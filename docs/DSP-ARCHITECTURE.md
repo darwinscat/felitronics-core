@@ -30,18 +30,32 @@ bake them in now (while the core is small) instead of retrofitting.
 - **Consistency + one test surface.** Same convolver, same detector, same analyzer across products,
   with one self-test suite per module (the `teq` discipline: measured audio == analytic curve).
 
+**Platform priority (product-driven, decides what we fund):**
+1. **Desktop** plugins + apps — **primary** (where the revenue is). This is what ships and what CI gates.
+2. **WASM** (browser demos / lightweight web) — **secondary, aspirational**.
+3. **Embedded / hardware** — **far-future, low priority.**
+
+We keep the core JUCE-free *so tiers 2–3 stay open*, but we **don't pay their tax early** (fixed-point,
+no-heap, embedded CI) — a tier earns its CI gate and its constraints only when a product funds it.
+
 ---
 
 ## 2. Portability laws (non-negotiable — WASM + embedded are first-class targets)
 
 These are what make the core actually portable. Violating one silently breaks a target.
 
-**Target tiers (each module declares which it supports; CI builds every tier).** Generic "WASM +
-embedded" is too coarse — name the profiles and what each allows:
+**Target tiers (each module declares which it supports).** Generic "WASM + embedded" is too coarse —
+name the profiles. Per the **platform priority (§1)**, **CI gates `desktop` (primary) today, with
+`wasm-audio` aspirational; both embedded tiers stay documented-but-not-gated** until a hardware product
+exists (3rd review: don't pay embedded's CI tax early).
 - `desktop` — heap in `prepare`, SIMD, JUCE only in adapters.
-- `wasm-audio` — AudioWorklet-safe; no blocking / filesystem in the audio path; bounded memory growth.
-- `embedded-fpu` — fixed max channels / block / IR / model; no heap after init.
-- `bare-mcu` — excludes NAM/Eigen and long-IR convolution; likely fixed-point.
+- `wasm-audio` — AudioWorklet-safe; no blocking / filesystem in the audio path; bounded memory growth;
+  **no FP-control register → relies on software denormal flushing (law 8)**.
+- `embedded-fpu` — float; fixed max channels / block / IR / model; no heap after init. Reachable from
+  the same code via templating.
+- `bare-mcu` — **fixed-point: a SEPARATE codebase, not a `using Sample` flag-flip** (different filter
+  topology / overflow scaling / coeff quantization). Documented, not promised from one source. Excludes
+  NAM/Eigen and long-IR convolution.
 
 1. **No threads in the core.** Threading is the *adapter's* job. The core is called synchronously.
    *(Why: WASM threads need SharedArrayBuffer + COOP/COEP; bare-metal may have none. Precedent:
@@ -66,16 +80,23 @@ embedded" is too coarse — name the profiles and what each allows:
    header-only function-local statics).
 7. **C++ subset that all toolchains accept** (C++20 desktop; keep an eye on what Emscripten and the
    embedded toolchain support).
-8. **Denormals handled portably.** The core never sets a **global** FTZ/DAZ mode (unsafe across
-   threads / other libs; no portable ARM/WASM equivalent). The adapter sets a portable
-   `ScopedFlushToZero` RAII at `process()` entry; the core assumes FTZ but never toggles it. Every
-   kernel ships a scalar fallback + a scalar↔SIMD parity test.
+8. **Denormals: every feedback kernel flushes in SOFTWARE; hardware FTZ is a desktop optimization,
+   never a correctness crutch.** *(Fixed by the 3rd review — agy/Gemini found the hole: WASM and many
+   embedded ARMs expose no FP-control register, so an "adapter sets FTZ, core assumes it" rule silently
+   fails on the `wasm-audio` tier → feedback filters decay into subnormals on silence → 10–100× CPU
+   spike.)* `teq` already does the right thing: `Biquad/Svf::flushDenormals()` zaps `|state| < 1e-15f`
+   to exact zero every block, so the state never reaches the subnormal range — `eq` is denormal-safe
+   **without** hardware FTZ. **The new `dynamics` envelope/release followers (and any future feedback
+   module) MUST adopt the same per-block software flush.** The core never sets a global FTZ/DAZ mode; an
+   adapter MAY set FTZ on desktop as a bonus. **Do NOT use `-ffast-math`** (it breaks the NaN/inf
+   semantics the tests assert). Every kernel also ships a scalar fallback + a scalar↔SIMD parity test.
 
-**These laws are CI-enforced, not aspirational.** From day one: a no-allocation-in-`process()` test,
-`-fno-exceptions` / `-fno-rtti` build configs, an **Emscripten** build, and an **arm-none-eabi**
-compile of the light modules — so a thread / alloc / dep / denormal creep fails the build immediately.
-Third-party deps (Eigen, kissfft, pffft) must be verified to build under `-fno-exceptions` (some use
-throwing asserts).
+**These laws are CI-enforced for the funded tiers, not aspirational.** From day one: a
+no-allocation-in-`process()` test, `-fno-exceptions` / `-fno-rtti` build configs, and an **Emscripten**
+(`wasm-audio`) build — so a thread / alloc / dep / denormal creep fails the build immediately. An
+**arm-none-eabi** job is documented but **not gated** until an embedded product funds it (3rd review:
+avoid embedded-grade CI scope creep). Third-party deps (Eigen, kissfft, pffft) must be verified to
+build under `-fno-exceptions` (some use throwing asserts).
 
 ---
 
@@ -278,9 +299,13 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
   compiled `STATIC`/`OBJECT`. §3, §5.
 - **RESOLVED (panel): the FFT-seam + zero-latency convolution spike goes FIRST**, before dynamics. §6.
 - **Sample type:** add a `using Sample = float` alias + non-`float*`-locked signatures **now**; full
-  templating when the first embedded target is real. (Was "later" → softened to avoid a fork-rewrite.)
-- **FFT seam API shape:** plan-object contract (sizes / scratch / layout / normalization); interface vs
-  C++20 concept decided in the spike.
+  templating reaches `embedded-fpu` (float). **`bare-mcu` (fixed-point) is a SEPARATE codebase** — the
+  alias does NOT flip a float SVF / NAM into fixed-point (different topology / scaling / quantization);
+  don't promise it from one source (3rd review).
+- **RESOLVED (3rd review): the FFT seam is compile-time** (template / C++20 concept), **not `virtual` in
+  the convolver hot path** (a vtable kills inlining / vectorization). The plan-object contract (sizes /
+  scratch / layout / normalization) is finalized in the spike. *(Nuance: the FFT runs ~once per partition
+  block, not per sample, so a vtable wouldn't be catastrophic — but compile-time stays the default.)*
 - **Double carve-outs:** specify, per module, where `double` is allowed on the audio thread
   (coefficient recompute) and for accumulators (RMS / LUFS / true-peak).
 - Single repo (this) vs multi-repo per module. (Lean: single repo, multiple targets — possibly layered:
@@ -300,8 +325,9 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
 
 ## 9. Panel review — 2026-06-29
 
-Reviewed by an independent panel (**Codex**, **DeepSeek**; **Gemini** unavailable — its MCP backend,
-the Antigravity `agy` CLI, isn't installed). Both reviewers **independently converged**:
+Reviewed by an independent panel — **Codex**, **DeepSeek**, and (added later) **agy / Gemini 3.1 Pro**
+run from the OrbitCab session; full notes in the companion `dsp-architecture-third-review.md`. All three
+**independently converged**:
 
 > **Verdict: proceed-with-changes.** The JUCE-free, seam-based, modular core is sound; the module
 > decomposition is sensible — but several seams were so underspecified that building heavy modules
@@ -319,12 +345,25 @@ Accepted-changes checklist (folded into §2–§8 above):
 - [x] Explicit **target tiers** (desktop / wasm-audio / embedded-fpu / bare-mcu); modules declare support. §2.
 - [x] FFT seam = **plan object** (scratch / sizes / layout / normalization); `convolution` owns its algorithm seam. §3.
 - [x] **Neural seam = inference-object**; model loading in adapter; build-time backend, not runtime swap. §3, §8.
-- [x] **Portable denormal RAII** (`ScopedFlushToZero`, no global FTZ from core) + scalar↔SIMD parity tests. §2.
+- [x] **Software denormal flush in every feedback kernel** (teq's `<1e-15 → 0` per block; FTZ a desktop
+      bonus only; no `-ffast-math`) + scalar↔SIMD parity tests. §2. *(corrected by the 3rd review)*
+- [x] **FFT seam = compile-time** (template/concept), not `virtual` in the hot path. §8.
 - [x] Size config beyond `kMaxChannels` (block / bands / partitions / IR) via template/policy + CMake preset; footprint reporting. §2.
 - [x] **Versioning is a contract**: SemVer + CHANGELOG + deprecation; *DSP output is versioned behaviour*; consumer-matrix + golden-audio CI. §5.
 - [x] `using Sample = float` alias + non-`float*`-locked signatures **now**. §2, §8.
 - [x] **CI-enforced laws from day one**: no-alloc-in-`process`, `-fno-exceptions` / `-fno-rtti`, Emscripten, arm-none-eabi. §2.
 - [x] `double` carve-outs (coeff recompute on audio thread; meter/LUFS/true-peak accumulators). §2, §8.
 
-Still to do: get **Gemini**'s third opinion once its backend is installed (`GEMINI_MCP_BACKEND=gemini`
-or install `agy`); resolve the remaining §8 open decisions during the FFT-seam spike.
+### Third reviewer — agy / Gemini 3.1 Pro (2026-06-29, via the OrbitCab session)
+Converged with Codex + DeepSeek on the sound calls (FFT-first, neural = build-time backend,
+versioning-as-behaviour, hybrid build) and found **one real correctness hole + two scope refinements**,
+all **verified against the actual code** (see `dsp-architecture-third-review.md`):
+- **Law 8 was wrong for WASM (now fixed, §2):** WASM / embedded ARM expose no FP-control register, so
+  "adapter sets FTZ, core assumes it" silently fails. `teq` already SOFTWARE-flushes (`<1e-15 → 0` per
+  block) so `eq` is WASM-safe; the rule is now "every feedback kernel software-flushes" — the new
+  `dynamics` followers must too. `-ffast-math` rejected (breaks the NaN/inf the tests assert).
+- **`bare-mcu` fixed-point = a separate codebase**, not a `using Sample` flag-flip (§2, §8).
+- **Tiers CI-gated only when a product funds them** (drop `bare-mcu` / arm-none-eabi from CI for now) (§2).
+- **FFT seam resolved to compile-time** (template / concept), not `virtual` in the hot path (§8).
+
+Still to do: resolve the remaining §8 open decisions during the FFT-seam spike.
