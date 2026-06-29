@@ -35,4 +35,11 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_eq_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_features(felitronics_eq_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_eq_tests COMMAND felitronics_eq_tests)
+
+    # New felitronics::eq primitives (Crossover2 + MultibandSplitter) — felitronics_test.h harness.
+    add_executable(felitronics_eq_crossover_tests tests/CrossoverTests.cpp)
+    target_link_libraries(felitronics_eq_crossover_tests PRIVATE felitronics::eq)
+    target_include_directories(felitronics_eq_crossover_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_eq_crossover_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_eq_crossover_tests COMMAND felitronics_eq_crossover_tests)
 endif()

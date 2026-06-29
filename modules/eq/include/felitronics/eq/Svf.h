@@ -55,8 +55,8 @@ public:
             case FilterType::LowPass:                                         m0 = 0.0;   m1 = 0.0;               m2 = 1.0;           break;
             case FilterType::HighPass:                                        m0 = 1.0;   m1 = -k;                m2 = -1.0;          break;
             case FilterType::BandPass:                                        m0 = 0.0;   m1 = k;                 m2 = 0.0;           break;  // unity gain at centre
-            case FilterType::Notch:                                          // swept notch/allpass/tilt unused
-            case FilterType::AllPass:                                        // (swept is bell-only & internal)
+            case FilterType::AllPass:                                        m0 = 1.0;   m1 = -2.0 * k;          m2 = 0.0;           break;  // 2nd-order allpass: v0 - 2k·v1 (flat |H|=1)
+            case FilterType::Notch:                                          // swept notch/tilt still unused
             case FilterType::Tilt:                                           m0 = 1.0;   m1 = 0.0;               m2 = 0.0;           break;  // -> pass-through
         }
 
