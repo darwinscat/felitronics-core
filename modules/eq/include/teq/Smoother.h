@@ -3,7 +3,7 @@
 
 #pragma once
 
-// Transitional compat shim — re-exports felitronics::core::Smoother as teq::Smoother.
+// Transitional compat shim — re-exports felitronics::core::Smoother (exp) + LinearSmoother as teq::.
 #include <felitronics/core/Smoother.h>
 
-namespace teq { using felitronics::core::Smoother; }
+namespace teq { using felitronics::core::Smoother; using felitronics::core::LinearSmoother; }
