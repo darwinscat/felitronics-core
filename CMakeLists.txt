@@ -46,6 +46,7 @@ add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
 add_subdirectory(modules/saturation)
 add_subdirectory(modules/stereo)
+add_subdirectory(modules/multiband)
 
 # Dev tools (reference-validation CLIs) — top-level builds only.
 if(PROJECT_IS_TOP_LEVEL)
