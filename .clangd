@@ -1,0 +1,6 @@
+# felitronics-core is C++20 (see CMakeLists / ADR Law 7). Tell clangd so it doesn't flag C++17/20
+# features (nested namespaces, inline/constexpr vars) as "extensions" when a file is opened before
+# compile_commands.json is generated.
+CompileFlags:
+  CompilationDatabase: build     # use build/compile_commands.json (real -I paths + -std per file)
+  Add: [-std=c++20]              # fallback for files not yet in the DB

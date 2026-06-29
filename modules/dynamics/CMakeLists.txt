@@ -1,0 +1,21 @@
+# felitronics::dynamics — EnvelopeFollower + GainComputer (the first NEW module). Header-only;
+# depends on core (FlushToZero). Composition (dynamic EQ / de-esser) is product glue, not here.
+add_library(felitronics_dynamics INTERFACE)
+add_library(felitronics::dynamics ALIAS felitronics_dynamics)
+target_include_directories(felitronics_dynamics INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(felitronics_dynamics INTERFACE felitronics::core)
+target_compile_features(felitronics_dynamics INTERFACE cxx_std_20)
+
+if(FELITRONICS_BUILD_TESTS)
+    add_executable(felitronics_dynamics_tests tests/DynamicsTests.cpp)
+    target_link_libraries(felitronics_dynamics_tests PRIVATE felitronics::dynamics)
+    target_include_directories(felitronics_dynamics_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_tests COMMAND felitronics_dynamics_tests)
+
+    add_executable(felitronics_dynamics_compressor_tests tests/CompressorTests.cpp)
+    target_link_libraries(felitronics_dynamics_compressor_tests PRIVATE felitronics::dynamics)
+    target_include_directories(felitronics_dynamics_compressor_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_compressor_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_compressor_tests COMMAND felitronics_dynamics_compressor_tests)
+endif()
