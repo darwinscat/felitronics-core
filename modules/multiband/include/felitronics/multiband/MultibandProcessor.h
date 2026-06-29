@@ -68,15 +68,15 @@ public:
     void setCrossovers (const float* hz, int count) noexcept { splitter_.setCrossovers (hz, count); }
     int  numBands() const noexcept { return splitter_.numBands(); }
 
-    BandProcessor&       band (int b)       noexcept { return proc_[(std::size_t) b]; }
-    const BandProcessor& band (int b) const noexcept { return proc_[(std::size_t) b]; }
+    BandProcessor&       band (int b)       noexcept { return proc_[(std::size_t) std::clamp (b, 0, MaxBands - 1)]; }
+    const BandProcessor& band (int b) const noexcept { return proc_[(std::size_t) std::clamp (b, 0, MaxBands - 1)]; }
 
-    // Set a band's params + re-derive latency (a lookahead change shifts alignment).
+    // Set a band's params + re-derive latency (a lookahead change shifts alignment). OOB index → ignored.
     template <class Params>
-    void setBandParams (int b, const Params& p) noexcept { proc_[(std::size_t) b].setParams (p); refreshLatency(); }
+    void setBandParams (int b, const Params& p) noexcept { if ((unsigned) b < (unsigned) MaxBands) { proc_[(std::size_t) b].setParams (p); refreshLatency(); } }
 
-    void setBandBypass (int b, bool x) noexcept { bypass_[(std::size_t) b] = x; refreshLatency(); }
-    void setBandSolo   (int b, bool x) noexcept { solo_[(std::size_t) b] = x; }
+    void setBandBypass (int b, bool x) noexcept { if ((unsigned) b < (unsigned) MaxBands) { bypass_[(std::size_t) b] = x; refreshLatency(); } }
+    void setBandSolo   (int b, bool x) noexcept { if ((unsigned) b < (unsigned) MaxBands) solo_[(std::size_t) b] = x; }
     void setMix        (float m) noexcept       { mix_ = std::clamp (m, 0.0f, 1.0f); }
     void refreshLatency() noexcept { recomputeLatency(); }
 
