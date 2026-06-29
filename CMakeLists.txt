@@ -49,6 +49,7 @@ add_subdirectory(modules/stereo)
 add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
 add_subdirectory(modules/deesser)
+add_subdirectory(modules/dither)
 
 # Dev tools (reference-validation CLIs) — top-level builds only.
 if(PROJECT_IS_TOP_LEVEL)
