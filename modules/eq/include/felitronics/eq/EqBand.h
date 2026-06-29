@@ -95,6 +95,37 @@ inline std::complex<double> bandResponse (const BandParams& p, double fs, double
     return h;
 }
 
+// A "Side lane" view of a band: its s* fields mapped into the primary design slots, so the same
+// designBand()/bandResponse() machinery evaluates the Side lane. Only meaningful when p.ms (the
+// engine splits M/S only on a 2-channel signal). on/bypass fold in the Side lane's enable state.
+inline BandParams sideView (const BandParams& p) noexcept
+{
+    BandParams s = p;
+    s.on     = p.on && p.sOn;     // Side runs only if the band is on AND its Side lane is enabled
+    s.bypass = p.sBypass;
+    s.type   = p.sType;
+    s.freq   = p.sFreq;
+    s.Q      = p.sQ;
+    s.gainDb = p.sGainDb;
+    s.slope  = p.sSlope;
+    s.swept  = false;             // M/S lanes are matched-only (no SVF sweep)
+    return s;
+}
+
+// Composite complex response of the whole bank on ONE stereo axis at digital w, from a caller-owned
+// snapshot (race-free). side=false → the Mid axis (also the plain L=R response when no band is M/S);
+// side=true → the Side axis. A non-M/S band contributes its single (stereo) response to both axes; an
+// M/S band contributes its Mid lane to the Mid axis and its Side lane to the Side axis.
+inline std::complex<double> compositeResponse (const BandParams* bands, int numBands,
+                                               double fs, double w, bool side) noexcept
+{
+    std::complex<double> h { 1.0, 0.0 };
+    for (int i = 0; i < numBands; ++i)
+        h *= (side && bands[i].ms) ? bandResponse (sideView (bands[i]), fs, w)
+                                   : bandResponse (bands[i], fs, w);
+    return h;
+}
+
 //==============================================================================
 // teq::EqBand — one EQ band. Owns its parameter smoothers, picks the right design, and
 // processes a block in place (mono or stereo). Two engines under one band:
