@@ -43,4 +43,79 @@ private:
     double fs = 0.0, coeff = 0.0, current = 0.0, target = 0.0;
 };
 
+//==============================================================================
+// One-pole? No — a fixed-increment LINEAR ramp. JUCE-free, RT-safe, bit-for-bit drop-in for
+// juce::SmoothedValue<float, ValueSmoothingTypes::Linear>: same method names, same float numerics, the
+// same `floor()` ramp-length, and the same decrement-then-step order — so a consumer swaps the TYPE with
+// no call-site changes and the host-facing feel (mute/gain/mix ramps) is identical. A new target restarts
+// a full `stepsToTarget`-sample ramp from the CURRENT value. Use the exponential Smoother above for
+// coefficient glides; use this where a JUCE linear smoother is being replaced.
+class LinearSmoother
+{
+public:
+    LinearSmoother() noexcept = default;
+    explicit LinearSmoother (float initialValue) noexcept : currentValue (initialValue), target (initialValue) {}
+
+    // Ramp length from seconds. NOTE: floor(), matching JUCE exactly (not round()).
+    void reset (double sampleRate, double rampLengthInSeconds) noexcept
+    {
+        reset ((int) std::floor (rampLengthInSeconds * sampleRate));
+    }
+
+    // Ramp length directly in samples. Snaps current→target and stops any ramp in progress.
+    void reset (int numSteps) noexcept
+    {
+        stepsToTarget = numSteps;
+        setCurrentAndTargetValue (target);
+    }
+
+    void setTargetValue (float newValue) noexcept
+    {
+        if (newValue == target) return;
+        if (stepsToTarget <= 0) { setCurrentAndTargetValue (newValue); return; }
+        target    = newValue;
+        countdown = stepsToTarget;
+        step      = (target - currentValue) / (float) countdown;
+    }
+
+    void setCurrentAndTargetValue (float newValue) noexcept
+    {
+        target = currentValue = newValue;
+        countdown = 0;
+    }
+
+    // One sample. Decrement-then-step, snapping to target on the final step (no float drift past target).
+    float getNextValue() noexcept
+    {
+        if (countdown <= 0) return target;
+        --countdown;
+        if (countdown > 0) currentValue += step;
+        else               currentValue = target;
+        return currentValue;
+    }
+
+    // Closed-form jump of n samples (== n getNextValue() calls), for once-per-block recompute.
+    float skip (int numSamples) noexcept
+    {
+        if (numSamples >= countdown) { setCurrentAndTargetValue (target); return target; }
+        currentValue += step * (float) numSamples;
+        countdown    -= numSamples;
+        return currentValue;
+    }
+
+    void applyGain (float* samples, int numSamples) noexcept
+    {
+        if (countdown > 0) for (int i = 0; i < numSamples; ++i) samples[i] *= getNextValue();
+        else               for (int i = 0; i < numSamples; ++i) samples[i] *= target;
+    }
+
+    float getCurrentValue() const noexcept { return currentValue; }
+    float getTargetValue()  const noexcept { return target; }
+    bool  isSmoothing()     const noexcept { return countdown > 0; }
+
+private:
+    float currentValue = 0.0f, target = 0.0f, step = 0.0f;
+    int   countdown = 0, stepsToTarget = 0;
+};
+
 } // namespace felitronics::core

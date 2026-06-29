@@ -45,6 +45,57 @@ int main()
         test::approx (b.value(), a.value(), 1e-9, "closed-form advance matches stepwise");
     }
 
+    // --- LinearSmoother: bit-for-bit drop-in for juce::SmoothedValue<float, Linear> ---
+    // (assertions ported from JUCE's own CommonSmoothedValueTests, so a swap can't change the feel)
+    test::group ("LinearSmoother == juce::SmoothedValue (Linear)");
+    {
+        // initial state
+        core::LinearSmoother sv;
+        test::approx (sv.getCurrentValue(), sv.getTargetValue(), 0.0, "init: current == target");
+        sv.getNextValue();
+        test::ok (! sv.isSmoothing(), "init: not smoothing");
+
+        // resetting + ramp arming
+        core::LinearSmoother r (15.0f);
+        r.reset (3);
+        test::approx (r.getCurrentValue(), 15.0, 1e-6, "reset keeps current at 15");
+        r.setTargetValue (16.0f);
+        test::ok (r.getTargetValue() == 16.0f && r.getCurrentValue() == 15.0f && r.isSmoothing(),
+                  "target armed, current not moved yet, smoothing");
+        test::ok (r.getNextValue() > 15.0f, "first step moves toward target");
+        r.reset (5);
+        test::ok (r.getCurrentValue() == 16.0f && ! r.isSmoothing(), "reset snaps current to target + stops");
+        r.setCurrentAndTargetValue (0.2f);
+        test::approx (r.getNextValue(), 0.2, 1e-6, "snapped value held");
+        test::ok (! r.isSmoothing(), "snap: not smoothing");
+
+        // linear ramp SHAPE: 1 -> 2 over 12 steps, snap exactly on the 12th
+        core::LinearSmoother b (1.0f);
+        b.reset (12); b.setTargetValue (2.0f);
+        float s[15]; for (int i = 0; i < 15; ++i) s[i] = b.getNextValue();
+        test::approx (s[0],  1.0 + 1.0 / 12.0,  1e-6, "step 1 == 1 + 1/12 (fixed increment)");
+        test::approx (s[10], 1.0 + 11.0 / 12.0, 1e-5, "step 11 == 1 + 11/12");
+        test::ok     (s[10] < 2.0f, "still below target before the final step");
+        test::approx (s[11], 2.0, 2e-7, "reaches exactly target on step 12");
+        test::approx (s[14], 2.0, 0.0, "holds target after");
+
+        // skip(n) == n * getNextValue()
+        core::LinearSmoother g; g.reset (12); g.setCurrentAndTargetValue (1.0f); g.setTargetValue (2.0f);
+        float ref[15]; for (int i = 0; i < 15; ++i) ref[i] = g.getNextValue();
+        g.setCurrentAndTargetValue (1.0f); g.setTargetValue (2.0f);
+        test::approx (g.skip (1), ref[0], 1e-5, "skip 1 == getNextValue #0");
+        test::approx (g.skip (1), ref[1], 1e-5, "skip 1 == getNextValue #1");
+        test::approx (g.skip (2), ref[3], 1e-5, "skip 2 == getNextValue #3");
+        g.skip (3);
+        test::approx (g.getCurrentValue(), ref[6], 1e-5, "after skip 3, current == #6");
+        test::approx (g.skip (300), g.getTargetValue(), 0.0, "skip past the end snaps to target");
+
+        // reset(sampleRate, seconds) uses floor(), matching JUCE
+        core::LinearSmoother f; f.reset (1000.0, 0.0125);            // floor(12.5) == 12 steps
+        f.setCurrentAndTargetValue (0.0f); f.setTargetValue (12.0f); // step == 1.0/sample
+        test::approx (f.getNextValue(), 1.0, 1e-6, "floor(0.0125*1000)=12 steps -> +1.0/step");
+    }
+
     // --- Math dB <-> gain ---
     test::group ("Math dB<->gain");
     test::approx (core::dbToGain (0.0),    1.0,    1e-12, "0 dB == unity");
