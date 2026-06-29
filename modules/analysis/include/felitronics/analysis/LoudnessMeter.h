@@ -35,6 +35,7 @@ public:
         for (int c = 0; c < kMaxChannels; ++c) w[c] = 1.0;
         hopRing.assign (kHopRing, 0.0);
         blockE.assign ((std::size_t) ((int) std::ceil (maxDurationSec * 10.0) + 4), 0.0);
+        stE.assign ((std::size_t) ((int) std::ceil (maxDurationSec) + 8), 0.0);     // 1 short-term sample/s for LRA
         reset();
     }
 
@@ -43,6 +44,7 @@ public:
         kw.reset();
         for (int c = 0; c < kMaxChannels; ++c) hopSumSq[c] = 0.0;
         hopCount = 0; hopWrite = 0; hopFilled = 0; blockCount = 0;
+        stCount = 0; stSince = 0;
         std::fill (hopRing.begin(), hopRing.end(), 0.0);
     }
 
@@ -61,6 +63,7 @@ public:
     double momentaryLufs()  const noexcept { return lufsOf (meanLastHops (4)); }    // 400 ms
     double shortTermLufs()  const noexcept { return lufsOf (meanLastHops (30)); }   // 3 s
     double integratedLufs() const noexcept { return integrated(); }                 // gated
+    double loudnessRangeLu() const noexcept { return lra(); }                       // EBU Tech 3342 (P95−P10)
 
 private:
     static constexpr int kMaxChannels = core::kMaxChannels;
@@ -75,6 +78,11 @@ private:
         if (hopFilled < kHopRing) ++hopFilled;
         if (hopFilled >= 4 && blockCount < (int) blockE.size())                     // a 400 ms block every 100 ms
             blockE[(std::size_t) blockCount++] = meanLastHops (4);
+        if (hopFilled >= kHopRing)                                                  // a 3 s short-term sample every 1 s (LRA)
+        {
+            if (stSince == 0 && stCount < (int) stE.size()) stE[(std::size_t) stCount++] = meanLastHops (kHopRing);
+            if (++stSince >= 10) stSince = 0;                                        // first at 3 s, then every 10 hops (libebur128)
+        }
         for (int c = 0; c < nc; ++c) hopSumSq[c] = 0.0;
         hopCount = 0;
     }
@@ -103,6 +111,40 @@ private:
         return c2 > 0 ? lufsOf (s2 / c2) : -120.0;
     }
 
+    // LRA (EBU Tech 3342) = P95 − P10 of the gated 3 s short-term loudness distribution. Two-pass gate over
+    // the 1 s-cadence stE[] energies: absolute −70 LUFS, then −20 LU below the energy-mean of the abs-gated
+    // set; percentiles via a fixed 0.1 LU histogram (−70..+30 LUFS), libebur128-faithful (no sort, no alloc).
+    double lra() const noexcept
+    {
+        if (stCount <= 0) return 0.0;
+        const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);                // energy for −70 LUFS
+        double sum = 0.0; int cnt = 0;
+        for (int j = 0; j < stCount; ++j) if (stE[(std::size_t) j] >= absT) { sum += stE[(std::size_t) j]; ++cnt; }
+        if (cnt == 0) return 0.0;
+        const double relT = 0.01 * (sum / cnt);                                     // −20 LU relative (energy ×0.01)
+
+        constexpr int kBins = 1000;                                                 // −70..+30 LUFS, 0.1 LU bins
+        int hist[kBins] = { 0 }; int total = 0;
+        for (int j = 0; j < stCount; ++j)
+        {
+            const double e = stE[(std::size_t) j];
+            if (e >= absT && e >= relT)                                             // ≥ gates (libebur128-faithful)
+            {
+                int b = (int) ((lufsOf (e) + 70.0) * 10.0);                         // 0.1 LU bins from −70 LUFS
+                b = b < 0 ? 0 : (b >= kBins ? kBins - 1 : b);
+                ++hist[b]; ++total;
+            }
+        }
+        if (total < 2) return 0.0;
+        auto pct = [&] (double p) {                                                 // libebur128 rank rule, bin lower bound
+            const int rank = (int) ((double) (total - 1) * p + 0.5);
+            int cum = 0, b = 0;
+            for (; b < kBins; ++b) { cum += hist[b]; if (cum > rank) break; }
+            return -70.0 + (double) (b < kBins ? b : kBins - 1) * 0.1;
+        };
+        return pct (0.95) - pct (0.10);                                             // the 0.05-LU bin offset cancels
+    }
+
     double fs = 48000.0; int ch = 2, hopSamples = 4800;
     KWeightingFilter kw;
     double w[kMaxChannels] {};
@@ -112,6 +154,8 @@ private:
     int hopWrite = 0, hopFilled = 0;
     std::vector<double> blockE;
     int blockCount = 0;
+    std::vector<double> stE;                                                        // 3 s short-term energies @1 s (LRA)
+    int stCount = 0, stSince = 0;
 };
 
 } // namespace felitronics::analysis

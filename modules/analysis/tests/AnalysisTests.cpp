@@ -107,6 +107,67 @@ int main()
         test::ok (std::isfinite (m) && m > -60.0, "momentary finite + sensible");
         test::approx (ig, m,  0.3, "integrated ≈ momentary for a steady tone");
         test::approx (st, m,  0.3, "short-term ≈ momentary for a steady tone");
+        test::ok (lm.loudnessRangeLu() < 1.0, "LRA ≈ 0 for a steady tone (no loudness variation)");
+    }
+
+    // --- LRA reflects the spread of a two-level program (EBU Tech 3342: P95 − P10 of gated short-term) ---
+    test::group ("LoudnessMeter LRA two-level program");
+    {
+        const double sr = 48000.0; const int seg = (int) (12.0 * sr);              // 12 s loud + 12 s quiet
+        std::vector<float> x ((std::size_t) (2 * seg));
+        for (int i = 0; i < seg; ++i) x[(std::size_t) i]         = (float) (0.5f  * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+        for (int i = 0; i < seg; ++i) x[(std::size_t) (seg + i)] = (float) (0.15f * std::sin (2.0 * core::kPi * 1000.0 * i / sr));   // ~10.5 dB down
+        analysis::LoudnessMeter lm; lm.prepare (sr, 1, 30.0);
+        const float* ch[1] { x.data() }; lm.process (ch, 1, 2 * seg);
+        const double lra = lm.loudnessRangeLu();
+        test::ok (lra > 7.0 && lra < 13.0, "loud↔quiet (~10.5 dB apart) → LRA ≈ the spread");
+    }
+
+    // --- a sub-3 s program has no short-term block → LRA is 0 by definition ---
+    test::group ("LoudnessMeter LRA needs >= 3 s");
+    {
+        const double sr = 48000.0; const int n = (int) (2.0 * sr);
+        std::vector<float> x ((std::size_t) n, 0.3f);
+        analysis::LoudnessMeter lm; lm.prepare (sr, 1, 10.0);
+        const float* ch[1] { x.data() }; lm.process (ch, 1, n);
+        test::ok (lm.loudnessRangeLu() == 0.0, "< 3 s of audio → LRA = 0 (no short-term sample yet)");
+    }
+
+    // a two-level program builder (loud `seg` s at 0.5, then quiet `seg` s at `quietAmp`)
+    auto twoLevel = [] (double sr, int seg, float quietAmp) {
+        std::vector<float> x ((std::size_t) (2 * seg));
+        for (int i = 0; i < seg; ++i) x[(std::size_t) i]         = (float) (0.5f     * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+        for (int i = 0; i < seg; ++i) x[(std::size_t) (seg + i)] = (float) (quietAmp * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+        return x;
+    };
+
+    // --- the relative gate is −20 LU (NOT −10): an 18 dB-down tail SURVIVES → LRA reflects it.
+    //     (had the gate been −10 LU, the quiet tail would be trimmed and LRA would collapse toward 0.) ---
+    test::group ("LoudnessMeter LRA −20 LU gate keeps wide dynamics");
+    {
+        const double sr = 48000.0; const int seg = (int) (12.0 * sr);
+        auto x = twoLevel (sr, seg, 0.0630f);                                       // ≈ −18 dB quiet section
+        analysis::LoudnessMeter lm; lm.prepare (sr, 1, 30.0);
+        const float* ch[1] { x.data() }; lm.process (ch, 1, 2 * seg);
+        const double lra = lm.loudnessRangeLu();
+        test::ok (lra > 13.0 && lra < 22.0, "18 dB spread → LRA ≈ 18 (the quiet tail passes the −20 LU gate)");
+    }
+
+    // --- reset is deterministic; mono and dual-mono stereo give the SAME LRA (the +3 LU offset cancels) ---
+    test::group ("LoudnessMeter LRA reset determinism + mono==stereo");
+    {
+        const double sr = 48000.0; const int seg = (int) (12.0 * sr);
+        auto x = twoLevel (sr, seg, 0.15f);
+        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 30.0);
+        const float* mono[1] { x.data() }; lm.process (mono, 1, 2 * seg);
+        const double lraA = lm.loudnessRangeLu();
+        lm.reset();
+        lm.process (mono, 1, 2 * seg);
+        const double lraB = lm.loudnessRangeLu();
+        test::ok (lraB == lraA, "reset → identical LRA on the same input (deterministic)");
+        lm.reset();
+        const float* stereo[2] { x.data(), x.data() }; lm.process (stereo, 2, 2 * seg);   // dual-mono = +3 LU everywhere
+        test::ok (std::fabs (lm.loudnessRangeLu() - lraA) < 0.2, "mono == dual-mono stereo LRA (a constant offset cancels in P95−P10)");
     }
 
     return test::report();
