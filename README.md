@@ -20,16 +20,22 @@ de-JUCE plan).
 | Module | Namespace | Target | What | Status |
 |---|---|---|---|---|
 | `core` | `felitronics::core` | `felitronics::core` | `Sample` alias, size config (SSOT), `Math`, `Smoother` (exp) + `LinearSmoother` (JUCE-compatible), software denormal flush + `ScopedFlushToZero`, `DelayLine`, the **`Fft` seam** (+ scalar backend) | header-only |
-| `analysis` | `felitronics::analysis` | `felitronics::analysis` | `SpectrumTap` (SPSC) + BS.1770 `LoudnessMeter` (LUFS, ffmpeg-validated) + `CorrelationMeter` | header-only |
-| `dynamics` | `felitronics::dynamics` | `felitronics::dynamics` | `EnvelopeFollower` + `GainComputer` + `ChannelLinker` + `GainReductionFollower` + a broadband `Compressor` | header-only |
-| `eq` | `felitronics::eq` | `felitronics::eq` (+ `teq::core` compat) | matched biquads (Vicanek) + Cytomic SVF + `EqBand` + `EqEngine` — migrated from TabbyEQ's `teq/` | header-only |
+| `analysis` | `felitronics::analysis` | `felitronics::analysis` | `SpectrumTap` (SPSC) + `LoudnessMeter` (BS.1770 LUFS M/S/I + **LRA**) + `TruePeakMeter` (dBTP, BS.1770-4) + `CorrelationMeter` + `KWeightingFilter` | header-only |
+| `dynamics` | `felitronics::dynamics` | `felitronics::dynamics` | `EnvelopeFollower` + `GainComputer` + `ChannelLinker` + `GainReductionFollower` + a broadband `Compressor` + `TransientShaper` | header-only |
+| `eq` | `felitronics::eq` | `felitronics::eq` (+ `teq::core` compat) | matched biquads (Vicanek) + Cytomic SVF + `EqBand` + `EqEngine` + `Crossover2` (LR4) + `MultibandSplitter` — migrated from TabbyEQ's `teq/` | header-only |
 | `convolution` | `felitronics::convolution` | `felitronics::convolution` | zero-latency partitioned FFT convolver + multi-channel click-free `ConvolutionEngine` (lockstep stereo IR swap) + offline Kaiser IR resampler | header-only |
 | `oversampling` | `felitronics::oversampling` | `felitronics::oversampling` | polyphase windowed-sinc FIR up/down sampler (true-peak / alias-free) | header-only |
 | `limiter` | `felitronics::limiter` | `felitronics::limiter` | brickwall **true-peak** limiter (guaranteed ceiling; oversample→limit→downsample) | header-only |
 | `neural` | `felitronics::neural` | `felitronics::neural` | process-only `Inference` seam + swap-safe `NeuralStage` (the NAM/Eigen backend + model loading live in the adapter) | header-only |
+| `saturation` | `felitronics::saturation` | `felitronics::saturation` | oversampled soft-saturation: `WaveShaper` (Tanh/Atan/Cubic/Asym) + `Saturator` | header-only |
+| `stereo` | `felitronics::stereo` | `felitronics::stereo` | `MidSide` matrix + `MonoBass` (bass mono-maker / elliptical) + `StereoWidth` (mono-fold-safe M/S width) | header-only |
+| `dynamiceq` | `felitronics::dynamiceq` | `felitronics::dynamiceq` | `DynamicEqBand` — a level-driven (cut/boost-when-loud/quiet) EQ band | header-only |
+| `deesser` | `felitronics::deesser` | `felitronics::deesser` | `DeEsser` — sibilance control, surgical dynamic-EQ · classic split-band | header-only |
+| `multiband` | `felitronics::multiband` | `felitronics::multiband` | generic `MultibandProcessor` (LR4 split → per-band → recombine) + `MultibandCompressor` + `MultibandWidth` | header-only |
+| `dither` | `felitronics::dither` | `felitronics::dither` | `Dither` — TPDF + error-feedback noise shaping (export 16/20/24-bit) | header-only |
 
 Every module is JUCE-free, declares its target tiers, and ships its own JUCE-free self-tests
-(measured audio == analytic curve — the `teq` discipline).
+(measured audio == analytic curve — the `teq` discipline) — **22 suites, 1022 checks** today.
 
 ## Build & test
 
@@ -55,9 +61,10 @@ target_link_libraries(app PRIVATE felitronics::eq felitronics::dynamics)   # lin
 # #include <teq/EqEngine.h>                (transitional compat — teq:: aliases felitronics::eq)
 ```
 
-> Status: **bootstrapping.** Light modules (`core`, `analysis`, `dynamics`, `eq`) land first; `eq` is
-> migrated out of TabbyEQ's `teq/` with a `teq::` compat shim so consumers repoint one at a time. The
-> FFT-seam spike has **landed** (`core/Fft` + `convolution`, the architecture's keystone); the remaining
-> heavy modules (`neural`, `limiter`, `oversampling`) follow.
+> Status: **a full mastering chain is in** — `eq` is migrated out of TabbyEQ's `teq/` (with a `teq::` compat
+> shim so consumers repoint one at a time); the FFT-seam keystone landed (`core/Fft` + `convolution`); and
+> the mastering set — saturation, dynamic-EQ, de-esser, multiband (comp + width), stereo width, mono-bass,
+> dither, true-peak limiter, metered by dBTP true-peak + LUFS/LRA — is built and green. Not yet published
+> (no tag); products consume the local checkout via `SOURCE_DIR`. See [`docs/CORE-OVERVIEW.md`](docs/CORE-OVERVIEW.md).
 
 License: **AGPL-3.0-or-later** (SPDX header on every file).
