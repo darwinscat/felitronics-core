@@ -44,6 +44,7 @@ add_subdirectory(modules/convolution)
 add_subdirectory(modules/oversampling)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
+add_subdirectory(modules/saturation)
 
 # Dev tools (reference-validation CLIs) — top-level builds only.
 if(PROJECT_IS_TOP_LEVEL)
