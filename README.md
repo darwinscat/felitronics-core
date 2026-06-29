@@ -19,11 +19,11 @@ de-JUCE plan).
 
 | Module | Namespace | Target | What | Status |
 |---|---|---|---|---|
-| `core` | `felitronics::core` | `felitronics::core` | `Sample` alias, size config (SSOT), `Math`, `Smoother`, software denormal flush + `ScopedFlushToZero`, `DelayLine`, the **`Fft` seam** (+ scalar backend) | header-only |
+| `core` | `felitronics::core` | `felitronics::core` | `Sample` alias, size config (SSOT), `Math`, `Smoother` (exp) + `LinearSmoother` (JUCE-compatible), software denormal flush + `ScopedFlushToZero`, `DelayLine`, the **`Fft` seam** (+ scalar backend) | header-only |
 | `analysis` | `felitronics::analysis` | `felitronics::analysis` | `SpectrumTap` (SPSC) + BS.1770 `LoudnessMeter` (LUFS, ffmpeg-validated) + `CorrelationMeter` | header-only |
 | `dynamics` | `felitronics::dynamics` | `felitronics::dynamics` | `EnvelopeFollower` + `GainComputer` + `ChannelLinker` + `GainReductionFollower` + a broadband `Compressor` | header-only |
 | `eq` | `felitronics::eq` | `felitronics::eq` (+ `teq::core` compat) | matched biquads (Vicanek) + Cytomic SVF + `EqBand` + `EqEngine` — migrated from TabbyEQ's `teq/` | header-only |
-| `convolution` | `felitronics::convolution` | `felitronics::convolution` | zero-latency partitioned FFT convolver + click-free `ConvolutionEngine` (dual-engine IR swap) + offline Kaiser IR resampler | header-only |
+| `convolution` | `felitronics::convolution` | `felitronics::convolution` | zero-latency partitioned FFT convolver + multi-channel click-free `ConvolutionEngine` (lockstep stereo IR swap) + offline Kaiser IR resampler | header-only |
 | `oversampling` | `felitronics::oversampling` | `felitronics::oversampling` | polyphase windowed-sinc FIR up/down sampler (true-peak / alias-free) | header-only |
 | `limiter` | `felitronics::limiter` | `felitronics::limiter` | brickwall **true-peak** limiter (guaranteed ceiling; oversample→limit→downsample) | header-only |
 | `neural` | `felitronics::neural` | `felitronics::neural` | process-only `Inference` seam + swap-safe `NeuralStage` (the NAM/Eigen backend + model loading live in the adapter) | header-only |
