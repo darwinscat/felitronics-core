@@ -118,7 +118,12 @@ public:
         if (s == 1)   // begin crossfade — length by warmth (cold first-prime vs short warm swap)
         {
             xfadePos_ = 0;
-            xfadeLen_ = (warmSamples_ >= coldXfade_) ? warmXfade_ : coldXfade_;
+            // The cold first-prime fade masks the empty-history ramp-up, which lasts ≈ the NEW IR's tail —
+            // so scale it to the ACTUAL loaded IR (its numParts), not maxParts. A short IR then fades in over
+            // the short anti-click window instead of the full max-tail; a long IR still gets a tail-length fade.
+            const int newParts = chan_[0].numParts[1 - cur_];                 // all channels share the IR length
+            xfadeLen_ = (warmSamples_ >= coldXfade_) ? warmXfade_
+                                                     : std::clamp ((newParts + 1) * P_, warmXfade_, coldXfade_);
             for (int c = 0; c < nc; ++c) primeTail (chan_[c], 1 - cur_);   // make the new slot's tail valid NOW from the warm FDL (else its zeroed tail leaks into the blend for ≤P samples)
             state_.store (2, std::memory_order_relaxed);
             s = 2;
