@@ -23,17 +23,18 @@ namespace felitronics::lineareq
 //
 // It builds a MIXED-PHASE FIR (MixedPhaseFir, cepstral blend φ = k·φ_min) of the bank's composite
 // magnitude, per Mid/Side axis, and convolves with the same click-free ConvolutionEngine as LinearPhaseEq.
-// At k≈0.5 the phase stays close to flat (most of linear's benefit) while pre-ringing and bulk delay drop
-// sharply — so the reported PDC latency is only (1−k)·L/2, FAR below linear's L/2, and transients are not
-// smeared by symmetric pre-ring.
+// At k≈0.5 the phase stays close to flat (most of linear's benefit) while pre-ringing drops sharply — and
+// the reported PDC latency is a FIXED L/4 (¼ the FIR, the same for every k), FAR below linear's L/2, so the
+// live blend knob never moves PDC and transients are not smeared by symmetric pre-ring.
 //
 //  • Design FFT D = 8·L masks cepstral time-aliasing on steep filters.
-//  • The mixed-phase impulse is shifted causal by `bulkDelay = (1−k)·L/2` (that shift IS the latency) and
+//  • The mixed-phase impulse is shifted causal by a FIXED `bulkDelay = L/4` (that shift IS the latency) and
 //    truncated to L taps with a TAIL taper (NO centred window — that would gut the front-loaded impulse).
 //  • A flat EQ renders a unit impulse at `bulkDelay` ⇒ exact unity-gain pass-through at the reported latency.
 //
 // Same threading contract as LinearPhaseEq: setBands()/buildFir()/prepare() are RT-UNSAFE (message thread,
-// host-serialised); process() is RT-safe. To change quality or the phase blend k, re-prepare().
+// host-serialised); process() is RT-safe. To change quality, re-prepare(); the blend k changes LIVE via
+// setBlend() (the bulk delay is fixed, so PDC never moves — no re-prepare).
 class NaturalPhaseEq
 {
 public:

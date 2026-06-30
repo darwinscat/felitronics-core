@@ -4,7 +4,7 @@
 // JUCE-free self-tests for NaturalPhaseEq — the mixed-phase ("Natural") rendering. Decisive properties:
 //   (1) a FLAT EQ renders a unit impulse at `bulkDelay` (unity pass-through at the reported latency);
 //   (2) the realised magnitude matches the bank's target (mixed phase preserves |H|);
-//   (3) latency = (1−k)·L/2 — strictly LESS than linear's L/2;
+//   (3) latency = a FIXED L/4 — strictly LESS than linear's L/2, and the same for every k;
 //   (4) the FIR is NON-symmetric and front-loaded (mixed phase, not linear), with less pre- than post-energy;
 //   (5) process() never allocates (RT-safe) and runs mono + stereo.
 
@@ -44,7 +44,7 @@ int main()
 
     NPE np; np.prepare (sr, 512, 2, Q, 0.5f);
     const int L = np.firSize();
-    const int delay = np.latencySamples();                           // = (1−k)·L/2 = L/4 for k=0.5
+    const int delay = np.latencySamples();                           // = L/4, fixed for all k
     std::vector<float> firMid ((std::size_t) L), firSide ((std::size_t) L);
     eq::BandParams flat[1];
 
@@ -70,7 +70,7 @@ int main()
         test::approx (firMagDb (firMid, 3000.0, sr), -8.0, 0.8, "−8 dB cut → ~−8 dB at 3 kHz");
     }
 
-    // --- (3) latency is (1−k)·L/2 and strictly lighter than linear's L/2 ---
+    // --- (3) latency is a FIXED L/4 and strictly lighter than linear's L/2 ---
     test::group ("NaturalPhaseEq latency lighter than linear");
     {
         test::ok (delay == L / 4, "k=0.5 → bulk delay == L/4");
@@ -145,6 +145,28 @@ int main()
         test::ok (diff > 1e-3, "the FIR actually changed (phase blended)");
         double preH = 0.0, preM = 0.0; for (int i = 0; i < lat0; ++i) { preH += std::fabs (fHalf[(std::size_t) i]); preM += std::fabs (fMin[(std::size_t) i]); }
         test::ok (preM < preH, "k=0.95 has less pre-ring than k=0.5 (toward minimum phase)");
+    }
+
+    // --- (9) magnitude holds across the WHOLE blend range k∈[0,1], not just k=0.5. A panel review worried
+    //     the fixed-L/4 bulk shift (asymmetric: L/4 pre-ring vs 3L/4 post) would clip pre-ring and wreck |H|
+    //     at low k. Measured: it does NOT — the re-injected |H| keeps the realised magnitude on target for
+    //     every k across the audible band (the only deviations sit in a steep HP's deep, inaudible sub-bass
+    //     stop-band, and shrink with quality). This locks that in. ---
+    test::group ("NaturalPhaseEq magnitude holds across all k (refutes the low-k truncation worry)");
+    {
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1200.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
+        NPE m;
+        for (float kk : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f })
+        {
+            m.prepare (sr, 512, 2, 1, kk);
+            std::vector<float> fir ((std::size_t) m.firSize());
+            m.buildFir (b, 1, false, fir.data());
+            double worst = 0.0;
+            for (double f = 100.0; f < 16000.0; f *= 1.1)
+                worst = std::max (worst, std::fabs (firMagDb (fir, f, sr) - eq::EqEngine::magnitudeDbFor (b, 1, f, sr)));
+            char msg[112]; std::snprintf (msg, sizeof msg, "k=%.2f: realised |H| within 0.5 dB of target across the audible band", (double) kk);
+            test::ok (worst < 0.5, msg);
+        }
     }
 
     return test::report();
