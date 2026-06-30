@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for per-band stereo width (MultibandProcessor<StereoWidth>). The two contracts that
-// matter (DSP council): (1) all bands neutral → the splitter's allpass reconstruction (sample-wise null);
+// matter: (1) all bands neutral → the splitter's allpass reconstruction (sample-wise null);
 // (2) the GLOBAL mono-fold invariant survives ANY per-band widths — ½(L+R) == allpass(½(Lin+Rin)) because
 // each band's Mid is untouched. Plus: a per-band width is frequency-selective (mono-ing one band removes
 // only that band's side); mono is a true passthrough; no alloc.

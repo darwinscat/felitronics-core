@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the neural seam: a live model swap changes the output; the epoch GC frees a
 // retired model only AFTER the audio thread stepped past its block (the `>` boundary — never on the

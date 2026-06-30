@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -18,7 +18,7 @@ namespace felitronics::eq
 // The foundation for multiband compressor / saturator / width.
 //
 // Naive cascading of 2-way LR4 crossovers is NOT flat: the low band of crossover-1 skips crossover-2's
-// phase, so the sum combs at f1. Fix (codex + deepseek converged): pass each already-split lower band
+// phase, so the sum combs at f1. Fix: pass each already-split lower band
 // through the LR4 ALLPASS of every LATER crossover, using the identity LP4+HP4 = allpass. Then the bands
 // telescope: Σ = A1·A2·…·A(N-1)·x, |·|=1.
 //
@@ -26,7 +26,7 @@ namespace felitronics::eq
 //   Bi = H1·…·Hi·L(i+1)·A(i+2)·…    (0 < i < N-1)
 //   B(N-1) = H1·H2·…·H(N-1)         (highest band, no compensation)
 //
-// Optimisation we verified (both bros mis-sized this): that LR4 allpass is only 2ND-ORDER —
+// Optimisation we verified: that LR4 allpass is only 2ND-ORDER —
 // LP4+HP4 = (s⁴+1)/(s²+√2s+1)² = (s²−√2s+1)/(s²+√2s+1) — so each compensation is ONE `Svf` in AllPass mode
 // (NOT a 4-SVF Crossover, NOT a wrong 2nd-order cascade). Zero latency, per-channel state, RT-safe.
 template <int MaxBands = 4>

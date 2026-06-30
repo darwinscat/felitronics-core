@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -23,8 +23,8 @@ namespace felitronics::multiband
 // prepare() is given a callable that prepares each band instance (their prepare signatures differ).
 //
 // Per-band bypass + solo. A global parallel dry/wet whose DRY is the band-sum ALLPASS RECONSTRUCTION (delayed
-// to match the wet's latency) — NOT the raw input, which would comb against the allpass-phase wet (codex's
-// catch; deepseek wrongly called them identical). Bands are aligned to the max band latency via per-band
+// to match the wet's latency) — NOT the raw input, which would comb against the allpass-phase wet. Bands
+// are aligned to the max band latency via per-band
 // DelayLines so a band with lookahead doesn't desync the sum. RT-safe: prepare() allocates, process() is
 // alloc/lock/throw-free. n ≤ maxBlock.
 template <class BandProcessor, int MaxBands = 4>

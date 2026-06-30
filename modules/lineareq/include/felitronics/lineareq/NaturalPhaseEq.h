@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -27,7 +27,7 @@ namespace felitronics::lineareq
 // sharply — so the reported PDC latency is only (1−k)·L/2, FAR below linear's L/2, and transients are not
 // smeared by symmetric pre-ring.
 //
-//  • Design FFT D = 8·L masks cepstral time-aliasing on steep filters (council: codex + deepseek).
+//  • Design FFT D = 8·L masks cepstral time-aliasing on steep filters.
 //  • The mixed-phase impulse is shifted causal by `bulkDelay = (1−k)·L/2` (that shift IS the latency) and
 //    truncated to L taps with a TAIL taper (NO centred window — that would gut the front-loaded impulse).
 //  • A flat EQ renders a unit impulse at `bulkDelay` ⇒ exact unity-gain pass-through at the reported latency.

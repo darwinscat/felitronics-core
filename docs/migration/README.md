@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. -->
+<!-- Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. -->
 
 # Migration playbook — repointing the products onto felitronics-core
 
@@ -33,7 +33,7 @@ changes.** felitronics-core is JUCE-free, so this fetch never pulls JUCE.
    → `orbitcab/docs/migration/`.
 4. **T6 — FFT-seam + zero-latency partitioned-convolution spike** (the keystone, core-side). Must also
    prove an offline IR resampler (≳60 dB SNR), variable host block size, and RT-safe partition GC — not
-   just a raw FFT. See `../dsp-shared-dsp-review.md` §4. → `orbitcab/docs/migration/` (scope) + a core spike.
+   just a raw FFT. → `orbitcab/docs/migration/` (scope) + a core spike.
 5. **T7 — OrbitCab cab-path de-JUCE** (`cab::Convolver`/`IRSlot`/`CabEngine` off `juce::dsp`), gated on T6.
 
 ## Acceptance (every task)

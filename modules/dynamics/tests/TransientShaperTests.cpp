@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the TransientShaper: a STEADY tone is left alone (the fast/slow detectors share a
 // type so norm≈0 in steady state — different crest factors would falsely fire); attack shaping boosts/cuts
@@ -170,7 +170,7 @@ int main()
         test::ok (std::fabs (ratio (0.9) - 1.0) <= std::fabs (ratio (0.0) - 1.0) + 1e-6, "threshold 0.9 leaves the steady tone at least as unshaped as 0.0");
     }
 
-    // --- sample-wise null against a hand-recomputed deadzone+smooth+mix pipeline (deepseek's top check) ---
+    // --- sample-wise null against a hand-recomputed deadzone+smooth+mix pipeline (the key check) ---
     test::group ("TransientShaper null vs hand-computed gain");
     {
         TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = 9.0; p.sustainDb = -6.0; p.threshold = 0.2; p.gainSmoothMs = 1.0; p.mix = 0.8; ts.setParams (p);

@@ -3,6 +3,10 @@ project(felitronics_core VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
+if(MSVC)
+    add_compile_options(/utf-8)         # sources use UTF-8 in comments (—, φ, ≈, ·) — MSVC needs this flag
+endif()
+
 # ----------------------------------------------------------------------------
 # felitronics-core — shared, framework-agnostic, JUCE-free, real-time-safe C++ DSP core.
 #

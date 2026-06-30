@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the Dynamic EQ band: a 0 dB band below threshold is a passthrough; cut-when-loud
 // (de-ess) attenuates a loud in-band tone; boost-when-quiet lifts a quiet in-band tone; an off-band tone is
@@ -118,7 +118,7 @@ int main()
         test::ok (md == 0.0, "identical L/R in → identical L/R out (linked detector)");
     }
 
-    // --- control-rate gain update is artifact-free (the consilium's top concern) ---
+    // --- control-rate gain update is artifact-free (the top concern) ---
     test::group ("DynamicEqBand control-rate K artifact check");
     {
         auto run = [&] (int K)

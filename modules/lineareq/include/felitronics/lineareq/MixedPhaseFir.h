@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -21,7 +21,7 @@ namespace felitronics::lineareq
 //   0<k<1  → "Natural phase": most of linear's flat phase, but the impulse is shifted forward so pre-ringing
 //            and bulk delay drop sharply. The mastering middle ground.
 //
-// METHOD — cepstral, exact (DSP council: codex + deepseek, both verified). The cepstrum is the log-spectrum
+// METHOD — cepstral, exact. The cepstrum is the log-spectrum
 // domain, so a LINEAR blend of cepstra is a linear blend of (log|H| + jφ): the magnitude term log|H| is the
 // same in both endpoints, so it is preserved EXACTLY, while the phase term blends 0 → φ_min linearly. Steps:
 //   1. logM = ln(max(|H|, floor))               (zero-phase spectrum)         → inverse FFT → real cepstrum c

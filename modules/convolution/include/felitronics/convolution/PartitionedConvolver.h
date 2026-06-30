@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -27,7 +27,7 @@ namespace felitronics::convolution
 // SPIKE SCOPE: uniform partitioning (not Gardner non-uniform) — adequate for short IRs (guitar cab /
 // short reverb) on desktop, which is the funded target. Long-IR efficiency (growing tail partitions) is
 // a later production optimization behind this same API. A live IR swap here is INSTANTANEOUS; a
-// click-free production swap needs a crossfade (run old+new over ~10-20 ms) — see dsp-shared-dsp-review §4.
+// click-free production swap needs a crossfade (run old+new over ~10-20 ms).
 template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft>
 class PartitionedConvolver
 {

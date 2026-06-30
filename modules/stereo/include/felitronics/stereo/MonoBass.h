@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -16,8 +16,8 @@ namespace felitronics::stereo
 // cutoff (vinyl/LP lacquer cutting — out-of-phase lows cause vertical stylus excursion — and general
 // mastering tightening). Zero added latency, minimum-phase.
 //
-// Design (DSP council, codex's topology — verified by math + the self-tests; deepseek's allpass-subtraction
-// variant was checked and REJECTED: AP4−LP4 has magnitude 1.5 at the cutoff, i.e. it boosts, not rejects).
+// Design — verified by math + the self-tests. An allpass-subtraction variant was checked and REJECTED:
+// AP4−LP4 has magnitude 1.5 at the cutoff, i.e. it boosts, not rejects.
 // Operate ONLY on the Side of a Mid/Side split, so the Mid (the mono content you keep) passes UNFILTERED —
 // no transient smear on the kept bass; only the low-frequency Side (stereo) energy is removed. A full L/R
 // crossover would needlessly filter the mono bass too.

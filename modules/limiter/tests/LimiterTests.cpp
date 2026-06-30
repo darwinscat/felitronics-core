@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the true-peak limiter: the GUARANTEE (output true-peak, measured by an
 // INDEPENDENT oversampler, stays at/below the ceiling even when the input's inter-sample peaks exceed

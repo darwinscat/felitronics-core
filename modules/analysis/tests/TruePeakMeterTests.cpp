@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the True-Peak meter. The decisive one is the canonical BS.1770 inter-sample case:
 // a full-scale fs/4 sine sampled so the grid lands at ±0.707 (sample peak −3.01 dBFS) while the real peak is

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -41,7 +41,7 @@ struct IrResampleConfig
 // Offline windowed-sinc (Kaiser) IR resampler. MESSAGE-THREAD ONLY (double math, allocates) — for
 // rate-converting an impulse response to the host SR on load. This is the >=60 dB-class resampler the
 // convolution path needs; the Catmull-Rom cab::StreamResampler (for NAM rate-match) is too low-SNR for
-// IRs (see dsp-shared-dsp-review §4). DC gain is normalized to 1.
+// IRs. DC gain is normalized to 1.
 inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, double outSr,
                                       IrResampleConfig cfg = {})
 {

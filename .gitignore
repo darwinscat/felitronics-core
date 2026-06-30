@@ -33,3 +33,29 @@ CLAUDE.md
 
 # Stray logs
 *.log
+
+# --- build / tooling (pre-publication hygiene) ---
+compile_commands.json
+CMakeUserPresets.json
+/Testing/
+CTestTestfile.cmake
+*.dSYM/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+.vs/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.swp
+*~
+.env
+.env.*
+
+# test audio — never commit songs / IRs / raw dumps
+*.wav
+*.aiff
+*.flac
+*.mp3
+*.raw

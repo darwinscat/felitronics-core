@@ -1,12 +1,12 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. -->
+<!-- Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. -->
 
 # Convolution — core API ready + the verified JUCE spec (OrbitCab cab-path de-JUCE)
 
 The core convolution path is built + tested (JUCE-free, all green). This doc is the **authoritative spec**
 for replacing OrbitCab's `juce::dsp::Convolution` without changing the sound. The JUCE behaviours below were
 **read out of the vendored source** (`build/_deps/juce-src/.../juce_Convolution.cpp`) and must be replicated
-byte-for-byte by the adapter — a panel (codex) found them; they were then verified line-by-line.
+byte-for-byte by the adapter — they were verified line-by-line against that source.
 
 ## What core provides (`felitronics::convolution` / `felitronics::core::fft`, all green)
 

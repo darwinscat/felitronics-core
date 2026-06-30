@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the reusable crossover primitives: the Svf AllPass mode, the LR4 `Crossover2`,
 // and the `MultibandSplitter` with allpass-compensated FLAT reconstruction. The headline check proves the
@@ -120,7 +120,7 @@ int main()
         test::ok (g_allocs.load() == before, "splitSample() did not allocate");
     }
 
-    // --- Svf AllPass |H|≈1 across Q / freq / rate (deepseek worried m1=-2k was wrong off-Butterworth) ---
+    // --- Svf AllPass |H|≈1 across Q / freq / rate (confirms m1=-2k is correct off-Butterworth) ---
     test::group ("Svf AllPass |H|=1 across Q / freq / rate");
     {
         double worst = 0.0;

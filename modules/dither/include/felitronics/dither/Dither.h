@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -15,8 +15,8 @@ namespace felitronics::dither
 //==============================================================================
 // felitronics::dither::Dither — the LAST stage before bit-depth reduction on export (float → 16/20/24-bit):
 // TPDF dither (eliminates quantization-noise modulation/distortion) + optional error-feedback noise shaping
-// (pushes the residual quantization noise out of the ear's sensitive band). DSP council (codex + deepseek);
-// the structure was cross-checked against the literature and the sign/curve confirmed by the self-tests.
+// (pushes the residual quantization noise out of the ear's sensitive band). The structure was
+// cross-checked against the literature and the sign/curve confirmed by the self-tests.
 //
 //   lsb   = 1 / 2^(bits-1)                                   (float audio in [-1, 1) → 2^bits codes)
 //   u[n]  = x[n] − Σ_k h_k · e[n−k]·lsb                       (error feedback; SUBTRACT → NTF(z) = 1 − H(z))

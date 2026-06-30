@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 # Validate felitronics-core analysis (LUFS, true-peak) against ffmpeg's ebur128 reference, on REAL songs
 # and on SYNTHETIC adversarial cases chosen to expose classic implementation bugs. ffmpeg and our tool
 # are always measured on the SAME decoded signal (mono↔stereo up-mix applies a -3 dB pan law — comparing
 # different signals is itself a trap).
 #
-# Usage: tools/validate_ffmpeg.sh [build-dir]   (run from the repo root)
+# Usage: FCORE_AUDIO=/path/to/songs tools/validate_ffmpeg.sh [build-dir]   (run from the repo root).
+# Drop any .flac/.wav into $FCORE_AUDIO for the "real songs" rows; the synthetic cases always run.
 set -u
 BUILD="${1:-build}"
 M="$BUILD/tools/fcore_measure"
-AUDIO="/Users/oleh/Downloads/AUDIO"
+AUDIO="${FCORE_AUDIO:-./audio}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 command -v ffmpeg >/dev/null || { echo "no ffmpeg"; exit 1; }
 [ -x "$M" ] || { echo "build $M first"; exit 1; }
@@ -30,11 +32,11 @@ check() { # name src sr ch
   printf "%-34s | %7s /%7s /%6s | %7s /%7s /%6s\n" "$name" "$rI" "$mI" "$(d "$mI" "$rI")" "$rT" "$mT" "$(d "$mT" "$rT")"
 }
 
-echo "### REAL SONGS"
-for f in cat-in-space-2020_DEAR42052542 cats-evolution-DEAR42037456 cat-in-space-2025_QT6G32570545; do
-  src="$AUDIO/$f.flac"; [ -f "$src" ] || continue
+echo "### REAL SONGS  (drop .flac/.wav into \$FCORE_AUDIO; skipped if none)"
+shopt -s nullglob
+for src in "$AUDIO"/*.flac "$AUDIO"/*.wav; do
   read sr ch < <(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,channels -of csv=p=0 "$src" | tr ',' ' ')
-  check "$f" "$src" "$sr" "$ch"
+  check "$(basename "$src")" "$src" "$sr" "$ch"
 done
 
 echo "### SYNTHETIC adversarial (expose: ISP, gating, coeff-recompute)"

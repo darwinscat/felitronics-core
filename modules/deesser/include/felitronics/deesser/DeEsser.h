@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -20,11 +20,11 @@ namespace felitronics::deesser
 {
 
 //==============================================================================
-// felitronics::deesser::DeEsser — tame sibilance. Two topologies (DSP council, codex + deepseek):
+// felitronics::deesser::DeEsser — tame sibilance. Two topologies:
 //   DynamicEq  (default) — a CutWhenLoud Bell at fc (delegates to dynamiceq::DynamicEqBand). SURGICAL: only
-//              the sibilant band moves, the rest of the top stays — mastering-safe (codex).
+//              the sibilant band moves, the rest of the top stays — mastering-safe.
 //   SplitBand            — an LR4 eq::Crossover2 at fc; the high band is DUCKED (the low band untouched);
-//              the allpass-flat sum makes it transparent when idle (deepseek). The classic clean de-esser,
+//              the allpass-flat sum makes it transparent when idle. The classic clean de-esser,
 //              but ducking the WHOLE band can dull air on a full mix.
 //
 // Detection is a BANDPASS sidechain at fc (NOT a high-pass) so loud non-sibilant HF — cymbals, air — doesn't

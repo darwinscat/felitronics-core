@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
-// JUCE-free self-tests for the linear-phase EQ. The decisive properties (DSP council):
+// JUCE-free self-tests for the linear-phase EQ. The decisive properties:
 //   (1) a FLAT EQ renders an EXACT unit impulse at the centre tap N/2 — proves the build needs no run-time
 //       gain hack (the 1/N inverse + the centre-1.0 Blackman-Harris suffice); (2) the FIR is symmetric →
 //       exactly linear phase; (3) the realised magnitude matches the Eq bank's target (within window ripple);
@@ -128,7 +128,7 @@ int main()
         test::ok (e.latencySamples() == N / 2, "latencySamples() == N/2");
     }
 
-    // --- (7) MONO path: 1-channel session → the Mid IR only, no crash, correct gain (refutes a review worry) ---
+    // --- (7) MONO path: 1-channel session → the Mid IR only, no crash, correct gain ---
     test::group ("LinearPhaseEq mono path");
     {
         LPE e; e.prepare (sr, 512, 1, Q);

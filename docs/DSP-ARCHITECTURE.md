@@ -1,10 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-<!-- Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. -->
+<!-- Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. -->
 
 # felitronics-core — DSP architecture (living ADR)
 
-**Status:** draft / in progress · **Owner:** Darwin's Cat (Felitronics line) · **Started:** 2026-06 ·
-**Reviewed:** 2026-06-29 (panel — see §9).
+**Status:** draft / in progress · **Owner:** Darwin's Cat (Felitronics line) · **Started:** 2026-06.
 
 `felitronics-core` is a **shared, framework-agnostic, JUCE-free DSP core** for the whole product
 family. One set of battle-tested, real-time-safe DSP primitives that every product builds on:
@@ -47,7 +46,7 @@ These are what make the core actually portable. Violating one silently breaks a 
 **Target tiers (each module declares which it supports).** Generic "WASM + embedded" is too coarse —
 name the profiles. Per the **platform priority (§1)**, **CI gates `desktop` (primary) today, with
 `wasm-audio` aspirational; both embedded tiers stay documented-but-not-gated** until a hardware product
-exists (3rd review: don't pay embedded's CI tax early).
+exists (no point paying embedded's CI tax early).
 - `desktop` — heap in `prepare`, SIMD, JUCE only in adapters.
 - `wasm-audio` — AudioWorklet-safe; no blocking / filesystem in the audio path; bounded memory growth;
   **no FP-control register → relies on software denormal flushing (law 8)**.
@@ -85,7 +84,7 @@ exists (3rd review: don't pay embedded's CI tax early).
 7. **C++ subset that all toolchains accept** (C++20 desktop; keep an eye on what Emscripten and the
    embedded toolchain support).
 8. **Denormals: every feedback kernel flushes in SOFTWARE; hardware FTZ is a desktop optimization,
-   never a correctness crutch.** *(Fixed by the 3rd review — agy/Gemini found the hole: WASM and many
+   never a correctness crutch.** *(The subtle hole: WASM and many
    embedded ARMs expose no FP-control register, so an "adapter sets FTZ, core assumes it" rule silently
    fails on the `wasm-audio` tier → feedback filters decay into subnormals on silence → 10–100× CPU
    spike.)* `teq` already does the right thing: `Biquad/Svf::flushDenormals()` zaps `|state| < 1e-15f`
@@ -98,8 +97,8 @@ exists (3rd review: don't pay embedded's CI tax early).
 **These laws are CI-enforced for the funded tiers, not aspirational.** From day one: a
 no-allocation-in-`process()` test, `-fno-exceptions` / `-fno-rtti` build configs, and an **Emscripten**
 (`wasm-audio`) build — so a thread / alloc / dep / denormal creep fails the build immediately. An
-**arm-none-eabi** job is documented but **not gated** until an embedded product funds it (3rd review:
-avoid embedded-grade CI scope creep). Third-party deps (Eigen, kissfft, pffft) must be verified to
+**arm-none-eabi** job is documented but **not gated** until an embedded product funds it (avoid
+embedded-grade CI scope creep). Third-party deps (Eigen, kissfft, pffft) must be verified to
 build under `-fno-exceptions` (some use throwing asserts).
 
 ---
@@ -107,7 +106,7 @@ build under `-fno-exceptions` (some use throwing asserts).
 ## 3. Module layout
 
 One umbrella, **independent modules**, each separately includable so a consumer pulls only what it
-needs (an EQ plugin must NOT drag in the neural runtime). **Hybrid build model (panel decision):** the
+needs (an EQ plugin must NOT drag in the neural runtime). **Hybrid build model:** the
 *light* modules (`core`, `eq`, `dynamics`, simple analysis) are header-only `INTERFACE` targets; the
 *heavy / platform-specific* ones (`convolution`, `neural`, the FFT backends, SIMD kernels) are
 **compiled `STATIC`/`OBJECT` targets with narrow public headers**, so intrinsics, denormal handling,
@@ -177,7 +176,7 @@ lowest-common-denominator that kills desktop performance).
 
 1. **Establish conventions + the `core` API contract** (this doc): `prepare()` / `process()`, block
    views, the size constants, error returns, `noexcept` audio APIs, and the no-alloc test harness.
-2. **FFT-seam spike FIRST** *(panel decision — the keystone)*: define `core/Fft` (the plan object) and
+2. **FFT-seam spike FIRST** *(the keystone)*: define `core/Fft` (the plan object) and
    prove a **JUCE-free zero-latency partitioned convolution** against synthetic IRs + one real backend,
    *before* building the core around the seam. This de-risks `convolution` / `analysis` / `limiter` and
    OrbitCab's de-JUCE-ing — the single highest architectural risk.
@@ -278,7 +277,7 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
   makeup `sqrt(dryMS/mixMS)`. JUCE-free math.
 - **Spectrum tap:** `cab::SpectrumTap` (`SpectrumTap.h`) — the same struct as the doc's `analysis`
   SpectrumTap, but a **JUCE-coupled diverged copy** (`juce::FloatVectorOperations`, `SpectrumTap.h:6,37`);
-  the JUCE-free `teq::SpectrumTap` twin is the consolidation base (see §7.3 + the shared-DSP review).
+  the JUCE-free `teq::SpectrumTap` twin is the consolidation base (see §7.3).
 - **NOT present today:** dedicated noise gate, drive / boost / clipper / waveshaper, oversampling.
   ("boost" is a NAM *capture* variant, not DSP; "gate" in the code = bypass / mute / auto-level gating.)
 
@@ -289,7 +288,7 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
     `juce::FloatVectorOperations`); the **`teq::SpectrumTap` copy IS** (`std::copy` + `reset()` +
     `tryPull()`). They are **diverged copies** of one struct → consolidate to the `teq::` shape as
     `felitronics::analysis::SpectrumTap`; OrbitCab swaps `FloatVectorOperations`→`std::copy` and
-    `CabEngine::pullSpectrum` (`CabEngine.cpp:323`) → `tap.tryPull()`. (See the shared-DSP review.)
+    `CabEngine::pullSpectrum` (`CabEngine.cpp:323`) → `tap.tryPull()`.
   - `neural` ← the NAM/Eigen runtime — **isolated behind the inference seam** so EQ/comp products never
     drag it in. (Runtime is NAM, not RTNeural; model loading stays in the adapter, see §8.)
   - `convolution` ← the cab IR conv — but only **after** a JUCE-free FFT impl exists behind the seam
@@ -330,7 +329,7 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
   `felitronics::convolution` requires real de-JUCE-ing: a JUCE-free FFT behind the seam, replacing the
   JUCE SVF (teq's Cytomic SVF is the natural swap), and dropping `juce::AudioBuffer`/`SmoothedValue`/
   `FloatVectorOperations` for `core` primitives. **This is the guitar plugin's main migration cost — size
-  it explicitly.** (This is exactly why the panel put the FFT-seam spike first, §6.)
+  it explicitly.** (This is exactly why the FFT-seam spike comes first, §6.)
 - **Neural-on-embedded conflicts with "bare-MCU friendly."** NAM-on-Eigen will not fit a small MCU →
   the inference seam must allow a *different backend per build* (not a runtime swap of one model), §8.
 
@@ -344,22 +343,22 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
 
 ## 8. Open decisions
 
-- **RESOLVED (panel): build model = hybrid** — light modules header-only `INTERFACE`, heavy modules
+- **RESOLVED: build model = hybrid** — light modules header-only `INTERFACE`, heavy modules
   compiled `STATIC`/`OBJECT`. §3, §5.
-- **RESOLVED (panel): the FFT-seam + zero-latency convolution spike goes FIRST**, before dynamics. §6.
+- **RESOLVED: the FFT-seam + zero-latency convolution spike goes FIRST**, before dynamics. §6.
   **DONE (2026-06-29) — landed + green:** `felitronics::core::fft` (compile-time seam + a scalar radix-2
   reference backend), `felitronics::convolution::PartitionedConvolver` (zero-latency direct-head +
   uniform-partitioned overlap-save tail; verified == direct convolution under hostile variable block
   splits + boundary impulses; no-alloc-in-`process`), and an offline Kaiser `resampleIr` (≥55 dB). 120
   checks across the FFT / convolution / resampler suites. The seam is a **compile-time backend with an
-  OPAQUE spectrum + a backend `spectralMultiplyAdd`** (so pffft/vDSP never pay an O(N) repack — the
-  Gemini fix); real backends (pffft/kissfft/juce::dsp::FFT) plug in later. Production still needs a
+  OPAQUE spectrum + a backend `spectralMultiplyAdd`** (so pffft/vDSP never pay an O(N) repack);
+  real backends (pffft/kissfft/juce::dsp::FFT) plug in later. Production still needs a
   crossfade on live IR swap + Gardner non-uniform partitions for long IRs (both noted, not spike scope).
 - **Sample type:** add a `using Sample = float` alias + non-`float*`-locked signatures **now**; full
   templating reaches `embedded-fpu` (float). **`bare-mcu` (fixed-point) is a SEPARATE codebase** — the
   alias does NOT flip a float SVF / NAM into fixed-point (different topology / scaling / quantization);
-  don't promise it from one source (3rd review).
-- **RESOLVED (3rd review): the FFT seam is compile-time** (template / C++20 concept), **not `virtual` in
+  don't promise it from one source.
+- **RESOLVED: the FFT seam is compile-time** (template / C++20 concept), **not `virtual` in
   the convolver hot path** (a vtable kills inlining / vectorization). The plan-object contract (sizes /
   scratch / layout / normalization) is finalized in the spike. *(Nuance: the FFT runs ~once per partition
   block, not per sample, so a vtable wouldn't be catastrophic — but compile-time stays the default.)*
@@ -372,64 +371,17 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
   path uses `juce::dsp::Convolution` + the JUCE SVF, so it's *not* JUCE-free today. Choosing the FFT-seam
   engine (pffft / kissfft / CMSIS) and porting the partitioned (zero-latency) convolver off `juce::dsp`
   is what unblocks both `felitronics::convolution` and the guitar plugin's WASM/embedded path → the spike.
-- **`neural` seam = inference-object level, build-time backend choice** (refined by the panel): the core
+- **`neural` seam = inference-object level, build-time backend choice**: the core
   defines a process-only inference interface; **model loading lives in the adapter** (the core accepts a
   pre-built inference object). "Per-platform" = the adapter links a different backend (NAM/Eigen on
   desktop+WASM; a lighter runtime / tiny model on hardware) — NOT a runtime swap of one model. Don't list
   RTNeural as a dependency until something actually uses it.
 
-- **RESOLVED (shared-DSP review, 2026-06-29 — `dsp-shared-dsp-review.md`): `analysis::SpectrumTap` = the
+- **RESOLVED: `analysis::SpectrumTap` = the
   `teq::` shape.** `cab::SpectrumTap` and `teq::SpectrumTap` are diverged copies of one SPSC struct;
   the `teq::` one is the strict superset (JUCE-free `std::copy` + `reset()` + `tryPull()`). OrbitCab
   adopts it; the mono-sum vs channel-0 *feeding* policy stays per-product.
-- **RESOLVED (shared-DSP review): SVF + Smoother dedup = REPLACEMENT, not code-merge.** OrbitCab's
+- **RESOLVED: SVF + Smoother dedup = REPLACEMENT, not code-merge.** OrbitCab's
   per-slot `juce::dsp::StateVariableTPTFilter` → `teq::Svf` (same Zavalishin TPT topology; HP/LP @
   12 dB/oct, Butterworth at Q≈0.707) and its `juce::SmoothedValue`s → a `core` `Smoother`. Both change
   the impl, not the math family → a **versioned-behaviour** swap (guard with a magnitude/phase golden test).
-
----
-
-## 9. Panel review — 2026-06-29
-
-Reviewed by an independent panel — **Codex**, **DeepSeek**, and (added later) **agy / Gemini 3.1 Pro**
-run from the OrbitCab session; full notes in the companion `dsp-architecture-third-review.md`. All three
-**independently converged**:
-
-> **Verdict: proceed-with-changes.** The JUCE-free, seam-based, modular core is sound; the module
-> decomposition is sensible — but several seams were so underspecified that building heavy modules
-> around them would force a costly re-architecture.
-
-> **#1 recommendation (all three, independently):** design the **FFT / convolution seam + a zero-latency
-> partitioned-convolution prototype FIRST**, before expanding the core around an unproven seam — it's
-> the keystone the heaviest modules (`convolution`, `analysis`, `limiter`) and OrbitCab's de-JUCE-ing
-> all depend on. "FFT seam ≠ `virtual fft(float*)`."
-
-Accepted-changes checklist (folded into §2–§8 above):
-
-- [x] Build model → **hybrid** (light header-only, heavy compiled). §3, §5.
-- [x] **FFT-seam spike goes first**, before dynamics. §6.
-- [x] Explicit **target tiers** (desktop / wasm-audio / embedded-fpu / bare-mcu); modules declare support. §2.
-- [x] FFT seam = **plan object** (scratch / sizes / layout / normalization); `convolution` owns its algorithm seam. §3.
-- [x] **Neural seam = inference-object**; model loading in adapter; build-time backend, not runtime swap. §3, §8.
-- [x] **Software denormal flush in every feedback kernel** (teq's `<1e-15 → 0` per block; FTZ a desktop
-      bonus only; no `-ffast-math`) + scalar↔SIMD parity tests. §2. *(corrected by the 3rd review)*
-- [x] **FFT seam = compile-time** (template/concept), not `virtual` in the hot path. §8.
-- [x] Size config beyond `kMaxChannels` (block / bands / partitions / IR) via template/policy + CMake preset; footprint reporting. §2.
-- [x] **Versioning is a contract**: SemVer + CHANGELOG + deprecation; *DSP output is versioned behaviour*; consumer-matrix + golden-audio CI. §5.
-- [x] `using Sample = float` alias + non-`float*`-locked signatures **now**. §2, §8.
-- [x] **CI-enforced laws from day one (funded tiers)**: no-alloc-in-`process`, `-fno-exceptions` / `-fno-rtti`, Emscripten (`wasm-audio`); arm-none-eabi documented-not-gated. §2.
-- [x] `double` carve-outs (coeff recompute on audio thread; meter/LUFS/true-peak accumulators). §2, §8.
-
-### Third reviewer — agy / Gemini 3.1 Pro (2026-06-29, via the OrbitCab session)
-Converged with Codex + DeepSeek on the sound calls (FFT-first, neural = build-time backend,
-versioning-as-behaviour, hybrid build) and found **one real correctness hole + two scope refinements**,
-all **verified against the actual code** (see `dsp-architecture-third-review.md`):
-- **Law 8 was wrong for WASM (now fixed, §2):** WASM / embedded ARM expose no FP-control register, so
-  "adapter sets FTZ, core assumes it" silently fails. `teq` already SOFTWARE-flushes (`<1e-15 → 0` per
-  block) so `eq` is WASM-safe; the rule is now "every feedback kernel software-flushes" — the new
-  `dynamics` followers must too. `-ffast-math` rejected (breaks the NaN/inf the tests assert).
-- **`bare-mcu` fixed-point = a separate codebase**, not a `using Sample` flag-flip (§2, §8).
-- **Tiers CI-gated only when a product funds them** (drop `bare-mcu` / arm-none-eabi from CI for now) (§2).
-- **FFT seam resolved to compile-time** (template / concept), not `virtual` in the hot path (§8).
-
-Still to do: resolve the remaining §8 open decisions during the FFT-seam spike.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the Dither. The properties that matter for a mastering dither:
 //   (1) TPDF dither LINEARISES — a sub-LSB DC survives as the time-average of the quantized output (without
@@ -167,7 +167,7 @@ int main()
     }
 
     // --- (9) NO NOISE MODULATION: error variance is independent of signal level — the property the
-    //     "shape the dither too" topology could have broken (the consilium's top adversarial concern) ---
+    //     "shape the dither too" topology could have broken (the top adversarial concern) ---
     test::group ("Dither has no noise modulation");
     {
         auto errVar = [&] (NS shaping, double dc) {

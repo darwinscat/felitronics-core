@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the multiband engine: with no compression the bands recombine to the splitter's
 // flat (allpass) reconstruction; a per-band compressor lowers ONLY its band's level + reports gain
@@ -123,7 +123,7 @@ int main()
         test::ok (g_allocs.load() == before, "process() did not allocate (4-band stereo, lookahead)");
     }
 
-    // --- solo overrides the parallel dry/wet (the review bug: at mix<1 the dry leaked non-solo bands) ---
+    // --- solo overrides the parallel dry/wet (the bug it guards: at mix<1 the dry leaked non-solo bands) ---
     test::group ("MultibandCompressor solo overrides dry/wet mix");
     {
         multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);

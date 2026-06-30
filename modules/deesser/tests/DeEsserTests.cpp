@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the De-esser: both topologies attenuate a loud sibilant-band tone; an off-band
 // (low) tone is untouched; the split-band sum is transparent (allpass reconstruction) when idle; `listen`
@@ -122,7 +122,7 @@ int main()
         test::ok (md == 0.0, "identical L/R in → identical L/R out (linked detector)");
     }
 
-    // --- toggling mode/listen mid-stream stays clean (the consilium's top worry: stale-path state) ---
+    // --- toggling mode/listen mid-stream stays clean (the top worry here: stale-path state) ---
     test::group ("DeEsser mode/listen toggle continuity");
     {
         DE d; d.prepare (sr, 512, 1); DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = -30.0; p.ratio = 4.0; d.setParams (p);

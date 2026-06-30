@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for felitronics::dynamics (EnvelopeFollower + GainComputer) — measured
 // behaviour vs the analytic envelope / compressor-expander law.
@@ -115,8 +115,8 @@ int main()
     }
 
     // Symmetric soft knee is INTENTIONAL (centred on threshold, smears ±knee/2) — pin the textbook
-    // shape so a future "fix" can't silently make it one-sided. (A reviewer flagged the inactive-side
-    // tail as a bug; it is standard soft-knee behaviour — see docs/dsp-shared-dsp-review.md §6.)
+    // shape so a future "fix" can't silently make it one-sided. (The inactive-side tail can look like a
+    // bug, but it is standard soft-knee behaviour.)
     test::group ("GainComputer: symmetric soft knee (intentional)");
     {
         dynamics::GainComputer gc; gc.setMode (dynamics::Mode::UpCompress);

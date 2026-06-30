@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -14,8 +14,8 @@ namespace felitronics::saturation
 // |x| <= 1 maps to |y| <= 1: the curve rounds the top + adds harmonics WITHOUT changing the full-scale
 // level (the right shape for a mastering "glue" saturator that sits before the make-loud gain).
 //
-// `drive` (k) sets how much curve: k → 0 is ~linear (no effect), larger k = more harmonics. Curves
-// (DSP-council pick): Tanh (odd, smooth/dark — the safe default), Atan (odd, a touch brighter/harder
+// `drive` (k) sets how much curve: k → 0 is ~linear (no effect), larger k = more harmonics. Curves:
+// Tanh (odd, smooth/dark — the safe default), Atan (odd, a touch brighter/harder
 // knee), Cubic (mostly 3rd, a cheap soft clipper), Asym (tube/triode — `bias` adds EVEN harmonics):
 //   Tanh   y = tanh(kx)/tanh(k)
 //   Atan   y = atan(kx)/atan(k)

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: ci
+
+on:
+  push:
+    branches: [ main, "feat/**" ]
+  pull_request:
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (JUCE-free; no external deps)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

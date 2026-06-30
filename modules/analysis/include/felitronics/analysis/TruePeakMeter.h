@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -28,8 +28,7 @@ namespace detail
 // felitronics::analysis::TruePeakMeter — inter-sample (true) peak per ITU-R BS.1770-4 / EBU R128 (dBTP):
 // oversample, then take the max of the reconstructed waveform — the inter-sample peaks a raw sample meter
 // misses. A READ-ONLY sink (it never touches the audio), so it adds ZERO latency; the interpolation FIR's
-// group delay only postpones *discovery* of a peak, which is irrelevant to a running max (DSP council:
-// codex + deepseek).
+// group delay only postpones *discovery* of a peak, which is irrelevant to a running max.
 //
 // The interpolator is a Kaiser-windowed-sinc polyphase FIR (factor × tapsPerPhase), each phase normalised to
 // unity DC so a constant reads exactly and the sample grid is reproduced — the meter therefore can never

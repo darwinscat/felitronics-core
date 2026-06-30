@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -11,7 +11,7 @@ namespace felitronics::multiband
 
 //==============================================================================
 // felitronics::multiband::MultibandWidth — per-band stereo width: a stereo::StereoWidth on every LR4 band of
-// the splitter (low-narrow / high-wide is the mastering norm). PURE COMPOSITION — zero new DSP (DSP council).
+// the splitter (low-narrow / high-wide is the mastering norm). PURE COMPOSITION — zero new DSP.
 //
 // Because StereoWidth touches ONLY the Side (the Mid passes untouched at unity output gain), the GLOBAL
 // mono-fold invariant survives ANY per-band widening: ½(L+R) folds to the allpass-reconstructed input Mid,

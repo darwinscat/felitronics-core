@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // fcore_measure — a tiny streaming measurement CLI for validating felitronics-core's analysis against a
 // reference (ffmpeg). Reads interleaved 32-bit-float little-endian PCM (as ffmpeg emits with `-f f32le`)

@@ -2,69 +2,50 @@
 
 # felitronics-core
 
-A shared, **framework-agnostic, JUCE-free, real-time-safe** C++20 DSP core for the Darwin's Cat /
-Felitronics product family — EQ, dynamics, convolution, limiting, analysis, neural amp, … — built as
-**independent modules** that any product composes: plugins (TabbyEQ, a future compressor/limiter),
-the guitar amp plugin (OrbitCab), and future **WASM** and **embedded (hardware)** builds.
+**JUCE-free, real-time-safe, header-only C++20 DSP core** for the Darwin's Cat audio plugins
+(TabbyEQ, OrbitCab, …). A set of independent `process()`-RT-safe modules — each its own namespace +
+CMake target, each with framework-free self-tests. **No external dependencies: pure C++20 standard library.**
 
-The core stays pure C++ so it compiles everywhere; host frameworks (JUCE, a WASM shell, firmware)
-live only in thin per-platform *adapters*.
-
-➡ **Start here: [`docs/DSP-ARCHITECTURE.md`](docs/DSP-ARCHITECTURE.md)** — the living architecture /
-ADR. Companions: [`docs/dsp-architecture-third-review.md`](docs/dsp-architecture-third-review.md) (panel
-review) and [`docs/dsp-shared-dsp-review.md`](docs/dsp-shared-dsp-review.md) (cross-plugin shared-DSP +
-de-JUCE plan).
+[![ci](https://github.com/darwinscat/felitronics-core/actions/workflows/ci.yml/badge.svg)](https://github.com/darwinscat/felitronics-core/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](#)
+[![header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](#)
+[![deps: none](https://img.shields.io/badge/deps-none%20(std%20only)-brightgreen.svg)](#)
 
 ## Modules
 
-| Module | Namespace | Target | What | Status |
-|---|---|---|---|---|
-| `core` | `felitronics::core` | `felitronics::core` | `Sample` alias, size config (SSOT), `Math`, `Smoother` (exp) + `LinearSmoother` (JUCE-compatible), software denormal flush + `ScopedFlushToZero`, `DelayLine`, the **`Fft` seam** (+ scalar backend) | header-only |
-| `analysis` | `felitronics::analysis` | `felitronics::analysis` | `SpectrumTap` (SPSC) + `LoudnessMeter` (BS.1770 LUFS M/S/I + **LRA**) + `TruePeakMeter` (dBTP, BS.1770-4) + `CorrelationMeter` + `KWeightingFilter` | header-only |
-| `dynamics` | `felitronics::dynamics` | `felitronics::dynamics` | `EnvelopeFollower` + `GainComputer` + `ChannelLinker` + `GainReductionFollower` + a broadband `Compressor` + `TransientShaper` | header-only |
-| `eq` | `felitronics::eq` | `felitronics::eq` (+ `teq::core` compat) | matched biquads (Vicanek) + Cytomic SVF + `EqBand` + `EqEngine` + `Crossover2` (LR4) + `MultibandSplitter` — migrated from TabbyEQ's `teq/` | header-only |
-| `convolution` | `felitronics::convolution` | `felitronics::convolution` | zero-latency partitioned FFT convolver + multi-channel click-free `ConvolutionEngine` (lockstep stereo IR swap) + offline Kaiser IR resampler | header-only |
-| `oversampling` | `felitronics::oversampling` | `felitronics::oversampling` | polyphase windowed-sinc FIR up/down sampler (true-peak / alias-free) | header-only |
-| `limiter` | `felitronics::limiter` | `felitronics::limiter` | brickwall **true-peak** limiter (guaranteed ceiling; oversample→limit→downsample) | header-only |
-| `neural` | `felitronics::neural` | `felitronics::neural` | process-only `Inference` seam + swap-safe `NeuralStage` (the NAM/Eigen backend + model loading live in the adapter) | header-only |
-| `saturation` | `felitronics::saturation` | `felitronics::saturation` | oversampled soft-saturation: `WaveShaper` (Tanh/Atan/Cubic/Asym) + `Saturator` | header-only |
-| `stereo` | `felitronics::stereo` | `felitronics::stereo` | `MidSide` matrix + `MonoBass` (bass mono-maker / elliptical) + `StereoWidth` (mono-fold-safe M/S width) | header-only |
-| `dynamiceq` | `felitronics::dynamiceq` | `felitronics::dynamiceq` | `DynamicEqBand` — a level-driven (cut/boost-when-loud/quiet) EQ band | header-only |
-| `deesser` | `felitronics::deesser` | `felitronics::deesser` | `DeEsser` — sibilance control, surgical dynamic-EQ · classic split-band | header-only |
-| `multiband` | `felitronics::multiband` | `felitronics::multiband` | generic `MultibandProcessor` (LR4 split → per-band → recombine) + `MultibandCompressor` + `MultibandWidth` | header-only |
-| `dither` | `felitronics::dither` | `felitronics::dither` | `Dither` — TPDF + error-feedback noise shaping (export 16/20/24-bit) | header-only |
+`core` (FFT seam · smoother · delay · denormal flush) · `eq` (Vicanek matched biquads · SVF · EQ engine ·
+crossovers) · `lineareq` (linear- & mixed-phase "Natural" FIR EQ over partitioned convolution) ·
+`convolution` (zero-latency partitioned convolver · click-free IR swap) · `dynamics` · `multiband` ·
+`dynamiceq` · `deesser` · `stereo` · `saturation` · `dither` · `oversampling` · `limiter` (true-peak) ·
+`analysis` (LUFS/LRA · dBTP true-peak · correlation) · `neural` (inference seam).
 
-Every module is JUCE-free, declares its target tiers, and ships its own JUCE-free self-tests
-(measured audio == analytic curve — the `teq` discipline) — **22 suites, 1022 checks** today.
+Each module links on its own (`felitronics::eq`, `felitronics::lineareq`, …) — pull only what you use.
+Every module ships JUCE-free self-tests (measured audio == analytic truth).
 
 ## Build & test
-
-JUCE-free, so configuring does **not** fetch JUCE:
 
 ```sh
 cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build
 ```
 
-## Consume (pinned by tag, like JUCE)
+## Consume
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(felitronics_core
-    GIT_REPOSITORY <repo-url>
+    GIT_REPOSITORY https://github.com/darwinscat/felitronics-core.git
     GIT_TAG        <pinned-tag>)
 FetchContent_MakeAvailable(felitronics_core)
 
-target_link_libraries(app PRIVATE felitronics::eq felitronics::dynamics)   # link only what you use
-# #include <felitronics/eq/EqEngine.h>     (new code)
-# #include <teq/EqEngine.h>                (transitional compat — teq:: aliases felitronics::eq)
+target_link_libraries(app PRIVATE felitronics::eq felitronics::lineareq)   # link only what you use
+```
+```cpp
+#include <felitronics/eq/EqEngine.h>
 ```
 
-> Status: **a full mastering chain is in** — `eq` is migrated out of TabbyEQ's `teq/` (with a `teq::` compat
-> shim so consumers repoint one at a time); the FFT-seam keystone landed (`core/Fft` + `convolution`); and
-> the mastering set — saturation, dynamic-EQ, de-esser, multiband (comp + width), stereo width, mono-bass,
-> dither, true-peak limiter, metered by dBTP true-peak + LUFS/LRA — is built and green. Not yet published
-> (no tag); products consume the local checkout via `SOURCE_DIR`. See [`docs/CORE-OVERVIEW.md`](docs/CORE-OVERVIEW.md).
+## License
 
-License: **AGPL-3.0-or-later** (SPDX header on every file).
+[AGPL-3.0-or-later](LICENSE) · © 2026 Darwin's Cat.

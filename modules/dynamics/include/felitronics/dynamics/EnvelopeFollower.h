@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -22,7 +22,7 @@ enum class Detector { Peak, Rms };
 //==============================================================================
 // felitronics::dynamics::EnvelopeFollower — a one-pole attack/release follower on a mono sidechain
 // probe. Pure signal-in → envelope-out; no EQ/param/GUI knowledge (the dynamic-EQ composition lives in
-// the product). This is exactly the "unguarded feedback kernel" the 3rd review flagged for Law 8 — so
+// the product). This is exactly the "unguarded feedback kernel" that is a known risk for Law 8 — so
 // it `flushDenormals()` its state every block (works on every tier, no hardware FTZ needed).
 //
 // RT-safe: process() does no alloc/lock/IO/throw. One instance per band+lane in the EQ use case.

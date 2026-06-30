@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for NaturalPhaseEq — the mixed-phase ("Natural") rendering. Decisive properties:
 //   (1) a FLAT EQ renders a unit impulse at `bulkDelay` (unity pass-through at the reported latency);
@@ -108,8 +108,8 @@ int main()
         test::ok (finite, "output finite");
     }
 
-    // --- (6) STEEP filter accuracy: the kept L taps must still track a steep HP's magnitude (council:
-    //     codex — bulkDelay/L truncation is approximate; this bounds the error on a hard curve) ---
+    // --- (6) STEEP filter accuracy: the kept L taps must still track a steep HP's magnitude
+    //     (bulkDelay/L truncation is approximate; this bounds the error on a hard curve) ---
     test::group ("NaturalPhaseEq tracks a steep high-pass");
     {
         NPE hp; hp.prepare (sr, 512, 2, 2, 0.5f);                    // quality 2 → L = 8192 (headroom for ringing)

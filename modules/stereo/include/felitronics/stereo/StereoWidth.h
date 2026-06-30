@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -20,13 +20,13 @@ namespace felitronics::stereo
 //
 //   width = 0 → mono (S removed),  1 → neutral,  2 → wide (+6 dB side). Clamped to [0, 2].
 //
-// THE MONO-FOLD INVARIANT (DSP council, codex — the reason no "mono-safe" limiter is needed): the tool
+// THE MONO-FOLD INVARIANT (the reason no "mono-safe" limiter is needed): the tool
 // touches ONLY the Side, so at outputGain=1 the Mid is mathematically untouched — the mono sum ½(L'+R') = M
 // is preserved (to float rounding; the two halves round separately). Widening therefore can NEVER weaken the
 // mono fold below the source; it only changes how much of the (already-present) stereo difference survives
 // the fold. So we do NOT second-guess the engineer with a correlation-driven side limiter (that pumps and is
 // content-dependent — rejected for a mastering tool); we hard-clamp and let a host CorrelationMeter do the
-// metering. deepseek's correlation-limited "mono-safe" mode was considered and declined for this reason.
+// metering. A correlation-limited "mono-safe" mode was considered and declined for this reason.
 //
 // width/outputGain are LINEAR-smoothed (core::LinearSmoother, ~20 ms) so live automation doesn't click — a
 // width step is otherwise an instant Δwidth·S discontinuity. Linear (not exponential) so a settled value

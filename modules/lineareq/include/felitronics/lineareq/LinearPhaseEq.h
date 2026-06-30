@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -20,7 +20,7 @@ namespace felitronics::lineareq
 // composite MAGNITUDE response (eq::EqEngine::magnitudeGridFor, per Mid/Side axis) it builds a symmetric
 // zero-phase FIR and convolves: the EQ's amplitude shape, ZERO phase shift, constant group delay = N/2.
 //
-// DSP council (codex + deepseek) — built to FIX the plugin prototype it's extracted from (which stuttered
+// Built to FIX the plugin prototype it's extracted from (which stuttered
 // rebuilding a huge FIR on every node drag):
 //   • CORE owns NO thread. setBands()/buildFir() are RT-UNSAFE (FFT/IFFT/window) — the HOST calls them off
 //     the audio thread and DEBOUNCES (rebuild on drag-settle, not per move). process() is RT-safe. setBands()

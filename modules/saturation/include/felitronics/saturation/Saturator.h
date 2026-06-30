@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa. Part of felitronics-core — see LICENSE.
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 #pragma once
 
@@ -22,7 +22,7 @@ namespace felitronics::saturation
 // region (the asymmetric curve's even harmonics shift the mean), then returns to base rate and applies
 // DRIVE-COMPENSATION + a linear dry/wet + output trim.
 //
-// Gain-staging (the council's lesson — a reference tool reverted its saturator twice over this): the curve
+// Gain-staging (a reference tool reverted its saturator twice over this): the curve
 // is peak-normalised (|x|≤1 → |y|≤1), `autoComp` undoes the small-signal-gain bump so loudness doesn't jump
 // with drive, and the dry/wet blend is LINEAR (convex combination of bounded signals → peak-safe). Place it
 // BEFORE the loudness gain + final limiter.
