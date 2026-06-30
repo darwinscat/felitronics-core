@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: codeql
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: "27 4 * * 1"   # weekly (Mon 04:27 UTC)
+
+jobs:
+  analyze:
+    name: CodeQL (C++)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload the analysis to the Security tab
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+          # queries: security-extended   # opt-in to the broader (noisier) query suite
+
+      # C++ is compiled, so CodeQL needs a build to analyze — building the tests compiles every
+      # module header, so the whole header-only library is covered.
+      - name: Build the tests (compiles all headers)
+        run: |
+          cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON
+          cmake --build build -j
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
