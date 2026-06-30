@@ -160,11 +160,11 @@ int main()
     // --- (9) quality table + the unit-impulse property holds at a larger N too ---
     test::group ("LinearPhaseEq quality sizes");
     {
-        const int expect[4] { 4096, 16384, 65536, 131072 };
-        bool tab = true; for (int q = 0; q < 4; ++q) tab &= (LPE::firSizeForQuality (q) == expect[q]);
-        test::ok (tab && LPE::firSizeForQuality (-1) == 4096 && LPE::firSizeForQuality (99) == 131072, "quality 0..3 → {4096,16384,65536,131072}, clamped");
-        LPE e; e.prepare (sr, 512, 2, 1);                            // q=1 → N=16384
-        test::ok (e.firSize() == 16384 && e.latencySamples() == 8192, "q=1 → N=16384, latency 8192");
+        const int expect[5] { 4096, 8192, 16384, 32768, 131072 };
+        bool tab = true; for (int q = 0; q < 5; ++q) tab &= (LPE::firSizeForQuality (q) == expect[q]);
+        test::ok (tab && LPE::firSizeForQuality (-1) == 4096 && LPE::firSizeForQuality (99) == 131072, "quality 0..4 → {4096,8192,16384,32768,131072}, clamped");
+        LPE e; e.prepare (sr, 512, 2, 2);                            // q=2 → N=16384
+        test::ok (e.firSize() == 16384 && e.latencySamples() == 8192, "q=2 → N=16384, latency 8192");
         std::vector<float> fir (16385); e.buildFir (flat, 0, false, fir.data());
         double mo = 0; for (int i = 0; i <= 16384; ++i) if (i != 8192) mo = std::max (mo, (double) std::fabs (fir[(std::size_t) i]));
         test::ok (std::fabs (fir[8192] - 1.0f) < 1e-3 && mo < 1e-3, "flat → unit impulse at N/2 holds at N=16384 too");

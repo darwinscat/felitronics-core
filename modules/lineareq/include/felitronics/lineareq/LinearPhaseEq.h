@@ -40,10 +40,13 @@ namespace felitronics::lineareq
 class LinearPhaseEq
 {
 public:
-    static constexpr int kNumQuality = 4;                       // Low / High / Ultra / Offline
+    static constexpr int kNumQuality = 5;                       // Low / Medium / High / Very High / Maximum
     static int firSizeForQuality (int q) noexcept
     {
-        static constexpr int sizes[kNumQuality] = { 4096, 16384, 65536, 131072 };
+        // Power-of-two FIR lengths (our FFT is radix-2). Latency = N/2 ≈ FabFilter's linear-phase ladder
+        // — 2048 / 4096 / 8192 / 16384 / 65536 vs FabFilter's 3072 / 5120 / 9216 / 17408 / 66560 @ 44.1k:
+        // comparable, converging to equal at Maximum.
+        static constexpr int sizes[kNumQuality] = { 4096, 8192, 16384, 32768, 131072 };
         return sizes[std::clamp (q, 0, kNumQuality - 1)];
     }
 
