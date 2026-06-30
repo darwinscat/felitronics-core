@@ -97,7 +97,7 @@ int main()
         for (int i = 0; i < 512; ++i) { L[i] = 0.3f; R[i] = -0.3f; }
         const long before = g_allocs.load();
         s.process (io, 2, 512); s.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate (os=4)");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (os=4)");
     }
 
     // --- Asymmetric curve -> the DC blocker removes the offset (with a contrast where it's off) ---

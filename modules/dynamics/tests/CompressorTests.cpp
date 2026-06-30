@@ -128,7 +128,7 @@ int main()
         comp.process (ch, 2, n);
         comp.process (ch, 2, n);
         const long after = g_allocs.load();
-        test::ok (after == before, "process() performed zero heap allocations");
+        test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
 
     return test::report();

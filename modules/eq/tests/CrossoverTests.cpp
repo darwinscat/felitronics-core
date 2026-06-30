@@ -117,7 +117,7 @@ int main()
         float band[4]; mb.splitSample (0, 0.5f, band);
         const long before = g_allocs.load();
         for (int i = 0; i < 512; ++i) mb.splitSample (0, 0.1f, band);
-        test::ok (g_allocs.load() == before, "splitSample() did not allocate");
+        test::okNoAlloc (g_allocs.load() == before, "splitSample() did not allocate");
     }
 
     // --- Svf AllPass |H|≈1 across Q / freq / rate (confirms m1=-2k is correct off-Butterworth) ---

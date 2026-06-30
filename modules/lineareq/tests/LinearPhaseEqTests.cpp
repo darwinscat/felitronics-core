@@ -124,7 +124,7 @@ int main()
         e.process (io, 2, 512);
         const long before = g_allocs.load();
         e.process (io, 2, 512); e.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
         test::ok (e.latencySamples() == N / 2, "latencySamples() == N/2");
     }
 

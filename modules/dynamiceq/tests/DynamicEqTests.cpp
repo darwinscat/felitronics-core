@@ -104,7 +104,7 @@ int main()
         d.process (io, 2, 512);
         const long before = g_allocs.load();
         d.process (io, 2, 512); d.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
     // --- stereo linked: one gain, image preserved ---

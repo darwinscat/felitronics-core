@@ -19,6 +19,6 @@ jobs:
       - name: Configure (JUCE-free; no external deps)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
       - name: Build
-        run: cmake --build build -j
+        run: cmake --build build --config Release -j   # --config is required by multi-config gens (VS on Windows)
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure   # -C likewise (no-op on single-config)

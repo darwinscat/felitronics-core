@@ -84,7 +84,7 @@ int main()
         eng.process (in.data(), out.data(), 512);      // crosses the crossfade
         eng.process (in.data(), out.data(), 512);
         const long after = g_allocs.load();
-        test::ok (after == before, "process() performed zero heap allocations (even across a swap)");
+        test::okNoAlloc (after == before, "process() performed zero heap allocations (even across a swap)");
     }
 
     // --- STEREO lockstep: identical input + broadcast IR ⇒ L and R are bit-identical THROUGH a swap ---

@@ -108,7 +108,7 @@ int main()
         const long before = g_allocs.load();
         d.process (io, 2, 512);
         DP dq = p; dq.mode = Mode::DynamicEq; d.setParams (dq); d.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate (split-band + dynamic-eq)");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (split-band + dynamic-eq)");
     }
 
     // --- stereo linked: one gain, image preserved ---

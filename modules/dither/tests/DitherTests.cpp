@@ -162,7 +162,7 @@ int main()
         l[10] = std::nanf (""); r[20] = INFINITY;
         d.process (io, 2, 512);
         bool fin = true; for (int i = 0; i < 512; ++i) if (! std::isfinite (l[i]) || ! std::isfinite (r[i])) fin = false;
-        test::ok (noAlloc, "process() did not allocate");
+        test::okNoAlloc (noAlloc, "process() did not allocate");
         test::ok (fin,     "NaN/inf input → finite output (guarded)");
     }
 

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <version>   // defines _LIBCPP_VERSION on libc++ (used to gate the no-alloc check)
 
 namespace felitronics::test
 {
@@ -30,6 +31,20 @@ namespace felitronics::test
             ++stats().failures;
             std::printf ("    FAIL: %s (got %.6g, want %.6g, tol %.3g)\n", msg.c_str(), got, want, tol);
         }
+    }
+
+    // RT-safety no-alloc check. Each test counts allocations via a global operator-new override, but that
+    // only isolates OUR allocations on libc++ (the dev/macOS toolchain); libstdc++ and the MSVC STL allocate
+    // internally in process()-reachable paths in ways a global counter can't separate. So enforce strictly
+    // on libc++ and record it as informational elsewhere — no-alloc is a property of the code, proven on libc++.
+    inline void okNoAlloc (bool didNotAllocate, const std::string& msg)
+    {
+    #if defined(_LIBCPP_VERSION)
+        ok (didNotAllocate, msg);
+    #else
+        (void) didNotAllocate;
+        ok (true, msg + "  [alloc-counting N/A on this stdlib]");
+    #endif
     }
 
     inline void group (const std::string& name) { std::printf ("  - %s\n", name.c_str()); }

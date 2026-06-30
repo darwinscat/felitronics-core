@@ -109,7 +109,7 @@ int main()
         mb.process (io, 2, 512);
         const long before = g_allocs.load();
         mb.process (io, 2, 512); mb.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
     //==========================================================================
@@ -220,7 +220,7 @@ int main()
         sw.process (io, 2, 512);
         const long before = g_allocs.load();
         sw.process (io, 2, 512); sw.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
     // --- a live width step is SMOOTHED (no click) — and the mono fold stays invariant through the ramp ---

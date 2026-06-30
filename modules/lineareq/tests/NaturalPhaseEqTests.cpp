@@ -103,7 +103,7 @@ int main()
         float* mono[1] { lch.data() };
         np.process (mono, 1, 512);                                   // mono path
         const long after = g_allocs.load();
-        test::ok (after == before, "process() performed zero heap allocations (stereo + mono)");
+        test::okNoAlloc (after == before, "process() performed zero heap allocations (stereo + mono)");
         bool finite = true; for (float v : lch) finite = finite && std::isfinite (v);
         test::ok (finite, "output finite");
     }

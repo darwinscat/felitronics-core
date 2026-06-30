@@ -114,7 +114,7 @@ int main()
         mw.process (io, 2, 512);
         const long before = g_allocs.load();
         mw.process (io, 2, 512); mw.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
     // --- (6) width=2 on an isolated band doubles THAT band's side (+6 dB), per the M/S side law ---

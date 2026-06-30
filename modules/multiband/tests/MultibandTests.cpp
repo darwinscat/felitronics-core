@@ -120,7 +120,7 @@ int main()
         mc.process (io, 2, 512);
         const long before = g_allocs.load();
         mc.process (io, 2, 512); mc.process (io, 2, 512);
-        test::ok (g_allocs.load() == before, "process() did not allocate (4-band stereo, lookahead)");
+        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (4-band stereo, lookahead)");
     }
 
     // --- solo overrides the parallel dry/wet (the bug it guards: at mix<1 the dry leaked non-solo bands) ---

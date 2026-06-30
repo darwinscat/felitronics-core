@@ -88,7 +88,7 @@ int main()
         GainInference::dtors.store (0);
         const long beforeNew = g_allocs.load();
         stage.process (io, 2, 512); stage.process (io, 2, 512);
-        test::ok (g_allocs.load() == beforeNew, "process() did not allocate");
+        test::okNoAlloc (g_allocs.load() == beforeNew, "process() did not allocate");
         test::ok (GainInference::dtors.load() == 0, "process() did not delete");
     }
 

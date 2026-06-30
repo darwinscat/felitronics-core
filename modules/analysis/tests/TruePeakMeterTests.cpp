@@ -154,7 +154,7 @@ int main()
         m.process (io, 2, 512); m.process (io, 2, 512);
         const bool noAlloc = (g_allocs.load() == before);
         l[100] = std::nanf (""); r[200] = INFINITY; m.process (io, 2, 512);
-        test::ok (noAlloc, "process() did not allocate");
+        test::okNoAlloc (noAlloc, "process() did not allocate");
         test::ok (std::isfinite (m.truePeakDb()), "NaN/inf input → finite reading (guarded)");
     }
 
