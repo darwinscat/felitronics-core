@@ -2,8 +2,8 @@
 
 # felitronics-core — what's inside (quick map)
 
-JUCE-free, RT-safe, header-only C++20 DSP. **14 modules · 22 test suites · 1022 checks green** (branch
-`feat/dsp-modules`, 2026-06-29). Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
+JUCE-free, RT-safe, header-only C++20 DSP. **15 modules · 25 test suites · 1086 checks green**
+(`v0.1.0`). Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
 
 ## Foundations (building blocks)
 
@@ -14,6 +14,7 @@ JUCE-free, RT-safe, header-only C++20 DSP. **14 modules · 22 test suites · 102
 | `dynamics` | the detector/gain toolkit + compressor + transient | `EnvelopeFollower`, `GainComputer`, `Compressor`, `TransientShaper`, `ChannelLinker` |
 | `oversampling` | polyphase windowed-sinc up/down (alias-free / true-peak) | `PolyphaseOversampler` |
 | `convolution` | zero-latency partitioned IR convolver | `PartitionedConvolver`, `ConvolutionEngine` (click-free IR swap), `IrResampler` |
+| `lineareq` | linear- & mixed-phase FIR EQ over partitioned convolution | `LinearPhaseEq` (5 quality steps), `NaturalPhaseEq` + `MixedPhaseFir` (φ=k·φ_min "Natural" blend) |
 | `neural` | process-only inference seam (NAM lives in the adapter) | `Inference`, `NeuralStage` |
 
 ## Mastering chain

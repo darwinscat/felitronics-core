@@ -13,9 +13,9 @@ endif()
 # felitronics-core — shared, framework-agnostic, JUCE-free, real-time-safe C++ DSP core.
 #
 # Independent modules, each separately includable so a consumer pulls only what it needs (an EQ
-# plugin must NOT drag in the neural runtime). The LIGHT modules below are header-only INTERFACE
-# targets; the HEAVY / platform-specific ones (convolution, neural, FFT backends) land later as
-# compiled STATIC/OBJECT targets with narrow public headers. See docs/DSP-ARCHITECTURE.md.
+# plugin must NOT drag in the neural runtime). All 15 modules below are header-only INTERFACE targets
+# (convolution / neural / lineareq included); the full per-module map with key types is
+# docs/CORE-OVERVIEW.md. See docs/DSP-ARCHITECTURE.md for the design rationale.
 #
 # Module          Namespace               Target                Deps
 #   core          felitronics::core       felitronics::core     —            (Sample, sizes, Math, Smoother, flush)

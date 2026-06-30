@@ -73,8 +73,8 @@ exists (no point paying embedded's CI tax early).
    `juce::dsp::FFT`; WASM / embedded → pffft / kissfft / CMSIS-DSP. (Precedent: both plugins run the
    spectrum-analyzer `juce::dsp::FFT` *in the adapter/UI* — TabbyEQ `ui/EqCurveDisplay.h:111`, OrbitCab
    `ui/SpectrumAnalyser.h` — while the `teq::`/`cab::` cores stay FFT-free; OrbitCab also hides
-   `juce::dsp::Convolution` behind `cab::Convolver`'s raw-float seam. NB: TabbyEQ has **no** linear-phase
-   convolution yet — that is roadmap, not shipped.)
+   `juce::dsp::Convolution` behind `cab::Convolver`'s raw-float seam. NB: TabbyEQ now **ships** linear- and
+   mixed-phase EQ via `felitronics::lineareq` over `felitronics::convolution` — the `teq::` core itself stays FFT-seam-based.)
 5. **Configurable sizes.** Not just `kMaxChannels` (16 desktop → mono/stereo on hardware) but also
    `kMaxBlockSize` / `kMaxBands` / `kMaxPartitions` / `kMaxIrSamples`. Set via **template param /
    policy + a per-tier CMake preset**, not a fragile pre-include `#define`. Each module reports its
@@ -223,20 +223,20 @@ here is the *goal* state — only the adapter touches JUCE.
 - GUI spectrum FFT = `juce::dsp::FFT` (`ui/EqCurveDisplay.h:111`) — the real "FFT lives in the adapter,
   core stays clean" precedent (mirrors OrbitCab's analyzer).
 
-**3. Future core modules TabbyEQ will use.**
-- **`dynamics`** (NEW — the next feature; full design in `tabby-eq/docs/DYNAMICS.md`): core primitives
-  `EnvelopeFollower` + `GainComputer` (JUCE-free, software-flush per Law 8), developed inside `teq/`
-  first and migrated with the `eq` extraction. The **dynamic-EQ composition** (detector = a Cytomic-SVF
+**3. Core modules TabbyEQ uses (now shipped) + future.**
+- **`dynamics`** (TabbyEQ Phase 2; full design in `tabby-eq/docs/DYNAMICS.md`): core primitives
+  `EnvelopeFollower` + `GainComputer` + `Compressor` (JUCE-free, software-flush per Law 8) now live in
+  **`felitronics::dynamics`** (migrated with the `eq` extraction). The **dynamic-EQ composition** (detector = a Cytomic-SVF
   band-pass probe on the band's region; gain applied as a **matched-static × SVF gain-delta**, per M/S
   lane; GR-metering atomics for the host/UI) stays **product glue in TabbyEQ** (the §4 rule). De-esser
   = a preset on the same engine.
-- **`analysis`** ← the pre/post `SpectrumTap`s (already JUCE-free here) + a future correlation meter.
-- **`convolution` (linear-phase) — NOT IMPLEMENTED YET.** *Correction to the prior claim:* linear-phase
-  is **deferred / roadmap**, not "already implemented in the adapter" — there is **no convolution / FIR
-  / overlap-add in TabbyEQ's code** today (only the analyzer `juce::dsp::FFT`); docs list it as later
-  (`docs/ROADMAP.md:10`, `docs/MS-DUAL-MODE.md:26`). When built it rides `felitronics::convolution` on
-  the FFT seam. The dynamics×Linear interaction (dynamics is time-varying → bypassed in Linear mode,
-  `docs/DYNAMICS.md:112-117`) is a constraint for *future* features, not current behaviour.
+- **`analysis`** ← the pre/post `SpectrumTap`s + the `CorrelationMeter` (both now in `felitronics::analysis`).
+- **`convolution` + `lineareq` — SHIPPED.** TabbyEQ now offers **Linear Phase** (linear-phase FIR, 5
+  quality steps) and **Natural Phase** (mixed-phase FIR, φ=k·φ_min) via **`felitronics::lineareq`**
+  (`LinearPhaseEq` / `NaturalPhaseEq` / `MixedPhaseFir`) over **`felitronics::convolution`**'s
+  partitioned, click-free IR-swap engine (`ConvolutionEngine`) on the FFT seam — so dragging a band
+  re-swaps the IR **artifact-free**. The dynamics×FIR interaction (dynamics is time-varying → bypassed
+  in the FIR phase modes, `docs/DYNAMICS.md:112-117`) is now live behaviour, not a future constraint.
 - possibly **`limiter`** on the output (future).
 
 ### Guitar amp plugin (OrbitCab) — desktop plugin
