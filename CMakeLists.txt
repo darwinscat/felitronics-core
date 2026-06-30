@@ -5,6 +5,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at 
 
 if(MSVC)
     add_compile_options(/utf-8)         # sources use UTF-8 in comments (—, φ, ≈, ·) — MSVC needs this flag
+    add_link_options(/STACK:8388608)    # 8 MB stack (the Unix default). Tests put a ~200 KB EqEngine on the
+                                        # stack; MSVC's 1 MB default overflows → SegFault. Match Unix.
 endif()
 
 # ----------------------------------------------------------------------------
