@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# This is a header-only, std-only library with ZERO code dependencies — the only thing to keep current
+# is the CI's GitHub Actions. Dependabot watches those weekly and opens a PR when one needs bumping
+# (e.g. actions/checkout). No package-ecosystem (npm/pip/cargo/…) entry because there are no deps.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
