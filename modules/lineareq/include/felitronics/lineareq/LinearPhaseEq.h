@@ -64,11 +64,14 @@ public:
         computeWindow();
 
         int part = 64; while (part < maxBlock_) part <<= 1;     // partition ≥ maxBlock, pow2
-        // crossfade = N: a freshly-swapped convolver bank only accrues input history from the swap on, so it
-        // isn't response-correct until a full FIR (N) of samples has passed. Fading over exactly N masks that
-        // ramp-up (the new bank is weighted ≈0 while it's least valid) → the swap is BOTH click-free AND
-        // response-correct, with no post-swap settling glitch (codex). isBusy() stays true for that N.
-        if (! conv_.prepare (part, N_ + 1, N_, 2)) return false;   // 2 banks: Mid (ch0) + Side (ch1)
+        // SHORT crossfade for interactive swaps. ConvolutionEngine (design B) keeps ONE warm input history
+        // shared by two IR slots, so a swapped IR is response-correct immediately — only a short anti-click
+        // fade is needed (≥ the partition P, to cover the one-chunk pendingTail recompute). The engine
+        // derives its OWN long fade for the COLD first activation, so an EQ band drag lands in ~tens of ms,
+        // not a full FIR (the old N-long fade is what made interactive dragging lag ~seconds). isBusy() is
+        // then true only for that short window → the host's coalescing rebuild stays responsive.
+        const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // ≥ 2P and ≥ ~20 ms
+        if (! conv_.prepare (part, N_ + 1, warmXfade, 2)) return false;   // Mid IR (ch0) + Side IR (ch1)
         return true;
     }
 

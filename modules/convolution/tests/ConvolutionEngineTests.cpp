@@ -6,6 +6,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
+#include <felitronics/convolution/PartitionedConvolver.h>   // reference convolver for the null tests
 
 #include <atomic>
 #include <cmath>
@@ -148,6 +149,111 @@ int main()
         test::ok (eL < 3e-3, "L converges to IR-A response");
         test::ok (eR < 3e-3, "R converges to IR-B response");
         test::ok (lr > 1e-3, "L and R differ (true-stereo IR actually applied per channel)");
+    }
+
+    // --- DESIGN B: a WARM swap settles within the SHORT fade, not a full FIR length ---
+    // (the whole point of the shared-FDL rework: dragging a band must not lag ~seconds)
+    test::group ("ConvolutionEngine warm swap settles within the short fade (not the FIR length)");
+    {
+        const int Pw = 64, irMaxW = 2048, irLenW = 1500, warmXf = 128, nw = 2900;
+        const int coldXf = ((irMaxW - Pw + Pw - 1) / Pw) * Pw;     // = maxParts·P (the cold-prime length)
+        Lcg rw { 7 };
+        std::vector<float> iA (irLenW), iB (irLenW), xw (nw);
+        for (auto& v : iA) v = 0.05f * rw.next();
+        for (auto& v : iB) v = 0.05f * rw.next();
+        for (auto& v : xw) v = 0.5f  * rw.next();
+
+        convolution::ConvolutionEngine<> eng; eng.prepare (Pw, irMaxW, warmXf);
+        std::vector<float> yw (nw, 0.0f);
+        const int sw = coldXf + 200;                               // swap well after the shared history is warm
+        eng.setIr (iA.data(), irLenW); eng.process (xw.data(), yw.data(), sw);
+        const bool warmOk = eng.setIr (iB.data(), irLenW);
+        eng.process (xw.data() + sw, yw.data() + sw, nw - sw);
+        test::ok (warmOk, "warm swap accepted");
+
+        convolution::PartitionedConvolver<> refB; refB.prepare (Pw, irMaxW); refB.setIr (iB.data(), irLenW);
+        std::vector<float> yB (nw, 0.0f); refB.process (xw.data(), yB.data(), nw);
+        const int settled = sw + warmXf + Pw + 4;                  // just past the SHORT fade + one chunk
+        double e = 0.0; for (int i = settled; i < nw; ++i) e = std::max (e, (double) std::fabs (yw[i] - yB[i]));
+        test::ok (e < 2e-3, "matches the new IR right after the short fade — no N-length lag");
+    }
+
+    // --- DESIGN B: cold first prime is LONG; subsequent warm swaps are SHORT (isBusy timing) ---
+    test::group ("ConvolutionEngine cold prime long, warm swap short");
+    {
+        const int Pc = 64, irMaxC = 1024, irLenC = 700, warmXf = 128;
+        const int coldXf = ((irMaxC - Pc + Pc - 1) / Pc) * Pc;
+        Lcg rc { 99 };
+        std::vector<float> iA (irLenC), iB (irLenC), xc (4000);
+        for (auto& v : iA) v = 0.05f * rc.next();
+        for (auto& v : iB) v = 0.05f * rc.next();
+        for (auto& v : xc) v = 0.5f  * rc.next();
+
+        convolution::ConvolutionEngine<> eng; eng.prepare (Pc, irMaxC, warmXf);
+        std::vector<float> y (4000, 0.0f); int pos = 0;
+        auto run = [&] (int k) { eng.process (xc.data() + pos, y.data() + pos, k); pos += k; };
+        eng.setIr (iA.data(), irLenC);
+        run (warmXf + 8);   test::ok (eng.isBusy(),   "cold first prime still busy past the short-fade length");
+        run (coldXf);       test::ok (! eng.isBusy(), "cold prime finished (≈ tail length)");
+        test::ok (eng.setIr (iB.data(), irLenC), "warm swap accepted");
+        run (warmXf + Pc + 8); test::ok (! eng.isBusy(), "warm swap finished within the short fade");
+    }
+
+    // --- DESIGN B: the swap PRIMES the new slot's tail (no ≤P dip from a zeroed tail) ---
+    test::group ("ConvolutionEngine swap primes the new slot tail (no dip)");
+    {
+        const int Ps = 64, irMaxS = 400, irLenS = 200, warmXf = 128;
+        const int coldXf = ((irMaxS - Ps + Ps - 1) / Ps) * Ps;
+        std::vector<float> zA (irLenS, 0.0f);                       // IR A: silence
+        std::vector<float> dB (irLenS, 0.0f); dB[Ps] = 1.0f;        // IR B: one tail tap → delay by P (steady tail = 1 for DC in)
+        std::vector<float> ones (4000, 1.0f), y (4000, 0.0f);
+
+        convolution::ConvolutionEngine<> eng; eng.prepare (Ps, irMaxS, warmXf);
+        int pos = 0; auto run = [&] (int k) { eng.process (ones.data() + pos, y.data() + pos, k); pos += k; };
+        eng.setIr (zA.data(), irLenS); run (coldXf + 4 * Ps);       // warm the FDL with the DC input (output stays 0)
+        const int sw = pos;
+        eng.setIr (dB.data(), irLenS);                             // warm swap → short fade; B's tail must be primed to 1
+        run (warmXf + 2 * Ps);
+
+        double e = 0.0;
+        for (int m = 0; m < warmXf; ++m)
+        {
+            const float t = (float) m / (float) (warmXf - 1);
+            const float expect = t * t * (3.0f - 2.0f * t);        // smoothstep weight on B (whose primed tail = 1)
+            e = std::max (e, (double) std::fabs (y[sw + m] - expect));
+        }
+        test::ok (e < 2e-3, "blend follows smoothstep with B's tail live from sample 0 (a zeroed tail would dip ~0.5)");
+    }
+
+    // --- DESIGN B: reset() flushes history + re-arms a cold prime, but KEEPS the live IR ---
+    test::group ("ConvolutionEngine reset keeps the live IR but re-arms cold");
+    {
+        const int Pr = 64, irMaxR = 1024, irLenR = 700, warmXf = 128;
+        const int coldXf = ((irMaxR - Pr + Pr - 1) / Pr) * Pr;
+        Lcg rr3 { 5 };
+        std::vector<float> iA (irLenR), iB (irLenR), iC (irLenR), xr (4000);
+        for (auto& v : iA) v = 0.05f * rr3.next();
+        for (auto& v : iB) v = 0.05f * rr3.next();
+        for (auto& v : iC) v = 0.05f * rr3.next();
+        for (auto& v : xr) v = 0.5f  * rr3.next();
+        iA[0] = 0.70f; iB[0] = -0.40f;                              // distinct head taps → tells which IR is live
+
+        convolution::ConvolutionEngine<> eng; eng.prepare (Pr, irMaxR, warmXf);
+        std::vector<float> y (4000, 0.0f); int pos = 0;
+        auto run = [&] (int k) { eng.process (xr.data() + pos, y.data() + pos, k); pos += k; };
+        eng.setIr (iA.data(), irLenR); run (coldXf + 200);          // cold-prime A → warm
+        test::ok (eng.setIr (iB.data(), irLenR), "swap to B accepted (warm)");
+        run (warmXf + Pr + 8);
+        test::ok (! eng.isBusy(), "warm swap to B done — B is the live slot (cur_ flipped)");
+
+        eng.reset();                                                // flush history; B must stay live
+        float imp[1] { 1.0f }, oimp[1] { 0.0f };
+        eng.process (imp, oimp, 1);                                 // first post-reset sample = head[live]·δ = iB[0]
+        test::ok (std::fabs (oimp[0] - iB[0]) < 1e-6, "reset kept the live IR (B's head), did not revert to A");
+        test::ok (std::fabs (oimp[0] - iA[0]) > 1e-3, "  …and it is NOT A");
+        test::ok (eng.setIr (iC.data(), irLenR), "post-reset swap accepted");
+        run (warmXf + 8);
+        test::ok (eng.isBusy(), "post-reset swap is COLD again (busy past the short fade) → history re-armed");
     }
 
     return test::report();
