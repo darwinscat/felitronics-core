@@ -131,7 +131,7 @@ int main()
         {
             if (o == 2048) { DP q = p; q.mode = Mode::DynamicEq; d.setParams (q); }                 // toggle topology
             if (o == 4608) { DP q = p; q.mode = Mode::DynamicEq; q.listen = true; d.setParams (q); } // toggle listen
-            float* io[1] { y.data() + o }; d.process (io, 1, 512);
+            float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o));   // last block < 512 (N not a multiple)
         }
         bool bad = false; double mx = 0; for (int i = 0; i < N; ++i) { if (! std::isfinite (y[i])) bad = true; mx = std::max (mx, (double) std::fabs (y[i])); }
         test::ok (! bad && mx < 2.0, "mode/listen toggled mid-stream → no NaN, no full-scale spike");
