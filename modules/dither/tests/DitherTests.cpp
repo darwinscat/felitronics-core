@@ -107,7 +107,7 @@ int main()
     {
         DP p; p.bits = 16; p.shaping = NS::Psychoacoustic;
         D d; d.prepare (sr, 1024, 1); d.setParams (p);
-        unsigned long s = 1; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 1; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 200000; std::vector<float> y (N); for (int i = 0; i < N; ++i) y[i] = 0.95f * rng();
         double mx = 0; for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
         for (float v : y) mx = std::max (mx, (double) std::fabs (v));
@@ -142,7 +142,7 @@ int main()
         DP p; p.bits = 32;
         D d; d.prepare (sr, 1024, 1); d.setParams (p);
         const int N = 1000; std::vector<float> y (N), y0 (N);
-        unsigned long s = 7; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 7; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         for (int i = 0; i < N; ++i) { y[i] = 0.5f * rng(); y0[i] = y[i]; }
         for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (y[i] - y0[i]));
@@ -211,7 +211,7 @@ int main()
     test::group ("Dither reset determinism + seed");
     {
         DP p; p.bits = 16; p.shaping = NS::Weighted; p.seed = 12345;
-        auto run = [&] (const DP& q) { D d; d.prepare (sr, 1024, 1); d.setParams (q); std::vector<float> y (4000); unsigned long s = 3; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; }; for (int i = 0; i < 4000; ++i) y[i] = 0.2f * rng(); for (int o = 0; o < 4000; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, 4000 - o)); } return y; };
+        auto run = [&] (const DP& q) { D d; d.prepare (sr, 1024, 1); d.setParams (q); std::vector<float> y (4000); unsigned long long s = 3; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; }; for (int i = 0; i < 4000; ++i) y[i] = 0.2f * rng(); for (int o = 0; o < 4000; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, 4000 - o)); } return y; };
         const auto a = run (p), b = run (p);
         double md = 0; for (int i = 0; i < 4000; ++i) md = std::max (md, (double) std::fabs (a[i] - b[i]));
         test::ok (md == 0.0, "same seed + fresh prepare/reset → identical output (deterministic dither)");

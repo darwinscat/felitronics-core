@@ -63,7 +63,7 @@ int main()
     {
         eq::Svf ap; ap.prepare (sr, 1); ap.setParams (eq::FilterType::AllPass, 1234.0, kQ, 0.0);
         eq::Crossover2 xo; xo.prepare (sr, 1); xo.setFrequency (1234.0f);
-        unsigned long s = 22699; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 22699; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         int N = 6000; double md = 0;
         for (int i = 0; i < N; ++i)
         {
@@ -145,7 +145,7 @@ int main()
         {
             eq::MultibandSplitter<4> mb; mb.prepare (sr, 1); mb.setNumBands (bands); mb.setCrossovers (xf, bands - 1);
             eq::Svf ref[3]; for (int j = 0; j < bands - 1; ++j) { ref[j].prepare (sr, 1); ref[j].setParams (eq::FilterType::AllPass, xf[j], kQ, 0.0); }
-            unsigned long s = 999; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+            unsigned long long s = 999; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
             int N = 6000; double md = 0; float band[4];
             for (int i = 0; i < N; ++i)
             {

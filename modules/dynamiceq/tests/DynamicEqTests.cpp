@@ -139,7 +139,7 @@ int main()
         DP p; p.freq = 1200.0; p.Q = 1.5; p.staticGainDb = 5.0; p.ratio = 1.0; p.rangeDb = 0.0;
         DB d; d.prepare (sr, 1); d.setParams (p);
         eq::Svf ref; ref.prepare (sr, 1); ref.setParams (eq::FilterType::Bell, 1200.0, 1.5, 5.0);
-        unsigned long s = 11; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 11; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.3f * rng(); y[i] = x[i]; }
         for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }

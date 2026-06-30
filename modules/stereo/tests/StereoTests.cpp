@@ -114,9 +114,9 @@ int main()
 
     //==========================================================================
     // StereoWidth: a Mid/Side side-gain. The headline safety property is the mono-fold invariant.
-    auto rngPair = [] (int N, unsigned long seed, std::vector<float>& L, std::vector<float>& R)
+    auto rngPair = [] (int N, unsigned long long seed, std::vector<float>& L, std::vector<float>& R)
     {
-        unsigned long s = seed; auto u = [&] { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = seed; auto u = [&] { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         L.resize (N); R.resize (N); for (int i = 0; i < N; ++i) { L[i] = 0.6f * u(); R[i] = 0.6f * u(); }
     };
 

@@ -26,7 +26,7 @@ void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 using namespace felitronics;
 
 // A tiny deterministic LCG so the test is reproducible (no <random> alloc surprises).
-struct Lcg { unsigned long s; float next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; } };
+struct Lcg { unsigned long long s; float next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; } };
 
 static std::vector<float> directConv (const std::vector<float>& x, const std::vector<float>& h)
 {

@@ -72,7 +72,7 @@ int main()
     test::group ("TruePeak >= sample peak");
     {
         TPM m; m.prepare (sr, 1024, 1);
-        unsigned long s = 5; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 5; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N); for (int i = 0; i < N; ++i) x[i] = 0.6f * rng();
         for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
         test::ok (m.truePeakDb() >= m.samplePeakDb() - 1e-4, "true peak ≥ sample peak (max over a superset of the grid)");
@@ -198,7 +198,7 @@ int main()
     test::group ("TruePeak 1x path at 192 kHz");
     {
         TPM m; m.prepare (192000.0, 1024, 1);
-        unsigned long s = 8; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 8; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 4000; std::vector<float> x (N); for (int i = 0; i < N; ++i) x[i] = 0.7f * rng();
         for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
         test::ok (m.oversampleFactor() == 1, "192 kHz selects 1× (no oversampling)");

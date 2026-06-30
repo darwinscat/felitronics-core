@@ -61,7 +61,7 @@ int main()
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));     // threshold above signal → no GR
         const int N = 8000; std::vector<float> x (N), y (N);
-        unsigned long s = 7; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 7; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         for (int i = 0; i < N; ++i) { x[i] = 0.3f * rng(); y[i] = x[i]; }
         runBlocks (mc, y);
         test::ok (std::fabs (rms (y, N / 2) / rms (x, N / 2) - 1.0) < 0.05, "no-compression output == allpass reconstruction (RMS flat)");
@@ -143,7 +143,7 @@ int main()
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (24.0, 2.0));  // never compresses → unity
         eq::MultibandSplitter<4> ref; ref.prepare (sr, 1); ref.setNumBands (3); ref.setCrossovers (xf, 2);
-        unsigned long s = 3; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 3; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.3f * rng(); y[i] = x[i]; }
         runBlocks (mc, y);
@@ -161,7 +161,7 @@ int main()
         mc.setBandParams (0, comp (24.0, 2.0)); mc.setBandParams (1, comp (24.0, 2.0, lookMs)); mc.setBandParams (2, comp (24.0, 2.0));
         eq::MultibandSplitter<4> ref; ref.prepare (sr, 1); ref.setNumBands (3); ref.setCrossovers (xf, 2);
         core::DelayLine refDelay; refDelay.prepare (L + 1); refDelay.setDelay (L);
-        unsigned long s = 5; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 5; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.3f * rng(); y[i] = x[i]; }
         runBlocks (mc, y);
@@ -196,7 +196,7 @@ int main()
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));
         const int N = 6000; std::vector<float> l (N), r (N, 0.0f);
-        unsigned long s = 9; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
+        unsigned long long s = 9; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         for (int i = 0; i < N; ++i) l[i] = 0.3f * rng();
         for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; mc.process (io, 2, std::min (512, N - o)); }
         test::ok (rms (r, N / 2) == 0.0, "right channel stays silent while left is driven (independent state)");
