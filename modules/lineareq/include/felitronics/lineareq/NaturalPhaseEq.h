@@ -10,6 +10,7 @@
 #include <felitronics/core/Config.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -49,10 +50,12 @@ public:
         fs_       = sampleRate > 0.0 ? sampleRate : 48000.0;
         maxBlock_ = std::max (1, maxBlock);
         channels_ = std::clamp (numChannels, 1, core::kMaxChannels);
-        k_        = std::clamp (k, 0.0f, 1.0f);
+        k_.store (std::clamp (k, 0.0f, 1.0f), std::memory_order_relaxed);
         L_        = firSizeForQuality (quality);
         D_        = 8 * L_;                                      // cepstral design size (≥ 8× the kept IR)
-        bulkDelay_ = (int) std::lround ((1.0f - k_) * (float) L_ * 0.5f);   // causal shift = reported latency
+        bulkDelay_ = L_ / 4;                                     // FIXED causal shift (the mixed-phase sweet spot) → a
+                                                                // STABLE reported latency, so the live blend knob moves
+                                                                // phase/pre-ring WITHOUT moving PDC (no re-prepare).
 
         if (! mp_.prepare (D_)) return false;
         magBuf_.assign ((std::size_t) (D_ / 2 + 1), 0.0f);
@@ -71,7 +74,11 @@ public:
     int  firSize() const noexcept { return L_; }
     int  latencySamples() const noexcept { return bulkDelay_; }   // the causal bulk shift (convolver adds 0)
     bool isBusy() const noexcept { return conv_.isBusy(); }
-    float blend() const noexcept { return k_; }
+    float blend() const noexcept { return k_.load (std::memory_order_relaxed); }
+
+    // Change the phase blend LIVE — no re-prepare (the bulk delay / reported latency is fixed). The next
+    // setBands() rebuilds the FIR with the new k via the host's off-thread builder (a click-free swap).
+    void setBlend (float k) noexcept { k_.store (std::clamp (k, 0.0f, 1.0f), std::memory_order_relaxed); }
 
     // RT-UNSAFE (message thread): rebuild the Mid+Side mixed-phase FIRs from a snapshot, hand to the
     // convolver for a click-free swap. False if a swap is still crossfading (host coalesces with latest).
@@ -88,7 +95,7 @@ public:
     void buildFir (const eq::BandParams* bands, int numBands, bool side, float* out) noexcept
     {
         eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), D_ / 2 + 1, side);
-        const float* h = mp_.build (magBuf_.data(), k_);       // D-point mixed-phase impulse (circular)
+        const float* h = mp_.build (magBuf_.data(), k_.load (std::memory_order_relaxed));   // D-point mixed-phase impulse
 
         // Extract L causal taps: the peak sits at h[0], pre-ring wraps to h[D-1..]; shift right by bulkDelay
         // so out[bulkDelay] = h[0]. Tail (+ light head) taper suppresses truncation ripple.
@@ -138,7 +145,7 @@ private:
     double fs_ = 48000.0;
     int maxBlock_ = 512, channels_ = 2;
     int L_ = 4096, D_ = 32768, bulkDelay_ = 1024;
-    float k_ = 0.5f;
+    std::atomic<float> k_ { 0.5f };   // phase blend — live-settable without a re-prepare (the builder reads it)
 
     MixedPhaseFir<core::fft::DefaultRealFft> mp_;                            // cepstral mixed-phase FIR designer
     convolution::ConvolutionEngine<core::fft::DefaultRealFft, 2> conv_;      // Mid (ch0) + Side (ch1), click-free swap

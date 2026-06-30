@@ -130,5 +130,22 @@ int main()
         test::approx (firMagDb (firMid,  500.0, sr), 0.0, 0.6, "≈ 0 dB away from the cut");
     }
 
+    // --- (8) setBlend changes the phase LIVE but keeps the latency fixed (for a smooth knob, no re-prepare) ---
+    test::group ("NaturalPhaseEq setBlend: phase moves, latency fixed");
+    {
+        NPE n2; n2.prepare (sr, 512, 2, 1, 0.5f);
+        const int Ld = n2.firSize(), lat0 = n2.latencySamples();
+        std::vector<float> fHalf ((std::size_t) Ld), fMin ((std::size_t) Ld);
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1500.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
+        n2.buildFir (b, 1, false, fHalf.data());     // k = 0.5
+        n2.setBlend (0.95f);
+        n2.buildFir (b, 1, false, fMin.data());      // k = 0.95 (near minimum phase)
+        test::ok (n2.latencySamples() == lat0, "latency unchanged by the blend (fixed bulk delay → no re-prepare)");
+        double diff = 0.0; for (int i = 0; i < Ld; ++i) diff = std::max (diff, (double) std::fabs (fHalf[(std::size_t) i] - fMin[(std::size_t) i]));
+        test::ok (diff > 1e-3, "the FIR actually changed (phase blended)");
+        double preH = 0.0, preM = 0.0; for (int i = 0; i < lat0; ++i) { preH += std::fabs (fHalf[(std::size_t) i]); preM += std::fabs (fMin[(std::size_t) i]); }
+        test::ok (preM < preH, "k=0.95 has less pre-ring than k=0.5 (toward minimum phase)");
+    }
+
     return test::report();
 }
