@@ -49,6 +49,7 @@ public:
     // the SHORT (warm) anti-click fade; the cold first-prime length is derived internally. Message thread.
     bool prepare (int partitionSize, int maxIrSamples, int crossfadeSamples, int numChannels = 1)
     {
+        prepared_ = false;                            // any early return below leaves the engine unprepared (setIr/process reject)
         if (numChannels < 1 || numChannels > MaxChannels) return false;
         if (! core::fft::isPow2 (partitionSize)) return false;
         channels_ = numChannels;
@@ -60,7 +61,7 @@ public:
         maxParts_ = (maxIrSamples > P_) ? ((maxIrSamples - P_ + P_ - 1) / P_) : 0;
 
         warmXfade_ = crossfadeSamples < 1 ? 1 : crossfadeSamples;
-        coldXfade_ = maxParts_ > 0 ? maxParts_ * P_ : warmXfade_;   // cold prime ≈ the tail length
+        coldXfade_ = maxParts_ > 0 ? std::max (warmXfade_, maxParts_ * P_) : warmXfade_;   // cold prime ≈ tail, never below the warm fade (keeps the std::clamp lo<=hi)
 
         inputSpec_.assign ((std::size_t) specF_, 0.0f);
         acc_.assign       ((std::size_t) specF_, 0.0f);
@@ -70,6 +71,7 @@ public:
         cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
         phase_ = 0; fdlPos_ = 0; warmSamples_ = 0;
         state_.store (0, std::memory_order_relaxed);
+        prepared_ = true;                             // fully built — only now may setIr()/process() run
         return true;
     }
 
@@ -93,7 +95,7 @@ public:
     // is already pending/crossfading (the caller coalesces with the latest snapshot).
     bool setIr (const float* const* irPerCh, int nch, int len)
     {
-        if (nch < 1 || state_.load (std::memory_order_acquire) != 0) return false;   // busy
+        if (nch < 1 || ! prepared_ || state_.load (std::memory_order_acquire) != 0) return false;   // unprepared / busy
         const int stg = 1 - cur_;                                                    // inactive slot
         for (int c = 0; c < channels_; ++c)
             chan_[c].buildIr (stg, irPerCh[c < nch ? c : nch - 1], len, P_, maxParts_, specF_, buildFft_);
@@ -111,6 +113,7 @@ public:
     // Audio thread. Planar; `in`/`out` may alias (in-place). RT-safe, zero latency.
     void process (const float* const* in, float* const* out, int numChannelsToProcess, int n) noexcept
     {
+        if (! prepared_) return;                                    // never prepared — channel buffers are empty
         const int nc = numChannelsToProcess < channels_ ? numChannelsToProcess : channels_;
         if (nc <= 0 || n <= 0) return;
 
@@ -177,6 +180,7 @@ private:
         // cached tail — it is recomputed from the warm shared FDL on the next chunk after the swap.
         void buildIr (int k, const float* ir, int len, int P, int maxParts, int specF, Fft& fft)
         {
+            if (P <= 0) return;                 // unprepared engine — nothing to build (also guards the /P below)
             if (len < 0) len = 0;
             for (int i = 0; i < P; ++i) h0[k][(std::size_t) i] = (i < len) ? ir[i] : 0.0f;
 
@@ -321,6 +325,7 @@ private:
     Chan chan_[MaxChannels];
     std::vector<float> inputSpec_, acc_, ifftOut_;        // shared FFT scratch (one channel at a time)
     std::atomic<int> state_ { 0 };                        // 0 Idle · 1 Pending (staged) · 2 Crossfading
+    bool prepared_ = false;                               // true ONLY after a fully-successful prepare(); setIr()/process() reject until then (a partial/failed prepare leaves it false even if P_>0)
     int P_ = 0, N_ = 0, specF_ = 0, maxParts_ = 0, channels_ = 1;
     int cur_ = 0;                                         // active slot (0/1)
     int phase_ = 0, fdlPos_ = 0;                          // shared per-chunk timing (all channels lockstep)

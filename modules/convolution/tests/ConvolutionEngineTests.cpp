@@ -256,5 +256,41 @@ int main()
         test::ok (eng.isBusy(), "post-reset swap is COLD again (busy past the short fade) → history re-armed");
     }
 
+    // --- unprepared-engine guards (regression: a consumer's ctor pushed an IR before prepare()) ---
+    // setIr() before prepare() hit buildIr with P_=0 → `(tailLen + P - 1) / P` divided by zero. ARM64
+    // SDIV returns 0 (silent no-op) so macOS was fine; x86-64 IDIV raises #DE → the host process crashed
+    // inside the consumer's constructor. setIr()/process() must now REJECT until a successful prepare().
+    test::group ("ConvolutionEngine rejects setIr()/process() before prepare()");
+    {
+        convolution::ConvolutionEngine<> eng;                        // default-constructed, NOT prepared (P_=0)
+        std::vector<float> ir (irLen), in (256, 0.3f), out (256, 0.0f);
+        for (auto& v : ir) v = 0.1f * r.next();
+
+        test::ok (! eng.isBusy(), "fresh engine is idle");
+        test::ok (! eng.setIr (ir.data(), irLen), "setIr() before prepare() returns false (no div-by-0, no crash)");
+        test::ok (! eng.isBusy(), "  …and it did NOT arm a swap (state stays idle)");
+        eng.process (in.data(), out.data(), 256);                    // must be a silent no-op, not an empty-buffer access
+        bool untouched = true; for (float v : out) untouched = untouched && (v == 0.0f);
+        test::ok (untouched, "process() before prepare() is a no-op (output left untouched)");
+
+        test::ok (eng.prepare (P, irMax, xfade), "prepare() after the rejected loads");
+        test::ok (eng.setIr (ir.data(), irLen), "setIr() now accepted once prepared");
+        eng.process (in.data(), out.data(), 256);
+        bool finite = true; for (float v : out) finite = finite && std::isfinite (v);
+        test::ok (finite, "process() produces finite output after prepare");
+    }
+
+    // --- a FAILED prepare() must stay unprepared (partial init: P_>0 but FFT setup failed) ---
+    // prepare(P=1) passes isPow2(1) and sets P_=1, but the 2-point FFT prepare fails (size < 4) and
+    // prepare() returns false. A plain `P_<=0` guard would NOT catch this (P_==1); the prepared_ flag
+    // must, so setIr() still rejects rather than writing into the empty (unallocated) channel buffers.
+    test::group ("ConvolutionEngine: a failed prepare() stays unprepared");
+    {
+        convolution::ConvolutionEngine<> eng;
+        std::vector<float> ir (irLen, 0.05f);
+        test::ok (! eng.prepare (1, irMax, xfade), "prepare(P=1) fails (FFT size 2 < 4)");
+        test::ok (! eng.setIr (ir.data(), irLen), "setIr() still rejected after a failed prepare (no OOB into empty h0)");
+    }
+
     return test::report();
 }
