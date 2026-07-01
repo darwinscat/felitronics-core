@@ -1,5 +1,7 @@
 # Build output
 /build/
+/build-san/
+/build32/
 /cmake-build-*/
 /out/
 *.o
