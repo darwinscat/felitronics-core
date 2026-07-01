@@ -1,0 +1,3 @@
+# Code owners — a change to the default branch needs an approving review from a code
+# owner (Oleh or Alisa); either owner satisfies it. Oleh has a bypass allowance (solo-friendly).
+* @tsyma @AliceLafox
