@@ -31,6 +31,11 @@ class NeuralStage
 public:
     struct Spec { double sampleRate = 48000.0; int maxBlock = 512; int maxChannels = 2; };
 
+    // Retired models live in `retired_` (unique_ptr — freed by the default member dtor). The LIVE model is
+    // held as a RAW atomic pointer (so the audio thread can read it lock-free), so nothing owns it once the
+    // stage is torn down — free it here, else a NeuralStage that ever loaded a model leaks it on host teardown.
+    ~NeuralStage() noexcept { delete live_.load (std::memory_order_acquire); }
+
     void prepare (Spec s) noexcept
     {
         spec_ = s;

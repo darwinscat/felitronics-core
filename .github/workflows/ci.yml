@@ -43,10 +43,9 @@ jobs:
         run: cmake --build build-san -j
       - name: Test
         env:
-          # detect_leaks=0 for now: LSan (Linux-only) surfaced a PRE-EXISTING leak in the neural module's
-          # RT-safe model-swap (retired models not reclaimed by exit) — a different bug class from this PR's
-          # use-before-prepare hardening, and one that can't be reproduced on the macOS dev box. Tracked as a
-          # follow-up; re-enable leak detection once it's fixed. ASan (OOB / use-after-free) + UBSan stay ON.
-          ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:strict_string_checks=1:detect_stack_use_after_return=1
+          # LSan (Linux-only; macOS has no LeakSanitizer) → this job is where leaks fail the build. It caught
+          # a real one: NeuralStage held its live model as a raw pointer with no destructor, leaking it on
+          # teardown — now fixed (~NeuralStage frees it; a ctors==dtors test guards it on every platform).
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-san --output-on-failure
