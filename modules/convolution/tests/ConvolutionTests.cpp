@@ -148,5 +148,23 @@ int main()
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
 
+    // --- lifecycle/misuse: setIr()/process() before / after a failed prepare must not /0 or touch empty buffers ---
+    // Unprepared P_==0 → setIr divided by P_ (the same fault as the ConvolutionEngine ctor bug); process wrote
+    // frame_[0] into an empty buffer. A failed prepare (non-pow2 P) must stay unprepared. Guarded now.
+    test::group ("PartitionedConvolver: reject setIr/process before / after failed prepare");
+    {
+        convolution::PartitionedConvolver<> conv;                    // NOT prepared (P_ == 0)
+        std::vector<float> ir { 1.0f, 0.5f, 0.25f }, x (8, 0.0f), y (8, 0.0f); x[0] = 1.0f;
+        conv.setIr (ir.data(), (int) ir.size());                     // must NOT divide by P_==0
+        conv.process (x.data(), y.data(), 8);                        // must NOT write into empty frame_
+        test::ok (! conv.prepare (48, 256), "prepare(non-pow2 P=48) fails");
+        conv.setIr (ir.data(), (int) ir.size());                     // still unprepared → no-op
+        conv.process (x.data(), y.data(), 8);
+        test::ok (conv.prepare (64, 256), "prepare(P=64) works");
+        conv.setIr (ir.data(), (int) ir.size());
+        conv.process (x.data(), y.data(), 8);
+        test::approx (y[0], 1.0, 1e-6, "convolves correctly once prepared");
+    }
+
     return test::report();
 }

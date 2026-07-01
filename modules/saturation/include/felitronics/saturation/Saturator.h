@@ -46,6 +46,7 @@ public:
 
     bool prepare (double sampleRate, int maxBlock, int maxChannels, int oversampleFactor = 4, int tapsPerPhase = 32)
     {
+        prepared_ = false;                                             // any early return below leaves it unprepared
         if (sampleRate <= 0.0 || maxBlock < 1) return false;
         fs_       = sampleRate;
         maxBlock_ = maxBlock;
@@ -60,6 +61,7 @@ public:
         dcX1_.assign   ((std::size_t) channels_, 0.0f);
         dcY1_.assign   ((std::size_t) channels_, 0.0f);
         applyParams();
+        prepared_ = true;                                              // fully built — process() may now run
         return true;
     }
 
@@ -78,7 +80,7 @@ public:
     void process (float* const* io, int numChannels, int n) noexcept
     {
         const int nc = std::min (numChannels, channels_);
-        if (nc <= 0 || n <= 0) return;
+        if (! prepared_ || nc <= 0 || n <= 0 || n > maxBlock_) return;   // unprepared / failed-prepare / oversized block → no OOB
         const int osN = n * os_;
         for (int c = 0; c < nc; ++c)
         {
@@ -150,6 +152,7 @@ private:
     int    maxBlock_ = 0, channels_ = 0, os_ = 1;
     float  comp_ = 1.0f, dcR_ = 0.0f, mix_ = 1.0f, outGain_ = 1.0f;
     bool   dcEnabled_ = false;
+    bool   prepared_  = false;                             // true only after a fully-successful prepare()
 
     std::vector<float>  osBuf_, wetBuf_;
     std::vector<float*> osPtrs_, wetPtrs_;
