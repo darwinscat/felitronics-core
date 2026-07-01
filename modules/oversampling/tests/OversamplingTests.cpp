@@ -76,5 +76,20 @@ int main()
         test::ok (maxErr < 0.03, "round-trip == input delayed by latency()");
     }
 
+    // --- lifecycle/misuse: upsample/downsample before prepare (or after a failed prepare) must no-op ---
+    // channels_ defaults to 0 and prepare() rejects bad args BEFORE mutating dims, so misuse is a safe no-op.
+    test::group ("PolyphaseOversampler: safe before prepare / after failed prepare");
+    {
+        oversampling::PolyphaseOversampler os;         // NOT prepared (channels_ == 0)
+        float base[8] { 0.1f, 0,0,0,0,0,0,0 }; float osb[32] {};
+        const float* in[1] { base }; float* outo[1] { osb };
+        os.upsample (in, 1, 8, outo);                  // channels_==0 → no-op
+        const float* ino[1] { osb }; float* outb[1] { base };
+        os.downsample (ino, 1, 8, outb);               // no-op
+        test::ok (! os.prepare (4, 1, 2), "prepare(tapsPerPhase=2) fails (rejected before mutating dims)");
+        os.upsample (in, 1, 8, outo);                  // still unprepared → no-op
+        test::ok (os.prepare (4, 1, 32), "prepare valid");
+    }
+
     return test::report();
 }

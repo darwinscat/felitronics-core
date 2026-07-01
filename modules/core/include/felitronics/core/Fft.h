@@ -62,6 +62,7 @@ public:
 
     void forward (const float* real, float* spec) noexcept
     {
+        if (n_ <= 0) return;                                // unprepared — scratch_ empty (per-transform guard, not per-sample)
         for (int i = 0; i < n_; ++i) scratch_[(std::size_t) i] = std::complex<float> (real[i], 0.0f);
         transform (scratch_.data(), n_, false);
         spec[0] = scratch_[0].real();                       // DC (real)
@@ -75,6 +76,7 @@ public:
 
     void inverse (const float* spec, float* real) noexcept
     {
+        if (n_ <= 0) return;                                // unprepared — scratch_ empty
         scratch_[0]                            = std::complex<float> (spec[0], 0.0f);
         scratch_[(std::size_t) (n_ / 2)]       = std::complex<float> (spec[1], 0.0f);
         for (int k = 1; k < n_ / 2; ++k)       // Hermitian symmetry rebuilds the upper half

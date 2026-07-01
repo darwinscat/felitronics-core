@@ -137,5 +137,13 @@ int main()
         test::approx (last, 1.0, 1e-9, "impulse appears at delay == capacity (64)");
     }
 
+    // --- DelayLine: a DEFAULT (unprepared) line is a valid delay-0 passthrough, not an empty-buffer OOB ---
+    test::group ("DelayLine: default (unprepared) is a safe passthrough");
+    {
+        core::DelayLine raw;                          // never prepared — buf_ defaults to one slot
+        test::approx (raw.process (0.5f), 0.5, 1e-9, "unprepared process() = delay-0 passthrough (no empty-buffer OOB)");
+        test::ok (raw.capacity() == 0, "unprepared capacity is 0");
+    }
+
     return test::report();
 }

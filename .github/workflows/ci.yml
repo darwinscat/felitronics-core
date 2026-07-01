@@ -22,3 +22,27 @@ jobs:
         run: cmake --build build --config Release -j   # --config is required by multi-config gens (VS on Windows)
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure   # -C likewise (no-op on single-config)
+
+  # Dedicated ASan + UBSan job. UBSan makes platform-divergent UB LOUD on x86-64 (integer /0, signed
+  # overflow, OOB shift, null store) that is SILENT on the dev machine (Apple-Silicon ARM64) — the exact
+  # class that let an unprepared-engine divide-by-zero ship and only surface as a Windows crash. Separate
+  # job (Linux/Clang-specific flags) rather than a 4th OS-matrix row.
+  sanitizers:
+    name: ubuntu-clang-asan-ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure (ASan + UBSan, hard-fail on any UB)
+        run: >
+          cmake -S . -B build-san
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++
+          -DFELITRONICS_BUILD_TESTS=ON
+          -DFELITRONICS_ENABLE_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build-san -j
+      - name: Test
+        env:
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-san --output-on-failure
