@@ -120,5 +120,19 @@ int main()
         test::ok (a5 > a1 + 1e-4, "k=0.5 pre-ring > k=1 pre-ring");
     }
 
+    // --- lifecycle/misuse: build() before / after a failed prepare() must not write into empty buffers ---
+    // Unprepared D_=0 with empty spec_/ceps_/h_; build() wrote spec_[0]/[1] (OOB) and ran an unprepared FFT.
+    // A failed prepare (non-pow2) must leave it unprepared, not half-built. Guarded now (returns nullptr).
+    test::group ("MixedPhaseFir: reject build() before / after failed prepare");
+    {
+        lineareq::MixedPhaseFir<> mp;                                 // NOT prepared
+        std::vector<float> magm (64, 1.0f);
+        test::ok (mp.build (magm.data(), 0.5f) == nullptr, "build() before prepare() returns nullptr (no OOB write)");
+        test::ok (mp.prepare (64), "prepare(64)");
+        test::ok (mp.build (magm.data(), 0.5f) != nullptr, "build() works once prepared");
+        test::ok (! mp.prepare (7), "prepare(non-pow2) fails");
+        test::ok (mp.build (magm.data(), 0.5f) == nullptr, "build() rejected after a failed prepare (stays unprepared)");
+    }
+
     return test::report();
 }

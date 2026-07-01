@@ -39,6 +39,7 @@ public:
     // designSize D: a power of two, ≥ ~8× the FIR length you intend to keep. Message thread.
     bool prepare (int designSize)
     {
+        prepared_ = false;                                   // any early return below leaves it unprepared
         if (! core::fft::isPow2 (designSize)) return false;
         D_ = designSize;
         if (! fft_.prepare (D_)) return false;
@@ -46,6 +47,7 @@ public:
         ceps_.assign ((std::size_t) D_, 0.0f);
         spec_.assign ((std::size_t) specF_, 0.0f);
         h_.assign    ((std::size_t) D_, 0.0f);
+        prepared_ = true;                                    // fully built — build() may now run
         return true;
     }
 
@@ -56,6 +58,7 @@ public:
     // shifts it causal). RT-UNSAFE.
     const float* build (const float* mag, float k) noexcept
     {
+        if (! prepared_) return nullptr;                     // unprepared / failed prepare — no write into empty spec_/ceps_/h_
         const int H = D_ / 2;
         k = std::clamp (k, 0.0f, 1.0f);
         constexpr float floorMag = 1.0e-5f;
@@ -100,6 +103,7 @@ public:
 private:
     Fft fft_;
     int D_ = 0, specF_ = 0;
+    bool prepared_ = false;                                  // true only after a fully-successful prepare()
     std::vector<float> ceps_, spec_, h_;
 };
 

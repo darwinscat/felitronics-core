@@ -9,6 +9,26 @@ if(MSVC)
                                         # stack; MSVC's 1 MB default overflows → SegFault. Match Unix.
 endif()
 
+# ASan + UBSan for dev + a dedicated CI job. UBSan makes platform-divergent UB LOUD on any host: a
+# convolution divide-by-zero on an unprepared engine was SILENT on Apple-Silicon (ARM SDIV /0 → 0) yet
+# crashed on x86-64 (IDIV #DE) and would HardFault on bare-metal. `-fno-sanitize-recover=all` turns every
+# UB into a hard failure (== a trap), so a future port to "who knows what" (Cortex-M …) stays honest.
+# Flags are global so every module self-test is instrumented. Clang/GCC only (MSVC has no UBSan).
+option(FELITRONICS_ENABLE_SANITIZERS "Build the self-tests with ASan + UBSan (hard-fail; Clang/GCC)" OFF)
+if(FELITRONICS_ENABLE_SANITIZERS)
+    if(NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
+        message(FATAL_ERROR "FELITRONICS_ENABLE_SANITIZERS requires Clang or GCC (MSVC has no UBSan).")
+    endif()
+    message(STATUS "felitronics-core: ASan + UBSan enabled (hard-fail on any UB)")
+    add_compile_options(-g -fno-omit-frame-pointer
+                        -fsanitize=address,undefined -fno-sanitize-recover=all)  # NOT -fsanitize=integer: the dither RNG wraps unsigned on purpose
+    add_link_options(-fsanitize=address,undefined)
+    add_compile_definitions(_GLIBCXX_ASSERTIONS)                                  # libstdc++ container bounds checks (inert on libc++; ASan covers OOB there)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        add_compile_options(-ftrivial-auto-var-init=pattern)                     # cheap uninitialised-stack tripwire
+    endif()
+endif()
+
 # ----------------------------------------------------------------------------
 # felitronics-core — shared, framework-agnostic, JUCE-free, real-time-safe C++ DSP core.
 #

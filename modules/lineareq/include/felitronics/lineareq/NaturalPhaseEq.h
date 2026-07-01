@@ -48,6 +48,7 @@ public:
     // quality picks L (the convolution IR length). k ∈ [0,1] blends phase (0 linear … 1 minimum). RT-UNSAFE.
     bool prepare (double sampleRate, int maxBlock, int numChannels, int quality, float k = 0.5f) noexcept
     {
+        prepared_ = false;                                      // any early return below leaves it unprepared
         fs_       = sampleRate > 0.0 ? sampleRate : 48000.0;
         maxBlock_ = std::max (1, maxBlock);
         channels_ = std::clamp (numChannels, 1, core::kMaxChannels);
@@ -67,6 +68,7 @@ public:
         int part = 64; while (part < maxBlock_) part <<= 1;     // partition ≥ maxBlock, pow2
         const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // short anti-click fade (design B)
         if (! conv_.prepare (part, L_, warmXfade, 2)) return false;   // Mid IR (ch0) + Side IR (ch1)
+        prepared_ = true;                                       // fully built — setBands()/buildFir() may now run
         return true;
     }
 
@@ -85,6 +87,7 @@ public:
     // convolver for a click-free swap. False if a swap is still crossfading (host coalesces with latest).
     bool setBands (const eq::BandParams* bands, int numBands) noexcept
     {
+        if (! prepared_) return false;                         // unprepared — FIR buffers + MixedPhaseFir are empty
         buildFir (bands, numBands, false, firMid_.data());     // Mid axis
         buildFir (bands, numBands, true,  firSide_.data());    // Side axis
         const float* irs[2] { firMid_.data(), firSide_.data() };
@@ -95,6 +98,7 @@ public:
     // the convolver itself. magnitude → MixedPhaseFir (phase k·φ_min) → causal shift by bulkDelay + taper.
     void buildFir (const eq::BandParams* bands, int numBands, bool side, float* out) noexcept
     {
+        if (! prepared_) return;                               // unprepared — magBuf_/taper_ empty + MixedPhaseFir not built
         eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), D_ / 2 + 1, side);
         const float* h = mp_.build (magBuf_.data(), k_.load (std::memory_order_relaxed));   // D-point mixed-phase impulse
 
@@ -146,6 +150,7 @@ private:
     double fs_ = 48000.0;
     int maxBlock_ = 512, channels_ = 2;
     int L_ = 4096, D_ = 32768, bulkDelay_ = 1024;
+    bool prepared_ = false;                                    // true only after a fully-successful prepare()
     std::atomic<float> k_ { 0.5f };   // phase blend — live-settable without a re-prepare (the builder reads it)
 
     MixedPhaseFir<core::fft::DefaultRealFft> mp_;                            // cepstral mixed-phase FIR designer
