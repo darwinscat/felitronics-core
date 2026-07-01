@@ -33,7 +33,7 @@ enum class FilterType
     HighPass,    // Q at 12 dB/oct; 24 dB/oct is Butterworth (Q ignored)
     LowPass,     // Q at 12 dB/oct; 24 dB/oct is Butterworth (Q ignored)
     BandPass,    // Q, unity gain at centre
-    Notch,       // band-stop: deep null at f0, unity at DC/Nyquist, width by Q
+    Notch,       // band-stop: deep null at f0, unity at DC/Nyquist; width by Q, steepness by slope
     AllPass,     // flat magnitude, 360° phase rotation through f0 (Q = sharpness)
     Tilt         // spectral tilt about f0: lows -gainDb, highs +gainDb
 };
@@ -47,7 +47,8 @@ struct BandParams
     double     freq   = 1000.0;   // Hz (engine clamps to [10, 0.49*fs])
     double     Q      = 1.0;
     double     gainDb = 0.0;      // bells & shelves
-    int        slope  = 12;       // HP/LP only: 12 (uses Q) or 24 dB/oct (Butterworth, Q ignored)
+    int        slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch: steepness (order=slope/6),
+                                  // sections=ceil(order/2); 6/12→single notch (Q=width), 24→2 … 96→8.
     bool       swept  = false;    // true → zero-delay SVF (smooth fast fc sweeps for search mode)
     bool       bypass = false;    // band kept but muted (ghost) — distinct from on=false (removed)
 
