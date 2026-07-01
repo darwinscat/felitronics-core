@@ -42,4 +42,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_eq_crossover_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_eq_crossover_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_eq_crossover_tests COMMAND felitronics_eq_crossover_tests)
+
+    # Cytomic SVF HPF/LPF golden (measured magnitude == BLT 2nd-order Butterworth) — the analytic safety net
+    # for OrbitCab's IRSlot de-JUCE; the direct null vs juce::dsp::StateVariableTPTFilter lives in orbitcab.
+    add_executable(felitronics_eq_svf_tests tests/SvfTests.cpp)
+    target_link_libraries(felitronics_eq_svf_tests PRIVATE felitronics::eq)
+    target_include_directories(felitronics_eq_svf_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_eq_svf_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_eq_svf_tests COMMAND felitronics_eq_svf_tests)
 endif()
