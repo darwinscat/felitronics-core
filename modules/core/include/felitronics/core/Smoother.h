@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace felitronics::core
 {
@@ -69,9 +71,20 @@ public:
         setCurrentAndTargetValue (target);
     }
 
+    // Matches juce::approximatelyEqual EXACTLY (abs tol = smallest normal, rel tol = machine epsilon; non-finite
+    // → exact ==), so a ~1-ULP automation-jitter target is a no-op just like JUCE — no spurious ramp restart /
+    // zipper the original never had. A raw `==` would restart a full ramp on a difference JUCE treats as equal.
+    static bool approxEqual (float a, float b) noexcept
+    {
+        if (! (std::isfinite (a) && std::isfinite (b))) return a == b;
+        const float diff = std::fabs (a - b);
+        return diff <= std::numeric_limits<float>::min()
+            || diff <= std::numeric_limits<float>::epsilon() * std::max (std::fabs (a), std::fabs (b));
+    }
+
     void setTargetValue (float newValue) noexcept
     {
-        if (newValue == target) return;
+        if (approxEqual (newValue, target)) return;
         if (stepsToTarget <= 0) { setCurrentAndTargetValue (newValue); return; }
         target    = newValue;
         countdown = stepsToTarget;

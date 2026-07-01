@@ -94,6 +94,14 @@ int main()
         core::LinearSmoother f; f.reset (1000.0, 0.0125);            // floor(12.5) == 12 steps
         f.setCurrentAndTargetValue (0.0f); f.setTargetValue (12.0f); // step == 1.0/sample
         test::approx (f.getNextValue(), 1.0, 1e-6, "floor(0.0125*1000)=12 steps -> +1.0/step");
+
+        // juce::approximatelyEqual tolerance: a ~1-ULP target change is a NO-OP (no ramp restart / zipper),
+        // exactly like juce::SmoothedValue::setTargetValue — automation that jitters the last bit stays quiet.
+        core::LinearSmoother t (1.0f); t.reset (100);
+        t.setTargetValue (std::nextafter (1.0f, 2.0f));             // one ULP up == exactly FLT_EPSILON away
+        test::ok (! t.isSmoothing(), "1-ULP target change is ignored (juce tolerance) — no spurious ramp");
+        t.setTargetValue (1.001f);                                 // a genuine change (>> epsilon*|v|)
+        test::ok (t.isSmoothing(), "a real target change still arms the ramp");
     }
 
     // --- Math dB <-> gain ---
