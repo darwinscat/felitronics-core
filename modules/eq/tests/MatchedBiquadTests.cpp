@@ -399,6 +399,26 @@ void runMatchedBiquadTests()
                 }
     }
 
+    group ("resonant shelf: plateaus stay EXACT near Nyquist at low Q + high gain (numerator feasibility clamp)");
+    {
+        // Regression for the numerator-feasibility bug: near Nyquist a low-Q, high-gain shelf drove the
+        // single-biquad 3-point fit infeasible (W²+B2<0); the plateau then ballooned (a +30 dB high
+        // shelf read +100 dB at DC → overload/NaN). The DC/Nyquist endpoints must be exact at any Q.
+        for (double f0 : { 0.30 * fs, 0.40 * fs, 0.45 * fs, 0.49 * fs })
+            for (double gDb : { 6.0, 15.0, 30.0 })
+                for (double Q : { 0.05, 0.2, 0.5, 0.707 })
+                {
+                    const auto hs = matched::highShelfQDb (f0, fs, gDb, Q);
+                    const auto ls = matched::lowShelfQDb  (f0, fs, gDb, Q);
+                    const std::string at = " (f0=" + std::to_string ((int) f0) + " g=" + std::to_string ((int) gDb) + " Q=" + std::to_string (Q) + ")";
+                    expectTrue (hs.isStable() && ls.isStable(),    "shelves stable near Nyquist"     + at);
+                    expectNear (hs.magnitudeDb (0.0), 0.0, 0.1,    "high shelf DC plateau == 0 dB"    + at);
+                    expectNear (hs.magnitudeDb (kPi), gDb, 0.1,    "high shelf Nyquist plateau == g"  + at);
+                    expectNear (ls.magnitudeDb (kPi), 0.0, 0.1,    "low shelf Nyquist plateau == 0 dB"+ at);
+                    expectNear (ls.magnitudeDb (0.0), gDb, 0.1,    "low shelf DC plateau == gain"     + at);
+                }
+    }
+
     group ("stability across a freq / Q / gain grid");
     {
         for (double f0 : { 40.0, 200.0, 1000.0, 8000.0, 18000.0, 21000.0 })

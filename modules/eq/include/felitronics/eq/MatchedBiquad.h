@@ -68,9 +68,16 @@ namespace detail
     {
         const double sB0 = safeSqrt (B0), sB1 = safeSqrt (B1);
         const double W   = 0.5 * (sB0 + sB1);
-        c.b0 = 0.5 * (W + safeSqrt (W * W + B2));
+        // Feasibility clamp. The identity b0+b2 = W (which makes |H(DC)|=√B0 and |H(Nyq)|=√B1 EXACT)
+        // holds only while W²+B2 ≥ 0. Near Nyquist a low-Q, high-gain shelf drives B2 large-negative;
+        // safeSqrt then zeroes W²+B2 but b2 kept the un-clamped B2, breaking the identity and
+        // ballooning the plateau (a +30 dB high shelf read +100 dB at DC → overload/NaN). Clamping B2
+        // to its feasible floor −W² keeps the DC/Nyquist endpoints EXACT and only sacrifices the
+        // (physically unattainable) corner overshoot.
+        const double B2c = (B2 < -W * W) ? -W * W : B2;
+        c.b0 = 0.5 * (W + safeSqrt (W * W + B2c));
         c.b1 = 0.5 * (sB0 - sB1);
-        c.b2 = (c.b0 != 0.0) ? -B2 / (4.0 * c.b0) : 0.0;
+        c.b2 = (c.b0 != 0.0) ? -B2c / (4.0 * c.b0) : 0.0;
     }
 
     // Shared solver for the 2-pole Butterworth shelf (2poleShelvingFits appendix), given the
