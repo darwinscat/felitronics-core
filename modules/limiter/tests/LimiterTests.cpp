@@ -113,5 +113,19 @@ int main()
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
 
+    // --- lifecycle/misuse: process before/after a FAILED prepare + oversized blocks must not OOB osBuf ---
+    test::group ("TruePeakLimiter: reject process before / after failed prepare, and oversized blocks");
+    {
+        limiter::TruePeakLimiter lim;                                // NOT prepared (maxCh == 0)
+        float a[64] {}, b[64] {}; float* io[2] { a, b };
+        lim.process (io, 2, 16);                                     // maxCh==0 → no-op
+        lim.prepare (48000.0, 16, 2, 2);                            // tapsPerPhase=2 < 4 → oversampler prepare fails → stays unprepared
+        lim.process (io, 2, 16);                                     // must no-op, not run an unprepared oversampler
+        lim.prepare (48000.0, 16, 2, 32);                           // valid
+        lim.process (io, 2, 16);                                     // works
+        lim.process (io, 2, 64);                                     // numSamples=64 > maxBlock=16 → no-op, must not overrun osBuf
+        test::ok (true, "no OOB across failed-prepare / oversized-block process (ASan/UBSan is the check)");
+    }
+
     return test::report();
 }

@@ -215,5 +215,18 @@ int main()
         test::ok (std::isfinite (m.truePeakDb()) && m.truePeakDb() > 0.2 && m.truePeakDb() < 3.0, "square edges overshoot to a plausible +0.2..+3 dBTP (finite, no overflow)");
     }
 
+    // --- lifecycle/misuse: process() before prepare() must not index empty hist_/pos_ (channels_ defaults to 2) ---
+    test::group ("TruePeakMeter: reject process before prepare");
+    {
+        analysis::TruePeakMeter m;                                   // NOT prepared (channels_ == 2, hist_/pos_ empty)
+        float a[16] {}, b[16] {}; const float* io[2] { a, b };
+        m.process (io, 2, 16);                                       // must no-op, not index empty pos_[c]
+        test::ok (m.truePeakDb() < -100.0, "no peak registered before prepare");
+        m.prepare (48000.0, 16, 2);
+        for (auto& v : a) v = 0.5f;
+        m.process (io, 2, 16);                                       // works
+        test::ok (std::isfinite (m.truePeakDb()), "true-peak finite once prepared");
+    }
+
     return test::report();
 }

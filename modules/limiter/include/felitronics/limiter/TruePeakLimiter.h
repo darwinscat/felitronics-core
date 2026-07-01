@@ -65,11 +65,14 @@ class TruePeakLimiter
 public:
     void prepare (double sampleRate, int maxBlock, int maxChannels, int tapsPerPhase = 32)
     {
+        prepared_ = false;                                     // any early return below leaves it unprepared
+        if (sampleRate <= 0.0 || maxBlock < 1) return;         // invalid stream config
         fs    = sampleRate;
         maxCh = maxChannels < 1 ? 1 : (maxChannels > core::kMaxChannels ? core::kMaxChannels : maxChannels);
+        maxBlock_ = maxBlock;
         tpp   = tapsPerPhase;
         F     = params.oversampleFactor < 2 ? 2 : params.oversampleFactor;
-        os.prepare (F, maxCh, tpp);
+        if (! os.prepare (F, maxCh, tpp)) return;              // oversampler rejected (e.g. tapsPerPhase<4) → stay unprepared
 
         osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock * F, 0.0f));
         osPtrs.assign ((std::size_t) maxCh, nullptr);
@@ -81,6 +84,7 @@ public:
 
         apply (params);
         reset();
+        prepared_ = true;                                      // fully built — process() may now run
     }
 
     void reset() noexcept
@@ -99,7 +103,7 @@ public:
     void process (float* const* channels, int numChannels, int numSamples) noexcept
     {
         const int nc = numChannels < maxCh ? numChannels : maxCh;
-        if (nc <= 0 || numSamples <= 0) return;
+        if (! prepared_ || nc <= 0 || numSamples <= 0 || numSamples > maxBlock_) return;   // unprepared / oversized → no OOB in osBuf
         const int osN = numSamples * F;
 
         for (int c = 0; c < nc; ++c) osPtrs[(std::size_t) c] = osBuf[(std::size_t) c].data();
@@ -147,7 +151,8 @@ private:
     }
 
     double fs = 48000.0;
-    int maxCh = 0, tpp = 32, F = 4;
+    int maxCh = 0, tpp = 32, F = 4, maxBlock_ = 0;
+    bool prepared_ = false;                     // true only after a fully-successful prepare()
     TruePeakLimiterParams params;
 
     oversampling::PolyphaseOversampler os;

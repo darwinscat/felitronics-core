@@ -55,6 +55,7 @@ public:
 
     void prepare (double sampleRate, int /*maxBlock*/, int maxChannels) noexcept
     {
+        prepared_ = false;
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
         channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
         chooseFactor();
@@ -63,6 +64,7 @@ public:
         pos_.assign  ((std::size_t) channels_, 0);
         applyBallistics();
         reset();
+        prepared_ = true;
     }
 
     // NB: a factor change re-designs the FIR (allocates) → call from the prepare/stopped context, not the
@@ -94,6 +96,7 @@ public:
     // READ-ONLY: io is sampled, never modified.
     void process (const float* const* io, int numChannels, int n) noexcept
     {
+        if (! prepared_) return;                                 // unprepared — hist_/pos_ empty (channels_ defaults to 2)
         const int nc = std::min (numChannels, channels_);
         if (nc <= 0) return;
         float blockMax = 0.0f;
@@ -176,6 +179,7 @@ private:
 
     double fs_ = 48000.0;
     int channels_ = 2, L_ = 4;
+    bool prepared_ = false;                     // true only after prepare() (hist_/pos_ allocated)
     TruePeakMeterParams params_;
 
     std::vector<float> proto_;                  // N = L*tapsPerPhase taps, Σ = 1

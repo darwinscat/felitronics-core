@@ -28,7 +28,8 @@ class LoudnessMeter
 public:
     void prepare (double sampleRate, int numChannels, double maxDurationSec = 3600.0)
     {
-        fs = sampleRate;
+        prepared_ = false;
+        fs = sampleRate > 0.0 ? sampleRate : 48000.0;                  // fs<=0 → hopSamples 0 → /0 in finishHop
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
         kw.prepare (fs, ch);
         hopSamples = (int) std::lround (0.1 * fs);                      // 100 ms
@@ -37,6 +38,7 @@ public:
         blockE.assign ((std::size_t) ((int) std::ceil (maxDurationSec * 10.0) + 4), 0.0);
         stE.assign ((std::size_t) ((int) std::ceil (maxDurationSec) + 8), 0.0);     // 1 short-term sample/s for LRA
         reset();
+        prepared_ = true;
     }
 
     void reset() noexcept
@@ -52,6 +54,7 @@ public:
 
     void process (const float* const* channels, int numChannels, int n) noexcept
     {
+        if (! prepared_) return;                                       // unprepared — hopRing/blockE/stE empty
         const int nc = numChannels < ch ? numChannels : ch;
         for (int i = 0; i < n; ++i)
         {
@@ -146,6 +149,7 @@ private:
     }
 
     double fs = 48000.0; int ch = 2, hopSamples = 4800;
+    bool prepared_ = false;                     // true only after prepare() (hopRing/blockE/stE allocated)
     KWeightingFilter kw;
     double w[kMaxChannels] {};
     double hopSumSq[kMaxChannels] {};
