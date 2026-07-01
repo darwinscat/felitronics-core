@@ -56,7 +56,7 @@ class LinearSmoother
 {
 public:
     LinearSmoother() noexcept = default;
-    explicit LinearSmoother (float initialValue) noexcept : currentValue (initialValue), target (initialValue) {}
+    LinearSmoother (float initialValue) noexcept : currentValue (initialValue), target (initialValue) {}   // non-explicit: juce::SmoothedValue is too, so `LinearSmoother x { 1.0f }` array-init stays a drop-in
 
     // Ramp length from seconds. NOTE: floor(), matching JUCE exactly (not round()).
     void reset (double sampleRate, double rampLengthInSeconds) noexcept
