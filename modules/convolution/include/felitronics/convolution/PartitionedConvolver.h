@@ -35,6 +35,7 @@ public:
     // partitionSize P (pow2; FFT size = 2P). maxIrSamples sizes the partition arrays. Message thread.
     bool prepare (int partitionSize, int maxIrSamples)
     {
+        prepared_ = false;                                    // any early return below leaves it unprepared
         if (! core::fft::isPow2 (partitionSize)) return false;
         P_ = partitionSize;
         N_ = 2 * P_;
@@ -53,6 +54,7 @@ public:
 
         numParts_ = 0;
         reset();
+        prepared_ = true;                                     // fully built — setIr()/process() may now run
         return true;
     }
 
@@ -72,6 +74,7 @@ public:
     // SPIKE: resets the running state (instantaneous swap). Production: crossfade instead.
     void setIr (const float* ir, int len)
     {
+        if (! prepared_) return;                              // unprepared: P_==0 → /0, or empty h0_/irSpec_
         if (len < 0) len = 0;
         for (int i = 0; i < P_; ++i) h0_[(std::size_t) i] = (i < len) ? ir[i] : 0.0f;
 
@@ -97,6 +100,7 @@ public:
     // Audio thread. out[n] = (in * IR)[n] (causal linear convolution). RT-safe.
     void process (const float* in, float* out, int n) noexcept
     {
+        if (! prepared_) return;                              // unprepared: frame_/pendingTail_ empty
         for (int s = 0; s < n; ++s)
         {
             frame_[(std::size_t) (P_ + phase_)] = in[s];
@@ -148,6 +152,7 @@ private:
 
     Fft fft_;
     int P_ = 0, N_ = 0, specF_ = 0, maxParts_ = 0, numParts_ = 0, phase_ = 0, fdlPos_ = 0;
+    bool prepared_ = false;                                   // true only after a fully-successful prepare()
     std::vector<float> frame_, h0_, pendingTail_, inputSpec_, acc_, ifftOut_, fdl_, irSpec_;
 };
 

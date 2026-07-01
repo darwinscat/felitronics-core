@@ -126,5 +126,21 @@ int main()
         test::ok (std::fabs (meanOff) > 1e-3, "DC blocker OFF -> asym curve leaves a measurable DC offset");
     }
 
+    // --- lifecycle/misuse: process() after a FAILED prepare (partial init) or with n>maxBlock must not OOB ---
+    // prepare() sets channels_ (clamped >=1) BEFORE ovs_.prepare() can fail — a failed prepare left channels_>=1
+    // with empty osBuf_/osPtrs_, and process() (nc>=1) indexed them; an oversized block overran osBuf_. Guarded now.
+    test::group ("Saturator: reject process before / after failed prepare, and oversized blocks");
+    {
+        saturation::Saturator sat;                                   // NOT prepared (channels_ == 0)
+        float a[32] {}, b[32] {}; float* io[2] { a, b };
+        sat.process (io, 2, 16);                                     // channels_==0 → safe no-op
+        test::ok (! sat.prepare (48000.0, 16, 2, 4, 2), "prepare(tapsPerPhase=2) fails (oversampler rejects <4)");
+        sat.process (io, 2, 16);                                     // FAILED prepare → no-op, must not index empty osBuf_
+        test::ok (sat.prepare (48000.0, 16, 2, 4, 32), "prepare valid");
+        sat.process (io, 2, 16);                                     // works
+        sat.process (io, 2, 32);                                     // n=32 > maxBlock=16 → no-op, must not overrun osBuf_
+        test::ok (true, "no OOB across failed-prepare / oversized-block process (ASan/UBSan is the real check)");
+    }
+
     return test::report();
 }

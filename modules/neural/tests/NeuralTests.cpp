@@ -26,10 +26,10 @@ using namespace felitronics;
 // Reference backend: a gain "inference" with a static destructor counter (so GC timing is observable).
 struct GainInference
 {
-    static inline std::atomic<int> dtors { 0 };
+    static inline std::atomic<int> alive { 0 }, dtors { 0 };   // alive = net live (never reset); dtors is store(0)'d by GC-timing tests
     float gain = 1.0f; int latency = 0;
-    explicit GainInference (float g = 1.0f, int lat = 0) noexcept : gain (g), latency (lat) {}
-    ~GainInference() { dtors.fetch_add (1, std::memory_order_relaxed); }
+    explicit GainInference (float g = 1.0f, int lat = 0) noexcept : gain (g), latency (lat) { alive.fetch_add (1, std::memory_order_relaxed); }
+    ~GainInference() { alive.fetch_sub (1, std::memory_order_relaxed); dtors.fetch_add (1, std::memory_order_relaxed); }
     void prepare (double, int, int) noexcept {}
     void reset() noexcept {}
     void process (float* const* io, int nc, int n) noexcept { for (int c = 0; c < nc; ++c) for (int i = 0; i < n; ++i) io[c][i] *= gain; }
@@ -110,6 +110,11 @@ int main()
         for (int i = 0; i < 6; ++i) last = stage.swapPrepared (std::make_unique<GainInference> ((float) i));  // no GC/process → fills
         test::ok (! last, "swap returns false when the retire queue is full");
     }
+
+    // Leak check (local proxy for the CI's LeakSanitizer): once every NeuralStage scope above has closed,
+    // every GainInference ever constructed must be destroyed — including each stage's LIVE model, which is a
+    // raw pointer freed by ~NeuralStage. Before that destructor existed, the live models leaked (LSan caught it).
+    test::ok (GainInference::alive.load() == 0, "no leak: every model destroyed (net alive == 0)");
 
     return test::report();
 }

@@ -115,5 +115,19 @@ int main()
         test::ok (maxErr < 1e-3, "FFT product, inverted, equals circular convolution");
     }
 
+    // --- lifecycle/misuse: forward()/inverse() before prepare() must not touch the empty scratch_ ---
+    test::group ("ScalarRadix2Real: reject forward/inverse before prepare");
+    {
+        core::fft::DefaultRealFft raw;                // NOT prepared (n_==0, scratch_ empty)
+        float in[8] { 1,0,0,0,0,0,0,0 }, spec[8] {}, out[8] {};
+        raw.forward (in, spec);                        // must no-op, not read scratch_[0]
+        raw.inverse (spec, out);                       // must no-op, not write scratch_[0]
+        test::ok (raw.size() == 0, "unprepared FFT reports size 0");
+        test::ok (raw.prepare (8), "prepare(8)");
+        raw.forward (in, spec);
+        raw.inverse (spec, out);
+        test::ok (std::isfinite (out[0]), "forward/inverse finite once prepared");
+    }
+
     return test::report();
 }

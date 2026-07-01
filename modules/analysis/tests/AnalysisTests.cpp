@@ -170,5 +170,17 @@ int main()
         test::ok (std::fabs (lm.loudnessRangeLu() - lraA) < 0.2, "mono == dual-mono stereo LRA (a constant offset cancels in P95−P10)");
     }
 
+    // --- lifecycle/misuse: process() before prepare() (empty hopRing) + fs<=0 (hopSamples 0 → /0 in finishHop) ---
+    test::group ("LoudnessMeter: reject process before prepare; survive fs<=0");
+    {
+        analysis::LoudnessMeter lm;                                  // NOT prepared (hopRing empty; hopSamples defaults 4800)
+        std::vector<float> sig (6000, 0.1f); const float* io[1] { sig.data() };
+        lm.process (io, 1, 6000);                                    // > hopSamples → would finishHop into empty hopRing; must no-op
+        test::ok (true, "process before prepare did not OOB the hop ring (ASan check)");
+        lm.prepare (0.0, 2);                                         // fs<=0 → clamped, hopSamples>=1 (no /0 in finishHop)
+        lm.process (io, 1, 6000);
+        test::ok (true, "process after fs<=0 prepare did not divide by zero (UBSan check)");
+    }
+
     return test::report();
 }

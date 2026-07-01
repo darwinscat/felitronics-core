@@ -169,5 +169,21 @@ int main()
         }
     }
 
+    // --- lifecycle/misuse: setBands()/process() before prepare() must not touch empty buffers ---
+    // Same shape as LinearPhaseEq, plus setBands() drives an UNPREPARED MixedPhaseFir (mp_.build) → empty
+    // spec_/ceps_/h_. All silent on ARM64, OOB on x86-64 / bare-metal. Guarded now.
+    test::group ("NaturalPhaseEq: reject setBands/process before prepare");
+    {
+        lineareq::NaturalPhaseEq eqm;                                 // NOT prepared
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1000.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
+        test::ok (! eqm.setBands (b, 1), "setBands() before prepare() returns false (no write into empty FIR / unprepared MixedPhaseFir)");
+        float l[16] {}, r[16] {}; float* io[2] { l, r };
+        eqm.process (io, 2, 16);                                      // no-op
+        eqm.reset();
+        test::ok (eqm.prepare (48000.0, 16, 2, 0, 0.5f), "prepare() after the rejected calls");
+        test::ok (eqm.setBands (b, 1), "setBands() works once prepared");
+        eqm.process (io, 2, 16);
+    }
+
     return test::report();
 }

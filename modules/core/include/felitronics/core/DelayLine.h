@@ -42,7 +42,7 @@ public:
     }
 
 private:
-    std::vector<float> buf_;
+    std::vector<float> buf_ { 0.0f };   // default-VALID: a 1-slot delay-0 passthrough until prepare() (no empty-buffer OOB, no hot-path branch)
     int cap_ = 0, delay_ = 0, pos_ = 0;
 };
 

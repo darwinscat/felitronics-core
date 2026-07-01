@@ -53,6 +53,7 @@ public:
     // RT-UNSAFE (message thread): allocates the FIR/FFT/convolver. quality ∈ [0,3] picks the FIR length.
     bool prepare (double sampleRate, int maxBlock, int numChannels, int quality) noexcept
     {
+        prepared_ = false;                                     // any early return below leaves it unprepared
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
         maxBlock_ = std::max (1, maxBlock);
         channels_ = std::clamp (numChannels, 1, core::kMaxChannels);
@@ -75,6 +76,7 @@ public:
         // then true only for that short window → the host's coalescing rebuild stays responsive.
         const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // ≥ 2P and ≥ ~20 ms
         if (! conv_.prepare (part, N_ + 1, warmXfade, 2)) return false;   // Mid IR (ch0) + Side IR (ch1)
+        prepared_ = true;                                      // fully built — setBands()/buildFir() may now run
         return true;
     }
 
@@ -89,6 +91,7 @@ public:
     // still crossfading (isBusy()) — the host should retry with the LATEST snapshot once it's free.
     bool setBands (const eq::BandParams* bands, int numBands) noexcept
     {
+        if (! prepared_) return false;                         // unprepared — the FIR/scratch buffers are empty
         buildFir (bands, numBands, false, firMid_.data());     // Mid axis
         buildFir (bands, numBands, true,  firSide_.data());    // Side axis
         const float* irs[2] { firMid_.data(), firSide_.data() };
@@ -99,6 +102,7 @@ public:
     // a host that wants to drive the convolver itself.
     void buildFir (const eq::BandParams* bands, int numBands, bool side, float* out) noexcept
     {
+        if (! prepared_) return;                               // unprepared — magBuf_/spec_/time_/window_ are empty
         const int N = N_;
         eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), N / 2 + 1, side);
 
@@ -150,6 +154,7 @@ private:
 
     double fs_ = 48000.0;
     int maxBlock_ = 512, channels_ = 2, N_ = 16384;
+    bool prepared_ = false;                                    // true only after a fully-successful prepare()
 
     core::fft::DefaultRealFft buildFft_;                        // size-N IFFT for the FIR design
     convolution::ConvolutionEngine<core::fft::DefaultRealFft, 2> conv_;   // Mid (ch0) + Side (ch1), click-free swap
