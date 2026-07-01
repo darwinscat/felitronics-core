@@ -36,6 +36,24 @@ namespace
     }
 
     double db (double x) noexcept { return 20.0 * std::log10 (std::max (1e-12, x)); }
+
+    // Analog Butterworth band-stop magnitude (dB) for a prototype order m:
+    //   |H(iΩ)|² = 1 / (1 + (BW·Ω / (Ω0² − Ω²))^{2m}),  Ω0 = 2π f0,  BW = Ω0/Q.
+    // The independent reference the matched cascade is NULL-tested against.
+    double analogBandStopDb (double f, double f0, double Q, int m) noexcept
+    {
+        const double Om0 = 2.0 * kPi * f0, BW = Om0 / Q, Om = 2.0 * kPi * f;
+        const double x = BW * Om / (Om0 * Om0 - Om * Om);
+        return 10.0 * std::log10 (1.0 / (1.0 + std::pow (std::fabs (x), 2.0 * (double) m)));
+    }
+
+    // |H(e^{jw})| in dB of a cascade of biquad sections (their product response).
+    double cascadeDb (const BiquadCoeffs* s, int n, double w) noexcept
+    {
+        double m = 1.0;
+        for (int i = 0; i < n; ++i) m *= s[i].magnitude (w);
+        return 20.0 * std::log10 (std::max (1e-300, m));
+    }
 }
 
 void runMatchedBiquadTests()
@@ -80,10 +98,11 @@ void runMatchedBiquadTests()
     group ("notch / all-pass / tilt");
     {
         const auto n = matched::notch (1000.0, fs, 4.0);
-        expectTrue (n.magnitudeDb (w (1000.0)) < -40.0,    "notch: deep null at f0");
-        expectNear (n.magnitudeDb (0.0),       0.0, 0.05,  "notch: unity at DC");
-        expectNear (n.magnitudeDb (w (100.0)), 0.0, 1.0,   "notch: ~unity a decade below");
-        expectTrue (n.isStable(),                          "notch stable");
+        expectTrue (n.magnitudeDb (w (1000.0)) < -40.0,     "notch: deep null at f0");
+        expectNear (n.magnitudeDb (0.0),        0.0, 0.05,  "notch: unity at DC");
+        expectNear (n.magnitudeDb (w (100.0)),  0.0, 1.0,   "notch: ~unity a decade below");
+        expectNear (n.magnitudeDb (w (10000.0)), 0.0, 1.0,  "notch: ~unity a decade above");
+        expectTrue (n.isStable(),                           "notch stable");
 
         const auto ap = matched::allpass (2000.0, fs, 2.0);
         for (double f : { 50.0, 500.0, 2000.0, 9000.0, 18000.0 })
@@ -97,6 +116,166 @@ void runMatchedBiquadTests()
         expectNear (tiltDb (40.0),    -G,  1.0, "tilt: lows ~ -12 dB");
         expectNear (tiltDb (16000.0),  G,  1.0, "tilt: highs ~ +12 dB");
         expectNear (tiltDb (1000.0),   0.0, 1.5, "tilt: ~0 at the pivot");
+    }
+
+    group ("single notch: sweep f0 / Q — deep null, unity a decade out, log-symmetric skirts");
+    {
+        for (double f0 : { 60.0, 250.0, 1000.0, 4000.0, 12000.0 })
+            for (double Q : { 0.5, 1.0, 4.0, 16.0 })
+            {
+                const auto c = matched::notch (f0, fs, Q);
+                const std::string at = " (f0=" + std::to_string ((int) f0) + " Q=" + std::to_string (Q) + ")";
+                expectTrue (c.isStable(),                        "swept-Q notch stable" + at);
+                expectTrue (c.magnitudeDb (w (f0)) < -40.0,      "deep null at f0"       + at);
+                // unity a decade out on BOTH sides (a decade above must stay below Nyquist).
+                if (f0 * 10.0 < 0.45 * fs)
+                    expectNear (c.magnitudeDb (w (f0 * 10.0)), 0.0, 1.0, "unity a decade above" + at);
+                if (f0 / 10.0 > 20.0)
+                    expectNear (c.magnitudeDb (w (f0 / 10.0)), 0.0, 1.0, "unity a decade below" + at);
+                // skirts symmetric in LOG frequency: |H(f0·r)| ≈ |H(f0/r)| for a geometric detune r.
+                // Holds away from Nyquist; a matched notch trades log-symmetry for analog-magnitude
+                // fidelity as f→fs/2, so only assert it where both skirt points stay below 0.20·fs.
+                for (double r : { 1.3, 2.0, 3.0 })
+                    if (f0 * r < 0.20 * fs && f0 / r > 20.0)
+                    {
+                        const double up = c.magnitudeDb (w (f0 * r)), dn = c.magnitudeDb (w (f0 / r));
+                        expectNear (up, dn, 0.6, "log-symmetric skirt r=" + std::to_string (r) + at);
+                    }
+            }
+    }
+
+    group ("variable-order band-stop: order 1 == matched::notch BIT-FOR-BIT (legacy sessions don't drift)");
+    {
+        BiquadCoeffs out[8];
+        for (double f0 : { 50.0, 200.0, 1000.0, 5000.0, 18000.0 })
+            for (double Q : { 0.3, 0.707, 2.0, 8.0, 30.0 })
+            {
+                const int n = matched::notchCascade (f0, fs, Q, 1, out);
+                const auto ref = matched::notch (f0, fs, Q);
+                const std::string at = " (f0=" + std::to_string ((int) f0) + " Q=" + std::to_string (Q) + ")";
+                expectTrue (n == 1, "order-1 is a single section" + at);
+                expectTrue (out[0].b0 == ref.b0 && out[0].b1 == ref.b1 && out[0].b2 == ref.b2
+                         && out[0].a1 == ref.a1 && out[0].a2 == ref.a2, "coeffs bit-identical" + at);
+            }
+    }
+
+    group ("variable-order band-stop: deep null + unity DC/Nyquist + skirt steepens monotonically with order");
+    {
+        for (double f0 : { 120.0, 1000.0, 6000.0 })
+        {
+            const double Q = 3.0;
+            double prevSteep = -1e9;
+            BiquadCoeffs out[8];
+            for (int m : { 1, 2, 3, 4, 6, 8 })
+            {
+                const int n = matched::notchCascade (f0, fs, Q, m, out);
+                const std::string at = " (f0=" + std::to_string ((int) f0) + " m=" + std::to_string (m) + ")";
+                expectTrue (n == m,                                    "section count == order"    + at);
+                bool stable = true; for (int i = 0; i < n; ++i) stable = stable && out[i].isStable();
+                expectTrue (stable,                                    "all sections stable"       + at);
+                expectTrue (cascadeDb (out, n, w (f0)) < -60.0,        "order-fold deep null at f0" + at);
+                expectNear (cascadeDb (out, n, 0.0), 0.0, 0.02,        "unity at DC"               + at);
+                expectNear (cascadeDb (out, n, kPi), 0.0, 0.5,         "≈unity at Nyquist"          + at);
+                // steepness = dB recovered between a near-null detune and an octave out; grows with order.
+                const double steep = cascadeDb (out, n, w (f0 * 2.0)) - cascadeDb (out, n, w (f0 * std::pow (2.0, 1.0 / 6.0)));
+                if (m > 1) expectTrue (steep > prevSteep + 0.2, "skirt steeper than lower order" + at);
+                prevSteep = steep;
+            }
+        }
+    }
+
+    group ("variable-order band-stop: reference-NULL vs analog Butterworth band-stop");
+    {
+        BiquadCoeffs out[8];
+        // Mid-band notch: the matched cascade tracks the analog prototype tightly away from Nyquist.
+        for (int m : { 2, 3, 4, 5, 7, 8 })
+        {
+            const double f0 = 1000.0, Q = 2.0;
+            const int n = matched::notchCascade (f0, fs, Q, m, out);
+            double maxErr = 0.0;
+            for (double f = 100.0; f < 0.30 * fs; f *= 1.02)
+                if (std::fabs (f - f0) > 0.06 * f0)                    // skip the ±ε neighbourhood of the −∞ null
+                    maxErr = std::max (maxErr, std::fabs (cascadeDb (out, n, w (f)) - analogBandStopDb (f, f0, Q, m)));
+            std::printf ("      m=%d mid-band max|cascade−analog| = %.4f dB\n", m, maxErr);
+            expectTrue (maxErr < 0.10, "matched cascade == analog band-stop (m=" + std::to_string (m) + ")");
+        }
+        // High notch pushing skirts toward Nyquist: still close, looser tolerance (matched ≠ exact at fs/2).
+        {
+            const double f0 = 9000.0, Q = 3.0; const int m = 4;
+            const int n = matched::notchCascade (f0, fs, Q, m, out);
+            double maxErr = 0.0;
+            for (double f = 2000.0; f < 0.45 * fs; f *= 1.02)
+                if (std::fabs (f - f0) > 0.06 * f0)
+                    maxErr = std::max (maxErr, std::fabs (cascadeDb (out, n, w (f)) - analogBandStopDb (f, f0, Q, m)));
+            std::printf ("      high f0=9k m=4 broadband max|cascade−analog| = %.4f dB\n", maxErr);
+            expectTrue (maxErr < 1.0, "high-f0 cascade tracks analog within 1 dB across band");
+        }
+    }
+
+    group ("variable-order band-stop: stable + deep null across fs / f0 / Q / order grid");
+    {
+        int unstable = 0; double worstNull = -1e9;
+        BiquadCoeffs out[8];
+        for (double fsg : { 44100.0, 48000.0, 96000.0 })
+            for (double Q : { 0.2, 0.5, 0.707, 2.0, 10.0, 30.0 })
+                for (int m : { 2, 3, 4, 6, 8 })
+                    for (double f0 = 20.0; f0 <= 0.45 * fsg; f0 *= 1.4)
+                    {
+                        const int n = matched::notchCascade (f0, fsg, Q, m, out);
+                        for (int i = 0; i < n; ++i) if (! out[i].isStable()) ++unstable;
+                        worstNull = std::max (worstNull, cascadeDb (out, n, 2.0 * kPi * f0 / fsg));
+                    }
+        std::printf ("      grid: %d unstable sections; worst null across grid = %.1f dB\n", unstable, worstNull);
+        expectTrue (unstable == 0,       "every section stable across the whole grid");
+        expectTrue (worstNull < -60.0,   "null stays ≥60 dB deep everywhere on the grid");
+    }
+
+    group ("variable-order band-stop: Nyquist edge — f0 near fs/2 stays deep + stable");
+    {
+        BiquadCoeffs out[8];
+        for (double frac : { 0.40, 0.45, 0.48 })
+            for (int m : { 2, 4, 8 })
+            {
+                const double f0 = frac * fs;
+                const int n = matched::notchCascade (f0, fs, 3.0, m, out);
+                const std::string at = " (f0=" + std::to_string ((int) f0) + " m=" + std::to_string (m) + ")";
+                bool stable = true; for (int i = 0; i < n; ++i) stable = stable && out[i].isStable();
+                expectTrue (stable,                              "sections stable near Nyquist" + at);
+                expectTrue (cascadeDb (out, n, w (f0)) < -60.0,  "null survives near Nyquist"    + at);
+                expectNear (cascadeDb (out, n, 0.0), 0.0, 0.05,  "unity at DC near Nyquist"      + at);
+            }
+    }
+
+    group ("variable-order band-stop: exactly `order` sections for every order 1..8 (odd-order pairing)");
+    {
+        BiquadCoeffs out[8];
+        for (int m = 1; m <= 8; ++m)
+            for (double f0 : { 100.0, 1000.0, 9000.0 })
+                for (double Q : { 0.5, 3.0, 12.0 })
+                {
+                    const int n = matched::notchCascade (f0, fs, Q, m, out);
+                    const std::string at = " (order=" + std::to_string (m) + " f0=" + std::to_string ((int) f0) + ")";
+                    expectTrue (n == m, "returns exactly `order` sections" + at);
+                    bool stable = true; for (int i = 0; i < n; ++i) stable = stable && out[i].isStable();
+                    expectTrue (stable, "all sections stable" + at);
+                    expectTrue (cascadeDb (out, n, w (f0)) < -60.0, "deep null" + at);
+                }
+    }
+
+    group ("variable-order band-stop: a cut-only filter never boosts above unity (maximally flat)");
+    {
+        BiquadCoeffs out[8];
+        double worstOver = -1e9;
+        for (double Q : { 0.05, 0.2, 0.707, 4.0, 40.0 })
+            for (int m : { 2, 4, 6, 8 })
+                for (double f0 : { 20.0, 200.0, 2000.0, 0.40 * fs, 0.48 * fs })
+                {
+                    const int n = matched::notchCascade (f0, fs, Q, m, out);
+                    for (double f = 5.0; f < 0.5 * fs; f *= 1.03)
+                        worstOver = std::max (worstOver, cascadeDb (out, n, w (f)));
+                }
+        std::printf ("      worst magnitude above 0 dB across the grid = %+.4f dB\n", worstOver);
+        expectTrue (worstOver < 0.02, "band-stop never boosts (<= unity everywhere => maximally flat)");
     }
 
     group ("lowpass: matched hits analog |H(w0)| = Q where RBJ cramps");

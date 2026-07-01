@@ -239,6 +239,76 @@ namespace matched
     }
 
     //==========================================================================
+    // Variable-order matched band-stop (Butterworth). `sections` (1..8) is the Butterworth LP
+    // prototype order AND the biquad count: the analog low-pass→band-stop transform
+    //     s_lp → BW·s / (s² + Ω0²),   Ω0 = 2π f0,  BW = Ω0 / Q
+    // maps each prototype pole p to a quadratic  s² − (BW/p)·s + Ω0² = 0  whose two roots are a
+    // geometric (log-symmetric) stagger pair about f0 (product of roots = Ω0²). Every section pins
+    // its ZEROS at ±w0 (numerator normalised to unity at DC, exactly as matched::notch), so the
+    // cascade keeps an order-fold INFINITE null that never drifts, a maximally-flat passband, and
+    // skirts that steepen with `sections`; only the POLES stagger. Q stays the overall −3 dB
+    // BANDWIDTH (Q = f0/BW), independent of order.
+    //
+    // Poles are placed by the matched-Z map z = exp(sT) — algebraically identical to
+    // detail::matchedPoles — so nothing cramps at Nyquist, and because the LP→BS transform keeps
+    // every pole in the left half-plane (roots share the sign of Re, and their sum has Re<0 ⇒ both
+    // in the LHP) each z sits strictly inside the unit circle ⇒ every section is stable by
+    // construction, with no frequency clamp. `sections`≤1 falls back to notch(f0,fs,Q) BIT-FOR-BIT
+    // (the legacy single notch / swept anchor). Fills out[0..n) and returns n (== clamped sections).
+    // Preconditions (as across matched::): 0 < f0 < fs/2 and Q > 0 — designBand() guarantees them.
+    inline int notchCascade (double f0, double fs, double Q, int sections, BiquadCoeffs* out) noexcept
+    {
+        const int m = sections < 1 ? 1 : (sections > 8 ? 8 : sections);
+        if (m == 1) { out[0] = notch (f0, fs, Q); return 1; }
+
+        const double w0  = 2.0 * kPi * f0 / fs;          // digital notch angle (shared zeros at ±w0)
+        const double cw  = std::cos (w0);
+        const double Om0 = 2.0 * kPi * f0;               // analog centre (rad/s)
+        const double BW  = Om0 / Q;                       // analog −3 dB bandwidth (rad/s)
+        const double T   = 1.0 / fs;
+
+        // One matched notch biquad from a pair of analog-pole exponentials z1,z2 (a conjugate pair,
+        // or two reals for an over-damped centre section): stable poles, zeros pinned at ±w0, gain
+        // normalised to unity at DC — the same numerator the single matched::notch uses.
+        auto emit = [&] (int idx, const std::complex<double>& z1, const std::complex<double>& z2) noexcept
+        {
+            const double a1 = -(z1 + z2).real();
+            const double a2 =  (z1 * z2).real();
+            const double k  = (1.0 + a1 + a2) / (2.0 - 2.0 * cw);
+            out[idx] = { k, -2.0 * k * cw, k, a1, a2 };
+        };
+
+        int n = 0;
+        for (int i = 1; i <= m; ++i)
+        {
+            // i-th Butterworth LP prototype pole on the unit circle in the LHP (angles in (π/2, 3π/2)).
+            const double theta = kPi * (2.0 * i - 1.0) / (2.0 * m) + kPi * 0.5;
+            const std::complex<double> p { std::cos (theta), std::sin (theta) };
+            if (p.imag() < -1e-12) continue;             // one representative per conjugate prototype pair
+
+            // LP→BS quadratic  s² + b·s + Ω0² = 0  with b = −BW/p. Take the larger-magnitude root
+            // directly (its two terms reinforce — no cancellation), the smaller by Vieta (r1·r2 = Ω0²),
+            // so a wide (low-Q) notch keeps full precision in its low stagger pole.
+            const std::complex<double> b    = -BW / p;
+            const std::complex<double> disc = std::sqrt (b * b - 4.0 * Om0 * Om0);
+            const std::complex<double> r1   = (std::abs (-b + disc) >= std::abs (-b - disc))
+                                                ? 0.5 * (-b + disc) : 0.5 * (-b - disc);
+            const std::complex<double> r2   = (Om0 * Om0) / r1;
+
+            if (std::abs (p.imag()) < 1e-12)
+                emit (n++, std::exp (r1 * T), std::exp (r2 * T));                 // real proto pole → 1 centre section
+            else
+            {
+                const std::complex<double> zr1 = std::exp (r1 * T);              // complex proto pole → 2 stagger
+                const std::complex<double> zr2 = std::exp (r2 * T);              // sections (each root ⊗ its conjugate)
+                emit (n++, zr1, std::conj (zr1));
+                emit (n++, zr2, std::conj (zr2));
+            }
+        }
+        return n;
+    }
+
+    //==========================================================================
     // All-pass: |H| = 1 at every frequency (flat magnitude); the phase rotates 360° through f0 with
     // sharpness set by Q. Numerator is the reversed denominator, which forces unit magnitude.
     inline BiquadCoeffs allpass (double f0, double fs, double Q) noexcept

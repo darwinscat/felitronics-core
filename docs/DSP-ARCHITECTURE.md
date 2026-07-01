@@ -206,6 +206,12 @@ here is the *goal* state — only the adapter touches JUCE.
   biquad** cascade (Vicanek, up to 96 dB/oct = 8 sections, `MatchedBiquad.h`) for static treatment, and
   a **Cytomic SVF** (`teq::Svf`, applied at `:283`) for the swept/search band (clean under fast `fc`
   sweeps). Coeffs recompute once per block, skipped when settled (`:192-194`).
+- **Variable-order Notch** (`matched::notchCascade`, `designBand` Notch branch): the band-stop mirrors
+  HP/LP — `slope` → order (`clamp(slope/6,1,16)`), realised as a Butterworth LP→BS cascade of
+  `ceil(order/2)` matched sections (capped at 8) with the **zeros pinned at f0** (an order-fold infinite
+  null that never drifts) and only the **poles staggered**; `Q` stays the −3 dB **width**, independent
+  of order. Mapping: 6/12 dB/oct → 1 section (**== the legacy single matched notch, bit-for-bit** →
+  old sessions don't drift), 24→2, 48→4, 96→8. The GUI curve picks it up for free (it iterates `d.sec[]`).
 - **M/S dual-lane**: in `ms` mode each band runs an independent Mid (col 0) + Side (col 1) design
   (`EqBand.h:200-216`; Side params `EqTypes.h:46-55`); mono/surround = Mid lane only.
 - **Software denormal flush** in both kernels (`Biquad::flushDenormals` `MatchedBiquad.h:426`,

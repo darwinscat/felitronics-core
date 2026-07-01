@@ -54,6 +54,17 @@ inline BandDesign designBand (const BandParams& in, double fs) noexcept
         }
         d.n = idx;
     }
+    else if (p.type == FilterType::Notch && ! p.swept)
+    {
+        // Variable-steepness matched band-stop. `order` mirrors HP/LP (slope/6); a notch biquad is
+        // inherently 2-sided, so the Butterworth prototype order — and the biquad count — is
+        // ceil(order/2), capped at kMaxSections. order∈{1,2} (slope 6/12) → 1 section == today's
+        // single matched notch BIT-FOR-BIT (legacy sessions don't drift); 24→2, 48→4, 96→8. Q stays
+        // the overall −3 dB bandwidth, independent of order.
+        const int order = std::clamp (p.slope / 6, 1, 16);
+        const int m     = std::clamp ((order + 1) / 2, 1, BandDesign::kMaxSections);
+        d.n = matched::notchCascade (p.freq, fs, p.Q, m, d.sec);
+    }
     else if (p.type == FilterType::Tilt)
     {
         d.sec[0] = matched::lowShelfDb  (p.freq, fs, -p.gainDb);   // lows down

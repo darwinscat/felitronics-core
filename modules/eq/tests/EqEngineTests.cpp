@@ -13,9 +13,22 @@
 #include <teq/Smoother.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <vector>
+
+// RT-safety: count every heap allocation so the audio path can be asserted alloc-free (as in the
+// other module suites). Only ONE TU in this executable may replace global operator new.
+static std::atomic<long> g_allocs { 0 };
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void  operator delete   (void* p) noexcept { std::free (p); }
+void  operator delete[] (void* p) noexcept { std::free (p); }
+void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
+void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace teq;
 
@@ -272,6 +285,176 @@ void runEqEngineTests()
             std::printf ("      HP %2d dB/oct: octave rolloff = %.1f dB\n", slope, oct);
             expectTrue (oct > slope * 0.85 && oct < slope * 1.18, "HP slope ~ " + std::to_string (slope) + " dB/oct");
         }
+    }
+
+    group ("Notch variable order: designBand slope->sections mapping; default slope 12 == legacy single notch");
+    {
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 4.0;
+        const int expect[][2] = { {6,1}, {12,1}, {24,2}, {36,3}, {48,4}, {72,6}, {96,8} };   // order=slope/6; sections=ceil(order/2)
+        for (auto& e : expect) { p.slope = e[0]; const auto d = designBand (p, fs);
+            expectTrue (d.n == e[1], "slope " + std::to_string (e[0]) + " -> " + std::to_string (e[1]) + " sections"); }
+
+        p.slope = 12; const auto d12 = designBand (p, fs);                 // the default must be the pre-existing notch, bit-for-bit
+        const auto ref = matched::notch (1000.0, fs, 4.0);
+        expectTrue (d12.n == 1 && d12.sec[0].b0 == ref.b0 && d12.sec[0].b1 == ref.b1 && d12.sec[0].b2 == ref.b2
+                 && d12.sec[0].a1 == ref.a1 && d12.sec[0].a2 == ref.a2, "slope 12 == matched::notch bit-for-bit (no session drift)");
+
+        p.slope = 96; p.swept = true; const auto ds = designBand (p, fs);  // swept notch stays the single fallback (SVF = one stage)
+        expectTrue (ds.n == 1, "swept notch ignores slope (single fallback)");
+    }
+
+    group ("EqBand Notch variable slope: audio == analytic; in-band attenuation grows with slope");
+    {
+        const double f0 = 1000.0, fdet = f0 * std::pow (2.0, 1.0 / 6.0);   // +1/6 octave: inside the -3 dB band
+        auto meas = [&] (int slope)
+        {
+            EqBand band; band.prepare (fs, 1);
+            BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = f0; p.Q = 3.0; p.slope = slope;
+            band.setParams (p);
+            const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, fdet, fs);
+            const double r = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * fdet / fs)));
+            return std::pair<double, double> { a, r };
+        };
+        double prev = 1e9;
+        for (int slope : { 12, 24, 48, 96 })
+        {
+            const auto ar = meas (slope);
+            std::printf ("      notch slope=%2d @+1/6oct: audio=%.2f  analytic=%.2f dB\n", slope, ar.first, ar.second);
+            expectNear (ar.first, ar.second, 0.6, "audio == analytic response (slope " + std::to_string (slope) + ")");
+            expectTrue (ar.first < prev - 2.0, "steeper slope attenuates more in-band (slope " + std::to_string (slope) + ")");
+            prev = ar.first;
+        }
+        EqBand band; band.prepare (fs, 1);                                 // far from f0 the high-order notch is transparent
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = f0; p.Q = 3.0; p.slope = 96;
+        band.setParams (p);
+        const double far = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 250.0, fs);
+        expectNear (far, 0.0, 0.4, "slope-96 notch: unity two octaves below f0");
+    }
+
+    group ("RT-safety: a moving 8-section (slope-96) Notch processes with ZERO heap allocations");
+    {
+        EqBand band; band.prepare (fs, 2);
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = 96;
+        band.setParams (p);
+        const int n = 128; std::vector<float> L ((size_t) n), R ((size_t) n);
+        float* ch[2] = { L.data(), R.data() };
+        auto fill = [&] (int b) { for (int i = 0; i < n; ++i) {
+            L[(size_t) i] = (float) (0.10 * std::sin (2.0 * kPi *  900.0 * (b * n + i) / fs));
+            R[(size_t) i] = (float) (0.08 * std::sin (2.0 * kPi * 1100.0 * (b * n + i) / fs)); } };
+        for (int b = 0; b < 4; ++b) { fill (b); band.processBlock (ch, 2, n); }   // warm up (allocs before the snapshot are fine)
+
+        const long before = g_allocs.load (std::memory_order_relaxed);
+        for (int b = 0; b < 300; ++b)
+        {
+            p.freq = 700.0 + 0.7 * b;                                      // keep the freq smoother moving -> designBand()/notchCascade run every block
+            band.setParams (p);
+            fill (b);
+            band.processBlock (ch, 2, n);
+        }
+        const long after = g_allocs.load (std::memory_order_relaxed);
+        std::printf ("      heap allocations during 300 moving 8-section blocks: %ld\n", after - before);
+        expectTrue (after == before, "moving high-order notch: no heap allocation in the audio path");
+        expectTrue (! anyNaN (L.data(), n) && ! anyNaN (R.data(), n), "finite output");
+    }
+
+    group ("Notch through a LIVE broadband signal: per-band energy is cut at f0, preserved elsewhere");
+    {
+        // Deterministic, portable white noise (fixed 64-bit LCG — identical bytes on every platform,
+        // no std::random locale/impl variance) so the measurement is reproducible on Windows / any CPU.
+        std::uint64_t st = 0x9E3779B97F4A7C15ULL;
+        auto rnd = [&] { st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+                         return (double) (st >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0; };
+        const int N = 1 << 15;
+        std::vector<float> in ((size_t) N);
+        for (int i = 0; i < N; ++i) in[(size_t) i] = (float) (0.2 * rnd());
+
+        // Integrated band energy over [fa,fb] (sum of exact-bin Goertzel powers — averages out the
+        // single-realization leakage a per-bin estimate suffers on a steep skirt; stable across builds).
+        auto binPow = [&] (const std::vector<float>& x, double f) {
+            const double c = 2.0 * std::cos (2.0 * kPi * f / fs); double s1 = 0.0, s2 = 0.0;
+            for (int i = 0; i < N; ++i) { const double s0 = (double) x[(size_t) i] + c * s1 - s2; s2 = s1; s1 = s0; }
+            return s1 * s1 + s2 * s2 - c * s1 * s2;
+        };
+        auto bandDb = [&] (const std::vector<float>& out, double fa, double fb) {
+            const long ka = std::llround (fa * N / fs), kb = std::llround (fb * N / fs);
+            double ei = 0.0, eo = 0.0;
+            for (long k = ka; k <= kb; ++k) { const double f = (double) k * fs / N; ei += binPow (in, f); eo += binPow (out, f); }
+            return 10.0 * std::log10 (eo / std::max (1e-300, ei));
+        };
+        auto runNotch = [&] (int slope) {
+            EqBand band; band.prepare (fs, 1);
+            BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = slope;
+            band.setParams (p);
+            std::vector<float> out = in;
+            for (int o = 0; o < N; o += 256) { float* ch[1] = { out.data() + o }; band.processBlock (ch, 1, std::min (256, N - o)); }
+            return out;
+        };
+
+        const auto o96 = runNotch (96), o24 = runNotch (24);
+        const double stop96 = bandDb (o96, 917.0, 1091.0), stop24 = bandDb (o24, 917.0, 1091.0);   // ±1/6 oct around f0
+        std::printf ("      live noise: stopband energy slope24=%.1f  slope96=%.1f dB\n", stop24, stop96);
+        expectTrue (stop96 < -25.0,          "slope-96 strips >25 dB of live energy in the ±1/6-oct stop band");
+        expectTrue (stop24 < -10.0,          "slope-24 also cuts the stop band");
+        expectTrue (stop96 < stop24 - 8.0,   "higher order removes materially MORE in-band energy");
+        for (const auto& band : { std::pair<double,double> { 280.0, 360.0 }, { 500.0, 700.0 }, { 3800.0, 4200.0 } })
+            expectNear (bandDb (o96, band.first, band.second), 0.0, 0.2,
+                        "passband energy preserved [" + std::to_string ((int) band.first) + "," + std::to_string ((int) band.second) + "]");
+    }
+
+    group ("Notch denormal flush: high-order tail decays to exact zero (no subnormal spikes on any CPU)");
+    {
+        EqBand band; band.prepare (fs, 1);
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = 96;   // 8 sections
+        band.setParams (p);
+        const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* ch[1] = { buf.data() };
+        band.processBlock (ch, 1, n);
+        for (int b = 0; b < 300; ++b) { for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n); }
+        double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
+        expectTrue (tail == 0.0, "8-section notch tail flushed to exact zero (no denormal residue)");
+    }
+
+    group ("Notch topology toggle (slope 96<->12 changes section count) clears stale state");
+    {
+        const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); float* ch[1] = { buf.data() };
+        EqBand band; band.prepare (fs, 1);
+        BandParams hi; hi.on = true; hi.type = FilterType::Notch; hi.freq = 1000.0; hi.Q = 3.0; hi.slope = 96;
+        band.setParams (hi);
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; band.processBlock (ch, 1, n);       // build 8-section state
+        BandParams lo = hi; lo.slope = 12; band.setParams (lo);
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);                       // -> single (resets)
+        band.setParams (hi);                                                                                    // -> 8 sections again
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);
+        double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
+        expectTrue (tail == 0.0, "no stale tail after the notch section count changes");
+    }
+
+    group ("parameter safety: a high-order Notch with NaN / Inf / degenerate params stays finite");
+    {
+        const double inf = std::numeric_limits<double>::infinity();
+        EqEngine eng; eng.prepare (fs, 256, 1);
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = std::nan (""); p.Q = 0.0; p.gainDb = inf; p.slope = 96;
+        eng.setBand (0, p);
+        const int n = 256; std::vector<float> buf ((size_t) n);
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.3f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
+        float* ch[1] = { buf.data() };
+        for (int b = 0; b < 20; ++b) eng.process (ch, 1, n);
+        expectTrue (! anyNaN (buf.data(), n),                  "sanitised high-order notch -> finite output");
+        expectTrue (std::isfinite (eng.magnitudeDb (1000.0)),  "magnitudeDb finite for a bad-param high-order notch");
+    }
+
+    group ("Notch high order in M/S: an 8-section Mid-lane notch leaves the Side axis untouched");
+    {
+        EqBand b; b.prepare (fs, 2);
+        BandParams p; p.on = true; p.ms = true; p.sOn = false;                     // Side lane disabled -> Side (L−R) must be bit-exact
+        p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = 96;
+        b.setParams (p);
+        const int n = 200; std::vector<float> L ((size_t) n), R ((size_t) n), S0 ((size_t) n);
+        for (int i = 0; i < n; ++i) { L[(size_t) i] = (float) (0.20 * std::sin (2.0 * kPi * 1122.0 * i / fs));
+                                      R[(size_t) i] = (float) (0.15 * std::sin (2.0 * kPi * 1122.0 * i / fs + 0.7));
+                                      S0[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]); }
+        float* ch[2] = { L.data(), R.data() }; b.processBlock (ch, 2, n);
+        double sErr = 0.0; for (int i = 0; i < n; ++i) sErr = std::max (sErr, (double) std::fabs (0.5f * (L[(size_t) i] - R[(size_t) i]) - S0[(size_t) i]));
+        expectNear (sErr, 0.0, 1e-5, "8-section Mid notch: Side axis preserved to float precision");
     }
 
     group ("bypass: a bypassed band is transparent");
