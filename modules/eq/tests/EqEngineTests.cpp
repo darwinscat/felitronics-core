@@ -183,6 +183,44 @@ void runEqEngineTests()
         expectNear (meas, 0.0, 0.5, "unity (0 dB) at centre");
     }
 
+    group ("swept Notch is a REAL notch (SVF low+high): deep cut at fc, unity off-band — not a pass-through");
+    {
+        // Regression: FilterType::Notch with swept=true used to be a bit-exact audio pass-through
+        // (the SVF mapped it to m0=1,m1=0,m2=0) while the display showed a full notch curve. The SVF
+        // now realises notch = low + high = v0 − k·v1, with an exact null at the prewarped fc.
+        EqBand band; band.prepare (fs, 1);
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 2.0; p.swept = true;
+        band.setParams (p);
+        auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
+        const double atFc  = sineGainDb (ap, 1000.0, fs);
+        const double below = sineGainDb (ap, 125.0,  fs);
+        const double above = sineGainDb (ap, 8000.0, fs);
+        std::printf ("      swept notch: fc=%.1f  125Hz=%.2f  8k=%.2f dB\n", atFc, below, above);
+        expectTrue (atFc < -30.0,      "deep cut at fc (audio was a bit-exact pass-through)");
+        expectNear (below, 0.0, 0.3,   "unity well below fc");
+        expectNear (above, 0.0, 0.3,   "unity well above fc");
+    }
+
+    group ("swept Tilt runs the MATCHED two-shelf tilt (non-sweepable): audio == displayed curve");
+    {
+        // Regression: FilterType::Tilt with swept=true used to be a bit-exact audio pass-through while
+        // response()/bandResponse displayed the full ±gain tilt (up to ±30 dB of GUI lying). A one-SVF
+        // tilt cannot hold a unity pivot beyond ~6 dB, so Tilt now ignores the swept flag entirely.
+        EqBand band; band.prepare (fs, 1);
+        BandParams p; p.on = true; p.type = FilterType::Tilt; p.freq = 1000.0; p.Q = 1.0; p.gainDb = 12.0; p.swept = true;
+        band.setParams (p);
+        auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
+        const double lows  = sineGainDb (ap, 60.0,    fs);
+        const double highs = sineGainDb (ap, 12000.0, fs);
+        const double rLow  = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * 60.0    / fs)));
+        const double rHigh = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * 12000.0 / fs)));
+        std::printf ("      swept tilt: lows=%.2f (disp %.2f)  highs=%.2f (disp %.2f) dB\n", lows, rLow, highs, rHigh);
+        expectNear (lows,  -12.0, 1.0, "lows ~ -12 dB (tilt is audible, not silent)");
+        expectNear (highs,  12.0, 1.0, "highs ~ +12 dB");
+        expectNear (lows,  rLow,  0.4, "audio == displayed curve (lows)");
+        expectNear (highs, rHigh, 0.4, "audio == displayed curve (highs)");
+    }
+
     group ("swept SVF high shelf is Butterworth (plateau == gain, Q-independent)");
     {
         auto plateau = [&] (double Q)
