@@ -327,7 +327,7 @@ static double gGain = 12.0;                                               // gai
 
 static CellResult evalBell (double f0, double Q, double fs, double fCap)
 {
-    BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = f0; p.Q = Q; p.gainDb = gGain;
+    BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).gainDb = gGain;
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
     const double A = std::pow (10.0, gGain / 20.0);
@@ -338,7 +338,7 @@ static CellResult evalBell (double f0, double Q, double fs, double fCap)
 static CellResult evalShelf (double f0, double Q, double fs, double fCap, bool high)
 {
     BandParams p; p.on = true; p.type = high ? FilterType::HighShelf : FilterType::LowShelf;
-    p.freq = f0; p.Q = Q; p.gainDb = gGain;
+    p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).gainDb = gGain;
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
     const double A = std::pow (10.0, gGain / 20.0);
@@ -382,7 +382,7 @@ static CellResult evalCutSlope (double f0, double orderD, double fs, double fCap
 {
     const int order = std::clamp ((int) std::lround (orderD), 1, 16);
     BandParams p; p.on = true; p.type = hp ? FilterType::HighPass : FilterType::LowPass;
-    p.freq = f0; p.Q = 0.707; p.slope = order * 6;
+    p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = order * 6;
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
     auto rf = [&] (double f) { return hp ? ref::butterHP (f, f0, order) : ref::butterLP (f, f0, order); };
@@ -395,7 +395,7 @@ static CellResult evalLP (double f0, double y, double fs, double fCap) { return 
 
 static CellResult evalBandpass (double f0, double Q, double fs, double fCap)
 {
-    BandParams p; p.on = true; p.type = FilterType::BandPass; p.freq = f0; p.Q = Q;
+    BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q;
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
     double e = scanError (d, fs, f0, fCap, false, [&] (double f) { return ref::bandpass (f, f0, Q); });
@@ -404,7 +404,7 @@ static CellResult evalBandpass (double f0, double Q, double fs, double fCap)
 }
 static CellResult evalNotchM (double f0, double Q, double fs, double fCap, int slope)
 {
-    BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = f0; p.Q = Q; p.slope = slope;
+    BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).slope = slope;
     const int m = std::clamp ((std::clamp (slope / 6, 1, 16) + 1) / 2, 1, 8);
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
@@ -420,7 +420,7 @@ static CellResult evalNotchOrder (double f0, double orderD, double fs, double fC
 
 static CellResult evalAllpass (double f0, double Q, double fs, double fCap)
 {
-    BandParams p; p.on = true; p.type = FilterType::AllPass; p.freq = f0; p.Q = Q;
+    BandParams p; p.on = true; p.type = FilterType::AllPass; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q;
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
     // |H| must be identically 1; group delay must stay positive (a wrong-phase allpass hides in |H|).
@@ -447,7 +447,7 @@ static CellResult evalAllpass (double f0, double Q, double fs, double fCap)
 }
 static CellResult evalTilt (double f0, double gainDb, double fs, double fCap)
 {
-    BandParams p; p.on = true; p.type = FilterType::Tilt; p.freq = f0; p.gainDb = gainDb; p.Q = 1.0;
+    BandParams p; p.on = true; p.type = FilterType::Tilt; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).gainDb = gainDb; p.lane (Lane::Stereo).Q = 1.0;
     const BandDesign d = designBand (p, fs);
     if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
     const double G = std::pow (10.0, gainDb / 20.0);
@@ -666,7 +666,7 @@ static void renderCurveSheet (const std::string& name, const std::string& title,
         // RBJ baseline (bell): shows the cookbook cramping the matched design avoids
         if (cfg.rbj)
         {
-            const auto r = rbj::peaking (cfg.p.freq, fs, cfg.p.Q, std::pow (10.0, cfg.p.gainDb / 20.0));
+            const auto r = rbj::peaking (cfg.p.lane (Lane::Stereo).freq, fs, cfg.p.lane (Lane::Stereo).Q, std::pow (10.0, cfg.p.lane (Lane::Stereo).gainDb / 20.0));
             lx = -1; ly = -1;
             for (int i = 0; i < 480; ++i)
             {
@@ -695,7 +695,7 @@ static void renderCurveSheet (const std::string& name, const std::string& title,
         for (int i = 0; i < 480; ++i)
         {
             const double f = fLo * std::pow (fHi / fLo, i / 479.0);
-            const bool skip = cfg.notchNull && std::fabs (f - cfg.p.freq) < 0.06 * cfg.p.freq;
+            const bool skip = cfg.notchNull && std::fabs (f - cfg.p.lane (Lane::Stereo).freq) < 0.06 * cfg.p.lane (Lane::Stereo).freq;
             const double rm = cfg.refMag (f, cfg.p);
             const double am = digitalMag (d, 2.0 * kPi * f / fs);
             const size_t bin = std::min (meas.size() - 1, (size_t) std::llround (f / fs * (double) nFft));
@@ -730,20 +730,20 @@ static void renderCurveSheet (const std::string& name, const std::string& title,
 
 //==============================================================================================
 // Curve-sheet reference adapters.
-static double refBellP    (double f, const BandParams& p) { return ref::bellMag  (f, p.freq, p.Q, std::pow (10.0, p.gainDb / 20.0)); }
-static double refLoShelfP (double f, const BandParams& p) { return ref::shelfQ   (f, p.freq, p.Q, std::pow (10.0, p.gainDb / 20.0), false); }
-static double refHiShelfP (double f, const BandParams& p) { return ref::shelfQ   (f, p.freq, p.Q, std::pow (10.0, p.gainDb / 20.0), true); }
-static double refHPp      (double f, const BandParams& p) { return ref::butterHP (f, p.freq, std::clamp (p.slope / 6, 1, 16)); }
-static double refLPp      (double f, const BandParams& p) { return ref::butterLP (f, p.freq, std::clamp (p.slope / 6, 1, 16)); }
-static double refBPp      (double f, const BandParams& p) { return ref::bandpass (f, p.freq, p.Q); }
+static double refBellP    (double f, const BandParams& p) { return ref::bellMag  (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q, std::pow (10.0, p.lane (Lane::Stereo).gainDb / 20.0)); }
+static double refLoShelfP (double f, const BandParams& p) { return ref::shelfQ   (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q, std::pow (10.0, p.lane (Lane::Stereo).gainDb / 20.0), false); }
+static double refHiShelfP (double f, const BandParams& p) { return ref::shelfQ   (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q, std::pow (10.0, p.lane (Lane::Stereo).gainDb / 20.0), true); }
+static double refHPp      (double f, const BandParams& p) { return ref::butterHP (f, p.lane (Lane::Stereo).freq, std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16)); }
+static double refLPp      (double f, const BandParams& p) { return ref::butterLP (f, p.lane (Lane::Stereo).freq, std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16)); }
+static double refBPp      (double f, const BandParams& p) { return ref::bandpass (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q); }
 static double refNotchP   (double f, const BandParams& p)
-{ return ref::bandstop (f, p.freq, p.Q, std::clamp ((std::clamp (p.slope / 6, 1, 16) + 1) / 2, 1, 8)); }
+{ return ref::bandstop (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q, std::clamp ((std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16) + 1) / 2, 1, 8)); }
 static double refAPp      (double f, const BandParams&)   { (void) f; return 1.0; }
-static double refTiltP    (double f, const BandParams& p) { return ref::tilt     (f, p.freq, std::pow (10.0, p.gainDb / 20.0)); }
+static double refTiltP    (double f, const BandParams& p) { return ref::tilt     (f, p.lane (Lane::Stereo).freq, std::pow (10.0, p.lane (Lane::Stereo).gainDb / 20.0)); }
 
 static BandParams mk (FilterType t, double f0, double Q, double g = 0.0, int slope = 12, bool swept = false)
 {
-    BandParams p; p.on = true; p.type = t; p.freq = f0; p.Q = Q; p.gainDb = g; p.slope = slope; p.swept = swept;
+    BandParams p; p.on = true; p.type = t; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).gainDb = g; p.lane (Lane::Stereo).slope = slope; p.swept = swept;
     return p;
 }
 
