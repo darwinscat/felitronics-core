@@ -25,4 +25,10 @@ namespace teq
     using felitronics::eq::compositeResponse;
     using felitronics::eq::ResponseMatrix;
     using felitronics::eq::matrixResponse;
+    using felitronics::eq::accumulateBand;
+    using felitronics::eq::matrixResponseZeroPhase;
+    using felitronics::eq::laneActive;
+    using felitronics::eq::onlyStereoEnabled;
+    using felitronics::eq::MatrixBasis;
+    using felitronics::eq::detectBasis;
 }
