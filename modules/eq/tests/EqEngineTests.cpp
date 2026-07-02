@@ -763,4 +763,30 @@ void runEqEngineTests()
           const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { b.processBlock (ch, nc, n); }, 1000.0, fs);
           expectNear (g, 6.0, 0.5, "mono + M/S: Mid lane applies to the mono channel"); }
     }
+
+    group ("M/S on a surround bus (nc>=3): every channel runs the MID lane — Side never leaks into ch1");
+    {
+        // Regression: the Side lane's coefficients used to be written into state COLUMN 1
+        // unconditionally, but the M/S encode/decode branch only runs on exactly 2 channels — so on a
+        // surround bus channel 1 was filtered with the SIDE design (a 24 dB error), or with a HYBRID
+        // Mid/Side section chain when the two lanes' section counts differ. The documented contract
+        // (EqTypes.h) is: mono/surround ignore ms -> Mid lane only. The Side lane now owns its state.
+        const int C = 6;
+        { EqEngine eng; eng.prepare (fs, 256, C);                       // Mid +12 bell vs Side -12 bell, same freq
+          BandParams p; p.on = true; p.ms = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 1.0; p.gainDb = 12.0;
+          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 1000.0; p.sQ = 1.0; p.sGainDb = -12.0;
+          eng.setBand (0, p);
+          const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
+          for (int c = 0; c < C; ++c)
+              expectNear (g[(size_t) c], 12.0, 0.4, "surround ch " + std::to_string (c) + " == Mid lane (+12), not Side (-12)");
+        }
+        { EqEngine eng; eng.prepare (fs, 256, C);                       // section-count mismatch: Mid HP24 (2 sec) vs Side Bell (1 sec)
+          BandParams p; p.on = true; p.ms = true; p.type = FilterType::HighPass; p.freq = 1000.0; p.Q = 0.707; p.slope = 24;
+          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 1000.0; p.sQ = 1.0; p.sGainDb = 6.0;
+          eng.setBand (0, p);
+          const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
+          for (int c = 0; c < C; ++c)
+              expectNear (g[(size_t) c], -3.0103, 0.4, "surround ch " + std::to_string (c) + " == Mid HP24 at fc (no hybrid chain)");
+        }
+    }
 }
