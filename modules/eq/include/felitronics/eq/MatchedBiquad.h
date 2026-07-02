@@ -239,15 +239,47 @@ namespace matched
         const double w0 = 2.0 * kPi * f0 / fs;
         detail::matchedPoles (w0, Q, c.a1, c.a2);
 
-        const double s = std::sin (w0 * 0.5);
-        const double phi1 = s * s, phi0 = 1.0 - phi1, phi2 = 4.0 * phi0 * phi1;
-        const double t0 = 1.0 + c.a1 + c.a2, t1 = 1.0 - c.a1 + c.a2;
-        const double A0 = t0 * t0, A1 = t1 * t1, A2 = -4.0 * c.a2;
+        double B1, B2;
+        if (w0 < 0.02)
+        {
+            // Tiny-w0 branch. The classic evaluation dies of catastrophic cancellation here: R1 and
+            // R2 cancel to O(q²w0⁴)/O(q²w0²), then R1−R2·φ1 cancels again to O(q²w0⁶) — below double
+            // precision for f0 ≲ 50 Hz at high Q, driving B1 negative → safeSqrt clamps b1 to −0 and
+            // the CENTRE GAIN blows up (+28.6 dB at fs=192k, f0=10, Q=40; the formulas are exact,
+            // the double arithmetic isn't). Evaluate B1,B2 by their Maclaurin series in w0 instead
+            // (polynomials in q=1/(2Q) — valid for both the cos and cosh pole branches). Verified:
+            // centre unity within 1.9e-4 dB over fs{44.1..192}k × Q[0.05,40] × f0[10,200 Hz], seam
+            // jump ≤ 1.5e-5 dB at the gate; above the gate the classic path below is byte-identical.
+            const double q = 1.0 / (2.0 * Q);
+            const double q2 = q * q, q3 = q2 * q, q4 = q2 * q2, q5 = q4 * q, q6 = q4 * q2, q7 = q6 * q, q8 = q4 * q4;
+            const double x = w0, x2 = x * x, x3 = x2 * x, x4 = x2 * x2, x5 = x4 * x, x6 = x4 * x2;
+            B2 = x2 * ( (4.0 /  3.0) * q2
+               + x  * (-8.0 /  3.0) * q3
+               + x2 * ( 2.0 / 45.0  * q2 + 128.0 / 45.0 * q4)
+               + x3 * (-4.0 / 45.0  * q3 -  32.0 / 15.0 * q5)
+               + x4 * ( 1.0 / 630.0 * q2 +  94.0 / 945.0 * q4 + 44.0 / 35.0 * q6)
+               + x5 * (-1.0 / 315.0 * q3 -  76.0 / 945.0 * q5 - 584.0 / 945.0 * q7)
+               + x6 * ( 1.0 / 18900.0 * q2 + 209.0 / 56700.0 * q4 + 734.0 / 14175.0 * q6 + 3728.0 / 14175.0 * q8));
+            B1 = x2 * ( (32.0 /  3.0) * q2
+               + x  * (-64.0 /  3.0) * q3
+               + x2 * (-128.0 / 45.0 * q2 + 1168.0 / 45.0 * q4)
+               + x3 * ( 256.0 / 45.0 * q3 -  352.0 / 15.0 * q5)
+               + x4 * (  82.0 / 315.0 * q2 - 6088.0 / 945.0 * q4 + 1072.0 / 63.0 * q6)
+               + x5 * (-164.0 / 315.0 * q3 + 5008.0 / 945.0 * q5 - 1952.0 / 189.0 * q7)
+               + x6 * ( -46.0 / 4725.0 * q2 + 8131.0 / 14175.0 * q4 - 49376.0 / 14175.0 * q6 + 76528.0 / 14175.0 * q8));
+        }
+        else
+        {
+            const double s = std::sin (w0 * 0.5);
+            const double phi1 = s * s, phi0 = 1.0 - phi1, phi2 = 4.0 * phi0 * phi1;
+            const double t0 = 1.0 + c.a1 + c.a2, t1 = 1.0 - c.a1 + c.a2;
+            const double A0 = t0 * t0, A1 = t1 * t1, A2 = -4.0 * c.a2;
 
-        const double R1 = A0 * phi0 + A1 * phi1 + A2 * phi2;
-        const double R2 = -A0 + A1 + 4.0 * (phi0 - phi1) * A2;
-        const double B2 = (R1 - R2 * phi1) / (4.0 * phi1 * phi1);
-        const double B1 = R2 + 4.0 * (phi1 - phi0) * B2;
+            const double R1 = A0 * phi0 + A1 * phi1 + A2 * phi2;
+            const double R2 = -A0 + A1 + 4.0 * (phi0 - phi1) * A2;
+            B2 = (R1 - R2 * phi1) / (4.0 * phi1 * phi1);
+            B1 = R2 + 4.0 * (phi1 - phi0) * B2;
+        }
         c.b1 = -0.5 * detail::safeSqrt (B1);
         c.b0 = 0.5 * (detail::safeSqrt (B2 + c.b1 * c.b1) - c.b1);
         c.b2 = -c.b0 - c.b1;
