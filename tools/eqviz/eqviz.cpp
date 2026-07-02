@@ -465,7 +465,7 @@ static RGB bandColour (double errDb)
     return kRed;
 }
 static void renderHeatmap (const MapSpec& spec, double fs, double fCap, const std::string& outDir,
-                           std::FILE* csv, std::vector<std::string>& indexLines)
+                           std::FILE* csv, std::vector<std::string>& statsLines, std::vector<std::string>& imageBlocks)
 {
     const int cell = 5, mL = 64, mT = 34, mB = 40, mR = 120;
     const int W = mL + spec.nx * cell + mR, H = mT + spec.ny * cell + mB;
@@ -531,9 +531,10 @@ static void renderHeatmap (const MapSpec& spec, double fs, double fCap, const st
     const double pctGreen = 100.0 * nGreen / (double) (spec.nx * spec.ny);
     std::fprintf (csv, "%s,%d,%.1f,%.3f,\"%s\",%d\n", spec.name.c_str(), (int) fs, pctGreen, worst, worstAt.c_str(), nBroken);
     char line[256];
-    std::snprintf (line, sizeof (line), "| %s | %d | %.1f%% | %.3f dB (%s) | %d | ![%s](%s) |",
-                   spec.title.c_str(), (int) fs, pctGreen, worst, worstAt.c_str(), nBroken, file.c_str(), file.c_str());
-    indexLines.push_back (line);
+    std::snprintf (line, sizeof (line), "| %s | %d | %.1f%% | %.3f dB (%s) | %d |",
+                   spec.title.c_str(), (int) fs, pctGreen, worst, worstAt.c_str(), nBroken);
+    statsLines.push_back (line);
+    imageBlocks.push_back ("### " + spec.title + " — " + std::to_string ((int) fs) + " HZ\n\n![" + file + "](" + file + ")\n");
     std::printf ("  %-28s fs=%-6d green=%5.1f%%  worst=%7.3f dB  broken=%d\n",
                  spec.name.c_str(), (int) fs, pctGreen, worst, nBroken);
 }
@@ -609,7 +610,7 @@ struct CurveCfg
 
 static void renderCurveSheet (const std::string& name, const std::string& title,
                               const std::vector<CurveCfg>& cfgs, double fs,
-                              const std::string& outDir, std::vector<std::string>& indexLines)
+                              const std::string& outDir, std::vector<std::string>& imageBlocks)
 {
     const int cols = 2, rows = ((int) cfgs.size() + 1) / 2;
     const int PW = 420, PH = 240, mL = 40, gap = 18, top = 30;
@@ -723,7 +724,7 @@ static void renderCurveSheet (const std::string& name, const std::string& title,
 
     const std::string file = name + "_fs" + std::to_string ((int) fs) + ".png";
     if (! png::write (outDir + "/" + file, W, H, cv.px)) gWriteFailed = true;
-    indexLines.push_back ("| curves: " + title + " | " + std::to_string ((int) fs) + " | | | | ![" + file + "](" + file + ") |");
+    imageBlocks.push_back ("### CURVES: " + title + " — " + std::to_string ((int) fs) + " HZ\n\n![" + file + "](" + file + ")\n");
     std::printf ("  %-28s fs=%-6d curve sheet\n", name.c_str(), (int) fs);
 }
 
@@ -771,7 +772,8 @@ int main (int argc, char** argv)
     std::FILE* csv = std::fopen ((outDir + "/summary.csv").c_str(), "w");
     if (! csv) { std::fprintf (stderr, "cannot write to %s (does the directory exist?)\n", outDir.c_str()); return 2; }
     std::fprintf (csv, "map,fs,pct_green,worst_db,worst_at,broken_cells\n");
-    std::vector<std::string> indexLines;
+    std::vector<std::string> statsLines;
+    std::vector<std::string> imageBlocks;
 
     std::vector<MapSpec> maps;
     auto add = [&] (const char* n, const char* t, const char* yl, double lo, double hi, bool ylog,
@@ -793,7 +795,7 @@ int main (int argc, char** argv)
             add (("bell"    + sfx).c_str(), ("BELL"       + gl).c_str(), "Q", 0.05, 40.0, true, evalBell);
             add (("loshelf" + sfx).c_str(), ("LOW SHELF"  + gl).c_str(), "Q", 0.05, 40.0, true, evalLoShelf);
             add (("hishelf" + sfx).c_str(), ("HIGH SHELF" + gl).c_str(), "Q", 0.05, 40.0, true, evalHiShelf);
-            for (const auto& m : maps) renderHeatmap (m, fs, fCap, outDir, csv, indexLines);
+            for (const auto& m : maps) renderHeatmap (m, fs, fCap, outDir, csv, statsLines, imageBlocks);
         }
         // Q-independent / other-axis maps
         maps.clear();
@@ -804,7 +806,7 @@ int main (int argc, char** argv)
         add ("lp",       "LOWPASS BUTTERWORTH",  "ORDER",   1.0,  16.0, false, evalLP);
         add ("notchcas", "NOTCH CASCADE Q=.707", "ORDER",   1.0,  16.0, false, evalNotchOrder);
         add ("tilt",     "TILT",                 "GAIN DB", -30.0, 30.0, false, evalTilt);
-        for (const auto& m : maps) renderHeatmap (m, fs, fCap, outDir, csv, indexLines);
+        for (const auto& m : maps) renderHeatmap (m, fs, fCap, outDir, csv, statsLines, imageBlocks);
 
         // curve sheets with the measured float path (sentinel + vanilla configs per type)
         renderCurveSheet ("curves_bell_shelf", "BELL + SHELVES", {
@@ -812,29 +814,31 @@ int main (int argc, char** argv)
             { "BELL 16K Q4 +6 (AIR)",  mk (FilterType::Bell,      16000, 4.0,  6), refBellP,    true  },
             { "HISHELF 18K Q0.7 +6",   mk (FilterType::HighShelf, 18000, 0.7,  6), refHiShelfP, false },
             { "LOSHELF 0.45FS Q0.05 +6", mk (FilterType::LowShelf, 0.45 * fs, 0.05, 6), refLoShelfP, false },
-        }, fs, outDir, indexLines);
+        }, fs, outDir, imageBlocks);
         renderCurveSheet ("curves_cuts_bp", "CUTS + BANDPASS", {
             { "HP 1K ORDER 3 (18DB/OCT)", mk (FilterType::HighPass, 1000, 0.707, 0, 18), refHPp, false },
             { "LP 4K ORDER 8",            mk (FilterType::LowPass,  4000, 0.707, 0, 48), refLPp, false },
             { "BP 10.6HZ Q40 (LOW CORNER)", mk (FilterType::BandPass, 10.61, 40.0, 0),   refBPp, false },
             { "BP 1K Q4",                 mk (FilterType::BandPass, 1000, 4.0, 0),       refBPp, false },
-        }, fs, outDir, indexLines);
+        }, fs, outDir, imageBlocks);
         renderCurveSheet ("curves_notch_ap_tilt", "NOTCH + ALLPASS + TILT", {
             { "NOTCH 15K Q0.5 M4 (ALIAS)", mk (FilterType::Notch, 15000, 0.5, 0, 48), refNotchP, false, true },
             { "NOTCH 1K Q3 M8",            mk (FilterType::Notch, 1000, 3.0, 0, 96),  refNotchP, false, true },
             { "ALLPASS 2K Q2",             mk (FilterType::AllPass, 2000, 2.0, 0),    refAPp,    false },
             { "TILT 1K +12 (SWEPT FLAG)",  mk (FilterType::Tilt, 1000, 1.0, 12, 12, true), refTiltP, false },
-        }, fs, outDir, indexLines);
+        }, fs, outDir, imageBlocks);
     }
 
     // index.md
     if (std::FILE* idx = std::fopen ((outDir + "/index.md").c_str(), "w"))
     {
-        std::fprintf (idx, "# eqviz — filter quality pictures\n\nColour bands: green <0.1 dB · yellow <1 dB · orange <3 dB · red >=3 dB · black = unstable/non-finite.\n");
+        std::fprintf (idx, "# EQ Filter Quality Atlas\n\nEvery `felitronics::eq` filter type measured against an INDEPENDENT analog reference and rendered as quality maps. Generated by `tools/eqviz`.\n\nColour bands: green <0.1 dB · yellow <1 dB · orange <3 dB · red >=3 dB · black = unstable/non-finite.\n");
         std::fprintf (idx, "Error = worst |digital - analog reference| over f in [20 Hz, %s], both sides floor-clamped at -50 dB, MAXed with per-type invariants (centre gain, plateaus, null depth >= 60 dB, |H(fc)| = -3.01 dB, allpass |H|=1 + group delay > 0). Resonant shelves are scored against the analog ENVELOPE (their shipped contract), not pointwise.\n\n", full ? "0.4999 fs" : "0.95 fs/2");
         std::fprintf (idx, "READ THE MAPS AS DIFFS: some yellow/orange near the top of the band and at the extreme right edge is the matched design's INTENDED near-Nyquist trade (no cramping; first-order sections are bilinear; the single notch's frozen legacy sag). A regression is NEW red/black, or orange spreading into the mid-band, relative to main's maps.\n\n");
-        std::fprintf (idx, "| map | fs | green | worst | broken | image |\n|---|---|---|---|---|---|\n");
-        for (const auto& l : indexLines) std::fprintf (idx, "%s\n", l.c_str());
+        std::fprintf (idx, "## Summary\n\n| map | fs | green | worst | broken |\n|---|---|---|---|---|\n");
+        for (const auto& l : statsLines) std::fprintf (idx, "%s\n", l.c_str());
+        std::fprintf (idx, "\n## Maps\n\n");
+        for (const auto& b : imageBlocks) std::fprintf (idx, "%s\n", b.c_str());
         std::fclose (idx);
     }
     std::fclose (csv);
