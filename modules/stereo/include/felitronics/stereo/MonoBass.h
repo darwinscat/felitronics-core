@@ -21,8 +21,8 @@ namespace felitronics::stereo
 // TOPOLOGY (verified by math + the self-tests). Operate ONLY on the Side of a Mid/Side split, so the Mid
 // (the mono content you keep) passes UNFILTERED — no transient smear on the kept bass; only the
 // low-frequency Side (stereo) energy is removed. A full L/R crossover would needlessly filter the mono
-// bass too. Below fc the output is L == R BY CONSTRUCTION (the side goes to zero), so the tool can only
-// IMPROVE mono compatibility, never harm it.
+// bass too. The side rolls off at 24 dB/oct below fc (−6 dB at fc), so deep below fc the output tends to
+// L == R by construction — the tool can only IMPROVE mono compatibility, never harm it.
 //
 //   M = ½(L+R),  S = ½(L-R)
 //   S_wet = lowWidth·LP4(S) + HP4(S)      // LP4/HP4 = eq::Crossover2, a 4th-order Linkwitz-Riley split
@@ -67,7 +67,7 @@ public:
 
     void prepare (double sampleRate, int /*maxBlock*/ = 0, int /*maxChannels*/ = 2) noexcept
     {
-        fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        fs_ = (std::isfinite (sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;   // inf/NaN/≤0 -> 48 kHz
         xo_.prepare (fs_, 1);
         widthSm_.reset (fs_, kSmoothingMs * 0.001);
         xfSm_.reset (fs_, kSmoothingMs * 0.001);
@@ -133,7 +133,8 @@ public:
 private:
     void applyFrequency() noexcept                  // coefficients only — no state reset, so a freq move doesn't click
     {
-        freq_ = std::clamp (freq_, kMinFreq, (float) (0.45 * fs_));
+        const float hi = std::max (kMinFreq, (float) (0.45 * fs_));   // keep lo <= hi even at absurdly low fs (clamp UB otherwise)
+        freq_ = std::clamp (freq_, kMinFreq, hi);
         xo_.setFrequency (freq_);
     }
 

@@ -264,14 +264,18 @@ int main()
     test::group ("MonoBass: bypass boundary click-free + no stale tails");
     {
         // Worst case on purpose: pure Side tone AT fc, where the wet allpass is -1 vs the raw +1 —
-        // an unsmoothed switch would step by 2A; the crossfade must keep steps at carrier-slew scale.
-        const int seg = 4800, N = 6 * seg; const float A = 0.5f;
+        // an unsmoothed switch would step by up to 2A; the crossfade must keep steps at carrier-slew
+        // scale. fc is deliberately NOT an integer divisor of the segment (121.7 Hz + a phase offset):
+        // 120 Hz over 4800-sample calls puts every call boundary on a zero crossing, where a hard
+        // switch would be invisible — the topology change happens at call boundaries, so they must
+        // land at non-zero carrier phase for this test to have teeth.
+        const int seg = 4800, N = 6 * seg; const float A = 0.5f; const double fTone = 121.7;
         std::vector<float> L (N), R (N);
-        for (int i = 0; i < N; ++i) { const float v = A * (float) std::sin (2.0 * pi * 120.0 * i / sr); L[i] = v; R[i] = -v; }
+        for (int i = 0; i < N; ++i) { const float v = A * (float) std::sin (2.0 * pi * fTone * i / sr + 0.7); L[i] = v; R[i] = -v; }
         double inSlew = 0; for (int i = 1; i < N; ++i) inSlew = std::max (inSlew, (double) std::fabs (0.5f * (L[i] - R[i]) - 0.5f * (L[i - 1] - R[i - 1])));
 
         std::vector<float> Li = L, Ri = R;                                    // keep the input for the bypassed-segment check
-        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
+        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency ((float) fTone); mb.setLowWidth (0.0f); mb.reset();
         auto blk = [&] (int k) { float* io[2] { L.data() + k * seg, R.data() + k * seg }; mb.process (io, 2, seg); };
         blk (0);                                                              // settled mono-making
         mb.setLowWidth (1.0f); blk (1);                                       // 20 ms fade out, settles inside
@@ -335,6 +339,19 @@ int main()
 
         mb.setFrequency (5000.0f); mb.prepare (8000.0);
         test::ok (mb.frequency() == 3600.0f, "prepare() at a lower fs re-clamps fc to the new 0.45*fs");
+
+        // prepare() abuse: non-finite / absurdly low rates must not reach the clamp with lo > hi (UB)
+        // or the smoother ramp with an inf sample count.
+        { stereo::MonoBass m4; m4.prepare (INFINITY);
+          test::ok (m4.frequency() == 120.0f, "prepare(inf) -> 48 kHz fallback, fc clamp sane"); }
+        { stereo::MonoBass m4; m4.prepare (std::nan ("")); m4.setFrequency (200.0f);
+          test::ok (m4.frequency() == 200.0f, "prepare(NaN) -> 48 kHz fallback, setters live"); }
+        { stereo::MonoBass m4; m4.prepare (30.0);                            // 0.45*fs < kMinFreq: hi must not sink below lo
+          test::ok (m4.frequency() == 20.0f, "prepare(30 Hz) -> fc pinned at the 20 Hz floor (no lo>hi clamp UB)");
+          std::vector<float> l (256, 0.5f), r (256, -0.5f); float* io4[2] { l.data(), r.data() };
+          m4.process (io4, 2, 256);
+          bool fin = true; for (int i = 0; i < 256; ++i) fin = fin && std::isfinite (l[i]) && std::isfinite (r[i]);
+          test::ok (fin, "processing at an absurd fs stays finite"); }
 
         // Hammer noise through the extreme corners — the output must stay finite everywhere.
         bool finite = true;
