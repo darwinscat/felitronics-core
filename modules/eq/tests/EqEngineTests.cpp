@@ -13,11 +13,14 @@
 #include <teq/Smoother.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <vector>
 
 // RT-safety: count every heap allocation so the audio path can be asserted alloc-free (as in the
@@ -103,6 +106,73 @@ namespace
     }
 
     bool anyNaN (const float* d, int n) { for (int i = 0; i < n; ++i) if (! std::isfinite (d[i])) return true; return false; }
+}
+
+// Frozen v0.1.x process semantics for the T1 reference-NULL: the Stereo per-channel loop and the M/S
+// delta-fold, verbatim from the pre-lanes engine, but driven by the SAME designBand() coefficients the
+// v2 engine uses (fed through laneView, so the coefficients are shared and only the ROUTING is being
+// nulled). Snap-on-set (no ramp), so a static band is bit-exact against EqBand.
+namespace refv01
+{
+    struct Band
+    {
+        double fs = 48000.0;
+        int    ch = 2;
+        int    nST = 0, nM = 0, nS = 0;
+        bool   stRun = false, midRun = false, sideRun = false;
+        BiquadCoeffs cST[EqBand::kMaxSections], cM[EqBand::kMaxSections], cS[EqBand::kMaxSections];
+        Biquad bST[EqBand::kMaxSections][EqBand::kMaxChannels];
+        Biquad bM[EqBand::kMaxSections], bS[EqBand::kMaxSections];
+
+        void prepare (double sr, int nc) noexcept
+        {
+            fs = sr; ch = nc;
+            for (int s = 0; s < EqBand::kMaxSections; ++s)
+            {
+                for (int c = 0; c < EqBand::kMaxChannels; ++c) bST[s][c].reset();
+                bM[s].reset(); bS[s].reset();
+            }
+        }
+
+        void set (const BandParams& b) noexcept
+        {
+            const BandParams vST = laneView (b, Lane::Stereo);
+            const BandParams vM  = laneView (b, Lane::Mid);
+            const BandParams vS  = laneView (b, Lane::Side);
+            stRun   = vST.on && ! vST.bypass;
+            midRun  = vM.on  && ! vM.bypass;
+            sideRun = vS.on  && ! vS.bypass;
+            nST = nM = nS = 0;
+            if (stRun)   { const auto d = designBand (vST, fs); nST = d.n; for (int s = 0; s < d.n; ++s) { cST[s] = d.sec[s]; for (int c = 0; c < ch; ++c) bST[s][c].setCoeffs (cST[s]); } }
+            if (midRun)  { const auto d = designBand (vM,  fs); nM  = d.n; for (int s = 0; s < d.n; ++s) { cM[s]  = d.sec[s]; bM[s].setCoeffs (cM[s]); } }
+            if (sideRun) { const auto d = designBand (vS,  fs); nS  = d.n; for (int s = 0; s < d.n; ++s) { cS[s]  = d.sec[s]; bS[s].setCoeffs (cS[s]); } }
+        }
+
+        // {st}-only: the frozen v0.1.x per-channel loop.
+        void processStereo (float* const* c, int nc, int n) noexcept
+        {
+            const int C = nc < ch ? nc : ch;
+            for (int ci = 0; ci < C; ++ci)
+                for (int i = 0; i < n; ++i)
+                { float x = c[ci][i]; for (int s = 0; s < nST; ++s) x = bST[s][ci].processSample (x); c[ci][i] = x; }
+        }
+
+        // {m,s}: the frozen v0.1.x delta-fold (2-channel). midRun / sideRun gate each lane.
+        void processMS (float* const* c, int n) noexcept
+        {
+            float* L = c[0]; float* R = c[1];
+            for (int i = 0; i < n; ++i)
+            {
+                const float m = 0.5f * (L[i] + R[i]);
+                const float s = 0.5f * (L[i] - R[i]);
+                float dM = 0.0f, dS = 0.0f;
+                if (midRun)  { float x = m; for (int k = 0; k < nM; ++k) x = bM[k].processSample (x); dM = x - m; }
+                if (sideRun) { float y = s; for (int k = 0; k < nS; ++k) y = bS[k].processSample (y); dS = y - s; }
+                L[i] += dM + dS;
+                R[i] += dM - dS;
+            }
+        }
+    };
 }
 
 void runEqEngineTests()
@@ -849,5 +919,280 @@ void runEqEngineTests()
           for (int c = 0; c < C; ++c)
               expectNear (g[(size_t) c], 6.0, 0.4, "surround ch " + std::to_string (c) + " == ST lane (+6) on every channel");
         }
+    }
+
+    // ============================ PR-A lane tests (T1 .. T4) ============================
+    // Portable, seeded PRNG in [-1,1] (fixed 64-bit LCG — identical bytes on every platform).
+    auto lcg = [] (std::uint64_t& st) noexcept
+    {
+        st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (float) ((double) (st >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0);
+    };
+
+    group ("T1 legacy equivalence (reference-null): v2 lanes reproduce the v0.1.x paths bit-exact");
+    {
+        const int n = 128, blocks = 12;
+        auto nullTest = [&] (const BandParams& band, bool ms, const std::string& label)
+        {
+            EqBand eng; eng.prepare (fs, 2); eng.setParams (band);
+            refv01::Band ref; ref.prepare (fs, 2); ref.set (band);
+            std::uint64_t s = 0xABCDEF12u;
+            std::vector<float> eL ((size_t) n), eR ((size_t) n), rL ((size_t) n), rR ((size_t) n);
+            double maxErr = 0.0;
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < n; ++i) { const float l = 0.30f * lcg (s), r = 0.25f * lcg (s);
+                                              eL[(size_t) i] = rL[(size_t) i] = l; eR[(size_t) i] = rR[(size_t) i] = r; }
+                float* ec[2] = { eL.data(), eR.data() }; eng.processBlock (ec, 2, n);
+                float* rc[2] = { rL.data(), rR.data() }; if (ms) ref.processMS (rc, n); else ref.processStereo (rc, 2, n);
+                for (int i = 0; i < n; ++i) { maxErr = std::max (maxErr, (double) std::fabs (eL[(size_t) i] - rL[(size_t) i]));
+                                             maxErr = std::max (maxErr, (double) std::fabs (eR[(size_t) i] - rR[(size_t) i])); }
+            }
+            expectTrue (maxErr == 0.0, label);
+        };
+
+        { BandParams p; p.on = true; p.type = FilterType::Bell;                                    // (a) {st} == old Stereo path
+          p.lane (Lane::Stereo).freq = 900.0; p.lane (Lane::Stereo).Q = 2.5; p.lane (Lane::Stereo).gainDb = 7.0;
+          nullTest (p, false, "{st} bell == v0.1.x Stereo per-channel loop (bit-exact)"); }
+
+        { BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;    // (b) {m,s} == old M/S fold
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1200.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  =  6.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 3000.0; p.lane (Lane::Side).Q = 1.5; p.lane (Lane::Side).gainDb = -8.0;
+          nullTest (p, true, "{m,s} bells == v0.1.x M/S delta-fold (bit-exact)"); }
+
+        { BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;    // (c) mid-bypassed + side-active
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).bypass = true;
+          p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  = 10.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 2500.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb = -6.0;
+          nullTest (p, true, "mid-bypassed + side-active == v0.1.x bypass semantics (bit-exact)"); }
+    }
+
+    group ("T2 axis purity: each lane touches only its own axis (untouched axis exact)");
+    {
+        const int n = 200;
+        // L/R-only: the opposite channel is NEVER written -> bit-exact. M-only injects the SAME delta to
+        // L and R (leaving the Side signal L-R), S-only injects +/- (leaving the Mid signal L+R) -> those
+        // hold to float precision (the test's own L±R recombination rounds; the engine adds zero net to
+        // that axis). See report note: 'bit-exact' in the spec is exact for L/R, float-exact for M/S.
+        auto axisTest = [&] (Lane lane, double gainDb)
+        {
+            BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+            p.lane (lane).on = true; p.lane (lane).freq = 1000.0; p.lane (lane).Q = 2.0; p.lane (lane).gainDb = gainDb;
+            EqBand b; b.prepare (fs, 2); b.setParams (p);
+            std::uint64_t s = 0x2468ACEu;
+            std::vector<float> L ((size_t) n), R ((size_t) n), L0 ((size_t) n), R0 ((size_t) n);
+            for (int i = 0; i < n; ++i) { L[(size_t) i] = L0[(size_t) i] = 0.30f * lcg (s); R[(size_t) i] = R0[(size_t) i] = 0.27f * lcg (s); }
+            float* c[2] = { L.data(), R.data() }; b.processBlock (c, 2, n);
+            std::array<double,4> d { 0, 0, 0, 0 };   // {maxΔL, maxΔR, maxΔ(L-R), maxΔ(L+R)}
+            for (int i = 0; i < n; ++i)
+            {
+                d[0] = std::max (d[0], (double) std::fabs (L[(size_t) i] - L0[(size_t) i]));
+                d[1] = std::max (d[1], (double) std::fabs (R[(size_t) i] - R0[(size_t) i]));
+                d[2] = std::max (d[2], (double) std::fabs ((L[(size_t) i] - R[(size_t) i]) - (L0[(size_t) i] - R0[(size_t) i])));
+                d[3] = std::max (d[3], (double) std::fabs ((L[(size_t) i] + R[(size_t) i]) - (L0[(size_t) i] + R0[(size_t) i])));
+            }
+            return d;
+        };
+
+        { const auto d = axisTest (Lane::Left, 9.0);  expectTrue (d[1] == 0.0, "L-only: R channel bit-exact"); expectTrue (d[0] > 0.0, "L-only: L channel changed"); }
+        { const auto d = axisTest (Lane::Right, 9.0); expectTrue (d[0] == 0.0, "R-only: L channel bit-exact"); expectTrue (d[1] > 0.0, "R-only: R channel changed"); }
+        { const auto d = axisTest (Lane::Mid, 12.0);  expectNear (d[2], 0.0, 1e-6, "M-only: Side axis (L-R) preserved"); expectTrue (d[3] > 0.0, "M-only: Mid axis (L+R) changed"); }
+        { const auto d = axisTest (Lane::Side, 12.0); expectNear (d[3], 0.0, 1e-6, "S-only: Mid axis (L+R) preserved"); expectTrue (d[2] > 0.0, "S-only: Side axis (L-R) changed"); }
+    }
+
+    group ("T3 matrix truth: measured 2x2 stereo response == analytic matrixResponse (complex)");
+    {
+        const int W = 4096;                                  // analysis window; probe freqs are bin-aligned (leakage-free)
+        auto column = [&] (EqEngine& eng, int inCh, double f) -> std::array<std::complex<double>, 2>
+        {
+            const double w = 2.0 * kPi * f / fs;
+            std::vector<float> L ((size_t) W), R ((size_t) W);
+            long nAbs = 0;
+            auto fill = [&] { for (int i = 0; i < W; ++i) { const double v = 0.25 * std::sin (w * (double) (nAbs + i));
+                                  L[(size_t) i] = (inCh == 0) ? (float) v : 0.0f; R[(size_t) i] = (inCh == 1) ? (float) v : 0.0f; } };
+            for (int b = 0; b < 40; ++b) { fill(); float* c[2] = { L.data(), R.data() }; eng.process (c, 2, W); nAbs += W; }   // reach steady state
+            fill();
+            std::complex<double> X { 0, 0 };
+            for (int i = 0; i < W; ++i) { const double s = (inCh == 0) ? (double) L[(size_t) i] : (double) R[(size_t) i]; X += s * std::polar (1.0, -w * (double) (nAbs + i)); }
+            float* c[2] = { L.data(), R.data() }; eng.process (c, 2, W);
+            std::complex<double> YL { 0, 0 }, YR { 0, 0 };
+            for (int i = 0; i < W; ++i) { YL += (double) L[(size_t) i] * std::polar (1.0, -w * (double) (nAbs + i)); YR += (double) R[(size_t) i] * std::polar (1.0, -w * (double) (nAbs + i)); }
+            return { YL / X, YR / X };
+        };
+
+        auto probe = [&] (const BandParams* bands, int nb, const std::string& label)
+        {
+            for (int ki : { 85, 171, 341 })                  // 996 / 2003 / 3996 Hz (= ki*fs/W -> integer cycles)
+            {
+                EqEngine eng; eng.prepare (fs, W, 2);
+                for (int i = 0; i < nb; ++i) eng.setBand (i, bands[i]);
+                const double f = (double) ki * fs / (double) W, w = 2.0 * kPi * f / fs;
+                const auto cL = column (eng, 0, f);           // inject L -> {hLL, hRL}
+                const auto cR = column (eng, 1, f);           // inject R -> {hLR, hRR}
+                const ResponseMatrix H = matrixResponse (bands, nb, fs, w);
+                const std::string at = " " + label + " @k" + std::to_string (ki);
+                expectNear (std::abs (cL[0] - H.hLL), 0.0, 0.02, "hLL" + at);   // COMPLEX compare (proves polarity + order)
+                expectNear (std::abs (cR[0] - H.hLR), 0.0, 0.02, "hLR" + at);
+                expectNear (std::abs (cL[1] - H.hRL), 0.0, 0.02, "hRL" + at);
+                expectNear (std::abs (cR[1] - H.hRR), 0.0, 0.02, "hRR" + at);
+            }
+        };
+
+        std::uint64_t rng = 0xC0FFEE123ULL;
+        auto uni = [&] (double lo, double hi) { rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            return lo + (hi - lo) * ((double) (rng >> 11) * (1.0 / 9007199254740992.0)); };
+        auto mk = [&] (LaneParams& lp, bool on) { lp.on = on; lp.freq = uni (300.0, 5000.0); lp.Q = uni (0.6, 3.5); lp.gainDb = uni (-8.0, 8.0); };
+
+        { BandParams p; p.on = true; p.type = FilterType::Bell;                    // (a) one band, ALL FIVE lanes active
+          mk (p.lane (Lane::Stereo), true); mk (p.lane (Lane::Left), true); mk (p.lane (Lane::Right), true);
+          mk (p.lane (Lane::Mid), true); mk (p.lane (Lane::Side), true);
+          probe (&p, 1, "all-five"); }
+
+        { BandParams b[2];                                                          // (b) {L,R} then {M,S} — cross terms + order
+          b[0].on = true; b[0].type = FilterType::Bell; b[0].lane (Lane::Stereo).on = false;
+          mk (b[0].lane (Lane::Left), true); mk (b[0].lane (Lane::Right), true);
+          b[1].on = true; b[1].type = FilterType::Bell; b[1].lane (Lane::Stereo).on = false;
+          mk (b[1].lane (Lane::Mid), true); mk (b[1].lane (Lane::Side), true);
+          probe (b, 2, "LR;MS"); }
+
+        { BandParams b[3];                                                          // (c) three bands, seeded-random mixed subsets
+          for (int j = 0; j < 3; ++j)
+          {
+              b[j].on = true; b[j].type = FilterType::Bell;
+              bool any = false;
+              for (Lane l : { Lane::Stereo, Lane::Left, Lane::Right, Lane::Mid, Lane::Side })
+              { const bool on = uni (0.0, 1.0) < 0.5; mk (b[j].lane (l), on); any = any || on; }
+              if (! any) b[j].lane (Lane::Stereo).on = true;   // guarantee at least one lane
+          }
+          probe (b, 3, "random"); }
+    }
+
+    group ("T4 topology / reset / cost: hard-step enable, type reset, ST-only buses, swept gating, cost-zero");
+    {
+        const int n = 128;
+        auto fillNoise = [&] (std::uint64_t& s, std::vector<float>& L, std::vector<float>& R)
+        { for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.30f * lcg (s); R[(size_t) i] = 0.25f * lcg (s); } };
+
+        // (a) enabling a lane mid-stream: HARD STEP, FRESH state, no NaN — the newly engaged lane settles
+        //     to the SAME steady state as an engine that always had it (proves no stale history).
+        {
+            BandParams full; full.on = true; full.type = FilterType::Bell;
+            full.lane (Lane::Stereo).freq = 1000.0; full.lane (Lane::Stereo).Q = 2.0; full.lane (Lane::Stereo).gainDb = 6.0;
+            full.lane (Lane::Side).on = true; full.lane (Lane::Side).freq = 3000.0; full.lane (Lane::Side).Q = 2.0; full.lane (Lane::Side).gainDb = 9.0;
+            BandParams stOnly = full; stOnly.lane (Lane::Side).on = false;
+
+            EqBand A; A.prepare (fs, 2); A.setParams (full);
+            EqBand B; B.prepare (fs, 2); B.setParams (stOnly);
+            std::uint64_t sa = 0x9u, sb = 0x9u;                              // identical streams
+            std::vector<float> aL ((size_t) n), aR ((size_t) n), bL ((size_t) n), bR ((size_t) n);
+            bool nan = false;
+            for (int blk = 0; blk < 40; ++blk)
+            {
+                fillNoise (sa, aL, aR); fillNoise (sb, bL, bR);
+                if (blk == 6) B.setParams (full);                           // enable the Side lane mid-stream (hard step)
+                float* ac[2] = { aL.data(), aR.data() }; A.processBlock (ac, 2, n);
+                float* bc[2] = { bL.data(), bR.data() }; B.processBlock (bc, 2, n);
+                nan = nan || anyNaN (bL.data(), n) || anyNaN (bR.data(), n);
+            }
+            double conv = 0.0; for (int i = 0; i < n; ++i) { conv = std::max (conv, (double) std::fabs (aL[(size_t) i] - bL[(size_t) i]));
+                                                             conv = std::max (conv, (double) std::fabs (aR[(size_t) i] - bR[(size_t) i])); }
+            expectTrue (! nan, "no NaN across a mid-stream lane enable");
+            expectNear (conv, 0.0, 1e-5, "enabled lane settles to the always-on steady state (fresh + hard step)");
+        }
+
+        // (b) a type change with the SAME section count still resets the columns — no stale tail.
+        {
+            EqBand b; b.prepare (fs, 1);
+            BandParams bell; bell.on = true; bell.type = FilterType::Bell;
+            bell.lane (Lane::Stereo).freq = 1000.0; bell.lane (Lane::Stereo).Q = 4.0; bell.lane (Lane::Stereo).gainDb = 12.0;
+            b.setParams (bell);
+            std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* c[1] = { buf.data() };
+            b.processBlock (c, 1, n);                                        // build Bell state
+            BandParams bp = bell; bp.type = FilterType::BandPass;            // Bell -> BandPass: both 1 section
+            b.setParams (bp);
+            for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; b.processBlock (c, 1, n);   // silence in -> resets -> silent out
+            double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
+            expectTrue (tail == 0.0, "type change (Bell->BandPass, same section count) resets state");
+        }
+
+        // (c) a non-stereo bus runs the ST lane ONLY — L/R/M/S are provably inert (transparent).
+        {
+            EqBand b; b.prepare (fs, 1);
+            BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+            p.lane (Lane::Left).on = true; p.lane (Lane::Left).gainDb = 12.0;
+            p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).gainDb  = 12.0;
+            b.setParams (p);
+            const double g = sineGainDb ([&] (float* const* ch, int nc, int nn) { b.processBlock (ch, nc, nn); }, 1000.0, fs);
+            expectNear (g, 0.0, 0.05, "true-mono: non-ST lanes inert (transparent)");
+        }
+
+        // (d) swept is honored ONLY in the single-ST config: split the point (add a flat Mid lane) and the
+        //     ST lane must fall back to the matched 24 dB/oct cascade (not the single 12 dB/oct SVF stage).
+        {
+            EqBand b; b.prepare (fs, 2);
+            BandParams p; p.on = true; p.type = FilterType::HighPass; p.swept = true;
+            p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = 24;
+            p.lane (Lane::Mid).on = true; p.lane (Lane::Mid).freq = 1000.0; p.lane (Lane::Mid).gainDb = 0.0;   // flat Mid -> splits the point
+            b.setParams (p);
+            std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f); float* c[2] = { L.data(), R.data() }; b.processBlock (c, 2, n);
+            const double r250 = 20.0 * std::log10 (std::abs (b.response (2.0 * kPi * 250.0 / fs, Axis::Mid)));
+            const double r500 = 20.0 * std::log10 (std::abs (b.response (2.0 * kPi * 500.0 / fs, Axis::Mid)));
+            expectTrue ((r500 - r250) > 18.0, "split swept HP24: ST uses the matched 24 dB/oct cascade (swept gated off)");
+        }
+
+        // (e) COST-ZERO disabled-lane writes: churning a DISABLED lane's params every block leaves the
+        //     output BIT-IDENTICAL to never touching it (no design, snapped smoother, no recompute).
+        //     Chosen assertion: output-invariance (the strongest honest observable; the material-change
+        //     gate additionally suppresses the recompute).
+        {
+            auto run = [&] (bool churn)
+            {
+                EqBand b; b.prepare (fs, 2);
+                BandParams p; p.on = true; p.type = FilterType::Bell;
+                p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
+                p.lane (Lane::Side).on = false; p.lane (Lane::Side).freq = 2000.0;   // present but DISABLED
+                b.setParams (p);
+                std::uint64_t s = 0x5EEDu; std::vector<float> L ((size_t) n), R ((size_t) n), out;
+                for (int blk = 0; blk < 16; ++blk)
+                {
+                    fillNoise (s, L, R);
+                    if (churn) { p.lane (Lane::Side).freq = 500.0 + 13.0 * blk; b.setParams (p); }   // automate the DISABLED lane
+                    float* c[2] = { L.data(), R.data() }; b.processBlock (c, 2, n);
+                    for (int i = 0; i < n; ++i) { out.push_back (L[(size_t) i]); out.push_back (R[(size_t) i]); }
+                }
+                return out;
+            };
+            const auto a = run (false), bb = run (true);
+            double d = 0.0; for (size_t i = 0; i < a.size(); ++i) d = std::max (d, (double) std::fabs (a[i] - bb[i]));
+            expectTrue (d == 0.0, "disabled-lane automation is inert: output bit-identical (cost-zero)");
+        }
+    }
+
+    group ("RT-safety (lanes): a moving all-five-lane band processes with ZERO heap allocations");
+    {
+        EqBand band; band.prepare (fs, 2);
+        BandParams p; p.on = true; p.type = FilterType::Bell;
+        for (const Lane l : { Lane::Stereo, Lane::Left, Lane::Right, Lane::Mid, Lane::Side })
+        { p.lane (l).on = true; p.lane (l).freq = 800.0; p.lane (l).Q = 2.0; p.lane (l).gainDb = 4.0; }
+        band.setParams (p);
+        const int nn = 128; std::vector<float> L ((size_t) nn), R ((size_t) nn); float* c[2] = { L.data(), R.data() };
+        auto fill = [&] (int b) { for (int i = 0; i < nn; ++i) {
+            L[(size_t) i] = (float) (0.10 * std::sin (2.0 * kPi *  700.0 * (b * nn + i) / fs));
+            R[(size_t) i] = (float) (0.08 * std::sin (2.0 * kPi * 1100.0 * (b * nn + i) / fs)); } };
+        for (int b = 0; b < 4; ++b) { fill (b); band.processBlock (c, 2, nn); }   // warm up (allocs before the snapshot are fine)
+
+        const long before = g_allocs.load (std::memory_order_relaxed);
+        for (int b = 0; b < 300; ++b)
+        {
+            for (const Lane l : { Lane::Stereo, Lane::Left, Lane::Right, Lane::Mid, Lane::Side })
+                p.lane (l).freq = 600.0 + 0.5 * b + 5.0 * (double) (int) l;    // keep every lane's smoother moving
+            band.setParams (p);
+            fill (b);
+            band.processBlock (c, 2, nn);
+        }
+        const long after = g_allocs.load (std::memory_order_relaxed);
+        std::printf ("      heap allocations during 300 moving all-five-lane blocks: %ld\n", after - before);
+        expectTrue (after == before, "moving 5-lane band: no heap allocation in the audio path");
+        expectTrue (! anyNaN (L.data(), nn) && ! anyNaN (R.data(), nn), "finite output");
     }
 }
