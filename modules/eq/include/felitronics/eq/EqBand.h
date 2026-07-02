@@ -187,38 +187,96 @@ inline std::complex<double> compositeResponse (const BandParams* bands, int numB
 // unit input Y.
 struct ResponseMatrix { std::complex<double> hLL, hLR, hRL, hRR; };
 
+// Fold ONE band into the running 2×2 accumulator, in the NORMATIVE processing order (matches
+// EqBand::process). The matrix operators do NOT commute — diag(H_L,H_R) and H_MS only commute when
+// H_L == H_R — so this order is load-bearing and identical in the engine, the analytic forms and the
+// FIR builder:
+//   H_band = H_MS · diag(H_L, H_R) · (H_ST · I)          (H_ST is scalar; its position is free)
+//   H_MS   = [[ (H_M+H_S)/2, (H_M−H_S)/2 ],
+//             [ (H_M−H_S)/2, (H_M+H_S)/2 ]]              (identity when both M/S lanes idle)
+//   acc   <- H_band · acc                                (later bands multiply on the LEFT = series flow)
+// This is the SINGLE source of truth for the composition; matrixResponse (complex) and
+// matrixResponseZeroPhase (linear-phase, real signed) differ only in how the 5 scalar lane responses are
+// evaluated — never in how they combine (so polarity/order can never diverge between the two paths).
+inline void accumulateBand (ResponseMatrix& acc, std::complex<double> hST, std::complex<double> hL,
+                            std::complex<double> hR, std::complex<double> hM, std::complex<double> hS) noexcept
+{
+    const std::complex<double> dLL = hST * hL;              // diag(H_L,H_R) · (H_ST·I)
+    const std::complex<double> dRR = hST * hR;
+    const std::complex<double> mp  = 0.5 * (hM + hS);       // H_MS diagonal
+    const std::complex<double> mm  = 0.5 * (hM - hS);       // H_MS off-diagonal
+    // H_band = H_MS · diag(dLL, dRR) = [[mp·dLL, mm·dRR], [mm·dLL, mp·dRR]]
+    const ResponseMatrix hb { mp * dLL, mm * dRR, mm * dLL, mp * dRR };
+    acc = ResponseMatrix {
+        hb.hLL * acc.hLL + hb.hLR * acc.hRL,  hb.hLL * acc.hLR + hb.hLR * acc.hRR,
+        hb.hRL * acc.hLL + hb.hRR * acc.hRL,  hb.hRL * acc.hLR + hb.hRR * acc.hRR
+    };
+}
+
 inline ResponseMatrix matrixResponse (const BandParams* bands, int numBands, double fs, double w) noexcept
 {
-    // Per band, composed in the NORMATIVE processing order (matches EqBand::process). The matrix
-    // operators do NOT commute — diag(H_L,H_R) and H_MS only commute when H_L == H_R — so this order
-    // is load-bearing and identical in the engine, this analytic form and the FIR builder:
-    //   H_band = H_MS · diag(H_L, H_R) · (H_ST · I)          (H_ST is scalar; its position is free)
-    //   H_MS   = [[ (H_M+H_S)/2, (H_M−H_S)/2 ],
-    //             [ (H_M−H_S)/2, (H_M+H_S)/2 ]]              (identity when both M/S lanes idle)
     // The bank product is taken in process order: band 0 first ⇒ rightmost factor.
     ResponseMatrix acc { { 1.0, 0.0 }, { 0.0, 0.0 }, { 0.0, 0.0 }, { 1.0, 0.0 } };   // identity
     for (int i = 0; i < numBands; ++i)
     {
         const BandParams& b = bands[i];
-        const std::complex<double> hST = bandResponse (laneView (b, Lane::Stereo), fs, w);
-        const std::complex<double> hL  = bandResponse (laneView (b, Lane::Left),   fs, w);
-        const std::complex<double> hR  = bandResponse (laneView (b, Lane::Right),  fs, w);
-        const std::complex<double> hM  = bandResponse (laneView (b, Lane::Mid),    fs, w);
-        const std::complex<double> hS  = bandResponse (laneView (b, Lane::Side),   fs, w);
-
-        const std::complex<double> dLL = hST * hL;              // diag(H_L,H_R) · (H_ST·I)
-        const std::complex<double> dRR = hST * hR;
-        const std::complex<double> mp  = 0.5 * (hM + hS);       // H_MS diagonal
-        const std::complex<double> mm  = 0.5 * (hM - hS);       // H_MS off-diagonal
-        // H_band = H_MS · diag(dLL, dRR) = [[mp·dLL, mm·dRR], [mm·dLL, mp·dRR]]
-        const ResponseMatrix hb { mp * dLL, mm * dRR, mm * dLL, mp * dRR };
-        // acc <- H_band · acc  (later bands multiply on the LEFT, matching the series signal flow)
-        acc = ResponseMatrix {
-            hb.hLL * acc.hLL + hb.hLR * acc.hRL,  hb.hLL * acc.hLR + hb.hLR * acc.hRR,
-            hb.hRL * acc.hLL + hb.hRR * acc.hRL,  hb.hRL * acc.hLR + hb.hRR * acc.hRR
-        };
+        accumulateBand (acc,
+                        bandResponse (laneView (b, Lane::Stereo), fs, w),
+                        bandResponse (laneView (b, Lane::Left),   fs, w),
+                        bandResponse (laneView (b, Lane::Right),  fs, w),
+                        bandResponse (laneView (b, Lane::Mid),    fs, w),
+                        bandResponse (laneView (b, Lane::Side),   fs, w));
     }
     return acc;
+}
+
+// The ZERO-PHASE 2×2 transfer: every SCALAR LANE response replaced by its magnitude |H_lane| (real,
+// non-negative) BEFORE composing. The matrix entries stay REAL but SIGNED — e.g. (|H_M|−|H_S|)/2 keeps
+// its sign; taking |·| of the entries instead would break M/S reconstruction. This is the linear-phase
+// FIR path's source of truth: a real (signed) spectrum inverse-transforms to a SYMMETRIC IR ⇒ exact
+// linear phase, while the sign is preserved. Same accumulateBand composition as matrixResponse.
+inline ResponseMatrix matrixResponseZeroPhase (const BandParams* bands, int numBands, double fs, double w) noexcept
+{
+    auto mag = [&] (const BandParams& b, Lane l) noexcept
+    { return std::complex<double> (std::abs (bandResponse (laneView (b, l), fs, w)), 0.0); };
+
+    ResponseMatrix acc { { 1.0, 0.0 }, { 0.0, 0.0 }, { 0.0, 0.0 }, { 1.0, 0.0 } };   // identity
+    for (int i = 0; i < numBands; ++i)
+    {
+        const BandParams& b = bands[i];
+        accumulateBand (acc, mag (b, Lane::Stereo), mag (b, Lane::Left), mag (b, Lane::Right),
+                        mag (b, Lane::Mid), mag (b, Lane::Side));
+    }
+    return acc;
+}
+
+// Does lane `l` of band `b` ACTUALLY run? (point on && !point bypass && lane on && !lane bypass) — the
+// same predicate the engine uses (EqBand::laneOnIn). Basis detection and the FIR builder read this to
+// pick a convolver topology.
+inline bool laneActive (const BandParams& b, Lane l) noexcept
+{
+    const LaneParams& lp = b.lane (l);
+    return b.on && ! b.bypass && lp.on && ! lp.bypass;
+}
+
+// The convolver topology a bank needs (matches convolution::MatrixConvolver::Topology, kept here so the
+// eq module owns no convolution dependency): no active L/R lane anywhere ⇒ the whole matrix is
+// [[a,b],[b,a]] (diagonal in M/S) ⇒ MSDiag (the plain single-ST case lands here too — today's 2-IR cost);
+// no active M/S lane ⇒ diag(H_LL,H_RR) ⇒ LRDiag; otherwise the general 4-entry Full matrix.
+enum class MatrixBasis { MSDiag, LRDiag, Full };
+
+inline MatrixBasis detectBasis (const BandParams* bands, int numBands) noexcept
+{
+    bool anyLR = false, anyMS = false;
+    for (int i = 0; i < numBands; ++i)
+    {
+        const BandParams& b = bands[i];
+        anyLR = anyLR || laneActive (b, Lane::Left) || laneActive (b, Lane::Right);
+        anyMS = anyMS || laneActive (b, Lane::Mid)  || laneActive (b, Lane::Side);
+    }
+    if (! anyLR) return MatrixBasis::MSDiag;
+    if (! anyMS) return MatrixBasis::LRDiag;
+    return MatrixBasis::Full;
 }
 
 //==============================================================================

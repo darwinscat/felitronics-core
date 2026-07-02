@@ -118,6 +118,25 @@ public:
         }
     }
 
+    // Fill the FOUR entries of the ZERO-PHASE 2×2 matrix (matrixResponseZeroPhase) on the same uniform
+    // grid as magnitudeGridFor. The entries are REAL but SIGNED (the off-diagonals can go negative) — a
+    // linear-phase FIR host inverse-transforms each to a symmetric IR (a signed real spectrum stays
+    // symmetric, keeping the sign). Only the Full topology needs all four; the diagonal topologies use
+    // magnitudeGridFor on the axis composites. Race-free (caller-owned snapshot).
+    static void matrixGridZeroPhase (const BandParams* bandsIn, int numBands, double fs,
+                                     float* outLL, float* outLR, float* outRL, float* outRR, int n) noexcept
+    {
+        const double nyq = 0.5 * fs;
+        for (int k = 0; k < n; ++k)
+        {
+            const double f = (n > 1) ? nyq * (double) k / (double) (n - 1) : 0.0;
+            const double w = 2.0 * kPi * f / fs;
+            const ResponseMatrix H = matrixResponseZeroPhase (bandsIn, numBands, fs, w);
+            outLL[k] = (float) H.hLL.real();  outLR[k] = (float) H.hLR.real();
+            outRL[k] = (float) H.hRL.real();  outRR[k] = (float) H.hRR.real();
+        }
+    }
+
     double sampleRate() const noexcept { return fs; }
 
     SpectrumTap& inputTap()  noexcept { return inTap; }

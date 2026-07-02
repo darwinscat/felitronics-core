@@ -59,6 +59,37 @@ public:
     const float* build (const float* mag, float k) noexcept
     {
         if (! prepared_) return nullptr;                     // unprepared / failed prepare — no write into empty spec_/ceps_/h_
+        computeBlendedSpec (mag, k);
+        fft_.inverse (spec_.data(), h_.data());              // h[0..D): mixed-phase impulse (circular)
+        return h_.data();
+    }
+
+    // The blended COMPLEX spectrum |H|·e^{j k φ_min} at D/2+1 bins into outRe/outIm (DC & Nyquist real →
+    // outIm[0]=outIm[D/2]=0). Same cepstral pipeline as build() but WITHOUT the final inverse — for the
+    // matrix-FIR path, which must compose the complex entries (sums of blended lane responses) on the grid
+    // BEFORE inverting. Each blended response is min-phase-multiplicative, so the blend distributes over
+    // PRODUCTS but NOT over the sums inside an H_MS entry → the consumer blends per lane, then composes,
+    // then inverts. RT-UNSAFE. Returns false if unprepared.
+    bool buildSpectrum (const float* mag, float k, double* outRe, double* outIm) noexcept
+    {
+        if (! prepared_) return false;
+        computeBlendedSpec (mag, k);
+        const int H = D_ / 2;
+        outRe[0] = spec_[0]; outIm[0] = 0.0;                 // DC (real)
+        outRe[(std::size_t) H] = spec_[1]; outIm[(std::size_t) H] = 0.0;   // Nyquist (real)
+        for (int b = 1; b < H; ++b)
+        {
+            outRe[(std::size_t) b] = spec_[(std::size_t) (2 * b)];
+            outIm[(std::size_t) b] = spec_[(std::size_t) (2 * b + 1)];
+        }
+        return true;
+    }
+
+private:
+    // Steps 1–3 of the cepstral pipeline: leave spec_ (packed) = |H|·e^{j k φ_min}. Shared by build() (which
+    // then inverts to the impulse) and buildSpectrum() (which returns the spectrum for matrix composition).
+    void computeBlendedSpec (const float* mag, float k) noexcept
+    {
         const int H = D_ / 2;
         k = std::clamp (k, 0.0f, 1.0f);
         constexpr float floorMag = 1.0e-5f;
@@ -85,7 +116,7 @@ public:
         }
 
         // 3. forward FFT of the blended cepstrum → log H = log|H| + j·(k·φ_min); take the phase, rebuild
-        //    H = |H|·e^{jφ}, inverse → the mixed-phase impulse. (DC/Nyquist are forced real.)
+        //    H = |H|·e^{jφ}. (DC/Nyquist are forced real.)
         fft_.forward (ceps_.data(), spec_.data());           // spec_ = [DC, Nyq, re,im, …]
         spec_[0] = mag[0];                                   // DC   (phase 0)
         spec_[1] = mag[(std::size_t) H];                     // Nyq  (phase 0)
@@ -96,11 +127,8 @@ public:
             spec_[(std::size_t) (2 * b)]     = m * std::cos (phi);
             spec_[(std::size_t) (2 * b + 1)] = m * std::sin (phi);
         }
-        fft_.inverse (spec_.data(), h_.data());              // h[0..D): mixed-phase impulse (circular)
-        return h_.data();
     }
 
-private:
     Fft fft_;
     int D_ = 0, specF_ = 0;
     bool prepared_ = false;                                  // true only after a fully-successful prepare()
