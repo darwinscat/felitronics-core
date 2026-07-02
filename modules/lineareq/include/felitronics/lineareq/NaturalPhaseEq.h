@@ -10,6 +10,7 @@
 #include <felitronics/core/Config.h>
 
 #include <algorithm>
+#include <memory>
 #include <atomic>
 #include <cmath>
 #include <complex>
@@ -81,16 +82,30 @@ public:
 
         int part = 64; while (part < maxBlock_) part <<= 1;     // partition ≥ maxBlock, pow2
         const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // short anti-click fade
-        if (! conv_.prepare (part, L_, warmXfade, channels_ == 1 ? 1 : 2)) return false;
+        chConv_.clear();
+        if (channels_ > 2)                                      // non-stereo: per-channel mono ST-only operators
+        {
+            for (int c = 0; c < channels_; ++c)
+            {
+                chConv_.push_back (std::make_unique<Conv>());
+                if (! chConv_.back()->prepare (part, L_, warmXfade, 1)) return false;
+            }
+        }
+        else if (! conv_.prepare (part, L_, warmXfade, channels_ == 1 ? 1 : 2)) return false;
         prepared_ = true;                                       // fully built — setBands()/buildFir() may now run
         return true;
     }
 
-    void reset() noexcept { conv_.reset(); }
+    void reset() noexcept { conv_.reset(); for (auto& c : chConv_) c->reset(); }
 
     int  firSize() const noexcept { return L_; }
     int  latencySamples() const noexcept { return bulkDelay_; }   // the causal bulk shift (convolver adds 0)
-    bool isBusy() const noexcept { return conv_.isBusy(); }
+    bool isBusy() const noexcept
+    {
+        if (conv_.isBusy()) return true;
+        for (auto& c : chConv_) if (c->isBusy()) return true;
+        return false;
+    }
     float blend() const noexcept { return k_.load (std::memory_order_relaxed); }
 
     // Change the phase blend LIVE — no re-prepare (the bulk delay / reported latency is fixed). The next
@@ -102,7 +117,19 @@ public:
     // crossfading (host coalesces with the latest snapshot).
     bool setBands (const eq::BandParams* bands, int numBands) noexcept
     {
-        if (! prepared_) return false;                         // unprepared — FIR buffers + MixedPhaseFir are empty
+        if (! prepared_) return false;
+        if (isBusy()) return false;                            // coalesce BEFORE any expensive rebuild
+
+        // NON-STEREO bus (channels_ > 2): the v2 engine runs ONLY the ST lane, per channel — so does
+        // the FIR: one ST-only-composite IR convolved independently on every channel.
+        if (channels_ > 2)
+        {
+            buildFir (bands, numBands, eq::Axis::Stereo, fir_[0].data());
+            bool ok = true;
+            for (auto& c : chConv_) ok = c->setIr (fir_[0].data(), L_) && ok;
+            return ok;
+        }
+                         // unprepared — FIR buffers + MixedPhaseFir are empty
 
         // MONO (channels_ == 1): the v2 engine runs ONLY the ST lane on a non-stereo bus → bank 0 is the
         // ST-only composite (Axis::Stereo), and the FIR matches the IIR (LANES.md §FIR, mono).
@@ -154,6 +181,12 @@ public:
     void process (float* const* io, int numChannels, int n) noexcept
     {
         if (n <= 0) return;
+        if (channels_ > 2)                                     // non-stereo: ST-only IR per channel
+        {
+            const int nc = numChannels < channels_ ? numChannels : channels_;
+            for (int c = 0; c < nc; ++c) { float* one[1] { io[c] }; chConv_[(std::size_t) c]->process (one, one, 1, n); }
+            return;
+        }
         const int nc = numChannels >= 2 ? 2 : 1;
         conv_.process (io, io, nc, n);                         // raw L/R in → MatrixConvolver routes + decodes in place
     }
@@ -275,7 +308,8 @@ private:
 
     MixedPhaseFir<core::fft::DefaultRealFft> mp_;                            // cepstral mixed-phase FIR designer
     core::fft::DefaultRealFft dFft_;                                         // size-D IFFT for composed matrix entries
-    Conv conv_;                                                              // matrix operator convolver, click-free swap
+    Conv conv_;
+    std::vector<std::unique_ptr<Conv>> chConv_;                 // channels_ > 2: one mono ST-only operator per channel                                                              // matrix operator convolver, click-free swap
 
     std::vector<float> magBuf_, taper_, packSpec_, entryTime_;
     std::vector<float>  fir_[4];                                             // up to 4 entry IRs (diag topologies use [0..1])

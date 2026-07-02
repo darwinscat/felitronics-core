@@ -9,6 +9,7 @@
 #include <felitronics/core/Config.h>
 
 #include <algorithm>
+#include <memory>
 #include <cmath>
 #include <vector>
 
@@ -76,16 +77,30 @@ public:
         // activation, so an EQ band drag lands in ~tens of ms, not a full FIR. isBusy() is then true only
         // for that short window → the host's coalescing rebuild stays responsive.
         const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // ≥ 2P and ≥ ~20 ms
-        if (! conv_.prepare (part, N_ + 1, warmXfade, channels_ == 1 ? 1 : 2)) return false;
+        chConv_.clear();
+        if (channels_ > 2)                                      // non-stereo: per-channel mono ST-only operators
+        {
+            for (int c = 0; c < channels_; ++c)
+            {
+                chConv_.push_back (std::make_unique<Conv>());
+                if (! chConv_.back()->prepare (part, N_ + 1, warmXfade, 1)) return false;
+            }
+        }
+        else if (! conv_.prepare (part, N_ + 1, warmXfade, channels_ == 1 ? 1 : 2)) return false;
         prepared_ = true;                                      // fully built — setBands()/buildFir() may now run
         return true;
     }
 
-    void reset() noexcept { conv_.reset(); }
+    void reset() noexcept { conv_.reset(); for (auto& c : chConv_) c->reset(); }
 
     int  firSize() const noexcept { return N_; }
     int  latencySamples() const noexcept { return N_ / 2; }     // symmetric FIR group delay (convolver adds 0)
-    bool isBusy() const noexcept { return conv_.isBusy(); }     // a swap is mid-crossfade → coalesce setBands()
+    bool isBusy() const noexcept
+    {
+        if (conv_.isBusy()) return true;
+        for (auto& c : chConv_) if (c->isBusy()) return true;
+        return false;
+    }     // a swap is mid-crossfade → coalesce setBands()
 
     // RT-UNSAFE (message thread, off the audio thread): rebuild the entry FIRs from a caller-owned
     // BandParams snapshot, pick the convolver topology (basis detection), and hand the operator over for a
@@ -93,7 +108,19 @@ public:
     // LATEST snapshot once it's free.
     bool setBands (const eq::BandParams* bands, int numBands) noexcept
     {
-        if (! prepared_) return false;                            // unprepared — the FIR/scratch buffers are empty
+        if (! prepared_) return false;
+        if (isBusy()) return false;                            // coalesce BEFORE any expensive rebuild
+
+        // NON-STEREO bus (channels_ > 2): the v2 engine runs ONLY the ST lane, per channel — so does
+        // the FIR: one ST-only-composite IR convolved independently on every channel.
+        if (channels_ > 2)
+        {
+            buildFir (bands, numBands, eq::Axis::Stereo, fir_[0].data());
+            bool ok = true;
+            for (auto& c : chConv_) ok = c->setIr (fir_[0].data(), N_ + 1) && ok;
+            return ok;
+        }
+                            // unprepared — the FIR/scratch buffers are empty
 
         // MONO (channels_ == 1): the v2 engine runs ONLY the ST lane on a non-stereo bus, so bank 0 is the
         // ST-only composite (Axis::Stereo) and the FIR matches the IIR (LANES.md §FIR, mono).
@@ -145,6 +172,12 @@ public:
     void process (float* const* io, int numChannels, int n) noexcept
     {
         if (n <= 0) return;
+        if (channels_ > 2)                                     // non-stereo: ST-only IR per channel
+        {
+            const int nc = numChannels < channels_ ? numChannels : channels_;
+            for (int c = 0; c < nc; ++c) { float* one[1] { io[c] }; chConv_[(std::size_t) c]->process (one, one, 1, n); }
+            return;
+        }
         const int nc = numChannels >= 2 ? 2 : 1;
         conv_.process (io, io, nc, n);                         // raw L/R in → MatrixConvolver routes + decodes in place
     }
@@ -189,7 +222,8 @@ private:
     bool prepared_ = false;                                    // true only after a fully-successful prepare()
 
     core::fft::DefaultRealFft buildFft_;                        // size-N IFFT for the FIR design
-    Conv conv_;                                                 // matrix operator convolver (MSDiag / LRDiag / Full), click-free swap
+    Conv conv_;
+    std::vector<std::unique_ptr<Conv>> chConv_;                 // channels_ > 2: one mono ST-only operator per channel                                                 // matrix operator convolver (MSDiag / LRDiag / Full), click-free swap
 
     std::vector<float> magBuf_, spec_, time_, window_;
     std::vector<float> grid_[4];                                // 4 signed-real entry grids (Full only)

@@ -223,5 +223,42 @@ int main()
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate on the Full matrix path");
     }
 
+    // --- (5) NON-STEREO bus: the v2 rule (nc != 2 => ST lane only) holds in the FIR path too ---
+    test::group ("surround FIR: ST-only per channel; domain lanes inert");
+    {
+        const int CH = 6, M = 16000;
+        lineareq::LinearPhaseEq e; e.prepare (sr, 512, CH, 0);
+
+        auto run = [&] (const eq::BandParams* b, int nb, double expectDb, const char* label)
+        {
+            test::ok (e.setBands (b, nb), "setBands (6ch)");
+            std::vector<std::vector<float>> ch ((std::size_t) CH, std::vector<float> ((std::size_t) M));
+            for (int c = 0; c < CH; ++c)
+                for (int i = 0; i < M; ++i) ch[(std::size_t) c][(std::size_t) i] = (float) (0.3 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+            for (int o = 0; o < M; o += 512)
+            {
+                float* io[CH];                                              // advance every channel pointer per block
+                for (int c = 0; c < CH; ++c) io[c] = ch[(std::size_t) c].data() + o;
+                e.process (io, CH, std::min (512, M - o));
+            }
+            double inSq = 0; for (int i = M - 4000; i < M; ++i) { const double v = 0.3 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += v * v; }
+            double worst = 0.0;
+            for (int c = 0; c < CH; ++c)
+            {
+                double outSq = 0; for (int i = M - 4000; i < M; ++i) outSq += (double) ch[(std::size_t) c][(std::size_t) i] * ch[(std::size_t) c][(std::size_t) i];
+                worst = std::max (worst, std::fabs (10.0 * std::log10 (outSq / inSq) - expectDb));
+            }
+            test::ok (worst < 0.5, label);
+        };
+
+        eq::BandParams st[1]; st[0].on = true; st[0].type = eq::FilterType::Bell;
+        st[0].lane (eq::Lane::Stereo).freq = 1000.0; st[0].lane (eq::Lane::Stereo).Q = 2.0; st[0].lane (eq::Lane::Stereo).gainDb = 6.0;
+        run (st, 1, 6.0, "6ch: ST bell +6 dB lands on EVERY channel");
+
+        eq::BandParams ms[1]; ms[0].on = true; ms[0].type = eq::FilterType::Bell; ms[0].lane (eq::Lane::Stereo).on = false;
+        ms[0].lane (eq::Lane::Mid).on = true; ms[0].lane (eq::Lane::Mid).freq = 1000.0; ms[0].lane (eq::Lane::Mid).Q = 2.0; ms[0].lane (eq::Lane::Mid).gainDb = 12.0;
+        run (ms, 1, 0.0, "6ch: {m}-only point is TRANSPARENT (domain lanes inert off-stereo)");
+    }
+
     return test::report();
 }
