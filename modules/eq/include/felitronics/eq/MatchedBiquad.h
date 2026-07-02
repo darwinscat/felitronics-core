@@ -566,14 +566,27 @@ namespace matched
     // a notch (its sections are robust DC-normalised nulls) but for a band-pass the independent
     // perturbation breaks that delicate cancellation: high-Q / high-order stagger sections ripple and
     // OVERSHOOT by up to +14 dB (measured on the Q=30, 96 dB/oct corner). The bilinear transform maps the
-    // WHOLE analog prototype CONFORMALLY, so Butterworth maximal flatness survives at every order and Q
-    // (overshoot ≤ +0.3 dB across a 44.1/48/96 kHz × f0 × Q × order grid) — which is exactly why BLT, not
-    // matched-Z, is the textbook transform for a digital Butterworth band-pass. The two analog −3 dB
-    // edges are PRE-WARPED so the digital edges land on them exactly ⇒ no edge "cramping" and an
-    // order-invariant bandwidth (edges move < 0.1 % across order). The only trade is AT Nyquist: the
-    // numerator's z = −1 zero rolls the top of the band off to silence a hair faster than the analog
-    // residual — inaudible (deep stopband), the band-pass mirror of the single notch's frozen
-    // near-Nyquist trade; a Nyquist-MATCHED band-pass stays with sections == 1 (matched::bandpass).
+    // WHOLE analog prototype CONFORMALLY, so Butterworth maximal flatness survives at every order and Q —
+    // which is exactly why BLT, not matched-Z, is the textbook transform for a digital Butterworth
+    // band-pass. The two analog −3 dB edges are PRE-WARPED so the digital edges land on them exactly:
+    // while the band sits CLEAR of Nyquist (upper analog edge ≤ 0.40·fs) the edges are pinned to the
+    // analog within 0.02 %, the −3 dB bandwidth is order-invariant, and the response never exceeds
+    // unity by more than +0.02 dB (grid-measured, 44.1–192 kHz × f0 × Q × order).
+    //
+    // NEAR-NYQUIST TRADE — CENTRE UNITY WINS (a documented trade, the band-pass mirror of the single
+    // notch's frozen near-Nyquist sag). The cascade is normalised to EXACT unity at f0 — the family
+    // contract, and what sections == 1 does, so a slope 12↔24 toggle never steps the centre gain. But
+    // tan() warping puts the warped band centre √(W1·W2) slightly OFF f0, and once the band's upper
+    // analog edge pushes past ~0.40·fs (or clamps at 0.4999·fs because the requested band physically
+    // exceeds Nyquist) that offset grows: the true passband peak then reads up to +0.29 dB just above
+    // f0 (grid ceiling +0.287 dB; e.g. fs=48k, f0=0.47·fs, Q=8, m=2: +0.277 dB at ~23.9 kHz), the
+    // designed edges read shallower than −3.01 dB by the same offset, and the realised −3 dB span
+    // drifts ≤ ~3 % across order in the clamped corner. Peak-normalising instead would zero the
+    // overshoot but push the CENTRE below unity by the same ~0.28 dB and break the sections==1
+    // bit-contract at the slope seam — rejected. The z = −1 zero also rolls the deep stopband off to
+    // silence a hair faster than the analog residual — inaudible. A Nyquist-MATCHED band-pass stays
+    // with sections == 1 (matched::bandpass). Contract locks: the "never boosts" and "near-Nyquist
+    // contract" test groups in MatchedBiquadTests assert these exact bounds.
     //
     // Pole placement mirrors notchCascade's, on the band-PASS branch: the analog low-pass→band-pass map
     //     s_lp → (s² + Ω0²) / (BW·s),   Ω0 = 2π f0,  BW = Ω0 / Q

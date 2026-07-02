@@ -717,7 +717,9 @@ void runMatchedBiquadTests()
     group ("variable-order band-pass: −3 dB bandwidth is INVARIANT across order (only the skirt steepens)");
     {
         // The analog −3 dB edges are where |x| = 1, independent of order; the pre-warped bilinear design
-        // pins them, so the digital −3 dB span must not move as the cascade steepens.
+        // pins them, so the digital −3 dB span must not move as the cascade steepens. These bands all
+        // sit clear of Nyquist (upper analog edge ≤ 0.40·fs), so the edges must also land ON the analog
+        // edges absolutely (grid-measured 0.02%), not merely agree with each other.
         for (double f0 : { 1000.0, 3000.0, 6000.0 })
             for (double Q : { 0.707, 2.0, 8.0 })
             {
@@ -725,6 +727,9 @@ void runMatchedBiquadTests()
                 double loRef, hiRef; bandEdges3dB (out, nRef, fs, f0, loRef, hiRef);
                 const std::string at0 = " (f0=" + std::to_string ((int) f0) + " Q=" + std::to_string (Q) + ")";
                 expectTrue (loRef > 0.0 && hiRef > 0.0, "found both −3 dB edges" + at0);
+                const double aQ = 1.0 / (2.0 * Q), rQ = std::sqrt (1.0 + aQ * aQ);
+                expectTrue (std::fabs (loRef - f0 * (rQ - aQ)) / (f0 * (rQ - aQ)) < 0.01, "lower edge PINNED to the analog edge" + at0);
+                expectTrue (std::fabs (hiRef - f0 * (rQ + aQ)) / (f0 * (rQ + aQ)) < 0.01, "upper edge PINNED to the analog edge" + at0);
                 for (int m : { 3, 4, 6, 8 })
                 {
                     const int n = matched::bandpassCascade (f0, fs, Q, m, out);
@@ -736,21 +741,60 @@ void runMatchedBiquadTests()
             }
     }
 
-    group ("variable-order band-pass: never boosts above unity (maximally flat — the Butterworth peak is unity at f0)");
+    group ("variable-order band-pass: maximal flatness — <= +0.02 dB clear of Nyquist, <= +0.30 dB ceiling near it");
     {
-        double worstOver = -1e9;
+        // The two-tier contract bandpassCascade's header documents (centre unity wins near Nyquist):
+        //   * band CLEAR of Nyquist (upper analog −3 dB edge f0·(√(1+a²)+a) ≤ 0.40·fs, a = 1/(2Q)):
+        //     the response never exceeds unity by more than +0.02 dB (grid-measured +0.017);
+        //   * near/past Nyquist (incl. the 0.4999·fs edge clamp): the exact-unity-at-f0 normalisation
+        //     lets the true peak poke up to +0.29 dB above unity (grid-measured ceiling +0.287) —
+        //     f0 = 0.47·fs and 0.49·fs are asserted here too, no exemption.
+        double worstClear = -1e9, worstNyq = -1e9;
         for (double sr : { 44100.0, 48000.0, 96000.0 })
-            for (double Q : { 0.05, 0.2, 0.707, 4.0, 40.0 })
+            for (double Q : { 0.05, 0.2, 0.707, 2.0, 4.0, 40.0 })
                 for (int m : { 2, 3, 4, 6, 8 })
-                    for (double f0 : { 20.0, 200.0, 2000.0, 0.30 * sr, 0.45 * sr })
+                    for (double f0 : { 20.0, 200.0, 2000.0, 0.30 * sr, 0.45 * sr, 0.47 * sr, 0.49 * sr })
                     {
-                        if (f0 >= 0.47 * sr) continue;
                         const int n = matched::bandpassCascade (f0, sr, Q, m, out);
-                        for (double f = 5.0; f < 0.5 * sr; f *= 1.02)
-                            worstOver = std::max (worstOver, cascadeDb (out, n, 2.0 * kPi * f / sr));
+                        double over = -1e9;
+                        for (double f = 5.0; f < 0.5 * sr; f *= 1.01)
+                            over = std::max (over, cascadeDb (out, n, 2.0 * kPi * f / sr));
+                        const double aQ = 1.0 / (2.0 * Q), rQ = std::sqrt (1.0 + aQ * aQ);
+                        const bool clear = f0 * (rQ + aQ) <= 0.40 * sr && f0 * (rQ - aQ) >= 1.0;
+                        if (clear) worstClear = std::max (worstClear, over);
+                        else       worstNyq   = std::max (worstNyq, over);
                     }
-        std::printf ("      worst magnitude above 0 dB across the grid = %+.4f dB\n", worstOver);
-        expectTrue (worstOver < 0.5, "band-pass never boosts (<= ~unity everywhere => maximally flat)");
+        std::printf ("      worst above 0 dB: clear-of-Nyquist=%+.4f dB, near-Nyquist=%+.4f dB\n", worstClear, worstNyq);
+        expectTrue (worstClear < 0.02, "band clear of Nyquist: never boosts beyond +0.02 dB (maximally flat)");
+        expectTrue (worstNyq   < 0.30, "near-Nyquist ceiling: never boosts beyond +0.30 dB (centre-unity trade)");
+    }
+
+    group ("variable-order band-pass: near-Nyquist contract — CENTRE UNITY WINS (documented trade, pinned)");
+    {
+        // The review's falsification case (fs=48k, f0=0.47·fs, Q=8): the band's upper analog −3 dB edge
+        // exceeds Nyquist (clamped to 0.4999·fs), and the tan() warp shifts the warped band centre off
+        // f0. The shipped decision: normalisation keeps f0 at EXACT unity (the family contract; what
+        // m==1 does bit-for-bit), so the true peak reads ~+0.28 dB just above f0 and the −3 dB span
+        // drifts a few % with order. All three are pinned so the trade stays a DECISION, not an
+        // accident — a future peak-normalising "fix" must consciously rewrite this contract and the
+        // bandpassCascade header comment together.
+        const double sr = 48000.0, f0 = 0.47 * sr, Q = 8.0;
+        double bw2 = 0.0;
+        for (int m : { 2, 4, 8 })
+        {
+            const int n = matched::bandpassCascade (f0, sr, Q, m, out);
+            const std::string at = " (m=" + std::to_string (m) + ")";
+            expectNear (cascadeDb (out, n, 2.0 * kPi * f0 / sr), 0.0, 1e-4, "centre stays EXACT unity" + at);
+            double over = -1e9;
+            for (double f = 1000.0; f < 0.49999 * sr; f *= 1.001)
+                over = std::max (over, cascadeDb (out, n, 2.0 * kPi * f / sr));
+            expectTrue (over < 0.30, "peak within the documented +0.30 dB ceiling" + at);
+            if (m == 2) expectTrue (over > 0.15, "the m=2 near-Nyquist peak is REAL (~+0.28 dB, not laundered away)");
+            double lo, hi; bandEdges3dB (out, n, sr, f0, lo, hi);
+            if (m == 2) bw2 = hi - lo;
+            else if (bw2 > 0.0 && lo > 0.0 && hi > 0.0)
+                expectTrue (std::fabs ((hi - lo) - bw2) / bw2 < 0.05, "clamped-corner −3 dB span drifts < 5% across order" + at);
+        }
     }
 
     group ("variable-order band-pass: stable + finite + unity at centre across fs / f0 / Q / order grid (incl near-Nyquist)");

@@ -33,7 +33,10 @@ enum class FilterType
     HighShelf,   // gainDb (Butterworth slope, Q ignored)
     HighPass,    // Q at 12 dB/oct; 24 dB/oct is Butterworth (Q ignored)
     LowPass,     // Q at 12 dB/oct; 24 dB/oct is Butterworth (Q ignored)
-    BandPass,    // Q, unity gain at centre
+    BandPass,    // unity gain at centre; Q = overall −3 dB bandwidth (order-INVARIANT), skirt
+                 // steepness by slope (order = slope/6; slope 6/12 = the frozen single matched
+                 // band-pass, bit-for-bit). Near Nyquist CENTRE UNITY WINS: the true peak may read
+                 // up to ~+0.29 dB just off f0 — matched::bandpassCascade's documented trade
     Notch,       // band-stop: deep null at f0, unity at DC; width by Q, steepness by slope. Toward
                  // Nyquist it tracks the analog Butterworth band-stop residual (a wide/high notch
                  // legitimately reads below 0 dB at fs/2; slope 6/12 = the frozen single notch,
@@ -56,7 +59,8 @@ struct LaneParams
     double freq   = 1000.0;   // Hz (engine clamps to [10, 0.49*fs])
     double Q      = 1.0;
     double gainDb = 0.0;      // bells & shelves
-    int    slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch: steepness (order=slope/6)
+    int    slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch/BandPass: skirt steepness
+                              // (order = slope/6; Q stays the −3 dB bandwidth, order-invariant)
     bool   bypass = false;    // lane kept but muted (ghost node) — distinct from on=false
 
     // Doubles compared by bit pattern (not `==`) so the engine's recompute-skip stays exact without
