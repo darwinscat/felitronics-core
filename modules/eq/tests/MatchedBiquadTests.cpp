@@ -212,6 +212,58 @@ void runMatchedBiquadTests()
         }
     }
 
+    group ("variable-order band-stop: near-Nyquist reference-NULL — aliased stagger poles refit to the analog");
+    {
+        // Regression for the alias sag: a wide (Q ≤ 0.7) high-f0 notch throws the LP→BS upper
+        // stagger poles above fs/2; z = exp(sT) wrapped them into the band and the whole top end
+        // sagged to ≈ DOUBLE the analog dB (f0=15k Q=0.5 @48k: m=2 read −23.9 dB at Nyquist vs the
+        // analog −12.7; m=4 read −49.5 vs −25.0). The alias-gated refit must now hit the analog
+        // point AT Nyquist (exact by construction — both match points interpolate the reference)
+        // and track it broadband: ≤ 1.5 dB for m ≤ 4 (one wrapped pole), ≤ 3 dB for m = 8 (two
+        // wrapped poles share the correction; the residue is interpolation between the two exact
+        // match points), measured where the reference is audible (> −40 dB) outside the null ±6%.
+        BiquadCoeffs out[8];
+        double worstN = 0.0, worstB = 0.0;
+        for (double fsr : { 44100.0, 48000.0 })
+            for (double f0 : { 12000.0, 15000.0, 16000.0 })
+                for (double Q : { 0.5, 0.7 })
+                    for (int m : { 2, 4, 8 })
+                    {
+                        const int n = matched::notchCascade (f0, fsr, Q, m, out);
+                        const std::string at = " (fs=" + std::to_string ((int) fsr) + " f0=" + std::to_string ((int) f0)
+                                             + " Q=" + std::to_string (Q) + " m=" + std::to_string (m) + ")";
+                        bool stable = true; for (int i = 0; i < n; ++i) stable = stable && out[i].isStable();
+                        expectTrue (stable,                                             "refit sections stable" + at);
+                        expectTrue (cascadeDb (out, n, 2.0 * kPi * f0 / fsr) < -60.0,   "infinite null survives the refit" + at);
+                        expectNear (cascadeDb (out, n, 0.0), 0.0, 0.02,                 "unity at DC survives the refit" + at);
+
+                        const double errN = std::fabs (cascadeDb (out, n, kPi) - analogBandStopDb (0.5 * fsr, f0, Q, m));
+                        expectTrue (errN < 0.10,                                        "Nyquist == analog reference" + at);
+
+                        double errB = 0.0;
+                        for (double f = 100.0; f < 0.4999 * fsr; f *= 1.02)
+                        {
+                            const double ref = analogBandStopDb (f, f0, Q, m);
+                            if (ref > -40.0 && std::fabs (f - f0) > 0.06 * f0)
+                                errB = std::max (errB, std::fabs (cascadeDb (out, n, 2.0 * kPi * f / fsr) - ref));
+                        }
+                        expectTrue (errB < (m <= 4 ? 1.5 : 3.0),                        "broadband tracks analog" + at);
+                        worstN = std::max (worstN, errN); worstB = std::max (worstB, errB);
+                    }
+        std::printf ("      near-Nyquist grid: worst |Nyq err| = %.4f dB, worst broadband err = %.3f dB\n", worstN, worstB);
+
+        // The two headline falsification cases, pinned: Nyquist must equal the analog reference
+        // (−12.7 / −25.0 dB) instead of the old doubled sag (−23.9 / −49.5 dB).
+        {
+            const int n2 = matched::notchCascade (15000.0, 48000.0, 0.5, 2, out);
+            expectNear (cascadeDb (out, n2, kPi), analogBandStopDb (24000.0, 15000.0, 0.5, 2), 0.10,
+                        "f0=15k Q=0.5 m=2 @48k: Nyquist == analog −12.7 dB (was −23.9)");
+            const int n4 = matched::notchCascade (15000.0, 48000.0, 0.5, 4, out);
+            expectNear (cascadeDb (out, n4, kPi), analogBandStopDb (24000.0, 15000.0, 0.5, 4), 0.10,
+                        "f0=15k Q=0.5 m=4 @48k: Nyquist == analog −25.0 dB (was −49.5)");
+        }
+    }
+
     group ("variable-order band-stop: stable + deep null across fs / f0 / Q / order grid");
     {
         int unstable = 0; double worstNull = -1e9;

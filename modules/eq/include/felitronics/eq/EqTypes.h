@@ -33,7 +33,10 @@ enum class FilterType
     HighPass,    // Q at 12 dB/oct; 24 dB/oct is Butterworth (Q ignored)
     LowPass,     // Q at 12 dB/oct; 24 dB/oct is Butterworth (Q ignored)
     BandPass,    // Q, unity gain at centre
-    Notch,       // band-stop: deep null at f0, unity at DC/Nyquist; width by Q, steepness by slope
+    Notch,       // band-stop: deep null at f0, unity at DC; width by Q, steepness by slope. Toward
+                 // Nyquist it tracks the analog Butterworth band-stop residual (a wide/high notch
+                 // legitimately reads below 0 dB at fs/2; slope 6/12 = the frozen single notch,
+                 // which under-shoots that residual — see matched::notch)
     AllPass,     // flat magnitude, 360° phase rotation through f0 (Q = sharpness)
     Tilt         // spectral tilt about f0: lows -gainDb, highs +gainDb
 };
