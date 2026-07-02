@@ -61,3 +61,4 @@ xcuserdata/
 *.flac
 *.mp3
 *.raw
+build-verify*/
