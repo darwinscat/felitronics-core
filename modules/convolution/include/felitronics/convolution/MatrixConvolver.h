@@ -145,6 +145,10 @@ public:
             slot_[stg].banks[b].build (banks[b], len, P_, maxParts_, specF_, buildFft_);
         return true;
     }
+    // KNOWN residual: across N instances the publishes are N independent atomic stores — if the audio
+    // thread interleaves mid-loop, one channel's fade can start up to ONE block before another's. With
+    // identical IRs on every channel and a ≥20 ms smoothstep fade this is inaudible; a shared fade clock
+    // across instances was judged over-engineering (revisit only if a real bed swap ever images).
     void publishStaged() noexcept { state_.store (1, std::memory_order_release); }   // → Pending
 
     // Mono convenience: a single IR broadcast onto the one bank.
