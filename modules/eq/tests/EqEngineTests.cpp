@@ -287,6 +287,25 @@ void runEqEngineTests()
         }
     }
 
+    group ("HP/LP every order incl. ODD: -3.01 dB at fc (Butterworth invariant) + flat passband, no ripple");
+    {
+        // Regression for the odd-order pole-Q bug: the cos enumeration made a 3rd-order LP read -7.8 dB
+        // at fc (corner ~42% low). A Butterworth of ANY order is exactly -3.0103 dB at fc.
+        for (int slope : { 6, 12, 18, 24, 30, 36, 42, 48, 54, 66, 78, 90, 96 })
+            for (int hp = 0; hp < 2; ++hp)
+            {
+                const double fc = 1000.0;
+                BandParams p; p.on = true; p.type = hp ? FilterType::HighPass : FilterType::LowPass; p.freq = fc; p.slope = slope;
+                const std::string at = " (slope " + std::to_string (slope) + (hp ? " HP)" : " LP)");
+                auto dbAt = [&] (double f) { return 20.0 * std::log10 (std::abs (bandResponse (p, fs, 2.0 * kPi * f / fs))); };
+                expectNear (dbAt (fc), -3.0103, 0.15, "|H(fc)| == -3.01 dB" + at);                 // THE odd-order discriminator
+                expectNear (dbAt (hp ? fc * 8.0 : fc / 8.0), 0.0, 0.2, "flat passband" + at);       // deep passband ~ unity
+                // monotone through the corner (no ripple/overshoot): passband -> -3 dB -> stopband
+                const double near = dbAt (hp ? fc * 1.3 : fc / 1.3), far = dbAt (hp ? fc / 1.3 : fc * 1.3);
+                expectTrue (near > -3.0103 && far < -3.0103, "monotone through fc, no ripple" + at);
+            }
+    }
+
     group ("Notch variable order: designBand slope->sections mapping; default slope 12 == legacy single notch");
     {
         BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 4.0;
