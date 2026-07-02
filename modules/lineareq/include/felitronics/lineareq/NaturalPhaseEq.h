@@ -125,9 +125,12 @@ public:
         if (channels_ > 2)
         {
             buildFir (bands, numBands, eq::Axis::Stereo, fir_[0].data());
-            bool ok = true;
-            for (auto& c : chConv_) ok = c->setIr (fir_[0].data(), L_) && ok;
-            return ok;
+            const float* one[1] { fir_[0].data() };
+            bool ok = true;                                     // stage ALL channels first (expensive builds)...
+            for (auto& c : chConv_) ok = c->stageOperator (Conv::Topology::LRDiag, one, 1, L_) && ok;
+            if (! ok) return false;
+            for (auto& c : chConv_) c->publishStaged();         // ...then publish back-to-back: lockstep fades
+            return true;
         }
                          // unprepared — FIR buffers + MixedPhaseFir are empty
 

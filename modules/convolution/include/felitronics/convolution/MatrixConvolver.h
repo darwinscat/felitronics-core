@@ -93,7 +93,7 @@ public:
             frameR_.assign ((std::size_t) N_, 0.0f);
             fdlR_.assign   ((std::size_t) maxParts_ * (std::size_t) specF_, 0.0f);
         }
-        for (int k = 0; k < 2; ++k) slot_[k].prepare (P_, maxParts_, specF_);
+        for (int k = 0; k < 2; ++k) slot_[k].prepare (P_, maxParts_, specF_, mono_ ? 1 : kMaxBanks);
 
         cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
         phase_ = 0; fdlPos_ = 0; warmSamples_ = 0;
@@ -124,6 +124,17 @@ public:
     // Returns false if a swap is already pending/crossfading (the caller coalesces with the latest snapshot).
     bool setOperator (Topology topo, const float* const* banks, int numBanks, int len)
     {
+        if (! stageOperator (topo, banks, numBanks, len)) return false;
+        publishStaged();
+        return true;
+    }
+
+    // Two-phase variant: build the operator into the inactive slot WITHOUT publishing. A host running one
+    // convolver per channel (the surround ST-only path) stages every instance first (the expensive bank
+    // FFTs), then publishes them back-to-back — so all channels enter their crossfade within nanoseconds
+    // of each other instead of skewing by whole audio blocks while later channels are still building.
+    bool stageOperator (Topology topo, const float* const* banks, int numBanks, int len)
+    {
         if (! prepared_ || banks == nullptr || state_.load (std::memory_order_acquire) != 0) return false;
         const int stg = 1 - cur_;                                          // inactive slot
         const int nb  = mono_ ? 1 : std::min (numBanks, numBanksFor (topo));
@@ -132,9 +143,9 @@ public:
         slot_[stg].numBanks = mono_ ? 1 : numBanksFor (topo);
         for (int b = 0; b < slot_[stg].numBanks; ++b)
             slot_[stg].banks[b].build (banks[b], len, P_, maxParts_, specF_, buildFft_);
-        state_.store (1, std::memory_order_release);                       // → Pending (publishes)
         return true;
     }
+    void publishStaged() noexcept { state_.store (1, std::memory_order_release); }   // → Pending
 
     // Mono convenience: a single IR broadcast onto the one bank.
     bool setIr (const float* ir, int len)
@@ -223,9 +234,10 @@ private:
         Bank banks[kMaxBanks];
         std::vector<float> tailL, tailR;   // P each — this operator's cached tail for the NEXT chunk
 
-        void prepare (int P, int maxParts, int specF)
+        void prepare (int P, int maxParts, int specF, int nBanks)
         {
-            for (auto& b : banks) b.prepare (P, maxParts, specF);
+            for (int b = 0; b < nBanks; ++b) banks[b].prepare (P, maxParts, specF);   // mono: bank 0 only — a
+            // mono operator never touches banks[1..3] (setOperator caps numBanks), so their spectra stay unallocated
             tailL.assign ((std::size_t) P, 0.0f);
             tailR.assign ((std::size_t) P, 0.0f);
         }
