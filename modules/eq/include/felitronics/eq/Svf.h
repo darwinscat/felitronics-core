@@ -56,8 +56,8 @@ public:
             case FilterType::HighPass:                                        m0 = 1.0;   m1 = -k;                m2 = -1.0;          break;
             case FilterType::BandPass:                                        m0 = 0.0;   m1 = k;                 m2 = 0.0;           break;  // unity gain at centre
             case FilterType::AllPass:                                        m0 = 1.0;   m1 = -2.0 * k;          m2 = 0.0;           break;  // 2nd-order allpass: v0 - 2k·v1 (flat |H|=1)
-            case FilterType::Notch:                                          // swept notch/tilt still unused
-            case FilterType::Tilt:                                           m0 = 1.0;   m1 = 0.0;               m2 = 0.0;           break;  // -> pass-through
+            case FilterType::Notch:                                          m0 = 1.0;   m1 = -k;                m2 = 0.0;           break;  // notch = low + high = v0 - k·v1: exact null at the prewarped fc, unity at DC/Nyquist
+            case FilterType::Tilt:                                           m0 = 1.0;   m1 = 0.0;               m2 = 0.0;           break;  // NOT sweepable (EqBand always runs the matched two-shelf tilt — a one-SVF tilt cannot hold a unity pivot past ~6 dB); pass-through kept defensively
         }
 
         a1 = 1.0 / (1.0 + g * (g + k));

@@ -269,7 +269,7 @@ public:
         // One sample through this band's filter chain on a given per-channel state column.
         auto filt = [this] (int col, float x) noexcept
         {
-            if (p.swept) return svf.processSample (col, x);
+            if (sweptActive()) return svf.processSample (col, x);
             for (int s = 0; s < designN; ++s) x = bq[s][col].processSample (x);
             return x;
         };
@@ -314,11 +314,12 @@ private:
 
         // A topology switch (section count changed, swept<->static, route, OR Stereo<->M/S) changes
         // WHICH filters run — clear all state so a re-activated section never resumes a stale tail.
-        if (d.n != designN || dS.n != designNside || p.swept != lastSwept || p.ms != lastMs) reset();
+        const bool sw = sweptActive();
+        if (d.n != designN || dS.n != designNside || sw != lastSwept || p.ms != lastMs) reset();
 
         designN     = d.n;
         designNside = dS.n;
-        lastSwept = p.swept;
+        lastSwept = sw;
         lastMs    = p.ms;
 
         for (int s = 0; s < d.n; ++s) coeffs[s] = d.sec[s];
@@ -327,16 +328,22 @@ private:
 
         for (int s = 0; s < dS.n; ++s) { coeffsSide[s] = dS.sec[s]; bqSide[s].setCoeffs (coeffsSide[s]); }   // Side -> its OWN state
 
-        if (p.swept) svf.setParams (p.type, sp.freq, sp.Q, sp.gainDb);   // swept = single SVF stage (12 dB/oct)
+        if (sw) svf.setParams (p.type, sp.freq, sp.Q, sp.gainDb);   // swept = single SVF stage (12 dB/oct)
     }
 
     void flushState() noexcept
     {
-        if (p.swept) { svf.flushDenormals(); return; }
+        if (sweptActive()) { svf.flushDenormals(); return; }
         for (int c = 0; c < ch; ++c)                                   // Mid/main lane, per channel
             for (int s = 0; s < kMaxSections; ++s) bq[s][c].flushDenormals();
         for (int s = 0; s < kMaxSections; ++s) bqSide[s].flushDenormals();   // Side lane (M/S)
     }
+
+    // The swept (SVF) engine only runs for types the single SVF stage can actually realise. Tilt has
+    // no one-SVF realisation with a unity pivot beyond ~6 dB of tilt, so a swept Tilt band runs the
+    // matched two-shelf design instead (the audio finally matches the displayed curve; previously a
+    // swept Tilt was a silent pass-through while the GUI showed the full ±gain tilt).
+    bool sweptActive() const noexcept { return p.swept && p.type != FilterType::Tilt; }
 
     BandParams p;
     double fs = 44100.0;

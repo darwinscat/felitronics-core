@@ -49,7 +49,9 @@ struct BandParams
     double     gainDb = 0.0;      // bells & shelves
     int        slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch: steepness (order=slope/6),
                                   // sections=ceil(order/2); 6/12→single notch (Q=width), 24→2 … 96→8.
-    bool       swept  = false;    // true → zero-delay SVF (smooth fast fc sweeps for search mode)
+    bool       swept  = false;    // true → zero-delay SVF (smooth fast fc sweeps for search mode).
+                                  // Notch sweeps as a real SVF notch; Tilt has no one-SVF realisation
+                                  // and always runs the matched two-shelf design (flag ignored).
     bool       bypass = false;    // band kept but muted (ghost) — distinct from on=false (removed)
 
     // M/S dual-mode: the flat fields above are the Mid/main lane; these are the independent Side lane.
