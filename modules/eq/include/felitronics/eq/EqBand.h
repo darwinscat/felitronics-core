@@ -179,6 +179,7 @@ public:
     {
         for (int c = 0; c < kMaxChannels; ++c)
             for (int s = 0; s < kMaxSections; ++s) bq[s][c].reset();
+        for (int s = 0; s < kMaxSections; ++s) bqSide[s].reset();
         svf.reset();
     }
 
@@ -253,7 +254,7 @@ public:
                 const float s = 0.5f * (L[n] - R[n]);
                 float dM = 0.0f, dS = 0.0f;
                 if (midActive)  { float x = m; for (int k = 0; k < designN;     ++k) x = bq[k][0].processSample (x); dM = x - m; }
-                if (sideActive) { float y = s; for (int k = 0; k < designNside; ++k) y = bq[k][1].processSample (y); dS = y - s; }
+                if (sideActive) { float y = s; for (int k = 0; k < designNside; ++k) y = bqSide[k].processSample (y); dS = y - s; }
                 L[n] += dM + dS;   // L=M+S, R=M-S: fold deltas back. An idle lane (d=0) leaves its axis bit-exact.
                 R[n] += dM - dS;
             }
@@ -324,7 +325,7 @@ private:
         for (int c = 0; c < ch; ++c)
             for (int s = 0; s < d.n; ++s) bq[s][c].setCoeffs (coeffs[s]);
 
-        for (int s = 0; s < dS.n; ++s) { coeffsSide[s] = dS.sec[s]; bq[s][1].setCoeffs (coeffsSide[s]); }   // Side -> col 1
+        for (int s = 0; s < dS.n; ++s) { coeffsSide[s] = dS.sec[s]; bqSide[s].setCoeffs (coeffsSide[s]); }   // Side -> its OWN state
 
         if (p.swept) svf.setParams (p.type, sp.freq, sp.Q, sp.gainDb);   // swept = single SVF stage (12 dB/oct)
     }
@@ -332,8 +333,9 @@ private:
     void flushState() noexcept
     {
         if (p.swept) { svf.flushDenormals(); return; }
-        for (int c = 0; c < ch; ++c)                                   // covers Mid (col 0) + Side (col 1)
+        for (int c = 0; c < ch; ++c)                                   // Mid/main lane, per channel
             for (int s = 0; s < kMaxSections; ++s) bq[s][c].flushDenormals();
+        for (int s = 0; s < kMaxSections; ++s) bqSide[s].flushDenormals();   // Side lane (M/S)
     }
 
     BandParams p;
@@ -349,6 +351,10 @@ private:
 
     Smoother freqS, qS, gainS, sFreqS, sQS, sGainS;
     Biquad   bq[kMaxSections][kMaxChannels];
+    Biquad   bqSide[kMaxSections];   // Side lane's OWN state (M/S runs it on 2-ch only). It must never
+                                     // alias a Mid channel column: writing Side coeffs into bq[s][1]
+                                     // corrupted channel 1 on surround (nc>=3), where the plain
+                                     // per-channel loop — not the M/S branch — consumes column 1.
     Svf      svf;
     BiquadCoeffs coeffs[kMaxSections], coeffsSide[kMaxSections];
 };
