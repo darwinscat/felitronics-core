@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 
 using namespace teq;
@@ -261,6 +262,111 @@ void runMatchedBiquadTests()
             const int n4 = matched::notchCascade (15000.0, 48000.0, 0.5, 4, out);
             expectNear (cascadeDb (out, n4, kPi), analogBandStopDb (24000.0, 15000.0, 0.5, 4), 0.10,
                         "f0=15k Q=0.5 m=4 @48k: Nyquist == analog −25.0 dB (was −49.5)");
+        }
+    }
+
+    group ("notchCascade contract locks: no-gate byte-identity, promotion rule, blend corner, wm point");
+    {
+        // Consilium-requested regression locks for the alias fix. A test-local replica of the LEGACY
+        // pass-1 emission (matched-Z LP→BS, zeros pinned, DC-normalised — the pre-fix design):
+        auto legacyCascade = [] (double f0, double sr, double Q, int m, BiquadCoeffs* o) noexcept
+        {
+            const double w0 = 2.0 * kPi * f0 / sr, cw = std::cos (w0);
+            const double Om0 = 2.0 * kPi * f0, BW = Om0 / Q, T = 1.0 / sr;
+            auto emit = [&] (int i, std::complex<double> z1, std::complex<double> z2) noexcept
+            {
+                const double a1 = -(z1 + z2).real(), a2 = (z1 * z2).real();
+                const double k = (1.0 + a1 + a2) / (2.0 - 2.0 * cw);
+                o[i] = { k, -2.0 * k * cw, k, a1, a2 };
+            };
+            int n = 0;
+            for (int i = 1; i <= m; ++i)
+            {
+                const double th = kPi * (2.0 * i - 1.0) / (2.0 * m) + kPi * 0.5;
+                const std::complex<double> p { std::cos (th), std::sin (th) };
+                if (p.imag() < -1e-12) continue;
+                const std::complex<double> b = -BW / p, d = std::sqrt (b * b - 4.0 * Om0 * Om0);
+                const std::complex<double> r1 = (std::abs (-b + d) >= std::abs (-b - d)) ? 0.5 * (-b + d) : 0.5 * (-b - d);
+                const std::complex<double> r2 = (Om0 * Om0) / r1;
+                if (std::abs (p.imag()) < 1e-12) emit (n++, std::exp (r1 * T), std::exp (r2 * T));
+                else { const auto z1 = std::exp (r1 * T), z2 = std::exp (r2 * T);
+                       emit (n++, z1, std::conj (z1)); emit (n++, z2, std::conj (z2)); }
+            }
+            return n;
+        };
+
+        // 1) NO-GATE BYTE-IDENTITY: wherever nothing wraps AND the legacy cascade already sits within
+        //    the ±0.05 dB promotion threshold at Nyquist, the shipped design must equal the legacy one
+        //    BIT FOR BIT. Where the promotion gate fires instead (legacy off by more), the shipped
+        //    cascade must land on the analog reference. (The ambiguous sliver around the threshold is
+        //    skipped — gate flip there is by design.)
+        int identical = 0, corrected = 0;
+        BiquadCoeffs a[8], b[8];
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+            for (double Q : { 1.0, 3.0 })
+                for (int m : { 2, 4, 8 })
+                    for (double f0 = 100.0; f0 <= 0.25 * sr; f0 *= 1.5)
+                    {
+                        const int na = matched::notchCascade (f0, sr, Q, m, a);
+                        const int nb = legacyCascade (f0, sr, Q, m, b);
+                        const double legErr = std::fabs (cascadeDb (b, nb, kPi) - analogBandStopDb (0.5 * sr, f0, Q, m));
+                        const std::string at = " (fs=" + std::to_string ((int) sr) + " f0=" + std::to_string ((int) f0)
+                                             + " Q=" + std::to_string (Q) + " m=" + std::to_string (m) + ")";
+                        if (legErr < 0.045)
+                        {
+                            bool same = (na == nb);
+                            for (int i = 0; same && i < na; ++i)
+                                same = a[i].b0 == b[i].b0 && a[i].b1 == b[i].b1 && a[i].b2 == b[i].b2
+                                    && a[i].a1 == b[i].a1 && a[i].a2 == b[i].a2;
+                            expectTrue (same, "no-gate design byte-identical to legacy" + at);
+                            ++identical;
+                        }
+                        else if (legErr > 0.06)
+                        {
+                            expectNear (cascadeDb (a, na, kPi), analogBandStopDb (0.5 * sr, f0, Q, m), 0.10,
+                                        "promoted design lands on the analog Nyquist point" + at);
+                            ++corrected;
+                        }
+                    }
+        std::printf ("      contract-lock grid: %d byte-identical, %d promotion-corrected\n", identical, corrected);
+        expectTrue (identical >= 100, "grid genuinely exercises the byte-identity path");
+        expectTrue (corrected  >= 1,  "grid genuinely exercises the promotion path");
+
+        // 2) PROMOTION RULE, pinned: hot-but-unwrapped poles near fs/2 — legacy missed the analog
+        //    Nyquist point by 6.5..21.7 dB; the promoted refit must land on it.
+        for (double f0 : { 20000.0, 21000.0 })
+            for (int m : { 2, 4 })
+            {
+                const int n = matched::notchCascade (f0, 48000.0, 2.0, m, a);
+                expectNear (cascadeDb (a, n, kPi), analogBandStopDb (24000.0, f0, 2.0, m), 0.10,
+                            "promotion pins Nyquist to analog (f0=" + std::to_string ((int) f0) + " m=" + std::to_string (m) + ")");
+            }
+
+        // 3) λ-BLEND CORNER, pinned (f0 = 0.49·fs, wide, high order): the no-boost invariant must win —
+        //    stable, deep null, DC unity, and NEVER above unity anywhere.
+        for (double Q : { 0.7, 2.0 })
+            for (int m : { 6, 8 })
+            {
+                const double sr = 96000.0, f0 = 0.49 * sr;
+                const int n = matched::notchCascade (f0, sr, Q, m, a);
+                const std::string at = " (Q=" + std::to_string (Q) + " m=" + std::to_string (m) + ")";
+                bool stable = true; for (int i = 0; i < n; ++i) stable = stable && a[i].isStable();
+                double over = -1e9;
+                for (int j = 0; j <= 100; ++j)
+                    over = std::max (over, cascadeDb (a, n, kPi * std::pow (0.001, 1.0 - j / 100.0)));
+                expectTrue (stable,                                          "blend corner stable"            + at);
+                expectTrue (over < 0.01,                                     "blend corner never boosts"      + at);
+                expectTrue (cascadeDb (a, n, 2.0 * kPi * f0 / sr) < -60.0,   "blend corner keeps the null"    + at);
+                expectNear (cascadeDb (a, n, 0.0), 0.0, 0.02,                "blend corner keeps DC unity"    + at);
+            }
+
+        // 4) SECOND MATCH POINT, pinned: the refit interpolates the analog reference at wm = √(w0·π)
+        //    too, not only at Nyquist (headline case, unblended).
+        {
+            const double sr = 48000.0, f0 = 15000.0, w0 = 2.0 * kPi * f0 / sr, wm = std::sqrt (w0 * kPi);
+            const int n = matched::notchCascade (f0, sr, 0.5, 4, a);
+            expectNear (cascadeDb (a, n, wm), analogBandStopDb (wm * sr / (2.0 * kPi), f0, 0.5, 4), 0.10,
+                        "cascade == analog at the wm match point (f0=15k Q=0.5 m=4 @48k)");
         }
     }
 
