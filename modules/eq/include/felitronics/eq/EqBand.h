@@ -38,9 +38,13 @@ inline BandDesign designBand (const BandParams& in, double fs) noexcept
 
     if (isCut && ! p.swept)
     {
-        // Butterworth cascade: order = slope/6 poles {1,2,4,6,8,12,16}; sections = order/2 (+ a
-        // first-order section if the order is odd, i.e. 6 dB/oct). Per-section Qs are the standard
-        // Butterworth pole Qs, each realised by a Nyquist-matched biquad.
+        // Butterworth cascade: order = slope/6 poles {1..16}; sections = order/2 (+ a first-order
+        // section for odd order, e.g. 6/18/30 dB/oct). Per-section Qs are the standard Butterworth
+        // pole Qs — a pole pair at s = −sin θ ± j·cos θ has Q = 1/(2 sin θ) — realised by
+        // Nyquist-matched biquads. The SIN enumeration is correct for BOTH parities; the previous
+        // cos form was even-order-only (a 3rd-order LP read −7.8 dB at fc instead of −3 dB, its
+        // corner ~42% low). Pairs are emitted low-Q-first, which for even order reproduces the
+        // previous cascade section-for-section (same Q per slot), so shipped even slopes don't move.
         const int  order = std::clamp (p.slope / 6, 1, 16);
         const bool isHP  = (p.type == FilterType::HighPass);
         int idx = 0;
@@ -49,7 +53,7 @@ inline BandDesign designBand (const BandParams& in, double fs) noexcept
         const int nSec = order / 2;
         for (int k = 1; k <= nSec && idx < BandDesign::kMaxSections; ++k)
         {
-            const double Qk = 1.0 / (2.0 * std::cos ((2.0 * k - 1.0) * kPi / (2.0 * order)));
+            const double Qk = 1.0 / (2.0 * std::sin ((2.0 * (nSec - k) + 1.0) * kPi / (2.0 * order)));
             d.sec[idx++] = isHP ? matched::highpass (p.freq, fs, Qk) : matched::lowpass (p.freq, fs, Qk);
         }
         d.n = idx;
