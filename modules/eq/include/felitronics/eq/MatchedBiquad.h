@@ -554,6 +554,100 @@ namespace matched
     }
 
     //==========================================================================
+    // Variable-order band-PASS (Butterworth) — the band-PASS mirror of notchCascade. `sections` (1..8)
+    // is the Butterworth low-pass prototype order AND the biquad count; `Q` is the overall −3 dB
+    // BANDWIDTH (Q = f0/BW), held INVARIANT across order (only the SKIRTS steepen with `sections`); and
+    // `sections == 1` reproduces the frozen single matched::bandpass BIT-FOR-BIT (legacy sessions can't
+    // drift — the same contract notchCascade keeps for the single notch). Unity gain at the centre f0.
+    //
+    // WHY THE BILINEAR TRANSFORM HERE (not matched-Z + refit like notchCascade). A band-PASS PASSBAND is
+    // maximally flat only if the staggered resonant sections cancel EXACTLY into unity across the band.
+    // notchCascade places each pole by an independent impulse-invariant map (z = exp(sT)) — harmless for
+    // a notch (its sections are robust DC-normalised nulls) but for a band-pass the independent
+    // perturbation breaks that delicate cancellation: high-Q / high-order stagger sections ripple and
+    // OVERSHOOT by up to +14 dB (measured on the Q=30, 96 dB/oct corner). The bilinear transform maps the
+    // WHOLE analog prototype CONFORMALLY, so Butterworth maximal flatness survives at every order and Q
+    // (overshoot ≤ +0.3 dB across a 44.1/48/96 kHz × f0 × Q × order grid) — which is exactly why BLT, not
+    // matched-Z, is the textbook transform for a digital Butterworth band-pass. The two analog −3 dB
+    // edges are PRE-WARPED so the digital edges land on them exactly ⇒ no edge "cramping" and an
+    // order-invariant bandwidth (edges move < 0.1 % across order). The only trade is AT Nyquist: the
+    // numerator's z = −1 zero rolls the top of the band off to silence a hair faster than the analog
+    // residual — inaudible (deep stopband), the band-pass mirror of the single notch's frozen
+    // near-Nyquist trade; a Nyquist-MATCHED band-pass stays with sections == 1 (matched::bandpass).
+    //
+    // Pole placement mirrors notchCascade's, on the band-PASS branch: the analog low-pass→band-pass map
+    //     s_lp → (s² + Ω0²) / (BW·s),   Ω0 = 2π f0,  BW = Ω0 / Q
+    // sends each prototype pole p to a quadratic  s² − (BW·p)·s + Ω0² = 0  whose two roots are a
+    // geometric (log-symmetric) stagger pair about f0 (product of roots = Ω0²) — the CONJUGATE of
+    // notchCascade's LP→BS quadratic (b = −BW·p vs −BW/p), so the two families share pole MAGNITUDES;
+    // only the numerator differs (band-pass zeros at DC & Nyquist vs the notch's null at ±w0). Poles are
+    // carried to z by the bilinear map z = (1+s)/(1−s) in the pre-warped (s = tan(w/2)) domain, so every
+    // pole lands strictly inside the unit circle ⇒ each section is stable by construction. Each section
+    // pins its zeros at z = ±1 (a DC and a Nyquist null); the cascade is scaled to unity at f0. Fixed
+    // arrays, noexcept, O(sections) work — RT-safe at design rate. Fills out[0..n) and returns n
+    // (== clamped sections). Preconditions (as across matched::): 0 < f0 < fs/2 and Q > 0 —
+    // designBand() guarantees them.
+    inline int bandpassCascade (double f0, double fs, double Q, int sections, BiquadCoeffs* out) noexcept
+    {
+        const int m = sections < 1 ? 1 : (sections > 8 ? 8 : sections);
+        if (m == 1) { out[0] = bandpass (f0, fs, Q); return 1; }    // frozen single band-pass, bit-for-bit
+
+        // Analog −3 dB band edges (Hz): f_{hi,lo} = f0·(√(1+1/(2Q)²) ± 1/(2Q)); |x| = 1 there for EVERY
+        // order, so pinning them makes the bandwidth order-invariant. Pre-warp each (tan half-angle,
+        // T = 2 normalisation) so the bilinear map lands the digital edges exactly on them.
+        const double a    = 1.0 / (2.0 * Q);
+        const double root = std::sqrt (1.0 + a * a);
+        const double flo  = std::clamp (f0 * (root - a), 1.0, 0.49 * fs);
+        const double fhi  = std::clamp (f0 * (root + a), flo * 1.0001, 0.4999 * fs);
+        const double W1   = std::tan (kPi * flo / fs);
+        const double W2   = std::tan (kPi * fhi / fs);
+        const double BW   = W2 - W1;                    // pre-warped analog bandwidth
+        const double W0sq = W1 * W2;                    // pre-warped analog centre²
+
+        // One biquad from an analog band-pass pole pair (a conjugate pair, or two reals for the
+        // over-damped centre section): bilinear poles, zeros pinned at z = ±1 (numerator 1 − z⁻²).
+        auto emit = [&] (int idx, const std::complex<double>& ra, const std::complex<double>& rb) noexcept
+        {
+            const std::complex<double> z1 = (1.0 + ra) / (1.0 - ra);   // bilinear z = (1+s)/(1−s)
+            const std::complex<double> z2 = (1.0 + rb) / (1.0 - rb);
+            out[idx] = { 1.0, 0.0, -1.0, -(z1 + z2).real(), (z1 * z2).real() };
+        };
+
+        int n = 0;
+        for (int i = 1; i <= m; ++i)
+        {
+            // i-th Butterworth LP prototype pole on the unit circle in the LHP (angles in (π/2, 3π/2)).
+            const double theta = kPi * (2.0 * i - 1.0) / (2.0 * m) + kPi * 0.5;
+            const std::complex<double> p { std::cos (theta), std::sin (theta) };
+            if (p.imag() < -1e-12) continue;             // one representative per conjugate prototype pair
+
+            // LP→BP quadratic  s² + b·s + W0sq = 0  with b = −BW·p. Take the larger-magnitude root
+            // directly (its two terms reinforce — no cancellation), the smaller by Vieta (r1·r2 = W0sq).
+            const std::complex<double> b    = -BW * p;
+            const std::complex<double> disc = std::sqrt (b * b - 4.0 * W0sq);
+            const std::complex<double> r1   = (std::abs (-b + disc) >= std::abs (-b - disc))
+                                                ? 0.5 * (-b + disc) : 0.5 * (-b - disc);
+            const std::complex<double> r2   = W0sq / r1;
+
+            if (std::abs (p.imag()) < 1e-12)
+                emit (n++, r1, r2);                      // centre section: two roots (real, or a conj pair)
+            else                                         // complex proto pole → 2 stagger sections
+            {
+                emit (n++, r1, std::conj (r1));
+                emit (n++, r2, std::conj (r2));
+            }
+        }
+
+        // Scale the whole cascade to unity at the centre f0 (one section carries the gain — the others
+        // stay {1,0,−1,…}; the magnitude product is order-independent unity by construction).
+        const double w0 = 2.0 * kPi * f0 / fs;
+        double g = 1.0;
+        for (int i = 0; i < n; ++i) g *= out[i].magnitude (w0);
+        if (g > 0.0) { const double s = 1.0 / g; out[0].b0 *= s; out[0].b2 *= s; }
+        return n;
+    }
+
+    //==========================================================================
     // All-pass: |H| = 1 at every frequency (flat magnitude); the phase rotates 360° through f0 with
     // sharpness set by Q. Numerator is the reversed denominator, which forces unit magnitude.
     inline BiquadCoeffs allpass (double f0, double fs, double Q) noexcept

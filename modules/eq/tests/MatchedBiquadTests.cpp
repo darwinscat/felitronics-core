@@ -48,6 +48,32 @@ namespace
         return 10.0 * std::log10 (1.0 / (1.0 + std::pow (std::fabs (x), 2.0 * (double) m)));
     }
 
+    // Analog Butterworth band-PASS magnitude (dB) for a prototype order m — the power-complement of
+    // the band-stop:  |H(iΩ)|² = 1 / (1 + ((Ω0² − Ω²)/(BW·Ω))^{2m}). The independent reference the
+    // variable-order band-pass cascade is NULL-tested against.
+    double analogBandPassDb (double f, double f0, double Q, int m) noexcept
+    {
+        const double Om0 = 2.0 * kPi * f0, BW = Om0 / Q, Om = 2.0 * kPi * f;
+        if (Om <= 0.0) return -300.0;
+        const double invx = (Om0 * Om0 - Om * Om) / (BW * Om);
+        return 10.0 * std::log10 (1.0 / (1.0 + std::pow (std::fabs (invx), 2.0 * (double) m)));
+    }
+
+    // Lower / upper −3 dB crossing frequencies (Hz) of a biquad cascade, found by a fine log scan.
+    // Returns {flo, fhi}; a crossing left at 0 means "not found in [20, 0.4999 fs)".
+    void bandEdges3dB (const BiquadCoeffs* s, int n, double fs, double f0, double& flo, double& fhi) noexcept
+    {
+        flo = 0.0; fhi = 0.0;
+        double prev = -1e9;
+        for (double f = 20.0; f < 0.4999 * fs; f *= 1.0002)
+        {
+            const double d = 20.0 * std::log10 (std::max (1e-300, [&] { double m = 1.0; for (int i = 0; i < n; ++i) m *= s[i].magnitude (2.0 * kPi * f / fs); return m; } ()));
+            if (prev < -3.0103 && d >= -3.0103 && flo == 0.0) flo = f;
+            if (prev >= -3.0103 && d < -3.0103 && f > f0)      fhi = f;
+            prev = d;
+        }
+    }
+
     // |H(e^{jw})| in dB of a cascade of biquad sections (their product response).
     double cascadeDb (const BiquadCoeffs* s, int n, double w) noexcept
     {
@@ -623,6 +649,147 @@ void runMatchedBiquadTests()
                 expectTrue (std::fabs (d) < 0.2, "seam continuity at the gate (Q=" + std::to_string (Q) + ")");
             }
         }
+    }
+
+    group ("variable-order band-pass: order 1 == matched::bandpass BIT-FOR-BIT (legacy sessions don't drift)");
+    {
+        BiquadCoeffs out[8];
+        for (double f0 : { 50.0, 200.0, 1000.0, 5000.0, 18000.0 })
+            for (double Q : { 0.3, 0.707, 2.0, 8.0, 30.0 })
+            {
+                const int n = matched::bandpassCascade (f0, fs, Q, 1, out);
+                const auto ref = matched::bandpass (f0, fs, Q);
+                const std::string at = " (f0=" + std::to_string ((int) f0) + " Q=" + std::to_string (Q) + ")";
+                expectTrue (n == 1, "order-1 is a single section" + at);
+                expectTrue (out[0].b0 == ref.b0 && out[0].b1 == ref.b1 && out[0].b2 == ref.b2
+                         && out[0].a1 == ref.a1 && out[0].a2 == ref.a2, "coeffs bit-identical" + at);
+            }
+    }
+
+    group ("variable-order band-pass: exactly `order` sections, stable, unity at centre; skirt steepens with order");
+    {
+        for (double f0 : { 300.0, 1000.0, 6000.0 })
+        {
+            const double Q = 2.0;
+            double prevSteep = -1e9;
+            BiquadCoeffs out[8];
+            for (int m : { 1, 2, 3, 4, 6, 8 })
+            {
+                const int n = matched::bandpassCascade (f0, fs, Q, m, out);
+                const std::string at = " (f0=" + std::to_string ((int) f0) + " m=" + std::to_string (m) + ")";
+                expectTrue (n == m,                                     "section count == order"       + at);
+                bool stable = true; for (int i = 0; i < n; ++i) stable = stable && out[i].isStable();
+                expectTrue (stable,                                     "all sections stable"          + at);
+                expectNear (cascadeDb (out, n, w (f0)), 0.0, 1e-4,      "unity at centre f0"           + at);
+                // skirt steepness = dB dropped from a near-centre detune to an octave out; grows with order.
+                const double steep = cascadeDb (out, n, w (f0 * std::pow (2.0, 1.0 / 6.0))) - cascadeDb (out, n, w (f0 * 2.0));
+                if (m > 1) expectTrue (steep > prevSteep + 0.2, "skirt steeper than lower order" + at);
+                prevSteep = steep;
+            }
+        }
+    }
+
+    group ("variable-order band-pass: reference-NULL vs analog Butterworth band-pass (band below Nyquist)");
+    {
+        BiquadCoeffs out[8];
+        // A band whose whole −3 dB span sits well below Nyquist tracks the analog prototype tightly
+        // across order (passband + audible skirt; the very deep skirt near fs/2 legitimately rolls off
+        // faster — the digital cannot pass beyond fs/2 — so score only where the reference is audible).
+        for (double f0 : { 500.0, 1000.0, 3000.0 })
+            for (double Q : { 2.0, 4.0, 8.0 })
+                for (int m : { 2, 3, 4, 6, 8 })
+                {
+                    const int n = matched::bandpassCascade (f0, fs, Q, m, out);
+                    double maxErr = 0.0;
+                    for (double f = f0 / 16.0; f < f0 * 16.0 && f < 0.32 * fs; f *= 1.01)
+                    {
+                        const double ref = analogBandPassDb (f, f0, Q, m);
+                        if (ref > -25.0)                           // audible passband + upper skirt
+                            maxErr = std::max (maxErr, std::fabs (cascadeDb (out, n, w (f)) - ref));
+                    }
+                    std::printf ("      f0=%5.0f Q=%.1f m=%d  passband max|cascade−analog| = %.4f dB\n", f0, Q, m, maxErr);
+                    expectTrue (maxErr < 2.0, "band-pass cascade == analog band-pass (m=" + std::to_string (m) + ")");
+                }
+    }
+
+    BiquadCoeffs out[8];
+
+    group ("variable-order band-pass: −3 dB bandwidth is INVARIANT across order (only the skirt steepens)");
+    {
+        // The analog −3 dB edges are where |x| = 1, independent of order; the pre-warped bilinear design
+        // pins them, so the digital −3 dB span must not move as the cascade steepens.
+        for (double f0 : { 1000.0, 3000.0, 6000.0 })
+            for (double Q : { 0.707, 2.0, 8.0 })
+            {
+                const int nRef = matched::bandpassCascade (f0, fs, Q, 2, out);   // reference order (m=2)
+                double loRef, hiRef; bandEdges3dB (out, nRef, fs, f0, loRef, hiRef);
+                const std::string at0 = " (f0=" + std::to_string ((int) f0) + " Q=" + std::to_string (Q) + ")";
+                expectTrue (loRef > 0.0 && hiRef > 0.0, "found both −3 dB edges" + at0);
+                for (int m : { 3, 4, 6, 8 })
+                {
+                    const int n = matched::bandpassCascade (f0, fs, Q, m, out);
+                    double lo, hi; bandEdges3dB (out, n, fs, f0, lo, hi);
+                    const std::string at = " (f0=" + std::to_string ((int) f0) + " Q=" + std::to_string (Q) + " m=" + std::to_string (m) + ")";
+                    if (lo > 0.0 && loRef > 0.0) expectTrue (std::fabs (lo - loRef) / loRef < 0.03, "lower edge invariant" + at);
+                    if (hi > 0.0 && hiRef > 0.0) expectTrue (std::fabs (hi - hiRef) / hiRef < 0.03, "upper edge invariant" + at);
+                }
+            }
+    }
+
+    group ("variable-order band-pass: never boosts above unity (maximally flat — the Butterworth peak is unity at f0)");
+    {
+        double worstOver = -1e9;
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+            for (double Q : { 0.05, 0.2, 0.707, 4.0, 40.0 })
+                for (int m : { 2, 3, 4, 6, 8 })
+                    for (double f0 : { 20.0, 200.0, 2000.0, 0.30 * sr, 0.45 * sr })
+                    {
+                        if (f0 >= 0.47 * sr) continue;
+                        const int n = matched::bandpassCascade (f0, sr, Q, m, out);
+                        for (double f = 5.0; f < 0.5 * sr; f *= 1.02)
+                            worstOver = std::max (worstOver, cascadeDb (out, n, 2.0 * kPi * f / sr));
+                    }
+        std::printf ("      worst magnitude above 0 dB across the grid = %+.4f dB\n", worstOver);
+        expectTrue (worstOver < 0.5, "band-pass never boosts (<= ~unity everywhere => maximally flat)");
+    }
+
+    group ("variable-order band-pass: stable + finite + unity at centre across fs / f0 / Q / order grid (incl near-Nyquist)");
+    {
+        int unstable = 0, nonfinite = 0; double worstCentre = 0.0;
+        for (double fsg : { 44100.0, 48000.0, 96000.0, 192000.0 })
+            for (double Q : { 0.05, 0.2, 0.707, 2.0, 10.0, 40.0 })
+                for (int m : { 1, 2, 3, 4, 5, 6, 7, 8 })
+                    for (double f0 = 20.0; f0 <= 0.47 * fsg; f0 *= 1.4)
+                    {
+                        const int n = matched::bandpassCascade (f0, fsg, Q, m, out);
+                        for (int i = 0; i < n; ++i)
+                        {
+                            const auto& c = out[i];
+                            if (! (std::isfinite (c.b0) && std::isfinite (c.b1) && std::isfinite (c.b2)
+                                && std::isfinite (c.a1) && std::isfinite (c.a2))) ++nonfinite;
+                            if (! c.isStable()) ++unstable;
+                        }
+                        worstCentre = std::max (worstCentre, std::fabs (cascadeDb (out, n, 2.0 * kPi * f0 / fsg)));
+                    }
+        std::printf ("      grid: %d unstable, %d non-finite; worst |centre gain| = %.2e dB\n", unstable, nonfinite, worstCentre);
+        expectTrue (unstable == 0,        "every section stable across the whole grid");
+        expectTrue (nonfinite == 0,       "every coefficient finite across the whole grid");
+        expectTrue (worstCentre < 1e-4,   "unity at centre f0 everywhere on the grid");
+    }
+
+    group ("variable-order band-pass: exactly `order` sections for every order 1..8");
+    {
+        for (int m = 1; m <= 8; ++m)
+            for (double f0 : { 100.0, 1000.0, 9000.0 })
+                for (double Q : { 0.5, 3.0, 12.0 })
+                {
+                    const int n = matched::bandpassCascade (f0, fs, Q, m, out);
+                    const std::string at = " (order=" + std::to_string (m) + " f0=" + std::to_string ((int) f0) + ")";
+                    expectTrue (n == m, "returns exactly `order` sections" + at);
+                    bool stable = true; for (int i = 0; i < n; ++i) stable = stable && out[i].isStable();
+                    expectTrue (stable, "all sections stable" + at);
+                    expectNear (cascadeDb (out, n, w (f0)), 0.0, 1e-4, "unity at centre" + at);
+                }
     }
 
     group ("stability across a freq / Q / gain grid");

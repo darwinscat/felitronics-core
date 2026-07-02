@@ -458,6 +458,48 @@ void runEqEngineTests()
         expectNear (far, 0.0, 0.4, "slope-96 notch: unity two octaves below f0");
     }
 
+    group ("BandPass variable order: designBand slope->sections mapping; slope 6/12 == legacy single band-pass");
+    {
+        BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 4.0;
+        const int expect[][2] = { {6,1}, {12,1}, {24,2}, {36,3}, {48,4}, {72,6}, {96,8} };   // order=slope/6; sections=ceil(order/2)
+        for (auto& e : expect) { p.lane (Lane::Stereo).slope = e[0]; const auto d = designBand (p, fs);
+            expectTrue (d.n == e[1], "slope " + std::to_string (e[0]) + " -> " + std::to_string (e[1]) + " sections"); }
+
+        const auto ref = matched::bandpass (1000.0, fs, 4.0);                                  // slope 6 & 12 (order 1 & 2) -> the frozen single band-pass
+        auto bitEq = [&] (const BiquadCoeffs& c) { return c.b0 == ref.b0 && c.b1 == ref.b1 && c.b2 == ref.b2 && c.a1 == ref.a1 && c.a2 == ref.a2; };
+        for (int slope : { 6, 12 }) { p.lane (Lane::Stereo).slope = slope; const auto d = designBand (p, fs);
+            expectTrue (d.n == 1 && bitEq (d.sec[0]), "slope " + std::to_string (slope) + " == matched::bandpass bit-for-bit (no session drift)"); }
+
+        p.swept = true; p.lane (Lane::Stereo).slope = 96; const auto ds = designBand (p, fs);   // swept band-pass stays the single fallback (SVF = one stage)
+        expectTrue (ds.n == 1 && bitEq (ds.sec[0]), "swept band-pass ignores slope (single fallback == matched::bandpass)");
+    }
+
+    group ("EqBand BandPass variable slope: audio == analytic; skirt attenuation grows with slope; unity at centre");
+    {
+        const double f0 = 1000.0, fskirt = f0 * 2.0;                       // one octave above centre: in the upper skirt, where slope bites
+        auto meas = [&] (int slope, double f)
+        {
+            EqBand band; band.prepare (fs, 1);
+            BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).slope = slope;
+            band.setParams (p);
+            const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, f, fs);
+            const double r = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * f / fs)));
+            return std::pair<double, double> { a, r };
+        };
+        double prev = 1e9;
+        for (int slope : { 12, 24, 48, 96 })
+        {
+            const auto ar = meas (slope, fskirt);
+            std::printf ("      bandpass slope=%2d @+1oct: audio=%.2f  analytic=%.2f dB\n", slope, ar.first, ar.second);
+            expectNear (ar.first, ar.second, 0.7, "audio == analytic response (slope " + std::to_string (slope) + ")");
+            expectTrue (ar.first < prev - 2.0, "steeper slope attenuates more in the skirt (slope " + std::to_string (slope) + ")");
+            prev = ar.first;
+        }
+        const auto ctr = meas (96, f0);                                   // unity at the centre for any slope
+        std::printf ("      bandpass slope=96 @centre: audio=%.2f dB\n", ctr.first);
+        expectNear (ctr.first, 0.0, 0.3, "slope-96 band-pass: unity at centre f0 (audio)");
+    }
+
     group ("RT-safety: a moving 8-section (slope-96) Notch processes with ZERO heap allocations");
     {
         EqBand band; band.prepare (fs, 2);
