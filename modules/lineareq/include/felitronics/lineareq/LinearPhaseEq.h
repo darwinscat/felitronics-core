@@ -91,20 +91,22 @@ public:
     // still crossfading (isBusy()) — the host should retry with the LATEST snapshot once it's free.
     bool setBands (const eq::BandParams* bands, int numBands) noexcept
     {
-        if (! prepared_) return false;                         // unprepared — the FIR/scratch buffers are empty
-        buildFir (bands, numBands, false, firMid_.data());     // Mid axis
-        buildFir (bands, numBands, true,  firSide_.data());    // Side axis
+        if (! prepared_) return false;                            // unprepared — the FIR/scratch buffers are empty
+        // TODO(PR-B, LANES.md §FIR): L/R lanes need the matrix engine; ignored here — this 2-IR M/S
+        // path samples only the Mid/Side axis composites (each folds in the ST lanes: ∏ H_ST·H_M etc.).
+        buildFir (bands, numBands, eq::Axis::Mid,  firMid_.data());
+        buildFir (bands, numBands, eq::Axis::Side, firSide_.data());
         const float* irs[2] { firMid_.data(), firSide_.data() };
         return conv_.setIr (irs, 2, N_ + 1);
     }
 
     // RT-UNSAFE: build ONE axis's symmetric zero-phase FIR into out[0..N] (N+1 taps). Exposed for tests /
     // a host that wants to drive the convolver itself.
-    void buildFir (const eq::BandParams* bands, int numBands, bool side, float* out) noexcept
+    void buildFir (const eq::BandParams* bands, int numBands, eq::Axis axis, float* out) noexcept
     {
         if (! prepared_) return;                               // unprepared — magBuf_/spec_/time_/window_ are empty
         const int N = N_;
-        eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), N / 2 + 1, side);
+        eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), N / 2 + 1, axis);
 
         spec_[0] = magBuf_[0];                                  // DC (real)
         spec_[1] = magBuf_[(std::size_t) (N / 2)];              // Nyquist (real)

@@ -10,6 +10,9 @@
 namespace teq
 {
     using felitronics::eq::FilterType;
+    using felitronics::eq::Lane;
+    using felitronics::eq::kNumLanes;
+    using felitronics::eq::LaneParams;
     using felitronics::eq::BandParams;
     using felitronics::core::kMaxChannels;
 }

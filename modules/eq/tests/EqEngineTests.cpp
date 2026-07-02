@@ -122,7 +122,7 @@ void runEqEngineTests()
     group ("EqBand bell: measured gain == response() at centre, ~unity far off");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 6.0;
+        BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (p);
         const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs);
         const double resp = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * 1000.0 / fs)));
@@ -132,7 +132,7 @@ void runEqEngineTests()
         expectNear (meas, resp, 0.4, "measured ~ response");
 
         EqBand far; far.prepare (fs, 1);
-        BandParams q; q.on = true; q.type = FilterType::Bell; q.freq = 1000.0; q.Q = 4.0; q.gainDb = 9.0;
+        BandParams q; q.on = true; q.type = FilterType::Bell; q.lane (Lane::Stereo).freq = 1000.0; q.lane (Lane::Stereo).Q = 4.0; q.lane (Lane::Stereo).gainDb = 9.0;
         far.setParams (q);
         const double low = sineGainDb ([&] (float* const* ch, int nc, int n) { far.processBlock (ch, nc, n); }, 60.0, fs);
         expectNear (low, 0.0, 0.3, "unity an octave+ away");
@@ -141,7 +141,7 @@ void runEqEngineTests()
     group ("EqBand swept (SVF) bell tracks the same +6 dB");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 2000.0; p.Q = 3.0; p.gainDb = 6.0; p.swept = true;
+        BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 2000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).gainDb = 6.0; p.swept = true;
         band.setParams (p);
         const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 2000.0, fs);
         std::printf ("      swept bell @2k: measured=%.3f dB\n", meas);
@@ -151,7 +151,7 @@ void runEqEngineTests()
     group ("EqBand HP 24 dB/oct rolls off ~24 dB/octave in the stopband");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::HighPass; p.freq = 1000.0; p.Q = 0.707; p.slope = 24;
+        BandParams p; p.on = true; p.type = FilterType::HighPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = 24;
         band.setParams (p);
         auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
         const double g125 = sineGainDb (ap, 125.0, fs);
@@ -163,8 +163,8 @@ void runEqEngineTests()
     group ("EqEngine: two bells cascade, measured == magnitudeDb");
     {
         EqEngine eng; eng.prepare (fs, 512, 1);
-        BandParams a; a.on = true; a.type = FilterType::Bell; a.freq = 300.0;  a.Q = 1.0; a.gainDb =  4.0;
-        BandParams b; b.on = true; b.type = FilterType::Bell; b.freq = 3000.0; b.Q = 1.0; b.gainDb = -3.0;
+        BandParams a; a.on = true; a.type = FilterType::Bell; a.lane (Lane::Stereo).freq = 300.0;  a.lane (Lane::Stereo).Q = 1.0; a.lane (Lane::Stereo).gainDb =  4.0;
+        BandParams b; b.on = true; b.type = FilterType::Bell; b.lane (Lane::Stereo).freq = 3000.0; b.lane (Lane::Stereo).Q = 1.0; b.lane (Lane::Stereo).gainDb = -3.0;
         eng.setBand (0, a); eng.setBand (1, b);
         const double m = sineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, 300.0, fs);
         const double r = eng.magnitudeDb (300.0);
@@ -176,7 +176,7 @@ void runEqEngineTests()
     group ("swept SVF BandPass has unity gain at centre");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::BandPass; p.freq = 1000.0; p.Q = 4.0; p.swept = true;
+        BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 4.0; p.swept = true;
         band.setParams (p);
         const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs);
         std::printf ("      swept BP @1k Q=4: measured=%.3f dB\n", meas);
@@ -189,7 +189,7 @@ void runEqEngineTests()
         // (the SVF mapped it to m0=1,m1=0,m2=0) while the display showed a full notch curve. The SVF
         // now realises notch = low + high = v0 − k·v1, with an exact null at the prewarped fc.
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 2.0; p.swept = true;
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.swept = true;
         band.setParams (p);
         auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
         const double atFc  = sineGainDb (ap, 1000.0, fs);
@@ -207,7 +207,7 @@ void runEqEngineTests()
         // response()/bandResponse displayed the full ±gain tilt (up to ±30 dB of GUI lying). A one-SVF
         // tilt cannot hold a unity pivot beyond ~6 dB, so Tilt now ignores the swept flag entirely.
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Tilt; p.freq = 1000.0; p.Q = 1.0; p.gainDb = 12.0; p.swept = true;
+        BandParams p; p.on = true; p.type = FilterType::Tilt; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 1.0; p.lane (Lane::Stereo).gainDb = 12.0; p.swept = true;
         band.setParams (p);
         auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
         const double lows  = sineGainDb (ap, 60.0,    fs);
@@ -226,7 +226,7 @@ void runEqEngineTests()
         auto plateau = [&] (double Q)
         {
             EqBand band; band.prepare (fs, 1);
-            BandParams p; p.on = true; p.type = FilterType::HighShelf; p.freq = 3000.0; p.Q = Q; p.gainDb = 12.0; p.swept = true;
+            BandParams p; p.on = true; p.type = FilterType::HighShelf; p.lane (Lane::Stereo).freq = 3000.0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).gainDb = 12.0; p.swept = true;
             band.setParams (p);
             return sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 14000.0, fs);
         };
@@ -241,7 +241,7 @@ void runEqEngineTests()
         const double inf = std::numeric_limits<double>::infinity();
         EqEngine eng; eng.prepare (fs, 256, 1);
         BandParams p; p.on = true; p.type = FilterType::Bell;
-        p.freq = std::nan (""); p.Q = 0.0; p.gainDb = inf;       // NaN freq, Q=0, +Inf gain
+        p.lane (Lane::Stereo).freq = std::nan (""); p.lane (Lane::Stereo).Q = 0.0; p.lane (Lane::Stereo).gainDb = inf;       // NaN freq, Q=0, +Inf gain
         eng.setBand (0, p);
         const int n = 256;
         std::vector<float> buf ((size_t) n);
@@ -256,7 +256,7 @@ void runEqEngineTests()
     group ("denormal flush: tail decays to exact zero after silence");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 6.0;
+        BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (p);
         const int n = 64;
         std::vector<float> buf ((size_t) n, 0.0f);
@@ -271,7 +271,7 @@ void runEqEngineTests()
     group ("first setParams snaps (no ramp from defaults on load)");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 6.0;
+        BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (p);
         // measured after only 2 blocks (< 30 ms smoothing): snapped -> already +6 dB, not mid-ramp.
         const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs, 2);
@@ -283,8 +283,8 @@ void runEqEngineTests()
     {
         EqEngine eng; eng.prepare (fs, 512, 1);
         BandParams arr[EqEngine::kMaxBands] {};
-        arr[0].on = true; arr[0].type = FilterType::Bell;      arr[0].freq = 300.0;  arr[0].Q = 1.0; arr[0].gainDb =  4.0;
-        arr[1].on = true; arr[1].type = FilterType::HighShelf; arr[1].freq = 8000.0;                 arr[1].gainDb = -5.0;
+        arr[0].on = true; arr[0].type = FilterType::Bell;      arr[0].lane (Lane::Stereo).freq = 300.0;  arr[0].lane (Lane::Stereo).Q = 1.0; arr[0].lane (Lane::Stereo).gainDb =  4.0;
+        arr[1].on = true; arr[1].type = FilterType::HighShelf; arr[1].lane (Lane::Stereo).freq = 8000.0;                 arr[1].lane (Lane::Stereo).gainDb = -5.0;
         eng.setBand (0, arr[0]); eng.setBand (1, arr[1]);
         const int n = 64; std::vector<float> z ((size_t) n, 0.0f); float* ch[1] = { z.data() };
         for (int b = 0; b < 4; ++b) eng.process (ch, 1, n);     // let the live coeffs update
@@ -299,7 +299,7 @@ void runEqEngineTests()
     group ("swept HP slope=24 is single-stage: audio slope == response slope (~12 dB/oct)");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::HighPass; p.freq = 1000.0; p.Q = 0.707; p.slope = 24; p.swept = true;
+        BandParams p; p.on = true; p.type = FilterType::HighPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = 24; p.swept = true;
         band.setParams (p);
         auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
         const double a125 = sineGainDb (ap, 125.0, fs), a250 = sineGainDb (ap, 250.0, fs);
@@ -316,7 +316,7 @@ void runEqEngineTests()
     {
         for (int slope : { 6, 12, 24, 36, 48, 72, 96 })
         {
-            BandParams p; p.on = true; p.type = FilterType::HighPass; p.freq = 1000.0; p.slope = slope;
+            BandParams p; p.on = true; p.type = FilterType::HighPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).slope = slope;
             const double r1 = 20.0 * std::log10 (std::abs (bandResponse (p, fs, 2.0 * kPi * 250.0 / fs)));
             const double r2 = 20.0 * std::log10 (std::abs (bandResponse (p, fs, 2.0 * kPi * 500.0 / fs)));
             const double oct = r2 - r1;   // one octave (250->500) in the stopband
@@ -333,7 +333,7 @@ void runEqEngineTests()
             for (int hp = 0; hp < 2; ++hp)
             {
                 const double fc = 1000.0;
-                BandParams p; p.on = true; p.type = hp ? FilterType::HighPass : FilterType::LowPass; p.freq = fc; p.slope = slope;
+                BandParams p; p.on = true; p.type = hp ? FilterType::HighPass : FilterType::LowPass; p.lane (Lane::Stereo).freq = fc; p.lane (Lane::Stereo).slope = slope;
                 const std::string at = " (slope " + std::to_string (slope) + (hp ? " HP)" : " LP)");
                 auto dbAt = [&] (double f) { return 20.0 * std::log10 (std::abs (bandResponse (p, fs, 2.0 * kPi * f / fs))); };
                 expectNear (dbAt (fc), -3.0103, 0.15, "|H(fc)| == -3.01 dB" + at);                 // THE odd-order discriminator
@@ -346,17 +346,17 @@ void runEqEngineTests()
 
     group ("Notch variable order: designBand slope->sections mapping; default slope 12 == legacy single notch");
     {
-        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 4.0;
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 4.0;
         const int expect[][2] = { {6,1}, {12,1}, {24,2}, {36,3}, {48,4}, {72,6}, {96,8} };   // order=slope/6; sections=ceil(order/2)
-        for (auto& e : expect) { p.slope = e[0]; const auto d = designBand (p, fs);
+        for (auto& e : expect) { p.lane (Lane::Stereo).slope = e[0]; const auto d = designBand (p, fs);
             expectTrue (d.n == e[1], "slope " + std::to_string (e[0]) + " -> " + std::to_string (e[1]) + " sections"); }
 
-        p.slope = 12; const auto d12 = designBand (p, fs);                 // the default must be the pre-existing notch, bit-for-bit
+        p.lane (Lane::Stereo).slope = 12; const auto d12 = designBand (p, fs);                 // the default must be the pre-existing notch, bit-for-bit
         const auto ref = matched::notch (1000.0, fs, 4.0);
         expectTrue (d12.n == 1 && d12.sec[0].b0 == ref.b0 && d12.sec[0].b1 == ref.b1 && d12.sec[0].b2 == ref.b2
                  && d12.sec[0].a1 == ref.a1 && d12.sec[0].a2 == ref.a2, "slope 12 == matched::notch bit-for-bit (no session drift)");
 
-        p.slope = 96; p.swept = true; const auto ds = designBand (p, fs);  // swept notch stays the single fallback (SVF = one stage)
+        p.lane (Lane::Stereo).slope = 96; p.swept = true; const auto ds = designBand (p, fs);  // swept notch stays the single fallback (SVF = one stage)
         expectTrue (ds.n == 1, "swept notch ignores slope (single fallback)");
     }
 
@@ -366,7 +366,7 @@ void runEqEngineTests()
         auto meas = [&] (int slope)
         {
             EqBand band; band.prepare (fs, 1);
-            BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = f0; p.Q = 3.0; p.slope = slope;
+            BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = slope;
             band.setParams (p);
             const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, fdet, fs);
             const double r = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * fdet / fs)));
@@ -382,7 +382,7 @@ void runEqEngineTests()
             prev = ar.first;
         }
         EqBand band; band.prepare (fs, 1);                                 // far from f0 the high-order notch is transparent
-        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = f0; p.Q = 3.0; p.slope = 96;
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = 96;
         band.setParams (p);
         const double far = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 250.0, fs);
         expectNear (far, 0.0, 0.4, "slope-96 notch: unity two octaves below f0");
@@ -391,7 +391,7 @@ void runEqEngineTests()
     group ("RT-safety: a moving 8-section (slope-96) Notch processes with ZERO heap allocations");
     {
         EqBand band; band.prepare (fs, 2);
-        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = 96;
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = 96;
         band.setParams (p);
         const int n = 128; std::vector<float> L ((size_t) n), R ((size_t) n);
         float* ch[2] = { L.data(), R.data() };
@@ -403,7 +403,7 @@ void runEqEngineTests()
         const long before = g_allocs.load (std::memory_order_relaxed);
         for (int b = 0; b < 300; ++b)
         {
-            p.freq = 700.0 + 0.7 * b;                                      // keep the freq smoother moving -> designBand()/notchCascade run every block
+            p.lane (Lane::Stereo).freq = 700.0 + 0.7 * b;                                      // keep the freq smoother moving -> designBand()/notchCascade run every block
             band.setParams (p);
             fill (b);
             band.processBlock (ch, 2, n);
@@ -440,7 +440,7 @@ void runEqEngineTests()
         };
         auto runNotch = [&] (int slope) {
             EqBand band; band.prepare (fs, 1);
-            BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = slope;
+            BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = slope;
             band.setParams (p);
             std::vector<float> out = in;
             for (int o = 0; o < N; o += 256) { float* ch[1] = { out.data() + o }; band.processBlock (ch, 1, std::min (256, N - o)); }
@@ -461,7 +461,7 @@ void runEqEngineTests()
     group ("Notch denormal flush: high-order tail decays to exact zero (no subnormal spikes on any CPU)");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = 96;   // 8 sections
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = 96;   // 8 sections
         band.setParams (p);
         const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* ch[1] = { buf.data() };
         band.processBlock (ch, 1, n);
@@ -474,10 +474,10 @@ void runEqEngineTests()
     {
         const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); float* ch[1] = { buf.data() };
         EqBand band; band.prepare (fs, 1);
-        BandParams hi; hi.on = true; hi.type = FilterType::Notch; hi.freq = 1000.0; hi.Q = 3.0; hi.slope = 96;
+        BandParams hi; hi.on = true; hi.type = FilterType::Notch; hi.lane (Lane::Stereo).freq = 1000.0; hi.lane (Lane::Stereo).Q = 3.0; hi.lane (Lane::Stereo).slope = 96;
         band.setParams (hi);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; band.processBlock (ch, 1, n);       // build 8-section state
-        BandParams lo = hi; lo.slope = 12; band.setParams (lo);
+        BandParams lo = hi; lo.lane (Lane::Stereo).slope = 12; band.setParams (lo);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);                       // -> single (resets)
         band.setParams (hi);                                                                                    // -> 8 sections again
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);
@@ -489,7 +489,7 @@ void runEqEngineTests()
     {
         const double inf = std::numeric_limits<double>::infinity();
         EqEngine eng; eng.prepare (fs, 256, 1);
-        BandParams p; p.on = true; p.type = FilterType::Notch; p.freq = std::nan (""); p.Q = 0.0; p.gainDb = inf; p.slope = 96;
+        BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = std::nan (""); p.lane (Lane::Stereo).Q = 0.0; p.lane (Lane::Stereo).gainDb = inf; p.lane (Lane::Stereo).slope = 96;
         eng.setBand (0, p);
         const int n = 256; std::vector<float> buf ((size_t) n);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.3f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
@@ -502,8 +502,9 @@ void runEqEngineTests()
     group ("Notch high order in M/S: an 8-section Mid-lane notch leaves the Side axis untouched");
     {
         EqBand b; b.prepare (fs, 2);
-        BandParams p; p.on = true; p.ms = true; p.sOn = false;                     // Side lane disabled -> Side (L−R) must be bit-exact
-        p.type = FilterType::Notch; p.freq = 1000.0; p.Q = 3.0; p.slope = 96;
+        BandParams p; p.on = true; p.type = FilterType::Notch;                      // {m}-only: Mid notch, Side idle -> Side (L−R) bit-exact
+        p.lane (Lane::Stereo).on = false;
+        p.lane (Lane::Mid).on = true; p.lane (Lane::Mid).freq = 1000.0; p.lane (Lane::Mid).Q = 3.0; p.lane (Lane::Mid).slope = 96;
         b.setParams (p);
         const int n = 200; std::vector<float> L ((size_t) n), R ((size_t) n), S0 ((size_t) n);
         for (int i = 0; i < n; ++i) { L[(size_t) i] = (float) (0.20 * std::sin (2.0 * kPi * 1122.0 * i / fs));
@@ -534,7 +535,7 @@ void runEqEngineTests()
                             for (int slope : { 6, 12, 24, 96 })
                                 for (int sw = 0; sw < 2; ++sw)
                                 {
-                                    BandParams p; p.on = true; p.type = tc.type; p.freq = f0; p.Q = Q; p.gainDb = g; p.slope = slope; p.swept = (sw == 1);
+                                    BandParams p; p.on = true; p.type = tc.type; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).gainDb = g; p.lane (Lane::Stereo).slope = slope; p.swept = (sw == 1);
                                     const BandDesign d = designBand (p, sr); ++designs;
                                     for (int s = 0; s < d.n; ++s)
                                     {
@@ -562,7 +563,7 @@ void runEqEngineTests()
                 for (int sw = 0; sw < 2; ++sw)
                 {
                     EqEngine eng; eng.prepare (fs, 128, 2);
-                    BandParams p; p.on = true; p.type = tc.type; p.freq = h.f; p.Q = h.q; p.gainDb = h.g; p.slope = 96; p.swept = (sw == 1);
+                    BandParams p; p.on = true; p.type = tc.type; p.lane (Lane::Stereo).freq = h.f; p.lane (Lane::Stereo).Q = h.q; p.lane (Lane::Stereo).gainDb = h.g; p.lane (Lane::Stereo).slope = 96; p.swept = (sw == 1);
                     eng.setBand (0, p);
                     const int n = 128; std::vector<float> L ((size_t) n), R ((size_t) n);
                     for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.95f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
@@ -583,7 +584,7 @@ void runEqEngineTests()
             for (int sw = 0; sw < 2; ++sw)
             {
                 EqBand band; band.prepare (fs, 2);
-                BandParams p; p.on = true; p.type = tc.type; p.freq = 1000.0; p.Q = 4.0; p.gainDb = 12.0; p.slope = 96; p.swept = (sw == 1);
+                BandParams p; p.on = true; p.type = tc.type; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 4.0; p.lane (Lane::Stereo).gainDb = 12.0; p.lane (Lane::Stereo).slope = 96; p.swept = (sw == 1);
                 band.setParams (p);
                 const int n = 64; std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f); L[0] = 1.0f; R[0] = 1.0f;
                 float* ch[2] = { L.data(), R.data() };
@@ -597,7 +598,7 @@ void runEqEngineTests()
     group ("bypass: a bypassed band is transparent");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams p; p.on = true; p.bypass = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 12.0;
+        BandParams p; p.on = true; p.bypass = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 12.0;
         band.setParams (p);
         const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs);
         expectNear (g, 0.0, 0.05, "bypassed band passes audio at 0 dB");
@@ -606,7 +607,7 @@ void runEqEngineTests()
     group ("turning a band off resets state (no stale tail on re-enable)");
     {
         EqBand band; band.prepare (fs, 1);
-        BandParams on; on.on = true; on.type = FilterType::Bell; on.freq = 1000.0; on.Q = 2.0; on.gainDb = 6.0;
+        BandParams on; on.on = true; on.type = FilterType::Bell; on.lane (Lane::Stereo).freq = 1000.0; on.lane (Lane::Stereo).Q = 2.0; on.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (on);
         const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* ch[1] = { buf.data() };
         band.processBlock (ch, 1, n);                              // build state from an impulse
@@ -625,7 +626,7 @@ void runEqEngineTests()
         const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); float* ch[1] = { buf.data() };
 
         EqBand band; band.prepare (fs, 1);
-        BandParams sw; sw.on = true; sw.type = FilterType::Bell; sw.freq = 1000.0; sw.Q = 4.0; sw.gainDb = 6.0; sw.swept = true;
+        BandParams sw; sw.on = true; sw.type = FilterType::Bell; sw.lane (Lane::Stereo).freq = 1000.0; sw.lane (Lane::Stereo).Q = 4.0; sw.lane (Lane::Stereo).gainDb = 6.0; sw.swept = true;
         band.setParams (sw);
         buf[0] = 1.0f; band.processBlock (ch, 1, n);                                          // SVF builds state
         BandParams st = sw; st.swept = false; band.setParams (st);
@@ -636,10 +637,10 @@ void runEqEngineTests()
         expectTrue (t1 == 0.0, "no stale SVF tail after swept<->static");
 
         EqBand hp; hp.prepare (fs, 1);
-        BandParams p24; p24.on = true; p24.type = FilterType::HighPass; p24.freq = 1000.0; p24.Q = 0.707; p24.slope = 24;
+        BandParams p24; p24.on = true; p24.type = FilterType::HighPass; p24.lane (Lane::Stereo).freq = 1000.0; p24.lane (Lane::Stereo).Q = 0.707; p24.lane (Lane::Stereo).slope = 24;
         hp.setParams (p24);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; hp.processBlock (ch, 1, n);   // bq0+bq1 state
-        BandParams p12 = p24; p12.slope = 12; hp.setParams (p12);
+        BandParams p12 = p24; p12.lane (Lane::Stereo).slope = 12; hp.setParams (p12);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; hp.processBlock (ch, 1, n);                  // -> single (resets)
         hp.setParams (p24);                                                                             // -> 24 again
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; hp.processBlock (ch, 1, n);
@@ -650,7 +651,7 @@ void runEqEngineTests()
     group ("EqEngine: silence stays silent, no NaN (stereo)");
     {
         EqEngine eng; eng.prepare (fs, 256, 2);
-        BandParams p; p.on = true; p.type = FilterType::HighShelf; p.freq = 8000.0; p.gainDb = 12.0;
+        BandParams p; p.on = true; p.type = FilterType::HighShelf; p.lane (Lane::Stereo).freq = 8000.0; p.lane (Lane::Stereo).gainDb = 12.0;
         eng.setBand (0, p);
         const int n = 256;
         std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f);
@@ -666,7 +667,7 @@ void runEqEngineTests()
     {
         const int C = 6;
         EqEngine eng; eng.prepare (fs, 256, C);
-        BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 6.0;
+        BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         eng.setBand (0, p);
         const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
         for (int c = 0; c < C; ++c)
@@ -677,7 +678,7 @@ void runEqEngineTests()
     {
         const int C = 8;                                   // exercises Svf ic1[c]/ic2[c] for c = 0..7
         EqEngine eng; eng.prepare (fs, 256, C);
-        BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 2000.0; p.Q = 3.0; p.gainDb = 6.0; p.swept = true;
+        BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 2000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).gainDb = 6.0; p.swept = true;
         eng.setBand (0, p);
         const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 2000.0, fs);
         for (int c = 0; c < C; ++c)
@@ -688,7 +689,7 @@ void runEqEngineTests()
     {
         const int C = teq::kMaxChannels;                   // 16: top of the supported range
         EqEngine eng; eng.prepare (fs, 256, C);
-        BandParams p; p.on = true; p.type = FilterType::HighShelf; p.freq = 6000.0; p.gainDb = 9.0;
+        BandParams p; p.on = true; p.type = FilterType::HighShelf; p.lane (Lane::Stereo).freq = 6000.0; p.lane (Lane::Stereo).gainDb = 9.0;
         eng.setBand (0, p);
         const int n = 256;
         std::vector<std::vector<float>> bufs ((size_t) C, std::vector<float> ((size_t) n, 0.0f));
@@ -713,7 +714,7 @@ void runEqEngineTests()
         // / channel-count-dependent math (incl. on the top channel 15) makes maxErr != 0.
         auto checkIndependence = [&] (bool swept, const std::string& label)
         {
-            BandParams p; p.on = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 3.0; p.gainDb = 6.0; p.swept = swept;
+            BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).gainDb = 6.0; p.swept = swept;
 
             std::vector<std::vector<float>> ref ((size_t) C, std::vector<float> ((size_t) n));
             for (int c = 0; c < C; ++c)
@@ -770,34 +771,34 @@ void runEqEngineTests()
         };
 
         { EqBand b; b.prepare (fs, 2);                                  // Mid +12 @1k, Side flat
-          BandParams p; p.on = true; p.ms = true;
-          p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 12.0;
-          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 1000.0; p.sQ = 2.0; p.sGainDb = 0.0;
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  = 12.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 1000.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb =  0.0;
           b.setParams (p);
           expectNear (msProbe (b, false, 1000.0), 12.0, 0.5, "Mid lane +12 dB at 1k");
           expectNear (msProbe (b, true,  1000.0),  0.0, 0.1, "Side lane flat at 1k"); }
 
         { EqBand b; b.prepare (fs, 2);                                  // Side -9 @3k, Mid flat
-          BandParams p; p.on = true; p.ms = true;
-          p.type = FilterType::Bell; p.freq = 3000.0; p.Q = 2.0; p.gainDb = 0.0;
-          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 3000.0; p.sQ = 2.0; p.sGainDb = -9.0;
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 3000.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  =  0.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 3000.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb = -9.0;
           b.setParams (p);
           expectNear (msProbe (b, true,  3000.0), -9.0, 0.5, "Side lane -9 dB at 3k");
           expectNear (msProbe (b, false, 3000.0),  0.0, 0.1, "Mid lane flat at 3k"); }
 
         { EqBand b; b.prepare (fs, 2);                                  // independent freq: Mid +6 @500, Side -6 @5k
-          BandParams p; p.on = true; p.ms = true;
-          p.type = FilterType::Bell; p.freq = 500.0;  p.Q = 2.0; p.gainDb =  6.0;
-          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 5000.0; p.sQ = 2.0; p.sGainDb = -6.0;
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 500.0;  p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  =  6.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 5000.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb = -6.0;
           b.setParams (p);
           expectNear (msProbe (b, false, 500.0),   6.0, 0.5, "Mid +6 at its own freq");
           expectNear (msProbe (b, true,  5000.0), -6.0, 0.5, "Side -6 at its own freq");
           expectNear (msProbe (b, false, 5000.0),  0.0, 0.5, "Mid flat at the Side freq");
           expectNear (msProbe (b, true,  500.0),   0.0, 0.5, "Side flat at the Mid freq"); }
 
-        { EqBand b; b.prepare (fs, 2);                                  // Side disabled -> Side axis bit-exact
-          BandParams p; p.on = true; p.ms = true; p.sOn = false;
-          p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 12.0;
+        { EqBand b; b.prepare (fs, 2);                                  // {m}-only: Side idle -> Side axis bit-exact
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on = true; p.lane (Lane::Mid).freq = 1000.0; p.lane (Lane::Mid).Q = 2.0; p.lane (Lane::Mid).gainDb = 12.0;
           b.setParams (p);
           const int n = 200; std::vector<float> L ((size_t) n), R ((size_t) n), S0 ((size_t) n);
           for (int i = 0; i < n; ++i) { L[(size_t) i] = (float) (0.20 * std::sin (2.0 * kPi * 700.0 * i / fs));
@@ -805,45 +806,48 @@ void runEqEngineTests()
                                         S0[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]); }
           float* ch[2] = { L.data(), R.data() }; b.processBlock (ch, 2, n);
           double sErr = 0.0; for (int i = 0; i < n; ++i) sErr = std::max (sErr, (double) std::fabs (0.5f * (L[(size_t) i] - R[(size_t) i]) - S0[(size_t) i]));
-          expectNear (sErr, 0.0, 1e-5, "Side disabled: Side axis (L-R) preserved to float precision"); }
+          expectNear (sErr, 0.0, 1e-5, "Side idle: Side axis (L-R) preserved to float precision"); }
 
-        { EqBand b; b.prepare (fs, 2);                                  // Mid bypassed + Side active
-          BandParams p; p.on = true; p.ms = true; p.bypass = true;
-          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 2000.0; p.sQ = 2.0; p.sGainDb = 12.0;
+        { EqBand b; b.prepare (fs, 2);                                  // Mid bypassed (ghost) + Side active
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).bypass = true;   // Mid lane kept but muted
+          p.lane (Lane::Mid).freq  = 2000.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  = 12.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 2000.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb = 12.0;
           b.setParams (p);
-          expectNear (msProbe (b, true,  2000.0), 12.0, 0.6, "Side processes while Mid is bypassed");
-          expectNear (msProbe (b, false, 2000.0),  0.0, 0.1, "Mid axis preserved while bypassed"); }
+          expectNear (msProbe (b, true,  2000.0), 12.0, 0.6, "Side processes while the Mid lane is bypassed");
+          expectNear (msProbe (b, false, 2000.0),  0.0, 0.1, "Mid axis preserved while its lane is bypassed"); }
 
-        { EqBand b; b.prepare (fs, 1);                                  // mono + M/S -> Mid lane on the mono channel
-          BandParams p; p.on = true; p.ms = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 2.0; p.gainDb = 6.0;
+        { EqBand b; b.prepare (fs, 1);                                  // mono + {m,s}: v2 runs the ST lane ONLY -> transparent
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  = 6.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 1000.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb = 6.0;
           b.setParams (p);
           const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { b.processBlock (ch, nc, n); }, 1000.0, fs);
-          expectNear (g, 6.0, 0.5, "mono + M/S: Mid lane applies to the mono channel"); }
+          expectNear (g, 0.0, 0.05, "mono + {m,s}: M/S lanes inert on a non-stereo bus (ST-only rule)"); }
     }
 
-    group ("M/S on a surround bus (nc>=3): every channel runs the MID lane — Side never leaks into ch1");
+    group ("Lanes on a surround bus (nc>=3): only the ST lane runs — L/R/M/S are silently inert");
     {
-        // Regression: the Side lane's coefficients used to be written into state COLUMN 1
-        // unconditionally, but the M/S encode/decode branch only runs on exactly 2 channels — so on a
-        // surround bus channel 1 was filtered with the SIDE design (a 24 dB error), or with a HYBRID
-        // Mid/Side section chain when the two lanes' section counts differ. The documented contract
-        // (EqTypes.h) is: mono/surround ignore ms -> Mid lane only. The Side lane now owns its state.
+        // v2 contract (LANES.md): on a non-stereo bus (mono / surround / ambisonics) ONLY the Stereo
+        // lane runs; the L/R/M/S lanes need a 2-channel bus and are silently inactive. So a {m,s} point
+        // is transparent on surround, while a plain {st} point applies to every channel.
         const int C = 6;
-        { EqEngine eng; eng.prepare (fs, 256, C);                       // Mid +12 bell vs Side -12 bell, same freq
-          BandParams p; p.on = true; p.ms = true; p.type = FilterType::Bell; p.freq = 1000.0; p.Q = 1.0; p.gainDb = 12.0;
-          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 1000.0; p.sQ = 1.0; p.sGainDb = -12.0;
+        { EqEngine eng; eng.prepare (fs, 256, C);                       // {m,s} split point: Mid +12 vs Side -12, same freq
+          BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
+          p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 1.0; p.lane (Lane::Mid).gainDb  =  12.0;
+          p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 1000.0; p.lane (Lane::Side).Q = 1.0; p.lane (Lane::Side).gainDb = -12.0;
           eng.setBand (0, p);
           const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
           for (int c = 0; c < C; ++c)
-              expectNear (g[(size_t) c], 12.0, 0.4, "surround ch " + std::to_string (c) + " == Mid lane (+12), not Side (-12)");
+              expectNear (g[(size_t) c], 0.0, 0.02, "surround ch " + std::to_string (c) + " == transparent (M/S lanes inert)");
         }
-        { EqEngine eng; eng.prepare (fs, 256, C);                       // section-count mismatch: Mid HP24 (2 sec) vs Side Bell (1 sec)
-          BandParams p; p.on = true; p.ms = true; p.type = FilterType::HighPass; p.freq = 1000.0; p.Q = 0.707; p.slope = 24;
-          p.sOn = true; p.sType = FilterType::Bell; p.sFreq = 1000.0; p.sQ = 1.0; p.sGainDb = 6.0;
+        { EqEngine eng; eng.prepare (fs, 256, C);                       // plain {st} point: applies to every channel
+          BandParams p; p.on = true; p.type = FilterType::Bell;
+          p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 1.0; p.lane (Lane::Stereo).gainDb = 6.0;
           eng.setBand (0, p);
           const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
           for (int c = 0; c < C; ++c)
-              expectNear (g[(size_t) c], -3.0103, 0.4, "surround ch " + std::to_string (c) + " == Mid HP24 at fc (no hybrid chain)");
+              expectNear (g[(size_t) c], 6.0, 0.4, "surround ch " + std::to_string (c) + " == ST lane (+6) on every channel");
         }
     }
 }

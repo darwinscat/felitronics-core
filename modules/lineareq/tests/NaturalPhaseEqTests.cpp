@@ -51,7 +51,7 @@ int main()
     // --- (1) flat EQ → a unit impulse at the bulk delay (unity pass-through at the latency) ---
     test::group ("NaturalPhaseEq flat EQ == unit impulse at the bulk delay");
     {
-        np.buildFir (flat, 0, false, firMid.data());
+        np.buildFir (flat, 0, eq::Axis::Mid, firMid.data());
         double maxOther = 0.0;
         for (int i = 0; i < L; ++i) if (i != delay) maxOther = std::max (maxOther, (double) std::fabs (firMid[(std::size_t) i]));
         test::approx (firMid[(std::size_t) delay], 1.0, 1e-3, "peak tap == 1.0 at bulkDelay (unity gain)");
@@ -61,12 +61,12 @@ int main()
     // --- (2) realised magnitude matches the bank's target (mixed phase preserves |H|) ---
     test::group ("NaturalPhaseEq magnitude matches the EQ target");
     {
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1000.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
-        np.buildFir (b, 1, false, firMid.data());
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0;
+        np.buildFir (b, 1, eq::Axis::Mid, firMid.data());
         test::approx (firMagDb (firMid, 1000.0, sr),  6.0, 0.8, "+6 dB bell → ~+6 dB at 1 kHz");
         test::approx (firMagDb (firMid,  100.0, sr),  0.0, 0.6, "≈ 0 dB well below the bell");
-        eq::BandParams c[1]; c[0].on = true; c[0].type = eq::FilterType::Bell; c[0].freq = 3000.0; c[0].Q = 3.0; c[0].gainDb = -8.0;
-        np.buildFir (c, 1, false, firMid.data());
+        eq::BandParams c[1]; c[0].on = true; c[0].type = eq::FilterType::Bell; c[0].lane (eq::Lane::Stereo).freq = 3000.0; c[0].lane (eq::Lane::Stereo).Q = 3.0; c[0].lane (eq::Lane::Stereo).gainDb = -8.0;
+        np.buildFir (c, 1, eq::Axis::Mid, firMid.data());
         test::approx (firMagDb (firMid, 3000.0, sr), -8.0, 0.8, "−8 dB cut → ~−8 dB at 3 kHz");
     }
 
@@ -80,8 +80,8 @@ int main()
     // --- (4) the FIR is mixed phase: NON-symmetric + front-loaded (less pre- than post-energy) ---
     test::group ("NaturalPhaseEq FIR is mixed phase (not linear/symmetric)");
     {
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1200.0; b[0].Q = 2.0; b[0].gainDb = 8.0;
-        np.buildFir (b, 1, false, firMid.data());
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1200.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 8.0;
+        np.buildFir (b, 1, eq::Axis::Mid, firMid.data());
         double asym = 0.0; for (int i = 0; i < L; ++i) asym = std::max (asym, (double) std::fabs (firMid[(std::size_t) i] - firMid[(std::size_t) (L - 1 - i)]));
         test::ok (asym > 1e-3, "NOT symmetric (mixed phase, unlike linear)");
         double pre = 0.0, post = 0.0;
@@ -93,7 +93,7 @@ int main()
     // --- (5) process() is RT-safe (no alloc) + runs mono and stereo ---
     test::group ("NaturalPhaseEq process no-alloc + mono/stereo");
     {
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1000.0; b[0].Q = 1.5; b[0].gainDb = 4.0;
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 1.5; b[0].lane (eq::Lane::Stereo).gainDb = 4.0;
         np.setBands (b, 1);                                          // build (message thread, allocates) BEFORE the snapshot
         std::vector<float> lch (512, 0.1f), rch (512, -0.1f);
         float* io[2] { lch.data(), rch.data() };
@@ -114,8 +114,8 @@ int main()
     {
         NPE hp; hp.prepare (sr, 512, 2, 2, 0.5f);                    // quality 2 → L = 8192 (headroom for ringing)
         std::vector<float> fir ((std::size_t) hp.firSize());
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::HighPass; b[0].freq = 1000.0; b[0].Q = 0.707; b[0].slope = 24;
-        hp.buildFir (b, 1, false, fir.data());
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::HighPass; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 0.707; b[0].lane (eq::Lane::Stereo).slope = 24;
+        hp.buildFir (b, 1, eq::Axis::Mid, fir.data());
         test::approx (firMagDb (fir, 4000.0, sr), eq::EqEngine::magnitudeDbFor (b, 1, 4000.0, sr), 1.0, "pass-band (4 kHz) ≈ target");
         test::approx (firMagDb (fir, 2000.0, sr), eq::EqEngine::magnitudeDbFor (b, 1, 2000.0, sr), 1.2, "near cutoff (2 kHz) ≈ target");
         test::ok (firMagDb (fir, 250.0, sr) < -14.0, "stop-band (250 Hz) strongly attenuated");
@@ -124,8 +124,8 @@ int main()
     // --- (7) a deep narrow cut keeps its depth (steep/narrow feature survives the truncation) ---
     test::group ("NaturalPhaseEq keeps a deep narrow cut");
     {
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 2000.0; b[0].Q = 6.0; b[0].gainDb = -18.0;
-        np.buildFir (b, 1, false, firMid.data());                   // np: L = 4096
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 2000.0; b[0].lane (eq::Lane::Stereo).Q = 6.0; b[0].lane (eq::Lane::Stereo).gainDb = -18.0;
+        np.buildFir (b, 1, eq::Axis::Mid, firMid.data());                   // np: L = 4096
         test::approx (firMagDb (firMid, 2000.0, sr), eq::EqEngine::magnitudeDbFor (b, 1, 2000.0, sr), 2.0, "−18 dB narrow cut depth ≈ target");
         test::approx (firMagDb (firMid,  500.0, sr), 0.0, 0.6, "≈ 0 dB away from the cut");
     }
@@ -136,10 +136,10 @@ int main()
         NPE n2; n2.prepare (sr, 512, 2, 1, 0.5f);
         const int Ld = n2.firSize(), lat0 = n2.latencySamples();
         std::vector<float> fHalf ((std::size_t) Ld), fMin ((std::size_t) Ld);
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1500.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
-        n2.buildFir (b, 1, false, fHalf.data());     // k = 0.5
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1500.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0;
+        n2.buildFir (b, 1, eq::Axis::Mid, fHalf.data());     // k = 0.5
         n2.setBlend (0.95f);
-        n2.buildFir (b, 1, false, fMin.data());      // k = 0.95 (near minimum phase)
+        n2.buildFir (b, 1, eq::Axis::Mid, fMin.data());      // k = 0.95 (near minimum phase)
         test::ok (n2.latencySamples() == lat0, "latency unchanged by the blend (fixed bulk delay → no re-prepare)");
         double diff = 0.0; for (int i = 0; i < Ld; ++i) diff = std::max (diff, (double) std::fabs (fHalf[(std::size_t) i] - fMin[(std::size_t) i]));
         test::ok (diff > 1e-3, "the FIR actually changed (phase blended)");
@@ -154,13 +154,13 @@ int main()
     //     stop-band, and shrink with quality). This locks that in. ---
     test::group ("NaturalPhaseEq magnitude holds across all k (refutes the low-k truncation worry)");
     {
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1200.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1200.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0;
         NPE m;
         for (float kk : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f })
         {
             m.prepare (sr, 512, 2, 1, kk);
             std::vector<float> fir ((std::size_t) m.firSize());
-            m.buildFir (b, 1, false, fir.data());
+            m.buildFir (b, 1, eq::Axis::Mid, fir.data());
             double worst = 0.0;
             for (double f = 100.0; f < 16000.0; f *= 1.1)
                 worst = std::max (worst, std::fabs (firMagDb (fir, f, sr) - eq::EqEngine::magnitudeDbFor (b, 1, f, sr)));
@@ -175,7 +175,7 @@ int main()
     test::group ("NaturalPhaseEq: reject setBands/process before prepare");
     {
         lineareq::NaturalPhaseEq eqm;                                 // NOT prepared
-        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].freq = 1000.0; b[0].Q = 2.0; b[0].gainDb = 6.0;
+        eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0;
         test::ok (! eqm.setBands (b, 1), "setBands() before prepare() returns false (no write into empty FIR / unprepared MixedPhaseFir)");
         float l[16] {}, r[16] {}; float* io[2] { l, r };
         eqm.process (io, 2, 16);                                      // no-op

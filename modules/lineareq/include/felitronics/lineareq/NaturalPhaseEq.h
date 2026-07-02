@@ -88,18 +88,20 @@ public:
     bool setBands (const eq::BandParams* bands, int numBands) noexcept
     {
         if (! prepared_) return false;                         // unprepared — FIR buffers + MixedPhaseFir are empty
-        buildFir (bands, numBands, false, firMid_.data());     // Mid axis
-        buildFir (bands, numBands, true,  firSide_.data());    // Side axis
+        // TODO(PR-B, LANES.md §FIR): L/R lanes need the matrix engine; ignored here — this 2-IR M/S
+        // path samples only the Mid/Side axis composites (each folds in the ST lanes: ∏ H_ST·H_M etc.).
+        buildFir (bands, numBands, eq::Axis::Mid,  firMid_.data());
+        buildFir (bands, numBands, eq::Axis::Side, firSide_.data());
         const float* irs[2] { firMid_.data(), firSide_.data() };
         return conv_.setIr (irs, 2, L_);
     }
 
     // RT-UNSAFE: build ONE axis's mixed-phase FIR into out[0..L). Exposed for tests / a host that drives
     // the convolver itself. magnitude → MixedPhaseFir (phase k·φ_min) → causal shift by bulkDelay + taper.
-    void buildFir (const eq::BandParams* bands, int numBands, bool side, float* out) noexcept
+    void buildFir (const eq::BandParams* bands, int numBands, eq::Axis axis, float* out) noexcept
     {
         if (! prepared_) return;                               // unprepared — magBuf_/taper_ empty + MixedPhaseFir not built
-        eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), D_ / 2 + 1, side);
+        eq::EqEngine::magnitudeGridFor (bands, numBands, fs_, magBuf_.data(), D_ / 2 + 1, axis);
         const float* h = mp_.build (magBuf_.data(), k_.load (std::memory_order_relaxed));   // D-point mixed-phase impulse
 
         // Extract L causal taps: the peak sits at h[0], pre-ring wraps to h[D-1..]; shift right by bulkDelay

@@ -4,13 +4,13 @@
 #pragma once
 
 #include <felitronics/eq/EqTypes.h>
-#include <felitronics/eq/EqTypes.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/core/Smoother.h>
 #include <felitronics/eq/Svf.h>
 
 #include <algorithm>
 #include <complex>
+#include <cstddef>
 
 namespace felitronics::eq
 {
@@ -25,18 +25,24 @@ struct BandDesign
     int n = 1;
 };
 
+// Design one lane's filter. The design fields (freq/Q/gainDb/slope) are read from the PRIMARY slot,
+// lanes[Stereo] — laneView() packs whichever lane is being evaluated into that slot, so this one
+// routine serves every lane. `type`/`swept` are the point's shared fields.
 inline BandDesign designBand (const BandParams& in, double fs) noexcept
 {
     auto finiteOr = [] (double x, double fb) noexcept { return std::isfinite (x) ? x : fb; };
-    BandParams p = in;
-    p.freq   = std::clamp (finiteOr (p.freq, 1000.0), 10.0, 0.49 * fs);
-    p.Q      = std::clamp (finiteOr (p.Q, 1.0), 0.05, 40.0);
-    p.gainDb = std::clamp (finiteOr (p.gainDb, 0.0), -30.0, 30.0);
+    const LaneParams& src = in.lane (Lane::Stereo);
+    const double     freq  = std::clamp (finiteOr (src.freq, 1000.0), 10.0, 0.49 * fs);
+    const double     Q     = std::clamp (finiteOr (src.Q, 1.0), 0.05, 40.0);
+    const double     gainDb = std::clamp (finiteOr (src.gainDb, 0.0), -30.0, 30.0);
+    const int        slope = src.slope;
+    const FilterType type  = in.type;
+    const bool       swept = in.swept;
 
     BandDesign d;
-    const bool isCut = (p.type == FilterType::HighPass || p.type == FilterType::LowPass);
+    const bool isCut = (type == FilterType::HighPass || type == FilterType::LowPass);
 
-    if (isCut && ! p.swept)
+    if (isCut && ! swept)
     {
         // Butterworth cascade: order = slope/6 poles {1..16}; sections = order/2 (+ a first-order
         // section for odd order, e.g. 6/18/30 dB/oct). Per-section Qs are the standard Butterworth
@@ -45,48 +51,48 @@ inline BandDesign designBand (const BandParams& in, double fs) noexcept
         // cos form was even-order-only (a 3rd-order LP read −7.8 dB at fc instead of −3 dB, its
         // corner ~42% low). Pairs are emitted low-Q-first, which for even order reproduces the
         // previous cascade section-for-section (same Q per slot), so shipped even slopes don't move.
-        const int  order = std::clamp (p.slope / 6, 1, 16);
-        const bool isHP  = (p.type == FilterType::HighPass);
+        const int  order = std::clamp (slope / 6, 1, 16);
+        const bool isHP  = (type == FilterType::HighPass);
         int idx = 0;
         if (order % 2 == 1)
-            d.sec[idx++] = isHP ? matched::highpass1 (p.freq, fs) : matched::lowpass1 (p.freq, fs);
+            d.sec[idx++] = isHP ? matched::highpass1 (freq, fs) : matched::lowpass1 (freq, fs);
         const int nSec = order / 2;
         for (int k = 1; k <= nSec && idx < BandDesign::kMaxSections; ++k)
         {
             const double Qk = 1.0 / (2.0 * std::sin ((2.0 * (nSec - k) + 1.0) * kPi / (2.0 * order)));
-            d.sec[idx++] = isHP ? matched::highpass (p.freq, fs, Qk) : matched::lowpass (p.freq, fs, Qk);
+            d.sec[idx++] = isHP ? matched::highpass (freq, fs, Qk) : matched::lowpass (freq, fs, Qk);
         }
         d.n = idx;
     }
-    else if (p.type == FilterType::Notch && ! p.swept)
+    else if (type == FilterType::Notch && ! swept)
     {
         // Variable-steepness matched band-stop. `order` mirrors HP/LP (slope/6); a notch biquad is
         // inherently 2-sided, so the Butterworth prototype order — and the biquad count — is
         // ceil(order/2), capped at kMaxSections. order∈{1,2} (slope 6/12) → 1 section == today's
         // single matched notch BIT-FOR-BIT (legacy sessions don't drift); 24→2, 48→4, 96→8. Q stays
         // the overall −3 dB bandwidth, independent of order.
-        const int order = std::clamp (p.slope / 6, 1, 16);
+        const int order = std::clamp (slope / 6, 1, 16);
         const int m     = std::clamp ((order + 1) / 2, 1, BandDesign::kMaxSections);
-        d.n = matched::notchCascade (p.freq, fs, p.Q, m, d.sec);
+        d.n = matched::notchCascade (freq, fs, Q, m, d.sec);
     }
-    else if (p.type == FilterType::Tilt)
+    else if (type == FilterType::Tilt)
     {
-        d.sec[0] = matched::lowShelfDb  (p.freq, fs, -p.gainDb);   // lows down
-        d.sec[1] = matched::highShelfDb (p.freq, fs,  p.gainDb);   // highs up -> spectral tilt about f0
+        d.sec[0] = matched::lowShelfDb  (freq, fs, -gainDb);   // lows down
+        d.sec[1] = matched::highShelfDb (freq, fs,  gainDb);   // highs up -> spectral tilt about f0
         d.n = 2;
     }
     else
     {
-        switch (p.type)
+        switch (type)
         {
-            case FilterType::Bell:      d.sec[0] = matched::peakingDb    (p.freq, fs, p.Q, p.gainDb);     break;
-            case FilterType::LowShelf:  d.sec[0] = matched::lowShelfQDb  (p.freq, fs, p.gainDb, p.Q);     break;  // resonant (Q) shelf
-            case FilterType::HighShelf: d.sec[0] = matched::highShelfQDb (p.freq, fs, p.gainDb, p.Q);     break;
-            case FilterType::HighPass:  d.sec[0] = matched::highpass     (p.freq, fs, p.Q);         break;  // swept fallback (single)
-            case FilterType::LowPass:   d.sec[0] = matched::lowpass      (p.freq, fs, p.Q);         break;  // swept fallback (single)
-            case FilterType::BandPass:  d.sec[0] = matched::bandpass     (p.freq, fs, p.Q);         break;
-            case FilterType::Notch:     d.sec[0] = matched::notch        (p.freq, fs, p.Q);         break;
-            case FilterType::AllPass:   d.sec[0] = matched::allpass      (p.freq, fs, p.Q);         break;
+            case FilterType::Bell:      d.sec[0] = matched::peakingDb    (freq, fs, Q, gainDb);     break;
+            case FilterType::LowShelf:  d.sec[0] = matched::lowShelfQDb  (freq, fs, gainDb, Q);     break;  // resonant (Q) shelf
+            case FilterType::HighShelf: d.sec[0] = matched::highShelfQDb (freq, fs, gainDb, Q);     break;
+            case FilterType::HighPass:  d.sec[0] = matched::highpass     (freq, fs, Q);         break;  // swept fallback (single)
+            case FilterType::LowPass:   d.sec[0] = matched::lowpass      (freq, fs, Q);         break;  // swept fallback (single)
+            case FilterType::BandPass:  d.sec[0] = matched::bandpass     (freq, fs, Q);         break;
+            case FilterType::Notch:     d.sec[0] = matched::notch        (freq, fs, Q);         break;
+            case FilterType::AllPass:   d.sec[0] = matched::allpass      (freq, fs, Q);         break;
             case FilterType::Tilt:      break;   // handled above (two shelves)
         }
         d.n = 1;
@@ -100,7 +106,8 @@ inline std::complex<double> evalCoeffs (const BiquadCoeffs& c, double w) noexcep
     return (c.b0 + c.b1 * z1 + c.b2 * z2) / (1.0 + c.a1 * z1 + c.a2 * z2);
 }
 
-// Race-free GUI response at digital w — computed purely from a caller-owned BandParams snapshot.
+// Race-free GUI response at digital w — computed purely from a caller-owned BandParams snapshot. Reads
+// the PRIMARY slot (lanes[Stereo]); feed it a laneView() to evaluate a specific lane.
 inline std::complex<double> bandResponse (const BandParams& p, double fs, double w) noexcept
 {
     if (! p.on || p.bypass) return { 1.0, 0.0 };
@@ -110,45 +117,107 @@ inline std::complex<double> bandResponse (const BandParams& p, double fs, double
     return h;
 }
 
-// A "Side lane" view of a band: its s* fields mapped into the primary design slots, so the same
-// designBand()/bandResponse() machinery evaluates the Side lane. Only meaningful when p.ms (the
-// engine splits M/S only on a 2-channel signal). on/bypass fold in the Side lane's enable state.
-inline BandParams sideView (const BandParams& p) noexcept
+// A single-lane view of a band: `which`'s design fields folded into the primary design slot
+// (lanes[Stereo]), so the same designBand()/bandResponse() machinery evaluates that lane. `on` folds
+// the point's on with the lane's on; `bypass` folds the point's whole-point bypass with the lane's.
+// Only the Stereo lane carries `swept` (the search band operates on unsplit points). Generalises the
+// old sideView: laneView(p, Lane::Side) is the former Side view.
+inline BandParams laneView (const BandParams& p, Lane which) noexcept
 {
-    BandParams s = p;
-    s.on     = p.on && p.sOn;     // Side runs only if the band is on AND its Side lane is enabled
-    s.bypass = p.sBypass;
-    s.type   = p.sType;
-    s.freq   = p.sFreq;
-    s.Q      = p.sQ;
-    s.gainDb = p.sGainDb;
-    s.slope  = p.sSlope;
-    s.swept  = false;             // M/S lanes are matched-only (no SVF sweep)
-    return s;
+    const LaneParams src = p.lane (which);
+    BandParams v = p;
+    v.lane (Lane::Stereo) = src;                            // design fields come from `which`
+    v.swept  = (which == Lane::Stereo) ? p.swept : false;   // only the ST lane sweeps
+    v.on     = p.on && src.on;                              // fold the point's + lane's enable
+    v.bypass = p.bypass || src.bypass;                      // point bypass OR lane bypass mutes it
+    return v;
+}
+
+// A stereo display / analysis axis (decision #7 display math; matrixResponse is the exact version).
+enum class Axis { Left, Right, Mid, Side };
+
+inline constexpr Lane axisLane (Axis a) noexcept
+{
+    switch (a)
+    {
+        case Axis::Left:  return Lane::Left;
+        case Axis::Right: return Lane::Right;
+        case Axis::Mid:   return Lane::Mid;
+        case Axis::Side:  return Lane::Side;
+    }
+    return Lane::Mid;
 }
 
 // Composite complex response of the whole bank on ONE stereo axis at digital w, from a caller-owned
-// snapshot (race-free). side=false → the Mid axis (also the plain L=R response when no band is M/S);
-// side=true → the Side axis. A non-M/S band contributes its single (stereo) response to both axes; an
-// M/S band contributes its Mid lane to the Mid axis and its Side lane to the Side axis.
+// snapshot (race-free). Industry-standard display math (decision #7): axis a = ∏ over bands of
+// H_ST · H_a — the ST lane (folds into every axis) times that axis's own-domain lane. An idle lane
+// contributes exact identity (laneView folds it off → bandResponse early-returns 1 → skipped, exactly
+// as an inactive band is today). Cross-domain coupling is deliberately ignored HERE; matrixResponse is
+// the exact 2×2 the FIR path and the tests use.
 inline std::complex<double> compositeResponse (const BandParams* bands, int numBands,
-                                               double fs, double w, bool side) noexcept
+                                               double fs, double w, Axis a) noexcept
 {
+    const Lane axl = axisLane (a);
     std::complex<double> h { 1.0, 0.0 };
     for (int i = 0; i < numBands; ++i)
-        h *= (side && bands[i].ms) ? bandResponse (sideView (bands[i]), fs, w)
-                                   : bandResponse (bands[i], fs, w);
+    {
+        h *= bandResponse (laneView (bands[i], Lane::Stereo), fs, w);   // ST folds into every axis
+        h *= bandResponse (laneView (bands[i], axl),          fs, w);   // the axis's own-domain lane
+    }
     return h;
 }
 
+// The exact 2×2 complex transfer of the whole bank in the L/R basis at digital w. This is the FIR
+// builder's and the tests' source of truth (the GUI uses compositeResponse). Entry hXY = output X per
+// unit input Y.
+struct ResponseMatrix { std::complex<double> hLL, hLR, hRL, hRR; };
+
+inline ResponseMatrix matrixResponse (const BandParams* bands, int numBands, double fs, double w) noexcept
+{
+    // Per band, composed in the NORMATIVE processing order (matches EqBand::process). The matrix
+    // operators do NOT commute — diag(H_L,H_R) and H_MS only commute when H_L == H_R — so this order
+    // is load-bearing and identical in the engine, this analytic form and the FIR builder:
+    //   H_band = H_MS · diag(H_L, H_R) · (H_ST · I)          (H_ST is scalar; its position is free)
+    //   H_MS   = [[ (H_M+H_S)/2, (H_M−H_S)/2 ],
+    //             [ (H_M−H_S)/2, (H_M+H_S)/2 ]]              (identity when both M/S lanes idle)
+    // The bank product is taken in process order: band 0 first ⇒ rightmost factor.
+    ResponseMatrix acc { { 1.0, 0.0 }, { 0.0, 0.0 }, { 0.0, 0.0 }, { 1.0, 0.0 } };   // identity
+    for (int i = 0; i < numBands; ++i)
+    {
+        const BandParams& b = bands[i];
+        const std::complex<double> hST = bandResponse (laneView (b, Lane::Stereo), fs, w);
+        const std::complex<double> hL  = bandResponse (laneView (b, Lane::Left),   fs, w);
+        const std::complex<double> hR  = bandResponse (laneView (b, Lane::Right),  fs, w);
+        const std::complex<double> hM  = bandResponse (laneView (b, Lane::Mid),    fs, w);
+        const std::complex<double> hS  = bandResponse (laneView (b, Lane::Side),   fs, w);
+
+        const std::complex<double> dLL = hST * hL;              // diag(H_L,H_R) · (H_ST·I)
+        const std::complex<double> dRR = hST * hR;
+        const std::complex<double> mp  = 0.5 * (hM + hS);       // H_MS diagonal
+        const std::complex<double> mm  = 0.5 * (hM - hS);       // H_MS off-diagonal
+        // H_band = H_MS · diag(dLL, dRR) = [[mp·dLL, mm·dRR], [mm·dLL, mp·dRR]]
+        const ResponseMatrix hb { mp * dLL, mm * dRR, mm * dLL, mp * dRR };
+        // acc <- H_band · acc  (later bands multiply on the LEFT, matching the series signal flow)
+        acc = ResponseMatrix {
+            hb.hLL * acc.hLL + hb.hLR * acc.hRL,  hb.hLL * acc.hLR + hb.hLR * acc.hRR,
+            hb.hRL * acc.hLL + hb.hRR * acc.hRL,  hb.hRL * acc.hLR + hb.hRR * acc.hRR
+        };
+    }
+    return acc;
+}
+
 //==============================================================================
-// teq::EqBand — one EQ band. Owns its parameter smoothers, picks the right design, and
-// processes a block in place (mono or stereo). Two engines under one band:
+// EqBand — one EQ point, split across up to five placement lanes (ST / L / R / M / S). Owns each
+// lane's parameter smoothers, picks the right design per lane, and processes a block in place. Two
+// engines under the ST lane:
 //   * static treatment band  -> matched biquad(s) (Nyquist-accurate; 24 dB/oct = 2 sections)
-//   * swept / search band    -> zero-delay SVF    (clean under a fast fc sweep)
-// Smoothers advance in closed form per block, so coefficients are recomputed once per block
-// while freq/Q/gain still move in real time — no zipper, no per-sample biquad redesign.
-// `response()` always reports the matched (display) curve so the GUI stays honest near Nyquist.
+//   * swept / search band    -> zero-delay SVF    (clean under a fast fc sweep; single-ST config only)
+// Smoothers advance in closed form per block, so coefficients are recomputed once per block while
+// freq/Q/gain still move in real time — no zipper, no per-sample biquad redesign. Idle lanes cost zero
+// (never designed; their smoothers snap; excluded from the moving/settled check). Lane on/off and lane
+// bypass are HARD operator steps (topology reset + snap), exactly the shipped band-enable semantics —
+// not amplitude crossfades. `response()` always reports the matched (display) curve so the GUI stays
+// honest near Nyquist.
 class EqBand
 {
 public:
@@ -159,211 +228,376 @@ public:
     {
         fs = sampleRate;
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
-        freqS.prepare (fs, smoothMs);
-        qS.prepare    (fs, smoothMs);
-        gainS.prepare (fs, smoothMs);
-        sFreqS.prepare (fs, smoothMs);
-        sQS.prepare    (fs, smoothMs);
-        sGainS.prepare (fs, smoothMs);
-        freqS.snap (p.freq); qS.snap (p.Q); gainS.snap (p.gainDb);
-        sFreqS.snap (p.sFreq); sQS.snap (p.sQ); sGainS.snap (p.sGainDb);
-        svf.prepare (fs, ch);
+        stFreqS_.prepare (fs, smoothMs); stQS_.prepare (fs, smoothMs); stGainS_.prepare (fs, smoothMs);
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            rt.freqS.prepare (fs, smoothMs); rt.qS.prepare (fs, smoothMs); rt.gainS.prepare (fs, smoothMs);
+        }
+        snapAll();
+        svf_.prepare (fs, ch);
+        lastType_ = p.type;
         updateCoeffs();
         recomputePending = false;
         initialized = false;
-        wasActive = false;
+        bandWasActive = false;
         reset();
     }
 
     void reset() noexcept
     {
-        for (int c = 0; c < kMaxChannels; ++c)
-            for (int s = 0; s < kMaxSections; ++s) bq[s][c].reset();
-        for (int s = 0; s < kMaxSections; ++s) bqSide[s].reset();
-        svf.reset();
+        resetST();
+        for (const Lane l : kMonoLanes) resetLane (laneRt_[(std::size_t) l]);
     }
 
-    // Call from the SAME thread as processBlock() (typically the audio thread, where the host
-    // adapter reads its atomic parameters), or synchronise externally — the engine takes no
-    // internal lock. The FIRST call SNAPS (a freshly loaded plugin starts at its settings, no
-    // ramp); later calls smooth freq/Q/gain. Identical params are a no-op (recompute stays skipped
-    // even if called every block). type/slope/swept/on apply on the next block.
+    // Call from the SAME thread as processBlock() (typically the audio thread, where the host adapter
+    // reads its atomic parameters), or synchronise externally — the engine takes no internal lock. The
+    // FIRST call SNAPS every lane (a freshly loaded plugin starts at its settings, no ramp); later
+    // calls smooth freq/Q/gain of ACTIVE lanes and SNAP idle lanes (cost-zero) and lanes that just
+    // toggled on/off (a hard operator step). Identical params are a no-op. type/slope/swept/on apply on
+    // the next block.
     void setParams (const BandParams& npIn) noexcept
     {
-        auto finiteOr = [] (double x, double fb) noexcept { return std::isfinite (x) ? x : fb; };
-        BandParams np = npIn;
-        np.freq    = std::clamp (finiteOr (np.freq, 1000.0), 10.0, 0.49 * fs);
-        np.Q       = std::clamp (finiteOr (np.Q, 1.0), 0.05, 40.0);
-        np.gainDb  = std::clamp (finiteOr (np.gainDb, 0.0), -30.0, 30.0);
-        np.sFreq   = std::clamp (finiteOr (np.sFreq, 1000.0), 10.0, 0.49 * fs);
-        np.sQ      = std::clamp (finiteOr (np.sQ, 1.0), 0.05, 40.0);
-        np.sGainDb = std::clamp (finiteOr (np.sGainDb, 0.0), -30.0, 30.0);
+        const BandParams np = clamped (npIn);
 
         if (! initialized)
         {
             p = np;
-            freqS.snap (p.freq);   qS.snap (p.Q);   gainS.snap (p.gainDb);
-            sFreqS.snap (p.sFreq); sQS.snap (p.sQ); sGainS.snap (p.sGainDb);
+            snapAll();
             initialized = true;
             recomputePending = true;
+            return;
         }
-        else if (! (np == p))
+        if (np == p) return;
+
+        // Snapshot each lane's active-ness BEFORE overwriting p: a lane that stays active ramps (smooth
+        // edit); one that toggles on/off — or is idle — snaps (idle = cost-zero, toggle = hard step).
+        // Classify the change: a write confined to IDLE lanes' freq/Q/gain snaps those smoothers but
+        // needs NO recompute — parking automation on a disabled lane burns nothing.
+        bool material = (np.type != p.type) || (np.swept != p.swept) || (np.on != p.on) || (np.bypass != p.bypass);
+        bool wasOn[kNumLanes];
+        for (int i = 0; i < kNumLanes; ++i)
         {
-            p = np;
-            freqS.setTarget (p.freq);   qS.setTarget (p.Q);   gainS.setTarget (p.gainDb);
-            sFreqS.setTarget (p.sFreq); sQS.setTarget (p.sQ); sGainS.setTarget (p.sGainDb);
-            recomputePending = true;
+            wasOn[i] = laneOnIn (p, i);
+            const LaneParams& a = p.lanes[(std::size_t) i];
+            const LaneParams& b = np.lanes[(std::size_t) i];
+            const bool topo = (a.on != b.on) || (a.bypass != b.bypass) || (a.slope != b.slope);   // routing / section count
+            material = material || topo || ((wasOn[i] || laneOnIn (np, i)) && ! (a == b));         // an active lane's design
         }
+
+        p = np;
+
+        applyLaneTargets (Lane::Stereo, stFreqS_, stQS_, stGainS_, wasOn[(std::size_t) Lane::Stereo]);
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            applyLaneTargets (l, rt.freqS, rt.qS, rt.gainS, wasOn[(std::size_t) l]);
+        }
+        if (material) recomputePending = true;
     }
 
     const BandParams& params() const noexcept { return p; }
 
-    // Audio thread. In-place. RT-safe (no alloc / lock / IO).
+    // Audio thread. In-place. RT-safe (no alloc / lock / IO). Normative order: ST per channel, then
+    // L on ch0 / R on ch1, then the M/S delta-fold (2-channel only; mono/surround run the ST lane only).
     void processBlock (float* const* channels, int numChannels, int numSamples) noexcept
     {
-        const bool midActive  = p.on && ! p.bypass;                       // Mid/main lane
-        const bool sideActive = p.on && p.ms && p.sOn && ! p.sBypass;     // Side lane (M/S only)
-        const bool active     = midActive || sideActive;                  // a bypassed Mid still lets Side run
-        if (! active || numSamples <= 0)
-        {
-            if (! active && wasActive) { reset(); wasActive = false; }   // clear the tail so re-enabling doesn't pop
-            return;
-        }
-        wasActive = true;
-
-        freqS.advance (numSamples);  qS.advance (numSamples);  gainS.advance (numSamples);
-        sFreqS.advance (numSamples); sQS.advance (numSamples); sGainS.advance (numSamples);
-
-        // Recompute only when something actually moves — a static, settled band skips the
-        // per-block tan/exp/sin/sqrt entirely.
-        const bool moving = ! (freqS.settled() && qS.settled() && gainS.settled()
-                            && sFreqS.settled() && sQS.settled() && sGainS.settled());
-        if (recomputePending || moving) { updateCoeffs(); recomputePending = moving; }
-
         const int nc = numChannels < ch ? numChannels : ch;
 
-        // M/S dual-design (2-ch only): exact local encode -> filter Mid (col 0) / Side (col 1) -> decode.
-        // Matched filters only (no swept in M/S). Composes in series — the next band sees L/R again.
-        if (p.ms && nc == 2)
+        const bool stRun = laneOn (Lane::Stereo);              // ST runs on every channel (any nc)
+        const bool lRun  = nc == 2 && laneOn (Lane::Left);
+        const bool rRun  = nc == 2 && laneOn (Lane::Right);
+        const bool mRun  = nc == 2 && laneOn (Lane::Mid);
+        const bool sRun  = nc == 2 && laneOn (Lane::Side);
+        const bool anyRun = stRun || lRun || rRun || mRun || sRun;
+
+        if (! anyRun || numSamples <= 0)
+        {
+            if (! anyRun && bandWasActive) { reset(); bandWasActive = false; }   // clear tails so re-enabling doesn't pop
+            return;
+        }
+        bandWasActive = true;
+
+        // Advance every lane's smoothers (closed form; an idle/snapped smoother is a settled no-op).
+        stFreqS_.advance (numSamples); stQS_.advance (numSamples); stGainS_.advance (numSamples);
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            rt.freqS.advance (numSamples); rt.qS.advance (numSamples); rt.gainS.advance (numSamples);
+        }
+
+        // Recompute only when a RUNNING lane actually moves — a static, settled band skips the trig.
+        bool moving = false;
+        if (stRun) moving = moving || ! (stFreqS_.settled() && stQS_.settled() && stGainS_.settled());
+        if (lRun)  moving = moving || laneMoving (Lane::Left);
+        if (rRun)  moving = moving || laneMoving (Lane::Right);
+        if (mRun)  moving = moving || laneMoving (Lane::Mid);
+        if (sRun)  moving = moving || laneMoving (Lane::Side);
+        if (recomputePending || moving) { updateCoeffs(); recomputePending = moving; }
+
+        // (1) ST lane — per channel. The swept SVF path only runs in the single-ST config; matched
+        //     biquads otherwise. (The swept engine legitimately runs on mono and surround too.)
+        if (stRun)
+        {
+            if (sweptActive())
+                for (int c = 0; c < nc; ++c)
+                {
+                    float* d = channels[c];
+                    for (int n = 0; n < numSamples; ++n) d[n] = svf_.processSample (c, d[n]);
+                }
+            else
+                for (int c = 0; c < nc; ++c)
+                {
+                    float* d = channels[c];
+                    for (int n = 0; n < numSamples; ++n)
+                    {
+                        float x = d[n];
+                        for (int s = 0; s < designNST_; ++s) x = bqST_[s][c].processSample (x);
+                        d[n] = x;
+                    }
+                }
+        }
+
+        // (2) L lane on ch0, R lane on ch1, then (3) the M/S delta-fold — 2-channel only.
+        if (nc == 2)
         {
             float* L = channels[0];
             float* R = channels[1];
-            for (int n = 0; n < numSamples; ++n)
+
+            if (lRun)
             {
-                const float m = 0.5f * (L[n] + R[n]);
-                const float s = 0.5f * (L[n] - R[n]);
-                float dM = 0.0f, dS = 0.0f;
-                if (midActive)  { float x = m; for (int k = 0; k < designN;     ++k) x = bq[k][0].processSample (x); dM = x - m; }
-                if (sideActive) { float y = s; for (int k = 0; k < designNside; ++k) y = bqSide[k].processSample (y); dS = y - s; }
-                L[n] += dM + dS;   // L=M+S, R=M-S: fold deltas back. An idle lane (d=0) leaves its axis bit-exact.
-                R[n] += dM - dS;
+                LaneRt& rt = laneRt_[(std::size_t) Lane::Left];
+                for (int n = 0; n < numSamples; ++n)
+                {
+                    float x = L[n];
+                    for (int s = 0; s < rt.designN; ++s) x = rt.bq[s].processSample (x);
+                    L[n] = x;
+                }
             }
-            flushState();
-            return;
-        }
-
-        // Non-M/S path runs the Mid/main lane only. If the Mid lane is off (e.g. M/S band on mono with
-        // Mid bypassed) there is nothing to do here.
-        if (! midActive) { flushState(); return; }
-
-        // One sample through this band's filter chain on a given per-channel state column.
-        auto filt = [this] (int col, float x) noexcept
-        {
-            if (sweptActive()) return svf.processSample (col, x);
-            for (int s = 0; s < designN; ++s) x = bq[s][col].processSample (x);
-            return x;
-        };
-
-        // Stereo / mono / surround: the Mid/main lane runs per channel (M/S is handled above).
-        for (int c = 0; c < nc; ++c)
-        {
-            float* d = channels[c];
-            for (int n = 0; n < numSamples; ++n) d[n] = filt (c, d[n]);
+            if (rRun)
+            {
+                LaneRt& rt = laneRt_[(std::size_t) Lane::Right];
+                for (int n = 0; n < numSamples; ++n)
+                {
+                    float x = R[n];
+                    for (int s = 0; s < rt.designN; ++s) x = rt.bq[s].processSample (x);
+                    R[n] = x;
+                }
+            }
+            if (mRun || sRun)
+            {
+                LaneRt& M = laneRt_[(std::size_t) Lane::Mid];
+                LaneRt& S = laneRt_[(std::size_t) Lane::Side];
+                for (int n = 0; n < numSamples; ++n)
+                {
+                    const float m = 0.5f * (L[n] + R[n]);
+                    const float s = 0.5f * (L[n] - R[n]);
+                    float dM = 0.0f, dS = 0.0f;
+                    if (mRun) { float x = m; for (int k = 0; k < M.designN; ++k) x = M.bq[k].processSample (x); dM = x - m; }
+                    if (sRun) { float y = s; for (int k = 0; k < S.designN; ++k) y = S.bq[k].processSample (y); dS = y - s; }
+                    L[n] += dM + dS;   // L=M+S, R=M-S: fold deltas back. An idle lane (d=0) leaves its axis bit-exact.
+                    R[n] += dM - dS;
+                }
+            }
         }
 
         flushState();   // per-block denormal guard
     }
 
-    // Complex frequency response at digital w (rad/sample) from the band's current smoothed state.
-    // For a race-free GUI curve prefer the free bandResponse() with your own BandParams snapshot.
-    std::complex<double> response (double w) const noexcept
+    // Complex frequency response of ONE axis at digital w (rad/sample) from the band's current smoothed
+    // coefficients: H_ST · H_a (an idle lane's column is designN==0 → contributes identity). Best-effort
+    // LIVE readout — for a guaranteed race-free GUI curve prefer the free compositeResponse().
+    std::complex<double> response (double w, Axis a = Axis::Mid) const noexcept
     {
         if (! p.on || p.bypass) return { 1.0, 0.0 };
         std::complex<double> h { 1.0, 0.0 };
-        for (int s = 0; s < designN; ++s) h *= evalCoeffs (coeffs[s], w);
+        for (int s = 0; s < designNST_; ++s) h *= evalCoeffs (coeffsST_[s], w);       // ST folds into every axis
+        const LaneRt& rt = laneRt_[(std::size_t) axisLane (a)];
+        for (int s = 0; s < rt.designN; ++s) h *= evalCoeffs (rt.coeffs[s], w);       // the axis's own-domain lane
         return h;
     }
 
 private:
+    // A single-signal lane (L / R / M / S): one biquad column (they are single-signal filters by
+    // construction). The ST lane is separate — it keeps per-channel columns + the swept SVF.
+    struct LaneRt
+    {
+        Smoother     freqS, qS, gainS;
+        Biquad       bq[kMaxSections];
+        BiquadCoeffs coeffs[kMaxSections];
+        int          designN = 0;
+        bool         active  = false;   // designed on the last updateCoeffs()? (drives the topology reset)
+    };
+
+    static constexpr Lane kMonoLanes[4] { Lane::Left, Lane::Right, Lane::Mid, Lane::Side };
+
+    bool pointActive() const noexcept { return p.on && ! p.bypass; }
+
+    // Does lane `l` want to run? (point active AND lane on AND lane not bypassed) — nc-agnostic; the
+    // process() step additionally gates L/R/M/S on nc==2.
+    bool laneOn (Lane l) const noexcept
+    {
+        const LaneParams& lp = p.lane (l);
+        return pointActive() && lp.on && ! lp.bypass;
+    }
+
+    static bool laneOnIn (const BandParams& q, int i) noexcept
+    {
+        const LaneParams& lp = q.lanes[(std::size_t) i];
+        return q.on && ! q.bypass && lp.on && ! lp.bypass;
+    }
+
+    bool laneMoving (Lane l) const noexcept
+    {
+        const LaneRt& rt = laneRt_[(std::size_t) l];
+        return ! (rt.freqS.settled() && rt.qS.settled() && rt.gainS.settled());
+    }
+
+    // The point is "unsplit" (single-ST) when no other lane is enabled — the only configuration in
+    // which the swept SVF bites (the search→treat workflow operates on unsplit points).
+    bool onlyStereo() const noexcept
+    {
+        return ! (p.lane (Lane::Left).on || p.lane (Lane::Right).on
+               || p.lane (Lane::Mid).on  || p.lane (Lane::Side).on);
+    }
+
+    // The swept (SVF) engine only runs for types the single SVF stage can realise, AND only in the
+    // single-ST configuration. Tilt has no one-SVF realisation with a unity pivot beyond ~6 dB, so a
+    // swept Tilt runs the matched two-shelf design instead.
+    bool sweptActive() const noexcept
+    {
+        return p.swept && p.type != FilterType::Tilt && onlyStereo();
+    }
+
+    void applyLaneTargets (Lane l, Smoother& fS, Smoother& qS2, Smoother& gS, bool wasOn) noexcept
+    {
+        const LaneParams& lp = p.lane (l);
+        if (laneOn (l) && wasOn) { fS.setTarget (lp.freq); qS2.setTarget (lp.Q); gS.setTarget (lp.gainDb); }  // smooth edit
+        else                     { fS.snap (lp.freq);      qS2.snap (lp.Q);      gS.snap (lp.gainDb); }        // idle / hard step
+    }
+
+    void snapAll() noexcept
+    {
+        const LaneParams& st = p.lane (Lane::Stereo);
+        stFreqS_.snap (st.freq); stQS_.snap (st.Q); stGainS_.snap (st.gainDb);
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            const LaneParams& lp = p.lane (l);
+            rt.freqS.snap (lp.freq); rt.qS.snap (lp.Q); rt.gainS.snap (lp.gainDb);
+        }
+    }
+
+    BandParams clamped (const BandParams& in) const noexcept
+    {
+        auto finiteOr = [] (double x, double fb) noexcept { return std::isfinite (x) ? x : fb; };
+        BandParams np = in;
+        for (int i = 0; i < kNumLanes; ++i)
+        {
+            LaneParams& lp = np.lanes[(std::size_t) i];
+            lp.freq   = std::clamp (finiteOr (lp.freq, 1000.0), 10.0, 0.49 * fs);
+            lp.Q      = std::clamp (finiteOr (lp.Q, 1.0), 0.05, 40.0);
+            lp.gainDb = std::clamp (finiteOr (lp.gainDb, 0.0), -30.0, 30.0);
+        }
+        return np;
+    }
+
     void updateCoeffs() noexcept
     {
-        BandParams sp = p;
-        sp.freq = freqS.value(); sp.Q = qS.value(); sp.gainDb = gainS.value();
+        const bool typeChanged = (p.type != lastType_);   // shared type change resets EVERY lane's column
+        lastType_ = p.type;
 
-        const BandDesign d = designBand (sp, fs);
-
-        // Side lane (M/S only): design from a side-view of the params (s* fields into the design slots).
-        BandDesign dS; dS.n = 0;
-        if (p.ms)
+        // ---- ST lane (per-channel columns; the only lane that can sweep) ----
         {
-            BandParams ssp = p;
-            ssp.type = p.sType; ssp.slope = p.sSlope; ssp.swept = false;
-            ssp.freq = sFreqS.value(); ssp.Q = sQS.value(); ssp.gainDb = sGainS.value();
-            dS = designBand (ssp, fs);
+            const bool active = laneOn (Lane::Stereo);
+            const bool sw     = sweptActive();
+            BandDesign d; d.n = 0;
+            if (active)
+            {
+                BandParams sp = p;
+                LaneParams& s = sp.lane (Lane::Stereo);
+                s.freq = stFreqS_.value(); s.Q = stQS_.value(); s.gainDb = stGainS_.value();
+                sp.swept = sw;   // single-stage swept design ONLY in the single-ST config; else the matched cascade
+                d = designBand (sp, fs);   // sp.type is the point's shared field
+            }
+            // Topology switch (section count, swept<->static, activation, OR the shared type) → clear
+            // the ST columns so a re-activated section never resumes a stale tail.
+            if (d.n != designNST_ || sw != lastSwept_ || active != stActive_ || typeChanged) resetST();
+            designNST_ = d.n;
+            lastSwept_ = sw;
+            stActive_  = active;
+            for (int s = 0; s < d.n; ++s) coeffsST_[s] = d.sec[s];
+            for (int c = 0; c < ch; ++c)
+                for (int s = 0; s < d.n; ++s) bqST_[s][c].setCoeffs (coeffsST_[s]);
+            if (active && sw) svf_.setParams (p.type, stFreqS_.value(), stQS_.value(), stGainS_.value());  // single SVF stage
         }
 
-        // A topology switch (section count changed, swept<->static, route, OR Stereo<->M/S) changes
-        // WHICH filters run — clear all state so a re-activated section never resumes a stale tail.
-        const bool sw = sweptActive();
-        if (d.n != designN || dS.n != designNside || sw != lastSwept || p.ms != lastMs) reset();
-
-        designN     = d.n;
-        designNside = dS.n;
-        lastSwept = sw;
-        lastMs    = p.ms;
-
-        for (int s = 0; s < d.n; ++s) coeffs[s] = d.sec[s];
-        for (int c = 0; c < ch; ++c)
-            for (int s = 0; s < d.n; ++s) bq[s][c].setCoeffs (coeffs[s]);
-
-        for (int s = 0; s < dS.n; ++s) { coeffsSide[s] = dS.sec[s]; bqSide[s].setCoeffs (coeffsSide[s]); }   // Side -> its OWN state
-
-        if (sw) svf.setParams (p.type, sp.freq, sp.Q, sp.gainDb);   // swept = single SVF stage (12 dB/oct)
+        // ---- L / R / M / S lanes (one column each) ----
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            const bool active = laneOn (l);
+            BandDesign d; d.n = 0;
+            if (active)
+            {
+                BandParams sp = p;
+                LaneParams& s = sp.lane (Lane::Stereo);
+                s = p.lane (l);                       // this lane's design fields (incl. slope) into the slot
+                s.freq = rt.freqS.value(); s.Q = rt.qS.value(); s.gainDb = rt.gainS.value();
+                sp.swept = false;                     // only the ST lane sweeps
+                d = designBand (sp, fs);
+            }
+            if (d.n != rt.designN || active != rt.active || typeChanged) resetLane (rt);
+            rt.designN = d.n;
+            rt.active  = active;
+            for (int s = 0; s < d.n; ++s) { rt.coeffs[s] = d.sec[s]; rt.bq[s].setCoeffs (rt.coeffs[s]); }
+        }
     }
 
     void flushState() noexcept
     {
-        if (sweptActive()) { svf.flushDenormals(); return; }
-        for (int c = 0; c < ch; ++c)                                   // Mid/main lane, per channel
-            for (int s = 0; s < kMaxSections; ++s) bq[s][c].flushDenormals();
-        for (int s = 0; s < kMaxSections; ++s) bqSide[s].flushDenormals();   // Side lane (M/S)
+        if (sweptActive()) svf_.flushDenormals();
+        else for (int c = 0; c < ch; ++c)
+                 for (int s = 0; s < kMaxSections; ++s) bqST_[s][c].flushDenormals();
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            for (int s = 0; s < kMaxSections; ++s) rt.bq[s].flushDenormals();
+        }
     }
 
-    // The swept (SVF) engine only runs for types the single SVF stage can actually realise. Tilt has
-    // no one-SVF realisation with a unity pivot beyond ~6 dB of tilt, so a swept Tilt band runs the
-    // matched two-shelf design instead (the audio finally matches the displayed curve; previously a
-    // swept Tilt was a silent pass-through while the GUI showed the full ±gain tilt).
-    bool sweptActive() const noexcept { return p.swept && p.type != FilterType::Tilt; }
+    void resetST() noexcept
+    {
+        for (int c = 0; c < kMaxChannels; ++c)
+            for (int s = 0; s < kMaxSections; ++s) bqST_[s][c].reset();
+        svf_.reset();
+    }
+
+    static void resetLane (LaneRt& rt) noexcept
+    {
+        for (int s = 0; s < kMaxSections; ++s) rt.bq[s].reset();
+    }
 
     BandParams p;
     double fs = 44100.0;
     int    ch = 2;
-    int    designN = 1;
-    int    designNside = 0;
     bool   recomputePending = true;
     bool   initialized = false;
-    bool   wasActive = false;
-    bool   lastSwept = false;
-    bool   lastMs = false;
+    bool   bandWasActive = false;
+    FilterType lastType_ = FilterType::Bell;
 
-    Smoother freqS, qS, gainS, sFreqS, sQS, sGainS;
-    Biquad   bq[kMaxSections][kMaxChannels];
-    Biquad   bqSide[kMaxSections];   // Side lane's OWN state (M/S runs it on 2-ch only). It must never
-                                     // alias a Mid channel column: writing Side coeffs into bq[s][1]
-                                     // corrupted channel 1 on surround (nc>=3), where the plain
-                                     // per-channel loop — not the M/S branch — consumes column 1.
-    Svf      svf;
-    BiquadCoeffs coeffs[kMaxSections], coeffsSide[kMaxSections];
+    // ST lane: per-channel biquad columns (mono→surround→ambisonics) + the swept SVF.
+    Smoother     stFreqS_, stQS_, stGainS_;
+    Biquad       bqST_[kMaxSections][kMaxChannels];
+    BiquadCoeffs coeffsST_[kMaxSections];
+    int          designNST_ = 1;
+    bool         stActive_  = false;
+    bool         lastSwept_ = false;
+    Svf          svf_;
+
+    // L / R / M / S lanes. Indexed by Lane; the [Lane::Stereo] entry is unused (the ST lane keeps the
+    // per-channel columns above) — a trivial, deliberate slot for index-by-enum clarity.
+    LaneRt laneRt_[kNumLanes];
 };
 
 } // namespace felitronics::eq

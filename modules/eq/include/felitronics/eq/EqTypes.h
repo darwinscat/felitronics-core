@@ -4,13 +4,14 @@
 #pragma once
 
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 
-// felitronics::eq base types (FilterType, BandParams) + the module's internal ALIAS HUB: it pulls the
-// cross-module names the eq engine uses — kMaxChannels + kPi + Smoother (felitronics::core) and
-// SpectrumTap (felitronics::analysis) — into felitronics::eq, so the MatchedBiquad/Svf/EqBand/EqEngine
-// bodies migrated from TabbyEQ's teq:: sources stay byte-identical (they reference these unqualified).
-// The SSOT kMaxChannels lives in felitronics::core (see Config.h).
+// felitronics::eq base types (FilterType, Lane, LaneParams, BandParams) + the module's internal ALIAS
+// HUB: it pulls the cross-module names the eq engine uses — kMaxChannels + kPi + Smoother
+// (felitronics::core) and SpectrumTap (felitronics::analysis) — into felitronics::eq, so the
+// MatchedBiquad/Svf/EqBand/EqEngine bodies migrated from TabbyEQ's teq:: sources stay byte-identical
+// (they reference these unqualified). The SSOT kMaxChannels lives in felitronics::core (see Config.h).
 #include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/core/Smoother.h>
@@ -41,42 +42,56 @@ enum class FilterType
     Tilt         // spectral tilt about f0: lows -gainDb, highs +gainDb
 };
 
-// One band's full specification. The plugin adapter maps APVTS params into this; the engine owns no
-// parameter system of its own (stays framework-agnostic).
-struct BandParams
+// Placement lanes (Pro-Q-style, but multi-select — a point may live in several at once). The fixed
+// enum order IS the processing order (ST first), which the engine, the analytic 2×2 matrix and the FIR
+// builder all compose in — see EqBand::process / matrixResponse. `kNumLanes` is the SSOT count.
+enum class Lane : std::uint8_t { Stereo, Left, Right, Mid, Side };
+inline constexpr int kNumLanes = 5;
+
+// One placement lane's full parameter set. The point's `type`/`swept` are SHARED across its lanes
+// (decision #2); everything that can differ per domain lives here.
+struct LaneParams
 {
-    bool       on     = false;
-    FilterType type   = FilterType::Bell;
-    double     freq   = 1000.0;   // Hz (engine clamps to [10, 0.49*fs])
-    double     Q      = 1.0;
-    double     gainDb = 0.0;      // bells & shelves
-    int        slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch: steepness (order=slope/6),
-                                  // sections=ceil(order/2); 6/12→single notch (Q=width), 24→2 … 96→8.
-    bool       swept  = false;    // true → zero-delay SVF (smooth fast fc sweeps for search mode).
-                                  // Notch sweeps as a real SVF notch; Tilt has no one-SVF realisation
-                                  // and always runs the matched two-shelf design (flag ignored).
-    bool       bypass = false;    // band kept but muted (ghost) — distinct from on=false (removed)
+    bool   on     = false;    // lane enabled (the menu checkbox)
+    double freq   = 1000.0;   // Hz (engine clamps to [10, 0.49*fs])
+    double Q      = 1.0;
+    double gainDb = 0.0;      // bells & shelves
+    int    slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch: steepness (order=slope/6)
+    bool   bypass = false;    // lane kept but muted (ghost node) — distinct from on=false
 
-    // M/S dual-mode: the flat fields above are the Mid/main lane; these are the independent Side lane.
-    // Only used when ms==true on a 2-channel signal (mono/surround ignore it -> Mid lane only).
-    bool       ms      = false;          // false = Stereo (one lane on L/R), true = Mid/Side (two lanes)
-    bool       sOn     = true;           // Side lane enabled
-    FilterType sType   = FilterType::Bell;
-    double     sFreq   = 1000.0;
-    double     sQ      = 1.0;
-    double     sGainDb = 0.0;
-    int        sSlope  = 12;
-    bool       sBypass = false;
-
-    // Exact change-detection. The doubles are compared by bit pattern (not `==`) so the engine's
-    // recompute-skip stays exact without tripping -Wfloat-equal in strict-warning builds.
-    bool operator== (const BandParams& o) const noexcept
+    // Doubles compared by bit pattern (not `==`) so the engine's recompute-skip stays exact without
+    // tripping -Wfloat-equal in strict-warning builds.
+    bool operator== (const LaneParams& o) const noexcept
     {
         auto bits = [] (double d) noexcept { return std::bit_cast<std::uint64_t> (d); };
-        return on == o.on && type == o.type && slope == o.slope && swept == o.swept && bypass == o.bypass
-            && ms == o.ms && sOn == o.sOn && sType == o.sType && sSlope == o.sSlope && sBypass == o.sBypass
-            && bits (freq) == bits (o.freq) && bits (Q) == bits (o.Q) && bits (gainDb) == bits (o.gainDb)
-            && bits (sFreq) == bits (o.sFreq) && bits (sQ) == bits (o.sQ) && bits (sGainDb) == bits (o.sGainDb);
+        return on == o.on && slope == o.slope && bypass == o.bypass
+            && bits (freq) == bits (o.freq) && bits (Q) == bits (o.Q) && bits (gainDb) == bits (o.gainDb);
+    }
+};
+
+// One band ("point"): a filter of one shared `type`, split across a set of placement lanes. The plugin
+// adapter maps APVTS params into this; the engine owns no parameter system of its own (framework-
+// agnostic). A fresh band reproduces the pre-lanes default exactly: point off, one Stereo lane enabled
+// at 1 kHz / Q 1 / 0 dB / slope 12, all other lanes off.
+struct BandParams
+{
+    bool       on     = false;               // the point exists
+    FilterType type   = FilterType::Bell;    // SHARED by all lanes (decision #2)
+    bool       swept  = false;               // search band; honored only in the single-ST configuration
+    bool       bypass = false;               // whole-point bypass (strip power button)
+    LaneParams lanes[kNumLanes] { { true }, {}, {}, {}, {} };   // lanes[Stereo].on = true, the rest off
+
+    // Index a lane by its enum (the array is public, but this reads without the static_cast noise).
+    LaneParams&       lane (Lane l)       noexcept { return lanes[static_cast<std::size_t> (l)]; }
+    const LaneParams& lane (Lane l) const noexcept { return lanes[static_cast<std::size_t> (l)]; }
+
+    // Exact change-detection across the shared fields + every lane (each LaneParams compares its own
+    // doubles by bit pattern), so the engine's recompute-skip stays exact.
+    bool operator== (const BandParams& o) const noexcept
+    {
+        if (! (on == o.on && type == o.type && swept == o.swept && bypass == o.bypass)) return false;
+        for (int i = 0; i < kNumLanes; ++i) if (! (lanes[i] == o.lanes[i])) return false;
+        return true;
     }
 };
 
