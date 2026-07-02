@@ -287,9 +287,15 @@ namespace matched
     }
 
     //==========================================================================
-    // Notch (band-stop): an infinite null at f0, unity at DC/Nyquist, width set by Q. Zeros sit on
-    // the unit circle at +-w0; poles come from the matched-pole placement (Q-consistent with the
-    // rest of the family), then the numerator is scaled to pass DC at unity.
+    // Notch (band-stop): an infinite null at f0, unity at DC, width set by Q. Zeros sit on the
+    // unit circle at +-w0; poles come from the matched-pole placement (Q-consistent with the rest
+    // of the family), then the numerator is scaled to pass DC at unity. NOT unity at Nyquist for a
+    // wide and/or high notch: the analog prototype itself keeps residual attenuation at fs/2
+    // (|H|² = 1/(1+x²), x = BW·Ω/(Ω0²−Ω²)), and the heavily-damped matched poles under-shoot even
+    // that, roughly DOUBLING the analog dB (f0=20 kHz, Q=0.5, fs=48 kHz: −25.4 dB at Nyquist vs
+    // the analog −14.9; a narrow mid-band notch is back to ~0 dB well before fs/2). FROZEN legacy
+    // contract — sessions rely on these exact bytes; the analog-faithful near-Nyquist behaviour
+    // lives in notchCascade (sections ≥ 2), which alias-corrects its stagger poles.
     inline BiquadCoeffs notch (double f0, double fs, double Q) noexcept
     {
         BiquadCoeffs c;
@@ -313,11 +319,36 @@ namespace matched
     // BANDWIDTH (Q = f0/BW), independent of order.
     //
     // Poles are placed by the matched-Z map z = exp(sT) — algebraically identical to
-    // detail::matchedPoles — so nothing cramps at Nyquist, and because the LP→BS transform keeps
-    // every pole in the left half-plane (roots share the sign of Re, and their sum has Re<0 ⇒ both
-    // in the LHP) each z sits strictly inside the unit circle ⇒ every section is stable by
-    // construction, with no frequency clamp. `sections`≤1 falls back to notch(f0,fs,Q) BIT-FOR-BIT
-    // (the legacy single notch / swept anchor). Fills out[0..n) and returns n (== clamped sections).
+    // detail::matchedPoles — and because the LP→BS transform keeps every pole in the left
+    // half-plane (roots share the sign of Re, and their sum has Re<0 ⇒ both in the LHP) each z
+    // sits strictly inside the unit circle ⇒ every section is stable by construction. BUT exp()
+    // WRAPS once Im(s)·T > π: a wide and/or high notch throws upper stagger poles ABOVE Nyquist
+    // (only the upper root of a pair can — |r1||r2| = Ω0² pins the lower one below Ω0 < π/T),
+    // and the alias lands mid-band where it stops providing the analog upper-side recovery. With
+    // DC-normalised numerators the whole top end then sags to ≈ DOUBLE the analog dB (f0=15 kHz,
+    // Q=0.5, fs=48 kHz, 4 sections: −49.5 dB at Nyquist vs the analog −25.0); heavily-damped
+    // sections just below the wrap add a few dB of the same sag. Alias-gated repair, in order:
+    //   1. REFIT every wrapped section: zeros stay pinned and DC stays unity, while the pole
+    //      pair (2 DOF) is solved in closed form so the section interpolates its own analog
+    //      magnitude — times the computable matched-Z error of the untouched sections, split
+    //      evenly — EXACTLY at Nyquist and at wm = √(w0·π). The cascade then equals the analog
+    //      band-stop at both points and tracks it between (the case above: exact at fs/2,
+    //      ≤ 1.3 dB broadband). The Nyquist condition is linear in (u,v) = (−a1/2, a2), the wm
+    //      condition reduces to one quadratic in s = 1+v; of two valid roots prefer the pole
+    //      product nearest the matched-Z radius. No stable root ⇒ a double REAL pole solved for
+    //      the Nyquist point alone (|H| is then a ratio of linears in cos w on each side of the
+    //      null ⇒ provably monotone ⇒ can never bulge the passband).
+    //   2. if nothing wraps yet the cascade misses the analog Nyquist point by > ±0.05 dB (f0
+    //      parked near fs/2, poles hot but unwrapped), the top-angle section is refit the same way.
+    //   3. a band-stop must never exceed unity (maximal flatness — the analog reference can't).
+    //      The result is sampled on a fixed log grid; if it pokes > +0.005 dB anywhere the refit
+    //      pole pairs are blended back toward matched-Z (7-step bisection on one global λ — the
+    //      stability triangle is convex so every blend is stable; λ=0 is the legacy design, which
+    //      never boosts). Only extreme corners blend (f0 ≳ 0.4·fs and wide).
+    // When no gate fires the output is BIT-IDENTICAL to the legacy design (verified across a
+    // 44.1/48/96 kHz × Q × order × f0 grid), and `sections`≤1 falls back to notch(f0,fs,Q)
+    // BIT-FOR-BIT (the legacy single notch / swept anchor). Fixed arrays, noexcept, O(sections)
+    // work — RT-safe at design rate. Fills out[0..n) and returns n (== clamped sections).
     // Preconditions (as across matched::): 0 < f0 < fs/2 and Q > 0 — designBand() guarantees them.
     inline int notchCascade (double f0, double fs, double Q, int sections, BiquadCoeffs* out) noexcept
     {
@@ -340,7 +371,19 @@ namespace matched
             const double k  = (1.0 + a1 + a2) / (2.0 - 2.0 * cw);
             out[idx] = { k, -2.0 * k * cw, k, a1, a2 };
         };
+        // The same section from a pole pair given as (u, v) = (half the pole sum, pole product) —
+        // the refit / blend parametrisation (a1 = −2u, a2 = v).
+        auto emitUV = [&] (int idx, double u, double v) noexcept
+        {
+            const double a1 = -2.0 * u, a2 = v;
+            const double k  = (1.0 + a1 + a2) / (2.0 - 2.0 * cw);
+            out[idx] = { k, -2.0 * k * cw, k, a1, a2 };
+        };
 
+        // Pass 1 — legacy matched-Z placement (bit-identical ops), recording each section's analog
+        // pole pair and the unwrapped digital angle Im(r)·T that decides aliasing.
+        std::complex<double> ra[8], rb[8];
+        double ang[8];
         int n = 0;
         for (int i = 1; i <= m; ++i)
         {
@@ -359,14 +402,153 @@ namespace matched
             const std::complex<double> r2   = (Om0 * Om0) / r1;
 
             if (std::abs (p.imag()) < 1e-12)
-                emit (n++, std::exp (r1 * T), std::exp (r2 * T));                 // real proto pole → 1 centre section
+            {
+                ra[n] = r1; rb[n] = r2; ang[n] = std::abs (r1.imag()) * T;        // centre pair: Im ≤ Ω0 < π/T,
+                emit (n++, std::exp (r1 * T), std::exp (r2 * T));                 // never wraps (real proto pole)
+            }
             else
             {
                 const std::complex<double> zr1 = std::exp (r1 * T);              // complex proto pole → 2 stagger
                 const std::complex<double> zr2 = std::exp (r2 * T);              // sections (each root ⊗ its conjugate)
+                ra[n] = r1; rb[n] = std::conj (r1); ang[n] = std::abs (r1.imag()) * T;
                 emit (n++, zr1, std::conj (zr1));
+                ra[n] = r2; rb[n] = std::conj (r2); ang[n] = std::abs (r2.imag()) * T;
                 emit (n++, zr2, std::conj (zr2));
             }
+        }
+
+        // Pass 2 — alias gate: sections whose analog pole wrapped under exp(sT) must be refit.
+        bool refit[8] = {};
+        int nR = 0;
+        for (int i = 0; i < n; ++i)
+            if (ang[i] > kPi) { refit[i] = true; ++nR; }
+
+        const double Omn = kPi / T;                                              // Nyquist (rad/s)
+        auto analogSec = [&] (int i, double Om) noexcept                         // section i's analog magnitude
+        {                                                                        // (zeros ±iΩ0, DC-normalised)
+            const std::complex<double> iw (0.0, Om);
+            const double num = std::abs (Om0 * Om0 - Om * Om);
+            const double den = std::abs (iw - ra[i]) * std::abs (iw - rb[i]);
+            return std::abs (ra[i] * rb[i]) / (Om0 * Om0) * num / den;
+        };
+        auto analogCascade = [&] (double Om) noexcept                            // the closed-form reference
+        {
+            const double x = BW * Om / (Om0 * Om0 - Om * Om);
+            return 1.0 / std::sqrt (1.0 + std::pow (std::abs (x), 2.0 * (double) m));
+        };
+
+        if (nR == 0)                                                             // nothing wrapped: promote the
+        {                                                                        // top-angle section only if the
+            double err = analogCascade (Omn);                                    // Nyquist point is off > ±0.05 dB
+            for (int i = 0; i < n; ++i) err /= out[i].magnitude (kPi);
+            if (err > 1.0058 || err < 0.9943)
+            {
+                int top = 0;
+                for (int i = 1; i < n; ++i) if (ang[i] > ang[top]) top = i;
+                refit[top] = true; nR = 1;
+            }
+            if (nR == 0) return n;                                               // BIT-IDENTICAL legacy output
+        }
+
+        // Matched-Z error of the sections we KEEP, at digital frequency w — the refit sections
+        // absorb it (split evenly in magnitude) so the CASCADE, not just each section, lands on
+        // the analog reference at the match points.
+        auto residKept = [&] (double w) noexcept
+        {
+            double r = 1.0;
+            for (int i = 0; i < n; ++i)
+                if (! refit[i]) r *= analogSec (i, w / T) / out[i].magnitude (w);
+            return r;
+        };
+
+        const double wm     = std::sqrt (w0 * kPi);                              // 2nd match point (log-mid of null→Nyquist)
+        const double tm     = std::cos (wm);
+        const double residN = std::pow (residKept (kPi), 1.0 / (double) nR);
+        const double residM = std::pow (residKept (wm),  1.0 / (double) nR);
+
+        double u0[8], v0[8], u1[8], v1[8];                                       // pole pairs: matched-Z … refit
+        for (int i = 0; i < n; ++i)
+        {
+            if (! refit[i]) continue;
+            u0[i] = -0.5 * out[i].a1; v0[i] = out[i].a2;
+
+            const double Mn    = analogSec (i, Omn)    * residN;                 // Nyquist target
+            const double Mm    = analogSec (i, wm / T) * residM;                 // wm target
+            const double alpha = Mn * (1.0 - cw) / (1.0 + cw);
+
+            // |H(π)| = Mn is LINEAR in (u,v): (1−2u+v)(1+c) = Mn(1−c)(1+2u+v) ⇒ u = g(1+v) with
+            // g below; |H(wm)| = Mm then reduces to qa·s² + qb·s + qc = 0 in s = 1+v (numerator
+            // power N(t) = 4(t−c)², denominator power D(t) = (1−v)² + 4u² − 4u(1+v)t + 4vt²).
+            const double g  = (1.0 - alpha) / (2.0 * (1.0 + alpha));
+            const double L  = (1.0 - 2.0 * g) * (1.0 - 2.0 * g) * 4.0 * (tm - cw) * (tm - cw)
+                              / ((2.0 - 2.0 * cw) * (2.0 - 2.0 * cw));
+            const double A_ = 1.0 + 4.0 * g * g - 4.0 * g * tm;
+            const double B_ = 4.0 * (tm * tm - 1.0);
+            const double qa = L - Mm * Mm * A_, qb = -Mm * Mm * B_, qc = Mm * Mm * B_;
+
+            double s = -1.0; bool ok = false;
+            if (std::abs (qa) > 1e-300)
+            {
+                const double dsc = qb * qb - 4.0 * qa * qc;
+                if (dsc >= 0.0)
+                {
+                    const double sd = std::sqrt (dsc);
+                    const double s1 = (-qb + sd) / (2.0 * qa), s2 = (-qb - sd) / (2.0 * qa);
+                    const double Rz   = std::exp (ra[i].real() * T);             // matched-Z radius as the
+                    const double want = 1.0 + Rz * Rz;                           // root-selection prior
+                    const bool ok1 = s1 > 0.0 && s1 < 2.0, ok2 = s2 > 0.0 && s2 < 2.0;
+                    if (ok1 && ok2) { s = std::abs (s1 - want) < std::abs (s2 - want) ? s1 : s2; ok = true; }
+                    else if (ok1)   { s = s1; ok = true; }
+                    else if (ok2)   { s = s2; ok = true; }
+                }
+            }
+            else if (std::abs (qb) > 1e-300) { s = -qc / qb; ok = (s > 0.0 && s < 2.0); }
+
+            bool solved = false;
+            if (ok)
+            {
+                const double v = s - 1.0, u = g * s;
+                const BiquadCoeffs c { 1.0, 0.0, 1.0, -2.0 * u, v };             // denominator-only stability probe
+                if (c.isStable()) { u1[i] = u; v1[i] = v; solved = true; }
+            }
+            if (! solved)                                                        // 1-pt monotone fallback: double
+            {                                                                    // real pole, Nyquist target exact
+                const double sa = std::sqrt (std::max (0.0, alpha));
+                const double Rp = (alpha >= 1.0) ? (sa - 1.0) / (sa + 1.0) : -(1.0 - sa) / (1.0 + sa);
+                u1[i] = -Rp; v1[i] = Rp * Rp;
+            }
+        }
+
+        // Pass 3 — maximal-flatness guard. Blend λ: 0 = legacy matched-Z pole pairs, 1 = full
+        // refit. Sample the cascade on a fixed log grid; on any poke above unity bisect λ down.
+        auto apply = [&] (double lam) noexcept
+        {
+            for (int i = 0; i < n; ++i)
+                if (refit[i]) emitUV (i, u0[i] + lam * (u1[i] - u0[i]), v0[i] + lam * (v1[i] - v0[i]));
+        };
+        auto overUnity = [&] () noexcept
+        {
+            for (int j = 0; j <= 47; ++j)
+            {
+                const double w = kPi * std::pow (0.002, 1.0 - j / 47.0);
+                double mag = 1.0;
+                for (int i = 0; i < n; ++i) mag *= out[i].magnitude (w);
+                if (mag > 1.0006) return true;                                   // > ~+0.005 dB
+            }
+            return false;
+        };
+
+        apply (1.0);
+        if (overUnity())
+        {
+            double lo = 0.0, hi = 1.0;                                           // λ=0 == legacy: never boosts
+            for (int it = 0; it < 7; ++it)
+            {
+                const double mid = 0.5 * (lo + hi);
+                apply (mid);
+                if (overUnity()) hi = mid; else lo = mid;
+            }
+            apply (lo);
         }
         return n;
     }
