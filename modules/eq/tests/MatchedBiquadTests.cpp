@@ -435,6 +435,38 @@ void runMatchedBiquadTests()
                 }
     }
 
+    group ("bandpass: unity at centre survives the low-f0 corner (catastrophic-cancellation regression)");
+    {
+        // matched::bandpass used to read +28.65 dB at its own centre (fs=192k, f0=10.03, Q=40): at
+        // tiny w0 the B1/B2 invariants cancel below double precision (R1−R2·φ1 ~ O(q²w0⁶)), B1 went
+        // negative and safeSqrt clamped b1 to −0. A Maclaurin-series branch (w0 < 0.02) now evaluates
+        // B1/B2 stably; above the gate the classic path is arithmetically identical.
+        for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
+            for (double Q : { 0.05, 0.5, 2.0, 8.0, 40.0 })
+                for (double f0 : { 10.0, 10.03325, 15.0, 30.0, 60.0, 120.0, 200.0, 1000.0 })
+                {
+                    const auto c = matched::bandpass (f0, sr, Q);
+                    const std::string at = " (fs=" + std::to_string ((int) sr) + " f0=" + std::to_string (f0) + " Q=" + std::to_string (Q) + ")";
+                    expectNear (c.magnitudeDb (2.0 * kPi * f0 / sr), 0.0, 0.002, "unity at centre" + at);
+                    expectTrue (c.isStable(),                                    "stable"          + at);
+                    expectNear (c.b0 + c.b1 + c.b2, 0.0, 1e-15,                  "exact DC zero"   + at);
+                }
+        // Seam continuity: f0 straddling the w0=0.02 gate at fs=48k (152.789 Hz). The two designs
+        // differ by a genuine 1% fc shift, so compare only FAR from the centre, where that shift
+        // contributes < 0.1 dB — any real branch discontinuity would show up as a gross jump.
+        // (The true same-f0 seam, measured by evaluating both branches at one w0, is ≤ 1.5e-5 dB.)
+        for (double Q : { 0.05, 2.0, 40.0 })
+        {
+            const auto lo = matched::bandpass (152.0, 48000.0, Q);   // series side of the gate
+            const auto hi = matched::bandpass (153.5, 48000.0, Q);   // classic side of the gate
+            for (double f : { 76.0, 305.0, 5000.0 })
+            {
+                const double d = lo.magnitudeDb (2.0 * kPi * f / 48000.0) - hi.magnitudeDb (2.0 * kPi * f / 48000.0);
+                expectTrue (std::fabs (d) < 0.2, "seam continuity at the gate (Q=" + std::to_string (Q) + ")");
+            }
+        }
+    }
+
     group ("stability across a freq / Q / gain grid");
     {
         for (double f0 : { 40.0, 200.0, 1000.0, 8000.0, 18000.0, 21000.0 })
