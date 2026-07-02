@@ -457,6 +457,86 @@ void runEqEngineTests()
         expectNear (sErr, 0.0, 1e-5, "8-section Mid notch: Side axis preserved to float precision");
     }
 
+    // ===== per-type crash / robustness battery — EVERY FilterType, not just Bell/Notch =====
+    struct TypeCase { FilterType type; const char* name; };
+    const TypeCase ALL_TYPES[] = {
+        { FilterType::Bell, "Bell" }, { FilterType::LowShelf, "LowShelf" }, { FilterType::HighShelf, "HighShelf" },
+        { FilterType::HighPass, "HighPass" }, { FilterType::LowPass, "LowPass" }, { FilterType::BandPass, "BandPass" },
+        { FilterType::Notch, "Notch" }, { FilterType::AllPass, "AllPass" }, { FilterType::Tilt, "Tilt" },
+    };
+
+    group ("every FilterType: designBand coeffs finite + every section stable across the param grid");
+    {
+        for (const auto& tc : ALL_TYPES)
+        {
+            long designs = 0, bad = 0;
+            for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
+                for (double f0 = 10.0; f0 <= 0.49 * sr; f0 *= 1.5)
+                    for (double Q : { 0.05, 0.707, 5.0, 40.0 })
+                        for (double g : { -30.0, 0.0, 30.0 })
+                            for (int slope : { 6, 12, 24, 96 })
+                                for (int sw = 0; sw < 2; ++sw)
+                                {
+                                    BandParams p; p.on = true; p.type = tc.type; p.freq = f0; p.Q = Q; p.gainDb = g; p.slope = slope; p.swept = (sw == 1);
+                                    const BandDesign d = designBand (p, sr); ++designs;
+                                    for (int s = 0; s < d.n; ++s)
+                                    {
+                                        const auto& c = d.sec[s];
+                                        const bool fin = std::isfinite (c.b0) && std::isfinite (c.b1) && std::isfinite (c.b2)
+                                                      && std::isfinite (c.a1) && std::isfinite (c.a2);
+                                        if (! fin || ! c.isStable()) ++bad;
+                                    }
+                                }
+            expectTrue (bad == 0, std::string (tc.name) + ": coeffs finite + stable across the grid (" + std::to_string (designs) + " designs)");
+        }
+    }
+
+    group ("every FilterType: adversarial NaN / Inf / degenerate params -> finite output, no NaN");
+    {
+        const double inf = std::numeric_limits<double>::infinity(), qnan = std::nan ("");
+        struct Bad { double f, q, g; };
+        const Bad hostile[] = { { qnan, qnan, qnan }, { inf, inf, inf }, { -inf, -inf, -inf }, { 0.0, 0.0, 0.0 },
+                                { -1000.0, -5.0, -1e9 }, { 1e12, 1e12, 1e12 }, { qnan, 0.0, inf }, { 60000.0, 40.0, 30.0 },
+                                { 1e12, 0.0, 1e9 }, { 1e12, -1.0, 1e9 } };   // -> f≈Nyquist, Q≈min, +30 dB: the resonant-shelf balloon corner
+        for (const auto& tc : ALL_TYPES)
+        {
+            int nanOut = 0, magBad = 0;
+            for (const auto& h : hostile)
+                for (int sw = 0; sw < 2; ++sw)
+                {
+                    EqEngine eng; eng.prepare (fs, 128, 2);
+                    BandParams p; p.on = true; p.type = tc.type; p.freq = h.f; p.Q = h.q; p.gainDb = h.g; p.slope = 96; p.swept = (sw == 1);
+                    eng.setBand (0, p);
+                    const int n = 128; std::vector<float> L ((size_t) n), R ((size_t) n);
+                    for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.95f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
+                                                  R[(size_t) i] = 0.80f * (float) std::sin (2.0 * kPi * 3000.0 * i / fs); }
+                    float* ch[2] = { L.data(), R.data() };
+                    for (int blk = 0; blk < 8; ++blk) eng.process (ch, 2, n);
+                    if (anyNaN (L.data(), n) || anyNaN (R.data(), n)) ++nanOut;
+                    if (! std::isfinite (eng.magnitudeDb (1000.0))) ++magBad;
+                }
+            expectTrue (nanOut == 0, std::string (tc.name) + ": sanitised params -> finite output (no NaN)");
+            expectTrue (magBad == 0, std::string (tc.name) + ": magnitudeDb finite under hostile params");
+        }
+    }
+
+    group ("every FilterType: denormal tail flushes to exact zero (matched + swept)");
+    {
+        for (const auto& tc : ALL_TYPES)
+            for (int sw = 0; sw < 2; ++sw)
+            {
+                EqBand band; band.prepare (fs, 2);
+                BandParams p; p.on = true; p.type = tc.type; p.freq = 1000.0; p.Q = 4.0; p.gainDb = 12.0; p.slope = 96; p.swept = (sw == 1);
+                band.setParams (p);
+                const int n = 64; std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f); L[0] = 1.0f; R[0] = 1.0f;
+                float* ch[2] = { L.data(), R.data() };
+                band.processBlock (ch, 2, n);
+                for (int b = 0; b < 400; ++b) { for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.0f; R[(size_t) i] = 0.0f; } band.processBlock (ch, 2, n); }
+                double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (L[(size_t) i]) + std::fabs (R[(size_t) i]);
+                expectTrue (tail == 0.0, std::string (tc.name) + (sw ? " (swept)" : " (matched)") + ": denormal tail flushed to exact zero");
+            }
+    }
+
     group ("bypass: a bypassed band is transparent");
     {
         EqBand band; band.prepare (fs, 1);
