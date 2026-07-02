@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
 
 //==============================================================================
 // teq::matched — Vicanek matched-filter coefficient design. The matched design fits
@@ -68,16 +69,39 @@ namespace detail
     {
         const double sB0 = safeSqrt (B0), sB1 = safeSqrt (B1);
         const double W   = 0.5 * (sB0 + sB1);
-        // Feasibility clamp. The identity b0+b2 = W (which makes |H(DC)|=√B0 and |H(Nyq)|=√B1 EXACT)
-        // holds only while W²+B2 ≥ 0. Near Nyquist a low-Q, high-gain shelf drives B2 large-negative;
-        // safeSqrt then zeroes W²+B2 but b2 kept the un-clamped B2, breaking the identity and
-        // ballooning the plateau (a +30 dB high shelf read +100 dB at DC → overload/NaN). Clamping B2
-        // to its feasible floor −W² keeps the DC/Nyquist endpoints EXACT and only sacrifices the
-        // (physically unattainable) corner overshoot.
-        const double B2c = (B2 < -W * W) ? -W * W : B2;
-        c.b0 = 0.5 * (W + safeSqrt (W * W + B2c));
+        c.b0 = 0.5 * (W + safeSqrt (W * W + B2));
         c.b1 = 0.5 * (sB0 - sB1);
-        c.b2 = (c.b0 != 0.0) ? -B2c / (4.0 * c.b0) : 0.0;
+        c.b2 = (c.b0 != 0.0) ? -B2 / (4.0 * c.b0) : 0.0;
+    }
+
+    // Feasibility of the 3-point (DC, corner, Nyquist) numerator fit: real min-phase b0,b2 exist iff
+    // W²+B2 ≥ 0 (W = ½(√B0+√B1)). When it fails, the fit is infeasible — forcing it puts the numerator
+    // zeros on/outside the unit circle (a spurious passband notch in a boost; a near-unit-circle pole,
+    // hence a huge peak, in a reciprocal cut). Callers fall back to the non-resonant shelf there.
+    inline bool shelfFitFeasible (double B0, double B1, double B2) noexcept
+    {
+        const double W = 0.5 * (safeSqrt (B0) + safeSqrt (B1));
+        return W * W + B2 > 0.0;
+    }
+
+    // Exact min & max of the quadratic ratio (n2·t²+n1·t+n0)/(d2·t²+d1·t+d0) over t∈[lo,hi] (hi may be
+    // +∞): endpoints + the ≤2 stationary points (roots of (n2d1−n1d2)t²+2(n2d0−n0d2)t+(n1d0−n0d1)=0).
+    // Denominator assumed > 0 on the interval. Used to bound a biquad's |H|² (t=cos w∈[−1,1]) and the
+    // analog resonant-shelf |H|² (t=(f/f0)²∈[0,∞)) in closed form — no frequency sampling.
+    struct RatioBound { double lo, hi; };
+    inline RatioBound ratioExtent (double n2, double n1, double n0, double d2, double d1, double d0,
+                                   double lo, double hi) noexcept
+    {
+        auto val = [&] (double t) noexcept { return (n2 * t * t + n1 * t + n0) / (d2 * t * t + d1 * t + d0); };
+        double mn = 1e300, mx = -1e300;
+        auto upd = [&] (double t) noexcept { if (t >= lo && t <= hi) { const double v = val (t); mn = std::min (mn, v); mx = std::max (mx, v); } };
+        upd (lo);
+        if (std::isfinite (hi)) upd (hi);
+        else if (d2 != 0.0) { const double v = n2 / d2; mn = std::min (mn, v); mx = std::max (mx, v); }   // t→∞
+        const double a = n2 * d1 - n1 * d2, b = 2.0 * (n2 * d0 - n0 * d2), c = n1 * d0 - n0 * d1;
+        if (std::abs (a) < 1e-300) { if (std::abs (b) > 1e-300) upd (-c / b); }
+        else { const double disc = b * b - 4.0 * a * c; if (disc >= 0.0) { const double s = std::sqrt (disc); upd ((-b + s) / (2.0 * a)); upd ((-b - s) / (2.0 * a)); } }
+        return { mn, mx };
     }
 
     // Shared solver for the 2-pole Butterworth shelf (2poleShelvingFits appendix), given the
@@ -428,7 +452,34 @@ namespace matched
         const double denW0 = A0 * phi0 + A1 * phi1 + A2 * phi2;
         const double B2  = (Hc2 * denW0 - B0 * phi0 - B1 * phi1) / phi2;
 
+        // Feasibility guard: near Nyquist a low-Q, high-gain shelf makes the 3-point (DC/corner/Nyquist)
+        // fit infeasible (W²+B2 ≤ 0). Forcing it puts the numerator zeros on/outside the unit circle → a
+        // spurious deep passband notch in a boost, and via the reciprocal-cut path a near-unit-circle
+        // pole → a huge peak. The infeasible corner is always LOW Q (no real resonance to lose), so fall
+        // back to the smooth non-resonant matched Butterworth shelf: exact plateaus, monotone, no zeros
+        // near the unit circle. Feasible designs (incl. every legitimate high-Q resonance) are untouched.
+        if (! detail::shelfFitFeasible (B0, B1, B2))
+            return high ? highShelf (f0, fs, gainLin) : lowShelf (f0, fs, gainLin);
+
         detail::solveNumerator (B0, B1, B2, c);
+
+        // Post-design envelope guard for the FEASIBLE-but-pathological corner. A feasible fit can still
+        // throw a spurious NOTCH into a boost (a +18 dB shelf dipping −23 dB mid-band → its reciprocal
+        // CUT peaks +23 dB) or a spurious PEAK (a +6 dB low shelf reading +15 dB). Bound the realised
+        // |H| by the INTENDED analog resonant-shelf envelope (poles (w0,Q), zeros (w0√A,Q)): a genuine
+        // high-Q resonance — deep zero-driven dip AND high pole peak — stays INSIDE that envelope, while
+        // a spurious excursion escapes it. Both computed in closed form (detail::ratioExtent).
+        const double kq = 1.0 / (Q * Q) - 2.0;                          // analog |H|² = N(y)/D(y), y=(f/f0)²  (A already = gainLin)
+        const auto an = detail::ratioExtent (high ? A * A : 1.0, A * kq, high ? 1.0 : A * A,   // N(y)
+                                             1.0, kq, 1.0, 0.0, std::numeric_limits<double>::infinity());   // D(y), y∈[0,∞)
+        const auto dg = detail::ratioExtent (4.0 * c.b0 * c.b2, 2.0 * c.b1 * (c.b0 + c.b2),    // realised |H|²
+                                             (c.b0 - c.b2) * (c.b0 - c.b2) + c.b1 * c.b1,
+                                             4.0 * c.a2, 2.0 * c.a1 * (1.0 + c.a2),
+                                             (1.0 - c.a2) * (1.0 - c.a2) + c.a1 * c.a1, -1.0, 1.0);          // t=cos w∈[−1,1]
+        const double m2 = 2.0;                                          // (10^(3/20))² ≈ +3 dB in power
+        if (dg.hi > an.hi * m2 || dg.lo < an.lo / m2)                    // escapes the analog envelope by > 3 dB
+            return high ? highShelf (f0, fs, gainLin) : lowShelf (f0, fs, gainLin);
+
         return c;
     }
 

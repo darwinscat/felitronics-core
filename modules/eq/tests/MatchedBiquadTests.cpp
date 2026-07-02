@@ -399,23 +399,39 @@ void runMatchedBiquadTests()
                 }
     }
 
-    group ("resonant shelf: plateaus stay EXACT near Nyquist at low Q + high gain (numerator feasibility clamp)");
+    group ("resonant shelf: near-Nyquist low-Q high-gain stays SMOOTH — no spurious notch/peak (feasibility fallback)");
     {
-        // Regression for the numerator-feasibility bug: near Nyquist a low-Q, high-gain shelf drove the
-        // single-biquad 3-point fit infeasible (W²+B2<0); the plateau then ballooned (a +30 dB high
-        // shelf read +100 dB at DC → overload/NaN). The DC/Nyquist endpoints must be exact at any Q.
-        for (double f0 : { 0.30 * fs, 0.40 * fs, 0.45 * fs, 0.49 * fs })
-            for (double gDb : { 6.0, 15.0, 30.0 })
-                for (double Q : { 0.05, 0.2, 0.5, 0.707 })
+        // Regression for the ill-conditioned 3-point fit. Near Nyquist a low-Q, high-gain shelf makes the
+        // fit infeasible (W²+B2≤0): forcing it drives the numerator zeros onto the unit circle → a
+        // spurious DEEP passband NOTCH in a boost (−40..−72 dB), and via the reciprocal cut a huge PEAK
+        // (+35..+53 dB). The design now falls back to the smooth non-resonant matched shelf there. The
+        // exact-plateau endpoints are traded for smoothness: the ACTIVE plateau may gently UNDER-reach
+        // near Nyquist, but there must be NO notch/peak and no overshoot beyond the gain.
+        auto minDb = [] (const BiquadCoeffs& c, double sr) { double m = 1e9;
+            for (double f = 20.0; f < 0.5 * sr; f *= 1.03) m = std::min (m, c.magnitudeDb (2.0 * kPi * f / sr)); return m; };
+        auto maxDb = [] (const BiquadCoeffs& c, double sr) { double m = -1e9;
+            for (double f = 20.0; f < 0.5 * sr; f *= 1.03) m = std::max (m, c.magnitudeDb (2.0 * kPi * f / sr)); return m; };
+        for (double f0 : { 2000.0, 4000.0, 6078.0, 0.30 * fs, 0.40 * fs, 0.45 * fs, 0.49 * fs })   // mid-band (incl. the
+            for (double gDb : { 6.0, 15.0, 18.69, 30.0 })                  // feasible-notch corner) AND near-Nyquist
+                for (double Q : { 0.05, 0.1676, 0.2, 0.5, 0.707 })         // low Q: no legitimate resonance
                 {
-                    const auto hs = matched::highShelfQDb (f0, fs, gDb, Q);
-                    const auto ls = matched::lowShelfQDb  (f0, fs, gDb, Q);
+                    // all four low-Q shelf variants must stay within their plateau band [min(0,g),max(0,g)]
+                    // up to a mild near-band-edge residual — no SEVERE spurious notch/peak (the reported
+                    // −40..−72 dB notches / +15..+53 dB peaks). (Mild ~2 dB near-edge deviation is the
+                    // matched-vs-analog trade at the very band edge and is allowed.)
+                    struct Var { BiquadCoeffs c; double g; const char* nm; };
+                    const Var vs[] = { { matched::highShelfQDb (f0, fs,  gDb, Q),  gDb, "hi-boost" },
+                                       { matched::highShelfQDb (f0, fs, -gDb, Q), -gDb, "hi-cut"   },
+                                       { matched::lowShelfQDb  (f0, fs,  gDb, Q),  gDb, "lo-boost" },
+                                       { matched::lowShelfQDb  (f0, fs, -gDb, Q), -gDb, "lo-cut"   } };
                     const std::string at = " (f0=" + std::to_string ((int) f0) + " g=" + std::to_string ((int) gDb) + " Q=" + std::to_string (Q) + ")";
-                    expectTrue (hs.isStable() && ls.isStable(),    "shelves stable near Nyquist"     + at);
-                    expectNear (hs.magnitudeDb (0.0), 0.0, 0.1,    "high shelf DC plateau == 0 dB"    + at);
-                    expectNear (hs.magnitudeDb (kPi), gDb, 0.1,    "high shelf Nyquist plateau == g"  + at);
-                    expectNear (ls.magnitudeDb (kPi), 0.0, 0.1,    "low shelf Nyquist plateau == 0 dB"+ at);
-                    expectNear (ls.magnitudeDb (0.0), gDb, 0.1,    "low shelf DC plateau == gain"     + at);
+                    for (const auto& v : vs)
+                    {
+                        expectTrue (v.c.isStable(), std::string ("stable ") + v.nm + at);
+                        expectTrue (minDb (v.c, fs) > std::min (0.0, v.g) - 3.5, std::string ("no spurious notch ") + v.nm + at);
+                        expectTrue (maxDb (v.c, fs) < std::max (0.0, v.g) + 3.5, std::string ("no spurious peak ")  + v.nm + at);
+                    }
+                    expectNear (vs[0].c.magnitudeDb (0.0), 0.0, 0.1, "high-shelf boost DC plateau == 0 dB" + at);   // DC endpoint stays exact
                 }
     }
 
