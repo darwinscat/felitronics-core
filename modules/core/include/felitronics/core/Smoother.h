@@ -37,7 +37,11 @@ public:
 
     inline double advance (int n) noexcept
     {
-        if (n > 0) current = target + std::pow (coeff, (double) n) * (current - target);
+        // Settled early-out: a snapped/converged smoother (current == target) skips the pow — so an
+        // idle parameter costs one compare per block, not a transcendental (the eq lanes' cost-zero
+        // contract rides on this).
+        if (n > 0 && std::fabs (current - target) > 0.0)
+            current = target + std::pow (coeff, (double) n) * (current - target);
         return current;
     }
 

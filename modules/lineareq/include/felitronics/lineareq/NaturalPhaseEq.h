@@ -90,7 +90,9 @@ public:
         if (! prepared_) return false;                         // unprepared — FIR buffers + MixedPhaseFir are empty
         // TODO(PR-B, LANES.md §FIR): L/R lanes need the matrix engine; ignored here — this 2-IR M/S
         // path samples only the Mid/Side axis composites (each folds in the ST lanes: ∏ H_ST·H_M etc.).
-        buildFir (bands, numBands, eq::Axis::Mid,  firMid_.data());
+        // MONO (channels_ == 1): bank 0 is the ST-ONLY composite — the v2 engine runs nothing but the
+        // ST lane on a non-stereo bus, and the FIR must match the IIR (LANES.md §FIR, mono).
+        buildFir (bands, numBands, channels_ == 1 ? eq::Axis::Stereo : eq::Axis::Mid, firMid_.data());
         buildFir (bands, numBands, eq::Axis::Side, firSide_.data());
         const float* irs[2] { firMid_.data(), firSide_.data() };
         return conv_.setIr (irs, 2, L_);

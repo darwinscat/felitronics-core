@@ -106,6 +106,19 @@ int main()
         test::okNoAlloc (after == before, "process() performed zero heap allocations (stereo + mono)");
         bool finite = true; for (float v : lch) finite = finite && std::isfinite (v);
         test::ok (finite, "output finite");
+
+        // v2 lanes rule: a mono-prepared instance builds bank 0 from the ST-ONLY composite, so a
+        // {m}-only point is TRANSPARENT on mono — matching the IIR engine's non-stereo behaviour.
+        NPE t; t.prepare (sr, 512, 1, Q, 0.5f);
+        eq::BandParams mb[1]; mb[0].on = true; mb[0].type = eq::FilterType::Bell; mb[0].lane (eq::Lane::Stereo).on = false;
+        mb[0].lane (eq::Lane::Mid).on = true; mb[0].lane (eq::Lane::Mid).freq = 1000.0; mb[0].lane (eq::Lane::Mid).Q = 2.0; mb[0].lane (eq::Lane::Mid).gainDb = 12.0;
+        t.setBands (mb, 1);
+        const int M = 16000; std::vector<float> y ((std::size_t) M);
+        for (int i = 0; i < M; ++i) y[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+        for (int o = 0; o < M; o += 512) { float* io1[1] { y.data() + o }; t.process (io1, 1, std::min (512, M - o)); }
+        double inSq = 0, outSq = 0;
+        for (int i = M - 4000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += s * s; outSq += (double) y[(std::size_t) i] * y[(std::size_t) i]; }
+        test::approx (10.0 * std::log10 (outSq / inSq), 0.0, 0.3, "mono {m}-only point is transparent (ST-only bank 0, matches the IIR engine)");
     }
 
     // --- (6) STEEP filter accuracy: the kept L taps must still track a steep HP's magnitude

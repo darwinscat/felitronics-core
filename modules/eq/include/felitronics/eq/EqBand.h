@@ -117,33 +117,47 @@ inline std::complex<double> bandResponse (const BandParams& p, double fs, double
     return h;
 }
 
+// The point is "unsplit" (single-ST) when no other lane is ENABLED — the only configuration in which
+// the swept search band bites (the search→treat workflow operates on unsplit points). Shared by the
+// runtime (EqBand::sweptActive) and the stateless analytics (laneView), so the displayed/FIR'd curve
+// and the audio can never disagree about the swept gating.
+inline bool onlyStereoEnabled (const BandParams& p) noexcept
+{
+    return ! (p.lane (Lane::Left).on || p.lane (Lane::Right).on
+           || p.lane (Lane::Mid).on  || p.lane (Lane::Side).on);
+}
+
 // A single-lane view of a band: `which`'s design fields folded into the primary design slot
 // (lanes[Stereo]), so the same designBand()/bandResponse() machinery evaluates that lane. `on` folds
 // the point's on with the lane's on; `bypass` folds the point's whole-point bypass with the lane's.
-// Only the Stereo lane carries `swept` (the search band operates on unsplit points). Generalises the
+// `swept` survives only for the ST lane of an UNSPLIT point — the same gate the runtime applies — so
+// a split point's ST lane evaluates as the matched cascade the engine actually runs. Generalises the
 // old sideView: laneView(p, Lane::Side) is the former Side view.
 inline BandParams laneView (const BandParams& p, Lane which) noexcept
 {
     const LaneParams src = p.lane (which);
     BandParams v = p;
     v.lane (Lane::Stereo) = src;                            // design fields come from `which`
-    v.swept  = (which == Lane::Stereo) ? p.swept : false;   // only the ST lane sweeps
+    v.swept  = (which == Lane::Stereo) && p.swept && onlyStereoEnabled (p);
     v.on     = p.on && src.on;                              // fold the point's + lane's enable
     v.bypass = p.bypass || src.bypass;                      // point bypass OR lane bypass mutes it
     return v;
 }
 
 // A stereo display / analysis axis (decision #7 display math; matrixResponse is the exact version).
-enum class Axis { Left, Right, Mid, Side };
+// Axis::Stereo is the ST-lanes-only composite — what a non-stereo bus actually runs (the FIR path's
+// mono IR is built from it); the four domain axes each fold the ST lanes in.
+enum class Axis { Stereo, Left, Right, Mid, Side };
 
 inline constexpr Lane axisLane (Axis a) noexcept
 {
     switch (a)
     {
-        case Axis::Left:  return Lane::Left;
-        case Axis::Right: return Lane::Right;
-        case Axis::Mid:   return Lane::Mid;
-        case Axis::Side:  return Lane::Side;
+        case Axis::Stereo: return Lane::Stereo;
+        case Axis::Left:   return Lane::Left;
+        case Axis::Right:  return Lane::Right;
+        case Axis::Mid:    return Lane::Mid;
+        case Axis::Side:   return Lane::Side;
     }
     return Lane::Mid;
 }
@@ -162,7 +176,8 @@ inline std::complex<double> compositeResponse (const BandParams* bands, int numB
     for (int i = 0; i < numBands; ++i)
     {
         h *= bandResponse (laneView (bands[i], Lane::Stereo), fs, w);   // ST folds into every axis
-        h *= bandResponse (laneView (bands[i], axl),          fs, w);   // the axis's own-domain lane
+        if (a != Axis::Stereo)
+            h *= bandResponse (laneView (bands[i], axl), fs, w);        // the axis's own-domain lane
     }
     return h;
 }
@@ -412,8 +427,11 @@ public:
         if (! p.on || p.bypass) return { 1.0, 0.0 };
         std::complex<double> h { 1.0, 0.0 };
         for (int s = 0; s < designNST_; ++s) h *= evalCoeffs (coeffsST_[s], w);       // ST folds into every axis
-        const LaneRt& rt = laneRt_[(std::size_t) axisLane (a)];
-        for (int s = 0; s < rt.designN; ++s) h *= evalCoeffs (rt.coeffs[s], w);       // the axis's own-domain lane
+        if (a != Axis::Stereo)
+        {
+            const LaneRt& rt = laneRt_[(std::size_t) axisLane (a)];                    // laneRt_[Stereo] would be
+            for (int s = 0; s < rt.designN; ++s) h *= evalCoeffs (rt.coeffs[s], w);    // empty anyway — explicit > implicit
+        }
         return h;
     }
 
@@ -453,13 +471,9 @@ private:
         return ! (rt.freqS.settled() && rt.qS.settled() && rt.gainS.settled());
     }
 
-    // The point is "unsplit" (single-ST) when no other lane is enabled — the only configuration in
-    // which the swept SVF bites (the search→treat workflow operates on unsplit points).
-    bool onlyStereo() const noexcept
-    {
-        return ! (p.lane (Lane::Left).on || p.lane (Lane::Right).on
-               || p.lane (Lane::Mid).on  || p.lane (Lane::Side).on);
-    }
+    // Unsplit (single-ST) check — delegates to the free onlyStereoEnabled() so the runtime gate and
+    // the stateless analytics (laneView) can never disagree about swept.
+    bool onlyStereo() const noexcept { return onlyStereoEnabled (p); }
 
     // The swept (SVF) engine only runs for types the single SVF stage can realise, AND only in the
     // single-ST configuration. Tilt has no one-SVF realisation with a unity pivot beyond ~6 dB, so a
@@ -521,7 +535,9 @@ private:
                 d = designBand (sp, fs);   // sp.type is the point's shared field
             }
             // Topology switch (section count, swept<->static, activation, OR the shared type) → clear
-            // the ST columns so a re-activated section never resumes a stale tail.
+            // the ST columns so a re-activated section never resumes a stale tail. (A toggle set AND
+            // unset between two process blocks intentionally does NOT reset: no block ran in the
+            // interim, so the state is one continuous stream — resetting would be the artifact.)
             if (d.n != designNST_ || sw != lastSwept_ || active != stActive_ || typeChanged) resetST();
             designNST_ = d.n;
             lastSwept_ = sw;

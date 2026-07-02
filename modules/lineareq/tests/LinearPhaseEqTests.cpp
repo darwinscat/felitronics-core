@@ -142,6 +142,17 @@ int main()
         for (int o = 0; o < M; o += 512) { float* io[1] { x.data() + o }; e.process (io, 1, std::min (512, M - o)); }
         double inSq = 0, outSq = 0; for (int i = M - 4000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += s * s; outSq += (double) x[(std::size_t) i] * x[(std::size_t) i]; }
         test::approx (10.0 * std::log10 (outSq / inSq), 6.0, 0.8, "mono 1 kHz tone +6 dB through the Mid IR (no crash)");
+
+        // v2 lanes rule: a non-stereo bus runs the ST lane ONLY — a {m}-only point must be TRANSPARENT
+        // on mono (the IIR engine is; bank 0 is built from the ST-only composite so the FIR matches it).
+        LPE t; t.prepare (sr, 512, 1, Q);
+        eq::BandParams mb[1]; mb[0].on = true; mb[0].type = eq::FilterType::Bell; mb[0].lane (eq::Lane::Stereo).on = false;
+        mb[0].lane (eq::Lane::Mid).on = true; mb[0].lane (eq::Lane::Mid).freq = 1000.0; mb[0].lane (eq::Lane::Mid).Q = 2.0; mb[0].lane (eq::Lane::Mid).gainDb = 12.0;
+        t.setBands (mb, 1);
+        std::vector<float> y (M); for (int i = 0; i < M; ++i) y[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+        for (int o = 0; o < M; o += 512) { float* io[1] { y.data() + o }; t.process (io, 1, std::min (512, M - o)); }
+        double inSq2 = 0, outSq2 = 0; for (int i = M - 4000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq2 += s * s; outSq2 += (double) y[(std::size_t) i] * y[(std::size_t) i]; }
+        test::approx (10.0 * std::log10 (outSq2 / inSq2), 0.0, 0.3, "mono {m}-only point is transparent (ST-only bank 0, matches the IIR engine)");
     }
 
     // --- (8) an IR swap mid-stream is click-free AND response-correct after it settles (crossfade=N) ---

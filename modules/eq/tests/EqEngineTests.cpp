@@ -1138,6 +1138,24 @@ void runEqEngineTests()
             const double r250 = 20.0 * std::log10 (std::abs (b.response (2.0 * kPi * 250.0 / fs, Axis::Mid)));
             const double r500 = 20.0 * std::log10 (std::abs (b.response (2.0 * kPi * 500.0 / fs, Axis::Mid)));
             expectTrue ((r500 - r250) > 18.0, "split swept HP24: ST uses the matched 24 dB/oct cascade (swept gated off)");
+
+            // The STATELESS analytics must agree — laneView gates swept on the unsplit config too, so
+            // the GUI curve / FIR grids (compositeResponse) and the matrix show the same matched
+            // cascade the engine runs, not the single swept stage.
+            const double a250 = EqEngine::magnitudeDbFor (&p, 1, 250.0, fs, Axis::Mid);
+            const double a500 = EqEngine::magnitudeDbFor (&p, 1, 500.0, fs, Axis::Mid);
+            expectTrue ((a500 - a250) > 18.0, "split swept HP24: analytics run the same matched cascade (laneView swept gate)");
+        }
+
+        // (d2) Axis::Stereo == the ST-lanes-only composite (what a non-stereo bus runs; the FIR mono
+        //      bank is built from it): with ST bell +6 and Mid bell +12 at f0, Stereo axis reads the
+        //      ST lane alone and Mid axis reads their product.
+        {
+            BandParams p; p.on = true; p.type = FilterType::Bell;
+            p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 1.0; p.lane (Lane::Stereo).gainDb = 6.0;
+            p.lane (Lane::Mid).on = true; p.lane (Lane::Mid).freq = 1000.0; p.lane (Lane::Mid).Q = 1.0; p.lane (Lane::Mid).gainDb = 12.0;
+            expectNear (EqEngine::magnitudeDbFor (&p, 1, 1000.0, fs, Axis::Stereo),  6.0, 0.01, "Axis::Stereo = ST lane only");
+            expectNear (EqEngine::magnitudeDbFor (&p, 1, 1000.0, fs, Axis::Mid),    18.0, 0.01, "Axis::Mid = ST x Mid product");
         }
 
         // (e) COST-ZERO disabled-lane writes: churning a DISABLED lane's params every block leaves the
