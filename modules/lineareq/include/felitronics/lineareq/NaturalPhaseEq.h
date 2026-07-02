@@ -116,7 +116,10 @@ public:
         }
     }
 
-    // RT-safe (audio thread), in place. Stereo (≥2 ch) → M/S; mono → the Mid IR. `n` ≤ maxBlock.
+    // RT-safe (audio thread), in place. Stereo (≥2 ch) → M/S; mono → bank 0. `n` ≤ maxBlock.
+    // CONTRACT: the call's channel topology must match prepare() — bank 0 is built for the PREPARED
+    // count (mono → ST-only composite, stereo → Mid axis); feeding a mono buffer to a stereo-prepared
+    // instance convolves the Mid bank (host misuse — re-prepare on a bus change, as the adapter does).
     void process (float* const* io, int numChannels, int n) noexcept
     {
         if (n <= 0) return;
