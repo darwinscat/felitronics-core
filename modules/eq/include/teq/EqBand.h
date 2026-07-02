@@ -19,4 +19,10 @@ namespace teq
     using felitronics::eq::designBand;
     using felitronics::eq::evalCoeffs;
     using felitronics::eq::bandResponse;
+    using felitronics::eq::laneView;
+    using felitronics::eq::Axis;
+    using felitronics::eq::axisLane;
+    using felitronics::eq::compositeResponse;
+    using felitronics::eq::ResponseMatrix;
+    using felitronics::eq::matrixResponse;
 }

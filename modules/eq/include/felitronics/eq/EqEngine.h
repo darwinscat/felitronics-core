@@ -72,14 +72,15 @@ public:
         if (spec) for (int n = 0; n < numSamples; ++n) outTap.push (channels[0][n]);
     }
 
-    // Total magnitude (dB) of all active bands at a real frequency — best-effort LIVE readout
-    // (reads the bands' current coefficients; may briefly race a concurrent param change on the
-    // audio thread). For a guaranteed race-free GUI curve use the static magnitudeDbFor() below.
-    double magnitudeDb (double freqHz) const noexcept
+    // Total magnitude (dB) of all active bands on one stereo axis at a real frequency — best-effort
+    // LIVE readout (reads the bands' current coefficients; may briefly race a concurrent param change
+    // on the audio thread). Defaults to the Mid axis (== the L=R response when no band is split). For a
+    // guaranteed race-free GUI curve use the static magnitudeDbFor() below.
+    double magnitudeDb (double freqHz, Axis a = Axis::Mid) const noexcept
     {
         const double w = 2.0 * kPi * freqHz / fs;
         std::complex<double> h { 1.0, 0.0 };
-        for (auto& b : bands) h *= b.response (w);
+        for (auto& b : bands) h *= b.response (w, a);
         return 20.0 * std::log10 (std::max (1e-9, std::abs (h)));
     }
 
@@ -90,30 +91,30 @@ public:
 
     // Race-free GUI curve: total magnitude (dB) from a caller-owned BandParams array (touches no
     // engine state). Pass the same params you fed setBand(), plus sampleRate(). The plain overload is
-    // the Mid axis (== the L=R response when no band is M/S); pass `side` to pick a stereo axis.
+    // the Mid axis (== the L=R response when no band is split); pass an Axis to pick another.
     static double magnitudeDbFor (const BandParams* bandsIn, int numBands, double freqHz, double fs) noexcept
     {
-        return magnitudeDbFor (bandsIn, numBands, freqHz, fs, false);
+        return magnitudeDbFor (bandsIn, numBands, freqHz, fs, Axis::Mid);
     }
 
-    static double magnitudeDbFor (const BandParams* bandsIn, int numBands, double freqHz, double fs, bool side) noexcept
+    static double magnitudeDbFor (const BandParams* bandsIn, int numBands, double freqHz, double fs, Axis a) noexcept
     {
         const double w = 2.0 * kPi * freqHz / fs;
-        return 20.0 * std::log10 (std::max (1e-9, std::abs (compositeResponse (bandsIn, numBands, fs, w, side))));
+        return 20.0 * std::log10 (std::max (1e-9, std::abs (compositeResponse (bandsIn, numBands, fs, w, a))));
     }
 
     // Fill out[0..n-1] with the LINEAR-magnitude composite on a uniform grid f[k] = k·fs/(2·(n-1)) —
     // i.e. k=0 at DC … k=n-1 at Nyquist (so for an FFT of size N pass n = N/2 + 1). Chosen stereo axis,
     // race-free. A host builds a linear-phase FIR from this (zero-phase magnitude → IFFT → window).
     static void magnitudeGridFor (const BandParams* bandsIn, int numBands, double fs,
-                                  float* out, int n, bool side) noexcept
+                                  float* out, int n, Axis a) noexcept
     {
         const double nyq = 0.5 * fs;
         for (int k = 0; k < n; ++k)
         {
             const double f = (n > 1) ? nyq * (double) k / (double) (n - 1) : 0.0;
             const double w = 2.0 * kPi * f / fs;
-            out[k] = (float) std::abs (compositeResponse (bandsIn, numBands, fs, w, side));
+            out[k] = (float) std::abs (compositeResponse (bandsIn, numBands, fs, w, a));
         }
     }
 
