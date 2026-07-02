@@ -49,3 +49,23 @@ jobs:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-san --output-on-failure
+
+  # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
+  # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.
+  # Fails only on crash / unstable-or-non-finite designs (black cells); colour judgement stays human.
+  eqviz:
+    name: eqviz-quality-pictures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
+      - name: Build eqviz
+        run: cmake --build build -j --target eqviz
+      - name: Render quality maps
+        run: mkdir -p eqviz-out && ./build/tools/eqviz eqviz-out --fs 44100,48000,96000,192000
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eqviz-quality-pictures
+          path: eqviz-out/
+          if-no-files-found: error
