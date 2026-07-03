@@ -43,11 +43,11 @@ public:
         if (maxAlignSamples < 0) maxAlignSamples = 0;
 
         splitter_.prepare (sampleRate, channels_);
-        bandBuf_.assign ((std::size_t) MaxBands * channels_ * maxBlock_, 0.0f);
-        dryBuf_.assign  ((std::size_t) channels_ * maxBlock_, 0.0f);
+        bandBuf_.assign ((std::size_t) MaxBands * (std::size_t) channels_ * (std::size_t) maxBlock_, 0.0f);
+        dryBuf_.assign  ((std::size_t) channels_ * (std::size_t) maxBlock_, 0.0f);
         for (int b = 0; b < MaxBands; ++b) { bandPtrs_[(std::size_t) b].assign ((std::size_t) channels_, nullptr); prepareBand (proc_[(std::size_t) b]); }
 
-        align_.assign ((std::size_t) MaxBands * channels_, core::DelayLine {});
+        align_.assign ((std::size_t) MaxBands * (std::size_t) channels_, core::DelayLine {});
         for (auto& d : align_) d.prepare (maxAlignSamples);
         dryDelay_.assign ((std::size_t) channels_, core::DelayLine {});
         for (auto& d : dryDelay_) d.prepare (maxAlignSamples);
@@ -150,8 +150,8 @@ private:
         for (auto& d : dryDelay_) d.setDelay (latency_);
     }
 
-    float* bandData (int b, int c) noexcept { return bandBuf_.data() + ((std::size_t) b * channels_ + (std::size_t) c) * maxBlock_; }
-    float* dryData  (int c)        noexcept { return dryBuf_.data()  + (std::size_t) c * maxBlock_; }
+    float* bandData (int b, int c) noexcept { return bandBuf_.data() + ((std::size_t) b * (std::size_t) channels_ + (std::size_t) c) * (std::size_t) maxBlock_; }
+    float* dryData  (int c)        noexcept { return dryBuf_.data()  + (std::size_t) c * (std::size_t) maxBlock_; }
 
     double fs_ = 48000.0;
     int maxBlock_ = 0, channels_ = 0, latency_ = 0;

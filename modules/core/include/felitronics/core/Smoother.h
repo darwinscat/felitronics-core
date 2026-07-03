@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <felitronics/core/Math.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -80,7 +82,7 @@ public:
     // zipper the original never had. A raw `==` would restart a full ramp on a difference JUCE treats as equal.
     static bool approxEqual (float a, float b) noexcept
     {
-        if (! (std::isfinite (a) && std::isfinite (b))) return a == b;
+        if (! (std::isfinite (a) && std::isfinite (b))) return exactlyEqual (a, b);   // intentional exact == (see Math.h)
         const float diff = std::fabs (a - b);
         return diff <= std::numeric_limits<float>::min()
             || diff <= std::numeric_limits<float>::epsilon() * std::max (std::fabs (a), std::fabs (b));

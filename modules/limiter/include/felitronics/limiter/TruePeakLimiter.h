@@ -89,7 +89,7 @@ public:
         F     = params.oversampleFactor < 2 ? 2 : params.oversampleFactor;
         if (! os.prepare (F, maxCh, tpp)) return;              // oversampler rejected (e.g. tapsPerPhase<4) → stay unprepared
 
-        osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock * F, 0.0f));
+        osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock * (std::size_t) F, 0.0f));
         osPtrs.assign ((std::size_t) maxCh, nullptr);
 
         const int maxLookOS = (int) std::ceil (kMaxLookaheadMs * 0.001 * fs) * F;

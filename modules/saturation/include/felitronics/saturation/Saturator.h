@@ -151,10 +151,11 @@ private:
         const float dcHz     = finite (params_.dcBlockHz, 10.0f);
         shaper_.setShape (params_.shape);
         shaper_.setBias  (bias);
-        shaper_.setDrive (core::dbToGain (driveDb) - 1.0f);             // driveDb 0 → k≈0 (linear)
-        comp_    = std::pow (std::max (1.0e-6f, shaper_.slopeAtZero()), -std::clamp (autoComp, 0.0f, 1.0f));
+        shaper_.setDrive ((float) (core::dbToGain (driveDb) - 1.0));    // driveDb 0 → k≈0 (linear)
+        comp_    = (float) std::pow ((double) std::max (1.0e-6f, shaper_.slopeAtZero()),
+                                     (double) -std::clamp (autoComp, 0.0f, 1.0f));
         mix_     = std::clamp (finite (params_.mix, 1.0f), 0.0f, 1.0f);
-        outGain_ = core::dbToGain (finite (params_.outputDb, 0.0f));
+        outGain_ = (float) core::dbToGain (finite (params_.outputDb, 0.0f));
         const double fsOs = fs_ * (double) os_;
         const double fc   = std::clamp ((double) dcHz, 0.0, 0.49 * fsOs);
         dcR_ = (fc <= 0.0) ? 0.0f : (float) std::exp (-2.0 * core::kPi * fc / fsOs);
