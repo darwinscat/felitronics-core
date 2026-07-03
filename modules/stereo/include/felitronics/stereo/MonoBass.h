@@ -4,88 +4,145 @@
 #pragma once
 
 #include <felitronics/stereo/MidSide.h>
-#include <felitronics/eq/Svf.h>
+#include <felitronics/eq/Crossover2.h>
+#include <felitronics/core/Smoother.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace felitronics::stereo
 {
 
 //==============================================================================
 // felitronics::stereo::MonoBass — "elliptical EQ" / bass mono-maker: collapse the low end to mono below a
-// cutoff (vinyl/LP lacquer cutting — out-of-phase lows cause vertical stylus excursion — and general
+// crossover (vinyl/LP lacquer cutting — out-of-phase lows cause vertical stylus excursion — and general
 // mastering tightening). Zero added latency, minimum-phase.
 //
-// Design — verified by math + the self-tests. An allpass-subtraction variant was checked and REJECTED:
-// AP4−LP4 has magnitude 1.5 at the cutoff, i.e. it boosts, not rejects.
-// Operate ONLY on the Side of a Mid/Side split, so the Mid (the mono content you keep) passes UNFILTERED —
-// no transient smear on the kept bass; only the low-frequency Side (stereo) energy is removed. A full L/R
-// crossover would needlessly filter the mono bass too.
+// TOPOLOGY (verified by math + the self-tests). Operate ONLY on the Side of a Mid/Side split, so the Mid
+// (the mono content you keep) passes UNFILTERED — no transient smear on the kept bass; only the
+// low-frequency Side (stereo) energy is removed. A full L/R crossover would needlessly filter the mono
+// bass too. The side rolls off at 24 dB/oct below fc (−6 dB at fc), so deep below fc the output tends to
+// L == R by construction — the tool can only IMPROVE mono compatibility, never harm it.
 //
 //   M = ½(L+R),  S = ½(L-R)
-//   S' = lowWidth·LP4(S) + HP4(S)
+//   S_wet = lowWidth·LP4(S) + HP4(S)      // LP4/HP4 = eq::Crossover2, a 4th-order Linkwitz-Riley split
+//   S'    = xf·S + (1-xf)·S_wet           // xf = the full-wide bypass crossfade (see PARAMS below)
 //   L' = M + S',  R' = M − S'
 //
-// LP4/HP4 are 4th-order Linkwitz-Riley (two cascaded Butterworth Q=1/√2 sections each). The LR4 identity
-// LP4 + HP4 = allpass (proven flat: |LP4+HP4| = (1+ω⁴)/(1+ω⁴) = 1) makes the `lowWidth` taper exact:
-// lowWidth=0 → S'=HP4(S) (mono below fc); lowWidth=1 → S'=allpass(S) (side magnitude preserved → we bypass
-// entirely there for bit-transparency). Above fc, HP4≈1 so the full stereo image is intact.
+// WHY LINKWITZ-RILEY, fixed at LR4 / 24 dB/oct — consilium-settled; don't re-litigate without new math:
+//  * The LR4 identity LP4+HP4 = allpass — (1+s⁴)/(s²+√2s+1)², |·| = (1+ω⁴)/(1+ω⁴) = 1, the branches
+//    exactly IN-PHASE — is what makes the `lowWidth` taper bump-free: the blended side magnitude is
+//    (lowWidth + r⁴)/(1 + r⁴) with r = tan(πf/fs)/tan(πfc/fs) (the BLT warp the TPT SVF realises exactly).
+//  * matched::highpass/lowpass (the Nyquist-matched EQ filters) were REJECTED: they are magnitude fits,
+//    not a complementary pair — their sum is not that allpass, so the blend would ripple; and Nyquist
+//    accuracy buys nothing at a ~120 Hz crossover.
+//  * An allpass-subtraction variant was REJECTED: AP4−LP4 has magnitude 1.5 at fc (a boost, not a reject).
+//  * A crossfade blend w·S + (1−w)·HP4(S) was REJECTED: S and HP4(S) are anti-phase at fc (HP4(jω₀) = −½),
+//    so that blend NULLS the side at fc when w = ⅓.
+//  * LR2 / 12 dB/oct was REJECTED: LP2+HP2 = (1+s²)/(s+1)² has a NULL at fc — its flat sum needs a
+//    polarity flip (LP−HP), which breaks S' = w·LP + HP. LR8 / 48 dB/oct would be admissible (the in-phase
+//    allpass sum holds) but is YAGNI until a product asks for it.
 //
-// RT-safe: no alloc/lock/throw in process(); four SVF instances hold the only state (the Side is one channel).
+// PARAMS. `lowWidth` ∈ [0,1] — 0 = fully mono below fc (default), 1 = full stereo — is LINEAR-smoothed
+// (~20 ms) so live automation doesn't click. Full-wide is special: the wet path at lowWidth=1 is the LR4
+// allpass — magnitude-flat but phase-rotated (−1 at fc) — so a hard switch to raw bypass there would
+// click. Instead lowWidth=1 also ramps the dry/wet crossfade `xf`→1 (same 20 ms), and only once xf has
+// SETTLED at 1.0 does process() take the bit-exact early-return bypass. Entering ANY bypass (settled
+// full-wide / disabled / non-stereo) resets the crossover state, so re-entry never replays stale tails —
+// it restarts the filters from zero, a bounded click-free settle (tested). `setEnabled` stays a hard
+// toggle (host-level bypasses ramp; sibling StereoWidth parity). Setters reject non-finite values and
+// clamp (a stray host NaN can't poison the SVF state — std::clamp would pass it through). reset() snaps
+// the smoothers to their targets (snap-on-load: no ramp on session recall). `frequency()` reads back the
+// clamped value ([20, 0.45·fs], re-clamped if prepare() lowers fs).
+//
+// STRICTLY STEREO: process() touches the buffer ONLY when numChannels == 2 — a mono or surround bus
+// passes through whole (treating a stereo pair inside a wider layout is a routing decision the host
+// owns, not this class). RT-safe: no alloc/lock/throw in process(); state = one eq::Crossover2 (the Side
+// is one channel) + two LinearSmoothers.
 class MonoBass
 {
 public:
+    static constexpr double kSmoothingMs = 20.0;    // click-free lowWidth automation + the bypass crossfade
+    static constexpr float  kMinFreq     = 20.0f;
+
     void prepare (double sampleRate, int /*maxBlock*/ = 0, int /*maxChannels*/ = 2) noexcept
     {
-        fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
-        lp1_.prepare (fs_, 1); lp2_.prepare (fs_, 1);
-        hp1_.prepare (fs_, 1); hp2_.prepare (fs_, 1);
-        applyFilters();
+        fs_ = (std::isfinite (sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;   // inf/NaN/≤0 -> 48 kHz
+        xo_.prepare (fs_, 1);
+        widthSm_.reset (fs_, kSmoothingMs * 0.001);
+        xfSm_.reset (fs_, kSmoothingMs * 0.001);
+        applyFrequency();
         reset();
     }
 
-    void reset() noexcept { lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset(); }
+    void reset() noexcept                           // snap smoothers to targets (settled, no glide) + clear filter state
+    {
+        widthSm_.setCurrentAndTargetValue (lowWidth_);
+        xfSm_.setCurrentAndTargetValue (lowWidth_ >= 1.0f ? 1.0f : 0.0f);
+        xo_.reset();
+        bypassed_ = false;
+    }
 
     void setEnabled (bool e) noexcept { enabled_ = e; }
-    void setFrequency (float hz) noexcept { freq_ = std::clamp (hz, 20.0f, (float) (0.45 * fs_)); applyFilters(); }
-    void setLowWidth (float w) noexcept { lowWidth_ = std::clamp (w, 0.0f, 1.0f); }   // 0 = mono below fc, 1 = full stereo
+
+    void setFrequency (float hz) noexcept
+    {
+        if (! std::isfinite (hz)) return;           // reject NaN/inf — keep the last good value
+        freq_ = hz;
+        applyFrequency();
+    }
+
+    void setLowWidth (float w) noexcept             // 0 = mono below fc, 1 = full stereo (settles into bypass)
+    {
+        if (! std::isfinite (w)) return;
+        lowWidth_ = std::clamp (w, 0.0f, 1.0f);
+        widthSm_.setTargetValue (lowWidth_);
+        xfSm_.setTargetValue (lowWidth_ >= 1.0f ? 1.0f : 0.0f);
+    }
 
     bool  isEnabled() const noexcept { return enabled_; }
     float frequency() const noexcept { return freq_; }
     float lowWidth()  const noexcept { return lowWidth_; }
     static constexpr int latencySamples() noexcept { return 0; }
 
-    // Stereo, in place: io[0]=L, io[1]=R. Bypass (signal untouched) when disabled, < 2 channels, or fully wide.
+    // Stereo, in place: io[0]=L, io[1]=R. Bypass (buffer untouched) when disabled, numChannels != 2, or
+    // settled full-wide. Entering bypass clears the crossover so re-entry starts from silence, not stale tails.
     void process (float* const* io, int numChannels, int n) noexcept
     {
-        if (numChannels < 2 || ! enabled_ || lowWidth_ >= 1.0f - 1.0e-6f) return;
+        if (numChannels != 2 || ! enabled_ || (! xfSm_.isSmoothing() && xfSm_.getCurrentValue() == 1.0f))
+        {
+            if (! bypassed_) { bypassed_ = true; xo_.reset(); }
+            return;
+        }
+        bypassed_ = false;
         float* L = io[0];
         float* R = io[1];
         for (int i = 0; i < n; ++i)
         {
+            const float w  = widthSm_.getNextValue();
+            const float xf = xfSm_.getNextValue();
             float m, s; MidSide::encode (L[i], R[i], m, s);
-            const float lp = lp2_.processSample (0, lp1_.processSample (0, s));   // LP4(S)
-            const float hp = hp2_.processSample (0, hp1_.processSample (0, s));   // HP4(S)
-            const float sOut = lowWidth_ * lp + hp;                               // lowWidth·LP4 + HP4
+            float lp, hp; xo_.processSample (0, s, lp, hp);
+            const float wet  = w * lp + hp;                  // side magnitude (w + r⁴)/(1+r⁴) — bump-free (LR4 in-phase)
+            const float sOut = xf * s + (1.0f - xf) * wet;   // ≠ wet only while fading into/out of full-wide
             MidSide::decode (m, sOut, L[i], R[i]);
         }
-        lp1_.flushDenormals(); lp2_.flushDenormals(); hp1_.flushDenormals(); hp2_.flushDenormals();
+        xo_.flushDenormals();
     }
 
 private:
-    void applyFilters() noexcept   // coefficients only — no state reset, so a freq move doesn't click
+    void applyFrequency() noexcept                  // coefficients only — no state reset, so a freq move doesn't click
     {
-        constexpr double Q = 0.7071067811865476;   // 1/√2 Butterworth → cascade = 4th-order Linkwitz-Riley
-        lp1_.setParams (eq::FilterType::LowPass,  freq_, Q, 0.0);
-        lp2_.setParams (eq::FilterType::LowPass,  freq_, Q, 0.0);
-        hp1_.setParams (eq::FilterType::HighPass, freq_, Q, 0.0);
-        hp2_.setParams (eq::FilterType::HighPass, freq_, Q, 0.0);
+        const float hi = std::max (kMinFreq, (float) (0.45 * fs_));   // keep lo <= hi even at absurdly low fs (clamp UB otherwise)
+        freq_ = std::clamp (freq_, kMinFreq, hi);
+        xo_.setFrequency (freq_);
     }
 
     double fs_ = 48000.0;
-    float  freq_ = 150.0f, lowWidth_ = 0.0f;
-    bool   enabled_ = true;
-    eq::Svf lp1_, lp2_, hp1_, hp2_;   // Side-channel LR4 low-pass + high-pass cascades
+    float  freq_ = 120.0f, lowWidth_ = 0.0f;
+    bool   enabled_ = true, bypassed_ = false;
+    eq::Crossover2 xo_;                             // the Side-channel LR4 split (the primitive extracted from here, reused back)
+    core::LinearSmoother widthSm_ { 0.0f }, xfSm_ { 0.0f };
 };
 
 } // namespace felitronics::stereo
