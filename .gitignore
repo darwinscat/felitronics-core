@@ -64,3 +64,5 @@ xcuserdata/
 *.raw
 build-verify*/
 build-b*/
+build-monobass*/
+build-bp*/

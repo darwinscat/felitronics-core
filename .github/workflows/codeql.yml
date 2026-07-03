@@ -17,9 +17,9 @@ jobs:
       security-events: write   # upload the analysis to the Security tab
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
           build-mode: manual
@@ -32,6 +32,6 @@ jobs:
           cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON
           cmake --build build -j
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:c-cpp"
