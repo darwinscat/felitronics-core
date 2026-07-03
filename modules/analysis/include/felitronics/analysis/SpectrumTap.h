@@ -5,6 +5,7 @@
 
 #include <algorithm>   // std::copy
 #include <atomic>
+#include <cstddef>
 
 namespace felitronics::analysis
 {
@@ -33,14 +34,15 @@ struct SpectrumTapT
     static constexpr int kOrder = FftOrder;
     static constexpr int kSize  = 1 << FftOrder;
 
-    // Producer-only hot state (the audio thread writes `idx` every sample).
-    alignas (64) float fifo[kSize] {};
+    // Producer-only hot state (the audio thread writes `idx` every sample). NB: explicit size_t casts on
+    // the template-dependent array bounds — GCC's -Wsign-conversion flags a dependent int bound.
+    alignas (64) float fifo[(std::size_t) kSize] {};
     int idx = 0;
 
     // Cross-thread handshake (`ready`) + the snapshot the GUI reads (`data`), each on its own cache
     // line so they don't false-share the producer's per-sample `idx` write.
     alignas (64) std::atomic<bool> ready { false };
-    alignas (64) float data[kSize] {};
+    alignas (64) float data[(std::size_t) kSize] {};
 
     void reset() noexcept { idx = 0; ready.store (false, std::memory_order_release); }
 

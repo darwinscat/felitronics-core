@@ -89,7 +89,7 @@ public:
         if (nc <= 0 || n <= 0 || n > maxBlock_) return;
 
         // 1) split into per-band planar buffers; capture the allpass-reconstructed dry for the parallel mix
-        float tmp[MaxBands] {};
+        float tmp[(std::size_t) MaxBands] {};
         for (int c = 0; c < nc; ++c)
         {
             float* dry = dryData (c);
@@ -158,9 +158,9 @@ private:
     float mix_ = 1.0f;
 
     eq::MultibandSplitter<MaxBands> splitter_;
-    std::array<BandProcessor, MaxBands> proc_ {};
-    std::array<bool, MaxBands> bypass_ {}, solo_ {};
-    std::array<std::vector<float*>, MaxBands> bandPtrs_;
+    std::array<BandProcessor, (std::size_t) MaxBands> proc_ {};
+    std::array<bool, (std::size_t) MaxBands> bypass_ {}, solo_ {};
+    std::array<std::vector<float*>, (std::size_t) MaxBands> bandPtrs_;
     std::vector<float> bandBuf_, dryBuf_;
     std::vector<core::DelayLine> align_, dryDelay_;
 };

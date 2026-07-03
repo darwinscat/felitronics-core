@@ -80,7 +80,7 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
             acc  += (double) in[k] * w;
             wsum += w;
         }
-        out[(std::size_t) n] = (float) (wsum != 0.0 ? acc / wsum : 0.0);    // normalize → unity DC
+        out[(std::size_t) n] = (float) (! core::exactlyEqual (wsum, 0.0) ? acc / wsum : 0.0);    // normalize → unity DC (intentional exact ==)
     }
     return out;
 }

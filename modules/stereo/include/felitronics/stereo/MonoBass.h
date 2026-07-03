@@ -109,7 +109,7 @@ public:
     // settled full-wide. Entering bypass clears the crossover so re-entry starts from silence, not stale tails.
     void process (float* const* io, int numChannels, int n) noexcept
     {
-        if (numChannels != 2 || ! enabled_ || (! xfSm_.isSmoothing() && xfSm_.getCurrentValue() == 1.0f))
+        if (numChannels != 2 || ! enabled_ || (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f)))
         {
             if (! bypassed_) { bypassed_ = true; xo_.reset(); }
             return;

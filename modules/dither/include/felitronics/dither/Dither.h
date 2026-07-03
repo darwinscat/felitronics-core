@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/Config.h>
+#include <felitronics/core/Math.h>
 
 #include <algorithm>
 #include <cmath>
@@ -97,7 +98,7 @@ public:
                 float in = x[i];
                 if (! std::isfinite (in)) in = 0.0f;       // a stray NaN/inf must not poison the export
 
-                if (autoBlank_ && in == 0.0f)
+                if (autoBlank_ && core::exactlyEqual (in, 0.0f))   // intentional exact == (digital black only)
                 {
                     if (st.blank < blankSamples_) ++st.blank;
                     if (st.blank >= blankSamples_) { st.clearShaper(); x[i] = 0.0f; continue; }   // digital black
@@ -157,7 +158,8 @@ private:
 
     void seedChannel (int c) noexcept
     {
-        std::uint64_t s = params_.seed ^ (0x9E3779B97F4A7C15ULL * (std::uint64_t) (c + 1));
+        constexpr std::uint64_t kGolden = 0x9E3779B97F4A7C15ULL;   // uint64_t, not ULL literal: keeps the ^/* in one type (GCC -Wsign-conversion)
+        std::uint64_t s = params_.seed ^ (kGolden * (std::uint64_t) (c + 1));
         const std::uint64_t a = splitmix64 (s), b = splitmix64 (s);
         ch_[c].state = 0u; ch_[c].inc = (b << 1) | 1u;     // inc must be odd
         pcg (ch_[c]); ch_[c].state += a; pcg (ch_[c]);     // PCG seeding ritual

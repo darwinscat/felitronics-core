@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 namespace felitronics::eq
 {
@@ -144,9 +145,10 @@ private:
     static constexpr double kQ = 0.7071067811865476;
     double fs_ = 48000.0;
     int numBands_ = MaxBands, numXovers_ = MaxBands - 1;
-    float freqs_[kMaxCrossovers] = {};
-    Crossover2 xover_[kMaxCrossovers];
-    Svf comp_[kMaxCrossovers][kMaxCrossovers];   // comp_[band][crossover]: allpass for band < crossover
+    // size_t casts on the template-dependent bounds: GCC's -Wsign-conversion flags a dependent int bound.
+    float freqs_[(std::size_t) kMaxCrossovers] = {};
+    Crossover2 xover_[(std::size_t) kMaxCrossovers];
+    Svf comp_[(std::size_t) kMaxCrossovers][(std::size_t) kMaxCrossovers];   // comp_[band][crossover]: allpass for band < crossover
 };
 
 } // namespace felitronics::eq

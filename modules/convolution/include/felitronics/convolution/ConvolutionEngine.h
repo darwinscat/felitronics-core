@@ -322,7 +322,7 @@ private:
 
     Fft fft_;                                            // audio-thread FFT (chunkAll / macSlot / primeTail)
     Fft buildFft_;                                        // message-thread FFT (buildIr) — separate, so an IR build never races the audio FFT
-    Chan chan_[MaxChannels];
+    Chan chan_[(std::size_t) MaxChannels];               // size_t cast: GCC -Wsign-conversion flags a dependent int bound
     std::vector<float> inputSpec_, acc_, ifftOut_;        // shared FFT scratch (one channel at a time)
     std::atomic<int> state_ { 0 };                        // 0 Idle · 1 Pending (staged) · 2 Crossfading
     bool prepared_ = false;                               // true ONLY after a fully-successful prepare(); setIr()/process() reject until then (a partial/failed prepare leaves it false even if P_>0)
