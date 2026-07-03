@@ -91,5 +91,30 @@ int main()
         test::ok (os.prepare (4, 1, 32), "prepare valid");
     }
 
+    // --- latency query before prepare() must not report tpp-1 == -1 ---
+    test::group ("Oversampler latencySamples before prepare == 0");
+    {
+        oversampling::PolyphaseOversampler os;
+        test::ok (os.latencySamples() == 0, "unprepared oversampler reports 0, not -1");
+    }
+
+    // --- 8x round-trip == delayed identity (the 2/4x paths are covered above; 8x is the metering path) ---
+    test::group ("Oversampler 8x round-trip == delayed identity");
+    {
+        const int L = 8, n = 512; const double f = 500.0, A = 0.6;
+        oversampling::PolyphaseOversampler os; os.prepare (L, 1, tpp);
+        std::vector<float> x (n); for (int i = 0; i < n; ++i) x[i] = (float) (A * std::sin (2.0 * core::kPi * f * i / sr));
+        std::vector<float> osb ((std::size_t) n * L), z (n);
+        const float* xi[1] { x.data() }; float* ob[1] { osb.data() };
+        os.upsample (xi, 1, n, ob);
+        const float* obc[1] { osb.data() }; float* zo[1] { z.data() };
+        os.downsample (obc, 1, n, zo);
+        const int lat = os.latencySamples();
+        test::ok (lat == tpp - 1, "8x round-trip latency == tpp-1");
+        double maxErr = 0.0;
+        for (int i = lat + 60; i < n - 10; ++i) maxErr = std::max (maxErr, (double) std::fabs (z[(std::size_t) i] - x[(std::size_t) (i - lat)]));
+        test::ok (maxErr < 0.03, "8x round-trip == input delayed by latency()");
+    }
+
     return test::report();
 }

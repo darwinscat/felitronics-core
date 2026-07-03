@@ -266,5 +266,26 @@ int main()
         test::ok (md < 1e-5, "io[0]==io[1] → output = gain·in (gain applied once; width inert on S=0)");
     }
 
+    // --- MonoBass: a stray non-finite parameter is rejected, never poisons the SVFs ---
+    test::group ("MonoBass: non-finite params rejected");
+    {
+        const int N = 512;
+        std::vector<float> L (N), R (N);
+        for (int i = 0; i < N; ++i)
+        {
+            const float v = (float) std::sin (2.0 * pi * 100.0 * i / sr);
+            L[i] = 0.5f * v; R[i] = -0.5f * v;                        // anti-phase low = pure Side (worst case)
+        }
+        stereo::MonoBass mb; mb.prepare (sr);
+        mb.setFrequency (150.0f); mb.setLowWidth (0.0f);
+        mb.setFrequency (std::nanf ("")); mb.setLowWidth (std::nanf (""));
+        test::ok (mb.frequency() == 150.0f && mb.lowWidth() == 0.0f, "setFrequency(NaN)/setLowWidth(NaN) ignored — last good kept");
+        float* io[2] { L.data(), R.data() };
+        mb.process (io, 2, N);
+        bool fin = true;
+        for (int i = 0; i < N; ++i) fin &= (bool) std::isfinite (L[i]) && (bool) std::isfinite (R[i]);
+        test::ok (fin, "output stays finite after NaN parameter pokes");
+    }
+
     return test::report();
 }

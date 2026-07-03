@@ -53,9 +53,14 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
     if (outLen <= 0) return out;
     out.assign ((std::size_t) outLen, 0.0f);
 
-    const double fc     = 0.5 * std::min (1.0, ratio) * cfg.cutoffScale;   // cycles per INPUT sample
-    const int    R      = cfg.halfTaps;
-    const double i0beta = detail::besselI0 (cfg.beta);
+    // Sanitize the config — halfTaps < 1 makes the tap loop empty (an all-zero "IR"), a non-finite
+    // beta/cutoffScale poisons every tap.
+    const int    R      = cfg.halfTaps < 1 ? 1 : cfg.halfTaps;
+    const double beta   = (std::isfinite (cfg.beta) && cfg.beta >= 0.0) ? cfg.beta : 8.0;
+    const double cScale = (std::isfinite (cfg.cutoffScale) && cfg.cutoffScale > 0.0 && cfg.cutoffScale <= 1.0)
+                        ? cfg.cutoffScale : 0.95;
+    const double fc     = 0.5 * std::min (1.0, ratio) * cScale;            // cycles per INPUT sample
+    const double i0beta = detail::besselI0 (beta);
 
     for (int n = 0; n < outLen; ++n)
     {
@@ -70,7 +75,7 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
                                                          : std::sin (2.0 * core::kPi * fc * xx) / (core::kPi * xx);
             const double r    = xx / (double) R;                           // window argument in [-1, 1]
             const double win  = (r <= -1.0 || r >= 1.0) ? 0.0
-                              : detail::besselI0 (cfg.beta * std::sqrt (1.0 - r * r)) / i0beta;
+                              : detail::besselI0 (beta * std::sqrt (1.0 - r * r)) / i0beta;
             const double w    = sinc * win;
             acc  += (double) in[k] * w;
             wsum += w;

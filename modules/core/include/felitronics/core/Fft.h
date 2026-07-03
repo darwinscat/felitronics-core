@@ -52,8 +52,8 @@ public:
 
     bool prepare (int n) noexcept
     {
-        if (! isPow2 (n) || n < 4) return false;
-        n_ = n;
+        if (! isPow2 (n) || n < 4) { n_ = 0; return false; }   // reject → UNPREPARED (house rule): a failed
+        n_ = n;                                                //   RE-prepare must not keep the stale old plan
         scratch_.assign ((std::size_t) n, std::complex<float> {});   // ALLOC here (prepare) only
         return true;
     }

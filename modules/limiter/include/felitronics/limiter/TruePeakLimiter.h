@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::limiter
@@ -19,23 +20,37 @@ namespace felitronics::limiter
 namespace detail
 {
     // O(1)-amortized sliding-window maximum (monotonic-decreasing deque). Front = max over the last W.
+    // prepare() fixes the CAPACITY; setWindow() picks the effective window ≤ capacity, RT-safe (no alloc),
+    // so the limiter can retune the lookahead per setParams() without a re-prepare. Expiry runs BEFORE the
+    // insert — insert-first can overwrite the head (the current max) once a strictly-decreasing run fills
+    // the deque, under-reading the max exactly when a decaying peak is still inside the lookahead. Indices
+    // are int64 (a `long` is 32-bit on Windows → wraps after ~3 h of oversampled pushes).
     class SlidingMax
     {
     public:
-        void prepare (int window) { W = window < 1 ? 1 : window; v.assign ((std::size_t) W, 0.0f); ix.assign ((std::size_t) W, 0); reset(); }
+        void prepare (int maxWindow)
+        {
+            cap = maxWindow < 1 ? 1 : maxWindow;
+            v.assign ((std::size_t) cap, 0.0f); ix.assign ((std::size_t) cap, 0);
+            W = cap;
+            reset();
+        }
+
         void reset() noexcept { head = tail = count = 0; n = 0; }
+
+        void setWindow (int w) noexcept { W = w < 1 ? 1 : (w > cap ? cap : w); }   // stale entries expire on the next pushes
 
         float push (float x) noexcept
         {
-            while (count > 0) { const int b = (tail - 1 + W) % W; if (v[(std::size_t) b] <= x) { tail = b; --count; } else break; }
-            v[(std::size_t) tail] = x; ix[(std::size_t) tail] = n; tail = (tail + 1) % W; ++count;
-            while (count > 0 && ix[(std::size_t) head] <= n - W) { head = (head + 1) % W; --count; }
+            while (count > 0 && ix[(std::size_t) head] <= n - (std::int64_t) W) { head = (head + 1) % cap; --count; }
+            while (count > 0) { const int b = (tail - 1 + cap) % cap; if (v[(std::size_t) b] <= x) { tail = b; --count; } else break; }
+            v[(std::size_t) tail] = x; ix[(std::size_t) tail] = n; tail = (tail + 1) % cap; ++count;
             ++n;
             return v[(std::size_t) head];
         }
 
     private:
-        int W = 1; std::vector<float> v; std::vector<long> ix; int head = 0, tail = 0, count = 0; long n = 0;
+        int cap = 1, W = 1; std::vector<float> v; std::vector<std::int64_t> ix; int head = 0, tail = 0, count = 0; std::int64_t n = 0;
     };
 }
 
@@ -138,15 +153,22 @@ private:
 
     void apply (const TruePeakLimiterParams& p) noexcept
     {
-        ceilingDb    = p.ceilingDbTp;
-        lookBaseband = (int) std::lround (p.lookaheadMs * 0.001 * fs);
+        // Non-finite params fall back to the defaults (house rule) — a NaN ceiling/lookahead would poison
+        // grDb / feed lround() UB.
+        ceilingDb    = std::isfinite (p.ceilingDbTp) ? p.ceilingDbTp : -1.0;
+        const double lookMs = std::isfinite (p.lookaheadMs) ? p.lookaheadMs : 0.0;
+        lookBaseband = (int) std::lround (lookMs * 0.001 * fs);
         if (lookBaseband < 0) lookBaseband = 0;
         const int maxLookBb = (int) std::ceil (kMaxLookaheadMs * 0.001 * fs);
         if (lookBaseband > maxLookBb) lookBaseband = maxLookBb;
         const int lookOS = lookBaseband * F;
         for (auto& d : osDelays) d.setDelay (lookOS);
+        // The max window must equal the ACTUAL lookahead (+1 for the sample being output). The capacity-wide
+        // window held the gain down for the full 20 ms after every peak — a release that ignored the knob.
+        slide.setWindow (lookOS + 1);
 
-        const double t = p.releaseMs * 0.001 * fs * F;   // release time constant at the OS rate
+        const double relMs = std::isfinite (p.releaseMs) ? p.releaseMs : 100.0;
+        const double t = relMs * 0.001 * fs * F;         // release time constant at the OS rate
         relCoef = (t <= 0.0) ? 0.0f : (float) std::exp (-1.0 / t);
     }
 

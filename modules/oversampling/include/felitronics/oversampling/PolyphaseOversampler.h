@@ -60,7 +60,8 @@ public:
     double filterLatencyOversampled() const noexcept { return (double) (N - 1) * 0.5; }
     // Round-trip (up THEN down) latency in BASEBAND samples. EXACT integer: the two (N-1)/2 OS group
     // delays plus the decimation phase (L-1) combine to (N - L)/L = tpp - 1 baseband samples.
-    int latencySamples() const noexcept { return tpp - 1; }
+    // Unprepared (tpp == 0) reports 0, not -1 — hosts query latency before prepare().
+    int latencySamples() const noexcept { return tpp > 0 ? tpp - 1 : 0; }
 
     // n baseband samples per channel → n*L oversampled samples. out[ch] holds n*L.
     void upsample (const float* const* in, int channels, int n, float* const* out) noexcept

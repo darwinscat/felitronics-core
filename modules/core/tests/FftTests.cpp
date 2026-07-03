@@ -129,5 +129,22 @@ int main()
         test::ok (std::isfinite (out[0]), "forward/inverse finite once prepared");
     }
 
+    // --- FALSIFICATION: a FAILED RE-prepare must leave the plan UNPREPARED, not keep the stale old plan ---
+    // (house rule everywhere else: any early return in prepare() leaves the object unprepared; a caller that
+    // ignored the `false` would otherwise run a size-16 transform against its new size-2 buffers → OOB)
+    test::group ("ScalarRadix2Real: failed re-prepare leaves the plan unprepared");
+    {
+        ScalarRadix2Real f;
+        test::ok (  f.prepare (16), "prepare 16");
+        test::ok (! f.prepare (2),  "re-prepare with invalid size fails");
+        test::ok (f.size() == 0,    "failed re-prepare → size 0 (stale plan dropped)");
+        float re[16] {}; re[0] = 1.0f;
+        float spec[16]; std::fill (spec, spec + 16, 123.0f);
+        f.forward (re, spec);                                  // must no-op on the dead plan
+        bool untouched = true; for (float v : spec) untouched &= (v == 123.0f);
+        test::ok (untouched, "forward() after failed re-prepare is a no-op");
+        test::ok (f.prepare (8), "re-prepare with a valid size recovers");
+    }
+
     return test::report();
 }

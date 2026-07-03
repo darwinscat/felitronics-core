@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -163,6 +164,24 @@ int main()
             return rmsTail (y, 5000) / rmsTail (x, 5000);                  // < 1 → cut
         };
         test::ok (reduction (6000.0) < 0.9 * reduction (13000.0), "the 6 kHz bell cuts its band; 13 kHz air (off the bell) is spared");
+    }
+
+    // --- non-finite params must not poison the stream (NaN fc reaches the Svf/Crossover otherwise) ---
+    test::group ("DeEsser non-finite params rejected");
+    {
+        const double qnan = std::numeric_limits<double>::quiet_NaN();
+        for (auto mode : { Mode::DynamicEq, Mode::SplitBand })
+        {
+            DP p; p.mode = mode; p.fc = qnan; p.scQ = qnan; p.thresholdDb = qnan;
+            p.ratio = qnan; p.kneeDb = qnan; p.rangeDb = qnan; p.attackMs = qnan; p.releaseMs = qnan;
+            DE d; d.prepare (sr, 512, 1); d.setParams (p);
+            const int N = 4000; std::vector<float> y (N);
+            for (int i = 0; i < N; ++i) y[i] = (float) (0.5 * std::sin (2.0 * pi * 8000.0 * i / sr));
+            for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+            bool fin = true; for (float v : y) fin &= (bool) std::isfinite (v);
+            test::ok (fin, mode == Mode::DynamicEq ? "all-NaN params → finite output (DynamicEq mode)"
+                                                   : "all-NaN params → finite output (SplitBand mode)");
+        }
     }
 
     return test::report();

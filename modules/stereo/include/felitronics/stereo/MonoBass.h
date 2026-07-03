@@ -7,6 +7,7 @@
 #include <felitronics/eq/Svf.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace felitronics::stereo
 {
@@ -47,8 +48,9 @@ public:
     void reset() noexcept { lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset(); }
 
     void setEnabled (bool e) noexcept { enabled_ = e; }
-    void setFrequency (float hz) noexcept { freq_ = std::clamp (hz, 20.0f, (float) (0.45 * fs_)); applyFilters(); }
-    void setLowWidth (float w) noexcept { lowWidth_ = std::clamp (w, 0.0f, 1.0f); }   // 0 = mono below fc, 1 = full stereo
+    // Setters reject non-finite values (std::clamp passes NaN through — it would poison the SVF coefficients).
+    void setFrequency (float hz) noexcept { if (! std::isfinite (hz)) return; freq_ = std::clamp (hz, 20.0f, (float) (0.45 * fs_)); applyFilters(); }
+    void setLowWidth (float w) noexcept { if (! std::isfinite (w)) return; lowWidth_ = std::clamp (w, 0.0f, 1.0f); }   // 0 = mono below fc, 1 = full stereo
 
     bool  isEnabled() const noexcept { return enabled_; }
     float frequency() const noexcept { return freq_; }

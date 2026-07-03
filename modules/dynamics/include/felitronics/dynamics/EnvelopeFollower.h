@@ -63,7 +63,7 @@ private:
     float coeff (double ms) const noexcept
     {
         const double t = ms * 0.001;
-        if (t <= 0.0 || fs <= 0.0) return 0.0f;
+        if (! (t > 0.0) || fs <= 0.0) return 0.0f;   // !(t>0) also catches a NaN time → instant, never a NaN coeff
         const float c = (float) std::exp (-1.0 / (t * fs));
         return c < 1.0e-15f ? 0.0f : c;     // absurdly short time → instant; never leave a subnormal coeff
     }

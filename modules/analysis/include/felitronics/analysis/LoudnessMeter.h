@@ -86,7 +86,9 @@ private:
             if (stSince == 0 && stCount < (int) stE.size()) stE[(std::size_t) stCount++] = meanLastHops (kHopRing);
             if (++stSince >= 10) stSince = 0;                                        // first at 3 s, then every 10 hops (libebur128)
         }
-        for (int c = 0; c < nc; ++c) hopSumSq[c] = 0.0;
+        // Clear EVERY channel's accumulator, not just c < nc: a channel that vanishes mid-hop (host drops
+        // the channel count) must not park its partial energy and leak it into a later hop when it returns.
+        for (int c = 0; c < kMaxChannels; ++c) hopSumSq[c] = 0.0;
         hopCount = 0;
     }
 

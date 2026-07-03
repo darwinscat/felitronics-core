@@ -24,7 +24,7 @@ public:
     void setTimeMs (double timeMs) noexcept
     {
         const double tau = timeMs * 0.001;
-        coeff = (tau <= 0.0 || fs <= 0.0) ? 0.0 : std::exp (-1.0 / (tau * fs));
+        coeff = (! (tau > 0.0) || ! (fs > 0.0)) ? 0.0 : std::exp (-1.0 / (tau * fs));   // !(x>0) also catches NaN → instant, never a NaN coeff
     }
 
     void   setTarget (double t) noexcept { target = t; }

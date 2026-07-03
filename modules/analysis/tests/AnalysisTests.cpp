@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using namespace felitronics;
@@ -180,6 +181,65 @@ int main()
         lm.prepare (0.0, 2);                                         // fs<=0 → clamped, hopSamples>=1 (no /0 in finishHop)
         lm.process (io, 1, 6000);
         test::ok (true, "process after fs<=0 prepare did not divide by zero (UBSan check)");
+    }
+
+    // --- FALSIFICATION: one non-finite sample must not latch the correlation meter forever ---
+    test::group ("CorrelationMeter recovers from a non-finite sample");
+    {
+        analysis::CorrelationMeter cm; cm.prepare (48000.0, 50.0);
+        cm.process (std::numeric_limits<float>::quiet_NaN(), 0.5f);
+        for (int i = 0; i < 48000; ++i)
+        {
+            const float v = (float) std::sin (2.0 * core::kPi * 997.0 * i / 48000.0);
+            cm.process (0.5f * v, -0.5f * v);                          // anti-phase → ρ must read −1
+        }
+        test::approx (cm.correlation(), -1.0, 0.05, "one NaN sample must not latch the meter (anti-phase reads −1)");
+    }
+
+    // --- FALSIFICATION: a channel dropped mid-hop must not leak its partial energy into a later hop ---
+    test::group ("LoudnessMeter: a dropped channel's partial hop can't leak later");
+    {
+        const double srr = 48000.0;
+        analysis::LoudnessMeter lm; lm.prepare (srr, 2);
+        const int half = 2400, hop = 4800;
+        std::vector<float> zero ((std::size_t) hop, 0.0f), zhalf ((std::size_t) half, 0.0f), loud ((std::size_t) half);
+        for (int i = 0; i < half; ++i) loud[(std::size_t) i] = (float) (0.45 * std::sin (2.0 * core::kPi * 1000.0 * i / srr));
+        const float* st2[2] { zhalf.data(), loud.data() };
+        lm.process (st2, 2, half);                                     // half a hop of loud R…
+        const float* st0[2] { zero.data(), zero.data() };
+        lm.process (st0, 2, 2300);                                     // …zeros IN STEREO so the K-filter ring decays
+                                                                       // (the parked hop energy stays parked)…
+        const float* mono[1] { zero.data() };
+        for (int h = 0; h < 3; ++h) lm.process (mono, 1, hop);         // …then the channel count DROPS mid-hop
+        for (int h = 0; h < 4; ++h) lm.process (st0, 2, hop);          // back to stereo: 400 ms of true silence
+        // A leaked half-hop of −7 dBFS tone reads ≈ −20 LUFS here; the honest K-filter ring tail is ≈ −80.
+        test::ok (lm.momentaryLufs() < -60.0, "momentary after 400 ms of silence ≈ silence (no stale channel energy)");
+    }
+
+    // --- BS.1770 absolute reference: a 997 Hz 0 dBFS mono sine reads −3.01 LKFS (both base rates) ---
+    test::group ("LoudnessMeter 997 Hz 0 dBFS == −3.01 LUFS (BS.1770 reference)");
+    {
+        for (double srr : { 48000.0, 44100.0 })
+        {
+            analysis::LoudnessMeter lm; lm.prepare (srr, 1);
+            const int n = (int) (5.0 * srr);
+            std::vector<float> x ((std::size_t) n);
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) std::sin (2.0 * core::kPi * 997.0 * i / srr);
+            const float* ch[1] { x.data() };
+            lm.process (ch, 1, n);
+            test::approx (lm.integratedLufs(), -3.01, 0.1, srr == 48000.0 ? "997 Hz @48k → −3.01 LKFS" : "997 Hz @44.1k → −3.01 LKFS");
+        }
+    }
+
+    // --- steady DC is fully rejected by the RLB high-pass (K-weighting), not metered as loudness ---
+    test::group ("LoudnessMeter steady DC is K-weighted away");
+    {
+        const double srr = 48000.0;
+        analysis::LoudnessMeter lm; lm.prepare (srr, 1);
+        std::vector<float> x ((std::size_t) (3.0 * srr), 0.5f);
+        const float* ch[1] { x.data() };
+        lm.process (ch, 1, (int) x.size());
+        test::ok (lm.momentaryLufs() < -100.0, "steady 0.5 DC → momentary at the silence floor");
     }
 
     return test::report();

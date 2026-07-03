@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -140,6 +141,60 @@ int main()
         sat.process (io, 2, 16);                                     // works
         sat.process (io, 2, 32);                                     // n=32 > maxBlock=16 → no-op, must not overrun osBuf_
         test::ok (true, "no OOB across failed-prepare / oversized-block process (ASan/UBSan is the real check)");
+    }
+
+    // --- FALSIFICATION: at os>1 the dry/wet mix must be latency-aligned (undelayed dry combs the wet) ---
+    test::group ("Saturator os=4 dry/wet mix is latency-aligned (no comb)");
+    {
+        const int n = 4096;
+        std::vector<float> x (n);
+        for (int i = 0; i < n; ++i) x[i] = (float) (0.5 * std::sin (2.0 * pi * 1000.0 * i / 48000.0));
+        std::vector<float> y = x; float* ch[1] { y.data() };
+        saturation::Saturator sat; sat.prepare (48000.0, n, 1, 4);
+        saturation::Saturator::Params p;
+        p.driveDb = 0.0f; p.autoComp = 0.0f; p.mix = 0.5f; p.outputDb = 0.0f;   // ≈linear curve → wet ≈ delayed dry
+        sat.setParams (p);
+        sat.process (ch, 1, n);
+        auto rmsHalf = [] (const std::vector<float>& v) {
+            double s2 = 0.0; const int from = (int) v.size() / 2;
+            for (int i = from; i < (int) v.size(); ++i) s2 += (double) v[i] * v[i];
+            return std::sqrt (s2 / ((int) v.size() - from)); };
+        // aligned: 0.5·x + 0.5·x == x; unaligned by 31 samples @1 kHz: |0.5 + 0.5·e^{-jθ}| ≈ 0.44
+        test::approx (rmsHalf (y) / rmsHalf (x), 1.0, 0.05, "mix=0.5 at ~zero drive is level-neutral (dry delayed to match wet)");
+    }
+
+    // --- autoComp=1 → unity small-signal gain regardless of drive ---
+    test::group ("Saturator autoComp=1 small-signal unity");
+    {
+        const int n = 4096;
+        std::vector<float> x (n);
+        for (int i = 0; i < n; ++i) x[i] = (float) (0.005 * std::sin (2.0 * pi * 500.0 * i / 48000.0));
+        std::vector<float> y = x; float* ch[1] { y.data() };
+        saturation::Saturator sat; sat.prepare (48000.0, n, 1, 4);
+        saturation::Saturator::Params p; p.driveDb = 12.0f; p.autoComp = 1.0f; p.mix = 1.0f;
+        sat.setParams (p);
+        sat.process (ch, 1, n);
+        double sx = 0.0, sy = 0.0;
+        for (int i = n / 2; i < n; ++i) { sx += (double) x[i] * x[i]; sy += (double) y[i] * y[i]; }
+        test::approx (std::sqrt (sy / sx), 1.0, 0.02, "12 dB drive + autoComp 1 → tiny signal passes at unity");
+    }
+
+    // --- non-finite params must not poison the stream (house rule: clamp + reject non-finite) ---
+    test::group ("Saturator non-finite params rejected");
+    {
+        const int n = 512;
+        std::vector<float> y (n);
+        for (int i = 0; i < n; ++i) y[i] = (float) (0.5 * std::sin (2.0 * pi * 997.0 * i / 48000.0));
+        float* ch[1] { y.data() };
+        saturation::Saturator sat; sat.prepare (48000.0, n, 1, 4);
+        saturation::Saturator::Params p;
+        p.shape = Shape::Asym;
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+        p.bias = qnan; p.mix = qnan; p.outputDb = qnan; p.autoComp = qnan; p.dcBlockHz = qnan; p.driveDb = qnan;
+        sat.setParams (p);
+        sat.process (ch, 1, n);
+        bool finite = true; for (float v : y) finite &= (bool) std::isfinite (v);
+        test::ok (finite, "all-NaN params → finite output (fallbacks applied)");
     }
 
     return test::report();

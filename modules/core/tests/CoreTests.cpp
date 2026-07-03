@@ -10,7 +10,9 @@
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/DelayLine.h>
 
+#include <cmath>
 #include <cstdio>
+#include <limits>
 
 using namespace felitronics;
 
@@ -151,6 +153,16 @@ int main()
         core::DelayLine raw;                          // never prepared — buf_ defaults to one slot
         test::approx (raw.process (0.5f), 0.5, 1e-9, "unprepared process() = delay-0 passthrough (no empty-buffer OOB)");
         test::ok (raw.capacity() == 0, "unprepared capacity is 0");
+    }
+
+    // --- FALSIFICATION: a non-finite smoothing time must not poison the smoother state ---
+    test::group ("Smoother non-finite time rejected");
+    {
+        core::Smoother s; s.prepare (48000.0, 30.0);
+        s.setTimeMs (std::numeric_limits<double>::quiet_NaN());   // NaN tau → coeff must fall back, not go NaN
+        s.snap (0.0); s.setTarget (1.0);
+        const double v = s.next();
+        test::ok (std::isfinite (v), "next() stays finite after setTimeMs(NaN)");
     }
 
     return test::report();
