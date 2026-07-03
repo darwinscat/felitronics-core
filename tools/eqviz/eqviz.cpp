@@ -250,6 +250,15 @@ namespace ref
         const double d = Om0 * Om0 - Om * Om;
         return (BW * Om) / std::sqrt (d * d + BW * Om * BW * Om);
     }
+    // Analog order-m Butterworth band-pass: |H(iΩ)|² = 1 / (1 + ((Ω0²−Ω²)/(BW·Ω))^{2m}) — the
+    // power-complement of the band-stop, the reference the variable-order bandpassCascade nulls against.
+    inline double bandpassM (double f, double f0, double Q, int m)
+    {
+        const double Om0 = f0, BW = f0 / Q, Om = f;
+        if (Om <= 0.0) return 0.0;
+        const double invx = (Om0 * Om0 - Om * Om) / (BW * Om);
+        return 1.0 / std::sqrt (1.0 + std::pow (std::fabs (invx), 2.0 * (double) m));
+    }
     inline double bandstop (double f, double f0, double Q, int m)
     {
         const double Om0 = f0, BW = f0 / Q, Om = f;
@@ -402,6 +411,18 @@ static CellResult evalBandpass (double f0, double Q, double fs, double fCap)
     e = std::max (e, std::fabs (dB (digitalMag (d, 2.0 * kPi * f0 / fs))));           // unity at centre, exact
     return { e, false };
 }
+static CellResult evalBandpassM (double f0, double Q, double fs, double fCap, int slope)
+{
+    BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).slope = slope;
+    const int m = std::clamp ((std::clamp (slope / 6, 1, 16) + 1) / 2, 1, 8);
+    const BandDesign d = designBand (p, fs);
+    if (! designOk (d)) { gAnyBroken = true; return { 0.0, true }; }
+    double e = scanError (d, fs, f0, fCap, false, [&] (double f) { return ref::bandpassM (f, f0, Q, m); });
+    e = std::max (e, std::fabs (dB (digitalMag (d, 2.0 * kPi * f0 / fs))));           // unity at centre, exact
+    return { e, false };
+}
+static CellResult evalBandpassOrder (double f0, double orderD, double fs, double fCap)
+{ return evalBandpassM (f0, 0.707, fs, fCap, std::clamp ((int) std::lround (orderD), 1, 16) * 6); }
 static CellResult evalNotchM (double f0, double Q, double fs, double fCap, int slope)
 {
     BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).slope = slope;
@@ -736,6 +757,8 @@ static double refHiShelfP (double f, const BandParams& p) { return ref::shelfQ  
 static double refHPp      (double f, const BandParams& p) { return ref::butterHP (f, p.lane (Lane::Stereo).freq, std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16)); }
 static double refLPp      (double f, const BandParams& p) { return ref::butterLP (f, p.lane (Lane::Stereo).freq, std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16)); }
 static double refBPp      (double f, const BandParams& p) { return ref::bandpass (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q); }
+static double refBPcasP    (double f, const BandParams& p)
+{ return ref::bandpassM (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q, std::clamp ((std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16) + 1) / 2, 1, 8)); }
 static double refNotchP   (double f, const BandParams& p)
 { return ref::bandstop (f, p.lane (Lane::Stereo).freq, p.lane (Lane::Stereo).Q, std::clamp ((std::clamp (p.lane (Lane::Stereo).slope / 6, 1, 16) + 1) / 2, 1, 8)); }
 static double refAPp      (double f, const BandParams&)   { (void) f; return 1.0; }
@@ -805,6 +828,7 @@ int main (int argc, char** argv)
         add ("hp",       "HIGHPASS BUTTERWORTH", "ORDER",   1.0,  16.0, false, evalHP);
         add ("lp",       "LOWPASS BUTTERWORTH",  "ORDER",   1.0,  16.0, false, evalLP);
         add ("notchcas", "NOTCH CASCADE Q=.707", "ORDER",   1.0,  16.0, false, evalNotchOrder);
+        add ("bpcascade","BANDPASS CASCADE Q=.707","ORDER", 1.0,  16.0, false, evalBandpassOrder);
         add ("tilt",     "TILT",                 "GAIN DB", -30.0, 30.0, false, evalTilt);
         for (const auto& m : maps) renderHeatmap (m, fs, fCap, outDir, csv, statsLines, imageBlocks);
 
@@ -819,7 +843,7 @@ int main (int argc, char** argv)
             { "HP 1K ORDER 3 (18DB/OCT)", mk (FilterType::HighPass, 1000, 0.707, 0, 18), refHPp, false },
             { "LP 4K ORDER 8",            mk (FilterType::LowPass,  4000, 0.707, 0, 48), refLPp, false },
             { "BP 10.6HZ Q40 (LOW CORNER)", mk (FilterType::BandPass, 10.61, 40.0, 0),   refBPp, false },
-            { "BP 1K Q4",                 mk (FilterType::BandPass, 1000, 4.0, 0),       refBPp, false },
+            { "BP CASCADE 1K Q2 M4 (48DB/OCT)", mk (FilterType::BandPass, 1000, 2.0, 0, 48), refBPcasP, false },
         }, fs, outDir, imageBlocks);
         renderCurveSheet ("curves_notch_ap_tilt", "NOTCH + ALLPASS + TILT", {
             { "NOTCH 15K Q0.5 M4 (ALIAS)", mk (FilterType::Notch, 15000, 0.5, 0, 48), refNotchP, false, true },
@@ -834,7 +858,7 @@ int main (int argc, char** argv)
     {
         std::fprintf (idx, "# EQ Filter Quality Atlas\n\nEvery `felitronics::eq` filter type measured against an INDEPENDENT analog reference and rendered as quality maps. Generated by `tools/eqviz`.\n\nColour bands: green <0.1 dB · yellow <1 dB · orange <3 dB · red >=3 dB · black = unstable/non-finite.\n");
         std::fprintf (idx, "Error = worst |digital - analog reference| over f in [20 Hz, %s], both sides floor-clamped at -50 dB, MAXed with per-type invariants (centre gain, plateaus, null depth >= 60 dB, |H(fc)| = -3.01 dB, allpass |H|=1 + group delay > 0). Resonant shelves are scored against the analog ENVELOPE (their shipped contract), not pointwise.\n\n", full ? "0.4999 fs" : "0.95 fs/2");
-        std::fprintf (idx, "READ THE MAPS AS DIFFS: some yellow/orange near the top of the band and at the extreme right edge is the matched design's INTENDED near-Nyquist trade (no cramping; first-order sections are bilinear; the single notch's frozen legacy sag). A regression is NEW red/black, or orange spreading into the mid-band, relative to main's maps.\n\n");
+        std::fprintf (idx, "READ THE MAPS AS DIFFS: some yellow/orange near the top of the band and at the extreme right edge is the matched design's INTENDED near-Nyquist trade (no cramping; first-order sections are bilinear; the single notch's frozen legacy sag; the BANDPASS CASCADE is a bilinear Butterworth band-pass, so its high-f0 columns roll off to the z=-1 Nyquist zero a touch faster than the analog skirt — deep-stopband, inaudible). A regression is NEW red/black, or orange spreading into the mid-band, relative to main's maps.\n\n");
         std::fprintf (idx, "## Summary\n\n| map | fs | green | worst | broken |\n|---|---|---|---|---|\n");
         for (const auto& l : statsLines) std::fprintf (idx, "%s\n", l.c_str());
         std::fprintf (idx, "\n## Maps\n\n");
