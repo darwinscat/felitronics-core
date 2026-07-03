@@ -465,7 +465,12 @@ void runEqEngineTests()
         for (auto& e : expect) { p.lane (Lane::Stereo).slope = e[0]; const auto d = designBand (p, fs);
             expectTrue (d.n == e[1], "slope " + std::to_string (e[0]) + " -> " + std::to_string (e[1]) + " sections"); }
 
-        const auto ref = matched::bandpass (1000.0, fs, 4.0);                                  // slope 6 & 12 (order 1 & 2) -> the frozen single band-pass
+        // Launder the reference args through volatile: with literals, Clang CONSTANT-FOLDS the tan()
+        // inside matched::bandpass using LLVM's own math, while designBand computes at runtime through
+        // the platform libm — glibc/x86 disagreed by 1 ulp and broke this bit-lock in CI (macOS libm
+        // happened to agree). volatile forces BOTH sides through the same runtime code.
+        volatile double refF = 1000.0, refQ = 4.0;
+        const auto ref = matched::bandpass (refF, fs, refQ);                                   // slope 6 & 12 (order 1 & 2) -> the frozen single band-pass
         auto bitEq = [&] (const BiquadCoeffs& c) { return c.b0 == ref.b0 && c.b1 == ref.b1 && c.b2 == ref.b2 && c.a1 == ref.a1 && c.a2 == ref.a2; };
         for (int slope : { 6, 12 }) { p.lane (Lane::Stereo).slope = slope; const auto d = designBand (p, fs);
             expectTrue (d.n == 1 && bitEq (d.sec[0]), "slope " + std::to_string (slope) + " == matched::bandpass bit-for-bit (no session drift)"); }
