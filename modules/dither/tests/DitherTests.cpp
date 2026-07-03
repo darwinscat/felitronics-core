@@ -221,5 +221,20 @@ int main()
         test::ok (diff > 1000, "a different seed → a different dither stream");
     }
 
+    // --- (13) full-scale rail: sustained +1.0 must stay bounded under 9th-order shaping, then blank clean ---
+    test::group ("Dither full-scale rail stability + blanking recovery");
+    {
+        DP p; p.bits = 16; p.shaping = NS::Psychoacoustic;
+        D d; d.prepare (sr, 1024, 1); d.setParams (p);
+        const int N = 20000; std::vector<float> y (N, 1.0f);               // sustained clipping rail
+        for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
+        double mx = 0; bool fin = true;
+        for (float v : y) { fin &= (bool) std::isfinite (v); mx = std::max (mx, (double) std::fabs (v)); }
+        test::ok (fin && mx <= 1.0, "clamped rail input stays bounded under the 9-tap feedback (no windup)");
+        std::vector<float> z (8192, 0.0f);
+        for (int o = 0; o < 8192; o += 1024) { float* io[1] { z.data() + o }; d.process (io, 1, 1024); }
+        test::ok (z[8191] == 0.0f, "after 4096+ zero samples the channel blanks to digital black (no rail latch)");
+    }
+
     return test::report();
 }

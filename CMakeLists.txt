@@ -82,3 +82,25 @@ add_subdirectory(modules/lineareq)
 if(PROJECT_IS_TOP_LEVEL)
     add_subdirectory(tools)
 endif()
+
+# ----------------------------------------------------------------------------
+# Header hygiene — one TU that #includes EVERY public header (felitronics + the teq shims, key templates
+# explicitly instantiated) under a strict, DOWNSTREAM-grade warning set with -Werror. Consumers compile
+# our headers under juce::juce_recommended_warning_flags (-Wconversion, -Wfloat-equal, …); this target
+# makes that a core gate so the class of "clean here, warns in TabbyEQ" bugs dies in CI, not downstream.
+# Clang/GCC only (MSVC maps differently; the clang/gcc jobs are the gate).
+if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
+    add_executable(felitronics_header_hygiene test_support/HeaderHygiene.cpp)
+    target_link_libraries(felitronics_header_hygiene PRIVATE
+        felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
+        felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
+        felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
+        felitronics::deesser felitronics::dither felitronics::lineareq)
+    target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
+    target_compile_options(felitronics_header_hygiene PRIVATE
+        -Werror -Wall -Wextra -Wpedantic
+        -Wconversion -Wsign-conversion -Wfloat-equal -Wshadow -Wcast-align
+        -Wzero-as-null-pointer-constant -Wunreachable-code -Wswitch-enum -Wextra-semi
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wshorten-64-to-32;-Wimplicit-float-conversion;-Wconditional-uninitialized;-Wconstant-conversion;-Wbool-conversion>)
+    add_test(NAME felitronics_header_hygiene COMMAND felitronics_header_hygiene)
+endif()

@@ -70,5 +70,21 @@ int main()
         test::ok (rejDb < -55.0, "20 kHz tone rejected >= 55 dB on 48k->24k");
     }
 
+    // --- FALSIFICATION: a degenerate config (halfTaps=0) must not silently produce an all-zero IR ---
+    test::group ("Resampler sanitizes a degenerate config");
+    {
+        std::vector<float> in (1000, 0.5f);
+        convolution::IrResampleConfig cfg; cfg.halfTaps = 0;               // window radius 0 → empty tap loop if unguarded
+        auto out = convolution::resampleIr (in, 48000.0, 44100.0, cfg);
+        test::ok (! out.empty(), "produced output");
+        double maxErr = 1.0;                                               // fail-closed if empty
+        if (! out.empty())
+        {
+            maxErr = 0.0;
+            for (int i = 50; i < (int) out.size() - 50; ++i) maxErr = std::max (maxErr, (double) std::fabs (out[(std::size_t) i] - 0.5f));
+        }
+        test::ok (maxErr < 5e-2, "halfTaps=0 clamped to a usable window (not an all-zero IR)");
+    }
+
     return test::report();
 }

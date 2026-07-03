@@ -108,9 +108,17 @@ public:
 private:
     void updateAudio() noexcept { audio_.setParams (params_.type, params_.freq, params_.Q, curGainDb_); }
 
+    static double finite (double v, double fallback) noexcept { return std::isfinite (v) ? v : fallback; }
+
     void apply (const DynamicEqBandParams& p) noexcept
     {
-        side_.setParams (eq::FilterType::BandPass, p.freq, p.Q, 0.0);
+        // Sanitize the fields that feed the SVFs / gain math directly — a NaN freq reaches tan() and poisons
+        // both filters. threshold/ratio/knee/range are guarded by the GainComputer; the followers' coeff()
+        // guards attack/release. Sanitized into params_ so updateAudio()/dynamicDeltaDb() see safe values.
+        params_.freq         = finite (p.freq, 1000.0);
+        params_.Q            = finite (p.Q, 2.0);
+        params_.staticGainDb = finite (p.staticGainDb, 0.0);
+        side_.setParams (eq::FilterType::BandPass, params_.freq, params_.Q, 0.0);
         env_.setDetector (p.detector);
         env_.setTimes (2.0, 2.0);                                 // a short, symmetric level window; the GR follower does the musical timing
         gc_.setThresholdDb (p.thresholdDb); gc_.setRatio (p.ratio); gc_.setKneeDb (p.kneeDb); gc_.setRangeDb (p.rangeDb);

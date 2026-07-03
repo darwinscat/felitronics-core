@@ -295,11 +295,11 @@ private:
         const int head = std::min (bulkDelay_ / 2, L_ / 16);                 // ≤ half the pre-ring region
         const int tail = std::max (1, L_ / 8);                              // last ~12.5%
         for (int i = 0; i < head; ++i)
-            taper_[(std::size_t) i] = 0.5f * (1.0f - std::cos (core::kPi * (float) i / (float) head));
+            taper_[(std::size_t) i] = (float) (0.5 * (1.0 - std::cos (core::kPi * (double) i / (double) head)));
         for (int i = 0; i < tail; ++i)
         {
             const int idx = L_ - 1 - i;
-            taper_[(std::size_t) idx] = 0.5f * (1.0f - std::cos (core::kPi * (float) i / (float) tail));
+            taper_[(std::size_t) idx] = (float) (0.5 * (1.0 - std::cos (core::kPi * (double) i / (double) tail)));
         }
     }
 

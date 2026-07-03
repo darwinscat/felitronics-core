@@ -83,7 +83,7 @@ public:
     {
         if (numChannels < 2 || ! enabled_) return;
         if (! widthSm_.isSmoothing() && ! gainSm_.isSmoothing()
-            && widthSm_.getCurrentValue() == 1.0f && gainSm_.getCurrentValue() == 1.0f)
+            && core::exactlyEqual (widthSm_.getCurrentValue(), 1.0f) && core::exactlyEqual (gainSm_.getCurrentValue(), 1.0f))
             return;                                  // settled neutral → bit-exact, skip the round-trip
         float* L = io[0];
         float* R = io[1];

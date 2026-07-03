@@ -202,5 +202,19 @@ int main()
         test::ok (rms (r, N / 2) == 0.0, "right channel stays silent while left is driven (independent state)");
     }
 
+    // --- setters on an UNPREPARED processor must be safe no-ops (empty align_/dryDelay_ vectors) ---
+    test::group ("MultibandCompressor setters before prepare are safe");
+    {
+        multiband::MultibandCompressor<4> mc;                              // NOT prepared
+        const float xf[2] = { 250.0f, 2500.0f };
+        mc.setCrossovers (xf, 2);
+        mc.setBandParams (0, comp (-30.0, 4.0));
+        mc.setBandBypass (1, true); mc.setBandSolo (2, true); mc.setMix (0.5f);
+        (void) mc.setNumBands (3);
+        (void) mc.latencySamples();
+        test::ok (true, "no OOB/crash from setters on an unprepared processor (ASan is the check)");
+        test::ok (mc.prepare (sr, 512, 2), "prepare still succeeds after early setters");
+    }
+
     return test::report();
 }

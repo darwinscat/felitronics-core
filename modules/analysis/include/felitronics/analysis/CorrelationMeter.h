@@ -24,11 +24,15 @@ public:
     void setWindow (double windowMs) noexcept
     {
         const double t = windowMs * 0.001;
-        alpha = (t <= 0.0 || fs <= 0.0) ? 1.0 : (1.0 - std::exp (-1.0 / (t * fs)));
+        alpha = (! (t > 0.0) || fs <= 0.0) ? 1.0 : (1.0 - std::exp (-1.0 / (t * fs)));   // !(t>0) also catches NaN
     }
 
     inline void process (float l, float r) noexcept
     {
+        // A single NaN/inf sample would latch all three one-pole accumulators at NaN FOREVER (the state
+        // never heals) and correlation() would read a false +1.0 from then on. Treat it as 0.
+        if (! std::isfinite (l)) l = 0.0f;
+        if (! std::isfinite (r)) r = 0.0f;
         sLL += alpha * ((double) l * l - sLL);
         sRR += alpha * ((double) r * r - sRR);
         sLR += alpha * ((double) l * r - sLR);

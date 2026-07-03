@@ -110,10 +110,17 @@ public:
     }
 
 private:
+    static double finite (double v, double fallback) noexcept { return std::isfinite (v) ? v : fallback; }
+
     void apply (const DeEsserParams& p) noexcept
     {
-        side_.setParams (eq::FilterType::BandPass, p.fc, p.scQ, 0.0);
-        xover_.setFrequency ((float) p.fc);
+        // Sanitize what feeds the SVF/crossover directly (a NaN fc reaches tan()); threshold/ratio/knee/range
+        // are guarded by the GainComputer, attack/release by the followers' coeff(). Written back to params_
+        // so a later relatch/reset sees safe values too.
+        params_.fc  = finite (p.fc, 7000.0);
+        params_.scQ = finite (p.scQ, 2.0);
+        side_.setParams (eq::FilterType::BandPass, params_.fc, params_.scQ, 0.0);
+        xover_.setFrequency ((float) params_.fc);
         env_.setDetector (p.detector); env_.setTimes (2.0, 2.0);
         gc_.setMode (dynamics::Mode::DownCompress);
         gc_.setThresholdDb (p.thresholdDb); gc_.setRatio (p.ratio); gc_.setKneeDb (p.kneeDb); gc_.setRangeDb (p.rangeDb);
@@ -121,7 +128,7 @@ private:
         link_ = p.link;
 
         dynamiceq::DynamicEqBandParams dp;
-        dp.type = eq::FilterType::Bell; dp.freq = p.fc; dp.Q = p.scQ; dp.mode = dynamiceq::DynamicEqMode::CutWhenLoud;
+        dp.type = eq::FilterType::Bell; dp.freq = params_.fc; dp.Q = params_.scQ; dp.mode = dynamiceq::DynamicEqMode::CutWhenLoud;
         dp.thresholdDb = p.thresholdDb; dp.ratio = p.ratio; dp.kneeDb = p.kneeDb; dp.rangeDb = p.rangeDb;
         dp.attackMs = p.attackMs; dp.releaseMs = p.releaseMs; dp.detector = p.detector; dp.link = p.link;
         deq_.setParams (dp);

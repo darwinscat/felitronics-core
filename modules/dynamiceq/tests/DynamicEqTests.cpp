@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -145,6 +146,27 @@ int main()
         for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
         double md = 0; for (int i = 0; i < N; ++i) { const float r = ref.processSample (0, x[i]); if (i >= 1000) md = std::max (md, (double) std::fabs (y[i] - r)); }
         test::ok (md < 1.0e-3, "ratio=1 dynamic band == a plain Svf Bell (identical shape)");
+    }
+
+    // --- boost when loud (the third mode — previously untested) ---
+    test::group ("DynamicEqBand boost-when-loud");
+    {
+        DP p; p.freq = 1000.0; p.Q = 2.0; p.mode = Mode::BoostWhenLoud; p.thresholdDb = -30.0; p.ratio = 4.0; p.rangeDb = 12.0;
+        DP flat = p; flat.rangeDb = 0.0;                                    // range 0 → no dynamic move
+        const double rB = rmsTail (runTone (p,    1000.0, 0.5, 12000, sr), 6000);
+        const double rF = rmsTail (runTone (flat, 1000.0, 0.5, 12000, sr), 6000);
+        test::ok (rB > 1.5 * rF, "a loud in-band tone is BOOSTED in BoostWhenLoud mode");
+    }
+
+    // --- non-finite params must not poison the stream (NaN freq reaches the Svf's tan() otherwise) ---
+    test::group ("DynamicEqBand non-finite params rejected");
+    {
+        const double qnan = std::numeric_limits<double>::quiet_NaN();
+        DP p; p.freq = qnan; p.Q = qnan; p.staticGainDb = qnan; p.thresholdDb = qnan;
+        p.attackMs = qnan; p.releaseMs = qnan; p.ratio = qnan; p.kneeDb = qnan; p.rangeDb = qnan;
+        auto y = runTone (p, 1000.0, 0.5, 4000, sr);
+        bool fin = true; for (float v : y) fin &= (bool) std::isfinite (v);
+        test::ok (fin, "all-NaN params → finite output (fallbacks applied)");
     }
 
     return test::report();

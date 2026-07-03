@@ -40,8 +40,8 @@ public:
         L = factor; tpp = tapsPerPhase; N = L * tpp;
         channels_ = maxChannels < 1 ? 1 : (maxChannels > core::kMaxChannels ? core::kMaxChannels : maxChannels);
         designFilter();
-        upHist.assign   ((std::size_t) channels_ * tpp, 0.0f);
-        downHist.assign ((std::size_t) channels_ * N,   0.0f);
+        upHist.assign   ((std::size_t) channels_ * (std::size_t) tpp, 0.0f);
+        downHist.assign ((std::size_t) channels_ * (std::size_t) N,   0.0f);
         upPos.assign    ((std::size_t) channels_, 0);
         downPos.assign  ((std::size_t) channels_, 0);
         return true;
@@ -60,7 +60,8 @@ public:
     double filterLatencyOversampled() const noexcept { return (double) (N - 1) * 0.5; }
     // Round-trip (up THEN down) latency in BASEBAND samples. EXACT integer: the two (N-1)/2 OS group
     // delays plus the decimation phase (L-1) combine to (N - L)/L = tpp - 1 baseband samples.
-    int latencySamples() const noexcept { return tpp - 1; }
+    // Unprepared (tpp == 0) reports 0, not -1 — hosts query latency before prepare().
+    int latencySamples() const noexcept { return tpp > 0 ? tpp - 1 : 0; }
 
     // n baseband samples per channel → n*L oversampled samples. out[ch] holds n*L.
     void upsample (const float* const* in, int channels, int n, float* const* out) noexcept
@@ -69,7 +70,7 @@ public:
         for (int c = 0; c < nc; ++c)
         {
             int   pos  = upPos[(std::size_t) c];
-            float* h   = &upHist[(std::size_t) c * tpp];
+            float* h   = &upHist[(std::size_t) c * (std::size_t) tpp];
             for (int m = 0; m < n; ++m)
             {
                 h[pos] = in[c][m];
@@ -96,7 +97,7 @@ public:
         for (int c = 0; c < nc; ++c)
         {
             int   pos = downPos[(std::size_t) c];
-            float* h  = &downHist[(std::size_t) c * N];
+            float* h  = &downHist[(std::size_t) c * (std::size_t) N];
             for (int m = 0; m < n; ++m)
             {
                 for (int p = 0; p < L; ++p) { h[pos] = in[c][m * L + p]; if (++pos >= N) pos = 0; }

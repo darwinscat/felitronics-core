@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 // global allocation counter (no-alloc-in-process proof)
@@ -129,6 +130,26 @@ int main()
         comp.process (ch, 2, n);
         const long after = g_allocs.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
+    }
+
+    // --- non-finite params must not poison the stream (house rule: clamp + reject non-finite) ---
+    test::group ("Compressor non-finite params rejected");
+    {
+        const int n = 2048;
+        std::vector<float> y (n);
+        for (int i = 0; i < n; ++i) y[i] = (float) (0.5 * std::sin (2.0 * core::kPi * 200.0 * i / fs));
+        float* ch[1] { y.data() };
+        dynamics::Compressor comp; comp.prepare (fs, n, 1);
+        dynamics::CompressorParams p;
+        const double qnan = std::numeric_limits<double>::quiet_NaN();
+        p.thresholdDb = -20.0; p.ratio = 4.0;
+        p.attackMs = qnan; p.releaseMs = qnan; p.makeupDb = qnan; p.lookaheadMs = qnan; p.rmsWindowMs = qnan;
+        comp.setParams (p);
+        comp.process (ch, 1, n);
+        bool fin = true; for (float v : y) fin &= (bool) std::isfinite (v);
+        test::ok (fin, "NaN times/makeup/lookahead → finite output");
+        test::ok (comp.latencySamples() >= 0 && comp.latencySamples() <= (int) (50.0 * 0.001 * fs) + 1,
+                  "latency stays within [0, maxLookahead] under NaN lookahead");
     }
 
     return test::report();

@@ -2,8 +2,8 @@
 
 # felitronics-core — what's inside (quick map)
 
-JUCE-free, RT-safe, header-only C++20 DSP. **15 modules · 25 test suites · 1086 checks green**
-(`v0.1.0`). Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
+JUCE-free, RT-safe, header-only C++20 DSP. **15 modules · 28 test suites · 4770 checks green**
+(also green under ASan+UBSan). Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
 
 ## Foundations (building blocks)
 

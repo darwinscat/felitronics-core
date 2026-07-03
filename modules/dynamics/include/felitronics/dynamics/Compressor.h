@@ -126,17 +126,19 @@ private:
         gc.setRatio (p.ratio);
         gc.setKneeDb (p.kneeDb);
         gc.setRangeDb (p.rangeDb);
-        grFollower.setTimes (p.attackMs, p.releaseMs);
+        grFollower.setTimes (p.attackMs, p.releaseMs);   // non-finite times → instant (the follower's coeff guard)
 
-        const double t = p.rmsWindowMs * 0.001;
+        // Non-finite params fall back (house rule): a NaN window/lookahead/makeup would leave a NaN coeff,
+        // feed lround() UB, or poison the per-sample gain.
+        const double t = (std::isfinite (p.rmsWindowMs) ? p.rmsWindowMs : 0.0) * 0.001;
         rmsCoeff = (t <= 0.0 || fs <= 0.0) ? 0.0f : (float) std::exp (-1.0 / (t * fs));
 
-        lookSamples = (int) std::lround (p.lookaheadMs * 0.001 * fs);
+        lookSamples = (int) std::lround ((std::isfinite (p.lookaheadMs) ? p.lookaheadMs : 0.0) * 0.001 * fs);
         if (lookSamples < 0) lookSamples = 0;
         if (lookSamples > maxLookSamples) lookSamples = maxLookSamples;
         for (auto& d : delays) d.setDelay (lookSamples);
 
-        makeupAppliedDb = p.makeupDb + (p.autoMakeup ? autoMakeupDb (gc) : 0.0);
+        makeupAppliedDb = (std::isfinite (p.makeupDb) ? p.makeupDb : 0.0) + (p.autoMakeup ? autoMakeupDb (gc) : 0.0);
     }
 
     double fs = 48000.0;

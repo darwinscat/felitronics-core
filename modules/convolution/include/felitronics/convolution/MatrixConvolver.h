@@ -424,7 +424,8 @@ private:
             if (! mono_) frameR_[(std::size_t) (P_ + phase_)] = in[1][s];
             const float* frL = &frameL_[(std::size_t) (P_ + phase_)];
             const float* frR = mono_ ? nullptr : &frameR_[(std::size_t) (P_ + phase_)];
-            float oL, oR; computeOutputs (sl, phase_, frL, frR, oL, oR);
+            float oL = 0.0f, oR = 0.0f;   // zero-init: the mono path leaves oR unwritten (GCC -Wmaybe-uninitialized at -O2)
+            computeOutputs (sl, phase_, frL, frR, oL, oR);
             out[0][s] = oL;
             if (! mono_) out[1][s] = oR;
             if (++phase_ == P_) { phase_ = 0; chunkAll (false); }
@@ -447,7 +448,7 @@ private:
             if (! mono_) frameR_[(std::size_t) (P_ + phase_)] = in[1][s];
             const float* frL = &frameL_[(std::size_t) (P_ + phase_)];
             const float* frR = mono_ ? nullptr : &frameR_[(std::size_t) (P_ + phase_)];
-            float oLo, oRo, oLn, oRn;
+            float oLo = 0.0f, oRo = 0.0f, oLn = 0.0f, oRn = 0.0f;   // zero-init (see processRange)
             computeOutputs (sOld, phase_, frL, frR, oLo, oRo);
             computeOutputs (sNew, phase_, frL, frR, oLn, oRn);
             out[0][s] = oLo * wOld + oLn * wNew;

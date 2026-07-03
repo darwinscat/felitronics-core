@@ -71,7 +71,7 @@ namespace detail
         const double W   = 0.5 * (sB0 + sB1);
         c.b0 = 0.5 * (W + safeSqrt (W * W + B2));
         c.b1 = 0.5 * (sB0 - sB1);
-        c.b2 = (c.b0 != 0.0) ? -B2 / (4.0 * c.b0) : 0.0;
+        c.b2 = (! core::exactlyEqual (c.b0, 0.0)) ? -B2 / (4.0 * c.b0) : 0.0;   // intentional exact == (see core/Math.h)
     }
 
     // Feasibility of the 3-point (DC, corner, Nyquist) numerator fit: real min-phase b0,b2 exist iff
@@ -97,7 +97,7 @@ namespace detail
         auto upd = [&] (double t) noexcept { if (t >= lo && t <= hi) { const double v = val (t); mn = std::min (mn, v); mx = std::max (mx, v); } };
         upd (lo);
         if (std::isfinite (hi)) upd (hi);
-        else if (d2 != 0.0) { const double v = n2 / d2; mn = std::min (mn, v); mx = std::max (mx, v); }   // t→∞
+        else if (! core::exactlyEqual (d2, 0.0)) { const double v = n2 / d2; mn = std::min (mn, v); mx = std::max (mx, v); }   // t→∞
         const double a = n2 * d1 - n1 * d2, b = 2.0 * (n2 * d0 - n0 * d2), c = n1 * d0 - n0 * d1;
         if (std::abs (a) < 1e-300) { if (std::abs (b) > 1e-300) upd (-c / b); }
         else { const double disc = b * b - 4.0 * a * c; if (disc >= 0.0) { const double s = std::sqrt (disc); upd ((-b + s) / (2.0 * a)); upd ((-b - s) / (2.0 * a)); } }

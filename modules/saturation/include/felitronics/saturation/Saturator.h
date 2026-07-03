@@ -6,6 +6,7 @@
 #include <felitronics/saturation/WaveShaper.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/core/Config.h>
+#include <felitronics/core/DelayLine.h>
 #include <felitronics/core/Math.h>
 
 #include <algorithm>
@@ -60,6 +61,9 @@ public:
         wetPtrs_.assign((std::size_t) channels_, nullptr);
         dcX1_.assign   ((std::size_t) channels_, 0.0f);
         dcY1_.assign   ((std::size_t) channels_, 0.0f);
+        dryDelay_.assign ((std::size_t) channels_, core::DelayLine {});
+        const int lat = (os_ > 1) ? ovs_.latencySamples() : 0;   // align the dry to the wet's round-trip
+        for (auto& d : dryDelay_) { d.prepare (lat); d.setDelay (lat); }
         applyParams();
         prepared_ = true;                                              // fully built — process() may now run
         return true;
@@ -70,6 +74,7 @@ public:
         if (os_ > 1) ovs_.reset();
         std::fill (dcX1_.begin(), dcX1_.end(), 0.0f);
         std::fill (dcY1_.begin(), dcY1_.end(), 0.0f);
+        for (auto& d : dryDelay_) d.reset();
     }
 
     int  latencySamples() const noexcept { return os_ > 1 ? ovs_.latencySamples() : 0; }
@@ -119,29 +124,42 @@ public:
         if (os_ > 1) ovs_.downsample (osPtrs_.data(), nc, n, wetPtrs_.data());
         else for (int c = 0; c < nc; ++c) std::copy (osPtrs_[(std::size_t) c], osPtrs_[(std::size_t) c] + n, wetPtrs_[(std::size_t) c]);
 
-        // 4) drive-compensate the wet, then a linear (peak-safe) dry/wet, then output trim
+        // 4) drive-compensate the wet, then a linear (peak-safe) dry/wet, then output trim. The dry runs
+        //    through a DelayLine matching the oversampler round-trip — an undelayed dry combs the wet at
+        //    mix < 1 (31 samples ≈ −7 dB notch-ripple at 1 kHz / 48 k).
         for (int c = 0; c < nc; ++c)
+        {
+            core::DelayLine& dl = dryDelay_[(std::size_t) c];
             for (int i = 0; i < n; ++i)
             {
-                const float dry = io[c][i];
+                const float dry = dl.process (io[c][i]);
                 const float wet = comp_ * wetPtrs_[(std::size_t) c][i];
                 io[c][i] = outGain_ * ((1.0f - mix_) * dry + mix_ * wet);
             }
+        }
     }
 
 private:
+    static float finite (float v, float fallback) noexcept { return std::isfinite (v) ? v : fallback; }
+
     void applyParams() noexcept
     {
+        // Non-finite params fall back to the struct defaults (house rule) — std::clamp passes NaN through.
+        const float driveDb  = finite (params_.driveDb,   3.0f);
+        const float bias     = finite (params_.bias,      0.0f);
+        const float autoComp = finite (params_.autoComp,  0.5f);
+        const float dcHz     = finite (params_.dcBlockHz, 10.0f);
         shaper_.setShape (params_.shape);
-        shaper_.setBias  (params_.bias);
-        shaper_.setDrive (core::dbToGain (params_.driveDb) - 1.0f);     // driveDb 0 → k≈0 (linear)
-        comp_    = std::pow (std::max (1.0e-6f, shaper_.slopeAtZero()), -std::clamp (params_.autoComp, 0.0f, 1.0f));
-        mix_     = std::clamp (params_.mix, 0.0f, 1.0f);
-        outGain_ = core::dbToGain (params_.outputDb);
+        shaper_.setBias  (bias);
+        shaper_.setDrive ((float) (core::dbToGain (driveDb) - 1.0));    // driveDb 0 → k≈0 (linear)
+        comp_    = (float) std::pow ((double) std::max (1.0e-6f, shaper_.slopeAtZero()),
+                                     (double) -std::clamp (autoComp, 0.0f, 1.0f));
+        mix_     = std::clamp (finite (params_.mix, 1.0f), 0.0f, 1.0f);
+        outGain_ = (float) core::dbToGain (finite (params_.outputDb, 0.0f));
         const double fsOs = fs_ * (double) os_;
-        const double fc   = std::clamp ((double) params_.dcBlockHz, 0.0, 0.49 * fsOs);
+        const double fc   = std::clamp ((double) dcHz, 0.0, 0.49 * fsOs);
         dcR_ = (fc <= 0.0) ? 0.0f : (float) std::exp (-2.0 * core::kPi * fc / fsOs);
-        dcEnabled_ = (params_.dcBlockHz > 0.0f) && (params_.shape == WaveShaper::Shape::Asym);
+        dcEnabled_ = (dcHz > 0.0f) && (params_.shape == WaveShaper::Shape::Asym);
     }
 
     Params      params_ {};
@@ -157,6 +175,7 @@ private:
     std::vector<float>  osBuf_, wetBuf_;
     std::vector<float*> osPtrs_, wetPtrs_;
     std::vector<float>  dcX1_, dcY1_;
+    std::vector<core::DelayLine> dryDelay_;    // per channel, os round-trip — keeps the dry/wet mix comb-free
 };
 
 } // namespace felitronics::saturation
