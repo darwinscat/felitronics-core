@@ -5,6 +5,13 @@
 
 **Status:** draft / in progress · **Owner:** Darwin's Cat (Felitronics line) · **Started:** 2026-06.
 
+> **🔴 #1 open performance debt.** The core ships only a scalar FFT backend (`ScalarRadix2Real` =
+> `DefaultRealFft`, `core/Fft.h:145`) and a scalar `O(P)` direct-head FIR in the partitioned convolvers,
+> so long-convolution cost **explodes at host block 2048+**. Latent for shipped OrbitCab (its IR cab uses
+> `juce::dsp::Convolution`); a **blocker** for `convolution` / `lineareq` products. Full analysis, fix
+> plan and acceptance criteria (perf at 2048+, not just a null-match):
+> [`PERF-SCALAR-FFT-BOTTLENECK.md`](PERF-SCALAR-FFT-BOTTLENECK.md).
+
 `felitronics-core` is a **shared, framework-agnostic, JUCE-free DSP core** for the whole product
 family. One set of battle-tested, real-time-safe DSP primitives that every product builds on:
 plugins (TabbyEQ, a future compressor / true-peak limiter), the **guitar amp** plugin (already
