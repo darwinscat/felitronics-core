@@ -32,9 +32,12 @@ namespace felitronics::lineareq
 // causal bulk shift, and reports that shift as latency.
 //
 // RT-UNSAFE (message thread): prepare()/build() allocate / run FFTs. Pairs with ConvolutionEngine for the swap.
-template <class Fft = core::fft::DefaultRealFft>
+template <class Fft = core::fft::ScalarRadix2Real>   // ALWAYS the packed-Hermitian designer — the default must stay valid past a DefaultRealFft→SIMD flip
 class MixedPhaseFir
 {
+    static_assert (core::fft::PackedHermitianSpectrum<Fft>,
+                   "MixedPhaseFir hand-packs the scalar packed-Hermitian spectrum (DC, Nyquist, re/im pairs); "
+                   "instantiate it with a packed-Hermitian backend (ScalarRadix2Real), never a SIMD z-order backend");
 public:
     // designSize D: a power of two, ≥ ~8× the FIR length you intend to keep. Message thread.
     bool prepare (int designSize)

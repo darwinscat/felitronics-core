@@ -85,6 +85,8 @@ template class  felitronics::convolution::PartitionedConvolver<felitronics::core
 template class  felitronics::convolution::ConvolutionEngine<felitronics::core::fft::DefaultRealFft, 2>;
 template class  felitronics::convolution::MatrixConvolver<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::lineareq::MixedPhaseFir<felitronics::core::fft::DefaultRealFft>;
+template class  felitronics::lineareq::BasicLinearPhaseEq<felitronics::core::fft::DefaultRealFft>;
+template class  felitronics::lineareq::BasicNaturalPhaseEq<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::eq::MultibandSplitter<4>;
 template class  felitronics::multiband::MultibandProcessor<felitronics::dynamics::Compressor, 4>;
 template class  felitronics::multiband::MultibandCompressor<4>;
