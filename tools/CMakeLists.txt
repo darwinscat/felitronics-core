@@ -18,6 +18,17 @@ if(FELITRONICS_WITH_PFFFT)
     target_compile_definitions(fcore_fftbench PRIVATE FELITRONICS_WITH_PFFFT)
 endif()
 
+# Optional JUCE/vDSP FFT reference column — FetchContent's JUCE INTO THE BENCH ONLY (never the core/product).
+option(FELITRONICS_BENCH_JUCE "Fetch JUCE and add a JUCE-FFT reference column to fcore_fftbench" OFF)
+if(FELITRONICS_BENCH_JUCE)
+    include(FetchContent)
+    FetchContent_Declare(juce GIT_REPOSITORY https://github.com/juce-framework/JUCE.git GIT_TAG 8.0.4 GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(juce)
+    target_link_libraries(fcore_fftbench PRIVATE juce::juce_dsp juce::juce_events)
+    target_compile_definitions(fcore_fftbench PRIVATE
+        FELITRONICS_BENCH_JUCE=1 JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0 JUCE_STANDALONE_APPLICATION=1)
+endif()
+
 # eqviz — renders PNG "quality pictures" (heatmaps + curve sheets) of every eq filter type against
 # independent analog references. Offline; catches parameter-corner bugs eyes-first (see tools/eqviz).
 add_executable(eqviz eqviz/eqviz.cpp)
