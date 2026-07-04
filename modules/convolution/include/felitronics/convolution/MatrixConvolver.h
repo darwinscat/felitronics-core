@@ -193,8 +193,8 @@ private:
     // Holds IR data only — reset() does NOT clear it (history lives in the FDL / frames, not here).
     struct Bank
     {
-        std::vector<float> h0;        // P: direct (head) taps
-        std::vector<float> irSpec;    // maxParts × specF: tail partition spectra
+        std::vector<float>              h0;      // P: direct (head) taps (time domain — plain)
+        core::fft::AlignedVector<float> irSpec;  // maxParts × specF: tail partition spectra — SIMD-aligned (seam)
         int numParts = 0;
 
         void prepare (int P, int maxParts, int specF)
@@ -215,7 +215,7 @@ private:
             int parts = (tailLen > 0) ? ((tailLen + P - 1) / P) : 0;
             if (parts > maxParts) parts = maxParts;
 
-            std::vector<float> part ((std::size_t) (2 * P), 0.0f);
+            core::fft::AlignedVector<float> part ((std::size_t) (2 * P), 0.0f);   // forward input — aligned
             for (int j = 0; j < parts; ++j)
             {
                 std::fill (part.begin(), part.end(), 0.0f);
@@ -273,7 +273,7 @@ private:
     }
 
     // acc_ += Σ_j srcFdl[(base-j) wrap] .* bank.irSpec[j]  (direct — L or R history against one bank)
-    void macBank (const std::vector<float>& srcFdl, const Bank& bank, int base) noexcept
+    void macBank (const core::fft::AlignedVector<float>& srcFdl, const Bank& bank, int base) noexcept
     {
         for (int j = 0; j < bank.numParts; ++j)
         {
@@ -468,9 +468,10 @@ private:
     Fft fft_;                                            // audio-thread FFT (chunkAll / computeTails)
     Fft buildFft_;                                        // message-thread FFT (Bank::build) — separate, no race
     Slot slot_[2];
-    std::vector<float> frameL_, frameR_;                  // 2P each: [prev | current] input accumulators
-    std::vector<float> fdlL_, fdlR_;                      // maxParts × specF: rings of past raw L/R input spectra
-    std::vector<float> inputSpec_, viewSpec_, acc_, ifftOut_, tmpTailA_, tmpTailB_;   // shared FFT scratch
+    core::fft::AlignedVector<float> frameL_, frameR_;     // 2P each: [prev | current] input accumulators (seam: forward input)
+    core::fft::AlignedVector<float> fdlL_, fdlR_;         // maxParts × specF: rings of past raw L/R input spectra (seam)
+    core::fft::AlignedVector<float> inputSpec_, viewSpec_, acc_, ifftOut_;   // shared FFT scratch — SIMD-aligned (seam)
+    std::vector<float> tmpTailA_, tmpTailB_;              // P each: time-domain tail scratch (plain)
     std::atomic<int> state_ { 0 };                        // 0 Idle · 1 Pending (staged) · 2 Crossfading
     bool prepared_ = false;
     bool mono_ = false;

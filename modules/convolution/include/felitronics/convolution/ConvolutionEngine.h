@@ -149,11 +149,11 @@ private:
     // Per-channel: ONE running input history shared by TWO IR coefficient slots.
     struct Chan
     {
-        std::vector<float> frame;            // 2P: [previous chunk | current chunk] input accumulator
-        std::vector<float> fdl;              // maxParts × specF: ring of past INPUT spectra (IR-independent)
-        std::vector<float> pendingTail[2];   // P each: cached tail output per slot
-        std::vector<float> h0[2];            // P each: direct (head) taps per slot
-        std::vector<float> irSpec[2];        // maxParts × specF each: tail partition spectra per slot
+        core::fft::AlignedVector<float> frame;       // 2P: [prev | current] input accumulator (seam: forward input)
+        core::fft::AlignedVector<float> fdl;         // maxParts × specF: ring of past INPUT spectra (seam)
+        std::vector<float> pendingTail[2];   // P each: cached tail output per slot (time domain — plain)
+        std::vector<float> h0[2];            // P each: direct (head) taps per slot (time domain — plain)
+        core::fft::AlignedVector<float> irSpec[2];   // maxParts × specF each: tail partition spectra (seam)
         int numParts[2] { 0, 0 };
 
         void prepare (int P, int N, int specF, int maxParts)
@@ -188,7 +188,7 @@ private:
             int parts = (tailLen > 0) ? ((tailLen + P - 1) / P) : 0;
             if (parts > maxParts) parts = maxParts;
 
-            std::vector<float> part ((std::size_t) (2 * P), 0.0f);
+            core::fft::AlignedVector<float> part ((std::size_t) (2 * P), 0.0f);   // forward input — aligned
             for (int j = 0; j < parts; ++j)
             {
                 std::fill (part.begin(), part.end(), 0.0f);
@@ -323,7 +323,7 @@ private:
     Fft fft_;                                            // audio-thread FFT (chunkAll / macSlot / primeTail)
     Fft buildFft_;                                        // message-thread FFT (buildIr) — separate, so an IR build never races the audio FFT
     Chan chan_[(std::size_t) MaxChannels];               // size_t cast: GCC -Wsign-conversion flags a dependent int bound
-    std::vector<float> inputSpec_, acc_, ifftOut_;        // shared FFT scratch (one channel at a time)
+    core::fft::AlignedVector<float> inputSpec_, acc_, ifftOut_;   // shared FFT scratch — SIMD-aligned (seam)
     std::atomic<int> state_ { 0 };                        // 0 Idle · 1 Pending (staged) · 2 Crossfading
     bool prepared_ = false;                               // true ONLY after a fully-successful prepare(); setIr()/process() reject until then (a partial/failed prepare leaves it false even if P_>0)
     int P_ = 0, N_ = 0, specF_ = 0, maxParts_ = 0, channels_ = 1;

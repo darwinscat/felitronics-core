@@ -82,7 +82,7 @@ public:
         int parts = (tailLen > 0) ? ((tailLen + P_ - 1) / P_) : 0;
         if (parts > maxParts_) parts = maxParts_;
 
-        std::vector<float> part ((std::size_t) N_, 0.0f);
+        core::fft::AlignedVector<float> part ((std::size_t) N_, 0.0f);   // forward input — aligned
         for (int j = 0; j < parts; ++j)
         {
             std::fill (part.begin(), part.end(), 0.0f);
@@ -153,7 +153,8 @@ private:
     Fft fft_;
     int P_ = 0, N_ = 0, specF_ = 0, maxParts_ = 0, numParts_ = 0, phase_ = 0, fdlPos_ = 0;
     bool prepared_ = false;                                   // true only after a fully-successful prepare()
-    std::vector<float> frame_, h0_, pendingTail_, inputSpec_, acc_, ifftOut_, fdl_, irSpec_;
+    core::fft::AlignedVector<float> frame_, inputSpec_, acc_, ifftOut_, fdl_, irSpec_;   // seam-crossing — SIMD-aligned
+    std::vector<float> h0_, pendingTail_;                                                // time domain — plain
 };
 
 } // namespace felitronics::convolution
