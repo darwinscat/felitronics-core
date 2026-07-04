@@ -57,6 +57,10 @@
 #include <felitronics/stereo/MonoBass.h>
 #include <felitronics/stereo/StereoWidth.h>
 
+#if defined(FELITRONICS_WITH_PFFFT)   // optional compiled SIMD backend — header only reaches the gate when the option is ON
+#include <felitronics/fftpffft/PffftRealFft.h>
+#endif
+
 // The teq compat shims are public too — they are what TabbyEQ/OrbitCab actually include.
 #include <teq/EqBand.h>
 #include <teq/EqEngine.h>
@@ -87,6 +91,9 @@ template class  felitronics::convolution::MatrixConvolver<felitronics::core::fft
 template class  felitronics::lineareq::MixedPhaseFir<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::lineareq::BasicLinearPhaseEq<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::lineareq::BasicNaturalPhaseEq<felitronics::core::fft::DefaultRealFft>;
+#if defined(FELITRONICS_WITH_PFFFT)   // the SIMD backend through the strict gate: PR2's C1 static_asserts + the row-stride precondition
+template class  felitronics::convolution::MatrixConvolver<felitronics::fftpffft::PffftRealFft>;
+#endif
 template class  felitronics::eq::MultibandSplitter<4>;
 template class  felitronics::multiband::MultibandProcessor<felitronics::dynamics::Compressor, 4>;
 template class  felitronics::multiband::MultibandCompressor<4>;

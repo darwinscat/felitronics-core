@@ -4,7 +4,8 @@
 
 **JUCE-free, real-time-safe, header-only C++20 DSP core** for the Darwin's Cat audio plugins
 (TabbyEQ, OrbitCab, …). A set of independent `process()`-RT-safe modules — each its own namespace +
-CMake target, each with framework-free self-tests. **No external dependencies: pure C++20 standard library.**
+CMake target, each with framework-free self-tests. **No external dependencies by default: pure C++20 standard
+library** — plus one opt-in, vendored SIMD FFT backend (`fftpffft`, `-DFELITRONICS_WITH_PFFFT=ON`, default OFF).
 
 [![ci](https://github.com/darwinscat/felitronics-core/actions/workflows/ci.yml/badge.svg)](https://github.com/darwinscat/felitronics-core/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
@@ -22,7 +23,8 @@ quality maps of every `eq` filter vs independent analog references, regenerated 
 crossovers) · `lineareq` (linear- & mixed-phase "Natural" FIR EQ over partitioned convolution) ·
 `convolution` (zero-latency partitioned convolver · click-free IR swap) · `dynamics` · `multiband` ·
 `dynamiceq` · `deesser` · `stereo` · `saturation` · `dither` · `oversampling` · `limiter` (true-peak) ·
-`analysis` (LUFS/LRA · dBTP true-peak · correlation) · `neural` (inference seam).
+`analysis` (LUFS/LRA · dBTP true-peak · correlation) · `neural` (inference seam) ·
+`fftpffft` (**optional** compiled SIMD FFT backend — vendored pffft, `-DFELITRONICS_WITH_PFFFT=ON`).
 
 Each module links on its own (`felitronics::eq`, `felitronics::lineareq`, …) — pull only what you use.
 Every module ships JUCE-free self-tests (measured audio == analytic truth).
