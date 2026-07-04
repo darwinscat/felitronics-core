@@ -22,9 +22,9 @@ namespace felitronics::convolution
 // publishStaged/setIr/process/reset/isBusy/latencySamples()==0 signatures, so lineareq's
 // `using Conv = MatrixConvolver<AudioFft>` becomes `= MatrixConvolverNupc<AudioFft>` with no other change.
 //
-// PHASED BUILD. This is PHASE 2: mono + LRDiag topologies, instant operator swap (no click-free crossfade yet).
-//   • Phase 3 will ADD the MSDiag / Full routing branches (macView forms the ½(X_L ± X_R) spectral views per
-//     stage from the same per-stage L/R FDLs — the structure below is already channel-indexed for it).
+// PHASED BUILD. This is PHASE 3: ALL topologies (mono / LRDiag / MSDiag / Full), instant operator swap.
+//   • MSDiag forms the ½(X_L ± X_R) spectral views PER STAGE from the per-stage L/R FDLs (macViewStage), MACs
+//     bank_M / bank_S, and decodes yL = yM+yS, yR = yM−yS; Full does the 4-bank cross sums per stage.
 //   • Phase 4 will replace the instant swap with the 2-slot smoothstep warm crossfade (the state_/cur_/two-slot
 //     machinery + the tail-prime-from-warm-FDL are already here; only the fade branch is stubbed instant).
 //
@@ -77,12 +77,15 @@ public:
 
         warmXfade_ = crossfadeSamples < 1 ? 1 : crossfadeSamples;
 
-        int maxSpecF = 1, maxN = 1;
-        for (int st = 0; st < numStages_; ++st) { maxSpecF = std::max (maxSpecF, spec_[st].specF); maxN = std::max (maxN, spec_[st].N); }
+        int maxSpecF = 1, maxN = 1, maxB = 1;
+        for (int st = 0; st < numStages_; ++st) { maxSpecF = std::max (maxSpecF, spec_[st].specF); maxN = std::max (maxN, spec_[st].N); maxB = std::max (maxB, spec_[st].B); }
         inputSpec_.assign ((std::size_t) maxSpecF, 0.0f);
+        viewSpec_.assign  ((std::size_t) maxSpecF, 0.0f);
         acc_.assign       ((std::size_t) maxSpecF, 0.0f);
         ifftOut_.assign   ((std::size_t) maxN,     0.0f);
         buildBuf_.assign  ((std::size_t) maxN,     0.0f);
+        tmpTailA_.assign  ((std::size_t) maxB,     0.0f);
+        tmpTailB_.assign  ((std::size_t) maxB,     0.0f);
 
         for (int ch = 0; ch < channels_; ++ch) { headHist_[ch].assign ((std::size_t) P0_, 0.0f); headPos_[ch] = 0; }
 
@@ -155,12 +158,11 @@ public:
     }
 
     // Build the operator into the inactive slot WITHOUT publishing (the surround ST-only path stages every
-    // instance then publishes back-to-back). PHASE 2: mono + LRDiag only — MSDiag/Full are rejected (Phase 3).
+    // instance then publishes back-to-back). All topologies (mono / LRDiag / MSDiag / Full) are supported.
     bool stageOperator (Topology topo, const float* const* banks, int numBanks, int len)
     {
         if (! prepared_ || banks == nullptr || state_.load (std::memory_order_acquire) != 0) return false;
         const Topology t = mono_ ? Topology::LRDiag : topo;
-        if (! mono_ && (t == Topology::MSDiag || t == Topology::Full)) return false;   // Phase 3 — not yet supported
         const int nb = mono_ ? 1 : numBanksFor (t);
         if (numBanks < nb) return false;
         const int stg = 1 - cur_;
@@ -295,6 +297,24 @@ private:
         }
     }
 
+    // acc_ += Σ_j (½(X_L ± X_R))[base-j] .* bank.irSpec[st][j] — the on-the-fly per-stage M/S spectral view
+    // (sign +→M, −→S), formed elementwise over the stage's spectrum floats by FFT layout-linearity.
+    void macViewStage (const Bank& bank, int st, int base, float sign) noexcept
+    {
+        const int C = spec_[st].C, specF = spec_[st].specF;
+        const core::fft::AlignedVector<float>& fL = hist_[(std::size_t) st].fdl[0];
+        const core::fft::AlignedVector<float>& fR = hist_[(std::size_t) st].fdl[1];
+        for (int j = 0; j < bank.activeParts[st]; ++j)
+        {
+            int idx = base - j; if (idx < 0) idx += C;
+            const float* xl = &fL[(std::size_t) idx * (std::size_t) specF];
+            const float* xr = &fR[(std::size_t) idx * (std::size_t) specF];
+            for (int i = 0; i < specF; ++i) viewSpec_[(std::size_t) i] = 0.5f * (xl[i] + sign * xr[i]);
+            hist_[(std::size_t) st].fft.spectralMultiplyAdd (viewSpec_.data(),
+                                                             &bank.irSpec[(std::size_t) st][(std::size_t) j * (std::size_t) specF], acc_.data());
+        }
+    }
+
     void invAccToStage (std::vector<float>& tail, int st) noexcept
     {
         hist_[(std::size_t) st].fft.inverse (acc_.data(), ifftOut_.data());
@@ -316,9 +336,22 @@ private:
                 clearAcc (st); macBankStage (hist_[(std::size_t) st].fdl[0], sl.banks[0], st, base); invAccToStage (sl.tail[(std::size_t) st][0], st);
                 clearAcc (st); macBankStage (hist_[(std::size_t) st].fdl[1], sl.banks[1], st, base); invAccToStage (sl.tail[(std::size_t) st][1], st);
                 break;
+
             case Topology::MSDiag:
+                clearAcc (st); macViewStage (sl.banks[0], st, base, +1.0f); invAccToStage (tmpTailA_, st);   // yM tail
+                clearAcc (st); macViewStage (sl.banks[1], st, base, -1.0f); invAccToStage (tmpTailB_, st);   // yS tail
+                for (int i = 0; i < spec_[st].B; ++i)
+                {
+                    const float m = tmpTailA_[(std::size_t) i], sd = tmpTailB_[(std::size_t) i];   // m = yM, sd = yS
+                    sl.tail[(std::size_t) st][0][(std::size_t) i] = m + sd;   // decode yL = yM + yS
+                    sl.tail[(std::size_t) st][1][(std::size_t) i] = m - sd;   //        yR = yM − yS
+                }
+                break;
+
             case Topology::Full:
-                break;   // Phase 3
+                clearAcc (st); macBankStage (hist_[(std::size_t) st].fdl[0], sl.banks[0], st, base); macBankStage (hist_[(std::size_t) st].fdl[1], sl.banks[1], st, base); invAccToStage (sl.tail[(std::size_t) st][0], st);   // yL = LL∗xL + LR∗xR
+                clearAcc (st); macBankStage (hist_[(std::size_t) st].fdl[0], sl.banks[2], st, base); macBankStage (hist_[(std::size_t) st].fdl[1], sl.banks[3], st, base); invAccToStage (sl.tail[(std::size_t) st][1], st);   // yR = RL∗xL + RR∗xR
+                break;
         }
     }
 
@@ -363,8 +396,50 @@ private:
                 break;
             }
             case Topology::MSDiag:
+            {
+                const std::vector<float>& hM = sl.banks[0].h0;
+                const std::vector<float>& hS = sl.banks[1].h0;
+                const int pos0 = headPos_[0], pos1 = headPos_[1], mask = headMask_;
+                float headM = 0.0f, headS = 0.0f;                          // form m/s on the fly by linearity
+                for (int i = 0; i < P0_; ++i)
+                {
+                    const float l = headHist_[0][(std::size_t) ((pos0 - i) & mask)];
+                    const float r = headHist_[1][(std::size_t) ((pos1 - i) & mask)];
+                    headM += hM[(std::size_t) i] * 0.5f * (l + r);
+                    headS += hS[(std::size_t) i] * 0.5f * (l - r);
+                }
+                float yl = headM + headS, yr = headM - headS;             // tails already decoded to yL/yR
+                for (int st = 0; st < numStages_; ++st)
+                {
+                    const int ph = hist_[(std::size_t) st].phase;
+                    yl += sl.tail[(std::size_t) st][0][(std::size_t) ph];
+                    yr += sl.tail[(std::size_t) st][1][(std::size_t) ph];
+                }
+                out[0][s] = yl; out[1][s] = yr;
+                break;
+            }
             case Topology::Full:
-                break;   // Phase 3
+            {
+                const std::vector<float>& LL = sl.banks[0].h0, & LR = sl.banks[1].h0, & RL = sl.banks[2].h0, & RR = sl.banks[3].h0;
+                const int pos0 = headPos_[0], pos1 = headPos_[1], mask = headMask_;
+                float hLL = 0.0f, hLR = 0.0f, hRL = 0.0f, hRR = 0.0f;
+                for (int i = 0; i < P0_; ++i)
+                {
+                    const float l = headHist_[0][(std::size_t) ((pos0 - i) & mask)];
+                    const float r = headHist_[1][(std::size_t) ((pos1 - i) & mask)];
+                    hLL += LL[(std::size_t) i] * l; hLR += LR[(std::size_t) i] * r;
+                    hRL += RL[(std::size_t) i] * l; hRR += RR[(std::size_t) i] * r;
+                }
+                float yl = hLL + hLR, yr = hRL + hRR;
+                for (int st = 0; st < numStages_; ++st)
+                {
+                    const int ph = hist_[(std::size_t) st].phase;
+                    yl += sl.tail[(std::size_t) st][0][(std::size_t) ph];
+                    yr += sl.tail[(std::size_t) st][1][(std::size_t) ph];
+                }
+                out[0][s] = yl; out[1][s] = yr;
+                break;
+            }
         }
     }
 
@@ -390,7 +465,8 @@ private:
     StageSpec spec_[kMaxStages] {};
     Slot slot_[2];
     std::vector<float> headHist_[2];                               // P0 ring per channel (time domain)
-    core::fft::AlignedVector<float> inputSpec_, acc_, ifftOut_, buildBuf_;   // shared scratch, sized to the largest stage
+    core::fft::AlignedVector<float> inputSpec_, viewSpec_, acc_, ifftOut_, buildBuf_;   // shared scratch (seam), sized to the largest stage
+    std::vector<float> tmpTailA_, tmpTailB_;                                            // max-B M/S decode scratch (time domain)
     std::atomic<int> state_ { 0 };                                 // 0 Idle · 1 Pending (staged) — Phase 4 adds 2 Crossfading
     bool prepared_ = false;
     bool mono_ = false;
