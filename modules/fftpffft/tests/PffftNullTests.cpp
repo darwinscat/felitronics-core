@@ -15,6 +15,7 @@
 #include <felitronics_test.h>
 #include <felitronics/convolution/MatrixConvolver.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/fftpffft/PffftRealFft.h>
 
 #include <algorithm>
@@ -198,6 +199,42 @@ int main()
             std::printf ("      NUPC capped block=%3d  err=%.2e (peak %.2e, rel %.2e)\n", block, e, pk, e / (pk + 1e-30));
             test::ok (e < 1e-4 * pk + 1e-6, "NUPC pffft nulls scalar (capped, block=" + std::to_string (block) + ")");
         }
+    }
+
+    // --- MatrixConvolverNupc (Phase-2 matrix facade) cross-backend NULL: pffft z-order through the per-stage
+    //     channel-indexed FDL + LRDiag routing (mono + LRDiag) ---
+    test::group ("cross-backend NULL: MatrixConvolverNupc<Pffft> == <Scalar> (mono + LRDiag)");
+    {
+        using McnS = convolution::MatrixConvolverNupc<Scalar>;
+        using McnP = convolution::MatrixConvolverNupc<Pf>;
+        const int nuLen = 5000, nuMax = 8192, nuN = 9000;
+        Lcg rn { 13579 };
+        std::vector<float> hL ((std::size_t) nuLen), hR ((std::size_t) nuLen);
+        for (auto& v : hL) v = 0.06f * rn.next(); for (auto& v : hR) v = 0.06f * rn.next();
+        std::vector<float> xL ((std::size_t) nuN), xR ((std::size_t) nuN);
+        for (auto& v : xL) v = 0.3f * rn.next(); for (auto& v : xR) v = 0.3f * rn.next();
+
+        // mono
+        { McnS s; McnP p; s.prepare (128, nuMax, 128, 1); p.prepare (128, nuMax, 128, 1);
+          s.setIr (hL.data(), nuLen); p.setIr (hL.data(), nuLen);
+          std::vector<float> ys = xL, yp = xL;
+          for (int o = 0; o < nuN; o += 512) { const int m = std::min (512, nuN - o); const float* a[1] { ys.data() + o }; const float* b[1] { yp.data() + o }; float* ao[1] { ys.data() + o }; float* bo[1] { yp.data() + o }; s.process (a, ao, 1, m); p.process (b, bo, 1, m); }
+          const double e = maxDiff (ys, yp), pk = peak (ys);
+          std::printf ("      MatrixConvolverNupc mono err=%.2e (peak %.2e, rel %.2e)\n", e, pk, e / (pk + 1e-30));
+          test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc mono: pffft nulls scalar"); }
+
+        // LRDiag, non-power-of-two block
+        { McnS s; McnP p; s.prepare (128, nuMax, 128, 2); p.prepare (128, nuMax, 128, 2);
+          const float* bk[2] { hL.data(), hR.data() };
+          s.setOperator (McnS::Topology::LRDiag, bk, 2, nuLen); p.setOperator (McnP::Topology::LRDiag, bk, 2, nuLen);
+          std::vector<float> sL = xL, sR = xR, pL = xL, pR = xR;
+          for (int o = 0; o < nuN; o += 257) { const int m = std::min (257, nuN - o);
+            const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
+            const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
+            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+          const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
+          std::printf ("      MatrixConvolverNupc LRDiag@257 err=%.2e (peak %.2e, rel %.2e)\n", e, pk, e / (pk + 1e-30));
+          test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc LRDiag: pffft nulls scalar"); }
     }
 
     // --- mid-stream topology swap: both backends run the same MSDiag->Full swap; parity incl. the fade ---
