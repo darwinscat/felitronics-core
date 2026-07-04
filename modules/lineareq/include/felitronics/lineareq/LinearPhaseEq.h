@@ -71,7 +71,7 @@ public:
         for (auto& f : fir_)  f.assign ((std::size_t) (N_ + 1), 0.0f);       // up to 4 entry IRs
         computeWindow();
 
-        int part = 64; while (part < maxBlock_) part <<= 1;     // partition ≥ maxBlock, pow2
+        const int part = kPartition;                           // FIXED, DECOUPLED from the host block (see kPartition)
         // SHORT crossfade for interactive swaps (MatrixConvolver keeps ONE warm L/R history shared by two
         // operator slots, so a swapped operator is response-correct immediately — only a short anti-click
         // fade is needed, ≥ the partition P). The engine derives its OWN long fade for the COLD first
@@ -187,6 +187,13 @@ public:
     }
 
 private:
+    // The internal convolver partition, DECOUPLED from the host block. The partitioned convolver is a per-sample
+    // engine whose FFT step fires every P samples (phase wraps at P) regardless of the host block, so P need not
+    // track maxBlock. A measure-off (2026-07) showed cost is dominated by the O(P)/sample scalar direct head, so
+    // the old `P ≥ maxBlock` made CPU BLOW UP with the host block (a 131072-tap FIR ~4× costlier at block 8192
+    // than 2048). A FIXED small P makes cost BLOCK-INDEPENDENT; 128 is the measured sweet spot across the quality
+    // range and both FFT backends. Zero latency is preserved regardless of P (the head covers the first P taps).
+    static constexpr int kPartition = 128;
     using DesignFft = core::fft::ScalarRadix2Real;   // FIR design hand-packs the scalar packed-Hermitian layout → pinned
     static_assert (core::fft::PackedHermitianSpectrum<DesignFft>, "design FFT must be packed-Hermitian (gridToSymmetricFir)");
     using Conv      = convolution::MatrixConvolver<AudioFft>;   // audio path — swappable to a SIMD backend

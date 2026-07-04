@@ -81,7 +81,7 @@ public:
         entryTime_.assign ((std::size_t) D_, 0.0f);
         computeTaper();
 
-        int part = 64; while (part < maxBlock_) part <<= 1;     // partition ≥ maxBlock, pow2
+        const int part = kPartition;                           // FIXED, DECOUPLED from the host block (see kPartition)
         const int warmXfade = std::max (2 * part, (int) std::lround (0.02 * fs_));   // short anti-click fade
         chConv_.clear();
         if (channels_ > 2)                                      // non-stereo: per-channel mono ST-only operators
@@ -196,6 +196,11 @@ public:
     }
 
 private:
+    // Internal convolver partition, DECOUPLED from the host block (the convolver's FFT step fires every P samples
+    // regardless of block size). A measure-off (2026-07) showed the O(P)/sample scalar head dominates, so the old
+    // `P ≥ maxBlock` made CPU grow with the host block; a FIXED small P makes it BLOCK-INDEPENDENT. 128 is the
+    // measured sweet spot; the reported latency (bulkDelay_) is independent of P. See LinearPhaseEq::kPartition.
+    static constexpr int kPartition = 128;
     using DesignFft = core::fft::ScalarRadix2Real;   // cepstral FIR design hand-packs the scalar packed-Hermitian layout → pinned
     static_assert (core::fft::PackedHermitianSpectrum<DesignFft>, "design FFT must be packed-Hermitian (buildFullBanks/MixedPhaseFir)");
     using Conv      = convolution::MatrixConvolver<AudioFft>;   // audio path — swappable to a SIMD backend
