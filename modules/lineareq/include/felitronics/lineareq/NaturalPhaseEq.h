@@ -46,7 +46,8 @@ namespace felitronics::lineareq
 // Same threading contract as LinearPhaseEq: setBands()/buildFir()/prepare() are RT-UNSAFE (message thread,
 // host-serialised); process() is RT-safe. To change quality, re-prepare(); the blend k changes LIVE via
 // setBlend() (the bulk delay is fixed, so PDC never moves — no re-prepare).
-class NaturalPhaseEq
+template <core::fft::RealFftBackend AudioFft = core::fft::DefaultRealFft>
+class BasicNaturalPhaseEq
 {
 public:
     static constexpr int kNumQuality = 4;                       // kept-IR length (L) per quality — lighter than Linear
@@ -76,7 +77,7 @@ public:
         for (auto& g : laneIm_) g.assign ((std::size_t) (D_ / 2 + 1), 0.0);
         for (auto& g : accRe_)  g.assign ((std::size_t) (D_ / 2 + 1), 0.0);   // composed 2×2 entry spectra (Full)
         for (auto& g : accIm_)  g.assign ((std::size_t) (D_ / 2 + 1), 0.0);
-        packSpec_.assign  ((std::size_t) D_, 0.0f);
+        packSpec_.assign  ((std::size_t) DesignFft::spectrumFloats (D_), 0.0f);   // packed-Hermitian scratch (== D_ for the pinned scalar)
         entryTime_.assign ((std::size_t) D_, 0.0f);
         computeTaper();
 
@@ -195,7 +196,9 @@ public:
     }
 
 private:
-    using Conv = convolution::MatrixConvolver<core::fft::DefaultRealFft>;
+    using DesignFft = core::fft::ScalarRadix2Real;   // cepstral FIR design hand-packs the scalar packed-Hermitian layout → pinned
+    static_assert (core::fft::PackedHermitianSpectrum<DesignFft>, "design FFT must be packed-Hermitian (buildFullBanks/MixedPhaseFir)");
+    using Conv      = convolution::MatrixConvolver<AudioFft>;   // audio path — swappable to a SIMD backend
 
     // Extract L causal taps from a D-point mixed-phase impulse: peak at h[0], pre-ring wraps to h[D-1..];
     // shift right by bulkDelay so out[bulkDelay] = h[0]. Tail (+ light head) taper suppresses truncation ripple.
@@ -309,8 +312,8 @@ private:
     bool prepared_ = false;                                    // true only after a fully-successful prepare()
     std::atomic<float> k_ { 0.5f };   // phase blend — live-settable without a re-prepare (the builder reads it)
 
-    MixedPhaseFir<core::fft::DefaultRealFft> mp_;                            // cepstral mixed-phase FIR designer
-    core::fft::DefaultRealFft dFft_;                                         // size-D IFFT for composed matrix entries
+    MixedPhaseFir<DesignFft> mp_;                                           // cepstral mixed-phase FIR designer (pinned scalar)
+    DesignFft dFft_;                                                        // size-D IFFT for composed matrix entries (pinned scalar)
     Conv conv_;
     std::vector<std::unique_ptr<Conv>> chConv_;                 // channels_ > 2: one mono ST-only operator per channel                                                              // matrix operator convolver, click-free swap
 
@@ -319,5 +322,10 @@ private:
     std::vector<double> laneRe_[eq::kNumLanes], laneIm_[eq::kNumLanes];      // per-lane blended spectra (Full)
     std::vector<double> accRe_[4], accIm_[4];                                // composed 2×2 entry spectra (Full)
 };
+
+// Keep the bare `lineareq::NaturalPhaseEq` spelling working (default = the scalar audio backend); a consumer
+// wanting a SIMD audio path spells BasicNaturalPhaseEq<SomeSimdFft> for any core::fft::RealFftBackend (e.g. the
+// option-gated pffft adapter) — the cepstral design FFTs stay scalar regardless.
+using NaturalPhaseEq = BasicNaturalPhaseEq<>;
 
 } // namespace felitronics::lineareq

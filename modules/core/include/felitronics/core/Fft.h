@@ -10,6 +10,7 @@
 #include <concepts>
 #include <cstddef>
 #include <new>
+#include <type_traits>
 #include <vector>
 
 //==============================================================================
@@ -41,6 +42,16 @@ concept RealFftBackend = requires (B b, const float* r, float* w, const float* s
     { b.inverse (s, w) }      noexcept -> std::same_as<void>;   // spectrum     -> real[N]  (1/N normalized)
     { b.spectralMultiplyAdd (s, s, acc) } noexcept -> std::same_as<void>;
 };
+
+// A backend whose spectrum is the packed-Hermitian layout the lineareq FIR designers hand-write directly
+// (s[0]=DC, s[1]=Nyquist, s[2k]/s[2k+1]=Re[k]/Im[k]). ONLY such a backend may drive the DESIGN-time FFTs; a
+// SIMD backend with its own opaque layout (pffft's z-order) must NOT (it would silently corrupt the FIR).
+// The design FFTs are pinned to ScalarRadix2Real and static_assert this, so a wrong instantiation fails to
+// COMPILE rather than mis-designing at runtime.
+template <class F>
+concept PackedHermitianSpectrum = RealFftBackend<F>
+    && requires { requires std::same_as<std::remove_cvref_t<decltype (F::kPackedHermitianSpectrum)>, bool>;   // a bool member (not int/enum/fn that is merely truthy)
+                  requires F::kPackedHermitianSpectrum; };                                                    // ...and it is true
 
 //==============================================================================
 // SEAM STORAGE — the frequency-domain buffers a SIMD backend convolves IN PLACE (pffft's
@@ -99,7 +110,8 @@ template <class T> using AlignedVector = std::vector<T, SeamAllocator<T>>;
 class ScalarRadix2Real
 {
 public:
-    static constexpr int spectrumFloats (int n) noexcept { return n; }
+    static constexpr int  spectrumFloats (int n) noexcept { return n; }
+    static constexpr bool kPackedHermitianSpectrum = true;   // s[0]=DC, s[1]=Nyq, s[2k]/s[2k+1]=Re/Im — the layout lineareq hand-writes
 
     bool prepare (int n) noexcept
     {
@@ -191,6 +203,8 @@ private:
 };
 
 static_assert (RealFftBackend<ScalarRadix2Real>, "ScalarRadix2Real must satisfy the seam");
+static_assert (PackedHermitianSpectrum<ScalarRadix2Real>,
+               "ScalarRadix2Real is the packed-Hermitian design reference the lineareq FIR designers hand-pack");
 
 // The default real-FFT backend (swap per tier later via the template seam).
 using DefaultRealFft = ScalarRadix2Real;

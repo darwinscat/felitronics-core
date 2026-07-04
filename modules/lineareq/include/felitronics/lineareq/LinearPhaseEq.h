@@ -40,7 +40,8 @@ namespace felitronics::lineareq
 // MASTERING tool, not for live monitoring. CONTRACTS: setBands()/buildFir()/prepare() are message-thread
 // (host-serialised — a single producer); reset() is audio-thread (or externally synced) and cancels any
 // pending swap. To change quality (N) re-prepare(). RT-safe: process() never allocates/locks/throws.
-class LinearPhaseEq
+template <core::fft::RealFftBackend AudioFft = core::fft::DefaultRealFft>
+class BasicLinearPhaseEq
 {
 public:
     static constexpr int kNumQuality = 5;                       // Low / Medium / High / Very High / Maximum
@@ -64,7 +65,7 @@ public:
 
         if (! buildFft_.prepare (N_)) return false;
         magBuf_.assign ((std::size_t) (N_ / 2 + 1), 0.0f);
-        spec_.assign   ((std::size_t) N_, 0.0f);
+        spec_.assign   ((std::size_t) DesignFft::spectrumFloats (N_), 0.0f);   // packed-Hermitian scratch (== N_ for the pinned scalar)
         time_.assign   ((std::size_t) N_, 0.0f);
         for (auto& g : grid_) g.assign ((std::size_t) (N_ / 2 + 1), 0.0f);   // 4 signed-real entry grids (Full)
         for (auto& f : fir_)  f.assign ((std::size_t) (N_ + 1), 0.0f);       // up to 4 entry IRs
@@ -186,7 +187,9 @@ public:
     }
 
 private:
-    using Conv = convolution::MatrixConvolver<core::fft::DefaultRealFft>;
+    using DesignFft = core::fft::ScalarRadix2Real;   // FIR design hand-packs the scalar packed-Hermitian layout → pinned
+    static_assert (core::fft::PackedHermitianSpectrum<DesignFft>, "design FFT must be packed-Hermitian (gridToSymmetricFir)");
+    using Conv      = convolution::MatrixConvolver<AudioFft>;   // audio path — swappable to a SIMD backend
 
     // A real (signed) grid of N/2+1 points → a symmetric zero-phase FIR of N+1 taps. Shared by the axis
     // path (magnitude grid, always ≥ 0) and the Full entry path (signed matrix entries — an off-diagonal
@@ -224,7 +227,7 @@ private:
     int maxBlock_ = 512, channels_ = 2, N_ = 16384;
     bool prepared_ = false;                                    // true only after a fully-successful prepare()
 
-    core::fft::DefaultRealFft buildFft_;                        // size-N IFFT for the FIR design
+    DesignFft buildFft_;                                       // size-N IFFT for the FIR design (pinned scalar)
     Conv conv_;
     std::vector<std::unique_ptr<Conv>> chConv_;                 // channels_ > 2: one mono ST-only operator per channel                                                 // matrix operator convolver (MSDiag / LRDiag / Full), click-free swap
 
@@ -232,5 +235,10 @@ private:
     std::vector<float> grid_[4];                                // 4 signed-real entry grids (Full only)
     std::vector<float> fir_[4];                                 // up to 4 entry IRs (MSDiag/LRDiag use [0..1])
 };
+
+// Keep the bare `lineareq::LinearPhaseEq` spelling working (default = the scalar audio backend); a consumer
+// wanting a SIMD audio path spells BasicLinearPhaseEq<SomeSimdFft> for any core::fft::RealFftBackend (e.g. the
+// option-gated pffft adapter) — the FIR-design FFTs stay scalar regardless.
+using LinearPhaseEq = BasicLinearPhaseEq<>;
 
 } // namespace felitronics::lineareq
