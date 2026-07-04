@@ -3,9 +3,20 @@
 
 # #1 performance debt — the scalar-FFT / direct-head convolution bottleneck
 
-**Status:** OPEN · highest-priority core optimisation · **Owner:** Darwin's Cat (Felitronics line)
-**Impact:** latent for shipped OrbitCab · **blocker** for any FFT/convolution product (linear-phase EQ,
-matrix / true-stereo convolution).
+**Status:** ✅ **RESOLVED in v0.4.0** (PRs #23–#26) · **Owner:** Darwin's Cat (Felitronics line)
+**Impact:** the block-explosion is gone — long-convolution cost is now **block-INDEPENDENT**.
+
+> **RESOLUTION (v0.4.0).** Fixed by (a) a SIMD **pffft** `RealFftBackend` — the optional compiled module
+> `felitronics::fftpffft` (`-DFELITRONICS_WITH_PFFFT=ON`, cross-backend NULL-tested) — behind the existing
+> template seam (#25), and (b) **decoupling the convolver partition from the host block** (a fixed internal
+> `P=128` instead of `P≥maxBlock`, #26). A 131072-tap linear-phase EQ is now **~2.0 %RT with pffft at every
+> host block** (was ~39 %RT @ block 8192 on the old scalar path), zero-latency, JUCE-free. Groundwork:
+> SIMD-aligned FFT-seam buffers (#23) + the templated design/audio backend split with a compile-enforced C1
+> guard (#24). The original analysis below is kept for the record.
+>
+> **Follow-up (a NEW item, not this debt):** the fixed-`P=128` convolver is block-independent but 2–13× more
+> CPU than `juce::dsp::Convolution` at host blocks ≥ 512 — a non-uniform (Gardner) partitioned convolver is
+> planned to beat it (`docs/PERF-CONVOLVER-JUCE-GAP.md`, lands with the JUCE-bench PR).
 
 ---
 
