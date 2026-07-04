@@ -34,6 +34,10 @@ inline constexpr bool isPow2 (int n) noexcept { return n > 0 && (n & (n - 1)) ==
 // A real-FFT backend for size N (pow2). `spectrumFloats(N)` is the backend's spectrum buffer length in
 // floats (layout is the backend's business). `inverse` is 1/N-normalized so a round-trip is identity.
 // `spectralMultiplyAdd(a,b,acc)` does acc += a (.*) b in the backend's own layout (the convolver's MAC).
+// LAYOUT LINEARITY — the layout must be a fixed LINEAR map of the transform: an elementwise float add/scale of
+// two spectra must equal the spectrum of the same add/scale in the time domain. MatrixConvolver relies on this
+// to build its on-the-fly M/S views (½(X_L ± X_R), per float). Holds for the scalar packed-Hermitian layout and
+// pffft's z-order (both are permutations of the linear DFT); a polar magnitude/phase layout would NOT qualify.
 template <class B>
 concept RealFftBackend = requires (B b, const float* r, float* w, const float* s, float* acc, int n) {
     { B::spectrumFloats (n) } noexcept -> std::convertible_to<int>;
