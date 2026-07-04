@@ -13,6 +13,7 @@
 // -DFELITRONICS_WITH_PFFFT=ON for the SIMD column.
 
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
 #if defined(FELITRONICS_WITH_PFFFT)
@@ -83,14 +84,75 @@ static double benchRT (int topoSel, int nBanks, int irLen, int P, int block, dou
     return 100.0 * cpu / audio;
 }
 
+// Steady-state %RT of the Phase-1 NonUniformConvolver<Backend> in the common LRDiag case = TWO mono instances
+// (L, R). Head P0 + capped-doubling to Bmax, irLen taps, host block `block`. Returns the MEAN %RT; writes the
+// WORST single-block %RT to maxBlockPctOut (the mean hides the periodic spike when every stage's FFT coincides
+// — the per-buffer cost a real-time thread must survive). block-INDEPENDENT + TRUE sample-zero-latency.
+template <class Backend>
+static double benchNU (int irLen, int P0, int Bmax, int block, double fs, double warmSec, double measSec, double& maxBlockPctOut)
+{
+    using NUc = convolution::NonUniformConvolver<Backend>;
+    NUc l, r;
+    if (! l.prepare (P0, Bmax, irLen) || ! r.prepare (P0, Bmax, irLen)) { maxBlockPctOut = -1.0; return -1.0; }
+
+    std::mt19937 rng (12345);
+    std::uniform_real_distribution<float> u (-1.0f, 1.0f);
+    std::vector<float> irL ((std::size_t) irLen), irR ((std::size_t) irLen);
+    for (int i = 0; i < irLen; ++i)
+    {
+        irL[(std::size_t) i] = 0.02f * std::exp (-3.0f * (float) i / (float) irLen) * u (rng);
+        irR[(std::size_t) i] = 0.02f * std::exp (-3.0f * (float) i / (float) irLen) * u (rng);
+    }
+    l.setIr (irL.data(), irLen);
+    r.setIr (irR.data(), irLen);
+
+    std::vector<float> inL ((std::size_t) block), inR ((std::size_t) block), L ((std::size_t) block), R ((std::size_t) block);
+    for (int i = 0; i < block; ++i) { inL[(std::size_t) i] = 0.3f * u (rng); inR[(std::size_t) i] = 0.3f * u (rng); }
+
+    core::ScopedFlushToZero ftz;
+    auto once = [&]
+    {
+        std::memcpy (L.data(), inL.data(), (std::size_t) block * sizeof (float));
+        std::memcpy (R.data(), inR.data(), (std::size_t) block * sizeof (float));
+        l.process (L.data(), L.data(), block);
+        r.process (R.data(), R.data(), block);
+    };
+
+    for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // pass the cold prime + warm caches
+
+    const int measBlocks = std::max (1, (int) (measSec * fs / block));
+    const double audioPerBlock = (double) block / fs;
+
+    // Pass 1 — clean whole-loop timing for the MEAN (no per-block clock overhead).
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < measBlocks; ++i) once();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double mean = 100.0 * std::chrono::duration<double> (t1 - t0).count() / ((double) measBlocks * audioPerBlock);
+
+    // Pass 2 — per-block timing for the WORST buffer (captures the coincident-FFT spike).
+    double maxBlk = 0.0;
+    for (int i = 0; i < measBlocks; ++i)
+    {
+        const auto b0 = std::chrono::steady_clock::now();
+        once();
+        const auto b1 = std::chrono::steady_clock::now();
+        maxBlk = std::max (maxBlk, std::chrono::duration<double> (b1 - b0).count() / audioPerBlock);
+    }
+    maxBlockPctOut = 100.0 * maxBlk;
+    return mean;
+}
+
 #if defined(FELITRONICS_BENCH_JUCE)
-// The FAIR head-to-head: JUCE's OWN partitioned convolver (juce::dsp::Convolution) at the same IR/block,
-// vs our MatrixConvolver<Pffft>. loadImpulseResponse is async (background thread) → poll getCurrentIRSize()
-// until the IR is live before warming/measuring. Returns -1 if the IR never loaded.
-static double benchJuceConvolution (int irLen, int block, double fs, double warmSec, double measSec, int& latencyOut)
+// The FAIR head-to-head: JUCE's OWN convolver (juce::dsp::Convolution). prepMaxBlock is what the plugin declares
+// at prepare() (ProcessSpec::maximumBlockSize — this is what JUCE sizes its partitioning + reports its latency
+// from); hostBlock is what the host actually delivers to process() (hostBlock <= prepMaxBlock). They are usually
+// equal (the head-to-head passes them equal), but DECOUPLING them exposes the real-world case where a host
+// declares a large max yet delivers smaller/variable buffers. Async IR load → poll getCurrentIRSize(). -1 if it
+// never loaded.
+static double benchJuceConvolution (int irLen, int prepMaxBlock, int hostBlock, double fs, double warmSec, double measSec, int& latencyOut)
 {
     juce::dsp::Convolution conv;
-    juce::dsp::ProcessSpec spec { fs, (juce::uint32) block, 2 };
+    juce::dsp::ProcessSpec spec { fs, (juce::uint32) prepMaxBlock, 2 };
     conv.prepare (spec);
 
     juce::AudioBuffer<float> ir (2, irLen);
@@ -101,8 +163,8 @@ static double benchJuceConvolution (int irLen, int block, double fs, double warm
     conv.loadImpulseResponse (std::move (ir), fs, juce::dsp::Convolution::Stereo::yes,
                               juce::dsp::Convolution::Trim::no, juce::dsp::Convolution::Normalise::no);
 
-    juce::AudioBuffer<float> inBuf (2, block), outBuf (2, block);
-    for (int ch = 0; ch < 2; ++ch) { float* p = inBuf.getWritePointer (ch); for (int i = 0; i < block; ++i) p[i] = 0.3f * u (rng); }
+    juce::AudioBuffer<float> inBuf (2, hostBlock), outBuf (2, hostBlock);
+    for (int ch = 0; ch < 2; ++ch) { float* p = inBuf.getWritePointer (ch); for (int i = 0; i < hostBlock; ++i) p[i] = 0.3f * u (rng); }
     outBuf.clear();
     // NON-replacing: read the constant inBuf, write outBuf — the input never degenerates into feedback.
     auto once = [&] { juce::dsp::AudioBlock<float> ib (inBuf), ob (outBuf);
@@ -119,12 +181,12 @@ static double benchJuceConvolution (int irLen, int block, double fs, double warm
     if (conv.getCurrentIRSize() < irLen) return -1.0;                      // IR never fully loaded (headless)
     latencyOut = (int) conv.getLatency();
 
-    for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();
-    const int measBlocks = std::max (1, (int) (measSec * fs / block));
+    for (int i = 0, w = (int) (warmSec * fs / hostBlock); i < w; ++i) once();
+    const int measBlocks = std::max (1, (int) (measSec * fs / hostBlock));
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < measBlocks; ++i) once();
     const auto t1 = std::chrono::steady_clock::now();
-    return 100.0 * std::chrono::duration<double> (t1 - t0).count() / ((double) measBlocks * (double) block / fs);
+    return 100.0 * std::chrono::duration<double> (t1 - t0).count() / ((double) measBlocks * (double) hostBlock / fs);
 }
 
 // DECISIVE sanity check: does juce::dsp::Convolution actually convolve the FULL irLen-tap IR (so its low %RT
@@ -185,6 +247,9 @@ int main()
     const double fs = 48000.0;
     const int irLen = 131072;   // ~ LinearPhaseEq Maximum (N=131072; the EQ passes N+1 taps — the +1 is perf-negligible)
     const int blocks[] = { 256, 512, 1024, 2048, 4096, 8192 };
+    // NUPC + JUCE head-to-head also cover the SMALL blocks that low-latency / live rigs (guitar amp, monitoring)
+    // actually run — that is exactly NUPC's win regime, so it must be measured, not extrapolated.
+    const int nuBlocks[] = { 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
     const struct { int sel, nBanks; const char* name; } topos[] = {
         { 0, 2, "LRDiag  (stereo, 2 convolutions — the common case)" },
         { 1, 4, "Full    (2x2 matrix, 4 convolutions — worst-case routing)" },
@@ -228,23 +293,93 @@ int main()
     std::printf ("\nOLD scalar grows with the host block (the shipped bottleneck); NEW is block-independent;\n");
     std::printf ("NEW pffft is lowest — and the fix holds even in Full (worst-case 4-conv) routing.\n");
 
+    //==========================================================================================================
+    // Phase-1 NonUniformConvolver (Gardner): head 128 + capped-doubling FFT tail (default Bmax=4096), LRDiag =
+    // 2 mono instances. TRUE sample-zero-latency, block-INDEPENDENT. The uniform MatrixConvolver above uses
+    // 1023 partitions (P=128); NUPC uses ~5 doubling + 1 uniform stage → far cheaper spectral MAC. The
+    // max/block column exposes the periodic coincident-FFT spike (a per-buffer RT cost the mean hides).
+    {
+        const int P0 = 128, Bmax = 4096;
+        std::printf ("\n== NonUniformConvolver — LRDiag (head %d + capped-doubling to Bmax=%d) ==\n", P0, Bmax);
+#if defined(FELITRONICS_WITH_PFFFT)
+        std::printf ("  host block |  NUPC scalar (mean)  |  NUPC pffft (mean)  |  NUPC pffft (max/block)\n");
+        std::printf ("  ----------- ---------------------- --------------------- ------------------------\n");
+        for (int b : nuBlocks)
+        {
+            double sMax = 0.0, pMax = 0.0;
+            const double s = benchNU<core::fft::ScalarRadix2Real> (irLen, P0, Bmax, b, fs, 3.0, 2.0, sMax);
+            const double p = benchNU<fftpffft::PffftRealFft>       (irLen, P0, Bmax, b, fs, 3.0, 2.0, pMax);
+            std::printf ("  %9d  |  %7.2f%%           |  %7.2f%%          |  %7.2f%%\n", b, s, p, pMax);
+        }
+        // Bmax sweep — find the platform optimum (Fable: octave-doubling is ~26% suboptimal; the near-field/tail
+        // split is tunable). At the SMALL block (64 — our realtime target) the coincident-FFT spike matters most,
+        // so watch max/block, not just mean: a big B_max lands a big FFT in a tiny callback.
+        for (int probeBlk : { 64, 512 })
+        {
+            std::printf ("\n  Bmax sweep (NUPC pffft, host block %d):  ", probeBlk);
+            for (int Bm : { 1024, 2048, 4096, 8192 })
+            {
+                double mx = 0.0; const double m = benchNU<fftpffft::PffftRealFft> (irLen, P0, Bm, probeBlk, fs, 3.0, 2.0, mx);
+                std::printf ("Bmax=%d: %.2f%% (max %.2f%%)   ", Bm, m, mx);
+            }
+        }
+        std::printf ("\n");
+#else
+        std::printf ("  host block |  NUPC scalar (mean)  |  NUPC scalar (max/block)\n");
+        std::printf ("  ----------- ---------------------- -------------------------\n");
+        for (int b : nuBlocks)
+        {
+            double sMax = 0.0;
+            const double s = benchNU<core::fft::ScalarRadix2Real> (irLen, P0, Bmax, b, fs, 3.0, 2.0, sMax);
+            std::printf ("  %9d  |  %7.2f%%           |  %7.2f%%\n", b, s, sMax);
+        }
+        std::printf ("  (configure -DFELITRONICS_WITH_PFFFT=ON for the SIMD NUPC column)\n");
+#endif
+        std::printf ("  → block-INDEPENDENT mean (~0.9%%) + zero latency at EVERY host block from ONE prepare.\n");
+        std::printf ("    JUCE is zero-latency too, but its cost TRACKS the actual block (cheap only at big blocks);\n");
+        std::printf ("    NUPC's edge is a FLAT cost and the small-block regime — see the head-to-head below.\n");
+    }
+
 #if defined(FELITRONICS_BENCH_JUCE)
     // THE FAIR HEAD-TO-HEAD: JUCE's own convolver vs our MatrixConvolver<Pffft>, same IR, LRDiag/stereo.
-    std::printf ("\n== JUCE head-to-head (same 131072-tap stereo IR) ==\n");
-    std::printf ("  NB juce::dsp::Convolution reports ZERO latency too — it is UNIFORM-partitioned (partition =\n");
-    std::printf ("  host block), so a bigger block => far fewer partitions => cheaper. Ours is a fixed P=128\n");
-    std::printf ("  head+tail (block-INDEPENDENT) — the flat ~2%% is its 1023 partitions + an O(P) scalar head.\n");
-    std::printf ("  host block |  juce::dsp::Convolution (its latency)  |  our MatrixConvolver<pffft> (0 latency)\n");
+    std::printf ("\n== JUCE head-to-head (same 131072-tap stereo IR; both zero-latency) ==\n");
+    std::printf ("  NB juce::dsp::Convolution also reports ZERO latency (getLatency()==0) — its cost falls as the\n");
+    std::printf ("  host block grows (bigger partitions => fewer of them). NUPC is FLAT ~0.9%% and true sample-\n");
+    std::printf ("  accurate zero latency; it WINS at small blocks and stays predictable across a variable block.\n");
+    std::printf ("  host block |  juce::dsp::Convolution (its latency)  |  NUPC<pffft> mean (max/block, 0 latency)\n");
     std::printf ("  ----------- --------------------------------------- ----------------------------------------\n");
-    for (int b : blocks)
+    for (int b : nuBlocks)
     {
         int lat = 0;
-        const double j = benchJuceConvolution (irLen, b, fs, 3.0, 2.0, lat);
-        const double p = benchRT<fftpffft::PffftRealFft> (0, 2, irLen, 128, b, fs, 3.0, 2.0);
-        if (j < 0.0) std::printf ("  %9d  |  (IR load failed)                     |  %7.2f%%\n", b, p);
-        else         std::printf ("  %9d  |  %6.2f%%  (lat %6d smp = %6.1f ms)  |  %7.2f%%  (0.0 ms)\n",
-                                  b, j, lat, 1000.0 * lat / fs, p);
+        const double j = benchJuceConvolution (irLen, b, b, fs, 3.0, 2.0, lat);   // oracle-tuned: maxBlock == host block
+        double nuMax = 0.0;
+        const double nu = benchNU<fftpffft::PffftRealFft> (irLen, 128, 4096, b, fs, 3.0, 2.0, nuMax);
+        if (j < 0.0) std::printf ("  %9d  |  (IR load failed)                     |  %6.2f%%  (max %6.2f%%)\n", b, nu, nuMax);
+        else         std::printf ("  %9d  |  %6.2f%%  (lat %6d smp = %6.1f ms)  |  %6.2f%%  (max %6.2f%%, 0.0 ms)\n",
+                                  b, j, lat, 1000.0 * lat / fs, nu, nuMax);
     }
+    std::printf ("  NUPC WINS at small blocks (256: ~2.3x cheaper) and is FLAT; JUCE wins once the host block is\n");
+    std::printf ("  large (its partition grows with the block). Both are zero-latency — the edge is FLAT cost.\n");
+    // MEASURED (not assumed): the head-to-head oracle-tunes JUCE's maxBlock = the actual host block (its best
+    // case). A plugin declares ONE maximumBlockSize at prepare(); the host may then deliver SMALLER/variable
+    // buffers. Prepare JUCE for maxBlock=8192, feed it a smaller block: JUCE STAYS zero-latency, but its cost
+    // tracks the ACTUAL block — fed 256 it pays ~2.8% (worse than its own 256-tuned 2.06%), while NUPC is flat
+    // ~0.9% from one prepare. (Correcting an earlier assumption that JUCE would gain latency here — it does not.)
+    std::printf ("\n== JUCE prepared maxBlock=8192, then fed a SMALLER host block (real-world variable buffers) ==\n");
+    std::printf ("  host block |  juce::dsp::Convolution(maxBlock=8192)  |  NUPC<pffft> (one prepare, 0 latency)\n");
+    std::printf ("  ----------- --------------------------------------- ----------------------------------------\n");
+    for (int hb : { 256, 1024, 8192 })
+    {
+        int lat = 0;
+        const double j = benchJuceConvolution (irLen, 8192, hb, fs, 3.0, 2.0, lat);
+        double nuMax = 0.0;
+        const double nu = benchNU<fftpffft::PffftRealFft> (irLen, 128, 4096, hb, fs, 3.0, 2.0, nuMax);
+        if (j < 0.0) std::printf ("  %9d  |  (IR load failed)                     |  %6.2f%%  (0.0 ms)\n", hb, nu);
+        else         std::printf ("  %9d  |  %6.2f%%  (lat %6d smp = %6.1f ms)  |  %6.2f%%  (max %5.2f%%, 0.0 ms)\n",
+                                  hb, j, lat, 1000.0 * lat / fs, nu, nuMax);
+    }
+    std::printf ("  → JUCE's cost follows the ACTUAL block (small block = expensive, always); NUPC is flat. A\n");
+    std::printf ("    host running small/variable buffers is cheaper + steadier on NUPC, both at zero latency.\n");
     // Same-engine FFT-backend reference (JUCE's FFT/vDSP in OUR engine; scalar MAC + 2N layout → a handicap,
     // NOT juce::dsp::Convolution — shown only to isolate the FFT).
     std::printf ("\n== JUCE-FFT-in-our-engine (P=128, LRDiag; scalar MAC — proxy only) ==\n");

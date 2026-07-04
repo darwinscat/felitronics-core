@@ -14,6 +14,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/fftpffft/PffftRealFft.h>
 
 #include <algorithm>
@@ -170,6 +171,33 @@ int main()
         const double e = maxDiff (ys, yp), pk = peak (ys);
         std::printf ("      mono err=%.2e (peak %.2e)\n", e, pk);
         test::ok (e < 1e-4 * pk + 1e-6, "mono: pffft nulls scalar");   // same gate as the stereo topologies
+    }
+
+    // --- NUPC cross-backend NULL: the SHIPPING pffft path through the NON-UNIFORM stage array. This is the
+    //     only null of NonUniformConvolver<Pffft> — its per-stage distinct FFT sizes + memcpy between FDL rows
+    //     are exactly where a z-order / row-alignment bug would hide (the scalar tests can't see it). ---
+    test::group ("cross-backend NULL: NonUniformConvolver<Pffft> == NonUniformConvolver<Scalar>");
+    {
+        using NuS = convolution::NonUniformConvolver<Scalar>;
+        using NuP = convolution::NonUniformConvolver<Pf>;
+        const int nuLen = 5000, nuMax = 8192, nuN = 9000;
+        Lcg rn { 24680 };
+        std::vector<float> h ((std::size_t) nuLen); for (auto& v : h) v = 0.06f * rn.next();
+        std::vector<float> xin ((std::size_t) nuN);  for (auto& v : xin) v = 0.3f * rn.next();
+        for (int p : { 0, 127, 128, 4095, 4096, nuLen - 1 }) if (p >= 0 && p < nuN) xin[(std::size_t) p] += 1.0f;  // stage-boundary impulses
+
+        for (int block : { 128, 512, 257 })   // small + typical + non-power-of-two
+        {
+            NuS s; NuP pf;
+            test::ok (s.prepare (128, nuMax, nuLen) && pf.prepare (128, nuMax, nuLen), "NUPC prepare (both backends)");
+            s.setIr (h.data(), nuLen); pf.setIr (h.data(), nuLen);
+            std::vector<float> ys (nuN, 0.0f), yp (nuN, 0.0f);
+            for (int o = 0; o < nuN; o += block)
+            { const int m = std::min (block, nuN - o); s.process (&xin[(std::size_t) o], &ys[(std::size_t) o], m); pf.process (&xin[(std::size_t) o], &yp[(std::size_t) o], m); }
+            const double e = maxDiff (ys, yp), pk = peak (ys);
+            std::printf ("      NUPC capped block=%3d  err=%.2e (peak %.2e, rel %.2e)\n", block, e, pk, e / (pk + 1e-30));
+            test::ok (e < 1e-4 * pk + 1e-6, "NUPC pffft nulls scalar (capped, block=" + std::to_string (block) + ")");
+        }
     }
 
     // --- mid-stream topology swap: both backends run the same MSDiag->Full swap; parity incl. the fade ---
