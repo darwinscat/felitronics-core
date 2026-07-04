@@ -16,6 +16,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
+#if defined(_WIN32)
+ #include <malloc.h>   // _aligned_malloc / _aligned_free (MSVC has no posix_memalign)
+#endif
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -25,6 +29,36 @@ void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
 void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
+// Aligned overloads too — SeamAllocator uses ::operator new(size, align_val_t); without these the counter
+// goes blind to every SIMD-aligned seam buffer (a future in-process aligned alloc would then pass this test).
+// Portable: _aligned_malloc on MSVC (no posix_memalign there — the Windows CI row would fail to compile),
+// posix_memalign elsewhere, with matched frees; throws std::bad_alloc on failure (the allocator relies on it).
+static inline void* countedAlignedNew (std::size_t s, std::align_val_t a)
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    const std::size_t al = (std::size_t) a < sizeof (void*) ? sizeof (void*) : (std::size_t) a;
+   #if defined(_WIN32)
+    void* p = _aligned_malloc (s ? s : 1, al);
+   #else
+    void* p = nullptr; if (::posix_memalign (&p, al, s ? s : 1) != 0) p = nullptr;
+   #endif
+    if (p == nullptr) throw std::bad_alloc();
+    return p;
+}
+static inline void countedAlignedFree (void* p) noexcept
+{
+   #if defined(_WIN32)
+    _aligned_free (p);
+   #else
+    std::free (p);
+   #endif
+}
+void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
+void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
+void  operator delete   (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
+void  operator delete[] (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
+void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
+void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
 
 using namespace felitronics;
 using MC = convolution::MatrixConvolver<>;

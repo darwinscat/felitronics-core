@@ -8,6 +8,8 @@
 #include <cmath>
 #include <complex>
 #include <concepts>
+#include <cstddef>
+#include <new>
 #include <vector>
 
 //==============================================================================
@@ -39,6 +41,55 @@ concept RealFftBackend = requires (B b, const float* r, float* w, const float* s
     { b.inverse (s, w) }      noexcept -> std::same_as<void>;   // spectrum     -> real[N]  (1/N normalized)
     { b.spectralMultiplyAdd (s, s, acc) } noexcept -> std::same_as<void>;
 };
+
+//==============================================================================
+// SEAM STORAGE — the frequency-domain buffers a SIMD backend convolves IN PLACE (pffft's
+// zconvolve_accumulate, vDSP) must be SIMD-aligned; std::vector's default allocator does not guarantee it,
+// and a backend-side padding trick is impossible because the convolver memcpys whole spectra between FDL
+// rows (a byte copy preserves offset-in-buffer, not absolute alignment). So the alignment is engine-side:
+// the convolvers hold their seam-crossing buffers in AlignedVector. kSeamAlignment=64 is a cacheline —
+// a safe superset of every real-FFT SIMD width (SSE/NEON 16, AVX 32). ROW-STRIDE PRECONDITION: FDL / IR
+// partition rows are packed at j*spectrumFloats(N), so a row is aligned only if spectrumFloats(N)*sizeof(float)
+// is a multiple of kSeamAlignment. Holds for ScalarRadix2Real and pffft (spectrumFloats==N; pow2 N>=32 → a
+// 64-multiple). A backend whose natural spectrum length is NOT a multiple (an N+2-float unpacked-Hermitian
+// layout — juce::dsp::FFT, kissfft-real) MUST round its reported spectrumFloats up (harmless: rows are
+// zero-init, forward writes only the natural length, the backend never reads the slack).
+// Backend-agnostic: the scalar reference ignores the stronger alignment (unobservable in its output). All
+// allocation is in prepare() (message thread), so the throwing aligned operator new is RT-fine.
+//
+// SEAM CONTRACT (relied on across the two backend instances a convolver holds — the message-thread build
+// FFT and the audio FFT): for a given backend TYPE and size N, spectra are interchangeable — the layout is
+// a pure function of (type, N), independent of the instance. True for ScalarRadix2Real and pffft; a plan/
+// wisdom-dependent backend (e.g. FFTW with FFTW_MEASURE) would violate it and must not be used here.
+inline constexpr std::size_t kSeamAlignment = 64;
+
+template <class T, std::size_t Alignment = kSeamAlignment>
+struct SeamAllocator
+{
+    static_assert ((Alignment & (Alignment - 1)) == 0, "kSeamAlignment must be a power of two");
+    static_assert (Alignment >= alignof (T),            "kSeamAlignment must be >= alignof(T)");
+
+    using value_type = T;
+    template <class U> struct rebind { using other = SeamAllocator<U, Alignment>; };
+
+    SeamAllocator() noexcept = default;
+    template <class U> SeamAllocator (const SeamAllocator<U, Alignment>&) noexcept {}
+
+    T* allocate (std::size_t n)
+    {
+        if (n > static_cast<std::size_t> (-1) / sizeof (T)) throw std::bad_array_new_length();
+        return static_cast<T*> (::operator new (n * sizeof (T), std::align_val_t (Alignment)));
+    }
+    void deallocate (T* p, std::size_t) noexcept { ::operator delete (p, std::align_val_t (Alignment)); }
+
+    template <class U> bool operator== (const SeamAllocator<U, Alignment>&) const noexcept { return true; }
+    template <class U> bool operator!= (const SeamAllocator<U, Alignment>&) const noexcept { return false; }
+};
+
+// A std::vector whose storage is kSeamAlignment-aligned — for every convolver buffer that crosses the FFT
+// seam (FDL rows, IR partition spectra, the input/view/accumulator spectra, and the forward/inverse real
+// scratch). Time-domain-only buffers (head taps, cached tails) stay plain std::vector.
+template <class T> using AlignedVector = std::vector<T, SeamAllocator<T>>;
 
 //==============================================================================
 // ScalarRadix2Real — the JUCE-free reference + spike default. Correctness-first (a full complex radix-2
