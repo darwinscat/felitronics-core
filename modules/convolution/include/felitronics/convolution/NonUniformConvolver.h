@@ -52,6 +52,7 @@ class NonUniformConvolver
 public:
     static constexpr int kMaxStages = 16;   // P0>=64, B_max<=2^21 → <=15 doubling stages + 1 tail; generous
     static constexpr int kMaxPartition = 1 << 24;   // hard cap so the FFT size 2*B never overflows signed int (far above any real IR)
+    static constexpr int kMaxIrSamples = 1 << 24;   // hard cap so a cumulative stage offset (stored as int) can't overflow (16M smp ≫ any IR)
 
     // One tunable schedule step: `count` partitions of block size `blockSize` (pow2). The head size P0 and the
     // steps must satisfy the zero-latency recurrence B_{s+1} = (count_s + 1)·B_s with B_0 = P0 (validated in
@@ -97,6 +98,7 @@ public:
         prepared_ = false;
         if (! core::fft::isPow2 (headSize) || ! core::fft::isPow2 (maxBlock) || maxBlock < headSize) return false;
         if (headSize > kMaxPartition || maxBlock > kMaxPartition) return false;
+        if (maxIrSamples > kMaxIrSamples) return false;
         std::array<ScheduleStep, kMaxStages> steps {};
         const int n = buildCappedSchedule (headSize, maxBlock, maxIrSamples, steps);
         return prepareWithSchedule (headSize, steps.data(), n, maxIrSamples);
@@ -112,6 +114,7 @@ public:
         if (! core::fft::isPow2 (headSize) || headSize > kMaxPartition) return false;
         if (numSteps < 0 || numSteps > kMaxStages) return false;
         if (numSteps > 0 && steps == nullptr) return false;
+        if (maxIrSamples > kMaxIrSamples) return false;
         if (maxIrSamples < 0) maxIrSamples = 0;
 
         // Validate the WHOLE schedule — recurrence AND coverage — BEFORE touching any state, so a bad schedule
@@ -160,6 +163,9 @@ public:
 
     // Set the IR (copies, builds the head taps + every stage's partition spectra). Message thread (the stages'
     // build FFTs allocate a scratch). SPIKE: resets the running state (instantaneous swap). Production: crossfade.
+    // NOT concurrency-safe with process(): setIr() reuses each stage's audio-thread fft_ and calls reset(), so it
+    // must NOT run while process() is on another thread — this primitive is a "swap while stopped" API. For a
+    // click-free LIVE swap on the audio thread use MatrixConvolverNupc (separate build FFT + a 2-slot crossfade).
     void setIr (const float* ir, int len)
     {
         if (! prepared_) return;

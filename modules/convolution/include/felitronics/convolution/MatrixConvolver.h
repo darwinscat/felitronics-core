@@ -151,11 +151,11 @@ public:
     // across instances was judged over-engineering (revisit only if a real bed swap ever images).
     void publishStaged() noexcept { state_.store (1, std::memory_order_release); }   // → Pending
 
-    // Mono convenience: a single IR broadcast onto the one bank.
+    // Mono convenience: broadcast a single IR onto both output channels (or the one bank when prepared mono).
     bool setIr (const float* ir, int len)
     {
-        const float* one[1] { ir };
-        return setOperator (Topology::LRDiag, one, 1, len);
+        const float* both[2] { ir, ir };
+        return setOperator (Topology::LRDiag, both, mono_ ? 1 : 2, len);
     }
 
     // Audio thread. Planar `in`/`out` may alias (in-place). RT-safe, zero latency. The matrix width is
@@ -472,6 +472,7 @@ private:
     core::fft::AlignedVector<float> fdlL_, fdlR_;         // maxParts × specF: rings of past raw L/R input spectra (seam)
     core::fft::AlignedVector<float> inputSpec_, viewSpec_, acc_, ifftOut_;   // shared FFT scratch — SIMD-aligned (seam)
     std::vector<float> tmpTailA_, tmpTailB_;              // P each: time-domain tail scratch (plain)
+    static_assert (std::atomic<int>::is_always_lock_free, "state_ must be lock-free — it is read/written on the audio thread");
     std::atomic<int> state_ { 0 };                        // 0 Idle · 1 Pending (staged) · 2 Crossfading
     bool prepared_ = false;
     bool mono_ = false;

@@ -59,6 +59,7 @@ public:
     static constexpr int kMaxBanks  = 4;
     static constexpr int kMaxStages = 16;
     static constexpr int kMaxPartition = 1 << 24;   // hard cap so the FFT size 2*B never overflows signed int (far above any real IR)
+    static constexpr int kMaxIrSamples = 1 << 24;   // hard cap so a stage offset (stored as int) can't overflow (16M smp ≫ any IR)
     static constexpr int kDefaultMaxBlock = 2048;   // B_max cap: flat mean at any B_max, smaller worst-buffer spike than 4096
 
     static int numBanksFor (Topology t) noexcept { return t == Topology::Full ? 4 : 2; }
@@ -72,6 +73,7 @@ public:
         prepared_ = false;
         if (numChannels < 1 || numChannels > 2) return false;
         if (! core::fft::isPow2 (partitionSize) || partitionSize > kMaxPartition) return false;
+        if (maxIrSamples > kMaxIrSamples) return false;
         if (maxIrSamples < 0) maxIrSamples = 0;
         channels_ = numChannels;
         mono_     = (channels_ == 1);
@@ -186,11 +188,11 @@ public:
 
     void publishStaged() noexcept { state_.store (1, std::memory_order_release); }
 
-    // Mono convenience: a single IR onto the one bank.
+    // Mono convenience: broadcast a single IR onto both output channels (or the one bank when prepared mono).
     bool setIr (const float* ir, int len)
     {
-        const float* one[1] { ir };
-        return setOperator (Topology::LRDiag, one, 1, len);
+        const float* both[2] { ir, ir };
+        return setOperator (Topology::LRDiag, both, mono_ ? 1 : 2, len);
     }
 
     // Audio thread. Planar in/out may alias (in-place). RT-safe, zero latency. Needs >= channels_ planes.
@@ -529,7 +531,8 @@ private:
     std::vector<float> headHist_[2];                               // P0 ring per channel (time domain)
     core::fft::AlignedVector<float> inputSpec_, viewSpec_, acc_, ifftOut_, buildBuf_;   // shared scratch (seam), sized to the largest stage
     std::vector<float> tmpTailA_, tmpTailB_;                                            // max-B M/S decode scratch (time domain)
-    std::atomic<int> state_ { 0 };                                 // 0 Idle · 1 Pending (staged) — Phase 4 adds 2 Crossfading
+    static_assert (std::atomic<int>::is_always_lock_free, "state_ must be lock-free — it is read/written on the audio thread");
+    std::atomic<int> state_ { 0 };                                 // 0 Idle · 1 Pending (staged) · 2 Crossfading
     bool prepared_ = false;
     bool mono_ = false;
     int P0_ = 0, headMask_ = 0, headPos_[2] { 0, 0 };

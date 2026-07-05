@@ -132,6 +132,21 @@ int main()
           test::ok (maxDiff (yR, rR, settled, N) / (peak (rR) + 1e-30) < 2e-4, "Full yR == RL∗xL + RR∗xR"); }
     }
 
+    // --- setIr() on a STEREO instance broadcasts the mono IR to BOTH channels (regression: it returned false) ---
+    test::group ("setIr broadcasts to both channels on a stereo instance");
+    {
+        const int L = 4000, N = L + 9000;
+        Lcg r { 91 };
+        std::vector<float> h ((std::size_t) L); for (auto& v : h) v = 0.05f * r.next();
+        std::vector<float> xL ((std::size_t) N), xR ((std::size_t) N); for (auto& v : xL) v = 0.30f * r.next(); for (auto& v : xR) v = 0.35f * r.next();
+        MCN mc; test::ok (mc.prepare (128, maxIr, 128, 2), "prepare stereo");
+        test::ok (mc.setIr (h.data(), L), "setIr accepted on a stereo instance");   // regression: used to return false (numBanks 1 < 2)
+        std::vector<float> yL, yR; runStereo (mc, xL, xR, yL, yR, 256);
+        const std::vector<float> rL = convRef (xL, h, maxIr), rR = convRef (xR, h, maxIr);
+        test::ok (maxDiff (yL, rL, settled, N) / (peak (rL) + 1e-30) < 2e-4, "stereo setIr: yL == h ∗ xL");
+        test::ok (maxDiff (yR, rR, settled, N) / (peak (rR) + 1e-30) < 2e-4, "stereo setIr: yR == h ∗ xR");
+    }
+
     // --- channel isolation (LRDiag): R input all-zero → R output exactly silent (blend of two zero paths) ---
     test::group ("channel isolation: R input zero → R output silent");
     {
