@@ -29,40 +29,44 @@ fixed-`P=128` matrix convolver everywhere**, and **3–17× cheaper than JUCE at
 amp or live monitor actually runs**. JUCE's cost swings ~70× with the block (10.50 % → 0.15 %): it is expensive
 at the small blocks and only overtakes us past ~512 samples, where its few large partitions cost less.
 
-## Every real DAW buffer — the nose-to-nose sweep (16 → 4096, all 129 sizes, two machines)
+## The full buffer range — the nose-to-nose sweep (4 → 8192, log-ladder, two machines)
 
-The head-to-head above walks powers of two. But hosts offer **every 32-sample buffer**, and most of the ones users
-pick are **not powers of two**. Measured at all 129 from 16 to 4096 samples, LRDiag, JUCE 8.0.4 oracle-tuned
-(`maxBlock` = the actual buffer, its best case), on **two very different CPUs** — an Apple M5 Pro (NEON) and an Intel
-i9-13900H (SSE, pinned to a P-core). NUPC is **flat at every one**; JUCE is a sawtooth that peaks at each power of two.
-The chart at the top of this page carries both machines and all 129 points; representative rows
-(`mean(worst)` = NUPC mean and worst-single-buffer %RT):
+The head-to-head above walks powers of two. This sweep samples the whole range on a **geometric (log-uniform)
+ladder** — ~4 points per octave, dense where it matters (small buffers) — on **two very different CPUs**: an Apple M5
+Pro (NEON) and an Intel i9-13900H (SSE, pinned to a P-core). LRDiag, JUCE 8.0.4 oracle-tuned (`maxBlock` = the actual
+buffer). Each point is the **mean of 3–10 warmed measure windows** (escalated when the spread is large); the NUPC
+spread stayed **< ~6 %**. NUPC is measured from 4; JUCE only from 16 (below 16 is not a real host buffer and just
+distorts the plot). NUPC is **flat everywhere**; JUCE is a sawtooth that peaks at each power of two. The chart at the
+top of this page carries both machines and all 43 points; representative rows (`mean(worst)` = NUPC mean and
+worst-single-buffer %RT):
 
 | host buffer | M5 Pro · JUCE | M5 · NUPC mean(worst) | i9-13900H · JUCE | i9 · NUPC mean(worst) |
 |---:|---:|---:|---:|---:|
-| 16   | 95.7 % | 0.59 (21.1) | 72.6 % | 1.10 (40.1) |
-| 64   | 9.24 % | 0.59 (6.7)  | 13.4 % | 1.09 (10.6) |
-| 128  | 2.86 % | 0.61 (3.7)  | 5.97 % | 1.08 (5.7)  |
-| 256  | 1.87 % | 0.58 (2.4)  | 4.13 % | 1.08 (3.2)  |
-| 512  | 0.89 % | 0.58 (1.3)  | 2.02 % | 1.09 (2.0)  |
-| 1024 | 0.52 % | 0.59 (0.9)  | 1.16 % | 1.09 (1.4)  |
-| 2048 | 0.27 % | 0.58 (0.7)  | 0.75 % | 1.09 (1.1)  |
-| 4096 | 0.19 % | 0.59 (0.6)  | 0.67 % | 1.08 (1.1)  |
+| 4    | — (synthetic) | 0.69 (152.6) | — (synthetic) | 1.11 (158.6) |
+| 16   | 107.7 % | 0.61 (31.1) | 71.5 % | 1.08 (38.6) |
+| 64   | 9.72 %  | 0.59 (12.6) | 12.8 % | 1.08 (10.5) |
+| 128  | 2.94 %  | 0.62 (5.5)  | 5.84 % | 1.09 (5.6)  |
+| 256  | 1.94 %  | 0.61 (1.8)  | 4.12 % | 1.08 (3.0)  |
+| 512  | 0.98 %  | 0.62 (1.3)  | 2.00 % | 1.08 (1.9)  |
+| 1024 | 0.48 %  | 0.63 (1.1)  | 1.16 % | 1.09 (1.4)  |
+| 2048 | 0.29 %  | 0.63 (0.7)  | 0.75 % | 1.07 (1.1)  |
+| 4096 | 0.18 %  | 0.59 (0.7)  | 0.67 % | 1.09 (1.1)  |
+| 8192 | 0.15 %  | 0.64 (0.7)  | 0.54 % | 1.08 (1.1)  |
 
 **Reading it.** NUPC's mean is flat — **~0.6 % on the M5, ~1.08 % on the i9** — at every buffer from one `prepare()`;
 the ~1.8× gap between machines is core speed (Apple/NEON vs Intel/SSE), not the algorithm. JUCE's cost tracks the
-buffer: dear at the small, low-latency sizes (up to ~96 % / ~73 % at 16 samples), cheap at large power-of-two blocks.
-The lines cross around **~544 samples on the M5**; on the **i9 NUPC is cheaper at every buffer except the exact 2048
-and 4096**, where JUCE's clean power-of-two partition wins the mean. Both are zero-latency throughout. The worst-buffer
-column is the once-per-`B_max` coincident-FFT spike — expensive at tiny blocks (21 % M5 / 40 % i9 at 16) but bounded,
-rare, and **under 100 % (no xrun)**; it decays to ~1 % by block 256.
+buffer: dear at the small, low-latency sizes (up to ~108 % / ~72 % at 16 samples — over real-time on the M5), cheap at
+large blocks. The lines cross around **~640 samples on the M5**; on the **i9 NUPC is cheaper almost everywhere**, JUCE
+only winning the mean near 4096–8192. Both are zero-latency throughout. The worst-buffer column is the
+once-per-`B_max` coincident-FFT spike — bounded and rare, decaying to ~1 % by block 256. Below 16 samples (not a real
+host buffer, shown only to characterise) that single worst buffer can exceed real-time, while the **mean stays flat
+~0.6 %**.
 
-> **Measurement notes.** (1) Warm up to steady state before the measure window (the sweep uses 3.0 s). An earlier
-> build primed a long ~2.5 s first-activation crossfade that a shorter warm left half-faded, inflating the mean by
-> ~0.35 %; that crossfade is now short (a cold FDL already yields the exact convolution, so no long prime is needed),
-> and the steady-state numbers here are unaffected by it either way. (2) On a hybrid CPU (the 13900H) pin the bench
-> to a performance core — an E-core reads ~2× slower. (3) JUCE's tiny-block cost carries a few-% run-to-run variance
-> (e.g. M5 @16 measured 96–103 % across runs).
+> **Measurement notes.** (1) Each point is the mean of 3–10 warmed windows (adaptive on the spread) — external jitter
+> only *adds* time, so a tight spread means the mean equals the true cost, and the median tracked the mean. (2) On a
+> hybrid CPU (the 13900H) pin the bench to a performance core — an E-core reads ~2× slower. (3) JUCE's tiny-block cost
+> still carries a few-% run-to-run variance (e.g. M5 @16 measured 96–108 % across runs). (4) The `B_max=2048` cap
+> bounds the worst-buffer spike (a smaller cap trims it; time-distributed scheduling is the planned RT hardening).
 
 ## Per topology (all flat, block-independent)
 
@@ -97,13 +101,15 @@ MSDiag / Full add the ½(X_L±X_R) view / the 4-bank cross sums — a modest, fl
 cmake -S . -B build-juce -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_BENCH_JUCE=ON
 cmake --build build-juce --target fcore_fftbench -j
 ./build-juce/tools/fcore_fftbench                       # correctness probe + OLD/NEW/pffft + NUPC + matrix-NUPC + JUCE head-to-head
-FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench    # only the 129-buffer nose-to-nose sweep (16→4096), CSV: buffer,ms,juce,nupc,nupc_max
+FCORE_FINE_SWEEP=1 ./build-juce/tools/fcore_fftbench    # the fine log-ladder sweep (4→8192, adaptive 3–10 reps), CSV
+FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench    # (legacy) the +32 linear sweep 16→4096
 ```
 
-Regenerate the chart above (`docs/assets/nupc-vs-juce.svg`) from a per-machine CSV of that sweep:
+Regenerate the chart above (`docs/assets/nupc-vs-juce.svg`) from a per-machine CSV of the fine sweep (on the i9,
+pin the bench to a P-core: `taskset -c 0 env FCORE_FINE_SWEEP=1 …`):
 
 ```sh
-FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench | grep -E '^  [0-9]+[*]?,' > i9.csv   # run on each machine
+FCORE_FINE_SWEEP=1 ./build-juce/tools/fcore_fftbench | grep -E '^  [0-9]' > i9.csv   # run on each machine
 python3 tools/plot-convolver-sweep.py i9.csv m5.csv docs/assets/nupc-vs-juce.svg
 ```
 

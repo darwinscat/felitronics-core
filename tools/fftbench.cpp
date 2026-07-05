@@ -144,10 +144,33 @@ static double benchNU (int irLen, int P0, int Bmax, int block, double fs, double
     return mean;
 }
 
+// Adaptive repeated measurement: run `oneWindow` (one warmed %RT window) minReps times; if the spread
+// (max-min)/mean exceeds `thresh`, escalate to maxReps. Returns the MEAN and writes the spread% + median. (External
+// jitter only ADDS time — so a tight spread ⇒ mean == true cost; median/min track code speed, mean tracks load.)
+template <class Fn>
+static double adaptiveMean (Fn oneWindow, double& spreadOut, double& medianOut, int minReps = 3, int maxReps = 10, double thresh = 0.12)
+{
+    if (maxReps > 16) maxReps = 16;
+    double v[16]; int n = 0;
+    auto recompute = [&] (double& mean, double& spread, double& med)
+    {
+        double s = 0.0, lo = v[0], hi = v[0], tmp[16];
+        for (int i = 0; i < n; ++i) { s += v[i]; lo = std::min (lo, v[i]); hi = std::max (hi, v[i]); tmp[i] = v[i]; }
+        mean = s / (double) n;
+        spread = mean > 0.0 ? (hi - lo) / mean : 0.0;
+        std::sort (tmp, tmp + n); med = tmp[n / 2];
+    };
+    for (int i = 0; i < minReps && n < maxReps; ++i) v[n++] = oneWindow();
+    double mean = 0.0, spread = 0.0, med = 0.0; recompute (mean, spread, med);
+    if (spread > thresh) { while (n < maxReps) v[n++] = oneWindow(); recompute (mean, spread, med); }
+    spreadOut = spread; medianOut = med;
+    return mean;
+}
+
 // The SHIPPING matrix convolver: a single stereo MatrixConvolverNupc<Backend> routed by `topo` (0 LRDiag,
 // 1 MSDiag, 2 Full). This is what lineareq now convolves on. Mean %RT + worst single-block %RT. block-INDEPENDENT.
 template <class Backend>
-static double benchMatrixNupc (int topoSel, int nBanks, int irLen, int block, double fs, double warmSec, double measSec, double& maxBlockPctOut)
+static double benchMatrixNupc (int topoSel, int nBanks, int irLen, int block, double fs, double warmSec, double measSec, double& maxBlockPctOut, int reps = 1, double* spreadOut = nullptr)
 {
     using MC = convolution::MatrixConvolverNupc<Backend>;
     MC mc;
@@ -174,14 +197,20 @@ static double benchMatrixNupc (int topoSel, int nBanks, int irLen, int block, do
         float* io[2] { L.data(), R.data() }; mc.process (io, io, 2, block);
     };
 
-    for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // pass the cold prime + warm caches
+    for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // warm caches (+ any first-activation fade)
 
     const int measBlocks = std::max (1, (int) (measSec * fs / block));
     const double audioPerBlock = (double) block / fs;
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < measBlocks; ++i) once();
-    const auto t1 = std::chrono::steady_clock::now();
-    const double mean = 100.0 * std::chrono::duration<double> (t1 - t0).count() / ((double) measBlocks * audioPerBlock);
+    auto oneWindow = [&]() -> double
+    {
+        const auto a = std::chrono::steady_clock::now();
+        for (int i = 0; i < measBlocks; ++i) once();
+        const auto b = std::chrono::steady_clock::now();
+        return 100.0 * std::chrono::duration<double> (b - a).count() / ((double) measBlocks * audioPerBlock);
+    };
+    double spread = 0.0, med = 0.0;
+    const double mean = (reps <= 1) ? oneWindow() : adaptiveMean (oneWindow, spread, med, reps, 10);
+    if (spreadOut) *spreadOut = spread;
 
     double maxBlk = 0.0;
     for (int i = 0; i < measBlocks; ++i) { const auto b0 = std::chrono::steady_clock::now(); once(); const auto b1 = std::chrono::steady_clock::now(); maxBlk = std::max (maxBlk, std::chrono::duration<double> (b1 - b0).count() / audioPerBlock); }
@@ -196,7 +225,7 @@ static double benchMatrixNupc (int topoSel, int nBanks, int irLen, int block, do
 // equal (the head-to-head passes them equal), but DECOUPLING them exposes the real-world case where a host
 // declares a large max yet delivers smaller/variable buffers. Async IR load → poll getCurrentIRSize(). -1 if it
 // never loaded.
-static double benchJuceConvolution (int irLen, int prepMaxBlock, int hostBlock, double fs, double warmSec, double measSec, int& latencyOut)
+static double benchJuceConvolution (int irLen, int prepMaxBlock, int hostBlock, double fs, double warmSec, double measSec, int& latencyOut, int reps = 1, double* spreadOut = nullptr)
 {
     juce::dsp::Convolution conv;
     juce::dsp::ProcessSpec spec { fs, (juce::uint32) prepMaxBlock, 2 };
@@ -230,10 +259,18 @@ static double benchJuceConvolution (int irLen, int prepMaxBlock, int hostBlock, 
 
     for (int i = 0, w = (int) (warmSec * fs / hostBlock); i < w; ++i) once();
     const int measBlocks = std::max (1, (int) (measSec * fs / hostBlock));
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < measBlocks; ++i) once();
-    const auto t1 = std::chrono::steady_clock::now();
-    return 100.0 * std::chrono::duration<double> (t1 - t0).count() / ((double) measBlocks * (double) hostBlock / fs);
+    const double audioPerBlock = (double) hostBlock / fs;
+    auto oneWindow = [&]() -> double
+    {
+        const auto a = std::chrono::steady_clock::now();
+        for (int i = 0; i < measBlocks; ++i) once();
+        const auto b = std::chrono::steady_clock::now();
+        return 100.0 * std::chrono::duration<double> (b - a).count() / ((double) measBlocks * audioPerBlock);
+    };
+    double spread = 0.0, med = 0.0;
+    const double mean = (reps <= 1) ? oneWindow() : adaptiveMean (oneWindow, spread, med, reps, 10);
+    if (spreadOut) *spreadOut = spread;
+    return mean;
 }
 
 // DECISIVE sanity check: does juce::dsp::Convolution actually convolve the FULL irLen-tap IR (so its low %RT
@@ -293,7 +330,8 @@ int main()
 #endif
     const double fs = 48000.0;
     const int irLen = 131072;   // ~ LinearPhaseEq Maximum (N=131072; the EQ passes N+1 taps — the +1 is perf-negligible)
-    const bool sweepOnly = std::getenv ("FCORE_SWEEP_ONLY") != nullptr;   // FCORE_SWEEP_ONLY=1 → run only the DAW-buffer sweep
+    const bool fineSweep = std::getenv ("FCORE_FINE_SWEEP") != nullptr;   // FCORE_FINE_SWEEP=1 → only the fine log-ladder sweep (adaptive reps)
+    const bool sweepOnly = std::getenv ("FCORE_SWEEP_ONLY") != nullptr || fineSweep;   // either sweep → skip the heavy tables
     const int blocks[] = { 256, 512, 1024, 2048, 4096, 8192 };
     // NUPC + JUCE head-to-head also cover the SMALL blocks that low-latency / live rigs (guitar amp, monitoring)
     // actually run — that is exactly NUPC's win regime, so it must be measured, not extrapolated.
@@ -455,16 +493,15 @@ int main()
     std::printf ("    host running small/variable buffers is cheaper + steadier on NUPC, both at zero latency.\n");
   }   // end if (! sweepOnly) — the JUCE head-to-head tables
 
+  if (! fineSweep)
+  {
     // REAL DAW buffer sizes — including the NON-power-of-two ones a host actually offers (96 / 160 / 192 / 992…).
-    // NUPC is FLAT at every one (block-independent handles ANY n); JUCE's cost tracks the buffer. This is the
-    // block-independence claim measured at the sizes users pick, not just powers of two.
+    // NUPC is FLAT at every one (block-independent handles ANY n); JUCE's cost tracks the buffer. Legacy +32 ladder
+    // (dense-linear at the top); the release chart uses the FINE log-ladder below (FCORE_FINE_SWEEP=1).
     std::printf ("\n== Real DAW buffer sweep (EVERY size a host offers) — juce::dsp::Convolution vs MatrixConvolverNupc, LRDiag ==\n");
     std::printf ("  buffer,ms,juce_pct,nupc_pct,nupc_maxpct   (CSV: every 32-sample DAW buffer; * suffix = non-pow2)\n");
     std::vector<int> dawBufs { 16, 32, 64 };
     for (int b = 96; b <= 4096; b += 32) dawBufs.push_back (b);   // the real DAW ladder: every 32 samples, out to 4096
-    // warm MUST outlast NUPC's cold-prime crossfade (coldXfade_ = max_s(C_s*B_s) ≈ 2.5 s for Bmax=2048 over a
-    // 131072-tap IR) or the measure window still double-convolves the warm+cold slots and INFLATES the mean by
-    // ~0.35% — matches the 3.0 s head-to-head only once the crossfade has fully settled.
     for (int b : dawBufs)
     {
         int lat = 0;
@@ -473,7 +510,34 @@ int main()
         const double nu = benchMatrixNupc<fftpffft::PffftRealFft> (0, 2, irLen, b, fs, 3.0, 1.0, nMax);
         std::printf ("  %d%s,%.2f,%.2f,%.2f,%.2f\n", b, (b & (b - 1)) ? "*" : "", 1000.0 * b / fs, j, nu, nMax);
     }
-    std::printf ("  → NUPC dead-flat at EVERY buffer; JUCE a sawtooth that exceeds real-time at <= 32 samples.\n");
+    std::printf ("  → NUPC dead-flat at EVERY buffer; JUCE a sawtooth.\n");
+  }
+  else
+  {
+    // FINE log-ladder sweep — the RELEASE chart. Geometric spacing (~4 points/octave) so the LOG-x axis is sampled
+    // evenly, dense at the small buffers where the action is. NUPC from 4; JUCE only from 16 (below 16 JUCE is
+    // uninformative and would just distort the plot). Each point = 3 warmed measure windows, escalating to 10 if the
+    // spread is large; we report the MEAN + spread% ((max-min)/mean). block-INDEPENDENT ⇒ NUPC flat, JUCE tracks block.
+    std::printf ("\n== FINE log-ladder sweep (adaptive 3-10 reps) — buffer,ms,juce_mean,juce_spread%%,nupc_mean,nupc_spread%%,nupc_worst ==\n");
+    std::vector<int> ladder;
+    for (int b = 4; b <= 8192; )
+    {
+        ladder.push_back (b);
+        int oct = 1; while ((oct << 1) <= b) oct <<= 1;   // largest power of two <= b
+        b += std::max (2, oct >> 2);                        // ~4 points per octave (log-uniform)
+    }
+    if (ladder.back() != 8192) ladder.push_back (8192);
+    for (int b : ladder)
+    {
+        double nSpread = 0.0, nMax = 0.0;
+        const double nu = benchMatrixNupc<fftpffft::PffftRealFft> (0, 2, irLen, b, fs, 3.0, 1.0, nMax, 3, &nSpread);
+        double jMean = -1.0, jSpread = 0.0;
+        if (b >= 16) { int lat = 0; jMean = benchJuceConvolution (irLen, b, b, fs, 3.0, 1.0, lat, 3, &jSpread); }
+        std::printf ("  %d%s,%.2f,%.2f,%.1f,%.2f,%.1f,%.2f\n",
+                     b, (b & (b - 1)) ? "*" : "", 1000.0 * b / fs, jMean, 100.0 * jSpread, nu, 100.0 * nSpread, nMax);
+    }
+    std::printf ("  → NUPC flat 4→8192; JUCE (from 16) a sawtooth. mean of 3-10 warmed windows; spread%% = (max-min)/mean.\n");
+  }
 
     if (! sweepOnly)
     {

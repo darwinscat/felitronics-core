@@ -27,8 +27,9 @@ to 4096, from one `prepare()`.
   (in `NonUniformConvolver`, `MatrixConvolver`, `ConvolutionEngine`).
 - **fix(convolution):** `setIr()` broadcasts a mono IR to both channels on a stereo instance (was rejected); a
   `static_assert` pins `state_` lock-free; `maxIrSamples` capped against a stage-offset overflow.
-- **docs/tools:** `PERF-NUPC-VS-JUCE.md` (two-machine 16→4096 sweep + an in-repo SVG chart), `PERF-CONVOLVER-JUCE-GAP.md`
-  (the design ADR); `fftbench` head-to-head + 129-buffer sweep; `tools/plot-convolver-sweep.py`.
+- **docs/tools:** `PERF-NUPC-VS-JUCE.md` (a two-machine 4→8192 fine log-ladder sweep — Apple M5 Pro + Intel i9-13900H,
+  adaptive 3–10 warmed reps — rendered to an in-repo SVG chart), `PERF-CONVOLVER-JUCE-GAP.md` (the design ADR);
+  `fftbench` head-to-head + `FCORE_FINE_SWEEP`; `tools/plot-convolver-sweep.py`.
 
 Verified by an architecture consilium (per phase), a Popper falsification campaign (differential fuzzer vs
 `PartitionedConvolver` + double precision, ASan/UBSan/TSan), and a release-candidate crew review. `ctest` green.
