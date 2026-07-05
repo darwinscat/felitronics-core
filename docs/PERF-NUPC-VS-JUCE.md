@@ -57,10 +57,12 @@ and 4096**, where JUCE's clean power-of-two partition wins the mean. Both are ze
 column is the once-per-`B_max` coincident-FFT spike — expensive at tiny blocks (21 % M5 / 40 % i9 at 16) but bounded,
 rare, and **under 100 % (no xrun)**; it decays to ~1 % by block 256.
 
-> **Measurement notes.** (1) The warm-up **must outlast NUPC's cold-prime crossfade** (`coldXfade_ = max_s(C_s·B_s)`
-> ≈ 2.5 s for `B_max = 2048` over a 131072-tap IR) or the mean inflates by ~0.35 %; the sweep uses a 3.0 s warm.
-> (2) On a hybrid CPU (the 13900H) pin the bench to a performance core — an E-core reads ~2× slower. (3) JUCE's
-> tiny-block cost carries a few-% run-to-run variance (e.g. M5 @16 measured 96–103 % across runs).
+> **Measurement notes.** (1) Warm up to steady state before the measure window (the sweep uses 3.0 s). An earlier
+> build primed a long ~2.5 s first-activation crossfade that a shorter warm left half-faded, inflating the mean by
+> ~0.35 %; that crossfade is now short (a cold FDL already yields the exact convolution, so no long prime is needed),
+> and the steady-state numbers here are unaffected by it either way. (2) On a hybrid CPU (the 13900H) pin the bench
+> to a performance core — an E-core reads ~2× slower. (3) JUCE's tiny-block cost carries a few-% run-to-run variance
+> (e.g. M5 @16 measured 96–103 % across runs).
 
 ## Per topology (all flat, block-independent)
 
