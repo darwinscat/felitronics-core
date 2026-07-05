@@ -44,7 +44,7 @@ namespace felitronics::convolution
 // CONTRACTS mirror ConvolutionEngine: prepare() allocates (message thread, RT-UNSAFE); setOperator()/setIr()
 // are RT-UNSAFE single-producer message-thread (must not race reset()); process() is RT-safe (no
 // alloc/lock/throw), zero latency; isBusy() is true while a swap is crossfading (the host coalesces);
-// reset() flushes history (re-arms a cold prime) but keeps the live operator. The FFT is the compile-time
+// reset() flushes history (the next swap fades in from silence) but keeps the live operator. The FFT is the compile-time
 // backend seam (no hot-path vtable). Stereo only (2 output channels); the class is intentionally not
 // channel-parameterised — the 2×2 matrix IS its reason to exist.
 template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft>
@@ -60,7 +60,7 @@ public:
     static int numBanksFor (Topology t) noexcept { return t == Topology::Full ? 4 : 2; }
 
     // partitionSize P (pow2; FFT size = 2P). maxIrSamples sizes the partition arrays. crossfadeSamples is
-    // the SHORT (warm) anti-click fade; the cold first-prime length is derived internally. numChannels is 1
+    // the anti-click crossfade length, used for every swap (first activation and warm swaps alike). numChannels is 1
     // (mono) or 2 (stereo). Message thread; allocates.
     bool prepare (int partitionSize, int maxIrSamples, int crossfadeSamples, int numChannels = 2)
     {
@@ -77,7 +77,6 @@ public:
         maxParts_ = (maxIrSamples > P_) ? ((maxIrSamples - P_ + P_ - 1) / P_) : 0;
 
         warmXfade_ = crossfadeSamples < 1 ? 1 : crossfadeSamples;
-        coldXfade_ = maxParts_ > 0 ? std::max (warmXfade_, maxParts_ * P_) : warmXfade_;
 
         inputSpec_.assign ((std::size_t) specF_, 0.0f);
         viewSpec_.assign  ((std::size_t) specF_, 0.0f);
@@ -96,13 +95,13 @@ public:
         for (int k = 0; k < 2; ++k) slot_[k].prepare (P_, maxParts_, specF_, mono_ ? 1 : kMaxBanks);
 
         cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
-        phase_ = 0; fdlPos_ = 0; warmSamples_ = 0;
+        phase_ = 0; fdlPos_ = 0;
         state_.store (0, std::memory_order_relaxed);
         prepared_ = true;
         return true;
     }
 
-    // Flush the running history (next swap re-primes cold) but KEEP the live operator. Cancels a pending
+    // Flush the running history (next swap fades in from silence) but KEEP the live operator. Cancels a pending
     // swap. Audio thread (or externally synced); must not run concurrently with setOperator().
     void reset() noexcept
     {
@@ -110,7 +109,7 @@ public:
         std::fill (fdlL_.begin(),   fdlL_.end(),   0.0f);
         if (! mono_) { std::fill (frameR_.begin(), frameR_.end(), 0.0f); std::fill (fdlR_.begin(), fdlR_.end(), 0.0f); }
         for (int k = 0; k < 2; ++k) slot_[k].resetTails();
-        xfadePos_ = 0; phase_ = 0; fdlPos_ = 0; warmSamples_ = 0;   // keep cur_ (the live operator)
+        xfadePos_ = 0; phase_ = 0; fdlPos_ = 0;   // keep cur_ (the live operator)
         state_.store (0, std::memory_order_relaxed);
     }
 
@@ -151,11 +150,11 @@ public:
     // across instances was judged over-engineering (revisit only if a real bed swap ever images).
     void publishStaged() noexcept { state_.store (1, std::memory_order_release); }   // → Pending
 
-    // Mono convenience: a single IR broadcast onto the one bank.
+    // Mono convenience: broadcast a single IR onto both output channels (or the one bank when prepared mono).
     bool setIr (const float* ir, int len)
     {
-        const float* one[1] { ir };
-        return setOperator (Topology::LRDiag, one, 1, len);
+        const float* both[2] { ir, ir };
+        return setOperator (Topology::LRDiag, both, mono_ ? 1 : 2, len);
     }
 
     // Audio thread. Planar `in`/`out` may alias (in-place). RT-safe, zero latency. The matrix width is
@@ -167,13 +166,11 @@ public:
         if (! prepared_ || n <= 0 || numChannelsToProcess < channels_) return;
 
         int s = state_.load (std::memory_order_acquire);
-        if (s == 1)   // begin crossfade — length by warmth (cold first-prime vs short warm swap)
-        {
+        if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE
+        {             // short smoothstep fade (warmXfade_) masks only the silence→convolution onset — no long cold prime.
             xfadePos_ = 0;
-            const int newParts = slot_[1 - cur_].maxNumParts();
-            xfadeLen_ = (warmSamples_ >= coldXfade_) ? warmXfade_
-                                                     : std::clamp ((newParts + 1) * P_, warmXfade_, coldXfade_);
-            if (maxParts_ > 0)                                             // prime the new slot's tail from the warm FDL
+            xfadeLen_ = warmXfade_;
+            if (maxParts_ > 0)                                             // prime the new slot's tail from the FDL
             {
                 int base = fdlPos_ - 1; if (base < 0) base += maxParts_;
                 computeTails (slot_[1 - cur_], base);
@@ -429,7 +426,6 @@ private:
             out[0][s] = oL;
             if (! mono_) out[1][s] = oR;
             if (++phase_ == P_) { phase_ = 0; chunkAll (false); }
-            if (warmSamples_ < coldXfade_) ++warmSamples_;
         }
     }
 
@@ -454,7 +450,6 @@ private:
             out[0][s] = oLo * wOld + oLn * wNew;
             if (! mono_) out[1][s] = oRo * wOld + oRn * wNew;
             if (++phase_ == P_) { phase_ = 0; chunkAll (true); }
-            if (warmSamples_ < coldXfade_) ++warmSamples_;
             if (++xfadePos_ >= xfadeLen_)
             {
                 cur_ = 1 - cur_;                                // new operator live; old now free to re-stage
@@ -472,14 +467,14 @@ private:
     core::fft::AlignedVector<float> fdlL_, fdlR_;         // maxParts × specF: rings of past raw L/R input spectra (seam)
     core::fft::AlignedVector<float> inputSpec_, viewSpec_, acc_, ifftOut_;   // shared FFT scratch — SIMD-aligned (seam)
     std::vector<float> tmpTailA_, tmpTailB_;              // P each: time-domain tail scratch (plain)
+    static_assert (std::atomic<int>::is_always_lock_free, "state_ must be lock-free — it is read/written on the audio thread");
     std::atomic<int> state_ { 0 };                        // 0 Idle · 1 Pending (staged) · 2 Crossfading
     bool prepared_ = false;
     bool mono_ = false;
     int P_ = 0, N_ = 0, specF_ = 0, maxParts_ = 0, channels_ = 2;
     int cur_ = 0;                                         // active slot (0/1)
     int phase_ = 0, fdlPos_ = 0;                          // shared per-chunk timing (both channels lockstep)
-    int xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1, coldXfade_ = 1;
-    long long warmSamples_ = 0;                           // samples processed (saturates at coldXfade_) → warm test
+    int xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1;
 };
 
 } // namespace felitronics::convolution

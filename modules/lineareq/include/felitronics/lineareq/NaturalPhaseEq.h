@@ -4,7 +4,7 @@
 #pragma once
 
 #include <felitronics/eq/EqEngine.h>
-#include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/Config.h>
@@ -203,7 +203,7 @@ private:
     static constexpr int kPartition = 128;
     using DesignFft = core::fft::ScalarRadix2Real;   // cepstral FIR design hand-packs the scalar packed-Hermitian layout → pinned
     static_assert (core::fft::PackedHermitianSpectrum<DesignFft>, "design FFT must be packed-Hermitian (buildFullBanks/MixedPhaseFir)");
-    using Conv      = convolution::MatrixConvolver<AudioFft>;   // audio path — swappable to a SIMD backend
+    using Conv      = convolution::MatrixConvolverNupc<AudioFft>;   // audio path — non-uniform (Gardner), block-independent; swappable to a SIMD backend
 
     // Extract L causal taps from a D-point mixed-phase impulse: peak at h[0], pre-ring wraps to h[D-1..];
     // shift right by bulkDelay so out[bulkDelay] = h[0]. Tail (+ light head) taper suppresses truncation ripple.

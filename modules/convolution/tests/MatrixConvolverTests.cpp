@@ -87,7 +87,7 @@ int main()
 {
     std::printf ("felitronics::convolution MatrixConvolver tests\n");
     const int P = 64, irMax = 400, len = 200, xfade = 128, n = 4000;
-    const int settled = 900;                              // past coldXfade (≈384) + tail fill + margin
+    const int settled = 900;                              // past the short crossfade + tail fill + margin
 
     Lcg r { 2718 };
     auto mkIr = [&] { std::vector<float> v ((std::size_t) len); for (auto& x : v) x = 0.15f * r.next(); return v; };

@@ -4,7 +4,7 @@
 #pragma once
 
 #include <felitronics/eq/EqEngine.h>
-#include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/Config.h>
 
@@ -196,7 +196,7 @@ private:
     static constexpr int kPartition = 128;
     using DesignFft = core::fft::ScalarRadix2Real;   // FIR design hand-packs the scalar packed-Hermitian layout → pinned
     static_assert (core::fft::PackedHermitianSpectrum<DesignFft>, "design FFT must be packed-Hermitian (gridToSymmetricFir)");
-    using Conv      = convolution::MatrixConvolver<AudioFft>;   // audio path — swappable to a SIMD backend
+    using Conv      = convolution::MatrixConvolverNupc<AudioFft>;   // audio path — non-uniform (Gardner), block-independent; swappable to a SIMD backend
 
     // A real (signed) grid of N/2+1 points → a symmetric zero-phase FIR of N+1 taps. Shared by the axis
     // path (magnitude grid, always ≥ 0) and the Full entry path (signed matrix entries — an off-diagonal

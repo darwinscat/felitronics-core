@@ -14,6 +14,8 @@
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/NonUniformConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/fftpffft/PffftRealFft.h>
 
 #include <algorithm>
@@ -170,6 +172,97 @@ int main()
         const double e = maxDiff (ys, yp), pk = peak (ys);
         std::printf ("      mono err=%.2e (peak %.2e)\n", e, pk);
         test::ok (e < 1e-4 * pk + 1e-6, "mono: pffft nulls scalar");   // same gate as the stereo topologies
+    }
+
+    // --- NUPC cross-backend NULL: the SHIPPING pffft path through the NON-UNIFORM stage array. This is the
+    //     only null of NonUniformConvolver<Pffft> — its per-stage distinct FFT sizes + memcpy between FDL rows
+    //     are exactly where a z-order / row-alignment bug would hide (the scalar tests can't see it). ---
+    test::group ("cross-backend NULL: NonUniformConvolver<Pffft> == NonUniformConvolver<Scalar>");
+    {
+        using NuS = convolution::NonUniformConvolver<Scalar>;
+        using NuP = convolution::NonUniformConvolver<Pf>;
+        const int nuLen = 5000, nuMax = 8192, nuN = 9000;
+        Lcg rn { 24680 };
+        std::vector<float> h ((std::size_t) nuLen); for (auto& v : h) v = 0.06f * rn.next();
+        std::vector<float> xin ((std::size_t) nuN);  for (auto& v : xin) v = 0.3f * rn.next();
+        for (int p : { 0, 127, 128, 4095, 4096, nuLen - 1 }) if (p >= 0 && p < nuN) xin[(std::size_t) p] += 1.0f;  // stage-boundary impulses
+
+        for (int block : { 128, 512, 257 })   // small + typical + non-power-of-two
+        {
+            NuS s; NuP pf;
+            test::ok (s.prepare (128, nuMax, nuLen) && pf.prepare (128, nuMax, nuLen), "NUPC prepare (both backends)");
+            s.setIr (h.data(), nuLen); pf.setIr (h.data(), nuLen);
+            std::vector<float> ys (nuN, 0.0f), yp (nuN, 0.0f);
+            for (int o = 0; o < nuN; o += block)
+            { const int m = std::min (block, nuN - o); s.process (&xin[(std::size_t) o], &ys[(std::size_t) o], m); pf.process (&xin[(std::size_t) o], &yp[(std::size_t) o], m); }
+            const double e = maxDiff (ys, yp), pk = peak (ys);
+            std::printf ("      NUPC capped block=%3d  err=%.2e (peak %.2e, rel %.2e)\n", block, e, pk, e / (pk + 1e-30));
+            test::ok (e < 1e-4 * pk + 1e-6, "NUPC pffft nulls scalar (capped, block=" + std::to_string (block) + ")");
+        }
+    }
+
+    // --- MatrixConvolverNupc (Phase-2 matrix facade) cross-backend NULL: pffft z-order through the per-stage
+    //     channel-indexed FDL + LRDiag routing (mono + LRDiag) ---
+    test::group ("cross-backend NULL: MatrixConvolverNupc<Pffft> == <Scalar> (mono / LRDiag / MSDiag / Full)");
+    {
+        using McnS = convolution::MatrixConvolverNupc<Scalar>;
+        using McnP = convolution::MatrixConvolverNupc<Pf>;
+        const int nuLen = 5000, nuMax = 8192, nuN = 9000;
+        Lcg rn { 13579 };
+        std::vector<float> hL ((std::size_t) nuLen), hR ((std::size_t) nuLen);
+        for (auto& v : hL) v = 0.06f * rn.next(); for (auto& v : hR) v = 0.06f * rn.next();
+        std::vector<float> xL ((std::size_t) nuN), xR ((std::size_t) nuN);
+        for (auto& v : xL) v = 0.3f * rn.next(); for (auto& v : xR) v = 0.3f * rn.next();
+
+        // mono
+        { McnS s; McnP p; s.prepare (128, nuMax, 128, 1); p.prepare (128, nuMax, 128, 1);
+          s.setIr (hL.data(), nuLen); p.setIr (hL.data(), nuLen);
+          std::vector<float> ys = xL, yp = xL;
+          for (int o = 0; o < nuN; o += 512) { const int m = std::min (512, nuN - o); const float* a[1] { ys.data() + o }; const float* b[1] { yp.data() + o }; float* ao[1] { ys.data() + o }; float* bo[1] { yp.data() + o }; s.process (a, ao, 1, m); p.process (b, bo, 1, m); }
+          const double e = maxDiff (ys, yp), pk = peak (ys);
+          std::printf ("      MatrixConvolverNupc mono err=%.2e (peak %.2e, rel %.2e)\n", e, pk, e / (pk + 1e-30));
+          test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc mono: pffft nulls scalar"); }
+
+        // LRDiag, non-power-of-two block
+        { McnS s; McnP p; s.prepare (128, nuMax, 128, 2); p.prepare (128, nuMax, 128, 2);
+          const float* bk[2] { hL.data(), hR.data() };
+          s.setOperator (McnS::Topology::LRDiag, bk, 2, nuLen); p.setOperator (McnP::Topology::LRDiag, bk, 2, nuLen);
+          std::vector<float> sL = xL, sR = xR, pL = xL, pR = xR;
+          for (int o = 0; o < nuN; o += 257) { const int m = std::min (257, nuN - o);
+            const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
+            const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
+            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+          const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
+          std::printf ("      MatrixConvolverNupc LRDiag@257 err=%.2e (peak %.2e, rel %.2e)\n", e, pk, e / (pk + 1e-30));
+          test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc LRDiag: pffft nulls scalar"); }
+
+        // MSDiag — the per-stage ½(X_L±X_R) view must stay valid in pffft's z-order layout
+        { McnS s; McnP p; s.prepare (128, nuMax, 128, 2); p.prepare (128, nuMax, 128, 2);
+          std::vector<float> hS ((std::size_t) nuLen); for (auto& v : hS) v = 0.05f * rn.next();
+          const float* bk[2] { hL.data(), hS.data() };
+          s.setOperator (McnS::Topology::MSDiag, bk, 2, nuLen); p.setOperator (McnP::Topology::MSDiag, bk, 2, nuLen);
+          std::vector<float> sL = xL, sR = xR, pL = xL, pR = xR;
+          for (int o = 0; o < nuN; o += 512) { const int m = std::min (512, nuN - o);
+            const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
+            const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
+            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+          const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
+          std::printf ("      MatrixConvolverNupc MSDiag err=%.2e (rel %.2e)\n", e, e / (pk + 1e-30));
+          test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc MSDiag: pffft nulls scalar"); }
+
+        // Full — 4-bank cross routing on the per-stage z-order FDLs
+        { McnS s; McnP p; s.prepare (128, nuMax, 128, 2); p.prepare (128, nuMax, 128, 2);
+          std::vector<float> h3 ((std::size_t) nuLen), h4 ((std::size_t) nuLen); for (auto& v : h3) v = 0.04f * rn.next(); for (auto& v : h4) v = 0.04f * rn.next();
+          const float* bk[4] { hL.data(), hR.data(), h3.data(), h4.data() };
+          s.setOperator (McnS::Topology::Full, bk, 4, nuLen); p.setOperator (McnP::Topology::Full, bk, 4, nuLen);
+          std::vector<float> sL = xL, sR = xR, pL = xL, pR = xR;
+          for (int o = 0; o < nuN; o += 257) { const int m = std::min (257, nuN - o);
+            const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
+            const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
+            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+          const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
+          std::printf ("      MatrixConvolverNupc Full@257 err=%.2e (rel %.2e)\n", e, e / (pk + 1e-30));
+          test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc Full: pffft nulls scalar"); }
     }
 
     // --- mid-stream topology swap: both backends run the same MSDiag->Full swap; parity incl. the fade ---
