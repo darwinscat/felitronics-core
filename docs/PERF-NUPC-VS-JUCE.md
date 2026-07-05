@@ -7,7 +7,7 @@ convolver: a 128-sample time-domain head + geometrically growing overlap-save FF
 `pffft` backend. It is **block-INDEPENDENT** (one `prepare()`, the same cost at every host block), **true
 sample-zero-latency**, and a NULL-verified drop-in for the old fixed-`P=128` `MatrixConvolver`.
 
-**📊 [Interactive chart →](https://claude.ai/code/artifact/1a118004-7d2f-4dc5-8522-bd95d743e4d9)**
+![Convolver CPU across the full DAW buffer range — MatrixConvolverNupc vs juce::dsp::Convolution on an Intel i9-13900H and an Apple M5 Pro, 131072-tap stereo, 16→4096 samples](assets/nupc-vs-juce.svg)
 
 ## Head-to-head (131072-tap stereo IR, LRDiag, 48 kHz, Apple M5 Pro, pffft · JUCE 8.0.4)
 
@@ -35,7 +35,7 @@ The head-to-head above walks powers of two. But hosts offer **every 32-sample bu
 pick are **not powers of two**. Measured at all 129 from 16 to 4096 samples, LRDiag, JUCE 8.0.4 oracle-tuned
 (`maxBlock` = the actual buffer, its best case), on **two very different CPUs** — an Apple M5 Pro (NEON) and an Intel
 i9-13900H (SSE, pinned to a P-core). NUPC is **flat at every one**; JUCE is a sawtooth that peaks at each power of two.
-The interactive chart linked above carries both machines and all 129 points; representative rows
+The chart at the top of this page carries both machines and all 129 points; representative rows
 (`mean(worst)` = NUPC mean and worst-single-buffer %RT):
 
 | host buffer | M5 Pro · JUCE | M5 · NUPC mean(worst) | i9-13900H · JUCE | i9 · NUPC mean(worst) |
@@ -95,7 +95,14 @@ MSDiag / Full add the ½(X_L±X_R) view / the 4-bank cross sums — a modest, fl
 cmake -S . -B build-juce -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_BENCH_JUCE=ON
 cmake --build build-juce --target fcore_fftbench -j
 ./build-juce/tools/fcore_fftbench                       # correctness probe + OLD/NEW/pffft + NUPC + matrix-NUPC + JUCE head-to-head
-FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench    # only the 65-buffer nose-to-nose sweep, as CSV (buffer,ms,juce,nupc,nupc_max)
+FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench    # only the 129-buffer nose-to-nose sweep (16→4096), CSV: buffer,ms,juce,nupc,nupc_max
+```
+
+Regenerate the chart above (`docs/assets/nupc-vs-juce.svg`) from a per-machine CSV of that sweep:
+
+```sh
+FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench | grep -E '^  [0-9]+[*]?,' > i9.csv   # run on each machine
+python3 tools/plot-convolver-sweep.py i9.csv m5.csv docs/assets/nupc-vs-juce.svg
 ```
 
 Correctness: `MatrixConvolverNupc`'s output is NULL-verified sample-by-sample against a direct time-domain

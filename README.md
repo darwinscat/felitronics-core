@@ -21,7 +21,7 @@ quality maps of every `eq` filter vs independent analog references, regenerated 
 (non-uniform, Gardner) holds a **flat, block-independent cost at every one of 129 real DAW buffers** (16→4096) —
 ~0.6 % RT on an Apple M5 Pro, ~1.08 % on an Intel i9-13900H — **cheaper than JUCE across the small, low-latency
 buffers a live rig runs** (JUCE only wins the mean at large power-of-two blocks); true sample-zero-latency
-([interactive two-machine chart](https://claude.ai/code/artifact/1a118004-7d2f-4dc5-8522-bd95d743e4d9)).
+([two-machine chart + tables](docs/PERF-NUPC-VS-JUCE.md)).
 
 ## Modules
 
