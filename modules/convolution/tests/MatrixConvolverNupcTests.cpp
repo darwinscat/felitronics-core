@@ -147,6 +147,24 @@ int main()
         test::ok (maxDiff (yR, rR, settled, N) / (peak (rR) + 1e-30) < 2e-4, "stereo setIr: yR == h ∗ xR");
     }
 
+    // --- F1 regression: a render SHORTER than the (removed) cold-prime length must be UN-attenuated. The old cold
+    //     fade scaled to the IR's reach (~6000 samples here); for a render of 4000 it never completed, so the WHOLE
+    //     output stayed on the attenuating ramp (~10 dB down, worse earlier). The cold-started FDL is already the
+    //     exact causal convolution, so now only the short warm fade (128) applies and the output is exact past it. ---
+    test::group ("short render is un-attenuated (no long cold fade)");
+    {
+        const int bigIr = 131072, L = 6000, Nr = 4000, xf = 128;   // IR reach (6000) > render (4000): old fade never finished
+        Lcg r { 4242 };
+        std::vector<float> h ((std::size_t) L); for (auto& v : h) v = 0.05f * r.next();
+        std::vector<float> x ((std::size_t) Nr); for (auto& v : x) v = 0.3f * r.next();
+        MCN mc; test::ok (mc.prepare (128, bigIr, xf, 1), "prepare mono, 131072-tap capacity");
+        mc.setIr (h.data(), L);
+        std::vector<float> y; runMono (mc, x, y, 256);
+        const std::vector<float> ref = convRef (x, h, bigIr);
+        const double rel = maxDiff (y, ref, xf + 256, Nr) / (peak (ref) + 1e-30);   // exact past the SHORT fade only
+        test::ok (rel < 2e-4, "output == reference right after the short fade (the whole render would be attenuated on the old cold ramp)");
+    }
+
     // --- channel isolation (LRDiag): R input all-zero → R output exactly silent (blend of two zero paths) ---
     test::group ("channel isolation: R input zero → R output silent");
     {
@@ -194,7 +212,7 @@ int main()
     // --- click-free WARM swap that honours the warm history (small maxIr → cheap warm-up) ---
     test::group ("warm swap: click-free + warm history");
     {
-        const int mIr = 4096, L = 2000, N = 20000, T = 9000;   // T > coldXfade(2048) → a SHORT warm fade
+        const int mIr = 4096, L = 2000, N = 20000, T = 9000;   // T is well past the first-activation fade → a plain warm swap
         Lcg r { 3131 };
         std::vector<float> h1 ((std::size_t) L), h2 ((std::size_t) L); for (auto& v : h1) v = 0.05f * r.next(); for (auto& v : h2) v = 0.05f * r.next();
         std::vector<float> x ((std::size_t) N); for (auto& v : x) v = 0.3f * r.next();
@@ -263,13 +281,13 @@ int main()
     // --- reset() in the MIDDLE of a crossfade cancels it cleanly (the one fade path with no other coverage) ---
     test::group ("reset() mid-crossfade cancels cleanly");
     {
-        const int mIr = 4096, L = 2000, N = 4000;   // first activation → a long cold fade (~2048 samples)
+        const int mIr = 4096, L = 2000, N = 4000, xf = 1024;   // a long WARM fade so 512 samples lands mid-crossfade
         Lcg r { 321 };
         std::vector<float> h ((std::size_t) L); for (auto& v : h) v = 0.05f * r.next();
         std::vector<float> x ((std::size_t) N); for (auto& v : x) v = 0.3f * r.next();
-        MCN mc; mc.prepare (128, mIr, 128, 1); mc.setIr (h.data(), L);
+        MCN mc; mc.prepare (128, mIr, xf, 1); mc.setIr (h.data(), L);
         std::vector<float> y ((std::size_t) N, 0.0f);
-        for (int i = 0; i < 512; i += 256) { const int m = std::min (256, 512 - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; mc.process (in, out, 1, m); }   // 512 samples into a ~2048 fade
+        for (int i = 0; i < 512; i += 256) { const int m = std::min (256, 512 - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; mc.process (in, out, 1, m); }   // 512 samples into the 1024-sample fade
         test::ok (mc.isBusy(), "busy mid-crossfade");
         mc.reset();
         test::ok (! mc.isBusy(), "reset() cancels the crossfade (idle)");

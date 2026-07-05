@@ -32,9 +32,9 @@ namespace felitronics::convolution
 // writes the inactive slot only while Idle and publishes with a release store; the audio thread reads
 // both slots only after acquiring that store (during the fade), and commits the slot flip at fade end.
 //
-// COLD START: on the very first activation the shared history is empty, so that ONE swap uses a long
-// fade (≈ the tail length) to mask the cold prime; once the history has filled, every swap uses the
-// short (anti-click) fade. Detected by an audio-thread sample counter (no message-thread race).
+// COLD START: on the very first activation the shared history is empty — but a cold-started overlap-save
+// FDL already produces the EXACT causal convolution (empty history = "no input before t=0"), so there is
+// nothing to mask. Every swap, first or later, uses the same short (anti-click) crossfade.
 //
 // LOCKSTEP: one crossfade position advanced once per sample-frame across all channels, so a stereo IR
 // swap (Mid IR ch0, Side IR ch1) can never move the image or decorrelate L/R. Race-free via a 3-state
@@ -46,7 +46,7 @@ class ConvolutionEngine
 {
 public:
     // partitionSize P (pow2; FFT size = 2P). maxIrSamples sizes the partition arrays. crossfadeSamples is
-    // the SHORT (warm) anti-click fade; the cold first-prime length is derived internally. Message thread.
+    // the anti-click crossfade length, used for every swap (first activation and warm swaps alike). Message thread.
     bool prepare (int partitionSize, int maxIrSamples, int crossfadeSamples, int numChannels = 1)
     {
         prepared_ = false;                            // any early return below leaves the engine unprepared (setIr/process reject)
@@ -61,7 +61,6 @@ public:
         maxParts_ = (maxIrSamples > P_) ? ((maxIrSamples - P_ + P_ - 1) / P_) : 0;
 
         warmXfade_ = crossfadeSamples < 1 ? 1 : crossfadeSamples;
-        coldXfade_ = maxParts_ > 0 ? std::max (warmXfade_, maxParts_ * P_) : warmXfade_;   // cold prime ≈ tail, never below the warm fade (keeps the std::clamp lo<=hi)
 
         inputSpec_.assign ((std::size_t) specF_, 0.0f);
         acc_.assign       ((std::size_t) specF_, 0.0f);
@@ -69,19 +68,19 @@ public:
         for (int c = 0; c < MaxChannels; ++c) chan_[c].prepare (P_, N_, specF_, maxParts_);
 
         cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
-        phase_ = 0; fdlPos_ = 0; warmSamples_ = 0;
+        phase_ = 0; fdlPos_ = 0;
         state_.store (0, std::memory_order_relaxed);
         prepared_ = true;                             // fully built — only now may setIr()/process() run
         return true;
     }
 
-    // Clears the running history (so the next swap re-primes cold) but KEEPS the current IR slot — reset
+    // Clears the running history (so the next swap fades in from silence) but KEEPS the current IR slot — reset
     // means "flush the tail", not "revert the EQ". Cancels any pending swap. Audio thread (or externally
     // synced); must not run concurrently with setIr().
     void reset() noexcept
     {
         for (int c = 0; c < channels_; ++c) chan_[c].reset();
-        xfadePos_ = 0; phase_ = 0; fdlPos_ = 0; warmSamples_ = 0;   // keep cur_ (the live IR slot)
+        xfadePos_ = 0; phase_ = 0; fdlPos_ = 0;   // keep cur_ (the live IR slot)
         state_.store (0, std::memory_order_relaxed);
     }
 
@@ -118,16 +117,11 @@ public:
         if (nc <= 0 || n <= 0) return;
 
         int s = state_.load (std::memory_order_acquire);
-        if (s == 1)   // begin crossfade — length by warmth (cold first-prime vs short warm swap)
-        {
+        if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE
+        {             // short smoothstep fade (warmXfade_) masks only the silence→convolution onset — no long cold prime.
             xfadePos_ = 0;
-            // The cold first-prime fade masks the empty-history ramp-up, which lasts ≈ the NEW IR's tail —
-            // so scale it to the ACTUAL loaded IR (its numParts), not maxParts. A short IR then fades in over
-            // the short anti-click window instead of the full max-tail; a long IR still gets a tail-length fade.
-            const int newParts = chan_[0].numParts[1 - cur_];                 // all channels share the IR length
-            xfadeLen_ = (warmSamples_ >= coldXfade_) ? warmXfade_
-                                                     : std::clamp ((newParts + 1) * P_, warmXfade_, coldXfade_);
-            for (int c = 0; c < nc; ++c) primeTail (chan_[c], 1 - cur_);   // make the new slot's tail valid NOW from the warm FDL (else its zeroed tail leaks into the blend for ≤P samples)
+            xfadeLen_ = warmXfade_;
+            for (int c = 0; c < nc; ++c) primeTail (chan_[c], 1 - cur_);   // make the new slot's tail valid NOW from the FDL (else its zeroed tail leaks into the blend for ≤P samples)
             state_.store (2, std::memory_order_relaxed);
             s = 2;
         }
@@ -285,7 +279,6 @@ private:
                 out[c][s] = headDot (ch.h0[cur_], fr, P_) + ch.pendingTail[cur_][(std::size_t) phase_];
             }
             if (++phase_ == P_) { phase_ = 0; chunkAll (nc, false); }
-            if (warmSamples_ < coldXfade_) ++warmSamples_;
         }
     }
 
@@ -309,7 +302,6 @@ private:
                 out[c][s] = oOld * wOld + oNew * wNew;
             }
             if (++phase_ == P_) { phase_ = 0; chunkAll (nc, true); }
-            if (warmSamples_ < coldXfade_) ++warmSamples_;
             if (++xfadePos_ >= xfadeLen_)
             {
                 cur_ = other;                                   // new slot live; old now free to re-stage
@@ -329,8 +321,7 @@ private:
     int P_ = 0, N_ = 0, specF_ = 0, maxParts_ = 0, channels_ = 1;
     int cur_ = 0;                                         // active slot (0/1)
     int phase_ = 0, fdlPos_ = 0;                          // shared per-chunk timing (all channels lockstep)
-    int xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1, coldXfade_ = 1;
-    long long warmSamples_ = 0;                           // samples processed (saturates at coldXfade_) → warm test
+    int xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1;
 };
 
 } // namespace felitronics::convolution

@@ -28,9 +28,9 @@ namespace felitronics::convolution
 //     bank_M / bank_S, and decodes yL = yM+yS, yR = yM−yS; Full does the 4-bank cross sums per stage.
 //   • setOperator stages an operator into the inactive slot; process() crossfades the OLD and NEW operators'
 //     FULL outputs (head + every stage's tail) by a smoothstep weight, BOTH computed from the SAME shared warm
-//     FDL (chunkStage recomputes both slots' tails as stages wrap). The first activation uses a long fade sized
-//     to the SLOWEST stage's FDL fill (coldXfade_ = max_s C_s·B_s) to mask the cold prime; later warm swaps use
-//     the short crossfadeSamples fade. isBusy() is true while fading (the host coalesces).
+//     FDL (chunkStage recomputes both slots' tails as stages wrap). Every swap uses the same short smoothstep
+//     crossfade (crossfadeSamples): a cold-started FDL already produces the EXACT causal convolution, so the fade
+//     only masks the silence→convolution onset (no long "cold prime"). isBusy() is true while fading (host coalesces).
 //
 // STRUCTURE (channel-indexed per-stage, mirrors MatrixConvolver's decoupled helpers replicated per stage):
 //   • the IR is tiled by a head [0,P0) + stages s of block B_s, count C_s, offset_s==B_s (zero-latency
@@ -85,9 +85,6 @@ public:
         if (numStages_ < 0) return false;                       // schedule can't cover maxIrSamples in kMaxStages
 
         warmXfade_ = crossfadeSamples < 1 ? 1 : crossfadeSamples;
-        long long slow = warmXfade_;   // the SLOWEST stage's FDL fill (stages warm in parallel) — the tail's C_max·B_max
-        for (int st = 0; st < numStages_; ++st) slow = std::max (slow, (long long) spec_[st].C * (long long) spec_[st].B);
-        coldXfade_ = (int) slow;
 
         int maxSpecF = 1, maxN = 1, maxB = 1;
         for (int st = 0; st < numStages_; ++st) { maxSpecF = std::max (maxSpecF, spec_[st].specF); maxN = std::max (maxN, spec_[st].N); maxB = std::max (maxB, spec_[st].B); }
@@ -133,7 +130,7 @@ public:
                 for (int ch = 0; ch < 2; ++ch) sl.tail[(std::size_t) st][(std::size_t) ch].assign ((std::size_t) spec_[st].B, 0.0f);
         }
 
-        cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_; warmSamples_ = 0;
+        cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
         state_.store (0, std::memory_order_relaxed);
         prepared_ = true;
         return true;
@@ -152,7 +149,7 @@ public:
         for (int k = 0; k < 2; ++k)
             for (int st = 0; st < numStages_; ++st)
                 for (int ch = 0; ch < 2; ++ch) std::fill (slot_[k].tail[(std::size_t) st][(std::size_t) ch].begin(), slot_[k].tail[(std::size_t) st][(std::size_t) ch].end(), 0.0f);
-        xfadePos_ = 0; warmSamples_ = 0;               // cancel any pending/active fade; re-arm the cold prime
+        xfadePos_ = 0;                                 // cancel any pending/active fade
         state_.store (0, std::memory_order_relaxed);   // keep cur_ (the live operator)
     }
 
@@ -201,12 +198,11 @@ public:
         if (! prepared_ || n <= 0 || numChannelsToProcess < channels_) return;
 
         int s = state_.load (std::memory_order_acquire);
-        if (s == 1)   // begin the crossfade — length by warmth (cold first-prime vs short warm swap)
-        {
+        if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE
+        {             // short smoothstep fade (warmXfade_) masks only the silence→convolution onset — no long cold prime.
             xfadePos_ = 0;
-            xfadeLen_ = (warmSamples_ >= coldXfade_) ? warmXfade_
-                                                     : std::clamp (incomingCoverage(), warmXfade_, coldXfade_);
-            for (int st = 0; st < numStages_; ++st)         // prime the new slot's tails from the warm per-stage FDLs
+            xfadeLen_ = warmXfade_;
+            for (int st = 0; st < numStages_; ++st)         // prime the new slot's tails from the per-stage FDLs
             {
                 int base = hist_[(std::size_t) st].fdlPos - 1; if (base < 0) base += spec_[st].C;
                 computeStageTails (slot_[1 - cur_], st, base);
@@ -470,7 +466,6 @@ private:
     {
         for (int st = 0; st < numStages_; ++st)
             if (++hist_[(std::size_t) st].phase == spec_[st].B) { hist_[(std::size_t) st].phase = 0; chunkStage (st, fading); }
-        if (warmSamples_ < coldXfade_) ++warmSamples_;
     }
 
     // Idle path: samples [a,b) through the single live operator.
@@ -512,19 +507,6 @@ private:
         }
     }
 
-    // The new operator's effective reach (head + its farthest active partition) — how long the cold fade needs
-    // to mask the warming FDL, capped by the full cold-prime length.
-    int incomingCoverage() const noexcept
-    {
-        const Slot& sl = slot_[1 - cur_];
-        long long cov = P0_;
-        for (int b = 0; b < sl.numBanks; ++b)
-            for (int st = 0; st < numStages_; ++st)
-                if (sl.banks[b].activeParts[st] > 0)
-                    cov = std::max (cov, (long long) spec_[st].offset + (long long) sl.banks[b].activeParts[st] * spec_[st].B);
-        return (int) std::min (cov, (long long) coldXfade_);
-    }
-
     std::array<History, kMaxStages> hist_ {};
     StageSpec spec_[kMaxStages] {};
     Slot slot_[2];
@@ -537,8 +519,7 @@ private:
     bool mono_ = false;
     int P0_ = 0, headMask_ = 0, headPos_[2] { 0, 0 };
     int numStages_ = 0, channels_ = 2;
-    int cur_ = 0, xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1, coldXfade_ = 1;
-    long long warmSamples_ = 0;                                    // samples processed (saturates at coldXfade_) → warm test
+    int cur_ = 0, xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1;
 };
 
 } // namespace felitronics::convolution
