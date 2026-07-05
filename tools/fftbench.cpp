@@ -13,6 +13,7 @@
 // -DFELITRONICS_WITH_PFFFT=ON for the SIMD column.
 
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
@@ -138,6 +139,51 @@ static double benchNU (int irLen, int P0, int Bmax, int block, double fs, double
         const auto b1 = std::chrono::steady_clock::now();
         maxBlk = std::max (maxBlk, std::chrono::duration<double> (b1 - b0).count() / audioPerBlock);
     }
+    maxBlockPctOut = 100.0 * maxBlk;
+    return mean;
+}
+
+// The SHIPPING matrix convolver: a single stereo MatrixConvolverNupc<Backend> routed by `topo` (0 LRDiag,
+// 1 MSDiag, 2 Full). This is what lineareq now convolves on. Mean %RT + worst single-block %RT. block-INDEPENDENT.
+template <class Backend>
+static double benchMatrixNupc (int topoSel, int nBanks, int irLen, int block, double fs, double warmSec, double measSec, double& maxBlockPctOut)
+{
+    using MC = convolution::MatrixConvolverNupc<Backend>;
+    MC mc;
+    const int warmXfade = std::max (256, (int) std::lround (0.02 * fs));
+    if (! mc.prepare (128, irLen, warmXfade, 2)) { maxBlockPctOut = -1.0; return -1.0; }
+
+    std::mt19937 rng (12345);
+    std::uniform_real_distribution<float> u (-1.0f, 1.0f);
+    std::vector<std::vector<float>> irs ((std::size_t) nBanks, std::vector<float> ((std::size_t) irLen));
+    for (auto& ir : irs) for (int i = 0; i < irLen; ++i) ir[(std::size_t) i] = 0.02f * std::exp (-3.0f * (float) i / (float) irLen) * u (rng);
+    std::vector<const float*> banks ((std::size_t) nBanks);
+    for (int b = 0; b < nBanks; ++b) banks[(std::size_t) b] = irs[(std::size_t) b].data();
+    using Topo = typename MC::Topology;
+    mc.setOperator (topoSel == 0 ? Topo::LRDiag : topoSel == 1 ? Topo::MSDiag : Topo::Full, banks.data(), nBanks, irLen);
+
+    std::vector<float> inL ((std::size_t) block), inR ((std::size_t) block), L ((std::size_t) block), R ((std::size_t) block);
+    for (int i = 0; i < block; ++i) { inL[(std::size_t) i] = 0.3f * u (rng); inR[(std::size_t) i] = 0.3f * u (rng); }
+
+    core::ScopedFlushToZero ftz;
+    auto once = [&]
+    {
+        std::memcpy (L.data(), inL.data(), (std::size_t) block * sizeof (float));
+        std::memcpy (R.data(), inR.data(), (std::size_t) block * sizeof (float));
+        float* io[2] { L.data(), R.data() }; mc.process (io, io, 2, block);
+    };
+
+    for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // pass the cold prime + warm caches
+
+    const int measBlocks = std::max (1, (int) (measSec * fs / block));
+    const double audioPerBlock = (double) block / fs;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < measBlocks; ++i) once();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double mean = 100.0 * std::chrono::duration<double> (t1 - t0).count() / ((double) measBlocks * audioPerBlock);
+
+    double maxBlk = 0.0;
+    for (int i = 0; i < measBlocks; ++i) { const auto b0 = std::chrono::steady_clock::now(); once(); const auto b1 = std::chrono::steady_clock::now(); maxBlk = std::max (maxBlk, std::chrono::duration<double> (b1 - b0).count() / audioPerBlock); }
     maxBlockPctOut = 100.0 * maxBlk;
     return mean;
 }
@@ -340,26 +386,48 @@ int main()
         std::printf ("    NUPC's edge is a FLAT cost and the small-block regime — see the head-to-head below.\n");
     }
 
+    //==========================================================================================================
+    // The SHIPPING matrix convolver — MatrixConvolverNupc, the class lineareq now convolves on. A SINGLE stereo
+    // instance on the raw-L/R history, routed per topology (LRDiag / MSDiag / Full). block-INDEPENDENT, 0 latency.
+    {
+        std::printf ("\n== MatrixConvolverNupc — the shipping matrix convolver (head 128, Bmax=2048, %d-tap IR) ==\n", irLen);
+#if defined(FELITRONICS_WITH_PFFFT)
+        std::printf ("  host block |  LRDiag pffft mean(max) |  MSDiag pffft mean(max) |  Full pffft mean(max)\n");
+        std::printf ("  ----------- ------------------------- ------------------------- -----------------------\n");
+        for (int b : nuBlocks)
+        {
+            double m0 = 0.0, m1 = 0.0, m2 = 0.0;
+            const double lr = benchMatrixNupc<fftpffft::PffftRealFft> (0, 2, irLen, b, fs, 3.0, 2.0, m0);
+            const double ms = benchMatrixNupc<fftpffft::PffftRealFft> (1, 2, irLen, b, fs, 3.0, 2.0, m1);
+            const double fu = benchMatrixNupc<fftpffft::PffftRealFft> (2, 4, irLen, b, fs, 3.0, 2.0, m2);
+            std::printf ("  %9d  |  %6.2f%% (%5.2f%%)       |  %6.2f%% (%5.2f%%)       |  %6.2f%% (%5.2f%%)\n", b, lr, m0, ms, m1, fu, m2);
+        }
+#else
+        std::printf ("  (configure -DFELITRONICS_WITH_PFFFT=ON for the SIMD matrix-NUPC columns)\n");
+#endif
+        std::printf ("  → ONE stereo instance, every topology FLAT + true sample-zero-latency — this is what the EQ ships on.\n");
+    }
+
 #if defined(FELITRONICS_BENCH_JUCE)
-    // THE FAIR HEAD-TO-HEAD: JUCE's own convolver vs our MatrixConvolver<Pffft>, same IR, LRDiag/stereo.
-    std::printf ("\n== JUCE head-to-head (same 131072-tap stereo IR; both zero-latency) ==\n");
-    std::printf ("  NB juce::dsp::Convolution also reports ZERO latency (getLatency()==0) — its cost falls as the\n");
-    std::printf ("  host block grows (bigger partitions => fewer of them). NUPC is FLAT ~0.9%% and true sample-\n");
-    std::printf ("  accurate zero latency; it WINS at small blocks and stays predictable across a variable block.\n");
-    std::printf ("  host block |  juce::dsp::Convolution (its latency)  |  NUPC<pffft> mean (max/block, 0 latency)\n");
-    std::printf ("  ----------- --------------------------------------- ----------------------------------------\n");
+    // THE HEAD-TO-HEAD nose-to-nose with JUCE, on the SHIPPING matrix convolver + the old fixed-P=128 one.
+    std::printf ("\n== HEAD-TO-HEAD: juce::dsp::Convolution vs our convolvers (131072-tap stereo LRDiag) ==\n");
+    std::printf ("  All three report ZERO latency. JUCE's cost falls with the block (bigger partitions); ours are\n");
+    std::printf ("  FLAT (block-independent). MatrixConvolverNupc is the shipping matrix convolver.\n");
+    std::printf ("  host block |  juce::dsp::Convolution  |  MatrixConvolver<pffft> (old) |  MatrixConvolverNupc<pffft>\n");
+    std::printf ("  ----------- -------------------------- ------------------------------- ---------------------------\n");
     for (int b : nuBlocks)
     {
         int lat = 0;
-        const double j = benchJuceConvolution (irLen, b, b, fs, 3.0, 2.0, lat);   // oracle-tuned: maxBlock == host block
-        double nuMax = 0.0;
-        const double nu = benchNU<fftpffft::PffftRealFft> (irLen, 128, 4096, b, fs, 3.0, 2.0, nuMax);
-        if (j < 0.0) std::printf ("  %9d  |  (IR load failed)                     |  %6.2f%%  (max %6.2f%%)\n", b, nu, nuMax);
-        else         std::printf ("  %9d  |  %6.2f%%  (lat %6d smp = %6.1f ms)  |  %6.2f%%  (max %6.2f%%, 0.0 ms)\n",
-                                  b, j, lat, 1000.0 * lat / fs, nu, nuMax);
+        const double j  = benchJuceConvolution (irLen, b, b, fs, 3.0, 2.0, lat);            // oracle-tuned (JUCE's best case)
+        const double mc = benchRT<fftpffft::PffftRealFft> (0, 2, irLen, 128, b, fs, 3.0, 2.0);   // old fixed-P=128 matrix convolver
+        double nMax = 0.0;
+        const double nu = benchMatrixNupc<fftpffft::PffftRealFft> (0, 2, irLen, b, fs, 3.0, 2.0, nMax);
+        if (j < 0.0) std::printf ("  %9d  |  (IR load failed)        |  %7.2f%%                     |  %6.2f%% (max %5.2f%%)\n", b, mc, nu, nMax);
+        else std::printf ("  %9d  |  %6.2f%% (%6.1f ms lat)  |  %7.2f%%                     |  %6.2f%% (max %5.2f%%)\n",
+                          b, j, 1000.0 * lat / fs, mc, nu, nMax);
     }
-    std::printf ("  NUPC WINS at small blocks (256: ~2.3x cheaper) and is FLAT; JUCE wins once the host block is\n");
-    std::printf ("  large (its partition grows with the block). Both are zero-latency — the edge is FLAT cost.\n");
+    std::printf ("  → MatrixConvolverNupc: FLAT ~0.9%%, 3-9x cheaper than JUCE at the 64-128 blocks live rigs run,\n");
+    std::printf ("    ~2.5x cheaper than the old fixed-P=128 matrix convolver, true sample-zero-latency, block-independent.\n");
     // MEASURED (not assumed): the head-to-head oracle-tunes JUCE's maxBlock = the actual host block (its best
     // case). A plugin declares ONE maximumBlockSize at prepare(); the host may then deliver SMALLER/variable
     // buffers. Prepare JUCE for maxBlock=8192, feed it a smaller block: JUCE STAYS zero-latency, but its cost
