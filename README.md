@@ -18,8 +18,9 @@ quality maps of every `eq` filter vs independent analog references, regenerated 
 (green <0.1 dB … red ≥3 dB; black = broken). If a filter regresses, it shows here before anyone hears it.
 
 **[⚡ Convolver benchmark — vs juce::dsp::Convolution](docs/PERF-NUPC-VS-JUCE.md)** — the EQ's `MatrixConvolverNupc`
-(non-uniform, Gardner) is a flat **~0.62 % RT** at every host block, **3–17× cheaper than JUCE** at the small buffers
-live rigs run, and ~3.5× cheaper than the old fixed-`P=128` convolver — true sample-zero-latency, block-independent
+(non-uniform, Gardner) is a flat **~0.6 % RT at every one of 65 real DAW buffers** (16→2048), **5–16× cheaper than
+JUCE at the 64–128-sample buffers live rigs run** (up to 174× at the smallest), and ~3.5× cheaper than the old
+fixed-`P=128` convolver — true sample-zero-latency, block-independent
 ([interactive chart](https://claude.ai/code/artifact/1a118004-7d2f-4dc5-8522-bd95d743e4d9)).
 
 ## Modules

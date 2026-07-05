@@ -9,7 +9,7 @@ sample-zero-latency**, and a NULL-verified drop-in for the old fixed-`P=128` `Ma
 
 **📊 [Interactive chart →](https://claude.ai/code/artifact/1a118004-7d2f-4dc5-8522-bd95d743e4d9)**
 
-## Head-to-head (131072-tap stereo IR, LRDiag, 48 kHz, Apple M5 Pro, pffft)
+## Head-to-head (131072-tap stereo IR, LRDiag, 48 kHz, Apple M5 Pro, pffft · JUCE 8.0.4)
 
 All three report `getLatency() == 0`. `%RT = CPU / audio time`; lower is better.
 
@@ -28,6 +28,41 @@ All three report `getLatency() == 0`. `%RT = CPU / audio time`; lower is better.
 fixed-`P=128` matrix convolver everywhere**, and **3–17× cheaper than JUCE at the 64–128-sample buffers a guitar
 amp or live monitor actually runs**. JUCE's cost swings ~70× with the block (10.50 % → 0.15 %): it is expensive
 at the small blocks and only overtakes us past ~512 samples, where its few large partitions cost less.
+
+## Every real DAW buffer — the nose-to-nose sweep (all 65 sizes)
+
+The head-to-head above walks powers of two. But hosts offer **every 32-sample buffer** (16, 32, 64, 96, 128,
+160, …, 2048) — and most of the ones users pick are **not powers of two**. Measured at all 65, LRDiag, JUCE 8.0.4
+oracle-tuned (`maxBlock` = the actual buffer, its best case). NUPC is **dead-flat 0.58–0.67 % (mean ~0.6 %)** at
+every one; JUCE is a sawtooth that peaks at each power of two. Representative rows (`*` = non-power-of-two; JUCE's
+tiny-block cost carries a few-% run-to-run variance, so this sweep and the powers-of-two table above are independent
+runs that differ slightly on JUCE — e.g. 9.74 % vs 10.50 % at block 64):
+
+| host buffer | ms | `juce::dsp::Convolution` 8.0.4 | **NUPC mean** | NUPC worst buffer | cheaper |
+|---:|---:|---:|---:|---:|---|
+| 16    | 0.33 | **102.6 %** ⛔ (over real-time) | **0.59 %** | 52.5 % | **174× us** |
+| 32    | 0.67 | 32.1 % | **0.59 %** | 15.2 % | **54× us** |
+| 64    | 1.33 | 9.74 % | **0.60 %** | 10.6 % | **16× us** |
+| 96\*  | 2.00 | 3.05 % | **0.59 %** | 4.97 % | 5.2× us |
+| 128   | 2.67 | 2.84 % | **0.60 %** | 3.64 % | 4.7× us |
+| 192\* | 4.00 | 1.99 % | **0.62 %** | 2.11 % | 3.2× us |
+| 256   | 5.33 | 1.94 % | **0.59 %** | 1.83 % | 3.3× us |
+| 512   | 10.67 | 0.95 % | **0.61 %** | 1.51 % | 1.6× us |
+| 992\* | 20.67 | 0.57 % | **0.59 %** | 0.90 % | ≈ even |
+| 1024  | 21.33 | 0.49 % | **0.59 %** | 1.48 % | JUCE 1.2× |
+| 2048  | 42.67 | 0.32 % | **0.62 %** | 0.70 % | JUCE 1.9× |
+
+**Reading it.** JUCE exceeds real-time only at the extreme 16-sample buffer (102.6 %), but stays **2–170× more
+expensive than NUPC up to ~512 samples** — the whole low-latency / live-rig range. The two lines cross near **544
+samples**: below it NUPC's flat mean wins, above it JUCE's few large partitions win the mean (see *Honest bounds*).
+Both are zero-latency throughout. The `NUPC worst buffer` column is the single most expensive buffer in the window
+(the once-per-`B_max` coincident-FFT): it spikes at tiny blocks (52 % at 16) but stays **under 100 % — no xrun**,
+while JUCE's *mean* there already isn't.
+
+> **Measurement note (reproducibility).** The sweep's warm-up **must outlast NUPC's cold-prime crossfade**
+> (`coldXfade_ = max_s(C_s·B_s)` ≈ 2.5 s for `B_max = 2048` over a 131072-tap IR). A shorter warm leaves the
+> measure window still double-convolving the warm + cold slots and **inflates the mean by ~0.35 %** — the sweep
+> uses a 3.0 s warm so it settles to the same steady state as the head-to-head.
 
 ## Per topology (all flat, block-independent)
 
@@ -61,7 +96,8 @@ MSDiag / Full add the ½(X_L±X_R) view / the 4-bank cross sums — a modest, fl
 ```sh
 cmake -S . -B build-juce -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_BENCH_JUCE=ON
 cmake --build build-juce --target fcore_fftbench -j
-./build-juce/tools/fcore_fftbench   # the correctness probe, the OLD/NEW/pffft + NUPC + matrix-NUPC sweep, and the JUCE head-to-head
+./build-juce/tools/fcore_fftbench                       # correctness probe + OLD/NEW/pffft + NUPC + matrix-NUPC + JUCE head-to-head
+FCORE_SWEEP_ONLY=1 ./build-juce/tools/fcore_fftbench    # only the 65-buffer nose-to-nose sweep, as CSV (buffer,ms,juce,nupc,nupc_max)
 ```
 
 Correctness: `MatrixConvolverNupc`'s output is NULL-verified sample-by-sample against a direct time-domain

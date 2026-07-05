@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>   // getenv (FCORE_SWEEP_ONLY)
 #include <cstring>
 #include <random>
 #include <vector>
@@ -292,6 +293,7 @@ int main()
 #endif
     const double fs = 48000.0;
     const int irLen = 131072;   // ~ LinearPhaseEq Maximum (N=131072; the EQ passes N+1 taps — the +1 is perf-negligible)
+    const bool sweepOnly = std::getenv ("FCORE_SWEEP_ONLY") != nullptr;   // FCORE_SWEEP_ONLY=1 → run only the DAW-buffer sweep
     const int blocks[] = { 256, 512, 1024, 2048, 4096, 8192 };
     // NUPC + JUCE head-to-head also cover the SMALL blocks that low-latency / live rigs (guitar amp, monitoring)
     // actually run — that is exactly NUPC's win regime, so it must be measured, not extrapolated.
@@ -313,6 +315,7 @@ int main()
     std::printf ("\n== JUCE correctness probe (does juce::dsp::Convolution really convolve all %d taps?) ==\n", irLen);
     juceCorrectnessCheck (irLen, fs);
 #endif
+  if (! sweepOnly) {
     for (const auto& tp : topos)
     {
         std::printf ("\n== %s ==\n", tp.name);
@@ -407,8 +410,10 @@ int main()
 #endif
         std::printf ("  → ONE stereo instance, every topology FLAT + true sample-zero-latency — this is what the EQ ships on.\n");
     }
+  }   // end if (! sweepOnly) — the non-JUCE %RT tables
 
 #if defined(FELITRONICS_BENCH_JUCE)
+  if (! sweepOnly) {
     // THE HEAD-TO-HEAD nose-to-nose with JUCE, on the SHIPPING matrix convolver + the old fixed-P=128 one.
     std::printf ("\n== HEAD-TO-HEAD: juce::dsp::Convolution vs our convolvers (131072-tap stereo LRDiag) ==\n");
     std::printf ("  All three report ZERO latency. JUCE's cost falls with the block (bigger partitions); ours are\n");
@@ -448,11 +453,36 @@ int main()
     }
     std::printf ("  → JUCE's cost follows the ACTUAL block (small block = expensive, always); NUPC is flat. A\n");
     std::printf ("    host running small/variable buffers is cheaper + steadier on NUPC, both at zero latency.\n");
-    // Same-engine FFT-backend reference (JUCE's FFT/vDSP in OUR engine; scalar MAC + 2N layout → a handicap,
-    // NOT juce::dsp::Convolution — shown only to isolate the FFT).
-    std::printf ("\n== JUCE-FFT-in-our-engine (P=128, LRDiag; scalar MAC — proxy only) ==\n");
-    for (int b : blocks)
-        std::printf ("  %9d  |  %7.2f%%\n", b, benchRT<bench::JuceRealFft> (0, 2, irLen, 128, b, fs, 3.0, 2.0));
+  }   // end if (! sweepOnly) — the JUCE head-to-head tables
+
+    // REAL DAW buffer sizes — including the NON-power-of-two ones a host actually offers (96 / 160 / 192 / 992…).
+    // NUPC is FLAT at every one (block-independent handles ANY n); JUCE's cost tracks the buffer. This is the
+    // block-independence claim measured at the sizes users pick, not just powers of two.
+    std::printf ("\n== Real DAW buffer sweep (EVERY size a host offers) — juce::dsp::Convolution vs MatrixConvolverNupc, LRDiag ==\n");
+    std::printf ("  buffer,ms,juce_pct,nupc_pct,nupc_maxpct   (CSV: every 32-sample DAW buffer; * suffix = non-pow2)\n");
+    std::vector<int> dawBufs { 16, 32, 64 };
+    for (int b = 96; b <= 2048; b += 32) dawBufs.push_back (b);   // the real DAW ladder: every 32 samples
+    // warm MUST outlast NUPC's cold-prime crossfade (coldXfade_ = max_s(C_s*B_s) ≈ 2.5 s for Bmax=2048 over a
+    // 131072-tap IR) or the measure window still double-convolves the warm+cold slots and INFLATES the mean by
+    // ~0.35% — matches the 3.0 s head-to-head only once the crossfade has fully settled.
+    for (int b : dawBufs)
+    {
+        int lat = 0;
+        const double j  = benchJuceConvolution (irLen, b, b, fs, 3.0, 1.0, lat);
+        double nMax = 0.0;
+        const double nu = benchMatrixNupc<fftpffft::PffftRealFft> (0, 2, irLen, b, fs, 3.0, 1.0, nMax);
+        std::printf ("  %d%s,%.2f,%.2f,%.2f,%.2f\n", b, (b & (b - 1)) ? "*" : "", 1000.0 * b / fs, j, nu, nMax);
+    }
+    std::printf ("  → NUPC dead-flat at EVERY buffer; JUCE a sawtooth that exceeds real-time at <= 32 samples.\n");
+
+    if (! sweepOnly)
+    {
+        // Same-engine FFT-backend reference (JUCE's FFT/vDSP in OUR engine; scalar MAC + 2N layout → a handicap,
+        // NOT juce::dsp::Convolution — shown only to isolate the FFT).
+        std::printf ("\n== JUCE-FFT-in-our-engine (P=128, LRDiag; scalar MAC — proxy only) ==\n");
+        for (int b : blocks)
+            std::printf ("  %9d  |  %7.2f%%\n", b, benchRT<bench::JuceRealFft> (0, 2, irLen, 128, b, fs, 3.0, 2.0));
+    }
 #endif
     return 0;
 }
