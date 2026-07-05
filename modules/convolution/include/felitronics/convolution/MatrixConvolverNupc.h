@@ -22,11 +22,15 @@ namespace felitronics::convolution
 // publishStaged/setIr/process/reset/isBusy/latencySamples()==0 signatures, so lineareq's
 // `using Conv = MatrixConvolver<AudioFft>` becomes `= MatrixConvolverNupc<AudioFft>` with no other change.
 //
-// PHASED BUILD. This is PHASE 3: ALL topologies (mono / LRDiag / MSDiag / Full), instant operator swap.
+// COMPLETE. ALL topologies (mono / LRDiag / MSDiag / Full) + the CLICK-FREE 2-slot smoothstep WARM crossfade
+// swap — a full drop-in for MatrixConvolver.
 //   • MSDiag forms the ½(X_L ± X_R) spectral views PER STAGE from the per-stage L/R FDLs (macViewStage), MACs
 //     bank_M / bank_S, and decodes yL = yM+yS, yR = yM−yS; Full does the 4-bank cross sums per stage.
-//   • Phase 4 will replace the instant swap with the 2-slot smoothstep warm crossfade (the state_/cur_/two-slot
-//     machinery + the tail-prime-from-warm-FDL are already here; only the fade branch is stubbed instant).
+//   • setOperator stages an operator into the inactive slot; process() crossfades the OLD and NEW operators'
+//     FULL outputs (head + every stage's tail) by a smoothstep weight, BOTH computed from the SAME shared warm
+//     FDL (chunkStage recomputes both slots' tails as stages wrap). The first activation uses a long fade sized
+//     to the SLOWEST stage's FDL fill (coldXfade_ = max_s C_s·B_s) to mask the cold prime; later warm swaps use
+//     the short crossfadeSamples fade. isBusy() is true while fading (the host coalesces).
 //
 // STRUCTURE (channel-indexed per-stage, mirrors MatrixConvolver's decoupled helpers replicated per stage):
 //   • the IR is tiled by a head [0,P0) + stages s of block B_s, count C_s, offset_s==B_s (zero-latency
@@ -76,6 +80,9 @@ public:
         if (numStages_ < 0) return false;                       // schedule can't cover maxIrSamples in kMaxStages
 
         warmXfade_ = crossfadeSamples < 1 ? 1 : crossfadeSamples;
+        long long slow = warmXfade_;   // the SLOWEST stage's FDL fill (stages warm in parallel) — the tail's C_max·B_max
+        for (int st = 0; st < numStages_; ++st) slow = std::max (slow, (long long) spec_[st].C * (long long) spec_[st].B);
+        coldXfade_ = (int) slow;
 
         int maxSpecF = 1, maxN = 1, maxB = 1;
         for (int st = 0; st < numStages_; ++st) { maxSpecF = std::max (maxSpecF, spec_[st].specF); maxN = std::max (maxN, spec_[st].N); maxB = std::max (maxB, spec_[st].B); }
@@ -121,7 +128,7 @@ public:
                 for (int ch = 0; ch < 2; ++ch) sl.tail[(std::size_t) st][(std::size_t) ch].assign ((std::size_t) spec_[st].B, 0.0f);
         }
 
-        cur_ = 0; warmSamples_ = 0;
+        cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_; warmSamples_ = 0;
         state_.store (0, std::memory_order_relaxed);
         prepared_ = true;
         return true;
@@ -140,7 +147,7 @@ public:
         for (int k = 0; k < 2; ++k)
             for (int st = 0; st < numStages_; ++st)
                 for (int ch = 0; ch < 2; ++ch) std::fill (slot_[k].tail[(std::size_t) st][(std::size_t) ch].begin(), slot_[k].tail[(std::size_t) st][(std::size_t) ch].end(), 0.0f);
-        warmSamples_ = 0;
+        xfadePos_ = 0; warmSamples_ = 0;               // cancel any pending/active fade; re-arm the cold prime
         state_.store (0, std::memory_order_relaxed);   // keep cur_ (the live operator)
     }
 
@@ -188,17 +195,23 @@ public:
     {
         if (! prepared_ || n <= 0 || numChannelsToProcess < channels_) return;
 
-        if (state_.load (std::memory_order_acquire) == 1)   // publish pending → go live INSTANTLY (Phase 2)
+        int s = state_.load (std::memory_order_acquire);
+        if (s == 1)   // begin the crossfade — length by warmth (cold first-prime vs short warm swap)
         {
+            xfadePos_ = 0;
+            xfadeLen_ = (warmSamples_ >= coldXfade_) ? warmXfade_
+                                                     : std::clamp (incomingCoverage(), warmXfade_, coldXfade_);
             for (int st = 0; st < numStages_; ++st)         // prime the new slot's tails from the warm per-stage FDLs
             {
                 int base = hist_[(std::size_t) st].fdlPos - 1; if (base < 0) base += spec_[st].C;
                 computeStageTails (slot_[1 - cur_], st, base);
             }
-            cur_ = 1 - cur_;
-            state_.store (0, std::memory_order_release);
+            state_.store (2, std::memory_order_relaxed);
+            s = 2;
         }
-        processRange (in, out, 0, n);
+
+        if (s != 2) { processRange (in, out, 0, n); return; }   // Idle → single live operator
+        processFade (in, out, n);
     }
 
 private:
@@ -357,7 +370,7 @@ private:
 
     // One stage's chunk boundary: FFT each channel's frame into the FDL, recompute the live operator's tails,
     // shift cur→prev, advance the ring.
-    void chunkStage (int st) noexcept
+    void chunkStage (int st, bool fading) noexcept
     {
         History& h = hist_[(std::size_t) st];
         const int B = spec_[st].B, specF = spec_[st].specF;
@@ -367,34 +380,29 @@ private:
             std::memcpy (&h.fdl[ch][(std::size_t) h.fdlPos * (std::size_t) specF], inputSpec_.data(), (std::size_t) specF * sizeof (float));
         }
         computeStageTails (slot_[cur_], st, h.fdlPos);
+        if (fading) computeStageTails (slot_[1 - cur_], st, h.fdlPos);   // keep the incoming operator's tail coherent through the fade
         for (int ch = 0; ch < channels_; ++ch)
             for (int i = 0; i < B; ++i) h.frame[ch][(std::size_t) i] = h.frame[ch][(std::size_t) (B + i)];
         if (++h.fdlPos >= spec_[st].C) h.fdlPos = 0;
     }
 
-    void computeOutputs (const Slot& sl, int s, float* const* out) noexcept
+    // The FULL output (head + every stage's tail at its phase) for ONE slot, per the topology. Called once
+    // (idle) or twice (during the crossfade — old + new slot from the SAME shared FDL) per sample.
+    void computeSlotOutputs (const Slot& sl, float& oL, float& oR) const noexcept
     {
         if (mono_)
         {
             float y = headDot (sl.banks[0], 0);
             for (int st = 0; st < numStages_; ++st) y += sl.tail[(std::size_t) st][0][(std::size_t) hist_[(std::size_t) st].phase];
-            out[0][s] = y;
+            oL = y; oR = 0.0f;
             return;
         }
+        float yl = 0.0f, yr = 0.0f;
         switch (sl.topo)
         {
             case Topology::LRDiag:
-            {
-                float yl = headDot (sl.banks[0], 0), yr = headDot (sl.banks[1], 1);
-                for (int st = 0; st < numStages_; ++st)
-                {
-                    const int ph = hist_[(std::size_t) st].phase;
-                    yl += sl.tail[(std::size_t) st][0][(std::size_t) ph];
-                    yr += sl.tail[(std::size_t) st][1][(std::size_t) ph];
-                }
-                out[0][s] = yl; out[1][s] = yr;
+                yl = headDot (sl.banks[0], 0); yr = headDot (sl.banks[1], 1);
                 break;
-            }
             case Topology::MSDiag:
             {
                 const std::vector<float>& hM = sl.banks[0].h0;
@@ -408,14 +416,7 @@ private:
                     headM += hM[(std::size_t) i] * 0.5f * (l + r);
                     headS += hS[(std::size_t) i] * 0.5f * (l - r);
                 }
-                float yl = headM + headS, yr = headM - headS;             // tails already decoded to yL/yR
-                for (int st = 0; st < numStages_; ++st)
-                {
-                    const int ph = hist_[(std::size_t) st].phase;
-                    yl += sl.tail[(std::size_t) st][0][(std::size_t) ph];
-                    yr += sl.tail[(std::size_t) st][1][(std::size_t) ph];
-                }
-                out[0][s] = yl; out[1][s] = yr;
+                yl = headM + headS; yr = headM - headS;                    // tails already decoded to yL/yR
                 break;
             }
             case Topology::Full:
@@ -430,35 +431,89 @@ private:
                     hLL += LL[(std::size_t) i] * l; hLR += LR[(std::size_t) i] * r;
                     hRL += RL[(std::size_t) i] * l; hRR += RR[(std::size_t) i] * r;
                 }
-                float yl = hLL + hLR, yr = hRL + hRR;
-                for (int st = 0; st < numStages_; ++st)
-                {
-                    const int ph = hist_[(std::size_t) st].phase;
-                    yl += sl.tail[(std::size_t) st][0][(std::size_t) ph];
-                    yr += sl.tail[(std::size_t) st][1][(std::size_t) ph];
-                }
-                out[0][s] = yl; out[1][s] = yr;
+                yl = hLL + hLR; yr = hRL + hRR;
                 break;
             }
         }
+        for (int st = 0; st < numStages_; ++st)
+        {
+            const int ph = hist_[(std::size_t) st].phase;
+            yl += sl.tail[(std::size_t) st][0][(std::size_t) ph];
+            yr += sl.tail[(std::size_t) st][1][(std::size_t) ph];
+        }
+        oL = yl; oR = yr;
     }
 
+    // Feed one input sample into the head rings + every stage's current frame half (per channel).
+    void writeInputs (const float* const* in, int s) noexcept
+    {
+        for (int ch = 0; ch < channels_; ++ch)
+        {
+            const float x = in[ch][s];
+            headPos_[ch] = (headPos_[ch] + 1) & headMask_;
+            headHist_[ch][(std::size_t) headPos_[ch]] = x;
+            for (int st = 0; st < numStages_; ++st) hist_[(std::size_t) st].frame[ch][(std::size_t) (spec_[st].B + hist_[(std::size_t) st].phase)] = x;
+        }
+    }
+
+    // Advance every stage's phase; a chunk boundary recomputes tails (both slots while fading) + warms the FDL.
+    void advanceStages (bool fading) noexcept
+    {
+        for (int st = 0; st < numStages_; ++st)
+            if (++hist_[(std::size_t) st].phase == spec_[st].B) { hist_[(std::size_t) st].phase = 0; chunkStage (st, fading); }
+        if (warmSamples_ < coldXfade_) ++warmSamples_;
+    }
+
+    // Idle path: samples [a,b) through the single live operator.
     void processRange (const float* const* in, float* const* out, int a, int b) noexcept
     {
         const Slot& sl = slot_[cur_];
         for (int s = a; s < b; ++s)
         {
-            for (int ch = 0; ch < channels_; ++ch)
-            {
-                const float x = in[ch][s];
-                headPos_[ch] = (headPos_[ch] + 1) & headMask_;
-                headHist_[ch][(std::size_t) headPos_[ch]] = x;
-                for (int st = 0; st < numStages_; ++st) hist_[(std::size_t) st].frame[ch][(std::size_t) (spec_[st].B + hist_[(std::size_t) st].phase)] = x;
-            }
-            computeOutputs (sl, s, out);
-            for (int st = 0; st < numStages_; ++st)
-                if (++hist_[(std::size_t) st].phase == spec_[st].B) { hist_[(std::size_t) st].phase = 0; chunkStage (st); }
+            writeInputs (in, s);
+            float oL = 0.0f, oR = 0.0f; computeSlotOutputs (sl, oL, oR);
+            out[0][s] = oL; if (! mono_) out[1][s] = oR;
+            advanceStages (false);
         }
+    }
+
+    // Crossfade path: blend the old (cur_) and new (1-cur_) operators by a smoothstep weight — both computed
+    // from the SAME shared FDL — then finish the block on the single new operator once the fade ends.
+    void processFade (const float* const* in, float* const* out, int n) noexcept
+    {
+        for (int s = 0; s < n; ++s)
+        {
+            const float t    = (float) xfadePos_ / (float) (xfadeLen_ > 1 ? xfadeLen_ - 1 : 1);   // 0→1, exactly 1 on the last sample
+            const float wNew = t * t * (3.0f - 2.0f * t);   // smoothstep: zero slope at both ends (click-free)
+            const float wOld = 1.0f - wNew;
+            writeInputs (in, s);
+            float oLo = 0.0f, oRo = 0.0f, oLn = 0.0f, oRn = 0.0f;
+            computeSlotOutputs (slot_[cur_],     oLo, oRo);
+            computeSlotOutputs (slot_[1 - cur_], oLn, oRn);
+            out[0][s] = oLo * wOld + oLn * wNew;
+            if (! mono_) out[1][s] = oRo * wOld + oRn * wNew;
+            advanceStages (true);
+            if (++xfadePos_ >= xfadeLen_)
+            {
+                cur_ = 1 - cur_;                                // new operator live; old now free to re-stage
+                state_.store (0, std::memory_order_release);
+                processRange (in, out, s + 1, n);              // finish the block on the single new operator
+                return;
+            }
+        }
+    }
+
+    // The new operator's effective reach (head + its farthest active partition) — how long the cold fade needs
+    // to mask the warming FDL, capped by the full cold-prime length.
+    int incomingCoverage() const noexcept
+    {
+        const Slot& sl = slot_[1 - cur_];
+        long long cov = P0_;
+        for (int b = 0; b < sl.numBanks; ++b)
+            for (int st = 0; st < numStages_; ++st)
+                if (sl.banks[b].activeParts[st] > 0)
+                    cov = std::max (cov, (long long) spec_[st].offset + (long long) sl.banks[b].activeParts[st] * spec_[st].B);
+        return (int) std::min (cov, (long long) coldXfade_);
     }
 
     std::array<History, kMaxStages> hist_ {};
@@ -472,8 +527,8 @@ private:
     bool mono_ = false;
     int P0_ = 0, headMask_ = 0, headPos_[2] { 0, 0 };
     int numStages_ = 0, channels_ = 2;
-    int cur_ = 0, warmXfade_ = 1;
-    long long warmSamples_ = 0;                                    // reserved for Phase-4 cold-prime fade
+    int cur_ = 0, xfadePos_ = 0, xfadeLen_ = 1, warmXfade_ = 1, coldXfade_ = 1;
+    long long warmSamples_ = 0;                                    // samples processed (saturates at coldXfade_) → warm test
 };
 
 } // namespace felitronics::convolution
