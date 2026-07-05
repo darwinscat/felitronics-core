@@ -29,40 +29,38 @@ fixed-`P=128` matrix convolver everywhere**, and **3–17× cheaper than JUCE at
 amp or live monitor actually runs**. JUCE's cost swings ~70× with the block (10.50 % → 0.15 %): it is expensive
 at the small blocks and only overtakes us past ~512 samples, where its few large partitions cost less.
 
-## Every real DAW buffer — the nose-to-nose sweep (all 65 sizes)
+## Every real DAW buffer — the nose-to-nose sweep (16 → 4096, all 129 sizes, two machines)
 
-The head-to-head above walks powers of two. But hosts offer **every 32-sample buffer** (16, 32, 64, 96, 128,
-160, …, 2048) — and most of the ones users pick are **not powers of two**. Measured at all 65, LRDiag, JUCE 8.0.4
-oracle-tuned (`maxBlock` = the actual buffer, its best case). NUPC is **dead-flat 0.58–0.67 % (mean ~0.6 %)** at
-every one; JUCE is a sawtooth that peaks at each power of two. Representative rows (`*` = non-power-of-two; JUCE's
-tiny-block cost carries a few-% run-to-run variance, so this sweep and the powers-of-two table above are independent
-runs that differ slightly on JUCE — e.g. 9.74 % vs 10.50 % at block 64):
+The head-to-head above walks powers of two. But hosts offer **every 32-sample buffer**, and most of the ones users
+pick are **not powers of two**. Measured at all 129 from 16 to 4096 samples, LRDiag, JUCE 8.0.4 oracle-tuned
+(`maxBlock` = the actual buffer, its best case), on **two very different CPUs** — an Apple M5 Pro (NEON) and an Intel
+i9-13900H (SSE, pinned to a P-core). NUPC is **flat at every one**; JUCE is a sawtooth that peaks at each power of two.
+The interactive chart linked above carries both machines and all 129 points; representative rows
+(`mean(worst)` = NUPC mean and worst-single-buffer %RT):
 
-| host buffer | ms | `juce::dsp::Convolution` 8.0.4 | **NUPC mean** | NUPC worst buffer | cheaper |
-|---:|---:|---:|---:|---:|---|
-| 16    | 0.33 | **102.6 %** ⛔ (over real-time) | **0.59 %** | 52.5 % | **174× us** |
-| 32    | 0.67 | 32.1 % | **0.59 %** | 15.2 % | **54× us** |
-| 64    | 1.33 | 9.74 % | **0.60 %** | 10.6 % | **16× us** |
-| 96\*  | 2.00 | 3.05 % | **0.59 %** | 4.97 % | 5.2× us |
-| 128   | 2.67 | 2.84 % | **0.60 %** | 3.64 % | 4.7× us |
-| 192\* | 4.00 | 1.99 % | **0.62 %** | 2.11 % | 3.2× us |
-| 256   | 5.33 | 1.94 % | **0.59 %** | 1.83 % | 3.3× us |
-| 512   | 10.67 | 0.95 % | **0.61 %** | 1.51 % | 1.6× us |
-| 992\* | 20.67 | 0.57 % | **0.59 %** | 0.90 % | ≈ even |
-| 1024  | 21.33 | 0.49 % | **0.59 %** | 1.48 % | JUCE 1.2× |
-| 2048  | 42.67 | 0.32 % | **0.62 %** | 0.70 % | JUCE 1.9× |
+| host buffer | M5 Pro · JUCE | M5 · NUPC mean(worst) | i9-13900H · JUCE | i9 · NUPC mean(worst) |
+|---:|---:|---:|---:|---:|
+| 16   | 95.7 % | 0.59 (21.1) | 72.6 % | 1.10 (40.1) |
+| 64   | 9.24 % | 0.59 (6.7)  | 13.4 % | 1.09 (10.6) |
+| 128  | 2.86 % | 0.61 (3.7)  | 5.97 % | 1.08 (5.7)  |
+| 256  | 1.87 % | 0.58 (2.4)  | 4.13 % | 1.08 (3.2)  |
+| 512  | 0.89 % | 0.58 (1.3)  | 2.02 % | 1.09 (2.0)  |
+| 1024 | 0.52 % | 0.59 (0.9)  | 1.16 % | 1.09 (1.4)  |
+| 2048 | 0.27 % | 0.58 (0.7)  | 0.75 % | 1.09 (1.1)  |
+| 4096 | 0.19 % | 0.59 (0.6)  | 0.67 % | 1.08 (1.1)  |
 
-**Reading it.** JUCE exceeds real-time only at the extreme 16-sample buffer (102.6 %), but stays **2–170× more
-expensive than NUPC up to ~512 samples** — the whole low-latency / live-rig range. The two lines cross near **544
-samples**: below it NUPC's flat mean wins, above it JUCE's few large partitions win the mean (see *Honest bounds*).
-Both are zero-latency throughout. The `NUPC worst buffer` column is the single most expensive buffer in the window
-(the once-per-`B_max` coincident-FFT): it spikes at tiny blocks (52 % at 16) but stays **under 100 % — no xrun**,
-while JUCE's *mean* there already isn't.
+**Reading it.** NUPC's mean is flat — **~0.6 % on the M5, ~1.08 % on the i9** — at every buffer from one `prepare()`;
+the ~1.8× gap between machines is core speed (Apple/NEON vs Intel/SSE), not the algorithm. JUCE's cost tracks the
+buffer: dear at the small, low-latency sizes (up to ~96 % / ~73 % at 16 samples), cheap at large power-of-two blocks.
+The lines cross around **~544 samples on the M5**; on the **i9 NUPC is cheaper at every buffer except the exact 2048
+and 4096**, where JUCE's clean power-of-two partition wins the mean. Both are zero-latency throughout. The worst-buffer
+column is the once-per-`B_max` coincident-FFT spike — expensive at tiny blocks (21 % M5 / 40 % i9 at 16) but bounded,
+rare, and **under 100 % (no xrun)**; it decays to ~1 % by block 256.
 
-> **Measurement note (reproducibility).** The sweep's warm-up **must outlast NUPC's cold-prime crossfade**
-> (`coldXfade_ = max_s(C_s·B_s)` ≈ 2.5 s for `B_max = 2048` over a 131072-tap IR). A shorter warm leaves the
-> measure window still double-convolving the warm + cold slots and **inflates the mean by ~0.35 %** — the sweep
-> uses a 3.0 s warm so it settles to the same steady state as the head-to-head.
+> **Measurement notes.** (1) The warm-up **must outlast NUPC's cold-prime crossfade** (`coldXfade_ = max_s(C_s·B_s)`
+> ≈ 2.5 s for `B_max = 2048` over a 131072-tap IR) or the mean inflates by ~0.35 %; the sweep uses a 3.0 s warm.
+> (2) On a hybrid CPU (the 13900H) pin the bench to a performance core — an E-core reads ~2× slower. (3) JUCE's
+> tiny-block cost carries a few-% run-to-run variance (e.g. M5 @16 measured 96–103 % across runs).
 
 ## Per topology (all flat, block-independent)
 

@@ -461,7 +461,7 @@ int main()
     std::printf ("\n== Real DAW buffer sweep (EVERY size a host offers) — juce::dsp::Convolution vs MatrixConvolverNupc, LRDiag ==\n");
     std::printf ("  buffer,ms,juce_pct,nupc_pct,nupc_maxpct   (CSV: every 32-sample DAW buffer; * suffix = non-pow2)\n");
     std::vector<int> dawBufs { 16, 32, 64 };
-    for (int b = 96; b <= 2048; b += 32) dawBufs.push_back (b);   // the real DAW ladder: every 32 samples
+    for (int b = 96; b <= 4096; b += 32) dawBufs.push_back (b);   // the real DAW ladder: every 32 samples, out to 4096
     // warm MUST outlast NUPC's cold-prime crossfade (coldXfade_ = max_s(C_s*B_s) ≈ 2.5 s for Bmax=2048 over a
     // 131072-tap IR) or the measure window still double-convolves the warm+cold slots and INFLATES the mean by
     // ~0.35% — matches the 3.0 s head-to-head only once the crossfade has fully settled.
