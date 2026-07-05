@@ -51,6 +51,7 @@ class NonUniformConvolver
 {
 public:
     static constexpr int kMaxStages = 16;   // P0>=64, B_max<=2^21 → <=15 doubling stages + 1 tail; generous
+    static constexpr int kMaxPartition = 1 << 24;   // hard cap so the FFT size 2*B never overflows signed int (far above any real IR)
 
     // One tunable schedule step: `count` partitions of block size `blockSize` (pow2). The head size P0 and the
     // steps must satisfy the zero-latency recurrence B_{s+1} = (count_s + 1)·B_s with B_0 = P0 (validated in
@@ -95,6 +96,7 @@ public:
     {
         prepared_ = false;
         if (! core::fft::isPow2 (headSize) || ! core::fft::isPow2 (maxBlock) || maxBlock < headSize) return false;
+        if (headSize > kMaxPartition || maxBlock > kMaxPartition) return false;
         std::array<ScheduleStep, kMaxStages> steps {};
         const int n = buildCappedSchedule (headSize, maxBlock, maxIrSamples, steps);
         return prepareWithSchedule (headSize, steps.data(), n, maxIrSamples);
@@ -107,7 +109,7 @@ public:
     bool prepareWithSchedule (int headSize, const ScheduleStep* steps, int numSteps, int maxIrSamples)
     {
         prepared_ = false;                                    // any early return below leaves it unprepared
-        if (! core::fft::isPow2 (headSize)) return false;
+        if (! core::fft::isPow2 (headSize) || headSize > kMaxPartition) return false;
         if (numSteps < 0 || numSteps > kMaxStages) return false;
         if (numSteps > 0 && steps == nullptr) return false;
         if (maxIrSamples < 0) maxIrSamples = 0;
@@ -119,7 +121,7 @@ public:
         {
             const int B = steps[s].blockSize;
             const int C = steps[s].count;
-            if (! core::fft::isPow2 (B) || C < 1) return false;
+            if (! core::fft::isPow2 (B) || C < 1 || B > kMaxPartition) return false;
             if ((long long) B != cum) return false;           // zero-latency invariant: offset_s == B_s
             cum += (long long) C * B;
         }

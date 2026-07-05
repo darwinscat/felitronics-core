@@ -58,17 +58,20 @@ public:
 
     static constexpr int kMaxBanks  = 4;
     static constexpr int kMaxStages = 16;
+    static constexpr int kMaxPartition = 1 << 24;   // hard cap so the FFT size 2*B never overflows signed int (far above any real IR)
     static constexpr int kDefaultMaxBlock = 2048;   // B_max cap: flat mean at any B_max, smaller worst-buffer spike than 4096
 
     static int numBanksFor (Topology t) noexcept { return t == Topology::Full ? 4 : 2; }
 
     // Signature-compatible with MatrixConvolver::prepare. `partitionSize` is the time-domain HEAD size P0
-    // (lineareq passes 128); B_max is an internal default. crossfadeSamples is stored for Phase 4 (inert here).
+    // (lineareq passes 128); B_max is an internal default. crossfadeSamples is the warm anti-click fade length —
+    // use >= ~32 for a click-free ramp (below that the smoothstep degenerates toward a 1-sample hard switch; the
+    // floor is 1, matching MatrixConvolver). lineareq passes ~20 ms, well above that.
     bool prepare (int partitionSize, int maxIrSamples, int crossfadeSamples, int numChannels = 2)
     {
         prepared_ = false;
         if (numChannels < 1 || numChannels > 2) return false;
-        if (! core::fft::isPow2 (partitionSize)) return false;
+        if (! core::fft::isPow2 (partitionSize) || partitionSize > kMaxPartition) return false;
         if (maxIrSamples < 0) maxIrSamples = 0;
         channels_ = numChannels;
         mono_     = (channels_ == 1);
@@ -350,6 +353,10 @@ private:
                 clearAcc (st); macBankStage (hist_[(std::size_t) st].fdl[1], sl.banks[1], st, base); invAccToStage (sl.tail[(std::size_t) st][1], st);
                 break;
 
+            // NB (numerical): decoding M/S → L/R in float means the Side channel of a near-mono input
+            // (x_L ≈ x_R ⇒ S ≈ 0) has a large RELATIVE error (~eps/‖S‖·‖M‖) — inherent to ANY L/R-output M/S
+            // process (a time-domain M/S convolver shows the same), not the spectral view. The L/R OUTPUTS stay
+            // accurate to float noise (~2e-7 rel) and the residual floor is the Mid level (~−136 dB), inaudible.
             case Topology::MSDiag:
                 clearAcc (st); macViewStage (sl.banks[0], st, base, +1.0f); invAccToStage (tmpTailA_, st);   // yM tail
                 clearAcc (st); macViewStage (sl.banks[1], st, base, -1.0f); invAccToStage (tmpTailB_, st);   // yS tail
