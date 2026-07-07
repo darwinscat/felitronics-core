@@ -76,7 +76,7 @@ jobs:
         run: cmake --build build -j --target eqviz
       - name: Render quality maps
         run: mkdir -p eqviz-out && ./build/tools/eqviz eqviz-out --fs 44100,48000,96000,192000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: eqviz-quality-pictures
           path: eqviz-out/
