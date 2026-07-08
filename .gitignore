@@ -1,7 +1,6 @@
 # Build output
 /build/
-/build-san/
-/build-asan/
+/build-*/
 /build32/
 /cmake-build-*/
 /out/
@@ -62,7 +61,3 @@ xcuserdata/
 *.flac
 *.mp3
 *.raw
-build-verify*/
-build-b*/
-build-monobass*/
-build-bp*/

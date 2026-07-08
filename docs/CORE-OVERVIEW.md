@@ -11,7 +11,7 @@ JUCE-free, RT-safe, header-only C++20 DSP. **15 modules · 28 test suites · 477
 |---|---|---|
 | `core` | maths, smoothing, delay, FFT seam, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `FlushToZero` |
 | `eq` | filters + the EQ engine + the multiband split | `Svf` (Cytomic), `MatchedBiquad` (Vicanek), `EqEngine`, `Crossover2` (LR4), `MultibandSplitter` |
-| `dynamics` | the detector/gain toolkit + compressor + transient | `EnvelopeFollower`, `GainComputer`, `Compressor`, `TransientShaper`, `ChannelLinker` |
+| `dynamics` | the detector/gain toolkit + compressor + gate + transient | `EnvelopeFollower`, `GainComputer`, `Compressor`, `NoiseGate`, `TransientShaper`, `ChannelLinker` |
 | `oversampling` | polyphase windowed-sinc up/down (alias-free / true-peak) | `PolyphaseOversampler` |
 | `convolution` | zero-latency partitioned IR convolver | `PartitionedConvolver`, `ConvolutionEngine` (click-free IR swap), `IrResampler` |
 | `lineareq` | linear- & mixed-phase FIR EQ over partitioned convolution | `LinearPhaseEq` (5 quality steps), `NaturalPhaseEq` + `MixedPhaseFir` (φ=k·φ_min "Natural" blend) |

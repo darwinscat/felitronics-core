@@ -27,7 +27,8 @@ buffers a live rig runs** (JUCE only wins the mean at large power-of-two blocks)
 
 `core` (FFT seam · smoother · delay · denormal flush) · `eq` (Vicanek matched biquads · SVF · EQ engine ·
 crossovers) · `lineareq` (linear- & mixed-phase "Natural" FIR EQ over partitioned convolution) ·
-`convolution` (zero-latency partitioned convolver · click-free IR swap) · `dynamics` · `multiband` ·
+`convolution` (zero-latency partitioned convolver · click-free IR swap) ·
+`dynamics` (detectors · compressor · noise gate · transient shaper) · `multiband` ·
 `dynamiceq` · `deesser` · `stereo` · `saturation` · `dither` · `oversampling` · `limiter` (true-peak) ·
 `analysis` (LUFS/LRA · dBTP true-peak · correlation) · `neural` (inference seam) ·
 `fftpffft` (**optional** compiled SIMD FFT backend — vendored pffft, `-DFELITRONICS_WITH_PFFFT=ON`).

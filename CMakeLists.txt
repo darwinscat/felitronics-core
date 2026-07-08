@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_core VERSION 0.5.0 LANGUAGES CXX)
+project(felitronics_core VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
@@ -40,7 +40,7 @@ endif()
 # Module          Namespace               Target                Deps
 #   core          felitronics::core       felitronics::core     —            (Sample, sizes, Math, Smoother, flush)
 #   analysis      felitronics::analysis   felitronics::analysis core         (SpectrumTap; FFT via the seam)
-#   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower + GainComputer)
+#   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · TransientShaper · ChannelLinker)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
 #
 # Consume (pinned by tag, exactly like JUCE) — JUCE-free, so this fetch never pulls JUCE:
