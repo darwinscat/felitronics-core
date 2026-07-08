@@ -5,6 +5,24 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.6.0 — noise gate (`felitronics::dynamics::NoiseGate`)
+
+A new `felitronics::dynamics` primitive: a dual-detection (ISP Decimator "G-String" style) **noise gate** —
+architecturally distinct from the continuous `Compressor` (a bistable **Schmitt trigger** with hysteresis +
+hold, a **LINEAR-fast open / EXP-slow close** VCA, a closed floor, and an on/off **enable crossfade**). It
+**composes the module kit** (`ChannelLinker` linked key + a Peak `EnvelopeFollower`) and adds the gate-specific
+state machine on top. Extracted from OrbitCab's in-amp gate (written portable by design) so plugins don't
+reinvent it.
+
+- **feat(dynamics):** `NoiseGate` — a two-phase **keyed** API (`analyse()` fills a per-sample gain curve from
+  the clean KEY; `applyGain()` attenuates a possibly-different downstream buffer, so any latency between the two
+  is free lookahead) plus a self-keyed `process()` convenience. A `Config` voicing struct (defaults = OrbitCab's
+  shipped tuning), `seedEnabled()` for a restored on-state, `currentGain()`/`currentCoreGain()` for a GR meter;
+  zero latency.
+- **RT / robustness:** NaN/Inf-safe (detector-input clamp + non-finite heal) and denormal-safe in software
+  (Law 8); no-allocation-in-`process()` proven; block-split NULL + sample-rate-invariance + adversarial
+  fail-open / transient / low-note-chatter tests.
+
 ## v0.5.0 — the non-uniform (Gardner) convolver: block-independent, cheaper at small buffers
 
 The v0.4.0 follow-up is delivered. A **non-uniform partitioned (Gardner 1995) convolver** — a time-domain head +

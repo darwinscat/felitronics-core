@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(felitronics_core VERSION 0.5.0 LANGUAGES CXX)
+project(felitronics_core VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd / IDEs parse the headers at the right C++ standard
 
