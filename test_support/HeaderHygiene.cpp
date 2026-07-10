@@ -45,6 +45,12 @@
 #include <felitronics/lineareq/LinearPhaseEq.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
+#include <felitronics/measurement/CaptureGate.h>
+#include <felitronics/measurement/Convolve.h>
+#include <felitronics/measurement/Deconvolve.h>
+#include <felitronics/measurement/IrPost.h>
+#include <felitronics/measurement/MicSetAlign.h>
+#include <felitronics/measurement/Sweep.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
 #include <felitronics/multiband/MultibandWidth.h>
