@@ -61,7 +61,7 @@ inline double peakGain (std::span<const std::vector<double>> set, double targetP
 {
     double pk = 0.0;
     for (const auto& ir : set)
-        for (double v : ir) pk = std::max (pk, std::fabs (v));
+        for (double v : ir) if (std::isfinite (v)) pk = std::max (pk, std::fabs (v));   // ignore poisoned samples
     return (pk > 0.0) ? targetPeak / pk : 1.0;
 }
 

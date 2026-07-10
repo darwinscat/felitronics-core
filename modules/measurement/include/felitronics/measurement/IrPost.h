@@ -67,7 +67,7 @@ inline std::vector<double> trimToOnset (std::span<const double> ir, const OnsetR
 inline double peakGain (std::span<const double> x, double targetPeak = 0.98) noexcept
 {
     double pk = 0.0;
-    for (double v : x) pk = std::max (pk, std::fabs (v));
+    for (double v : x) if (std::isfinite (v)) pk = std::max (pk, std::fabs (v));   // ignore poisoned samples
     return (pk > 0.0) ? targetPeak / pk : 1.0;
 }
 

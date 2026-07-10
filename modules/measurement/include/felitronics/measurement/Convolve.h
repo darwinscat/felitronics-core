@@ -9,8 +9,10 @@
 // consumers use the float `felitronics::core::fft` SEAM. Measurement deconvolves whole ~6 s captures
 // (~2^20-point transforms) where the numerical noise floor must stay far below the analog chain's —
 // a float 2^20 FFT's ~-120 dB roundoff, amplified ~+30 dB by the Farina inverse's +3 dB/oct HF boost,
-// would land within ~20-40 dB of a real capture's tail and stop being transparent. Double keeps it
-// below ~-260 dBFS. PROMOTION TRIGGER: the day a SECOND offline-double-FFT consumer appears
+// would land within ~20-40 dB of a real capture's tail and stop being transparent. Double keeps the
+// round-trip floor near -208 dBFS at 2^20 (measured; the `w *= wlen` twiddle recurrence drifts ~O(len)·eps
+// but that is still ~-178 dB after the Farina boost — far below a ~-120 dB analog floor, so the recurrence
+// is kept for speed). PROMOTION TRIGGER: the day a SECOND offline-double-FFT consumer appears
 // (analysis / lineareq), move `detail::fftInplace` + `convolve` to `felitronics/core/OfflineFft.h`
 // (a mechanical header move). Correctness is oracle-anchored (sweep⊛inverse≈δ + known-answer tests).
 //==============================================================================
@@ -25,11 +27,12 @@
 namespace felitronics::measurement
 {
 
-// Smallest power of two >= n (>= 1). Used to size the linear-convolution / spectrum FFTs.
+// Smallest power of two >= n (>= 1). Returns 0 if n exceeds the largest representable power of two
+// (n > 2^63 on 64-bit) — the `p != 0` guard stops the shift from wrapping to 0 and looping forever.
 inline std::size_t nextPow2 (std::size_t n) noexcept
 {
     std::size_t p = 1;
-    while (p < n) p <<= 1;
+    while (p < n && p != 0) p <<= 1;
     return p;
 }
 
@@ -55,7 +58,7 @@ inline void fftInplace (std::vector<std::complex<double>>& a, int sign) noexcept
         const std::complex<double> wlen (std::cos (ang), std::sin (ang));
         for (std::size_t i = 0; i < n; i += len)
         {
-            std::complex<double> w (1.0, 0.0);
+            std::complex<double> w (1.0, 0.0);            // twiddle recurrence — floor ~-208 dB at 2^20 (see header)
             for (std::size_t k = 0; k < len / 2; ++k)
             {
                 const std::complex<double> u = a[i + k];
@@ -76,6 +79,7 @@ inline std::vector<double> convolve (std::span<const double> x, std::span<const 
     if (x.empty() || h.empty()) return {};
     const std::size_t out = x.size() + h.size() - 1;
     const std::size_t n   = nextPow2 (out);
+    if (n < 2) return {};                          // out exceeds the largest representable power of two
     std::vector<std::complex<double>> X (n, std::complex<double> {}), H (n, std::complex<double> {});
     for (std::size_t i = 0; i < x.size(); ++i) X[i] = x[i];
     for (std::size_t i = 0; i < h.size(); ++i) H[i] = h[i];
@@ -93,6 +97,8 @@ inline std::vector<double> convolve (std::span<const double> x, std::span<const 
 inline std::vector<double> magSpectrum (std::span<const double> x, std::size_t nfft)
 {
     if (nfft < 2) return {};
+    nfft = nextPow2 (nfft);                        // radix-2 requires a power of two — round up (heal, don't UB)
+    if (nfft < 2) return {};                        // nextPow2 overflowed
     std::vector<std::complex<double>> X (nfft, std::complex<double> {});
     for (std::size_t i = 0; i < x.size() && i < nfft; ++i) X[i] = x[i];
     detail::fftInplace (X, -1);

@@ -50,17 +50,19 @@ struct Sweep
 // `spec` reflects the clamps.
 inline Sweep makeSweep (SweepSpec s)
 {
-    if (! (s.sampleRate >= 3000.0)) s.sampleRate = 48000.0;   // floor first so clamp lo<=hi holds
-    const double nyq = 0.5 * s.sampleRate;
-    if (! (s.f1 > 0.0)) s.f1 = 20.0;
-    s.f1 = std::clamp (s.f1, 1.0, nyq - 2.0);
-    if (! (s.f2 > s.f1)) s.f2 = s.f1 * 10.0;
-    s.f2 = std::clamp (s.f2, s.f1 * 1.0001 + 1.0, nyq * 0.999);
-    if (! (s.durationSeconds > 0.0)) s.durationSeconds = 1.0;
-    s.durationSeconds = std::max (s.durationSeconds, 16.0 / s.sampleRate);
-    if (! (s.amplitude >= 0.0)) s.amplitude = 0.5;
-    s.fadeSeconds = std::clamp (s.fadeSeconds, 0.0, 0.49 * s.durationSeconds);
-    s.tailSeconds = std::max (s.tailSeconds, 0.0);
+    // Sanitize EVERY parameter to a finite, valid domain (house rule). std::max/clamp are NaN-blind, so
+    // heal non-finite explicitly FIRST, and cap durations (llround(1e18*sr) would overflow → vector throw)
+    // and amplitude (the Farina boost ×(f2/f1) would overflow a huge amp to inf).
+    auto healPos = [] (double v, double def) noexcept { return (std::isfinite (v) && v > 0.0) ? v : def; };
+    s.sampleRate      = (std::isfinite (s.sampleRate) && s.sampleRate >= 3000.0) ? s.sampleRate : 48000.0;
+    const double nyq  = 0.5 * s.sampleRate;
+    s.durationSeconds = std::clamp (healPos (s.durationSeconds, 1.0), 16.0 / s.sampleRate, 60.0);   // <= 60 s (any real sweep)
+    s.tailSeconds     = std::clamp (std::isfinite (s.tailSeconds) ? s.tailSeconds : 0.0, 0.0, 60.0);
+    s.fadeSeconds     = std::clamp (std::isfinite (s.fadeSeconds) ? s.fadeSeconds : 0.0, 0.0, 0.49 * s.durationSeconds);
+    s.amplitude       = (std::isfinite (s.amplitude) && s.amplitude > 0.0) ? std::min (s.amplitude, 16.0) : 0.5;
+    s.f1              = std::clamp (healPos (s.f1, 20.0), 1.0, nyq * 0.45);   // <= 0.45*nyq → f2 window stays lo < hi
+    if (! (std::isfinite (s.f2) && s.f2 > s.f1)) s.f2 = s.f1 * 10.0;
+    s.f2              = std::clamp (s.f2, s.f1 * 1.0001 + 1.0, nyq * 0.999);  // lo < hi guaranteed by the f1 cap
 
     Sweep out;
     out.spec = s;

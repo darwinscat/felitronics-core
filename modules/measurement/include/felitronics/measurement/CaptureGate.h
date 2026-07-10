@@ -46,16 +46,22 @@ struct GateReport
     bool        sweepPresent   = false;
     double      sweepConfidence = 0.0;    // deconv peak / early floor — a PRESENCE ratio, NOT an SNR
     double      snrDb          = 0.0;     // honest band-limited measurement SNR (what REW reports)
+    bool        snrValid       = false;   // false when the recording was too short to measure SNR (snrDb is meaningless)
     std::size_t sweepLag       = 0;
 };
 
 // Band-limited [loHz, hiHz] energy of a window (sum of |X[k]|² in-band). The guitar-cab working band by default.
 inline double bandEnergy (std::span<const double> x, double sr, double loHz, double hiHz)
 {
-    std::size_t nf = 1; while (nf < x.size()) nf <<= 1; nf = std::max<std::size_t> (nf, 4096);
+    if (x.empty() || ! (sr > 0.0)) return 0.0;
+    std::size_t nf = 1; while (nf < x.size() && nf != 0) nf <<= 1; nf = std::max<std::size_t> (nf, 4096);
     const auto M = magSpectrum (x, nf);
-    const double binHz = sr / (double) nf;
-    const std::size_t lo = (std::size_t) std::ceil (loHz / binHz), hi = (std::size_t) std::floor (hiHz / binHz);
+    const double binHz = sr / (double) nf, nyq = 0.5 * sr;
+    // Clamp the band to a finite [0, Nyquist] BEFORE the float→size_t cast (casting a negative / NaN / inf
+    // double to an unsigned is UB; a raw negative loHz would wrap to a huge index).
+    const double lof = std::clamp (std::isfinite (loHz) ? loHz : 0.0, 0.0, nyq);
+    const double hif = std::clamp (std::isfinite (hiHz) ? hiHz : nyq, 0.0, nyq);
+    const std::size_t lo = (std::size_t) std::ceil (lof / binHz), hi = (std::size_t) std::floor (hif / binHz);
     double e = 0.0;
     for (std::size_t i = lo; i <= hi && i < M.size(); ++i) e += M[i] * M[i];
     return e;
@@ -85,6 +91,7 @@ inline GateReport gateRecording (std::span<const double> rec, const Sweep& sw, c
     g.clipped  = (g.clipRun >= cfg.clipRunSamples);
 
     const auto d = convolve (rec, sw.inverse);
+    if (d.empty()) { g.ok = false; g.reason = GateReject::SweepNotDetected; return g; }   // malformed sweep (empty inverse)
     double dpk = 0.0; std::size_t dl = 0;
     for (std::size_t i = 0; i < d.size(); ++i)
     {
@@ -118,7 +125,8 @@ inline GateReport gateRecording (std::span<const double> rec, const Sweep& sw, c
                         / (double) std::max<std::size_t> (1, sig.size());
         const double np = bandEnergy (nse, sw.spec.sampleRate, cfg.bandLoHz, cfg.bandHiHz)
                         / (double) std::max<std::size_t> (1, nse.size()) + 1e-30;
-        g.snrDb = 10.0 * std::log10 ((sp + 1e-30) / np);
+        g.snrDb    = 10.0 * std::log10 ((sp + 1e-30) / np);
+        g.snrValid = true;                                 // measured (else snrDb stays 0 + snrValid=false)
     }
 
     g.ok = ! g.clipped && g.sweepPresent;
