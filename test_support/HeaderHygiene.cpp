@@ -14,6 +14,7 @@
 #include <felitronics/analysis/KWeightingFilter.h>
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/SpectrumTap.h>
+#include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
@@ -24,6 +25,7 @@
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
+#include <felitronics/core/OfflineFft.h>
 #include <felitronics/core/Smoother.h>
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
