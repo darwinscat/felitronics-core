@@ -5,6 +5,35 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.7.0 — offline IR measurement + display curves (`felitronics::measurement`, `felitronics::analysis::offline`)
+
+The **offline** (message-thread, allocating, double-precision) half of an IR-capture pipeline, extracted
+from OrbitCapture (written portable by design) so the capture math lives in core instead of the app. This is
+deliberately **NOT** the RT path — real-time consumers still use the float `felitronics::core::fft` seam;
+these transform whole ~6 s captures where the numerical floor must sit far below the analog chain's, so they
+run in `double`. Every function clamps/heals non-finite params; correctness is oracle- + **numpy-cross-NULL**-
+anchored (an independent `numpy`/direct-time-domain recompute nulls the C++ to machine epsilon) and
+ASan/UBSan-clean.
+
+- **feat(measurement):** a new `felitronics::measurement` module — an **exponential sine sweep (ESS / Farina)**
+  generator + matched inverse (`Sweep`), **Farina deconvolution** with a latency-absorbing onset search past
+  the harmonic region (`Deconvolve`), IR post (onset / trim / peak-normalize, `IrPost`), a pre-deconv
+  **capture-quality gate** (clip / non-finite / sweep-presence / SNR, `CaptureGate`), and **multi-mic
+  common-onset alignment** that preserves the inter-mic comb (`MicSetAlign`). NULL-verified: sweep⊛inverse≈δ,
+  known-answer in-band magnitude, and the direct-time-domain convolution vs `numpy.convolve`.
+- **feat(analysis):** `felitronics::analysis::offline` display curves — `logMagnitudeCurve` (a 1/N-octave
+  RMS-power-smoothed magnitude on a log-f grid, in dB; energy-preserving `10·log10(mean|X|²) = 20·log10(rms)`)
+  and `interferenceDb` (where a multi-mic blend cancels or reinforces vs an incoherent power sum). Namespaced
+  `::offline` to keep the RT-metering contract of the rest of `felitronics::analysis` intact.
+- **refactor(core):** the shared offline double FFT (`nextPow2` / `detail::fftInplace` / `convolve` /
+  `magSpectrum`) is **promoted** `measurement` → `felitronics::core::offline` (`core/OfflineFft.h`) now that a
+  second offline-FFT consumer (the display curves) exists. `measurement/Convolve.h` re-exports it — the
+  measurement API and all its tests are unchanged.
+- **robustness (crew-hardened):** an adversarial "break-it" consilium (deepseek + antigravity + Fable) found
+  9 edge-case bugs in `measurement` and 4 in the display curves (a tiny/inf smoothing band → `(int)ceil(inf)`
+  UB; a non-pow2 `minNfft` → binHz↔bins skew; a huge-finite sample → `ΣM²` overflow → NaN; a top-bin band
+  inversion) — each fixed **with a regression test**. Verified false alarms were rejected against the code.
+
 ## v0.6.0 — noise gate (`felitronics::dynamics::NoiseGate`)
 
 A new `felitronics::dynamics` primitive: a dual-detection (ISP Decimator "G-String" style) **noise gate** —
