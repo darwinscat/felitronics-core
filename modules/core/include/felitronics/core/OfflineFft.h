@@ -75,6 +75,11 @@ inline void fftInplace (std::vector<std::complex<double>>& a, int sign) noexcept
 }
 } // namespace detail
 
+// Public forwarder for offline consumers that need the raw complex FFT directly (e.g.
+// felitronics::blend's Hilbert phase rotation) without reaching into detail::. Same routine —
+// sign = -1 forward, +1 inverse (NOT normalized). a.size() must be a power of two.
+inline void fftInplace (std::vector<std::complex<double>>& a, int sign) noexcept { detail::fftInplace (a, sign); }
+
 // Real linear convolution via double FFT. Returns length x.size()+h.size()-1 (empty if either input
 // is empty). OFFLINE — allocates. The measurement pipeline's one MAC (recording ⊛ inverse, sweep ⊛ inverse).
 inline std::vector<double> convolve (std::span<const double> x, std::span<const double> h)

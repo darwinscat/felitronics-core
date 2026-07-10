@@ -16,6 +16,7 @@
 #include <felitronics/analysis/SpectrumTap.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
+#include <felitronics/blend/Blend.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
 #include <felitronics/convolution/MatrixConvolver.h>
