@@ -2,14 +2,14 @@
 
 # felitronics-core — what's inside (quick map)
 
-JUCE-free, RT-safe, header-only C++20 DSP. **15 modules · 28 test suites · 4770 checks green**
+JUCE-free, RT-safe, header-only C++20 DSP. **16 modules · 37 test suites · 5572 checks green**
 (also green under ASan+UBSan). Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
 
 ## Foundations (building blocks)
 
 | Module | What | Key types |
 |---|---|---|
-| `core` | maths, smoothing, delay, FFT seam, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `FlushToZero` |
+| `core` | maths, smoothing, delay, RT FFT seam + offline double FFT, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `offline::` (`convolve`/`magSpectrum`), `FlushToZero` |
 | `eq` | filters + the EQ engine + the multiband split | `Svf` (Cytomic), `MatchedBiquad` (Vicanek), `EqEngine`, `Crossover2` (LR4), `MultibandSplitter` |
 | `dynamics` | the detector/gain toolkit + compressor + gate + transient | `EnvelopeFollower`, `GainComputer`, `Compressor`, `NoiseGate`, `TransientShaper`, `ChannelLinker` |
 | `oversampling` | polyphase windowed-sinc up/down (alias-free / true-peak) | `PolyphaseOversampler` |
@@ -29,11 +29,12 @@ JUCE-free, RT-safe, header-only C++20 DSP. **15 modules · 28 test suites · 477
 | `dither` | export bit-depth reduction | `Dither` (TPDF + noise shaping; 16/20/24-bit) |
 | `limiter` | brick-wall ceiling | `TruePeakLimiter` (oversample → limit → down) |
 
-## Meters / analysis
+## Meters · analysis · measurement
 
 | Module | What | Key types |
 |---|---|---|
-| `analysis` | metering + the FFT tap | `LoudnessMeter` (LUFS M/S/I + **LRA**), `TruePeakMeter` (dBTP, BS.1770-4), `CorrelationMeter`, `KWeightingFilter`, `SpectrumTap` |
+| `analysis` | RT metering + the FFT tap; **offline display curves** (`::offline`) | `LoudnessMeter` (LUFS M/S/I + **LRA**), `TruePeakMeter` (dBTP, BS.1770-4), `CorrelationMeter`, `KWeightingFilter`, `SpectrumTap`, `offline::logMagnitudeCurve` (1/N-oct, log-f), `offline::interferenceDb` |
+| `measurement` | **offline** IR capture: ESS/Farina sweep + deconv, IR post, capture gate, multi-mic align (message-thread, double) | `Sweep`, `Deconvolve`, `IrPost`, `CaptureGate`, `MicSetAlign` |
 
 **Build & test:** `cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON && cmake --build build -j && ctest --test-dir build`
 

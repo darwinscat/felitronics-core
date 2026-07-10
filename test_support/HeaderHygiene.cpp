@@ -14,6 +14,7 @@
 #include <felitronics/analysis/KWeightingFilter.h>
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/SpectrumTap.h>
+#include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
@@ -24,6 +25,7 @@
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
+#include <felitronics/core/OfflineFft.h>
 #include <felitronics/core/Smoother.h>
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
@@ -45,6 +47,12 @@
 #include <felitronics/lineareq/LinearPhaseEq.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
+#include <felitronics/measurement/CaptureGate.h>
+#include <felitronics/measurement/Convolve.h>
+#include <felitronics/measurement/Deconvolve.h>
+#include <felitronics/measurement/IrPost.h>
+#include <felitronics/measurement/MicSetAlign.h>
+#include <felitronics/measurement/Sweep.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
 #include <felitronics/multiband/MultibandWidth.h>
