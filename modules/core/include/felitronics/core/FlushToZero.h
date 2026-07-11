@@ -29,6 +29,15 @@ namespace felitronics::core
 inline void flushDenormal (float&  x) noexcept { if (std::fabs (x) < 1e-15f) x = 0.0f; }
 inline void flushDenormal (double& x) noexcept { if (std::fabs (x) < 1e-15)  x = 0.0;  }
 
+// Poison-hardened flush: everything flushDenormal zaps PLUS non-finite state (NaN/Inf → exact 0). A
+// NaN that reaches recursive state (one-pole/envelope/integrator) never decays out on its own — every
+// `state += a·(x − state)` stays NaN until reset — so kernels whose state can be poisoned by a bad
+// upstream sample flush with THIS variant. Same branch-cheap shape as flushDenormal (the isfinite
+// check is one classify, no extra pass); finite state at or above 1e-15 passes through bit-identically,
+// so on healthy streams it behaves exactly like flushDenormal — a drop-in strict superset.
+inline void flushPoison (float&  x) noexcept { if (! std::isfinite (x) || std::fabs (x) < 1e-15f) x = 0.0f; }
+inline void flushPoison (double& x) noexcept { if (! std::isfinite (x) || std::fabs (x) < 1e-15)  x = 0.0;  }
+
 //==============================================================================
 // ScopedFlushToZero — OPTIONAL desktop hardware FTZ/DAZ, RAII (set on construct, restore on destroy).
 // A belt-and-suspenders bonus over the software flush, NOT a correctness requirement. No-op where the

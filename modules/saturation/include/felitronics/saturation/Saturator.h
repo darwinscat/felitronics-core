@@ -30,7 +30,13 @@ namespace felitronics::saturation
 //
 // RT-safe: prepare() does all allocation; process() is alloc/lock/throw-free, in place. Params apply per
 // block (mastering params are near-static; a parameter smoother can wrap setParams() for automation). n
-// must be ≤ the maxBlock passed to prepare(). With oversampling the stage reports a round-trip latency.
+// may exceed the maxBlock passed to prepare() — process() chunks internally, state carries across chunks.
+// With oversampling the stage reports a round-trip latency.
+//
+// Poison-hardened: non-finite params fall back to defaults (applyParams), each input sample is
+// sanitized at the gate (NaN/Inf → 0, huge finite → ±1e6 clamp) so one bad sample can't lodge in the
+// oversampler/DC/dry-delay state, and the DC-blocker state flushes non-finite values per block. All
+// three guards are bit-transparent on finite, in-range signals (the NULL test proves it).
 class Saturator
 {
 public:
@@ -81,17 +87,46 @@ public:
 
     void setParams (const Params& p) noexcept { params_ = p; applyParams(); }
 
-    // In place, planar. RT-safe. n must be ≤ maxBlock.
+    // In place, planar. RT-safe. n may exceed maxBlock — chunked internally, fully processed.
     void process (float* const* io, int numChannels, int n) noexcept
     {
         const int nc = std::min (numChannels, channels_);
-        if (! prepared_ || nc <= 0 || n <= 0 || n > maxBlock_) return;   // unprepared / failed-prepare / oversized block → no OOB
+        if (! prepared_ || nc <= 0 || n <= 0) return;                    // unprepared / failed-prepare → no OOB
+        // Chunk to maxBlock so a caller passing n > maxBlock is FULLY processed instead of silently
+        // dropped. State carries across chunks via the members → bit-identical to one big call.
+        // maxBlock_ ≥ 1 whenever prepared_ (prepare() rejects less), so the loop always advances.
+        float* sub[core::kMaxChannels];
+        for (int off = 0; off < n; off += maxBlock_)
+        {
+            const int m = std::min (n - off, maxBlock_);
+            for (int c = 0; c < nc; ++c) sub[c] = io[c] + off;
+            processChunk (sub, nc, m);
+        }
+    }
+
+private:
+    // One ≤ maxBlock slice; nc already clamped by process(). Everything stateful streams across calls.
+    void processChunk (float* const* io, int nc, int n) noexcept
+    {
+        if (n <= 0) return;                                              // belt-and-suspenders (process() guarantees n ≥ 1)
         const int osN = n * os_;
         for (int c = 0; c < nc; ++c)
         {
             osPtrs_[(std::size_t) c]  = &osBuf_[(std::size_t) c * (std::size_t) (maxBlock_ * os_)];
             wetPtrs_[(std::size_t) c] = &wetBuf_[(std::size_t) c * (std::size_t) maxBlock_];
         }
+
+        // 0) sanitize AT THE GATE, in place — so the wet path AND the dry tap below both read the
+        //    sanitized signal: a NaN/Inf sample would lodge in the oversampler FIR / DC-blocker /
+        //    dry-delay state (NaN never decays out of a recursion); the clamp also catches an extreme
+        //    finite input that would overflow downstream. Finite in-range samples pass bit-identically
+        //    (std::clamp returns the value untouched inside the bounds).
+        for (int c = 0; c < nc; ++c)
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = io[c][i];
+                io[c][i] = std::clamp (std::isfinite (v) ? v : 0.0f, -1.0e6f, 1.0e6f);
+            }
 
         // 1) to the oversampled domain (io is only READ here, so it still holds the dry signal below)
         if (os_ > 1) ovs_.upsample (io, nc, n, osPtrs_.data());
@@ -112,7 +147,10 @@ public:
                     x1 = w; y1 = dc;
                     b[i] = dc;
                 }
-                dcX1_[(std::size_t) c] = x1; dcY1_[(std::size_t) c] = y1;
+                // flush NON-FINITE one-pole state only (no denormal threshold here: zapping a tiny
+                // finite tail would break the bit-identical NULL for quiet legitimate signals).
+                dcX1_[(std::size_t) c] = std::isfinite (x1) ? x1 : 0.0f;
+                dcY1_[(std::size_t) c] = std::isfinite (y1) ? y1 : 0.0f;
             }
             else
             {
@@ -139,7 +177,6 @@ public:
         }
     }
 
-private:
     static float finite (float v, float fallback) noexcept { return std::isfinite (v) ? v : fallback; }
 
     void applyParams() noexcept
