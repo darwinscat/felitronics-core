@@ -40,7 +40,7 @@ endif()
 # Module          Namespace               Target                Deps
 #   core          felitronics::core       felitronics::core     —            (Sample, sizes, Math, Smoother, flush)
 #   analysis      felitronics::analysis   felitronics::analysis core         (SpectrumTap; FFT via the seam)
-#   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · TransientShaper · ChannelLinker)
+#   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · AutoLeveler · TransientShaper · ChannelLinker)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
 #
 # Consume (pinned by tag, exactly like JUCE) — JUCE-free, so this fetch never pulls JUCE:
