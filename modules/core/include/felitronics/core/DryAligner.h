@@ -30,7 +30,11 @@ namespace felitronics::core
 //
 // Contract: advance() with numChannels ≤ the prepared channel count and numSamples ≤ the prepared
 // maxBlock; call it BEFORE any in-place stage overwrites `io`; delayed(ch) stays valid until the
-// next advance()/prepare().
+// next advance()/prepare(). advance() clamps both counts to the prepared sizes — a kept contract
+// makes the clamps a no-op, a violated one processes the prefix that fits (defined, no overrun)
+// instead of writing out of bounds. prepare() is still REQUIRED for real use: the default-
+// constructed state is safe but degenerate (1 channel, capacity 2, maxBlock 1 — everything clamps
+// down to that).
 //
 // 🔴 RT: advance() never allocates, locks or throws — both buffers are sized once in prepare().
 //==============================================================================
@@ -64,15 +68,17 @@ public:
     // this BEFORE any in-place stage overwrites it.
     void advance (const float* const* io, int numChannels, int numSamples, int delaySamples) noexcept
     {
-        const int C = cap_;
-        const int D = std::clamp (delaySamples, 0, C - 1);
-        for (int ch = 0; ch < numChannels; ++ch)
+        const int C  = cap_;
+        const int D  = std::clamp (delaySamples, 0, C - 1);
+        const int nc = std::clamp (numChannels, 0, channels_);   // kept contract → both clamps are
+        const int ns = std::clamp (numSamples,  0, maxBlock_);   //   no-ops; violated → no overrun
+        for (int ch = 0; ch < nc; ++ch)
         {
             float* r = ring_.data()    + (std::size_t) ch * (std::size_t) C;
             float* s = scratch_.data() + (std::size_t) ch * (std::size_t) maxBlock_;
             const float* x = io[ch];
             int wp = pos_;
-            for (int i = 0; i < numSamples; ++i)
+            for (int i = 0; i < ns; ++i)
             {
                 r[wp] = x[i];                       // write freshest input
                 int rp = wp - D; if (rp < 0) rp += C;
@@ -80,7 +86,7 @@ public:
                 if (++wp >= C) wp = 0;
             }
         }
-        pos_ = (pos_ + numSamples) % C;             // every channel advanced identically → one commit
+        pos_ = (pos_ + ns) % C;                     // every channel advanced identically → one commit
     }
 
     const float* delayed (int channel) const noexcept

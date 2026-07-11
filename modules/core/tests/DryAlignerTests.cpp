@@ -205,6 +205,44 @@ int main()
         test::ok (isDelayedBy (out, in, D), "post-reset stream realigns bit-exactly");
     }
 
+    // --- pre-prepare advance is SAFE: the default state is degenerate (1 ch, capacity 2, maxBlock 1)
+    //     and advance() clamps to it — a big block / many channels BEFORE prepare() must not overrun ---
+    test::group ("pre-prepare advance clamps to the degenerate default state (no overrun)");
+    {
+        core::DryAligner a;                                 // NO prepare()
+        const auto in0 = distinctSignal (64, 0xAAAAu);
+        const auto in1 = distinctSignal (64, 0xBBBBu);
+        const float* io[2] = { in0.data(), in1.data() };
+        a.advance (io, 2, 64, 0);                           // was OOB into the 1-sample scratch; now clamps
+        test::ok (a.delayed (0)[0] == in0[0], "the single staged sample is the block's first (D=0 identity)");
+        a.advance (io, 2, 64, 1000);                        // over-capacity tap on the degenerate ring too
+        a.advance (io, -3, -5, -1);                         // negative counts clamp to 0 (defined no-op)
+        // prepare() after the abuse restores full, bit-exact operation
+        a.prepare (1, 128, 256);
+        const auto in = distinctSignal (3000, 0xCCCCu);
+        test::ok (isDelayedBy (runAligner (a, in, 31, 128), in, 31),
+                  "prepare() after pre-prepare abuse works bit-exactly");
+    }
+
+    // --- post-prepare contract violations clamp to the prepared sizes (prefix processed, cursor consistent) ---
+    test::group ("contract-violating counts clamp to the prepared sizes");
+    {
+        const auto in  = distinctSignal (64, 0xDDDDu);
+        const auto in2 = distinctSignal (32, 0xEEEEu);
+        core::DryAligner a; a.prepare (1, 32, 256);         // 1 channel, maxBlock 32
+        const float* io3[3] = { in.data(), in.data(), in.data() };
+        a.advance (io3, 3, 64, 0);                          // 3 ch / 64 smp on a 1 ch / 32 smp aligner
+        bool prefix = true;
+        for (int i = 0; i < 32 && prefix; ++i) prefix = (a.delayed (0)[i] == in[(std::size_t) i]);
+        test::ok (prefix, "the 32-sample prefix is staged bit-exactly (rest clamped away)");
+        // the ring cursor advanced by the CLAMPED count (32): a D=32 tap now reads back that prefix
+        const float* io1[1] = { in2.data() };
+        a.advance (io1, 1, 32, 32);
+        bool aligned = true;
+        for (int i = 0; i < 32 && aligned; ++i) aligned = (a.delayed (0)[i] == in[(std::size_t) i]);
+        test::ok (aligned, "cursor committed by the clamped count — D=32 reads the previous prefix");
+    }
+
     // --- 🔴 RT: advance() performs zero heap allocations ---
     test::group ("advance() no-alloc");
     {
