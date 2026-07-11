@@ -56,9 +56,11 @@
 #include <felitronics/measurement/Convolve.h>
 #include <felitronics/measurement/Deconvolve.h>
 #include <felitronics/measurement/IrPost.h>
+#include <felitronics/measurement/LevelProbe.h>
 #include <felitronics/measurement/MicSetAlign.h>
 #include <felitronics/measurement/ModelGuess.h>
 #include <felitronics/measurement/PeakClip.h>
+#include <felitronics/measurement/ReferenceUnity.h>
 #include <felitronics/measurement/Sweep.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
