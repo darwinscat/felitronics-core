@@ -2,14 +2,14 @@
 
 # felitronics-core — what's inside (quick map)
 
-JUCE-free, RT-safe, header-only C++20 DSP. **17 modules · 38 test suites · 5612 checks green**
+JUCE-free, RT-safe, header-only C++20 DSP. **17 modules · 41 test suites · 5668 checks green**
 (also green under ASan+UBSan). Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
 
 ## Foundations (building blocks)
 
 | Module | What | Key types |
 |---|---|---|
-| `core` | maths, smoothing, delay, RT FFT seam + offline double FFT, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `offline::` (`convolve`/`magSpectrum`), `FlushToZero` |
+| `core` | maths, smoothing, delay, RT FFT seam + offline double FFT, denormal flush | `Math`, `Smoother` + `LinearSmoother`, `DelayLine`, `Fft`, `offline::` (`convolve`/`magSpectrum`), `FlushToZero`, `RtStreams` (Audition/Conv/Rec — the RT swap discipline as types) |
 | `eq` | filters + the EQ engine + the multiband split | `Svf` (Cytomic), `MatchedBiquad` (Vicanek), `EqEngine`, `Crossover2` (LR4), `MultibandSplitter` |
 | `dynamics` | the detector/gain toolkit + compressor + gate + transient | `EnvelopeFollower`, `GainComputer`, `Compressor`, `NoiseGate`, `TransientShaper`, `ChannelLinker` |
 | `oversampling` | polyphase windowed-sinc up/down (alias-free / true-peak) | `PolyphaseOversampler` |
