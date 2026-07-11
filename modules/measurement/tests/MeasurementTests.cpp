@@ -12,6 +12,7 @@
 #include <felitronics/measurement/IrPost.h>
 #include <felitronics/measurement/CaptureGate.h>
 #include <felitronics/measurement/MicSetAlign.h>
+#include <felitronics/measurement/XcorrAlign.h>
 
 #include <cmath>
 #include <cstddef>
@@ -138,6 +139,49 @@ int main()
         ok (set.delaySamples.size() == 2, "two mics aligned");
         ok (set.delaySamples[0] == 0, "earliest mic at delay 0");
         ok (set.delaySamples[1] == deltaMic, "second mic keeps the 17-sample inter-mic delay");
+    }
+
+    group ("XcorrAlign: fine time/polarity alignment (promoted from OrbitCapture)");
+    {
+        // A decaying "cab-ish" impulse at onset 1000; the channel = the same thing 53 samples LATE
+        // and polarity-flipped. Expect: invert detected, shift = -53 (advance the late channel).
+        auto mk = [] (std::size_t n, std::size_t onset)
+        {
+            std::vector<double> x (n, 0.0);
+            for (std::size_t i = onset; i < n; ++i)
+            {
+                const double t = (double) (i - onset);
+                x[i] = std::exp (-t / 300.0) * std::sin (0.13 * t) + 0.4 * std::exp (-t / 90.0) * std::sin (0.61 * t);
+            }
+            return x;
+        };
+        const auto ref = mk (16384, 1000);
+        auto late = mk (16384, 1000 + 53);
+        for (auto& v : late) v = -v;
+
+        const auto fix = measurement::xcorrAlign (ref, late, 96);
+        ok (fix.invert, "negative correlation peak -> polarity flip detected");
+        approx (fix.shiftSamples, -53.0, 0.5, "late channel gets a -53-sample advance");
+        ok (fix.corr > 0.95, "clean pair -> high confidence");
+
+        const auto self = measurement::xcorrAlign (ref, ref, 96);
+        ok (! self.invert && std::fabs (self.shiftSamples) < 0.5 && self.corr > 0.99,
+            "identical channels -> identity with ~1 confidence");
+
+        auto early = mk (16384, 1000 - 40);
+        const auto lead = measurement::xcorrAlign (ref, early, 96);
+        ok (! lead.invert, "same polarity kept");
+        approx (lead.shiftSamples, 40.0, 0.5, "leading channel gets a +40-sample delay");
+
+        const std::vector<double> silence (16384, 0.0);
+        const auto none = measurement::xcorrAlign (ref, silence, 96);
+        ok (none.corr == 0.0 && none.shiftSamples == 0.0 && ! none.invert,
+            "silence -> zero-confidence identity (no suggestion)");
+
+        const std::vector<std::vector<double>> set { ref, late, early };
+        const auto all = measurement::xcorrAlignSet (set, 0, 96);
+        ok (all.size() == 3 && all[0].shiftSamples == 0.0 && ! all[0].invert, "reference entry stays identity");
+        ok (all[1].invert && all[2].shiftSamples > 39.0, "set results match the pairwise calls");
     }
 
     return felitronics::test::report();
