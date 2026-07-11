@@ -34,8 +34,8 @@ JUCE-free, RT-safe, header-only C++20 DSP. **17 modules · 38 test suites · 561
 | Module | What | Key types |
 |---|---|---|
 | `analysis` | RT metering + the FFT tap; **offline display curves** (`::offline`) | `LoudnessMeter` (LUFS M/S/I + **LRA**), `TruePeakMeter` (dBTP, BS.1770-4), `CorrelationMeter`, `KWeightingFilter`, `SpectrumTap`, `offline::logMagnitudeCurve` (1/N-oct, log-f), `offline::interferenceDb` |
-| `measurement` | **offline** IR capture: ESS/Farina sweep + deconv, IR post, capture gate, multi-mic align, fine time/polarity align by cross-correlation (message-thread, double) | `Sweep`, `Deconvolve`, `IrPost`, `CaptureGate`, `MicSetAlign`, `XcorrAlign` |
-| `blend` | **offline** multi-mic IR blend engine: per-mic gain/phase/shift/HPF/LPF + master, solo/mute — the canonical home of the blend defaults | `StripParams`/`MasterParams`, `Filter`, `blendIrs`, `processedMic` |
+| `measurement` | **offline** IR capture: ESS/Farina sweep + deconv, IR post, capture gate, multi-mic align, fine time/polarity align by cross-correlation (message-thread, double) | `Sweep`, `Deconvolve`, `IrPost`, `CaptureGate`, `MicSetAlign`, `XcorrAlign`, `ModelGuess` |
+| `blend` | **offline** multi-mic IR blend engine: per-mic gain/phase/shift/HPF/LPF + master, solo/mute — the canonical home of the blend defaults | `StripParams`/`MasterParams`, `Filter`, `blendIrs`, `processedMic`, `Overlay` (`makeOverlay` — the one-call mix-view facade) |
 
 **Build & test:** `cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON && cmake --build build -j && ctest --test-dir build`
 
