@@ -76,6 +76,7 @@ add_subdirectory(modules/oversampling)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
 add_subdirectory(modules/saturation)
+add_subdirectory(modules/poweramp)   # tube power-amp trunk (SagEnvelope + TubeStage + PowerAmpStage, from OrbitCab) — needs eq + oversampling + saturation
 add_subdirectory(modules/stereo)
 add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
@@ -102,7 +103,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
     target_link_libraries(felitronics_header_hygiene PRIVATE
         felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
-        felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
+        felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE
