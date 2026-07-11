@@ -184,5 +184,89 @@ int main()
         ok (all[1].invert && all[2].shiftSamples > 39.0, "set results match the pairwise calls");
     }
 
+    group ("XcorrAlign hardening (adversarial-crew counterexamples pinned)");
+    {
+        auto mk = [] (std::size_t n, std::size_t onset)
+        {
+            std::vector<double> x (n, 0.0);
+            for (std::size_t i = onset; i < n; ++i)
+            {
+                const double t = (double) (i - onset);
+                x[i] = std::exp (-t / 300.0) * std::sin (0.13 * t) + 0.4 * std::exp (-t / 90.0) * std::sin (0.61 * t);
+            }
+            return x;
+        };
+
+        // 1) Onset delta beyond maxLag: the OLD code returned a confident WRONG lag with a false
+        //    invert (a side-lobe won). Must be a zero-confidence identity now.
+        {
+            const auto ref = mk (16384, 1000);
+            const auto far = mk (16384, 1099);                     // 99 late, maxLag 96
+            const auto r = measurement::xcorrAlign (ref, far, 96);
+            ok (r.corr == 0.0 && r.shiftSamples == 0.0 && ! r.invert,
+                "onset delta > maxLag -> no suggestion (never a confident wrong one)");
+        }
+
+        // 2) Per-lag normalization: corr is bounded by 1 even when the channel's energy grows
+        //    inside the window (the old fixed denominator produced corr > 1 and mis-ranked lags).
+        {
+            std::vector<double> ref (400, 0.0), ch (400, 0.0);
+            for (std::size_t i = 20; i < 320; ++i) ref[i] = 1.0;    // ref: a 300-long plateau
+            for (std::size_t i = 28; i < 320; ++i) ch[i]  = 1.0;    // ch: the same, 8 late
+            const auto r = measurement::xcorrAlign (ref, ch, 10, 200);
+            ok (r.corr <= 1.0, "corr never exceeds 1 (Cauchy-Schwarz with per-lag energies)");
+            approx (r.shiftSamples, -8.0, 1.0, "true 8-sample delay found, not an energy-biased lag");
+            ok (! r.invert, "no false polarity flip");
+        }
+
+        // 3) NULL vs a brute-force per-lag-normalized oracle on the cab-ish pair: identical
+        //    argmax + corr (the header's loop must BE the oracle, not an approximation of it).
+        {
+            const auto ref = mk (4096, 500);
+            auto ch = mk (4096, 553);
+            for (auto& v : ch) v = -v;
+            const auto r = measurement::xcorrAlign (ref, ch, 96, 512);
+
+            const auto onR = measurement::detectOnset (ref).onset;
+            const auto onC = measurement::detectOnset (ch).onset;
+            const std::size_t start0 = std::min (onR, onC) > 96 ? std::min (onR, onC) - 96 : 0;
+            const std::size_t win = std::min<std::size_t> (512, std::min (ref.size(), ch.size()) - start0 - 96);
+            double eR = 0.0;
+            for (std::size_t i = 0; i < win; ++i) eR += ref[start0 + i] * ref[start0 + i];
+            double bestC = 0.0, bestS = 0.0; int bestLag = 0;
+            for (int lag = -96; lag <= 96; ++lag)
+            {
+                double s = 0.0, eC = 0.0;
+                for (std::size_t i = 0; i < win; ++i)
+                {
+                    const long long j = (long long) (start0 + i) + lag;
+                    if (j >= 0 && j < (long long) ch.size()) { s += ref[start0 + i] * ch[(std::size_t) j]; eC += ch[(std::size_t) j] * ch[(std::size_t) j]; }
+                }
+                if (eC <= 0.0) continue;
+                const double c = std::fabs (s) / (std::sqrt (eR) * std::sqrt (eC));
+                if (c > bestC) { bestC = c; bestS = s; bestLag = lag; }
+            }
+            approx (r.shiftSamples, -(double) bestLag, 1e-12, "argmax NULLs against the brute-force oracle");
+            approx (r.corr, std::min (1.0, bestC), 1e-12, "confidence NULLs against the oracle");
+            ok (r.invert == (bestS < 0.0), "polarity NULLs against the oracle");
+        }
+
+        // 4) Subnormal-energy signals: the old sqrt(eR*eC) underflowed to 0 -> corr = inf.
+        {
+            std::vector<double> tiny (256, 0.0);
+            for (std::size_t i = 64; i < 256; ++i) tiny[i] = 1e-150 * std::sin (0.3 * (double) i);
+            const auto r = measurement::xcorrAlign (tiny, tiny, 32);
+            ok (std::isfinite (r.corr) && r.corr <= 1.0 && r.corr > 0.9,
+                "subnormal energies stay finite (identity ~1, never inf)");
+        }
+
+        // 5) Too little material for a stable estimate -> refuse, don't guess.
+        {
+            const std::vector<double> shortIr (100, 1.0);
+            const auto r = measurement::xcorrAlign (shortIr, shortIr, 96);
+            ok (r.corr == 0.0, "window below the 64-sample floor -> zero-confidence identity");
+        }
+    }
+
     return felitronics::test::report();
 }
