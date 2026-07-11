@@ -30,6 +30,7 @@
 #include <felitronics/core/OfflineFft.h>
 #include <felitronics/core/RtStreams.h>
 #include <felitronics/core/Smoother.h>
+#include <felitronics/core/StreamResampler.h>
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>

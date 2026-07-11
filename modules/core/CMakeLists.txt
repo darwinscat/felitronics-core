@@ -18,6 +18,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_fft_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_fft_tests COMMAND felitronics_core_fft_tests)
 
+    add_executable(felitronics_core_streamresampler_tests tests/StreamResamplerTests.cpp)   # streaming Catmull-Rom rate-match (from OrbitCab)
+    target_link_libraries(felitronics_core_streamresampler_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_streamresampler_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_streamresampler_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_streamresampler_tests COMMAND felitronics_core_streamresampler_tests)
+
     add_executable(felitronics_core_rtstreams_tests tests/RtStreamsTests.cpp)   # RT swap-discipline types (needs threads)
     target_link_libraries(felitronics_core_rtstreams_tests PRIVATE felitronics::core)
     target_include_directories(felitronics_core_rtstreams_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
