@@ -5,6 +5,34 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.8.0 — mic-blend engine (`felitronics::blend`) + fine IR alignment (`measurement::XcorrAlign`)
+
+The MIX side of the IR-capture family joins the capture side (v0.7.0) in core — both extracted from
+OrbitCapture (written portable by design), so OrbitCab and other consumers share ONE numerical
+fingerprint for blending and aligning multi-mic IRs.
+
+- **feat(blend):** a new `felitronics::blend` module — the **offline multi-mic IR blend engine**:
+  `StripParams`/`MasterParams` (per-mic gain / phase / fractional time shift / HPF / LPF + master,
+  solo/mute audibility rules), per-section-Q Butterworth HPF/LPF, Hilbert-based phase rotation,
+  windowed-sinc fractional shift (positive `shiftMs` = delay), and `blendIrs` (weighted sum +
+  master chain). Canonical defaults live HERE (80 Hz/24 dB · 8 kHz/12 dB) — consumers must not
+  re-declare them (a drifted default silently re-voices saved mixes). Extraction was gated by a
+  **byte-NULL** against the app's previous in-tree engine; OrbitCapture's `ocap::` blend names are
+  now `using`-shims over this module.
+- **feat(measurement):** `XcorrAlign` — **fine time/polarity alignment** of an IR against a
+  reference by normalized cross-correlation (`xcorrAlign` / `xcorrAlignSet`, ±maxLag samples,
+  fractional result): per-lag normalization with a Cauchy–Schwarz corr ≤ 1 bound, an onset-delta
+  guard that REFUSES (corr = 0) when the two onsets sit further apart than the search range,
+  polarity from the best normalized lag, subnormal-safe denominators. corr = 0 is the "no
+  confident suggestion" contract — callers must leave such a channel untouched.
+- **robustness (crew-hardened):** the adversarial consilium (codex + deepseek) hit XcorrAlign
+  before merge and found real bugs: a fixed-denominator normalization that could rank a wrong lag
+  above the true one AND report corr > 1; a confident wrong lag + false invert when the true lag
+  lies beyond `maxLag` (repro'd at corr 0.91); `inf` via `√(eR·eC)` underflow on subnormal
+  energies; a window off-by-one (+ the analysis-window floor raised 16 → 64). Each fix carries a
+  pinned counterexample test, and the whole search is NULLed against a brute-force oracle over
+  randomized signals.
+
 ## v0.7.0 — offline IR measurement + display curves (`felitronics::measurement`, `felitronics::analysis::offline`)
 
 The **offline** (message-thread, allocating, double-precision) half of an IR-capture pipeline, extracted
