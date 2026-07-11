@@ -24,6 +24,7 @@
 #include <felitronics/convolution/PartitionedConvolver.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
+#include <felitronics/core/DryAligner.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
