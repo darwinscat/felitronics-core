@@ -17,6 +17,7 @@
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/blend/Blend.h>
+#include <felitronics/blend/Overlay.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
 #include <felitronics/convolution/MatrixConvolver.h>
@@ -54,6 +55,7 @@
 #include <felitronics/measurement/Deconvolve.h>
 #include <felitronics/measurement/IrPost.h>
 #include <felitronics/measurement/MicSetAlign.h>
+#include <felitronics/measurement/ModelGuess.h>
 #include <felitronics/measurement/Sweep.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
