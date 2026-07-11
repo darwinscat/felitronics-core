@@ -268,5 +268,40 @@ int main()
         }
     }
 
+    // --- scanPeakClip: the standalone peak/flat-top pass (shared with sweepless consumers) ---
+    group ("scanPeakClip standalone");
+    {
+        // Hot but CLEAN: touches −0.1 dBFS repeatedly with no flat-top run → not clipped.
+        std::vector<double> hot (4800);
+        for (std::size_t i = 0; i < hot.size(); ++i) hot[i] = 0.9886 * std::sin (0.13 * (double) i);
+        auto r = measurement::scanPeakClip (hot);
+        ok (! r.clipped && ! r.nonFinite, "hot-but-clean take passes");
+        approx (r.peakDbfs, 20.0 * std::log10 (0.9886), 0.01, "peak dBFS measured");
+
+        // Real saturation: a 5-sample flat top at full scale → clipped, run reported.
+        std::vector<double> sat = hot;
+        for (std::size_t i = 100; i < 105; ++i) sat[i] = 1.0;
+        r = measurement::scanPeakClip (sat);
+        ok (r.clipped && r.clipRun == 5, "flat-top run of 5 detected as clipping");
+
+        // Two isolated full-scale samples (run < clipRunSamples) → NOT clipping.
+        std::vector<double> spikes = hot;
+        spikes[10] = 1.0; spikes[500] = -1.0;
+        r = measurement::scanPeakClip (spikes);
+        ok (! r.clipped && r.clipRun == 1, "isolated full-scale spikes are not a run");
+
+        // Non-finite is flagged honestly; empty input reports quiet defaults.
+        const std::vector<double> bad = { 0.1, std::nan (""), 0.2 };
+        ok (measurement::scanPeakClip (bad).nonFinite, "NaN flagged");
+        r = measurement::scanPeakClip (std::span<const double>{});
+        ok (! r.clipped && r.peakDbfs <= -119.0, "empty → quiet defaults (rejection is the caller's)");
+
+        // The gate's verdict is unchanged by the refactor: clipped recording → Clipped reject.
+        std::vector<double> rec (sw.signal.begin(), sw.signal.end());
+        for (auto& v : rec) v = std::max (-1.0, std::min (1.0, v * 5.0));   // drive the sweep hard into a clamp flat-top
+        const auto g = measurement::gateRecording (rec, sw);
+        ok (g.clipped && g.reason == measurement::GateReject::Clipped, "gateRecording still rejects clipping");
+    }
+
     return felitronics::test::report();
 }

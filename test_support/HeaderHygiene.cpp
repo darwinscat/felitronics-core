@@ -46,6 +46,7 @@
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/eq/MultibandSplitter.h>
 #include <felitronics/eq/Svf.h>
+#include <felitronics/io/Wav.h>
 #include <felitronics/limiter/TruePeakLimiter.h>
 #include <felitronics/lineareq/LinearPhaseEq.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
@@ -56,6 +57,7 @@
 #include <felitronics/measurement/IrPost.h>
 #include <felitronics/measurement/MicSetAlign.h>
 #include <felitronics/measurement/ModelGuess.h>
+#include <felitronics/measurement/PeakClip.h>
 #include <felitronics/measurement/Sweep.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
