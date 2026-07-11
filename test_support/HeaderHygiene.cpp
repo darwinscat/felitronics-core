@@ -35,6 +35,7 @@
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
+#include <felitronics/dynamics/AutoLeveler.h>
 #include <felitronics/dynamics/ChannelLinker.h>
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/EnvelopeFollower.h>
