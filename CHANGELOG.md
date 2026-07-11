@@ -5,6 +5,33 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.9.0 — RT stream types (`core::RtStreams`) + model guess + the mix-view overlay facade
+
+Three promotions from OrbitCapture, each behind the extraction bar (tests + adversarial crew
+codex/deepseek + NULL where possible) — landed as a second capture product arrived to consume them.
+
+- **feat(core):** `RtStreams` — the RT buffer-swap discipline AS TYPES (`AuditionStream`,
+  `ConvStream`, `RecStream`): flag DOWN → mutate within fixed/reserved storage → flag UP; std +
+  atomics only. Crew-hardened with four pinned fixes: a zero-length publish no longer arms an
+  empty looping clip (reader OOB), `RecStream::push` release-publishes `len` (an ARM harvest could
+  read an unsynchronized sample), the audition buffer is fixed-size (no reliance on
+  assign-within-capacity), `reserve()` guards int lengths. Reader rules (ACQUIRE gates, per-block
+  flag reload) and the known one-block quiescence gap (+ the deferred reader-ack epoch design) are
+  documented in the header. Suite includes a discipline-respecting concurrent smoke; ASan/UBSan
+  clean.
+- **feat(measurement):** `ModelGuess` — gear-model detection in a free-form file name against a
+  catalog. Conservative contract: exact fingerprint (the entry's last token) beats the 3+-digit
+  bare-number fallback; ANY ambiguity → no guess (a wrong guess poisons imported metadata
+  forever). Crew fix: locale-FREE tokenizer (`std::isalnum` could admit high-bit bytes under a
+  single-byte locale).
+- **feat(blend):** `Overlay`/`makeOverlay` — the one-call mix-view facade: per-mic curves (post
+  filters + gain), the blend curve (post Master), and the interference column (PRE-Master basis so
+  a Master rolloff never reads as phase cancellation, then faded by the Master's |H| — a display
+  weight by deliberate product decision, documented). NULLed to the hand-composed primitives at
+  machine epsilon; analytical pins (+3.01 dB in-phase twins, deep 180° notch, |H| only
+  attenuates). Crew fixes: bit-parity gain expression, no partial overlays on degenerate input,
+  non-finite params heal to defaults (the offline convention).
+
 ## v0.8.0 — mic-blend engine (`felitronics::blend`) + fine IR alignment (`measurement::XcorrAlign`)
 
 The MIX side of the IR-capture family joins the capture side (v0.7.0) in core — both extracted from
