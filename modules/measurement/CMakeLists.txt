@@ -35,4 +35,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_measurement_levelprobe_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_measurement_levelprobe_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_measurement_levelprobe_tests COMMAND felitronics_measurement_levelprobe_tests)
+
+    # Theory-first falsification suite for the family "unity" contract — derives every expectation from
+    # the documented contract + signal theory, then challenges LevelProbe/ReferenceUnity to meet it.
+    add_executable(felitronics_measurement_levelprobe_theory_tests tests/LevelProbeTheoryTests.cpp)
+    target_link_libraries(felitronics_measurement_levelprobe_theory_tests PRIVATE felitronics::measurement)
+    target_include_directories(felitronics_measurement_levelprobe_theory_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_measurement_levelprobe_theory_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_measurement_levelprobe_theory_tests COMMAND felitronics_measurement_levelprobe_theory_tests)
 endif()
