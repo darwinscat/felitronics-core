@@ -48,12 +48,12 @@ namespace detail
 
     inline void wrU32 (std::vector<std::uint8_t>& o, std::uint32_t v)
     {
-        o.push_back (v & 0xFF); o.push_back ((v >> 8) & 0xFF);
-        o.push_back ((v >> 16) & 0xFF); o.push_back ((v >> 24) & 0xFF);
+        o.push_back ((std::uint8_t) (v & 0xFF));         o.push_back ((std::uint8_t) ((v >> 8) & 0xFF));
+        o.push_back ((std::uint8_t) ((v >> 16) & 0xFF)); o.push_back ((std::uint8_t) ((v >> 24) & 0xFF));
     }
     inline void wrU16 (std::vector<std::uint8_t>& o, std::uint16_t v)
     {
-        o.push_back (v & 0xFF); o.push_back ((v >> 8) & 0xFF);
+        o.push_back ((std::uint8_t) (v & 0xFF)); o.push_back ((std::uint8_t) ((v >> 8) & 0xFF));
     }
     inline void wrTag (std::vector<std::uint8_t>& o, const char* t) { o.insert (o.end(), t, t + 4); }
 } // namespace detail
@@ -206,7 +206,7 @@ inline bool writeWav (const std::string& path, const std::vector<std::vector<dou
             else if (bits == 24)
             {
                 std::int32_t iv = (std::int32_t) std::llround (clampd (v) * 8388607.0);
-                o.push_back (iv & 0xFF); o.push_back ((iv >> 8) & 0xFF); o.push_back ((iv >> 16) & 0xFF);
+                o.push_back ((std::uint8_t) (iv & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 8) & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 16) & 0xFF));
             }
         }
     std::FILE* f = std::fopen (path.c_str(), "wb");
