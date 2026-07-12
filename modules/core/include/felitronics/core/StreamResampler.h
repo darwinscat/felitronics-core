@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -41,6 +42,9 @@ struct StreamResampler
     void reset (double inRate, double outRate, int capacity)
     {
         inPerOut = inRate / outRate;
+        // Contract-violation guards (message thread only — no cost on the valid path):
+        if (capacity < 0) capacity = 0;                      // negative would wrap (size_t) into a huge/UB alloc (or, small negatives, a tiny buffer)
+        if (capacity > INT_MAX - 8) capacity = INT_MAX - 8;  // keep buf.size() <= INT_MAX so the (int) buf.size() below never wraps negative
         buf.assign ((std::size_t) capacity + 8, 0.0f);       // ALLOC here (message thread) — never in process
         len = 3;                                             // 3 leading history zeros
         pos = 1.0;
@@ -48,11 +52,22 @@ struct StreamResampler
 
     void feed (const float* in, int n)
     {
-        if (len + n > (int) buf.size())                      // backstop: sized so this shouldn't trigger
+        if (n <= 0) return;                                  // guard: n==0 is a no-op (bit-identical); reject negative (std::copy of a reversed range is UB)
+        const int cap = (int) buf.size();                    // reset() keeps buf.size() <= INT_MAX, so this never wraps
+        if (n > cap)                                         // BACKSTOP: block alone can't fit — keep only its newest `cap` samples, drop all history
         {
-            const int drop = len + n - (int) buf.size();
+            in += (n - cap);
+            n   = cap;
+            len = 0;
+            pos = 1.0;
+        }
+        if (len + n > cap)                                   // backstop: sized so this shouldn't trigger on the valid path
+        {
+            int drop = len + n - cap;
+            if (drop > len) drop = len;                      // never memmove a size_t-underflowing (negative) count
             std::memmove (buf.data(), buf.data() + drop, (std::size_t) (len - drop) * sizeof (float));
             len -= drop; pos -= drop;
+            if (pos < 1.0) pos = 1.0;                        // keep the read head in-bounds — a dropped-past head must not let produce read buf[i-1] below buf[0]
         }
         std::copy (in, in + n, buf.data() + len);
         len += n;
