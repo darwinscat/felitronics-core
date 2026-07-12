@@ -15,6 +15,7 @@
 //==============================================================================
 
 #include <felitronics/measurement/Convolve.h>
+#include <felitronics/measurement/PeakClip.h>
 #include <felitronics/measurement/Sweep.h>
 
 #include <cmath>
@@ -76,19 +77,12 @@ inline GateReport gateRecording (std::span<const double> rec, const Sweep& sw, c
 
     // House rule: reject non-finite BEFORE any math (else one NaN makes the deconv all-NaN → every
     // comparison false → a wrong "sweep not detected" verdict). Honest failure with the true reason.
-    for (double v : rec)
-        if (! std::isfinite (v)) { g.ok = false; g.reason = GateReject::NonFinite; return g; }
-
-    double pk = 0.0;
-    int run = 0;
-    for (double v : rec)
-    {
-        pk = std::max (pk, std::fabs (v));
-        if (std::fabs (v) >= cfg.clipLevel) { if (++run > g.clipRun) g.clipRun = run; }
-        else run = 0;
-    }
-    g.peakDbfs = (pk > 0.0) ? 20.0 * std::log10 (pk) : -120.0;
-    g.clipped  = (g.clipRun >= cfg.clipRunSamples);
+    // The scan itself is the shared standalone pass (PeakClip.h).
+    const auto pc = scanPeakClip (rec, { cfg.clipLevel, cfg.clipRunSamples });
+    if (pc.nonFinite) { g.ok = false; g.reason = GateReject::NonFinite; return g; }
+    g.peakDbfs = pc.peakDbfs;
+    g.clipRun  = pc.clipRun;
+    g.clipped  = pc.clipped;
 
     const auto d = convolve (rec, sw.inverse);
     if (d.empty()) { g.ok = false; g.reason = GateReject::SweepNotDetected; return g; }   // malformed sweep (empty inverse)
