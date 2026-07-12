@@ -11,9 +11,15 @@
 //        44100   8.8200000000000003 → 8     22.050000000000001 → 22
 //        48000   9.5999999999999996 → 9     24 (exact)         → 24
 //        96000   19.199999999999999 → 19    48 (exact)         → 48
-//   2. A verbatim transcription of the OrbitCab source (below) — differential fuzz proves the
-//      promoted function equals it bit-for-bit across random channel counts / lengths / rates /
-//      content, including threshold-adversarial samples exactly at 0.001f·peak and denormals.
+//   2. A transcription of the OrbitCab source (below), faithful for FINITE inputs — differential
+//      fuzz (finite-only by construction) proves the promoted function equals it bit-for-bit across
+//      random channel counts / lengths / rates / content, including threshold-adversarial samples
+//      exactly at 0.001f·peak and denormals. On NaN the transcription mirrors JUCE's SCALAR fold
+//      (seed-first) while shipped OrbitCab may take a SIMD path with different NaN semantics — so
+//      the oracle is never consulted outside the finite domain.
+//   3. Outside the golden domain core DEFINES the behavior (see the header's DOMAIN note): the NaN
+//      fold, the Inf-threshold degeneration, and the input guards are pinned directly against
+//      hand-derived values, without the transcription oracle.
 
 #include <felitronics_test.h>
 #include <felitronics/measurement/IrPost.h>
@@ -21,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <random>
 #include <string>
 #include <utility>
@@ -33,12 +40,15 @@ using felitronics::test::group;
 using Buf = std::vector<std::vector<float>>;
 
 //==============================================================================
-// Verbatim transcription of OrbitCab's cab::detectLeadingSilence (src/core/IRMath.h), with
-// juce::AudioBuffer<float> replaced by raw channel vectors. JUCE equivalences, proven exact:
+// Transcription of OrbitCab's cab::detectLeadingSilence (src/core/IRMath.h), faithful for FINITE
+// inputs — the only domain where the tests consult it — with juce::AudioBuffer<float> replaced by
+// raw channel vectors. JUCE equivalences, exact on that domain:
 //   * juce::jmax (a, b) == (a < b ? b : a)  — transcribed literally.
 //   * buf.getMagnitude (ch, 0, n) == findMinAndMax over the range, then the max of {min, -min,
 //     max, -max}. Compare/negate only — every intermediate is a member of the input set or its
-//     negation, no rounding anywhere — so it equals the scalar max-|x| fold bit-for-bit.
+//     negation, no rounding anywhere — so for finite inputs it equals the scalar max-|x| fold
+//     bit-for-bit (on NaN it seeds from the first element like JUCE's scalar path, while shipped
+//     JUCE may take a SIMD path with different NaN semantics — hence the finite-domain scope).
 namespace orbitcab
 {
     inline float jmax (float a, float b) { return a < b ? b : a; }
@@ -91,7 +101,7 @@ namespace
         return measurement::detectLeadingSilence (ptrs.data(), (int) buf.size(), numSamples, sr);
     }
 
-    // Both oracles at once: promoted == verbatim OrbitCab == hand-derived index.
+    // Both oracles at once (finite inputs only): promoted == OrbitCab transcription == hand-derived.
     void golden (const Buf& buf, int n, double sr, int want, const std::string& what)
     {
         const int got = promoted (buf, n, sr);
@@ -202,8 +212,52 @@ int main()
         golden (b, 600, 48000.0, 491, "denormal floor below a denormal threshold");
     }
 
-    // --- differential fuzz: promoted vs the verbatim OrbitCab transcription, bit-identical ---
-    group ("differential fuzz vs the OrbitCab source (4000 cases)");
+    // --- defined domain: non-finite samples + input guards (core-pinned, no transcription oracle —
+    //     see the header's DOMAIN note; the shipped JUCE NaN fold is platform-dependent SIMD) ---
+    group ("defined domain: NaN/Inf pins + input guards");
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+
+        // NaN is always the SECOND argument of the fold's std::max → deterministically ignored,
+        // and an IEEE compare with NaN in the scan is false → never fires.
+        auto nanLead = deltaAt (400, 100);
+        nanLead[0][0] = nan;
+        ok (promoted (nanLead, 400, 48000.0) == 91, "NaN-leading channel: NaN ignored → 100-9 = 91");
+
+        Buf allNaN (1, std::vector<float> (100, nan));
+        ok (promoted (allNaN, 100, 48000.0) == 0, "all-NaN → peak stays 0 → don't trim");
+
+        Buf nanCh (2, std::vector<float> (400, 0.0f));
+        for (auto& v : nanCh[0]) v = nan;
+        nanCh[1][100] = 1.0f;
+        ok (promoted (nanCh, 400, 48000.0) == 91, "all-NaN channel beside a clean one → clean decides");
+
+        // Inf is ordered → propagates into the peak exactly as in OrbitCab: thresh = Inf, nothing
+        // crosses, onset degenerates to numSamples → the gated tail (numSamples - preRoll).
+        ok (promoted (deltaAt (400, 200, inf), 400, 48000.0) == 391,
+            "Inf peak → thresh Inf, no crossing → gated tail 400-9 = 391 (matches OrbitCab: Inf ordered)");
+        auto infPlus = deltaAt (1200, 800);
+        infPlus[0][500] = inf;
+        ok (promoted (infPlus, 1200, 48000.0) == 1191,
+            "Inf hijacks the threshold over finite signal → gated tail 1200-9 = 1191");
+
+        // Input guards: every invalid input → 0, noexcept-safe, no UB (the sampleRate guard also
+        // kills the (int)(0.0002*NaN/Inf) casts; the clamp kills the absurd-finite-rate overflow).
+        const auto good = deltaAt (400, 100);
+        ok (promoted (good, 400, std::numeric_limits<double>::quiet_NaN()) == 0, "NaN sampleRate → 0");
+        ok (promoted (good, 400, std::numeric_limits<double>::infinity()) == 0,  "Inf sampleRate → 0");
+        ok (promoted (good, 400, 0.0) == 0,      "zero sampleRate → 0");
+        ok (promoted (good, 400, -48000.0) == 0, "negative sampleRate → 0");
+        ok (promoted (good, 400, 1.0e18) == 0,   "absurd finite rate → clamped (int) casts, gated to 0");
+
+        const float* oneNull[2] = { good[0].data(), nullptr };
+        ok (measurement::detectLeadingSilence (oneNull, 2, 400, 48000.0) == 0, "one null channel → 0");
+        ok (measurement::detectLeadingSilence (nullptr, 2, 400, 48000.0) == 0, "null channel array → 0");
+    }
+
+    // --- differential fuzz: promoted vs the OrbitCab transcription — finite inputs only ---
+    group ("differential fuzz vs the OrbitCab source (4000 finite cases)");
     {
         std::mt19937 rng (0x0c4b1eadu);
         auto u01 = [&] { return std::uniform_real_distribution<float> (0.0f, 1.0f)(rng); };
