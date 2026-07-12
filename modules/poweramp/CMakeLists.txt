@@ -19,4 +19,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_poweramp_golden_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_poweramp_golden_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_poweramp_golden_tests COMMAND felitronics_poweramp_golden_tests)
+
+    # THEORY-FIRST falsification suite — derives every bound from amplifier/DSP theory + the headers'
+    # documented contracts (never tuned to pass) and tries to BREAK the stage. Documented deviations
+    # (the ~1e-2 "B9" feel-layer block-size discrepancy) are PINNED here, not fixed.
+    add_executable(felitronics_poweramp_theory_tests tests/PowerAmpTheoryTests.cpp)
+    target_link_libraries(felitronics_poweramp_theory_tests PRIVATE felitronics::poweramp)
+    target_include_directories(felitronics_poweramp_theory_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_poweramp_theory_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_poweramp_theory_tests COMMAND felitronics_poweramp_theory_tests)
 endif()
