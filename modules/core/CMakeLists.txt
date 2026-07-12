@@ -30,6 +30,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_streamresampler_theory_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_streamresampler_theory_tests COMMAND felitronics_core_streamresampler_theory_tests)
 
+    add_executable(felitronics_core_streamresampler_falsify_tests tests/StreamResamplerFalsifyTests.cpp)   # adversarial falsification pass (external cases + precision attacks)
+    target_link_libraries(felitronics_core_streamresampler_falsify_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_streamresampler_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_streamresampler_falsify_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_streamresampler_falsify_tests COMMAND felitronics_core_streamresampler_falsify_tests)
+
     add_executable(felitronics_core_rtstreams_tests tests/RtStreamsTests.cpp)   # RT swap-discipline types (needs threads)
     target_link_libraries(felitronics_core_rtstreams_tests PRIVATE felitronics::core)
     target_include_directories(felitronics_core_rtstreams_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
