@@ -5,7 +5,7 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
-## Unreleased
+## v0.11.0 — UTF-8 → ASCII romanization for filename slugs (`felitronics::text`)
 
 - **feat(text):** `felitronics::text` — JUCE-free UTF-8 → ASCII romanization for filename slugs.
   `decodeUtf8` (malformed bytes skipped, never guessed), `romanize` (one code point → ASCII: German
