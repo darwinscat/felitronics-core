@@ -49,4 +49,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_measurement_levelprobe_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_measurement_levelprobe_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_measurement_levelprobe_falsify_tests COMMAND felitronics_measurement_levelprobe_falsify_tests)
+
+    # detectLeadingSilence (the OrbitCab HEAD-trim fingerprint): parity suite — hand-derived golden trim
+    # indices + a differential oracle against a verbatim transcription of the OrbitCab source.
+    add_executable(felitronics_measurement_leadingsilence_tests tests/IrPostLeadingSilenceTests.cpp)
+    target_link_libraries(felitronics_measurement_leadingsilence_tests PRIVATE felitronics::measurement)
+    target_include_directories(felitronics_measurement_leadingsilence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_measurement_leadingsilence_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_measurement_leadingsilence_tests COMMAND felitronics_measurement_leadingsilence_tests)
+
 endif()

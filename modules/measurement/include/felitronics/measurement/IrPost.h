@@ -4,8 +4,10 @@
 #pragma once
 
 //==============================================================================
-// felitronics::measurement — post-processing of a derived IR: onset detection, onset-trim, peak gain.
-// OFFLINE, MESSAGE-THREAD-ONLY (double, allocates). Non-destructive by intent — the caller decides
+// felitronics::measurement — post-processing of a derived IR: onset detection (two detectors:
+// analysis-onset detectOnset + HEAD-trim detectLeadingSilence), onset-trim, peak gain.
+// OFFLINE, MESSAGE-THREAD-ONLY (double, allocates; detectLeadingSilence is float by contract —
+// golden trim points — and allocation-free). Non-destructive by intent — the caller decides
 // whether/where to apply a gain (the raw recording keeps its true level).
 //==============================================================================
 
@@ -47,6 +49,55 @@ inline OnsetResult detectOnset (std::span<const double> ir,
     while (on > searchStart && std::fabs (ir[on - 1]) >= thr) --on;
     r.onset = (on > searchStart + preRoll) ? on - preRoll : searchStart;
     return r;
+}
+
+// The complementary detector to detectOnset — a conservative LEADING-SILENCE measure for a destructive
+// HEAD trim (from OrbitCab, where the IR slot's trim and the waveform HEAD indicator share it so the
+// two can't drift apart). Forward scan for the FIRST sample (on any channel) with |x| > 0.001·peak —
+// peak taken across ALL channels — minus a ~0.2 ms pre-roll so the transient's leading edge isn't
+// clipped; returns 0 ("don't trim") unless more than ~0.5 ms would be gained.
+//
+// Two detectors, two jobs:
+//   * detectOnset (above)  — ANALYSIS onset: walks BACK from the peak, so a pre-onset floor above the
+//                            threshold can't fool it — but that same walk can step over real low-level
+//                            early energy. Right for measurement/alignment, wrong for destructive trims.
+//   * detectLeadingSilence — HEAD trim: never eats early energy (everything it removes is ≤ 0.1 % of
+//                            peak on EVERY channel, and the pre-roll + minimum-lead gate keep it shy);
+//                            a noise floor above 0.1 % of peak stops it early — it under-trims, never
+//                            over-trims. Idempotent: applying the returned trim and re-detecting gives 0.
+//
+// FINGERPRINT-SACRED (float by contract — golden trim points): consumers pin shipped HEAD-trim indices
+// to these exact values, so the arithmetic below must stay bit-identical — float compares with a strict
+// '>', TRUNCATING (int) casts for the pre-roll and the gate (44.1 kHz → 8 samples, not round()'s 9).
+// channels = per-channel read pointers (AudioBuffer-shaped, e.g. getArrayOfReadPointers()); reads the
+// first numSamples of each channel.
+inline int detectLeadingSilence (const float* const* channels, int numChannels, int numSamples,
+                                 double sampleRate) noexcept
+{
+    const int total = numSamples;
+    const int nch   = numChannels;
+    if (total <= 0 || nch <= 0 || channels == nullptr)
+        return 0;
+
+    float peak = 0.0f;                                  // == max getMagnitude across channels: the
+    for (int ch = 0; ch < nch; ++ch)                    // max/|x| fold is exact, so bit-identical
+        for (int i = 0; i < total; ++i)
+            peak = std::max (peak, std::abs (channels[ch][i]));
+    if (peak <= 0.0f)
+        return 0;
+
+    const float thresh = 0.001f * peak;
+    int onset = total;                                  // min over channels of the first supra-threshold
+    for (int ch = 0; ch < nch && onset > 0; ++ch)       // index (each channel scans up to the current min)
+    {
+        const float* d = channels[ch];
+        for (int i = 0; i < onset; ++i)
+            if (std::abs (d[i]) > thresh) { onset = i; break; }
+    }
+
+    const int preRoll = (int) (0.0002 * sampleRate);    // ~0.2 ms (truncated)
+    const int lead    = std::max (0, onset - preRoll);
+    return lead > (int) (0.0005 * sampleRate) ? lead : 0;
 }
 
 // Copy the IR from the onset forward. len == 0 → to end; else exactly len (zero-padded past the source).
