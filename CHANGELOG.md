@@ -5,6 +5,19 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## Unreleased
+
+- **feat(text):** `felitronics::text` — JUCE-free UTF-8 → ASCII romanization for filename slugs.
+  `decodeUtf8` (malformed bytes skipped, never guessed), `romanize` (one code point → ASCII: German
+  umlauts / ß / Œ, common Latin-1 accents, and full Russian Cyrillic incl. the multi-letter cases
+  Ж→Zh, Х→Kh, Щ→Shch, Ю→Yu; hard/soft signs vanish), and `transliterate` (the whole-string fold).
+  Extracted from OrbitCapture NAM's `Matrix.h` so every Darwin's Cat product shares ONE romanization
+  table — the RAW text stays in metadata; this is for FILENAMES, where cross-platform sync (macOS NFD
+  ↔ Windows/Linux NFC) and legacy ASCII parsers demand plain ASCII and a never-empty result.
+  Header-only, zero deps, header-hygiene clean under the strict downstream warning set. 41
+  falsification checks (every mapping asserted; intentional collisions like е/э→"e" pinned so callers
+  detect them).
+
 ## v0.10.0 — file I/O module + more OrbitCapture/OrbitCab promotions
 
 Each promotion behind the extraction bar (theory-first falsification tests + adversarial crew

@@ -78,6 +78,7 @@
 #include <felitronics/stereo/MidSide.h>
 #include <felitronics/stereo/MonoBass.h>
 #include <felitronics/stereo/StereoWidth.h>
+#include <felitronics/text/Translit.h>
 
 #if defined(FELITRONICS_WITH_PFFFT)   // optional compiled SIMD backend — header only reaches the gate when the option is ON
 #include <felitronics/fftpffft/PffftRealFft.h>
