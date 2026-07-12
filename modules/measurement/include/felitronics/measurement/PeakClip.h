@@ -41,14 +41,19 @@ inline PeakClipReport scanPeakClip (std::span<const double> rec, const PeakClipC
     int run = 0;
     for (double v : rec)
     {
-        if (! std::isfinite (v)) { r.nonFinite = true; continue; }   // fabs(NaN) comparisons are all-false anyway; flag honestly
+        if (! std::isfinite (v))                          // flag honestly — and a run means
+        {                                                 // CONSECUTIVE FINITE full-scale samples,
+            r.nonFinite = true;                           // so a NaN can never bridge one
+            run = 0;
+            continue;
+        }
         const double a = std::fabs (v);
         pk = std::max (pk, a);
         if (a >= cfg.clipLevel) { if (++run > r.clipRun) r.clipRun = run; }
         else run = 0;
     }
     r.peakDbfs = (pk > 0.0) ? 20.0 * std::log10 (pk) : -120.0;
-    r.clipped  = (r.clipRun >= cfg.clipRunSamples);
+    r.clipped  = (r.clipRun >= std::max (1, cfg.clipRunSamples));   // a run needs >= 1 sample
     return r;
 }
 

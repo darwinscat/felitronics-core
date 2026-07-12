@@ -129,6 +129,35 @@ int main()
         ok (! w.ok && ! w.error.empty(), "8-bit PCM read rejected loudly");
     }
 
+
+    group ("refutations from theory (crew round 1)");
+    {
+        auto tag = [] (std::vector<std::uint8_t>& o, const char* t) { o.insert (o.end(), t, t + 4); };
+        auto u32 = [] (std::vector<std::uint8_t>& o, std::uint32_t v) { for (int i = 0; i < 4; ++i) o.push_back ((std::uint8_t) ((v >> (8 * i)) & 0xFF)); };
+        auto u16 = [] (std::vector<std::uint8_t>& o, std::uint16_t v) { for (int i = 0; i < 2; ++i) o.push_back ((std::uint8_t) ((v >> (8 * i)) & 0xFF)); };
+
+        // SPEC: a data chunk claiming more bytes than exist is corruption -> loud reject, no clamp.
+        std::vector<std::uint8_t> trunc;
+        tag (trunc, "RIFF"); u32 (trunc, 100); tag (trunc, "WAVE");
+        tag (trunc, "fmt "); u32 (trunc, 16); u16 (trunc, 1); u16 (trunc, 1); u32 (trunc, 48000); u32 (trunc, 96000); u16 (trunc, 2); u16 (trunc, 16);
+        tag (trunc, "data"); u32 (trunc, 4); trunc.push_back (0); trunc.push_back (0);
+        ok (! io::readWavMemory (trunc.data(), trunc.size()).ok, "truncated data chunk rejected (never clamped)");
+
+        // SPEC: EXTENSIBLE must carry its 40-byte body — a 16-byte fmt with tag 0xFFFE would read
+        // the subtype out of the NEXT chunk's bytes.
+        std::vector<std::uint8_t> ext;
+        tag (ext, "RIFF"); u32 (ext, 100); tag (ext, "WAVE");
+        tag (ext, "fmt "); u32 (ext, 16); u16 (ext, 0xFFFE); u16 (ext, 1); u32 (ext, 48000); u32 (ext, 96000); u16 (ext, 2); u16 (ext, 16);
+        tag (ext, "data"); u32 (ext, 4); u16 (ext, 1); u16 (ext, 0);
+        ok (! io::readWavMemory (ext.data(), ext.size()).ok, "undersized EXTENSIBLE fmt rejected");
+
+        // SPEC: the writer refuses what the RIFF header cannot represent.
+        std::vector<std::vector<double>> many (70000, std::vector<double> (1, 0.0));
+        ok (! io::writeWav (tmp, many, 48000.0, 16, false), "u16 channel-count overflow refused");
+        ok (! io::writeWav (tmp, { { 0.1, 0.2 } }, std::nan (""), 16, false), "non-finite sample rate refused");
+        ok (! io::writeWav (tmp, { { 0.1 } }, -1.0, 16, false), "negative sample rate refused");
+    }
+
     std::remove (tmp.c_str());
     return felitronics::test::report();
 }

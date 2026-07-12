@@ -296,6 +296,15 @@ int main()
         r = measurement::scanPeakClip (std::span<const double>{});
         ok (! r.clipped && r.peakDbfs <= -119.0, "empty → quiet defaults (rejection is the caller's)");
 
+
+        // Refutations from theory (crew round 1): a clip RUN means CONSECUTIVE FINITE full-scale
+        // samples — a NaN can never bridge one; and an empty span stays quiet for ANY config.
+        std::vector<double> bridged = { 1.0, std::nan (""), 1.0, 1.0 };
+        const auto rb = measurement::scanPeakClip (bridged);
+        ok (rb.nonFinite && rb.clipRun == 2, "NaN breaks a flat-top run (no bridging)");
+        const auto re0 = measurement::scanPeakClip (std::span<const double>{}, { 0.999, 0 });
+        ok (! re0.clipped, "empty span stays unclipped under clipRunSamples=0");
+
         // The gate's verdict is unchanged by the refactor: clipped recording → Clipped reject.
         std::vector<double> rec (sw.signal.begin(), sw.signal.end());
         for (auto& v : rec) v = std::max (-1.0, std::min (1.0, v * 5.0));   // drive the sweep hard into a clamp flat-top

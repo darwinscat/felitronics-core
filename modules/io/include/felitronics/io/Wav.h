@@ -77,20 +77,39 @@ inline WavData readWavMemory (const std::uint8_t* bytes, std::size_t size)
         const std::uint8_t* id = bytes + pos;
         const std::uint32_t clen = rdU32 (bytes + pos + 4);
         const std::size_t body = pos + 8;
-        if (std::memcmp (id, "fmt ", 4) == 0 && clen >= 16 && body + 16 <= size)
+        // A chunk claiming more bytes than the file holds is corruption — reject LOUDLY (never
+        // clamp: a clamped data chunk silently truncates audio). The checked advance also kills
+        // the `body + clen` wrap that could loop forever on hostile input on 32-bit size_t.
+        if (clen > size - body) { w.error = "corrupt WAV (chunk overruns the file)"; return w; }
+        if (std::memcmp (id, "fmt ", 4) == 0 && clen >= 16)
         {
             fmt  = rdU16 (bytes + body);
             nch  = rdU16 (bytes + body + 2);
             rate = rdU32 (bytes + body + 4);
             bits = rdU16 (bytes + body + 14);
-            if (fmt == 0xFFFE && body + 26 <= size) fmt = rdU16 (bytes + body + 24);
+            if (fmt == 0xFFFE)
+            {
+                // WAVE_FORMAT_EXTENSIBLE: the subtype lives INSIDE this chunk (>= 40-byte body,
+                // cbSize >= 22) and the SubFormat GUID tail must be the standard media GUID —
+                // anything else is a crafted/corrupt header, not a format to trust.
+                static const std::uint8_t kGuidTail[14] =
+                    { 0x00,0x00, 0x00,0x00, 0x10,0x00, 0x80,0x00, 0x00,0xAA,0x00,0x38,0x9B,0x71 };
+                if (clen < 40 || rdU16 (bytes + body + 16) < 22
+                    || std::memcmp (bytes + body + 26, kGuidTail, sizeof (kGuidTail)) != 0)
+                {
+                    w.error = "corrupt WAV (bad WAVE_FORMAT_EXTENSIBLE header)"; return w;
+                }
+                fmt = rdU16 (bytes + body + 24);
+            }
         }
         else if (std::memcmp (id, "data", 4) == 0)
         {
             data = bytes + body;
-            datalen = std::min<std::size_t> (clen, size - body);
+            datalen = clen;
         }
-        pos = body + clen + (clen & 1);   // chunks are word-aligned
+        const std::size_t advance = (std::size_t) clen + (clen & 1u);
+        if (advance > size - body) break;                 // odd-length final chunk: parsed, done
+        pos = body + advance;
     }
     if (! data || nch == 0 || bits == 0) { w.error = "missing fmt/data"; return w; }
     // Reject unsupported formats loudly — do NOT return silent zeros with ok=true.
@@ -105,7 +124,8 @@ inline WavData readWavMemory (const std::uint8_t* bytes, std::size_t size)
     w.sr = rate; w.bits = bits; w.is_float = (fmt == 3);
     const std::size_t bytesPer = (std::size_t) bits / 8;
     const std::size_t frame = bytesPer * nch;
-    const std::size_t nf = frame ? datalen / frame : 0;
+    if (frame == 0 || datalen % frame != 0) { w.error = "corrupt WAV (data not frame-aligned)"; return w; }
+    const std::size_t nf = datalen / frame;
     w.ch.assign (nch, std::vector<double> (nf, 0.0));
     for (std::size_t i = 0; i < nf; ++i)
         for (std::uint16_t c = 0; c < nch; ++c)
@@ -154,11 +174,19 @@ inline bool writeWav (const std::string& path, const std::vector<std::vector<dou
     std::size_t nf = ch[0].size();
     for (const auto& c : ch) nf = std::min (nf, c.size());   // guard ragged channels (no OOB)
     if (nf == 0) return false;
+    // Refuse anything the RIFF header cannot represent — a silently truncated header field would
+    // write a lying file (e.g. 70000 channels wrapping to a u16, NaN sample rates, >4 GB data).
+    if (! std::isfinite (sr) || sr <= 0.0 || sr > 4294967295.0) return false;
+    if (ch.size() > 0xFFFFu) return false;
+    const std::uint64_t block64 = (std::uint64_t) ch.size() * (std::uint64_t) (bits / 8);
+    const std::uint64_t data64  = (std::uint64_t) nf * block64;
+    if (block64 > 0xFFFFu || data64 > 0xFFFFFFFFull - 44u) return false;
     const std::uint16_t nch = (std::uint16_t) ch.size();
     const std::uint16_t fmt = is_float ? 3 : 1;
     const std::uint32_t rate = (std::uint32_t) std::llround (sr);
-    const std::uint16_t block = (std::uint16_t) (nch * (bits / 8));
-    const std::uint32_t datalen = (std::uint32_t) (nf * block);
+    if ((std::uint64_t) rate * block64 > 0xFFFFFFFFull) return false;   // byteRate is a u32 too
+    const std::uint16_t block = (std::uint16_t) block64;
+    const std::uint32_t datalen = (std::uint32_t) data64;
     std::vector<std::uint8_t> o; o.reserve (44 + datalen);
     wrTag (o, "RIFF"); wrU32 (o, 36 + datalen); wrTag (o, "WAVE");
     wrTag (o, "fmt "); wrU32 (o, 16); wrU16 (o, fmt); wrU16 (o, nch);
