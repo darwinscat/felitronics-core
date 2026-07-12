@@ -40,7 +40,7 @@ endif()
 # Module          Namespace               Target                Deps
 #   core          felitronics::core       felitronics::core     —            (Sample, sizes, Math, Smoother, flush)
 #   analysis      felitronics::analysis   felitronics::analysis core         (SpectrumTap; FFT via the seam)
-#   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · TransientShaper · ChannelLinker)
+#   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · AutoLeveler · TransientShaper · ChannelLinker)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
 #
 # Consume (pinned by tag, exactly like JUCE) — JUCE-free, so this fetch never pulls JUCE:
@@ -76,6 +76,7 @@ add_subdirectory(modules/oversampling)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
 add_subdirectory(modules/saturation)
+add_subdirectory(modules/poweramp)   # tube power-amp trunk (SagEnvelope + TubeStage + PowerAmpStage, from OrbitCab) — needs eq + oversampling + saturation
 add_subdirectory(modules/stereo)
 add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
@@ -103,7 +104,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
     target_link_libraries(felitronics_header_hygiene PRIVATE
         felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
-        felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
+        felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)

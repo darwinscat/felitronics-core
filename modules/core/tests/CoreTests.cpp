@@ -10,7 +10,9 @@
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/DelayLine.h>
 
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 
@@ -119,6 +121,57 @@ int main()
         float g = 0.5f;     core::flushDenormal (g); test::ok (g == 0.5f, "normal float kept");
         double d = 1.0e-20; core::flushDenormal (d); test::ok (d == 0.0,  "tiny double -> exact 0");
         double e = 0.5;     core::flushDenormal (e); test::ok (e == 0.5,  "normal double kept");
+    }
+
+    // --- flushPoison: flushDenormal PLUS NaN/Inf → exact 0 (the promoted poison guard) ---
+    test::group ("flushPoison NaN/Inf/tiny -> exact 0, normals kept");
+    {
+        const float fnan = std::numeric_limits<float>::quiet_NaN();
+        const float finf = std::numeric_limits<float>::infinity();
+        float a = fnan;     core::flushPoison (a); test::ok (a == 0.0f,  "float NaN -> exact 0");
+        float b = finf;     core::flushPoison (b); test::ok (b == 0.0f,  "float +Inf -> exact 0");
+        float c = -finf;    core::flushPoison (c); test::ok (c == 0.0f,  "float -Inf -> exact 0");
+        float d = 1.0e-20f; core::flushPoison (d); test::ok (d == 0.0f,  "tiny float -> exact 0 (flushDenormal semantics kept)");
+        float e = 1.0e-40f; core::flushPoison (e); test::ok (e == 0.0f,  "subnormal float -> exact 0");
+        float f = 0.5f;     core::flushPoison (f); test::ok (f == 0.5f,  "normal float kept");
+        double dn = std::numeric_limits<double>::quiet_NaN();  core::flushPoison (dn); test::ok (dn == 0.0,  "double NaN -> exact 0");
+        double di = -std::numeric_limits<double>::infinity();  core::flushPoison (di); test::ok (di == 0.0,  "double -Inf -> exact 0");
+        double dt = 1.0e-20;                                   core::flushPoison (dt); test::ok (dt == 0.0,  "tiny double -> exact 0");
+        double dk = -2.5;                                      core::flushPoison (dk); test::ok (dk == -2.5, "normal double kept");
+    }
+
+    // --- flushPoison finite passthrough EXACTNESS: bit-compare across a magnitude sweep (normals down
+    //     through the flush boundary into subnormals) + agreement with flushDenormal on every finite
+    //     value — the poison variant is a drop-in strict superset on healthy state ---
+    test::group ("flushPoison finite sweep: bit-exact passthrough, == flushDenormal");
+    {
+        bool passExact = true, agree = true;
+        for (int k = -45; k <= 38; ++k)
+            for (int sgn = 0; sgn < 2; ++sgn)
+            {
+                const float v = (sgn != 0 ? -1.37f : 1.37f) * std::pow (10.0f, (float) k);
+                float p = v, q = v;
+                core::flushPoison (p); core::flushDenormal (q);
+                agree &= (std::bit_cast<uint32_t> (p) == std::bit_cast<uint32_t> (q));
+                if (std::fabs (v) >= 1e-15f)
+                    passExact &= (std::bit_cast<uint32_t> (p) == std::bit_cast<uint32_t> (v));
+            }
+        const float edges[] = { 1.0e-15f,                                      // the boundary itself (kept: < is strict)
+                                std::nextafterf (1.0e-15f, 0.0f),              // one ULP below (flushed)
+                                std::nextafterf (1.0e-15f, 1.0f),              // one ULP above (kept)
+                                std::numeric_limits<float>::min(),             // smallest normal (flushed — below 1e-15)
+                                std::numeric_limits<float>::denorm_min(),      // smallest subnormal (flushed)
+                                -0.0f };                                       // signed zero (flushed to +0, like flushDenormal)
+        for (const float v : edges)
+        {
+            float p = v, q = v;
+            core::flushPoison (p); core::flushDenormal (q);
+            agree &= (std::bit_cast<uint32_t> (p) == std::bit_cast<uint32_t> (q));
+        }
+        test::ok (passExact, "every finite |v| >= 1e-15 passes through bit-identically");
+        test::ok (agree, "flushPoison == flushDenormal on every finite value (sweep + boundary/subnormal edges)");
+        float b1 = 1.0e-15f;                        core::flushPoison (b1); test::ok (b1 == 1.0e-15f, "boundary 1e-15 itself is KEPT");
+        float b2 = std::nextafterf (1.0e-15f, 0.0f); core::flushPoison (b2); test::ok (b2 == 0.0f,     "one ULP below the boundary is flushed");
     }
 
     // --- ScopedFlushToZero: constructs/restores without crashing on any tier (smoke) ---

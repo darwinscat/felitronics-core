@@ -24,6 +24,7 @@
 #include <felitronics/convolution/PartitionedConvolver.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
+#include <felitronics/core/DryAligner.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
@@ -34,6 +35,7 @@
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
+#include <felitronics/dynamics/AutoLeveler.h>
 #include <felitronics/dynamics/ChannelLinker.h>
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/EnvelopeFollower.h>
@@ -56,9 +58,11 @@
 #include <felitronics/measurement/Convolve.h>
 #include <felitronics/measurement/Deconvolve.h>
 #include <felitronics/measurement/IrPost.h>
+#include <felitronics/measurement/LevelProbe.h>
 #include <felitronics/measurement/MicSetAlign.h>
 #include <felitronics/measurement/ModelGuess.h>
 #include <felitronics/measurement/PeakClip.h>
+#include <felitronics/measurement/ReferenceUnity.h>
 #include <felitronics/measurement/Sweep.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
@@ -66,6 +70,9 @@
 #include <felitronics/neural/Inference.h>
 #include <felitronics/neural/NeuralStage.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
+#include <felitronics/poweramp/PowerAmpStage.h>
+#include <felitronics/poweramp/SagEnvelope.h>
+#include <felitronics/poweramp/TubeStage.h>
 #include <felitronics/saturation/Saturator.h>
 #include <felitronics/saturation/WaveShaper.h>
 #include <felitronics/stereo/MidSide.h>
