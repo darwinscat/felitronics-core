@@ -49,4 +49,21 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_measurement_levelprobe_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_measurement_levelprobe_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_measurement_levelprobe_falsify_tests COMMAND felitronics_measurement_levelprobe_falsify_tests)
+
+    # detectLeadingSilence (the OrbitCab HEAD-trim fingerprint): parity suite — hand-derived golden trim
+    # indices + a differential oracle against a verbatim transcription of the OrbitCab source.
+    add_executable(felitronics_measurement_leadingsilence_tests tests/IrPostLeadingSilenceTests.cpp)
+    target_link_libraries(felitronics_measurement_leadingsilence_tests PRIVATE felitronics::measurement)
+    target_include_directories(felitronics_measurement_leadingsilence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_measurement_leadingsilence_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_measurement_leadingsilence_tests COMMAND felitronics_measurement_leadingsilence_tests)
+
+    # Theory-first falsification suite for detectLeadingSilence — every expectation derived from the
+    # documented contract (truncated pre-roll/gate constants, strict comparisons, global-peak fold),
+    # then the implementation is challenged: boundaries, scale/rate/channel invariances, idempotence.
+    add_executable(felitronics_measurement_leadingsilence_theory_tests tests/IrPostLeadingSilenceTheoryTests.cpp)
+    target_link_libraries(felitronics_measurement_leadingsilence_theory_tests PRIVATE felitronics::measurement)
+    target_include_directories(felitronics_measurement_leadingsilence_theory_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_measurement_leadingsilence_theory_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_measurement_leadingsilence_theory_tests COMMAND felitronics_measurement_leadingsilence_theory_tests)
 endif()
