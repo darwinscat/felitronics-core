@@ -757,7 +757,11 @@ int main()
     // when Bias>0 + Sag>0 (non-null vs Bias=0), and the WHOLE feel path (sag+load+iron+bias) is
     // PER-SAMPLE ⇒ block-size DETERMINISTIC (a per-block bias would break this).
     {
-        std::vector<float> in ((std::size_t) (warm + N), 0.0f);
+        // Sized warm+N+tail (like the sine buffers) so the diffWin windows [an, an+N) below stay IN
+        // BOUNDS: an = warm+kLat, so a warm+N buffer ends kLat samples short of the window — an OOB
+        // read (ASan heap-buffer-overflow) whose garbage was the phantom "~1e-2 feel-layer block-size
+        // discrepancy" this test used to report.
+        std::vector<float> in ((std::size_t) (warm + N + tail), 0.0f);
         { unsigned long long s = 3; for (auto& v : in) { s = s * 6364136223846793005ULL + 1; v = 0.4f * ((float) ((s >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f); } }
         TubeParams noB = Pf (24.0f, false, 1, 0.85f, 0.0f, 0.0f);
         TubeParams wiB = noB; wiB.bias = 1.0f;
@@ -765,12 +769,12 @@ int main()
         auto diffWin = [&] (const std::vector<float>& x, const std::vector<float>& y, int from, int to)
         { double m = 0; for (int i = from; i < to; ++i) m = std::max (m, (double) std::fabs (x[(std::size_t) i] - y[(std::size_t) i])); return m; };
         const double nonNull = diffWin (a0, a1, an, an + N);
-        // Block-size determinism: at feel=0 the stage is BIT-EXACT across block schedules (see S3). The FEEL
-        // layer, however, carries a small (~1e-2) pre-existing block-size discrepancy in steady state
-        // (the per-block coefficient smoother interacting with the long-memory sag envelope + shelves) — it
-        // shipped that way in OrbitCab (flagged there to root-cause later) and is inaudible. What this check
-        // must guarantee is that the load + output-transformer + per-sample bias stages do NOT REGRESS that:
-        // the full path stays within the sag/presence/depth feel-layer baseline.
+        // Block-size determinism: at feel=0 the stage is BIT-EXACT across block schedules (see S3) — and
+        // ROOT-CAUSED (the theory suite's TT9): so is the FEEL layer. The "~1e-2 pre-existing feel-layer
+        // discrepancy" this test once reported was NOT the DSP — it was this test's own analysis window
+        // reading kLat samples past a warm+N buffer (fixed above); measured in-bounds, baseDet/fullDet are
+        // exactly 0. The check stays as-is (never weakened): it still guarantees the load + output-
+        // transformer + per-sample bias stages do not regress the sag/presence/depth feel-layer baseline.
         std::vector<int> blk { 512 }, hostile { 1, 7, 64, 333, 512, 128 };
         TubeParams base3 = Pf (24.0f, false, 1, 0.8f, 0.5f, 0.5f);                          // sag/presence/depth feel only
         TubeParams full  = base3; full.load = 1.0f; full.iron = 1.0f; full.bias = 1.0f;     // + load/iron/bias
