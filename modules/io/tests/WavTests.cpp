@@ -21,10 +21,12 @@ using felitronics::test::group;
 
 namespace
 {
+constexpr double kPi = 3.14159265358979323846;   // portable: MSVC's <cmath> lacks M_PI by default; io stays zero-dep
+
 std::vector<double> sine (std::size_t n, double f, double sr, double amp)
 {
     std::vector<double> x (n);
-    for (std::size_t i = 0; i < n; ++i) x[i] = amp * std::sin (2.0 * M_PI * f * (double) i / sr);
+    for (std::size_t i = 0; i < n; ++i) x[i] = amp * std::sin (2.0 * kPi * f * (double) i / sr);
     return x;
 }
 
