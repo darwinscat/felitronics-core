@@ -64,8 +64,14 @@ inline float referenceUnityGain (const float* const* channels, int numChannels, 
     for (int c = 0; c < numChannels; ++c)                        // a null channel poisons the whole call
         if (channels[c] == nullptr) return 1.0f;
 
-    const int cap = std::min (numSamples, (int) std::lround (kIrAnalysisSeconds * sampleRate));
-    int N = 256; while (N < cap * 2 && N < (1 << 21)) N <<= 1;   // dense DTFT sampling of the IR
+    constexpr int kMaxFft = 1 << 21;
+    constexpr int kMaxAnalyzedTaps = kMaxFft / 2;                 // keep the documented 2x zero-padding at the hard FFT ceiling
+    const double requestedSeconds = kIrAnalysisSeconds * sampleRate;
+    const int requestedCap = requestedSeconds > (double) kMaxAnalyzedTaps
+                           ? kMaxAnalyzedTaps
+                           : (int) std::lround (requestedSeconds);
+    const int cap = std::min (numSamples, requestedCap);
+    int N = 256; while (N < cap * 2 && N < kMaxFft) N <<= 1;      // dense DTFT sampling of the IR
     core::fft::DefaultRealFft fft;
     if (! fft.prepare (N)) return 1.0f;
 
