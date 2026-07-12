@@ -40,7 +40,7 @@ struct IrResampleConfig
 //==============================================================================
 // Offline windowed-sinc (Kaiser) IR resampler. MESSAGE-THREAD ONLY (double math, allocates) — for
 // rate-converting an impulse response to the host SR on load. This is the >=60 dB-class resampler the
-// convolution path needs; the Catmull-Rom cab::StreamResampler (for NAM rate-match) is too low-SNR for
+// convolution path needs; the Catmull-Rom core::StreamResampler (streaming/NAM rate-match) is too low-SNR for
 // IRs. DC gain is normalized to 1.
 inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, double outSr,
                                       IrResampleConfig cfg = {})
