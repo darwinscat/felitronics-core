@@ -5,6 +5,24 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.10.0 — file I/O module + more OrbitCapture/OrbitCab promotions
+
+Each promotion behind the extraction bar (theory-first falsification tests + adversarial crew
+codex/deepseek + NULL where possible), landed as OrbitCapture NAM (the second capture product) and
+OrbitCab consume them.
+
+- **feat(io):** new zero-dependency `felitronics::io` module — minimal self-contained WAV
+  read/write (`readWav`/`readWavMemory`/`writeWav`/`writeWavMonoF32`), moved from OrbitCapture's
+  `oc/wav.hpp`. Crew-hardened: corrupt/truncated chunks are rejected loudly (never clamped),
+  `WAVE_FORMAT_EXTENSIBLE` requires its full body + SubFormat GUID, checked chunk advance (no
+  32-bit wrap), writer refuses headers it cannot represent (u16/u32 overflow, non-finite rates),
+  data must be frame-aligned. WavTests pin every case.
+- **feat(measurement):** `PeakClip.h` — standalone `scanPeakClip` (peak dBFS + flat-top clip run)
+  extracted from `gateRecording` for sweepless consumers (NAM reamp takes); a NaN breaks a run,
+  `clipRunSamples` clamped to >= 1. `detectLeadingSilence` — OrbitCab's forward-scan head-trim onset.
+- **feat(core,saturation):** NaN/Inf poison guards + chunking hardening (promoted from OrbitCab),
+  with theory-first falsification suites.
+
 ## v0.9.0 — RT stream types (`core::RtStreams`) + model guess + the mix-view overlay facade
 
 Three promotions from OrbitCapture, each behind the extraction bar (tests + adversarial crew
