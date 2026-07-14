@@ -5,6 +5,22 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.12.0 — decoupled-hop rolling analyzer tap (`felitronics::analysis`)
+
+- **feat(analysis):** `RollingSpectrumTap` — a lock-free SPSC analyzer tap whose snapshot cadence
+  (hop) is decoupled from its analysis window size. One rolling ring (max order 14 = 16384) serves any
+  FFT size ≤ MaxOrder from a single buffer: `publishIfDue(order, hop)` copies the most-recent
+  `N = 1<<order` samples — chronologically, across the ring wrap — into a single-slot immutable mailbox
+  and force-publishes when the order changes, so a consumer can offer a **selectable analyzer FFT size
+  with a click-free live switch** at a steady UI-rate cadence (overlapping windows for large N, gapped
+  for small N) — no per-order ring duplication, one write per sample. `tryPull(dst, outOrder)` reports
+  the order the frame was captured at so a wrong-size frame is discarded across a switch. `reset()`
+  restarts the producer only and never revokes a mid-pull reader — closing a torn-frame race that a
+  reset-clears-ready design would have when `prepareToPlay` runs against a live GUI reader. Tear-free by
+  the same acquire/release ownership handoff `SpectrumTap` uses, plus per-frame order/size metadata.
+  Header-only, JUCE-free. ctest: variable-N snapshot, warmup gate, hop cadence, forced publish on order
+  change, chronological wrap copy, race-free reset. Consumed by tabby-eq's analyzer-resolution feature.
+
 ## v0.11.0 — UTF-8 → ASCII romanization for filename slugs (`felitronics::text`)
 
 - **feat(text):** `felitronics::text` — JUCE-free UTF-8 → ASCII romanization for filename slugs.
