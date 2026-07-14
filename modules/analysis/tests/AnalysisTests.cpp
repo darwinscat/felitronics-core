@@ -5,6 +5,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/analysis/SpectrumTap.h>
+#include <felitronics/analysis/RollingSpectrumTap.h>
 #include <felitronics/analysis/KWeightingFilter.h>
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/CorrelationMeter.h>
@@ -20,6 +21,10 @@ using namespace felitronics;
 // Different orders are distinct, correctly-sized types (Law 5: configurable size without a fork).
 static_assert (analysis::SpectrumTapT<10>::kSize == 1024, "order 10 -> 1024");
 static_assert (analysis::SpectrumTap::kSize == 2048,       "default -> 2048");
+
+// The rolling tap sizes to the MAX window; it serves any smaller order from the one ring.
+static_assert (analysis::RollingSpectrumTap::kMaxSize == 16384,  "default MaxOrder 14 -> 16384");
+static_assert (analysis::RollingSpectrumTapT<11>::kMaxSize == 2048, "MaxOrder 11 -> 2048");
 
 int main()
 {
@@ -61,6 +66,109 @@ int main()
         for (int i = 0; i < N + 1; ++i) t3.push (3.0f);      // make a frame ready
         t3.reset();
         test::ok (! t3.tryPull (dst), "reset clears ready");
+    }
+
+    //==========================================================================
+    // RollingSpectrumTap — hop decoupled from window size; one 8192 ring serves any order.
+    static float rdst[analysis::RollingSpectrumTap::kMaxSize];   // pull buffer (>= kMaxSize), static: off-stack
+    int ro = -1;                                                 // reported order out-param
+    // Push `count` samples of a ramp starting at value `start` (chronology check: data[i] == start+i).
+    auto ramp = [] (auto& tap, long long count, long long start) noexcept {
+        for (long long i = 0; i < count; ++i) tap.push ((float) (start + i));
+    };
+
+    // --- a frame carries the requested window N, the most-recent N samples in chronological order,
+    //     and the order it was captured at; the first request is force-published ---
+    test::group ("RollingSpectrumTap variable-N snapshot");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        ramp (tap, 1024, 0);                                    // wpos = 1024
+        tap.publishIfDue (10, 512);                             // order 10 (N=1024), first → forced
+        test::ok (tap.tryPull (rdst, ro), "first request is force-published");
+        test::ok (ro == 10, "frame reports the captured order");
+        test::approx (rdst[0],    0.0,    1e-9, "oldest of the last 1024 == 0");
+        test::approx (rdst[1023], 1023.0, 1e-9, "newest == 1023");
+        test::ok (! tap.tryPull (rdst, ro), "re-armed after pull");
+    }
+
+    // --- no frame until the ring holds a FULL window of history (no short/garbage first frame).
+    //     Exercised at the MAX order (14 = 16384) — the largest window the ring must fill. ------------
+    test::group ("RollingSpectrumTap waits for a full window");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        ramp (tap, 16000, 0);                                   // < 16384
+        tap.publishIfDue (14, 1);                               // N=16384 > wpos → no-op
+        test::ok (! tap.tryPull (rdst, ro), "no frame until >= N samples exist");
+        ramp (tap, 400, 16000);                                 // wpos = 16400 >= 16384
+        tap.publishIfDue (14, 1);
+        test::ok (tap.tryPull (rdst, ro) && ro == 14, "frame once a full 16384 window exists");
+    }
+
+    // --- hop gates the cadence: no new frame until `hop` samples have accrued since the last publish ---
+    test::group ("RollingSpectrumTap hop cadence");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        ramp (tap, 1024, 0);
+        tap.publishIfDue (10, 512); test::ok (tap.tryPull (rdst, ro), "first frame");   // lastPublish = 1024
+        ramp (tap, 256, 1024);                                  // wpos = 1280, delta 256 < 512
+        tap.publishIfDue (10, 512);
+        test::ok (! tap.tryPull (rdst, ro), "no frame before the hop elapses");
+        ramp (tap, 256, 1280);                                  // wpos = 1536, delta 512 >= 512
+        tap.publishIfDue (10, 512);
+        test::ok (tap.tryPull (rdst, ro), "frame once the hop elapses");
+    }
+
+    // --- an order change force-publishes immediately, bypassing the hop (a live resolution switch) ---
+    test::group ("RollingSpectrumTap order change forces a frame");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        ramp (tap, 2048, 0);
+        tap.publishIfDue (10, 1000000);                         // order 10, huge hop
+        test::ok (tap.tryPull (rdst, ro) && ro == 10, "order 10 frame");
+        tap.publishIfDue (11, 1000000);                         // order changed → forced despite the huge hop
+        test::ok (tap.tryPull (rdst, ro) && ro == 11, "order change forces an immediate new-size frame");
+    }
+
+    // --- the wrap copy is chronologically correct once wpos exceeds the ring capacity. An order-13
+    //     (8192) window over a wpos past the 16384 ring end straddles the wrap → the two-part copy. ----
+    test::group ("RollingSpectrumTap wrap correctness");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        const long long total = (long long) analysis::RollingSpectrumTap::kMaxSize + 500;   // wpos past ring end
+        ramp (tap, total, 0);
+        tap.publishIfDue (13, 1);                               // last 8192 samples straddle the ring wrap
+        test::ok (tap.tryPull (rdst, ro), "frame after wrap");
+        test::approx (rdst[0],    (double) (total - 8192), 1e-9, "wrap: oldest of last 8192 correct");
+        test::approx (rdst[8191], (double) (total - 1),    1e-9, "wrap: newest correct");
+    }
+
+    // --- an unread frame is preserved: a busy slot skips the snapshot, reader still sees the OLD frame ---
+    test::group ("RollingSpectrumTap preserves an unread frame");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        ramp (tap, 1024, 0);
+        tap.publishIfDue (10, 1);                               // frame A (data == 0..1023), ready
+        ramp (tap, 1024, 1024);                                 // wpos = 2048, but slot unread
+        tap.publishIfDue (10, 1);                               // ready → snapshot skipped
+        test::ok (tap.tryPull (rdst, ro), "frame still ready");
+        test::approx (rdst[0], 0.0, 1e-9, "unread frame A preserved (not overwritten by the newer fill)");
+    }
+
+    // --- reset restarts the PRODUCER without revoking the reader: an already-published frame stays
+    //     drainable (no torn-frame race with a mid-pull reader), and the restarted ring re-arms the
+    //     forced first frame + needs a fresh full window again ---
+    test::group ("RollingSpectrumTap reset restarts the producer, keeps the mailbox");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        ramp (tap, 2048, 0);
+        tap.publishIfDue (11, 1);                              // frame ready
+        tap.reset();                                           // restart producer; mailbox left to the reader
+        test::ok (tap.tryPull (rdst, ro), "reset does NOT revoke an in-flight frame (race-free with a mid-pull reader)");
+        tap.publishIfDue (11, 1);                             // wpos == 0 after reset -> warmup gate, no frame yet
+        test::ok (! tap.tryPull (rdst, ro), "reset restarted the ring (a full window is needed again)");
+        ramp (tap, 2048, 0);
+        tap.publishIfDue (11, 1000000);                       // forced despite the huge hop (lastOrder re-armed to -1)
+        test::ok (tap.tryPull (rdst, ro), "reset re-armed the forced first frame");
     }
 
     // --- BS.1770 K-weighting: canonical 48 kHz coefficients + recompute at 44.1 k ---
