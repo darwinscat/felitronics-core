@@ -33,9 +33,9 @@ endif()
 # felitronics-core — shared, framework-agnostic, JUCE-free, real-time-safe C++ DSP core.
 #
 # Independent modules, each separately includable so a consumer pulls only what it needs (an EQ
-# plugin must NOT drag in the neural runtime). All 15 modules below are header-only INTERFACE targets
-# (convolution / neural / lineareq included); the full per-module map with key types is
-# docs/CORE-OVERVIEW.md. See docs/DSP-ARCHITECTURE.md for the design rationale.
+# plugin must NOT drag in the neural runtime). Most modules are header-only INTERFACE targets;
+# fftpffft and nam are compiled only when explicitly opted in. The full per-module map with key
+# types is docs/CORE-OVERVIEW.md. See docs/DSP-ARCHITECTURE.md for the design rationale.
 #
 # Module          Namespace               Target                Deps
 #   core          felitronics::core       felitronics::core     —            (Sample, sizes, Math, Smoother, flush)
@@ -57,10 +57,14 @@ endif()
 # A consumer that FetchContent's felitronics-core does NOT inherit the tests.
 option(FELITRONICS_BUILD_TESTS "Build felitronics-core self-tests" "${PROJECT_IS_TOP_LEVEL}")
 
-# Optional COMPILED SIMD FFT backend (pffft) — the one non-header-only module. Default OFF, so a consumer
+# Optional COMPILED SIMD FFT backend (pffft). Default OFF, so a consumer
 # that does not opt in stays header-only with zero external deps. When ON, felitronics::fftpffft is built and
 # (with tests) its cross-backend NULL suite runs. See modules/fftpffft + THIRD_PARTY_NOTICES.md.
 option(FELITRONICS_WITH_PFFFT "Build the optional compiled pffft SIMD FFT backend (felitronics::fftpffft)" OFF)
+
+# Optional COMPILED NAM backend. Default OFF preserves the JUCE-free, external-dependency-free header-only
+# path; ON fetches the pinned NeuralAmpModelerCore + namz sources and builds felitronics::nam.
+option(FELITRONICS_WITH_NAM "Build the optional NeuralAmpModelerCore backend (felitronics::nam)" OFF)
 
 if(FELITRONICS_BUILD_TESTS)
     enable_testing()
@@ -71,10 +75,12 @@ add_subdirectory(modules/core)
 add_subdirectory(modules/analysis)
 add_subdirectory(modules/dynamics)
 add_subdirectory(modules/eq)
+add_subdirectory(modules/fftpffft)   # OPTIONAL, compiled pffft SIMD backend — before convolution, whose CabConvolver may select it
 add_subdirectory(modules/convolution)
 add_subdirectory(modules/oversampling)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
+add_subdirectory(modules/nam)   # OPTIONAL, compiled NAM backend — depends on neural + core; self-gates on FELITRONICS_WITH_NAM
 add_subdirectory(modules/saturation)
 add_subdirectory(modules/poweramp)   # tube power-amp trunk (SagEnvelope + TubeStage + PowerAmpStage, from OrbitCab) — needs eq + oversampling + saturation
 add_subdirectory(modules/stereo)
@@ -87,7 +93,6 @@ add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Far
 add_subdirectory(modules/blend)   # OFFLINE mic-blend engine (mixer params + kernels + Σ(gain·strip) blend) — double coeffs, float buffers
 add_subdirectory(modules/io)   # OFFLINE file I/O (WAV read/write, moved from OrbitCapture's oc/wav.hpp) — zero-dep, message-thread
 add_subdirectory(modules/text)   # JUCE-free UTF-8 → ASCII romanization for filename slugs (German/ß + Cyrillic), from OrbitCapture NAM's Matrix.h — zero-dep, message-thread
-add_subdirectory(modules/fftpffft)   # OPTIONAL, compiled (pffft SIMD backend) — self-gates on FELITRONICS_WITH_PFFFT
 
 # Dev tools (reference-validation CLIs) — top-level builds only.
 if(PROJECT_IS_TOP_LEVEL)
@@ -108,15 +113,16 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text)
+    if(FELITRONICS_WITH_NAM)
+        target_link_libraries(felitronics_header_hygiene PRIVATE felitronics::nam)
+    endif()
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE
         -Werror -Wall -Wextra -Wpedantic
         -Wconversion -Wsign-conversion -Wfloat-equal -Wshadow -Wcast-align
         -Wzero-as-null-pointer-constant -Wunreachable-code -Wswitch-enum -Wextra-semi
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wshorten-64-to-32;-Wimplicit-float-conversion;-Wconditional-uninitialized;-Wconstant-conversion;-Wbool-conversion>)
-    if(FELITRONICS_WITH_PFFFT)   # push MatrixConvolver<PffftRealFft> through the strict gate (PR2 C1 asserts + row stride)
-        target_compile_definitions(felitronics_header_hygiene PRIVATE FELITRONICS_WITH_PFFFT)
-        target_link_libraries(felitronics_header_hygiene PRIVATE felitronics::fftpffft)
-    endif()
+    # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
+    # and backend target here, pushing MatrixConvolver<PffftRealFft> through the strict gate below.
     add_test(NAME felitronics_header_hygiene COMMAND felitronics_header_hygiene)
 endif()

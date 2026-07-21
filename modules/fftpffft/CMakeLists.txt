@@ -50,7 +50,7 @@ set_source_files_properties(pffft/pffft.c PROPERTIES COMPILE_OPTIONS
 if(FELITRONICS_BUILD_TESTS)
     add_executable(felitronics_pffft_tests tests/PffftNullTests.cpp)
     target_link_libraries(felitronics_pffft_tests PRIVATE
-        felitronics::fftpffft felitronics::convolution felitronics::lineareq)
+        felitronics::convolution felitronics::lineareq)   # convolution carries the selected pffft backend
     target_include_directories(felitronics_pffft_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_pffft_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_pffft_tests COMMAND felitronics_pffft_tests)

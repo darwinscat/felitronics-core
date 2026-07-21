@@ -14,11 +14,15 @@ deps must be AGPL-compatible (BSD / MIT / Apache / MPL-2.0) and are recorded her
 | `dynamics` | **none** | Original code. |
 | `eq` | **none copied** | The matched-filter **method** is from Martin Vicanek's papers — *"Matched Second Order Digital Filters"* (2016) and *"Matched Two-Pole Digital Shelving Filters"* (2024–2025) — **cited inline in `MatchedBiquad.h`**; no third-party code is copied. The Cytomic/Zavalishin TPT SVF (`Svf.h`) likewise implements a published method, not copied code. |
 
-## Optional compiled modules (vendored; opt-in via a CMake option)
+## Optional compiled modules (opt-in via a CMake option)
 
 | Module | Third-party code | Licence | AGPL-compatible |
 |---|---|---|---|
 | `fftpffft` | **pffft** (Julien Pommier, 2013), derived from FFTPACKv4 (Dr Paul Swarztrauber / NCAR, 1985) | BSD-style (FFTPACK5 / UCAR) | yes |
+| `nam` | **NeuralAmpModelerCore** at `b5a68c3ebed5035a91d9207219346c81e8e3ce8e` | MIT | yes |
+| `nam` | **Eigen**, supplied by NeuralAmpModelerCore's `Dependencies/eigen` submodule at that pin | MPL-2.0 | yes |
+| `nam` | **nlohmann/json**, vendored inside NeuralAmpModelerCore at that pin | MIT | yes |
+| `nam` | **namz** `v1.1.1` at `9be9ed8448ab2b72ebfd2605808a4b1f0b24c75a` (`https://github.com/darwinscat/namz`) | MIT | yes |
 
 `felitronics::fftpffft` — the optional SIMD FFT backend, built only with `-DFELITRONICS_WITH_PFFFT=ON`
 (default **OFF**, so the default consumer stays header-only with no external code). It vendors the 2-file
@@ -30,6 +34,11 @@ diffs stay byte-clean. The FFTPACK/UCAR licence requires the copyright notice be
 documentation of binary distributions**; that obligation flows to any product that ships this backend (e.g.
 OrbitCab must carry the pffft notice if it enables the SIMD path).
 
+`felitronics::nam` — the optional compiled NAM inference backend, built only with
+`-DFELITRONICS_WITH_NAM=ON` (default **OFF**). NeuralAmpModelerCore and namz are fetched at the pins
+above unless local source overrides are supplied; Eigen and nlohmann/json come from the pinned NAM
+tree. The target carries NAM's architecture-registration whole-archive link contract transitively.
+
 ## Heavy modules (planned — deps land with the module)
 
 These are **not built yet**; listed so the AGPL-compatibility is pre-cleared:
@@ -38,9 +47,6 @@ These are **not built yet**; listed so the AGPL-compatibility is pre-cleared:
 |---|---|---|---|
 | `convolution` | FFT backend — **shipped** as the optional `fftpffft` module (pffft; see above). kissfft stays a possible alternative. | BSD | yes |
 | `convolution` | (a high-quality offline IR resampler — windowed-sinc, original) | — | n/a |
-| `neural` | NeuralAmpModelerCore (NAM) | MIT | yes |
-| `neural` | Eigen | MPL-2.0 | yes |
-| `neural` | nlohmann/json | MIT | yes |
 
 Watch-list (do **not** add without review): ONNX Runtime, anything GPL-incompatible or with a stricter
 copyleft. Each heavy module must also be verified to build under `-fno-exceptions` (some deps use

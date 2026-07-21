@@ -9,23 +9,25 @@ on:
 
 jobs:
   build-test:
-    name: ${{ matrix.os }} pffft=${{ matrix.pffft }}
+    name: ${{ matrix.os }} pffft=${{ matrix.pffft }} nam=${{ matrix.nam }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:          # 3x default (OFF) proves the header-only path on every OS; 2x ON proves the
-          - { os: ubuntu-latest,  pffft: OFF }   #   compiled pffft backend on the two SIMD arches we ship:
-          - { os: macos-latest,   pffft: OFF }   #   x86-64/SSE (ubuntu) + arm64/NEON (macos). The cross-backend
-          - { os: windows-latest, pffft: OFF }   #   NULL suite runs only on the ON rows.
-          - { os: ubuntu-latest,  pffft: ON }
-          - { os: macos-latest,   pffft: ON }
+        include:          # OFF/OFF proves the default header-only path on every toolchain. NAM is also
+          - { os: ubuntu-latest,  pffft: OFF, nam: OFF }   # compiled on all three; pffft ON covers the two SIMD
+          - { os: macos-latest,   pffft: OFF, nam: OFF }   # arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
+          - { os: windows-latest, pffft: OFF, nam: OFF }   # (macos). Its cross-backend NULL suite runs on ON.
+          - { os: macos-latest,   pffft: OFF, nam: ON  }
+          - { os: windows-latest, pffft: OFF, nam: ON  }
+          - { os: ubuntu-latest,  pffft: ON,  nam: ON  }
+          - { os: macos-latest,   pffft: ON,  nam: ON  }
           # windows-latest + pffft ON is a fast-follow (pending a first green MSVC-pffft run); the OFF row
           # already proves the core compiles + tests on Windows.
     steps:
       - uses: actions/checkout@v7   # v5 runs on Node 24 (v4 is pinned to the deprecated Node 20)
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }} -DFELITRONICS_WITH_NAM=${{ matrix.nam }}
       - name: Build
         run: cmake --build build --config Release -j   # --config is required by multi-config gens (VS on Windows)
       - name: Test
@@ -49,6 +51,7 @@ jobs:
           -DFELITRONICS_BUILD_TESTS=ON
           -DFELITRONICS_ENABLE_SANITIZERS=ON
           -DFELITRONICS_WITH_PFFFT=ON
+          -DFELITRONICS_WITH_NAM=ON
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
