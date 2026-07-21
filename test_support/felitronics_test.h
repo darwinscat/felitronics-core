@@ -26,7 +26,8 @@ namespace felitronics::test
     inline void approx (double got, double want, double tol, const std::string& msg)
     {
         ++stats().checks;
-        if (std::fabs (got - want) > tol)
+        // Spell acceptance positively so unordered NaN comparisons cannot pass unnoticed.
+        if (! (std::fabs (got - want) <= tol))
         {
             ++stats().failures;
             std::printf ("    FAIL: %s (got %.6g, want %.6g, tol %.3g)\n", msg.c_str(), got, want, tol);

@@ -18,6 +18,7 @@
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/blend/Blend.h>
 #include <felitronics/blend/Overlay.h>
+#include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
 #include <felitronics/convolution/MatrixConvolver.h>
@@ -69,6 +70,9 @@
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/neural/Inference.h>
 #include <felitronics/neural/NeuralStage.h>
+#if defined(FELITRONICS_WITH_NAM)   // optional compiled NAM backend — public pImpl header is gated with its target
+#include <felitronics/nam/NamStage.h>
+#endif
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
