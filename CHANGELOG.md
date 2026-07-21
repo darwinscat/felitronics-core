@@ -5,6 +5,34 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.13.0 — CabConvolver + opt-in NAM backend (`felitronics::convolution`, `felitronics::nam`)
+
+- **feat(convolution):** `CabConvolver` — the product-level cab IR wrapper moves in from OrbitCab,
+  DSP byte-identical: reference-unity RMS normalization (2 kHz-shaped reference, ±30 dB clamp,
+  −60 dB near-silence floor), fixed NUPC schedule (head 128, 50 ms click-free crossfade),
+  mono-broadcast / LRDiag true-stereo publishing, latest-wins retry of a load rejected
+  mid-crossfade, staged-taps accessor for offline blend analysis. The
+  `FELITRONICS_WITH_PFFFT` backend selection now propagates uniformly through the module's
+  INTERFACE (fftpffft registers before convolution; hygiene/test targets deduped).
+- **feat(nam):** `felitronics::nam` — NEW opt-in compiled module (`FELITRONICS_WITH_NAM`, default
+  OFF, CMake ≥ 3.24). `NamStage` is OrbitCab's `cab::AmpStage` ported verbatim onto
+  `felitronics::neural::NeuralStage` + `felitronics::core::StreamResampler`: dual-instance true
+  stereo, −18 dB loudness makeup with per-model trim, model-rate contract, bounded retire queue
+  with a lossless last-wins pending intent. Loads raw `.nam` and packed `.namz` (namz used
+  directly on std buffers; NAMZ_IMPLEMENTATION is compiled exactly ONCE here — consumers include
+  `<namz.h>` without the define and link this archive). NeuralAmpModelerCore pinned by SHA and
+  linked WHOLE_ARCHIVE (architecture self-registration) with PRIVATE usage requirements — no
+  Eigen/nlohmann/NAM headers leak into consumer TUs; namz pinned by immutable commit; both
+  overridable by fail-loud local-source cache vars. ctest: analytic Linear FIR, namz round-trip +
+  v1 wire compat, loudness/trim makeup, rate-contract refusal against a live model, 70+
+  frozen-audio swap stress (mirror-publication discipline, deferred clear), true-stereo
+  independence, exact 96 kHz latency pin, resampled/truncated IR loads, and a dedicated
+  `EIGEN_RUNTIME_NO_MALLOC` gate (Linear + WaveNet allocation-free; LSTM/ConvNet documented as
+  upstream-allocating at the pin, load-compatible by design). Consumed by OrbitCab (cab::AmpStage
+  / cab::Convolver become aliases) and OrbitCapture NAM's Queue audition player.
+- **test(support):** `approx()` NaN-proofed (unordered comparisons now FAIL); CI adds NAM rows on
+  all three OSes (first MSVC nam_core build) + the sanitizer job, and keeps default OFF/OFF rows.
+
 ## v0.12.0 — decoupled-hop rolling analyzer tap (`felitronics::analysis`)
 
 - **feat(analysis):** `RollingSpectrumTap` — a lock-free SPSC analyzer tap whose snapshot cadence
