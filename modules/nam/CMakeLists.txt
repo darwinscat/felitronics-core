@@ -91,7 +91,14 @@ add_library(felitronics::nam ALIAS felitronics_nam)
 target_include_directories(felitronics_nam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # NamStage.cpp defines NAMZ_IMPLEMENTATION exactly once. Consumers deliberately receive namz's
 # declarations, include <namz.h> without that define, and link the codec symbols from this archive.
-target_include_directories(felitronics_nam SYSTEM PUBLIC ${namz_src_SOURCE_DIR}/include)
+# nlohmann rides along as a USAGE REQUIREMENT of those exported headers — namz's rig headers
+# (namz_rig*.h) publicly include <nlohmann/json.hpp>, so a consumer TU that includes them must be
+# able to resolve it without fetching its own copy. This exports ONLY namz + nlohmann; the NAM/Eigen
+# include dirs stay PRIVATE (see the nam_core link below).
+target_include_directories(felitronics_nam SYSTEM PUBLIC
+    ${namz_src_SOURCE_DIR}/include
+    ${nam_core_src_SOURCE_DIR}/Dependencies/nlohmann
+    ${nam_core_src_SOURCE_DIR}/Dependencies)
 target_compile_features(felitronics_nam PUBLIC cxx_std_20)
 target_compile_definitions(felitronics_nam PUBLIC FELITRONICS_WITH_NAM)
 set_target_properties(felitronics_nam PROPERTIES POSITION_INDEPENDENT_CODE ON)
