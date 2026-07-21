@@ -5,6 +5,13 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.13.1 — nlohmann rides with the exported namz headers (`felitronics::nam`)
+
+- **fix(nam):** namz's rig headers (`namz_rig*.h`) publicly include `<nlohmann/json.hpp>`;
+  consumers reaching them through `felitronics::nam` (OrbitCab's v0.13.0 migration) could not
+  resolve the include. The module now exports namz + nlohmann include dirs as a usage
+  requirement of its shipped headers — NAM/Eigen stay PRIVATE.
+
 ## v0.13.0 — CabConvolver + opt-in NAM backend (`felitronics::convolution`, `felitronics::nam`)
 
 - **feat(convolution):** `CabConvolver` — the product-level cab IR wrapper moves in from OrbitCab,
