@@ -48,4 +48,18 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_dynamics_autoleveler_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_dynamics_autoleveler_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_autoleveler_falsify_tests COMMAND felitronics_dynamics_autoleveler_falsify_tests)
+
+    add_executable(felitronics_dynamics_relativelevel_tests tests/RelativeLevelTests.cpp)
+    target_link_libraries(felitronics_dynamics_relativelevel_tests PRIVATE felitronics::dynamics)
+    target_include_directories(felitronics_dynamics_relativelevel_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_relativelevel_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_relativelevel_tests COMMAND felitronics_dynamics_relativelevel_tests)
+
+    # Links eq as well: the ballistics law is NULLed against a directly measured eq::Svf probe rise,
+    # which is what falsifies it. The dynamics MODULE itself stays independent of eq.
+    add_executable(felitronics_dynamics_ballistics_tests tests/BandBallisticsTests.cpp)
+    target_link_libraries(felitronics_dynamics_ballistics_tests PRIVATE felitronics::dynamics felitronics::eq)
+    target_include_directories(felitronics_dynamics_ballistics_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_ballistics_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_ballistics_tests COMMAND felitronics_dynamics_ballistics_tests)
 endif()
