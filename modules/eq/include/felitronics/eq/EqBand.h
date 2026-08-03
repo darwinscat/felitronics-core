@@ -563,7 +563,9 @@ private:
         bool         active  = false;   // designed on the last updateCoeffs()? (drives the topology reset)
         Svf          delta;             // dynamic gain-delta bell, INSIDE the lane (see setLaneDeltaDb)
         double       deltaDb = 0.0;
-        double       deltaApplied = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed
+        double       deltaApplied = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed,
+        double       freqApplied  = std::numeric_limits<double>::quiet_NaN();   // ... and the freq/Q
+        double       qApplied     = std::numeric_limits<double>::quiet_NaN();   // they were designed at
     };
 
     // Same bit-pattern discipline the params use, so a redesign-skip cannot be tripped by -Wfloat-equal
@@ -577,20 +579,31 @@ private:
     // so the moving part sits exactly where the static curve does.
     void updateDeltaCoeffs() noexcept
     {
-        if (! sameBits (deltaSTDb_, deltaAppliedST_))
+        // Keyed on freq/Q as well as the delta itself: holding a steady delta while the user drags the
+        // node would otherwise leave the moving bell parked at the frequency it was designed for. The
+        // SMOOTHED values are used, so the moving part travels with the static curve during a ramp
+        // instead of jumping to the target ahead of it.
         {
-            const LaneParams& lp = p.lane (Lane::Stereo);
-            deltaST_.setParams (FilterType::Bell, lp.freq, lp.Q, deltaSTDb_);
-            deltaAppliedST_ = deltaSTDb_;
+            const double f = stFreqS_.value(), q = stQS_.value();
+            LaneRt& stDummy = laneRt_[(std::size_t) Lane::Stereo];   // ST keeps its applied-state here
+            if (! sameBits (deltaSTDb_, deltaAppliedST_) || ! sameBits (f, stDummy.freqApplied)
+                || ! sameBits (q, stDummy.qApplied))
+            {
+                deltaST_.setParams (FilterType::Bell, f, q, deltaSTDb_);
+                deltaAppliedST_ = deltaSTDb_;
+                stDummy.freqApplied = f; stDummy.qApplied = q;
+            }
         }
         for (const Lane l : kMonoLanes)
         {
             LaneRt& rt = laneRt_[(std::size_t) l];
-            if (! sameBits (rt.deltaDb, rt.deltaApplied))
+            const double f = rt.freqS.value(), q = rt.qS.value();
+            if (! sameBits (rt.deltaDb, rt.deltaApplied) || ! sameBits (f, rt.freqApplied)
+                || ! sameBits (q, rt.qApplied))
             {
-                const LaneParams& lp = p.lane (l);
-                rt.delta.setParams (FilterType::Bell, lp.freq, lp.Q, rt.deltaDb);
+                rt.delta.setParams (FilterType::Bell, f, q, rt.deltaDb);
                 rt.deltaApplied = rt.deltaDb;
+                rt.freqApplied = f; rt.qApplied = q;
             }
         }
     }

@@ -76,8 +76,14 @@ public:
         for (auto& s : st_)
         {
             s.probe.reset(); s.env.reset(); s.rel.reset(); s.gr.reset();
-            s.deltaDb = 0.0; s.acc = 0;
+            s.deltaDb = 0.0;
+            // Invalidate the retune sentinels too. Svf::prepare() resets STATE but keeps coefficients,
+            // which were baked at the old sample rate (g = tan(pi*f/fs)); if the host re-prepares at a
+            // new rate and the adapter re-sends identical params, "unchanged" would skip the redesign
+            // and leave the probe listening an octave away from the band it drives.
+            s.freq = -1.0; s.Q = -1.0;
         }
+        engaged_ = false;
     }
 
     // Point parameters. A MATERIAL fc/Q change re-arms that lane's estimator adaptation window — a
@@ -93,15 +99,17 @@ public:
             const bool retuned = ! nearlyEqual (lp.freq, s.freq) || ! nearlyEqual (lp.Q, s.Q);
             if (retuned)
             {
-                s.probe.setParams (eq::FilterType::BandPass, lp.freq, lp.Q, 0.0);
+                const double f = probeFreq (lp.freq), q = probeQ (lp.Q);
+                s.probe.setParams (eq::FilterType::BandPass, f, q, 0.0);
                 s.rel.retuned();
-                const auto t = dynamics::BandBallistics::compute (fs_, lp.freq, lp.Q, p.dyn.atk, p.dyn.rel);
+                const auto t = dynamics::BandBallistics::compute (fs_, f, q, p.dyn.atk, p.dyn.rel);
                 s.gr.setTimes (t.attackMs, t.releaseMs);
-                s.freq = lp.freq; s.Q = lp.Q;
+                s.freq = lp.freq; s.Q = lp.Q;   // raw, so retune detection tracks what the caller sent
             }
             else if (! nearlyEqual (p.dyn.atk, dynAtk_) || ! nearlyEqual (p.dyn.rel, dynRel_))
             {
-                const auto t = dynamics::BandBallistics::compute (fs_, lp.freq, lp.Q, p.dyn.atk, p.dyn.rel);
+                const auto t = dynamics::BandBallistics::compute (fs_, probeFreq (lp.freq), probeQ (lp.Q),
+                                                                  p.dyn.atk, p.dyn.rel);
                 s.gr.setTimes (t.attackMs, t.releaseMs);
             }
 
@@ -125,8 +133,20 @@ public:
     void processBand (float* const* audio, const float* const* sidechain,
                       int numChannels, int numSamples, eq::EqBand& band) noexcept
     {
-        if (numSamples <= 0) return;
-        if (! dyn_.on) { band.processBlock (audio, numChannels, numSamples); return; }
+        if (numSamples <= 0 || numChannels <= 0) return;
+        const int nc = std::clamp (numChannels, 1, ch_);
+
+        // Disengaging must not leave the band frozen mid-duck: zero the seams and drop the
+        // detector/programme/GR state once, on the edge. Without this, toggling dynamics off during a
+        // loud passage and back on during a quiet one replays the old gain reduction onto material
+        // that asked for nothing.
+        if (! dyn_.on || sidechain == nullptr)
+        {
+            if (engaged_) { disengage (band); engaged_ = false; }
+            band.processBlock (audio, nc, numSamples);
+            return;
+        }
+        engaged_ = true;
 
         int done = 0;
         while (done < numSamples)
@@ -134,11 +154,15 @@ public:
             const int n = std::min (kControl, numSamples - done);
             float* aud[core::kMaxChannels];
             const float* sc[core::kMaxChannels];
-            const int nc = std::clamp (numChannels, 1, ch_);
             for (int c = 0; c < nc; ++c) { aud[c] = audio[c] + done; sc[c] = sidechain[c] + done; }
 
-            advance (sc, nc, n, band);
+            // AUDIO FIRST, then detect. Detecting this chunk before processing it would let a
+            // transient at sample 15 alter output sample 0 — up to 15 samples of undeclared
+            // look-ahead in a plugin that reports zero latency. Running the band on the delta derived
+            // from the PREVIOUS chunk keeps the path causal; the cost is one control period (0.33 ms)
+            // of delay on the gain, which the ballistics dwarf.
             band.processBlock (aud, nc, n);
+            advance (sc, nc, n, band);
             done += n;
         }
     }
@@ -158,7 +182,6 @@ private:
         double freq = -1.0, Q = -1.0;               // last applied, for retune detection
         double offsetDb = 0.0;                      // knee/2 + headroom: makes "idle" exact
         double deltaDb = 0.0;
-        int    acc = 0;
     };
 
     static constexpr double kRatio      = 4.0;   // fixed: the knob is range, not ratio
@@ -167,6 +190,29 @@ private:
     static bool nearlyEqual (double a, double b) noexcept
     {
         return std::isfinite (a) && std::isfinite (b) && std::fabs (a - b) <= 1.0e-9 * std::fmax (1.0, std::fabs (a));
+    }
+
+    // The SAME rails eq::EqBand applies to itself, so the detector, the ballistics and the filter can
+    // never describe three different bands — and so a NaN freq cannot reach tan() and poison the
+    // follower permanently (env = in + c*(env-in) never recovers from NaN).
+    double probeFreq (double f) const noexcept
+    {
+        return std::clamp (std::isfinite (f) ? f : 1000.0, 10.0, 0.49 * fs_);
+    }
+    static double probeQ (double q) noexcept
+    {
+        return std::clamp (std::isfinite (q) ? q : 1.0, 0.05, 40.0);
+    }
+
+    // Leave the band exactly as an opted-out one: no residual delta, no state that could resume.
+    void disengage (eq::EqBand& band) noexcept
+    {
+        for (int i = 0; i < eq::kNumLanes; ++i)
+        {
+            st_[i].deltaDb = 0.0;
+            st_[i].gr.reset(); st_[i].env.reset(); st_[i].probe.reset(); st_[i].rel.reset();
+            band.setLaneDeltaDb ((eq::Lane) i, 0.0);
+        }
     }
 
     // One control-rate chunk: run every running lane's detector over the SECTION INPUT and push its
@@ -217,14 +263,28 @@ private:
                 target = (double) sign_ * s.gc.deltaDb (levelDb);
             }
 
-            s.deltaDb = (double) s.gr.process ((float) target);
+            // The GR follower's coefficients are PER SAMPLE, so it must be advanced once per sample.
+            // Calling it once per control chunk would stretch every time constant by kControl — a
+            // nominal 1 ms attack would behave like 16 ms, and the amount would depend on the host's
+            // block size (a 17-sample block gives a different factor than a 64-sample one). The
+            // target is what updates at control rate; the smoothing does not.
+            float smoothed = (float) s.deltaDb;
+            for (int k = 0; k < n; ++k) smoothed = s.gr.process ((float) target);
+            s.deltaDb = (double) smoothed;
             band.setLaneDeltaDb (l, s.deltaDb);
+
+            s.probe.flushDenormals(); s.env.flushDenormals(); s.rel.flushDenormals(); s.gr.flushDenormals();
         }
     }
 
     static bool laneRuns (const eq::BandParams& p, eq::Lane l, int nc) noexcept
     {
         if (! p.on || p.bypass) return false;
+        // EqBand's swept branch runs its search SVF and never applies the delta, so a detector here
+        // would drive a seam the audio ignores — and deltaDb() would report gain reduction that is
+        // not happening. Same predicate EqBand::sweptActive uses, via the shared free function, so
+        // the two gates cannot drift apart.
+        if (p.swept && eq::onlyStereoEnabled (p)) return false;
         const eq::LaneParams& lp = p.lane (l);
         if (! lp.on || lp.bypass) return false;
         return l == eq::Lane::Stereo || nc == 2;      // L/R/M/S are stereo-only, as in EqBand
@@ -249,6 +309,7 @@ private:
     eq::DynParams dyn_;
     double        dynAtk_ = 0.5, dynRel_ = 0.5;
     float         sign_ = 1.0f;
+    bool          engaged_ = false;      // was the dynamics path live last call? (edge detect)
     LaneState     st_[eq::kNumLanes];
 };
 

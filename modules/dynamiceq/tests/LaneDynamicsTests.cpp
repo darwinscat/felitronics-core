@@ -146,9 +146,11 @@ int main()
         test::ok (identical, "an opted-out point is untouched by the composition layer");
     }
 
-    // The failure Fable found: an up-lifting band in silence sees a huge "under" and rails its boost
-    // onto the noise floor unless the COMPUTER'S INPUT is gated, not merely the estimator.
-    test::group ("silence does not rail an up-lifting band onto the noise floor");
+    // Was vacuous once: with a POSITIVE range and an inverted DownCompress, far-below-threshold
+    // silence already yields a zero target, so the test passed even with the gate removed. It now
+    // drives the gate directly — a very quiet but NON-silent tail, where the estimator is held and
+    // the relative level would otherwise read as a large excess.
+    test::group ("a held estimator cannot manufacture gain reduction on a decaying tail");
     {
         eq::BandParams p = dynBell (3000.0, 4.0, +12.0);      // positive range: lift when loud
         eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
@@ -171,10 +173,111 @@ int main()
                 dyn.processBand (aud, sc, 2, block, band);
             }
         };
-        feed (core::dbToGain (-20.0), 4.0);       // programme
-        feed (0.0, 3.0);                          // digital silence
+        feed (core::dbToGain (-20.0), 5.0);       // programme: the estimator learns -20
+        feed (core::dbToGain (-115.0), 3.0);      // a tail BELOW the activity floor, but NOT digital zero
         test::ok (std::fabs (dyn.deltaDb (eq::Lane::Stereo)) < 1.0,
-                  "the delta returns toward 0 in silence instead of railing at +range");
+                  "the gate holds the delta at 0 on a sub-floor tail");
+
+        // The converse, so the gate is not merely "always off": genuine programme still engages.
+        feed (core::dbToGain (-20.0), 4.0);
+        feed (core::dbToGain (-4.0), 0.4);        // a real 16 dB event over the learned programme
+        test::ok (dyn.deltaDb (eq::Lane::Stereo) > 1.0, "a real event still lifts (range is positive)");
+    }
+
+    // THE CADENCE BUG. GainReductionFollower's coefficients are PER SAMPLE. Advancing it once per
+    // control chunk stretched every time constant by kControl — a 1 ms attack behaved like 16 ms —
+    // and made the amount depend on the host block size, since a 17-sample block splits 16+1 while a
+    // 64-sample one splits 16+16+16+16. Both properties are pinned here.
+    test::group ("attack timing is real, and independent of the host block size");
+    {
+        // Time to reach 3 dB of reduction after a 20 dB step over the learned programme. An absolute
+        // threshold, deliberately: it needs no reference run and cannot degenerate when the settled
+        // value is small.
+        auto attackMs = [&] (int block)
+        {
+            eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
+            eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
+            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+
+            std::vector<float> L ((size_t) block), R ((size_t) block);
+            long phase = 0;
+            auto feed = [&] (double amp, double sec, bool timed) -> double
+            {
+                const int n = (int) (fs * sec);
+                for (int done = 0; done < n; done += block)
+                {
+                    for (int i = 0; i < block; ++i, ++phase)
+                    {
+                        const float v = (float) (amp * std::sin (2.0 * core::kPi * 3000.0 * (double) phase / fs));
+                        L[(size_t) i] = R[(size_t) i] = v;
+                    }
+                    float* aud[2] { L.data(), R.data() };
+                    const float* sc[2] { L.data(), R.data() };
+                    dyn.processBand (aud, sc, 2, block, band);
+                    if (timed && dyn.deltaDb (eq::Lane::Stereo) <= -3.0)
+                        return 1.0e3 * (double) (done + block) / fs;   // end of the chunk that got there
+                }
+                return -1.0;
+            };
+            feed (core::dbToGain (-30.0), 6.0, false);          // learn the programme
+            return feed (core::dbToGain (-10.0), 0.5, true);    // step, and time the rise
+        };
+
+        const double a64 = attackMs (64), a17 = attackMs (17), a15 = attackMs (15);
+        test::ok (a64 > 0.0 && a17 > 0.0 && a15 > 0.0, "attack measurable at every block size");
+        // Auto attack at 3 kHz / Q 4 is a few ms. The pre-fix code advanced the follower once per
+        // 16-sample chunk, stretching every constant by ~16x — this bound is what fails then.
+        test::ok (a64 < 25.0, "attack is the order the ballistics asked for, not 16x slower");
+        test::ok (std::fabs (a17 - a64) < 3.0, "a 17-sample block times like a 64-sample one");
+        test::ok (std::fabs (a15 - a64) < 3.0, "a 15-sample block times like a 64-sample one");
+    }
+
+    // Every other test drives the ST lane only — a sign error in laneSignal(Side) would have passed
+    // the whole suite. These exercise the derivations the product actually rests on.
+    test::group ("the M/S and L/R lanes detect their own domain");
+    {
+        auto lanePeak = [&] (eq::Lane lane, bool sideOnlyContent)
+        {
+            eq::BandParams p;
+            p.on = true; p.type = eq::FilterType::Bell;
+            p.lane (eq::Lane::Stereo).on = false;
+            eq::LaneParams& lp = p.lane (lane);
+            lp.on = true; lp.freq = 3000.0; lp.Q = 4.0; lp.gainDb = 0.0;
+            p.dyn.on = true; p.dyn.rangeDb = -12.0; p.dyn.thrAuto = true;
+
+            eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
+            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+
+            const int block = 64;
+            std::vector<float> L ((size_t) block), R ((size_t) block);
+            long phase = 0;
+            double deepest = 0.0;
+            const int total = (int) (fs * 8.0);
+            for (int done = 0; done < total; done += block)
+            {
+                for (int i = 0; i < block; ++i, ++phase)
+                {
+                    const double t = (double) phase / fs;
+                    const bool burst = std::fmod (t, 1.0) > 0.75;
+                    const double amp = core::dbToGain (-30.0 + (burst ? 14.0 : 0.0));
+                    const float v = (float) (amp * std::sin (2.0 * core::kPi * 3000.0 * t));
+                    // Side-only content: L = +v, R = -v (mid cancels). Otherwise mono (side cancels).
+                    L[(size_t) i] = v;
+                    R[(size_t) i] = sideOnlyContent ? -v : v;
+                }
+                float* aud[2] { L.data(), R.data() };
+                const float* sc[2] { L.data(), R.data() };
+                dyn.processBand (aud, sc, 2, block, band);
+                if ((double) done / fs > 3.0) deepest = std::fmin (deepest, dyn.deltaDb (lane));
+            }
+            return deepest;
+        };
+
+        test::ok (lanePeak (eq::Lane::Mid,  false) < -1.0, "a Mid lane engages on mono content");
+        test::ok (lanePeak (eq::Lane::Mid,  true)  > -0.5, "and stays idle when the content is side-only");
+        test::ok (lanePeak (eq::Lane::Side, true)  < -1.0, "a Side lane engages on side-only content");
+        test::ok (lanePeak (eq::Lane::Side, false) > -0.5, "and stays idle when the content is mono");
+        test::ok (lanePeak (eq::Lane::Left, false) < -1.0, "an L lane engages");
     }
 
     return test::report();
