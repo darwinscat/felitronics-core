@@ -21,7 +21,7 @@ static eq::BandParams dynBell (double freq, double Q, double rangeDb, bool on = 
     p.on = true; p.type = eq::FilterType::Bell;
     eq::LaneParams& st = p.lane (eq::Lane::Stereo);
     st.on = true; st.freq = freq; st.Q = Q; st.gainDb = 0.0;
-    p.dyn.on = on; p.dyn.rangeDb = rangeDb; p.dyn.thrAuto = true;
+    p.dyn.on = on; p.dyn.rangeDb = rangeDb;
     return p;
 }
 
@@ -243,7 +243,7 @@ int main()
             p.lane (eq::Lane::Stereo).on = false;
             eq::LaneParams& lp = p.lane (lane);
             lp.on = true; lp.freq = 3000.0; lp.Q = 4.0; lp.gainDb = 0.0;
-            p.dyn.on = true; p.dyn.rangeDb = -12.0; p.dyn.thrAuto = true;
+            p.dyn.on = true; p.dyn.rangeDb = -12.0;
 
             eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
             dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);

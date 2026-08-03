@@ -121,7 +121,6 @@ public:
             const double knee = std::min (6.0, 1.5 * range);
             s.gc.setKneeDb (knee);
             s.offsetDb = knee * 0.5 + kHeadroomDb;
-            s.gc.setThresholdDb (p.dyn.thrAuto ? 0.0 : p.dyn.thrDb);
         }
         dynAtk_ = p.dyn.atk; dynRel_ = p.dyn.rel;
         dyn_ = p.dyn;
@@ -249,19 +248,12 @@ private:
             s.rel.update (n);
 
             const double levelDb = core::gainToDb (std::fmax ((double) linked, 1.0e-9));
-            double target = 0.0;
-            if (dyn_.thrAuto)
-            {
-                // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
-                // level of 0 still asks for knee/8 * slope, so an up-lifting band would ride the
-                // noise floor through every pause.
-                if (s.rel.activity())
-                    target = (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb);
-            }
-            else
-            {
-                target = (double) sign_ * s.gc.deltaDb (levelDb);
-            }
+            // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative level
+            // of 0 still asks for knee/8 * slope, so an up-lifting band would ride the noise floor up
+            // through every pause.
+            const double target = s.rel.activity()
+                                ? (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb)
+                                : 0.0;
 
             // The GR follower's coefficients are PER SAMPLE, so it must be advanced once per sample.
             // Calling it once per control chunk would stretch every time constant by kControl — a

@@ -80,23 +80,28 @@ struct LaneParams
 // different dynamics per domain is what fission is for: split the point.
 //
 // `range` is the one number a user is expected to set; its SIGN is the direction (negative = pull
-// down as the region gets loud, the common move). Threshold is auto by default — see
-// dynamics::RelativeLevel for what "auto" can and cannot observe — and attack/release are deviations
-// from values derived from the band's own fc/Q by dynamics::BandBallistics, 0.5 meaning "auto".
+// down as the region gets loud, the common move). Attack/release are deviations from values derived
+// from the band's own fc/Q by dynamics::BandBallistics, 0.5 meaning "auto".
+//
+// THERE IS NO MANUAL THRESHOLD, deliberately. The threshold is always relative to the lane's own
+// programme level, because that is the ONLY thing that makes one shared setting meaningful across
+// lanes 20+ dB apart. An absolute dBFS threshold handed to all of them would be well defined in one
+// domain and meaningless in the next. See dynamics::RelativeLevel for what "relative" can and cannot
+// observe: it reacts to departures from a signal's own recent norm, not to a permanently excessive
+// band — that is what the static gain on the same node is for. If an absolute threshold is ever
+// wanted, it arrives as a NEW field (additive, sessions default it); shipping one now would freeze a
+// semantic we have not decided — absolute or relative, shared or per-lane.
 struct DynParams
 {
     bool   on      = false;
     double rangeDb = 0.0;      // signed cap on the delta; 0 == no dynamics
-    double thrDb   = 0.0;      // absolute threshold, used only when thrAuto is false
-    bool   thrAuto = true;     // track the lane's own programme level instead
     double atk     = 0.5;      // 0..1 deviation, 0.5 == the automatic value
     double rel     = 0.5;
 
     bool operator== (const DynParams& o) const noexcept
     {
         auto bits = [] (double d) noexcept { return std::bit_cast<std::uint64_t> (d); };
-        return on == o.on && thrAuto == o.thrAuto
-            && bits (rangeDb) == bits (o.rangeDb) && bits (thrDb) == bits (o.thrDb)
+        return on == o.on && bits (rangeDb) == bits (o.rangeDb)
             && bits (atk) == bits (o.atk) && bits (rel) == bits (o.rel);
     }
 };
