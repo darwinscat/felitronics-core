@@ -14,3 +14,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamiceq_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamiceq_tests COMMAND felitronics_dynamiceq_tests)
 endif()
+
+if(FELITRONICS_BUILD_TESTS)
+    # The lanes-aware composition layer (eq's delta seam + the dynamics primitives).
+    add_executable(felitronics_dynamiceq_lanes_tests tests/LaneDynamicsTests.cpp)
+    target_link_libraries(felitronics_dynamiceq_lanes_tests PRIVATE felitronics::dynamiceq)
+    target_include_directories(felitronics_dynamiceq_lanes_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamiceq_lanes_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamiceq_lanes_tests COMMAND felitronics_dynamiceq_lanes_tests)
+endif()

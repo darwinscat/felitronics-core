@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <vector>
 #include <atomic>
 #include <cmath>
 #include <complex>
@@ -33,13 +34,47 @@ public:
     static constexpr int kMaxBands    = 24;
     static constexpr int kMaxChannels = EqBand::kMaxChannels;
 
-    void prepare (double sampleRate, int /*maxBlock*/, int numChannels) noexcept
+    void prepare (double sampleRate, int maxBlock, int numChannels) noexcept
     {
         fs = sampleRate;
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
+        maxBlock_ = maxBlock > 0 ? maxBlock : 0;
+        // Sidechain scratch: the SECTION INPUT, preserved before any band touches the signal. A
+        // dynamics layer must detect on this and not on a band's own input — in a series chain that
+        // input is the previous bands' OUTPUT, so their moving deltas would modulate later detectors
+        // at overlapping frequencies and the chain would pump. Allocated here, never in process().
+        // maxBlock 0 (or a consumer that never asks) costs nothing.
+        scratch_.assign ((std::size_t) (maxBlock_ * ch), 0.0f);
+        for (int c = 0; c < kMaxChannels; ++c)
+            scPtr_[c] = (c < ch && maxBlock_ > 0) ? scratch_.data() + (std::size_t) c * (std::size_t) maxBlock_
+                                                  : nullptr;
+        scValid_ = 0;
         for (auto& b : bands) b.prepare (fs, ch);
         reset();
     }
+
+    // Capture this block's SECTION INPUT into the scratch buffer, then hand it back. Call at the top
+    // of a block, BEFORE processing any band; the pointers stay valid until the next capture. Returns
+    // nullptr if prepare() was given no maxBlock or the block is larger than promised — a caller that
+    // gets nullptr must skip its dynamics rather than detect on the wrong signal.
+    const float* const* captureSectionInput (const float* const* channels, int numChannels, int numSamples) noexcept
+    {
+        const int nc = numChannels < ch ? numChannels : ch;
+        if (nc <= 0 || numSamples <= 0 || numSamples > maxBlock_ || scratch_.empty()) { scValid_ = 0; return nullptr; }
+        for (int c = 0; c < nc; ++c)
+            std::copy (channels[c], channels[c] + numSamples, scPtr_[c]);
+        scValid_ = numSamples;
+        return scPtr_;
+    }
+
+    int  sectionInputSamples() const noexcept { return scValid_; }
+
+    // Direct band access, so a composition layer can interleave "compute this band's deltas" with
+    // "run this band" — the order dynamics requires, and one this engine deliberately does not
+    // hard-code, since it knows nothing about what drives it.
+    EqBand&       bandAt (int i)       noexcept { return bands[(size_t) std::clamp (i, 0, kMaxBands - 1)]; }
+    const EqBand& bandAt (int i) const noexcept { return bands[(size_t) std::clamp (i, 0, kMaxBands - 1)]; }
+    static constexpr int bandCount() noexcept { return kMaxBands; }   // not "numBands": several statics here already take that as a PARAMETER
 
     void reset() noexcept
     {
@@ -148,6 +183,9 @@ private:
     std::atomic<bool> spectrumOn { false };
 
     std::array<EqBand, kMaxBands> bands;
+    std::vector<float> scratch_;                 // section-input capture (see captureSectionInput)
+    float*             scPtr_[kMaxChannels] {};
+    int                maxBlock_ = 0, scValid_ = 0;
     SpectrumTap inTap, outTap;
 };
 

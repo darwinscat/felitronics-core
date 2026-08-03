@@ -73,16 +73,45 @@ struct LaneParams
     }
 };
 
+// Optional dynamics for a point. POINT-LEVEL, not per lane: every running lane gets its own detector
+// and its own delta (each probes its own freq/Q on its own signal), but they SHARE these settings.
+// That is only sound because the threshold is auto-relative — an absolute dBFS threshold shared
+// between a Mid and a Side lane, which can sit 20+ dB apart, would be meaningless. Wanting genuinely
+// different dynamics per domain is what fission is for: split the point.
+//
+// `range` is the one number a user is expected to set; its SIGN is the direction (negative = pull
+// down as the region gets loud, the common move). Threshold is auto by default — see
+// dynamics::RelativeLevel for what "auto" can and cannot observe — and attack/release are deviations
+// from values derived from the band's own fc/Q by dynamics::BandBallistics, 0.5 meaning "auto".
+struct DynParams
+{
+    bool   on      = false;
+    double rangeDb = 0.0;      // signed cap on the delta; 0 == no dynamics
+    double thrDb   = 0.0;      // absolute threshold, used only when thrAuto is false
+    bool   thrAuto = true;     // track the lane's own programme level instead
+    double atk     = 0.5;      // 0..1 deviation, 0.5 == the automatic value
+    double rel     = 0.5;
+
+    bool operator== (const DynParams& o) const noexcept
+    {
+        auto bits = [] (double d) noexcept { return std::bit_cast<std::uint64_t> (d); };
+        return on == o.on && thrAuto == o.thrAuto
+            && bits (rangeDb) == bits (o.rangeDb) && bits (thrDb) == bits (o.thrDb)
+            && bits (atk) == bits (o.atk) && bits (rel) == bits (o.rel);
+    }
+};
+
 // One band ("point"): a filter of one shared `type`, split across a set of placement lanes. The plugin
 // adapter maps APVTS params into this; the engine owns no parameter system of its own (framework-
 // agnostic). A fresh band reproduces the pre-lanes default exactly: point off, one Stereo lane enabled
-// at 1 kHz / Q 1 / 0 dB / slope 12, all other lanes off.
+// at 1 kHz / Q 1 / 0 dB / slope 12, all other lanes off, dynamics off.
 struct BandParams
 {
     bool       on     = false;               // the point exists
     FilterType type   = FilterType::Bell;    // SHARED by all lanes (decision #2)
     bool       swept  = false;               // search band; honored only in the single-ST configuration
     bool       bypass = false;               // whole-point bypass (strip power button)
+    DynParams  dyn;                          // SHARED by all lanes (see DynParams)
     LaneParams lanes[kNumLanes] { { true }, {}, {}, {}, {} };   // lanes[Stereo].on = true, the rest off
 
     // Index a lane by its enum (the array is public, but this reads without the static_cast noise).
@@ -94,6 +123,7 @@ struct BandParams
     bool operator== (const BandParams& o) const noexcept
     {
         if (! (on == o.on && type == o.type && swept == o.swept && bypass == o.bypass)) return false;
+        if (! (dyn == o.dyn)) return false;
         for (int i = 0; i < kNumLanes; ++i) if (! (lanes[i] == o.lanes[i])) return false;
         return true;
     }
