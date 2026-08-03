@@ -328,5 +328,54 @@ int main()
         test::approx (cut,   flat, 0.5, "a -12 dB static cut does not change the dynamics either");
     }
 
+    // THE GAP THE ABSOLUTE MODE EXISTS TO CLOSE, measured during a falsification round: a dark source
+    // whose band energy sits under the activity floor BETWEEN events gives the relative estimator
+    // nothing but the events themselves to learn from, so the excess collapses and the de-esser does
+    // nothing. Same programme, both modes, side by side.
+    test::group ("absolute threshold reaches events a relative one cannot see");
+    {
+        auto deepest = [&] (bool absolute, double floorDb, double burstDb)
+        {
+            eq::BandParams p = dynBell (7000.0, 3.5, -12.0);
+            p.dyn.thrAuto = ! absolute;
+            p.dyn.thrDb   = -50.0;                 // well under the bursts, well over the gaps
+            eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
+            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+
+            const int block = 64;
+            std::vector<float> L ((size_t) block), R ((size_t) block);
+            long phase = 0;
+            double d = 0.0;
+            for (int done = 0; done < (int) (fs * 8.0); done += block)
+            {
+                for (int i = 0; i < block; ++i, ++phase)
+                {
+                    const double t = (double) phase / fs;
+                    const bool burst = std::fmod (t, 1.0) > 0.8;         // 200 ms sibilant per second
+                    const double amp = core::dbToGain (burst ? burstDb : floorDb);
+                    const float v = (float) (amp * std::sin (2.0 * core::kPi * 7000.0 * t));
+                    L[(size_t) i] = R[(size_t) i] = v;
+                }
+                float* aud[2] { L.data(), R.data() };
+                const float* sc[2] { L.data(), R.data() };
+                dyn.processBand (aud, sc, 2, block, band);
+                if ((double) done / fs > 3.0) d = std::fmin (d, dyn.deltaDb (eq::Lane::Stereo));
+            }
+            return d;
+        };
+
+        // A dark source: -95 dBFS between sibilants, -40 dBFS bursts. Audible sibilance, no reference.
+        const double rel = deepest (false, -95.0, -40.0);
+        const double abs = deepest (true,  -95.0, -40.0);
+        // A -40 dBFS burst sits ~7 dB over the -50 threshold, so a 4:1 slope asks for a few dB —
+        // the point is that it acts AT ALL, and that the relative mode does not.
+        test::ok (abs < -2.0, "the absolute threshold treats the sibilant");
+        test::ok (abs < rel - 1.5, "and reaches an event the relative mode cannot see");
+
+        // Below the absolute threshold nothing happens, in either direction — no gate needed.
+        test::ok (std::fabs (deepest (true, -95.0, -60.0)) < 0.5,
+                  "material entirely under the threshold is left alone");
+    }
+
     return test::report();
 }

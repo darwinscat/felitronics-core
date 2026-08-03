@@ -121,6 +121,10 @@ public:
             const double knee = std::min (6.0, 1.5 * range);
             s.gc.setKneeDb (knee);
             s.offsetDb = knee * 0.5 + kHeadroomDb;
+            // Relative mode leaves the computer's threshold at 0 and feeds it a relative level;
+            // absolute mode puts the user's dBFS in and feeds it the raw level. One write per
+            // param change either way — never per sample.
+            s.gc.setThresholdDb (p.dyn.thrAuto ? 0.0 : p.dyn.thrDb);
         }
         dynAtk_ = p.dyn.atk; dynRel_ = p.dyn.rel;
         dyn_ = p.dyn;
@@ -258,12 +262,27 @@ private:
                 s.rel.accumulate (linked);
 
                 const double levelDb = core::gainToDb (std::fmax ((double) linked, 1.0e-9));
-                // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
-                // level of 0 still asks for knee/8 * slope, so an up-lifting band would ride the
-                // noise floor up through every pause.
-                const double target = s.rel.activity()
-                                    ? (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb)
-                                    : 0.0;
+                // The two modes must move TOGETHER — the computer's threshold and the level fed to it
+                // are ONE decision. Setting an absolute threshold while still feeding a relative
+                // level produced full-range reduction on material 20 dB UNDER the threshold.
+                double target = 0.0;
+                if (dyn_.thrAuto)
+                {
+                    // Relative: threshold pinned at 0, level expressed as excess over the programme.
+                    // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
+                    // level of 0 still asks for knee/8 * slope, so an up-lifting band would ride the
+                    // noise floor up through every pause.
+                    if (s.rel.activity())
+                        target = (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb);
+                }
+                else
+                {
+                    // Absolute: the user's dBFS IS the threshold and the raw level goes in. No
+                    // activity gate — material below the threshold yields no excess and no delta in
+                    // either direction, and gating would silence exactly the quiet-but-real events
+                    // (a sibilant over a dark source) this mode exists to reach.
+                    target = (double) sign_ * s.gc.deltaDb (levelDb);
+                }
                 smoothed = s.gr.process ((float) target);
             }
             s.rel.update (n);

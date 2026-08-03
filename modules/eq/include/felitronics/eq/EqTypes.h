@@ -83,25 +83,39 @@ struct LaneParams
 // down as the region gets loud, the common move). Attack/release are deviations from values derived
 // from the band's own fc/Q by dynamics::BandBallistics, 0.5 meaning "auto".
 //
-// THERE IS NO MANUAL THRESHOLD, deliberately. The threshold is always relative to the lane's own
-// programme level, because that is the ONLY thing that makes one shared setting meaningful across
-// lanes 20+ dB apart. An absolute dBFS threshold handed to all of them would be well defined in one
-// domain and meaningless in the next. See dynamics::RelativeLevel for what "relative" can and cannot
-// observe: it reacts to departures from a signal's own recent norm, not to a permanently excessive
-// band — that is what the static gain on the same node is for. If an absolute threshold is ever
-// wanted, it arrives as a NEW field (additive, sessions default it); shipping one now would freeze a
-// semantic we have not decided — absolute or relative, shared or per-lane.
+// TWO THRESHOLD MODES, and the default is the interesting one.
+//
+// `thrAuto` (default) is RELATIVE: each lane measures against its own programme level, which is what
+// lets one shared setting mean the same thing in Mid and in Side. It reacts to departures from a
+// signal's recent norm — sibilance, a resonance ringing on one note — and by construction it cannot
+// keep treating a level that has BECOME the norm.
+//
+// That last property is a real gap, not a philosophical one, and it is why the absolute mode exists.
+// Measured: a dark source whose 7 kHz sits under the activity floor BETWEEN sibilants gives the
+// estimator nothing but the sibilants themselves to learn from, so the relative excess collapses to
+// ~0 and the de-esser does nothing (0.117 dB of reduction where the same programme 40 dB louder got
+// the full 12). A relative threshold also cannot express "keep this band under X dBFS", nor treat a
+// chorus that is harsher for thirty seconds — the estimator absorbs it within a few.
+//
+// `thrAuto == false` uses `thrDb` as a plain dBFS threshold. It is POINT-level like everything here,
+// so every lane of a split point shares it: predictable (a louder domain crosses it more often) but
+// asymmetric, and a user who wants genuinely different thresholds per domain uses fission, exactly
+// as with every other shared setting. Auto remains the default precisely because the absolute mode
+// is the one that needs a level-aware user.
 struct DynParams
 {
     bool   on      = false;
     double rangeDb = 0.0;      // signed cap on the delta; 0 == no dynamics
+    double thrDb   = -24.0;    // ABSOLUTE threshold, dBFS — used only when thrAuto is false
+    bool   thrAuto = true;     // default: relative to the lane's own programme level
     double atk     = 0.5;      // 0..1 deviation, 0.5 == the automatic value
     double rel     = 0.5;
 
     bool operator== (const DynParams& o) const noexcept
     {
         auto bits = [] (double d) noexcept { return std::bit_cast<std::uint64_t> (d); };
-        return on == o.on && bits (rangeDb) == bits (o.rangeDb)
+        return on == o.on && thrAuto == o.thrAuto
+            && bits (rangeDb) == bits (o.rangeDb) && bits (thrDb) == bits (o.thrDb)
             && bits (atk) == bits (o.atk) && bits (rel) == bits (o.rel);
     }
 };
