@@ -113,7 +113,7 @@ public:
                 s.gr.setTimes (t.attackMs, t.releaseMs);
             }
 
-            const double range = std::fabs (p.dyn.rangeDb);
+            const double range = std::clamp (std::fabs (finiteOr (p.dyn.rangeDb, 0.0)), 0.0, 30.0);
             s.gc.setRangeDb (range);
             // Knee scaled off range so a small range keeps a proportionate corner instead of a 6 dB
             // smear, and offset by knee/2 so "idle on stationary programme" is EXACT: the steady-state
@@ -124,8 +124,15 @@ public:
             // Relative mode leaves the computer's threshold at 0 and feeds it a relative level;
             // absolute mode puts the user's dBFS in and feeds it the raw level. One write per
             // param change either way — never per sample.
-            s.gc.setThresholdDb (p.dyn.thrAuto ? 0.0 : p.dyn.thrDb);
+            s.gc.setThresholdDb (p.dyn.thrAuto ? 0.0
+                                               : std::clamp (finiteOr (p.dyn.thrDb, -24.0), -120.0, 24.0));
         }
+        // Switching threshold mode is an operator action, and the two modes measure different
+        // things — releasing an absolute-mode reduction into relative mode would apply gain nothing
+        // asked for. Drop it, the same hard-step semantic a lane enable already has.
+        if (p.dyn.thrAuto != dyn_.thrAuto)
+            for (auto& st : st_) { st.gr.reset(); st.deltaDb = 0.0; }
+
         dynAtk_ = p.dyn.atk; dynRel_ = p.dyn.rel;
         dyn_ = p.dyn;
         sign_ = (p.dyn.rangeDb < 0.0) ? 1.0f : -1.0f;   // range<0 = cut when loud (DownCompress as-is)
@@ -191,6 +198,8 @@ private:
 
     static constexpr double kRatio      = 4.0;   // fixed: the knob is range, not ratio
     static constexpr double kHeadroomDb = 3.0;   // how far above "normal" a peak must sit to engage
+
+    static double finiteOr (double v, double fb) noexcept { return std::isfinite (v) ? v : fb; }
 
     static bool nearlyEqual (double a, double b) noexcept
     {

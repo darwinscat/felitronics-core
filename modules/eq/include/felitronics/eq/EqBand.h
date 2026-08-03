@@ -684,6 +684,15 @@ private:
             lp.Q      = std::clamp (finiteOr (lp.Q, 1.0), 0.05, 40.0);
             lp.gainDb = std::clamp (finiteOr (lp.gainDb, 0.0), -30.0, 30.0);
         }
+        // Dynamics rails. Without them an absurd threshold makes digital silence earn the full range
+        // (the detector level is floored, so a threshold below that floor is permanently exceeded),
+        // and a huge range overflows float on its way into the gain follower, poisoning the meter
+        // with NaN until the next reset. +24 dBFS on the threshold because float hosts legitimately
+        // run hot inside a chain.
+        np.dyn.rangeDb = std::clamp (finiteOr (np.dyn.rangeDb, 0.0), -30.0, 30.0);
+        np.dyn.thrDb   = std::clamp (finiteOr (np.dyn.thrDb, -24.0), -120.0, 24.0);
+        np.dyn.atk     = std::clamp (finiteOr (np.dyn.atk, 0.5), 0.0, 1.0);
+        np.dyn.rel     = std::clamp (finiteOr (np.dyn.rel, 0.5), 0.0, 1.0);
         return np;
     }
 
