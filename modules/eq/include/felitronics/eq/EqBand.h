@@ -336,8 +336,19 @@ public:
     {
         resetST();
         for (const Lane l : kMonoLanes) resetLane (laneRt_[(std::size_t) l]);
-        deltaST_.reset();
-        for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.reset();
+        // Reset must leave NO live delta: the seam is state like any other, and a stream restart that
+        // kept it would apply the previous stream's gain reduction to the first block of the new one.
+        deltaST_.reset(); deltaSTDb_ = 0.0;
+        deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            rt.delta.reset(); rt.deltaDb = 0.0;
+            // Invalidate the design keys too — prepare() may have changed the sample rate, and Svf
+            // keeps coefficients baked with g = tan(pi*f/fs) across a prepare().
+            rt.deltaApplied = rt.freqApplied = rt.qApplied = std::numeric_limits<double>::quiet_NaN();
+        }
+        stFreqApplied_ = stQApplied_ = std::numeric_limits<double>::quiet_NaN();
     }
 
     //==========================================================================
@@ -585,13 +596,12 @@ private:
         // instead of jumping to the target ahead of it.
         {
             const double f = stFreqS_.value(), q = stQS_.value();
-            LaneRt& stDummy = laneRt_[(std::size_t) Lane::Stereo];   // ST keeps its applied-state here
-            if (! sameBits (deltaSTDb_, deltaAppliedST_) || ! sameBits (f, stDummy.freqApplied)
-                || ! sameBits (q, stDummy.qApplied))
+            if (! sameBits (deltaSTDb_, deltaAppliedST_) || ! sameBits (f, stFreqApplied_)
+                || ! sameBits (q, stQApplied_))
             {
                 deltaST_.setParams (FilterType::Bell, f, q, deltaSTDb_);
                 deltaAppliedST_ = deltaSTDb_;
-                stDummy.freqApplied = f; stDummy.qApplied = q;
+                stFreqApplied_ = f; stQApplied_ = q;
             }
         }
         for (const Lane l : kMonoLanes)
@@ -778,7 +788,9 @@ private:
     Svf          svf_;
     Svf          deltaST_;             // dynamic gain-delta bell for the ST lane (per channel)
     double       deltaSTDb_ = 0.0;
-    double       deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed
+    double       deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed,
+    double       stFreqApplied_  = std::numeric_limits<double>::quiet_NaN();   // ... and the freq/Q
+    double       stQApplied_     = std::numeric_limits<double>::quiet_NaN();   // they were designed at
 
     // L / R / M / S lanes. Indexed by Lane; the [Lane::Stereo] entry is unused (the ST lane keeps the
     // per-channel columns above) — a trivial, deliberate slot for index-by-enum clarity.

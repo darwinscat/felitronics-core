@@ -280,5 +280,53 @@ int main()
         test::ok (lanePeak (eq::Lane::Left, false) < -1.0, "an L lane engages");
     }
 
+    // Static gain must not perturb the dynamics: detector and programme estimate both derive from
+    // the same tap, so a gain shift cancels in relativeDb(). Worth pinning — it is why dragging a
+    // band's gain does not make its dynamics lurch.
+    //
+    // NOTE, so nobody mistakes its reach: this does NOT pin the section-input tap. Swapping the probe
+    // to the band's own output still passes, precisely BECAUSE the threshold is relative — the shift
+    // cancels there too. Distinguishing the two taps needs the feedback path the wrong tap creates
+    // (a delta that feeds its own detector self-limits), and that test is still owed.
+    test::group ("a static gain change does not perturb the dynamics");
+    {
+        auto deepestWithStaticGain = [&] (double staticGainDb)
+        {
+            eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
+            p.lane (eq::Lane::Stereo).gainDb = staticGainDb;
+            eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
+            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+
+            const int block = 64;
+            std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
+            long phase = 0;
+            double deepest = 0.0;
+            for (int done = 0; done < (int) (fs * 8.0); done += block)
+            {
+                for (int i = 0; i < block; ++i, ++phase)
+                {
+                    const double t = (double) phase / fs;
+                    const bool burst = std::fmod (t, 1.0) > 0.75;
+                    const double amp = core::dbToGain (-30.0 + (burst ? 14.0 : 0.0));
+                    const float v = (float) (amp * std::sin (2.0 * core::kPi * 3000.0 * t));
+                    L[(size_t) i] = R[(size_t) i] = v;
+                    sl[(size_t) i] = sr[(size_t) i] = v;      // the section input, kept pristine
+                }
+                float* aud[2] { L.data(), R.data() };
+                const float* sc[2] { sl.data(), sr.data() };
+                dyn.processBand (aud, sc, 2, block, band);
+                if ((double) done / fs > 3.0) deepest = std::fmin (deepest, dyn.deltaDb (eq::Lane::Stereo));
+            }
+            return deepest;
+        };
+
+        const double flat  = deepestWithStaticGain (0.0);
+        const double boost = deepestWithStaticGain (+12.0);
+        const double cut   = deepestWithStaticGain (-12.0);
+        test::ok (flat < -1.0, "the burst drives gain reduction at all");
+        test::approx (boost, flat, 0.5, "a +12 dB static boost does not change the dynamics");
+        test::approx (cut,   flat, 0.5, "a -12 dB static cut does not change the dynamics either");
+    }
+
     return test::report();
 }

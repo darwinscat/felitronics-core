@@ -139,7 +139,9 @@ public:
         // detector/programme/GR state once, on the edge. Without this, toggling dynamics off during a
         // loud passage and back on during a quiet one replays the old gain reduction onto material
         // that asked for nothing.
-        if (! dyn_.on || sidechain == nullptr)
+        // rangeDb == 0 is documented as "no dynamics", so it must DISENGAGE, not merely target zero:
+        // otherwise the last earned delta stays applied while the follower releases toward it.
+        if (! dyn_.on || dyn_.rangeDb == 0.0 || sidechain == nullptr)
         {
             if (engaged_) { disengage (band); engaged_ = false; }
             band.processBlock (audio, nc, numSamples);
@@ -225,7 +227,17 @@ private:
             if (! laneRuns (p, l, nc)) { st_[i].deltaDb = 0.0; band.setLaneDeltaDb (l, 0.0); continue; }
 
             LaneState& s = st_[i];
-            float linked = 0.0f;
+            // EVERYTHING that carries time runs PER SAMPLE: probe, envelope, gain computer and the
+            // GR follower. Only the estimator update and the seam write are control-rate, because
+            // those are the expensive ones (a log, and an Svf coefficient redesign in the band).
+            //
+            // Computing one target for the whole chunk and then advancing the follower n times looks
+            // equivalent and is not. An event landing on the LAST sample of a chunk would drive all n
+            // follower steps with the target it produced: with a 1 ms attack at 48 kHz the follower
+            // should have travelled 1 - a = 2.06% toward it, but would travel 1 - a^16 = 28.4% —
+            // 13.75x too far. The band's reaction would also depend on where in the chunk grid the
+            // transient happened to fall.
+            float smoothed = (float) s.deltaDb;
             for (int k = 0; k < n; ++k)
             {
                 // Channel LINKING is mandatory on the ST lane: probing each channel independently
@@ -242,26 +254,20 @@ private:
                     const float x = laneSignal (l, sc, nc, k);
                     e = std::fabs (s.probe.processSample (0, x));
                 }
-                linked = s.env.process (e);
+                const float linked = s.env.process (e);
                 s.rel.accumulate (linked);
+
+                const double levelDb = core::gainToDb (std::fmax ((double) linked, 1.0e-9));
+                // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
+                // level of 0 still asks for knee/8 * slope, so an up-lifting band would ride the
+                // noise floor up through every pause.
+                const double target = s.rel.activity()
+                                    ? (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb)
+                                    : 0.0;
+                smoothed = s.gr.process ((float) target);
             }
             s.rel.update (n);
 
-            const double levelDb = core::gainToDb (std::fmax ((double) linked, 1.0e-9));
-            // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative level
-            // of 0 still asks for knee/8 * slope, so an up-lifting band would ride the noise floor up
-            // through every pause.
-            const double target = s.rel.activity()
-                                ? (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb)
-                                : 0.0;
-
-            // The GR follower's coefficients are PER SAMPLE, so it must be advanced once per sample.
-            // Calling it once per control chunk would stretch every time constant by kControl — a
-            // nominal 1 ms attack would behave like 16 ms, and the amount would depend on the host's
-            // block size (a 17-sample block gives a different factor than a 64-sample one). The
-            // target is what updates at control rate; the smoothing does not.
-            float smoothed = (float) s.deltaDb;
-            for (int k = 0; k < n; ++k) smoothed = s.gr.process ((float) target);
             s.deltaDb = (double) smoothed;
             band.setLaneDeltaDb (l, s.deltaDb);
 
@@ -276,7 +282,9 @@ private:
         // would drive a seam the audio ignores — and deltaDb() would report gain reduction that is
         // not happening. Same predicate EqBand::sweptActive uses, via the shared free function, so
         // the two gates cannot drift apart.
-        if (p.swept && eq::onlyStereoEnabled (p)) return false;
+        // Must match EqBand::sweptActive EXACTLY, Tilt exclusion included: a swept Tilt runs the
+        // MATCHED path, so its delta seam is live and refusing to drive it kills dynamics silently.
+        if (p.swept && p.type != eq::FilterType::Tilt && eq::onlyStereoEnabled (p)) return false;
         const eq::LaneParams& lp = p.lane (l);
         if (! lp.on || lp.bypass) return false;
         return l == eq::Lane::Stereo || nc == 2;      // L/R/M/S are stereo-only, as in EqBand
