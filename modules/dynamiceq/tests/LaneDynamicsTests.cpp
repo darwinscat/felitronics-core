@@ -377,5 +377,91 @@ int main()
                   "material entirely under the threshold is left alone");
     }
 
+    // A lane that stops running must not resume its old gain reduction. Measured at 4.72 dB of
+    // unearned duck before the falling-edge reset, on EVERY path into that branch.
+    test::group ("a lane that stops running drops its state, it does not freeze it");
+    {
+        auto replayAfter = [&] (int which)     // 0 lane bypass, 1 lane off, 2 point bypass, 3 point off
+        {
+            eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
+            eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
+            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+
+            const int block = 64;
+            std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
+            long phase = 0;
+            auto feed = [&] (double db, double sec)
+            {
+                for (int done = 0; done < (int) (fs * sec); done += block)
+                {
+                    for (int i = 0; i < block; ++i, ++phase)
+                    {
+                        const float v = (float) (core::dbToGain (db)
+                                               * std::sin (2.0 * core::kPi * 3000.0 * (double) phase / fs));
+                        L[(size_t) i] = R[(size_t) i] = sl[(size_t) i] = sr[(size_t) i] = v;
+                    }
+                    float* aud[2] { L.data(), R.data() };
+                    const float* sc[2] { sl.data(), sr.data() };
+                    dyn.processBand (aud, sc, 2, block, band);
+                }
+            };
+            feed (-30.0, 6.0);                       // learn
+            feed (-14.0, 0.3);                       // earn real reduction
+            const double earned = dyn.deltaDb (eq::Lane::Stereo);
+
+            eq::BandParams off = p;                  // take the lane out of service
+            if      (which == 0) off.lane (eq::Lane::Stereo).bypass = true;
+            else if (which == 1) off.lane (eq::Lane::Stereo).on     = false;
+            else if (which == 2) off.bypass = true;
+            else                 off.on     = false;
+            band.setParams (off); dyn.setParams (off);
+            feed (-60.0, 1.0);                       // quiet while out of service
+
+            band.setParams (p); dyn.setParams (p);   // back in service, still quiet
+            feed (-60.0, (double) block / fs);       // ONE block: any longer and the release hides it
+            return std::pair<double,double> { earned, dyn.deltaDb (eq::Lane::Stereo) };
+        };
+
+        for (int which = 0; which < 4; ++which)
+        {
+            const auto r = replayAfter (which);
+            test::ok (r.first < -1.0, "the lane really did earn reduction first");
+            test::ok (std::fabs (r.second) < 1.0, "and none of it is replayed when it comes back");
+        }
+    }
+
+    // Kills probe-own-output: the sidechain carries events the AUDIO does not. A probe reading its
+    // own output sees a steady signal and does nothing. (Every other group here feeds the same
+    // buffer as both audio and sidechain, which is literally the wrong-tap topology — so those
+    // groups cannot see this mutation, however many of them there are.)
+    test::group ("the probe reads the sidechain, not the audio it is processing");
+    {
+        eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
+        eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
+        dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+
+        const int block = 64;
+        std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
+        long phase = 0;
+        double deepest = 0.0;
+        for (int done = 0; done < (int) (fs * 8.0); done += block)
+        {
+            for (int i = 0; i < block; ++i, ++phase)
+            {
+                const double t = (double) phase / fs;
+                const bool burst = std::fmod (t, 1.0) > 0.75;
+                const double sine = std::sin (2.0 * core::kPi * 3000.0 * t);
+                L[(size_t) i] = R[(size_t) i] = (float) (core::dbToGain (-30.0) * sine);   // steady audio
+                const double scDb = -30.0 + (burst ? 14.0 : 0.0);                          // bursty sidechain
+                sl[(size_t) i] = sr[(size_t) i] = (float) (core::dbToGain (scDb) * sine);
+            }
+            float* aud[2] { L.data(), R.data() };
+            const float* sc[2] { sl.data(), sr.data() };
+            dyn.processBand (aud, sc, 2, block, band);
+            if ((double) done / fs > 3.0) deepest = std::fmin (deepest, dyn.deltaDb (eq::Lane::Stereo));
+        }
+        test::ok (deepest < -1.0, "events present only in the sidechain still drive the band");
+    }
+
     return test::report();
 }

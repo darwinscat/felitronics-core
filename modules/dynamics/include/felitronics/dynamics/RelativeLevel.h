@@ -59,10 +59,13 @@ namespace felitronics::dynamics
 //     translation invariance and leave a hole in the activity gate.
 //   • ESTIMATE CLAMP — so it cannot learn a noise floor as "programme".
 //   • SEED — the first valid observation sets the estimate outright; crawling from zero would
-//     out-mass the signal for several time constants. reset() also ARMS THE FAST WINDOW, because a
-//     detector envelope is still climbing its own attack ramp at the first control tick, so the very
-//     first observation reads low; the window lets that self-correct in a fraction of a second
-//     instead of a slew-capped second and a half.
+//     out-mass the signal for several time constants. But it must not seed from the detector's OWN
+//     WARM-UP: at the first control tick the envelope follower is still climbing its attack ramp, so
+//     the observation reads ~25 dB low, the estimate seeds there, and the band ducks by its full
+//     range at EVERY playback start (measured: 12 dB, recovering over ~0.3 s). `seedDelayMs` of
+//     signal is therefore discarded before seeding — long enough for the envelope to be meaningful,
+//     short enough to be inaudible. reset() also arms the fast window so any residual error still
+//     self-corrects quickly.
 //   • FAST WINDOW ON RETUNE — a large fc/Q change invalidates what was learned, but reseeding on
 //     every parameter write would make the estimator instantaneous while a user DRAGS a node. So a
 //     retune opens a bounded window of faster adaptation instead. Both the time constant and the
@@ -86,9 +89,11 @@ public:
         double gapFactor     = 8.0;      // ... and the estimate falls that much slower through it
         double slewDbPerSec  = 12.0;     // hard bidirectional cap on estimate motion
         double clampLoDb     = -80.0;    // the estimate itself stays inside these
-        double clampHiDb     =   0.0;
+        double clampHiDb     =  24.0;    // NOT 0: float hosts legitimately run hot inside a chain,
+                                         // and pinning there invents permanent excess (measured -4.7 dB at +20 dBFS)
         double floorDb       = -80.0;    // below this: hold + report inactive. Kept >= clampLoDb.
         double activityHystDb = 6.0;     // re-activate only this far above the floor (no chatter)
+        double seedDelayMs   = 8.0;      // ignore this much signal before seeding (see SEED)
         double fastWindowMs  = 500.0;    // bounded fast-adaptation window after a retune / reset
         double fastFactor    = 8.0;      // how much faster inside that window (time AND slew)
     };
@@ -101,7 +106,7 @@ public:
 
     void reset() noexcept
     {
-        acc_ = 0.0; accN_ = 0; estDb_ = p_.clampLoDb; seeded_ = false; active_ = false;
+        acc_ = 0.0; accN_ = 0; estDb_ = p_.clampLoDb; seeded_ = false; active_ = false; warmed_ = 0;
         armFastWindow();                 // the first observation is a ramp artefact — let it correct
     }
 
@@ -138,7 +143,13 @@ public:
         const double dt = (double) numSamples / fs_;
         const bool   fast = fastLeft_ > 0;
 
-        if (! seeded_) { estDb_ = clampEstimate (obsDb); seeded_ = true; }                  // SEED
+        if (! seeded_)
+        {
+            // Discard the detector's warm-up before trusting a first observation (see SEED).
+            warmed_ += numSamples;
+            if ((double) warmed_ < p_.seedDelayMs * 1.0e-3 * fs_) return;
+            estDb_ = clampEstimate (obsDb); seeded_ = true;
+        }
         else
         {
             // Symmetric by default; only a genuine GAP stretches the constant (see header).
@@ -216,6 +227,7 @@ private:
     double estDb_ = -80.0;
     bool   seeded_ = false, active_ = false;
     int    fastLeft_ = 0;     // samples of ADAPTATION remaining in the fast window
+    int    warmed_   = 0;     // signal seen before seeding is allowed
 };
 
 } // namespace felitronics::dynamics

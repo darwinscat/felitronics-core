@@ -76,7 +76,7 @@ public:
         for (auto& s : st_)
         {
             s.probe.reset(); s.env.reset(); s.rel.reset(); s.gr.reset();
-            s.deltaDb = 0.0;
+            s.deltaDb = 0.0; s.running = false;
             // Invalidate the retune sentinels too. Svf::prepare() resets STATE but keeps coefficients,
             // which were baked at the old sample rate (g = tan(pi*f/fs)); if the host re-prepares at a
             // new rate and the adapter re-sends identical params, "unchanged" would skip the redesign
@@ -194,6 +194,7 @@ private:
         double freq = -1.0, Q = -1.0;               // last applied, for retune detection
         double offsetDb = 0.0;                      // knee/2 + headroom: makes "idle" exact
         double deltaDb = 0.0;
+        bool   running = false;   // was this lane live last chunk? (falling-edge detect)
     };
 
     static constexpr double kRatio      = 4.0;   // fixed: the knob is range, not ratio
@@ -224,7 +225,8 @@ private:
         for (int i = 0; i < eq::kNumLanes; ++i)
         {
             st_[i].deltaDb = 0.0;
-            st_[i].gr.reset(); st_[i].env.reset(); st_[i].probe.reset(); st_[i].rel.reset();
+            st_[i].gr.reset(); st_[i].env.reset(); st_[i].probe.reset();
+            st_[i].running = false;   // rel is KEPT: it describes the signal, not the processing
             band.setLaneDeltaDb ((eq::Lane) i, 0.0);
         }
     }
@@ -237,7 +239,21 @@ private:
         for (int i = 0; i < eq::kNumLanes; ++i)
         {
             const eq::Lane l = (eq::Lane) i;
-            if (! laneRuns (p, l, nc)) { st_[i].deltaDb = 0.0; band.setLaneDeltaDb (l, 0.0); continue; }
+            // A lane that stops running must DROP its detector state, not freeze it. Zeroing only the
+            // seam left probe/envelope/follower live, so re-enabling replayed almost the whole earned
+            // reduction onto whatever was playing then (measured 4.72 dB of unearned duck, on every
+            // path into this branch: lane bypass, lane off, point bypass, point off, swept toggle).
+            // The programme estimate is deliberately KEPT — it describes the signal, not the
+            // processing, and discarding it would re-seed from a detector warm-up ramp instead.
+            if (! laneRuns (p, l, nc))
+            {
+                LaneState& off = st_[i];
+                if (off.running) { off.gr.reset(); off.env.reset(); off.probe.reset(); off.running = false; }
+                off.deltaDb = 0.0;
+                band.setLaneDeltaDb (l, 0.0);
+                continue;
+            }
+            st_[i].running = true;
 
             LaneState& s = st_[i];
             // EVERYTHING that carries time runs PER SAMPLE: probe, envelope, gain computer and the
@@ -270,7 +286,10 @@ private:
                 const float linked = s.env.process (e);
                 s.rel.accumulate (linked);
 
-                const double levelDb = core::gainToDb (std::fmax ((double) linked, 1.0e-9));
+                // fastGainToDb, not gainToDb: this is a per-sample DETECTOR path (5.8 M calls/s in
+                // the 24-point / 5-lane worst case), and 0.0001 dB of error is invisible to a gain
+                // computer. Anything a user reads as a number still uses the exact one.
+                const double levelDb = (double) core::fastGainToDb (linked);
                 // The two modes must move TOGETHER — the computer's threshold and the level fed to it
                 // are ONE decision. Setting an absolute threshold while still feeding a relative
                 // level produced full-range reduction on material 20 dB UNDER the threshold.
