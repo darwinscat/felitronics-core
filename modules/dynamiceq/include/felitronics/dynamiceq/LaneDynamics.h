@@ -76,8 +76,14 @@ public:
         for (auto& s : st_)
         {
             s.probe.reset(); s.env.reset(); s.rel.reset(); s.gr.reset();
-            s.deltaDb = 0.0; s.acc = 0;
+            s.deltaDb = 0.0; s.running = false;
+            // Invalidate the retune sentinels too. Svf::prepare() resets STATE but keeps coefficients,
+            // which were baked at the old sample rate (g = tan(pi*f/fs)); if the host re-prepares at a
+            // new rate and the adapter re-sends identical params, "unchanged" would skip the redesign
+            // and leave the probe listening an octave away from the band it drives.
+            s.freq = -1.0; s.Q = -1.0;
         }
+        engaged_ = false;
     }
 
     // Point parameters. A MATERIAL fc/Q change re-arms that lane's estimator adaptation window — a
@@ -93,19 +99,21 @@ public:
             const bool retuned = ! nearlyEqual (lp.freq, s.freq) || ! nearlyEqual (lp.Q, s.Q);
             if (retuned)
             {
-                s.probe.setParams (eq::FilterType::BandPass, lp.freq, lp.Q, 0.0);
+                const double f = probeFreq (lp.freq), q = probeQ (lp.Q);
+                s.probe.setParams (eq::FilterType::BandPass, f, q, 0.0);
                 s.rel.retuned();
-                const auto t = dynamics::BandBallistics::compute (fs_, lp.freq, lp.Q, p.dyn.atk, p.dyn.rel);
+                const auto t = dynamics::BandBallistics::compute (fs_, f, q, p.dyn.atk, p.dyn.rel);
                 s.gr.setTimes (t.attackMs, t.releaseMs);
-                s.freq = lp.freq; s.Q = lp.Q;
+                s.freq = lp.freq; s.Q = lp.Q;   // raw, so retune detection tracks what the caller sent
             }
             else if (! nearlyEqual (p.dyn.atk, dynAtk_) || ! nearlyEqual (p.dyn.rel, dynRel_))
             {
-                const auto t = dynamics::BandBallistics::compute (fs_, lp.freq, lp.Q, p.dyn.atk, p.dyn.rel);
+                const auto t = dynamics::BandBallistics::compute (fs_, probeFreq (lp.freq), probeQ (lp.Q),
+                                                                  p.dyn.atk, p.dyn.rel);
                 s.gr.setTimes (t.attackMs, t.releaseMs);
             }
 
-            const double range = std::fabs (p.dyn.rangeDb);
+            const double range = std::clamp (std::fabs (finiteOr (p.dyn.rangeDb, 0.0)), 0.0, 30.0);
             s.gc.setRangeDb (range);
             // Knee scaled off range so a small range keeps a proportionate corner instead of a 6 dB
             // smear, and offset by knee/2 so "idle on stationary programme" is EXACT: the steady-state
@@ -113,8 +121,18 @@ public:
             const double knee = std::min (6.0, 1.5 * range);
             s.gc.setKneeDb (knee);
             s.offsetDb = knee * 0.5 + kHeadroomDb;
-            s.gc.setThresholdDb (p.dyn.thrAuto ? 0.0 : p.dyn.thrDb);
+            // Relative mode leaves the computer's threshold at 0 and feeds it a relative level;
+            // absolute mode puts the user's dBFS in and feeds it the raw level. One write per
+            // param change either way — never per sample.
+            s.gc.setThresholdDb (p.dyn.thrAuto ? 0.0
+                                               : std::clamp (finiteOr (p.dyn.thrDb, -24.0), -120.0, 24.0));
         }
+        // Switching threshold mode is an operator action, and the two modes measure different
+        // things — releasing an absolute-mode reduction into relative mode would apply gain nothing
+        // asked for. Drop it, the same hard-step semantic a lane enable already has.
+        if (p.dyn.thrAuto != dyn_.thrAuto)
+            for (auto& st : st_) { st.gr.reset(); st.deltaDb = 0.0; }
+
         dynAtk_ = p.dyn.atk; dynRel_ = p.dyn.rel;
         dyn_ = p.dyn;
         sign_ = (p.dyn.rangeDb < 0.0) ? 1.0f : -1.0f;   // range<0 = cut when loud (DownCompress as-is)
@@ -125,8 +143,22 @@ public:
     void processBand (float* const* audio, const float* const* sidechain,
                       int numChannels, int numSamples, eq::EqBand& band) noexcept
     {
-        if (numSamples <= 0) return;
-        if (! dyn_.on) { band.processBlock (audio, numChannels, numSamples); return; }
+        if (numSamples <= 0 || numChannels <= 0) return;
+        const int nc = std::clamp (numChannels, 1, ch_);
+
+        // Disengaging must not leave the band frozen mid-duck: zero the seams and drop the
+        // detector/programme/GR state once, on the edge. Without this, toggling dynamics off during a
+        // loud passage and back on during a quiet one replays the old gain reduction onto material
+        // that asked for nothing.
+        // rangeDb == 0 is documented as "no dynamics", so it must DISENGAGE, not merely target zero:
+        // otherwise the last earned delta stays applied while the follower releases toward it.
+        if (! dyn_.on || dyn_.rangeDb == 0.0 || sidechain == nullptr)
+        {
+            if (engaged_) { disengage (band); engaged_ = false; }
+            band.processBlock (audio, nc, numSamples);
+            return;
+        }
+        engaged_ = true;
 
         int done = 0;
         while (done < numSamples)
@@ -134,11 +166,15 @@ public:
             const int n = std::min (kControl, numSamples - done);
             float* aud[core::kMaxChannels];
             const float* sc[core::kMaxChannels];
-            const int nc = std::clamp (numChannels, 1, ch_);
             for (int c = 0; c < nc; ++c) { aud[c] = audio[c] + done; sc[c] = sidechain[c] + done; }
 
-            advance (sc, nc, n, band);
+            // AUDIO FIRST, then detect. Detecting this chunk before processing it would let a
+            // transient at sample 15 alter output sample 0 — up to 15 samples of undeclared
+            // look-ahead in a plugin that reports zero latency. Running the band on the delta derived
+            // from the PREVIOUS chunk keeps the path causal; the cost is one control period (0.33 ms)
+            // of delay on the gain, which the ballistics dwarf.
             band.processBlock (aud, nc, n);
+            advance (sc, nc, n, band);
             done += n;
         }
     }
@@ -158,15 +194,41 @@ private:
         double freq = -1.0, Q = -1.0;               // last applied, for retune detection
         double offsetDb = 0.0;                      // knee/2 + headroom: makes "idle" exact
         double deltaDb = 0.0;
-        int    acc = 0;
+        bool   running = false;   // was this lane live last chunk? (falling-edge detect)
     };
 
     static constexpr double kRatio      = 4.0;   // fixed: the knob is range, not ratio
     static constexpr double kHeadroomDb = 3.0;   // how far above "normal" a peak must sit to engage
 
+    static double finiteOr (double v, double fb) noexcept { return std::isfinite (v) ? v : fb; }
+
     static bool nearlyEqual (double a, double b) noexcept
     {
         return std::isfinite (a) && std::isfinite (b) && std::fabs (a - b) <= 1.0e-9 * std::fmax (1.0, std::fabs (a));
+    }
+
+    // The SAME rails eq::EqBand applies to itself, so the detector, the ballistics and the filter can
+    // never describe three different bands — and so a NaN freq cannot reach tan() and poison the
+    // follower permanently (env = in + c*(env-in) never recovers from NaN).
+    double probeFreq (double f) const noexcept
+    {
+        return std::clamp (std::isfinite (f) ? f : 1000.0, 10.0, 0.49 * fs_);
+    }
+    static double probeQ (double q) noexcept
+    {
+        return std::clamp (std::isfinite (q) ? q : 1.0, 0.05, 40.0);
+    }
+
+    // Leave the band exactly as an opted-out one: no residual delta, no state that could resume.
+    void disengage (eq::EqBand& band) noexcept
+    {
+        for (int i = 0; i < eq::kNumLanes; ++i)
+        {
+            st_[i].deltaDb = 0.0;
+            st_[i].gr.reset(); st_[i].env.reset(); st_[i].probe.reset();
+            st_[i].running = false;   // rel is KEPT: it describes the signal, not the processing
+            band.setLaneDeltaDb ((eq::Lane) i, 0.0);
+        }
     }
 
     // One control-rate chunk: run every running lane's detector over the SECTION INPUT and push its
@@ -177,10 +239,34 @@ private:
         for (int i = 0; i < eq::kNumLanes; ++i)
         {
             const eq::Lane l = (eq::Lane) i;
-            if (! laneRuns (p, l, nc)) { st_[i].deltaDb = 0.0; band.setLaneDeltaDb (l, 0.0); continue; }
+            // A lane that stops running must DROP its detector state, not freeze it. Zeroing only the
+            // seam left probe/envelope/follower live, so re-enabling replayed almost the whole earned
+            // reduction onto whatever was playing then (measured 4.72 dB of unearned duck, on every
+            // path into this branch: lane bypass, lane off, point bypass, point off, swept toggle).
+            // The programme estimate is deliberately KEPT — it describes the signal, not the
+            // processing, and discarding it would re-seed from a detector warm-up ramp instead.
+            if (! laneRuns (p, l, nc))
+            {
+                LaneState& off = st_[i];
+                if (off.running) { off.gr.reset(); off.env.reset(); off.probe.reset(); off.running = false; }
+                off.deltaDb = 0.0;
+                band.setLaneDeltaDb (l, 0.0);
+                continue;
+            }
+            st_[i].running = true;
 
             LaneState& s = st_[i];
-            float linked = 0.0f;
+            // EVERYTHING that carries time runs PER SAMPLE: probe, envelope, gain computer and the
+            // GR follower. Only the estimator update and the seam write are control-rate, because
+            // those are the expensive ones (a log, and an Svf coefficient redesign in the band).
+            //
+            // Computing one target for the whole chunk and then advancing the follower n times looks
+            // equivalent and is not. An event landing on the LAST sample of a chunk would drive all n
+            // follower steps with the target it produced: with a 1 ms attack at 48 kHz the follower
+            // should have travelled 1 - a = 2.06% toward it, but would travel 1 - a^16 = 28.4% —
+            // 13.75x too far. The band's reaction would also depend on where in the chunk grid the
+            // transient happened to fall.
+            float smoothed = (float) s.deltaDb;
             for (int k = 0; k < n; ++k)
             {
                 // Channel LINKING is mandatory on the ST lane: probing each channel independently
@@ -197,34 +283,55 @@ private:
                     const float x = laneSignal (l, sc, nc, k);
                     e = std::fabs (s.probe.processSample (0, x));
                 }
-                linked = s.env.process (e);
+                const float linked = s.env.process (e);
                 s.rel.accumulate (linked);
+
+                // fastGainToDb, not gainToDb: this is a per-sample DETECTOR path (5.8 M calls/s in
+                // the 24-point / 5-lane worst case), and 0.0001 dB of error is invisible to a gain
+                // computer. Anything a user reads as a number still uses the exact one.
+                const double levelDb = (double) core::fastGainToDb (linked);
+                // The two modes must move TOGETHER — the computer's threshold and the level fed to it
+                // are ONE decision. Setting an absolute threshold while still feeding a relative
+                // level produced full-range reduction on material 20 dB UNDER the threshold.
+                double target = 0.0;
+                if (dyn_.thrAuto)
+                {
+                    // Relative: threshold pinned at 0, level expressed as excess over the programme.
+                    // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
+                    // level of 0 still asks for knee/8 * slope, so an up-lifting band would ride the
+                    // noise floor up through every pause.
+                    if (s.rel.activity())
+                        target = (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb);
+                }
+                else
+                {
+                    // Absolute: the user's dBFS IS the threshold and the raw level goes in. No
+                    // activity gate — material below the threshold yields no excess and no delta in
+                    // either direction, and gating would silence exactly the quiet-but-real events
+                    // (a sibilant over a dark source) this mode exists to reach.
+                    target = (double) sign_ * s.gc.deltaDb (levelDb);
+                }
+                smoothed = s.gr.process ((float) target);
             }
             s.rel.update (n);
 
-            const double levelDb = core::gainToDb (std::fmax ((double) linked, 1.0e-9));
-            double target = 0.0;
-            if (dyn_.thrAuto)
-            {
-                // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
-                // level of 0 still asks for knee/8 * slope, so an up-lifting band would ride the
-                // noise floor through every pause.
-                if (s.rel.activity())
-                    target = (double) sign_ * s.gc.deltaDb (s.rel.relativeDb (levelDb) - s.offsetDb);
-            }
-            else
-            {
-                target = (double) sign_ * s.gc.deltaDb (levelDb);
-            }
-
-            s.deltaDb = (double) s.gr.process ((float) target);
+            s.deltaDb = (double) smoothed;
             band.setLaneDeltaDb (l, s.deltaDb);
+
+            s.probe.flushDenormals(); s.env.flushDenormals(); s.rel.flushDenormals(); s.gr.flushDenormals();
         }
     }
 
     static bool laneRuns (const eq::BandParams& p, eq::Lane l, int nc) noexcept
     {
         if (! p.on || p.bypass) return false;
+        // EqBand's swept branch runs its search SVF and never applies the delta, so a detector here
+        // would drive a seam the audio ignores — and deltaDb() would report gain reduction that is
+        // not happening. Same predicate EqBand::sweptActive uses, via the shared free function, so
+        // the two gates cannot drift apart.
+        // Must match EqBand::sweptActive EXACTLY, Tilt exclusion included: a swept Tilt runs the
+        // MATCHED path, so its delta seam is live and refusing to drive it kills dynamics silently.
+        if (p.swept && p.type != eq::FilterType::Tilt && eq::onlyStereoEnabled (p)) return false;
         const eq::LaneParams& lp = p.lane (l);
         if (! lp.on || lp.bypass) return false;
         return l == eq::Lane::Stereo || nc == 2;      // L/R/M/S are stereo-only, as in EqBand
@@ -249,6 +356,7 @@ private:
     eq::DynParams dyn_;
     double        dynAtk_ = 0.5, dynRel_ = 0.5;
     float         sign_ = 1.0f;
+    bool          engaged_ = false;      // was the dynamics path live last call? (edge detect)
     LaneState     st_[eq::kNumLanes];
 };
 

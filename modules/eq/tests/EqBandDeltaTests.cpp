@@ -7,6 +7,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/eq/EqBand.h>
+#include <felitronics/eq/EqEngine.h>
 #include <felitronics/core/Math.h>
 
 #include <cmath>
@@ -163,6 +164,71 @@ int main()
         bool finite = true;
         for (int i = 0; i < n; ++i) finite = finite && std::isfinite (L[i]) && std::isfinite (R[i]);
         test::ok (finite, "and the audio stays finite");
+    }
+
+    // A NONZERO delta on the STEREO lane must change the audio. Sounds too obvious to test — and it
+    // was the gap that mattered: the zero-delta test only proved transparency, and the only nonzero
+    // assertion used the Mid lane, so deleting the ST delta application passed the entire suite while
+    // silently disabling dynamics on the most-used lane, meters still reporting success.
+    test::group ("a nonzero Stereo delta actually changes the audio");
+    {
+        std::vector<float> aL (n), aR (n), bL (n), bR (n);
+        fillNoise (aL, aR, 20260803); bL = aL; bR = aR;
+
+        BandParams p = bellPoint (1000.0, 2.0, 0.0);
+        p.dyn.on = true;
+
+        EqBand ref; ref.prepare (fs, 2); ref.setParams (p);
+        ref.setLaneDeltaDb (Lane::Stereo, 0.0);
+        run (ref, aL, aR);
+
+        EqBand dut; dut.prepare (fs, 2); dut.setParams (p);
+        dut.setLaneDeltaDb (Lane::Stereo, -9.0);
+        run (dut, bL, bR);
+
+        double worst = 0.0;
+        for (int i = 0; i < n; ++i) worst = std::fmax (worst, (double) std::fabs (aL[i] - bL[i]));
+        test::ok (worst > 1.0e-3, "the ST delta reaches the signal on channel 0");
+
+        worst = 0.0;
+        for (int i = 0; i < n; ++i) worst = std::fmax (worst, (double) std::fabs (aR[i] - bR[i]));
+        test::ok (worst > 1.0e-3, "and on channel 1 — the ST lane is per-channel");
+    }
+
+    // The section-input capture must be a COPY. If it aliased the caller's buffers, every probe in a
+    // 24-point chain would end up reading whatever the bands had already written into them — which
+    // is the chained-pumping failure the whole mechanism exists to prevent. Nothing referenced this
+    // method from any test before, so replacing the copy with `return channels;` passed everything.
+    test::group ("captureSectionInput copies, and its contract is honest");
+    {
+        EqEngine eng;
+        eng.prepare (fs, 512, 2);
+
+        std::vector<float> L (256), R (256);
+        for (int i = 0; i < 256; ++i) { L[(size_t) i] = 0.5f; R[(size_t) i] = -0.5f; }
+        float* ch[2] { L.data(), R.data() };
+
+        const float* const* sc = eng.captureSectionInput ((const float* const*) ch, 2, 256);
+        test::ok (sc != nullptr, "capture succeeds inside the promised maxBlock");
+        test::ok (eng.sectionInputSamples() == 256, "and reports what it captured");
+
+        // Now scribble over the caller's buffers, exactly as the bands do when they process in place.
+        for (int i = 0; i < 256; ++i) { L[(size_t) i] = 99.0f; R[(size_t) i] = -99.0f; }
+        bool preserved = true;
+        for (int i = 0; i < 256; ++i)
+            preserved = preserved && sc[0][i] == 0.5f && sc[1][i] == -0.5f;
+        test::ok (preserved, "the captured section input survives the bands overwriting the audio");
+
+        // Oversized block: must refuse rather than hand back a short or stale buffer.
+        std::vector<float> big (1024, 0.25f);
+        float* bigCh[2] { big.data(), big.data() };
+        test::ok (eng.captureSectionInput ((const float* const*) bigCh, 2, 1024) == nullptr,
+                  "a block larger than promised is refused, not silently truncated");
+
+        // A stream restart must invalidate it — a consumer asking after reset gets nothing stale.
+        eng.captureSectionInput ((const float* const*) ch, 2, 128);
+        eng.reset();
+        test::ok (eng.sectionInputSamples() == 0, "reset invalidates the captured input");
     }
 
     return test::report();

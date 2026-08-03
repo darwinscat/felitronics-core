@@ -78,6 +78,7 @@ public:
 
     void reset() noexcept
     {
+        scValid_ = 0;   // a stream restart invalidates any captured section input
         for (auto& b : bands) b.reset();
         inTap.reset();
         outTap.reset();

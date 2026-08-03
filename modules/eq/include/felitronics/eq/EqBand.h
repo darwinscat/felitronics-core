@@ -336,8 +336,19 @@ public:
     {
         resetST();
         for (const Lane l : kMonoLanes) resetLane (laneRt_[(std::size_t) l]);
-        deltaST_.reset();
-        for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.reset();
+        // Reset must leave NO live delta: the seam is state like any other, and a stream restart that
+        // kept it would apply the previous stream's gain reduction to the first block of the new one.
+        deltaST_.reset(); deltaSTDb_ = 0.0;
+        deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            rt.delta.reset(); rt.deltaDb = 0.0;
+            // Invalidate the design keys too — prepare() may have changed the sample rate, and Svf
+            // keeps coefficients baked with g = tan(pi*f/fs) across a prepare().
+            rt.deltaApplied = rt.freqApplied = rt.qApplied = std::numeric_limits<double>::quiet_NaN();
+        }
+        stFreqApplied_ = stQApplied_ = std::numeric_limits<double>::quiet_NaN();
     }
 
     //==========================================================================
@@ -563,7 +574,9 @@ private:
         bool         active  = false;   // designed on the last updateCoeffs()? (drives the topology reset)
         Svf          delta;             // dynamic gain-delta bell, INSIDE the lane (see setLaneDeltaDb)
         double       deltaDb = 0.0;
-        double       deltaApplied = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed
+        double       deltaApplied = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed,
+        double       freqApplied  = std::numeric_limits<double>::quiet_NaN();   // ... and the freq/Q
+        double       qApplied     = std::numeric_limits<double>::quiet_NaN();   // they were designed at
     };
 
     // Same bit-pattern discipline the params use, so a redesign-skip cannot be tripped by -Wfloat-equal
@@ -577,20 +590,30 @@ private:
     // so the moving part sits exactly where the static curve does.
     void updateDeltaCoeffs() noexcept
     {
-        if (! sameBits (deltaSTDb_, deltaAppliedST_))
+        // Keyed on freq/Q as well as the delta itself: holding a steady delta while the user drags the
+        // node would otherwise leave the moving bell parked at the frequency it was designed for. The
+        // SMOOTHED values are used, so the moving part travels with the static curve during a ramp
+        // instead of jumping to the target ahead of it.
         {
-            const LaneParams& lp = p.lane (Lane::Stereo);
-            deltaST_.setParams (FilterType::Bell, lp.freq, lp.Q, deltaSTDb_);
-            deltaAppliedST_ = deltaSTDb_;
+            const double f = stFreqS_.value(), q = stQS_.value();
+            if (! sameBits (deltaSTDb_, deltaAppliedST_) || ! sameBits (f, stFreqApplied_)
+                || ! sameBits (q, stQApplied_))
+            {
+                deltaST_.setParams (FilterType::Bell, f, q, deltaSTDb_);
+                deltaAppliedST_ = deltaSTDb_;
+                stFreqApplied_ = f; stQApplied_ = q;
+            }
         }
         for (const Lane l : kMonoLanes)
         {
             LaneRt& rt = laneRt_[(std::size_t) l];
-            if (! sameBits (rt.deltaDb, rt.deltaApplied))
+            const double f = rt.freqS.value(), q = rt.qS.value();
+            if (! sameBits (rt.deltaDb, rt.deltaApplied) || ! sameBits (f, rt.freqApplied)
+                || ! sameBits (q, rt.qApplied))
             {
-                const LaneParams& lp = p.lane (l);
-                rt.delta.setParams (FilterType::Bell, lp.freq, lp.Q, rt.deltaDb);
+                rt.delta.setParams (FilterType::Bell, f, q, rt.deltaDb);
                 rt.deltaApplied = rt.deltaDb;
+                rt.freqApplied = f; rt.qApplied = q;
             }
         }
     }
@@ -661,6 +684,15 @@ private:
             lp.Q      = std::clamp (finiteOr (lp.Q, 1.0), 0.05, 40.0);
             lp.gainDb = std::clamp (finiteOr (lp.gainDb, 0.0), -30.0, 30.0);
         }
+        // Dynamics rails. Without them an absurd threshold makes digital silence earn the full range
+        // (the detector level is floored, so a threshold below that floor is permanently exceeded),
+        // and a huge range overflows float on its way into the gain follower, poisoning the meter
+        // with NaN until the next reset. +24 dBFS on the threshold because float hosts legitimately
+        // run hot inside a chain.
+        np.dyn.rangeDb = std::clamp (finiteOr (np.dyn.rangeDb, 0.0), -30.0, 30.0);
+        np.dyn.thrDb   = std::clamp (finiteOr (np.dyn.thrDb, -24.0), -120.0, 24.0);
+        np.dyn.atk     = std::clamp (finiteOr (np.dyn.atk, 0.5), 0.0, 1.0);
+        np.dyn.rel     = std::clamp (finiteOr (np.dyn.rel, 0.5), 0.0, 1.0);
         return np;
     }
 
@@ -765,7 +797,9 @@ private:
     Svf          svf_;
     Svf          deltaST_;             // dynamic gain-delta bell for the ST lane (per channel)
     double       deltaSTDb_ = 0.0;
-    double       deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed
+    double       deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed,
+    double       stFreqApplied_  = std::numeric_limits<double>::quiet_NaN();   // ... and the freq/Q
+    double       stQApplied_     = std::numeric_limits<double>::quiet_NaN();   // they were designed at
 
     // L / R / M / S lanes. Indexed by Lane; the [Lane::Stereo] entry is unused (the ST lane keeps the
     // per-channel columns above) — a trivial, deliberate slot for index-by-enum clarity.

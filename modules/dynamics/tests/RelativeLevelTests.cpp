@@ -145,9 +145,16 @@ int main()
         dynamics::RelativeLevel rl; rl.prepare (fs);
         test::ok (! rl.seeded(), "starts unseeded");
         test::approx (rl.relativeDb (-30.0), 0.0, 1.0e-12, "pre-seed relative reading is transparent");
+
+        // Seeding waits out seedDelayMs of signal: a real detector is still climbing its own attack
+        // ramp at the first control tick, and seeding there duck the band by its full range at every
+        // playback start.
         for (int i = 0; i < 16; ++i) rl.accumulate ((float) core::dbToGain (-30.0));
         rl.update (16);
-        test::ok (rl.seeded(), "seeded on first update");
+        test::ok (! rl.seeded(), "does NOT seed from the first window");
+
+        feed (rl, fs, core::dbToGain (-30.0), 20.0, 16);          // past the seed delay
+        test::ok (rl.seeded(), "seeds once the detector has had time to mean something");
         test::approx (rl.programDb(), -30.0, 0.1, "seeded AT the observation, not crawling from zero");
     }
 
@@ -156,9 +163,8 @@ int main()
     test::group ("a low first observation self-corrects quickly (reset arms the fast window)");
     {
         dynamics::RelativeLevel rl; rl.prepare (fs);
-        for (int i = 0; i < 16; ++i) rl.accumulate ((float) core::dbToGain (-60.0));   // ramp artefact
-        rl.update (16);
-        test::approx (rl.programDb(), -60.0, 0.1, "seeded low, as a real detector ramp would");
+        feed (rl, fs, core::dbToGain (-60.0), 20.0, 16);          // quiet start, past the seed delay
+        test::approx (rl.programDb(), -60.0, 0.1, "seeded low, as a quiet start would");
         feed (rl, fs, core::dbToGain (-25.0), 400.0, 16);
         test::ok (rl.programDb() > -38.0, "recovers most of a 35 dB seeding error within 400 ms");
 
@@ -166,8 +172,7 @@ int main()
         dynamics::RelativeLevel slow; slow.prepare (fs);
         dynamics::RelativeLevel::Params noWindow; noWindow.fastWindowMs = 0.0;
         slow.setParams (noWindow); slow.reset();
-        for (int i = 0; i < 16; ++i) slow.accumulate ((float) core::dbToGain (-60.0));
-        slow.update (16);
+        feed (slow, fs, core::dbToGain (-60.0), 20.0, 16);
         feed (slow, fs, core::dbToGain (-25.0), 400.0, 16);
         test::ok (slow.programDb() < rl.programDb() - 5.0, "and the window is what made that happen");
     }
@@ -257,10 +262,10 @@ int main()
         dynamics::RelativeLevel rl; rl.prepare (fs);
         rl.update (16);                                   // nothing accumulated
         test::ok (! rl.seeded() && std::isfinite (rl.programDb()), "update with no samples is a no-op");
-        for (int i = 0; i < 16; ++i) rl.accumulate ((float) core::dbToGain (-30.0));
-        rl.update (16);
+        feed (rl, fs, core::dbToGain (-30.0), 20.0, 16);   // past the seed delay
+        const double settled = rl.programDb();
         rl.update (16);                                   // second update, accumulator already drained
-        test::approx (rl.programDb(), -30.0, 0.1, "a repeated update does not move the estimate");
+        test::approx (rl.programDb(), settled, 1.0e-12, "a repeated update does not move the estimate");
         rl.update (0);
         rl.update (-5);
         test::ok (std::isfinite (rl.programDb()), "zero/negative sample counts are ignored");
