@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <complex>
+#include <limits>
 #include <cstddef>
 
 namespace felitronics::eq
@@ -321,6 +322,8 @@ public:
         }
         snapAll();
         svf_.prepare (fs, ch);
+        deltaST_.prepare (fs, ch);
+        for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.prepare (fs, 1);
         lastType_ = p.type;
         updateCoeffs();
         recomputePending = false;
@@ -333,6 +336,40 @@ public:
     {
         resetST();
         for (const Lane l : kMonoLanes) resetLane (laneRt_[(std::size_t) l]);
+        deltaST_.reset();
+        for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.reset();
+    }
+
+    //==========================================================================
+    // DYNAMIC GAIN DELTA — the seam a dynamic EQ composes through.
+    //
+    // The band applies a per-lane gain offset (dB) with a Cytomic SVF bell sitting INSIDE that lane,
+    // immediately after its matched static sections and BEFORE the M/S delta-fold. That placement is
+    // the whole point and cannot be reproduced from outside: for the M/S lanes the fold stays
+    // dM = filt(m) - m with filt = static o svfDelta, so a lane whose delta is 0 still leaves its
+    // axis bit-exact.
+    //
+    // WHO computes the delta is none of this module's business — a detector, a gain computer and
+    // ballistics live in whatever composes them (see felitronics::dynamiceq). `eq` deliberately takes
+    // a number, so it gains no dependency on `dynamics` and stays readable.
+    //
+    // The static curve remains a MATCHED biquad; only the moving part is an SVF, because its gain is
+    // cheap to modulate without a redesign. Feeding the whole gain through one SVF instead — as a
+    // simpler dynamic band does — would forfeit the Nyquist-accurate static response.
+    //
+    // Call from the processBlock thread. Cheap: it stores a number; coefficients follow at control
+    // rate inside process. Deltas are IGNORED unless params().dyn.on, so a non-dynamic band is
+    // bit-identical to one that never heard of dynamics.
+    void setLaneDeltaDb (Lane l, double db) noexcept
+    {
+        const double v = std::isfinite (db) ? std::clamp (db, -60.0, 60.0) : 0.0;
+        if (l == Lane::Stereo) deltaSTDb_ = v;
+        else                   laneRt_[(std::size_t) l].deltaDb = v;
+    }
+
+    double laneDeltaDb (Lane l) const noexcept
+    {
+        return l == Lane::Stereo ? deltaSTDb_ : laneRt_[(std::size_t) l].deltaDb;
     }
 
     // Call from the SAME thread as processBlock() (typically the audio thread, where the host adapter
@@ -420,6 +457,11 @@ public:
         if (sRun)  moving = moving || laneMoving (Lane::Side);
         if (recomputePending || moving) { updateCoeffs(); recomputePending = moving; }
 
+        // Dynamics is opt-in per point: with dyn.on false nothing below touches the signal, so a
+        // static band is bit-identical to one built before dynamics existed.
+        const bool dyn = p.dyn.on;
+        if (dyn) updateDeltaCoeffs();
+
         // (1) ST lane — per channel. The swept SVF path only runs in the single-ST config; matched
         //     biquads otherwise. (The swept engine legitimately runs on mono and surround too.)
         if (stRun)
@@ -438,6 +480,7 @@ public:
                     {
                         float x = d[n];
                         for (int s = 0; s < designNST_; ++s) x = bqST_[s][c].processSample (x);
+                        if (dyn) x = deltaST_.processSample (c, x);   // moving part, after the matched static
                         d[n] = x;
                     }
                 }
@@ -456,6 +499,7 @@ public:
                 {
                     float x = L[n];
                     for (int s = 0; s < rt.designN; ++s) x = rt.bq[s].processSample (x);
+                    if (dyn) x = rt.delta.processSample (0, x);
                     L[n] = x;
                 }
             }
@@ -466,6 +510,7 @@ public:
                 {
                     float x = R[n];
                     for (int s = 0; s < rt.designN; ++s) x = rt.bq[s].processSample (x);
+                    if (dyn) x = rt.delta.processSample (0, x);
                     R[n] = x;
                 }
             }
@@ -478,8 +523,9 @@ public:
                     const float m = 0.5f * (L[n] + R[n]);
                     const float s = 0.5f * (L[n] - R[n]);
                     float dM = 0.0f, dS = 0.0f;
-                    if (mRun) { float x = m; for (int k = 0; k < M.designN; ++k) x = M.bq[k].processSample (x); dM = x - m; }
-                    if (sRun) { float y = s; for (int k = 0; k < S.designN; ++k) y = S.bq[k].processSample (y); dS = y - s; }
+                    // filt = static o svfDelta, so the fold still nulls to zero on an idle lane.
+                    if (mRun) { float x = m; for (int k = 0; k < M.designN; ++k) x = M.bq[k].processSample (x); if (dyn) x = M.delta.processSample (0, x); dM = x - m; }
+                    if (sRun) { float y = s; for (int k = 0; k < S.designN; ++k) y = S.bq[k].processSample (y); if (dyn) y = S.delta.processSample (0, y); dS = y - s; }
                     L[n] += dM + dS;   // L=M+S, R=M-S: fold deltas back. An idle lane (d=0) leaves its axis bit-exact.
                     R[n] += dM - dS;
                 }
@@ -515,7 +561,39 @@ private:
         BiquadCoeffs coeffs[kMaxSections];
         int          designN = 0;
         bool         active  = false;   // designed on the last updateCoeffs()? (drives the topology reset)
+        Svf          delta;             // dynamic gain-delta bell, INSIDE the lane (see setLaneDeltaDb)
+        double       deltaDb = 0.0;
+        double       deltaApplied = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed
     };
+
+    // Same bit-pattern discipline the params use, so a redesign-skip cannot be tripped by -Wfloat-equal
+    // and NaN (the "never applied" sentinel) always compares unequal.
+    static bool sameBits (double a, double b) noexcept
+    {
+        return std::bit_cast<std::uint64_t> (a) == std::bit_cast<std::uint64_t> (b);
+    }
+
+    // Control-rate: push any changed lane delta into its SVF. The bell tracks the lane's own freq/Q,
+    // so the moving part sits exactly where the static curve does.
+    void updateDeltaCoeffs() noexcept
+    {
+        if (! sameBits (deltaSTDb_, deltaAppliedST_))
+        {
+            const LaneParams& lp = p.lane (Lane::Stereo);
+            deltaST_.setParams (FilterType::Bell, lp.freq, lp.Q, deltaSTDb_);
+            deltaAppliedST_ = deltaSTDb_;
+        }
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            if (! sameBits (rt.deltaDb, rt.deltaApplied))
+            {
+                const LaneParams& lp = p.lane (l);
+                rt.delta.setParams (FilterType::Bell, lp.freq, lp.Q, rt.deltaDb);
+                rt.deltaApplied = rt.deltaDb;
+            }
+        }
+    }
 
     static constexpr Lane kMonoLanes[4] { Lane::Left, Lane::Right, Lane::Mid, Lane::Side };
 
@@ -642,6 +720,11 @@ private:
 
     void flushState() noexcept
     {
+        if (p.dyn.on)   // Law 8 for the moving part too — these are feedback kernels like any other
+        {
+            deltaST_.flushDenormals();
+            for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.flushDenormals();
+        }
         if (sweptActive()) svf_.flushDenormals();
         else for (int c = 0; c < ch; ++c)
                  for (int s = 0; s < kMaxSections; ++s) bqST_[s][c].flushDenormals();
@@ -680,6 +763,9 @@ private:
     bool         stActive_  = false;
     bool         lastSwept_ = false;
     Svf          svf_;
+    Svf          deltaST_;             // dynamic gain-delta bell for the ST lane (per channel)
+    double       deltaSTDb_ = 0.0;
+    double       deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();   // last coeffs pushed
 
     // L / R / M / S lanes. Indexed by Lane; the [Lane::Stereo] entry is unused (the ST lane keeps the
     // per-channel columns above) — a trivial, deliberate slot for index-by-enum clarity.
