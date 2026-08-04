@@ -5,6 +5,37 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.14.0 — the auto-first dynamic EQ across placement lanes (`dynamics`, `eq`, `dynamiceq`)
+
+- **feat(dynamics):** `RelativeLevel` — a slow programme-level estimator with an offset, so a
+  threshold can be expressed relative to what a band's own region normally does rather than in
+  absolute dBFS (meaningless when the same setting is shared by lanes sitting 20 dB apart).
+  `BandBallistics` derives attack/release from a band's own `fc` and `Q`: a band's envelope rises
+  with its inverse bandwidth `Q/fc`, not with its period, so one 0..1 "deviation" pair means the
+  same thing on a 60 Hz band and a 7 kHz one. Both JUCE-free, software-flushed, control-rate safe.
+- **feat(eq):** `BandParams` gains point-level `DynParams { on, rangeDb, thrDb, thrAuto, atk, rel }`
+  and `EqBand` gains the **delta seam** `setLaneDeltaDb(Lane, dB)` — the band accepts a NUMBER and
+  applies it with its own `Svf` inside the lane, after the matched static biquad and before the M/S
+  fold. `eq` therefore takes no dependency on `dynamics`. With `dyn.on` false a band is
+  bit-identical to one built before dynamics existed.
+- **feat(eq):** `EqEngine::captureSectionInput()` + `bandAt()`/`bandCount()`. A dynamics layer must
+  detect on the section's own input: in a series chain a band's input is the previous bands' OUTPUT,
+  so their moving deltas would modulate later detectors at overlapping frequencies and the chain
+  would pump. The engine deliberately does not hard-code the interleaved loop — it hands out the
+  bands so a composition layer can run "delta, then band" in chain order.
+- **feat(dynamiceq):** `LaneDynamics` — the lanes-aware composition layer: per-lane sidechain probe,
+  envelope follower, `RelativeLevel`, `GainComputer` (ratio and knee fixed internally), GR
+  ballistics and the seam write, at a K=16 control rate. Reuses the primitives rather than
+  `DynamicEqBand`, whose single-SVF topology would forfeit the matched static curve.
+- **fix:** the hardening rounds behind the above — a per-sample control path (interval-correct
+  coefficients; a block-size-invariance test pins it), gate parity, no live state carried across
+  `reset()`, per-lane state drop on disengage, no seed-from-warmup duck at transport start, a
+  hot-signal clamp, and `core::fastGainToDb` on the detector paths (max error 0.0001 dB) to keep the
+  per-sample path affordable.
+- **fix(dynamiceq):** `laneSignal`'s `switch` names the Stereo lane instead of leaning on `default:`
+  — `-Wswitch-enum` is part of JUCE's recommended warning set, so the old form fired in every
+  consumer that included the header.
+
 ## v0.13.1 — nlohmann rides with the exported namz headers (`felitronics::nam`)
 
 - **fix(nam):** namz's rig headers (`namz_rig*.h`) publicly include `<nlohmann/json.hpp>`;
