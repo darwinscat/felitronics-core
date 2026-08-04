@@ -343,12 +343,13 @@ private:
         const float R = nc > 1 ? sc[1][k] : L;
         switch (l)
         {
-            case eq::Lane::Left:  return L;
-            case eq::Lane::Right: return R;
-            case eq::Lane::Mid:   return 0.5f * (L + R);
-            case eq::Lane::Side:  return 0.5f * (L - R);
-            default:              return L;
+            case eq::Lane::Left:   return L;
+            case eq::Lane::Right:  return R;
+            case eq::Lane::Mid:    return 0.5f * (L + R);
+            case eq::Lane::Side:   return 0.5f * (L - R);
+            case eq::Lane::Stereo: break;   // the ST lane detects on channel 0, handled by the fallthrough
         }
+        return L;
     }
 
     double        fs_ = 48000.0;
