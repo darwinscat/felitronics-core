@@ -15,6 +15,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_lineareq_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_lineareq_tests COMMAND felitronics_lineareq_tests)
 
+    add_executable(felitronics_magnitudecurve_tests tests/MagnitudeCurveTests.cpp)
+    target_link_libraries(felitronics_magnitudecurve_tests PRIVATE felitronics::lineareq)
+    target_include_directories(felitronics_magnitudecurve_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_magnitudecurve_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_magnitudecurve_tests COMMAND felitronics_magnitudecurve_tests)
+
     add_executable(felitronics_mixedphasefir_tests tests/MixedPhaseFirTests.cpp)
     target_link_libraries(felitronics_mixedphasefir_tests PRIVATE felitronics::lineareq)
     target_include_directories(felitronics_mixedphasefir_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

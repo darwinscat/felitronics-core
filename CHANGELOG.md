@@ -5,6 +5,23 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.15.0 — a magnitude table becomes a filter (`lineareq`)
+
+- **feat(lineareq):** `MagnitudeCurve.h` — dB against a log-frequency grid turned into a runnable
+  minimum-phase FIR. A measurement produces a table, a pack ships a table, and every reader of one
+  needs exactly this; it lived in OrbitCapture NAM until a second consumer appeared, which is one
+  copy earlier than the house rule allows. `logFreqGrid`, `curveDbAt`, `heldOutsideBand`,
+  `magnitudeCurveToFir`, `curveAtPosition`.
+- Minimum phase via `MixedPhaseFir` at k = 1: the magnitude is exact, there is no pre-ring and no
+  bulk delay, so switching a control does not shift the audio in time. It is not a fitted 1-pole —
+  measured on real hardware the best fit missed a Big Muff tone control by 15 to 65 dB across its
+  30 dB of tilt, so the curve is the only honest description.
+- `curveAtPosition` interpolates against the producer's stated `norm`, never the array index: a
+  control measured at 0/30/150/300 on a 300-degree dial has norms 0, 0.1, 0.5, 1.0, and treating
+  those as evenly spaced puts a knob halfway four to six decibels wrong.
+- **No product policy travels with it.** Trust thresholds and what a pack may claim stay with the
+  format that owns them; the trusted band arrives here as two numbers.
+
 ## v0.14.0 — the auto-first dynamic EQ across placement lanes (`dynamics`, `eq`, `dynamiceq`)
 
 - **feat(dynamics):** `RelativeLevel` — a slow programme-level estimator with an offset, so a
