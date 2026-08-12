@@ -673,15 +673,37 @@ namespace matched
     }
 
     //==========================================================================
-    // First-order low/high pass (6 dB/oct), bilinear. The matched 2nd-order machinery isn't needed
-    // at this gentle slope (Nyquist cramping is negligible) — used as the odd section of a cascade.
+    // First-order low pass (6 dB/oct), magnitude-matched. Bilinear is NOT usable here: it puts a
+    // zero at z = -1, so the response dives to -inf at Nyquist instead of rolling off at a gentle
+    // 6 dB/oct — audibly and visibly wrong for an LPF sitting in the top octaves (the "curve bends
+    // to the floor at 20k" bug). This design matches the analog magnitude exactly at DC, at f0
+    // (-3.01 dB) and at Nyquist; the pole falls out of a quadratic whose roots are reciprocal, so
+    // the small root is always the stable one.
     inline BiquadCoeffs lowpass1 (double f0, double fs) noexcept
     {
         BiquadCoeffs c;
-        const double K = std::tan (kPi * f0 / fs), nrm = 1.0 / (1.0 + K);
-        c.b0 = K * nrm; c.b1 = K * nrm; c.b2 = 0.0; c.a1 = (K - 1.0) * nrm; c.a2 = 0.0;
+        f0 = std::min (f0, 0.495 * fs);
+
+        const double fn = 0.5 * fs;
+        const double hN = 1.0 / std::sqrt (1.0 + (fn / f0) * (fn / f0)); // analog |H| at Nyquist
+        const double cw = std::cos (2.0 * kPi * f0 / fs);
+
+        const double A1 = 0.5 * (1.0 + cw);
+        const double A2 = 0.5 * hN * hN * (1.0 - cw);
+        const double P  = A1 + A2 - 0.5;
+        const double Q  = 2.0 * (A2 - A1) + cw;
+
+        const double disc  = std::max (0.0, Q * Q - 4.0 * P * P);
+        const double denom = -Q + std::sqrt (disc);
+        const double a     = denom > 1.0e-12 ? 2.0 * P / denom : 0.0;
+
+        c.b0 = 0.5 * ((1.0 - a) + hN * (1.0 + a));
+        c.b1 = 0.5 * ((1.0 - a) - hN * (1.0 + a));
+        c.b2 = 0.0; c.a1 = -a; c.a2 = 0.0;
         return c;
     }
+    // First-order high pass, bilinear — and here bilinear is right: the zero lands at DC, exactly
+    // where the analog filter has one, and at Nyquist it reads unity vs the analog ~1 (negligible).
     inline BiquadCoeffs highpass1 (double f0, double fs) noexcept
     {
         BiquadCoeffs c;

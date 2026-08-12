@@ -855,4 +855,77 @@ void runMatchedBiquadTests()
                 expectTrue (matched::lowShelfDb  (f0, fs, gDb).isStable(), "low shelf unstable" + at);
             }
     }
+
+    // The first-order sections are the ODD member of every variable-slope cascade, so whatever they do
+    // near Nyquist the whole 6/18/30/42 dB-per-octave family inherits. The theory is the analog one-pole
+    // |H| = 1/sqrt(1 + (f/f0)^2): it is finite everywhere, and at Nyquist it is a NUMBER, not a hole.
+    // A bilinear lowpass1 cannot express that — its zero at z = -1 forces -inf there — which is exactly
+    // the failure these cases refute.
+    group ("first-order lowpass: analog magnitude at DC, at f0 and AT NYQUIST (no bilinear dive)");
+    {
+        auto analog1Db = [] (double f, double f0)
+        { return 20.0 * std::log10 (1.0 / std::sqrt (1.0 + (f / f0) * (f / f0))); };
+
+        int unstable = 0, nonfinite = 0, nonMonotone = 0;
+        double worstDc = 0.0, worstF0 = 0.0, worstNyq = 0.0, worstDev = 0.0;
+
+        for (double fsg : { 44100.0, 48000.0, 96000.0, 192000.0 })
+            for (double f0 : { 20.0, 100.0, 1000.0, 5000.0, 10000.0, 16000.0, 20000.0 })
+            {
+                if (f0 > 0.49 * fsg) continue;
+                const auto c = matched::lowpass1 (f0, fsg);
+                if (! c.isStable()) ++unstable;
+                if (! (std::isfinite (c.b0) && std::isfinite (c.b1) && std::isfinite (c.a1))) ++nonfinite;
+
+                const double wf = 2.0 * kPi * f0 / fsg;
+                worstDc  = std::max (worstDc,  std::fabs (c.magnitudeDb (0.0)));
+                worstF0  = std::max (worstF0,  std::fabs (c.magnitudeDb (wf) - (-3.0103)));
+                worstNyq = std::max (worstNyq, std::fabs (c.magnitudeDb (kPi) - analog1Db (0.5 * fsg, f0)));
+
+                // Monotone down, and never further than a dB from the prototype in between: three
+                // matched points would still allow a ripple that the ear would hear as a resonance.
+                double prev = 1e9;
+                for (int i = 0; i <= 2000; ++i)
+                {
+                    const double f = 0.5 * fsg * (double) i / 2000.0;
+                    const double d = c.magnitudeDb (2.0 * kPi * f / fsg);
+                    if (d > prev + 1e-9) ++nonMonotone;
+                    prev = d;
+                    if (i > 0) worstDev = std::max (worstDev, std::fabs (d - analog1Db (f, f0)));
+                }
+            }
+
+        std::printf ("      first-order LP: |DC| %.2e dB, f0 err %.2e dB, Nyquist err %.2e dB, worst dev %.3f dB\n",
+                     worstDc, worstF0, worstNyq, worstDev);
+        expectTrue (unstable == 0,     "every first-order lowpass stable");
+        expectTrue (nonfinite == 0,    "every first-order lowpass coefficient finite");
+        expectTrue (nonMonotone == 0,  "magnitude falls monotonically — no ripple between matched points");
+        expectTrue (worstDc  < 1e-9,   "unity at DC");
+        expectTrue (worstF0  < 0.01,   "-3.01 dB at f0");
+        expectTrue (worstNyq < 1e-6,   "analog magnitude AT Nyquist (bilinear would read -inf)");
+        expectTrue (worstDev < 1.0,    "within 1 dB of the analog one-pole across the whole band");
+    }
+
+    group ("first-order lowpass: the top octaves roll off, they do not fall off a cliff");
+    {
+        // The bug this refutes: a 6 dB/oct LPF parked in the air band read like a brickwall at 20 kHz.
+        const auto c = matched::lowpass1 (20000.0, fs);
+        expectTrue (c.magnitudeDb (kPi) > -6.0, "20 kHz LP is barely down at Nyquist, not annihilated");
+        // Between an octave below f0 and Nyquist the slope must stay gentle — a bilinear section loses
+        // tens of dB over the same span.
+        const double drop = c.magnitudeDb (w (10000.0)) - c.magnitudeDb (kPi);
+        expectTrue (drop < 6.0, "less than 6 dB from 10 kHz to Nyquist");
+    }
+
+    group ("first-order highpass: keeps its DC zero (bilinear is the RIGHT choice there)");
+    {
+        for (double f0 : { 30.0, 300.0, 3000.0 })
+        {
+            const auto c = matched::highpass1 (f0, fs);
+            const std::string at = " (f0=" + std::to_string ((int) f0) + ")";
+            expectTrue (c.isStable(), "stable" + at);
+            expectTrue (c.magnitudeDb (0.0) < -200.0, "a true zero at DC" + at);
+            expectNear (c.magnitudeDb (w (f0)), -3.0103, 0.35, "about -3 dB at f0" + at);
+        }
+    }
 }
