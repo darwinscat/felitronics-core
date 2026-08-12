@@ -5,6 +5,27 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.16.0 — the plot's own maths comes home, and 6 dB/oct stops diving (`analysis`, `eq`)
+
+- **feat(analysis):** `PlotMap.h` + `SpectrumPane.h` graduate from TabbyEQ's `eqview` incubator.
+  `PlotMap` is the log-frequency / dB coordinate map of an EQ plot (freq↔x, dB↔y, both ways);
+  `SpectrumPane` is the analyzer pipeline — Hann → real FFT → smoothed dB with peak-hold, resolved
+  into liquid log-frequency columns. Header-only, JUCE-free, no plugin includes. A second consumer
+  is what unlocked the move: OrbitAmp's EQ links need the same two, and TabbyEQ now reads them from
+  here like everyone else.
+- **fix(eq):** `matched::lowpass1` no longer dives at Nyquist. Bilinear puts a zero at z = −1, so
+  every 6 dB/oct low pass fell to −inf in the top octaves instead of rolling off gently — and since
+  the first-order section is the odd member of every variable-slope cascade, orders 6 / 18 / 30 / 42
+  inherited it. The replacement is a magnitude-matched one-pole: exact at DC, at f0 (−3.01 dB) and
+  at Nyquist (the analog value), its pole taken from the quadratic whose roots are reciprocal, so
+  the small root is always the stable one. `highpass1` keeps bilinear — its zero belongs at DC,
+  which is where the analog filter has one.
+- **test(eq):** the first-order sections are pinned against the analog prototype
+  `|H| = 1/sqrt(1 + (f/f0)²)` over 44.1 / 48 / 96 / 192 kHz × 20 Hz … 20 kHz: unity at DC, −3.01 dB
+  at f0 (4e−08), the analog magnitude **at Nyquist** (7e−15 — a bilinear section reads −inf and
+  fails outright), monotone descent with no ripple between the matched points, and ≤ 0.97 dB from
+  the prototype in between.
+
 ## v0.15.0 — a magnitude table becomes a filter (`lineareq`)
 
 - **feat(lineareq):** `MagnitudeCurve.h` — dB against a log-frequency grid turned into a runnable
