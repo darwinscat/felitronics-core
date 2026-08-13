@@ -122,6 +122,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_nam_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_nam_tests COMMAND felitronics_nam_tests)
 
+    # Reads a config's SHAPE only, so it needs no model and no NAM backend — just the json header.
+    add_executable(felitronics_nam_rf_tests tests/ReceptiveFieldTests.cpp)
+    target_link_libraries(felitronics_nam_rf_tests PRIVATE felitronics::nam)
+    target_include_directories(felitronics_nam_rf_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_nam_rf_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_nam_rf_tests COMMAND felitronics_nam_rf_tests)
+
     add_executable(felitronics_nam_rtalloc_tests tests/NamStageRtAllocTests.cpp)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::nam)
     target_include_directories(felitronics_nam_rtalloc_tests PRIVATE
