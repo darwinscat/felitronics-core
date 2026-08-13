@@ -37,6 +37,9 @@ namespace felitronics::nam {
 
 using BlendModelId = std::uint64_t;      // 0 = this slot holds nothing
 inline constexpr int kBlendSlots = 2;
+// Far more than the handful of samples two captures of one device drift apart by, and still small
+// enough that the correction can never be mistaken for an effect.
+inline constexpr int kBlendMaxDelay = 128;
 
 struct BlendPolicy {
     // How far the weight may travel in one block. The full crossfade therefore takes at least
@@ -170,11 +173,10 @@ inline void blendLoadFailed(BlendState& s, int slot) {
 
 // A whole-sample delay applied in place, carrying its own tail between blocks. The tail MUST advance
 // every block, including while the slot is silent, or the first audible samples read a stale line.
-template <std::size_t Cap>
-inline void blendDelay(float* x, float (&tail)[Cap], int n, int count) {
-    if (n <= 0 || n > (int) Cap || count <= 0) return;
+inline void blendDelay(float* x, float* tail, int cap, int n, int count) {
+    if (x == nullptr || tail == nullptr || n <= 0 || n > cap || count <= 0) return;
     const int carry = std::min(n, count);
-    float keep[Cap] {};
+    float keep[kBlendMaxDelay] {};
     for (int i = 0; i < carry; ++i) keep[i] = x[count - carry + i];
     for (int i = count - 1; i >= n; --i) x[i] = x[i - n];
     for (int i = 0; i < std::min(n, count); ++i) x[i] = tail[i];

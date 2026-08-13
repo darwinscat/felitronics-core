@@ -280,17 +280,17 @@ int main() {
         constexpr std::size_t cap = 128;
         float tail[cap] {};
         float x[4] = { 1, 2, 3, 4 };
-        blendDelay(x, tail, 2, 4);
+        blendDelay(x, tail, (int) cap, 2, 4);
         ok(x[0] == 0.0f && x[1] == 0.0f && x[2] == 1.0f && x[3] == 2.0f,
            "two samples of delay pushes the block back by two");
         float y[4] = { 5, 6, 7, 8 };
-        blendDelay(y, tail, 2, 4);
+        blendDelay(y, tail, (int) cap, 2, 4);
         ok(y[0] == 3.0f && y[1] == 4.0f && y[2] == 5.0f && y[3] == 6.0f,
            "…and the next block continues from the tail, with nothing lost");
 
         float z[4] = { 1, 2, 3, 4 };
         float clean[cap] {};
-        blendDelay(z, clean, 0, 4);
+        blendDelay(z, clean, (int) cap, 0, 4);
         ok(z[0] == 1.0f && z[3] == 4.0f, "no delay changes nothing at all");
     }
 
