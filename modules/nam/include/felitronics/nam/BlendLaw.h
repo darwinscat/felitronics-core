@@ -143,4 +143,39 @@ inline void blendLoadFailed(BlendState& s, int slot) {
     if (slot >= 0 && slot < kBlendSlots) s.inFlight[slot] = false;
 }
 
+// ---- and the arithmetic that applies it to audio -------------------------------------------------
+// Separated from the law on purpose: the law says WHAT the weights are, this says what happens to the
+// samples. Losing one of the two model calls in the host was audible only as "the loudness ripples
+// with the knob" — because an unprocessed slot passes the DI through, and a DI is some ten decibels
+// above a normalised capture. A block of arithmetic that can be run without a model, a device or a
+// sound card is a block that cannot lose half of itself unnoticed.
+
+// A whole-sample delay applied in place, carrying its own tail between blocks. The tail MUST advance
+// every block, including while the slot is silent, or the first audible samples read a stale line.
+template <std::size_t Cap>
+inline void blendDelay(float* x, float (&tail)[Cap], int n, int count) {
+    if (n <= 0 || n > (int) Cap || count <= 0) return;
+    const int carry = std::min(n, count);
+    float keep[Cap] {};
+    for (int i = 0; i < carry; ++i) keep[i] = x[count - carry + i];
+    for (int i = count - 1; i >= n; --i) x[i] = x[i - n];
+    for (int i = 0; i < std::min(n, count); ++i) x[i] = tail[i];
+    for (int i = 0; i + carry < n; ++i) tail[i] = tail[i + carry];
+    for (int i = 0; i < carry; ++i) tail[n - carry + i] = keep[i];
+}
+
+// The two slot outputs, already produced by their own models, mixed by a weight that travels from
+// `beginB` to `endB` across the block. `a` is overwritten with the result. Linear, not equal-power:
+// both models were fed the identical signal so their harmonics arrive in phase and add — equal-power
+// would swell by 3 dB in the middle of every turn of the knob.
+inline void blendMix(float* a, const float* b, int count, double beginB, double endB) {
+    if (count <= 0) return;
+    const float from = (float) beginB, step = (float) ((endB - beginB) / (double) count);
+    float m = from;
+    for (int i = 0; i < count; ++i) {
+        m += step;
+        a[i] = a[i] * (1.0f - m) + b[i] * m;
+    }
+}
+
 } // namespace felitronics::nam

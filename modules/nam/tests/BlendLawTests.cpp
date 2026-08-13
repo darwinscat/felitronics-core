@@ -222,5 +222,59 @@ int main() {
         ok(run.loads == 0 && run.worstStep <= 1e-12, "no load, no movement - idle is idle");
     }
 
+    group("the mix is the two slots, weighted — and nothing else");
+    {
+        // THE SLIP THIS CATCHES: one of the two model calls went missing in the host, so the mix was
+        // the raw DI against a model rather than model against model. It was audible only as the
+        // loudness rippling with the knob, loud at every even capture and quiet at every odd one,
+        // because a DI is some ten decibels above a normalised capture. Here it is arithmetic.
+        constexpr int n = 8;
+        float a[n], b[n];
+        for (int i = 0; i < n; ++i) { a[i] = 1.0f; b[i] = 3.0f; }
+        blendMix(a, b, n, 0.0, 0.0);
+        bool allA = true; for (const float v : a) allA = allA && std::abs(v - 1.0f) < 1e-6f;
+        ok(allA, "at weight zero the first slot is the whole sound");
+
+        for (int i = 0; i < n; ++i) { a[i] = 1.0f; b[i] = 3.0f; }
+        blendMix(a, b, n, 1.0, 1.0);
+        bool allB = true; for (const float v : a) allB = allB && std::abs(v - 3.0f) < 1e-6f;
+        ok(allB, "…and at one, the second");
+
+        for (int i = 0; i < n; ++i) { a[i] = 1.0f; b[i] = 3.0f; }
+        blendMix(a, b, n, 0.5, 0.5);
+        bool half = true; for (const float v : a) half = half && std::abs(v - 2.0f) < 1e-6f;
+        ok(half, "halfway is the average - linear, so two coherent halves stay at unity");
+
+        // Ramping across the block: the last sample must have arrived at the end weight.
+        for (int i = 0; i < n; ++i) { a[i] = 0.0f; b[i] = 1.0f; }
+        blendMix(a, b, n, 0.0, 1.0);
+        ok(std::abs(a[n - 1] - 1.0f) < 1e-6f, "a ramp lands exactly on the weight the block ends with");
+        bool rising = true;
+        for (int i = 1; i < n; ++i) rising = rising && a[i] > a[i - 1];
+        ok(rising, "…and gets there monotonically, without a step");
+    }
+
+    group("a slot's delay line carries between blocks");
+    {
+        // The correction for two captures sitting a few samples apart. It has to survive a block
+        // boundary, and it has to keep advancing while the slot is silent — otherwise the first
+        // audible samples read a line full of whatever was there before.
+        constexpr std::size_t cap = 128;
+        float tail[cap] {};
+        float x[4] = { 1, 2, 3, 4 };
+        blendDelay(x, tail, 2, 4);
+        ok(x[0] == 0.0f && x[1] == 0.0f && x[2] == 1.0f && x[3] == 2.0f,
+           "two samples of delay pushes the block back by two");
+        float y[4] = { 5, 6, 7, 8 };
+        blendDelay(y, tail, 2, 4);
+        ok(y[0] == 3.0f && y[1] == 4.0f && y[2] == 5.0f && y[3] == 6.0f,
+           "…and the next block continues from the tail, with nothing lost");
+
+        float z[4] = { 1, 2, 3, 4 };
+        float clean[cap] {};
+        blendDelay(z, clean, 0, 4);
+        ok(z[0] == 1.0f && z[3] == 4.0f, "no delay changes nothing at all");
+    }
+
     return felitronics::test::report();
 }
