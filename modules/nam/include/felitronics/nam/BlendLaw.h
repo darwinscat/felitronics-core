@@ -94,9 +94,11 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     const bool unsafe0 = ! blendAudible(s, 0), unsafe1 = ! blendAudible(s, 1);
     const bool wrong0 = s.held[0] != r.want[0], wrong1 = s.held[1] != r.want[1];
     double goal;
-    if (unsafe0 && unsafe1) goal = 0.0;          // nothing may be heard: slot 0 sounds anyway, since
-                                                 // 132 ms of a model converging on the truth reads as
-                                                 // a knob and 132 ms of silence reads as a fault
+    // Nothing may be heard yet. One of them sounds anyway — 132 ms of a model converging on the
+    // truth reads as a knob, while 132 ms of silence reads as a fault. But NEVER an empty slot: a
+    // stage with no model passes its input straight through, and the raw DI is both wrong and about
+    // ten decibels louder than any capture. An empty slot is silent or it is a disaster.
+    if (unsafe0 && unsafe1) goal = (s.held[0] != 0 || s.held[1] == 0) ? 0.0 : 1.0;
     else if (unsafe1)       goal = 0.0;
     else if (unsafe0)       goal = 1.0;
     else if (wrong0 && wrong1) goal = s.x <= 0.5 ? 0.0 : 1.0;   // evacuate the LIGHTER one first and

@@ -197,6 +197,22 @@ int main() {
         ok(run.loads == 2, "exactly two loads: no timeout, no retry storm");
     }
 
+    group("an empty slot is never the one that sounds");
+    {
+        // A NamStage with no model is a PASSTHROUGH, not silence. Letting an empty slot carry would
+        // put the raw DI on the output — wrong, and some ten decibels louder than any capture.
+        BlendState s;                          // nothing held anywhere
+        s.held[1] = 7; s.need[1] = kPrewarm; s.fed[1] = kPrewarm;   // …except a fed model in slot 1
+        BlendRequest r; r.want[0] = 0; r.want[1] = 7; r.targetB = 0.5;
+        for (int b = 0; b < 40; ++b) blendStep(s, r, kBlock);
+        ok(std::abs(s.x - 1.0) < 1e-9, "the weight goes to the slot that actually holds a model");
+
+        BlendState both;                       // and with neither holding anything, slot 0 by default
+        BlendRequest none;
+        for (int b = 0; b < 40; ++b) blendStep(both, none, kBlock);
+        ok(both.x == 0.0, "…and with nothing anywhere it does not thrash");
+    }
+
     group("a request repeated forever changes nothing");
     {
         auto s = settledAt(150.0);
