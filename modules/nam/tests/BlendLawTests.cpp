@@ -71,12 +71,14 @@ struct Run {
         worstSeam = std::max(worstSeam, std::abs(st.beginB - prevEnd));
         prevEnd = st.endB;
 
-        // NOTHING UNFED MAY BE HEARD. Checked on the weight the block ENDS with as well as begins,
-        // because a slot may rise inside a block.
+        // NOTHING UNFED MAY BE HEARD — anywhere inside the block, and counted against the samples
+        // that had been fed BEFORE it, since a counter crossing the line mid-block does not make the
+        // first half of that block fed. The overall gain counts too: muted is not heard.
         for (int i = 0; i < kBlendSlots; ++i) {
             const double w = std::max(i == 0 ? 1.0 - st.beginB : st.beginB,
-                                      i == 0 ? 1.0 - st.endB   : st.endB);
-            if (s.held[i] != 0 && s.fed[i] < s.need[i] && w > 1.0e-9) unfedHeard = true;
+                                      i == 0 ? 1.0 - st.endB   : st.endB)
+                           * std::max(st.beginGain, st.endGain);
+            if (s.held[i] != 0 && s.fed[i] - kBlock < s.need[i] && w > 1.0e-9) unfedHeard = true;
         }
         // …and nothing may be REPLACED unless its weight is exactly zero.
         if (st.load.wanted) {
@@ -88,7 +90,7 @@ struct Run {
             ++loads;
             pending = true; pendSlot = st.load.slot; pendModel = st.load.model; pendLeft = std::max(1, loadBlocks);
         }
-        // A block where NEITHER slot is audible is a hole — the thing the law exists to avoid.
+        // A block where NEITHER slot is audible is a hole — tolerable only at a cold start.
         if (! blendAudible(s, 0) && ! blendAudible(s, 1)) ++gapBlocks;
     }
 };
@@ -207,10 +209,26 @@ int main() {
         for (int b = 0; b < 40; ++b) blendStep(s, r, kBlock);
         ok(std::abs(s.x - 1.0) < 1e-9, "the weight goes to the slot that actually holds a model");
 
-        BlendState both;                       // and with neither holding anything, slot 0 by default
+        BlendState both;                       // and with neither holding anything at all
         BlendRequest none;
-        for (int b = 0; b < 40; ++b) blendStep(both, none, kBlock);
+        BlendStep last;
+        for (int b = 0; b < 40; ++b) last = blendStep(both, none, kBlock);
         ok(both.x == 0.0, "…and with nothing anywhere it does not thrash");
+        ok(last.endGain == 0.0, "…and stays MUTED rather than letting a passthrough out");
+
+        // A freshly landed model is silent for its whole receptive field, gain and all.
+        BlendState cold; BlendRequest want; want.want[0] = 5; want.targetB = 0.0;
+        blendLanded(cold, 0, 5, kPrewarm);
+        bool heard = false;
+        int blocks = 0;
+        for (; blocks < 40; ++blocks) {
+            const auto st = blendStep(cold, want, kBlock);
+            const double w = std::max(st.beginGain, st.endGain) * std::max(1.0 - st.beginB, 1.0 - st.endB);
+            if (cold.fed[0] - kBlock < kPrewarm && w > 1e-9) heard = true;
+            if (st.endGain > 0.5) break;
+        }
+        ok(! heard, "a cold model is inaudible for its whole receptive field");
+        ok(blocks >= kPrewarm / kBlock, "…which is at least " + std::to_string(kPrewarm / kBlock) + " blocks");
     }
 
     group("a request repeated forever changes nothing");

@@ -64,10 +64,14 @@ struct BlendState {
     long long    need[kBlendSlots] {};   // …and how many it must have before it may be heard
     bool         inFlight[kBlendSlots] {};
     double       x = 0.0;                // THE applied weight of slot 1. The only state that sounds.
+    double       gain = 0.0;             // …and whether ANY of it may be heard yet
 };
 
 struct BlendStep {
     double    beginB = 0.0, endB = 0.0;  // the weight at the block's first and last sample
+    // …and how much of the result may be heard at all. One when anything is fed, ramped down to zero
+    // when nothing is — which happens only at a cold start, where silence is what a person expects.
+    double    beginGain = 1.0, endGain = 1.0;
     BlendLoad load;
 };
 
@@ -86,19 +90,28 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     out.beginB = s.x;
     if (blockSamples <= 0) { out.endB = s.x; return out; }
 
+    // FED BEFORE THIS BLOCK, not after. Counting the block first marks a slot audible for the WHOLE
+    // of the block in which its counter crosses the line — including the first few hundred samples,
+    // which are still short of the receptive field. One block of conservatism costs 10 ms of lag and
+    // buys the invariant outright.
+    const bool wasFed[kBlendSlots] { s.fed[0] >= s.need[0], s.fed[1] >= s.need[1] };
     for (int i = 0; i < kBlendSlots; ++i)
         if (s.held[i] != 0 && ! s.inFlight[i]) s.fed[i] += blockSamples;
 
     // The goal, in priority order. Anything unsafe to hear outranks anything merely wrong, and being
     // wrong outranks the request — because a slot cannot take its new model until it is silent.
-    const bool unsafe0 = ! blendAudible(s, 0), unsafe1 = ! blendAudible(s, 1);
+    const bool unsafe0 = ! (s.held[0] != 0 && ! s.inFlight[0] && wasFed[0]);
+    const bool unsafe1 = ! (s.held[1] != 0 && ! s.inFlight[1] && wasFed[1]);
     const bool wrong0 = s.held[0] != r.want[0], wrong1 = s.held[1] != r.want[1];
     double goal;
-    // Nothing may be heard yet. One of them sounds anyway — 132 ms of a model converging on the
-    // truth reads as a knob, while 132 ms of silence reads as a fault. But NEVER an empty slot: a
-    // stage with no model passes its input straight through, and the raw DI is both wrong and about
-    // ten decibels louder than any capture. An empty slot is silent or it is a disaster.
-    if (unsafe0 && unsafe1) goal = (s.held[0] != 0 || s.held[1] == 0) ? 0.0 : 1.0;
+    // NOTHING MAY BE HEARD YET, so nothing is. Letting a half-fed network out "so that something
+    // sounds" breaks the one invariant this law exists for, and it buys nothing: only ONE load is
+    // ever in flight, so a slot always holds either a fed model or the previous, warm one — which
+    // means this case is reachable only at a cold start or a device change. There, a tenth of a
+    // second of silence before the first note is what a person expects, and an empty stage is worse
+    // than silence anyway: NamStage with no model passes its input straight through, and a raw DI
+    // sits some ten decibels above a normalised capture.
+    if (unsafe0 && unsafe1) goal = s.x;                        // hold still; the gain below mutes it
     else if (unsafe1)       goal = 0.0;
     else if (unsafe0)       goal = 1.0;
     else if (wrong0 && wrong1) goal = s.x <= 0.5 ? 0.0 : 1.0;   // evacuate the LIGHTER one first and
@@ -111,6 +124,11 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     const double d = std::clamp(p.maxDeltaPerBlock, 1.0e-9, 1.0);
     s.x = std::clamp(s.x + std::clamp(goal - s.x, -d, d), 0.0, 1.0);
     out.endB = s.x;
+
+    out.beginGain = s.gain;
+    const double wantGain = (unsafe0 && unsafe1) ? 0.0 : 1.0;
+    s.gain = std::clamp(s.gain + std::clamp(wantGain - s.gain, -d, d), 0.0, 1.0);
+    out.endGain = s.gain;
 
     // A swap is asked for only at EXACTLY zero, and only one at a time. Everything above conspires to
     // make that reachable: a wrong slot's goal is a rail, and the rail is its own zero.
