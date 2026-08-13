@@ -129,6 +129,14 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_nam_rf_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_nam_rf_tests COMMAND felitronics_nam_rf_tests)
 
+    # Pure arithmetic — no model, no backend, no sound card. Every assertion is one of the defects
+    # that was previously found only by ear.
+    add_executable(felitronics_nam_blend_tests tests/BlendLawTests.cpp)
+    target_link_libraries(felitronics_nam_blend_tests PRIVATE felitronics::nam)
+    target_include_directories(felitronics_nam_blend_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_nam_blend_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_nam_blend_tests COMMAND felitronics_nam_blend_tests)
+
     add_executable(felitronics_nam_rtalloc_tests tests/NamStageRtAllocTests.cpp)
     target_link_libraries(felitronics_nam_rtalloc_tests PRIVATE felitronics::nam)
     target_include_directories(felitronics_nam_rtalloc_tests PRIVATE
