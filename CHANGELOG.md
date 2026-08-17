@@ -5,6 +5,39 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.17.0 — one law owns which capture is audible (`nam`)
+
+- **feat(nam):** `BlendLaw.h` — two model slots play the same input, a knob between two captures asks
+  for a fraction of each, and this header is the single writer of that number. It comes from the
+  OrbitCapture NAM player, where three places wrote it — the blend, the code following the nearest
+  capture, and a warm-up gate bolted on later. Each was defensible alone; together they replaced
+  models under a live gain and swung the weight across its whole range inside single 10 ms blocks
+  (measured on one sweep of a nine-capture device: 62 loads, 401 parked retries, a full 1.000 swing).
+  Seven attempts to fix that by ear in one day, three of which made it worse — hence a law with
+  properties provable by construction: the weight moves at most one step per block whatever happens,
+  a model is replaced only in a slot whose weight is exactly zero, and progress needs no timeout
+  because some slot's goal is always a rail. What gives is instantaneous accuracy — the incoming
+  model arrives ~132 ms late and the outgoing one carries alone until it does, which reads as a knob
+  rather than as a fault.
+- **feat(nam):** the mixing arithmetic lives with the law rather than in the host: `blendMix` and
+  `blendDelay`, with the properties that make a slip arithmetic instead of a listening exercise —
+  weight 0 is the first slot alone, 1 the second, halfway their linear average (two coherent halves
+  stay at unity, not +3 dB), a ramp lands exactly on the weight its block ends with, and a delay line
+  carries across a block boundary with nothing lost. The host had lost one of its two model calls, so
+  the mix was raw DI against a model; that is audible only as loudness rippling with the knob, and a
+  law about weights cannot see it.
+- **feat(nam):** `NamStage` reports the receptive field a model must be fed before it means anything,
+  and the law counts it BEFORE the block rather than after — one block of conservatism instead of a
+  few hundred samples of a network that has not heard the last 132 ms.
+- **fix(nam):** an unfed slot stays silent even when that means silence. The old "something must
+  sound" rule named slot 0, and a `NamStage` with no model is a PASSTHROUGH — so a device change put
+  the raw DI on the output, some ten decibels above any normalised capture. The step now carries its
+  own gain, ramped by the same clamp as the weight.
+- **refactor(nam):** `blendDelay` takes a pointer and a capacity instead of a template over the
+  tail's array size, which no caller with a `std::array` or a runtime-sized buffer could satisfy
+  without copying the function — which is exactly what the host had done, leaving 45 assertions
+  guarding code that never ran.
+
 ## v0.16.0 — the plot's own maths comes home, and 6 dB/oct stops diving (`analysis`, `eq`)
 
 - **feat(analysis):** `PlotMap.h` + `SpectrumPane.h` graduate from TabbyEQ's `eqview` incubator.
