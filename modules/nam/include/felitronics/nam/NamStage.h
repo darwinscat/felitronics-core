@@ -80,6 +80,13 @@ public:
     double modelLoudness()   const;   // the model's tagged loudness in dB (0 if none / no model)
     bool   modelHasLoudness() const;  // whether the loaded model carries a loudness tag
     int    latencySamples()  const;   // host-rate latency from rate-matching (0 if none / not resampling)
+    // How many samples this model must be FED before its output means anything — its receptive field.
+    // A network with empty buffers describes the silence it was born into for exactly this long, so
+    // anything that fades a freshly loaded model in has to run it silently for this many samples
+    // first. NAM answers for convnet/lstm and a container forwards to its submodel, but WaveNet does
+    // not override it — so for a WaveNet capture this is computed from the config instead of trusted
+    // as zero. 0 = no model, or an architecture nothing here can read.
+    int    prewarmSamples()  const;
 
 private:
     struct Impl;

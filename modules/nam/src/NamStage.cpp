@@ -4,6 +4,8 @@
 #include <felitronics/nam/NamStage.h>
 
 #include <NAM/dsp.h>        // NAM_SAMPLE (float, via NAM_SAMPLE_FLOAT) + class ::nam::DSP
+#include "ReceptiveField.h"
+
 #include <NAM/get_dsp.h>    // ::nam::get_dsp(path|json)
 
 #include <felitronics/core/StreamResampler.h>
@@ -58,13 +60,15 @@ public:
     // argument there right before NeuralStage::process() reaches this backend (same thread →
     // sequenced), keeping NamStage's per-block flag without widening the shared Inference seam.
     NamBackend (std::unique_ptr<::nam::DSP> m0, std::unique_ptr<::nam::DSP> m1,
-                float trimDb, const std::atomic<bool>& normalizeFlag)
+                float trimDb, const std::atomic<bool>& normalizeFlag, int prewarmFromConfig = 0)
         : normalize (&normalizeFlag)
     {
+        prewarm = prewarmFromConfig;          // …raised below by NAM's own answer, where it has one
         inst[0] = std::move (m0);
         inst[1] = std::move (m1);
 
         expectedSR = inst[0]->GetExpectedSampleRate();
+        prewarm = std::max (prewarm, inst[0]->GetPrewarmSamples());
         if (inst[0]->HasLoudness())
         {
             loudnessDb  = inst[0]->GetLoudness();
@@ -151,6 +155,7 @@ public:
 
     //--- model info (read by the loader for NamStage's UI-mirror atomics) ----------
     double reportedSampleRate()  const noexcept { return expectedSR; }
+    int    reportedPrewarm()     const noexcept { return prewarm; }
     double reportedLoudnessDb()  const noexcept { return loudnessDb; }
     bool   reportedHasLoudness() const noexcept { return hasLoudness; }
 
@@ -215,6 +220,7 @@ private:
     double expectedSR  = 0.0;
     double loudnessDb  = 0.0;
     bool   hasLoudness = false;
+    int    prewarm     = 0;
 
     double hostSR   = 48000.0;
     int    maxBlock = 512;
@@ -234,6 +240,7 @@ struct NamStage::Impl
 {
     // UI mirrors (message thread reads these) — published ONLY when a swap/clear actually lands
     // (swap first, mirrors second), so they always describe the model that is audibly live.
+    std::atomic<int>    prewarmSamples { 0 };
     std::atomic<double> expectedSR  { 0.0 };
     std::atomic<double> loudnessDb  { 0.0 };
     std::atomic<bool>   hasLoudness { false };
@@ -275,8 +282,9 @@ struct NamStage::Impl
     double modelRunSR = kModelSampleRate;   // run rate configured at the last prepare() — the
                                             // reference for the mid-stream model-rate contract
 
-    void publishMirrors (double sr, double ldb, bool hl)
+    void publishMirrors (double sr, double ldb, bool hl, int prewarm = 0)
     {
+        prewarmSamples.store (prewarm, std::memory_order_relaxed);
         expectedSR.store (sr, std::memory_order_relaxed);
         loudnessDb.store (ldb, std::memory_order_relaxed);
         hasLoudness.store (hl, std::memory_order_relaxed);
@@ -319,6 +327,7 @@ struct NamStage::Impl
         const double sr  = pendingBackend->reportedSampleRate();
         const double ldb = pendingBackend->reportedLoudnessDb();
         const bool   hl  = pendingBackend->reportedHasLoudness();
+        const int    pw  = pendingBackend->reportedPrewarm();
         pendingBackend->attachRetireLedger (&retiredLedger);
         const bool ok = stage.swapPrepared (std::move (pendingBackend));
         pendingActive = false;
@@ -326,7 +335,7 @@ struct NamStage::Impl
             return false;                  // mirrors stay untouched if it ever fired
         if (hadModel)
             ++retiredLedger;               // the replaced model just entered the retire queue
-        publishMirrors (sr, ldb, hl);
+        publishMirrors (sr, ldb, hl, pw);
         return true;
     }
 };
@@ -364,6 +373,8 @@ void NamStage::process (float* const* io, int numChannels, int numSamples, bool 
     impl->stage.process (io, numChannels, numSamples);
 }
 
+
+
 //==============================================================================
 bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float trimDb)
 {
@@ -374,6 +385,7 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
     constexpr std::size_t kMaxUnpackedNamBytes = 64u * 1024u * 1024u;   // zip-bomb guard on unpack
 
     std::unique_ptr<::nam::DSP> m0, m1;
+    int prewarmFromConfig = 0;
     try
     {
         std::vector<std::uint8_t> unpacked;            // owns reconstructed JSON iff input was packed
@@ -390,6 +402,7 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
         auto j = nlohmann::json::parse (begin, end);
         m0 = ::nam::get_dsp (j);            // two independent instances of the same capture
         m1 = ::nam::get_dsp (j);
+        prewarmFromConfig = detail::receptiveFieldFromConfig (j);
     }
     catch (...) { return false; }
 
@@ -412,7 +425,7 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
     // Build + prepare the new backend while it is NOT live (alloc + prewarm is fine here — and a
     // low-memory failure fails the LOAD, never the host: prepare() self-catches, see NamBackend).
     std::unique_ptr<NamBackend> backend;
-    try   { backend = std::make_unique<NamBackend> (std::move (m0), std::move (m1), trimDb, impl->normalize); }
+    try   { backend = std::make_unique<NamBackend> (std::move (m0), std::move (m1), trimDb, impl->normalize, prewarmFromConfig); }
     catch (...) { return false; }
     backend->prepare (impl->hostSR, impl->maxBlock, 2);
     if (! backend->prepared())
@@ -451,5 +464,6 @@ double NamStage::modelSampleRate()  const { return impl->expectedSR.load  (std::
 double NamStage::modelLoudness()    const { return impl->loudnessDb.load  (std::memory_order_relaxed); }
 bool   NamStage::modelHasLoudness() const { return impl->hasLoudness.load (std::memory_order_relaxed); }
 int    NamStage::latencySamples()   const { return impl->stage.latencySamples(); }
+int    NamStage::prewarmSamples()   const { return impl->prewarmSamples.load (std::memory_order_relaxed); }
 
 } // namespace felitronics::nam
