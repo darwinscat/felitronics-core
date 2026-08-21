@@ -164,27 +164,30 @@ inline WavData readWav (const std::string& path)
     return readWavMemory (b.data(), b.size());
 }
 
-inline bool writeWav (const std::string& path, const std::vector<std::vector<double>>& ch,
-                      double sr, int bits, bool is_float)
+/// Encode to a WAV image IN MEMORY. Same rules as writeWav (which is now this plus an fwrite): an
+/// empty result means the request was refused, never a truncated file. A library that keeps its audio
+/// in a database needs the bytes, not a path — and a temp file on the way there is a file to lose.
+inline std::vector<std::uint8_t> writeWavMemory (const std::vector<std::vector<double>>& ch,
+                                                double sr, int bits, bool is_float)
 {
     using namespace detail;
-    if (ch.empty()) return false;
+    if (ch.empty()) return {};
     const bool supported = (is_float && bits == 32) || (! is_float && (bits == 16 || bits == 24));
-    if (! supported) return false;
+    if (! supported) return {};
     std::size_t nf = ch[0].size();
     for (const auto& c : ch) nf = std::min (nf, c.size());   // guard ragged channels (no OOB)
-    if (nf == 0) return false;
+    if (nf == 0) return {};
     // Refuse anything the RIFF header cannot represent — a silently truncated header field would
     // write a lying file (e.g. 70000 channels wrapping to a u16, NaN sample rates, >4 GB data).
-    if (! std::isfinite (sr) || sr <= 0.0 || sr > 4294967295.0) return false;
-    if (ch.size() > 0xFFFFu) return false;
+    if (! std::isfinite (sr) || sr <= 0.0 || sr > 4294967295.0) return {};
+    if (ch.size() > 0xFFFFu) return {};
     const std::uint64_t block64 = (std::uint64_t) ch.size() * (std::uint64_t) (bits / 8);
     const std::uint64_t data64  = (std::uint64_t) nf * block64;
-    if (block64 > 0xFFFFu || data64 > 0xFFFFFFFFull - 44u) return false;
+    if (block64 > 0xFFFFu || data64 > 0xFFFFFFFFull - 44u) return {};
     const std::uint16_t nch = (std::uint16_t) ch.size();
     const std::uint16_t fmt = is_float ? 3 : 1;
     const std::uint32_t rate = (std::uint32_t) std::llround (sr);
-    if ((std::uint64_t) rate * block64 > 0xFFFFFFFFull) return false;   // byteRate is a u32 too
+    if ((std::uint64_t) rate * block64 > 0xFFFFFFFFull) return {};   // byteRate is a u32 too
     const std::uint16_t block = (std::uint16_t) block64;
     const std::uint32_t datalen = (std::uint32_t) data64;
     std::vector<std::uint8_t> o; o.reserve (44 + datalen);
@@ -209,6 +212,14 @@ inline bool writeWav (const std::string& path, const std::vector<std::vector<dou
                 o.push_back ((std::uint8_t) (iv & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 8) & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 16) & 0xFF));
             }
         }
+    return o;
+}
+
+inline bool writeWav (const std::string& path, const std::vector<std::vector<double>>& ch,
+                      double sr, int bits, bool is_float)
+{
+    const auto o = writeWavMemory (ch, sr, bits, is_float);
+    if (o.empty()) return false;
     std::FILE* f = std::fopen (path.c_str(), "wb");
     if (! f) return false;
     const bool okw = std::fwrite (o.data(), 1, o.size(), f) == o.size();
