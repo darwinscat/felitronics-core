@@ -5,6 +5,18 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.18.0 — a WAV can be handed over as bytes (`io`)
+
+- **feat(io):** `writeWavMemory` returns the encoded WAV image instead of writing it to a path. A
+  library that keeps its audio in a database needs the image itself, and a temp file on the way there
+  is a file to lose. This is the encoder that was already inside `writeWav`, lifted out unchanged:
+  `writeWav` is now that call plus one `fwrite`, so every rule holds for both by construction — an
+  empty result means the request was refused rather than a truncated file written, ragged channels
+  are guarded against reading past an end, and a header RIFF cannot represent (more than 65535
+  channels, a sample rate that is not finite, data past 4 GB) is refused outright rather than
+  silently wrapped into a lying field. A test asserts the file and the memory image are byte for byte
+  identical, so the two cannot drift apart later.
+
 ## v0.17.0 — one law owns which capture is audible (`nam`)
 
 - **feat(nam):** `BlendLaw.h` — two model slots play the same input, a knob between two captures asks

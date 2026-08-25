@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -54,6 +55,24 @@ int main()
         approx (w.sr, 48000.0, 0.0, "sample rate preserved");
         ok (w.bits == 32 && w.is_float, "32-bit float flags");
         ok (maxErr (w.ch[0], x) < 1e-7, "float roundtrip within float precision");
+    }
+
+    group ("in-memory encode: bytes, never a file on the way");
+    {
+        // A library that keeps its audio in a database needs the image itself; a temp file on the way
+        // there is a file to lose. The bytes must be identical to what writeWav puts on disk.
+        const auto x = sine (2400, 440.0, 48000.0, 0.7);
+        const auto bytes = io::writeWavMemory ({ x }, 48000.0, 24, false);
+        ok (! bytes.empty(), "writeWavMemory returns an image");
+        ok (io::writeWav (tmp, { x }, 48000.0, 24, false), "…and writeWav still writes one");
+        std::ifstream f (tmp, std::ios::binary);
+        const std::vector<std::uint8_t> onDisk ((std::istreambuf_iterator<char> (f)), std::istreambuf_iterator<char>());
+        ok (onDisk == bytes, "the file and the memory image are byte-for-byte the same");
+        const auto w = io::readWavMemory (bytes.data(), bytes.size());
+        ok (w.ok && w.ch.size() == 1 && w.frames() == x.size(), "and it reads back from memory");
+        ok (maxErr (w.ch[0], x) < 1e-6, "24-bit roundtrip through memory");
+        ok (io::writeWavMemory ({}, 48000.0, 16, false).empty(), "no channels → empty, never a truncated image");
+        ok (io::writeWavMemory ({ x }, 48000.0, 8, false).empty(), "8-bit → empty");
     }
 
     group ("24-bit PCM stereo roundtrip + deinterleave");
