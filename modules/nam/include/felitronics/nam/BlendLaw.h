@@ -29,6 +29,15 @@
 // and are compatible. What gives is INSTANTANEOUS ACCURACY. Crossing a capture, the incoming model
 // arrives about 132 ms late and the outgoing capture carries alone until it does. That is a morph
 // that trails the hand, which is what a person hears as a knob rather than as a fault.
+//
+// AND ONE ECONOMY, added after the law had settled: a slot that stands at EXACTLY zero under an
+// unchanged request for longer than the host allows goes COLD. The host stops running its model — the
+// model stays where it is, nothing is unloaded — and the law counts the slot unfed from then on,
+// because it is. The next change of request wakes it by the path a landing takes (fed back to zero,
+// the same receptive field to serve), so (3) holds across a sleep exactly as it holds across a load,
+// and the price is the one already paid at every crossing: the first turn after a rest trails the hand
+// by one warm-up. A slot with any weight at all is never cold, so a pair sounding together stays two
+// passes, as it must; a dial parked on a capture costs one.
 
 #include <algorithm>
 #include <cstdint>
@@ -46,6 +55,11 @@ struct BlendPolicy {
     // 1/maxDeltaPerBlock blocks — at 512 samples and 48 kHz, 0.25 gives 42.7 ms. This is the one
     // number a listener gets to argue with; everything else is derived from it.
     double maxDeltaPerBlock = 0.25;
+    // How long a slot may stand at exactly zero, its request unchanged, before it goes cold (see
+    // BlendState::cold). In SAMPLES, so the law stays as rate-blind as the rest of it; the host turns
+    // its seconds into these. Zero or less = never — the law's own default, because sleeping is an
+    // economy the host asks for with a number in its own rate, not a property of the recurrence.
+    long long coldAfterSamples = 0;
 };
 
 struct BlendRequest {
@@ -66,6 +80,13 @@ struct BlendState {
     long long    fed[kBlendSlots] {};    // samples of real signal since this model landed
     long long    need[kBlendSlots] {};   // …and how many it must have before it may be heard
     bool         inFlight[kBlendSlots] {};
+    // COLD: the slot stood at exactly zero, holding the wanted model, fed, under an unchanged request,
+    // for BlendPolicy::coldAfterSamples. The host does not run a cold slot's model (it stays held —
+    // nothing is unloaded), and the law counts the slot unfed while it sleeps. It wakes on the next
+    // change of request, re-landed with the same model and the same need: a warm-up, never a load.
+    bool         cold[kBlendSlots] {};
+    long long    still[kBlendSlots] {};  // samples at exactly zero under an unchanged request, so far
+    BlendRequest last;                   // the request the previous block was stepped with
     double       x = 0.0;                // THE applied weight of slot 1. The only state that sounds.
     double       gain = 0.0;             // …and whether ANY of it may be heard yet
 };
@@ -82,8 +103,17 @@ struct BlendStep {
 // whether it holds the WANTED model: an old capture is still a real one, and letting it carry while
 // its replacement warms is the whole reason a crossing sounds like a knob instead of a hole.
 inline bool blendAudible(const BlendState& s, int i) {
-    return s.held[i] != 0 && ! s.inFlight[i] && s.fed[i] >= s.need[i];
+    return s.held[i] != 0 && ! s.inFlight[i] && ! s.cold[i] && s.fed[i] >= s.need[i];
 }
+
+// The same request, number for number. Spelled with the orderings so that -Wfloat-equal has nothing
+// to say: a caller republishing the same numbers is the same request, and that is all this asks.
+inline bool blendSameRequest(const BlendRequest& a, const BlendRequest& b) {
+    return a.want[0] == b.want[0] && a.want[1] == b.want[1]
+        && a.targetB <= b.targetB && a.targetB >= b.targetB;
+}
+
+inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long prewarm);
 
 // One audio block. Advances the fed counters, decides the goal, moves the weight toward it by at
 // most one step, and — only where a slot has arrived at exactly zero — asks for the swap.
@@ -93,13 +123,27 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     out.beginB = s.x;
     if (blockSamples <= 0) { out.endB = s.x; return out; }
 
+    // A CHANGED REQUEST WAKES WHATEVER SLEEPS. Under an unchanged request a cold slot is at a fixed
+    // point — its weight at zero, nothing wrong, nothing in flight — so the only way the law can come
+    // to want it again is a new request; and the first block of that request is the earliest the slot
+    // can start serving its field. Woken by the landing path, with the model and the need it already
+    // has: fed from zero, silent until it has been, exactly as after a load. A wake the new request
+    // turns out not to need costs one warm-up of an inaudible model, and it sleeps again after.
+    const bool changed = ! blendSameRequest(r, s.last);
+    if (changed) {
+        for (int i = 0; i < kBlendSlots; ++i)
+            if (s.cold[i]) blendLanded(s, i, s.held[i], s.need[i]);
+        s.last = r;
+    }
+
     // FED BEFORE THIS BLOCK, not after. Counting the block first marks a slot audible for the WHOLE
     // of the block in which its counter crosses the line — including the first few hundred samples,
     // which are still short of the receptive field. One block of conservatism costs 10 ms of lag and
     // buys the invariant outright.
-    const bool wasFed[kBlendSlots] { s.fed[0] >= s.need[0], s.fed[1] >= s.need[1] };
+    // A cold slot is not fed — the host is not running it — and so is never marked fed.
+    const bool wasFed[kBlendSlots] { ! s.cold[0] && s.fed[0] >= s.need[0], ! s.cold[1] && s.fed[1] >= s.need[1] };
     for (int i = 0; i < kBlendSlots; ++i)
-        if (s.held[i] != 0 && ! s.inFlight[i]) s.fed[i] += blockSamples;
+        if (s.held[i] != 0 && ! s.inFlight[i] && ! s.cold[i]) s.fed[i] += blockSamples;
 
     // The goal, in priority order. Anything unsafe to hear outranks anything merely wrong, and being
     // wrong outranks the request — because a slot cannot take its new model until it is silent.
@@ -146,17 +190,33 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
                 break;
             }
         }
+
+    // AT REST, and for how long: the wanted model (or none wanted — a slot asked for nothing keeps
+    // its old capture and is never swapped, so it is at rest too), fed, at exactly zero for the whole
+    // block, under the request of the block before. Anything else — a move, a swap, a warm-up, a new
+    // request — starts the count over. The rest is counted as PLAYED: the block that completes it
+    // still runs, and the slot goes cold on the next, which the host reads after this call and skips.
+    for (int i = 0; i < kBlendSlots; ++i) {
+        const double w = std::max(i == 0 ? 1.0 - out.beginB : out.beginB, i == 0 ? 1.0 - out.endB : out.endB);
+        const bool atRest = ! changed && ! s.cold[i] && wasFed[i] && ! s.inFlight[i]
+                         && s.held[i] != 0 && (s.held[i] == r.want[i] || r.want[i] == 0) && w <= 0.0;
+        if (atRest && p.coldAfterSamples > 0 && s.still[i] >= p.coldAfterSamples) s.cold[i] = true;
+        s.still[i] = atRest ? s.still[i] + blockSamples : 0;
+    }
     return out;
 }
 
 // The message thread reporting back. `prewarm` is that model's own receptive field in HOST samples —
-// see NamStage::prewarmSamples(), and convert it, because the model counts in its own rate.
+// see NamStage::prewarmSamples(), and convert it, because the model counts in its own rate. Also the
+// law's own wake of a cold slot: the same model, the same need, fed from zero again.
 inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long prewarm) {
     if (slot < 0 || slot >= kBlendSlots) return;
     s.held[slot] = model;
     s.need[slot] = std::max(0LL, prewarm);
     s.fed[slot] = 0;
     s.inFlight[slot] = false;
+    s.cold[slot] = false;                // a landing is a wake, whether the model is new or the same one
+    s.still[slot] = 0;
 }
 
 // A load that could not be honoured (unreadable file, wrong rate). The slot keeps whatever it had,

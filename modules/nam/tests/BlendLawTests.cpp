@@ -47,6 +47,7 @@ BlendRequest requestAt(double deg) {
 // A run of the law with a scripted hand. `loadBlocks` is how many blocks a load takes to land.
 struct Run {
     BlendState  s;
+    BlendPolicy policy;
     int         loads = 0, gapBlocks = 0;
     double      worstStep = 0.0;
     double      worstSeam = 0.0;
@@ -65,7 +66,7 @@ struct Run {
             pending = false;
         }
         const bool wasInFlight = s.inFlight[0] || s.inFlight[1];
-        const auto st = blendStep(s, r, kBlock);
+        const auto st = blendStep(s, r, kBlock, policy);
 
         worstStep = std::max(worstStep, std::abs(st.endB - st.beginB));
         worstSeam = std::max(worstSeam, std::abs(st.beginB - prevEnd));
@@ -78,7 +79,7 @@ struct Run {
             const double w = std::max(i == 0 ? 1.0 - st.beginB : st.beginB,
                                       i == 0 ? 1.0 - st.endB   : st.endB)
                            * std::max(st.beginGain, st.endGain);
-            if (s.held[i] != 0 && s.fed[i] - kBlock < s.need[i] && w > 1.0e-9) unfedHeard = true;
+            if (s.held[i] != 0 && (s.cold[i] || s.fed[i] - kBlock < s.need[i]) && w > 1.0e-9) unfedHeard = true;
         }
         // …and nothing may be REPLACED unless its weight is exactly zero.
         if (st.load.wanted) {
@@ -238,6 +239,133 @@ int main() {
         const auto same = requestAt(150.0);
         for (int b = 0; b < 500; ++b) run.block(same, 1);
         ok(run.loads == 0 && run.worstStep <= 1e-12, "no load, no movement - idle is idle");
+    }
+
+    group("a slot at rest goes cold: at exactly zero, unchanged, and only once the rest is over");
+    {
+        // THE ECONOMY. A dial parked on a capture keeps the neighbour in the other slot at exactly
+        // zero, and that neighbour's network used to run every block for nothing — a second WaveNet
+        // pass for silence. The law may call the slot cold, and the host stop running it, only once
+        // it has been at rest for as long as the host allows: a pause between two moves of the hand
+        // is not a rest.
+        BlendPolicy p; p.coldAfterSamples = 2 * 48000;          // two seconds, in the law's own unit
+        const auto r = requestAt(150.0);                        // on a capture: by parity slot 1 carries
+        const int rest = 0, carry = 1;                          // …and slot 0 waits at exactly zero
+        auto s = settledAt(150.0);
+        ok(s.x >= 1.0 && s.held[rest] == r.want[rest], "the waiting slot holds the wanted neighbour at zero");
+        int blocks = 0;
+        BlendStep last;
+        while (! s.cold[rest] && blocks < 400) { last = blendStep(s, r, kBlock, p); ++blocks; }
+        ok(s.cold[rest], "the waiting slot goes cold");
+        ok((long long) (blocks - 1) * kBlock >= p.coldAfterSamples,
+           "…only once the whole rest has been PLAYED (" + std::to_string(blocks) + " blocks)");
+        ok((long long) blocks * kBlock < p.coldAfterSamples + 3 * kBlock, "…and not long after it");
+        ok(! s.cold[carry], "the carrying slot does not: it has weight");
+        ok(! blendAudible(s, rest) && blendAudible(s, carry), "cold reads as unfed — inaudible; the carrier still sounds");
+        ok(s.x >= 1.0 && s.held[rest] == r.want[rest] && ! last.load.wanted, "nothing moved and nothing was replaced");
+        for (int b = 0; b < 200; ++b) last = blendStep(s, r, kBlock, p);
+        ok(s.cold[rest] && s.x >= 1.0 && ! last.load.wanted, "…and under the same request it sleeps on: no load, no move");
+        ok(s.fed[rest] >= s.need[rest] && s.need[rest] == kPrewarm, "its counters are left as they were: the field is remembered for the wake");
+
+        // WAKING. The hand moves to 160, wanting a third of the cold slot. It wakes on the first block
+        // of the new request — re-landed, not reloaded — and is fed its whole field before a sample of
+        // it is heard; then the weight travels as it always does. The first turn after a rest trails
+        // the hand by one warm-up, the price already paid at every crossing.
+        Run run; run.s = s; run.policy = p; run.prevEnd = s.x;
+        const auto r2 = requestAt(160.0);
+        ok(r2.want[rest] == r.want[rest] && r2.targetB < 1.0, "the new request wants the sleeping model, in its slot, with weight");
+        run.block(r2, 1);
+        ok(! run.s.cold[rest], "the first block of the new request wakes it");
+        ok(run.s.fed[rest] == kBlock && run.s.need[rest] == kPrewarm, "…fed from zero, with the same field to serve");
+        ok(run.s.held[rest] == r2.want[rest] && run.loads == 0, "…the same model, in place: no load was asked");
+        int warm = 1;
+        while (run.s.x >= 1.0 && warm < 100) { run.block(r2, 1); ++warm; }
+        ok(run.s.x < 1.0, "the weight moves once the slot is fed");
+        ok(warm > kPrewarm / kBlock, "…and not before: " + std::to_string(warm) + " blocks, the field is "
+                                     + std::to_string(kPrewarm / kBlock));
+        ok(warm <= kPrewarm / kBlock + 3, "…nor much after");
+        for (int b = 0; b < 40; ++b) run.block(r2, 1);
+        ok(run.loads == 0, "no load in the whole wake: the model never left");
+        ok(! run.unfedHeard, "nothing unfed — and nothing cold — was heard on the way");
+        ok(run.worstStep <= kMaxDelta + 1e-9, "…and the weight never stepped");
+        ok(std::abs(run.s.x - r2.targetB) < 1e-6, "it arrives where it was sent");
+        ok(! run.s.cold[0] && ! run.s.cold[1], "…and with both slots heard, neither can sleep");
+    }
+
+    group("the rest is counted as played: the block that completes it runs, the next sleeps");
+    {
+        // A rest of ONE block. The first block under the new request starts the count; the second is
+        // the rest, and runs; the third finds the rest complete and is the first the host may skip.
+        BlendPolicy p; p.coldAfterSamples = kBlock;
+        auto s = settledAt(150.0);
+        const auto r = requestAt(150.0);
+        blendStep(s, r, kBlock, p);
+        ok(! s.cold[0], "the first block of a request is never a rest");
+        blendStep(s, r, kBlock, p);
+        ok(! s.cold[0] && s.still[0] == kBlock, "the block that completes the rest is still played");
+        blendStep(s, r, kBlock, p);
+        ok(s.cold[0], "…and the one after it is the first asleep");
+    }
+
+    group("a slot asked for nothing is at rest too");
+    {
+        // The caller wants one capture and nothing beside it: the other slot keeps its old model (the
+        // law never swaps for `want == 0`) at exactly zero — that is a rest, and it may sleep.
+        BlendPolicy p; p.coldAfterSamples = 2 * 48000;
+        auto s = settledAt(150.0);
+        auto r = requestAt(150.0); r.want[0] = 0;
+        BlendStep last;
+        for (int b = 0; b < 400; ++b) last = blendStep(s, r, kBlock, p);
+        ok(s.cold[0] && s.held[0] != 0 && ! last.load.wanted, "the slot wanted empty sleeps with its old model in place");
+        ok(! s.cold[1] && s.x >= 1.0, "…and the one carrying does not");
+    }
+
+    group("a slot with any weight never goes cold; the law's own default never sleeps");
+    {
+        BlendPolicy p; p.coldAfterSamples = 2 * 48000;
+        auto both = settledAt(165.0);                            // halfway between two captures
+        const auto r = requestAt(165.0);
+        for (int b = 0; b < 400; ++b) blendStep(both, r, kBlock, p);
+        ok(! both.cold[0] && ! both.cold[1], "four seconds between two captures: both stay awake");
+
+        auto s = settledAt(150.0);
+        const auto on = requestAt(150.0);
+        for (int b = 0; b < 400; ++b) blendStep(s, on, kBlock);     // the default policy
+        ok(! s.cold[0] && ! s.cold[1], "four seconds on a capture under the default policy: nothing sleeps");
+        BlendPolicy never; never.coldAfterSamples = 0;
+        for (int b = 0; b < 400; ++b) blendStep(s, on, kBlock, never);
+        ok(! s.cold[0] && ! s.cold[1], "…and zero means never, spelled out");
+
+        // A hand that keeps moving, however little, keeps the request changing — and a changed request
+        // is never a rest.
+        auto wobble = settledAt(150.0); int coldBlocks = 0;
+        for (int b = 0; b < 400; ++b) {
+            blendStep(wobble, requestAt(150.0 + 0.01 * (double) (b % 2)), kBlock, p);
+            if (wobble.cold[0] || wobble.cold[1]) ++coldBlocks;
+        }
+        ok(coldBlocks == 0, "a hand that wobbles a hundredth of a degree never lets a slot sleep");
+    }
+
+    group("a cold slot is replaced the way any silent slot is — and lands awake");
+    {
+        // The hand jumps to 120, wanting a different model in the sleeping slot. The change of request
+        // wakes the slot, the law sees it wrong and silent and asks for the swap at once, and the
+        // landing is a wake in its own right: fed from zero, then heard.
+        BlendPolicy p; p.coldAfterSamples = 2 * 48000;
+        auto s = settledAt(150.0);
+        for (int b = 0; b < 400; ++b) blendStep(s, requestAt(150.0), kBlock, p);
+        ok(s.cold[0], "asleep at 150");
+        Run run; run.s = s; run.policy = p; run.prevEnd = s.x;
+        const auto far = requestAt(120.0);
+        ok(far.want[0] != s.held[0] && far.want[1] == s.held[1] && far.targetB <= 0.0,
+           "120 wants another model in the sleeping slot, and all of it");
+        for (int b = 0; b < 200; ++b) run.block(far, 3);
+        ok(run.loads == 1, "exactly one load: the new model, into the slot that slept");
+        ok(! run.swapAboveZero && ! run.unfedHeard, "…swapped silent, heard only fed");
+        ok(run.gapBlocks == 0, "…and the old carrier sounded throughout");
+        ok(run.s.held[0] == far.want[0] && run.s.x <= 0.0, "it arrives: the new model carries alone");
+        for (int b = 0; b < 200; ++b) run.block(far, 3);
+        ok(run.s.cold[1] && ! run.s.cold[0], "…and two seconds later the OTHER slot, now the silent one, sleeps");
     }
 
     group("the mix is the two slots, weighted — and nothing else");

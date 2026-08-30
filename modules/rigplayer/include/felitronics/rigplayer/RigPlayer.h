@@ -17,6 +17,10 @@
 //     fetched, a network built and warmed, some twenty milliseconds for a WaveNet — is a JOB the
 //     player hands out (takeLoadJob) and the host runs where it likes (run, any thread) before
 //     bringing it back (deliver): no thread of its own, no policy, no hiccup on the drawing thread.
+//   • A slot that has stood silent under an unchanged request for kColdAfterSeconds goes COLD and its
+//     model is not run — a dial parked on a capture costs one network, not two. The law owns the flag
+//     (BlendState::cold) and wakes the slot, warm-up first, the moment the request changes; the model
+//     stays where it is throughout. slotCold() and coldBlocks() read it out.
 //   • A tone knob is applied as the pack describes it — a curve becomes a minimum-phase FIR, bands
 //     become biquads — on the side of the models its circuit puts it. ToneKnobs.h, pure.
 //   • A blend knob mixes the DI the models were fed, through the dry path's own response. BlendKnob.h.
@@ -69,6 +73,11 @@ public:
     // The curve form's FIR: 1024 taps designed through 8192 points, the numbers the bench auditions with.
     static constexpr int kFirTaps = 1024, kFirDesign = 8192;
     static constexpr int kMaxDelay = felitronics::nam::kBlendMaxDelay;
+    // How long a slot may stand at exactly zero, its request unchanged, before its model stops being
+    // run (BlendLaw.h, "and one economy"). Long against a hand — a pause this long IS the dial at rest
+    // — and short against a session, so the saving is there whenever nobody is turning. A host may set
+    // its own (setColdAfterSeconds); zero or less = never.
+    static constexpr double kColdAfterSeconds = 2.0;
 
     RigPlayer() = default;
     RigPlayer(const RigPlayer&) = delete;
@@ -81,6 +90,7 @@ public:
         fs_       = sampleRate > 0.0 ? sampleRate : 48000.0;
         maxBlock_ = std::max(1, maxBlock);
         channels_ = std::clamp(numChannels, 1, kMaxChannels);
+        coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
         for (auto& n : nam_) n.prepare(fs_, maxBlock_);
         // Not normalised: a tone curve's broadband level is part of what the pack says, and a dry path's
         // level rides in its gain. Reference-unity RMS is for cabinets, which these are not.
@@ -189,6 +199,7 @@ public:
         chainGain_.store(1.0f, std::memory_order_release);
         for (auto& g : slotGain_) g.store(1.0f, std::memory_order_release);
         for (auto& p : pendDelay_) p.store(0, std::memory_order_release);
+        for (auto& c : slotCold_) c.store(false, std::memory_order_release);
     }
     bool loaded() const { return loaded_; }
     const namz::rig::Stage& stage() const { return stage_; }
@@ -317,6 +328,15 @@ public:
     void setNormalize(bool on) { normalize_.store(on, std::memory_order_release); }
     bool normalize() const { return normalize_.load(std::memory_order_acquire); }
 
+    // The rest after which a silent slot's model is no longer run (kColdAfterSeconds). A slot that
+    // sounds at all is never cold; between two captures both models run, on one they do not. Zero or
+    // less = never. Takes effect from the next block; a slot already asleep stays asleep until woken.
+    void   setColdAfterSeconds(double seconds) {
+        coldSeconds_ = seconds;
+        coldAfter_.store(coldSamples(seconds), std::memory_order_release);
+    }
+    double coldAfterSeconds() const { return coldSeconds_; }
+
     // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay
     // travels with a model and is applied at the one instant its slot is silent — weight exactly zero
     // — never as a splice on a live signal. So a table handed in BEFORE playing lands with the first
@@ -441,10 +461,15 @@ public:
     int   warmBlocks()  const { return warmBlocks_.load(std::memory_order_relaxed); }
     int   mixJumps()    const { return mixJumps_.load(std::memory_order_relaxed); }
     float biggestJump() const { return biggestJump_.load(std::memory_order_relaxed); }
+    // Whether a slot is COLD right now — held, silent, its model not run (kColdAfterSeconds) — and the
+    // blocks it has slept since the last clearCounters(), for the dump beside warmBlocks().
+    bool  slotCold(int slot)   const { return slotCold_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
+    int   coldBlocks(int slot) const { return coldBlocks_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
     void  clearCounters() {
         warmBlocks_.store(0, std::memory_order_relaxed);
         mixJumps_.store(0, std::memory_order_relaxed);
         biggestJump_.store(0.0f, std::memory_order_relaxed);
+        for (auto& c : coldBlocks_) c.store(0, std::memory_order_relaxed);
     }
     long long modelLoads() const { return loads_; }                                   // how many the source was asked for
     int bandsDropped() const { return bandsDropped_; }                                // sections past kMaxBands
@@ -503,7 +528,7 @@ public:
 
             // THE LAW, once per block, and the only writer of the weight. Everything it needs arrives
             // through atomics; everything it asks for leaves the same way.
-            if (forget_.exchange(false, std::memory_order_acquire)) blend_ = {};
+            if (forget_.exchange(false, std::memory_order_acquire)) { blend_ = {}; coldRt_[0] = coldRt_[1] = false; }
             if (const int f = landFail_.exchange(0, std::memory_order_acquire); f != 0)
                 felitronics::nam::blendLoadFailed(blend_, f - 1);
             if (landFlag_.exchange(false, std::memory_order_acquire)) {
@@ -520,10 +545,22 @@ public:
             req.targetB = (double) reqTarget_.load(std::memory_order_acquire);
             req.want[0] = reqWant_[0].load(std::memory_order_relaxed);
             req.want[1] = reqWant_[1].load(std::memory_order_relaxed);
-            const auto law = felitronics::nam::blendStep(blend_, req, count);
+            felitronics::nam::BlendPolicy policy;
+            policy.coldAfterSamples = coldAfter_.load(std::memory_order_relaxed);
+            const auto law = felitronics::nam::blendStep(blend_, req, count, policy);
             if (law.load.wanted && loadAsk_.load(std::memory_order_relaxed) == 0)
                 loadAsk_.store((law.load.model << 1) | (std::uint64_t) (law.load.slot & 1), std::memory_order_release);
-            for (int i = 0; i < 2; ++i) held_[(std::size_t) i].store(blend_.held[i], std::memory_order_relaxed);
+            for (int i = 0; i < 2; ++i) {
+                held_[(std::size_t) i].store(blend_.held[i], std::memory_order_relaxed);
+                slotCold_[(std::size_t) i].store(blend_.cold[i], std::memory_order_relaxed);
+                // FALLING ASLEEP CLEARS THE DELAY LINE, exactly as a landing does (above): the tail would
+                // otherwise hold the slot's last samples from before the rest, and a model that declares
+                // no field (need == 0) is heard on the very block it wakes in — with those samples first.
+                if (blend_.cold[i] && ! coldRt_[i])
+                    for (auto& t : lagTail_[(std::size_t) i]) t.fill(0.0f);
+                coldRt_[i] = blend_.cold[i];
+                if (blend_.cold[i]) coldBlocks_[(std::size_t) i].fetch_add(1, std::memory_order_relaxed);
+            }
             // …and a staged retime lands the same way a model does: only where the slot is silent.
             for (int i = 0; i < 2; ++i) {
                 const double w = i == 0 ? 1.0 - law.endB : law.endB;
@@ -545,19 +582,31 @@ public:
             // THE SECOND CAPTURE'S COPY is taken here, after the pre-model tone and the chain trim, so
             // both models are fed the identical signal — and only now do the two part company, each
             // through its own trim: a linked setting plays its neighbour's model with less going in.
-            for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
-            rampInto(a, nch, count, slotGain_[0].load(std::memory_order_acquire), curSlot_[0]);
-            rampInto(b, nch, count, slotGain_[1].load(std::memory_order_acquire), curSlot_[1]);
-            nam_[0].process(a, nch, count, norm);
-            nam_[1].process(b, nch, count, norm);
+            // A COLD SLOT IS NOT RUN — not copied into, not trimmed, not modelled, not delayed, not even
+            // mixed: the law holds its weight at exactly zero for as long as it sleeps, so the other
+            // slot IS the sound, and its buffer — whatever it holds, however old — is left out rather
+            // than multiplied by zero (a NaN times zero is a NaN, for ever). Its trim ramp resumes from
+            // where it stopped and settles within its block, like any other gain change; its delay line
+            // was cleared on the way to sleep. (The rail is checked as well as the flag: the flag says
+            // what the law decided, the weights say what this block sounds like.)
+            const bool run[2] { ! blend_.cold[0], ! blend_.cold[1] };
+            const bool aAlone = ! run[1] && law.beginB <= 0.0 && law.endB <= 0.0;
+            const bool bAlone = ! run[0] && law.beginB >= 1.0 && law.endB >= 1.0;
+            if (run[1]) for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
+            if (run[0]) rampInto(a, nch, count, slotGain_[0].load(std::memory_order_acquire), curSlot_[0]);
+            if (run[1]) rampInto(b, nch, count, slotGain_[1].load(std::memory_order_acquire), curSlot_[1]);
+            if (run[0]) nam_[0].process(a, nch, count, norm);
+            if (run[1]) nam_[1].process(b, nch, count, norm);
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
             // Each slot carries its own history per channel, advanced every block including at zero.
             for (int c = 0; c < nch; ++c) {
-                felitronics::nam::blendDelay(a[c], lagTail_[0][(std::size_t) c].data(), kMaxDelay,
-                                             slotDelay_[0].load(std::memory_order_acquire), count);
-                felitronics::nam::blendDelay(b[c], lagTail_[1][(std::size_t) c].data(), kMaxDelay,
-                                             slotDelay_[1].load(std::memory_order_acquire), count);
-                felitronics::nam::blendMix(a[c], b[c], count, law.beginB, law.endB);
+                if (run[0]) felitronics::nam::blendDelay(a[c], lagTail_[0][(std::size_t) c].data(), kMaxDelay,
+                                                         slotDelay_[0].load(std::memory_order_acquire), count);
+                if (run[1]) felitronics::nam::blendDelay(b[c], lagTail_[1][(std::size_t) c].data(), kMaxDelay,
+                                                         slotDelay_[1].load(std::memory_order_acquire), count);
+                if (aAlone)      { /* slot 1 asleep at zero: `a` is the whole sound */ }
+                else if (bAlone) std::copy(b[c], b[c] + count, a[c]);
+                else             felitronics::nam::blendMix(a[c], b[c], count, law.beginB, law.endB);
                 // …and the law's own gain, which is below one only while nothing has been fed yet.
                 if (law.beginGain < 1.0 || law.endGain < 1.0) {
                     const float dg = (float) (law.endGain - law.beginGain) / (float) count;
@@ -677,6 +726,11 @@ private:
         const double mr = st.modelSampleRate();
         const double scale = (mr > 0.0 && fs_ > 0.0) ? fs_ / mr : 1.0;
         return (long long) std::ceil((double) pre * scale) + maxBlock_;
+    }
+
+    // The rest before a slot goes cold, in this rate's samples, for the law. Zero = never.
+    long long coldSamples(double seconds) const {
+        return seconds > 0.0 ? (long long) std::llround(seconds * fs_) : 0;
     }
 
     // ------------------------------------------------------------------------------- the tone ----
@@ -889,6 +943,7 @@ private:
     AlignmentTable     align_;
     long long          loads_ = 0;
     int                bandsDropped_ = 0;
+    double             coldSeconds_ = kColdAfterSeconds;
     // A 1/12-octave grid from 20 Hz to 20 kHz, on which every curve-form knob is summed whatever grid
     // it shipped on.
     std::vector<double> commonGrid_ = felitronics::lineareq::logFreqGrid(20.0, 20000.0, 121);
@@ -919,6 +974,9 @@ private:
     std::atomic<float>         liveMix_ { 0.0f };
     std::atomic<int>           warmBlocks_ { 0 }, mixJumps_ { 0 };
     std::atomic<float>         biggestJump_ { 0.0f };
+    std::atomic<long long>     coldAfter_ { 0 };          // coldSeconds_ at fs_, for the law; 0 = never
+    std::atomic<bool>          slotCold_[2] { false, false };
+    std::atomic<int>           coldBlocks_[2] { 0, 0 };
     std::atomic<float>         chainGain_ { 1.0f };
     std::atomic<float>         slotGain_[2] { 1.0f, 1.0f };
     std::atomic<bool>          normalize_ { false };
@@ -930,6 +988,7 @@ private:
 
     // audio thread only
     felitronics::nam::BlendState blend_ {};
+    bool coldRt_[2] {};                                // the law's cold flags as of the last block, to see a slot fall asleep
     std::array<float, (std::size_t) kMaxDelay> lagTail_[2][kMaxChannels] {};
     float curChain_ = 1.0f, curSlot_[2] { 1.0f, 1.0f }, curDry_ = 0.0f, curWet_ = 1.0f;
     BandSet                    bandRt_[2];

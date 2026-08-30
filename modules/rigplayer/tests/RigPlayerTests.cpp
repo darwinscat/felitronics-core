@@ -578,6 +578,165 @@ int main() {
         approx(db(b.gainAt(60.0, 0.1, 48, 64) / refLo), 6.0, 0.6, "+6 dB of curve at 96 kHz");
     }
 
+    group("a dial at rest: after kColdAfterSeconds the silent neighbour is not run — and stays loaded");
+    {
+        // THE ECONOMY, measured in the plugin: a dial parked on a capture kept its neighbour's network
+        // running at weight zero, every block, for nothing — 4.5 % of a P-core, 14 % of an E-core.
+        // With the handover a step (the plugin's STEP), the hand is always on a capture and the
+        // neighbour is always at exactly zero: after the rest it sleeps, and one model plays.
+        Bench b(rig);
+        b.p.setBlendShape({ 0.5, 0.0 });
+        ok(b.p.coldAfterSeconds() == RigPlayer::kColdAfterSeconds && RigPlayer::kColdAfterSeconds == 2.0,
+           "the rest is the player's constant, two seconds");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "150: the 0.5 capture alone");
+        ok(b.p.heldFileId(1) == "g240" && ! b.p.slotCold(1), "…its neighbour held at zero, awake: the hand only just arrived");
+        ok(b.p.modelLoads() == 2, "two loads");
+        b.p.clearCounters();
+        const int rest = (int) std::ceil(2.0 * kFs / kBlock);
+        approx(b.rms(1000.0, 0.1, rest, 32) / (0.1 / std::sqrt(2.0)), 0.5, 0.01, "two seconds later it sounds exactly the same");
+        ok(b.p.slotCold(1), "…and the neighbour's slot is cold");
+        ok(! b.p.slotCold(0), "the sounding slot is not");
+        ok(b.p.heldFileId(1) == "g240", "the model is still in the cold slot");
+        ok(b.p.modelLoads() == 2, "…nothing was loaded, nothing unloaded");
+        // The rest began when the neighbour landed and settled — somewhere inside the first
+        // measurement's 80 blocks — so of the 80 + 375 + 32 blocks since, it slept between 32 and 112.
+        const int slept = b.p.coldBlocks(1);
+        ok(slept >= 32 && slept <= 80 + 32, "it fell asleep at the two-second line, not before (" + std::to_string(slept)
+                                            + " blocks slept of " + std::to_string(80 + rest + 32) + ")");
+        ok(b.p.warmBlocks() == 0, "a sleeping slot is not a warming one");
+        b.rms(1000.0, 0.1, 0, 20);
+        ok(b.p.coldBlocks(1) == slept + 20, "twenty more blocks, twenty more slept: the model was not run once");
+        ok(b.p.coldBlocks(0) == 0, "…and the sounding one never slept");
+
+        // THE TURN AFTER THE REST. The hand moves to the next capture; in STEP that is all of the
+        // neighbour at once. The cold slot wakes on the first block, is fed its field — a warm-up, not
+        // a load — and only then does the weight travel, at the law's own pace, never in a step.
+        b.p.clearCounters();
+        ok(b.p.setDial("gain", 200.0), "the hand moves past the midpoint: the 240 capture, all of it");
+        int firstMove = -1, arrived = -1;
+        bool awakeAtOnce = false;
+        std::vector<double> level;
+        for (int k = 0; k < 40; ++k) {
+            level.push_back(b.rms(1000.0, 0.1, 0, 1) / (0.1 / std::sqrt(2.0)));
+            if (k == 0) awakeAtOnce = ! b.p.slotCold(1);
+            const float m = b.p.liveMix();
+            if (firstMove < 0 && m > 0.0f) firstMove = k;
+            if (arrived < 0 && m >= 1.0f) arrived = k;
+        }
+        ok(awakeAtOnce, "the first block of the turn wakes the slot");
+        // A Linear model DECLARES no field (NAM answers prewarm only for convnet and lstm; WaveNet's is
+        // read from its config), so its need is zero and the law may move the weight in the block the
+        // slot woke in. A model with a field waits it out first — the law's own test proves that with
+        // a 6332-sample field; here the claim is only "no later than the warm-up plus one block".
+        ok(firstMove >= 0 && firstMove <= 2, "the weight starts moving no later than the warm-up plus one block (block "
+                                             + std::to_string(firstMove) + ")");
+        ok(arrived == firstMove + 3, "…and arrives four blocks later, a quarter per block: the law's own slew, no step");
+        ok(b.p.biggestJump() <= 0.25f + 1e-6f, "no block moved the weight more than the law allows");
+        ok(b.p.modelLoads() == 2, "no load in the wake: the model never left");
+        ok(b.p.heldFileId(1) == "g240" && ! b.p.slotCold(1), "…the same model, awake");
+        // One block of a 1 kHz sine is 5⅓ cycles, so a block's RMS wanders by a percent or two with
+        // its phase; a step would be the whole half of level in one block.
+        bool monotone = true; double worstRise = 0.0;
+        for (std::size_t k = 1; k < level.size(); ++k) {
+            monotone = monotone && level[k] >= level[k - 1] - 0.03;
+            worstRise = std::max(worstRise, level[k] - level[k - 1]);
+        }
+        approx(level.back(), 1.0, 0.02, "what sounds at the end is the 240 capture");
+        ok(monotone && worstRise <= 0.5 * 0.25 * 1.3, "…reached by a rise, block on block, none of them a step (the worst "
+                                                      + std::to_string(worstRise) + " of level in one block)");
+        ok(b.p.warmBlocks() >= 0 && b.p.warmBlocks() <= 2, "the wake cost at most two blocks of warming");
+
+        // Zero means never: a host that wants both networks running says so.
+        b.p.setColdAfterSeconds(0.0);
+        b.p.clearCounters();
+        b.p.setDial("gain", 150.0);
+        b.rms(1000.0, 0.1, rest + 40, 32);
+        ok(! b.p.slotCold(0) && ! b.p.slotCold(1) && b.p.coldBlocks(0) == 0 && b.p.coldBlocks(1) == 0,
+           "with the rest set to zero nothing sleeps, however long the hand rests");
+        b.p.setColdAfterSeconds(0.5);
+        b.rms(1000.0, 0.1, (int) std::ceil(0.5 * kFs / kBlock), 32);
+        ok(b.p.slotCold(1), "…and half a second, once set, is a rest");
+    }
+
+    group("a player that sleeps sounds bit-identically to one that never does — through rests and turns");
+    {
+        // The same sine into two players, block for block: one sleeps after two seconds, one never.
+        // A cold slot is left out of the mix, not multiplied by zero, and a wake re-lands a model that
+        // has no memory of its own (a Linear gain, no alignment delay) — so not one sample may differ,
+        // resting on the lower capture (slot 1 asleep) or on the upper (slot 0 — the live buffer —
+        // asleep), nor across the turns between them.
+        Bench sleeps(rig), never(rig);
+        sleeps.p.setBlendShape({ 0.5, 0.0 }); never.p.setBlendShape({ 0.5, 0.0 });
+        never.p.setColdAfterSeconds(0.0);
+        const int rest = (int) std::ceil(2.0 * kFs / kBlock);
+        std::vector<float> x((std::size_t) kBlock), y((std::size_t) kBlock);
+        double phase = 0.0;
+        const auto both = [&](int blocks) {
+            float worst = 0.0f;
+            for (int b = 0; b < blocks; ++b) {
+                for (int i = 0; i < kBlock; ++i) {
+                    x[(std::size_t) i] = y[(std::size_t) i] = (float) (0.1 * std::sin(phase));
+                    phase += 2.0 * 3.14159265358979323846 * 1000.0 / kFs;
+                }
+                float* ix[1] { x.data() }; float* iy[1] { y.data() };
+                sleeps.p.process(ix, 1, kBlock); sleeps.p.serviceHere();
+                never.p.process(iy, 1, kBlock);  never.p.serviceHere();
+                for (int i = 0; i < kBlock; ++i) worst = std::max(worst, std::abs(x[(std::size_t) i] - y[(std::size_t) i]));
+            }
+            return worst;
+        };
+        ok(both(rest + 60) == 0.0f, "two and a half seconds on 150: identical, and by then slot 1 sleeps in one player");
+        ok(sleeps.p.slotCold(1) && ! never.p.slotCold(1), "…which it does");
+        sleeps.p.setDial("gain", 200.0); never.p.setDial("gain", 200.0);
+        ok(both(rest + 60) == 0.0f, "the turn to 240 and two and a half seconds there: identical, slot 0 now asleep");
+        ok(sleeps.p.slotCold(0) && ! sleeps.p.slotCold(1), "…the live buffer's slot, and the other awake");
+        sleeps.p.setDial("gain", 150.0); never.p.setDial("gain", 150.0);
+        ok(both(60) == 0.0f, "…and the turn back: identical to the last sample");
+        ok(sleeps.p.modelLoads() == 2 && never.p.modelLoads() == 2, "neither player loaded anything for a turn");
+    }
+
+    group("a slot's delay line is cleared on the way to sleep, as it is on a landing");
+    {
+        // THE BURST THIS CATCHES: with an alignment delay on the sleeping slot, its delay line held the
+        // last hundred samples from before the rest; a model that declares no field is heard on the
+        // block it wakes in, and those samples came out first — two seconds old, on a silent input.
+        AlignmentTable table;
+        table.lagByFile = { { "g60", 100 }, { "g150", 100 }, { "g240", 0 }, { "r150", 100 } };   // 240 is early: delayed by 100
+        Bench b(rig);
+        b.p.setBlendShape({ 0.5, 0.0 });
+        b.p.setAlignment(table);
+        const int rest = (int) std::ceil(2.0 * kFs / kBlock);
+        b.rms(1000.0, 0.1, rest + 40, 8);
+        ok(b.p.slotCold(1) && b.p.appliedSlotDelay(1) == 100, "the delayed neighbour is asleep");
+        std::vector<float> z((std::size_t) kBlock);
+        float* io[1] { z.data() };
+        float peak = 0.0f;
+        for (int k = 0; k < 8; ++k) { std::fill(z.begin(), z.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere(); }
+        for (const float v : z) peak = std::max(peak, std::abs(v));
+        ok(peak == 0.0f, "silence in, silence out, before the turn");
+        b.p.setDial("gain", 200.0);
+        for (int k = 0; k < 8; ++k) {
+            std::fill(z.begin(), z.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere();
+            for (const float v : z) peak = std::max(peak, std::abs(v));
+        }
+        ok(peak == 0.0f, "…and after it: nothing of the rest comes back out (peak " + std::to_string(peak) + ")");
+        ok(! b.p.slotCold(1) && b.p.liveMix() >= 1.0f, "the slot woke and took the sound — of a silent input");
+    }
+
+    group("between two captures both models run, however long the hand rests");
+    {
+        // SMOOTH between two captures: both are heard, so neither can be cold — two passes, as it
+        // must be. The saving is for the dial at rest on a capture, never for a mix.
+        Bench b(rig);
+        b.p.setDial("gain", 200.0);
+        b.p.clearCounters();
+        const int rest = (int) std::ceil(2.0 * kFs / kBlock);
+        approx(b.rms(1000.0, 0.1, rest + 40, 32) / (0.1 / std::sqrt(2.0)), (40.0 / 90.0) * 0.5 + (50.0 / 90.0) * 1.0, 0.015,
+               "two and a half seconds at 200: still 4/9 and 5/9 of each");
+        ok(! b.p.slotCold(0) && ! b.p.slotCold(1), "neither slot is cold");
+        ok(b.p.coldBlocks(0) == 0 && b.p.coldBlocks(1) == 0, "…and neither slept a single block");
+    }
+
     group("unload: silence, and a second device loads clean");
     {
         Bench b(rig);
