@@ -5,6 +5,22 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.20.0 — the pack player comes home (`rigplayer`)
+
+- **feat(rigplayer):** a new header-only module, `felitronics::rigplayer` — one device of a
+  `.orbitrig` pack, playing: which captures sound for a panel (`namz::rig`'s policy joined to
+  `pickBlend` along the gain dial), the crossfade between them (`nam`'s BlendLaw, once per block on
+  the audio thread), the tone knobs as the pack describes them (sections → biquads, a curve → one
+  minimum-phase FIR per side), a blend knob's dry path, the models' alignment from the pack's
+  `lag_samples`. JUCE-free, no thread of its own: a load is a job the host runs anywhere but the audio
+  thread (`takeLoadJob` / `run` / `deliver`). Moved, not copied, from OrbitCapture NAM with its tests,
+  so the capture app and a plugin play through ONE player; `modules/rigplayer/README.md` is the
+  host's contract. Self-gates on `FELITRONICS_WITH_NAM`.
+- **build(nam):** the module's own namz pin rises from v1.1.1 to v3.1.0 (`namz_rig.h` with `tone`
+  and `lag_samples`).
+- **fix(nam):** BlendLaw's exact-zero swap test is spelled `<= 0.0` on a weight clamped to [0, 1] —
+  the same zero, and GCC's `-Wfloat-equal` in the header-hygiene gate is satisfied.
+
 ## v0.19.0 — a model is built apart from its stage (`nam`)
 
 - **feat(nam):** `NamStage::prepareModel(bytes, sampleRate, maxBlock)` is the heavy half of a load —
