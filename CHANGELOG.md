@@ -5,6 +5,19 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.19.0 — a model is built apart from its stage (`nam`)
+
+- **feat(nam):** `NamStage::prepareModel(bytes, sampleRate, maxBlock)` is the heavy half of a load —
+  the bytes parsed, both instances built, the rate-match and the prewarm prepared — done on any
+  thread but the audio one and touching no stage; `install(prepared)` is the light half, a pointer
+  swap on the message thread through the same pending machinery a load uses. A pack player crossing
+  a capture paid up to 20 ms of its drawing thread per landing (measured in OrbitCapture NAM,
+  2026-08-30); now it hands that work to a worker and installs the result. `loadModelFromMemory` is
+  the two calls in a row — one path, two entry points — and behaves as before. A model prepared for
+  other numbers than the stage runs at is prepared again inside `install`, at the old cost; the rate
+  contract is judged at `install`, since only a stage can. `NamBackend` binds the normalize flag when
+  it meets its stage (`bindNormalize`) instead of at construction.
+
 ## v0.18.0 — a WAV can be handed over as bytes (`io`)
 
 - **feat(io):** `writeWavMemory` returns the encoded WAV image instead of writing it to a path. A
