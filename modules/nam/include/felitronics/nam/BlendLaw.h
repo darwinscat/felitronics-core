@@ -87,6 +87,11 @@ struct BlendState {
     bool         cold[kBlendSlots] {};
     long long    still[kBlendSlots] {};  // samples at exactly zero under an unchanged request, so far
     BlendRequest last;                   // the request the previous block was stepped with
+    BlendModelId asked[kBlendSlots] {};  // the model the outstanding load wants (0 = none out)
+    // A load that FAILED. A file that failed once fails every block, and asking again is a storm, not
+    // progress — so the law does not ask for this model in this slot again until the request names
+    // something else for it (a hand crossing to another pair is a new question). Any landing clears it.
+    BlendModelId refused[kBlendSlots] {};
     double       x = 0.0;                // THE applied weight of slot 1. The only state that sounds.
     double       gain = 0.0;             // …and whether ANY of it may be heard yet
 };
@@ -131,8 +136,10 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     // turns out not to need costs one warm-up of an inaudible model, and it sleeps again after.
     const bool changed = ! blendSameRequest(r, s.last);
     if (changed) {
-        for (int i = 0; i < kBlendSlots; ++i)
+        for (int i = 0; i < kBlendSlots; ++i) {
             if (s.cold[i]) blendLanded(s, i, s.held[i], s.need[i]);
+            if (r.want[i] != s.last.want[i]) s.refused[i] = 0;   // a new wish is worth a new try
+        }
         s.last = r;
     }
 
@@ -184,9 +191,10 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     if (! busy)
         for (int i = 0; i < kBlendSlots; ++i) {
             const double w = i == 0 ? 1.0 - s.x : s.x;
-            if (s.held[i] != r.want[i] && w <= 0.0 && r.want[i] != 0) {
+            if (s.held[i] != r.want[i] && w <= 0.0 && r.want[i] != 0 && r.want[i] != s.refused[i]) {
                 out.load = { true, i, r.want[i] };
                 s.inFlight[i] = true;
+                s.asked[i] = r.want[i];
                 break;
             }
         }
@@ -198,8 +206,9 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     // still runs, and the slot goes cold on the next, which the host reads after this call and skips.
     for (int i = 0; i < kBlendSlots; ++i) {
         const double w = std::max(i == 0 ? 1.0 - out.beginB : out.beginB, i == 0 ? 1.0 - out.endB : out.endB);
-        const bool atRest = ! changed && ! s.cold[i] && wasFed[i] && ! s.inFlight[i]
-                         && s.held[i] != 0 && (s.held[i] == r.want[i] || r.want[i] == 0) && w <= 0.0;
+        const bool atRest = ! changed && ! s.cold[i] && wasFed[i] && ! s.inFlight[i] && s.held[i] != 0
+                         && (s.held[i] == r.want[i] || r.want[i] == 0 || r.want[i] == s.refused[i])
+                         && w <= 0.0;
         if (atRest && p.coldAfterSamples > 0 && s.still[i] >= p.coldAfterSamples) s.cold[i] = true;
         s.still[i] = atRest ? s.still[i] + blockSamples : 0;
     }
@@ -217,12 +226,19 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
     s.inFlight[slot] = false;
     s.cold[slot] = false;                // a landing is a wake, whether the model is new or the same one
     s.still[slot] = 0;
+    s.asked[slot] = 0;
+    s.refused[slot] = 0;                 // what landed is real; whatever was refused may be asked anew
 }
 
 // A load that could not be honoured (unreadable file, wrong rate). The slot keeps whatever it had,
-// which is a real model, and the law will try again on the next block.
+// which is a real model — and the model that failed is remembered as refused: it is not asked for
+// again until the request names something else for this slot, because a deterministic failure asked
+// for every block is a storm of fetches and parses that fixes nothing. Such a slot is at rest.
 inline void blendLoadFailed(BlendState& s, int slot) {
-    if (slot >= 0 && slot < kBlendSlots) s.inFlight[slot] = false;
+    if (slot < 0 || slot >= kBlendSlots) return;
+    s.refused[slot] = s.asked[slot];
+    s.asked[slot] = 0;
+    s.inFlight[slot] = false;
 }
 
 // ---- and the arithmetic that applies it to audio -------------------------------------------------

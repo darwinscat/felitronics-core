@@ -292,6 +292,58 @@ int main() {
         approx(b.gainAt(1000.0), 0.5, 0.01, "…and the new pack loads its own and sounds");
     }
 
+    group("a landing published before the pack leaves dies with it");
+    {
+        // deliver() and unload() on the message thread, with no audio block between them: the landing
+        // sat published, the pack left, and the landing used to be consumed AFTER the forget — a stale
+        // model in a wiped law, over an emptied stage.
+        Bench b(rig);
+        std::vector<float> x((std::size_t) kBlock, 0.1f);
+        float* io[1] { x.data() };
+        b.p.process(io, 1, kBlock);                                  // the law asks
+        auto job = b.p.takeLoadJob();
+        ok(job.has_value(), "a job is out");
+        b.p.deliver(RigPlayer::run(std::move(*job)));                // …and lands, published for the audio thread
+        b.p.unload();
+        b.load(rig);
+        b.p.process(io, 1, kBlock);
+        ok(b.p.heldFileId(0).empty() && b.p.heldFileId(1).empty(),
+           "the new pack's law holds nothing of the old landing");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…and the new pack loads its own and sounds");
+    }
+
+    group("a file that cannot be a model is asked for once, not every block");
+    {
+        // THE STORM THIS PREVENTS: red's file is broken in this pack. The switch to red asks for it
+        // once, fails once, and the captures the hand came from carry on; it used to be re-fetched and
+        // re-parsed on every service tick, for ever, fixing nothing.
+        Bench b(rig);
+        b.files["r150"] = bytesOf("not a model at all");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "green 150 sounds");
+        ok(b.p.setSwitch("channel", "red"), "the hand switches to red, whose file is broken");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…and the captures it came from carry on");
+        ok(b.fetches == 3, "the broken file was asked of the source once");
+        ok(b.p.heldFileId(0) == "g150" && b.p.heldFileId(1) == "g240", "…and both slots keep their real models");
+        std::vector<float> x((std::size_t) kBlock, 0.1f);
+        float* io[1] { x.data() };
+        int asks = 0;
+        for (int k = 0; k < 100; ++k) {
+            std::fill(x.begin(), x.end(), 0.1f);
+            b.p.process(io, 1, kBlock);
+            b.p.service();
+            if (b.p.takeLoadJob().has_value()) ++asks;
+        }
+        ok(asks == 0 && b.fetches == 3, "a hundred blocks later it has not been asked for again");
+        ok(b.p.setSwitch("channel", "green"), "the hand leaves for green…");
+        b.p.process(io, 1, kBlock);                              // the law hears the wish change
+        ok(b.p.setSwitch("channel", "red"), "…and asks for red again");
+        std::optional<RigPlayer::LoadJob> again;
+        for (int k = 0; k < 10 && ! again; ++k) { b.p.process(io, 1, kBlock); b.p.service(); again = b.p.takeLoadJob(); }
+        ok(again.has_value() && again->fileId == "r150", "a new wish tries the file anew");
+        b.p.deliver(RigPlayer::run(std::move(*again)));          // fails again; the slot is refused again
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…and the sound never blinked");
+    }
+
     group("the dial: a pair mixed by angle, the extension past the top, each file fetched once");
     {
         Bench b(rig);
