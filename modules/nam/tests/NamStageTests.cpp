@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -347,6 +348,58 @@ int main()
                   "mono-to-stereo-to-mono re-prepare stays finite in both resampler lanes");
         test::ok (stereoLatency == 9 && stage.latencySamples() == 9,
                   "layout re-prepare leaves the pinned host latency stable");
+    }
+
+    test::group ("the load in two halves: prepared anywhere, installed on the message thread");
+    {
+        nam::NamStage stage;
+        stage.prepare (48000.0, 512);
+        const auto json = firModel();
+        auto prepared = nam::NamStage::prepareModel (json.data(), json.size(), 48000.0, 512);
+        test::ok (prepared != nullptr, "prepared with no stage in sight");
+        test::ok (! stage.hasModel(), "…and the stage has nothing yet");
+        nam::NamStage ref;                             // the reference: the same bytes, the one-call load
+        ref.prepare (48000.0, 512);
+        test::ok (load (ref, json), "reference loads");
+        test::ok (stage.install (std::move (prepared)), "installed");
+        test::ok (stage.hasModel() && prepared == nullptr, "…the stage holds it and the handle is spent");
+        std::vector<float> input (64, 0.0f);
+        input[0] = 1.0f;
+        const auto a = runMono (stage, input, false), b = runMono (ref, input, false);
+        bool same = a.size() == b.size();
+        for (std::size_t i = 0; same && i < a.size(); ++i) same = std::abs (a[i] - b[i]) < 1e-7f;
+        test::ok (same, "…and it is the model loadModelFromMemory gives, sample for sample");
+        test::ok (stage.modelSampleRate() == 48000.0 && stage.prewarmSamples() == ref.prewarmSamples()
+                      && stage.latencySamples() == ref.latencySamples(),
+                  "the mirrors read the installed model");
+
+        test::ok (! stage.install (nullptr), "a null handle is refused");
+        test::ok (stage.hasModel(), "…and the stage keeps its model");
+
+        auto other = nam::NamStage::prepareModel (json.data(), json.size(), 96000.0, 256);
+        test::ok (other != nullptr && stage.install (std::move (other)), "prepared for 96k/256, installed into a 48k/512 stage");
+        const auto c = runMono (stage, input, false);
+        same = c.size() == b.size();
+        for (std::size_t i = 0; same && i < c.size(); ++i) same = std::abs (c[i] - b[i]) < 1e-7f;
+        test::ok (same && stage.latencySamples() == ref.latencySamples(),
+                  "…prepared again for the stage's own numbers: the same output, the same latency");
+
+        const std::string junk = "{not a model";
+        test::ok (nam::NamStage::prepareModel (junk.data(), junk.size(), 48000.0, 512) == nullptr, "junk prepares to nothing");
+
+        const auto json96 = firModel ("96000");
+        auto wrong = nam::NamStage::prepareModel (json96.data(), json96.size(), 48000.0, 512);
+        test::ok (wrong != nullptr, "a 96 kHz model prepares — no stage was there to judge it");
+        test::ok (! stage.install (std::move (wrong)) && stage.hasModel(),
+                  "…and a stage running at 48 kHz refuses it, keeping its model, as a load would");
+
+        nam::NamStage::PreparedModel fromWorker;      // the point of the split: another thread does the work
+        std::thread ([&] { fromWorker = nam::NamStage::prepareModel (json.data(), json.size(), 48000.0, 512); }).join();
+        test::ok (fromWorker != nullptr && stage.install (std::move (fromWorker)), "prepared on a worker thread, installed here");
+        const auto d = runMono (stage, input, false);
+        same = d.size() == b.size();
+        for (std::size_t i = 0; same && i < d.size(); ++i) same = std::abs (d[i] - b[i]) < 1e-7f;
+        test::ok (same, "…the same model again");
     }
 
     test::group ("process is RT no-alloc");

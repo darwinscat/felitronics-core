@@ -68,6 +68,26 @@ public:
     // trimDb = per-model output offset (dB) folded into the loudness-normalisation makeup.
     // (Bytes only — file I/O stays in the adapter layer, never in pure-DSP core.)
     bool   loadModelFromMemory (const void* data, std::size_t size, float trimDb = 0.0f);
+
+    //--- the same load, in two halves ----------------------------------------------
+    // The heavy half — the bytes parsed, both instances built, the rate-match and the prewarm
+    // prepared — done ANYWHERE BUT the audio thread and touching no stage at all, so a host can run
+    // it on a worker while its drawing thread stays free: a WaveNet costs some twenty milliseconds
+    // here, which a hand on a knob feels as a hiccup. `sampleRate` and `maxBlock` are what the stage
+    // was prepared with; a model prepared for other numbers is prepared again by install(), on that
+    // thread, at the old cost. Null = a bad or unsupported model, the cases loadModelFromMemory()
+    // refuses — except the rate contract, which only a stage can judge (install() refuses those).
+    // loadModelFromMemory() IS prepareModel() followed by install(): one path, two entry points.
+    struct Prepared;
+    struct PreparedDeleter { void operator() (Prepared*) const noexcept; };
+    using PreparedModel = std::unique_ptr<Prepared, PreparedDeleter>;
+    static PreparedModel prepareModel (const void* data, std::size_t size, double sampleRate, int maxBlock,
+                                       float trimDb = 0.0f);
+    // The light half: message thread, a pointer swap. False — and the stage untouched — for a null
+    // handle or a model whose native rate breaks the rate contract (see loadModelFromMemory). Accepted
+    // = guaranteed to apply, exactly as a load: immediately, or on the next drain if the retire queue
+    // is momentarily full.
+    bool   install (PreparedModel model);
     void   clearModel();
     bool   collectGarbage();          // free models retired by a swap, once audio moved past them,
                                       // and land any load/clear deferred by a full retire queue.
