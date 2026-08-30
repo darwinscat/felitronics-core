@@ -26,7 +26,7 @@ Signal order, per block:
 |---|---|
 | `prepare(rate, maxBlock, channels ≤ 2)` | message, never while `process()` runs |
 | `load(rig, source)` / `unload()` | message |
-| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` | message |
+| `setDial(name, degrees)` / `setSwitch(name, value)` / `setToneOverride` / `setBlendShape` / `setNormalize` / `setAlignment` / `setColdAfterSeconds` | message |
 | `service()` then `takeLoadJob()` | message, from a timer — a few times a second at least |
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
@@ -46,6 +46,18 @@ thread, for a host without a worker and for a test.
 **`ModelSource` is called from wherever the host runs `run()`.** Make it safe to call off the message
 thread: it is called at most once at a time (one job in flight), but not from the thread that opened
 the pack. The reference host reads from a `juce::ZipFile` kept open, one entry per call.
+
+**A slot at rest goes cold.** A dial parked on a capture keeps the neighbouring capture in the other
+slot at exactly zero, warm and waiting — and its network used to run every block for nothing (measured
+in OrbitAmp's block, prepared for two planes and fed one: 4.5 % of a P-core, 14 % of an E-core). After
+`RigPlayer::kColdAfterSeconds` (2 s) at exactly zero under an unchanged request the slot goes COLD: its
+model is not run, and it stays loaded — nothing is fetched, nothing freed. The law owns the flag
+(`BlendState::cold`) and wakes the slot on the first block of the next change of request, warm-up
+first — the same re-landing a load ends with, with the model's own field — so nothing unfed is ever
+heard, and the first turn after a rest trails the hand by one warm-up (some 130 ms for a WaveNet, then
+the ordinary slew). A slot with any weight is never cold: between two captures both models run, on one
+they do not. `setColdAfterSeconds(s)` sets the rest (zero or less = never); `slotCold(i)` and
+`coldBlocks(i)` (since `clearCounters()`) read it out beside `warmBlocks()`, for a dump or a badge.
 
 ## What a host must do
 
