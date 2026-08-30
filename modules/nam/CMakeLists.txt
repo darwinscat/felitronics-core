@@ -35,11 +35,12 @@ else()
 endif()
 FetchContent_MakeAvailable(nam_core_src)
 
-# namz is a header-only, lossless .nam codec. Pin the v1.1.1 release by immutable commit. SOURCE_SUBDIR
-# deliberately points at a directory without CMakeLists.txt: populate the header without building
-# namz's project or fetching nlohmann twice.
-set(FELITRONICS_NAMZ_TAG "9be9ed8448ab2b72ebfd2605808a4b1f0b24c75a" CACHE STRING
-    "namz v1.1.1 commit to build against")
+# namz is a header-only, lossless .nam codec and the .orbitrig rig model (namz_rig*.h — schema 3 with
+# `tone` and `lag_samples`, which felitronics::rigplayer reads). Pin the v3.1.0 release by immutable
+# commit. SOURCE_SUBDIR deliberately points at a directory without CMakeLists.txt: populate the headers
+# without building namz's project or fetching nlohmann twice.
+set(FELITRONICS_NAMZ_TAG "217776041fe1635d94cdce6c9fb1a098530eda0c" CACHE STRING
+    "namz v3.1.0 commit to build against")
 set(FELITRONICS_NAMZ_SRC "" CACHE PATH
     "Local namz checkout (when empty, fetch the pin)")
 if(FELITRONICS_NAMZ_SRC AND NOT EXISTS "${FELITRONICS_NAMZ_SRC}")
