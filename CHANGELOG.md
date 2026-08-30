@@ -5,6 +5,16 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.21.1 — a stale landing dies with its pack; a failed load is refused
+
+- **fix(rigplayer):** `unload()` right after `deliver()`, with no audio block between: the published
+  landing no longer lands a stale model in the wiped law over an emptied stage — it dies before the
+  forget is posted.
+- **fix(nam):** a load that failed is refused (`BlendState::refused`), not asked for again on every
+  block: a file that fails identically every time cost a fetch and a parse per service tick, for
+  ever. The refusal lifts when the request names something else for the slot, or on any landing; the
+  slot keeps its old capture and counts as at rest, so it may sleep.
+
 ## v0.21.0 — a slot at rest goes cold (`rigplayer`, `nam`)
 
 - **feat(rigplayer):** a slot that has stood silent — weight exactly zero, request unchanged — for
