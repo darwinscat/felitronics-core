@@ -528,7 +528,7 @@ public:
 
             // THE LAW, once per block, and the only writer of the weight. Everything it needs arrives
             // through atomics; everything it asks for leaves the same way.
-            if (forget_.exchange(false, std::memory_order_acquire)) blend_ = {};
+            if (forget_.exchange(false, std::memory_order_acquire)) { blend_ = {}; coldRt_[0] = coldRt_[1] = false; }
             if (const int f = landFail_.exchange(0, std::memory_order_acquire); f != 0)
                 felitronics::nam::blendLoadFailed(blend_, f - 1);
             if (landFlag_.exchange(false, std::memory_order_acquire)) {
@@ -553,6 +553,12 @@ public:
             for (int i = 0; i < 2; ++i) {
                 held_[(std::size_t) i].store(blend_.held[i], std::memory_order_relaxed);
                 slotCold_[(std::size_t) i].store(blend_.cold[i], std::memory_order_relaxed);
+                // FALLING ASLEEP CLEARS THE DELAY LINE, exactly as a landing does (above): the tail would
+                // otherwise hold the slot's last samples from before the rest, and a model that declares
+                // no field (need == 0) is heard on the very block it wakes in — with those samples first.
+                if (blend_.cold[i] && ! coldRt_[i])
+                    for (auto& t : lagTail_[(std::size_t) i]) t.fill(0.0f);
+                coldRt_[i] = blend_.cold[i];
                 if (blend_.cold[i]) coldBlocks_[(std::size_t) i].fetch_add(1, std::memory_order_relaxed);
             }
             // …and a staged retime lands the same way a model does: only where the slot is silent.
@@ -576,11 +582,16 @@ public:
             // THE SECOND CAPTURE'S COPY is taken here, after the pre-model tone and the chain trim, so
             // both models are fed the identical signal — and only now do the two part company, each
             // through its own trim: a linked setting plays its neighbour's model with less going in.
-            // A COLD SLOT IS NOT RUN — not copied into, not trimmed, not modelled, not delayed. The law
-            // holds its weight at exactly zero for as long as it sleeps, so whatever its buffer holds
-            // weighs nothing in the mix; and the warm-up the law demands on waking outlasts both its
-            // trim ramp and its delay line, so neither is missed while it sleeps.
+            // A COLD SLOT IS NOT RUN — not copied into, not trimmed, not modelled, not delayed, not even
+            // mixed: the law holds its weight at exactly zero for as long as it sleeps, so the other
+            // slot IS the sound, and its buffer — whatever it holds, however old — is left out rather
+            // than multiplied by zero (a NaN times zero is a NaN, for ever). Its trim ramp resumes from
+            // where it stopped and settles within its block, like any other gain change; its delay line
+            // was cleared on the way to sleep. (The rail is checked as well as the flag: the flag says
+            // what the law decided, the weights say what this block sounds like.)
             const bool run[2] { ! blend_.cold[0], ! blend_.cold[1] };
+            const bool aAlone = ! run[1] && law.beginB <= 0.0 && law.endB <= 0.0;
+            const bool bAlone = ! run[0] && law.beginB >= 1.0 && law.endB >= 1.0;
             if (run[1]) for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
             if (run[0]) rampInto(a, nch, count, slotGain_[0].load(std::memory_order_acquire), curSlot_[0]);
             if (run[1]) rampInto(b, nch, count, slotGain_[1].load(std::memory_order_acquire), curSlot_[1]);
@@ -593,7 +604,9 @@ public:
                                                          slotDelay_[0].load(std::memory_order_acquire), count);
                 if (run[1]) felitronics::nam::blendDelay(b[c], lagTail_[1][(std::size_t) c].data(), kMaxDelay,
                                                          slotDelay_[1].load(std::memory_order_acquire), count);
-                felitronics::nam::blendMix(a[c], b[c], count, law.beginB, law.endB);
+                if (aAlone)      { /* slot 1 asleep at zero: `a` is the whole sound */ }
+                else if (bAlone) std::copy(b[c], b[c] + count, a[c]);
+                else             felitronics::nam::blendMix(a[c], b[c], count, law.beginB, law.endB);
                 // …and the law's own gain, which is below one only while nothing has been fed yet.
                 if (law.beginGain < 1.0 || law.endGain < 1.0) {
                     const float dg = (float) (law.endGain - law.beginGain) / (float) count;
@@ -975,6 +988,7 @@ private:
 
     // audio thread only
     felitronics::nam::BlendState blend_ {};
+    bool coldRt_[2] {};                                // the law's cold flags as of the last block, to see a slot fall asleep
     std::array<float, (std::size_t) kMaxDelay> lagTail_[2][kMaxChannels] {};
     float curChain_ = 1.0f, curSlot_[2] { 1.0f, 1.0f }, curDry_ = 0.0f, curWet_ = 1.0f;
     BandSet                    bandRt_[2];

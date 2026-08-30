@@ -624,9 +624,11 @@ int main() {
             if (arrived < 0 && m >= 1.0f) arrived = k;
         }
         ok(awakeAtOnce, "the first block of the turn wakes the slot");
-        // The Linear model's field is a sample; the law adds one block of conservatism; so the weight
-        // may not move in the block it woke in, nor the next, and must in the one after.
-        ok(firstMove >= 0 && firstMove <= 2, "the weight starts moving within the warm-up plus one block (block "
+        // A Linear model DECLARES no field (NAM answers prewarm only for convnet and lstm; WaveNet's is
+        // read from its config), so its need is zero and the law may move the weight in the block the
+        // slot woke in. A model with a field waits it out first — the law's own test proves that with
+        // a 6332-sample field; here the claim is only "no later than the warm-up plus one block".
+        ok(firstMove >= 0 && firstMove <= 2, "the weight starts moving no later than the warm-up plus one block (block "
                                              + std::to_string(firstMove) + ")");
         ok(arrived == firstMove + 3, "…and arrives four blocks later, a quarter per block: the law's own slew, no step");
         ok(b.p.biggestJump() <= 0.25f + 1e-6f, "no block moved the weight more than the law allows");
@@ -654,6 +656,71 @@ int main() {
         b.p.setColdAfterSeconds(0.5);
         b.rms(1000.0, 0.1, (int) std::ceil(0.5 * kFs / kBlock), 32);
         ok(b.p.slotCold(1), "…and half a second, once set, is a rest");
+    }
+
+    group("a player that sleeps sounds bit-identically to one that never does — through rests and turns");
+    {
+        // The same sine into two players, block for block: one sleeps after two seconds, one never.
+        // A cold slot is left out of the mix, not multiplied by zero, and a wake re-lands a model that
+        // has no memory of its own (a Linear gain, no alignment delay) — so not one sample may differ,
+        // resting on the lower capture (slot 1 asleep) or on the upper (slot 0 — the live buffer —
+        // asleep), nor across the turns between them.
+        Bench sleeps(rig), never(rig);
+        sleeps.p.setBlendShape({ 0.5, 0.0 }); never.p.setBlendShape({ 0.5, 0.0 });
+        never.p.setColdAfterSeconds(0.0);
+        const int rest = (int) std::ceil(2.0 * kFs / kBlock);
+        std::vector<float> x((std::size_t) kBlock), y((std::size_t) kBlock);
+        double phase = 0.0;
+        const auto both = [&](int blocks) {
+            float worst = 0.0f;
+            for (int b = 0; b < blocks; ++b) {
+                for (int i = 0; i < kBlock; ++i) {
+                    x[(std::size_t) i] = y[(std::size_t) i] = (float) (0.1 * std::sin(phase));
+                    phase += 2.0 * 3.14159265358979323846 * 1000.0 / kFs;
+                }
+                float* ix[1] { x.data() }; float* iy[1] { y.data() };
+                sleeps.p.process(ix, 1, kBlock); sleeps.p.serviceHere();
+                never.p.process(iy, 1, kBlock);  never.p.serviceHere();
+                for (int i = 0; i < kBlock; ++i) worst = std::max(worst, std::abs(x[(std::size_t) i] - y[(std::size_t) i]));
+            }
+            return worst;
+        };
+        ok(both(rest + 60) == 0.0f, "two and a half seconds on 150: identical, and by then slot 1 sleeps in one player");
+        ok(sleeps.p.slotCold(1) && ! never.p.slotCold(1), "…which it does");
+        sleeps.p.setDial("gain", 200.0); never.p.setDial("gain", 200.0);
+        ok(both(rest + 60) == 0.0f, "the turn to 240 and two and a half seconds there: identical, slot 0 now asleep");
+        ok(sleeps.p.slotCold(0) && ! sleeps.p.slotCold(1), "…the live buffer's slot, and the other awake");
+        sleeps.p.setDial("gain", 150.0); never.p.setDial("gain", 150.0);
+        ok(both(60) == 0.0f, "…and the turn back: identical to the last sample");
+        ok(sleeps.p.modelLoads() == 2 && never.p.modelLoads() == 2, "neither player loaded anything for a turn");
+    }
+
+    group("a slot's delay line is cleared on the way to sleep, as it is on a landing");
+    {
+        // THE BURST THIS CATCHES: with an alignment delay on the sleeping slot, its delay line held the
+        // last hundred samples from before the rest; a model that declares no field is heard on the
+        // block it wakes in, and those samples came out first — two seconds old, on a silent input.
+        AlignmentTable table;
+        table.lagByFile = { { "g60", 100 }, { "g150", 100 }, { "g240", 0 }, { "r150", 100 } };   // 240 is early: delayed by 100
+        Bench b(rig);
+        b.p.setBlendShape({ 0.5, 0.0 });
+        b.p.setAlignment(table);
+        const int rest = (int) std::ceil(2.0 * kFs / kBlock);
+        b.rms(1000.0, 0.1, rest + 40, 8);
+        ok(b.p.slotCold(1) && b.p.appliedSlotDelay(1) == 100, "the delayed neighbour is asleep");
+        std::vector<float> z((std::size_t) kBlock);
+        float* io[1] { z.data() };
+        float peak = 0.0f;
+        for (int k = 0; k < 8; ++k) { std::fill(z.begin(), z.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere(); }
+        for (const float v : z) peak = std::max(peak, std::abs(v));
+        ok(peak == 0.0f, "silence in, silence out, before the turn");
+        b.p.setDial("gain", 200.0);
+        for (int k = 0; k < 8; ++k) {
+            std::fill(z.begin(), z.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere();
+            for (const float v : z) peak = std::max(peak, std::abs(v));
+        }
+        ok(peak == 0.0f, "…and after it: nothing of the rest comes back out (peak " + std::to_string(peak) + ")");
+        ok(! b.p.slotCold(1) && b.p.liveMix() >= 1.0f, "the slot woke and took the sound — of a silent input");
     }
 
     group("between two captures both models run, however long the hand rests");

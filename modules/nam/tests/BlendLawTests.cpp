@@ -257,9 +257,9 @@ int main() {
         BlendStep last;
         while (! s.cold[rest] && blocks < 400) { last = blendStep(s, r, kBlock, p); ++blocks; }
         ok(s.cold[rest], "the waiting slot goes cold");
-        ok((long long) blocks * kBlock >= p.coldAfterSamples,
-           "…and not one block before the rest is over (" + std::to_string(blocks) + " blocks)");
-        ok((long long) blocks * kBlock < p.coldAfterSamples + 2 * kBlock, "…nor long after it");
+        ok((long long) (blocks - 1) * kBlock >= p.coldAfterSamples,
+           "…only once the whole rest has been PLAYED (" + std::to_string(blocks) + " blocks)");
+        ok((long long) blocks * kBlock < p.coldAfterSamples + 3 * kBlock, "…and not long after it");
         ok(! s.cold[carry], "the carrying slot does not: it has weight");
         ok(! blendAudible(s, rest) && blendAudible(s, carry), "cold reads as unfed — inaudible; the carrier still sounds");
         ok(s.x >= 1.0 && s.held[rest] == r.want[rest] && ! last.load.wanted, "nothing moved and nothing was replaced");
@@ -290,6 +290,34 @@ int main() {
         ok(run.worstStep <= kMaxDelta + 1e-9, "…and the weight never stepped");
         ok(std::abs(run.s.x - r2.targetB) < 1e-6, "it arrives where it was sent");
         ok(! run.s.cold[0] && ! run.s.cold[1], "…and with both slots heard, neither can sleep");
+    }
+
+    group("the rest is counted as played: the block that completes it runs, the next sleeps");
+    {
+        // A rest of ONE block. The first block under the new request starts the count; the second is
+        // the rest, and runs; the third finds the rest complete and is the first the host may skip.
+        BlendPolicy p; p.coldAfterSamples = kBlock;
+        auto s = settledAt(150.0);
+        const auto r = requestAt(150.0);
+        blendStep(s, r, kBlock, p);
+        ok(! s.cold[0], "the first block of a request is never a rest");
+        blendStep(s, r, kBlock, p);
+        ok(! s.cold[0] && s.still[0] == kBlock, "the block that completes the rest is still played");
+        blendStep(s, r, kBlock, p);
+        ok(s.cold[0], "…and the one after it is the first asleep");
+    }
+
+    group("a slot asked for nothing is at rest too");
+    {
+        // The caller wants one capture and nothing beside it: the other slot keeps its old model (the
+        // law never swaps for `want == 0`) at exactly zero — that is a rest, and it may sleep.
+        BlendPolicy p; p.coldAfterSamples = 2 * 48000;
+        auto s = settledAt(150.0);
+        auto r = requestAt(150.0); r.want[0] = 0;
+        BlendStep last;
+        for (int b = 0; b < 400; ++b) last = blendStep(s, r, kBlock, p);
+        ok(s.cold[0] && s.held[0] != 0 && ! last.load.wanted, "the slot wanted empty sleeps with its old model in place");
+        ok(! s.cold[1] && s.x >= 1.0, "…and the one carrying does not");
     }
 
     group("a slot with any weight never goes cold; the law's own default never sleeps");

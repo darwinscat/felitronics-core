@@ -51,11 +51,12 @@ the pack. The reference host reads from a `juce::ZipFile` kept open, one entry p
 slot at exactly zero, warm and waiting — and its network used to run every block for nothing (measured
 in OrbitAmp's block, prepared for two planes and fed one: 4.5 % of a P-core, 14 % of an E-core). After
 `RigPlayer::kColdAfterSeconds` (2 s) at exactly zero under an unchanged request the slot goes COLD: its
-model is not run, and it stays loaded — nothing is fetched, nothing freed. The law owns the flag
-(`BlendState::cold`) and wakes the slot on the first block of the next change of request, warm-up
-first — the same re-landing a load ends with, with the model's own field — so nothing unfed is ever
-heard, and the first turn after a rest trails the hand by one warm-up (some 130 ms for a WaveNet, then
-the ordinary slew). A slot with any weight is never cold: between two captures both models run, on one
+model is not run — nor mixed — and it stays loaded: nothing is fetched, nothing freed; its delay
+line is cleared as it falls asleep, as a landing clears it. The law owns the flag (`BlendState::cold`)
+and wakes the slot on the first block of the next change of request, warm-up first — the same
+re-landing a load ends with, with the model's own field — so nothing unfed is ever heard, and the
+first turn after a rest trails the hand by one warm-up (some 130 ms for a WaveNet, then the ordinary
+slew; a model that declares no field is heard at once). A slot with any weight is never cold: between two captures both models run, on one
 they do not. `setColdAfterSeconds(s)` sets the rest (zero or less = never); `slotCold(i)` and
 `coldBlocks(i)` (since `clearCounters()`) read it out beside `warmBlocks()`, for a dump or a badge.
 

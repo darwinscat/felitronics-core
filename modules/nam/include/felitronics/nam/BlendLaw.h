@@ -191,16 +191,17 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
             }
         }
 
-    // AT REST, and for how long: the wanted model, fed, at exactly zero for the whole block, under
-    // the request of the block before. Anything else — a move, a swap, a warm-up, a new request —
-    // starts the count over. Past the policy's line the slot goes cold; the host reads the flag after
-    // this call and runs the other model alone.
+    // AT REST, and for how long: the wanted model (or none wanted — a slot asked for nothing keeps
+    // its old capture and is never swapped, so it is at rest too), fed, at exactly zero for the whole
+    // block, under the request of the block before. Anything else — a move, a swap, a warm-up, a new
+    // request — starts the count over. The rest is counted as PLAYED: the block that completes it
+    // still runs, and the slot goes cold on the next, which the host reads after this call and skips.
     for (int i = 0; i < kBlendSlots; ++i) {
         const double w = std::max(i == 0 ? 1.0 - out.beginB : out.beginB, i == 0 ? 1.0 - out.endB : out.endB);
         const bool atRest = ! changed && ! s.cold[i] && wasFed[i] && ! s.inFlight[i]
-                         && s.held[i] != 0 && s.held[i] == r.want[i] && w <= 0.0;
-        s.still[i] = atRest ? s.still[i] + blockSamples : 0;
+                         && s.held[i] != 0 && (s.held[i] == r.want[i] || r.want[i] == 0) && w <= 0.0;
         if (atRest && p.coldAfterSamples > 0 && s.still[i] >= p.coldAfterSamples) s.cold[i] = true;
+        s.still[i] = atRest ? s.still[i] + blockSamples : 0;
     }
     return out;
 }
