@@ -56,12 +56,13 @@ class NamBackend
 public:
     // Both instances always exist (built by the loader) and prepare() configures both per-channel
     // resamplers, so a host switching the layout mono<->stereo (a re-prepare) is safe.
-    // `normalizeFlag` is owned by NamStage::Impl: the audio thread stores the per-call `normalize`
+    // The normalize flag is owned by NamStage::Impl: the audio thread stores the per-call `normalize`
     // argument there right before NeuralStage::process() reaches this backend (same thread →
-    // sequenced), keeping NamStage's per-block flag without widening the shared Inference seam.
+    // sequenced), keeping NamStage's per-block flag without widening the shared Inference seam. It is
+    // BOUND when the backend meets its stage (bindNormalize, before it goes live) — a backend can be
+    // built and prepared with no stage in sight; unbound, it plays raw.
     NamBackend (std::unique_ptr<::nam::DSP> m0, std::unique_ptr<::nam::DSP> m1,
-                float trimDb, const std::atomic<bool>& normalizeFlag, int prewarmFromConfig = 0)
-        : normalize (&normalizeFlag)
+                float trimDb, int prewarmFromConfig = 0)
     {
         prewarm = prewarmFromConfig;          // …raised below by NAM's own answer, where it has one
         inst[0] = std::move (m0);
@@ -87,6 +88,10 @@ public:
     // so its death doesn't skew the count. The dtor runs on the message thread only (NeuralStage
     // frees retired backends in collectGarbage / its own teardown, never on the audio thread).
     void attachRetireLedger (int* ledger) noexcept { retireLedger = ledger; }
+    // Message thread, on a backend that is NOT live (the loader, before the swap).
+    void bindNormalize (const std::atomic<bool>& flag) noexcept { normalize = &flag; }
+    double preparedSampleRate() const noexcept { return hostSR; }
+    int    preparedMaxBlock()   const noexcept { return maxBlock; }
     ~NamBackend() noexcept { if (retireLedger != nullptr) --(*retireLedger); }
 
     //--- felitronics::neural::Inference seam --------------------------------------
@@ -128,7 +133,7 @@ public:
             return;
 
         const int   n = std::min (numSamples, maxBlock);
-        const float g = normalize->load (std::memory_order_relaxed) ? makeup : 1.0f;
+        const float g = (normalize != nullptr && normalize->load (std::memory_order_relaxed)) ? makeup : 1.0f;
 
         if (numChannels == 1)
         {
@@ -212,7 +217,7 @@ private:
     }
 
     std::unique_ptr<::nam::DSP> inst[2];
-    const std::atomic<bool>*  normalize = nullptr;   // NamStage::Impl's per-call flag (see ctor)
+    const std::atomic<bool>*  normalize = nullptr;   // NamStage::Impl's per-call flag (bindNormalize)
     int*  retireLedger = nullptr;                    // attached only once live (see attachRetireLedger)
     bool  prepared_    = false;                      // false until prepare() fully succeeded
 
@@ -376,12 +381,22 @@ void NamStage::process (float* const* io, int numChannels, int numSamples, bool 
 
 
 //==============================================================================
-bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float trimDb)
+// A model built and prepared with no stage in sight: everything a load costs, minus the swap.
+struct NamStage::Prepared
+{
+    std::unique_ptr<NamBackend> backend;
+    double modelSR = 0.0;      // the model's own rate, for the stage's rate contract at install()
+};
+
+void NamStage::PreparedDeleter::operator() (Prepared* p) const noexcept { delete p; }
+
+NamStage::PreparedModel NamStage::prepareModel (const void* data, std::size_t size,
+                                                double sampleRate, int maxBlock, float trimDb)
 {
     // Accept BOTH raw .nam JSON and packed .namz (weights as float32). A packed blob is unpacked
     // to the equivalent JSON first, then the existing parse→get_dsp path runs unchanged — .namz
-    // is bit-exact to the float32 the engine computes, so the model is identical. Off the audio
-    // thread (message-thread reload poll); the alloc/parse cost is fine here.
+    // is bit-exact to the float32 the engine computes, so the model is identical. Any thread but
+    // the audio thread: nothing here touches a stage, and the alloc/parse cost is the point.
     constexpr std::size_t kMaxUnpackedNamBytes = 64u * 1024u * 1024u;   // zip-bomb guard on unpack
 
     std::unique_ptr<::nam::DSP> m0, m1;
@@ -395,7 +410,7 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
         {
             unpacked = namz::unpack (data, size, kMaxUnpackedNamBytes);
             if (unpacked.empty())
-                return false;
+                return nullptr;
             begin = reinterpret_cast<const char*> (unpacked.data());
             end   = begin + unpacked.size();
         }
@@ -404,12 +419,34 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
         m1 = ::nam::get_dsp (j);
         prewarmFromConfig = detail::receptiveFieldFromConfig (j);
     }
-    catch (...) { return false; }
+    catch (...) { return nullptr; }
 
     if (m0 == nullptr || m1 == nullptr)
-        return false;
+        return nullptr;
     // prototype: mono amp captures only
     if (m0->NumInputChannels() != 1 || m0->NumOutputChannels() != 1)
+        return nullptr;
+    const double modelSR = m0->GetExpectedSampleRate();
+
+    // Build + prepare the new backend while it is NOT live (alloc + prewarm is fine here — and a
+    // low-memory failure fails the LOAD, never the host: prepare() self-catches, see NamBackend).
+    std::unique_ptr<Prepared> out;
+    try
+    {
+        out = std::make_unique<Prepared>();
+        out->backend = std::make_unique<NamBackend> (std::move (m0), std::move (m1), trimDb, prewarmFromConfig);
+    }
+    catch (...) { return nullptr; }
+    out->modelSR = modelSR;
+    out->backend->prepare (sampleRate, std::max (1, maxBlock), 2);
+    if (! out->backend->prepared())
+        return nullptr;
+    return PreparedModel (out.release());
+}
+
+bool NamStage::install (PreparedModel model)
+{
+    if (model == nullptr || model->backend == nullptr)
         return false;
 
     // Rate contract: the run rate was decided in prepare() (audio stopped) — a model whose native
@@ -418,18 +455,19 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
     // it instead of misrepresenting it. A model that doesn't report a rate (<= 0) keeps the
     // previous behaviour (run at modelRunSR). (Factory NAMs are 48k, so this never fires for the
     // bundled library.)
-    const double modelSR = m0->GetExpectedSampleRate();
-    if (modelSR > 0.0 && std::abs (modelSR - impl->modelRunSR) > 0.5)
+    if (model->modelSR > 0.0 && std::abs (model->modelSR - impl->modelRunSR) > 0.5)
         return false;
 
-    // Build + prepare the new backend while it is NOT live (alloc + prewarm is fine here — and a
-    // low-memory failure fails the LOAD, never the host: prepare() self-catches, see NamBackend).
-    std::unique_ptr<NamBackend> backend;
-    try   { backend = std::make_unique<NamBackend> (std::move (m0), std::move (m1), trimDb, impl->normalize, prewarmFromConfig); }
-    catch (...) { return false; }
-    backend->prepare (impl->hostSR, impl->maxBlock, 2);
-    if (! backend->prepared())
-        return false;
+    auto backend = std::move (model->backend);
+    backend->bindNormalize (impl->normalize);
+    // Prepared for other numbers than this stage runs at: the same work again, here — the rare case
+    // of a rate change between the two halves, at the cost a one-call load always paid.
+    if (std::abs (backend->preparedSampleRate() - impl->hostSR) > 0.5 || backend->preparedMaxBlock() != impl->maxBlock)
+    {
+        backend->prepare (impl->hostSR, impl->maxBlock, 2);
+        if (! backend->prepared())
+            return false;
+    }
 
     // Accepted — from here the load is GUARANTEED to apply. Park it as the (single, last-wins)
     // pending intent and try to land it now: the normal path lands immediately; only a full
@@ -439,6 +477,12 @@ bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float tr
     impl->pendingActive  = true;
     impl->tryApplyPending();
     return true;
+}
+
+bool NamStage::loadModelFromMemory (const void* data, std::size_t size, float trimDb)
+{
+    // Both halves, here, on the caller's thread — the message thread, by this class's contract.
+    return install (prepareModel (data, size, impl->hostSR, impl->maxBlock, trimDb));
 }
 
 void NamStage::clearModel()
