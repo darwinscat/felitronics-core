@@ -5,6 +5,23 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.21.0 — a slot at rest goes cold (`rigplayer`, `nam`)
+
+- **feat(rigplayer):** a slot that has stood silent — weight exactly zero, request unchanged — for
+  `RigPlayer::kColdAfterSeconds` (2 s) goes cold: its model is not run, not mixed, and stays loaded;
+  its delay line is cleared as it falls asleep. The next change of request wakes it warm-up first, by
+  the landing path, with the model's own field — no load, nothing unfed heard. A slot with any weight
+  never sleeps: between two captures both models run, on one they do not. `setColdAfterSeconds()`
+  (zero or less = never), `slotCold()`, `coldBlocks()`. Measured in OrbitAmp's block with the dial
+  at rest: two passes for one sound, 4.5 % of a P-core and 14.3 % of an E-core — now one pass.
+- **feat(nam):** BlendLaw owns the flag — `BlendPolicy::coldAfterSamples` (default never),
+  `BlendState::cold` and `still`, `blendSameRequest()`. A cold slot counts as unfed; the wake is
+  `blendLanded()` with the model and the need already held; the rest is counted as played; a slot
+  asked for nothing is at rest too.
+- **fix(rigplayer):** the models run on the planes they are given, not on the width the player was
+  prepared for: a host prepared for stereo that plays one plane no longer pushes the silent second
+  plane through both networks (8.8 % → 4.5 % of real time in OrbitAmp's block).
+
 ## v0.20.0 — the pack player comes home (`rigplayer`)
 
 - **feat(rigplayer):** a new header-only module, `felitronics::rigplayer` — one device of a
