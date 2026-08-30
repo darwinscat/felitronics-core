@@ -462,6 +462,13 @@ public:
 
     // In place. `numChannels` up to what prepare() was given (fewer is fine: the missing planes are
     // silent). Any `numSamples`; longer than maxBlock is walked in pieces.
+    //
+    // THE MODELS RUN ON THE PLANES THEY ARE GIVEN, not on the width the player was prepared for.
+    // A host prepared for a stereo bus that plays one plane — a mono chain — used to push the silent
+    // second plane through both networks as well: four WaveNet passes a block for one channel of
+    // sound, and a quarter of a core gone to nothing. The convolvers still take the prepared width
+    // (the partitioned convolution no-ops when handed fewer planes), and the spare planes stay
+    // zeroed for them; only the expensive part — the two models — shrinks to what is playing.
     void process(float* const* io, int numChannels, int numSamples) {
         if (! prepared_ || io == nullptr || numSamples <= 0) return;
         const int nch = std::clamp(numChannels, 0, channels_);
@@ -492,7 +499,7 @@ public:
 
             // The chain's trim: past the top capture it rises with the angle, and a fast hand moves
             // tens of degrees between two events — so it is smoothed like every other gain here.
-            rampInto(a, channels_, count, chainGain_.load(std::memory_order_acquire), curChain_);
+            rampInto(a, nch, count, chainGain_.load(std::memory_order_acquire), curChain_);
 
             // THE LAW, once per block, and the only writer of the weight. Everything it needs arrives
             // through atomics; everything it asks for leaves the same way.
@@ -538,14 +545,14 @@ public:
             // THE SECOND CAPTURE'S COPY is taken here, after the pre-model tone and the chain trim, so
             // both models are fed the identical signal — and only now do the two part company, each
             // through its own trim: a linked setting plays its neighbour's model with less going in.
-            for (int c = 0; c < channels_; ++c) std::copy(a[c], a[c] + count, b[c]);
-            rampInto(a, channels_, count, slotGain_[0].load(std::memory_order_acquire), curSlot_[0]);
-            rampInto(b, channels_, count, slotGain_[1].load(std::memory_order_acquire), curSlot_[1]);
-            nam_[0].process(a, channels_, count, norm);
-            nam_[1].process(b, channels_, count, norm);
+            for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
+            rampInto(a, nch, count, slotGain_[0].load(std::memory_order_acquire), curSlot_[0]);
+            rampInto(b, nch, count, slotGain_[1].load(std::memory_order_acquire), curSlot_[1]);
+            nam_[0].process(a, nch, count, norm);
+            nam_[1].process(b, nch, count, norm);
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
             // Each slot carries its own history per channel, advanced every block including at zero.
-            for (int c = 0; c < channels_; ++c) {
+            for (int c = 0; c < nch; ++c) {
                 felitronics::nam::blendDelay(a[c], lagTail_[0][(std::size_t) c].data(), kMaxDelay,
                                              slotDelay_[0].load(std::memory_order_acquire), count);
                 felitronics::nam::blendDelay(b[c], lagTail_[1][(std::size_t) c].data(), kMaxDelay,
