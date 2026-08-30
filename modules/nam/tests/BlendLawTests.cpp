@@ -346,6 +346,32 @@ int main() {
         ok(coldBlocks == 0, "a hand that wobbles a hundredth of a degree never lets a slot sleep");
     }
 
+    group("a load that failed is refused: asked once, then not until the request changes");
+    {
+        // THE STORM THIS PREVENTS: a file that cannot be a model fails identically every time, and the
+        // law used to ask for it again on every block — a fetch and a parse per timer tick, for ever.
+        auto s = settledAt(150.0);
+        auto r = requestAt(120.0);                            // wants model 3 in slot 0, all of it
+        int asks = 0;
+        BlendStep st = blendStep(s, r, kBlock);
+        if (st.load.wanted) ++asks;
+        for (int b = 0; b < 10 && asks == 0; ++b) { st = blendStep(s, r, kBlock); if (st.load.wanted) ++asks; }
+        ok(asks == 1 && st.load.slot == 0 && st.load.model == 3, "the load is asked for");
+        blendLoadFailed(s, 0);
+        for (int b = 0; b < 400; ++b) { st = blendStep(s, r, kBlock); if (st.load.wanted) ++asks; }
+        ok(asks == 1, "…and after the failure, never again under the same request");
+        ok(s.held[0] == 5 && s.x >= 1.0, "the slot keeps its old capture, and the pair partner carries");
+        BlendPolicy p; p.coldAfterSamples = 2 * 48000;
+        for (int b = 0; b < 400; ++b) blendStep(s, r, kBlock, p);
+        ok(s.cold[0], "a refused slot is at rest: it may sleep");
+
+        auto back = requestAt(150.0);                          // slot 0's wish changes: 3 → 5, already held
+        for (int b = 0; b < 10; ++b) { st = blendStep(s, back, kBlock, p); if (st.load.wanted) ++asks; }
+        ok(asks == 1 && s.refused[0] == 0, "a new wish clears the refusal — here it is already held, so no load");
+        for (int b = 0; b < 10 && asks == 1; ++b) { st = blendStep(s, r, kBlock); if (st.load.wanted) ++asks; }
+        ok(asks == 2 && st.load.model == 3, "…and asking for the failed model AGAIN is a new question, tried anew");
+    }
+
     group("a cold slot is replaced the way any silent slot is — and lands awake");
     {
         // The hand jumps to 120, wanting a different model in the sleeping slot. The change of request
