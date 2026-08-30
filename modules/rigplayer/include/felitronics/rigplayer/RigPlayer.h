@@ -521,7 +521,7 @@ public:
             for (int i = 0; i < 2; ++i) {
                 const double w = i == 0 ? 1.0 - law.endB : law.endB;
                 const int want = pendDelay_[(std::size_t) i].load(std::memory_order_acquire);
-                if (w == 0.0 && want != slotDelay_[(std::size_t) i].load(std::memory_order_relaxed)) {
+                if (w <= 0.0 && want != slotDelay_[(std::size_t) i].load(std::memory_order_relaxed)) {   // exactly zero: the law clamps to [0, 1]
                     slotDelay_[(std::size_t) i].store(want, std::memory_order_relaxed);
                     for (auto& t : lagTail_[(std::size_t) i]) t.fill(0.0f);
                 }
@@ -844,11 +844,12 @@ private:
 
     // One linear ramp per block toward an exponential ~10 ms endpoint: smooth moves without an exp()
     // per sample. `current` is audio-thread-only.
+    static bool isOne(float g) { const float one = 1.0f; return std::memcmp(&g, &one, sizeof(float)) == 0; }   // bit for bit, as same()
     void rampInto(float* const* planes, int nch, int count, float want, float& current) const {
         const float decay = std::exp(-(float) count / (float) (0.010 * fs_));
         const float end   = want + (current - want) * decay;
         const float step  = (end - current) / (float) count;
-        if (current != 1.0f || want != 1.0f)
+        if (! isOne(current) || ! isOne(want))
             for (int c = 0; c < nch; ++c) {
                 float g = current;
                 float* x = planes[c];

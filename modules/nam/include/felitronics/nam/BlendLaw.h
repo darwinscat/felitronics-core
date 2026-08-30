@@ -134,12 +134,13 @@ inline BlendStep blendStep(BlendState& s, const BlendRequest& r, int blockSample
     out.endGain = s.gain;
 
     // A swap is asked for only at EXACTLY zero, and only one at a time. Everything above conspires to
-    // make that reachable: a wrong slot's goal is a rail, and the rail is its own zero.
+    // make that reachable: a wrong slot's goal is a rail, and the rail is its own zero. (`x` is clamped
+    // to [0, 1], so `w <= 0.0` IS exactly zero — spelled so that -Wfloat-equal has nothing to say.)
     const bool busy = s.inFlight[0] || s.inFlight[1];
     if (! busy)
         for (int i = 0; i < kBlendSlots; ++i) {
             const double w = i == 0 ? 1.0 - s.x : s.x;
-            if (s.held[i] != r.want[i] && w == 0.0 && r.want[i] != 0) {
+            if (s.held[i] != r.want[i] && w <= 0.0 && r.want[i] != 0) {
                 out.load = { true, i, r.want[i] };
                 s.inFlight[i] = true;
                 break;
