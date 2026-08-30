@@ -81,6 +81,7 @@ add_subdirectory(modules/oversampling)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
 add_subdirectory(modules/nam)   # OPTIONAL, compiled NAM backend — depends on neural + core; self-gates on FELITRONICS_WITH_NAM
+add_subdirectory(modules/rigplayer)   # OPTIONAL, the .orbitrig pack player — header-only over nam + convolution + lineareq + eq; self-gates on FELITRONICS_WITH_NAM
 add_subdirectory(modules/saturation)
 add_subdirectory(modules/poweramp)   # tube power-amp trunk (SagEnvelope + TubeStage + PowerAmpStage, from OrbitCab) — needs eq + oversampling + saturation
 add_subdirectory(modules/stereo)
@@ -114,7 +115,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text)
     if(FELITRONICS_WITH_NAM)
-        target_link_libraries(felitronics_header_hygiene PRIVATE felitronics::nam)
+        target_link_libraries(felitronics_header_hygiene PRIVATE felitronics::nam felitronics::rigplayer)
     endif()
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE

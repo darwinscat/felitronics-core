@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
+
+// The pack player (src/rigplayer), driven the way a hand drives it and checked without a sound card.
+// The pack is written by namz's writer and read back by its canonical reader, so what the player is
+// handed is what a plugin will be handed. The models are tiny Linear NAMs — a gain, or a pure delay —
+// whose output IDENTIFIES them, so "which capture is sounding, how loud, and how far apart" are numbers
+// read off the audio, not off a variable.
+
+#include <felitronics_test.h>
+#include <felitronics/rigplayer/RigPlayer.h>
+
+#include <namz.h>
+#include <namz_rig_load.h>
+#include <namz_rig_write.h>
+
+#include <cmath>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+
+using felitronics::test::approx;
+using felitronics::test::group;
+using felitronics::test::ok;
+using namespace felitronics::rigplayer;
+
+namespace {
+
+constexpr double kFs = 48000.0;
+constexpr int    kBlock = 256;
+
+// A NAM that is a gain: Linear, receptive field 1, one weight. What comes out says which one it is.
+std::string gainModel(double w) {
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+        R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":1,"bias":false,"implementation":"direct"},"weights":[%.6f],"sample_rate":48000})", w);
+    return buf;
+}
+
+// A NAM that is a pure delay of `d` samples: the window's first tap is the oldest sample and its last
+// the newest, so a weight on the first alone hands back what came in `d` samples ago.
+std::string delayModel(int d) {
+    std::string w = "[";
+    for (int i = 0; i < d; ++i) w += "0.0,";
+    w += "1.0]";
+    return R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":)" + std::to_string(d + 1)
+         + R"(,"bias":false,"implementation":"direct"},"weights":)" + w + R"(,"sample_rate":48000})";
+}
+
+std::vector<std::byte> bytesOf(const std::string& s) {
+    const auto* p = reinterpret_cast<const std::byte*>(s.data());
+    return { p, p + s.size() };
+}
+
+std::vector<std::byte> packed(const std::string& nam) {
+    const auto z = namz::pack(nam.data(), nam.size());
+    const auto* p = reinterpret_cast<const std::byte*>(z.data());
+    return { p, p + z.size() };
+}
+
+// THE DEVICE UNDER TEST. Two axes: a channel switch and a gain dial captured at 60, 150 and 240 of a
+// 300-degree sweep on the green channel, one capture on red. The bottom of the dial is a LINK — gain 0
+// plays the 60 capture fed 6 dB softer — spelled the way the pack spells it: a second files[] entry
+// pointing at the same file with an input_db. One tone knob as bands (a high shelf after the model),
+// one as a curve (a bass lift before it), and a blend knob whose dry path is a wire 6 dB down.
+namz::rig::Rig testRig(int polarity = 1) {
+    namz::rig::Rig rig;
+    rig.rigId = "test-rig"; rig.name = "Test Pedal"; rig.modeledBy = "the test";
+    namz::rig::Stage st;
+    st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam"; st.slot = "pedal";
+    st.make = "Darwin's Cat"; st.model = "Test Pedal"; st.gearType = "pedal";
+    auto& d = st.device;
+    d.family = "Test Pedal"; d.rigId = "test-rig"; d.slot = "pedal";
+    namz::rig::Control ch; ch.name = "channel"; ch.role = namz::rig::Role::Channel; ch.values = { "green", "red" };
+    namz::rig::Control g;  g.name = "gain";     g.role = namz::rig::Role::Gain;    g.values = { "60", "150", "240" }; g.sweep = 300;
+    d.controls = { ch, g };
+    const auto file = [](const char* id, const char* chan, const char* gain, double inDb = 0.0) {
+        namz::rig::FileEntry f; f.id = id; f.settings = { { "channel", chan }, { "gain", gain } }; f.inputDb = inDb; return f;
+    };
+    d.files = { file("g60", "green", "60"), file("g150", "green", "150"), file("g240", "green", "240"),
+                file("r150", "red", "150"), file("g60", "green", "0", -6.0) };
+
+    // `tone`: one band after the model, +6 dB at the top of the travel, -6 at the bottom, zero at 150.
+    namz::rig::Tone tone;
+    tone.name = "tone"; tone.sweep = 300; tone.placement = "post"; tone.reference = "150"; tone.defaultValue = "150";
+    namz::rig::Section hs; hs.kind = namz::rig::SectionKind::HighShelf; hs.hz = 3000.0; hs.q = 0.7;
+    hs.dbAtMin = -6.0; hs.dbAtMax = 6.0;
+    tone.sections = { hs };
+    // `bass`: a curve before the model — flat at 0 (the reference), and at 300 a +6 dB lift that runs
+    // out between 200 Hz and 2 kHz, on a 25-point grid of its own.
+    namz::rig::Tone bass;
+    bass.name = "bass"; bass.sweep = 300; bass.placement = "pre"; bass.reference = "0"; bass.defaultValue = "0";
+    bass.grid.fLo = 20.0; bass.grid.fHi = 20000.0; bass.grid.points = 25;
+    bass.trusted.levels = 1;
+    const auto grid = felitronics::lineareq::logFreqGrid(20.0, 20000.0, 25);
+    namz::rig::TonePosition p0; p0.value = "0"; p0.norm = 0.0; p0.db.assign(25, 0.0);
+    namz::rig::TonePosition p1; p1.value = "300"; p1.norm = 1.0;
+    for (const double f : grid)
+        p1.db.push_back(f <= 200.0 ? 6.0 : f >= 2000.0 ? 0.0 : 6.0 * (1.0 - std::log(f / 200.0) / std::log(10.0)));
+    bass.positions = { p0, p1 };
+    st.tone = { tone, bass };
+
+    // `mix`: wet at 300 (where the models were captured), dry at 0; the dry path is flat, 6 dB down.
+    namz::rig::Blend mix;
+    mix.name = "mix"; mix.sweep = 300; mix.reference = "300"; mix.dryEnd = "0"; mix.defaultValue = "300";
+    mix.polarity = polarity; mix.dryLevelDb = -6.0;
+    mix.grid.fLo = 20.0; mix.grid.fHi = 20000.0; mix.grid.points = 25;
+    mix.dryDb.assign(25, 0.0);
+    namz::rig::BlendPosition dry; dry.value = "0";   dry.norm = 0.0; dry.dryDb = 0.0;    dry.wetDb = -120.0;
+    namz::rig::BlendPosition wet; wet.value = "300"; wet.norm = 1.0; wet.dryDb = -120.0; wet.wetDb = 0.0;
+    mix.positions = { dry, wet };
+    st.blend = { mix };
+
+    rig.chain = { st };
+    return rig;
+}
+
+// The same rig, as a plugin would meet it: written by the pack writer, read by the canonical reader.
+namz::rig::Rig throughTheFormat(const namz::rig::Rig& rig, bool* okOut = nullptr) {
+    return namz::rig::loadRigManifest(namz::rig::writeManifest(rig), okOut);
+}
+
+struct Bench {
+    RigPlayer p;
+    std::map<std::string, std::vector<std::byte>> files;
+    int fetches = 0;
+    double phase = 0.0;
+    double fs = kFs;
+
+    Bench(const namz::rig::Rig& rig, int channels = 1, double sampleRate = kFs) : fs(sampleRate) {
+        files["g60"]  = packed(gainModel(0.25));           // packed, as the pack ships them…
+        files["g150"] = packed(gainModel(0.5));
+        files["g240"] = bytesOf(gainModel(1.0));           // …and raw, which the stage takes as well
+        files["r150"] = bytesOf(gainModel(0.75));
+        p.prepare(fs, kBlock, channels);
+        load(rig);
+    }
+    void load(const namz::rig::Rig& rig) {
+        p.load(rig, [this](const std::string& id) {
+            ++fetches;
+            const auto it = files.find(id);
+            return it == files.end() ? std::vector<std::byte> {} : it->second;
+        });
+    }
+
+    // Run the transport on a sine and read the RMS of channel `channel` over the last `measure` blocks
+    // — RMS, because a sampled peak is off by up to a fraction of a sample. Channel 1, when there is
+    // one, gets the same sine at `aR`. `serviceHere()` after every block — a host's timer, with the
+    // load job run right here rather than on a worker.
+    double rms(double hz, double a, int blocks = 48, int measure = 32, int channel = 0, double aR = 0.0) {
+        const int nch = p.channels();
+        std::vector<float> l((std::size_t) kBlock), r((std::size_t) kBlock);
+        double sum = 0.0; long n = 0;
+        for (int b = 0; b < blocks + measure; ++b) {
+            for (int i = 0; i < kBlock; ++i) {
+                const double s = std::sin(phase);
+                phase += 2.0 * 3.14159265358979323846 * hz / fs;
+                if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                l[(std::size_t) i] = (float) (a * s);
+                r[(std::size_t) i] = (float) (aR * s);
+            }
+            float* io[2] { l.data(), r.data() };
+            p.process(io, nch, kBlock);
+            p.serviceHere();
+            if (b >= blocks) {
+                const auto& x = channel == 0 ? l : r;
+                for (const float v : x) { sum += (double) v * v; ++n; }
+            }
+        }
+        return std::sqrt(sum / (double) std::max(1L, n));
+    }
+    // A measurement AGAINST the input: the chain's gain at `hz`, linear.
+    double gainAt(double hz, double a = 0.1, int blocks = 48, int measure = 32) {
+        return rms(hz, a, blocks, measure) / (a / std::sqrt(2.0));
+    }
+};
+
+double db(double lin) { return 20.0 * std::log10(std::max(1e-12, lin)); }
+
+// What the test rig's high shelf (3 kHz, Q 0.7) reads between 10 kHz and 100 Hz at `gainDb`, by the
+// format's own formula at this rate — the claim is "the player applies that formula", not "a shelf is
+// exactly its nominal gain 1.7 octaves up", which it is not.
+double shelfDb(double gainDb, double fs) {
+    const auto q = felitronics::rigplayer::designSection(felitronics::rigplayer::SectionKind::HighShelf, 3000.0, gainDb, 0.7, fs);
+    return felitronics::rigplayer::sectionMagnitudeDb(q, 10000.0, fs) - felitronics::rigplayer::sectionMagnitudeDb(q, 100.0, fs);
+}
+
+} // namespace
+
+int main() {
+    std::printf("felitronics::rigplayer::RigPlayer tests\n");
+
+    group("the rig round-trips through the pack writer and the canonical reader");
+    bool okManifest = false;
+    const auto rig = throughTheFormat(testRig(), &okManifest);
+    {
+        ok(okManifest, "the writer's manifest is a manifest to the reader");
+        ok(rig.chain.size() == 1 && rig.chain[0].kind == namz::rig::StageKind::Nam, "one NAM stage");
+        const auto& st = rig.chain[0];
+        ok(st.device.files.size() == 5, "five file entries, the link among them");
+        ok(st.device.files.size() == 5 && st.device.files[4].id == "g60" && st.device.files[4].inputDb == -6.0,
+           "the link is a second entry for the same file, with its input_db");
+        ok(st.tone.size() == 2, "both tone knobs survive");
+        ok(st.tone.size() == 2 && st.tone[0].sections.size() == 1 && st.tone[0].positions.empty(), "the band knob is bands");
+        ok(st.tone.size() == 2 && st.tone[1].positions.size() == 2 && st.tone[1].sections.empty(), "the curve knob is a curve");
+        ok(st.blend.size() == 1 && st.blend[0].positions.size() == 2, "the blend knob and its two ends");
+        ok(crossfadeDial(st.device) != nullptr && crossfadeDial(st.device)->name == "gain", "the gain dial is the crossfade axis");
+    }
+    const auto& dev = rig.chain[0].device;
+
+    group("selection: which files sound where (pure)");
+    {
+        Settings green { { "channel", "green" }, { "gain", "150" } };
+        auto s = select(dev, green, "gain", 150.0);
+        ok(s.knots.size() == 4, "four knots on green: the link at 0, then 60, 150, 240");
+        ok(s.fileA == 1 && s.fileB == 2 && s.mixB == 0.0,
+           "at 150 exactly the pair is 150 and 240 with nothing of 240: the neighbour is named, so it can be warm");
+        s = select(dev, green, "gain", 200.0);
+        ok(s.fileA == 1 && s.fileB == 2, "at 200 the pair is 150 and 240");
+        approx(s.mixB, 50.0 / 90.0, 1e-9, "…mixed by angle: 50 of the 90 degrees between them");
+        auto plan = slotPlan(s, dev);
+        ok(plan.file[0] == 1 && plan.file[1] == 2, "150 is the third knot (even) so it keeps slot 0");
+        approx(plan.targetB, 50.0 / 90.0, 1e-9, "…and slot 1's weight is the 240 share");
+        s = select(dev, green, "gain", 30.0);
+        ok(s.fileA == 4 && s.fileB == 0, "at 30 the pair is the link (a knot at 0) and the 60 capture");
+        plan = slotPlan(s, dev);
+        approx(plan.inputDb[0], -6.0, 1e-9, "…the link's slot is fed 6 dB softer");
+        approx(plan.inputDb[1], 0.0, 1e-9, "…the capture's is not");
+        s = select(dev, green, "gain", 300.0);
+        ok(s.fileA == 2 && s.fileB == 2, "past the top capture it plays alone");
+        approx(s.extendDb, 3.0, 1e-9, "…driven 0.05 dB per degree harder: 60 degrees, 3 dB");
+        Settings red { { "channel", "red" }, { "gain", "150" } };
+        s = select(dev, red, "gain", 240.0);
+        ok(s.knots.size() == 1 && s.fileA == 3 && s.fileB == 3, "red has one knot; at 240 it plays alone");
+        approx(s.extendDb, 4.5, 1e-9, "…90 degrees past it");
+        s = select(dev, green, "", 150.0);
+        ok(s.fileA == 1 && s.fileB == 1, "with no dial the panel's own file plays");
+    }
+
+    group("the law asks and service answers: silent until fed, then sounding");
+    {
+        Bench b(rig);
+        ok(b.p.loaded(), "loaded");
+        ok(b.p.settings().at("channel") == "green" && b.p.settings().at("gain") == "150",
+           "the pack's defaults: first channel, the middle of the gain sweep");
+        approx(b.p.dialDegrees(), 150.0, 1e-9, "…and the dial stands there");
+        // No service: nothing can land, and the law keeps the unfed slots silent.
+        std::vector<float> x((std::size_t) kBlock, 0.1f);
+        float* io[1] { x.data() };
+        for (int i = 0; i < 8; ++i) b.p.process(io, 1, kBlock);
+        double e = 0.0; for (const float v : x) e += v * v;
+        ok(e == 0.0, "before any model lands the output is silence, not the raw DI");
+        ok(b.fetches == 0, "…and nothing was fetched: the law asks, the host answers");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "at 150 the 0.5 capture plays");
+        ok(b.fetches == 2, "two fetches: the capture sounding, and its neighbour above, warm at zero weight");
+        ok(b.p.heldFileId(0) == "g150" && b.p.heldFileId(1) == "g240", "slot 0 holds it, slot 1 the neighbour");
+    }
+
+    group("the load as a job: taken once, run anywhere, delivered back — and a stale one dropped");
+    {
+        Bench b(rig);
+        std::vector<float> x((std::size_t) kBlock, 0.1f);
+        float* io[1] { x.data() };
+        b.p.process(io, 1, kBlock);                                  // the law asks
+        b.p.service();                                               // …and service does not load
+        ok(b.fetches == 0, "service() fetches nothing: the ask is work for the host");
+        auto job = b.p.takeLoadJob();
+        // Which slot first is the law's business (it frees the one at weight zero — slot 1, cold): the job
+        // names one of the two wanted captures, in the slot the law freed for it.
+        ok(job.has_value() && ((job->slot == 0 && job->fileId == "g150") || (job->slot == 1 && job->fileId == "g240")),
+           "the job names a wanted capture, for the slot the law freed");
+        ok(! b.p.takeLoadJob().has_value(), "one job out: no second one until it is back");
+        auto loaded = RigPlayer::run(std::move(*job));                // any thread — here; a worker in the app
+        ok(loaded.fetched && loaded.model != nullptr && b.fetches == 1, "run() fetched the bytes and built the model");
+        b.p.deliver(std::move(loaded));
+        ok(b.p.modelLoads() == 1, "delivered: the fetch is counted and the bytes kept");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…and it sounds (the neighbour arrives the same way)");
+        ok(b.fetches == 2, "…each file fetched once");
+
+        // A job out while the pack changes comes back for a pack that is gone — and is dropped whole.
+        b.p.setDial("gain", 0.0);                                    // wants the 60 capture
+        std::optional<RigPlayer::LoadJob> late;
+        for (int i = 0; i < 24 && ! late; ++i) { b.p.process(io, 1, kBlock); b.p.service(); late = b.p.takeLoadJob(); }
+        ok(late.has_value() && late->fileId == "g60", "the job for the 60 capture is out");
+        b.p.unload();
+        b.load(rig);
+        ok(! b.p.takeLoadJob().has_value(), "…and nothing new is handed out while it is out");
+        b.p.deliver(RigPlayer::run(std::move(*late)));
+        b.p.process(io, 1, kBlock);                                  // the new pack's law: nothing landed
+        ok(b.p.heldFileId(0).empty() && b.p.heldFileId(1).empty(), "delivered to the new pack it is dropped: no slot holds it");
+        approx(b.gainAt(1000.0), 0.5, 0.01, "…and the new pack loads its own and sounds");
+    }
+
+    group("the dial: a pair mixed by angle, the extension past the top, each file fetched once");
+    {
+        Bench b(rig);
+        approx(b.gainAt(1000.0), 0.5, 0.01, "150: the 0.5 capture");
+        ok(b.p.setDial("gain", 200.0), "the dial turns to 200");
+        approx(b.gainAt(1000.0), (40.0 / 90.0) * 0.5 + (50.0 / 90.0) * 1.0, 0.015,
+               "200: the 150 and 240 captures, 4/9 and 5/9 of each");
+        approx((double) b.p.liveMix(), 50.0 / 90.0, 0.01, "…and that is the weight the audio thread applied");
+        b.p.setDial("gain", 300.0);
+        approx(b.gainAt(1000.0), 1.0 * std::pow(10.0, 3.0 / 20.0), 0.03, "300: the top capture, 3 dB harder in");
+        b.p.setDial("gain", 150.0);
+        approx(b.gainAt(1000.0), 0.5, 0.01, "back at 150");
+        b.p.setDial("gain", 240.0);
+        approx(b.gainAt(1000.0), 1.0, 0.02, "240 alone");
+        ok(b.fetches == 2, "two fetches for two files, however many times the dial crossed them");
+        ok(b.p.modelLoads() == 2, "…which is what the player counts too");
+        const auto& knots = b.p.selection().knots;
+        ok(knots.size() == 4 && knots[0].deg == 0.0 && knots[3].deg == 240.0, "the ring's knots: 0 (the link) to 240");
+    }
+
+    group("the shape of the handover: where the 50/50 lands and how wide the fade is");
+    {
+        Bench b(rig);
+        ok(b.p.blendShape().point == 0.5 && b.p.blendShape().width == 1.0, "the default is the original law: midpoint, full span");
+        b.p.setDial("gain", 195.0);                                  // the middle of 150..240
+        approx(b.p.selection().mixB, 0.5, 1e-9, "…so the 50/50 sits in the middle of the pair");
+        b.p.setBlendShape({ 0.25, 1.0 });
+        ok(b.p.blendShape().point == 0.25, "the point moves to a quarter of the span");
+        b.p.setDial("gain", 172.5);                                  // 150 + 0.25 * 90
+        approx(b.p.selection().mixB, 0.5, 1e-9, "…and the 50/50 sits there now");
+        approx(b.gainAt(1000.0), 0.5 * 0.5 + 0.5 * 1.0, 0.015, "…which is what sounds: half of each capture");
+        b.p.setDial("gain", 161.25);                                 // halfway up the near side
+        approx(b.p.selection().mixB, 0.25, 1e-9, "the near side is a quarter of the way at its own half");
+        b.p.setBlendShape({ 0.25, 0.0 });
+        b.p.setDial("gain", 170.0);
+        approx(b.p.selection().mixB, 0.0, 1e-9, "width zero: below the point the lower capture alone");
+        b.p.setDial("gain", 175.0);
+        approx(b.p.selection().mixB, 1.0, 1e-9, "…above it the upper alone — a step, where the bench asked for one");
+        approx(b.gainAt(1000.0), 1.0, 0.02, "…and that is what sounds");
+        b.p.setBlendShape({});
+        b.p.setDial("gain", 195.0);
+        approx(b.p.selection().mixB, 0.5, 1e-9, "back to the law");
+    }
+
+    group("every knob by name: a dial in degrees, a switch by value, its position read back");
+    {
+        Bench b(rig);
+        ok(b.p.knobValue("tone") == "150" && b.p.knobValue("bass") == "0" && b.p.knobValue("mix") == "300",
+           "the tone and blend knobs start where the pack says");
+        ok(b.p.knobValue("gain") == "150" && b.p.knobValue("channel") == "green", "…and so do the captured axes");
+        ok(b.p.setDial("tone", 300.0) && b.p.knobValue("tone") == "300", "a band knob turned by degrees reads back in degrees");
+        ok(b.p.setDial("bass", 210.0) && b.p.knobValue("bass") == "210", "a curve knob the same");
+        ok(b.p.setDial("mix", 0.0) && b.p.knobValue("mix") == "0", "the blend knob the same");
+        ok(b.p.setSwitch("tone", "0") && b.p.knobValue("tone") == "0", "…or set to a value outright");
+        ok(b.p.setDial("gain", 200.0) && b.p.knobValue("gain") == "150",
+           "a captured dial reads back the knot at or below the hand; the angle is dialDegrees()");
+        approx(b.p.dialDegrees(), 200.0, 1e-9, "…which is where the hand is");
+        ok(! b.p.setDial("nope", 10.0) && b.p.knobValue("nope").empty(), "a knob the pack has not got: refused, and empty");
+    }
+
+    group("a linked setting plays its neighbour's weights, fed softer");
+    {
+        Bench b(rig);
+        b.p.setDial("gain", 0.0);
+        approx(b.gainAt(1000.0), 0.25 * std::pow(10.0, -6.0 / 20.0), 0.005,
+               "at 0 the 60 capture sounds, 6 dB less going in");
+        ok(b.p.heldFileId(0) == "g60", "…and it is that file in the slot");
+        b.p.setDial("gain", 30.0);
+        approx(b.gainAt(1000.0), 0.5 * 0.25 * std::pow(10.0, -6.0 / 20.0) + 0.5 * 0.25, 0.01,
+               "at 30, halfway to 60, the same weights softer and louder are crossfaded");
+    }
+
+    group("a switch turn is namz::rig's resolve; the dial keeps its angle and follows the new knots");
+    {
+        Bench b(rig);
+        b.p.setDial("gain", 240.0);
+        ok(b.p.setSwitch("channel", "red"), "channel to red");
+        ok(b.p.settings().at("channel") == "red", "…pinned");
+        ok(b.p.settings().at("gain") == "150", "…and the combination is red's only capture");
+        approx(b.p.dialDegrees(), 240.0, 1e-9, "…while the dial still stands at 240");
+        approx(b.gainAt(1000.0), 0.75 * std::pow(10.0, 4.5 / 20.0), 0.03, "so the red capture plays, 4.5 dB harder in");
+        ok(! b.p.setSwitch("channel", "blue"), "a value nothing was captured at is refused");
+        ok(b.p.settings().at("channel") == "red", "…and changes nothing");
+        ok(b.p.setSwitch("channel", "green"), "back to green");
+        approx(b.gainAt(1000.0), 1.0, 0.02, "…and the dial, still at 240, finds its capture again");
+        ok(b.p.setSwitch("gain", "60"), "the crossfade dial set by value");
+        approx(b.p.dialDegrees(), 60.0, 1e-9, "…is the dial turned there");
+    }
+
+    group("tone as bands: the travel law at the reference and at the stops");
+    {
+        Bench b(rig);
+        ok(b.p.bands(1).size() == 1 && b.p.bands(0).empty(), "one band after the model, none before");
+        ok(b.p.knobValue("tone") == "150", "the knob starts at its default, the reference");
+        const double flatLo = b.gainAt(100.0), flatHi = b.gainAt(10000.0);
+        approx(db(flatHi / flatLo), 0.0, 0.1, "at the reference the band is flat");
+        ok(b.p.setDial("tone", 300.0), "tone to the plus stop");
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)), shelfDb(6.0, kFs), 0.1, "+6 dB of high shelf at the plus stop, as the formula draws it");
+        b.p.setDial("tone", 0.0);
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)), shelfDb(-6.0, kFs), 0.1, "-6 dB at the minus stop");
+        b.p.setDial("tone", 225.0);
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)), shelfDb(3.0, kFs), 0.1, "halfway up from the reference: half the gain, in dB");
+        ok(b.p.knobValue("tone") == "225", "…and the knob reads back in the pack's words");
+    }
+
+    group("tone as a curve: the pack's decibels at this frequency, as a FIR before the model");
+    {
+        Bench b(rig);
+        ok(! b.p.curveActive(0), "at the reference the curve is flat and there is no FIR");
+        const double refLo = b.gainAt(60.0), refHi = b.gainAt(10000.0);
+        ok(b.p.setDial("bass", 300.0), "bass to the top");
+        ok(b.p.curveActive(0) && ! b.p.curveDb(0).empty(), "…and now there is a FIR on the pre side");
+        approx(db(b.gainAt(60.0) / refLo), 6.0, 0.6, "+6 dB at 60 Hz");
+        approx(db(b.gainAt(10000.0) / refHi), 0.0, 0.3, "nothing at 10 kHz");
+        b.p.setDial("bass", 150.0);
+        approx(db(b.gainAt(60.0) / refLo), 3.0, 0.6, "halfway: the two curves interpolated, +3 dB");
+    }
+
+    group("tone handed in beside the manifest: the same structures, another source");
+    {
+        Bench b(rig);
+        b.p.setDial("bass", 300.0);
+        const double refLo = b.gainAt(60.0);                  // the pack's curve: +6 dB at 60 Hz
+        // The bench rewrites `bass` as one band — a low shelf reaching +12 dB — and hears it at once.
+        namz::rig::Tone bass;
+        bass.name = "bass"; bass.sweep = 300; bass.placement = "pre"; bass.reference = "0"; bass.defaultValue = "0";
+        namz::rig::Section ls; ls.kind = namz::rig::SectionKind::LowShelf; ls.hz = 200.0; ls.q = 0.7;
+        ls.dbAtMin = 0.0; ls.dbAtMax = 12.0;
+        bass.sections = { ls };
+        b.p.setToneOverride({ bass });
+        ok(b.p.toneOverridden(), "the override is in");
+        ok(b.p.tones().size() == 2 && b.p.tones()[1].name == "bass" && b.p.tones()[1].positions.empty(),
+           "…and the knob plays as the band, in the pack's place for it");
+        ok(b.p.knobValue("bass") == "300", "the knob keeps its position across the swap");
+        const auto q = felitronics::rigplayer::designSection(felitronics::rigplayer::SectionKind::LowShelf, 200.0, 12.0, 0.7, kFs);
+        const double want = felitronics::rigplayer::sectionMagnitudeDb(q, 60.0, kFs);
+        approx(db(b.gainAt(60.0) / refLo) + 6.0, want, 0.3, "at 60 Hz the band's own decibels, not the curve's");
+        b.p.clearToneOverride();
+        ok(! b.p.toneOverridden(), "cleared");
+        approx(db(b.gainAt(60.0) / refLo), 0.0, 0.3, "…and the pack's curve is back");
+
+        // A knob the pack has no block for is a new knob, at its default.
+        namz::rig::Tone presence;
+        presence.name = "presence"; presence.sweep = 300; presence.placement = "post"; presence.reference = "150";
+        namz::rig::Section hs; hs.kind = namz::rig::SectionKind::HighShelf; hs.hz = 3000.0; hs.q = 0.7;
+        hs.dbAtMin = -6.0; hs.dbAtMax = 6.0;
+        presence.sections = { hs };
+        b.p.setToneOverride({ presence });
+        ok(b.p.tones().size() == 3 && b.p.knobValue("presence") == "150", "a new knob appears, at its reference");
+        const double flat = db(b.gainAt(10000.0) / b.gainAt(100.0));
+        ok(b.p.setDial("presence", 300.0), "…and turns");
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)) - flat, shelfDb(6.0, kFs), 0.1, "+6 dB of the new shelf");
+    }
+
+    group("blend: the dry path and the wet one as the pack states them");
+    {
+        Bench b(rig);
+        approx(b.gainAt(1000.0), 0.5, 0.01, "wet end (the default): the model alone");
+        ok(b.p.setDial("mix", 0.0), "mix to the dry end");
+        approx(b.gainAt(1000.0), std::pow(10.0, -6.0 / 20.0), 0.01, "dry end: the DI through the dry path, 6 dB down");
+        b.p.setDial("mix", 150.0);
+        approx(b.gainAt(1000.0), 0.5 * std::pow(10.0, -6.0 / 20.0) + 0.5 * 0.5, 0.01,
+               "halfway: half of each, in amplitude, summing in phase");
+    }
+    {
+        Bench b(throughTheFormat(testRig(-1)));
+        b.p.setSwitch("gain", "240");                          // a unity capture, so the two paths match
+        b.p.setDial("mix", 150.0);
+        const double half = b.gainAt(1000.0);
+        ok(half < 0.5 * 0.501 + 0.5 - 0.4, "polarity -1: the dry path is subtracted, and the middle of the knob nearly nulls");
+        approx(half, 0.5 - 0.5 * std::pow(10.0, -6.0 / 20.0), 0.01, "…to exactly the difference of the two");
+    }
+
+    group("alignment: two captures that land apart are lined up before they mix");
+    {
+        // Two files: unity, and unity two samples late.
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain; g.values = { "60", "240" }; g.sweep = 300;
+        st.device.controls = { g };
+        namz::rig::FileEntry a; a.id = "early"; a.settings = { { "gain", "60" } };
+        namz::rig::FileEntry c; c.id = "late";  c.settings = { { "gain", "240" } };
+        st.device.files = { a, c };
+        r.chain = { st };
+        std::map<std::string, std::vector<std::byte>> files {
+            { "early", bytesOf(gainModel(1.0)) }, { "late", bytesOf(delayModel(2)) } };
+        const ModelSource src = [&files](const std::string& id) { return files.at(id); };
+
+        const auto table = measureAlignment(st.device, src, kFs);
+        ok(table.lagByFile.size() == 2, "both files measured");
+        ok(table.lagByFile.count("late") && table.lagByFile.at("late") == 2, "the late one reads two samples late");
+        ok(table.delayOf("early") == 2 && table.delayOf("late") == 0, "so the early one is delayed by two, the late one not at all");
+
+        // At 6 kHz two samples are a quarter turn: unaligned, a 50/50 sum of the two is 3 dB down.
+        {
+            Bench b(r);
+            b.files = files;
+            b.p.setDial("gain", 150.0);
+            approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "without the table the pair combs: 0.707 at 6 kHz");
+        }
+        {
+            Bench b(r);
+            b.files = files;
+            b.p.setAlignment(table);                           // before anything lands: it travels with the loads
+            b.p.setDial("gain", 150.0);
+            approx(b.gainAt(6000.0), 1.0, 0.02, "with the table in hand before playing, the pair sums to one");
+            ok(b.p.appliedSlotDelay(0) == 2 && b.p.appliedSlotDelay(1) == 0, "…the early slot delayed, the late one not");
+        }
+        {
+            // A table that arrives MID-MIX lands at the one instant a slot is free — weight exactly zero —
+            // never as a splice on a live signal. So the comb stands until the dial visits a knot, and is
+            // gone once it has: the host that can measure before playing should.
+            Bench b(r);
+            b.files = files;
+            b.p.setDial("gain", 150.0);
+            approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "mid-mix, before the table: the comb");
+            b.p.setAlignment(table);
+            approx(b.gainAt(6000.0), std::sqrt(0.5), 0.02, "…and still the comb: neither slot is silent, so nothing lands");
+            b.p.setDial("gain", 240.0);
+            b.gainAt(6000.0);                                  // the top: the early capture leaves its slot at zero
+            b.p.setDial("gain", 150.0);
+            approx(b.gainAt(6000.0), 1.0, 0.02, "back at the middle it lands again, delayed, and the pair sums to one");
+        }
+    }
+
+    group("alignment from the pack: the lags written at pack time, no probe at load");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain; g.values = { "60", "240" }; g.sweep = 300;
+        st.device.controls = { g };
+        namz::rig::FileEntry a; a.id = "early"; a.settings = { { "gain", "60" } };  a.lagSamples = 0;
+        namz::rig::FileEntry c; c.id = "late";  c.settings = { { "gain", "240" } }; c.lagSamples = 2;
+        st.device.files = { a, c };
+        r.chain = { st };
+        bool okM = false;
+        const auto packed = throughTheFormat(r, &okM);
+        ok(okM && packed.chain.size() == 1 && packed.chain[0].device.files.size() == 2
+           && packed.chain[0].device.files[1].lagSamples == 2, "lag_samples round-trips through the writer and the reader");
+        const auto table = AlignmentTable::fromDevice(packed.chain[0].device);
+        ok(table.fromPack && ! table.empty() && table.delayOf("early") == 2 && table.delayOf("late") == 0,
+           "the table comes from the pack: the early file delayed by two");
+        approx(table.delayOf("early", 96000.0, 48000.0), 4.0, 0.0, "…and in host samples at 96 kHz, four");
+
+        std::map<std::string, std::vector<std::byte>> files {
+            { "early", bytesOf(gainModel(1.0)) }, { "late", bytesOf(delayModel(2)) } };
+        Bench b(packed);
+        b.files = files;
+        ok(b.p.alignmentFromPack(), "the player took the pack's reading at load");
+        b.p.setDial("gain", 150.0);
+        approx(b.gainAt(6000.0), 1.0, 0.02, "no setAlignment, no probe: the pair sums to one from the pack's numbers");
+        ok(b.p.appliedSlotDelay(0) == 2 && b.p.appliedSlotDelay(1) == 0, "…the early slot delayed by the pack's two");
+
+        // Half a reading is no reading.
+        auto half = packed;
+        half.chain[0].device.files[1].lagSamples.reset();
+        ok(AlignmentTable::fromDevice(half.chain[0].device).empty(), "a stage with one entry unmeasured is not measured");
+        Bench h(half);
+        h.files = files;
+        ok(! h.p.alignmentFromPack(), "…and the player does not pretend it is");
+    }
+
+    group("stereo: each channel its own signal through the same decision");
+    {
+        Bench b(rig, 2);
+        const double l = b.rms(1000.0, 0.1, 48, 32, 0, 0.2);
+        const double rr = b.rms(1000.0, 0.1, 48, 32, 1, 0.2);
+        approx(l / (0.1 / std::sqrt(2.0)), 0.5, 0.01, "left: the 0.5 capture on its own signal");
+        approx(rr / (0.2 / std::sqrt(2.0)), 0.5, 0.01, "right: the same capture on the other");
+    }
+
+    group("another rate: the bands and the curves are designed for it");
+    {
+        Bench b(rig, 1, 96000.0);
+        // A 48 kHz model at a 96 kHz host is rate-matched by the stage, and its resampler is not
+        // perfectly flat to 10 kHz — so the shelf is read against what the chain does with it flat.
+        const double base = db(b.gainAt(10000.0) / b.gainAt(100.0));
+        b.p.setDial("tone", 300.0);
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)) - base, shelfDb(6.0, 96000.0), 0.1,
+               "the shelf at 96 kHz, as the formula draws it there");
+        b.p.setDial("tone", 150.0);
+        const double refLo = b.gainAt(60.0, 0.1, 48, 64);
+        b.p.setDial("bass", 300.0);
+        approx(db(b.gainAt(60.0, 0.1, 48, 64) / refLo), 6.0, 0.6, "+6 dB of curve at 96 kHz");
+    }
+
+    group("unload: silence, and a second device loads clean");
+    {
+        Bench b(rig);
+        approx(b.gainAt(1000.0), 0.5, 0.01, "sounding");
+        b.p.unload();
+        ok(! b.p.loaded() && b.p.settings().empty(), "nothing loaded");
+        const double after = b.rms(1000.0, 0.1, 8, 8);
+        ok(after < 1e-6, "…and nothing sounds");
+        b.load(rig);
+        approx(b.gainAt(1000.0), 0.5, 0.01, "loaded again, sounding again");
+    }
+
+    return felitronics::test::report();
+}

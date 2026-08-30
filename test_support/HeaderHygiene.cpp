@@ -72,6 +72,14 @@
 #include <felitronics/neural/NeuralStage.h>
 #if defined(FELITRONICS_WITH_NAM)   // optional compiled NAM backend — public pImpl header is gated with its target
 #include <felitronics/nam/NamStage.h>
+#include <felitronics/rigplayer/AlignmentTable.h>   // …and the pack player over it, gated with the same option
+#include <felitronics/rigplayer/BlendKnob.h>
+#include <felitronics/rigplayer/ModelAlignment.h>
+#include <felitronics/rigplayer/ModelBlend.h>
+#include <felitronics/rigplayer/RigPlayer.h>
+#include <felitronics/rigplayer/RigSelection.h>
+#include <felitronics/rigplayer/SectionBiquad.h>
+#include <felitronics/rigplayer/ToneKnobs.h>
 #endif
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/poweramp/PowerAmpStage.h>
