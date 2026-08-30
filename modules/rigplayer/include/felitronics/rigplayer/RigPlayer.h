@@ -176,6 +176,11 @@ public:
         loaded_ = false;
         ++gen_;                                          // a job out for this pack comes back to be dropped
         setRequest(0, 0, 0.0f);
+        // A landing (or a failure) published and not yet consumed dies with its pack — and it must die
+        // BEFORE the forget is posted: consumed after it, it would land a stale model in a law that was
+        // just wiped and a stage that was just emptied, and an empty stage carried is the raw DI.
+        landFlag_.store(false, std::memory_order_release);
+        landFail_.store(0, std::memory_order_release);
         forget_.store(true, std::memory_order_release);
         loadAsk_.store(0, std::memory_order_release);    // …and an ask for it is void with it
         for (auto& n : nam_) n.clearModel();
