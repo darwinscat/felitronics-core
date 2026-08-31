@@ -5,6 +5,14 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.21.2 — the pack's input trims become a switch
+
+- **feat(rigplayer):** the per-file `input_db` trims (a linked setting plays its neighbour softer)
+  can be switched off — `setInputTrims(bool)`, ON by default. OFF feeds every capture at unity:
+  for a library shot at one honest level the stated attenuations only push a capture's drive
+  around, and into a nonlinear model a few dB less in is a lot less out. Read on the audio side,
+  riding the existing slot ramps — the toggle lands on the next block, click-free.
+
 ## v0.21.1 — a stale landing dies with its pack; a failed load is refused
 
 - **fix(rigplayer):** `unload()` right after `deliver()`, with no audio block between: the published
