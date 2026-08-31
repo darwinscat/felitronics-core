@@ -333,6 +333,13 @@ public:
     void setNormalize(bool on) { normalize_.store(on, std::memory_order_release); }
     bool normalize() const { return normalize_.load(std::memory_order_acquire); }
 
+    // Apply the pack's per-file input trims (`input_db` — a linked setting plays its neighbour
+    // softer). OFF feeds every capture at unity instead: for a library shot at one honest level
+    // the stated attenuations are somebody else's story, and into a nonlinear model a few dB
+    // less in is a lot less out. Read on the audio side, so the toggle lands on the next block.
+    void setInputTrims(bool on) { inputTrims_.store(on, std::memory_order_release); }
+    bool inputTrims() const { return inputTrims_.load(std::memory_order_acquire); }
+
     // The rest after which a silent slot's model is no longer run (kColdAfterSeconds). A slot that
     // sounds at all is never cold; between two captures both models run, on one they do not. Zero or
     // less = never. Takes effect from the next block; a slot already asleep stays asleep until woken.
@@ -597,9 +604,10 @@ public:
             const bool run[2] { ! blend_.cold[0], ! blend_.cold[1] };
             const bool aAlone = ! run[1] && law.beginB <= 0.0 && law.endB <= 0.0;
             const bool bAlone = ! run[0] && law.beginB >= 1.0 && law.endB >= 1.0;
+            const bool trims = inputTrims_.load(std::memory_order_acquire);
             if (run[1]) for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
-            if (run[0]) rampInto(a, nch, count, slotGain_[0].load(std::memory_order_acquire), curSlot_[0]);
-            if (run[1]) rampInto(b, nch, count, slotGain_[1].load(std::memory_order_acquire), curSlot_[1]);
+            if (run[0]) rampInto(a, nch, count, trims ? slotGain_[0].load(std::memory_order_acquire) : 1.0f, curSlot_[0]);
+            if (run[1]) rampInto(b, nch, count, trims ? slotGain_[1].load(std::memory_order_acquire) : 1.0f, curSlot_[1]);
             if (run[0]) nam_[0].process(a, nch, count, norm);
             if (run[1]) nam_[1].process(b, nch, count, norm);
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
@@ -985,6 +993,7 @@ private:
     std::atomic<float>         chainGain_ { 1.0f };
     std::atomic<float>         slotGain_[2] { 1.0f, 1.0f };
     std::atomic<bool>          normalize_ { false };
+    std::atomic<bool>          inputTrims_ { true };
     std::atomic<bool>          firBypass_[2] { true, true };
     std::atomic<bool>          dryActive_ { false }, dryFirBypass_ { true };
     std::atomic<float>         dryGain_ { 0.0f }, wetGain_ { 1.0f };
