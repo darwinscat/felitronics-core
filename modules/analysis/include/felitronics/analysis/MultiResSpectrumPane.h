@@ -25,9 +25,11 @@
 //     copies its suffix into scratch and windows the copy.
 //   • A short tier covers only part of the interval between two frames (1024 samples of a ~1600-sample
 //     hop at 30 fps), so a transient could fall in the gap. Tell the pane the hop (coverSamples) and a
-//     tier shorter than it analyses several 50 %-overlapping sub-windows reaching back over the hop
-//     and averages their power (Welch) — no blind gap, and less variance for free. The longest tier
-//     is one window, as before.
+//     tier shorter than it analyses as many 50 %-overlapping sub-windows as it takes to reach back over
+//     the hop, averaging their power (Welch) — no blind gap, and less variance for free. The longest
+//     tier is one window, as before. Pass the hop the tap REPORTED for this frame (RollingSpectrumTap
+//     publishes it next to the order): the requested hop is a lower bound — a block boundary, or a UI
+//     tick the reader missed, stretches the real one.
 //   • A log axis wants constant Q, and a seam between two FFT lengths is only invisible if both tiers
 //     read the SAME number for the same signal. No fixed per-bin scalar can (noise power per bin is
 //     proportional to bin width — a 4× shorter window sits 6 dB higher, bin for bin; a max over the
@@ -60,7 +62,7 @@
 //
 // Message-thread only; the audio thread is never touched (frames arrive through a lock-free tap).
 // Storage is fixed and flat-packed across tiers; ingest()/starve()/buildColumns() never allocate.
-// setTiers() is the one allocating call (it prepares the FFT plans). The object is large (~0.7 MB at
+// setTiers() is the one allocating call (it prepares the FFT plans). The object is large (~0.8 MB at
 // order 14) — hold it by unique_ptr or as a member of a heap-allocated owner, not on the stack.
 //
 // SpectrumPane stays as it is: this is a sibling for a constant-Q display, not a replacement.
@@ -88,7 +90,8 @@ struct MultiResSpectrumPaneT
     static constexpr int kWinCapacity = 2 * kMaxSize;
 
     static constexpr float  kFloorDb    = -120.0f;
-    static constexpr double kFloorPower = 1.0e-12;                       // 10^(kFloorDb/10): below it a bin is silence
+    static constexpr double kFloorPower = 1.0e-12;                       // 10^(kFloorDb/10): a READING below it is the floor
+    static constexpr double kMaxPower   = 1.0e12;                        // +120 dB: a bin power is clamped here before it narrows to float
 
     //==============================================================================
     // Tuning (message thread; take effect on the next tick / read).
@@ -97,7 +100,7 @@ struct MultiResSpectrumPaneT
     double bandOctaves  = 1.0 / 24.0;    // width of the constant-Q band a reading integrates
     double blendOctaves = 1.0 / 3.0;     // crossfade width above each seam (0 = hard seam)
     double binsPerBand  = 2.0;           // a tier is used where its bin is at least this many times finer than the band
-    int    coverSamples = 0;             // the consumer's frame hop; a tier shorter than it Welch-averages sub-windows over it
+    int    coverSamples = 0;             // the hop the tap reported for the frame; a tier shorter than it Welch-averages sub-windows over it
 
     MultiResSpectrumPaneT()
     {
@@ -178,16 +181,19 @@ struct MultiResSpectrumPaneT
     float tierBinDb   (int k, int i) const noexcept { return inRange (k, i) ? specDb  [(std::size_t) (tiers[(std::size_t) k].binOffset + i)] : kFloorDb; }
     float tierBinPeak (int k, int i) const noexcept { return inRange (k, i) ? specPeak[(std::size_t) (tiers[(std::size_t) k].binOffset + i)] : kFloorDb; }
 
-    // How many sub-windows tier k analyses per frame for the current coverSamples and a frame of `order`.
+    // How many sub-windows tier k analyses per frame for the current coverSamples and a frame of `order`:
+    // the fewest half-overlapped windows whose earliest one starts at or before n − coverSamples (one
+    // window already spans t.size), never more than the frame holds.
     int subWindows (int k, int order) const noexcept
     {
         if (k < 0 || k >= numTiers) return 0;
         const Tier& t = tiers[(std::size_t) k];
         const int n = 1 << std::clamp (order, 0, kMaxOrder);
         if (t.size > n) return 0;
-        const int hop  = t.size / 2;
-        const int need = 1 + (std::max (0, coverSamples - hop) + hop - 1) / hop;   // windows to reach back over the hop
-        const int room = 1 + (n - t.size) / hop;                                    // windows the frame can hold
+        const int hop   = t.size / 2;
+        const int cover = std::clamp (coverSamples, 0, kMaxSize);
+        const int need  = 1 + (std::max (0, cover - t.size) + hop - 1) / hop;
+        const int room  = 1 + (n - t.size) / hop;
         return std::clamp (need, 1, room);
     }
 
@@ -229,9 +235,9 @@ struct MultiResSpectrumPaneT
             {
                 if (starveTicks > 15)
                 {
-                    pw[i] *= 0.9f;                                       // −0.46 dB/tick, ~14 dB/s: a fade, not a cut
-                    db[i]  = (float) toDb ((double) pw[i]);
-                }
+                    pw[i] *= 0.5f;                                       // −3 dB/tick (60 dB in 0.7 s, as the classic pane's
+                    db[i]  = (float) toDb ((double) pw[i]);              // fade) — and faster than the peak falls, so the
+                }                                                        // peak trace never sinks under the fill
                 pk[i] = std::max (kFloorDb, pk[i] - peakFallDb);
             }
             rebuildSums (t);
@@ -250,12 +256,27 @@ struct MultiResSpectrumPaneT
     }
 
     // The tier a reading at f is taken from (before the seam blend): the shortest whose seam f has passed.
+    // A tier that has not seen a frame yet (a frame shorter than it, before the first full one) is
+    // skipped, so the display falls back to what IS there; before any frame at all, plain geometry.
     int tierAt (double f, double fs) const noexcept
     {
-        int k = 0;
-        for (int j = 1; j < numTiers; ++j)
-            if (f >= seamHz (j, fs)) k = j; else break;
-        return k;
+        bool anyValid = false;
+        for (int j = 0; j < numTiers; ++j) anyValid = anyValid || tiers[(std::size_t) j].valid;
+        int k = -1;
+        for (int j = 0; j < numTiers; ++j)
+        {
+            if (anyValid && ! tiers[(std::size_t) j].valid) continue;
+            if (k < 0 || f >= seamHz (j, fs)) k = j; else break;
+        }
+        return k < 0 ? 0 : k;
+    }
+
+    // The blend above seam k is at most blendOctaves wide and never reaches the next seam.
+    double blendWidthOctaves (int k, double fs) const noexcept
+    {
+        double w = blendOctaves;
+        if (k + 1 < numTiers && seamHz (k, fs) > 0.0) w = std::min (w, std::log2 (seamHz (k + 1, fs) / seamHz (k, fs)));
+        return w;
     }
 
     // One tier's band-power reading at f (no blend) — for tests and diagnostics.
@@ -314,7 +335,11 @@ private:
         for (int s = 0; s < subs; ++s)
         {
             const float* src = frame.data() + (n - t.size - s * half);
-            for (int i = 0; i < t.size; ++i) work[(std::size_t) i] = src[i] * w[i];
+            for (int i = 0; i < t.size; ++i)                             // a NaN/Inf SAMPLE would poison every bin of the
+            {                                                            // transform — it is dropped here, the rest survive
+                const float v = src[i];
+                work[(std::size_t) i] = std::isfinite (v) ? v * w[i] : 0.0f;
+            }
             fft[(std::size_t) k].forward (work.data(), spec.data());   // real[N] -> [DC, Nyq, re1, im1, …]
             for (int i = 0; i < t.bins; ++i)
             {
@@ -331,7 +356,8 @@ private:
         for (int i = 0; i < t.bins; ++i)
         {
             double p = a[i] * norm;
-            if (! (p >= 0.0) || ! std::isfinite (p)) p = 0.0;             // a NaN/Inf bin is silence, never poison
+            if (! (p >= 0.0)) p = 0.0;                                   // NaN → silence, never poison
+            if (p > kMaxPower) p = kMaxPower;                            // …and nothing narrows to a float infinity
             if (seed) pw[i] = (float) p;
             else      pw[i] += smoothCoeff * ((float) p - pw[i]);
             db[i] = (float) toDb ((double) pw[i]);
@@ -341,9 +367,10 @@ private:
     }
 
     // Prefix sums of per-bin POWER in double: S[0] = 0, S[i+1] = S[i] + P_i. A band's power is then two
-    // lookups whatever its width, and a fractional bin edge is a linear fraction of P_i. Bins at the
-    // silence floor count as zero, so silence reads the floor whatever the band width. The peak trace
-    // integrates the per-bin holds (a persistence envelope).
+    // lookups whatever its width, and a fractional bin edge is a linear fraction of P_i. Every positive
+    // bin counts, however small — eight components at −123 dB ARE a −114 dB band — and only the final
+    // reading is floored. The peak trace integrates the per-bin holds (a persistence envelope); a hold
+    // resting on the floor counts as nothing.
     void rebuildSums (const Tier& t) noexcept
     {
         constexpr double k = 0.23025850929940458;                        // ln(10)/10
@@ -355,7 +382,7 @@ private:
         for (int i = 0; i < t.bins; ++i)
         {
             const double p = (double) pw[i];
-            S[i + 1] = S[i] + (p > kFloorPower ? p : 0.0);
+            S[i + 1] = S[i] + (p > 0.0 ? p : 0.0);
             P[i + 1] = P[i] + (pk[i] > kFloorDb ? std::exp ((double) pk[i] * k) : 0.0);
         }
     }
@@ -400,12 +427,14 @@ private:
     double read (const double* sums, double f, double fs) const noexcept
     {
         if (numTiers == 0 || ! (f > 0.0) || ! (fs > 0.0) || ! std::isfinite (f) || ! std::isfinite (fs)) return (double) kFloorDb;
-        const int k = tierAt (f, fs);
+        f = std::min (f, (0.5 * fs) / bandHalfFactor());                 // above Nyquist: the last band that fits — tier choice,
+        const int k = tierAt (f, fs);                                    // blend and band alike, so the top reading repeats
         double p = bandPower (tiers[(std::size_t) k], sums, f, fs);
-        if (k > 0 && blendOctaves > 0.0)
+        if (k > 0 && blendOctaves > 0.0 && tiers[(std::size_t) (k - 1)].valid)
         {
-            const double w = std::log2 (f / seamHz (k, fs)) / blendOctaves;   // 0 at the seam → 1 a blend width above it
-            if (w < 1.0)                                                       // power crossfade: contributions add in power
+            const double width = blendWidthOctaves (k, fs);
+            const double w = width > 0.0 ? std::log2 (f / seamHz (k, fs)) / width : 1.0;   // 0 at the seam → 1 a blend width above it
+            if (w < 1.0)                                                                    // power crossfade: contributions add in power
                 p = (1.0 - w) * bandPower (tiers[(std::size_t) (k - 1)], sums, f, fs) + w * p;
         }
         return toDb (p);

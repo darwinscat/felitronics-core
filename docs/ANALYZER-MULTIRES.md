@@ -39,9 +39,17 @@ At 30 fps the consumer's hop is ~1600 samples. A 1024-sample suffix sees 21 ms o
 click can land in the other 12 ms and never enter the short tier — the region it owns shows nothing,
 peak-hold included. Shortening the hop does not help (the tap's mailbox is single-slot; the effective
 hop is the UI period). So the pane is told the hop (`coverSamples`) and **a tier shorter than the hop
-analyses several 50 %-overlapped suffix windows reaching back over it and averages their power
-(Welch)**: at 48 kHz the 1024 tier runs four (the cost of one 4096 FFT), the longer tiers one. No
-blind gap, and the 1-bin variance drops ~2.5× for free.
+analyses as many 50 %-overlapped suffix windows as it takes to reach back over it, averaging their
+power (Welch)**: at 48 kHz the 1024 tier runs three (the earliest starts 2048 samples back — the
+cost of one 4096 FFT), the longer tiers one. No blind gap, and the 1-bin variance drops ~2× for free.
+
+**The hop that happened, not the one requested** (both code reviews caught this): the tap publishes
+at a block boundary once the requested hop has elapsed, and not at all while the reader still owns
+the slot — with 2048-sample blocks the real hop is 2048, a missed UI tick doubles it, a 100 ms stall
+makes it 4800. So `RollingSpectrumTap` now publishes the samples that entered since its previous
+publish next to the order (`tryPull (dst, order, hop)`), and the consumer hands *that* to the pane
+per frame: a stall simply means more sub-windows (9 of 1024, 2 of 4096 for 4800 samples), never a
+gap. The requested hop is only a lower bound.
 
 ## The physics that dictates the level convention
 
@@ -106,9 +114,12 @@ tiers `{14, 12, 10}` = 16384 / 4096 / 1024, 1/24 oct, 48 kHz: bin-limited below 
 works (13 Welch sub-windows over the hop) but buys nothing visible; the set is configurable.
 
 **Seam blend.** Above each seam the reading crossfades — **in power**, where band contributions
-add — from the longer tier to the shorter over `blendOctaves` (default 1/3). Band power makes both
-tiers agree on noise in expectation; a sine's lobe partly outside a narrow band still disagrees by up
-to ~1 dB, and the blend turns any residue into a slope, never a step.
+add — from the longer tier to the shorter over `blendOctaves` (default 1/3), never wider than the
+spacing to the next seam. Band power makes both tiers agree on noise in expectation; a sine's lobe
+partly outside a narrow band still disagrees by up to ~1 dB, and the blend turns any residue into a
+slope, never a step. The invariance is a statement about expected **power**: the dB the display shows
+is the log of a smoothed estimate, and two tiers with different variances carry slightly different
+log biases (Jensen) — measured ≤ 0.3 dB at the Fast preset on a rolling stream, bounded by test 6.
 
 ## Per-tier state — and why it smooths power, not dB
 
@@ -119,11 +130,15 @@ is fed the same way — and the Welch tiers are fed by several windows, the long
 90 % while the short tier's do not. Fable measured the leak: **1.07 dB** step at the 4096 seam on
 stationary white noise with dB smoothing, moving with the hop; **0.2 dB** with power smoothing,
 unbiased against the analytic band power. Power smoothing also means silence fades as a release
-(−1.25 dB/tick at 0.25) rather than collapsing 30 dB in a tick. The peak trace integrates the per-bin
-holds — a persistence envelope over the band, ~0.5 dB above the smoothed fill on noise, not the power
-of any one instant. `starve()` = hold, then fade after ~0.5 s. Non-finite bins are silence.
+(−1.25 dB/tick at 0.25) rather than collapsing 30 dB in a tick, and the attack settles in ~6 ticks
+instead of ~17 — "Medium" is not the same motion as the classic pane's. The peak trace integrates the
+per-bin holds — a persistence envelope over the band, ~0.5 dB above the smoothed fill on noise, not
+the power of any one instant. `starve()` = hold, then fade at −3 dB/tick (faster than the peak falls,
+so the peak never sinks under the fill). A non-finite *sample* is dropped before the transform (one
+NaN must not silence a whole tier); every positive bin adds to a band however small (eight −123 dB
+components are a −114 dB band); only the final reading is floored.
 
-Per tick: K FFTs (16384 + 4096 + 4×1024 ≈ 1.5× the long one), an `O(bins)` normalise + prefix pass,
+Per tick: K FFTs (16384 + 4096 + 3×1024 ≈ 1.5× the long one), an `O(bins)` normalise + prefix pass,
 then `O(columns)` reads.
 
 ## Interface
@@ -146,14 +161,17 @@ using MultiResSpectrumPane = MultiResSpectrumPaneT<>;
 ```
 
 Storage is fixed and flat-packed across tiers (Σ bins over distinct orders ≤ `kMaxSize + MaxTiers`);
-`ingest` / `starve` / `buildColumns` / reads never allocate. The object is ~0.7 MB at order 14 —
-hold it by `unique_ptr`. A frame shorter than a tier leaves that tier holding; `ingest` clamps the
-order; f above Nyquist repeats the last band that fits. Message-thread only.
+`ingest` / `starve` / `buildColumns` / reads never allocate. The object is ~0.8 MB at order 14 —
+hold it by `unique_ptr`. A frame shorter than a tier leaves that tier holding, and reads fall back
+to the tiers that have seen a frame; `ingest` clamps the order; f above Nyquist repeats the last band
+that fits (tier choice and blend included). Message-thread only.
 
-**Consumer notes (TabbyEQ):** request order `frameOrder()` from the tap and pass the hop as
-`coverSamples`; keep the classic `specResolution` for the fixed-size mode and store the multi flag
-separately; `buildSpectrumPaths` becomes a template over the pane type; the tilt default drops per
-mode; the analyzer speed presets map 1:1 onto `smoothCoeff` / `peakFallDb`.
+**Consumer notes (TabbyEQ):** request order `frameOrder()` from the tap and pass the hop the tap
+*reported* for each frame as `coverSamples`; keep the classic `specResolution` for the fixed-size
+mode and store the multi flag separately; `buildSpectrumPaths` becomes a template over the pane
+type; the tilt default drops per mode; the analyzer speed presets map 1:1 onto `smoothCoeff` /
+`peakFallDb` (a different motion, see above); reset the pane pair you switch TO (`SpectrumPane`
+gained `reset()` for this) so it seeds instead of resuming a stale spectrum.
 
 ## Tests (`felitronics_multires_spectrum_tests`, property, no golden files)
 
@@ -163,15 +181,19 @@ mode; the analyzer speed presets map 1:1 onto `smoothCoeff` / `peakFallDb`.
    the lobe (≥ 4 bins), never below −3.5 dB or above +0.2 dB; the bin-limited −1.76 / −3.2 dB pins; a
    sweep through every seam + blend steps ≤ 0.5 dB per 1/60 oct.
 3. **DC half cell** — a unit constant: raw DC bin `4/ENBW`, a bin-limited read at DC half of it.
-4. **Welch cover** — sub-window counts at hop 0 / 1600 / huge; a click inside the hop gap is invisible
-   at cover 0 and registers at cover 1600.
+4. **Welch cover** — sub-window counts at hop 0 / 1024 / 1025 / 1600 / 4800 / INT_MAX; a click inside
+   the hop gap is invisible at cover 0 and registers at cover 1600; each tier's bins equal the **mean of
+   direct DFTs of every sub-window at its exact offset** (a 75 %-overlap mutant passed the suite
+   without this one). `RollingSpectrumTap` reports the hop that happened (block rounding, a missed tick).
 5. **Time resolution** — a burst in the last 512 samples: 1024 tier ≈ −3 dB (the trailing half of its
    Hann), 16384 tier below −40 dB (its Hann tail); a burst centred under the 1024 window: ≈ 0 dB vs
    25+ dB down.
 6. **Noise ensemble** (fixed PRNG, 800 independent frames, α = 0.05) — at every seam the longer and
-   shorter tier agree within 0.6 dB over the blend zone (peak trace 1.5 dB); +3 dB/oct across all
-   tiers; the analytic `10·log10(4σ²B/fs)` at 1.2 kHz within 0.5 dB; the seam residue at hops 800 /
-   1600 / 3200 (the reading must not depend on the UI rate); pink noise flat within 0.7 dB/oct.
+   shorter tier agree within 0.6 dB over the blend zone; +3 dB/oct across all tiers; the analytic
+   `10·log10(4σ²B/fs)` at 1.2 kHz within 0.5 dB; the seam residue at hops 800 / 1600 / 3200 (the
+   reading must not depend on the UI rate); pink noise flat within 0.7 dB/oct; and a **rolling
+   stream** as the tap delivers it (90 %-overlapped frames) at the Fast preset, residue averaged over
+   300 ticks: fill bias ≤ 0.5 dB, peak-trace bias ≤ 0.8 dB at every hop.
 7. **Parseval** — contiguous bands tiling 400 Hz–20 kHz sum to the bin power over the same interval
    within 0.02 dB (fractional edges, no double counting).
 8. **Fractional integration** — 60 random bands (1/200–1/4 oct, 20 Hz–12 kHz, all tiers) vs an
@@ -179,10 +201,12 @@ mode; the analyzer speed presets map 1:1 onto `smoothCoeff` / `peakFallDb`.
 9. **Smoothing + peak law** — the one-pole on power and the 0.8 dB/tick hold, tick by tick; starve
    holds 15 ticks then fades; `reset` is silence.
 10. **Silence** — every band at the floor after reset and on a zero frame; a −100 dB tone leaves the
-    far bands at the floor.
-11. **Adversarial** — NaN/Inf samples; f ≤ 0, NaN, Inf, above Nyquist; fs ≤ 0 / NaN; a frame shorter
-    than the longest tier (it holds, the others update); order 99; blend width 0; a non-positive band
-    width; unsorted / duplicate / out-of-range / empty / null tier lists.
+    far bands at the floor; eight −123 dB components read as one −114 dB band, not the floor.
+11. **Adversarial** — NaN/Inf samples (dropped: the sine next to them survives within 0.3 dB); f ≤ 0,
+    NaN, Inf, above Nyquist; fs ≤ 0 / NaN; a frame shorter than the longest tier (it holds, the others
+    update, reads fall back to them); order 99; blend width 0; a non-positive band width; a bin-limited
+    read at Nyquist is half the Nyquist bin; tiers {14,13,12,11} with a 1.5-oct blend sweep without a
+    step; unsorted / duplicate / out-of-range / empty / null tier lists.
 12. **Column geometry + no-alloc** — N+1 ascending points from x = 0, every column is
     `specDbToY (readDb + tilt)`, the 257-column minimum; ingest / starve / buildColumns / reads under
     the global operator-new counter.

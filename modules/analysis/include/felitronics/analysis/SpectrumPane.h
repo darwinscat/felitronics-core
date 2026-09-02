@@ -76,7 +76,8 @@ struct SpectrumPane
 
         if (newOrder < kMinOrder) newOrder = kMinOrder;
         if (newOrder > kMaxOrder) newOrder = kMaxOrder;
-        const bool orderChanged = (newOrder != order);
+        const bool orderChanged = (newOrder != order) || seedNext;   // reset() asks for a seed as an order change would
+        seedNext = false;
         if (orderChanged)
         {
             order   = newOrder;
@@ -107,6 +108,18 @@ struct SpectrumPane
                 specPeak[(size_t) i] = std::max (specPeak[(size_t) i] - peakFallDb, specDb[(size_t) i]);
             }
         }
+    }
+
+    // Forget every frame: bins to the floor, and the next ingest SEEDS from its bins (a clean cut, no
+    // fade-in from −120) — for a consumer that returns to this pane after drawing another, or a stream
+    // discontinuity. Keeps the order, the plans and the tuning.
+    void reset() noexcept
+    {
+        specDb.fill (-120.0f);
+        specPeak.fill (-120.0f);
+        starveTicks = 0;
+        frameArmed  = false;
+        seedNext    = true;
     }
 
     // No new frame this tick is NORMAL (a window arrives at up to ~30 fps vs the 30 Hz timer). Hold the
@@ -186,6 +199,7 @@ private:
     std::array<float, kMaxBins>     specPeak {};                  // slow-decay peak-hold
     int starveTicks = 0;                                          // consecutive ticks with no new frame
     bool frameArmed = false;                                      // debug protocol guard (see frameInput)
+    bool seedNext   = false;                                      // set by reset(): the next ingest seeds
 };
 
 } // namespace felitronics::analysis

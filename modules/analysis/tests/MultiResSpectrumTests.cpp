@@ -102,6 +102,24 @@ void streamFrames (Pane& p, Gen&& gen, int ticks)
         p.ingest (14);
     }
 }
+
+// Stream a ROLLING signal the way the tap does: every tick the frame is the last 16384 samples of a
+// continuous stream that advanced by `hop` — the long tier's frames overlap ~90 %, the short tier's not.
+template <class Gen, class OnTick>
+void streamRolling (Pane& p, Gen&& gen, int ticks, int hop, OnTick&& onTick)
+{
+    std::vector<float> ring ((std::size_t) N, 0.0f);
+    for (int i = 0; i < N; ++i) ring[(std::size_t) i] = (float) gen();
+    for (int t = 0; t < ticks; ++t)
+    {
+        std::copy (ring.begin() + hop, ring.end(), ring.begin());
+        for (int i = N - hop; i < N; ++i) ring[(std::size_t) i] = (float) gen();
+        std::copy (ring.begin(), ring.end(), p.frameInput());
+        p.coverSamples = hop;
+        p.ingest (14);
+        onTick (t);
+    }
+}
 }
 
 int main()
@@ -215,10 +233,13 @@ int main()
     group ("Welch cover: sub-windows over the hop, and a click in the hop gap is seen");
     {
         p.coverSamples = 1600;
-        ok (p.subWindows (2, 14) == 4 && p.subWindows (1, 14) == 1 && p.subWindows (0, 14) == 1, "hop 1600: the 1024 tier runs 4 half-overlapped windows, longer tiers one");
+        ok (p.subWindows (2, 14) == 3 && p.subWindows (1, 14) == 1 && p.subWindows (0, 14) == 1, "hop 1600: the 1024 tier runs 3 half-overlapped windows (the earliest starts at n−2048 ≤ n−1600), longer tiers one");
+        p.coverSamples = 1024; ok (p.subWindows (2, 14) == 1, "a hop of exactly one window needs one");
+        p.coverSamples = 1025; ok (p.subWindows (2, 14) == 2, "one sample more needs two");
+        p.coverSamples = 4800; ok (p.subWindows (2, 14) == 9 && p.subWindows (1, 14) == 2, "a 100 ms stall at 48 k: 9 windows of 1024, 2 of 4096");
         p.coverSamples = 0;   ok (p.subWindows (2, 14) == 1, "cover 0 → one suffix window");
-        p.coverSamples = 1 << 20; ok (p.subWindows (2, 14) == 1 + (N - 1024) / 512, "a huge cover is clamped to what the frame holds");
-        p.coverSamples = 1600; ok (p.subWindows (2, 12) == 4, "a 4096 frame at hop 1600 still runs the 4 the hop needs");
+        p.coverSamples = std::numeric_limits<int>::max(); ok (p.subWindows (2, 14) == 1 + (N - 1024) / 512, "INT_MAX cover is clamped to what the frame holds, no overflow");
+        p.coverSamples = 1600; ok (p.subWindows (2, 12) == 3, "a 4096 frame at hop 1600 still runs the 3 the hop needs");
         p.coverSamples = 1 << 20; ok (p.subWindows (2, 12) == 1 + (4096 - 1024) / 512, "a shorter frame holds fewer when the hop wants more");
         ok (p.subWindows (0, 12) == 0, "a tier longer than the frame runs none");
 
@@ -234,6 +255,40 @@ int main()
         ok (blind <= -100.0, "cover 0: the 1024 tier is blind to a click in the hop gap (" + std::to_string (blind) + " dB)");
         ok (seen >= -20.0,   "cover 1600: the click registers in the 1024 tier (" + std::to_string (seen) + " dB)");
         p.coverSamples = 1600;
+    }
+
+    //==========================================================================================
+    group ("Welch geometry: a tier's bins are the MEAN of direct DFTs of every sub-window at its exact offset");
+    {
+        p.reset(); p.coverSamples = 1600; p.smoothCoeff = 1.0f;
+        Rng r; float* in = p.frameInput();
+        for (int i = 0; i < N; ++i) in[i] = (float) r.uni();
+        std::vector<float> frame (in, in + N);
+        p.ingest (14);
+        const int k = 2, n = 1024, subs = p.subWindows (k, 14);
+        ok (subs == 3, "three sub-windows at hop 1600");
+        std::vector<double> w ((std::size_t) n); double sw2 = 0.0;
+        for (int i = 0; i < n; ++i) { w[(std::size_t) i] = 0.5 - 0.5 * std::cos (2.0 * kPi * (double) i / (double) (n - 1)); sw2 += w[(std::size_t) i] * w[(std::size_t) i]; }
+        double worst = 0.0;
+        for (int b : { 5, 41, 200, 333 })
+        {
+            double acc = 0.0;
+            for (int s = 0; s < subs; ++s)
+            {
+                const int off = N - n - s * (n / 2);                    // the newest window ends at the frame's end
+                double re = 0.0, im = 0.0;
+                for (int i = 0; i < n; ++i)
+                {
+                    const double x = (double) frame[(std::size_t) (off + i)] * w[(std::size_t) i];
+                    re += x * std::cos (2.0 * kPi * (double) b * (double) i / (double) n);
+                    im -= x * std::sin (2.0 * kPi * (double) b * (double) i / (double) n);
+                }
+                acc += re * re + im * im;
+            }
+            const double want = 10.0 * std::log10 (4.0 * acc / (double) subs / ((double) n * sw2));
+            worst = std::max (worst, std::fabs (want - (double) p.tierBinDb (k, b)));
+        }
+        ok (worst < 0.02, "bins match the mean of the sub-window DFTs within 0.02 dB (worst " + std::to_string (worst) + ")");
     }
 
     //==========================================================================================
@@ -301,6 +356,28 @@ int main()
             runWhite (cover, 600);
             const double d = seamResidue (2, false);
             ok (std::fabs (d) <= 0.6, "hop " + std::to_string (cover) + ": the 1024 seam residue stays within 0.6 dB (Δ " + std::to_string (d) + ")");
+        }
+        // The consumer's frames overlap (the tap rolls by the hop); at the FAST preset the peak trace is the
+        // most exposed statistic — this is the seam the display actually draws. A single snapshot of a
+        // 2-bin band at α 0.5 scatters ~0.7 dB, so the residue is averaged over the last 300 ticks: what is
+        // left is the bias (a Jensen term from the two tiers' different variances), and that is what is bounded.
+        for (int hop : { 800, 1600, 3200 })
+        {
+            p.reset(); p.smoothCoeff = 0.5f;
+            double accF[3] = { 0.0, 0.0, 0.0 }, accP[3] = { 0.0, 0.0, 0.0 }; int cnt = 0;
+            Rng r;
+            streamRolling (p, [&] { return r.uni(); }, 700, hop, [&] (int t)
+            {
+                if (t < 400) return;
+                for (int k = 1; k < 3; ++k) { accF[k] += seamResidue (k, false); accP[k] += seamResidue (k, true); }
+                ++cnt;
+            });
+            for (int k = 1; k < 3; ++k)
+            {
+                const double d = accF[k] / cnt, dp = accP[k] / cnt;
+                ok (std::fabs (d)  <= 0.5, "rolling hop " + std::to_string (hop) + ", α 0.5, seam " + std::to_string (k) + ": fill bias within 0.5 dB (Δ " + std::to_string (d) + ")");
+                ok (std::fabs (dp) <= 0.8, "  … peak trace bias within 0.8 dB (Δ " + std::to_string (dp) + ")");
+            }
         }
         {
             p.reset(); p.coverSamples = 1600; p.smoothCoeff = 0.05f;
@@ -392,7 +469,9 @@ int main()
         ok (q->tierBinDb (0, 100) == held, "starve ×15: the fill holds");
         approx ((double) q->tierBinPeak (0, 100), 10.0 * std::log10 (p0) - 1.6 - 15 * 0.8, 0.03, "starve ×15: the peak keeps falling");
         q->starve();
-        approx ((double) q->tierBinDb (0, 100), (double) held + 10.0 * std::log10 (0.9), 0.03, "starve #16: the fill fades (−0.46 dB/tick)");
+        approx ((double) q->tierBinDb (0, 100), (double) held + 10.0 * std::log10 (0.5), 0.03, "starve #16: the fill fades (−3 dB/tick)");
+        for (int t = 0; t < 30; ++t) q->starve();
+        ok (q->tierBinPeak (0, 100) >= q->tierBinDb (0, 100) - 0.01f, "…and the peak never sinks under the fill while both fade");
         q->reset();
         ok (q->readDb (f, fs) == (double) Pane::kFloorDb && q->readPeakDb (f, fs) == (double) Pane::kFloorDb, "reset → silence");
     }
@@ -411,19 +490,39 @@ int main()
         fillSine (p.frameInput(), N, 1000.0, 1.0e-5); p.ingest (14);          // −100 dB tone
         ok (p.readDb (10000.0, fs) == (double) Pane::kFloorDb, "a −100 dB tone at 1 kHz leaves 10 kHz at the floor");
         ok (p.readDb (1000.0, fs) > -103.0 && p.readDb (1000.0, fs) < -99.0, "…and reads ≈ −100 dB at 1 kHz");
+        // Bins below the floor still ADD: eight −123 dB components inside one 1/6-oct band are a −114 dB band.
+        p.reset(); p.bandOctaves = 1.0 / 6.0;
+        {
+            float* in = p.frameInput(); fillConst (in, N, 0.0f);
+            const double a = std::pow (10.0, -123.0 / 20.0);
+            for (int j = 0; j < 8; ++j)
+            {
+                const double f = (105.0 + 2.0 * (double) j) * fs / 1024.0;   // bin-centred in the 1024 tier, 2 bins apart
+                for (int i = 0; i < N; ++i) in[i] += (float) (a * std::sin (2.0 * kPi * f * (double) i / fs + 0.7 * (double) j));
+            }
+            p.ingest (14);
+            const double centre = 112.0 * fs / 1024.0;
+            approx (p.readDb (centre, fs), -123.0 + 10.0 * std::log10 (8.0), 0.5, "eight −123 dB tones read as one −114 dB band, not the floor");
+        }
+        p.bandOctaves = 1.0 / 24.0;
     }
 
     //==========================================================================================
     group ("adversarial inputs");
     {
         const double nan = std::numeric_limits<double>::quiet_NaN(), inf = std::numeric_limits<double>::infinity();
-        p.reset(); p.smoothCoeff = 0.25f;
+        p.reset(); p.smoothCoeff = 1.0f; p.coverSamples = 1600;
+        fillSine (p.frameInput(), N, 1000.0, 0.5); p.ingest (14);
+        const double clean = p.readDb (1000.0, fs);
+        p.reset();
         float* in = p.frameInput(); fillSine (in, N, 1000.0, 0.5);
         in[100] = (float) nan; in[N - 7] = (float) inf; in[N - 3000] = (float) -inf;
         p.ingest (14);
         bool finite = true;
         for (double f = 20.0; f < 24000.0; f *= 1.05) if (! std::isfinite (p.readDb (f, fs)) || ! std::isfinite (p.readPeakDb (f, fs))) finite = false;
         ok (finite, "NaN/Inf samples: every read stays finite");
+        approx (p.readDb (1000.0, fs), clean, 0.3, "…and three bad samples do not take the sine down with them (only they are dropped)");
+        p.smoothCoeff = 0.25f;
         p.reset(); fillSine (p.frameInput(), N, 1000.0, 0.5); p.ingest (14);
         ok (p.readDb (0.0, fs) == (double) Pane::kFloorDb && p.readDb (-5.0, fs) == (double) Pane::kFloorDb, "f ≤ 0 → floor");
         ok (p.readDb (1000.0, 0.0) == (double) Pane::kFloorDb && p.readDb (1000.0, nan) == (double) Pane::kFloorDb, "fs ≤ 0 / NaN → floor");
@@ -431,11 +530,35 @@ int main()
         ok (std::fabs (p.readDb (30000.0, fs) - p.readDb (0.5 * fs / std::exp2 (1.0 / 48.0), fs)) < 1e-9, "above Nyquist repeats the last band that fits");
         // a frame shorter than the longest tier: the long tier holds, the shorter ones update
         p.reset();
-        fillSine (p.frameInput(), N, 5000.0, 1.0); p.ingest (12);            // 4096-sample frame
+        { float* fr = p.frameInput(); fillSine (fr, N, 5000.0, 1.0); for (int i = 0; i < N; ++i) fr[i] = 0.5f * fr[i] + 0.5f * (float) std::sin (2.0 * kPi * 200.0 * (double) i / fs); }
+        p.ingest (12);                                                        // 4096-sample frame
         ok (p.tierBandDb (0, 5000.0, fs) == (double) Pane::kFloorDb, "order-12 frame: the 16384 tier holds (still silent)");
-        ok (p.tierBandDb (2, 5000.0, fs) > -1.0, "…while the 1024 tier read it");
+        ok (p.tierBandDb (2, 5000.0, fs) > -8.0, "…while the 1024 tier read it");
+        ok (p.readDb (200.0, fs) > -12.0, "a read below the silent tier's region falls back to the tier that HAS a frame (200 Hz via 4096), not the floor");
         fillSine (p.frameInput(), N, 5000.0, 1.0); p.ingest (99);            // clamps to 14
         ok (p.tierBandDb (0, 5000.0, fs) > -1.0, "order 99 clamps to the frame size and serves every tier");
+        // Nyquist is a half cell too: an alternating signal fills the Nyquist bin; a bin-limited read there is half of it.
+        p.reset(); p.smoothCoeff = 1.0f;
+        { float* fr = p.frameInput(); for (int i = 0; i < N; ++i) fr[i] = (i & 1) ? -1.0f : 1.0f; }
+        p.ingest (14);
+        p.bandOctaves = 1.0 / 2000.0;                                          // 8 Hz at Nyquist: narrower than the 1024 tier's bin
+        approx (p.tierBandDb (2, 0.5 * fs, fs), (double) p.tierBinDb (2, 512) + 10.0 * std::log10 (0.5), 0.02, "a bin-limited read at Nyquist is half the Nyquist bin");
+        p.bandOctaves = 1.0 / 24.0;
+        // Adjacent tiers with a blend wider than their spacing: the blend is bounded by the next seam, no step.
+        {
+            auto q = std::make_unique<Pane>();
+            const int adj[] = { 14, 13, 12, 11 }; q->setTiers (adj, 4); q->blendOctaves = 1.5; q->coverSamples = 0;
+            double maxStep = 0.0, prev = 0.0; bool first = true;
+            for (double o = -0.5; o <= 2.5; o += 1.0 / 60.0)
+            {
+                const double f = q->seamHz (1, fs) * std::exp2 (o);
+                q->reset(); q->smoothCoeff = 1.0f; fillSine (q->frameInput(), N, f, 1.0); q->ingest (14);
+                const double v = q->readDb (f, fs);
+                if (! first) maxStep = std::max (maxStep, std::fabs (v - prev));
+                prev = v; first = false;
+            }
+            ok (maxStep <= 0.6, "tiers {14,13,12,11}, blend 1.5 oct: a sine sweep across three seams steps ≤ 0.6 dB per 1/60 oct (max " + std::to_string (maxStep) + ")");
+        }
         p.blendOctaves = 0.0;
         ok (std::isfinite (p.readDb (p.seamHz (1, fs), fs)), "blend width 0 = a hard seam, still finite");
         p.blendOctaves = 1.0 / 3.0;
