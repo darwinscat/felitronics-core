@@ -95,6 +95,19 @@ struct MultiResSpectrumPaneT
     static constexpr float  kFloorDb    = -200.0f;                       // SpectrumPane's floor too: deep below every plot bottom
     static constexpr double kFloorPower = 1.0e-20;                       // 10^(kFloorDb/10): a READING below it is the floor
     static constexpr double kMaxPower   = 1.0e12;                        // +120 dB: a bin power is clamped here before it narrows to float
+    // Denormal guard for the smoothed POWER state. On an all-zero frame the fill smoother is
+    // pw ← (1−c)·pw, which in float32 descends into the subnormals and STICKS there: at the smallest
+    // subnormal c·pw rounds to zero, so pw stops changing and every bin is left doing subnormal
+    // arithmetic for the rest of the session. On x86 that is measurable — a tick on silence cost 3.0×
+    // a tick on signal (505 vs 168 us, i9-13900H, FTZ off, the message thread never sets it) — and it
+    // gets WORSE the longer the transport stays stopped, which is exactly backwards. So flush the
+    // state to a true zero once it is far below anything a reading can use.
+    // NOT core::flushDenormal: its 1e-15 is written for AMPLITUDE state, and here the array holds
+    // POWER, where 1e-15 is −150 dB — well inside the range this pane deliberately sums (v0.22.2:
+    // "every positive bin counts, however small"). At 1e-30 all kBinCapacity bins together carry
+    // < 1e-25 (−250 dB), below the −200 floor even under the steepest display tilt, so no reading
+    // moves; and 1e-30 is still ~8 binades above the smallest NORMAL float (1.18e-38).
+    static constexpr float  kFlushPower = 1.0e-30f;
 
     //==============================================================================
     // Tuning (message thread; take effect on the next tick / read).
@@ -183,6 +196,9 @@ struct MultiResSpectrumPaneT
     // Per-bin introspection (tests / diagnostics): the smoothed power's dB and the peak-hold of tier k, bin i.
     float tierBinDb   (int k, int i) const noexcept { return inRange (k, i) ? specDb  [(std::size_t) (tiers[(std::size_t) k].binOffset + i)] : kFloorDb; }
     float tierBinPeak (int k, int i) const noexcept { return inRange (k, i) ? specPeak[(std::size_t) (tiers[(std::size_t) k].binOffset + i)] : kFloorDb; }
+    // The RAW smoothed power behind tierBinDb. tierBinDb floors at −200 dB, so it cannot tell a bin
+    // that reached zero from one stuck in the subnormals — this is what the denormal-flush test reads.
+    float tierBinPower (int k, int i) const noexcept { return inRange (k, i) ? specPow [(std::size_t) (tiers[(std::size_t) k].binOffset + i)] : 0.0f; }
 
     // How many sub-windows tier k analyses per frame for the current coverSamples and a frame of `order`:
     // the fewest half-overlapped windows whose earliest one starts at or before n − coverSamples (one
@@ -239,8 +255,9 @@ struct MultiResSpectrumPaneT
                 if (starveTicks > 15)
                 {
                     pw[i] *= 0.5f;                                       // −3 dB/tick (60 dB in 0.7 s, as the classic pane's
-                    db[i]  = (float) toDb ((double) pw[i]);              // fade) — and faster than the peak falls, so the
-                }                                                        // peak trace never sinks under the fill
+                    if (pw[i] < kFlushPower) pw[i] = 0.0f;               // fade) — and faster than the peak falls, so the
+                    db[i]  = (float) toDb ((double) pw[i]);              // peak trace never sinks under the fill. The flush
+                }                                                        // keeps the tail out of the subnormals.
                 pk[i] = std::max (kFloorDb, pk[i] - peakFallDb);
             }
             rebuildSums (t);
@@ -378,6 +395,7 @@ private:
             if (p > kMaxPower) p = kMaxPower;                            // …and nothing narrows to a float infinity
             if (seed) pw[i] = (float) p;
             else      pw[i] += smoothCoeff * ((float) p - pw[i]);
+            if (std::fabs (pw[i]) < kFlushPower) pw[i] = 0.0f;            // never leave the state in the subnormals
             db[i] = (float) toDb ((double) pw[i]);
             pk[i] = seed ? db[i] : std::max (pk[i] - peakFallDb, db[i]);
         }
