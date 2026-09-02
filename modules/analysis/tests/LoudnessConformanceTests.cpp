@@ -8,7 +8,8 @@
 //   * cases 1–2: calibration and linearity, for I, M and S alike;
 //   * cases 3–5: the −10 LU relative gate, the −70 LUFS absolute gate, power-averaging across levels;
 //   * case 6: the 5.0 channel weights (Ls/Rs at 1.41);
-//   * cases 9 and 12: short-term and momentary settle to a constant over a periodic program.
+//   * cases 9 and 12: short-term and momentary settle to a constant over a periodic program;
+//   * cases 10 and 13: short-term and momentary read a slid tone in full at every offset.
 // Then what Table 1 alone would let a wrong meter get away with, each pinned by a signal built so that only
 // the property under test can change the reading: the absolute gate isolated from the relative one and at its
 // boundary; the relative gate at −10 LU; every channel counted, in phase or not; the K in K-weighting at both
@@ -226,6 +227,42 @@ int main()
             test::approx (lo, -23.0, 0.1, "case 12: M after 1 s never reads under −23.0 ± 0.1");
             test::approx (hi, -23.0, 0.1, "case 12: M after 1 s never reads over −23.0 ± 0.1");
         }
+    }
+
+    // --- Table 1 cases 10 and 13, the file-based S and M tests: a tone slid across the window grid in steps
+    //     finer than the gating hop (150 ms for the 3 s short-term case, 20 ms for the 400 ms momentary one)
+    //     must read its full level at EVERY offset, ±0.1 LU. A window that only moves in 100 ms steps misses
+    //     up to 40 ms of a 400 ms burst and reads it 0.45 LU low; the meter's 10 ms sub-hop lands within
+    //     one sub-hop of any offset. The meter is polled every 10 ms, as a display would at its finest. ---
+    test::group ("Tech 3341 Table 1 cases 10 and 13: S and M at every offset");
+    {
+        const int poll = (int) std::lround (0.01 * sr);
+        // (i × lead of silence, `tone` seconds at −23 dBFS, 1 s of silence): the maximum of `read` over the file.
+        const auto maxOver = [&] (double lead, double tone, double (analysis::LoudnessMeter::*read)() const) {
+            analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+            std::vector<float> sig ((std::size_t) std::llround (lead * sr), 0.0f);
+            const double amp = std::pow (10.0, -23.0 / 20.0);
+            const auto frames = (std::size_t) std::llround (tone * sr);
+            for (std::size_t i = 0; i < frames; ++i) sig.push_back ((float) (amp * std::sin (2.0 * core::kPi * kToneHz * (double) i / sr)));
+            sig.insert (sig.end(), (std::size_t) sr, 0.0f);
+            double best = -200.0;
+            for (std::size_t o = 0; o < sig.size(); o += (std::size_t) poll)
+            {
+                const int n = (int) std::min<std::size_t> ((std::size_t) poll, sig.size() - o);
+                const float* ch[2] { sig.data() + o, sig.data() + o };
+                lm.process (ch, 2, n);
+                best = std::max (best, (lm.*read)());
+            }
+            return best;
+        };
+        double worst13 = 0.0, worst10 = 0.0;
+        for (int i = 0; i < 20; ++i)
+        {
+            worst13 = std::max (worst13, std::fabs (maxOver (i * 0.020, 0.4, &analysis::LoudnessMeter::momentaryLufs) + 23.0));
+            worst10 = std::max (worst10, std::fabs (maxOver (i * 0.150, 3.0, &analysis::LoudnessMeter::shortTermLufs) + 23.0));
+        }
+        test::ok (worst13 <= 0.1, "case 13: max M of a 400 ms tone at −23 dBFS reads −23.0 ± 0.1 at all twenty 20 ms offsets");
+        test::ok (worst10 <= 0.1, "case 10: max S of a 3 s tone at −23 dBFS reads −23.0 ± 0.1 at all twenty 150 ms offsets");
     }
 
     // --- the relative gate must be computed from ALL absolutely-gated blocks, not on the fly. Loud body FIRST
