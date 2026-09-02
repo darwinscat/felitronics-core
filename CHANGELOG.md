@@ -5,6 +5,14 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.22.2 — fill and peak keep the same bins (`analysis`)
+
+- **fix(analysis):** `MultiResSpectrumPane` shares the classic pane's −200 dB floor. Its fill
+  counted every positive bin while its peak-hold was floored at −120 dB, so a band of quiet bins
+  read higher on the fill than on the peak trace and the two crossed near the plot's right edge. A
+  −130 dB tone now reads −130 untilted — below any plot bottom, not flattened — and the peak trace
+  never sits below the fill.
+
 ## v0.22.1 — the floor is silence, not a shelf (`analysis`)
 
 - **fix(analysis):** both spectrum panes clamped a reading at −120 dB and then added the display
