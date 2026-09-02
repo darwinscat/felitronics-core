@@ -28,8 +28,11 @@ namespace felitronics::analysis
 // arrives, so it must NOT be a one-pass running sum).
 //
 // RT-safe: prepare() allocates the sub-hop ring + the integrated-block buffer; process() only indexes them
-// (no alloc/lock/throw). Channel weights default to 1.0 (correct for mono/stereo); set them per the
-// BS.1770 roles (Ls/Rs = 1.41, LFE excluded) for surround — the host-layout→role mapping is product glue.
+// (no alloc/lock/throw). The gated measure keeps every block's energy to the end (the relative gate is a
+// two-pass), so the block store is sized for maxDurationSec of program at the prepared rate; blocks past it
+// are counted in droppedBlocks() and not kept — size for the longest program and that reads 0. Channel
+// weights default to 1.0 (correct for mono/stereo); set them per the BS.1770 roles (Ls/Rs = 1.41, LFE
+// excluded) for surround — the host-layout→role mapping is product glue.
 class LoudnessMeter
 {
 public:
@@ -42,8 +45,12 @@ public:
         subSamples = std::max (1, (int) std::lround (0.01 * fs));      // 10 ms; a gating hop is ten of them
         for (int c = 0; c < kMaxChannels; ++c) w[c] = 1.0;
         subRing.assign (kSubRing, 0.0);
-        blockE.assign ((std::size_t) ((int) std::ceil (maxDurationSec * 10.0) + 4), 0.0);
-        stE.assign ((std::size_t) ((int) std::ceil (maxDurationSec) + 8), 0.0);     // 1 short-term sample/s for LRA
+        // Sized by HOPS at this rate, not by seconds: a hop is 10 × lround (0.01·fs) samples, which is 100 ms
+        // only where fs is a multiple of 100 — elsewhere a per-second count drifts from the blocks that
+        // actually arrive. +4 blocks / +8 samples of slack cover the first block's onset and the 1 s cadence.
+        const double hops = std::ceil (std::max (0.0, maxDurationSec) * fs) / (double) (subSamples * kSubHopsPerHop);
+        blockE.assign ((std::size_t) hops + 4, 0.0);
+        stE.assign ((std::size_t) (hops / 10.0) + 8, 0.0);              // 1 short-term sample/s for LRA
         reset();
         prepared_ = true;
     }
@@ -52,7 +59,7 @@ public:
     {
         kw.reset();
         for (int c = 0; c < kMaxChannels; ++c) subSumSq[c] = 0.0;
-        subCount = 0; subWrite = 0; subFilled = 0; subInHop = 0; blockCount = 0;
+        subCount = 0; subWrite = 0; subFilled = 0; subInHop = 0; blockCount = 0; droppedBlocks_ = 0;
         stCount = 0; stSince = 0;
         std::fill (subRing.begin(), subRing.end(), 0.0);
     }
@@ -74,6 +81,11 @@ public:
     double shortTermLufs()  const noexcept { return lufsOf (meanLastSubHops (kSubRing)); }           // 3 s
     double integratedLufs() const noexcept { return integrated(); }                                  // gated
     double loudnessRangeLu() const noexcept { return lra(); }                                        // EBU Tech 3342 (P95−P10)
+
+    // Gating blocks that arrived past maxDurationSec and were not kept. Non-zero means integratedLufs() and
+    // loudnessRangeLu() describe the first maxDurationSec of the program only — a caller that must not lose a
+    // block sizes prepare() for its longest program and checks this reads 0.
+    int droppedBlocks() const noexcept { return droppedBlocks_; }
 
 private:
     static constexpr int kMaxChannels      = core::kMaxChannels;
@@ -99,8 +111,11 @@ private:
     // sample every 1 s for LRA.
     void finishHop() noexcept
     {
-        if (subFilled >= kMomentarySubHops && blockCount < (int) blockE.size())     // a 400 ms block every 100 ms
-            blockE[(std::size_t) blockCount++] = meanLastSubHops (kMomentarySubHops);
+        if (subFilled >= kMomentarySubHops)                                         // a 400 ms block every 100 ms
+        {
+            if (blockCount < (int) blockE.size()) blockE[(std::size_t) blockCount++] = meanLastSubHops (kMomentarySubHops);
+            else ++droppedBlocks_;                                                  // past maxDurationSec: counted, not kept
+        }
         if (subFilled >= kSubRing)                                                  // a 3 s short-term sample every 1 s (LRA)
         {
             if (stSince == 0 && stCount < (int) stE.size()) stE[(std::size_t) stCount++] = meanLastSubHops (kSubRing);
@@ -175,7 +190,7 @@ private:
     std::vector<double> subRing;                                                    // 300 × 10 ms sub-hop energies
     int subWrite = 0, subFilled = 0, subInHop = 0;
     std::vector<double> blockE;
-    int blockCount = 0;
+    int blockCount = 0, droppedBlocks_ = 0;
     std::vector<double> stE;                                                        // 3 s short-term energies @1 s (LRA)
     int stCount = 0, stSince = 0;
 };

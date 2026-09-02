@@ -402,16 +402,34 @@ int main()
         test::ok (std::isfinite (lm.integratedLufs()), "and the meter still reads");
     }
 
-    // --- the stated capacity is honoured to its last block: a program exactly as long as prepare() was told
-    //     records every block (the +4 headroom covers the hop-count rounding), and reads as an uncapped one ---
-    test::group ("maxDurationSec holds a program of exactly that length");
+    // --- the stated capacity holds a program of exactly that length at any rate, and a longer one is counted,
+    //     not silently truncated ---
+    test::group ("maxDurationSec: sized by the hop cadence, overflow reported");
     {
-        analysis::LoudnessMeter tight; tight.prepare (sr, 2, 3.0);
-        analysis::LoudnessMeter roomy; roomy.prepare (sr, 2, 60.0);
-        long long a = 0, b = 0;
-        feedSine (tight, sr, kToneHz, -20.0, 3.0, a);
-        feedSine (roomy, sr, kToneHz, -20.0, 3.0, b);
-        test::approx (tight.integratedLufs(), roomy.integratedLufs(), 1e-9, "3 s of capacity holds 3 s of program");
+        // Exactly the stated length keeps every block and reads as an uncapped meter — at 22.05 kHz too,
+        // where 0.01·fs rounds and the hop is 2210 samples rather than a true 100 ms, so a store sized in
+        // seconds would not match the blocks that arrive.
+        for (const double rate : { 48000.0, 44100.0, 22050.0 })
+        {
+            analysis::LoudnessMeter tight; tight.prepare (rate, 2, 3.0);
+            analysis::LoudnessMeter roomy; roomy.prepare (rate, 2, 60.0);
+            long long a = 0, b = 0;
+            feedSine (tight, rate, kToneHz, -20.0, 3.0, a);
+            feedSine (roomy, rate, kToneHz, -20.0, 3.0, b);
+            test::ok (tight.droppedBlocks() == 0, "3 s of capacity keeps every block of 3 s of program");
+            test::approx (tight.integratedLufs(), roomy.integratedLufs(), 1e-9, "and reads as the uncapped meter");
+        }
+        // Past it the surplus is counted: 5 s into 3 s of capacity at 48 kHz — the store holds 30 + 4 = 34
+        // blocks, 5 s produce 47 (50 hops less the 3 before the first block), 13 are dropped — and the
+        // reading still stands, over the blocks that were kept.
+        {
+            analysis::LoudnessMeter lm; lm.prepare (sr, 2, 3.0);
+            long long n = 0; feedSine (lm, sr, kToneHz, -20.0, 5.0, n);
+            test::ok (lm.droppedBlocks() == 13, "5 s into 3 s of capacity → 13 blocks reported dropped");
+            test::approx (lm.integratedLufs(), -20.0, 0.1, "the kept blocks still read the tone");
+            lm.reset();
+            test::ok (lm.droppedBlocks() == 0, "reset clears the count");
+        }
     }
 
     return test::report();
