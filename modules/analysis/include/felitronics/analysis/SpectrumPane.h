@@ -33,10 +33,13 @@
 namespace felitronics::analysis
 {
 
-struct SpectrumPane
+// The FFT backend is a template parameter constrained to the packed-Hermitian layout the bin loop reads
+// ([DC, Nyq, re1, im1, …]): the scalar reference by default, or fftpffft::PffftOrderedRealFft for SIMD.
+// `SpectrumPane` (the alias below) is the scalar one and reads exactly as before.
+template <felitronics::core::fft::PackedHermitianSpectrum Fft = felitronics::core::fft::DefaultRealFft>
+struct SpectrumPaneT
 {
-    // The bin loop below reads the packed [DC, Nyq, re1, im1, …] layout; another backend needs an adapter.
-    static_assert (felitronics::core::fft::DefaultRealFft::kPackedHermitianSpectrum, "SpectrumPane assumes the packed Hermitian spectrum layout");
+    using FftType = Fft;
     static constexpr int kMaxOrder = felitronics::analysis::RollingSpectrumTap::kMaxOrder;   // 14
     static constexpr int kMaxSize  = felitronics::analysis::RollingSpectrumTap::kMaxSize;    // 16384
     static constexpr int kMaxBins  = kMaxSize / 2 + 1;
@@ -46,7 +49,7 @@ struct SpectrumPane
     float smoothCoeff = 0.25f;        // per-tick smoothing toward the new frame (the analyzer "speed":
                                       // smaller = slower attack/release, larger = snappier)
 
-    SpectrumPane()
+    SpectrumPaneT()
     {
         for (int o = kMinOrder; o <= kMaxOrder; ++o)
             fft[(std::size_t) (o - kMinOrder)].prepare (1 << o);   // plan/alloc once, on the owner's (UI) thread
@@ -186,7 +189,7 @@ private:
 
     // Prebuilt real-FFT plans for orders kMinOrder..kMaxOrder (index = order − kMinOrder); switching
     // resolution picks a plan — never allocates.
-    felitronics::core::fft::DefaultRealFft fft[(std::size_t) (kMaxOrder - kMinOrder + 1)];
+    Fft fft[(std::size_t) (kMaxOrder - kMinOrder + 1)];
 
     int order   = 11;                                             // active FFT order (default 2048)
     int fftSize = 1 << 11;
@@ -201,5 +204,8 @@ private:
     bool frameArmed = false;                                      // debug protocol guard (see frameInput)
     bool seedNext   = false;                                      // set by reset(): the next ingest seeds
 };
+
+// The pane every consumer has been using: the scalar reference FFT.
+using SpectrumPane = SpectrumPaneT<>;
 
 } // namespace felitronics::analysis

@@ -69,11 +69,14 @@
 namespace felitronics::analysis
 {
 
-template <int MaxOrder = RollingSpectrumTap::kMaxOrder, int MaxTiers = 4>
+// The FFT backend is a template parameter constrained to the packed-Hermitian layout the bin loop reads:
+// the scalar reference by default, or fftpffft::PffftOrderedRealFft for SIMD (the tiers' 16384 + 4096 +
+// 3×1024 points per tick are the one place the analyzer's cost lives).
+template <int MaxOrder = RollingSpectrumTap::kMaxOrder, int MaxTiers = 4,
+          felitronics::core::fft::PackedHermitianSpectrum Fft = felitronics::core::fft::DefaultRealFft>
 struct MultiResSpectrumPaneT
 {
-    using Fft = felitronics::core::fft::DefaultRealFft;
-    static_assert (Fft::kPackedHermitianSpectrum, "MultiResSpectrumPane reads the packed [DC, Nyq, re, im…] layout; another backend needs an adapter");
+    using FftType = Fft;
 
     static constexpr int kMaxOrder = MaxOrder;
     static constexpr int kMinOrder = 8;                                  // 256 — below that a tier is a smear, not a window

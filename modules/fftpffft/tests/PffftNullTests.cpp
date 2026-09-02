@@ -17,6 +17,10 @@
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/fftpffft/PffftRealFft.h>
+#include <felitronics/fftpffft/PffftOrderedRealFft.h>
+#include <felitronics/analysis/SpectrumPane.h>
+#include <felitronics/analysis/MultiResSpectrumPane.h>
+#include <memory>
 
 #include <algorithm>
 #include <atomic>
@@ -345,6 +349,116 @@ int main()
     test::group ("C1: pffft z-order is rejected from design-time FFTs");
     test::ok (  core::fft::RealFftBackend<Pf>,          "PffftRealFft IS a RealFftBackend (valid audio backend)");
     test::ok (! core::fft::PackedHermitianSpectrum<Pf>, "PffftRealFft is NOT PackedHermitianSpectrum (design-FFT gate rejects it)");
+
+    //==========================================================================================
+    // The ORDERED sibling — the packed-Hermitian layout, bin for bin, so the spectrum panes can ride SIMD.
+    using Po = fftpffft::PffftOrderedRealFft;
+    using Sc = core::fft::ScalarRadix2Real;
+
+    test::group ("PffftOrderedRealFft: the ordered transform IS the packed-Hermitian layout (vs the scalar reference, re AND im)");
+    {
+        std::uint64_t seed = 0x1234567ull;
+        auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
+        for (int n : { 32, 256, 1024, 16384 })
+        {
+            Po po; Sc sc;
+            test::ok (po.prepare (n) && sc.prepare (n), "prepare " + std::to_string (n));
+            std::vector<float> x ((std::size_t) n), a ((std::size_t) n), b ((std::size_t) n);
+            for (auto& v : x) v = uni();
+            po.forward (x.data(), a.data()); sc.forward (x.data(), b.data());
+            float maxAbs = 0.0f, worst = 0.0f;
+            for (int i = 0; i < n; ++i) maxAbs = std::max (maxAbs, std::fabs (b[(std::size_t) i]));
+            for (int i = 0; i < n; ++i) worst = std::max (worst, std::fabs (a[(std::size_t) i] - b[(std::size_t) i]));
+            test::ok (worst <= 2.0e-5f * maxAbs, "N=" + std::to_string (n) + ": every packed float (DC, Nyq, re/im) matches the scalar within 2e-5 of full scale (worst " + std::to_string (worst / maxAbs) + ")");
+            // a bin-centred cosine: its Re lands in bin 5 with the scalar's sign convention (e^{-jωn}), Im ≈ 0
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = std::cos (2.0f * 3.14159265f * 5.0f * (float) i / (float) n);
+            po.forward (x.data(), a.data());
+            test::approx (a[10], (double) n / 2.0, 1e-3 * n, "N=" + std::to_string (n) + ": cos at bin 5 → Re[5] = N/2 at s[10]");
+            test::approx (a[11], 0.0, 1e-3 * n, "  … Im[5] = 0 at s[11]");
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = std::sin (2.0f * 3.14159265f * 5.0f * (float) i / (float) n);
+            po.forward (x.data(), a.data());
+            test::approx (a[11], -(double) n / 2.0, 1e-3 * n, "  … sin at bin 5 → Im[5] = −N/2 (the e^{−jωn} convention the designers assume)");
+        }
+    }
+
+    test::group ("PffftOrderedRealFft forward->inverse == identity; prepare admissibility; packed MAC");
+    {
+        Po po; test::ok (po.prepare (4096), "prepare 4096");
+        std::vector<float> x (4096), s (4096), y (4096);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::sin (0.013f * (float) i) * 0.5f + (float) (i % 7) * 0.01f;
+        po.forward (x.data(), s.data()); po.inverse (s.data(), y.data());
+        float worst = 0.0f; for (std::size_t i = 0; i < x.size(); ++i) worst = std::max (worst, std::fabs (x[i] - y[i]));
+        test::ok (worst < 1.0e-5f, "round trip within 1e-5 (worst " + std::to_string (worst) + ")");
+        Po bad;
+        test::ok (! bad.prepare (16), "N=16 refused (pffft real needs ≥ 32)");
+        test::ok (! bad.prepare (48), "N=48 refused (not a power of two)");
+        test::ok (  bad.prepare (32), "N=32 admitted");
+        Po m; Sc ms; m.prepare (64); ms.prepare (64);
+        std::vector<float> a (64), b (64), acc1 (64, 0.25f), acc2 (64, 0.25f);
+        for (int i = 0; i < 64; ++i) { a[(std::size_t) i] = 0.01f * (float) i; b[(std::size_t) i] = 1.0f - 0.02f * (float) i; }
+        m.spectralMultiplyAdd (a.data(), b.data(), acc1.data()); ms.spectralMultiplyAdd (a.data(), b.data(), acc2.data());
+        worst = 0.0f; for (int i = 0; i < 64; ++i) worst = std::max (worst, std::fabs (acc1[(std::size_t) i] - acc2[(std::size_t) i]));
+        test::ok (worst < 1.0e-6f, "spectralMultiplyAdd == the scalar packed MAC");
+        test::ok (core::fft::PackedHermitianSpectrum<Po>, "PffftOrderedRealFft IS PackedHermitianSpectrum (admitted where bins are read)");
+    }
+
+    test::group ("cross-backend NULL: SpectrumPaneT<PffftOrdered> == SpectrumPaneT<Scalar> (columns, both orders)");
+    {
+        auto pp = std::make_unique<analysis::SpectrumPaneT<Po>>();
+        auto ps = std::make_unique<analysis::SpectrumPaneT<Sc>>();
+        std::uint64_t seed = 0xBEEFull;
+        auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
+        analysis::PlotMap pm; pm.width = 900.0f; pm.height = 96.0f; pm.plotBottom = 96.0f; pm.specTop = 6.0; pm.specBottom = -90.0;   // 1 px per dB
+        for (int order : { 11, 14, 10 })
+        {
+            const int n = 1 << order;
+            for (int t = 0; t < 3; ++t)
+            {
+                std::vector<float> fr ((std::size_t) n); for (auto& v : fr) v = uni() * (1.0f + 0.5f * std::sin (0.01f * (float) t));
+                std::copy (fr.begin(), fr.end(), pp->frameInput()); pp->ingest (order);
+                std::copy (fr.begin(), fr.end(), ps->frameInput()); ps->ingest (order);
+            }
+            std::vector<float> yp, ys, pkp, pks;
+            pp->buildColumns (pm, 48000.0, 4.5, 1000.0, [&] (int, float, float y, float pk) { yp.push_back (y); pkp.push_back (pk); });
+            ps->buildColumns (pm, 48000.0, 4.5, 1000.0, [&] (int, float, float y, float pk) { ys.push_back (y); pks.push_back (pk); });
+            float worst = 0.0f;
+            for (std::size_t i = 0; i < ys.size(); ++i) worst = std::max ({ worst, std::fabs (yp[i] - ys[i]), std::fabs (pkp[i] - pks[i]) });
+            test::ok (ys.size() == 901 && worst <= 0.02f, "order " + std::to_string (order) + ": 901 columns, fill + peak within 0.02 dB (worst " + std::to_string (worst) + ")");
+        }
+        pp->starve(); ps->starve();
+        std::vector<float> fr (16384); for (auto& v : fr) v = uni();   // the test's own buffer, before the count starts
+        const long before = g_allocs.load();
+        std::copy (fr.begin(), fr.end(), pp->frameInput()); pp->ingest (14);
+        pp->buildColumns (pm, 48000.0, 4.5, 1000.0, [] (int, float, float, float) {});
+        test::okNoAlloc (g_allocs.load() == before, "the pffft pane's ingest + buildColumns allocate nothing");
+    }
+
+    test::group ("cross-backend NULL: MultiResSpectrumPaneT<…, PffftOrdered> == scalar (bins, stitched reads)");
+    {
+        using Mp = analysis::MultiResSpectrumPaneT<14, 4, Po>;
+        using Ms = analysis::MultiResSpectrumPaneT<14, 4, Sc>;
+        auto mp = std::make_unique<Mp>(); auto ms = std::make_unique<Ms>();
+        mp->coverSamples = 1600; ms->coverSamples = 1600;
+        std::uint64_t seed = 0xC0FFEEull;
+        auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
+        for (int t = 0; t < 4; ++t)
+        {
+            std::vector<float> fr (16384);
+            for (std::size_t i = 0; i < fr.size(); ++i) fr[i] = 0.3f * uni() + 0.5f * std::sin (2.0f * 3.14159265f * 1234.5f * (float) i / 48000.0f);
+            std::copy (fr.begin(), fr.end(), mp->frameInput()); mp->ingest (14);
+            std::copy (fr.begin(), fr.end(), ms->frameInput()); ms->ingest (14);
+        }
+        float worstBin = 0.0f; int compared = 0;
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < ms->tierBins (k); ++i)
+                if (ms->tierBinDb (k, i) > -90.0f) { worstBin = std::max (worstBin, std::fabs (mp->tierBinDb (k, i) - ms->tierBinDb (k, i))); ++compared; }
+        test::ok (compared > 5000 && worstBin <= 0.02f, "every bin above −90 dB in every tier within 0.02 dB (" + std::to_string (compared) + " bins, worst " + std::to_string (worstBin) + ")");
+        double worstRead = 0.0;
+        for (double f = 30.0; f < 20000.0; f *= 1.02)
+            worstRead = std::max ({ worstRead, std::fabs (mp->readDb (f, 48000.0) - ms->readDb (f, 48000.0)), std::fabs (mp->readPeakDb (f, 48000.0) - ms->readPeakDb (f, 48000.0)) });
+        test::ok (worstRead <= 0.02, "the stitched fill + peak reads 30 Hz–20 kHz within 0.02 dB (worst " + std::to_string (worstRead) + ")");
+        test::ok (mp->subWindows (2, 14) == 3, "the pffft pane runs the same three sub-windows");
+    }
 
     return felitronics::test::report();
 }

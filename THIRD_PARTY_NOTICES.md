@@ -10,7 +10,7 @@ deps must be AGPL-compatible (BSD / MIT / Apache / MPL-2.0) and are recorded her
 | Module | Third-party code | Notes |
 |---|---|---|
 | `core` | **none** | Original code. |
-| `analysis` | **none** | Original code (`SpectrumTap`). FFT impl is plugged by the adapter via the seam — its licence is recorded by whoever links it (JUCE `juce::dsp::FFT`, or pffft / kissfft = BSD). |
+| `analysis` | **none** | Original code (`SpectrumTap`, the spectrum panes). The panes' FFT is a template parameter: the core's own scalar reference by default, or `fftpffft::PffftOrderedRealFft` when a consumer opts into that module (licence recorded on its row). |
 | `dynamics` | **none** | Original code. |
 | `eq` | **none copied** | The matched-filter **method** is from Martin Vicanek's papers — *"Matched Second Order Digital Filters"* (2016) and *"Matched Two-Pole Digital Shelving Filters"* (2024–2025) — **cited inline in `MatchedBiquad.h`**; no third-party code is copied. The Cytomic/Zavalishin TPT SVF (`Svf.h`) likewise implements a published method, not copied code. |
 
