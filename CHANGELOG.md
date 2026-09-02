@@ -5,6 +5,34 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.23.0 — the loudness meter meets Tech 3341 (`analysis`)
+
+- **fix(analysis):** `LoudnessMeter` momentary and short-term now accumulate on a 10 ms sub-hop
+  (M = the last 40, S = the last 300) instead of the 100 ms gating hop, so either window lands
+  within 10 ms of any event. EBU Tech 3341's file-based cases 10 and 13 slide a 3 s / 400 ms tone
+  in 150 ms / 20 ms steps and expect the maximum to read the tone ±0.1 LU at every offset; a 400 ms
+  burst 40 ms off the hop grid read 0.45 LU low, and case 13 failed at 16 of its 20 offsets. **M and
+  S readings on transients change** by up to that much; the integrated measure is untouched in
+  substance — every tenth sub-hop closes the same 400 ms block at the same 100 ms hop, LRA keeps its
+  1 s cadence — and reads as before to the suite's tolerances (not bit-for-bit: 40 partial sums
+  where there were 4). The sub-hop ring is 300 doubles; `process()` still allocates nothing.
+- **fix(analysis):** `LoudnessMeter` sizes its block store by hops at the prepared rate rather than
+  by seconds (a hop is 10 × lround (0.01·fs) samples — 100 ms only where fs is a multiple of 100),
+  and blocks that arrive past `maxDurationSec` are counted in the new `droppedBlocks()` accessor
+  instead of vanishing under a straight-faced reading. Additive API; nothing throws on the audio
+  thread. A caller that must not lose a block sizes `prepare()` for its longest program and checks
+  it reads 0.
+- **test(analysis):** `felitronics_loudness_conformance_tests` — EBU Tech 3341 (2023) Table 1
+  synthesized from the spec's text: cases 1–5 at 48 and 44.1 kHz (I, M and S on cases 1–2), case 6
+  (the 5.0 channel weights), cases 9 and 12 (S and M settle on a periodic program), cases 10 and 13
+  (S and M at every offset); then what Table 1 lets a wrong meter get away with, each pinned by a
+  signal only the property under test can move — the absolute gate isolated from the relative one
+  and at its boundary, the relative gate at −10 LU, every channel as power (in phase or not), the K
+  shape at both rates against the published 48 kHz coefficients, a burst that tells 75 % block
+  overlap from none, chunk invariance, and `process()` allocating nothing. 59 checks. Grown from
+  the Looper Cat suite that gated the product's move onto this meter; crew-reviewed (Codex,
+  DeepSeek, Antigravity, a fresh Opus mutating the meter).
+
 ## v0.22.2 — fill and peak keep the same bins (`analysis`)
 
 - **fix(analysis):** `MultiResSpectrumPane` shares the classic pane's −200 dB floor. Its fill
