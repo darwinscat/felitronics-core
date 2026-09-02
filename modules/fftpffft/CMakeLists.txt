@@ -1,8 +1,10 @@
 # felitronics::fftpffft — OPTIONAL, COMPILED SIMD FFT backend (pffft). The FIRST non-header-only module in
 # the core: it vendors the 2-file original Julien-Pommier pffft (pffft.c/.h; BSD/FFTPACK — see
-# THIRD_PARTY_NOTICES.md) and exposes felitronics::fftpffft::PffftRealFft, a RealFftBackend for the audio
-# convolvers. Default OFF (option in the root CMakeLists) so the header-only "link only what you use" and
-# "no external deps" contract is unchanged for every consumer that does not opt in.
+# THIRD_PARTY_NOTICES.md) and exposes two RealFftBackends: felitronics::fftpffft::PffftRealFft (z-order,
+# the audio convolvers' backend, vectorised MAC) and PffftOrderedRealFft (packed-Hermitian order, for the
+# spectrum panes and anything that reads bins). Default OFF (option in the root CMakeLists) so the
+# header-only "link only what you use" and "no external deps" contract is unchanged for every consumer
+# that does not opt in.
 if(NOT FELITRONICS_WITH_PFFFT)
     return()
 endif()
@@ -19,6 +21,7 @@ endif()
 
 add_library(felitronics_fftpffft STATIC
     src/PffftRealFft.cpp
+    src/PffftOrderedRealFft.cpp        # the ORDERED (packed-Hermitian) sibling: for consumers that read bins
     pffft/pffft.c)
 add_library(felitronics::fftpffft ALIAS felitronics_fftpffft)
 
@@ -50,7 +53,8 @@ set_source_files_properties(pffft/pffft.c PROPERTIES COMPILE_OPTIONS
 if(FELITRONICS_BUILD_TESTS)
     add_executable(felitronics_pffft_tests tests/PffftNullTests.cpp)
     target_link_libraries(felitronics_pffft_tests PRIVATE
-        felitronics::convolution felitronics::lineareq)   # convolution carries the selected pffft backend
+        felitronics::convolution felitronics::lineareq    # convolution carries the selected pffft backend
+        felitronics::analysis)                            # the spectrum panes, nulled scalar vs ordered-pffft
     target_include_directories(felitronics_pffft_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_pffft_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_pffft_tests COMMAND felitronics_pffft_tests)
