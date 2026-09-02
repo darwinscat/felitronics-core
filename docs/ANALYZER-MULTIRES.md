@@ -82,7 +82,7 @@ For frequency *f* and band `[f·2^(−o/2), f·2^(o/2)]`, `o = bandOctaves` (def
 2. **Fractional-bin integration.** Each bin's power is spread uniformly over its cell; the band
    integrates that piecewise-constant density with *fractional* edge overlap, from **double** prefix
    sums (`O(bins)` per tick, `O(1)` per band). Whole-bin membership would alternate 1↔2 bins across
-   neighbouring columns — a 3 dB sawtooth on noise. Bins at the −120 dB floor count as zero, so
+   neighbouring columns — a 3 dB sawtooth on noise. Bins at the −200 dB floor count as zero, so
    silence reads the floor whatever the band width.
 3. **Calibration.** A full-scale sine whose main lobe lies inside the band reads **≈ 0 dBFS**
    (measured 0.00 / −0.09 dB at ≥ 3 bins per band). White noise of RMS σ reads
@@ -163,8 +163,14 @@ using MultiResSpectrumPane = MultiResSpectrumPaneT<>;
 Storage is fixed and flat-packed across tiers (Σ bins over distinct orders ≤ `kMaxSize + MaxTiers`);
 `ingest` / `starve` / `buildColumns` / reads never allocate. The object is ~0.8 MB at order 14 —
 hold it by `unique_ptr`. A frame shorter than a tier leaves that tier holding, and reads fall back
-to the tiers that have seen a frame; `ingest` clamps the order; f above Nyquist repeats the last band
-that fits (tier choice and blend included). Message-thread only.
+to the tiers that have seen a frame; `ingest` clamps the order; **f above Nyquist reads the floor** —
+there is nothing there to read, and holding the last band flat drew a shelf to the end of the axis
+(changed in v0.22.2). Message-thread only.
+
+**A cheaper sibling.** `MultiResSpectrumPaneFast` computes everything on this page identically — the
+fill is bit-identical and NULL-tested as such — for roughly half the CPU on a SIMD backend, by keeping
+the peak trace in power instead of dB and by deriving each column's geometry once for both traces
+rather than twice. Nothing here changes; see [`PERF-ANALYZER-MULTIRES.md`](PERF-ANALYZER-MULTIRES.md).
 
 **Consumer notes (TabbyEQ):** request order `frameOrder()` from the tap and pass the hop the tap
 *reported* for each frame as `coverSamples`; keep the classic `specResolution` for the fixed-size

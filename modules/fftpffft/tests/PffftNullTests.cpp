@@ -20,6 +20,7 @@
 #include <felitronics/fftpffft/PffftOrderedRealFft.h>
 #include <felitronics/analysis/SpectrumPane.h>
 #include <felitronics/analysis/MultiResSpectrumPane.h>
+#include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 #include <memory>
 
 #include <algorithm>
@@ -490,6 +491,47 @@ int main()
     }
 
     //==========================================================================================
+    // The fast sibling has its own paired NULL against MultiResSpectrumPane on the scalar reference
+    // (felitronics_multires_fast_pane_tests). What only this suite can check is that it behaves the same
+    // on the SIMD backend: that it still NULLs against the pane it copies WITH pffft underneath, and that
+    // it is itself backend-independent to the same 0.02 dB the sibling is held to.
+    test::group ("NULL: MultiResSpectrumPaneFast on pffft — vs the pane it copies, and vs itself on scalar");
+    {
+        auto fp = std::make_unique<analysis::MultiResSpectrumPaneFastT<14, 4, Po>>();
+        auto fsc = std::make_unique<analysis::MultiResSpectrumPaneFastT<14, 4, Sc>>();
+        auto cp = std::make_unique<analysis::MultiResSpectrumPaneT<14, 4, Po>>();
+        fp->coverSamples = 1600; fsc->coverSamples = 1600; cp->coverSamples = 1600;
+        std::uint64_t seed = 0xBEEF1234ull;
+        auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
+        for (int t = 0; t < 6; ++t)
+        {
+            std::vector<float> fr (16384);
+            for (std::size_t i = 0; i < fr.size(); ++i) fr[i] = 0.3f * uni() + 0.5f * std::sin (2.0f * 3.14159265f * 1234.5f * (float) i / 48000.0f);
+            std::copy (fr.begin(), fr.end(), fp ->frameInput()); fp ->ingest (14);
+            std::copy (fr.begin(), fr.end(), fsc->frameInput()); fsc->ingest (14);
+            std::copy (fr.begin(), fr.end(), cp ->frameInput()); cp ->ingest (14);
+        }
+        double sib = 0.0, backend = 0.0;
+        for (double f = 30.0; f < 20000.0; f *= 1.01)
+            for (double tilt : { 0.0, 4.5 })
+            {
+                sib = std::max ({ sib, std::fabs (fp->readDb (f, 48000.0, tilt, 1000.0) - cp->readDb (f, 48000.0, tilt, 1000.0)),
+                                       std::fabs (fp->readPeakDb (f, 48000.0, tilt, 1000.0) - cp->readPeakDb (f, 48000.0, tilt, 1000.0)) });
+                backend = std::max ({ backend, std::fabs (fp->readDb (f, 48000.0, tilt, 1000.0) - fsc->readDb (f, 48000.0, tilt, 1000.0)),
+                                              std::fabs (fp->readPeakDb (f, 48000.0, tilt, 1000.0) - fsc->readPeakDb (f, 48000.0, tilt, 1000.0)) });
+            }
+        test::ok (sib <= 0.02, "on pffft the fast pane still matches the pane it copies within 0.02 dB (worst " + std::to_string (sib) + ")");
+        test::ok (backend <= 0.02, "and the fast pane is backend-independent to the same 0.02 dB (worst " + std::to_string (backend) + ")");
+        // The columns too: the plan must survive a change of FFT backend unchanged.
+        analysis::PlotMap pm; pm.width = 900.0f; pm.height = 300.0f; pm.plotBottom = 300.0f;
+        std::vector<float> a, b; double worstPx = 0.0;
+        fp ->buildColumns (pm, 48000.0, 4.5, 1000.0, [&] (int, float, float y, float yp) { a.push_back (y); a.push_back (yp); });
+        cp ->buildColumns (pm, 48000.0, 4.5, 1000.0, [&] (int, float, float y, float yp) { b.push_back (y); b.push_back (yp); });
+        for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) worstPx = std::max (worstPx, (double) std::fabs (a[i] - b[i]));
+        test::ok (a.size() == b.size() && worstPx < 0.05, "and buildColumns agrees to well under a pixel on pffft (worst " + std::to_string (worstPx) + " px)");
+    }
+
+    //==========================================================================================
     // PERFORMANCE — the reason the ordered backend exists. One UI tick (ingest + 900 columns) per pane on
     // both backends; printed for the record, and the check is the one that matters: with the SIMD kernel
     // compiled in, the pffft pane must be cheaper than the scalar one. (The scalar table on its own is
@@ -529,6 +571,15 @@ int main()
             std::printf ("      multi, hop 1600  scalar %7.0f us   pffft %7.0f us   (%.1fx)\n", us, up, us / up);
             if (Pf::simdWidth() == 4) test::ok (up < us, "the multi-res pane on pffft is cheaper than on the scalar reference");
             test::ok (up < 33333.0 * 0.2, "a multi-res tick on pffft stays under 20 % of a 30 fps frame");
+
+            // The fast sibling on the same backend. With the transform this cheap, what it removes —
+            // a log10 and an exp per bin, and the column geometry the fill and the peak each derived
+            // for themselves — is most of what is left, so the gap is at its widest here.
+            auto mf = std::make_unique<analysis::MultiResSpectrumPaneFastT<14, 4, Po>>();
+            mf->coverSamples = 1600;
+            const double uf = tickMicros (*mf, 16384, 14);
+            std::printf ("      multi FAST, hop 1600           pffft %7.0f us   (%.2fx the current pane)\n", uf, up / uf);
+            if (Pf::simdWidth() == 4) test::ok (uf < 0.85 * up, "the fast pane is materially cheaper than the pane it copies on pffft");
         }
     }
 
