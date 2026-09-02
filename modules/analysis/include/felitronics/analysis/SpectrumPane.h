@@ -163,9 +163,15 @@ struct SpectrumPaneT
             const float  x = (float) i / (float) N * pm.width;
             const double f = pm.xToFreq (x);
             const int    curBin = std::clamp ((int) std::floor (f * binPerHz), 0, numBins - 1);
-            // pink-noise comp — frozen past Nyquist, where the columns repeat the last bin and a growing
-            // tilt would draw that flat tail as a ramp
-            const float  tilt = (float) (tiltDbPerOct * std::log2 (std::min (f, nyquist) / tiltPivotHz));
+            // Above Nyquist there is nothing: the floor (the columns used to repeat the Nyquist bin to the
+            // end of the axis — a shelf). The FIRST column past it still runs the peak scan, so the bins
+            // between the last sub-Nyquist column and the Nyquist bin are drawn once, never skipped.
+            if (f > nyquist && prevBin >= numBins - 1)
+            {
+                emit (i, x, pm.specDbToY ((double) kFloorDb), pm.specDbToY ((double) kFloorDb));
+                continue;
+            }
+            const float  tilt = (float) (tiltDbPerOct * std::log2 (f / tiltPivotHz));   // pink-noise comp
             emit (i, x, pm.specDbToY (column (specDb,   f, binPerHz, prevBin, curBin) + tilt),
                         pm.specDbToY (column (specPeak, f, binPerHz, prevBin, curBin) + tilt));
             prevBin = curBin;

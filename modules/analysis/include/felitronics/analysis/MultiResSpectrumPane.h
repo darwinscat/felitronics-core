@@ -92,8 +92,8 @@ struct MultiResSpectrumPaneT
     static constexpr int kSumCapacity = kBinCapacity + MaxTiers;          // one extra prefix entry per tier
     static constexpr int kWinCapacity = 2 * kMaxSize;
 
-    static constexpr float  kFloorDb    = -120.0f;
-    static constexpr double kFloorPower = 1.0e-12;                       // 10^(kFloorDb/10): a READING below it is the floor
+    static constexpr float  kFloorDb    = -200.0f;                       // SpectrumPane's floor too: deep below every plot bottom
+    static constexpr double kFloorPower = 1.0e-20;                       // 10^(kFloorDb/10): a READING below it is the floor
     static constexpr double kMaxPower   = 1.0e12;                        // +120 dB: a bin power is clamped here before it narrows to float
 
     //==============================================================================
@@ -294,8 +294,8 @@ struct MultiResSpectrumPaneT
     // signal, so it is applied to the POWER and the floor comes after: silence stays at the floor whatever
     // the tilt, and a band just above the floor is lifted like any other. (Adding the tilt to a floored
     // dB value drew silence as a straight line rising at the tilt's slope — the floor "lying on the plot
-    // and tilted", seen at once on a 120 dB range.) Past Nyquist the tilt is frozen: the reading there
-    // repeats the last band that fits, and a growing tilt would turn that flat tail into a ramp.
+    // and tilted", seen at once on a 120 dB range.) Past Nyquist there is nothing to read and nothing is
+    // read: the floor. (Holding the last band flat to the end of the axis drew a shelf there.)
     double readDb     (double f, double fs, double tiltDbPerOct, double tiltPivotHz) const noexcept { return toDb (readPower (sumDb.data(),   f, fs) * tiltGain (f, fs, tiltDbPerOct, tiltPivotHz)); }
     double readPeakDb (double f, double fs, double tiltDbPerOct, double tiltPivotHz) const noexcept { return toDb (readPower (sumPeak.data(), f, fs) * tiltGain (f, fs, tiltDbPerOct, tiltPivotHz)); }
 
@@ -330,12 +330,11 @@ private:
         return (p > kFloorPower) ? 10.0 * std::log10 (p) : (double) kFloorDb;
     }
 
-    // The display tilt as a power gain, frozen at Nyquist; a non-positive / non-finite pivot means no tilt.
+    // The display tilt as a power gain; a non-positive / non-finite pivot means no tilt.
     static double tiltGain (double f, double fs, double tiltDbPerOct, double tiltPivotHz) noexcept
     {
         if (! (tiltPivotHz > 0.0) || ! std::isfinite (tiltPivotHz) || ! std::isfinite (tiltDbPerOct) || ! (f > 0.0) || ! (fs > 0.0)) return 1.0;
-        const double ft = std::min (f, 0.5 * fs);
-        return std::pow (10.0, tiltDbPerOct * std::log2 (ft / tiltPivotHz) / 10.0);
+        return std::pow (10.0, tiltDbPerOct * std::log2 (f / tiltPivotHz) / 10.0);
     }
 
     double bandHalfFactor()  const noexcept { return std::exp2 (0.5 * std::max (1e-4, bandOctaves)); }   // 2^(o/2)
@@ -419,16 +418,15 @@ private:
     // here). Linear power in "full-scale sine = 1" units; 0 when the band is empty or invalid.
     // Bin i's cell is [(i − ½)·binHz, (i + ½)·binHz]; in bin units u = f/binHz + ½ a cell spans [i, i+1).
     // The one-sided axis runs u ∈ [½, bins − ½]: DC and Nyquist are half cells, which IS their one-sided
-    // weight. A band reaching past Nyquist is clipped; f itself is held at the last band that fits, so
-    // columns above Nyquist repeat the top reading (as SpectrumPane's do).
+    // weight. A band reaching past Nyquist is clipped to it (the reading is what lies below Nyquist);
+    // f itself above Nyquist is nothing — read() returns the floor there.
     double bandPower (const Tier& t, const double* sums, double f, double fs) const noexcept
     {
-        if (! (f > 0.0) || ! (fs > 0.0) || ! std::isfinite (f) || ! std::isfinite (fs)) return 0.0;
+        if (! (f > 0.0) || ! (fs > 0.0) || ! std::isfinite (f) || ! std::isfinite (fs) || f > 0.5 * fs) return 0.0;
         const double* S     = sums + t.sumOffset;
         const double  binHz = fs / (double) t.size;
         const double  h     = bandHalfFactor();
         const double  uMax  = (double) t.bins - 0.5;
-        f = std::min (f, (0.5 * fs) / h);
         const double uLo  = std::clamp ((f / h) / binHz + 0.5, 0.5, uMax);
         const double uHi  = std::clamp ((f * h) / binHz + 0.5, 0.5, uMax);
         const double span = uHi - uLo;                                   // the band's width in bins (edge-clamped)
@@ -447,8 +445,8 @@ private:
     double readPower (const double* sums, double f, double fs) const noexcept
     {
         if (numTiers == 0 || ! (f > 0.0) || ! (fs > 0.0) || ! std::isfinite (f) || ! std::isfinite (fs)) return 0.0;
-        f = std::min (f, (0.5 * fs) / bandHalfFactor());                 // above Nyquist: the last band that fits — tier choice,
-        const int k = tierAt (f, fs);                                    // blend and band alike, so the top reading repeats
+        if (f > 0.5 * fs) return 0.0;                                    // above Nyquist there is nothing: the floor
+        const int k = tierAt (f, fs);
         double p = bandPower (tiers[(std::size_t) k], sums, f, fs);
         if (k > 0 && blendOctaves > 0.0 && tiers[(std::size_t) (k - 1)].valid)
         {
