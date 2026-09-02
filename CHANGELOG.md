@@ -5,6 +5,40 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.24.0 — the constant-Q analyzer for half the CPU, and silence stops costing more than sound (`analysis`)
+
+- **feat(analysis):** `MultiResSpectrumPaneFast` — the same pane as `MultiResSpectrumPane`, computed
+  differently. A `perf` profile said **43.98 % of a tick was inside libm**, and the band integration
+  everyone assumed was the cost was 7.6 % while the FFT itself was 4.6 %. Three exact changes remove
+  35 349 of the tick's 37 111 transcendental calls: the peak trace is kept in **power** instead of dB
+  (which had cost a `log10` per bin to make the value the peak law compares against and then an `exp`
+  per bin to undo it — a transform and its own inverse); each column's geometry (owning tier, seam,
+  blend, fractional bin edges, display tilt) is derived **once into a fixed-size plan and shared by
+  the fill and the peak**, which previously each computed all of it; and DC and Nyquist are peeled out
+  of the magnitude loop. **1.82× on an M5 Pro and 2.33× on an i9-13900H with pffft** (1.20× / 1.34× on
+  the scalar FFT — the same absolute saving, since none of it depends on the transform). On x86 the
+  fast pane now costs less than a single classic 16384 pane. It is a **sibling**: `MultiResSpectrumPane`
+  is untouched, and the two are held together by a paired NULL in which **the fill is bit-identical**
+  and the peak is inside the sibling's own float-dB quantisation. Two divergences are pinned rather
+  than hidden — a negative `peakFallDb` is clamped instead of reaching an infinity, and below −120 dB
+  the band integral's own conditioning (a difference of two prefix sums scaled by the loudest bin in
+  the tier) stops the sibling being a reference at all, which a test measures rather than asserts.
+  New: `docs/PERF-ANALYZER-MULTIRES.md`, with the profile, the tables, the machines they were taken
+  on, and the lossy ideas that were measured and rejected.
+- **fix(analysis):** `MultiResSpectrumPane` no longer leaves its state stuck in the subnormals on
+  digital silence. The fill smoother is `pw ← (1−c)·pw`, and in float32 that descent does not end at
+  zero: at the smallest subnormal `c·pw` rounds away and `pw` stops moving, leaving all ~10 755 bins
+  doing subnormal arithmetic on the message thread with nothing setting FTZ/DAZ. On x86 the pane
+  therefore got **slower the longer the transport stayed stopped** — 505.4 µs on settled silence
+  against 167.6 µs with FTZ forced, a **3.0× penalty**, while on ARM it was free and so invisible.
+  The smoothed power is now flushed to a true zero below `1e-30` — deliberately **not**
+  `core::flushDenormal`, whose `1e-15` is an amplitude threshold and would erase the −150…−200 dB bins
+  this pane deliberately sums. No reading moves. New `tierBinPower` accessor: `tierBinDb` floors at
+  −200 and could not tell a bin that reached zero from one stuck at `1e-45`. The classic `SpectrumPane`
+  never had this — it smooths dB, which is already floored.
+- **docs(analysis):** `ANALYZER-MULTIRES.md` drops two claims the code stopped honouring in v0.22.2 —
+  a shelf repeating the last band above Nyquist (it reads the floor), and a −120 dB floor (it is −200).
+
 ## v0.23.0 — the loudness meter meets Tech 3341 (`analysis`)
 
 - **fix(analysis):** `LoudnessMeter` momentary and short-term now accumulate on a 10 ms sub-hop
