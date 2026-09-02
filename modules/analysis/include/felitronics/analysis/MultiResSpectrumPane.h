@@ -286,13 +286,22 @@ struct MultiResSpectrumPaneT
     double tierBandDb     (int k, double f, double fs) const noexcept { return (k >= 0 && k < numTiers) ? toDb (bandPower (tiers[(std::size_t) k], sumDb.data(),   f, fs)) : (double) kFloorDb; }
     double tierBandPeakDb (int k, double f, double fs) const noexcept { return (k >= 0 && k < numTiers) ? toDb (bandPower (tiers[(std::size_t) k], sumPeak.data(), f, fs)) : (double) kFloorDb; }
 
-    // The stitched readings — what the display shows (before the tilt).
-    double readDb     (double f, double fs) const noexcept { return read (sumDb.data(),   f, fs); }
-    double readPeakDb (double f, double fs) const noexcept { return read (sumPeak.data(), f, fs); }
+    // The stitched readings — what the display shows before the tilt. Floored at kFloorDb.
+    double readDb     (double f, double fs) const noexcept { return toDb (readPower (sumDb.data(),   f, fs)); }
+    double readPeakDb (double f, double fs) const noexcept { return toDb (readPower (sumPeak.data(), f, fs)); }
+
+    // The stitched readings WITH the display tilt (dB/oct about tiltPivotHz). The tilt is a gain on the
+    // signal, so it is applied to the POWER and the floor comes after: silence stays at the floor whatever
+    // the tilt, and a band just above the floor is lifted like any other. (Adding the tilt to a floored
+    // dB value drew silence as a straight line rising at the tilt's slope — the floor "lying on the plot
+    // and tilted", seen at once on a 120 dB range.) Past Nyquist the tilt is frozen: the reading there
+    // repeats the last band that fits, and a growing tilt would turn that flat tail into a ramp.
+    double readDb     (double f, double fs, double tiltDbPerOct, double tiltPivotHz) const noexcept { return toDb (readPower (sumDb.data(),   f, fs) * tiltGain (f, fs, tiltDbPerOct, tiltPivotHz)); }
+    double readPeakDb (double f, double fs, double tiltDbPerOct, double tiltPivotHz) const noexcept { return toDb (readPower (sumPeak.data(), f, fs) * tiltGain (f, fs, tiltDbPerOct, tiltPivotHz)); }
 
     // Sample the stitched spectrum into N+1 log-frequency columns and emit plot points through the map —
     // the same contract as SpectrumPane::buildColumns: emit (int i, float x, float yFill, float yPeak),
-    // i = 0..N, x ascending from 0. The pink-noise display tilt is added around tiltPivotHz.
+    // i = 0..N, x ascending from 0. Every column is specDbToY (readDb (f, fs, tilt, pivot)).
     template <class Emit>
     void buildColumns (const PlotMap& pm, double fs, double tiltDbPerOct, double tiltPivotHz, Emit&& emit) const
     {
@@ -301,8 +310,7 @@ struct MultiResSpectrumPaneT
         {
             const float  x = (float) i / (float) N * pm.width;
             const double f = pm.xToFreq (x);
-            const double tilt = tiltDbPerOct * std::log2 (f / tiltPivotHz);
-            emit (i, x, pm.specDbToY (readDb (f, fs) + tilt), pm.specDbToY (readPeakDb (f, fs) + tilt));
+            emit (i, x, pm.specDbToY (readDb (f, fs, tiltDbPerOct, tiltPivotHz)), pm.specDbToY (readPeakDb (f, fs, tiltDbPerOct, tiltPivotHz)));
         }
     }
 
@@ -320,6 +328,14 @@ private:
     static double toDb (double p) noexcept
     {
         return (p > kFloorPower) ? 10.0 * std::log10 (p) : (double) kFloorDb;
+    }
+
+    // The display tilt as a power gain, frozen at Nyquist; a non-positive / non-finite pivot means no tilt.
+    static double tiltGain (double f, double fs, double tiltDbPerOct, double tiltPivotHz) noexcept
+    {
+        if (! (tiltPivotHz > 0.0) || ! std::isfinite (tiltPivotHz) || ! std::isfinite (tiltDbPerOct) || ! (f > 0.0) || ! (fs > 0.0)) return 1.0;
+        const double ft = std::min (f, 0.5 * fs);
+        return std::pow (10.0, tiltDbPerOct * std::log2 (ft / tiltPivotHz) / 10.0);
     }
 
     double bandHalfFactor()  const noexcept { return std::exp2 (0.5 * std::max (1e-4, bandOctaves)); }   // 2^(o/2)
@@ -427,9 +443,10 @@ private:
         return (p > 0.0) ? p : 0.0;
     }
 
-    double read (const double* sums, double f, double fs) const noexcept
+    // The stitched reading as linear power (0 = nothing); toDb() floors it.
+    double readPower (const double* sums, double f, double fs) const noexcept
     {
-        if (numTiers == 0 || ! (f > 0.0) || ! (fs > 0.0) || ! std::isfinite (f) || ! std::isfinite (fs)) return (double) kFloorDb;
+        if (numTiers == 0 || ! (f > 0.0) || ! (fs > 0.0) || ! std::isfinite (f) || ! std::isfinite (fs)) return 0.0;
         f = std::min (f, (0.5 * fs) / bandHalfFactor());                 // above Nyquist: the last band that fits — tier choice,
         const int k = tierAt (f, fs);                                    // blend and band alike, so the top reading repeats
         double p = bandPower (tiers[(std::size_t) k], sums, f, fs);
@@ -440,7 +457,7 @@ private:
             if (w < 1.0)                                                                    // power crossfade: contributions add in power
                 p = (1.0 - w) * bandPower (tiers[(std::size_t) (k - 1)], sums, f, fs) + w * p;
         }
-        return toDb (p);
+        return p;
     }
 
     std::array<Tier, (std::size_t) MaxTiers>          tiers {};

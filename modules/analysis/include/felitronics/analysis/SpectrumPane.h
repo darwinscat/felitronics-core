@@ -44,6 +44,12 @@ struct SpectrumPaneT
     static constexpr int kMaxSize  = felitronics::analysis::RollingSpectrumTap::kMaxSize;    // 16384
     static constexpr int kMaxBins  = kMaxSize / 2 + 1;
     static constexpr int kMinOrder = 10;                                                     // 1024
+    // The internal floor. It sits far below any plot bottom on purpose: the display tilt is ADDED to a
+    // bin's dB, so a bin clamped at the floor and then tilted would surface as a straight line rising at
+    // the tilt's slope (with a −120 floor and +6 dB/oct that line stood at −94 dB at 20 kHz — silence
+    // "lying on the plot and tilted"). At −200 the tilted floor stays below every range; a bin that has
+    // real energy at −130 keeps it and is lifted like any other.
+    static constexpr float kFloorDb  = -200.0f;
 
     float peakFallDb  = 0.8f;         // peak-hold decay per tick (~24 dB/s at 30 Hz)
     float smoothCoeff = 0.25f;        // per-tick smoothing toward the new frame (the analyzer "speed":
@@ -54,8 +60,8 @@ struct SpectrumPaneT
         for (int o = kMinOrder; o <= kMaxOrder; ++o)
             fft[(std::size_t) (o - kMinOrder)].prepare (1 << o);   // plan/alloc once, on the owner's (UI) thread
         buildWindow (order);          // Hann for the default order
-        specDb.fill (-120.0f);
-        specPeak.fill (-120.0f);
+        specDb.fill (kFloorDb);
+        specPeak.fill (kFloorDb);
     }
 
     // The active analysis size (message-thread reads for buildColumns geometry).
@@ -98,8 +104,8 @@ struct SpectrumPaneT
             const float re  = (i == 0) ? spec[0] : (i == fftSize / 2) ? spec[1] : spec[(size_t) (2 * i)];
             const float im  = (i == 0 || i == fftSize / 2) ? 0.0f : spec[(size_t) (2 * i + 1)];
             const float mag = std::sqrt (re * re + im * im);      // |bin| of the unnormalized forward
-            const double g  = (double) mag / norm;                // == juce::Decibels::gainToDecibels (g, -120)
-            const double db = g > 0.0 ? std::max (-120.0, 20.0 * std::log10 (g)) : -120.0;
+            const double g  = (double) mag / norm;                // == juce::Decibels::gainToDecibels (g, kFloorDb)
+            const double db = g > 0.0 ? std::max ((double) kFloorDb, 20.0 * std::log10 (g)) : (double) kFloorDb;
             if (orderChanged)                                     // seed the new-resolution bins directly (no fade-in)
             {
                 specDb[(size_t) i]   = (float) db;
@@ -118,8 +124,8 @@ struct SpectrumPaneT
     // discontinuity. Keeps the order, the plans and the tuning.
     void reset() noexcept
     {
-        specDb.fill (-120.0f);
-        specPeak.fill (-120.0f);
+        specDb.fill (kFloorDb);
+        specPeak.fill (kFloorDb);
         starveTicks = 0;
         frameArmed  = false;
         seedNext    = true;
@@ -132,8 +138,8 @@ struct SpectrumPaneT
         if (starveTicks < 16) ++starveTicks;                      // bounded — never overflows over long silence
         for (int i = 0; i < numBins; ++i)
         {
-            if (starveTicks > 15) specDb[(size_t) i] += 0.05f * (-120.0f - specDb[(size_t) i]);
-            specPeak[(size_t) i] = std::max (-120.0f, specPeak[(size_t) i] - peakFallDb);
+            if (starveTicks > 15) specDb[(size_t) i] += 0.05f * (kFloorDb - specDb[(size_t) i]);
+            specPeak[(size_t) i] = std::max (kFloorDb, specPeak[(size_t) i] - peakFallDb);
         }
     }
 
@@ -151,12 +157,15 @@ struct SpectrumPaneT
         // Found by the crew's theory suite (codex #7); on the classic 20 Hz axis at ≥44.1 kHz both
         // seeds are bin 0, so the fix is bit-identical there.
         int prevBin = std::clamp ((int) std::floor (pm.xToFreq (0.0f) * binPerHz), 0, numBins - 1);
+        const double nyquist = 0.5 * fs;
         for (int i = 0; i <= N; ++i)
         {
             const float  x = (float) i / (float) N * pm.width;
             const double f = pm.xToFreq (x);
             const int    curBin = std::clamp ((int) std::floor (f * binPerHz), 0, numBins - 1);
-            const float  tilt = (float) (tiltDbPerOct * std::log2 (f / tiltPivotHz));   // pink-noise comp
+            // pink-noise comp — frozen past Nyquist, where the columns repeat the last bin and a growing
+            // tilt would draw that flat tail as a ramp
+            const float  tilt = (float) (tiltDbPerOct * std::log2 (std::min (f, nyquist) / tiltPivotHz));
             emit (i, x, pm.specDbToY (column (specDb,   f, binPerHz, prevBin, curBin) + tilt),
                         pm.specDbToY (column (specPeak, f, binPerHz, prevBin, curBin) + tilt));
             prevBin = curBin;
