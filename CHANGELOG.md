@@ -5,6 +5,17 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.22.1 — the floor is silence, not a shelf (`analysis`)
+
+- **fix(analysis):** both spectrum panes clamped a reading at −120 dB and then added the display
+  tilt, so silence came out as a straight line rising at the tilt's slope — with +6 dB/oct it stood
+  at −96 dB at 16 kHz, in plain view on a 120 dB range. `MultiResSpectrumPane` now applies the tilt
+  to the power and floors afterwards (`readDb (f, fs, tilt, pivot)`); `SpectrumPane` drops its
+  internal floor to −200 dB, deep below any plot bottom, so a tilted floor can never surface and a
+  bin with real energy at −130 dB keeps it. Both panes freeze the tilt past Nyquist, where the
+  columns repeat the last band that fits. Consumers that pinned the classic pane's −120 floor in
+  their own tests move to `SpectrumPane::kFloorDb`.
+
 ## v0.22.0 — the analyzer reads constant-Q, and rides SIMD (`analysis`, `fftpffft`)
 
 - **feat(analysis):** `MultiResSpectrumPane` — a constant-Q analyzer from several FFT lengths at
