@@ -24,8 +24,8 @@
 // arrived this tick. Message-thread only; the audio thread is never touched (frames arrive via a
 // lock-free tap).
 //
-// RESOLUTION: the analysis size N is chosen at RUNTIME (1024 / 2048 / 4096 / 8192 = FFT order
-// 10..13). All FFT plans are prebuilt in the ctor, so switching resolution costs no allocation — a
+// RESOLUTION: the analysis size N is chosen at RUNTIME (1024 … 16384 = FFT order 10..kMaxOrder, which
+// rides RollingSpectrumTap's). All FFT plans are prebuilt in the ctor, so switching resolution costs no allocation — a
 // live switch just starts FFTing at the new N. On the frame where the order changes, the dB state is
 // SEEDED directly from the new bins (not smoothed up from the −120 floor) so the display cuts cleanly
 // to the new resolution instead of fading in. Storage is sized to the maximum window; a smaller N
@@ -35,8 +35,10 @@ namespace felitronics::analysis
 
 struct SpectrumPane
 {
-    static constexpr int kMaxOrder = felitronics::analysis::RollingSpectrumTap::kMaxOrder;   // 13
-    static constexpr int kMaxSize  = felitronics::analysis::RollingSpectrumTap::kMaxSize;    // 8192
+    // The bin loop below reads the packed [DC, Nyq, re1, im1, …] layout; another backend needs an adapter.
+    static_assert (felitronics::core::fft::DefaultRealFft::kPackedHermitianSpectrum, "SpectrumPane assumes the packed Hermitian spectrum layout");
+    static constexpr int kMaxOrder = felitronics::analysis::RollingSpectrumTap::kMaxOrder;   // 14
+    static constexpr int kMaxSize  = felitronics::analysis::RollingSpectrumTap::kMaxSize;    // 16384
     static constexpr int kMaxBins  = kMaxSize / 2 + 1;
     static constexpr int kMinOrder = 10;                                                     // 1024
 
@@ -63,7 +65,7 @@ struct SpectrumPane
     // holds any order's frame; ingest(order) says how many of those samples are live.
     float* frameInput() noexcept { frameArmed = true; return fftBuf.data(); }
 
-    // Transform the frame at FFT `newOrder` (10..13). When the order changes vs the last ingest, the
+    // Transform the frame at FFT `newOrder` (10..kMaxOrder). When the order changes vs the last ingest, the
     // window is rebuilt and the dB/peak state is seeded straight from the new bins (a clean cut, no
     // fade-in); otherwise the usual per-tick smoothing + peak-hold runs.
     void ingest (int newOrder) noexcept
