@@ -5,6 +5,39 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.22.0 — the analyzer reads constant-Q, and rides SIMD (`analysis`, `fftpffft`)
+
+- **feat(analysis):** `MultiResSpectrumPane` — a constant-Q analyzer from several FFT lengths at
+  once. One frame from the rolling tap feeds 16384 / 4096 / 1024-point Hann suffixes that share the
+  frame's end (the short tier reports a transient first); a reading is the power in a 1/24-octave
+  band, integrated over the tier's bins with fractional edges from double prefix sums and normalised
+  by the window's measured ENBW — the one quantity two FFT lengths agree on for both a sine and
+  noise, which is what makes a seam invisible. Tiers are used where their bin is at least two per
+  band (seams 811 / 3246 Hz at 48 kHz), crossfaded in power over a third of an octave; below the
+  longest tier's bin the lows are bin-limited and say so. A tier shorter than the frame hop
+  Welch-averages as many half-overlapped windows as reach back over it, so a click between two
+  frames is never missed; the per-bin smoothing runs on power, not dB, because a log-domain average
+  carries a bias that depends on how the bin was fed. Design and physics: `docs/ANALYZER-MULTIRES.md`.
+  Crew-reviewed twice (codex, deepseek, Fable — the latter with simulations); property tests, not
+  golden files (`felitronics_multires_spectrum_tests`, 166 checks).
+- **feat(analysis):** `RollingSpectrumTap::tryPull (dst, order, hop)` reports the samples that
+  entered the ring since the previous publish — the hop that happened, which a block boundary or a
+  missed UI tick stretches past the one requested. The two-argument form stays.
+- **feat(analysis):** `SpectrumPane` becomes `SpectrumPaneT<Fft>` (constrained to the packed-Hermitian
+  layout its bin loop reads) with `SpectrumPane` the scalar alias, so every consumer reads as before;
+  it gains `reset()` (the next ingest seeds) for a consumer that returns to it after drawing another
+  pane. `MultiResSpectrumPaneT<MaxOrder, MaxTiers, Fft>` likewise.
+- **feat(fftpffft):** `PffftOrderedRealFft` — pffft's real transform in canonical order, which is
+  exactly the packed-Hermitian layout the scalar reference writes (F(0) and F(N/2) in the first slot,
+  then interleaved Re/Im, the e^{−jωn} sign), so it advertises `kPackedHermitianSpectrum` and is
+  admissible wherever bins are read. Beside the z-order `PffftRealFft`, not instead: the convolvers
+  keep their vectorised MAC; the analyzers get their SIMD. Nulled float for float against the scalar
+  (DC / Nyquist exact, Re / Im ≤ 2.4e-7 of full scale) with basis vectors pinning every slot, and both
+  panes on both backends within 0.02 dB. Per tick on an M-series Mac: a classic 16384 pane 267 → 73 µs,
+  the multi-res pane 381 → 126 µs.
+- **test:** `felitronics_spectrum_pane_perf_tests` — the panes' cost per UI tick on the scalar FFT,
+  printed for the record with loose ceilings; the pffft suite gains the scalar-vs-SIMD comparison.
+
 ## v0.21.2 — the pack's input trims become a switch
 
 - **feat(rigplayer):** the per-file `input_db` trims (a linked setting plays its neighbour softer)
