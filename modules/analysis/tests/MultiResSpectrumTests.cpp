@@ -595,6 +595,68 @@ int main()
     }
 
     //==========================================================================================
+    // The fill smoother on an all-zero frame is pw <- (1-c).pw, which in float32 walks down into the
+    // SUBNORMALS and sticks: at the smallest subnormal c.pw rounds to zero, so pw stops moving and every
+    // bin keeps doing subnormal arithmetic for the rest of the session. tierBinDb cannot see it (it floors
+    // at -200 either way) - tierBinPower can. Measured cost of the stuck state before the flush: a tick on
+    // silence was 3.0x a tick on signal on an i9-13900H (505 vs 168 us), and it never recovered.
+    group ("digital silence leaves the state at a true zero, not stuck in the subnormals");
+    {
+        constexpr float kSmallestNormal = 1.17549435e-38f;
+        Rng r;
+        for (float coeff : { 0.25f, 0.05f })
+        {
+            p.reset(); p.coverSamples = 1600; p.smoothCoeff = coeff;
+            streamFrames (p, [&] { return r.uni(); }, 6);                 // real signal first, so the state is loud
+            // On zeros the smoother is pw <- (1-c).pw, so the descent from full scale to the threshold
+            // takes ln(kFlushPower)/ln(1-c) ticks; ask for that many (+ margin), not a round number.
+            const int silent = 50 + (int) std::ceil (std::log ((double) Pane::kFlushPower) / std::log (1.0 - (double) coeff));
+            for (int t = 0; t < silent; ++t) { fillConst (p.frameInput(), N, 0.0f); p.ingest (14); }
+            int stuck = 0, nonZero = 0;
+            for (int k = 0; k < p.tierCount(); ++k)
+                for (int i = 0; i < p.tierBins (k); ++i)
+                {
+                    const float v = std::fabs (p.tierBinPower (k, i));
+                    if (v != 0.0f)          ++nonZero;
+                    if (v > 0.0f && v < kSmallestNormal) ++stuck;
+                }
+            ok (stuck == 0, "coeff " + std::to_string (coeff) + ": no bin is left subnormal after " + std::to_string (silent) + " zero frames (" + std::to_string (stuck) + ")");
+            ok (nonZero == 0, "coeff " + std::to_string (coeff) + ": every bin reached an exact zero (" + std::to_string (nonZero) + " non-zero)");
+        }
+
+        // starve()'s x0.5 fade reaches zero on its own, but only after ~23 subnormal ticks.
+        p.reset(); p.smoothCoeff = 0.25f;
+        streamFrames (p, [&] { return r.uni(); }, 6);
+        for (int t = 0; t < 400; ++t) p.starve();
+        int stuck = 0;
+        for (int k = 0; k < p.tierCount(); ++k)
+            for (int i = 0; i < p.tierBins (k); ++i)
+            {
+                const float v = std::fabs (p.tierBinPower (k, i));
+                if (v > 0.0f && v < kSmallestNormal) ++stuck;
+            }
+        ok (stuck == 0, "starve x400 leaves no subnormal bin either");
+
+        // The flush must be INVISIBLE. Two halves: (a) even if every bin sat just under the threshold,
+        // their whole sum stays far below the floor, so no band reading can move; (b) a bin ABOVE the
+        // threshold is untouched - here a DC cell five binades above it, which must survive intact.
+        const double allBinsAtThreshold = (double) Pane::kBinCapacity * (double) Pane::kFlushPower;
+        ok (allBinsAtThreshold < 0.01 * Pane::kFloorPower,
+            "every bin at the flush threshold still sums to far below the -200 dB floor");
+        ok ((double) Pane::kFlushPower > 100.0 * (double) kSmallestNormal,
+            "the threshold sits well above the smallest normal float, so the state never enters the subnormals");
+
+        p.reset(); p.smoothCoeff = 1.0f;
+        const double wantPow = 1.0e-25;                                   // 5 binades above the threshold, 5 below the floor
+        fillConst (p.frameInput(), N, (float) std::sqrt (wantPow * p.enbwBins (0) / 4.0));
+        p.ingest (14);
+        const double gotPow = (double) p.tierBinPower (0, 0);
+        ok (gotPow > 0.0, "a bin far below the floor but above the threshold is NOT flushed");
+        approx (10.0 * std::log10 (gotPow), 10.0 * std::log10 (wantPow), 0.05,
+                "...and it keeps its exact value: the flush never touches what a tilt could still lift");
+    }
+
+    //==========================================================================================
     group ("column geometry + tilt, and no allocation on the hot path");
     {
         p.reset(); p.coverSamples = 1600; p.smoothCoeff = 0.25f;
