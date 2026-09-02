@@ -118,6 +118,27 @@ int main()
         test::ok (tap.tryPull (rdst, ro), "frame once the hop elapses");
     }
 
+    // --- the frame reports the hop that HAPPENED: block rounding and a missed tick stretch it ---
+    test::group ("RollingSpectrumTap reports the hop that happened");
+    {
+        analysis::RollingSpectrumTap tap; tap.reset();
+        int hop = -1;
+        ramp (tap, 1024, 0);
+        tap.publishIfDue (10, 512);
+        test::ok (tap.tryPull (rdst, ro, hop) && hop == 1024, "first frame: everything since reset (1024)");
+        ramp (tap, 600, 1024);                                  // a 600-sample block crosses the 512 hop
+        tap.publishIfDue (10, 512);
+        test::ok (tap.tryPull (rdst, ro, hop) && hop == 600, "the hop reported is the delta that occurred (600), not the request (512)");
+        ramp (tap, 512, 1624); tap.publishIfDue (10, 512);      // published…
+        ramp (tap, 512, 2136); tap.publishIfDue (10, 512);      // …the reader is late, so this one is skipped
+        test::ok (tap.tryPull (rdst, ro, hop) && hop == 512, "the frame the late reader takes reports its own hop (512)");
+        ramp (tap, 100, 2648); tap.publishIfDue (10, 512);      // 512 skipped + 100 since the frame that was taken
+        test::ok (tap.tryPull (rdst, ro, hop) && hop == 612, "the missed tick shows up in the NEXT frame's hop (612)");
+        int ro2 = -1;
+        ramp (tap, 512, 2748); tap.publishIfDue (10, 512);
+        test::ok (tap.tryPull (rdst, ro2) && ro2 == 10, "the two-argument tryPull still works");
+    }
+
     // --- an order change force-publishes immediately, bypassing the hop (a live resolution switch) ---
     test::group ("RollingSpectrumTap order change forces a frame");
     {

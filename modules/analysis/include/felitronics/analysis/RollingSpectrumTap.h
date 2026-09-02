@@ -29,7 +29,7 @@ namespace felitronics::analysis
 //   • The ring (`ring`, `wpos`, `lastPublish`, `lastOrder`) is touched ONLY by the audio thread; the
 //     GUI never reads it. push() and publishIfDue() are both audio-thread — the snapshot copy reads
 //     the ring on the same thread that writes it, so it can never tear against a concurrent push().
-//   • The mailbox (`data`, `frameSize`, `frameOrder`) is written by the audio thread ONLY while
+//   • The mailbox (`data`, `frameSize`, `frameOrder`, `frameHop`) is written by the audio thread ONLY while
 //     `ready == false`, and read by the GUI ONLY while `ready == true`. The acquire/release `ready`
 //     flag hands off exclusive ownership of the mailbox — there is never concurrent access to it.
 //   • The request (`order`, `hopSamples`) is passed BY VALUE into publishIfDue from a single atomic
@@ -93,6 +93,7 @@ struct RollingSpectrumTapT
 
         frameSize   = (int) N;
         frameOrder  = order;
+        frameHop    = (int) std::min<std::uint64_t> (wpos - lastPublish, (std::uint64_t) kMaxSize);   // the hop that HAPPENED
         lastPublish = wpos;
         lastOrder   = order;
         ready.store (true, std::memory_order_release);
@@ -117,15 +118,21 @@ struct RollingSpectrumTapT
     // If a frame is ready, copy its `frameSize` samples into dst (dst must hold ≥ kMaxSize floats),
     // report the order it was captured at via outOrder, re-arm the slot, and return true. Else false.
     // The caller compares outOrder against the resolution it currently wants and discards a mismatch.
-    bool tryPull (float* dst, int& outOrder) noexcept
+    // outHopSamples is the number of samples that ENTERED the ring since the previous publish — the hop
+    // that actually happened, not the one requested: a block boundary rounds it up, a reader that missed
+    // a tick doubles it. A consumer that analyses the interval between frames (MultiResSpectrumPane's
+    // Welch cover) needs this number, not its own request. Capped at kMaxSize (the ring's reach).
+    bool tryPull (float* dst, int& outOrder, int& outHopSamples) noexcept
     {
         if (! ready.load (std::memory_order_acquire)) return false;
         const int n = frameSize;                                     // published before the release store
-        outOrder = frameOrder;
+        outOrder      = frameOrder;
+        outHopSamples = frameHop;
         std::copy (data, data + n, dst);
         ready.store (false, std::memory_order_release);
         return true;
     }
+    bool tryPull (float* dst, int& outOrder) noexcept { int hop = 0; return tryPull (dst, outOrder, hop); }
 
     //==============================================================================
     // Producer-only rolling history (audio thread) — its own cache line, away from the GUI mailbox.
@@ -140,6 +147,7 @@ struct RollingSpectrumTapT
     alignas (64) float             data[(std::size_t) kMaxSize] {};
     int                            frameSize  = 0;   // N of the published frame (1<<frameOrder)
     int                            frameOrder = 0;   // order the frame was captured at
+    int                            frameHop   = 0;   // samples pushed between the previous publish and this one
 };
 
 // Drop-in default: a 16384-sample (order-14) rolling history — enough for any analyser window

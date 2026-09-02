@@ -1,5 +1,5 @@
-# felitronics::analysis — SpectrumTap (lock-free SPSC analyser tap) today; correlation / LUFS and the
-# FFT-via-seam consumers land later. Header-only; depends on core.
+# felitronics::analysis — RT metering, the analyser taps and the spectrum panes (SpectrumPane, MultiResSpectrumPane);
+# offline display curves under ::offline. Header-only; depends on core.
 add_library(felitronics_analysis INTERFACE)
 add_library(felitronics::analysis ALIAS felitronics_analysis)
 target_include_directories(felitronics_analysis INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -24,4 +24,10 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_spectrum_curve_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_spectrum_curve_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_spectrum_curve_tests COMMAND felitronics_spectrum_curve_tests)
+
+    add_executable(felitronics_multires_spectrum_tests tests/MultiResSpectrumTests.cpp)
+    target_link_libraries(felitronics_multires_spectrum_tests PRIVATE felitronics::analysis)
+    target_include_directories(felitronics_multires_spectrum_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_multires_spectrum_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_multires_spectrum_tests COMMAND felitronics_multires_spectrum_tests)
 endif()
