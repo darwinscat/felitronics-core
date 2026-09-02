@@ -9,9 +9,11 @@
 //   * cases 3–5: the −10 LU relative gate, the −70 LUFS absolute gate, power-averaging across levels;
 //   * case 6: the 5.0 channel weights (Ls/Rs at 1.41);
 //   * cases 9 and 12: short-term and momentary settle to a constant over a periodic program.
-// Then the parts a flat RMS meter would fail: the K in K-weighting (a high tone reads hot, a low one reads
-// under), the −120 answer for what cannot be measured (silence, sub-gate signal, less than one 400 ms
-// block), and chunk invariance (the same stream in odd-sized pieces reads identically).
+// Then what Table 1 alone would let a wrong meter get away with, each pinned by a signal built so that only
+// the property under test can change the reading: the absolute gate isolated from the relative one and at its
+// boundary; the relative gate at −10 LU; every channel counted, in phase or not; the K in K-weighting at both
+// rates against the spec's published coefficients; a burst that tells 75 % block overlap from none; the −120
+// answer for what cannot be measured; chunk invariance; and process() allocating nothing.
 //
 // Grown from the Looper Cat conformance suite that gated the product's move onto this meter.
 
@@ -20,11 +22,22 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
+
+// RT-safety witness: every allocation in this binary is counted (the TruePeakMeter suite's pattern).
+static std::atomic<long> g_allocs { 0 };
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void  operator delete   (void* p) noexcept { std::free (p); }
+void  operator delete[] (void* p) noexcept { std::free (p); }
+void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
+void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -82,6 +95,38 @@ namespace
     }
 
     std::string at (double sr, const char* what) { return std::string (what) + (sr == 48000.0 ? " @48k" : " @44.1k"); }
+
+    // How a tone is laid across the channels — the fixtures that tell a per-channel power sum from every
+    // cheaper thing a meter could do instead (drop a channel, sum the samples, count one channel twice).
+    enum class Layout { leftOnly, rightOnly, antiPhase, mono };
+
+    double measureLayout (double sr, double dbfs, double seconds, Layout layout)
+    {
+        const int channels = layout == Layout::mono ? 1 : 2;
+        analysis::LoudnessMeter lm; lm.prepare (sr, channels, 60.0);
+        const double amp = std::pow (10.0, dbfs / 20.0);
+        const double w   = 2.0 * core::kPi * kToneHz / sr;
+        const long long frames = std::llround (seconds * sr);
+        std::vector<float> a (8192), b (8192, 0.0f);
+        for (long long o = 0; o < frames; o += 8192)
+        {
+            const int n = (int) std::min<long long> (8192, frames - o);
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = (float) (amp * std::sin (w * (double) (o + i)));
+                switch (layout)
+                {
+                    case Layout::leftOnly:  a[(std::size_t) i] = v;  b[(std::size_t) i] = 0.0f; break;
+                    case Layout::rightOnly: a[(std::size_t) i] = 0.0f; b[(std::size_t) i] = v;  break;
+                    case Layout::antiPhase: a[(std::size_t) i] = v;  b[(std::size_t) i] = -v;   break;
+                    case Layout::mono:      a[(std::size_t) i] = v;  break;
+                }
+            }
+            const float* ch[2] { a.data(), b.data() };
+            lm.process (ch, channels, n);
+        }
+        return lm.integratedLufs();
+    }
 }
 
 int main()
@@ -206,28 +251,92 @@ int main()
         // A tone wholly under the absolute gate: −80 dBFS reads −80 LUFS, below −70 — gated to nothing.
         test::ok (measure (sr, { { -80.0, 2.0 } }) == kNone, "a −80 dBFS tone (under the −70 LUFS gate) → −120");
 
-        // 399 ms is one hop short of the first 400 ms gating block; exactly 400 ms is exactly one block.
+        // 399 ms is one hop short of the first 400 ms gating block; exactly 400 ms is exactly one block — and
+        // that block reads the tone, not merely something above the sentinel.
         test::ok (measure (sr, { { -23.0, 0.399 } }) == kNone, "399 ms → no block yet → −120");
-        test::ok (measure (sr, { { -23.0, 0.400 } }) > -70.0,  "400 ms → one block → a reading");
+        test::approx (measure (sr, { { -23.0, 0.400 } }), -23.0, 0.2, "400 ms → one block → −23.0");
 
         // Any real gated mean averages blocks that each passed the −70 LUFS gate, so it lies above the gate by
         // construction: the gate is the line a consumer can draw between a reading and the sentinel.
-        test::ok (measure (sr, { { -69.0, 5.0 } }) > -70.0, "a −69 dBFS tone (just over the gate) reads above −70");
+        test::approx (measure (sr, { { -69.0, 5.0 } }), -69.0, 0.1, "a −69 dBFS tone (just over the gate) reads −69.0");
     }
 
-    // --- the K in K-weighting: shelf up high, RLB high-pass down low ---
-    test::group ("K-weighting shapes the reading");
+    // --- the absolute gate, isolated: Table 1's case 4 drops its −72 dBFS tails by the relative gate as much as
+    //     by the absolute one, so a meter with no absolute gate at all passes it. Here the sub-gate part sits
+    //     INSIDE the relative gate — only the absolute gate can drop it. ---
+    test::group ("absolute gate at −70 LUFS, isolated from the relative gate");
     {
-        // 8 kHz sits near the top of the shelf's knee: the prototype's gain is +4 dB asymptotically, so the
-        // reading lands a few dB hot of −23.
-        analysis::LoudnessMeter hi; hi.prepare (sr, 2, 20.0);
-        long long n1 = 0; feedSine (hi, sr, 8000.0, -23.0, 10.0, n1);
-        test::ok (hi.integratedLufs() > -23.0 + 2.5 && hi.integratedLufs() < -23.0 + 4.5, "8 kHz at −23 dBFS reads +2.5..+4.5 LU hot (the shelf)");
+        // −65 dBFS body, −72 dBFS tail, equal lengths: the abs-gated mean is −65.0 and the relative gate
+        // −75.0, so −72 would be kept by the relative gate — and a meter keeping it reads their mean, −67.2.
+        test::approx (measure (sr, { { -65.0, 10.0 }, { -72.0, 10.0 } }), -65.0, 0.1, "−65 body + −72 tail → −65.0 (the tail is dropped by the absolute gate alone)");
+        // The boundary itself: half a dB over the gate is a reading, half a dB under is the sentinel.
+        test::approx (measure (sr, { { -69.5, 5.0 } }), -69.5, 0.1, "−69.5 dBFS (just over the gate) reads −69.5");
+        test::ok (measure (sr, { { -70.5, 5.0 } }) == kNone, "−70.5 dBFS (just under the gate) → −120");
+    }
 
-        // 60 Hz is on the RLB high-pass slope (f0 ≈ 38 Hz): |H| ≈ −3 dB there.
-        analysis::LoudnessMeter lo; lo.prepare (sr, 2, 20.0);
-        long long n2 = 0; feedSine (lo, sr, 60.0, -23.0, 10.0, n2);
-        test::ok (lo.integratedLufs() < -23.0 - 2.0 && lo.integratedLufs() > -23.0 - 4.5, "60 Hz at −23 dBFS reads 2..4.5 LU under (the RLB high-pass)");
+    // --- the relative gate at −10 LU, not −8 (ATSC A/85's first edition) and not −12 ---
+    test::group ("relative gate at −10 LU");
+    {
+        // 60 s at −23 then 10 s at −32: the abs-gated mean is −23.6 and the relative gate −33.6, so the −32
+        // segment sits inside it and COUNTS — the reading is the mean of both, −23.58. At −34 the segment
+        // falls outside and the reading is the body alone, −23.0. A −8 LU gate would drop both (reading −23.0
+        // twice); a −12 LU gate would keep both (−23.58, then −23.61).
+        test::approx (measure (sr, { { -23.0, 60.0 }, { -32.0, 10.0 } }), -23.58, 0.1, "a segment 9 LU under the body is counted → −23.58");
+        test::approx (measure (sr, { { -23.0, 60.0 }, { -34.0, 10.0 } }), -23.00, 0.1, "a segment 11 LU under the body is dropped → −23.0");
+    }
+
+    // --- every channel counts, as power, in phase or not. Table 1 is dual-mono throughout, which a meter that
+    //     reads one channel and adds 3 dB, or sums the samples before squaring, passes just the same. ---
+    test::group ("channel handling: per-channel power, summed");
+    {
+        // One channel alone is the mono figure, −3.01 under the dual-mono one: −26.01. Either channel.
+        test::approx (measureLayout (sr, -23.0, 10.0, Layout::leftOnly),  -26.01, 0.1, "left only → −26.01");
+        test::approx (measureLayout (sr, -23.0, 10.0, Layout::rightOnly), -26.01, 0.1, "right only → −26.01");
+        // Anti-phase stereo carries the same power as in-phase: a meter summing samples before squaring
+        // would read silence.
+        test::approx (measureLayout (sr, -23.0, 10.0, Layout::antiPhase), -23.0, 0.1, "L = −R → −23.0 (power, not a sample sum)");
+        // A mono meter is the single-channel figure.
+        test::approx (measureLayout (sr, -23.0, 10.0, Layout::mono), -26.01, 0.1, "mono → −26.01");
+    }
+
+    // --- the K in K-weighting, at both rates. Table 1 sits at the one frequency where the K-filter's gain and
+    //     the −0.691 calibration cancel, so a flat meter passes all of it; away from 1 kHz the shape shows.
+    //     Expected readings come from BS.1770-4's PUBLISHED 48 kHz coefficient table, evaluated analytically
+    //     at the tone: |K| = −2.899 dB at 60 Hz (the RLB high-pass), +4.039 dB at 8 kHz (the shelf); a
+    //     −23 dBFS dual-mono tone therefore reads −23 + |K| − 0.691. The 44.1 kHz design differs from the
+    //     48 kHz table by under 0.005 dB at these tones. ---
+    for (const double rate : { 48000.0, 44100.0 })
+    {
+        test::group (at (rate, "K-weighting shapes the reading"));
+        analysis::LoudnessMeter hi; hi.prepare (rate, 2, 20.0);
+        long long n1 = 0; feedSine (hi, rate, 8000.0, -23.0, 10.0, n1);
+        test::approx (hi.integratedLufs(), -19.65, 0.15, at (rate, "8 kHz at −23 dBFS reads −19.65 (the shelf's +4.04 dB)"));
+
+        analysis::LoudnessMeter lo; lo.prepare (rate, 2, 20.0);
+        long long n2 = 0; feedSine (lo, rate, 60.0, -23.0, 10.0, n2);
+        test::approx (lo.integratedLufs(), -26.59, 0.15, at (rate, "60 Hz at −23 dBFS reads −26.59 (the high-pass's −2.90 dB)"));
+    }
+
+    // --- 400 ms blocks at a 100 ms hop: steady tones cannot tell 75 % overlap from none, a burst can ---
+    test::group ("block overlap: a burst tells 75 % from none");
+    {
+        // 200 ms of −20 dBFS tone from 300 ms to 500 ms in one second of silence, hop-aligned. Five
+        // overlapping 400 ms blocks touch it, holding 1/4, 1/2, 1/2, 1/2 and 1/4 of a full block's power; the
+        // silent blocks fall under the absolute gate and the relative gate (−10 LU under the mean) keeps all
+        // five, so the reading is the tone −10·log10(0.4) = −3.98 LU: −23.98. Non-overlapping blocks would
+        // hold 1/4 and 1/4 and read −6.02 LU under: −26.02.
+        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+        std::vector<float> sig ((std::size_t) sr, 0.0f);
+        const double amp = std::pow (10.0, -20.0 / 20.0);
+        for (std::size_t i = (std::size_t) (0.3 * sr); i < (std::size_t) (0.5 * sr); ++i)
+            sig[i] = (float) (amp * std::sin (2.0 * core::kPi * kToneHz * (double) (i - (std::size_t) (0.3 * sr)) / sr));
+        for (std::size_t o = 0; o < sig.size(); o += 4097)
+        {
+            const int n = (int) std::min<std::size_t> (4097, sig.size() - o);
+            const float* ch[2] { sig.data() + o, sig.data() + o };
+            lm.process (ch, 2, n);
+        }
+        test::approx (lm.integratedLufs(), -20.0 - 3.98, 0.3, "a 200 ms burst reads the tone −3.98 LU (five overlapping blocks)");
     }
 
     // --- chunking must not matter: one call vs odd-sized pieces straddling every hop ---
@@ -240,6 +349,20 @@ int main()
         feedSine (many, sr, kToneHz, -23.0, 5.0, b, 4097);     // odd chunks, straddling hops
         test::approx (many.integratedLufs(), one.integratedLufs(), 1e-9, "the same stream in 4097-frame pieces reads identically");
         test::approx (many.momentaryLufs(),  one.momentaryLufs(),  1e-9, "momentary too");
+    }
+
+    // --- the headline RT claim: process() allocates nothing, through hops, blocks and short-term samples ---
+    test::group ("process() does not allocate");
+    {
+        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+        std::vector<float> l (4800, 0.3f), r (4800, -0.2f);
+        const float* io[2] { l.data(), r.data() };
+        lm.process (io, 2, 4800);                                   // warm: the first hop
+        const long before = g_allocs.load();
+        for (int i = 0; i < 40; ++i) lm.process (io, 2, 4800);     // 4 s: hops, blocks and short-term samples all fire
+        const bool noAlloc = (g_allocs.load() == before);
+        test::okNoAlloc (noAlloc, "40 hops of process() did not allocate");
+        test::ok (std::isfinite (lm.integratedLufs()), "and the meter still reads");
     }
 
     // --- the stated capacity is honoured to its last block: a program exactly as long as prepare() was told
