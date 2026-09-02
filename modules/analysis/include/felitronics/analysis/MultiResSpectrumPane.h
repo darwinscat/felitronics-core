@@ -92,8 +92,8 @@ struct MultiResSpectrumPaneT
     static constexpr int kSumCapacity = kBinCapacity + MaxTiers;          // one extra prefix entry per tier
     static constexpr int kWinCapacity = 2 * kMaxSize;
 
-    static constexpr float  kFloorDb    = -120.0f;
-    static constexpr double kFloorPower = 1.0e-12;                       // 10^(kFloorDb/10): a READING below it is the floor
+    static constexpr float  kFloorDb    = -200.0f;                       // SpectrumPane's floor too: deep below every plot bottom
+    static constexpr double kFloorPower = 1.0e-20;                       // 10^(kFloorDb/10): a READING below it is the floor
     static constexpr double kMaxPower   = 1.0e12;                        // +120 dB: a bin power is clamped here before it narrows to float
 
     //==============================================================================

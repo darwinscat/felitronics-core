@@ -491,9 +491,12 @@ int main()
         ok (bottom, "…and every column of a silent, tilted spectrum sits on the plot's bottom");
         // a band with real energy at −130 dB is below the floor untilted, and +26 dB of tilt lifts it into view: −104, not the floor
         p.reset(); fillSine (p.frameInput(), N, 16000.0, std::pow (10.0, -130.0 / 20.0)); p.ingest (14);
-        ok (p.readDb (16000.0, fs) == (double) Pane::kFloorDb, "a −130 dB tone reads the floor untilted");
+        const double quiet = p.readDb (16000.0, fs);
+        ok (quiet > -134.0 && quiet < -128.0, "a −130 dB tone reads ≈ −130 untilted — below any plot bottom, but not flattened to the floor (got " + std::to_string (quiet) + ")");
         const double lifted = p.readDb (16000.0, fs, 6.0, 1000.0);
-        ok (lifted > -108.0 && lifted < -100.0, "…and with +24 dB of tilt at 16 kHz it reads ≈ −106 dB, not the tilted floor (got " + std::to_string (lifted) + ")");
+        ok (lifted > -108.0 && lifted < -100.0, "…and with +24 dB of tilt at 16 kHz it reads ≈ −106 dB (got " + std::to_string (lifted) + ")");
+        // the peak trace keeps the same bins the fill keeps: below −120 both still count, so the two traces never cross
+        ok (p.readPeakDb (16000.0, fs) >= p.readDb (16000.0, fs) - 1e-3, "the peak trace never sits below the fill (both count the same quiet bins; float dB round-trip ≤ 1e-3)");
         // past Nyquist the reading repeats the last band that fits and the tilt is frozen: a flat tail, not a ramp
         p.reset(); { Rng r; streamFrames (p, [&] { return r.uni(); }, 1); }
         const double atNyq = p.readDb (0.5 * fs, fs, 6.0, 1000.0);
