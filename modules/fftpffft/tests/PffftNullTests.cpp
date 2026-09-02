@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -359,7 +360,7 @@ int main()
     {
         std::uint64_t seed = 0x1234567ull;
         auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
-        for (int n : { 32, 256, 1024, 16384 })
+        for (int n : { 32, 64, 256, 1024, 16384 })
         {
             Po po; Sc sc;
             test::ok (po.prepare (n) && sc.prepare (n), "prepare " + std::to_string (n));
@@ -369,7 +370,25 @@ int main()
             float maxAbs = 0.0f, worst = 0.0f;
             for (int i = 0; i < n; ++i) maxAbs = std::max (maxAbs, std::fabs (b[(std::size_t) i]));
             for (int i = 0; i < n; ++i) worst = std::max (worst, std::fabs (a[(std::size_t) i] - b[(std::size_t) i]));
-            test::ok (worst <= 2.0e-5f * maxAbs, "N=" + std::to_string (n) + ": every packed float (DC, Nyq, re/im) matches the scalar within 2e-5 of full scale (worst " + std::to_string (worst / maxAbs) + ")");
+            test::ok (worst <= 2.0e-6f * maxAbs, "N=" + std::to_string (n) + ": every packed float (DC, Nyq, re/im) matches the scalar within 2e-6 of full scale (worst " + std::to_string (worst / maxAbs) + ")");
+            // basis vectors pin each slot on its own: a constant → s[0] = N; (−1)^n → s[1] = N and NOT s[N−1]
+            // (FFTPACK's own end slot); an impulse at n = 3 → Re/Im k = cos/−sin (6πk/N), the e^{−jωn} sign
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = 1.0f;
+            po.forward (x.data(), a.data());
+            test::approx (a[0], (double) n, 1e-3 * n, "N=" + std::to_string (n) + ": constant → s[0] = N (DC slot)");
+            test::approx (a[1], 0.0, 1e-3 * n, "  … and s[1] = 0");
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = (i & 1) ? -1.0f : 1.0f;
+            po.forward (x.data(), a.data());
+            test::approx (a[1], (double) n, 1e-3 * n, "  (−1)^n → s[1] = N (the Nyquist slot)");
+            test::approx (a[(std::size_t) (n - 1)], 0.0, 1e-3 * n, "  … and s[N−1] = 0 (not FFTPACK's end slot)");
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = (i == 3) ? 1.0f : 0.0f;
+            po.forward (x.data(), a.data());
+            for (int k : { 1, 2, n / 4 })
+            {
+                const double th = 2.0 * 3.14159265358979323846 * 3.0 * (double) k / (double) n;
+                test::approx (a[(std::size_t) (2 * k)],     std::cos (th), 1e-5, "  impulse at 3 → Re[" + std::to_string (k) + "] = cos");
+                test::approx (a[(std::size_t) (2 * k + 1)], -std::sin (th), 1e-5, "  impulse at 3 → Im[" + std::to_string (k) + "] = −sin (e^{−jωn})");
+            }
             // a bin-centred cosine: its Re lands in bin 5 with the scalar's sign convention (e^{-jωn}), Im ≈ 0
             for (int i = 0; i < n; ++i) x[(std::size_t) i] = std::cos (2.0f * 3.14159265f * 5.0f * (float) i / (float) n);
             po.forward (x.data(), a.data());
@@ -381,7 +400,7 @@ int main()
         }
     }
 
-    test::group ("PffftOrderedRealFft forward->inverse == identity; prepare admissibility; packed MAC");
+    test::group ("PffftOrderedRealFft forward->inverse == identity; the scalar's spectrum inverts on pffft; misaligned buffers; admissibility; packed MAC");
     {
         Po po; test::ok (po.prepare (4096), "prepare 4096");
         std::vector<float> x (4096), s (4096), y (4096);
@@ -389,6 +408,16 @@ int main()
         po.forward (x.data(), s.data()); po.inverse (s.data(), y.data());
         float worst = 0.0f; for (std::size_t i = 0; i < x.size(); ++i) worst = std::max (worst, std::fabs (x[i] - y[i]));
         test::ok (worst < 1.0e-5f, "round trip within 1e-5 (worst " + std::to_string (worst) + ")");
+        // the inverse must read the layout the SCALAR wrote — not merely undo its own forward
+        Sc sc; sc.prepare (4096); sc.forward (x.data(), s.data()); po.inverse (s.data(), y.data());
+        worst = 0.0f; for (std::size_t i = 0; i < x.size(); ++i) worst = std::max (worst, std::fabs (x[i] - y[i]));
+        test::ok (worst < 1.0e-5f, "scalar forward → pffft inverse == identity (the packed layout is shared both ways)");
+        // unaligned caller buffers on every side: pffft's alignment need is met by the bounces, not by the caller
+        std::vector<float> xu (4097 + 1), su (4096 + 1), yu (4096 + 1);
+        for (std::size_t i = 0; i < 4096; ++i) xu[i + 1] = x[i];
+        po.forward (xu.data() + 1, su.data() + 1); po.inverse (su.data() + 1, yu.data() + 1);
+        worst = 0.0f; for (std::size_t i = 0; i < 4096; ++i) worst = std::max ({ worst, std::fabs (su[i + 1] - s[i]) * 1e-3f, std::fabs (yu[i + 1] - x[i]) });
+        test::ok (worst < 1.0e-5f, "real in / spectrum out / spectrum in / real out all at data()+1: same spectrum, same round trip");
         Po bad;
         test::ok (! bad.prepare (16), "N=16 refused (pffft real needs ≥ 32)");
         test::ok (! bad.prepare (48), "N=48 refused (not a power of two)");
@@ -458,6 +487,49 @@ int main()
             worstRead = std::max ({ worstRead, std::fabs (mp->readDb (f, 48000.0) - ms->readDb (f, 48000.0)), std::fabs (mp->readPeakDb (f, 48000.0) - ms->readPeakDb (f, 48000.0)) });
         test::ok (worstRead <= 0.02, "the stitched fill + peak reads 30 Hz–20 kHz within 0.02 dB (worst " + std::to_string (worstRead) + ")");
         test::ok (mp->subWindows (2, 14) == 3, "the pffft pane runs the same three sub-windows");
+    }
+
+    //==========================================================================================
+    // PERFORMANCE — the reason the ordered backend exists. One UI tick (ingest + 900 columns) per pane on
+    // both backends; printed for the record, and the check is the one that matters: with the SIMD kernel
+    // compiled in, the pffft pane must be cheaper than the scalar one. (The scalar table on its own is
+    // felitronics_spectrum_pane_perf_tests.)
+    test::group ("performance: the panes on pffft vs the scalar reference (one tick = ingest + 900 columns)");
+    {
+        std::uint64_t seed = 0x51EDull;
+        auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
+        auto tickMicros = [&] (auto& pane, int frameSamples, int order)
+        {
+            analysis::PlotMap pm; pm.width = 900.0f; pm.height = 300.0f; pm.plotBottom = 300.0f;
+            volatile float sink = 0.0f; double best = 1e30;
+            for (int run = 0; run < 3; ++run)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int t = 0; t < 100; ++t)
+                {
+                    float* f = pane.frameInput(); for (int i = 0; i < frameSamples; ++i) f[i] = uni();
+                    pane.ingest (order);
+                    pane.buildColumns (pm, 48000.0, 1.5, 1000.0, [&] (int, float, float y, float yp) { sink = sink + y + yp; });
+                }
+                best = std::min (best, std::chrono::duration<double, std::micro> (std::chrono::steady_clock::now() - t0).count() / 100.0);
+            }
+            return best;
+        };
+        for (int o : { 11, 14 })
+        {
+            auto sp = std::make_unique<analysis::SpectrumPaneT<Sc>>(); auto pp = std::make_unique<analysis::SpectrumPaneT<Po>>();
+            const double us = tickMicros (*sp, 1 << o, o), up = tickMicros (*pp, 1 << o, o);
+            std::printf ("      classic %-6d scalar %7.0f us   pffft %7.0f us   (%.1fx)\n", 1 << o, us, up, us / up);
+            if (Pf::simdWidth() == 4) test::ok (up < us, "classic " + std::to_string (1 << o) + " on pffft is cheaper than on the scalar reference");
+        }
+        {
+            auto ms = std::make_unique<analysis::MultiResSpectrumPaneT<14, 4, Sc>>(); auto mp = std::make_unique<analysis::MultiResSpectrumPaneT<14, 4, Po>>();
+            ms->coverSamples = 1600; mp->coverSamples = 1600;
+            const double us = tickMicros (*ms, 16384, 14), up = tickMicros (*mp, 16384, 14);
+            std::printf ("      multi, hop 1600  scalar %7.0f us   pffft %7.0f us   (%.1fx)\n", us, up, us / up);
+            if (Pf::simdWidth() == 4) test::ok (up < us, "the multi-res pane on pffft is cheaper than on the scalar reference");
+            test::ok (up < 33333.0 * 0.2, "a multi-res tick on pffft stays under 20 % of a 30 fps frame");
+        }
     }
 
     return felitronics::test::report();

@@ -25,6 +25,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_spectrum_curve_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_spectrum_curve_tests COMMAND felitronics_spectrum_curve_tests)
 
+    add_executable(felitronics_spectrum_pane_perf_tests tests/SpectrumPanePerfTests.cpp)
+    target_link_libraries(felitronics_spectrum_pane_perf_tests PRIVATE felitronics::analysis)
+    target_include_directories(felitronics_spectrum_pane_perf_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_spectrum_pane_perf_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_spectrum_pane_perf_tests COMMAND felitronics_spectrum_pane_perf_tests)
+
     add_executable(felitronics_multires_spectrum_tests tests/MultiResSpectrumTests.cpp)
     target_link_libraries(felitronics_multires_spectrum_tests PRIVATE felitronics::analysis)
     target_include_directories(felitronics_multires_spectrum_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

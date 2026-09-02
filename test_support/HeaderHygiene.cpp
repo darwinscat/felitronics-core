@@ -92,8 +92,14 @@
 #include <felitronics/stereo/StereoWidth.h>
 #include <felitronics/text/Translit.h>
 
-#if defined(FELITRONICS_WITH_PFFFT)   // optional compiled SIMD backend — header only reaches the gate when the option is ON
+#include <felitronics/analysis/PlotMap.h>
+#include <felitronics/analysis/SpectrumPane.h>
+#include <felitronics/analysis/MultiResSpectrumPane.h>
+#include <felitronics/analysis/RollingSpectrumTap.h>
+
+#if defined(FELITRONICS_WITH_PFFFT)   // optional compiled SIMD backend — headers only reach the gate when the option is ON
 #include <felitronics/fftpffft/PffftRealFft.h>
+#include <felitronics/fftpffft/PffftOrderedRealFft.h>
 #endif
 
 // The teq compat shims are public too — they are what TabbyEQ/OrbitCab actually include.
@@ -126,8 +132,12 @@ template class  felitronics::convolution::MatrixConvolver<felitronics::core::fft
 template class  felitronics::lineareq::MixedPhaseFir<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::lineareq::BasicLinearPhaseEq<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::lineareq::BasicNaturalPhaseEq<felitronics::core::fft::DefaultRealFft>;
-#if defined(FELITRONICS_WITH_PFFFT)   // the SIMD backend through the strict gate: PR2's C1 static_asserts + the row-stride precondition
-template class  felitronics::convolution::MatrixConvolver<felitronics::fftpffft::PffftRealFft>;
+template struct felitronics::analysis::SpectrumPaneT<felitronics::core::fft::DefaultRealFft>;
+template struct felitronics::analysis::MultiResSpectrumPaneT<14, 4, felitronics::core::fft::DefaultRealFft>;
+#if defined(FELITRONICS_WITH_PFFFT)   // the SIMD backends through the strict gate: PR2's C1 static_asserts + the row-stride precondition,
+template class  felitronics::convolution::MatrixConvolver<felitronics::fftpffft::PffftRealFft>;            // and the ordered one under both panes
+template struct felitronics::analysis::SpectrumPaneT<felitronics::fftpffft::PffftOrderedRealFft>;
+template struct felitronics::analysis::MultiResSpectrumPaneT<14, 4, felitronics::fftpffft::PffftOrderedRealFft>;
 #endif
 template class  felitronics::eq::MultibandSplitter<4>;
 template class  felitronics::multiband::MultibandProcessor<felitronics::dynamics::Compressor, 4>;

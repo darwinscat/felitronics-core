@@ -31,7 +31,8 @@ bool PffftOrderedRealFft::prepare (int n) noexcept
     const auto len = static_cast<std::size_t> (n);
     in_.assign   (len, 0.0f);   // aligned bounce for the (possibly unaligned) real input / packed spectrum
     out_.assign  (len, 0.0f);   // aligned transform output, copied to the caller's (possibly unaligned) buffer
-    work_.assign (len, 0.0f);   // N floats for a REAL transform — non-NULL so pffft never falls back to alloca
+    work_.assign (len, 0.0f);   // N floats for a REAL transform — non-NULL, so pffft never takes its N-float
+                                //   stack fallback (a 16-byte VLA remains; not a heap allocation)
     n_ = n;
     return true;
 }
