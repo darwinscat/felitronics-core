@@ -477,6 +477,30 @@ int main()
     }
 
     //==========================================================================================
+    group ("the floor is silence, not a shelf: a tilt never lifts it, and a band just above it is lifted like any other");
+    {
+        p.reset(); p.coverSamples = 1600; p.smoothCoeff = 1.0f;
+        fillConst (p.frameInput(), N, 0.0f); p.ingest (14);                    // silence
+        bool floorEverywhere = true;
+        for (double f = 20.0; f < 28000.0; f *= 1.05)
+            if (p.readDb (f, fs, 6.0, 1000.0) != (double) Pane::kFloorDb || p.readPeakDb (f, fs, 6.0, 1000.0) != (double) Pane::kFloorDb) floorEverywhere = false;
+        ok (floorEverywhere, "silence with a +6 dB/oct tilt reads the floor at every frequency (it used to draw a −94 dB line at 20 kHz)");
+        analysis::PlotMap pm; pm.width = 900.0f; pm.height = 120.0f; pm.plotBottom = 120.0f; pm.specTop = 0.0; pm.specBottom = -120.0;   // 1 px per dB
+        bool bottom = true;
+        p.buildColumns (pm, fs, 6.0, 1000.0, [&] (int, float, float yF, float yP) { if (yF < pm.height - 1e-3f || yP < pm.height - 1e-3f) bottom = false; });
+        ok (bottom, "…and every column of a silent, tilted spectrum sits on the plot's bottom");
+        // a band with real energy at −130 dB is below the floor untilted, and +26 dB of tilt lifts it into view: −104, not the floor
+        p.reset(); fillSine (p.frameInput(), N, 16000.0, std::pow (10.0, -130.0 / 20.0)); p.ingest (14);
+        ok (p.readDb (16000.0, fs) == (double) Pane::kFloorDb, "a −130 dB tone reads the floor untilted");
+        const double lifted = p.readDb (16000.0, fs, 6.0, 1000.0);
+        ok (lifted > -108.0 && lifted < -100.0, "…and with +24 dB of tilt at 16 kHz it reads ≈ −106 dB, not the tilted floor (got " + std::to_string (lifted) + ")");
+        // past Nyquist the reading repeats the last band that fits and the tilt is frozen: a flat tail, not a ramp
+        p.reset(); { Rng r; streamFrames (p, [&] { return r.uni(); }, 1); }
+        const double atNyq = p.readDb (0.5 * fs, fs, 6.0, 1000.0);
+        ok (std::fabs (p.readDb (26000.0, fs, 6.0, 1000.0) - atNyq) < 1e-9 && std::fabs (p.readDb (28000.0, fs, 6.0, 1000.0) - atNyq) < 1e-9, "above Nyquist the tilted reading is flat (the tilt stops growing at fs/2)");
+    }
+
+    //==========================================================================================
     group ("silence reads the floor whatever the band width; a lone tone fabricates nothing far away");
     {
         p.reset(); p.coverSamples = 1600; p.smoothCoeff = 1.0f;
@@ -578,12 +602,20 @@ int main()
         {
             if (i == 0) firstAtZero = (x == 0.0f);
             if (x < lastX) ascending = false; lastX = x;
-            const double f = pm.xToFreq (x), tilt = 4.5 * std::log2 (f / 1000.0);
-            if (std::fabs (yF - pm.specDbToY (p.readDb (f, fs) + tilt)) > 1e-4f || std::fabs (yP - pm.specDbToY (p.readPeakDb (f, fs) + tilt)) > 1e-4f) consistent = false;
+            const double f = pm.xToFreq (x);
+            if (std::fabs (yF - pm.specDbToY (p.readDb (f, fs, 4.5, 1000.0))) > 1e-4f || std::fabs (yP - pm.specDbToY (p.readPeakDb (f, fs, 4.5, 1000.0))) > 1e-4f) consistent = false;
             ++count;
         });
         ok (count == 641 && ascending && firstAtZero, "N+1 = 641 ascending points, i = 0 at x = 0");
-        ok (consistent, "every column is specDbToY (readDb + tilt) — one geometry source");
+        ok (consistent, "every column is specDbToY (readDb (f, fs, tilt, pivot)) — one geometry source");
+        // The tilt is a gain on the signal, applied before the floor: a band at 1 kHz reads the same with any
+        // tilt (the pivot), a band at 4 kHz reads +9 dB with 4.5 dB/oct, and one at 250 Hz −9.
+        {
+            const double a = p.readDb (1000.0, fs), b = p.readDb (4000.0, fs), c = p.readDb (250.0, fs);
+            approx (p.readDb (1000.0, fs, 4.5, 1000.0), a, 1e-9, "tilt: the pivot reads unchanged");
+            approx (p.readDb (4000.0, fs, 4.5, 1000.0), b + 9.0, 1e-6, "tilt: two octaves up reads +9 dB at 4.5 dB/oct");
+            approx (p.readDb (250.0, fs, 4.5, 1000.0), c - 9.0, 1e-6, "tilt: two octaves down reads −9 dB");
+        }
         analysis::PlotMap z; z.width = 0.0f; z.height = 10.0f;
         count = 0; p.buildColumns (z, fs, 0.0, 1000.0, [&] (int, float, float, float) { ++count; });
         ok (count == 257, "a zero-width map still emits the minimum 257 columns");
