@@ -5,6 +5,24 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.25.0 — a knob that clicks states its filter, and NAM is pinned to a release (`rigplayer`, `nam`)
+
+- **feat(rigplayer):** a switch shipping its bands **per position**. namz 4.0.0 gave the format
+  `positions[].sections` — each position states the filter it IS, with no travel law, because a
+  switch's positions are words with an order and no angle for a gain to travel on. The player had no
+  path to it: such a knob went down the curve path, met an empty grid, matched `0 == 0` on the length
+  test and bypassed the filter. Flat, with every check along the way passing. `sectionsAtValue` builds
+  that position's bands by name and `bandsPerPosition` sends the knob to the band path.
+- **fix(rigplayer):** `setSwitch` refuses a value no position declares. It used to store any word,
+  report success and read it back on the knob while the sound was the reference — a typo of one letter
+  was accepted and heard as nothing. A dial still takes any degree of its travel, swept or not.
+- **build(nam):** NeuralAmpModelerCore is pinned to **v0.5.4**, a release rather than a commit.
+  `b5a68c3` was the tip of upstream main when OrbitCab pinned it and stopped being so forty-five
+  minutes later; it was inherited here with the NAM path and never moved. A real model through a
+  second of deterministic signal is **bit-identical** across the two pins, so nothing already captured
+  sounds new.
+- **build:** namz is fetched at **v4.0.0**, the schema the player now speaks.
+
 ## v0.24.0 — the constant-Q analyzer for half the CPU, and silence stops costing more than sound (`analysis`)
 
 - **feat(analysis):** `MultiResSpectrumPaneFast` — the same pane as `MultiResSpectrumPane`, computed
