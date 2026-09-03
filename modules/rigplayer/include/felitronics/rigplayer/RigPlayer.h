@@ -259,6 +259,15 @@ public:
             }
         for (const auto& t : tones())
             if (t.name == control) {
+                // A SWITCH ONLY HAS THE POSITIONS IT DECLARES. Accepting any word and storing it read
+                // back as a setting the knob does not have, while the sound was the reference — the
+                // caller was told `true` and heard nothing. A dial keeps taking any degree: every angle
+                // of its travel is playable, swept or not.
+                if (t.sweep <= 0 && ! t.positions.empty()) {
+                    bool found = false;
+                    for (const auto& p : t.positions) if (p.value == value) { found = true; break; }
+                    if (! found) return false;
+                }
                 toneAt_[control] = value;
                 if (prepared_) rebuildKnob(t);
                 return true;
@@ -757,7 +766,8 @@ private:
     void rebuildKnob(const namz::rig::Tone& t) {
         const int side = sideOf(t);
         if (side < 0) return;
-        if (! t.sections.empty()) rebuildBands(side); else rebuildCurves(side);
+        // Bands, whether they travel with a dial or stand still at a switch's position; else the curve.
+        if (! t.sections.empty() || bandsPerPosition(t)) rebuildBands(side); else rebuildCurves(side);
     }
 
     // Every curve-form knob on one side, summed (cascaded linear filters multiply, which in dB is a
@@ -767,7 +777,9 @@ private:
         std::vector<double> sum(commonGrid_.size(), 0.0);
         bool any = false;
         for (const auto& t : tones()) {
-            if (sideOf(t) != side || t.positions.empty()) continue;
+            // A knob whose positions carry BANDS ships no curve and no grid: it belongs to the other
+            // path, and asking this one for its curve would ask an empty grid for a value.
+            if (sideOf(t) != side || t.positions.empty() || bandsPerPosition(t)) continue;
             const auto grid  = gridOf(t);
             const auto curve = curveAt(t, grid, toneAt_[t.name]);
             if (curve.empty()) continue;
@@ -794,8 +806,13 @@ private:
         bandsShown_[side].clear();
         int dropped = 0;
         for (const auto& t : tones()) {
-            if (sideOf(t) != side || t.sections.empty()) continue;
-            for (const auto& q : sectionsAt(t, toneAt_[t.name], fs_)) {
+            if (sideOf(t) != side) continue;
+            // A DIAL's bands travel with its rotation; a SWITCH's stand whole at the position it is on.
+            // One list either way, in a fixed order, so band k keeps its state across knob moves.
+            const auto qs = ! t.sections.empty() ? sectionsAt(t, toneAt_[t.name], fs_)
+                          : bandsPerPosition(t)  ? sectionsAtValue(t, toneAt_[t.name], fs_)
+                                                 : std::vector<felitronics::rigplayer::SectionBiquad> {};
+            for (const auto& q : qs) {
                 if (set.count < kMaxBands) { set.c[set.count++] = q; bandsShown_[side].push_back(q); }
                 else ++dropped;
             }

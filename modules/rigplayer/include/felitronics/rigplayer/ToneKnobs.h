@@ -152,6 +152,30 @@ inline felitronics::rigplayer::SectionBiquad sectionAt(const namz::rig::Section&
     return felitronics::rigplayer::designSection(kindOf(s.kind), hz, gainDb, q, sampleRate, s.pivot);
 }
 
+// WHOSE BANDS LIVE ON ITS POSITIONS — a switch stating a filter at each of them (schema 4). It carries
+// no knob-level `sections`, because there is no rotation for a gain to travel on.
+inline bool bandsPerPosition(const Tone& t) {
+    for (const auto& p : t.positions) if (! p.sections.empty()) return true;
+    return false;
+}
+
+// The bands a SWITCH has at `value`: that position's own, whole, and NOTHING between two of them. No
+// travel law runs here — the position is found by name, and a name this knob does not declare has no
+// bands, which is the reference: flat, exactly what the models already are.
+inline std::vector<felitronics::rigplayer::SectionBiquad> sectionsAtValue(const Tone& t, const std::string& value,
+                                                                          double sampleRate) {
+    std::vector<felitronics::rigplayer::SectionBiquad> out;
+    for (const auto& p : t.positions)
+        if (p.value == value) {
+            out.reserve(p.sections.size());
+            for (const auto& s : p.sections)
+                out.push_back(felitronics::rigplayer::designSection(kindOf(s.kind), s.hz, s.gainDb,
+                                                                    s.q, sampleRate, s.pivot));
+            break;
+        }
+    return out;
+}
+
 // Every band of a `sections` knob at `value` (degrees). A knob whose bands cannot be built is empty —
 // the reference position plays, which is what dropping a tone knob has always meant.
 inline std::vector<felitronics::rigplayer::SectionBiquad> sectionsAt(const Tone& t, const std::string& value,
