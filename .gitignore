@@ -32,6 +32,7 @@ cmake_install.cmake
 # Local AI-assistant brain — kept private/local, not shipped
 CLAUDE.md
 .claude/
+.private/
 
 # Stray logs
 *.log
