@@ -45,7 +45,7 @@ FetchContent_MakeAvailable(nam_core_src)
 # `tone` and `lag_samples`, which felitronics::rigplayer reads). Pin the v3.1.0 release by immutable
 # commit. SOURCE_SUBDIR deliberately points at a directory without CMakeLists.txt: populate the headers
 # without building namz's project or fetching nlohmann twice.
-set(FELITRONICS_NAMZ_TAG "217776041fe1635d94cdce6c9fb1a098530eda0c" CACHE STRING
+set(FELITRONICS_NAMZ_TAG "v4.0.0" CACHE STRING
     "namz v3.1.0 commit to build against")
 set(FELITRONICS_NAMZ_SRC "" CACHE PATH
     "Local namz checkout (when empty, fetch the pin)")

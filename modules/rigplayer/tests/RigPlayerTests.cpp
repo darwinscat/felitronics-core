@@ -498,6 +498,36 @@ int main() {
         approx(db(b.gainAt(10000.0) / b.gainAt(100.0)) - flat, shelfDb(6.0, kFs), 0.1, "+6 dB of the new shelf");
     }
 
+    // A KNOB THAT CLICKS. Its positions are words with an order and no angle, so there is no rotation
+    // for a band's gain to travel on: each position states the filter it IS, and nothing is computed
+    // between two of them. Before schema 4 such a knob could not say this at all — it was given an
+    // evenly spaced `norm` nobody measured, and a bench that declared it as bands heard its measured
+    // curve instead, silently.
+    group("a knob that clicks: the filter is stated at the position, whole");
+    {
+        Bench b(rig);
+        namz::rig::Tone edge;
+        edge.name = "edge"; edge.placement = "post"; edge.reference = "sharp"; edge.defaultValue = "sharp";
+        namz::rig::TonePosition sharp;  sharp.value  = "sharp";      // the anchor states nothing: flat by construction
+        namz::rig::TonePosition smooth; smooth.value = "smooth";
+        namz::rig::PositionSection hs;
+        hs.kind = namz::rig::SectionKind::HighShelf; hs.hz = 3000.0; hs.q = 0.7; hs.gainDb = -6.0;
+        smooth.sections = { hs };
+        edge.positions = { sharp, smooth };
+        b.p.setToneOverride({ edge });
+        ok(b.p.knobValue("edge") == "sharp", "the switch opens at its anchor");
+        const double flat = db(b.gainAt(10000.0) / b.gainAt(100.0));
+        ok(b.p.setSwitch("edge", "smooth") && b.p.knobValue("edge") == "smooth", "…and clicks over");
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)) - flat, shelfDb(-6.0, kFs), 0.1,
+               "what sounds is that position's own filter, at its own decibels");
+        ok(b.p.setSwitch("edge", "sharp"), "back to the anchor");
+        approx(db(b.gainAt(10000.0) / b.gainAt(100.0)) - flat, 0.0, 0.1,
+               "…where the models play exactly as they were captured");
+        ok(! b.p.setSwitch("edge", "smoothh"), "a position this knob does not declare is REFUSED");
+        ok(b.p.knobValue("edge") == "sharp",
+           "…and the knob stayed where it was: it used to accept the word, read it back, and play the anchor");
+    }
+
     group("blend: the dry path and the wet one as the pack states them");
     {
         Bench b(rig);
