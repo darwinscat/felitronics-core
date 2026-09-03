@@ -12,8 +12,14 @@ include(FetchContent)
 
 # NeuralAmpModelerCore ships no usable library target. Populate the pinned sources without entering
 # its own project, then compile the same source set used by OrbitCab. Only Eigen's submodule is needed.
-set(FELITRONICS_NAM_CORE_TAG "b5a68c3ebed5035a91d9207219346c81e8e3ce8e" CACHE STRING
-    "NeuralAmpModelerCore commit to build against")
+# A RELEASE, not a commit somebody caught mid-air. The pin was `b5a68c3` — upstream's "Revert A2 fast
+# optimizations (#295)" — which was the tip of main when OrbitCab first pinned it and stopped being so
+# forty-five minutes later, when v0.5.4 was published. It was inherited here with the NAM path and
+# never moved. The three commits between them are an MSVC `restrict` fix on the inline GEMM, an
+# introspection feature for slimmable models, and a convolution optimisation; a real SM7 model through
+# a second of signal comes out BIT-IDENTICAL across the two, so nothing anyone captured sounds new.
+set(FELITRONICS_NAM_CORE_TAG "v0.5.4" CACHE STRING
+    "NeuralAmpModelerCore release to build against")
 set(FELITRONICS_NAM_CORE_SRC "" CACHE PATH
     "Local NeuralAmpModelerCore checkout (when empty, fetch the pin)")
 if(FELITRONICS_NAM_CORE_SRC AND NOT EXISTS "${FELITRONICS_NAM_CORE_SRC}")
