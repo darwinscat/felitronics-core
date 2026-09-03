@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Close pull requests from anyone but the copyright holders, with an explanation.
+#
+# WHY: this repo is AGPL and its copyright is held solely by Oleh Tsymaienko and Alisa Lafoks.
+# A merged outside contribution leaves its author holding copyright on those lines forever, and
+# from then on the project cannot change its own licensing terms without tracking that person
+# down. Nobody can foresee ten years; declining code costs nothing. See CONTRIBUTING.md.
+# Issues stay OPEN on purpose — a bug report or an idea carries no copyright, so those are
+# welcome and useful. Only code is refused.
+#
+# NOTE: `pull_request_target` is deliberate. A `pull_request` run triggered from a FORK gets a
+# read-only token and could not close anything. That trigger is only safe because this job NEVER
+# checks out, builds or executes the PR's code — it only calls the API with a fixed body. Keep it
+# that way: adding a checkout of the head ref here would hand a stranger our write token.
+name: no-external-code
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write          # a PR comment goes through the issues API
+
+jobs:
+  close:
+    # dependabot bumps GitHub Action versions (see .github/dependabot.yml) — config edits, not
+    # copyrightable expression, and we want them.
+    if: >-
+      github.event.pull_request.user.login != 'tsyma' &&
+      github.event.pull_request.user.login != 'AliceLafox' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain, then close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: |
+          cat > body.md <<'BODY'
+          Thank you for taking the time — but this project does not accept code contributions. That
+          is a standing policy, not a judgement on your patch.
+
+          felitronics-core is AGPL-3.0-or-later and its copyright is held solely by its two authors.
+          Merging outside code would tie the project's future licensing to everyone who ever
+          contributed, so the answer has to be the same regardless of how good the change is.
+          The reasoning is written out in [CONTRIBUTING.md](https://github.com/darwinscat/felitronics-core/blob/main/CONTRIBUTING.md).
+
+          **What does help, and is genuinely welcome:** open an *issue* describing the bug or the
+          idea. Reports and ideas carry no copyright, so they can be acted on freely — and if a fix
+          lands because of yours, it is credited in the changelog.
+
+          You remain free to fork this library and distribute your own modified version under the
+          AGPL. This policy takes none of those rights away; it is only about what gets merged here.
+          BODY
+          gh pr comment "$PR" --body-file body.md
+          gh pr close "$PR"

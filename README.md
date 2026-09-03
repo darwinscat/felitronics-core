@@ -59,6 +59,14 @@ target_link_libraries(app PRIVATE felitronics::eq felitronics::lineareq)   # lin
 #include <felitronics/eq/EqEngine.h>
 ```
 
+## Contributing
+
+**Issues yes, code no.** Bug reports, questions and ideas are welcome and get acted on (with
+credit in the changelog); pull requests containing code are closed unmerged, as a standing policy
+that keeps the copyright — and therefore every future licensing option — with the two authors.
+Forking under the AGPL is expressly fine. Reasoning: [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 [AGPL-3.0-or-later](LICENSE) · © 2026 Darwin's Cat.
+
