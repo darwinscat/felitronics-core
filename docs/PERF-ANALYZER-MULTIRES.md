@@ -116,10 +116,27 @@ measured rejections, kept here so they are not re-proposed:
 One UI tick = `ingest` + the columns. 48 kHz, frame 16384, hop 1600, default ladder 16384/4096/1024.
 Every variant is measured in **one process, round-robin** — each round times each row once and the
 figure is the median over nine rounds — so the boost/thermal drift of a laptop is charged to every row
-equally. **Absolute microseconds depend on the machine's thermal state; the ratios between rows do
-not**, and the ratios are what this table is for. Reproduce with
-`felitronics_spectrum_pane_perf_tests` (scalar) and `felitronics_pffft_tests` (both backends), which
-print the same pair and fail if the fast pane ever stops being cheaper.
+equally.
+
+**Absolute microseconds depend on the machine's thermal state; the ratios between rows do not**, and the
+ratios are what this table is for.
+
+> **Note on the two estimators (2026-09-04).** The claim above survived a scare and is left standing, but
+> the sentence that used to follow it — "reproduce with `felitronics_spectrum_pane_perf_tests` and
+> `felitronics_pffft_tests`, which print the same pair" — was not true of the METHOD. This table is a
+> round-robin median of nine rounds; the pffft suite was taking the best of three windows of a hundred
+> ticks, **with its own 16384-sample PRNG fill inside the clock**. Both mattered. The fill cost ~25 µs a
+> tick and was charged to both panes equally, dragging the ratio toward 1 (it read ~1.7–1.8 where this
+> table reads 1.82); and a ~15 ms window cannot find a clean sample on a co-tenanted CI VM, which is how
+> that suite came to read **1.05** on a `macos-latest` runner and fail a markdown-only commit. Diagnosis:
+> the runner slowed the fast pane 3.24× and the pane it copies only 2.08× — a slower machine scales both
+> alike, so that asymmetry is contamination of two SEPARATELY timed windows, not a different machine.
+>
+> The suite now takes the **minimum of 300 single ticks** with the fill outside the clock, and reads
+> ~2.2–2.4× — stable to 1.4 % under twenty competing busy loops. That is not a disagreement with the 1.82×
+> here: a min-of-N ratio sits above a median-of-N one, because per-tick jitter is proportionally larger on
+> the cheaper pane. **Min estimates the intrinsic tick; the median below is what a tick costs in practice.**
+> Reproducing this table means reproducing its own method.
 
 Machines: **Apple M5 Pro** (macOS, AppleClang, `-O2`, NEON) and **i9-13900H** (Debian 13, gcc 14.2,
 `-O2`, SSE, `performance` governor, pinned to a P-core with `taskset`).
