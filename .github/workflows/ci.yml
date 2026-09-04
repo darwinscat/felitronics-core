@@ -116,6 +116,11 @@ jobs:
   #                                      inside libc++-noexcept.a — hence the header lint below.
   #   denormal / law-8 violations     -> NOT caught, at all. That is a property of the CPU at runtime, not of
   #                                      the build (see the KWeightingFilter finding).
+  #   long double ON AN EMITTED PATH  -> caught from the ARTIFACT: on wasm32 the type is software binary128,
+  #                                      so every operation is a compiler-rt libcall (__addtf3, __multf3, …)
+  #                                      standing in the object file as an undefined symbol. Measured: the
+  #                                      tier's 83 objects yield exactly one hit, the sanctioned one.
+  #   long double in code NEVER emitted -> the text lint. Same split as the thread wrap and the header lint.
   #
   # ubuntu, NOT macos, and for the parity step that is load-bearing: Apple's libm and musl (what emscripten
   # compiles in) return different doubles from tan() at 88.2 and 192 kHz, so an arm64-macOS reference would
@@ -157,6 +162,41 @@ jobs:
             echo "^^ the wasm-audio tier is single-threaded by contract (DSP-ARCHITECTURE.md 2)"; exit 1
           fi
           echo "no threading headers in public module headers"
+      - name: No long double arithmetic in any emitted object — law 9, from the ARTIFACT
+        # The stronger half of law 9's enforcement, and it is free here because wasm32 hands it to us: on
+        # that target `long double` is IEEE binary128 in SOFTWARE, so every operation on it is a compiler-rt
+        # libcall — `__addtf3`, `__multf3`, `__trunctfdf2` — and shows up as an UNDEFINED SYMBOL in the
+        # object file. Measured on emsdk 6.0.9: an accumulate in `long double` emits them, `sizeof(long
+        # double)` alone emits nothing (correctly — naming the type is not using it), plain `double` emits
+        # nothing. Across the tier's 83 objects exactly ONE matches: fcore_measure.cpp.o, the native-only
+        # correlation accumulator law 9 sanctions by name. Zero false positives, one named exclusion.
+        #
+        # It pairs with the text lint below exactly as `--wrap=pthread_create` pairs with the header lint:
+        # this one reads EMITTED code, so no comment can fool it and a type reached through a macro or an
+        # alias cannot hide; it is blind to code never emitted (an uninstantiated template, an unused
+        # inline), which is precisely what the text lint covers.
+        run: |
+          NM="$EMSDK/upstream/bin/llvm-nm"
+          if find build-wasm-audio -name '*.o' ! -name 'fcore_measure.cpp.o' -print0 \
+             | xargs -0 "$NM" --undefined-only --print-file-name \
+             | grep -E ' U (__(add|sub|mul|div|neg|extend[sd]f|trunc|fix|float|eq|ne|lt|le|gt|ge|unord)tf[0-9a-z]*|(sqrt|pow|exp|log|sin|cos|tan|fabs|floor|ceil|fmod|hypot|fma)l)$'; then
+            echo "^^ a wasm32 long double operation is a compiler-rt libcall — DSP-ARCHITECTURE.md §2 law 9."
+            echo "   The one sanctioned use is tools/fcore_measure.cpp's native-only correlation accumulator."
+            exit 1
+          fi
+          echo "no long double arithmetic in any emitted object of the tier"
+      - name: No long double in core code — law 9, enforced
+        # DSP-ARCHITECTURE.md §2 law 9 said in its own text that nothing enforced it. This is the
+        # enforcement. It lives in THIS job rather than a new one because its sibling lint (the threading
+        # header grep) and the negative-control step below are already here, and a 2-second scan does not
+        # deserve a runner of its own — but note the law is not wasm-specific: `long double` is 8 bytes /
+        # 53 mantissa bits on arm64 macOS, 16/64 on x86-64 and 16/113 on wasm32, so it breaks determinism
+        # on EVERY tier. Not a bare grep, and for a specific reason: unlike `#include <thread>`, the words
+        # "long double" occur in prose all the time — law 9's own explanation is full of them — so the
+        # scanner lexes first and blanks comments, strings and raw strings before matching.
+        run: |
+          node tools/lint/check-no-long-double.mjs --self-test
+          node tools/lint/check-no-long-double.mjs
       - name: The gates still gate — negative controls
         # A gate nobody tries to break is a gate nobody knows still works. Both of these are cheap and both
         # would have caught a real rot: the --wrap gate depends on libc++ keeping std::thread's constructor
@@ -175,6 +215,33 @@ jobs:
             echo "CONTROL FAILED: the audit passed a -pthread artifact"; exit 1
           fi
           echo "control 2 ok: the artifact audit rejects a threaded module"
+          # Control 3: the long-double lint. Its own --self-test above proves the MATCHER; this proves the
+          # rest of it — that the scan actually reaches module code, reports file:line, and fails the step.
+          # A lint that quietly stopped discovering files would pass its step forever without this.
+          printf '// prose saying long double must be ignored\nusing Forbidden = long double;\n' \
+            > modules/core/include/felitronics/core/_lint_control.h
+          if node tools/lint/check-no-long-double.mjs > /dev/null 2>&1; then
+            rm -f modules/core/include/felitronics/core/_lint_control.h
+            echo "CONTROL FAILED: a long double in a module header did not fail the lint"; exit 1
+          fi
+          node tools/lint/check-no-long-double.mjs 2>&1 | grep -q "_lint_control.h:2" \
+            || { rm -f modules/core/include/felitronics/core/_lint_control.h; echo "CONTROL FAILED: wrong line reported"; exit 1; }
+          rm -f modules/core/include/felitronics/core/_lint_control.h
+          node tools/lint/check-no-long-double.mjs > /dev/null
+          echo "control 3 ok: the long-double lint fires on code, ignores prose, and the tree is clean again"
+          # Control 4: the ARTIFACT half of law 9. It rests entirely on emscripten lowering binary128
+          # arithmetic to __*tf* libcalls; an emsdk that gained native f128, or that renamed the routines,
+          # would turn the gate off silently with every row green. This is what notices.
+          printf 'double f(const float*p,int n){long double s=0.0L;for(int i=0;i<n;++i)s+=p[i];return (double)s;}\n' > /tmp/ld.cpp
+          em++ -std=c++20 -O2 -fno-exceptions -fno-rtti -c /tmp/ld.cpp -o /tmp/ld.o
+          "$EMSDK/upstream/bin/llvm-nm" --undefined-only /tmp/ld.o | grep -qE ' U __(add|extend)[a-z0-9]*tf' \
+            || { echo "CONTROL FAILED: long double arithmetic no longer lowers to a tf libcall — the artifact gate is off"; exit 1; }
+          printf 'unsigned g(){return (unsigned)sizeof(long double);}\n' > /tmp/ldsz.cpp
+          em++ -std=c++20 -O2 -fno-exceptions -fno-rtti -c /tmp/ldsz.cpp -o /tmp/ldsz.o
+          if "$EMSDK/upstream/bin/llvm-nm" --undefined-only /tmp/ldsz.o | grep -qE ' U __[a-z0-9]*tf'; then
+            echo "CONTROL FAILED: sizeof(long double) alone now emits a libcall — the gate would false-positive on the ABI probe"; exit 1
+          fi
+          echo "control 4 ok: long double arithmetic still lowers to a tf libcall, and sizeof() alone still does not"
       - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
         # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
         # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns
