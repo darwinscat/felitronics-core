@@ -371,6 +371,117 @@ int main()
                   "a flushed meter still reads a sane integrated loudness (" + std::to_string (lufs) + " LUFS)");
     }
 
+    // --- F7: one non-finite sample must not silently freeze the meter, and must be REPORTED ---
+    // Before this, K-weighting being an IIR meant one NaN made its state NaN forever, every later block
+    // energy NaN, and `NaN > absT` false — so the absolute gate silently DROPPED all of them and the meter
+    // went on reporting a healthy, plausible number computed over the fraction of the programme that
+    // predates the NaN. Measured on a 5 s tone with one NaN at 1 s: 40 of 47 block energies non-finite,
+    // integrated still reading -12.0345. Nothing said so; droppedBlocks() counts capacity only.
+    test::group ("LoudnessMeter: a non-finite sample is survived AND counted");
+    {
+        const double fs = 48000.0; const int n = (int) (fs * 5.0);
+        std::vector<float> a ((size_t) n), b ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            a[(size_t) i] = b[(size_t) i] = (float) (0.25 * std::sin (6.283185307179586 * 1000.0 * i / fs));
+
+        auto run = [&] (int poisonAt, float value)
+        {
+            std::vector<float> l = a, r = b;
+            if (poisonAt >= 0) l[(size_t) poisonAt] = value;
+            analysis::LoudnessMeter m; m.prepare (fs, 2, 30.0);
+            for (int off = 0; off < n; off += 480)
+            {
+                const float* ch[2] { l.data() + off, r.data() + off };
+                m.process (ch, 2, std::min (480, n - off));
+            }
+            int bad = 0; for (double e : m.gatingBlockEnergies()) if (! std::isfinite (e)) ++bad;
+            struct R { double integrated, momentary; int badBlocks, total; unsigned long long counter; };
+            return R { m.integratedLufs(), m.momentaryLufs(), bad, m.gatingBlockCount(),
+                       (unsigned long long) m.nonFiniteSubHops() };
+        };
+
+        const auto clean = run (-1, 0.0f);
+        test::ok (clean.counter == 0 && clean.badBlocks == 0, "a clean stream counts nothing");
+
+        const auto nan = run ((int) fs, std::numeric_limits<float>::quiet_NaN());
+        test::ok (nan.counter == 1, "one NaN sample = exactly one poisoned sub-hop, reported");
+        // EVERY energy stays finite. Not because the event is hidden — it is in the counter — but because
+        // this vector is the tier's cross-toolchain bit-comparison surface, and a COMPUTED NaN is not
+        // portable: `inf - inf` is 0x7ff8000000000000 on arm64 and 0xfff8000000000000 on x86-64 (measured
+        // on this Mac against Debian/gcc 14.2). Storing it would make every block line differ by machine.
+        // Before the fix, 40 of 47 energies here were NaN — everything after the NaN.
+        test::ok (nan.badBlocks == 0, "no non-finite energy survives into the comparison surface (got "
+                                      + std::to_string (nan.badBlocks) + ")");
+        test::ok (nan.total == clean.total, "no blocks are lost");
+        test::ok (std::isfinite (nan.momentary) && nan.momentary < -5.0,
+                  "the live reading RECOVERS instead of sitting at -120 forever");
+        // Not bit-identical, and it must not be claimed so. The poisoned 10 ms is recorded as silence, which
+        // is 1/40 of a 400 ms gating block — 10*log10(39/40) = -0.11 dB on the blocks that overlap it, and
+        // a few thousandths of a dB once averaged over the programme. That error is BOUNDED and derivable.
+        //
+        // The comparison that matters is not "0.005 dB versus the old 3.6e-05 dB". The old error was
+        // UNBOUNDED: it depended entirely on where the NaN fell, because the reading was whatever the
+        // pre-NaN fraction happened to say. Put the NaN early and the old meter reported -120 — silence —
+        // for a loud programme. Both placements are checked below.
+        const double delta = std::fabs (nan.integrated - clean.integrated);
+        test::ok (delta < 0.02, "the integrated answer returns to within 0.02 dB of the clean one (delta "
+                                + std::to_string (delta) + " dB)");
+
+        const auto early = run (2000, std::numeric_limits<float>::quiet_NaN());   // before the first block closes
+        test::ok (std::fabs (early.integrated - clean.integrated) < 0.02,
+                  "and an EARLY NaN — where the old meter read -120 for a loud programme — is bounded too ("
+                  + std::to_string (std::fabs (early.integrated - clean.integrated)) + " dB)");
+        test::ok (early.counter == 1, "one early NaN, one counted sub-hop");
+        // A poisoned CHANNEL must not be able to zero a sub-hop through a zero weight: BS.1770 gives LFE
+        // w = 0, and `0 * NaN` is NaN, so the catch is per channel and not on the weighted sum.
+        analysis::LoudnessMeter mw; mw.prepare (fs, 2, 30.0);
+        mw.setChannelWeight (0, std::numeric_limits<double>::quiet_NaN());
+        std::vector<float> q = a;
+        const float* cw[2] { q.data(), b.data() };
+        mw.process (cw, 2, 48000);
+        test::ok (mw.nonFiniteSubHops() == 0, "a non-finite channel WEIGHT is refused, not stored");
+
+        const auto inf = run ((int) fs, std::numeric_limits<float>::infinity());
+        test::ok (inf.counter >= 1, "+inf is counted too");
+        test::ok (std::isfinite (inf.integrated), "+inf no longer reads as silence");
+
+        analysis::LoudnessMeter m2; m2.prepare (fs, 2, 30.0);
+        std::vector<float> l = a; l[100] = std::numeric_limits<float>::quiet_NaN();
+        const float* ch2[2] { l.data(), b.data() };
+        m2.process (ch2, 2, 48000);
+        test::ok (m2.nonFiniteSubHops() > 0, "counter is set");
+        m2.reset();
+        test::ok (m2.nonFiniteSubHops() == 0, "and reset() clears it");
+    }
+
+    // --- F7: +inf through the LRA histogram was UNDEFINED BEHAVIOUR, not merely a wrong answer ---
+    // An infinite short-term energy passes `inf >= absT`, makes the relative threshold infinite, then passes
+    // `inf >= inf`, and the bin index computes (int) inf. Reproduced on main under UBSan: "inf is outside the
+    // range of representable values of type 'int'", from ONE +inf sample aligned so its sub-hop is the last
+    // in a 3 s window. The clamp after the conversion is too late — the conversion itself is the UB. Healing
+    // the filter made this MORE reachable, not less, because the neighbouring energies are then finite.
+    // This case runs in the ubuntu-clang-asan-ubsan job, where a regression is a hard failure.
+    test::group ("LoudnessMeter: +inf cannot reach (int) in the LRA histogram");
+    {
+        const double fs = 48000.0; const int n = (int) (fs * 12.0);
+        for (const int pos : { 191520, 191760, 192000, 143520, 144000 })
+        {
+            std::vector<float> l ((size_t) n), r ((size_t) n);
+            for (int i = 0; i < n; ++i)
+                l[(size_t) i] = r[(size_t) i] = (float) (0.25 * std::sin (6.283185307179586 * 1000.0 * i / fs));
+            l[(size_t) pos] = std::numeric_limits<float>::infinity();
+            analysis::LoudnessMeter m; m.prepare (fs, 2, 60.0);
+            for (int off = 0; off < n; off += 480)
+            {
+                const float* ch[2] { l.data() + off, r.data() + off };
+                m.process (ch, 2, std::min (480, n - off));
+            }
+            const double lra = m.loudnessRangeLu();
+            test::ok (std::isfinite (lra) && lra >= 0.0,
+                      "LRA stays finite with +inf at sample " + std::to_string (pos));
+        }
+    }
+
     // --- correlation: identical → +1, inverted → -1, quadrature → ~0 ---
     test::group ("CorrelationMeter");
     {

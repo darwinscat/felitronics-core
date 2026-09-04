@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <span>
 #include <vector>
 
@@ -61,11 +62,17 @@ public:
         kw.reset();
         for (int c = 0; c < kMaxChannels; ++c) subSumSq[c] = 0.0;
         subCount = 0; subWrite = 0; subFilled = 0; subInHop = 0; blockCount = 0; droppedBlocks_ = 0;
+        nonFiniteSubHops_ = 0;
         stCount = 0; stSince = 0;
         std::fill (subRing.begin(), subRing.end(), 0.0);
     }
 
-    void setChannelWeight (int c, double weight) noexcept { if (c >= 0 && c < kMaxChannels) w[c] = weight; }
+    // Non-finite is refused, not stored: `w[c] * energy` would make every sub-hop non-finite from a
+    // CONFIGURATION mistake, which no amount of healing downstream can undo. House rule for params.
+    void setChannelWeight (int c, double weight) noexcept
+    {
+        if (c >= 0 && c < kMaxChannels && std::isfinite (weight)) w[c] = weight;
+    }
 
     void process (const float* const* channels, int numChannels, int n) noexcept
     {
@@ -88,8 +95,27 @@ public:
     // block sizes prepare() for its longest program and checks this reads 0.
     int droppedBlocks() const noexcept { return droppedBlocks_; }
 
+    // Completed 10 ms sub-hops whose channel-weighted mean square came out NON-FINITE — the damage counter,
+    // and the reason the readings above may be believed or may not. STICKY until reset()/prepare(): a live
+    // display recovers within a few hundred ms (the K-weighting state is healed at each sub-hop boundary),
+    // but the whole-programme integrated and LRA answers are compromised for good, so anything non-zero
+    // means "this number is best effort, not a measurement".
+    //
+    // Why the SUB-HOP is the unit and not the 400 ms gating block: the sub-hop is the first energy boundary
+    // that does not depend on how the caller chunks its calls, and one poisoned sub-hop fans out into
+    // exactly FOUR overlapping gating blocks (the 400 ms window advances every 100 ms), so a block counter
+    // would report one event four times. It counts non-finite ENERGY, not bad input samples — a non-finite
+    // channel weight would land here too, and healing the filter cannot heal a poisoned configuration.
+    //
+    // uint64 and saturating: at 100 sub-hops a second a plain int overflows — UB — in about 249 days of
+    // continuous poison, and the one invariant this counter must keep is that non-zero never becomes zero
+    // again before reset().
+    std::uint64_t nonFiniteSubHops() const noexcept { return nonFiniteSubHops_; }
+
     // The 400 ms gating blocks' K-weighted mean-square energies, in arrival order, exactly as finishHop()
-    // recorded them — BEFORE either gate. This is what a cross-toolchain bit-exactness check compares:
+    // recorded them — BEFORE either gate. Always FINITE: a sub-hop whose K-weighted energy came out
+    // non-finite is recorded as silence and counted in nonFiniteSubHops(), so this vector stays a portable
+    // bit-comparison surface (a computed NaN would not be — its sign bit differs between arm64 and x86-64). This is what a cross-toolchain bit-exactness check compares:
     // integratedLufs() is DISCONTINUOUS in these energies (a block landing within ~1e-12 of a gate flips its
     // inclusion and moves the reading by ~0.01 dB), so it cannot carry a bit-identity claim, while the vector
     // itself is continuous in the input samples and can. Raw energy, not dB, deliberately — a dB accessor
@@ -129,8 +155,31 @@ private:
         // arrears can never exceed 10 ms of audio at any rate, and the cost is ~100 flushes a second.
         kw.flushDenormals();
 
-        double subMS = 0.0;
-        for (int c = 0; c < nc; ++c) subMS += w[c] * (subSumSq[c] / (double) subSamples);
+        // Non-finite energy is caught HERE — the first place it exists — per CHANNEL, and the poisoned
+        // channel's 10 ms is recorded as silence rather than propagated.
+        //
+        // Per channel, not on the sum, because BS.1770 gives LFE w = 0 and `0 * NaN` is NaN: one excluded
+        // channel would otherwise poison a sub-hop whose audible channels were perfectly fine.
+        //
+        // Recorded as 0.0 and NOT kept raw, which is the part that looks wrong and is not. Keeping the
+        // poison would read as the honest choice — gatingBlockEnergies() is the forensic surface — but that
+        // surface is ALSO the tier's cross-toolchain bit-exactness comparison, and a computed NaN is not
+        // portable: `inf - inf` (which is what +inf input produces inside the biquad) is 0x7ff8000000000000
+        // on arm64 and 0xfff8000000000000 on x86-64 — measured on this Mac against Debian/gcc 14.2, and the
+        // sign bit alone makes every block line differ between machines. A NaN that ARRIVED as input carries
+        // its payload identically on both, which is exactly why the old pinned test never showed this.
+        // Zero is canonical, and the event is not lost: it is in nonFiniteSubHops(). The cost is bounded and
+        // derivable — a zeroed sub-hop is 1/40 of a gating block, so 10*log10(39/40) = -0.11 dB on that
+        // block, and nothing on the rest of the programme.
+        double subMS = 0.0; bool poisoned = false;
+        for (int c = 0; c < nc; ++c)
+        {
+            const double e = subSumSq[c];              // NaN*NaN or inf*inf — any bad sample lands here
+            if (! std::isfinite (e)) { poisoned = true; continue; }
+            subMS += w[c] * (e / (double) subSamples);
+        }
+        if (poisoned && nonFiniteSubHops_ != ~std::uint64_t {}) ++nonFiniteSubHops_;
+        if (! std::isfinite (subMS)) { subMS = 0.0; if (! poisoned && nonFiniteSubHops_ != ~std::uint64_t {}) ++nonFiniteSubHops_; }
         subRing[(std::size_t) subWrite] = subMS;
         subWrite = (subWrite + 1) % kSubRing;
         if (subFilled < kSubRing) ++subFilled;
@@ -173,11 +222,16 @@ private:
         if (blockCount <= 0) return -120.0;
         const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);               // energy for -70 LUFS
         double sum = 0.0; int cnt = 0;
-        for (int j = 0; j < blockCount; ++j) if (blockE[(std::size_t) j] > absT) { sum += blockE[(std::size_t) j]; ++cnt; }
+        // isfinite FIRST, at every gate. `NaN > absT` is already false, but `+inf > absT` is TRUE, and one
+        // +inf energy then poisons `sum`, makes relT infinite, and the second gate admits nothing — the
+        // −120 "reads as silence" lie. Healing the filter makes this MORE reachable, not less: with the
+        // state repaired at the next sub-hop the surrounding energies are finite, so a single infinity can
+        // sit alone in a window instead of being swamped by NaNs.
+        for (int j = 0; j < blockCount; ++j) { const double z = blockE[(std::size_t) j]; if (std::isfinite (z) && z > absT) { sum += z; ++cnt; } }
         if (cnt == 0) return -120.0;
         const double relT = 0.1 * (sum / cnt);                                     // -10 LU relative to the abs-gated mean
         double s2 = 0.0; int c2 = 0;
-        for (int j = 0; j < blockCount; ++j) { const double z = blockE[(std::size_t) j]; if (z > absT && z > relT) { s2 += z; ++c2; } }
+        for (int j = 0; j < blockCount; ++j) { const double z = blockE[(std::size_t) j]; if (std::isfinite (z) && z > absT && z > relT) { s2 += z; ++c2; } }
         return c2 > 0 ? lufsOf (s2 / c2) : -120.0;
     }
 
@@ -189,7 +243,12 @@ private:
         if (stCount <= 0) return 0.0;
         const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);                // energy for −70 LUFS
         double sum = 0.0; int cnt = 0;
-        for (int j = 0; j < stCount; ++j) if (stE[(std::size_t) j] >= absT) { sum += stE[(std::size_t) j]; ++cnt; }
+        // isfinite first here too, and here it is not merely a wrong answer but UNDEFINED BEHAVIOUR: an
+        // infinite short-term energy passes `inf >= absT`, makes relT infinite, then passes `inf >= inf`,
+        // and the histogram index below computes (int) inf. Reproduced on main with UBSan — "inf is outside
+        // the range of representable values of type 'int'" — from ONE +inf input sample, aligned so its
+        // sub-hop is the last in a 3 s window. The clamp two lines down is too late: the conversion is the UB.
+        for (int j = 0; j < stCount; ++j) { const double e = stE[(std::size_t) j]; if (std::isfinite (e) && e >= absT) { sum += e; ++cnt; } }
         if (cnt == 0) return 0.0;
         const double relT = 0.01 * (sum / cnt);                                     // −20 LU relative (energy ×0.01)
 
@@ -198,7 +257,7 @@ private:
         for (int j = 0; j < stCount; ++j)
         {
             const double e = stE[(std::size_t) j];
-            if (e >= absT && e >= relT)                                             // ≥ gates (libebur128-faithful)
+            if (std::isfinite (e) && e >= absT && e >= relT)                        // ≥ gates (libebur128-faithful)
             {
                 int b = (int) ((lufsOf (e) + 70.0) * 10.0);                         // 0.1 LU bins from −70 LUFS
                 b = b < 0 ? 0 : (b >= kBins ? kBins - 1 : b);
@@ -225,6 +284,7 @@ private:
     int subWrite = 0, subFilled = 0, subInHop = 0;
     std::vector<double> blockE;
     int blockCount = 0, droppedBlocks_ = 0;
+    std::uint64_t nonFiniteSubHops_ = 0;   // sticky until reset()/prepare() — see the accessor
     std::vector<double> stE;                                                        // 3 s short-term energies @1 s (LRA)
     int stCount = 0, stSince = 0;
 };
