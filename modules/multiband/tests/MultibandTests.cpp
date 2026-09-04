@@ -102,6 +102,34 @@ int main()
     }
 
     // --- latency follows the max per-band lookahead ---
+    // --- LAW 8: the crossover state must not park in the subnormals on silence ---
+    // MultibandSplitter has offered flushDenormals() since it was written and nothing in this module ever
+    // called it, so the crossover SVFs decayed into the subnormal range on silence and stayed there — the
+    // per-band Compressor flushes itself, which is exactly why nobody noticed. Found while fixing the same
+    // law's violation in analysis::KWeightingFilter.
+    test::group ("MultibandProcessor: law 8 — the crossover flushes on silence");
+    {
+        const double fs = 48000.0; const int n = 512;
+        multiband::MultibandCompressor<4> mb;
+        mb.prepare (fs, n, 2);
+        std::vector<float> l ((std::size_t) n), r ((std::size_t) n);
+        float* io[2] { l.data(), r.data() };
+
+        for (int b = 0; b < 94; ++b)                       // ~1 s of noise, then ~2 s of digital silence
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = (b < 94 / 3) ? (float) (0.5 * std::sin (6.283185307179586 * 220.0 * (b * n + i) / fs)) : 0.0f;
+                l[(std::size_t) i] = r[(std::size_t) i] = v;
+            }
+            mb.process (io, 2, n);
+        }
+        // With the flush the tail is EXACTLY zero; without it the crossover keeps emitting a subnormal.
+        double maxOut = 0.0;
+        for (int i = 0; i < n; ++i) maxOut = std::max (maxOut, (double) std::fabs (l[(std::size_t) i]));
+        test::ok (maxOut == 0.0, "the split/recombined tail is exactly zero after silence, not a subnormal");
+    }
+
     test::group ("MultibandCompressor latency");
     {
         multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 2, 5.0); mc.setNumBands (3);

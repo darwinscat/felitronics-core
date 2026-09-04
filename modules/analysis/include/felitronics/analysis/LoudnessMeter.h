@@ -118,6 +118,17 @@ private:
 
     void finishSubHop (int nc) noexcept
     {
+        // LAW 8 lives HERE, not at the end of process(), and the difference is not cosmetic. This boundary
+        // is a deterministic 10 ms of AUDIO (lround(0.01*fs) samples); the end of process() is wherever the
+        // caller happened to cut the stream. Flushing there would make the numbers depend on the host's
+        // block size, and this repo claims — and tests — that they do not (tools/tests/ProbeTests.cpp:212,
+        // bit-exact across call sizes 1 … 100 003). It also fails outright at low rates: the probe accepts
+        // 1 kHz, where a single 8192-sample call spans 8.2 s. And the interval to beat is not the RLB's
+        // 2.85 s but the SHELF's 90 ms (4 324 samples at 48 kHz) — 8192 samples is already 170 ms, so a
+        // per-host-block flush would let the shelf sit subnormal for half of every silent block. Here the
+        // arrears can never exceed 10 ms of audio at any rate, and the cost is ~100 flushes a second.
+        kw.flushDenormals();
+
         double subMS = 0.0;
         for (int c = 0; c < nc; ++c) subMS += w[c] * (subSumSq[c] / (double) subSamples);
         subRing[(std::size_t) subWrite] = subMS;
