@@ -5,12 +5,31 @@
 
 **Status:** draft / in progress · **Owner:** Darwin's Cat (Felitronics line) · **Started:** 2026-06.
 
-> **🔴 #1 open performance debt.** The core ships only a scalar FFT backend (`ScalarRadix2Real` =
-> `DefaultRealFft`, `core/Fft.h:145`) and a scalar `O(P)` direct-head FIR in the partitioned convolvers,
-> so long-convolution cost **explodes at host block 2048+**. Latent for shipped OrbitCab (its IR cab uses
-> `juce::dsp::Convolution`); a **blocker** for `convolution` / `lineareq` products. Full analysis, fix
-> plan and acceptance criteria (perf at 2048+, not just a null-match):
-> [`PERF-SCALAR-FFT-BOTTLENECK.md`](PERF-SCALAR-FFT-BOTTLENECK.md).
+> **Convolution performance — two different debts, and neither is the one this box used to describe.**
+>
+> **✅ CLOSED in v0.4.0 (PRs #23–#26) — the scalar-FFT / block-explosion debt.** It was never "the default
+> backend is scalar"; it was that scalar was the *only* backend and that the convolver's partition was tied
+> to the host block. Both are gone: a SIMD **pffft** `RealFftBackend` ships as the optional compiled module
+> `felitronics::fftpffft` (`-DFELITRONICS_WITH_PFFFT=ON`) behind the existing template seam, and the
+> partition is decoupled from the host block. Long-convolution cost is now **block-INDEPENDENT** — a
+> 131072-tap linear-phase EQ costs ~2.0 %RT at *every* host block, against ~39 %RT at block 8192 before.
+> (`DefaultRealFft` is still `ScalarRadix2Real`, `core/Fft.h:233` — that is the seam's zero-dependency
+> default, which is the point of a seam.) [`PERF-SCALAR-FFT-BOTTLENECK.md`](PERF-SCALAR-FFT-BOTTLENECK.md).
+>
+> **🟢 ACCEPTANCE MET — convolver CPU vs `juce::dsp::Convolution`.** The successor item, and now delivered
+> in full: `MatrixConvolverNupc` (non-uniform / Gardner — a 128-sample time-domain head plus geometrically
+> growing overlap-save FFT tail stages) is **complete**, with every topology (mono / LRDiag / MSDiag / Full)
+> and the click-free 2-slot smoothstep warm crossfade, and `lineareq`'s linear- and natural-phase EQs
+> convolve on it. Flat ~0.8 %RT at every block, **3–9× cheaper than JUCE at the 64–128 blocks live rigs
+> run**, 2.4× cheaper than v0.4.0, true sample-zero-latency, NULL-verified.
+>
+> **🟡 What is actually still open** is one named thing, not the item as a whole: the **worst-buffer spike**
+> — all stages' FFTs coincide every `lcm = B_max` samples (7.8 % @ block 64 for `B_max=4096`; `B_max=2048`
+> is the default because it halves the spike at the same mean). Time-distributing the large FFTs over their
+> deadline is the RT-hardening that closes it. Separately and permanently NOT a goal: JUCE stays cheaper on
+> the *mean* at large oracle-tuned blocks — that is a theorem, the price of near-field zero-latency
+> coverage, not a gap to chase. [`PERF-CONVOLVER-JUCE-GAP.md`](PERF-CONVOLVER-JUCE-GAP.md) ·
+> [`PERF-NUPC-VS-JUCE.md`](PERF-NUPC-VS-JUCE.md).
 
 `felitronics-core` is a **shared, framework-agnostic, JUCE-free DSP core** for the whole product
 family. One set of battle-tested, real-time-safe DSP primitives that every product builds on:
