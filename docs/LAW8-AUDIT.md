@@ -91,8 +91,12 @@ be true at once:
 
 The rationale is retracted rather than edited, because the NULL it appealed to never tested the claim
 either way: scenario 4's 1e-20 block is absorbed to exact zero by the Asym bias (`−0.3f + 1e-20f == −0.3f`;
-`ulp(0.3) = 3e-8`), so the fixture never puts a tiny *finite* value into that state. Four threshold
-variants were built against it and all 194 checks pass in every one. The threshold chosen is **1e-30f**,
+`ulp(0.3) = 3e-8`), so the fixture never puts a tiny *finite* value into that state. Verified rather
+than assumed: three threshold variants were built against it — per-sample 1e-30f, per-sample 1e-15f,
+per-call 1e-15f — and all **197** checks of the three saturation suites pass in every one, so the
+fixture does not discriminate the threshold at all. (194 before this document's own law-8 test added
+three; if you reproduce this, count what your tree has rather than trusting the figure.) The threshold
+chosen is **1e-30f**,
 on the margin argument alone: 8 decades above the float subnormal floor, ~600 dB below anything audible.
 The flush is applied **per sample, not per call** — a threshold at the end of a call would put a numerical
 event wherever the *caller* cut the stream, which is exactly the chunk-invariance argument from

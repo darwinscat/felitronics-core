@@ -5,6 +5,11 @@
 JUCE-free, RT-safe, mostly header-only C++20 DSP. Optional compiled backends stay OFF by default,
 and the suite is also green under ASan+UBSan. Full design: [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md).
 
+**Before adding or changing a kernel that carries state**, read
+[`LAW8-AUDIT.md`](LAW8-AUDIT.md) — every recursive kernel in the repo has a verdict there, including
+the ones that are clean and why, plus the six-question checklist for a new one. It exists because the
+same audit had been started three times.
+
 ## Foundations (building blocks)
 
 | Module | What | Key types |
