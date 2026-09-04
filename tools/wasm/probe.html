@@ -34,13 +34,10 @@
 <pre id="out">pick a .f32 file…</pre>
 
 <script src="./build/fcprobe.web.js"></script>
-<script>
-const $ = (id) => document.getElementById(id);
-const bitsOf = (() => {
-    const dv = new DataView(new ArrayBuffer(8));
-    return (x) => { dv.setFloat64(0, x, true); return dv.getBigUint64(0, true).toString(16).padStart(16, '0'); };
-})();
+<script type="module">
+import { formatBlocks } from './blocks-format.mjs';
 
+const $ = (id) => document.getElementById(id);
 $('env').textContent =
     `crossOriginIsolated : ${self.crossOriginIsolated}   <- false proves no COOP/COEP was needed\n` +
     `SharedArrayBuffer   : ${typeof SharedArrayBuffer === 'undefined' ? 'undefined (unavailable)' : 'defined'}\n` +
@@ -83,12 +80,14 @@ $('file').addEventListener('change', async (ev) => {
     // which would detach a held view. Depending on statement order for correctness is how this bug ships.
     const e = new Float64Array(M.HEAPF64.subarray(outPtr >>> 3, (outPtr >>> 3) + written));
 
-    const lines = [];
-    lines.push(`# fcore blocks v1 sr=${sr} ch=${ch} os=${M._fc_probe_os_factor()}x${M._fc_probe_os_taps()} chunk=${M._fc_probe_chunk()}`);
-    lines.push(`tp ${bitsOf(M._fc_probe_tp_linear())}`);
-    lines.push(`blocks ${written}`);
-    for (let i = 0; i < Math.min(written, 8); ++i) lines.push(bitsOf(e[i]));
-    if (written > 8) lines.push(`… ${written - 8} more (diff the full stream against fcore_measure blocks)`);
+    // The SAME formatter the node harness uses, so the page cannot drift out of the format a diff compares.
+    const preview = formatBlocks({
+        sr, ch,
+        osFactor: M._fc_probe_os_factor(), osTaps: M._fc_probe_os_taps(), chunk: M._fc_probe_chunk(),
+        tp: M._fc_probe_tp_linear(), sp: M._fc_probe_sample_peak(),
+        energies: e, count: Math.min(written, 8),
+    }).trimEnd();
+    const tail = written > 8 ? `\n… ${written - 8} more (diff the full stream against fcore_measure blocks)` : '';
 
     const lufs = M._fc_probe_lufs(ptr, frames, ch, sr);
     const dbtp = M._fc_probe_dbtp(ptr, frames, ch, sr);
@@ -98,6 +97,6 @@ $('file').addEventListener('change', async (ev) => {
         `frames ${frames} x ${ch} ch @ ${sr} Hz   (${(performance.now() - t0).toFixed(0)} ms)\n` +
         `integrated  ${lufs.toFixed(6)} LUFS\n` +
         `true peak   ${dbtp.toFixed(6)} dBTP\n\n` +
-        lines.join('\n');
+        preview + tail;
 });
 </script>

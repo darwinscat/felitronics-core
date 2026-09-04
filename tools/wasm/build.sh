@@ -71,12 +71,9 @@ echo "  node $b"
 
 echo
 echo "=== no threads, proven from the artifact rather than from the page loading"
-echo -n "  shared memory in the wasm: "
-if command -v wasm-objdump >/dev/null; then wasm-objdump -x "$OUT/fcprobe.web.wasm" | grep -i "memories:" -A2 | head -3; else echo "(wasm-objdump absent — see the glue scan below)"; fi
-for pat in SharedArrayBuffer pthread 'new Worker' Atomics; do
-    n=$(grep -c "$pat" "$OUT/fcprobe.web.js" || true)
-    printf "  %-18s occurrences in glue: %s\n" "$pat" "$n"
-done
+# Parses the wasm memory section directly, so this checks something on every machine — the earlier
+# wasm-objdump step silently checked NOTHING wherever that tool was not installed, which is most machines.
+node "$HERE/check-no-threads.mjs" "$OUT/fcprobe.web.wasm" "$OUT/fcprobe.web.js"
 
 echo
 echo "=== size (acceptance criterion 2)"

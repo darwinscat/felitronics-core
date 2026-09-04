@@ -17,6 +17,7 @@
 // ever held across a call: `Module.HEAPF32` is re-read immediately before every use, results come back as
 // return values rather than through a view, and the output buffer is read only after the run has finished.
 
+import { formatBlocks } from './blocks-format.mjs';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
@@ -28,11 +29,6 @@ if (!rawPath) {
 }
 const sr = Number(srArg);
 const ch = Number(chArg);
-
-const bitsOf = (() => {
-    const dv = new DataView(new ArrayBuffer(8));
-    return (x) => { dv.setFloat64(0, x, true); return dv.getBigUint64(0, true).toString(16).padStart(16, '0'); };
-})();
 
 const require = createRequire(import.meta.url);
 const createFcProbe = require(resolve(modPath));
@@ -75,12 +71,11 @@ const energies = new Float64Array(M.HEAPF64.subarray(outPtr >>> 3, (outPtr >>> 3
 const tp = M._fc_probe_tp_linear();
 const dropped = M._fc_probe_dropped();
 
-let out = `# fcore blocks v1 sr=${bitsOf(sr)} ch=${ch} os=${M._fc_probe_os_factor()}x${M._fc_probe_os_taps()} chunk=${M._fc_probe_chunk()}\n`;
-out += `tp ${bitsOf(tp)}\n`;
-out += `sp ${bitsOf(M._fc_probe_sample_peak())}\n`;
-out += `blocks ${written}\n`;
-for (let i = 0; i < written; ++i) out += bitsOf(energies[i]) + '\n';
-process.stdout.write(out);
+process.stdout.write(formatBlocks({
+    sr, ch,
+    osFactor: M._fc_probe_os_factor(), osTaps: M._fc_probe_os_taps(), chunk: M._fc_probe_chunk(),
+    tp, sp: M._fc_probe_sample_peak(), energies,
+}));
 
 if (dropped !== 0) console.error(`warning: ${dropped} gating blocks dropped`);
 if (process.argv.includes('--debug'))
