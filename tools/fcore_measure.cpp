@@ -147,12 +147,12 @@ int main (int argc, char** argv)
         // Emitted as raw IEEE-754 bit patterns, not %a and not decimal: the other side of this comparison is
         // JavaScript, which has no hex-float printing and whose decimal formatting is not C's. A 16-hex-digit
         // pattern is the one representation both sides produce identically, so `diff` IS the parity test.
-        const int     n = probe.gatingBlockCount();
-        const double* e = probe.gatingBlockEnergies();
+        const auto e = probe.gatingBlockEnergies();
+        const int    n = (int) e.size();
         // The rate goes out as a bit pattern too, not as text: C's %g and JavaScript's Number-to-string do
         // not agree on a fractional rate (48000.123456 prints as 48000.12346 at ten significant digits), so a
         // decimal header would break the whole-file diff while every measured bit matched.
-        std::printf ("# fcore blocks v1 sr=%016llx ch=%d os=%dx%d chunk=%d\n",
+        std::printf ("# fcore blocks v2 sr=%016llx ch=%d os=%dx%d chunk=%d\n",
                      (unsigned long long) bits (fs), nc, fcore::Probe::kOsFactor, fcore::Probe::kOsTapsPerPhase, kChunk);
         std::printf ("tp %016llx\n", (unsigned long long) bits (probe.truePeakLinear()));
         std::printf ("sp %016llx\n", (unsigned long long) bits (probe.samplePeakLinear()));

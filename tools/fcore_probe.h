@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <span>
 #include <vector>
 
 namespace fcore
@@ -50,13 +51,11 @@ public:
     // kChunk*4 floats — 128 KB — not 4*frames, which would be 247 MB for a 5-minute stereo track on wasm32).
     // Chunking cannot change the arithmetic: LoudnessMeter::process() does identical per-sample work for any
     // n, and the oversampler's ring history makes upsample() a pure function of the samples seen so far —
-    // verified bit-identical for chunk sizes 1 … 1e6.
+    // verified bit-identical for chunk sizes 1 … 100003.
     static constexpr int kChunk         = 8192;
     static constexpr int kOsFactor      = 4;    // \ the true-peak filter this tool is the REFERENCE for;
     static constexpr int kOsTapsPerPhase = 32;  // / see the header comment before changing either
 
-    // maxDurationSec sizes the meter's gating-block store. The default holds 4 h at any rate (1.27 MB) —
-    // droppedBlocks() reads 0 for anything shorter, and a caller checks it rather than assuming.
     // Audio sample rates, bounded to a range the downstream arithmetic survives. "Positive and finite" is NOT
     // enough: LoudnessMeter sizes its hop with `lround(0.01*fs)` into an int and its block store with
     // `ceil(maxDurationSec*fs)`, so an absurd-but-finite rate (1e300, or Number.MIN_VALUE from a page)
@@ -65,6 +64,8 @@ public:
     static constexpr double kMinSampleRate = 1000.0;
     static constexpr double kMaxSampleRate = 768000.0;
 
+    // maxDurationSec sizes the meter's gating-block store. The default holds 4 h at any rate (1.27 MB) —
+    // droppedBlocks() reads 0 for anything shorter, and a caller checks it rather than assuming.
     bool prepare (double sampleRate, int channels, double maxDurationSec = 4.0 * 3600.0)
     {
         prepared_ = false;
@@ -137,10 +138,10 @@ public:
     {
         if (! prepared_ || finished_) return;
         finished_ = true;
-        std::vector<float> zeros ((std::size_t) kOsTapsPerPhase, 0.0f);
+        float zeros[kOsTapsPerPhase] {};                  // fixed: prepare() does all allocation
         for (int c = 0; c < nc_; ++c)
         {
-            const float* in[1] { zeros.data() };
+            const float* in[1] { zeros };
             float*       out[1] { osBuf_.data() };
             os_[(std::size_t) c].upsample (in, 1, kOsTapsPerPhase, out);
             const int upN = kOsTapsPerPhase * kOsFactor;
@@ -151,7 +152,7 @@ public:
 
     // --- what a cross-toolchain check compares (continuous in the input samples) ---
     int           gatingBlockCount()    const noexcept { return lm_.gatingBlockCount(); }
-    const double* gatingBlockEnergies() const noexcept { return lm_.gatingBlockEnergies(); }
+    std::span<const double> gatingBlockEnergies() const noexcept { return lm_.gatingBlockEnergies(); }
 
     // The true peak is never below the SAMPLE peak: the reconstructed signal passes through the samples by
     // construction. Enforcing that as a floor costs nothing and makes a whole class of filter-side mistake
@@ -161,7 +162,14 @@ public:
 
     // --- what a human reads (derived; routed through log10, so not the bit-exactness surface) ---
     double integratedLufs() const noexcept { return lm_.integratedLufs(); }
-    double truePeakDb()     const noexcept { return 20.0 * std::log10 (maxTp_ > 1e-9 ? maxTp_ : 1e-9); }
+    // The dB of truePeakLinear(), NOT of the oversampler maximum: the two differ whenever the sample peak
+    // is the larger of the two (a lone impulse, anything ending abruptly), and a tool whose dB and linear
+    // answers disagree is worse than one that is merely wrong.
+    double truePeakDb()     const noexcept
+    {
+        const double tp = truePeakLinear();
+        return 20.0 * std::log10 (tp > 1e-9 ? tp : 1e-9);
+    }
     int    droppedBlocks()  const noexcept { return lm_.droppedBlocks(); }
 
 private:

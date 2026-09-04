@@ -399,10 +399,10 @@ int main()
         feedSine (lm, sr, kToneHz, -20.0, 3.0, idx);
         feedSine (lm, sr, kToneHz, -35.0, 3.0, idx);           // quiet enough for the relative gate to drop it
 
-        const int     n = lm.gatingBlockCount();
-        const double* e = lm.gatingBlockEnergies();
+        const auto e = lm.gatingBlockEnergies();
+        const int    n = (int) e.size();
         test::ok (n == 57, "6 s → one 400 ms block per 100 ms hop, the first at 400 ms (60 hops less 3)");
-        test::ok (e != nullptr, "and the vector is reachable");
+        test::ok (e.size() == (std::size_t) n && ! e.empty(), "the span carries exactly the recorded blocks");
 
         const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);        // energy for −70 LUFS
         double s1 = 0.0; int c1 = 0;

@@ -104,7 +104,8 @@ namespace
     {
         Surface s;
         s.tp = p.truePeakLinear();
-        s.blocks.assign (p.gatingBlockEnergies(), p.gatingBlockEnergies() + p.gatingBlockCount());
+        const auto e = p.gatingBlockEnergies();
+        s.blocks.assign (e.begin(), e.end());
         return s;
     }
 
@@ -198,7 +199,8 @@ int main()
             for (float v : prog[(std::size_t) c]) legacySamplePeak = std::max (legacySamplePeak, (double) std::fabs (v));
 
         Surface legacy; legacy.tp = std::max (maxTp, legacySamplePeak);
-        legacy.blocks.assign (lm.gatingBlockEnergies(), lm.gatingBlockEnergies() + lm.gatingBlockCount());
+        const auto le = lm.gatingBlockEnergies();
+        legacy.blocks.assign (le.begin(), le.end());
 
         const Surface viaProbe = runChunked (prog, sr, nc, 0, /*drain*/ false);
         test::ok (legacy.blocks.size() > 40, "the fixture produced a meaningful number of gating blocks");
@@ -399,6 +401,70 @@ int main()
         }
     }
 
+    // --- The dB form and the linear form must be the same number. They were not: truePeakDb() was computed
+    //     from the oversampler maximum while truePeakLinear() applied the sample-peak floor, so the two
+    //     disagreed on exactly the signals the floor exists for. Caught in review; pinned here. ---
+    test::group ("truePeakDb() is the dB of truePeakLinear(), including on the signals where the floor bites");
+    {
+        for (const bool endOnTransient : { false, true })
+        {
+            std::vector<float> s (4096, 0.0f);
+            s[endOnTransient ? s.size() - 1 : 2048] = 1.0f;      // a lone impulse: the floor is the answer
+            fcore::Probe p; p.prepare (48000.0, 1);
+            const float* io[1] { s.data() };
+            p.process (io, 1, (long long) s.size());
+            p.finish();
+            test::approx (p.truePeakDb(), 20.0 * std::log10 (p.truePeakLinear()), 1e-12,
+                          endOnTransient ? "impulse at the very end" : "impulse mid-buffer");
+        }
+    }
+
+    // --- The drain length must actually be enough to empty the ring, not merely "enough in practice". ---
+    test::group ("finish() drains the whole ring: one more zero would add nothing");
+    {
+        std::vector<float> s (2048, 0.0f);
+        s[s.size() - 1] = 1.0f;
+        const float* io[1] { s.data() };
+
+        fcore::Probe drained; drained.prepare (48000.0, 1);
+        drained.process (io, 1, (long long) s.size());
+        drained.finish();
+
+        // The same signal followed by MORE silence than finish() pushes must reach the same answer: if 32
+        // zeros left anything in the filter, the longer tail would find it.
+        std::vector<float> padded = s; padded.resize (s.size() + 4 * fcore::Probe::kOsTapsPerPhase, 0.0f);
+        fcore::Probe longer; longer.prepare (48000.0, 1);
+        const float* io2[1] { padded.data() };
+        longer.process (io2, 1, (long long) padded.size());
+        longer.finish();
+
+        test::approx (drained.truePeakLinear(), longer.truePeakLinear(), 0.0,
+                      "32 zeros flush the 32-sample ring exactly — four times as many find nothing more");
+    }
+
+    // --- The wasm shim keeps ONE Probe and re-prepares it per call, so a stale byte between runs would be a
+    //     silent, cross-file corruption. Prove re-prepare is a real reset at the Probe level. ---
+    test::group ("re-prepare is a clean reset: A → B → A reproduces A exactly");
+    {
+        const Planar a = makeProgram (48000.0, 2, 3.0);
+        const Planar b = makeProgram (44100.0, 1, 2.0);
+
+        fcore::Probe p;
+        auto runOn = [&p] (const Planar& prog, double sr, int nc)
+        {
+            p.prepare (sr, nc);
+            const auto base = ptrs (prog);
+            p.process (base.data(), nc, (long long) prog[0].size());
+            p.finish();
+            return surfaceOf (p);
+        };
+
+        const Surface first  = runOn (a, 48000.0, 2);
+        (void)                 runOn (b, 44100.0, 1);
+        const Surface again  = runOn (a, 48000.0, 2);
+        test::ok (first == again, "a different rate and channel count in between left nothing behind");
+    }
+
     // --- Non-finite SAMPLES. Documenting what actually happens, because the honest answer is unpleasant and
     //     a future reader must not mistake silence for safety. ---
     test::group ("non-finite samples: the documented (unpleasant) behaviour");
@@ -446,6 +512,44 @@ int main()
         test::ok (p.droppedBlocks() == 0, "and droppedBlocks() does NOT report them (it counts capacity only)");
     }
 
+    // --- +inf is not NaN and does not behave like it. Worth its own group, because the loudness answer it
+    //     produces is the most misleading one this code can emit: it reads as SILENCE. ---
+    test::group ("+inf samples: the failure mode that reads as silence");
+    {
+        const double inf = std::numeric_limits<float>::infinity();
+        {
+            // +inf before the first gating block closes: every block that ever forms is NaN (the K-weighting
+            // IIR is poisoned from that sample on), all are dropped by the absolute gate, and the meter has
+            // nothing left to average — so it answers −120, the sentinel that means "silence".
+            fcore::Probe p; p.prepare (48000.0, 1);
+            std::vector<float> s (48000, 0.5f);
+            s[1000] = (float) inf;
+            const float* io[1] { s.data() };
+            p.process (io, 1, (long long) s.size());
+            p.finish();
+            test::approx (p.integratedLufs(), -120.0, 1e-12,
+                          "a loud signal containing one +inf reads as SILENCE, not as an error");
+            test::ok (std::isinf (p.truePeakDb()) || p.truePeakDb() > 100.0,
+                      "while the true peak reports the infinity honestly");
+        }
+        {
+            // +inf after real program has been measured: the earlier blocks survive, the later ones are
+            // dropped, and the reading freezes at whatever the pre-inf material said.
+            fcore::Probe p; p.prepare (48000.0, 1);
+            std::vector<float> good (48000, 0.5f);
+            const float* g[1] { good.data() };
+            p.process (g, 1, (long long) good.size());
+            const double before = p.integratedLufs();
+            std::vector<float> bad (48000, 0.5f);
+            bad[100] = (float) inf;
+            const float* b[1] { bad.data() };
+            p.process (b, 1, (long long) bad.size());
+            p.process (g, 1, (long long) good.size());
+            test::ok (std::isfinite (p.integratedLufs()), "the reading stays finite and plausible");
+            test::ok (sameBits (p.integratedLufs(), before), "and frozen at the pre-inf value");
+        }
+    }
+
     // --- The gating-block cadence, at every rate the family plausibly meets. Also the evidence table for the
     //     escalated cross-tier determinism question, which is about rates. ---
     test::group ("gating-block cadence holds at every rate");
@@ -471,28 +575,37 @@ int main()
         test::ok (fcore::Probe::kOsFactor == 4, "4× oversampling, as the reference tool has always used");
         test::ok (fcore::Probe::kOsTapsPerPhase == 32, "32 taps/phase — a 128-tap prototype");
 
+        // A 12 kHz sine phased to miss the sample crests: the classic inter-sample-peak fixture, and the one
+        // place the two filter DESIGNS actually diverge. On a broadband impulse they now agree exactly, since
+        // both land on the sample-peak floor; on ordinary music they agree to 0.0009–0.0028 dB.
         const double sr = 48000.0;
-        const Planar prog = makeProgram (sr, 2, 4.0);
+        const long long n = (long long) (sr * 2);
+        Planar prog (2, std::vector<float> ((std::size_t) n));
+        for (long long i = 0; i < n; ++i)
+        {
+            const float v = (float) (0.9 * std::sin (2.0 * core::kPi * 12000.0 * (double) i / sr + 0.7));
+            prog[0][(std::size_t) i] = prog[1][(std::size_t) i] = v;
+        }
+
         fcore::Probe p; p.prepare (sr, 2);
         const auto base = ptrs (prog);
-        p.process (base.data(), 2, (long long) prog[0].size());
+        p.process (base.data(), 2, n);
+        p.finish();
 
         analysis::TruePeakMeter tpm; tpm.prepare (sr, fcore::Probe::kChunk, 2);
-        tpm.process (base.data(), 2, (int) prog[0].size());
+        tpm.process (base.data(), 2, (int) n);
 
         const double a = p.truePeakDb(), b = tpm.truePeakDb();
         test::ok (std::isfinite (a) && std::isfinite (b), "both filters produced a reading");
+        test::ok (a > 20.0 * std::log10 (p.samplePeakLinear()) + 1.0,
+                  "the inter-sample peak really is well above the sample peak here");
         test::ok (! sameBits (a, b),
-                  "they are NOT bit-identical — a shim reaching for TruePeakMeter would fail the parity check");
-        // How far apart depends entirely on how much energy sits in the top octave. On real music the two
-        // agree to 0.0009–0.0028 dB (measured on cold-gaze / gr-clip / click120). On this fixture, whose
-        // clicks are single-sample impulses and therefore maximally broadband, they diverge by ~1.1 dB —
-        // because Probe's prototype cuts at 0.90x Nyquist and simply does not see the top tenth of the band,
-        // so it reads LOW. Pinned as a live discrepancy: if either filter changes, this fails and someone
-        // has to look. (Which of the two is spec-correct is an open question — see the fix-session notes.)
-        test::ok (b > a, "TruePeakMeter reads HIGHER: Probe's 0.90x-Nyquist guard under-reads broadband peaks");
-        test::ok (std::fabs (a - b) > 0.5 && std::fabs (a - b) < 2.0,
-                  "on single-sample impulses the gap is about a dB, not a rounding difference");
+                  "the two designs are NOT bit-identical — a shim reaching for TruePeakMeter fails parity");
+        test::ok (std::fabs (a - b) > 0.01 && std::fabs (a - b) < 0.5,
+                  "they differ by tens of a dB on high-frequency content, not by a rounding step");
+        // NB: both under-read ffmpeg's ebur128 here by ~0.5 dB (it reports −0.3, we report −0.81 / −0.88), so
+        // ffmpeg does NOT arbitrate between them — that is a separate question about oversampling factor, not
+        // about which of these two prototypes is right. Recorded, not resolved.
     }
 
     // --- The RT claim the core lives by, on the shared body too. ---

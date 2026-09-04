@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <span>
 #include <vector>
 
 namespace felitronics::analysis
@@ -93,10 +94,21 @@ public:
     // inclusion and moves the reading by ~0.01 dB), so it cannot carry a bit-identity claim, while the vector
     // itself is continuous in the input samples and can. Raw energy, not dB, deliberately — a dB accessor
     // would route the comparison back through log10, whose 1-ulp disagreement between libms is precisely what
-    // such a check must not inherit. Valid for gatingBlockCount() entries until the next
-    // process()/reset()/prepare(); the count is 0 (and the pointer may be null) before prepare().
-    int           gatingBlockCount()    const noexcept { return blockCount; }
-    const double* gatingBlockEnergies() const noexcept { return blockE.data(); }
+    // such a check must not inherit.
+    //
+    // The span is valid until the next prepare() (the only place the storage is reallocated); process() only
+    // appends, and reset() zeroes the count rather than the storage. Empty before prepare().
+    //
+    // WHAT THIS PINS. It commits the meter to keeping every block's energy as a contiguous array of double in
+    // arrival order. Retention itself is already forced by the two-pass relative gate, so the new constraint
+    // is only the storage shape — but it does stand in the way of the one plausible future change here, a
+    // libebur128-style HISTOGRAM mode for unbounded streams (which is the real answer to droppedBlocks()).
+    // Should that arrive, this accessor returns an empty span in histogram mode rather than pretending.
+    std::span<const double> gatingBlockEnergies() const noexcept
+    {
+        return { blockE.data(), (std::size_t) blockCount };
+    }
+    int gatingBlockCount() const noexcept { return blockCount; }
 
 private:
     static constexpr int kMaxChannels      = core::kMaxChannels;

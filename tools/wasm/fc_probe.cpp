@@ -140,7 +140,7 @@ FC_EXPORT std::uint32_t fc_probe_block_energies (double* out, std::uint32_t cap)
     const std::uint32_t n = (std::uint32_t) probe().gatingBlockCount();
     const std::uint32_t m = n < cap ? n : cap;
     if (! inHeap (out, (std::uint64_t) m * sizeof (double))) return 0;   // the output span must fit too
-    if (m > 0) std::memcpy (out, probe().gatingBlockEnergies(), (std::size_t) m * sizeof (double));
+    if (m > 0) std::memcpy (out, probe().gatingBlockEnergies().data(), (std::size_t) m * sizeof (double));
     return m;
 }
 
