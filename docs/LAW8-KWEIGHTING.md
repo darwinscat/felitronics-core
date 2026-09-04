@@ -104,12 +104,9 @@ without it.
 
 ## Still open, deliberately
 
-- **A single non-finite sample still freezes the meter forever.** K-weighting is an IIR, so its state stays
-  NaN; `NaN > absT` is false, the absolute gate silently drops every later block, and the meter keeps
-  reporting a healthy number computed over the pre-NaN part while `droppedBlocks()` says nothing. Using
-  `flushPoison` here would be free and would end the freeze — but a meter should *report* damage, not
-  quietly repair it, so the real fix needs an observability counter (`nonFiniteSubHops()`) and a rewrite of
-  the tests that currently pin the freeze. That is its own change, not a rider on a performance fix.
+- ~~A single non-finite sample still freezes the meter forever.~~ **Fixed — see
+  [`NONFINITE-METER.md`](NONFINITE-METER.md).** The flush here is now `flushPoison`, so the IIR state is
+  healed at the same sub-hop boundary, and `LoudnessMeter::nonFiniteSubHops()` reports the event.
 - **`fcore::Probe` accepts sample rates the loudness path cannot serve.** Its floor is 1 kHz, but the shelf
   is designed at 1682 Hz, so below **3364 Hz** the bilinear `tan(π f₀/fs)` goes negative and the shelf pole
   leaves the unit circle — |pole| = 1.31 at 3 kHz, **2.15 at 1 kHz**. The filter is unstable there and the

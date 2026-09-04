@@ -55,15 +55,20 @@ public:
     // 4.6 ns/sample path), and not per host block — 8192 samples is 170 ms at 48 kHz, already past the
     // shelf limit, and it would also make the result depend on the caller's chunking, which this repo
     // tests as bit-invariant. LoudnessMeter uses its 10 ms sub-hop: 480 samples at 48 kHz, a 9x margin.
-    // flushDenormal, not flushPoison: a non-finite sample freezing this meter forever is a real and SEPARATE
-    // defect (docs/P0-WASM-SPIKE.md), and fixing it properly needs an observability counter, not a quiet
-    // heal. Numbers, fixed point and benchmark: docs/LAW8-KWEIGHTING.md.
+    // flushPoison, not flushDenormal — the strict superset, which also zeroes NON-FINITE state. That is the
+    // second half of the same problem: this is an IIR, so one NaN sample makes its state NaN FOREVER, every
+    // later block energy NaN, and `NaN > absT` false — the absolute gate then silently drops them all while
+    // the meter keeps reporting a healthy number computed over the fraction of the programme that predates
+    // the NaN. Healing here bounds the damage to the 10 ms sub-hop the bad sample fell in. It is NOT a
+    // licence to ignore the event: LoudnessMeter counts it in nonFiniteSubHops(), because a meter must
+    // REPORT damage, not quietly repair it. Cost is one isfinite per state word per sub-hop — negligible,
+    // but not literally free. Numbers, fixed point and benchmark: docs/LAW8-KWEIGHTING.md.
     void flushDenormals() noexcept
     {
         for (int c = 0; c < ch; ++c)   // `ch`, not kMaxChannels: the rest are zeroed by reset() and never
         {                              // processed, so flushing them is pure cost for a guaranteed no-op
-            core::flushDenormal (z1a[c]); core::flushDenormal (z2a[c]);
-            core::flushDenormal (z1b[c]); core::flushDenormal (z2b[c]);
+            core::flushPoison (z1a[c]); core::flushPoison (z2a[c]);
+            core::flushPoison (z1b[c]); core::flushPoison (z2b[c]);
         }
     }
 

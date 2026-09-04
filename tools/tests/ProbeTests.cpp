@@ -484,52 +484,65 @@ int main()
         const float* io2[1] { bad.data() };
         p.process (io2, 1, 8192);
 
-        // The two paths behave OPPOSITELY, and the difference is the whole point:
+        // Both paths now survive a non-finite sample, by different mechanisms:
         //
-        //  * the true peak RECOVERS. The oversampler's history is a 32-sample ring, so the NaN shifts out of
-        //    it; `std::max(x, NaN)` returns `x` meanwhile, so the maximum is merely blind for those samples
-        //    and then works again. Feed it something LOUDER afterwards and it duly rises — which is exactly
-        //    why the naive test (feeding the same level after the NaN) cannot tell recovery from a freeze.
-        //  * the loudness does NOT recover. K-weighting is an IIR: once its state is NaN it is NaN forever,
-        //    so every later block energy is NaN. And the reading never goes NaN either, which would at least
-        //    be visible — `NaN > absT` is false, so the absolute gate silently DROPS every poisoned block and
-        //    the meter keeps reporting a healthy number computed over the fraction of the program that
-        //    predates the NaN. droppedBlocks() does not mention it; it counts capacity overflow only.
+        //  * the true peak RECOVERS on its own. The oversampler's history is a 32-sample ring, so the NaN
+        //    shifts out of it; `std::max(x, NaN)` returns `x` meanwhile, so the maximum is merely blind for
+        //    those samples and then works again. Feed it something LOUDER afterwards and it duly rises —
+        //    which is why the naive test (feeding the same level after the NaN) cannot tell recovery from a
+        //    freeze. This half never needed fixing.
+        //  * the loudness is REPAIRED and REPORTED. It used to be the opposite of recovery: K-weighting is
+        //    an IIR, so its state stayed NaN forever, every later block energy was NaN, `NaN > absT` is
+        //    false, and the absolute gate silently dropped all of them while the meter went on reporting a
+        //    healthy number computed over the fraction of the programme that predated the NaN. Now the
+        //    state is healed at the 10 ms sub-hop boundary, the poisoned sub-hop is recorded as silence,
+        //    and nonFiniteSubHops() says it happened. droppedBlocks() still means capacity only.
         //
-        // Recorded for the fix session, pinned here so it cannot change unnoticed. NOT fixed in the spike.
+        // This group used to pin the DEFECT — and could not even see it: its 8192-sample lead-in is 171 ms,
+        // less than one 400 ms gating block, so `lufsBefore` was the -120 no-block sentinel and the "frozen"
+        // assertion compared a sentinel to itself. It passed both before and after the behaviour changed.
         std::vector<float> louder (8192, 0.95f);
         const float* io3[1] { louder.data() };
         p.process (io3, 1, 8192);
         test::ok (p.truePeakLinear() > tpBefore + 0.1,
                   "the true peak RECOVERS once the NaN shifts out of the 32-sample FIR ring");
 
-        test::ok (! std::isnan (p.integratedLufs()), "the loudness reading does not go NaN, which would be visible");
-        test::ok (sameBits (p.integratedLufs(), lufsBefore),
-                  "it is frozen instead: every post-NaN block is silently dropped by the absolute gate");
-        int nanBlocks = 0;
+        test::ok (! std::isnan (p.integratedLufs()), "the loudness reading does not go NaN");
+        (void) lufsBefore;
+        int nonFinite = 0;
         for (int j = 0; j < p.gatingBlockCount(); ++j)
-            if (std::isnan (p.gatingBlockEnergies()[j])) ++nanBlocks;
-        test::ok (nanBlocks > 0, "the dropped blocks are there in the vector, as NaN — invisible to the reading");
-        test::ok (p.droppedBlocks() == 0, "and droppedBlocks() does NOT report them (it counts capacity only)");
+            if (! std::isfinite (p.gatingBlockEnergies()[j])) ++nonFinite;
+        // EVERY energy finite — not to hide the event but because this vector is the cross-toolchain
+        // bit-comparison surface, and a COMPUTED NaN is not portable: `inf - inf` is 0x7ff8000000000000 on
+        // arm64 and 0xfff8000000000000 on x86-64 (measured, this Mac vs Debian/gcc 14.2). The event lives
+        // in the counter instead, where it costs no portability.
+        test::ok (nonFinite == 0, "no non-finite energy reaches the comparison surface");
+        test::ok (p.nonFiniteSubHops() == 1, "and exactly one sub-hop is reported as poisoned");
+        test::ok (p.droppedBlocks() == 0, "droppedBlocks() still means capacity only — the two are independent");
     }
 
-    // --- +inf is not NaN and does not behave like it. Worth its own group, because the loudness answer it
-    //     produces is the most misleading one this code can emit: it reads as SILENCE. ---
-    test::group ("+inf samples: the failure mode that reads as silence");
+    // --- +inf is not NaN and did not behave like it, and that difference used to be the sharpest edge here:
+    //     `NaN > absT` is false, but `+inf > absT` is TRUE, so one infinite energy poisoned the relative
+    //     gate and the answer became -120 — a loud programme reading as SILENCE. Worse, an infinite
+    //     SHORT-TERM energy reached `(int) ((lufsOf(inf) + 70) * 10)` in the LRA histogram: undefined
+    //     behaviour, reproduced under UBSan. Both are gone; this group is what keeps them gone. ---
+    test::group ("+inf samples: no longer silence, and no longer undefined behaviour");
     {
         const double inf = std::numeric_limits<float>::infinity();
         {
-            // +inf before the first gating block closes: every block that ever forms is NaN (the K-weighting
-            // IIR is poisoned from that sample on), all are dropped by the absolute gate, and the meter has
-            // nothing left to average — so it answers −120, the sentinel that means "silence".
+            // +inf before the first gating block closes. This used to answer −120, the sentinel that means
+            // "silence", for a loud signal — every block was NaN, all were dropped, nothing was left to
+            // average. Now the damage is one sub-hop and the answer is the programme's.
             fcore::Probe p; p.prepare (48000.0, 1);
             std::vector<float> s (48000, 0.5f);
             s[1000] = (float) inf;
             const float* io[1] { s.data() };
             p.process (io, 1, (long long) s.size());
             p.finish();
-            test::approx (p.integratedLufs(), -120.0, 1e-12,
-                          "a loud signal containing one +inf reads as SILENCE, not as an error");
+            test::ok (std::isfinite (p.integratedLufs()) && p.integratedLufs() > -100.0,
+                      "a loud signal containing one +inf no longer reads as silence ("
+                      + std::to_string (p.integratedLufs()) + " LUFS)");
+            test::ok (p.nonFiniteSubHops() >= 1, "and the event is reported");
             test::ok (std::isinf (p.truePeakDb()) || p.truePeakDb() > 100.0,
                       "while the true peak reports the infinity honestly");
         }
@@ -547,7 +560,17 @@ int main()
             p.process (b, 1, (long long) bad.size());
             p.process (g, 1, (long long) good.size());
             test::ok (std::isfinite (p.integratedLufs()), "the reading stays finite and plausible");
-            test::ok (sameBits (p.integratedLufs(), before), "and frozen at the pre-inf value");
+            // Prove it is still MEASURING and not merely holding: feed real programme after the infinity.
+            // It has to be a tone, not more DC — K-weighting removes DC, so a louder constant would leave
+            // the reading legitimately unchanged and the assertion would test nothing.
+            std::vector<float> tone (96000);
+            for (std::size_t i = 0; i < tone.size(); ++i)
+                tone[i] = (float) (0.5 * std::sin (6.283185307179586 * 1000.0 * (double) i / 48000.0));
+            const float* t[1] { tone.data() };
+            p.process (t, 1, (long long) tone.size());
+            test::ok (! sameBits (p.integratedLufs(), before),
+                      "and it KEEPS MEASURING instead of freezing at the pre-inf value");
+            test::ok (p.nonFiniteSubHops() >= 1, "with the damage reported rather than silent");
         }
     }
 

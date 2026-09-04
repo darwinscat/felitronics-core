@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <span>
 #include <vector>
 
@@ -171,6 +172,9 @@ public:
         return 20.0 * std::log10 (tp > 1e-9 ? tp : 1e-9);
     }
     int    droppedBlocks()  const noexcept { return lm_.droppedBlocks(); }
+    // Forwarded so a caller can tell a MEASUREMENT from a best-effort number: non-zero means a
+    // non-finite sample reached the loudness path and its 10 ms was recorded as silence.
+    std::uint64_t nonFiniteSubHops() const noexcept { return lm_.nonFiniteSubHops(); }
 
 private:
     felitronics::analysis::LoudnessMeter                        lm_;
