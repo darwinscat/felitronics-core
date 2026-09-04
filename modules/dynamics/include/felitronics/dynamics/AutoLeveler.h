@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <felitronics/core/FlushToZero.h>
+
 #include <algorithm>
 #include <cmath>
 
@@ -119,6 +121,12 @@ public:
         const double a = 1.0 - std::exp (-(double) numSamples / (kMatchTimeConstant * currentSampleRate));
         dryMeanSq += a * (dryBlockMeanSq - dryMeanSq);
         mixMeanSq += a * (mixBlockMeanSq - mixMeanSq);
+        // Law 8. Both followers decay geometrically on silence and STICK in the subnormals (at 128
+        // samples / 48 kHz, a ≈ 0.0176, so every k·u with k ≤ ½/a ≈ 28 is a fixed point). The cost of
+        // leaving them there is small — two double FMAs per BLOCK, not per sample, and the silence gate
+        // below skips the sqrt — but it is not zero, it never ends, and the fix is two compares.
+        core::flushDenormal (dryMeanSq);
+        core::flushDenormal (mixMeanSq);
 
         float rawTarget;
         if (! enabled)

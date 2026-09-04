@@ -36,6 +36,7 @@ public:
         sLL += alpha * ((double) l * l - sLL);
         sRR += alpha * ((double) r * r - sRR);
         sLR += alpha * ((double) l * r - sLR);
+        flushDenormals();   // law 8, HERE and not left to the caller — see the note on flushDenormals()
     }
 
     double correlation() const noexcept
@@ -44,6 +45,19 @@ public:
         return d > 1e-12 ? std::clamp (sLR / d, -1.0, 1.0) : 1.0;
     }
 
+    // Law 8. `process()` already calls this every sample, so a consumer never has to — the method stays
+    // public only because it was, and because a host may want to zap the state at a transport jump.
+    // NB the stall here is SLOW, not absent: at the default 300 ms window silence needs ~220 s to walk the
+    // state down into the subnormal band. That is a long tail on a mix bus, not an exemption.
+    //
+    // Why per sample rather than per block, and why not left to the owner: this meter has no owner. It is
+    // a leaf primitive with no in-repo caller — the adapter that drives it is the only thing that could
+    // have called a flush, and for the whole life of the class nothing did, which is the F1
+    // `MultibandSplitter` failure exactly (the method existed; no line invoked it). On silence all three
+    // one-poles decay geometrically and STICK: for the default 300 ms window at 48 kHz every subnormal
+    // k·u with k ≤ ½/alpha ≈ 7200 maps to itself, so the state never reaches zero and every later sample
+    // pays the subnormal penalty on three dependent double FMAs. The cost of preventing that is three
+    // fabs+compares against a three-FMA dependency chain the loop is latency-bound on anyway.
     void flushDenormals() noexcept { core::flushDenormal (sLL); core::flushDenormal (sRR); core::flushDenormal (sLR); }
 
 private:

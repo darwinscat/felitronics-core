@@ -620,5 +620,53 @@ int main()
                   "the oversized call transformed the buffer (old code silently no-opped it)");
     }
 
+    // --- LAW 8 (state, not timing). The Asym curve's DC blocker is the one recursive state in this
+    //     module. On silence the curve gives w == 0 exactly (it is normalised so y(0) == 0), so y1 becomes
+    //     a pure R^n decay — and R = 0.99967 at 10 Hz / 4x 48 kHz has a subnormal fixed-point band up to
+    //     k <= 0.5/(1-R) ~= 1528, so it used to freeze at 2.14e-42 after 1.5 s and never underflow. The
+    //     observable is the OUTPUT: a state that reached exact zero emits exact zero.
+    //
+    //     Asserted TWICE on purpose. At 5 s the un-flushed state is subnormal, which a machine running
+    //     hardware FTZ would read as zero — so the regression could hide. At 1.25 s it is ~8e-35, a
+    //     NORMAL float (the flush fires at 1.10 s, the state would go subnormal at 1.39 s), so that
+    //     assertion holds on every machine regardless of the FP control register. ---
+    test::group ("Saturator: law 8 — the DC blocker's silent tail reaches EXACT zero");
+    {
+        const double fs = 48000.0; const int block = 256;
+        saturation::Saturator sat;
+        test::ok (sat.prepare (fs, block, 1, 4, 32), "prepared 4x, mono");
+        saturation::Saturator::Params p;
+        p.shape = saturation::WaveShaper::Shape::Asym;   // the ONLY shape that arms the DC blocker
+        p.bias = 0.3f; p.driveDb = 12.0f; p.dcBlockHz = 10.0f;
+        sat.setParams (p);
+
+        std::vector<float> buf ((std::size_t) block);
+        float* io[1] { buf.data() };
+        for (int b = 0; b < 100; ++b)                    // charge the blocker with real programme
+        {
+            for (int i = 0; i < block; ++i)
+                buf[(std::size_t) i] = (float) (0.8 * std::sin (2.0 * M_PI * 220.0 * (b * block + i) / fs));
+            sat.process (io, 1, block);
+        }
+
+        const auto silentBlocksAllZero = [&] (int blocks)
+        {
+            bool allZero = true;
+            for (int b = 0; b < blocks; ++b)
+            {
+                std::fill (buf.begin(), buf.end(), 0.0f);
+                sat.process (io, 1, block);
+                allZero = true;                          // only the LAST block's verdict counts
+                for (int i = 0; i < block; ++i) allZero = allZero && (buf[(std::size_t) i] == 0.0f);
+            }
+            return allZero;
+        };
+
+        test::ok (silentBlocksAllZero ((int) (1.25 * fs) / block),
+                  "output is EXACTLY zero at 1.25 s (the un-flushed tail would still be a NORMAL ~8e-35)");
+        test::ok (silentBlocksAllZero ((int) (3.75 * fs) / block),
+                  "still exactly zero at 5 s of silence");
+    }
+
     return test::report();
 }

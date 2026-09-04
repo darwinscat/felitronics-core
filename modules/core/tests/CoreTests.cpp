@@ -218,5 +218,29 @@ int main()
         test::ok (std::isfinite (v), "next() stays finite after setTimeMs(NaN)");
     }
 
+    // --- LAW 8 (state, not timing): an exponential glide toward ZERO must ARRIVE. Without the snap the
+    //     residual is a geometric decay with a whole band of subnormal fixed points (k*coeff rounds back to
+    //     k for every k <= 0.5/(1-coeff)), so it parks a hair above zero forever. Both APIs, and both
+    //     negative control stays deep in the NORMAL range at 5 s (4.1e-73, both APIs — they are the same
+    //     coeff^240000), so hardware FTZ cannot mask a regression here. ---
+    test::group ("Smoother: law 8 — a glide to zero lands on EXACT zero");
+    {
+        const double fs = 48000.0;
+        core::Smoother s; s.prepare (fs, 30.0); s.snap (1.0); s.setTarget (0.0);
+        for (int i = 0; i < (int) (5.0 * fs); ++i) s.next();
+        test::ok (core::exactlyEqual (s.value(), 0.0), "next(): exactly 0 after 5 s aimed at 0");
+
+        core::Smoother b; b.prepare (fs, 30.0); b.snap (1.0); b.setTarget (0.0);
+        for (int i = 0; i < (int) (5.0 * fs) / 128; ++i) b.advance (128);
+        test::ok (core::exactlyEqual (b.value(), 0.0), "advance(128): exactly 0 after 5 s aimed at 0");
+
+        // The snap lands ON the target, not on zero — a non-zero target is unaffected, and settling is
+        // now EXACT, which is what makes advance()'s cost-zero early-out reachable at all.
+        core::Smoother t; t.prepare (fs, 30.0); t.snap (0.0); t.setTarget (997.0);
+        for (int i = 0; i < (int) (5.0 * fs); ++i) t.next();
+        test::ok (core::exactlyEqual (t.value(), 997.0), "a non-zero target is reached EXACTLY too");
+        test::ok (t.settled (0.0), "settled(0) — the early-out can actually fire");
+    }
+
     return test::report();
 }
