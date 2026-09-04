@@ -30,11 +30,29 @@ namespace detail
 // misses. A READ-ONLY sink (it never touches the audio), so it adds ZERO latency; the interpolation FIR's
 // group delay only postpones *discovery* of a peak, which is irrelevant to a running max.
 //
-// The interpolator is a Kaiser-windowed-sinc polyphase FIR (factor × tapsPerPhase), each phase normalised to
-// unity DC so a constant reads exactly and the sample grid is reproduced — the meter therefore can never
-// under-read the sample peak. BS.1770-4 specifies a particular table; the Recommendation also allows an
-// equivalent filter, so we DESIGN one meeting the envelope (flat pass-band, ≥ ~60 dB image rejection) and
-// VERIFY it against the canonical fs/4 inter-sample test rather than trusting a copied coefficient list.
+// The interpolator is a Kaiser-windowed-sinc polyphase FIR (factor × tapsPerPhase). The PROTOTYPE is
+// normalised to Σ = 1, which leaves each phase at 1/L only to the accuracy the design happens to give:
+// measured, the four phases at 4× sit at 0.999961 and 1.000039 after ×L, so a steady constant reads
+// +0.000342 dB rather than exactly 0. What guarantees the meter can never under-read the SAMPLE peak is not
+// that normalisation — it is the `tp = ax` seed in process(), which puts the grid sample itself under the
+// running max before any phase is evaluated. That floor is load-bearing: on EBU Tech 3341 tests 15 and 20 it
+// IS the reading, the phase loop having found nothing above it. Do not remove it.
+//
+// KNOW WHAT THIS 48-TAP PROTOTYPE DOES NEAR NYQUIST — it is short, and cutting at the base Nyquist buys
+// pass-band reach at the cost of a slow transition. Computed from the design: −0.85 dB at 0.8 × Nyquist,
+// −2.6 at 0.9, −6.0 at Nyquist, and the first image band is still passed at −6.0 / −8.5 / −11.7 dB at 1.00 /
+// 1.05 / 1.10 × Nyquist. So it does not discard the top octave — but it does let near-Nyquist images through,
+// and they beat against the baseband term. Measured consequence on the official EBU inter-sample transient
+// files (tests 20-23, which are ONE band-limited signal at four sample-grid offsets, so a shift-invariant
+// meter must read one number): this meter reads −0.130 / −0.084 / −0.217 / −0.084, a spread of 0.13 dB,
+// where tools/fcore_probe.h's longer 0.90 × Nyquist design spreads 0.0001. All four pass, and the spread is
+// not a correctness bug, but it is why the two designs disagree and it belongs in any decision to merge them.
+//
+// BS.1770-4 specifies a particular table; the Recommendation also allows an equivalent filter, so we DESIGN
+// one meeting the envelope (flat pass-band, ≥ ~60 dB image rejection) and VERIFY it against a published
+// external criterion rather than trusting a copied coefficient list: EBU Tech 3341-2023 §2.6 Table 1
+// true-peak tests 15-19 run in ctest (felitronics_truepeak_conformance_tests), and tests 15-23 have been
+// run against the official EBU Loudness Test Set out of tree — all nine inside the +0.2/−0.4 dB envelope.
 //
 // Oversampling factor by source rate (targets the spec's ~176.4/192 kHz analysis rate): < 88.2 kHz → 4×,
 // < 176.4 kHz → 2×, else 1× (the grid already resolves the peak). It is a PURE MAX — no integration, no
