@@ -22,6 +22,13 @@ jobs:
           - { os: windows-latest, pffft: OFF, nam: ON  }
           - { os: ubuntu-latest,  pffft: ON,  nam: ON  }
           - { os: macos-latest,   pffft: ON,  nam: ON  }
+          # arm64 LINUX — the axis nothing above covers. Every other row confounds two variables: the two
+          # arm64 rows are also the only Apple rows, so "arm64" and "Apple's toolchain" always move together
+          # and a divergence cannot be attributed. It is not a hypothetical distinction — the P0 spike found
+          # Apple's libm returning different doubles from tan() than musl and glibc at 88.2/192 kHz, i.e. the
+          # outlier was the TOOLCHAIN while the ISA was innocent (docs/P0-WASM-SPIKE.md). glibc-on-arm64 is
+          # the cell that separates them. Free for public repositories, same steps as every other row.
+          - { os: ubuntu-24.04-arm, pffft: OFF, nam: OFF }
           # windows-latest + pffft ON is a fast-follow (pending a first green MSVC-pffft run); the OFF row
           # already proves the core compiles + tests on Windows.
     steps:
@@ -64,6 +71,29 @@ jobs:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-san --output-on-failure
+
+  # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
+  # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
+  # not a theoretical gap. `felitronics_saturation_theory_tests` was RED on gcc 14.2 / Debian 13 on UNTOUCHED
+  # main while every row here was green, and it stayed invisible until it was run off a developer's second
+  # machine (PR #105: a "float-ulp noise floor" constant of 2e-7 sat between 2^-23 and 2^-22, so a two-ulp
+  # residual tripped it — which toolchain landed on which side was luck). A finding that only a machine
+  # OUTSIDE CI can make is a finding CI is not making. Separate job, not a 4th OS-matrix row, for the same
+  # reason as the sanitizers above: the flags are toolchain-specific.
+  gcc-14:
+    name: ubuntu-gcc-14
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install g++-14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env: { CC: gcc-14, CXX: g++-14 }
+        run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON
+      - name: Build
+        run: cmake --build build-gcc14 -j
+      - name: Test
+        run: ctest --test-dir build-gcc14 --output-on-failure
 
   # wasm-audio — the tier DSP-ARCHITECTURE.md §2 declares, GATED here instead of aspirational. Builds every
   # default module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole suite in node, and

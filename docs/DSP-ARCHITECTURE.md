@@ -160,6 +160,28 @@ the CPU at runtime, invisible to any build. Full write-up:
    in CI runs `blocks`, which is `double` throughout. **Nothing enforces this law today**; like law 8 it is
    a property no build error can see, and unlike law 8 it does not even cost CPU when violated — it just
    quietly gives a different answer per tier.
+10. **FP contraction is STATED, never inherited: the build sets `-ffp-contract=on`.** `a*b + c` may be
+   fused into one FMA with a single rounding instead of two — a *different* number, slightly more
+   accurate, and the toolchains disagree about when they are allowed to do it: **clang defaults to `on`**
+   (fusion within one expression — the C/C++ standard's own rule), **GCC defaults to `fast`** (fusion
+   *across statements*, beyond what the standard permits), and **MSVC's `/fp:precise` does not contract
+   at all**. Three defaults, three sets of numbers, from one source file.
+   *(Not academic. It broke two exactness claims the day an arm64 Linux row first reached CI, on
+   untouched `main`: `poweramp`'s "silence in ⇒ output identically 0" read **1.26e-08**, and the
+   multi-res fast pane missed its budget by **0.005841 dB**. Both are cancellations — TT1 wants
+   `g(0+vb) − g(−0+vb)` to vanish exactly — and a cancellation stops cancelling the moment one half is
+   computed with one rounding and the other with two. Nothing could see it before: baseline x86-64 has
+   no FMA instruction to contract with at all, and the only arm64 rows were also the only Apple rows,
+   where clang's default already behaved.)*
+   **`on`, not `off`.** It fixes both, and it costs the shipping tier nothing because it is already
+   clang's default — macOS builds exactly as before, so no perf change and no golden/NULL churn. `off`
+   fixes them too but bans FMA outright, measured at **+12 % on the `Svf` sample loop** (16.25 → 18.24 ms,
+   arm64 macOS) for no benefit anyone has demonstrated. On the shipping convolver both are within noise
+   (~0.58 %RT either way — its hot path is pffft's intrinsics, which no contraction flag reaches).
+   NB **GCC ≤ 13 implements `on` as `off`** (no `fmadd` emitted at all); GCC 14 emits the standard
+   behaviour — one `fmadd` for the single-expression form, none for the cross-statement one. Verified on
+   both. This law, unlike 8 and 9, IS enforced: every non-MSVC row compiles with the flag, and the arm64
+   Linux row is what fails if it is removed.
 
 **These laws are CI-enforced for the funded tiers, not aspirational.** Today: a
 no-allocation test on the paths that install an allocation counter, a compile-only `-fno-exceptions` /

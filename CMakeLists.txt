@@ -7,6 +7,22 @@ if(MSVC)
     add_compile_options(/utf-8)         # sources use UTF-8 in comments (—, φ, ≈, ·) — MSVC needs this flag
     add_link_options(/STACK:8388608)    # 8 MB stack (the Unix default). Tests put a ~200 KB EqEngine on the
                                         # stack; MSVC's 1 MB default overflows → SegFault. Match Unix.
+else()
+    # FP CONTRACTION, stated instead of inherited (DSP-ARCHITECTURE.md §2 law 10). `a*b + c` may become a
+    # single FMA with ONE rounding instead of two, and the toolchains do not agree on when: clang defaults
+    # to `on` (fusion within one expression, the C/C++ standard's own rule), GCC defaults to `fast` (fusion
+    # ACROSS statements). That difference is not academic — it broke two exactness claims the moment an
+    # arm64 Linux row reached CI, on untouched main: poweramp's "silence in ⇒ output identically 0" read
+    # 1.26e-08, and the multi-res fast pane missed its budget by 0.005841 dB. Neither the Mac (clang) nor
+    # any x86 row could see it: baseline x86-64 has no FMA instruction to contract with at all.
+    #
+    # `on`, not `off`. It fixes both (verified on gcc 13.3 and 14.2, aarch64) and costs the shipping tier
+    # NOTHING, because it is already clang's default. `off` also fixes them but disables FMA everywhere,
+    # measured at +12% on the Svf sample loop (16.25 -> 18.24 ms, arm64 macOS) for no demonstrated benefit.
+    # NB on GCC <= 13 `on` is implemented as `off` (no fmadd emitted at all); GCC 14 emits the standard
+    # behaviour — 1 fmadd for the single-expression form, 0 for the cross-statement one. Both pass.
+    # MSVC needs no equivalent: its default /fp:precise does not contract.
+    add_compile_options(-ffp-contract=on)
 endif()
 
 # The `wasm-audio` tier's PHYSICS. Its POLICY (-fno-exceptions -fno-rtti) lives in the `wasm-audio` CMake
