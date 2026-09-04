@@ -62,3 +62,10 @@ xcuserdata/
 *.flac
 *.mp3
 *.raw
+*.f32
+
+# wasm spike output (tools/wasm/build.sh) — build artifacts, rebuilt from source on demand
+/tools/wasm/build/
+
+# playwright-mcp scratch (page snapshots, console logs) from driving the probe page
+.playwright-mcp/
