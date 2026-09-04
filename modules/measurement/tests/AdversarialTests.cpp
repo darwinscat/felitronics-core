@@ -42,8 +42,13 @@ int main()
     {
         ok (measurement::nextPow2 (0) == 1, "nextPow2(0)=1");
         ok (measurement::nextPow2 (5) == 8, "nextPow2(5)=8");
-        ok (measurement::nextPow2 (std::size_t (1) << 63) == (std::size_t (1) << 63), "nextPow2(2^63)=2^63");
-        ok (measurement::nextPow2 ((std::size_t (1) << 63) + 1) == 0, "nextPow2(>2^63)=0 (no hang)");
+        // The top bit comes from the WIDTH, not from a hard-coded 63. `std::size_t(1) << 63` is UB where
+        // size_t is 32 bits (wasm32), so on that tier this case did not test the overflow guard — it shifted
+        // into nonsense and then failed. Spelled this way it exercises the guard at whatever width it is
+        // compiled for, which is strictly more than the 64-bit-only version tested.
+        constexpr std::size_t kTop = std::size_t (1) << (std::numeric_limits<std::size_t>::digits - 1);
+        ok (measurement::nextPow2 (kTop) == kTop, "nextPow2(top bit) = top bit");
+        ok (measurement::nextPow2 (kTop + 1) == 0, "nextPow2(> top bit) = 0 (no hang)");
     }
 
     // B2 — magSpectrum on a non-power-of-two nfft must NOT heap-overflow; it rounds nfft up.

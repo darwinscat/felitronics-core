@@ -66,11 +66,18 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_flushpoison_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_flushpoison_falsify_tests COMMAND felitronics_core_flushpoison_falsify_tests)
 
-    add_executable(felitronics_core_rtstreams_tests tests/RtStreamsTests.cpp)   # RT swap-discipline types (needs threads)
-    target_link_libraries(felitronics_core_rtstreams_tests PRIVATE felitronics::core)
-    target_include_directories(felitronics_core_rtstreams_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
-    target_compile_features(felitronics_core_rtstreams_tests PRIVATE cxx_std_20)
-    find_package(Threads REQUIRED)
-    target_link_libraries(felitronics_core_rtstreams_tests PRIVATE Threads::Threads)
-    add_test(NAME felitronics_core_rtstreams_tests COMMAND felitronics_core_rtstreams_tests)
+    # RT swap-discipline types — the one suite that needs REAL threads, so it is outside the `wasm-audio`
+    # tier by construction: that tier is single-threaded by contract (no pthreads, no SharedArrayBuffer, no
+    # COOP/COEP). Emscripten does NOT refuse this build without -pthread — it links pthread stubs whose
+    # pthread_create returns ENOTSUP, so the target would compile, link, and abort at runtime. Excluding it
+    # here says so once, instead of leaving a permanently red test that means nothing.
+    if(NOT EMSCRIPTEN)
+        add_executable(felitronics_core_rtstreams_tests tests/RtStreamsTests.cpp)
+        target_link_libraries(felitronics_core_rtstreams_tests PRIVATE felitronics::core)
+        target_include_directories(felitronics_core_rtstreams_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+        target_compile_features(felitronics_core_rtstreams_tests PRIVATE cxx_std_20)
+        find_package(Threads REQUIRED)
+        target_link_libraries(felitronics_core_rtstreams_tests PRIVATE Threads::Threads)
+        add_test(NAME felitronics_core_rtstreams_tests COMMAND felitronics_core_rtstreams_tests)
+    endif()
 endif()

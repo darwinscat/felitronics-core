@@ -13,6 +13,7 @@
 #include <felitronics/analysis/CorrelationMeter.h>
 #include <felitronics/analysis/KWeightingFilter.h>
 #include <felitronics/analysis/LoudnessMeter.h>
+#include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 #include <felitronics/analysis/SpectrumTap.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
@@ -22,6 +23,7 @@
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
@@ -36,12 +38,16 @@
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
+#include <felitronics/dynamiceq/LaneDynamics.h>
 #include <felitronics/dynamics/AutoLeveler.h>
+#include <felitronics/dynamics/BandBallistics.h>
 #include <felitronics/dynamics/ChannelLinker.h>
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainComputer.h>
 #include <felitronics/dynamics/GainReductionFollower.h>
+#include <felitronics/dynamics/NoiseGate.h>
+#include <felitronics/dynamics/RelativeLevel.h>
 #include <felitronics/dynamics/TransientShaper.h>
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/eq/EqBand.h>
@@ -53,6 +59,7 @@
 #include <felitronics/io/Wav.h>
 #include <felitronics/limiter/TruePeakLimiter.h>
 #include <felitronics/lineareq/LinearPhaseEq.h>
+#include <felitronics/lineareq/MagnitudeCurve.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
 #include <felitronics/measurement/CaptureGate.h>
@@ -65,12 +72,14 @@
 #include <felitronics/measurement/PeakClip.h>
 #include <felitronics/measurement/ReferenceUnity.h>
 #include <felitronics/measurement/Sweep.h>
+#include <felitronics/measurement/XcorrAlign.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandProcessor.h>
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/neural/Inference.h>
 #include <felitronics/neural/NeuralStage.h>
 #if defined(FELITRONICS_WITH_NAM)   // optional compiled NAM backend — public pImpl header is gated with its target
+#include <felitronics/nam/BlendLaw.h>
 #include <felitronics/nam/NamStage.h>
 #include <felitronics/rigplayer/AlignmentTable.h>   // …and the pack player over it, gated with the same option
 #include <felitronics/rigplayer/BlendKnob.h>
@@ -145,5 +154,11 @@ template class  felitronics::multiband::MultibandCompressor<4>;
 template class  felitronics::multiband::MultibandWidth<4>;
 template class  felitronics::neural::NeuralStage<NullInference>;
 template struct felitronics::analysis::SpectrumTapT<felitronics::analysis::kSpectrumFftOrder>;
+// Public class templates nothing else here instantiated, so no gate — strict warnings OR -fno-exceptions —
+// ever entered their member bodies. Both compilers skip an uninstantiated template member entirely, so a
+// `throw` added inside one of these would have been invisible on every CI row.
+template class  felitronics::convolution::NonUniformConvolver<felitronics::core::fft::DefaultRealFft>;
+template class  felitronics::convolution::MatrixConvolverNupc<felitronics::core::fft::DefaultRealFft>;
+template struct felitronics::analysis::RollingSpectrumTapT<14>;
 
 int main() { return 0; }

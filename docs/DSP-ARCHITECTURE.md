@@ -38,7 +38,8 @@ bake them in now (while the core is small) instead of retrofitting.
 
 **Platform priority (product-driven, decides what we fund):**
 1. **Desktop** plugins + apps — **primary** (where the revenue is). This is what ships and what CI gates.
-2. **WASM** (browser demos / lightweight web) — **secondary, aspirational**.
+2. **WASM** (browser demos / lightweight web) — **secondary, and GATED in CI** since the `wasm-audio`
+   job landed. Read §2 for what that gate does and does not prove.
 3. **Embedded / hardware** — **far-future, low priority.**
 
 We keep the core JUCE-free *so tiers 2–3 stay open*, but we **don't pay their tax early** (fixed-point,
@@ -51,9 +52,23 @@ no-heap, embedded CI) — a tier earns its CI gate and its constraints only when
 These are what make the core actually portable. Violating one silently breaks a target.
 
 **Target tiers (each module declares which it supports).** Generic "WASM + embedded" is too coarse —
-name the profiles. Per the **platform priority (§1)**, **CI gates `desktop` (primary) today, with
-`wasm-audio` aspirational; both embedded tiers stay documented-but-not-gated** until a hardware product
-exists (no point paying embedded's CI tax early).
+name the profiles. Per the **platform priority (§1)**, **CI gates `desktop` (primary) and, since the
+`wasm-audio` job, that tier too; both embedded tiers stay documented-but-not-gated** until a hardware
+product exists (no point paying embedded's CI tax early).
+
+**What the `wasm-audio` gate proves, exactly.** It builds every default module for wasm32 with
+`-fno-exceptions -fno-rtti`, runs the whole self-test suite in node, and audits every emitted `.wasm`
+for shared memory or thread-shaped imports. So: an exception or RTTI use is a **compile** error; an
+incompatible dependency is a compile/link error; an allocation in `process()` is a **runtime** failure
+(emscripten is libc++, so the alloc counter in `felitronics_test.h` actually enforces there, unlike the
+libstdc++ rows). **A thread on a live code path is a LINK error** — but only because the tier links
+`--wrap=pthread_create`: on its own, emscripten without `-pthread` links pthread *stubs* returning
+`ENOTSUP`, so `std::thread` compiles, links and merely aborts at runtime (measured, emsdk 6.0.9). What
+the wrap still cannot see: a thread in code never emitted (an unused inline, an uninstantiated template),
+and `std::mutex`, whose lock lives inside `libc++-noexcept.a` and whose stub silently succeeds — a lint
+over module headers covers the latter. **Law 8 is not covered at all**: a denormal stall is a property of
+the CPU at runtime, invisible to any build. Full write-up:
+[`WASM-AUDIO-TIER.md`](WASM-AUDIO-TIER.md).
 - `desktop` — heap in `prepare`, SIMD, JUCE only in adapters.
 - `wasm-audio` — AudioWorklet-safe; no blocking / filesystem in the audio path; bounded memory growth;
   **no FP-control register → relies on software denormal flushing (law 8)**.
@@ -101,9 +116,13 @@ exists (no point paying embedded's CI tax early).
    adapter MAY set FTZ on desktop as a bonus. **Do NOT use `-ffast-math`** (it breaks the NaN/inf
    semantics the tests assert). Every kernel also ships a scalar fallback + a scalar↔SIMD parity test.
 
-**These laws are CI-enforced for the funded tiers, not aspirational.** From day one: a
-no-allocation-in-`process()` test, `-fno-exceptions` / `-fno-rtti` build configs, and an **Emscripten**
-(`wasm-audio`) build — so a thread / alloc / dep / denormal creep fails the build immediately. An
+**These laws are CI-enforced for the funded tiers, not aspirational.** Today: a
+no-allocation test on the paths that install an allocation counter, a compile-only `-fno-exceptions` /
+`-fno-rtti` probe over every public header on the Clang/GCC rows (MSVC spells the flags differently and is
+not a gate for it), and an **Emscripten** (`wasm-audio`) build + node run. That catches an exception, a
+dep, an alloc on an instrumented path, and (via `--wrap=pthread_create`) a thread that is actually reached;
+it does **not** catch a denormal at all, nor a thread in code that is never emitted — see the box in the tier list above rather
+than trusting this sentence's older, broader wording. An
 **arm-none-eabi** job is documented but **not gated** until an embedded product funds it (avoid
 embedded-grade CI scope creep). Third-party deps (Eigen, kissfft, pffft) must be verified to
 build under `-fno-exceptions` (some use throwing asserts).
@@ -171,7 +190,8 @@ lowest-common-denominator that kills desktop performance).
   vectors guard behaviour.
 - **Portability CI for the funded tiers, from day one** (not "later"): the no-alloc /
   `-fno-exceptions` / `-fno-rtti` configs, scalar↔SIMD parity tests, and an **Emscripten**
-  (`wasm-audio`) build of the light modules. An **arm-none-eabi** job is documented but **not gated**
+  (`wasm-audio`) build of the light modules — all three now real, plus a native↔wasm bit-exactness NULL
+  test on a generated fixture. An **arm-none-eabi** job is documented but **not gated**
   until an embedded product funds it (see §2).
 - **License:** AGPL-3.0-or-later, SPDX header on every file. Each heavy module records its third-party
   deps + AGPL-compatibility in `THIRD_PARTY_NOTICES.md` (NAM MIT, Eigen MPL-2.0, nlohmann/json MIT,
