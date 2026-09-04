@@ -41,7 +41,11 @@ static inline void* countedAlignedNew (std::size_t s, std::align_val_t a)
    #else
     void* p = nullptr; if (::posix_memalign (&p, al, s ? s : 1) != 0) p = nullptr;
    #endif
+   #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     if (p == nullptr) throw std::bad_alloc();
+   #else
+    if (p == nullptr) std::abort();   // the wasm-audio tier compiles -fno-exceptions, where `throw` is a PARSE error
+   #endif
     return p;
 }
 static inline void countedAlignedFree (void* p) noexcept

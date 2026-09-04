@@ -127,3 +127,28 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
     # and backend target here, pushing MatrixConvolver<PffftRealFft> through the strict gate below.
     add_test(NAME felitronics_header_hygiene COMMAND felitronics_header_hygiene)
 endif()
+
+# ----------------------------------------------------------------------------
+# -fno-exceptions / -fno-rtti PROBE — compile-only. Reuses the hygiene TU verbatim (every public header
+# PLUS the explicit instantiations at its foot), because the failure this guards is INSTANTIATION-dependent:
+# `throw` inside a class-template member body is diagnosed when the member is instantiated, not when the
+# header is included. Measured on emsdk 6.0.9 + Apple clang 21 — including core/Fft.h alone is clean; naming
+# SeamAllocator<float>::allocate (or any AlignedVector) is what errors. So a probe that merely #included
+# would prove nothing.
+# Why a NATIVE target when the wasm-audio job already builds this way: the wasm job is one toolchain
+# (emscripten/clang). This runs on every existing CI row, so gcc and Apple clang are covered too, and it
+# stays green on a machine with no emsdk. Building it IS the assertion — there is nothing to run.
+# NOT linked against felitronics::nam / ::rigplayer: the NAM backend legitimately uses try/catch (its
+# upstream sources throw), so it is outside the exception-free tier by design, not by oversight.
+# Clang/GCC only — MSVC spells this /EHs-c- and warns rather than errors, so it is not a gate there.
+if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
+    add_library(felitronics_no_exceptions_probe OBJECT test_support/HeaderHygiene.cpp)
+    target_link_libraries(felitronics_no_exceptions_probe PRIVATE
+        felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
+        felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
+        felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
+        felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
+        felitronics::io felitronics::text)
+    target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
+    target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
+endif()

@@ -9,6 +9,7 @@
 #include <complex>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <new>
 #include <type_traits>
 #include <vector>
@@ -92,7 +93,21 @@ struct SeamAllocator
 
     T* allocate (std::size_t n)
     {
-        if (n > static_cast<std::size_t> (-1) / sizeof (T)) throw std::bad_array_new_length();
+        // The overflow guard is DEAD through std::vector (it consults max_size() = SIZE_MAX/sizeof(T) and
+        // throws length_error first) and LIVE for a direct SeamAllocator user — keep it: on wasm32 size_t is
+        // 32 bits, so n*sizeof(T) wraps at 4 GB, a size unreachable on 64. Dropping it there would hand back
+        // a tiny buffer for a huge request and let the caller trample the heap.
+        // The #if mirrors libc++'s own __new/exceptions.h. It is not decoration: the `wasm-audio` tier builds
+        // -fno-exceptions, under which a `throw` is a hard PARSE error (not a link error), so this one line
+        // failed the whole module. _CPPUNWIND is NOT redundant — MSVC has historically defined only that one.
+        if (n > static_cast<std::size_t> (-1) / sizeof (T))
+        {
+           #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+            throw std::bad_array_new_length();
+           #else
+            std::abort();   // exactly what libc++'s operator new does with exceptions off; emscripten prints Aborted() + a stack
+           #endif
+        }
         return static_cast<T*> (::operator new (n * sizeof (T), std::align_val_t (Alignment)));
     }
     void deallocate (T* p, std::size_t) noexcept { ::operator delete (p, std::align_val_t (Alignment)); }
