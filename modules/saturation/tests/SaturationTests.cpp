@@ -645,7 +645,7 @@ int main()
         for (int b = 0; b < 100; ++b)                    // charge the blocker with real programme
         {
             for (int i = 0; i < block; ++i)
-                buf[(std::size_t) i] = (float) (0.8 * std::sin (2.0 * M_PI * 220.0 * (b * block + i) / fs));
+                buf[(std::size_t) i] = (float) (0.8 * std::sin (2.0 * core::kPi * 220.0 * (b * block + i) / fs));
             sat.process (io, 1, block);
         }
 
