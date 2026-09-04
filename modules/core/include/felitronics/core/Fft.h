@@ -97,15 +97,19 @@ struct SeamAllocator
         // throws length_error first) and LIVE for a direct SeamAllocator user — keep it: on wasm32 size_t is
         // 32 bits, so n*sizeof(T) wraps at 4 GB, a size unreachable on 64. Dropping it there would hand back
         // a tiny buffer for a huge request and let the caller trample the heap.
-        // The #if mirrors libc++'s own __new/exceptions.h. It is not decoration: the `wasm-audio` tier builds
-        // -fno-exceptions, under which a `throw` is a hard PARSE error (not a link error), so this one line
-        // failed the whole module. _CPPUNWIND is NOT redundant — MSVC has historically defined only that one.
+        // The #if mirrors libc++'s own __throw_bad_array_new_length (__new/exceptions.h), which throws where
+        // exceptions exist and aborts where they do not. It is not decoration: the `wasm-audio` tier builds
+        // -fno-exceptions, and this one line failed every TU that touched an AlignedVector. Note WHEN it
+        // fails — at INSTANTIATION of the member, not at parse: including this header under -fno-exceptions
+        // is clean on Apple clang, em++ and gcc alike (all three measured), which is why the probe that
+        // guards it instantiates rather than merely including.
+        // _CPPUNWIND is NOT redundant — MSVC documents that macro and defines no __cpp_exceptions.
         if (n > static_cast<std::size_t> (-1) / sizeof (T))
         {
            #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::bad_array_new_length();
            #else
-            std::abort();   // exactly what libc++'s operator new does with exceptions off; emscripten prints Aborted() + a stack
+            std::abort();   // libc++ spells this _LIBCPP_VERBOSE_ABORT; abort() keeps emscripten's Aborted() + stack
            #endif
         }
         return static_cast<T*> (::operator new (n * sizeof (T), std::align_val_t (Alignment)));

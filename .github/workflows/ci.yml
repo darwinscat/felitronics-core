@@ -65,6 +65,122 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-san --output-on-failure
 
+  # wasm-audio — the tier DSP-ARCHITECTURE.md §2 declares, GATED here instead of aspirational. Builds every
+  # default module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole suite in node, and
+  # proves the no-threads claim from the ARTIFACTS rather than from the command line. It is also the only
+  # place CI compiles the P0 spike at all — that build broke unnoticed once, precisely because nothing here
+  # touched it.
+  #
+  # WHAT THIS GATE ACTUALLY CATCHES, so nobody reads more into a green tick than it earns:
+  #   an exception or RTTI            -> COMPILE error (the preset's -fno-exceptions -fno-rtti)
+  #   an incompatible dependency      -> compile/link error
+  #   an allocation in process()      -> RUNTIME failure. Emscripten is libc++, so felitronics_test.h's
+  #                                      okNoAlloc() takes its enforcing branch — on Linux/libstdc++ it does
+  #                                      not, so this tier enforces what the ubuntu rows only record.
+  #   a THREAD on a live path         -> LINK error, but ONLY because the tier links --wrap=pthread_create.
+  #                                      On its own this would not be a build error at all: measured on emsdk
+  #                                      6.0.9, without -pthread std::thread compiles AND LINKS (the pthread
+  #                                      stubs return ENOTSUP) and merely aborts at runtime. Two things the
+  #                                      wrap still cannot see: a thread in code never emitted (an unused
+  #                                      inline, an uninstantiated template), and std::mutex, whose lock sits
+  #                                      inside libc++-noexcept.a — hence the header lint below.
+  #   denormal / law-8 violations     -> NOT caught, at all. That is a property of the CPU at runtime, not of
+  #                                      the build (see the KWeightingFilter finding).
+  #
+  # ubuntu, NOT macos, and for the parity step that is load-bearing: Apple's libm and musl (what emscripten
+  # compiles in) return different doubles from tan() at 88.2 and 192 kHz, so an arm64-macOS reference would
+  # diverge from wasm for a reason that is not a regression. glibc agrees with musl at every rate measured.
+  # docs/P0-WASM-SPIKE.md has the numbers.
+  wasm-audio:
+    name: wasm-audio-tier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install emsdk 6.0.9
+        # Installed from upstream directly rather than through a third-party action, so the only thing this
+        # job trusts is emscripten itself. 6.0.9 is the toolchain every number in docs/P0-WASM-SPIKE.md was
+        # measured on; moving it should be a deliberate act, not drift.
+        # `--branch 6.0.9` pins the CLONE too. Without it `--depth 1` fetches emsdk master — the installer
+        # and the release manifest — and only the SDK *version argument* would be pinned, which is not the
+        # same thing and would have made the word "pinned" here false.
+        run: |
+          git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install 6.0.9
+          "$HOME/emsdk/emsdk" activate 6.0.9
+          source "$HOME/emsdk/emsdk_env.sh"
+          echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
+          echo "PATH=$PATH"   >> "$GITHUB_ENV"
+      - name: Configure + build the tier
+        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio
+      - name: Run the suite in node
+        # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
+        run: ctest --preset wasm-audio
+      - name: No threads — audited on EVERY emitted .wasm, not one sample
+        run: node tools/wasm/check-no-threads.mjs --all build-wasm-audio
+      - name: No threading header in a public module header
+        # The --wrap above makes a std::thread on a live code path a LINK error, which is the real gate.
+        # It does not catch std::mutex: mutex::lock lives inside libc++-noexcept.a and emscripten's stub
+        # (library_pthread_stub.c) silently returns 0, so a lock would be a no-op nobody noticed. This lint
+        # closes that, and it is honest about being a lint: it reads text, not the artifact.
+        run: |
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(thread|mutex|shared_mutex|condition_variable|future|latch|barrier|semaphore|stop_token)>' modules/*/include; then
+            echo "^^ the wasm-audio tier is single-threaded by contract (DSP-ARCHITECTURE.md 2)"; exit 1
+          fi
+          echo "no threading headers in public module headers"
+      - name: The gates still gate — negative controls
+        # A gate nobody tries to break is a gate nobody knows still works. Both of these are cheap and both
+        # would have caught a real rot: the --wrap gate depends on libc++ keeping std::thread's constructor
+        # header-inline, and a future emsdk that moves it into the archive would switch the gate off with
+        # every row still green; and the artifact audit is a hand-written wasm parser.
+        run: |
+          set -e
+          printf '#include <thread>\nint main(){ std::thread t([]{}); t.join(); return 0; }\n' > /tmp/thr.cpp
+          if em++ -std=c++20 -O1 -fno-exceptions -fno-rtti -Wl,--wrap=pthread_create /tmp/thr.cpp -o /tmp/thr.js 2>/tmp/thr.err; then
+            echo "CONTROL FAILED: a std::thread linked cleanly — the --wrap gate is not gating"; exit 1
+          fi
+          grep -q "__wrap_pthread_create" /tmp/thr.err || { echo "CONTROL FAILED: link failed for the wrong reason"; cat /tmp/thr.err; exit 1; }
+          echo "control 1 ok: a live std::thread fails the link"
+          em++ -std=c++20 -O1 -pthread /tmp/thr.cpp -o /tmp/thrp.js 2>/dev/null
+          if node tools/wasm/check-no-threads.mjs /tmp/thrp.wasm /tmp/thrp.js > /dev/null 2>&1; then
+            echo "CONTROL FAILED: the audit passed a -pthread artifact"; exit 1
+          fi
+          echo "control 2 ok: the artifact audit rejects a threaded module"
+      - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
+        # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
+        # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns
+        # a blown stack from "wrong answers, then memory access out of bounds" into a named diagnosis.
+        # The perf suite is excluded: its assertions are RELATIVE wall-clock, and SAFE_HEAP instruments every
+        # load and store, so it measures the instrumentation rather than the code.
+        run: |
+          cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
+                -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
+          cmake --build build-wasm-checked -j
+          ctest --test-dir build-wasm-checked -j4 --output-on-failure -E spectrum_pane_perf
+      - name: The P0 spike artifacts still build
+        run: ./tools/wasm/build.sh
+      - name: NULL test — native vs wasm, bit-exact, on a GENERATED fixture
+        # No private audio in a public repo: the fixture is synthesised from an integer PRNG with no
+        # transcendental in sight, so it is byte-identical on any engine. The comparison surface is the
+        # pre-gate 400 ms block-energy vector, not the scalar LUFS — a gated scalar is discontinuous in its
+        # own inputs and cannot carry a bit-exactness claim (docs/P0-WASM-SPIKE.md). The checked artifact
+        # (SAFE_HEAP + ASSERTIONS=2 + stack checks) is diffed too: building it without running it would
+        # prove nothing, and the libsoxr precedent is exactly a clean build that died at runtime.
+        run: |
+          cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
+          cmake --build build-native -j --target fcore_measure
+          node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
+          # The generator claims to be deterministic by construction; this turns that into a MEASURED fact
+          # on a different machine, OS and node build than the one it was written on. Recorded from two
+          # local runs on macOS/arm64. If a future edit to the generator changes the signal, this line is
+          # what says so, instead of every report quietly citing a different "97 block energies".
+          echo "ad4b9513d9d9b88827a07116d36ceafa5c73a7602239c8e4ff6d49c6e2beac39  fixture.f32" | sha256sum -c -
+          ./build-native/tools/fcore_measure blocks 48000 2 fixture.f32 > native.txt
+          node tools/wasm/parity.mjs tools/wasm/build/fcprobe.node.js  48000 2 fixture.f32 > wasm.txt
+          node tools/wasm/parity.mjs tools/wasm/build/fcprobe.debug.js 48000 2 fixture.f32 > wasm-checked.txt
+          diff native.txt wasm.txt
+          diff native.txt wasm-checked.txt
+          echo "bit-identical: $(sed -n 's/^blocks //p' native.txt) block energies + true peak + sample peak"
+
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.
   # Fails only on crash / unstable-or-non-finite designs (black cells); colour judgement stays human.

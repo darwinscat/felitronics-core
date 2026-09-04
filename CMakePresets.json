@@ -1,0 +1,46 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "desktop",
+            "displayName": "desktop — Release + self-tests",
+            "description": "The developer default. Release is NOT optional: felitronics_spectrum_pane_perf_tests fails an unoptimised build (19 s against 1 s).",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "FELITRONICS_BUILD_TESTS": "ON"
+            }
+        },
+        {
+            "name": "wasm-audio",
+            "displayName": "wasm-audio — the Emscripten tier (DSP-ARCHITECTURE.md §2)",
+            "description": "Every default module built for wasm32 with exceptions and RTTI OFF and no pthreads, tests run in node. Needs emsdk on PATH ($EMSDK set by emsdk_env.sh). The link-time physics of the tier (8 MB stack, growable heap, assertions) lives in CMakeLists under if(EMSCRIPTEN); this preset carries the POLICY. -ffp-contract=off is stated even though baseline wasm has no scalar FMA to contract with, so the numeric contract survives a toolchain that grows one.",
+            "binaryDir": "${sourceDir}/build-wasm-audio",
+            "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "FELITRONICS_BUILD_TESTS": "ON",
+                "CMAKE_CXX_FLAGS": "-fno-exceptions -fno-rtti -ffp-contract=off"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "desktop",    "configurePreset": "desktop",    "jobs": 0, "configuration": "Release" },
+        { "name": "wasm-audio", "configurePreset": "wasm-audio", "jobs": 0 }
+    ],
+    "testPresets": [
+        {
+            "name": "desktop",
+            "configurePreset": "desktop",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "wasm-audio",
+            "configurePreset": "wasm-audio",
+            "description": "ctest drives each test .js through node — the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR for us.",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}

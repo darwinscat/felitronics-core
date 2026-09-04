@@ -152,7 +152,12 @@ public:
         // that asked for nothing.
         // rangeDb == 0 is documented as "no dynamics", so it must DISENGAGE, not merely target zero:
         // otherwise the last earned delta stays applied while the follower releases toward it.
-        if (! dyn_.on || dyn_.rangeDb == 0.0 || sidechain == nullptr)
+        // Spelled fabs(x) <= 0.0 rather than x == 0.0 so -Wfloat-equal has nothing to say (gcc warns on the
+        // literal comparison where clang does not — it only surfaced when this header joined the strict
+        // gate). The two are EXACTLY equivalent on every input: +-0 -> true, any other finite -> false,
+        // +-inf and NaN -> false, matching == in all four. Plain `<= 0.0` would NOT do: rangeDb's SIGN is
+        // the direction (negative = cut when loud, :138), so that would disengage half the modes.
+        if (! dyn_.on || std::fabs (dyn_.rangeDb) <= 0.0 || sidechain == nullptr)
         {
             if (engaged_) { disengage (band); engaged_ = false; }
             band.processBlock (audio, nc, numSamples);
