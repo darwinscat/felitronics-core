@@ -184,16 +184,25 @@ the CPU at runtime, invisible to any build. Full write-up:
    (~0.58 %RT either way — its hot path is pffft's intrinsics, which no contraction flag reaches).
    NB **GCC ≤ 13 implements `on` as `off`** (no `fmadd` emitted at all); GCC 14 emits the standard
    behaviour — one `fmadd` for the single-expression form, none for the cross-statement one. Verified on
-   both. This law, unlike 8 and 9, IS enforced: every non-MSVC row compiles with the flag, and the arm64
-   Linux row is what fails if it is removed.
+   both. **This law is enforced, and it is enforced differently from the two before it**: not by a lint
+   and not by a scan, but because every non-MSVC row compiles with the flag — remove it and the arm64
+   Linux row goes red on its own. (It said "unlike 8 and 9" when it was written, hours before law 9 got
+   its own two gates. Law 8 remains the odd one out: a denormal stall is a property of the CPU at
+   runtime and no build can see it.)
 
-**These laws are CI-enforced for the funded tiers, not aspirational.** Today: a
+**These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the
+difference is worth reading rather than assuming. Today: a
 no-allocation test on the paths that install an allocation counter, a compile-only `-fno-exceptions` /
 `-fno-rtti` probe over every public header on the Clang/GCC rows (MSVC spells the flags differently and is
-not a gate for it), and an **Emscripten** (`wasm-audio`) build + node run. That catches an exception, a
-dep, an alloc on an instrumented path, and (via `--wrap=pthread_create`) a thread that is actually reached;
+not a gate for it), an **Emscripten** (`wasm-audio`) build + node run, a **`long double` scan** over
+`modules/*/include` and `modules/*/src` paired with an **artifact** gate over the tier's objects (law 9),
+and **`-ffp-contract=on`** on every non-MSVC row, whose removal reds the arm64 Linux row (law 10). That
+catches an exception, a
+dep, an alloc on an instrumented path, (via `--wrap=pthread_create`) a thread that is actually reached, and
+a `long double` in core code whether it is emitted or not;
 it does **not** catch a denormal at all, nor a thread in code that is never emitted — see the box in the tier list above rather
-than trusting this sentence's older, broader wording. An
+than trusting this sentence's older, broader wording. **Law 8 is now the only law here with no gate of any
+kind**, for the reason it states: a denormal stall lives in the CPU at runtime, not in the build. An
 **arm-none-eabi** job is documented but **not gated** until an embedded product funds it (avoid
 embedded-grade CI scope creep). Third-party deps (Eigen, kissfft, pffft) must be verified to
 build under `-fno-exceptions` (some use throwing asserts).
