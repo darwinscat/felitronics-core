@@ -100,6 +100,13 @@ public:
                 for (int b = 0; b < nb; ++b) bandData (b, c)[i] = tmp[b];
             }
         }
+        // LAW 8. The crossover's SVFs are feedback state and nothing was flushing them: the per-band
+        // Compressor flushes itself (Compressor.h), and MultibandSplitter has offered flushDenormals()
+        // (MultibandSplitter.h) since it was written, but no caller in this module ever invoked it — so on
+        // silence the crossover state decayed into the subnormals and stayed there, at 10-100x the cost on
+        // any CPU without hardware FTZ. Once per block, after the split loop, exactly like every other
+        // kernel in the core. Found while fixing the same law's violation in analysis::KWeightingFilter.
+        splitter_.flushDenormals();
 
         // 2) process each band in place (bypassed bands keep their split signal)
         for (int b = 0; b < nb; ++b)

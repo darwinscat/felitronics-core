@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/Config.h>
+#include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
 
 #include <cmath>
@@ -40,6 +41,30 @@ public:
         const double y1 = sa.b0 * x  + z1a[c]; z1a[c] = sa.b1 * x  - sa.a1 * y1 + z2a[c]; z2a[c] = sa.b2 * x  - sa.a2 * y1;
         const double y2 = sb.b0 * y1 + z1b[c]; z1b[c] = sb.b1 * y1 - sb.a1 * y2 + z2b[c]; z2b[c] = sb.b2 * y1 - sb.a2 * y2;
         return y2;
+    }
+
+    // LAW 8 (docs/DSP-ARCHITECTURE.md §2). Zero the state once it is numerically dead, so it never reaches
+    // the subnormal range: with zero input these two TDF-II biquads decay and then STICK — the RLB pair
+    // (z1,z2) = (-251u, +249u), u = 2^-1074, maps to itself EXACTLY at 48 kHz — and on a CPU with no
+    // hardware FTZ, which is what a browser gives, silence then costs ~54x more than music.
+    // THE BINDING NUMBER IS THE SHELF, NOT THE RLB, and it is much smaller than it first looks. From the
+    // 1e-15 threshold the RLB (pole 0.995) needs ~2.85 s to reach the subnormal floor, but the shelf
+    // (pole 0.856) needs only **90 ms** — 4 324 samples at 48 kHz, 3 983 at 44.1 kHz, and 90 ms at every
+    // rate, since both scale together. So the owner's flush cadence has to beat 90 ms, not 2.85 s.
+    // The OWNER therefore calls this on a deterministic AUDIO boundary: not per sample (that would tax a
+    // 4.6 ns/sample path), and not per host block — 8192 samples is 170 ms at 48 kHz, already past the
+    // shelf limit, and it would also make the result depend on the caller's chunking, which this repo
+    // tests as bit-invariant. LoudnessMeter uses its 10 ms sub-hop: 480 samples at 48 kHz, a 9x margin.
+    // flushDenormal, not flushPoison: a non-finite sample freezing this meter forever is a real and SEPARATE
+    // defect (docs/P0-WASM-SPIKE.md), and fixing it properly needs an observability counter, not a quiet
+    // heal. Numbers, fixed point and benchmark: docs/LAW8-KWEIGHTING.md.
+    void flushDenormals() noexcept
+    {
+        for (int c = 0; c < ch; ++c)   // `ch`, not kMaxChannels: the rest are zeroed by reset() and never
+        {                              // processed, so flushing them is pure cost for a guaranteed no-op
+            core::flushDenormal (z1a[c]); core::flushDenormal (z2a[c]);
+            core::flushDenormal (z1b[c]); core::flushDenormal (z2b[c]);
+        }
     }
 
     const Coeffs& shelfCoeffs() const noexcept { return sa; }   // for tests (vs the canonical 48 k values)

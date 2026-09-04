@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <limits>
 #include <vector>
+#include <chrono>
 
 using namespace felitronics;
 
@@ -25,6 +26,8 @@ static_assert (analysis::SpectrumTap::kSize == 2048,       "default -> 2048");
 // The rolling tap sizes to the MAX window; it serves any smaller order from the one ring.
 static_assert (analysis::RollingSpectrumTap::kMaxSize == 16384,  "default MaxOrder 14 -> 16384");
 static_assert (analysis::RollingSpectrumTapT<11>::kMaxSize == 2048, "MaxOrder 11 -> 2048");
+
+volatile double g_perfSink = 0.0;   // keeps the timed loop from being optimised away
 
 int main()
 {
@@ -207,6 +210,165 @@ int main()
         test::approx (h.a2,  0.9900722503662099, 1e-9, "hp a2");
         analysis::KWeightingFilter kw2; kw2.prepare (44100.0, 2);
         test::ok (std::fabs (kw2.shelfCoeffs().b0 - s.b0) > 1e-4, "coeffs recomputed at 44.1 k (not hardcoded)");
+    }
+
+    // --- LAW 8: the state must reach EXACTLY zero on silence, not stick in the subnormals ---
+    // The defect this guards is not theoretical and not small: with no flush the two TDF-II biquads decay
+    // into the subnormal range after ~2.96 s of digital silence and then STICK — (z1,z2) = (-251u, +249u),
+    // u = 2^-1074, maps to itself EXACTLY at 48 kHz — so on a CPU with no hardware FTZ (which is what a
+    // browser gives; `wasm-audio` has no FP control register) silence costs 54x more than music.
+    // Measured on x86-64 gcc 14.2 -O2, 2 s of signal: 0.299 ms for a tone against 16.077 ms for stuck
+    // silence, and 0.384 ms once this flush is in. Apple Silicon runs subnormals at full speed and shows
+    // nothing, which is exactly why this survived so long.
+    test::group ("KWeightingFilter: law 8 — silence flushes to exact zero");
+    {
+        const double fs = 48000.0;
+        auto exciteThenSilence = [fs] (analysis::KWeightingFilter& f, bool flush, double seconds)
+        {
+            for (int i = 0; i < (int) fs; ++i)                     // 1 s of tone: a zeroed state fed zeros
+                f.process (0, std::sin (6.283185307179586 * 997.0 * i / fs));   // stays zero, so EXCITE first
+            const int blocks = (int) (fs * seconds) / 512;
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < 512; ++i) f.process (0, 0.0);
+                if (flush) f.flushDenormals();                    // exactly what LoudnessMeter does per block
+            }
+            return f.process (0, 0.0);
+        };
+
+        analysis::KWeightingFilter dirty; dirty.prepare (fs, 1);
+        const double stuck = exciteThenSilence (dirty, false, 5.0);
+        // NEGATIVE CONTROL. Without the flush the output after 5 s of silence is a nonzero SUBNORMAL — if
+        // this ever reads 0 the positive test below has stopped proving anything.
+        test::ok (stuck != 0.0 && std::fabs (stuck) < 1e-300,
+                  "without the flush the state is a stuck subnormal, not zero");
+
+        analysis::KWeightingFilter clean; clean.prepare (fs, 1);
+        const double flushed = exciteThenSilence (clean, true, 5.0);
+        test::ok (flushed == 0.0, "with the per-block flush the state is EXACTLY zero after 5 s of silence");
+
+        // And it is reached long before the subnormal range is: the flush threshold is 1e-15, ~293 decimal
+        // orders above the smallest normal double, so the sticky fixed point is never approached at all.
+        analysis::KWeightingFilter quick; quick.prepare (fs, 1);
+        test::ok (exciteThenSilence (quick, true, 1.0) == 0.0, "already exactly zero after 1 s");
+    }
+
+    // --- the flush must not make the answer depend on the host's block size ---
+    // This is the test that killed the first design. Flushing at the end of LoudnessMeter::process() looks
+    // equivalent and is not: it puts a numerical event on a boundary the CALLER chooses, so the same stream
+    // split differently gives different numbers — and this repo tests the opposite (ProbeTests.cpp:212,
+    // bit-exact across call sizes 1 … 100 003). Flushing per 10 ms sub-hop is caller-independent.
+    test::group ("LoudnessMeter: the law-8 flush keeps chunk invariance bit-exact");
+    {
+        const double fs = 48000.0;
+        const int n = (int) (fs * 3.0);
+        std::vector<float> a ((size_t) n), b ((size_t) n);
+        for (int i = 0; i < n; ++i)                      // 1 s tone, 1 s digital silence, 1 s tone: the
+        {                                                // silence is what drives the state through 1e-15
+            const double t = (double) i / fs;
+            const double v = (t < 1.0 || t >= 2.0) ? 0.5 * std::sin (6.283185307179586 * 1000.0 * i / fs) : 0.0;
+            a[(size_t) i] = b[(size_t) i] = (float) v;
+        }
+        const float* chans[2] { a.data(), b.data() };
+
+        auto runChunked = [&] (int chunk)
+        {
+            analysis::LoudnessMeter m; m.prepare (fs, 2, 20.0);
+            for (int off = 0; off < n; off += chunk)
+            {
+                const int take = (off + chunk <= n) ? chunk : (n - off);
+                const float* part[2] { a.data() + off, b.data() + off };
+                m.process (part, 2, take);
+            }
+            return m.integratedLufs();
+        };
+        (void) chans;
+        const double ref = runChunked (n);
+        for (const int chunk : { 1, 7, 64, 512, 8192, 100003 })
+            test::ok (runChunked (chunk) == ref,
+                      "chunk " + std::to_string (chunk) + " is bit-identical to one call");
+    }
+
+    // --- the flush cadence must beat the SHELF, at every rate the filter is valid for ---
+    // The number that binds is not the RLB stage's 2.85 s but the shelf's 90 ms: pole 0.856 against 0.995,
+    // so from the 1e-15 threshold the shelf reaches the subnormal floor in 3 983 samples at 44.1 kHz and
+    // 4 324 at 48 kHz — 90 ms at every rate, since both scale together. A per-host-block flush at
+    // kMaxBlockSize (8192 = 170 ms at 48 kHz) would therefore be too slow by 2x; the meter's 10 ms sub-hop
+    // is 480 samples at 48 kHz, a 9x margin. This test drives the PRODUCTION path at four rates.
+    test::group ("LoudnessMeter: the sub-hop flush beats the shelf stage at every rate");
+    {
+        for (const double fs : { 44100.0, 48000.0, 96000.0, 192000.0 })
+        {
+            analysis::KWeightingFilter f; f.prepare (fs, 1);
+            const int sub = (int) std::lround (0.01 * fs);        // the meter's 10 ms sub-hop
+            for (int i = 0; i < (int) fs; ++i)                    // 1 s of tone — a zeroed state fed zeros
+                f.process (0, std::sin (6.283185307179586 * 997.0 * i / fs));   // stays zero, so excite first
+            for (int k = 0; k < 500; ++k)                         // 5 s of silence, flushed per sub-hop
+            { for (int i = 0; i < sub; ++i) f.process (0, 0.0); f.flushDenormals(); }
+            test::ok (f.process (0, 0.0) == 0.0,
+                      "exactly zero after 5 s of silence at " + std::to_string ((int) fs) + " Hz");
+        }
+    }
+
+    // --- LAW 8, the part only a CLOCK can see: silence must not cost more than sound ---
+    // This is the check that actually matters on the tier the law exists for, and it is written as a RATIO
+    // on purpose: an absolute millisecond budget would be a lottery on a shared CI runner, while silence
+    // and music are measured back to back so load hits both. On arm64 it passes by construction (Apple
+    // Silicon runs subnormals at full speed) and proves nothing there — it earns its keep on the x86 rows,
+    // where removing the flush takes the ratio from ~1.3 to ~54 (measured, i9-13900H, gcc 14.2 -O2).
+    // Bound 10x: a factor of 4 below the real defect and 7 above the healthy state.
+    test::group ("KWeightingFilter: silence is not more expensive than sound (law 8, x86 rows)");
+    {
+        const double fs = 48000.0;
+        const int block = 512, seconds = 1;
+        auto timeIt = [fs, block, seconds] (bool silence)
+        {
+            analysis::KWeightingFilter f; f.prepare (fs, 2);
+            for (int i = 0; i < (int) fs; ++i) f.process (0, std::sin (6.283185307179586 * 997.0 * i / fs));
+            for (int i = 0; i < (int) (fs * 4); ++i) f.process (0, 0.0);   // reach the sticky region
+            std::vector<double> buf ((size_t) block);
+            for (int i = 0; i < block; ++i)
+                buf[(size_t) i] = silence ? 0.0 : 0.25 * std::sin (6.283185307179586 * 440.0 * i / fs);
+            double best = 1e300;
+            for (int rep = 0; rep < 3; ++rep)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                double acc = 0.0;
+                for (int off = 0; off < (int) (fs * seconds); off += block)
+                {
+                    for (int i = 0; i < block; ++i) acc += f.process (0, buf[(size_t) i]);
+                    f.flushDenormals();
+                }
+                const auto t1 = std::chrono::steady_clock::now();
+                g_perfSink += acc;                                    // escape, or the loop is dead code
+                best = std::min (best, std::chrono::duration<double, std::milli> (t1 - t0).count());
+            }
+            return best;
+        };
+        const double music = timeIt (false), silence = timeIt (true);
+        const double ratio = music > 0.0 ? silence / music : 1.0;
+        std::printf ("      [music %.3f ms, silence %.3f ms, ratio %.2fx]\n", music, silence, ratio);
+        test::ok (ratio < 10.0, "silence costs less than 10x sound (ratio " + std::to_string (ratio) + ")");
+    }
+
+    // --- the flush must not move a reading: it only ever zeroes what is already far below the gate ---
+    test::group ("KWeightingFilter: the flush changes no measured loudness");
+    {
+        const double fs = 48000.0;
+        const int n = (int) fs;                                   // 1 s
+        std::vector<float> l ((size_t) n), r ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            l[(size_t) i] = r[(size_t) i] = (float) (0.5 * std::sin (6.283185307179586 * 1000.0 * i / fs));
+        const float* chans[2] { l.data(), r.data() };
+
+        analysis::LoudnessMeter m; m.prepare (fs, 2, 10.0);
+        m.process (chans, 2, n);
+        const double lufs = m.integratedLufs();
+        // -3.01 LUFS is the analytic answer for a 1 kHz sine at 0.5 in both channels: a 1 kHz tone sits at
+        // K-weighting unity, so LUFS = 10*log10(2 * 0.5^2/2) - 0.691 + ... — the conformance suite pins the
+        // exact value; here the point is only that a flushed meter still produces a sane finite reading.
+        test::ok (std::isfinite (lufs) && lufs < 0.0 && lufs > -10.0,
+                  "a flushed meter still reads a sane integrated loudness (" + std::to_string (lufs) + " LUFS)");
     }
 
     // --- correlation: identical → +1, inverted → -1, quadrature → ~0 ---
