@@ -544,20 +544,43 @@ int main()
     {
         std::uint64_t seed = 0x51EDull;
         auto uni = [&] { seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27; return (float) ((seed * 0x2545F4914F6CDD1Dull) >> 40) / 8388608.0f - 1.0f; };
+        // MINIMUM OF 300 SINGLE TICKS, with the harness's own PRNG fill OUTSIDE the clock. Both halves of
+        // that sentence were bought with a CI failure, so they are worth the paragraph.
+        //
+        // It used to be the best of three windows of a HUNDRED ticks. Same 300 ticks of work, but the wrong
+        // shape: a min over windows needs ONE clean window, and a 100-tick window here is ~15 ms, which
+        // necessarily spans several scheduler quanta. On a co-tenanted 3-vCPU CI VM there is no clean 15 ms,
+        // so best-of-3 — or best-of-30 — buys nothing, and the two panes are timed in SEPARATE windows, so
+        // whatever steal each one caught lands in the ratio. That is exactly what happened: the runner read
+        // 308 us for the fast pane against ~95 here, but only 323 against ~156 for the pane it copies —
+        // 3.24x versus 2.08x. A slower machine scales both alike; only additive contamination of separately
+        // timed windows skews them, and the fast pane, timed last, wore it.
+        //
+        // A single tick is ~60-150 us and fits inside one quantum, so each of the 300 draws is its own
+        // chance at a clean sample and the minimum finds one with overwhelming probability. Measured on an
+        // 18-core Mac, this pane pair on pffft: the old estimator reads 1.73/1.90/1.81 quiet and
+        // 1.83/1.81/1.84/1.87 under twenty busy loops — a 10 % spread; this one reads 2.361/2.373/2.367
+        // quiet and 2.389/2.369/2.394/2.375 loaded — 1.4 %, and the loaded and quiet ranges OVERLAP.
+        // Contention finer than a tick (memory bandwidth, DVFS) is multiplicative and cancels in a ratio.
+        //
+        // The fill moves out because it is the harness, not the pane: 16384 PRNG samples cost ~25 us per
+        // tick and were being charged to both panes equally, which drags a ratio toward 1. That single
+        // change is most of the gap between the old numbers and these (and reconciles the suite with
+        // docs/PERF-ANALYZER-MULTIRES.md, whose harness never timed it). NB a min-of-N ratio sits ABOVE a
+        // median-of-N ratio — per-tick jitter is proportionally larger on the cheaper pane — so 2.37 here
+        // and 1.82 in the doc's median-of-nine table are the same panes under two estimators, not a
+        // disagreement.
         auto tickMicros = [&] (auto& pane, int frameSamples, int order)
         {
             analysis::PlotMap pm; pm.width = 900.0f; pm.height = 300.0f; pm.plotBottom = 300.0f;
             volatile float sink = 0.0f; double best = 1e30;
-            for (int run = 0; run < 3; ++run)
+            for (int t = 0; t < 300; ++t)
             {
+                float* f = pane.frameInput(); for (int i = 0; i < frameSamples; ++i) f[i] = uni();   // NOT timed
                 const auto t0 = std::chrono::steady_clock::now();
-                for (int t = 0; t < 100; ++t)
-                {
-                    float* f = pane.frameInput(); for (int i = 0; i < frameSamples; ++i) f[i] = uni();
-                    pane.ingest (order);
-                    pane.buildColumns (pm, 48000.0, 1.5, 1000.0, [&] (int, float, float y, float yp) { sink = sink + y + yp; });
-                }
-                best = std::min (best, std::chrono::duration<double, std::micro> (std::chrono::steady_clock::now() - t0).count() / 100.0);
+                pane.ingest (order);
+                pane.buildColumns (pm, 48000.0, 1.5, 1000.0, [&] (int, float, float y, float yp) { sink = sink + y + yp; });
+                best = std::min (best, std::chrono::duration<double, std::micro> (std::chrono::steady_clock::now() - t0).count());
             }
             return best;
         };
@@ -579,6 +602,18 @@ int main()
             // The fast sibling on the same backend. With the transform this cheap, what it removes —
             // a log10 and an exp per bin, and the column geometry the fill and the peak each derived
             // for themselves — is most of what is left, so the gap is at its widest here.
+            //
+            // The bar stayed at 0.85 through the CI failure that prompted the estimator above, and that is
+            // the point: the claim was never what broke. With the intrinsic tick measured rather than a
+            // window of them plus the harness's PRNG, this pair reads ~2.37x on pffft — twice the margin
+            // the bar asks for, and it did not move under twenty busy loops. It cannot fall below 1 by
+            // construction either: the fast pane's work is a strict SUBSET of the pane it copies — same
+            // ladder (pinned by #107's transform tally), same magnitude loop, minus two libm calls per bin
+            // and minus the column geometry the fill and the peak each used to derive for themselves.
+            //
+            // What could still make it red on a machine nobody here has: a part whose libm is far cheaper
+            // relative to its FFT than Apple's. The printed number is the diagnosis — a red at 2.3 means
+            // the code changed, a red near 1.0 means look at the machine before the code.
             auto mf = std::make_unique<analysis::MultiResSpectrumPaneFastT<14, 4, Po>>();
             mf->coverSamples = 1600;
             const double uf = tickMicros (*mf, 16384, 14);
