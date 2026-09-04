@@ -38,7 +38,17 @@ jobs:
       - name: Build
         run: cmake --build build --config Release -j   # --config is required by multi-config gens (VS on Windows)
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure   # -C likewise (no-op on single-config)
+        # The perf-shaped suites run VERBOSE first, then everything runs normally. Two lines, and they
+        # exist because `--output-on-failure` prints a test's stdout only when it FAILS — so every gate
+        # that compares timings is invisible in a green run, and you cannot tell a gate from an ornament.
+        # That bit twice in one day: when the new arm64 row went red nobody could see what ratio it had
+        # measured, and when the pane gate was repaired nobody could see whether it now passed by 2.2x or
+        # by 1.02x. Same red on a real failure (the verbose run fails first and prints everything); on a
+        # green run, the numbers are in the log. `-R` matching nothing exits 0, so the pffft=OFF rows just
+        # skip that one. Costs ~3 s.
+        run: |
+          ctest --test-dir build -C Release -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
+          ctest --test-dir build -C Release --output-on-failure   # -C likewise (no-op on single-config)
 
   # Dedicated ASan + UBSan job. UBSan makes platform-divergent UB LOUD on x86-64 (integer /0, signed
   # overflow, OOB shift, null store) that is SILENT on the dev machine (Apple-Silicon ARM64) — the exact
@@ -93,7 +103,9 @@ jobs:
       - name: Build
         run: cmake --build build-gcc14 -j
       - name: Test
-        run: ctest --test-dir build-gcc14 --output-on-failure
+        run: |
+          ctest --test-dir build-gcc14 -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
+          ctest --test-dir build-gcc14 --output-on-failure
 
   # wasm-audio — the tier DSP-ARCHITECTURE.md §2 declares, GATED here instead of aspirational. Builds every
   # default module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole suite in node, and
