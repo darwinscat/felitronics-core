@@ -466,6 +466,12 @@ public:
 
     // ---- read-outs of the audio thread, for a strip or a dump ----
     float liveMix() const { return liveMix_.load(std::memory_order_acquire); }        // applied weight of slot 1
+    // Applied blend gains — what the audio thread multiplied by on the last block, not what was asked for.
+    // Same read-out contract as liveMix() above: a strip can show the gain that is actually in the sound
+    // while the ramp is still travelling, and it is the only place a law-8 regression on these ramps is
+    // visible at all (the stuck value is a subnormal that adds nothing to a normal sample).
+    float liveDry() const { return liveDry_.load(std::memory_order_acquire); }
+    float liveWet() const { return liveWet_.load(std::memory_order_acquire); }
     // The file id held in a slot right now ("" = nothing yet).
     std::string heldFileId(int slot) const {
         const auto id = held_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed);
@@ -648,8 +654,8 @@ public:
                 const float wantDry = dryGain_.load(std::memory_order_acquire);
                 const float wantWet = wetGain_.load(std::memory_order_acquire);
                 const float decay   = std::exp(-(float) count / (float) (0.010 * fs_));
-                const float endDry  = wantDry + (curDry_ - wantDry) * decay;
-                const float endWet  = wantWet + (curWet_ - wantWet) * decay;
+                const float endDry  = rampEnd(wantDry, curDry_, decay);   // law 8 — see rampEnd
+                const float endWet  = rampEnd(wantWet, curWet_, decay);
                 const float stepDry = (endDry - curDry_) / (float) count;
                 const float stepWet = (endWet - curWet_) / (float) count;
                 for (int c = 0; c < channels_; ++c) {
@@ -660,6 +666,8 @@ public:
                     }
                 }
                 curDry_ = endDry; curWet_ = endWet;
+                liveDry_.store(endDry, std::memory_order_release);
+                liveWet_.store(endWet, std::memory_order_release);
             }
             done += count;
         }
@@ -933,12 +941,30 @@ private:
         }
     }
 
+    // Law 8. Every gain here approaches its target asymptotically — `end = want + (current-want)*decay`
+    // — so it never arrives: the residual parks in a fixed-point band and stays. For want == 0 that band
+    // is subnormal (at 128 samples / 48 kHz decay = 0.766, so every k*u with k <= 0.5/(1-decay) ~= 2.1
+    // maps to itself; measured: frozen at 2 ulp, stall beginning ~1 s in), and the audio then pays for it
+    // per sample: `gd += stepDry; a[c][i]*gw + d[c][i]*gd` is ~3 assisting operations per sample per
+    // channel, and the mix loop is gated on `dryActive_` — a dry IR being LOADED — not on either gain.
+    //
+    // An EXACT zero is reachable and the repo's own fixture ships one: `BlendKnob::linOf` returns 0.0 for
+    // any level at or below -120 dB, which is how a pack spells "this path is off" (RigPlayerTests.cpp's
+    // rig: wetDb -120 at the dry end, dryDb -120 at the wet end). What does NOT stall is the initialised
+    // or reset 0 — 0 -> 0 stays exactly 0; the stall needs an audible position first and a -120 dB one
+    // after it. The second condition below covers the non-zero targets the same way core::Smoother does.
+    static float rampEnd(float want, float current, float decay) {
+        const float d  = (current - want) * decay;
+        const float nx = want + d;
+        return (std::fabs(d) < 1e-30f || felitronics::core::exactlyEqual(nx, current)) ? want : nx;
+    }
+
     // One linear ramp per block toward an exponential ~10 ms endpoint: smooth moves without an exp()
     // per sample. `current` is audio-thread-only.
     static bool isOne(float g) { const float one = 1.0f; return std::memcmp(&g, &one, sizeof(float)) == 0; }   // bit for bit, as same()
     void rampInto(float* const* planes, int nch, int count, float want, float& current) const {
         const float decay = std::exp(-(float) count / (float) (0.010 * fs_));
-        const float end   = want + (current - want) * decay;
+        const float end   = rampEnd(want, current, decay);
         const float step  = (end - current) / (float) count;
         if (! isOne(current) || ! isOne(want))
             for (int c = 0; c < nch; ++c) {
@@ -1002,6 +1028,7 @@ private:
     std::atomic<int>           slotDelay_[2] { 0, 0 };
     std::atomic<std::uint64_t> held_[2] { 0, 0 };
     std::atomic<float>         liveMix_ { 0.0f };
+    std::atomic<float>         liveDry_ { 0.0f }, liveWet_ { 1.0f };
     std::atomic<int>           warmBlocks_ { 0 }, mixJumps_ { 0 };
     std::atomic<float>         biggestJump_ { 0.0f };
     std::atomic<long long>     coldAfter_ { 0 };          // coldSeconds_ at fs_, for the law; 0 = never

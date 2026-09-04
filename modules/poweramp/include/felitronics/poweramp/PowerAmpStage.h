@@ -264,6 +264,27 @@ struct PowerAmpStage::Impl
         }
     }
 
+    // Law 8 for the block-rate coefficient smoothers below. `cur += a*(target-cur)` is asymptotic, so it
+    // never arrives: the residual has a fixed-point band at k*ulp(target), k <= 0.5/a (~5 at block 128 /
+    // 48 kHz, where a = 0.101), and simply parks there. Two conditions, as in core::Smoother — a threshold
+    // for target 0, and "the update did not move the value" for every other target, which cannot fire
+    // early because in the normal range the mantissa makes k*a >> 0.5.
+    //
+    // Most of these are consumed by a per-BLOCK gate (`presOn`, `depthOn`, `loadOn`, `biasOn`, `ironOn`,
+    // all `> 1e-4f`) which reads a stuck subnormal as "off" — the right answer, reached by accident. But
+    // `topoCur` is NOT gated: TubeStage blends `(1-topo)*pp + topo*se` on every OVERSAMPLED sample, so
+    // after one SE->PP toggle a stuck topo costs two subnormal ops x the oversample factor, per sample,
+    // per channel, forever. `leakCur` reaches the per-sample curves the same way. So this is not the
+    // 13-FMAs-per-block housekeeping it looks like. Snapping also restores a real property: topo lands on
+    // EXACT 0, so the "all-off => bare push-pull path, byte-identical" contract holds after a toggle and
+    // not only from a cold start.
+    static void glide (float& cur, float target, float a) noexcept
+    {
+        const float d  = a * (target - cur);
+        const float nx = cur + d;
+        cur = (std::fabs (d) < 1e-30f || core::exactlyEqual (nx, cur)) ? target : nx;
+    }
+
     void processChunk (float* const* io, int nCh, int n)
     {
         if (n <= 0) return;   // guards the 1.0f/n ramps below: a 0-length chunk is a div-by-zero
@@ -271,19 +292,19 @@ struct PowerAmpStage::Impl
         // --- per-block coefficient smoothing (~25 ms one-pole at block rate; first block snaps) ---
         const float a = (! primed) ? 1.0f
                       : (sampleRate > 0.0 ? (float) (1.0 - std::exp (- (double) n / (0.025 * sampleRate))) : 1.0f);
-        gCur    += a * (gTarget    - gCur);
-        outCur  += a * (outTarget  - outCur);
-        topoCur += a * (topoTarget - topoCur);
-        kCur    += a * (kTarget    - kCur);
-        vbCur   += a * (vbTarget   - vbCur);
-        bSeCur  += a * (bSeTarget  - bSeCur);
-        leakCur += a * (leakTarget - leakCur);
-        sagCur   += a * (sagTarget   - sagCur);
-        loadCur  += a * (loadTarget  - loadCur);
-        ironCur  += a * (ironTarget  - ironCur);
-        biasCur  += a * (biasTarget  - biasCur);
-        presCur  += a * (presTarget  - presCur);
-        depthCur += a * (depthTarget - depthCur);
+        glide (gCur,    gTarget,    a);
+        glide (outCur,   outTarget,   a);
+        glide (topoCur,  topoTarget,  a);
+        glide (kCur,     kTarget,     a);
+        glide (vbCur,    vbTarget,    a);
+        glide (bSeCur,   bSeTarget,   a);
+        glide (leakCur,  leakTarget,  a);
+        glide (sagCur,   sagTarget,   a);
+        glide (loadCur,  loadTarget,  a);
+        glide (ironCur,  ironTarget,  a);
+        glide (biasCur,  biasTarget,  a);
+        glide (presCur,  presTarget,  a);
+        glide (depthCur, depthTarget, a);
 
         const Voicing& v = voicing;
 

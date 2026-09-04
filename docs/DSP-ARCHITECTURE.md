@@ -125,7 +125,9 @@ the CPU at runtime, invisible to any build. Full write-up:
 7. **C++ subset that all toolchains accept** (C++20 desktop; keep an eye on what Emscripten and the
    embedded toolchain support).
 8. **Denormals: every feedback kernel flushes in SOFTWARE; hardware FTZ is a desktop optimization,
-   never a correctness crutch.** *(The subtle hole: WASM and many
+   never a correctness crutch.** Every recursive kernel in the repo now has a written verdict —
+   including the clean ones and why — in [`LAW8-AUDIT.md`](LAW8-AUDIT.md); the mechanism is a
+   **fixed-point band**, not "it eventually underflows". *(The subtle hole: WASM and many
    embedded ARMs expose no FP-control register, so an "adapter sets FTZ, core assumes it" rule silently
    fails on the `wasm-audio` tier → feedback filters decay into subnormals on silence → 10–100× CPU
    spike.)* `teq` already does the right thing: `Biquad/Svf::flushDenormals()` zaps `|state| < 1e-15f`

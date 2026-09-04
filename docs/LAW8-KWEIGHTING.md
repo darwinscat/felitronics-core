@@ -111,9 +111,14 @@ without it.
   is designed at 1682 Hz, so below **3364 Hz** the bilinear `tan(π f₀/fs)` goes negative and the shelf pole
   leaves the unit circle — |pole| = 1.31 at 3 kHz, **2.15 at 1 kHz**. The filter is unstable there and the
   loudness answer is meaningless, while `prepare()` happily accepts it.
-- **Other unflushed recursive state**, found in the same audit and left alone on purpose:
-  `saturation::Saturator`'s DC blocker flushes non-finite only, *by design*, with a written rationale that
-  deserves its owner's decision rather than a drive-by change; `core::Smoother` can stick when its target is
-  exactly zero (a mute), though it has no in-repo caller of `next()`; `poweramp`'s coefficient smoothers and
-  `rigplayer`'s gain state are the same shape. The claim that K-weighting was "the only feedback kernel
-  without a flush" was true only of `core` + `analysis` + `oversampling`, and is not repeated here.
+- ~~**Other unflushed recursive state**, found in the same audit and left alone on purpose.~~
+  **CLOSED — the audit was finished, and this paragraph was wrong about the most expensive item in it.**
+  All of `core::Smoother`, `poweramp`'s coefficient smoothers, `rigplayer`'s gain ramps and
+  `saturation::Saturator`'s DC blocker were stalling, plus two nobody had looked at
+  (`analysis::CorrelationMeter`, whose `flushDenormals()` existed with **zero callers** — this file's own
+  `MultibandSplitter` lesson, repeating — and `dynamics::AutoLeveler`). The Saturator was recorded above as
+  a design decision deserving its owner's judgement; the judgement turned on an assumption that does not
+  hold. Its state does **not** traverse the subnormals and underflow: it freezes at 2.14e-42 after 1.5 s,
+  escapes the stage as −3.4e-41 on every sample, and costs a measured **23.9×** on x86. The rationale also
+  appealed to a NULL that never exercised the case. Full write-up, with the four kernels that are genuinely
+  clean and why: [`LAW8-AUDIT.md`](LAW8-AUDIT.md).
