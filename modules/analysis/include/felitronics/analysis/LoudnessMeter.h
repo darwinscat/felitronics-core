@@ -87,6 +87,17 @@ public:
     // block sizes prepare() for its longest program and checks this reads 0.
     int droppedBlocks() const noexcept { return droppedBlocks_; }
 
+    // The 400 ms gating blocks' K-weighted mean-square energies, in arrival order, exactly as finishHop()
+    // recorded them — BEFORE either gate. This is what a cross-toolchain bit-exactness check compares:
+    // integratedLufs() is DISCONTINUOUS in these energies (a block landing within ~1e-12 of a gate flips its
+    // inclusion and moves the reading by ~0.01 dB), so it cannot carry a bit-identity claim, while the vector
+    // itself is continuous in the input samples and can. Raw energy, not dB, deliberately — a dB accessor
+    // would route the comparison back through log10, whose 1-ulp disagreement between libms is precisely what
+    // such a check must not inherit. Valid for gatingBlockCount() entries until the next
+    // process()/reset()/prepare(); the count is 0 (and the pointer may be null) before prepare().
+    int           gatingBlockCount()    const noexcept { return blockCount; }
+    const double* gatingBlockEnergies() const noexcept { return blockE.data(); }
+
 private:
     static constexpr int kMaxChannels      = core::kMaxChannels;
     static constexpr int kSubHopsPerHop    = 10;                                    // 10 × 10 ms = the 100 ms gating hop
