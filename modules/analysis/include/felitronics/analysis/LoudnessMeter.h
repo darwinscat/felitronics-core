@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <span>
 #include <vector>
 
 namespace felitronics::analysis
@@ -86,6 +87,28 @@ public:
     // loudnessRangeLu() describe the first maxDurationSec of the program only — a caller that must not lose a
     // block sizes prepare() for its longest program and checks this reads 0.
     int droppedBlocks() const noexcept { return droppedBlocks_; }
+
+    // The 400 ms gating blocks' K-weighted mean-square energies, in arrival order, exactly as finishHop()
+    // recorded them — BEFORE either gate. This is what a cross-toolchain bit-exactness check compares:
+    // integratedLufs() is DISCONTINUOUS in these energies (a block landing within ~1e-12 of a gate flips its
+    // inclusion and moves the reading by ~0.01 dB), so it cannot carry a bit-identity claim, while the vector
+    // itself is continuous in the input samples and can. Raw energy, not dB, deliberately — a dB accessor
+    // would route the comparison back through log10, whose 1-ulp disagreement between libms is precisely what
+    // such a check must not inherit.
+    //
+    // The span is valid until the next prepare() (the only place the storage is reallocated); process() only
+    // appends, and reset() zeroes the count rather than the storage. Empty before prepare().
+    //
+    // WHAT THIS PINS. It commits the meter to keeping every block's energy as a contiguous array of double in
+    // arrival order. Retention itself is already forced by the two-pass relative gate, so the new constraint
+    // is only the storage shape — but it does stand in the way of the one plausible future change here, a
+    // libebur128-style HISTOGRAM mode for unbounded streams (which is the real answer to droppedBlocks()).
+    // Should that arrive, this accessor returns an empty span in histogram mode rather than pretending.
+    std::span<const double> gatingBlockEnergies() const noexcept
+    {
+        return { blockE.data(), (std::size_t) blockCount };
+    }
+    int gatingBlockCount() const noexcept { return blockCount; }
 
 private:
     static constexpr int kMaxChannels      = core::kMaxChannels;

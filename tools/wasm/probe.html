@@ -1,0 +1,102 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later
+     Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
+
+     P0 acceptance criterion 3: this page loads the module, feeds it an f32 buffer and prints the numbers,
+     served with NO COOP/COEP headers — which is only possible because the build has no threads. It reports
+     crossOriginIsolated so the absence is visible rather than assumed.
+
+     Deliberately ugly. P0 says: do not build a nice JS wrapper. -->
+<meta charset="utf-8">
+<title>fcore P0 wasm probe</title>
+<style>
+  body { font: 13px ui-monospace, Menlo, Consolas, monospace; margin: 2rem; max-width: 60rem; }
+  fieldset { border: 1px solid #999; margin-bottom: 1rem; }
+  label { margin-right: 1rem; }
+  pre { background: #f4f4f4; padding: .75rem; overflow-x: auto; white-space: pre-wrap; }
+  .bad { color: #a00; } .good { color: #070; }
+</style>
+
+<h1>felitronics-core — P0 wasm probe</h1>
+
+<fieldset>
+  <legend>environment</legend>
+  <pre id="env">…</pre>
+</fieldset>
+
+<fieldset>
+  <legend>input — raw interleaved f32le (what <code>ffmpeg -f f32le</code> emits)</legend>
+  <label>sample rate <input id="sr" value="48000" size="8"></label>
+  <label>channels <input id="ch" value="2" size="3"></label>
+  <label><input type="file" id="file"></label>
+</fieldset>
+
+<pre id="out">pick a .f32 file…</pre>
+
+<script src="./build/fcprobe.web.js"></script>
+<script type="module">
+import { formatBlocks } from './blocks-format.mjs';
+
+const $ = (id) => document.getElementById(id);
+$('env').textContent =
+    `crossOriginIsolated : ${self.crossOriginIsolated}   <- false proves no COOP/COEP was needed\n` +
+    `SharedArrayBuffer   : ${typeof SharedArrayBuffer === 'undefined' ? 'undefined (unavailable)' : 'defined'}\n` +
+    `hardwareConcurrency : ${navigator.hardwareConcurrency}   (irrelevant — the module is single-threaded)`;
+
+let M = null;
+const ready = createFcProbe().then((m) => {
+    M = m;
+    $('out').textContent = `module loaded. os=${M._fc_probe_os_factor()}x${M._fc_probe_os_taps()} ` +
+                           `chunk=${M._fc_probe_chunk()} sizeof(long double)=${M._fc_probe_sizeof_longdouble()}\n` +
+                           `pick a .f32 file…`;
+});
+
+$('file').addEventListener('change', async (ev) => {
+    await ready;
+    const f = ev.target.files[0];
+    if (!f) return;
+    const sr = Number($('sr').value), ch = Number($('ch').value);
+    $('out').textContent = 'reading…';
+
+    const inter = new Float32Array(await f.arrayBuffer());
+    const frames = Math.floor(inter.length / ch);
+    const planar = new Float32Array(frames * ch);
+    for (let c = 0; c < ch; ++c)
+        for (let i = 0; i < frames; ++i) planar[c * frames + i] = inter[i * ch + c];
+
+    const t0 = performance.now();
+    const ptr = M._malloc(planar.length * 4);
+    if (!ptr) { $('out').textContent = 'wasm OOM'; return; }
+    // HEAPF32 is re-read AFTER the malloc and never cached: ALLOW_MEMORY_GROWTH detaches every existing view
+    // when memory grows, and writes to a detached view are silently dropped.
+    M.HEAPF32.set(planar, ptr >>> 2);
+
+    if (!M._fc_probe_run(ptr, frames, ch, sr)) { $('out').textContent = 'fc_probe_run rejected its arguments'; M._free(ptr); return; }
+
+    const n = M._fc_probe_block_count();
+    const outPtr = M._malloc(n * 8);
+    const written = M._fc_probe_block_energies(outPtr, n);
+    // Re-read, and COPY out at once: the lufs/dbtp calls below run the measurement again and can grow memory,
+    // which would detach a held view. Depending on statement order for correctness is how this bug ships.
+    const e = new Float64Array(M.HEAPF64.subarray(outPtr >>> 3, (outPtr >>> 3) + written));
+
+    // The SAME formatter the node harness uses, so the page cannot drift out of the format a diff compares.
+    const preview = formatBlocks({
+        sr, ch,
+        osFactor: M._fc_probe_os_factor(), osTaps: M._fc_probe_os_taps(), chunk: M._fc_probe_chunk(),
+        tp: M._fc_probe_tp_linear(), sp: M._fc_probe_sample_peak(),
+        energies: e, count: Math.min(written, 8),
+    }).trimEnd();
+    const tail = written > 8 ? `\n… ${written - 8} more (diff the full stream against fcore_measure blocks)` : '';
+
+    const lufs = M._fc_probe_lufs(ptr, frames, ch, sr);
+    const dbtp = M._fc_probe_dbtp(ptr, frames, ch, sr);
+    M._free(outPtr); M._free(ptr);
+
+    $('out').textContent =
+        `frames ${frames} x ${ch} ch @ ${sr} Hz   (${(performance.now() - t0).toFixed(0)} ms)\n` +
+        `integrated  ${lufs.toFixed(6)} LUFS\n` +
+        `true peak   ${dbtp.toFixed(6)} dBTP\n\n` +
+        preview + tail;
+});
+</script>

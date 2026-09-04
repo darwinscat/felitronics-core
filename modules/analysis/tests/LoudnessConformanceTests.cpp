@@ -388,6 +388,53 @@ int main()
         test::approx (many.momentaryLufs(),  one.momentaryLufs(),  1e-9, "momentary too");
     }
 
+    // --- the pre-gate block energies are exposed so a cross-toolchain check can compare a quantity that is
+    //     CONTINUOUS in the input (the gated reading jumps when a block crosses a threshold). They are only
+    //     worth exposing if they are genuinely what the reading is computed from — so re-derive BS.1770's
+    //     two-pass gating from the vector alone and null it against the meter's own answer ---
+    test::group ("gating block energies: the exposed vector re-derives the gated reading");
+    {
+        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 60.0);
+        long long idx = 0;
+        feedSine (lm, sr, kToneHz, -20.0, 3.0, idx);
+        feedSine (lm, sr, kToneHz, -35.0, 3.0, idx);           // quiet enough for the relative gate to drop it
+
+        const auto e = lm.gatingBlockEnergies();
+        const int    n = (int) e.size();
+        test::ok (n == 57, "6 s → one 400 ms block per 100 ms hop, the first at 400 ms (60 hops less 3)");
+        test::ok (e.size() == (std::size_t) n && ! e.empty(), "the span carries exactly the recorded blocks");
+
+        const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);        // energy for −70 LUFS
+        double s1 = 0.0; int c1 = 0;
+        for (int j = 0; j < n; ++j) if (e[(std::size_t) j] > absT) { s1 += e[(std::size_t) j]; ++c1; }
+        test::ok (c1 > 0, "the absolute gate kept something to average");
+        const double relT = 0.1 * (s1 / (double) c1);                        // −10 LU relative to the abs-gated mean
+        double s2 = 0.0; int c2 = 0;
+        for (int j = 0; j < n; ++j)
+        {
+            const double z = e[(std::size_t) j];
+            if (z > absT && z > relT) { s2 += z; ++c2; }
+        }
+        test::ok (c2 > 0 && c2 < c1, "the relative gate dropped the quiet stretch — so this is not a vacuous null");
+        test::approx (-0.691 + 10.0 * std::log10 (s2 / (double) c2), lm.integratedLufs(), 1e-12,
+                      "gating re-derived from the vector alone nulls the meter's own integrated reading");
+    }
+
+    // --- lifecycle: the vector is empty before prepare() and again after reset(), so a harness cannot read
+    //     a stale block from a previous run ---
+    test::group ("gating block energies: empty before prepare, cleared by reset");
+    {
+        analysis::LoudnessMeter fresh;
+        test::ok (fresh.gatingBlockCount() == 0, "no blocks before prepare()");
+        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 20.0);
+        test::ok (lm.gatingBlockCount() == 0, "none straight after prepare() either");
+        long long idx = 0;
+        feedSine (lm, sr, kToneHz, -23.0, 2.0, idx);
+        test::ok (lm.gatingBlockCount() == 17, "2 s of program → 17 blocks");
+        lm.reset();
+        test::ok (lm.gatingBlockCount() == 0, "reset() clears the count");
+    }
+
     // --- the headline RT claim: process() allocates nothing, through hops, blocks and short-term samples ---
     test::group ("process() does not allocate");
     {
