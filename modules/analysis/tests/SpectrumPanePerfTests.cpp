@@ -16,6 +16,9 @@
 #include <felitronics/analysis/MultiResSpectrumPane.h>
 #include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 
+#include <felitronics/core/Fft.h>
+
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -54,6 +57,46 @@ double tickMicros (Pane& p, int frameSamples, int order, int ticks)
     if (best[0] > best[1]) std::swap (best[0], best[1]);
     return best[1];
 }
+
+// A counting FFT backend: the scalar reference verbatim, plus a tally of transforms by size. It exists so
+// that one claim in this file can be checked WITHOUT a clock. `Tag` only gives each instantiation its own
+// tally — the panes hold their backends by value, so the counter has to be static.
+template <int Tag>
+class CountingFft
+{
+public:
+    using Inner = core::fft::ScalarRadix2Real;
+    static constexpr bool kPackedHermitianSpectrum = Inner::kPackedHermitianSpectrum;
+    static constexpr int  spectrumFloats (int n) noexcept { return Inner::spectrumFloats (n); }
+
+    static constexpr int kMaxLog2 = 24;          // wider than any order a pane template permits
+    static inline std::array<long long, kMaxLog2> tally {};      // [log2(n)] -> transforms of that size
+    static void resetTally() noexcept { tally.fill (0); }
+
+    bool prepare (int n) noexcept { n_ = n; return inner_.prepare (n); }
+    void forward (const float* r, float* w) noexcept { inner_.forward (r, w); bump(); }    // count COMPLETED
+    void inverse (const float* sp, float* w) noexcept { inner_.inverse (sp, w); bump(); }   // transforms
+    void spectralMultiplyAdd (const float* a, const float* b, float* acc) noexcept { inner_.spectralMultiplyAdd (a, b, acc); }
+
+private:
+    // Bucket k is the smallest power of two >= n_, so it is the exact size for the powers of two a radix-2
+    // backend accepts. An unprepared instance (n_ == 0) lands in bucket 0, which the schedule assertions
+    // then report as transforms missing from every expected size rather than silently matching.
+    void bump() noexcept { int k = 0; while ((1LL << k) < n_ && k < kMaxLog2 - 1) ++k; ++tally[(std::size_t) k]; }
+    Inner inner_;
+    int   n_ = 0;
+};
+
+// One tick through a pane, for the tally rather than the clock.
+template <class Pane>
+void oneTick (Pane& p, int frameSamples, int order)
+{
+    analysis::PlotMap pm; pm.width = 900.0f; pm.height = 300.0f; pm.plotBottom = 300.0f;
+    volatile float sink = 0.0f;
+    float* f = p.frameInput(); for (int i = 0; i < frameSamples; ++i) f[i] = uni();
+    p.ingest (order);
+    p.buildColumns (pm, 48000.0, 1.5, 1000.0, [&] (int, float, float y, float yp) { sink = sink + y + yp; });
+}
 }
 
 int main()
@@ -82,16 +125,38 @@ int main()
         const double us = tickMicros (*m, 16384, 14, ticks);
         std::printf ("    multi, hop %-5d %8.0f us/tick  (%5.2f %% of a 30 fps frame)\n", cover, us, 100.0 * us / kTickBudgetUs);
         ok (us < 0.20 * kTickBudgetUs, "multi at hop " + std::to_string (cover) + ": a tick stays under 20 % of the frame (" + std::to_string ((int) us) + " us)");
+        // The one check left in this file that compares SEPARATELY TIMED phases. Margin on a dev Mac is
+        // about 2x (384 us against a 794 us threshold) — two orders wider than the 1.05x ratio that used to
+        // flake below, but not unconditional: contention landing on this measurement and not on the earlier
+        // classic ones is how it would go red. Recorded so the next reader has the number rather than a
+        // hunch; deliberately NOT widened, because it has never actually been observed to fail.
         if (cover == 1600)
             ok (us < 2.0 * (classicUs[4] + classicUs[2] + 3.0 * classicUs[0]),
                 "multi at hop 1600 costs less than twice its tiers' classic panes (16384 + 4096 + 3×1024) — the stitching is not the cost");
     }
 
     //==========================================================================================
-    // The fast sibling, same ladder, same tick. On the scalar reference the FFT dominates, so the
-    // saving is a modest fraction here — but it is the SAME absolute saving as on a SIMD backend,
-    // because what it removes (a log10 and an exp per bin, and the column geometry computed twice)
-    // does not depend on the transform. The pffft suite prints the same pair where that shows.
+    // The fast sibling, same ladder, same tick.
+    //
+    // WHAT IS ASSERTED HERE AND WHAT IS NOT. The saving this sibling exists for — a log10 and an exp per
+    // bin, and the column geometry derived once instead of twice — is scalar work AROUND the transform.
+    // On this backend the transform dominates, so the difference lands inside the noise of a shared CI
+    // machine, and an assertion on the RATIO of two wall-clock timings measures the machine, not the code:
+    // `b < 1.05 * a` used to live here and failed roughly one CI run in ten with nothing changed
+    // (measured on main: 0.918889x on 2026-09-04, 0.906340x on 2026-09-02, and 0.890892x on a branch whose
+    // sibling job on the same commit passed). A check that only ever fires falsely is worse than no check:
+    // it teaches everyone that red means nothing.
+    //
+    // So the COST claim lives where the effect is large enough to measure — the pffft suite, where the
+    // sibling is 1.8-2.3x cheaper and the bar is `uf < 0.85 * up` with margin to spare. BE CLEAR ABOUT WHAT
+    // THAT COSTS: that suite is built only with FELITRONICS_WITH_PFFFT=ON, which is OFF by default, so in a
+    // default build nothing here guards the sibling's defining cost property. It is guarded at the level of
+    // the REPOSITORY, by the required pffft=ON jobs on Linux and macOS in .github/workflows/ci.yml — not by
+    // this file. The group below is deliberately a WEAKER claim, not a substitute: it pins the FFT schedule,
+    // which is what makes any timing comparison meaningful in the first place and catches a sibling that
+    // quietly starts transforming more than the pane it copies. It says nothing about the scalar work that
+    // IS the saving — a sibling that reintroduced the per-bin log10/exp would pass it untouched. The
+    // timings are still printed, for the record.
     group ("multi-resolution: the fast sibling against the pane it copies");
     {
         auto cur  = std::make_unique<analysis::MultiResSpectrumPane>();
@@ -100,8 +165,58 @@ int main()
         const double a = tickMicros (*cur, 16384, 14, ticks);
         const double b = tickMicros (*fast, 16384, 14, ticks);
         std::printf ("    multi current %8.0f us/tick   multi FAST %8.0f us/tick   (%.2fx)\n", a, b, a / b);
-        ok (b < 1.05 * a, "the fast pane is not more expensive than the pane it copies (" + std::to_string (a / b) + "x)");
-        ok (b < 0.20 * kTickBudgetUs, "and a fast tick stays under 20 % of a 30 fps frame (" + std::to_string ((int) b) + " us)");
+        ok (b < 0.20 * kTickBudgetUs, "a fast tick stays under 20 % of a 30 fps frame (" + std::to_string ((int) b) + " us)");
+    }
+
+    // Equality between the two panes is NOT enough on its own: anything that moved both of them the same
+    // way — a different tier ladder, a different hop cadence, a prepare() that silently stopped working —
+    // would keep them equal and slip through, and `total > 0` would not notice. So the EXPECTED schedule is
+    // asserted for each pane separately, and equality follows from that. The numbers are the ladder this
+    // file already names one assertion earlier: per tick, one 16384 + one 4096 + three 1024 at hop 1600.
+    // Nothing golden about them — they are the documented design, written down where a change to it has to
+    // be acknowledged rather than absorbed.
+    group ("the panes' transform schedule is exactly the documented ladder (no clock involved)");
+    {
+        constexpr int kOrder = analysis::RollingSpectrumTap::kMaxOrder;
+        constexpr int kTicks = 8;
+        using CurCount  = analysis::MultiResSpectrumPaneT     <kOrder, 4, CountingFft<0>>;
+        using FastCount = analysis::MultiResSpectrumPaneFastT <kOrder, 4, CountingFft<1>>;
+
+        struct Expect { int size, perTick; };
+        constexpr Expect kLadder[] { { 1024, 3 }, { 4096, 1 }, { 16384, 1 } };
+
+        CountingFft<0>::resetTally();
+        CountingFft<1>::resetTally();
+        {
+            auto c = std::make_unique<CurCount>();  c->coverSamples = 1600;
+            auto f = std::make_unique<FastCount>(); f->coverSamples = 1600;
+            for (int t = 0; t < kTicks; ++t) { oneTick (*c, 16384, 14); oneTick (*f, 16384, 14); }
+        }
+
+        long long totalCur = 0, totalFast = 0, expected = 0;
+        std::string shape;
+        for (std::size_t k = 0; k < (std::size_t) CountingFft<0>::kMaxLog2; ++k)
+        {
+            const long long x = CountingFft<0>::tally[k], y = CountingFft<1>::tally[k];
+            totalCur += x; totalFast += y;
+            if (x != 0 || y != 0)
+                shape += " " + std::to_string (1LL << k) + ":" + std::to_string (x) + "/" + std::to_string (y);
+        }
+        std::printf ("    transforms over %d ticks (size:current/fast) —%s\n", kTicks, shape.c_str());
+
+        for (const Expect& e : kLadder)
+        {
+            int k = 0; while ((1 << k) < e.size) ++k;
+            const long long want = (long long) e.perTick * kTicks;
+            expected += want;
+            ok (CountingFft<0>::tally[(std::size_t) k] == want,
+                "current pane: " + std::to_string (e.perTick) + " x " + std::to_string (e.size) + " per tick");
+            ok (CountingFft<1>::tally[(std::size_t) k] == want,
+                "fast sibling: " + std::to_string (e.perTick) + " x " + std::to_string (e.size) + " per tick");
+        }
+        ok (totalCur == expected && totalFast == expected,
+            "and neither pane transforms anything else, at any other size (" + std::to_string (totalCur)
+                + " / " + std::to_string (totalFast) + " of " + std::to_string (expected) + ")");
     }
 
     return test::report();
