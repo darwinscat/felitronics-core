@@ -286,7 +286,15 @@ int main()
 
         bool decays = true;
         for (int k = 1; k < kWins; ++k)
-            if (wmax[(size_t) k] > std::max (0.5f * wmax[(size_t) k - 1], 2e-7f)) decays = false;   // 2e-7 = float-ulp noise floor
+            // Floor 1e-6 — the SAME constant the convergence check below uses. 2e-7 was too tight to be a
+            // float-noise floor: it sits BETWEEN 2^-23 (1.19e-7) and 2^-22 (2.38e-7), so a residual of two
+            // ulps trips it. Measured on this fixture at burst=1, gcc 14.2 lingers two windows at 3.58e-07
+            // and 2.38e-07 (1.5 and 1.0 x 2^-22) and FAILS, while Apple clang reaches exact zero one window
+            // earlier and passes; at burst=256 clang itself clears 2e-7 by a single ulp (1.788e-07). Which
+            // side of the floor a toolchain landed on was luck, not DSP: the poison decays identically on
+            // both. Windows 0->1 and 1->2 fall four orders and one, and are still checked — only the tail
+            // the very next assertion already calls converged is exempt.
+            if (wmax[(size_t) k] > std::max (0.5f * wmax[(size_t) k - 1], 1e-6f)) decays = false;
         test::ok (decays, "Asym windowed residual decays geometrically, burst=" + std::to_string (burstLen));
         test::ok (wmax[(size_t) kWins - 1] <= 1e-6f, "Asym final residual <= 1e-6, burst=" + std::to_string (burstLen)
                                                      + " (got " + std::to_string (wmax[(size_t) kWins - 1]) + ")");
