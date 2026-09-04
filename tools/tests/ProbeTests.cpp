@@ -18,6 +18,7 @@
 // of defect this suite exists to catch.
 
 #include <felitronics_test.h>
+#include <ebu_tech3341_truepeak.h>
 
 #include "fcore_probe.h"
 
@@ -606,6 +607,59 @@ int main()
         // NB: both under-read ffmpeg's ebur128 here by ~0.5 dB (it reports −0.3, we report −0.81 / −0.88), so
         // ffmpeg does NOT arbitrate between them — that is a separate question about oversampling factor, not
         // about which of these two prototypes is right. Recorded, not resolved.
+    }
+
+    // --- EBU Tech 3341-2023 §2.6: the external criterion, on the tool that is the family's TP reference. ---
+    // The signals and every constant come from test_support/ebu_tech3341_truepeak.h, shared verbatim with
+    // felitronics_truepeak_conformance_tests so the two implementations answer to one copy of the spec.
+    // Verified out of tree against the OFFICIAL EBU Loudness Test Set: this Probe passes all of Table 1's
+    // true-peak tests 15-23 on the shipped WAVs, and reads within 0.0005 dB of what it reads here.
+    {
+        using namespace felitronics::test::ebu3341;
+        for (const double sr : { 48000.0, 44100.0 })
+        {
+            test::group (std::string ("EBU Tech 3341 true-peak tests 15-19 at Fs ") + std::to_string ((int) sr));
+            for (const TruePeakCase& c : kTruePeakCases)
+            {
+                std::vector<float> ch;
+                synthesize (c, sr, 0.5, ch);
+                const float* io[2] { ch.data(), ch.data() };
+
+                fcore::Probe p;
+                test::ok (p.prepare (sr, 2), "prepare");
+                p.process (io, 2, (long long) ch.size());
+
+                // Boundary semantics, as an executable fact rather than a comment. finish() implements
+                // FILE-BOUNDARY true peak — zero assumed either side of the file, so the drain's edge ringing
+                // counts — whereas EBU's formal test is STEADY-STATE. The 10 ms taper is precisely what makes
+                // the two coincide, and confusing them is what produced two of the three wrong readings this
+                // finding went through. On a tapered signal the drain must therefore add nothing at all.
+                const double before = p.truePeakLinear();
+                p.finish();
+                test::ok (p.truePeakLinear() == before,
+                          std::string ("test ") + std::to_string (c.number)
+                              + ": the 10 ms taper makes file-boundary TP and steady-state TP the same number");
+
+                const std::string tag = "test " + std::to_string (c.number) + " (" + c.name + ")";
+                const double dTarget = p.truePeakDb() - c.targetDb;
+                test::ok (dTarget <= kTolAboveDb && dTarget >= -kTolBelowDb, tag + ": inside the EBU envelope");
+
+                // The regression gate: the grid half-step is derived from kOsFactor, so what is left for
+                // this to catch is filter quality. See kBudgetSlackDb in the fixture header.
+                const double dOracle = p.truePeakDb() - oracleDb (c);
+                const double floorDb = gridBoundDb (c, fcore::Probe::kOsFactor) - kBudgetSlackDb;
+                test::ok (dOracle <= kBudgetSlackDb && dOracle >= floorDb,
+                          tag + ": within the derived grid bound of the analytic true peak");
+
+                test::approx (20.0 * std::log10 (p.samplePeakLinear()), sampleGridPeakDb (c), 1.0e-4,
+                              tag + ": sample peak is the closed-form sample-grid maximum");
+
+                // No "true peak >= sample peak" assertion: truePeakLinear() IS max(maxTp_, samplePeak_), so
+                // it cannot fail. The derived bound above is strictly stronger anyway — on case 16 it forces
+                // the interpolator to have recovered 2.82 dB above the sample peak. The invariant is pinned
+                // where it can break, in the "the sample peak is a hard floor" group above.
+            }
+        }
     }
 
     // --- The RT claim the core lives by, on the shared body too. ---
