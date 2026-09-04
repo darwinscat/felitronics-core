@@ -157,9 +157,13 @@ the CPU at runtime, invisible to any build. Full write-up:
    because it never asks for anything but IEEE `double` arithmetic. One exception is sanctioned and is
    written down at the point of use: the `correlation` accumulator in `tools/fcore_measure.cpp`, a
    native-only sanity number that is explicitly *not* a cross-tier comparison surface — the cross-tier NULL
-   in CI runs `blocks`, which is `double` throughout. **Nothing enforces this law today**; like law 8 it is
-   a property no build error can see, and unlike law 8 it does not even cost CPU when violated — it just
-   quietly gives a different answer per tier.
+   in CI runs `blocks`, which is `double` throughout. **This law IS enforced**, in the two halves the
+   `wasm-audio` job pairs everywhere: a text lint over `modules/*/include` and `modules/*/src` that lexes
+   before it matches (the words appear in prose constantly, including in this paragraph) and also catches
+   an L-suffixed float literal, which is a `long double` that never names itself; and an **artifact** gate,
+   because on wasm32 the type is software binary128, so every operation on it is a compiler-rt libcall
+   standing in the object file as an undefined symbol. The text half sees code that is never emitted; the
+   artifact half cannot be fooled by a comment, a macro or an alias. Both carry negative controls.
 10. **FP contraction is STATED, never inherited: the build sets `-ffp-contract=on`.** `a*b + c` may be
    fused into one FMA with a single rounding instead of two — a *different* number, slightly more
    accurate, and the toolchains disagree about when they are allowed to do it: **clang defaults to `on`**
