@@ -68,7 +68,7 @@ roughly three thousand times more sensitive than the scalar it replaced.**
 
 | file | raw | gzip | brotli |
 |---|---|---|---|
-| `fcprobe.web.wasm` | 30 673 | 16 311 | **14 660** |
+| `fcprobe.web.wasm` | 30 677 | 16 360 | **14 585** |
 | `fcprobe.web.js` | 8 719 | 3 092 | 2 788 |
 
 The two release `.wasm` (web glue and node glue) are **byte-identical** — `-sENVIRONMENT` shapes JS, not
@@ -80,8 +80,14 @@ Verified in a real browser against `python3 -m http.server`, which sends no isol
 `crossOriginIsolated === false` and `SharedArrayBuffer === undefined` — threads are not merely unused, they
 are **unavailable**, and the module works anyway. Its printed output was bit-identical to the native CLI.
 
-Stronger and cheaper than the page test, and now part of `build.sh`: the artifact itself carries **zero**
-occurrences of `SharedArrayBuffer`, `pthread`, `new Worker` or `Atomics`, and its memory is not shared.
+Stronger and cheaper than the page test, and now part of `build.sh` via `check-no-threads.mjs`, which parses
+the wasm memory section directly rather than shelling out to a `wasm-objdump` most machines do not have:
+
+```
+memories declared: 1
+  min 258 pages (16.1 MiB), max 32768 pages (2048.0 MiB), shared=false
+glue mentions SharedArrayBuffer / pthread / new Worker / Atomics.   0 times each
+```
 
 ### 4. `-fno-exceptions` clean
 
@@ -137,19 +143,43 @@ Bit-exactness holds at the rates the corpus uses — and **not** everywhere:
 | 176.4 kHz | identical | — |
 | **192 kHz** | **396 of 397 blocks differ** | — |
 
-The cause is `analysis::KWeightingFilter::computeCoeffs`, which designs the BS.1770 coefficients with
-`std::tan` and `std::pow` in `double`. Emscripten's musl `tan` and Apple's `tan` disagree by 1 ulp at several
-rates; at 88.2 and 192 kHz that disagreement survives into the coefficients instead of being absorbed by
-rounding, and a changed coefficient changes the filter for *every* sample — hence nearly every block, not one.
+The true-peak line is identical at all six rates — the oversampler's prototype is designed from the
+oversampling factor alone and never sees the sample rate. Everything above is the loudness path.
 
-The three-way comparison is the useful part: **x86-64 Linux/gcc agrees with wasm at 88.2 kHz while arm64
-macOS does not.** glibc and musl agree; Apple's libm is the odd one out. So the divergence lives on the
-development machine, and Linux CI would never see it.
+The cause is `analysis::KWeightingFilter::computeCoeffs`, which designs the BS.1770 coefficients with
+`std::tan` and `std::pow` in `double`. Measured against a 300-bit reference, the shelf stage's
+`tan(pi*1681.974/fs)` on Apple's libm is:
+
+| rate | 44.1 k | 48 k | 88.2 k | 96 k | 176.4 k | 192 k |
+|---|---|---|---|---|---|---|
+| error vs correctly rounded | +0.61 ulp | **−0.03** | +0.66 | +0.82 | −0.68 | **−1.07** |
+| bit-identical to CR? | no | **yes** | no | no | no | no |
+
+So Apple's libm is the outlier at **five of six** rates, and at 192 kHz its error exceeds one ulp — it is not
+even faithfully rounded there. musl (what Emscripten compiles in) and glibc both return the correctly rounded
+value at all six. The second-stage `tan(pi*38.135/fs)` agrees everywhere.
+
+Only two of those five survive into the coefficients: at 88.2 kHz the shelf's `b0`/`b2` flip and at 192 kHz
+`a2` does, and a changed coefficient changes the filter for *every* sample — hence nearly every block rather
+than one. At 44.1, 96 and 176.4 kHz the 1-ulp difference is absorbed by the coefficient arithmetic. **48 kHz
+is not absorption at all** — Apple's `tan` simply happens to be correctly rounded at that one argument.
+
+The three-way comparison is what makes this actionable: **x86-64 Linux/gcc agrees with wasm at 88.2 kHz while
+arm64 macOS does not.** The divergence lives on the development machine, and a Linux CI job would never see
+it.
+
+Magnitude, so the risk is not overstated. Over the 397-block sweep fixture, the largest single-block
+divergence is **2.8e-13 dB at 88.2 kHz** and **1.2e-12 dB at 192 kHz** (6.4e-14 and 2.7e-13 relative in
+energy). A *tolerance* criterion at 1e-9 dB would therefore pass at all six rates with three orders of margin;
+**bit-identity passes at four, and at three of those four only by luck.** That is the whole argument for
+treating the rate question as an open determinism contract rather than a pass/fail gate: the numbers are
+fine, the guarantee is not.
 
 Two consequences worth stating plainly:
 
-- 44.1, 48 and 96 kHz pass **by rounding absorption, not by construction**. Any libm update on either side
-  could end that. 96 kHz is heavily used, so this is not an exotic corner.
+- 44.1, 96 and 176.4 kHz pass **by rounding absorption, not by construction**, and 48 kHz by a coincidence of
+  one argument. Any libm update on either side could end either. 96 kHz is heavily used, so this is not an
+  exotic corner.
 - The core has no stated cross-platform determinism contract. It needs one before any facade can promise
   "bit-identical output" across tiers. The cheap route is to remove libm from the compared path entirely —
   the coefficients are designed from two transcendentals at a handful of standard rates.
@@ -202,6 +232,10 @@ agreed on it bit-exactly. Two fixes, both in `fcore::Probe`:
   construction, so `truePeak >= samplePeak` always. On its own the floor recovers most of the error above
   (0.0152 → 0.95); `finish()` supplies the inter-sample part the floor cannot know about.
 
+A third defect, found in the same review and introduced by the fix above: `truePeakDb()` was computed from
+the oversampler maximum while `truePeakLinear()` applied the new floor, so the tool's dB and linear answers
+disagreed on exactly the signals the floor exists for. Both now derive from one value.
+
 Also hardened while there, all of it facing input a page computes: the sample rate is bounded to
 1 kHz … 768 kHz (positive-and-finite is not enough — `lround(0.01*fs)` on 1e300 is out of range, and a page
 can pass `Number.MIN_VALUE` as easily as 48000), `maxDurationSec` is validated, a non-positive channel count
@@ -223,9 +257,13 @@ handed lies inside the wasm heap instead of trapping on a pointer near the top o
   `analysis` module will, through the three spectrum panes.
 - **The core holds two different true-peak filters.** This tool's path (`PolyphaseOversampler` at 4×, 32
   taps/phase, cutoff 0.90× Nyquist, Kaiser β9) and `analysis::TruePeakMeter` (48 taps, full base Nyquist, β8,
-  factor by rate). They agree to 0.0009–0.0028 dB on music but diverge by **~1.1 dB** on single-sample
-  impulses, where the 0.90 guard discards the top of the band and this path reads **low**. Which is
-  spec-correct is unresolved: ffmpeg's `ebur128` prints one decimal and cannot arbitrate.
+  factor by rate). They agree to 0.0009–0.0028 dB on music, and to ~0.07 dB on a 12 kHz sine phased to miss
+  the sample crests — the one fixture where the *designs* actually diverge. (An earlier ~1.1 dB figure on
+  impulses was this tool's missing sample-peak floor, not a filter difference; with the floor both land on the
+  sample peak and agree exactly.) Which design is spec-correct stays **unresolved, and ffmpeg does not
+  arbitrate**: on that 12 kHz fixture `ebur128` reports −0.3 dBTP while ours report −0.81 and −0.88, so both
+  4× paths under-read it by about half a dB. That is a question about oversampling factor, not about which
+  prototype is right.
 - **A single non-finite sample silently freezes the loudness.** The two paths fail differently, and only one
   of them recovers. The true peak is blind for 32 samples while the NaN sits in the polyphase ring
   (`std::max(x, NaN)` returns `x`) and then works again — feed it louder audio afterwards and it duly rises.
