@@ -5,12 +5,31 @@
 
 **Status:** draft / in progress · **Owner:** Darwin's Cat (Felitronics line) · **Started:** 2026-06.
 
-> **🔴 #1 open performance debt.** The core ships only a scalar FFT backend (`ScalarRadix2Real` =
-> `DefaultRealFft`, `core/Fft.h:145`) and a scalar `O(P)` direct-head FIR in the partitioned convolvers,
-> so long-convolution cost **explodes at host block 2048+**. Latent for shipped OrbitCab (its IR cab uses
-> `juce::dsp::Convolution`); a **blocker** for `convolution` / `lineareq` products. Full analysis, fix
-> plan and acceptance criteria (perf at 2048+, not just a null-match):
-> [`PERF-SCALAR-FFT-BOTTLENECK.md`](PERF-SCALAR-FFT-BOTTLENECK.md).
+> **Convolution performance — two different debts, and neither is the one this box used to describe.**
+>
+> **✅ CLOSED in v0.4.0 (PRs #23–#26) — the scalar-FFT / block-explosion debt.** It was never "the default
+> backend is scalar"; it was that scalar was the *only* backend and that the convolver's partition was tied
+> to the host block. Both are gone: a SIMD **pffft** `RealFftBackend` ships as the optional compiled module
+> `felitronics::fftpffft` (`-DFELITRONICS_WITH_PFFFT=ON`) behind the existing template seam, and the
+> partition is decoupled from the host block. Long-convolution cost is now **block-INDEPENDENT** — a
+> 131072-tap linear-phase EQ costs ~2.0 %RT at *every* host block, against ~39 %RT at block 8192 before.
+> (`DefaultRealFft` is still `ScalarRadix2Real`, `core/Fft.h:233` — that is the seam's zero-dependency
+> default, which is the point of a seam.) [`PERF-SCALAR-FFT-BOTTLENECK.md`](PERF-SCALAR-FFT-BOTTLENECK.md).
+>
+> **🟢 ACCEPTANCE MET — convolver CPU vs `juce::dsp::Convolution`.** The successor item, and now delivered
+> in full: `MatrixConvolverNupc` (non-uniform / Gardner — a 128-sample time-domain head plus geometrically
+> growing overlap-save FFT tail stages) is **complete**, with every topology (mono / LRDiag / MSDiag / Full)
+> and the click-free 2-slot smoothstep warm crossfade, and `lineareq`'s linear- and natural-phase EQs
+> convolve on it. Flat ~0.8 %RT at every block, **3–9× cheaper than JUCE at the 64–128 blocks live rigs
+> run**, 2.4× cheaper than v0.4.0, true sample-zero-latency, NULL-verified.
+>
+> **🟡 What is actually still open** is one named thing, not the item as a whole: the **worst-buffer spike**
+> — all stages' FFTs coincide every `lcm = B_max` samples (7.8 % @ block 64 for `B_max=4096`; `B_max=2048`
+> is the default because it halves the spike at the same mean). Time-distributing the large FFTs over their
+> deadline is the RT-hardening that closes it. Separately and permanently NOT a goal: JUCE stays cheaper on
+> the *mean* at large oracle-tuned blocks — that is a theorem, the price of near-field zero-latency
+> coverage, not a gap to chase. [`PERF-CONVOLVER-JUCE-GAP.md`](PERF-CONVOLVER-JUCE-GAP.md) ·
+> [`PERF-NUPC-VS-JUCE.md`](PERF-NUPC-VS-JUCE.md).
 
 `felitronics-core` is a **shared, framework-agnostic, JUCE-free DSP core** for the whole product
 family. One set of battle-tested, real-time-safe DSP primitives that every product builds on:
@@ -89,7 +108,8 @@ the CPU at runtime, invisible to any build. Full write-up:
    `using Sample = float` alias and keep raw `float*` out of public signatures **now**, so full
    sample-type templating later is a flag-flip, not a fork-rewrite. *(Carve-out: coefficient recompute
    on the audio thread, and meter/LUFS/true-peak accumulators, may legitimately use `double` — specify
-   per module; the ban is on gratuitous `double` in the sample loop.)*
+   per module; the ban is on gratuitous `double` in the sample loop.)* **`double` is the ceiling — `long
+   double` is not a third option anywhere near a tier boundary, see law 9.**
 4. **Dependencies behind a seam, never hard-wired.** Heavy primitives (FFT, neural inference) are
    reached through a thin interface so each platform plugs its own impl: JUCE adapter →
    `juce::dsp::FFT`; WASM / embedded → pffft / kissfft / CMSIS-DSP. (Precedent: both plugins run the
@@ -106,7 +126,9 @@ the CPU at runtime, invisible to any build. Full write-up:
 7. **C++ subset that all toolchains accept** (C++20 desktop; keep an eye on what Emscripten and the
    embedded toolchain support).
 8. **Denormals: every feedback kernel flushes in SOFTWARE; hardware FTZ is a desktop optimization,
-   never a correctness crutch.** *(The subtle hole: WASM and many
+   never a correctness crutch.** Every recursive kernel in the repo now has a written verdict —
+   including the clean ones and why — in [`LAW8-AUDIT.md`](LAW8-AUDIT.md); the mechanism is a
+   **fixed-point band**, not "it eventually underflows". *(The subtle hole: WASM and many
    embedded ARMs expose no FP-control register, so an "adapter sets FTZ, core assumes it" rule silently
    fails on the `wasm-audio` tier → feedback filters decay into subnormals on silence → 10–100× CPU
    spike.)* `teq` already does the right thing: `Biquad/Svf::flushDenormals()` zaps `|state| < 1e-15f`
@@ -115,6 +137,29 @@ the CPU at runtime, invisible to any build. Full write-up:
    module) MUST adopt the same per-block software flush.** The core never sets a global FTZ/DAZ mode; an
    adapter MAY set FTZ on desktop as a bonus. **Do NOT use `-ffast-math`** (it breaks the NaN/inf
    semantics the tests assert). Every kernel also ships a scalar fallback + a scalar↔SIMD parity test.
+9. **No `long double` in anything that crosses a tier boundary.** It is not a type with a defined
+   precision — it is whatever the target's ABI happens to say, and the answers disagree in *size* as well
+   as in precision. Measured, one source file, three toolchains:
+
+   | tier | `sizeof(long double)` | mantissa bits | what it actually is |
+   |---|---:|---:|---|
+   | arm64 macOS (Apple clang 21.0.0) | 8 | 53 | **plain `double`** — no extra precision at all |
+   | x86-64 Linux (gcc 14.2.0) | 16 | 64 | 80-bit x87 extended, padded to 16 |
+   | wasm32 (emsdk 6.0.9) | 16 | 113 | IEEE binary128 quad, software-emulated |
+
+   Two traps live in that table. **The two 16-byte answers are different formats** — `sizeof` agreeing
+   proves nothing, and a size assertion would pass while the arithmetic diverged. And **the dev machine is
+   the least precise of the three**: on arm64 macOS `1.0L + 2⁻⁶⁰ == 1.0L`, so an accumulator written and
+   tested *here* because it "needed the headroom" silently has none, while the same line carries 64 bits on
+   the Linux CI row and 113 in the browser. (arm64 Linux is a fourth answer — AAPCS64 mandates binary128 —
+   documented, not measured here.) None of this is a toolchain bug; it is what the type is.
+   **Use `double`, or compensated (Kahan / Neumaier) summation**, which is deterministic on every tier
+   because it never asks for anything but IEEE `double` arithmetic. One exception is sanctioned and is
+   written down at the point of use: the `correlation` accumulator in `tools/fcore_measure.cpp`, a
+   native-only sanity number that is explicitly *not* a cross-tier comparison surface — the cross-tier NULL
+   in CI runs `blocks`, which is `double` throughout. **Nothing enforces this law today**; like law 8 it is
+   a property no build error can see, and unlike law 8 it does not even cost CPU when violated — it just
+   quietly gives a different answer per tier.
 
 **These laws are CI-enforced for the funded tiers, not aspirational.** Today: a
 no-allocation test on the paths that install an allocation counter, a compile-only `-fno-exceptions` /

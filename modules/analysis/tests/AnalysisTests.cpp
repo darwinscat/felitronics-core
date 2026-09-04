@@ -586,6 +586,31 @@ int main()
     }
 
     // --- FALSIFICATION: one non-finite sample must not latch the correlation meter forever ---
+    // LAW 8 (state, not timing). The three one-poles decay geometrically on silence and STICK in the
+    // subnormals — for a window of `w` ms every subnormal k*u with k <= 0.5/alpha maps to itself — and
+    // nothing outside this class ever called flushDenormals(), so process() now does it itself.
+    //
+    // The state is private and correlation() is a RATIO, so the observation is indirect and deliberate:
+    // after the silence, feed 1000 samples on L ONLY. sLL climbs to ~0.16 while sRR keeps whatever the
+    // silence left. A meter whose state truly reached zero has sRR == 0, hence d == 0, hence the
+    // documented `d > 1e-12 ? sLR/d : 1.0` branch returns EXACTLY 1.0. A meter that parked at 1.9e-19
+    // instead gets d = 1.6e-10 — 161x the gate — and reports ~1e-9. The 120 ms window is chosen so both
+    // margins are real: the flush fires at 4.0 s (1 s before the assertion) and the un-flushed residual
+    // is 1.9e-19, a NORMAL double, so hardware FTZ cannot hide the regression either.
+    test::group ("CorrelationMeter: law 8 — silence leaves EXACT zero, not a subnormal");
+    {
+        analysis::CorrelationMeter cm; cm.prepare (48000.0, 120.0);
+        for (int i = 0; i < 24000; ++i)
+        {
+            const float v = (float) (0.7 * std::sin (2.0 * core::kPi * 500.0 * i / 48000.0));
+            cm.process (v, v);
+        }
+        for (int i = 0; i < 240000; ++i) cm.process (0.0f, 0.0f);       // 5 s of digital black
+        for (int i = 0; i < 1000; ++i)   cm.process (1.0f, 0.0f);       // L only: lights sLL, leaves sRR
+        test::ok (core::exactlyEqual (cm.correlation(), 1.0),
+                  "sRR is EXACTLY 0 after silence (a stuck subnormal reads ~1e-9 here)");
+    }
+
     test::group ("CorrelationMeter recovers from a non-finite sample");
     {
         analysis::CorrelationMeter cm; cm.prepare (48000.0, 50.0);

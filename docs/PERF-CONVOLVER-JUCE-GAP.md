@@ -2,8 +2,13 @@
 
 # Convolver CPU gap vs juce::dsp::Convolution (the next perf item)
 
-**Status: Phase-1 LANDED** (the mono/LRDiag `NonUniformConvolver` primitive — see the Phase-1 result below;
-matrix routing + click-free swap are later phases). The original #1 debt (scalar-FFT + O(P) direct-head cost
+**Status: COMPLETE — acceptance bar MET, every phase landed.** The Phase-1 result below is the mono/LRDiag
+`NonUniformConvolver` primitive; the later phases it promised have since shipped too, in
+`MatrixConvolverNupc` — all topologies (mono / LRDiag / MSDiag / Full) plus the click-free 2-slot smoothstep
+warm crossfade — and `lineareq`'s linear- and natural-phase EQs convolve on it. One RT-hardening remains
+open and is named at the end of the Phase-1 result: time-distributing the large FFTs so the worst-buffer
+spike (all stages coinciding every `lcm = B_max` samples) stops being bounded-but-lumpy. The original #1
+debt (scalar-FFT + O(P) direct-head cost
 that EXPLODED with the host block) is RESOLVED by #23–#26 (SIMD pffft backend + fixed `P=128` → block-
 independent). This document records a
 *separate, newly-measured* finding: our partitioned convolver, while now block-independent and JUCE-free, is
@@ -82,8 +87,9 @@ the audio path rides the SIMD backend. Reuses the SeamAllocator-aligned FDL + sp
 
 ## Phase-1 result (mono/LRDiag primitive — `NonUniformConvolver<Fft>`, LANDED)
 
-Phase 1 = the bare mono primitive (LRDiag = two instances), NULL-verified, benched. Later phases add the
-matrix-routing facade (MSDiag/LRDiag/Full) + the click-free warm swap on top.
+Phase 1 = the bare mono primitive (LRDiag = two instances), NULL-verified, benched. The later phases it
+promised — the matrix-routing facade (MSDiag/LRDiag/Full) and the click-free warm swap — have since landed
+on top of it as `MatrixConvolverNupc`; the numbers below are the primitive's and still stand.
 
 **Measured (M5 Pro, 131072-tap stereo LRDiag, 48 kHz, pffft, `getLatency()==0`):**
 

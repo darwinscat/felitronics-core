@@ -528,6 +528,30 @@ int main() {
            "…and the knob stayed where it was: it used to accept the word, read it back, and play the anchor");
     }
 
+    // LAW 8 (state, not timing). The blend ramps are `end = want + (current-want)*decay` — asymptotic, so
+    // without a snap they never arrive. An EXACT-zero target is not hypothetical and needs no special pack:
+    // BlendKnob::linOf returns 0.0 for any level at or below -120 dB, which is how this very rig spells
+    // "off" (dry end: wetDb -120). Move the dial there after an audible position and the wet gain decays
+    // to a subnormal fixed point (decay 0.587 at kBlock 256 => k <= 0.5/(1-decay) ~= 1.2, so 1 ulp) and
+    // stays, while `mixDry` — gated on a dry IR being LOADED, not on the gains — keeps the per-sample mix
+    // loop running over it for the life of the rig.
+    //
+    // Asserted twice, as in the Saturator's law-8 test: at 5 s the un-flushed value is 1 ulp (subnormal,
+    // so a machine with hardware FTZ could read it as zero and hide a regression), while at 0.8 s it is
+    // 1.8e-35 — a NORMAL float — and the flush has already fired (it does so at 0.69 s). The observable is
+    // liveWet(), the applied gain the audio thread actually multiplied by.
+    group("blend: law 8 — a gain aimed at exact zero ARRIVES (it used to park in the subnormals)");
+    {
+        Bench b(rig);
+        b.rms(440.0, 0.2, 16, 0);                                   // default dial = wet end: curWet_ -> 1
+        ok(b.p.liveWet() > 0.9f, "the wet gain is up before the move");
+        ok(b.p.setDial("mix", 0.0), "mix to the dry end — the pack states the wet path at -120 dB, i.e. 0");
+        b.rms(440.0, 0.2, 150, 0);                                  // 0.8 s: un-flushed would be 1.8e-35
+        ok(b.p.liveWet() == 0.0f, "applied wet is EXACTLY 0 at 0.8 s (a normal 1.8e-35 without the snap)");
+        b.rms(440.0, 0.2, 788, 0);                                  // out to 5 s
+        ok(b.p.liveWet() == 0.0f, "still exactly 0 after 5 s");
+    }
+
     group("blend: the dry path and the wet one as the pack states them");
     {
         Bench b(rig);

@@ -158,7 +158,8 @@ public:
     int  numChannels() const noexcept { return channels_; }
 
     // Message thread — single producer, must not race reset(). Stage a whole operator into the inactive slot,
-    // then publish; process() goes live INSTANTLY (Phase 2 — the click-free crossfade lands in Phase 4).
+    // then publish; the next process() picks it up and crossfades it in over `crossfadeSamples` (see the
+    // state 1 -> 2 handoff in process() below — the warm swap is implemented, not pending).
     bool setOperator (Topology topo, const float* const* banks, int numBanks, int len)
     {
         if (! stageOperator (topo, banks, numBanks, len)) return false;

@@ -144,11 +144,37 @@ private:
                 {
                     const float w  = shaper_.processSample (b[i]);
                     const float dc = w - x1 + dcR_ * y1;     // one-pole DC blocker  H(z)=(1-z⁻¹)/(1-R·z⁻¹)
-                    x1 = w; y1 = dc;
-                    b[i] = dc;
+                    x1 = w;
+                    y1 = (std::fabs (dc) < 1e-30f) ? 0.0f : dc;   // law 8 — see the note below the loop
+                    b[i] = y1;
                 }
-                // flush NON-FINITE one-pole state only (no denormal threshold here: zapping a tiny
-                // finite tail would break the bit-identical NULL for quiet legitimate signals).
+                // LAW 8, and the rationale that used to stand here is retracted rather than edited. It
+                // read: "no denormal threshold: zapping a tiny finite tail would break the bit-identical
+                // NULL for quiet legitimate signals." Right about the risk, wrong about the cost of doing
+                // nothing, and — this is the part worth recording — the NULL it appealed to never tested
+                // the claim either way: scenario 4's 1e-20 block is absorbed to exact zero by the Asym
+                // bias (-0.3f + 1e-20f == -0.3f), so the fixture never puts a tiny FINITE value in this
+                // state at all. Four threshold variants were built against it and all 194 checks pass.
+                //
+                // What doing nothing actually cost. On silence the Asym curve gives w == 0 exactly (it is
+                // normalised so y(0) == 0), so x1 goes to zero and y1 becomes a pure R^n decay — which
+                // STICKS: with R = 0.99967 (10 Hz at 4x 48 kHz) every subnormal k*u with k <= 0.5/(1-R)
+                // ~= 1528 maps to itself under round-to-nearest, so y1 froze at 2.14e-42 after 1.5 s and
+                // never underflowed. The stuck value then fed the 128-tap downsampling FIR, every operand
+                // subnormal, and LEFT the stage: -3.40249e-41 on every output sample, bit-identical on
+                // arm64 and x86, i.e. contagion into whatever comes next. Measured on x86-64 (i9-13900H,
+                // gcc 14.2 -O2, 2 s mono, best of 5): music 18.97 ms, stalled silence 452.72 ms — 23.9x,
+                // 22.6 %RT per channel. Forcing FTZ/DAZ on the same binary: 18.33 ms, no penalty at all,
+                // which is what proves it is purely the denormal path. With the flush: 18.25 ms.
+                //
+                // The flush is PER SAMPLE (in the loop above), not here, because a threshold applied at
+                // the end of a call would put a numerical event wherever the CALLER cut the stream — the
+                // chunk-invariance argument from docs/LAW8-KWEIGHTING.md, and this module asserts
+                // bit-identical chunking explicitly. 1e-30f rather than core::flushDenormal's 1e-15f is a
+                // margin choice, not a NULL-forced one: it is 8 decades above the float subnormal floor
+                // and ~600 dB below anything audible, so it cannot be reached by a signal while still
+                // being unreachable from below by the stall. This per-call line keeps its ORIGINAL job,
+                // the poison guard: a NaN in recursive state never decays out on its own.
                 dcX1_[(std::size_t) c] = std::isfinite (x1) ? x1 : 0.0f;
                 dcY1_[(std::size_t) c] = std::isfinite (y1) ? y1 : 0.0f;
             }
