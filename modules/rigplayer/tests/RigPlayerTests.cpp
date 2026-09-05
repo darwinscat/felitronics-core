@@ -121,6 +121,13 @@ namz::rig::Rig throughTheFormat(const namz::rig::Rig& rig, bool* okOut = nullptr
     return namz::rig::loadRigManifest(namz::rig::writeManifest(rig), okOut);
 }
 
+// The same device with the pack's own two levels written on the stage, through the format as well.
+namz::rig::Rig levelled(double inDb, double outDb) {
+    auto r = testRig();
+    r.chain[0].inputDb = inDb; r.chain[0].outputDb = outDb;
+    return throughTheFormat(r);
+}
+
 struct Bench {
     RigPlayer p;
     std::map<std::string, std::vector<std::byte>> files;
@@ -569,6 +576,67 @@ int main() {
         const double half = b.gainAt(1000.0);
         ok(half < 0.5 * 0.501 + 0.5 - 0.4, "polarity -1: the dry path is subtracted, and the middle of the knob nearly nulls");
         approx(half, 0.5 - 0.5 * std::pow(10.0, -6.0 / 20.0), 0.01, "…to exactly the difference of the two");
+    }
+
+    group("the pack's own levels: the guitar in, the device out");
+    {
+        const double q6 = std::pow(10.0, -6.0 / 20.0);
+        Bench b(levelled(-6.0, 0.0));
+        ok(b.p.stageInputDb() == -6.0 && b.p.stageOutputDb() == 0.0, "the player reads both levels off the pack");
+        approx(b.gainAt(1000.0), 0.5 * q6, 0.01, "at 150 the model is fed 6 dB softer");
+        b.p.setDial("gain", 0.0);
+        approx(b.gainAt(1000.0), 0.25 * q6 * q6, 0.005,
+               "at the link the two ADD: the pack's 6 dB and the alias's own 6 dB");
+    }
+    {
+        // The input level reaches the DRY side of a blend too. One guitar cannot arrive at the two ends
+        // of a mix at two different levels, so both move together and the stated mix is untouched.
+        const double q6 = std::pow(10.0, -6.0 / 20.0);
+        Bench plain(rig), quiet(levelled(-6.0, 0.0));
+        ok(plain.p.setDial("mix", 0.0), "the plain pack to the dry end");
+        ok(quiet.p.setDial("mix", 0.0), "the levelled one too");
+        approx(quiet.gainAt(1000.0), plain.gainAt(1000.0) * q6, 0.01, "the dry path is fed 6 dB softer as well");
+        plain.p.setDial("mix", 150.0); quiet.p.setDial("mix", 150.0);
+        approx(quiet.gainAt(1000.0), plain.gainAt(1000.0) * q6, 0.01,
+               "…so halfway across the knob the mix is the same mix, 6 dB down");
+    }
+    {
+        // The output level is a scalar on the whole stage, applied AFTER the mix — the same number at
+        // every position of the blend knob, which is what "it cannot move the blend" means as a number.
+        const double q6 = std::pow(10.0, -6.0 / 20.0);
+        Bench plain(rig), quieter(levelled(0.0, -6.0));
+        approx(quieter.gainAt(1000.0), plain.gainAt(1000.0) * q6, 0.005, "the wet end comes out 6 dB down");
+        ok(plain.p.setDial("mix", 0.0), "the plain pack to the dry end");
+        ok(quieter.p.setDial("mix", 0.0), "the levelled one too");
+        approx(quieter.gainAt(1000.0), plain.gainAt(1000.0) * q6, 0.005, "so does the dry end — the same scalar");
+        plain.p.setDial("mix", 150.0); quieter.p.setDial("mix", 150.0);
+        approx(quieter.gainAt(1000.0), plain.gainAt(1000.0) * q6, 0.005,
+               "and so does halfway across, which is the blend's ratio left exactly where the pack put it");
+    }
+    {
+        // A pack level cannot put a step into a crossfade that had none: the ladder with one is the
+        // ladder without one times the scalar, at every angle — the link at the bottom included.
+        const double q3 = std::pow(10.0, -3.0 / 20.0);
+        Bench plain(rig), lower(levelled(0.0, -3.0));
+        for (const double deg : { 0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0 }) {
+            plain.p.setDial("gain", deg); lower.p.setDial("gain", deg);
+            char what[96];
+            std::snprintf(what, sizeof what, "the crossfade at %.0f deg is untouched but for the scalar", deg);
+            approx(lower.gainAt(1000.0), plain.gainAt(1000.0) * q3, 0.01, what);
+        }
+    }
+    {
+        // The loudness tag is a contract, not a listener's option. A player that opens un-normalised
+        // plays every capture at whatever level the hardware gave, and this default must not be
+        // quietly turned back — hence a test on the default itself.
+        RigPlayer fresh;
+        ok(fresh.normalize(), "a player normalizes by default");
+        Bench b(rig);
+        ok(b.p.normalize(), "…and so does one with a pack in it");
+        b.p.setNormalize(false);
+        b.p.unload();
+        b.load(rig);
+        ok(! b.p.normalize(), "the switch is still the host's to throw, and survives a reload");
     }
 
     group("alignment: two captures that land apart are lined up before they mix");
