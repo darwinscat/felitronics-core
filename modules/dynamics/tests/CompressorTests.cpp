@@ -27,6 +27,10 @@ void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
+// prepare() is [[nodiscard]]: a refused configuration must never be mistaken for a prepared one.
+static void prep (dynamics::Compressor& c, double sr, int n, int nch, double maxLookMs = 50.0)
+{ test::ok (c.prepare (sr, n, nch, maxLookMs), "prepare() accepted the configuration"); }
+
 static double rmsTail (const std::vector<float>& v, double frac)
 {
     const int from = (int) (v.size() * (1.0 - frac));
@@ -52,7 +56,7 @@ int main()
         float* ch[1] { y.data() };
 
         dynamics::Compressor comp;
-        comp.prepare (fs, n, 1);
+        prep (comp, fs, n, 1);
         dynamics::CompressorParams p;
         p.detector = dynamics::Detector::Rms; p.rmsWindowMs = 30.0;
         p.mode = dynamics::Mode::DownCompress; p.thresholdDb = -20.0; p.ratio = 4.0; p.kneeDb = 0.0;
@@ -80,7 +84,7 @@ int main()
         float* ch[2] { yl.data(), yr.data() };
 
         dynamics::Compressor comp;
-        comp.prepare (fs, n, 2);
+        prep (comp, fs, n, 2);
         dynamics::CompressorParams p;
         p.detector = dynamics::Detector::Rms; p.rmsWindowMs = 30.0; p.link = dynamics::LinkMode::Max;
         p.thresholdDb = -24.0; p.ratio = 4.0; p.kneeDb = 0.0; p.attackMs = 5.0; p.releaseMs = 80.0;
@@ -102,7 +106,7 @@ int main()
         float* ch[1] { y.data() };
 
         dynamics::Compressor comp;
-        comp.prepare (fs, n, 1, 5.0);            // maxLookahead 5 ms ⊇ 64 samples
+        prep (comp, fs, n, 1, 5.0);            // maxLookahead 5 ms ⊇ 64 samples
         dynamics::CompressorParams p;
         p.thresholdDb = 24.0;                    // above any signal → gain == 1 → pure delay
         p.lookaheadMs = (double) look / fs * 1000.0;
@@ -122,7 +126,7 @@ int main()
         std::vector<float> a (n, 0.2f), b (n, 0.2f);
         float* ch[2] { a.data(), b.data() };
         dynamics::Compressor comp;
-        comp.prepare (fs, n, 2, 10.0);
+        prep (comp, fs, n, 2, 10.0);
         dynamics::CompressorParams p; p.thresholdDb = -30.0; p.ratio = 4.0; p.lookaheadMs = 2.0;
         comp.setParams (p);                      // allocations allowed up to here
         const long before = g_allocs.load();
@@ -139,7 +143,7 @@ int main()
         std::vector<float> y (n);
         for (int i = 0; i < n; ++i) y[i] = (float) (0.5 * std::sin (2.0 * core::kPi * 200.0 * i / fs));
         float* ch[1] { y.data() };
-        dynamics::Compressor comp; comp.prepare (fs, n, 1);
+        dynamics::Compressor comp; prep (comp, fs, n, 1);
         dynamics::CompressorParams p;
         const double qnan = std::numeric_limits<double>::quiet_NaN();
         p.thresholdDb = -20.0; p.ratio = 4.0;

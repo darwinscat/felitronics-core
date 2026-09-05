@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -32,6 +33,22 @@ static double rms (const std::vector<float>& v, int from)
     for (int i = from; i < (int) v.size(); ++i) { e += (double) v[i] * v[i]; ++c; }
     return c ? std::sqrt (e / (double) c) : 0.0;
 }
+
+// A band processor that does nothing but record whether it was asked to prepare, and answer as told.
+// It exists to prove that MultibandProcessor forwards the verdict rather than discarding it.
+struct StubBand
+{
+    static inline int prepared = 0;
+    bool prepare (bool ok) noexcept { ++prepared; return ok; }
+    void reset() noexcept {}
+    void process (float* const*, int, int) noexcept {}
+    int  latencySamples() const noexcept { return 0; }
+    template <class P> void setParams (const P&) noexcept {}
+};
+
+// prepare() is [[nodiscard]] on the compressor path: a refused configuration must never look like a
+// prepared one, so every call site here asserts the verdict instead of discarding it.
+template <class P, class... A> static void prep (P& proc, A... args) { test::ok (proc.prepare (args...), "prepare() accepted the configuration"); }
 
 static dynamics::CompressorParams comp (double thr, double ratio, double lookMs = 0.0)
 {
@@ -57,7 +74,7 @@ int main()
     // --- no compression → bands recombine to the flat (allpass) reconstruction ---
     test::group ("MultibandCompressor flat when not compressing");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));     // threshold above signal → no GR
         const int N = 8000; std::vector<float> x (N), y (N);
@@ -70,7 +87,7 @@ int main()
     // --- a per-band compressor lowers ONLY its band's level + reports GR ---
     test::group ("MultibandCompressor low band compresses");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         auto run = [&] (double thr) -> double
         {
@@ -91,7 +108,7 @@ int main()
     // --- solo isolates a band ---
     test::group ("MultibandCompressor solo isolates a band");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));
         mc.setBandSolo (0, true);                                              // only the low band
@@ -111,7 +128,7 @@ int main()
     {
         const double fs = 48000.0; const int n = 512;
         multiband::MultibandCompressor<4> mb;
-        mb.prepare (fs, n, 2);
+        prep (mb, fs, n, 2);
         std::vector<float> l ((std::size_t) n), r ((std::size_t) n);
         float* io[2] { l.data(), r.data() };
 
@@ -132,7 +149,7 @@ int main()
 
     test::group ("MultibandCompressor latency");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 2, 5.0); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 2, 5.0); mc.setNumBands (3);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));
         test::ok (mc.latencySamples() == 0, "no lookahead → 0 latency");
         mc.setBandParams (1, comp (12.0, 2.0, 2.0));                          // band 1: 2 ms lookahead
@@ -142,7 +159,7 @@ int main()
     // --- no allocation in process() ---
     test::group ("MultibandCompressor no-alloc");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 2); mc.setNumBands (4);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 2); mc.setNumBands (4);
         for (int b = 0; b < 4; ++b) mc.setBandParams (b, comp (-10.0, 4.0, 1.0));
         std::vector<float> l (512, 0.2f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
         mc.process (io, 2, 512);
@@ -154,7 +171,7 @@ int main()
     // --- solo overrides the parallel dry/wet (the bug it guards: at mix<1 the dry leaked non-solo bands) ---
     test::group ("MultibandCompressor solo overrides dry/wet mix");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));
         mc.setBandSolo (0, true); mc.setMix (0.5f);                          // solo low + 50% parallel mix
@@ -167,7 +184,7 @@ int main()
     // --- unity bands ⇒ output nulls SAMPLE-WISE against the splitter's own allpass reconstruction ---
     test::group ("MultibandProcessor perfect reconstruction (unity bands)");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (24.0, 2.0));  // never compresses → unity
         eq::MultibandSplitter<4> ref; ref.prepare (sr, 1); ref.setNumBands (3); ref.setCrossovers (xf, 2);
@@ -184,7 +201,7 @@ int main()
     test::group ("MultibandProcessor latency alignment");
     {
         const double lookMs = 1.0; const int L = (int) std::lround (lookMs * 0.001 * sr);
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1, 5.0); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1, 5.0); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         mc.setBandParams (0, comp (24.0, 2.0)); mc.setBandParams (1, comp (24.0, 2.0, lookMs)); mc.setBandParams (2, comp (24.0, 2.0));
         eq::MultibandSplitter<4> ref; ref.prepare (sr, 1); ref.setNumBands (3); ref.setCrossovers (xf, 2);
@@ -203,7 +220,7 @@ int main()
     {
         auto runMix = [&] (float mix) -> double
         {
-            multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 1); mc.setNumBands (3);
+            multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 1); mc.setNumBands (3);
             const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
             mc.setBandParams (0, comp (-30.0, 4.0)); mc.setBandParams (1, comp (24.0, 2.0)); mc.setBandParams (2, comp (24.0, 2.0));
             mc.setMix (mix);
@@ -220,7 +237,7 @@ int main()
     // --- stereo channel independence ---
     test::group ("MultibandCompressor stereo independence");
     {
-        multiband::MultibandCompressor<4> mc; mc.prepare (sr, 512, 2); mc.setNumBands (3);
+        multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 2); mc.setNumBands (3);
         const float xf[2] = { 250.0f, 2500.0f }; mc.setCrossovers (xf, 2);
         for (int b = 0; b < 3; ++b) mc.setBandParams (b, comp (12.0, 2.0));
         const int N = 6000; std::vector<float> l (N), r (N, 0.0f);
@@ -241,7 +258,37 @@ int main()
         (void) mc.setNumBands (3);
         (void) mc.latencySamples();
         test::ok (true, "no OOB/crash from setters on an unprepared processor (ASan is the check)");
-        test::ok (mc.prepare (sr, 512, 2), "prepare still succeeds after early setters");
+        prep (mc, sr, 512, 2);   // still succeeds after the early setters
+    }
+
+    // The band-prepare verdict has to reach the caller. `MultibandProcessor` used to call the band
+    // preparer and discard what it said, so a Compressor that REFUSED its configuration produced a
+    // multiband that reported success and then silently did nothing to the audio.
+    test::group ("MultibandProcessor propagates a band's prepare() verdict");
+    {
+        StubBand::prepared = 0;
+        multiband::MultibandProcessor<StubBand, 4> ok4;
+        test::ok (ok4.prepare (48000.0, 512, 2, 0, [] (StubBand& b) { return b.prepare (true); }),
+                  "all bands accept -> prepare() returns true");
+        test::ok (StubBand::prepared == 4, "and every band was asked");
+
+        StubBand::prepared = 0;
+        multiband::MultibandProcessor<StubBand, 4> bad4;
+        test::ok (! bad4.prepare (48000.0, 512, 2, 0, [] (StubBand& b) { return b.prepare (StubBand::prepared != 3); }),
+                  "one band refuses -> prepare() returns false");
+        test::ok (StubBand::prepared == 4, "and the refusal did not stop the others being prepared");
+    }
+
+    // A finite but enormous maxLookaheadMs reached an out-of-range floating-to-integer conversion here
+    // before any band could refuse it — undefined behaviour, in the wrapper's own arithmetic.
+    test::group ("MultibandCompressor bounds the lookahead before it converts it");
+    {
+        multiband::MultibandCompressor<4> mc;
+        test::ok (! mc.prepare (48000.0, 512, 2, 1.0e300), "an absurd maxLookahead is refused");
+        test::ok (! mc.prepare (48000.0, 512, 2, 1.0e9), "so is a merely enormous one");
+        test::ok (! mc.prepare (48000.0, 512, 2, std::numeric_limits<double>::quiet_NaN()), "and a NaN");
+        test::ok (! mc.prepare (1.0e12, 512, 2, 5.0), "an absurd sample rate is refused too");
+        test::ok (mc.prepare (48000.0, 512, 2, 50.0), "and a sane configuration is accepted");
     }
 
     return test::report();

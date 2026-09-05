@@ -30,7 +30,13 @@ public:
     void setThresholdDb (double dB) noexcept { thr   = std::isfinite (dB) ? dB : 0.0; }
     void setRatio  (double r) noexcept { ratio = (std::isfinite (r) && r > 1.0) ? r : 1.0; }
     void setKneeDb (double k) noexcept { knee  = (std::isfinite (k) && k > 0.0) ? k : 0.0; }
-    void setRangeDb (double r) noexcept { range = (std::isfinite (r) && r > 0.0) ? r : 0.0; }   // ± delta cap
+    // BOUNDED, not merely finite. The delta this caps is cast to float by every consumer, and a finite
+    // but enormous range let a finite threshold produce a delta of ~1e300 that became -Inf in float; the
+    // GR follower then evaluated `-Inf + c*(0 - -Inf)` = NaN and never recovered, so ordinary parameters
+    // restored afterwards produced NaN audio for the rest of the stream. 400 dB is a gain of 1e20 —
+    // six times any real range and far inside float — so the cap is unreachable in use.
+    void setRangeDb (double r) noexcept
+    { range = (std::isfinite (r) && r > 0.0) ? (r < kMaxRangeDb ? r : kMaxRangeDb) : 0.0; }   // ± delta cap
     void setMode (Mode m) noexcept { mode = m; }
 
     double thresholdDb() const noexcept { return thr; }
@@ -49,6 +55,15 @@ public:
         }
         if (delta >  range) delta =  range;
         if (delta < -range) delta = -range;
+        // The clamp above is TWO ORDERED COMPARISONS, and both are false for a NaN — so it does not
+        // make the header's finiteness promise true on its own. One reachable NaN exists with entirely
+        // valid params: ratio == 1.0 (the honest "1:1, off" setting, and also the fallback setRatio()
+        // applies to any invalid ratio) makes slope exactly 0, and an infinite level then computes
+        // `kneeOver(+Inf) * 0` = `Inf * 0` = NaN, which reaches the gain as dbToGain(NaN) and turns the
+        // whole stream into NaN permanently. Substituting 0 (= transparent) is the only answer that
+        // carries no invented information. Bit-transparent for every finite and infinite input: those
+        // are already resolved by the clamps above.
+        if (std::isnan (delta)) delta = 0.0;
         return delta;
     }
 
@@ -65,6 +80,8 @@ private:
         const double t = x + h;                       // 0 .. knee
         return (t * t) / (2.0 * knee);
     }
+
+    static constexpr double kMaxRangeDb = 400.0;
 
     double thr = -18.0, ratio = 2.0, knee = 0.0, range = 24.0;
     Mode   mode = Mode::DownCompress;

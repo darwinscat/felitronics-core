@@ -8,6 +8,7 @@
 #include <felitronics/core/Config.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <array>
 #include <vector>
 
@@ -45,7 +46,18 @@ public:
         splitter_.prepare (sampleRate, channels_);
         bandBuf_.assign ((std::size_t) MaxBands * (std::size_t) channels_ * (std::size_t) maxBlock_, 0.0f);
         dryBuf_.assign  ((std::size_t) channels_ * (std::size_t) maxBlock_, 0.0f);
-        for (int b = 0; b < MaxBands; ++b) { bandPtrs_[(std::size_t) b].assign ((std::size_t) channels_, nullptr); prepareBand (proc_[(std::size_t) b]); }
+        // A band processor whose own prepare() can FAIL (dynamics::Compressor refuses a configuration
+        // it cannot honour rather than half-honouring it) must be able to say so through here, or the
+        // caller learns about it as "the multiband does nothing" much later. Every band is still
+        // prepared — returning early would leave the rest of them uninitialised — and the verdict is
+        // ANDed. `if constexpr` keeps void-returning band processors (stereo::StereoWidth) working.
+        bool bandsOk = true;
+        for (int b = 0; b < MaxBands; ++b)
+        {
+            bandPtrs_[(std::size_t) b].assign ((std::size_t) channels_, nullptr);
+            if constexpr (std::is_void_v<decltype (prepareBand (proc_[0]))>) prepareBand (proc_[(std::size_t) b]);
+            else bandsOk = prepareBand (proc_[(std::size_t) b]) && bandsOk;
+        }
 
         align_.assign ((std::size_t) MaxBands * (std::size_t) channels_, core::DelayLine {});
         for (auto& d : align_) d.prepare (maxAlignSamples);
@@ -53,7 +65,7 @@ public:
         for (auto& d : dryDelay_) d.prepare (maxAlignSamples);
 
         refreshLatency(); reset();
-        return true;
+        return bandsOk;
     }
 
     void reset() noexcept
