@@ -187,6 +187,7 @@ struct PowerAmpStage::Impl
     float comp = 1.0f;
     float gApplied = 1.0f, postApplied = 1.0f;       // per-sample ramp anchors
     bool  primed = false;
+    int   ranNc  = 0;                                // channels that advanced state on the previous call
 
     void prepare (double sr, int mb, int osFactor)
     {
@@ -223,6 +224,27 @@ struct PowerAmpStage::Impl
         svfLoadRes.reset();
         svfLoadRise.reset();
         for (int c = 0; c < kMaxCh; ++c) { otLp[c] = 0.0f; otHf[c] = 0.0f; }
+        ranNc = 0;   // nothing has run, so nothing can be stopping (see dropStoppedChannels)
+    }
+
+    // Clear the sample memory of every channel that ran on the previous accepted call and does not run on
+    // this one. A channel that leaves and RETURNS re-enters with its oversampler FIR, its DC blocker, its
+    // output-transformer poles and its five SVF columns frozen rather than decayed, and plays them into
+    // whatever comes back — measured 0.649 (-3.8 dBFS) out of DIGITAL SILENCE after stereo -> mono ->
+    // stereo. Per channel, never wholesale: the channel that stayed owes nothing to the one that left.
+    // `sag` is deliberately untouched — it is ONE supply shared by both channels, so it is supposed to
+    // follow whichever channels are actually there, exactly like a linked detector.
+    void dropStoppedChannels (int nCh) noexcept
+    {
+        for (int c = nCh; c < ranNc; ++c)
+        {
+            ovs.resetChannel (c);
+            dcx1[c] = dcy1[c] = 0.0;
+            otLp[c] = otHf[c] = 0.0f;
+            svfPresence.resetChannel (c); svfDepth.resetChannel (c); svfMid.resetChannel (c);
+            svfLoadRes.resetChannel (c);  svfLoadRise.resetChannel (c);
+        }
+        ranNc = nCh;
     }
 
     void setParams (const Params& p, const Voicing& v)
@@ -252,6 +274,7 @@ struct PowerAmpStage::Impl
         const int nCh = std::min (numChannels, kMaxCh);
         if (nCh <= 0 || numSamples <= 0 || maxBlock <= 0)   // maxBlock<=0 ⇒ process() called before prepare():
             return;                                          // clean no-op (also kills the off+=0 infinite loop)
+        dropStoppedChannels (nCh);                           // a call that ran nothing never reaches here
 
         // Chunk to maxBlock so a caller passing numSamples > maxBlock is FULLY processed instead of
         // silently leaving the tail dry. State carries across chunks via the members → seamless.

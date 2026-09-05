@@ -85,6 +85,7 @@ public:
             s.freq = -1.0; s.Q = -1.0;
         }
         engaged_ = false;
+        ranStProbeNc_ = 0;
     }
 
     // Point parameters. A MATERIAL fc/Q change re-arms that lane's estimator adaptation window — a
@@ -235,6 +236,7 @@ private:
             st_[i].running = false;   // rel is KEPT: it describes the signal, not the processing
             band.setLaneDeltaDb ((eq::Lane) i, 0.0);
         }
+        ranStProbeNc_ = 0;        // every probe column is zero now; there is no edge left to compute
     }
 
     // One control-rate chunk: run every running lane's detector over the SECTION INPUT and push its
@@ -242,6 +244,20 @@ private:
     void advance (const float* const* sc, int nc, int n, eq::EqBand& band) noexcept
     {
         const eq::BandParams& p = band.params();
+
+        // The Stereo lane's probe is PER CHANNEL and advances only for c < nc, while the envelope and the
+        // GR follower it feeds are shared and keep integrating. The lane itself never stops — ST runs at any
+        // nc — so the per-lane drop below cannot see this, and a channel that leaves and returns hands the
+        // linked max() a column frozen from before the gap: measured 11.97 dB of unearned reduction on
+        // DIGITAL SILENCE, against 0.000 on the run where the channel never left. Participation here is per
+        // column, so it is tracked per column, and cleared per column — resetting the whole probe would
+        // restart the channel that stayed and perturb the shared envelope it drives.
+        {
+            const int nowSt = laneRuns (p, eq::Lane::Stereo, nc) ? nc : 0;
+            eq::Svf&  probe = st_[(std::size_t) eq::Lane::Stereo].probe;
+            for (int c = nowSt; c < ranStProbeNc_; ++c) probe.resetChannel (c);
+            ranStProbeNc_ = nowSt;
+        }
         for (int i = 0; i < eq::kNumLanes; ++i)
         {
             const eq::Lane l = (eq::Lane) i;
@@ -372,6 +388,7 @@ private:
     double        dynAtk_ = 0.5, dynRel_ = 0.5;
     float         sign_ = 1.0f;
     bool          engaged_ = false;      // was the dynamics path live last call? (edge detect)
+    int           ranStProbeNc_ = 0;     // ST probe columns that advanced on the previous chunk
     LaneState     st_[eq::kNumLanes];
 };
 
