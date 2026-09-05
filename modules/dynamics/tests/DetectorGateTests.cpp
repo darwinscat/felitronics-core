@@ -12,12 +12,69 @@
 // size; gate-before diverges by ZERO, at every block size. Part one's per-block recovery cannot
 // substitute either — it restarts the filter from silence, which is a `reset()`, not a repair.
 //
-// WHAT AN INPUT GATE IS ENOUGH FOR, measured rather than assumed. The gate bounds the filter input to
-// ±1e6, and the largest output any configuration produces from that — swept over every filter type ×
-// 5 frequencies × Q up to 1000 × ±60 dB of gain, driven by a square wave at the filter's own centre
-// frequency — is 1.98e9. Its square is 3.9e18 against a float maximum of 3.4e38, so the squaring that
-// `MeanPower` and the Rms follower do cannot overflow, and a second gate on the filter's output would
-// buy nothing. The output would have to reach 1.8e19 first.
+// WHAT AN INPUT GATE IS ENOUGH FOR. This argument has been wrong twice, in the two different ways
+// such an argument can be wrong, and both are recorded because the corrections are the content.
+//
+// FIRST VERSION — a SAMPLE dressed as a proof: sweep every filter type x 5 frequencies x Q to 1000 x
+// +-60 dB, driven by a square wave at the centre frequency; the largest output from a +-1e6 input is
+// 1.98e9; its square 3.9e18 sits far under FLT_MAX 3.4e38; therefore no second gate on the filter's
+// OUTPUT is needed. The conclusion is right and the reasoning does not reach it. A sine or square
+// sweep measures peak |H|; the worst-case gain over ARBITRARY bounded inputs is the L1 norm of the
+// impulse response, which is larger. A sweep can only ever miss.
+//
+// SECOND VERSION — the right method, read off the wrong row. These three sidechains are not "every
+// filter type": all are `FilterType::BandPass` at gain 0 (DeEsser.h, DynamicEqBand.h,
+// LaneDynamics.h), whose SVF tap is `m0=0, m1=k, m2=0` with `k = 1/Q` — unity gain at the centre BY
+// CONSTRUCTION, at every Q. Raising Q rings up the internal state and divides the output tap by the
+// same k, so the output does not grow with Q at all; the measured L1 falls to 4/pi = 1.27324 and
+// stays there. Quoting that convergence as the bound was an error: the L1 norm is largest at LOW Q,
+// and `Svf::setParams` clamps Q at 1e-3, while the callers apply only `finite()`. The bound is the
+// worst row, not the settled one.
+//
+// THE BOUND, with an input that ATTAINS it rather than one that was tried. For |x| <= 1 the supremum
+// is exactly the L1 norm, and `x[n] = sign(h[N-1-n])` realises it — every tap then adds with one
+// sign. Measured that way at 48 kHz, from a 1e6 input, agreeing with the L1 sum to six digits:
+//
+//     fc 7 kHz:  Q 1e-3 -> 2.475e6   Q 0.1 -> 2.089e6   Q 0.5 -> 1.485e6   Q >= 10 -> 1.271e6
+//
+// Swept over each module's ACTUAL parameter rails (61x61 log grid in Q and frequency), the supremum
+// and where it sits:
+//
+//     DeEsser / DynamicEqBand   Q >= 1e-3 (the `Svf` floor; the callers apply only `finite()`),
+//                               f in [1, 0.49*fs]      ->  L1 2.9429 at Q 1e-3, 821 Hz   =>  2.94e6
+//     LaneDynamics              probeQ in [0.05, 40],
+//                               probeFreq in [10, 0.49*fs] ->  L1 2.4333 at Q 0.05, 3.7 kHz => 2.43e6
+//
+// So the sidechain output is bounded by 2.95e6 over the whole reachable range, for EVERY bounded
+// input rather than for the ones that were tried — and 670x smaller than the 1.98e9 the old sweep
+// reported for filter configurations these three modules never use.
+//
+// Note the direction: L1 rises as Q FALLS. Overdamped, the two poles are real and the fast one maps
+// near z = -1, giving a sign-alternating tail whose absolute sum exceeds its net sum. Reading the
+// converged 4/pi off a table that started at Q 0.5 was the second wrong version of this comment.
+//
+// The chain then squares once into the `MeanPower` sum (at most kMaxChannels = 16 lanes, 1.4e14),
+// takes the square root back (`sqrt(sq/nc)` is a MEAN, so `linked` <= 2.95e6 again and does not grow
+// with the channel count), and squares once more into the Rms follower's state (8.7e12). Two
+// squarings with a `sqrt` between them, so the fourth power never forms. The largest number reached
+// anywhere is 1.4e14 against FLT_MAX 3.4e38 — twenty-four orders of margin, so a second gate on the
+// filter's output would buy nothing.
+//
+// KNOWN AND ACCEPTED COST OF SUBSTITUTING ZERO. It is not free: replacing one sample of a loud,
+// near-DC key with 0 is a STEP, and a band-pass rings on a step. Isolated by running the same build
+// twice, once with a NaN in L and once without, and reading the innocent RIGHT channel — L at DC,
+// R a quiet 12 kHz tone, `fc` 7 kHz, threshold −40 dB:
+//
+//     scQ 2.0, L=1.0  ->  0.53 dB extra duck over 6.3 ms       scQ 2.0, L=0.5  ->  0.17 dB
+//     scQ 0.5, L=1.0  ->  4.29 dB extra duck over 170 ms       scQ 0.5, L=0.5  ->  2.39 dB
+//
+// The wide setting is the expensive one, and it rings for the rest of the block rather than for a few
+// milliseconds — worth knowing before quoting a single reassuring figure for this.
+//
+// The alternative is worse, which is why this is the contract: ungated, the NaN poisons the recursive
+// sidechain permanently, `fabs(NaN) > linked` is false, and the `Max` link then IGNORES that
+// channel's de-esser for the rest of the session. A bounded artefact on a pathological input beats
+// silent permanent failure.
 //
 // THE ACCEPTANCE IS THE GAIN TRAJECTORY, NOT THE AUDIO, and that is forced rather than chosen. These
 // modules are SELF-KEYED: the poisoned sample is a sample of the PROGRAMME, which is also the key, and
@@ -98,13 +155,87 @@ private:
 };
 
 //==============================================================================
+// ONE COMBINATION BELOW CARRIES NO WEIGHT, AND SAYING SO IS THE ONLY WAY IT STAYS HONEST.
+// Under `LinkMode::Max` the gate's NaN->0 is INDISTINGUISHABLE from no gate at all: the raw linker
+// compares with `a > mx`, which is false for a NaN, so an ungated NaN is dropped — and a substituted
+// zero never wins the comparison either. The two agree for every companion value, so the NaN x Max
+// row of the sweep below would pass with `linkAmplitudeGated` reverted to `linkAmplitude`. It is a
+// mathematical identity for a STEREO frame, and the weight for `Max` there rests on the other five
+// poisons, each of which the measurement below shows to discriminate.
+//
+// "No configuration discriminates" would be the tempting next sentence and it is FALSE. `MONO` does:
+// `ChannelLinker.h` short-circuits `numChannels == 1` to `std::fabs (get (0))` with no comparison at
+// all, so an ungated NaN goes straight into both followers. Measured, mono TransientShaper, NaN at
+// sample 700, block 256 — ungated, 12070 samples differ from the sanitised run once part one's flush
+// has restarted the state and stepped `gainSm_` back to 1; gated, zero differ. So the mono row is
+// added below as a SIGHTED fixture for exactly the case the stereo row cannot see.
+// (This is specific to the LINK. In DeEsser/DynamicEqBand/LaneDynamics the same NaN first meets a
+// recursive filter, where it does not get dropped and does poison — those fixtures are not vacuous.)
+static void maxLinkDropsNanWithNoGateAtAll()
+{
+    test::group ("LinkMode::Max — the NaN row is an identity, and every other poison is not");
+
+    for (const auto& p : kPoisons)
+        for (float other : { 0.0f, 0.5f, 1.0f })
+        {
+            float bad = p.bad, sane = p.sane, mate = other;
+            const float* poisoned[2]  = { &bad,  &mate };
+            const float* sanitised[2] = { &sane, &mate };
+            const float ungated = dynamics::linkAmplitude       (dynamics::LinkMode::Max, poisoned,  2, 0);
+            const float clean   = dynamics::linkAmplitudeGated  (dynamics::LinkMode::Max, sanitised, 2, 0);
+            const bool  agree   = ungated == clean;
+            const std::string what = std::string ("Max, ") + p.name + " beside " + std::to_string (other);
+
+            if (std::isnan (p.bad))
+                test::ok (agree, what + ": an UNGATED NaN already equals the sanitised link — this row"
+                                        " proves nothing about the gate, by construction");
+            else
+                test::ok (! agree, what + ": the ungated link differs from the sanitised one, so this"
+                                          " row does carry the gate's weight");
+        }
+}
+
+//==============================================================================
 // TransientShaper — no gain accessor, so the innocent CHANNEL is the trajectory: its own input is
 // untouched, so its output is bit-identical exactly when the shared gain is.
+// NB the NaN x Max row is vacuous — see `maxLinkDropsNanWithNoGateAtAll` above for why, and for the
+// measurement that the other five poisons are not.
 static void transientShaperSubstitutesItsKey()
 {
     test::group ("TransientShaper — a poisoned channel does not move the gain the others get");
 
     const int n = 24064, blk = 256, at = 700;   // n IS A MULTIPLE OF blk — see the note at the top
+
+    // MONO FIRST — the configuration the stereo sweep below structurally cannot see under `Max`.
+    // There is no innocent channel here, so the trajectory is the module's own output AFTER the
+    // poisoned sample has been flushed away; what is being compared is whether the two runs converge.
+    for (const auto& p : kPoisons)
+    {
+        SharedRig mono (1, n);
+        auto runMono = [&] (float poisonValue)
+        {
+            std::vector<float> src ((std::size_t) n);
+            for (int i = 0; i < n; ++i) src[(std::size_t) i] = toneAt (i, 900.0);
+            mono.fill (0, src);
+            mono.lane (0)[at] = poisonValue;
+            dynamics::TransientShaper t; t.prepare (kFs, blk, 1);
+            dynamics::TransientShaperParams tp;
+            tp.attackDb = 8.0; tp.sustainDb = -4.0; tp.mix = 1.0; tp.link = dynamics::LinkMode::Max;
+            t.setParams (tp);
+            for (int off = 0; off < n; off += blk)
+            { float* io[1] { mono.lane (0) + off }; t.process (io, 1, blk); }
+            return mono.snapshot (0);
+        };
+        const auto sane = runMono (p.sane), bad = runMono (p.bad);
+        int differ = 0;
+        for (int i = at + blk; i < n; ++i)          // from the block AFTER the poison: it is gone by then
+            if (std::memcmp (&sane[(std::size_t) i], &bad[(std::size_t) i], sizeof (float)) != 0) ++differ;
+        test::ok (differ == 0, std::string ("TransientShaper MONO, ") + p.name
+                  + ": once the poisoned block is past, the stream is bit-identical to the sanitised"
+                    " one (" + std::to_string (differ) + " of "
+                  + std::to_string (n - at - blk) + " differ)");
+    }
+
     for (const auto& p : kPoisons)
      for (auto link : { dynamics::LinkMode::Max, dynamics::LinkMode::MeanPower })
      {
@@ -217,15 +348,38 @@ static void theGainTrajectoriesAreSubstituted()
 }
 
 //==============================================================================
-// LaneDynamics takes its sidechain separately, so here the AUDIO null is the honest one — and the
-// mid/side lanes are the reason the gate sits before `laneSignal`'s arithmetic rather than after it:
-// `0.5f * (Inf - Inf)` is a NaN indistinguishable from a legitimate zero.
+// LaneDynamics takes its sidechain separately, so here the AUDIO null is the honest one.
+//
+// WHY THE GATE SITS BEFORE `laneSignal`'S ARITHMETIC, stated correctly on the third attempt. It is
+// NOT the `Inf - Inf` argument this comment used to give: `0.5f*(Inf-Inf)` is a NaN, a later gate
+// maps it to 0, and gating BEFORE maps the same frame to `0.5f*(1e6-1e6)` — also 0. Measured, both
+// channels +Inf and +Inf/-Inf alike: the two placements are bit-identical. That argument is empty.
+//
+// The real reason is the frame with ONE bad channel, where gating after DISCARDS THE GOOD ONE:
+//
+//     L=Inf, R=0.5   gate before -> Side -0.25      gate after -> Side 0     (the 0.5 is lost)
+//     L=NaN, R=0.5   gate before -> Side -0.25      gate after -> Side 0     (the 0.5 is lost)
+//     L=2e6, R=0.5   gate before -> Side 5e5        gate after -> Side 1e6   (clamp not linear)
+//
+// Gating first means every lane below is a bounded combination of bounded numbers, and a channel
+// that was never in trouble still contributes what it should.
 static void laneDynamicsGatesBeforeTheMidSideArithmetic()
 {
-    test::group ("LaneDynamics — gated before the M/S subtraction, audio nulled against the sanitised key");
+    test::group ("LaneDynamics — gating first keeps the good channel; audio nulled against the sanitised key");
 
-    const int n = 4096, blk = 128, at = 300;
+    // THE BAND MUST ACTUALLY ENGAGE, and `bp.dyn.on = true` is not enough to make it. `thrAuto`
+    // defaults to TRUE — a RELATIVE threshold, measured against each lane's own programme level — so a
+    // fixture that never leaves its own programme level idles at exactly zero delta on every lane.
+    // Measured on this fixture as first written: max |delta| 0.0000 dB on Stereo, Mid AND Side. Six
+    // assertions were green against a band that was doing nothing at all. They still failed under a
+    // no-gate mutation, which is what hid it — but only because the poison at 300 happened to land
+    // inside RelativeLevel's 8 ms seed window, four samples before a chunk flush, moving the seed by
+    // 0.126 dB. At 100, 383, 400, 600, 1000, 2200, 2500 or 3000 the ungated audio is bit-identical
+    // and all six pass with no gate whatsoever. An absolute threshold engages the band (12 dB on
+    // every lane) and the poison position stops being load-bearing — so it is swept, not chosen.
+    const int n = 4096, blk = 128;
     for (const auto& p : kPoisons)
+     for (int at : { 300, 383, 1000, 2500 })
      for (int poisonRight = 0; poisonRight < 2; ++poisonRight)
      {
          std::vector<float> src[2], sc[2];
@@ -260,6 +414,7 @@ static void laneDynamicsGatesBeforeTheMidSideArithmetic()
              for (auto lane : { eq::Lane::Stereo, eq::Lane::Mid, eq::Lane::Side })
              { auto& lp = bp.lane (lane); lp.on = true; lp.freq = 800.0; lp.Q = 1.0; lp.gainDb = 0.0; }
              bp.dyn.on = true; bp.dyn.rangeDb = -12.0;
+             bp.dyn.thrAuto = false; bp.dyn.thrDb = -30.0;   // ABSOLUTE — see the note above
              ld.setParams (bp);
              eq::EqBand band; band.prepare (kFs, 2); band.setParams (bp);
              for (int off = 0; off < n; off += blk)
@@ -274,7 +429,7 @@ static void laneDynamicsGatesBeforeTheMidSideArithmetic()
          };
          const auto poisoned = run (p.bad), sanitised = run (p.sane);
          const int bad = std::memcmp (poisoned.data(), sanitised.data(), poisoned.size() * sizeof (float)) == 0 ? 0 : 1;
-         test::ok (bad == 0, std::string ("LaneDynamics, ") + p.name + " in channel "
+         test::ok (bad == 0, std::string ("LaneDynamics, ") + p.name + " at " + std::to_string (at) + " in channel "
                    + std::to_string (ch) + ": the audio is bit-identical to the sanitised run");
      }
 }
@@ -322,6 +477,7 @@ static void theGainIsSharedAndThatIsWhyIsolationIsAPrimitiveProperty()
 int main()
 {
     std::printf ("P14 part two — the detector inputs are gated, before the filter\n");
+    maxLinkDropsNanWithNoGateAtAll();
     transientShaperSubstitutesItsKey();
     theGainTrajectoriesAreSubstituted();
     laneDynamicsGatesBeforeTheMidSideArithmetic();

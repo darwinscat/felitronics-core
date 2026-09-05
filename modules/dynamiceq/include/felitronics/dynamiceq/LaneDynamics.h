@@ -343,9 +343,14 @@ private:
         return l == eq::Lane::Stereo || nc == 2;      // L/R/M/S are stereo-only, as in EqBand
     }
 
-    // GATED HERE, BEFORE THE ARITHMETIC, and that ordering is the point: the mid/side lanes SUBTRACT,
-    // and `0.5f * (Inf - Inf)` is a NaN that no later gate can tell from a legitimate zero. Gating the
-    // raw channels first means every lane below is a bounded combination of bounded numbers.
+    // GATED HERE, BEFORE THE ARITHMETIC, and the reason is NOT the tempting one. `0.5f*(Inf-Inf)` is
+    // a NaN, but a gate placed after would map it to 0 and gating before maps the same frame to
+    // `0.5f*(1e6-1e6)`, also 0 — measured bit-identical, so that argument proves nothing.
+    // What gating first actually buys is the frame with ONE bad channel: at L=Inf, R=0.5 gating
+    // before gives Side -0.25 and gating after gives 0, DISCARDING a channel that was never in
+    // trouble. Above 1e6 the lanes are also not clamp-linear (L=2e6, R=0.5 -> 5e5 before, 1e6 after).
+    // Gating the raw channels first means every lane below is a bounded combination of bounded
+    // numbers, and a healthy channel still contributes what it should.
     static float laneSignal (eq::Lane l, const float* const* sc, int nc, int k) noexcept
     {
         const float L = dynamics::detectorGate (sc[0][k]);
