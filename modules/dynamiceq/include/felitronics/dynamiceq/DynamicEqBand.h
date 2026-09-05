@@ -85,11 +85,13 @@ public:
             float linked = 0.0f;
             if (link_ == dynamics::LinkMode::Max)
             {
-                for (int c = 0; c < nc; ++c) { const float a = std::fabs (side_.processSample (c, io[c][i])); if (a > linked) linked = a; }
+                // Gated on the filter's INPUT — see the note in DeEsser: the sidechain filter is
+                // recursive, so gating its output would only change the sign of the defect.
+                for (int c = 0; c < nc; ++c) { const float a = std::fabs (side_.processSample (c, dynamics::detectorGate (io[c][i]))); if (a > linked) linked = a; }
             }
             else
             {
-                float sq = 0.0f; for (int c = 0; c < nc; ++c) { const float bp = side_.processSample (c, io[c][i]); sq += bp * bp; }
+                float sq = 0.0f; for (int c = 0; c < nc; ++c) { const float bp = side_.processSample (c, dynamics::detectorGate (io[c][i])); sq += bp * bp; }
                 linked = std::sqrt (sq / (float) nc);
             }
             const float lvl   = env_.process (linked);

@@ -46,6 +46,14 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamics_poison_recovery_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_poison_recovery_tests COMMAND felitronics_dynamics_poison_recovery_tests)
 
+    # P14 part two: PREVENTION — the four consumers gate their detector input before the filter. Links
+    # deesser and dynamiceq for the same reason the recovery suite does: the contract spans them.
+    add_executable(felitronics_dynamics_detector_gate_tests tests/DetectorGateTests.cpp)
+    target_link_libraries(felitronics_dynamics_detector_gate_tests PRIVATE felitronics::dynamics felitronics::eq felitronics::deesser felitronics::dynamiceq)
+    target_include_directories(felitronics_dynamics_detector_gate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_detector_gate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_detector_gate_tests COMMAND felitronics_dynamics_detector_gate_tests)
+
     add_executable(felitronics_dynamics_transient_tests tests/TransientShaperTests.cpp)
     target_link_libraries(felitronics_dynamics_transient_tests PRIVATE felitronics::dynamics)
     target_include_directories(felitronics_dynamics_transient_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

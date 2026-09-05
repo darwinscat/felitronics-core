@@ -67,7 +67,12 @@ public:
         if (nc <= 0) return;
         for (int i = 0; i < n; ++i)
         {
-            const float linked = linkAmplitude (params_.link, channels, nc, i);
+            // GATED, and per sample before the link — the same shape and the same reason as the
+            // compressor's. `MeanPower` squares INSIDE the link, so a gate on the linked result would
+            // read an overflowed frame as silence; and both followers below are recursive, so one bad
+            // sample reaching them is permanent. Measured on the unguarded code: one NaN in ONE
+            // channel left 102300 of 102400 output samples non-finite in EVERY channel, for good.
+            const float linked = linkAmplitudeGated (params_.link, channels, nc, i);
             const float fe = fast_.process (linked);
             const float se = slow_.process (linked);
             const float norm = (fe - se) / (fe + se + 1.0e-9f);                 // ∈ [−1, 1]
