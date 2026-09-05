@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <felitronics/core/FlushToZero.h>
 #include <felitronics/eq/EqTypes.h>
 
 #include <algorithm>
@@ -893,11 +894,15 @@ struct Biquad
         return (float) y;
     }
 
-    // Per-block denormal guard — see Svf::flushDenormals.
+    // Per-block guard on the delay state — poison included, for the reasons and with the limits
+    // spelled out in Svf::flushDenormals. Measured the same way and with the same result: one +Inf
+    // into this filter left 479000 of the next 480000 outputs non-finite under a denormal-only guard,
+    // because `fabs(NaN) < 1e-15f` is false. This is the runtime state of every `eq` consumer that is
+    // not an SVF — the EQ bands, and `rigplayer`'s per-band filters.
     void flushDenormals() noexcept
     {
-        if (std::fabs (z1) < 1e-15f) z1 = 0.0f;
-        if (std::fabs (z2) < 1e-15f) z2 = 0.0f;
+        core::flushPoison (z1);
+        core::flushPoison (z2);
     }
 };
 

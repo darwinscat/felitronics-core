@@ -34,8 +34,11 @@ public:
 
     float valueDb() const noexcept { return currentDb; }
 
-    // Law 8: flush the follower state once it decays below the subnormal-risk threshold (release → 0).
-    void flushDenormals() noexcept { core::flushDenormal (currentDb); }
+    // Law 8: flush the follower state once it decays below the subnormal-risk threshold (release → 0),
+    // and clear it if it is ever non-finite. The second half is unreachable through `Compressor` — the
+    // detector is gated and `GainComputer::deltaDb` substitutes 0 for a NaN delta — so this is the
+    // primitive keeping its own promise for whoever drives it directly, not a fix for a live defect.
+    void flushDenormals() noexcept { core::flushPoison (currentDb); }
 
 private:
     void  updateCoeffs() noexcept { atkCoeff = coeff (atkMs); relCoeff = coeff (relMs); }

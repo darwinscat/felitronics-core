@@ -82,10 +82,15 @@ public:
     // level below the new floor cannot reach a gain at all — what is left is visible only to a caller
     // reading the raw envelope, which is why the compressor's own output no longer depends on the
     // partition and the meter, below -280 dBFS, still can.
+    // POISON IS CLEARED TOO, and in Rms mode NOT by swapping in `core::flushPoison`. That would look
+    // like the obvious edit and would silently undo the paragraph above: `flushPoison` carries the
+    // house 1e-15 threshold, which in the POWER domain means an amplitude of 3.2e-8, i.e. -150 dBFS —
+    // the very bug this comment exists to record. The non-finite half is what has to be added; the
+    // 1e-30 threshold is what has to survive.
     void flushDenormals() noexcept
     {
-        if (det == Detector::Rms) { if (env < 1.0e-30f) env = 0.0f; }
-        else core::flushDenormal (env);
+        if (det == Detector::Rms) { if (! std::isfinite (env) || env < 1.0e-30f) env = 0.0f; }
+        else core::flushPoison (env);
     }
 
 private:

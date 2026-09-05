@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <felitronics/eq/EqTypes.h>
+#include <felitronics/core/FlushToZero.h>
 #include <felitronics/eq/EqTypes.h>
 
 #include <cmath>
@@ -76,14 +76,38 @@ public:
         return (float) (m0 * v0 + m1 * v1 + m2 * v2);
     }
 
-    // Per-block denormal guard: zap tiny integrator state to exact zero so decaying tails
-    // don't sustain subnormals (CPU spikes). Inaudible (< ~-300 dB). Host should also set FTZ/DAZ.
+    // Per-block guard on the integrator state: zap tiny values to exact zero so decaying tails don't
+    // sustain subnormals (CPU spikes), AND zap non-finite ones, which is the part that is not an
+    // optimisation. Inaudible (< ~-300 dB). A host may also set FTZ/DAZ.
+    //
+    // WHY POISON AND NOT ONLY DENORMALS. `ic1 = 2*v1 - ic1` is recursive, and a NaN in it reproduces
+    // itself for ever: `fabs(NaN) < 1e-15f` is FALSE, so a denormal-only guard steps over exactly the
+    // state it needs to clear. Measured on this filter — one +Inf sample into a band-pass, then a
+    // healthy 7 kHz tone: 479000 of the next 480000 outputs non-finite, with the per-block flush
+    // running throughout. NaN behaves identically. That is the "one bad sample forever" defect, and
+    // for an AUDIO-path filter it is the only remedy available: the house rule is that the audio path
+    // is not sanitised (a compressor is not a sanitiser), so nothing may gate this filter's input.
+    // A DETECTOR path is different and must be gated upstream instead — see the note below.
+    //
+    // WHAT THIS BUYS AND WHAT IT DOES NOT. It bounds the damage; it does not undo it. Recovery happens
+    // at the flush, which the OWNER clocks, so a poisoned filter emits rubbish until the end of the
+    // caller's block — 0.3 ms at 32 samples, 84 ms at 4096, 170 ms at 8192 — and then restarts from
+    // silence. Restarting is exactly `reset()`: the filter's history is gone, so the recovered stream
+    // is NOT the stream a sanitised input would have produced, and this is deliberately not claimed.
+    // A detector cannot live with either property, which is why detectors gate their input instead of
+    // relying on this.
+    //
+    // BIT-IDENTICAL ON HEALTHY STREAMS, and that is provable rather than hoped: `core::flushPoison` is
+    // a strict superset of `core::flushDenormal` — they agree on every FINITE input, exhaustively
+    // swept by class in `core/tests/FlushPoisonTheoryTests.cpp`. The only finite input that reaches a
+    // different outcome here is one that overflows the float state itself (sign-alternating |x| ≳
+    // 1e38), where the new behaviour is the better one.
     void flushDenormals() noexcept
     {
         for (int c = 0; c < kMaxChannels; ++c)
         {
-            if (std::fabs (ic1[c]) < 1e-15f) ic1[c] = 0.0f;
-            if (std::fabs (ic2[c]) < 1e-15f) ic2[c] = 0.0f;
+            core::flushPoison (ic1[c]);
+            core::flushPoison (ic2[c]);
         }
     }
 
