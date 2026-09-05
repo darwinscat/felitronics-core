@@ -19,6 +19,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamics_compressor_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_compressor_tests COMMAND felitronics_dynamics_compressor_tests)
 
+    # Links eq as well: the acceptance signal needs a REAL sidechain high-pass, and building it from
+    # eq::MatchedBiquad in the TEST is the point — the filter lives in the caller, never in the
+    # compressor (ADR §4). The dynamics MODULE itself stays independent of eq.
+    add_executable(felitronics_dynamics_sidechain_tests tests/CompressorSidechainTests.cpp)
+    target_link_libraries(felitronics_dynamics_sidechain_tests PRIVATE felitronics::dynamics felitronics::eq)
+    target_include_directories(felitronics_dynamics_sidechain_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_sidechain_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_sidechain_tests COMMAND felitronics_dynamics_sidechain_tests)
+
     add_executable(felitronics_dynamics_transient_tests tests/TransientShaperTests.cpp)
     target_link_libraries(felitronics_dynamics_transient_tests PRIVATE felitronics::dynamics)
     target_include_directories(felitronics_dynamics_transient_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

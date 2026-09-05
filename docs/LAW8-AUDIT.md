@@ -159,7 +159,12 @@ when no lane runs) · `eq::Svf` / `eq::MatchedBiquad` (1e-15f) · `rigplayer::ru
 `MatchedBiquad` per block) · `nam::BlendLaw` (linear step + clamp lands on exact 0/1) · the convolver IR
 crossfade (a countdown, not a decay) · `stereo::MonoBass` (flushes its crossover, resets on bypass) ·
 `stereo::StereoWidth` (`LinearSmoother` only) · `MultiResSpectrumPane` (has its own power-aware guard) ·
-`SagEnvelope` (1e-30f) · `TubeStage` (memoryless) · `poweramp`'s `gApplied`/`postApplied` (linear ramps,
+`SagEnvelope` (1e-30f) · `dynamics::EnvelopeFollower` in **Rms** mode (1e-30f — the state there is a
+POWER, so the house 1e-15 amplitude threshold would have zapped a level of 3.2e-8, i.e. −150 dBFS. That
+is not merely audible-adjacent, it made the OUTPUT depend on the caller's block partition, because the
+flush fires once per `process()` call: measured on a −160 dBFS input, −7.5 dB of gain reduction in one
+10000-sample call against 0.00 dB in 10000 one-sample calls, the same stream. Same reasoning, and the
+same constant, as `SagEnvelope` and the power-aware guard in `MultiResSpectrumPane`) · `TubeStage` (memoryless) · `poweramp`'s `gApplied`/`postApplied` (linear ramps,
 land exactly) · every `EnvelopeFollower` owner (Compressor, NoiseGate, DeEsser, DynamicEqBand,
 LaneDynamics, TransientShaper) · `DelayLine` / `DryAligner` / `StreamResampler` (no recursion) ·
 `Fft` / `Pffft*` / `MatrixConvolver*` / `IrResampler` / `PolyphaseOversampler` / `BlendKernels` (FIR and

@@ -46,6 +46,7 @@
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainComputer.h>
 #include <felitronics/dynamics/GainReductionFollower.h>
+#include <felitronics/dynamics/LinkedDetector.h>
 #include <felitronics/dynamics/NoiseGate.h>
 #include <felitronics/dynamics/RelativeLevel.h>
 #include <felitronics/dynamics/TransientShaper.h>
