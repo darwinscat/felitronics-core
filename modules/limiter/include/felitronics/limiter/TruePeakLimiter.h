@@ -129,11 +129,26 @@ struct TruePeakLimiterParams
 // hard-limited master and ~0.3 dB for ordinary material, at 4× or 8× alike — and if you need a
 // GUARANTEE rather than a budget, measure the delivered peak and close the loop on it.
 //
-// ALWAYS IN THE PATH, even when nothing is being limited: the 0.90 × Nyquist prototype is a round trip,
-// so the top of the band is attenuated — 0.00 dB at 0.36 fs, −0.40 at 0.40, −4.0 at 0.44, −6.0 at 0.45,
-// identically at every factor (the transition width is constant in base-rate units). That is a mastering
-// decision, not a rounding error, and it is pinned in the suite so a wider pass band has to be chosen
-// deliberately.
+// ALWAYS IN THE PATH, even when nothing is being limited: the 0.90 × Nyquist prototype is applied TWICE,
+// once interpolating and once decimating, so the top of the band is attenuated by |H|² — the dB figures
+// of one pass, DOUBLED. Measured on the round trip at tapsPerPhase = 32 (and derived independently from
+// designFilter()'s coefficients, agreeing to three decimals):
+//
+//        f/fs      2×        4×        8×
+//        0.36    −0.001    −0.001    −0.000
+//        0.40    −0.800    −0.775    −0.762
+//        0.44    −8.092    −8.065    −8.052
+//        0.45   −12.041   −12.041   −12.041
+//
+// THIS COMMENT USED TO READ −0.40 / −4.0 / −6.0 AND CALL THEM THE ROUND TRIP. Those are one pass. The
+// correction matters because the number is a mastering decision, not a rounding error, and a product
+// reading it was sizing that decision on half the truth — doubly so with a saturator in front, since a
+// second oversampled stage doubles it again (at 44.1 kHz, clipper + limiter at 32 taps cost −1.549 dB at
+// 17.6 kHz and −6.033 at 18.5). `tapsPerPhase = 64` removes it below 0.41 fs for 63 samples instead of
+// 31; `felitronics::mastering` defaults to 64 for exactly that reason and pins the whole table.
+// NB it is only APPROXIMATELY factor-independent: exact at 0.45, spread over 0.038 dB at 0.40.
+// The suite's own droop check stops at 5fs/14 ≈ 0.357 fs, which is why this stood uncorrected — the
+// three frequencies the figures name were never measured.
 //
 // WHAT IS CLAMPED, all of it visible rather than silent (oversampleFactor(), lookaheadSamples(),
 // effectiveReleaseMs(), effectiveCeilingDbTp()): the oversampling factor into [2, 16]; the lookahead
@@ -188,7 +203,14 @@ public:
         F     = config.oversampleFactor < 2 ? 2 : config.oversampleFactor;   // a requested 1 becomes 2; above kMaxFactor was refused
         if (! os.prepare (F, maxCh, tpp)) return false;        // oversampler rejected → stay unprepared
 
-        osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock * (std::size_t) F, 0.0f));
+        // maxBlock_, NOT maxBlock: the cap two lines up exists to bound exactly this allocation
+        // ("without a cap a hostile or mistaken prepare() could ask for gigabytes"), and sizing the
+        // buffer from the UNCAPPED argument left it doing nothing. It is reachable by ordinary use, not
+        // only by a hostile one — this header tells an offline caller that sizing maxBlock to a whole
+        // file is a normal thing to do, and a 10-minute stereo file at 48 kHz asked for 460 MB per
+        // channel instead of the 16 MB the cap allows. processChunk() already works in maxBlock_-sized
+        // pieces, so the smaller buffer is the one it was always using.
+        osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock_ * (std::size_t) F, 0.0f));
         osPtrs.assign ((std::size_t) maxCh, nullptr);
 
         // A rate so low that 20 ms cannot hold the minimum lookahead would make the clamp below

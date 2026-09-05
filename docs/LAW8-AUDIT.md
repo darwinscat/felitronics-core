@@ -174,6 +174,36 @@ transforms — no decaying recursion) · `TruePeakMeter` and `SpectrumPane` (set
 **Not verified:** NAM/neural inference state (external code; an LSTM's zero-input fixed point is nonzero,
 so no subnormal stall is expected, but it has not been measured).
 
+### ⚠ THE SWEEP ABOVE ASSUMED A SMALL BLOCK, and one call shape falls outside it
+
+Every "clean, per-block flush" verdict here rests on `core/FlushToZero.h`'s own reasoning: *"a block is
+too short to re-traverse the gap, so state never reaches subnormal across blocks."* **That is false for a
+big block**, and a big block is not exotic — `Compressor`, `EqEngine` and `Dither` all accept any length,
+and `TruePeakLimiter`'s header explicitly tells an offline caller that sizing `maxBlock` to a whole file
+is a normal thing to do. A flush that fires once per CALL cannot fire inside one.
+
+Measured (P6, `eq::EqEngine`, one +6 dB bell, 1000 samples of tone then 39000 of digital silence, tail
+`[2000, 40000)`):
+
+| call shape | exact zeros | SUBNORMAL | last non-zero |
+|---|---|---|---|
+| whole file, one call | 1 | **37678** | 7.006e-45 at i = 39999 |
+| block 4096 | 35905 | 1774 | 7.006e-45 at i = 4095 |
+| block 64 | 38000 | 0 | — |
+| block 1 | 38000 | 0 | — |
+
+So the entire tail sits in the subnormal range — the 10–100× stall this law exists to prevent, and the
+one already measured at 23.9× on `Saturator`'s DC blocker. `eq::EqBand` and `stereo::MonoBass` are listed
+as clean above; that verdict holds for a host-sized block and NOT for a whole-file call. `Saturator` is
+genuinely clean either way, because its flush is per SAMPLE.
+
+**What to do about it is a choice, and P6 took the third option:** (a) move the flushes into the sample
+loop — correct, but a versioned behaviour change in a module TabbyEQ ships; (b) cap the block a stage
+will accept — reintroduces the silent-truncation defect P2 F2 closed; (c) **stop the caller's block from
+reaching the stage at all**, which is what `felitronics::mastering` does with a fixed internal quantum,
+and why it has one. A future re-audit should measure the whole-file shape for every row above rather than
+assume the sweep covered it.
+
 ---
 
 ## How these are tested

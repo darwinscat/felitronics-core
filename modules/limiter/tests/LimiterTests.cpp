@@ -20,8 +20,9 @@
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+static std::atomic<long long> g_allocBytes { 0 };   // SIZE, not just count — the maxBlock cap is about bytes
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
@@ -230,6 +231,41 @@ int main()
     {
         limiter::TruePeakLimiter lim;
         test::ok (lim.latencySamples() == 0, "unprepared limiter reports 0 latency, not -1");
+    }
+
+    // THE maxBlock CAP HAS TO BOUND THE ALLOCATION IT EXISTS FOR. prepare() clamps maxBlock to
+    // kMaxBlock (1 << 20) and then chunks by the clamped value — but the oversampled scratch used to be
+    // sized from the UNCLAMPED argument, so the cap bounded nothing. It is reachable by ordinary use,
+    // not a hostile one: the header tells an offline caller that sizing maxBlock to a whole file is
+    // normal, and a 10-minute stereo file at 48 kHz then asked for ~460 MB per channel. Counting BYTES
+    // is what discriminates — the number of allocations is identical either way.
+    test::group ("prepare() respects its own maxBlock cap in BYTES, not only in chunking");
+    {
+        auto bytesFor = [] (int maxBlock) {
+            const long long before = g_allocBytes.load();
+            {
+                limiter::TruePeakLimiter lim;
+                test::ok (lim.prepare (48000.0, maxBlock, 1, {}), "prepare(maxBlock = " + std::to_string (maxBlock) + ")");
+            }
+            return g_allocBytes.load() - before;
+        };
+        const long long atCap   = bytesFor (1 << 20);
+        const long long overCap = bytesFor (1 << 23);          // eight times the cap
+        test::ok (overCap <= atCap + (atCap / 8),
+                  "asking for 8x the cap allocates no more than asking for the cap ("
+                  + std::to_string (overCap / 1024) + " KB vs " + std::to_string (atCap / 1024) + " KB)");
+        // ...and the clamp is still only a scratch size: a call far larger than maxBlock is processed
+        // whole, so nothing was traded away for the bound.
+        limiter::TruePeakLimiter lim;
+        test::ok (lim.prepare (48000.0, 1 << 23, 1, {}), "prepare with an over-cap maxBlock still succeeds");
+        std::vector<float> x ((std::size_t) 200000, 0.9f);
+        float* io[1] { x.data() };
+        limiter::TruePeakLimiterParams pr; pr.ceilingDbTp = -6.0; lim.setParams (pr);
+        lim.process (io, 1, (int) x.size());
+        double peak = 0.0;
+        bool finite = true;
+        for (float v : x) { finite &= (bool) std::isfinite (v); peak = std::max (peak, (double) std::fabs (v)); }
+        test::ok (finite && peak > 0.0 && peak < 0.9, "...and a 200000-sample call is still limited, whole");
     }
 
     return test::report();

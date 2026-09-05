@@ -80,8 +80,19 @@ public:
     // construction, so it cannot make the state partition-independent; it can only put the floor where
     // nothing downstream can see it. `core::gainToDb` clamps its argument at 1e-12 (-240 dBFS), so a
     // level below the new floor cannot reach a gain at all — what is left is visible only to a caller
-    // reading the raw envelope, which is why the compressor's own output no longer depends on the
-    // partition and the meter, below -280 dBFS, still can.
+    // reading the raw envelope, and the meter below -280 dBFS still shows it.
+    // THIS PARAGRAPH USED TO END "...which is why the compressor's own output no longer depends on the
+    // partition." IT IS FALSE, and the counterexample is two samples long. The flush zeroes the state,
+    // but the trajectory OUT of zero and out of a surviving 8.45e-31 then climbs back ABOVE the 1e-12
+    // floor, where the clamp no longer hides the difference. With the window set so the coefficient is
+    // exactly 0.5f (rmsWindowMs = 1000/(fs·ln2)) and a key of [1.3e-15f, 1.5e-12f], the amplitude after
+    // the second sample is 1.060660367e-12 carried against 1.060660168e-12 flushed; through a threshold
+    // of -240 dB at 4:1 on a programme of 0.5f that is 0.478396237 in one 2-sample call against
+    // 0.478396297 in two 1-sample calls — half an LSB of 24-bit, from a floor that was supposed to make
+    // it unreachable. What the floor buys is that ordinary material does not reach the window between
+    // 1e-15 and 1e-12; it is not a proof that nothing can. A caller that needs the output to be
+    // partition-independent has to stop the caller's blocks reaching the stage at all — which is what
+    // `felitronics::mastering` does with a fixed internal quantum, and why it has one.
     // POISON IS CLEARED TOO, and in Rms mode NOT by swapping in `core::flushPoison`. That would look
     // like the obvious edit and would silently undo the paragraph above: `flushPoison` carries the
     // house 1e-15 threshold, which in the POWER domain means an amplitude of 3.2e-8, i.e. -150 dBFS —

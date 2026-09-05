@@ -139,6 +139,7 @@ add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
 add_subdirectory(modules/deesser)
 add_subdirectory(modules/dither)
+add_subdirectory(modules/mastering)   # the mastering CHAIN — after every stage it composes (eq, dynamics, saturation, limiter, stereo, dither)
 add_subdirectory(modules/lineareq)
 add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Farina deconv/gate) — double, message-thread
 add_subdirectory(modules/blend)   # OFFLINE mic-blend engine (mixer params + kernels + Σ(gain·strip) blend) — double coeffs, float buffers
@@ -162,7 +163,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
-        felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
+        felitronics::deesser felitronics::dither felitronics::mastering felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text)
     if(FELITRONICS_WITH_NAM)
         target_link_libraries(felitronics_header_hygiene PRIVATE felitronics::nam felitronics::rigplayer)
@@ -197,7 +198,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
-        felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
+        felitronics::deesser felitronics::dither felitronics::mastering felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)

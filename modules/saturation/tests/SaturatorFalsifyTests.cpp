@@ -116,6 +116,28 @@ int main()
     }
 
     group ("own attack: failed prepare leaves process as a no-op");
+    // A NaN SAMPLE RATE. `NaN <= 0.0` is false, so the guard used to let it through, return true, and
+    // emit NaN: fsOs is NaN, so the DC blocker coefficient exp(-2*pi*fc/NaN) is NaN and the Asym path
+    // carries it out. Checking `prepare` alone is not enough — the point is that nothing downstream has
+    // to survive it, so the output is checked too.
+    {
+        Sat s;
+        ok (! s.prepare (std::nan (""), 64, 1, 4), "prepare(NaN sample rate) is refused");
+        ok (! s.prepare (std::numeric_limits<double>::infinity(), 64, 1, 4), "prepare(inf sample rate) is refused");
+        Sat::Params p;
+        p.shape = felitronics::saturation::WaveShaper::Shape::Asym;
+        p.driveDb = 6.0f;
+        p.bias = 0.3f;
+        s.setParams (p);
+        std::vector<float> a (64, 0.3f);
+        float* io[1] { a.data() };
+        s.process (io, 1, 64);
+        bool finite = true;
+        for (float v : a) finite &= (bool) std::isfinite (v);
+        ok (finite, "...and the unprepared stage emits nothing non-finite");
+        ok (a[40] == 0.3f, "...having left the caller's buffer untouched");
+    }
+
     {
         Sat s;
         ok (! s.prepare (-48000.0, 0, 2, 4), "invalid prepare fails");

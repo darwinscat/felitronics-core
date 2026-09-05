@@ -54,7 +54,12 @@ public:
     bool prepare (double sampleRate, int maxBlock, int maxChannels, int oversampleFactor = 4, int tapsPerPhase = 32)
     {
         prepared_ = false;                                             // any early return below leaves it unprepared
-        if (sampleRate <= 0.0 || maxBlock < 1) return false;
+        // Spelled positively so a NaN FAILS. `NaN <= 0.0` is false, so the previous form accepted a
+        // NaN rate, returned true, and went on to emit NaN: fsOs is NaN, so the DC blocker's
+        // exp(-2π·fc/NaN) is NaN and the Asym path carries it into the output (measured on
+        // prepare(NaN, 64, 1, 4, 32) — returns TRUE, output sample 40 is nan). Same shape and same
+        // reason as the guard in TruePeakLimiter::prepare.
+        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || maxBlock < 1) return false;
         fs_       = sampleRate;
         maxBlock_ = maxBlock;
         channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);

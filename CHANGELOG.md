@@ -5,6 +5,68 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## Unreleased — the chain that gives the same bits however you cut it (`mastering`)
+
+- **feat(mastering):** a new module, and the first one that is a **composition** rather than a stage:
+  `MasteringChain` — `gain → EQ → [M/S mono-bass] → compressor (optional internal sidechain HPF) →
+  [soft clipper] → gain → true-peak limiter → dither` — plus `OfflineRenderer` over it. No new DSP; every
+  stage already shipped. What is new is the part composition kept getting wrong.
+  - **A FIXED INTERNAL QUANTUM, not a promise.** The chain never hands a caller's block boundary to a
+    stage: it buffers and calls every stage with exactly `internalBlock` samples. That is not tidiness,
+    it is the only thing that makes "same input, same output, whatever the block size" TRUE here.
+    Measured on this tree: `eq::EqBand` and `stereo::MonoBass` flush filter state once per *call*, so
+    renders at block 4096 and block 1 differ in 4721 and 8908 samples; a band parked at 0 dB moves that
+    divergence out of the tail and into the programme (2083 samples of a 50000-sample tone, from sample
+    24); `dither::Dither`'s auto-blank then amplifies 1e-15 into **three LSB of a 24-bit master** by
+    deciding whether the tail is exactly zero; and the compressor is not exempt either — a key of
+    `[1.3e-15, 1.5e-12]` with the RMS window set so the follower coefficient is exactly 0.5 gives
+    0.478396237 in one 2-sample call against 0.478396297 in two 1-sample calls. Costs `internalBlock`
+    samples of declared latency and, measured, **no CPU at all**: 2.26–2.30 %RT flat for every quantum
+    from 16 to 4096, so the size is chosen for latency and never for speed. It also closes a Law 8 hole
+    nobody had looked at: a whole-file call left 37678 of a 38000-sample tail SUBNORMAL, because
+    `FlushToZero`'s "a block is too short to re-traverse the gap" is false for a big block.
+  - **Latency is READ BACK from the stages, never computed.** A chain that derives the number itself can
+    agree with its own bypass aligners while disagreeing with the stage — `Compressor::prepare(..,
+    maxLookaheadMs = 50)` caps the lookahead at 2400 samples, so a chain asking for 60 ms and computing
+    `lround(2880)` would hold both at 2880 and pass a bypass null while sitting 480 samples out. The
+    suite finds the delay by SEARCHING for the shift that nulls, and measures the active chain's group
+    delay from a DFT bin's phase at 25 Hz — a frequency whose period exceeds twice the delay, so the
+    answer is not ambiguous modulo a period.
+  - **Bypass is decided per stage by measurement, not by uniformity.** The compressor gets an exactly
+    transparent WARM bypass out of its own curve (`ratio = 1` → slope exactly 0 → gain exactly `1.0f`,
+    sign of zero included, detector still tracking). The clipper and the limiter are skipped with a
+    `core::DryAligner` holding their PDC — the clipper's own `mix = 0` is bit-exact for ordinary audio
+    but normalises `-0.0f`, and the limiter has no bypass at all: at a ceiling of +60 dBTP it still costs
+    the 0.90·Nyquist round trip. Latency never moves when a bypass is toggled.
+  - **`tapsPerPhase` defaults to 64**, against the stages' own 32. The prototype loss is a round trip, so
+    it doubles in dB, and clipper + limiter in series double it again: at 44.1 kHz that is **−1.549 dB at
+    17.6 kHz**, −6.033 at 18.5 and −16.131 at 19.4. At 64 taps: +0.000 / −0.610 / −10.182, for +64
+    samples. The table is pinned in the suite — the limiter's own tests stop at 0.357·fs and did not
+    notice that its header's droop figures are one filter pass labelled as the round trip.
+  - **The channel count is EXACT.** `process()` refuses any count but the prepared one, touching neither
+    buffer nor state, so `[A, refused, B]` is bit-identical to `[A, B]`. The stages disagree among
+    themselves — the compressor refuses a wider call, the limiter, saturator and EQ process a PREFIX,
+    mono-bass ignores anything that is not exactly two — and reconciling that from outside is the
+    field-mapping that falls out of step.
+  - **One input gate**, in the shape `Saturator` and `TruePeakLimiter` already use, so a poisoned sample
+    is bit-identical to the sanitised one it stands for, whichever stages are on. And the chain validates
+    its own sample rate positively: `Saturator::prepare(NaN)` returns **true** and emits NaN, and
+    `EqEngine::prepare` does not validate at all.
+  - `OfflineRenderer` is defined by a formula rather than a description: `out[n] = y[n + D]`, where `y`
+    is the chain's output for the input followed by `D` zeros. Same length as the input, aligned, and the
+    last `D` frames present — the ffmpeg chain this replaces never emitted them, so a click 4 ms before
+    the end of a file disappeared.
+  - **Coverage: 193 checks across two binaries, and 27 of 27 mutations of the module are caught.** The
+    second binary exists because the obvious latency test is unsound on its own; everything in it
+    re-derives the answer from outside the chain. Two of the mutations found real defects while the suite
+    was green — `reset()` resumed an interrupted EQ parameter ramp (0.51 of difference, full scale,
+    against a fresh chain) and a bypass toggle read a cold aligner.
+- **feat(stereo):** `MonoBassParams` + `MonoBass::setParams()` / `params()`. Additive; `setParams` calls
+  the three existing setters, so every clamp and rejection is unchanged and the audio is bit-identical
+  (pinned). `params()` reads back the RESOLVED values — a corner below 20 Hz comes back clamped.
+- **docs(ADR §4):** the "no cross-module glue in the core" rule is amended to what the tree has actually
+  been doing since `dynamiceq`: a composite belongs here when IT is the unit under test; the voicing
+  stays in the product.
 ## v0.28.0 — the host states the whole number, and the player does the subtracting (`rigplayer`)
 
 - **feat(rigplayer):** `setHostInputDb()` / `setHostOutputDb()` — a host with a fader of its own now
