@@ -59,6 +59,19 @@ namespace felitronics::stereo
 // passes through whole (treating a stereo pair inside a wider layout is a routing decision the host
 // owns, not this class). RT-safe: no alloc/lock/throw in process(); state = one eq::Crossover2 (the Side
 // is one channel) + two LinearSmoothers.
+// THE STAGE OWNS THE TYPE OF ITS OWN PARAMETERS. Added so a composite that drives this stage passes
+// one object through instead of copying three fields across, which is the shape that falls out of step
+// the first time a fourth setting appears here (the reason `CompressorParams` derives from
+// `GainReductionParams` rather than repeating it). Purely additive: `setParams` calls the three
+// setters below in the order a caller would, so every clamp, non-finite rejection and smoothing
+// decision is unchanged and the result is bit-identical to setting them by hand — pinned in the suite.
+struct MonoBassParams
+{
+    bool  enabled     = true;
+    float frequencyHz = 120.0f;
+    float lowWidth    = 0.0f;      // 0 = mono below fc, 1 = full stereo (settles into bypass)
+};
+
 class MonoBass
 {
 public:
@@ -99,6 +112,20 @@ public:
         widthSm_.setTargetValue (lowWidth_);
         xfSm_.setTargetValue (lowWidth_ >= 1.0f ? 1.0f : 0.0f);
     }
+
+    // The three setters above as one object — see MonoBassParams. Order matters only in that it is the
+    // order a caller would use; none of the three interacts with another.
+    void setParams (const MonoBassParams& p) noexcept
+    {
+        setEnabled   (p.enabled);
+        setFrequency (p.frequencyHz);
+        setLowWidth  (p.lowWidth);
+    }
+
+    // The RESOLVED values, after this class's own clamps and rejections — `frequencyHz` comes back
+    // clamped to [20, 0.45*fs] and a non-finite write comes back as the last good value. A composite
+    // that has to report what it actually applied reads this, rather than echoing what it was handed.
+    MonoBassParams params() const noexcept { return { enabled_, freq_, lowWidth_ }; }
 
     bool  isEnabled() const noexcept { return enabled_; }
     float frequency() const noexcept { return freq_; }

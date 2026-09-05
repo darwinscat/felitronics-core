@@ -34,6 +34,7 @@ same audit had been started three times.
 | `multiband` | split → per-band processor → recombine (LR4, allpass-flat) | `MultibandProcessor`, `MultibandCompressor`, `MultibandWidth` |
 | `dither` | export bit-depth reduction | `Dither` (TPDF + noise shaping; 16/20/24-bit) |
 | `limiter` | brick-wall ceiling | `TruePeakLimiter` (oversample → limit → down) |
+| `mastering` | **the chain itself**, streaming + block-independent, plus the offline render wrapper. The one module that composes many others on purpose — the composite is the unit under test; the VOICING (preset tables, targets) stays in the product | `MasteringChain` (fixed internal quantum → the same bits at any caller block size), `MasteringChainConfig`/`Params`/`Resolved`, `OfflineRenderer` (`out[n] = y[n+D]`, tail included) |
 
 ## Meters · analysis · measurement
 
@@ -49,3 +50,9 @@ Add `-DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON` for both optional co
 
 **A full mastering chain is now buildable in core:** saturation → dynamic-EQ → de-esser → multiband comp →
 stereo width → transient → mono-bass → dither, metered by true-peak (dBTP) + LUFS/LRA.
+
+**...and one is now BUILT, in `mastering`:** `gain → EQ → [M/S mono-bass] → compressor (optional internal
+sidechain HPF) → [soft clipper] → gain → true-peak limiter → dither`, as a single streaming object with a
+declared latency, a latency-neutral per-stage bypass, and a tail that is not lost. It is deliberately the
+composite of the stages above rather than a new one; what it adds is the thing composition kept getting
+wrong — see its header for why block independence needed a fixed internal quantum instead of a promise.

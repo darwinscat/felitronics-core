@@ -248,10 +248,25 @@ lowest-common-denominator that kills desktop performance).
 - Parameter systems (JUCE APVTS, etc.), state save/load, GUI.
 - Host glue (AudioProcessor, CLAP, AU), file/IR loading, **neural model loading**, the concrete FFT
   engine, setting the denormal CPU mode.
-- **Cross-module "glue."** Example: TabbyEQ's *dynamic EQ* = `eq` band + `dynamics` detector fed by
-  the band's band-pass, applying the computed gain as an SVF gain-delta. That composition is
-  TabbyEQ-specific and lives in TabbyEQ, **not** in `eq` or `dynamics`. A standalone compressor uses
-  the same `dynamics` broadband. The core gives primitives; products compose them.
+- **PRODUCT-SPECIFIC cross-module "glue."** Example: TabbyEQ's *dynamic EQ* = `eq` band + `dynamics`
+  detector fed by the band's band-pass, applying the computed gain as an SVF gain-delta. That
+  composition is TabbyEQ-specific and lives in TabbyEQ, **not** in `eq` or `dynamics`. A standalone
+  compressor uses the same `dynamics` broadband. The core gives primitives; products compose them.
+
+  **AMENDED — where the line actually is.** As written this read as "no composite belongs in the core",
+  and the tree had already outgrown that in five places (`dynamiceq`, `deesser`, `multiband`,
+  `poweramp`, `rigplayer`) before `mastering` arrived. The rule those five follow, stated properly:
+
+  > A composite belongs in the core when **it is the unit under test** and its behaviour is shared.
+  > It gets its OWN module, which may depend on many others; the primitive modules stay independent of
+  > each other. What stays in the product is the **VOICING** — preset tables, target curves, defaults,
+  > the taste.
+
+  The discriminator is not "how many modules does it touch" but "can it be wrong on its own". A
+  mastering chain can: its defects are latency arithmetic, block dependence, stale state across a
+  bypass and a lost tail — none of which live in any stage, and all of which are only reachable by
+  testing the composition. `felitronics::mastering` therefore ships here while `mastering-config.json`
+  (JAZZ/METAL, LIGHT/HEAVY) stays in the product, and that split is the rule, not an exception to it.
 
 ---
 
