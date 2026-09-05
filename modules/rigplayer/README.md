@@ -87,9 +87,20 @@ mixes one guitar with itself and both ends of that mix must be fed the same sign
 LAST, after the mix, because it is one number for the whole stage and applied any earlier it would
 ride the wet side alone and move the blend the pack states for this position.
 
-`stageInputDb()` / `stageOutputDb()` read back what the player is applying. **A host with a fader of
-its own must send only its DEVIATION from these**, never the whole number — otherwise the level lands
-twice, in the app and again in the pack, and the app stops sounding like the pack it exports.
+`stageInputDb()` / `stageOutputDb()` read back what the PACK states. A host that only plays packs
+needs nothing else — the player applies them and there is no switch.
+
+**A host with a fader of its own states the WHOLE number, never a difference.** `setHostInputDb(db)` /
+`setHostOutputDb(db)` say "play this device at that level"; the player uses the hand instead of the
+pack's own, and `std::nullopt` hands the level back to the pack. The hand survives a `load()` — it
+belongs to the bench, not to the pack.
+
+This is not a convenience. A host that subtracts has to know which pack is loaded at the moment it
+subtracts, and it reads that from its own document: the document changes when somebody edits it, when
+a rebuild is in flight, when a device is switched mid-build. Every one of those leaves the level
+wrong, silently, in the same class as the double application these keys were added to end. The player
+is the only place that cannot disagree with itself about which pack it holds, so the arithmetic lives
+here. `hostInputDb()` / `hostOutputDb()` read the hand back.
 
 `setInputTrims(false)` switches off exactly one thing: `files[].input_db`, the trim of one alias
 against its neighbour. It has never reached the pack's own levels and does not reach them now.

@@ -139,6 +139,7 @@ public:
         unload();
         if (stage.kind != namz::rig::StageKind::Nam || stage.device.files.empty()) return false;
         stage_  = stage;
+        publishLevels();          // the new pack's levels stand from here, not from the end of load()
         source_ = std::move(source);
         const auto& d = stage_.device;
         // One model per DISTINCT file: several settings pointing at one file — the pack's link — share
@@ -210,6 +211,9 @@ public:
         dryFirBypass_.store(true, std::memory_order_release);
         dryGain_.store(0.0f, std::memory_order_release);
         wetGain_.store(1.0f, std::memory_order_release);
+        // …and with no stage there is nothing to be fed or delivered: an empty player is a wire,
+        // whatever hand the host is holding. The hand itself is kept — it is the bench's, not the
+        // pack's — and lands again on the next load().
         inGain_.store(1.0f, std::memory_order_release);
         outGain_.store(1.0f, std::memory_order_release);
         chainGain_.store(1.0f, std::memory_order_release);
@@ -219,6 +223,25 @@ public:
     }
     bool loaded() const { return loaded_; }
     const namz::rig::Stage& stage() const { return stage_; }
+
+    /// THE HOST'S OWN HAND ON THE PACK'S TWO LEVELS — the WHOLE number it wants this device played
+    /// at, never a difference from what the pack states. Absent (the default) leaves the pack's own
+    /// number standing, which is what a plugin wants and why a plugin needs none of this.
+    ///
+    /// A host with a fader used to subtract: it sent `hand - what the pack says`, and applied that
+    /// outside the player. That cannot be made correct. The subtraction needs to know which pack is
+    /// loaded RIGHT NOW, and a host reads that from its own document — which changes when somebody
+    /// edits it, when a rebuild is in flight, when a device is switched mid-build. Every one of those
+    /// left the level wrong, silently, in the same class as the double application this pair of keys
+    /// was added to end. The player is the one applying the level and the only place that cannot
+    /// disagree with itself about which pack it holds, so the subtraction lives here or nowhere.
+    ///
+    /// Message thread, like every other setter. Survives a load: the hand belongs to the bench and
+    /// not to the pack, so the next pack is played at the same number without the host restating it.
+    void setHostInputDb (std::optional<double> db) { hostIn_  = db; publishLevels(); }
+    void setHostOutputDb(std::optional<double> db) { hostOut_ = db; publishLevels(); }
+    std::optional<double> hostInputDb()  const { return hostIn_; }
+    std::optional<double> hostOutputDb() const { return hostOut_; }
     // The pack's own two levels, for a host that prints or draws them. These are what the player IS
     // applying: a host with a fader of its own applies only its deviation from them, or the level
     // lands twice — which is exactly the bug that made these keys necessary.
@@ -711,6 +734,15 @@ private:
 
     static float linOf(double db) { return std::abs(db) < 0.0005 ? 1.0f : (float) std::pow(10.0, db / 20.0); }
 
+    /// WHAT THE PLAYER IS APPLYING, decided in ONE place: the host's hand if it has one, else the
+    /// pack's own number. Called from apply(), from the host setters, and from load() before anything
+    /// slow — a pack swap used to publish unity here (unload's reset) and the real gains only at the
+    /// end of load(), so a callback landing in between heard neither pack's level.
+    void publishLevels() {
+        inGain_ .store(linOf(hostIn_  ? *hostIn_  : stage_.inputDb),  std::memory_order_release);
+        outGain_.store(linOf(hostOut_ ? *hostOut_ : stage_.outputDb), std::memory_order_release);
+    }
+
     std::uint64_t modelIdOf(int file) const {
         return file < 0 || (std::size_t) file >= fileModel_.size() ? 0 : (std::uint64_t) fileModel_[(std::size_t) file] + 1;
     }
@@ -730,10 +762,7 @@ private:
     // law does with it — in what order, and whether a model may be replaced yet — is its business.
     void apply() {
         const auto& d = stage_.device;
-        // The pack's levels are properties of the STAGE and stand whether or not a file can be
-        // selected, so they are stored ahead of the early return below.
-        inGain_.store(linOf(stage_.inputDb), std::memory_order_release);
-        outGain_.store(linOf(stage_.outputDb), std::memory_order_release);
+        publishLevels();   // ahead of the early return: they are the stage's, not the selection's
         sel_  = select(d, axes_, dial_, dialDeg_, shape_, topExtend_);
         plan_ = slotPlan(sel_, d);
         if (plan_.file[0] < 0) { setRequest(0, 0, 0.0f); return; }
@@ -1071,6 +1100,7 @@ private:
     // term in chainGain_: inGain_ has to reach the dry side of a blend, and chainGain_ is applied
     // after the dry block has already been taken.
     std::atomic<float>         inGain_ { 1.0f }, outGain_ { 1.0f };
+    std::optional<double>      hostIn_, hostOut_;      // message thread only; empty = the pack's own
     std::atomic<float>         chainGain_ { 1.0f };
     std::atomic<float>         slotGain_[2] { 1.0f, 1.0f };
     // A model's `metadata.loudness` tag is a CONTRACT, not a listener's option: off, every capture

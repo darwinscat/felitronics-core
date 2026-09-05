@@ -38,6 +38,19 @@ std::string gainModel(double w) {
     return buf;
 }
 
+// A NAM that is a gain AND AN OFFSET: y = w*x + b. The offset is what makes this fixture worth
+// having — it is the cheapest thing that is not a pure scalar, and a pure scalar cannot tell the
+// player's two levels apart. Feed the network half as much and the offset is untouched (w*x/2 + b);
+// halve the STAGE's output and the offset halves with everything else ((w*x + b)/2). So the mean of
+// the output says which of the two was applied, and the release's central claim — input is drive,
+// output is volume — finally has a test that a swap would fail.
+std::string biasModel(double w, double b) {
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+        R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":1,"bias":true,"implementation":"direct"},"weights":[%.6f,%.6f],"sample_rate":48000})", w, b);
+    return buf;
+}
+
 // A NAM that is a pure delay of `d` samples: the window's first tap is the oldest sample and its last
 // the newest, so a weight on the first alone hands back what came in `d` samples ago.
 std::string delayModel(int d) {
@@ -637,6 +650,79 @@ int main() {
         b.p.unload();
         b.load(rig);
         ok(! b.p.normalize(), "the switch is still the host's to throw, and survives a reload");
+    }
+
+    group("input is drive and output is volume: a model that is not a pure scalar tells them apart");
+    {
+        // The mean of the output IS the offset the network adds. Scale what goes IN and the offset
+        // stands; scale what comes OUT and the offset scales too. Every other fixture in this file is
+        // a pure gain, through which the two levels are indistinguishable — swap where the player
+        // applies them and nothing else here would notice.
+        const auto biased = [] (const std::string& nam) {
+            return [nam] (const std::string&) { return bytesOf(nam); };
+        };
+        const auto meanOf = [] (Bench& b) {
+            std::vector<float> l((std::size_t) kBlock);
+            double sum = 0.0; long n = 0;
+            for (int k = 0; k < 80; ++k) {
+                std::fill(l.begin(), l.end(), 0.0f);          // silence in: what comes out is the offset
+                float* io[2] { l.data(), nullptr };
+                b.p.process(io, 1, kBlock);
+                b.p.serviceHere();
+                if (k >= 48) for (const float v : l) { sum += (double) v; ++n; }
+            }
+            return sum / (double) std::max(1L, n);
+        };
+        const auto model = biasModel(0.5, 0.25);
+
+        Bench plain(rig);
+        plain.p.load(throughTheFormat(testRig()).chain[0], biased(model));
+        const double base = meanOf(plain);
+        ok(std::abs(base - 0.25) < 0.02, "the fixture adds its offset: mean 0.25");
+
+        auto inRig = testRig(); inRig.chain[0].inputDb = -6.0;
+        Bench fedLess(rig);
+        fedLess.p.load(throughTheFormat(inRig).chain[0], biased(model));
+        ok(std::abs(meanOf(fedLess) - 0.25) < 0.02,
+           "input_db does NOT touch the offset — it is drive, and drive is not volume");
+
+        auto outRig = testRig(); outRig.chain[0].outputDb = -6.0;
+        Bench quieter(rig);
+        quieter.p.load(throughTheFormat(outRig).chain[0], biased(model));
+        ok(std::abs(meanOf(quieter) - 0.25 * std::pow(10.0, -6.0 / 20.0)) < 0.02,
+           "…while output_db takes the offset down with everything else: it is volume");
+    }
+
+    group("the host's own hand: the WHOLE number, and the player does the subtracting");
+    {
+        // A host with a fader states what it wants the device played at. It never sends a difference:
+        // the difference needs to know which pack is loaded, the host reads that from its own document,
+        // and the document and the pack disagree whenever an edit or a rebuild is in flight. Here there
+        // is one number and one place that applies it.
+        const double q6 = std::pow(10.0, -6.0 / 20.0);
+        Bench b(levelled(-6.0, 0.0));
+        ok(! b.p.hostInputDb() && ! b.p.hostOutputDb(), "a fresh player holds no hand: the pack's own stands");
+        approx(b.gainAt(1000.0), 0.5 * q6, 0.01, "…and it is the pack's -6 dB that is heard");
+
+        b.p.setHostInputDb(0.0);
+        approx(b.gainAt(1000.0), 0.5, 0.01, "the hand at 0 REPLACES the pack's -6, it does not add to it");
+
+        b.p.setHostInputDb(-12.0);
+        approx(b.gainAt(1000.0), 0.5 * std::pow(10.0, -12.0 / 20.0), 0.01, "…and -12 is heard as -12, once");
+
+        // THE WHOLE POINT: a new pack states something else, and the hand still wins without the host
+        // saying a word. This is the case that was wrong when the host did the subtracting — the pack
+        // changed under it and its arithmetic did not.
+        b.load(levelled(-18.0, 0.0));
+        approx(b.gainAt(1000.0), 0.5 * std::pow(10.0, -12.0 / 20.0), 0.01,
+               "a pack swap does not move the hand, and does not double with it");
+
+        b.p.setHostInputDb(std::nullopt);
+        approx(b.gainAt(1000.0), 0.5 * std::pow(10.0, -18.0 / 20.0), 0.01,
+               "letting go hands the level back to the pack");
+
+        b.p.setHostOutputDb(-6.0);
+        approx(b.gainAt(1000.0), 0.5 * std::pow(10.0, -18.0 / 20.0) * q6, 0.01, "the other end works the same way");
     }
 
     group("alignment: two captures that land apart are lined up before they mix");
