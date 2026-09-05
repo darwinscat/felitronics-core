@@ -7,11 +7,10 @@
 #include <felitronics/core/Math.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/FlushToZero.h>
-#include <felitronics/dynamics/GainComputer.h>
-#include <felitronics/dynamics/GainReductionFollower.h>
 #include <felitronics/dynamics/ChannelLinker.h>
-#include <felitronics/dynamics/EnvelopeFollower.h>   // Detector enum (Peak / Rms)
-#include <felitronics/dynamics/LinkedDetector.h>     // DetectorParams + the detector path itself
+#include <felitronics/dynamics/EnvelopeFollower.h>     // Detector enum (Peak / Rms)
+#include <felitronics/dynamics/GainComputer.h>
+#include <felitronics/dynamics/GainReductionPath.h>    // detector → curve → ballistics, as one object
 
 #include <cmath>
 #include <vector>
@@ -19,32 +18,57 @@
 namespace felitronics::dynamics
 {
 
-// Derives from DetectorParams (`detector`, `link`, `rmsWindowMs`) rather than repeating those three
-// fields, so that handing a CompressorParams to a LinkedDetector is a base-class binding and not a
-// mapping somebody has to keep in step. Field access is unchanged — `p.detector`, `p.link`,
-// `p.rmsWindowMs` all still name the same things. It stays an aggregate (a public, non-virtual base is
-// allowed in one since C++17), so `CompressorParams p;` then assigning members works exactly as before,
-// and it stays trivially copyable. THIS IS A SOURCE-COMPATIBILITY BREAK, and the header is the place to
-// say so plainly rather than to reassure: POSITIONAL brace initialisation shifts by three fields, a
-// a designated initialiser naming a base member (`{.detector = ...}`) no longer compiles, and
-// `std::is_standard_layout_v` becomes false (`is_aggregate_v` and `is_trivially_copyable_v` stay true,
-// and positional brace initialisation still works both flat and with the base nested — compile-checked,
-// both spellings). Nothing in this repository does any of those; a consumer outside it might.
-struct CompressorParams : DetectorParams
+// Derives from GainReductionParams — which derives from DetectorParams in turn — rather than
+// repeating those fields, so that handing a CompressorParams to a GainReductionPath (and through it to
+// a LinkedDetector) is a base-class binding and not a mapping somebody has to keep in step. Field
+// access is unchanged: `p.detector`, `p.thresholdDb`, `p.attackMs` all still name the same things, and
+// what is left HERE is exactly what lives outside the gain-reduction path — makeup is a decision about
+// output level, lookahead one about alignment, and neither changes how much to compress.
+// It stays an aggregate (a public, non-virtual base is allowed in one since C++17), so
+// `CompressorParams p;` then assigning members works exactly as before, and it stays trivially
+// copyable. THE SOURCE-COMPATIBILITY BREAK P2 DOCUMENTED IS UNCHANGED IN KIND, one level deeper:
+// POSITIONAL brace initialisation needs the bases nested, a designated initialiser naming a base
+// member does not compile, and `std::is_standard_layout_v` is false (`is_aggregate_v` and
+// `is_trivially_copyable_v` stay true — compile-checked). Nothing in this repository does any of
+// those; a consumer outside it might. The LOGICAL field order is unchanged from P2's layout. One more
+// shape moved and is worth naming because it is silent: a POINTER TO MEMBER now has the base's type —
+// `decltype (&CompressorParams::thresholdDb)` is `double GainReductionParams::*`, not
+// `double CompressorParams::*` — which matters to exact-type reflection, serialisation tables and
+// overload sets built on member pointers. Ordinary access `p.thresholdDb` is untouched.
+struct CompressorParams : GainReductionParams
 {
-    Mode mode = Mode::DownCompress;
-
-    double thresholdDb = -18.0;
-    double ratio       = 2.0;
-    double kneeDb      = 6.0;
-    double rangeDb     = 60.0;
-
-    double attackMs    = 10.0;                    // ballistics on the GAIN REDUCTION (not the level)
-    double releaseMs   = 100.0;
-
     double makeupDb    = 0.0;
     bool   autoMakeup  = false;                   // adds a STATIC auto-makeup (see autoMakeupDb)
     double lookaheadMs = 0.0;
+};
+
+// WHERE THE PER-SAMPLE GAIN REDUCTION COMES OUT. `gainReductionDb()` reports the value after the LAST
+// sample of the block, which is a sample of the gain reduction, not a summary of it: polling it at
+// block ends is a subsampling whose rate is the host's block size, so no percentile, mean or maximum
+// can be built on it. This is that missing output, and it is deliberately a BUFFER rather than a
+// statistic: a mean here would fix a window, a histogram would fix a bin width and a percentile rule,
+// and both would then be a SECOND definition of a quantity the offline analysis already defines. The
+// compressor emits the samples; whoever wants a statistic owns its definition, once.
+//
+// `data == nullptr` (the default) is off, and costs one perfectly predicted branch per sample — the
+// source says per sample and means it; whether a compiler hoists it out of the loop is the compiler's
+// business, not a promise this header can make. Otherwise `capacity` must be at least `numSamples` or
+// THE WHOLE CALL IS REFUSED — audio, state and the tap buffer untouched — for the same reason a channel
+// count above the prepared maximum is refused: a partially written diagnostic is worse than none,
+// because it looks like data. `capacity` is not deducible from the pointer, which is the whole reason
+// it travels with it in one type instead of being a bare argument; the same lesson as
+// `numKeyChannels`, whose absence is why there is no four-argument key form.
+//
+// IT MUST NOT OVERLAP `io` OR `key`, AT ANY SHIFT, and this one is not diagnosable from in here. The
+// gain reduction for sample `i` is written before that sample's audio is read, so a tap aliased onto
+// a programme plane destroys the input it is about to measure: measured, with `ratio = 1` (a
+// transparent compressor), no lookahead, and `gr.data == io[0]`, a block of 0.5 came out as digital
+// silence. A shifted overlap corrupts samples this call has not reached yet. Same rule and same
+// reason as the key's: aliasing here is not "usually fine", it is the caller's to avoid.
+struct GainReductionTap
+{
+    float* data     = nullptr;
+    int    capacity = 0;
 };
 
 // A STATIC auto-makeup (dB): half-compensate the gain reduction a 0 dBFS signal would receive. Static
@@ -56,8 +80,8 @@ inline double autoMakeupDb (const GainComputer& gc) noexcept { return -0.5 * gc.
 //==============================================================================
 // felitronics::dynamics::Compressor — a broadband, channel-LINKED compressor that composes the dynamics
 // primitives in the clean topology:
-//     LinkedDetector (gate → link → envelope) → stateless GainComputer (curve) → GR ballistics (timing)
-//     → makeup → apply to the LOOKAHEAD-delayed signal.
+//     GainReductionPath (detector → curve → ballistics, ONE object) → makeup → apply to the
+//     LOOKAHEAD-delayed signal.
 // Smoothing the gain reduction (not the detector level) keeps the attack/release independent of the
 // knee/ratio. Product-neutral: no sidechain EQ, params system, GUI, metering policy, dry/wet — those
 // stay in the product (it's the "core gives primitives + a broadband composite; products compose" line).
@@ -185,8 +209,7 @@ public:
         maxLookSamples = (int) std::ceil (maxLookaheadMs * 0.001 * fs);
         delays.assign ((std::size_t) maxCh, core::DelayLine {});
         for (auto& d : delays) d.prepare (maxLookSamples);
-        det.prepare (fs);
-        grFollower.prepare (fs);
+        path.prepare (fs);
         lookSamples = -1;                                      // force apply() to size the fresh lines
         apply (params);
         reset();
@@ -197,21 +220,33 @@ public:
     void reset() noexcept
     {
         for (auto& d : delays) d.reset();
-        det.reset();
-        grFollower.reset();
+        path.reset();
         lastNc_ = 0;
     }
 
     void   setParams (const CompressorParams& p) noexcept { params = p; apply (p); }
     int    latencySamples()  const noexcept { return prepared_ ? lookSamples : 0; }
-    double gainReductionDb() const noexcept { return grFollower.valueDb(); }   // for metering
-    float  detectorLevel()   const noexcept { return det.level(); }            // linked level, linear
+    // The gain reduction AFTER THE LAST SAMPLE of the most recent block — a sample, not a summary.
+    // For anything that needs the shape (a percentile, a mean, a maximum), pass a GainReductionTap:
+    // polling this at block ends subsamples at the host's block rate, which is not a property of the
+    // signal at all.
+    double gainReductionDb() const noexcept { return path.valueDb(); }         // for metering
+    float  detectorLevel()   const noexcept { return path.detectorLevel(); }   // linked level, linear
     bool   isPrepared()      const noexcept { return prepared_; }
 
     // Audio thread, in place, self-keyed (the detector reads the programme). RT-safe.
     void process (float* const* channels, int numChannels, int numSamples) noexcept
     {
-        process (channels, numChannels, numSamples, nullptr, 0);
+        process (channels, numChannels, numSamples, nullptr, 0, GainReductionTap {});
+    }
+
+    // Self-keyed, with the per-sample gain reduction tapped out. NB this IS a four-argument form, and
+    // the one the key deliberately does not have — because `GainReductionTap` is a named type carrying
+    // its own capacity, so the shape that made a bare `const float*` key dangerous (a pointer whose
+    // extent only the caller knows) does not arise. RT-safe.
+    void process (float* const* channels, int numChannels, int numSamples, GainReductionTap gr) noexcept
+    {
+        process (channels, numChannels, numSamples, nullptr, 0, gr);
     }
 
     // Audio thread, in place, with an EXTERNAL KEY — read the header note above for the time-base and
@@ -219,8 +254,19 @@ public:
     void process (float* const* channels, int numChannels, int numSamples,
                   const float* const* key, int numKeyChannels) noexcept
     {
+        process (channels, numChannels, numSamples, key, numKeyChannels, GainReductionTap {});
+    }
+
+    // The full form: external key AND the per-sample gain reduction. `gr.data == nullptr` is off; a
+    // non-null tap with `gr.capacity < numSamples` REFUSES the whole call, leaving audio, state and
+    // the tap buffer untouched. RT-safe.
+    void process (float* const* channels, int numChannels, int numSamples,
+                  const float* const* key, int numKeyChannels, GainReductionTap gr) noexcept
+    {
         if (! prepared_ || numChannels <= 0 || numSamples <= 0) return;
         if (numChannels > maxCh) return;                       // refuse — see "MORE CHANNELS THAN PREPARED"
+        // Checked BEFORE anything moves, so a refused call is indistinguishable from one never made.
+        if (gr.data != nullptr && gr.capacity < numSamples) return;
         const int nc = numChannels;
 
         // A channel that sat out blocks holds `lookSamples` of audio from before it left. Zero only
@@ -235,13 +281,9 @@ public:
 
         for (int i = 0; i < numSamples; ++i)
         {
-            // --- detector: gate → link → envelope, in the object P3 can build from the same params ---
-            const float level = det.process (detCh, detNc, i);
-
-            // --- curve → GR ballistics → gain ---
-            const double levelDb    = core::gainToDb (level);
-            const float  targetDb   = (float) gc.deltaDb (levelDb);
-            const float  grDb       = grFollower.process (targetDb);
+            // --- detector → curve → GR ballistics, in the ONE object an offline pass drives too ---
+            const float  grDb       = path.process (detCh, detNc, i);
+            if (gr.data != nullptr) gr.data[i] = grDb;         // signed, BEFORE makeup and the delay
             // THE SUM is what reaches dbToGain, and it is bounded here and nowhere else. An UpCompress
             // curve sitting at +rangeDb plus a large makeup is +800 dB, i.e. 1e40 — +Inf once cast to
             // float — and `0.0f * Inf` is NaN, so a silent passage came out poisoned from entirely
@@ -259,8 +301,7 @@ public:
             }
         }
 
-        det.flushDenormals();
-        grFollower.flushDenormals();
+        path.flushDenormals();
     }
 
 private:
@@ -271,17 +312,11 @@ private:
 
     void apply (const CompressorParams& p) noexcept
     {
-        gc.setMode (p.mode);
-        gc.setThresholdDb (p.thresholdDb);
-        gc.setRatio (p.ratio);
-        gc.setKneeDb (p.kneeDb);
-        gc.setRangeDb (p.rangeDb);
-        grFollower.setTimes (p.attackMs, p.releaseMs);   // non-finite times → instant (the follower's coeff guard)
-
-        // SLICING, on purpose: the compressor's own parameter object IS the detector's. Nothing maps
-        // fields across, so nothing can fall out of step when a detector field is added. Non-finite
-        // windows are handled inside the follower's coefficient guard, same as the times above.
-        det.setParams (p);
+        // SLICING, on purpose: the compressor's own parameter object IS the path's, and through it the
+        // detector's. Nothing maps fields across, so nothing can fall out of step when a field is added
+        // at either level. Non-finite times and windows are handled inside the followers' coefficient
+        // guards.
+        path.setParams (p);
 
         // A non-finite lookahead would feed lround() undefined behaviour; clamp in the DOUBLE domain
         // first, because std::lround(1e300) is out of range for a long before any int clamp can help.
@@ -301,15 +336,13 @@ private:
         // Not bounded HERE, deliberately: what has to stay inside float is the SUM of this and the
         // gain reduction, and process() bounds that in one place. Two clamps would mask each other —
         // and did, until a mutation of either survived the suite because the other was still standing.
-        makeupAppliedDb = (std::isfinite (p.makeupDb) ? p.makeupDb : 0.0) + (p.autoMakeup ? autoMakeupDb (gc) : 0.0);
+        makeupAppliedDb = (std::isfinite (p.makeupDb) ? p.makeupDb : 0.0) + (p.autoMakeup ? autoMakeupDb (path.curve()) : 0.0);
     }
 
     double fs = 48000.0;
     CompressorParams params;
 
-    GainComputer          gc;
-    LinkedDetector        det;
-    GainReductionFollower grFollower;
+    GainReductionPath            path;
     std::vector<core::DelayLine> delays;
 
     int    lookSamples = 0, maxLookSamples = 0, maxCh = 0, lastNc_ = 0;

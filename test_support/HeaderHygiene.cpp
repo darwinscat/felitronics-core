@@ -46,8 +46,12 @@
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainComputer.h>
 #include <felitronics/dynamics/GainReductionFollower.h>
+#include <felitronics/dynamics/GainReductionPath.h>
 #include <felitronics/dynamics/LinkedDetector.h>
 #include <felitronics/dynamics/NoiseGate.h>
+#include <felitronics/dynamics/offline/DetectorAnalysis.h>
+#include <felitronics/dynamics/offline/Quantile.h>
+#include <felitronics/dynamics/offline/ThresholdSolver.h>
 #include <felitronics/dynamics/RelativeLevel.h>
 #include <felitronics/dynamics/TransientShaper.h>
 #include <felitronics/eq/Crossover2.h>

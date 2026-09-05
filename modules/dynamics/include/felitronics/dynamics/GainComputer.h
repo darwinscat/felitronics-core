@@ -28,7 +28,7 @@ public:
     // Finite-guarded: a NaN/inf param can't leak a NaN delta into the gain path (the consumer tests
     // assert finiteness). ±inf input levels are handled by the range clamp in deltaDb().
     void setThresholdDb (double dB) noexcept { thr   = std::isfinite (dB) ? dB : 0.0; }
-    void setRatio  (double r) noexcept { ratio = (std::isfinite (r) && r > 1.0) ? r : 1.0; }
+    void setRatio  (double r) noexcept { ratio_ = (std::isfinite (r) && r > 1.0) ? r : 1.0; }
     void setKneeDb (double k) noexcept { knee  = (std::isfinite (k) && k > 0.0) ? k : 0.0; }
     // BOUNDED, not merely finite. The delta this caps is cast to float by every consumer, and a finite
     // but enormous range let a finite threshold produce a delta of ~1e300 that became -Inf in float; the
@@ -39,19 +39,34 @@ public:
     { range = (std::isfinite (r) && r > 0.0) ? (r < kMaxRangeDb ? r : kMaxRangeDb) : 0.0; }   // ± delta cap
     void setMode (Mode m) noexcept { mode = m; }
 
+    // THE EFFECTIVE VALUES, i.e. what the curve will actually use after its own guards and caps — not
+    // what was passed in. A caller that reasons about the curve (an offline solver sizing a search
+    // bracket, say) must read these rather than re-derive them: `setRangeDb` caps at 400 dB, and a
+    // solver that divided the RAW range by the curve slope produced an infinite bracket and then a
+    // confident answer of +Inf from entirely finite parameters. One place decides; everyone reads it.
     double thresholdDb() const noexcept { return thr; }
+    double ratio()       const noexcept { return ratio_; }
+    double kneeDb()      const noexcept { return knee; }
+    double rangeDb()     const noexcept { return range; }
     Mode   modeValue()   const noexcept { return mode; }
+
+    // How much one dB past the knee is worth, in dB of gain change — the curve's own slope, so that a
+    // caller does not have to know which mode multiplies by what.
+    double multiplier() const noexcept
+    {
+        return (mode == Mode::DownExpand) ? (ratio_ - 1.0) : (1.0 - 1.0 / ratio_);
+    }
 
     // level (dB) → signed gain delta (dB), clamped to [-range, +range]. delta == 0 ⇒ transparent.
     double deltaDb (double levelDb) const noexcept
     {
-        const double slope = 1.0 - 1.0 / ratio;      // compressor slope (0 at 1:1, →1 at ∞:1)
+        const double slope = 1.0 - 1.0 / ratio_;      // compressor slope (0 at 1:1, →1 at ∞:1)
         double delta = 0.0;
         switch (mode)
         {
             case Mode::DownCompress: delta = -kneeOver (levelDb - thr) * slope;          break;  // cut as it gets loud
             case Mode::UpCompress:   delta = +kneeOver (thr - levelDb) * slope;          break;  // lift as it gets quiet
-            case Mode::DownExpand:   delta = -kneeOver (thr - levelDb) * (ratio - 1.0);  break;  // duck below threshold
+            case Mode::DownExpand:   delta = -kneeOver (thr - levelDb) * (ratio_ - 1.0); break;  // duck below threshold
         }
         if (delta >  range) delta =  range;
         if (delta < -range) delta = -range;
@@ -83,7 +98,7 @@ private:
 
     static constexpr double kMaxRangeDb = 400.0;
 
-    double thr = -18.0, ratio = 2.0, knee = 0.0, range = 24.0;
+    double thr = -18.0, ratio_ = 2.0, knee = 0.0, range = 24.0;
     Mode   mode = Mode::DownCompress;
 };
 
