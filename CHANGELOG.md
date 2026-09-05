@@ -67,6 +67,24 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 - **docs(ADR §4):** the "no cross-module glue in the core" rule is amended to what the tree has actually
   been doing since `dynamiceq`: a composite belongs here when IT is the unit under test; the voicing
   stays in the product.
+## v0.29.0 — the loudness tag answers for the slot that is sounding (`rigplayer`)
+
+- **feat(rigplayer):** `soundingLoudness()` — the tag of the model actually carrying the sound, with
+  `tagged`, `blended` and `slot` beside the number. `modelLoudness()` / `modelHasLoudness()` always
+  read slot 0, and slots are handed out by knot parity: on an odd capture the whole sound comes from
+  slot 1 while slot 0 holds a neighbour at zero weight, so a host drawing "the tag of the model
+  sounding" drew the silent one's — or called a tagged model untagged. Three reviewers found it
+  independently.
+  - The slot is chosen by the APPLIED weight, not the requested one: while a model is loading or
+    warming, the old slot is what is audible, and a face has to name what is heard.
+  - `blended` is set only when the weight is strictly between the ends AND the two slots hold
+    different files — at rest both slots hold the same capture, and one number is then the whole
+    truth. During a real crossfade there are two tags in the sound, and an API that returns one
+    without saying so invites the same quiet wrongness this readout exists to end.
+- **BREAKING:** `modelLoudness()` and `modelHasLoudness()` are REMOVED rather than kept as aliases.
+  Their documented meaning is "slot 0" — the defect itself — so an alias would go on answering wrongly
+  for anyone who did not recompile.
+
 ## v0.28.0 — the host states the whole number, and the player does the subtracting (`rigplayer`)
 
 - **feat(rigplayer):** `setHostInputDb()` / `setHostOutputDb()` — a host with a fader of its own now
