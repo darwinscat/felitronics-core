@@ -30,10 +30,20 @@
 //       - shapes without the DC blocker have FINITE memory: up FIR (tapsPerPhase base samples) +
 //         down FIR (~taps) + dry delay (latency) => bit-exact reconvergence within a horizon
 //         H = 4*latency + 128 (generous cover of that sum);
-//       - Asym adds the one-pole DC blocker: pole a = exp(-2*pi*10Hz/(4*48kHz)) per oversampled
-//         sample => over a 2000-base-sample window the residual shrinks by a^8000 ~ 0.073; assert a
-//         conservative x0.5 per-window geometric decay (floored at 2e-7 float-ulp noise) and a final
-//         residual <= 1e-6. Sustained Inf bursts recover identically (gate feeds zeros during burst).
+//       - Asym adds the one-pole DC blocker: pole a = exp(-2*pi*fc/(os*fs)) per oversampled sample
+//         => over a 2000-base-sample window the residual shrinks by a^8000 ~ 0.073 at the default
+//         10 Hz; assert a conservative x0.25 per-window geometric decay, floored at the build's OWN
+//         measured float-noise floor (a control run with every input sample moved one ulp) rather
+//         than at a constant, and a final residual down to that same floor. Sustained Inf bursts
+//         recover identically (gate feeds zeros during burst).
+//
+//  3b) THE POLE, separately and two-sided. Containment says a disturbance dies; it cannot say which
+//     pole killed it, and the poison fixture runs at the default dcBlockHz — so hardcoding that
+//     default inside prepare() leaves the whole suite green. On silence the Asym curve gives w == 0
+//     exactly, so the recurrence degenerates to y = R*y and the tail ratio over dn base samples is
+//     exp(-2*pi*fc*dn/fs), independent of os and invariant to every downstream gain => assert it
+//     against theory to 1% (derived: dn*os multiplications carry at most (dn*os)*u = 4.8e-4), for
+//     several fc and both os = 1 and 4.
 //
 //  4) CHUNK ASSOCIATIVITY. "n may exceed maxBlock - chunked internally, state carries across chunks
 //     -> bit-identical to one big call" => ANY call-size decomposition of the same stream is
@@ -255,21 +265,27 @@ int main()
                                   + " (H=" + std::to_string (H) + ", diffs " + std::to_string (tailDiff) + ")");
     }
 
-    test::group ("poison horizon: Asym one-pole DC tail — geometric decay (<=0.5x per 2000-sample window; theory 0.073x) and final residual <= 1e-6");
+    test::group ("poison horizon: Asym one-pole DC tail — geometric decay (<=0.25x per 2000-sample window; theory 0.073x) down to the build's OWN measured float-noise floor");
     for (int burstLen : { 1, 256 })   // single NaN hit, then a sustained Inf burst
     {
         Params p; p.shape = Shape::Asym; p.driveDb = 6.0f; p.bias = 0.25f; p.mix = 0.7f;
 
         const int j = 1500, tail = 26000, N = j + burstLen + tail;
-        Planar clean (1, N), pois (1, N);
+        Planar clean (1, N), pois (1, N), ctrl (1, N);
         fillSignal (clean, 515u);
-        for (int n = 0; n < N; ++n) pois.ch[0][(size_t) n] = clean.ch[0][(size_t) n];
+        for (int n = 0; n < N; ++n)
+        {
+            const float v = clean.ch[0][(size_t) n];
+            pois.ch[0][(size_t) n] = v;
+            ctrl.ch[0][(size_t) n] = std::nextafterf (v, 2.0f);   // CONTROL: every sample off by one ulp
+        }
         for (int n = j; n < j + burstLen; ++n) pois.ch[0][(size_t) n] = (burstLen == 1 ? kQNaN : kInf);
 
-        Sat sc, sp;
-        test::ok (prep (sc, p) && prep (sp, p), "prepare");
+        Sat sc, sp, sn;
+        test::ok (prep (sc, p) && prep (sp, p) && prep (sn, p), "prepare");
         sc.process (clean.data(), 1, N);
         sp.process (pois.data(), 1, N);
+        sn.process (ctrl.data(), 1, N);
 
         int nonFinite = 0;
         for (int n = 0; n < N; ++n) if (! std::isfinite (pois.ch[0][(size_t) n])) ++nonFinite;
@@ -277,28 +293,163 @@ int main()
 
         const int W = 2000, kWins = tail / W;   // 13 windows from the end of the burst
         std::vector<float> wmax ((size_t) kWins, 0.0f);
+        float noise = 0.0f;                     // the build's OWN float-noise floor on this exact path
         for (int k = 0; k < kWins; ++k)
             for (int n = j + burstLen + k * W; n < j + burstLen + (k + 1) * W; ++n)
             {
                 const float d = std::fabs (pois.ch[0][(size_t) n] - clean.ch[0][(size_t) n]);
                 if (d > wmax[(size_t) k]) wmax[(size_t) k] = d;
+                const float c = std::fabs (ctrl.ch[0][(size_t) n] - clean.ch[0][(size_t) n]);
+                if (c > noise) noise = c;
             }
 
+        // THE FLOOR IS MEASURED, NOT CHOSEN. Below it the ratio clause has no defined answer: the state
+        // residual is a random walk with an ABSORBING zero (once the two runs' states coincide they are
+        // bit-identical forever), so the last windows are float noise whose window-to-window ratio is ~1
+        // by construction. Every previous floor here was a constant fitted to whatever the last failing
+        // toolchain produced — 2e-7, then 1e-6 — and each one moved the same argument forward by one
+        // release. Measured 2026-09-05 against v0.25.0's 2e-7: arm64 passes, x86_64 fails at burst=1
+        // (3.576e-07 vs a 2.682e-07 bound), and the cause is NOT FP contraction — arm64 built with
+        // -ffp-contract=off still passes, and on baseline x86-64 the flag is a bit-exact no-op (no FMA
+        // to contract, CMakeLists.txt:17). The actual divergence is Apple's libm: tanhf differs between
+        // the arm64 and x86_64 slices on 1538 of 800001 sampled points, by exactly 1 ulp, while atanf is
+        // identical — and Asym is the ONLY shape with tanh inside a recursion (Saturator.h:146).
+        //
+        // So `noise` is measured by a CONTROL RUN of the same fixture with every input sample moved one
+        // ulp: the smallest perturbation this path can carry, run through the same 128-tap downsampler
+        // whose 128 roundings decorrelate between two nearly-equal histories. That scale is what a fixed
+        // constant cannot track — it is 8.5-9 ulp(peak) on Apple silicon but up to 20 ulp = 1.19e-06 on
+        // a native Intel Mac (macOS 13.7, clang 14), i.e. a REAL build whose own noise floor EXCEEDS the
+        // 1e-6 constant this line used to carry. A floor a build's noise can step over is not a floor.
+        //
+        // x3 over the control, not x1: the control understates, because a sustained 1-ulp input offset is
+        // not the same excitation as a decaying state difference (measured 9 ulp control vs 13 ulp worst
+        // poison-regime residual on the same build, 1.44x). Interval: >= 2*13/9 = 2.89 for a two-fold
+        // margin over that, and the ratio clause keeps its teeth as long as F stays well under RHO*prev
+        // (291 ulp at the burst=256 handoff). x3 sits in the middle of [2.89, 3.9).
+        //
+        // RHO 0.25, not 0.5: theory is R^(os*W) = 0.0730 (R = exp(-2*pi*10/192000), Saturator.h:224), so
+        // 0.25 still admits a pole 2.4x slower than specified while being twice as tight as before. This
+        // clause no longer carries the corner frequency at all — that is asserted directly, two-sided and
+        // parameterised, by the "DC blocker pole" group below, which a 0.5x or 0.25x ratio cannot do.
+        // A self-measured floor has one failure mode a constant does not: a regression that makes the path
+        // NOISIER also raises `noise`, and would silently buy itself a looser assertion. So the calibrator
+        // is itself asserted, both ways. 64 ulp is 3.2x the worst honest reading seen (20 ulp = 1.19e-06,
+        // native Intel, macOS 13.7 / clang 14; Apple silicon reads 8.5-9).
+        float cleanPeak = 0.0f;
+        for (int n = 0; n < N; ++n) cleanPeak = std::max (cleanPeak, std::fabs (clean.ch[0][(size_t) n]));
+        const float ulp = std::nextafterf (cleanPeak, 2.0f) - cleanPeak;
+        const float F = 3.0f * noise;
+        test::ok (noise > 0.0f, "control run is live (1-ulp input perturbation reaches the output), burst="
+                                + std::to_string (burstLen));
+        test::ok (noise <= 64.0f * ulp, "control noise floor is itself in range, burst=" + std::to_string (burstLen)
+                                        + " (got " + std::to_string (noise / ulp) + " ulp, cap 64)");
         bool decays = true;
         for (int k = 1; k < kWins; ++k)
-            // Floor 1e-6 — the SAME constant the convergence check below uses. 2e-7 was too tight to be a
-            // float-noise floor: it sits BETWEEN 2^-23 (1.19e-7) and 2^-22 (2.38e-7), so a residual of two
-            // ulps trips it. Measured on this fixture at burst=1, gcc 14.2 lingers two windows at 3.58e-07
-            // and 2.38e-07 (1.5 and 1.0 x 2^-22) and FAILS, while Apple clang reaches exact zero one window
-            // earlier and passes; at burst=256 clang itself clears 2e-7 by a single ulp (1.788e-07). Which
-            // side of the floor a toolchain landed on was luck, not DSP: the poison decays identically on
-            // both. Windows 0->1 and 1->2 fall four orders and one, and are still checked — only the tail
-            // the very next assertion already calls converged is exempt.
-            if (wmax[(size_t) k] > std::max (0.5f * wmax[(size_t) k - 1], 1e-6f)) decays = false;
+            if (wmax[(size_t) k] > std::max (0.25f * wmax[(size_t) k - 1], F)) decays = false;
         test::ok (decays, "Asym windowed residual decays geometrically, burst=" + std::to_string (burstLen));
-        test::ok (wmax[(size_t) kWins - 1] <= 1e-6f, "Asym final residual <= 1e-6, burst=" + std::to_string (burstLen)
-                                                     + " (got " + std::to_string (wmax[(size_t) kWins - 1]) + ")");
+        test::ok (wmax[(size_t) kWins - 1] <= 2.0f * noise,
+                  "Asym final residual is down to the measured noise floor, burst=" + std::to_string (burstLen)
+                  + " (got " + std::to_string (wmax[(size_t) kWins - 1]) + ", floor " + std::to_string (2.0f * noise) + ")");
+        if (burstLen == 256)   // the ratio clause is only meaningful while a DC tail is actually present
+            test::ok (wmax[1] > 8.0f * F, "fixture guard: the DC tail is live at window 1, burst=256 (got "
+                                          + std::to_string (wmax[1]) + " vs " + std::to_string (8.0f * F) + ")");
     }
+
+    //==========================================================================
+    // 3c) The DC-blocker POLE itself. Everything above measures CONTAINMENT — that a disturbance dies —
+    //     and none of it can see WHICH pole did the dying: the poison fixture runs at the default
+    //     dcBlockHz, so replacing `fc` with the literal 10.0 at Saturator.h:224 (silently ignoring the
+    //     public parameter for every other value) leaves the WHOLE saturation suite green — measured
+    //     2026-09-05, 197 checks, 0 failures across all three binaries. A ratio-vs-previous-window rule
+    //     cannot close that: it bounds decay from one side and knows nothing of the requested corner.
+    //
+    //     So assert the pole directly and TWO-SIDED. On silence the Asym curve gives w == 0 EXACTLY
+    //     (r(0) = tanh(k*b) - biasTanh_ with the same operands, WaveShaper.h:59), so once the FIR memory
+    //     has cleared, Saturator.h:146 degenerates to y = R*y and the tail is a pure geometric sequence.
+    //     Its ratio over dn base samples is R^(os*dn) = exp(-2*pi*fc*dn/fs) — independent of os, and
+    //     invariant to every gain downstream (comp_, mix_, outGain_ at Saturator.h:199-201 all cancel in
+    //     a ratio), which is why this reads the pole and nothing else.
+    //
+    //     Tolerance 1% is DERIVED, not measured, and the derivation has TWO terms, not one. The tail is
+    //     n = dn*os = 8000 float multiplications by R (n roundings), and the stored coefficient at
+    //     Saturator.h:224 carries its own rounding which is then reused all n times — that second term
+    //     dominates and is easy to miss: (R_float/R_exact)^8000 = 1.000206 at 10 Hz on its own. Together
+    //     gamma_2n = 16000u/(1-16000u) = 9.55e-4, plus ~5.6e-5 for the two 128-tap endpoint dot products,
+    //     so ~1.0e-3; 1% leaves 10x over that. It is nonetheless brutally sharp on the pole itself —
+    //     d(ln r)/ln(r) = d(fc)/fc, so at fc = 10 Hz (ln r = -2.618) 1% on the ratio is 0.38% on fc.
+    //     Against the hardcoded-10-Hz mutant this group reads 13.7x at 20 Hz and 2576x at 40 Hz.
+    test::group ("DC blocker pole: silent tail decays at exactly exp(-2*pi*dcBlockHz*dn/fs), two-sided, per os and per fc");
+    for (int os : { 1, 4 })
+        for (float fc : { 5.0f, 10.0f, 20.0f, 40.0f })
+        {
+            Params p; p.shape = Shape::Asym; p.driveDb = 6.0f; p.bias = 0.25f;
+            p.mix = 1.0f; p.autoComp = 0.0f; p.outputDb = 0.0f;   // comp_ = mix_ = outGain_ = 1: read the
+            p.dcBlockHz = fc;                                     // blocker, not the trim around it
+
+            const int charge = 4096, dn = 2000, N = charge + 3 * dn + 256;
+            Sat s;
+            test::ok (prep (s, p, 48000.0, 512, 1, os), "prepare (os=" + std::to_string (os) + ")");
+
+            Planar b (1, N);
+            for (int n = 0; n < charge; ++n) b.ch[0][(size_t) n] = 0.8f;   // a DC step charges the blocker
+            s.process (b.data(), 1, N);
+
+            const auto tailPeak = [&] (int c)
+            {
+                float m = 0.0f;
+                for (int n = c; n < c + 64; ++n) m = std::max (m, std::fabs (b.ch[0][(size_t) n]));
+                return (double) m;
+            };
+            const int    n1 = charge + dn;                 // well past up-FIR + down-FIR + dry-delay memory
+            const double y1 = tailPeak (n1), y2 = tailPeak (n1 + dn), y3 = tailPeak (n1 + 2 * dn);
+            const double th = std::exp (-2.0 * core::kPi * (double) fc * (double) dn / 48000.0);
+
+            const std::string tag = " (os=" + std::to_string (os) + ", fc=" + std::to_string ((int) fc) + " Hz)";
+            // Keep the whole measurement clear of law 8: the per-sample flush at Saturator.h:148 zaps the
+            // state below 1e-30, which would bend the geometry if the tail ever reached it.
+            test::ok (y3 > 1e-20 && y1 > 0.0, "tail is live and far above the law-8 flush" + tag);
+            const double r1 = y2 / y1, r2 = y3 / y2;
+            test::ok (std::fabs (r1 / th - 1.0) < 0.01, "tail ratio matches the requested pole" + tag
+                                                        + " (got " + std::to_string (r1) + ", want " + std::to_string (th) + ")");
+            test::ok (std::fabs (r2 / th - 1.0) < 0.01, "tail ratio is stationary one window later" + tag
+                                                        + " (got " + std::to_string (r2) + ", want " + std::to_string (th) + ")");
+        }
+
+    //==========================================================================
+    // 3d) The blocker's NUMERATOR. H(z) = (1 - z^-1)/(1 - R*z^-1) has a zero at z = 1, i.e. DC gain
+    //     EXACTLY zero — and 3c pins only the denominator. The two are independently breakable: scaling
+    //     x1 by nextafterf(1,0) at Saturator.h:146 leaves the pole untouched, so 3c passes, and leaves
+    //     poison reconvergence untouched, so 3a/3b pass, while DC gain becomes (1-nextafterf(1,0))/(1-R)
+    //     = 5.96e-08/3.27e-04 ~ 1.8e-04 instead of 0. The coarse |block-mean| < 1e-3 in SaturationTests
+    //     can miss that too.
+    //
+    //     Measured at os=1, where there is no FIR and no dry delay to muddy the reading: on a constant
+    //     input the Asym curve gives a constant w, so w - x1 cancels EXACTLY and the state decays as a
+    //     pure R^n to zero. With mix=1, autoComp=0, outputDb=0 every downstream gain is exactly 1, so
+    //     the output IS the state: after 40000 samples R^40000 = e^-52 ~ 1e-23, i.e. nothing. A bound of
+    //     1e-9 therefore leaves ~14 decades of headroom on a correct build while catching the mutant
+    //     above (~9e-05 with this drive) by five orders.
+    test::group ("DC blocker numerator: zero at z=1 — a constant input leaves EXACTLY no steady-state offset (os=1)");
+    for (float bias : { -0.35f, 0.25f })
+        for (float dc : { 0.8f, -0.6f })
+        {
+            Params p; p.shape = Shape::Asym; p.driveDb = 9.0f; p.bias = bias;
+            p.mix = 1.0f; p.autoComp = 0.0f; p.outputDb = 0.0f; p.dcBlockHz = 10.0f;
+
+            const int N = 42000, look = 2000;
+            Sat s;
+            test::ok (prep (s, p, 48000.0, 512, 1, 1), "prepare (os=1)");
+            Planar b (1, N);
+            for (int n = 0; n < N; ++n) b.ch[0][(size_t) n] = dc;
+            s.process (b.data(), 1, N);
+
+            float resid = 0.0f;
+            for (int n = N - look; n < N; ++n) resid = std::max (resid, std::fabs (b.ch[0][(size_t) n]));
+            const std::string tag = " (bias=" + std::to_string (bias) + ", dc=" + std::to_string (dc) + ")";
+            test::ok (resid < 1e-9f, "constant input leaves no DC through the blocker" + tag
+                                     + " (got " + std::to_string (resid) + ")");
+        }
 
     //==========================================================================
     // 4) Chunk associativity — thousands of random chunkings, bit-identical to the one-call reference.
