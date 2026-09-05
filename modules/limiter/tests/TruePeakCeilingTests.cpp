@@ -127,13 +127,13 @@ public:
     {
         wk = w; fs = sampleRate; maxCh = maxChannels; maxBlock_ = maxBlock;
         F  = factor < 2 ? 2 : factor;                                    // the real class clamps identically
-        os.prepare (F, maxCh, 32); down.prepare (F, maxCh, 32);
+        (void) os.prepare (F, maxCh, 32); (void) down.prepare (F, maxCh, 32);
         osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock * (std::size_t) F, 0.0f));
         osPtrs.assign ((std::size_t) maxCh, nullptr);
         const int maxLookOS = (int) std::ceil (20.0 * 0.001 * fs) * F;
         osDelays.assign ((std::size_t) maxCh, core::DelayLine {});
         for (auto& d : osDelays) d.prepare (maxLookOS);
-        slide.prepare (maxLookOS + 1); broken.prepare (maxLookOS + 1);
+        (void) slide.prepare (maxLookOS + 1); (void) broken.prepare (maxLookOS + 1);
         perCh.assign ((std::size_t) maxCh, detail_slide {});
         for (auto& s : perCh) s.s.prepare (maxLookOS + 1);
         gridPeak = 0.0; grDb = 0.0f;
@@ -246,18 +246,16 @@ struct Setup { double ceilingDb = -1.0, releaseMs = 50.0, lookaheadMs = 1.0; int
 // latencySamples(), so without it the tail of the witness never comes out, the buffer stops
 // mid-waveform, and both oracles — which interpolate the periodic extension — would honestly report
 // the overshoot of a discontinuity the signal never contained. Blocked at `block` (0 = one shot) so the
-// same helper serves the block-invariance NULL.
+// same helper serves the block-invariance NULL. Topology goes to prepare(), parameters after it.
 static std::vector<std::vector<float>> renderAt (const std::vector<std::vector<float>>& in, double sr,
                                                  const Setup& s, int block, double* grOut = nullptr)
 {
     const int nch = (int) in.size(), n = (int) in[0].size();
     limiter::TruePeakLimiter lim;
-    limiter::TruePeakLimiterParams p;
-    p.ceilingDbTp = s.ceilingDb; p.releaseMs = s.releaseMs; p.lookaheadMs = s.lookaheadMs;
-    p.oversampleFactor = s.factor;
-    lim.setParams (p);
     const int maxBlock = block > 0 ? block : n;
-    lim.prepare (sr, maxBlock, nch);
+    (void) lim.prepare (sr, maxBlock, nch, { s.lookaheadMs, s.factor, 32 });   // topology is prepare-time only now
+    limiter::TruePeakLimiterParams p;
+    p.ceilingDbTp = s.ceilingDb; p.releaseMs = s.releaseMs;
     lim.setParams (p);
     const int drain = lim.latencySamples() + 64;
     std::vector<std::vector<float>> out ((std::size_t) nch, std::vector<float> ((std::size_t) (n + drain), 0.0f));
@@ -278,7 +276,7 @@ static std::vector<std::vector<float>> renderRef (const std::vector<std::vector<
 {
     const int nch = (int) in.size(), n = (int) in[0].size();
     ReferenceLimiter ref;
-    ref.prepare (sr, n, nch, s.factor, w);
+    (void) ref.prepare (sr, n, nch, s.factor, w);
     ref.setParams (s.ceilingDb, s.releaseMs, s.lookaheadMs);
     const int drain = (32 - 1) + (int) std::lround (s.lookaheadMs * 0.001 * sr) + 64;
     std::vector<std::vector<float>> out ((std::size_t) nch, std::vector<float> ((std::size_t) (n + drain), 0.0f));
@@ -347,7 +345,7 @@ int main()
     {
         std::vector<float> s;
         test::ebu3341::synthesize (test::ebu3341::kTruePeakCases[1], sr, 0.10, s);   // #16, fs/4 phase 45
-        oversampling::PolyphaseOversampler m; m.prepare (8, 1, 32);
+        oversampling::PolyphaseOversampler m; (void) m.prepare (8, 1, 32);
         std::vector<float> osb (s.size() * 8);
         const float* xi[1] { s.data() }; float* oo[1] { osb.data() };
         m.upsample (xi, 1, (int) s.size(), oo);
@@ -577,16 +575,40 @@ int main()
     // OF, so the structure degenerates into a clipper at the oversampled rate. `lookaheadMs` is not
     // clamped to a minimum, so a caller can reach this by asking politely. Pinned as behaviour, with
     // the number, because the composite must not ship it.
-    test::group ("lookaheadMs = 0 degenerates into an OS-rate clipper (pinned: the composite must not)");
+    // WAS a pinned defect: lookaheadMs = 0 was legal and left the bound behind (+2.05 dB over) — with
+    // no delay there is nothing to look ahead OF, and the structure degenerated into a clipper at the
+    // oversampled rate. Anything rounding to zero baseband samples did it, so the floor is not a
+    // millisecond number: it is TWO BASEBAND SAMPLES, the smallest value at which every witness lands
+    // back inside the delivered envelope at both conformance rates and every factor (worst margin
+    // 0.35 dB). At 48 kHz that is 42 microseconds — invisible at any musical setting.
+    test::group ("lookaheadMs below the measured floor is clamped, visibly");
     {
         const double C = -1.0;
         const auto click = tpw::clickTrain (sr, 0.10, 3.0, 26.0, 0.5);
         std::vector<std::vector<float>> in { click };
-        const auto none = renderAt (in, sr, Setup { C, 50.0, 0.0, 4 }, 0);
-        const auto some = renderAt (in, sr, Setup { C, 50.0, 1.0, 4 }, 0);
-        const double overNone = tp::truePeakDbFft (none[0]) - C, overSome = tp::truePeakDbFft (some[0]) - C;
-        test::ok (overNone > 1.5, "at lookahead 0 the delivered peak is " + dbs (overNone) + " dB over the ceiling");
-        test::ok (overSome < 0.10, "at lookahead 1 ms the same witness lands " + dbs (overSome) + " dB over");
+        for (int F : { 2, 4, 8 })
+        {
+            const auto none = renderAt (in, sr, Setup { C, 50.0, 0.0, F }, 0);
+            const double over = tp::truePeakDbFft (none[0]) - C;
+            test::ok (over <= tpw::deliveredBudgetDb (F), "F=" + std::to_string (F)
+                      + ": a requested lookahead of 0 delivers " + dbs (over) + " dB over, inside the budget"
+                      " (it used to be +2.05)");
+        }
+        limiter::TruePeakLimiter lim;
+        (void) lim.prepare (sr, 512, 1, { 0.0, 4, 32 });
+        test::ok (lim.lookaheadSamples() == 2, "and the clamp is not silent: lookaheadSamples() reports "
+                                               + std::to_string (lim.lookaheadSamples()));
+        limiter::TruePeakLimiter big;
+        (void) big.prepare (44100.0, 512, 1, { 0.0, 4, 32 });
+        test::ok (big.lookaheadSamples() == 2, "the floor is in SAMPLES, so it is the same at 44.1 kHz");
+        // The other end, and it is not symmetric bookkeeping: an absurd FINITE lookahead used to reach
+        // std::lround() before the clamp, and the out-of-range result then clamped UPWARD to the
+        // minimum — a caller asking for the largest lookahead silently got the smallest.
+        limiter::TruePeakLimiter huge;
+        (void) huge.prepare (sr, 512, 1, { 1.0e300, 4, 32 });
+        test::ok (huge.lookaheadSamples() == (int) std::lround (20.0 * 0.001 * sr),
+                  "an absurd finite lookahead clamps to the 20 ms maximum, not to the minimum (got "
+                  + std::to_string (huge.lookaheadSamples()) + ")");
     }
 
     // ---------------------------------------------------------------- releaseMs = 0 is legal too
@@ -596,26 +618,42 @@ int main()
     // instead of a decaying tail. Measured on the plateau witness, edge offset swept: +1.48 dB over at
     // 4x. One tenth of a millisecond of release already halves it. The budget above is stated for
     // release > 0 and this is why.
-    test::group ("releaseMs = 0 leaves the budget behind (pinned: the composite must floor the release)");
+    test::group ("releaseMs below the measured floor is clamped, visibly");
     {
+        // WAS a pinned defect of the same family, found by an adversarial witness rather than by reading:
+        // at releaseMs = 0 the release coefficient is 0, the gain is free to jump on every oversampled
+        // sample, and the downsampler's step response then rides on a ceiling-flat plateau (+1.48 dB
+        // over). The floor is EIGHT baseband samples — the smallest at which every witness, including the
+        // click train at that release, lands back inside the envelope (worst margin 0.23 dB). 167 us at
+        // 48 kHz, far below any musical release.
         const double C = -1.0;
-        for (int F : { 4, 8 })
+        for (int F : { 2, 4, 8 })
         {
-            double worstZero = -1e9, worstSmall = -1e9;
+            double worst = -1e9;
             for (int k = 0; k < 8; ++k)
             {
-                const double off = (double) k / 8.0;
-                const auto x = tpw::plateau (sr, 0.17, 60.0, 18.0, 0.042, 0.104, off);
+                const auto x = tpw::plateau (sr, 0.17, 60.0, 18.0, 0.042, 0.104, (double) k / 8.0);
                 std::vector<std::vector<float>> in { x };
-                worstZero  = std::max (worstZero,  tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.0, 1.0, F }, 0)[0]));
-                worstSmall = std::max (worstSmall, tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.1, 1.0, F }, 0)[0]));
+                worst = std::max (worst, tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.0, 1.0, F }, 0)[0]));
             }
-            test::ok (worstZero - C > tpw::deliveredBudgetDb (F),
-                      "F=" + std::to_string (F) + ": at release 0 the plateau delivers " + dbs (worstZero - C)
-                      + " dB over, past the " + dbs (tpw::deliveredBudgetDb (F)) + " dB budget");
-            test::ok (worstSmall - C <= tpw::deliveredBudgetDb (F),
-                      "F=" + std::to_string (F) + ": and 0.1 ms of release brings it back to " + dbs (worstSmall - C) + " dB");
+            test::ok (worst - C <= tpw::deliveredBudgetDb (F), "F=" + std::to_string (F)
+                      + ": a requested release of 0 delivers " + dbs (worst - C) + " dB over, inside the budget"
+                      " (it used to be +1.48)");
+            const auto click = tpw::clickTrain (sr, 0.12, 3.0, 26.0, 0.5);
+            std::vector<std::vector<float>> ci { click };
+            const double c2 = tp::truePeakDbFft (renderAt (ci, sr, Setup { C, 0.0, 1.0, F }, 0)[0]) - C;
+            test::ok (c2 <= tpw::deliveredBudgetDb (F), "F=" + std::to_string (F)
+                      + ": and the click train at that release too (" + dbs (c2) + ")");
         }
+        limiter::TruePeakLimiter lim;
+        (void) lim.prepare (sr, 512, 1, { 1.0, 4, 32 });
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 0.0;
+        lim.setParams (p);
+        // Tolerance, not exactness, and deliberately: effectiveReleaseMs() is derived BACK from the
+        // float coefficient the limiter actually uses, so it reports what the audio path does rather
+        // than what the caller asked for. The round trip through float costs a few parts per million.
+        test::approx (lim.effectiveReleaseMs(), 8000.0 / sr, 1.0e-4,
+                      "and the clamp is visible: effectiveReleaseMs() reports " + dbs (lim.effectiveReleaseMs()) + " ms");
     }
 
     // ---------------------------------------------------------------- scale invariance of the excess
@@ -757,8 +795,8 @@ int main()
         // And a stereo-prepared limiter handed a single channel must limit it, not walk off the end of
         // the pointer array — a host that drops to mono mid-session is not exotic.
         limiter::TruePeakLimiter lim;
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0; p.lookaheadMs = 1.0; p.oversampleFactor = 4;
-        lim.setParams (p); lim.prepare (sr, (int) loud.size(), 2); lim.setParams (p);
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
+        (void) lim.prepare (sr, (int) loud.size(), 2, { 1.0, 4, 32 }); lim.setParams (p);
         std::vector<float> mono = loud; float* one[1] { mono.data() };
         lim.process (one, 1, (int) loud.size());
         test::ok (tp::samplePeakDb (mono) < -0.5, "a stereo-prepared limiter still limits a mono call ("
@@ -779,8 +817,7 @@ int main()
         {
             limiter::TruePeakLimiter lim;
             limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
-            p.lookaheadMs = r.lookMs; p.oversampleFactor = 4;
-            lim.setParams (p); lim.prepare (r.rate, 512, 1, r.taps); lim.setParams (p);
+            (void) lim.prepare (r.rate, 512, 1, { r.lookMs, 4, r.taps }); lim.setParams (p);
             const int want = (r.taps - 1) + (int) std::lround (r.lookMs * 0.001 * r.rate);
             test::ok (lim.latencySamples() == want,
                       std::to_string ((int) r.rate) + " Hz, " + dbs (r.lookMs) + " ms, " + std::to_string (r.taps)
@@ -815,8 +852,8 @@ int main()
         // More channels than were prepared must be refused, not walked past.
         {
             limiter::TruePeakLimiter narrow;
-            limiter::TruePeakLimiterParams np; np.ceilingDbTp = -1.0; np.lookaheadMs = 1.0; np.oversampleFactor = 4;
-            narrow.setParams (np); narrow.prepare (sr, 256, 1); narrow.setParams (np);
+            limiter::TruePeakLimiterParams np; np.ceilingDbTp = -1.0;
+            (void) narrow.prepare (sr, 256, 1, { 1.0, 4, 32 }); narrow.setParams (np);
             std::vector<float> ca (256, 0.9f), cb (256, 0.9f);
             float* two[2] { ca.data(), cb.data() };
             narrow.process (two, 2, 256);                                 // prepared for 1, handed 2
@@ -826,8 +863,8 @@ int main()
         // preparing, which would let a setParams that stored its argument and forgot to apply it pass.
         {
             limiter::TruePeakLimiter late;
-            limiter::TruePeakLimiterParams lp; lp.ceilingDbTp = -1.0; lp.lookaheadMs = 1.0; lp.oversampleFactor = 4;
-            late.prepare (sr, 1024, 1, 32);
+            limiter::TruePeakLimiterParams lp; lp.ceilingDbTp = -1.0;
+            (void) late.prepare (sr, 1024, 1, { 1.0, 4, 32 });
             lp.ceilingDbTp = -12.0; lp.releaseMs = 50.0;
             late.setParams (lp);                                          // only NOW is the ceiling set
             std::vector<float> hot (1024);
@@ -908,9 +945,9 @@ int main()
         std::vector<float> loud ((std::size_t) n), silence ((std::size_t) n, 0.0f);
         for (int i = 0; i < n; ++i) loud[(std::size_t) i] = (float) (0.9 * std::sin (2.0 * core::kPi * 1000.0 * (double) i / sr));
         limiter::TruePeakLimiter a, b;
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0; p.lookaheadMs = 1.0; p.oversampleFactor = 4;
-        a.setParams (p); a.prepare (sr, n, 1); a.setParams (p);
-        b.setParams (p); b.prepare (sr, n, 1); b.setParams (p);
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
+        (void) a.prepare (sr, n, 1, { 1.0, 4, 32 }); a.setParams (p);
+        (void) b.prepare (sr, n, 1, { 1.0, 4, 32 }); b.setParams (p);
         std::vector<float> warm = loud; float* w[1] { warm.data() };
         a.process (w, 1, n);
         a.reset();
@@ -925,15 +962,20 @@ int main()
         // number is a hidden 48 kHz assumption — the same construction runs to sample 157 at 96 kHz and
         // 253 at 192 kHz.
         const int historyBaseband = 32;
-        test::ok (last < a.latencySamples() + 32, "any post-reset residue dies within latency + the FIR tail ("
-                                                  + std::to_string (last) + " < " + std::to_string (a.latencySamples() + 32) + ")");
+        // WAS bounded-but-present: reset() cleared the delays, the deque and the gain but never the
+        // oversampler's FIR histories, so SILENCE after a reset came out at the ceiling for ~110 samples
+        // of the previous stream, peaking 0.036 dB ABOVE it. The old form of this row asserted only that
+        // the residue died within the filter history, which was true before and after — it could not
+        // close the defect. Equality with a fresh instance can.
+        test::ok (last < 0, "silence after reset() is bit-identical to a freshly prepared instance"
+                            + std::string (last < 0 ? "" : " (differs to sample " + std::to_string (last) + ")"));
         // And it is bounded — but NOT by the ceiling, which is the sharper half of this finding. reset()
         // leaves the downsampler holding ceiling-level oversampled samples and then feeds it zeros; the
         // decimation FIR reconstructs that step with its own overshoot, so the residue peaks slightly
         // ABOVE the ceiling. Measured +0.036 dB at most buffer lengths (and, by luck, +0.001 at 4096 —
         // which is why the first version of this row asserted "at or below the ceiling" and passed).
-        test::ok (tp::samplePeakDb (ya) <= -1.0 + 0.08, "and it stays within the downsampler's step overshoot of it ("
-                                                        + dbs (tp::samplePeakDb (ya) + 1.0) + " dB over the ceiling)");
+        test::ok (tp::samplePeakDb (ya) <= -299.0, "and it is silence, not the previous stream at the ceiling ("
+                                                  + dbs (tp::samplePeakDb (ya)) + " dBFS)");
         // The gain state specifically must be cleared, and silence cannot show it. Two details matter and
         // both were found by trying the mutation: the reset has to follow the LOUD pass directly (a
         // silence pass in between lets the release walk grDb back toward 0 on its own), and the level has
@@ -945,9 +987,8 @@ int main()
         // essentially where the loud pass left it (64 samples move it by 0.3 %). Then reset() is the
         // only thing that can bring the gain back to unity, and the measurement can be taken at once.
         limiter::TruePeakLimiter c;
-        limiter::TruePeakLimiterParams cp; cp.ceilingDbTp = -1.0; cp.releaseMs = 500.0; cp.lookaheadMs = 1.0;
-        cp.oversampleFactor = 4;
-        c.setParams (cp); c.prepare (sr, n, 1); c.setParams (cp);
+        limiter::TruePeakLimiterParams cp; cp.ceilingDbTp = -1.0; cp.releaseMs = 500.0;
+        (void) c.prepare (sr, n, 1, { 1.0, 4, 32 }); c.setParams (cp);
         std::vector<float> hot = loud; float* ph[1] { hot.data() };
         for (int i = 0; i < n; ++i) hot[(std::size_t) i] = (float) (hot[(std::size_t) i] * 30.0);   // ~29 dB of reduction
         c.process (ph, 1, n);
@@ -993,82 +1034,359 @@ int main()
     // path does not read out of bounds. It is pinned here as behaviour because the composite that will
     // sit on top of this limiter has to chunk its input, and "it no-ops" and "it ships your peaks" are
     // the same sentence read twice.
-    test::group ("Oversized block is returned UNLIMITED (pinned: the composite must chunk at maxBlock)");
+    // WAS a pinned defect: a block above maxBlock came back untouched — unlimited, and silently, which
+    // for a module whose only promise is a ceiling is the worst possible failure. It is chunked now, and
+    // the assertion is EQUIVALENCE rather than "the peak looks limited": a peak-only check would pass a
+    // chunker that carried its streaming state wrongly across the boundary.
+    test::group ("A block above maxBlock is chunked, and equals the caller having chunked it");
     {
-        const int n = 1024;
+        const int n = 2048;
         std::vector<float> x ((std::size_t) n, 0.0f);
         for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) (10.0 * std::sin (2.0 * core::kPi * 1000.0 * (double) i / sr));
-        std::vector<float> y = x; float* ch[1] { y.data() };
-        limiter::TruePeakLimiter lim;
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.lookaheadMs = 1.0; p.oversampleFactor = 4;
-        lim.setParams (p); lim.prepare (sr, 512, 1); lim.setParams (p);
-        lim.process (ch, 1, n);                                          // 1024 > maxBlock 512
-        test::ok (firstDifference (x, y) < 0, "a block above maxBlock comes back untouched at "
-                                              + dbs (tp::samplePeakDb (y)) + " dBFS, i.e. unlimited");
-        std::vector<float> z (x.begin(), x.begin() + 512); float* ch2[1] { z.data() };
-        lim.process (ch2, 1, 512);                                       // exactly maxBlock must be processed
-        test::ok (tp::samplePeakDb (z) < -0.9, "a block of exactly maxBlock IS processed (" + dbs (tp::samplePeakDb (z)) + " dBFS)");
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
+        for (int mb : { 512, 100 })                      // 100 leaves a remainder chunk, the interesting one
+        {
+            limiter::TruePeakLimiter one, many;
+            test::ok (one.prepare (sr, mb, 1, { 1.0, 4, 32 }) && many.prepare (sr, mb, 1, { 1.0, 4, 32 }),
+                      "maxBlock " + std::to_string (mb) + ": both prepared");
+            one.setParams (p); many.setParams (p);
+            std::vector<float> a2 = x, b2 = x;
+            float* pa[1] { a2.data() };
+            one.process (pa, 1, n);                                          // one oversized call
+            for (int off = 0; off < n; off += mb)
+            { float* pb[1] { b2.data() + off }; many.process (pb, 1, std::min (mb, n - off)); }
+            test::ok (firstDifference (a2, b2) < 0, "maxBlock " + std::to_string (mb)
+                      + ": one call of " + std::to_string (n) + " == the caller chunking it, sample for sample");
+            test::ok (tp::samplePeakDb (a2) < -0.9, "maxBlock " + std::to_string (mb)
+                      + ": and the whole buffer really is limited (" + dbs (tp::samplePeakDb (a2)) + " dBFS)");
+        }
     }
 
     // ---------------------------------------------------------------- two holes found by the review round
-    // Neither is fixed here (both are module changes, outside this task), and both are pinned with their
-    // measured behaviour so the composite cannot meet them by surprise.
-    test::group ("Non-finite input and a mid-stream lookahead change (pinned holes, NOT fixed here)");
+    // Both WERE holes pinned by the previous task and are closed now; the assertions below are the
+    // positive form, and each of them fails if its fix is undone.
+    test::group ("Non-finite input, and a lookahead change that can no longer be expressed");
     {
         const double C = -1.0;
-        // (a) A single non-finite INPUT sample. The house rule covers non-finite PARAMETERS; audio is
-        // not guarded, and `core::flushPoison` — the house tool for exactly this — is not used here.
-        // Measured, at a 1 ms lookahead and 4x: both +Inf and NaN put 63 non-finite samples in the
-        // output (the FIR's own support), and they then differ sharply. NaN is transient: gainToDb(NaN)
-        // fails the comparisons, grDb returns to 0 and the stream recovers. +Inf is PERMANENT:
-        // gainToDb(inf) is inf, so rawRedDb is -inf, grDb becomes -inf, -inf * relCoef stays -inf, and
-        // the rest of the file is digital silence. Both assertions PIN DEFECTS — when the module flushes
-        // poison on the way in, the counts go to zero and the tail comes back, and both must be inverted.
+        // (a) WAS two pinned defects. One +Inf drove grDb to -inf, where -inf * relCoef stays -inf, and
+        // the rest of the stream became digital silence; a NaN additionally lodged in the sliding-max
+        // deque, which pops on `v[b] <= x` and therefore never pops past a NaN. A gate at the input makes
+        // both unreachable — the oversampler copies raw input into its history, so anything downstream of
+        // upsample() would already be too late. The assertion is the MAPPING, not merely the absence of
+        // NaN: the poisoned buffer must render bit-identically to the buffer with the substitution
+        // already applied. A finite 3e38 is in the same table because the clamp, not the isfinite test,
+        // is what catches it.
         const int n = 4096;
-        for (int kind = 0; kind < 2; ++kind)
+        for (int kind = 0; kind < 3; ++kind)
         {
-            std::vector<float> x ((std::size_t) n);
-            for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) (0.1 * std::sin (2.0 * core::kPi * 997.0 * (double) i / sr));
-            x[1000] = kind == 0 ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN();
-            std::vector<std::vector<float>> in { x };
-            const auto y = renderAt (in, sr, Setup { C, 50.0, 1.0, 4 }, 0);
-            int nonFinite = 0, lastNf = -1;
-            for (int i = 0; i < (int) y[0].size(); ++i)
-                if (! std::isfinite (y[0][(std::size_t) i])) { ++nonFinite; lastNf = i; }
-            const char* what = kind == 0 ? "+Inf" : "NaN";
-            test::ok (nonFinite == 63, std::string ("KNOWN HOLE, pinned: one ") + what
-                      + " input sample puts " + std::to_string (nonFinite) + " non-finite samples in the output");
+            const float poison = kind == 0 ? std::numeric_limits<float>::infinity()
+                               : kind == 1 ? std::numeric_limits<float>::quiet_NaN()
+                                           : 3.0e38f;
+            const float substitute = kind == 2 ? 1.0e6f : 0.0f;
+            const char* what = kind == 0 ? "+Inf" : kind == 1 ? "NaN" : "a finite 3e38";
+            std::vector<float> bad ((std::size_t) n), good ((std::size_t) n);
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = (float) (4.0 * std::sin (2.0 * core::kPi * 997.0 * (double) i / sr));   // hot: it must LIMIT
+                bad[(std::size_t) i] = good[(std::size_t) i] = v;
+            }
+            bad[1000] = poison; good[1000] = substitute;
+            std::vector<std::vector<float>> bi { bad }, gi { good };
+            const auto yb = renderAt (bi, sr, Setup { C, 50.0, 1.0, 4 }, 0);
+            const auto yg = renderAt (gi, sr, Setup { C, 50.0, 1.0, 4 }, 0);
+            test::ok (firstDifference (yb[0], yg[0]) < 0,
+                      std::string ("one ") + what + " renders bit-identically to the value the gate substitutes");
+            bool finite = true;
+            for (float v : yb[0]) finite &= (bool) std::isfinite (v);
+            test::ok (finite, std::string ("one ") + what + " leaves no non-finite sample in the output");
             double tail = 0.0;
-            for (int i = lastNf + 1; i < (int) y[0].size(); ++i) tail = std::max (tail, (double) std::fabs (y[0][(std::size_t) i]));
+            for (int i = 2000; i + 200 < (int) yb[0].size(); ++i) tail = std::max (tail, (double) std::fabs (yb[0][(std::size_t) i]));
+            // The substitution level decides how fast the stream comes back, so the two cases get
+            // different thresholds rather than one loose one. A gate value of 0 costs nothing; the 1e6
+            // clamp is +120 dBFS, so it legitimately ducks and climbs back over a release time — what
+            // matters is that it CLIMBS, where +Inf used to leave digital silence (-600 dBFS) for good.
             const double tailDb = 20.0 * std::log10 (tail > 1e-30 ? tail : 1e-30);
-            if (kind == 0)
-                test::ok (tailDb < -100.0, "KNOWN HOLE, pinned: and +Inf mutes the rest of the stream ("
-                                           + dbs (tailDb) + " dBFS against an input of -20)");
-            else
-                test::approx (tailDb, -20.0, 0.2, "NaN, by contrast, is transient — the stream recovers to "
-                                                  + dbs (tailDb) + " dBFS");
+            test::ok (tailDb > -100.0, std::string ("the stream after ") + what + " is alive ("
+                      + dbs (tailDb) + " dBFS) — +Inf used to mute it permanently");
+            if (kind != 2)
+                test::ok (tailDb > -3.0, std::string ("and after ") + what
+                          + " it is back at the ceiling within the buffer (" + dbs (tailDb) + " dBFS)");
+        }
+        // A FINITE but absurd ceiling was the same kill through another door: (float)(-1e308 - smaxDb)
+        // overflows to -inf. Raised by the review round, not by the task list, and verified here.
+        for (double absurd : { -1.0e30, -1.0e308, 1.0e308 })
+        {
+            std::vector<float> x ((std::size_t) 2048);
+            for (int i = 0; i < 2048; ++i) x[(std::size_t) i] = (float) (0.1 * std::sin (0.1 * (double) i));
+            limiter::TruePeakLimiter lim; (void) lim.prepare (sr, 2048, 1, { 1.0, 4, 32 });
+            limiter::TruePeakLimiterParams pp; pp.ceilingDbTp = absurd; pp.releaseMs = 50.0;
+            lim.setParams (pp);
+            float* ch[1] { x.data() };
+            lim.process (ch, 1, 2048); lim.process (ch, 1, 2048);
+            test::ok (std::isfinite (lim.gainReductionDb()), "an absurd finite ceiling (" + dbs (absurd)
+                      + " dBTP) leaves the gain state finite, not stuck at -inf");
+            test::ok (lim.effectiveCeilingDbTp() >= -200.0 && lim.effectiveCeilingDbTp() <= 60.0,
+                      "and the clamp is visible: effectiveCeilingDbTp() reports " + dbs (lim.effectiveCeilingDbTp()));
         }
 
-        // (b) Raising lookaheadMs mid-stream RE-EMITS audio that already went out, at a gain computed
-        // for the quiet material that followed it. setDelay only moves a read offset, and the widened
-        // sliding window cannot recover detector entries the narrow one already evicted. Measured
-        // +28.8 dB over the ceiling. This assertion PINS THE DEFECT: when the module clamps the
-        // lookahead or rebuilds its state on change, invert it to `<= deliveredBudgetDb (4)`.
-        std::vector<float> b ((std::size_t) 8192, 0.0f);
-        for (int i = 470; i < 500; ++i)
-            b[(std::size_t) i] = (float) (std::pow (10.0, 30.0 / 20.0) * std::sin (2.0 * core::kPi * 0.25 * (double) i + 0.7));
-        limiter::TruePeakLimiter lim;
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 1.0; p.lookaheadMs = 0.5; p.oversampleFactor = 4;
-        lim.setParams (p); lim.prepare (sr, 64, 1); lim.setParams (p);
-        float* ch[1];
-        for (int i = 0; i < 8192; i += 64)
+        // (b) Raising lookaheadMs mid-stream used to RE-EMIT audio that had already gone out, at a gain
+        // computed for the quiet material after it: +28.8 dB over the ceiling. setDelay moves only a read
+        // offset, and the widened window cannot recover detector entries the narrow one evicted. The
+        // parameter now lives in the prepare-time config, so the call that did it does not COMPILE — the
+        // assertion is therefore about the contract rather than a number: latency is fixed for the life
+        // of a prepared stream, and per-block automation cannot move it.
         {
-            if (i == 640) { p.lookaheadMs = 5.0; lim.setParams (p); }
-            ch[0] = b.data() + i; lim.process (ch, 1, 64);
+            limiter::TruePeakLimiter a, b2;
+            (void) a.prepare (sr, 64, 1, { 0.5, 4, 32 });
+            (void) b2.prepare (sr, 64, 1, { 5.0, 4, 32 });
+            test::ok (a.latencySamples() != b2.latencySamples(),
+                      "lookahead still changes latency (" + std::to_string (a.latencySamples()) + " vs "
+                      + std::to_string (b2.latencySamples()) + ") — which is why it cannot be a per-block parameter");
+            limiter::TruePeakLimiterParams pp; pp.ceilingDbTp = C; pp.releaseMs = 1.0;
+            std::vector<float> burst ((std::size_t) 8192, 0.0f);
+            for (int i = 470; i < 500; ++i)
+                burst[(std::size_t) i] = (float) (std::pow (10.0, 30.0 / 20.0) * std::sin (2.0 * core::kPi * 0.25 * (double) i + 0.7));
+            const int before = a.latencySamples();
+            float* ch[1];
+            for (int i = 0; i < 8192; i += 64)
+            {
+                pp.releaseMs = (i == 640) ? 2.0 : 1.0;                    // per-block automation, every block
+                a.setParams (pp);
+                ch[0] = burst.data() + i; a.process (ch, 1, 64);
+            }
+            test::ok (a.latencySamples() == before, "and per-block setParams cannot move it");
+            test::ok (tp::samplePeakDb (burst) - C <= tpw::deliveredBudgetDb (4),
+                      "the burst is delivered " + dbs (tp::samplePeakDb (burst) - C)
+                      + " dB over the ceiling, inside the budget — it used to be +28.4");
         }
-        test::ok (tp::samplePeakDb (b) - C > 20.0,
-                  "KNOWN HOLE, pinned: raising the lookahead mid-stream re-emits the burst at "
-                  + dbs (tp::samplePeakDb (b) - C) + " dB over the ceiling");
+    }
+
+    // ---------------------------------------------------------------- what the review round found
+    // Every one of these closes a defect the first version of this task shipped past. They are grouped
+    // because they share a shape: state that is PER CHANNEL meeting state that is SHARED, and validation
+    // that checked one end of a range.
+    test::group ("Channel count, validation ranges, and a release long enough to stop being one");
+    {
+        const double C = -1.0;
+        // A channel that sits out a few blocks used to come back re-emitting audio whose detector
+        // entries had expired globally while it was away: +19.76 dB over the ceiling, at every factor.
+        for (int F : { 2, 4, 8 })
+        {
+            limiter::TruePeakLimiter lim;
+            (void) lim.prepare (sr, 4096, 2, { 1.0, F, 32 });
+            limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 50.0;
+            lim.setParams (p);
+            std::vector<float> L (40, 0.0f), R (40, 0.0f);
+            R[0] = 10.0f;                                                 // +20 dBFS, RIGHT channel only
+            { float* io[2] { L.data(), R.data() }; lim.process (io, 2, 40); }
+            std::vector<float> mono (24000, 0.0f);
+            { float* io[1] { mono.data() }; lim.process (io, 1, 24000); } // the right channel freezes here
+            std::vector<float> L2 (4096, 0.0f), R2 (4096, 0.0f);
+            { float* io[2] { L2.data(), R2.data() }; lim.process (io, 2, 4096); }
+            test::ok (tp::samplePeakDb (R2) <= C, "F=" + std::to_string (F)
+                      + ": stereo -> mono -> stereo leaves nothing above the ceiling on the resumed channel ("
+                      + dbs (tp::samplePeakDb (R2)) + " dBFS; it used to be +18.76)");
+        }
+        // Validation covered one end of two ranges only.
+        {
+            limiter::TruePeakLimiter lim;
+            test::ok (! lim.prepare (sr, 64, 1, { 1.0, 4, std::numeric_limits<int>::max() }),
+                      "tapsPerPhase = INT_MAX is refused (it overflowed factor*taps inside the oversampler)");
+            test::ok (! lim.prepare (1.0, 64, 1, { 1.0, 4, 32 }),
+                      "a 1 Hz rate is refused (20 ms could not hold the minimum lookahead, and the clamp "
+                      "became std::clamp(x, 2, 1) — lo > hi is undefined)");
+            test::ok (lim.prepare (8000.0, 64, 1, { 1.0, 4, 32 }), "but a legitimately low rate still prepares");
+            test::ok (lim.isPrepared() && lim.oversampleFactor() == 4,
+                      "and the getters report the live topology (isPrepared, oversampleFactor "
+                      + std::to_string (lim.oversampleFactor()) + ")");
+        }
+        // A release long enough that exp(-1/t) rounds to 1.0f stopped being a release at all.
+        for (double rel : { 1000.0, 175000.0, 1.0e9 })
+        {
+            limiter::TruePeakLimiter lim; (void) lim.prepare (sr, 512, 1, { 1.0, 4, 32 });
+            limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = rel;
+            lim.setParams (p);
+            std::vector<float> hot (512, 4.0f); float* io[1] { hot.data() };
+            lim.process (io, 1, 512);
+            const double engaged = lim.gainReductionDb();
+            std::vector<float> quiet (480000, 0.0f); float* q[1] { quiet.data() };
+            lim.process (q, 1, 480000);                                   // ten seconds of silence
+            test::ok (engaged < -1.0, "release " + dbs (rel) + " ms: the limiter engaged (" + dbs (engaged) + " dB)");
+            test::ok (lim.gainReductionDb() > engaged, "release " + dbs (rel)
+                      + " ms: and the gain still recovers, however slowly (" + dbs (engaged) + " -> "
+                      + dbs (lim.gainReductionDb()) + " dB) — at 175 s it used to be stuck for good");
+        }
+        // The gate was only ever tested with POSITIVE poison.
+        for (int kind = 0; kind < 2; ++kind)
+        {
+            const float poison = kind == 0 ? -std::numeric_limits<float>::infinity() : -3.0e38f;
+            const float substitute = kind == 0 ? 0.0f : -1.0e6f;
+            std::vector<float> bad (4096), good (4096);
+            for (int i = 0; i < 4096; ++i)
+            {
+                const float v = (float) (4.0 * std::sin (2.0 * core::kPi * 997.0 * (double) i / sr));
+                bad[(std::size_t) i] = good[(std::size_t) i] = v;
+            }
+            bad[1000] = poison; good[1000] = substitute;
+            std::vector<std::vector<float>> bi { bad }, gi { good };
+            test::ok (firstDifference (renderAt (bi, sr, Setup { C, 50.0, 1.0, 4 }, 0)[0],
+                                       renderAt (gi, sr, Setup { C, 50.0, 1.0, 4 }, 0)[0]) < 0,
+                      std::string (kind == 0 ? "-Inf" : "a finite -3e38")
+                      + " maps to its substitute too — the gate is not one-sided");
+        }
+        // Chunking and reset were only ever nulled in mono, so a per-channel offset or a per-channel
+        // reset could have been wrong in the second channel and nothing would have said so.
+        {
+            const int n = 2048;
+            std::vector<float> a1 (n), a2 (n), b1 (n), b2 (n);
+            for (int i = 0; i < n; ++i)
+            {
+                a1[(std::size_t) i] = a2[(std::size_t) i] = (float) (10.0 * std::sin (2.0 * core::kPi * 1000.0 * (double) i / sr));
+                b1[(std::size_t) i] = b2[(std::size_t) i] = (float) (7.0 * std::sin (2.0 * core::kPi * 1700.0 * (double) i / sr + 0.9));
+            }
+            limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 50.0;
+            limiter::TruePeakLimiter one, many;
+            (void) one.prepare (sr, 512, 2, { 1.0, 4, 32 }); (void) many.prepare (sr, 512, 2, { 1.0, 4, 32 });
+            one.setParams (p); many.setParams (p);
+            { float* io[2] { a1.data(), b1.data() }; one.process (io, 2, n); }
+            for (int off = 0; off < n; off += 512)
+            { float* io[2] { a2.data() + off, b2.data() + off }; many.process (io, 2, 512); }
+            test::ok (firstDifference (a1, a2) < 0 && firstDifference (b1, b2) < 0,
+                      "STEREO: one oversized call == the caller chunking it, on both channels");
+            limiter::TruePeakLimiter warm, fresh;
+            (void) warm.prepare (sr, n, 2, { 1.0, 4, 32 }); (void) fresh.prepare (sr, n, 2, { 1.0, 4, 32 });
+            warm.setParams (p); fresh.setParams (p);
+            std::vector<float> w1 = a1, w2 = b1;
+            { float* io[2] { w1.data(), w2.data() }; warm.process (io, 2, n); }
+            warm.reset();
+            std::vector<float> x1 (n, 0.0f), x2 (n, 0.0f), y1 (n, 0.0f), y2 (n, 0.0f);
+            { float* io[2] { x1.data(), x2.data() }; warm.process (io, 2, n); }
+            { float* io[2] { y1.data(), y2.data() }; fresh.process (io, 2, n); }
+            test::ok (firstDifference (x1, y1) < 0 && firstDifference (x2, y2) < 0,
+                      "STEREO: reset() equals a fresh instance on both channels");
+        }
+    }
+
+    // ---------------------------------------------------------------- the contract surface itself
+    // The review round mutated the header line by line and found that most of what lives OUTSIDE the
+    // sample loop was unpinned: validation ranges, fallbacks, getters, and the state a failed re-prepare
+    // leaves behind. The reference NULL cannot see any of it — the transcription has no guards at all —
+    // so it needs its own rows.
+    test::group ("Validation ranges, fallbacks and getters are pinned, not just the sample loop");
+    {
+        const double C = -1.0;
+        limiter::TruePeakLimiter lim;
+        test::ok (! lim.prepare (1.0e300, 512, 1),                "an absurd sample rate is refused");
+        test::ok (! lim.prepare (sr, 512, 1, { -1.0, 4, 32 }),    "a negative lookahead is refused");
+        test::ok (! lim.prepare (sr, 512, 1, { 1.0, 32, 32 }),    "a factor above the cap is REFUSED, not silently reduced");
+        test::ok (! lim.prepare (sr, 512, core::kMaxChannels + 1),"more channels than supported is REFUSED — clamping would have "
+                                                                 "let the surplus pass through unlimited");
+        test::ok (lim.prepare (sr, 512, 2, { 1.0, 8, 32 }), "a valid configuration prepares");
+        test::ok (lim.isPrepared() && lim.oversampleFactor() == 8 && lim.lookaheadSamples() == 48,
+                  "and the getters report the live topology (factor " + std::to_string (lim.oversampleFactor())
+                  + ", lookahead " + std::to_string (lim.lookaheadSamples()) + " samples)");
+        const int wasLatency = lim.latencySamples();
+        test::ok (! lim.prepare (sr, 512, 1, { 1.0, 4, 2 }), "then a bad re-prepare fails");
+        test::ok (! lim.isPrepared() && lim.latencySamples() == 0 && lim.lookaheadSamples() == 0
+                  && lim.oversampleFactor() == 0,
+                  "and every accessor reports nothing-prepared rather than the previous topology (was latency "
+                  + std::to_string (wasLatency) + ")");
+
+        // maxBlock is a scratch-buffer hint now, so a big one must PREPARE rather than fail — failing
+        // would leave process() returning the buffer untouched, the very defect this task closed.
+        limiter::TruePeakLimiter big;
+        test::ok (big.prepare (sr, 1 << 23, 1, { 1.0, 4, 32 }), "an oversized maxBlock is clamped, not refused");
+        {
+            limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 50.0; big.setParams (p);
+            std::vector<float> x (4096, 4.0f); float* io[1] { x.data() };
+            big.process (io, 1, 4096);
+            test::ok (tp::samplePeakDb (x) < -0.9, "and it still limits (" + dbs (tp::samplePeakDb (x)) + " dBFS)");
+        }
+
+        // Non-finite parameters fall back to the documented DEFAULTS, which "the output stayed finite"
+        // does not pin — the fallback value could be anything and that assertion would still pass.
+        limiter::TruePeakLimiter fb;
+        test::ok (fb.prepare (sr, 512, 1, { 1.0, 4, 32 }), "prepared for the fallback checks");
+        limiter::TruePeakLimiterParams np;
+        np.ceilingDbTp = std::numeric_limits<double>::quiet_NaN();
+        np.releaseMs   = std::numeric_limits<double>::quiet_NaN();
+        fb.setParams (np);
+        test::approx (fb.effectiveCeilingDbTp(), -1.0, 1.0e-12, "a NaN ceiling falls back to the -1 dBTP default");
+        test::approx (fb.effectiveReleaseMs(), 100.0, 0.05, "a NaN release falls back to the 100 ms default"); // 0.05: the float coefficient round trip
+        limiter::TruePeakLimiterParams cp; cp.ceilingDbTp = -1.0e9; cp.releaseMs = 50.0;
+        fb.setParams (cp);
+        test::approx (fb.effectiveCeilingDbTp(), -200.0, 1.0e-12, "and an absurd finite ceiling lands on the documented floor");
+    }
+
+    test::group ("Poison and reset, on the channel and at the moment the mono rows could not reach");
+    {
+        const double C = -1.0;
+        // The gate loops over channels; a loop that only ever read channel 0 passed every mono row.
+        std::vector<float> l (4096), r0 (4096), r1 (4096);
+        for (int i = 0; i < 4096; ++i)
+        {
+            const float v = (float) (4.0 * std::sin (2.0 * core::kPi * 997.0 * (double) i / sr));
+            l[(std::size_t) i] = v; r0[(std::size_t) i] = r1[(std::size_t) i] = v * 0.5f;
+        }
+        r0[1000] = std::numeric_limits<float>::quiet_NaN();
+        r1[1000] = 0.0f;
+        std::vector<std::vector<float>> bi { l, r0 }, gi { l, r1 };
+        const auto yb = renderAt (bi, sr, Setup { C, 50.0, 1.0, 4 }, 0);
+        const auto yg = renderAt (gi, sr, Setup { C, 50.0, 1.0, 4 }, 0);
+        test::ok (firstDifference (yb[1], yg[1]) < 0 && firstDifference (yb[0], yg[0]) < 0,
+                  "a NaN on channel 1 is gated exactly like one on channel 0 — both channels stay identical "
+                  "to the substituted render");
+
+        // reset() must clear the DETECTOR, not only the gain: without slide.reset() the first sample after
+        // a reset still saw the old window and pulled the gain 27 dB down.
+        limiter::TruePeakLimiter lim;
+        test::ok (lim.prepare (sr, 4096, 1, { 1.0, 4, 32 }), "prepared for the reset checks");
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 50.0; lim.setParams (p);
+        std::vector<float> hot (4096, 4.0f); float* ph[1] { hot.data() };
+        lim.process (ph, 1, 4096);
+        lim.reset();
+        std::vector<float> one (1, 0.0f); float* po[1] { one.data() };
+        lim.process (po, 1, 1);
+        test::approx (lim.gainReductionDb(), 0.0, 0.0,
+                      "one silent sample after reset() draws exactly no gain reduction (the detector was cleared too)");
+
+        // And the gain state must reach EXACT zero after limiting, not a denormal tail — which is the one
+        // observable difference the poison/denormal flush makes.
+        lim.process (ph, 1, 4096);
+        std::vector<float> quiet (120000, 0.0f); float* pq[1] { quiet.data() };
+        lim.process (pq, 1, 120000);                                  // 2.5 s of silence
+        test::approx (lim.gainReductionDb(), 0.0, 0.0,
+                      "and after limiting plus 2.5 s of silence the gain state is exactly 0, not a denormal");
+    }
+
+    // ---------------------------------------------------------------- the corner the floors do NOT cover
+    // Each floor was measured with the OTHER parameter at a musical value. Both at once is a different
+    // point, and it sits OUTSIDE the envelope — bringing it inside would need floors at 24 baseband
+    // samples (0.5 ms), which is a musical setting and would change the sound of a legitimate one. So it
+    // is characterised here with its number instead of being clamped away, and the header says so.
+    test::group ("Both floors at once: outside the envelope, on purpose, with the number pinned");
+    {
+        const double C = -1.0;
+        for (int F : { 2, 4, 8 })
+        {
+            double worst = -1e9;
+            std::vector<std::vector<float>> ws { tpw::clickTrain (sr, 0.12, 3.0, 26.0, 0.5),
+                                                 tpw::denseNoise (sr, 0.12, 10.0),
+                                                 tpw::denseNoise (sr, 0.12, 20.0) };
+            for (auto& w : ws)
+            {
+                std::vector<std::vector<float>> in { w };
+                worst = std::max (worst, tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.0, 0.0, F }, 0)[0]) - C);
+            }
+            test::ok (worst <= tpw::deliveredBudgetDb (F) + 0.5,
+                      "F=" + std::to_string (F) + ": at BOTH floors the worst witness is " + dbs (worst)
+                      + " dB over — outside the " + dbs (tpw::deliveredBudgetDb (F))
+                      + " dB envelope, and bounded well inside the unfloored +2.8");
+            if (F == 8)
+                test::ok (worst > tpw::deliveredBudgetDb (F),
+                          "and at 8x it really is outside it (" + dbs (worst) + " > " + dbs (tpw::deliveredBudgetDb (F))
+                          + ") — this row exists so that fact cannot be forgotten");
+        }
     }
 
     // ---------------------------------------------------------------- 44.1 kHz, and the rates above it

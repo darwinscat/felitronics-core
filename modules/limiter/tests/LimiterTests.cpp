@@ -32,7 +32,7 @@ using namespace felitronics;
 // Independent true-peak (dBTP) of a baseband buffer, via a FRESH 8x oversampler (not the limiter's).
 static double measureTruePeakDb (const std::vector<float>& x)
 {
-    oversampling::PolyphaseOversampler m; m.prepare (8, 1, 32);
+    oversampling::PolyphaseOversampler m; (void) m.prepare (8, 1, 32);
     std::vector<float> osb (x.size() * 8);
     const float* xi[1] { x.data() }; float* oo[1] { osb.data() };
     m.upsample (xi, 1, (int) x.size(), oo);
@@ -64,8 +64,8 @@ int main()
         test::ok (inTp > -1.0 + 0.3, "input true-peak is genuinely above the ceiling (real ISP case)");
 
         std::vector<float> y = x; float* ch[1] { y.data() };
-        limiter::TruePeakLimiter lim; lim.prepare (sr, n, 1);
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0; p.lookaheadMs = 1.0; p.oversampleFactor = 4;
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });   // topology is a prepare-time thing now
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
         lim.setParams (p);
         lim.process (ch, 1, n);
 
@@ -81,8 +81,8 @@ int main()
         std::vector<float> x (n);
         for (int i = 0; i < n; ++i) x[i] = (float) (A * std::sin (2.0 * core::kPi * f * i / sr));
         std::vector<float> y = x; float* ch[1] { y.data() };
-        limiter::TruePeakLimiter lim; lim.prepare (sr, n, 1);
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.lookaheadMs = 1.0;
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0;
         lim.setParams (p);
         lim.process (ch, 1, n);
         test::approx (rmsTail (y, 0.3) / rmsTail (x, 0.3), 1.0, 0.05, "amplitude preserved (transparent)");
@@ -92,9 +92,7 @@ int main()
     // --- latency = oversampler round-trip + lookahead (baseband) ---
     test::group ("Limiter latency");
     {
-        limiter::TruePeakLimiter lim; lim.prepare (sr, 512, 2);
-        limiter::TruePeakLimiterParams p; p.lookaheadMs = 1.0; p.oversampleFactor = 4;
-        lim.setParams (p);
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, 512, 2, { 1.0, 4, 32 });
         const int look = (int) std::lround (1.0 * 0.001 * sr);       // 48 baseband
         test::ok (lim.latencySamples() == (32 - 1) + look, "latency = (tpp-1) + lookahead");
     }
@@ -105,8 +103,8 @@ int main()
         const int n = 512;
         std::vector<float> a (n, 0.6f), b (n, 0.6f);
         float* ch[2] { a.data(), b.data() };
-        limiter::TruePeakLimiter lim; lim.prepare (sr, n, 2);
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.lookaheadMs = 1.0;
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 2, { 1.0, 4, 32 });
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0;
         lim.setParams (p);
         const long before = g_allocs.load();
         lim.process (ch, 2, n);
@@ -121,11 +119,12 @@ int main()
         limiter::TruePeakLimiter lim;                                // NOT prepared (maxCh == 0)
         float a[64] {}, b[64] {}; float* io[2] { a, b };
         lim.process (io, 2, 16);                                     // maxCh==0 → no-op
-        lim.prepare (48000.0, 16, 2, 2);                            // tapsPerPhase=2 < 4 → oversampler prepare fails → stays unprepared
+        test::ok (! lim.prepare (48000.0, 16, 2, { 1.0, 4, 2 }),      // tapsPerPhase=2 < 4 → rejected
+                  "prepare() REPORTS an unusable configuration instead of half-building");
         lim.process (io, 2, 16);                                     // must no-op, not run an unprepared oversampler
-        lim.prepare (48000.0, 16, 2, 32);                           // valid
+        test::ok (lim.prepare (48000.0, 16, 2, { 1.0, 4, 32 }), "and accepts a valid one");
         lim.process (io, 2, 16);                                     // works
-        lim.process (io, 2, 64);                                     // numSamples=64 > maxBlock=16 → no-op, must not overrun osBuf
+        lim.process (io, 2, 64);                                     // 64 > maxBlock 16 → CHUNKED now, not dropped
         test::ok (true, "no OOB across failed-prepare / oversized-block process (ASan/UBSan is the check)");
     }
 
@@ -133,7 +132,7 @@ int main()
     // (insert-before-expire with capacity == W overwrites the head — the current max — on the W+1-th push)
     test::group ("SlidingMax survives a full deque (4,3,2,1,0 @ W=4)");
     {
-        limiter::detail::SlidingMax sm; sm.prepare (4);
+        limiter::detail::SlidingMax sm; (void) sm.prepare (4);
         const float in[5]   = { 4.0f, 3.0f, 2.0f, 1.0f, 0.0f };
         const float want[5] = { 4.0f, 4.0f, 4.0f, 4.0f, 3.0f };   // window of 4 → last covers {3,2,1,0}
         for (int i = 0; i < 5; ++i)
@@ -144,7 +143,7 @@ int main()
     test::group ("SlidingMax == brute-force window max (hostile sequence)");
     {
         const int W = 5;
-        limiter::detail::SlidingMax sm; sm.prepare (W);
+        limiter::detail::SlidingMax sm; (void) sm.prepare (W);
         unsigned long long s = 42;
         auto rnd = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 65536.0f; };
         std::vector<float> xs;
@@ -172,8 +171,8 @@ int main()
         const int rampLen = (int) (0.025 * sr);                      // 25 ms strictly-decreasing > the 20 ms window
         for (int i = 0; i < rampLen; ++i) x[i] = 1.0f - 0.7f * (float) i / (float) rampLen;   // 1.0 → 0.3
         std::vector<float> y = x; float* ch[1] { y.data() };
-        limiter::TruePeakLimiter lim; lim.prepare (sr, n, 1);
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = 20.0 * std::log10 (0.25); p.releaseMs = 0.5; p.lookaheadMs = 1.0;
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = 20.0 * std::log10 (0.25); p.releaseMs = 0.5;
         lim.setParams (p);
         lim.process (ch, 1, n);
         double mx = 0.0; for (float v : y) mx = std::max (mx, (double) std::fabs (v));
@@ -188,8 +187,8 @@ int main()
         for (int i = 0; i < 96; ++i)  x[i] = (float) std::sin (2.0 * core::kPi * 0.25 * i + 0.7);            // 2 ms 0 dBFS fs/4 burst
         for (int i = 96; i < n; ++i)  x[i] = (float) (0.25 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));  // then a −12 dB tone
         std::vector<float> y = x; float* ch[1] { y.data() };
-        limiter::TruePeakLimiter lim; lim.prepare (sr, n, 1);
-        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -6.0; p.releaseMs = 1.0; p.lookaheadMs = 1.0;
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -6.0; p.releaseMs = 1.0;
         lim.setParams (p);
         lim.process (ch, 1, n);
         auto rmsWin = [] (const std::vector<float>& v, int a, int b) {
@@ -206,16 +205,24 @@ int main()
         std::vector<float> y (n);
         for (int i = 0; i < n; ++i) y[i] = (float) (0.8 * std::sin (2.0 * core::kPi * 997.0 * i / sr));
         float* ch[1] { y.data() };
-        limiter::TruePeakLimiter lim; lim.prepare (sr, n, 1);
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
         limiter::TruePeakLimiterParams p;
         p.ceilingDbTp = std::numeric_limits<double>::quiet_NaN();
         p.releaseMs   = std::numeric_limits<double>::quiet_NaN();
-        p.lookaheadMs = std::numeric_limits<double>::quiet_NaN();
         lim.setParams (p);
         lim.process (ch, 1, n);
         bool finite = true; for (float v : y) finite &= (bool) std::isfinite (v);
-        test::ok (finite, "NaN ceiling/release/lookahead → finite output");
-        test::ok (lim.latencySamples() >= 0, "latency stays non-negative under NaN lookahead");
+        test::ok (finite, "NaN ceiling/release → finite output");
+        test::ok (lim.latencySamples() >= 0, "latency stays non-negative");
+        // The lookahead moved into the prepare-time config, so a non-finite one is REFUSED rather than
+        // silently swallowed — and a non-finite SAMPLE RATE too: `rate <= 0.0` is false for NaN, which
+        // used to walk straight into std::lround(NaN).
+        limiter::TruePeakLimiter bad;
+        test::ok (! bad.prepare (sr, n, 1, { std::numeric_limits<double>::quiet_NaN(), 4, 32 }),
+                  "prepare() refuses a non-finite lookahead");
+        test::ok (! bad.prepare (std::numeric_limits<double>::quiet_NaN(), n, 1), "prepare() refuses a NaN sample rate");
+        test::ok (! bad.prepare (std::numeric_limits<double>::infinity(), n, 1), "prepare() refuses an infinite sample rate");
+        test::ok (! bad.isPrepared(), "and stays unprepared after all three");
     }
 
     // --- latency query before prepare() must not report the unprepared oversampler's tpp-1 == -1 ---
