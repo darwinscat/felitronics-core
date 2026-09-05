@@ -75,6 +75,30 @@ they do not. `setColdAfterSeconds(s)` sets the rest (zero or less = never); `slo
    any of them back as the pack spells it; `dialDegrees()` is the crossfade dial's angle,
    `settings()` the captured combination.
 
+## Levels — what is always applied, and the one thing a host may switch off
+
+The pack's own two levels are applied **always**, from the moment `load()` reads them. They are what
+the pack's author decided about this device: `chain[].input_db` is how hard the guitar is fed into it
+— the working point, so it changes the sound and not the volume — and `chain[].output_db` is how loud
+it leaves, so packs can be balanced against one another.
+
+Where they sit is not decoration. `input_db` goes FIRST, ahead of the dry copy, because a blend knob
+mixes one guitar with itself and both ends of that mix must be fed the same signal. `output_db` goes
+LAST, after the mix, because it is one number for the whole stage and applied any earlier it would
+ride the wet side alone and move the blend the pack states for this position.
+
+`stageInputDb()` / `stageOutputDb()` read back what the player is applying. **A host with a fader of
+its own must send only its DEVIATION from these**, never the whole number — otherwise the level lands
+twice, in the app and again in the pack, and the app stops sounding like the pack it exports.
+
+`setInputTrims(false)` switches off exactly one thing: `files[].input_db`, the trim of one alias
+against its neighbour. It has never reached the pack's own levels and does not reach them now.
+
+`setNormalize()` defaults to **true**. A model's `metadata.loudness` tag is a contract, not a
+listener's option: with it off, every capture plays at whatever level the hardware happened to give,
+and no two packs can be compared at all. A host may turn it off to hear a model against the hardware,
+and should make that state loud — it is a measuring position, not a way to listen.
+
 ## Drawing — the one honest source of the curve
 
 The tone as it PLAYS, not as it was measured: `commonGrid()` (1/12-octave, 20 Hz – 20 kHz) with

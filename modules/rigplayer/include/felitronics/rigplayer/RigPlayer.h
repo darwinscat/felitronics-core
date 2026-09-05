@@ -5,9 +5,9 @@
 // (namz::rig — the manifest as the canonical reader returns it) and a way to get a file's bytes, tell it
 // where the knobs stand, feed it audio. It does, in signal order:
 //
-//     in → dry copy → pre tone (bands, curve) → chain trim → ┬→ trim A → model A → align ─┐
-//                                                            └→ trim B → model B → align ─┴→ mix
-//        → post tone (bands, curve) → dry/wet blend → out
+//     in → pack in → dry copy → pre tone (bands, curve) → chain trim → ┬→ trim A → model A → align ─┐
+//                                                                      └→ trim B → model B → align ─┴→ mix
+//        → post tone (bands, curve) → dry/wet blend → pack out → out
 //
 //   • WHICH files play is namz::rig's policy (a turned control is law) joined to ModelBlend.h's pair
 //     along the gain dial — RigSelection.h, pure.
@@ -24,8 +24,15 @@
 //   • A tone knob is applied as the pack describes it — a curve becomes a minimum-phase FIR, bands
 //     become biquads — on the side of the models its circuit puts it. ToneKnobs.h, pure.
 //   • A blend knob mixes the DI the models were fed, through the dry path's own response. BlendKnob.h.
-//   • The slot trims are the files' own `input_db` — a linked setting plays its neighbour softer — and
-//     the chain trim is the extension past the ends of the captured range.
+//   • THE PACK'S OWN TWO LEVELS BRACKET EVERYTHING IT DOES. `chain[].input_db` is the level of the
+//     guitar into this device, and it goes FIRST — ahead of the dry copy, because a blend knob mixes
+//     one guitar with itself and both ends must be fed the same signal. `chain[].output_db` is the
+//     level the device leaves at, and it goes LAST, after the mix, so balancing one pack against
+//     another cannot move the blend the pack was told to hold. Neither is behind setInputTrims():
+//     they are the author's statement about the pack, not a listener's option.
+//   • The slot trims are the files' own `input_db` — a linked setting plays its neighbour softer, and
+//     this is the one thing setInputTrims() switches off — and the chain trim is the extension past
+//     the ends of the captured range, which the dry path never saw either.
 //   • The models' offsets are measured from the bytes (AlignmentTable.h) by the host, on any thread,
 //     and handed in; each slot's delay travels with its model and lands when the slot is silent.
 //
@@ -103,6 +110,8 @@ public:
             for (auto& t : lagTail_) t[c].fill(0.0f);
         }
         for (auto& side : bq_) for (auto& band : side) for (auto& b : band) b.reset();
+        curIn_    = inGain_.load(std::memory_order_relaxed);
+        curOut_   = outGain_.load(std::memory_order_relaxed);
         curChain_ = chainGain_.load(std::memory_order_relaxed);
         for (int i = 0; i < 2; ++i) curSlot_[i] = slotGain_[i].load(std::memory_order_relaxed);
         curDry_ = dryGain_.load(std::memory_order_relaxed);
@@ -201,6 +210,8 @@ public:
         dryFirBypass_.store(true, std::memory_order_release);
         dryGain_.store(0.0f, std::memory_order_release);
         wetGain_.store(1.0f, std::memory_order_release);
+        inGain_.store(1.0f, std::memory_order_release);
+        outGain_.store(1.0f, std::memory_order_release);
         chainGain_.store(1.0f, std::memory_order_release);
         for (auto& g : slotGain_) g.store(1.0f, std::memory_order_release);
         for (auto& p : pendDelay_) p.store(0, std::memory_order_release);
@@ -208,6 +219,11 @@ public:
     }
     bool loaded() const { return loaded_; }
     const namz::rig::Stage& stage() const { return stage_; }
+    // The pack's own two levels, for a host that prints or draws them. These are what the player IS
+    // applying: a host with a fader of its own applies only its deviation from them, or the level
+    // lands twice — which is exactly the bug that made these keys necessary.
+    double stageInputDb()  const { return stage_.inputDb; }
+    double stageOutputDb() const { return stage_.outputDb; }
 
     // ---------------------------------------------------------------- message thread: the panel ----
 
@@ -538,6 +554,14 @@ public:
             }
             for (int s = 0; s < 2; ++s) takeBands(s);
 
+            // THE PACK'S INPUT LEVEL, and it goes first: before the dry block, before the pre-model
+            // tone, before everything. It is the level of the GUITAR into this device, and a blend
+            // knob mixes one guitar with itself — feed the models less and the dry side the same as
+            // ever and the mix becomes two instruments at two volumes. `extendDb` is a different
+            // animal and stays in chainGain_ below: a trick played inside the pack past the top
+            // capture, which the dry path leaving at the input jack never saw.
+            rampInto(a, nch, count, inGain_.load(std::memory_order_acquire), curIn_);
+
             // Keep the DRY block before anything touches it: the same DI the models are fed, which is
             // the whole economy of a blend. Taken ahead of the pre-model tone — the hardware's dry path
             // leaves at the input jack.
@@ -669,6 +693,11 @@ public:
                 liveDry_.store(endDry, std::memory_order_release);
                 liveWet_.store(endWet, std::memory_order_release);
             }
+
+            // THE PACK'S OUTPUT LEVEL, and it goes last: after the mix. One number for the whole
+            // stage, and applied any earlier it would ride the wet side alone and move a blend the
+            // pack states for this position.
+            rampInto(a, nch, count, outGain_.load(std::memory_order_acquire), curOut_);
             done += count;
         }
     }
@@ -701,6 +730,10 @@ private:
     // law does with it — in what order, and whether a model may be replaced yet — is its business.
     void apply() {
         const auto& d = stage_.device;
+        // The pack's levels are properties of the STAGE and stand whether or not a file can be
+        // selected, so they are stored ahead of the early return below.
+        inGain_.store(linOf(stage_.inputDb), std::memory_order_release);
+        outGain_.store(linOf(stage_.outputDb), std::memory_order_release);
         sel_  = select(d, axes_, dial_, dialDeg_, shape_, topExtend_);
         plan_ = slotPlan(sel_, d);
         if (plan_.file[0] < 0) { setRequest(0, 0, 0.0f); return; }
@@ -1034,9 +1067,15 @@ private:
     std::atomic<long long>     coldAfter_ { 0 };          // coldSeconds_ at fs_, for the law; 0 = never
     std::atomic<bool>          slotCold_[2] { false, false };
     std::atomic<int>           coldBlocks_[2] { 0, 0 };
+    // The pack's own levels, and the reason they are two gains of their own rather than one more
+    // term in chainGain_: inGain_ has to reach the dry side of a blend, and chainGain_ is applied
+    // after the dry block has already been taken.
+    std::atomic<float>         inGain_ { 1.0f }, outGain_ { 1.0f };
     std::atomic<float>         chainGain_ { 1.0f };
     std::atomic<float>         slotGain_[2] { 1.0f, 1.0f };
-    std::atomic<bool>          normalize_ { false };
+    // A model's `metadata.loudness` tag is a CONTRACT, not a listener's option: off, every capture
+    // plays at whatever level the hardware happened to give, and two packs cannot be compared at all.
+    std::atomic<bool>          normalize_ { true };
     std::atomic<bool>          inputTrims_ { true };
     std::atomic<bool>          firBypass_[2] { true, true };
     std::atomic<bool>          dryActive_ { false }, dryFirBypass_ { true };
@@ -1048,6 +1087,7 @@ private:
     felitronics::nam::BlendState blend_ {};
     bool coldRt_[2] {};                                // the law's cold flags as of the last block, to see a slot fall asleep
     std::array<float, (std::size_t) kMaxDelay> lagTail_[2][kMaxChannels] {};
+    float curIn_ = 1.0f, curOut_ = 1.0f;
     float curChain_ = 1.0f, curSlot_[2] { 1.0f, 1.0f }, curDry_ = 0.0f, curWet_ = 1.0f;
     BandSet                    bandRt_[2];
     felitronics::rigplayer::SectionBiquad   bandCur_[2][kMaxBands];
