@@ -37,6 +37,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamics_detector_analysis_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_detector_analysis_tests COMMAND felitronics_dynamics_detector_analysis_tests)
 
+    # P14 part one: what the SHARED recursive primitives do with a poisoned state. Links eq as well —
+    # the primitives being hardened live on both sides of that line (eq::Svf, eq::Biquad,
+    # dynamics::EnvelopeFollower, dynamics::GainReductionFollower) and the contract is one contract.
+    add_executable(felitronics_dynamics_poison_recovery_tests tests/PoisonRecoveryTests.cpp)
+    target_link_libraries(felitronics_dynamics_poison_recovery_tests PRIVATE felitronics::dynamics felitronics::eq felitronics::deesser felitronics::dynamiceq)
+    target_include_directories(felitronics_dynamics_poison_recovery_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_poison_recovery_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_poison_recovery_tests COMMAND felitronics_dynamics_poison_recovery_tests)
+
     add_executable(felitronics_dynamics_transient_tests tests/TransientShaperTests.cpp)
     target_link_libraries(felitronics_dynamics_transient_tests PRIVATE felitronics::dynamics)
     target_include_directories(felitronics_dynamics_transient_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

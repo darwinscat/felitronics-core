@@ -84,6 +84,16 @@ public:
             for (int c = 0; c < nc; ++c) channels[c][i] += channels[c][i] * m;  // = x*(1 + mix*(gain-1))
         }
         fast_.flushDenormals(); slow_.flushDenormals();
+        // ...AND the de-zipper, which is a recursive one-pole of its own and was not flushed at all.
+        // Hardening the two envelope followers is not enough: `norm` reaches `gainSm_` through
+        // `std::clamp(NaN)` = NaN and `dbToGain(NaN)`, and from there `m = mix*(gainSm_-1)` multiplies
+        // EVERY channel — so one poisoned sample in ONE channel took the whole buffer down for good.
+        // Measured before this line existed: 100764 of 102400 output samples non-finite in the
+        // *innocent* channel, the last block 512 of 512, with the follower flushes already in place.
+        // NEUTRAL HERE IS ONE, NOT ZERO. `core::flushPoison` would set unity gain to 0, and
+        // `m = mix*(0-1)` is silence at full mix — the same value `reset()` writes is the only answer
+        // that means "do nothing", which is what a cleared de-zipper has to mean.
+        if (! std::isfinite (gainSm_)) gainSm_ = 1.0f;
     }
 
 private:
