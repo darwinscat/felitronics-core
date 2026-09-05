@@ -5,6 +5,31 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.27.0 — a pack carries its own two levels, and normalizing is the default (`rigplayer`, `nam`)
+
+- **feat(rigplayer):** a pack states **how hard it is fed and how loud it leaves** — namz 4.1.0's
+  `chain[].input_db` and `chain[].output_db`, applied by the player and by nothing else. Packs are not
+  balanced against each other (a Big Muff leaves some 12 dB louder than a clean preamp, and a boost is
+  hotter still than the preamp it feeds) while inside a pack the models sit within ±0.4 dB of one
+  another, so the level that differs belongs to the DEVICE. Until now the only place to put it was
+  `files[].input_db`, spread across every entry, which made one key mean two things at once.
+  - The input level goes **first, ahead of the dry copy**, and deliberately NOT into `chainGain_` where
+    `extendDb` lives: a blend knob mixes one guitar with itself, and feeding the models less while the
+    dry side is fed as ever turns the mix into two instruments at two volumes. `extendDb` stays where it
+    is — it is a trick played inside the pack past the top capture, which the dry path leaving at the
+    input jack never saw.
+  - The output level goes **last, after the mix**. One number for the whole stage, and applied any
+    earlier it would ride the wet side alone and move the blend the pack states for that position.
+  - Neither is behind `setInputTrims()`, which keeps gating exactly what it always gated:
+    `files[].input_db`, the trim of one alias against its neighbour. `stageInputDb()` /
+    `stageOutputDb()` read back what the player is applying — **a host with a fader of its own must
+    send only its deviation from these**, or the level lands twice.
+- **change(rigplayer):** `setNormalize()` now defaults to **true**. A model's `metadata.loudness` tag is
+  a contract, not a listener's option: with it off, every capture plays at whatever level the hardware
+  happened to give, and no two packs can be compared at all. A host that wants the old behaviour must
+  now ask for it.
+- **build(nam):** namz pinned at **v4.1.0**, which is where the two keys are.
+
 ## v0.26.0 — a tier that stops being aspirational, an external key for the compressor, and six kernels that finally arrive at zero (`build`, `dynamics`, `analysis`, `saturation`, `tools`)
 
 - **feat(build):** the **`wasm-audio` tier is a gate**, not a paragraph. DSP-ARCHITECTURE.md §2 had
