@@ -51,6 +51,16 @@ std::string biasModel(double w, double b) {
     return buf;
 }
 
+// The same gain WITH the loudness tag a real capture ships: the model's own metadata block, where it
+// says how loud it came out of the hardware. The audio still says WHICH model this is; the tag says
+// which one a read-out is looking at.
+std::string taggedGainModel(double w, double loudnessDb) {
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+        R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":1,"bias":false,"implementation":"direct"},"weights":[%.6f],"sample_rate":48000,"metadata":{"loudness":%.6f}})", w, loudnessDb);
+    return buf;
+}
+
 // A NAM that is a pure delay of `d` samples: the window's first tap is the oldest sample and its last
 // the newest, so a weight on the first alone hands back what came in `d` samples ago.
 std::string delayModel(int d) {
@@ -650,6 +660,53 @@ int main() {
         b.p.unload();
         b.load(rig);
         ok(! b.p.normalize(), "the switch is still the host's to throw, and survives a reload");
+    }
+
+    group("the loudness tag answers for the slot that is SOUNDING, not for slot 0");
+    {
+        // Slots are handed out by the PARITY of a capture's place on the dial, so on an odd rung the
+        // whole sound leaves slot 1 while slot 0 holds the silent neighbour. A read-out fixed to slot 0
+        // therefore names a model nobody can hear — and a host that draws "no tag, plays raw" from it
+        // warns about a capture that carries one.
+        //
+        // The three captures are told apart twice over: by the gain that comes out (0.25 / 0.5 / 1.0,
+        // with normalizing off so the models play raw) and by the tag each carries — -33 on the 60
+        // capture, -12 on the 150 one, and none at all on the 240. So the tag is checked against the
+        // audio, not against a variable.
+        const auto tagged = [](const std::string& id) {
+            if (id == "g60")  return bytesOf(taggedGainModel(0.25, -33.0));
+            if (id == "g150") return bytesOf(taggedGainModel(0.5, -12.0));
+            if (id == "g240") return bytesOf(gainModel(1.0));
+            return std::vector<std::byte> {};
+        };
+        Bench b(rig);
+        b.p.setNormalize(false);
+        b.p.load(rig.chain[0], tagged);
+
+        approx(b.gainAt(1000.0), 0.5, 0.01, "at 150 the 0.5 capture sounds: the third knot, an EVEN rung");
+        auto l = b.p.soundingLoudness();
+        ok(l.slot == 0 && l.tagged && ! l.blended, "…so slot 0 is the sound, alone, and carries a tag");
+        approx(l.db, -12.0, 1e-9, "…which is the 150 capture's own");
+
+        b.p.setDial("gain", 60.0);
+        approx(b.gainAt(1000.0), 0.25, 0.01, "at 60 the 0.25 capture sounds: an ODD rung, and slot 1 has all of it");
+        ok(b.p.heldFileId(1) == "g60" && b.p.heldFileId(0) == "g150",
+           "…while slot 0 holds the neighbour it will fade back to, silent");
+        l = b.p.soundingLoudness();
+        ok(l.slot == 1 && l.tagged && ! l.blended, "the read-out follows the sound into slot 1");
+        approx(l.db, -33.0, 1e-9, "…and states the tag of the capture that is sounding, not the silent one's -12");
+
+        b.p.setDial("gain", 200.0);
+        approx(b.gainAt(1000.0), (40.0 / 90.0) * 0.5 + (50.0 / 90.0) * 1.0, 0.015,
+               "at 200 both captures sound, five ninths of the way to the 240");
+        l = b.p.soundingLoudness();
+        ok(l.slot == 1 && ! l.tagged,
+           "the heavier half is the 240 capture, which has NO tag — and that is what a face must warn about");
+        ok(l.blended, "…and it says so: a second, different capture is audible beside it, so this is one tag of two");
+
+        b.p.unload();
+        l = b.p.soundingLoudness();
+        ok(! l.tagged && ! l.blended, "an unloaded player sounds nothing, so it tags nothing");
     }
 
     group("input is drive and output is volume: a model that is not a pure scalar tells them apart");
