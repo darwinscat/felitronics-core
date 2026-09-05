@@ -1028,6 +1028,27 @@ int main()
         }
     }
 
+    // ...AND THE THREE FREQUENCIES THE HEADER'S OWN FIGURES NAME, which nothing measured until now.
+    // That gap is why the header stood for so long saying the ROUND TRIP costs -0.40 / -4.0 / -6.0 dB
+    // at 0.40 / 0.44 / 0.45 fs: those are ONE filter pass. The prototype is applied twice — once
+    // interpolating, once decimating — so the dB double, and the real figures are the ones pinned here.
+    // Two-sided on purpose: an upper budget alone would have accepted the wrong number just as happily.
+    test::group ("Round-trip droop where the header quotes it (two-sided, the doc-defect witness)");
+    {
+        struct Row { int p, q; double expectDb; const char* where; };
+        const Row rows[] { { 2,  5, 0.775,  "0.40 fs (19.2 kHz at 48k)" },
+                           { 11, 25, 8.065, "0.44 fs (21.1 kHz at 48k)" },
+                           { 9, 20, 12.041, "0.45 fs (21.6 kHz at 48k)" } };
+        for (const auto& r : rows)
+        {
+            const auto x = tpw::gridTone (sr, 0.10, r.p, r.q, -20.0, 0.0);
+            std::vector<std::vector<float>> in { x };
+            const auto y = renderAt (in, sr, Setup { -1.0, 50.0, 1.0, 4 }, 0);
+            const double droop = tp::truePeakDbFft (x, 16) - tp::truePeakDbFft (y[0], 16);
+            test::approx (droop, r.expectDb, 0.25, std::string ("round-trip droop at ") + r.where);
+        }
+    }
+
     // ---------------------------------------------------------------- the hole, pinned as a hole
     // A block larger than maxBlock is REJECTED, and rejection means the audio is returned untouched —
     // so an oversized block is delivered UNLIMITED, silently. The existing suite asserts only that this

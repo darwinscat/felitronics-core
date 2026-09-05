@@ -236,5 +236,62 @@ int main()
         test::ok (z[8191] == 0.0f, "after 4096+ zero samples the channel blanks to digital black (no rail latch)");
     }
 
+    // A LARGE FINITE SAMPLE REACHES THE QUANTISER, and the conversion has to be bounded BEFORE it, not
+    // after. Non-finite input is zeroed at the top of process(), but nothing here clamps MAGNITUDE, so
+    // a stage upstream running without a limiter (a bypassed one plus a makeup gain) delivers this. At
+    // 24 bits the scale is 8388608, so |v| past ~1.1e12 used to overflow int64 in
+    // `(int64) floor (v * scale + 0.5)` — undefined, and the clamp that was supposed to catch it ran on
+    // the RESULT.
+    // WHERE THIS CHECK ACTUALLY BITES, because it is not the same everywhere and a reader verifying it
+    // by reverting the fix deserves to know: on arm64 the conversion SATURATES, so the old code reached
+    // the right answer by accident and the value checks below stay green. On x86-64 it yields the
+    // "integer indefinite" INT64_MIN, which the old clamp then pinned to minCode_ — a full-scale
+    // NEGATIVE sample out of a positive input, which is what the sign check catches. The gate that
+    // holds on every row is the ASan+UBSan configuration: reverting the fix and running this suite under
+    // it aborts with "3.2768e+34 is outside the range of representable values of type 'long long'"
+    // (measured), because -fno-sanitize-recover=all makes UB a hard failure rather than a wrong number.
+    {
+        test::group ("Out-of-range input cannot reach the float->integer conversion");
+        for (int bits : { 16, 24 })
+        {
+            dither::Dither d;
+            d.prepare (48000.0, 512, 1);
+            dither::DitherParams p; p.bits = bits; p.shaping = dither::NoiseShaping::None; p.autoBlank = false;
+            d.setParams (p);
+
+            const float huge[] = { 1.0e13f, -1.0e13f, 1.0e30f, -1.0e30f, 3.0e38f, -3.0e38f, 1.0f, -1.0f };
+            std::vector<float> y (huge, huge + 8);
+            float* io[1] { y.data() };
+            d.process (io, 1, 8);
+
+            const double ceiling = 1.0;
+            bool bounded = true, finite = true;
+            for (float v : y) { finite &= (bool) std::isfinite (v); bounded &= (std::fabs ((double) v) <= ceiling); }
+            test::ok (finite,  std::to_string (bits) + "-bit: an absurd finite input stays finite");
+            test::ok (bounded, std::to_string (bits) + "-bit: ...and is clamped into the PCM range, not wrapped");
+            test::ok (y[0] > 0.0f && y[1] < 0.0f, std::to_string (bits) + "-bit: ...keeping its sign (a wrapped code would not)");
+        }
+
+        // ...and the fix is bit-transparent for everything inside the range: a normal render must be
+        // untouched by it, which is what makes the clamp a guard rather than a behaviour change.
+        dither::Dither a, b;
+        a.prepare (48000.0, 512, 2); b.prepare (48000.0, 512, 2);
+        dither::DitherParams p; p.bits = 24; a.setParams (p); b.setParams (p);
+        std::vector<float> l (4096), r (4096), l2, r2;
+        for (int i = 0; i < 4096; ++i)
+        {
+            l[(std::size_t) i] = 0.61f * (float) std::sin (2.0 * 3.14159265358979323846 * 997.0 * i / 48000.0);
+            r[(std::size_t) i] = -0.49f * l[(std::size_t) i];
+        }
+        l2 = l; r2 = r;
+        float* pa[2] { l.data(), r.data() };
+        float* pb[2] { l2.data(), r2.data() };
+        a.process (pa, 2, 4096);
+        for (int o = 0; o < 4096; o += 512) { float* io[2] { l2.data() + o, r2.data() + o }; b.process (io, 2, 512); }
+        bool same = true;
+        for (int i = 0; i < 4096; ++i) same &= (l[(std::size_t) i] == l2[(std::size_t) i]) && (r[(std::size_t) i] == r2[(std::size_t) i]);
+        test::ok (same, "in-range material is unaffected by the bound (and still block-independent)");
+    }
+
     return test::report();
 }

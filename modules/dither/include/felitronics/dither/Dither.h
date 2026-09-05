@@ -111,8 +111,18 @@ public:
                 const double d = tpdf (st) * lsb_;          // ±1 LSB triangular
                 const double v = u + d;
 
-                std::int64_t code = (std::int64_t) std::floor (v * scale_ + 0.5);   // mid-tread round-half-up
-                code = std::clamp (code, minCode_, maxCode_);
+                // CLAMP IN THE DOUBLE DOMAIN, BEFORE THE CONVERSION. The clamp used to come after it,
+                // which is too late: a floating-to-integer conversion whose value is outside the target
+                // range is undefined, and `v` is only bounded by what the caller sent. Non-finite input
+                // is already zeroed above, but a large FINITE one is not — nothing here clamps
+                // magnitude — so a stage upstream running without a limiter (a bypassed one, plus a
+                // makeup gain) reaches it: at 24 bits `scale_` is 8388608, so any |v| past ~1.1e12
+                // overflows int64 before the old clamp could act. Bit-identical inside the code range,
+                // where the bounds are exactly representable in double and the branch is not taken.
+                const double scaled = std::floor (v * scale_ + 0.5);   // mid-tread round-half-up
+                const std::int64_t code = scaled <= (double) minCode_ ? minCode_
+                                        : scaled >= (double) maxCode_ ? maxCode_
+                                                                      : (std::int64_t) scaled;
                 const double y = (double) code * lsb_;
 
                 double eLsb = (y - u) * scale_;             // TOTAL added noise d+q (LSB units) → shapes the dither too
