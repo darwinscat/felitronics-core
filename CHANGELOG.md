@@ -5,6 +5,69 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.26.0 — a tier that stops being aspirational, an external key for the compressor, and six kernels that finally arrive at zero (`build`, `dynamics`, `analysis`, `saturation`, `tools`)
+
+- **feat(build):** the **`wasm-audio` tier is a gate**, not a paragraph. DSP-ARCHITECTURE.md §2 had
+  named it since it was written and always marked it aspirational. There is now a `wasm-audio` CMake
+  preset and a CI job that builds every default module for wasm32 with exceptions and RTTI off and no
+  pthreads, runs the whole suite in node, and audits every emitted artifact — green under a checked
+  `SAFE_HEAP` configuration too. What it does and does not prove is written down in
+  `docs/WASM-AUDIO-TIER.md`: a thread is not a build error, and law 8 is not covered by it.
+- **fix(core):** the one `throw` that closed the exception-free tier. `core/Fft.h`'s
+  `SeamAllocator::allocate` held the only `throw` in the shipped core, and `-fno-exceptions` makes a
+  `throw` a hard PARSE error — so the tier the ADR promises could not be built at all. Guarded the way
+  libc++ guards `__throw_bad_array_new_length`: throw where exceptions exist, `std::abort()` where they
+  do not.
+- **feat(dynamics):** an **external key for the compressor**. On a mastering bus the kick and the bass
+  decide the gain reduction of the whole mix — defect number one of the ffmpeg chain this core
+  replaces, and it would have been reproduced exactly, because the ADR rightly forbids putting an EQ
+  inside the compressor. So the EQ does not come in: the input goes out. Eleven ways the module could
+  not be trusted with a key are closed with it.
+- **fix(dynamics):** the limiter's promise matches its measurement — **twenty** contract defects, against
+  the six the task named. The worst was on no list: only the channels passed to `process()` advanced
+  their state, so a channel-count change mid-stream went **+19.8 dB** over the ceiling. Topology moved
+  to `prepare()`, input gated, oversized blocks chunked, floors stated.
+- **fix:** **law 8, finished** — six kernels that never actually arrived at zero, not the three the
+  earlier pass left open, and the entry recorded as harmless was the most expensive of them. Stated
+  properly the mechanism is not "denormals": `x <- t + r*(x-t)` never ARRIVES, because a residual of
+  `k` ulps maps to itself for every `k <= 0.5/(1-r)`, so the decay stops dead while the state is still
+  finite and keeps feeding whatever is downstream.
+- **fix(analysis,multiband):** silence stops costing **54x** more than music. `KWeightingFilter` was the
+  last kernel in core+analysis+oversampling with no software denormal flush; on zero input its two
+  TDF-II biquads reach a subnormal pair that maps to itself exactly and freeze there — measured out to
+  600 s. On a CPU with no hardware FTZ, which is exactly what a browser gives, that is what silence
+  then costs.
+- **fix(analysis):** one bad sample stops making the loudness meter **lie quietly**. K-weighting is an
+  IIR, so a single NaN made its state NaN forever, every later 400 ms block energy NaN, and
+  `NaN > absT` false — so the absolute gate silently dropped all of them and the meter averaged only
+  the part that predated the NaN, reporting a healthy, plausible number for a programme it had stopped
+  measuring.
+- **feat(analysis):** the **pre-gate block energies**, for a comparison that cannot jump. Integrated
+  LUFS is discontinuous in its own inputs — BS.1770's gates are strict comparisons, so a block within
+  ~1e-12 of a threshold flips inclusion between two builds and moves the reading by ~0.01 dB. No
+  scalar tolerance on a gated quantity is a robust equivalence measure; the energies before either
+  gate are continuous in the input samples, and cross-toolchain work needs that surface.
+- **test(analysis,tools):** true-peak gets its **first external judge**. Both paths had been tested only
+  against their own documented behaviour; EBU Tech 3341 §2.6 defines an acceptance envelope nobody here
+  wrote, and it is now applied — tests 15-23 of the official EBU Loudness Test Set v05 pass on both
+  implementations.
+- **fix(build):** **law 10** — say what FP contraction we want instead of inheriting three answers. The
+  arm64 Linux CI row went red on its first run on untouched `main`, which is what it was added for:
+  `a*b + c` may fuse into one FMA with a single rounding, and the toolchains disagree about when.
+  `-ffp-contract=on` is stated; it costs the shipping tier nothing, because it is already clang's
+  default.
+- **test(saturation):** a noise floor the build **measures for itself**, and the DC blocker's pole and
+  numerator, neither of which was tested anywhere. The poison-containment floor had been a constant
+  fitted twice to whichever toolchain last went red; below it the assertion has no defined answer,
+  because the state residual is a random walk with an absorbing zero. It is now a control run — every
+  input sample moved one ulp — because a real build's own noise floor reads 20 ulp = 1.19e-06, above
+  the constant the line used to carry. Mutation testing then showed the corner frequency could be
+  hardcoded and the numerator's zero moved without a single one of 197 checks noticing; both are
+  asserted directly now, two-sided.
+- **feat(tools):** `fcore::Probe` — one measurement body for the native reference and for wasm — plus
+  the C ABI, build recipe, parity harness and page behind it, and an artifact audit that proves
+  no-threads from the binary and keeps the two JS sides from drifting.
+
 ## v0.25.0 — a knob that clicks states its filter, and NAM is pinned to a release (`rigplayer`, `nam`)
 
 - **feat(rigplayer):** a switch shipping its bands **per position**. namz 4.0.0 gave the format
