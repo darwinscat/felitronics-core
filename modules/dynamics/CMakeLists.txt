@@ -28,6 +28,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamics_sidechain_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_sidechain_tests COMMAND felitronics_dynamics_sidechain_tests)
 
+    # P3: the offline detector-domain analysis and the threshold solver. Links only dynamics — the
+    # acceptance runs the REAL Compressor and sorts its gain-reduction tap, so the second instrument
+    # verifying the search is in the same module rather than a dependency.
+    add_executable(felitronics_dynamics_detector_analysis_tests tests/DetectorAnalysisTests.cpp)
+    target_link_libraries(felitronics_dynamics_detector_analysis_tests PRIVATE felitronics::dynamics)
+    target_include_directories(felitronics_dynamics_detector_analysis_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_detector_analysis_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_detector_analysis_tests COMMAND felitronics_dynamics_detector_analysis_tests)
+
     add_executable(felitronics_dynamics_transient_tests tests/TransientShaperTests.cpp)
     target_link_libraries(felitronics_dynamics_transient_tests PRIVATE felitronics::dynamics)
     target_include_directories(felitronics_dynamics_transient_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
