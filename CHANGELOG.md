@@ -5,6 +5,30 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.28.0 — the host states the whole number, and the player does the subtracting (`rigplayer`)
+
+- **feat(rigplayer):** `setHostInputDb()` / `setHostOutputDb()` — a host with a fader of its own now
+  states the WHOLE level it wants a device played at, and the player uses it in place of the pack's
+  `chain[].input_db` / `chain[].output_db`. `std::nullopt` (the default) hands the level back to the
+  pack, so a plugin that only plays packs is unaffected and needs no call.
+  - v0.27.0 left the arithmetic with the host: it sent `hand − what the pack says`, applied outside
+    the player. That cannot be made correct. The subtraction has to know which pack is loaded at the
+    moment it happens, and a host reads that from its own document — which diverges from the loaded
+    pack whenever somebody edits it, a rebuild is in flight, or a device is switched mid-build. Each
+    of those left the level silently wrong, in the same class as the double application the two keys
+    were added to end. The player is the only place that cannot disagree with itself about which pack
+    it holds. `hostInputDb()` / `hostOutputDb()` read the hand back.
+  - The hand survives a `load()`: it belongs to the bench, not to the pack.
+- **fix(rigplayer):** a pack swap no longer publishes unity levels in the middle of itself. `load()`
+  called `unload()`, which resets both gains, and republished the real ones only at the end — a
+  callback landing in between heard neither pack's level. The stage's levels are now published as
+  soon as the stage is known, and one function decides what is applied.
+- **test(rigplayer):** a fixture that is not a pure scalar. Every model in these tests was a linear
+  gain, and through a pure gain the two levels are indistinguishable — moving where the player applies
+  them would have failed nothing. A Linear NAM WITH BIAS adds an offset that input scaling leaves
+  alone and output scaling takes down, so the release's central claim (input is drive, output is
+  volume) is now something a swap would break.
+
 ## v0.27.0 — a pack carries its own two levels, and normalizing is the default (`rigplayer`, `nam`)
 
 - **feat(rigplayer):** a pack states **how hard it is fed and how loud it leaves** — namz 4.1.0's
