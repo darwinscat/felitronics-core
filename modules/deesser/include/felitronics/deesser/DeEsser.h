@@ -88,7 +88,13 @@ public:
             float sc[core::kMaxChannels]; float linked = 0.0f, sq = 0.0f;
             for (int c = 0; c < nc; ++c)
             {
-                sc[c] = side_.processSample (c, io[c][i]);
+                // GATED ON THE FILTER'S INPUT, not on its output. The filter is recursive, so a
+                // poisoned sample reaching it is permanent — and a gate placed AFTER it would read
+                // the resulting NaN as silence, turning "noise for ever" into "silence for ever"
+                // rather than fixing anything. Measured: gate-after diverges from a sanitised
+                // reference by 1222..5533 samples and 0.2..171 dB depending on the caller's block
+                // size; gate-before diverges by zero, at every block size.
+                sc[c] = side_.processSample (c, dynamics::detectorGate (io[c][i]));
                 const float a = std::fabs (sc[c]);
                 if (link_ == dynamics::LinkMode::Max) { if (a > linked) linked = a; } else sq += sc[c] * sc[c];
             }

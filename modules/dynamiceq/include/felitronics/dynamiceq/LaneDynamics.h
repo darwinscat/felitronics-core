@@ -5,6 +5,7 @@
 
 #include <felitronics/eq/EqBand.h>
 #include <felitronics/eq/Svf.h>
+#include <felitronics/dynamics/ChannelLinker.h>   // detectorGate — the sidechain path is gated
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainComputer.h>
 #include <felitronics/dynamics/GainReductionFollower.h>
@@ -281,11 +282,11 @@ private:
                 if (l == eq::Lane::Stereo)
                 {
                     for (int c = 0; c < nc; ++c)
-                        e = std::fmax (e, std::fabs (s.probe.processSample (c, sc[c][k])));
+                        e = std::fmax (e, std::fabs (s.probe.processSample (c, dynamics::detectorGate (sc[c][k]))));
                 }
                 else
                 {
-                    const float x = laneSignal (l, sc, nc, k);
+                    const float x = laneSignal (l, sc, nc, k);      // already gated, see laneSignal
                     e = std::fabs (s.probe.processSample (0, x));
                 }
                 const float linked = s.env.process (e);
@@ -342,10 +343,13 @@ private:
         return l == eq::Lane::Stereo || nc == 2;      // L/R/M/S are stereo-only, as in EqBand
     }
 
+    // GATED HERE, BEFORE THE ARITHMETIC, and that ordering is the point: the mid/side lanes SUBTRACT,
+    // and `0.5f * (Inf - Inf)` is a NaN that no later gate can tell from a legitimate zero. Gating the
+    // raw channels first means every lane below is a bounded combination of bounded numbers.
     static float laneSignal (eq::Lane l, const float* const* sc, int nc, int k) noexcept
     {
-        const float L = sc[0][k];
-        const float R = nc > 1 ? sc[1][k] : L;
+        const float L = dynamics::detectorGate (sc[0][k]);
+        const float R = nc > 1 ? dynamics::detectorGate (sc[1][k]) : L;
         switch (l)
         {
             case eq::Lane::Left:   return L;
