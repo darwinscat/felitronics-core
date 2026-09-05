@@ -31,7 +31,7 @@ Signal order, per block:
 | `RigPlayer::run(job)` | ANY thread but the audio one — a pool, a worker, or right here |
 | `deliver(loaded)` | message — strictly; it installs into the stages |
 | `process(io, channels, n)` | audio — allocates nothing, locks nothing, touches no file |
-| every read-out (`liveMix`, `heldFileId`, `selection`, `knobValue`, the drawing readers…) | message |
+| every read-out (`liveMix`, `heldFileId`, `soundingLoudness`, `selection`, `knobValue`, the drawing readers…) | message |
 
 **Loading is a job the host runs.** `service()` never loads. When the law wants a model,
 `takeLoadJob()` hands out ONE job at a time — slot, `files[].id`, the bytes if already fetched, the
@@ -104,6 +104,24 @@ here. `hostInputDb()` / `hostOutputDb()` read the hand back.
 
 `setInputTrims(false)` switches off exactly one thing: `files[].input_db`, the trim of one alias
 against its neighbour. It has never reached the pack's own levels and does not reach them now.
+
+**The tag of what is SOUNDING, and the slot trap it exists to close.** `soundingLoudness()` returns
+the `metadata.loudness` of the capture the sound is actually leaving by — `db` and `tagged` — never of
+whichever model happens to sit in slot 0. Slots go by the PARITY of a capture's place on the dial, so
+on an odd rung the whole sound comes out of slot 1 while slot 0 holds the silent neighbour; a face
+that read slot 0 named a model nobody could hear, or warned "plays raw" about a capture that carries
+a tag.
+
+**During a crossfade there is no single honest number, and this does not invent one.** Two captures
+are in the sound with two tags: `db`/`tagged` are the heavier slot's — the one carrying most of the
+sound, `slot` says which that is — and `blended` says the other slot holds a DIFFERENT capture and is
+audible beside it. So a face can say "one of two", or drop the number entirely while `blended` is
+true, instead of stating a level the sound has not got. At the ends of the dial both slots hold the
+same capture and `blended` is false however the weight sits. The weight it reads is the APPLIED one
+(`liveMix()`), not the requested one: while a model is still loading or warming, the slot that IS the
+sound is the old one. `tagged` is false both for a model without a tag and for a slot with no model
+at all — `heldFileId(slot)` tells those two apart. It describes the MODEL mix alone: a blend knob at
+its dry end takes every model out of the sound and says nothing here.
 
 `setNormalize()` defaults to **true**. A model's `metadata.loudness` tag is a contract, not a
 listener's option: with it off, every capture plays at whatever level the hardware happened to give,

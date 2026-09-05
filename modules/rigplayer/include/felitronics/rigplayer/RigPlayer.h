@@ -517,10 +517,40 @@ public:
         return id == 0 || id > models_.size() ? std::string() : models_[(std::size_t) id - 1].id;
     }
     int appliedSlotDelay(int slot) const { return slotDelay_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
-    // The loudness tag of what slot 0 holds — during a crossfade each model carries its own, and slot
-    // 0 is the one a panel names. Message thread.
-    double modelLoudness()   const { return nam_[0].modelLoudness(); }
-    bool   modelHasLoudness() const { return nam_[0].modelHasLoudness(); }
+    // THE LOUDNESS TAG OF WHAT IS SOUNDING — of the slot the sound actually leaves by, which is not
+    // always slot 0. Slots are handed out by the PARITY of a capture's place on the dial (slotPlan,
+    // RigSelection.h), so on an odd rung the whole sound comes out of slot 1 while slot 0 holds the
+    // silent neighbour: a face that read slot 0 named the wrong capture, or warned "plays raw" about a
+    // model that carries a tag.
+    //
+    // DURING A CROSSFADE THERE IS NO SINGLE HONEST NUMBER, and this does not invent one. `db` and
+    // `tagged` are the slot carrying MOST of the sound, and `blended` says the other slot holds a
+    // DIFFERENT capture and is audible beside it — so a face can say "one of two" instead of stating a
+    // level the sound has not got. At the ends of the dial both slots hold the same capture, and there
+    // `blended` is false however the weight sits.
+    //
+    // The weight is the APPLIED one (liveMix()), not the one asked for: while a model is still loading
+    // or warming the slot that IS the sound is the old one, and its tag is what a face should show.
+    // `tagged` is false both for a model without a tag and for a slot with no model at all —
+    // heldFileId(slot) tells those two apart. This is the model mix alone: a blend knob at its dry end
+    // takes every model out of the sound and says nothing here. Message thread.
+    struct SoundingLoudness {
+        double db      = 0.0;      // the tag of the slot carrying most of the sound, in dB
+        bool   tagged  = false;    // …and whether that slot carries one at all
+        bool   blended = false;    // …and whether a second, different capture is audible beside it
+        int    slot    = 0;        // which slot that was
+    };
+    SoundingLoudness soundingLoudness() const {
+        // unload() empties both stages at once while the audio thread clears its own numbers a block
+        // later: with no pack there is nothing sounding to carry a tag.
+        if (! loaded_) return {};
+        const float mix = liveMix_.load(std::memory_order_acquire);
+        const auto  h0  = held_[0].load(std::memory_order_relaxed);
+        const auto  h1  = held_[1].load(std::memory_order_relaxed);
+        const int   s   = mix > 0.5f ? 1 : 0;
+        return { nam_[s].modelLoudness(), nam_[s].modelHasLoudness(),
+                 mix > 0.0f && mix < 1.0f && h0 != 0 && h1 != 0 && h0 != h1, s };
+    }
     // Instrumentation, for a bench's dump: blocks in which a slot was still warming, weight moves of
     // more than 2 % inside one block and the biggest of them — a whole swing inside one block is a step
     // in all but name. Counted since the last clearCounters().
