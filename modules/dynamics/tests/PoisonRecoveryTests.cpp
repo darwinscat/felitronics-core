@@ -33,6 +33,10 @@
 
 #include <felitronics/dynamics/EnvelopeFollower.h>
 #include <felitronics/dynamics/GainReductionFollower.h>
+#include <felitronics/dynamics/TransientShaper.h>
+#include <felitronics/dynamics/AutoLeveler.h>
+#include <felitronics/deesser/DeEsser.h>
+#include <felitronics/dynamiceq/DynamicEqBand.h>
 #include <felitronics/eq/Svf.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/core/Math.h>
@@ -47,6 +51,12 @@ using namespace felitronics;
 static constexpr double kFs = 48000.0;
 static const float kInf = std::numeric_limits<float>::infinity();
 static const float kNan = std::numeric_limits<float>::quiet_NaN();
+
+// THE POISON SET, and -Inf is in it deliberately. A guard written as "NaN or +Inf" reads as complete
+// and is not; a suite that feeds only those two blesses it. `std::isfinite` covers all three, so the
+// cost of checking is nothing and the cost of NOT checking is a whole class of input.
+struct Poison { const char* name; float value; };
+static const Poison kPoisons[] = { { "+Inf", kInf }, { "-Inf", -kInf }, { "NaN", kNan } };
 
 static float toneAt (int i, double f = 7000.0, double amp = 0.5)
 {
@@ -80,10 +90,9 @@ static void poisonIsPermanentWithoutTheFlush()
 
     // The flush is the owner's call, so "not calling it" is the honest way to show what the state
     // does on its own — and it is also the shape of every consumer that forgets to.
-    for (int kind = 0; kind < 2; ++kind)
+    for (const auto& p : kPoisons)
     {
-        const float bad = (kind == 0) ? kInf : kNan;
-        const char* nm = (kind == 0) ? "+Inf" : "NaN";
+        const float bad = p.value; const char* nm = p.name;
         {
             eq::Svf f; f.prepare (kFs, 2); f.setParams (eq::FilterType::BandPass, 7000.0, 2.0, 0.0);
             int nonFinite = 0;
@@ -130,10 +139,9 @@ static void theFlushRecoversAndIsExactlyAReset()
 {
     test::group ("recovery: the flush clears the poison, and what it leaves is reset()");
 
-    for (int kind = 0; kind < 2; ++kind)
+    for (const auto& p : kPoisons)
     {
-        const float bad = (kind == 0) ? kInf : kNan;
-        const char* nm = (kind == 0) ? "+Inf" : "NaN";
+        const float bad = p.value; const char* nm = p.name;
 
         // Svf: charge, poison, flush at the block edge, then a healthy block must be finite AND alive.
         {
@@ -197,7 +205,9 @@ static void theFlushRecoversAndIsExactlyAReset()
         int diff = 0;
         for (int i = 0; i < 3000; ++i)
         {
-            a.processSample (0, (i == 500) ? kInf : toneAt (i));       // poisoned channel
+            a.processSample (0, (i == 500) ? -kInf : toneAt (i));      // poisoned channel (-Inf: the
+                                                                      // value a "NaN or +Inf" guard
+                                                                      // would step straight over)
             b.processSample (0, toneAt (i));
             const float ya = a.processSample (1, toneAt (i, 300.0));   // the innocent neighbour
             const float yb = b.processSample (1, toneAt (i, 300.0));
@@ -296,10 +306,25 @@ static void theFollowersKeepTheirOwnThresholds()
         test::approx ((double) env, (double) quiet, (double) quiet * 0.05,
                       "and it tracks the input, rather than being zapped to silence by a 1e-15 power floor");
     }
+    // The band between the two thresholds was unpinned: a mutation moving 1e-30 to 1e-20 survived the
+    // whole tree, because nothing tracked a signal quiet enough to tell them apart. -230 dBFS is a
+    // power of 1e-23, inside that band and still above `core::gainToDb`'s own floor.
+    {
+        const float veryQuiet = (float) core::dbToGain (-230.0);
+        dynamics::EnvelopeFollower f;
+        f.prepare (kFs); f.setDetector (dynamics::Detector::Rms); f.setTimes (5.0, 5.0);
+        float env = 0.0f;
+        for (int blk = 0; blk < 40; ++blk) { for (int i = 0; i < 256; ++i) env = f.process (veryQuiet); f.flushDenormals(); }
+        test::approx ((double) env, (double) veryQuiet, (double) veryQuiet * 0.05,
+                      "a -230 dBFS input is still tracked after 40 flushes — the threshold is 1e-30 of "
+                      "POWER, and anything coarser silently swallows this band");
+    }
+
     // ...and the poison half does work, in both detector modes.
     for (auto det : { dynamics::Detector::Peak, dynamics::Detector::Rms })
-     for (float bad : { kInf, kNan })
+     for (const auto& p : kPoisons)
      {
+         const float bad = p.value;
          dynamics::EnvelopeFollower f;
          f.prepare (kFs); f.setDetector (det); f.setTimes (5.0, 50.0);
          for (int i = 0; i < 100; ++i) f.process (0.4f);
@@ -314,8 +339,9 @@ static void theFollowersKeepTheirOwnThresholds()
      }
 
     test::group ("GainReductionFollower — the same, for the ballistics on the gain");
-    for (float bad : { kInf, kNan })
+    for (const auto& p : kPoisons)
     {
+        const float bad = p.value;
         dynamics::GainReductionFollower g;
         g.prepare (kFs); g.setTimes (5.0, 50.0);
         for (int i = 0; i < 100; ++i) g.process (-6.0f);
@@ -337,6 +363,298 @@ static void theFollowersKeepTheirOwnThresholds()
     }
 }
 
+
+//==============================================================================
+// PARTIAL poisoning: the case a direct Inf or NaN cannot reach, because it takes both state words at
+// once. A finite input that OVERFLOWS on the way leaves one word non-finite and the other a large
+// finite number, and a per-word flush then "heals" the filter into something that is not a reset
+// filter at all — it carries the survivor forward and re-poisons itself from it. Measured on the
+// biquad before the fix: two samples of SILENCE after the flush it emitted -3.27e38, then -Inf.
+static void partialPoisoningIsHealedAtomically()
+{
+    test::group ("partial poisoning — the two state words are ONE state");
+
+    // Reachable, and shown to be reachable rather than assumed: a finite 1e37 sine at Q 40.
+    {
+        eq::Biquad f; f.setCoeffs (lowpass (2000.0, 40.0));
+        int partialAt = -1;
+        for (int i = 0; i < 4000 && partialAt < 0; ++i)
+        {
+            f.processSample ((float) (1.0e37 * std::sin (2.0 * core::kPi * 2000.0 * i / kFs)));
+            if (std::isfinite (f.z1) != std::isfinite (f.z2)) partialAt = i;
+        }
+        test::ok (partialAt > 0, "a FINITE input does leave one word non-finite and the other finite (sample "
+                  + std::to_string (partialAt) + ")");
+
+        f.flushDenormals();
+        eq::Biquad fresh; fresh.setCoeffs (lowpass (2000.0, 40.0));
+        int diff = 0;
+        for (int k = 0; k < 64; ++k)
+        {
+            const float a = f.processSample (0.0f), b = fresh.processSample (0.0f);
+            if (std::memcmp (&a, &b, 4) != 0) ++diff;
+        }
+        test::ok (diff == 0, "and after the flush it is bit-for-bit a reset filter over the next 64 samples of silence");
+    }
+
+    // The same shape for the Svf, asked of the output because the state is private — and asserting
+    // BOTH halves, because the atomic branch has to fire when it should and not when it should not.
+    // The same 1e37 drive overflows at Q 40 and does not at Q 8 (measured: 3852 non-finite outputs
+    // against none), so the two Q values pin the two directions. A test that demanded "reset" of both
+    // would be demanding that a healthy filter throw its history away.
+    for (double q : { 8.0, 40.0 })
+    {
+        eq::Svf f, fresh;
+        f.prepare (kFs, 2); fresh.prepare (kFs, 2);
+        f.setParams (eq::FilterType::BandPass, 7000.0, q, 0.0);
+        fresh.setParams (eq::FilterType::BandPass, 7000.0, q, 0.0);
+        bool wentBad = false;
+        for (int i = 0; i < 4000; ++i)
+            if (! std::isfinite (f.processSample (0, (float) (1.0e37 * std::sin (2.0 * core::kPi * 7000.0 * i / kFs)))))
+                wentBad = true;
+        f.flushDenormals();
+        int diff = 0;
+        for (int k = 0; k < 64; ++k)
+        {
+            const float a = f.processSample (0, 0.0f), b = fresh.processSample (0, 0.0f);
+            if (std::memcmp (&a, &b, 4) != 0) ++diff;
+        }
+        const std::string at = "Svf at Q " + std::to_string ((int) q);
+        if (wentBad)
+        {
+            test::ok (q > 20.0, at + ": a finite 1e37 drive DOES overflow it here");
+            test::ok (diff == 0, at + ": overflowed, then flushed, is bit-for-bit a reset filter");
+        }
+        else
+        {
+            test::ok (q < 20.0, at + ": the same drive leaves it finite here");
+            test::ok (diff > 0, at + ": a HEALTHY filter keeps its history — the flush must not reset it");
+        }
+    }
+
+    // A CONSTANT drive is what actually splits the Svf's pair — a swept sine does not, which is how a
+    // 25920-point sweep of sines and squares concluded, wrongly, that the case was unreachable here.
+    // fc 100 Hz at Q 2, 162 samples of 3e38: with the pair cleared word by word the next output on
+    // SILENCE is 1.05e36; cleared atomically it is zero.
+    {
+        eq::Svf f, fresh;
+        f.prepare (kFs, 2); fresh.prepare (kFs, 2);
+        f.setParams (eq::FilterType::LowPass, 100.0, 2.0, 0.0);
+        fresh.setParams (eq::FilterType::LowPass, 100.0, 2.0, 0.0);
+        for (int i = 0; i < 162; ++i) f.processSample (0, 3.0e38f);
+        f.flushDenormals();
+        int diff = 0;
+        for (int k = 0; k < 64; ++k)
+        {
+            const float a = f.processSample (0, 0.0f), b = fresh.processSample (0, 0.0f);
+            if (std::memcmp (&a, &b, 4) != 0) ++diff;
+        }
+        test::ok (diff == 0, "Svf, constant 3e38 at fc 100 / Q 2: the pair is cleared atomically, so the "
+                             "flushed filter is bit-for-bit a reset one");
+    }
+
+    // EVERY channel recovers, and it is checked for EVERY channel. A guard applied to channel 0 alone
+    // — or a loop stopping one short — survives any test that poisons only channel 0 and treats the
+    // rest as innocent bystanders, which is what the neighbour check above does by design.
+    for (int c = 0; c < core::kMaxChannels; ++c)
+    {
+        eq::Svf f, fresh;
+        f.prepare (kFs, core::kMaxChannels); fresh.prepare (kFs, core::kMaxChannels);
+        f.setParams (eq::FilterType::LowPass, 3000.0, 0.707, 0.0);
+        fresh.setParams (eq::FilterType::LowPass, 3000.0, 0.707, 0.0);
+        for (int i = 0; i < 256; ++i) f.processSample (c, toneAt (i));
+        f.processSample (c, kInf);
+        f.flushDenormals();
+        int diff = 0;
+        for (int i = 0; i < 200; ++i)
+        {
+            const float a = f.processSample (c, toneAt (i));
+            const float b = fresh.processSample (c, toneAt (i));
+            if (std::memcmp (&a, &b, 4) != 0) ++diff;
+        }
+        test::ok (diff == 0, "channel " + std::to_string (c) + " recovers to a reset filter");
+    }
+}
+
+//==============================================================================
+// A finite input can poison a follower without going anywhere near 1e38, because the Rms state is a
+// SQUARE: 1e20 * 1e20 overflows in float. Worth its own check, because the natural way to describe
+// the bit-exactness claim — "only inputs above 1e38 differ" — is wrong for exactly this reason.
+static void aFiniteInputCanPoisonThroughTheSquare()
+{
+    test::group ("the square is a poisoning route of its own — 1e20, not 1e38");
+
+    dynamics::EnvelopeFollower f;
+    f.prepare (kFs); f.setDetector (dynamics::Detector::Rms); f.setTimes (5.0, 5.0);
+    for (int i = 0; i < 100; ++i) f.process (0.3f);
+    f.process (1.0e20f);                                     // finite, positive, not alternating
+    test::ok (! std::isfinite (f.envelope()),
+              "a FINITE 1e20 leaves the Rms state non-finite — the square overflowed, not the input");
+    f.flushDenormals();
+    float last = 0.0f;
+    for (int i = 0; i < 2000; ++i) last = f.process (0.3f);
+    test::approx ((double) last, 0.3, 0.01, "and the flush brings it back to tracking the signal");
+
+    // Peak mode does NOT square, so the same input is harmless there — which is the other half of
+    // saying where the route actually is.
+    dynamics::EnvelopeFollower p;
+    p.prepare (kFs); p.setDetector (dynamics::Detector::Peak); p.setTimes (5.0, 5.0);
+    for (int i = 0; i < 100; ++i) p.process (0.3f);
+    p.process (1.0e20f);
+    test::ok (std::isfinite (p.envelope()), "Peak mode does not square, so 1e20 leaves it finite");
+}
+
+
+//==============================================================================
+// THE CONSUMERS, which is where the promise is actually kept or broken. Hardening four primitives
+// does nothing for a product unless the module that owns them calls the flush — and until these
+// checks existed, every one of those calls could be DELETED without a single suite going red.
+// Mutations that survived the whole 18-binary tree: DynamicEqBand dropping `audio_.flushDenormals()`,
+// dropping `side_` and `env_`, DeEsser dropping `xover_.flushDenormals()`, TransientShaper dropping
+// both of its follower flushes. The contract is per module, so the test has to be per module.
+static void theConsumersRecoverWithinOneBlock()
+{
+    test::group ("consumers — one bad sample, and the NEXT block is clean again");
+
+    const double fs = kFs;
+    const int n = 8192, blk = 512;
+    auto tone = [] (int i) { return (float) (0.4 * std::sin (2.0 * core::kPi * 700.0 * i / kFs)); };
+
+    // TransientShaper. Mono, because the stereo Max link would hide the poison — see the note below.
+    for (auto link : { dynamics::LinkMode::Max, dynamics::LinkMode::MeanPower })
+    {
+        std::vector<float> x ((std::size_t) n);
+        for (int i = 0; i < n; ++i) x[(std::size_t) i] = tone (i);
+        x[100] = kNan;
+        dynamics::TransientShaper t; t.prepare (fs, blk, 1);
+        dynamics::TransientShaperParams p; p.attackDb = 6.0; p.sustainDb = -3.0; p.mix = 1.0; p.link = link;
+        t.setParams (p);
+        for (int off = 0; off < n; off += blk) { float* io[1] { x.data() + off }; t.process (io, 1, blk); }
+        int afterFirstBlock = 0; double energy = 0.0;
+        for (int i = blk; i < n; ++i)
+        {
+            if (! std::isfinite (x[(std::size_t) i])) ++afterFirstBlock;
+            else energy += std::fabs ((double) x[(std::size_t) i]);
+        }
+        const std::string nm = std::string ("TransientShaper (")
+                             + (link == dynamics::LinkMode::Max ? "Max" : "MeanPower") + ")";
+        test::ok (afterFirstBlock == 0, nm + ": everything after the poisoned block is finite ("
+                  + std::to_string (afterFirstBlock) + ")");
+        // ...AND THE SIGNAL IS BACK, measured against an unpoisoned run rather than against zero.
+        // Clearing the de-zipper to zero instead of unity does not silence the stream for ever — the
+        // one-pole climbs back over its own smoothing time — so a total-energy check cannot see it.
+        // What it does is punch a hole: measured, the worst sample right after the flush is 0.030 of
+        // the reference against 0.777 with unity. That is 30 dB, and it is what this pins.
+        std::vector<float> ref ((std::size_t) n);
+        for (int i = 0; i < n; ++i) ref[(std::size_t) i] = tone (i);
+        {
+            dynamics::TransientShaper t2; t2.prepare (fs, blk, 1); t2.setParams (p);
+            for (int off = 0; off < n; off += blk) { float* io[1] { ref.data() + off }; t2.process (io, 1, blk); }
+        }
+        double worst = 1.0;
+        for (int i = blk; i < blk + 2048 && i < n; ++i)
+        {
+            const double r = std::fabs ((double) ref[(std::size_t) i]);
+            if (r > 0.05) worst = std::min (worst, std::fabs ((double) x[(std::size_t) i]) / r);
+        }
+        test::ok (worst > 0.5, nm + ": and no 30 dB hole where the de-zipper restarted (worst |y|/|ref| "
+                  + std::to_string (worst) + "; clearing it to zero instead of unity gives 0.030)");
+        test::ok (energy > 0.2 * 0.4 * (n - blk), nm + ": and the audio is there at all");
+    }
+
+    // ...and the reason the mono fixture is not an accident: a stereo Max link DROPS a NaN by
+    // comparison (`NaN > mx` is false), so a stereo fixture would pass while proving nothing. Pinned,
+    // so that nobody later "simplifies" the fixture into a blind one.
+    {
+        std::vector<float> a ((std::size_t) n), b ((std::size_t) n);
+        for (int i = 0; i < n; ++i) a[(std::size_t) i] = b[(std::size_t) i] = tone (i);
+        a[100] = kNan;
+        dynamics::TransientShaper t; t.prepare (fs, blk, 2);
+        dynamics::TransientShaperParams p; p.attackDb = 6.0; p.sustainDb = -3.0; p.link = dynamics::LinkMode::Max;
+        t.setParams (p);
+        for (int off = 0; off < n; off += blk) { float* io[2] { a.data() + off, b.data() + off }; t.process (io, 2, blk); }
+        int bad = 0; for (int i = 0; i < n; ++i) if (! std::isfinite (b[(std::size_t) i])) ++bad;
+        test::ok (bad == 0, "a stereo Max link drops a one-channel NaN by comparison — which is why the "
+                            "fixture above is mono, and this is pinned so it stays that way");
+    }
+
+    // DeEsser — BOTH modes, because they are different signal paths and the default one returns early.
+    // `DynamicEq` delegates to a dynamic-EQ band and never touches `xover_`, so a fixture that only
+    // ran the default would bless a build with the crossover flush deleted. `SplitBand` is where that
+    // crossover lives, in the AUDIO path, where a gate is not allowed and the flush is the only thing
+    // standing between one sample and a permanently dead band.
+    for (auto mode : { deesser::DeEsserMode::DynamicEq, deesser::DeEsserMode::SplitBand })
+    {
+        std::vector<float> x ((std::size_t) n);
+        for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 6500.0 * i / kFs));
+        x[100] = kInf;
+        deesser::DeEsser d; d.prepare (fs, blk, 1);
+        deesser::DeEsserParams dp; dp.mode = mode; d.setParams (dp);
+        for (int off = 0; off < n; off += blk) { float* io[1] { x.data() + off }; d.process (io, 1, blk); }
+        int after = 0; double energy = 0.0;
+        for (int i = blk; i < n; ++i)
+        {
+            if (! std::isfinite (x[(std::size_t) i])) ++after;
+            else energy += std::fabs ((double) x[(std::size_t) i]);
+        }
+        const std::string nm = std::string ("DeEsser ")
+                             + (mode == deesser::DeEsserMode::DynamicEq ? "DynamicEq" : "SplitBand");
+        test::ok (after == 0, nm + ": everything after the poisoned block is finite (" + std::to_string (after) + ")");
+        test::ok (energy > 0.2 * 0.4 * (n - blk), nm + ": and the audio came back");
+        test::ok (std::isfinite (d.gainReductionDb()), nm + ": and the reported gain reduction is a number again");
+    }
+
+    // DynamicEqBand — two filters, one in the sidechain and one in the audio path, and the failure
+    // here is INVISIBLE to a finiteness check. A poisoned detector reaches `std::max(NaN, 1e-9f)`,
+    // which is NaN, and `core::gainToDb` turns that into its floor of -240 dB — a perfectly finite
+    // number. The audio stays clean and the band simply stops responding for ever. So the check is
+    // that the delta still MOVES with the signal, measured against a run that was never poisoned.
+    {
+        auto run = [&] (bool poison)
+        {
+            std::vector<float> x ((std::size_t) n);
+            for (int i = 0; i < n; ++i)
+            {
+                const double amp = (i > n / 2) ? 0.7 : 0.02;          // a quiet half, then a loud one
+                x[(std::size_t) i] = (float) (amp * std::sin (2.0 * core::kPi * 400.0 * i / kFs));
+            }
+            if (poison) x[100] = kInf;
+            dynamiceq::DynamicEqBand e; e.prepare (fs, 1);
+            int after = 0;
+            for (int off = 0; off < n; off += blk)
+            {
+                float* io[1] { x.data() + off }; e.process (io, 1, blk);
+                if (off >= blk) for (int i = 0; i < blk; ++i) if (! std::isfinite (x[(std::size_t) (off + i)])) ++after;
+            }
+            return std::pair<int, double> { after, e.dynamicDeltaDb() };
+        };
+        const auto clean = run (false), dirty = run (true);
+        test::ok (dirty.first == 0, "DynamicEqBand: everything after the poisoned block is finite ("
+                  + std::to_string (dirty.first) + ")");
+        test::approx (dirty.second, clean.second, 0.5,
+                      "and the band is still RESPONDING — its delta matches an unpoisoned run ("
+                      + std::to_string (dirty.second) + " against " + std::to_string (clean.second)
+                      + " dB). A finiteness check cannot see this: a dead detector reads -240 dB, which is finite.");
+    }
+
+    // AutoLeveler fails SILENTLY, so the check has to be about movement, not about finiteness: the
+    // audio stays perfectly good while the makeup stops tracking for ever. Measured before the fix:
+    // frozen at 0.000 dB across 4000 healthy blocks that were asking for +14.
+    {
+        dynamics::AutoLeveler al; al.prepare (fs);
+        auto drive = [&] (double dry, double mix, int blocks)
+        { for (int k = 0; k < blocks; ++k) { al.processBlock (dry, mix, true, blk); for (int i = 0; i < blk; ++i) al.getNextGain(); } };
+        drive (0.01, 0.01, 200);
+        const double before = al.currentGainDb();
+        al.processBlock (std::numeric_limits<double>::quiet_NaN(), 0.01, true, blk);
+        drive (0.25, 0.01, 4000);
+        test::ok (std::fabs (al.currentGainDb() - before) > 10.0,
+                  "AutoLeveler still TRACKS after a poisoned block (" + std::to_string (al.currentGainDb())
+                  + " dB, was " + std::to_string (before) + ") — its failure mode is a frozen target, not a NaN");
+        test::approx (al.currentGainDb(), 13.98, 0.5, "and it reaches the level the energies ask for");
+    }
+}
+
 //==============================================================================
 int main()
 {
@@ -346,5 +664,8 @@ int main()
     theDamageWindowIsTheCallersBlockAndSaysSo();
     healthyStreamsAreUntouched();
     theFollowersKeepTheirOwnThresholds();
+    partialPoisoningIsHealedAtomically();
+    aFiniteInputCanPoisonThroughTheSquare();
+    theConsumersRecoverWithinOneBlock();
     return felitronics::test::report();
 }

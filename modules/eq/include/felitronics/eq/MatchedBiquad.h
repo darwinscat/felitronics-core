@@ -899,10 +899,13 @@ struct Biquad
     // into this filter left 479000 of the next 480000 outputs non-finite under a denormal-only guard,
     // because `fabs(NaN) < 1e-15f` is false. This is the runtime state of every `eq` consumer that is
     // not an SVF — the EQ bands, and `rigplayer`'s per-band filters.
+    // ATOMIC — see Svf::flushDenormals for why, and for the measurement: this is the filter the
+    // partial-poisoning counterexample was found on. `z1` and `z2` are one state; clearing one and
+    // keeping the other is how a "healed" filter emits -3.27e38 and then -Inf into silence.
     void flushDenormals() noexcept
     {
-        core::flushPoison (z1);
-        core::flushPoison (z2);
+        if (! std::isfinite (z1) || ! std::isfinite (z2)) { z1 = 0.0f; z2 = 0.0f; }
+        else { core::flushDenormal (z1); core::flushDenormal (z2); }
     }
 };
 

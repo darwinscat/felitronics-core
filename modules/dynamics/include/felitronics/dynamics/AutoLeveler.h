@@ -125,8 +125,16 @@ public:
         // samples / 48 kHz, a ≈ 0.0176, so every k·u with k ≤ ½/a ≈ 28 is a fixed point). The cost of
         // leaving them there is small — two double FMAs per BLOCK, not per sample, and the silence gate
         // below skips the sqrt — but it is not zero, it never ends, and the fix is two compares.
-        core::flushDenormal (dryMeanSq);
-        core::flushDenormal (mixMeanSq);
+        // POISON, not only denormals — and here the failure is silent, which is why it is worth the
+        // two extra compares. A single non-finite block energy makes both followers NaN for ever
+        // (`state += a*(x - state)` never returns), and then `dryMeanSq > kMatchFloorMeanSq` is FALSE,
+        // so the silence gate below HOLDS THE LAST TARGET and returns. The audio stays perfectly
+        // finite and the makeup simply stops moving: measured, frozen at +6.02 dB across 8000 healthy
+        // unity blocks — 21 seconds — with nothing anywhere reading as broken.
+        // `flushPoison` is safe on these states rather than merely convenient: its 1e-15 threshold is
+        // 90 dB below `kMatchFloorMeanSq` (1e-6), so the silence gate reaches them long before it does.
+        core::flushPoison (dryMeanSq);
+        core::flushPoison (mixMeanSq);
 
         float rawTarget;
         if (! enabled)
