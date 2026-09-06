@@ -50,6 +50,7 @@
 #include <felitronics/rigplayer/ToneKnobs.h>
 
 #include <felitronics/convolution/CabConvolver.h>
+#include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/lineareq/MagnitudeCurve.h>
 #include <felitronics/nam/BlendLaw.h>
@@ -77,6 +78,65 @@ public:
     // Biquads per side. Every band of every `sections` knob on that side is one; a pack carrying more
     // than this on one side would be a first, and the rest are left out (bandsDropped() says so).
     static constexpr int kMaxBands = 24;
+
+    // HOW LONG A COEFFICIENT MOVE TAKES, and it is READ OFF THE BAND rather than chosen or inherited.
+    //
+    // It used to be the host's block: the coefficients travelled linearly across whatever `process()`
+    // was handed, so the same turn of the same knob took 0.33 ms at a block of 16 and 85 ms at 4096 —
+    // 180 SECONDS on the whole-file call an offline driver makes. A spread of 500000x is not a
+    // behaviour, so there was nothing to preserve; what there was instead was a question with no
+    // number in the file, and this is that number.
+    //
+    // WHAT SETS IT. A biquad cannot be moved faster than it forgets: its poles sit at radius
+    // r = sqrt(|a2|), the impulse response decays as r^n, and a move completed well inside that decay
+    // asks the filter to be somewhere its own state has not caught up to. So ONE ring time — the
+    // filter's own -60 dB memory — is the length, and the two rails below are what keep that honest.
+    //
+    // FIVE RING TIMES WAS TRIED FIRST AND REJECTED WITH A NUMBER, which is worth keeping because the
+    // reasoning for it is seductive. Measured on this exact mechanism against the same move done
+    // infinitely slowly (the adiabatic reference), the transient a fast move ADDS over the ideal one
+    // is +14.88 dB at L = 1, +3.13 at 64, +0.93 at 256 and +0.32 at five rings — so five rings is
+    // indeed where the overshoot stops mattering FOR A SHARP, LARGE MOVE (a +12 -> -12 dB bell at
+    // Q 1.4). But no pack ships one. On the reference pack's actual bass band — a 167 Hz Q 0.58 low
+    // shelf — the overshoot is 0.00 dB at EVERY length and the adiabatic error is already -47 dB at an
+    // instantaneous jump, while five rings would have handed that knob 45 ms and hit the ceiling. That
+    // is a large feel change on the one knob a player actually turns, bought with no measurable
+    // artefact. One ring gives the same band 9.1 ms, which is what a 512-sample host was already
+    // producing (10.7 ms) — the least surprising number available, and the insurance still fires where
+    // it was asked to.
+    //
+    // THE FLOOR IS THE ONE NUMBER THE PACKS ACTUALLY NEEDED. Every band in the reference pack
+    // (namz conformance `rig-measured`: a 167 Hz Q 0.58 low shelf travelling [-12, +6] dB with its
+    // corner over [120, 240] Hz, a 1077 Hz Q 0.65 tilt, a 10 kHz Q 0.8 switch position) is a shelf or
+    // tilt with Q BELOW ONE. They barely ring — 0.2 to 7.6 ms — and their adiabatic error is already
+    // -47 dB at an INSTANTANEOUS jump; stretching the move to 16.7 ms buys 3.7 dB. Only the switch
+    // click overshoots at all (+2.35 dB at L = 1), and it is down to +0.18 dB by sixteen samples. So
+    // for the packs that exist nothing constrains this from below, and 64 samples is a floor with a
+    // 4x margin on the only artefact anyone could measure.
+    //
+    // THE CEILING IS A LAG BUDGET, not a DSP one, which is why it is a named constant and not a
+    // formula: a band that rings 176 ms (a 100 Hz bell at Q 8 — the pack schema permits it, nothing
+    // in `namz_rig_load.h` bounds `hz` or `q` beyond "positive") would ask for 880 ms, and a knob that
+    // trails the hand by a second is broken in a different way. Past the ceiling the move is honestly
+    // too fast for the filter and the overshoot above is what it costs.
+    static constexpr int kBandRampMin =   64;   // 1.3 ms at 48 kHz — kills the switch-click transient
+    static constexpr int kBandRampMax = 2048;   // 42.7 ms — the lag budget, the only taste in here
+    static constexpr double kBandRampRings = 1.0;   // ONE ring; see the note above for why not five
+
+    static int bandRampLength(const felitronics::rigplayer::SectionBiquad& from,
+                              const felitronics::rigplayer::SectionBiquad& to) {
+        auto ring = [] (double a2) {
+            const double r = std::sqrt(std::fabs(a2));
+            if (! (r > 0.0)) return 0.0;                       // no pole pair: nothing to outrun
+            if (! (r < 1.0)) return (double) kBandRampMax;      // marginal or worse: take the ceiling
+            return std::log(1.0e-3) / std::log(r);              // samples to -60 dB
+        };
+        const double n = kBandRampRings * std::max(ring(from.a2), ring(to.a2));
+        if (! (n > (double) kBandRampMin)) return kBandRampMin;
+        if (n >= (double) kBandRampMax)    return kBandRampMax;
+        return (int) n;
+    }
+
     // The curve form's FIR: 1024 taps designed through 8192 points, the numbers the bench auditions with.
     static constexpr int kFirTaps = 1024, kFirDesign = 8192;
     static constexpr int kMaxDelay = felitronics::nam::kBlendMaxDelay;
@@ -110,6 +170,9 @@ public:
             for (auto& t : lagTail_) t[c].fill(0.0f);
         }
         for (auto& side : bq_) for (auto& band : side) for (auto& b : band) b.reset();
+        for (auto& g : bandGrid_) g.reset();             // a stream restart re-anchors the audio-time grid
+        for (int s = 0; s < 2; ++s)                      // ...and cancels any ramp the old stream left flying
+            for (int k = 0; k < kMaxBands; ++k) bandPos_[s][k] = bandLen_[s][k] = 0;
         curIn_    = inGain_.load(std::memory_order_relaxed);
         curOut_   = outGain_.load(std::memory_order_relaxed);
         curChain_ = chainGain_.load(std::memory_order_relaxed);
@@ -1006,7 +1069,8 @@ private:
         // A band that appears (a load) starts AT its coefficients — there is nothing to ramp from; one
         // that is already running ramps to the new ones across the next block.
         for (int k = rt.count; k < in.count; ++k) {
-            bandCur_[side][k] = in.c[k];
+            bandCur_[side][k] = bandFrom_[side][k] = bandTo_[side][k] = in.c[k];
+            bandPos_[side][k] = bandLen_[side][k] = 0;         // arrived: nothing to travel
             for (auto& b : bq_[side][k]) b.reset();
         }
         rt = in;
@@ -1020,41 +1084,76 @@ private:
             && std::memcmp(&x.a2, &y.a2, sizeof(double)) == 0;
     }
 
-    // Every band of a side, on every channel. Coefficients that changed since the last block travel
-    // linearly across this one — a knob dragged sixty times a second never steps a filter.
+    // Every band of a side, on every channel. Coefficients that changed travel linearly over a length
+    // THE BAND ITSELF DECLARES (see bandRampLength) — a knob dragged sixty times a second never steps a
+    // filter, and it now does not step it differently on a different host either. The ramp carries
+    // across calls: `bandPos_` counts SAMPLES, so where the caller cuts the stream changes nothing.
     void runBands(int side, float* const* planes, int count) {
         auto& rt = bandRt_[side];
         for (int k = 0; k < rt.count; ++k) {
-            const auto& to = rt.c[k];
-            auto& from = bandCur_[side][k];
+            const auto& want = rt.c[k];
             auto& bands = bq_[side][k];
-            if (same(from, to)) {
+
+            // A NEW TARGET STARTS A NEW RAMP, from wherever the last one had got to — a hand that
+            // moves again mid-travel is the ordinary case, not the exception.
+            if (! same(want, bandTo_[side][k])) {
+                bandFrom_[side][k] = bandCur_[side][k];
+                bandTo_[side][k]   = want;
+                bandLen_[side][k]  = bandRampLength(bandFrom_[side][k], want);
+                bandPos_[side][k]  = 0;
+            }
+
+            if (bandPos_[side][k] >= bandLen_[side][k]) {       // arrived: no interpolation at all
+                bandCur_[side][k] = bandTo_[side][k];
                 for (int c = 0; c < channels_; ++c) {
                     auto& bq = bands[(std::size_t) c];
-                    bq.c = to;
+                    bq.c = bandTo_[side][k];
                     float* x = planes[c];
                     for (int i = 0; i < count; ++i) x[i] = bq.processSample(x[i]);
-                    bq.flushDenormals();
                 }
             } else {
-                const double inv = 1.0 / (double) count;
+                const auto& from = bandFrom_[side][k];
+                const auto& to   = bandTo_[side][k];
+                const double inv = 1.0 / (double) bandLen_[side][k];
+                const int    p0  = bandPos_[side][k];
                 for (int c = 0; c < channels_; ++c) {
                     auto& bq = bands[(std::size_t) c];
                     float* x = planes[c];
+                    int p = p0;
                     for (int i = 0; i < count; ++i) {
-                        const double t = (double) (i + 1) * inv;
-                        bq.c.b0 = from.b0 + (to.b0 - from.b0) * t;
-                        bq.c.b1 = from.b1 + (to.b1 - from.b1) * t;
-                        bq.c.b2 = from.b2 + (to.b2 - from.b2) * t;
-                        bq.c.a1 = from.a1 + (to.a1 - from.a1) * t;
-                        bq.c.a2 = from.a2 + (to.a2 - from.a2) * t;
+                        if (p < bandLen_[side][k]) {
+                            ++p;
+                            const double t = (double) p * inv;
+                            bq.c.b0 = from.b0 + (to.b0 - from.b0) * t;
+                            bq.c.b1 = from.b1 + (to.b1 - from.b1) * t;
+                            bq.c.b2 = from.b2 + (to.b2 - from.b2) * t;
+                            bq.c.a1 = from.a1 + (to.a1 - from.a1) * t;
+                            bq.c.a2 = from.a2 + (to.a2 - from.a2) * t;
+                        } else bq.c = to;
                         x[i] = bq.processSample(x[i]);
                     }
-                    bq.flushDenormals();
+                    bandCur_[side][k] = bq.c;                   // every channel walks the same path
                 }
-                from = to;
+                bandPos_[side][k] = std::min(p0 + count, bandLen_[side][k]);
             }
         }
+
+        // LAW 8 ON THE AUDIO-TIME GRID, not at the end of the call (core/StateGrid.h, law 8a). The
+        // flush zeroes state, so running it where the CALLER happened to cut made the output a
+        // function of the host's block size — which would have undone, at 1e-15, exactly what the
+        // declared ramp length above buys at full scale. One grid per side; both are driven with the
+        // same counts, so they stay in step by construction.
+        auto& grid = bandGrid_[side];
+        for (int off = 0; off < count; ) {
+            const int seg = grid.segment(count - off);
+            off += seg;
+            if (grid.advance(seg))
+                for (int k = 0; k < rt.count; ++k)
+                    for (int c = 0; c < channels_; ++c) bq_[side][k][(std::size_t) c].flushDenormals();
+        }
+        // The poison half keeps the call's clock — see eq::Biquad::healPoison(). Invisible while finite.
+        for (int k = 0; k < rt.count; ++k)
+            for (int c = 0; c < channels_; ++c) bq_[side][k][(std::size_t) c].healPoison();
     }
 
     // Law 8. Every gain here approaches its target asymptotically — `end = want + (current-want)*decay`
@@ -1175,7 +1274,12 @@ private:
     float curIn_ = 1.0f, curOut_ = 1.0f;
     float curChain_ = 1.0f, curSlot_[2] { 1.0f, 1.0f }, curDry_ = 0.0f, curWet_ = 1.0f;
     BandSet                    bandRt_[2];
-    felitronics::rigplayer::SectionBiquad   bandCur_[2][kMaxBands];
+    felitronics::rigplayer::SectionBiquad   bandCur_[2][kMaxBands];    // what the filters are running NOW
+    felitronics::rigplayer::SectionBiquad   bandFrom_[2][kMaxBands];   // where the ramp in flight started
+    felitronics::rigplayer::SectionBiquad   bandTo_[2][kMaxBands];     // ...and where it is going
+    int                                     bandPos_[2][kMaxBands] {}; // samples of it consumed
+    int                                     bandLen_[2][kMaxBands] {}; // its declared length (bandRampLength)
+    felitronics::core::StateGrid            bandGrid_[2];              // law 8 on audio time, per side
     felitronics::eq::Biquad    bq_[2][kMaxBands][kMaxChannels];
     felitronics::convolution::CabConvolver fir_[2], dry_;
     std::vector<float> slotB_[kMaxChannels], dryBuf_[kMaxChannels], spare_[kMaxChannels];

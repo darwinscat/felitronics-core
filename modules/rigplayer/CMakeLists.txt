@@ -17,7 +17,7 @@ target_link_libraries(felitronics_rigplayer INTERFACE
 target_compile_features(felitronics_rigplayer INTERFACE cxx_std_20)
 
 if(FELITRONICS_BUILD_TESTS)
-    foreach(t IN ITEMS RigPlayer ModelBlend ModelAlignment)
+    foreach(t IN ITEMS RigPlayer ModelBlend ModelAlignment BandRamp)
         string(TOLOWER "${t}" tl)
         add_executable(felitronics_rigplayer_${tl}_tests tests/${t}Tests.cpp)
         target_link_libraries(felitronics_rigplayer_${tl}_tests PRIVATE felitronics::rigplayer)
