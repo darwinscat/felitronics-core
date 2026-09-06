@@ -20,3 +20,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_multibandwidth_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_multibandwidth_tests COMMAND felitronics_multibandwidth_tests)
 endif()
+
+if(FELITRONICS_BUILD_TESTS)
+    # A channel that stops being split and is split again — the whole crossover tree for that column,
+    # plus its per-band alignment delay lines, none of which decays while it is away.
+    add_executable(felitronics_multiband_gatestate_tests tests/MultibandGateStateTests.cpp)
+    target_link_libraries(felitronics_multiband_gatestate_tests PRIVATE felitronics::multiband)
+    target_include_directories(felitronics_multiband_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_multiband_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_multiband_gatestate_tests COMMAND felitronics_multiband_gatestate_tests)
+endif()
