@@ -111,6 +111,19 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## v0.27.0 — a pack carries its own two levels, and normalizing is the default (`rigplayer`, `nam`)
 
+- **feat(dynamics):** the gain-reduction path became **one object**: `GainReductionPath` carries
+  detector → curve → ballistics together, `CompressorParams : GainReductionParams : DetectorParams`
+  completes that layering, and `GainReductionTap` publishes the per-sample gain reduction. Alongside them
+  `dynamics::offline::{QuantileHistogram, EnvelopeAnalyzer, ThresholdSolver}` — the detector-domain
+  analysis that finds the threshold delivering a wanted gain reduction by MEASURING rather than by
+  inverting a curve. None of this was declared when it shipped; the refactor itself was bit-identical to
+  the previous compressor across 23 328 configurations × 210 million samples.
+- **BREAKING (dynamics, source):** completing that layering moved `thresholdDb` and its neighbours into
+  `GainReductionParams`, so **`decltype (&CompressorParams::thresholdDb)` is now
+  `double GainReductionParams::*`, not `double CompressorParams::*`**. Exact-type reflection,
+  serialisation tables and any `T C::*` template argument spelled with the derived class stop compiling.
+  The header says so at `Compressor.h`; this file did not. See also the v0.26.0 note above, which is the
+  first half of the same change.
 - **feat(rigplayer):** a pack states **how hard it is fed and how loud it leaves** — namz 4.1.0's
   `chain[].input_db` and `chain[].output_db`, applied by the player and by nothing else. Packs are not
   balanced against each other (a Big Muff leaves some 12 dB louder than a clean preamp, and a boost is
@@ -147,6 +160,21 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   `throw` a hard PARSE error — so the tier the ADR promises could not be built at all. Guarded the way
   libc++ guards `__throw_bad_array_new_length`: throw where exceptions exist, `std::abort()` where they
   do not.
+- **BREAKING (dynamics, source):** `CompressorParams` stopped being a flat struct and became
+  `CompressorParams : GainReductionParams : DetectorParams`, so its own fields moved into base classes.
+  Three things break, and this release did not say so:
+  - **Designated initializers stop compiling.** `CompressorParams{ .ratio = 4.0 }` is now
+    *"field designator 'ratio' does not refer to any field in type 'CompressorParams'"* — a designator
+    may only name a DIRECT member, and `ratio` lives in `GainReductionParams` now.
+  - **Positional brace-initialization stops compiling too**, loudly rather than silently: brace elision
+    fills the base first, so the pre-existing `CompressorParams{ -12.0, 4.0 }` now tries to initialize
+    `DetectorParams::Detector` and `DetectorParams::LinkMode` from doubles. Loud is the good outcome —
+    the alternative would have been the same spelling quietly assigning to different fields.
+  - **`std::is_standard_layout_v<CompressorParams>` is now false** (it was true), which matters to
+    anything doing `offsetof`, C interop, or exact-layout serialisation. It remains an aggregate and
+    trivially copyable.
+  - Assigning to the fields by name (`p.ratio = 4.0;`) is unaffected, which is how most callers write it
+    and why this went unnoticed.
 - **feat(dynamics):** an **external key for the compressor**. On a mastering bus the kick and the bass
   decide the gain reduction of the whole mix — defect number one of the ffmpeg chain this core
   replaces, and it would have been reproduced exactly, because the ADR rightly forbids putting an EQ
