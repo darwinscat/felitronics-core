@@ -221,6 +221,80 @@ double shelfDb(double gainDb, double fs) {
 int main() {
     std::printf("felitronics::rigplayer::RigPlayer tests\n");
 
+    group("a plane that stops playing and plays again brings nothing back with it");
+    {
+        // The models run on the planes they are GIVEN, and so do the per-slot alignment delay lines
+        // beside them. A plane the host stops handing over keeps its `lagTail_` frozen rather than
+        // draining it, and hands it back when the host widens again. The tail is EXACTLY as many samples
+        // as the slot's delay, so how loud it is depends on where in the waveform the plane was taken —
+        // which makes a single measurement a lower bound and not a number. The ceiling is derivable: the
+        // tail sits after the slot's gain and before the blend, so it cannot exceed amplitude x slot
+        // weight, here 0.5 x 0.5 = 0.25. A sweep of all 218 leaving phases at SAMPLE resolution reaches
+        // 0.249986 — 99.99% of that ceiling, so the number is 0.25 (-12.0 dBFS) and nothing can beat it.
+        // All of it lands in the first three samples of the return, and none on the plane that stayed.
+        // The comment in the player says that
+        // history is "advanced every block including at zero", which is true only for the planes that
+        // are playing; that is the gap.
+        //
+        // The fixture is built to measure the DELAY LINE and nothing else: two MEMORYLESS gain models
+        // with the alignment table set by hand, so the only per-plane state in the path is the tail.
+        // With a model that has its own memory the leak is larger and only partly this — see the note
+        // in the findings about `neural::NeuralStage`.
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain; g.values = { "60", "240" }; g.sweep = 300;
+        st.device.controls = { g };
+        namz::rig::FileEntry fa; fa.id = "early"; fa.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fc; fc.id = "late";  fc.settings = { { "gain", "240" } };
+        st.device.files = { fa, fc };
+        r.chain = { st };
+        std::map<std::string, std::vector<std::byte>> files {
+            { "early", bytesOf(gainModel(1.0)) }, { "late", bytesOf(gainModel(1.0)) } };
+        // BOTH SLOT ASSIGNMENTS. delayOf() is maxLag - lag, so one table always puts the delay on slot 0
+        // and the other on slot 1. A version of this test that used only the first passed with a fix that
+        // cleared slot 0 alone — the mutation survived the whole suite, 247 checks, because slot 1 never
+        // carried a delay in it.
+        for (int flip = 0; flip < 2; ++flip) {
+        AlignmentTable table;
+        table.lagByFile = flip ? std::map<std::string, int> { { "early", 3 }, { "late", 0 } }
+                               : std::map<std::string, int> { { "early", 0 }, { "late", 3 } };
+        table.sampleRate = kFs;
+
+        Bench b(r, 2);
+        b.files = files;
+        b.p.setAlignment(table);
+        b.p.setDial("gain", 150.0);
+
+        std::vector<float> L((std::size_t) kBlock), R((std::size_t) kBlock);
+        float* io[2] { L.data(), R.data() };
+        double phase = 0.0, charged = 0.0;
+        for (int k = 0; k < 304; ++k) {
+            for (int i = 0; i < kBlock; ++i) {
+                L[(std::size_t) i] = 0.0f;
+                R[(std::size_t) i] = (float) (0.5 * std::sin(phase));
+                phase += 2.0 * 3.14159265358979 * 220.0 / kFs;
+            }
+            b.p.process(io, 2, kBlock); b.p.serviceHere();
+            for (float v : R) charged = std::fmax(charged, (double) std::fabs(v));
+        }
+        ok(b.p.appliedSlotDelay(flip) > 0,
+           "precondition: THIS pass's slot carries the delay, so its tail holds samples");
+        ok(! b.p.slotCold(flip), "precondition: and that slot is awake, so it is the one contributing");
+        ok(charged > 0.1, "precondition: the plane under test really was playing");
+
+        for (int k = 0; k < 100; ++k) { std::fill(L.begin(), L.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere(); }
+
+        double worst = 0.0;
+        for (int k = 0; k < 20; ++k) {
+            std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
+            b.p.process(io, 2, kBlock); b.p.serviceHere();
+            for (float v : R) worst = std::fmax(worst, (double) std::fabs(v));
+            for (float v : L) worst = std::fmax(worst, (double) std::fabs(v));
+        }
+        ok(worst == 0.0, "silence in, exact zero out on the plane that came back (was up to 0.25 = -12.0 dBFS)");
+        }
+    }
+
     group("the rig round-trips through the pack writer and the canonical reader");
     bool okManifest = false;
     const auto rig = throughTheFormat(testRig(), &okManifest);
