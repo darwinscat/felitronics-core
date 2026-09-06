@@ -28,6 +28,19 @@ struct PassBand
     int  latencySamples() const noexcept { return 0; }
 };
 
+// A band whose latency is set per INSTANCE, because the aligners hold `maxLatency - ownLatency` samples:
+// with every band reporting the same number every line is zero-length and holds nothing. A first version
+// of this suite used a zero-latency band, a second used one constant latency for all four, and both were
+// blind to the alignment delays for the same reason.
+struct LateBand
+{
+    int lat = 0;
+    bool prepare (int l) noexcept { lat = l; return true; }
+    void reset() noexcept {}
+    void process (float* const*, int, int) noexcept {}
+    int  latencySamples() const noexcept { return lat; }
+};
+
 static double peakOf (const std::vector<float>& v)
 {
     double m = 0.0; for (float x : v) m = std::fmax (m, (double) std::fabs (x)); return m;
@@ -106,6 +119,41 @@ int main()
         }
         ok (energy > 1.0, "precondition: the surviving channel carried signal");
         ok (equal, "channel 0 is bit-equal to the run where nothing ever left");
+    }
+
+    group ("the per-band alignment delays are cleared too");
+    {
+        // A band that declares latency makes the processor align the others through DelayLines, one per
+        // band and channel. Those hold audio, and they are per channel, so a returning channel replays
+        // them exactly like the crossover columns. Only a band with non-zero latency puts them in play.
+        multiband::MultibandProcessor<LateBand, 4> m;
+        int next = 0;
+        ok (m.prepare (48000.0, N, 2, 256, [&next] (LateBand& b) { return b.prepare (64 * next++); }),
+            "precondition: the processor prepared with room to align 256 samples");
+        ok (m.latencySamples() >= 192, "precondition: the bands report DIFFERENT latencies, so the aligners hold audio");
+
+        std::vector<float> L ((std::size_t) N, 0.0f), R ((std::size_t) N, 0.0f);
+        float* io[2] { L.data(), R.data() };
+
+        double charged = 0.0;
+        for (int k = 0; k < 40; ++k)
+        {
+            std::fill (L.begin(), L.end(), 0.0f); fillNoise (R, 23u + (unsigned) k);
+            m.process (io, 2, N);
+            charged = std::fmax (charged, peakOf (R));
+        }
+        ok (charged > 0.1, "precondition: the right channel really was being split and aligned");
+
+        for (int k = 0; k < 40; ++k) { std::fill (L.begin(), L.end(), 0.0f); m.process (io, 1, N); }
+
+        double worst = 0.0;
+        for (int k = 0; k < 8; ++k)
+        {
+            std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
+            m.process (io, 2, N);
+            worst = std::fmax (worst, peakOf (R));
+        }
+        ok (worst == 0.0, "silence in, exact zero out — the alignment lines came back empty too");
     }
 
     return felitronics::test::report();
