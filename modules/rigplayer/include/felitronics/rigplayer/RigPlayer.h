@@ -594,6 +594,30 @@ public:
         if (! prepared_ || io == nullptr || numSamples <= 0) return;
         const int nch = std::clamp(numChannels, 0, channels_);
         if (nch == 0) return;
+
+        // A PLANE THAT STOPS PLAYING AND PLAYS AGAIN. The models run on the planes they are given, and so
+        // do the per-slot alignment delay lines beside them — `for (int c = 0; c < nch; …)` below. A plane
+        // the host stops handing over therefore keeps its `lagTail_` frozen rather than draining it, and
+        // hands it back when the host widens again. The tail is exactly the slot's delay in samples, so its
+        // loudness is whatever the plane was carrying — a ceiling, not a sample: it sits after the slot's
+        // gain and before the blend, so it cannot exceed amplitude x slot weight, and a sweep of all 218
+        // leaving phases at sample resolution reaches 99.99% of that. Out of DIGITAL SILENCE: up to 0.25,
+        // which is -12.0 dBFS, in the first three samples of the return, none of it on the plane that stayed.
+        //
+        // THIS IS THE SMALLER HALF. The models' own per-channel state freezes the same way and is worse:
+        // NamStage runs instance 1 only when a second plane is present, so on a return it continues the OLD
+        // note for one RECEPTIVE FIELD — measured ceiling 0.5 (-6.0 dBFS), and for any field of three samples
+        // or more this clear removes nothing of it. That half needs a per-channel reset threaded through
+        // NamStage and neural::NeuralStage, and is not attempted here.
+        // The comment beside those lines says the history is "advanced every block including at zero" —
+        // true for the planes that are playing, which is exactly the gap. Dropping it here matches what
+        // this file already does in three other places where a slot's delay line stops being valid: a
+        // landing, a retime, and falling asleep all fill it. The convolvers and the tone are not touched:
+        // they are handed the PREPARED width with the spare planes zeroed, so they never stop running.
+        if (nch < ranNch_)
+            for (int i = 0; i < 2; ++i)
+                for (int c = nch; c < ranNch_; ++c) lagTail_[i][(std::size_t) c].fill(0.0f);
+        ranNch_ = nch;
         const bool norm = normalize_.load(std::memory_order_acquire);
         float* a[kMaxChannels]; float* b[kMaxChannels]; float* d[kMaxChannels];
         for (int c = 0; c < kMaxChannels; ++c) { b[c] = slotB_[c].data(); d[c] = dryBuf_[c].data(); }
@@ -1147,6 +1171,7 @@ private:
     felitronics::nam::BlendState blend_ {};
     bool coldRt_[2] {};                                // the law's cold flags as of the last block, to see a slot fall asleep
     std::array<float, (std::size_t) kMaxDelay> lagTail_[2][kMaxChannels] {};
+    int ranNch_ = 0;                        // planes that advanced state on the previous call
     float curIn_ = 1.0f, curOut_ = 1.0f;
     float curChain_ = 1.0f, curSlot_[2] { 1.0f, 1.0f }, curDry_ = 0.0f, curWet_ = 1.0f;
     BandSet                    bandRt_[2];
