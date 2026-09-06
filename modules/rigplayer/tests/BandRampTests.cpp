@@ -28,15 +28,24 @@ using felitronics::test::ok;
 using felitronics::test::group;
 
 static constexpr double kFs = 48000.0;
+// The rails are TIME, so the suite derives its expectations from the rate exactly as the header does.
+static const int kRampMin = (int) (RigPlayer::kBandRampMinSeconds * kFs);
+static const int kRampMax = (int) (RigPlayer::kBandRampMaxSeconds * kFs);
 
 // The ring time this file claims the length is read from, computed independently of the header: the
 // poles sit at radius sqrt(|a2|) and the impulse response decays as r^n, so -60 dB is at
 // ln(1e-3)/ln(r) samples. If the two disagree, one of them is wrong and the test says which.
-static double ringSamples (double a2)
+// Computed here from a1 AND a2, independently of the header. `sqrt(|a2|)` alone is the GEOMETRIC MEAN
+// of the two pole magnitudes and is right only for a complex pair; a low-Q design has a REAL pair, and
+// the mean then misses the slow root badly — `matched::highShelfQDb(1000, Q 0.05, +12 dB)` has poles
+// 0.9908 and -0.2975, mean 5.3 samples against the slow root's 1053. The first version of this helper
+// duplicated the header's own mistake and therefore endorsed it.
+static double ringSamples (double a1, double a2)
 {
-    const double r = std::sqrt (std::fabs (a2));
-    if (! (r > 0.0) || ! (r < 1.0)) return 0.0;
-    return std::log (1.0e-3) / std::log (r);
+    const double disc = a1 * a1 - 4.0 * a2;
+    const double rho  = disc >= 0.0 ? (std::fabs (a1) + std::sqrt (disc)) * 0.5 : std::sqrt (std::fabs (a2));
+    if (! (rho > 0.0) || ! (rho < 1.0)) return 0.0;
+    return std::log (1.0e-3) / std::log (rho);
 }
 
 static void testLengthIsReadOffTheBand()
@@ -52,21 +61,21 @@ static void testLengthIsReadOffTheBand()
     const SectionBiquad ringing = designSection (SectionKind::Peak, 100.0, 9.0, 8.0, kFs);
 
     // PRECONDITION — the three really do have different memories, or the rest measures nothing.
-    const double rFast = ringSamples (fast.a2), rSlow = ringSamples (slow.a2), rRing = ringSamples (ringing.a2);
+    const double rFast = ringSamples (fast.a1, fast.a2), rSlow = ringSamples (slow.a1, slow.a2), rRing = ringSamples (ringing.a1, ringing.a2);
     ok (rFast < rSlow && rSlow < rRing,
         "PRECONDITION the three bands ring for different times: " + std::to_string (1000.0 * rFast / kFs) + " / "
         + std::to_string (1000.0 * rSlow / kFs) + " / " + std::to_string (1000.0 * rRing / kFs) + " ms");
 
-    const int lFast = RigPlayer::bandRampLength (fast, fast);
-    const int lSlow = RigPlayer::bandRampLength (slow, slow);
-    const int lRing = RigPlayer::bandRampLength (ringing, ringing);
+    const int lFast = RigPlayer::bandRampLength (fast, fast, kFs);
+    const int lSlow = RigPlayer::bandRampLength (slow, slow, kFs);
+    const int lRing = RigPlayer::bandRampLength (ringing, ringing, kFs);
 
-    ok (lFast == RigPlayer::kBandRampMin,
+    ok (lFast == kRampMin,
         "a band that barely rings takes the FLOOR (" + std::to_string (lFast) + ")");
-    ok (lSlow > RigPlayer::kBandRampMin && lSlow < RigPlayer::kBandRampMax,
+    ok (lSlow > kRampMin && lSlow < kRampMax,
         "a band that rings ~8 ms takes a length between the rails (" + std::to_string (lSlow) + " samples, "
         + std::to_string (1000.0 * lSlow / kFs) + " ms)");
-    ok (lRing == RigPlayer::kBandRampMax,
+    ok (lRing == kRampMax,
         "a band that rings 176 ms is capped by the LAG BUDGET, not served (" + std::to_string (lRing) + ")");
     // ...and the middle one really is ONE ring, computed here independently of the header.
     ok (std::fabs ((double) lSlow - rSlow) <= 1.0,
@@ -79,14 +88,50 @@ static void testLengthIsReadOffTheBand()
 
     // The SLOWER of the two endpoints wins — a move from a fast band to a slow one has to respect the
     // slow one, and a fixture that only ever passed the same band twice would not see it.
-    ok (RigPlayer::bandRampLength (fast, slow) == lSlow && RigPlayer::bandRampLength (slow, fast) == lSlow,
+    ok (RigPlayer::bandRampLength (fast, slow, kFs) == lSlow && RigPlayer::bandRampLength (slow, fast, kFs) == lSlow,
         "the length is set by the SLOWER endpoint, in either direction");
+
+    // A REAL POLE PAIR — the case `sqrt(|a2|)` gets wrong and the suite had none of. A low-Q shelf is
+    // the ordinary way to reach it, and packs are full of low-Q shelves.
+    {
+        const SectionBiquad lowQ = designSection (SectionKind::HighShelf, 1000.0, 12.0, 0.05, kFs);
+        ok (lowQ.a1 * lowQ.a1 - 4.0 * lowQ.a2 > 0.0, "PRECONDITION a Q 0.05 shelf really has REAL poles");
+        const double mean = std::log (1.0e-3) / std::log (std::sqrt (std::fabs (lowQ.a2)));
+        const double dom  = ringSamples (lowQ.a1, lowQ.a2);
+        ok (dom > 20.0 * mean, "PRECONDITION the two estimates disagree by more than 20x ("
+                               + std::to_string (mean) + " vs " + std::to_string (dom) + ")");
+        ok (RigPlayer::bandRampLength (lowQ, lowQ, kFs) > kRampMin,
+            "a real-pole band is NOT collapsed to the floor by the geometric mean ("
+            + std::to_string (RigPlayer::bandRampLength (lowQ, lowQ, kFs)) + " samples)");
+        ok (std::fabs ((double) RigPlayer::bandRampLength (lowQ, lowQ, kFs) - dom) <= 1.0
+            || RigPlayer::bandRampLength (lowQ, lowQ, kFs) == kRampMax,
+            "...it is the DOMINANT root's ring, or the ceiling");
+    }
+
+    // THE RAILS ARE TIME. A ring is a duration — a 167 Hz shelf rings 9.08 ms at every rate — so the
+    // rails have to be too, or the same pack gets a quarter of the lag budget on a 192 kHz session.
+    {
+        const SectionBiquad r96  = designSection (SectionKind::Peak, 100.0, 9.0, 8.0, 96000.0);
+        const SectionBiquad r48  = designSection (SectionKind::Peak, 100.0, 9.0, 8.0, 48000.0);
+        const int l96 = RigPlayer::bandRampLength (r96, r96, 96000.0);
+        const int l48 = RigPlayer::bandRampLength (r48, r48, 48000.0);
+        ok (l96 == (int) (RigPlayer::kBandRampMaxSeconds * 96000.0) && l48 == (int) (RigPlayer::kBandRampMaxSeconds * 48000.0),
+            "PRECONDITION both rates put this band at the CEILING (" + std::to_string (l48) + " / " + std::to_string (l96) + ")");
+        ok (std::fabs (1000.0 * l96 / 96000.0 - 1000.0 * l48 / 48000.0) < 0.05,
+            "the ceiling is the same TIME at 48 and 96 kHz (" + std::to_string (1000.0 * l48 / 48000.0) + " vs "
+            + std::to_string (1000.0 * l96 / 96000.0) + " ms)");
+        const SectionBiquad f96 = designSection (SectionKind::HighShelf, 10000.0, -9.0, 0.8, 96000.0);
+        const SectionBiquad f48 = designSection (SectionKind::HighShelf, 10000.0, -9.0, 0.8, 48000.0);
+        ok (std::fabs (1000.0 * RigPlayer::bandRampLength (f96, f96, 96000.0) / 96000.0
+                     - 1000.0 * RigPlayer::bandRampLength (f48, f48, 48000.0) / 48000.0) < 0.05,
+            "...and so is the floor");
+    }
 
     // Degenerate inputs cannot produce a length outside the rails.
     SectionBiquad flat {}; flat.b0 = 1.0;                     // no pole pair at all
     SectionBiquad unstable {}; unstable.b0 = 1.0; unstable.a2 = 4.0;
-    ok (RigPlayer::bandRampLength (flat, flat) == RigPlayer::kBandRampMin, "a2 = 0 takes the floor");
-    ok (RigPlayer::bandRampLength (unstable, unstable) == RigPlayer::kBandRampMax, "|a2| >= 1 takes the ceiling");
+    ok (RigPlayer::bandRampLength (flat, flat, kFs) == kRampMin, "a2 = 0 takes the floor");
+    ok (RigPlayer::bandRampLength (unstable, unstable, kFs) == kRampMax, "|a2| >= 1 takes the ceiling");
 }
 
 //==============================================================================
@@ -228,7 +273,7 @@ static void testTheMoveIsTheSameHoweverItIsCut()
     {
         const SectionBiquad a = designSection (SectionKind::LowShelf, 167.0, -12.0, 0.58, kFs);
         const SectionBiquad b = designSection (SectionKind::LowShelf, 167.0,   6.0, 0.58, kFs);
-        const int L = RigPlayer::bandRampLength (a, b);
+        const int L = RigPlayer::bandRampLength (a, b, kFs);
         ok (L > 128, "PRECONDITION this band's ramp is " + std::to_string (L) + " samples, longer than the small blocks");
     }
 
@@ -296,7 +341,7 @@ static void testARestartedRampDoesNotJump()
     group ("a second edit mid-ramp continues from where the first had got to");
     const int n = 12000, firstEdit = 4000;
     const int L = RigPlayer::bandRampLength (designSection (SectionKind::LowShelf, 167.0, -12.0, 0.58, kFs),
-                                             designSection (SectionKind::LowShelf, 167.0,   6.0, 0.58, kFs));
+                                             designSection (SectionKind::LowShelf, 167.0,   6.0, 0.58, kFs), kFs);
     const int interrupt = firstEdit + L * 27 / 100;            // 27 % along, so "where it had got to" is far from both ends
 
     auto play = [&] (double startDial, bool edits, double firstTo, double secondTo, std::vector<float>& o)
@@ -346,6 +391,189 @@ static void testARestartedRampDoesNotJump()
 }
 
 //==============================================================================
+// THE RAMP NULLS AN INDEPENDENT ORACLE, THROUGH THE REAL PLAYER, ON BOTH CHANNELS.
+//
+// This is the test the rest of the suite turned out not to be. The diff-pass consilium ran three
+// mutations against it and all three PASSED: (A) `bandLen_ = 0`, i.e. no ramp at all, just a jump with
+// continuous filter state; (B) `takeBands` re-initialising every band on every publish, i.e. reset plus
+// jump; (C) the ramp cursor shared across channels, so channel 1 skips the ramp — invisible because
+// every other fixture here is MONO. Block-invariance is satisfied by any edit landing on a fixed
+// absolute sample, a jump included, so it cannot see (A) or (B); and the "restarted ramp" check reads
+// an RMS window where a jump's continuous state sits on the right side of the comparison anyway.
+//
+// What sees all three is a reference NULL: an oracle built from the primitives — the same designSection
+// endpoints, bandRampLength, and the interpolation the header specifies — fed the SAME input through
+// one eq::Biquad, with the PLAYER as the thing under test. The replica is legitimate here precisely
+// because it is the reference and not the DUT.
+static void testTheRampNullsAnOracle()
+{
+    group ("the ramp nulls an independent oracle through RigPlayer::process, on BOTH channels");
+    const int n = 20000, edit1 = 6000, edit2 = 6000 + 120;
+    const SectionBiquad cA = designSection (SectionKind::LowShelf, 167.0, -12.0, 0.58, kFs);   // dial 0
+    const SectionBiquad cB = designSection (SectionKind::LowShelf, 167.0,   6.0, 0.58, kFs);   // dial 300
+    const SectionBiquad cC = designSection (SectionKind::LowShelf, 167.0,  -4.8, 0.58, kFs);   // dial 90
+
+    std::vector<float> in ((std::size_t) n);
+    for (int i = 0; i < n; ++i)
+        in[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs)
+                                     + 0.2 * std::sin (2.0 * M_PI * 1400.0 * (double) i / kFs));
+
+    RigPlayer p;
+    p.prepare (kFs, n, 2);                                     // STEREO — the only fixture here that is
+    p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
+    for (int i = 0; i < 64; ++i) p.serviceHere();
+    p.setDial ("bass", 0.0);
+    std::vector<float> L = in, R = in;
+    auto run = [&] (int from, int to, int block) {
+        for (int off = from; off < to; off += block)
+        { const int c = std::min (block, to - off); float* io[2] { L.data() + off, R.data() + off }; p.process (io, 2, c); p.serviceHere(); }
+    };
+    run (0, edit1, 6000 / 32);                                 // settle the gains and the blend law
+    p.setDial ("bass", 300.0); run (edit1, edit2, 64);
+    p.setDial ("bass",  90.0); run (edit2, n, 64);
+
+    auto lerp = [] (const SectionBiquad& f, const SectionBiquad& t, double u) {
+        SectionBiquad c;
+        c.b0 = f.b0 + (t.b0 - f.b0) * u; c.b1 = f.b1 + (t.b1 - f.b1) * u; c.b2 = f.b2 + (t.b2 - f.b2) * u;
+        c.a1 = f.a1 + (t.a1 - f.a1) * u; c.a2 = f.a2 + (t.a2 - f.a2) * u; return c; };
+    eq::Biquad bq; bq.setCoeffs (cA); bq.reset();
+    std::vector<float> o ((std::size_t) n);
+    SectionBiquad cur = cA, from = cA, to = cA; int pos = 0, len = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (i == edit1) { from = cur; to = cB; len = RigPlayer::bandRampLength (from, to, kFs); pos = 0; }
+        if (i == edit2) { from = cur; to = cC; len = RigPlayer::bandRampLength (from, to, kFs); pos = 0; }
+        if (pos < len) { ++pos; cur = lerp (from, to, (double) pos / (double) len); } else cur = to;
+        bq.setCoeffs (cur);
+        o[(std::size_t) i] = bq.processSample (in[(std::size_t) i]);
+    }
+
+    auto worstIn = [&] (const std::vector<float>& y, int a, int b) {
+        double w = 0.0; for (int i = a; i < b; ++i) w = std::fmax (w, std::fabs ((double) y[(std::size_t) i] - (double) o[(std::size_t) i])); return w; };
+    ok (RigPlayer::bandRampLength (cA, cB, kFs) > 128,
+        "PRECONDITION the ramp is longer than the blocks (" + std::to_string (RigPlayer::bandRampLength (cA, cB, kFs)) + ")");
+    const double pre = worstIn (L, edit1 - 1000, edit1);
+    ok (pre < 1e-5, "PRECONDITION before the edit the player IS the band: worst " + std::to_string (pre));
+    ok (worstIn (L, edit1, n) < 1e-5, "the LEFT channel nulls the oracle across both ramps (worst " + std::to_string (worstIn (L, edit1, n)) + ")");
+    ok (worstIn (R, edit1, n) < 1e-5, "the RIGHT channel nulls it too (worst " + std::to_string (worstIn (R, edit1, n)) + ")");
+    {   // PRECONDITION — the null has teeth: a jump would miss the oracle by a lot.
+        eq::Biquad j; j.setCoeffs (cA); j.reset(); double wj = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            if (i == edit1) j.setCoeffs (cB);
+            if (i == edit2) j.setCoeffs (cC);
+            const double y = j.processSample (in[(std::size_t) i]);
+            if (i >= edit1) wj = std::fmax (wj, std::fabs (y - (double) o[(std::size_t) i]));
+        }
+        ok (wj > 1e-2, "PRECONDITION a jump would miss the oracle by " + std::to_string (wj) + " — the null has teeth");
+    }
+}
+
+//==============================================================================
+// WHERE THE FLUSH SITS, not merely whether it exists. A version of this change ran the segment loop
+// AFTER all the audio — the right number of flushes, every one of them on the same final state, which
+// is the per-call defect wearing the grid's clothes. Deleting the flush is caught by the tail reaching
+// exact zero; MISPLACING it is not, because at the end of a call the state is the same either way.
+// What separates them is a call that spans many periods: with the flush inside, a whole-file call
+// zeroes the tail on the grid exactly as a sliced one does; with it outside, the whole-file call
+// carries the tail to the end untouched.
+static void testTheFlushIsInsideTheCall()
+{
+    group ("the flush happens INSIDE the call, on the grid — not after all the audio");
+    const int n = 30000;
+    auto render = [&] (int block, std::vector<float>& o)
+    {
+        RigPlayer p;
+        p.prepare (kFs, n, 1);
+        p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
+        for (int i = 0; i < 64; ++i) p.serviceHere();
+        p.setDial ("bass", 300.0);
+        o.assign ((std::size_t) n, 0.0f);
+        for (int i = 0; i < 1200; ++i)                          // tone, then digital silence
+            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * M_PI * 110.0 * (double) i / kFs));
+        // The first 2000 samples ALWAYS in 32 equal calls: `nam::BlendLaw` moves its weight by at most
+        // 0.25 per CALL, so an arm that starts with one long call leaves the blend gain climbing for the
+        // whole render and this test would measure that instead of the flush (measured: 3228 samples).
+        for (int off = 0; off < 2000; off += 2000 / 32)
+        { const int c = std::min (2000 / 32, 2000 - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+        for (int off = 2000; off < n; off += block)
+        { const int c = std::min (block, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+    };
+    std::vector<float> whole, sliced;
+    render (n, whole);          // the tail in ONE call spanning 437 grid periods
+    render (100, sliced);       // ...against many, at a size that is not a multiple of the period
+
+    // PRECONDITION 1 — the tail reaches EXACT zero in the sliced arm, i.e. the flush is doing something.
+    long long zeros = 0;
+    for (int i = 5000; i < n; ++i) if (sliced[(std::size_t) i] == 0.0f) ++zeros;
+    ok (zeros > (n - 5000) / 2, "PRECONDITION the sliced tail reaches exact zero (" + std::to_string (zeros) + ")");
+    // PRECONDITION 2 — the tone is real, so the tail is a decay and not silence from the start.
+    double peak = 0.0;
+    for (int i = 0; i < 1200; ++i) peak = std::fmax (peak, std::fabs ((double) sliced[(std::size_t) i]));
+    ok (peak > 0.05, "PRECONDITION the tone is there (" + std::to_string (peak) + ")");
+
+    long long diff = 0;
+    for (int i = 0; i < n; ++i) if (whole[(std::size_t) i] != sliced[(std::size_t) i]) ++diff;
+    ok (diff == 0, "a call spanning 437 grid periods flushes inside itself, exactly as 100-sample calls do ("
+                   + std::to_string (diff) + " differ)");
+}
+
+//==============================================================================
+// prepare() IS A RESTART, WHICH MEANS THE BANDS RESTART TOO. Cancelling a ramp in flight is not enough:
+// `bandTo_` and `bandCur_` survive, `rebuildBands` republishes the same COUNT, and `takeBands`
+// re-initialises only bands BEYOND that count — so without retiring them the first block after a
+// restart GLIDES from the previous stream's coefficients. Measured before the fix: 5951 samples
+// differing from a fresh player, worst 0.54.
+static void testPrepareRestartsTheBands()
+{
+    group ("prepare() retires the bands — the next stream does not glide from the last one's");
+    const int n = 16000;
+    auto render = [&] (bool viaRestart, std::vector<float>& o)
+    {
+        RigPlayer p;
+        p.prepare (kFs, n, 1);
+        p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
+        for (int i = 0; i < 64; ++i) p.serviceHere();
+        if (viaRestart)
+        {
+            p.setDial ("bass", 0.0);                            // the OLD stream's position...
+            std::vector<float> w (256, 0.2f);
+            float* io[1] { w.data() };
+            p.process (io, 1, 256);                             // ...actually applied
+            p.prepare (kFs, n, 1);                              // and now: a new stream
+            p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
+            for (int i = 0; i < 64; ++i) p.serviceHere();
+        }
+        p.setDial ("bass", 300.0);
+        o.assign ((std::size_t) n, 0.0f);
+        for (int i = 0; i < n; ++i)
+            o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs));
+        for (int off = 0; off < n; off += 256)
+        { const int c = std::min (256, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+    };
+    std::vector<float> fresh, restarted;
+    render (false, fresh);
+    render (true,  restarted);
+    // PRECONDITION — the two dial positions are far apart, so a stale glide between them would show.
+    {
+        // Measure the RESPONSE, not b0: the two shelf designs differ by 18 dB down low while their b0
+        // values sit close together, so a b0 comparison is a precondition about the wrong quantity —
+        // it failed here while the designs were 18 dB apart.
+        const SectionBiquad lo = designSection (SectionKind::LowShelf, 167.0, -12.0, 0.58, kFs);
+        const SectionBiquad hi = designSection (SectionKind::LowShelf, 167.0,   6.0, 0.58, kFs);
+        const double dLo = sectionMagnitudeDb (lo, 40.0, kFs), dHi = sectionMagnitudeDb (hi, 40.0, kFs);
+        ok (std::fabs (dHi - dLo) > 12.0, "PRECONDITION dial 0 and dial 300 are " + std::to_string (dHi - dLo)
+                                          + " dB apart at 40 Hz — a stale glide between them would show");
+    }
+    long long diff = 0; double worst = 0.0;
+    for (int i = 0; i < n; ++i)
+        if (fresh[(std::size_t) i] != restarted[(std::size_t) i])
+        { ++diff; worst = std::fmax (worst, std::fabs ((double) fresh[(std::size_t) i] - (double) restarted[(std::size_t) i])); }
+    ok (diff == 0, "a player restarted after running at another dial position renders like a fresh one ("
+                   + std::to_string (diff) + " differ, worst " + std::to_string (worst) + ")");
+}
+
+//==============================================================================
 // prepare() RE-ANCHORS THE AUDIO-TIME GRID. Without it a re-prepared player inherits the phase the old
 // stream left, so the law-8 flush lands somewhere else and two renders of the same programme differ.
 // Invisible to any fixture whose tail never reaches the flush threshold, so this one has a tail.
@@ -374,8 +602,12 @@ static void testPrepareReAnchorsTheGrid()
         o.assign ((std::size_t) n, 0.0f);
         for (int i = 0; i < 1000; ++i)              // tone, then digital silence: the tail is the point
             o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * M_PI * 120.0 * (double) i / kFs));
-        for (int off = 0; off < n; off += 512)
-        { const int c = std::min (512, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+        // 100, NOT 512. The grid period is 64, so a call size that is a MULTIPLE of it puts the same
+        // number of boundaries in every call whatever the phase — floor((0+512)/64) and
+        // floor((37+512)/64) are both 8 — and the phase shift this test exists to detect becomes
+        // invisible. The first version of this fixture used 512 and passed with the re-anchor deleted.
+        for (int off = 0; off < n; off += 100)
+        { const int c = std::min (100, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
     };
 
     std::vector<float> fresh, reused;
@@ -397,9 +629,14 @@ static void testPrepareReAnchorsTheGrid()
 // Measured on this mechanism at +14.88 dB for an instant jump; the floor has to hold that down.
 static void testTheFloorHoldsDownTheOvershoot()
 {
-    group ("the floor is where it is because of the transient a faster move adds");
-    // The reference pack's switch click: flat -> a 10 kHz Q 0.8 shelf at -9 dB, the one movement in the
-    // whole pack that overshoots at all.
+    group ("the floor holds down the transient a faster move adds — on a band that RAMPS");
+    // ⚠️ NOT the reference pack's switch. That switch's two positions carry ZERO and ONE section, so
+    // moving between them changes the BAND COUNT, and `takeBands` starts an appearing band AT its
+    // coefficients with no ramp at all — an appearance is a hard step, and giving it one is a separate
+    // policy (P26 follow-up), not something this floor covers. The first version of this test claimed
+    // it did, on a fixture that kept one biquad alive and interpolated identity -> shelf: a transition
+    // the player does not perform. What follows is the same shape as a band that DOES ramp, and it is
+    // labelled as the synthetic it is.
     const SectionBiquad from = designSection (SectionKind::HighShelf, 10000.0,  0.0, 0.8, kFs);
     const SectionBiquad to   = designSection (SectionKind::HighShelf, 10000.0, -9.0, 0.8, kFs);
     const double probe = 14000.0;
@@ -431,7 +668,7 @@ static void testTheFloorHoldsDownTheOvershoot()
     };
 
     const double instant = peakOver (1);
-    const double atFloor = peakOver (RigPlayer::kBandRampMin);
+    const double atFloor = peakOver (kRampMin);
     // PRECONDITION — the instant move DOES overshoot, or the floor is holding down nothing.
     ok (instant > 1.0, "PRECONDITION an instant move overshoots the ideal one by "
                        + std::to_string (instant) + " dB");
@@ -444,6 +681,9 @@ int main()
     testLengthIsReadOffTheBand();
     testTheMoveIsTheSameHoweverItIsCut();
     testARestartedRampDoesNotJump();
+    testTheRampNullsAnOracle();
+    testTheFlushIsInsideTheCall();
+    testPrepareRestartsTheBands();
     testPrepareReAnchorsTheGrid();
     testTheFloorHoldsDownTheOvershoot();
     return felitronics::test::report();
