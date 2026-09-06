@@ -13,3 +13,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dither_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dither_tests COMMAND felitronics_dither_tests)
 endif()
+
+if(FELITRONICS_BUILD_TESTS)
+    # A channel that stops being dithered and starts again — the shaper history is memory, the auto-blank
+    # counter is a clock, and they need opposite treatment.
+    add_executable(felitronics_dither_gatestate_tests tests/DitherGateStateTests.cpp)
+    target_link_libraries(felitronics_dither_gatestate_tests PRIVATE felitronics::dither)
+    target_include_directories(felitronics_dither_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dither_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dither_gatestate_tests COMMAND felitronics_dither_gatestate_tests)
+endif()

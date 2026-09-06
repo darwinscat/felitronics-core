@@ -55,6 +55,20 @@ public:
         std::fill (downPos.begin(),  downPos.end(),  0);
     }
 
+    // Clear ONE channel's histories, leaving every other channel BIT-EXACT — for an owner whose
+    // channel stopped being fed and will be fed again. The ring POSITIONS go with the samples: they
+    // are state like any other, and a channel whose ring is zeroed while its cursor stays put sits at
+    // a phase reset() can never produce, so "this column now equals a fresh one" would be false about
+    // a column that looks clean. Unprepared (channels_ == 0) is a no-op, not a bad index.
+    void resetChannel (int c) noexcept
+    {
+        if (c < 0 || c >= channels_) return;
+        std::fill_n (upHist.begin()   + (std::ptrdiff_t) c * (std::ptrdiff_t) tpp, tpp, 0.0f);
+        std::fill_n (downHist.begin() + (std::ptrdiff_t) c * (std::ptrdiff_t) N,   N,   0.0f);
+        upPos[(std::size_t) c]   = 0;
+        downPos[(std::size_t) c] = 0;
+    }
+
     int factor() const noexcept { return L; }
     // Group delay of ONE filter pass, in OVERSAMPLED samples ((N-1)/2 for a linear-phase FIR).
     double filterLatencyOversampled() const noexcept { return (double) (N - 1) * 0.5; }

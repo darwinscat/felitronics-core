@@ -58,6 +58,20 @@ public:
             xover_[k].reset();
             for (int j = 0; j < kMaxCrossovers; ++j) comp_[k][j].reset();
         }
+        // (the per-channel form is resetChannel below)
+    }
+
+    // Clear ONE channel's columns across every crossover and every allpass compensator, leaving the other
+    // channels bit-exact. Like Crossover2, this object takes its channel as an argument and is not itself
+    // gated on a count — but its OWNERS run it over `c < nc`, and a channel that leaves and returns then
+    // replays the whole tree. Measured through MultibandProcessor: 1.55e-01 (-16.2 dBFS) out of silence.
+    void resetChannel (int ch) noexcept
+    {
+        for (int k = 0; k < kMaxCrossovers; ++k)
+        {
+            xover_[k].resetChannel (ch);
+            for (int j = 0; j < kMaxCrossovers; ++j) comp_[k][j].resetChannel (ch);
+        }
     }
 
     bool setNumBands (int bands) noexcept

@@ -32,6 +32,15 @@ public:
 
     void reset() noexcept { for (int c = 0; c < kMaxChannels; ++c) { ic1[c] = 0.0f; ic2[c] = 0.0f; } }
 
+    // Clear ONE channel's integrators, leaving every other channel BIT-EXACT. An owner whose channel
+    // stopped being processed needs exactly this: reset() would restart the channels that never left,
+    // and a filter that keeps running has no business losing its tail because a neighbour went away.
+    void resetChannel (int c) noexcept
+    {
+        if (c < 0 || c >= kMaxChannels) return;
+        ic1[c] = 0.0f; ic2[c] = 0.0f;
+    }
+
     // Precondition: the caller passes FINITE parameters. Q and gainDb are BOUNDED here, which is not
     // the same as sanitised and the difference matters: `Q < 1e-3` and both gain comparisons are false
     // for a NaN, so a NaN Q walks straight through into `pow`, `k`, `a1..a3` and `m0..m2`, and every

@@ -80,6 +80,7 @@ public:
     void reset() noexcept
     {
         for (int c = 0; c < channels_; ++c) chan_[c].reset();
+        ranNc_ = 0;                               // nothing has run, so nothing can be stopping
         xfadePos_ = 0; phase_ = 0; fdlPos_ = 0;   // keep cur_ (the live IR slot)
         state_.store (0, std::memory_order_relaxed);
     }
@@ -87,6 +88,9 @@ public:
     static constexpr int latencySamples() noexcept { return 0; }
     bool isBusy() const noexcept { return state_.load (std::memory_order_acquire) != 0; }
     int  numChannels() const noexcept { return channels_; }
+
+    // Channels that advanced state on the previous accepted call (see the note in process()).
+    int  ranNc_ = 0;
 
     // Message thread — SINGLE producer; must not run concurrently with reset(). Per-channel IR (a
     // true-stereo IR); if fewer channels are supplied than configured, the last is broadcast to the
@@ -115,6 +119,14 @@ public:
         if (! prepared_) return;                                    // never prepared — channel buffers are empty
         const int nc = numChannelsToProcess < channels_ ? numChannelsToProcess : channels_;
         if (nc <= 0 || n <= 0) return;
+
+        // A channel that stops being asked for keeps a full frame, FDL and pending tail — frozen, not
+        // decayed — and replays them when it is asked for again. Measured through CabConvolver, stereo ->
+        // mono -> stereo: 9.12e-02 (-20.8 dBFS) on the returning channel out of DIGITAL SILENCE. Per
+        // channel only: `phase_`, `fdlPos_` and `xfadePos_` below are the engine's shared block position
+        // and are supposed to keep running for the channels that stayed.
+        for (int c = nc; c < ranNc_; ++c) chan_[c].reset();
+        ranNc_ = nc;
 
         int s = state_.load (std::memory_order_acquire);
         if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE

@@ -328,7 +328,6 @@ public:
         updateCoeffs();
         recomputePending = false;
         initialized = false;
-        bandWasActive = false;
         reset();
     }
 
@@ -336,6 +335,10 @@ public:
     {
         resetST();
         for (const Lane l : kMonoLanes) resetLane (laneRt_[(std::size_t) l]);
+        // Nothing has run since a stream restart, so nothing can be STOPPING: forget what ran before, or the
+        // next block would compute a falling edge against a stream that no longer exists.
+        ranMatchedST_ = ranSweptST_ = ranDeltaST_ = 0;
+        for (int i = 0; i < kNumLanes; ++i) ranLane_[i] = ranLaneDelta_[i] = false;
         // Reset must leave NO live delta: the seam is state like any other, and a stream restart that
         // kept it would apply the previous stream's gain reduction to the first block of the new one.
         deltaST_.reset(); deltaSTDb_ = 0.0;
@@ -444,12 +447,20 @@ public:
         const bool sRun  = nc == 2 && laneOn (Lane::Side);
         const bool anyRun = stRun || lRun || rRun || mRun || sRun;
 
-        if (! anyRun || numSamples <= 0)
-        {
-            if (! anyRun && bandWasActive) { reset(); bandWasActive = false; }   // clear tails so re-enabling doesn't pop
-            return;
-        }
-        bandWasActive = true;
+        // A cell that STOPS executing loses its sample memory here, on the falling edge. Frozen state is
+        // not decayed state: a cell that resumes with it replays a signal from before the gap — measured
+        // +8.12 dBFS out of DIGITAL SILENCE when a Side lane sat out a mono stretch. Every gate that can
+        // stop a real recursion counts, not just the channel count: a lane switched off, the swept/matched
+        // branch, and dyn.on stop one just as completely. This generalises what the band already did for
+        // itself when EVERY lane went idle; that case is now simply the one where no cell is left running.
+        // A call carrying no samples ran nothing, so it stopped nothing — it must not move an edge.
+        // `nc > 0` is not belt-and-braces: numChannels is caller-supplied and unclamped below, so a
+        // negative width would make the half-open ranges below start at a NEGATIVE column and index
+        // bqST_[s][-1] — inside the object, where a sanitizer cannot see it. It is also the same rule as
+        // the sample count: a call that processes no channel ran nothing, so it stopped nothing.
+        if (numSamples > 0 && nc > 0) dropStoppedCells (nc, stRun, p.dyn.on);
+
+        if (numSamples <= 0) return;   // no samples, no time: nothing advances and no edge moves
 
         // Advance every lane's smoothers (closed form; an idle/snapped smoother is a settled no-op).
         stFreqS_.advance (numSamples); stQS_.advance (numSamples); stGainS_.advance (numSamples);
@@ -462,11 +473,30 @@ public:
         // Recompute only when a RUNNING lane actually moves — a static, settled band skips the trig.
         bool moving = false;
         if (stRun) moving = moving || ! (stFreqS_.settled() && stQS_.settled() && stGainS_.settled());
-        if (lRun)  moving = moving || laneMoving (Lane::Left);
-        if (rRun)  moving = moving || laneMoving (Lane::Right);
-        if (mRun)  moving = moving || laneMoving (Lane::Mid);
-        if (sRun)  moving = moving || laneMoving (Lane::Side);
+        // ENABLED, not running: a lane that is switched on keeps earning redesigns even while the channel
+        // count parks it, because its smoothers advance regardless (above) and updateCoeffs() is what turns
+        // a smoothed value into coefficients. Gating this on xRun let a lane settle unseen during a mono
+        // stretch and come back filtering at the value of the FIRST mono block — measured 798 Hz for a
+        // 500->4000 Hz edit, +0.64 dB where +12 was asked. Design eligibility is nc-agnostic, exactly as
+        // updateCoeffs() is, so the mono design sequence now matches the stereo one block for block and the
+        // coefficients after a return are BIT-EQUAL to the run where the channel never left. The trig costs
+        // what it costs in stereo, and only while the lane actually ramps.
+        if (laneOn (Lane::Left))  moving = moving || laneMoving (Lane::Left);
+        if (laneOn (Lane::Right)) moving = moving || laneMoving (Lane::Right);
+        if (laneOn (Lane::Mid))   moving = moving || laneMoving (Lane::Mid);
+        if (laneOn (Lane::Side))  moving = moving || laneMoving (Lane::Side);
         if (recomputePending || moving) { updateCoeffs(); recomputePending = moving; }
+
+        // ONLY THE AUDIO STOPS. A parameter ramp runs on the caller's clock, and the smoothers above have
+        // always advanced for lanes that were not running — the fully-idle band was the one case that fell
+        // out of that rule, because the return used to sit above them. It made the SAME edit arrive at two
+        // different times depending on whether some unrelated lane happened to be on: with a flat 0 dB
+        // companion keeping the band alive the design tracked through the gap, and without one the ramp
+        // froze and finished ~200 ms AFTER the stream came back (measured: a 500 -> 4000 Hz edit parked at
+        // 651.5 Hz for a one-second mono stretch, then 1548 Hz at 10 ms, 3536 at 50 ms, 3984 at 200 ms).
+        // An inert lane deciding another lane's behaviour is the defect this file has already closed once;
+        // this is the same shape, one gate further out. Nothing below this line touches a stopped cell.
+        if (! anyRun) return;
 
         // Dynamics is opt-in per point: with dyn.on false nothing below touches the signal, so a
         // static band is bit-identical to one built before dynamics existed.
@@ -779,13 +809,51 @@ private:
         for (int s = 0; s < kMaxSections; ++s) rt.bq[s].reset();
     }
 
+    // Clear the sample memory of every cell that ran on the previous sample-bearing call and does not run
+    // on this one. SIGNAL HISTORY ONLY: seams (deltaSTDb_, LaneRt::deltaDb), smoothers and the applied-value
+    // caches are current CONTROL, not memory of past audio — they say what the band should do now, and a
+    // lane coming back must obey the latest command, not the one in force when it left. (setLaneDeltaDb's
+    // producer decides when a delta has expired; LaneDynamics already zeroes its own seam on the same edge.)
+    // The running set of channels is always [0, nc), so recording the COUNT that ran says which columns did,
+    // and the falling edge is the half-open range [now, then). Per channel, never wholesale: a channel that
+    // never left owes nothing to one that did, which is why Svf grew resetChannel().
+    void dropStoppedCells (int nc, bool stRun, bool dynOn) noexcept
+    {
+        const bool swept = sweptActive();
+        const int nowMatched = (stRun && ! swept)          ? nc : 0;
+        const int nowSwept   = (stRun &&   swept)          ? nc : 0;
+        const int nowDelta   = (stRun && ! swept && dynOn) ? nc : 0;
+
+        for (int c = nowMatched; c < ranMatchedST_; ++c)
+            for (int s = 0; s < kMaxSections; ++s) bqST_[s][c].reset();
+        for (int c = nowSwept; c < ranSweptST_; ++c) svf_.resetChannel (c);
+        for (int c = nowDelta;  c < ranDeltaST_;  ++c) deltaST_.resetChannel (c);
+        ranMatchedST_ = nowMatched; ranSweptST_ = nowSwept; ranDeltaST_ = nowDelta;
+
+        for (const Lane l : kMonoLanes)
+        {
+            const std::size_t i = (std::size_t) l;
+            LaneRt&    rt   = laneRt_[i];
+            const bool runs = (nc == 2) && laneOn (l);          // L/R/M/S are stereo-only, as everywhere here
+            if (ranLane_[i]      && ! runs)            for (int s = 0; s < kMaxSections; ++s) rt.bq[s].reset();
+            if (ranLaneDelta_[i] && ! (runs && dynOn)) rt.delta.resetChannel (0);   // one column by construction
+            ranLane_[i]      = runs;
+            ranLaneDelta_[i] = runs && dynOn;
+        }
+    }
+
     BandParams p;
     double fs = 44100.0;
     int    ch = 2;
     bool   recomputePending = true;
     bool   initialized = false;
-    bool   bandWasActive = false;
     FilterType lastType_ = FilterType::Bell;
+
+    // What actually ADVANCED state on the previous sample-bearing call — the channel count that ran, 0 for
+    // "this cell did not run at all". Deliberately not stActive_/LaneRt::active: those describe the DESIGN,
+    // are nc-agnostic, and are refreshed only when updateCoeffs() happens to run, so they lag execution.
+    int    ranMatchedST_ = 0, ranSweptST_ = 0, ranDeltaST_ = 0;
+    bool   ranLane_[kNumLanes] {}, ranLaneDelta_[kNumLanes] {};
 
     // ST lane: per-channel biquad columns (mono→surround→ambisonics) + the swept SVF.
     Smoother     stFreqS_, stQS_, stGainS_;

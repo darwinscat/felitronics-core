@@ -72,6 +72,7 @@ public:
             ch_[c].clearShaper();
             ch_[c].blank = 0;
         }
+        ranNc_ = 0;   // nothing has run, so nothing can be stopping
     }
 
     void setParams (const DitherParams& p) noexcept
@@ -89,6 +90,30 @@ public:
     {
         if (bits_ >= 32 || numChannels <= 0) return;      // float export → bypass
         const int nc = std::min (numChannels, core::kMaxChannels);   // state exists for every channel → never silently skip
+        if (n <= 0) return;
+
+        // A channel that stops being dithered freezes its shaper error history and its auto-blank counter,
+        // and resumes both when it comes back: measured 3.58e-07 out of DIGITAL SILENCE on the returning
+        // channel — about six LSB of 24 bit — against EXACTLY 0.0 on a channel that never left. Small, but
+        // this is the stage P6 F2 caught amplifying 1e-15 to three LSB, so a stale counter here is not
+        // harmless bookkeeping.
+        //
+        // The shaper history is sample memory and is dropped. The BLANK counter is not: it counts how long
+        // this channel has been digitally silent, and a channel nobody is feeding is silent — so it is
+        // ADVANCED by the samples it missed, not cleared. Clearing it is the tempting move and it is
+        // backwards: it sends the returning channel back to the start of the blank window, so it emits
+        // dither into silence for another 4096 samples. Advancing it makes the returning channel agree
+        // with the one that stayed, which is the whole invariant. The PCG stream is left alone: it is a
+        // noise source, not memory of past audio, and reseeding it would only change which noise is made.
+        for (int c = nc; c < ranNc_; ++c) ch_[c].clearShaper();
+        ranNc_ = nc;
+        // ...and the counter keeps counting for EVERY channel nobody is feeding, on every call — not once
+        // on the edge. This is the one ledger in this work that had to be a clock rather than a latch: the
+        // others record what a cell REMEMBERS, this one records how long a channel has been silent, and
+        // that goes on being true while nobody calls. Doing it on the edge alone credits a single block
+        // and the returning channel still dithers into silence for the rest of the window.
+        for (int c = nc; c < core::kMaxChannels; ++c)
+            if (ch_[c].blank < blankSamples_) ch_[c].blank = std::min (blankSamples_, ch_[c].blank + n);
         for (int c = 0; c < nc; ++c)
         {
             Channel& st = ch_[c];
@@ -137,6 +162,8 @@ public:
 
 private:
     static constexpr int kMaxOrder = 9;
+
+    int ranNc_ = 0;                                        // channels dithered on the previous call
 
     struct Channel
     {
