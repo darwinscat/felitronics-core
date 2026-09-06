@@ -46,6 +46,9 @@ using felitronics::test::ok;
 using felitronics::test::approx;
 using felitronics::test::group;
 
+// Portable: MSVC's <cmath> lacks kPi by default, and the repo's own convention (io/tests/WavTests.cpp:25)
+// is a local constant rather than _USE_MATH_DEFINES. `felitronics::core::kPi` is the same number.
+static constexpr double kPi = 3.14159265358979323846;
 static constexpr double kFs = 48000.0;
 static constexpr int    kK  = core::StateGrid::kPeriod;
 static constexpr float  kSmallestNormal = 1.17549435e-38f;
@@ -60,7 +63,7 @@ static void programme (std::vector<float>& L, std::vector<float>& R, int n, int 
     L.assign ((std::size_t) n, 0.0f); R.assign ((std::size_t) n, 0.0f);
     for (int i = 0; i < toneSamples && i < n; ++i)
     {
-        const float v = (float) (0.5 * std::sin (2.0 * M_PI * 1000.0 * (double) i / kFs));
+        const float v = (float) (0.5 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
         L[(std::size_t) i] = v; R[(std::size_t) i] = 0.9f * v;
     }
 }
@@ -230,7 +233,7 @@ static void testEqSlicingInvarianceUnderARamp()
         b.setParams (to);
         std::vector<float> buf[2]; buf[0].assign (64, 0.0f); buf[1].assign (64, 0.0f);
         float* ch[2] = { buf[0].data(), buf[1].data() };
-        const double w = 2.0 * M_PI * 5000.0 / kFs;
+        const double w = 2.0 * kPi * 5000.0 / kFs;
         b.processBlock (ch, 2, 64);
         const double a1 = std::abs (b.response (w));
         for (int k = 0; k < 8; ++k) b.processBlock (ch, 2, 64);
@@ -327,7 +330,7 @@ static void testAGlideThatLandsAtOnceIsStillDesigned()
         std::vector<float> L (kK, 0.0f), R (kK, 0.0f);
         float* ch[2] = { L.data(), R.data() };
         b.processBlock (ch, 2, kK);
-        const double w = 2.0 * M_PI * 4000.0 / kFs;
+        const double w = 2.0 * kPi * 4000.0 / kFs;
         const double gotDb = 20.0 * std::log10 (std::abs (b.response (w)));
         // PRECONDITION — the two designs are far apart, so "designed at the target" is a real claim.
         eq::BandParams src = bell (500.0, 12.0, 2.0);
@@ -359,7 +362,7 @@ static void testPoisonWindowIsBounded()
         std::vector<float> L ((std::size_t) n), R ((std::size_t) n);
         for (int i = 0; i < n; ++i)
         {
-            const float v = (float) (0.25 * std::sin (2.0 * M_PI * 1000.0 * (double) i / kFs));
+            const float v = (float) (0.25 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
             L[(std::size_t) i] = v; R[(std::size_t) i] = v;
         }
         L[100] = std::numeric_limits<float>::infinity();
@@ -385,7 +388,7 @@ static void testPoisonWindowIsBounded()
         ok (e.prepare (kFs, 4000, 2), "poison fixture (short blocks): prepared");
         e.setBand (0, bell (1000.0, 6.0, 2.0));
         std::vector<float> L (4000, 0.0f), R (4000, 0.0f);
-        for (int i = 0; i < 4000; ++i) { const float v = (float) (0.25 * std::sin (2.0 * M_PI * 1000.0 * (double) i / kFs)); L[(std::size_t) i] = v; R[(std::size_t) i] = v; }
+        for (int i = 0; i < 4000; ++i) { const float v = (float) (0.25 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs)); L[(std::size_t) i] = v; R[(std::size_t) i] = v; }
         L[100] = std::numeric_limits<float>::infinity();
         for (int off = 0; off < 4000; ++off) { float* ch[2] = { L.data() + off, R.data() + off }; e.process (ch, 2, 1); }
         long long bad = 0;
@@ -481,7 +484,7 @@ static void testClearAudioStateIsAStop()
         band->processBlock (wc, 2, 480);
     }
     // PRECONDITION — the glide is genuinely unfinished at the stop, or "keeps ramping" means nothing.
-    const double w = 2.0 * M_PI * 900.0 / kFs;
+    const double w = 2.0 * kPi * 900.0 / kFs;
     const double midway = std::abs (running.response (w));
     ok (midway > 1.05 && midway < 2.7, "PRECONDITION the glide is mid-flight (|H| = " + std::to_string (midway) + ")");
 
@@ -573,7 +576,7 @@ static void testRampFollowsItsOwnDesign()
     buf[0].assign ((std::size_t) kK, 0.0f); buf[1].assign ((std::size_t) kK, 0.0f);
     float* ch[2] = { buf[0].data(), buf[1].data() };
 
-    const double w = 2.0 * M_PI * 2000.0 / kFs;
+    const double w = 2.0 * kPi * 2000.0 / kFs;
     bool agreed = true;
     double worst = 0.0, minH = 1e300, maxH = -1e300; int worstTick = -1; long long moving = 0;
     for (int tickNo = 1; tickNo <= 2000; ++tickNo)
@@ -779,7 +782,7 @@ static void testPoisonHealIsAtomic()
                   t.reset();
                   for (int i = 0; i < 512; ++i)
                   {
-                      t.processSample ((float) (amp * std::sin (2.0 * M_PI * ff * (double) i / kFs)));
+                      t.processSample ((float) (amp * std::sin (2.0 * kPi * ff * (double) i / kFs)));
                       if (std::isfinite (t.z1) != std::isfinite (t.z2))
                       { half = true; b = t; foundAmp = amp; foundQ = qq; foundF = ff; break; }
                   }
