@@ -5,7 +5,81 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
-## Unreleased — the chain that gives the same bits however you cut it (`mastering`)
+## Unreleased
+
+- **fix(eq, saturation, dynamiceq, deesser, poweramp, convolution, multiband, dither):** **a filter that
+  is not called does not decay — it FREEZES**, and replays a signal from before the gap when it is called
+  again. Eleven instances of one shape: a cell of per-channel or per-lane recursion behind a gate the
+  surrounding object keeps running through. All eleven were present in every release up to this one.
+  Measured out of DIGITAL SILENCE on the input: `ConvolutionEngine` 7.44e-01 (**−2.6 dBFS**),
+  `MultibandProcessor` 1.55e-01 (−16.2), `DeEsser` in SplitBand 6.25e-02 (−24.1), `PowerAmpStage`
+  1.67e-02 (−35.5) on its own knob gates and 0.649 (−3.8) on a channel change, `EqBand` **+8.12 dBFS**,
+  `LaneDynamics` 11.97 dB of unearned gain reduction, `DynamicEqBand` 0.388 eleven samples in,
+  `Saturator` 0.9337, `EqBand`'s swept branch 0.690, `Dither` six LSB of 24 bit.
+  - The rule is **the falling edge of PARTICIPATION**, per cell: a cell that ran on the previous
+    sample-bearing call and does not run on this one loses its sample memory, whatever stopped it. NOT
+    "the channel count grew" — `EqBand`'s single-signal lanes gate on `nc == 2` exactly, so `2→3→2`
+    retires them on the INCREASE and revives them on the DECREASE, and the compressor's `nc > lastNc_`
+    rule never fires there. Only sample memory is dropped: gain seams, smoothers and applied-value caches
+    are current CONTROL and are preserved.
+- **BREAKING (behaviour):** the gates above stop and restart at a CONSTANT channel count too, so fixing
+  them changes what those transitions sound like. Named, because each is now pinned by a test:
+  - a whole-band idle in `eq::EqBand` clears signal history only — it used to call the full `reset()`, so
+    an inert companion lane on 0 dB decided whether another lane's commanded gain survived. The full
+    reset, seams included, now belongs to explicit `reset()` alone.
+  - switching a lane off, flipping `swept`, or turning `dyn.on` off now clears that path's delta filter
+    state; `Saturator`'s Asym↔symmetric toggle clears its DC blocker; `PowerAmpStage`'s presence, depth,
+    load and iron gates clear their filters and its sag envelope.
+  - a parameter ramp in `eq::EqBand` now advances while the band is idle. It always did for lanes that
+    were not running; the fully-idle band was the one case that fell out of the rule, so the same edit
+    landed at two different times depending on whether an unrelated lane happened to be on.
+  - a parked lane's PROGRAMME ESTIMATE in `dynamiceq::LaneDynamics` is now duration-aware: kept below a
+    quarter of the estimator's own averaging constant, fast-adapted below four times it, discarded beyond.
+    Keeping it unconditionally cost 17.87 dB for 3.36 s against a lane that heard the change — in boost
+    mode, 18 dB of unearned BOOST. The trade is named rather than hidden: after a long SILENT park the
+    first loud material is no longer ducked.
+- **BREAKING (eq, source):** `EqEngine::prepare` is now `[[nodiscard]] bool` and REFUSES a sample rate it
+  cannot honour; `EqBand::prepare` returns `bool` and a refused band stays inert. It validated nothing
+  before, and `fs` reaches every coefficient through `tan(pi*f/fs)`: measured, `prepare(0)` and
+  `prepare(NaN)` each put 63 of 64 output samples non-finite on a 0.25 input, and `prepare(1.0)` does the
+  same to a HighPass or a Notch. Only the mastering chain was protected, because it validates at its own
+  entrance. This is the second half of the fix `Saturator::prepare` received in v0.26.0.
+- **BREAKING (eq, behaviour):** `EqEngine::captureSectionInput` records the WIDTH it captured, not only
+  the length, and hands back `nullptr` for the columns outside it — the same refusal it already made for
+  an over-long block. They used to point at the PREVIOUS block's audio, so a consumer reading one column
+  too far detected on a signal that was not that block's, silently and on plausible data.
+  `sectionInputChannels()` reports the width.
+- **feat(eq, oversampling):** `resetChannel(int)` on `Svf`, `Crossover2`, `MultibandSplitter` and
+  `PolyphaseOversampler` — purely additive. Clearing one channel's state without restarting the channels
+  that never left is what the isolation half of the fix above needs, and none of them could do it.
+  `PolyphaseOversampler::resetChannel` clears the ring POSITIONS with the samples.
+- **perf(eq):** `Svf::flushDenormals` visits the PREPARED channels instead of `kMaxChannels`. The columns
+  past `ch` are never written and `reset()` zeroes them, so visiting them was a no-op that cost the same
+  as real work — since v0.26.0 the body is two `isfinite` tests and two stores per column rather than a
+  flush, so a mono `Svf` paid for sixteen, once per block, in the primitive every band, lane, crossover
+  and probe calls.
+
+## v0.29.0 — the loudness tag answers for the slot that is sounding, and the chain gives the same bits however you cut it (`rigplayer`, `mastering`)
+
+- **feat(rigplayer):** `soundingLoudness()` — the tag of the model actually carrying the sound, with
+  `tagged`, `blended` and `slot` beside the number. `modelLoudness()` / `modelHasLoudness()` always
+  read slot 0, and slots are handed out by knot parity: on an odd capture the whole sound comes from
+  slot 1 while slot 0 holds a neighbour at zero weight, so a host drawing "the tag of the model
+  sounding" drew the silent one's — or called a tagged model untagged. Three reviewers found it
+  independently.
+  - The slot is chosen by the APPLIED weight, not the requested one: while a model is loading or
+    warming, the old slot is what is audible, and a face has to name what is heard.
+  - `blended` is set only when the weight is strictly between the ends AND the two slots hold
+    different files — at rest both slots hold the same capture, and one number is then the whole
+    truth. During a real crossfade there are two tags in the sound, and an API that returns one
+    without saying so invites the same quiet wrongness this readout exists to end.
+- **BREAKING:** `modelLoudness()` and `modelHasLoudness()` are REMOVED rather than kept as aliases.
+  Their documented meaning is "slot 0" — the defect itself — so an alias would go on answering wrongly
+  for anyone who did not recompile.
+
+<!-- `mastering` shipped in this tag (PR #132, merged before the v0.29.0 release PR #134) but its
+     entry sat under Unreleased until it was moved here, so this file claimed the module was not
+     released for three versions. The text below is that entry, unchanged. -->
 
 - **feat(mastering):** a new module, and the first one that is a **composition** rather than a stage:
   `MasteringChain` — `gain → EQ → [M/S mono-bass] → compressor (optional internal sidechain HPF) →
@@ -67,23 +141,6 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 - **docs(ADR §4):** the "no cross-module glue in the core" rule is amended to what the tree has actually
   been doing since `dynamiceq`: a composite belongs here when IT is the unit under test; the voicing
   stays in the product.
-## v0.29.0 — the loudness tag answers for the slot that is sounding (`rigplayer`)
-
-- **feat(rigplayer):** `soundingLoudness()` — the tag of the model actually carrying the sound, with
-  `tagged`, `blended` and `slot` beside the number. `modelLoudness()` / `modelHasLoudness()` always
-  read slot 0, and slots are handed out by knot parity: on an odd capture the whole sound comes from
-  slot 1 while slot 0 holds a neighbour at zero weight, so a host drawing "the tag of the model
-  sounding" drew the silent one's — or called a tagged model untagged. Three reviewers found it
-  independently.
-  - The slot is chosen by the APPLIED weight, not the requested one: while a model is loading or
-    warming, the old slot is what is audible, and a face has to name what is heard.
-  - `blended` is set only when the weight is strictly between the ends AND the two slots hold
-    different files — at rest both slots hold the same capture, and one number is then the whole
-    truth. During a real crossfade there are two tags in the sound, and an API that returns one
-    without saying so invites the same quiet wrongness this readout exists to end.
-- **BREAKING:** `modelLoudness()` and `modelHasLoudness()` are REMOVED rather than kept as aliases.
-  Their documented meaning is "slot 0" — the defect itself — so an alias would go on answering wrongly
-  for anyone who did not recompile.
 
 ## v0.28.0 — the host states the whole number, and the player does the subtracting (`rigplayer`)
 
