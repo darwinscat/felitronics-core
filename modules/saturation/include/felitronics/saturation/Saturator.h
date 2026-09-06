@@ -76,6 +76,12 @@ public:
         const int lat = (os_ > 1) ? ovs_.latencySamples() : 0;   // align the dry to the wet's round-trip
         for (auto& d : dryDelay_) { d.prepare (lat); d.setDelay (lat); }
         applyParams();
+        // The ledger must die with the buffers it indexes. prepare() REALLOCATES every per-channel vector
+        // above, so a stale count from a wider previous life would send the next drop past the end of the
+        // new ones — measured as an AddressSanitizer container-overflow on dryDelay_ after
+        // prepare(2) -> process -> prepare(1) -> process. prepare() does not call reset(), so this cannot
+        // be left to reset() to do.
+        ranNc_ = ranDcNc_ = 0;
         prepared_ = true;                                              // fully built — process() may now run
         return true;
     }

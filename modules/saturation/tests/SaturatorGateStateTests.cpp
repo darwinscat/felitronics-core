@@ -180,6 +180,42 @@ static void testNoEdgeWithoutSamples()
     ok (equal, "the stream is bit-identical across the empty probe");
 }
 
+static void testRePrepareNarrower()
+{
+    group ("a narrower re-prepare must not leave a ledger pointing past the new buffers");
+
+    // prepare() REALLOCATES every per-channel vector and does NOT call reset(), so a run ledger left over
+    // from a wider previous life indexes storage that no longer exists — an AddressSanitizer
+    // container-overflow on dryDelay_, reached by nothing more exotic than a host changing its bus width.
+    const int N = 64;
+    saturation::Saturator reused, fresh;
+    saturation::Saturator::Params p; p.driveDb = 9.0f; p.mix = 0.5f;
+    reused.setParams (p); fresh.setParams (p);
+
+    ok (reused.prepare (kFs, N, 2), "precondition: the stage prepared wide");
+    std::vector<float> a (N), b (N);
+    float* io2[2] { a.data(), b.data() };
+    for (int k = 0; k < 8; ++k) { fillNoise (a, 3u + (unsigned) k); fillNoise (b, 33u + (unsigned) k); reused.process (io2, 2, N); }
+    ok (peakOf (a) > 0.0, "precondition: the wide life really ran");
+
+    ok (reused.prepare (kFs, N, 1), "the stage re-prepares narrower");
+    ok (fresh.prepare  (kFs, N, 1), "and a fresh instance prepares the same way");
+
+    // Everything prepare() touches is reallocated zeroed, so a correctly re-prepared instance is
+    // indistinguishable from a new one — which is both the safety check and the behaviour check.
+    bool equal = true;
+    std::vector<float> u (N), v (N);
+    float* iou[1] { u.data() }; float* iov[1] { v.data() };
+    for (int k = 0; k < 12; ++k)
+    {
+        fillNoise (u, 500u + (unsigned) k); v = u;
+        reused.process (iou, 1, N);
+        fresh.process  (iov, 1, N);
+        equal = equal && bitEqual (u, v);
+    }
+    ok (equal, "the re-prepared instance is bit-identical to a fresh one");
+}
+
 static void testOversamplerResetChannel()
 {
     group ("PolyphaseOversampler::resetChannel clears the ring AND its position");
@@ -193,18 +229,30 @@ static void testOversamplerResetChannel()
     float* cin[3] { in0.data(), in1.data(), in2.data() };
     float* cup[3] { up0.data(), up1.data(), up2.data() };
 
+    // The block length must NOT divide the ring: 8 blocks of 32 through a 32-slot ring land the cursor
+    // back on zero, and a test run from a zeroed cursor cannot tell a cleared cursor from an uncleared
+    // one no matter what it asserts. 30 is coprime enough to leave it elsewhere. The DOWNsampler is
+    // charged too — its ring is N = L*tpp long and has its own cursor.
+    const int M = 30;
+    std::vector<float> dn0 (M), dn1 (M), dn2 (M);
+    float* cdn[3] { dn0.data(), dn1.data(), dn2.data() };
     for (int k = 0; k < 8; ++k)                              // charge every column with something different
     {
         fillNoise (in0, 1u + (unsigned) k); fillNoise (in1, 9001u + (unsigned) k); fillNoise (in2, 4242u + (unsigned) k);
-        a.upsample (cin, 3, N, cup);
+        a.upsample (cin, 3, M, cup);
+        const float* down[3] { up0.data(), up1.data(), up2.data() };
+        a.downsample (down, 3, M, cdn);
     }
     ok (peakOf (up1) > 0.0, "precondition: the columns really carry history");
 
     a.resetChannel (1);
 
-    // A reset column must behave exactly like one from a never-used instance. If only the ring were
-    // cleared and the cursor left where it was, the column would still be aligned differently and this
-    // comparison would drift; nothing else in the object can hide that.
+    // A reset column must behave exactly like one from a never-used instance. Note what this does NOT
+    // prove: leaving the cursor where it was is UNOBSERVABLE here and everywhere else through this API,
+    // because every read is relative to the post-write cursor, so a uniformly zero ring is the same ring
+    // at any rotation. resetChannel() clears the cursor anyway — a column whose ring is zeroed while its
+    // cursor sits elsewhere is not the fresh column it claims to be — but no test can fail on it, and
+    // saying otherwise would be a test that certifies its own comment.
     std::vector<float> t (N, 0.0f); t[0] = 1.0f;             // an impulse reads the whole history out
     std::vector<float> zero (N, 0.0f);
     std::vector<float> aOut ((std::size_t) N * L), fOut ((std::size_t) N * L);
@@ -226,6 +274,7 @@ int main()
     std::printf ("felitronics::saturation — execution-gate state\n");
 
     testChannelGate();
+    testRePrepareNarrower();
     testIsolation();
     testShapeGate();
     testNoEdgeWithoutSamples();

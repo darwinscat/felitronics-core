@@ -458,6 +458,35 @@ static void testWhatSurvives()
         ok (e > 0.5, "precondition: the stream carried signal");
         ok (equal, "an empty call at a narrower width moves no edge — the stream is bit-identical");
     }
+
+    // (c) A call that processes no CHANNEL is the same kind of non-event, and the width is caller-supplied
+    //     and unclamped from below: a negative one would make the drop's half-open ranges start at a
+    //     negative column and write bqST_[s][-1] — inside the object, where a sanitizer sees nothing.
+    {
+        EqBand dut, ref;
+        dut.prepare (kFs, 2); ref.prepare (kFs, 2);
+        BandParams p = stPlusSide (200.0, 12.0);
+        p.dyn.on = true;
+        dut.setParams (p); ref.setParams (p);
+        dut.setLaneDeltaDb (Lane::Side, -6.0); ref.setLaneDeltaDb (Lane::Side, -6.0);
+
+        std::vector<float> d0 (128), d1 (128), r0 (128), r1 (128);
+        float* dch[2] { d0.data(), d1.data() };
+        float* rch[2] { r0.data(), r1.data() };
+        bool equal = true; double e = 0.0;
+        for (int k = 0; k < 16; ++k)
+        {
+            fillNoise (d0, 21u + (unsigned) k); fillNoise (d1, 71u + (unsigned) k);
+            r0 = d0; r1 = d1;
+            if (k == 6) { dut.processBlock (dch, 0, 128); dut.processBlock (dch, -1, 128); }
+            dut.processBlock (dch, 2, 128);
+            ref.processBlock (rch, 2, 128);
+            equal = equal && bitEqual (d0, r0) && bitEqual (d1, r1);
+            e += peakOf (d0);
+        }
+        ok (e > 0.5, "precondition: the stream carried signal");
+        ok (equal, "a zero-width and a NEGATIVE-width call leave the stream bit-identical, and index nothing");
+    }
 }
 
 //==================================================================================================

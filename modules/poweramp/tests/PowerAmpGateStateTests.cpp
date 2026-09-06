@@ -143,6 +143,54 @@ int main()
         ok (worst == 0.0, "silence in, exact zero out after 2 -> 1 -> 2 (was 0.649 = -3.8 dBFS)");
     }
 
+    group ("the stage's OWN gates: a knob glided to zero stops a real recursion");
+    {
+        // Same defect, at a CONSTANT channel count. The knob glides (~25 ms at block rate), so the gate
+        // closes about 84 blocks after the write — with the filter's state holding live signal. Everything
+        // else in the chain is an FIR or a one-pole that a long silent stretch drains EXACTLY, which is
+        // what makes "zero" the right oracle and is asserted as a precondition before the knob comes back.
+        struct Gate { const char* name; float poweramp::Params::* knob; double wasDbfs; };
+        const Gate gates[4] {
+            { "presence", &poweramp::Params::presence, -44.9 },
+            { "depth",    &poweramp::Params::depth,    -59.7 },
+            { "load",     &poweramp::Params::load,     -35.5 },
+            { "iron",     &poweramp::Params::iron,     -40.2 },
+        };
+
+        for (const Gate& g : gates)
+        {
+            poweramp::PowerAmpStage a; a.prepare (kFs, N, 4);
+            poweramp::Params on = loudParams();
+            on.presence = on.depth = on.load = on.iron = 0.0f;   // exactly ONE gate under test at a time
+            on.*(g.knob) = 0.8f;
+            a.setParams (on, liveVoicing());
+
+            std::vector<float> L ((std::size_t) N, 0.0f), R ((std::size_t) N, 0.0f);
+            float* io[2] { L.data(), R.data() };
+            auto tone = [&] (int k) { for (int i = 0; i < N; ++i) L[(std::size_t) i] = R[(std::size_t) i] = (float) (0.8 * std::sin (0.07 * (k * N + i))); };
+            auto hush = [&] { std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f); };
+
+            double charged = 0.0;
+            for (int k = 0; k < 40; ++k) { tone (k); a.process (io, 2, N); charged = std::fmax (charged, peakOf (L)); }
+            ok (charged > 0.01, std::string ("precondition ") + g.name + ": the gate really was open and driven");
+
+            poweramp::Params off = on; off.*(g.knob) = 0.0f;      // the knob goes to zero...
+            a.setParams (off, liveVoicing());
+            for (int k = 40; k < 200; ++k) { tone (k); a.process (io, 2, N); }   // ...and the gate closes mid-signal
+
+            for (int k = 0; k < 1500; ++k) { hush(); a.process (io, 2, N); }     // drain everything that still runs
+            ok (peakOf (L) == 0.0 && peakOf (R) == 0.0,
+                std::string ("precondition ") + g.name + ": the rest of the chain drained to EXACT zero");
+
+            a.setParams (on, liveVoicing());                                     // the knob comes back
+            double worst = 0.0;
+            for (int k = 0; k < 200; ++k) { hush(); a.process (io, 2, N); worst = std::fmax (worst, std::fmax (peakOf (L), peakOf (R))); }
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "%s gate off -> on: exact zero out of silence (was %.1f dBFS)", g.name, g.wasDbfs);
+            ok (worst == 0.0, msg);
+        }
+    }
+
     group ("isolation: the channel that never left keeps its history bit-exact");
     {
         poweramp::PowerAmpStage dut, ref;

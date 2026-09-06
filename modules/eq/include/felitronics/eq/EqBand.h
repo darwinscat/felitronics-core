@@ -454,7 +454,11 @@ public:
         // branch, and dyn.on stop one just as completely. This generalises what the band already did for
         // itself when EVERY lane went idle; that case is now simply the one where no cell is left running.
         // A call carrying no samples ran nothing, so it stopped nothing — it must not move an edge.
-        if (numSamples > 0) dropStoppedCells (nc, stRun, p.dyn.on);
+        // `nc > 0` is not belt-and-braces: numChannels is caller-supplied and unclamped below, so a
+        // negative width would make the half-open ranges below start at a NEGATIVE column and index
+        // bqST_[s][-1] — inside the object, where a sanitizer cannot see it. It is also the same rule as
+        // the sample count: a call that processes no channel ran nothing, so it stopped nothing.
+        if (numSamples > 0 && nc > 0) dropStoppedCells (nc, stRun, p.dyn.on);
 
         if (! anyRun || numSamples <= 0) return;
 

@@ -146,7 +146,14 @@ public:
                       int numChannels, int numSamples, eq::EqBand& band) noexcept
     {
         if (numSamples <= 0 || numChannels <= 0) return;
-        const int nc = std::clamp (numChannels, 1, ch_);
+        int nc = std::clamp (numChannels, 1, ch_);
+        // The sidechain may be NARROWER than the audio: EqEngine::captureSectionInput records the width it
+        // actually captured and hands back nullptr for the columns outside it, so a caller that captures 1
+        // channel and then asks for 2 would have this loop dereference one. Detect on what was captured
+        // rather than on a null pointer; a lane that ends up with no sidechain at all is refused above.
+        if (sidechain != nullptr)
+            for (int c = 0; c < nc; ++c) if (sidechain[c] == nullptr) { nc = c; break; }
+        if (nc <= 0) { if (engaged_) { disengage (band); engaged_ = false; } band.processBlock (audio, std::clamp (numChannels, 1, ch_), numSamples); return; }
 
         // Disengaging must not leave the band frozen mid-duck: zero the seams and drop the
         // detector/programme/GR state once, on the edge. Without this, toggling dynamics off during a
