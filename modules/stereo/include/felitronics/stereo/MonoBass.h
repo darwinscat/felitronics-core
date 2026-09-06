@@ -6,6 +6,7 @@
 #include <felitronics/stereo/MidSide.h>
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/core/Smoother.h>
+#include <felitronics/core/StateGrid.h>
 
 #include <algorithm>
 #include <cmath>
@@ -93,6 +94,7 @@ public:
         widthSm_.setCurrentAndTargetValue (lowWidth_);
         xfSm_.setCurrentAndTargetValue (lowWidth_ >= 1.0f ? 1.0f : 0.0f);
         xo_.reset();
+        grid_.reset();                              // a stream restart re-anchors the maintenance grid
         bypassed_ = false;
     }
 
@@ -139,6 +141,7 @@ public:
         if (numChannels != 2 || ! enabled_ || (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f)))
         {
             if (! bypassed_) { bypassed_ = true; xo_.reset(); }
+            if (n > 0) grid_.skip (n);      // bypassed audio is still audio TIME — keep the grid anchored
             return;
         }
         bypassed_ = false;
@@ -146,6 +149,18 @@ public:
         float* R = io[1];
         for (int i = 0; i < n; ++i)
         {
+            // SETTLING INTO FULL-WIDE IS A SAMPLE EVENT, not a call event. `xfSm_` arrives inside this
+            // loop, and testing for it only at the top of the next call left every sample in between
+            // going through the M/S round trip — which is NOT the identity in float (0.5(L+R) + 0.5(L-R)
+            // rounds twice), so the output depended on where the caller cut: measured 1 LSB of 24 bit
+            // (5.96e-08) on 22953 of 336000 samples across the re-slicing sweep. Same test, same
+            // one-shot reset, moved to the clock it belongs on.
+            if (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f))
+            {
+                bypassed_ = true; xo_.reset();
+                grid_.skip (n - i);           // the bypassed remainder is still audio time
+                return;
+            }
             const float w  = widthSm_.getNextValue();
             const float xf = xfSm_.getNextValue();
             float m, s; MidSide::encode (L[i], R[i], m, s);
@@ -153,8 +168,15 @@ public:
             const float wet  = w * lp + hp;                  // side magnitude (w + r⁴)/(1+r⁴) — bump-free (LR4 in-phase)
             const float sOut = xf * s + (1.0f - xf) * wet;   // ≠ wet only while fading into/out of full-wide
             MidSide::decode (m, sOut, L[i], R[i]);
+            // LAW 8 on the AUDIO-TIME grid, not at the end of the call: the flush zeroes state, so
+            // putting it where the caller happened to cut made the output a function of the host's
+            // block size (measured on this stage: 37180 of 40000 tail samples differ between a
+            // whole-file call and one-sample calls, and a whole-file call never flushed at all).
+            // One increment and a compare per sample; the flush itself still runs once per period.
+            if (grid_.advance (1)) xo_.flushDenormals();
         }
-        xo_.flushDenormals();
+        // The poison half stays per call — see eq::Biquad::healPoison(). Invisible on a finite stream.
+        xo_.healPoison();
     }
 
 private:
@@ -169,6 +191,7 @@ private:
     float  freq_ = 120.0f, lowWidth_ = 0.0f;
     bool   enabled_ = true, bypassed_ = false;
     eq::Crossover2 xo_;                             // the Side-channel LR4 split (the primitive extracted from here, reused back)
+    core::StateGrid grid_;                          // law 8 on audio time, never on the caller's block
     core::LinearSmoother widthSm_ { 0.0f }, xfSm_ { 0.0f };
 };
 

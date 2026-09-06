@@ -115,6 +115,19 @@ public:
         outTap.reset();
     }
 
+    // A STOP, not a restart: clear what the previous audio left behind and leave the parameter epoch
+    // alone — see `EqBand::clearAudioState()`. This is what a consumer that skips the engine for a while
+    // wants at the bypass edge, and it is what `reset()` used to do before reset() became a real stream
+    // restart. Reaching for reset() there would now also snap every ramp in flight and make the next
+    // parameter write a hard step.
+    void clearAudioState() noexcept
+    {
+        scValid_ = scNc_ = 0;   // the captured section input belongs to audio that will not be continued
+        for (auto& b : bands) b.clearAudioState();
+        inTap.reset();
+        outTap.reset();
+    }
+
     void setBand (int i, const BandParams& p) noexcept
     {
         if (i >= 0 && i < kMaxBands) bands[(size_t) i].setParams (p);

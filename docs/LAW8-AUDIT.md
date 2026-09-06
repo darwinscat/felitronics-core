@@ -204,6 +204,39 @@ reaching the stage at all**, which is what `felitronics::mastering` does with a 
 and why it has one. A future re-audit should measure the whole-file shape for every row above rather than
 assume the sweep covered it.
 
+### ✅ CLOSED for `eq` and `stereo` — option (a), on a GRID rather than per sample
+
+The window that made (a) expensive closed (TabbyEQ has no audience), and the cheap form of it is a
+sample-phase counter rather than a per-sample branch: `core::StateGrid`, period 64 samples, described as
+law 8a in [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md). `eq::EqBand` (and therefore `EqEngine`) and
+`stereo::MonoBass` now flush there. Measured, same fixture as the table above:
+
+| | `eq::EqEngine` | `stereo::MonoBass` |
+|---|---:|---:|
+| tail samples differing between a whole-file call and one-sample calls, BEFORE | 38 522 of 40 000 | 37 180 of 40 000 |
+| … AFTER | **0** | **0** |
+| subnormal tail samples on a whole-file call, BEFORE | 37 678 | 32 842 |
+| … AFTER | **0** | **0** |
+| non-finite outputs after ONE +Inf, whole-file call, BEFORE | 479 900 of 480 000 | — |
+| … AFTER | **28** (≤ one grid period) | — |
+
+The flush cadence and the **control** cadence moved together, because block-invariance is false without
+both: `core::Smoother::advance(n)` is a closed form in `pow(coeff, n)`, and `pow(c,a)·pow(c,b)` is not
+`pow(c,a+b)` in binary64, so a band with a ramp in flight was slicing-dependent at **1.31 full scale** —
+eight orders of magnitude louder than the denormal effect and invisible to a fixture that only renders
+settled parameters. `EqBand` now advances its smoothers by exactly one period per grid tick and redesigns
+there; a MATERIAL change (type, slope, swept, on/bypass, an active lane's design) still applies at the
+call boundary, because the run flags and the stopped-cell ledger already read the new parameters and
+would otherwise run the new topology on the old coefficients for up to 63 samples.
+
+**Still per call, measured and left for their own pass** — same mechanism, different owners:
+`deesser::DeEsser` (1 735 samples of 336 000 slicing-dependent, worst 1.97e-17), `dynamiceq::DynamicEqBand`
+(5 844, worst 2.46e-16), `dynamiceq::LaneDynamics` (its 16-sample control grid restarts at every call),
+`dynamics::Compressor` / `NoiseGate` / `TransientShaper` (their followers), `multiband::MultibandProcessor`,
+`poweramp::PowerAmpStage`, `rigplayer::RigPlayer`, `limiter::TruePeakLimiter` (its internal chunk loop is
+anchored at the call, not at audio time), and the offline `EnvelopeAnalyzer` / `ThresholdSolver`, which
+flush once per WHOLE KEY and so carry the whole-file hole into the solver.
+
 ---
 
 ## How these are tested
