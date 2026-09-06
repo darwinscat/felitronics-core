@@ -167,6 +167,16 @@ public:
         }
     }
 
+    // The POISON half alone, for an owner that runs it at the end of every call while the denormal half
+    // rides the audio-time grid — see `eq::Biquad::healPoison()` for why the two halves have different
+    // clocks. On a stream whose state stays finite this cannot change a bit, so it costs the grid's
+    // slicing-invariance nothing.
+    void healPoison() noexcept
+    {
+        for (int c = 0; c < ch; ++c)
+            if (! std::isfinite (ic1[c]) || ! std::isfinite (ic2[c])) { ic1[c] = 0.0f; ic2[c] = 0.0f; }
+    }
+
 private:
     double fs = 44100.0;
     int    ch = 2;

@@ -330,15 +330,16 @@ public:
         if (cfg_.dither)     dith_.reset();
         for (int c = 0; c < core::kMaxChannels; ++c) hpf_[c].reset();
         std::fill (keyBuf_.begin(), keyBuf_.end(), 0.0f);
-        // A stream restart has to restore the PARAMETER smoothers too, and summing the stages' own
-        // resets does not do it: `EqBand::reset()` clears filter state and deliberately leaves the
-        // freq/Q/gain smoothers where they are. Measured before this line existed — set a band to 0 dB,
-        // render, set it to +9 dB (a 30 ms ramp), render 10 ms of it, reset, render again: the result
-        // differed from a freshly prepared chain by up to 0.51, full scale, because the ramp simply
-        // resumed. That would have made `OfflineRenderer`'s "two renders of the same input are
-        // bit-identical" false for any programme whose parameters moved during the first pass.
+        // The PARAMETER smoothers are restored by the stages' own resets now. This line used to carry
+        // `forceSnap_ = true` as well, because `EqBand::reset()` cleared filter state and deliberately
+        // left the freq/Q/gain smoothers where they were: set a band to 0 dB, render, set it to +9 dB
+        // (a 30 ms ramp), render 10 ms of it, reset, render again, and the result differed from a
+        // freshly prepared chain by up to 0.51 FULL SCALE because the ramp simply resumed — which would
+        // have made `OfflineRenderer`'s "two renders of the same input are bit-identical" false for any
+        // programme whose parameters moved during the first pass. `EqBand::reset()` now snaps, so the
+        // workaround (write every band with its lanes off, then write them back, so the real write is
+        // seen as a first write) is gone with the defect it was hiding.
         paramsDirty_ = true;
-        forceSnap_   = true;
         bypassKnown_ = false;
     }
 
@@ -439,7 +440,7 @@ private:
         if (eq_ != nullptr)
         {
             if (! params_.bypassEq) eq_->process (ch, nch_, K_);
-            else if (bypassChanged_.eq) eq_->reset();
+            else if (bypassChanged_.eq) eq_->clearAudioState();   // a STOP, not a stream restart
         }
 
         // --- M/S mono-bass (zero latency) ------------------------------------------------------
@@ -535,25 +536,7 @@ private:
         preLimGain_ = gainOf (p.preLimiterGainDb);
 
         if (eq_)
-        {
-            // Make the write below behave like the FIRST write after prepare(), which snaps. `EqBand`
-            // snaps a lane whose previous state was OFF and ramps one that stays on, so writing every
-            // lane off first turns the real write into a snap. There is no other way in: `initialized`
-            // is only cleared by `EqBand::prepare`, and reaching it means `EqEngine::prepare`, which
-            // allocates. Two stores per band, on a reset, and nothing at all on the streaming path.
-            if (forceSnap_)
-            {
-                for (int i = 0; i < eq::EqEngine::kMaxBands; ++i)
-                {
-                    eq::BandParams off = p.eqBands[i];
-                    off.on = false;
-                    for (eq::LaneParams& l : off.lanes) l.on = false;
-                    eq_->setBand (i, off);
-                }
-                forceSnap_ = false;
-            }
             for (int i = 0; i < eq::EqEngine::kMaxBands; ++i) eq_->setBand (i, p.eqBands[i]);
-        }
         if (cfg_.monoBass) monoBass_.setParams (p.monoBass);
 
         if (cfg_.compressor)
@@ -587,7 +570,7 @@ private:
 
     double fs_ = 48000.0;
     int    nch_ = 0, K_ = 0, pos_ = 0, latency_ = 0;
-    bool   prepared_ = false, paramsDirty_ = true, bypassKnown_ = false, forceSnap_ = true;
+    bool   prepared_ = false, paramsDirty_ = true, bypassKnown_ = false;
 
     MasteringChainConfig cfg_ {};
     MasteringChainParams params_ {}, pendingParams_ {};

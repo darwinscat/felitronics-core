@@ -7,6 +7,54 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **fix(core, eq, stereo):** **law 8's denormal flush ran once per `process()` call, so the caller's
+  block size decided where a numerical event landed.** New `core::StateGrid` — a phase counter over
+  AUDIO samples, period 64, re-anchored by `reset()` — and `eq::EqBand` (hence `EqEngine`) and
+  `stereo::MonoBass` now do their periodic maintenance there. The rule is written up as **law 8a** in
+  `docs/DSP-ARCHITECTURE.md`; two modules had already reached it independently (`analysis::LoudnessMeter`
+  per 10 ms sub-hop, `saturation::Saturator` per sample).
+  - **BREAKING (behaviour), `eq` and `stereo`:** output moves. On settled parameters the change is
+    confined to the sub-audible: 8.3 % of samples over a 27 M-sample sweep, worst difference 1.95e-13,
+    loudest differing sample −127 dBFS. With a parameter ramp in flight it is large and intended
+    (worst 1.25 full scale) — the smoothers now advance by exactly one grid period per tick instead of
+    by the whole call, which is what makes a ramping band slicing-invariant at all.
+  - What it buys, measured: a whole-file render of a bell into silence went from **38 522 of 40 000 tail
+    samples differing** from a one-sample-at-a-time render to **0**; from **37 678 subnormal tail
+    samples** (the 10–100× stall on any CPU without hardware FTZ) to **0**; and one `+Inf` input sample,
+    which used to poison **479 900 of the next 480 000 samples** of a whole-file render, is now healed
+    within one grid period (28 samples). A host with a block SHORTER than a period keeps its immediate
+    recovery: the `isfinite` half of the flush still runs at the end of every call
+    (`eq::Biquad::healPoison()`, `eq::Svf::healPoison()`, `eq::Crossover2::healPoison()` — additive).
+  - **BREAKING (behaviour), `dynamiceq::LaneDynamics`:** it drives `eq::EqBand` in 16-sample control
+    chunks, so the band's STATIC freq/Q/gain glide used to advance every 16 samples and now advances
+    every 64. Measured on a 500 → 5000 Hz +12 dB edit with 30 ms smoothing: designs per 100 ms
+    300 → 75, largest single step 2.15 → 3.22 dB — still finer than any real host block gave before
+    (a 512-sample host took 10 steps of 11.8 dB), but it moved, and a dynamic band is where edit
+    smoothness is most visible. The gain DELTA itself is unaffected: it is an arrival, still consumed
+    at the producer's 16-sample cadence.
+  - **BREAKING (behaviour), `stereo::MonoBass`:** settling into the full-wide bypass is now decided per
+    sample instead of at the top of the next call. The samples in between used to take the M/S round
+    trip, which is not the identity in float — 1 LSB of 24 bit (5.96e-08) on 22 953 samples of the
+    re-slicing sweep, and it made the output depend on where the caller cut.
+- **BREAKING (behaviour), `eq::EqBand::reset()`:** it is now a real STREAM RESTART — it re-snaps the
+  freq/Q/gain smoothers, redesigns, and clears `initialized` so the first parameter write after it snaps,
+  exactly as the first write after `prepare()` does. It used to clear filter state and leave the
+  smoothers mid-glide, so a second render of the same programme started from a different design: measured
+  **0.51 full scale** against a freshly prepared chain. `mastering::MasteringChain` carried that as a
+  `forceSnap_` workaround (writing every band with its lanes off and then writing them back); the
+  workaround is deleted, and the chain is bit-identical without it across 20 scenarios × 1 152 000 samples.
+- **NEW API, `eq::EqBand::clearAudioState()` / `eq::EqEngine::clearAudioState()`:** a STOP — clear what
+  the previous audio left behind (filter memory, participation ledgers, dynamic seams, design-key caches)
+  and leave the parameter epoch and the grid phase alone. This is what a consumer skipping the engine for
+  a while actually wants at a bypass edge; `reset()` there would now also snap every ramp in flight and
+  turn the next parameter write into a hard step. **`mastering::MasteringChain` was updated; an external
+  consumer that calls `EqEngine::reset()` on an EQ-off edge (OrbitCab's `AmpEq::process`) should switch
+  to `clearAudioState()` to keep today's behaviour.**
+- **fix(core):** `core::Smoother::advance(n)` memoises `pow(coeff, n)` on `n`, dropped whenever `coeff`
+  changes. Bit-identical by construction (`pow` is a pure function) — pinned by a test, and by the
+  bit-exact null of every existing consumer — and it is what keeps a transcendental per parameter per
+  grid period off the audio thread.
+
 - **fix(eq, saturation, dynamiceq, deesser, poweramp, convolution, multiband, dither):** **a filter that
   is not called does not decay — it FREEZES**, and replays a signal from before the gap when it is called
   again. Eleven instances of one shape: a cell of per-channel or per-lane recursion behind a gate the

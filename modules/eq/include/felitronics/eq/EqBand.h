@@ -6,6 +6,7 @@
 #include <felitronics/eq/EqTypes.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/core/Smoother.h>
+#include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/Svf.h>
 
 #include <algorithm>
@@ -339,20 +340,23 @@ public:
             LaneRt& rt = laneRt_[(std::size_t) l];
             rt.freqS.prepare (fs, smoothMs); rt.qS.prepare (fs, smoothMs); rt.gainS.prepare (fs, smoothMs);
         }
-        snapAll();
         svf_.prepare (fs, ch);
         deltaST_.prepare (fs, ch);
         for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.prepare (fs, 1);
         lastType_ = p.type;
-        updateCoeffs();
-        recomputePending = false;
-        initialized = false;
-        reset();
+        reset();                                              // prepare's tail IS a stream restart — see reset()
         prepared_ = true;                                     // fully built — processBlock may now run
         return true;
     }
 
-    void reset() noexcept
+    // Clear everything the PREVIOUS AUDIO left behind, and nothing else: filter memory, the participation
+    // ledgers, the dynamic seams and the design-key caches. What a STOP needs — a stage that is skipped for
+    // a while and comes back must not re-emit audio from before the gap, but it is still the same stream and
+    // the same parameter trajectory, so the smoothers, the targets and the grid phase are none of its
+    // business. This is the operation `MasteringChain` and OrbitCab reach for at a bypass edge, and it is
+    // the granularity P18 settled on inside this file: a stop clears signal memory, only an explicit
+    // reset() restarts the parameter epoch.
+    void clearAudioState() noexcept
     {
         resetST();
         for (const Lane l : kMonoLanes) resetLane (laneRt_[(std::size_t) l]);
@@ -360,8 +364,8 @@ public:
         // next block would compute a falling edge against a stream that no longer exists.
         ranMatchedST_ = ranSweptST_ = ranDeltaST_ = 0;
         for (int i = 0; i < kNumLanes; ++i) ranLane_[i] = ranLaneDelta_[i] = false;
-        // Reset must leave NO live delta: the seam is state like any other, and a stream restart that
-        // kept it would apply the previous stream's gain reduction to the first block of the new one.
+        // No live delta may survive: the seam is state like any other, and a restart that kept it would
+        // apply the previous stream's gain reduction to the first block of the new one.
         deltaST_.reset(); deltaSTDb_ = 0.0;
         deltaAppliedST_ = std::numeric_limits<double>::quiet_NaN();
         for (const Lane l : kMonoLanes)
@@ -373,6 +377,29 @@ public:
             rt.deltaApplied = rt.freqApplied = rt.qApplied = std::numeric_limits<double>::quiet_NaN();
         }
         stFreqApplied_ = stQApplied_ = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    // A STREAM RESTART, and now it means what the house signature says: the band is left in exactly the
+    // state prepare() leaves it in, so `prepare()` is this plus the rate/width setup and cannot drift from
+    // it. It used to clear the filters and deliberately leave the freq/Q/gain smoothers wherever the
+    // previous stream had pushed them, which made a second render of the same programme start from a
+    // different design — measured before the workaround that hid it: a band edited from 0 to +9 dB, 10 ms
+    // of the 30 ms ramp rendered, reset, rendered again, differed from a freshly prepared chain by 0.51
+    // FULL SCALE. `MasteringChain` carried that as `forceSnap_`, writing every band with its lanes off and
+    // then writing them back so the real write would snap; the workaround is gone with the defect.
+    // `initialized = false` is the half that is easy to miss and is REQUIRED: without it a write arriving
+    // AFTER the reset ramps from the old value instead of snapping, which is the same defect one call
+    // later — and it is the right contract on its own, since "the first write after a restart snaps" is
+    // exactly what a first write after prepare() already does.
+    void reset() noexcept
+    {
+        clearAudioState();
+        grid_.reset();               // a stream restart re-anchors the audio-time maintenance grid
+        snapAll();
+        updateCoeffs();
+        recomputePending = false;
+        settlePending_   = false;
+        initialized      = false;
     }
 
     //==========================================================================
@@ -484,17 +511,65 @@ public:
 
         if (numSamples <= 0) return;   // no samples, no time: nothing advances and no edge moves
 
-        // Advance every lane's smoothers (closed form; an idle/snapped smoother is a settled no-op).
-        stFreqS_.advance (numSamples); stQS_.advance (numSamples); stGainS_.advance (numSamples);
+        // A MATERIAL change — type, slope, swept, on/bypass, or an active lane's design — takes effect
+        // HERE, at the call boundary, exactly as it always did. It cannot wait for the next grid tick:
+        // the run flags and dropStoppedCells above already read the NEW params, so up to kPeriod-1
+        // samples would run the new topology on the old coefficients (a swept band re-enabled after a
+        // static stretch would drive `svf_` with whatever its last swept episode left there). What waits
+        // for the grid is the RAMP, which is a continuous approximation and has no such coupling.
+        // `settlePending_` is ARMED here, not just cleared: this design is made from the smoother values
+        // as they stand BEFORE the first tick advances them, so the tick owes one redesign whatever it
+        // then finds. Without the arming, a glide that LANDS on its first tick — which is every glide
+        // when `smoothMs` is 0, and any glide that starts within `settled()`'s epsilon — read
+        // `moving == false` and was never designed at its target at all: measured, a 500 -> 4000 Hz
+        // write at smoothMs 0 left the band answering +0.919 dB at 4 kHz where +12 was asked, for ever.
+        if (recomputePending) { updateCoeffs(); recomputePending = false; settlePending_ = true; }
+
+        // Dynamics is opt-in per point: with dyn.on false nothing below touches the signal, so a
+        // static band is bit-identical to one built before dynamics existed. The delta stays on the
+        // CALLER's clock deliberately — it is a value pushed in by setLaneDeltaDb() at whatever cadence
+        // its producer runs (felitronics::dynamiceq drives it every 16 samples), so quantising it to
+        // kPeriod would round a 1 ms attack up to 1.33 ms. It is an arrival, not maintenance.
+        const bool dyn = p.dyn.on;
+        if (dyn) updateDeltaCoeffs();
+
+        // THE SEGMENT LOOP. Everything periodic — the parameter ramp, the redesign it earns, and the
+        // law-8 flush — happens at `core::StateGrid` boundaries, which are counted in AUDIO samples and
+        // therefore fall on the same absolute indices however the caller sliced the stream. The audio
+        // itself is untouched by the split: each lane's recursion is per-sample and the M/S fold reads
+        // L and R after they were written for the SAME sample, so processing [a,b) lane by lane inside a
+        // segment is the identical sequence of operations.
+        for (int off = 0; off < numSamples; )
+        {
+            if (grid_.phase() == 0) tick (anyRun);
+            const int seg = grid_.segment (numSamples - off);
+            if (anyRun) runAudio (channels, nc, off, seg, stRun, lRun, rRun, mRun, sRun, dyn);
+            grid_.advance (seg);
+            off += seg;
+        }
+
+        // The POISON half, per call and on top of the grid. See eq::Biquad::healPoison(): a NaN's only
+        // quality is how soon it goes, and a 16-sample host must not start waiting 64. On a stream whose
+        // state stays finite this line cannot change a bit, so the invariance claim above survives it.
+        healState();
+    }
+
+private:
+    // One grid tick: advance the parameter ramp by exactly kPeriod samples, redesign if it moved, then
+    // run law 8. ALWAYS exactly kPeriod — a partial segment must not advance control, or the ramp would
+    // be back on the caller's clock (advance(17) then advance(47) is not advance(64) in binary64).
+    void tick (bool anyRun) noexcept
+    {
+        stFreqS_.advance (core::StateGrid::kPeriod); stQS_.advance (core::StateGrid::kPeriod); stGainS_.advance (core::StateGrid::kPeriod);
         for (const Lane l : kMonoLanes)
         {
             LaneRt& rt = laneRt_[(std::size_t) l];
-            rt.freqS.advance (numSamples); rt.qS.advance (numSamples); rt.gainS.advance (numSamples);
+            rt.freqS.advance (core::StateGrid::kPeriod); rt.qS.advance (core::StateGrid::kPeriod); rt.gainS.advance (core::StateGrid::kPeriod);
         }
 
-        // Recompute only when a RUNNING lane actually moves — a static, settled band skips the trig.
+        // Recompute only when an ENABLED lane actually moves — a static, settled band skips the trig.
         bool moving = false;
-        if (stRun) moving = moving || ! (stFreqS_.settled() && stQS_.settled() && stGainS_.settled());
+        if (laneOn (Lane::Stereo)) moving = ! (stFreqS_.settled() && stQS_.settled() && stGainS_.settled());
         // ENABLED, not running: a lane that is switched on keeps earning redesigns even while the channel
         // count parks it, because its smoothers advance regardless (above) and updateCoeffs() is what turns
         // a smoothed value into coefficients. Gating this on xRun let a lane settle unseen during a mono
@@ -507,24 +582,38 @@ public:
         if (laneOn (Lane::Right)) moving = moving || laneMoving (Lane::Right);
         if (laneOn (Lane::Mid))   moving = moving || laneMoving (Lane::Mid);
         if (laneOn (Lane::Side))  moving = moving || laneMoving (Lane::Side);
-        if (recomputePending || moving) { updateCoeffs(); recomputePending = moving; }
+        // `settlePending_` is the ramp's last step: the tick on which a smoother finally lands reads
+        // `settled()`, so without carrying one more redesign the settled value would never be designed.
+        if (settlePending_ || moving) { updateCoeffs(); settlePending_ = moving; }
 
-        // ONLY THE AUDIO STOPS. A parameter ramp runs on the caller's clock, and the smoothers above have
-        // always advanced for lanes that were not running — the fully-idle band was the one case that fell
-        // out of that rule, because the return used to sit above them. It made the SAME edit arrive at two
+        // AND THE MOVING BELL FOLLOWS THE STATIC ONE. updateDeltaCoeffs() reads the SMOOTHED freq/Q —
+        // "the moving part travels with the static curve during a ramp instead of jumping ahead of it" —
+        // so it has to be redesigned wherever those move, which is here. Doing it only at the call
+        // boundary (where the arriving delta VALUE is consumed) left the bell designed at the frequency
+        // the smoothers held BEFORE this tick, and on a whole-stream call left it there for the whole
+        // render: measured on a 500 -> 4000 Hz ramp with a constant -12 dB delta, the static band was at
+        // 652.1 Hz while the delta bell sat at 500 Hz, and a 1024-sample call differed from 16-sample
+        // calls on 1008 of 1024 samples, worst 0.27. Free when nothing moved — every branch inside is
+        // keyed on the applied freq/Q/delta bits.
+        if (p.dyn.on) updateDeltaCoeffs();
+
+        // ONLY THE AUDIO STOPS. A parameter ramp runs on the caller's clock, and the smoothers above
+        // advance for lanes that are not running — the fully-idle band was the one case that fell out of
+        // that rule, because the early return used to sit above them. It made the SAME edit arrive at two
         // different times depending on whether some unrelated lane happened to be on: with a flat 0 dB
         // companion keeping the band alive the design tracked through the gap, and without one the ramp
         // froze and finished ~200 ms AFTER the stream came back (measured: a 500 -> 4000 Hz edit parked at
         // 651.5 Hz for a one-second mono stretch, then 1548 Hz at 10 ms, 3536 at 50 ms, 3984 at 200 ms).
-        // An inert lane deciding another lane's behaviour is the defect this file has already closed once;
-        // this is the same shape, one gate further out. Nothing below this line touches a stopped cell.
-        if (! anyRun) return;
+        // Nothing below this line touches a stopped cell: with no lane running there is no state to flush
+        // — dropStoppedCells cleared every cell on the falling edge — so the flush is skipped, not owed.
+        if (anyRun) flushState();
+    }
 
-        // Dynamics is opt-in per point: with dyn.on false nothing below touches the signal, so a
-        // static band is bit-identical to one built before dynamics existed.
-        const bool dyn = p.dyn.on;
-        if (dyn) updateDeltaCoeffs();
-
+    // `numSamples` samples of one grid segment, starting at `off`. Byte-for-byte the loop that used to
+    // run over the whole call.
+    void runAudio (float* const* channels, int nc, int off, int numSamples,
+                   bool stRun, bool lRun, bool rRun, bool mRun, bool sRun, bool dyn) noexcept
+    {
         // (1) ST lane — per channel. The swept SVF path only runs in the single-ST config; matched
         //     biquads otherwise. (The swept engine legitimately runs on mono and surround too.)
         if (stRun)
@@ -532,13 +621,13 @@ public:
             if (sweptActive())
                 for (int c = 0; c < nc; ++c)
                 {
-                    float* d = channels[c];
+                    float* d = channels[c] + off;
                     for (int n = 0; n < numSamples; ++n) d[n] = svf_.processSample (c, d[n]);
                 }
             else
                 for (int c = 0; c < nc; ++c)
                 {
-                    float* d = channels[c];
+                    float* d = channels[c] + off;
                     for (int n = 0; n < numSamples; ++n)
                     {
                         float x = d[n];
@@ -552,8 +641,8 @@ public:
         // (2) L lane on ch0, R lane on ch1, then (3) the M/S delta-fold — 2-channel only.
         if (nc == 2)
         {
-            float* L = channels[0];
-            float* R = channels[1];
+            float* L = channels[0] + off;
+            float* R = channels[1] + off;
 
             if (lRun)
             {
@@ -594,10 +683,9 @@ public:
                 }
             }
         }
-
-        flushState();   // per-block denormal guard
     }
 
+public:
     // Complex frequency response of ONE axis at digital w (rad/sample) from the band's current smoothed
     // coefficients: H_ST · H_a (an idle lane's column is designN==0 → contributes identity). Best-effort
     // LIVE readout — for a guaranteed race-free GUI curve prefer the free compositeResponse().
@@ -802,6 +890,11 @@ private:
         }
     }
 
+    // Law 8, once per `core::StateGrid` period. DESIGNED SECTIONS ONLY, which is not an optimisation
+    // dressed as one: a section past `designN` was zeroed by resetST()/resetLane() at the topology change
+    // that shrank the count and is never written by the audio loop, so visiting it was always a
+    // guaranteed no-op — 48 Biquads scanned where a stereo one-section bell has 2. That headroom is what
+    // pays for running this eight times more often than a 512-sample host used to.
     void flushState() noexcept
     {
         if (p.dyn.on)   // Law 8 for the moving part too — these are feedback kernels like any other
@@ -811,11 +904,32 @@ private:
         }
         if (sweptActive()) svf_.flushDenormals();
         else for (int c = 0; c < ch; ++c)
-                 for (int s = 0; s < kMaxSections; ++s) bqST_[s][c].flushDenormals();
+                 for (int s = 0; s < designNST_; ++s) bqST_[s][c].flushDenormals();
         for (const Lane l : kMonoLanes)
         {
             LaneRt& rt = laneRt_[(std::size_t) l];
-            for (int s = 0; s < kMaxSections; ++s) rt.bq[s].flushDenormals();
+            for (int s = 0; s < rt.designN; ++s) rt.bq[s].flushDenormals();
+        }
+    }
+
+    // The poison half of the same sweep, run at the END OF EVERY CALL rather than on the grid — see
+    // eq::Biquad::healPoison(). Cannot change a bit while the state is finite, so it is invisible to the
+    // slicing-invariance claim; it exists so a host with a block SHORTER than a grid period keeps the
+    // recovery it has today instead of waiting for the next boundary.
+    void healState() noexcept
+    {
+        if (p.dyn.on)
+        {
+            deltaST_.healPoison();
+            for (const Lane l : kMonoLanes) laneRt_[(std::size_t) l].delta.healPoison();
+        }
+        if (sweptActive()) svf_.healPoison();
+        else for (int c = 0; c < ch; ++c)
+                 for (int s = 0; s < designNST_; ++s) bqST_[s][c].healPoison();
+        for (const Lane l : kMonoLanes)
+        {
+            LaneRt& rt = laneRt_[(std::size_t) l];
+            for (int s = 0; s < rt.designN; ++s) rt.bq[s].healPoison();
         }
     }
 
@@ -868,8 +982,10 @@ private:
     double fs = 44100.0;
     int    ch = 2;
     bool   prepared_ = false;                 // true only after a fully-successful prepare()
-    bool   recomputePending = true;
+    bool   recomputePending = true;   // a MATERIAL change is pending: applied at the next call boundary
+    bool   settlePending_   = false;  // the ramp's last redesign, owed to the tick AFTER a smoother lands
     bool   initialized = false;
+    core::StateGrid grid_;            // audio-time maintenance + control clock (see core/StateGrid.h)
     FilterType lastType_ = FilterType::Bell;
 
     // What actually ADVANCED state on the previous sample-bearing call — the channel count that ran, 0 for

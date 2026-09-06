@@ -57,6 +57,10 @@ public:
 
     void flushDenormals() noexcept { lp1_.flushDenormals(); lp2_.flushDenormals(); hp1_.flushDenormals(); hp2_.flushDenormals(); }
 
+    // The poison half alone, for an owner running it per call while the denormal half rides the
+    // audio-time grid — see `eq::Biquad::healPoison()`.
+    void healPoison() noexcept { lp1_.healPoison(); lp2_.healPoison(); hp1_.healPoison(); hp2_.healPoison(); }
+
 private:
     static constexpr double kQ = 0.7071067811865476;   // 1/√2 Butterworth → cascade = 4th-order Linkwitz-Riley
     float freq_ = 1000.0f;
