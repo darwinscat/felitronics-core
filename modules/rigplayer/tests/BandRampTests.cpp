@@ -27,6 +27,9 @@ using namespace felitronics::rigplayer;
 using felitronics::test::ok;
 using felitronics::test::group;
 
+// Portable: MSVC's <cmath> lacks kPi by default, and the repo's own convention
+// (io/tests/WavTests.cpp:25) is a local constant rather than _USE_MATH_DEFINES.
+static constexpr double kPi = 3.14159265358979323846;
 static constexpr double kFs = 48000.0;
 // The rails are TIME, so the suite derives its expectations from the rate exactly as the header does.
 static const int kRampMin = (int) (RigPlayer::kBandRampMinSeconds * kFs);
@@ -192,8 +195,8 @@ static void renderThroughPlayer (int block, double fromDial, double toDial, int 
     p.setDial ("bass", fromDial);
     out.assign ((std::size_t) n, 0.0f);
     for (int i = 0; i < n; ++i)
-        out[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs)
-                                      + 0.2 * std::sin (2.0 * M_PI * 1400.0 * (double) i / kFs));
+        out[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs)
+                                      + 0.2 * std::sin (2.0 * kPi * 1400.0 * (double) i / kFs));
     auto span = [&] (int from, int to)
     {
         for (int off = from; off < to; off += block)
@@ -300,7 +303,7 @@ static void testTheMoveIsTheSameHoweverItIsCut()
             p.setDial ("bass", 0.0);
             o.assign ((std::size_t) n, 0.0f);
             for (int i = 0; i < n; ++i)
-                o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs));
+                o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs));
             auto span = [&] (int from, int to) {
                 for (int off = from; off < to; off += block)
                 { const int c = std::min (block, to - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
@@ -353,7 +356,7 @@ static void testARestartedRampDoesNotJump()
         p.setDial ("bass", startDial);
         o.assign ((std::size_t) n, 0.0f);
         for (int i = 0; i < n; ++i)
-            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs));
+            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs));
         auto call = [&] (int from, int to)
         {
             for (int off = from; off < to; off += 64)
@@ -415,8 +418,8 @@ static void testTheRampNullsAnOracle()
 
     std::vector<float> in ((std::size_t) n);
     for (int i = 0; i < n; ++i)
-        in[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs)
-                                     + 0.2 * std::sin (2.0 * M_PI * 1400.0 * (double) i / kFs));
+        in[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs)
+                                     + 0.2 * std::sin (2.0 * kPi * 1400.0 * (double) i / kFs));
 
     RigPlayer p;
     p.prepare (kFs, n, 2);                                     // STEREO — the only fixture here that is
@@ -490,7 +493,7 @@ static void testTheFlushIsInsideTheCall()
         p.setDial ("bass", 300.0);
         o.assign ((std::size_t) n, 0.0f);
         for (int i = 0; i < 1200; ++i)                          // tone, then digital silence
-            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * M_PI * 110.0 * (double) i / kFs));
+            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * kPi * 110.0 * (double) i / kFs));
         // The first 2000 samples ALWAYS in 32 equal calls: `nam::BlendLaw` moves its weight by at most
         // 0.25 per CALL, so an arm that starts with one long call leaves the blend gain climbing for the
         // whole render and this test would measure that instead of the flush (measured: 3228 samples).
@@ -547,7 +550,7 @@ static void testPrepareRestartsTheBands()
         p.setDial ("bass", 300.0);
         o.assign ((std::size_t) n, 0.0f);
         for (int i = 0; i < n; ++i)
-            o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * M_PI * 90.0 * (double) i / kFs));
+            o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs));
         for (int off = 0; off < n; off += 256)
         { const int c = std::min (256, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
     };
@@ -601,7 +604,7 @@ static void testPrepareReAnchorsTheGrid()
         }
         o.assign ((std::size_t) n, 0.0f);
         for (int i = 0; i < 1000; ++i)              // tone, then digital silence: the tail is the point
-            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * M_PI * 120.0 * (double) i / kFs));
+            o[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * kPi * 120.0 * (double) i / kFs));
         // 100, NOT 512. The grid period is 64, so a call size that is a MULTIPLE of it puts the same
         // number of boundaries in every call whatever the phase — floor((0+512)/64) and
         // floor((37+512)/64) are both 8 — and the phase shift this test exists to detect becomes
@@ -644,7 +647,7 @@ static void testTheFloorHoldsDownTheOvershoot()
     auto peakOver = [&] (int L)
     {
         eq::Biquad bq; bq.setCoeffs (from); bq.reset();
-        const double w = 2.0 * M_PI * probe / kFs;
+        const double w = 2.0 * kPi * probe / kFs;
         for (int i = 0; i < 48000; ++i) bq.processSample ((float) (0.5 * std::sin (w * (double) i)));
         double pk = 0.0, ipk = 0.0;
         for (int i = 0; i < 24000; ++i)
