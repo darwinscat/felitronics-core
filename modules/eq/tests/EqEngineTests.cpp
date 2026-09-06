@@ -35,6 +35,13 @@ void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace teq;
 
+// EqEngine::prepare() is [[nodiscard]] and REFUSES a rate it cannot honour, so a call site that discards
+// the verdict is exactly the mistake the attribute exists to catch. Assert it, as MultibandTests does.
+static void prepEng (EqEngine& e, double fs, int maxBlock, int nch)
+{
+    teqtest::expectTrue (e.prepare (fs, maxBlock, nch), "EqEngine::prepare() accepted the configuration");
+}
+
 namespace
 {
     // Steady-state gain (dB) of a mono in-place processing callback at frequency f.
@@ -232,7 +239,7 @@ void runEqEngineTests()
 
     group ("EqEngine: two bells cascade, measured == magnitudeDb");
     {
-        EqEngine eng; eng.prepare (fs, 512, 1);
+        EqEngine eng; prepEng (eng, fs, 512, 1);
         BandParams a; a.on = true; a.type = FilterType::Bell; a.lane (Lane::Stereo).freq = 300.0;  a.lane (Lane::Stereo).Q = 1.0; a.lane (Lane::Stereo).gainDb =  4.0;
         BandParams b; b.on = true; b.type = FilterType::Bell; b.lane (Lane::Stereo).freq = 3000.0; b.lane (Lane::Stereo).Q = 1.0; b.lane (Lane::Stereo).gainDb = -3.0;
         eng.setBand (0, a); eng.setBand (1, b);
@@ -309,7 +316,7 @@ void runEqEngineTests()
     group ("parameter safety: bad Q / huge gain / NaN / Inf do not produce NaN");
     {
         const double inf = std::numeric_limits<double>::infinity();
-        EqEngine eng; eng.prepare (fs, 256, 1);
+        EqEngine eng; prepEng (eng, fs, 256, 1);
         BandParams p; p.on = true; p.type = FilterType::Bell;
         p.lane (Lane::Stereo).freq = std::nan (""); p.lane (Lane::Stereo).Q = 0.0; p.lane (Lane::Stereo).gainDb = inf;       // NaN freq, Q=0, +Inf gain
         eng.setBand (0, p);
@@ -351,7 +358,7 @@ void runEqEngineTests()
 
     group ("stateless magnitudeDbFor matches the live magnitudeDb");
     {
-        EqEngine eng; eng.prepare (fs, 512, 1);
+        EqEngine eng; prepEng (eng, fs, 512, 1);
         BandParams arr[EqEngine::kMaxBands] {};
         arr[0].on = true; arr[0].type = FilterType::Bell;      arr[0].lane (Lane::Stereo).freq = 300.0;  arr[0].lane (Lane::Stereo).Q = 1.0; arr[0].lane (Lane::Stereo).gainDb =  4.0;
         arr[1].on = true; arr[1].type = FilterType::HighShelf; arr[1].lane (Lane::Stereo).freq = 8000.0;                 arr[1].lane (Lane::Stereo).gainDb = -5.0;
@@ -605,7 +612,7 @@ void runEqEngineTests()
     group ("parameter safety: a high-order Notch with NaN / Inf / degenerate params stays finite");
     {
         const double inf = std::numeric_limits<double>::infinity();
-        EqEngine eng; eng.prepare (fs, 256, 1);
+        EqEngine eng; prepEng (eng, fs, 256, 1);
         BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = std::nan (""); p.lane (Lane::Stereo).Q = 0.0; p.lane (Lane::Stereo).gainDb = inf; p.lane (Lane::Stereo).slope = 96;
         eng.setBand (0, p);
         const int n = 256; std::vector<float> buf ((size_t) n);
@@ -679,7 +686,7 @@ void runEqEngineTests()
             for (const auto& h : hostile)
                 for (int sw = 0; sw < 2; ++sw)
                 {
-                    EqEngine eng; eng.prepare (fs, 128, 2);
+                    EqEngine eng; prepEng (eng, fs, 128, 2);
                     BandParams p; p.on = true; p.type = tc.type; p.lane (Lane::Stereo).freq = h.f; p.lane (Lane::Stereo).Q = h.q; p.lane (Lane::Stereo).gainDb = h.g; p.lane (Lane::Stereo).slope = 96; p.swept = (sw == 1);
                     eng.setBand (0, p);
                     const int n = 128; std::vector<float> L ((size_t) n), R ((size_t) n);
@@ -767,7 +774,7 @@ void runEqEngineTests()
 
     group ("EqEngine: silence stays silent, no NaN (stereo)");
     {
-        EqEngine eng; eng.prepare (fs, 256, 2);
+        EqEngine eng; prepEng (eng, fs, 256, 2);
         BandParams p; p.on = true; p.type = FilterType::HighShelf; p.lane (Lane::Stereo).freq = 8000.0; p.lane (Lane::Stereo).gainDb = 12.0;
         eng.setBand (0, p);
         const int n = 256;
@@ -783,7 +790,7 @@ void runEqEngineTests()
     group ("EqEngine: 6-channel (5.1) static bell — every channel +6 dB, no cross-talk");
     {
         const int C = 6;
-        EqEngine eng; eng.prepare (fs, 256, C);
+        EqEngine eng; prepEng (eng, fs, 256, C);
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         eng.setBand (0, p);
         const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
@@ -794,7 +801,7 @@ void runEqEngineTests()
     group ("EqEngine: 8-channel (7.1) swept SVF bell — per-channel SVF state, every channel +6 dB");
     {
         const int C = 8;                                   // exercises Svf ic1[c]/ic2[c] for c = 0..7
-        EqEngine eng; eng.prepare (fs, 256, C);
+        EqEngine eng; prepEng (eng, fs, 256, C);
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 2000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).gainDb = 6.0; p.swept = true;
         eng.setBand (0, p);
         const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 2000.0, fs);
@@ -805,7 +812,7 @@ void runEqEngineTests()
     group ("EqEngine: 16-channel (max cap) silence stays silent, no NaN");
     {
         const int C = teq::kMaxChannels;                   // 16: top of the supported range
-        EqEngine eng; eng.prepare (fs, 256, C);
+        EqEngine eng; prepEng (eng, fs, 256, C);
         BandParams p; p.on = true; p.type = FilterType::HighShelf; p.lane (Lane::Stereo).freq = 6000.0; p.lane (Lane::Stereo).gainDb = 9.0;
         eng.setBand (0, p);
         const int n = 256;
@@ -836,13 +843,13 @@ void runEqEngineTests()
             std::vector<std::vector<float>> ref ((size_t) C, std::vector<float> ((size_t) n));
             for (int c = 0; c < C; ++c)
             {
-                EqEngine mono; mono.prepare (fs, n, 1); mono.setBand (0, p);
+                EqEngine mono; prepEng (mono, fs, n, 1); mono.setBand (0, p);
                 for (int i = 0; i < n; ++i) ref[(size_t) c][(size_t) i] = signalAt (c, i);
                 float* m[1] = { ref[(size_t) c].data() };
                 mono.process (m, 1, n);
             }
 
-            EqEngine eng; eng.prepare (fs, n, C); eng.setBand (0, p);
+            EqEngine eng; prepEng (eng, fs, n, C); eng.setBand (0, p);
             std::vector<std::vector<float>> buf ((size_t) C, std::vector<float> ((size_t) n));
             std::vector<float*> ptr ((size_t) C);
             for (int c = 0; c < C; ++c)
@@ -949,7 +956,7 @@ void runEqEngineTests()
         // lane runs; the L/R/M/S lanes need a 2-channel bus and are silently inactive. So a {m,s} point
         // is transparent on surround, while a plain {st} point applies to every channel.
         const int C = 6;
-        { EqEngine eng; eng.prepare (fs, 256, C);                       // {m,s} split point: Mid +12 vs Side -12, same freq
+        { EqEngine eng; prepEng (eng, fs, 256, C);                       // {m,s} split point: Mid +12 vs Side -12, same freq
           BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).on = false;
           p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 1.0; p.lane (Lane::Mid).gainDb  =  12.0;
           p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 1000.0; p.lane (Lane::Side).Q = 1.0; p.lane (Lane::Side).gainDb = -12.0;
@@ -958,7 +965,7 @@ void runEqEngineTests()
           for (int c = 0; c < C; ++c)
               expectNear (g[(size_t) c], 0.0, 0.02, "surround ch " + std::to_string (c) + " == transparent (M/S lanes inert)");
         }
-        { EqEngine eng; eng.prepare (fs, 256, C);                       // plain {st} point: applies to every channel
+        { EqEngine eng; prepEng (eng, fs, 256, C);                       // plain {st} point: applies to every channel
           BandParams p; p.on = true; p.type = FilterType::Bell;
           p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 1.0; p.lane (Lane::Stereo).gainDb = 6.0;
           eng.setBand (0, p);
@@ -1071,7 +1078,7 @@ void runEqEngineTests()
         {
             for (int ki : { 85, 171, 341 })                  // 996 / 2003 / 3996 Hz (= ki*fs/W -> integer cycles)
             {
-                EqEngine eng; eng.prepare (fs, W, 2);
+                EqEngine eng; prepEng (eng, fs, W, 2);
                 for (int i = 0; i < nb; ++i) eng.setBand (i, bands[i]);
                 const double f = (double) ki * fs / (double) W, w = 2.0 * kPi * f / fs;
                 const auto cL = column (eng, 0, f);           // inject L -> {hLL, hRL}

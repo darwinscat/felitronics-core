@@ -249,7 +249,7 @@ static void testCompositionAgainstAHandBuiltChain()
     dither::Dither        dit;
     eq::Biquad            hpf[2];
 
-    eqE.prepare (48000.0, K, nch);
+    ok (eqE.prepare (48000.0, K, nch), "EqEngine::prepare() accepted the configuration");
     for (int i = 0; i < eq::EqEngine::kMaxBands; ++i) eqE.setBand (i, p.eqBands[i]);
     mb.prepare (48000.0, K, nch);
     mb.setParams (p.monoBass);
