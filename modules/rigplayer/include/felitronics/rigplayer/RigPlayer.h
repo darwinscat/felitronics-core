@@ -158,9 +158,12 @@ public:
         // THE DOMINANT ROOT, and `sqrt(|a2|)` is NOT it. a2 is the pole PRODUCT, so its square root is
         // the GEOMETRIC MEAN of the two magnitudes — right only when they are equal, which is exactly
         // the complex-conjugate case and no other. A real pair is what a LOW-Q design gives, and packs
-        // are full of low-Q shelves: `matched::highShelfQDb(1000 Hz, Q 0.05, +-12 dB)` has real poles at
-        // 0.9908 and -0.2975, so the mean says 5.3 samples where the slow pole rings for 1053. That is a
-        // 140x underestimate on precisely the shape this player exists to run.
+        // are full of low-Q shelves. `matched::highShelfQDb(1 kHz, 48 kHz, +12 dB, Q 0.05)` has real
+        // poles at 0.99346 and 0.07343 — BOTH POSITIVE, and it is the FAST one that the mean drags the
+        // answer down to: the mean says 5.28 samples where the slow pole rings for 1052.78, a 199x
+        // underestimate. Its -12 dB sibling (poles 0.99670 and 0.39809) misses by 140x: 14.95 against
+        // 2090.39. Two shapes, two different factors — quoting one shape's pair with the other's factor
+        // is how the first draft of this note was wrong.
         auto ring = [kBandRampMax] (double a1, double a2) {
             const double disc = a1 * a1 - 4.0 * a2;
             const double rho  = disc >= 0.0 ? (std::fabs(a1) + std::sqrt(disc)) * 0.5   // real pair: the larger root
