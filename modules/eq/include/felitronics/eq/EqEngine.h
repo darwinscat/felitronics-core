@@ -46,7 +46,11 @@ public:
     [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int numChannels) noexcept
     {
         prepared_ = false;                              // any early return below leaves the engine unprepared
-        if (! (std::isfinite (sampleRate) && sampleRate > 0.0 && sampleRate <= 3.0e6)) return false;
+        // Same domain test as the bands below, and for the same reason: a band clamps its frequency to
+        // [10 Hz, 0.49*fs], so a rate under 20.41 Hz hands `std::clamp` a lo above its hi. The engine
+        // repeats it rather than relying on the bands because it is the module's front door and refuses
+        // before allocating the scratch buffer. Spelled positively so NaN fails.
+        if (! (std::isfinite (sampleRate) && 0.49 * sampleRate >= 10.0 && sampleRate <= 3.0e6)) return false;
         fs = sampleRate;
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
         maxBlock_ = maxBlock > 0 ? maxBlock : 0;

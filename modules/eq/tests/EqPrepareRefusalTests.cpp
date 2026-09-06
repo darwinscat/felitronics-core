@@ -95,6 +95,42 @@ int main()
         ok (peak > 0.5, "a +12 dB bell at 1 kHz really lifts a 0.25 tone — the guard did not disable the EQ");
     }
 
+    group ("the accepted domain is exactly the one the design can express");
+    {
+        // The decisive test here is a PROPERTY OVER THE WHOLE ACCEPTED DOMAIN, not a handful of bad values,
+        // because this failure does not announce itself. Every band clamps its frequency to [10 Hz,
+        // 0.49*fs], and `std::clamp` with lo above hi is a violated precondition: measured on the previous
+        // guard, fs = 20 produced a perfectly plausible 0.377 and fs = 1 produced 7.2e+28. "The output is
+        // finite" is therefore not a test for it, and neither is UBSan — a library precondition is not
+        // language UB. So: for EVERY rate prepare() accepts, 0.49*fs must reach 10 Hz.
+        int accepted = 0, refused = 0;
+        bool domainHolds = true, agree = true, finiteOut = true;
+        for (int i = 0; i <= 4000; ++i)
+        {
+            // dense across 20.408163…, the exact point where the domain becomes non-empty, then decades out
+            const double fs = (i <= 2000) ? (19.0 + 0.001 * i)
+                                          : std::pow (10.0, -1.0 + 8.0 * (double) (i - 2000) / 2000.0);
+            EqEngine e; EqBand b;
+            const bool okE = e.prepare (fs, 64, 2);
+            const bool okB = b.prepare (fs, 2);
+            agree = agree && (okE == okB);
+            if (okE) { ++accepted; domainHolds = domainHolds && (0.49 * fs >= 10.0); }
+            else       ++refused;
+            if (okE)
+            {
+                e.setBand (0, bell (std::min (1000.0, 0.4 * fs), 6.0));
+                std::vector<float> L ((std::size_t) 32, 0.25f), R ((std::size_t) 32, 0.25f);
+                float* ch[2] { L.data(), R.data() };
+                e.process (ch, 2, 32);
+                finiteOut = finiteOut && (nonFinite (L) == 0);
+            }
+        }
+        ok (accepted > 100 && refused > 100, "precondition: the sweep straddles the boundary in both directions");
+        ok (domainHolds, "every accepted rate leaves the design domain [10 Hz, 0.49*fs] non-empty");
+        ok (agree, "the engine and the band accept and refuse exactly the same rates");
+        ok (finiteOut, "and every accepted rate produces finite audio");
+    }
+
     group ("Svf::flushDenormals visits the prepared channels only, and that changes no output");
     {
         // The columns past `ch` are never written, so flushing them was always a no-op. Assert exactly

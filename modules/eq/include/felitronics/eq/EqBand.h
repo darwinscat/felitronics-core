@@ -323,7 +323,14 @@ public:
     bool prepare (double sampleRate, int numChannels, double smoothMs = 30.0) noexcept
     {
         prepared_ = false;                                    // any early return below leaves it unprepared
-        if (! (std::isfinite (sampleRate) && sampleRate > 0.0 && sampleRate <= 3.0e6)) return false;
+        // The rate must leave the DESIGN DOMAIN NON-EMPTY, which is a stronger demand than "positive" and
+        // is read off the design rather than chosen: every band clamps its frequency to [10 Hz, 0.49*fs],
+        // and `std::clamp` with lo > hi is a violated precondition — undefined behaviour, not a clamp.
+        // So 0.49*fs must reach 10 Hz, i.e. fs >= 20.41 Hz. Accepting less was measured to produce finite
+        // nonsense rather than an obvious failure: at fs = 20 the output looks plausible at 0.377, and at
+        // fs = 1 it is 7.2e+28 — which is exactly why "the output is finite" is not a test for this.
+        // Spelled positively so NaN fails, as in Saturator (P6 F12) and TruePeakLimiter.
+        if (! (std::isfinite (sampleRate) && 0.49 * sampleRate >= 10.0 && sampleRate <= 3.0e6)) return false;
         fs = sampleRate;
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
         stFreqS_.prepare (fs, smoothMs); stQS_.prepare (fs, smoothMs); stGainS_.prepare (fs, smoothMs);
