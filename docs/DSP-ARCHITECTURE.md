@@ -278,10 +278,14 @@ lowest-common-denominator that kills desktop performance).
 - **Consumption:** pinned tag via CMake `FetchContent` (exactly how the products already pin JUCE).
   OrbitCab already consumes `teq` this way (`SOURCE_SUBDIR teq`, pinned tag) — so `teq → felitronics::eq`
   is just repointing the URL/tag, not un-vendoring a folder copy.
-- **Versioning is a contract, not just tags.** SemVer + `CHANGELOG.md` + a deprecation policy (compat
-  aliases that warn). **DSP output is versioned behaviour** — a changed filter curve, limiter release
-  shape, or convolver latency breaks presets/sessions as surely as an API rename → treat it as a
-  breaking change. A **consumer-matrix CI** builds TabbyEQ + OrbitCab against each release; golden-audio
+- **Versioning is a contract, not just tags.** SemVer + `CHANGELOG.md`, and **no compatibility
+  aliases**: a name whose documented meaning IS the defect is removed, and the consumers stop
+  compiling until they move — that refusal is the notice. An alias that goes on answering the old way
+  is a wrong answer with a warning attached, and the warning is the half nobody reads;
+  `modelLoudness()` always meant "slot 0", which was the bug, and v0.29.0 deleted it rather than
+  keep it politely lying. **DSP output is versioned behaviour** — a changed filter curve, limiter
+  release shape, or convolver latency breaks presets/sessions as surely as an API rename → treat it
+  as a breaking change. A **consumer-matrix CI** builds TabbyEQ + OrbitCab against each release; golden-audio
   vectors guard behaviour.
 - **Portability CI for the funded tiers, from day one** (not "later"): the no-alloc /
   `-fno-exceptions` / `-fno-rtti` configs, scalar↔SIMD parity tests, and an **Emscripten**
