@@ -157,8 +157,13 @@ the CPU at runtime, invisible to any build. Full write-up:
    reference implementations: `analysis::LoudnessMeter` (its 10 ms sub-hop, reasoned out in
    [`LAW8-KWEIGHTING.md`](LAW8-KWEIGHTING.md)) and `saturation::Saturator` (per sample). The claim a
    gridded kernel may then make is **bit-identical output under arbitrary re-slicing from the same
-   `reset()`** — nothing about events that ARRIVE per call (a parameter write, a bypass toggle, a
-   channel-count change), which are the caller's own timeline.
+   `reset()`, for an identical event timeline and while the state stays FINITE** — nothing about events
+   that ARRIVE per call (a parameter write, a bypass toggle, a channel-count change), which are the
+   caller's own timeline, and nothing once a filter has overflowed: poison recovery deliberately keeps
+   the call's clock (below), so from the first non-finite state onward the output is call-dependent
+   again. That last clause is not hypothetical — a swept band-pass at 20 kHz Q 2 fed `{3e38f, 0}` emits
+   a finite first sample and overflows its integrator, after which two one-sample calls give 0 on the
+   second sample and one two-sample call gives NaN.
 
    Three things this rule does NOT say. **(a) The poison half keeps its own clock.** A NaN's only quality
    is how soon it goes, so the `isfinite` half of a flush runs at the END OF EVERY CALL as well — it

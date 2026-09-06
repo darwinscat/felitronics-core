@@ -227,6 +227,96 @@ static void testEqSlicingInvarianceUnderARamp()
 }
 
 //==============================================================================
+// The DYNAMIC bell has to travel with the static one. `updateDeltaCoeffs()` reads the SMOOTHED freq/Q,
+// so it belongs wherever those move — the grid tick. Designing it only at the call boundary left it at
+// whatever the smoothers held when the call started, and on a whole-stream call left it there for the
+// whole render. Found by the diff-pass consilium on the first version of this change, not by this suite.
+static void testDeltaBellFollowsTheStaticRamp()
+{
+    group ("eq::EqBand — the dynamic bell tracks the static ramp on the same clock");
+    const int n = 8000;
+    const int blocks[] = { 0, 1024, 256, 64, 16, 7, 1 };
+
+    auto render = [&] (int blk, std::vector<float>& L, std::vector<float>& R)
+    {
+        programme (L, R, n, n);
+        eq::EqBand b;
+        ok (b.prepare (kFs, 2), "delta-follow fixture: prepared");
+        eq::BandParams p = bell (500.0, 6.0, 2.0); p.dyn.on = true;
+        b.setParams (p);
+        eq::BandParams t = bell (4000.0, 6.0, 2.0); t.dyn.on = true;
+        b.setParams (t);                                   // the static design now glides 500 -> 4000
+        b.setLaneDeltaDb (eq::Lane::Stereo, -12.0);        // ... under a CONSTANT delta
+        const int step = blk > 0 ? blk : n;
+        for (int off = 0; off < n; off += step)
+        {
+            const int m = (step < n - off) ? step : n - off;
+            float* ch[2] = { L.data() + off, R.data() + off };
+            b.processBlock (ch, 2, m);
+        }
+    };
+
+    std::vector<float> refL, refR; render (0, refL, refR);
+    // PRECONDITION — the delta is LIVE: the same render with dyn.on but a ZERO delta differs audibly.
+    {
+        std::vector<float> zL, zR; programme (zL, zR, n, n);
+        eq::EqBand b; ok (b.prepare (kFs, 2), "delta-follow control: prepared");
+        eq::BandParams p = bell (500.0, 6.0, 2.0); p.dyn.on = true; b.setParams (p);
+        eq::BandParams t = bell (4000.0, 6.0, 2.0); t.dyn.on = true; b.setParams (t);
+        float* ch[2] = { zL.data(), zR.data() };
+        b.processBlock (ch, 2, n);
+        double worst = 0.0;
+        for (int i = 0; i < n; ++i) worst = std::fmax (worst, std::fabs ((double) zL[(std::size_t) i] - (double) refL[(std::size_t) i]));
+        ok (worst > 0.05, "PRECONDITION the -12 dB delta actually moves the signal (" + std::to_string (worst) + ")");
+    }
+    for (int blk : blocks)
+    {
+        std::vector<float> L, R; render (blk, L, R);
+        long long diff = 0; double worst = 0.0;
+        for (int i = 0; i < n; ++i)
+            if (L[(std::size_t) i] != refL[(std::size_t) i])
+            { ++diff; worst = std::fmax (worst, std::fabs ((double) L[(std::size_t) i] - (double) refL[(std::size_t) i])); }
+        ok (diff == 0, "dyn.on + ramping: block " + std::to_string (blk) + " bit-identical (" + std::to_string (diff)
+                       + " differ, worst " + std::to_string (worst) + ")");
+    }
+}
+
+//==============================================================================
+// A glide that LANDS ON ITS FIRST TICK still has to be designed at its target. With `smoothMs = 0` every
+// glide does, so the material redesign — which is made from the pre-tick values — must owe the tick one
+// more. Without that the band answered +0.919 dB where +12 was asked, for ever.
+static void testAGlideThatLandsAtOnceIsStillDesigned()
+{
+    group ("eq::EqBand — a ramp that settles on its first tick is designed at its TARGET");
+    for (double smoothMs : { 0.0, 0.001, 30.0 })
+    {
+        eq::EqBand b;
+        ok (b.prepare (kFs, 2, smoothMs), "instant-glide fixture: prepared (" + std::to_string (smoothMs) + " ms)");
+        b.setParams (bell (500.0, 12.0, 2.0));            // first write snaps
+        b.setParams (bell (4000.0, 12.0, 2.0));           // second write: a glide of length smoothMs
+        std::vector<float> L (kK, 0.0f), R (kK, 0.0f);
+        float* ch[2] = { L.data(), R.data() };
+        b.processBlock (ch, 2, kK);
+        const double w = 2.0 * M_PI * 4000.0 / kFs;
+        const double gotDb = 20.0 * std::log10 (std::abs (b.response (w)));
+        // PRECONDITION — the two designs are far apart, so "designed at the target" is a real claim.
+        eq::BandParams src = bell (500.0, 12.0, 2.0);
+        const eq::BandDesign d0 = eq::designBand (src, kFs);
+        std::complex<double> h0 { 1.0, 0.0 };
+        for (int i = 0; i < d0.n; ++i) h0 *= eq::evalCoeffs (d0.sec[i], w);
+        const double staleDb = 20.0 * std::log10 (std::abs (h0));
+        ok (std::fabs (staleDb - 12.0) > 6.0, "PRECONDITION the stale design reads " + std::to_string (staleDb)
+                                              + " dB at 4 kHz, far from the asked +12");
+        if (smoothMs <= 0.001)
+            ok (std::fabs (gotDb - 12.0) < 0.05, std::to_string (smoothMs) + " ms: the band is at its TARGET after one tick ("
+                                                 + std::to_string (gotDb) + " dB)");
+        else
+            ok (gotDb > staleDb + 0.05, "30 ms: the band has left the stale design and is travelling ("
+                                        + std::to_string (gotDb) + " dB)");
+    }
+}
+
+//==============================================================================
 static void testPoisonWindowIsBounded()
 {
     group ("eq::EqEngine — one non-finite sample is healed within ONE grid period, at any block size");
@@ -705,6 +795,8 @@ int main()
     testEqSlicingInvariance();
     testEqSlicingInvarianceUnderARamp();
     testRampFollowsItsOwnDesign();
+    testDeltaBellFollowsTheStaticRamp();
+    testAGlideThatLandsAtOnceIsStillDesigned();
     testGridReAnchorsOnReset();
     testPoisonWindowIsBounded();
     testPoisonHealIsAtomic();

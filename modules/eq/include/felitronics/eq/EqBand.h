@@ -517,7 +517,13 @@ public:
         // samples would run the new topology on the old coefficients (a swept band re-enabled after a
         // static stretch would drive `svf_` with whatever its last swept episode left there). What waits
         // for the grid is the RAMP, which is a continuous approximation and has no such coupling.
-        if (recomputePending) { updateCoeffs(); recomputePending = false; }
+        // `settlePending_` is ARMED here, not just cleared: this design is made from the smoother values
+        // as they stand BEFORE the first tick advances them, so the tick owes one redesign whatever it
+        // then finds. Without the arming, a glide that LANDS on its first tick — which is every glide
+        // when `smoothMs` is 0, and any glide that starts within `settled()`'s epsilon — read
+        // `moving == false` and was never designed at its target at all: measured, a 500 -> 4000 Hz
+        // write at smoothMs 0 left the band answering +0.919 dB at 4 kHz where +12 was asked, for ever.
+        if (recomputePending) { updateCoeffs(); recomputePending = false; settlePending_ = true; }
 
         // Dynamics is opt-in per point: with dyn.on false nothing below touches the signal, so a
         // static band is bit-identical to one built before dynamics existed. The delta stays on the
@@ -579,6 +585,17 @@ private:
         // `settlePending_` is the ramp's last step: the tick on which a smoother finally lands reads
         // `settled()`, so without carrying one more redesign the settled value would never be designed.
         if (settlePending_ || moving) { updateCoeffs(); settlePending_ = moving; }
+
+        // AND THE MOVING BELL FOLLOWS THE STATIC ONE. updateDeltaCoeffs() reads the SMOOTHED freq/Q —
+        // "the moving part travels with the static curve during a ramp instead of jumping ahead of it" —
+        // so it has to be redesigned wherever those move, which is here. Doing it only at the call
+        // boundary (where the arriving delta VALUE is consumed) left the bell designed at the frequency
+        // the smoothers held BEFORE this tick, and on a whole-stream call left it there for the whole
+        // render: measured on a 500 -> 4000 Hz ramp with a constant -12 dB delta, the static band was at
+        // 652.1 Hz while the delta bell sat at 500 Hz, and a 1024-sample call differed from 16-sample
+        // calls on 1008 of 1024 samples, worst 0.27. Free when nothing moved — every branch inside is
+        // keyed on the applied freq/Q/delta bits.
+        if (p.dyn.on) updateDeltaCoeffs();
 
         // ONLY THE AUDIO STOPS. A parameter ramp runs on the caller's clock, and the smoothers above
         // advance for lanes that are not running — the fully-idle band was the one case that fell out of
