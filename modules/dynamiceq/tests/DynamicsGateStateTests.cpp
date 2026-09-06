@@ -308,6 +308,84 @@ static void testDynamicEqBandIsolation()
 }
 
 //==================================================================================================
+// The programme estimate is KEPT across a park, and that is the correct answer — measured, not argued.
+//==================================================================================================
+static void testProgrammeEstimateSurvivesThePark()
+{
+    group ("auto threshold: a parked lane returns reacting like one that never left");
+
+    // A review seat read the preserved RelativeLevel as a defect: learn -40 dBFS, park the lane, let the
+    // programme become -10 dBFS, return, and the stale norm earns reduction for what is now normal. The
+    // measurement says otherwise, and this test exists so nobody has to re-litigate it: a lane that NEVER
+    // left ducks exactly the same, because a 30 dB jump IS a real excess until the estimator learns the new
+    // norm. Discarding the estimate instead makes the returning lane read +0.000 dB — it stops reacting to
+    // a genuine 30 dB jump at all, which is the processing silently switched off, not a fix. Re-arming the
+    // fast window (retuned()) converges 8x sooner but then the parked lane no longer matches the one that
+    // stayed, which is the invariant this suite is built on.
+    //
+    // The whole point needs thrAuto TRUE. The rest of this file forces it false to pin the detector, and
+    // that is exactly why the earlier suite could not see this question at all.
+    const int B = 64;
+    const double f = 1000.0;
+    const double quiet = core::dbToGain (-40.0), loud = core::dbToGain (-10.0);
+
+    auto measure = [&] (bool park, double& deepest, double& settleMs)
+    {
+        eq::BandParams p;
+        p.on = true; p.type = eq::FilterType::Bell;
+        p.lane (eq::Lane::Stereo).on = false;                  // Side only, so a mono stretch parks the lane
+        eq::LaneParams& sd = p.lane (eq::Lane::Side);
+        sd.on = true; sd.freq = f; sd.Q = 2.0; sd.gainDb = 0.0;
+        p.dyn.on = true; p.dyn.rangeDb = -40.0;                // wide, so nothing pins against the range
+        p.dyn.thrAuto = true;                                  // the estimator is the thing under test
+
+        eq::EqBand band; band.prepare (kFs, 2); band.setParams (p);
+        dynamiceq::LaneDynamics dyn; dyn.prepare (kFs, 2); dyn.setParams (p);
+
+        std::vector<float> L ((std::size_t) B), R ((std::size_t) B), sl ((std::size_t) B), sr ((std::size_t) B);
+        float* aud[2] { L.data(), R.data() };
+        const float* sc[2] { sl.data(), sr.data() };
+        long ph = 0;
+        auto feed = [&] (double amp, int nc, int blocks)
+        {
+            for (int k = 0; k < blocks; ++k)
+            {
+                for (int i = 0; i < B; ++i, ++ph)
+                {
+                    const float v = (float) (amp * std::sin (2.0 * core::kPi * f * (double) ph / kFs));
+                    L[(std::size_t) i] = sl[(std::size_t) i] =  v;      // antiphase: pure Side
+                    R[(std::size_t) i] = sr[(std::size_t) i] = -v;
+                }
+                dyn.processBand (aud, sc, nc, B, band);
+            }
+        };
+
+        feed (quiet, 2, (int) (kFs * 4.0 / B));                // learn a quiet programme
+        if (park) feed (0.0, 1, (int) (kFs * 1.0 / B));        // park the lane for a second
+        deepest = 0.0; settleMs = -1.0;
+        const int n = (int) (kFs * 8.0 / B);
+        for (int k = 0; k < n; ++k)
+        {
+            feed (loud, 2, 1);
+            const double d = dyn.deltaDb (eq::Lane::Side);
+            deepest = std::fmin (deepest, d);
+            if (settleMs < 0.0 && k > 4 && std::fabs (d) < 0.5) settleMs = (double) k * B / kFs * 1000.0;
+        }
+    };
+
+    double refDeep = 0.0, refSettle = 0.0, parkDeep = 0.0, parkSettle = 0.0;
+    measure (false, refDeep, refSettle);
+    measure (true,  parkDeep, parkSettle);
+
+    ok (refDeep < -10.0, "precondition: the never-parked lane really ducks on a 30 dB jump");
+    ok (refSettle > 0.0 && refSettle < 6000.0, "precondition: and it really recovers, so 'settled' means something");
+    ok (std::fabs (parkDeep - refDeep) < 1.0,
+        "the parked lane ducks as deeply as one that never left (discarding the estimate reads +0.000)");
+    ok (parkSettle > 0.0 && std::fabs (parkSettle - refSettle) < 0.25 * refSettle,
+        "and recovers over the same time (re-arming the fast window would be 8x sooner)");
+}
+
+//==================================================================================================
 int main()
 {
     std::printf ("felitronics::dynamiceq — execution-gate state\n");
@@ -317,6 +395,7 @@ int main()
     testLaneDynamicsStayingColumn();
     testDynamicEqBandChannelGate();
     testDynamicEqBandIsolation();
+    testProgrammeEstimateSurvivesThePark();
 
     group ("RT-safety");
     {

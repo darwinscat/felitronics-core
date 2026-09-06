@@ -460,7 +460,7 @@ public:
         // the sample count: a call that processes no channel ran nothing, so it stopped nothing.
         if (numSamples > 0 && nc > 0) dropStoppedCells (nc, stRun, p.dyn.on);
 
-        if (! anyRun || numSamples <= 0) return;
+        if (numSamples <= 0) return;   // no samples, no time: nothing advances and no edge moves
 
         // Advance every lane's smoothers (closed form; an idle/snapped smoother is a settled no-op).
         stFreqS_.advance (numSamples); stQS_.advance (numSamples); stGainS_.advance (numSamples);
@@ -486,6 +486,17 @@ public:
         if (laneOn (Lane::Mid))   moving = moving || laneMoving (Lane::Mid);
         if (laneOn (Lane::Side))  moving = moving || laneMoving (Lane::Side);
         if (recomputePending || moving) { updateCoeffs(); recomputePending = moving; }
+
+        // ONLY THE AUDIO STOPS. A parameter ramp runs on the caller's clock, and the smoothers above have
+        // always advanced for lanes that were not running — the fully-idle band was the one case that fell
+        // out of that rule, because the return used to sit above them. It made the SAME edit arrive at two
+        // different times depending on whether some unrelated lane happened to be on: with a flat 0 dB
+        // companion keeping the band alive the design tracked through the gap, and without one the ramp
+        // froze and finished ~200 ms AFTER the stream came back (measured: a 500 -> 4000 Hz edit parked at
+        // 651.5 Hz for a one-second mono stretch, then 1548 Hz at 10 ms, 3536 at 50 ms, 3984 at 200 ms).
+        // An inert lane deciding another lane's behaviour is the defect this file has already closed once;
+        // this is the same shape, one gate further out. Nothing below this line touches a stopped cell.
+        if (! anyRun) return;
 
         // Dynamics is opt-in per point: with dyn.on false nothing below touches the signal, so a
         // static band is bit-identical to one built before dynamics existed.

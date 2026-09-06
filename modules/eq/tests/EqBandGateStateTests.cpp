@@ -408,6 +408,64 @@ static void testNonChannelGates()
 }
 
 //==================================================================================================
+// 4b. A parameter ramp runs on the caller's clock, and an INERT lane must not decide when it lands.
+//==================================================================================================
+static void testRampIsWallClock()
+{
+    group ("a ramp keeps running while the band is idle, with or without a companion lane");
+
+    // The smoothers have always advanced for lanes that were not running; the fully-idle band was the one
+    // case that fell out of that rule, because the early return sat above them. The visible cost was that
+    // the SAME edit landed at two different times depending on whether an unrelated lane happened to be on
+    // — with a flat 0 dB ST companion the design tracked through the gap, without one it froze and finished
+    // about 200 ms AFTER the stream came back (measured: parked at 651.5 Hz, then 1548 / 3536 / 3984 Hz at
+    // 10 / 50 / 200 ms). An inert lane deciding another lane's behaviour is the shape this file closed once
+    // already for state; this is the same shape for design.
+    const int N = 64;
+    const double target = 4000.0;
+
+    auto peakHz = [] (EqBand& b)
+    {
+        double best = 0.0, bf = 0.0;
+        for (double f = 50.0; f < 12000.0; f *= 1.01)
+        {
+            const double m = std::abs (b.response (2.0 * core::kPi * f / kFs, Axis::Side));
+            if (m > best) { best = m; bf = f; }
+        }
+        return bf;
+    };
+
+    double parked[2] {}, onReturn[2] {};
+    for (int companion = 0; companion < 2; ++companion)
+    {
+        BandParams p;
+        p.on = true; p.type = FilterType::Bell;
+        p.lane (Lane::Stereo).on = (companion != 0);          // the inert companion, flat at 0 dB
+        p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).gainDb = 0.0;
+        LaneParams& sd = p.lane (Lane::Side);
+        sd.on = true; sd.freq = 500.0; sd.Q = 2.0; sd.gainDb = 12.0;
+
+        EqBand b; b.prepare (kFs, 2); b.setParams (p);
+        std::vector<float> L ((std::size_t) N, 0.01f), R ((std::size_t) N, -0.01f);
+        float* ch[2] { L.data(), R.data() };
+        auto run = [&] (int nc, int blocks) { for (int k = 0; k < blocks; ++k) b.processBlock (ch, nc, N); };
+
+        run (2, 20);
+        sd.freq = target; p.lane (Lane::Side) = sd; b.setParams (p);   // the edit, one block before the gap
+        run (2, 1);
+        run (1, (int) (kFs * 1.0 / N));                                 // a second of mono: no Side audio
+        parked[companion] = peakHz (b);
+        run (2, 1);
+        onReturn[companion] = peakHz (b);
+    }
+
+    ok (std::fabs (parked[1] - target) < 100.0, "precondition: WITH a companion the design tracked through the gap");
+    ok (std::fabs (parked[0] - target) < 100.0, "without one it tracks too — the ramp did not stop with the audio");
+    ok (std::fabs (onReturn[0] - onReturn[1]) < 1.0,
+        "the edit lands at the same time either way — an inert lane decides nothing");
+}
+
+//==================================================================================================
 // 5. What must NOT be cleared, and what must NOT count as an edge.
 //==================================================================================================
 static void testWhatSurvives()
@@ -584,6 +642,7 @@ int main()
     testRecoveryCoefficients();
     testRecoveryStrongNull();
     testNonChannelGates();
+    testRampIsWallClock();
     testWhatSurvives();
     testSvfResetChannel();
     testCaptureWidth();
