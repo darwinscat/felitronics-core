@@ -907,6 +907,20 @@ struct Biquad
         if (! std::isfinite (z1) || ! std::isfinite (z2)) { z1 = 0.0f; z2 = 0.0f; }
         else { core::flushDenormal (z1); core::flushDenormal (z2); }
     }
+
+    // THE POISON HALF ALONE — the branch above with the denormal threshold removed. It exists because
+    // the two halves want DIFFERENT clocks. The denormal flush is periodic maintenance and belongs on
+    // the audio-time grid (`core::StateGrid`), or the output depends on how the caller sliced the
+    // stream. Healing a NaN is not maintenance: it is damage control whose only quality is HOW SOON,
+    // and moving it to the grid would have made a 16-sample host wait 64 samples instead of 16. So an
+    // owner runs this one at the end of every call, on top of the grid: a caller with a small block
+    // keeps the recovery it has today, one with a large block gains the grid's bound, and nobody loses.
+    // Free of slicing effects by construction — on a stream whose state stays finite this method
+    // cannot change a single bit, so it adds nothing to the invariance claim it sits beside.
+    void healPoison() noexcept
+    {
+        if (! std::isfinite (z1) || ! std::isfinite (z2)) { z1 = 0.0f; z2 = 0.0f; }
+    }
 };
 
 } // namespace felitronics::eq

@@ -45,6 +45,7 @@ public:
     {
         const double tau = timeMs * 0.001;
         coeff = (! (tau > 0.0) || ! (fs > 0.0)) ? 0.0 : std::exp (-1.0 / (tau * fs));   // !(x>0) also catches NaN → instant, never a NaN coeff
+        strideN = 0;                                                                    // the memoised coeffⁿ belongs to the OLD coeff
     }
 
     void   setTarget (double t) noexcept { target = t; }
@@ -62,11 +63,23 @@ public:
         // contract rides on this). This is only TRUE because of the snap: a residual that merely
         // decays never becomes 0.0 when the target is 0, so before the snap the pow ran forever.
         if (n > 0 && std::fabs (current - target) > 0.0)
-            step (std::pow (coeff, (double) n));
+            step (stride (n));
         return current;
     }
 
 private:
+    // coeffⁿ, memoised on n. `std::pow` is a pure function of (coeff, n), so returning the cached value
+    // is bit-identical to recomputing it — this is a cost change and nothing else, and the cache is
+    // dropped whenever `coeff` moves (setTimeMs, and therefore prepare). It exists because a consumer
+    // that advances on a FIXED audio-time grid (`core::StateGrid`) asks for the same n every tick, and
+    // a transcendental per parameter per 64 samples is the one cost that grid would otherwise add to
+    // the audio thread. A consumer still advancing by a varying block size simply never hits the cache.
+    inline double stride (int n) noexcept
+    {
+        if (n != strideN) { strideN = n; strideC = std::pow (coeff, (double) n); }
+        return strideC;
+    }
+
     // One glide step by `c` (= coeffⁿ), with the law-8 snap. See the class note for both conditions.
     inline double step (double c) noexcept
     {
@@ -86,6 +99,8 @@ private:
     static constexpr double kSnap = 1e-15;
 
     double fs = 0.0, coeff = 0.0, current = 0.0, target = 0.0;
+    int    strideN = 0;          // n the memoised power belongs to; 0 = empty (advance(0) is a no-op anyway)
+    double strideC = 0.0;
 };
 
 //==============================================================================

@@ -137,6 +137,42 @@ the CPU at runtime, invisible to any build. Full write-up:
    module) MUST adopt the same per-block software flush.** The core never sets a global FTZ/DAZ mode; an
    adapter MAY set FTZ on desktop as a bonus. **Do NOT use `-ffast-math`** (it breaks the NaN/inf
    semantics the tests assert). Every kernel also ships a scalar fallback + a scalar↔SIMD parity test.
+
+   **8a. THE FLUSH IS CLOCKED BY AUDIO TIME, NEVER BY THE `process()` CALL — `core::StateGrid`.** The
+   sentence above says *"every block"*, and for a decade of host callbacks that read as a cadence. It is
+   not one: the end of `process()` is wherever the CALLER chose to cut the stream, so the flush is an
+   event whose position the core does not control. That fails in both directions at once. **The output
+   becomes a function of the slicing** — measured on `eq::EqEngine`, 38522 of 40000 tail samples differ
+   between a whole-file call and one-sample calls of the same programme, and on `stereo::MonoBass`
+   37180 of 40000. **And on a call that spans a whole file the flush never fires inside it at all**, so
+   the stall this law exists to prevent happens in full (37678 of 38000 tail samples subnormal), and a
+   single non-finite input sample is never healed either — one +Inf poisoned 479900 of the next 480000
+   samples of a whole-file render against 1 sample when the same stream was fed one sample at a time.
+   A whole-file call is not exotic: `Compressor`, `EqEngine`, `Dither` and `TruePeakLimiter` all invite
+   one in their headers.
+
+   So: **a kernel drives its periodic maintenance from `core::StateGrid`** — a phase counter over AUDIO
+   samples, period `kPeriod = 64`, re-anchored by `reset()` — and splits its per-sample work at those
+   boundaries. Two kernels reached this conclusion on their own before it was a rule and are the
+   reference implementations: `analysis::LoudnessMeter` (its 10 ms sub-hop, reasoned out in
+   [`LAW8-KWEIGHTING.md`](LAW8-KWEIGHTING.md)) and `saturation::Saturator` (per sample). The claim a
+   gridded kernel may then make is **bit-identical output under arbitrary re-slicing from the same
+   `reset()`** — nothing about events that ARRIVE per call (a parameter write, a bypass toggle, a
+   channel-count change), which are the caller's own timeline.
+
+   Three things this rule does NOT say. **(a) The poison half keeps its own clock.** A NaN's only quality
+   is how soon it goes, so the `isfinite` half of a flush runs at the END OF EVERY CALL as well — it
+   cannot change a bit while the state is finite, so it costs the invariance claim nothing, and a host
+   with a block shorter than a period keeps the immediate recovery it had (`eq::Biquad::healPoison()`).
+   **(b) `kPeriod` is chosen, not derived.** Any period makes a stall unreachable, because a state under
+   the 1e-15 threshold is 23 decades above the subnormal floor and cannot outlive one period; 64 is the
+   smallest block a live rig runs and a power of two, so hosts at 64/128/256/512 see exactly one boundary
+   per call. What the period does set is the one-time subnormal exposure per silence event (measured worst
+   run for a real pole from 1e-15: 8 samples at 32, 16 at 64, 180 at 256, 8116 at 8192) and the poison
+   recovery bound. Do not argue a period from pole radius: a DF2T biquad with `a1 = −65/128`,
+   `a2 = 9/128` — poles at radius 0.265 — walks from 1e-15 to the exact nonzero fixed point
+   `(z1, z2) = (2⁻¹⁴⁹, −0)` in 53 silent updates and stays there for ever. **(c) An oversampled kernel
+   counts its OWN clock**: 64 base-rate frames is 512 recursive updates at 8×.
 9. **No `long double` in anything that crosses a tier boundary.** It is not a type with a defined
    precision — it is whatever the target's ABI happens to say, and the answers disagree in *size* as well
    as in precision. Measured, one source file, three toolchains:
