@@ -69,6 +69,7 @@ public:
     {
         side_.reset(); audio_.reset(); env_.reset(); gr_.reset();
         ksamp_ = 0; curGainDb_ = params_.staticGainDb; updateAudio();
+        ranNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedChannels)
     }
 
     void setParams (const DynamicEqBandParams& p) noexcept { params_ = p; apply (p); }
@@ -78,7 +79,8 @@ public:
     void process (float* const* io, int numChannels, int n) noexcept
     {
         const int nc = std::min (numChannels, channels_);
-        if (nc <= 0) return;
+        if (nc <= 0 || n <= 0) return;
+        dropStoppedChannels (nc);
         for (int i = 0; i < n; ++i)
         {
             // detector: per-channel sidechain BandPass → one linked level
@@ -108,6 +110,17 @@ public:
     }
 
 private:
+    // Both filters are per channel and advance only for c < nc; the envelope and the GR follower they feed
+    // are shared and keep running. A channel that leaves and RETURNS therefore re-enters with a sidechain
+    // column and an audio column frozen from before the gap — measured, on DIGITAL SILENCE, an 0.388 audio
+    // tail eleven samples in and 8.85 dB of unearned reduction. Per channel only: the shared detector path
+    // legitimately follows whatever channels are actually present.
+    void dropStoppedChannels (int nc) noexcept
+    {
+        for (int c = nc; c < ranNc_; ++c) { side_.resetChannel (c); audio_.resetChannel (c); }
+        ranNc_ = nc;
+    }
+
     void updateAudio() noexcept { audio_.setParams (params_.type, params_.freq, params_.Q, curGainDb_); }
 
     static double finite (double v, double fallback) noexcept { return std::isfinite (v) ? v : fallback; }
@@ -141,6 +154,7 @@ private:
     DynamicEqBandParams params_;
 
     eq::Svf side_, audio_;                       // sidechain BandPass · audio Bell/shelf
+    int     ranNc_ = 0;                          // channels that advanced state on the previous call
     dynamics::EnvelopeFollower    env_;
     dynamics::GainComputer        gc_;
     dynamics::GainReductionFollower gr_;

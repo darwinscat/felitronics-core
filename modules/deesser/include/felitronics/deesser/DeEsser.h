@@ -59,7 +59,11 @@ public:
         reset();
     }
 
-    void reset() noexcept { side_.reset(); xover_.reset(); env_.reset(); gr_.reset(); deq_.reset(); grDb_ = 0.0f; }
+    void reset() noexcept
+    {
+        side_.reset(); xover_.reset(); env_.reset(); gr_.reset(); deq_.reset(); grDb_ = 0.0f;
+        ranNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedChannels)
+    }
     void setParams (const DeEsserParams& p) noexcept
     {
         const bool relatch = (p.mode != params_.mode) || (p.listen != params_.listen);   // topology / signal-path change
@@ -72,7 +76,8 @@ public:
     void process (float* const* io, int numChannels, int n) noexcept
     {
         const int nc = std::min (numChannels, channels_);
-        if (nc <= 0) return;
+        if (nc <= 0 || n <= 0) return;
+        dropStoppedChannels (nc);
 
         // DynamicEq mode = the surgical dynamic-EQ band (no split, no listen detour).
         if (params_.mode == DeEsserMode::DynamicEq && ! params_.listen)
@@ -144,6 +149,21 @@ private:
     int channels_ = 2;
     DeEsserParams params_;
 
+    // The sidechain band-pass and the crossover are both PER CHANNEL and both advance only for c < nc,
+    // while the envelope and the GR follower they feed are shared. In SplitBand mode a channel that
+    // leaves and returns therefore replays two frozen recursions into the new stream — measured 1.706e-01
+    // (-15.4 dBFS) on the returning channel at sample 0, out of DIGITAL SILENCE, against 0.000 for the
+    // channel that stayed. DynamicEq mode was already safe because it delegates to DynamicEqBand, which
+    // carries its own ledger; this suite's own tests never processed more than one channel, which is why
+    // a green suite said nothing about it. The shared detector half is deliberately untouched: it is
+    // supposed to follow whichever channels are actually present.
+    void dropStoppedChannels (int nc) noexcept
+    {
+        for (int c = nc; c < ranNc_; ++c) { side_.resetChannel (c); xover_.resetChannel (c); }
+        ranNc_ = nc;
+    }
+
+    int     ranNc_ = 0;                          // channels that advanced state on the previous call
     eq::Svf side_;                               // sidechain BandPass
     eq::Crossover2 xover_;                       // LR4 split (SplitBand mode)
     dynamics::EnvelopeFollower env_;

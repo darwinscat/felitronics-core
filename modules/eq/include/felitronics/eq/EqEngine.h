@@ -76,14 +76,25 @@ public:
     {
         if (! prepared_) { scValid_ = 0; return nullptr; }
         const int nc = numChannels < ch ? numChannels : ch;
-        if (nc <= 0 || numSamples <= 0 || numSamples > maxBlock_ || scratch_.empty()) { scValid_ = 0; return nullptr; }
+        if (nc <= 0 || numSamples <= 0 || numSamples > maxBlock_ || scratch_.empty()) { scValid_ = scNc_ = 0; return nullptr; }
         for (int c = 0; c < nc; ++c)
-            std::copy (channels[c], channels[c] + numSamples, scPtr_[c]);
+        {
+            scPtr_[c] = scratch_.data() + (std::size_t) c * (std::size_t) maxBlock_;   // a capture wider than
+            std::copy (channels[c], channels[c] + numSamples, scPtr_[c]);              // the last one restores
+        }
+        // The capture has a WIDTH as well as a length, and only the length used to be recorded. A narrow
+        // capture after a wide one left the columns past nc pointing at the PREVIOUS block's audio, so a
+        // consumer reading one column too far detected on a signal that is not this block's — silently, and
+        // on data that looks perfectly plausible. Columns outside the capture are handed back as nullptr
+        // instead: the same refusal this method already makes for a block that is too long.
+        for (int c = nc; c < kMaxChannels; ++c) scPtr_[c] = nullptr;
         scValid_ = numSamples;
+        scNc_    = nc;
         return scPtr_;
     }
 
-    int  sectionInputSamples() const noexcept { return scValid_; }
+    int  sectionInputSamples()  const noexcept { return scValid_; }
+    int  sectionInputChannels() const noexcept { return scNc_; }   // width of the last capture, 0 if none
 
     // Direct band access, so a composition layer can interleave "compute this band's deltas" with
     // "run this band" — the order dynamics requires, and one this engine deliberately does not
@@ -94,7 +105,7 @@ public:
 
     void reset() noexcept
     {
-        scValid_ = 0;   // a stream restart invalidates any captured section input
+        scValid_ = scNc_ = 0;   // a stream restart invalidates any captured section input
         for (auto& b : bands) b.reset();
         inTap.reset();
         outTap.reset();
@@ -204,7 +215,7 @@ private:
     std::vector<float> scratch_;                 // section-input capture (see captureSectionInput)
     float*             scPtr_[kMaxChannels] {};
     bool               prepared_ = false;          // true only after a fully-successful prepare()
-    int                maxBlock_ = 0, scValid_ = 0;
+    int                maxBlock_ = 0, scValid_ = 0, scNc_ = 0;
     SpectrumTap inTap, outTap;
 };
 

@@ -59,6 +59,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_eq_prepare_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_eq_prepare_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_eq_prepare_tests COMMAND felitronics_eq_prepare_tests)
+    # What a cell does when it STOPS being executed and runs again later — the channel count, a lane
+    # switched off, the swept/matched branch and dyn.on all stop a real recursion while the band runs on.
+    add_executable(felitronics_eq_gatestate_tests tests/EqBandGateStateTests.cpp)
+    target_link_libraries(felitronics_eq_gatestate_tests PRIVATE felitronics::eq)
+    target_include_directories(felitronics_eq_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_eq_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_eq_gatestate_tests COMMAND felitronics_eq_gatestate_tests)
 
     add_executable(felitronics_eq_svf_tests tests/SvfTests.cpp)
     target_link_libraries(felitronics_eq_svf_tests PRIVATE felitronics::eq)

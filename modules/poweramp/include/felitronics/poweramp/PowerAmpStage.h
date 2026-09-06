@@ -187,6 +187,9 @@ struct PowerAmpStage::Impl
     float comp = 1.0f;
     float gApplied = 1.0f, postApplied = 1.0f;       // per-sample ramp anchors
     bool  primed = false;
+    int   ranNc  = 0;                                // channels that advanced state on the previous call
+    bool  ranPres_ = false, ranDepth_ = false, ranMid_ = false;   // and which of this stage's own gates
+    bool  ranLoad_ = false, ranIron_  = false, ranSag_ = false;   // were open on the previous CHUNK
 
     void prepare (double sr, int mb, int osFactor)
     {
@@ -223,6 +226,48 @@ struct PowerAmpStage::Impl
         svfLoadRes.reset();
         svfLoadRise.reset();
         for (int c = 0; c < kMaxCh; ++c) { otLp[c] = 0.0f; otHf[c] = 0.0f; }
+        ranNc = 0;   // nothing has run, so nothing can be stopping (see dropStoppedChannels)
+        ranPres_ = ranDepth_ = ranMid_ = ranLoad_ = ranIron_ = ranSag_ = false;
+    }
+
+    // The same rule as the channel drop, applied to this stage's OWN gates. A knob glided to zero stops a
+    // real recursion at a CONSTANT channel count, and the stage picks it up again when the knob comes
+    // back — measured out of EXACT digital silence, after knob->0, four seconds of silence, knob->0.8:
+    // load 1.67e-2 (-35.5 dBFS), iron 9.73e-3 (-40.2 dBFS), presence 5.70e-3 (-44.9 dBFS), depth 1.04e-3.
+    // This lives in processChunk and not in process() because the gates are computed PER CHUNK from
+    // glided values, so the predicate can cross inside a single oversized call. Every column is cleared,
+    // not just the live ones: the gate is global, and a column outside nCh was cleared already.
+    // `sag` is one shared supply, so it is cleared whole — it is the only cell here that is not per channel.
+    void dropStoppedGates (bool presOn, bool depthOn, bool midOn, bool loadOn, bool ironOn, bool sagOn) noexcept
+    {
+        if (ranPres_  && ! presOn)  for (int c = 0; c < kMaxCh; ++c) svfPresence.resetChannel (c);
+        if (ranDepth_ && ! depthOn) for (int c = 0; c < kMaxCh; ++c) svfDepth.resetChannel (c);
+        if (ranMid_   && ! midOn)   for (int c = 0; c < kMaxCh; ++c) svfMid.resetChannel (c);
+        if (ranLoad_  && ! loadOn)  for (int c = 0; c < kMaxCh; ++c) { svfLoadRes.resetChannel (c); svfLoadRise.resetChannel (c); }
+        if (ranIron_  && ! ironOn)  for (int c = 0; c < kMaxCh; ++c) { otLp[c] = 0.0f; otHf[c] = 0.0f; }
+        if (ranSag_   && ! sagOn)   sag.reset();
+        ranPres_ = presOn; ranDepth_ = depthOn; ranMid_ = midOn;
+        ranLoad_ = loadOn; ranIron_ = ironOn;  ranSag_  = sagOn;
+    }
+
+    // Clear the sample memory of every channel that ran on the previous accepted call and does not run on
+    // this one. A channel that leaves and RETURNS re-enters with its oversampler FIR, its DC blocker, its
+    // output-transformer poles and its five SVF columns frozen rather than decayed, and plays them into
+    // whatever comes back — measured 0.649 (-3.8 dBFS) out of DIGITAL SILENCE after stereo -> mono ->
+    // stereo. Per channel, never wholesale: the channel that stayed owes nothing to the one that left.
+    // `sag` is deliberately untouched — it is ONE supply shared by both channels, so it is supposed to
+    // follow whichever channels are actually there, exactly like a linked detector.
+    void dropStoppedChannels (int nCh) noexcept
+    {
+        for (int c = nCh; c < ranNc; ++c)
+        {
+            ovs.resetChannel (c);
+            dcx1[c] = dcy1[c] = 0.0;
+            otLp[c] = otHf[c] = 0.0f;
+            svfPresence.resetChannel (c); svfDepth.resetChannel (c); svfMid.resetChannel (c);
+            svfLoadRes.resetChannel (c);  svfLoadRise.resetChannel (c);
+        }
+        ranNc = nCh;
     }
 
     void setParams (const Params& p, const Voicing& v)
@@ -252,6 +297,7 @@ struct PowerAmpStage::Impl
         const int nCh = std::min (numChannels, kMaxCh);
         if (nCh <= 0 || numSamples <= 0 || maxBlock <= 0)   // maxBlock<=0 ⇒ process() called before prepare():
             return;                                          // clean no-op (also kills the off+=0 infinite loop)
+        dropStoppedChannels (nCh);                           // a call that ran nothing never reaches here
 
         // Chunk to maxBlock so a caller passing numSamples > maxBlock is FULLY processed instead of
         // silently leaving the tail dry. State carries across chunks via the members → seamless.
@@ -404,6 +450,8 @@ struct PowerAmpStage::Impl
         const bool   biasOn = biasCur > 1.0e-4f && sagOn && v.sagBiasDepth > 0.0f;
         const float  invMaxDroopB = v.sagMaxDroop > 0.0f ? 1.0f / v.sagMaxDroop : 0.0f;
         const float  biasScale    = biasCur * v.sagBiasDepth * vbCur;   // vbEff = vbCur − biasScale·droopN
+
+        dropStoppedGates (presOn, depthOn, midOn, loadOn, ironOn, sagOn);
 
         // --- upsample → PP/SE waveshape (+ per-sample bias) + DC-block + output transformer (OS domain) → downsample ---
         ovs.upsample (io, nCh, n, osPtr);

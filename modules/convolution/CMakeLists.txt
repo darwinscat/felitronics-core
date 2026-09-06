@@ -61,3 +61,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_convolution_cabconvolver_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_convolution_cabconvolver_tests COMMAND felitronics_convolution_cabconvolver_tests)
 endif()
+
+if(FELITRONICS_BUILD_TESTS)
+    # A convolver channel that stops being asked for and is asked for again — a whole frame, an FDL and a
+    # pending tail, none of which decays while it is away.
+    add_executable(felitronics_convolution_gatestate_tests tests/ConvolutionGateStateTests.cpp)
+    target_link_libraries(felitronics_convolution_gatestate_tests PRIVATE felitronics::convolution)
+    target_include_directories(felitronics_convolution_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_convolution_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_convolution_gatestate_tests COMMAND felitronics_convolution_gatestate_tests)
+endif()

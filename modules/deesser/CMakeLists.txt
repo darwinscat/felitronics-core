@@ -13,3 +13,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_deesser_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_deesser_tests COMMAND felitronics_deesser_tests)
 endif()
+
+if(FELITRONICS_BUILD_TESTS)
+    # The eighth place a returning channel replays frozen recursions — SplitBand runs two of them per
+    # channel with no ledger, and the suite above never processes more than one channel.
+    add_executable(felitronics_deesser_gatestate_tests tests/DeEsserGateStateTests.cpp)
+    target_link_libraries(felitronics_deesser_gatestate_tests PRIVATE felitronics::deesser)
+    target_include_directories(felitronics_deesser_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_deesser_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_deesser_gatestate_tests COMMAND felitronics_deesser_gatestate_tests)
+endif()

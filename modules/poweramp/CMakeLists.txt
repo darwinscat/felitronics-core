@@ -29,6 +29,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_poweramp_theory_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_poweramp_theory_tests COMMAND felitronics_poweramp_theory_tests)
 
+    # What a channel does when it stops being fed and is fed again — six recursions behind one `ch < nCh`.
+    add_executable(felitronics_poweramp_gatestate_tests tests/PowerAmpGateStateTests.cpp)
+    target_link_libraries(felitronics_poweramp_gatestate_tests PRIVATE felitronics::poweramp)
+    target_include_directories(felitronics_poweramp_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_poweramp_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_poweramp_gatestate_tests COMMAND felitronics_poweramp_gatestate_tests)
+
     add_executable(felitronics_poweramp_falsify_tests tests/PowerAmpFalsifyTests.cpp)
     target_link_libraries(felitronics_poweramp_falsify_tests PRIVATE felitronics::poweramp)
     target_include_directories(felitronics_poweramp_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

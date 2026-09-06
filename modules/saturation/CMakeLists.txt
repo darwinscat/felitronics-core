@@ -19,6 +19,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_saturation_theory_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_saturation_theory_tests COMMAND felitronics_saturation_theory_tests)
 
+    # What a channel does when it stops being fed and is fed again — plus the stage's own dcEnabled_ gate.
+    add_executable(felitronics_saturation_gatestate_tests tests/SaturatorGateStateTests.cpp)
+    target_link_libraries(felitronics_saturation_gatestate_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_gatestate_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_gatestate_tests COMMAND felitronics_saturation_gatestate_tests)
+
     add_executable(felitronics_saturation_falsify_tests tests/SaturatorFalsifyTests.cpp)
     target_link_libraries(felitronics_saturation_falsify_tests PRIVATE felitronics::saturation)
     target_include_directories(felitronics_saturation_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

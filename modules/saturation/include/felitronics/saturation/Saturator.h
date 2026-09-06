@@ -76,6 +76,12 @@ public:
         const int lat = (os_ > 1) ? ovs_.latencySamples() : 0;   // align the dry to the wet's round-trip
         for (auto& d : dryDelay_) { d.prepare (lat); d.setDelay (lat); }
         applyParams();
+        // The ledger must die with the buffers it indexes. prepare() REALLOCATES every per-channel vector
+        // above, so a stale count from a wider previous life would send the next drop past the end of the
+        // new ones — measured as an AddressSanitizer container-overflow on dryDelay_ after
+        // prepare(2) -> process -> prepare(1) -> process. prepare() does not call reset(), so this cannot
+        // be left to reset() to do.
+        ranNc_ = ranDcNc_ = 0;
         prepared_ = true;                                              // fully built — process() may now run
         return true;
     }
@@ -86,6 +92,7 @@ public:
         std::fill (dcX1_.begin(), dcX1_.end(), 0.0f);
         std::fill (dcY1_.begin(), dcY1_.end(), 0.0f);
         for (auto& d : dryDelay_) d.reset();
+        ranNc_ = ranDcNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedCells)
     }
 
     int  latencySamples() const noexcept { return os_ > 1 ? ovs_.latencySamples() : 0; }
@@ -97,6 +104,7 @@ public:
     {
         const int nc = std::min (numChannels, channels_);
         if (! prepared_ || nc <= 0 || n <= 0) return;                    // unprepared / failed-prepare → no OOB
+        dropStoppedCells (nc);                                           // before any audio: see the note there
         // Chunk to maxBlock so a caller passing n > maxBlock is FULLY processed instead of silently
         // dropped. State carries across chunks via the members → bit-identical to one big call.
         // maxBlock_ ≥ 1 whenever prepared_ (prepare() rejects less), so the loop always advances.
@@ -110,6 +118,30 @@ public:
     }
 
 private:
+    // Clear the sample memory of every cell that ran on the previous accepted call and does not run on this
+    // one. A channel that leaves and RETURNS is the case: its oversampler FIR, its DC blocker and its dry
+    // delay are frozen, not decayed, and it replays them into a stream that has moved on — measured 0.9337
+    // out of DIGITAL SILENCE, 29 samples after a return. The DC blocker has a second gate of its own,
+    // dcEnabled_, which the Asym→symmetric→Asym path opens and closes at a constant channel count and which
+    // freezes x1/y1 exactly the same way. Per channel, never wholesale: a channel that never left keeps its
+    // history bit-exact, which is why the oversampler grew resetChannel(). A call that carries no samples
+    // (or none this stage accepts) ran nothing, so it stops nothing and never reaches here.
+    void dropStoppedCells (int nc) noexcept
+    {
+        const int nowDc = dcEnabled_ ? nc : 0;
+        for (int c = nc; c < ranNc_; ++c)
+        {
+            if (os_ > 1) ovs_.resetChannel (c);
+            dryDelay_[(std::size_t) c].reset();
+        }
+        for (int c = nowDc; c < ranDcNc_; ++c)
+        {
+            dcX1_[(std::size_t) c] = 0.0f;
+            dcY1_[(std::size_t) c] = 0.0f;
+        }
+        ranNc_ = nc; ranDcNc_ = nowDc;
+    }
+
     // One ≤ maxBlock slice; nc already clamped by process(). Everything stateful streams across calls.
     void processChunk (float* const* io, int nc, int n) noexcept
     {
@@ -239,6 +271,7 @@ private:
     float  comp_ = 1.0f, dcR_ = 0.0f, mix_ = 1.0f, outGain_ = 1.0f;
     bool   dcEnabled_ = false;
     bool   prepared_  = false;                             // true only after a fully-successful prepare()
+    int    ranNc_ = 0, ranDcNc_ = 0;                       // what advanced state on the previous accepted call
 
     std::vector<float>  osBuf_, wetBuf_;
     std::vector<float*> osPtrs_, wetPtrs_;
