@@ -25,6 +25,13 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     within one grid period (28 samples). A host with a block SHORTER than a period keeps its immediate
     recovery: the `isfinite` half of the flush still runs at the end of every call
     (`eq::Biquad::healPoison()`, `eq::Svf::healPoison()`, `eq::Crossover2::healPoison()` — additive).
+  - **BREAKING (behaviour), `dynamiceq::LaneDynamics`:** it drives `eq::EqBand` in 16-sample control
+    chunks, so the band's STATIC freq/Q/gain glide used to advance every 16 samples and now advances
+    every 64. Measured on a 500 → 5000 Hz +12 dB edit with 30 ms smoothing: designs per 100 ms
+    300 → 75, largest single step 2.15 → 3.22 dB — still finer than any real host block gave before
+    (a 512-sample host took 10 steps of 11.8 dB), but it moved, and a dynamic band is where edit
+    smoothness is most visible. The gain DELTA itself is unaffected: it is an arrival, still consumed
+    at the producer's 16-sample cadence.
   - **BREAKING (behaviour), `stereo::MonoBass`:** settling into the full-wide bypass is now decided per
     sample instead of at the top of the next call. The samples in between used to take the M/S round
     trip, which is not the identity in float — 1 LSB of 24 bit (5.96e-08) on 22 953 samples of the

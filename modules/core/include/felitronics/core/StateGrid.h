@@ -41,8 +41,9 @@ namespace felitronics::core
 //   * subnormal exposure per silence event stays at or below what today's smallest realistic host block
 //     already gives (measured worst run inside one period, real pole from 1e-15: 8 samples at K=32,
 //     16 at K=64, 180 at K=256, 8116 at K=8192);
-//   * it is the smallest block a live rig runs, and a power of two, so hosts at 64/128/256/512 see
-//     exactly one boundary per call and no split segments at all;
+//   * it is the smallest block a live rig runs, and a power of two, so every host block that is a
+//     multiple of it (64, 128, 256, 512, ...) is a whole number of periods — the boundaries land on the
+//     call boundaries and no segment is ever split;
 //   * where a kernel also puts its CONTROL rate on this grid it sets the redesign budget: 750 ticks/s
 //     at 48 kHz.
 // A stall CANNOT be dismissed by pole radius, which is the argument this file used to invite: a DF2T
@@ -81,8 +82,10 @@ public:
 
     // Advance by `n` samples of audio that produced no maintenance — a stage that was bypassed or ran
     // nothing still consumed audio TIME, and freezing the phase there would make every later boundary
-    // depend on how long the bypass lasted. `n >= 0`, any size.
-    void skip (int n) noexcept { phase_ = (phase_ + n % kPeriod) % kPeriod; }
+    // depend on how long the bypass lasted. Any size; a non-positive `n` moves nothing, which is not
+    // decoration — a negative one would leave the phase negative and `segment()` would then hand out
+    // MORE than a period, past the caller's own buffer.
+    void skip (int n) noexcept { if (n > 0) phase_ = (phase_ + n % kPeriod) % kPeriod; }
 
     int phase() const noexcept { return phase_; }
 

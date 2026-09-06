@@ -127,6 +127,12 @@ static void testGridArithmetic()
     ok (h.phase() == 5, "skip() is modular and survives a large jump");
     h.skip (0);
     ok (h.phase() == 5, "skip(0) moves nothing");
+    // A NEGATIVE skip must move nothing either. Without the guard the phase goes negative and then
+    // `segment()` hands out MORE than a period — past the end of the caller's own buffer, on a
+    // primitive that is public and whose owners are not all obliged to have checked.
+    h.skip (-1); h.skip (-1000);
+    ok (h.phase() == 5, "a negative skip moves nothing (" + std::to_string (h.phase()) + ")");
+    ok (h.segment (1000000) <= kK && h.segment (1000000) >= 1, "segment() stays inside [1, kPeriod] after a negative skip");
 }
 
 //==============================================================================
@@ -140,9 +146,33 @@ static void testEqSlicingInvariance()
     // The 0 dB bell is here on purpose: P18 F18 measured that a matched bell at 0 dB is NOT bit-exactly
     // unity — it holds state and rings at ~1.4e-10 — so its state sits AT the flush threshold and the
     // divergence used to land in the middle of the TONE, not only in the tail.
+    // FIVE LANES, not only ST. The segment loop offsets each lane's pointers separately, and a sweep of
+    // ST-only bells cannot see an offset dropped on the L/R path: that mutation passed a 200-check suite,
+    // EqBandDeltaTests and EqBandGateStateTests, and was caught only by an unrelated response test.
+    auto fiveLane = [] {
+        eq::BandParams p; p.on = true; p.type = eq::FilterType::Bell;
+        for (auto& l : p.lanes) l.on = false;
+        struct { eq::Lane l; double f, q, g; } spec[] = {
+            { eq::Lane::Stereo, 900.0, 1.1,  4.0 }, { eq::Lane::Left, 250.0, 0.8, -6.0 },
+            { eq::Lane::Right, 3100.0, 2.2,  5.0 }, { eq::Lane::Mid,  600.0, 1.5, -3.0 },
+            { eq::Lane::Side, 7000.0, 0.9,  7.0 } };
+        for (const auto& sp : spec)
+        {
+            auto& ln = p.lanes[(std::size_t) sp.l];
+            ln.on = true; ln.freq = sp.f; ln.Q = sp.q; ln.gainDb = sp.g;
+        }
+        return p;
+    };
+    auto sweptBand = [] {
+        eq::BandParams p = bell (2500.0, 0.0, 3.0);
+        p.type = eq::FilterType::BandPass; p.swept = true;
+        return p;
+    };
     const Case cases[] = { { "Bell +6 dB", bell (1000.0, 6.0) },
                            { "Bell  0 dB", bell (1000.0, 0.0) },
-                           { "Bell -20 dB Q8", bell (4000.0, -20.0, 8.0) } };
+                           { "Bell -20 dB Q8", bell (4000.0, -20.0, 8.0) },
+                           { "five lanes ST+L+R+M+S", fiveLane() },
+                           { "swept band-pass (SVF path)", sweptBand() } };
 
     for (const Case& c : cases)
     {
@@ -594,6 +624,41 @@ static void testRampFollowsItsOwnDesign()
     ok (std::fabs (std::abs (b.response (w)) - std::abs (hf)) < 1e-6,
         "the FINAL settled design is the target's, within the smoother's own settle epsilon");
 
+    // AND THE CARRY ITSELF, BIT-EXACTLY. The check above cannot see it: dropping the carried redesign
+    // moves the final |H| by 1.08e-12, four orders under that tolerance, so the suite passed the
+    // mutation. What the carry actually promises is sharp — on the tick where the smoother LANDS, the
+    // band redesigns once more, so its response is the design at the landed value and not at the
+    // one-tick-earlier value. Same `designBand`, same double, so the bits must agree exactly.
+    {
+        eq::EqBand cb;
+        ok (cb.prepare (kFs, 2, smoothMs), "settle-carry fixture: prepared");
+        cb.setParams (bell (f0, gain, q));
+        cb.setParams (bell (f1, gain, q));
+        core::Smoother cref; cref.prepare (kFs, smoothMs); cref.snap (f0); cref.setTarget (f1);
+        std::vector<float> cb0 ((std::size_t) kK, 0.0f), cb1 ((std::size_t) kK, 0.0f);
+        float* cc[2] = { cb0.data(), cb1.data() };
+        bool landed = false, exact = false; int landTick = -1; double landErr = -1.0;
+        for (int tickNo = 1; tickNo <= 4000 && ! landed; ++tickNo)
+        {
+            const bool wasMoving = ! cref.settled();
+            cb.processBlock (cc, 2, kK);
+            cref.advance (kK);
+            if (wasMoving && cref.settled())          // THIS is the landing tick
+            {
+                landed = true; landTick = tickNo;
+                eq::BandParams op = bell (cref.value(), gain, q);
+                const eq::BandDesign d = eq::designBand (op, kFs);
+                std::complex<double> h { 1.0, 0.0 };
+                for (int i = 0; i < d.n; ++i) h *= eq::evalCoeffs (d.sec[i], w);
+                landErr = std::fabs (std::abs (cb.response (w)) - std::abs (h));
+                exact = (landErr == 0.0);
+            }
+        }
+        ok (landed, "PRECONDITION the glide LANDED inside the fixture (tick " + std::to_string (landTick) + ")");
+        ok (exact, "on the landing tick the band's design is BIT-EXACTLY the landed value's (err "
+                   + std::to_string (landErr) + ")");
+    }
+
     // THE SAME ORACLE ON A MONO LANE. The ST columns and the L/R/M/S lanes advance through different
     // code, so pinning one says nothing about the other.
     {
@@ -733,20 +798,26 @@ static void testPoisonHealIsAtomic()
         }
     }
     {   // ... and the same through MonoBass's public surface, which is where the per-call heal lives.
-        stereo::MonoBass m; m.prepare (kFs, 512, 2);
+        // THE CALL LENGTH IS THE FIXTURE. 512 is a whole number of periods, so a grid flush lands inside
+        // the call and heals the poison whether or not the per-call heal exists — the first version of
+        // this check passed with `xo_.healPoison()` deleted. 500 samples puts the last boundary at 448,
+        // so poison injected at 490 can ONLY be cleared by the per-call heal.
+        const int n1 = 500, n2 = 100;
+        stereo::MonoBass m; m.prepare (kFs, n1, 2);
         m.setParams ({ true, 150.0f, 0.0f });
-        std::vector<float> L (512, 0.0f), R (512, 0.0f);
-        for (int i = 0; i < 512; ++i) { L[(std::size_t) i] = 0.3f; R[(std::size_t) i] = -0.3f; }
-        L[10] = std::numeric_limits<float>::infinity();
+        std::vector<float> L ((std::size_t) n1, 0.3f), R ((std::size_t) n1, -0.3f);
+        L[490] = std::numeric_limits<float>::infinity();
         float* ch[2] = { L.data(), R.data() };
-        m.process (ch, 2, 512);
+        m.process (ch, 2, n1);
         long long bad = 0; for (float v : L) if (! std::isfinite (v)) ++bad;
-        ok (bad >= 1, "PRECONDITION the +Inf poisoned MonoBass's crossover (" + std::to_string (bad) + " non-finite)");
-        std::vector<float> L2 (512, 0.05f), R2 (512, -0.05f);
+        ok (bad >= 1, "PRECONDITION the +Inf poisoned MonoBass's crossover AFTER the last grid boundary ("
+                      + std::to_string (bad) + " non-finite)");
+        std::vector<float> L2 ((std::size_t) n2, 0.05f), R2 ((std::size_t) n2, -0.05f);
         float* ch2[2] = { L2.data(), R2.data() };
-        m.process (ch2, 2, 512);
+        m.process (ch2, 2, n2);
         long long bad2 = 0; for (float v : L2) if (! std::isfinite (v)) ++bad2;
-        ok (bad2 == 0, "the NEXT call is clean — the per-call poison heal ran (" + std::to_string (bad2) + " non-finite)");
+        ok (bad2 == 0, "the NEXT call is clean — only the per-call poison heal can have done that ("
+                       + std::to_string (bad2) + " non-finite)");
     }
 }
 

@@ -171,8 +171,8 @@ the CPU at runtime, invisible to any build. Full write-up:
    with a block shorter than a period keeps the immediate recovery it had (`eq::Biquad::healPoison()`).
    **(b) `kPeriod` is chosen, not derived.** Any period makes a stall unreachable, because a state under
    the 1e-15 threshold is 23 decades above the subnormal floor and cannot outlive one period; 64 is the
-   smallest block a live rig runs and a power of two, so hosts at 64/128/256/512 see exactly one boundary
-   per call. What the period does set is the one-time subnormal exposure per silence event (measured worst
+   smallest block a live rig runs and a power of two, so every host block that is a multiple of it is a
+   whole number of periods and no segment is ever split. What the period does set is the one-time subnormal exposure per silence event (measured worst
    run for a real pole from 1e-15: 8 samples at 32, 16 at 64, 180 at 256, 8116 at 8192) and the poison
    recovery bound. Do not argue a period from pole radius: a DF2T biquad with `a1 = −65/128`,
    `a2 = 9/128` — poles at radius 0.265 — walks from 1e-15 to the exact nonzero fixed point
