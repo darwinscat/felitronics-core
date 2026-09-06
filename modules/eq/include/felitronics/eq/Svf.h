@@ -140,9 +140,18 @@ public:
     // × 6 Q values × 6 amplitudes from 1e35 to 3e38 × 3 waveforms, this build against a word-by-word
     // one — and found none in 25920 outputs. The shape is kept anyway: the sibling biquad needs it
     // for real, and one contract with one shape beats two.
+    // Over the PREPARED channels, not over kMaxChannels. The columns past `ch` are never written — every
+    // owner drives this with `c < nc <= ch` — and reset() zeroes all of them, so visiting them was always
+    // a no-op that cost the same as real work: after #126 the loop body is not a flush but two isfinite
+    // tests and two stores per column, so a mono Svf was paying for sixteen. This is the hottest primitive
+    // in the repository and it is called once per block by every band, lane, crossover and probe.
+    //
+    // The precondition is the class's own contract, so this cannot silently start missing state: an owner
+    // that wrote past `ch` would already be indexing a column prepare() never claimed, and reset() still
+    // clears every column, so nothing can survive a stream restart either.
     void flushDenormals() noexcept
     {
-        for (int c = 0; c < kMaxChannels; ++c)
+        for (int c = 0; c < ch; ++c)
         {
             if (! std::isfinite (ic1[c]) || ! std::isfinite (ic2[c])) { ic1[c] = 0.0f; ic2[c] = 0.0f; }
             else { core::flushDenormal (ic1[c]); core::flushDenormal (ic2[c]); }

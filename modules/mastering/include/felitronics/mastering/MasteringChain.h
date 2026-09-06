@@ -253,7 +253,8 @@ public:
         if (cfg_.eq)
         {
             eq_ = std::make_unique<eq::EqEngine>();
-            eq_->prepare (fs_, K_, nch_);
+            if (! eq_->prepare (fs_, K_, nch_)) return false;   // the EQ now refuses a rate it cannot honour
+
         }
         else eq_.reset();
 

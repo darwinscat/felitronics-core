@@ -9,6 +9,7 @@
 #include <felitronics/eq/Svf.h>
 
 #include <algorithm>
+#include <cmath>
 #include <complex>
 #include <limits>
 #include <cstddef>
@@ -310,8 +311,19 @@ public:
     static constexpr int kMaxChannels = Svf::kMaxChannels;
     static constexpr int kMaxSections = BandDesign::kMaxSections;
 
-    void prepare (double sampleRate, int numChannels, double smoothMs = 30.0) noexcept
+    // REFUSES a sample rate it cannot honour, and says so, rather than half-honouring it. `fs` reaches
+    // every coefficient through tan(pi*f/fs) and its friends, so a zero or non-finite rate does not
+    // degrade the filter, it poisons it: measured, prepare(0, 2) and prepare(NaN, 2) each put 63 of 64
+    // output samples non-finite on an ordinary 0.25 input, and prepare(1.0, 2) does the same on a
+    // HighPass or a Notch. Spelled POSITIVELY so NaN fails — `NaN <= 0.0` is false, which is exactly how
+    // the same hole survived in Saturator until P6 F12. A refused band stays unprepared and processBlock
+    // does nothing at all, so a caller that ignores the verdict gets silence rather than poison; the
+    // return is there for one that wants to know. (EqEngine, the module's front door, marks its own
+    // prepare [[nodiscard]]; here that would cost a hundred casts in call sites the gate already covers.)
+    bool prepare (double sampleRate, int numChannels, double smoothMs = 30.0) noexcept
     {
+        prepared_ = false;                                    // any early return below leaves it unprepared
+        if (! (std::isfinite (sampleRate) && sampleRate > 0.0 && sampleRate <= 3.0e6)) return false;
         fs = sampleRate;
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
         stFreqS_.prepare (fs, smoothMs); stQS_.prepare (fs, smoothMs); stGainS_.prepare (fs, smoothMs);
@@ -330,6 +342,8 @@ public:
         initialized = false;
         bandWasActive = false;
         reset();
+        prepared_ = true;                                     // fully built — processBlock may now run
+        return true;
     }
 
     void reset() noexcept
@@ -435,6 +449,7 @@ public:
     // L on ch0 / R on ch1, then the M/S delta-fold (2-channel only; mono/surround run the ST lane only).
     void processBlock (float* const* channels, int numChannels, int numSamples) noexcept
     {
+        if (! prepared_) return;                               // a refused rate has no coefficients to run
         const int nc = numChannels < ch ? numChannels : ch;
 
         const bool stRun = laneOn (Lane::Stereo);              // ST runs on every channel (any nc)
@@ -782,6 +797,7 @@ private:
     BandParams p;
     double fs = 44100.0;
     int    ch = 2;
+    bool   prepared_ = false;                 // true only after a fully-successful prepare()
     bool   recomputePending = true;
     bool   initialized = false;
     bool   bandWasActive = false;

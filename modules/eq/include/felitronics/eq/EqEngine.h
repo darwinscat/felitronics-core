@@ -12,6 +12,7 @@
 #include <vector>
 #include <atomic>
 #include <cmath>
+#include <cmath>
 #include <complex>
 
 namespace felitronics::eq
@@ -34,8 +35,18 @@ public:
     static constexpr int kMaxBands    = 24;
     static constexpr int kMaxChannels = EqBand::kMaxChannels;
 
-    void prepare (double sampleRate, int maxBlock, int numChannels) noexcept
+    // REFUSES a configuration it cannot honour. `sampleRate` reaches every coefficient in every band, so
+    // a zero or non-finite one does not degrade the EQ, it poisons it — measured, prepare(NaN, 64, 2)
+    // then a 0.25 input gives 63 non-finite samples out of 64. This was the second half of P6 F12:
+    // Saturator's identical hole was closed then and this one was not, so only the mastering chain, which
+    // validates at its own входе, was protected — a direct consumer of `eq` got NaN in silence.
+    // [[nodiscard]] and a refusal, matching TruePeakLimiter (P12) and Compressor (P2), rather than the
+    // silent substitution some void prepare()s in this repo do: a caller that believes it prepared and
+    // processes at the wrong rate is the failure those two exist to prevent. Spelled positively so NaN fails.
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int numChannels) noexcept
     {
+        prepared_ = false;                              // any early return below leaves the engine unprepared
+        if (! (std::isfinite (sampleRate) && sampleRate > 0.0 && sampleRate <= 3.0e6)) return false;
         fs = sampleRate;
         ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
         maxBlock_ = maxBlock > 0 ? maxBlock : 0;
@@ -49,8 +60,12 @@ public:
             scPtr_[c] = (c < ch && maxBlock_ > 0) ? scratch_.data() + (std::size_t) c * (std::size_t) maxBlock_
                                                   : nullptr;
         scValid_ = 0;
-        for (auto& b : bands) b.prepare (fs, ch);
+        bool ok = true;
+        for (auto& b : bands) ok = b.prepare (fs, ch) && ok;   // every band, then the verdict — never short-circuit
+        if (! ok) return false;
         reset();
+        prepared_ = true;
+        return true;
     }
 
     // Capture this block's SECTION INPUT into the scratch buffer, then hand it back. Call at the top
@@ -59,6 +74,7 @@ public:
     // gets nullptr must skip its dynamics rather than detect on the wrong signal.
     const float* const* captureSectionInput (const float* const* channels, int numChannels, int numSamples) noexcept
     {
+        if (! prepared_) { scValid_ = 0; return nullptr; }
         const int nc = numChannels < ch ? numChannels : ch;
         if (nc <= 0 || numSamples <= 0 || numSamples > maxBlock_ || scratch_.empty()) { scValid_ = 0; return nullptr; }
         for (int c = 0; c < nc; ++c)
@@ -99,6 +115,7 @@ public:
     // Audio thread. In-place over `numChannels` planar buffers of `numSamples`.
     void process (float* const* channels, int numChannels, int numSamples) noexcept
     {
+        if (! prepared_) return;                        // a refused configuration has nothing to run
         const int nc = numChannels < ch ? numChannels : ch;
         if (nc <= 0 || numSamples <= 0) return;
 
@@ -186,6 +203,7 @@ private:
     std::array<EqBand, kMaxBands> bands;
     std::vector<float> scratch_;                 // section-input capture (see captureSectionInput)
     float*             scPtr_[kMaxChannels] {};
+    bool               prepared_ = false;          // true only after a fully-successful prepare()
     int                maxBlock_ = 0, scValid_ = 0;
     SpectrumTap inTap, outTap;
 };

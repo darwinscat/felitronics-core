@@ -202,7 +202,7 @@ int main()
     test::group ("captureSectionInput copies, and its contract is honest");
     {
         EqEngine eng;
-        eng.prepare (fs, 512, 2);
+        test::ok (eng.prepare (fs, 512, 2), "EqEngine::prepare() accepted the configuration");
 
         std::vector<float> L (256), R (256);
         for (int i = 0; i < 256; ++i) { L[(size_t) i] = 0.5f; R[(size_t) i] = -0.5f; }
