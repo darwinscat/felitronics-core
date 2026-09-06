@@ -308,81 +308,134 @@ static void testDynamicEqBandIsolation()
 }
 
 //==================================================================================================
-// The programme estimate is KEPT across a park, and that is the correct answer — measured, not argued.
+// What a PARK does to the programme estimate — the policy, asserted by its contract.
 //==================================================================================================
-static void testProgrammeEstimateSurvivesThePark()
+// A parked lane cannot see the programme move. Keeping its picture and discarding it are both wrong in
+// opposite cases, and from the inside the lane cannot tell them apart: on return it only sees "a signal
+// N dB from my last known norm". The one thing it does know is HOW LONG it was blind, and that is what
+// the policy keys on, with thresholds taken from the estimator's own averaging constant.
+//
+// This replaces a test that could not see the question at all: it inserted the park only into the parked
+// run, so both rigs had heard exactly the same programme and "parked == stayed" was true by construction.
+// Its recovery check was also unsound — it latched the FIRST near-zero crossing, so a trajectory that
+// never recovered still reported a settle time. Both are fixed here: the reference HEARS the change, and
+// recovery is the LAST crossing plus a requirement that it stays recovered.
+static void testParkPolicy()
 {
-    group ("auto threshold: a parked lane returns reacting like one that never left");
+    group ("auto threshold: how long the lane was blind decides what happens to its programme estimate");
 
-    // A review seat read the preserved RelativeLevel as a defect: learn -40 dBFS, park the lane, let the
-    // programme become -10 dBFS, return, and the stale norm earns reduction for what is now normal. The
-    // measurement says otherwise, and this test exists so nobody has to re-litigate it: a lane that NEVER
-    // left ducks exactly the same, because a 30 dB jump IS a real excess until the estimator learns the new
-    // norm. Discarding the estimate instead makes the returning lane read +0.000 dB — it stops reacting to
-    // a genuine 30 dB jump at all, which is the processing silently switched off, not a fix. Re-arming the
-    // fast window (retuned()) converges 8x sooner but then the parked lane no longer matches the one that
-    // stayed, which is the invariant this suite is built on.
-    //
-    // The whole point needs thrAuto TRUE. The rest of this file forces it false to pin the detector, and
-    // that is exactly why the earlier suite could not see this question at all.
     const int B = 64;
     const double f = 1000.0;
-    const double quiet = core::dbToGain (-40.0), loud = core::dbToGain (-10.0);
 
-    auto measure = [&] (bool park, double& deepest, double& settleMs)
+    // Returns the largest |DUT - REF| over the window after the return, and the last time it exceeded
+    // 0.5 dB. `heard` selects the reference: one that ran through the stretch, or one that also missed it.
+    struct Trace { double worst, lastAboveMs, at10, at100; };
+    // `viaDyn` selects HOW the lane is parked: by the channel count, or by switching dynamics off — a
+    // different code path (processBand's disengaged branch) that reaches the SAME policy. A version of
+    // this test that only ever parked by channel count left that path unmeasured.
+    auto compare = [&] (double gapSec, bool refHeard, bool viaDyn = false) -> Trace
     {
-        eq::BandParams p;
-        p.on = true; p.type = eq::FilterType::Bell;
-        p.lane (eq::Lane::Stereo).on = false;                  // Side only, so a mono stretch parks the lane
-        eq::LaneParams& sd = p.lane (eq::Lane::Side);
-        sd.on = true; sd.freq = f; sd.Q = 2.0; sd.gainDb = 0.0;
-        p.dyn.on = true; p.dyn.rangeDb = -40.0;                // wide, so nothing pins against the range
-        p.dyn.thrAuto = true;                                  // the estimator is the thing under test
-
-        eq::EqBand band; band.prepare (kFs, 2); band.setParams (p);
-        dynamiceq::LaneDynamics dyn; dyn.prepare (kFs, 2); dyn.setParams (p);
+        auto build = [&] (dynamiceq::LaneDynamics& dyn, eq::EqBand& band)
+        {
+            eq::BandParams p;
+            p.on = true; p.type = eq::FilterType::Bell;
+            p.lane (eq::Lane::Stereo).on = false;                 // Side only: a mono stretch parks it
+            eq::LaneParams& sd = p.lane (eq::Lane::Side);
+            sd.on = true; sd.freq = f; sd.Q = 2.0; sd.gainDb = 0.0;
+            p.dyn.on = true; p.dyn.rangeDb = -24.0;               // inside the rail, so nothing pins
+            p.dyn.thrAuto = true;
+            band.prepare (kFs, 2); band.setParams (p);
+            dyn.prepare (kFs, 2);  dyn.setParams (p);
+        };
+        eq::EqBand bd, br; dynamiceq::LaneDynamics dd, dr;
+        build (dd, bd); build (dr, br);
+        auto setDyn = [&] (dynamiceq::LaneDynamics& dyn, eq::EqBand& band, bool on)
+        {
+            eq::BandParams q = band.params(); q.dyn.on = on; band.setParams (q); dyn.setParams (q);
+        };
 
         std::vector<float> L ((std::size_t) B), R ((std::size_t) B), sl ((std::size_t) B), sr ((std::size_t) B);
         float* aud[2] { L.data(), R.data() };
         const float* sc[2] { sl.data(), sr.data() };
         long ph = 0;
-        auto feed = [&] (double amp, int nc, int blocks)
+        auto feed = [&] (dynamiceq::LaneDynamics& dyn, eq::EqBand& band, double db, int nc, int blocks)
         {
+            const double amp = core::dbToGain (db);
             for (int k = 0; k < blocks; ++k)
             {
-                for (int i = 0; i < B; ++i, ++ph)
+                for (int i = 0; i < B; ++i)
                 {
-                    const float v = (float) (amp * std::sin (2.0 * core::kPi * f * (double) ph / kFs));
-                    L[(std::size_t) i] = sl[(std::size_t) i] =  v;      // antiphase: pure Side
+                    const float v = (float) (amp * std::sin (2.0 * core::kPi * f * (double) (ph + i) / kFs));
+                    L[(std::size_t) i] = sl[(std::size_t) i] =  v;
                     R[(std::size_t) i] = sr[(std::size_t) i] = -v;
                 }
                 dyn.processBand (aud, sc, nc, B, band);
+                ph += B;
             }
         };
+        // Both learn the same quiet programme, then it becomes loud DURING the stretch. The DUT is parked
+        // through it; the reference either hears it (nc = 2) or is parked too.
+        const long save = ph;
+        feed (dd, bd, -40.0, 2, (int) (kFs * 4.0 / B));
+        ph = save; feed (dr, br, -40.0, 2, (int) (kFs * 4.0 / B));
+        const long afterLearn = ph;
+        if (viaDyn) setDyn (dd, bd, false);                                      // park by switching dynamics off
+        feed (dd, bd, -10.0, viaDyn ? 2 : 1, (int) (kFs * gapSec / B));           // DUT: blind either way
+        if (viaDyn) setDyn (dd, bd, true);
+        ph = afterLearn; feed (dr, br, -10.0, refHeard ? 2 : 1, (int) (kFs * gapSec / B));
+        const long afterGap = ph;
 
-        feed (quiet, 2, (int) (kFs * 4.0 / B));                // learn a quiet programme
-        if (park) feed (0.0, 1, (int) (kFs * 1.0 / B));        // park the lane for a second
-        deepest = 0.0; settleMs = -1.0;
-        const int n = (int) (kFs * 8.0 / B);
+        Trace t { 0.0, -1.0, 0.0, 0.0 };
+        const int n = (int) (kFs * 6.0 / B);
         for (int k = 0; k < n; ++k)
         {
-            feed (loud, 2, 1);
-            const double d = dyn.deltaDb (eq::Lane::Side);
-            deepest = std::fmin (deepest, d);
-            if (settleMs < 0.0 && k > 4 && std::fabs (d) < 0.5) settleMs = (double) k * B / kFs * 1000.0;
+            const long here = ph;
+            feed (dd, bd, -10.0, 2, 1);
+            ph = here; feed (dr, br, -10.0, 2, 1);
+            const double d = std::fabs (dd.deltaDb (eq::Lane::Side) - dr.deltaDb (eq::Lane::Side));
+            const double ms = (double) k * B / kFs * 1000.0;
+            t.worst = std::fmax (t.worst, d);
+            if (d > 0.5) t.lastAboveMs = ms;                       // LAST crossing, not the first
+            if (ms <= 10.0)  t.at10  = d;
+            if (ms <= 100.0) t.at100 = d;
         }
+        (void) afterGap;
+        return t;
     };
 
-    double refDeep = 0.0, refSettle = 0.0, parkDeep = 0.0, parkSettle = 0.0;
-    measure (false, refDeep, refSettle);
-    measure (true,  parkDeep, parkSettle);
+    // PRECONDITION. The two references must actually disagree, or every number below is about nothing.
+    const Trace blind = compare (10.0, false);
+    approx (blind.worst, 0.0, 1.0, "precondition: against a reference that was ALSO blind, any policy looks fine");
 
-    ok (refDeep < -10.0, "precondition: the never-parked lane really ducks on a 30 dB jump");
-    ok (refSettle > 0.0 && refSettle < 6000.0, "precondition: and it really recovers, so 'settled' means something");
-    ok (std::fabs (parkDeep - refDeep) < 1.0,
-        "the parked lane ducks as deeply as one that never left (discarding the estimate reads +0.000)");
-    ok (parkSettle > 0.0 && std::fabs (parkSettle - refSettle) < 0.25 * refSettle,
-        "and recovers over the same time (re-arming the fast window would be 8x sooner)");
+    // SHORT park — below a quarter of the estimator's averaging constant. Too short for the programme to
+    // have moved far, so the picture is kept and the lane behaves as it always did.
+    const Trace shortPark = compare (0.3, true);
+    ok (shortPark.worst > 0.0, "precondition: the short-park fixture is live");
+    ok (shortPark.lastAboveMs < 4000.0, "a short park does not leave the lane wrong for the whole settle");
+
+    // LONG park — beyond four times the constant. The programme certainly moved; the returning lane must
+    // agree with the one that heard it. This is the case a KEEP policy fails by 17.87 dB for 3.36 s.
+    const Trace longPark = compare (10.0, true);
+    approx (longPark.worst, 0.0, 1.0,
+            "after a long park the lane agrees with the reference that heard the change (keep: 17.87 dB)");
+    ok (longPark.lastAboveMs < 0.0 || longPark.lastAboveMs < 200.0,
+        "and it agrees from the start, not after a settle");
+
+    // MID park — between the two. The picture is kept but the estimator is told to correct fast, so the
+    // divergence must SHRINK: a policy that merely keeps holds it flat for seconds.
+    const Trace midPark = compare (2.0, true);
+    ok (midPark.at10 > 1.0, "precondition: the mid-park fixture really starts out wrong");
+    ok (midPark.at100 < 0.75 * midPark.at10, "a mid-length park corrects fast rather than holding its error");
+    ok (midPark.lastAboveMs > 0.0 && midPark.lastAboveMs < 1500.0,
+        "and it is done inside the fast window, not after the full averaging constant");
+
+    // THE OTHER PARK PATH. Switching dynamics off leaves through processBand's disengaged branch, never
+    // reaching the per-lane code the cases above exercise. It must accrue blind time the same way, or a
+    // plain A/B bypass across a programme change comes back with the full unearned reduction.
+    const Trace longDyn = compare (10.0, true, true);
+    approx (longDyn.worst, 0.0, 1.0, "a long park via dyn.on obeys the same policy as one via the channel count");
+    const Trace shortDyn = compare (0.3, true, true);
+    ok (shortDyn.lastAboveMs < 4000.0, "and a short one via dyn.on does too");
 }
 
 //==================================================================================================
@@ -395,7 +448,7 @@ int main()
     testLaneDynamicsStayingColumn();
     testDynamicEqBandChannelGate();
     testDynamicEqBandIsolation();
-    testProgrammeEstimateSurvivesThePark();
+    testParkPolicy();
 
     group ("RT-safety");
     {

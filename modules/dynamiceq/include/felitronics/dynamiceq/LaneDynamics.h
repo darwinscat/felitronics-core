@@ -77,7 +77,7 @@ public:
         for (auto& s : st_)
         {
             s.probe.reset(); s.env.reset(); s.rel.reset(); s.gr.reset();
-            s.deltaDb = 0.0; s.running = false;
+            s.deltaDb = 0.0; s.running = false; s.parked = 0;
             // Invalidate the retune sentinels too. Svf::prepare() resets STATE but keeps coefficients,
             // which were baked at the old sample rate (g = tan(pi*f/fs)); if the host re-prepares at a
             // new rate and the adapter re-sends identical params, "unchanged" would skip the redesign
@@ -169,6 +169,7 @@ public:
         if (! dyn_.on || std::fabs (dyn_.rangeDb) <= 0.0 || sidechain == nullptr)
         {
             if (engaged_) { disengage (band); engaged_ = false; }
+            for (auto& st : st_) st.parked += numSamples;   // this park counts too — see applyParkPolicy
             band.processBlock (audio, nc, numSamples);
             return;
         }
@@ -200,6 +201,7 @@ public:
 private:
     struct LaneState
     {
+        long                            parked = 0; // samples this lane has been blind (see applyParkPolicy)
         eq::Svf                         probe;      // sidechain band-pass at this lane's freq/Q
         dynamics::EnvelopeFollower      env;
         dynamics::RelativeLevel         rel;
@@ -231,6 +233,33 @@ private:
     static double probeQ (double q) noexcept
     {
         return std::clamp (std::isfinite (q) ? q : 1.0, 0.05, 40.0);
+    }
+
+    // WHAT A PARK DOES TO THE PROGRAMME ESTIMATE. `rel` is the lane's picture of its own recent norm, and
+    // a parked lane cannot see the programme move. Keeping the picture and discarding it are BOTH wrong,
+    // in opposite cases, and the lane cannot tell them apart from the inside — on return it only ever sees
+    // "a signal N dB from my last known norm", whether the norm went stale during the gap or the signal
+    // genuinely jumped at the return. Measured, Side lane, thrAuto, against the lane that ran through the
+    // stretch (max divergence over 6 s from the return):
+    //
+    //   park SILENT, the change arrives AFTER the return   keep 0.07 dB · retuned 13.8 · reset 17.9
+    //   the programme CHANGES during a 10 s park           keep 17.87 for 3.36 s · retuned 17.1 but 429 ms · reset 0
+    //   the same in BOOST mode                             keep +17.87 dB of unearned BOOST for 3.4 s
+    //   learned loud, quiet during a 60 s park, loud burst keep MISSES a real +30 dB event · reset 0.007
+    //
+    // So the only thing that separates the cases is HOW LONG the lane was blind, which it does know. Short
+    // enough and the programme cannot have moved far, so the picture is still the best one available;
+    // long enough and it certainly has. The thresholds are the estimator's OWN averaging constant rather
+    // than invented seconds — a quarter of it and four times it — so they follow if that constant is ever
+    // retuned. This replaces a policy whose recorded justification ("discarding would re-seed from the
+    // detector's warm-up ramp") was already answered inside RelativeLevel by seedDelayMs.
+    void applyParkPolicy (LaneState& s) noexcept
+    {
+        const double tauMs    = s.rel.params().timeMs;
+        const double parkedMs = (fs_ > 0.0) ? 1000.0 * (double) s.parked / fs_ : 0.0;
+        if      (parkedMs > 4.00 * tauMs) s.rel.reset();      // certainly a different programme by now
+        else if (parkedMs > 0.25 * tauMs) s.rel.retuned();    // maybe: keep it, but correct fast
+        s.parked = 0;                                          // below that: too short to have moved
     }
 
     // Leave the band exactly as an opted-out one: no residual delta, no state that could resume.
@@ -278,10 +307,12 @@ private:
             {
                 LaneState& off = st_[i];
                 if (off.running) { off.gr.reset(); off.env.reset(); off.probe.reset(); off.running = false; }
+                off.parked += n;                 // how long this lane has been blind, in samples
                 off.deltaDb = 0.0;
                 band.setLaneDeltaDb (l, 0.0);
                 continue;
             }
+            if (! st_[i].running) applyParkPolicy (st_[i]);   // the rising edge, before rel is read below
             st_[i].running = true;
 
             LaneState& s = st_[i];

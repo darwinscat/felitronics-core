@@ -30,6 +30,15 @@ public:
 
     void reset() noexcept { lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset(); }
 
+    // Clear ONE channel's four columns, leaving every other channel bit-exact. This object takes its
+    // channel as an argument and so is not itself gated on a count — but its OWNERS run it over c < nc,
+    // and a channel that leaves and returns then replays four frozen Svf columns into the new stream.
+    void resetChannel (int ch) noexcept
+    {
+        lp1_.resetChannel (ch); lp2_.resetChannel (ch);
+        hp1_.resetChannel (ch); hp2_.resetChannel (ch);
+    }
+
     void setFrequency (float hz) noexcept
     {
         freq_ = hz;
