@@ -464,7 +464,7 @@ its own JUCE-free self-tests.
 
 | Module          | What                                                                 | Build / deps / notes |
 |-----------------|---------------------------------------------------------------------|--------------|
-| `core`          | Math, `Smoother`, `ScopedFlushToZero`, `kMaxChannels` (SSOT) + size config, fixed-size ring / lock-free SPSC FIFO, `Sample` alias, the **FFT seam** | header-only, zero deps; the shared base |
+| `core`          | Math, `Smoother`, `ScopedFlushToZero`, `kMaxChannels` (SSOT) + size config, fixed-size ring / lock-free SPSC FIFO, `Sample` alias, `DelayLine` / `DryAligner` / `StreamResampler`, the **FFT seam** | header-only, zero deps; the shared base. `StreamResampler`'s measured cost — droop, phase modulation and a decimation with no stopband — is [`STREAM-RESAMPLER-COST.md`](STREAM-RESAMPLER-COST.md) |
 | `eq`            | matched biquads (Vicanek) + Cytomic SVF + `EqBand` + `EqEngine`      | header-only = today's `teq::` (becomes `eq`) |
 | `dynamics`      | `EnvelopeFollower` (peak/RMS, attack/release) + `GainComputer` (threshold/ratio/knee/range, downward+upward) | header-only, zero deps; **first NEW module** |
 | `analysis`      | spectrum tap (the existing `SpectrumTap`), correlation, LUFS/loudness | header-only; FFT **via the seam** |
