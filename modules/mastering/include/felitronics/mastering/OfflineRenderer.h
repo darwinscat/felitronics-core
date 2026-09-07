@@ -44,6 +44,10 @@ namespace felitronics::mastering
 // audio callback. It does not allocate inside `render()` (the scratch is sized in `prepare()`), which
 // matters because the chain underneath is RT-safe and a test that counts allocations over a whole
 // render should see none.
+// The do-nothing sink the plain `render()` uses. Named rather than a lambda so the two overloads are
+// visibly the same call.
+struct NullTapSink { void operator() (const MasteringChainTaps&, long long) const noexcept {} };
+
 class OfflineRenderer
 {
 public:
@@ -78,6 +82,23 @@ public:
     bool render (MasteringChain& chain, const float* const* in, float* const* out,
                  int numChannels, int frames)
     {
+        MasteringChainTaps none;
+        return render (chain, in, out, numChannels, frames, none, NullTapSink {});
+    }
+
+    // A render that also hands the chain's TAPS out, block by block. It is the SAME loop — the one
+    // above forwards to this one with a sink that does nothing — because the alignment arithmetic
+    // `out[n] = y[n + D]` is the contract of this class and a second copy of it is a second thing to get
+    // wrong. `sink(taps, tapStreamPos)` is called after every accepted block, with the position of the
+    // first tap frame of that block in the chain's tap stream (which starts at 0 on the reset below);
+    // the tap buffers are the CALLER's and are overwritten each block, so a sink consumes them there.
+    //
+    // The sink is a template rather than an interface on purpose: nothing in this core is virtual, and a
+    // per-block indirection in an offline class should still not need a vtable to exist.
+    template <class TapSink>
+    bool render (MasteringChain& chain, const float* const* in, float* const* out,
+                 int numChannels, int frames, MasteringChainTaps& taps, TapSink&& sink)
+    {
         if (block_ < 1) return false;                   // a refused prepare() leaves it unusable
         if (! chain.isPrepared() || numChannels != chain.numChannels()) return false;
         if (numChannels < 1 || numChannels > maxCh_ || scratch_.empty()) return false;
@@ -92,6 +113,7 @@ public:
         for (int c = 0; c < numChannels; ++c)
             sp[c] = scratch_.data() + (std::size_t) c * (std::size_t) block_;
 
+        long long tapPos = 0;
         for (long long off = 0; off < total; )
         {
             const int m = (int) std::min<long long> ((long long) block_, total - off);
@@ -106,7 +128,7 @@ public:
                     sp[c][i] = (s < (long long) frames) ? in[c][s] : 0.0f;
                 }
 
-            if (! chain.process (sp, numChannels, m)) return false;
+            if (! chain.process (sp, numChannels, m, taps)) return false;
 
             // Streaming sample (off + i) carries input sample (off + i - D). Everything before 0 is the
             // chain's own priming and is dropped; everything from `frames` on is past the end.
@@ -117,6 +139,10 @@ public:
                     if (o >= 0 && o < (long long) frames) out[c][o] = sp[c][i];
                 }
 
+            // AFTER the write-back, so a sink that looks at `out` sees this block's audio, and with the
+            // tap position of the block that was just produced rather than of the next one.
+            sink (taps, tapPos);
+            tapPos += taps.framesWritten;
             off += m;
         }
         return true;
