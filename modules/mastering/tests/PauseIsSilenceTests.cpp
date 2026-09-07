@@ -1061,6 +1061,88 @@ static void bypassedBandResidualIsOneChunk()
         "a gap moves it by one chunk only: " + std::to_string (residual) + " dB of " + std::to_string (std::fabs (before)));
 }
 
+// (g) THE COUNTER'S WIDENING, at the only length that can see it. `ksamp_ + rem` in `int` overflows only
+//     when the sum passes INT_MAX, and `rem` is `n` MINUS the samples the honest loop walked — so a gap
+//     of INT_MAX on a band whose ballistics are still moving leaves `rem` a hundred thousand short of the
+//     edge and the un-widened arithmetic survives. It is visible only when the loop breaks IMMEDIATELY,
+//     i.e. when the shared state is already at its fixed point when the pause begins. That is not an
+//     exotic state: it is every pause that follows another pause.
+static void counterWideningOnASettledBand()
+{
+    group ("law 11c — DynamicEqBand: the counter widens correctly when the pause starts already settled");
+    for (int K : { 3, 5, 7, 16 })
+        for (int phase = 0; phase < K && phase < 4; ++phase)
+        {
+            const int B = 64;
+            dynamiceq::DynamicEqBandParams p;
+            p.freq = 3000.0; p.Q = 2.0; p.thresholdDb = -40.0; p.ratio = 6.0; p.rangeDb = 18.0;
+            p.attackMs = 1.0; p.releaseMs = 0.4; p.coeffUpdatePeriod = K;
+            dynamiceq::DynamicEqBand A, Bd;
+            if (! (A.prepare (kFs, 2) && Bd.prepare (kFs, 2))) { ok (false, "prepare"); return; }
+            A.setParams (p); Bd.setParams (p);
+            std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+            for (int k = 0; k < 8; ++k) { fillTone (l, k * B, 3000.0, 0.9f); r = l;
+                                          float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+                                          fillTone (l, k * B, 3000.0, 0.9f); r = l;
+                                          float* jo[2] = { l.data(), r.data() }; run (Bd.process (jo, 2, B)); }
+            if (! drainToRest (A, Bd, B)) ok (false, "precondition: the per-channel path reaches rest");
+            // SETTLE the shared state first, so the pause below breaks on its first step and `rem` is the
+            // whole of INT_MAX. Then place the counter at `phase`, which is what decides the overflow.
+            { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 200000)); }
+            { std::vector<float> z1 (200000, 0.0f), z2 (200000, 0.0f); float* jo[2] = { z1.data(), z2.data() }; run (Bd.process (jo, 2, 200000)); }
+            if (phase > 0)
+            {
+                float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, phase));
+                std::vector<float> z1 ((std::size_t) phase, 0.0f), z2 ((std::size_t) phase, 0.0f);
+                float* jo[2] = { z1.data(), z2.data() }; run (Bd.process (jo, 2, phase));
+            }
+            { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 2147483647)); }
+            {
+                // CONGRUENT TO THE WHOLE OF A's REMAINING TIME, not to the gap alone: B has already
+                // walked the same 200 000 settling samples, so the shortcut has to subtract them or the
+                // two runs land on different counter phases. Written wrong the first time, and K = 5 and
+                // K = 16 passed anyway because 200 000 is a multiple of both — the third blind form,
+                // caught by the rows that are not.
+                const long long M = 200000LL + ((2147483647LL - 200000LL) % (long long) K);
+                std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f);
+                for (long long done = 0; done < M; )
+                { const int n = (int) std::min (M - done, (long long) B);
+                  std::fill (z1.begin(), z1.end(), 0.0f); std::fill (z2.begin(), z2.end(), 0.0f);
+                  float* jo[2] = { z1.data(), z2.data() }; run (Bd.process (jo, 2, n)); done += n; }
+            }
+            std::vector<float> al ((std::size_t) B), ar ((std::size_t) B), bl ((std::size_t) B), br ((std::size_t) B);
+            fillTone (al, 0, 3000.0, 0.9f); ar = al; bl = al; br = al;
+            float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
+            run (A.process (ai, 2, B)); run (Bd.process (bi, 2, B));
+            bool same = true; for (int i = 0; i < B; ++i) same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
+            if (! same) ok (false, "an INT_MAX pause from a settled state keeps the counter phase, K "
+                                   + std::to_string (K) + " phase " + std::to_string (phase));
+        }
+    ok (true, "DynamicEqBand: the counter's widening holds at the length that overflows an int");
+}
+
+// (h) A CHILD'S REFUSAL ON THE NARROWING PATH REACHES THE CALLER. The verdict used to be `(void)`-cast
+//     away, and the band loop skips a bypassed band, so a bypassed child that refused reported nothing
+//     at all and the composite still returned true. Law 11's whole point is that a refusal is RETURNED.
+static void aRefusedBypassedChildIsReported()
+{
+    group ("law 11 — a bypassed band that REFUSES the narrowing call is not silently accepted");
+    const int B = 64;
+    multiband::MultibandProcessor<dynamics::Compressor, 3> m;
+    if (! m.prepare (kFs, B, 2, 0, [&] (dynamics::Compressor& c) { return c.prepare (kFs, B, 2, 50.0); }))
+    { ok (false, "prepare"); return; }
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    fillTone (l, 0, 300.0, 0.5f); r = l;
+    { float* io[2] = { l.data(), r.data() }; run (m.process (io, 2, B)); }
+    m.setBandBypass (1, true);
+    // Disarm band 1 on its own: `prepare` with a width of zero is refused, and law 11b says a refused
+    // prepare leaves the object UNUSABLE. Every later call to it must therefore be refused too.
+    ok (! m.band (1).prepare (kFs, B, 0, 50.0), "precondition: the band's own prepare(0) is refused");
+    fillTone (l, 0, 300.0, 0.5f);
+    float* io[1] = { l.data() };
+    ok (! m.process (io, 1, B), "the composite reports the refusal instead of returning true");
+}
+
 int main()
 {
     std::printf ("law 11c — a pause is silence\n");
@@ -1086,5 +1168,7 @@ int main()
     aPoisonedStateSurvivesAPause();
     multibandDoubleClockAtZeroWidth();
     bypassedBandResidualIsOneChunk();
+    counterWideningOnASettledBand();
+    aRefusedBypassedChildIsReported();
     return felitronics::test::report();
 }
