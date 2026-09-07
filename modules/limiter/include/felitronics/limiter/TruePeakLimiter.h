@@ -278,10 +278,20 @@ public:
     // the caller having made maxBlock-sized calls. It used to return the buffer UNTOUCHED instead,
     // i.e. unlimited and silently, which for a module whose only promise is a ceiling is the worst
     // possible failure.
-    void process (float* const* channels, int numChannels, int numSamples) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). The width used to be CLAMPED, and the header above documented the
+    // surplus channels leaving UNLIMITED as if it were a contract. Measured: prepared for 2, called with
+    // 4, ceiling -1 dBFS, input +6.02 dBFS — the surplus came out at +6.02, i.e. +7.02 dB over the ceiling
+    // it was told to hold (unbounded in general: it is the caller's own input, untouched). Worse than the
+    // level, the two processed planes carry latencySamples() = 79 of oversampler + lookahead that the two
+    // untouched ones do not, so a fold-down combs at fs/(2*79) = 304 Hz — a fault that sounds like a
+    // timbre rather than like a fault. Refused whole, before anything moves.
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples) noexcept
     {
-        const int nc = numChannels < maxCh ? numChannels : maxCh;
-        if (! prepared_ || nc <= 0 || numSamples <= 0) return;
+        if (numChannels < 0 || numSamples < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > maxCh) return false;                 // width is a LIMIT — law 11(b)
+        if (numSamples == 0) return true;
+        const int nc = numChannels;
 
         // A CHANGE OF CHANNEL COUNT IS A TOPOLOGY CHANGE, and it has to clear the state. Only the
         // supplied channels advance their oversampler history and lookahead delay, while the detector
@@ -294,6 +304,7 @@ public:
         // already is, and it restores the bound from the first sample after it.
         if (lastNc_ != 0 && nc != lastNc_) reset();
         lastNc_ = nc;
+        if (nc == 0) return true;                              // law 11(d): the reset above IS the edge
 
         float* sub[core::kMaxChannels] {};
         for (int off = 0; off < numSamples; )
@@ -303,6 +314,7 @@ public:
             processChunk (sub, nc, n);
             off += n;                                          // `off += maxBlock_` could step past INT_MAX
         }
+        return true;
     }
 
 private:

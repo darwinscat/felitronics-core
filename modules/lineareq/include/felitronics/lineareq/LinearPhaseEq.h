@@ -60,7 +60,8 @@ public:
         prepared_ = false;                                     // any early return below leaves it unprepared
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
         maxBlock_ = std::max (1, maxBlock);
-        channels_ = std::clamp (numChannels, 1, core::kMaxChannels);
+        if (numChannels < 1 || numChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
+        channels_ = numChannels;
         N_ = firSizeForQuality (quality);
 
         if (! buildFft_.prepare (N_)) return false;
@@ -170,20 +171,36 @@ public:
         gridToSymmetricFir (magBuf_.data(), out);
     }
 
-    // RT-safe (audio thread), in place. Stereo (≥2 ch) → the picked topology; mono → bank 0. `n` ≤ maxBlock.
+    // RT-safe (audio thread), in place. The width is EXACT (law 11b/c) — the topology must match what
+    // prepare() was given, and a gap is signalled with reset(), not with a zero-width call. Any `n`:
+    // the convolver is block-independent, so maxBlock is not a limit here.
     // CONTRACT: the call's channel topology must match prepare() — bank 0 is built for the PREPARED count
     // (mono → ST-only composite, stereo → the matrix); re-prepare on a bus change, as the adapter does.
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). The stereo path convolves a 2x2 matrix, so it needs BOTH planes:
+    // a mono call on a stereo-prepared EQ is refused, by the convolver, and now says so.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        if (n <= 0) return;
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        // LAW 11(b)+(c): the width is EXACT for this module, in both directions and on both paths — the
+        // header already says the topology must match prepare(). Two reasons, both measured:
+        //   * a stereo-prepared engine convolves a 2x2 matrix, so `nch = 1` cannot be honoured and the
+        //     matrix engine refuses it — while `nch = 0` used to be ACCEPTED here and short-circuited,
+        //     which is two different answers to the same question one line apart;
+        //   * on the `channels_ > 2` path the per-channel operators are MONO, so a narrow call was
+        //     accepted and the stopped planes simply FROZE: 0.605 out of DIGITAL SILENCE (-4.4 dBFS)
+        //     on planes 2-3 of a 4-channel prepare narrowed to 2 and widened back.
+        // A gap for a matrix convolver is not expressible as a zero-width call — the operator needs its
+        // planes — so the caller signals one with reset(), and that is the contract, stated.
+        if (numChannels != channels_) return false;
+        if (n == 0) return true;                               // no samples: no time, no edge
         if (channels_ > 2)                                     // non-stereo: ST-only IR per channel
         {
-            const int nc = numChannels < channels_ ? numChannels : channels_;
-            for (int c = 0; c < nc; ++c) { float* one[1] { io[c] }; chConv_[(std::size_t) c]->process (one, one, 1, n); }
-            return;
+            bool ok = true;
+            for (int c = 0; c < numChannels; ++c) { float* one[1] { io[c] }; ok = chConv_[(std::size_t) c]->process (one, one, 1, n) && ok; }
+            return ok;
         }
-        const int nc = numChannels >= 2 ? 2 : 1;
-        conv_.process (io, io, nc, n);                         // raw L/R in → MatrixConvolver routes + decodes in place
+        return conv_.process (io, io, numChannels, n);         // raw L/R in → MatrixConvolver routes + decodes in place
     }
 
 private:

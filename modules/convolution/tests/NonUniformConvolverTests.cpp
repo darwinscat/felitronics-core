@@ -92,7 +92,7 @@ static std::vector<float> convPartitioned (const std::vector<float>& x, const st
 {
     convolution::PartitionedConvolver<> pc; pc.prepare (P, maxIr); pc.setIr (h.data(), (int) h.size());
     std::vector<float> y (x.size(), 0.0f);
-    pc.process (x.data(), y.data(), (int) x.size());
+    felitronics::test::run (pc.process (x.data(), y.data(), (int) x.size()));
     return y;
 }
 
@@ -103,7 +103,7 @@ static std::vector<float> runNU (NU& nu, const std::vector<float>& x, int block)
     for (int i = 0; i < (int) x.size(); i += block)
     {
         const int m = std::min (block, (int) x.size() - i);
-        nu.process (&x[(std::size_t) i], &y[(std::size_t) i], m);
+        felitronics::test::run (nu.process (&x[(std::size_t) i], &y[(std::size_t) i], m));
     }
     return y;
 }
@@ -208,7 +208,7 @@ int main()
         const std::vector<float> outOfPlace = runNU (a, x, 128);
         NU b; b.prepare (128, 4096, L); b.setIr (h.data(), L);
         std::vector<float> io = x;                                     // process in place
-        for (int i = 0; i < N; i += 128) { const int m = std::min (128, N - i); b.process (&io[(std::size_t) i], &io[(std::size_t) i], m); }
+        for (int i = 0; i < N; i += 128) { const int m = std::min (128, N - i); felitronics::test::run (b.process (&io[(std::size_t) i], &io[(std::size_t) i], m)); }
         test::ok (maxDiff (io, outOfPlace, 0, N) < 1e-6, "in-place output bit-matches out-of-place");
     }
 
@@ -239,11 +239,11 @@ int main()
         std::vector<float> h, x; makeSignals (L, 4096, 128, 4096, 33u, h, x);
         NU nu; nu.prepare (128, 4096, L); nu.setIr (h.data(), L);
         std::vector<float> y (4096, 0.0f);
-        nu.process (x.data(), y.data(), 2048);                        // warm: cross a few chunk boundaries
-        nu.process (&x[2048], &y[2048], 2048);
+        felitronics::test::run (nu.process (x.data(), y.data(), 2048));                        // warm: cross a few chunk boundaries
+        felitronics::test::run (nu.process (&x[2048], &y[2048], 2048));
         const long before = g_allocs.load();
-        nu.process (x.data(), y.data(), 2048);                        // steady-state incl. big-stage FFT firings
-        nu.process (&x[2048], &y[2048], 2048);
+        felitronics::test::run (nu.process (x.data(), y.data(), 2048));                        // steady-state incl. big-stage FFT firings
+        felitronics::test::run (nu.process (&x[2048], &y[2048], 2048));
         test::okNoAlloc (g_allocs.load() == before, "process() performed zero heap allocations");
     }
 
@@ -255,8 +255,8 @@ int main()
         test::ok (! nu.prepare (128, 3000, 1000), "non-pow2 maxBlock rejected");
         // an unprepared engine is a safe no-op
         std::vector<float> in (64, 0.1f), out (64, -9.0f);
-        nu.process (in.data(), out.data(), 64);
-        test::ok (out[0] == -9.0f, "process() before prepare() is a no-op (no write, no crash)");
+        test::ok (! nu.process (in.data(), out.data(), 64), "process() before prepare() is REFUSED (law 11)");
+        test::ok (out[0] == -9.0f, "...and is a no-op (no write, no crash)");
         float dummy = 1.0f; nu.setIr (&dummy, 1);                     // setIr before prepare — no-op, no crash
         test::ok (true, "setIr() before prepare() did not crash");
 

@@ -127,25 +127,35 @@ public:
     // 🔴 RT-safe, in place — the audio thread reaches this via NeuralStage::process() on the
     // live instance. Never allocates, locks, does IO or throws. An unprepared backend (failed
     // low-memory prepare — see above) is a clean passthrough.
-    void process (float* const* io, int numChannels, int numSamples) noexcept
+    // LAW 11: the length is a CAPACITY, so a call longer than maxBlock is CHUNKED, not clamped. It used
+    // to be `n = std::min (numSamples, maxBlock)`, and the tail past maxBlock then came out of the amp
+    // BIT-IDENTICAL TO ITS INPUT — measured on a Linear model prepared for 64 and called with 512: 448
+    // of 512 samples never met the model at all. Simply dropping the clamp would have been far worse than
+    // the defect: `processChannel` copies n samples into `modelIn`, which is `maxModelFrames` long, and
+    // NAM's own buffers are sized from the prepared block too — an unclamped n is a heap overflow here
+    // and a resize (an allocation, on the audio thread) inside NAM.
+    //
+    // The loop lives HERE and not in NeuralStage::process on purpose: the live model is resolved ONCE
+    // per host call, above us. Chunking a level up would re-resolve it per chunk, so a model swap landing
+    // mid-buffer could put half a block through the old capture and half through the new one.
+    // This is exactly what rigplayer::RigPlayer already does around its own NamStage instances.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept
     {
-        if (! prepared_ || numChannels <= 0 || numSamples <= 0)
-            return;
+        if (numChannels < 0 || numSamples < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > 2) return false;                 // a NAM capture is mono or true-stereo; nothing else
+        if (numChannels == 0 || numSamples == 0) return true;
 
-        const int   n = std::min (numSamples, maxBlock);
         const float g = (normalize != nullptr && normalize->load (std::memory_order_relaxed)) ? makeup : 1.0f;
-
-        if (numChannels == 1)
+        for (int off = 0; off < numSamples; )
         {
-            processChannel (ch[0], inst[0].get(), io[0], n, g);   // mono track → 1 instance
+            const int n = std::min (numSamples - off, maxBlock);
+            processChannel (ch[0], inst[0].get(), io[0] + off, n, g);          // mono track → 1 instance
+            if (numChannels > 1)                                               // stereo → 2 independent instances
+                processChannel (ch[1], inst[1].get(), io[1] + off, n, g);
+            off += n;                                      // `off += maxBlock` could step past INT_MAX
         }
-        else
-        {
-            // stereo track → 2 independent instances (true stereo). Extra channels (none on a stereo
-            // bus) are left untouched.
-            processChannel (ch[0], inst[0].get(), io[0], n, g);
-            processChannel (ch[1], inst[1].get(), io[1], n, g);
-        }
+        return true;
     }
 
     void reset() noexcept {}   // transient state cleared by prepare()'s Reset on the next play
@@ -369,13 +379,14 @@ void NamStage::prepare (double sampleRate, int maxBlock)
 void NamStage::reset() {}   // transient state cleared by prepare()'s Reset on the next play
 
 //==============================================================================
-void NamStage::process (float* const* io, int numChannels, int numSamples, bool normalize)
+bool NamStage::process (float* const* io, int numChannels, int numSamples, bool normalize) noexcept
 {
     // The shared Inference seam is process(io, nc, n) — the per-block `normalize` flag travels via
     // an atomic the live backend reads inside the SAME call (same thread → sequenced). Block
     // counting + the live-model resolve live in NeuralStage; no model → clean passthrough.
+    if (io == nullptr && numChannels > 0 && numSamples > 0) return false;
     impl->normalize.store (normalize, std::memory_order_relaxed);
-    impl->stage.process (io, numChannels, numSamples);
+    return impl->stage.process (io, numChannels, numSamples);
 }
 
 

@@ -77,7 +77,7 @@ public:
         if (! (maxDurationSec > 0.0) || ! std::isfinite (maxDurationSec)) return false;
 
         nc_ = channels;
-        lm_.prepare (sampleRate, nc_, maxDurationSec);
+        (void) lm_.prepare (sampleRate, nc_, maxDurationSec);   // a tool, not a test: the probe is best-effort
         os_.assign ((std::size_t) nc_, {});
         for (auto& o : os_) if (! o.prepare (kOsFactor, 1, kOsTapsPerPhase)) return false;
         osBuf_.assign ((std::size_t) kChunk * (std::size_t) kOsFactor, 0.0f);
@@ -106,7 +106,7 @@ public:
             const int m = (int) std::min<long long> (kChunk, n - off);
             for (int c = 0; c < useCh; ++c) view[c] = planar[c] + off;
 
-            lm_.process (view, useCh, m);
+            (void) lm_.process (view, useCh, m);
 
             for (int c = 0; c < useCh; ++c)
             {

@@ -70,13 +70,13 @@ static void testChannelGate()
 
     std::vector<float> L (N, 0.0f), R (N, 0.9f);
     float* io[2] { L.data(), R.data() };
-    s.process (io, 2, N);
+    felitronics::test::run (s.process (io, 2, N));
     ok (peakOf (R) > 0.3, "precondition: the right channel really was driven");
 
-    for (int k = 0; k < 20; ++k) { std::fill (L.begin(), L.end(), 0.0f); s.process (io, 1, N); }
+    for (int k = 0; k < 20; ++k) { std::fill (L.begin(), L.end(), 0.0f); felitronics::test::run (s.process (io, 1, N)); }
 
     std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
-    s.process (io, 2, N);
+    felitronics::test::run (s.process (io, 2, N));
     ok (peakOf (R) == 0.0, "silence in, exact zero out on the returned channel (was 0.9337 at i=29)");
     ok (peakOf (L) == 0.0, "and on the channel that stayed, which has heard nothing but silence");
 }
@@ -102,8 +102,8 @@ static void testIsolation()
         const bool gap = (k >= 20 && k < 40);
         fillNoise (d0, 31u + (unsigned) k); fillNoise (d1, 707u + (unsigned) k);
         r0 = d0; r1 = d1;
-        dut.process (dio, gap ? 1 : 2, N);
-        ref.process (rio, 2, N);
+        felitronics::test::run (dut.process (dio, gap ? 1 : 2, N));
+        felitronics::test::run (ref.process (rio, 2, N));
         equal = equal && bitEqual (d0, r0);
         energy += peakOf (d0);
     }
@@ -133,7 +133,7 @@ static void testShapeGate()
     for (int k = 0; k < 20; ++k)
     {
         for (int i = 0; i < N; ++i) a[(std::size_t) i] = b[(std::size_t) i] = (float) (0.8 * std::sin (0.06 * (k * N + i)));
-        s.process (io, 2, N);
+        felitronics::test::run (s.process (io, 2, N));
         charged = peakOf (a);
     }
     ok (charged > 0.1, "precondition: the asymmetric curve really was driving the blocker");
@@ -143,12 +143,12 @@ static void testShapeGate()
     for (int k = 0; k < 40; ++k)
     {
         std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
-        s.process (io, 2, N);
+        felitronics::test::run (s.process (io, 2, N));
     }
     p.shape = saturation::WaveShaper::Shape::Asym;           // and opens again
     s.setParams (p);
     std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
-    s.process (io, 2, N);
+    felitronics::test::run (s.process (io, 2, N));
     ok (peakOf (a) == 0.0 && peakOf (b) == 0.0, "Asym -> Tanh -> Asym: exact zero out of silence");
 }
 
@@ -170,9 +170,9 @@ static void testNoEdgeWithoutSamples()
     {
         fillNoise (d0, 5u + (unsigned) k); fillNoise (d1, 55u + (unsigned) k);
         r0 = d0; r1 = d1;
-        if (k == 12) dut.process (dio, 1, 0);                // an empty probe at a narrower width
-        dut.process (dio, 2, N);
-        ref.process (rio, 2, N);
+        if (k == 12) felitronics::test::run (dut.process (dio, 1, 0));                // an empty probe at a narrower width
+        felitronics::test::run (dut.process (dio, 2, N));
+        felitronics::test::run (ref.process (rio, 2, N));
         equal = equal && bitEqual (d0, r0) && bitEqual (d1, r1);
         e += peakOf (d0);
     }
@@ -195,7 +195,7 @@ static void testRePrepareNarrower()
     ok (reused.prepare (kFs, N, 2), "precondition: the stage prepared wide");
     std::vector<float> a (N), b (N);
     float* io2[2] { a.data(), b.data() };
-    for (int k = 0; k < 8; ++k) { fillNoise (a, 3u + (unsigned) k); fillNoise (b, 33u + (unsigned) k); reused.process (io2, 2, N); }
+    for (int k = 0; k < 8; ++k) { fillNoise (a, 3u + (unsigned) k); fillNoise (b, 33u + (unsigned) k); felitronics::test::run (reused.process (io2, 2, N)); }
     ok (peakOf (a) > 0.0, "precondition: the wide life really ran");
 
     ok (reused.prepare (kFs, N, 1), "the stage re-prepares narrower");
@@ -209,8 +209,8 @@ static void testRePrepareNarrower()
     for (int k = 0; k < 12; ++k)
     {
         fillNoise (u, 500u + (unsigned) k); v = u;
-        reused.process (iou, 1, N);
-        fresh.process  (iov, 1, N);
+        felitronics::test::run (reused.process (iou, 1, N));
+        felitronics::test::run (fresh.process  (iov, 1, N));
         equal = equal && bitEqual (u, v);
     }
     ok (equal, "the re-prepared instance is bit-identical to a fresh one");
@@ -290,9 +290,9 @@ int main()
         std::vector<float> v[4];
         float* io[4] {};
         for (int c = 0; c < 4; ++c) { v[c].assign ((std::size_t) N, 0.05f); io[c] = v[c].data(); }
-        s.process (io, 4, N);
+        felitronics::test::run (s.process (io, 4, N));
         const int before = g_allocs.load();
-        for (int k = 0; k < 40; ++k) s.process (io, (k % 3) + 2, N);
+        for (int k = 0; k < 40; ++k) felitronics::test::run (s.process (io, (k % 3) + 2, N));
         felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across 40 blocks of changing width");
     }
 

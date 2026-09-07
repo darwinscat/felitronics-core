@@ -71,7 +71,7 @@ struct Lcg { unsigned long long s; float next() { s = s * 6364136223846793005ULL
 static std::vector<float> convRef (const std::vector<float>& x, const std::vector<float>& h, int maxIr)
 {
     convolution::PartitionedConvolver<> pc; pc.prepare (128, maxIr); pc.setIr (h.data(), (int) h.size());
-    std::vector<float> y (x.size(), 0.0f); pc.process (x.data(), y.data(), (int) x.size());
+    std::vector<float> y (x.size(), 0.0f); felitronics::test::run (pc.process (x.data(), y.data(), (int) x.size()));
     return y;
 }
 static double maxDiff (const std::vector<float>& a, const std::vector<float>& b, int from, int to)
@@ -83,12 +83,12 @@ static double maxDeriv (const std::vector<float>& y, int from, int to)
 static void runStereo (MCN& mc, const std::vector<float>& xL, const std::vector<float>& xR, std::vector<float>& yL, std::vector<float>& yR, int block)
 {
     yL.assign (xL.size(), 0.0f); yR.assign (xR.size(), 0.0f);
-    for (int i = 0; i < (int) xL.size(); i += block) { const int m = std::min (block, (int) xL.size() - i); const float* in[2] { &xL[(std::size_t) i], &xR[(std::size_t) i] }; float* out[2] { &yL[(std::size_t) i], &yR[(std::size_t) i] }; mc.process (in, out, 2, m); }
+    for (int i = 0; i < (int) xL.size(); i += block) { const int m = std::min (block, (int) xL.size() - i); const float* in[2] { &xL[(std::size_t) i], &xR[(std::size_t) i] }; float* out[2] { &yL[(std::size_t) i], &yR[(std::size_t) i] }; felitronics::test::run (mc.process (in, out, 2, m)); }
 }
 static void runMono (MCN& mc, const std::vector<float>& x, std::vector<float>& y, int block)
 {
     y.assign (x.size(), 0.0f);
-    for (int i = 0; i < (int) x.size(); i += block) { const int m = std::min (block, (int) x.size() - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; mc.process (in, out, 1, m); }
+    for (int i = 0; i < (int) x.size(); i += block) { const int m = std::min (block, (int) x.size() - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; felitronics::test::run (mc.process (in, out, 1, m)); }
 }
 
 int main()
@@ -225,7 +225,7 @@ int main()
         for (int i = 0; i < N; i += 256)
         {
             if (swapAt < 0 && i >= T) { if (mc.setIr (h2.data(), L)) swapAt = i; }
-            const int m = std::min (256, N - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; mc.process (in, out, 1, m);
+            const int m = std::min (256, N - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; felitronics::test::run (mc.process (in, out, 1, m));
         }
         test::ok (swapAt > 0, "warm swap accepted mid-stream");
         const double steady = maxDeriv (y, swapAt - 800, swapAt - 100);
@@ -268,7 +268,7 @@ int main()
                     else          { const float* b[2] { hM.data(), hS.data() };                       ok = mc.setOperator (MCN::Topology::MSDiag, b, 2, L); }
                     if (ok) swapAt = i;
                 }
-                const int m = std::min (256, N - i); const float* in[2] { &xL[(std::size_t) i], &xR[(std::size_t) i] }; float* out[2] { &yL[(std::size_t) i], &yR[(std::size_t) i] }; mc.process (in, out, 2, m);
+                const int m = std::min (256, N - i); const float* in[2] { &xL[(std::size_t) i], &xR[(std::size_t) i] }; float* out[2] { &yL[(std::size_t) i], &yR[(std::size_t) i] }; felitronics::test::run (mc.process (in, out, 2, m));
             }
             test::ok (swapAt > 0, dir == 0 ? "MSDiag→Full accepted" : "Full→MSDiag accepted");
             const double steady = maxDeriv (yL, swapAt - 800, swapAt - 100);
@@ -291,11 +291,11 @@ int main()
         std::vector<float> x ((std::size_t) N); for (auto& v : x) v = 0.3f * r.next();
         MCN mc; mc.prepare (128, mIr, xf, 1); mc.setIr (h.data(), L);
         std::vector<float> y ((std::size_t) N, 0.0f);
-        for (int i = 0; i < 512; i += 256) { const int m = std::min (256, 512 - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; mc.process (in, out, 1, m); }   // 512 samples into the 1024-sample fade
+        for (int i = 0; i < 512; i += 256) { const int m = std::min (256, 512 - i); const float* in[1] { &x[(std::size_t) i] }; float* out[1] { &y[(std::size_t) i] }; felitronics::test::run (mc.process (in, out, 1, m)); }   // 512 samples into the 1024-sample fade
         test::ok (mc.isBusy(), "busy mid-crossfade");
         mc.reset();
         test::ok (! mc.isBusy(), "reset() cancels the crossfade (idle)");
-        std::vector<float> z (1000, 0.1f), zo (1000, 0.0f); const float* zin[1] { z.data() }; float* zout[1] { zo.data() }; mc.process (zin, zout, 1, 1000);
+        std::vector<float> z (1000, 0.1f), zo (1000, 0.0f); const float* zin[1] { z.data() }; float* zout[1] { zo.data() }; felitronics::test::run (mc.process (zin, zout, 1, 1000));
         bool finite = true; for (float v : zo) if (! std::isfinite (v)) finite = false;
         test::ok (finite, "output finite + stable after a mid-fade reset");
         test::ok (mc.setIr (h.data(), L), "a fresh operator is accepted after the reset");
@@ -317,7 +317,7 @@ int main()
             std::vector<float> yL, yR; runStereo (a, xL, xR, yL, yR, 128);
             MCN b; b.prepare (128, maxIr, 128, 2); b.setOperator (topo, bk, nb, L);
             std::vector<float> iL = xL, iR = xR;
-            for (int i = 0; i < N; i += 128) { const int m = std::min (128, N - i); const float* in[2] { &iL[(std::size_t) i], &iR[(std::size_t) i] }; float* out[2] { &iL[(std::size_t) i], &iR[(std::size_t) i] }; b.process (in, out, 2, m); }
+            for (int i = 0; i < N; i += 128) { const int m = std::min (128, N - i); const float* in[2] { &iL[(std::size_t) i], &iR[(std::size_t) i] }; float* out[2] { &iL[(std::size_t) i], &iR[(std::size_t) i] }; felitronics::test::run (b.process (in, out, 2, m)); }
             test::ok (maxDiff (iL, yL, 0, N) < 1e-6 && maxDiff (iR, yR, 0, N) < 1e-6, std::string ("in-place bit-matches out-of-place"));
         }
     }
@@ -330,20 +330,20 @@ int main()
         MCN mc; mc.prepare (128, maxIr, 128, 1); mc.setIr (h1.data(), L);
         std::vector<float> x (2048, 0.2f), y (2048, 0.0f);
         const float* in[1] { x.data() }; float* out[1] { y.data() };
-        mc.process (in, out, 1, 2048);
+        felitronics::test::run (mc.process (in, out, 1, 2048));
         mc.setIr (h2.data(), L);                                     // stage a swap → next process crossfades
         const long before = g_allocs.load();
-        mc.process (in, out, 1, 2048);                              // inside the crossfade (blends both slots)
-        mc.process (in, out, 1, 2048);
+        felitronics::test::run (mc.process (in, out, 1, 2048));                              // inside the crossfade (blends both slots)
+        felitronics::test::run (mc.process (in, out, 1, 2048));
         test::okNoAlloc (g_allocs.load() == before, "mono process() zero heap allocations across a crossfade");
 
         std::vector<float> f0 ((std::size_t) L, 0.001f), f1 ((std::size_t) L, 0.0005f), f2 ((std::size_t) L, 0.0005f), f3 ((std::size_t) L, -0.001f);
         MCN mf; mf.prepare (128, maxIr, 128, 2);
         { const float* bk[4] { f0.data(), f1.data(), f2.data(), f3.data() }; mf.setOperator (MCN::Topology::Full, bk, 4, L); }
         std::vector<float> xl (2048, 0.2f), xr (2048, -0.1f); const float* sin[2] { xl.data(), xr.data() }; float* sout[2] { xl.data(), xr.data() };
-        mf.process (sin, sout, 2, 2048);
+        felitronics::test::run (mf.process (sin, sout, 2, 2048));
         const long before2 = g_allocs.load();
-        mf.process (sin, sout, 2, 2048);
+        felitronics::test::run (mf.process (sin, sout, 2, 2048));
         test::okNoAlloc (g_allocs.load() == before2, "stereo Full process() zero heap allocations");
     }
 
@@ -362,7 +362,7 @@ int main()
         std::vector<float> ir (200, 0.01f); const float* one[2] { ir.data(), ir.data() };
         test::ok (mc.setOperator (MCN::Topology::LRDiag, one, 2, 200), "setOperator accepted (idle)");
         std::vector<float> l (8, 0.1f), rr (8, 0.1f); const float* in[2] { l.data(), rr.data() }; float* out[2] { l.data(), rr.data() };
-        mc.process (in, out, 2, 8);                                  // begins the cold fade → busy
+        felitronics::test::run (mc.process (in, out, 2, 8));                                  // begins the cold fade → busy
         test::ok (mc.isBusy(), "busy during the cold prime crossfade");
         const float* b2[2] { ir.data(), ir.data() };
         test::ok (! mc.setOperator (MCN::Topology::LRDiag, b2, 2, 200), "second operator rejected while fading (host coalesces)");

@@ -51,11 +51,22 @@ public:
     // chain re-blocks everything to its internal quantum anyway, which is exactly what makes this
     // parameter free to choose. Pinned in the suite: rendering the same programme at 1, 977 and 65536
     // is bit-identical.
-    void prepare (int maxChannels, int blockSize)
+    [[nodiscard]] bool prepare (int maxChannels, int blockSize)
     {
-        maxCh_ = std::clamp (maxChannels, 1, core::kMaxChannels);
-        block_ = blockSize > 0 ? blockSize : 1;
+        // LAW 11(b), AND ITS MISSING HALF: a refused prepare() writes NOTHING **and leaves the object
+        // unusable**. The two are only compatible in this order — DISARM first, validate, then write —
+        // because validating first means returning before the disarm, which leaves the previous
+        // preparation standing and answering process() calls. This is Saturator's idiom, made general.
+        block_ = 0;                              // 0 == unprepared; render() refuses on it Validating one argument,
+        // storing it, and then refusing on the next left the new WIDTH standing beside the old buffer —
+        // and render() sizes its scratch pointers from the width. ASan: heap-buffer-overflow, a WRITE
+        // four bytes past a 1024-byte region, after prepare(1, 256) then prepare(2, 0).
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
+        if (blockSize < 1) return false;
+        maxCh_ = maxChannels;
+        block_ = blockSize;
         scratch_.assign ((std::size_t) maxCh_ * (std::size_t) block_, 0.0f);
+        return true;
     }
 
     int maxChannels() const noexcept { return maxCh_; }
@@ -67,6 +78,7 @@ public:
     bool render (MasteringChain& chain, const float* const* in, float* const* out,
                  int numChannels, int frames)
     {
+        if (block_ < 1) return false;                   // a refused prepare() leaves it unusable
         if (! chain.isPrepared() || numChannels != chain.numChannels()) return false;
         if (numChannels < 1 || numChannels > maxCh_ || scratch_.empty()) return false;
         if (frames < 0) return false;

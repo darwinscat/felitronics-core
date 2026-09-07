@@ -6,6 +6,7 @@
 // SVF band matches the matched band, a 24 dB/oct HP rolls off ~24 dB/oct, and process() is clean
 // (silence stays silent, no NaN). JUCE-free.
 
+#include <felitronics_test.h>   // felitronics::test::run — law 11 verdicts
 #include "TestUtil.h"
 
 #include <teq/EqBand.h>
@@ -201,7 +202,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (p);
-        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs);
+        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 1000.0, fs);
         const double resp = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * 1000.0 / fs)));
         std::printf ("      bell @1k: measured=%.3f dB  response=%.3f dB\n", meas, resp);
         expectNear (meas, 6.0, 0.4,  "measured +6 dB");
@@ -211,7 +212,7 @@ void runEqEngineTests()
         EqBand far; far.prepare (fs, 1);
         BandParams q; q.on = true; q.type = FilterType::Bell; q.lane (Lane::Stereo).freq = 1000.0; q.lane (Lane::Stereo).Q = 4.0; q.lane (Lane::Stereo).gainDb = 9.0;
         far.setParams (q);
-        const double low = sineGainDb ([&] (float* const* ch, int nc, int n) { far.processBlock (ch, nc, n); }, 60.0, fs);
+        const double low = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (far.processBlock (ch, nc, n)); }, 60.0, fs);
         expectNear (low, 0.0, 0.3, "unity an octave+ away");
     }
 
@@ -220,7 +221,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 2000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).gainDb = 6.0; p.swept = true;
         band.setParams (p);
-        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 2000.0, fs);
+        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 2000.0, fs);
         std::printf ("      swept bell @2k: measured=%.3f dB\n", meas);
         expectNear (meas, 6.0, 0.5, "SVF bell +6 dB");
     }
@@ -230,7 +231,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::HighPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = 24;
         band.setParams (p);
-        auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
+        auto ap = [&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); };
         const double g125 = sineGainDb (ap, 125.0, fs);
         const double g250 = sineGainDb (ap, 250.0, fs);
         std::printf ("      HP24: g(125)=%.2f  g(250)=%.2f  slope=%.1f dB/oct\n", g125, g250, g250 - g125);
@@ -243,7 +244,7 @@ void runEqEngineTests()
         BandParams a; a.on = true; a.type = FilterType::Bell; a.lane (Lane::Stereo).freq = 300.0;  a.lane (Lane::Stereo).Q = 1.0; a.lane (Lane::Stereo).gainDb =  4.0;
         BandParams b; b.on = true; b.type = FilterType::Bell; b.lane (Lane::Stereo).freq = 3000.0; b.lane (Lane::Stereo).Q = 1.0; b.lane (Lane::Stereo).gainDb = -3.0;
         eng.setBand (0, a); eng.setBand (1, b);
-        const double m = sineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, 300.0, fs);
+        const double m = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (eng.process (ch, nc, n)); }, 300.0, fs);
         const double r = eng.magnitudeDb (300.0);
         std::printf ("      @300: measured=%.3f dB  magnitudeDb=%.3f dB\n", m, r);
         expectNear (m, r, 0.4, "measured ~ magnitudeDb");
@@ -255,7 +256,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 4.0; p.swept = true;
         band.setParams (p);
-        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs);
+        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 1000.0, fs);
         std::printf ("      swept BP @1k Q=4: measured=%.3f dB\n", meas);
         expectNear (meas, 0.0, 0.5, "unity (0 dB) at centre");
     }
@@ -268,7 +269,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.swept = true;
         band.setParams (p);
-        auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
+        auto ap = [&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); };
         const double atFc  = sineGainDb (ap, 1000.0, fs);
         const double below = sineGainDb (ap, 125.0,  fs);
         const double above = sineGainDb (ap, 8000.0, fs);
@@ -286,7 +287,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::Tilt; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 1.0; p.lane (Lane::Stereo).gainDb = 12.0; p.swept = true;
         band.setParams (p);
-        auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
+        auto ap = [&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); };
         const double lows  = sineGainDb (ap, 60.0,    fs);
         const double highs = sineGainDb (ap, 12000.0, fs);
         const double rLow  = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * 60.0    / fs)));
@@ -305,7 +306,7 @@ void runEqEngineTests()
             EqBand band; band.prepare (fs, 1);
             BandParams p; p.on = true; p.type = FilterType::HighShelf; p.lane (Lane::Stereo).freq = 3000.0; p.lane (Lane::Stereo).Q = Q; p.lane (Lane::Stereo).gainDb = 12.0; p.swept = true;
             band.setParams (p);
-            return sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 14000.0, fs);
+            return sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 14000.0, fs);
         };
         const double g1 = plateau (1.0), g4 = plateau (4.0);
         std::printf ("      swept HS plateau @14k: Q=1 -> %.3f dB, Q=4 -> %.3f dB\n", g1, g4);
@@ -324,7 +325,7 @@ void runEqEngineTests()
         std::vector<float> buf ((size_t) n);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.2f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
         float* ch[1] = { buf.data() };
-        for (int b = 0; b < 20; ++b) eng.process (ch, 1, n);
+        for (int b = 0; b < 20; ++b) felitronics::test::run (eng.process (ch, 1, n));
         expectTrue (! anyNaN (buf.data(), n),                                       "sanitised params -> finite output");
         expectTrue (std::isfinite (eng.magnitudeDb (1000.0)),                       "magnitudeDb finite");
         expectTrue (std::isfinite (EqEngine::magnitudeDbFor (&p, 1, 1000.0, fs)),   "magnitudeDbFor finite on bad params");
@@ -339,8 +340,8 @@ void runEqEngineTests()
         std::vector<float> buf ((size_t) n, 0.0f);
         buf[0] = 1.0f;                                           // impulse, then silence
         float* ch[1] = { buf.data() };
-        band.processBlock (ch, 1, n);
-        for (int b = 0; b < 200; ++b) { for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n); }
+        felitronics::test::run (band.processBlock (ch, 1, n));
+        for (int b = 0; b < 200; ++b) { for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (band.processBlock (ch, 1, n)); }
         double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
         expectTrue (tail == 0.0, "tail flushed to exact zero (no denormal residue)");
     }
@@ -351,7 +352,7 @@ void runEqEngineTests()
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (p);
         // measured after only 2 blocks (< 30 ms smoothing): snapped -> already +6 dB, not mid-ramp.
-        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs, 2);
+        const double meas = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 1000.0, fs, 2);
         std::printf ("      gain after 2 blocks: %.3f dB\n", meas);
         expectNear (meas, 6.0, 0.5, "target reached immediately (no ramp from defaults)");
     }
@@ -364,7 +365,7 @@ void runEqEngineTests()
         arr[1].on = true; arr[1].type = FilterType::HighShelf; arr[1].lane (Lane::Stereo).freq = 8000.0;                 arr[1].lane (Lane::Stereo).gainDb = -5.0;
         eng.setBand (0, arr[0]); eng.setBand (1, arr[1]);
         const int n = 64; std::vector<float> z ((size_t) n, 0.0f); float* ch[1] = { z.data() };
-        for (int b = 0; b < 4; ++b) eng.process (ch, 1, n);     // let the live coeffs update
+        for (int b = 0; b < 4; ++b) felitronics::test::run (eng.process (ch, 1, n));     // let the live coeffs update
         for (double f : { 100.0, 300.0, 1000.0, 8000.0, 15000.0 })
         {
             const double live      = eng.magnitudeDb (f);
@@ -378,7 +379,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.type = FilterType::HighPass; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = 24; p.swept = true;
         band.setParams (p);
-        auto ap = [&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); };
+        auto ap = [&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); };
         const double a125 = sineGainDb (ap, 125.0, fs), a250 = sineGainDb (ap, 250.0, fs);
         const double audioSlope = a250 - a125;
         const double r125 = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * 125.0 / fs)));
@@ -445,7 +446,7 @@ void runEqEngineTests()
             EqBand band; band.prepare (fs, 1);
             BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = slope;
             band.setParams (p);
-            const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, fdet, fs);
+            const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, fdet, fs);
             const double r = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * fdet / fs)));
             return std::pair<double, double> { a, r };
         };
@@ -461,7 +462,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);                                 // far from f0 the high-order notch is transparent
         BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = 96;
         band.setParams (p);
-        const double far = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 250.0, fs);
+        const double far = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 250.0, fs);
         expectNear (far, 0.0, 0.4, "slope-96 notch: unity two octaves below f0");
     }
 
@@ -494,7 +495,7 @@ void runEqEngineTests()
             EqBand band; band.prepare (fs, 1);
             BandParams p; p.on = true; p.type = FilterType::BandPass; p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).slope = slope;
             band.setParams (p);
-            const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, f, fs);
+            const double a = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, f, fs);
             const double r = 20.0 * std::log10 (std::abs (band.response (2.0 * kPi * f / fs)));
             return std::pair<double, double> { a, r };
         };
@@ -522,7 +523,7 @@ void runEqEngineTests()
         auto fill = [&] (int b) { for (int i = 0; i < n; ++i) {
             L[(size_t) i] = (float) (0.10 * std::sin (2.0 * kPi *  900.0 * (b * n + i) / fs));
             R[(size_t) i] = (float) (0.08 * std::sin (2.0 * kPi * 1100.0 * (b * n + i) / fs)); } };
-        for (int b = 0; b < 4; ++b) { fill (b); band.processBlock (ch, 2, n); }   // warm up (allocs before the snapshot are fine)
+        for (int b = 0; b < 4; ++b) { fill (b); felitronics::test::run (band.processBlock (ch, 2, n)); }   // warm up (allocs before the snapshot are fine)
 
         const long before = g_allocs.load (std::memory_order_relaxed);
         for (int b = 0; b < 300; ++b)
@@ -530,7 +531,7 @@ void runEqEngineTests()
             p.lane (Lane::Stereo).freq = 700.0 + 0.7 * b;                                      // keep the freq smoother moving -> designBand()/notchCascade run every block
             band.setParams (p);
             fill (b);
-            band.processBlock (ch, 2, n);
+            felitronics::test::run (band.processBlock (ch, 2, n));
         }
         const long after = g_allocs.load (std::memory_order_relaxed);
         std::printf ("      heap allocations during 300 moving 8-section blocks: %ld\n", after - before);
@@ -567,7 +568,7 @@ void runEqEngineTests()
             BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = slope;
             band.setParams (p);
             std::vector<float> out = in;
-            for (int o = 0; o < N; o += 256) { float* ch[1] = { out.data() + o }; band.processBlock (ch, 1, std::min (256, N - o)); }
+            for (int o = 0; o < N; o += 256) { float* ch[1] = { out.data() + o }; felitronics::test::run (band.processBlock (ch, 1, std::min (256, N - o))); }
             return out;
         };
 
@@ -588,8 +589,8 @@ void runEqEngineTests()
         BandParams p; p.on = true; p.type = FilterType::Notch; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).slope = 96;   // 8 sections
         band.setParams (p);
         const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* ch[1] = { buf.data() };
-        band.processBlock (ch, 1, n);
-        for (int b = 0; b < 300; ++b) { for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n); }
+        felitronics::test::run (band.processBlock (ch, 1, n));
+        for (int b = 0; b < 300; ++b) { for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (band.processBlock (ch, 1, n)); }
         double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
         expectTrue (tail == 0.0, "8-section notch tail flushed to exact zero (no denormal residue)");
     }
@@ -600,11 +601,11 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams hi; hi.on = true; hi.type = FilterType::Notch; hi.lane (Lane::Stereo).freq = 1000.0; hi.lane (Lane::Stereo).Q = 3.0; hi.lane (Lane::Stereo).slope = 96;
         band.setParams (hi);
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; band.processBlock (ch, 1, n);       // build 8-section state
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; felitronics::test::run (band.processBlock (ch, 1, n));       // build 8-section state
         BandParams lo = hi; lo.lane (Lane::Stereo).slope = 12; band.setParams (lo);
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);                       // -> single (resets)
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (band.processBlock (ch, 1, n));                       // -> single (resets)
         band.setParams (hi);                                                                                    // -> 8 sections again
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (band.processBlock (ch, 1, n));
         double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
         expectTrue (tail == 0.0, "no stale tail after the notch section count changes");
     }
@@ -618,7 +619,7 @@ void runEqEngineTests()
         const int n = 256; std::vector<float> buf ((size_t) n);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.3f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
         float* ch[1] = { buf.data() };
-        for (int b = 0; b < 20; ++b) eng.process (ch, 1, n);
+        for (int b = 0; b < 20; ++b) felitronics::test::run (eng.process (ch, 1, n));
         expectTrue (! anyNaN (buf.data(), n),                  "sanitised high-order notch -> finite output");
         expectTrue (std::isfinite (eng.magnitudeDb (1000.0)),  "magnitudeDb finite for a bad-param high-order notch");
     }
@@ -634,7 +635,7 @@ void runEqEngineTests()
         for (int i = 0; i < n; ++i) { L[(size_t) i] = (float) (0.20 * std::sin (2.0 * kPi * 1122.0 * i / fs));
                                       R[(size_t) i] = (float) (0.15 * std::sin (2.0 * kPi * 1122.0 * i / fs + 0.7));
                                       S0[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]); }
-        float* ch[2] = { L.data(), R.data() }; b.processBlock (ch, 2, n);
+        float* ch[2] = { L.data(), R.data() }; felitronics::test::run (b.processBlock (ch, 2, n));
         double sErr = 0.0; for (int i = 0; i < n; ++i) sErr = std::max (sErr, (double) std::fabs (0.5f * (L[(size_t) i] - R[(size_t) i]) - S0[(size_t) i]));
         expectNear (sErr, 0.0, 1e-5, "8-section Mid notch: Side axis preserved to float precision");
     }
@@ -693,7 +694,7 @@ void runEqEngineTests()
                     for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.95f * (float) std::sin (2.0 * kPi * 1000.0 * i / fs);
                                                   R[(size_t) i] = 0.80f * (float) std::sin (2.0 * kPi * 3000.0 * i / fs); }
                     float* ch[2] = { L.data(), R.data() };
-                    for (int blk = 0; blk < 8; ++blk) eng.process (ch, 2, n);
+                    for (int blk = 0; blk < 8; ++blk) felitronics::test::run (eng.process (ch, 2, n));
                     if (anyNaN (L.data(), n) || anyNaN (R.data(), n)) ++nanOut;
                     if (! std::isfinite (eng.magnitudeDb (1000.0))) ++magBad;
                 }
@@ -712,8 +713,8 @@ void runEqEngineTests()
                 band.setParams (p);
                 const int n = 64; std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f); L[0] = 1.0f; R[0] = 1.0f;
                 float* ch[2] = { L.data(), R.data() };
-                band.processBlock (ch, 2, n);
-                for (int b = 0; b < 400; ++b) { for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.0f; R[(size_t) i] = 0.0f; } band.processBlock (ch, 2, n); }
+                felitronics::test::run (band.processBlock (ch, 2, n));
+                for (int b = 0; b < 400; ++b) { for (int i = 0; i < n; ++i) { L[(size_t) i] = 0.0f; R[(size_t) i] = 0.0f; } felitronics::test::run (band.processBlock (ch, 2, n)); }
                 double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (L[(size_t) i]) + std::fabs (R[(size_t) i]);
                 expectTrue (tail == 0.0, std::string (tc.name) + (sw ? " (swept)" : " (matched)") + ": denormal tail flushed to exact zero");
             }
@@ -724,7 +725,7 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams p; p.on = true; p.bypass = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 12.0;
         band.setParams (p);
-        const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { band.processBlock (ch, nc, n); }, 1000.0, fs);
+        const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); }, 1000.0, fs);
         expectNear (g, 0.0, 0.05, "bypassed band passes audio at 0 dB");
     }
 
@@ -734,13 +735,13 @@ void runEqEngineTests()
         BandParams on; on.on = true; on.type = FilterType::Bell; on.lane (Lane::Stereo).freq = 1000.0; on.lane (Lane::Stereo).Q = 2.0; on.lane (Lane::Stereo).gainDb = 6.0;
         band.setParams (on);
         const int n = 64; std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* ch[1] = { buf.data() };
-        band.processBlock (ch, 1, n);                              // build state from an impulse
+        felitronics::test::run (band.processBlock (ch, 1, n));                              // build state from an impulse
         BandParams off = on; off.on = false; band.setParams (off);
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f;
-        band.processBlock (ch, 1, n);                              // off block -> resets state
+        felitronics::test::run (band.processBlock (ch, 1, n));                              // off block -> resets state
         band.setParams (on);                                      // re-enable
         for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f;
-        band.processBlock (ch, 1, n);                              // silent in -> must be silent out
+        felitronics::test::run (band.processBlock (ch, 1, n));                              // silent in -> must be silent out
         double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
         expectTrue (tail == 0.0, "re-enabled band starts from a clean state");
     }
@@ -752,22 +753,22 @@ void runEqEngineTests()
         EqBand band; band.prepare (fs, 1);
         BandParams sw; sw.on = true; sw.type = FilterType::Bell; sw.lane (Lane::Stereo).freq = 1000.0; sw.lane (Lane::Stereo).Q = 4.0; sw.lane (Lane::Stereo).gainDb = 6.0; sw.swept = true;
         band.setParams (sw);
-        buf[0] = 1.0f; band.processBlock (ch, 1, n);                                          // SVF builds state
+        buf[0] = 1.0f; felitronics::test::run (band.processBlock (ch, 1, n));                                          // SVF builds state
         BandParams st = sw; st.swept = false; band.setParams (st);
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);     // -> static (resets)
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (band.processBlock (ch, 1, n));     // -> static (resets)
         band.setParams (sw);                                                                 // -> swept again
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; band.processBlock (ch, 1, n);
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (band.processBlock (ch, 1, n));
         double t1 = 0.0; for (int i = 0; i < n; ++i) t1 += std::fabs (buf[(size_t) i]);
         expectTrue (t1 == 0.0, "no stale SVF tail after swept<->static");
 
         EqBand hp; hp.prepare (fs, 1);
         BandParams p24; p24.on = true; p24.type = FilterType::HighPass; p24.lane (Lane::Stereo).freq = 1000.0; p24.lane (Lane::Stereo).Q = 0.707; p24.lane (Lane::Stereo).slope = 24;
         hp.setParams (p24);
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; hp.processBlock (ch, 1, n);   // bq0+bq1 state
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; buf[0] = 1.0f; felitronics::test::run (hp.processBlock (ch, 1, n));   // bq0+bq1 state
         BandParams p12 = p24; p12.lane (Lane::Stereo).slope = 12; hp.setParams (p12);
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; hp.processBlock (ch, 1, n);                  // -> single (resets)
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (hp.processBlock (ch, 1, n));                  // -> single (resets)
         hp.setParams (p24);                                                                             // -> 24 again
-        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; hp.processBlock (ch, 1, n);
+        for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (hp.processBlock (ch, 1, n));
         double t2 = 0.0; for (int i = 0; i < n; ++i) t2 += std::fabs (buf[(size_t) i]);
         expectTrue (t2 == 0.0, "no stale bq1 tail after 24<->12 dB/oct");
     }
@@ -780,7 +781,7 @@ void runEqEngineTests()
         const int n = 256;
         std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f);
         float* ch[2] = { L.data(), R.data() };
-        for (int b = 0; b < 10; ++b) eng.process (ch, 2, n);
+        for (int b = 0; b < 10; ++b) felitronics::test::run (eng.process (ch, 2, n));
         double energy = 0.0;
         for (int i = 0; i < n; ++i) energy += std::fabs (L[(size_t) i]) + std::fabs (R[(size_t) i]);
         expectTrue (energy == 0.0, "silence stays silent");
@@ -793,7 +794,7 @@ void runEqEngineTests()
         EqEngine eng; prepEng (eng, fs, 256, C);
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 2.0; p.lane (Lane::Stereo).gainDb = 6.0;
         eng.setBand (0, p);
-        const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
+        const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (eng.process (ch, nc, n)); }, C, 1000.0, fs);
         for (int c = 0; c < C; ++c)
             expectNear (g[(size_t) c], 6.0, 0.4, "ch " + std::to_string (c) + " static bell +6 dB");
     }
@@ -804,7 +805,7 @@ void runEqEngineTests()
         EqEngine eng; prepEng (eng, fs, 256, C);
         BandParams p; p.on = true; p.type = FilterType::Bell; p.lane (Lane::Stereo).freq = 2000.0; p.lane (Lane::Stereo).Q = 3.0; p.lane (Lane::Stereo).gainDb = 6.0; p.swept = true;
         eng.setBand (0, p);
-        const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 2000.0, fs);
+        const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (eng.process (ch, nc, n)); }, C, 2000.0, fs);
         for (int c = 0; c < C; ++c)
             expectNear (g[(size_t) c], 6.0, 0.5, "ch " + std::to_string (c) + " swept bell +6 dB");
     }
@@ -819,7 +820,7 @@ void runEqEngineTests()
         std::vector<std::vector<float>> bufs ((size_t) C, std::vector<float> ((size_t) n, 0.0f));
         std::vector<float*> ptr ((size_t) C);
         for (int c = 0; c < C; ++c) ptr[(size_t) c] = bufs[(size_t) c].data();
-        for (int b = 0; b < 10; ++b) eng.process (ptr.data(), C, n);
+        for (int b = 0; b < 10; ++b) felitronics::test::run (eng.process (ptr.data(), C, n));
         double energy = 0.0; bool nan = false;
         for (int c = 0; c < C; ++c) for (int i = 0; i < n; ++i)
         { energy += std::fabs (bufs[(size_t) c][(size_t) i]); nan = nan || ! std::isfinite (bufs[(size_t) c][(size_t) i]); }
@@ -846,7 +847,7 @@ void runEqEngineTests()
                 EqEngine mono; prepEng (mono, fs, n, 1); mono.setBand (0, p);
                 for (int i = 0; i < n; ++i) ref[(size_t) c][(size_t) i] = signalAt (c, i);
                 float* m[1] = { ref[(size_t) c].data() };
-                mono.process (m, 1, n);
+                felitronics::test::run (mono.process (m, 1, n));
             }
 
             EqEngine eng; prepEng (eng, fs, n, C); eng.setBand (0, p);
@@ -857,7 +858,7 @@ void runEqEngineTests()
                 for (int i = 0; i < n; ++i) buf[(size_t) c][(size_t) i] = signalAt (c, i);
                 ptr[(size_t) c] = buf[(size_t) c].data();
             }
-            eng.process (ptr.data(), C, n);
+            felitronics::test::run (eng.process (ptr.data(), C, n));
 
             double maxErr = 0.0;
             for (int c = 0; c < C; ++c) for (int i = 0; i < n; ++i)
@@ -883,11 +884,11 @@ void runEqEngineTests()
                                   const float v = (float) (amp * std::sin (phase));
                                   phase += dp; if (phase > 2.0 * kPi) phase -= 2.0 * kPi;
                                   L[(size_t) n] = v; R[(size_t) n] = side ? -v : v; } };
-            for (int b = 0; b < 400; ++b) { fill(); float* ch[2] = { L.data(), R.data() }; band.processBlock (ch, 2, block); }
+            for (int b = 0; b < 400; ++b) { fill(); float* ch[2] = { L.data(), R.data() }; felitronics::test::run (band.processBlock (ch, 2, block)); }
             fill();
             std::vector<double> inDom ((size_t) block);
             for (int n = 0; n < block; ++n) inDom[(size_t) n] = side ? 0.5 * (L[(size_t) n] - R[(size_t) n]) : 0.5 * (L[(size_t) n] + R[(size_t) n]);
-            { float* ch[2] = { L.data(), R.data() }; band.processBlock (ch, 2, block); }
+            { float* ch[2] = { L.data(), R.data() }; felitronics::test::run (band.processBlock (ch, 2, block)); }
             double ir = 0.0, orr = 0.0;
             for (int n = 0; n < block; ++n) { const double dm = side ? 0.5 * (L[(size_t) n] - R[(size_t) n]) : 0.5 * (L[(size_t) n] + R[(size_t) n]);
                                               ir += inDom[(size_t) n] * inDom[(size_t) n]; orr += dm * dm; }
@@ -928,7 +929,7 @@ void runEqEngineTests()
           for (int i = 0; i < n; ++i) { L[(size_t) i] = (float) (0.20 * std::sin (2.0 * kPi * 700.0 * i / fs));
                                         R[(size_t) i] = (float) (0.15 * std::sin (2.0 * kPi * 700.0 * i / fs + 0.7));
                                         S0[(size_t) i] = 0.5f * (L[(size_t) i] - R[(size_t) i]); }
-          float* ch[2] = { L.data(), R.data() }; b.processBlock (ch, 2, n);
+          float* ch[2] = { L.data(), R.data() }; felitronics::test::run (b.processBlock (ch, 2, n));
           double sErr = 0.0; for (int i = 0; i < n; ++i) sErr = std::max (sErr, (double) std::fabs (0.5f * (L[(size_t) i] - R[(size_t) i]) - S0[(size_t) i]));
           expectNear (sErr, 0.0, 1e-5, "Side idle: Side axis (L-R) preserved to float precision"); }
 
@@ -946,7 +947,7 @@ void runEqEngineTests()
           p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 2.0; p.lane (Lane::Mid).gainDb  = 6.0;
           p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 1000.0; p.lane (Lane::Side).Q = 2.0; p.lane (Lane::Side).gainDb = 6.0;
           b.setParams (p);
-          const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { b.processBlock (ch, nc, n); }, 1000.0, fs);
+          const double g = sineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (b.processBlock (ch, nc, n)); }, 1000.0, fs);
           expectNear (g, 0.0, 0.05, "mono + {m,s}: M/S lanes inert on a non-stereo bus (ST-only rule)"); }
     }
 
@@ -961,7 +962,7 @@ void runEqEngineTests()
           p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).freq  = 1000.0; p.lane (Lane::Mid).Q  = 1.0; p.lane (Lane::Mid).gainDb  =  12.0;
           p.lane (Lane::Side).on = true; p.lane (Lane::Side).freq = 1000.0; p.lane (Lane::Side).Q = 1.0; p.lane (Lane::Side).gainDb = -12.0;
           eng.setBand (0, p);
-          const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
+          const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (eng.process (ch, nc, n)); }, C, 1000.0, fs);
           for (int c = 0; c < C; ++c)
               expectNear (g[(size_t) c], 0.0, 0.02, "surround ch " + std::to_string (c) + " == transparent (M/S lanes inert)");
         }
@@ -969,7 +970,7 @@ void runEqEngineTests()
           BandParams p; p.on = true; p.type = FilterType::Bell;
           p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 1.0; p.lane (Lane::Stereo).gainDb = 6.0;
           eng.setBand (0, p);
-          const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { eng.process (ch, nc, n); }, C, 1000.0, fs);
+          const auto g = multiSineGainDb ([&] (float* const* ch, int nc, int n) { felitronics::test::run (eng.process (ch, nc, n)); }, C, 1000.0, fs);
           for (int c = 0; c < C; ++c)
               expectNear (g[(size_t) c], 6.0, 0.4, "surround ch " + std::to_string (c) + " == ST lane (+6) on every channel");
         }
@@ -997,7 +998,7 @@ void runEqEngineTests()
             {
                 for (int i = 0; i < n; ++i) { const float l = 0.30f * lcg (s), r = 0.25f * lcg (s);
                                               eL[(size_t) i] = rL[(size_t) i] = l; eR[(size_t) i] = rR[(size_t) i] = r; }
-                float* ec[2] = { eL.data(), eR.data() }; eng.processBlock (ec, 2, n);
+                float* ec[2] = { eL.data(), eR.data() }; felitronics::test::run (eng.processBlock (ec, 2, n));
                 float* rc[2] = { rL.data(), rR.data() }; if (ms) ref.processMS (rc, n); else ref.processStereo (rc, 2, n);
                 for (int i = 0; i < n; ++i) { maxErr = std::max (maxErr, (double) std::fabs (eL[(size_t) i] - rL[(size_t) i]));
                                              maxErr = std::max (maxErr, (double) std::fabs (eR[(size_t) i] - rR[(size_t) i])); }
@@ -1036,7 +1037,7 @@ void runEqEngineTests()
             std::uint64_t s = 0x2468ACEu;
             std::vector<float> L ((size_t) n), R ((size_t) n), L0 ((size_t) n), R0 ((size_t) n);
             for (int i = 0; i < n; ++i) { L[(size_t) i] = L0[(size_t) i] = 0.30f * lcg (s); R[(size_t) i] = R0[(size_t) i] = 0.27f * lcg (s); }
-            float* c[2] = { L.data(), R.data() }; b.processBlock (c, 2, n);
+            float* c[2] = { L.data(), R.data() }; felitronics::test::run (b.processBlock (c, 2, n));
             std::array<double,4> d { 0, 0, 0, 0 };   // {maxΔL, maxΔR, maxΔ(L-R), maxΔ(L+R)}
             for (int i = 0; i < n; ++i)
             {
@@ -1064,11 +1065,11 @@ void runEqEngineTests()
             long nAbs = 0;
             auto fill = [&] { for (int i = 0; i < W; ++i) { const double v = 0.25 * std::sin (w * (double) (nAbs + i));
                                   L[(size_t) i] = (inCh == 0) ? (float) v : 0.0f; R[(size_t) i] = (inCh == 1) ? (float) v : 0.0f; } };
-            for (int b = 0; b < 40; ++b) { fill(); float* c[2] = { L.data(), R.data() }; eng.process (c, 2, W); nAbs += W; }   // reach steady state
+            for (int b = 0; b < 40; ++b) { fill(); float* c[2] = { L.data(), R.data() }; felitronics::test::run (eng.process (c, 2, W)); nAbs += W; }   // reach steady state
             fill();
             std::complex<double> X { 0, 0 };
             for (int i = 0; i < W; ++i) { const double s = (inCh == 0) ? (double) L[(size_t) i] : (double) R[(size_t) i]; X += s * std::polar (1.0, -w * (double) (nAbs + i)); }
-            float* c[2] = { L.data(), R.data() }; eng.process (c, 2, W);
+            float* c[2] = { L.data(), R.data() }; felitronics::test::run (eng.process (c, 2, W));
             std::complex<double> YL { 0, 0 }, YR { 0, 0 };
             for (int i = 0; i < W; ++i) { YL += (double) L[(size_t) i] * std::polar (1.0, -w * (double) (nAbs + i)); YR += (double) R[(size_t) i] * std::polar (1.0, -w * (double) (nAbs + i)); }
             return { YL / X, YR / X };
@@ -1144,8 +1145,8 @@ void runEqEngineTests()
             {
                 fillNoise (sa, aL, aR); fillNoise (sb, bL, bR);
                 if (blk == 6) B.setParams (full);                           // enable the Side lane mid-stream (hard step)
-                float* ac[2] = { aL.data(), aR.data() }; A.processBlock (ac, 2, n);
-                float* bc[2] = { bL.data(), bR.data() }; B.processBlock (bc, 2, n);
+                float* ac[2] = { aL.data(), aR.data() }; felitronics::test::run (A.processBlock (ac, 2, n));
+                float* bc[2] = { bL.data(), bR.data() }; felitronics::test::run (B.processBlock (bc, 2, n));
                 nan = nan || anyNaN (bL.data(), n) || anyNaN (bR.data(), n);
             }
             double conv = 0.0; for (int i = 0; i < n; ++i) { conv = std::max (conv, (double) std::fabs (aL[(size_t) i] - bL[(size_t) i]));
@@ -1161,10 +1162,10 @@ void runEqEngineTests()
             bell.lane (Lane::Stereo).freq = 1000.0; bell.lane (Lane::Stereo).Q = 4.0; bell.lane (Lane::Stereo).gainDb = 12.0;
             b.setParams (bell);
             std::vector<float> buf ((size_t) n, 0.0f); buf[0] = 1.0f; float* c[1] = { buf.data() };
-            b.processBlock (c, 1, n);                                        // build Bell state
+            felitronics::test::run (b.processBlock (c, 1, n));                                        // build Bell state
             BandParams bp = bell; bp.type = FilterType::BandPass;            // Bell -> BandPass: both 1 section
             b.setParams (bp);
-            for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; b.processBlock (c, 1, n);   // silence in -> resets -> silent out
+            for (int i = 0; i < n; ++i) buf[(size_t) i] = 0.0f; felitronics::test::run (b.processBlock (c, 1, n));   // silence in -> resets -> silent out
             double tail = 0.0; for (int i = 0; i < n; ++i) tail += std::fabs (buf[(size_t) i]);
             expectTrue (tail == 0.0, "type change (Bell->BandPass, same section count) resets state");
         }
@@ -1176,7 +1177,7 @@ void runEqEngineTests()
             p.lane (Lane::Left).on = true; p.lane (Lane::Left).gainDb = 12.0;
             p.lane (Lane::Mid).on  = true; p.lane (Lane::Mid).gainDb  = 12.0;
             b.setParams (p);
-            const double g = sineGainDb ([&] (float* const* ch, int nc, int nn) { b.processBlock (ch, nc, nn); }, 1000.0, fs);
+            const double g = sineGainDb ([&] (float* const* ch, int nc, int nn) { felitronics::test::run (b.processBlock (ch, nc, nn)); }, 1000.0, fs);
             expectNear (g, 0.0, 0.05, "true-mono: non-ST lanes inert (transparent)");
         }
 
@@ -1188,7 +1189,7 @@ void runEqEngineTests()
             p.lane (Lane::Stereo).freq = 1000.0; p.lane (Lane::Stereo).Q = 0.707; p.lane (Lane::Stereo).slope = 24;
             p.lane (Lane::Mid).on = true; p.lane (Lane::Mid).freq = 1000.0; p.lane (Lane::Mid).gainDb = 0.0;   // flat Mid -> splits the point
             b.setParams (p);
-            std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f); float* c[2] = { L.data(), R.data() }; b.processBlock (c, 2, n);
+            std::vector<float> L ((size_t) n, 0.0f), R ((size_t) n, 0.0f); float* c[2] = { L.data(), R.data() }; felitronics::test::run (b.processBlock (c, 2, n));
             const double r250 = 20.0 * std::log10 (std::abs (b.response (2.0 * kPi * 250.0 / fs, Axis::Mid)));
             const double r500 = 20.0 * std::log10 (std::abs (b.response (2.0 * kPi * 500.0 / fs, Axis::Mid)));
             expectTrue ((r500 - r250) > 18.0, "split swept HP24: ST uses the matched 24 dB/oct cascade (swept gated off)");
@@ -1229,7 +1230,7 @@ void runEqEngineTests()
                 {
                     fillNoise (s, L, R);
                     if (churn) { p.lane (Lane::Side).freq = 500.0 + 13.0 * blk; b.setParams (p); }   // automate the DISABLED lane
-                    float* c[2] = { L.data(), R.data() }; b.processBlock (c, 2, n);
+                    float* c[2] = { L.data(), R.data() }; felitronics::test::run (b.processBlock (c, 2, n));
                     for (int i = 0; i < n; ++i) { out.push_back (L[(size_t) i]); out.push_back (R[(size_t) i]); }
                 }
                 return out;
@@ -1251,7 +1252,7 @@ void runEqEngineTests()
         auto fill = [&] (int b) { for (int i = 0; i < nn; ++i) {
             L[(size_t) i] = (float) (0.10 * std::sin (2.0 * kPi *  700.0 * (b * nn + i) / fs));
             R[(size_t) i] = (float) (0.08 * std::sin (2.0 * kPi * 1100.0 * (b * nn + i) / fs)); } };
-        for (int b = 0; b < 4; ++b) { fill (b); band.processBlock (c, 2, nn); }   // warm up (allocs before the snapshot are fine)
+        for (int b = 0; b < 4; ++b) { fill (b); felitronics::test::run (band.processBlock (c, 2, nn)); }   // warm up (allocs before the snapshot are fine)
 
         const long before = g_allocs.load (std::memory_order_relaxed);
         for (int b = 0; b < 300; ++b)
@@ -1260,7 +1261,7 @@ void runEqEngineTests()
                 p.lane (l).freq = 600.0 + 0.5 * b + 5.0 * (double) (int) l;    // keep every lane's smoother moving
             band.setParams (p);
             fill (b);
-            band.processBlock (c, 2, nn);
+            felitronics::test::run (band.processBlock (c, 2, nn));
         }
         const long after = g_allocs.load (std::memory_order_relaxed);
         std::printf ("      heap allocations during 300 moving all-five-lane blocks: %ld\n", after - before);

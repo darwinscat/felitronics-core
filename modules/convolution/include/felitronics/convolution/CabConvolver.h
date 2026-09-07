@@ -82,11 +82,18 @@ public:
     // normalize=false skips the reference-unity RMS normalization (LOUDNESS above) — a REVERB IR is a
     // decay tail, not a tone-shaping cab bandpass, so RMS-normalizing its mostly-decayed length would
     // blow up the wet gain. The spring IRs are peak-normalized at bundle time; the Reverb Mix sets level.
-    void prepare (double sampleRate, int maxBlock, int numChannels, double maxIrSeconds = 4.0,
-                  bool normalize = true)
+    // Law 11(b): `numChannels` is BINDING, and this convolver's ceiling is 2, not core::kMaxChannels.
+    // It used to CLAMP — prepare(..., 4) succeeded silently as a stereo convolver, after which
+    // process(io, 4, n) was a perfectly well-formed call that left planes 2 and 3 DRY. An observable
+    // refusal in process() is worth nothing if prepare() already agreed to something it cannot do.
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int numChannels, double maxIrSeconds = 4.0,
+                                bool normalize = true)
     {
+        prepared_ = false;                       // law 11: a REFUSED prepare leaves the object unusable,
+        if (numChannels < 1 || numChannels > 2)  // the way Compressor and TruePeakLimiter already do —
+            return false;                        // otherwise a rejected re-prepare silently keeps the old one
         hostSr_    = sampleRate > 0.0 ? sampleRate : 48000.0;
-        channels_  = std::clamp (numChannels, 1, 2);
+        channels_  = numChannels;
         maxBlock_  = std::max (1, maxBlock);                // retained for API parity — NUPC is block-independent
         normalize_ = normalize;
 
@@ -100,6 +107,7 @@ public:
         pendingRetry_ = false;
         pendingLen_   = 0;
         pendingNch_   = 0;
+        return prepared_;
     }
 
     void reset() { convolution_.reset(); }
@@ -125,9 +133,10 @@ public:
 
     // RT-safe in-place convolution of `numChannels` planar channels. NUPC processes the prepared channel
     // count and no-ops if handed fewer planes — callers pass the prepared width (wet buffer == bus width).
-    void process (float* const* io, int numChannels, int numSamples)
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples)
     {
-        convolution_.process (io, io, numChannels, numSamples);   // in-place (in == out), zero latency
+        if (! prepared_) return false;                                   // ...and process() has to READ that flag
+        return convolution_.process (io, io, numChannels, numSamples);   // in-place (in == out), zero latency
     }
 
     // "A load is in flight": either the async crossfade hasn't finished, or a load is still queued because

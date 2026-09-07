@@ -38,11 +38,12 @@ namespace felitronics::analysis
 class LoudnessMeter
 {
 public:
-    void prepare (double sampleRate, int numChannels, double maxDurationSec = 3600.0)
+    [[nodiscard]] bool prepare (double sampleRate, int numChannels, double maxDurationSec = 3600.0)
     {
         prepared_ = false;
         fs = sampleRate > 0.0 ? sampleRate : 48000.0;                  // fs<=0 → subSamples 0 → /0 in finishSubHop
-        ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
+        if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING
+        ch = numChannels;
         kw.prepare (fs, ch);
         subSamples = std::max (1, (int) std::lround (0.01 * fs));      // 10 ms; a gating hop is ten of them
         for (int c = 0; c < kMaxChannels; ++c) w[c] = 1.0;
@@ -55,12 +56,14 @@ public:
         stE.assign ((std::size_t) (hops / 10.0) + 8, 0.0);              // 1 short-term sample/s for LRA
         reset();
         prepared_ = true;
+        return true;
     }
 
     void reset() noexcept
     {
         kw.reset();
         for (int c = 0; c < kMaxChannels; ++c) subSumSq[c] = 0.0;
+        ranNc_ = 0;                             // nothing has run, so nothing can be stopping
         subCount = 0; subWrite = 0; subFilled = 0; subInHop = 0; blockCount = 0; droppedBlocks_ = 0;
         nonFiniteSubHops_ = 0;
         stCount = 0; stSince = 0;
@@ -74,15 +77,36 @@ public:
         if (c >= 0 && c < kMaxChannels && std::isfinite (weight)) w[c] = weight;
     }
 
-    void process (const float* const* channels, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). NB the sub-hop counter runs on the SAMPLES, not on the channels,
+    // so a zero-width call still spends measurement time — that was already true and is law 11(d).
+    [[nodiscard]] bool process (const float* const* channels, int numChannels, int n) noexcept
     {
-        if (! prepared_) return;                                       // unprepared — subRing/blockE/stE empty
-        const int nc = numChannels < ch ? numChannels : ch;
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;                                 // unprepared — subRing/blockE/stE empty
+        if (numChannels > ch) return false;                            // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                                      // law 11(d): the ONE true no-op —
+                                                                      // and the falling edge below is
+                                                                      // clocked by `n`, exactly as 11a says
+        const int nc = numChannels;
+        // THE SIBLING OF TruePeakMeter'S HISTORY. `KWeightingFilter` holds a per-channel TDF-II state,
+        // and a channel that stops and comes back is weighted against audio from before the gap: the
+        // RLB shelf's tail spills out on return. Measured — a 60 Hz tone, one second of zero-width
+        // calls, then 400 ms of DIGITAL SILENCE — momentary read -29.19 LUFS where real silence reads
+        // -120.00. Same class, same answer, one file over.
+        //
+        // ONLY THE FILTER. `subSumSq` is not stale memory, it is MEASUREMENT ALREADY TAKEN in the
+        // sub-hop now in progress, and clearing it here threw that away: one zero-width call in the
+        // middle of a tone moved the reading by -3.02 LU, a single zero-width sample turned -9.11 LUFS
+        // into -120, and the evidence of a non-finite input (`nonFiniteSubHops()`) went from 1 to 0.
+        // A falling edge drops what a cell REMEMBERS, never what a meter has already counted.
+        for (int c = nc; c < ranNc_; ++c) kw.resetChannel (c);
+        ranNc_ = nc;
         for (int i = 0; i < n; ++i)
         {
             for (int c = 0; c < nc; ++c) { const double y = kw.process (c, (double) channels[c][i]); subSumSq[c] += y * y; }
             if (++subCount >= subSamples) finishSubHop (nc);
         }
+        return true;
     }
 
     double momentaryLufs()  const noexcept { return lufsOf (meanLastSubHops (kMomentarySubHops)); }  // 400 ms
@@ -275,6 +299,7 @@ private:
     }
 
     double fs = 48000.0; int ch = 2, subSamples = 480;
+    int ranNc_ = 0;                             // channels that advanced K-weighting on the previous call
     bool prepared_ = false;                     // true only after prepare() (subRing/blockE/stE allocated)
     KWeightingFilter kw;
     double w[kMaxChannels] {};

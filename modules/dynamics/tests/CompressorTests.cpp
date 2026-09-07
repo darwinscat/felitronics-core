@@ -62,7 +62,7 @@ int main()
         p.mode = dynamics::Mode::DownCompress; p.thresholdDb = -20.0; p.ratio = 4.0; p.kneeDb = 0.0;
         p.attackMs = 5.0; p.releaseMs = 80.0; p.makeupDb = 0.0;
         comp.setParams (p);
-        comp.process (ch, 1, n);
+        felitronics::test::run (comp.process (ch, 1, n));
 
         const double appliedDb = 20.0 * std::log10 (rmsTail (y, 0.2) / rmsTail (x, 0.2));
         test::approx (appliedDb, -9.0, 0.6, "12 dB over @4:1 → ~-9 dB applied");
@@ -89,7 +89,7 @@ int main()
         p.detector = dynamics::Detector::Rms; p.rmsWindowMs = 30.0; p.link = dynamics::LinkMode::Max;
         p.thresholdDb = -24.0; p.ratio = 4.0; p.kneeDb = 0.0; p.attackMs = 5.0; p.releaseMs = 80.0;
         comp.setParams (p);
-        comp.process (ch, 2, n);
+        felitronics::test::run (comp.process (ch, 2, n));
 
         const double gL = 20.0 * std::log10 (rmsTail (yl, 0.2) / rmsTail (xl, 0.2));
         const double gR = 20.0 * std::log10 (rmsTail (yr, 0.2) / rmsTail (xr, 0.2));
@@ -113,7 +113,7 @@ int main()
         comp.setParams (p);
         test::ok (comp.latencySamples() == look, "reports lookahead as latency");
 
-        comp.process (ch, 1, n);
+        felitronics::test::run (comp.process (ch, 1, n));
         test::approx (y[(std::size_t) look], 1.0, 1e-4, "impulse appears at exactly `lookahead`");
         double leak = 0.0; for (int i = 0; i < look; ++i) leak = std::max (leak, (double) std::fabs (y[(std::size_t) i]));
         test::ok (leak < 1e-6, "nothing before the lookahead delay (no off-by-one)");
@@ -130,8 +130,8 @@ int main()
         dynamics::CompressorParams p; p.thresholdDb = -30.0; p.ratio = 4.0; p.lookaheadMs = 2.0;
         comp.setParams (p);                      // allocations allowed up to here
         const long before = g_allocs.load();
-        comp.process (ch, 2, n);
-        comp.process (ch, 2, n);
+        felitronics::test::run (comp.process (ch, 2, n));
+        felitronics::test::run (comp.process (ch, 2, n));
         const long after = g_allocs.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
@@ -149,7 +149,7 @@ int main()
         p.thresholdDb = -20.0; p.ratio = 4.0;
         p.attackMs = qnan; p.releaseMs = qnan; p.makeupDb = qnan; p.lookaheadMs = qnan; p.rmsWindowMs = qnan;
         comp.setParams (p);
-        comp.process (ch, 1, n);
+        felitronics::test::run (comp.process (ch, 1, n));
         bool fin = true; for (float v : y) fin &= (bool) std::isfinite (v);
         test::ok (fin, "NaN times/makeup/lookahead → finite output");
         test::ok (comp.latencySamples() >= 0 && comp.latencySamples() <= (int) (50.0 * 0.001 * fs) + 1,

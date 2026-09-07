@@ -41,6 +41,7 @@
 //                   bit-exact across schedules; feel ON carries the KNOWN ~1e-2 "B9" feel-layer block
 //                   discrepancy — PINNED (≤2e-2) and reported, NOT chased (a documented deviation).
 
+#include <felitronics_test.h>   // felitronics::test::run — law 11 verdicts
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>
@@ -89,7 +90,7 @@ public:
         p.sag = t.sag; p.presence = t.presence; p.depth = t.depth; p.load = t.load; p.iron = t.iron; p.bias = t.bias;
         d.setParams (p, kTubeVoicings[(std::size_t) std::clamp (t.tubeType, 0, 3)]);
     }
-    void process (float* const* io, int numChannels, int numSamples) noexcept { d.process (io, numChannels, numSamples); }
+    void process (float* const* io, int numChannels, int numSamples) noexcept { felitronics::test::run (d.process (io, numChannels, numSamples)); }
     int  latencySamples() const noexcept { return d.latencySamples(); }
 
 private:
@@ -446,7 +447,13 @@ int main()
         check (detOnA < 1e-6 && detOnB < 1e-6, "TT9 feel-ON block-size invariance is bit-exact (no real B9 deviation; golden's ~1e-2 is OOB-window)");
     }
 
-    std::printf ("%d checks, %d failures\n", g_checks, g_fail);
-    std::printf (g_fail ? "THEORY SUITE FAILED\n" : "THEORY SUITE PASSED\n");
-    return g_fail ? 1 : 0;
+    // This runner keeps its own counter, so a failure recorded by the SHARED harness — which is where
+    // felitronics::test::run() reports a REFUSED process() call — has to be folded in, or every such
+    // refusal is printed and then ignored. Found by the diff-pass consilium with its own mutation:
+    // an unconditional `return false` from PowerAmpStage::process printed 27 724 refusals and still
+    // exited 0.
+    const int sharedFailures = felitronics::test::stats().failures;
+    std::printf ("%d checks, %d failures (+%d from the shared harness)\n", g_checks, g_fail, sharedFailures);
+    std::printf ((g_fail || sharedFailures) ? "THEORY SUITE FAILED\n" : "THEORY SUITE PASSED\n");
+    return (g_fail || sharedFailures) ? 1 : 0;
 }

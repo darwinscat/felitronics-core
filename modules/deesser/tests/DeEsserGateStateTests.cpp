@@ -71,7 +71,7 @@ int main()
         const auto mode = (m == 0) ? deesser::DeEsserMode::SplitBand : deesser::DeEsserMode::DynamicEq;
         const char* name = (m == 0) ? "SplitBand" : "DynamicEq";
 
-        deesser::DeEsser d; d.prepare (kFs, N, 2);
+        deesser::DeEsser d; felitronics::test::run (d.prepare (kFs, N, 2));
         d.setParams (params (mode));
 
         std::vector<float> L ((std::size_t) N, 0.0f), R ((std::size_t) N, 0.0f);
@@ -82,18 +82,18 @@ int main()
         {
             std::fill (L.begin(), L.end(), 0.0f);
             fillNoise (R, 7u + (unsigned) k);                 // only the right channel carries programme
-            d.process (io, 2, N);
+            felitronics::test::run (d.process (io, 2, N));
             charged = std::fmax (charged, peakOf (R));
         }
         ok (charged > 0.05, std::string ("precondition ") + name + ": the right channel really was driven");
 
-        for (int k = 0; k < (int) (kFs * 2.0 / N); ++k) { std::fill (L.begin(), L.end(), 0.0f); d.process (io, 1, N); }
+        for (int k = 0; k < (int) (kFs * 2.0 / N); ++k) { std::fill (L.begin(), L.end(), 0.0f); felitronics::test::run (d.process (io, 1, N)); }
 
         double worst = 0.0;
         for (int k = 0; k < 20; ++k)
         {
             std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
-            d.process (io, 2, N);
+            felitronics::test::run (d.process (io, 2, N));
             worst = std::fmax (worst, std::fmax (peakOf (L), peakOf (R)));
         }
         ok (worst == 0.0, std::string (name) + ": silence in, exact zero out (SplitBand was 6.25e-02)");
@@ -105,7 +105,7 @@ int main()
         // Keep the leaving channel silent: the shared path then sees the same programme either way, and the
         // only thing that can differ is the per-channel state this fix touches.
         deesser::DeEsser dut, ref;
-        dut.prepare (kFs, N, 2); ref.prepare (kFs, N, 2);
+        felitronics::test::run (dut.prepare (kFs, N, 2)); felitronics::test::run (ref.prepare (kFs, N, 2));
         dut.setParams (params (deesser::DeEsserMode::SplitBand));
         ref.setParams (params (deesser::DeEsserMode::SplitBand));
 
@@ -119,8 +119,8 @@ int main()
             fillNoise (d0, 91u + (unsigned) k);
             std::fill (d1.begin(), d1.end(), 0.0f);
             r0 = d0; r1 = d1;
-            dut.process (dio, (k >= 40 && k < 80) ? 1 : 2, N);
-            ref.process (rio, 2, N);
+            felitronics::test::run (dut.process (dio, (k >= 40 && k < 80) ? 1 : 2, N));
+            felitronics::test::run (ref.process (rio, 2, N));
             equal = equal && bitEqual (d0, r0);
             energy += peakOf (d0);
         }
@@ -130,14 +130,14 @@ int main()
 
     group ("RT-safety");
     {
-        deesser::DeEsser d; d.prepare (kFs, N, 4);
+        deesser::DeEsser d; felitronics::test::run (d.prepare (kFs, N, 4));
         d.setParams (params (deesser::DeEsserMode::SplitBand));
         std::vector<float> v[4];
         float* io[4] {};
         for (int c = 0; c < 4; ++c) { v[c].assign ((std::size_t) N, 0.05f); io[c] = v[c].data(); }
-        d.process (io, 4, N);
+        felitronics::test::run (d.process (io, 4, N));
         const int before = g_allocs.load();
-        for (int k = 0; k < 40; ++k) d.process (io, (k % 3) + 2, N);
+        for (int k = 0; k < 40; ++k) felitronics::test::run (d.process (io, (k % 3) + 2, N));
         felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across 40 blocks of changing width");
     }
 

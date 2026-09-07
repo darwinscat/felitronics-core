@@ -84,7 +84,7 @@ static std::vector<float> convDbl (const std::vector<float>& x, const std::vecto
 static std::vector<float> convP (const std::vector<float>& x, const std::vector<float>& h, int maxIr)
 {
     convolution::PartitionedConvolver<> pc; pc.prepare (128, maxIr); pc.setIr (h.data(), (int) h.size());
-    std::vector<float> y (x.size(), 0.0f); pc.process (x.data(), y.data(), (int) x.size()); return y;
+    std::vector<float> y (x.size(), 0.0f); felitronics::test::run (pc.process (x.data(), y.data(), (int) x.size())); return y;
 }
 static double relSettled (const std::vector<float>& a, const std::vector<float>& b, int from)
 {
@@ -102,7 +102,7 @@ static void runMCN (MCN& mc, const std::vector<float>& xL, const std::vector<flo
     {
         int b = blkRng.range (1, 900); b = std::min (b, N - i);
         const float* in[2] { &xL[(std::size_t) i], &xR[(std::size_t) i] }; float* out[2] { &yL[(std::size_t) i], &yR[(std::size_t) i] };
-        mc.process (in, out, nch, b); i += b;
+        felitronics::test::run (mc.process (in, out, nch, b)); i += b;
     }
 }
 
@@ -209,7 +209,7 @@ int main()
             auto build = [&] (MCN& mc) { mc.prepare (P0, maxIr, 128, nch); if (nch == 1) mc.setIr (h[0].data(), len); else mc.setOperator (topoSel == 0 ? MCN::Topology::LRDiag : topoSel == 1 ? MCN::Topology::MSDiag : MCN::Topology::Full, banks.data(), nb, len); };
             // A: one big call
             MCN a; build (a); std::vector<float> aL ((std::size_t) N, 0.0f), aR ((std::size_t) N, 0.0f);
-            { const float* in[2] { xL.data(), xR.data() }; float* out[2] { aL.data(), aR.data() }; a.process (in, out, nch, N); }
+            { const float* in[2] { xL.data(), xR.data() }; float* out[2] { aL.data(), aR.data() }; felitronics::test::run (a.process (in, out, nch, N)); }
             // B: random small blocks
             MCN b; build (b); std::vector<float> bL, bR; Rng blk { 0x51u + (unsigned long long) it }; runMCN (b, xL, xR, nch, bL, bR, blk);
             const bool same = std::memcmp (aL.data(), bL.data(), (std::size_t) N * sizeof (float)) == 0
@@ -242,7 +242,7 @@ int main()
         std::vector<float> x ((std::size_t) N), y ((std::size_t) N, 0.0f);
         const float denorm = std::numeric_limits<float>::denorm_min();
         for (int i = 0; i < N; ++i) x[(std::size_t) i] = (i % 7 == 0) ? denorm : 0.2f * r.unit();
-        { const float* in[1] { x.data() }; float* out[1] { y.data() }; mc.process (in, out, 1, N); }   // warm past the cold fade
+        { const float* in[1] { x.data() }; float* out[1] { y.data() }; felitronics::test::run (mc.process (in, out, 1, N)); }   // warm past the cold fade
         bool finite = true; for (float v : y) if (! std::isfinite (v)) finite = false;
         test::ok (finite, "denormal-laced finite input → finite output (no denormal runaway in a pure FIR)");
 
@@ -250,18 +250,18 @@ int main()
         std::vector<float> ir (L, 0.001f); const float* bk[4] { ir.data(), ir.data(), ir.data(), ir.data() };
         MCN mf; mf.prepare (128, 131072, 128, 2); mf.setOperator (MCN::Topology::Full, bk, 4, L);
         std::vector<float> l (4096, 0.1f), rr (4096, -0.1f); const float* sin[2] { l.data(), rr.data() }; float* so[2] { l.data(), rr.data() };
-        mf.process (sin, so, 2, 4096);
-        const long before = g_allocs.load(); mf.process (sin, so, 2, 4096);
+        felitronics::test::run (mf.process (sin, so, 2, 4096));
+        const long before = g_allocs.load(); felitronics::test::run (mf.process (sin, so, 2, 4096));
         test::okNoAlloc (g_allocs.load() == before, "no heap allocation in a stress Full process()");
 
         // NaN in must not crash or hang (output may be NaN — we only require it returns + doesn't corrupt state)
         std::vector<float> xn ((std::size_t) N, 0.1f); xn[(std::size_t) 3000] = std::numeric_limits<float>::quiet_NaN();
         std::vector<float> yn ((std::size_t) N, 0.0f);
         MCN mn; mn.prepare (128, 131072, 128, 1); mn.setIr (h.data(), L);
-        { const float* in[1] { xn.data() }; float* out[1] { yn.data() }; mn.process (in, out, 1, N); }
+        { const float* in[1] { xn.data() }; float* out[1] { yn.data() }; felitronics::test::run (mn.process (in, out, 1, N)); }
         mn.reset();   // recovers cleanly
         std::vector<float> xc ((std::size_t) 2000, 0.1f), yc ((std::size_t) 2000, 0.0f);
-        { const float* in[1] { xc.data() }; float* out[1] { yc.data() }; mn.process (in, out, 1, 2000); }
+        { const float* in[1] { xc.data() }; float* out[1] { yc.data() }; felitronics::test::run (mn.process (in, out, 1, 2000)); }
         bool recovered = true; for (float v : yc) if (! std::isfinite (v)) recovered = false;
         test::ok (recovered, "reset() recovers finite output after a NaN-poisoned input (no persistent corruption)");
     }

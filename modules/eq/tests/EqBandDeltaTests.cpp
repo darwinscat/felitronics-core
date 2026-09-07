@@ -31,7 +31,7 @@ static BandParams bellPoint (double freq, double Q, double gainDb)
 static void run (EqBand& b, std::vector<float>& L, std::vector<float>& R)
 {
     float* ch[2] { L.data(), R.data() };
-    b.processBlock (ch, 2, (int) L.size());
+    felitronics::test::run (b.processBlock (ch, 2, (int) L.size()));
 }
 
 static void fillNoise (std::vector<float>& L, std::vector<float>& R, unsigned seed)

@@ -193,10 +193,23 @@ public:
         return setOperator (Topology::LRDiag, both, mono_ ? 1 : 2, len);
     }
 
-    // Audio thread. Planar in/out may alias (in-place). RT-safe, zero latency. Needs >= channels_ planes.
-    void process (const float* const* in, float* const* out, int numChannelsToProcess, int n) noexcept
+    // Audio thread. Planar in/out may alias (in-place). RT-safe, zero latency. Needs EXACTLY channels_
+    // planes — law 11(b)+(c); any other width is refused and RETURNS false.
+    [[nodiscard]] bool process (const float* const* in, float* const* out, int numChannelsToProcess, int n) noexcept
     {
-        if (! prepared_ || n <= 0 || numChannelsToProcess < channels_) return;
+        if (numChannelsToProcess < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        // The WIDTH is validated before the empty-length shortcut: `process(io, channels_ + 1, 0)` is a
+        // malformed call that happens to have nothing to do, and answering "accepted" about it would tell
+        // the caller its geometry is fine right up until the first non-empty block. Law 11's check order.
+        // LAW 11(b)+(c): the matrix width is EXACT. A NARROW call is refused because a 2x2 matrix needs
+        // BOTH input planes to compute either output — refused OBSERVABLY now, where it used to return
+        // void, so a caller that pre-zeroed `out` got DIGITAL SILENCE and no way to find out (P18 F35,
+        // measured through CabConvolver as a 9.12e-02 "leak" that was really forty unprocessed blocks
+        // and a tail). A WIDER call is refused for the ordinary reason: the planes past `channels_` have
+        // no operator to run and would have gone out DRY while the first two were convolved.
+        if (numChannelsToProcess != channels_) return false;
+        if (n == 0) return true;                                       // no samples: no time, no edge
 
         int s = state_.load (std::memory_order_acquire);
         if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE
@@ -212,8 +225,9 @@ public:
             s = 2;
         }
 
-        if (s != 2) { processRange (in, out, 0, n); return; }   // Idle → single live operator
+        if (s != 2) { processRange (in, out, 0, n); return true; }   // Idle → single live operator
         processFade (in, out, n);
+        return true;
     }
 
 private:

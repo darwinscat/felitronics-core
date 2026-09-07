@@ -38,10 +38,10 @@ static double rmsTail (const std::vector<float>& v, int from)
 
 static std::vector<float> runTone (const DP& p, double f, double amp, int N, double sr)
 {
-    DE d; d.prepare (sr, 512, 1); d.setParams (p);
+    DE d; felitronics::test::run (d.prepare (sr, 512, 1)); d.setParams (p);
     std::vector<float> y (N);
     for (int i = 0; i < N; ++i) y[i] = (float) (amp * std::sin (2.0 * core::kPi * f * i / sr));
-    for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+    for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o))); }
     return y;
 }
 
@@ -83,11 +83,11 @@ int main()
     test::group ("DeEsser idle transparent");
     {
         DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = 12.0; p.ratio = 4.0;   // never triggers
-        DE d; d.prepare (sr, 512, 1); d.setParams (p);
+        DE d; felitronics::test::run (d.prepare (sr, 512, 1)); d.setParams (p);
         unsigned long long s = 4; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 8000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.2f * rng(); y[i] = x[i]; }
-        for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o))); }
         test::ok (std::fabs (rmsTail (y, 4000) / rmsTail (x, 4000) - 1.0) < 0.05, "idle split-band = allpass reconstruction (RMS flat)");
     }
 
@@ -103,22 +103,22 @@ int main()
     // --- no allocation in process() (both modes) ---
     test::group ("DeEsser no-alloc");
     {
-        DE d; d.prepare (sr, 512, 2); DP p; p.mode = Mode::SplitBand; p.fc = 6500.0; p.thresholdDb = -20.0; d.setParams (p);
+        DE d; felitronics::test::run (d.prepare (sr, 512, 2)); DP p; p.mode = Mode::SplitBand; p.fc = 6500.0; p.thresholdDb = -20.0; d.setParams (p);
         std::vector<float> l (512, 0.3f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
-        d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512));
         const long before = g_allocs.load();
-        d.process (io, 2, 512);
-        DP dq = p; dq.mode = Mode::DynamicEq; d.setParams (dq); d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512));
+        DP dq = p; dq.mode = Mode::DynamicEq; d.setParams (dq); felitronics::test::run (d.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (split-band + dynamic-eq)");
     }
 
     // --- stereo linked: one gain, image preserved ---
     test::group ("DeEsser stereo identical");
     {
-        DE d; d.prepare (sr, 512, 2); DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = -30.0; p.ratio = 4.0; d.setParams (p);
+        DE d; felitronics::test::run (d.prepare (sr, 512, 2)); DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = -30.0; p.ratio = 4.0; d.setParams (p);
         const int N = 8000; std::vector<float> l (N), r (N);
         for (int i = 0; i < N; ++i) { const float v = (float) (0.7 * std::sin (2.0 * pi * 8000.0 * i / sr)); l[i] = v; r[i] = v; }
-        for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; d.process (io, 2, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (d.process (io, 2, std::min (512, N - o))); }
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (l[i] - r[i]));
         test::ok (md == 0.0, "identical L/R in → identical L/R out (linked detector)");
     }
@@ -126,13 +126,13 @@ int main()
     // --- toggling mode/listen mid-stream stays clean (the top worry here: stale-path state) ---
     test::group ("DeEsser mode/listen toggle continuity");
     {
-        DE d; d.prepare (sr, 512, 1); DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = -30.0; p.ratio = 4.0; d.setParams (p);
+        DE d; felitronics::test::run (d.prepare (sr, 512, 1)); DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = -30.0; p.ratio = 4.0; d.setParams (p);
         const int N = 8000; std::vector<float> y (N); for (int i = 0; i < N; ++i) y[i] = (float) (0.5 * std::sin (2.0 * pi * 8000.0 * i / sr));
         for (int o = 0; o < N; o += 512)
         {
             if (o == 2048) { DP q = p; q.mode = Mode::DynamicEq; d.setParams (q); }                 // toggle topology
             if (o == 4608) { DP q = p; q.mode = Mode::DynamicEq; q.listen = true; d.setParams (q); } // toggle listen
-            float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o));   // last block < 512 (N not a multiple)
+            float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o)));   // last block < 512 (N not a multiple)
         }
         bool bad = false; double mx = 0; for (int i = 0; i < N; ++i) { if (! std::isfinite (y[i])) bad = true; mx = std::max (mx, (double) std::fabs (y[i])); }
         test::ok (! bad && mx < 2.0, "mode/listen toggled mid-stream → no NaN, no full-scale spike");
@@ -142,12 +142,12 @@ int main()
     test::group ("DeEsser idle == Crossover2 reconstruction");
     {
         DP p; p.mode = Mode::SplitBand; p.fc = 6000.0; p.scQ = 1.0; p.thresholdDb = 12.0; p.ratio = 4.0;   // never triggers
-        DE d; d.prepare (sr, 512, 1); d.setParams (p);
+        DE d; felitronics::test::run (d.prepare (sr, 512, 1)); d.setParams (p);
         eq::Crossover2 ref; ref.prepare (sr, 1); ref.setFrequency (6000.0f);
         unsigned long long s = 6; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.2f * rng(); y[i] = x[i]; }
-        for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o))); }
         double md = 0; for (int i = 0; i < N; ++i) { float lo, hi; ref.processSample (0, x[i], lo, hi); if (i >= 1000) md = std::max (md, (double) std::fabs (y[i] - (lo + hi))); }
         test::ok (md < 1e-3, "idle split-band == Crossover2 low+high (allpass reconstruction)");
     }
@@ -174,10 +174,10 @@ int main()
         {
             DP p; p.mode = mode; p.fc = qnan; p.scQ = qnan; p.thresholdDb = qnan;
             p.ratio = qnan; p.kneeDb = qnan; p.rangeDb = qnan; p.attackMs = qnan; p.releaseMs = qnan;
-            DE d; d.prepare (sr, 512, 1); d.setParams (p);
+            DE d; felitronics::test::run (d.prepare (sr, 512, 1)); d.setParams (p);
             const int N = 4000; std::vector<float> y (N);
             for (int i = 0; i < N; ++i) y[i] = (float) (0.5 * std::sin (2.0 * pi * 8000.0 * i / sr));
-            for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+            for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o))); }
             bool fin = true; for (float v : y) fin &= (bool) std::isfinite (v);
             test::ok (fin, mode == Mode::DynamicEq ? "all-NaN params → finite output (DynamicEq mode)"
                                                    : "all-NaN params → finite output (SplitBand mode)");

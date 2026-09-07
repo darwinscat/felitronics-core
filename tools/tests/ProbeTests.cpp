@@ -175,7 +175,7 @@ int main()
         const long long n = (long long) prog[0].size();
 
         // the arithmetic the tool ran before fcore_probe.h existed
-        analysis::LoudnessMeter lm; lm.prepare (sr, nc, 4.0 * 3600.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, nc, 4.0 * 3600.0));
         std::vector<oversampling::PolyphaseOversampler> os ((std::size_t) nc);
         for (auto& o : os) o.prepare (4, 1, 32);
         std::vector<float> osbuf ((std::size_t) fcore::Probe::kChunk * 4);
@@ -184,7 +184,7 @@ int main()
         {
             const int m = (int) std::min<long long> (fcore::Probe::kChunk, n - off);
             const float* view[2] { prog[0].data() + off, prog[1].data() + off };
-            lm.process (view, nc, m);
+            felitronics::test::run (lm.process (view, nc, m));
             for (int c = 0; c < nc; ++c)
             {
                 const float* in[1] { view[c] }; float* out[1] { osbuf.data() };
@@ -616,8 +616,8 @@ int main()
         p.process (base.data(), 2, n);
         p.finish();
 
-        analysis::TruePeakMeter tpm; tpm.prepare (sr, fcore::Probe::kChunk, 2);
-        tpm.process (base.data(), 2, (int) n);
+        analysis::TruePeakMeter tpm; felitronics::test::run (tpm.prepare (sr, fcore::Probe::kChunk, 2));
+        felitronics::test::run (tpm.process (base.data(), 2, (int) n));
 
         const double a = p.truePeakDb(), b = tpm.truePeakDb();
         test::ok (std::isfinite (a) && std::isfinite (b), "both filters produced a reading");

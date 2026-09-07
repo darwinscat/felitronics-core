@@ -602,7 +602,7 @@ static std::vector<double> measuredMag (const BandParams& p, double fs, size_t& 
         for (size_t off = 0; off < n; off += 4096)
         {
             float* ch[1] = { h.data() + off };
-            band.processBlock (ch, 1, (int) std::min<size_t> (4096, n - off));
+            (void) band.processBlock (ch, 1, (int) std::min<size_t> (4096, n - off));
         }
         float peak = 0.0f, tail = 0.0f;
         for (size_t i = 0; i < n; ++i) peak = std::max (peak, std::fabs (h[i]));

@@ -333,7 +333,8 @@ public:
         // Spelled positively so NaN fails, as in Saturator (P6 F12) and TruePeakLimiter.
         if (! (std::isfinite (sampleRate) && 0.49 * sampleRate >= 10.0 && sampleRate <= 3.0e6)) return false;
         fs = sampleRate;
-        ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
+        if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING
+        ch = numChannels;
         stFreqS_.prepare (fs, smoothMs); stQS_.prepare (fs, smoothMs); stGainS_.prepare (fs, smoothMs);
         for (const Lane l : kMonoLanes)
         {
@@ -484,10 +485,15 @@ public:
 
     // Audio thread. In-place. RT-safe (no alloc / lock / IO). Normative order: ST per channel, then
     // L on ch0 / R on ch1, then the M/S delta-fold (2-channel only; mono/surround run the ST lane only).
-    void processBlock (float* const* channels, int numChannels, int numSamples) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). Geometry first, before anything moves: a malformed or too-wide
+    // call is refused whole and leaves the band exactly as it was. `numSamples` has no limit here — the
+    // band sizes no scratch by it.
+    [[nodiscard]] bool processBlock (float* const* channels, int numChannels, int numSamples) noexcept
     {
-        if (! prepared_) return;                               // a refused rate has no coefficients to run
-        const int nc = numChannels < ch ? numChannels : ch;
+        if (numChannels < 0 || numSamples < 0) return false;   // malformed — never clamped into an index
+        if (! prepared_) return false;                         // a refused rate has no coefficients to run
+        if (numChannels > ch) return false;                    // width is a LIMIT — law 11(b)
+        const int nc = numChannels;
 
         const bool stRun = laneOn (Lane::Stereo);              // ST runs on every channel (any nc)
         const bool lRun  = nc == 2 && laneOn (Lane::Left);
@@ -503,13 +509,18 @@ public:
         // branch, and dyn.on stop one just as completely. This generalises what the band already did for
         // itself when EVERY lane went idle; that case is now simply the one where no cell is left running.
         // A call carrying no samples ran nothing, so it stopped nothing — it must not move an edge.
-        // `nc > 0` is not belt-and-braces: numChannels is caller-supplied and unclamped below, so a
-        // negative width would make the half-open ranges below start at a NEGATIVE column and index
-        // bqST_[s][-1] — inside the object, where a sanitizer cannot see it. It is also the same rule as
-        // the sample count: a call that processes no channel ran nothing, so it stopped nothing.
-        if (numSamples > 0 && nc > 0) dropStoppedCells (nc, stRun, p.dyn.on);
+        // LAW 11a: the edge is clocked by `numSamples`, NOT by the width. This used to also require
+        // `nc > 0`, on the reading that "a call that processes no channel ran nothing". That reading is
+        // wrong, and it is the same defect P18 closed: a stretch of zero-width calls is a real gap in the
+        // stream, and every cell sat it out. Measured on the sibling case (Compressor, 5 ms of lookahead,
+        // 4800 zero-width samples, then stereo DIGITAL SILENCE): 0.280315 out of the silence, -11.05 dBFS,
+        // the last non-zero sample at index 239 — exactly the frozen 240-sample lookahead line replaying.
+        // The other job of the old `nc > 0` — keeping a negative width out of the half-open ranges below,
+        // which would index bqST_[s][-1] inside the object where a sanitizer cannot see it — is now done
+        // earlier and better by law 11's malformed-call refusal at the top.
+        if (numSamples > 0) dropStoppedCells (nc, stRun, p.dyn.on);
 
-        if (numSamples <= 0) return;   // no samples, no time: nothing advances and no edge moves
+        if (numSamples == 0) return true;   // no samples, no time: nothing advances and no edge moves
 
         // A MATERIAL change — type, slope, swept, on/bypass, or an active lane's design — takes effect
         // HERE, at the call boundary, exactly as it always did. It cannot wait for the next grid tick:
@@ -552,6 +563,7 @@ public:
         // quality is how soon it goes, and a 16-sample host must not start waiting 64. On a stream whose
         // state stays finite this line cannot change a bit, so the invariance claim above survives it.
         healState();
+        return true;
     }
 
 private:

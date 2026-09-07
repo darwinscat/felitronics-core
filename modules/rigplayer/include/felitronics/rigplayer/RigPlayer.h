@@ -194,16 +194,23 @@ public:
     // ---------------------------------------------------------------- message thread: setup ----
 
     // Sizes every buffer and (re)builds anything designed for a rate. Never while process() runs.
-    void prepare(double sampleRate, int maxBlock, int numChannels) {
+    // LAW 11(b): BINDING, and it used to CLAMP — `prepare(48000, 256, 4)` was accepted as a 2-channel
+    // player, after which every `process(io, 4, n)` was refused forever and the caller was told only at
+    // the second call. That is the defect the law's own text describes, in this file.
+    [[nodiscard]] bool prepare(double sampleRate, int maxBlock, int numChannels) {
+        prepared_ = false;                       // law 11(b): disarm FIRST, then validate, then write
+        if (numChannels < 1 || numChannels > kMaxChannels) return false;
+        if (maxBlock < 1) return false;
         fs_       = sampleRate > 0.0 ? sampleRate : 48000.0;
-        maxBlock_ = std::max(1, maxBlock);
-        channels_ = std::clamp(numChannels, 1, kMaxChannels);
+        maxBlock_ = maxBlock;
+        channels_ = numChannels;   // validated above — law 11(b) forbids the clamp that was here
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
         for (auto& n : nam_) n.prepare(fs_, maxBlock_);
         // Not normalised: a tone curve's broadband level is part of what the pack says, and a dry path's
         // level rides in its gain. Reference-unity RMS is for cabinets, which these are not.
-        for (auto& f : fir_) f.prepare(fs_, maxBlock_, channels_, 0.1, false);
-        dry_.prepare(fs_, maxBlock_, channels_, 0.1, false);
+        prepared_ = false;                       // a refused sub-prepare leaves the player unprepared
+        for (auto& f : fir_) if (! f.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
+        if (! dry_.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
@@ -236,6 +243,7 @@ public:
             for (int s = 0; s < 2; ++s) { rebuildCurves(s); rebuildBands(s); }
             rebuildDry();
         }
+        return true;
     }
     bool   prepared()   const { return prepared_; }
     double sampleRate() const { return fs_; }
@@ -703,12 +711,19 @@ public:
     // A host prepared for a stereo bus that plays one plane — a mono chain — used to push the silent
     // second plane through both networks as well: four WaveNet passes a block for one channel of
     // sound, and a quarter of a core gone to nothing. The convolvers still take the prepared width
-    // (the partitioned convolution no-ops when handed fewer planes), and the spare planes stay
+    // (the convolvers take the prepared width and REFUSE any other — law 11c), and the spare planes stay
     // zeroed for them; only the expensive part — the two models — shrinks to what is playing.
-    void process(float* const* io, int numChannels, int numSamples) {
-        if (! prepared_ || io == nullptr || numSamples <= 0) return;
-        const int nch = std::clamp(numChannels, 0, channels_);
-        if (nch == 0) return;
+    [[nodiscard]] bool process(float* const* io, int numChannels, int numSamples) {
+        if (numChannels < 0 || numSamples < 0) return false;         // malformed — law 11
+        if (! prepared_ || io == nullptr) return false;
+        if (numChannels > channels_) return false;                   // width is a LIMIT — law 11(b)
+        if (numSamples == 0) return true;               // law 11(d): no samples, no time, no edge
+        // `numChannels == 0` is NOT short-circuited here: it is a GAP, and the pipeline below is what
+        // makes the gap real — the per-slot lagTail_ fill on the falling edge, and the three convolvers,
+        // which run on the zeroed spare planes and go on decaying. Returning early left both slots
+        // frozen: measured 0.2317 out of DIGITAL SILENCE (-12.7 dBFS) on the return, on both slots.
+        const int nch = numChannels;
+        bool ok = true;                                              // the stages' verdicts, ANDed
 
         // A PLANE THAT STOPS PLAYING AND PLAYS AGAIN. The models run on the planes they are given, and so
         // do the per-slot alignment delay lines beside them — `for (int c = 0; c < nch; …)` below. A plane
@@ -763,7 +778,7 @@ public:
 
             // The knobs that sit BEFORE the distortion in the hardware, shaping what gets distorted.
             runBands(0, a, count);
-            if (! firBypass_[0].load(std::memory_order_acquire)) fir_[0].process(a, channels_, count);
+            if (! firBypass_[0].load(std::memory_order_acquire)) ok = fir_[0].process(a, channels_, count) && ok;
 
             // The chain's trim: past the top capture it rises with the angle, and a fast hand moves
             // tens of degrees between two events — so it is smoothed like every other gain here.
@@ -839,8 +854,8 @@ public:
             if (run[1]) for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
             if (run[0]) rampInto(a, nch, count, trims ? slotGain_[0].load(std::memory_order_acquire) : 1.0f, curSlot_[0]);
             if (run[1]) rampInto(b, nch, count, trims ? slotGain_[1].load(std::memory_order_acquire) : 1.0f, curSlot_[1]);
-            if (run[0]) nam_[0].process(a, nch, count, norm);
-            if (run[1]) nam_[1].process(b, nch, count, norm);
+            if (run[0]) ok = nam_[0].process(a, nch, count, norm) && ok;
+            if (run[1]) ok = nam_[1].process(b, nch, count, norm) && ok;
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
             // Each slot carries its own history per channel, advanced every block including at zero.
             for (int c = 0; c < nch; ++c) {
@@ -861,12 +876,12 @@ public:
 
             // The knobs AFTER the distortion, shaping what came out.
             runBands(1, a, count);
-            if (! firBypass_[1].load(std::memory_order_acquire)) fir_[1].process(a, channels_, count);
+            if (! firBypass_[1].load(std::memory_order_acquire)) ok = fir_[1].process(a, channels_, count) && ok;
 
             // The blend, as the hardware sums it: the dry path through its own response, then the two
             // gains the pack states for this position.
             if (mixDry) {
-                if (! dryFirBypass_.load(std::memory_order_acquire)) dry_.process(d, channels_, count);
+                if (! dryFirBypass_.load(std::memory_order_acquire)) ok = dry_.process(d, channels_, count) && ok;
                 const float wantDry = dryGain_.load(std::memory_order_acquire);
                 const float wantWet = wetGain_.load(std::memory_order_acquire);
                 const float decay   = std::exp(-(float) count / (float) (0.010 * fs_));
@@ -892,6 +907,7 @@ public:
             rampInto(a, nch, count, outGain_.load(std::memory_order_acquire), curOut_);
             done += count;
         }
+        return ok;
     }
 
 private:

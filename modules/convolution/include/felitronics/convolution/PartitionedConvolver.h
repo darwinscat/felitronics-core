@@ -98,9 +98,13 @@ public:
     }
 
     // Audio thread. out[n] = (in * IR)[n] (causal linear convolution). RT-safe.
-    void process (const float* in, float* out, int n) noexcept
+    // Law 11: a block-level entry point returns its verdict, mono or not. This one has no channel
+    // axis, so its whole rejected domain is `n < 0` and "never prepared" — but a caller that
+    // never prepared it was reading an empty state, and now hears about it at the call site.
+    [[nodiscard]] bool process (const float* in, float* out, int n) noexcept
     {
-        if (! prepared_) return;                              // unprepared: frame_/pendingTail_ empty
+        if (n < 0) return false;
+        if (! prepared_) return false;                              // unprepared: frame_/pendingTail_ empty
         for (int s = 0; s < n; ++s)
         {
             frame_[(std::size_t) (P_ + phase_)] = in[s];
@@ -114,6 +118,7 @@ public:
 
             if (++phase_ == P_) { phase_ = 0; processChunk(); }
         }
+        return true;
     }
 
 private:

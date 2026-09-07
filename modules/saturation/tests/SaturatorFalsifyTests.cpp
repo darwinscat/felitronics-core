@@ -60,7 +60,7 @@ int main()
         ok (s.prepare (48000.0, 16, 1, 1), "prepare os=1");
         s.setParams (p);
         float* io[1] { x.data() };
-        s.process (io, 1, (int) x.size());
+        felitronics::test::run (s.process (io, 1, (int) x.size()));
         ok (equalBits (x, want), "gate maps [NaN,Inf,-Inf,2e6,-3e6,5e5,0,-0] by sanitize-then-clamp");
     }
 
@@ -82,7 +82,7 @@ int main()
         Sat a, b;
         ok (a.prepare (48000.0, 257, 1, 4) && b.prepare (48000.0, 257, 1, 4), "prepare stateful saturators");
         a.setParams (p); b.setParams (p);
-        { float* io[1] { one.data() }; a.process (io, 1, (int) one.size()); }
+        { float* io[1] { one.data() }; felitronics::test::run (a.process (io, 1, (int) one.size())); }
         int pos = 0;
         const int chunks[] { 1, 64, 3, 257, 19, 128, 2, 511 };
         int ci = 0;
@@ -91,11 +91,11 @@ int main()
             if ((ci % 5) == 0)
             {
                 float* z[1] { split.data() + pos };
-                b.process (z, 1, 0);
+                felitronics::test::run (b.process (z, 1, 0));
             }
             const int n = std::min (chunks[ci++ % 8], (int) split.size() - pos);
             float* io[1] { split.data() + pos };
-            b.process (io, 1, n);
+            felitronics::test::run (b.process (io, 1, n));
             pos += n;
         }
         ok (equalBits (one, split), "Asym/DC/dry-delay state is associative across hostile chunks");
@@ -111,7 +111,7 @@ int main()
         ok (s.prepare (48000.0, 16, 1, 1), "prepare os=1");
         s.setParams (p);
         float* io[1] { x.data() };
-        s.process (io, 1, (int) x.size());
+        felitronics::test::run (s.process (io, 1, (int) x.size()));
         ok (equalBits (x, want), "finite in-range values pass through the gate bit-identically");
     }
 
@@ -131,7 +131,7 @@ int main()
         s.setParams (p);
         std::vector<float> a (64, 0.3f);
         float* io[1] { a.data() };
-        s.process (io, 1, 64);
+        ok (! s.process (io, 1, 64), "an unprepared stage REFUSES the call (law 11)");
         bool finite = true;
         for (float v : a) finite &= (bool) std::isfinite (v);
         ok (finite, "...and the unprepared stage emits nothing non-finite");
@@ -144,7 +144,7 @@ int main()
         std::vector<float> a { 1.0f, -2.0f, 3.0f };
         const auto before = a;
         float* io[1] { a.data() };
-        s.process (io, 1, (int) a.size());
+        ok (! s.process (io, 1, (int) a.size()), "process after a failed prepare is REFUSED (law 11)");
         ok (equalBits (a, before), "process after failed prepare leaves caller buffer untouched");
     }
 

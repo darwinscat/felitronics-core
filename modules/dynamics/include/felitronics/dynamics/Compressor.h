@@ -235,45 +235,56 @@ public:
     bool   isPrepared()      const noexcept { return prepared_; }
 
     // Audio thread, in place, self-keyed (the detector reads the programme). RT-safe.
-    void process (float* const* channels, int numChannels, int numSamples) noexcept
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples) noexcept
     {
-        process (channels, numChannels, numSamples, nullptr, 0, GainReductionTap {});
+        return process (channels, numChannels, numSamples, nullptr, 0, GainReductionTap {});
     }
 
     // Self-keyed, with the per-sample gain reduction tapped out. NB this IS a four-argument form, and
     // the one the key deliberately does not have — because `GainReductionTap` is a named type carrying
     // its own capacity, so the shape that made a bare `const float*` key dangerous (a pointer whose
     // extent only the caller knows) does not arise. RT-safe.
-    void process (float* const* channels, int numChannels, int numSamples, GainReductionTap gr) noexcept
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples, GainReductionTap gr) noexcept
     {
-        process (channels, numChannels, numSamples, nullptr, 0, gr);
+        return process (channels, numChannels, numSamples, nullptr, 0, gr);
     }
 
     // Audio thread, in place, with an EXTERNAL KEY — read the header note above for the time-base and
     // channel-count contract. `key == nullptr` or `numKeyChannels <= 0` means self-keyed. RT-safe.
-    void process (float* const* channels, int numChannels, int numSamples,
-                  const float* const* key, int numKeyChannels) noexcept
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples,
+                                const float* const* key, int numKeyChannels) noexcept
     {
-        process (channels, numChannels, numSamples, key, numKeyChannels, GainReductionTap {});
+        return process (channels, numChannels, numSamples, key, numKeyChannels, GainReductionTap {});
     }
 
     // The full form: external key AND the per-sample gain reduction. `gr.data == nullptr` is off; a
     // non-null tap with `gr.capacity < numSamples` REFUSES the whole call, leaving audio, state and
     // the tap buffer untouched. RT-safe.
-    void process (float* const* channels, int numChannels, int numSamples,
-                  const float* const* key, int numKeyChannels, GainReductionTap gr) noexcept
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples,
+                                const float* const* key, int numKeyChannels, GainReductionTap gr) noexcept
     {
-        if (! prepared_ || numChannels <= 0 || numSamples <= 0) return;
-        if (numChannels > maxCh) return;                       // refuse — see "MORE CHANNELS THAN PREPARED"
+        if (numChannels < 0 || numSamples < 0) return false;   // malformed
+        if (! prepared_) return false;
+        if (numChannels > maxCh) return false;                 // refuse — see "MORE CHANNELS THAN PREPARED"
         // Checked BEFORE anything moves, so a refused call is indistinguishable from one never made.
-        if (gr.data != nullptr && gr.capacity < numSamples) return;
+        if (gr.data != nullptr && gr.capacity < numSamples) return false;
+        if (numSamples == 0) return true;                      // no samples: no time, no edge, nothing
         const int nc = numChannels;
 
         // A channel that sat out blocks holds `lookSamples` of audio from before it left. Zero only
         // those lines; the shared detector and gain reduction are still tracking a real signal.
+        //
+        // LAW 11a: a channel that STOPPED is one at index >= nc on a call that carried samples — the
+        // width alone does not say it, the sample count does. Only the widening half used to be handled
+        // here, so a stretch of narrower (or zero-width) calls left the departed lanes' lookahead lines
+        // FROZEN and they replayed on return: measured, 5 ms of lookahead, a tone, 4800 samples of
+        // zero-width calls, then stereo DIGITAL SILENCE -> 0.280315 out of the silence (-11.05 dBFS),
+        // last non-zero at sample 239, i.e. the whole 240-sample line, note for note.
+        for (int c = nc; c < lastNc_; ++c) delays[(std::size_t) c].reset();
         if (lastNc_ > 0 && nc > lastNc_)
             for (int c = lastNc_; c < nc; ++c) delays[(std::size_t) c].reset();
         lastNc_ = nc;
+        if (nc == 0) return true;                              // law 11(d): time and the edge, but no audio
 
         const float* const* detCh = key;
         int                 detNc = numKeyChannels;
@@ -302,6 +313,7 @@ public:
         }
 
         path.flushDenormals();
+        return true;
     }
 
 private:

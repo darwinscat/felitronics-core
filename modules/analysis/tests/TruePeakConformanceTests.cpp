@@ -63,14 +63,14 @@ namespace
         synthesize (c, sr, kSeconds, ch);
 
         analysis::TruePeakMeter m;
-        m.prepare (sr, 1024, 2);
+        felitronics::test::run (m.prepare (sr, 1024, 2));
 
         const long long n = (long long) ch.size();
         for (long long off = 0; off < n; off += 1024)
         {
             const int len = (int) std::min<long long> (1024, n - off);
             const float* view[2] { ch.data() + off, ch.data() + off };
-            m.process (view, 2, len);
+            felitronics::test::run (m.process (view, 2, len));
         }
         return { m.truePeakDb(), m.samplePeakDb(), m.oversampleFactor() };
     }
@@ -150,16 +150,16 @@ int main()
         for (float& v : quiet) v *= 0.1f;                       // -20 dB exactly
 
         analysis::TruePeakMeter m;
-        m.prepare (48000.0, 1024, 2);
+        felitronics::test::run (m.prepare (48000.0, 1024, 2));
         const float* io[2] { loud.data(), loud.data() };
-        m.process (io, 2, (int) loud.size());
+        felitronics::test::run (m.process (io, 2, (int) loud.size()));
         const double first = m.truePeakDb();
 
         m.reset();
         test::ok (m.truePeakDb() < -100.0, "immediately after reset() the meter reads nothing, not the old max");
 
         const float* io2[2] { quiet.data(), quiet.data() };
-        m.process (io2, 2, (int) quiet.size());
+        felitronics::test::run (m.process (io2, 2, (int) quiet.size()));
         test::approx (m.truePeakDb(), first - 20.0, 1.0e-3, "the quieter pass reads exactly 20 dB down");
     }
 
@@ -183,10 +183,10 @@ int main()
         std::vector<float> ch;
         synthesize (c, 48000.0, kSeconds, ch);
         analysis::TruePeakMeter m;
-        m.prepare (48000.0, 1024, 2);
+        felitronics::test::run (m.prepare (48000.0, 1024, 2));
         const float* io[2] { ch.data(), ch.data() };
         const long before = g_allocs.load (std::memory_order_relaxed);
-        m.process (io, 2, (int) ch.size());
+        felitronics::test::run (m.process (io, 2, (int) ch.size()));
         // Snapshot the verdict BEFORE calling the harness: okNoAlloc takes a std::string, whose temporary is
         // long enough to heap-allocate, and the order in which the two arguments are evaluated is
         // unspecified. Reading the counter inside the call is a coin flip on the compiler.

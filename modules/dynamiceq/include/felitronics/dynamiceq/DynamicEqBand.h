@@ -53,17 +53,23 @@ struct DynamicEqBandParams
 class DynamicEqBand
 {
 public:
-    void prepare (double sampleRate, int maxChannels) noexcept
+    [[nodiscard]] bool prepare (double sampleRate, int maxChannels) noexcept
     {
+        prepared_ = false;                                        // any early return below leaves it unprepared
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
-        channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        channels_ = maxChannels;
         side_.prepare (fs_, channels_);
         audio_.prepare (fs_, channels_);
         env_.prepare (fs_);
         gr_.prepare (fs_);
         apply (params_);
         reset();
+        prepared_ = true;
+        return true;
     }
+
+    bool isPrepared() const noexcept { return prepared_; }
 
     void reset() noexcept
     {
@@ -76,11 +82,16 @@ public:
     static constexpr int latencySamples() noexcept { return 0; }
     double dynamicDeltaDb() const noexcept { return curGainDb_ - params_.staticGainDb; }   // for metering
 
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2).
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        const int nc = std::min (numChannels, channels_);
-        if (nc <= 0 || n <= 0) return;
-        dropStoppedChannels (nc);
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > channels_) return false;                // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                                  // no samples: no time, no edge
+        const int nc = numChannels;
+        dropStoppedChannels (nc);                                 // law 11(d): the edge is clocked by n
+        if (nc == 0) return true;
         for (int i = 0; i < n; ++i)
         {
             // detector: per-channel sidechain BandPass → one linked level
@@ -107,6 +118,7 @@ public:
             for (int c = 0; c < nc; ++c) io[c][i] = audio_.processSample (c, io[c][i]);
         }
         env_.flushDenormals(); gr_.flushDenormals(); side_.flushDenormals(); audio_.flushDenormals();
+        return true;
     }
 
 private:
@@ -151,6 +163,7 @@ private:
 
     double fs_ = 48000.0;
     int channels_ = 2;
+    bool prepared_ = false;                                       // true only after a prepare() that succeeded
     DynamicEqBandParams params_;
 
     eq::Svf side_, audio_;                       // sidechain BandPass · audio Bell/shelf

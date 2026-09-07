@@ -231,6 +231,136 @@ the CPU at runtime, invisible to any build. Full write-up:
    its own two gates. Law 8 remains the odd one out: a denormal stall is a property of the CPU at
    runtime and no build can see it.)
 
+11. **THE CALL IS A REQUEST AGAINST A PREPARED CAPACITY, AND A REQUEST THAT CANNOT BE HONOURED IN FULL
+   IS REFUSED AS A WHOLE — `[[nodiscard]] bool process(...)`.** `prepare(sampleRate, maxBlock,
+   maxChannels)` states what the object was built for; every argument it takes is binding, and a module
+   that ignores one is lying about its contract. What a caller may then hand `process()` split into four
+   questions, and the core used to answer each of them four different ways — the census that opened this
+   law found **three answers for the width, four for the length, and a case that fits none of them**:
+
+   **(a) THE LENGTH `n` IS A CAPACITY, NOT A LIMIT.** `maxBlock` sizes scratch. `process()` chunks
+   internally, so any `n >= 0` is processed IN FULL, and the chunked pass is **bit-identical to the
+   caller having chunked it itself AT THE SAME BOUNDARIES** — that is the invariant, and it is what makes
+   the rule testable. (It is deliberately not "bit-identical under arbitrary re-slicing": that is law 8a's
+   claim, it is owned by the grid, and a rate-matched stage such as `nam::NamStage` cannot make it at all.)
+   Never truncate the tail, never refuse a long call. *(An offline caller sizing `maxBlock` to a whole
+   file is a normal thing to do — `Compressor`, `EqEngine`, `Dither` and `TruePeakLimiter` all invite one
+   in their headers — and refusing it would return the buffer UNTOUCHED, i.e. exactly the
+   unlimited-passthrough defect the refusal was meant to prevent.)* Measured before this law:
+   `dynamics::NoiseGate` clamped `n` to its curve and let **3840 of 4096** samples out **+89.99 dB**
+   louder than the gated ones — 100 % of the construction ceiling, which is `-floorDb` = 90 dB;
+   `nam::NamStage` clamped `n` to `maxBlock` and let **448 of 512** samples bypass the amp model
+   BIT-IDENTICAL to its input; `multiband::MultibandProcessor` dropped the **entire** call.
+   **The one exception is a two-phase API whose first phase RETURNS a buffer of `maxBlock`**
+   (`NoiseGate::analyse`/`applyGain`, `EqEngine::captureSectionInput`): it cannot chunk, because the
+   result must outlive the call. Those refuse — observably — and their fused convenience form chunks.
+   **PHASE A OWNS THE CLOCK, PHASE B OWNS NOTHING.** The two phases describe ONE block of audio time, so
+   only the first may spend it; a phase B that also advanced would count the same samples twice. And
+   phase A owes a LENGTH as well as a buffer — what it actually produced — because phase B bounded by
+   the buffer's capacity instead applies a curve from a previous call
+   (`NoiseGate::analysedSamples()`, `EqEngine::sectionInputSamples()`).
+
+   **(b) THE WIDTH `nch` IS A LIMIT.** State for a channel that was never prepared cannot be invented,
+   so `nch > maxChannels` is refused **as a whole call, before anything moves** — the refused call is
+   indistinguishable from one never made. Never a prefix. A prefix is not the safer half-measure it
+   looks like: the surplus channels are unprocessed either way, and processing some of them only hides
+   the fault while the processed ones acquire a latency and a gain the others do not — a level and comb
+   mismatch on fold-down. Measured: `limiter::TruePeakLimiter` prepared for 2 and called with 4 emitted
+   the surplus at **+7.02 dB over the ceiling it was told to hold** (unbounded in general — it is the
+   caller's own input, untouched); `saturation::Saturator`'s surplus came out **bit-identical to the
+   input**, with no saturation at all.
+
+   **(c) A NARROWER CALL IS LEGAL.** `nch < maxChannels` is a supported mode, not an error: it means
+   those channels are playing and the rest stopped, and law 11a below says what happens to the state of
+   the ones that stopped. A module for which a narrow call is *meaningless* — a matrix convolution needs
+   both input planes to compute either output; a stereo stage needs two — refuses it, says so in its
+   header, and the refusal is **returned**. Silence is not a refusal: `convolution::MatrixConvolverNupc`
+   used to drop a narrow call and write nothing at all, so a caller that pre-zeroed its output buffer
+   got digital silence and no way to find out. **A module whose width is EXACT refuses `nch == 0` too,
+   and its gap is `reset()`, not a zero-width call** — the clock-only form of 11(d) is not expressible
+   for an operator that needs its planes. A composite therefore does not forward a gap to such a
+   module: `lineareq::LinearPhaseEq`, `NaturalPhaseEq`, both matrix convolvers and
+   `mastering::MasteringChain` are the list.
+
+   **(d) FOR AN ACCEPTED CALL, `n > 0` IS THE TRIGGER FOR BOTH CLOCKS: AUDIO TIME *AND* THE FALLING
+   EDGE.** "Accepted" is not decoration: a REFUSED call moves nothing at all, the clock included, so the
+   checks of (b) and (c) come first and this clause never applies to a call that failed them. Where a
+   width is EXACT (the matrix convolvers) a zero-width call is a refusal, not a clock-only call, and the
+   width check settles it before `n == 0` is even looked at. A call carrying
+   samples spent that many samples of audio time whether or not any channel was processed, so the law-8a
+   grid ADVANCES — `nch == 0, n > 0` is a **clock-only** call, exactly what `stereo::MonoBass` already
+   does in bypass (`grid_.skip(n)`). Measured before this law, on the same band and the same stream:
+   `eq::EqBand::processBlock(io, 0, N)` advanced its grid and `eq::EqEngine::process(io, 0, N)` dropped
+   the call, and after 10240 samples of zero-width calls their glides had diverged by **11.08 dB**.
+   **And by the same token every channel at index >= `nch` STOPPED for those samples** — at `nch == 0`,
+   all of them — so law 11a's falling edge fires too. These two halves are not independent: saying "time
+   passed" and "nobody stopped" in one breath is a contradiction, and it reopens the exact defect P18
+   closed. Measured on untouched `main`: `Compressor` prepared for 2 with 5 ms of lookahead, a tone, then
+   4800 samples of zero-width calls, then stereo DIGITAL SILENCE — **0.280315 out of the silence
+   (-11.05 dBFS), last non-zero at sample 239**, i.e. exactly the 240-sample lookahead line replaying
+   audio from before the gap. `n == 0` is the only true no-op: no time, no edge, nothing.
+   Negative `n` or `nch` is a malformed call: refused, never clamped into an index.
+
+   **The verdict is RETURNED, because a `void` refusal is the disease this law exists to cure.** Every
+   block-level `process()` is `[[nodiscard]] bool`; `true` means "this call was accepted and honoured in
+   full". A compile-time diagnostic at the call site is the strongest signal available inside a
+   `noexcept` function that may not allocate, lock or throw, it costs nothing at runtime, and it is
+   already this repository's idiom for a refusal — `prepare()` has been `[[nodiscard]] bool` since P2.
+   `bool` rather than a status enum on purpose: the reason is always visible at the call site (the caller
+   knows what it passed), a second refusal idiom for the same concept is how a core ends up with four
+   policies again, and `bool` composes — a composite ANDs its stages' verdicts the way `prepare()`
+   already does. **Order of the checks is part of the law**, so that one malformed call has one answer:
+   malformed (`n < 0 || nch < 0`) → unprepared → `nch > maxChannels` → `n == 0` → `nch == 0` → run.
+
+   **11a. THE FALLING EDGE IS CLOCKED BY `n`, NOT BY `nch`.** P18 gave a channel that stops being fed
+   the rule: drop its sample memory, or it replays it on return. What it left ambiguous is when a channel
+   counts as having stopped, and `eq::EqBand` answered "only on a call that ran at least one channel"
+   (`numSamples > 0 && nc > 0`). That half is wrong, and the number above is what it costs: a stretch of
+   zero-width calls is a real gap in the stream, and a stage that treats it as "nothing happened" hands
+   the gap's far side a frozen delay line. **A channel stopped for this call iff `n > 0` and its index is
+   >= `nch`.** The `nc > 0` guard survives only in its other job — keeping a negative width out of a
+   half-open range — and law 11's malformed-call refusal now does that job earlier and better.
+
+   **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
+   `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`
+   silently clamped `prepare(..., 4)` to 2, after which `process(io, 4, n)` was a perfectly legal call
+   that left planes 2-3 DRY, and fifteen more modules clamped the same way. Every argument `prepare()`
+   takes is binding; a value it cannot honour is refused there, the way `Compressor` and
+   `TruePeakLimiter` already do — which is what makes law 11(b) reachable at all. And "the defaults are
+   a valid configuration" is a claim to CHECK, not to assume: `stereo::MonoBass` looked like one and is
+   not — its crossover has no coefficients until `prepare()` runs, so a default-constructed object
+   passes the side band it is supposed to fold at **-6.02 dB where a prepared one kills it to -54.22**.
+
+   **A REFUSED `prepare()` ADOPTS NOTHING AND LEAVES THE OBJECT UNUSABLE — IN THAT ORDER: DISARM,
+   VALIDATE, WRITE.** Read literally, "writes nothing" and "leaves it unprepared" contradict each other,
+   because disarming is itself a write; the order is what reconciles them, and getting it wrong costs a
+   defect in either direction. Validate-then-disarm leaves the PREVIOUS preparation standing and still
+   answering `process()`; write-then-validate leaves an UNVALIDATED argument in place. So: clear the
+   readiness flag on entry, validate every argument, and only then store any of them. Both halves are
+   load-bearing, and both were got wrong three times each while this law was being applied. Validating one
+   argument, storing it, and then refusing on the next leaves a new WIDTH standing beside an old buffer:
+   in `mastering::OfflineRenderer` that was a **heap-buffer-overflow**, a write past the scratch region,
+   which ASan caught only because a consilium seat went looking for it. And a refusal that returns
+   before reaching the inner `prepare()` leaves the object ARMED on its previous build — measured on
+   `multiband::MultibandCompressor`: `prepare(2)`, then a refused `prepare(0)`, then `process(io, 2, 64)`
+   still returned true and still processed.
+
+   **11c. WHAT LAW 11 DOES NOT YET SAY: THE SHARED DETECTOR ON A CLOCK-ONLY CALL.** 11(d) settles the
+   grid and the per-channel falling edge. It does not settle what a stage's SHARED, one-per-instance
+   ballistics do while `nch == 0` — and the core gives **three different answers today**, which is the
+   argument for deciding it rather than leaving it: **freeze** (`Compressor`, `DeEsser`, `DynamicEqBand`,
+   `TransientShaper`, `NoiseGate`), **reset everything** (`limiter::TruePeakLimiter`, whose
+   `nc != lastNc_` guard now reaches `nc == 0` and clears the whole state — measured, gain reduction
+   -5.08 dB to 0.00 and a 48-sample hole on the return), and **disengage** (`dynamiceq::LaneDynamics`,
+   which drops its detectors deliberately). The freeze case: Measured: `dynamics::Compressor` holding
+   **-16.71 dB of gain reduction through a full second of zero-width calls**, then dipping the return by
+   **-16.62 dB** on material that arrives below its threshold; the same shape sits in `DeEsser`,
+   `DynamicEqBand`, `TransientShaper` and `NoiseGate`. Two answers are defensible — run the detector on
+   the silence that audio time says went by, or treat "every channel stopped" as a reset — and they
+   differ audibly, so this is a product decision and not a bug to be patched quietly. **Recorded here
+   rather than guessed**; the address is `dynamics::Compressor::process` and its four siblings.
+
+
 **These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the
 difference is worth reading rather than assuming. Today: a
 no-allocation test on the paths that install an allocation counter, a compile-only `-fno-exceptions` /

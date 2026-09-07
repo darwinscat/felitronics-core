@@ -37,7 +37,7 @@ static double peakDelta (double fs, double levelDb, double freq, double Q, doubl
     const eq::BandParams p = dynBell (freq, Q, rangeDb);
     band.setParams (p);
 
-    dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+    dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
     const int block = 64, n = (int) (fs * sec);
     std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
@@ -55,7 +55,7 @@ static double peakDelta (double fs, double levelDb, double freq, double Q, doubl
         }
         float* aud[2] { L.data(), R.data() };
         const float* sc[2] { sl.data(), sr.data() };
-        dyn.processBand (aud, sc, 2, block, band);
+        felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
         if (t_elapsed (done, fs) > 3.0)                              // let the estimator settle first
             deepest = std::fmin (deepest, dyn.deltaDb (eq::Lane::Stereo));
     }
@@ -72,7 +72,7 @@ static double settledDelta (double fs, double levelDb, double freq, double Q, do
     const eq::BandParams p = dynBell (freq, Q, rangeDb);
     band.setParams (p);
 
-    dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+    dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
     const int block = 64, n = (int) (fs * sec);
     std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
@@ -87,7 +87,7 @@ static double settledDelta (double fs, double levelDb, double freq, double Q, do
         }
         float* aud[2] { L.data(), R.data() };
         const float* sc[2] { sl.data(), sr.data() };
-        dyn.processBand (aud, sc, 2, block, band);
+        felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
     }
     return dyn.deltaDb (eq::Lane::Stereo);
 }
@@ -133,13 +133,13 @@ int main()
 
         eq::EqBand ref; ref.prepare (fs, 2); ref.setParams (p);
         float* r[2] { aL.data(), aR.data() };
-        ref.processBlock (r, 2, n);
+        felitronics::test::run (ref.processBlock (r, 2, n));
 
         eq::EqBand dut; dut.prepare (fs, 2); dut.setParams (p);
-        dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+        dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
         float* d[2] { bL.data(), bR.data() };
         const float* sc[2] { bL.data(), bR.data() };
-        dyn.processBand (d, sc, 2, n, dut);
+        felitronics::test::run (dyn.processBand (d, sc, 2, n, dut));
 
         bool identical = true;
         for (int i = 0; i < n; ++i) identical = identical && (aL[(size_t) i] == bL[(size_t) i]);
@@ -154,7 +154,7 @@ int main()
     {
         eq::BandParams p = dynBell (3000.0, 4.0, +12.0);      // positive range: lift when loud
         eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-        dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+        dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
         const int block = 64;
         std::vector<float> L ((size_t) block), R ((size_t) block);
@@ -170,7 +170,7 @@ int main()
                 }
                 float* aud[2] { L.data(), R.data() };
                 const float* sc[2] { L.data(), R.data() };
-                dyn.processBand (aud, sc, 2, block, band);
+                felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
             }
         };
         feed (core::dbToGain (-20.0), 5.0);       // programme: the estimator learns -20
@@ -197,7 +197,7 @@ int main()
         {
             eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
             eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+            dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
             std::vector<float> L ((size_t) block), R ((size_t) block);
             long phase = 0;
@@ -213,7 +213,7 @@ int main()
                     }
                     float* aud[2] { L.data(), R.data() };
                     const float* sc[2] { L.data(), R.data() };
-                    dyn.processBand (aud, sc, 2, block, band);
+                    felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
                     if (timed && dyn.deltaDb (eq::Lane::Stereo) <= -3.0)
                         return 1.0e3 * (double) (done + block) / fs;   // end of the chunk that got there
                 }
@@ -246,7 +246,7 @@ int main()
             p.dyn.on = true; p.dyn.rangeDb = -12.0;
 
             eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+            dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
             const int block = 64;
             std::vector<float> L ((size_t) block), R ((size_t) block);
@@ -267,7 +267,7 @@ int main()
                 }
                 float* aud[2] { L.data(), R.data() };
                 const float* sc[2] { L.data(), R.data() };
-                dyn.processBand (aud, sc, 2, block, band);
+                felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
                 if ((double) done / fs > 3.0) deepest = std::fmin (deepest, dyn.deltaDb (lane));
             }
             return deepest;
@@ -295,7 +295,7 @@ int main()
             eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
             p.lane (eq::Lane::Stereo).gainDb = staticGainDb;
             eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+            dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
             const int block = 64;
             std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
@@ -314,7 +314,7 @@ int main()
                 }
                 float* aud[2] { L.data(), R.data() };
                 const float* sc[2] { sl.data(), sr.data() };
-                dyn.processBand (aud, sc, 2, block, band);
+                felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
                 if ((double) done / fs > 3.0) deepest = std::fmin (deepest, dyn.deltaDb (eq::Lane::Stereo));
             }
             return deepest;
@@ -340,7 +340,7 @@ int main()
             p.dyn.thrAuto = ! absolute;
             p.dyn.thrDb   = -50.0;                 // well under the bursts, well over the gaps
             eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+            dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
             const int block = 64;
             std::vector<float> L ((size_t) block), R ((size_t) block);
@@ -358,7 +358,7 @@ int main()
                 }
                 float* aud[2] { L.data(), R.data() };
                 const float* sc[2] { L.data(), R.data() };
-                dyn.processBand (aud, sc, 2, block, band);
+                felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
                 if ((double) done / fs > 3.0) d = std::fmin (d, dyn.deltaDb (eq::Lane::Stereo));
             }
             return d;
@@ -385,7 +385,7 @@ int main()
         {
             eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
             eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-            dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+            dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
             const int block = 64;
             std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
@@ -402,7 +402,7 @@ int main()
                     }
                     float* aud[2] { L.data(), R.data() };
                     const float* sc[2] { sl.data(), sr.data() };
-                    dyn.processBand (aud, sc, 2, block, band);
+                    felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
                 }
             };
             feed (-30.0, 6.0);                       // learn
@@ -438,7 +438,7 @@ int main()
     {
         eq::BandParams p = dynBell (3000.0, 4.0, -12.0);
         eq::EqBand band; band.prepare (fs, 2); band.setParams (p);
-        dynamiceq::LaneDynamics dyn; dyn.prepare (fs, 2); dyn.setParams (p);
+        dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (fs, 2)); dyn.setParams (p);
 
         const int block = 64;
         std::vector<float> L ((size_t) block), R ((size_t) block), sl ((size_t) block), sr ((size_t) block);
@@ -457,7 +457,7 @@ int main()
             }
             float* aud[2] { L.data(), R.data() };
             const float* sc[2] { sl.data(), sr.data() };
-            dyn.processBand (aud, sc, 2, block, band);
+            felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
             if ((double) done / fs > 3.0) deepest = std::fmin (deepest, dyn.deltaDb (eq::Lane::Stereo));
         }
         test::ok (deepest < -1.0, "events present only in the sidechain still drive the band");

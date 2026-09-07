@@ -52,7 +52,8 @@ public:
         // before allocating the scratch buffer. Spelled positively so NaN fails.
         if (! (std::isfinite (sampleRate) && 0.49 * sampleRate >= 10.0 && sampleRate <= 3.0e6)) return false;
         fs = sampleRate;
-        ch = numChannels < 1 ? 1 : (numChannels > kMaxChannels ? kMaxChannels : numChannels);
+        if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING — a width
+        ch = numChannels;                                                  // it clamped was a width it lied about
         maxBlock_ = maxBlock > 0 ? maxBlock : 0;
         // Sidechain scratch: the SECTION INPUT, preserved before any band touches the signal. A
         // dynamics layer must detect on this and not on a band's own input — in a series chain that
@@ -78,9 +79,21 @@ public:
     // gets nullptr must skip its dynamics rather than detect on the wrong signal.
     const float* const* captureSectionInput (const float* const* channels, int numChannels, int numSamples) noexcept
     {
-        if (! prepared_) { scValid_ = 0; return nullptr; }
-        const int nc = numChannels < ch ? numChannels : ch;
-        if (nc <= 0 || numSamples <= 0 || numSamples > maxBlock_ || scratch_.empty()) { scValid_ = scNc_ = 0; return nullptr; }
+        // LAW 11: this is the second two-phase API the law names, and it owes the same two things as
+        // NoiseGate::analyse. (1) The WIDTH is a limit, not a clamp: a capture wider than the prepared
+        // engine used to be silently narrowed, so a consumer asking for 3 planes got 2 and no word of
+        // it. (2) A REFUSED capture must be inert — clobbering `scValid_` on refusal destroyed a
+        // capture the previous call had legitimately produced (measured: a valid length of 32 became 0
+        // when a 65-sample capture was refused against a 64-sample capacity).
+        if (! prepared_) return nullptr;
+        if (numChannels < 0 || numSamples < 0) return nullptr;
+        if (numChannels > ch || numSamples > maxBlock_ || scratch_.empty()) return nullptr;
+        // `n == 0` is the ONE true no-op — the same clause this branch's sibling (NoiseGate::analyse)
+        // was corrected for in this very change. Zeroing the bookkeeping here destroyed a capture the
+        // previous call had legitimately produced: a valid 32 became 0.
+        if (numSamples == 0) return nullptr;
+        const int nc = numChannels;
+        if (nc == 0) { scValid_ = scNc_ = 0; return nullptr; }   // a real, EMPTY capture: no columns
         for (int c = 0; c < nc; ++c)
         {
             scPtr_[c] = scratch_.data() + (std::size_t) c * (std::size_t) maxBlock_;   // a capture wider than
@@ -141,16 +154,26 @@ public:
     void setSpectrumActive (bool active) noexcept { spectrumOn.store (active, std::memory_order_relaxed); }
 
     // Audio thread. In-place over `numChannels` planar buffers of `numSamples`.
-    void process (float* const* channels, int numChannels, int numSamples) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). The engine used to drop a zero-width call outright while the very
+    // same band, driven directly, advanced its audio-time grid — so one EqBand behaved two ways depending
+    // on which side of this method it was called from. Measured on one 500 -> 4000 Hz glide and 10240
+    // samples of (nch = 0) calls: the two had diverged by 11.08 dB. The bands are now always driven,
+    // because a call carrying samples spent that much audio time whoever was listening.
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples) noexcept
     {
-        if (! prepared_) return;                        // a refused configuration has nothing to run
-        const int nc = numChannels < ch ? numChannels : ch;
-        if (nc <= 0 || numSamples <= 0) return;
+        if (numChannels < 0 || numSamples < 0) return false;   // malformed
+        if (! prepared_) return false;                         // a refused configuration has nothing to run
+        if (numChannels > ch) return false;                    // width is a LIMIT — law 11(b)
+        if (numSamples == 0) return true;                      // no samples: no time, no edge, nothing
+        const int nc = numChannels;
 
-        const bool spec = spectrumOn.load (std::memory_order_relaxed);
+        // The taps read channel 0, so they run only when there IS one; the bands run either way.
+        const bool spec = spectrumOn.load (std::memory_order_relaxed) && nc > 0;
         if (spec) for (int n = 0; n < numSamples; ++n) inTap.push (channels[0][n]);
-        for (auto& b : bands) b.processBlock (channels, nc, numSamples);
+        bool ok = true;
+        for (auto& b : bands) ok = b.processBlock (channels, nc, numSamples) && ok;
         if (spec) for (int n = 0; n < numSamples; ++n) outTap.push (channels[0][n]);
+        return ok;
     }
 
     // Total magnitude (dB) of all active bands on one stereo axis at a real frequency — best-effort

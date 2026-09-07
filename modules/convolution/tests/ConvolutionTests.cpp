@@ -103,7 +103,7 @@ int main()
         conv.setIr (ir.data(), irLen);
 
         std::vector<float> y (n, 0.0f);
-        conv.process (x.data(), y.data(), n);
+        felitronics::test::run (conv.process (x.data(), y.data(), n));
         test::ok (maxAbsDiff (y, directConv (x, ir)) < 2e-3, "single-block output == direct conv");
     }
 
@@ -126,7 +126,7 @@ int main()
         {
             int blk = splits[si++ % (int) (sizeof (splits) / sizeof (splits[0]))];
             if (off + blk > n) blk = n - off;
-            conv.process (x.data() + off, y.data() + off, blk);
+            felitronics::test::run (conv.process (x.data() + off, y.data() + off, blk));
             off += blk;
         }
         test::ok (maxAbsDiff (y, directConv (x, ir)) < 2e-3, "variable-block output == direct conv (no off-by-one)");
@@ -145,7 +145,7 @@ int main()
             convolution::PartitionedConvolver<> conv;
             conv.prepare (P, d + 1);
             conv.setIr (ir.data(), d + 1);
-            conv.process (x.data(), y.data(), n);
+            felitronics::test::run (conv.process (x.data(), y.data(), n));
             test::approx (y[(std::size_t) d], 1.0, 2e-4, "impulse appears at exactly delay d");
             double leak = 0.0; for (int i = 0; i < n; ++i) if (i != d) leak = std::max (leak, (double) std::fabs (y[(std::size_t) i]));
             test::ok (leak < 2e-4, "no energy off the delay");
@@ -153,7 +153,7 @@ int main()
         // d == 0 specifically pins ZERO added latency: out[0] is produced in the same call.
         std::vector<float> ir { 1.0f }, x (n, 0.0f), y (n, 0.0f); x[0] = 1.0f;
         convolution::PartitionedConvolver<> conv; conv.prepare (P, 1); conv.setIr (ir.data(), 1);
-        conv.process (x.data(), y.data(), 1);   // a SINGLE-sample call
+        felitronics::test::run (conv.process (x.data(), y.data(), 1));   // a SINGLE-sample call
         test::approx (y[0], 1.0, 1e-6, "latency 0: out[0] ready in the same 1-sample call");
         test::ok (convolution::PartitionedConvolver<>::latencySamples() == 0, "reports 0 latency");
     }
@@ -167,7 +167,7 @@ int main()
         for (auto& v : ir) v = 0.5f * r.next();
         for (auto& v : x)  v = 0.5f * r.next();
         convolution::PartitionedConvolver<> conv; conv.prepare (P, irLen); conv.setIr (ir.data(), irLen);
-        conv.process (x.data(), y.data(), n);
+        felitronics::test::run (conv.process (x.data(), y.data(), n));
         test::ok (maxAbsDiff (y, directConv (x, ir)) < 2e-3, "head-only IR == direct conv");
     }
 
@@ -180,8 +180,8 @@ int main()
         conv.prepare (P, irLen);
         conv.setIr (ir.data(), irLen);          // allocations allowed up to here
         const long before = g_allocs.load();
-        conv.process (x.data(), y.data(), n);
-        conv.process (x.data(), y.data(), n);   // cross a chunk boundary a few times
+        felitronics::test::run (conv.process (x.data(), y.data(), n));
+        felitronics::test::run (conv.process (x.data(), y.data(), n));   // cross a chunk boundary a few times
         const long after = g_allocs.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
@@ -194,13 +194,13 @@ int main()
         convolution::PartitionedConvolver<> conv;                    // NOT prepared (P_ == 0)
         std::vector<float> ir { 1.0f, 0.5f, 0.25f }, x (8, 0.0f), y (8, 0.0f); x[0] = 1.0f;
         conv.setIr (ir.data(), (int) ir.size());                     // must NOT divide by P_==0
-        conv.process (x.data(), y.data(), 8);                        // must NOT write into empty frame_
+        test::ok (! conv.process (x.data(), y.data(), 8), "an unprepared convolver REFUSES and says so (law 11)");
         test::ok (! conv.prepare (48, 256), "prepare(non-pow2 P=48) fails");
         conv.setIr (ir.data(), (int) ir.size());                     // still unprepared → no-op
-        conv.process (x.data(), y.data(), 8);
+        test::ok (! conv.process (x.data(), y.data(), 8), "...and after a FAILED prepare too");
         test::ok (conv.prepare (64, 256), "prepare(P=64) works");
         conv.setIr (ir.data(), (int) ir.size());
-        conv.process (x.data(), y.data(), 8);
+        felitronics::test::run (conv.process (x.data(), y.data(), 8));
         test::approx (y[0], 1.0, 1e-6, "convolves correctly once prepared");
     }
 

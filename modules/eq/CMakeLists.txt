@@ -32,7 +32,8 @@ if(FELITRONICS_BUILD_TESTS)
         tests/MatchedBiquadTests.cpp
         tests/EqEngineTests.cpp)
     target_link_libraries(felitronics_eq_tests PRIVATE felitronics::eq)
-    target_include_directories(felitronics_eq_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_include_directories(felitronics_eq_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                                     ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_eq_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_eq_tests COMMAND felitronics_eq_tests)
 

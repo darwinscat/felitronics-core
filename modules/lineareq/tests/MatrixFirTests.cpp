@@ -49,11 +49,11 @@ template <class Engine>
 static void captureColumn (Engine& e, int inCh, int cap, std::vector<float>& oL, std::vector<float>& oR)
 {
     // settle: run silence long enough to finish the cold fade-in → convolver idle on the single operator.
-    for (int b = 0; b < 40; ++b) { std::vector<float> z0 (512, 0.0f), z1 (512, 0.0f); float* io[2] { z0.data(), z1.data() }; e.process (io, 2, 512); }
+    for (int b = 0; b < 40; ++b) { std::vector<float> z0 (512, 0.0f), z1 (512, 0.0f); float* io[2] { z0.data(), z1.data() }; felitronics::test::run (e.process (io, 2, 512)); }
     const int M = 3 * cap + 1024;
     std::vector<float> L ((std::size_t) M, 0.0f), R ((std::size_t) M, 0.0f);
     (inCh == 0 ? L : R)[0] = 1.0f;
-    for (int o = 0; o < M; o += 512) { float* io[2] { L.data() + o, R.data() + o }; e.process (io, 2, std::min (512, M - o)); }
+    for (int o = 0; o < M; o += 512) { float* io[2] { L.data() + o, R.data() + o }; felitronics::test::run (e.process (io, 2, std::min (512, M - o))); }
     oL.assign (L.begin(), L.begin() + cap);
     oR.assign (R.begin(), R.begin() + cap);
 }
@@ -217,9 +217,9 @@ int main()
         lineareq::LinearPhaseEq e; e.prepare (sr, 512, 2, 0);
         e.setBands (full, 2);
         std::vector<float> L (512, 0.2f), R (512, -0.1f); float* io[2] { L.data(), R.data() };
-        e.process (io, 2, 512);                                            // consume the fade-in
+        felitronics::test::run (e.process (io, 2, 512));                                            // consume the fade-in
         const long before = g_allocs.load();
-        e.process (io, 2, 512); e.process (io, 2, 512);
+        felitronics::test::run (e.process (io, 2, 512)); felitronics::test::run (e.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate on the Full matrix path");
     }
 
@@ -239,7 +239,7 @@ int main()
             {
                 float* io[CH];                                              // advance every channel pointer per block
                 for (int c = 0; c < CH; ++c) io[c] = ch[(std::size_t) c].data() + o;
-                e.process (io, CH, std::min (512, M - o));
+                felitronics::test::run (e.process (io, CH, std::min (512, M - o)));
             }
             double inSq = 0; for (int i = M - 4000; i < M; ++i) { const double v = 0.3 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += v * v; }
             double worst = 0.0;

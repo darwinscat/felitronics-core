@@ -134,7 +134,7 @@ namespace
     struct NullInference
     {
         void prepare (double, int, int) noexcept {}
-        void process (float* const*, int, int) noexcept {}
+        bool process (float* const*, int, int) noexcept { return true; }
         void reset() noexcept {}
         int  latencySamples() const noexcept { return 0; }
     };

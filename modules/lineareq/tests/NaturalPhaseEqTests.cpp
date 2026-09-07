@@ -97,12 +97,16 @@ int main()
         np.setBands (b, 1);                                          // build (message thread, allocates) BEFORE the snapshot
         std::vector<float> lch (512, 0.1f), rch (512, -0.1f);
         float* io[2] { lch.data(), rch.data() };
-        np.process (io, 2, 512);                                     // consume the initial fade-in
+        felitronics::test::run (np.process (io, 2, 512));                                     // consume the initial fade-in
         const long before = g_allocs.load();
-        np.process (io, 2, 512);
+        felitronics::test::run (np.process (io, 2, 512));
         float* mono[1] { lch.data() };
-        np.process (mono, 1, 512);                                   // mono path
-        const long after = g_allocs.load();
+        // LAW 11(c): a stereo-prepared natural-phase EQ convolves a 2x2 matrix, so a 1-plane call cannot
+        // be honoured. It used to be accepted and do NOTHING (the matrix convolver dropped it, void), and
+        // this line called that "the mono path". It is a refusal now, and it says so.
+        const bool monoRefused = ! np.process (mono, 1, 512);   // recorded here, ASSERTED after the snapshot:
+        const long after = g_allocs.load();                     // test::ok builds a std::string and allocates
+        test::ok (monoRefused, "a mono call on a STEREO-prepared engine is refused (law 11c)");
         test::okNoAlloc (after == before, "process() performed zero heap allocations (stereo + mono)");
         bool finite = true; for (float v : lch) finite = finite && std::isfinite (v);
         test::ok (finite, "output finite");
@@ -115,7 +119,7 @@ int main()
         t.setBands (mb, 1);
         const int M = 16000; std::vector<float> y ((std::size_t) M);
         for (int i = 0; i < M; ++i) y[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
-        for (int o = 0; o < M; o += 512) { float* io1[1] { y.data() + o }; t.process (io1, 1, std::min (512, M - o)); }
+        for (int o = 0; o < M; o += 512) { float* io1[1] { y.data() + o }; felitronics::test::run (t.process (io1, 1, std::min (512, M - o))); }
         double inSq = 0, outSq = 0;
         for (int i = M - 4000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += s * s; outSq += (double) y[(std::size_t) i] * y[(std::size_t) i]; }
         test::approx (10.0 * std::log10 (outSq / inSq), 0.0, 0.3, "mono {m}-only point is transparent (ST-only bank 0, matches the IIR engine)");
@@ -191,11 +195,11 @@ int main()
         eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0;
         test::ok (! eqm.setBands (b, 1), "setBands() before prepare() returns false (no write into empty FIR / unprepared MixedPhaseFir)");
         float l[16] {}, r[16] {}; float* io[2] { l, r };
-        eqm.process (io, 2, 16);                                      // no-op
+        test::ok (! eqm.process (io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         eqm.reset();
         test::ok (eqm.prepare (48000.0, 16, 2, 0, 0.5f), "prepare() after the rejected calls");
         test::ok (eqm.setBands (b, 1), "setBands() works once prepared");
-        eqm.process (io, 2, 16);
+        felitronics::test::run (eqm.process (io, 2, 16));
     }
 
     return test::report();

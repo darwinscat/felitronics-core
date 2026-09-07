@@ -71,7 +71,7 @@ static double benchRT (int topoSel, int nBanks, int irLen, int P, int block, dou
     {
         std::memcpy (L.data(), inL.data(), (std::size_t) block * sizeof (float));
         std::memcpy (R.data(), inR.data(), (std::size_t) block * sizeof (float));
-        float* io[2] { L.data(), R.data() }; mc.process (io, io, 2, block);
+        float* io[2] { L.data(), R.data() }; (void) mc.process (io, io, 2, block);
     };
 
     for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // pass the cold prime + warm caches
@@ -194,7 +194,7 @@ static double benchMatrixNupc (int topoSel, int nBanks, int irLen, int block, do
     {
         std::memcpy (L.data(), inL.data(), (std::size_t) block * sizeof (float));
         std::memcpy (R.data(), inR.data(), (std::size_t) block * sizeof (float));
-        float* io[2] { L.data(), R.data() }; mc.process (io, io, 2, block);
+        float* io[2] { L.data(), R.data() }; (void) mc.process (io, io, 2, block);
     };
 
     for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // warm caches (+ any first-activation fade)

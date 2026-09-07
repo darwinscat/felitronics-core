@@ -47,24 +47,38 @@ struct TransientShaperParams
 class TransientShaper
 {
 public:
-    void prepare (double sampleRate, int /*maxBlock*/ = 0, int /*maxChannels*/ = 2) noexcept
+    // Law 11(b): `maxChannels` is BINDING. It used to be ignored, so the shaper's declared width was a
+    // fiction and process() bounded itself by core::kMaxChannels instead — "prepared for 2" then meant
+    // something different here than in the stage next door.
+    [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/ = 0, int maxChannels = 2) noexcept
     {
+        prepared_ = false;                                        // any early return below leaves it unprepared
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
+        channels_ = maxChannels;
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
         fast_.prepare (fs_); fast_.setDetector (Detector::Peak);
         slow_.prepare (fs_); slow_.setDetector (Detector::Peak);   // SAME type as fast → steady tone = norm 0
         apply (params_);
         reset();
+        prepared_ = true;
+        return true;
     }
+
+    bool isPrepared() const noexcept { return prepared_; }
 
     void reset() noexcept { fast_.reset(); slow_.reset(); gainSm_ = 1.0f; }
 
     void setParams (const TransientShaperParams& p) noexcept { params_ = p; apply (p); }
     static constexpr int latencySamples() noexcept { return 0; }
 
-    void process (float* const* channels, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2).
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int n) noexcept
     {
-        const int nc = numChannels < core::kMaxChannels ? numChannels : core::kMaxChannels;
-        if (nc <= 0) return;
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > channels_) return false;                // width is a LIMIT — law 11(b)
+        if (n == 0 || numChannels == 0) return true;              // nothing to run (no per-channel memory here)
+        const int nc = numChannels;
         for (int i = 0; i < n; ++i)
         {
             // GATED, and per sample before the link — the same shape and the same reason as the
@@ -99,6 +113,7 @@ public:
         // `m = mix*(0-1)` is silence at full mix — the same value `reset()` writes is the only answer
         // that means "do nothing", which is what a cleared de-zipper has to mean.
         if (! std::isfinite (gainSm_)) gainSm_ = 1.0f;
+        return true;
     }
 
 private:
@@ -117,6 +132,8 @@ private:
     }
 
     double fs_ = 48000.0;
+    int  channels_ = 2;                   // declared width — law 11(b), a LIMIT
+    bool prepared_ = false;               // true only after a prepare() that succeeded
     TransientShaperParams params_;
     EnvelopeFollower fast_, slow_;
     float attackDb_ = 0.0f, sustainDb_ = 0.0f, threshold_ = 0.2f, mix_ = 1.0f, smoothCoeff_ = 0.0f, gainSm_ = 1.0f;

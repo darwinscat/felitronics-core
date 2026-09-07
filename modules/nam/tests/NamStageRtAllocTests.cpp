@@ -66,14 +66,14 @@ void exerciseNoEigenMalloc (const std::string& json, const char* architecture)
         right[(std::size_t) i] = -0.15f * std::cos (0.07f * (float) i);
     }
     float* io[2] { left.data(), right.data() };
-    stage.process (io, 2, 64, false);       // warm every process-reachable path before closing the gate
+    felitronics::test::run (stage.process (io, 2, 64, false));       // warm every process-reachable path before closing the gate
 
 #if defined(EIGEN_RUNTIME_NO_MALLOC)
     std::printf ("    Eigen malloc gate: %s\n", architecture);
     std::fflush (stdout);
     Eigen::internal::set_is_malloc_allowed (false);
-    stage.process (io, 2, 64, false);
-    stage.process (io, 2, 64, true);
+    felitronics::test::run (stage.process (io, 2, 64, false));
+    felitronics::test::run (stage.process (io, 2, 64, true));
     Eigen::internal::set_is_malloc_allowed (true);
     std::printf ("    Eigen malloc gate passed: %s\n", architecture);
     std::fflush (stdout);
@@ -103,7 +103,7 @@ int main()
         test::ok (lstm.loadModelFromMemory (json.data(), json.size()), "minimal LSTM fixture loads");
         std::vector<float> block (64, 0.125f);
         float* io[1] { block.data() };
-        lstm.process (io, 1, 64, false);
+        felitronics::test::run (lstm.process (io, 1, 64, false));
         test::ok (finite (block), "minimal LSTM fixture processes finitely with allocation allowed");
         // Deliberately excluded from the closed Eigen-malloc gate: the pinned LSTM returns an
         // owning dynamic Eigen::VectorXf from get_hidden_state() for every processed sample.

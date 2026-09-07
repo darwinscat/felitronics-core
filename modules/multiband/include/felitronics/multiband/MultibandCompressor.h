@@ -28,6 +28,7 @@ class MultibandCompressor
 public:
     [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels, double maxLookaheadMs = 50.0)
     {
+        ready_ = false;                                              // law 11(b): disarm, then validate
         if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate)) return false;
         // Finite is not enough: `maxLookaheadMs = 1e300` is finite, and the `(int) std::ceil(...)`
         // two lines down is then an out-of-range floating-to-integer conversion — undefined, and
@@ -39,9 +40,13 @@ public:
         // core::kMaxChannels, so passing the raw count to the band lambda used to prepare each
         // Compressor for a wider layout than the buffers around it — invisible while Compressor::prepare
         // returned void, a hard prepare() failure now that it can refuse.
-        const int mc = std::clamp (maxChannels, 1, core::kMaxChannels);
+        // The early return here left the composite ARMED on its previous build, because it never reached
+        // the inner prepare() that clears `prepared_`: measured, prepare(2) then prepare(0) -> false, and
+        // process(io, 2, 64) still returned true and processed. MultibandProcessor::prepare refuses the
+        // same width one call down and disarms itself, so the guard is redundant as well as harmful.
+        const int mc = maxChannels;
         const int maxAlign = (int) std::ceil (maxLookaheadMs * 0.001 * sampleRate) + 1;
-        return mb_.prepare (sampleRate, maxBlock, mc, maxAlign,
+        return ready_ = mb_.prepare (sampleRate, maxBlock, mc, maxAlign,
                             [&] (dynamics::Compressor& c) { return c.prepare (sampleRate, maxBlock, mc, maxLookaheadMs); });
     }
 
@@ -59,9 +64,11 @@ public:
     int    latencySamples() const noexcept { return mb_.latencySamples(); }
     double bandGainReductionDb (int b) noexcept { return mb_.band (b).gainReductionDb(); }
 
-    void process (float* const* io, int numChannels, int n) noexcept { mb_.process (io, numChannels, n); }
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
+    { return ready_ && mb_.process (io, numChannels, n); }   // a refused prepare() disarms — law 11(b)
 
 private:
+    bool ready_ = false;      // law 11(b): an EARLY refusal must not leave the old build answering
     MultibandProcessor<dynamics::Compressor, MaxBands> mb_;
 };
 

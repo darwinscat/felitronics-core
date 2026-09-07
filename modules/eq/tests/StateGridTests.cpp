@@ -91,7 +91,7 @@ static void renderEq (const eq::BandParams& p, const eq::BandParams* second,
     {
         const int m = (step < n - off) ? step : n - off;
         float* ch[2] = { L.data() + off, R.data() + off };
-        e.process (ch, 2, m);
+        felitronics::test::run (e.process (ch, 2, m));
     }
 }
 
@@ -234,11 +234,11 @@ static void testEqSlicingInvarianceUnderARamp()
         std::vector<float> buf[2]; buf[0].assign (64, 0.0f); buf[1].assign (64, 0.0f);
         float* ch[2] = { buf[0].data(), buf[1].data() };
         const double w = 2.0 * kPi * 5000.0 / kFs;
-        b.processBlock (ch, 2, 64);
+        felitronics::test::run (b.processBlock (ch, 2, 64));
         const double a1 = std::abs (b.response (w));
-        for (int k = 0; k < 8; ++k) b.processBlock (ch, 2, 64);
+        for (int k = 0; k < 8; ++k) felitronics::test::run (b.processBlock (ch, 2, 64));
         const double a2 = std::abs (b.response (w));
-        for (int k = 0; k < 40; ++k) b.processBlock (ch, 2, 64);
+        for (int k = 0; k < 40; ++k) felitronics::test::run (b.processBlock (ch, 2, 64));
         const double a3 = std::abs (b.response (w));
         ok (std::fabs (a2 - a1) > 1e-3 && std::fabs (a3 - a2) > 1e-3,
             "PRECONDITION the design is still MOVING across the render (|H| " + std::to_string (a1) + " -> "
@@ -285,7 +285,7 @@ static void testDeltaBellFollowsTheStaticRamp()
         {
             const int m = (step < n - off) ? step : n - off;
             float* ch[2] = { L.data() + off, R.data() + off };
-            b.processBlock (ch, 2, m);
+            felitronics::test::run (b.processBlock (ch, 2, m));
         }
     };
 
@@ -297,7 +297,7 @@ static void testDeltaBellFollowsTheStaticRamp()
         eq::BandParams p = bell (500.0, 6.0, 2.0); p.dyn.on = true; b.setParams (p);
         eq::BandParams t = bell (4000.0, 6.0, 2.0); t.dyn.on = true; b.setParams (t);
         float* ch[2] = { zL.data(), zR.data() };
-        b.processBlock (ch, 2, n);
+        felitronics::test::run (b.processBlock (ch, 2, n));
         double worst = 0.0;
         for (int i = 0; i < n; ++i) worst = std::fmax (worst, std::fabs ((double) zL[(std::size_t) i] - (double) refL[(std::size_t) i]));
         ok (worst > 0.05, "PRECONDITION the -12 dB delta actually moves the signal (" + std::to_string (worst) + ")");
@@ -329,7 +329,7 @@ static void testAGlideThatLandsAtOnceIsStillDesigned()
         b.setParams (bell (4000.0, 12.0, 2.0));           // second write: a glide of length smoothMs
         std::vector<float> L (kK, 0.0f), R (kK, 0.0f);
         float* ch[2] = { L.data(), R.data() };
-        b.processBlock (ch, 2, kK);
+        felitronics::test::run (b.processBlock (ch, 2, kK));
         const double w = 2.0 * kPi * 4000.0 / kFs;
         const double gotDb = 20.0 * std::log10 (std::abs (b.response (w)));
         // PRECONDITION — the two designs are far apart, so "designed at the target" is a real claim.
@@ -371,7 +371,7 @@ static void testPoisonWindowIsBounded()
         {
             const int m = (step < n - off) ? step : n - off;
             float* ch[2] = { L.data() + off, R.data() + off };
-            e.process (ch, 2, m);
+            felitronics::test::run (e.process (ch, 2, m));
         }
         long long bad = 0; int last = -1;
         for (int i = 0; i < n; ++i) if (! std::isfinite (L[(std::size_t) i])) { ++bad; last = i; }
@@ -390,7 +390,7 @@ static void testPoisonWindowIsBounded()
         std::vector<float> L (4000, 0.0f), R (4000, 0.0f);
         for (int i = 0; i < 4000; ++i) { const float v = (float) (0.25 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs)); L[(std::size_t) i] = v; R[(std::size_t) i] = v; }
         L[100] = std::numeric_limits<float>::infinity();
-        for (int off = 0; off < 4000; ++off) { float* ch[2] = { L.data() + off, R.data() + off }; e.process (ch, 2, 1); }
+        for (int off = 0; off < 4000; ++off) { float* ch[2] = { L.data() + off, R.data() + off }; felitronics::test::run (e.process (ch, 2, 1)); }
         long long bad = 0;
         for (int i = 0; i < 4000; ++i) if (! std::isfinite (L[(std::size_t) i])) ++bad;
         ok (bad == 1, "one-sample calls still heal in ONE sample, not one period (" + std::to_string (bad) + ")");
@@ -420,7 +420,7 @@ static void testResetIsAStreamRestart()
             band.setParams (b);                                // start a 30 ms glide
             std::vector<float> wL, wR; programme (wL, wR, 480, 480);
             float* wc[2] = { wL.data(), wR.data() };
-            band.processBlock (wc, 2, 480);                    // render 10 ms of it
+            felitronics::test::run (band.processBlock (wc, 2, 480));                    // render 10 ms of it
             band.reset();
             if (writeAfter != nullptr) band.setParams (*writeAfter);
         }
@@ -429,7 +429,7 @@ static void testResetIsAStreamRestart()
             band.setParams (writeAfter != nullptr ? *writeAfter : b);   // a freshly prepared band, one write
         }
         float* ch[2] = { L.data(), R.data() };
-        band.processBlock (ch, 2, n);
+        felitronics::test::run (band.processBlock (ch, 2, n));
         out = L;
     };
 
@@ -481,7 +481,7 @@ static void testClearAudioStateIsAStop()
         band->setParams (b);
         std::vector<float> wL, wR; programme (wL, wR, 480, 480);
         float* wc[2] = { wL.data(), wR.data() };
-        band->processBlock (wc, 2, 480);
+        felitronics::test::run (band->processBlock (wc, 2, 480));
     }
     // PRECONDITION — the glide is genuinely unfinished at the stop, or "keeps ramping" means nothing.
     const double w = 2.0 * kPi * 900.0 / kFs;
@@ -495,8 +495,8 @@ static void testClearAudioStateIsAStop()
     std::vector<float> L1, R1, L2, R2; programme (L1, R1, n, n / 3); L2 = L1; R2 = R1;
     float* c1[2] = { L1.data(), R1.data() };
     float* c2[2] = { L2.data(), R2.data() };
-    stopped.processBlock (c1, 2, n);
-    running.processBlock (c2, 2, n);
+    felitronics::test::run (stopped.processBlock (c1, 2, n));
+    felitronics::test::run (running.processBlock (c2, 2, n));
     // The two differ only where the cleared filter memory shows (the first samples); the RAMP must be the
     // same, so the two converge and the far end is bit-identical.
     long long tailDiff = 0;
@@ -516,14 +516,14 @@ static void testMonoBassSlicingInvariance()
         auto render = [&] (std::vector<float>& L, std::vector<float>& R, int blk)
         {
             programme (L, R, n);
-            stereo::MonoBass m; m.prepare (kFs, n, 2);
+            stereo::MonoBass m; felitronics::test::run (m.prepare (kFs, n, 2));
             m.setParams ({ true, 150.0f, width });
             const int step = blk > 0 ? blk : n;
             for (int off = 0; off < n; off += step)
             {
                 const int k = (step < n - off) ? step : n - off;
                 float* ch[2] = { L.data() + off, R.data() + off };
-                m.process (ch, 2, k);
+                felitronics::test::run (m.process (ch, 2, k));
             }
         };
         render (ref[0], ref[1], 0);
@@ -581,7 +581,7 @@ static void testRampFollowsItsOwnDesign()
     double worst = 0.0, minH = 1e300, maxH = -1e300; int worstTick = -1; long long moving = 0;
     for (int tickNo = 1; tickNo <= 2000; ++tickNo)
     {
-        b.processBlock (ch, 2, kK);
+        felitronics::test::run (b.processBlock (ch, 2, kK));
         ref.advance (kK);
 
         eq::BandParams oracleP = bell (ref.value(), gain, q);
@@ -644,7 +644,7 @@ static void testRampFollowsItsOwnDesign()
         for (int tickNo = 1; tickNo <= 4000 && ! landed; ++tickNo)
         {
             const bool wasMoving = ! cref.settled();
-            cb.processBlock (cc, 2, kK);
+            felitronics::test::run (cb.processBlock (cc, 2, kK));
             cref.advance (kK);
             if (wasMoving && cref.settled())          // THIS is the landing tick
             {
@@ -680,7 +680,7 @@ static void testRampFollowsItsOwnDesign()
         bool sAgreed = true; double sWorst = 0.0, sMin = 1e300, sMax = -1e300; long long sMoving = 0;
         for (int tickNo = 1; tickNo <= 2000; ++tickNo)
         {
-            sb.processBlock (ch, 2, kK);
+            felitronics::test::run (sb.processBlock (ch, 2, kK));
             sref.advance (kK);
             eq::BandParams op = sideBand (sref.value());
             op.lanes[(std::size_t) eq::Lane::Stereo] = op.lanes[(std::size_t) eq::Lane::Side];   // designBand reads the primary slot
@@ -721,13 +721,13 @@ static void testGridReAnchorsOnReset()
         fresh.setParams (bell (1000.0, 6.0)); used.setParams (bell (1000.0, 6.0));
         std::vector<float> wL, wR; programme (wL, wR, warm, warm);
         float* wc[2] = { wL.data(), wR.data() };
-        used.processBlock (wc, 2, warm);     // leave the phase at 37
+        felitronics::test::run (used.processBlock (wc, 2, warm));     // leave the phase at 37
         used.reset(); fresh.reset();
         std::vector<float> aL, aR, bL, bR; programme (aL, aR, n); bL = aL; bR = aR;
         float* ac[2] = { aL.data(), aR.data() };
         float* bc[2] = { bL.data(), bR.data() };
-        fresh.processBlock (ac, 2, n);
-        used.processBlock (bc, 2, n);
+        felitronics::test::run (fresh.processBlock (ac, 2, n));
+        felitronics::test::run (used.processBlock (bc, 2, n));
         long long diff = 0;
         for (int i = 0; i < n; ++i) if (aL[(std::size_t) i] != bL[(std::size_t) i] || aR[(std::size_t) i] != bR[(std::size_t) i]) ++diff;
         // PRECONDITION — the tail actually reaches the flush, or the phase is unobservable.
@@ -737,17 +737,17 @@ static void testGridReAnchorsOnReset()
     }
     {   // stereo::MonoBass
         stereo::MonoBass fresh, used;
-        fresh.prepare (kFs, n, 2); used.prepare (kFs, n, 2);
+        felitronics::test::run (fresh.prepare (kFs, n, 2)); felitronics::test::run (used.prepare (kFs, n, 2));
         fresh.setParams ({ true, 150.0f, 0.0f }); used.setParams ({ true, 150.0f, 0.0f });
         std::vector<float> wL, wR; programme (wL, wR, warm, warm);
         float* wc[2] = { wL.data(), wR.data() };
-        used.process (wc, 2, warm);
+        felitronics::test::run (used.process (wc, 2, warm));
         used.reset(); fresh.reset();
         std::vector<float> aL, aR, bL, bR; programme (aL, aR, n); bL = aL; bR = aR;
         float* ac[2] = { aL.data(), aR.data() };
         float* bc[2] = { bL.data(), bR.data() };
-        fresh.process (ac, 2, n);
-        used.process (bc, 2, n);
+        felitronics::test::run (fresh.process (ac, 2, n));
+        felitronics::test::run (used.process (bc, 2, n));
         long long diff = 0;
         for (int i = 0; i < n; ++i) if (aL[(std::size_t) i] != bL[(std::size_t) i] || aR[(std::size_t) i] != bR[(std::size_t) i]) ++diff;
         long long zeros = 0; for (int i = 2000; i < n; ++i) if (aL[(std::size_t) i] == 0.0f) ++zeros;
@@ -806,18 +806,18 @@ static void testPoisonHealIsAtomic()
         // this check passed with `xo_.healPoison()` deleted. 500 samples puts the last boundary at 448,
         // so poison injected at 490 can ONLY be cleared by the per-call heal.
         const int n1 = 500, n2 = 100;
-        stereo::MonoBass m; m.prepare (kFs, n1, 2);
+        stereo::MonoBass m; felitronics::test::run (m.prepare (kFs, n1, 2));
         m.setParams ({ true, 150.0f, 0.0f });
         std::vector<float> L ((std::size_t) n1, 0.3f), R ((std::size_t) n1, -0.3f);
         L[490] = std::numeric_limits<float>::infinity();
         float* ch[2] = { L.data(), R.data() };
-        m.process (ch, 2, n1);
+        felitronics::test::run (m.process (ch, 2, n1));
         long long bad = 0; for (float v : L) if (! std::isfinite (v)) ++bad;
         ok (bad >= 1, "PRECONDITION the +Inf poisoned MonoBass's crossover AFTER the last grid boundary ("
                       + std::to_string (bad) + " non-finite)");
         std::vector<float> L2 ((std::size_t) n2, 0.05f), R2 ((std::size_t) n2, -0.05f);
         float* ch2[2] = { L2.data(), R2.data() };
-        m.process (ch2, 2, n2);
+        felitronics::test::run (m.process (ch2, 2, n2));
         long long bad2 = 0; for (float v : L2) if (! std::isfinite (v)) ++bad2;
         ok (bad2 == 0, "the NEXT call is clean — only the per-call poison heal can have done that ("
                        + std::to_string (bad2) + " non-finite)");
@@ -885,12 +885,12 @@ int main()
         b.setParams (bell (1000.0, 6.0));
         std::vector<float> v[2]; float* ch[2] {};
         for (int c = 0; c < 2; ++c) { v[c].assign (4096, 0.1f); ch[c] = v[c].data(); }
-        b.processBlock (ch, 2, 4096);
+        felitronics::test::run (b.processBlock (ch, 2, 4096));
         const int before = g_allocs.load();
-        for (int k = 0; k < 20; ++k) b.processBlock (ch, 2, 4096);
+        for (int k = 0; k < 20; ++k) felitronics::test::run (b.processBlock (ch, 2, 4096));
         b.reset();
         b.clearAudioState();
-        for (int k = 0; k < 20; ++k) b.processBlock (ch, 2, 1);
+        for (int k = 0; k < 20; ++k) felitronics::test::run (b.processBlock (ch, 2, 1));
         felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across the segment loop, reset() and clearAudioState()");
     }
 

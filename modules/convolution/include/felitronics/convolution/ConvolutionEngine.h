@@ -70,6 +70,8 @@ public:
         cur_ = 0; xfadePos_ = 0; xfadeLen_ = warmXfade_;
         phase_ = 0; fdlPos_ = 0;
         state_.store (0, std::memory_order_relaxed);
+        ranNc_ = 0;                                   // a re-prepare may NARROW channels_; the ledger of
+                                                      // "what ran last call" belongs to the old topology
         prepared_ = true;                             // fully built — only now may setIr()/process() run
         return true;
     }
@@ -114,11 +116,14 @@ public:
     }
 
     // Audio thread. Planar; `in`/`out` may alias (in-place). RT-safe, zero latency.
-    void process (const float* const* in, float* const* out, int numChannelsToProcess, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2).
+    [[nodiscard]] bool process (const float* const* in, float* const* out, int numChannelsToProcess, int n) noexcept
     {
-        if (! prepared_) return;                                    // never prepared — channel buffers are empty
-        const int nc = numChannelsToProcess < channels_ ? numChannelsToProcess : channels_;
-        if (nc <= 0 || n <= 0) return;
+        if (numChannelsToProcess < 0 || n < 0) return false;
+        if (! prepared_) return false;                              // never prepared — channel buffers are empty
+        if (numChannelsToProcess > channels_) return false;         // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                                    // no samples: no time, no edge
+        const int nc = numChannelsToProcess;
 
         // A channel that stops being asked for keeps a full frame, FDL and pending tail — frozen, not
         // decayed — and replays them when it is asked for again. Measured through CabConvolver, stereo ->
@@ -127,6 +132,7 @@ public:
         // and are supposed to keep running for the channels that stayed.
         for (int c = nc; c < ranNc_; ++c) chan_[c].reset();
         ranNc_ = nc;
+        if (nc == 0) return true;                                   // law 11(d): the edge above IS the work
 
         int s = state_.load (std::memory_order_acquire);
         if (s == 1)   // begin the crossfade. A cold-started FDL already yields the EXACT causal convolution, so ONE
@@ -138,16 +144,17 @@ public:
             s = 2;
         }
 
-        if (s != 2) { processRange (in, out, nc, 0, n); return; }   // Idle → single active slot
+        if (s != 2) { processRange (in, out, nc, 0, n); return true; }   // Idle → single active slot
         processFade (in, out, nc, n);
+        return true;
     }
 
     // Mono convenience (keeps a single-channel consumer on the 3-arg process()).
-    void process (const float* in, float* out, int n) noexcept
+    [[nodiscard]] bool process (const float* in, float* out, int n) noexcept
     {
         const float* ins[1]  { in };
         float*       outs[1] { out };
-        process (ins, outs, 1, n);
+        return process (ins, outs, 1, n);
     }
 
 private:

@@ -35,19 +35,19 @@ using NS = dither::NoiseShaping;
 // run a constant-input block through a fresh Dither, return the output
 static std::vector<float> runConst (const DP& p, double dc, int N)
 {
-    D d; d.prepare (48000.0, 1024, 1); d.setParams (p);
+    D d; felitronics::test::run (d.prepare (48000.0, 1024, 1)); d.setParams (p);
     std::vector<float> y (N, (float) dc);
-    for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
+    for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, N - o))); }
     return y;
 }
 
 // the error signal (out − in) for a 1 kHz tone at `amp`, fresh Dither
 static std::vector<double> toneError (const DP& p, double amp, int N, double sr)
 {
-    D d; d.prepare (sr, 1024, 1); d.setParams (p);
+    D d; felitronics::test::run (d.prepare (sr, 1024, 1)); d.setParams (p);
     std::vector<float> y (N); std::vector<double> in (N);
     for (int i = 0; i < N; ++i) { in[i] = amp * std::sin (2.0 * core::kPi * 1000.0 * i / sr); y[i] = (float) in[i]; }
-    for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
+    for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, N - o))); }
     std::vector<double> e (N); for (int i = 0; i < N; ++i) e[i] = (double) y[i] - in[i];
     return e;
 }
@@ -106,10 +106,10 @@ int main()
     test::group ("Dither psychoacoustic is stable");
     {
         DP p; p.bits = 16; p.shaping = NS::Psychoacoustic;
-        D d; d.prepare (sr, 1024, 1); d.setParams (p);
+        D d; felitronics::test::run (d.prepare (sr, 1024, 1)); d.setParams (p);
         unsigned long long s = 1; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 200000; std::vector<float> y (N); for (int i = 0; i < N; ++i) y[i] = 0.95f * rng();
-        double mx = 0; for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
+        double mx = 0; for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, N - o))); }
         for (float v : y) mx = std::max (mx, (double) std::fabs (v));
         test::ok (mx < 1.001, "9th-order feedback stays bounded on full-scale noise (no runaway)");
     }
@@ -120,7 +120,7 @@ int main()
         const int N = 8000;
         DP on;  on.bits = 16;  on.shaping = NS::Weighted; on.autoBlank = true;  on.autoBlankSamples = 1000;
         DP off = on; off.autoBlank = false;
-        auto tailEnergy = [&] (const DP& p) { D d; d.prepare (sr, 1024, 1); d.setParams (p); std::vector<float> y (N, 0.0f); for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); } double s = 0; for (int i = N - 2000; i < N; ++i) s += (double) y[i] * y[i]; return s; };
+        auto tailEnergy = [&] (const DP& p) { D d; felitronics::test::run (d.prepare (sr, 1024, 1)); d.setParams (p); std::vector<float> y (N, 0.0f); for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, N - o))); } double s = 0; for (int i = N - 2000; i < N; ++i) s += (double) y[i] * y[i]; return s; };
         test::ok (tailEnergy (on)  == 0.0, "autoBlank on: a sustained-silence tail is exactly zero (digital black)");
         test::ok (tailEnergy (off) >  0.0, "autoBlank off: silence still gets dither (a steady noise floor)");
     }
@@ -129,9 +129,9 @@ int main()
     test::group ("Dither decorrelates L/R");
     {
         DP p; p.bits = 16; p.shaping = NS::None;
-        D d; d.prepare (sr, 1024, 2); d.setParams (p);
+        D d; felitronics::test::run (d.prepare (sr, 1024, 2)); d.setParams (p);
         const int N = 4000; std::vector<float> l (N, (float) (0.5 * lsb16)), r (N, (float) (0.5 * lsb16));   // sit on the 0↔1-LSB boundary
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; d.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (d.process (io, 2, std::min (1024, N - o))); }
         int diff = 0; for (int i = 0; i < N; ++i) if (l[i] != r[i]) ++diff;
         test::ok (diff > N / 4, "identical boundary input → independent per-channel dither flips rounding differently");
     }
@@ -140,11 +140,11 @@ int main()
     test::group ("Dither 32-bit bypass");
     {
         DP p; p.bits = 32;
-        D d; d.prepare (sr, 1024, 1); d.setParams (p);
+        D d; felitronics::test::run (d.prepare (sr, 1024, 1)); d.setParams (p);
         const int N = 1000; std::vector<float> y (N), y0 (N);
         unsigned long long s = 7; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         for (int i = 0; i < N; ++i) { y[i] = 0.5f * rng(); y0[i] = y[i]; }
-        for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, N - o))); }
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (y[i] - y0[i]));
         test::ok (md == 0.0, "bits=32 → exact passthrough (no quantization, no dither)");
     }
@@ -153,14 +153,14 @@ int main()
     test::group ("Dither no-alloc + finite guard");
     {
         DP p; p.bits = 24; p.shaping = NS::Psychoacoustic;
-        D d; d.prepare (sr, 1024, 2); d.setParams (p);
+        D d; felitronics::test::run (d.prepare (sr, 1024, 2)); d.setParams (p);
         std::vector<float> l (512, 0.3f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
-        d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512));
         const long before = g_allocs.load();
-        d.process (io, 2, 512); d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512)); felitronics::test::run (d.process (io, 2, 512));
         const bool noAlloc = (g_allocs.load() == before);
         l[10] = std::nanf (""); r[20] = INFINITY;
-        d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512));
         bool fin = true; for (int i = 0; i < 512; ++i) if (! std::isfinite (l[i]) || ! std::isfinite (r[i])) fin = false;
         test::okNoAlloc (noAlloc, "process() did not allocate");
         test::ok (fin,     "NaN/inf input → finite output (guarded)");
@@ -211,7 +211,7 @@ int main()
     test::group ("Dither reset determinism + seed");
     {
         DP p; p.bits = 16; p.shaping = NS::Weighted; p.seed = 12345;
-        auto run = [&] (const DP& q) { D d; d.prepare (sr, 1024, 1); d.setParams (q); std::vector<float> y (4000); unsigned long long s = 3; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; }; for (int i = 0; i < 4000; ++i) y[i] = 0.2f * rng(); for (int o = 0; o < 4000; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, 4000 - o)); } return y; };
+        auto run = [&] (const DP& q) { D d; felitronics::test::run (d.prepare (sr, 1024, 1)); d.setParams (q); std::vector<float> y (4000); unsigned long long s = 3; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; }; for (int i = 0; i < 4000; ++i) y[i] = 0.2f * rng(); for (int o = 0; o < 4000; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, 4000 - o))); } return y; };
         const auto a = run (p), b = run (p);
         double md = 0; for (int i = 0; i < 4000; ++i) md = std::max (md, (double) std::fabs (a[i] - b[i]));
         test::ok (md == 0.0, "same seed + fresh prepare/reset → identical output (deterministic dither)");
@@ -225,14 +225,14 @@ int main()
     test::group ("Dither full-scale rail stability + blanking recovery");
     {
         DP p; p.bits = 16; p.shaping = NS::Psychoacoustic;
-        D d; d.prepare (sr, 1024, 1); d.setParams (p);
+        D d; felitronics::test::run (d.prepare (sr, 1024, 1)); d.setParams (p);
         const int N = 20000; std::vector<float> y (N, 1.0f);               // sustained clipping rail
-        for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (1024, N - o))); }
         double mx = 0; bool fin = true;
         for (float v : y) { fin &= (bool) std::isfinite (v); mx = std::max (mx, (double) std::fabs (v)); }
         test::ok (fin && mx <= 1.0, "clamped rail input stays bounded under the 9-tap feedback (no windup)");
         std::vector<float> z (8192, 0.0f);
-        for (int o = 0; o < 8192; o += 1024) { float* io[1] { z.data() + o }; d.process (io, 1, 1024); }
+        for (int o = 0; o < 8192; o += 1024) { float* io[1] { z.data() + o }; felitronics::test::run (d.process (io, 1, 1024)); }
         test::ok (z[8191] == 0.0f, "after 4096+ zero samples the channel blanks to digital black (no rail latch)");
     }
 
@@ -255,14 +255,14 @@ int main()
         for (int bits : { 16, 24 })
         {
             dither::Dither d;
-            d.prepare (48000.0, 512, 1);
+            felitronics::test::run (d.prepare (48000.0, 512, 1));
             dither::DitherParams p; p.bits = bits; p.shaping = dither::NoiseShaping::None; p.autoBlank = false;
             d.setParams (p);
 
             const float huge[] = { 1.0e13f, -1.0e13f, 1.0e30f, -1.0e30f, 3.0e38f, -3.0e38f, 1.0f, -1.0f };
             std::vector<float> y (huge, huge + 8);
             float* io[1] { y.data() };
-            d.process (io, 1, 8);
+            felitronics::test::run (d.process (io, 1, 8));
 
             const double ceiling = 1.0;
             bool bounded = true, finite = true;
@@ -275,7 +275,7 @@ int main()
         // ...and the fix is bit-transparent for everything inside the range: a normal render must be
         // untouched by it, which is what makes the clamp a guard rather than a behaviour change.
         dither::Dither a, b;
-        a.prepare (48000.0, 512, 2); b.prepare (48000.0, 512, 2);
+        felitronics::test::run (a.prepare (48000.0, 512, 2)); felitronics::test::run (b.prepare (48000.0, 512, 2));
         dither::DitherParams p; p.bits = 24; a.setParams (p); b.setParams (p);
         std::vector<float> l (4096), r (4096), l2, r2;
         for (int i = 0; i < 4096; ++i)
@@ -286,8 +286,8 @@ int main()
         l2 = l; r2 = r;
         float* pa[2] { l.data(), r.data() };
         float* pb[2] { l2.data(), r2.data() };
-        a.process (pa, 2, 4096);
-        for (int o = 0; o < 4096; o += 512) { float* io[2] { l2.data() + o, r2.data() + o }; b.process (io, 2, 512); }
+        felitronics::test::run (a.process (pa, 2, 4096));
+        for (int o = 0; o < 4096; o += 512) { float* io[2] { l2.data() + o, r2.data() + o }; felitronics::test::run (b.process (io, 2, 512)); }
         bool same = true;
         for (int i = 0; i < 4096; ++i) same &= (l[(std::size_t) i] == l2[(std::size_t) i]) && (r[(std::size_t) i] == r2[(std::size_t) i]);
         test::ok (same, "in-range material is unaffected by the bound (and still block-independent)");

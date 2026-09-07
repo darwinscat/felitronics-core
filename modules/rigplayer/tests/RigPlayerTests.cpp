@@ -163,7 +163,7 @@ struct Bench {
         files["g150"] = packed(gainModel(0.5));
         files["g240"] = bytesOf(gainModel(1.0));           // …and raw, which the stage takes as well
         files["r150"] = bytesOf(gainModel(0.75));
-        p.prepare(fs, kBlock, channels);
+        felitronics::test::run (p.prepare(fs, kBlock, channels));
         load(rig);
     }
     void load(const namz::rig::Rig& rig) {
@@ -191,7 +191,7 @@ struct Bench {
                 r[(std::size_t) i] = (float) (aR * s);
             }
             float* io[2] { l.data(), r.data() };
-            p.process(io, nch, kBlock);
+            felitronics::test::run (p.process(io, nch, kBlock));
             p.serviceHere();
             if (b >= blocks) {
                 const auto& x = channel == 0 ? l : r;
@@ -220,6 +220,24 @@ double shelfDb(double gainDb, double fs) {
 
 int main() {
     std::printf("felitronics::rigplayer::RigPlayer tests\n");
+
+    group("law 11b: prepare() is binding — it used to CLAMP the width");
+    {
+        // `prepare(48000, 256, 4)` was accepted as a 2-channel player, after which every
+        // `process(io, 4, n)` was refused forever and the caller learned of it only at the second call.
+        // That is the defect law 11(b)'s own text describes, in this file.
+        RigPlayer rp;
+        ok(! rp.prepare(kFs, 256, 4), "prepare(numChannels = 4) is REFUSED (the player's ceiling is 2)");
+        ok(! rp.prepare(kFs, 256, 0), "prepare(numChannels = 0) is REFUSED");
+        ok(! rp.prepare(kFs, 0,   2), "prepare(maxBlock = 0) is REFUSED");
+        ok(  rp.prepare(kFs, 256, 2), "...and a width it can honour is accepted");
+        // DISARM COMES FIRST: a refused RE-prepare must not leave the previous build answering.
+        ok(! rp.prepare(kFs, 256, 4), "a refused RE-prepare");
+        ok(! rp.prepared(),           "...leaves the player unprepared, not armed on the old build");
+        std::vector<float> l(64, 0.0f), r(64, 0.0f);
+        float* io2[2] { l.data(), r.data() };
+        ok(! rp.process(io2, 2, 64),  "...so process() refuses too");
+    }
 
     group("a plane that stops playing and plays again brings nothing back with it");
     {
@@ -254,7 +272,8 @@ int main() {
         // and the other on slot 1. A version of this test that used only the first passed with a fix that
         // cleared slot 0 alone — the mutation survived the whole suite, 247 checks, because slot 1 never
         // carried a delay in it.
-        for (int flip = 0; flip < 2; ++flip) {
+        for (int flip = 0; flip < 2; ++flip)
+        for (int narrowFirst = 1; narrowFirst >= 0; --narrowFirst) {
         AlignmentTable table;
         table.lagByFile = flip ? std::map<std::string, int> { { "early", 3 }, { "late", 0 } }
                                : std::map<std::string, int> { { "early", 0 }, { "late", 3 } };
@@ -274,7 +293,7 @@ int main() {
                 R[(std::size_t) i] = (float) (0.5 * std::sin(phase));
                 phase += 2.0 * 3.14159265358979 * 220.0 / kFs;
             }
-            b.p.process(io, 2, kBlock); b.p.serviceHere();
+            felitronics::test::run (b.p.process(io, 2, kBlock)); b.p.serviceHere();
             for (float v : R) charged = std::fmax(charged, (double) std::fabs(v));
         }
         ok(b.p.appliedSlotDelay(flip) > 0,
@@ -282,16 +301,24 @@ int main() {
         ok(! b.p.slotCold(flip), "precondition: and that slot is awake, so it is the one contributing");
         ok(charged > 0.1, "precondition: the plane under test really was playing");
 
-        for (int k = 0; k < 100; ++k) { std::fill(L.begin(), L.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere(); }
+        // THE GAP. `narrowFirst` picks its WIDTH: 1 plane (the P18 case — the plane under test keeps
+        // playing zeros while its neighbour stops) or 0 planes (the P20 case — nothing plays at all).
+        // Both are gaps under law 11a, because both carry samples. Only the zero-width pass can see the
+        // second defect: with one plane still playing, the plane under test drains itself and there is
+        // nothing left to replay, which is why folding this into the existing loop caught nothing.
+        const int gapWidth = narrowFirst ? 1 : 0;
+        for (int k = 0; k < 100; ++k) { std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
+                                        felitronics::test::run (b.p.process(io, gapWidth, kBlock)); b.p.serviceHere(); }
 
         double worst = 0.0;
         for (int k = 0; k < 20; ++k) {
             std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
-            b.p.process(io, 2, kBlock); b.p.serviceHere();
+            felitronics::test::run (b.p.process(io, 2, kBlock)); b.p.serviceHere();
             for (float v : R) worst = std::fmax(worst, (double) std::fabs(v));
             for (float v : L) worst = std::fmax(worst, (double) std::fabs(v));
         }
-        ok(worst == 0.0, "silence in, exact zero out on the plane that came back (was up to 0.25 = -12.0 dBFS)");
+        ok(worst == 0.0, std::string("silence in, exact zero out after a ") + (narrowFirst ? "NARROW" : "ZERO-WIDTH")
+                         + " gap (was 0.25 = -12.0 dBFS, and 0.2317 = -12.7 dBFS)");
         }
     }
 
@@ -352,7 +379,7 @@ int main() {
         // No service: nothing can land, and the law keeps the unfed slots silent.
         std::vector<float> x((std::size_t) kBlock, 0.1f);
         float* io[1] { x.data() };
-        for (int i = 0; i < 8; ++i) b.p.process(io, 1, kBlock);
+        for (int i = 0; i < 8; ++i) felitronics::test::run (b.p.process(io, 1, kBlock));
         double e = 0.0; for (const float v : x) e += v * v;
         ok(e == 0.0, "before any model lands the output is silence, not the raw DI");
         ok(b.fetches == 0, "…and nothing was fetched: the law asks, the host answers");
@@ -366,7 +393,7 @@ int main() {
         Bench b(rig);
         std::vector<float> x((std::size_t) kBlock, 0.1f);
         float* io[1] { x.data() };
-        b.p.process(io, 1, kBlock);                                  // the law asks
+        felitronics::test::run (b.p.process(io, 1, kBlock));                                  // the law asks
         b.p.service();                                               // …and service does not load
         ok(b.fetches == 0, "service() fetches nothing: the ask is work for the host");
         auto job = b.p.takeLoadJob();
@@ -385,13 +412,13 @@ int main() {
         // A job out while the pack changes comes back for a pack that is gone — and is dropped whole.
         b.p.setDial("gain", 0.0);                                    // wants the 60 capture
         std::optional<RigPlayer::LoadJob> late;
-        for (int i = 0; i < 24 && ! late; ++i) { b.p.process(io, 1, kBlock); b.p.service(); late = b.p.takeLoadJob(); }
+        for (int i = 0; i < 24 && ! late; ++i) { felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.service(); late = b.p.takeLoadJob(); }
         ok(late.has_value() && late->fileId == "g60", "the job for the 60 capture is out");
         b.p.unload();
         b.load(rig);
         ok(! b.p.takeLoadJob().has_value(), "…and nothing new is handed out while it is out");
         b.p.deliver(RigPlayer::run(std::move(*late)));
-        b.p.process(io, 1, kBlock);                                  // the new pack's law: nothing landed
+        felitronics::test::run (b.p.process(io, 1, kBlock));                                  // the new pack's law: nothing landed
         ok(b.p.heldFileId(0).empty() && b.p.heldFileId(1).empty(), "delivered to the new pack it is dropped: no slot holds it");
         approx(b.gainAt(1000.0), 0.5, 0.01, "…and the new pack loads its own and sounds");
     }
@@ -404,13 +431,13 @@ int main() {
         Bench b(rig);
         std::vector<float> x((std::size_t) kBlock, 0.1f);
         float* io[1] { x.data() };
-        b.p.process(io, 1, kBlock);                                  // the law asks
+        felitronics::test::run (b.p.process(io, 1, kBlock));                                  // the law asks
         auto job = b.p.takeLoadJob();
         ok(job.has_value(), "a job is out");
         b.p.deliver(RigPlayer::run(std::move(*job)));                // …and lands, published for the audio thread
         b.p.unload();
         b.load(rig);
-        b.p.process(io, 1, kBlock);
+        felitronics::test::run (b.p.process(io, 1, kBlock));
         ok(b.p.heldFileId(0).empty() && b.p.heldFileId(1).empty(),
            "the new pack's law holds nothing of the old landing");
         approx(b.gainAt(1000.0), 0.5, 0.01, "…and the new pack loads its own and sounds");
@@ -433,16 +460,16 @@ int main() {
         int asks = 0;
         for (int k = 0; k < 100; ++k) {
             std::fill(x.begin(), x.end(), 0.1f);
-            b.p.process(io, 1, kBlock);
+            felitronics::test::run (b.p.process(io, 1, kBlock));
             b.p.service();
             if (b.p.takeLoadJob().has_value()) ++asks;
         }
         ok(asks == 0 && b.fetches == 3, "a hundred blocks later it has not been asked for again");
         ok(b.p.setSwitch("channel", "green"), "the hand leaves for green…");
-        b.p.process(io, 1, kBlock);                              // the law hears the wish change
+        felitronics::test::run (b.p.process(io, 1, kBlock));                              // the law hears the wish change
         ok(b.p.setSwitch("channel", "red"), "…and asks for red again");
         std::optional<RigPlayer::LoadJob> again;
-        for (int k = 0; k < 10 && ! again; ++k) { b.p.process(io, 1, kBlock); b.p.service(); again = b.p.takeLoadJob(); }
+        for (int k = 0; k < 10 && ! again; ++k) { felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.service(); again = b.p.takeLoadJob(); }
         ok(again.has_value() && again->fileId == "r150", "a new wish tries the file anew");
         b.p.deliver(RigPlayer::run(std::move(*again)));          // fails again; the slot is refused again
         approx(b.gainAt(1000.0), 0.5, 0.01, "…and the sound never blinked");
@@ -798,7 +825,7 @@ int main() {
             for (int k = 0; k < 80; ++k) {
                 std::fill(l.begin(), l.end(), 0.0f);          // silence in: what comes out is the offset
                 float* io[2] { l.data(), nullptr };
-                b.p.process(io, 1, kBlock);
+                felitronics::test::run (b.p.process(io, 1, kBlock));
                 b.p.serviceHere();
                 if (k >= 48) for (const float v : l) { sum += (double) v; ++n; }
             }
@@ -1070,8 +1097,8 @@ int main() {
                     phase += 2.0 * 3.14159265358979323846 * 1000.0 / kFs;
                 }
                 float* ix[1] { x.data() }; float* iy[1] { y.data() };
-                sleeps.p.process(ix, 1, kBlock); sleeps.p.serviceHere();
-                never.p.process(iy, 1, kBlock);  never.p.serviceHere();
+                felitronics::test::run (sleeps.p.process(ix, 1, kBlock)); sleeps.p.serviceHere();
+                felitronics::test::run (never.p.process(iy, 1, kBlock));  never.p.serviceHere();
                 for (int i = 0; i < kBlock; ++i) worst = std::max(worst, std::abs(x[(std::size_t) i] - y[(std::size_t) i]));
             }
             return worst;
@@ -1102,12 +1129,12 @@ int main() {
         std::vector<float> z((std::size_t) kBlock);
         float* io[1] { z.data() };
         float peak = 0.0f;
-        for (int k = 0; k < 8; ++k) { std::fill(z.begin(), z.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere(); }
+        for (int k = 0; k < 8; ++k) { std::fill(z.begin(), z.end(), 0.0f); felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.serviceHere(); }
         for (const float v : z) peak = std::max(peak, std::abs(v));
         ok(peak == 0.0f, "silence in, silence out, before the turn");
         b.p.setDial("gain", 200.0);
         for (int k = 0; k < 8; ++k) {
-            std::fill(z.begin(), z.end(), 0.0f); b.p.process(io, 1, kBlock); b.p.serviceHere();
+            std::fill(z.begin(), z.end(), 0.0f); felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.serviceHere();
             for (const float v : z) peak = std::max(peak, std::abs(v));
         }
         ok(peak == 0.0f, "…and after it: nothing of the rest comes back out (peak " + std::to_string(peak) + ")");

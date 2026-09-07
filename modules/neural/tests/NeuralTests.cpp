@@ -32,7 +32,10 @@ struct GainInference
     ~GainInference() { alive.fetch_sub (1, std::memory_order_relaxed); dtors.fetch_add (1, std::memory_order_relaxed); }
     void prepare (double, int, int) noexcept {}
     void reset() noexcept {}
-    void process (float* const* io, int nc, int n) noexcept { for (int c = 0; c < nc; ++c) for (int i = 0; i < n; ++i) io[c][i] *= gain; }
+    bool refuseEverything = false;   // a backend-SPECIFIC refusal, so the stage has a verdict to lose
+    [[nodiscard]] bool process (float* const* io, int nc, int n) noexcept   // law 11: the verdict is returned
+    { if (nc < 0 || n < 0 || refuseEverything) return false;
+      for (int c = 0; c < nc; ++c) for (int i = 0; i < n; ++i) io[c][i] *= gain; return true; }
     int  latencySamples() const noexcept { return latency; }
 };
 static_assert (neural::Inference<GainInference>, "GainInference must satisfy the seam");
@@ -47,18 +50,18 @@ int main()
         neural::NeuralStage<GainInference> stage; stage.prepare ({ 48000.0, 512, 2 });
         test::ok (! stage.hasModel(), "starts with no model");
         float a[4] { 1, 1, 1, 1 }, b[4] { 1, 1, 1, 1 }; float* io[2] { a, b };
-        stage.process (io, 2, 4);
+        felitronics::test::run (stage.process (io, 2, 4));
         test::approx (a[0], 1.0, 1e-6, "no model → passthrough");
 
         stage.swapPrepared (std::make_unique<GainInference> (2.0f));
         test::ok (stage.hasModel(), "has model after swap");
         float c[4] { 1, 1, 1, 1 }, d[4] { 1, 1, 1, 1 }; float* io2[2] { c, d };
-        stage.process (io2, 2, 4);
+        felitronics::test::run (stage.process (io2, 2, 4));
         test::approx (c[0], 2.0, 1e-6, "model applied (×2)");
 
         stage.swapPrepared (std::make_unique<GainInference> (0.5f));
         float e[4] { 1, 1, 1, 1 }, f[4] { 1, 1, 1, 1 }; float* io3[2] { e, f };
-        stage.process (io3, 2, 4);
+        felitronics::test::run (stage.process (io3, 2, 4));
         test::approx (e[0], 0.5, 1e-6, "swapped model applied (×0.5)");
     }
 
@@ -69,11 +72,11 @@ int main()
         neural::NeuralStage<GainInference> stage; stage.prepare ({ 48000.0, 64, 1 });
         stage.swapPrepared (std::make_unique<GainInference> (1.0f));        // model A live
         float x[4] { 1, 1, 1, 1 }; float* io[1] { x };
-        stage.process (io, 1, 4);                                           // audioBlock → 1 (A "in use")
+        felitronics::test::run (stage.process (io, 1, 4));                                           // audioBlock → 1 (A "in use")
         stage.swapPrepared (std::make_unique<GainInference> (2.0f));        // B live; A retired at block 1
         stage.collectGarbage();                                            // now=1, 1>1 false → A kept
         test::ok (GainInference::dtors.load() == 0, "retired model NOT freed at the same block");
-        stage.process (io, 1, 4);                                           // audioBlock → 2
+        felitronics::test::run (stage.process (io, 1, 4));                                           // audioBlock → 2
         stage.collectGarbage();                                            // now=2 > 1 → A freed
         test::ok (GainInference::dtors.load() == 1, "retired model freed after audio stepped past");
     }
@@ -87,7 +90,7 @@ int main()
         float* io[2] { a, b };
         GainInference::dtors.store (0);
         const long beforeNew = g_allocs.load();
-        stage.process (io, 2, 512); stage.process (io, 2, 512);
+        felitronics::test::run (stage.process (io, 2, 512)); felitronics::test::run (stage.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == beforeNew, "process() did not allocate");
         test::ok (GainInference::dtors.load() == 0, "process() did not delete");
     }
@@ -112,6 +115,39 @@ int main()
     }
 
     // Leak check (local proxy for the CI's LeakSanitizer): once every NeuralStage scope above has closed,
+    // LAW 11 — the stage returns the BACKEND's verdict, it does not manufacture one. A stage with no
+    // model installed is a documented clean passthrough and therefore an ACCEPTED call; a stage whose
+    // backend refuses must say so, or the whole point of returning a verdict is lost one layer up.
+    test::group ("law 11: NeuralStage returns the backend's verdict");
+    {
+        neural::NeuralStage<GainInference> stage; stage.prepare ({ 48000.0, 512, 2 });
+        float a[4] { 1, 1, 1, 1 }, b[4] { 1, 1, 1, 1 }; float* io[2] { a, b };
+        test::ok (stage.process (io, 2, 4), "no model installed is a passthrough, and an ACCEPTED call");
+        stage.swapPrepared (std::make_unique<GainInference> (2.0f));
+        test::ok (stage.process (io, 2, 4), "...and so is a normal call with a model");
+        test::ok (! stage.process (io, -1, 4), "a malformed call is REFUSED");
+        test::ok (! stage.process (io, 2, -4), "...on either extent");
+        test::ok (! stage.process (io, 3, 4),  "...and a width past the prepared spec");
+        {
+            // The geometry has to be judged the SAME WAY with and without a model: it used to be
+            // delegated, so an EMPTY stage answered "accepted" to a malformed call and a loaded one
+            // answered "refused". And the refusal must not step the retire counter the GC reads.
+            neural::NeuralStage<GainInference> empty; empty.prepare ({ 48000.0, 512, 2 });
+            test::ok (! empty.process (io, -1, 4), "a stage with NO model refuses a malformed call too");
+            test::ok (! empty.process (io, 3, 4),  "...and a too-wide one");
+        }
+        {
+            // ...and a refusal that is the BACKEND's own must reach the caller, not be replaced by
+            // the stage's optimism.
+            neural::NeuralStage<GainInference> s2; s2.prepare ({ 48000.0, 512, 2 });
+            auto b = std::make_unique<GainInference> (2.0f); b->refuseEverything = true;
+            s2.swapPrepared (std::move (b));
+            test::ok (! s2.process (io, 2, 4), "a BACKEND-specific refusal is returned, not swallowed");
+            s2.collectGarbage();
+        }
+        stage.collectGarbage();
+    }
+
     // every GainInference ever constructed must be destroyed — including each stage's LIVE model, which is a
     // raw pointer freed by ~NeuralStage. Before that destructor existed, the live models leaked (LSan caught it).
     test::ok (GainInference::alive.load() == 0, "no leak: every model destroyed (net alive == 0)");

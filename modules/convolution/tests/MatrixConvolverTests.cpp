@@ -74,7 +74,7 @@ static std::vector<float> convRef (const std::vector<float>& ir, const std::vect
 {
     convolution::PartitionedConvolver<> pc; pc.prepare (P, irMax); pc.setIr (ir.data(), (int) ir.size());
     std::vector<float> out (in.size(), 0.0f);
-    pc.process (in.data(), out.data(), (int) in.size());
+    felitronics::test::run (pc.process (in.data(), out.data(), (int) in.size()));
     return out;
 }
 
@@ -105,7 +105,7 @@ int main()
     {
         oL.assign ((std::size_t) n, 0.0f); oR.assign ((std::size_t) n, 0.0f);
         for (int i = 0; i < n; ++i) { oL[(std::size_t) i] = xL[(std::size_t) i]; oR[(std::size_t) i] = xR[(std::size_t) i]; }
-        for (int o = 0; o < n; o += 512) { float* io[2] { oL.data() + o, oR.data() + o }; mc.process (io, io, 2, std::min (512, n - o)); }
+        for (int o = 0; o < n; o += 512) { float* io[2] { oL.data() + o, oR.data() + o }; felitronics::test::run (mc.process (io, io, 2, std::min (512, n - o))); }
     };
 
     // --- LRDiag == two independent mono convolutions (direct L/R routing) ---
@@ -171,7 +171,7 @@ int main()
             if (! switched && o >= T)
             { const float* b[4] { irLL.data(), irLR.data(), irRL.data(), irRR.data() };
               if (A.setOperator (MC::Topology::Full, b, 4, len)) switched = true; }
-            float* io[2] { aL.data() + o, aR.data() + o }; A.process (io, io, 2, std::min (256, n - o));
+            float* io[2] { aL.data() + o, aR.data() + o }; felitronics::test::run (A.process (io, io, 2, std::min (256, n - o)));
         }
         test::ok (switched, "topology switch accepted mid-stream");
 
@@ -195,7 +195,7 @@ int main()
         const int tail = n - T;
         std::vector<float> bL (tail), bR (tail);
         for (int i = 0; i < tail; ++i) { bL[(std::size_t) i] = xL[(std::size_t) (T + i)]; bR[(std::size_t) i] = xR[(std::size_t) (T + i)]; }
-        for (int o = 0; o < tail; o += 256) { float* io[2] { bL.data() + o, bR.data() + o }; B.process (io, io, 2, std::min (256, tail - o)); }
+        for (int o = 0; o < tail; o += 256) { float* io[2] { bL.data() + o, bR.data() + o }; felitronics::test::run (B.process (io, io, 2, std::min (256, tail - o))); }
         // compare A[T + after..] to B[after..] over a window where the pre-switch tail still matters
         double warmDiff = 0.0;
         for (int i = xfade + P; i < xfade + P + 400; ++i)
@@ -209,7 +209,7 @@ int main()
         MC mc; test::ok (mc.prepare (P, irMax, xfade, 1), "prepare mono"); test::ok (mc.numChannels() == 1, "1 channel");
         test::ok (mc.setIr (irM.data(), len), "setIr (mono convenience)");
         std::vector<float> y (n); for (int i = 0; i < n; ++i) y[(std::size_t) i] = xL[(std::size_t) i];
-        for (int o = 0; o < n; o += 512) { float* io[1] { y.data() + o }; mc.process (io, io, 1, std::min (512, n - o)); }
+        for (int o = 0; o < n; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (mc.process (io, io, 1, std::min (512, n - o))); }
         const std::vector<float> ref = convRef (irM, xL, P, irMax);
         test::ok (maxDiff (y, ref, settled, n) < 1e-4, "mono output == irM ∗ xL");
     }
@@ -220,11 +220,11 @@ int main()
         MC mc; mc.prepare (P, irMax, xfade, 2);
         { const float* b[2] { irM.data(), irS.data() }; mc.setOperator (MC::Topology::MSDiag, b, 2, len); }
         std::vector<float> l (512, 0.2f), rr (512, -0.1f); float* io[2] { l.data(), rr.data() };
-        mc.process (io, io, 2, 512);                      // consume the initial fade-in
+        felitronics::test::run (mc.process (io, io, 2, 512));                      // consume the initial fade-in
         { const float* b[4] { irLL.data(), irLR.data(), irRL.data(), irRR.data() }; mc.setOperator (MC::Topology::Full, b, 4, len); }
         const long before = g_allocs.load();
-        mc.process (io, io, 2, 512);                      // crosses the crossfade (MSDiag→Full)
-        mc.process (io, io, 2, 512);
+        felitronics::test::run (mc.process (io, io, 2, 512));                      // crosses the crossfade (MSDiag→Full)
+        felitronics::test::run (mc.process (io, io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() performed zero heap allocations across a topology swap");
     }
 
@@ -234,11 +234,12 @@ int main()
         MC fresh;
         const float* b[2] { irM.data(), irS.data() };
         test::ok (! fresh.setOperator (MC::Topology::MSDiag, b, 2, len), "setOperator before prepare() rejected");
-        float l[16] {}, rr[16] {}; float* io[2] { l, rr }; fresh.process (io, io, 2, 16);   // no-op, no crash
+        float l[16] {}, rr[16] {}; float* io[2] { l, rr };
+        test::ok (! fresh.process (io, io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         test::ok (fresh.prepare (P, irMax, xfade, 2), "prepare after the rejected call");
         test::ok (fresh.setOperator (MC::Topology::MSDiag, b, 2, len), "first operator accepted (idle)");
         std::vector<float> l2 (512, 0.1f), r2 (512, 0.1f); float* io2[2] { l2.data(), r2.data() };
-        fresh.process (io2, io2, 2, 8);                  // begin the (cold) fade → busy
+        felitronics::test::run (fresh.process (io2, io2, 2, 8));                  // begin the (cold) fade → busy
         test::ok (fresh.isBusy(), "busy during the cold prime");
         const float* b2[4] { irLL.data(), irLR.data(), irRL.data(), irRR.data() };
         test::ok (! fresh.setOperator (MC::Topology::Full, b2, 4, len), "second operator rejected while busy (host coalesces)");

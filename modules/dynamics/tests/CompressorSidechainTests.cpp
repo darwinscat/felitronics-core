@@ -200,8 +200,8 @@ int main()
                         float* ia[2] { a0.data() + off, a1.data() + off };
                         float* ib[2] { b0.data() + off, b1.data() + off };
                         const float* kb[2] { b0.data() + off, b1.data() + off };   // the io buffer itself
-                        ca.process (ia, nch, m);
-                        cb.process (ib, nch, m, kb, nch);
+                        felitronics::test::run (ca.process (ia, nch, m));
+                        felitronics::test::run (cb.process (ib, nch, m, kb, nch));
                         }
                     worst += countDiff (a0, b0) + (nch == 2 ? countDiff (a1, b1) : 0);
                     ++cases;
@@ -238,8 +238,8 @@ int main()
                       float* ia[2] { a0.data(), a1.data() };
                       float* ib[2] { b0.data(), b1.data() };
                       const float* k[2] { key0.data(), key1.data() };
-                      if (keyed) { c.process (ia, nch, n, k, nch); o.process (ib, nch, n, k, nch); }
-                      else       { c.process (ia, nch, n);          o.process (ib, nch, n); }
+                      if (keyed) { felitronics::test::run (c.process (ia, nch, n, k, nch)); o.process (ib, nch, n, k, nch); }
+                      else       { felitronics::test::run (c.process (ia, nch, n));          o.process (ib, nch, n); }
 
                       diff += countDiff (a0, b0) + countDiff (a1, b1);
                       ++cases;
@@ -259,7 +259,7 @@ int main()
         {   // silent programme, loud key: the programme stays EXACTLY silent, but gain reduction happens
             auto a = silence; float* io[1] { a.data() }; const float* k[1] { loud.data() };
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
-            c.process (io, 1, n, k, 1);
+            felitronics::test::run (c.process (io, 1, n, k, 1));
             bool zero = true; for (float v : a) zero &= (v == 0.0f);
             test::ok (zero, "silent programme + loud key: output is exactly silent (no key leakage into io)");
             test::ok (c.gainReductionDb() < -10.0, "silent programme + loud key: the key still drives the gain reduction");
@@ -267,7 +267,7 @@ int main()
         {   // loud programme, silent key: nothing happens AT ALL — gain is exactly 1.0
             auto a = loud; float* io[1] { a.data() }; const float* k[1] { silence.data() };
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
-            c.process (io, 1, n, k, 1);
+            felitronics::test::run (c.process (io, 1, n, k, 1));
             test::ok (countDiff (a, loud) == 0, "loud programme + silent key: output is the input, bit for bit");
         }
     }
@@ -290,8 +290,8 @@ int main()
             ca.setParams (p); cb.setParams (p);
             float* ia[2] { a0.data(), a1.data() }; const float* k1[1] { key.data() };
             float* ib[2] { b0.data(), b1.data() }; const float* k2[2] { key.data(), key.data() };
-            ca.process (ia, 2, n, k1, 1);
-            cb.process (ib, 2, n, k2, 2);
+            felitronics::test::run (ca.process (ia, 2, n, k1, 1));
+            felitronics::test::run (cb.process (ib, 2, n, k2, 2));
             test::ok (countDiff (a0, b0) + countDiff (a1, b1) == 0,
                       std::string ("mono key == duplicated stereo key (") + (l == dynamics::LinkMode::Max ? "Max" : "MeanPower") + ")");
         }
@@ -309,7 +309,7 @@ int main()
         auto p = baseParams(); p.thresholdDb = -40.0; p.ratio = 10.0;
         dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1, 10.0), "prepare");
         p.lookaheadMs = 3.0; c.setParams (p);
-        c.process (io, 1, n, k, 1);
+        felitronics::test::run (c.process (io, 1, n, k, 1));
         test::ok (countDiff (key, keyCopy) == 0, "the compressor did not modify the key buffer");
     }
 
@@ -331,7 +331,7 @@ int main()
                 const int m = std::min (blk, n - off);
                 float* sub[1] { a.data() + off };
                 const float* k[1] { key.data() + off };
-                c.process (sub, 1, m, k, 1);
+                felitronics::test::run (c.process (sub, 1, m, k, 1));
             }
             if (ref.empty()) ref = a;
             else test::ok (countDiff (a, ref) == 0, "block " + std::to_string (blk) + " == block 1, bit for bit");
@@ -351,8 +351,8 @@ int main()
         c1.setParams (p); c2.setParams (p);
         float* io1[1] { a.data() }; float* io2[1] { b.data() };
         const float* k[1] { key.data() };
-        c1.process (io1, 1, n, k, 1);
-        c2.process (io2, 1, n, k, 1);
+        felitronics::test::run (c1.process (io1, 1, n, k, 1));
+        felitronics::test::run (c2.process (io2, 1, n, k, 1));
         test::ok (countDiff (a, b) == 0, "maxBlock 64 fed 40000 samples == maxBlock 40000, bit for bit");
         test::ok (rmsOf (a, 20000, n) < rmsOf (s, 20000, n) * 0.9, "and it actually compressed (not a silent bypass)");
     }
@@ -377,7 +377,7 @@ int main()
             c.setParams (p);
             const int look = c.latencySamples();
             float* io[1] { a.data() }; const float* k[1] { key.data() };
-            c.process (io, 1, n, k, 1);
+            felitronics::test::run (c.process (io, 1, n, k, 1));
             // static target for 0.9 at -12 dBFS / 4:1  ->  -(20log10(0.9)+12)*0.75 = -8.31 dB
             const double lvlDb = core::gainToDb ((double) in[(std::size_t) t]);
             const double want  = (double) in[(std::size_t) t] * core::dbToGain (-(lvlDb + 12.0) * 0.75);
@@ -438,7 +438,7 @@ int main()
             {
                 float* s[1] { a.data() + i };
                 const float* k[1] { key.data() + i };
-                if (external) c.process (s, 1, 1, k, 1); else c.process (s, 1, 1);
+                if (external) felitronics::test::run (c.process (s, 1, 1, k, 1)); else felitronics::test::run (c.process (s, 1, 1));
                 gr[(std::size_t) i] = c.gainReductionDb();
             }
             return a;
@@ -503,8 +503,8 @@ int main()
             float* ia[1] { a.data() + off }; float* ib[1] { b.data() + off };
             const float* k[1] { key.data() + off };
             const bool keyed = (bi >= 10 && bi < 25);                  // on at block 10, off at block 25
-            if (keyed) { c.process (ia, 1, blk, k, 1); o.process (ib, 1, blk, k, 1); }
-            else       { c.process (ia, 1, blk);        o.process (ib, 1, blk); }
+            if (keyed) { felitronics::test::run (c.process (ia, 1, blk, k, 1)); o.process (ib, 1, blk, k, 1); }
+            else       { felitronics::test::run (c.process (ia, 1, blk));        o.process (ib, 1, blk); }
             if (bi == 10 || bi == 25) biggestJump = std::max (biggestJump, std::fabs (c.gainReductionDb() - prevGr));
             prevGr = c.gainReductionDb();
             if (c.latencySamples() != 48) { test::ok (false, "latency moved at block " + std::to_string (bi)); break; }
@@ -533,7 +533,7 @@ int main()
             float* ia[2] { a0.data() + off, a1.data() + off };
             float* ib[2] { b0.data() + off, b1.data() + off };
             const float* k[2] { k0.data() + off, k1.data() + off };
-            c.process (ia, 2, blk, k, keyNc);
+            felitronics::test::run (c.process (ia, 2, blk, k, keyNc));
             o.process (ib, 2, blk, k, keyNc);
             if (c.latencySamples() != 0) { test::ok (false, "latency moved at block " + std::to_string (bi)); break; }
         }
@@ -555,15 +555,15 @@ int main()
         used.setParams (p); fresh.setParams (p);
         {   // dirty the instance: keyed blocks, unkeyed blocks, a loud key
             auto d = s; float* io[1] { d.data() }; const float* k[1] { key.data() };
-            used.process (io, 1, n, k, 1);
-            used.process (io, 1, n);
+            felitronics::test::run (used.process (io, 1, n, k, 1));
+            felitronics::test::run (used.process (io, 1, n));
             used.reset();
         }
         auto a = s, b = s;
         float* ia[1] { a.data() }; float* ib[1] { b.data() };
         const float* k[1] { key.data() };
-        used.process (ia, 1, n, k, 1);
-        fresh.process (ib, 1, n, k, 1);
+        felitronics::test::run (used.process (ia, 1, n, k, 1));
+        felitronics::test::run (fresh.process (ib, 1, n, k, 1));
         test::ok (countDiff (a, b) == 0, "reset instance == fresh instance, bit for bit");
     }
 
@@ -591,7 +591,7 @@ int main()
                   dynamics::Compressor c; test::ok (c.prepare (kFs, n, nch), "prepare"); c.setParams (p);
                   float* io[2] { a0.data(), a1.data() };
                   const float* k[2] { key0.data(), key1.data() };
-                  c.process (io, nch, n, k, nch);
+                  felitronics::test::run (c.process (io, nch, n, k, nch));
                   test::ok (allFinite (a0) && (nch == 1 || allFinite (a1)), "output stays finite");
                   test::ok (c.gainReductionDb() < -6.0,
                             "the detector recovered and is still compressing (GR " + std::to_string (c.gainReductionDb()) + " dB)");
@@ -612,7 +612,7 @@ int main()
             auto a = tone (n, 500.0, 0.5);
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             float* io[1] { a.data() }; const float* k[1] { key.data() };
-            c.process (io, 1, n, k, 1);
+            felitronics::test::run (c.process (io, 1, n, k, 1));
             test::ok (allFinite (a), "output stays finite");
             test::ok (c.gainReductionDb() < 1.0, "no runaway boost (GR " + std::to_string (c.gainReductionDb()) + " dB, cap was +60)");
             test::ok (rmsOf (a, n - 4000, n) < 2.0, "and the output level is sane");
@@ -632,7 +632,7 @@ int main()
             auto a = tone (n, 500.0, 0.5);
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             float* io[1] { a.data() }; const float* k[1] { key.data() };
-            c.process (io, 1, n, k, 1);
+            felitronics::test::run (c.process (io, 1, n, k, 1));
             test::ok (allFinite (a), "output finite at ratio " + std::to_string (ratio));
             test::ok (countDiff (a, tone (n, 500.0, 0.5)) == 0, "and 1:1 is transparent, bit for bit");
         }
@@ -651,7 +651,7 @@ int main()
             a[(std::size_t) 100] = poison;
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             float* io[1] { a.data() };
-            c.process (io, 1, n);
+            felitronics::test::run (c.process (io, 1, n));
             test::ok (c.gainReductionDb() < -6.0, "self-keyed detector recovered from a poisoned programme sample");
             bool tailFinite = true; for (int i = 1000; i < n; ++i) tailFinite &= (bool) std::isfinite (a[(std::size_t) i]);
             test::ok (tailFinite, "and everything after it is finite");
@@ -672,16 +672,16 @@ int main()
         const int n1 = 1000;
         for (int i = n1 - look; i < n1; ++i) R[(std::size_t) i] = 0.75f;    // a marker only R will hold
         float* ch2[2] { L.data(), R.data() };
-        c.process (ch2, 2, n1);
+        felitronics::test::run (c.process (ch2, 2, n1));
 
         std::vector<float> mono (20000, 0.0f);
         float* ch1[1] { mono.data() };
-        c.process (ch1, 1, 20000);                                          // R sits out for 417 ms
+        felitronics::test::run (c.process (ch1, 1, 20000));                                          // R sits out for 417 ms
         test::ok (c.latencySamples() == look, "latency unchanged by the channel-count change");
 
         std::vector<float> L3 (2048, 0.0f), R3 (2048, 0.0f);                // silence in
         float* ch3[2] { L3.data(), R3.data() };
-        c.process (ch3, 2, 1024);
+        felitronics::test::run (c.process (ch3, 2, 1024));
         double worst = 0.0;
         for (int i = 0; i < 1024; ++i) worst = std::max (worst, (double) std::fabs (R3[(std::size_t) i]));
         test::ok (worst == 0.0, "silence in, silence out on the returning channel (was 0.75)");
@@ -689,7 +689,7 @@ int main()
         // And the live channel must NOT have been reset along with it: the shared gain keeps running.
         std::vector<float> L4 (2048, 0.5f), R4 (2048, 0.5f);
         float* ch4[2] { L4.data(), R4.data() };
-        c.process (ch4, 2, 1024);
+        felitronics::test::run (c.process (ch4, 2, 1024));
         test::ok (countDiff (L4, R4) == 0, "both channels still receive the same gain (no image shift)");
     }
 
@@ -705,15 +705,15 @@ int main()
         dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
 
         auto loud = tone (n, 400.0, 0.7);
-        { auto a = loud; float* io[1] { a.data() }; c.process (io, 1, n); }
+        { auto a = loud; float* io[1] { a.data() }; felitronics::test::run (c.process (io, 1, n)); }
         test::ok (c.gainReductionDb() < -10.0, "loud RMS pass compressed");
 
         p.detector = dynamics::Detector::Peak; c.setParams (p);
         auto quiet = tone (n * 2, 400.0, core::dbToGain (-80.0));
-        { auto a = quiet; float* io[1] { a.data() }; c.process (io, 1, n * 2); }
+        { auto a = quiet; float* io[1] { a.data() }; felitronics::test::run (c.process (io, 1, n * 2)); }
 
         p.detector = dynamics::Detector::Rms; c.setParams (p);
-        { auto a = quiet; float* io[1] { a.data() }; c.process (io, 1, n * 2); }
+        { auto a = quiet; float* io[1] { a.data() }; felitronics::test::run (c.process (io, 1, n * 2)); }
         test::ok (std::fabs (c.gainReductionDb()) < 0.5,
                   "-80 dBFS material earns no reduction after Rms -> Peak -> Rms (was -8.5 dB)");
     }
@@ -727,13 +727,13 @@ int main()
         auto p = baseParams(); p.thresholdDb = 24.0; p.lookaheadMs = 0.0;   // no compression: isolate the delay
         dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1, 10.0), "prepare"); c.setParams (p);
         std::vector<float> loud ((std::size_t) n, 0.9f);
-        { auto a = loud; float* io[1] { a.data() }; c.process (io, 1, n); }
+        { auto a = loud; float* io[1] { a.data() }; felitronics::test::run (c.process (io, 1, n)); }
         test::ok (c.latencySamples() == 0, "lookahead 0 reported");
 
         p.lookaheadMs = 1.0; c.setParams (p);                               // 48 samples
         test::ok (c.latencySamples() == 48, "the new lookahead is reported");
         std::vector<float> silence ((std::size_t) n, 0.0f);
-        { float* io[1] { silence.data() }; c.process (io, 1, n); }
+        { float* io[1] { silence.data() }; felitronics::test::run (c.process (io, 1, n)); }
         double worst = 0.0; for (float v : silence) worst = std::max (worst, (double) std::fabs (v));
         test::ok (worst == 0.0, "silence in, silence out after the lookahead change (was 0.9)");
     }
@@ -764,8 +764,8 @@ int main()
                 ca.setParams (p); cb.setParams (p);
                 float* ia[2] { a0.data(), a1.data() }; const float* ka[2] { k0b.data(), k1.data() };
                 float* ib[2] { b0.data(), b1.data() }; const float* kb[2] { k0g.data(), k1.data() };
-                ca.process (ia, nch, n, ka, nch);
-                cb.process (ib, nch, n, kb, nch);
+                felitronics::test::run (ca.process (ia, nch, n, ka, nch));
+                felitronics::test::run (cb.process (ib, nch, n, kb, nch));
                 test::ok (countDiff (a0, b0) + countDiff (a1, b1) == 0,
                           "poisoned key == sanitised key, bit for bit");
             }
@@ -787,8 +787,8 @@ int main()
             ca.setParams (p); cb.setParams (p);
             float* ia[1] { a.data() }; float* ib[1] { b.data() };
             const float* k[1] { loudKey.data() };
-            ca.process (ia, 1, n);                            // three-argument form
-            cb.process (ib, 1, n, k, keyNc);                  // non-null key, count <= 0
+            felitronics::test::run (ca.process (ia, 1, n));                            // three-argument form
+            felitronics::test::run (cb.process (ib, 1, n, k, keyNc));                  // non-null key, count <= 0
             test::ok (countDiff (a, b) == 0,
                       "key with count " + std::to_string (keyNc) + " == self-keyed, bit for bit");
         }
@@ -809,7 +809,7 @@ int main()
         p.thresholdDb = -20.0; p.ratio = 4.0; p.attackMs = 1.0;
         auto a = tone (n, 400.0, 0.2); float* io[1] { a.data() };
         dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
-        c.process (io, 1, n, ptrs.data(), keyNc);
+        felitronics::test::run (c.process (io, 1, n, ptrs.data(), keyNc));
         test::ok (c.gainReductionDb() < -5.0, "the 17th key channel drove the gain (count is not clamped)");
     }
 
@@ -831,8 +831,8 @@ int main()
             {
                 std::vector<float> a ((std::size_t) n, (float) amp);
                 dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
-                if (mode == 0) { float* io[1] { a.data() }; c.process (io, 1, n); }
-                else for (int i = 0; i < n; ++i) { float* io[1] { a.data() + i }; c.process (io, 1, 1); }
+                if (mode == 0) { float* io[1] { a.data() }; felitronics::test::run (c.process (io, 1, n)); }
+                else for (int i = 0; i < n; ++i) { float* io[1] { a.data() + i }; felitronics::test::run (c.process (io, 1, 1)); }
                 gr[mode] = c.gainReductionDb();
             }
             test::approx (gr[0], gr[1], 1e-9,
@@ -851,10 +851,10 @@ int main()
 
         dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare");
         auto a = tone (n, 400.0, 0.5); float* io[1] { a.data() };
-        c.setParams (wild); c.process (io, 1, n);
+        c.setParams (wild); felitronics::test::run (c.process (io, 1, n));
         test::ok (allFinite (a), "the extreme-parameter block itself stays finite");
         auto b = tone (n, 400.0, 0.5); float* io2[1] { b.data() };
-        c.setParams (sane); c.process (io2, 1, n);
+        c.setParams (sane); felitronics::test::run (c.process (io2, 1, n));
         test::ok (allFinite (b), "and ordinary parameters afterwards produce finite audio");
         test::ok (std::isfinite (c.gainReductionDb()), "the gain-reduction state recovered");
 
@@ -864,7 +864,7 @@ int main()
         dynamics::Compressor c2; test::ok (c2.prepare (kFs, n, 1), "prepare");
         c2.setParams (huge);
         std::vector<float> quiet ((std::size_t) n, 0.0f); float* io3[1] { quiet.data() };
-        c2.process (io3, 1, n);
+        felitronics::test::run (c2.process (io3, 1, n));
         test::ok (allFinite (quiet), "an absurd makeup does not turn silence into NaN");
 
         // THE SUM, which bounding each term on its own does not bound: an UpCompress curve parked at
@@ -877,7 +877,7 @@ int main()
         c3.setParams (both);
         std::vector<float> sil ((std::size_t) n, 0.0f), key ((std::size_t) n, 0.5f);
         float* io4[1] { sil.data() }; const float* k4[1] { key.data() };
-        c3.process (io4, 1, n, k4, 1);
+        felitronics::test::run (c3.process (io4, 1, n, k4, 1));
         test::ok (allFinite (sil), "a +rangeDb boost PLUS a +400 dB makeup still produces finite audio");
         test::ok (std::isfinite (c3.gainReductionDb()), "and finite gain-reduction state");
     }
@@ -901,10 +901,10 @@ int main()
             if (bi == 2)                                     // one refused call in the middle, for `a` only
             {
                 float* two[2] { spare.data(), spare.data() };
-                a.process (two, 2, n);                       // 2 channels on a 1-channel instance: refused
+                test::ok (! a.process (two, 2, n), "2 channels on a 1-channel instance: refused, and it says so");
             }
-            a.process (ia, 1, n);
-            b.process (ib, 1, n);
+            felitronics::test::run (a.process (ia, 1, n));
+            felitronics::test::run (b.process (ib, 1, n));
         }
         test::ok (countDiff (ya, yb) == 0, "a refused call changed nothing about the stream that followed");
     }
@@ -921,7 +921,7 @@ int main()
             p.attackMs = 0.5; p.releaseMs = relMs;
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             auto loud = tone (n, 400.0, 0.8); float* io[1] { loud.data() };
-            c.process (io, 1, n);
+            felitronics::test::run (c.process (io, 1, n));
             test::ok (c.gainReductionDb() < -5.0, "a loud pass still earns reduction with releaseMs = " + std::to_string (relMs));
             test::ok (std::isfinite (c.gainReductionDb()), "and the state stays finite");
         }
@@ -943,7 +943,7 @@ int main()
         // reference: always stereo
         auto rL = L, rR = R;
         dynamics::Compressor cr; test::ok (cr.prepare (kFs, blk, 2, 50.0), "prepare"); cr.setParams (p);
-        for (int bi = 0; bi < 4; ++bi) { float* io[2] { rL.data() + bi * blk, rR.data() + bi * blk }; cr.process (io, 2, blk); }
+        for (int bi = 0; bi < 4; ++bi) { float* io[2] { rL.data() + bi * blk, rR.data() + bi * blk }; felitronics::test::run (cr.process (io, 2, blk)); }
 
         // under test: stereo, stereo, MONO (R sits out), stereo
         auto tL = L, tR = R;
@@ -952,8 +952,8 @@ int main()
         for (int bi = 0; bi < 4; ++bi)
         {
             float* io[2] { tL.data() + bi * blk, tR.data() + bi * blk };
-            if (bi == 2) { grBefore = ct.gainReductionDb(); ct.process (io, 1, blk); grAfter = ct.gainReductionDb(); }
-            else ct.process (io, 2, blk);
+            if (bi == 2) { grBefore = ct.gainReductionDb(); felitronics::test::run (ct.process (io, 1, blk)); grAfter = ct.gainReductionDb(); }
+            else felitronics::test::run (ct.process (io, 2, blk));
         }
         // The mono block itself sees only L, so L can differ from the reference from there on; what must
         // NOT happen is the survivor losing its in-flight audio at the moment R leaves.
@@ -979,7 +979,7 @@ int main()
             p.thresholdDb = -100.0; p.ratio = 4.0; p.kneeDb = 0.0; p.attackMs = 0.0; p.releaseMs = 0.0;
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             auto loud = tone (n, 400.0, 0.8); float* io[1] { loud.data() };
-            c.process (io, 1, n);
+            felitronics::test::run (c.process (io, 1, n));
             test::ok (c.gainReductionDb() < -0.5,
                       "the envelope still climbed out of zero with a 1e6 ms window (GR " + std::to_string (c.gainReductionDb()) + " dB)");
         }
@@ -990,7 +990,7 @@ int main()
             p.attackMs = 1.0e6; p.releaseMs = 50.0;
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             auto loud = tone (n, 400.0, 0.8); float* io[1] { loud.data() };
-            c.process (io, 1, n);
+            felitronics::test::run (c.process (io, 1, n));
             test::ok (c.gainReductionDb() < 0.0, "the gain reduction left zero with a 1e6 ms attack");
         }
         {   // GR follower on RELEASE: an INFINITE release must fall back to instant, not freeze
@@ -1000,10 +1000,10 @@ int main()
             p.attackMs = 0.5; p.releaseMs = std::numeric_limits<double>::infinity();
             dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
             auto loud = tone (n, 400.0, 0.8); float* io[1] { loud.data() };
-            c.process (io, 1, n);
+            felitronics::test::run (c.process (io, 1, n));
             test::ok (c.gainReductionDb() < -5.0, "a loud pass earned reduction");
             std::vector<float> quiet ((std::size_t) n, 0.0f); float* io2[1] { quiet.data() };
-            c.process (io2, 1, n);
+            felitronics::test::run (c.process (io2, 1, n));
             test::ok (c.gainReductionDb() > -0.5,
                       "and an infinite release still released (GR " + std::to_string (c.gainReductionDb()) + " dB, a frozen coefficient would hold it)");
         }
@@ -1045,10 +1045,10 @@ int main()
         p.detector = dynamics::Detector::Rms; p.rmsWindowMs = 50.0; p.thresholdDb = -60.0;
         dynamics::Compressor c; test::ok (c.prepare (kFs, n, 1), "prepare"); c.setParams (p);
         auto loud = tone (4096, 400.0, 0.8); float* io[1] { loud.data() };
-        c.process (io, 1, 4096);
+        felitronics::test::run (c.process (io, 1, 4096));
         test::ok (c.detectorLevel() > 0.1f, "the detector is charged");
         std::vector<float> silence ((std::size_t) n, 0.0f); float* io2[1] { silence.data() };
-        c.process (io2, 1, n);
+        felitronics::test::run (c.process (io2, 1, n));
         test::ok (c.detectorLevel() == 0.0f, "and is exactly zero after silence, not a subnormal tail");
         test::ok (c.gainReductionDb() == 0.0, "the gain-reduction state landed on exact zero too");
     }
@@ -1075,7 +1075,7 @@ int main()
         // An unprepared instance must do NOTHING, not something.
         std::vector<float> a (256, 0.5f); const auto in = a;
         float* io[1] { a.data() };
-        c.process (io, 1, 256);
+        test::ok (! c.process (io, 1, 256), "an unprepared process() is REFUSED (law 11)");
         test::ok (countDiff (a, in) == 0, "an unprepared process() leaves the buffer untouched");
 
         test::ok (c.prepare (kFs, 512, 2), "a sane configuration is accepted");
@@ -1093,7 +1093,7 @@ int main()
         std::vector<float> L ((std::size_t) n, 0.9f), R ((std::size_t) n, 0.9f);
         const auto Lin = L, Rin = R;
         float* io[2] { L.data(), R.data() };
-        c.process (io, 2, n);
+        test::ok (! c.process (io, 2, n), "a stereo call on a mono-prepared instance is REFUSED");
         test::ok (countDiff (L, Lin) == 0 && countDiff (R, Rin) == 0,
                   "a stereo buffer on a mono-prepared instance is returned untouched");
     }
@@ -1108,11 +1108,11 @@ int main()
         test::ok (c.prepare (kFs, n, 2, 10.0), "prepare");
         auto p = baseParams(); p.thresholdDb = -30.0; p.ratio = 4.0; p.lookaheadMs = 2.0;
         c.setParams (p);
-        c.process (io, 2, n, key, 1);                       // warm every branch before counting
+        felitronics::test::run (c.process (io, 2, n, key, 1));                       // warm every branch before counting
         const long before = g_allocs.load();
-        c.process (io, 2, n, key, 1);
-        c.process (io, 2, n);
-        c.process (io, 2, n, key, 1);
+        felitronics::test::run (c.process (io, 2, n, key, 1));
+        felitronics::test::run (c.process (io, 2, n));
+        felitronics::test::run (c.process (io, 2, n, key, 1));
         const long after = g_allocs.load();
         test::okNoAlloc (after == before, "keyed and unkeyed process() performed zero heap allocations");
     }
@@ -1140,9 +1140,9 @@ int main()
               for (int bi = 0; bi < blocks; ++bi)
               {
                   float* ia[1] { a.data() + bi * blk }; float* ib[1] { b.data() + bi * blk };
-                  ca.process (ia, 1, blk);
+                  felitronics::test::run (ca.process (ia, 1, blk));
                   cb.setParams (p);                                  // ...every single block
-                  cb.process (ib, 1, blk);
+                  felitronics::test::run (cb.process (ib, 1, blk));
               }
               test::ok (countDiff (a, b) == 0, "params pushed every block == pushed once, bit for bit");
               test::ok (rmsOf (b, blk * blocks / 2, blk * blocks) > 1e-3, "and it is still compressing, not collapsed to silence");
@@ -1164,7 +1164,7 @@ int main()
         for (int bi = 0; bi < 4; ++bi)
         {
             float* io[2] { L.data() + bi * blk, R.data() + bi * blk };
-            c.process (io, bi == 2 ? 1 : 2, blk);                    // block 2 is mono; block 3 is the RETURN
+            felitronics::test::run (c.process (io, bi == 2 ? 1 : 2, blk));                    // block 2 is mono; block 3 is the RETURN
         }
         // With gain == 1 the compressor is a pure delay, so L must be its own input shifted by `look`
         // at EVERY index past the first `look` samples — including across the return block.
@@ -1187,7 +1187,7 @@ int main()
         {   // charge the state on a real stream
             auto a = probeSignal (n, 0.0), b = probeSignal (n, 3.0);
             float* w[2] { a.data(), b.data() };
-            c.process (w, 2, n);
+            felitronics::test::run (c.process (w, 2, n));
         }
         test::ok (c.isPrepared() && c.latencySamples() == 96, "prepared and reporting its latency");
 
@@ -1196,7 +1196,7 @@ int main()
         test::ok (c.latencySamples() == 0, "reporting no latency rather than a stale one");
         auto before = probeSignal (n, 5.0); auto after = before;
         float* q[2] { after.data(), after.data() };
-        c.process (q, 2, n);
+        test::ok (! c.process (q, 2, n), "and process() on the now-unprepared instance is REFUSED");
         test::ok (countDiff (after, before) == 0, "and process() is a byte-for-byte no-op");
         (void) io;
     }
@@ -1367,7 +1367,7 @@ int main()
               {
                   float* io[2] { a0.data() + i, a1.data() + i };
                   const float* ks[2] { k0.data() + i, k1.data() + i };
-                  c.process (io, 2, 1, ks, 1 + 1);                 // one sample at a time, so the meter is per-sample
+                  felitronics::test::run (c.process (io, 2, 1, ks, 1 + 1));                 // one sample at a time, so the meter is per-sample
                   const float mine = off.process (k, 2, i);
                   const float theirs = c.detectorLevel();
                   if (std::memcmp (&mine, &theirs, sizeof (float)) != 0) ++diff;

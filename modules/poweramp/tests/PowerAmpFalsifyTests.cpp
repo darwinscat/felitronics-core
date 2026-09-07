@@ -58,7 +58,7 @@ std::vector<float> runMono (Params p, Voicing v, std::vector<float> x, int maxBl
     d.prepare (kSr, maxBlock, 4);
     d.setParams (p, v);
     float* io[1] { x.data() };
-    d.process (io, 1, (int) x.size());
+    felitronics::test::run (d.process (io, 1, (int) x.size()));
     return x;
 }
 
@@ -138,12 +138,12 @@ int main()
         PowerAmpStage a, b;
         a.prepare (kSr, 128, 4); b.prepare (kSr, 128, 4);
         a.setParams (p, v); b.setParams (p, v);
-        { float* io[1] { one.data() }; a.process (io, 1, (int) one.size()); }
+        { float* io[1] { one.data() }; felitronics::test::run (a.process (io, 1, (int) one.size())); }
         for (int off = 0; off < (int) split.size(); off += 128)
         {
             b.setParams (p, v);
             float* io[1] { split.data() + off };
-            b.process (io, 1, std::min (128, (int) split.size() - off));
+            felitronics::test::run (b.process (io, 1, std::min (128, (int) split.size() - off)));
         }
         ok (one == split, "oversized call matches explicit 128-sample chunking bit-for-bit");
     }
@@ -155,10 +155,17 @@ int main()
         std::vector<float> a (512, 0.1f), b (512, -0.1f), sentinel (512, 123.0f);
         PowerAmpStage d; d.prepare (kSr, 512, 4); d.setParams (p, v);
         float* io[3] { a.data(), b.data(), sentinel.data() };
-        d.process (io, 3, 512);
+        // LAW 11(b): the surplus channel is no longer "ignored" — the WHOLE call is refused, and the two
+        // prepared channels are left alone too. A prefix would have given them a latency and a gain the
+        // third does not have, which is a comb on fold-down rather than a visible fault.
+        ok (! d.process (io, 3, 512), "a 3-channel call on a 2-channel stage is REFUSED (law 11b)");
         bool untouched = true;
         for (float x : sentinel) untouched = untouched && (x == 123.0f);
-        ok (untouched, "third channel is ignored without touching its buffer");
+        ok (untouched, "third channel is not touched");
+        bool prefixUntouched = true;
+        for (float x : a) prefixUntouched = prefixUntouched && (x == 0.1f);
+        for (float x : b) prefixUntouched = prefixUntouched && (x == -0.1f);
+        ok (prefixUntouched, "...and neither are the two PREPARED channels: refused means nothing moved");
         ok (allFiniteAndBounded (a) && allFiniteAndBounded (b), "processed stereo channels remain finite");
     }
 

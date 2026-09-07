@@ -62,7 +62,8 @@ public:
         if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || maxBlock < 1) return false;
         fs_       = sampleRate;
         maxBlock_ = maxBlock;
-        channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
+        channels_ = maxChannels;
         os_       = (oversampleFactor >= 2) ? oversampleFactor : 1;
         if (os_ > 1 && ! ovs_.prepare (os_, channels_, tapsPerPhase)) return false;
 
@@ -100,21 +101,30 @@ public:
     void setParams (const Params& p) noexcept { params_ = p; applyParams(); }
 
     // In place, planar. RT-safe. n may exceed maxBlock — chunked internally, fully processed.
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). The width used to be clamped and the surplus left BIT-IDENTICAL to
+    // its input — measured at drive +24 dB, prepared 2 / called 4: max |out-in| was 0.94633 on a prepared
+    // plane and exactly 0 on a surplus one, i.e. no saturation at all. Refused whole now.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        const int nc = std::min (numChannels, channels_);
-        if (! prepared_ || nc <= 0 || n <= 0) return;                    // unprepared / failed-prepare → no OOB
-        dropStoppedCells (nc);                                           // before any audio: see the note there
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;                                   // unprepared / failed-prepare → no OOB
+        if (numChannels > channels_) return false;                       // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                                         // no samples: no time, no edge
+        const int nc = numChannels;
+        dropStoppedCells (nc);                                           // law 11(d): the edge is clocked by n
+        if (nc == 0) return true;
         // Chunk to maxBlock so a caller passing n > maxBlock is FULLY processed instead of silently
         // dropped. State carries across chunks via the members → bit-identical to one big call.
         // maxBlock_ ≥ 1 whenever prepared_ (prepare() rejects less), so the loop always advances.
         float* sub[core::kMaxChannels];
-        for (int off = 0; off < n; off += maxBlock_)
+        for (int off = 0; off < n; )
         {
             const int m = std::min (n - off, maxBlock_);
             for (int c = 0; c < nc; ++c) sub[c] = io[c] + off;
             processChunk (sub, nc, m);
+            off += m;                                                    // `off += maxBlock_` could step past INT_MAX
         }
+        return true;
     }
 
 private:
