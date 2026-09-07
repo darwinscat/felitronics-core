@@ -108,8 +108,10 @@ struct TruePeakLimiterParams
 //     property of its lowpass, and hiding the term is not the same as not having it — `mastering` has
 //     run at 64 taps, and therefore at +0.436, since it was written. A sweep of every fs·p/q with
 //     q ≤ 64 below 0.46 fs, net of the round-trip droop, confirms 2fs/5 is the maximum and that it
-//     SATURATES: 64, 80 and 96 taps all deliver +0.436 at 4×. Widen the pass band further and this term
-//     has to be re-derived again.
+//     holds at every taps count anything here uses (64, 80, 96, 128, 256 all give +0.436 at 4×), but NOT
+//     without limit: at 512 taps and 8× the winner becomes 4fs/9 (+0.132 net against 2fs/5's +0.108),
+//     because the pass band finally reaches 0.4444 fs. Re-derive when the cutoff moves, and re-derive
+//     when the taps grow far enough to deliver a smaller-M tone higher up.
 //   * GAIN MODULATION — and neither oversampling nor a slower release removes it. The attack is
 //     instantaneous, so the limited product is not band-limited and the downsampler overshoots
 //     re-band-limiting it. It SATURATES near 0.92 dB (4×) / 0.87 (8×) above ~5 dB of reduction, and
@@ -128,7 +130,10 @@ struct TruePeakLimiterParams
 // and the floors below are NOT inside that domain. Two measured examples of leaving it: alternating
 // ±500000 (i.e. +114 dBFS, inside the gate) at the release floor delivers +2.67 dB over, where the same
 // shape at a 1 ms release delivers +0.44 and at 50 ms +0.004; and with BOTH parameters on their floors
-// the dense witness reaches +1.59 (4×) / +1.56 (8×), past the figures above. Bringing even that corner
+// the dense witness reaches +1.87 (4×) / +1.82 (8×), past the figures above. Those two rose with the
+// taps default — they were +1.59 and +1.56 at 32 taps — because at both floors the limiter is an OS-rate
+// clipper and a longer, sharper FIR rings more re-band-limiting a signal of steps. Both are pinned per
+// taps count in the suite. Bringing even that corner
 // inside would need floors at 24 baseband samples (0.5 ms), which is a musical setting and would change
 // the sound of a legitimate one — so the corner is documented instead of clamped away. The only thing
 // proven for every input is the on-grid bound.

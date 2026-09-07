@@ -388,6 +388,11 @@ int main()
             check (lo.latencySamples() == 3, "TT7 a taps count below the oversampler's floor clamps to 4 -> latency 3");
             PowerAmpStage hi; hi.prepare (kSr, kMaxBlk, 4, 5000);
             check (hi.latencySamples() == 1023, "TT7 ...and above kMaxTapsPerPhase clamps to 1024 -> latency 1023");
+            // An ODD interior value. Every other point exercised here — 32, 64, 96, and both clamp
+            // results 4 and 1024 — is even, so `tpp -= tpp % 2` after the clamp passes all of them while
+            // silently giving a caller who asks for 65 a 64-tap filter and one sample less latency.
+            PowerAmpStage odd; odd.prepare (kSr, kMaxBlk, 4, 65);
+            check (odd.latencySamples() == 64, "TT7 an ODD taps count is honoured exactly: 65 -> latency 64");
         }
 
         TubePowerAmp fresh;                                          // not prepared

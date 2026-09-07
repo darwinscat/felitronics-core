@@ -1426,9 +1426,12 @@ int main()
                                - tp::truePeakDbFft (renderAt (in, sr, Setup { -1.0, 50.0, 1.0, F }, 0)[0], 16);
             test::ok (droop < 0.05, "F=" + std::to_string (F) + ": PREMISE — 2fs/5 now passes FLAT ("
                                     + dbs (droop) + " dB of droop), which is why its grid term can reach the output");
-            test::ok (tpw::deliveredBudgetDb (F) >= std::max (third, fifth) + tpw::kModulationEnvelopeDb - 1e-9,
-                      "F=" + std::to_string (F) + ": the budget carries the LARGER of the two grid terms ("
-                      + dbs (std::max (third, fifth)) + ")");
+            // EQUALITY, not a lower bound. ">=" is satisfied by any inflation of the budget, and an
+            // inflated budget weakens every other assertion in this file that spends it as a ceiling —
+            // adding 1.0 dB at 2x only passes all 232 checks harder.
+            test::approx (tpw::deliveredBudgetDb (F), std::max (third, fifth) + tpw::kModulationEnvelopeDb, 1e-9,
+                          "F=" + std::to_string (F) + ": the budget IS the larger grid term plus the envelope ("
+                          + dbs (std::max (third, fifth)) + " + " + dbs (tpw::kModulationEnvelopeDb) + ")");
         }
         // ...and the max is not cosmetic — neither tone wins everywhere, so a helper that hardcodes
         // either one is wrong at some factor.
@@ -1477,9 +1480,18 @@ int main()
                       "F=" + std::to_string (F) + ": at BOTH floors the worst witness is " + dbs (worst)
                       + " dB over — outside the " + dbs (tpw::deliveredBudgetDb (F))
                       + " dB envelope, and bounded well inside the unfloored +2.8");
+            // BOTH columns anchored to numbers, not only to each other. `worst < was + 0.40` alone is
+            // satisfied by making the two columns IDENTICAL — pass the default to both and it reads
+            // "0 < 0.40" and passes, which is a mutation that removes the comparison's whole subject.
+            const double wantNow[] = { 2.1585, 1.8683, 1.8242 }, wantWas[] = { 1.7969, 1.5874, 1.5609 };
+            const int fi = F == 2 ? 0 : (F == 4 ? 1 : 2);
+            test::approx (worst, wantNow[fi], 0.05, "F=" + std::to_string (F) + ": corner at the DEFAULT taps");
+            test::approx (was,   wantWas[fi], 0.05, "F=" + std::to_string (F) + ": corner at the OLD 32 taps");
+            test::ok (worst > was + 0.15,
+                      "F=" + std::to_string (F) + ": and the sharper default really does cost here ("
+                      + dbs (was) + " -> " + dbs (worst) + "), so the two columns are not the same run");
             test::ok (worst < was + 0.40,
-                      "F=" + std::to_string (F) + ": the sharper default costs under 0.40 dB HERE ("
-                      + dbs (was) + " -> " + dbs (worst) + "; measured +0.362 / +0.281 / +0.263 at 2x / 4x / 8x)");
+                      "F=" + std::to_string (F) + ": ...but under 0.40 dB (+0.362 / +0.281 / +0.263 at 2x / 4x / 8x)");
             if (F == 8)
                 test::ok (worst > tpw::deliveredBudgetDb (F),
                           "and at 8x it really is outside it (" + dbs (worst) + " > " + dbs (tpw::deliveredBudgetDb (F))

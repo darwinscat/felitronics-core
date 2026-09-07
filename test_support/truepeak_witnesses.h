@@ -130,8 +130,11 @@ inline constexpr double kModulationEnvelopeDb = 1.15;   // worst measured compon
 //        max      +1.2494   +0.4359   +0.1076      <- what it returns now
 //
 // A sweep of every fs*p/q with q <= 64 below 0.46 fs, net of the round-trip droop, confirms those are the
-// maxima and that they SATURATE: 64, 80 and 96 taps all deliver +0.4359 at 4x, so this does not have to
-// be re-derived again for a further widening of the same kind — only for one that moves the CUTOFF.
+// maxima at the taps counts anything here uses: 64, 80, 96, 128 and 256 all deliver +0.4359 at 4x. It is
+// NOT safe past that, and the boundary was found rather than assumed — at 512 taps and 8x the winner
+// changes to 4fs/9 (+0.1320 net against 2fs/5's +0.1076), because the pass band finally reaches 0.4444 fs.
+// So the rule is: re-derive when the CUTOFF moves, and re-derive when the taps grow far enough for a
+// smaller-M tone higher up to be delivered flat. kMaxTapsPerPhase is 1024, so both are reachable.
 inline double deliveredBudgetDb (int factor)
 {
     return std::max (gridBreachDb (1, 3, factor), gridBreachDb (2, 5, factor)) + kModulationEnvelopeDb;

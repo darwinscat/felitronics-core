@@ -36,23 +36,34 @@ namespace detail
 // and tapsPerPhase is the only thing that decides whether it does. The design DECLARES its own target
 // one line down — `beta = 9.0` is a ~90 dB Kaiser stopband — and everything above 0.50 fs folds
 // straight back into the audio band, so that number is the filter's job rather than a nicety.
-// Worst |H| over the whole fold region [0.5, factor/2] fs — the WORST of factors 2, 4 and 8, from a
-// 400k-point scan (they agree to 0.5 dB, and the worst is at 2x above 60 taps):
+// Worst |H| over the whole fold region [0.5, factor/2] fs — the WORST of factors 2, 4 and 8:
 //
-//        tpp      32       40       48       56       60       64       72       96      128
-//        dB    -26.9    -37.0    -51.1    -76.2    -90.7    -90.5    -91.9    -94.3    -97.9
+//        tpp      32       40       50       56       57      58      59      60      64      72
+//        dB    -26.9    -37.0    -55.7    -76.2    -82.6   -90.7   -89.8   -90.7   -90.5   -91.9
 //
-// So 60 is where the filter first DELIVERS the design it declares, and above it the stopband is on the
-// window's floor — further taps buy pass-band width, not rejection. THE DEFAULT USED TO BE 32, i.e. the
-// prototype delivered 27 dB where it promised 90.
+// Read that carefully, because it is NOT a step. Below ~58 the transition is genuinely unfinished and
+// the rejection is monotonically poor. At ~58 it reaches the Kaiser window's floor and then RIPPLES
+// there, +-1 dB, as the last sidelobe slides relative to the fold: 59 (-89.85) and 61 (-89.89) sit a
+// tenth of a dB the wrong side of the declared 90, while 63 and 65 are near -91.3. So "the first taps
+// count meeting -90.0" is 58, not 60, and that integer is a knife-edge artefact of testing a rippling
+// quantity against a hard bar — what the sweep establishes is where the transition FINISHES. THE
+// DEFAULT USED TO BE 32, i.e. the prototype delivered 27 dB where it promised 90; 64 sits at -90.46,
+// past the knee and on the floor. Above the knee further taps buy pass-band width, not rejection.
 //
-// End to end, and READ ITS SCOPE: on a Saturator (0.17 fs tone, tanh at +24 dB, 4x) the 3rd harmonic
-// lands at 0.51 fs — inside the transition band — and folded back to 0.49 fs at -44.7 dBc, where 64
-// taps put it at -94.0. That is the component the TAPS own. It is NOT a claim about total aliasing: a
-// tanh has infinitely many harmonics and the ones above the OS Nyquist fold inside the oversampled
-// domain, which no decimation filter reaches, so the total non-harmonic energy of a hard-driven
-// waveshaper barely moves (-31.97 -> -31.27 dBc at +24 dB of drive — marginally WORSE, since a flatter
-// pass band also delivers what had already folded). Total aliasing is the FACTOR's axis.
+// End to end on a Saturator (0.17 fs tone, 4x), TOTAL non-harmonic energy — every bin that is not a
+// harmonic BELOW Nyquist, so a harmonic that folded to get there counts as the aliasing it is:
+//
+//        drive     +0       +6      +12      +18      +24      +30      +36  dB
+//        32     -135.3    -60.1    -48.2    -44.3    -31.8    -25.3    -22.9  dBc
+//        64     -130.8   -132.3   -101.0    -50.3    -31.3    -24.8    -22.4  dBc
+//
+// At the drive this stage is actually used at — its own Params doc calls 1..6 dB the mastering range —
+// the taps remove 50 to 72 dB of aliasing. They stop helping above about +24 dB, where the harmonic
+// series reaches past the OS Nyquist and folds INSIDE the oversampled domain, which no decimation
+// filter can reach: that is the FACTOR's axis, and there the total is 0.5 dB worse, because a flatter
+// pass band also delivers what had already folded. The component the taps own at every drive is the
+// transition-band leakage — the 3rd harmonic of a 0.17 fs tone sits at 0.51 fs and folds to 0.49 fs,
+// where 32 taps left it at -45.5 dBc and 64 puts it at -139.4, i.e. into the float noise.
 // Pass-band flatness is a COROLLARY of the same width, not a second requirement: two oversampled
 // stages in series (the real assembly — a clipper in front of a limiter) then droop under 0.04 dB to
 // 0.41 fs, against -3.25 dB at 32. The pass-band edge follows 0.45 fs - c/tpp with c = 2.385 (0.1 dB),

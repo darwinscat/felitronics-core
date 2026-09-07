@@ -456,6 +456,21 @@ int main()
         float a[32] {}, b[32] {}; float* io[2] { a, b };
         test::ok (! sat.process (io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         test::ok (! sat.prepare (48000.0, 16, 2, 4, 2), "prepare(tapsPerPhase=2) fails (oversampler rejects <4)");
+        // BOTH CEILINGS, and both directions of the contract. The CHANGELOG says this REFUSES an
+        // out-of-range topology; nothing tested it, and a mutation replacing either refusal with a silent
+        // std::min() passed 484 checks. Silent clamping is the failure this repo rates worst — the caller
+        // gets a filter it did not ask for and no way to find out — and law 11 says prepare() is binding.
+        test::ok (! sat.prepare (48000.0, 16, 2, 65),          "prepare(oversampleFactor=65) is REFUSED, not clamped to 64");
+        test::ok (! sat.prepare (48000.0, 16, 2, 4, 1025),     "prepare(tapsPerPhase=1025) is REFUSED, not clamped to 1024");
+        test::ok (! sat.prepare (48000.0, 16, 2, std::numeric_limits<int>::max()),
+                  "prepare(oversampleFactor=INT_MAX) is REFUSED (it used to overflow factor*taps)");
+        test::ok (! sat.prepare (48000.0, 16, 2, 4, std::numeric_limits<int>::max()),
+                  "prepare(tapsPerPhase=INT_MAX) is REFUSED too");
+        // ...and the last LEGAL values on both axes are accepted, so a bound made exclusive is visible.
+        test::ok (sat.prepare (48000.0, 16, 2, 64) && sat.latencySamples() == 63,
+                  "the 64x ceiling itself is ACCEPTED (inclusive, and the taps default still applies)");
+        test::ok (sat.prepare (48000.0, 16, 1, 2, 1024) && sat.latencySamples() == 1023,
+                  "...and 1024 taps/phase is accepted, giving a 1023-sample round trip");
         test::ok (! sat.process (io, 2, 16), "...and after a FAILED prepare too, still reported");
         test::ok (sat.prepare (48000.0, 16, 2, 4, 32), "prepare valid");
         felitronics::test::run (sat.process (io, 2, 16));                                     // works

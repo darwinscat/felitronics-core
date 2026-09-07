@@ -474,12 +474,14 @@ int main()
     // 🔴 THE WINDOW USED TO STOP AT 10 kHz, AND THAT IS WHY THIS SUITE CERTIFIED tapsPerPhase = 32.
     // The decimator's transition band runs from 0.45 fs to the fold at 0.5 fs, so what leaks through it
     // lands between ~0.5 and 0.55 fs and folds back to 0.45-0.5 fs — i.e. 21.6-24 kHz at 48 k, entirely
-    // ABOVE the old 10 kHz cut. Measured on this fixture with the window at 10 kHz, a 3 kHz fundamental at
-    // +12 dB drive reads -77.9 dBc at BOTH 32 and 64 taps: the cells could not move, so the map read the
-    // taps count as irrelevant and its own comment attributed the floor it saw to "the oversampler's filter
-    // quality". Over the whole band the same cell reads -60.8 (32) against -77.9 (64), an 8 kHz fundamental
-    // reads -39.3 against -73.5, and the worst guitar-range cell reads -67.6 (32) against -76.6 (64) — so
-    // the shipped configuration FAILED this suite's own -70 dBc bar and the window hid it by 8 dB.
+    // ABOVE the old 10 kHz cut. Under that window the taps count read as irrelevant, and worse than
+    // irrelevant: at a 3 kHz fundamental and +12 dB of drive the 10 kHz window scored 32 taps BETTER than
+    // 64 (-77.8 against -77.4), which is how the map came to attribute the floor it saw to "the
+    // oversampler's filter quality" and call a sharper OS a future option.
+    // The numbers below are the ones this suite PRINTS, at both taps counts, so a reader can check them
+    // by running it: a 3 kHz fundamental at +12 dB goes -56.2 (32) -> -75.9 (64), and the worst
+    // guitar-range cell -68.7 -> -77.4, which is the shipped configuration FAILING this suite's own
+    // -70 dBc bar by 1.3 dB where the widened window shows an 8.7 dB gap.
     // Aliasing at 15 kHz is aliasing; the band ends at Nyquist, not at 10 kHz.
     const int aN = 8192, aWarm = 4096, aTail = 512, aAn = aWarm + kLat;
     auto aliasNHDbcTpp = [&] (int cyc, float dr, bool se, int tpp) -> double {
@@ -512,13 +514,13 @@ int main()
                 std::printf ("\n");
             }
         }
-        // The reference-free method still shows a ~-76 dBc FLOOR that is CONSTANT vs drive for low
-        // fundamentals (193 Hz reads -76/-75/-75 at 12/24/36 dB). That floor is NOT the oversampler's filter
-        // quality, and the earlier claim here that it was is refuted by measurement: it does not move at all
-        // between 32 and 64 taps/phase (-76.2 both), so it belongs to something else in the stage, and the
-        // nonlinearity adds NOTHING above it in the guitar range. What the taps DO move is everything the old
-        // 10 kHz window excluded (see the note above). The MAP shows the stage's aliasing rising above the
-        // floor only at HF + hot drive (the 8x / hard-class-B boundary). We gate the guitar range at -70 dBc.
+        // The reference-free method still shows a ~-78 dBc FLOOR that is nearly CONSTANT vs drive for low
+        // fundamentals (193 Hz reads -78.0 / -77.4 / -77.2 at 12 / 24 / 36 dB). That floor is NOT the
+        // oversampler's filter quality, and the earlier claim here that it was is refuted by the two maps
+        // above: it barely moves between 32 and 64 taps (-78.4 against -78.0), so it belongs to something
+        // else in the stage, and the nonlinearity adds nothing above it in the guitar range. What the taps
+        // DO move is everything the old 10 kHz window excluded. The MAP shows the stage's aliasing rising
+        // above the floor only at HF + hot drive (the 8x / hard-class-B boundary). Gate at -70 dBc.
         double worstGuitar = -300;
         for (int c : { 33, 171 }) for (float dr : { 12.0f, 24.0f }) worstGuitar = std::max (worstGuitar, aliasNHDbc (c, dr, true));
         std::printf ("       worst guitar-range cell (≤1.2 kHz fund, ≤24 dB SE) = %.1f dBc (OS floor ≈ -76)\n", worstGuitar);

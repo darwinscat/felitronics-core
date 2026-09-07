@@ -47,9 +47,10 @@
 // aliasing gate (PowerAmpGoldenTests, "reference-free non-harmonic energy") declared that adequate. It
 // is not, and the gate could not see why: its analysis window stopped at 10 kHz, which is BELOW where
 // the transition-band leakage lands. Over the whole band the same gate reads −68.7 dBc at 32 taps — a
-// FAILURE of its own −70 dBc bar — against −77.4 at the core default of 64; a 3 kHz fundamental at
-// +12 dB drive goes −56.2 → −75.9 dBc. (Both figures come from the suite itself, which now prints the
-// map at BOTH taps counts, so they are reproducible by running it rather than quoted from a probe.)
+// FAILURE of its own −70 dBc bar, by 1.3 dB — against −77.4 at the core default of 64, an 8.7 dB gap;
+// a 3 kHz fundamental at +12 dB drive goes −56.2 → −75.9 dBc. (Every figure here is one the suite
+// PRINTS, at both taps counts, so it is reproducible by running it rather than quoted from a probe —
+// an earlier revision of this note quoted probe numbers that the suite does not produce.)
 // So the default is the core's now, and the knob is exposed: a live rig that would rather have the 32
 // samples back than the rejection can still ask for 32, which it previously could not express at all.
 // It is not free: the stage costs 1.24 %RT at 32 taps and 2.43 at 64 (48 kHz, stereo, 4x, block 512),
@@ -129,7 +130,11 @@ public:
     // higher factor (e.g. 32) to build an alias-free reference for null comparison. Latency is
     // tapsPerPhase-1 regardless of factor, so 4x and 32x stay sample-aligned. `tapsPerPhase` takes the
     // core's own default (see the TAPS note above and PolyphaseOversampler.h for its derivation);
-    // passing it explicitly pins a topology against that default. NB the golden battery lifted from
+    // passing it explicitly pins a topology against that default. It is CLAMPED to [4, 1024], not
+    // refused — this prepare() returns void and always has, so a rejected value would leave the stage
+    // unprepared with no way to say so. That is deliberately UNLIKE `Saturator` and `TruePeakLimiter`,
+    // whose prepare() returns bool and therefore refuses; a caller that needs the refusal should read
+    // latencySamples() back and compare, since it is tapsPerPhase - 1 by construction. NB the golden battery lifted from
     // OrbitCab runs at the DEFAULT, not at the old 32: what it pins is the stage's structure (processing
     // order, guards, chunk boundaries, block-size determinism, the feel gate), none of which the taps
     // count touches, and it carries separate two-sided checks at an explicit 32 and 96 for the topology

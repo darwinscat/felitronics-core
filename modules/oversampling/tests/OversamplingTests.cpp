@@ -139,6 +139,10 @@ int runTapsTests()
         // Liveness of the instrument, asserted before it is believed. It reads the design's own -6.02 dB
         // cutoff anchor, and it separates two topologies by 40 dB on the same frequency: an instrument
         // that could only ever read "very small" would pass the table below by being deaf.
+        g_prepareRefused = false;                  // BEFORE the first probe, not after the loop below:
+                                                   // placed later it covered neither the factor sweep nor
+                                                   // the separation check, both of which a +1e9 sentinel
+                                                   // satisfies. Same shape as the defect this group pins.
         const double anchor = roundTripDb (4, -1, 0.45, 1);
         test::approx (anchor, -12.041, 0.05,
                       "PRECONDITION: the round trip reads its own 0.45 fs cutoff at -12.04 dB (= 2 x -6.02)");
@@ -159,15 +163,28 @@ int runTapsTests()
                       "factor " + std::to_string (factor) + ": 32 taps did NOT (" + std::to_string (was)
                       + " dB) — the defect this default closes, and the reason it is not a droop question");
         }
-        // 48 taps is not a cheaper way to satisfy it, and 60 is where it first holds: pinned so that
-        // "somewhere between 32 and 64" cannot be quietly re-opened.
-        g_prepareRefused = false;
-        const double at48 = worstFoldDb (4, 48), at60 = worstFoldDb (4, 60);
+        // WHERE THE KNEE IS, and why "the first taps count that passes" is the wrong question. Below ~58
+        // the transition is unfinished and the rejection is monotonically poor; at ~58 it reaches the
+        // Kaiser floor and RIPPLES there by about a dB, so 59 and 61 fall a tenth of a dB short while 58,
+        // 60 and 64 clear it. An earlier version of this comment said "60 is where it first holds" — it
+        // is 58, and the integer is an artefact of a hard bar on a rippling quantity. Pinned as the KNEE
+        // plus the ripple, which is what is actually true, so neither can be quietly re-opened.
+        const double at48 = worstFoldDb (4, 48), at57 = worstFoldDb (4, 57), at58 = worstFoldDb (4, 58);
+        const double at59 = worstFoldDb (4, 59), at61 = worstFoldDb (4, 61);
         test::ok (! g_prepareRefused,
-                  "PRECONDITION: every probe above actually PREPARED — a refused prepare returns +1e9, which "
-                  "satisfies an upper bound without measuring anything");
+                  "PRECONDITION: every probe in this group actually PREPARED — a refused prepare returns "
+                  "+1e9, which satisfies an upper bound without measuring anything");
         test::ok (at48 > -60.0, "48 taps still misses the declared stopband by ~38 dB");
-        test::ok (at60 <= -90.0, "60 taps is where it first holds — the default rounds that up to 64");
+        std::printf ("       knee: 48 -> %.2f, 57 -> %.2f, 58 -> %.2f, 59 -> %.2f, 61 -> %.2f dB\n", at48, at57, at58, at59, at61);
+        test::ok (at57 > -88.0, "57 taps still misses it — the transition is genuinely unfinished below the knee");
+        test::ok (at58 <= -90.0, "58 taps is the FIRST that meets it (not 60, as this once claimed)");
+        // The ripple stated as a PROPERTY rather than as integers crossing a bar. `at61 > -90.0` reads
+        // -90.00 here — a knife-edge that a different libm could flip, and an assertion whose margin is
+        // its own rounding is not an assertion. That MORE taps can be WORSE is the real content, and it
+        // has 0.8 dB of room: monotone-in-taps is exactly what a reader would assume and it is false.
+        test::ok (at59 > at58 + 0.5,
+                  "59 taps is measurably WORSE than 58 (" + std::to_string (at59) + " vs " + std::to_string (at58)
+                  + ") — the stopband ripples on the window floor, so the knee is a region, not an integer");
     }
 
     // ---------------------------------------------------------------- 2. end to end, through a real nonlinearity
@@ -195,7 +212,7 @@ int runTapsTests()
         auto aliasDbc = [&] (int taps)
         {
             oversampling::PolyphaseOversampler os;
-            (void) (taps < 0 ? os.prepare (4, 1) : os.prepare (4, 1, taps));
+            if (! (taps < 0 ? os.prepare (4, 1) : os.prepare (4, 1, taps))) g_prepareRefused = true;
             const int n = kSettle + kWin;
             std::vector<float> x ((std::size_t) n), osb ((std::size_t) n * 4);
             for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) (0.9 * std::sin (2.0 * kPi * f0 * (double) i));
@@ -211,7 +228,10 @@ int runTapsTests()
                              20.0 * std::log10 (amp (x, folds[i], kSettle) / std::max (1e-30, fund)));
             return 20.0 * std::log10 (amp (x, folds[0], kSettle) / std::max (1e-30, fund));
         };
+        g_prepareRefused = false;
         const double now = aliasDbc (-1), was = aliasDbc (32);
+        test::ok (! g_prepareRefused, "PRECONDITION: both alias probes prepared — a refusal emits silence, "
+                                      "and -inf dBc satisfies every upper bound below");
         std::printf ("       tanh at 0.17 fs, 4x: the 0.51 -> 0.49 fs fold = %.2f dBc at the default, %.2f dBc at 32 taps\n",
                      now, was);
         test::ok (was > -50.0, "32 taps let the transition-band fold through at " + std::to_string (was)
@@ -294,6 +314,14 @@ int runTapsTests()
         // The OTHER factor of the same product. `Saturator` hands its oversampleFactor straight through
         // with no ceiling of its own, so prepare(INT_MAX, 1) on the default taps was UBSan-confirmed
         // signed overflow and then a length_error out of assign() — a terminate under -fno-exceptions.
+        // The LITERAL numbers, not the constants. Every check here phrased as `kMax + 1` / `kMax` moves
+        // with the constant, so `kMaxFactor = 64 -> 63` passes them all while silently dropping the 64x
+        // support the header documents. A bound is a promise to callers, and callers write integers.
+        test::ok (oversampling::PolyphaseOversampler::kMaxFactor == 64
+                    && oversampling::PolyphaseOversampler::kMaxTapsPerPhase == 1024,
+                  "the documented ceilings are 64x and 1024 taps/phase — pinned as numbers, not as themselves");
+        test::ok (! big.prepare (65, 1), "factor 65 is refused (the documented ceiling is 64)");
+        test::ok (! big.prepare (4, 1, 1025), "1025 taps/phase is refused (the documented ceiling is 1024)");
         test::ok (! big.prepare (oversampling::PolyphaseOversampler::kMaxFactor + 1, 1),
                   "a factor above kMaxFactor is refused too — either argument alone can overflow N");
         test::ok (! big.prepare (std::numeric_limits<int>::max(), 1),
@@ -413,6 +441,20 @@ int main()
     // channels_ defaults to 0 and prepare() rejects bad args BEFORE mutating dims, so misuse is a safe no-op.
     test::group ("PolyphaseOversampler: safe before prepare / after failed prepare");
     {
+        // Sentinels, because "no-op" is a claim about the CALLER's buffers and nothing here read them
+        // back: a downsample() that zeroed its output when unprepared passed every check below.
+        float sentinelIn[8], sentinelOut[8];
+        for (int i = 0; i < 8; ++i) { sentinelIn[i] = 0.5f + 0.1f * (float) i; sentinelOut[i] = -1.0f - (float) i; }
+        {
+            oversampling::PolyphaseOversampler unprepped;
+            const float* si[1] { sentinelIn }; float* so[1] { sentinelOut };
+            unprepped.upsample (si, 1, 8, so);
+            unprepped.downsample (si, 1, 2, so);
+            bool untouched = true;
+            for (int i = 0; i < 8; ++i) untouched = untouched && sentinelOut[i] == -1.0f - (float) i;
+            test::ok (untouched, "unprepared up/downsample leave the caller's OUTPUT buffer untouched, "
+                                 "not merely 'do not crash'");
+        }
         oversampling::PolyphaseOversampler os;         // NOT prepared (channels_ == 0)
         float base[8] { 0.1f, 0,0,0,0,0,0,0 }; float osb[32] {};
         const float* in[1] { base }; float* outo[1] { osb };

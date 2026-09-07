@@ -13,25 +13,40 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   between 0.45 fs and the fold at 0.50 fs, and `tapsPerPhase` is the only thing that decides whether it
   does. The design DECLARES its own target one line from the taps — `beta = 9.0`, a ~90 dB Kaiser
   stopband — and **at 32 taps it delivered 27 dB.** Everything above 0.50 fs folds straight back into the
-  audio band, so that is not a nicety: measured end to end on a `Saturator` (0.17 fs tone, tanh at
-  +24 dB, 4×), the 3rd harmonic sits at 0.51 fs — just inside the transition band — and folded back to
-  0.49 fs at **−44.7 dBc**; at 64 taps that line is **−94.0 dBc**. **Scope, because it is easy to
-  overstate:** that is the component the TAPS own. A tanh has infinitely many harmonics and the ones
-  above the OS Nyquist fold inside the oversampled domain, where no decimation filter reaches them — so
-  the TOTAL non-harmonic energy of a hard-driven waveshaper barely moves (**−31.97 → −31.27 dBc** at
-  +24 dB of drive, i.e. marginally worse, since a flatter pass band also delivers what had already
-  folded). Total aliasing is the FACTOR's axis; the transition band is this one. Worst rejection over
-  the whole fold region, all three factors: 32 → −27 dB, 48 → −52, **60 → −90.7 (the first value that
-  honours the declared design)**, 64 → −90.8, 96 → −94.3. 64 is the smallest round number above that
-  floor, and above the floor further taps buy pass-band width rather than rejection — which is why the
-  answer is not 96.
+  audio band, so that is not a nicety. Measured end to end on a `Saturator` at 0.17 fs and 4×, TOTAL
+  non-harmonic energy — every bin that is not a harmonic BELOW Nyquist, so a harmonic that folded to get
+  there counts as the aliasing it is:
+
+    drive     +0       +6      +12      +18      +24      +30      +36  dB
+    32     −135.3    −60.1    −48.2    −44.3    −31.8    −25.3    −22.9  dBc
+    64     −130.8   −132.3   −101.0    −50.3    −31.3    −24.8    −22.4  dBc
+
+  **At the drive this stage is used at — `Saturator::Params` calls 1..6 dB the mastering range — the
+  taps remove 50 to 72 dB of aliasing.** They stop helping above about +24 dB, where the harmonic series
+  reaches past the OS Nyquist and folds INSIDE the oversampled domain, which no decimation filter can
+  reach: that is the oversampling FACTOR's axis, and there the total is 0.5 dB worse, because a flatter
+  pass band also delivers what had already folded. The component the taps own at every drive is the
+  transition-band leakage — the 3rd harmonic of a 0.17 fs tone lands at 0.51 fs and folds to 0.49 fs,
+  where 32 taps left it at −45.5 dBc and 64 puts it at −139.4, into the float noise. (That last pair is
+  one tone landing in one of the kernel's nulls; the honest figure for what 64 taps give ANYWHERE in the
+  fold region is the worst case below, −90.5 dB, not the null.) Worst rejection over
+  the whole fold region, worst of factors 2/4/8: 32 → −26.9 dB, 48 → −51.1, 56 → −76.2, 57 → −82.6,
+  **58 → −90.7**, 59 → −89.8, 60 → −90.7, **64 → −90.5**, 96 → −94.3. Read as a knee, not a step:
+  below ~58 the transition is genuinely unfinished, at ~58 it reaches the Kaiser window's floor and then
+  RIPPLES there by about a dB, so 59 and 61 fall a tenth of a dB short while 58, 60 and 64 clear it.
+  "The first taps count meeting −90.0" is therefore 58, and that integer is an artefact of a hard bar on
+  a rippling quantity. 64 is the round number past the knee; above it further taps buy pass-band width
+  rather than rejection — which is why the answer is not 96.
   - **The pass band is the COROLLARY, and it is the half that was already written down.** Two oversampled
     stages in series — a clipper in front of a limiter, the real assembly — cost **−1.549 dB at 17.6 kHz
     and −6.033 at 18.5 kHz at 44.1 kHz** on the old default, i.e. every consumer that built that chain got
     a ~19 kHz lowpass silently. They now cost **+0.000 and −0.610**. `felitronics::mastering` has passed 64
     explicitly since it was written and is **bit-identical** across this change (verified over 942 912
     float32 values, 18 configurations; the same stand shows the DEFAULT paths differing, so it is not a
-    blind null). Any caller that passes `tapsPerPhase` explicitly is likewise bit-identical.
+    blind null). A caller passing `tapsPerPhase` explicitly is likewise bit-identical — with one
+    exception, which is the new guard below rather than the default: a topology that used to be accepted
+    and is now refused (`factor` above 64, `tapsPerPhase` above 1024) does not "produce the same bits",
+    it produces a `false` from `prepare()`.
   - **LATENCY MOVES, and it is host-visible.** Every affected stage reports `tapsPerPhase − 1`, so
     **31 → 63** samples; `TruePeakLimiter` at its default 1 ms lookahead and 48 kHz goes **79 → 111**.
     Read it from `latencySamples()`, which is what `mastering::MasteringChain` already does.
@@ -54,8 +69,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     is now **2fs/5 rather than fs/3**, so the grid-geometry term goes **+0.302 → +0.436 dB at 4×** and
     **+0.075 → +0.108 at 8×** (unchanged at 2×, where fs/3 still dominates at +1.250). The old figures
     were a property of the lowpass, not of the limiter — `mastering` has been running at +0.436 all along.
-    2fs/5 is now a witness in the ceiling matrix, and the whole ceiling suite runs on the SHIPPED topology
-    instead of a hardcoded 32. **The one place the sharper filter costs** is the degenerate corner with
+    2fs/5 is now a witness in the ceiling matrix, and the CHARACTERISATION battery — everything reached
+    through `Setup`/`renderAt`, including the reference oracle it nulls against — runs on the SHIPPED
+    topology instead of a hardcoded 32. Roughly two dozen guard and plumbing checks still spell 32 out on
+    purpose; those are about refusal and resumption, not about the filter. **The one place the sharper filter costs** is the degenerate corner with
     lookahead AND release both at their floors, where re-band-limiting a step rings more: **+0.36 / +0.28 /
     +0.26 dB at 2× / 4× / 8×**, pinned. The ON-GRID bound, the only thing actually promised, is unchanged.
   - **Source-level API break beyond the defaults:** `PowerAmpStage::prepare` gains a fourth parameter,
