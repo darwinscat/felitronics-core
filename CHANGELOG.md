@@ -7,6 +7,50 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **BREAKING (behaviour), `dynamics`, `deesser`, `dynamiceq`, `poweramp`, `multiband`, `core`: LAW 11c —
+  A PAUSE IS SILENCE.** A call with `nch == 0, n > 0` now advances a stage's SHARED, one-per-instance
+  ballistics exactly as `n` samples of digital silence at a live width would, instead of freezing them.
+  Law 11(d) already called such a call a GAP IN THE STREAM rather than a no-op — audio time PASSED — and
+  a detector standing still through passing time contradicts the sentence that made the grid advance.
+  Per-channel memory keeps being dropped exactly as before (11a/11d are untouched), and `reset()` is not
+  the answer either: it claims a stream RESTART where the caller said a gap.
+  - **What the freeze cost, measured.** `dynamics::Compressor` held **-25.311 dB of gain reduction
+    through a full second of gap** where the same second of silence releases to -2.076, and dipped the
+    return by **-22.11 dB** on material below its threshold (-24.09 dB through ten seconds);
+    `dynamiceq::DynamicEqBand` held -21.774 against -2.985; `deesser::DeEsser` -8.000 against -1.104;
+    `dynamics::TransientShaper` moved the return by 1.76-2.60 dB. The loudest is `dynamics::NoiseGate`,
+    and it is not a shifted envelope but a state machine that never fired: a gate that has to CLOSE
+    through a pause stayed wide open, and a -54 dBFS tone on the return came out at -54 where silence
+    gates it to -144 — **89.99 dB, 100 % of the construction ceiling.** All of those are now 0.00 dB.
+  - **Seven addresses, chosen by MECHANISM.** The five above, plus `dynamiceq::LaneDynamics` (which
+    deliberately DISENGAGED — the "dynamics were switched off" verb, not the "time passed" one; its lanes
+    now run the control loop at width zero) and `poweramp::PowerAmpStage`, whose one shared sag supply
+    and thirteen block-rate glides stopped dead on a gap. `multiband::MultibandProcessor` forwards a gap
+    to every band exactly once — it used to forward it TWICE to a bypassed band, invisible under freeze
+    and a double clock under this law.
+  - **`limiter::TruePeakLimiter` is deliberately NOT included.** It does a full `reset()` on a gap, which
+    is wrong under any answer (gain reduction -5.08 dB to 0.00, a 48-sample hole on the return), but its
+    ballistics are a sliding lookahead window rather than an exponential, and its per-channel state is
+    audio that has not been emitted yet. That is its own item (P29) with its own rule.
+  - **Bit-exactness, with its area.** Every call with `nch > 0` is bit-identical to the base — verified by
+    hash over all seven stages, every mode x detector x link x control period, with width sweeps,
+    self-keyed and externally keyed, and the gain-reduction tap. Two exceptions, each with its own test:
+    `NoiseGate` now drops a stopped lane's sidechain high-pass (law 11a, which it never had — worth
+    **89.99 dB** on a narrowing as well as on a gap), and `MultibandProcessor` no longer hands a bypassed
+    band a row of NULL planes on a narrowing call, **which was a segfault, not a wrong number**.
+  - **Cost.** The silent recurrence is autonomous, so it reaches a bitwise fixed point and the rest of the
+    pause is free; and once the detector level reaches `core::kGainToDbFloor` the curve's output is a
+    constant, so the per-sample work collapses to one multiply-add. `pow(c, n)` is deliberately not used —
+    it is a different number from `n` rounded multiplications. The horizon is a property of the TIME
+    CONSTANT, not of the pause: 23 609 samples at a 5 ms release, 457 808 at 100 ms, 4 461 677 at 1 s, and
+    not reached in 200 000 000 at the coefficient cap.
+  - **New API.** `core::kGainToDbFloor` and `core::sameBits`; `EnvelopeFollower::stateWord`/
+    `advanceSilence`, `GainReductionFollower::advanceConstant`, `GainReductionPath::advanceSilence`,
+    `LinkedDetector::stateWord`/`advanceSilence`, `poweramp::PowerAmpStage::sagDroop`. Additive only.
+  - `dynamiceq::LaneDynamics`' park counter is now a saturating `long long`: as a `long` it is 32 bits on
+    the MSVC row, where `parked += n` at 48 kHz is signed overflow after 12.4 hours — unreachable while a
+    gap disengaged a lane in one step, reachable the moment a pause became something a lane spends.
+
 - **BREAKING (behaviour + latency), `oversampling`, `saturation`, `limiter`, `poweramp`:** **the shipped
   `tapsPerPhase` default rises from 32 to 64, and the reason is aliasing, not the pass band.**
   `PolyphaseOversampler`'s cutoff is FIXED at 0.90 × baseband Nyquist, so its transition band has to fit

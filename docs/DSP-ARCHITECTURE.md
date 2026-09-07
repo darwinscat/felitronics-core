@@ -345,20 +345,63 @@ the CPU at runtime, invisible to any build. Full write-up:
    `multiband::MultibandCompressor`: `prepare(2)`, then a refused `prepare(0)`, then `process(io, 2, 64)`
    still returned true and still processed.
 
-   **11c. WHAT LAW 11 DOES NOT YET SAY: THE SHARED DETECTOR ON A CLOCK-ONLY CALL.** 11(d) settles the
-   grid and the per-channel falling edge. It does not settle what a stage's SHARED, one-per-instance
-   ballistics do while `nch == 0` — and the core gives **three different answers today**, which is the
-   argument for deciding it rather than leaving it: **freeze** (`Compressor`, `DeEsser`, `DynamicEqBand`,
-   `TransientShaper`, `NoiseGate`), **reset everything** (`limiter::TruePeakLimiter`, whose
-   `nc != lastNc_` guard now reaches `nc == 0` and clears the whole state — measured, gain reduction
-   -5.08 dB to 0.00 and a 48-sample hole on the return), and **disengage** (`dynamiceq::LaneDynamics`,
-   which drops its detectors deliberately). The freeze case: Measured: `dynamics::Compressor` holding
-   **-16.71 dB of gain reduction through a full second of zero-width calls**, then dipping the return by
-   **-16.62 dB** on material that arrives below its threshold; the same shape sits in `DeEsser`,
-   `DynamicEqBand`, `TransientShaper` and `NoiseGate`. Two answers are defensible — run the detector on
-   the silence that audio time says went by, or treat "every channel stopped" as a reset — and they
-   differ audibly, so this is a product decision and not a bug to be patched quietly. **Recorded here
-   rather than guessed**; the address is `dynamics::Compressor::process` and its four siblings.
+   **11c. A PAUSE IS SILENCE.** A clock-only call advances a stage's SHARED, one-per-instance ballistics
+   **exactly as `n` samples of digital silence at a live width would**. Not frozen, not reset: the same
+   arithmetic the audio path runs, with the detector's input at digital zero. This follows from 11(d)
+   rather than adding to it — that clause already says the call is a GAP IN THE STREAM and not a no-op,
+   so audio time PASSED, and a detector that stands still through passing time contradicts the same
+   sentence that made the grid advance. `reset()` is not the answer either, for the reason P19 separated
+   the verbs: `reset()` is a stream RESTART and claims more than the caller said, while
+   `clearAudioState()` is a stop. The core used to give **three** answers here — freeze (`Compressor`,
+   `DeEsser`, `DynamicEqBand`, `TransientShaper`, `NoiseGate`), reset (`limiter::TruePeakLimiter`), and
+   disengage (`dynamiceq::LaneDynamics`) — and the freeze is what it cost: `Compressor` held **-25.311 dB
+   of gain reduction through a full second of zero-width calls** where the same second of silence
+   releases to -2.076, and dipped the return by **-22.11 dB** on material below its threshold (-24.09 dB
+   through a ten-second gap); `DynamicEqBand` held -21.774 against -2.985; `DeEsser` -8.000 against
+   -1.104. The loudest was `NoiseGate`, and it is not a shifted envelope but a state machine that never
+   fired: a gate that has to CLOSE through a pause stayed wide open, and a -54 dBFS tone on the return
+   came out at -54 where silence gates it to -144 — **89.99 dB, 100 % of the construction ceiling**
+   (`-floorDb` = 90 dB).
+
+   **THE ADDRESSES ARE THE MECHANISM, NOT A LIST**: shared, one-per-instance ballistics that a zero-width
+   call leaves without a clock. Seven today — the five above plus `dynamiceq::LaneDynamics` (whose lanes
+   now run the control loop at width zero, where the Stereo lane's linked probe over zero columns is
+   exactly `+0.0f` and L/R/M/S take the same "this lane stopped" branch they take at width one) and
+   `poweramp::PowerAmpStage`, whose ONE shared sag supply and thirteen block-rate glides stopped dead on
+   a gap. A composite forwards the gap rather than swallowing it (`multiband::MultibandProcessor` does,
+   per band, exactly once — it used to do it twice for a bypassed band, which was invisible under freeze
+   and a double clock under this law). `analysis::LoudnessMeter` had already answered this way on its own:
+   at `nch == 0` its sub-hop windows keep sliding as zero-energy hops.
+
+   **WHY IT IS WELL POSED AT WIDTH ZERO.** The linked level of an all-zero frame is exactly `+0.0f` at
+   EVERY width, width zero included (`linkAmplitudeImpl` returns 0 for `numChannels <= 0`), so the silent
+   trajectory does not depend on how wide the caller's silence was — which is what lets a pause be
+   compared against a silence at all. The comparison is at the SAME CALL BOUNDARIES: every stage here
+   flushes once per call, so a gap cut into three pieces equals a silence cut into the same three. And it
+   is stated after the law-11a falling edge has fired: per-channel memory is dropped exactly as before,
+   so the detector meets zeros rather than a ring-down. **An external key is still consumed** — the
+   PROGRAMME is what stopped, not the key, and `process(zeros, nch, n, key, nk)` runs the detector on the
+   key, so a pause that ignored it would differ from the silence it is defined to equal.
+
+   **THE COST IS BOUNDED BY THE BALLISTICS, NOT BY THE PAUSE.** The silent recurrence is AUTONOMOUS, so it
+   reaches a bitwise fixed point and everything past that point is free; and once the detector level
+   reaches `core::kGainToDbFloor` the dB conversion returns the same bits for every smaller level, so the
+   curve's output is a constant and the per-sample work collapses to one multiply-add. `pow(c, n)` is
+   deliberately NOT used: it is a different number from `n` rounded multiplications, and it would buy
+   speed with the bit-exactness this law is stated in. Be precise about the horizon, because the obvious
+   claim is false: the recurrence does NOT reach zero — it parks on a SUBNORMAL, and `flushDenormals()` is
+   what turns that into a real zero — and the settling length is a property of the TIME CONSTANT, measured
+   at 48 kHz as **23 609 samples for a 5 ms release, 457 808 for 100 ms, 4 461 677 for 1 s, and not
+   reached in 200 000 000 at the coefficient cap.** "A ten-hour gap costs what a ten-second one costs" is
+   true only past that horizon.
+
+   **THE LIMITER IS DELIBERATELY OUT.** `limiter::TruePeakLimiter` reaches `nc == 0` through its width
+   guard and does a full `reset()` — wrong under any answer (measured: gain reduction -5.08 dB to 0.00 and
+   a 48-sample hole on the return), but wrong in its own way: its ballistics are not exponential but a
+   sliding lookahead window with a running maximum, where "a pause of `n`" means "`n` zeros entered the
+   window and it shifted", and its per-channel state is not detector history but AUDIO THAT HAS NOT BEEN
+   EMITTED YET, which cannot be dropped without a hole by definition. That is **P29**, and it will state
+   its own rule as a window shift, with the oversampler's phase to prove as well.
 
 
 **These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the

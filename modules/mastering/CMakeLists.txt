@@ -48,4 +48,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_call_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_call_contract_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_call_contract_tests COMMAND felitronics_call_contract_tests)
+
+    # Law 11c ("a pause is silence") spans seven addresses in six modules plus one composite, and the law
+    # is ONE claim — split per module, each stage would get to answer it its own way. Lives here for the
+    # same reason CallContractTests does: this is the module that already links everything law 11 touches.
+    add_executable(felitronics_pause_is_silence_tests tests/PauseIsSilenceTests.cpp)
+    target_link_libraries(felitronics_pause_is_silence_tests PRIVATE
+        felitronics::mastering felitronics::multiband felitronics::deesser felitronics::dynamiceq
+        felitronics::poweramp felitronics::eq)
+    target_include_directories(felitronics_pause_is_silence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_pause_is_silence_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_pause_is_silence_tests COMMAND felitronics_pause_is_silence_tests)
 endif()

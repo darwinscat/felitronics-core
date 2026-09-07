@@ -142,16 +142,35 @@ private:
         // Telling it only at nc == 0 left the narrowing case leaking: stereo -> bypass -> mono -> bands
         // back on -> stereo silence emitted -16.6378 dBFS on the right, last non-zero at sample 239,
         // the whole lookahead line.
+        // ...and NOT when the width is zero, because the `nc == 0` branch below already calls every band
+        // — bypassed ones included — with exactly this `(0, n)`. While a band merely FROZE on a gap the
+        // duplicate was invisible; under law 11c it is a DOUBLE CLOCK, and the first chunk of every gap
+        // would advance a bypassed band's ballistics by 2n. Found on the diff, before it shipped.
+        //
+        // 🔴 AND THE PLANES HAVE TO EXIST. `bandPtrs_[b]` is filled ONLY in the band loop below, which
+        // `continue`s past a bypassed band — so a band bypassed since `prepare()` reached this call with
+        // a row of NULLs and the band processor dereferenced them. That is a SEGFAULT, not a wrong
+        // number, and it is on untouched `main`: prepare(2) → process(io, 2, n) → bypass a band →
+        // process(io, 1, n) crashes in `GainReductionPath::process`. ASan names the line. It was
+        // invisible because nothing in the suite narrowed the width WITH a band bypassed.
+        // What the planes should CARRY is digital silence: this band "has been receiving nothing all
+        // along" (the sentence right above), so law 11c's own answer applies to it — the falling edge
+        // lands and the ballistics spend the block on silence, rather than on whatever the previous
+        // call happened to leave in the band buffer.
+        if (nc > 0)
         for (int b = 0; b < nb; ++b)
-            if (bypass_[(std::size_t) b])
-                for (int c = nc; c < ranNc_; ++c)
+            if (bypass_[(std::size_t) b] && nc < ranNc_)
+            {
+                for (int c = 0; c < nc; ++c)
                 {
-                    if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
-                        proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
-                    else
-                        (void) proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
-                    break;                          // one call per band carries the whole falling edge
+                    bandPtrs_[(std::size_t) b][(std::size_t) c] = bandData (b, c);
+                    std::fill_n (bandData (b, c), n, 0.0f);
                 }
+                if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
+                    proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+                else
+                    (void) proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+            }
         for (int c = nc; c < ranNc_; ++c)
         {
             splitter_.resetChannel (c);

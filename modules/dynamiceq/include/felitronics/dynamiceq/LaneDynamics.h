@@ -160,17 +160,37 @@ public:
         if (numSamples == 0) return band.processBlock (audio, numChannels, numSamples);
         if (numChannels == 0)
         {
-            // LAW 11(a): at nch == 0 every lane stopped, and this layer has that edge already — it is
-            // the "dynamics off" branch below. Passing the gap only to the BAND left the detectors,
-            // `deltaDb`, `running` and `parked` frozen, and the band then applied a stale delta to the
-            // first samples back: measured, a lane holding -12.000 dB through a full second of gap, and
-            // the first 16 samples of the return pushed down by -5.25 dB. Real silence gives 0.000.
-            // The band's verdict is taken FIRST: `disengage()` moves this layer's own state, and a
-            // refused call must move nothing. Measured on the ordering that ran it first — the call
-            // returned false and still took deltaDb from -11.9999 to 0.
+            // LAW 11c — A PAUSE IS SILENCE, and this branch used to answer it with DISENGAGE: it dropped
+            // every lane's detector wholesale, which is the "dynamics were switched off" verb, not the
+            // "time passed with nothing playing" one. What a silent block of the same length does is run
+            // the same control loop at width zero, and the code already says what that means — the ST
+            // lane is eligible at any width and its linked probe over ZERO columns is exactly +0.0f
+            // (`sc` is never dereferenced, so a null sidechain is safe there), while L/R/M/S are gated on
+            // `nc == 2` and therefore take the same "this lane stopped" branch they take at width one.
+            // The band's verdict is taken FIRST: this layer's state must not move on a refused call.
+            // Measured on the ordering that ran it first — the call returned false and still took
+            // deltaDb from -11.9999 to 0.
+            //
+            // A NULL SIDECHAIN IS NOT A DISENGAGE AT WIDTH ZERO. At any other width it is, and rightly:
+            // the caller has a programme and no key to detect on. At width zero there are no columns to
+            // point at, so the pointer carries no information at all — the key is silence because the
+            // programme is, and reading `nullptr` as "dynamics off" would put every gap straight back
+            // into the freeze this branch exists to remove. `dyn_.on` and `rangeDb == 0` still disengage:
+            // those are configuration, and configuration does not become a pause.
             if (! band.processBlock (audio, 0, numSamples)) return false;
-            if (engaged_) { disengage (band); engaged_ = false; }
-            for (auto& st : st_) st.parked += numSamples;
+            if (! dyn_.on || std::fabs (dyn_.rangeDb) <= 0.0)
+            {
+                if (engaged_) { disengage (band); engaged_ = false; }
+                for (auto& st : st_) st.parked = addParked (st.parked, numSamples);
+                return true;
+            }
+            engaged_ = true;
+            for (int done = 0; done < numSamples; )
+            {
+                const int n = std::min (kControl, numSamples - done);      // the SAME control grid as below
+                advance (nullptr, 0, n, band);
+                done += n;
+            }
             return true;
         }
         int nc = numChannels;
@@ -196,7 +216,7 @@ public:
         if (! dyn_.on || std::fabs (dyn_.rangeDb) <= 0.0 || sidechain == nullptr)
         {
             if (engaged_) { disengage (band); engaged_ = false; }
-            for (auto& st : st_) st.parked += numSamples;   // this park counts too — see applyParkPolicy
+            for (auto& st : st_) st.parked = addParked (st.parked, numSamples);   // this park counts too — see applyParkPolicy
             return band.processBlock (audio, nc, numSamples);
         }
         engaged_ = true;
@@ -234,7 +254,13 @@ public:
 private:
     struct LaneState
     {
-        long                            parked = 0; // samples this lane has been blind (see applyParkPolicy)
+        // Samples this lane has been blind (see applyParkPolicy). `long long`, not `long`: `long` is
+        // 32 bits on the MSVC row (LLP64), where `parked += n` at 48 kHz is signed overflow — undefined
+        // behaviour — after 12.4 hours of park. That was unreachable while a gap disengaged the lane in
+        // one step and became reachable the moment law 11c made a pause something a lane SPENDS; it is
+        // saturated below rather than merely widened, because the value is read against a threshold and
+        // a wrap to a small number would read as "the programme cannot have moved".
+        long long                       parked = 0;
         eq::Svf                         probe;      // sidechain band-pass at this lane's freq/Q
         dynamics::EnvelopeFollower      env;
         dynamics::RelativeLevel         rel;
@@ -250,6 +276,14 @@ private:
     static constexpr double kHeadroomDb = 3.0;   // how far above "normal" a peak must sit to engage
 
     static double finiteOr (double v, double fb) noexcept { return std::isfinite (v) ? v : fb; }
+
+    // Saturating, because the only thing this counter is asked is "long enough that the programme has
+    // certainly moved?" — and a wrap answers "no" for a park of thirty years.
+    static long long addParked (long long parked, int n) noexcept
+    {
+        constexpr long long kCap = 1LL << 52;                  // ~2900 years at 48 kHz, exact in double
+        return parked > kCap - (long long) n ? kCap : parked + (long long) n;
+    }
 
     static bool nearlyEqual (double a, double b) noexcept
     {
@@ -340,7 +374,7 @@ private:
             {
                 LaneState& off = st_[i];
                 if (off.running) { off.gr.reset(); off.env.reset(); off.probe.reset(); off.running = false; }
-                off.parked += n;                 // how long this lane has been blind, in samples
+                off.parked = addParked (off.parked, n);   // how long this lane has been blind, in samples
                 off.deltaDb = 0.0;
                 band.setLaneDeltaDb (l, 0.0);
                 continue;

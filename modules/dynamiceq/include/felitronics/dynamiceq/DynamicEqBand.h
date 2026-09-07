@@ -91,7 +91,7 @@ public:
         if (n == 0) return true;                                  // no samples: no time, no edge
         const int nc = numChannels;
         dropStoppedChannels (nc);                                 // law 11(d): the edge is clocked by n
-        if (nc == 0) return true;
+        if (nc == 0) { advanceSilence (n); return true; }         // law 11c: a pause IS silence
         for (int i = 0; i < n; ++i)
         {
             // detector: per-channel sidechain BandPass → one linked level
@@ -107,13 +107,7 @@ public:
                 float sq = 0.0f; for (int c = 0; c < nc; ++c) { const float bp = side_.processSample (c, dynamics::detectorGate (io[c][i])); sq += bp * bp; }
                 linked = std::sqrt (sq / (float) nc);
             }
-            const float lvl   = env_.process (linked);
-            const float lvlDb = (float) core::gainToDb ((double) std::max (lvl, 1.0e-9f));
-            const float delta = sign_ * (float) gc_.deltaDb ((double) lvlDb);
-            const float smooth = gr_.process (delta);
-
-            if (ksamp_ == 0) { curGainDb_ = (double) params_.staticGainDb + (double) smooth; updateAudio(); }
-            if (++ksamp_ >= K_) ksamp_ = 0;
+            sharedStep (linked);
 
             for (int c = 0; c < nc; ++c) io[c][i] = audio_.processSample (c, io[c][i]);
         }
@@ -122,6 +116,63 @@ public:
     }
 
 private:
+    // LAW 11c — `n` samples of DIGITAL SILENCE through the SHARED half of the loop above. The per-channel
+    // sidechain columns were just dropped by `dropStoppedChannels(0)`, so a silent band's linked level is
+    // exactly +0.0f: the loop's own MeanPower branch cannot be reused for it — `std::sqrt (sq / (float) nc)`
+    // is 0/0 at width zero — so the level is PINNED rather than computed, which is the same number by a
+    // route that has no division in it. Freezing instead held -21.774 dB of dynamic delta through a
+    // second of gap where silence releases to -2.985 (and to -0.000 through ten seconds).
+    //
+    // THE CONTROL COUNTER IS PART OF THE CLOCK. `ksamp_` selects which samples redesign the audio filter,
+    // and a pause that did not advance it would put the band's coefficient grid out of phase with the
+    // stream for ever after. It runs honestly in the loop below; once the CONTINUOUS state has stopped
+    // moving, the only thing left to do is the counter, and that closes in the obvious form — but only
+    // AFTER at least one honest step, because `apply()` can lower `K_` without normalising `ksamp_`, and
+    // `(ksamp_ + rem) % K_` disagrees with iterating whenever `ksamp_ >= K_` (from ksamp_ = 10, K_ = 4 the
+    // loop reaches 0 in one step; the formula says 3). One honest step maps any counter into [0, K_), and
+    // the loop below has always run one by the time the shortcut is reached. The arithmetic is widened
+    // before the add for the reason `core::StateGrid::skip` widens its own: `ksamp_ + rem` is an int.
+    void advanceSilence (int n) noexcept
+    {
+        int i = 0;
+        for (; i < n; ++i)
+        {
+            const float e0 = env_.stateWord(), g0 = gr_.valueDb();
+            const double c0 = curGainDb_;
+            sharedStep (0.0f);   // a silent band links to exactly +0.0f at every width
+            if (core::sameBits (e0, env_.stateWord()) && core::sameBits (g0, gr_.valueDb())
+                && core::exactlyEqual (c0, curGainDb_))
+            { ++i; break; }
+            if (! std::isfinite (env_.stateWord()) && ! std::isfinite (e0)
+                && ! std::isfinite (gr_.valueDb()) && ! std::isfinite (g0)) { ++i; break; }
+        }
+        const long long rem = (long long) n - (long long) i;
+        if (rem > 0)
+        {
+            // A coefficient write lands iff some remaining index enters the body at counter 0. The first
+            // such index is 1 when ksamp_ == 0 and K_ - ksamp_ + 1 otherwise; it is idempotent here
+            // because `smooth` no longer moves, so applying it once is applying it every time.
+            if (ksamp_ == 0 || rem > (long long) K_ - (long long) ksamp_) { curGainDb_ = (double) params_.staticGainDb + (double) gr_.valueDb(); updateAudio(); }
+            ksamp_ = (int) (((long long) ksamp_ + rem) % (long long) K_);
+        }
+        env_.flushDenormals(); gr_.flushDenormals(); side_.flushDenormals(); audio_.flushDenormals();
+    }
+
+    // ONE sample of the SHARED body — everything downstream of the link and upstream of the per-channel
+    // audio filter. It is written once and called from both loops, so the pause and the audio cannot end
+    // up with two spellings of the same arithmetic that merely agree today; the narrowing of `lvlDb` to
+    // float BEFORE the curve is one of the differences between this stage, `Compressor` and `DeEsser`
+    // that a shared "silence primitive" would have quietly flattened.
+    void sharedStep (float linked) noexcept
+    {
+        const float lvl   = env_.process (linked);
+        const float lvlDb = (float) core::gainToDb ((double) std::max (lvl, 1.0e-9f));
+        const float delta = sign_ * (float) gc_.deltaDb ((double) lvlDb);
+        const float smooth = gr_.process (delta);
+        if (ksamp_ == 0) { curGainDb_ = (double) params_.staticGainDb + (double) smooth; updateAudio(); }
+        if (++ksamp_ >= K_) ksamp_ = 0;
+    }
+
     // Both filters are per channel and advance only for c < nc; the envelope and the GR follower they feed
     // are shared and keep running. A channel that leaves and RETURNS therefore re-enters with a sidechain
     // column and an audio column frozen from before the gap — measured, on DIGITAL SILENCE, an 0.388 audio

@@ -77,7 +77,13 @@ public:
         if (numChannels < 0 || n < 0) return false;
         if (! prepared_) return false;
         if (numChannels > channels_) return false;                // width is a LIMIT — law 11(b)
-        if (n == 0 || numChannels == 0) return true;              // nothing to run (no per-channel memory here)
+        if (n == 0) return true;                                  // no samples: the ONE true no-op
+        // LAW 11c — a pause IS silence. There is no per-channel memory here, so the whole state is the
+        // two envelopes and the de-zipper, and all three have to spend the audio time law 11(d) says
+        // went by. Freezing them left the return 1.76-2.60 dB away from what the same stretch of
+        // digital silence produces, in either direction depending on how far the two envelopes had
+        // separated when the gap arrived.
+        if (numChannels == 0) { advanceSilence (n); return true; }
         const int nc = numChannels;
         for (int i = 0; i < n; ++i)
         {
@@ -86,20 +92,7 @@ public:
             // read an overflowed frame as silence; and both followers below are recursive, so one bad
             // sample reaching them is permanent. Measured on the unguarded code: one NaN in ONE
             // channel left 102300 of 102400 output samples non-finite in EVERY channel, for good.
-            const float linked = linkAmplitudeGated (params_.link, channels, nc, i);
-            const float fe = fast_.process (linked);
-            const float se = slow_.process (linked);
-            const float norm = (fe - se) / (fe + se + 1.0e-9f);                 // ∈ [−1, 1]
-            // deadzone: a steady tone has a small fast/slow ripple — only a real transient clears `threshold`.
-            const float a = std::fabs (norm);
-            const float t = a <= threshold_ ? 0.0f : (a - threshold_) / (1.0f - threshold_);   // rescale [thr,1]→[0,1]
-            const float shaped = norm < 0.0f ? -t : t;
-            float gdb = attackDb_ * std::max (shaped, 0.0f) + sustainDb_ * std::max (-shaped, 0.0f);
-            gdb = std::clamp (gdb, -24.0f, 24.0f);
-            const float g = (float) core::dbToGain ((double) gdb);
-            gainSm_ = g + smoothCoeff_ * (gainSm_ - g);                         // one-pole de-zipper
-
-            const float m = mix_ * (gainSm_ - 1.0f);                            // 0 dry … applied at mix 1
+            const float m = sharedStep (linkAmplitudeGated (params_.link, channels, nc, i));
             for (int c = 0; c < nc; ++c) channels[c][i] += channels[c][i] * m;  // = x*(1 + mix*(gain-1))
         }
         fast_.flushDenormals(); slow_.flushDenormals();
@@ -117,6 +110,50 @@ public:
     }
 
 private:
+    // LAW 11c — `n` samples of DIGITAL SILENCE. `linkAmplitudeGated` on an all-zero frame is exactly
+    // +0.0f at every width, so the pinned level below is what a silent block of ANY width feeds these
+    // two followers, and the rest is the audio loop's own body, line for line.
+    //
+    // NOTHING COLLAPSES HERE, and saying so is the point. This stage has no dB floor to hide behind:
+    // `fast_` and `slow_` decay at DIFFERENT rates, so `norm = (fe-se)/(fe+se+1e-9)` keeps moving for as
+    // long as either envelope is alive — it slides toward -1 while the slow one dominates and back to 0
+    // as it dies — and the deadzone, the two gain trims and `dbToGain` all stay live behind it. One
+    // observed zero of `shaped` is NOT a plateau; the only sufficient condition is both envelopes
+    // resting, and at that point `norm` is 0/1e-9 = 0, `gdb` is 0, `dbToGain(0)` is exactly 1.0f and the
+    // de-zipper converges on the unity its own `reset()` writes. So the honest loop runs, and the
+    // fixed-point exit is what bounds it.
+    void advanceSilence (int n) noexcept
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const float f0 = fast_.stateWord(), s0 = slow_.stateWord(), g0 = gainSm_;
+            (void) sharedStep (0.0f);       // linkAmplitudeGated of an all-zero frame, at every width
+            if (core::sameBits (f0, fast_.stateWord()) && core::sameBits (s0, slow_.stateWord())
+                && core::sameBits (g0, gainSm_)) break;
+            if (! std::isfinite (gainSm_) && ! std::isfinite (g0)) break;
+        }
+        fast_.flushDenormals(); slow_.flushDenormals();
+        if (! std::isfinite (gainSm_)) gainSm_ = 1.0f;            // the same neutral-is-ONE guard as above
+    }
+
+    // ONE sample of the SHARED body: linked level in, the mix-weighted gain offset `m` out. Written once
+    // and called from both loops, so the pause runs the audio path's arithmetic rather than a copy of it.
+    float sharedStep (float linked) noexcept
+    {
+        const float fe = fast_.process (linked);
+        const float se = slow_.process (linked);
+        const float norm = (fe - se) / (fe + se + 1.0e-9f);                 // ∈ [−1, 1]
+        // deadzone: a steady tone has a small fast/slow ripple — only a real transient clears `threshold`.
+        const float a = std::fabs (norm);
+        const float t = a <= threshold_ ? 0.0f : (a - threshold_) / (1.0f - threshold_);   // rescale [thr,1]→[0,1]
+        const float shaped = norm < 0.0f ? -t : t;
+        float gdb = attackDb_ * std::max (shaped, 0.0f) + sustainDb_ * std::max (-shaped, 0.0f);
+        gdb = std::clamp (gdb, -24.0f, 24.0f);
+        const float g = (float) core::dbToGain ((double) gdb);
+        gainSm_ = g + smoothCoeff_ * (gainSm_ - g);                         // one-pole de-zipper
+        return mix_ * (gainSm_ - 1.0f);                                     // 0 dry … applied at mix 1
+    }
+
     static double finite (double v, double fallback) noexcept { return std::isfinite (v) ? v : fallback; }
 
     void apply (const TransientShaperParams& p) noexcept

@@ -284,7 +284,41 @@ public:
         if (lastNc_ > 0 && nc > lastNc_)
             for (int c = lastNc_; c < nc; ++c) delays[(std::size_t) c].reset();
         lastNc_ = nc;
-        if (nc == 0) return true;                              // law 11(d): time and the edge, but no audio
+        if (nc == 0)
+        {
+            // LAW 11c: A PAUSE IS SILENCE. Audio time passed (law 11(d) says so), and the shared
+            // ballistics spend it the way `n` samples of digital silence would — the per-channel lines
+            // above have just been dropped, and what is left is one detector and one gain-reduction
+            // follower, whose silent input is exactly +0.0f at any width. Freezing them instead held
+            // -25.311 dB of gain reduction through a full second of gap where silence releases to
+            // -2.076, and dipped the return by -22.11 dB on material below the threshold (-24.09 dB
+            // through a ten-second gap).
+            //
+            // AN EXTERNAL KEY IS STILL CONSUMED, and that follows from the law rather than adding to it.
+            // The invariant is "this call equals the same call at a live width carrying digital
+            // silence", and `process(zeros, nch, n, key, nk)` runs the detector on the KEY. The
+            // PROGRAMME is what stopped, not the key: a sidechain that keeps arriving keeps being
+            // detected, and pretending it vanished would make the pause differ from the silence it is
+            // defined to equal.
+            //
+            // A REQUESTED TAP TAKES THE HONEST LOOP, because the tap is a per-SAMPLE observable and a
+            // silent block of any width fills it sample by sample. Nothing is lost: the collapse buys
+            // its speed by not producing the intermediate values, so a caller that asked for exactly
+            // those values has asked for the linear work. All three spellings end in the same
+            // `GainReductionPath` entry points the audio loop uses, so they agree bit for bit.
+            if (key != nullptr && numKeyChannels > 0)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    const float grDb = path.process (key, numKeyChannels, i);
+                    if (gr.data != nullptr) gr.data[i] = grDb;
+                }
+            }
+            else if (gr.data != nullptr) for (int i = 0; i < numSamples; ++i) gr.data[i] = path.processSample (0.0f);
+            else                         path.advanceSilence (numSamples);
+            path.flushDenormals();                             // the same once-per-call cadence as below
+            return true;
+        }
 
         const float* const* detCh = key;
         int                 detNc = numKeyChannels;
