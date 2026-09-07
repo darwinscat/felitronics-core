@@ -478,7 +478,12 @@ static void powerAmpInvariant()
         // not move a single bit — the fifth blind form, and this repository has already paid for it).
         poweramp::PowerAmpStage A, Bp, C;
         poweramp::Voicing v;
-        v.sagMaxDroop = 0.35f; v.sagFastMs = 3.0f; v.sagRecoveryMs = 150.0f; v.driveScale = 1.0f;
+        // A 20-SECOND sag recovery, which is not musical and is the point: the drain to exact rest takes
+        // 512 blocks (~1.4 s), and a musical 150 ms recovery would have released the supply completely
+        // before the pause even started — the fixture would then compare two rested rails and pass
+        // against a stage that freezes the supply. A state defect is tested at settings where the state
+        // is still VISIBLE; the musical setting belongs to a test about sound, not about this.
+        v.sagMaxDroop = 0.35f; v.sagFastMs = 3.0f; v.sagRecoveryMs = 20000.0f; v.driveScale = 1.0f;
         poweramp::Params pp; pp.driveDb = 18.0f; pp.sag = 1.0f; pp.outputDb = 0.0f;
         A.prepare (kFs, B); Bp.prepare (kFs, B); C.prepare (kFs, B);
         A.setParams (pp, v); Bp.setParams (pp, v); C.setParams (pp, v);
@@ -488,12 +493,13 @@ static void powerAmpInvariant()
             fillTone (l, k * B, 120.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
             fillTone (l, k * B, 120.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bp.process (jo, 2, B));
         }
-        // THE OBSERVABLE IS THE SHARED SUPPLY, not the return audio. Every other stage here can be
-        // compared on its output because its per-channel path reaches EXACT rest on silence; this one
-        // does not — measured, its DC blocker and output-transformer poles are still moving after 256
-        // silent blocks — so an audio comparison would be reading law 11a's drop against a ring-down
-        // that never finishes, which is the wrong law. `sagDroop()` is precisely the quantity law 11c
-        // makes a claim about, and `C` below is the precondition that the claim is not vacuous.
+        // TWO OBSERVABLES, and the audio one is the load-bearing half. This stage's per-channel path DOES
+        // reach exact rest on silence, but slowly: measured, its residue is 5.1e-08 after 64 silent
+        // blocks, 8.0e-22 after 256 and exactly zero after 512 — so a 256-block drain would have compared
+        // law 11a's drop against a ring-down that had not finished, and read a defect that is not there.
+        // Past rest the return is bit-comparable, and it is the only thing that can see the thirteen
+        // block-rate GLIDES: `sagDroop()` cannot, because it reads the supply and not the drive.
+        if (! drainToRest (A, Bp, B, 1024)) ok (false, "precondition: the per-channel path reaches exact rest before the pause");
         // ...AND A GLIDE IN FLIGHT. The thirteen block-rate smoothers are snapped on the first block and
         // never moved again unless a parameter changes, so a fixture that sets the params once and then
         // pauses would pass against an implementation that freezes the glides — which is half of what
@@ -512,10 +518,21 @@ static void powerAmpInvariant()
         }
         if (! bitsEqual (A.sagDroop(), Bp.sagDroop()))
             ok (false, "the sag supply after a gap equals the sag supply after silence, gap " + std::to_string (gap));
+        {
+            std::vector<float> al ((std::size_t) B), ar ((std::size_t) B), bl ((std::size_t) B), br ((std::size_t) B);
+            fillTone (al, 0, 120.0, 0.9f); ar = al; bl = al; br = al;
+            float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
+            run (A.process (ai, 2, B)); run (Bp.process (bi, 2, B));
+            bool same = true, live = false;
+            for (int i = 0; i < B; ++i) { same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
+                                          live = live || std::fabs ((double) bl[(std::size_t) i]) > 1.0e-3; }
+            if (! same) ok (false, "the return after a gap is bit-identical to the return after silence, gap " + std::to_string (gap));
+            if (gap == kGaps[0]) ok (live, "precondition: the return actually carries audio");
+        }
         if (gap <= 480) ok (! bitsEqual (Bp.sagDroop(), C.sagDroop()),
                             "precondition: the sag supply is genuinely charged — a cold stage answers differently");
-        if (gap >= 48000) ok (Bp.sagDroop() < 0.5f * chargedDroop,
-                            "...and a pause of a second recovers most of the rail, exactly as silence does");
+        if (gap >= 48000) ok (Bp.sagDroop() < chargedDroop,
+                            "...and a second of pause has visibly recovered the rail, exactly as silence does");
     }
     ok (true, "PowerAmpStage: the sag supply and its glides spend a pause exactly as silence does");
 }
@@ -789,7 +806,7 @@ static void compressorKeepsItsExternalKey()
 //     int, and `rem` here is two billion), and the coefficient write that has to land in the remainder.
 static void controlCounterAtHugeLengths()
 {
-    group ("law 11c — DynamicEqBand: the control counter closes correctly over a two-billion-sample pause");
+    group ("law 11c — DynamicEqBand: the control counter closes correctly over an INT_MAX-sample pause");
     for (int K : { 3, 7, 16 })
         for (int pre : { 0, 1, 2, 5 })
         {
@@ -814,18 +831,21 @@ static void controlCounterAtHugeLengths()
                 std::vector<float> t1 ((std::size_t) pre, 0.0f), t2 ((std::size_t) pre, 0.0f);
                 float* jo[2] = { t1.data(), t2.data() }; run (Bd.process (jo, 2, pre));
             }
-            // A takes the whole two billion in one zero-width call. B walks the SAME number of samples of
+            // A takes the whole INT_MAX in one zero-width call. B walks the SAME number of samples of
             // real silence, in chunks — and the two must land on the same counter phase, which the
             // returning audio is what makes visible. Two billion is chosen so `ksamp_ + rem` overflows an
             // int: the loop's own fixed-point exit is what makes it cheap enough to run in a test.
-            { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 2000000000)); }
+            // INT_MAX, not "a big number". `ksamp_ + rem` in `int` overflows only when the sum passes
+            // 2147483647, and two billion plus a counter under sixteen does not: a mutation that drops
+            // the widening survives every gap shorter than this one.
+            { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 2147483647)); }
             {
                 // The reference cannot literally walk two billion samples in a test, and it does not have
                 // to: past the settling horizon the only thing still moving is the counter, so a length
                 // CONGRUENT to 2e9 modulo K — and far past the horizon — lands on the same state. The
                 // congruence is the whole point; an "about the same" length would silently change the
                 // phase, which is exactly what this test is for.
-                const long long M = 4000000LL + ((2000000000LL - 4000000LL) % (long long) K);
+                const long long M = 4000000LL + ((2147483647LL - 4000000LL) % (long long) K);
                 std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f);
                 for (long long done = 0; done < M; )
                 {
@@ -839,9 +859,9 @@ static void controlCounterAtHugeLengths()
             float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
             run (A.process (ai, 2, B)); run (Bd.process (bi, 2, B));
             bool same = true; for (int i = 0; i < B; ++i) same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
-            if (! same) ok (false, "a two-billion-sample pause lands on the same counter phase, K " + std::to_string (K) + " pre " + std::to_string (pre));
+            if (! same) ok (false, "an INT_MAX-sample pause lands on the same counter phase, K " + std::to_string (K) + " pre " + std::to_string (pre));
         }
-    ok (true, "DynamicEqBand: the counter's closed form matches the loop at lengths that overflow an int");
+    ok (true, "DynamicEqBand: the counter's closed form matches the loop at a length that overflows an int");
 }
 
 // (c) THE COEFFICIENT WRITE IN THE REMAINDER. Once the continuous state is fixed the loop stops, and the
@@ -934,6 +954,28 @@ static void thePauseFlushes()
 // (e) A POISONED STATE ENTERING A PAUSE. The silent loops break on two non-finite states in a row rather
 //     than spinning for the whole gap; the stage must still come out finite, because law 8's flush is
 //     what clears poison and the pause owes it.
+// The pause owes law 8's flush, and the flush is OBSERVABLE: the silent recurrence parks on a subnormal,
+// so a pause that skipped its flush leaves one in a feedback state. Past the horizon the delta must be
+// EXACTLY zero — a subnormal there is the missing flush, and it is the one thing a numeric test can see
+// of a law the architecture doc says has no gate at all.
+static void thePauseLeavesNoSubnormal()
+{
+    group ("law 8 through law 11c — a long pause leaves the shared state at EXACTLY zero, not a subnormal");
+    const int B = 64;
+    dynamiceq::DynamicEqBandParams p;
+    p.freq = 3000.0; p.Q = 2.0; p.thresholdDb = -40.0; p.ratio = 6.0; p.rangeDb = 18.0;
+    p.attackMs = 1.0; p.releaseMs = 5.0; p.coeffUpdatePeriod = 1;   // K = 1: every sample writes the seam
+    dynamiceq::DynamicEqBand A;
+    if (! A.prepare (kFs, 2)) { ok (false, "prepare"); return; }
+    A.setParams (p);
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    for (int k = 0; k < 24; ++k) { fillTone (l, k * B, 3000.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B)); }
+    ok (std::fabs (A.dynamicDeltaDb()) > 0.5, "precondition: the band is holding a delta before the pause");
+    { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 300000)); }   // past the horizon
+    { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 1)); }        // one more, to publish the flushed state
+    ok (bitsEqual (A.dynamicDeltaDb(), 0.0), "the delta is exactly 0.0 after the pause, bit for bit");
+}
+
 static void aPoisonedStateSurvivesAPause()
 {
     group ("law 11c — a NaN reaching a stage before a pause does not survive it, and does not hang it");
@@ -1040,6 +1082,7 @@ int main()
     controlCounterAtHugeLengths();
     coefficientWriteLandsInTheRemainder();
     thePauseFlushes();
+    thePauseLeavesNoSubnormal();
     aPoisonedStateSurvivesAPause();
     multibandDoubleClockAtZeroWidth();
     bypassedBandResidualIsOneChunk();
