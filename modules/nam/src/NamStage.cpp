@@ -168,7 +168,8 @@ public:
     // history zeros with pos = 1.0, so output k reads input position k·inPerOut − 2 — EVERY stage
     // delays by exactly 2 of ITS OWN input samples. Round trip = 2 host samples (down) + 2 model
     // samples (up), the latter converted to host rate. Measured back from the carrier phase of the
-    // shipped round trip at 100/200 Hz: 3.851 / 3.840 host samples at 44.1 kHz, against 3.8375 here.
+    // shipped round trip, with the whole-period ambiguity resolved by an impulse onset: 3.8375 at
+    // 44.1 kHz, 6.0000 at 96 kHz, 5.6750 at 88.2 kHz, 3.3333 at 32 kHz — the geometry to four decimals.
     //
     // The true delay is FRACTIONAL and this reports an integer, so round to nearest (the residual is
     // ≤0.5 samples, was up to 3.3). It is also mildly frequency-dependent — the kernel's own phase

@@ -75,9 +75,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   `2 + 2·hostSR/modelRunSR` host samples, now reported rounded to nearest: **6 → 4 at 44.1 kHz, 9 → 6
   at 96 kHz, 9 → 6 at 88.2 kHz, 5 → 3 at 22.05 kHz**; unchanged (0) at the model's own rate, where the
   resampler is not in the path at all. Hosts using the reported number for delay compensation move by
-  that much; `rigplayer` takes the max over both slots and both moved identically, so **slot-to-slot
-  alignment does not change** — only the absolute PDC — and `AlignmentTable` measures at 48 kHz, where
-  the resampler is bypassed. No audio sample changes. The old tests pinned the FORMULA, which is why
+  that much. **Nothing inside `rigplayer` moves**: slot alignment runs on `AlignmentTable::delayOf()` →
+  `blendDelay()`/`lagTail_`, and none of those reads `latencySamples()` at all — `RigPlayer` only
+  republishes the max of the two slots outward, and both changed identically. No audio sample changes,
+  in this stage or any other. The old tests pinned the FORMULA, which is why
   nothing caught it; the new one measures the delay from the carrier phase of the shipped round trip
   (3.8375 / 6.0000 / 5.6750 samples, matching the geometry to four decimals) and asserts the reported
   integer is the nearest one to it.
@@ -88,14 +89,20 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   periodically time-varying filter whose per-phase gain has Fourier coefficients `H(Ω+2πk)`, so the
   "amplitude modulation" and the "interpolation images" are **one mechanism**, not two. The NAM round
   trip at 44.1 ↔ 48 kHz costs **−4.17 dB coherent and −9.27 dB worst-phase at 17.64 kHz** (−2.59/−5.14
-  at 15 kHz, −5.48/−14.79 at 20 kHz), those being ceilings from a composite period of exactly 147
-  output samples that visits every reachable phase pair. **The decimating direction has no stopband at
+  at 15 kHz, −5.48/−14.79 at 20 kHz), from a composite period of exactly 147 output samples. That set
+  is complete for the shipped priming but is a LINE through the two stages' phase torus, not the full
+  product: over all 160 integer alignments the worst phase barely moves (−9.29 against −9.27) while the
+  coherent carrier spans −3.59…−6.83, because it is an interference term between the stages. **The decimating direction has no stopband at
   all**: at phase *t = 0* the weights are `(0,1,0,0)`, a bare sample pick, so a tone above the output
-  Nyquist survives at −3 dB rms / 0.0 dB peak and folds into 20.1–22.05 kHz. Against the model's own
-  aliasing floor the added artifacts sit below it on a high-gain capture but **up to +9.8 dB above it on
-  a clean one** from 15 kHz up, and **driving harder makes it worse, not better** (+11.4 dB of error and
-  +12.5 dB of folded alias over a 42 dB input sweep) — because "driven" is exactly what fills the band
-  the un-filtered decimation folds back. **No kernel change here**: the header now states the cost, the
+  Nyquist survives at −3 dB rms / 0.0 dB peak and folds back as TWO strong components — `44100 − g` at
+  about −5 dB and `g − 3900` at about −7 dB — i.e. across **18.15–22.05 kHz**, not one top slice. Against the model's own
+  aliasing floor the OUTPUT leg alone sits below it on a high-gain capture but **up to +9.8 dB above it on
+  a clean one** from 15 kHz up (the whole rate-match: above in 22 of 30 tone × level cells, up to
+  +12.3 dB), and **driving harder does not help** — across a 42 dB sweep the error-to-signal ratio is
+  flat in 16–22 kHz where the artifacts live and grows +10…+14 dB in 0–4 kHz where they do not, because
+  the nonlinearity **demodulates** the input leg's images into the audible range: a 20 kHz tone at
+  −18 dBFS into a high-gain capture returns a **100 Hz line at −17.7 dBFS, 14.5 dB louder than its own
+  carrier**, against −174.6 dBFS through an ideal round trip. **No kernel change here**: the header now states the cost, the
   new `felitronics_core_streamresampler_lptv_tests` (44 checks) pins the table, the period-147 closure
   and the 0 dB decimation peak, and the candidate comparison (a 32-tap polyphase sinc: flat −0.11 dB at
   17.64 kHz with no modulation, 16–42 dB of stopband, +0.066 %RT per mono channel, 30.7 host samples of

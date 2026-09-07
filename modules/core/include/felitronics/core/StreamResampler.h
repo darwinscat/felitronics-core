@@ -29,21 +29,30 @@ namespace felitronics::core
 // modulation" and the "interpolation images" are one mechanism, not two. Round trip 44.1↔48 kHz
 // (the shipped NAM path), coherent carrier / worst phase, in dB:
 //     10 k −0.64/−1.16 · 15 k −2.59/−5.14 · 17.64 k −4.17/−9.27 · 20 k −5.48/−14.79
-// The composite gain is periodic with EXACTLY 147 output samples at this ratio and visits every
-// phase pair, so those are ceilings from the topology, not sampled maxima.
+// The composite gain is periodic with EXACTLY 147 output samples at this ratio, so those 147 values
+// are the complete set — but they are a LINE through the two stages' phase torus, fixed by the
+// shipped priming (both stages reset together at pos = 1, len = 3), not the full 160x147 product.
+// Swept over all 160 integer alignments the WORST phase barely moves (-9.29 dB at 17.64 kHz against
+// the -9.27 here, so that column is effectively the ceiling), while the coherent carrier spans
+// -3.59 .. -6.83 dB — it is an interference term between the two stages and belongs to the priming.
 //
 // 🔴 AND THE DECIMATING DIRECTION HAS NO ANTI-ALIASING AT ALL. Going 48 → 44.1 this kernel passes a
 // tone above the output Nyquist at −3 dB rms and 0.0 dB PEAK — at phase t = 0 the weights are
-// (0,1,0,0), a bare sample pick, which attenuates nothing at any frequency. Everything the driven
-// stage makes between 22.05 and 24 kHz folds into 20.1–22.05 kHz.
+// (0,1,0,0), a bare sample pick, which attenuates nothing at any frequency. A tone at g ∈ (22.05,
+// 24) kHz comes back as TWO strong components, not one: 44100 − g at about −5 dB and g − 3900 at
+// about −7 dB (23 kHz in → 21.1 kHz at −5.33 and 19.1 kHz at −7.04), plus weaker terms near
+// −45 dB. So everything the driven stage makes above 22.05 kHz lands across 18.15–22.05 kHz.
 //
 // The older note here said "the driven nonlinear stage masks the interpolation images". Measured, it
 // is CONDITIONAL and it does not cover the whole error: (a) the carrier droop is not an added
 // component at all, so nothing masks it; (b) against the model's OWN aliasing floor the added
-// artifacts sit BELOW it on a high-gain capture and up to +9.8 dB ABOVE it on a clean one, from
-// 15 kHz up; (c) driving the stage harder makes it WORSE, not better — over a 42 dB input sweep the
-// error grew +11.4 dB and the folded-alias term +12.5 dB, because "driven" is exactly what fills
-// 22.05–24 kHz for the un-filtered decimation to fold back. Whether to change the kernel is a
+// artifacts of the OUTPUT leg sit BELOW it on a high-gain capture and up to +9.8 dB ABOVE it on a
+// clean one from 15 kHz up (the whole rate-match is above it in 22 of 30 tone x level cells, by up to
+// +12.3 dB); (c) driving the stage harder does not help — over a 42 dB input sweep the error-to-signal
+// ratio is FLAT in 16–22 kHz where the artifacts live, and grows +10 to +14 dB in 0–4 kHz where they
+// do not, because the nonlinearity DEMODULATES the input leg's images into the audible range: a 20 kHz
+// tone at −18 dBFS into a high-gain capture comes back with a 100 Hz line at −17.7 dBFS, 14.5 dB
+// LOUDER than its own carrier, against −174.6 through an ideal round trip. Whether to change the kernel is a
 // product decision (it buys transparency with latency: a 32-tap polyphase sinc measures
 // −0.11 dB flat at 17.64 kHz with no modulation and 16–42 dB of stopband, for +0.066 %RT per mono
 // channel and 30.7 host samples of round-trip delay against today's 3.84). Full numbers, the
