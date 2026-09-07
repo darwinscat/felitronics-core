@@ -115,13 +115,26 @@ inline double gridBreachDb (int p, int q, int factor)
 inline constexpr double kModulationEnvelopeDb = 1.15;   // worst measured component: 1.06 (8x, click at 0.1 ms)
 
 // The whole delivered allowance for a factor: the grid's closed form at the worst tone the round trip
-// passes flat, plus the modulation envelope. (Content above ~0.40 fs has a LARGER grid term — a
-// 0.35-0.45 fs transient sits 0.43 dB over on the 4x grid against the tone term's 0.30 — but the
-// prototype's own droop removes it before delivery, so it cannot reach the output. Widen the pass band
-// and this term has to be re-derived.)
+// passes flat, plus the modulation envelope.
+//
+// RE-DERIVED when the shipped tapsPerPhase rose from 32 to 64, which is exactly what the sentence that
+// used to close this comment demanded ("widen the pass band and this term has to be re-derived"). It
+// said the 2fs/5 tone had the larger grid term but could not reach the output because the prototype's
+// own droop took 0.775 dB off it first. The pass band is flat there now, so it can, and the worst tone
+// the round trip passes FLAT is 2fs/5 rather than fs/3 at 4x and 8x. The maximum is taken rather than
+// assumed: at 2x, fs/3 is still worse (1.2494 against 0.4359), so neither tone wins everywhere.
+//
+//        factor        2         4         8
+//        fs/3     +1.2494   +0.3011   +0.0746      <- what this used to return
+//        2fs/5    +0.4359   +0.4359   +0.1076
+//        max      +1.2494   +0.4359   +0.1076      <- what it returns now
+//
+// A sweep of every fs*p/q with q <= 64 below 0.46 fs, net of the round-trip droop, confirms those are the
+// maxima and that they SATURATE: 64, 80 and 96 taps all deliver +0.4359 at 4x, so this does not have to
+// be re-derived again for a further widening of the same kind — only for one that moves the CUTOFF.
 inline double deliveredBudgetDb (int factor)
 {
-    return gridBreachDb (1, 3, factor) + kModulationEnvelopeDb;
+    return std::max (gridBreachDb (1, 3, factor), gridBreachDb (2, 5, factor)) + kModulationEnvelopeDb;
 }
 
 // The taper, borrowed rather than re-spelled. 10 ms at both ends, raised cosine, indexed from the end

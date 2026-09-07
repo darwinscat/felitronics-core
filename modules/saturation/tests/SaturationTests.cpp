@@ -200,8 +200,13 @@ namespace nulltest
         uint32_t s;
     };
 
+    // `tpp` is threaded through EXPLICITLY rather than left to each class's default. The frozen copy and
+    // the live one are being compared for one thing — that the hardening guards are bit-transparent — and
+    // a difference in DEFAULTS is not that thing. Leaving it implicit made the null fail the moment the
+    // default moved from 32 to 64, i.e. it punished the change it exists to be independent of. Both
+    // topologies are now run, which is strictly more coverage than the single implicit one it replaces.
     template <class Sat>
-    std::vector<float> runScenario (int id)
+    std::vector<float> runScenario (int id, int tpp)
     {
         std::vector<float> out, ch0, ch1;
         auto push = [&] (float* const* io, int nc, int n)
@@ -216,7 +221,7 @@ namespace nulltest
         {
             case 1:   // os=1, 2ch, Tanh on random noise, partial mix + trim
             {
-                s.prepare (48000.0, 512, 2, 1);
+                s.prepare (48000.0, 512, 2, 1, tpp);
                 p.shape = Shape::Tanh; p.driveDb = 18.0f; p.mix = 0.7f; p.outputDb = -1.0f; p.autoComp = 0.5f;
                 s.setParams (p);
                 Rng r (0xC0FFEE01u);
@@ -232,7 +237,7 @@ namespace nulltest
             }
             case 2:   // os=4, 2ch, Tanh on two sines, full wet + autoComp 1
             {
-                s.prepare (48000.0, 256, 2, 4);
+                s.prepare (48000.0, 256, 2, 4, tpp);
                 p.shape = Shape::Tanh; p.driveDb = 12.0f; p.mix = 1.0f; p.autoComp = 1.0f;
                 s.setParams (p);
                 ch0.resize (256); ch1.resize (256);
@@ -252,7 +257,7 @@ namespace nulltest
             }
             case 3:   // os=4, 1ch, Asym (DC blocker active) on sine+noise, half mix
             {
-                s.prepare (48000.0, 512, 1, 4);
+                s.prepare (48000.0, 512, 1, 4, tpp);
                 p.shape = Shape::Asym; p.driveDb = 9.0f; p.bias = 0.4f; p.mix = 0.5f; p.outputDb = 2.0f; p.autoComp = 0.25f;
                 s.setParams (p);
                 Rng r (0xBADF00D5u);
@@ -272,7 +277,7 @@ namespace nulltest
             }
             case 4:   // os=4, 2ch, Asym on EDGE buffers: silence, DC, ±FS alternation, tiny 1e-20, ramps
             {
-                s.prepare (48000.0, 512, 2, 4);
+                s.prepare (48000.0, 512, 2, 4, tpp);
                 p.shape = Shape::Asym; p.driveDb = 24.0f; p.bias = -0.3f; p.mix = 1.0f; p.autoComp = 0.5f;
                 s.setParams (p);
                 Rng r (0x5EED0004u);
@@ -298,7 +303,7 @@ namespace nulltest
             }
             case 5:   // os=4, 2ch, finite param sweep between blocks (shape switch mid-stream), odd block size
             {
-                s.prepare (44100.0, 333, 2, 4);
+                s.prepare (44100.0, 333, 2, 4, tpp);
                 Rng r (0xAB12CD34u);
                 ch0.resize (333); ch1.resize (333);
                 float* io[2] { ch0.data(), ch1.data() };
@@ -394,8 +399,9 @@ int main()
     // --- Saturator oversampled (os = 4): latency, peak-safety, no-alloc ---
     test::group ("Saturator oversampled (os=4)");
     {
-        saturation::Saturator s; s.prepare (48000.0, 512, 2, 4);              // tpp = 32 default
-        test::ok (s.latencySamples() == 31, "os=4 round-trip latency == tpp-1 == 31");
+        saturation::Saturator s; s.prepare (48000.0, 512, 2, 4);              // tapsPerPhase = the core default
+        test::ok (s.latencySamples() == oversampling::PolyphaseOversampler::kDefaultTapsPerPhase - 1,
+                  "os=4 round-trip latency == tpp-1 == 63 (the default rose from 32 — see PolyphaseOversampler.h)");
 
         saturation::Saturator::Params p; p.shape = Shape::Tanh; p.driveDb = 18.0f; p.mix = 1.0f; p.autoComp = 0.0f; s.setParams (p);
         std::vector<float> L (512), R (512); float* io[2] { L.data(), R.data() };
@@ -516,15 +522,29 @@ int main()
     //     outputs must be bit-identical (memcmp) — the guards may only ever touch poisoned streams. ---
     test::group ("Saturator hardening NULL: bit-identical to the frozen pre-change engine");
     {
-        for (int id = 1; id <= 6; ++id)
+        // Both topologies: the 32 the stage used to default to, and the 64 it defaults to now. Scenario 6
+        // pins its own 16 regardless, so three taps counts are covered in all.
+        for (int tpp : { 32, oversampling::PolyphaseOversampler::kDefaultTapsPerPhase })
+            for (int id = 1; id <= 6; ++id)
+            {
+                const std::string at = " (tapsPerPhase " + std::to_string (tpp) + ")";
+                const std::vector<float> now = nulltest::runScenario<saturation::Saturator> (id, tpp);
+                const std::vector<float> pre = nulltest::runScenario<prechange::Saturator> (id, tpp);
+                test::ok (now.size() == pre.size() && ! now.empty(),
+                          "scenario " + std::to_string (id) + at + ": output sizes match");
+                test::ok (now.size() == pre.size()
+                            && std::memcmp (now.data(), pre.data(), now.size() * sizeof (float)) == 0,
+                          "scenario " + std::to_string (id) + at + ": bit-identical output");
+            }
+        // ...and the null above is now blind to exactly one thing — the DEFAULT itself, since both sides
+        // are told what to use. That is the thing this task changed, so it is asserted directly rather
+        // than left to be inferred: the live class must take 64 and must still reach 32 when asked.
         {
-            const std::vector<float> now = nulltest::runScenario<saturation::Saturator> (id);
-            const std::vector<float> pre = nulltest::runScenario<prechange::Saturator> (id);
-            test::ok (now.size() == pre.size() && ! now.empty(),
-                      "scenario " + std::to_string (id) + ": output sizes match");
-            test::ok (now.size() == pre.size()
-                        && std::memcmp (now.data(), pre.data(), now.size() * sizeof (float)) == 0,
-                      "scenario " + std::to_string (id) + ": bit-identical output");
+            saturation::Saturator def, old;
+            test::ok (def.prepare (48000.0, 64, 1, 4) && def.latencySamples() == 63,
+                      "the Saturator's DEFAULT tapsPerPhase is the core's 64 (round trip 63 samples)");
+            test::ok (old.prepare (48000.0, 64, 1, 4, 32) && old.latencySamples() == 31,
+                      "an explicit 32 still reaches the old topology (round trip 31) — the argument is honoured");
         }
     }
 

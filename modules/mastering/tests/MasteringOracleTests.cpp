@@ -21,6 +21,7 @@
 //     notice that its header's droop figures were a factor of two out.
 
 #include <felitronics/mastering/OfflineRenderer.h>
+#include <felitronics/oversampling/PolyphaseOversampler.h>   // kDefaultTapsPerPhase — named, not inherited transitively
 #include <felitronics_test.h>
 
 #include <algorithm>
@@ -366,9 +367,15 @@ static void testPassbandPinned()
                                     + std::to_string (tpp) + " (" + std::to_string ((int) (row.r * fs)) + " Hz)");
         }
 
-    // And the reason the chain defaults to 64 rather than the stages' own 32, stated as a check.
-    ok (mastering::MasteringChainConfig {}.tapsPerPhase == 64,
-        "the chain's default tapsPerPhase is 64 — 32 costs -1.55 dB at 17.6 kHz with the clipper in");
+    // The chain has always defaulted to 64; the STAGES defaulted to 32 until P21 raised them, and the
+    // reason was never only the droop this table shows — at 32 taps the prototype delivered 27 dB of
+    // stopband against the 90 its own Kaiser design declares. Both defaults are asserted here, because
+    // the chain passing its own value explicitly is exactly what made it immune to the stages' being
+    // wrong, and that immunity is worth keeping visible rather than losing now that they agree.
+    ok (mastering::MasteringChainConfig {}.tapsPerPhase == 64, "the chain's default tapsPerPhase is 64");
+    ok (limiter::TruePeakLimiterConfig {}.tapsPerPhase == 64
+          && oversampling::PolyphaseOversampler::kDefaultTapsPerPhase == 64,
+        "and the stages now default to 64 too — the chain no longer has to compensate for them");
 }
 
 //==============================================================================

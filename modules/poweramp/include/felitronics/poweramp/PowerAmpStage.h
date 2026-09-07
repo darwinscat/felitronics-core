@@ -41,7 +41,24 @@
 // 🔴 RT rule: process() never allocates, locks, does IO or throws. All state/buffers are heap-
 // allocated in prepare() behind a pImpl, NOT by-value members — the by-value stage member stays tiny
 // and Windows' 1 MB audio-thread stack is never at risk (the MSVC rule). prepare() is message/host
-// thread only. Latency = the oversampler round-trip (tapsPerPhase−1 = 31), constant across factor.
+// thread only. Latency = the oversampler round-trip (tapsPerPhase−1), constant across factor.
+//
+// TAPS. The stage used to hardcode 32 taps/phase with no way for a caller to say otherwise, and its own
+// aliasing gate (PowerAmpGoldenTests, "reference-free non-harmonic energy") declared that adequate. It
+// is not, and the gate could not see why: its analysis window stopped at 10 kHz, which is BELOW where
+// the transition-band leakage lands. Over the whole band the same gate reads −68.7 dBc at 32 taps — a
+// FAILURE of its own −70 dBc bar — against −77.4 at the core default of 64; a 3 kHz fundamental at
+// +12 dB drive goes −56.2 → −75.9 dBc. (Both figures come from the suite itself, which now prints the
+// map at BOTH taps counts, so they are reproducible by running it rather than quoted from a probe.)
+// So the default is the core's now, and the knob is exposed: a live rig that would rather have the 32
+// samples back than the rejection can still ask for 32, which it previously could not express at all.
+// It is not free: the stage costs 1.24 %RT at 32 taps and 2.43 at 64 (48 kHz, stereo, 4x, block 512),
+// and the round trip goes 31 → 63 samples, i.e. +0.67 ms at 48 kHz.
+//
+// WHAT THE TAPS DO NOT FIX, so that nobody reads the above as more than it is: the map's hot and
+// high-frequency cells (a 3 kHz fundamental at +24 dB reads −40.9 dBc at EITHER taps count) are the
+// tube's own harmonics folding INSIDE the oversampled domain. That is the oversampling FACTOR's axis;
+// no decimation filter reaches them.
 //==============================================================================
 namespace felitronics::poweramp
 {
@@ -110,8 +127,16 @@ public:
     // Allocate state for this stream / block size. Message/host thread (prepareToPlay) — never
     // the audio thread. `oversampleFactor` defaults to 4 (the shipping value); a test may pass a
     // higher factor (e.g. 32) to build an alias-free reference for null comparison. Latency is
-    // tpp-1 regardless of factor, so 4x and 32x stay sample-aligned.
-    void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4);
+    // tapsPerPhase-1 regardless of factor, so 4x and 32x stay sample-aligned. `tapsPerPhase` takes the
+    // core's own default (see the TAPS note above and PolyphaseOversampler.h for its derivation);
+    // passing it explicitly pins a topology against that default. NB the golden battery lifted from
+    // OrbitCab runs at the DEFAULT, not at the old 32: what it pins is the stage's structure (processing
+    // order, guards, chunk boundaries, block-size determinism, the feel gate), none of which the taps
+    // count touches, and it carries separate two-sided checks at an explicit 32 and 96 for the topology
+    // itself. OrbitCab's own copy keeps its 32 and passes it explicitly, so its sound and its host
+    // latency are unaffected by this default.
+    void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,
+                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase);
     void reset();
 
     // Set the controls + the product-chosen voicing. RT-safe: stores targets (and copies the plain-
@@ -138,7 +163,7 @@ struct PowerAmpStage::Impl
 {
     using Svf = felitronics::eq::Svf;
 
-    static constexpr int    kTpp       = 32;       // FIR taps/phase → 31-sample baseband round-trip latency
+    static constexpr int    kMinTpp    = 4;        // the oversampler's own floor; clamped, like the factor
     static constexpr int    kMaxCh     = 2;        // stereo max (engine contract)
     static constexpr float  kDcBlockHz = 10.0f;    // OS-domain DC blocker corner
     static constexpr float  kSagMinRail = 0.2f;    // clamp s = 1−droop away from 0 (never invert / div-blow-up)
@@ -158,6 +183,7 @@ struct PowerAmpStage::Impl
     double sampleRate = 0.0;
     int    maxBlock   = 0;
     int    os         = 4;                          // oversampling factor (4 shipping; test may set 32)
+    int    tpp        = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // FIR taps/phase → (tpp-1)-sample round trip
 
     felitronics::oversampling::PolyphaseOversampler ovs;
     std::vector<float> osBuf[kMaxCh];               // maxBlock*os per channel (caller-owned OS scratch)
@@ -193,12 +219,16 @@ struct PowerAmpStage::Impl
     bool  ranPres_ = false, ranDepth_ = false, ranMid_ = false;   // and which of this stage's own gates
     bool  ranLoad_ = false, ranIron_  = false, ranSag_ = false;   // were open on the previous CHUNK
 
-    void prepare (double sr, int mb, int osFactor)
+    void prepare (double sr, int mb, int osFactor, int tapsPerPhase)
     {
         sampleRate = sr;
         maxBlock   = std::max (1, mb);
         os         = std::clamp (osFactor, 2, 32);
-        ovs.prepare (os, kMaxCh, kTpp);
+        // Clamped rather than refused, because prepare() returns void here and always has: a rejected
+        // taps count would leave the stage unprepared with no way to say so, which is the worse failure.
+        tpp        = std::clamp (tapsPerPhase, kMinTpp,
+                                 felitronics::oversampling::PolyphaseOversampler::kMaxTapsPerPhase);
+        ovs.prepare (os, kMaxCh, tpp);
         for (int ch = 0; ch < kMaxCh; ++ch)
         {
             osBuf[ch].assign ((std::size_t) (maxBlock * os), 0.0f);
@@ -553,7 +583,7 @@ struct PowerAmpStage::Impl
 inline PowerAmpStage::PowerAmpStage() : impl (std::make_unique<Impl>()) {}
 inline PowerAmpStage::~PowerAmpStage() = default;
 
-inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor) { impl->prepare (sampleRate, maxBlock, oversampleFactor); }
+inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor, int tapsPerPhase) { impl->prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase); }
 inline void PowerAmpStage::reset() { impl->reset(); }
 inline void PowerAmpStage::setParams (const Params& params, const Voicing& voicing) noexcept { impl->setParams (params, voicing); }
 inline bool PowerAmpStage::process (float* const* io, int numChannels, int numSamples) noexcept { return impl->process (io, numChannels, numSamples); }

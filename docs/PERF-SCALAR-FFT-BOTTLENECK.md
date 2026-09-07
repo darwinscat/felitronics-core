@@ -95,7 +95,7 @@ Because `P` is tied to the partition / host-block size, **this is what blows up 
 | `convolution/ConvolutionEngine` + `PartitionedConvolver` | yes | partitioned on `ScalarRadix2Real` | `O(P)` scalar MAC / **output sample** (direct head) + per-chunk scalar FFT + `O(numParts)` spectral MAC; ×2 while crossfading | yes | **yes** | 🔴 high |
 | `convolution/MatrixConvolver` | yes | own 2×2 partitioned on `ScalarRadix2Real` | `O(P)` / sample **× bank** (2–4×) + tail FFT / spectral MAC | yes | **yes** | 🔴 high |
 | `lineareq/LinearPhaseEq` + `NaturalPhaseEq` | yes | `MatrixConvolver<DefaultRealFft>` | `O(P)` direct head + amortised `O(firLen/P)` tail; FIR up to **131072** taps | yes | **yes** (partial¹) | 🔴 high |
-| `oversampling/PolyphaseOversampler` | FIR, no FFT | scalar polyphase Kaiser-sinc | `O(taps)` / sample, **short** filters (tpp=32, N≤256) | yes | no (inherent) | 🟢 low |
+| `oversampling/PolyphaseOversampler` | FIR, no FFT | scalar polyphase Kaiser-sinc | `O(taps)` / sample, **short** filters (tpp=64, N≤512) | yes | no (inherent) | 🟢 low |
 | `lineareq/MixedPhaseFir` | FFT, design-time | `ScalarRadix2Real` in `build()` | 3× `O(D log D)` FFT on the **message** thread; 0 on audio | no | no | ⚪ none |
 | `neural/Inference` + `NeuralStage` | no | plumbing (concept + swap holder) | `O(1)` / block dispatch | no | no | ⚪ none |
 | cheap-sweep² | no | biquad/SVF · envelope · waveshaper · short FIR | `O(1)` / sample / band | yes | no | ⚪ none |
@@ -174,7 +174,9 @@ has few tail partitions, so the head *is* the cost). Vectorise the dot product (
 unroll). This is the part a faster FFT does **not** fix, and the reason acceptance is measured at 2048+.
 
 ### (c) Polyphase oversampler SIMD — low priority, inherent
-`PolyphaseOversampler` (`:84/:105`) is a correct short-filter scalar FIR (tpp=32, N≤256). Not a
+`PolyphaseOversampler` (`:84/:105`) is a correct short-filter scalar FIR (tpp=64 by default, N≤512 at 8x;
+the default rose from 32 in P21 and the FIR cost rose with it — measured 2.09x on a clipper+limiter pair,
+2.13 -> 4.44 %RT at 48 kHz stereo 4x, which is why the row above is amber rather than green now). Not a
 bottleneck — FFT/partitioning would not help (filters are far too short). Optional ~2–4× SIMD MAC only
 (documented future backend, `:32`).
 
