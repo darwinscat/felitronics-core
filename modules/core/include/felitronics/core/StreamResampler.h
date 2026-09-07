@@ -19,13 +19,41 @@ namespace felitronics::core
 // host rate — host→model on the way in, model→host on the way out. feed() appends input; the
 // produce*() calls emit as many output samples as the buffered history allows, with `pos` carrying
 // the sub-sample phase across blocks — arbitrary in/out block sizes, no long-term drift. Identity
-// ratio passes the signal with a clean 2-sample delay (catmull @ t=0 reads one sample behind).
+// ratio passes the signal with a clean 2-sample delay (catmull @ t=0 reads one sample behind), and
+// EVERY ratio delays by exactly 2 of this stage's own input samples (buf holds 3 leading zeros and
+// pos starts at 1, so output k reads input position k·inPerOut − 2).
+//
+// 🔴 WHAT THIS KERNEL COSTS — MEASURED (P32), not asserted. A phase-dependent kernel is a LINEAR
+// PERIODICALLY TIME-VARYING filter, so its error is two things at once, and they are the same thing
+// seen twice: the per-phase gain M(t) has Fourier coefficients H(Ω+2πk), i.e. the "amplitude
+// modulation" and the "interpolation images" are one mechanism, not two. Round trip 44.1↔48 kHz
+// (the shipped NAM path), coherent carrier / worst phase, in dB:
+//     10 k −0.64/−1.16 · 15 k −2.59/−5.14 · 17.64 k −4.17/−9.27 · 20 k −5.48/−14.79
+// The composite gain is periodic with EXACTLY 147 output samples at this ratio and visits every
+// phase pair, so those are ceilings from the topology, not sampled maxima.
+//
+// 🔴 AND THE DECIMATING DIRECTION HAS NO ANTI-ALIASING AT ALL. Going 48 → 44.1 this kernel passes a
+// tone above the output Nyquist at −3 dB rms and 0.0 dB PEAK — at phase t = 0 the weights are
+// (0,1,0,0), a bare sample pick, which attenuates nothing at any frequency. Everything the driven
+// stage makes between 22.05 and 24 kHz folds into 20.1–22.05 kHz.
+//
+// The older note here said "the driven nonlinear stage masks the interpolation images". Measured, it
+// is CONDITIONAL and it does not cover the whole error: (a) the carrier droop is not an added
+// component at all, so nothing masks it; (b) against the model's OWN aliasing floor the added
+// artifacts sit BELOW it on a high-gain capture and up to +9.8 dB ABOVE it on a clean one, from
+// 15 kHz up; (c) driving the stage harder makes it WORSE, not better — over a 42 dB input sweep the
+// error grew +11.4 dB and the folded-alias term +12.5 dB, because "driven" is exactly what fills
+// 22.05–24 kHz for the un-filtered decimation to fold back. Whether to change the kernel is a
+// product decision (it buys transparency with latency: a 32-tap polyphase sinc measures
+// −0.11 dB flat at 17.64 kHz with no modulation and 16–42 dB of stopband, for +0.066 %RT per mono
+// channel and 30.7 host samples of round-trip delay against today's 3.84). Full numbers, the
+// two-oracle protocol and the candidate table: docs/STREAM-RESAMPLER-COST.md.
 //
 // FAMILY SPLIT vs convolution::resampleIr: THAT is the OFFLINE Kaiser windowed-sinc (≥60 dB-class,
 // message-thread, allocates) for rate-converting an impulse response on load — an IR is a
 // fingerprint and must survive intact. THIS is the cheap STREAMING rate-match for a live signal
-// path, where the driven nonlinear stage masks the interpolation images; Catmull-Rom is too
-// low-SNR for IRs. Don't swap them.
+// path. The split still holds — but it is a COST decision, not a transparency claim, and the cost
+// above is the price. Don't swap them.
 //
 // 🔴 Fixed capacity, allocated once in reset() (message thread): feed()/produce*() never allocate,
 // lock, do IO, or throw on the audio thread. `buf` is a linear scratch holding `len` valid samples

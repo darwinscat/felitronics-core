@@ -351,14 +351,85 @@ int main()
         test::ok (one.process (pa, 0, N, false) && one.process (pa, 1, 0, false), "degenerate calls are accepted no-ops");
     }
 
+    test::group ("latency is a MEASUREMENT, not a formula — the reported number matches the real delay");
+    {
+        // The old `ceil(3*hostSR/modelRunSR) + 3` was a guess and it was 2.16 samples long at 44.1 kHz;
+        // the tests pinned the formula, so nothing caught it. This one measures the delay the stage
+        // ACTUALLY has and compares. Geometry: StreamResampler::reset() leaves 3 leading zeros with
+        // pos = 1.0, so each stage delays by exactly 2 of its own input samples -> the round trip is
+        // 2 + 2*hostSR/modelRunSR host samples (3.8375 at 44.1 kHz, 6.0 at 96 kHz).
+        //
+        // Method: a unity model and a LOW tone, so a delay of a few samples cannot be confused with a
+        // whole period. For y[n] = A·sin(W(n-D)) summed against cos/sin, W·D = atan2(-sum(y·cos),
+        // sum(y·sin)) — no FFT, no window, no grid.
+        //
+        // 🔴 THE WINDOW IS ITSELF A GRID and the first version of this test tripped on it: with a
+        // window that is not a whole number of tone periods, the discarded sum(sin(2Wn-WD)) term does
+        // not cancel and reads as ~0.1 samples of phantom delay (it showed as 6.11 where the geometry
+        // says 6.00). So: f = hostSR/512 makes the tone period EXACTLY 512 samples at any host rate,
+        // and the window is 150528 = 512·294 = 147·1024 samples — a whole number of tone periods AND
+        // a whole number of the resampler's own 147-sample modulation periods, so neither the tone nor
+        // its sidebands leak into the estimate. Both counts are also whole multiples of the 64 block.
+        auto measuredDelay = [] (double hostSR, int block)
+        {
+            nam::NamStage stage;
+            stage.prepare (hostSR, block);
+            const auto json = gainModel();
+            if (! load (stage, json)) return -1.0;
+            stage.prepare (hostSR, block);
+            const double f = hostSR / 512.0;                       // period = 512 samples, exactly
+            const double W = 2.0 * 3.14159265358979323846 * f / hostSR;
+            const int skip = 76800, span = 150528;                 // 512·294 and 147·1024
+            double sc = 0.0, ss = 0.0;
+            std::vector<float> b ((std::size_t) block);
+            for (int off = 0; off < skip + span; off += block)
+            {
+                for (int i = 0; i < block; ++i) b[(std::size_t) i] = (float) std::sin (W * (off + i));
+                float* io[1] { b.data() };
+                felitronics::test::run (stage.process (io, 1, block, false));
+                if (off >= skip)
+                    for (int i = 0; i < block; ++i)
+                    {
+                        sc += (double) b[(std::size_t) i] * std::cos (W * (off + i));
+                        ss += (double) b[(std::size_t) i] * std::sin (W * (off + i));
+                    }
+            }
+            return std::atan2 (-sc, ss) / W;
+        };
+
+        // precondition: the instrument reads ZERO where there is no resampler at all (NamStage.cpp
+        // engages it only when |hostSR - modelRunSR| > 0.5), so it cannot be reading its own bias.
+        const double none = measuredDelay (48000.0, 64);
+        test::approx (none, 0.0, 0.05, "precondition: at the model's own rate the measured delay is 0.00 samples");
+
+        struct Case { double host, expect; };
+        for (const Case c : { Case { 44100.0, 3.8375 }, Case { 96000.0, 6.0 }, Case { 88200.0, 5.675 } })
+        {
+            const double d = measuredDelay (c.host, 64);
+            std::printf ("      host %7.0f: measured round-trip delay %.4f samples (geometry %.4f)\n",
+                         c.host, d, c.expect);
+            test::approx (d, c.expect, 0.05,
+                          "host " + std::to_string ((int) c.host) + ": the delay IS 2 + 2*host/model");
+            nam::NamStage st;
+            st.prepare (c.host, 64);
+            const auto json = gainModel();
+            test::ok (load (st, json), "model loads for the reported-latency comparison");
+            st.prepare (c.host, 64);
+            test::ok (std::fabs ((double) st.latencySamples() - d) <= 0.5,
+                      "host " + std::to_string ((int) c.host) + ": latencySamples() = "
+                      + std::to_string (st.latencySamples()) + " is the nearest integer to the measured "
+                      + std::to_string (d) + " (the old formula was off by up to 3.3)");
+        }
+    }
+
     test::group ("96 kHz host rate matching");
     {
         nam::NamStage stage;
         stage.prepare (96000.0, 256);
         const auto json = gainModel();
         test::ok (load (stage, json), "48 kHz model loads on a 96 kHz host");
-        test::ok (stage.latencySamples() == 9,
-                  "latency pins ceil(3 * 96000 / 48000) + 3 exactly");
+        test::ok (stage.latencySamples() == 6,
+                  "latency is the MEASURED geometry 2 + 2*96000/48000, not the old ceil(3*r)+3 guess");
 
         std::vector<float> block (256);
         bool finite = true;
@@ -390,7 +461,7 @@ int main()
         const bool monoAgain = processLayout (1);
         test::ok (monoFirst && stereo && monoAgain,
                   "mono-to-stereo-to-mono re-prepare stays finite in both resampler lanes");
-        test::ok (stereoLatency == 9 && stage.latencySamples() == 9,
+        test::ok (stereoLatency == 6 && stage.latencySamples() == 6,
                   "layout re-prepare leaves the pinned host latency stable");
     }
 

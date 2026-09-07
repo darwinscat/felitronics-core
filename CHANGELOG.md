@@ -66,6 +66,40 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - `dynamiceq::LaneDynamics`' park counter is now a saturating `long long`: as a `long` it is 32 bits on
     the MSVC row, where `parked += n` at 48 kHz is signed overflow after 12.4 hours — unreachable while a
     gap disengaged a lane in one step, reachable the moment a pause became something a lane spends.
+- **BREAKING (reported latency), `nam`:** **`NamStage::latencySamples()` was 2.16 samples too long at
+  44.1 kHz and up to 3.3 at 88.2 kHz.** It reported `ceil(3·hostSR/modelRunSR) + 3` — a guess at "~3
+  samples of lookahead per stage" — where the geometry is exact and one line away in the same
+  repository: `StreamResampler.h` says the identity ratio "passes the signal with a clean 2-sample
+  delay", and that is true at EVERY ratio, because `reset()` leaves 3 leading history zeros with
+  `pos = 1.0`, so output *k* reads input position *k·inPerOut − 2*. The round trip is therefore
+  `2 + 2·hostSR/modelRunSR` host samples, now reported rounded to nearest: **6 → 4 at 44.1 kHz, 9 → 6
+  at 96 kHz, 9 → 6 at 88.2 kHz, 5 → 3 at 22.05 kHz**; unchanged (0) at the model's own rate, where the
+  resampler is not in the path at all. Hosts using the reported number for delay compensation move by
+  that much; `rigplayer` takes the max over both slots and both moved identically, so **slot-to-slot
+  alignment does not change** — only the absolute PDC — and `AlignmentTable` measures at 48 kHz, where
+  the resampler is bypassed. No audio sample changes. The old tests pinned the FORMULA, which is why
+  nothing caught it; the new one measures the delay from the carrier phase of the shipped round trip
+  (3.8375 / 6.0000 / 5.6750 samples, matching the geometry to four decimals) and asserts the reported
+  integer is the nearest one to it.
+- **`core`, docs:** **`StreamResampler`'s header claimed transparency it does not have, and now carries
+  the measurement instead.** The old justification — *"the driven nonlinear stage masks the
+  interpolation images"* — had no number behind it, and the quantity that had since been measured was a
+  different one. Measured (`docs/STREAM-RESAMPLER-COST.md`, new): a phase-dependent kernel is a linear
+  periodically time-varying filter whose per-phase gain has Fourier coefficients `H(Ω+2πk)`, so the
+  "amplitude modulation" and the "interpolation images" are **one mechanism**, not two. The NAM round
+  trip at 44.1 ↔ 48 kHz costs **−4.17 dB coherent and −9.27 dB worst-phase at 17.64 kHz** (−2.59/−5.14
+  at 15 kHz, −5.48/−14.79 at 20 kHz), those being ceilings from a composite period of exactly 147
+  output samples that visits every reachable phase pair. **The decimating direction has no stopband at
+  all**: at phase *t = 0* the weights are `(0,1,0,0)`, a bare sample pick, so a tone above the output
+  Nyquist survives at −3 dB rms / 0.0 dB peak and folds into 20.1–22.05 kHz. Against the model's own
+  aliasing floor the added artifacts sit below it on a high-gain capture but **up to +9.8 dB above it on
+  a clean one** from 15 kHz up, and **driving harder makes it worse, not better** (+11.4 dB of error and
+  +12.5 dB of folded alias over a 42 dB input sweep) — because "driven" is exactly what fills the band
+  the un-filtered decimation folds back. **No kernel change here**: the header now states the cost, the
+  new `felitronics_core_streamresampler_lptv_tests` (44 checks) pins the table, the period-147 closure
+  and the 0 dB decimation peak, and the candidate comparison (a 32-tap polyphase sinc: flat −0.11 dB at
+  17.64 kHz with no modulation, 16–42 dB of stopband, +0.066 %RT per mono channel, 30.7 host samples of
+  delay against today's 3.84) is in the document for the product decision.
 
 - **BREAKING (behaviour + latency), `oversampling`, `saturation`, `limiter`, `poweramp`:** **the shipped
   `tapsPerPhase` default rises from 32 to 64, and the reason is aliasing, not the pass band.**
