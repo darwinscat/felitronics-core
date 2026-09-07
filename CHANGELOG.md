@@ -39,7 +39,11 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     self-keyed and externally keyed, and the gain-reduction tap. Two exceptions, each with its own test:
     `NoiseGate` now drops a stopped lane's sidechain high-pass (law 11a, which it never had — worth
     **89.99 dB** on a narrowing as well as on a gap), and `MultibandProcessor` no longer hands a bypassed
-    band a row of NULL planes on a narrowing call, **which was a segfault, not a wrong number**.
+    band a row of NULL planes on a narrowing call, **which was a segfault, not a wrong number** — and the
+    same fix has a second, non-crashing half: a bypassed band whose planes were already valid used to be
+    clocked on the PREVIOUS chunk's split audio at a narrowing edge and is now clocked on digital silence
+    (3.12 dB on its meter, 1.6 dB out of silence on un-bypass). The segfault itself needs the band
+    bypassed BEFORE its first call at that width — once it has run live, the planes are filled.
   - **Two contract changes at width zero**, both consequences of "a pause is the same call carrying
     silence" and both tested: a `GainReductionTap` handed to `Compressor::process` is now FILLED on a
     zero-width call where it used to be left untouched, and an external key handed to the same call is now

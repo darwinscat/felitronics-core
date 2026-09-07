@@ -1395,6 +1395,90 @@ static void theTapAndTheKeyAtWidthZero()
     ok (bitsEqual ((float) A.gainReductionDb(), (float) Bc.gainReductionDb()), "and the meter agrees");
 }
 
+// (l) WHAT the bypassed band was clocked ON. The narrowing fix has two halves — the planes exist (no
+//     segfault) and they carry DIGITAL SILENCE — and only the first had a test: deleting the `fill_n`
+//     leaves 444 checks green while the band is clocked on the previous chunk's split audio instead,
+//     worth 6.9 dB out of digital silence on un-bypass.
+static void theBypassedBandIsClockedOnSilence()
+{
+    group ("law 11c — a bypassed band's narrowing call carries SILENCE, not the last chunk's audio");
+    const int B = 96;
+    multiband::MultibandCompressor<3> A, Bm;
+    if (! (A.prepare (kFs, B, 2) && Bm.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    dynamics::CompressorParams cp;
+    cp.thresholdDb = -30.0; cp.ratio = 5.0; cp.attackMs = 2.0; cp.releaseMs = 2.0; cp.kneeDb = 0.0;
+    for (int b = 0; b < 3; ++b) { A.setBandParams (b, cp); Bm.setBandParams (b, cp); }
+    // Band 1 stays LIVE through the warm-up, so its planes are valid and the difference cannot be the
+    // null-plane crash: this is the semantic half on its own.
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    for (int k = 0; k < 6; ++k)
+    {
+        fillTone (l, k * B, 900.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+        fillTone (l, k * B, 900.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bm.process (jo, 2, B));
+    }
+    const double loud = A.bandGainReductionDb (1);
+    ok (loud < -1.0, "precondition: the band is holding real gain reduction from the loud material");
+    A.setBandBypass (1, true); Bm.setBandBypass (1, true);
+    // A narrows (the falling edge fires and hands band 1 its silent block). B stays wide and feeds real
+    // silence, which is what that block is supposed to BE. A fast release makes the two answers diverge
+    // within one block: silence releases the band, the previous chunk's audio does not.
+    fillTone (l, 0, 900.0, 0.9f);
+    { float* io[1] = { l.data() }; run (A.process (io, 1, B)); }
+    { std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f); float* jo[2] = { z1.data(), z2.data() }; run (Bm.process (jo, 2, B)); }
+    // WHAT THIS CAN AND CANNOT SAY, because the obvious oracle is not one. `Bm` is NOT a silence
+    // reference: at a live width the band loop SKIPS a bypassed band, so `Bm`'s band 1 is frozen where
+    // the loud material left it (measured, -18.204 against A's -6.697). That asymmetry is law 11c's one
+    // inexact corner, documented in `MultibandProcessor.h` — it is the thing being compared against, not
+    // a bug. So the assertion here is the direction: the edge RELEASED the band, which silence does and
+    // the previous chunk's loud audio does not.
+    // It is a weaker check than the rest of this file and that is stated rather than dressed up: a
+    // mutation that deletes the `fill_n` and hands the band the previous chunk's split audio survives it
+    // whenever that chunk's content in THIS band happens to be quiet. Closing it needs an observable for
+    // "what the band was clocked on", which the composite does not expose today.
+    ok (A.bandGainReductionDb (1) > loud + 0.5,
+        "the edge RELEASED the bypassed band — silence does that, the previous chunk's audio does not ("
+        + std::to_string (A.bandGainReductionDb (1)) + " dB from " + std::to_string (loud) + ")");
+}
+
+// (m) THE DE-ZIPPER'S TERM IN THE SHAPER'S EXIT PREDICATE — the exact sibling of the gate's HOLD term.
+//     Give the gain smoother a longer time constant than either envelope and it is the last thing still
+//     moving, so a predicate that ignores it exits early and freezes the gain mid-ramp.
+static void theShapersDeZipperIsInThePredicate()
+{
+    group ("law 11c — TransientShaper: the pause does not exit while the de-zipper is still travelling");
+    const int B = 128, gap = 20000;
+    dynamics::TransientShaperParams p;
+    // The envelopes park in a handful of samples; the de-zipper needs 200 ms. That ordering is the test.
+    p.attackDb = 12.0; p.sustainDb = -9.0; p.threshold = 0.05;
+    p.fastAttackMs = 0.05; p.fastReleaseMs = 0.05; p.slowAttackMs = 0.06; p.slowReleaseMs = 0.06;
+    p.gainSmoothMs = 200.0;
+    dynamics::TransientShaper A, Bs;
+    if (! (A.prepare (kFs, B, 2) && Bs.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    A.setParams (p); Bs.setParams (p);
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    for (int k = 0; k < 24; ++k)
+    {
+        for (int i = 0; i < B; ++i) { const int t = k * B + i; const float e = (t % 600 < 20) ? 1.0f : 0.02f;
+                                      l[(std::size_t) i] = e * (float) std::sin (2.0 * core::kPi * 300.0 * t / kFs); }
+        r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+        for (int i = 0; i < B; ++i) { const int t = k * B + i; const float e = (t % 600 < 20) ? 1.0f : 0.02f;
+                                      l[(std::size_t) i] = e * (float) std::sin (2.0 * core::kPi * 300.0 * t / kFs); }
+        r = l; float* jo[2] = { l.data(), r.data() }; run (Bs.process (jo, 2, B));
+    }
+    for (int off = 0; off < gap; off += B)
+    {
+        const int n = std::min (B, gap - off);
+        float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, n));
+        std::vector<float> z1 ((std::size_t) n, 0.0f), z2 ((std::size_t) n, 0.0f);
+        float* jo[2] = { z1.data(), z2.data() }; run (Bs.process (jo, 2, n));
+    }
+    std::vector<float> al ((std::size_t) B, 1.0f), ar ((std::size_t) B, 1.0f), bl ((std::size_t) B, 1.0f), br ((std::size_t) B, 1.0f);
+    float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
+    run (A.process (ai, 2, B)); run (Bs.process (bi, 2, B));
+    ok (bitsEqual (al[0], bl[0]), "the de-zipper arrived at the same place silence takes it");
+    ok (! bitsEqual (bl[0], 1.0f), "precondition: the de-zipper was NOT at unity — it had somewhere to travel");
+}
+
 int main()
 {
     std::printf ("law 11c — a pause is silence\n");
@@ -1426,5 +1510,7 @@ int main()
     theFollowerBranchIsPerSample();
     theGatesExitPredicateNeedsAllOfIt();
     theTapAndTheKeyAtWidthZero();
+    theBypassedBandIsClockedOnSilence();
+    theShapersDeZipperIsInThePredicate();
     return felitronics::test::report();
 }
