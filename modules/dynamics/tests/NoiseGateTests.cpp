@@ -47,7 +47,7 @@ static float runMono (NoiseGate& g, const std::vector<float>& src, int blocks, i
     {
         for (int i = 0; i < n; ++i) blk[(std::size_t) i] = src[(std::size_t) ((b * n + i) % (int) src.size())];
         const float* in[1] { blk.data() };
-        g.analyse (in, 1, n, on, thr);
+        felitronics::test::run (g.analyse (in, 1, n, on, thr));
     }
     return g.currentCoreGain();
 }
@@ -59,20 +59,20 @@ int main()
 
     test::group ("starts CLOSED — silence + on holds the floor (no startup leak)");
     {
-        NoiseGate g; g.prepare (kSr, N, 2); g.seedEnabled (true);   // a session restored gate-ON: no fade-in leak
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2)); g.seedEnabled (true);   // a session restored gate-ON: no fade-in leak
         std::vector<float> z ((std::size_t) N, 0.0f); const float* in[1] { z.data() };
-        g.analyse (in, 1, N, true, -60.0f);
+        felitronics::test::run (g.analyse (in, 1, N, true, -60.0f));
         test::ok (g.currentCoreGain() < 1.0e-3f, "coreGain at floor on silence");
         test::ok (g.currentGain()     < 1.0e-3f, "effective gain at floor (enabled)");
     }
 
     test::group ("gate OFF = bit-exact unity passthrough");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         auto s = sine (220.0, kSr, N, 0.3);
         std::vector<float> probe ((std::size_t) N, 1.0f);
-        for (int b = 0; b < 8; ++b) { const float* in[1] { s.data() }; g.analyse (in, 1, N, false, -60.0f); }
-        float* pb[1] { probe.data() }; g.applyGain (pb, 1, N);
+        for (int b = 0; b < 8; ++b) { const float* in[1] { s.data() }; felitronics::test::run (g.analyse (in, 1, N, false, -60.0f)); }
+        float* pb[1] { probe.data() }; felitronics::test::run (g.applyGain (pb, 1, N));
         bool unity = true; for (float v : probe) unity = unity && (v == 1.0f);
         test::ok (unity, "applyGain leaves the buffer exactly unchanged when off");
         test::approx (g.currentGain(), 1.0, 1.0e-6, "effective gain is exactly unity when off");
@@ -80,27 +80,27 @@ int main()
 
     test::group ("loud tone above threshold OPENS");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         test::ok (runMono (g, sine (220.0, kSr, N, 0.1), 8, N, true, -60.0f) > 0.99f, "-20 dBFS > -60 thr opens fully");
     }
 
     // A FINITE ±FLT_MAX overflows the sidechain IIR to ±Inf; a naive flush passes Inf and sticks the gate open.
     test::group ("NaN/Inf key does not brick the gate (recovers to closed)");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         std::vector<float> poison ((std::size_t) N, 0.0f); poison[0] = FLT_MAX; poison[1] = -FLT_MAX;
-        { const float* in[1] { poison.data() }; g.analyse (in, 1, N, true, -40.0f); }
+        { const float* in[1] { poison.data() }; felitronics::test::run (g.analyse (in, 1, N, true, -40.0f)); }
         std::vector<float> z ((std::size_t) N, 0.0f); float last = 1.0f;
-        for (int b = 0; b < 40; ++b) { const float* in[1] { z.data() }; g.analyse (in, 1, N, true, -40.0f); last = g.currentCoreGain(); }
+        for (int b = 0; b < 40; ++b) { const float* in[1] { z.data() }; felitronics::test::run (g.analyse (in, 1, N, true, -40.0f)); last = g.currentCoreGain(); }
         test::ok (std::isfinite (last), "coreGain finite after +/-FLT_MAX");
         test::ok (last < 1.0e-3f, "gate RECOVERS to closed (not stuck open)");
     }
 
     test::group ("GR reading is effective — off reads ~unity, not floor");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         std::vector<float> z ((std::size_t) N, 0.0f);
-        for (int b = 0; b < 4; ++b) { const float* in[1] { z.data() }; g.analyse (in, 1, N, false, -60.0f); }
+        for (int b = 0; b < 4; ++b) { const float* in[1] { z.data() }; felitronics::test::run (g.analyse (in, 1, N, false, -60.0f)); }
         test::ok (g.currentGain() > 0.99f, "effective gain ~1.0 while disabled");
         test::ok (g.currentCoreGain() < 1.0e-3f, "raw core gain still tracks closed");
     }
@@ -110,13 +110,13 @@ int main()
         auto src = sine (130.0, kSr, 600, 0.2);
         auto render = [&] (std::vector<int> chunks)
         {
-            NoiseGate g; g.prepare (kSr, 600, 2);
+            NoiseGate g; felitronics::test::run (g.prepare (kSr, 600, 2));
             std::vector<float> out = src; int off = 0;
             for (int c : chunks)
             {
                 int m = std::min (c, (int) src.size() - off); if (m <= 0) break;
                 const float* in[1] { src.data() + off }; float* ob[1] { out.data() + off };
-                g.analyse (in, 1, m, true, -70.0f); g.applyGain (ob, 1, m); off += m;
+                felitronics::test::run (g.analyse (in, 1, m, true, -70.0f)); felitronics::test::run (g.applyGain (ob, 1, m)); off += m;
             }
             return out;
         };
@@ -128,14 +128,14 @@ int main()
 
     test::group ("sustained low-E does not chatter / false-close");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         auto e = sine (82.41, kSr, N, 0.06);   // ~ -24 dBFS, well above -60
         float minCore = 1.0f;
         for (int b = 0; b < 90; ++b)
         {
             std::vector<float> blk ((std::size_t) N);
             for (int i = 0; i < N; ++i) blk[(std::size_t) i] = e[(std::size_t) ((b * N + i) % (int) e.size())];
-            const float* in[1] { blk.data() }; g.analyse (in, 1, N, true, -60.0f);
+            const float* in[1] { blk.data() }; felitronics::test::run (g.analyse (in, 1, N, true, -60.0f));
             if (b > 4) minCore = std::min (minCore, g.currentCoreGain());
         }
         test::ok (minCore > 0.99f, "gate stays fully open across the whole sustained low note");
@@ -143,21 +143,21 @@ int main()
 
     test::group ("linear-fast open preserves the transient (unity within ~2 ms)");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         std::vector<float> z ((std::size_t) N, 0.0f);
-        for (int b = 0; b < 20; ++b) { const float* in[1] { z.data() }; g.analyse (in, 1, N, true, -60.0f); }
+        for (int b = 0; b < 20; ++b) { const float* in[1] { z.data() }; felitronics::test::run (g.analyse (in, 1, N, true, -60.0f)); }
         std::vector<float> step ((std::size_t) N, 0.5f), probe ((std::size_t) N, 1.0f);
         const float* in[1] { step.data() }; float* pb[1] { probe.data() };
-        g.analyse (in, 1, N, true, -60.0f); g.applyGain (pb, 1, N);
+        felitronics::test::run (g.analyse (in, 1, N, true, -60.0f)); felitronics::test::run (g.applyGain (pb, 1, N));
         int idx = -1; for (int i = 0; i < N; ++i) if (probe[(std::size_t) i] > 0.5f) { idx = i; break; }
         test::ok (idx >= 0 && idx < 96, "gain reaches ~unity within ~2 ms of the onset");
     }
 
     test::group ("linked stereo detector (max of L/R)");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         auto loud = sine (300.0, kSr, N, 0.2); std::vector<float> silent ((std::size_t) N, 0.0f);
-        for (int b = 0; b < 8; ++b) { const float* in[2] { silent.data(), loud.data() }; g.analyse (in, 2, N, true, -60.0f); }
+        for (int b = 0; b < 8; ++b) { const float* in[2] { silent.data(), loud.data() }; felitronics::test::run (g.analyse (in, 2, N, true, -60.0f)); }
         test::ok (g.currentCoreGain() > 0.99f, "loud RIGHT opens the gate even with a silent LEFT");
     }
 
@@ -166,12 +166,12 @@ int main()
         auto openMs = [] (double sr)
         {
             const int n = (int) sr;
-            NoiseGate g; g.prepare (sr, n, 2);
+            NoiseGate g; felitronics::test::run (g.prepare (sr, n, 2));
             std::vector<float> z ((std::size_t) n, 0.0f);
-            { const float* in[1] { z.data() }; g.analyse (in, 1, n, true, -60.0f); }
+            { const float* in[1] { z.data() }; felitronics::test::run (g.analyse (in, 1, n, true, -60.0f)); }
             std::vector<float> step ((std::size_t) n, 0.5f), probe ((std::size_t) n, 1.0f);
             const float* in[1] { step.data() }; float* pb[1] { probe.data() };
-            g.analyse (in, 1, n, true, -60.0f); g.applyGain (pb, 1, n);
+            felitronics::test::run (g.analyse (in, 1, n, true, -60.0f)); felitronics::test::run (g.applyGain (pb, 1, n));
             int idx = 0; for (int i = 0; i < n; ++i) if (probe[(std::size_t) i] > 0.5f) { idx = i; break; }
             return idx * 1000.0 / sr;
         };
@@ -182,15 +182,29 @@ int main()
 
     test::group ("degenerate numChannels = 0 is a safe no-op");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
-        const float* none[1] { nullptr }; g.analyse (none, 0, N, true, -60.0f);
-        float* nb[1] { nullptr }; g.applyGain (nb, 0, N);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
+        // A REAL curve first: on a fresh gate analysedSamples() is already 0, so the check below could
+        // not see the invalidation it is about. The mutation stand found exactly that blind spot.
+        std::vector<float> key ((std::size_t) N, 0.2f);
+        const float* kp[2] { key.data(), key.data() };
+        felitronics::test::run (g.analyse (kp, 2, N, true, -60.0f));
+        test::ok (g.analysedSamples() == N, "precondition: a curve of N samples exists");
+        const float* none[1] { nullptr }; felitronics::test::run (g.analyse (none, 0, N, true, -60.0f));
+        test::ok (g.analysedSamples() == 0, "a zero-lane analyse() produces NO curve, and records that");
+        // ...so phase B has nothing to apply and says so, instead of multiplying by the PREVIOUS call's
+        // curve. That is the defect measured at 90.0 dB of attenuation on unanalysed material.
+        // ...and phase B answers the SAME geometry the same way: nch == 0 has no lane to attenuate, so
+        // it is an accepted no-op in both phases. The curve's length is what phase B is bounded by, and
+        // the check for it comes after — law 11's own order.
+        float* nb[1] { nullptr }; felitronics::test::run (g.applyGain (nb, 0, N));
+        std::vector<float> one ((std::size_t) N, 1.0f); float* op[1] { one.data() };
+        test::ok (! g.applyGain (op, 1, N), "...but applying a REAL lane past the analysed length is refused");
         test::ok (true, "no crash / no OOB on a zero-lane block");
     }
 
     test::group ("NaN threshold falls back, does not freeze");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         test::ok (runMono (g, sine (220.0, kSr, N, 0.1), 8, N, true, std::nanf ("")) > 0.99f,
                   "NaN threshold -> fallback, still opens on a loud tone");
     }
@@ -198,7 +212,7 @@ int main()
     // RT-safety: analyse()/applyGain()/process() must not allocate (all storage sized in prepare()).
     test::group ("no allocation in analyse/applyGain/process");
     {
-        NoiseGate g; g.prepare (kSr, N, 2);
+        NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         auto s = sine (220.0, kSr, N, 0.2);
         std::vector<float> buf ((std::size_t) N);
         const long before = g_allocs.load();
@@ -206,9 +220,9 @@ int main()
         {
             for (int i = 0; i < N; ++i) buf[(std::size_t) i] = s[(std::size_t) i];
             const float* in[1] { buf.data() }; float* io[1] { buf.data() };
-            g.analyse (in, 1, N, true, -40.0f);
-            g.applyGain (io, 1, N);
-            g.process  (io, 1, N, true, -40.0f);
+            felitronics::test::run (g.analyse (in, 1, N, true, -40.0f));
+            felitronics::test::run (g.applyGain (io, 1, N));
+            felitronics::test::run (g.process  (io, 1, N, true, -40.0f));
         }
         test::okNoAlloc (g_allocs.load() == before, "analyse/applyGain/process allocated nothing");
     }

@@ -38,10 +38,10 @@ static double rmsTail (const std::vector<float>& v, int from)
 
 static std::vector<float> runTone (const DP& p, double f, double amp, int N, double sr)
 {
-    DB d; d.prepare (sr, 1); d.setParams (p);
+    DB d; felitronics::test::run (d.prepare (sr, 1)); d.setParams (p);
     std::vector<float> y (N);
     for (int i = 0; i < N; ++i) y[i] = (float) (amp * std::sin (2.0 * core::kPi * f * i / sr));
-    for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+    for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o))); }
     return y;
 }
 
@@ -100,21 +100,21 @@ int main()
     // --- no allocation in process() ---
     test::group ("DynamicEqBand no-alloc");
     {
-        DB d; d.prepare (sr, 2); DP p; p.freq = 3000.0; p.mode = Mode::CutWhenLoud; p.thresholdDb = -20.0; d.setParams (p);
+        DB d; felitronics::test::run (d.prepare (sr, 2)); DP p; p.freq = 3000.0; p.mode = Mode::CutWhenLoud; p.thresholdDb = -20.0; d.setParams (p);
         std::vector<float> l (512, 0.3f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
-        d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512));
         const long before = g_allocs.load();
-        d.process (io, 2, 512); d.process (io, 2, 512);
+        felitronics::test::run (d.process (io, 2, 512)); felitronics::test::run (d.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
     // --- stereo linked: one gain, image preserved ---
     test::group ("DynamicEqBand stereo identical");
     {
-        DB d; d.prepare (sr, 2); DP p; p.freq = 5000.0; p.Q = 2.0; p.mode = Mode::CutWhenLoud; p.thresholdDb = -30.0; p.ratio = 6.0; d.setParams (p);
+        DB d; felitronics::test::run (d.prepare (sr, 2)); DP p; p.freq = 5000.0; p.Q = 2.0; p.mode = Mode::CutWhenLoud; p.thresholdDb = -30.0; p.ratio = 6.0; d.setParams (p);
         const int N = 8000; std::vector<float> l (N), r (N);
         for (int i = 0; i < N; ++i) { const float v = (float) (0.7 * std::sin (2.0 * pi * 5000.0 * i / sr)); l[i] = v; r[i] = v; }
-        for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; d.process (io, 2, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (d.process (io, 2, std::min (512, N - o))); }
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (l[i] - r[i]));
         test::ok (md == 0.0, "identical L/R in → identical L/R out (linked detector)");
     }
@@ -138,12 +138,12 @@ int main()
     test::group ("DynamicEqBand static null vs plain Svf Bell");
     {
         DP p; p.freq = 1200.0; p.Q = 1.5; p.staticGainDb = 5.0; p.ratio = 1.0; p.rangeDb = 0.0;
-        DB d; d.prepare (sr, 1); d.setParams (p);
+        DB d; felitronics::test::run (d.prepare (sr, 1)); d.setParams (p);
         eq::Svf ref; ref.prepare (sr, 1); ref.setParams (eq::FilterType::Bell, 1200.0, 1.5, 5.0);
         unsigned long long s = 11; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.3f * rng(); y[i] = x[i]; }
-        for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; d.process (io, 1, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (d.process (io, 1, std::min (512, N - o))); }
         double md = 0; for (int i = 0; i < N; ++i) { const float r = ref.processSample (0, x[i]); if (i >= 1000) md = std::max (md, (double) std::fabs (y[i] - r)); }
         test::ok (md < 1.0e-3, "ratio=1 dynamic band == a plain Svf Bell (identical shape)");
     }

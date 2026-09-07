@@ -273,12 +273,12 @@ int main()
 
         auto runChunked = [&] (int chunk)
         {
-            analysis::LoudnessMeter m; m.prepare (fs, 2, 20.0);
+            analysis::LoudnessMeter m; felitronics::test::run (m.prepare (fs, 2, 20.0));
             for (int off = 0; off < n; off += chunk)
             {
                 const int take = (off + chunk <= n) ? chunk : (n - off);
                 const float* part[2] { a.data() + off, b.data() + off };
-                m.process (part, 2, take);
+                felitronics::test::run (m.process (part, 2, take));
             }
             return m.integratedLufs();
         };
@@ -361,8 +361,8 @@ int main()
             l[(size_t) i] = r[(size_t) i] = (float) (0.5 * std::sin (6.283185307179586 * 1000.0 * i / fs));
         const float* chans[2] { l.data(), r.data() };
 
-        analysis::LoudnessMeter m; m.prepare (fs, 2, 10.0);
-        m.process (chans, 2, n);
+        analysis::LoudnessMeter m; felitronics::test::run (m.prepare (fs, 2, 10.0));
+        felitronics::test::run (m.process (chans, 2, n));
         const double lufs = m.integratedLufs();
         // -3.01 LUFS is the analytic answer for a 1 kHz sine at 0.5 in both channels: a 1 kHz tone sits at
         // K-weighting unity, so LUFS = 10*log10(2 * 0.5^2/2) - 0.691 + ... — the conformance suite pins the
@@ -388,11 +388,11 @@ int main()
         {
             std::vector<float> l = a, r = b;
             if (poisonAt >= 0) l[(size_t) poisonAt] = value;
-            analysis::LoudnessMeter m; m.prepare (fs, 2, 30.0);
+            analysis::LoudnessMeter m; felitronics::test::run (m.prepare (fs, 2, 30.0));
             for (int off = 0; off < n; off += 480)
             {
                 const float* ch[2] { l.data() + off, r.data() + off };
-                m.process (ch, 2, std::min (480, n - off));
+                felitronics::test::run (m.process (ch, 2, std::min (480, n - off)));
             }
             int bad = 0; for (double e : m.gatingBlockEnergies()) if (! std::isfinite (e)) ++bad;
             struct R { double integrated, momentary; int badBlocks, total; unsigned long long counter; };
@@ -434,21 +434,21 @@ int main()
         test::ok (early.counter == 1, "one early NaN, one counted sub-hop");
         // A poisoned CHANNEL must not be able to zero a sub-hop through a zero weight: BS.1770 gives LFE
         // w = 0, and `0 * NaN` is NaN, so the catch is per channel and not on the weighted sum.
-        analysis::LoudnessMeter mw; mw.prepare (fs, 2, 30.0);
+        analysis::LoudnessMeter mw; felitronics::test::run (mw.prepare (fs, 2, 30.0));
         mw.setChannelWeight (0, std::numeric_limits<double>::quiet_NaN());
         std::vector<float> q = a;
         const float* cw[2] { q.data(), b.data() };
-        mw.process (cw, 2, 48000);
+        felitronics::test::run (mw.process (cw, 2, 48000));
         test::ok (mw.nonFiniteSubHops() == 0, "a non-finite channel WEIGHT is refused, not stored");
 
         const auto inf = run ((int) fs, std::numeric_limits<float>::infinity());
         test::ok (inf.counter >= 1, "+inf is counted too");
         test::ok (std::isfinite (inf.integrated), "+inf no longer reads as silence");
 
-        analysis::LoudnessMeter m2; m2.prepare (fs, 2, 30.0);
+        analysis::LoudnessMeter m2; felitronics::test::run (m2.prepare (fs, 2, 30.0));
         std::vector<float> l = a; l[100] = std::numeric_limits<float>::quiet_NaN();
         const float* ch2[2] { l.data(), b.data() };
-        m2.process (ch2, 2, 48000);
+        felitronics::test::run (m2.process (ch2, 2, 48000));
         test::ok (m2.nonFiniteSubHops() > 0, "counter is set");
         m2.reset();
         test::ok (m2.nonFiniteSubHops() == 0, "and reset() clears it");
@@ -470,11 +470,11 @@ int main()
             for (int i = 0; i < n; ++i)
                 l[(size_t) i] = r[(size_t) i] = (float) (0.25 * std::sin (6.283185307179586 * 1000.0 * i / fs));
             l[(size_t) pos] = std::numeric_limits<float>::infinity();
-            analysis::LoudnessMeter m; m.prepare (fs, 2, 60.0);
+            analysis::LoudnessMeter m; felitronics::test::run (m.prepare (fs, 2, 60.0));
             for (int off = 0; off < n; off += 480)
             {
                 const float* ch[2] { l.data() + off, r.data() + off };
-                m.process (ch, 2, std::min (480, n - off));
+                felitronics::test::run (m.process (ch, 2, std::min (480, n - off)));
             }
             const double lra = m.loudnessRangeLu();
             test::ok (std::isfinite (lra) && lra >= 0.0,
@@ -503,9 +503,9 @@ int main()
         const double sr = 48000.0; const int n = (int) (5.0 * sr);
         std::vector<float> L (n), R (n);
         for (int i = 0; i < n; ++i) { const float v = (float) (0.5 * std::sin (2.0 * core::kPi * 1000.0 * i / sr)); L[i] = v; R[i] = v; }
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 10.0));
         const float* ch[2] { L.data(), R.data() };
-        lm.process (ch, 2, n);
+        felitronics::test::run (lm.process (ch, 2, n));
         const double m = lm.momentaryLufs(), st = lm.shortTermLufs(), ig = lm.integratedLufs();
         test::ok (std::isfinite (m) && m > -60.0, "momentary finite + sensible");
         test::approx (ig, m,  0.3, "integrated ≈ momentary for a steady tone");
@@ -520,8 +520,8 @@ int main()
         std::vector<float> x ((std::size_t) (2 * seg));
         for (int i = 0; i < seg; ++i) x[(std::size_t) i]         = (float) (0.5f  * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
         for (int i = 0; i < seg; ++i) x[(std::size_t) (seg + i)] = (float) (0.15f * std::sin (2.0 * core::kPi * 1000.0 * i / sr));   // ~10.5 dB down
-        analysis::LoudnessMeter lm; lm.prepare (sr, 1, 30.0);
-        const float* ch[1] { x.data() }; lm.process (ch, 1, 2 * seg);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 1, 30.0));
+        const float* ch[1] { x.data() }; felitronics::test::run (lm.process (ch, 1, 2 * seg));
         const double lra = lm.loudnessRangeLu();
         test::ok (lra > 7.0 && lra < 13.0, "loud↔quiet (~10.5 dB apart) → LRA ≈ the spread");
     }
@@ -531,8 +531,8 @@ int main()
     {
         const double sr = 48000.0; const int n = (int) (2.0 * sr);
         std::vector<float> x ((std::size_t) n, 0.3f);
-        analysis::LoudnessMeter lm; lm.prepare (sr, 1, 10.0);
-        const float* ch[1] { x.data() }; lm.process (ch, 1, n);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 1, 10.0));
+        const float* ch[1] { x.data() }; felitronics::test::run (lm.process (ch, 1, n));
         test::ok (lm.loudnessRangeLu() == 0.0, "< 3 s of audio → LRA = 0 (no short-term sample yet)");
     }
 
@@ -550,8 +550,8 @@ int main()
     {
         const double sr = 48000.0; const int seg = (int) (12.0 * sr);
         auto x = twoLevel (sr, seg, 0.0630f);                                       // ≈ −18 dB quiet section
-        analysis::LoudnessMeter lm; lm.prepare (sr, 1, 30.0);
-        const float* ch[1] { x.data() }; lm.process (ch, 1, 2 * seg);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 1, 30.0));
+        const float* ch[1] { x.data() }; felitronics::test::run (lm.process (ch, 1, 2 * seg));
         const double lra = lm.loudnessRangeLu();
         test::ok (lra > 13.0 && lra < 22.0, "18 dB spread → LRA ≈ 18 (the quiet tail passes the −20 LU gate)");
     }
@@ -561,15 +561,15 @@ int main()
     {
         const double sr = 48000.0; const int seg = (int) (12.0 * sr);
         auto x = twoLevel (sr, seg, 0.15f);
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 30.0);
-        const float* mono[1] { x.data() }; lm.process (mono, 1, 2 * seg);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 30.0));
+        const float* mono[1] { x.data() }; felitronics::test::run (lm.process (mono, 1, 2 * seg));
         const double lraA = lm.loudnessRangeLu();
         lm.reset();
-        lm.process (mono, 1, 2 * seg);
+        felitronics::test::run (lm.process (mono, 1, 2 * seg));
         const double lraB = lm.loudnessRangeLu();
         test::ok (lraB == lraA, "reset → identical LRA on the same input (deterministic)");
         lm.reset();
-        const float* stereo[2] { x.data(), x.data() }; lm.process (stereo, 2, 2 * seg);   // dual-mono = +3 LU everywhere
+        const float* stereo[2] { x.data(), x.data() }; felitronics::test::run (lm.process (stereo, 2, 2 * seg));   // dual-mono = +3 LU everywhere
         test::ok (std::fabs (lm.loudnessRangeLu() - lraA) < 0.2, "mono == dual-mono stereo LRA (a constant offset cancels in P95−P10)");
     }
 
@@ -578,10 +578,10 @@ int main()
     {
         analysis::LoudnessMeter lm;                                  // NOT prepared (hopRing empty; hopSamples defaults 4800)
         std::vector<float> sig (6000, 0.1f); const float* io[1] { sig.data() };
-        lm.process (io, 1, 6000);                                    // > hopSamples → would finishHop into empty hopRing; must no-op
+        test::ok (! lm.process (io, 1, 6000), "process() before prepare() is REFUSED (law 11), not a silent no-op");
         test::ok (true, "process before prepare did not OOB the hop ring (ASan check)");
-        lm.prepare (0.0, 2);                                         // fs<=0 → clamped, hopSamples>=1 (no /0 in finishHop)
-        lm.process (io, 1, 6000);
+        felitronics::test::run (lm.prepare (0.0, 2));                                         // fs<=0 → clamped, hopSamples>=1 (no /0 in finishHop)
+        felitronics::test::run (lm.process (io, 1, 6000));
         test::ok (true, "process after fs<=0 prepare did not divide by zero (UBSan check)");
     }
 
@@ -627,18 +627,18 @@ int main()
     test::group ("LoudnessMeter: a dropped channel's partial hop can't leak later");
     {
         const double srr = 48000.0;
-        analysis::LoudnessMeter lm; lm.prepare (srr, 2);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (srr, 2));
         const int half = 2400, hop = 4800;
         std::vector<float> zero ((std::size_t) hop, 0.0f), zhalf ((std::size_t) half, 0.0f), loud ((std::size_t) half);
         for (int i = 0; i < half; ++i) loud[(std::size_t) i] = (float) (0.45 * std::sin (2.0 * core::kPi * 1000.0 * i / srr));
         const float* st2[2] { zhalf.data(), loud.data() };
-        lm.process (st2, 2, half);                                     // half a hop of loud R…
+        felitronics::test::run (lm.process (st2, 2, half));                                     // half a hop of loud R…
         const float* st0[2] { zero.data(), zero.data() };
-        lm.process (st0, 2, 2300);                                     // …zeros IN STEREO so the K-filter ring decays
+        felitronics::test::run (lm.process (st0, 2, 2300));                                     // …zeros IN STEREO so the K-filter ring decays
                                                                        // (the parked hop energy stays parked)…
         const float* mono[1] { zero.data() };
-        for (int h = 0; h < 3; ++h) lm.process (mono, 1, hop);         // …then the channel count DROPS mid-hop
-        for (int h = 0; h < 4; ++h) lm.process (st0, 2, hop);          // back to stereo: 400 ms of true silence
+        for (int h = 0; h < 3; ++h) felitronics::test::run (lm.process (mono, 1, hop));         // …then the channel count DROPS mid-hop
+        for (int h = 0; h < 4; ++h) felitronics::test::run (lm.process (st0, 2, hop));          // back to stereo: 400 ms of true silence
         // A leaked half-hop of −7 dBFS tone reads ≈ −20 LUFS here; the honest K-filter ring tail is ≈ −80.
         test::ok (lm.momentaryLufs() < -60.0, "momentary after 400 ms of silence ≈ silence (no stale channel energy)");
     }
@@ -648,12 +648,12 @@ int main()
     {
         for (double srr : { 48000.0, 44100.0 })
         {
-            analysis::LoudnessMeter lm; lm.prepare (srr, 1);
+            analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (srr, 1));
             const int n = (int) (5.0 * srr);
             std::vector<float> x ((std::size_t) n);
             for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) std::sin (2.0 * core::kPi * 997.0 * i / srr);
             const float* ch[1] { x.data() };
-            lm.process (ch, 1, n);
+            felitronics::test::run (lm.process (ch, 1, n));
             test::approx (lm.integratedLufs(), -3.01, 0.1, srr == 48000.0 ? "997 Hz @48k → −3.01 LKFS" : "997 Hz @44.1k → −3.01 LKFS");
         }
     }
@@ -662,10 +662,10 @@ int main()
     test::group ("LoudnessMeter steady DC is K-weighted away");
     {
         const double srr = 48000.0;
-        analysis::LoudnessMeter lm; lm.prepare (srr, 1);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (srr, 1));
         std::vector<float> x ((std::size_t) (3.0 * srr), 0.5f);
         const float* ch[1] { x.data() };
-        lm.process (ch, 1, (int) x.size());
+        felitronics::test::run (lm.process (ch, 1, (int) x.size()));
         test::ok (lm.momentaryLufs() < -100.0, "steady 0.5 DC → momentary at the silence floor");
     }
 

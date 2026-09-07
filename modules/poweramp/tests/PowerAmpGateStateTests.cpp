@@ -89,7 +89,7 @@ static double lastPeakWith (const poweramp::Params& p, const poweramp::Voicing& 
             L[(std::size_t) i] = 0.0f;
             R[(std::size_t) i] = (float) (0.9 * std::sin (0.05 * (k * N + i)));
         }
-        a.process (io, 2, N);
+        felitronics::test::run (a.process (io, 2, N));
         last = peakOf (R);
     }
     return last;
@@ -126,18 +126,18 @@ int main()
                 L[(std::size_t) i] = 0.0f;
                 R[(std::size_t) i] = (float) (0.9 * std::sin (0.05 * (k * N + i)));
             }
-            a.process (io, 2, N);
+            felitronics::test::run (a.process (io, 2, N));
             charged = std::fmax (charged, peakOf (R));
         }
         ok (charged > 0.05, "precondition: the right channel really was driven");
 
-        for (int k = 0; k < 20; ++k) { std::fill (L.begin(), L.end(), 0.0f); a.process (io, 1, N); }
+        for (int k = 0; k < 20; ++k) { std::fill (L.begin(), L.end(), 0.0f); felitronics::test::run (a.process (io, 1, N)); }
 
         double worst = 0.0;
         for (int k = 0; k < 10; ++k)
         {
             std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
-            a.process (io, 2, N);
+            felitronics::test::run (a.process (io, 2, N));
             worst = std::fmax (worst, std::fmax (peakOf (L), peakOf (R)));
         }
         ok (worst == 0.0, "silence in, exact zero out after 2 -> 1 -> 2 (was 0.649 = -3.8 dBFS)");
@@ -171,20 +171,20 @@ int main()
             auto hush = [&] { std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f); };
 
             double charged = 0.0;
-            for (int k = 0; k < 40; ++k) { tone (k); a.process (io, 2, N); charged = std::fmax (charged, peakOf (L)); }
+            for (int k = 0; k < 40; ++k) { tone (k); felitronics::test::run (a.process (io, 2, N)); charged = std::fmax (charged, peakOf (L)); }
             ok (charged > 0.01, std::string ("precondition ") + g.name + ": the gate really was open and driven");
 
             poweramp::Params off = on; off.*(g.knob) = 0.0f;      // the knob goes to zero...
             a.setParams (off, liveVoicing());
-            for (int k = 40; k < 200; ++k) { tone (k); a.process (io, 2, N); }   // ...and the gate closes mid-signal
+            for (int k = 40; k < 200; ++k) { tone (k); felitronics::test::run (a.process (io, 2, N)); }   // ...and the gate closes mid-signal
 
-            for (int k = 0; k < 1500; ++k) { hush(); a.process (io, 2, N); }     // drain everything that still runs
+            for (int k = 0; k < 1500; ++k) { hush(); felitronics::test::run (a.process (io, 2, N)); }     // drain everything that still runs
             ok (peakOf (L) == 0.0 && peakOf (R) == 0.0,
                 std::string ("precondition ") + g.name + ": the rest of the chain drained to EXACT zero");
 
             a.setParams (on, liveVoicing());                                     // the knob comes back
             double worst = 0.0;
-            for (int k = 0; k < 200; ++k) { hush(); a.process (io, 2, N); worst = std::fmax (worst, std::fmax (peakOf (L), peakOf (R))); }
+            for (int k = 0; k < 200; ++k) { hush(); felitronics::test::run (a.process (io, 2, N)); worst = std::fmax (worst, std::fmax (peakOf (L), peakOf (R))); }
             char msg[160];
             std::snprintf (msg, sizeof msg, "%s gate off -> on: exact zero out of silence (was %.1f dBFS)", g.name, g.wasDbfs);
             ok (worst == 0.0, msg);
@@ -211,8 +211,8 @@ int main()
             fillNoise (d0, (unsigned) (11u + (unsigned) k));
             std::fill (d1.begin(), d1.end(), 0.0f);
             r0 = d0; r1 = d1;
-            dut.process (dio, (k >= 25 && k < 50) ? 1 : 2, N);
-            ref.process (rio, 2, N);
+            felitronics::test::run (dut.process (dio, (k >= 25 && k < 50) ? 1 : 2, N));
+            felitronics::test::run (ref.process (rio, 2, N));
             equal = equal && bitEqual (d0, r0);
             energy += peakOf (d0);
         }
@@ -226,9 +226,9 @@ int main()
         a.setParams (loudParams(), liveVoicing());
         std::vector<float> L ((std::size_t) N, 0.05f), R ((std::size_t) N, 0.05f);
         float* io[2] { L.data(), R.data() };
-        a.process (io, 2, N);
+        felitronics::test::run (a.process (io, 2, N));
         const int before = g_allocs.load();
-        for (int k = 0; k < 40; ++k) a.process (io, (k % 2) + 1, N);
+        for (int k = 0; k < 40; ++k) felitronics::test::run (a.process (io, (k % 2) + 1, N));
         felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across 40 blocks of changing width");
     }
 

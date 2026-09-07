@@ -258,7 +258,8 @@ public:
         }
         else eq_.reset();
 
-        if (cfg_.monoBass) monoBass_.prepare (fs_, K_, nch_);
+        if (cfg_.monoBass && ! monoBass_.prepare (fs_, K_, nch_)) return false;   // it is stereo-only, and
+                                                                                 // says so now — law 11(b)
 
         int compLat = 0;
         if (cfg_.compressor)
@@ -294,7 +295,7 @@ public:
             alignLim_.prepare (nch_, K_, limLat + 2);
         }
 
-        if (cfg_.dither) dith_.prepare (fs_, K_, nch_);
+        if (cfg_.dither && ! dith_.prepare (fs_, K_, nch_)) return false;
 
         if (cfg_.sidechainHpfHz > 0.0)
         {
@@ -380,12 +381,15 @@ public:
     // Audio thread, in place, planar. RT-safe. `numSamples` may be anything at all, including a whole
     // file. Returns false — TOUCHING NOTHING — if the chain is unprepared or the channel count is not
     // the prepared one; a refused call is indistinguishable from one never made.
-    bool process (float* const* io, int numChannels, int numSamples) noexcept
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept
     {
+        if (numChannels < 0 || numSamples < 0) return false;
         if (! prepared_ || io == nullptr) return false;
-        if (numChannels != nch_) return false;
-        if (numSamples < 0) return false;
+        if (numChannels != nch_) return false;   // the chain's width is EXACT: the stages behind it are
+                                                 // prepared for it and a narrower call would leave the
+                                                 // FIFO half-swapped mid-quantum
         if (numSamples == 0) return true;
+        stageRefused_ = false;                   // this call's verdict; the quanta below OR into it
 
         for (int off = 0; off < numSamples; )
         {
@@ -399,7 +403,7 @@ public:
             off  += take;
             if (pos_ == K_) { runQuantum(); pos_ = 0; }
         }
-        return true;
+        return ! stageRefused_;
     }
 
     // Drain the chain: writes exactly min(latencySamples(), capacity) frames and returns that count.
@@ -413,12 +417,16 @@ public:
         const int n = std::min (latency_, capacity);
         if (n <= 0) return 0;
         for (int c = 0; c < nch_; ++c) std::fill (out[c], out[c] + n, 0.0f);
-        (void) process (out, numChannels, n);
+        if (! process (out, numChannels, n)) return 0;
         return n;
     }
 
 private:
     // One quantum: exactly K_ samples, every stage, always. This is the only place a stage is called.
+    // LAW 11: every stage's verdict is checked here rather than discarded. None of them CAN refuse — the
+    // chain prepares each for exactly (nch_, >= K_) and hands it exactly that — so a refusal would mean
+    // this class and a stage disagree about their own geometry, which is worth knowing about. It is
+    // recorded rather than acted on: a quantum is atomic and there is nothing sane to do half way.
     void runQuantum() noexcept
     {
         float* ch[core::kMaxChannels] {};
@@ -439,14 +447,14 @@ private:
         // --- EQ (zero latency: bypass is simply not calling it) --------------------------------
         if (eq_ != nullptr)
         {
-            if (! params_.bypassEq) eq_->process (ch, nch_, K_);
+            if (! params_.bypassEq) stageRefused_ |= ! eq_->process (ch, nch_, K_);
             else if (bypassChanged_.eq) eq_->clearAudioState();   // a STOP, not a stream restart
         }
 
         // --- M/S mono-bass (zero latency) ------------------------------------------------------
         if (cfg_.monoBass)
         {
-            if (! params_.bypassMonoBass) monoBass_.process (ch, nch_, K_);
+            if (! params_.bypassMonoBass) stageRefused_ |= ! monoBass_.process (ch, nch_, K_);
             else if (bypassChanged_.monoBass) monoBass_.reset();
         }
 
@@ -468,9 +476,9 @@ private:
                     hpf_[c].flushDenormals();
                     key[c] = k;
                 }
-                comp_.process (ch, nch_, K_, key, nch_);
+                stageRefused_ |= ! comp_.process (ch, nch_, K_, key, nch_);
             }
-            else comp_.process (ch, nch_, K_);
+            else stageRefused_ |= ! comp_.process (ch, nch_, K_);
         }
 
         // --- soft clipper: skipped when bypassed, its PDC held by the aligner -------------------
@@ -482,7 +490,7 @@ private:
             // stage freezes its history, and a frozen oversampler replays pre-gap audio on re-entry.
             alignClip_.advance ((const float* const*) ch, nch_, K_, sat_.latencySamples());
             if (bypassChanged_.clipper) sat_.reset();
-            if (! params_.bypassClipper) sat_.process (ch, nch_, K_);
+            if (! params_.bypassClipper) stageRefused_ |= ! sat_.process (ch, nch_, K_);
             else for (int c = 0; c < nch_; ++c) std::copy_n (alignClip_.delayed (c), K_, ch[c]);
         }
 
@@ -493,12 +501,12 @@ private:
         {
             alignLim_.advance ((const float* const*) ch, nch_, K_, lim_.latencySamples());
             if (bypassChanged_.limiter) lim_.reset();
-            if (! params_.bypassLimiter) lim_.process (ch, nch_, K_);
+            if (! params_.bypassLimiter) stageRefused_ |= ! lim_.process (ch, nch_, K_);
             else for (int c = 0; c < nch_; ++c) std::copy_n (alignLim_.delayed (c), K_, ch[c]);
         }
 
         // --- dither, last, and only when it is not bypassed --------------------------------------
-        if (cfg_.dither && ! params_.bypassDither) dith_.process (ch, nch_, K_);
+        if (cfg_.dither && ! params_.bypassDither) stageRefused_ |= ! dith_.process (ch, nch_, K_);
 
         bypassChanged_ = {};
     }
@@ -571,6 +579,7 @@ private:
     double fs_ = 48000.0;
     int    nch_ = 0, K_ = 0, pos_ = 0, latency_ = 0;
     bool   prepared_ = false, paramsDirty_ = true, bypassKnown_ = false;
+    bool   stageRefused_ = false;            // a stage refused a quantum — see runQuantum()
 
     MasteringChainConfig cfg_ {};
     MasteringChainParams params_ {}, pendingParams_ {};

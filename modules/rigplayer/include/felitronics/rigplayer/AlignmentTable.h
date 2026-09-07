@@ -64,7 +64,7 @@ inline std::vector<float> probeThrough(const std::vector<std::byte>& model, cons
     for (std::size_t p = 0; p < y.size(); p += 512) {
         const int n = (int) std::min<std::size_t>(512, y.size() - p);
         float* io[1] { y.data() + p };
-        m.process(io, 1, n, false);
+        if (! m.process(io, 1, n, false)) return y;
     }
     return y;
 }

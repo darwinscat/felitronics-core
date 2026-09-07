@@ -357,7 +357,7 @@ static void testBypassNull()
     Buf y = x;
     {
         int off = 0;
-        for (int b : partPrimes (n)) { auto p = planes (y, off); chain.process (p.data(), nch, b); off += b; }
+        for (int b : partPrimes (n)) { auto p = planes (y, off); felitronics::test::run (chain.process (p.data(), nch, b)); off += b; }
     }
     long long bad = 0;
     for (int c = 0; c < nch; ++c)
@@ -372,7 +372,7 @@ static void testBypassNull()
 
     // The OFFLINE form: an exact identity, same length, no shift, tail included.
     mastering::OfflineRenderer r;
-    r.prepare (nch, 997);
+    felitronics::test::run (r.prepare (nch, 997));
     Buf out = silence (nch, n);
     auto ip = planes (const_cast<Buf&> (x));
     auto op = planes (out);
@@ -402,14 +402,14 @@ static void testFlushIsProcessOfZeros()
 
     // (a) stream x, then flush().
     Buf ya = x;
-    { auto p = planes (ya); a.process (p.data(), nch, n); }
+    { auto p = planes (ya); felitronics::test::run (a.process (p.data(), nch, n)); }
     Buf ta = silence (nch, D);
     { auto p = planes (ta); ok (a.flush (p.data(), nch, D) == D, "flush() writes exactly latencySamples() frames"); }
 
     // (b) stream x followed by D zeros, no flush() at all.
     Buf xb = x;
     for (int c = 0; c < nch; ++c) xb[(std::size_t) c].resize ((std::size_t) (n + D), 0.0f);
-    { auto p = planes (xb); b.process (p.data(), nch, n + D); }
+    { auto p = planes (xb); felitronics::test::run (b.process (p.data(), nch, n + D)); }
 
     long long bad = 0;
     for (int c = 0; c < nch; ++c)
@@ -446,15 +446,15 @@ static void testRendererContract()
         const Buf x = loudProgramme (nch, n);
         Buf ref = silence (nch, n), got = silence (nch, n);
         mastering::OfflineRenderer r1, r2;
-        r1.prepare (nch, 4096);
-        r2.prepare (nch, 1);
+        felitronics::test::run (r1.prepare (nch, 4096));
+        felitronics::test::run (r2.prepare (nch, 1));
         auto ip = planes (const_cast<Buf&> (x));
         { auto op = planes (ref); ok (r1.render (chain, (const float* const*) ip.data(), op.data(), nch, n), "render at blockSize 4096"); }
         { auto op = planes (got); ok (r2.render (chain, (const float* const*) ip.data(), op.data(), nch, n), "render at blockSize 1"); }
         ok (bitEqual (ref, got), "renderer blockSize does not change the result");
 
         mastering::OfflineRenderer r3;
-        r3.prepare (nch, 65536);
+        felitronics::test::run (r3.prepare (nch, 65536));
         Buf big = silence (nch, n);
         { auto op = planes (big); r3.render (chain, (const float* const*) ip.data(), op.data(), nch, n); }
         ok (bitEqual (ref, big), "renderer blockSize 65536 does not change the result either");
@@ -474,7 +474,7 @@ static void testRendererContract()
         for (int c = 0; c < nch; ++c) x[(std::size_t) c][(std::size_t) (n - 1)] = 0.8f;
         Buf out = silence (nch, n);
         mastering::OfflineRenderer r;
-        r.prepare (nch, 512);
+        felitronics::test::run (r.prepare (nch, 512));
         auto ip = planes (x);
         auto op = planes (out);
         ok (r.render (chain, (const float* const*) ip.data(), op.data(), nch, n), "render the last-sample click");
@@ -492,7 +492,7 @@ static void testRendererContract()
         for (int i = 0; i < n; ++i) for (int c = 0; c < nch; ++c) x[(std::size_t) c][(std::size_t) i] = 0.4f;
         Buf out = silence (nch, std::max (n, 1));
         mastering::OfflineRenderer r;
-        r.prepare (nch, 333);
+        felitronics::test::run (r.prepare (nch, 333));
         auto ip = planes (x);
         auto op = planes (out);
         ok (r.render (chain, (const float* const*) ip.data(), op.data(), nch, n),
@@ -505,7 +505,7 @@ static void testRendererContract()
         const Buf src = loudProgramme (nch, n);
         Buf ref = silence (nch, n), inplace = src;
         mastering::OfflineRenderer r;
-        r.prepare (nch, 640);
+        felitronics::test::run (r.prepare (nch, 640));
         auto ip = planes (const_cast<Buf&> (src));
         { auto op = planes (ref); r.render (chain, (const float* const*) ip.data(), op.data(), nch, n); }
         { auto pp = planes (inplace); r.render (chain, (const float* const*) pp.data(), pp.data(), nch, n); }
@@ -548,7 +548,7 @@ static void testSequences()
             auto p2 = planes (ya, half);
             ok (a.process (p2.data(), nch, n - half), "second half accepted");
         }
-        { auto p = planes (yb); b.process (p.data(), nch, n); }
+        { auto p = planes (yb); felitronics::test::run (b.process (p.data(), nch, n)); }
         ok (bitEqual (ya, yb), "a refused call is indistinguishable from one never made");
     }
 
@@ -561,11 +561,11 @@ static void testSequences()
         a.setParams (prm);
         fresh.setParams (prm);
         Buf warm = x;
-        { auto p = planes (warm); a.process (p.data(), nch, n); }   // dirty the state
+        { auto p = planes (warm); felitronics::test::run (a.process (p.data(), nch, n)); }   // dirty the state
         a.reset();
         Buf ya = x, yf = x;
-        { auto p = planes (ya); a.process (p.data(), nch, n); }
-        { auto p = planes (yf); fresh.process (p.data(), nch, n); }
+        { auto p = planes (ya); felitronics::test::run (a.process (p.data(), nch, n)); }
+        { auto p = planes (yf); felitronics::test::run (fresh.process (p.data(), nch, n)); }
         ok (bitEqual (ya, yf), "after reset() the chain is bit-identical to a freshly prepared one");
         // MUTATION WITNESS: drop `paramsDirty_ = true` from reset() and this fails, because the EQ's
         // smoothers stay wherever the first pass left them.
@@ -710,14 +710,14 @@ static void testMutationGaps()
             for (int i = 0; i < 4096; ++i)
                 loud[(std::size_t) c][(std::size_t) i] = 0.95f * (float) std::sin (2.0 * kPi * 300.0 * i / 48000.0);
 
-        Buf a = loud; { auto pl = planes (a); chain.process (pl.data(), nch, 4096); }          // active, loud
+        Buf a = loud; { auto pl = planes (a); felitronics::test::run (chain.process (pl.data(), nch, 4096)); }          // active, loud
         p.bypassLimiter = true; chain.setParams (p);
-        Buf b = loud; { auto pl = planes (b); chain.process (pl.data(), nch, 4096); }          // bypassed, loud
+        Buf b = loud; { auto pl = planes (b); felitronics::test::run (chain.process (pl.data(), nch, 4096)); }          // bypassed, loud
         for (int k = 0; k < 4; ++k)                                                             // drain everything
-        { Buf z = silence (nch, 4096); auto pl = planes (z); chain.process (pl.data(), nch, 4096); }
+        { Buf z = silence (nch, 4096); auto pl = planes (z); felitronics::test::run (chain.process (pl.data(), nch, 4096)); }
         p.bypassLimiter = false; chain.setParams (p);
         Buf out = silence (nch, 4096);
-        { auto pl = planes (out); chain.process (pl.data(), nch, 4096); }                       // active again, SILENCE in
+        { auto pl = planes (out); felitronics::test::run (chain.process (pl.data(), nch, 4096)); }                       // active again, SILENCE in
 
         double peak = 0.0;
         for (int c = 0; c < nch; ++c)
@@ -749,10 +749,10 @@ static void testMutationGaps()
         const int n = T + 6 * K;
         Buf x = loudProgramme (nch, n, 4242u);
         const Buf src = x;
-        { auto pl = planes (x); chain.process (pl.data(), nch, T); }          // active
+        { auto pl = planes (x); felitronics::test::run (chain.process (pl.data(), nch, T)); }          // active
         p.bypassClipper = p.bypassLimiter = true;
         chain.setParams (p);                                                  // takes effect at sample T
-        { auto pl = planes (x, T); chain.process (pl.data(), nch, n - T); }   // bypassed
+        { auto pl = planes (x, T); felitronics::test::run (chain.process (pl.data(), nch, n - T)); }   // bypassed
 
         const int D = chain.latencySamples();
 
@@ -820,14 +820,14 @@ static void testMutationGaps()
         mastering::MasteringChain c1, c2;
         ok (c1.prepare (48000.0, nch, cfg) && c2.prepare (48000.0, nch, cfg), "prepare for the mid-ramp reset check");
         c1.setParams (A);
-        { Buf y = x; auto pl = planes (y); c1.process (pl.data(), nch, 1024); }
+        { Buf y = x; auto pl = planes (y); felitronics::test::run (c1.process (pl.data(), nch, 1024)); }
         c1.setParams (B);                                  // starts the ramp
-        { Buf y = x; auto pl = planes (y); c1.process (pl.data(), nch, 512); }   // stop ~10 ms into it
+        { Buf y = x; auto pl = planes (y); felitronics::test::run (c1.process (pl.data(), nch, 512)); }   // stop ~10 ms into it
         c1.reset();
-        Buf y1 = x; { auto pl = planes (y1); c1.process (pl.data(), nch, n); }
+        Buf y1 = x; { auto pl = planes (y1); felitronics::test::run (c1.process (pl.data(), nch, n)); }
 
         c2.setParams (B);
-        Buf y2 = x; { auto pl = planes (y2); c2.process (pl.data(), nch, n); }
+        Buf y2 = x; { auto pl = planes (y2); felitronics::test::run (c2.process (pl.data(), nch, n)); }
         ok (bitEqual (y1, y2), "reset() in the middle of a parameter ramp restores a FRESH chain");
     }
 
@@ -865,11 +865,11 @@ static void testMutationGaps()
 
         Buf padded = x;                                    // x followed by D zeros — the definition
         for (int c = 0; c < nch; ++c) padded[(std::size_t) c].resize ((std::size_t) (n + D), 0.0f);
-        { auto pl = planes (padded); a.process (pl.data(), nch, n + D); }
+        { auto pl = planes (padded); felitronics::test::run (a.process (pl.data(), nch, n + D)); }
 
         Buf out = silence (nch, n);
         mastering::OfflineRenderer r;
-        r.prepare (nch, 512);
+        felitronics::test::run (r.prepare (nch, 512));
         auto ip = planes (const_cast<Buf&> (x));
         auto op = planes (out);
         ok (r.render (b, (const float* const*) ip.data(), op.data(), nch, n), "render for the formula null");
@@ -913,25 +913,26 @@ static void testRtSafety()
     // Warm up outside the counted region so a first-touch page fault or a lazily-built static cannot be
     // mistaken for an allocation.
     setPlanes (0);
-    chain.process (px, nch, 1024);
+    felitronics::test::run (chain.process (px, nch, 1024));
     chain.reset();
 
     const long long before = g_allocs.load();
     setPlanes (0);
-    chain.process (px, nch, n);                            // one whole-programme call
+    felitronics::test::run (chain.process (px, nch, n));                            // one whole-programme call
     {
         int off = 0;
-        for (int b : part) { setPlanes (off); chain.process (px, nch, b); off += b; }
+        for (int b : part) { setPlanes (off); felitronics::test::run (chain.process (px, nch, b)); off += b; }
     }
     prm.bypassLimiter = true;  chain.setParams (prm);      // a bypass toggle, mid-stream
-    setPlanes (0); chain.process (px, nch, 4096);
+    setPlanes (0); felitronics::test::run (chain.process (px, nch, 4096));
     prm.bypassLimiter = false; chain.setParams (prm);
-    setPlanes (0); chain.process (px, nch, 4096);
-    chain.process (pm, 1, 64);                             // a refused call
+    setPlanes (0); felitronics::test::run (chain.process (px, nch, 4096));
+    const bool monoRefused = ! chain.process (pm, 1, 64);   // asserted after the snapshot — test::ok allocates
     chain.flush (pt, nch, (int) tail[0].size());
     chain.reset();
     (void) chain.resolved();
     const long long after = g_allocs.load();
+    test::ok (monoRefused, "a mono call on a stereo chain is refused");
 
     okNoAlloc (after == before, "process() / flush() / setParams() / reset() / resolved() allocate nothing ("
                                 + std::to_string (after - before) + ")");
@@ -955,7 +956,7 @@ static void testResolvedReadback()
     prm.monoBass.frequencyHz = 5.0f;                       // below the stage's own floor of 20 Hz
     chain.setParams (prm);
     Buf x = silence (nch, cfg.internalBlock);
-    { auto p = planes (x); chain.process (p.data(), nch, cfg.internalBlock); }   // one quantum applies them
+    { auto p = planes (x); felitronics::test::run (chain.process (p.data(), nch, cfg.internalBlock)); }   // one quantum applies them
 
     const auto r = chain.resolved();
     ok (r.latencySamples == chain.latencySamples(), "resolved latency agrees with latencySamples()");
@@ -989,14 +990,14 @@ static void testMonoBassParams()
     l2 = l1; r2 = r1;
 
     stereo::MonoBass a, b;
-    a.prepare (48000.0, n, 2);
-    b.prepare (48000.0, n, 2);
+    felitronics::test::run (a.prepare (48000.0, n, 2));
+    felitronics::test::run (b.prepare (48000.0, n, 2));
     a.setEnabled (true); a.setFrequency (137.0f); a.setLowWidth (0.25f);
     b.setParams ({ true, 137.0f, 0.25f });
     float* pa[2] { l1.data(), r1.data() };
     float* pb[2] { l2.data(), r2.data() };
-    a.process (pa, 2, n);
-    b.process (pb, 2, n);
+    felitronics::test::run (a.process (pa, 2, n));
+    felitronics::test::run (b.process (pb, 2, n));
     long long bad = 0;
     for (int i = 0; i < n; ++i)
         if (bits (l1[(std::size_t) i]) != bits (l2[(std::size_t) i]) || bits (r1[(std::size_t) i]) != bits (r2[(std::size_t) i])) ++bad;

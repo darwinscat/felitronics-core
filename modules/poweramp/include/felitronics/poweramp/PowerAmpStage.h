@@ -119,7 +119,9 @@ public:
     void setParams (const Params& params, const Voicing& voicing) noexcept;
 
     // 🔴 RT-safe, in place on planar channels: the full oversampled tube power-amp chain.
-    void process (float* const* io, int numChannels, int numSamples) noexcept;
+    // Law 11 (DSP-ARCHITECTURE.md §2): any numSamples (chunked inside); numChannels above what prepare()
+    // gave REFUSES the whole call — false means nothing was touched.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept;
 
     // Host-rate latency = the oversampler round-trip (tpp-1), constant across drive/topology/factor.
     int  latencySamples() const noexcept;
@@ -292,22 +294,27 @@ struct PowerAmpStage::Impl
         biasTarget  = std::isfinite (p.bias)     ? std::clamp (p.bias,     0.0f, 1.0f) : 0.0f;
     }
 
-    void process (float* const* io, int numChannels, int numSamples)
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples)
     {
-        const int nCh = std::min (numChannels, kMaxCh);
-        if (nCh <= 0 || numSamples <= 0 || maxBlock <= 0)   // maxBlock<=0 ⇒ process() called before prepare():
-            return;                                          // clean no-op (also kills the off+=0 infinite loop)
-        dropStoppedChannels (nCh);                           // a call that ran nothing never reaches here
+        if (numChannels < 0 || numSamples < 0) return false;
+        if (maxBlock <= 0) return false;                     // process() before prepare(): nothing to run on
+        if (numChannels > kMaxCh) return false;              // width is a LIMIT — law 11(b)
+        if (numSamples == 0) return true;                    // no samples: no time, no edge
+        const int nCh = numChannels;
+        dropStoppedChannels (nCh);                           // law 11(d): the edge is clocked by numSamples
+        if (nCh == 0) return true;
 
         // Chunk to maxBlock so a caller passing numSamples > maxBlock is FULLY processed instead of
         // silently leaving the tail dry. State carries across chunks via the members → seamless.
         float* sub[kMaxCh];
-        for (int off = 0; off < numSamples; off += maxBlock)
+        for (int off = 0; off < numSamples; )
         {
             const int n = std::min (numSamples - off, maxBlock);
             for (int ch = 0; ch < nCh; ++ch) sub[ch] = io[ch] + off;
             processChunk (sub, nCh, n);
+            off += n;                                        // `off += maxBlock` could step past INT_MAX
         }
+        return true;
     }
 
     // Law 8 for the block-rate coefficient smoothers below. `cur += a*(target-cur)` is asymptotic, so it
@@ -549,7 +556,7 @@ inline PowerAmpStage::~PowerAmpStage() = default;
 inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor) { impl->prepare (sampleRate, maxBlock, oversampleFactor); }
 inline void PowerAmpStage::reset() { impl->reset(); }
 inline void PowerAmpStage::setParams (const Params& params, const Voicing& voicing) noexcept { impl->setParams (params, voicing); }
-inline void PowerAmpStage::process (float* const* io, int numChannels, int numSamples) noexcept { impl->process (io, numChannels, numSamples); }
+inline bool PowerAmpStage::process (float* const* io, int numChannels, int numSamples) noexcept { return impl->process (io, numChannels, numSamples); }
 inline int  PowerAmpStage::latencySamples() const noexcept { return impl->latencySamples(); }
 
 } // namespace felitronics::poweramp

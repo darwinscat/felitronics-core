@@ -513,7 +513,7 @@ static void theCompressorTapIsTheTruth()
            {
                const int m = std::min (blk, 24000 - off);
                float* io[1] { audio.data() + off };
-               c.process (io, 1, m, GainReductionTap { tap.data() + off, m });
+               felitronics::test::run (c.process (io, 1, m, GainReductionTap { tap.data() + off, m }));
            }
            GainReductionPath path; path.prepare (kFs); path.setParams (cp); path.reset();
            const float* p0 = music.data(); const float* const* k = &p0;
@@ -544,8 +544,8 @@ static void theCompressorTapIsTheTruth()
         {
             const int m = std::min (256, 24000 - off);
             float* ai[1] { ax.data() + off }; float* bi[1] { bx.data() + off };
-            a.process (ai, 1, m);
-            b.process (bi, 1, m, GainReductionTap { tap.data() + off, m });
+            felitronics::test::run (a.process (ai, 1, m));
+            felitronics::test::run (b.process (bi, 1, m, GainReductionTap { tap.data() + off, m }));
         }
         test::ok (std::memcmp (ax.data(), bx.data(), ax.size() * 4) == 0, "audio is bit-identical with the tap on");
         test::ok (a.gainReductionDb() == b.gainReductionDb(), "and so is the state");
@@ -559,14 +559,14 @@ static void theCompressorTapIsTheTruth()
         std::vector<float> audio (256, 0.7f), tap (256, -1.0f);
         const std::vector<float> before = audio;
         float* io[1] { audio.data() };
-        c.process (io, 1, 256, GainReductionTap { tap.data(), 255 });
+        test::ok (! c.process (io, 1, 256, GainReductionTap { tap.data(), 255 }), "a short tap REFUSES the call (law 11)");
         test::ok (std::memcmp (audio.data(), before.data(), 256 * 4) == 0, "a short tap leaves the AUDIO untouched");
         bool tapUntouched = true; for (float v : tap) if (v != -1.0f) tapUntouched = false;
         test::ok (tapUntouched, "and the tap buffer untouched");
         test::ok (c.gainReductionDb() == 0.0, "and the state untouched");
         // exactly enough is enough — and the proof is that the TAP was written, not that the audio
         // moved: the first sample of a fresh compressor legitimately comes out at unity gain.
-        c.process (io, 1, 256, GainReductionTap { tap.data(), 256 });
+        felitronics::test::run (c.process (io, 1, 256, GainReductionTap { tap.data(), 256 }));
         bool tapWritten = false; for (float v : tap) if (v != -1.0f) tapWritten = true;
         test::ok (tapWritten, "a capacity of exactly numSamples is accepted");
     }
@@ -577,7 +577,7 @@ static void theCompressorTapIsTheTruth()
         Compressor c; (void) c.prepare (kFs, 64, 1, 0.0); c.setParams (cp);
         std::vector<float> audio (64, 0.6f);
         float* io[1] { audio.data() };
-        c.process (io, 1, 64, GainReductionTap { nullptr, 999 });
+        felitronics::test::run (c.process (io, 1, 64, GainReductionTap { nullptr, 999 }));
         test::ok (c.gainReductionDb() < 0.0, "a null tap with a capacity is off, not a refusal — the call ran");
     }
 
@@ -688,7 +688,7 @@ static void theRoundTripIsMeasuredWithADifferentInstrument()
              {
                  const int m = std::min (1024, n - off);
                  float* io[1] { audio.data() + off };
-                 c.process (io, 1, m, GainReductionTap { tap.data() + off, m });
+                 felitronics::test::run (c.process (io, 1, m, GainReductionTap { tap.data() + off, m }));
              }
              std::vector<double> mag ((std::size_t) n);
              for (int i = 0; i < n; ++i) mag[(std::size_t) i] = std::fabs ((double) tap[(std::size_t) i]);
@@ -828,7 +828,7 @@ static void everyRefusalHasAName()
             {
                 const int m = std::min (4096, 48000 - off);
                 float* io[1] { audio.data() + off };
-                c.process (io, 1, m, GainReductionTap { tap.data() + off, m });
+                felitronics::test::run (c.process (io, 1, m, GainReductionTap { tap.data() + off, m }));
             }
             std::vector<double> mag ((std::size_t) 48000);
             for (int i = 0; i < 48000; ++i) mag[(std::size_t) i] = std::fabs ((double) tap[(std::size_t) i]);
@@ -897,7 +897,7 @@ static void theGateReadsTheLevelAndNotTheResult()
         {
             const int m = std::min (1024, n - off);
             float* io[1] { audio.data() + off };
-            c.process (io, 1, m, GainReductionTap { tap.data() + off, m });
+            felitronics::test::run (c.process (io, 1, m, GainReductionTap { tap.data() + off, m }));
         }
         LinkedDetector d; d.prepare (kFs); d.setParams (B); d.reset();
         std::vector<double> kept;
@@ -1131,7 +1131,7 @@ static void theStatisticIsAParameterNotAnAssumption()
         {
             const int m = std::min (512, n - off);
             float* io[1] { audio.data() + off };
-            c.process (io, 1, m, GainReductionTap { tap.data() + off, m });
+            felitronics::test::run (c.process (io, 1, m, GainReductionTap { tap.data() + off, m }));
         }
         double sum = 0.0, mx = 0.0;
         std::vector<double> mag ((std::size_t) n);
@@ -1354,7 +1354,7 @@ static void theConsiliumsCounterexamples()
             c.setParams (cp);
             std::vector<float> audio = x, tap ((std::size_t) n);
             float* io[1] { audio.data() };
-            c.process (io, 1, n, GainReductionTap { tap.data(), n });
+            felitronics::test::run (c.process (io, 1, n, GainReductionTap { tap.data(), n }));
             LinkedDetector d; d.prepare (kFs); d.setParams (p); d.reset();
             std::vector<double> kept;
             for (int i = 0; i < n; ++i)

@@ -17,7 +17,8 @@ namespace felitronics::neural
 // of felitronics-core and orbitcab's cab::AmpStage). Reached as a TEMPLATE (no vtable in the hot path).
 //
 //   prepare(sampleRate, maxBlock, maxChannels)  — off the audio thread; may allocate / prewarm.
-//   process(io, numChannels, numSamples)         — RT-safe: no alloc/lock/IO/throw; in place.
+//   process(io, numChannels, numSamples) -> bool — RT-safe: no alloc/lock/IO/throw; in place. Law 11:
+//                                                 false = the call was REFUSED and nothing changed.
 //   reset()                                      — RT-safe state clear.
 //   latencySamples()                             — host-rate latency (incl. any backend resampling).
 //
@@ -28,7 +29,7 @@ concept Inference =
     requires (T t, const T ct, double sr, int maxBlock, int maxChannels, float* const* io, int nc, int n)
 {
     { t.prepare (sr, maxBlock, maxChannels) } noexcept -> std::same_as<void>;
-    { t.process (io, nc, n) }                noexcept -> std::same_as<void>;
+    { t.process (io, nc, n) }                noexcept -> std::same_as<bool>;   // law 11: the verdict is RETURNED
     { t.reset() }                            noexcept -> std::same_as<void>;
     { ct.latencySamples() }                  noexcept -> std::same_as<int>;
 };

@@ -43,11 +43,11 @@ int main()
     // --- a STEADY tone is not shaped (the both-Peak detector reads norm ≈ 0 in steady state) ---
     test::group ("TransientShaper steady tone unaffected");
     {
-        TS ts; ts.prepare (sr, 512, 1);
+        TS ts; felitronics::test::run (ts.prepare (sr, 512, 1));
         TP p; p.attackDb = 12.0; p.sustainDb = 12.0; ts.setParams (p);
         const int N = 12000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { x[i] = 0.5f * (float) std::sin (2.0 * pi * 1000.0 * i / sr); y[i] = x[i]; }
-        float* io[1] { y.data() }; ts.process (io, 1, N);
+        float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
         test::ok (std::fabs (rmsRange (y, 6000, 12000) / rmsRange (x, 6000, 12000) - 1.0) < 0.05,
                   "steady sine: output ≈ input (no false transient shaping)");
     }
@@ -57,11 +57,11 @@ int main()
     {
         auto run = [&] (double atkDb) -> double
         {
-            TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = atkDb; ts.setParams (p);
+            TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.attackDb = atkDb; ts.setParams (p);
             const int N = 12000; std::vector<float> y (N, 0.0f);
             const int onset = 48;                                            // 1 ms of silence, then a tone onset
             for (int i = onset; i < N; ++i) y[i] = 0.5f * (float) std::sin (2.0 * pi * 1000.0 * (i - onset) / sr);
-            float* io[1] { y.data() }; ts.process (io, 1, N);
+            float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
             return rmsRange (y, onset, onset + 480) / rmsRange (y, 9000, 12000);   // onset region / steady region
         };
         const double up = run (12.0), flat = run (0.0), down = run (-12.0);
@@ -75,10 +75,10 @@ int main()
     {
         auto tail = [&] (double susDb) -> double
         {
-            TS ts; ts.prepare (sr, 512, 1); TP p; p.sustainDb = susDb; ts.setParams (p);
+            TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.sustainDb = susDb; ts.setParams (p);
             const int N = 12000; std::vector<float> y (N);
             for (int i = 0; i < N; ++i) { const double t = (double) i / sr; y[i] = (float) (std::exp (-t / 0.03) * std::sin (2.0 * pi * 1000.0 * i / sr)); }
-            float* io[1] { y.data() }; ts.process (io, 1, N);
+            float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
             return rmsRange (y, 4800, 9600);                                 // the 100–200 ms decay tail
         };
         test::ok (tail (12.0) > tail (-12.0) * 1.2, "sustainDb +12 fattens the tail vs -12");
@@ -87,10 +87,10 @@ int main()
     // --- mix = 0 is exact dry (no lookahead) ---
     test::group ("TransientShaper mix");
     {
-        TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = 12.0; p.mix = 0.0; ts.setParams (p);
+        TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.attackDb = 12.0; p.mix = 0.0; ts.setParams (p);
         const int N = 4000; std::vector<float> x (N, 0.0f), y (N, 0.0f);
         const int onset = 48; for (int i = onset; i < N; ++i) { x[i] = 0.5f * (float) std::sin (2.0 * pi * 1000.0 * (i - onset) / sr); y[i] = x[i]; }
-        float* io[1] { y.data() }; ts.process (io, 1, N);
+        float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (y[i] - x[i]));
         test::ok (md < 1e-6, "mix=0 → exact dry passthrough");
     }
@@ -104,21 +104,21 @@ int main()
     // --- no allocation in process() ---
     test::group ("TransientShaper no-alloc");
     {
-        TS ts; ts.prepare (sr, 512, 2); TP p; p.attackDb = 6.0; p.sustainDb = -6.0; ts.setParams (p);
+        TS ts; felitronics::test::run (ts.prepare (sr, 512, 2)); TP p; p.attackDb = 6.0; p.sustainDb = -6.0; ts.setParams (p);
         std::vector<float> l (512, 0.2f), r (512, -0.1f); float* io[2] { l.data(), r.data() };
-        ts.process (io, 2, 512);
+        felitronics::test::run (ts.process (io, 2, 512));
         const long before = g_allocs.load();
-        ts.process (io, 2, 512); ts.process (io, 2, 512);
+        felitronics::test::run (ts.process (io, 2, 512)); felitronics::test::run (ts.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
     // --- linked gain preserves the stereo image ---
     test::group ("TransientShaper stereo image preserved");
     {
-        TS ts; ts.prepare (sr, 512, 2); TP p; p.attackDb = 12.0; ts.setParams (p);
+        TS ts; felitronics::test::run (ts.prepare (sr, 512, 2)); TP p; p.attackDb = 12.0; ts.setParams (p);
         const int N = 4000; std::vector<float> l (N), r (N);
         const int onset = 48; for (int i = 0; i < N; ++i) { const float v = (i < onset) ? 0.0f : 0.5f * (float) std::sin (2.0 * pi * 1000.0 * (i - onset) / sr); l[i] = v; r[i] = v; }
-        float* io[2] { l.data(), r.data() }; ts.process (io, 2, N);
+        float* io[2] { l.data(), r.data() }; felitronics::test::run (ts.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (l[i] - r[i]));
         test::ok (md == 0.0, "identical L/R in → identical L/R out (one linked gain)");
     }
@@ -129,10 +129,10 @@ int main()
         double worst = 0.0;
         for (double f : { 50.0, 500.0, 5000.0 })
         {
-            TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = 24.0; p.sustainDb = 24.0; ts.setParams (p);
+            TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.attackDb = 24.0; p.sustainDb = 24.0; ts.setParams (p);
             const int N = 12000; std::vector<float> x (N), y (N);
             for (int i = 0; i < N; ++i) { x[i] = 0.5f * (float) std::sin (2.0 * pi * f * i / sr); y[i] = x[i]; }
-            float* io[1] { y.data() }; ts.process (io, 1, N);
+            float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
             worst = std::max (worst, std::fabs (rmsRange (y, 6000, 12000) / rmsRange (x, 6000, 12000) - 1.0));
         }
         test::ok (worst < 0.05, "50 / 500 / 5k Hz steady tones unshaped (deadzone holds)");
@@ -143,10 +143,10 @@ int main()
     {
         auto run = [&] (double atk, double sus, int a, int b) -> double
         {
-            TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = atk; p.sustainDb = sus; ts.setParams (p);
+            TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.attackDb = atk; p.sustainDb = sus; ts.setParams (p);
             const int N = 12000; std::vector<float> y (N);
             for (int i = 0; i < N; ++i) { const double t = (double) i / sr; y[i] = (float) (std::exp (-t / 0.04) * std::sin (2.0 * pi * 1000.0 * i / sr)); }
-            float* io[1] { y.data() }; ts.process (io, 1, N);
+            float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
             return rmsRange (y, a, b);
         };
         const double onsetFlat = run (0, 0, 0, 480), tailFlat = run (0, 0, 6000, 11000);
@@ -161,10 +161,10 @@ int main()
     {
         auto ratio = [&] (double thr) -> double
         {
-            TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = 12.0; p.sustainDb = 12.0; p.threshold = thr; ts.setParams (p);
+            TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.attackDb = 12.0; p.sustainDb = 12.0; p.threshold = thr; ts.setParams (p);
             const int N = 12000; std::vector<float> x (N), y (N);
             for (int i = 0; i < N; ++i) { x[i] = 0.5f * (float) std::sin (2.0 * pi * 200.0 * i / sr); y[i] = x[i]; }
-            float* io[1] { y.data() }; ts.process (io, 1, N);
+            float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
             return rmsRange (y, 6000, 12000) / rmsRange (x, 6000, 12000);
         };
         test::ok (std::fabs (ratio (0.9) - 1.0) <= std::fabs (ratio (0.0) - 1.0) + 1e-6, "threshold 0.9 leaves the steady tone at least as unshaped as 0.0");
@@ -173,7 +173,7 @@ int main()
     // --- sample-wise null against a hand-recomputed deadzone+smooth+mix pipeline (the key check) ---
     test::group ("TransientShaper null vs hand-computed gain");
     {
-        TS ts; ts.prepare (sr, 512, 1); TP p; p.attackDb = 9.0; p.sustainDb = -6.0; p.threshold = 0.2; p.gainSmoothMs = 1.0; p.mix = 0.8; ts.setParams (p);
+        TS ts; felitronics::test::run (ts.prepare (sr, 512, 1)); TP p; p.attackDb = 9.0; p.sustainDb = -6.0; p.threshold = 0.2; p.gainSmoothMs = 1.0; p.mix = 0.8; ts.setParams (p);
         dynamics::EnvelopeFollower rf, rs;
         rf.prepare (sr); rf.setDetector (dynamics::Detector::Peak); rf.setTimes (0.3, 20.0);
         rs.prepare (sr); rs.setDetector (dynamics::Detector::Peak); rs.setTimes (15.0, 150.0);
@@ -181,7 +181,7 @@ int main()
         float gsm = 1.0f;
         const int N = 4000; std::vector<float> x (N), y (N);
         for (int i = 0; i < N; ++i) { const float v = (i < 48) ? 0.0f : 0.5f * (float) std::sin (2.0 * pi * 1000.0 * (i - 48) / sr); x[i] = v; y[i] = v; }
-        float* io[1] { y.data() }; ts.process (io, 1, N);
+        float* io[1] { y.data() }; felitronics::test::run (ts.process (io, 1, N));
         double md = 0;
         for (int i = 0; i < N; ++i)
         {

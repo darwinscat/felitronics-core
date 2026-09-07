@@ -75,12 +75,12 @@ static double analyticSide (double f, double fc, double sr, double w)
 // Drive a settled MonoBass with an anti-phase tone (pure Side, M = 0) and measure |S_out/S_in| steady-state.
 static double measuredSide (double f, double fc, float w, double sr)
 {
-    stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency ((float) fc); mb.setLowWidth (w); mb.reset();
+    stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setFrequency ((float) fc); mb.setLowWidth (w); mb.reset();
     const int warm = 24000, win = 48000, N = warm + win;
     std::vector<float> L (N), R (N);
     for (int i = 0; i < N; ++i) { const float v = 0.5f * (float) std::sin (2.0 * core::kPi * f * i / sr); L[i] = v; R[i] = -v; }
     float* io[2] { L.data(), R.data() };
-    mb.process (io, 2, N);
+    felitronics::test::run (mb.process (io, 2, N));
     std::vector<float> side (N); for (int i = 0; i < N; ++i) side[i] = 0.5f * (L[i] - R[i]);
     return toneAmp (side, warm, f, sr) / 0.5;
 }
@@ -108,7 +108,7 @@ int main()
     // --- the headline property: IN-PHASE content is NOT filtered, bit-exact (vs a full crossover, which would) ---
     test::group ("MonoBass: mono content passes UNFILTERED (bit-exact)");
     {
-        stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (0.0f); mb.reset();          // default fc = 120
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (0.0f); mb.reset();          // default fc = 120
         test::ok (mb.frequency() == 120.0f, "default crossover is 120 Hz");
         const int N = 6000; std::vector<float> L (N), R (N), ref (N);
         for (int i = 0; i < N; ++i)
@@ -117,13 +117,13 @@ int main()
                           + 0.3f * (float) std::sin (2.0 * pi * 3000.0 * i / sr);
             L[i] = v; R[i] = v; ref[i] = v;
         }
-        float* io[2] { L.data(), R.data() }; mb.process (io, 2, N);
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (mb.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) { md = std::max (md, (double) std::fabs (L[i] - ref[i])); md = std::max (md, (double) std::fabs (R[i] - ref[i])); }
         test::ok (md == 0.0, "L==R in -> out == in BIT-EXACT (S=0; float 1/2(L+L)=L is exact) — kept bass never filtered");
 
         std::vector<float> mono, dummy; rngPair (2048, 11, mono, dummy);                  // aliased dual-mono buffer
         auto buf = mono; float* alias[2] { buf.data(), buf.data() };
-        mb.reset(); mb.process (alias, 2, 2048);
+        mb.reset(); felitronics::test::run (mb.process (alias, 2, 2048));
         md = 0; for (int i = 0; i < 2048; ++i) md = std::max (md, (double) std::fabs (buf[i] - mono[i]));
         test::ok (md == 0.0, "aliased io[0]==io[1] (dual-mono) -> untouched bit-exact");
     }
@@ -169,8 +169,8 @@ int main()
         const int N = 12000; std::vector<float> L0, R0; rngPair (N, 41, L0, R0);
 
         auto L = L0, R = R0;
-        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency (fcF); mb.setLowWidth (wF); mb.reset();
-        float* io[2] { L.data(), R.data() }; mb.process (io, 2, N);
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setFrequency (fcF); mb.setLowWidth (wF); mb.reset();
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (mb.process (io, 2, N));
 
         constexpr double Q = 0.7071067811865476;              // the same Butterworth literal Crossover2 uses
         eq::Svf lp1, lp2, hp1, hp2;
@@ -196,12 +196,12 @@ int main()
     test::group ("MonoBass: mono-sum invariant (Mid untouched, incl. through fades)");
     {
         const int N = 6000; std::vector<float> L0, R0; rngPair (N, 7, L0, R0); auto L = L0, R = R0;
-        stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (0.5f); mb.reset();
-        float* a[2] { L.data(), R.data() };                   mb.process (a, 2, 2000);   // settled w=0.5
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (0.5f); mb.reset();
+        float* a[2] { L.data(), R.data() };                   felitronics::test::run (mb.process (a, 2, 2000));   // settled w=0.5
         mb.setLowWidth (1.0f);
-        float* b[2] { L.data() + 2000, R.data() + 2000 };     mb.process (b, 2, 500);    // mid-fade toward full-wide
+        float* b[2] { L.data() + 2000, R.data() + 2000 };     felitronics::test::run (mb.process (b, 2, 500));    // mid-fade toward full-wide
         mb.setLowWidth (0.2f);
-        float* c[2] { L.data() + 2500, R.data() + 2500 };     mb.process (c, 2, N - 2500);   // retargeted mid-fade
+        float* c[2] { L.data() + 2500, R.data() + 2500 };     felitronics::test::run (mb.process (c, 2, N - 2500));   // retargeted mid-fade
         double worst = 0.0;
         for (int i = 0; i < N; ++i) worst = std::max (worst, (double) std::fabs (0.5f * (L[i] + R[i]) - 0.5f * (L0[i] + R0[i])));
         test::ok (worst < 1e-6, "mono fold preserved through settled + fading states (bound: decode halves round separately)");
@@ -224,8 +224,8 @@ int main()
             return ab / std::sqrt (aa * bb);
         };
         const double corrIn = corrTail (L, R);
-        stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (0.0f); mb.reset();
-        float* io[2] { L.data(), R.data() }; mb.process (io, 2, N);
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (0.0f); mb.reset();
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (mb.process (io, 2, N));
         const double corrOut = corrTail (L, R);
         test::ok (corrIn < 0.6, "input decorrelated below fc (corr ~ 0.47)");
         test::ok (corrOut > 0.995, "output correlation -> +1 below fc (low side collapsed)");
@@ -240,22 +240,22 @@ int main()
             double m = 0; for (int i = 0; i < N; ++i) { m = std::max (m, (double) std::fabs (A[i] - A0[i])); m = std::max (m, (double) std::fabs (B[i] - B0[i])); }
             return m;
         };
-        { auto L = L0, R = R0; stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (1.0f); mb.reset();
-          float* io[2] { L.data(), R.data() }; mb.process (io, 2, N);
+        { auto L = L0, R = R0; stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (1.0f); mb.reset();
+          float* io[2] { L.data(), R.data() }; felitronics::test::run (mb.process (io, 2, N));
           test::ok (md2 (L, R, L0, R0) == 0.0, "settled lowWidth=1 -> exact passthrough"); }
-        { auto L = L0, R = R0; stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (0.0f); mb.reset(); mb.setEnabled (false);
-          float* io[2] { L.data(), R.data() }; mb.process (io, 2, N);
+        { auto L = L0, R = R0; stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (0.0f); mb.reset(); mb.setEnabled (false);
+          float* io[2] { L.data(), R.data() }; felitronics::test::run (mb.process (io, 2, N));
           test::ok (md2 (L, R, L0, R0) == 0.0, "disabled -> exact passthrough"); }
-        { auto L = L0; stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (0.0f); mb.reset();
-          float* io[1] { L.data() }; mb.process (io, 1, N);
+        { auto L = L0; stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (0.0f); mb.reset();
+          float* io[1] { L.data() }; felitronics::test::run (mb.process (io, 1, N));
           double m = 0; for (int i = 0; i < N; ++i) m = std::max (m, (double) std::fabs (L[i] - L0[i]));
           test::ok (m == 0.0, "mono call (numChannels=1) -> untouched"); }
         {   // 5.1-style call: ALL channels must pass through — the front pair is NOT silently treated
             std::vector<std::vector<float>> ch (6), ref (6);
             for (int c = 0; c < 6; ++c) { std::vector<float> d; rngPair (N, 200 + (unsigned long long) c, ch[c], d); ref[c] = ch[c]; }
             float* io[6]; for (int c = 0; c < 6; ++c) io[c] = ch[c].data();
-            stereo::MonoBass mb; mb.prepare (sr); mb.setLowWidth (0.0f); mb.reset();
-            mb.process (io, 6, N);
+            stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setLowWidth (0.0f); mb.reset();
+            test::ok (! mb.process (io, 6, N), "surround call on a stereo stage is REFUSED, not silently ignored (law 11b)");
             double m = 0; for (int c = 0; c < 6; ++c) for (int i = 0; i < N; ++i) m = std::max (m, (double) std::fabs (ch[c][i] - ref[c][i]));
             test::ok (m == 0.0, "surround call (numChannels=6) -> ALL channels untouched (strict stereo gate)"); }
     }
@@ -275,8 +275,8 @@ int main()
         double inSlew = 0; for (int i = 1; i < N; ++i) inSlew = std::max (inSlew, (double) std::fabs (0.5f * (L[i] - R[i]) - 0.5f * (L[i - 1] - R[i - 1])));
 
         std::vector<float> Li = L, Ri = R;                                    // keep the input for the bypassed-segment check
-        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency ((float) fTone); mb.setLowWidth (0.0f); mb.reset();
-        auto blk = [&] (int k) { float* io[2] { L.data() + k * seg, R.data() + k * seg }; mb.process (io, 2, seg); };
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setFrequency ((float) fTone); mb.setLowWidth (0.0f); mb.reset();
+        auto blk = [&] (int k) { float* io[2] { L.data() + k * seg, R.data() + k * seg }; felitronics::test::run (mb.process (io, 2, seg)); };
         blk (0);                                                              // settled mono-making
         mb.setLowWidth (1.0f); blk (1);                                       // 20 ms fade out, settles inside
         blk (2);                                                              // fully bypassed segment
@@ -295,15 +295,15 @@ int main()
 
         // Stale-tail proof: hammer a LOUD low tone into bypass, then come back on SILENCE — any old filter
         // state would ring out audibly; the reset-on-entering-bypass must make the return exactly silent.
-        stereo::MonoBass mb2; mb2.prepare (sr); mb2.setFrequency (120.0f); mb2.setLowWidth (0.0f); mb2.reset();
+        stereo::MonoBass mb2; felitronics::test::run (mb2.prepare (sr)); mb2.setFrequency (120.0f); mb2.setLowWidth (0.0f); mb2.reset();
         std::vector<float> l (seg), r (seg); float* io2[2] { l.data(), r.data() };
         auto loud = [&] { for (int i = 0; i < seg; ++i) { const float v = 0.9f * (float) std::sin (2.0 * pi * 30.0 * i / sr); l[i] = v; r[i] = -v; } };
-        loud(); mb2.process (io2, 2, seg);                                    // warm, loud low side
-        mb2.setLowWidth (1.0f); loud(); mb2.process (io2, 2, seg);            // fade out on loud material
-        loud(); mb2.process (io2, 2, seg);                                    // settled bypass -> state reset here
+        loud(); felitronics::test::run (mb2.process (io2, 2, seg));                                    // warm, loud low side
+        mb2.setLowWidth (1.0f); loud(); felitronics::test::run (mb2.process (io2, 2, seg));            // fade out on loud material
+        loud(); felitronics::test::run (mb2.process (io2, 2, seg));                                    // settled bypass -> state reset here
         mb2.setLowWidth (0.0f);
         std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
-        mb2.process (io2, 2, seg);                                            // re-enter on silence
+        felitronics::test::run (mb2.process (io2, 2, seg));                                            // re-enter on silence
         double tail = 0; for (int i = 0; i < seg; ++i) { tail = std::max (tail, (double) std::fabs (l[i])); tail = std::max (tail, (double) std::fabs (r[i])); }
         test::ok (tail == 0.0, "re-entry from bypass on silence is EXACTLY silent (no stale filter tails)");
     }
@@ -314,10 +314,10 @@ int main()
         const int N = 96000; std::vector<float> L (N), R (N);
         for (int i = 0; i < N; ++i) { const float v = 0.5f * (float) std::sin (2.0 * pi * 60.0 * i / sr); L[i] = v; R[i] = -v; }
         double inSlew = 0; for (int i = 1; i < N; ++i) inSlew = std::max (inSlew, (double) std::fabs (0.5f * (L[i] - R[i]) - 0.5f * (L[i - 1] - R[i - 1])));
-        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
-        float* a[2] { L.data(), R.data() };                   mb.process (a, 2, N / 2);
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
+        float* a[2] { L.data(), R.data() };                   felitronics::test::run (mb.process (a, 2, N / 2));
         mb.setLowWidth (0.8f);                                                // STEP — must ramp, not jump
-        float* b[2] { L.data() + N / 2, R.data() + N / 2 };   mb.process (b, 2, N / 2);
+        float* b[2] { L.data() + N / 2, R.data() + N / 2 };   felitronics::test::run (mb.process (b, 2, N / 2));
         double worstStep = 0;
         for (int i = 1; i < N; ++i) worstStep = std::max (worstStep, std::fabs ((double) (0.5f * (L[i] - R[i])) - (double) (0.5f * (L[i - 1] - R[i - 1]))));
         test::ok (worstStep < 3.0 * inSlew, "side steps stay at carrier-slew scale through the w ramp (unsmoothed jump would be ~0.3)");
@@ -329,7 +329,7 @@ int main()
     // --- parameter abuse: near-Nyquist clamp, low clamp, prepare re-clamp, non-finite rejection ---
     test::group ("MonoBass: fc / param abuse stays sane");
     {
-        stereo::MonoBass mb; mb.prepare (sr);
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr));
         mb.setFrequency (1.0e9f);  test::ok (mb.frequency() == (float) (0.45 * sr), "fc clamps to 0.45*fs");
         mb.setFrequency (1.0f);    test::ok (mb.frequency() == 20.0f, "fc clamps up to 20 Hz");
         mb.setFrequency (std::nanf ("")); mb.setFrequency (INFINITY); mb.setFrequency (-INFINITY);
@@ -337,19 +337,19 @@ int main()
         mb.setLowWidth (0.6f); mb.setLowWidth (std::nanf ("")); mb.setLowWidth (-INFINITY);
         test::ok (mb.lowWidth() == 0.6f, "setLowWidth(NaN/-inf) ignored — last good value kept");
 
-        mb.setFrequency (5000.0f); mb.prepare (8000.0);
+        mb.setFrequency (5000.0f); felitronics::test::run (mb.prepare (8000.0));
         test::ok (mb.frequency() == 3600.0f, "prepare() at a lower fs re-clamps fc to the new 0.45*fs");
 
         // prepare() abuse: non-finite / absurdly low rates must not reach the clamp with lo > hi (UB)
         // or the smoother ramp with an inf sample count.
-        { stereo::MonoBass m4; m4.prepare (INFINITY);
+        { stereo::MonoBass m4; felitronics::test::run (m4.prepare (INFINITY));
           test::ok (m4.frequency() == 120.0f, "prepare(inf) -> 48 kHz fallback, fc clamp sane"); }
-        { stereo::MonoBass m4; m4.prepare (std::nan ("")); m4.setFrequency (200.0f);
+        { stereo::MonoBass m4; felitronics::test::run (m4.prepare (std::nan (""))); m4.setFrequency (200.0f);
           test::ok (m4.frequency() == 200.0f, "prepare(NaN) -> 48 kHz fallback, setters live"); }
-        { stereo::MonoBass m4; m4.prepare (30.0);                            // 0.45*fs < kMinFreq: hi must not sink below lo
+        { stereo::MonoBass m4; felitronics::test::run (m4.prepare (30.0));                            // 0.45*fs < kMinFreq: hi must not sink below lo
           test::ok (m4.frequency() == 20.0f, "prepare(30 Hz) -> fc pinned at the 20 Hz floor (no lo>hi clamp UB)");
           std::vector<float> l (256, 0.5f), r (256, -0.5f); float* io4[2] { l.data(), r.data() };
-          m4.process (io4, 2, 256);
+          felitronics::test::run (m4.process (io4, 2, 256));
           bool fin = true; for (int i = 0; i < 256; ++i) fin = fin && std::isfinite (l[i]) && std::isfinite (r[i]);
           test::ok (fin, "processing at an absurd fs stays finite"); }
 
@@ -357,16 +357,16 @@ int main()
         bool finite = true;
         for (float fc : { 20.0f, (float) (0.45 * sr) })
         {
-            stereo::MonoBass m2; m2.prepare (sr); m2.setFrequency (fc); m2.setLowWidth (0.0f); m2.reset();
+            stereo::MonoBass m2; felitronics::test::run (m2.prepare (sr)); m2.setFrequency (fc); m2.setLowWidth (0.0f); m2.reset();
             std::vector<float> L, R; rngPair (48000, 3 + (unsigned long long) fc, L, R);
             float* io[2] { L.data(), R.data() };
-            for (int k = 0; k < 48000 / 512; ++k) { float* b[2] { L.data() + k * 512, R.data() + k * 512 }; m2.process (b, 2, 512); }
+            for (int k = 0; k < 48000 / 512; ++k) { float* b[2] { L.data() + k * 512, R.data() + k * 512 }; felitronics::test::run (m2.process (b, 2, 512)); }
             (void) io;
             for (int i = 0; i < 48000; ++i) finite = finite && std::isfinite (L[i]) && std::isfinite (R[i]);
         }
-        stereo::MonoBass m3; m3.prepare (0.0);                               // absurd fs -> 48 kHz fallback
+        stereo::MonoBass m3; felitronics::test::run (m3.prepare (0.0));                               // absurd fs -> 48 kHz fallback
         std::vector<float> L, R; rngPair (2048, 5, L, R); float* io[2] { L.data(), R.data() };
-        m3.process (io, 2, 2048);
+        felitronics::test::run (m3.process (io, 2, 2048));
         for (int i = 0; i < 2048; ++i) finite = finite && std::isfinite (L[i]) && std::isfinite (R[i]);
         test::ok (finite, "fc at both clamp rails + prepare(0) fallback: output finite under noise");
     }
@@ -374,16 +374,16 @@ int main()
     // --- loud -> silence: the state must flush to EXACT zero (no denormal-sustained tails) ---
     test::group ("MonoBass: denormal flush -> exact zero after silence");
     {
-        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
         std::vector<float> L (4800), R (4800);
         for (int i = 0; i < 4800; ++i) { const float v = 0.9f * (float) std::sin (2.0 * pi * 120.0 * i / sr); L[i] = v; R[i] = -v; }
-        float* io[2] { L.data(), R.data() }; mb.process (io, 2, 4800);
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (mb.process (io, 2, 4800));
         std::vector<float> zl (512), zr (512); float* zio[2] { zl.data(), zr.data() };
         bool finite = true;
         for (int k = 0; k < 94; ++k)                                          // ~1 s of true silence, re-zeroed per block
         {
             std::fill (zl.begin(), zl.end(), 0.0f); std::fill (zr.begin(), zr.end(), 0.0f);
-            mb.process (zio, 2, 512);
+            felitronics::test::run (mb.process (zio, 2, 512));
             for (int i = 0; i < 512; ++i) finite = finite && std::isfinite (zl[i]) && std::isfinite (zr[i]);
         }
         double lastMax = 0; for (int i = 0; i < 512; ++i) { lastMax = std::max (lastMax, (double) std::fabs (zl[i])); lastMax = std::max (lastMax, (double) std::fabs (zr[i])); }
@@ -394,14 +394,14 @@ int main()
     // --- no allocation in process(), including through param moves and a bypass fade ---
     test::group ("MonoBass: no-alloc");
     {
-        stereo::MonoBass mb; mb.prepare (sr); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
+        stereo::MonoBass mb; felitronics::test::run (mb.prepare (sr)); mb.setFrequency (120.0f); mb.setLowWidth (0.0f); mb.reset();
         std::vector<float> L (512, 0.2f), R (512, -0.2f); float* io[2] { L.data(), R.data() };
-        mb.process (io, 2, 512);
+        felitronics::test::run (mb.process (io, 2, 512));
         const long before = g_allocs.load();
-        mb.process (io, 2, 512);
-        mb.setLowWidth (1.0f);  mb.process (io, 2, 512);                     // fade + settle into bypass
-        mb.process (io, 2, 512);                                             // bypassed (state reset path)
-        mb.setLowWidth (0.3f); mb.setFrequency (90.0f); mb.process (io, 2, 512);
+        felitronics::test::run (mb.process (io, 2, 512));
+        mb.setLowWidth (1.0f);  felitronics::test::run (mb.process (io, 2, 512));                     // fade + settle into bypass
+        felitronics::test::run (mb.process (io, 2, 512));                                             // bypassed (state reset path)
+        mb.setLowWidth (0.3f); mb.setFrequency (90.0f); felitronics::test::run (mb.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process()/setters did not allocate (incl. bypass transitions)");
     }
 
@@ -415,8 +415,8 @@ int main()
         double worst = 0.0;
         for (float w : { 0.0f, 0.5f, 1.3f, 2.0f })
         {
-            std::vector<float> L = L0, R = R0; stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (w);
-            float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+            std::vector<float> L = L0, R = R0; stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (w);
+            float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
             for (int i = 0; i < N; ++i) worst = std::max (worst, (double) std::fabs (0.5f * (L[i] + R[i]) - 0.5f * (L0[i] + R0[i])));
         }
         test::ok (worst < 1e-6, "mono sum unchanged at width ∈ {0, .5, 1.3, 2} (widening can't weaken the fold)");
@@ -426,8 +426,8 @@ int main()
     test::group ("StereoWidth: neutral is bit-exact");
     {
         const int N = 512; std::vector<float> L0, R0; rngPair (N, 3, L0, R0); auto L = L0, R = R0;
-        stereo::StereoWidth sw; sw.prepare (sr);                              // defaults: width 1, gain 1
-        float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr));                              // defaults: width 1, gain 1
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) { md = std::max (md, (double) std::fabs (L[i] - L0[i])); md = std::max (md, (double) std::fabs (R[i] - R0[i])); }
         test::ok (md == 0.0, "width=1, gain=1 → exact passthrough");
     }
@@ -436,8 +436,8 @@ int main()
     test::group ("StereoWidth: width=0 → mono");
     {
         const int N = 1000; std::vector<float> L0, R0; rngPair (N, 9, L0, R0); auto L = L0, R = R0;
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (0.0f); sw.reset();   // snap past the smoothing ramp
-        float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (0.0f); sw.reset();   // snap past the smoothing ramp
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         double diff = 0, toM = 0; for (int i = 0; i < N; ++i) { diff = std::max (diff, (double) std::fabs (L[i] - R[i])); toM = std::max (toM, (double) std::fabs (L[i] - 0.5f * (L0[i] + R0[i]))); }
         test::ok (diff == 0.0 && toM < 1e-6, "width=0 → L==R==½(L+R) (pure mono)");
     }
@@ -446,8 +446,8 @@ int main()
     test::group ("StereoWidth: width=2 doubles the side");
     {
         const int N = 1000; std::vector<float> L0, R0; rngPair (N, 21, L0, R0); auto L = L0, R = R0;
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (2.0f); sw.reset();   // snap past the smoothing ramp
-        float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (2.0f); sw.reset();   // snap past the smoothing ramp
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs ((L[i] - R[i]) - 2.0f * (L0[i] - R0[i])));
         test::ok (md < 1e-5, "side difference scaled ×2 (the S axis tracks width)");
     }
@@ -457,8 +457,8 @@ int main()
     {
         const int N = 600; std::vector<float> in; std::vector<float> dummy; rngPair (N, 5, in, dummy);
         auto L = in, R = in;                                                  // L==R → S=0
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (2.0f);
-        float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (2.0f);
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) { md = std::max (md, (double) std::fabs (L[i] - in[i])); md = std::max (md, (double) std::fabs (R[i] - in[i])); }
         test::ok (md == 0.0, "L==R in → unchanged out at width=2 (width scales zero side)");
     }
@@ -467,8 +467,8 @@ int main()
     test::group ("StereoWidth: outputGain trims level");
     {
         const int N = 600; std::vector<float> L0, R0; rngPair (N, 13, L0, R0); auto L = L0, R = R0;
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (1.0f); sw.setOutputGain (2.0f); sw.reset();
-        float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (1.0f); sw.setOutputGain (2.0f); sw.reset();
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) { md = std::max (md, (double) std::fabs (L[i] - 2.0f * L0[i])); md = std::max (md, (double) std::fabs (R[i] - 2.0f * R0[i])); }
         test::ok (md < 1e-6, "width=1, gain=2 → output = 2× input (M and S both scale)");
     }
@@ -478,8 +478,8 @@ int main()
     {
         const int N = 4000; std::vector<float> L0, R0; rngPair (N, 31, L0, R0);
         auto sideRms = [&] (float w) {
-            std::vector<float> L = L0, R = R0; stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (w); sw.reset();
-            float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+            std::vector<float> L = L0, R = R0; stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (w); sw.reset();
+            float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
             std::vector<float> sde (N); for (int i = 0; i < N; ++i) sde[i] = 0.5f * (L[i] - R[i]);
             return rmsTail (sde, 0);
         };
@@ -491,11 +491,11 @@ int main()
     test::group ("StereoWidth: bypass");
     {
         const int N = 256; std::vector<float> L0, R0; rngPair (N, 99, L0, R0); auto L = L0, R = R0;
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (1.8f);
-        float* mono[1] { L.data() }; sw.process (mono, 1, N);                 // < 2 ch → passthrough
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (1.8f);
+        float* mono[1] { L.data() }; felitronics::test::run (sw.process (mono, 1, N));                 // < 2 ch → passthrough
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (L[i] - L0[i]));
         test::ok (md == 0.0, "mono call (numChannels<2) → untouched");
-        sw.setEnabled (false); float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        sw.setEnabled (false); float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         md = 0; for (int i = 0; i < N; ++i) { md = std::max (md, (double) std::fabs (L[i] - L0[i])); md = std::max (md, (double) std::fabs (R[i] - R0[i])); }
         test::ok (md == 0.0, "disabled → untouched");
     }
@@ -503,11 +503,11 @@ int main()
     // --- no allocation in process() ---
     test::group ("StereoWidth: no-alloc");
     {
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (1.7f); sw.setOutputGain (1.1f);
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (1.7f); sw.setOutputGain (1.1f);
         std::vector<float> L (512, 0.3f), R (512, -0.2f); float* io[2] { L.data(), R.data() };
-        sw.process (io, 2, 512);
+        felitronics::test::run (sw.process (io, 2, 512));
         const long before = g_allocs.load();
-        sw.process (io, 2, 512); sw.process (io, 2, 512);
+        felitronics::test::run (sw.process (io, 2, 512)); felitronics::test::run (sw.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
@@ -517,10 +517,10 @@ int main()
         const int N = 4000; std::vector<float> L0 (N), R0 (N);
         for (int i = 0; i < N; ++i) { L0[i] = 0.5f * (float) std::sin (2.0 * pi * 500.0 * i / sr); R0[i] = 0.5f * (float) std::sin (2.0 * pi * 500.0 * i / sr + 0.6); }
         double inSlew = 0; for (int i = 1; i < N; ++i) inSlew = std::max (inSlew, (double) std::fabs (0.5f * (L0[i] - R0[i]) - 0.5f * (L0[i - 1] - R0[i - 1])));
-        auto L = L0, R = R0; stereo::StereoWidth sw; sw.prepare (sr); sw.reset();        // settled at width 1
-        float* a[2] { L.data(), R.data() }; sw.process (a, 2, N / 2);                     // width 1 (near-passthrough)
+        auto L = L0, R = R0; stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.reset();        // settled at width 1
+        float* a[2] { L.data(), R.data() }; felitronics::test::run (sw.process (a, 2, N / 2));                     // width 1 (near-passthrough)
         sw.setWidth (2.0f);                                                              // STEP — must ramp, not jump
-        float* b[2] { L.data() + N / 2, R.data() + N / 2 }; sw.process (b, 2, N / 2);
+        float* b[2] { L.data() + N / 2, R.data() + N / 2 }; felitronics::test::run (sw.process (b, 2, N / 2));
         double worstStep = 0, worstMono = 0;
         for (int i = 1; i < N; ++i)
         {
@@ -535,10 +535,10 @@ int main()
     test::group ("StereoWidth: non-finite params rejected");
     {
         const int N = 256; std::vector<float> L0, R0; rngPair (N, 55, L0, R0); auto L = L0, R = R0;
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (1.5f); sw.setOutputGain (1.2f); sw.reset();
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (1.5f); sw.setOutputGain (1.2f); sw.reset();
         sw.setWidth (std::nanf ("")); sw.setOutputGain (INFINITY); sw.setWidth (-INFINITY);   // all must be ignored
         test::ok (sw.width() == 1.5f && sw.outputGain() == 1.2f, "setWidth(NaN)/setOutputGain(±inf) ignored — last good value kept");
-        float* io[2] { L.data(), R.data() }; sw.process (io, 2, N);
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (sw.process (io, 2, N));
         bool fin = true; for (int i = 0; i < N; ++i) if (! std::isfinite (L[i]) || ! std::isfinite (R[i])) fin = false;
         test::ok (fin, "output stays finite after a NaN/inf parameter poke");
     }
@@ -547,9 +547,9 @@ int main()
     test::group ("StereoWidth: aliased L==R applies gain once");
     {
         const int N = 200; std::vector<float> in, dummy; rngPair (N, 77, in, dummy); auto buf = in;
-        stereo::StereoWidth sw; sw.prepare (sr); sw.setWidth (1.7f); sw.setOutputGain (2.0f); sw.reset();
+        stereo::StereoWidth sw; felitronics::test::run (sw.prepare (sr)); sw.setWidth (1.7f); sw.setOutputGain (2.0f); sw.reset();
         float* io[2] { buf.data(), buf.data() };                                  // L and R alias one buffer
-        sw.process (io, 2, N);
+        felitronics::test::run (sw.process (io, 2, N));
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (buf[i] - 2.0f * in[i]));
         test::ok (md < 1e-5, "io[0]==io[1] → output = gain·in (gain applied once; width inert on S=0)");
     }

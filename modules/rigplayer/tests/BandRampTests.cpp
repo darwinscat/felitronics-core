@@ -189,7 +189,7 @@ static void renderThroughPlayer (int block, double fromDial, double toDial, int 
     // sizes the internal chunking, the convolver's partitioning and the stage's buffers), so varying
     // it too would compare two different players rather than two slicings of one. The first version of
     // this fixture passed `block` here and every row differed from sample zero, before the edit.
-    p.prepare (kFs, n, 1);
+    felitronics::test::run (p.prepare (kFs, n, 1));
     p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
     for (int i = 0; i < 64; ++i) p.serviceHere();              // let the model land
     p.setDial ("bass", fromDial);
@@ -203,7 +203,7 @@ static void renderThroughPlayer (int block, double fromDial, double toDial, int 
         {
             const int count = std::min (block, to - off);
             float* io[1] { out.data() + off };
-            p.process (io, 1, count);
+            felitronics::test::run (p.process (io, 1, count));
             p.serviceHere();
         }
     };
@@ -219,7 +219,7 @@ static void renderThroughPlayer (int block, double fromDial, double toDial, int 
         {
             const int c = std::min (step, to - off);
             float* io[1] { out.data() + off };
-            p.process (io, 1, c);
+            felitronics::test::run (p.process (io, 1, c));
             p.serviceHere();
         }
     };
@@ -297,7 +297,7 @@ static void testTheMoveIsTheSameHoweverItIsCut()
         auto twoEdits = [&] (int block, std::vector<float>& o)
         {
             RigPlayer p;
-            p.prepare (kFs, n, 1);                             // configuration fixed; only the cutting varies
+            felitronics::test::run (p.prepare (kFs, n, 1));                             // configuration fixed; only the cutting varies
             p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
             for (int i = 0; i < 64; ++i) p.serviceHere();
             p.setDial ("bass", 0.0);
@@ -306,10 +306,10 @@ static void testTheMoveIsTheSameHoweverItIsCut()
                 o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs));
             auto span = [&] (int from, int to) {
                 for (int off = from; off < to; off += block)
-                { const int c = std::min (block, to - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+                { const int c = std::min (block, to - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
             };
             for (int off = 0; off < 6000; off += 6000 / 32)     // pre-edit: 32 calls, always the same
-            { const int c = std::min (6000 / 32, 6000 - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+            { const int c = std::min (6000 / 32, 6000 - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
             p.setDial ("bass", 300.0);
             span (6000, 6000 + 120);          // 120 samples in — well inside the ramp
             p.setDial ("bass", 90.0);         // ...and the hand moves again
@@ -350,7 +350,7 @@ static void testARestartedRampDoesNotJump()
     auto play = [&] (double startDial, bool edits, double firstTo, double secondTo, std::vector<float>& o)
     {
         RigPlayer p;
-        p.prepare (kFs, n, 1);
+        felitronics::test::run (p.prepare (kFs, n, 1));
         p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
         for (int i = 0; i < 64; ++i) p.serviceHere();
         p.setDial ("bass", startDial);
@@ -360,7 +360,7 @@ static void testARestartedRampDoesNotJump()
         auto call = [&] (int from, int to)
         {
             for (int off = from; off < to; off += 64)
-            { const int c = std::min (64, to - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+            { const int c = std::min (64, to - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
         };
         if (! edits) { call (0, n); return; }
         call (0, firstEdit);
@@ -422,14 +422,14 @@ static void testTheRampNullsAnOracle()
                                      + 0.2 * std::sin (2.0 * kPi * 1400.0 * (double) i / kFs));
 
     RigPlayer p;
-    p.prepare (kFs, n, 2);                                     // STEREO — the only fixture here that is
+    felitronics::test::run (p.prepare (kFs, n, 2));                                     // STEREO — the only fixture here that is
     p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
     for (int i = 0; i < 64; ++i) p.serviceHere();
     p.setDial ("bass", 0.0);
     std::vector<float> L = in, R = in;
     auto run = [&] (int from, int to, int block) {
         for (int off = from; off < to; off += block)
-        { const int c = std::min (block, to - off); float* io[2] { L.data() + off, R.data() + off }; p.process (io, 2, c); p.serviceHere(); }
+        { const int c = std::min (block, to - off); float* io[2] { L.data() + off, R.data() + off }; felitronics::test::run (p.process (io, 2, c)); p.serviceHere(); }
     };
     run (0, edit1, 6000 / 32);                                 // settle the gains and the blend law
     p.setDial ("bass", 300.0); run (edit1, edit2, 64);
@@ -487,7 +487,7 @@ static void testTheFlushIsInsideTheCall()
     auto render = [&] (int block, std::vector<float>& o)
     {
         RigPlayer p;
-        p.prepare (kFs, n, 1);
+        felitronics::test::run (p.prepare (kFs, n, 1));
         p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
         for (int i = 0; i < 64; ++i) p.serviceHere();
         p.setDial ("bass", 300.0);
@@ -498,9 +498,9 @@ static void testTheFlushIsInsideTheCall()
         // 0.25 per CALL, so an arm that starts with one long call leaves the blend gain climbing for the
         // whole render and this test would measure that instead of the flush (measured: 3228 samples).
         for (int off = 0; off < 2000; off += 2000 / 32)
-        { const int c = std::min (2000 / 32, 2000 - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+        { const int c = std::min (2000 / 32, 2000 - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
         for (int off = 2000; off < n; off += block)
-        { const int c = std::min (block, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+        { const int c = std::min (block, n - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
     };
     std::vector<float> whole, sliced;
     render (n, whole);          // the tail in ONE call spanning 437 grid periods
@@ -534,7 +534,7 @@ static void testPrepareRestartsTheBands()
     auto render = [&] (bool viaRestart, std::vector<float>& o)
     {
         RigPlayer p;
-        p.prepare (kFs, n, 1);
+        felitronics::test::run (p.prepare (kFs, n, 1));
         p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
         for (int i = 0; i < 64; ++i) p.serviceHere();
         if (viaRestart)
@@ -542,8 +542,8 @@ static void testPrepareRestartsTheBands()
             p.setDial ("bass", 0.0);                            // the OLD stream's position...
             std::vector<float> w (256, 0.2f);
             float* io[1] { w.data() };
-            p.process (io, 1, 256);                             // ...actually applied
-            p.prepare (kFs, n, 1);                              // and now: a new stream
+            felitronics::test::run (p.process (io, 1, 256));                             // ...actually applied
+            felitronics::test::run (p.prepare (kFs, n, 1));                              // and now: a new stream
             p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
             for (int i = 0; i < 64; ++i) p.serviceHere();
         }
@@ -552,7 +552,7 @@ static void testPrepareRestartsTheBands()
         for (int i = 0; i < n; ++i)
             o[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * kPi * 90.0 * (double) i / kFs));
         for (int off = 0; off < n; off += 256)
-        { const int c = std::min (256, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+        { const int c = std::min (256, n - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
     };
     std::vector<float> fresh, restarted;
     render (false, fresh);
@@ -588,7 +588,7 @@ static void testPrepareReAnchorsTheGrid()
     auto render = [&] (bool warmFirst, std::vector<float>& o)
     {
         RigPlayer p;
-        p.prepare (kFs, n, 1);
+        felitronics::test::run (p.prepare (kFs, n, 1));
         p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
         for (int i = 0; i < 64; ++i) p.serviceHere();
         p.setDial ("bass", 300.0);
@@ -596,8 +596,8 @@ static void testPrepareReAnchorsTheGrid()
         {
             std::vector<float> w ((std::size_t) warm, 0.1f);
             float* io[1] { w.data() };
-            p.process (io, 1, warm);
-            p.prepare (kFs, n, 1);
+            felitronics::test::run (p.process (io, 1, warm));
+            felitronics::test::run (p.prepare (kFs, n, 1));
             p.load (oneBandRig(), [] (const std::string&) { return unityModel(); });
             for (int i = 0; i < 64; ++i) p.serviceHere();
             p.setDial ("bass", 300.0);
@@ -610,7 +610,7 @@ static void testPrepareReAnchorsTheGrid()
         // floor((37+512)/64) are both 8 — and the phase shift this test exists to detect becomes
         // invisible. The first version of this fixture used 512 and passed with the re-anchor deleted.
         for (int off = 0; off < n; off += 100)
-        { const int c = std::min (100, n - off); float* io[1] { o.data() + off }; p.process (io, 1, c); p.serviceHere(); }
+        { const int c = std::min (100, n - off); float* io[1] { o.data() + off }; felitronics::test::run (p.process (io, 1, c)); p.serviceHere(); }
     };
 
     std::vector<float> fresh, reused;

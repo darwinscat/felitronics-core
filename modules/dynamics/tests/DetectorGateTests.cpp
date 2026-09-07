@@ -218,12 +218,12 @@ static void transientShaperSubstitutesItsKey()
             for (int i = 0; i < n; ++i) src[(std::size_t) i] = toneAt (i, 900.0);
             mono.fill (0, src);
             mono.lane (0)[at] = poisonValue;
-            dynamics::TransientShaper t; t.prepare (kFs, blk, 1);
+            dynamics::TransientShaper t; felitronics::test::run (t.prepare (kFs, blk, 1));
             dynamics::TransientShaperParams tp;
             tp.attackDb = 8.0; tp.sustainDb = -4.0; tp.mix = 1.0; tp.link = dynamics::LinkMode::Max;
             t.setParams (tp);
             for (int off = 0; off < n; off += blk)
-            { float* io[1] { mono.lane (0) + off }; t.process (io, 1, blk); }
+            { float* io[1] { mono.lane (0) + off }; felitronics::test::run (t.process (io, 1, blk)); }
             return mono.snapshot (0);
         };
         const auto sane = runMono (p.sane), bad = runMono (p.bad);
@@ -247,14 +247,14 @@ static void transientShaperSubstitutesItsKey()
          {
              rig.fill (0, src0); rig.fill (1, src1);
              rig.lane (0)[at] = poisonValue;
-             dynamics::TransientShaper t; t.prepare (kFs, blk, 2);
+             dynamics::TransientShaper t; felitronics::test::run (t.prepare (kFs, blk, 2));
              dynamics::TransientShaperParams tp;
              tp.attackDb = 8.0; tp.sustainDb = -4.0; tp.mix = 1.0; tp.link = link;
              t.setParams (tp);
              for (int off = 0; off < n; off += blk)
              {
                  float* io[2] { rig.lane (0) + off, rig.lane (1) + off };
-                 t.process (io, 2, blk);
+                 felitronics::test::run (t.process (io, 2, blk));
              }
              return rig.snapshot (1);                 // the innocent channel
          };
@@ -304,11 +304,11 @@ static void theGainTrajectoriesAreSubstituted()
                     x[(std::size_t) i] = (float) (burst * (double) toneAt (i, 6500.0, 0.045));
                 }
                 x[(std::size_t) at] = which == 0 ? p.bad : p.sane;
-                deesser::DeEsser d; d.prepare (kFs, blk, 1);
+                deesser::DeEsser d; felitronics::test::run (d.prepare (kFs, blk, 1));
                 deesser::DeEsserParams dp; dp.mode = mode; d.setParams (dp);
                 auto& trace = which == 0 ? traceA : traceB;
                 for (int off = 0; off + blk <= n; off += blk)
-                { float* io[1] { x.data() + off }; d.process (io, 1, blk); trace.push_back (d.gainReductionDb()); }
+                { float* io[1] { x.data() + off }; felitronics::test::run (d.process (io, 1, blk)); trace.push_back (d.gainReductionDb()); }
             }
             int bad = 0;
             for (std::size_t i = 0; i < traceA.size(); ++i)
@@ -329,12 +329,12 @@ static void theGainTrajectoriesAreSubstituted()
                 std::vector<float> l ((std::size_t) n), r ((std::size_t) n);
                 for (int i = 0; i < n; ++i) { l[(std::size_t) i] = toneAt (i, 400.0, 0.5); r[(std::size_t) i] = toneAt (i, 1500.0, 0.3); }
                 l[(std::size_t) at] = which == 0 ? p.bad : p.sane;
-                dynamiceq::DynamicEqBand e; e.prepare (kFs, 2);
+                dynamiceq::DynamicEqBand e; felitronics::test::run (e.prepare (kFs, 2));
                 dynamiceq::DynamicEqBandParams ep; ep.link = link; ep.coeffUpdatePeriod = 1;
                 e.setParams (ep);
                 auto& trace = which == 0 ? traceA : traceB;
                 for (int off = 0; off + blk <= n; off += blk)
-                { float* io[2] { l.data() + off, r.data() + off }; e.process (io, 2, blk); trace.push_back (e.dynamicDeltaDb()); }
+                { float* io[2] { l.data() + off, r.data() + off }; felitronics::test::run (e.process (io, 2, blk)); trace.push_back (e.dynamicDeltaDb()); }
             }
             int bad = 0;
             for (std::size_t i = 0; i < traceA.size(); ++i)
@@ -404,7 +404,7 @@ static void laneDynamicsGatesBeforeTheMidSideArithmetic()
          {
              for (int c = 0; c < 2; ++c) { rig.fill (c, src[c]); rig.fill (2 + c, sc[c]); }
              rig.lane (2 + ch)[at] = poisonValue;
-             dynamiceq::LaneDynamics ld; ld.prepare (kFs, 2);
+             dynamiceq::LaneDynamics ld; felitronics::test::run (ld.prepare (kFs, 2));
              // THE BAND ITSELF MUST BE ON, not only its lanes and its dynamics. `BandParams::on`
              // defaults to false and `processBand` then returns before touching the sidechain — the
              // first version of this test exercised nothing at all, and every mutation of the gate
@@ -421,7 +421,7 @@ static void laneDynamicsGatesBeforeTheMidSideArithmetic()
              {
                  float* a[2] { rig.lane (0) + off, rig.lane (1) + off };
                  const float* s[2] { rig.lane (2) + off, rig.lane (3) + off };
-                 ld.processBand (a, s, 2, blk, band);
+                 felitronics::test::run (ld.processBand (a, s, 2, blk, band));
              }
              std::vector<float> both;
              for (int c = 0; c < 2; ++c) { const auto v = rig.snapshot (c); both.insert (both.end(), v.begin(), v.end()); }
@@ -459,11 +459,11 @@ static void theGainIsSharedAndThatIsWhyIsolationIsAPrimitiveProperty()
         l[(std::size_t) i] = lRef[(std::size_t) i] = (float) (burst * std::sin (2.0 * core::kPi * 1000.0 * i / kFs));
         r[(std::size_t) i] = rRef[(std::size_t) i] = toneAt (i, 1000.0, 0.2);
     }
-    dynamiceq::DynamicEqBand e; e.prepare (kFs, 2);
+    dynamiceq::DynamicEqBand e; felitronics::test::run (e.prepare (kFs, 2));
     dynamiceq::DynamicEqBandParams ep; ep.link = dynamics::LinkMode::Max; ep.coeffUpdatePeriod = 1;
     ep.thresholdDb = -20.0; ep.ratio = 4.0; ep.rangeDb = 18.0;
     e.setParams (ep);
-    for (int i = 0; i < n; ++i) { float* io[2] { l.data() + i, r.data() + i }; e.process (io, 2, 1); }
+    for (int i = 0; i < n; ++i) { float* io[2] { l.data() + i, r.data() + i }; felitronics::test::run (e.process (io, 2, 1)); }
 
     double worst = 0.0;
     for (int i = n / 2 + 100; i < n / 2 + 400; ++i)

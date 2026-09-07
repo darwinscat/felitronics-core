@@ -46,11 +46,19 @@ public:
     static constexpr float  kMaxWidth     = 2.0f;    // +6 dB side — the mastering-grade ceiling
     static constexpr double kSmoothingMs  = 20.0;    // click-free width/gain automation
 
-    void prepare (double sampleRate, int /*maxBlock*/ = 0, int /*maxChannels*/ = 2) noexcept
+    // Law 11, the same rule as MonoBass beside it: the M/S arithmetic needs no rate, but the smoothers
+    // do, so "the defaults are a valid configuration" is only half true. One answer for both.
+    // LAW 11(b): it TAKES a width, so the width is binding — "a module that ignores an argument is
+    // lying about its contract" was true of this one. Disarm first, validate, then write.
+    [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/ = 0, int maxChannels = 2) noexcept
     {
+        prepared_ = false;
+        if (maxChannels < 1 || maxChannels > 2) return false;
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
         widthSm_.reset (fs_, kSmoothingMs * 0.001); gainSm_.reset (fs_, kSmoothingMs * 0.001);
         reset();
+        prepared_ = true;
+        return true;
     }
 
     void reset() noexcept                            // snap the smoothers to their targets (settled, no glide)
@@ -79,12 +87,18 @@ public:
     static constexpr int latencySamples() noexcept { return 0; }
 
     // Stereo, in place: io[0]=L, io[1]=R. Bypass (untouched) when disabled, < 2 channels, or settled-neutral.
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2): a fixed STEREO stage — mono is a documented true passthrough,
+    // wider than 2 is refused.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        if (numChannels < 2 || ! enabled_) return;
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;               // the smoothers have no rate yet
+        if (numChannels > 2) return false;           // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                     // no samples: no time, no edge
+        if (numChannels < 2 || ! enabled_) return true;
         if (! widthSm_.isSmoothing() && ! gainSm_.isSmoothing()
             && core::exactlyEqual (widthSm_.getCurrentValue(), 1.0f) && core::exactlyEqual (gainSm_.getCurrentValue(), 1.0f))
-            return;                                  // settled neutral → bit-exact, skip the round-trip
+            return true;                             // settled neutral → bit-exact, skip the round-trip
         float* L = io[0];
         float* R = io[1];
         for (int i = 0; i < n; ++i)
@@ -94,10 +108,12 @@ public:
             float m, s; MidSide::encode (L[i], R[i], m, s);
             MidSide::decode (g * m, g * (w * s), L[i], R[i]);   // gain folded in → M untouched at g=1; alias-safe
         }
+        return true;
     }
 
 private:
     double fs_ = 48000.0;
+    bool   prepared_ = false;   // law 11: the smoothers have no rate before prepare()
     float  width_ = 1.0f, gain_ = 1.0f;
     bool   enabled_ = true;
     core::LinearSmoother widthSm_ { 1.0f }, gainSm_ { 1.0f };

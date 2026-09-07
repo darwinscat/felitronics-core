@@ -50,10 +50,17 @@ class LaneDynamics
 public:
     static constexpr int kControl = 16;      // samples between delta updates (~0.33 ms at 48 k)
 
-    void prepare (double sampleRate, int maxChannels) noexcept
+    [[nodiscard]] bool prepare (double sampleRate, int maxChannels) noexcept
     {
+        // LAW 11(b): DISARM first, validate, then write. Validating first meant returning before the
+        // disarm, so a refused prepare() left the previous preparation standing and still processing;
+        // writing first meant a refused prepare() left the new sample rate beside the old objects, so
+        // `parkedMs = 1000 * parked / fs_` read a 3 s park as 1.5 s. This order is the only one that
+        // gives both halves.
+        prepared_ = false;
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         fs_ = (std::isfinite (sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;
-        ch_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        ch_ = maxChannels;
         for (int i = 0; i < eq::kNumLanes; ++i)
         {
             LaneState& s = st_[i];
@@ -70,6 +77,8 @@ public:
             s.gc.setThresholdDb (0.0);                     // RelativeLevel wiring: never rewritten
         }
         reset();
+        prepared_ = true;
+        return true;
     }
 
     void reset() noexcept
@@ -142,18 +151,36 @@ public:
 
     // Audio + sidechain in, band driven out. `audio` is processed IN PLACE by `band`; `sidechain` is
     // the EQ section's common input. Split into control-rate chunks so a 1 ms attack means 1 ms.
-    void processBand (float* const* audio, const float* const* sidechain,
-                      int numChannels, int numSamples, eq::EqBand& band) noexcept
+    [[nodiscard]] bool processBand (float* const* audio, const float* const* sidechain,
+                                    int numChannels, int numSamples, eq::EqBand& band) noexcept
     {
-        if (numSamples <= 0 || numChannels <= 0) return;
-        int nc = std::clamp (numChannels, 1, ch_);
+        if (numChannels < 0 || numSamples < 0) return false;   // malformed — law 11
+        if (! prepared_) return false;                         // ...and an unprepared layer refuses too
+        if (numChannels > ch_) return false;                   // width is a LIMIT — law 11(b)
+        if (numSamples == 0) return band.processBlock (audio, numChannels, numSamples);
+        if (numChannels == 0)
+        {
+            // LAW 11(a): at nch == 0 every lane stopped, and this layer has that edge already — it is
+            // the "dynamics off" branch below. Passing the gap only to the BAND left the detectors,
+            // `deltaDb`, `running` and `parked` frozen, and the band then applied a stale delta to the
+            // first samples back: measured, a lane holding -12.000 dB through a full second of gap, and
+            // the first 16 samples of the return pushed down by -5.25 dB. Real silence gives 0.000.
+            // The band's verdict is taken FIRST: `disengage()` moves this layer's own state, and a
+            // refused call must move nothing. Measured on the ordering that ran it first — the call
+            // returned false and still took deltaDb from -11.9999 to 0.
+            if (! band.processBlock (audio, 0, numSamples)) return false;
+            if (engaged_) { disengage (band); engaged_ = false; }
+            for (auto& st : st_) st.parked += numSamples;
+            return true;
+        }
+        int nc = numChannels;
         // The sidechain may be NARROWER than the audio: EqEngine::captureSectionInput records the width it
         // actually captured and hands back nullptr for the columns outside it, so a caller that captures 1
         // channel and then asks for 2 would have this loop dereference one. Detect on what was captured
         // rather than on a null pointer; a lane that ends up with no sidechain at all is refused above.
         if (sidechain != nullptr)
             for (int c = 0; c < nc; ++c) if (sidechain[c] == nullptr) { nc = c; break; }
-        if (nc <= 0) { if (engaged_) { disengage (band); engaged_ = false; } band.processBlock (audio, std::clamp (numChannels, 1, ch_), numSamples); return; }
+        if (nc <= 0) { if (engaged_) { disengage (band); engaged_ = false; } return band.processBlock (audio, numChannels, numSamples); }
 
         // Disengaging must not leave the band frozen mid-duck: zero the seams and drop the
         // detector/programme/GR state once, on the edge. Without this, toggling dynamics off during a
@@ -170,11 +197,11 @@ public:
         {
             if (engaged_) { disengage (band); engaged_ = false; }
             for (auto& st : st_) st.parked += numSamples;   // this park counts too — see applyParkPolicy
-            band.processBlock (audio, nc, numSamples);
-            return;
+            return band.processBlock (audio, nc, numSamples);
         }
         engaged_ = true;
 
+        bool ok = true;
         int done = 0;
         while (done < numSamples)
         {
@@ -188,10 +215,16 @@ public:
             // look-ahead in a plugin that reports zero latency. Running the band on the delta derived
             // from the PREVIOUS chunk keeps the path causal; the cost is one control period (0.33 ms)
             // of delay on the gain, which the ballistics dwarf.
-            band.processBlock (aud, nc, n);
+            // The band's verdict GATES the control step. It used to be recorded and then ignored, so a
+            // refused audio call still moved the detector and the per-lane delta: measured, a band
+            // prepared for 1 channel driven at 2 returned false and still moved deltaDb(Stereo) from 0
+            // to -0.0345 dB. Law 11's own invariant — a refused call moves nothing — has to hold for the
+            // control seam as well as for the audio.
+            if (! band.processBlock (aud, nc, n)) { ok = false; break; }
             advance (sc, nc, n, band);
             done += n;
         }
+        return ok;
     }
 
     // Live gain reduction of one lane (dB, signed) — for metering. Lock-free by being a plain read on
@@ -422,6 +455,7 @@ private:
 
     double        fs_ = 48000.0;
     int           ch_ = 2;
+    bool          prepared_ = false;   // law 11: process() before a successful prepare() is refused
     eq::DynParams dyn_;
     double        dynAtk_ = 0.5, dynRel_ = 0.5;
     float         sign_ = 1.0f;

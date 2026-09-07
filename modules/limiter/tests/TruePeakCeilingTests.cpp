@@ -265,7 +265,7 @@ static std::vector<std::vector<float>> renderAt (const std::vector<std::vector<f
     {
         const int k = std::min (maxBlock, n + drain - i);
         for (int c = 0; c < nch; ++c) ptrs[(std::size_t) c] = out[(std::size_t) c].data() + i;
-        lim.process (ptrs.data(), nch, k);
+        felitronics::test::run (lim.process (ptrs.data(), nch, k));
     }
     if (grOut) *grOut = lim.gainReductionDb();
     return out;
@@ -798,7 +798,7 @@ int main()
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
         (void) lim.prepare (sr, (int) loud.size(), 2, { 1.0, 4, 32 }); lim.setParams (p);
         std::vector<float> mono = loud; float* one[1] { mono.data() };
-        lim.process (one, 1, (int) loud.size());
+        felitronics::test::run (lim.process (one, 1, (int) loud.size()));
         test::ok (tp::samplePeakDb (mono) < -0.5, "a stereo-prepared limiter still limits a mono call ("
                                                   + dbs (tp::samplePeakDb (mono)) + " dBFS)");
     }
@@ -856,8 +856,10 @@ int main()
             (void) narrow.prepare (sr, 256, 1, { 1.0, 4, 32 }); narrow.setParams (np);
             std::vector<float> ca (256, 0.9f), cb (256, 0.9f);
             float* two[2] { ca.data(), cb.data() };
-            narrow.process (two, 2, 256);                                 // prepared for 1, handed 2
-            test::ok (cb[128] == 0.9f, "a mono-prepared limiter leaves the extra channel untouched rather than writing it");
+            // LAW 11(b): the whole call is refused, so BOTH planes are untouched — not just the extra one.
+            test::ok (! narrow.process (two, 2, 256), "a mono-prepared limiter REFUSES a stereo call (law 11b)");
+            test::ok (cb[128] == 0.9f && ca[128] == 0.9f,
+                      "...leaving both planes untouched: a prefix would have limited one and not the other");
         }
         // setParams AFTER prepare has to reach the state as well; every render helper here sets before
         // preparing, which would let a setParams that stored its argument and forgot to apply it pass.
@@ -870,7 +872,7 @@ int main()
             std::vector<float> hot (1024);
             for (int i = 0; i < 1024; ++i) hot[(std::size_t) i] = (float) (0.9 * std::sin (2.0 * core::kPi * 997.0 * (double) i / sr));
             float* hp[1] { hot.data() };
-            late.process (hp, 1, 1024);
+            felitronics::test::run (late.process (hp, 1, 1024));
             test::ok (tp::samplePeakDb (hot) < -11.0, "a ceiling set after prepare() is the one that applies ("
                                                       + dbs (tp::samplePeakDb (hot)) + " dBFS)");
         }
@@ -949,12 +951,12 @@ int main()
         (void) a.prepare (sr, n, 1, { 1.0, 4, 32 }); a.setParams (p);
         (void) b.prepare (sr, n, 1, { 1.0, 4, 32 }); b.setParams (p);
         std::vector<float> warm = loud; float* w[1] { warm.data() };
-        a.process (w, 1, n);
+        felitronics::test::run (a.process (w, 1, n));
         a.reset();
         std::vector<float> ya = silence, yb = silence;
         float* pa[1] { ya.data() }; float* pb[1] { yb.data() };
-        a.process (pa, 1, n);
-        b.process (pb, 1, n);
+        felitronics::test::run (a.process (pa, 1, n));
+        felitronics::test::run (b.process (pb, 1, n));
         int last = -1;
         for (int i = 0; i < n; ++i) if (ya[(std::size_t) i] != yb[(std::size_t) i]) last = i;   // exact, as above
         // The residue cannot outlive the reported latency plus the FIR tail. Written from
@@ -991,16 +993,16 @@ int main()
         (void) c.prepare (sr, n, 1, { 1.0, 4, 32 }); c.setParams (cp);
         std::vector<float> hot = loud; float* ph[1] { hot.data() };
         for (int i = 0; i < n; ++i) hot[(std::size_t) i] = (float) (hot[(std::size_t) i] * 30.0);   // ~29 dB of reduction
-        c.process (ph, 1, n);
+        felitronics::test::run (c.process (ph, 1, n));
         test::ok (c.gainReductionDb() < -15.0, "the loud pass really did drive the gain deep ("
                                                 + dbs (c.gainReductionDb()) + " dB)");
         std::vector<float> flush (64, 0.0f); float* pf[1] { flush.data() };
-        c.process (pf, 1, 64);                                       // flush the filter history, keep grDb
+        felitronics::test::run (c.process (pf, 1, 64));                                       // flush the filter history, keep grDb
         c.reset();
         std::vector<float> soft ((std::size_t) n);
         for (int i = 0; i < n; ++i) soft[(std::size_t) i] = (float) (0.05 * std::sin (2.0 * core::kPi * 997.0 * (double) i / sr));
         std::vector<float> ys = soft; float* ps[1] { ys.data() };
-        c.process (ps, 1, n);
+        felitronics::test::run (c.process (ps, 1, n));
         const std::vector<float> justAfter (ys.begin() + 2 * historyBaseband, ys.begin() + 2 * historyBaseband + 256);
         test::approx (tp::samplePeakDb (justAfter), -26.02, 0.2,
                       "immediately after reset, quiet material passes at unity — the gain state really is cleared");
@@ -1073,9 +1075,9 @@ int main()
             one.setParams (p); many.setParams (p);
             std::vector<float> a2 = x, b2 = x;
             float* pa[1] { a2.data() };
-            one.process (pa, 1, n);                                          // one oversized call
+            felitronics::test::run (one.process (pa, 1, n));                                          // one oversized call
             for (int off = 0; off < n; off += mb)
-            { float* pb[1] { b2.data() + off }; many.process (pb, 1, std::min (mb, n - off)); }
+            { float* pb[1] { b2.data() + off }; felitronics::test::run (many.process (pb, 1, std::min (mb, n - off))); }
             test::ok (firstDifference (a2, b2) < 0, "maxBlock " + std::to_string (mb)
                       + ": one call of " + std::to_string (n) + " == the caller chunking it, sample for sample");
             test::ok (tp::samplePeakDb (a2) < -0.9, "maxBlock " + std::to_string (mb)
@@ -1143,7 +1145,7 @@ int main()
             limiter::TruePeakLimiterParams pp; pp.ceilingDbTp = absurd; pp.releaseMs = 50.0;
             lim.setParams (pp);
             float* ch[1] { x.data() };
-            lim.process (ch, 1, 2048); lim.process (ch, 1, 2048);
+            felitronics::test::run (lim.process (ch, 1, 2048)); felitronics::test::run (lim.process (ch, 1, 2048));
             test::ok (std::isfinite (lim.gainReductionDb()), "an absurd finite ceiling (" + dbs (absurd)
                       + " dBTP) leaves the gain state finite, not stuck at -inf");
             test::ok (lim.effectiveCeilingDbTp() >= -200.0 && lim.effectiveCeilingDbTp() <= 60.0,
@@ -1173,7 +1175,7 @@ int main()
             {
                 pp.releaseMs = (i == 640) ? 2.0 : 1.0;                    // per-block automation, every block
                 a.setParams (pp);
-                ch[0] = burst.data() + i; a.process (ch, 1, 64);
+                ch[0] = burst.data() + i; felitronics::test::run (a.process (ch, 1, 64));
             }
             test::ok (a.latencySamples() == before, "and per-block setParams cannot move it");
             test::ok (tp::samplePeakDb (burst) - C <= tpw::deliveredBudgetDb (4),
@@ -1199,11 +1201,11 @@ int main()
             lim.setParams (p);
             std::vector<float> L (40, 0.0f), R (40, 0.0f);
             R[0] = 10.0f;                                                 // +20 dBFS, RIGHT channel only
-            { float* io[2] { L.data(), R.data() }; lim.process (io, 2, 40); }
+            { float* io[2] { L.data(), R.data() }; felitronics::test::run (lim.process (io, 2, 40)); }
             std::vector<float> mono (24000, 0.0f);
-            { float* io[1] { mono.data() }; lim.process (io, 1, 24000); } // the right channel freezes here
+            { float* io[1] { mono.data() }; felitronics::test::run (lim.process (io, 1, 24000)); } // the right channel freezes here
             std::vector<float> L2 (4096, 0.0f), R2 (4096, 0.0f);
-            { float* io[2] { L2.data(), R2.data() }; lim.process (io, 2, 4096); }
+            { float* io[2] { L2.data(), R2.data() }; felitronics::test::run (lim.process (io, 2, 4096)); }
             test::ok (tp::samplePeakDb (R2) <= C, "F=" + std::to_string (F)
                       + ": stereo -> mono -> stereo leaves nothing above the ceiling on the resumed channel ("
                       + dbs (tp::samplePeakDb (R2)) + " dBFS; it used to be +18.76)");
@@ -1228,10 +1230,10 @@ int main()
             limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = rel;
             lim.setParams (p);
             std::vector<float> hot (512, 4.0f); float* io[1] { hot.data() };
-            lim.process (io, 1, 512);
+            felitronics::test::run (lim.process (io, 1, 512));
             const double engaged = lim.gainReductionDb();
             std::vector<float> quiet (480000, 0.0f); float* q[1] { quiet.data() };
-            lim.process (q, 1, 480000);                                   // ten seconds of silence
+            felitronics::test::run (lim.process (q, 1, 480000));                                   // ten seconds of silence
             test::ok (engaged < -1.0, "release " + dbs (rel) + " ms: the limiter engaged (" + dbs (engaged) + " dB)");
             test::ok (lim.gainReductionDb() > engaged, "release " + dbs (rel)
                       + " ms: and the gain still recovers, however slowly (" + dbs (engaged) + " -> "
@@ -1269,20 +1271,20 @@ int main()
             limiter::TruePeakLimiter one, many;
             (void) one.prepare (sr, 512, 2, { 1.0, 4, 32 }); (void) many.prepare (sr, 512, 2, { 1.0, 4, 32 });
             one.setParams (p); many.setParams (p);
-            { float* io[2] { a1.data(), b1.data() }; one.process (io, 2, n); }
+            { float* io[2] { a1.data(), b1.data() }; felitronics::test::run (one.process (io, 2, n)); }
             for (int off = 0; off < n; off += 512)
-            { float* io[2] { a2.data() + off, b2.data() + off }; many.process (io, 2, 512); }
+            { float* io[2] { a2.data() + off, b2.data() + off }; felitronics::test::run (many.process (io, 2, 512)); }
             test::ok (firstDifference (a1, a2) < 0 && firstDifference (b1, b2) < 0,
                       "STEREO: one oversized call == the caller chunking it, on both channels");
             limiter::TruePeakLimiter warm, fresh;
             (void) warm.prepare (sr, n, 2, { 1.0, 4, 32 }); (void) fresh.prepare (sr, n, 2, { 1.0, 4, 32 });
             warm.setParams (p); fresh.setParams (p);
             std::vector<float> w1 = a1, w2 = b1;
-            { float* io[2] { w1.data(), w2.data() }; warm.process (io, 2, n); }
+            { float* io[2] { w1.data(), w2.data() }; felitronics::test::run (warm.process (io, 2, n)); }
             warm.reset();
             std::vector<float> x1 (n, 0.0f), x2 (n, 0.0f), y1 (n, 0.0f), y2 (n, 0.0f);
-            { float* io[2] { x1.data(), x2.data() }; warm.process (io, 2, n); }
-            { float* io[2] { y1.data(), y2.data() }; fresh.process (io, 2, n); }
+            { float* io[2] { x1.data(), x2.data() }; felitronics::test::run (warm.process (io, 2, n)); }
+            { float* io[2] { y1.data(), y2.data() }; felitronics::test::run (fresh.process (io, 2, n)); }
             test::ok (firstDifference (x1, y1) < 0 && firstDifference (x2, y2) < 0,
                       "STEREO: reset() equals a fresh instance on both channels");
         }
@@ -1320,7 +1322,7 @@ int main()
         {
             limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 50.0; big.setParams (p);
             std::vector<float> x (4096, 4.0f); float* io[1] { x.data() };
-            big.process (io, 1, 4096);
+            felitronics::test::run (big.process (io, 1, 4096));
             test::ok (tp::samplePeakDb (x) < -0.9, "and it still limits (" + dbs (tp::samplePeakDb (x)) + " dBFS)");
         }
 
@@ -1364,18 +1366,18 @@ int main()
         test::ok (lim.prepare (sr, 4096, 1, { 1.0, 4, 32 }), "prepared for the reset checks");
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = C; p.releaseMs = 50.0; lim.setParams (p);
         std::vector<float> hot (4096, 4.0f); float* ph[1] { hot.data() };
-        lim.process (ph, 1, 4096);
+        felitronics::test::run (lim.process (ph, 1, 4096));
         lim.reset();
         std::vector<float> one (1, 0.0f); float* po[1] { one.data() };
-        lim.process (po, 1, 1);
+        felitronics::test::run (lim.process (po, 1, 1));
         test::approx (lim.gainReductionDb(), 0.0, 0.0,
                       "one silent sample after reset() draws exactly no gain reduction (the detector was cleared too)");
 
         // And the gain state must reach EXACT zero after limiting, not a denormal tail — which is the one
         // observable difference the poison/denormal flush makes.
-        lim.process (ph, 1, 4096);
+        felitronics::test::run (lim.process (ph, 1, 4096));
         std::vector<float> quiet (120000, 0.0f); float* pq[1] { quiet.data() };
-        lim.process (pq, 1, 120000);                                  // 2.5 s of silence
+        felitronics::test::run (lim.process (pq, 1, 120000));                                  // 2.5 s of silence
         test::approx (lim.gainReductionDb(), 0.0, 0.0,
                       "and after limiting plus 2.5 s of silence the gain state is exactly 0, not a denormal");
     }

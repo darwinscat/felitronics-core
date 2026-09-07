@@ -152,8 +152,8 @@ int main()
 
                 Sat sa, sb;
                 test::ok (prep (sa, p, 48000.0, 512, 1, os) && prep (sb, p, 48000.0, 512, 1, os), "prepare");
-                sa.process (a.data(), 1, N);
-                sb.process (b.data(), 1, N);
+                felitronics::test::run (sa.process (a.data(), 1, N));
+                felitronics::test::run (sb.process (b.data(), 1, N));
 
                 int bad = 0;
                 for (int n = 0; n < N; ++n)
@@ -178,7 +178,7 @@ int main()
             Sat s;
             test::ok (prep (s, p, 48000.0, 512, 1, os), "prepare");
             const int skip = s.latencySamples() + 256;   // settle: FIR group delay + full kernel span
-            s.process (r.data(), 1, N);
+            felitronics::test::run (s.process (r.data(), 1, N));
 
             float maxDip = 0.0f;
             for (int n = skip + 1; n < N; ++n)
@@ -219,8 +219,8 @@ int main()
 
         Sat sp, st;
         test::ok (prep (sp, p, 48000.0, 512, CH) && prep (st, p, 48000.0, 512, CH), "prepare");
-        sp.process (poisoned.data(), CH, N);
-        st.process (twin.data(), CH, N);
+        felitronics::test::run (sp.process (poisoned.data(), CH, N));
+        felitronics::test::run (st.process (twin.data(), CH, N));
 
         int bad = 0, nonFinite = 0;
         for (int c = 0; c < CH; ++c)
@@ -249,8 +249,8 @@ int main()
         Sat sc, sp;
         test::ok (prep (sc, p) && prep (sp, p), "prepare");
         const int H = 4 * sc.latencySamples() + 128;   // >= up-FIR + down-FIR + dry-delay memory, generous
-        sc.process (clean.data(), 1, N);
-        sp.process (pois.data(), 1, N);
+        felitronics::test::run (sc.process (clean.data(), 1, N));
+        felitronics::test::run (sp.process (pois.data(), 1, N));
 
         int preDiff = 0, tailDiff = 0, nonFinite = 0;
         for (int n = 0; n < N; ++n)
@@ -283,9 +283,9 @@ int main()
 
         Sat sc, sp, sn;
         test::ok (prep (sc, p) && prep (sp, p) && prep (sn, p), "prepare");
-        sc.process (clean.data(), 1, N);
-        sp.process (pois.data(), 1, N);
-        sn.process (ctrl.data(), 1, N);
+        felitronics::test::run (sc.process (clean.data(), 1, N));
+        felitronics::test::run (sp.process (pois.data(), 1, N));
+        felitronics::test::run (sn.process (ctrl.data(), 1, N));
 
         int nonFinite = 0;
         for (int n = 0; n < N; ++n) if (! std::isfinite (pois.ch[0][(size_t) n])) ++nonFinite;
@@ -393,7 +393,7 @@ int main()
 
             Planar b (1, N);
             for (int n = 0; n < charge; ++n) b.ch[0][(size_t) n] = 0.8f;   // a DC step charges the blocker
-            s.process (b.data(), 1, N);
+            felitronics::test::run (s.process (b.data(), 1, N));
 
             const auto tailPeak = [&] (int c)
             {
@@ -442,7 +442,7 @@ int main()
             test::ok (prep (s, p, 48000.0, 512, 1, 1), "prepare (os=1)");
             Planar b (1, N);
             for (int n = 0; n < N; ++n) b.ch[0][(size_t) n] = dc;
-            s.process (b.data(), 1, N);
+            felitronics::test::run (s.process (b.data(), 1, N));
 
             float resid = 0.0f;
             for (int n = N - look; n < N; ++n) resid = std::max (resid, std::fabs (b.ch[0][(size_t) n]));
@@ -480,7 +480,7 @@ int main()
             Sat sr, ss;
             if (! prep (sr, p, 48000.0, maxBlock, ch, os) || ! prep (ss, p, 48000.0, maxBlock, ch, os)) { ++prepFails; continue; }
 
-            sr.process (ref.data(), ch, N);   // one call; N > maxBlock exercises the internal chunker
+            felitronics::test::run (sr.process (ref.data(), ch, N));   // one call; N > maxBlock exercises the internal chunker
 
             int pos = 0;
             float* sub[core::kMaxChannels] {};
@@ -489,12 +489,12 @@ int main()
                 if (rng() % 10u == 0u)                       // zero-length call: a no-op by theory
                 {
                     for (int c = 0; c < ch; ++c) sub[c] = split.ch[(size_t) c].data() + pos;
-                    ss.process (sub, ch, 0);
+                    felitronics::test::run (ss.process (sub, ch, 0));
                 }
                 int m = 1 + (int) (rng() % (unsigned) (2 * maxBlock + 41));
                 if (m > N - pos) m = N - pos;
                 for (int c = 0; c < ch; ++c) sub[c] = split.ch[(size_t) c].data() + pos;
-                ss.process (sub, ch, m);
+                felitronics::test::run (ss.process (sub, ch, m));
                 pos += m;
             }
 
@@ -531,8 +531,8 @@ int main()
 
         Sat si, st;
         test::ok (prep (si, p) && prep (st, p), "prepare");
-        si.process (in.data(), 1, N);
-        st.process (twin.data(), 1, N);
+        felitronics::test::run (si.process (in.data(), 1, N));
+        felitronics::test::run (st.process (twin.data(), 1, N));
 
         int bad = 0, nonFinite = 0;
         for (int n = 0; n < N; ++n)
@@ -570,8 +570,8 @@ int main()
 
                 Sat sa, sb;
                 test::ok (prep (sa, pp) && prep (sb, pt), "prepare");
-                sa.process (a.data(), 1, N);
-                sb.process (b.data(), 1, N);
+                felitronics::test::run (sa.process (a.data(), 1, N));
+                felitronics::test::run (sb.process (b.data(), 1, N));
 
                 int bad = 0;
                 for (int n = 0; n < N; ++n)
@@ -613,7 +613,7 @@ int main()
 
         Sat s;
         test::ok (prep (s, p, 48000.0, 512, CH), "prepare");
-        s.process (buf.data(), CH, N);
+        felitronics::test::run (s.process (buf.data(), CH, N));
 
         int nonFinite = 0;
         for (int c = 0; c < CH; ++c)

@@ -68,7 +68,7 @@ int main()
         limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });   // topology is a prepare-time thing now
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0; p.releaseMs = 50.0;
         lim.setParams (p);
-        lim.process (ch, 1, n);
+        felitronics::test::run (lim.process (ch, 1, n));
 
         const double outTp = measureTruePeakDb (y);
         test::ok (outTp <= -1.0 + 0.5, "output true-peak ≤ ceiling (+0.5 dB downsample-ripple margin)");
@@ -85,7 +85,7 @@ int main()
         limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0;
         lim.setParams (p);
-        lim.process (ch, 1, n);
+        felitronics::test::run (lim.process (ch, 1, n));
         test::approx (rmsTail (y, 0.3) / rmsTail (x, 0.3), 1.0, 0.05, "amplitude preserved (transparent)");
         test::ok (lim.gainReductionDb() > -0.3, "no meaningful gain reduction below ceiling");
     }
@@ -108,8 +108,8 @@ int main()
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0;
         lim.setParams (p);
         const long before = g_allocs.load();
-        lim.process (ch, 2, n);
-        lim.process (ch, 2, n);
+        felitronics::test::run (lim.process (ch, 2, n));
+        felitronics::test::run (lim.process (ch, 2, n));
         const long after = g_allocs.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
@@ -119,13 +119,13 @@ int main()
     {
         limiter::TruePeakLimiter lim;                                // NOT prepared (maxCh == 0)
         float a[64] {}, b[64] {}; float* io[2] { a, b };
-        lim.process (io, 2, 16);                                     // maxCh==0 → no-op
+        test::ok (! lim.process (io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         test::ok (! lim.prepare (48000.0, 16, 2, { 1.0, 4, 2 }),      // tapsPerPhase=2 < 4 → rejected
                   "prepare() REPORTS an unusable configuration instead of half-building");
-        lim.process (io, 2, 16);                                     // must no-op, not run an unprepared oversampler
+        test::ok (! lim.process (io, 2, 16), "...and after a FAILED prepare too, still reported");
         test::ok (lim.prepare (48000.0, 16, 2, { 1.0, 4, 32 }), "and accepts a valid one");
-        lim.process (io, 2, 16);                                     // works
-        lim.process (io, 2, 64);                                     // 64 > maxBlock 16 → CHUNKED now, not dropped
+        felitronics::test::run (lim.process (io, 2, 16));                                     // works
+        felitronics::test::run (lim.process (io, 2, 64));                                     // 64 > maxBlock 16 → CHUNKED now, not dropped
         test::ok (true, "no OOB across failed-prepare / oversized-block process (ASan/UBSan is the check)");
     }
 
@@ -175,7 +175,7 @@ int main()
         limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = 20.0 * std::log10 (0.25); p.releaseMs = 0.5;
         lim.setParams (p);
-        lim.process (ch, 1, n);
+        felitronics::test::run (lim.process (ch, 1, n));
         double mx = 0.0; for (float v : y) mx = std::max (mx, (double) std::fabs (v));
         test::ok (mx <= 0.25 * 1.03, "every output sample ≤ ceiling on the smooth ramp (got max " + std::to_string (mx) + ")");
     }
@@ -191,7 +191,7 @@ int main()
         limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 1, { 1.0, 4, 32 });
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = -6.0; p.releaseMs = 1.0;
         lim.setParams (p);
-        lim.process (ch, 1, n);
+        felitronics::test::run (lim.process (ch, 1, n));
         auto rmsWin = [] (const std::vector<float>& v, int a, int b) {
             double s2 = 0.0; for (int i = a; i < b; ++i) s2 += (double) v[i] * v[i]; return std::sqrt (s2 / std::max (1, b - a)); };
         const double got  = rmsWin (y, (int) (0.010 * sr), (int) (0.020 * sr));   // 10–20 ms: burst long gone at 1 ms lookahead
@@ -211,7 +211,7 @@ int main()
         p.ceilingDbTp = std::numeric_limits<double>::quiet_NaN();
         p.releaseMs   = std::numeric_limits<double>::quiet_NaN();
         lim.setParams (p);
-        lim.process (ch, 1, n);
+        felitronics::test::run (lim.process (ch, 1, n));
         bool finite = true; for (float v : y) finite &= (bool) std::isfinite (v);
         test::ok (finite, "NaN ceiling/release → finite output");
         test::ok (lim.latencySamples() >= 0, "latency stays non-negative");
@@ -261,7 +261,7 @@ int main()
         std::vector<float> x ((std::size_t) 200000, 0.9f);
         float* io[1] { x.data() };
         limiter::TruePeakLimiterParams pr; pr.ceilingDbTp = -6.0; lim.setParams (pr);
-        lim.process (io, 1, (int) x.size());
+        felitronics::test::run (lim.process (io, 1, (int) x.size()));
         double peak = 0.0;
         bool finite = true;
         for (float v : x) { finite &= (bool) std::isfinite (v); peak = std::max (peak, (double) std::fabs (v)); }

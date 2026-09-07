@@ -92,7 +92,7 @@ static void runStereo (MC& mc, const std::vector<float>& xL, const std::vector<f
                        std::vector<float>& oL, std::vector<float>& oR, int block = 512)
 {
     oL = xL; oR = xR;
-    for (int o = 0; o < N; o += block) { float* io[2] { oL.data() + o, oR.data() + o }; mc.process (io, io, 2, std::min (block, N - o)); }
+    for (int o = 0; o < N; o += block) { float* io[2] { oL.data() + o, oR.data() + o }; felitronics::test::run (mc.process (io, io, 2, std::min (block, N - o))); }
 }
 
 static double maxDiff (const std::vector<float>& a, const std::vector<float>& b)
@@ -178,7 +178,7 @@ int main()
         McS s; McP p; s.prepare (P, irMax, xfade, 1); p.prepare (P, irMax, xfade, 1);
         s.setIr (irM.data(), len); p.setIr (irM.data(), len);
         std::vector<float> ys = xL, yp = xL;
-        for (int o = 0; o < N; o += 512) { float* a[1] { ys.data() + o }; float* b[1] { yp.data() + o }; s.process (a, a, 1, std::min (512, N - o)); p.process (b, b, 1, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* a[1] { ys.data() + o }; float* b[1] { yp.data() + o }; felitronics::test::run (s.process (a, a, 1, std::min (512, N - o))); felitronics::test::run (p.process (b, b, 1, std::min (512, N - o))); }
         const double e = maxDiff (ys, yp), pk = peak (ys);
         std::printf ("      mono err=%.2e (peak %.2e)\n", e, pk);
         test::ok (e < 1e-4 * pk + 1e-6, "mono: pffft nulls scalar");   // same gate as the stereo topologies
@@ -204,7 +204,7 @@ int main()
             s.setIr (h.data(), nuLen); pf.setIr (h.data(), nuLen);
             std::vector<float> ys (nuN, 0.0f), yp (nuN, 0.0f);
             for (int o = 0; o < nuN; o += block)
-            { const int m = std::min (block, nuN - o); s.process (&xin[(std::size_t) o], &ys[(std::size_t) o], m); pf.process (&xin[(std::size_t) o], &yp[(std::size_t) o], m); }
+            { const int m = std::min (block, nuN - o); felitronics::test::run (s.process (&xin[(std::size_t) o], &ys[(std::size_t) o], m)); felitronics::test::run (pf.process (&xin[(std::size_t) o], &yp[(std::size_t) o], m)); }
             const double e = maxDiff (ys, yp), pk = peak (ys);
             std::printf ("      NUPC capped block=%3d  err=%.2e (peak %.2e, rel %.2e)\n", block, e, pk, e / (pk + 1e-30));
             test::ok (e < 1e-4 * pk + 1e-6, "NUPC pffft nulls scalar (capped, block=" + std::to_string (block) + ")");
@@ -228,7 +228,7 @@ int main()
         { McnS s; McnP p; s.prepare (128, nuMax, 128, 1); p.prepare (128, nuMax, 128, 1);
           s.setIr (hL.data(), nuLen); p.setIr (hL.data(), nuLen);
           std::vector<float> ys = xL, yp = xL;
-          for (int o = 0; o < nuN; o += 512) { const int m = std::min (512, nuN - o); const float* a[1] { ys.data() + o }; const float* b[1] { yp.data() + o }; float* ao[1] { ys.data() + o }; float* bo[1] { yp.data() + o }; s.process (a, ao, 1, m); p.process (b, bo, 1, m); }
+          for (int o = 0; o < nuN; o += 512) { const int m = std::min (512, nuN - o); const float* a[1] { ys.data() + o }; const float* b[1] { yp.data() + o }; float* ao[1] { ys.data() + o }; float* bo[1] { yp.data() + o }; felitronics::test::run (s.process (a, ao, 1, m)); felitronics::test::run (p.process (b, bo, 1, m)); }
           const double e = maxDiff (ys, yp), pk = peak (ys);
           std::printf ("      MatrixConvolverNupc mono err=%.2e (peak %.2e, rel %.2e)\n", e, pk, e / (pk + 1e-30));
           test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc mono: pffft nulls scalar"); }
@@ -241,7 +241,7 @@ int main()
           for (int o = 0; o < nuN; o += 257) { const int m = std::min (257, nuN - o);
             const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
             const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
-            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+            felitronics::test::run (s.process (a, ao, 2, m)); felitronics::test::run (p.process (b, bo, 2, m)); }
           const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
           std::printf ("      MatrixConvolverNupc LRDiag@257 err=%.2e (peak %.2e, rel %.2e)\n", e, pk, e / (pk + 1e-30));
           test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc LRDiag: pffft nulls scalar"); }
@@ -255,7 +255,7 @@ int main()
           for (int o = 0; o < nuN; o += 512) { const int m = std::min (512, nuN - o);
             const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
             const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
-            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+            felitronics::test::run (s.process (a, ao, 2, m)); felitronics::test::run (p.process (b, bo, 2, m)); }
           const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
           std::printf ("      MatrixConvolverNupc MSDiag err=%.2e (rel %.2e)\n", e, e / (pk + 1e-30));
           test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc MSDiag: pffft nulls scalar"); }
@@ -269,7 +269,7 @@ int main()
           for (int o = 0; o < nuN; o += 257) { const int m = std::min (257, nuN - o);
             const float* a[2] { sL.data() + o, sR.data() + o }; float* ao[2] { sL.data() + o, sR.data() + o };
             const float* b[2] { pL.data() + o, pR.data() + o }; float* bo[2] { pL.data() + o, pR.data() + o };
-            s.process (a, ao, 2, m); p.process (b, bo, 2, m); }
+            felitronics::test::run (s.process (a, ao, 2, m)); felitronics::test::run (p.process (b, bo, 2, m)); }
           const double e = std::max (maxDiff (sL, pL), maxDiff (sR, pR)), pk = std::max (peak (sL), peak (sR));
           std::printf ("      MatrixConvolverNupc Full@257 err=%.2e (rel %.2e)\n", e, e / (pk + 1e-30));
           test::ok (e < 1e-4 * pk + 1e-6, "MatrixConvolverNupc Full: pffft nulls scalar"); }
@@ -288,7 +288,7 @@ int main()
             { const float* b[4] { irLL.data(), irLR.data(), irRL.data(), irRR.data() };
               s.setOperator (McS::Topology::Full, b, 4, len); p.setOperator (McP::Topology::Full, b, 4, len); sw = true; }
             float* a[2] { sL.data() + o, sR.data() + o }; float* b[2] { pL.data() + o, pR.data() + o };
-            const int m = std::min (256, N - o); s.process (a, a, 2, m); p.process (b, b, 2, m);
+            const int m = std::min (256, N - o); felitronics::test::run (s.process (a, a, 2, m)); felitronics::test::run (p.process (b, b, 2, m));
         }
         report2 ("swap MSDiag>Full", sL, sR, pL, pR);
     }
@@ -344,10 +344,10 @@ int main()
         McP p; p.prepare (P, irMax, xfade, 2);
         { const float* b[2] { irM.data(), irS.data() }; p.setOperator (McP::Topology::MSDiag, b, 2, len); }
         std::vector<float> l (512, 0.2f), rr (512, -0.1f); float* io[2] { l.data(), rr.data() };
-        p.process (io, io, 2, 512);
+        felitronics::test::run (p.process (io, io, 2, 512));
         const long before = g_allocs.load();
-        p.process (io, io, 2, 512);
-        p.process (io, io, 2, 512);
+        felitronics::test::run (p.process (io, io, 2, 512));
+        felitronics::test::run (p.process (io, io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "pffft process() performed zero heap allocations");
     }
 

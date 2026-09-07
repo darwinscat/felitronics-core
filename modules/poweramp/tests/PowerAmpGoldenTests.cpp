@@ -37,6 +37,7 @@
 //   X6 DC offset shifts the PP operating point ⇒ even harmonics appear (documented physics)
 //   B1-B9 sag / presence / depth / virtual load / output transformer / dynamic bias
 
+#include <felitronics_test.h>   // felitronics::test::run — law 11 verdicts
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>
@@ -119,7 +120,9 @@ public:
         p.sag = t.sag; p.presence = t.presence; p.depth = t.depth; p.load = t.load; p.iron = t.iron; p.bias = t.bias;
         d.setParams (p, kTubeVoicings[(std::size_t) std::clamp (t.tubeType, 0, 3)]);
     }
-    void process (float* const* io, int numChannels, int numSamples) noexcept { d.process (io, numChannels, numSamples); }
+    // Returns the stage's law-11 verdict rather than swallowing it: X8 below drives this seam on an
+    // UNPREPARED stage on purpose and now asserts the refusal, instead of only asserting the silence.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept { return d.process (io, numChannels, numSamples); }
     int  latencySamples() const noexcept { return d.latencySamples(); }
 
 private:
@@ -189,7 +192,7 @@ std::vector<float> runStage (const TubeParams& tp, std::vector<float> buf, int o
         n = std::min (n, total - pos);
         d.setParams (tp);
         float* io[1] { buf.data() + pos };
-        d.process (io, 1, n);
+        felitronics::test::run (d.process (io, 1, n));
         pos += n; ++bi;
     }
     return buf;
@@ -416,7 +419,7 @@ int main()
             TubePowerAmp d; d.prepare (sr, kMaxBlk, 4);
             ok = ok && (d.latencySamples() == kLat);
             std::vector<float> v (4096); { unsigned long long s = 7; for (auto& x : v) { s = s * 6364136223846793005ULL + 1ULL; x = 0.5f * ((float) ((s >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f); } }
-            for (int pos = 0; pos < 4096; pos += 512) { d.setParams (P (24.0f, true, 2)); float* io[1] { v.data() + pos }; d.process (io, 1, 512); }
+            for (int pos = 0; pos < 4096; pos += 512) { d.setParams (P (24.0f, true, 2)); float* io[1] { v.data() + pos }; felitronics::test::run (d.process (io, 1, 512)); }
             ok = ok && allFinite (v) && maxAbs (v, 0, 4096) < 4.0;
         }
         check (ok, "S9 sample-rate independence: latency 31 + finite + bounded at 44.1/88.2/96/192 kHz");
@@ -485,18 +488,18 @@ int main()
     // X2: a NaN/Inf burst must not POISON the stream — output recovers to finite on later valid blocks.
     {
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4); d.setParams (P (18.0f, false));
-        std::vector<float> bad (256, std::numeric_limits<float>::quiet_NaN()); { float* io[1] { bad.data() }; d.process (io, 1, 256); }
-        std::vector<float> inf (256, std::numeric_limits<float>::infinity()); { float* io[1] { inf.data() }; d.process (io, 1, 256); }
+        std::vector<float> bad (256, std::numeric_limits<float>::quiet_NaN()); { float* io[1] { bad.data() }; felitronics::test::run (d.process (io, 1, 256)); }
+        std::vector<float> inf (256, std::numeric_limits<float>::infinity()); { float* io[1] { inf.data() }; felitronics::test::run (d.process (io, 1, 256)); }
         bool recovered = true; double tailRms = 0;
-        for (int blk = 0; blk < 40; ++blk) { auto s = sine (0, 256, 0, 8, 0.3); d.setParams (P (18.0f, false)); float* io[1] { s.data() }; d.process (io, 1, 256); if (blk >= 30) { recovered = recovered && allFinite (s); tailRms += rms (s, 0, 256); } }
+        for (int blk = 0; blk < 40; ++blk) { auto s = sine (0, 256, 0, 8, 0.3); d.setParams (P (18.0f, false)); float* io[1] { s.data() }; felitronics::test::run (d.process (io, 1, 256)); if (blk >= 30) { recovered = recovered && allFinite (s); tailRms += rms (s, 0, 256); } }
         std::printf ("       X2 post-NaN recovered RMS (last 10 blocks) = %.4f\n", tailRms / 10);
         check (recovered && tailRms / 10 > 1e-3, "X2 stream recovers to finite, non-zero output after a NaN/Inf burst");
     }
     // X3: long silence then a tiny impulse — denormal underflow must not stall recovery.
     {
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4); d.setParams (P (18.0f, false));
-        for (int blk = 0; blk < 400; ++blk) { std::vector<float> z (256, 0.0f); float* io[1] { z.data() }; d.process (io, 1, 256); }
-        std::vector<float> imp (256, 0.0f); imp[10] = 1e-3f; float* io[1] { imp.data() }; d.process (io, 1, 256);
+        for (int blk = 0; blk < 400; ++blk) { std::vector<float> z (256, 0.0f); float* io[1] { z.data() }; felitronics::test::run (d.process (io, 1, 256)); }
+        std::vector<float> imp (256, 0.0f); imp[10] = 1e-3f; float* io[1] { imp.data() }; felitronics::test::run (d.process (io, 1, 256));
         check (allFinite (imp) && maxAbs (imp, 0, 256) > 1e-6, "X3 recovers a tiny impulse after long silence (no denormal stall)");
     }
     // X4: stereo isolation (silent R stays silent) + L==R symmetry for identical input.
@@ -504,10 +507,10 @@ int main()
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4); d.setParams (P (24.0f, true, 2));
         auto sig = sine (0, 4096, 0, 100, 0.5);
         std::vector<float> L = sig, R (4096, 0.0f);
-        float* io[2] { L.data(), R.data() }; d.process (io, 2, 4096);
+        float* io[2] { L.data(), R.data() }; felitronics::test::run (d.process (io, 2, 4096));
         check (maxAbs (R, 0, 4096) < 1e-9, "X4 stereo isolation: silent R channel stays silent (< -180 dB)");
         TubePowerAmp d2; d2.prepare (kSr, kMaxBlk, 4); d2.setParams (P (24.0f, true, 2));
-        std::vector<float> L2 = sig, R2 = sig; float* io2[2] { L2.data(), R2.data() }; d2.process (io2, 2, 4096);
+        std::vector<float> L2 = sig, R2 = sig; float* io2[2] { L2.data(), R2.data() }; felitronics::test::run (d2.process (io2, 2, 4096));
         double sym = 0; for (int i = 0; i < 4096; ++i) sym = std::max (sym, (double) std::fabs (L2[(std::size_t) i] - R2[(std::size_t) i]));
         check (sym < 1e-7, "X4 stereo symmetry: identical L/R inputs give identical outputs");
     }
@@ -518,9 +521,9 @@ int main()
             TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
             std::vector<float> tone = sine (0, 8192, 0, 171, 0.3);    // ~1 kHz over 8192 @48k
             // steady on `a`
-            for (int pos = 0; pos < 4096; pos += 256) { d.setParams (a); float* io[1] { tone.data() + pos }; d.process (io, 1, 256); }
+            for (int pos = 0; pos < 4096; pos += 256) { d.setParams (a); float* io[1] { tone.data() + pos }; felitronics::test::run (d.process (io, 1, 256)); }
             // switch to `b`
-            for (int pos = 4096; pos < 8192; pos += 256) { d.setParams (b); float* io[1] { tone.data() + pos }; d.process (io, 1, 256); }
+            for (int pos = 4096; pos < 8192; pos += 256) { d.setParams (b); float* io[1] { tone.data() + pos }; felitronics::test::run (d.process (io, 1, 256)); }
             double steady = 0; for (int i = 200; i < 3900; ++i) steady = std::max (steady, (double) std::fabs (tone[(std::size_t) (i + 1)] - tone[(std::size_t) i]));
             double atSwitch = 0; for (int i = 4060; i < 4200; ++i) atSwitch = std::max (atSwitch, (double) std::fabs (tone[(std::size_t) (i + 1)] - tone[(std::size_t) i]));
             return atSwitch / std::max (1e-9, steady);
@@ -560,16 +563,18 @@ int main()
         d.setParams (P (24.0f, false));                   // must not crash
         (void) d.latencySamples();                        // must not crash
         std::vector<float> in (777, 0.3f), copy = in;
-        float* io[1] { in.data() }; d.process (io, 1, 777);   // must return immediately (no hang / no div0)
+        float* io[1] { in.data() };
+        const bool refused = ! d.process (io, 1, 777);        // must return immediately (no hang / no div0)
+        check (refused, "X8 lifecycle: process before prepare is REFUSED, and says so (law 11)");
         bool unchanged = true; for (std::size_t i = 0; i < in.size(); ++i) unchanged = unchanged && (in[i] == copy[i]);
         check (unchanged && allFinite (in), "X8 lifecycle: process before prepare is a clean no-op (no hang / div-by-zero)");
     }
     // X9: div-by-zero provocation — maxBlock=1 (n=1 ramps), n>maxBlock (chunking), pure silence (0/0).
     {
         bool ok = true;
-        { TubePowerAmp d; d.prepare (kSr, 1, 4); d.setParams (P (24.0f, false)); for (int k = 0; k < 64; ++k) { float s = std::sin (0.3f * (float) k); float* io[1] { &s }; d.process (io, 1, 1); ok = ok && std::isfinite (s); } }
-        { TubePowerAmp d; d.prepare (kSr, 256, 4); d.setParams (P (24.0f, false)); std::vector<float> v (1000, 0.2f); float* io[1] { v.data() }; d.process (io, 1, 1000); ok = ok && allFinite (v); }
-        { TubePowerAmp d; d.prepare (kSr, 512, 4); d.setParams (P (0.0f, false)); std::vector<float> z (4096, 0.0f); float* io[1] { z.data() }; d.process (io, 1, 4096); ok = ok && allFinite (z); }
+        { TubePowerAmp d; d.prepare (kSr, 1, 4); d.setParams (P (24.0f, false)); for (int k = 0; k < 64; ++k) { float s = std::sin (0.3f * (float) k); float* io[1] { &s }; felitronics::test::run (d.process (io, 1, 1)); ok = ok && std::isfinite (s); } }
+        { TubePowerAmp d; d.prepare (kSr, 256, 4); d.setParams (P (24.0f, false)); std::vector<float> v (1000, 0.2f); float* io[1] { v.data() }; felitronics::test::run (d.process (io, 1, 1000)); ok = ok && allFinite (v); }
+        { TubePowerAmp d; d.prepare (kSr, 512, 4); d.setParams (P (0.0f, false)); std::vector<float> z (4096, 0.0f); float* io[1] { z.data() }; felitronics::test::run (d.process (io, 1, 4096)); ok = ok && allFinite (z); }
         check (ok, "X9 edge block sizes (maxBlock=1, n>maxBlock chunking, silence) ⇒ finite (guards hold)");
     }
     // X10: determinism across two FRESH instances (catches uninitialised state / platform nondeterminism).
@@ -585,9 +590,9 @@ int main()
     {
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
         std::vector<float> buf (kMaxBlk, 0.2f); float* io[1] { buf.data() };
-        for (int w = 0; w < 8; ++w) { d.setParams (P (24.0f, false, 1)); d.process (io, 1, kMaxBlk); }   // warm up (not counted)
+        for (int w = 0; w < 8; ++w) { d.setParams (P (24.0f, false, 1)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }   // warm up (not counted)
         const long before = g_allocs.load (std::memory_order_relaxed);
-        for (int k = 0; k < 64; ++k) { d.setParams (P (24.0f, (k & 1) != 0, k & 3)); d.process (io, 1, kMaxBlk); }   // vary params + topology too
+        for (int k = 0; k < 64; ++k) { d.setParams (P (24.0f, (k & 1) != 0, k & 3)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }   // vary params + topology too
         const long allocs = g_allocs.load (std::memory_order_relaxed) - before;
         std::printf ("       X11 heap allocations across 64 process()+setParams calls = %ld\n", allocs);
         check (allocs == 0, "X11 process()/setParams perform ZERO heap allocations (the RT rule, asserted)");
@@ -598,9 +603,9 @@ int main()
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
         TubeParams bad; bad.driveDb = std::numeric_limits<float>::quiet_NaN(); bad.outputDb = std::numeric_limits<float>::infinity(); bad.autoComp = std::numeric_limits<float>::quiet_NaN();
         std::vector<float> in = sine (0, 4096, 0, 171, 0.3);
-        d.setParams (bad); { float* io[1] { in.data() }; d.process (io, 1, 4096); }
+        d.setParams (bad); { float* io[1] { in.data() }; felitronics::test::run (d.process (io, 1, 4096)); }
         std::vector<float> in2 = sine (0, 4096, 0, 171, 0.3);
-        d.setParams (P (18.0f, false)); { float* io[1] { in2.data() }; d.process (io, 1, 4096); }   // recover with valid params
+        d.setParams (P (18.0f, false)); { float* io[1] { in2.data() }; felitronics::test::run (d.process (io, 1, 4096)); }   // recover with valid params
         check (allFinite (in) && allFinite (in2) && rms (in2, 512, 3000) > 1e-3,
                "X12 non-finite params (NaN driveDb / Inf outputDb / NaN autoComp) ⇒ finite output, no poison");
     }
@@ -650,9 +655,9 @@ int main()
     {
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
         std::vector<float> buf (kMaxBlk, 0.5f); float* io[1] { buf.data() };
-        for (int w = 0; w < 16; ++w) { d.setParams (Pf (24.0f, false, 2, 1.0f, 1.0f, 1.0f)); d.process (io, 1, kMaxBlk); }
+        for (int w = 0; w < 16; ++w) { d.setParams (Pf (24.0f, false, 2, 1.0f, 1.0f, 1.0f)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }
         const long before = g_allocs.load (std::memory_order_relaxed);
-        for (int k = 0; k < 64; ++k) { d.setParams (Pf (24.0f, (k & 1) != 0, k & 3, 1.0f, 0.7f, 0.7f)); d.process (io, 1, kMaxBlk); }
+        for (int k = 0; k < 64; ++k) { d.setParams (Pf (24.0f, (k & 1) != 0, k & 3, 1.0f, 0.7f, 0.7f)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }
         check (g_allocs.load (std::memory_order_relaxed) - before == 0, "B4 feel ON: process()/setParams ZERO allocations (RT rule)");
         check (d.latencySamples() == kLat, "B4 feel ON: latency still 31");
         std::vector<float> src ((std::size_t) 4096, 0.0f); { unsigned long long s = 3; for (auto& x : src) { s = s * 6364136223846793005ULL + 1ULL; x = 0.6f * ((float) ((s >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f); } }
@@ -688,12 +693,12 @@ int main()
             TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
             d.setParams (Pf (36.0f, true, 2, 1.0f, 0.0f, 0.0f));   // hot EL84, sag fully on
             std::vector<float> buf ((std::size_t) kMaxBlk); float* io[1] { buf.data() };
-            if (burst) { std::fill (buf.begin(), buf.end(), 1.0e38f); d.process (io, 1, kMaxBlk); }   // overflow
+            if (burst) { std::fill (buf.begin(), buf.end(), 1.0e38f); felitronics::test::run (d.process (io, 1, kMaxBlk)); }   // overflow
             double e = 0; const int NB = 60;
             for (int b = 0; b < NB; ++b)
             {
                 for (int i = 0; i < kMaxBlk; ++i) buf[(std::size_t) i] = 0.3f * (float) std::sin (tp * 220.0 * (b * kMaxBlk + i) / kSr);
-                d.process (io, 1, kMaxBlk);
+                felitronics::test::run (d.process (io, 1, kMaxBlk));
                 if (b >= NB - 10) for (int i = 0; i < kMaxBlk; ++i) e += (double) buf[i] * buf[i];
             }
             return std::sqrt (e / (10.0 * kMaxBlk));
@@ -785,7 +790,10 @@ int main()
         check (fullDet <= baseDet * 1.5 + 1e-4, "B9 load+iron+bias don't regress feel-layer block-size determinism");
     }
 
-    std::printf ("%d checks, %d failures\n", g_checks, g_fail);
-    std::printf (g_fail ? "GOLDEN FAILED\n" : "GOLDEN PASSED\n");
-    return g_fail ? 1 : 0;
+    // See the note in PowerAmpTheoryTests: the shared harness's failures (a REFUSED process() call)
+    // must reach this runner's exit code, or test::run() is decoration.
+    const int sharedFailures = felitronics::test::stats().failures;
+    std::printf ("%d checks, %d failures (+%d from the shared harness)\n", g_checks, g_fail, sharedFailures);
+    std::printf ((g_fail || sharedFailures) ? "GOLDEN FAILED\n" : "GOLDEN PASSED\n");
+    return (g_fail || sharedFailures) ? 1 : 0;
 }

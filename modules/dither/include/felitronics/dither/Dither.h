@@ -56,13 +56,19 @@ struct DitherParams
 class Dither
 {
 public:
-    void prepare (double sampleRate, int /*maxBlock*/, int maxChannels) noexcept
+    [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/, int maxChannels) noexcept
     {
+        prepared_ = false;                                     // any early return below leaves it unprepared
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
-        channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        channels_ = maxChannels;
         apply (params_);
         reset();
+        prepared_ = true;
+        return true;
     }
+
+    bool isPrepared() const noexcept { return prepared_; }
 
     void reset() noexcept
     {
@@ -86,11 +92,21 @@ public:
 
     static constexpr int latencySamples() noexcept { return 0; }
 
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2). The width used to be bounded by core::kMaxChannels rather than by
+    // what prepare() was given, so `channels_` was recorded and then never consulted — the object's own
+    // declared width was a fiction. It is a LIMIT now, like everywhere else. The PCG state does exist for
+    // every channel, which is why this one had no audible defect to measure; the contract still has to be
+    // the same one, or "prepared for 2" means something different here than in the stage next door.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        if (bits_ >= 32 || numChannels <= 0) return;      // float export → bypass
-        const int nc = std::min (numChannels, core::kMaxChannels);   // state exists for every channel → never silently skip
-        if (n <= 0) return;
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;                    // before prepare() the PCG streams are seedless:
+                                                          // state=inc=0 makes every draw -0.5, so "TPDF" is a
+                                                          // constant -1 LSB, a DC offset rather than dither
+        if (numChannels > channels_) return false;        // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                          // no samples: no time, no edge
+        if (bits_ >= 32) return true;                     // float export → bypass (an ACCEPTED call)
+        const int nc = numChannels;
 
         // A channel that stops being dithered freezes its shaper error history and its auto-blank counter,
         // and resumes both when it comes back: measured 3.58e-07 out of DIGITAL SILENCE on the returning
@@ -112,8 +128,10 @@ public:
         // others record what a cell REMEMBERS, this one records how long a channel has been silent, and
         // that goes on being true while nobody calls. Doing it on the edge alone credits a single block
         // and the returning channel still dithers into silence for the rest of the window.
-        for (int c = nc; c < core::kMaxChannels; ++c)
-            if (ch_[c].blank < blankSamples_) ch_[c].blank = std::min (blankSamples_, ch_[c].blank + n);
+        for (int c = nc; c < core::kMaxChannels; ++c)                     // `blank + n` in int overflows at
+            if (ch_[c].blank < blankSamples_)                              // a call length near INT_MAX, and
+                ch_[c].blank = (int) std::min<long long> (blankSamples_,   // law 11 promises ANY length
+                                                          (long long) ch_[c].blank + (long long) n);
         for (int c = 0; c < nc; ++c)
         {
             Channel& st = ch_[c];
@@ -158,6 +176,7 @@ public:
                 x[i] = (float) y;
             }
         }
+        return true;
     }
 
 private:
@@ -230,6 +249,7 @@ private:
 
     double fs_ = 48000.0;
     int channels_ = 2;
+    bool prepared_ = false;                                // true only after a prepare() that succeeded
     DitherParams params_;
 
     int bits_ = 24, order_ = 2;

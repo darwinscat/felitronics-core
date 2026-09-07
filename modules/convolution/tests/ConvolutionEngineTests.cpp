@@ -93,9 +93,9 @@ int main()
 
         std::vector<float> y (n, 0.0f);
         eng.setIr (irA.data(), irLen);                 // first load (fades in from silence)
-        eng.process (x.data(), y.data(), 1400);        // settle on IR A
+        felitronics::test::run (eng.process (x.data(), y.data(), 1400));        // settle on IR A
         const bool swapOk = eng.setIr (irB.data(), irLen);
-        eng.process (x.data() + 1400, y.data() + 1400, n - 1400);   // crossfade A→B + settle
+        felitronics::test::run (eng.process (x.data() + 1400, y.data() + 1400, n - 1400));   // crossfade A→B + settle
         test::ok (swapOk, "swap accepted while idle");
 
         // continuity: the derivative across the swap must not spike vs the steady region (no click).
@@ -105,7 +105,7 @@ int main()
 
         // convergence: well after the swap, output == a fresh IR-B convolver fed the same input.
         convolution::PartitionedConvolver<> ref; ref.prepare (P, irMax); ref.setIr (irB.data(), irLen);
-        std::vector<float> yref (n, 0.0f); ref.process (x.data(), yref.data(), n);
+        std::vector<float> yref (n, 0.0f); felitronics::test::run (ref.process (x.data(), yref.data(), n));
         double maxErr = 0.0; for (int i = 2200; i < n; ++i) maxErr = std::max (maxErr, (double) std::fabs (y[i] - yref[i]));
         test::ok (maxErr < 3e-3, "converges to the new IR's steady response");
     }
@@ -116,11 +116,11 @@ int main()
         convolution::ConvolutionEngine<> eng; eng.prepare (P, irMax, xfade);
         std::vector<float> in (512, 0.2f), out (512, 0.0f);
         eng.setIr (irA.data(), irLen);
-        eng.process (in.data(), out.data(), 512);      // consume the initial fade-in
+        felitronics::test::run (eng.process (in.data(), out.data(), 512));      // consume the initial fade-in
         eng.setIr (irB.data(), irLen);                 // arm a swap (build is message-thread, before the snapshot)
         const long before = g_allocs.load();
-        eng.process (in.data(), out.data(), 512);      // crosses the crossfade
-        eng.process (in.data(), out.data(), 512);
+        felitronics::test::run (eng.process (in.data(), out.data(), 512));      // crosses the crossfade
+        felitronics::test::run (eng.process (in.data(), out.data(), 512));
         const long after = g_allocs.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations (even across a swap)");
     }
@@ -138,13 +138,13 @@ int main()
         {
             const float* in[2]  { x.data(), x.data() };            // same input on both channels
             float*       out[2] { l.data(), rr.data() };
-            eng.process (in, out, 2, 1400);                        // settle on A
+            felitronics::test::run (eng.process (in, out, 2, 1400));                        // settle on A
         }
         eng.setIr (irB.data(), irLen);                             // arm swap on both channels at once
         {
             const float* in[2]  { x.data() + 1400, x.data() + 1400 };
             float*       out[2] { l.data() + 1400, rr.data() + 1400 };
-            eng.process (in, out, 2, n - 1400);                    // crossfade A→B
+            felitronics::test::run (eng.process (in, out, 2, n - 1400));                    // crossfade A→B
         }
         double maxLR = 0.0;
         for (int i = 0; i < n; ++i) maxLR = std::max (maxLR, (double) std::fabs (l[i] - rr[i]));
@@ -158,8 +158,8 @@ int main()
         convolution::ConvolutionEngine<> mo; mo.prepare (P, irMax, xfade, 1);
         std::vector<float> sl (n, 0.0f), srr (n, 0.0f), mout (n, 0.0f);
         const float* sin[2] { x.data(), x.data() }; float* sout[2] { sl.data(), srr.data() };
-        st.setIr (irA.data(), irLen); st.process (sin, sout, 2, n);
-        mo.setIr (irA.data(), irLen); mo.process (x.data(), mout.data(), n);
+        st.setIr (irA.data(), irLen); felitronics::test::run (st.process (sin, sout, 2, n));
+        mo.setIr (irA.data(), irLen); felitronics::test::run (mo.process (x.data(), mout.data(), n));
         double mErr = 0.0; for (int i = 0; i < n; ++i) mErr = std::max (mErr, (double) std::fabs (sl[i] - mout[i]));
         test::ok (mErr == 0.0, "broadcast stereo channel matches the mono engine bit-for-bit");
     }
@@ -172,11 +172,11 @@ int main()
         const float* irs[2] { irA.data(), irB.data() };
         eng.setIr (irs, 2, irLen);                                 // L gets A, R gets B (one armed swap)
         const float* in[2] { x.data(), x.data() }; float* out[2] { l.data(), rr.data() };
-        eng.process (in, out, 2, n);
+        felitronics::test::run (eng.process (in, out, 2, n));
 
         convolution::PartitionedConvolver<> rA, rB; rA.prepare (P, irMax); rB.prepare (P, irMax);
         rA.setIr (irA.data(), irLen); rB.setIr (irB.data(), irLen);
-        std::vector<float> yA (n, 0.0f), yB (n, 0.0f); rA.process (x.data(), yA.data(), n); rB.process (x.data(), yB.data(), n);
+        std::vector<float> yA (n, 0.0f), yB (n, 0.0f); felitronics::test::run (rA.process (x.data(), yA.data(), n)); felitronics::test::run (rB.process (x.data(), yB.data(), n));
         double eL = 0.0, eR = 0.0, lr = 0.0;
         for (int i = 2200; i < n; ++i)
         {
@@ -204,13 +204,13 @@ int main()
         convolution::ConvolutionEngine<> eng; eng.prepare (Pw, irMaxW, warmXf);
         std::vector<float> yw (nw, 0.0f);
         const int sw = coldXf + 200;                               // swap well after the shared history is warm
-        eng.setIr (iA.data(), irLenW); eng.process (xw.data(), yw.data(), sw);
+        eng.setIr (iA.data(), irLenW); felitronics::test::run (eng.process (xw.data(), yw.data(), sw));
         const bool warmOk = eng.setIr (iB.data(), irLenW);
-        eng.process (xw.data() + sw, yw.data() + sw, nw - sw);
+        felitronics::test::run (eng.process (xw.data() + sw, yw.data() + sw, nw - sw));
         test::ok (warmOk, "warm swap accepted");
 
         convolution::PartitionedConvolver<> refB; refB.prepare (Pw, irMaxW); refB.setIr (iB.data(), irLenW);
-        std::vector<float> yB (nw, 0.0f); refB.process (xw.data(), yB.data(), nw);
+        std::vector<float> yB (nw, 0.0f); felitronics::test::run (refB.process (xw.data(), yB.data(), nw));
         const int settled = sw + warmXf + Pw + 4;                  // just past the SHORT fade + one chunk
         double e = 0.0; for (int i = settled; i < nw; ++i) e = std::max (e, (double) std::fabs (yw[i] - yB[i]));
         test::ok (e < 2e-3, "matches the new IR right after the short fade — no N-length lag");
@@ -229,7 +229,7 @@ int main()
 
         convolution::ConvolutionEngine<> eng; eng.prepare (Pc, irMaxC, warmXf);
         std::vector<float> y (4000, 0.0f); int pos = 0;
-        auto run = [&] (int k) { eng.process (xc.data() + pos, y.data() + pos, k); pos += k; };
+        auto run = [&] (int k) { felitronics::test::run (eng.process (xc.data() + pos, y.data() + pos, k)); pos += k; };
         eng.setIr (iA.data(), irLenC);
         run (warmXf / 2);      test::ok (eng.isBusy(),   "first activation busy mid-fade");
         run (warmXf + Pc + 8); test::ok (! eng.isBusy(), "first activation finished within the short fade (no long cold prime)");
@@ -247,7 +247,7 @@ int main()
         std::vector<float> ones (4000, 1.0f), y (4000, 0.0f);
 
         convolution::ConvolutionEngine<> eng; eng.prepare (Ps, irMaxS, warmXf);
-        int pos = 0; auto run = [&] (int k) { eng.process (ones.data() + pos, y.data() + pos, k); pos += k; };
+        int pos = 0; auto run = [&] (int k) { felitronics::test::run (eng.process (ones.data() + pos, y.data() + pos, k)); pos += k; };
         eng.setIr (zA.data(), irLenS); run (coldXf + 4 * Ps);       // warm the FDL with the DC input (output stays 0)
         const int sw = pos;
         eng.setIr (dB.data(), irLenS);                             // warm swap → short fade; B's tail must be primed to 1
@@ -278,7 +278,7 @@ int main()
 
         convolution::ConvolutionEngine<> eng; eng.prepare (Pr, irMaxR, warmXf);
         std::vector<float> y (4000, 0.0f); int pos = 0;
-        auto run = [&] (int k) { eng.process (xr.data() + pos, y.data() + pos, k); pos += k; };
+        auto run = [&] (int k) { felitronics::test::run (eng.process (xr.data() + pos, y.data() + pos, k)); pos += k; };
         eng.setIr (iA.data(), irLenR); run (coldXf + 200);          // run A a while to warm the shared history
         test::ok (eng.setIr (iB.data(), irLenR), "swap to B accepted (warm)");
         run (warmXf + Pr + 8);
@@ -286,7 +286,7 @@ int main()
 
         eng.reset();                                                // flush history; B must stay live
         float imp[1] { 1.0f }, oimp[1] { 0.0f };
-        eng.process (imp, oimp, 1);                                 // first post-reset sample = head[live]·δ = iB[0]
+        felitronics::test::run (eng.process (imp, oimp, 1));                                 // first post-reset sample = head[live]·δ = iB[0]
         test::ok (std::fabs (oimp[0] - iB[0]) < 1e-6, "reset kept the live IR (B's head), did not revert to A");
         test::ok (std::fabs (oimp[0] - iA[0]) > 1e-3, "  …and it is NOT A");
         test::ok (eng.setIr (iC.data(), irLenR), "post-reset swap accepted");
@@ -307,13 +307,13 @@ int main()
         test::ok (! eng.isBusy(), "fresh engine is idle");
         test::ok (! eng.setIr (ir.data(), irLen), "setIr() before prepare() returns false (no div-by-0, no crash)");
         test::ok (! eng.isBusy(), "  …and it did NOT arm a swap (state stays idle)");
-        eng.process (in.data(), out.data(), 256);                    // must be a silent no-op, not an empty-buffer access
+        test::ok (! eng.process (in.data(), out.data(), 256), "process() before prepare() is REFUSED (law 11)");
         bool untouched = true; for (float v : out) untouched = untouched && (v == 0.0f);
         test::ok (untouched, "process() before prepare() is a no-op (output left untouched)");
 
         test::ok (eng.prepare (P, irMax, xfade), "prepare() after the rejected loads");
         test::ok (eng.setIr (ir.data(), irLen), "setIr() now accepted once prepared");
-        eng.process (in.data(), out.data(), 256);
+        felitronics::test::run (eng.process (in.data(), out.data(), 256));
         bool finite = true; for (float v : out) finite = finite && std::isfinite (v);
         test::ok (finite, "process() produces finite output after prepare");
     }

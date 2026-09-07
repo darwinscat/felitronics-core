@@ -62,7 +62,7 @@ static void runBlocks (multiband::MultibandCompressor<4>& mc, std::vector<float>
     for (int o = 0; o < (int) y.size(); o += block)
     {
         float* io[1] { y.data() + o };
-        mc.process (io, 1, std::min (block, (int) y.size() - o));
+        felitronics::test::run (mc.process (io, 1, std::min (block, (int) y.size() - o)));
     }
 }
 
@@ -139,7 +139,7 @@ int main()
                 const float v = (b < 94 / 3) ? (float) (0.5 * std::sin (6.283185307179586 * 220.0 * (b * n + i) / fs)) : 0.0f;
                 l[(std::size_t) i] = r[(std::size_t) i] = v;
             }
-            mb.process (io, 2, n);
+            felitronics::test::run (mb.process (io, 2, n));
         }
         // With the flush the tail is EXACTLY zero; without it the crossover keeps emitting a subnormal.
         double maxOut = 0.0;
@@ -162,9 +162,9 @@ int main()
         multiband::MultibandCompressor<4> mc; prep (mc, sr, 512, 2); mc.setNumBands (4);
         for (int b = 0; b < 4; ++b) mc.setBandParams (b, comp (-10.0, 4.0, 1.0));
         std::vector<float> l (512, 0.2f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
-        mc.process (io, 2, 512);
+        felitronics::test::run (mc.process (io, 2, 512));
         const long before = g_allocs.load();
-        mc.process (io, 2, 512); mc.process (io, 2, 512);
+        felitronics::test::run (mc.process (io, 2, 512)); felitronics::test::run (mc.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (4-band stereo, lookahead)");
     }
 
@@ -243,7 +243,7 @@ int main()
         const int N = 6000; std::vector<float> l (N), r (N, 0.0f);
         unsigned long long s = 9; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         for (int i = 0; i < N; ++i) l[i] = 0.3f * rng();
-        for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; mc.process (io, 2, std::min (512, N - o)); }
+        for (int o = 0; o < N; o += 512) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mc.process (io, 2, std::min (512, N - o))); }
         test::ok (rms (r, N / 2) == 0.0, "right channel stays silent while left is driven (independent state)");
     }
 

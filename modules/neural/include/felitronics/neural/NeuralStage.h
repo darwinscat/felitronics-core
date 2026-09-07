@@ -62,11 +62,22 @@ public:
     bool hasModel() const noexcept { return live_.load (std::memory_order_acquire) != nullptr; }
 
     // Audio thread, in place. RT-safe. No model → passthrough (leaves `io` unchanged).
-    void process (float* const* io, int numChannels, int numSamples) noexcept
+    // Law 11 — the verdict is the BACKEND's. No model loaded is not a refusal: a stage with nothing
+    // installed is a documented clean passthrough, so it accepts the call and does nothing to it.
+    // The live pointer is resolved ONCE here, so a backend that chunks internally keeps one model for
+    // the whole host call — see the note in NamBackend::process.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept
     {
+        // GEOMETRY FIRST, before the no-model shortcut AND before the retire counter. Deferring it to
+        // the backend made the verdict depend on whether a model happened to be loaded: with none
+        // installed, `process(io, -1, n)` and a width past the spec both answered "accepted", and the
+        // same calls answered "refused" the moment a model landed. A malformed call is malformed either
+        // way, and it must not step the block counter that the garbage collector reads.
+        if (numChannels < 0 || numSamples < 0) return false;
+        if (numChannels > spec_.maxChannels) return false;
         audioBlock_.fetch_add (1, std::memory_order_acq_rel);
         Backend* p = live_.load (std::memory_order_acquire);
-        if (p) p->process (io, numChannels, numSamples);
+        return p == nullptr || p->process (io, numChannels, numSamples);
     }
 
     void reset() noexcept { if (Backend* p = live_.load (std::memory_order_acquire)) p->reset(); }

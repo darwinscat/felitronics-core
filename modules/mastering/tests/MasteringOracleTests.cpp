@@ -136,7 +136,7 @@ static void testLatencyFoundNotAsked()
                 }
 
             Buf y = x;
-            { auto pl = planes (y); chain.process (pl.data(), nch, n); }
+            { auto pl = planes (y); felitronics::test::run (chain.process (pl.data(), nch, n)); }
 
             int found = -1, matches = 0;
             for (int d = 0; d <= 4096; ++d)
@@ -174,7 +174,7 @@ static void testActiveGroupDelayByPhase()
     const double f = 25.0, fs = 48000.0;
     Buf x = tone (nch, n, f, 0.25f);
     Buf y = x;
-    { auto pl = planes (y); chain.process (pl.data(), nch, n); }
+    { auto pl = planes (y); felitronics::test::run (chain.process (pl.data(), nch, n)); }
 
     const int from = 24000, len = 48000;                   // an integer number of periods, clear of both edges
     const auto bx = binAt (x[0], from, len, f, fs);
@@ -238,7 +238,7 @@ static void testCompositionAgainstAHandBuiltChain()
     ok (chain.prepare (48000.0, nch, cfg), "prepare the chain");
     chain.setParams (p);
     Buf viaChain = x;
-    { auto pl = planes (viaChain); chain.process (pl.data(), nch, n); }
+    { auto pl = planes (viaChain); felitronics::test::run (chain.process (pl.data(), nch, n)); }
 
     // --- the same stages, by hand, at the same quantum ---
     eq::EqEngine          eqE;
@@ -251,7 +251,7 @@ static void testCompositionAgainstAHandBuiltChain()
 
     ok (eqE.prepare (48000.0, K, nch), "EqEngine::prepare() accepted the configuration");
     for (int i = 0; i < eq::EqEngine::kMaxBands; ++i) eqE.setBand (i, p.eqBands[i]);
-    mb.prepare (48000.0, K, nch);
+    felitronics::test::run (mb.prepare (48000.0, K, nch));
     mb.setParams (p.monoBass);
     ok (comp.prepare (48000.0, K, nch, std::max (cfg.compressorLookaheadMs, 1.0)), "hand: compressor prepare");
     { auto cp = p.compressor; cp.lookaheadMs = cfg.compressorLookaheadMs; comp.setParams (cp); }
@@ -261,7 +261,7 @@ static void testCompositionAgainstAHandBuiltChain()
     lc.lookaheadMs = cfg.limiterLookaheadMs; lc.oversampleFactor = cfg.oversampleFactor; lc.tapsPerPhase = cfg.tapsPerPhase;
     ok (lim.prepare (48000.0, K, nch, lc), "hand: limiter prepare");
     lim.setParams (p.limiter);
-    dit.prepare (48000.0, K, nch);
+    felitronics::test::run (dit.prepare (48000.0, K, nch));
     dit.setParams (p.dither);
     const eq::BiquadCoeffs hc = eq::matched::highpass (cfg.sidechainHpfHz, 48000.0, 0.70710678118654752);
     for (int c = 0; c < nch; ++c) hpf[c].setCoeffs (hc);
@@ -281,8 +281,8 @@ static void testCompositionAgainstAHandBuiltChain()
                 ch[c][i] = std::clamp (std::isfinite (v) ? v : 0.0f, -1.0e6f, 1.0e6f);
             }
         for (int c = 0; c < nch; ++c) for (int i = 0; i < K; ++i) ch[c][i] *= gIn;
-        eqE.process (ch, nch, K);
-        mb.process (ch, nch, K);
+        felitronics::test::run (eqE.process (ch, nch, K));
+        felitronics::test::run (mb.process (ch, nch, K));
         const float* kp[2] {};
         for (int c = 0; c < nch; ++c)
         {
@@ -291,11 +291,11 @@ static void testCompositionAgainstAHandBuiltChain()
             hpf[c].flushDenormals();
             kp[c] = k;
         }
-        comp.process (ch, nch, K, kp, nch);
-        sat.process (ch, nch, K);
+        felitronics::test::run (comp.process (ch, nch, K, kp, nch));
+        felitronics::test::run (sat.process (ch, nch, K));
         for (int c = 0; c < nch; ++c) for (int i = 0; i < K; ++i) ch[c][i] *= gPre;
-        lim.process (ch, nch, K);
-        dit.process (ch, nch, K);
+        felitronics::test::run (lim.process (ch, nch, K));
+        felitronics::test::run (dit.process (ch, nch, K));
     }
 
     // The chain's output trails the hand-built one by exactly the internal quantum.
@@ -352,7 +352,7 @@ static void testPassbandPinned()
 
             Buf x = tone (1, n, row.r * fs, 0.25f, fs);
             Buf y = x;
-            { auto pl = planes (y); chain.process (pl.data(), 1, n); }
+            { auto pl = planes (y); felitronics::test::run (chain.process (pl.data(), 1, n)); }
 
             double pin = 0.0, pout = 0.0;
             for (int i = n / 2; i < n; ++i)
@@ -402,7 +402,7 @@ static void testTwoGainNodes()
         c.setParams (p);
         Buf y = x;
         auto pl = planes (y);
-        c.process (pl.data(), nch, n);
+        felitronics::test::run (c.process (pl.data(), nch, n));
         double acc = 0.0;
         for (int i = n / 2; i < n; ++i) acc += (double) y[0][(std::size_t) i] * y[0][(std::size_t) i];
         return std::sqrt (acc / (double) (n - n / 2));
@@ -455,7 +455,7 @@ static void testSidechainKey()
         c.setParams (p);
         Buf y = tone (nch, n, toneHz, 0.35f);
         auto pl = planes (y);
-        c.process (pl.data(), nch, n);
+        felitronics::test::run (c.process (pl.data(), nch, n));
         double acc = 0.0;
         for (int i = n / 2; i < n; ++i) acc += (double) y[0][(std::size_t) i] * y[0][(std::size_t) i];
         return std::sqrt (acc / (double) (n - n / 2));
@@ -489,7 +489,7 @@ static void testSidechainKey()
         c.setParams (p);
         Buf x = tone (nch, n, 180.0, 0.4f);
         Buf viaChain = x;
-        { auto pl = planes (viaChain); c.process (pl.data(), nch, n); }
+        { auto pl = planes (viaChain); felitronics::test::run (c.process (pl.data(), nch, n)); }
 
         dynamics::Compressor comp;
         ok (comp.prepare (48000.0, K, nch, std::max (cfg.compressorLookaheadMs, 1.0)), "hand: compressor prepare");
@@ -503,7 +503,7 @@ static void testSidechainKey()
                 const float v = ch[0][i];
                 ch[0][i] = std::clamp (std::isfinite (v) ? v : 0.0f, -1.0e6f, 1.0e6f);
             }
-            comp.process (ch, nch, K);                     // the THREE-argument, self-keyed form
+            felitronics::test::run (comp.process (ch, nch, K));                     // the THREE-argument, self-keyed form
         }
         long long bad = 0;
         for (int i = 0; i + K < n; ++i)

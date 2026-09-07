@@ -66,18 +66,18 @@ int main()
         for (int k = 0; k < 40; ++k)
         {
             std::fill (L.begin(), L.end(), 0.0f); fillNoise (R, 5u + (unsigned) k);
-            e.process (in, out, 2, N);
+            felitronics::test::run (e.process (in, out, 2, N));
             charged = std::fmax (charged, peakOf (R));
         }
         ok (charged > 0.1, "precondition: the right channel really was convolving");
 
-        for (int k = 0; k < 40; ++k) { std::fill (L.begin(), L.end(), 0.0f); e.process (in, out, 1, N); }
+        for (int k = 0; k < 40; ++k) { std::fill (L.begin(), L.end(), 0.0f); felitronics::test::run (e.process (in, out, 1, N)); }
 
         double worst = 0.0;
         for (int k = 0; k < 8; ++k)
         {
             std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
-            e.process (in, out, 2, N);
+            felitronics::test::run (e.process (in, out, 2, N));
             worst = std::fmax (worst, peakOf (R));
         }
         ok (worst == 0.0, "silence in, exact zero out on the returned channel (was 7.44e-01 = -2.6 dBFS)");
@@ -101,8 +101,8 @@ int main()
             fillNoise (d0, 41u + (unsigned) k);
             std::fill (d1.begin(), d1.end(), 0.0f);
             r0 = d0; r1 = d1;
-            dut.process (din, dout, (k >= 40 && k < 80) ? 1 : 2, N);
-            ref.process (rin, rout, 2, N);
+            felitronics::test::run (dut.process (din, dout, (k >= 40 && k < 80) ? 1 : 2, N));
+            felitronics::test::run (ref.process (rin, rout, 2, N));
             equal = equal && bitEqual (d0, r0);
             energy += peakOf (d0);
         }

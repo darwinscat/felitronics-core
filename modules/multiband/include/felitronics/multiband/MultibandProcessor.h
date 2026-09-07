@@ -38,9 +38,13 @@ public:
     template <class PrepareBand>
     bool prepare (double sampleRate, int maxBlock, int maxChannels, int maxAlignSamples, PrepareBand&& prepareBand)
     {
+        prepared_ = false;                                   // any early return below leaves it unprepared
         if (sampleRate <= 0.0 || maxBlock < 1) return false;
+        // Law 11(b): prepare() is BINDING. A silently clamped width makes process()'s refusal a fiction —
+        // the caller is told nothing here and then legitimately hands over more planes than exist.
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
         fs_ = sampleRate; maxBlock_ = maxBlock;
-        channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        channels_ = maxChannels;
         if (maxAlignSamples < 0) maxAlignSamples = 0;
 
         splitter_.prepare (sampleRate, channels_);
@@ -65,8 +69,11 @@ public:
         for (auto& d : dryDelay_) d.prepare (maxAlignSamples);
 
         refreshLatency(); reset();
+        prepared_ = bandsOk;                                 // a band that refused leaves the composite unusable
         return bandsOk;
     }
+
+    bool isPrepared() const noexcept { return prepared_; }
 
     void reset() noexcept
     {
@@ -95,23 +102,88 @@ public:
 
     int  latencySamples() const noexcept { return latency_; }
 
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11. Geometry is checked BEFORE anything moves, so a refused call is indistinguishable from one
+    // never made; then the LENGTH is chunked (it used to drop the whole call at n > maxBlock — measured,
+    // max |out - in| over a 1024-sample call at maxBlock 256 was exactly 0: not one sample was touched).
+    // Each chunk is one full pass of the four steps below, so the result is bit-identical to the caller
+    // having made the same maxBlock-sized calls itself — every piece of state (the crossover, the band
+    // processors, the alignment and dry delay lines) lives in members and carries across the seam.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        const int nc = std::min (numChannels, channels_);
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > channels_) return false;          // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                            // no samples: no time, no edge, nothing
+        bool ok = true;
+        for (int off = 0; off < n; )
+        {
+            const int m = std::min (n - off, maxBlock_);
+            float* sub[core::kMaxChannels] {};
+            for (int c = 0; c < numChannels; ++c) sub[(std::size_t) c] = io[c] + off;
+            ok = runChunk (sub, numChannels, m) && ok;
+            off += m;                                       // `off += maxBlock_` could step past INT_MAX
+        }
+        return ok;
+    }
+
+private:
+    // ONE chunk: nc is already validated and m <= maxBlock_.
+    bool runChunk (float* const* io, int numChannels, int n) noexcept
+    {
+        const int nc = numChannels;
         const int nb = splitter_.numBands();
-        if (nc <= 0 || n <= 0 || n > maxBlock_) return;
 
         // A channel that stops being split keeps the whole crossover tree for its column — every Svf in
         // every crossover and every allpass compensator — plus its per-band alignment delay lines. None of
         // it decays while the channel is away, and it replays on return: measured 1.55e-01 (-16.2 dBFS)
         // out of DIGITAL SILENCE. Per channel, never wholesale: the channels that stayed owe it nothing.
         // The band processors are not touched here — each carries its own ledger, or does not need one.
+        // A BYPASSED band is stopped whatever the width does — it has been receiving nothing all along.
+        // Telling it only at nc == 0 left the narrowing case leaking: stereo -> bypass -> mono -> bands
+        // back on -> stereo silence emitted -16.6378 dBFS on the right, last non-zero at sample 239,
+        // the whole lookahead line.
+        for (int b = 0; b < nb; ++b)
+            if (bypass_[(std::size_t) b])
+                for (int c = nc; c < ranNc_; ++c)
+                {
+                    if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
+                        proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+                    else
+                        (void) proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+                    break;                          // one call per band carries the whole falling edge
+                }
         for (int c = nc; c < ranNc_; ++c)
         {
             splitter_.resetChannel (c);
             for (int b = 0; b < MaxBands; ++b) align_[(std::size_t) (b * channels_ + c)].reset();
+            // ...AND the parallel dry line, which is per-channel memory exactly like the rest. It was
+            // missed because the obvious fixture cannot see it: at mix == 1 the sum is
+            // `d + 1.0f * (wet - d)`, which is `wet` EXACTLY in IEEE, so the frozen dry cancels itself.
+            // At mix 0.5 the whole 240-sample line replays: 0.25 out of DIGITAL SILENCE (-12.0 dBFS),
+            // last non-zero at sample 239. My own zero-width probe ran at mix 1 and read 0.
+            dryDelay_[(std::size_t) c].reset();
         }
         ranNc_ = nc;
+        if (nc == 0)
+        {
+            // LAW 11(a)+(d): the gap has to reach the BANDS. Returning here left every band processor
+            // holding its own frozen per-channel state — measured through MultibandCompressor with 5 ms
+            // of lookahead: 0.308 out of DIGITAL SILENCE (-10.2 dBFS), last non-zero at sample 239, the
+            // whole delay line. A composite that swallows the gap reproduces, one storey up, exactly the
+            // defect its own bands were fixed for.
+            // A BYPASSED band is stopped too — it has been receiving nothing all along, and the gap is
+            // the moment its own per-channel state has to go, or it replays on un-bypass. Measured with
+            // the bands bypassed during the gap: -11.83 dBFS out of digital silence.
+            bool zeroOk = true;
+            for (int b = 0; b < nb; ++b)
+            {
+                if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
+                    proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), 0, n);
+                else
+                    zeroOk = proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), 0, n) && zeroOk;
+            }
+            return zeroOk;
+        }
 
         // 1) split into per-band planar buffers; capture the allpass-reconstructed dry for the parallel mix
         float tmp[(std::size_t) MaxBands] {};
@@ -134,11 +206,22 @@ public:
         splitter_.flushDenormals();
 
         // 2) process each band in place (bypassed bands keep their split signal)
+        // A band's own verdict is ANDed in. It cannot be checked before the split (the bands run on the
+        // SPLIT signal, which does not exist yet), so a band that refuses leaves this chunk partially
+        // processed — the composite's "refused ⇒ nothing moved" guarantee covers the geometry THIS class
+        // validates, which is the part a caller can get wrong. A band refusing at a width and length this
+        // class already validated means someone re-prepared that band alone, through band(i).
+        // `if constexpr` keeps void-returning band processors (stereo::StereoWidth) working, exactly as
+        // prepare() already does for prepareBand.
+        bool bandsOk = true;
         for (int b = 0; b < nb; ++b)
         {
             if (bypass_[(std::size_t) b]) continue;
             for (int c = 0; c < nc; ++c) bandPtrs_[(std::size_t) b][(std::size_t) c] = bandData (b, c);
-            proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+            if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
+                proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+            else
+                bandsOk = proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n) && bandsOk;
         }
 
         // 3) align every band to the max band latency
@@ -165,9 +248,9 @@ public:
                 io[c][i] = anySolo ? wet : (d + mix_ * (wet - d));
             }
         }
+        return bandsOk;
     }
 
-private:
     void recomputeLatency() noexcept
     {
         const int nb = splitter_.numBands();
@@ -188,6 +271,7 @@ private:
     int    ranNc_ = 0;                    // channels that advanced state on the previous call
     double fs_ = 48000.0;
     int maxBlock_ = 0, channels_ = 0, latency_ = 0;
+    bool prepared_ = false;               // true only after a prepare() in which every band succeeded
     float mix_ = 1.0f;
 
     eq::MultibandSplitter<MaxBands> splitter_;

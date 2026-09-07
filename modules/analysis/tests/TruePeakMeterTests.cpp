@@ -30,16 +30,16 @@ using TPM = analysis::TruePeakMeter;
 // run a mono tone through a fresh meter, return its true-peak dBTP
 static double tonePeakDb (double f, double amp, double phase, int N, double sr)
 {
-    TPM m; m.prepare (sr, 1024, 1);
+    TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
     std::vector<float> x (N); for (int i = 0; i < N; ++i) x[i] = (float) (amp * std::sin (2.0 * core::kPi * f * i / sr + phase));
-    for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+    for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
     return m.truePeakDb();
 }
 
 // same, but raised-cosine fade-in so there is NO onset step (→ measures the STEADY tone, not a step overshoot)
 static double tonePeakDbFaded (double f, double amp, double phase, int N, double sr)
 {
-    TPM m; m.prepare (sr, 1024, 1);
+    TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
     const int fade = 2000;
     std::vector<float> x (N);
     for (int i = 0; i < N; ++i)
@@ -47,7 +47,7 @@ static double tonePeakDbFaded (double f, double amp, double phase, int N, double
         const double env = i < fade ? 0.5 * (1.0 - std::cos (core::kPi * i / fade)) : 1.0;
         x[i] = (float) (env * amp * std::sin (2.0 * core::kPi * f * i / sr + phase));
     }
-    for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+    for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
     return m.truePeakDb();
 }
 
@@ -59,10 +59,10 @@ int main()
     // --- THE canonical test: a 0 dBFS fs/4 sine whose samples straddle the peak reads ~0 dBTP, not −3 ---
     test::group ("TruePeak recovers the fs/4 inter-sample peak");
     {
-        TPM m; m.prepare (sr, 1024, 1);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
         const int N = 8000; std::vector<float> x (N);
         for (int i = 0; i < N; ++i) x[i] = (float) std::sin (2.0 * core::kPi * (sr / 4.0) * i / sr + core::kPi / 4.0);   // samples = ±0.707
-        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
         test::approx (m.samplePeakDb(), -3.0103, 0.05, "raw sample peak is −3.01 dBFS (grid misses the crest)");
         test::ok (m.truePeakDb() > -0.5 && m.truePeakDb() < 0.3, "true peak recovers ~0 dBTP (the real crest between samples)");
         test::ok (m.truePeakDb() - m.samplePeakDb() > 2.5, "true peak exceeds sample peak by ~3 dB (inter-sample recovery)");
@@ -71,10 +71,10 @@ int main()
     // --- TP is never LESS than the sample peak (the interpolator passes through the grid) ---
     test::group ("TruePeak >= sample peak");
     {
-        TPM m; m.prepare (sr, 1024, 1);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
         unsigned long long s = 5; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 6000; std::vector<float> x (N); for (int i = 0; i < N; ++i) x[i] = 0.6f * rng();
-        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
         test::ok (m.truePeakDb() >= m.samplePeakDb() - 1e-4, "true peak ≥ sample peak (max over a superset of the grid)");
     }
 
@@ -82,10 +82,10 @@ int main()
     //     real bandlimited step → it legitimately overshoots, so we measure a settled block, not the onset. ---
     test::group ("TruePeak of a steady constant is exact");
     {
-        TPM m; m.prepare (sr, 1024, 1);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
         std::vector<float> x (2048, 0.5f); const float* io[1] { x.data() };
-        m.process (io, 1, 2048);                                       // fill the ring (absorb the onset step)
-        m.process (io, 1, 2048);                                       // steady block — no step inside it
+        felitronics::test::run (m.process (io, 1, 2048));                                       // fill the ring (absorb the onset step)
+        felitronics::test::run (m.process (io, 1, 2048));                                       // steady block — no step inside it
         test::approx (m.truePeakDbBlock(), core::gainToDb (0.5), 0.02, "steady constant 0.5 → exactly −6.02 dBTP (unity-DC phases)");
     }
 
@@ -108,7 +108,7 @@ int main()
     test::group ("TruePeak oversampling factor by rate");
     {
         TPM a, b, c, d;
-        a.prepare (44100.0, 512, 1); b.prepare (48000.0, 512, 1); c.prepare (96000.0, 512, 1); d.prepare (192000.0, 512, 1);
+        felitronics::test::run (a.prepare (44100.0, 512, 1)); felitronics::test::run (b.prepare (48000.0, 512, 1)); felitronics::test::run (c.prepare (96000.0, 512, 1)); felitronics::test::run (d.prepare (192000.0, 512, 1));
         test::ok (a.oversampleFactor() == 4 && b.oversampleFactor() == 4, "44.1/48 kHz → 4×");
         test::ok (c.oversampleFactor() == 2, "96 kHz → 2×");
         test::ok (d.oversampleFactor() == 1, "192 kHz → 1× (grid already resolves the peak)");
@@ -117,20 +117,20 @@ int main()
     // --- stereo reports the max across channels ---
     test::group ("TruePeak stereo = max across channels");
     {
-        TPM m; m.prepare (sr, 1024, 2);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 2));
         const int N = 4000; std::vector<float> l (N), r (N);
         for (int i = 0; i < N; ++i) { l[i] = (float) (0.1 * std::sin (2.0 * core::kPi * 1000.0 * i / sr)); r[i] = (float) (0.8 * std::sin (2.0 * core::kPi * 1000.0 * i / sr)); }
-        for (int o = 0; o < N; o += 1024) { const float* io[2] { l.data() + o, r.data() + o }; m.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { const float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (m.process (io, 2, std::min (1024, N - o))); }
         test::approx (m.truePeakDb(), core::gainToDb (0.8), 0.2, "loud R channel sets the reading (max across channels)");
     }
 
     // --- the display ballistic holds then decays; the authoritative max does NOT decay ---
     test::group ("TruePeak ballistics (display only)");
     {
-        TPM m; analysis::TruePeakMeterParams p; p.holdMs = 50.0; p.decayDbPerSec = 100.0; m.prepare (sr, 1024, 1); m.setParams (p);
+        TPM m; analysis::TruePeakMeterParams p; p.holdMs = 50.0; p.decayDbPerSec = 100.0; felitronics::test::run (m.prepare (sr, 1024, 1)); m.setParams (p);
         const int burst = 1000, tail = 40000;
         std::vector<float> y (burst + tail, 0.0f); for (int i = 0; i < burst; ++i) y[i] = 0.9f;   // loud burst then silence
-        for (int o = 0; o < (int) y.size(); o += 1024) { const float* io[1] { y.data() + o }; m.process (io, 1, std::min (1024, (int) y.size() - o)); }
+        for (int o = 0; o < (int) y.size(); o += 1024) { const float* io[1] { y.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, (int) y.size() - o))); }
         test::ok (m.truePeakDb() > core::gainToDb (0.9) - 0.5, "authoritative true peak captured the burst and HOLDS it (never decays)");
         test::ok (m.displayTruePeakDb() < m.truePeakDb() - 3.0, "display ballistic has decayed well below the captured peak");
     }
@@ -138,8 +138,8 @@ int main()
     // --- reset clears the maxima ---
     test::group ("TruePeak reset");
     {
-        TPM m; m.prepare (sr, 1024, 1);
-        std::vector<float> x (1024, 0.7f); const float* io[1] { x.data() }; m.process (io, 1, 1024);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
+        std::vector<float> x (1024, 0.7f); const float* io[1] { x.data() }; felitronics::test::run (m.process (io, 1, 1024));
         m.reset();
         test::ok (m.truePeakDb() < -100.0 && m.samplePeakDb() < -100.0, "after reset → −∞-ish (no peak held)");
     }
@@ -147,13 +147,13 @@ int main()
     // --- no allocation in process(); a non-finite input cannot poison the reading ---
     test::group ("TruePeak no-alloc + finite guard");
     {
-        TPM m; m.prepare (sr, 1024, 2);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 2));
         std::vector<float> l (512, 0.3f), r (512, -0.2f); const float* io[2] { l.data(), r.data() };
-        m.process (io, 2, 512);
+        felitronics::test::run (m.process (io, 2, 512));
         const long before = g_allocs.load();
-        m.process (io, 2, 512); m.process (io, 2, 512);
+        felitronics::test::run (m.process (io, 2, 512)); felitronics::test::run (m.process (io, 2, 512));
         const bool noAlloc = (g_allocs.load() == before);
-        l[100] = std::nanf (""); r[200] = INFINITY; m.process (io, 2, 512);
+        l[100] = std::nanf (""); r[200] = INFINITY; felitronics::test::run (m.process (io, 2, 512));
         test::okNoAlloc (noAlloc, "process() did not allocate");
         test::ok (std::isfinite (m.truePeakDb()), "NaN/inf input → finite reading (guarded)");
     }
@@ -185,10 +185,10 @@ int main()
     test::group ("TruePeak 2x path at 96 kHz");
     {
         const double sr2 = 96000.0;
-        TPM m; m.prepare (sr2, 1024, 1);
+        TPM m; felitronics::test::run (m.prepare (sr2, 1024, 1));
         const int N = 8000; std::vector<float> x (N);
         for (int i = 0; i < N; ++i) x[i] = (float) std::sin (2.0 * core::kPi * (sr2 / 4.0) * i / sr2 + core::kPi / 4.0);
-        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
         std::printf ("    [96k] factor=%d truePeak=%+.3f samplePeak=%+.3f\n", m.oversampleFactor(), m.truePeakDb(), m.samplePeakDb());
         test::ok (m.oversampleFactor() == 2, "96 kHz selects 2×");
         test::ok (m.truePeakDb() - m.samplePeakDb() > 1.5, "2× recovers a chunk of the fs/4 inter-sample crest (above sample peak)");
@@ -197,10 +197,10 @@ int main()
     // --- the 1× path (192 kHz) is sample-peak identical (the grid already resolves the crest) ---
     test::group ("TruePeak 1x path at 192 kHz");
     {
-        TPM m; m.prepare (192000.0, 1024, 1);
+        TPM m; felitronics::test::run (m.prepare (192000.0, 1024, 1));
         unsigned long long s = 8; auto rng = [&]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; };
         const int N = 4000; std::vector<float> x (N); for (int i = 0; i < N; ++i) x[i] = 0.7f * rng();
-        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
         test::ok (m.oversampleFactor() == 1, "192 kHz selects 1× (no oversampling)");
         test::ok (m.truePeakDb() == m.samplePeakDb(), "1× → true peak == sample peak (no interpolation)");
     }
@@ -208,10 +208,10 @@ int main()
     // --- a full-scale square wave (high inter-sample content) reads a finite, plausible dBTP ---
     test::group ("TruePeak of a full-scale square");
     {
-        TPM m; m.prepare (sr, 1024, 1);
+        TPM m; felitronics::test::run (m.prepare (sr, 1024, 1));
         const int N = 8000; std::vector<float> x (N);
         for (int i = 0; i < N; ++i) x[i] = ((i / 8) % 2) ? 1.0f : -1.0f;     // ~3 kHz square, ±1 full-scale
-        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; m.process (io, 1, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { const float* io[1] { x.data() + o }; felitronics::test::run (m.process (io, 1, std::min (1024, N - o))); }
         test::ok (std::isfinite (m.truePeakDb()) && m.truePeakDb() > 0.2 && m.truePeakDb() < 3.0, "square edges overshoot to a plausible +0.2..+3 dBTP (finite, no overflow)");
     }
 
@@ -220,11 +220,11 @@ int main()
     {
         analysis::TruePeakMeter m;                                   // NOT prepared (channels_ == 2, hist_/pos_ empty)
         float a[16] {}, b[16] {}; const float* io[2] { a, b };
-        m.process (io, 2, 16);                                       // must no-op, not index empty pos_[c]
+        test::ok (! m.process (io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         test::ok (m.truePeakDb() < -100.0, "no peak registered before prepare");
-        m.prepare (48000.0, 16, 2);
+        felitronics::test::run (m.prepare (48000.0, 16, 2));
         for (auto& v : a) v = 0.5f;
-        m.process (io, 2, 16);                                       // works
+        felitronics::test::run (m.process (io, 2, 16));                                       // works
         test::ok (std::isfinite (m.truePeakDb()), "true-peak finite once prepared");
     }
 

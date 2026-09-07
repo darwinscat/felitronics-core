@@ -63,7 +63,7 @@ void pumpCrossfade (CabConvolver& convolver, int channels = 2)
     std::vector<float> left (512, 0.0f), right (512, 0.0f);
     float* io[2] { left.data(), right.data() };
     for (int i = 0; i < 12; ++i)
-        convolver.process (io, channels, 512);    // 6144 samples > the fixed 50 ms fade at 48 kHz
+        felitronics::test::run (convolver.process (io, channels, 512));    // 6144 samples > the fixed 50 ms fade at 48 kHz
 }
 
 void renderVariableBlocks (CabConvolver& convolver, std::vector<float>& left, std::vector<float>& right)
@@ -76,7 +76,7 @@ void renderVariableBlocks (CabConvolver& convolver, std::vector<float>& left, st
         const int remaining = (int) (left.size() - pos);
         const int count = std::min (blocks[blockIndex % 6], remaining);
         float* io[2] { left.data() + pos, right.data() + pos };
-        convolver.process (io, 2, count);
+        felitronics::test::run (convolver.process (io, 2, count));
         pos += (std::size_t) count;
         ++blockIndex;
     }
@@ -134,7 +134,7 @@ int main()
             std::vector<float> ir (256, 0.0f);
             ir[0] = amplitude;
             CabConvolver convolver;
-            convolver.prepare (48000.0, 512, 2, 0.05);
+            felitronics::test::run (convolver.prepare (48000.0, 512, 2, 0.05));
             const float* banks[1] { ir.data() };
             convolver.loadIR (banks, 1, (int) ir.size(), 48000.0);
             return convolver.irNormalizationGainDb();
@@ -153,7 +153,7 @@ int main()
     {
         const auto ir = decayingIr (257);
         CabConvolver convolver;
-        convolver.prepare (48000.0, 512, 2, 0.05);
+        felitronics::test::run (convolver.prepare (48000.0, 512, 2, 0.05));
         const float* banks[1] { ir.data() };
         convolver.loadIR (banks, 1, (int) ir.size(), 48000.0);
         test::approx (convolver.irNormalizationGainDb(), referenceNormalizationGainDb (ir, 48000.0),
@@ -188,7 +188,7 @@ int main()
         {
             const auto ir = decayingIr (sourceLength);
             CabConvolver convolver;
-            convolver.prepare (48000.0, 512, 2, 0.05);
+            felitronics::test::run (convolver.prepare (48000.0, 512, 2, 0.05));
             const float* banks[1] { ir.data() };
             convolver.loadIR (banks, 1, (int) ir.size(), irRate);
             const auto& staged = convolver.stagedTaps();
@@ -224,7 +224,7 @@ int main()
         ir[400] = 0.75f;       // retained in stagedTaps(), deliberately outside the audible schedule
 
         CabConvolver convolver;
-        convolver.prepare (48000.0, 128, 2, (double) capSamples / 48000.0, false);
+        felitronics::test::run (convolver.prepare (48000.0, 128, 2, (double) capSamples / 48000.0, false));
         const float* banks[1] { ir.data() };
         convolver.loadIR (banks, 1, (int) ir.size(), 48000.0);
         test::ok (convolver.stagedTaps()[0] == ir,
@@ -250,7 +250,7 @@ int main()
         std::vector<float> rightIr = leftIr;
         for (float& v : rightIr) v *= 0.5f;
         CabConvolver convolver;
-        convolver.prepare (48000.0, 256, 2, 0.05);
+        felitronics::test::run (convolver.prepare (48000.0, 256, 2, 0.05));
         const float* banks[2] { leftIr.data(), rightIr.data() };
         convolver.loadIR (banks, 2, (int) leftIr.size(), 48000.0);
         const auto& staged = convolver.stagedTaps();
@@ -263,7 +263,7 @@ int main()
         left[0] = 1.0f;
         right[0] = 1.0f;
         float* io[2] { left.data(), right.data() };
-        convolver.process (io, 2, 256);
+        felitronics::test::run (convolver.process (io, 2, 256));
         bool lrDiag = true;
         for (std::size_t i = 0; i < leftIr.size(); ++i)
             lrDiag = lrDiag && std::fabs (left[i] - staged[0][i]) < 2.0e-4f
@@ -275,7 +275,7 @@ int main()
     {
         std::vector<float> ir { 0.75f, -0.25f, 0.125f, 0.0625f };
         CabConvolver convolver;
-        convolver.prepare (48000.0, 128, 2, 0.05, false);
+        felitronics::test::run (convolver.prepare (48000.0, 128, 2, 0.05, false));
         const float* banks[1] { ir.data() };
         convolver.loadIR (banks, 1, (int) ir.size(), 48000.0);
         test::approx (convolver.irNormalizationGain(), 1.0, 0.0, "normalization gain is exactly one");
@@ -288,7 +288,7 @@ int main()
         std::vector<float> second { 0.0f, 1.0f, 0.0f, 0.0f };
         std::vector<float> latest { 0.25f, -0.5f, 0.75f, -1.0f };
         CabConvolver convolver;
-        convolver.prepare (48000.0, 128, 2, 0.05, false);
+        felitronics::test::run (convolver.prepare (48000.0, 128, 2, 0.05, false));
         const float* a[1] { first.data() };
         const float* b[1] { second.data() };
         const float* c[1] { latest.data() };
@@ -296,7 +296,7 @@ int main()
 
         float left[64] {}, right[64] {};
         float* io[2] { left, right };
-        convolver.process (io, 2, 64);       // begins the first publication's 50 ms crossfade
+        felitronics::test::run (convolver.process (io, 2, 64));       // begins the first publication's 50 ms crossfade
         convolver.loadIR (b, 1, (int) second.size(), 48000.0);
         test::ok (convolver.hasPending(), "load is retained when NUPC rejects it mid-crossfade");
         convolver.loadIR (c, 1, (int) latest.size(), 48000.0);
@@ -313,7 +313,7 @@ int main()
         impulse[0] = 1.0f;
         other[0] = 1.0f;
         float* render[2] { impulse.data(), other.data() };
-        convolver.process (render, 2, (int) impulse.size());
+        felitronics::test::run (convolver.process (render, 2, (int) impulse.size()));
         bool latestWon = true;
         for (std::size_t i = 0; i < latest.size(); ++i)
             latestWon = latestWon && impulse[i] == latest[i] && other[i] == latest[i];

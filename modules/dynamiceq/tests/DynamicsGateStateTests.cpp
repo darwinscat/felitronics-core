@@ -76,7 +76,7 @@ static void testLaneDynamicsProbe()
         const eq::BandParams p = dynPoint (cs.f, cs.Q);
 
         eq::EqBand band; band.prepare (kFs, 2); band.setParams (p);
-        dynamiceq::LaneDynamics dyn; dyn.prepare (kFs, 2); dyn.setParams (p);
+        dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (kFs, 2)); dyn.setParams (p);
 
         std::vector<float> L ((std::size_t) block), R ((std::size_t) block), sl ((std::size_t) block), sr ((std::size_t) block);
         float* aud[2] { L.data(), R.data() };
@@ -94,7 +94,7 @@ static void testLaneDynamicsProbe()
                 L[(std::size_t) i] = sl[(std::size_t) i] = 0.0f;
                 R[(std::size_t) i] = sr[(std::size_t) i] = v;
             }
-            dyn.processBand (aud, sc, 2, block, band);
+            felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
             deepest = std::fmin (deepest, dyn.deltaDb (eq::Lane::Stereo));
         }
         ok (deepest < -6.0, std::string ("precondition ") + cs.name + ": the tone really earned gain reduction");
@@ -104,7 +104,7 @@ static void testLaneDynamicsProbe()
         {
             std::fill (L.begin(), L.end(), 0.0f); std::fill (sl.begin(), sl.end(), 0.0f);
             std::fill (R.begin(), R.end(), 0.0f); std::fill (sr.begin(), sr.end(), 0.0f);
-            dyn.processBand (aud, sc, 1, block, band);
+            felitronics::test::run (dyn.processBand (aud, sc, 1, block, band));
         }
         const double before = dyn.deltaDb (eq::Lane::Stereo);
         approx (before, 0.0, 0.05, std::string ("precondition ") + cs.name + ": the delta released before the return");
@@ -120,7 +120,7 @@ static void testLaneDynamicsProbe()
         {
             std::fill (L.begin(), L.end(), 0.0f); std::fill (sl.begin(), sl.end(), 0.0f);
             std::fill (R.begin(), R.end(), 0.0f); std::fill (sr.begin(), sr.end(), 0.0f);
-            dyn.processBand (aud, sc, 2, block, band);
+            felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
             deepestAfter = std::fmin (deepestAfter, dyn.deltaDb (eq::Lane::Stereo));
             audio        = std::fmax (audio, std::fmax (peakOf (L), peakOf (R)));
         }
@@ -138,7 +138,7 @@ static void testLaneDynamicsIsolation()
     const int block = 64;
     const eq::BandParams p = dynPoint (1000.0, 2.0);
     eq::EqBand band; band.prepare (kFs, 2); band.setParams (p);
-    dynamiceq::LaneDynamics dyn; dyn.prepare (kFs, 2); dyn.setParams (p);
+    dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (kFs, 2)); dyn.setParams (p);
 
     std::vector<float> L ((std::size_t) block), R ((std::size_t) block), sl ((std::size_t) block), sr ((std::size_t) block);
     float* aud[2] { L.data(), R.data() };
@@ -153,7 +153,7 @@ static void testLaneDynamicsIsolation()
             L[(std::size_t) i] = sl[(std::size_t) i] = 0.0f;
             R[(std::size_t) i] = sr[(std::size_t) i] = v;
         }
-        dyn.processBand (aud, sc, 2, block, band);
+        felitronics::test::run (dyn.processBand (aud, sc, 2, block, band));
     }
     const double withBoth = dyn.deltaDb (eq::Lane::Stereo);
     ok (withBoth < -6.0, "precondition: the loud channel is driving the linked detector");
@@ -161,7 +161,7 @@ static void testLaneDynamicsIsolation()
     for (int done = 0; done < (int) (kFs / 2); done += block)   // drop to mono: the loud channel is gone
     {
         for (int i = 0; i < block; ++i, ++ph) { L[(std::size_t) i] = sl[(std::size_t) i] = 0.0f; }
-        dyn.processBand (aud, sc, 1, block, band);
+        felitronics::test::run (dyn.processBand (aud, sc, 1, block, band));
     }
     ok (dyn.deltaDb (eq::Lane::Stereo) > withBoth + 5.0,
         "losing the loud channel really releases the shared gain — the shared half was not frozen by the fix");
@@ -182,7 +182,7 @@ static void testLaneDynamicsStayingColumn()
     const int block = 64;
     const eq::BandParams p = dynPoint (100.0, 10.0, -18.0);
     eq::EqBand band; band.prepare (kFs, 2); band.setParams (p);
-    dynamiceq::LaneDynamics dyn; dyn.prepare (kFs, 2); dyn.setParams (p);
+    dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (kFs, 2)); dyn.setParams (p);
 
     std::vector<float> L ((std::size_t) block), R ((std::size_t) block), sl ((std::size_t) block), sr ((std::size_t) block);
     float* aud[2] { L.data(), R.data() };
@@ -197,7 +197,7 @@ static void testLaneDynamicsStayingColumn()
             L[(std::size_t) i] = sl[(std::size_t) i] = v;      // channel 0 is the LOUD one, and it stays
             R[(std::size_t) i] = sr[(std::size_t) i] = 0.0f;   // channel 1 is silent, and it leaves
         }
-        dyn.processBand (aud, sc, nc, block, band);
+        felitronics::test::run (dyn.processBand (aud, sc, nc, block, band));
     };
 
     for (int done = 0; done < (int) kFs; done += block) feed (2);
@@ -222,7 +222,7 @@ static void testDynamicEqBandChannelGate()
         dynamiceq::DynamicEqBand b;
         dynamiceq::DynamicEqBandParams p;
         p.freq = cs.f; p.Q = cs.Q; p.thresholdDb = -60.0; p.rangeDb = 12.0; p.staticGainDb = 0.0;
-        b.prepare (kFs, 2); b.setParams (p);
+        felitronics::test::run (b.prepare (kFs, 2)); b.setParams (p);
 
         std::vector<float> L ((std::size_t) N, 0.0f), R ((std::size_t) N, 0.0f);
         float* io[2] { L.data(), R.data() };
@@ -236,7 +236,7 @@ static void testDynamicEqBandChannelGate()
                 L[(std::size_t) i] = 0.0f;
                 R[(std::size_t) i] = (float) std::sin (2.0 * core::kPi * cs.f * (double) ph / kFs);
             }
-            b.process (io, 2, N);
+            felitronics::test::run (b.process (io, 2, N));
             drove = std::fmax (drove, std::fabs (b.dynamicDeltaDb()));
         }
         ok (drove > 3.0, std::string ("precondition ") + cs.name + ": the tone really moved the band");
@@ -244,7 +244,7 @@ static void testDynamicEqBandChannelGate()
         for (int done = 0; done < (int) kFs; done += N)      // the excursion: mono, silence
         {
             std::fill (L.begin(), L.end(), 0.0f);
-            b.process (io, 1, N);
+            felitronics::test::run (b.process (io, 1, N));
         }
 
         std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
@@ -252,7 +252,7 @@ static void testDynamicEqBandChannelGate()
         for (int k = 0; k < 20; ++k)
         {
             std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
-            b.process (io, 2, N);
+            felitronics::test::run (b.process (io, 2, N));
             worst = std::fmax (worst, std::fmax (peakOf (L), peakOf (R)));
         }
         ok (worst == 0.0, std::string (cs.name) + ": exact zero out of silence on the returned channel (was 0.388)");
@@ -268,7 +268,7 @@ static void testDynamicEqBandIsolation()
     dynamiceq::DynamicEqBand dut, ref;
     dynamiceq::DynamicEqBandParams p;
     p.freq = 800.0; p.Q = 1.5; p.thresholdDb = -70.0; p.rangeDb = 9.0;
-    dut.prepare (kFs, 2); ref.prepare (kFs, 2);
+    felitronics::test::run (dut.prepare (kFs, 2)); felitronics::test::run (ref.prepare (kFs, 2));
     dut.setParams (p);   ref.setParams (p);
 
     std::vector<float> d0 ((std::size_t) N), d1 ((std::size_t) N), r0 ((std::size_t) N), r1 ((std::size_t) N);
@@ -288,8 +288,8 @@ static void testDynamicEqBandIsolation()
             d0[(std::size_t) i] = r0[(std::size_t) i] = v;
             d1[(std::size_t) i] = r1[(std::size_t) i] = v;
         }
-        dut.process (dio, (k >= 100 && k < 200) ? 1 : 2, N);
-        ref.process (rio, 2, N);
+        felitronics::test::run (dut.process (dio, (k >= 100 && k < 200) ? 1 : 2, N));
+        felitronics::test::run (ref.process (rio, 2, N));
     }
     ok (peakOf (d0) > 0.05, "precondition: the stream is still carrying signal at the end");
 
@@ -345,7 +345,7 @@ static void testParkPolicy()
             p.dyn.on = true; p.dyn.rangeDb = -24.0;               // inside the rail, so nothing pins
             p.dyn.thrAuto = true;
             band.prepare (kFs, 2); band.setParams (p);
-            dyn.prepare (kFs, 2);  dyn.setParams (p);
+            felitronics::test::run (dyn.prepare (kFs, 2));  dyn.setParams (p);
         };
         eq::EqBand bd, br; dynamiceq::LaneDynamics dd, dr;
         build (dd, bd); build (dr, br);
@@ -369,7 +369,7 @@ static void testParkPolicy()
                     L[(std::size_t) i] = sl[(std::size_t) i] =  v;
                     R[(std::size_t) i] = sr[(std::size_t) i] = -v;
                 }
-                dyn.processBand (aud, sc, nc, B, band);
+                felitronics::test::run (dyn.processBand (aud, sc, nc, B, band));
                 ph += B;
             }
         };
@@ -455,7 +455,7 @@ int main()
         const int N = 64;
         const eq::BandParams p = dynPoint (1000.0, 2.0);
         eq::EqBand band; band.prepare (kFs, 4); band.setParams (p);
-        dynamiceq::LaneDynamics dyn; dyn.prepare (kFs, 4); dyn.setParams (p);
+        dynamiceq::LaneDynamics dyn; felitronics::test::run (dyn.prepare (kFs, 4)); dyn.setParams (p);
         std::vector<float> v[4], s[4];
         float* aud[4] {}; const float* sc[4] {};
         for (int c = 0; c < 4; ++c)
@@ -463,9 +463,9 @@ int main()
             v[c].assign ((std::size_t) N, 0.2f); s[c].assign ((std::size_t) N, 0.2f);
             aud[c] = v[c].data(); sc[c] = s[c].data();
         }
-        dyn.processBand (aud, sc, 2, N, band);
+        felitronics::test::run (dyn.processBand (aud, sc, 2, N, band));
         const int before = g_allocs.load();
-        for (int k = 0; k < 40; ++k) dyn.processBand (aud, sc, (k % 3) + 1, N, band);
+        for (int k = 0; k < 40; ++k) felitronics::test::run (dyn.processBand (aud, sc, (k % 3) + 1, N, band));
         felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across 40 blocks of changing width");
     }
 

@@ -47,8 +47,8 @@ int main()
     {
         const int N = 8000; std::vector<float> l (N), r (N), l0 (N), r0 (N);
         for (int i = 0; i < N; ++i) { l[i] = l0[i] = 0.4f * rng(); r[i] = r0[i] = 0.4f * rng(); }
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; mw.process (io, 2, std::min (1024, N - o)); }
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mw.process (io, 2, std::min (1024, N - o))); }
         eq::MultibandSplitter<4> refL, refR; refL.prepare (sr, 1); refR.prepare (sr, 1);
         refL.setNumBands (3); refL.setCrossovers (xover, 2); refR.setNumBands (3); refR.setCrossovers (xover, 2);
         double md = 0; float band[4];
@@ -66,9 +66,9 @@ int main()
     {
         const int N = 8000; std::vector<float> l (N), r (N), m0 (N);
         for (int i = 0; i < N; ++i) { l[i] = 0.4f * rng(); r[i] = 0.4f * rng(); m0[i] = 0.5f * (l[i] + r[i]); }
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setBandWidth (0, 0.5f); mw.setBandWidth (1, 1.3f); mw.setBandWidth (2, 1.8f); mw.reset();   // arbitrary, settled
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; mw.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mw.process (io, 2, std::min (1024, N - o))); }
         eq::MultibandSplitter<4> refM; refM.prepare (sr, 1); refM.setNumBands (3); refM.setCrossovers (xover, 2);
         double md = 0; float band[4];
         for (int i = 0; i < N; ++i) { refM.splitSample (0, m0[i], band); const float rm = refM.sumSample (band); if (i >= 1000) md = std::max (md, (double) std::fabs (0.5f * (l[i] + r[i]) - rm)); }
@@ -86,9 +86,9 @@ int main()
             l[i] = mid + sde; r[i] = mid - sde;                                            // side lives entirely at 6 kHz
         }
         std::vector<float> sideIn (N); for (int i = 0; i < N; ++i) sideIn[i] = 0.5f * (l[i] - r[i]);
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setBandWidth (2, 0.0f); mw.reset();                                             // mono the > 2 kHz band
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; mw.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mw.process (io, 2, std::min (1024, N - o))); }
         std::vector<float> sideOut (N); for (int i = 0; i < N; ++i) sideOut[i] = 0.5f * (l[i] - r[i]);
         test::ok (rmsTail (sideOut, N / 2) < 0.1 * rmsTail (sideIn, N / 2), "width=0 on the high band kills the 6 kHz side (low-band side would survive)");
     }
@@ -98,9 +98,9 @@ int main()
     {
         const int N = 1024; std::vector<float> x (N), x0 (N);
         for (int i = 0; i < N; ++i) x[i] = x0[i] = 0.5f * rng();
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setBandWidth (0, 0.0f); mw.setBandWidth (2, 2.0f);
-        float* io[1] { x.data() }; mw.process (io, 1, N);
+        float* io[1] { x.data() }; felitronics::test::run (mw.process (io, 1, N));
         double md = 0; for (int i = 0; i < N; ++i) md = std::max (md, (double) std::fabs (x[i] - x0[i]));
         test::ok (md == 0.0, "numChannels < 2 → bit-exact passthrough");
     }
@@ -108,12 +108,12 @@ int main()
     // --- (5) no allocation in process() ---
     test::group ("MultibandWidth no-alloc");
     {
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 512, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 512, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setBandWidth (0, 0.7f); mw.setBandWidth (2, 1.6f);
         std::vector<float> l (512, 0.3f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
-        mw.process (io, 2, 512);
+        felitronics::test::run (mw.process (io, 2, 512));
         const long before = g_allocs.load();
-        mw.process (io, 2, 512); mw.process (io, 2, 512);
+        felitronics::test::run (mw.process (io, 2, 512)); felitronics::test::run (mw.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
     }
 
@@ -122,9 +122,9 @@ int main()
     {
         const int N = 10000; std::vector<float> l (N), r (N), sideIn (N);
         for (int i = 0; i < N; ++i) { const float s = 0.3f * (float) std::sin (2.0 * pi * 600.0 * i / sr); l[i] = s; r[i] = -s; sideIn[i] = 0.5f * (l[i] - r[i]); }   // M=0, S at 600 Hz (mid-band 1)
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setBandWidth (1, 2.0f); mw.reset();
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; mw.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mw.process (io, 2, std::min (1024, N - o))); }
         std::vector<float> sideOut (N); for (int i = 0; i < N; ++i) sideOut[i] = 0.5f * (l[i] - r[i]);
         const double ratio = rmsTail (sideOut, N / 2) / rmsTail (sideIn, N / 2);
         test::ok (ratio > 1.8 && ratio < 2.15, "width=2 on the 600 Hz band → its side ≈ doubled");
@@ -133,12 +133,12 @@ int main()
     // --- (7) an out-of-range band index is a safe no-op (no UB on the per-band array) ---
     test::group ("MultibandWidth out-of-range band index is safe");
     {
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setBandWidth (1, 1.5f);
         mw.setBandWidth (-1, 0.0f); mw.setBandWidth (4, 0.0f); mw.setBandWidth (99, 0.0f);   // all ignored
         mw.setBandBypass (-1, true); mw.setBandSolo (7, true);
         const int N = 1024; std::vector<float> l (N), r (N); for (int i = 0; i < N; ++i) { l[i] = 0.3f * rng(); r[i] = 0.3f * rng(); }
-        float* io[2] { l.data(), r.data() }; mw.process (io, 2, N);
+        float* io[2] { l.data(), r.data() }; felitronics::test::run (mw.process (io, 2, N));
         bool fin = true; for (int i = 0; i < N; ++i) if (! std::isfinite (l[i]) || ! std::isfinite (r[i])) fin = false;
         test::ok (fin && mw.bandWidth (1) == 1.5f && mw.bandWidth (99) == 1.0f, "OOB indices ignored (no crash; the valid band untouched)");
     }
@@ -148,9 +148,9 @@ int main()
     {
         const int N = 8000; std::vector<float> l (N), r (N), l0 (N), r0 (N);
         for (int i = 0; i < N; ++i) { l[i] = l0[i] = 0.4f * rng(); r[i] = r0[i] = 0.4f * rng(); }
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (3); mw.setCrossovers (xover, 2);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (3); mw.setCrossovers (xover, 2);
         mw.setMix (0.5f);                                                                  // widths all 1 → wet == dry
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; mw.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mw.process (io, 2, std::min (1024, N - o))); }
         eq::MultibandSplitter<4> refL, refR; refL.prepare (sr, 1); refR.prepare (sr, 1);
         refL.setNumBands (3); refL.setCrossovers (xover, 2); refR.setNumBands (3); refR.setCrossovers (xover, 2);
         double md = 0; float band[4];
@@ -164,9 +164,9 @@ int main()
         const int N = 8000; std::vector<float> l (N), r (N), m0 (N);
         for (int i = 0; i < N; ++i) { l[i] = 0.4f * rng(); r[i] = 0.4f * rng(); m0[i] = 0.5f * (l[i] + r[i]); }
         const float xf4[3] { 120.0f, 800.0f, 5000.0f };
-        multiband::MultibandWidth<4> mw; mw.prepare (sr, 1024, 2); mw.setNumBands (4); mw.setCrossovers (xf4, 3);
+        multiband::MultibandWidth<4> mw; felitronics::test::run (mw.prepare (sr, 1024, 2)); mw.setNumBands (4); mw.setCrossovers (xf4, 3);
         mw.setBandWidth (0, 0.5f); mw.setBandWidth (1, 1.2f); mw.setBandWidth (2, 0.8f); mw.setBandWidth (3, 1.7f); mw.reset();
-        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; mw.process (io, 2, std::min (1024, N - o)); }
+        for (int o = 0; o < N; o += 1024) { float* io[2] { l.data() + o, r.data() + o }; felitronics::test::run (mw.process (io, 2, std::min (1024, N - o))); }
         eq::MultibandSplitter<4> refM; refM.prepare (sr, 1); refM.setNumBands (4); refM.setCrossovers (xf4, 3);
         double md = 0; float band[4];
         for (int i = 0; i < N; ++i) { refM.splitSample (0, m0[i], band); const float rm = refM.sumSample (band); if (i >= 1000) md = std::max (md, (double) std::fabs (0.5f * (l[i] + r[i]) - rm)); }

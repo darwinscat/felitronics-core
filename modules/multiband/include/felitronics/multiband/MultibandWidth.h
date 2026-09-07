@@ -25,10 +25,17 @@ template <int MaxBands = 4>
 class MultibandWidth
 {
 public:
-    bool prepare (double sampleRate, int maxBlock, int maxChannels)
+    // LAW 11(b): the ceiling is TWO, not core::kMaxChannels — the band behind this is a fixed stereo
+    // stage. prepare(..., 4) used to be accepted, after which process(io, 4, n) was a well-formed call
+    // that split and allpass-reconstructed all four planes, had its band refuse, and returned false
+    // having ALREADY MOVED the buffer by 0.5358 — a refusal that is not inert, which is the one thing
+    // law 11 promises about a refusal.
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels)
     {
-        return mb_.prepare (sampleRate, maxBlock, maxChannels, 0,            // StereoWidth is zero-latency → no align delay
-                            [&] (stereo::StereoWidth& w) { w.prepare (sampleRate, maxBlock, maxChannels); });
+        ready_ = false;                                                  // law 11(b): disarm, then validate
+        if (maxChannels < 1 || maxChannels > 2) return false;
+        return ready_ = mb_.prepare (sampleRate, maxBlock, maxChannels, 0,            // StereoWidth is zero-latency → no align delay
+                            [&] (stereo::StereoWidth& w) { return w.prepare (sampleRate, maxBlock, maxChannels); });
     }
 
     void reset() noexcept { mb_.reset(); }
@@ -45,13 +52,21 @@ public:
 
     int latencySamples() const noexcept { return mb_.latencySamples(); }     // 0 (LR4 split + StereoWidth)
 
-    void process (float* const* io, int numChannels, int n) noexcept
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        if (numChannels < 2) return;                                         // mono → true passthrough (no allpass phase)
-        mb_.process (io, numChannels, n);
+        if (numChannels < 0 || n < 0) return false;
+        if (! ready_) return false;                                      // a refused prepare() disarms it
+        // Mono stays a true passthrough — but the call still goes DOWN, at zero width, so the crossover
+        // tree behind it sees the gap and drops its frozen state. Returning here left an LR4 tree at
+        // 120 Hz ringing on the return: 0.498 out of DIGITAL SILENCE (-6.06 dBFS), a tail past 512
+        // samples, for both a mono and a zero-width call. It also makes the composite answer for
+        // `prepared` rather than accepting a call it was never prepared for.
+        if (numChannels < 2) return mb_.process (io, 0, n);
+        return mb_.process (io, numChannels, n);
     }
 
 private:
+    bool ready_ = false;      // law 11(b): a refused prepare() must not leave the old build answering
     MultibandProcessor<stereo::StereoWidth, MaxBands> mb_;
 };
 

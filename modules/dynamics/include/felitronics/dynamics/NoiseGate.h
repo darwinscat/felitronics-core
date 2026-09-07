@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <felitronics/core/Config.h>
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/dynamics/ChannelLinker.h>
 #include <felitronics/dynamics/EnvelopeFollower.h>
@@ -57,15 +58,29 @@ public:
         LinkMode link       = LinkMode::Max;   // image-preserving multichannel link (reacts to the loudest lane)
     };
 
-    void prepare (double sampleRate, int maxBlock, int /*maxChannels*/)
+    // Law 11: every argument prepare() takes is BINDING. `maxChannels` used to be ignored here, which
+    // made the gate's declared width a fiction — it would happily attenuate any number of lanes, and the
+    // fused process() below needs a bound to build its chunk pointers from. Refuses rather than clamps,
+    // for the reason Compressor states: a silently reduced width refuses every later call instead.
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels)
     {
+        prepared_ = false;                                   // any early return below leaves it unprepared
+        if (maxBlock < 1) return false;
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
         sr = sampleRate > 1000.0 ? sampleRate : 48000.0;
-        gainCurve.assign ((std::size_t) std::max (1, maxBlock), 1.0f);
+        maxCh_ = maxChannels;
+        gainCurve.assign ((std::size_t) maxBlock, 1.0f);
         setConfig (cfg);
         // enable is seeded by the first analyse() block (on ? 1 : 0 via the ramp); start unity.
         enable = 0.0f;
         reset();
+        prepared_ = true;
+        return true;
     }
+
+    bool isPrepared() const noexcept { return prepared_; }
+    int  maxBlock()   const noexcept { return prepared_ ? (int) gainCurve.size() : 0; }
+    int  maxChannels() const noexcept { return prepared_ ? maxCh_ : 0; }
 
     // Recompute coefficients from `c`. Not the audio thread (or call it before the stream starts).
     void setConfig (const Config& c)
@@ -94,6 +109,7 @@ public:
         lastGain = 1.0f + enable * (floorGain - 1.0f);
         open = false;
         hold = 0;
+        analysedN_ = 0;                   // a restarted stream carries no analysed curve
     }
 
     // Seed the on/off crossfade to a known state (a JUMP, no ramp): call after prepare() when the host knows
@@ -107,11 +123,23 @@ public:
 
     // PHASE A — read the LINKED key from `key` (≤2 lanes are linked) and fill the per-sample gain curve.
     // `on` = the gate feature toggle; `thresholdDb` = the open threshold (dBFS, vs the key level).
-    void analyse (const float* const* key, int numChannels, int n, bool on, float thresholdDb) noexcept
+    // LAW 11(a), the named exception: this phase's RESULT is the curve, and the curve is exactly
+    // maxBlock long, so a longer call cannot be chunked — the second phase would have nothing to apply.
+    // It therefore REFUSES instead of clamping. Clamping is what it used to do, and it let the samples
+    // past maxBlock out UNGATED: measured 3840 of 4096 at +89.99 dB over the gated ones, which is
+    // 100% of the construction ceiling (-floorDb = 90 dB). Use process() for a call of any length.
+    [[nodiscard]] bool analyse (const float* const* key, int numChannels, int n, bool on, float thresholdDb) noexcept
     {
-        n = std::min (n, (int) gainCurve.size());
+        if (numChannels < 0 || n < 0) return false;                       // malformed
+        if (! prepared_) return false;
+        if (numChannels > maxCh_) return false;                           // width is a LIMIT
+        if (n > (int) gainCurve.size()) return false;                     // capacity-bearing: see above
+        if (n == 0) return true;                                          // law 11(d): n == 0 is the ONE true
+                                                                          // no-op — it must not invalidate a
+                                                                          // curve a previous call produced
         const int keyCh = std::min (numChannels, 2);
-        if (keyCh < 1 || n <= 0) return;                                  // no lane to key off — never deref key[0] blindly
+        analysedN_ = 0;                                                   // no valid curve until this call writes one
+        if (keyCh < 1) return true;                                       // no lane to key off — never deref key[0] blindly
         if (! std::isfinite (thresholdDb)) thresholdDb = -50.0f;          // a NaN threshold would freeze both compares
         const float openLin  = dbToGain (thresholdDb);
         const float closeLin = dbToGain (thresholdDb - cfg.hysteresisDb);
@@ -154,22 +182,72 @@ public:
         env.flushDenormals();
         lastCoreGain = coreGain;
         lastGain     = gainCurve[(std::size_t) (n - 1)];
+        analysedN_   = n;                                                 // this is how far the curve is valid
+        return true;
     }
 
+    // How many samples of the curve the last accepted analyse() produced. applyGain() may not reach past it.
+    int analysedSamples() const noexcept { return analysedN_; }
+
     // PHASE B — apply the stored curve to `io` (the SAME curve on every lane = a linked gate).
-    void applyGain (float* const* io, int numChannels, int n) const noexcept
+    [[nodiscard]] bool applyGain (float* const* io, int numChannels, int n) const noexcept
     {
-        n = std::min (n, (int) gainCurve.size());
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > maxCh_) return false;
+        // THE CURVE HAS A LENGTH, AND ONLY THE CURVE KNOWS IT. Bounding phase B by the buffer's CAPACITY
+        // instead of by what phase A actually wrote let a short analysis be followed by a long apply, and
+        // the tail was then multiplied by the PREVIOUS call's curve: measured, analyse(quiet, 512) settled
+        // closed, then analyse(LOUD, 256), then applyGain(512) attenuated samples [256,512) by 90.0 dB —
+        // the floor — on material that was never analysed at all. Same class as the width EqEngine's
+        // captureSectionInput closed (a capture narrower than the read), one axis over.
+        if (numChannels == 0) return true;   // no lanes to attenuate — the same geometry analyse()
+                                             // accepts, and law 11's order answers it before the curve
+        if (n > analysedN_) return false;
         for (int ch = 0; ch < numChannels; ++ch)
             for (int i = 0; i < n; ++i)
                 io[ch][i] *= gainCurve[(std::size_t) i];
+        return true;
     }
 
-    // Self-keyed convenience: detect + attenuate the same buffer in one call.
-    void process (float* const* io, int numChannels, int n, bool on, float thresholdDb) noexcept
+    // Self-keyed convenience: detect + attenuate the same buffer in one call. LAW 11(a) — the length is
+    // a CAPACITY: this form chunks to maxBlock, so any n is gated IN FULL and the result is bit-identical
+    // to the caller having chunked it itself (every piece of state — env, hold, open, coreGain, enable —
+    // lives in members and carries across the seam). The two-phase form above cannot do this, which is
+    // exactly why this one exists.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n, bool on, float thresholdDb) noexcept
     {
-        analyse (io, numChannels, n, on, thresholdDb);
-        applyGain (io, numChannels, n);
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > maxCh_) return false;
+        if (n == 0) return true;                        // no samples: the ONE true no-op
+        if (numChannels == 0)
+        {
+            // An accepted call with no lanes produced no curve, and the fused form has to say so or it
+            // disagrees with its own two-phase halves: analyse(key, 0, n) sets the length to 0, so a
+            // later applyGain() is refused — while this path used to leave the OLD curve standing and
+            // the same applyGain() then attenuated by the floor, about -90 dB.
+            analysedN_ = 0;
+            return true;
+        }
+
+        const int mb = (int) gainCurve.size();
+        float* sub[core::kMaxChannels] {};
+        for (int off = 0; off < n; )
+        {
+            const int m = std::min (n - off, mb);
+            for (int c = 0; c < numChannels; ++c) sub[(std::size_t) c] = io[c] + off;
+            // NEITHER OF THESE CAN FIRE, and that is load-bearing rather than lucky: every condition the
+            // two phases refuse on — malformed extents, unprepared, a width past maxCh_, a length past the
+            // curve — is settled above this loop, and `m <= mb` by construction. It matters because a
+            // mid-loop `return false` would break law 11's own invariant: the chunks BEFORE it have
+            // already run, so the call would be both refused and half-done. If a future guard makes one
+            // of these reachable, the loop has to become all-or-nothing FIRST.
+            if (! analyse (sub, numChannels, m, on, thresholdDb)) return false;
+            if (! applyGain (sub, numChannels, m)) return false;
+            off += m;                                   // `off += mb` could step past INT_MAX
+        }
+        return true;
     }
 
     // EFFECTIVE applied gain at the last block end (incl. the enable crossfade) — the honest GR-meter reading:
@@ -199,6 +277,9 @@ private:
     int    hold = 0;
 
     std::vector<float> gainCurve;         // per-sample multiplier (incl. enable), sized maxBlock in prepare()
+    int    maxCh_ = 0;                    // declared width — law 11(b), a LIMIT, not a clamp
+    int    analysedN_ = 0;                // samples of gainCurve the last analyse() actually wrote
+    bool   prepared_ = false;             // true only after a prepare() that succeeded
 };
 
 } // namespace felitronics::dynamics

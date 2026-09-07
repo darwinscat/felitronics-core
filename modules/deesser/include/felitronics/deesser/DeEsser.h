@@ -46,18 +46,24 @@ struct DeEsserParams
 class DeEsser
 {
 public:
-    void prepare (double sampleRate, int maxBlock, int maxChannels) noexcept
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels) noexcept
     {
+        prepared_ = false;                                       // any early return below leaves it unprepared
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
-        channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        channels_ = maxChannels;
         side_.prepare (fs_, channels_);
         xover_.prepare (fs_, channels_);
         env_.prepare (fs_); gr_.prepare (fs_);
         (void) maxBlock;
-        deq_.prepare (fs_, channels_);
+        if (! deq_.prepare (fs_, channels_)) return false;
         apply (params_);
         reset();
+        prepared_ = true;
+        return true;
     }
+
+    bool isPrepared() const noexcept { return prepared_; }
 
     void reset() noexcept
     {
@@ -73,18 +79,26 @@ public:
     static constexpr int latencySamples() noexcept { return 0; }
     double gainReductionDb() const noexcept { return grDb_; }
 
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2) — see the law for what each refusal means.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
-        const int nc = std::min (numChannels, channels_);
-        if (nc <= 0 || n <= 0) return;
-        dropStoppedChannels (nc);
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;
+        if (numChannels > channels_) return false;                // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                                  // no samples: no time, no edge
+        const int nc = numChannels;
+        dropStoppedChannels (nc);                                 // law 11(d): the edge is clocked by n
+        // ...and the gap has to reach the INNER band too: its own per-channel SVFs freeze the same way.
+        // Measured on a 7 kHz tone through the default DynamicEq mode: 0.182 out of DIGITAL SILENCE
+        // (-14.8 dBFS) when this returned early instead of passing the zero width down.
+        if (nc == 0) return deq_.process (io, 0, n);
 
         // DynamicEq mode = the surgical dynamic-EQ band (no split, no listen detour).
         if (params_.mode == DeEsserMode::DynamicEq && ! params_.listen)
         {
-            deq_.process (io, numChannels, n);
+            const bool ok = deq_.process (io, numChannels, n);
             grDb_ = (float) deq_.dynamicDeltaDb();
-            return;
+            return ok;
         }
 
         for (int i = 0; i < n; ++i)
@@ -118,6 +132,7 @@ public:
             }
         }
         side_.flushDenormals(); xover_.flushDenormals(); env_.flushDenormals(); gr_.flushDenormals();
+        return true;
     }
 
 private:
@@ -147,6 +162,7 @@ private:
 
     double fs_ = 48000.0;
     int channels_ = 2;
+    bool prepared_ = false;                                       // true only after a prepare() that succeeded
     DeEsserParams params_;
 
     // The sidechain band-pass and the crossover are both PER CHANNEL and both advance only for c < nc,

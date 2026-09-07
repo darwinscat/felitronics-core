@@ -52,10 +52,12 @@ public:
     void prepare (double sampleRate, int maxBlock);
     void reset();
 
-    // 🔴 RT-safe, in place. No model loaded → clean passthrough (no-op).
+    // 🔴 RT-safe, in place. No model loaded → clean passthrough (no-op, and an ACCEPTED call).
     // `normalize` applies the model's loudness makeup (output normalisation) when the model
     // carries a loudness tag — brings raw model output to a consistent reference level.
-    void process (float* const* io, int numChannels, int numSamples, bool normalize);
+    // Law 11: `numSamples` is any length (chunked internally); `numChannels` is 1 or 2 and anything
+    // else is REFUSED whole — false means nothing was touched. See DSP-ARCHITECTURE.md §2 law 11.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples, bool normalize) noexcept;
 
     //--- model lifecycle (message thread) ----------------------------------------
     // Build a NAM model from raw .nam bytes off the audio thread and atomic-swap it in.

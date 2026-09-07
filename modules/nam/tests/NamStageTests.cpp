@@ -101,7 +101,7 @@ std::vector<float> runMono (felitronics::nam::NamStage& stage, const std::vector
 {
     std::vector<float> output = input;
     float* io[1] { output.data() };
-    stage.process (io, 1, (int) output.size(), normalize);
+    felitronics::test::run (stage.process (io, 1, (int) output.size(), normalize));
     return output;
 }
 
@@ -132,7 +132,7 @@ int main()
         const auto leftBefore = left;
         const auto rightBefore = right;
         float* io[2] { left.data(), right.data() };
-        stage.process (io, 2, 512, true);
+        felitronics::test::run (stage.process (io, 2, 512, true));
         test::ok (left == leftBefore && right == rightBefore, "buffer is untouched without a model");
         test::ok (stage.latencySamples() == 0, "no model reports zero latency");
     }
@@ -224,7 +224,7 @@ int main()
         stage.clearModel();
         float advance = 0.0f;
         float* advanceIo[1] { &advance };
-        stage.process (advanceIo, 1, 1, false);
+        felitronics::test::run (stage.process (advanceIo, 1, 1, false));
         stage.collectGarbage();
         const auto untagged = gainModel (nullptr);
         test::ok (load (stage, untagged), "untagged model is accepted under the historical 48 kHz fallback");
@@ -251,7 +251,7 @@ int main()
 
         float probe = 1.0f;
         float* io[1] { &probe };
-        stage.process (io, 1, 1, false);
+        felitronics::test::run (stage.process (io, 1, 1, false));
         test::approx (probe, 0.65, 1.0e-6, "the frozen live model is audibly the 65th accepted load");
         test::ok (stage.collectGarbage(), "one audio block plus garbage collection lands the pending intent");
         test::ok (stage.modelHasLoudness() && stage.modelSampleRate() == 48000.0,
@@ -259,7 +259,7 @@ int main()
         test::approx (stage.modelLoudness(), -102.0, 1.0e-9,
                       "the latest (72nd), not the first parked load, wins");
         probe = 1.0f;
-        stage.process (io, 1, 1, false);
+        felitronics::test::run (stage.process (io, 1, 1, false));
         test::approx (probe, 0.72, 1.0e-6, "the latest pending model is audible after the drain");
         stage.collectGarbage();
 
@@ -273,7 +273,7 @@ int main()
         test::ok (stage.hasModel() && stage.modelSampleRate() == 48000.0 && ! stage.modelHasLoudness(),
                   "a deferred clear leaves the live model and mirrors truthful");
         probe = 0.0f;
-        stage.process (io, 1, 1, false);
+        felitronics::test::run (stage.process (io, 1, 1, false));
         test::ok (stage.collectGarbage(), "deferred clear lands after one block drains the queue");
         test::ok (! stage.hasModel() && stage.modelSampleRate() == 0.0
                   && ! stage.modelHasLoudness() && stage.modelLoudness() == 0.0,
@@ -295,7 +295,7 @@ int main()
         const auto leftInput = left;
         const auto rightInput = right;
         float* stereoIo[2] { left.data(), right.data() };
-        stereo.process (stereoIo, 2, 16, false);
+        felitronics::test::run (stereo.process (stereoIo, 2, 16, false));
         const auto independentLeft = runMono (monoLeft, leftInput, false);
         const auto independentRight = runMono (monoRight, rightInput, false);
 
@@ -305,6 +305,50 @@ int main()
         test::ok (biasOnly, "silent R receives exactly its own bias-only response with no L-tap crosstalk");
         test::ok (left == independentLeft && right == independentRight,
                   "one stereo run equals two independent mono runs sample-for-sample");
+    }
+
+    // LAW 11(a) — the length is a CAPACITY. This used to be `n = std::min (numSamples, maxBlock)`, so
+    // everything past the prepared block came out of the amp BIT-IDENTICAL to its input: measured on
+    // this same Linear FIR, prepared for 64 and called with 512, 448 of 512 samples never met the model.
+    // Simply dropping the clamp would have been worse than the defect — processChannel copies n samples
+    // into a `maxModelFrames` scratch and NAM's own buffers are sized from the prepared block, so an
+    // unclamped n is a heap overflow here and a resize (an allocation) inside NAM, on the audio thread.
+    test::group ("law 11a: a call longer than maxBlock is CHUNKED, not clamped");
+    {
+        const int MB = 64, N = 517;                       // 517 is deliberately not a multiple of 64
+        nam::NamStage one, many;
+        one.prepare (48000.0, MB);
+        many.prepare (48000.0, MB);
+        const auto json = firModel();
+        test::ok (load (one, json) && load (many, json), "precondition: the FIR fixture loads into both");
+
+        std::vector<float> a ((std::size_t) N, 0.0f), b;
+        for (int i = 0; i < N; ++i) a[(std::size_t) i] = (i % 41 == 0) ? 0.9f : 0.05f * (float) std::sin (0.037 * i);
+        const auto in = a;
+        b = a;
+
+        float* pa[1] { a.data() };
+        felitronics::test::run (one.process (pa, 1, N, false));
+        for (int off = 0; off < N; )
+        {
+            const int m = std::min (N - off, MB);
+            float* pb[1] { b.data() + off };
+            felitronics::test::run (many.process (pb, 1, m, false));
+            off += m;
+        }
+
+        int touched = 0; double spread = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            if (a[(std::size_t) i] != in[(std::size_t) i]) ++touched;
+            spread = std::max (spread, (double) std::fabs (a[(std::size_t) i] - in[(std::size_t) i]));
+        }
+        test::ok (spread > 1e-3, "precondition: the model MOVED the signal (max |out-in| = " + std::to_string (spread) + ")");
+        test::ok (touched == N, "every one of the " + std::to_string (N) + " samples met the model (was: 64 of 517)");
+        test::ok (a == b, "...and one long call is bit-identical to the caller's own 64-sample calls");
+        test::ok (! one.process (pa, 3, N, false), "a 3-channel call is REFUSED — a NAM capture is mono or true-stereo");
+        test::ok (! one.process (pa, 1, -1, false), "a negative length is REFUSED");
+        test::ok (one.process (pa, 0, N, false) && one.process (pa, 1, 0, false), "degenerate calls are accepted no-ops");
     }
 
     test::group ("96 kHz host rate matching");
@@ -324,7 +368,7 @@ int main()
             for (int i = 0; i < 256; ++i)
                 block[(std::size_t) i] = 0.25f * std::sin (0.03f * (float) (pass * 256 + i));
             float* io[1] { block.data() };
-            stage.process (io, 1, 256, false);
+            felitronics::test::run (stage.process (io, 1, 256, false));
             finite = finite && allFinite (block);
             for (float value : block) peak = std::max (peak, std::fabs (value));
         }
@@ -335,7 +379,7 @@ int main()
         {
             std::vector<float> left (256, 0.1f), right (256, -0.1f);
             float* io[2] { left.data(), right.data() };
-            stage.process (io, channels, 256, false);
+            felitronics::test::run (stage.process (io, channels, 256, false));
             return allFinite (left) && (channels == 1 || allFinite (right));
         };
         const bool monoFirst = processLayout (1);
@@ -410,10 +454,10 @@ int main()
         test::ok (load (stage, json), "RT fixture model loads");
         std::vector<float> left (512, 0.2f), right (512, -0.15f);
         float* io[2] { left.data(), right.data() };
-        stage.process (io, 2, 512, false);        // warm every process-reachable container first
+        felitronics::test::run (stage.process (io, 2, 512, false));        // warm every process-reachable container first
         const long before = g_allocs.load (std::memory_order_relaxed);
-        stage.process (io, 2, 512, false);
-        stage.process (io, 2, 512, true);
+        felitronics::test::run (stage.process (io, 2, 512, false));
+        felitronics::test::run (stage.process (io, 2, 512, true));
         test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
                          "NamStage::process performs no heap allocation");
     }

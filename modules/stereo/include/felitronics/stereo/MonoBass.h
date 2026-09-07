@@ -79,14 +79,24 @@ public:
     static constexpr double kSmoothingMs = 20.0;    // click-free lowWidth automation + the bypass crossfade
     static constexpr float  kMinFreq     = 20.0f;
 
-    void prepare (double sampleRate, int /*maxBlock*/ = 0, int /*maxChannels*/ = 2) noexcept
+    // Law 11: a default-constructed MonoBass is NOT a valid configuration, whatever its member defaults
+    // suggest — `xo_` has no coefficients until this runs, so the fold does not fold. Measured on a pure
+    // SIDE signal at lowWidth 0: a default object passes the side band at -6.02 dB where a prepared one
+    // kills it to -54.22 — 48.199 dB of difference at 30 Hz, 6.02 at 120.
+    // LAW 11(b): it TAKES a width, so the width is binding — "a module that ignores an argument is
+    // lying about its contract" was true of this one. Disarm first, validate, then write.
+    [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/ = 0, int maxChannels = 2) noexcept
     {
+        prepared_ = false;
+        if (maxChannels < 1 || maxChannels > 2) return false;
         fs_ = (std::isfinite (sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;   // inf/NaN/≤0 -> 48 kHz
         xo_.prepare (fs_, 1);
         widthSm_.reset (fs_, kSmoothingMs * 0.001);
         xfSm_.reset (fs_, kSmoothingMs * 0.001);
         applyFrequency();
         reset();
+        prepared_ = true;
+        return true;
     }
 
     void reset() noexcept                           // snap smoothers to targets (settled, no glide) + clear filter state
@@ -136,13 +146,20 @@ public:
 
     // Stereo, in place: io[0]=L, io[1]=R. Bypass (buffer untouched) when disabled, numChannels != 2, or
     // settled full-wide. Entering bypass clears the crossover so re-entry starts from silence, not stale tails.
-    void process (float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2): this is a fixed STEREO stage, so 2 is both its maximum and the
+    // only width it can act on; narrower is a documented passthrough, wider is refused.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int n) noexcept
     {
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;                  // see prepare(): the crossover is not built yet
+        if (numChannels > 2) return false;              // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                        // no samples: no time, no edge, nothing at all —
+                                                        // the bypass edge below used to fire even here
         if (numChannels != 2 || ! enabled_ || (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f)))
         {
             if (! bypassed_) { bypassed_ = true; xo_.reset(); }
-            if (n > 0) grid_.skip (n);      // bypassed audio is still audio TIME — keep the grid anchored
-            return;
+            grid_.skip (n);                 // bypassed audio is still audio TIME — keep the grid anchored
+            return true;
         }
         bypassed_ = false;
         float* L = io[0];
@@ -159,7 +176,7 @@ public:
             {
                 bypassed_ = true; xo_.reset();
                 grid_.skip (n - i);           // the bypassed remainder is still audio time
-                return;
+                return true;
             }
             const float w  = widthSm_.getNextValue();
             const float xf = xfSm_.getNextValue();
@@ -177,6 +194,7 @@ public:
         }
         // The poison half stays per call — see eq::Biquad::healPoison(). Invisible on a finite stream.
         xo_.healPoison();
+        return true;
     }
 
 private:
@@ -188,6 +206,7 @@ private:
     }
 
     double fs_ = 48000.0;
+    bool   prepared_ = false;   // law 11: the crossover has no coefficients before prepare()
     float  freq_ = 120.0f, lowWidth_ = 0.0f;
     bool   enabled_ = true, bypassed_ = false;
     eq::Crossover2 xo_;                             // the Side-channel LR4 split (the primitive extracted from here, reused back)

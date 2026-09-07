@@ -93,10 +93,13 @@ namespace prechange
 
         void setParams (const Params& p) noexcept { params_ = p; applyParams(); }
 
-        void process (float* const* io, int numChannels, int n) noexcept
+        // Returns bool only so the shared runScenario<Sat> template below can drive both copies through
+        // felitronics::test::run; the frozen pre-change ARITHMETIC is untouched and the NULL is on samples.
+        // `false` here is the pre-change refusal (n > maxBlock_), which is what the null is comparing.
+        bool process (float* const* io, int numChannels, int n) noexcept
         {
             const int nc = std::min (numChannels, channels_);
-            if (! prepared_ || nc <= 0 || n <= 0 || n > maxBlock_) return;
+            if (! prepared_ || nc <= 0 || n <= 0 || n > maxBlock_) return false;
             const int osN = n * os_;
             for (int c = 0; c < nc; ++c)
             {
@@ -141,6 +144,7 @@ namespace prechange
                     io[c][i] = outGain_ * ((1.0f - mix_) * dry + mix_ * wet);
                 }
             }
+            return true;
         }
 
     private:
@@ -221,7 +225,7 @@ namespace nulltest
                 for (int b = 0; b < 6; ++b)
                 {
                     for (int i = 0; i < 512; ++i) { ch0[i] = r.next(); ch1[i] = r.next(); }
-                    s.process (io, 2, 512);
+                    felitronics::test::run (s.process (io, 2, 512));
                     push (io, 2, 512);
                 }
                 break;
@@ -241,7 +245,7 @@ namespace nulltest
                         ch0[i] = 0.9f * (float) std::sin (2.0 * 3.141592653589793 *  997.0 * t / 48000.0);
                         ch1[i] = 0.9f * (float) std::sin (2.0 * 3.141592653589793 * 1499.0 * t / 48000.0 + 0.5);
                     }
-                    s.process (io, 2, 256);
+                    felitronics::test::run (s.process (io, 2, 256));
                     push (io, 2, 256);
                 }
                 break;
@@ -261,7 +265,7 @@ namespace nulltest
                         const int t = b * 512 + i;
                         ch0[i] = 0.7f * (float) std::sin (2.0 * 3.141592653589793 * 187.5 * t / 48000.0) + 0.2f * r.next();
                     }
-                    s.process (io, 1, 512);
+                    felitronics::test::run (s.process (io, 1, 512));
                     push (io, 1, 512);
                 }
                 break;
@@ -287,7 +291,7 @@ namespace nulltest
                             default: { const float t = -1.0f + 2.0f * (float) i / 511.0f; ch0[i] = t; ch1[i] = -t; } break;
                         }
                     }
-                    s.process (io, 2, 512);
+                    felitronics::test::run (s.process (io, 2, 512));
                     push (io, 2, 512);
                 }
                 break;
@@ -310,7 +314,7 @@ namespace nulltest
                     q.autoComp = 0.2f * (float) b;
                     s.setParams (q);
                     for (int i = 0; i < 333; ++i) { ch0[i] = r.next(); ch1[i] = r.next(); }
-                    s.process (io, 2, 333);
+                    felitronics::test::run (s.process (io, 2, 333));
                     push (io, 2, 333);
                 }
                 break;
@@ -326,7 +330,7 @@ namespace nulltest
                 for (int b = 0; b < 4; ++b)
                 {
                     for (int i = 0; i < 512; ++i) ch0[i] = r.next();
-                    s.process (io, 1, 512);
+                    felitronics::test::run (s.process (io, 1, 512));
                     push (io, 1, 512);
                 }
                 break;
@@ -373,7 +377,7 @@ int main()
         float a[6] { 0.1f, -0.2f, 0.3f, -0.4f, 0.5f, -0.6f }, ref[6];
         for (int i = 0; i < 6; ++i) ref[i] = a[i];
         float b6[6] {}; float* io[2] { a, b6 };
-        s.process (io, 2, 6);
+        felitronics::test::run (s.process (io, 2, 6));
         double md = 0; for (int i = 0; i < 6; ++i) md = std::max (md, (double) std::fabs (a[i] - ref[i]));
         test::ok (md < 1e-6, "mix=0 -> exact dry passthrough");
 
@@ -382,7 +386,7 @@ int main()
         std::vector<float> x (512), y (512);
         for (int i = 0; i < 512; ++i) { x[i] = 0.5f * (float) std::sin (2.0 * pi * 1000.0 * i / 48000.0); y[i] = x[i]; }
         float* io2[1] { y.data() };
-        s2.process (io2, 1, 512);
+        felitronics::test::run (s2.process (io2, 1, 512));
         double dl = 0; for (int i = 64; i < 512; ++i) dl = std::max (dl, (double) std::fabs (y[i] - x[i]));
         test::ok (dl < 5e-3, "drive 0 -> ~linear passthrough (os=1)");
     }
@@ -399,14 +403,14 @@ int main()
         for (int blk = 0; blk < 8; ++blk)
         {
             for (int i = 0; i < 512; ++i) { const int n = blk * 512 + i; const float v = (float) std::sin (2.0 * pi * 1000.0 * n / 48000.0); L[i] = v; R[i] = v; }
-            s.process (io, 2, 512);
+            felitronics::test::run (s.process (io, 2, 512));
             if (blk >= 4) for (int i = 0; i < 512; ++i) peak = std::max (peak, (double) std::fabs (L[i]));
         }
         test::ok (peak < 1.10, "peak-safe: full-scale sine stays ~bounded (peak-normalised curve)");
 
         for (int i = 0; i < 512; ++i) { L[i] = 0.3f; R[i] = -0.3f; }
         const long before = g_allocs.load();
-        s.process (io, 2, 512); s.process (io, 2, 512);
+        felitronics::test::run (s.process (io, 2, 512)); felitronics::test::run (s.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (os=4)");
     }
 
@@ -425,7 +429,7 @@ int main()
         {
             for (int i = 0; i < 1024; ++i) { const int n = blk * 1024 + i; const float v = 0.7f * (float) std::sin (2.0 * pi * f * n / 48000.0); xo[i] = v; xf[i] = v; }
             float* ioOn[1] { xo.data() }; float* ioOff[1] { xf.data() };
-            on.process (ioOn, 1, 1024); off.process (ioOff, 1, 1024);
+            felitronics::test::run (on.process (ioOn, 1, 1024)); felitronics::test::run (off.process (ioOff, 1, 1024));
             if (blk == 7)
             {
                 double sOn = 0, sOff = 0; for (int i = 0; i < 1024; ++i) { sOn += xo[i]; sOff += xf[i]; }
@@ -444,12 +448,12 @@ int main()
     {
         saturation::Saturator sat;                                   // NOT prepared (channels_ == 0)
         float a[32] {}, b[32] {}; float* io[2] { a, b };
-        sat.process (io, 2, 16);                                     // unprepared → safe no-op
+        test::ok (! sat.process (io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         test::ok (! sat.prepare (48000.0, 16, 2, 4, 2), "prepare(tapsPerPhase=2) fails (oversampler rejects <4)");
-        sat.process (io, 2, 16);                                     // FAILED prepare → no-op, must not index empty osBuf_
+        test::ok (! sat.process (io, 2, 16), "...and after a FAILED prepare too, still reported");
         test::ok (sat.prepare (48000.0, 16, 2, 4, 32), "prepare valid");
-        sat.process (io, 2, 16);                                     // works
-        sat.process (io, 2, 32);                                     // n=32 > maxBlock=16 → chunked 16+16, must not overrun osBuf_
+        felitronics::test::run (sat.process (io, 2, 16));                                     // works
+        felitronics::test::run (sat.process (io, 2, 32));                                     // n=32 > maxBlock=16 → chunked 16+16, must not overrun osBuf_
         test::ok (true, "no OOB across failed-prepare / oversized-block process (ASan/UBSan is the real check)");
     }
 
@@ -464,7 +468,7 @@ int main()
         saturation::Saturator::Params p;
         p.driveDb = 0.0f; p.autoComp = 0.0f; p.mix = 0.5f; p.outputDb = 0.0f;   // ≈linear curve → wet ≈ delayed dry
         sat.setParams (p);
-        sat.process (ch, 1, n);
+        felitronics::test::run (sat.process (ch, 1, n));
         auto rmsHalf = [] (const std::vector<float>& v) {
             double s2 = 0.0; const int from = (int) v.size() / 2;
             for (int i = from; i < (int) v.size(); ++i) s2 += (double) v[i] * v[i];
@@ -483,7 +487,7 @@ int main()
         saturation::Saturator sat; sat.prepare (48000.0, n, 1, 4);
         saturation::Saturator::Params p; p.driveDb = 12.0f; p.autoComp = 1.0f; p.mix = 1.0f;
         sat.setParams (p);
-        sat.process (ch, 1, n);
+        felitronics::test::run (sat.process (ch, 1, n));
         double sx = 0.0, sy = 0.0;
         for (int i = n / 2; i < n; ++i) { sx += (double) x[i] * x[i]; sy += (double) y[i] * y[i]; }
         test::approx (std::sqrt (sy / sx), 1.0, 0.02, "12 dB drive + autoComp 1 → tiny signal passes at unity");
@@ -502,7 +506,7 @@ int main()
         const float qnan = std::numeric_limits<float>::quiet_NaN();
         p.bias = qnan; p.mix = qnan; p.outputDb = qnan; p.autoComp = qnan; p.dcBlockHz = qnan; p.driveDb = qnan;
         sat.setParams (p);
-        sat.process (ch, 1, n);
+        felitronics::test::run (sat.process (ch, 1, n));
         bool finite = true; for (float v : y) finite &= (bool) std::isfinite (v);
         test::ok (finite, "all-NaN params → finite output (fallbacks applied)");
     }
@@ -549,7 +553,7 @@ int main()
                     a0[i] = v; a1[i] = -v; b0[i] = v; b1[i] = -v;
                 }
                 if (blk == 2) { b0[7] = qnan; b0[100] = pinf; b0[255] = -pinf; b1[300] = qnan; }
-                clean.process (ioA, 2, 512); hit.process (ioB, 2, 512);
+                felitronics::test::run (clean.process (ioA, 2, 512)); felitronics::test::run (hit.process (ioB, 2, 512));
                 for (int i = 0; i < 512; ++i) allFinite &= std::isfinite (b0[i]) && std::isfinite (b1[i]);
                 if (blk >= 4)
                     lateEqual &= std::memcmp (a0.data(), b0.data(), sizeof (float) * 512) == 0
@@ -578,7 +582,7 @@ int main()
                     a[i] = v; b[i] = v;
                 }
                 if (blk == 2) { b[0] = qnan; b[128] = pinf; b[400] = -pinf; }
-                clean.process (ioA, 1, 512); hit.process (ioB, 1, 512);
+                felitronics::test::run (clean.process (ioA, 1, 512)); felitronics::test::run (hit.process (ioB, 1, 512));
                 for (int i = 0; i < 512; ++i) allFinite &= (bool) std::isfinite (b[i]);
                 if (blk >= 20)
                     for (int i = 0; i < 512; ++i) lateDiff = std::max (lateDiff, (double) std::fabs (a[i] - b[i]));
@@ -601,14 +605,14 @@ int main()
         std::vector<float> yA = x, yB = x, yC = x;
 
         saturation::Saturator sA; sA.prepare (48000.0, N, 1, 4); sA.setParams (p);
-        { float* io[1] { yA.data() }; sA.process (io, 1, N); }                       // one monolithic call
+        { float* io[1] { yA.data() }; felitronics::test::run (sA.process (io, 1, N)); }                       // one monolithic call
 
         saturation::Saturator sB; sB.prepare (48000.0, N, 1, 4); sB.setParams (p);
         for (int off = 0; off < N; off += 512)                                       // manual 16 x 512 calls
-        { float* io[1] { yB.data() + off }; sB.process (io, 1, 512); }
+        { float* io[1] { yB.data() + off }; felitronics::test::run (sB.process (io, 1, 512)); }
 
         saturation::Saturator sC; sC.prepare (48000.0, 500, 1, 4); sC.setParams (p); // maxBlock 500 → the driver
-        { float* io[1] { yC.data() }; sC.process (io, 1, N); }                       //   chunks 16x500 + 192
+        { float* io[1] { yC.data() }; felitronics::test::run (sC.process (io, 1, N)); }                       //   chunks 16x500 + 192
 
         test::ok (std::memcmp (yA.data(), yB.data(), sizeof (float) * N) == 0,
                   "one 8192 call == 16x512 manual calls (state streams across calls)");
@@ -646,7 +650,7 @@ int main()
         {
             for (int i = 0; i < block; ++i)
                 buf[(std::size_t) i] = (float) (0.8 * std::sin (2.0 * core::kPi * 220.0 * (b * block + i) / fs));
-            sat.process (io, 1, block);
+            felitronics::test::run (sat.process (io, 1, block));
         }
 
         const auto silentBlocksAllZero = [&] (int blocks)
@@ -655,7 +659,7 @@ int main()
             for (int b = 0; b < blocks; ++b)
             {
                 std::fill (buf.begin(), buf.end(), 0.0f);
-                sat.process (io, 1, block);
+                felitronics::test::run (sat.process (io, 1, block));
                 allZero = true;                          // only the LAST block's verdict counts
                 for (int i = 0; i < block; ++i) allZero = allZero && (buf[(std::size_t) i] == 0.0f);
             }

@@ -35,4 +35,17 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_mastering_oracle_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_mastering_oracle_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_mastering_oracle_tests COMMAND felitronics_mastering_oracle_tests)
+
+    # LAW 11 — the caller's contract, as PROPERTIES over the whole accepted and the whole rejected
+    # domain of every block-level entry point in the core. It lives here rather than in a module
+    # because the law is cross-module by construction: the census that produced it found three answers
+    # for the width and four for the length, and a single-module suite is exactly what let that happen.
+    # Links every module that has such an entry point (mastering already pulls most of them in).
+    add_executable(felitronics_call_contract_tests tests/CallContractTests.cpp)
+    target_link_libraries(felitronics_call_contract_tests PRIVATE
+        felitronics::mastering felitronics::multiband felitronics::deesser felitronics::dynamiceq
+        felitronics::poweramp felitronics::lineareq felitronics::convolution felitronics::analysis)
+    target_include_directories(felitronics_call_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_call_contract_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_call_contract_tests COMMAND felitronics_call_contract_tests)
 endif()

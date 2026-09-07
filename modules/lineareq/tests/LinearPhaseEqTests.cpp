@@ -99,7 +99,7 @@ int main()
         LPE e; e.prepare (sr, 512, 2, Q); e.setBands (flat, 0);       // unit-impulse IR (crossfades in over ~40 ms)
         const int M = 12000, imp = 6000;                              // impulse well past the crossfade
         std::vector<float> L (M, 0.0f), R (M, 0.0f); L[(std::size_t) imp] = 1.0f; R[(std::size_t) imp] = 1.0f;
-        for (int o = 0; o < M; o += 512) { float* io[2] { L.data() + o, R.data() + o }; e.process (io, 2, std::min (512, M - o)); }
+        for (int o = 0; o < M; o += 512) { float* io[2] { L.data() + o, R.data() + o }; felitronics::test::run (e.process (io, 2, std::min (512, M - o))); }
         int peakIdx = 0; double peak = 0; for (int i = 0; i < M; ++i) if (std::fabs (L[(std::size_t) i]) > peak) { peak = std::fabs (L[(std::size_t) i]); peakIdx = i; }
         test::ok (peakIdx == imp + N / 2, "output impulse lands at input + N/2 (linear-phase latency)");
         test::approx (peak, 1.0, 0.02, "unit gain (flat EQ passes through, just delayed)");
@@ -114,7 +114,7 @@ int main()
         e.setBands (b, 1);
         const int M = 16000;
         std::vector<float> L (M), R (M); for (int i = 0; i < M; ++i) { L[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr)); R[(std::size_t) i] = L[(std::size_t) i]; }
-        for (int o = 0; o < M; o += 512) { float* io[2] { L.data() + o, R.data() + o }; e.process (io, 2, std::min (512, M - o)); }
+        for (int o = 0; o < M; o += 512) { float* io[2] { L.data() + o, R.data() + o }; felitronics::test::run (e.process (io, 2, std::min (512, M - o))); }
         double inSq = 0, outSq = 0; int from = M - 4000;              // tail: past crossfade + latency
         for (int i = from; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += s * s; outSq += (double) L[(std::size_t) i] * L[(std::size_t) i]; }
         test::approx (10.0 * std::log10 (outSq / inSq), 6.0, 0.8, "1 kHz tone out ≈ +6 dB through the +6 dB bell");
@@ -126,9 +126,9 @@ int main()
         LPE e; e.prepare (sr, 512, 2, Q);
         eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 2000.0; b[0].lane (eq::Lane::Stereo).gainDb = -4.0; e.setBands (b, 1);
         std::vector<float> L (512, 0.3f), R (512, -0.2f); float* io[2] { L.data(), R.data() };
-        e.process (io, 2, 512);
+        felitronics::test::run (e.process (io, 2, 512));
         const long before = g_allocs.load();
-        e.process (io, 2, 512); e.process (io, 2, 512);
+        felitronics::test::run (e.process (io, 2, 512)); felitronics::test::run (e.process (io, 2, 512));
         test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
         test::ok (e.latencySamples() == N / 2, "latencySamples() == N/2");
     }
@@ -139,7 +139,7 @@ int main()
         LPE e; e.prepare (sr, 512, 1, Q);
         eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0; e.setBands (b, 1);
         const int M = 16000; std::vector<float> x (M); for (int i = 0; i < M; ++i) x[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
-        for (int o = 0; o < M; o += 512) { float* io[1] { x.data() + o }; e.process (io, 1, std::min (512, M - o)); }
+        for (int o = 0; o < M; o += 512) { float* io[1] { x.data() + o }; felitronics::test::run (e.process (io, 1, std::min (512, M - o))); }
         double inSq = 0, outSq = 0; for (int i = M - 4000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += s * s; outSq += (double) x[(std::size_t) i] * x[(std::size_t) i]; }
         test::approx (10.0 * std::log10 (outSq / inSq), 6.0, 0.8, "mono 1 kHz tone +6 dB through the Mid IR (no crash)");
 
@@ -150,7 +150,7 @@ int main()
         mb[0].lane (eq::Lane::Mid).on = true; mb[0].lane (eq::Lane::Mid).freq = 1000.0; mb[0].lane (eq::Lane::Mid).Q = 2.0; mb[0].lane (eq::Lane::Mid).gainDb = 12.0;
         t.setBands (mb, 1);
         std::vector<float> y (M); for (int i = 0; i < M; ++i) y[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
-        for (int o = 0; o < M; o += 512) { float* io[1] { y.data() + o }; t.process (io, 1, std::min (512, M - o)); }
+        for (int o = 0; o < M; o += 512) { float* io[1] { y.data() + o }; felitronics::test::run (t.process (io, 1, std::min (512, M - o))); }
         double inSq2 = 0, outSq2 = 0; for (int i = M - 4000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq2 += s * s; outSq2 += (double) y[(std::size_t) i] * y[(std::size_t) i]; }
         test::approx (10.0 * std::log10 (outSq2 / inSq2), 0.0, 0.3, "mono {m}-only point is transparent (ST-only bank 0, matches the IIR engine)");
     }
@@ -166,7 +166,7 @@ int main()
         for (int o = 0; o < M; o += 512)
         {
             if (! swapped && o >= 8000 && e.setBands (b, 1)) swapped = true;   // swap flat→bell mid-stream
-            float* io[2] { L.data() + o, R.data() + o }; e.process (io, 2, std::min (512, M - o));
+            float* io[2] { L.data() + o, R.data() + o }; felitronics::test::run (e.process (io, 2, std::min (512, M - o)));
         }
         double mx = 0; for (int i = 0; i < M; ++i) mx = std::max (mx, (double) std::fabs (L[(std::size_t) i]));
         double inSq = 0, outSq = 0; for (int i = M - 3000; i < M; ++i) { const double s = 0.4 * std::sin (2.0 * core::kPi * 1000.0 * i / sr); inSq += s * s; outSq += (double) L[(std::size_t) i] * L[(std::size_t) i]; }
@@ -206,11 +206,11 @@ int main()
         eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 1000.0; b[0].lane (eq::Lane::Stereo).Q = 2.0; b[0].lane (eq::Lane::Stereo).gainDb = 6.0;
         test::ok (! eqm.setBands (b, 1), "setBands() before prepare() returns false (no write into empty FIR)");
         float l[16] {}, r[16] {}; float* io[2] { l, r };
-        eqm.process (io, 2, 16);                                      // no-op, not an empty-buffer access
+        test::ok (! eqm.process (io, 2, 16), "process() before prepare() is REFUSED (law 11)");
         eqm.reset();                                                  // safe on an unprepared engine
         test::ok (eqm.prepare (48000.0, 16, 2, 0), "prepare() after the rejected calls");
         test::ok (eqm.setBands (b, 1), "setBands() works once prepared");
-        eqm.process (io, 2, 16);
+        felitronics::test::run (eqm.process (io, 2, 16));
     }
 
     return test::report();

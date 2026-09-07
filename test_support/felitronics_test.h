@@ -10,6 +10,9 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#if __has_include(<source_location>)
+  #include <source_location>
+#endif
 #include <version>   // defines _LIBCPP_VERSION on libc++ (used to gate the no-alloc check)
 
 namespace felitronics::test
@@ -47,6 +50,33 @@ namespace felitronics::test
         ok (true, msg + "  [alloc-counting N/A on this stdlib]");
     #endif
     }
+
+    // A [[nodiscard]] core call — process()/analyse()/applyGain()/prepare() — that the fixture EXPECTS
+    // to be accepted.
+    // Law 11 (DSP-ARCHITECTURE.md §2) makes every such entry point return its verdict, and a fixture that
+    // throws the verdict away is the blind fixture this project keeps finding: it would pass unchanged
+    // against a stage that had silently stopped processing. Wrapping the call turns that into a failure
+    // without adding a check, so suite counts stay comparable across the change.
+    // Use `ok (! obj.process (...), "…")` for a call that is MEANT to be refused.
+    // The location comes from std::source_location's default argument, so the call site stays
+    // `test::run (x.process (...))` and still names itself when it fails.
+#if defined(__cpp_lib_source_location) && __cpp_lib_source_location >= 201907L
+    inline bool run (bool accepted, const std::source_location loc = std::source_location::current())
+    {
+        if (! accepted)
+        {
+            ++stats().failures;
+            std::printf ("    FAIL: a core call was REFUSED at %s:%u\n", loc.file_name(), (unsigned) loc.line());
+        }
+        return accepted;
+    }
+#else
+    inline bool run (bool accepted)
+    {
+        if (! accepted) { ++stats().failures; std::printf ("    FAIL: a core call was REFUSED\n"); }
+        return accepted;
+    }
+#endif
 
     inline void group (const std::string& name) { std::printf ("  - %s\n", name.c_str()); }
 

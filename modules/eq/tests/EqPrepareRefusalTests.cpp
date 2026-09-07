@@ -57,7 +57,7 @@ int main()
         e.setBand (0, bell());
         std::vector<float> L ((std::size_t) N, 0.25f), R ((std::size_t) N, 0.25f);
         float* ch[2] { L.data(), R.data() };
-        e.process (ch, 2, N);
+        ok (! e.process (ch, 2, N), "...and the refusal is RETURNED, not silent (law 11)");
         ok (nonFinite (L) == 0 && nonFinite (R) == 0,
             std::string ("...and a refused engine emits nothing non-finite (") + badName[i] + ")");
         ok (L[0] == 0.25f && R[0] == 0.25f, "...and does not touch the buffer at all");
@@ -73,7 +73,7 @@ int main()
         b.setParams (bell (1000.0, 6.0, FilterType::HighPass));
         std::vector<float> L ((std::size_t) N, 0.25f), R ((std::size_t) N, 0.25f);
         float* ch[2] { L.data(), R.data() };
-        b.processBlock (ch, 2, N);
+        ok (! b.processBlock (ch, 2, N), "...and the refusal is RETURNED, not silent (law 11)");
         ok (nonFinite (L) == 0 && L[0] == 0.25f, std::string ("...and stays inert (") + badName[i] + ")");
     }
 
@@ -89,7 +89,7 @@ int main()
             for (int i = 0; i < N; ++i)
                 L[(std::size_t) i] = R[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * core::kPi * 1000.0 * (k * N + i) / 48000.0));
             float* ch[2] { L.data(), R.data() };
-            e.process (ch, 2, N);
+            felitronics::test::run (e.process (ch, 2, N));
             for (float x : L) peak = std::fmax (peak, (double) std::fabs (x));
         }
         ok (peak > 0.5, "a +12 dB bell at 1 kHz really lifts a 0.25 tone — the guard did not disable the EQ");
@@ -121,7 +121,7 @@ int main()
                 e.setBand (0, bell (std::min (1000.0, 0.4 * fs), 6.0));
                 std::vector<float> L ((std::size_t) 32, 0.25f), R ((std::size_t) 32, 0.25f);
                 float* ch[2] { L.data(), R.data() };
-                e.process (ch, 2, 32);
+                felitronics::test::run (e.process (ch, 2, 32));
                 finiteOut = finiteOut && (nonFinite (L) == 0);
             }
         }

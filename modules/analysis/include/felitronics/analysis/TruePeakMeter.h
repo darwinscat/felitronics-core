@@ -71,11 +71,12 @@ class TruePeakMeter
 public:
     static constexpr int kTapsPerPhase = 12;     // 48-tap prototype at 4× — matches the spec filter length
 
-    void prepare (double sampleRate, int /*maxBlock*/, int maxChannels) noexcept
+    [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/, int maxChannels) noexcept
     {
         prepared_ = false;
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
-        channels_ = std::clamp (maxChannels, 1, core::kMaxChannels);
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
+        channels_ = maxChannels;
         chooseFactor();
         designFilter();
         hist_.assign ((std::size_t) channels_ * (std::size_t) kTapsPerPhase, 0.0f);
@@ -83,6 +84,7 @@ public:
         applyBallistics();
         reset();
         prepared_ = true;
+        return true;
     }
 
     // NB: a factor change re-designs the FIR (allocates) → call from the prepare/stopped context, not the
@@ -101,6 +103,7 @@ public:
         std::fill (pos_.begin(),  pos_.end(),  0);
         truePeakLin_ = samplePeakLin_ = blockTpLin_ = 0.0f;
         holdLin_ = 0.0f; holdCount_ = 0;
+        ranNc_ = 0;                                 // nothing has run, so nothing can be stopping
     }
 
     static constexpr int latencySamples() noexcept { return 0; }
@@ -112,11 +115,28 @@ public:
     double displayTruePeakDb()const noexcept { return toDb (holdLin_); }         // hold/decay ballistic (display)
 
     // READ-ONLY: io is sampled, never modified.
-    void process (const float* const* io, int numChannels, int n) noexcept
+    // Law 11 (DSP-ARCHITECTURE.md §2).
+    [[nodiscard]] bool process (const float* const* io, int numChannels, int n) noexcept
     {
-        if (! prepared_) return;                                 // unprepared — hist_/pos_ empty (channels_ defaults to 2)
-        const int nc = std::min (numChannels, channels_);
-        if (nc <= 0) return;
+        if (numChannels < 0 || n < 0) return false;
+        if (! prepared_) return false;                           // unprepared — hist_/pos_ empty (channels_ defaults to 2)
+        if (numChannels > channels_) return false;               // width is a LIMIT — law 11(b)
+        if (n == 0) return true;                                 // no samples: no time, no edge
+        const int nc = numChannels;
+        // A METER HAS A FALLING EDGE AFTER ALL, and the comment that used to sit here said it did not.
+        // `hist_` is per-channel sample memory: the polyphase interpolator keeps kTapsPerPhase samples
+        // per plane, so a channel that stops and comes back is measured against audio from before the
+        // gap. Measured: a full-scale impulse, one second of zero-width calls, then stereo DIGITAL
+        // SILENCE read -0.92 dBTP on the first block back. This is a READING, not audio, so it belongs
+        // to the same class as the rest of analysis (P18 F37 -> P25); it is closed here because law 11
+        // is what makes the gap observable at all.
+        for (int c = nc; c < ranNc_; ++c)
+        {
+            std::fill_n (&hist_[(std::size_t) c * (std::size_t) kTapsPerPhase], kTapsPerPhase, 0.0f);
+            pos_[(std::size_t) c] = 0;
+        }
+        ranNc_ = nc;
+        if (nc == 0) return true;
         float blockMax = 0.0f;
         for (int c = 0; c < nc; ++c)
         {
@@ -155,6 +175,7 @@ public:
         }
         blockTpLin_ = blockMax;
         if (blockMax > truePeakLin_) truePeakLin_ = blockMax;
+        return true;
     }
 
 private:
@@ -197,6 +218,7 @@ private:
 
     double fs_ = 48000.0;
     int channels_ = 2, L_ = 4;
+    int ranNc_ = 0;                             // planes that advanced history on the previous call
     bool prepared_ = false;                     // true only after prepare() (hist_/pos_ allocated)
     TruePeakMeterParams params_;
 

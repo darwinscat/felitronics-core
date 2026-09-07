@@ -39,7 +39,7 @@ int main()
     group ("a returning channel blanks exactly like one that never left");
     {
         dither::Dither dut, ref;
-        dut.prepare (48000.0, N, 2); ref.prepare (48000.0, N, 2);
+        felitronics::test::run (dut.prepare (48000.0, N, 2)); felitronics::test::run (ref.prepare (48000.0, N, 2));
         dither::DitherParams p; dut.setParams (p); ref.setParams (p);
 
         std::vector<float> a (N), b (N), ra (N), rb (N);
@@ -51,7 +51,7 @@ int main()
         {
             std::fill (a.begin(), a.end(), 0.0f); fillNoise (b, 9u + (unsigned) k);
             ra = a; rb = b;
-            dut.process (dio, 2, N); ref.process (rio, 2, N);
+            felitronics::test::run (dut.process (dio, 2, N)); felitronics::test::run (ref.process (rio, 2, N));
             charged = std::fmax (charged, peakOf (b));
         }
         ok (charged > 1.0e-4, "precondition: the channel under test really carried signal");
@@ -60,7 +60,7 @@ int main()
         {
             std::fill (a.begin(), a.end(), 0.0f);
             std::fill (ra.begin(), ra.end(), 0.0f); std::fill (rb.begin(), rb.end(), 0.0f);
-            dut.process (dio, 1, N); ref.process (rio, 2, N);
+            felitronics::test::run (dut.process (dio, 1, N)); felitronics::test::run (ref.process (rio, 2, N));
         }
 
         double wd = 0.0, wr = 0.0;
@@ -68,7 +68,7 @@ int main()
         {
             std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
             std::fill (ra.begin(), ra.end(), 0.0f); std::fill (rb.begin(), rb.end(), 0.0f);
-            dut.process (dio, 2, N); ref.process (rio, 2, N);
+            felitronics::test::run (dut.process (dio, 2, N)); felitronics::test::run (ref.process (rio, 2, N));
             wd = std::fmax (wd, peakOf (b)); wr = std::fmax (wr, peakOf (rb));
         }
         ok (wr == 0.0, "precondition: the reference blanked, so 'exactly zero' is the right bar");
@@ -80,24 +80,24 @@ int main()
         // Advancing it once on the edge credits a single block and sends the returning channel back to the
         // start of the 4096-sample window. It has to keep counting for every channel nobody is feeding, so
         // a SHORT absence must leave it still un-blanked and a long one blanked — the counter is real time.
-        dither::Dither d; d.prepare (48000.0, N, 2);
+        dither::Dither d; felitronics::test::run (d.prepare (48000.0, N, 2));
         dither::DitherParams p; p.autoBlankSamples = 4096; d.setParams (p);
 
         std::vector<float> a (N), b (N);
         float* io[2] { a.data(), b.data() };
-        for (int k = 0; k < 40; ++k) { std::fill (a.begin(), a.end(), 0.0f); fillNoise (b, 3u + (unsigned) k); d.process (io, 2, N); }
+        for (int k = 0; k < 40; ++k) { std::fill (a.begin(), a.end(), 0.0f); fillNoise (b, 3u + (unsigned) k); felitronics::test::run (d.process (io, 2, N)); }
 
-        for (int k = 0; k < 4; ++k) { std::fill (a.begin(), a.end(), 0.0f); d.process (io, 1, N); }   // 512 samples away
+        for (int k = 0; k < 4; ++k) { std::fill (a.begin(), a.end(), 0.0f); felitronics::test::run (d.process (io, 1, N)); }   // 512 samples away
         std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
-        d.process (io, 2, N);
+        felitronics::test::run (d.process (io, 2, N));
         ok (peakOf (b) > 0.0, "a short absence is not yet a blank — the window is real time, not a flag");
 
-        for (int k = 0; k < 40; ++k) { std::fill (a.begin(), a.end(), 0.0f); d.process (io, 1, N); }  // well past it
+        for (int k = 0; k < 40; ++k) { std::fill (a.begin(), a.end(), 0.0f); felitronics::test::run (d.process (io, 1, N)); }  // well past it
         double worst = 0.0;
         for (int k = 0; k < 8; ++k)
         {
             std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
-            d.process (io, 2, N); worst = std::fmax (worst, peakOf (b));
+            felitronics::test::run (d.process (io, 2, N)); worst = std::fmax (worst, peakOf (b));
         }
         ok (worst == 0.0, "and a long one is");
     }
@@ -117,7 +117,7 @@ int main()
         // samples differ, worst 6.10e-05, which is two LSB of 16 bit.
         const int N = 64;
         dither::Dither hot, cold;
-        hot.prepare (48000.0, N, 2); cold.prepare (48000.0, N, 2);
+        felitronics::test::run (hot.prepare (48000.0, N, 2)); felitronics::test::run (cold.prepare (48000.0, N, 2));
         dither::DitherParams p;
         p.bits = 16;                                    // a big LSB, so the shaper's feedback is visible
         p.shaping = dither::NoiseShaping::Weighted;
@@ -133,7 +133,7 @@ int main()
         {
             std::fill (ha.begin(), ha.end(), 0.0f); fillNoise (hb, 17u + (unsigned) k);
             std::fill (ca.begin(), ca.end(), 0.0f); std::fill (cb.begin(), cb.end(), 0.0f);
-            hot.process (hio, 2, N); cold.process (cio, 2, N);
+            felitronics::test::run (hot.process (hio, 2, N)); felitronics::test::run (cold.process (cio, 2, N));
             charged = std::fmax (charged, peakOf (hb));
         }
         ok (charged > 1.0e-4, "precondition: one instance really charged its shaper and the other did not");
@@ -141,7 +141,7 @@ int main()
         for (int k = 0; k < 4; ++k)                     // channel 1 leaves on BOTH, so the PCGs stay aligned
         {
             std::fill (ha.begin(), ha.end(), 0.0f); std::fill (ca.begin(), ca.end(), 0.0f);
-            hot.process (hio, 1, N); cold.process (cio, 1, N);
+            felitronics::test::run (hot.process (hio, 1, N)); felitronics::test::run (cold.process (cio, 1, N));
         }
 
         int differing = 0;
@@ -153,7 +153,7 @@ int main()
                 ha[(std::size_t) i] = ca[(std::size_t) i] = 0.0f;
                 hb[(std::size_t) i] = cb[(std::size_t) i] = v;
             }
-            hot.process (hio, 2, N); cold.process (cio, 2, N);
+            felitronics::test::run (hot.process (hio, 2, N)); felitronics::test::run (cold.process (cio, 2, N));
             for (int i = 0; i < N; ++i) if (! (hb[(std::size_t) i] == cb[(std::size_t) i])) ++differing;
         }
         ok (differing == 0, "the returning channel carries no error history from before it left");

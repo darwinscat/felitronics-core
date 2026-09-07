@@ -35,6 +35,14 @@ public:
         for (int c = 0; c < kMaxChannels; ++c) { z1a[c] = z2a[c] = 0.0; z1b[c] = z2b[c] = 0.0; }
     }
 
+    // Clear ONE channel's state, leaving every other bit-exact — for an owner whose channel stopped
+    // being fed and will be fed again (law 11a's falling edge). Unprepared or out of range is a no-op.
+    void resetChannel (int c) noexcept
+    {
+        if (c < 0 || c >= kMaxChannels) return;
+        z1a[c] = z2a[c] = 0.0; z1b[c] = z2b[c] = 0.0;
+    }
+
     // K-weighted sample (double) for channel c. Two TDF-II biquads in series.
     inline double process (int c, double x) noexcept
     {

@@ -526,10 +526,10 @@ static void theConsumersRecoverWithinOneBlock()
         std::vector<float> x ((std::size_t) n);
         for (int i = 0; i < n; ++i) x[(std::size_t) i] = tone (i);
         x[100] = kNan;
-        dynamics::TransientShaper t; t.prepare (fs, blk, 1);
+        dynamics::TransientShaper t; felitronics::test::run (t.prepare (fs, blk, 1));
         dynamics::TransientShaperParams p; p.attackDb = 6.0; p.sustainDb = -3.0; p.mix = 1.0; p.link = link;
         t.setParams (p);
-        for (int off = 0; off < n; off += blk) { float* io[1] { x.data() + off }; t.process (io, 1, blk); }
+        for (int off = 0; off < n; off += blk) { float* io[1] { x.data() + off }; felitronics::test::run (t.process (io, 1, blk)); }
         int afterFirstBlock = 0; double energy = 0.0;
         for (int i = blk; i < n; ++i)
         {
@@ -548,8 +548,8 @@ static void theConsumersRecoverWithinOneBlock()
         std::vector<float> ref ((std::size_t) n);
         for (int i = 0; i < n; ++i) ref[(std::size_t) i] = tone (i);
         {
-            dynamics::TransientShaper t2; t2.prepare (fs, blk, 1); t2.setParams (p);
-            for (int off = 0; off < n; off += blk) { float* io[1] { ref.data() + off }; t2.process (io, 1, blk); }
+            dynamics::TransientShaper t2; felitronics::test::run (t2.prepare (fs, blk, 1)); t2.setParams (p);
+            for (int off = 0; off < n; off += blk) { float* io[1] { ref.data() + off }; felitronics::test::run (t2.process (io, 1, blk)); }
         }
         double worst = 1.0;
         for (int i = blk; i < blk + 2048 && i < n; ++i)
@@ -569,10 +569,10 @@ static void theConsumersRecoverWithinOneBlock()
         std::vector<float> a ((std::size_t) n), b ((std::size_t) n);
         for (int i = 0; i < n; ++i) a[(std::size_t) i] = b[(std::size_t) i] = tone (i);
         a[100] = kNan;
-        dynamics::TransientShaper t; t.prepare (fs, blk, 2);
+        dynamics::TransientShaper t; felitronics::test::run (t.prepare (fs, blk, 2));
         dynamics::TransientShaperParams p; p.attackDb = 6.0; p.sustainDb = -3.0; p.link = dynamics::LinkMode::Max;
         t.setParams (p);
-        for (int off = 0; off < n; off += blk) { float* io[2] { a.data() + off, b.data() + off }; t.process (io, 2, blk); }
+        for (int off = 0; off < n; off += blk) { float* io[2] { a.data() + off, b.data() + off }; felitronics::test::run (t.process (io, 2, blk)); }
         int bad = 0; for (int i = 0; i < n; ++i) if (! std::isfinite (b[(std::size_t) i])) ++bad;
         test::ok (bad == 0, "a stereo Max link drops a one-channel NaN by comparison — which is why the "
                             "fixture above is mono, and this is pinned so it stays that way");
@@ -588,9 +588,9 @@ static void theConsumersRecoverWithinOneBlock()
         std::vector<float> x ((std::size_t) n);
         for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) (0.4 * std::sin (2.0 * core::kPi * 6500.0 * i / kFs));
         x[100] = kInf;
-        deesser::DeEsser d; d.prepare (fs, blk, 1);
+        deesser::DeEsser d; felitronics::test::run (d.prepare (fs, blk, 1));
         deesser::DeEsserParams dp; dp.mode = mode; d.setParams (dp);
-        for (int off = 0; off < n; off += blk) { float* io[1] { x.data() + off }; d.process (io, 1, blk); }
+        for (int off = 0; off < n; off += blk) { float* io[1] { x.data() + off }; felitronics::test::run (d.process (io, 1, blk)); }
         int after = 0; double energy = 0.0;
         for (int i = blk; i < n; ++i)
         {
@@ -619,11 +619,11 @@ static void theConsumersRecoverWithinOneBlock()
                 x[(std::size_t) i] = (float) (amp * std::sin (2.0 * core::kPi * 400.0 * i / kFs));
             }
             if (poison) x[100] = kInf;
-            dynamiceq::DynamicEqBand e; e.prepare (fs, 1);
+            dynamiceq::DynamicEqBand e; felitronics::test::run (e.prepare (fs, 1));
             int after = 0;
             for (int off = 0; off < n; off += blk)
             {
-                float* io[1] { x.data() + off }; e.process (io, 1, blk);
+                float* io[1] { x.data() + off }; felitronics::test::run (e.process (io, 1, blk));
                 if (off >= blk) for (int i = 0; i < blk; ++i) if (! std::isfinite (x[(std::size_t) (off + i)])) ++after;
             }
             return std::pair<int, double> { after, e.dynamicDeltaDb() };

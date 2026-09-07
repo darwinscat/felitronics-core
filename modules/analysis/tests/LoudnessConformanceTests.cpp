@@ -68,7 +68,7 @@ namespace
             const int n = (int) std::min<long long> (frames, chunk);
             for (int i = 0; i < n; ++i) buf[(std::size_t) i] = (float) (amp * std::sin (w * (double) sampleIndex++));
             const float* ch[2] { buf.data(), buf.data() };
-            lm.process (ch, 2, n);
+            felitronics::test::run (lm.process (ch, 2, n));
             frames -= n;
             after ((double) sampleIndex / sr);
         }
@@ -84,7 +84,7 @@ namespace
     template <typename After>
     analysis::LoudnessMeter run (double sr, const Steps& steps, int chunk, After&& after)
     {
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 200.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 200.0));
         long long idx = 0;
         for (const auto& [dbfs, seconds] : steps) feedSine (lm, sr, kToneHz, dbfs, seconds, idx, chunk, after);
         return lm;
@@ -104,7 +104,7 @@ namespace
     double measureLayout (double sr, double dbfs, double seconds, Layout layout)
     {
         const int channels = layout == Layout::mono ? 1 : 2;
-        analysis::LoudnessMeter lm; lm.prepare (sr, channels, 60.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, channels, 60.0));
         const double amp = std::pow (10.0, dbfs / 20.0);
         const double w   = 2.0 * core::kPi * kToneHz / sr;
         const long long frames = std::llround (seconds * sr);
@@ -124,7 +124,7 @@ namespace
                 }
             }
             const float* ch[2] { a.data(), b.data() };
-            lm.process (ch, channels, n);
+            felitronics::test::run (lm.process (ch, channels, n));
         }
         return lm.integratedLufs();
     }
@@ -183,7 +183,7 @@ int main()
     //     setChannelWeight; the role→channel mapping is the host's. ---
     test::group ("Tech 3341 Table 1 case 6: 5.0 channel weights");
     {
-        analysis::LoudnessMeter lm; lm.prepare (sr, 5, 30.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 5, 30.0));
         lm.setChannelWeight (3, 1.41); lm.setChannelWeight (4, 1.41);
         const auto tone = [sr] (double dbfs) {
             std::vector<float> v ((std::size_t) std::llround (20.0 * sr));
@@ -196,7 +196,7 @@ int main()
         {
             const int n = (int) std::min<std::size_t> (8192, front.size() - o);
             const float* ch[5] { front.data() + o, front.data() + o, centre.data() + o, surround.data() + o, surround.data() + o };
-            lm.process (ch, 5, n);
+            felitronics::test::run (lm.process (ch, 5, n));
         }
         test::approx (lm.integratedLufs(), -23.0, 0.1, "case 6: L/R −28, C −24, Ls/Rs −30 with weights → −23.0");
     }
@@ -212,7 +212,7 @@ int main()
         const int hop = (int) std::lround (0.1 * sr);   // read the meter once per hop, as a display would
         double lo = 0.0, hi = -200.0;
         {
-            analysis::LoudnessMeter lm; lm.prepare (sr, 2, 60.0);
+            analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 60.0));
             long long idx = 0;
             for (const auto& [dbfs, seconds] : nine)
                 feedSine (lm, sr, kToneHz, dbfs, seconds, idx, hop, [&] (double t) { if (t >= 3.0) { lo = std::min (lo, lm.shortTermLufs()); hi = std::max (hi, lm.shortTermLufs()); } });
@@ -220,7 +220,7 @@ int main()
             test::approx (hi, -23.0, 0.1, "case 9: S after 3 s never reads over −23.0 ± 0.1");
         }
         {
-            analysis::LoudnessMeter lm; lm.prepare (sr, 2, 60.0); lo = 0.0; hi = -200.0;
+            analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 60.0)); lo = 0.0; hi = -200.0;
             long long idx = 0;
             for (const auto& [dbfs, seconds] : twelve)
                 feedSine (lm, sr, kToneHz, dbfs, seconds, idx, hop, [&] (double t) { if (t >= 1.0) { lo = std::min (lo, lm.momentaryLufs()); hi = std::max (hi, lm.momentaryLufs()); } });
@@ -239,7 +239,7 @@ int main()
         const int poll = (int) std::lround (0.01 * sr);
         // (i × lead of silence, `tone` seconds at −23 dBFS, 1 s of silence): the maximum of `read` over the file.
         const auto maxOver = [&] (double lead, double tone, double (analysis::LoudnessMeter::*read)() const) {
-            analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+            analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 10.0));
             std::vector<float> sig ((std::size_t) std::llround (lead * sr), 0.0f);
             const double amp = std::pow (10.0, -23.0 / 20.0);
             const auto frames = (std::size_t) std::llround (tone * sr);
@@ -250,7 +250,7 @@ int main()
             {
                 const int n = (int) std::min<std::size_t> ((std::size_t) poll, sig.size() - o);
                 const float* ch[2] { sig.data() + o, sig.data() + o };
-                lm.process (ch, 2, n);
+                felitronics::test::run (lm.process (ch, 2, n));
                 best = std::max (best, (lm.*read)());
             }
             return best;
@@ -279,10 +279,10 @@ int main()
     test::group ("unmeasurable input answers the −120 sentinel");
     {
         // Digital silence: blocks exist, every one of them is under the absolute gate.
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 10.0));
         std::vector<float> zeros ((std::size_t) sr, 0.0f);
         const float* ch[2] { zeros.data(), zeros.data() };
-        lm.process (ch, 2, (int) sr);
+        felitronics::test::run (lm.process (ch, 2, (int) sr));
         test::ok (lm.integratedLufs() == kNone, "one second of digital silence → −120");
 
         // A tone wholly under the absolute gate: −80 dBFS reads −80 LUFS, below −70 — gated to nothing.
@@ -345,11 +345,11 @@ int main()
     for (const double rate : { 48000.0, 44100.0 })
     {
         test::group (at (rate, "K-weighting shapes the reading"));
-        analysis::LoudnessMeter hi; hi.prepare (rate, 2, 20.0);
+        analysis::LoudnessMeter hi; felitronics::test::run (hi.prepare (rate, 2, 20.0));
         long long n1 = 0; feedSine (hi, rate, 8000.0, -23.0, 10.0, n1);
         test::approx (hi.integratedLufs(), -19.65, 0.15, at (rate, "8 kHz at −23 dBFS reads −19.65 (the shelf's +4.04 dB)"));
 
-        analysis::LoudnessMeter lo; lo.prepare (rate, 2, 20.0);
+        analysis::LoudnessMeter lo; felitronics::test::run (lo.prepare (rate, 2, 20.0));
         long long n2 = 0; feedSine (lo, rate, 60.0, -23.0, 10.0, n2);
         test::approx (lo.integratedLufs(), -26.59, 0.15, at (rate, "60 Hz at −23 dBFS reads −26.59 (the high-pass's −2.90 dB)"));
     }
@@ -362,7 +362,7 @@ int main()
         // silent blocks fall under the absolute gate and the relative gate (−10 LU under the mean) keeps all
         // five, so the reading is the tone −10·log10(0.4) = −3.98 LU: −23.98. Non-overlapping blocks would
         // hold 1/4 and 1/4 and read −6.02 LU under: −26.02.
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 10.0));
         std::vector<float> sig ((std::size_t) sr, 0.0f);
         const double amp = std::pow (10.0, -20.0 / 20.0);
         for (std::size_t i = (std::size_t) (0.3 * sr); i < (std::size_t) (0.5 * sr); ++i)
@@ -371,7 +371,7 @@ int main()
         {
             const int n = (int) std::min<std::size_t> (4097, sig.size() - o);
             const float* ch[2] { sig.data() + o, sig.data() + o };
-            lm.process (ch, 2, n);
+            felitronics::test::run (lm.process (ch, 2, n));
         }
         test::approx (lm.integratedLufs(), -20.0 - 3.98, 0.3, "a 200 ms burst reads the tone −3.98 LU (five overlapping blocks)");
     }
@@ -379,8 +379,8 @@ int main()
     // --- chunking must not matter: one call vs odd-sized pieces straddling every hop ---
     test::group ("chunk invariance");
     {
-        analysis::LoudnessMeter one;  one.prepare (sr, 2, 20.0);
-        analysis::LoudnessMeter many; many.prepare (sr, 2, 20.0);
+        analysis::LoudnessMeter one;  felitronics::test::run (one.prepare (sr, 2, 20.0));
+        analysis::LoudnessMeter many; felitronics::test::run (many.prepare (sr, 2, 20.0));
         long long a = 0, b = 0;
         feedSine (one,  sr, kToneHz, -23.0, 5.0, a, 240000);   // one call
         feedSine (many, sr, kToneHz, -23.0, 5.0, b, 4097);     // odd chunks, straddling hops
@@ -394,7 +394,7 @@ int main()
     //     two-pass gating from the vector alone and null it against the meter's own answer ---
     test::group ("gating block energies: the exposed vector re-derives the gated reading");
     {
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 60.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 60.0));
         long long idx = 0;
         feedSine (lm, sr, kToneHz, -20.0, 3.0, idx);
         feedSine (lm, sr, kToneHz, -35.0, 3.0, idx);           // quiet enough for the relative gate to drop it
@@ -426,7 +426,7 @@ int main()
     {
         analysis::LoudnessMeter fresh;
         test::ok (fresh.gatingBlockCount() == 0, "no blocks before prepare()");
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 20.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 20.0));
         test::ok (lm.gatingBlockCount() == 0, "none straight after prepare() either");
         long long idx = 0;
         feedSine (lm, sr, kToneHz, -23.0, 2.0, idx);
@@ -438,12 +438,12 @@ int main()
     // --- the headline RT claim: process() allocates nothing, through hops, blocks and short-term samples ---
     test::group ("process() does not allocate");
     {
-        analysis::LoudnessMeter lm; lm.prepare (sr, 2, 10.0);
+        analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 10.0));
         std::vector<float> l (4800, 0.3f), r (4800, -0.2f);
         const float* io[2] { l.data(), r.data() };
-        lm.process (io, 2, 4800);                                   // warm: the first hop
+        felitronics::test::run (lm.process (io, 2, 4800));                                   // warm: the first hop
         const long before = g_allocs.load();
-        for (int i = 0; i < 40; ++i) lm.process (io, 2, 4800);     // 4 s: hops, blocks and short-term samples all fire
+        for (int i = 0; i < 40; ++i) felitronics::test::run (lm.process (io, 2, 4800));     // 4 s: hops, blocks and short-term samples all fire
         const bool noAlloc = (g_allocs.load() == before);
         test::okNoAlloc (noAlloc, "40 hops of process() did not allocate");
         test::ok (std::isfinite (lm.integratedLufs()), "and the meter still reads");
@@ -458,8 +458,8 @@ int main()
         // seconds would not match the blocks that arrive.
         for (const double rate : { 48000.0, 44100.0, 22050.0 })
         {
-            analysis::LoudnessMeter tight; tight.prepare (rate, 2, 3.0);
-            analysis::LoudnessMeter roomy; roomy.prepare (rate, 2, 60.0);
+            analysis::LoudnessMeter tight; felitronics::test::run (tight.prepare (rate, 2, 3.0));
+            analysis::LoudnessMeter roomy; felitronics::test::run (roomy.prepare (rate, 2, 60.0));
             long long a = 0, b = 0;
             feedSine (tight, rate, kToneHz, -20.0, 3.0, a);
             feedSine (roomy, rate, kToneHz, -20.0, 3.0, b);
@@ -470,7 +470,7 @@ int main()
         // blocks, 5 s produce 47 (50 hops less the 3 before the first block), 13 are dropped — and the
         // reading still stands, over the blocks that were kept.
         {
-            analysis::LoudnessMeter lm; lm.prepare (sr, 2, 3.0);
+            analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 3.0));
             long long n = 0; feedSine (lm, sr, kToneHz, -20.0, 5.0, n);
             test::ok (lm.droppedBlocks() == 13, "5 s into 3 s of capacity → 13 blocks reported dropped");
             test::approx (lm.integratedLufs(), -20.0, 0.1, "the kept blocks still read the tone");

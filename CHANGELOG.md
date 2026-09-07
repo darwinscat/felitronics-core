@@ -7,6 +7,127 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **BREAKING (API + behaviour), every module with a block-level `process()`:** **the core had four
+  different answers to "the caller passed something other than what was prepared", and every one of them
+  was SILENT.** A census over all 24 modules found three answers for the width, four for the length, and a
+  case that fits neither. The single rule is now **law 11** in `docs/DSP-ARCHITECTURE.md`, and every
+  block-level entry point returns its verdict: **`[[nodiscard]] bool process(...)`**, `true` = "accepted
+  and honoured in full". That is the API break — a call site that ignored the result now warns, and warns
+  in exactly the place where the contract is decided.
+  - **The LENGTH is a capacity, not a limit.** `maxBlock` sizes scratch; `process()` chunks, so any
+    `n >= 0` is processed IN FULL and the chunked pass is bit-identical to the caller having chunked it
+    itself at the same boundaries. Three stages truncated silently before: **`dynamics::NoiseGate`** let
+    everything past `maxBlock` out UNGATED — 3840 of 4096 samples at **+89.99 dB** over the gated ones,
+    which is 100 % of the construction ceiling (`-floorDb` = 90 dB); **`nam::NamStage`** let it bypass the
+    amp model **bit-identical to its input** — 448 of 512 samples on a 64-sample prepare; and
+    **`multiband::MultibandProcessor`** dropped the ENTIRE call, not one sample touched. (Dropping
+    `NamStage`'s clamp without chunking would have been far worse than the defect: an unclamped `n` is a
+    heap overflow in the backend's scratch and a resize — an allocation — inside NAM, on the audio thread.)
+  - **The exception, and it is named in the law:** a two-phase API whose first phase RETURNS a buffer of
+    `maxBlock` cannot chunk, because the result has to outlive the call. `NoiseGate::analyse`/`applyGain`
+    and `EqEngine::captureSectionInput` therefore REFUSE an over-long call rather than truncate it.
+    `NoiseGate` also now records how far the curve is valid: phase B used to be bounded by the buffer's
+    CAPACITY rather than by what phase A wrote, so a short analysis followed by a long apply multiplied
+    the tail by the PREVIOUS call's curve — measured, **90.0 dB of attenuation on material that was never
+    analysed**. `NoiseGate::analysedSamples()` is the new accessor; `NoiseGate::prepare()` now returns
+    `bool` and honours `maxChannels`, which it used to ignore.
+  - **The WIDTH is a limit: `nch > maxChannels` refuses the WHOLE call, before anything moves.** It used
+    to process a prefix in eleven modules. A prefix is not the safer half-measure it looks like — the
+    surplus channels are unprocessed either way, and processing some of them only hides the fault while
+    the processed ones acquire a latency and a gain the others do not: `limiter::TruePeakLimiter` prepared
+    for 2 and called with 4 emitted the surplus **+7.02 dB over its ceiling** AND left the two it did
+    process **79 samples late** relative to them, which combs at 304 Hz on any fold-down.
+    `saturation::Saturator`'s surplus came out **bit-identical to the input**, with no saturation at all.
+    **Affected:** `TruePeakLimiter`, `Saturator`, `EqBand`, `EqEngine`, `Dither` (which was bounded by
+    `core::kMaxChannels` rather than by its own prepared width), `DeEsser`, `DynamicEqBand`,
+    `TransientShaper` (which ignored `maxChannels` entirely), `PowerAmpStage`, `ConvolutionEngine`,
+    `MultibandProcessor`, `LinearPhaseEq`, `NaturalPhaseEq`, `LoudnessMeter`, `TruePeakMeter`, `MonoBass`,
+    `StereoWidth`, `RigPlayer`, `NamStage`.
+  - **A NARROWER call stays legal** (it is the falling-edge mode P18 defined) **except where it is
+    meaningless**, and there it is refused OBSERVABLY: `convolution::MatrixConvolver` and
+    `MatrixConvolverNupc` need exactly `channels_` planes — a 2x2 matrix needs both inputs to compute
+    either output. They used to drop such a call and write NOTHING, so a caller that pre-zeroed its output
+    got digital silence and no way to find out (P18 F35). Their width is EXACT now in both directions: a
+    WIDER call used to be accepted with the extra planes left dry. This propagates to `CabConvolver`,
+    `LinearPhaseEq` and `NaturalPhaseEq`, whose "mono path" on a stereo-prepared engine had in fact been
+    doing nothing at all.
+  - **BREAKING (behaviour): a call with `n > 0` and NO channels is a GAP in the stream, not a no-op.** It
+    spends audio time (the law-8a grid advances) AND every channel at index >= `nch` counts as stopped, so
+    P18's falling edge fires — at `nch == 0`, for all of them. Saying "time passed" and "nobody stopped"
+    in one breath reopens exactly the defect P18 closed: measured on untouched `main`,
+    `dynamics::Compressor` with 5 ms of lookahead, a tone, 4800 samples of zero-width calls, then stereo
+    DIGITAL SILENCE emitted **0.280315 out of the silence (-11.05 dBFS)**, last non-zero at sample 239 —
+    the whole 240-sample lookahead line, note for note. `Compressor` also gains the NARROWING half of that
+    edge, which it never had. `eq::EqEngine` used to drop a zero-width call outright while the same
+    `EqBand` driven directly advanced its grid: on one 500 -> 4000 Hz glide and 10240 samples of such
+    calls the two had diverged by **11.08 dB**. Negative `n` or `nch` is malformed and refused, never
+    clamped into an index.
+  - **`prepare()` is binding too, and refuses what it cannot honour** — an observable refusal in
+    `process()` is worth nothing if `prepare()` already lied. `convolution::CabConvolver::prepare()`
+    silently clamped `numChannels` to 2, after which `process(io, 4, n)` was a well-formed call that left
+    planes 2-3 DRY; it returns `bool` now, as do `NoiseGate::prepare`, `Dither::prepare`,
+    `DeEsser::prepare`, `DynamicEqBand::prepare` and `TransientShaper::prepare`.
+    `MultibandProcessor` gained a `prepared_` flag (its `prepare()` could already fail and `process()`
+    ran anyway), and `ConvolutionEngine::prepare()` now clears the participation ledger it left stale.
+  - **`neural::Inference` changed:** the concept requires `process(io, nc, n) -> bool`. Any custom
+    inference backend must return its verdict.
+  - Two integer-overflow fixes that came with the "any `n`" promise: the chunk loops in
+    `saturation::Saturator` and `poweramp::PowerAmpStage` advanced by `maxBlock` rather than by the length
+    actually taken (signed overflow near `INT_MAX`, which `TruePeakLimiter` had already fixed), and
+    `dither::Dither`'s blank counter added `n` to an `int` before clamping it.
+  - **A refused `prepare()` writes NOTHING and leaves the object UNPREPARED.** Both halves cost a defect
+    while this law was being applied and are now part of it: storing one argument before validating the
+    next left a new WIDTH beside an old buffer (`mastering::OfflineRenderer` — a heap-buffer-overflow
+    ASan caught), and refusing before reaching an inner `prepare()` left the object ARMED on its previous
+    build (`multiband::MultibandCompressor` — `prepare(2)`, a refused `prepare(0)`, and `process()` still
+    ran). **Also `[[nodiscard]] bool` now:** `rigplayer::RigPlayer::prepare` (it CLAMPED the width — the
+    literal defect this law describes), `multiband::MultibandWidth::prepare` (its ceiling is 2, not
+    `kMaxChannels`, because its band is a fixed stereo stage), `analysis::TruePeakMeter::prepare`,
+    `analysis::LoudnessMeter::prepare`, `dynamiceq::LaneDynamics::prepare`,
+    `mastering::OfflineRenderer::prepare`.
+  - **`stereo::MonoBass` and `stereo::StereoWidth` now refuse `process()` before `prepare()`.** Their
+    member defaults looked like a valid configuration and are not: MonoBass's crossover has no
+    coefficients until `prepare()` runs, so a default-constructed object passes the side band it exists
+    to fold at **-6.02 dB where a prepared one kills it to -54.22** — 48.2 dB at 30 Hz.
+  - **The gap reaches per-channel state one layer further down than the first pass saw.** A composite
+    must PASS a zero-width call to what it wraps, not answer for it: `multiband::MultibandProcessor` now
+    also drops the parallel DRY delay (the whole 240-sample line replayed — 0.25 out of digital silence,
+    -12.0 dBFS, invisible at mix 1 where the sum cancels exactly) and notifies BYPASSED bands (-11.83
+    dBFS); `dynamiceq::LaneDynamics` releases its own lanes (a lane held -12.000 dB through a second of
+    gap and pushed the return down by -5.25 dB); `analysis::LoudnessMeter` clears the K-weighting state
+    of a stopped channel, like `TruePeakMeter`'s history (momentary read **-29.19 LUFS** into digital
+    silence, against -120.00). New: `analysis::KWeightingFilter::resetChannel(c)`.
+  - **`eq::EqEngine::captureSectionInput` is the law's other two-phase API and owes the same:** a width
+    above the prepared one is refused rather than narrowed, and a refused OR empty call is inert — an
+    `n == 0` capture used to wipe a valid 32-sample one.
+  - **Also newly REFUSED where these used to clamp or run:** `prepare(..., maxChannels = 0)` on
+    `eq::EqBand`, `eq::EqEngine`, `saturation::Saturator`, `lineareq::LinearPhaseEq`,
+    `lineareq::NaturalPhaseEq`, `multiband::MultibandProcessor` (hence `MultibandCompressor`) — a JUCE
+    host with a disabled bus passes exactly that; `prepare(..., maxBlock/blockSize <= 0)` on
+    `dynamics::NoiseGate`, `multiband::MultibandProcessor`, `mastering::OfflineRenderer` and
+    `rigplayer::RigPlayer`; and `process()` BEFORE `prepare()` on `dither::Dither`,
+    `deesser::DeEsser`, `dynamics::TransientShaper`, `dynamiceq::DynamicEqBand`, `dynamiceq::LaneDynamics`
+    and `dynamics::NoiseGate`, which used to run on their member defaults.
+  - **`limiter::TruePeakLimiter` now treats a zero-width call as the channel-count change it is** and
+    resets — measured, gain reduction from -5.08 dB to 0.00 and a 48-sample hole on the return. That is
+    the discontinuity its header already accepts for a width change; it is called out here because it is
+    a THIRD answer to law 11c's open question, arrived at by the width rule rather than chosen.
+  - **`convolution::PartitionedConvolver::process` and `NonUniformConvolver::process` also return
+    `bool`.** They are mono and take no channel count, so "every block-level entry point" would otherwise
+    have been a claim with two exceptions.
+  - **`nam::NamStage` has no falling edge**: a stereo model's second instance keeps its receptive field
+    across a gap (measured, 0.5 out of digital silence at a 16-sample field). Law 11a's guarantee does
+    not reach it, and the fix belongs with the model half — recorded, not silently claimed.
+  - **`stereo::MonoBass::prepare` and `StereoWidth::prepare` return `[[nodiscard]] bool` and honour the
+    `maxChannels` they take** — they used to accept it and ignore it, which is the thing law 11(b) calls
+    lying about a contract. `mastering::MasteringChain::prepare` propagates the MonoBass verdict.
+  - **Migration:** check the return value. **Two-phase callers first:** `NoiseGate::analyse` now REFUSES
+    a block longer than `maxBlock` where it used to truncate, so a consumer that hands it a raw host
+    block and ignores the verdict gets the WHOLE block ungated instead of only the tail. Use the fused
+    `process()`, which chunks, or chunk at the call site. `if (! stage.process (io, nch, n)) { /* your geometry is wrong */ }`
+    A consumer that today passes more channels than it prepared for, or a block longer than a
+    capacity-bearing `analyse()`, was already getting broken audio — it was just not being told.
+
 - **fix(core, eq, stereo):** **law 8's denormal flush ran once per `process()` call, so the caller's
   block size decided where a numerical event landed.** New `core::StateGrid` — a phase counter over
   AUDIO samples, period 64, re-anchored by `reset()` — and `eq::EqBand` (hence `EqEngine`) and
