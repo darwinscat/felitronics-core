@@ -160,12 +160,27 @@ public:
 
     void reset() noexcept {}   // transient state cleared by prepare()'s Reset on the next play
 
-    // Host-rate latency the rate-matcher introduces (0 when not resampling). The cubic resampler
-    // needs ~3 samples of lookahead per stage to prime; round-trip ≈ down (model→host) + up.
+    // Host-rate latency the rate-matcher introduces (0 when not resampling).
+    //
+    // 🔴 This used to be `ceil(3*hostSR/modelRunSR) + 3` — a guess at "~3 samples of lookahead per
+    // stage", and 2.16 samples too long at 44.1 kHz (6 reported against 3.84 real; 9 against 6.00 at
+    // 96 kHz). The geometry is exact and needs no guess: StreamResampler::reset() leaves 3 leading
+    // history zeros with pos = 1.0, so output k reads input position k·inPerOut − 2 — EVERY stage
+    // delays by exactly 2 of ITS OWN input samples. Round trip = 2 host samples (down) + 2 model
+    // samples (up), the latter converted to host rate. Measured back from the carrier phase of the
+    // shipped round trip, with the whole-period ambiguity resolved by an impulse onset: 3.8375 at
+    // 44.1 kHz, 6.0000 at 96 kHz, 5.6750 at 88.2 kHz, 3.3333 at 32 kHz — the geometry to four decimals.
+    //
+    // The true delay is FRACTIONAL and this reports an integer, so round to nearest (the residual is
+    // ≤0.5 samples against the geometry, and was up to 3.3). It is also mildly frequency-dependent —
+    // the coherent term's GROUP delay adds +0.018 samples at 10 kHz and +0.620 at 20 kHz on top of the
+    // geometric figure — which no single integer can express, and which no consumer of this number can
+    // act on either. What consumers DO act on: OrbitCab and orbit-amp delay their dry/bypass path by
+    // this same number, so it is an audio-alignment figure there and not only a PDC one.
     int latencySamples() const noexcept
     {
         if (! prepared_ || ! resampling) return 0;   // an unprepared backend passes through — no latency
-        return (int) std::ceil (3.0 * hostSR / modelRunSR) + 3;
+        return (int) std::lround (2.0 + 2.0 * hostSR / modelRunSR);
     }
 
     //--- model info (read by the loader for NamStage's UI-mirror atomics) ----------

@@ -66,6 +66,69 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - `dynamiceq::LaneDynamics`' park counter is now a saturating `long long`: as a `long` it is 32 bits on
     the MSVC row, where `parked += n` at 48 kHz is signed overflow after 12.4 hours — unreachable while a
     gap disengaged a lane in one step, reachable the moment a pause became something a lane spends.
+- **BREAKING (reported latency), `nam`:** **`NamStage::latencySamples()` was 2.16 samples too long at
+  44.1 kHz and up to 3.3 at 88.2 kHz.** It reported `ceil(3·hostSR/modelRunSR) + 3` — a guess at "~3
+  samples of lookahead per stage" — where the geometry is exact and one line away in the same
+  repository: `StreamResampler.h` says the identity ratio "passes the signal with a clean 2-sample
+  delay", and that is true at EVERY ratio, because `reset()` leaves 3 leading history zeros with
+  `pos = 1.0`, so output *k* reads input position *k·inPerOut − 2*. The round trip is therefore
+  `2 + 2·hostSR/modelRunSR` host samples, now reported rounded to nearest: **6 → 4 at 44.1 kHz, 9 → 6
+  at 96 kHz, 9 → 6 at 88.2 kHz, 5 → 3 at 22.05 kHz**; unchanged (0) at the model's own rate, where the
+  resampler is not in the path at all. Hosts using the reported number for delay compensation move by
+  that much — and **twice that** in the two shipped hosts, which sum a preamp and a poweramp stage
+  (4 samples at 44.1 kHz, 6 at 96). **Nothing inside `rigplayer` moves**: slot alignment runs on
+  `AlignmentTable::delayOf()` → `blendDelay()`/`lagTail_`, and none of those reads `latencySamples()`
+  at all — `RigPlayer` only republishes the max of the two slots outward, and both changed identically.
+  **No audio sample changes inside this repository. Downstream, audio does move, and it moves into
+  alignment:** OrbitCab delays its dry/bypass path by this same number
+  (`src/poweramp/PowerAmpRouter.cpp`, `src/core/CabEngine.cpp`) and orbit-amp does the same at the dry
+  end of its crossfade, so the wet path sat at the true 3.84 samples while the dry was held at the
+  reported 6 — a 2.16-sample mismatch whose first comb notch fell at ~10.2 kHz during an on↔off
+  crossfade (3.0 samples and ~16 kHz at 96 kHz). It is now 0.16 and 0.00. ⚠️ **Three OrbitCab tests pin a number that is now known to be WRONG**
+  (`tests/PowerAmpRouterAlignTests.cpp`, three `expectEquals(L, ceil(3·sr/48000) + 3)`). They will fail
+  on the next core bump, and the fix is to replace the pinned value with the geometry
+  `2 + 2·hostSR/modelRunSR` — **not** to restore the old formula in core. The old tests pinned the FORMULA, which is why
+  nothing caught it; the new one measures the delay from the carrier phase of the shipped round trip
+  (3.8375 / 6.0000 / 5.6750 samples, matching the geometry to four decimals) and asserts the reported
+  integer is the nearest one to it.
+- **`core`, docs:** **`StreamResampler`'s header claimed transparency it does not have, and now carries
+  the measurement instead.** The old justification — *"the driven nonlinear stage masks the
+  interpolation images"* — had no number behind it, and the quantity that had since been measured was a
+  different one. Measured (`docs/STREAM-RESAMPLER-COST.md`, new): a phase-dependent kernel is a linear
+  periodically time-varying filter whose per-phase gain has Fourier coefficients `H(Ω+2πk)`, so the
+  "amplitude modulation" and the "interpolation images" are **one mechanism**, not two. The NAM round
+  trip at 44.1 ↔ 48 kHz costs **−4.17 dB coherent and −9.27 dB worst-phase at 17.64 kHz** (−2.59/−5.14
+  at 15 kHz, −5.48/−14.79 at 20 kHz), from a composite period of exactly 147 output samples. **That is
+  ONE round trip; OrbitCab runs two `NamStage`s IN SERIES** (preamp → EQ → poweramp, and its own
+  `updateLatency()` comment says so), i.e. four of these stages — measured **−9.03/−13.16 at 17.64 kHz
+  and −12.09/−17.85 at 20 kHz**, where doubling the decibels would say −8.35/−18.53. On that chain the
+  BEST phase falls from −0.61 dB to −5.20, so the top octave is down at every phase rather than only at
+  some. `rigplayer` runs its two stages in parallel and stays on the one-round-trip row. That set
+  is complete for the shipped priming but is a LINE through the two stages' phase torus, not the full
+  product: over all 160 integer alignments the worst phase barely moves (−9.29 against −9.27) while the
+  coherent carrier spans −3.59…−6.83, because it is an interference term between the stages. **The decimating direction has no stopband at
+  all**: at phase *t = 0* the weights are `(0,1,0,0)`, a bare sample pick, so a tone above the output
+  Nyquist survives at −3 dB rms / 0.0 dB SAMPLE peak (a time-domain fact with a kernel reason: at
+  `t = 0` the weights are `(0,1,0,0)` so |M(0)| = 1 at every frequency, and the phase grid has points
+  within 1/147 of zero where |M| is still −0.002 dB; across the measured rows no spectral line exceeds
+  −4.67 dB) and folds back as TWO strong components — `44100 − g` at
+  about −5 dB and `g − 3900` at about −7 dB — i.e. across **18.15–22.05 kHz**, not one top slice. Against the model's own
+  aliasing floor the OUTPUT leg alone sits 3–24 dB below it on a high-gain capture but **up to +9.8 dB
+  above it on a clean one**, at every level from 17.5 kHz up (the whole rate-match: above in 22 of 30 tone × level cells, up to
+  +12.3 dB), and **driving harder does not help** — across a 42 dB sweep the error-to-signal ratio is
+  flat in 16–22 kHz where the artifacts live and grows +10…+14 dB in 0–4 kHz where they do not, because
+  the nonlinearity **demodulates** the input leg's images into the audible range: a 20 kHz tone at
+  −18 dBFS into a high-gain capture returns a **100 Hz line at −17.7 dBFS, 14.5 dB louder than its own
+  carrier**, against −174.6 dBFS through an ideal round trip. **No kernel change here**: the header now states the cost, the
+  new `felitronics_core_streamresampler_lptv_tests` (75 checks) pins the table, the period-147 closure,
+  the 0 dB decimation peak and the criterion itself — the round trip adds **−8.84 dBc at 17.5 kHz**, and
+  a `tanh` has to be driven to **`tanh(6.2x)`** (bisected) before its own folding reaches that, so below
+  a near-square-wave drive the rate-match is the LOUDER artifact. The candidate comparison is in the
+  document for the product decision — including the part the two tone axes get wrong on their own: a
+  32-tap sinc flattens both axes and is still **5 dB worse in the bass** on real DI through a driven
+  capture, because its band edge feeds the same demodulation from a different cause. A 64-tap one at a
+  0.99 cutoff is better in every band at every drive, for **+2.5 %** of what the stage already spends on
+  the model and **61.4 host samples** of delay against today's 3.84.
 
 - **BREAKING (behaviour + latency), `oversampling`, `saturation`, `limiter`, `poweramp`:** **the shipped
   `tapsPerPhase` default rises from 32 to 64, and the reason is aliasing, not the pass band.**

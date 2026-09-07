@@ -19,13 +19,62 @@ namespace felitronics::core
 // host rate — host→model on the way in, model→host on the way out. feed() appends input; the
 // produce*() calls emit as many output samples as the buffered history allows, with `pos` carrying
 // the sub-sample phase across blocks — arbitrary in/out block sizes, no long-term drift. Identity
-// ratio passes the signal with a clean 2-sample delay (catmull @ t=0 reads one sample behind).
+// ratio passes the signal with a clean 2-sample delay (catmull @ t=0 reads one sample behind), and
+// EVERY ratio delays by exactly 2 of this stage's own input samples (buf holds 3 leading zeros and
+// pos starts at 1, so output k reads input position k·inPerOut − 2).
+//
+// 🔴 WHAT THIS KERNEL COSTS — MEASURED (P32), not asserted. A phase-dependent kernel is a LINEAR
+// PERIODICALLY TIME-VARYING filter, so its error is two things at once, and they are the same thing
+// seen twice: the per-phase gain M(t) has Fourier coefficients H(Ω+2πk), i.e. the "amplitude
+// modulation" and the "interpolation images" are one mechanism, not two. Round trip 44.1↔48 kHz
+// (the shipped NAM path), coherent carrier / worst phase, in dB:
+//     10 k −0.64/−1.16 · 15 k −2.59/−5.14 · 17.64 k −4.17/−9.27 · 20 k −5.48/−14.79
+// 🔴 That is ONE round trip. OrbitCab runs TWO NamStages IN SERIES at the host rate (preamp → EQ →
+// poweramp), i.e. FOUR of these stages, and the cascade is not the decibels doubled: measured
+// −9.03/−13.16 at 17.64 kHz and −12.09/−17.85 at 20 kHz, where doubling would say −8.35/−18.53. The
+// best phase falls from −0.61 dB to −5.20, so on that chain the top octave is down at EVERY phase.
+// `rigplayer` runs its two stages in PARALLEL and stays on the one-round-trip row.
+// The composite gain is periodic with EXACTLY 147 output samples at this ratio, so those 147 values
+// are the complete set — but they are a LINE through the two stages' phase torus, fixed by the
+// shipped priming (both stages reset together at pos = 1, len = 3), not the full 160x147 product.
+// Swept over all 160 integer alignments the shipped priming lands at or near the worst (-9.29 dB at
+// 17.64 kHz against the -9.27 here; 0.91 dB off at 20 kHz) — an observation about this priming, not a
+// bound — while the coherent carrier spans -3.59 .. -6.83 dB, being an interference term between the
+// two stages rather than a property of the kernel.
+//
+// 🔴 AND THE DECIMATING DIRECTION HAS NO ANTI-ALIASING AT ALL. Going 48 → 44.1 this kernel passes a
+// tone above the output Nyquist at −3 dB rms and 0.0 dB sample PEAK. The peak is a TIME-domain fact
+// with a kernel reason: at t = 0 the weights are (0,1,0,0), so |M(0)| = 1 at EVERY frequency, and the
+// phase grid has points within 1/147 of zero where |M| is still −0.002 dB — so the tone comes through
+// somewhere in every period whatever the signal's own grid does. (Across the five rows measured, no
+// single spectral LINE exceeds −4.67 dB; the peak is not one of them.) A tone at g ∈ (22.05,
+// 24) kHz comes back as TWO strong components, not one: 44100 − g at about −5 dB and g − 3900 at
+// about −7 dB (23 kHz in → 21.1 kHz at −5.33 and 19.1 kHz at −7.04), plus weaker terms near −45 dB
+// that go lower still. The STRONG pair lands across 18.15–22.05 kHz — that is where the damage is,
+// not where it stops.
+//
+// The older note here said "the driven nonlinear stage masks the interpolation images". Measured, it
+// is CONDITIONAL and it does not cover the whole error: (a) the carrier droop is not an added
+// component at all, so nothing masks it; (b) against the model's OWN aliasing floor the added
+// artifacts of the OUTPUT leg sit 3-24 dB BELOW it on a high-gain capture but ABOVE it on a clean one
+// at every level from 17.5 kHz up, by up to +9.8 dB (the whole rate-match is above it in 22 of 30
+// tone x level cells, by up to +12.3 dB); (c) driving the stage harder does not help — over a 42 dB input sweep the error-to-signal
+// ratio is FLAT in 16–22 kHz where the artifacts live, and grows +10 to +14 dB in 0–4 kHz where they
+// do not, because the nonlinearity DEMODULATES the input leg's images into the audible range: a 20 kHz
+// tone at −18 dBFS into a high-gain capture comes back with a 100 Hz line at −17.7 dBFS, 14.5 dB
+// LOUDER than its own carrier, against −174.6 through an ideal round trip. Whether to change the kernel is a
+// product decision, and it buys transparency with LATENCY: a 64-tap polyphase sinc at a 0.99 cutoff
+// measures 0.00 dB flat to 19 kHz with no modulation at all and is better than this kernel in EVERY
+// band on real DI through a driven capture, for +2.5 % of what the stage already spends on the model
+// and 61.4 host samples of delay against today's 3.84. A cheaper 32-tap one flattens the same two tone
+// axes but is 5 dB WORSE in the bass on program material — the cutoff decides this, not the taps. Full numbers, the
+// two-oracle protocol and the candidate table: docs/STREAM-RESAMPLER-COST.md.
 //
 // FAMILY SPLIT vs convolution::resampleIr: THAT is the OFFLINE Kaiser windowed-sinc (≥60 dB-class,
 // message-thread, allocates) for rate-converting an impulse response on load — an IR is a
 // fingerprint and must survive intact. THIS is the cheap STREAMING rate-match for a live signal
-// path, where the driven nonlinear stage masks the interpolation images; Catmull-Rom is too
-// low-SNR for IRs. Don't swap them.
+// path. The split still holds — but it is a COST decision, not a transparency claim, and the cost
+// above is the price. Don't swap them.
 //
 // 🔴 Fixed capacity, allocated once in reset() (message thread): feed()/produce*() never allocate,
 // lock, do IO, or throw on the audio thread. `buf` is a linear scratch holding `len` valid samples
