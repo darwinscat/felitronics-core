@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -165,10 +166,15 @@ static void fixedPointIsIdempotent()
     dynamics::GainReductionPath a, b;
     a.prepare (kFs); b.prepare (kFs); a.setParams (p); b.setParams (p);
     for (int i = 0; i < 2000; ++i) { const float x = 0.9f * (float) std::sin (2.0 * core::kPi * 300.0 * i / kFs); (void) a.processSample (x); (void) b.processSample (x); }
+    const float charged = a.valueDb();
     a.advanceSilence (2000000);
     b.advanceSilence (2000000000);                     // a thousand times longer: same answer, same cost
     ok (bitsEqual (a.valueDb(), b.valueDb()), "2e6 and 2e9 samples of pause leave the same gain reduction");
     ok (bitsEqual (a.detectorLevel(), b.detectorLevel()), "...and the same detector level");
+    // ...and the pause DID something. Without this the group passes against an `advanceSilence` with an
+    // empty body: two untouched instances hold the same charged state and agree perfectly.
+    ok (std::fabs (a.valueDb()) < 0.001f && std::fabs (charged) > 1.0f,
+        "precondition: the charged " + std::to_string (charged) + " dB actually decayed across the pause");
 }
 
 //==============================================================================
@@ -257,13 +263,16 @@ static void shaperInvariant()
             float* jo[2] = { z1.data(), z2.data() }; run (Bs.process (jo, 2, n));
             off += n;
         }
-        std::vector<float> al (B), ar (B), bl (B), br (B);
-        fillTone (al, 0, 300.0, 0.2f); ar = al; bl = al; br = al;
+        std::vector<float> al (B), ar (B), bl (B), br (B), dry (B);
+        fillTone (al, 0, 300.0, 0.2f); ar = al; bl = al; br = al; dry = al;   // the ACTUAL input, kept
         float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
         run (A.process (ai, 2, B)); run (Bs.process (bi, 2, B));
         bool same = true, moved = false;
+        // `moved` compares against the buffer that was actually fed, not against a re-derivation of it:
+        // `fillTone` narrows a float sine, and re-deriving it in double and narrowing afterwards differs
+        // in 23 of 128 samples — enough to satisfy "it is shaping" at mix 0, where it is shaping nothing.
         for (int i = 0; i < B; ++i) { same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
-                                      moved = moved || ! bitsEqual (bl[(std::size_t) i], (float) (0.2 * std::sin (2.0 * core::kPi * 300.0 * i / kFs))); }
+                                      moved = moved || ! bitsEqual (bl[(std::size_t) i], dry[(std::size_t) i]); }
         if (! same) ok (false, "the return after the gap is bit-identical to the return after silence, gap " + std::to_string (gap));
         if (gap == kGaps[0]) ok (moved, "precondition: the shaper is actually shaping the return");
     }
@@ -378,7 +387,10 @@ static void controlCounterPhase()
             const int B = 64;
             dynamiceq::DynamicEqBandParams p;
             p.freq = 3000.0; p.Q = 2.0; p.thresholdDb = -40.0; p.ratio = 6.0; p.rangeDb = 18.0;
-            p.attackMs = 1.0; p.releaseMs = 250.0; p.coeffUpdatePeriod = 16;
+            // A FAST release on purpose: with a slow one the follower is still moving for the whole gap
+            // and the honest loop consumes all of it, so the closed-form remainder — the thing this group
+            // is named after — never runs and deleting it would leave the group passing.
+            p.attackMs = 1.0; p.releaseMs = 0.4; p.coeffUpdatePeriod = 16;
             dynamiceq::DynamicEqBand A, Bd;
             if (! (A.prepare (kFs, 2) && Bd.prepare (kFs, 2))) { ok (false, "prepare"); return; }
             A.setParams (p); Bd.setParams (p);
@@ -482,6 +494,13 @@ static void powerAmpInvariant()
         // silent blocks — so an audio comparison would be reading law 11a's drop against a ring-down
         // that never finishes, which is the wrong law. `sagDroop()` is precisely the quantity law 11c
         // makes a claim about, and `C` below is the precondition that the claim is not vacuous.
+        // ...AND A GLIDE IN FLIGHT. The thirteen block-rate smoothers are snapped on the first block and
+        // never moved again unless a parameter changes, so a fixture that sets the params once and then
+        // pauses would pass against an implementation that freezes the glides — which is half of what
+        // this stage's law-11c defect was. Move Drive and Output right before the gap so both runs enter
+        // it mid-transition.
+        poweramp::Params moved = pp; moved.driveDb = 3.0f; moved.outputDb = -8.0f; moved.sag = 0.3f;
+        A.setParams (moved, v); Bp.setParams (moved, v); C.setParams (moved, v);
         const float chargedDroop = A.sagDroop();
         for (int off = 0; off < gap; )
         {
@@ -714,6 +733,292 @@ static void gateDropsItsSidechainHighPass()
     ok (worst < 1.0e-5, "precondition: the gate really is CLOSED on the return, so an opening would show");
 }
 
+//==============================================================================
+// 7. ROUND TWO. Everything below exists because a mutation of the real code SURVIVED round one. The
+//    stand's score by round is in the report; this is the half of it that turned into tests.
+
+// (a) AN EXTERNAL KEY IS STILL CONSUMED THROUGH A PAUSE. The programme stopped; the key did not. The
+//     invariant says a gap equals the same call at a live width carrying silence, and THAT call runs the
+//     detector on the key — so a pause that ignored it would not be the silence it is defined to equal.
+static void compressorKeepsItsExternalKey()
+{
+    group ("law 11c — Compressor: a gap still consumes an external key");
+    for (int gap : { 7, 63, 1000, 4801 })
+    {
+        const int B = 128;
+        dynamics::CompressorParams p;
+        p.thresholdDb = -40.0; p.ratio = 4.0; p.kneeDb = 0.0; p.attackMs = 1.0; p.releaseMs = 250.0;
+        dynamics::Compressor A, Bc, Z;
+        if (! (A.prepare (kFs, B, 2) && Bc.prepare (kFs, B, 2) && Z.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+        A.setParams (p); Bc.setParams (p); Z.setParams (p);
+        std::vector<float> l (B), r (B), k1 (B), k2 (B);
+        for (int blk = 0; blk < 8; ++blk)
+        {
+            fillTone (l, blk * B, 300.0, 0.9f); r = l; fillTone (k1, blk * B, 300.0, 0.9f); k2 = k1;
+            float* io[2] = { l.data(), r.data() }; const float* key[2] = { k1.data(), k2.data() };
+            run (A.process (io, 2, B, key, 2)); 
+            fillTone (l, blk * B, 300.0, 0.9f); r = l;
+            float* jo[2] = { l.data(), r.data() }; run (Bc.process (jo, 2, B, key, 2));
+            fillTone (l, blk * B, 300.0, 0.9f); r = l;
+            float* zo[2] = { l.data(), r.data() }; run (Z.process (zo, 2, B, key, 2));
+        }
+        // A: zero-width WITH the key still arriving.  Bc: a silent PROGRAMME at width 2, same key.
+        // Z: zero-width with NO key — the control that proves the key is doing something.
+        for (int off = 0; off < gap; )
+        {
+            const int n = std::min (B, gap - off);
+            for (int i = 0; i < n; ++i) k1[(std::size_t) i] = 0.9f * (float) std::sin (2.0 * core::kPi * 300.0 * (off + i) / kFs);
+            k2 = k1;
+            const float* key[2] = { k1.data(), k2.data() };
+            float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, n, key, 2));
+            std::vector<float> z1 ((std::size_t) n, 0.0f), z2 ((std::size_t) n, 0.0f);
+            float* jo[2] = { z1.data(), z2.data() }; run (Bc.process (jo, 2, n, key, 2));
+            float* zo[2] = { nullptr, nullptr }; run (Z.process (zo, 0, n, nullptr, 0));
+            off += n;
+        }
+        if (! bitsEqual ((float) A.gainReductionDb(), (float) Bc.gainReductionDb()))
+            ok (false, "a keyed gap equals a keyed silence, gap " + std::to_string (gap));
+        ok (! bitsEqual ((float) A.gainReductionDb(), (float) Z.gainReductionDb()),
+            "precondition: the key is doing something — a keyless gap answers differently");
+    }
+    ok (true, "Compressor: a gap consumes its external key exactly as a silent block does");
+}
+
+// (b) THE CONTROL COUNTER'S CLOSED FORM, at a length no honest loop would ever be asked to walk. Two
+//     things are under test that a short gap cannot reach: the widened arithmetic (`ksamp_ + rem` is an
+//     int, and `rem` here is two billion), and the coefficient write that has to land in the remainder.
+static void controlCounterAtHugeLengths()
+{
+    group ("law 11c — DynamicEqBand: the control counter closes correctly over a two-billion-sample pause");
+    for (int K : { 3, 7, 16 })
+        for (int pre : { 0, 1, 2, 5 })
+        {
+            const int B = 64;
+            dynamiceq::DynamicEqBandParams p;
+            p.freq = 3000.0; p.Q = 2.0; p.thresholdDb = -40.0; p.ratio = 6.0; p.rangeDb = 18.0;
+            p.attackMs = 1.0; p.releaseMs = 40.0; p.coeffUpdatePeriod = K;
+            dynamiceq::DynamicEqBand A, Bd;
+            if (! (A.prepare (kFs, 2) && Bd.prepare (kFs, 2))) { ok (false, "prepare"); return; }
+            A.setParams (p); Bd.setParams (p);
+            std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+            for (int k = 0; k < 24; ++k)
+            {
+                fillTone (l, k * B, 3000.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+                fillTone (l, k * B, 3000.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bd.process (jo, 2, B));
+            }
+            if (! drainToRest (A, Bd, B)) ok (false, "precondition: the per-channel path reaches rest");
+            if (pre > 0)   // leave the counter off phase zero by a call of `pre` samples
+            {
+                std::vector<float> s1 ((std::size_t) pre, 0.0f), s2 ((std::size_t) pre, 0.0f);
+                float* io[2] = { s1.data(), s2.data() }; run (A.process (io, 2, pre));
+                std::vector<float> t1 ((std::size_t) pre, 0.0f), t2 ((std::size_t) pre, 0.0f);
+                float* jo[2] = { t1.data(), t2.data() }; run (Bd.process (jo, 2, pre));
+            }
+            // A takes the whole two billion in one zero-width call. B walks the SAME number of samples of
+            // real silence, in chunks — and the two must land on the same counter phase, which the
+            // returning audio is what makes visible. Two billion is chosen so `ksamp_ + rem` overflows an
+            // int: the loop's own fixed-point exit is what makes it cheap enough to run in a test.
+            { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 2000000000)); }
+            {
+                // The reference cannot literally walk two billion samples in a test, and it does not have
+                // to: past the settling horizon the only thing still moving is the counter, so a length
+                // CONGRUENT to 2e9 modulo K — and far past the horizon — lands on the same state. The
+                // congruence is the whole point; an "about the same" length would silently change the
+                // phase, which is exactly what this test is for.
+                const long long M = 4000000LL + ((2000000000LL - 4000000LL) % (long long) K);
+                std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f);
+                for (long long done = 0; done < M; )
+                {
+                    const int n = (int) std::min (M - done, (long long) B);
+                    std::fill (z1.begin(), z1.end(), 0.0f); std::fill (z2.begin(), z2.end(), 0.0f);
+                    float* jo[2] = { z1.data(), z2.data() }; run (Bd.process (jo, 2, n)); done += n;
+                }
+            }
+            std::vector<float> al ((std::size_t) B), ar ((std::size_t) B), bl ((std::size_t) B), br ((std::size_t) B);
+            fillTone (al, 0, 3000.0, 0.9f); ar = al; bl = al; br = al;
+            float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
+            run (A.process (ai, 2, B)); run (Bd.process (bi, 2, B));
+            bool same = true; for (int i = 0; i < B; ++i) same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
+            if (! same) ok (false, "a two-billion-sample pause lands on the same counter phase, K " + std::to_string (K) + " pre " + std::to_string (pre));
+        }
+    ok (true, "DynamicEqBand: the counter's closed form matches the loop at lengths that overflow an int");
+}
+
+// (c) THE COEFFICIENT WRITE IN THE REMAINDER. Once the continuous state is fixed the loop stops, and the
+//     remaining samples are closed in form — including the `ksamp_ == 0` write, which is idempotent only
+//     because `smooth` no longer moves. Dropping it leaves the audio filter designed for a delta the band
+//     no longer holds. The gap here is long enough to reach the fixed point and the counter is placed so
+//     the write MUST land inside the remainder.
+static void coefficientWriteLandsInTheRemainder()
+{
+    group ("law 11c — DynamicEqBand: the coefficient write inside the skipped remainder is not lost");
+    for (int K : { 4, 16, 64 })
+    {
+        const int B = 64;
+        dynamiceq::DynamicEqBandParams p;
+        p.freq = 3000.0; p.Q = 2.0; p.thresholdDb = -40.0; p.ratio = 6.0; p.rangeDb = 18.0;
+        p.attackMs = 1.0; p.releaseMs = 5.0;                    // FAST, so the fixed point arrives early
+        p.coeffUpdatePeriod = K;
+        dynamiceq::DynamicEqBand A, Bd;
+        if (! (A.prepare (kFs, 2) && Bd.prepare (kFs, 2))) { ok (false, "prepare"); return; }
+        A.setParams (p); Bd.setParams (p);
+        std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+        for (int k = 0; k < 24; ++k)
+        {
+            fillTone (l, k * B, 3000.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+            fillTone (l, k * B, 3000.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bd.process (jo, 2, B));
+        }
+        if (! drainToRest (A, Bd, B)) ok (false, "precondition: the per-channel path reaches rest");
+        const double before = A.dynamicDeltaDb();
+        ok (std::fabs (before) > 0.5, "precondition: the band is still holding a delta when the pause starts");
+        // ONE call against ONE call. The law is stated at the SAME CALL BOUNDARIES, and here that is
+        // load-bearing rather than pedantic: the once-per-call denormal flush is what turns the parked
+        // subnormal into a real zero, so a single 300 000-sample gap against 4 688 blocked silent calls
+        // would differ by exactly that flush — measured, `curGainDb_` -1.6815581571897805e-43 against 0 —
+        // for a reason that is law 8's cadence and not law 11c's arithmetic.
+        { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, 300000)); }
+        { std::vector<float> z1 (300000, 0.0f), z2 (300000, 0.0f); float* jo[2] = { z1.data(), z2.data() }; run (Bd.process (jo, 2, 300000)); }
+        ok (bitsEqual (A.dynamicDeltaDb(), Bd.dynamicDeltaDb()), "the delta after the skipped remainder matches silence, K " + std::to_string (K));
+        ok (! bitsEqual (A.dynamicDeltaDb(), before), "precondition: the delta actually arrived during the pause");
+        // ...and the FILTER agrees, which is what the coefficient write is for.
+        std::vector<float> al ((std::size_t) B), ar ((std::size_t) B), bl ((std::size_t) B), br ((std::size_t) B);
+        fillTone (al, 0, 3000.0, 0.9f); ar = al; bl = al; br = al;
+        float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
+        run (A.process (ai, 2, B)); run (Bd.process (bi, 2, B));
+        bool same = true; for (int i = 0; i < B; ++i) same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
+        ok (same, "the audio filter is designed for the delta the band actually holds, K " + std::to_string (K));
+    }
+}
+
+// (d) THE PAUSE OWES THE SAME LAW-8 FLUSH THE AUDIO PATH OWES. The silent recurrence parks on a SUBNORMAL
+//     rather than on zero, so the once-per-call flush is what turns it into a real zero — and a pause that
+//     skipped it would leave a subnormal in a feedback state and disagree with silence in the last bits.
+static void thePauseFlushes()
+{
+    group ("law 11c — the pause carries the same once-per-call denormal flush as the audio path");
+    for (int gap : { 20000, 60000, 200000 })
+    {
+        const int B = 64;
+        dynamiceq::DynamicEqBandParams p;
+        p.freq = 3000.0; p.Q = 2.0; p.thresholdDb = -40.0; p.ratio = 6.0; p.rangeDb = 18.0;
+        p.attackMs = 1.0; p.releaseMs = 30.0; p.coeffUpdatePeriod = 16;
+        dynamiceq::DynamicEqBand A, Bd;
+        if (! (A.prepare (kFs, 2) && Bd.prepare (kFs, 2))) { ok (false, "prepare"); return; }
+        A.setParams (p); Bd.setParams (p);
+        std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+        for (int k = 0; k < 24; ++k)
+        {
+            fillTone (l, k * B, 3000.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+            fillTone (l, k * B, 3000.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bd.process (jo, 2, B));
+        }
+        if (! drainToRest (A, Bd, B)) ok (false, "precondition: the per-channel path reaches rest");
+        // ONE zero-width call for the whole gap, against the SAME gap cut into blocks. The flush cadence
+        // differs between them by construction — one flush against many — so this is not a bit-equality
+        // claim, it is the claim that BOTH end at a state that behaves identically on the return, which
+        // is what the flush exists to guarantee.
+        { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, gap)); }
+        {
+            std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f);
+            for (int off = 0; off < gap; off += B) { std::fill (z1.begin(), z1.end(), 0.0f); std::fill (z2.begin(), z2.end(), 0.0f);
+                                                     float* jo[2] = { z1.data(), z2.data() }; run (Bd.process (jo, 2, std::min (B, gap - off))); }
+        }
+        std::vector<float> al ((std::size_t) B), ar ((std::size_t) B), bl ((std::size_t) B), br ((std::size_t) B);
+        fillTone (al, 0, 3000.0, 0.9f); ar = al; bl = al; br = al;
+        float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
+        run (A.process (ai, 2, B)); run (Bd.process (bi, 2, B));
+        bool same = true; for (int i = 0; i < B; ++i) same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
+        ok (same, "one long gap and the same gap in blocks reach the same flushed state, gap " + std::to_string (gap));
+    }
+}
+
+// (e) A POISONED STATE ENTERING A PAUSE. The silent loops break on two non-finite states in a row rather
+//     than spinning for the whole gap; the stage must still come out finite, because law 8's flush is
+//     what clears poison and the pause owes it.
+static void aPoisonedStateSurvivesAPause()
+{
+    group ("law 11c — a NaN reaching a stage before a pause does not survive it, and does not hang it");
+    const int B = 64;
+    dynamics::TransientShaperParams p;
+    p.attackDb = 12.0; p.sustainDb = -9.0; p.threshold = 0.05; p.gainSmoothMs = 1.0;
+    dynamics::TransientShaper s;
+    if (! s.prepare (kFs, B, 2)) { ok (false, "prepare"); return; }
+    s.setParams (p);
+    std::vector<float> l ((std::size_t) B, 0.5f), r ((std::size_t) B, 0.5f);
+    l[7] = std::numeric_limits<float>::quiet_NaN();
+    { float* io[2] = { l.data(), r.data() }; run (s.process (io, 2, B)); }
+    { float* io[2] = { nullptr, nullptr }; run (s.process (io, 0, 2000000000)); }   // must not spin
+    std::vector<float> a ((std::size_t) B, 0.25f), b ((std::size_t) B, 0.25f);
+    { float* io[2] = { a.data(), b.data() }; run (s.process (io, 2, B)); }
+    bool finite = true; for (int i = 0; i < B; ++i) finite = finite && std::isfinite (a[(std::size_t) i]);
+    ok (finite, "the stage is finite after a poisoned block and a two-billion-sample pause");
+}
+
+// (f) THE COMPOSITE'S DOUBLE CLOCK, at the width where it lived. The falling-edge call for a bypassed band
+//     and the zero-width branch both reach for the same band; without the width guard the first chunk of
+//     every gap advances that band by 2n.
+static void multibandDoubleClockAtZeroWidth()
+{
+    group ("law 11c — MultibandProcessor clocks a BYPASSED band once per gap, not once per chunk");
+    const int B = 64, gap = 48000;
+    // A takes the gap in 750 chunks. `Bone` takes ONE chunk of the same length as A's first chunk and
+    // then stops. The bypassed band is skipped on every chunk but the falling edge, so the two must
+    // agree — and they would not if the `! fallingEdge` guard were missing, because A would then have
+    // clocked the bypassed band by all 48 000 samples instead of by 64.
+    multiband::MultibandCompressor<3> A, Bone;
+    if (! (A.prepare (kFs, B, 2) && Bone.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    dynamics::CompressorParams cp;
+    cp.thresholdDb = -45.0; cp.ratio = 8.0; cp.attackMs = 0.5; cp.releaseMs = 400.0; cp.kneeDb = 0.0;
+    for (int b = 0; b < 3; ++b) { A.setBandParams (b, cp); Bone.setBandParams (b, cp); }
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    for (int k = 0; k < 30; ++k)
+    {
+        fillTone (l, k * B, 300.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+        fillTone (l, k * B, 300.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bone.process (jo, 2, B));
+    }
+    if (! drainToRest (A, Bone, B, 256)) ok (false, "precondition: the crossover tree reaches rest before the pause");
+    A.setBandBypass (1, true); Bone.setBandBypass (1, true);
+    const double charged = A.bandGainReductionDb (1);
+    ok (std::fabs (charged) > 1.0, "precondition: the bypassed band is holding real gain reduction");
+    for (int off = 0; off < gap; off += B) { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, std::min (B, gap - off))); }
+    { float* io[2] = { nullptr, nullptr }; run (Bone.process (io, 0, B)); }
+    ok (bitsEqual ((float) A.bandGainReductionDb (1), (float) Bone.bandGainReductionDb (1)),
+        "a 48 000-sample gap advances a bypassed band by ONE chunk, not by the whole gap");
+    ok (! bitsEqual ((float) A.bandGainReductionDb (1), (float) charged),
+        "precondition: that one chunk is visible — the band did move");
+}
+
+// ...and the residual this cannot remove: a bypassed band gets ONE chunk of the gap where live-width
+// silence gives it none, because law 11 has no call that carries an edge without time. The test states
+// the size of that residual so it cannot grow unnoticed.
+static void bypassedBandResidualIsOneChunk()
+{
+    group ("law 11c — the bypassed-band residual is bounded to one chunk, and its size is stated");
+    const int B = 64;
+    multiband::MultibandCompressor<3> A, Bm;
+    if (! (A.prepare (kFs, B, 2) && Bm.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    dynamics::CompressorParams cp;
+    cp.thresholdDb = -45.0; cp.ratio = 8.0; cp.attackMs = 0.5; cp.releaseMs = 400.0; cp.kneeDb = 0.0;
+    for (int b = 0; b < 3; ++b) { A.setBandParams (b, cp); Bm.setBandParams (b, cp); }
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    for (int k = 0; k < 30; ++k)
+    {
+        fillTone (l, k * B, 300.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+        fillTone (l, k * B, 300.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bm.process (jo, 2, B));
+    }
+    if (! drainToRest (A, Bm, B, 256)) ok (false, "precondition: the crossover tree reaches rest before the pause");
+    A.setBandBypass (1, true); Bm.setBandBypass (1, true);
+    const double before = A.bandGainReductionDb (1);
+    for (int off = 0; off < 48000; off += B) { float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, std::min (B, 48000 - off))); }
+    { std::vector<float> z1 (48000, 0.0f), z2 (48000, 0.0f);
+      for (int off = 0; off < 48000; off += B) { std::fill (z1.begin(), z1.end(), 0.0f); std::fill (z2.begin(), z2.end(), 0.0f);
+                                                 float* jo[2] = { z1.data(), z2.data() }; run (Bm.process (jo, 2, std::min (B, 48000 - off))); } }
+    ok (bitsEqual ((float) Bm.bandGainReductionDb (1), (float) before),
+        "live-width silence leaves a bypassed band FROZEN — that is what bypass means today");
+    const double residual = std::fabs (A.bandGainReductionDb (1) - before);
+    ok (residual > 0.0 && residual < 0.05 * std::fabs (before),
+        "a gap moves it by one chunk only: " + std::to_string (residual) + " dB of " + std::to_string (std::fabs (before)));
+}
+
 int main()
 {
     std::printf ("law 11c — a pause is silence\n");
@@ -731,5 +1036,12 @@ int main()
     multibandDoesNotDoubleClock();
     multibandBypassedNarrowingDoesNotCrash();
     gateDropsItsSidechainHighPass();
+    compressorKeepsItsExternalKey();
+    controlCounterAtHugeLengths();
+    coefficientWriteLandsInTheRemainder();
+    thePauseFlushes();
+    aPoisonedStateSurvivesAPause();
+    multibandDoubleClockAtZeroWidth();
+    bypassedBandResidualIsOneChunk();
     return felitronics::test::report();
 }
