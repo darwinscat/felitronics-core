@@ -301,6 +301,22 @@ assertion `bestDb ≤ 0.0001` would have **failed the correct kernel**; it is no
 The 20 kHz row is the designed band edge doing its job: 20 kHz is 0.907 of the 22.05 kHz Nyquist and
 the cutoff is at 0.99, so −0.013 dB is the shoulder, not an error.
 
+**And the shoulder past 20 kHz, which is the audible half of "brighter than the cubic" and was missing
+from the first version of this table** (a crew round asked for it by name). Round trip, coherent
+carrier:
+
+| f | 20 000 | 20 500 | 21 000 | 21 500 | 22 000 |
+|---|---|---|---|---|---|
+| sinc | −0.013 | −0.327 | −1.962 | −6.770 | −20.43 |
+| cubic | −5.475 | −5.667 | −5.813 | −5.906 | −5.941 |
+
+(Both rows measured by the same instrument; the cubic's was not estimated.) Read it honestly: **the two
+cross at about 21.2 kHz, and above that the sinc is the DARKER of the two**, because it
+is doing the band-limiting the cubic simply refused to do. What the cubic passed up there was not signal
+— it was the material that folded back and that a driven stage then demodulated (§4, §6.3). Everything
+below 20 kHz is where "brighter" lives, and there the sinc is flat to 0.0002 dB against the cubic's
+−4.17 at 17.64 kHz.
+
 ### 6.2 The decimating direction now has a stopband
 
 48 → 44.1, tone above the 22.05 kHz output Nyquist, dB rms / sample peak:
@@ -412,6 +428,31 @@ test that kept its old rate list would have gone silently blind.
   does not: DC now lands within a derived 4.6e−6 (measured 3.6e−7, 46 % of samples still bit-exact),
   and a ramp within 4e−7 relative. Integer ratios are no longer sample-picking either — 96 → 48 kHz is
   a filtered decimation now, which is the point.
+
+### 6.7 🔴 WHERE THE TRANSPARENCY CLAIM STOPS — it is a claim about the RATIO, not the kernel
+
+Every other number in this document is measured at a 44.1 kHz host. The window is a fixed `kTaps = 64`
+**input** samples, so its transition width in Hz scales with the **input** rate: at a 192 kHz host the
+down leg is a 4:1 decimation and those same 64 taps buy a ~17 kHz transition, which starts inside the
+audio band. Round trip host ↔ 48 kHz, coherent carrier in dB:
+
+| host | 15 kHz | 17.64 kHz | 19 kHz | 20 kHz |
+|---|---|---|---|---|
+| 44 100 | +0.0000 | +0.0002 | +0.0003 | −0.0133 |
+| 88 200 | −0.0003 | −0.0002 | −0.0005 | −0.0009 |
+| 96 000 | +0.0003 | +0.0002 | −0.0004 | −0.0075 |
+| **176 400** | +0.0001 | **−0.0374** | **−0.2352** | **−0.6147** |
+| **192 000** | +0.0003 | **−0.0814** | **−0.3512** | **−0.7908** |
+
+**So "transparent" is asserted for hosts up to 96 kHz and no further.** At 176.4 and 192 kHz this kernel
+costs up to 0.8 dB in the top octave — still far better than the cubic, which had no anti-aliasing at
+all and folded everything above 24 kHz back down, but not the flat response the rest of this document
+describes. The rows are pinned in `felitronics_core_streamresampler_lptv_tests` in BOTH directions, so a
+future kernel that fixed it has to come and edit them rather than quietly pass.
+
+**The fix, if it is ever wanted, is a design change and not a tuning knob:** scale `kTaps` with
+`max(1, inRate/outRate)`, which restores the transition width in Hz and costs CPU in exact proportion —
+4× the taps at 192 kHz. That is a plan item, not a P34 one.
 
 ## 7. What is gated and what is only recorded here
 

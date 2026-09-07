@@ -50,18 +50,30 @@ namespace felitronics::core
 //
 //     output k is centred on input position  k·inPerOut − kHalf     →  D = kHalf = 32
 //
-// EVERY stage delays by exactly kHalf (32) of ITS OWN input samples — the group delay of a symmetric
-// 64-tap FIR, no more and no less. The 44.1 ↔ 48 round trip is 32 host samples (down) + 32 model
-// samples (up) converted to host rate = 32 + 32·(44100/48000) = 61.4000 host samples, 1.392 ms.
-// MEASURED back from the carrier phase at 100 Hz and 500 Hz (below the first whole-period wrap, so
-// unambiguous): 61.4000 samples, the geometry to four decimals. It was 3.8375 with the cubic.
-// The delay is mildly frequency-dependent on top of that — the coherent term's GROUP delay, which no
-// single integer can express and no consumer can act on. Callers that must align a dry path (OrbitCab,
-// orbit-amp) take this same figure, so it is an audio-alignment number there and not only PDC.
+// EVERY stage delays by exactly kHalf (32) of ITS OWN input samples. 🔴 NOT "the group delay of a
+// symmetric 64-tap FIR" — that would be 31.5, and saying so was wrong even though the number is right.
+// The taps sit at offsets −31 … +32 RELATIVE TO `pos`, and the kernel is symmetric about argument
+// zero, i.e. about `pos` itself; the 32 is where the priming puts `pos`, not a property of the tap
+// count. The 44.1 ↔ 48 round trip is 32 host samples (down) + 32 model samples (up) converted to host
+// rate = 32 + 32·(44100/48000) = 61.4000 host samples, 1.392 ms.
+// MEASURED back from the carrier phase at 100 Hz and 200 Hz — 500 Hz is NOT usable, its period is
+// 88.2 samples so 61.4 wraps and reads −26.8, which is the same delay and a different branch. Result:
+// 61.4000, the geometry to four decimals. It was 3.8375 with the cubic.
+// The phase delay is FLAT with frequency: swept on one stage at 50 Hz … 19 kHz on both legs it reads
+// 32.000000 in every cell. (The cubic's was not, and its header carried a +0.62-sample-at-20-kHz
+// caveat; that caveat died with it and is deliberately not restated.) Callers that must align a dry
+// path (OrbitCab, orbit-amp, and rigplayer's own dry/wet blend) take this same figure, so it is an
+// audio-alignment number there and not only PDC.
 //
 // IDENTITY RATIO. At an exactly equal in/out rate the class short-circuits to a pure delay: a 0.99
 // cutoff is a real (if gentle) low-pass, and a caller asking for no rate change must not silently get
-// one. The delay is still kHalf, so latency stays one formula for every ratio.
+// one. The delay is still kHalf, so latency stays one formula for every ratio, and no phase table is
+// built at all (513 rows x 64 floats = 128 KiB that a bit-copy never reads).
+// ⚠️ THAT IS A DISCONTINUITY IN THE TRANSFER FUNCTION, AND IT IS EXACT. Rates that differ by one ULP
+// take the filtered path; rates that are bit-identical take the copy. A caller that rate-matches
+// "nearly equal" clocks (a drifting external device, a 48000.001 host) will therefore hear the band
+// edge appear the moment the two stop being equal. That is the right trade for THIS class — the
+// alternative is a tolerance nobody can pick — but it is a sharp edge and callers should know.
 //
 // FAMILY SPLIT vs convolution::resampleIr: THAT is the OFFLINE Kaiser windowed-sinc (message-thread,
 // allocates, its own cutoff criterion) for rate-converting an impulse response on load — an IR is a
@@ -92,8 +104,8 @@ struct StreamResampler
     bool identity = false;              // exact 1:1 ratio → pure delay, no filtering (see header note)
 
     // The delay this stage adds, in ITS OWN INPUT samples — the single source of truth for every
-    // consumer that has to align something against it. It is the group delay of the symmetric
-    // kTaps-long FIR, and it does NOT depend on the ratio: output k is centred on input k·r − kHalf
+    // consumer that has to align something against it. It does NOT depend on the ratio and it is NOT
+    // the (N-1)/2 = 31.5 of a symmetric 64-tap FIR: output k is centred on input k·r − kHalf
     // (derivation in the header block above). A round trip through two stages costs
     // delayInputSamples() of the first stage's input rate plus the same count of the second's, which
     // is why NamStage reports kHalf·(1 + hostSR/modelRunSR) and not twice one number.
@@ -134,19 +146,47 @@ struct StreamResampler
             inRate = outRate = 1.0;
 
         inPerOut = inRate / outRate;
+        // 🔴 GUARD THE QUOTIENT, NOT ONLY THE OPERANDS. Both rates can be finite, positive and sane on
+        // their own and still produce a step this class cannot walk: reset(DBL_MAX, 1, ...) passes every
+        // check above and then converts DBL_MAX to int inside the produce loop, which is UB; a step of
+        // DBL_MIN/DBL_MAX is zero, so `pos` never advances and one input sample is emitted forever. The
+        // bound is deliberately generous — 1e6:1 in either direction is far past any audio use — and it
+        // keeps floor(pos) inside int for any buffer this class can hold.
+        if (! std::isfinite (inPerOut) || inPerOut <= 0.0 || inPerOut > 1.0e6 || inPerOut < 1.0e-6)
+            inPerOut = 1.0;
         // `fabs(d) <= 0` is exact equality without tripping -Wfloat-equal, and (unlike `!(d > 0)`)
         // it is false for a NaN — which the guard above has already excluded anyway.
         identity = (std::fabs (inRate - outRate) <= 0.0);
 
         if (capacity < 0) capacity = 0;                                          // negative would wrap (size_t) into a huge/UB alloc
         if (capacity > INT_MAX - (kTaps + 8)) capacity = INT_MAX - (kTaps + 8);  // keep buf.size() <= INT_MAX so the (int) buf.size() below never wraps negative
-        buf.assign ((std::size_t) capacity + (std::size_t) kTaps + 8, 0.0f);     // ALLOC here (message thread) — never in process
-        len = kTaps;                                                             // kTaps leading history zeros
-        pos = (double) kHalf;                                                    // → output k centred on input k·r − kHalf
 
-        // The phase table. Row p holds the taps for phase t = p/kPhases; row kPhases is the t → 1 limit,
-        // present so the linear interpolation never has to wrap — a wrapped row would need a SHIFTED tap
-        // alignment, which is the classic off-by-one of this construction.
+        // 🔴 ORDER MATTERS ON THE FAILURE PATH. len goes to 0 FIRST, so that if either allocation below
+        // throws (bad_alloc, and this function is not noexcept), the object is left in the one state
+        // that produces nothing rather than one that reads an empty table: produceAvailable's first
+        // test is `i + kHalf >= len`, which is true at len = 0 and breaks immediately. NamStage's
+        // prepare catches and marks itself unprepared, but a standalone caller may catch and carry on.
+        len = 0;
+        pos = (double) kHalf;
+        buf.assign ((std::size_t) capacity + (std::size_t) kTaps + 8, 0.0f);     // ALLOC here (message thread) — never in process
+
+        // The phase table. Row p holds the taps for phase t = p/kPhases; row kPhases is evaluated at
+        // t = 1 and exists so the linear interpolation never has to wrap — a wrapped row would need a
+        // SHIFTED tap alignment, which is the classic off-by-one of this construction. (It is exactly
+        // that shift: row kPhases[j] = row 0[j-1] by construction, with a fresh tap entering at j = 0.)
+        // 🔴 It is NOT "the continuous kernel's t → 1 limit", which is what an earlier version of this
+        // comment claimed. kernelAt() forces the window to zero at |u| >= 1, whereas a true Kaiser has
+        // a non-zero endpoint I0(0)/I0(beta) there; the coefficient this drops is about -1.12e-5, i.e.
+        // -99 dB. So this is a ZERO-ENDED Kaiser variant, deliberately, and the seam is consistent with
+        // it — but the two are not the same function and the comment must not say they are.
+        if (identity)
+        {
+            tab.clear();                    // the copy path never reads it — do not pay 128 KiB for it
+            tab.shrink_to_fit();
+            len = kTaps;                    // kTaps leading history zeros; the delay is kHalf either way
+            return;
+        }
+
         const double fc = kCutoff * std::min (1.0, outRate / inRate);
         tab.assign ((std::size_t) (kPhases + 1) * (std::size_t) kTaps, 0.0f);
         for (int p = 0; p <= kPhases; ++p)
@@ -161,9 +201,12 @@ struct StreamResampler
             for (int j = 0; j < kTaps; ++j)
                 tab[(std::size_t) p * (std::size_t) kTaps + (std::size_t) j] = (float) (row[j] * inv);
         }
+        len = kTaps;                                                             // kTaps leading history zeros
     }
 
-    void feed (const float* in, int n)
+    // noexcept on the hot path is the house contract, and it is honest here: every call below is
+    // on floats, raw pointers or memmove. reset() is deliberately NOT noexcept — it allocates.
+    void feed (const float* in, int n) noexcept
     {
         if (n <= 0) return;                                  // guard: n==0 is a no-op (bit-identical); reject negative (std::copy of a reversed range is UB)
         const int cap = (int) buf.size();                    // reset() keeps buf.size() <= INT_MAX, so this never wraps
@@ -186,13 +229,14 @@ struct StreamResampler
         len += n;
     }
 
-    int produceAvailable (float* out, int cap)
+    int produceAvailable (float* out, int cap) noexcept
     {
         int k = 0;
         while (k < cap)
         {
             const int i = (int) std::floor (pos);
-            if (i + kHalf >= len) break;                     // need buf[i-kBehind .. i+kHalf]
+            if (i >= len - kHalf) break;                     // need buf[i-kBehind .. i+kHalf]; written this
+                                                             // way so a huge i cannot overflow i + kHalf
             if (i < kBehind) break;                          // …and the history behind it (backstop paths only)
 
             const float* x = buf.data() + (std::size_t) (i - kBehind);
@@ -235,7 +279,7 @@ struct StreamResampler
         return k;
     }
 
-    void produceExact (float* out, int want)                 // pad with silence on startup underflow
+    void produceExact (float* out, int want) noexcept        // pad with silence on startup underflow
     {
         const int got = produceAvailable (out, want);
         for (int k = got; k < want; ++k) out[k] = 0.0f;

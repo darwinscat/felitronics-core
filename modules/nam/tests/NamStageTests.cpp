@@ -573,7 +573,7 @@ int main()
         }
     }
 
-    test::group ("🔴 48 kHz NULL — at the model's own rate the kernel change must move NOTHING");
+    test::group ("🔴 RATE-CHANGE NULLS — the resampler must not survive its own reconfiguration");
     {
         // THE MAIN DEFENCE OF P34. NamStage engages the rate-matcher only past
         // |hostSR - modelRunSR| > 0.5, so at a 48 kHz host with a 48 kHz capture there is no resampler
@@ -690,6 +690,55 @@ int main()
             test::ok (viaResampling.latencySamples() == 0,
                       "…and it reports no latency there either, which is the same claim in the number "
                       "the host acts on");
+        }
+
+        // 🔴 AND THE FORM THAT ACTUALLY CATCHES A STALE TABLE. A diverse-testing round mutated
+        // StreamResampler::reset() to early-return when its table was already populated — a resampler
+        // that keeps designing for the ratio it saw first — and that mutant passed 345 of 345 checks
+        // across this repository, INCLUDING the gate above. The gate above cannot see it: at 48 kHz the
+        // resampler is never invoked, so `viaResampling ≡ virgin` by construction whatever the table
+        // holds. What catches it is a rate change that lands somewhere the resampler DOES run.
+        //
+        // The fixture is the GAIN model on purpose. The FIR model has two samples of history that
+        // survive NAM's own Reset across a prepare() — verified cross-tree, it does the same on main
+        // with the Catmull-Rom kernel — so a FIR-based version of this test would fail for a reason
+        // that is not the resampler's and is not this PR's to fix. A memoryless model removes that
+        // term and leaves only the question being asked.
+        {
+            const auto json = gainModel();
+            auto renderAt = [&json] (double firstRate, bool runAudio, double finalRate)
+            {
+                nam::NamStage st;
+                st.prepare (firstRate, 64);
+                if (! load (st, json)) return std::vector<float>{};
+                st.prepare (firstRate, 64);
+                if (runAudio)
+                {
+                    std::vector<float> warm (512, 0.3f);
+                    float* wio[1] { warm.data() };
+                    felitronics::test::run (st.process (wio, 1, 512, false));
+                }
+                st.prepare (finalRate, 64);
+                std::vector<float> in (1024, 0.0f);
+                for (int i = 0; i < 1024; ++i)
+                    in[(std::size_t) i] = 0.5f * (float) std::sin (2.0 * 3.14159265358979323846 * 6000.0 * i / finalRate);
+                return runMono (st, in, false);
+            };
+            struct Case { double first; bool audio; double final_; const char* what; };
+            for (const Case c : { Case { 44100.0, true,  48000.0, "ran at 44.1 kHz, then re-prepared at 48" },
+                                  Case { 44100.0, true,  44100.0, "ran at 44.1 kHz, then re-prepared at 44.1" },
+                                  Case { 44100.0, true,  96000.0, "ran at 44.1 kHz, then re-prepared at 96" },
+                                  Case { 48000.0, false, 44100.0, "loaded at 48 kHz, then prepared at 44.1" } })
+            {
+                const auto viaOther = renderAt (c.first, c.audio, c.final_);
+                const auto virginAt = renderAt (c.final_, false, c.final_);
+                bool identical = (! viaOther.empty() && viaOther.size() == virginAt.size());
+                for (std::size_t i = 0; identical && i < viaOther.size(); ++i)
+                    identical = (std::memcmp (&viaOther[i], &virginAt[i], sizeof (float)) == 0);
+                test::ok (identical,
+                          std::string ("a stage that ") + c.what + " renders bit-identically to one "
+                          "prepared there directly — reset() re-DESIGNS the kernel, it does not top it up");
+            }
         }
     }
 
@@ -862,18 +911,32 @@ int main()
 
     test::group ("process is RT no-alloc");
     {
-        nam::NamStage stage;
-        stage.prepare (48000.0, 512);
-        const auto json = gainModel();
-        test::ok (load (stage, json), "RT fixture model loads");
-        std::vector<float> left (512, 0.2f), right (512, -0.15f);
-        float* io[2] { left.data(), right.data() };
-        felitronics::test::run (stage.process (io, 2, 512, false));        // warm every process-reachable container first
-        const long before = g_allocs.load (std::memory_order_relaxed);
-        felitronics::test::run (stage.process (io, 2, 512, false));
-        felitronics::test::run (stage.process (io, 2, 512, true));
-        test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
-                         "NamStage::process performs no heap allocation");
+        // 🔴 TWO RATES, AND THE SECOND ONE IS THE WHOLE POINT. This test prepared only at 48 kHz, where
+        // `resampling` is false and processChannel takes its early branch — so the single check that
+        // NamStage::process never allocates was STRUCTURALLY BLIND to the resampler, before this change
+        // and after it. A crew round confirmed the hole by mutation: a resampler that allocates a copy
+        // of its table inside every decimating callback survived the entire suite. 44.1 kHz is the
+        // configuration a live rig actually runs, and it is the one where the table is read.
+        //
+        // The FIRST call after a prepare is included in the measured window on purpose: the table is
+        // built in reset(), but any lazy initialisation anywhere would land exactly there.
+        for (const double rate : { 48000.0, 44100.0 })
+        {
+            nam::NamStage stage;
+            stage.prepare (rate, 512);
+            const auto json = gainModel();
+            test::ok (load (stage, json), "RT fixture model loads at " + std::to_string ((int) rate));
+            std::vector<float> left (512, 0.2f), right (512, -0.15f);
+            float* io[2] { left.data(), right.data() };
+            felitronics::test::run (stage.process (io, 2, 512, false));    // warm every process-reachable container
+            const long before = g_allocs.load (std::memory_order_relaxed);
+            felitronics::test::run (stage.process (io, 2, 512, false));
+            felitronics::test::run (stage.process (io, 2, 512, true));
+            test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                             "NamStage::process performs no heap allocation at "
+                             + std::to_string ((int) rate) + " Hz"
+                             + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
+        }
     }
 
     return test::report();

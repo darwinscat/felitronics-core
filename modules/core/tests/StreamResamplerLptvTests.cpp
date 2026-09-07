@@ -322,6 +322,51 @@ int main()
     }
 
     // ------------------------------------------------------------------------------------------------
+    group ("HOST RATE — where 'transparent' holds, and the rate at which it stops");
+    {
+        // 🔴 TRANSPARENCY IS NOT A PROPERTY OF THE KERNEL ALONE, and every other number in this suite is
+        // measured at one host rate. The window is a fixed kTaps INPUT samples, so its transition width
+        // in Hz scales with the INPUT rate: at a 192 kHz host the down leg is a 4:1 decimation and those
+        // same 64 taps buy a ~17 kHz transition, which starts eating the audio band. A crew round found
+        // this by sweeping rates; nothing here would have.
+        //
+        // The rows below are the honest scope of the claim, and the table is asserted BOTH ways: flat
+        // where it is flat, and DROOPING where it droops. Pinning only the good rates would be the same
+        // omission again, one level up.
+        struct Row { double host; double at20k; double tol; const char* note; };
+        const Row rows[] = {
+            {  44100.0, -0.0133, 0.002, "the shipped NAM rate: flat to the band edge" },
+            {  88200.0, -0.0009, 0.002, "still flat" },
+            {  96000.0, -0.0075, 0.002, "still flat" },
+            { 176400.0, -0.6147, 0.010, "🔴 NOT flat: a 3.675:1 decimation with a fixed 64 taps" },
+            { 192000.0, -0.7908, 0.010, "🔴 NOT flat: a 4:1 decimation with a fixed 64 taps" },
+        };
+        for (const auto& r : rows)
+        {
+            const auto g = roundTripGains<StreamResampler> (20000.0, r.host, M, 64, 20000, 20000);
+            std::printf ("      host %6.0f Hz, 20 kHz round trip: %+8.4f dB   %s\n",
+                         r.host, coherentDb (g), r.note);
+            approx (coherentDb (g), r.at20k, r.tol,
+                    std::to_string ((int) r.host) + " Hz host: the 20 kHz carrier is what the fixed "
+                    "64-tap window buys at THIS ratio");
+        }
+        // …and the claim stated as a claim, so a future kernel that fixed it would have to come and
+        // edit this line rather than silently pass: transparency is asserted for hosts up to 96 kHz.
+        {
+            const auto g96 = roundTripGains<StreamResampler> (19000.0, 96000.0, M, 64, 20000, 20000);
+            ok (std::fabs (coherentDb (g96)) < 0.002,
+                "at 96 kHz the round trip is still flat at 19 kHz (" + std::to_string (coherentDb (g96))
+                + " dB) — the transparency claim covers 44.1 / 88.2 / 96, and stops there");
+            const auto g192 = roundTripGains<StreamResampler> (19000.0, 192000.0, M, 64, 20000, 20000);
+            ok (coherentDb (g192) < -0.1,
+                "…and at 192 kHz it is NOT (" + std::to_string (coherentDb (g192)) + " dB at 19 kHz), "
+                "which is a documented limit of a fixed-length window under a 4:1 decimation, not a bug "
+                "to be tuned away here — scaling kTaps with the ratio is a design change with a CPU "
+                "cost proportional to it");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
     group ("SIGN AND DELAY — magnitudes cannot see a polarity flip, and this kernel is flat");
     {
         // Every statistic above is a magnitude, so a kernel that inverted the signal would pass all of
@@ -342,6 +387,25 @@ int main()
         approx (-std::arg (coherent (g2)) / (2.0 * kPi * 200.0 / H), 61.4, 0.01,
                 "…and the same delay at 200 Hz, i.e. the phase delay is FLAT with frequency — the "
                 "cubic's was not, and its header carried a +0.62-sample-at-20-kHz caveat because of it");
+
+        // 🔴 …AND FLATNESS ASSERTED ONLY AT 100 AND 200 Hz IS FLATNESS ASSERTED WHERE IT IS TRIVIAL.
+        // The cubic's own frequency dependence was +0.018 samples at 10 kHz and +0.620 at 20 kHz — i.e.
+        // entirely in the top octave, exactly where these two frequencies say nothing. The header
+        // claims the new kernel is flat; that claim belongs up there. Above ~360 Hz the delay exceeds
+        // half a tone period and the phase wraps, so each reading is resolved into the branch nearest
+        // the geometry — which is legitimate BECAUSE the integer is independently fixed by the impulse
+        // onset in NamStageTests, not because we like 61.4.
+        for (double f : { 5000.0, 10000.0, 17640.0, 19000.0 })
+        {
+            const auto gh = roundTripGains<StreamResampler> (f, H, M, 64, kSkip, kKeep);
+            const double Wf = 2.0 * kPi * f / H;
+            const double period = 2.0 * kPi / Wf;
+            double d = -std::arg (coherent (gh)) / Wf;
+            while (d < 61.4 - 0.5 * period) d += period;
+            while (d > 61.4 + 0.5 * period) d -= period;
+            approx (d, 61.4, 0.01, std::to_string ((int) f) + " Hz: the delay is STILL 61.4 samples — "
+                                   "flat into the top octave, which is the only place the cubic's was not");
+        }
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -394,7 +458,10 @@ int main()
         for (int b : { 1, 17, 63, 128, 512 })
         {
             const auto g = roundTripGains<StreamResampler> (17640.0, H, M, b, kSkip, kKeep);
-            ok (std::abs (coherent (g) - cref) < 3.0e-3,
+            // 3e-3 was inherited from the cubic, where the block-to-block spread was real. On this
+            // kernel the measured spread is 1.5e-10 … 1.6e-9, so 3e-3 admitted a 0.001-sample
+            // block-dependent slip without a murmur. 1e-6 is still ~600x the measurement and rejects it.
+            ok (std::abs (coherent (g) - cref) < 1.0e-6,
                 "block " + std::to_string (b) + ": the COMPLEX carrier matches block 64 (|delta| = "
                 + std::to_string (std::abs (coherent (g) - cref)) + ") — magnitude alone would not see a sign flip");
             approx (worstDb (g), worstDb (ref), 0.002, "block " + std::to_string (b) + ": …and so does the worst phase");
@@ -404,12 +471,23 @@ int main()
     // ------------------------------------------------------------------------------------------------
     group ("COUNT — the EXACT number of outputs a feed yields, not a bound on it");
     {
-        // The produced count is UNCHANGED by the kernel swap, and that is worth pinning rather than
-        // assuming: the priming moved from (len = 3, pos = 1) to (len = kTaps, pos = kHalf), and the
-        // availability test from `i + 2 < len` to `i + kHalf < len`. Both moved by the same amount, so
-        //   floor(kHalf + k·r) + kHalf < N + kTaps   <=>   floor(k·r) < N   <=>   K = ceil(N/r),
-        // exactly as before. A mutation that stops the loop one sample early stays inside the theory
-        // suite's ±2 drift bound at every length and survives; asserted EXACTLY, it does not.
+        // The produced-count FORMULA is unchanged by the kernel swap: the priming moved from
+        // (len = 3, pos = 1) to (len = kTaps, pos = kHalf) and the availability test from `i + 2 < len`
+        // to `i + kHalf < len` — both by the same amount — so in exact arithmetic
+        //   floor(kHalf + k·r) + kHalf < N + kTaps   <=>   floor(k·r) < N   <=>   K = ceil(N/r).
+        //
+        // 🔴 IN FLOAT IT IS NOT ALWAYS THE SAME NUMBER, and an earlier version of this comment claimed
+        // it was. A crew round measured the exception: `pos` now accumulates from 32.0 instead of 1.0,
+        // and at lengths that land EXACTLY on an integer boundary that changes which side of it the
+        // sum falls on. Measured against the cubic: N = 147 at 44.1->48 gives 161 where the cubic gave
+        // 160, and N = 160 at 48->44.1 gives 147 where it gave 148. Every other length in the sweep
+        // agrees exactly. This is harmless inside NamStage — the down leg is bounded by
+        // maxModelFrames and the up leg is asked for exactly n — but "unchanged" was the wrong word
+        // and the difference is a real ULP fact, not a rounding of the prose.
+        //
+        // A mutation that stops the loop one sample early stays inside the theory suite's ±2 drift
+        // bound at every length and survives; asserted EXACTLY against the class's own accumulator
+        // (which has no slack at all), it does not.
         //
         // The expectation is not a closed form with slack — it is the SAME double accumulation the class
         // does, which has no slack at all: 48000/44100 = 160/147 is not a binary fraction and can land a
@@ -529,10 +607,28 @@ int main()
             std::printf ("      %6.0f Hz above the 22.05 kHz Nyquist -> rms %7.2f dB  peak %7.2f dB   (cubic: %.1f / 0.0)\n",
                          row.f, rmsDb, peakDb, row.oldRms);
             approx (rmsDb, row.rms, 0.05, std::to_string ((int) row.f) + " Hz: the designed stopband, not a sample pick");
-            ok (peakDb < rmsDb + 3.05,
-                std::to_string ((int) row.f) + " Hz: the sample PEAK now tracks the rms (" + std::to_string (peakDb)
-                + " dB). The cubic read 0.0 dB here because |M(0)| = 1 at every frequency for a (0,1,0,0) "
-                "weight set; no phase of this kernel is a bare sample pick");
+            // 🔴 THIS BOUND USED TO BE `rmsDb + 3.05` AND WAS THEATRE. `rmsDb` is already scaled by
+            // sqrt(2), i.e. it IS the amplitude, so for a sinusoidal residual the peak equals it and
+            // the honest margin is ~0, not 3. Measured through the same instrument, the REFERENCE CUBIC
+            // — whose whole defect is a 0 dB sample peak — passed the old line at 22.1 kHz (margin
+            // +0.069 dB) and at 22.5 kHz (+0.020). A bound the thing it exists to catch walks through
+            // is not a bound. The four rows below 23.9 kHz measure peak - rms = 0.002 dB, so 0.10 is
+            // fifty times the measurement and still catches a sample pick by 3 dB.
+            if (row.f < 23800.0)
+                ok (peakDb < rmsDb + 0.10,
+                    std::to_string ((int) row.f) + " Hz: the sample PEAK tracks the rms to 0.10 dB (peak "
+                    + std::to_string (peakDb) + ", rms " + std::to_string (rmsDb) + "). The cubic read "
+                    "0.0 dB here because |M(0)| = 1 at every frequency for a (0,1,0,0) weight set; no "
+                    "phase of this kernel is a bare sample pick");
+            else
+                // Deep in the stopband the residual is no longer a sinusoid — it is the sum of a few
+                // very small images, so its crest factor is genuinely higher (+2.85 dB measured) and a
+                // 0.10 dB rule would fail a correct kernel. What matters at this frequency is only that
+                // the peak is nowhere near 0 dB, which is the claim the cubic failed by 80 dB.
+                ok (peakDb < -80.0,
+                    std::to_string ((int) row.f) + " Hz: the sample peak is " + std::to_string (peakDb)
+                    + " dB, not the 0.0 dB the cubic reproduced here; deep in the stopband the residual "
+                    "is not a single sinusoid, so its crest is bounded rather than tracked");
         }
 
         // WHERE it lands. A tone at g in (22.05, 24) kHz used to return as 44100 − g AND as g − 3900,

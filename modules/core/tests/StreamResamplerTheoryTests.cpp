@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 using felitronics::core::StreamResampler;
@@ -104,7 +105,14 @@ namespace
         const double ipo = inRate / outRate;
         const int K = (int) out.size();
         double sig = 0.0, noise = 0.0; int c = 0;
-        for (int k = 64; k + 64 < K; ++k)                            // skip startup / tail edges
+        // 🔴 THE SKIP IS DERIVED FROM THE KERNEL, not a round number. Output k is centred on input
+        // position k·ipo − D and the aperture reaches kHalf either side of that centre, so the window
+        // is not yet clear of reset()'s leading zeros until k·ipo − D ≥ kHalf, i.e. k ≥ (D+kHalf)/ipo.
+        // A fixed 64 was fine for the cubic (D = 2, aperture ±2) and is NOT for this kernel: at
+        // ipo = 0.5 the first analysed output still had half its window in the priming zeros, and the
+        // SNR it reported was the startup transient, not the passband. That cost a round.
+        const int edge = (int) std::ceil ((StreamResampler::delayInputSamples() + StreamResampler::kHalf) / ipo) + 8;
+        for (int k = edge; k + edge < K; ++k)
         {
             // out[k] targets input position k·ipo - kHalf. Asked of the class, not restated: this is
             // the number that moved when the kernel did, and hard-coding it is how it went stale before.
@@ -128,11 +136,20 @@ int main()
         // (catmull(c,c,c,c,t) = 0.5·2c), so DC came back bit-identical. This kernel's rows are a
         // partition of unity BY CONSTRUCTION — each row is divided by its own sum inside reset() — but
         // that normalisation happens in double and is stored as float, and the run-time sum is a
-        // 64-term float dot product. Bound: 64 terms each rounded at 2^-24, against a coefficient
-        // vector whose ABSOLUTE sum is ~1.2 (a windowed sinc has negative lobes) → 64·2^-24·1.2 ≈ 4.6e-6.
-        // Measured worst deviation across four ratios × four constants: 3.6e-7, with 46 % of samples
-        // still landing bit-exact. Asserted at 2e-6 — inside the derivation, an order above the
-        // measurement, and far below any real defect (a mis-normalised row is a per-mille effect).
+        // 64-term float dot product.
+        //
+        // 🔴 THE DERIVATION PUBLISHED HERE FIRST WAS WRONG AND A CREW ROUND CAUGHT IT. It used an
+        // absolute coefficient sum of "~1.2", which is what a naive look at a unit-sum kernel suggests.
+        // MEASURED on the shipped table: max Σ|w| = 2.77365 on the interpolating leg and 2.26297 on the
+        // decimating one — a windowed sinc's negative lobes carry far more weight than its unit sum
+        // admits. So the worst-case bound is
+        //     kTaps · 2^-24 · max Σ|w| = 64 · 5.96e-8 · 2.774 = 1.06e-5,
+        // not 4.6e-6, and the 2e-6 that used to be asserted here was BELOW its own stated derivation —
+        // i.e. fitted to the measurement while claiming to be derived. Asserted at 1.2e-5 now: just
+        // above the adversarial bound, so no correct implementation can fail it on any toolchain, and
+        // still 100x below a real defect (a mis-normalised row is a per-mille effect). The measurement
+        // is PRINTED so a regression is visible in the log even while it passes: 4.768e-7 today, and a
+        // crew round confirmed the same value bit-for-bit on Apple clang, gcc 14 and MSVC.
         const double ratios[][2] = { {48000, 48000}, {44100, 48000}, {96000, 48000}, {48000, 44100} };
         const float  consts[]    = { 1.0f, 0.5f, 0.25f, -0.75f };
         int checked = 0; double worst = 0.0;
@@ -148,8 +165,132 @@ int main()
                 }
             }
         std::printf ("      worst settled-DC deviation over %d samples: %.3e\n", checked, worst);
-        ok (checked > 5000 && worst < 2.0e-6,
-            "every settled DC sample equals the input constant to the derived 64-tap float bound");
+        ok (checked > 5000 && worst < 1.2e-5,
+            "every settled DC sample equals the input constant to the derived 64-tap float bound "
+            "(kTaps·2^-24·max sum|w| = 1.06e-5; measured " + std::to_string (worst) + ")");
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    group ("THE TABLE AS AN OBJECT — invariants no dB measurement in this repo can see");
+    {
+        // 🔴 WHY THIS GROUP EXISTS, and it is the most expensive lesson of the P34 crew rounds. A
+        // diverse-testing round mutated reset() to early-return when `tab` was already populated — a
+        // STALE TABLE, i.e. a resampler that keeps designing for the previous ratio forever. That
+        // mutant passed **345 of 345 checks** across every suite in this repository. Not one number
+        // moved, because every fixture in every suite constructs a FRESH instance, and a fresh instance
+        // has an empty table and therefore builds the right one. The production path nobody was
+        // exercising is the ordinary one: a DAW changes sample rate, NamBackend::prepare re-enters
+        // configureRates, and the SAME down/up objects are reset() to a new ratio.
+        //
+        // The lesson generalises past this defect: a kernel is a data structure as well as a filter,
+        // and its structural invariants have to be asserted directly. Everything below is a property
+        // of the TABLE, checkable in microseconds, and each one is a defect class that costs 90 dB or
+        // more of transparency while every passband and stopband pin in the tree stays green.
+
+        // (a) reset() to a different ratio must REBUILD, not reuse.
+        {
+            StreamResampler r;
+            r.reset (44100.0, 48000.0, 512);
+            const std::vector<float> up = r.tab;
+            r.reset (48000.0, 44100.0, 512);
+            // Precondition first, so this cannot pass by both tables being empty or both identical for
+            // an unrelated reason: the two ratios design genuinely different kernels (cutoff 0.99 of
+            // the input Nyquist one way, 0.99·44100/48000 = 0.909 the other).
+            ok (! up.empty() && up.size() == r.tab.size(),
+                "precondition: both ratios build a table of the same shape");
+            bool differs = false;
+            for (std::size_t i = 0; i < up.size() && ! differs; ++i) differs = (up[i] != r.tab[i]);
+            ok (differs, "reset() to a DIFFERENT ratio rebuilds the phase table — a stale table passes "
+                         "every dB assertion in this repository, so it has to be caught structurally");
+        }
+
+        // (b) …and the rendered consequence, which is the shape the DAW actually takes: a stage reset
+        // to ratio A, RUN, then reset to ratio B must produce exactly what a virgin B produces.
+        {
+            auto render = [] (bool viaOtherRatio)
+            {
+                StreamResampler r;
+                if (viaOtherRatio)
+                {
+                    r.reset (48000.0, 44100.0, 2048);
+                    std::vector<float> warm (1024, 0.3f), sink (4096);
+                    r.feed (warm.data(), 1024);
+                    (void) r.produceAvailable (sink.data(), 4096);   // make it carry real state
+                }
+                r.reset (44100.0, 48000.0, 2048);
+                std::vector<float> in (1024), out (4096);
+                for (int i = 0; i < 1024; ++i) in[(std::size_t) i] = 0.5f * (float) std::sin (0.21 * i);
+                r.feed (in.data(), 1024);
+                const int k = r.produceAvailable (out.data(), 4096);
+                out.resize ((std::size_t) k);
+                return out;
+            };
+            const auto viaOther = render (true), virginRun = render (false);
+            bool identical = (viaOther.size() == virginRun.size());
+            for (std::size_t i = 0; identical && i < viaOther.size(); ++i)
+                identical = (std::memcmp (&viaOther[i], &virginRun[i], sizeof (float)) == 0);
+            ok (identical && viaOther.size() > 900,
+                "a resampler reset to one ratio, RUN, and then reset to another renders bit-identically "
+                "to one that only ever saw the second — reset() is a full re-design, not a top-up");
+        }
+
+        // (c) THE WINDOW EDGE. kernelAt is defined to return exactly zero at |x| >= kHalf, and the seam
+        // row depends on it: a `>` instead of `>=` there (the header names it "the classic off-by-one")
+        // leaves a ~1.3e-5 tap alive at the edge, which survives the whole suite except two float
+        // tolerances that catch it by luck. Asserted directly, it cannot hide.
+        {
+            const double fc = StreamResampler::kCutoff;
+            ok (StreamResampler::kernelAt ((double) StreamResampler::kHalf, fc) == 0.0
+                && StreamResampler::kernelAt (-(double) StreamResampler::kHalf, fc) == 0.0,
+                "the window is EXACTLY zero at |x| = kHalf, both signs");
+            ok (StreamResampler::kernelAt ((double) StreamResampler::kHalf + 1.0, fc) == 0.0,
+                "…and beyond it");
+            ok (std::fabs (StreamResampler::kernelAt (0.0, fc) - fc) < 1e-12,
+                "…and the centre tap is fc, i.e. the window is 1 there and the sinc is unwindowed at 0");
+        }
+
+        // (d) THE SEAM ROW. Row kPhases must be row 0 shifted by exactly one tap; that is the whole
+        // reason a (kPhases+1)-row table exists instead of a wrapping index. If it is not, one output
+        // in every 147 at the shipped ratio uses a kernel misaligned by a full input sample.
+        {
+            StreamResampler r;
+            r.reset (44100.0, 48000.0, 512);
+            const float* row0   = r.tab.data();
+            const float* rowEnd = r.tab.data() + (std::size_t) StreamResampler::kPhases * StreamResampler::kTaps;
+            bool shifted = true;
+            for (int j = 1; j < StreamResampler::kTaps; ++j) shifted = shifted && (rowEnd[j] == row0[j - 1]);
+            ok (shifted, "row kPhases IS row 0 shifted one tap — the seam is consistent, so linear "
+                         "interpolation never has to wrap");
+            ok (rowEnd[0] == 0.0f && row0[StreamResampler::kTaps - 1] == 0.0f,
+                "…and the taps that enter and leave at the seam are exactly zero, which is what makes "
+                "the shift exact rather than approximate");
+        }
+
+        // (e) EVERY row is a partition of unity, checked as data rather than through a DC signal.
+        {
+            StreamResampler r;
+            r.reset (48000.0, 44100.0, 512);
+            double worst = 0.0;
+            for (int p = 0; p <= StreamResampler::kPhases; ++p)
+            {
+                double sum = 0.0;
+                for (int j = 0; j < StreamResampler::kTaps; ++j)
+                    sum += (double) r.tab[(std::size_t) p * StreamResampler::kTaps + (std::size_t) j];
+                worst = std::max (worst, std::fabs (sum - 1.0));
+            }
+            std::printf ("      worst |sum(row) - 1| over all %d rows: %.3e\n", StreamResampler::kPhases + 1, worst);
+            ok (worst < 1.0e-6, "every phase row sums to 1 to float storage precision");
+        }
+
+        // (f) IDENTITY builds no table at all — a bit-copy has nothing to read, and 128 KiB per
+        // instance is not free when a NamStage holds four of them and retires up to 64 backends.
+        {
+            StreamResampler r;
+            r.reset (48000.0, 48000.0, 512);
+            ok (r.identity && r.tab.empty(), "an identity ratio designs no kernel and allocates no table");
+            r.reset (48000.0, 44100.0, 512);
+            ok (! r.identity && ! r.tab.empty(), "…and moving off identity builds one");
+        }
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -190,20 +331,40 @@ int main()
         //   f = 0.45 (19.8 kHz, into the transition band) -> 85.6 dB
         // The cubic at f = 0.30 read about 55 dB and fell away steeply; here the whole passband sits
         // within 9 dB of itself.
+        // 🔴 TWO RATIOS, and the second one is not decoration. A crew mutation that corrupted the taps
+        // with a ZERO-SUM symmetric perturbation — invisible to DC, invisible to the 44.1↔48 rows —
+        // cost 4.4 dB at 3 kHz through a 2x INTERPOLATION and survived every suite, because nothing
+        // measured an integer up-ratio's passband at all. 48 -> 96 is that case: the phase alternates
+        // between exactly two rows, so a defect living in one row has nowhere to average out.
+        struct RB { double in, out; const char* name; };
         const double fs[] = { 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4 };
         double lo = 1e9, hi = -1e9;
-        for (double f : fs)
-        {
-            const double s = sineResampleSnrDb (44100, 48000, f, 40000, 0.5);
-            std::printf ("      SNR(f=%.3f, %5.0f Hz) = %6.1f dB\n", f, f * 44100.0, s);
-            lo = std::min (lo, s); hi = std::max (hi, s);
-            ok (s >= 90.0, "SNR at f=" + std::to_string (f) + " clears 90 dB — the cubic could not do "
-                           "this above f=0.05, and did not claim to");
-        }
-        ok (hi - lo < 12.0,
-            "…and the SNR spread across SIX octaves is " + std::to_string (hi - lo) + " dB. The cubic's "
-            "own law was 18 dB per octave, i.e. ~100 dB across this span: a kernel that still obeyed it "
-            "would fail this line, which is exactly what makes the line worth asserting");
+        for (const RB rb : { RB {44100, 48000, "44.1->48"}, RB {48000, 96000, "48->96 (integer 2x)"} })
+            for (double f : fs)
+            {
+                const double s = sineResampleSnrDb (rb.in, rb.out, f, 40000, 0.5);
+                std::printf ("      %-20s SNR(f=%.3f, %5.0f Hz) = %6.1f dB\n", rb.name, f, f * rb.in, s);
+                lo = std::min (lo, s); hi = std::max (hi, s);
+                // 🔴 THE FLOOR IS DERIVED, and the first version of this line was not — it was read off
+                // the 44.1->48 column alone (min 95.8) and set at 92, which the 48->96 column then
+                // failed at three frequencies. The failure was correct and the threshold was wrong.
+                // What bounds this SNR is the window's own PASSBAND RIPPLE: an ideal-sine oracle counts
+                // a systematic gain error of delta as "noise", so SNR <= -20*log10(delta), and for a
+                // Kaiser beta = 8.6, delta = 10^(-86.7/20) = 4.6e-5 -> 86.7 dB. That is a property of
+                // the DESIGN, identical at every ratio; the 44.1->48 column simply happens to sample
+                // the ripple pattern at kinder points. Asserted at 84 dB: below the derived floor, so
+                // no correct kernel can fail it anywhere, and 40 dB above what the cubic reached in
+                // this band (its SNR at f=0.3 was about 55 dB and falling 18 dB per octave).
+                ok (s >= 84.0, std::string (rb.name) + " SNR at f=" + std::to_string (f)
+                               + " clears the derived 86.7 dB Kaiser ripple floor (asserted at 84)");
+            }
+        // The spread is bounded by the same ripple: the ceiling is float/table precision (~105 dB) and
+        // the floor is the 86.7 dB ripple, so ~18 dB is the designed range and 25 dB is the assertion.
+        // A kernel still obeying the cubic's 18 dB-per-octave law would spread ~100 dB across this span
+        // and fail by a factor of four, which is what makes a loose-looking bound still worth having.
+        ok (hi - lo < 25.0,
+            "…and the SNR spread across SIX octaves and two ratios is " + std::to_string (hi - lo)
+            + " dB, inside the range the window's own ripple allows — the cubic's law would give ~100");
 
         // The band edge is a DESIGNED feature and must still be visible: the cutoff sits at 0.99 of the
         // lower Nyquist, so f = 0.45 is inside the transition and must read measurably worse than the

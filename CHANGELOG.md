@@ -9,7 +9,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 - **BREAKING (behaviour), `core`, `nam`: `StreamResampler`'s interpolation kernel is now a 64-tap
   polyphase windowed sinc, not a Catmull-Rom cubic. Every model at 44.1 kHz sounds different — brighter
-  in the top octave, and without a bass artefact it should never have had.** The cubic had no
+  in the top octave, and without a bass artefact it should never have had.** (Read "brighter" as scoped:
+  it holds for hosts up to 96 kHz. At 176.4 and 192 kHz the fixed 64-tap window under a ~4:1 decimation
+  costs up to 0.8 dB at 20 kHz — still far better than a kernel with no anti-aliasing at all, but not
+  flat; the rows are pinned in both directions and §6.7 of the doc says so.) The cubic had no
   anti-aliasing of any kind, and P32 measured what that cost; this is the fix, and it is not neutral.
   - **Passband.** One round trip 44.1 ↔ 48 kHz, coherent carrier / worst phase, at 17.64 kHz:
     **−4.17 / −9.27 dB → +0.0002 / +0.0000 dB**. At 20 kHz **−5.48 / −14.79 → −0.0133 / −0.0135**. The

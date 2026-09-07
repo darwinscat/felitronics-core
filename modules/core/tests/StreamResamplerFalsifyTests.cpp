@@ -136,30 +136,61 @@ int main()
         const auto out = oneShot (44100.0, 48000.0, in);
         const double step = 44100.0 / 48000.0;
         const double D = felitronics::core::StreamResampler::delayInputSamples();
-        double worst = 0.0;
+        double worst = 0.0, worstAbs = 0.0, maxWant = 0.0;
         double firstWindow = 0.0, lastWindow = 0.0;
         int firstN = 0, lastN = 0;
         for (std::size_t k = 128; k + 128 < out.size(); ++k)
         {
             const double want = step * (double) k - D;
             const double err = std::fabs ((double) out[k] - want);
+            worstAbs = std::max (worstAbs, err);
+            maxWant  = std::max (maxWant, std::fabs (want));
             worst = std::max (worst, err / std::max (1.0, std::fabs (want)));    // RELATIVE, see below
             if (k < 1024) { firstWindow += err / std::max (1.0, std::fabs (want)); ++firstN; }
             if (k + 1024 > out.size()) { lastWindow += err / std::max (1.0, std::fabs (want)); ++lastN; }
         }
         const double head = firstWindow / std::max (1, firstN), tail = lastWindow / std::max (1, lastN);
-        std::printf ("      worst RELATIVE ramp error %.3e, head avg %.3e, tail avg %.3e\n", worst, head, tail);
-        // 🔴 THE MEASURE IS RELATIVE, and the reason is the whole point of the group. A ramp's VALUE
-        // grows linearly, so its float quantization error grows with it: an absolute bound would read
-        // "the tail is 20x worse than the head" on a perfectly drift-free resampler, which is what an
-        // earlier version of this line did. Accumulator drift is what would show up as a growing
-        // RELATIVE error; float quantization is flat in relative terms. Absolute worst here is 0.023 on
-        // values near 40 000 — six ulps of a 64-term float dot product, where the cubic's four-term one
-        // cost about 1.5 (sqrt(64/4) = 4x, and that is the whole difference).
-        ok (worst < 5.0e-6, "float-output ramp error stays at the float ulp scale over 1 second");
+        std::printf ("      worst RELATIVE ramp error %.3e, head avg %.3e, tail avg %.3e (worst ABS %.3e)\n",
+                     worst, head, tail, worstAbs);
+        // 🔴 TWO CORRECTIONS A CREW ROUND FORCED HERE, and the second is the interesting one.
+        //
+        // (1) The error is NOT float quantization. An earlier version of this comment said "six ulps of
+        //     a 64-term float dot product", which sounded plausible and was wrong. The residual is the
+        //     kernel's own FIRST MOMENT: the 64 taps cover [-31-t, 32-t], which is symmetric about zero
+        //     only at t = 0 and t = 0.5, so for every other phase the edge taps are unequal
+        //     (kernelAt(31.7) = -1.72e-5 against kernelAt(-31.3) = +1.09e-6) and a ramp comes out
+        //     shifted by up to 3.6e-4 of a sample. Times the ramp's slope, that is a fixed ABSOLUTE
+        //     error, identical on clang, gcc and MSVC — deterministic, not noise.
+        //
+        // (2) Because it is absolute and fixed, a RELATIVE bound is silently fitted to WHERE THE LOOP
+        //     STARTS: the ramp's value grows, so the same error divided by a bigger number looks
+        //     smaller. Starting at k = 64 instead of 128 makes the identical kernel read 1.3e-5 and
+        //     fail a 5e-6 line. So the bound on the SIZE is absolute now, derived from the first moment
+        //     (3.6e-4 samples x the 0.919 slope = 3.3e-4; asserted at 1e-3), and the RELATIVE pair is
+        //     kept for the claim it can actually make: that the error does not GROW along the ramp,
+        //     which is what accumulator drift would do and float quantization would not.
+        // The bound has TWO terms because the error does, and single-term versions of this line failed
+        // the correct kernel twice while I was writing it — once too tight by 80x, once by 1.2x.
+        //   Term 1, the kernel's FIRST MOMENT: a fixed 3.3e-4 absolute (see above), dominant while the
+        //     ramp is still small. Rounded up to 1e-3.
+        //   Term 2, float SUMMATION of large values: the dot product adds 64 products of magnitude up
+        //     to |x|·max|w|, and the coefficient vector's ABSOLUTE sum is 2.77 (measured on the shipped
+        //     table — a windowed sinc's negative lobes carry far more than its unit sum suggests). The
+        //     realistic accumulation error is sqrt(kTaps)·u·Σ|w|·|x| with u = 2^-24; the adversarial
+        //     one is kTaps·u·Σ|w|·|x|, which is 8x larger and would make this line meaningless.
+        // Measured 0.0266 against the sqrt form's 0.058 — a factor of 2, on a fixture whose values run
+        // to 44 000. NEITHER term grows with k, which is the claim the group exists to make.
+        constexpr double kAbsCoeffSum = 2.78;                  // measured max Σ|w| over all phase rows
+        const double bound = 1.0e-3 + std::sqrt ((double) felitronics::core::StreamResampler::kTaps)
+                                      * std::ldexp (1.0, -24) * kAbsCoeffSum * maxWant;
+        std::printf ("      derived bound %.3e (first moment 1e-3 + sqrt(64)·2^-24·2.78·%.0f)\n", bound, maxWant);
+        ok (worstAbs < bound,
+            "the ramp error is the kernel's first moment plus float storage of a large value ("
+            + std::to_string (worstAbs) + " against a derived " + std::to_string (bound)
+            + "), not accumulator drift");
         ok (tail < 4.0 * std::max (head, 1.0e-8),
-            "…and the tail is no worse RELATIVE to the signal than the head: float quantization, not "
-            "accumulator drift, which would grow without bound");
+            "…and RELATIVE to the signal the tail is no worse than the head, which is the drift claim: "
+            "a drifting phase accumulator grows without bound, a fixed first moment does not");
     }
 
     group ("DeepSeek 1.5 adapted: hostile chunk schedule matches one-shot within float phase rounding");
@@ -194,9 +225,12 @@ int main()
         // a MEASUREMENT with a decade of headroom, not a derivation — and it is stated as such.
         std::printf ("      quadratic: worst |err| %.3e over a span of %.0f (relative %.2e)\n",
                      worst, span, worst / std::max (1.0, span));
-        ok (worst / std::max (1.0, span) < 1.0e-3,
+        // 🔴 1e-3 RELATIVE WAS TOO LOOSE AND A CREW ROUND SAID SO WITH A NUMBER: on a fixture whose
+        // values reach 15621, it admitted 15.6 of absolute error, and a harmful mutation walked through.
+        // Measured is 3.9e-7 relative; 1e-5 keeps a factor of 25 and closes the door.
+        ok (worst / std::max (1.0, span) < 1.0e-5,
             "quadratic reproduction is no longer exact — an approximating kernel does not pass through "
-            "its samples — but it holds to 1e-3 relative across half-sample phases");
+            "its samples — but it holds to 1e-5 relative across half-sample phases");
     }
 
     return felitronics::test::report();
