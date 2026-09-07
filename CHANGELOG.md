@@ -7,6 +7,90 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **BREAKING (behaviour + latency), `oversampling`, `saturation`, `limiter`, `poweramp`:** **the shipped
+  `tapsPerPhase` default rises from 32 to 64, and the reason is aliasing, not the pass band.**
+  `PolyphaseOversampler`'s cutoff is FIXED at 0.90 × baseband Nyquist, so its transition band has to fit
+  between 0.45 fs and the fold at 0.50 fs, and `tapsPerPhase` is the only thing that decides whether it
+  does. The design DECLARES its own target one line from the taps — `beta = 9.0`, a ~90 dB Kaiser
+  stopband — and **at 32 taps it delivered 27 dB.** Everything above 0.50 fs folds straight back into the
+  audio band, so that is not a nicety. Measured end to end on a `Saturator` at 0.17 fs and 4×, TOTAL
+  non-harmonic energy — every bin that is not a harmonic BELOW Nyquist, so a harmonic that folded to get
+  there counts as the aliasing it is:
+
+    drive     +0       +6      +12      +18      +24      +30      +36  dB
+    32     −135.3    −60.1    −48.2    −44.3    −31.8    −25.3    −22.9  dBc
+    64     −130.8   −132.3   −101.0    −50.3    −31.3    −24.8    −22.4  dBc
+
+  **At the drive this stage is used at — `Saturator::Params` calls 1..6 dB the mastering range — the
+  taps remove 50 to 72 dB of aliasing.** They stop helping above about +24 dB, where the harmonic series
+  reaches past the OS Nyquist and folds INSIDE the oversampled domain, which no decimation filter can
+  reach: that is the oversampling FACTOR's axis, and there the total is 0.5 dB worse, because a flatter
+  pass band also delivers what had already folded. The component the taps own at every drive is the
+  transition-band leakage — the 3rd harmonic of a 0.17 fs tone lands at 0.51 fs and folds to 0.49 fs,
+  where 32 taps left it at −45.5 dBc and 64 puts it at −139.4, into the float noise. (That last pair is
+  one tone landing in one of the kernel's nulls; the honest figure for what 64 taps give ANYWHERE in the
+  fold region is the worst case below, −90.5 dB, not the null.) Worst rejection over
+  the whole fold region, worst of factors 2/4/8: 32 → −26.9 dB, 48 → −51.1, 56 → −76.2, 57 → −82.6,
+  **58 → −90.7**, 59 → −89.8, 60 → −90.7, **64 → −90.5**, 96 → −94.3. Read as a knee, not a step:
+  below ~58 the transition is genuinely unfinished, at ~58 it reaches the Kaiser window's floor and then
+  RIPPLES there by about a dB, so 59 and 61 fall a tenth of a dB short while 58, 60 and 64 clear it.
+  "The first taps count meeting −90.0" is therefore 58, and that integer is an artefact of a hard bar on
+  a rippling quantity. 64 is the round number past the knee; above it further taps buy pass-band width
+  rather than rejection — which is why the answer is not 96.
+  - **The pass band is the COROLLARY, and it is the half that was already written down.** Two oversampled
+    stages in series — a clipper in front of a limiter, the real assembly — cost **−1.549 dB at 17.6 kHz
+    and −6.033 at 18.5 kHz at 44.1 kHz** on the old default, i.e. every consumer that built that chain got
+    a ~19 kHz lowpass silently. They now cost **+0.000 and −0.610**. `felitronics::mastering` has passed 64
+    explicitly since it was written and is **bit-identical** across this change (verified over 942 912
+    float32 values, 18 configurations; the same stand shows the DEFAULT paths differing, so it is not a
+    blind null). A caller passing `tapsPerPhase` explicitly is likewise bit-identical — with one
+    exception, which is the new guard below rather than the default: a topology that used to be accepted
+    and is now refused (`factor` above 64, `tapsPerPhase` above 1024) does not "produce the same bits",
+    it produces a `false` from `prepare()`.
+  - **LATENCY MOVES, and it is host-visible.** Every affected stage reports `tapsPerPhase − 1`, so
+    **31 → 63** samples; `TruePeakLimiter` at its default 1 ms lookahead and 48 kHz goes **79 → 111**.
+    Read it from `latencySamples()`, which is what `mastering::MasteringChain` already does.
+  - **CPU ROUGHLY DOUBLES in the FIR** — "no CPU cost" would be false here. Measured at 48 kHz, stereo,
+    4×, block 512: `Saturator` 0.97 → 2.19 %RT, `TruePeakLimiter` 1.10 → 2.22 %RT, the pair in series
+    **2.13 → 4.44 %RT** (2.09×).
+  - **`poweramp::PowerAmpStage` gets the knob it never had** — `prepare (sampleRate, maxBlock,
+    oversampleFactor, tapsPerPhase)` — and takes the same default. It used to hardcode 32 with no way for
+    a caller to say otherwise, and its own aliasing gate certified that as adequate **because the gate's
+    analysis window stopped at 10 kHz**, below where the transition-band leakage lands. Over the whole
+    band the same gate reads **−68.7 dBc at 32 taps, which FAILS its own −70 dBc bar**, against −77.4 at
+    64; a 3 kHz fundamental at +12 dB of drive goes −56.2 → −75.9 dBc. The window is widened to Nyquist
+    and the suite prints the whole map at BOTH taps counts. The stage's CPU roughly doubles with everyone
+    else's — **1.24 → 2.43 %RT** — and its round trip goes 31 → 63 samples (+0.67 ms at 48 kHz). What the
+    taps do NOT fix there: the map's hot cells (a 3 kHz fundamental at +24 dB reads −40.9 dBc at either
+    taps count) are the tube's harmonics folding inside the oversampled domain, which is the FACTOR's
+    axis. OrbitCab keeps its own copy of the stage at an explicit 32 and is unaffected.
+  - **`TruePeakLimiter`'s delivered-excess characterisation is RE-DERIVED**, as its own header demanded
+    ("widen the pass band and this term has to be re-derived"). The worst tone the round trip passes flat
+    is now **2fs/5 rather than fs/3**, so the grid-geometry term goes **+0.302 → +0.436 dB at 4×** and
+    **+0.075 → +0.108 at 8×** (unchanged at 2×, where fs/3 still dominates at +1.250). The old figures
+    were a property of the lowpass, not of the limiter — `mastering` has been running at +0.436 all along.
+    2fs/5 is now a witness in the ceiling matrix, and the CHARACTERISATION battery — everything reached
+    through `Setup`/`renderAt`, including the reference oracle it nulls against — runs on the SHIPPED
+    topology instead of a hardcoded 32. Roughly two dozen guard and plumbing checks still spell 32 out on
+    purpose; those are about refusal and resumption, not about the filter. **The one place the sharper filter costs** is the degenerate corner with
+    lookahead AND release both at their floors, where re-band-limiting a step rings more: **+0.36 / +0.28 /
+    +0.26 dB at 2× / 4× / 8×**, pinned. The ON-GRID bound, the only thing actually promised, is unchanged.
+  - **Source-level API break beyond the defaults:** `PowerAmpStage::prepare` gains a fourth parameter,
+    so its *type* changes. Ordinary calls still compile (the parameter is defaulted), but anything that
+    names the function's type — `void (PowerAmpStage::*)(double, int, int)`, a `std::function` built
+    from it, an explicit `&PowerAmpStage::prepare` cast — does not.
+  - **`PolyphaseOversampler::prepare` now refuses `tapsPerPhase` above `kMaxTapsPerPhase` (1024) and
+    `factor` above `kMaxFactor` (64)** —
+    both factors of `N = factor * tapsPerPhase` had to be bounded because the PRODUCT is what overflows a
+    signed int before allocating, and either argument alone can do it. `TruePeakLimiter` guarded both at
+    its own gate already; `Saturator` passes an unbounded `oversampleFactor` straight through, and
+    `prepare(INT_MAX, 1)` on the default taps is UBSan-confirmed overflow followed by a `length_error` —
+    a terminate under the wasm tier's `-fno-exceptions`.
+  - **`oversampling`'s own suite measured none of this**: it ran entirely at a hardcoded 32 on tones of
+    500 Hz and 2 kHz at 48 kHz (0.010 and 0.042 fs), owning the default and never looking where the
+    default decides anything. It now pins the stopband, the aliasing and the two-stage droop surface,
+    two-sidedly, with its oracle's liveness asserted.
+
 - **BREAKING (API + behaviour), every module with a block-level `process()`:** **the core had four
   different answers to "the caller passed something other than what was prepared", and every one of them
   was SILENT.** A census over all 24 modules found three answers for the width, four for the length, and a

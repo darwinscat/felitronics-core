@@ -123,11 +123,14 @@ private:
 class ReferenceLimiter
 {
 public:
-    void prepare (double sampleRate, int maxBlock, int maxChannels, int factor, const Weakening& w)
+    void prepare (double sampleRate, int maxBlock, int maxChannels, int factor, const Weakening& w, int taps)
     {
         wk = w; fs = sampleRate; maxCh = maxChannels; maxBlock_ = maxBlock;
         F  = factor < 2 ? 2 : factor;                                    // the real class clamps identically
-        (void) os.prepare (F, maxCh, 32); (void) down.prepare (F, maxCh, 32);
+        // The taps count comes from the SETUP, like the factor: the oracle and the class under test have to
+        // stand on the same topology or the null is measuring the topology instead of the limiter.
+        tpp_ = taps;
+        (void) os.prepare (F, maxCh, tpp_); (void) down.prepare (F, maxCh, tpp_);
         osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock * (std::size_t) F, 0.0f));
         osPtrs.assign ((std::size_t) maxCh, nullptr);
         const int maxLookOS = (int) std::ceil (20.0 * 0.001 * fs) * F;
@@ -235,12 +238,19 @@ private:
     BrokenSlidingMax                broken;
     std::vector<detail_slide>       perCh;
     double fs = 48000.0, ceilingDb = -1.0, gridPeak = 0.0;
-    int maxCh = 0, maxBlock_ = 0, F = 4, lookBaseband = 0;
+    int maxCh = 0, maxBlock_ = 0, F = 4, tpp_ = 64, lookBaseband = 0;
     float relCoef = 0.0f, grDb = 0.0f, lastGain = 1.0f;
 };
 
 //==============================================================================
-struct Setup { double ceilingDb = -1.0, releaseMs = 50.0, lookaheadMs = 1.0; int factor = 4; };
+// tapsPerPhase is part of the TOPOLOGY and belongs here with the factor. It used to be hardcoded to 32
+// inside renderAt(), which meant this entire battery — the ceiling bound, the derate characterisation,
+// the witness matrix — measured a configuration the limiter had stopped shipping the moment the default
+// moved. A suite that pins a number the product does not use is not a weaker test, it is a test of
+// something else. Defaulted to the shipped value; passed explicitly only where the OLD topology is the
+// point of the check.
+struct Setup { double ceilingDb = -1.0, releaseMs = 50.0, lookaheadMs = 1.0; int factor = 4;
+               int taps = limiter::TruePeakLimiterConfig {}.tapsPerPhase; };
 
 // Render through the REAL class. The drain matters and is not padding: the limiter delays by
 // latencySamples(), so without it the tail of the witness never comes out, the buffer stops
@@ -253,7 +263,7 @@ static std::vector<std::vector<float>> renderAt (const std::vector<std::vector<f
     const int nch = (int) in.size(), n = (int) in[0].size();
     limiter::TruePeakLimiter lim;
     const int maxBlock = block > 0 ? block : n;
-    (void) lim.prepare (sr, maxBlock, nch, { s.lookaheadMs, s.factor, 32 });   // topology is prepare-time only now
+    (void) lim.prepare (sr, maxBlock, nch, { s.lookaheadMs, s.factor, s.taps });   // topology is prepare-time only now
     limiter::TruePeakLimiterParams p;
     p.ceilingDbTp = s.ceilingDb; p.releaseMs = s.releaseMs;
     lim.setParams (p);
@@ -276,9 +286,9 @@ static std::vector<std::vector<float>> renderRef (const std::vector<std::vector<
 {
     const int nch = (int) in.size(), n = (int) in[0].size();
     ReferenceLimiter ref;
-    (void) ref.prepare (sr, n, nch, s.factor, w);
+    (void) ref.prepare (sr, n, nch, s.factor, w, s.taps);
     ref.setParams (s.ceilingDb, s.releaseMs, s.lookaheadMs);
-    const int drain = (32 - 1) + (int) std::lround (s.lookaheadMs * 0.001 * sr) + 64;
+    const int drain = (s.taps - 1) + (int) std::lround (s.lookaheadMs * 0.001 * sr) + 64;
     std::vector<std::vector<float>> out ((std::size_t) nch, std::vector<float> ((std::size_t) (n + drain), 0.0f));
     for (int c = 0; c < nch; ++c) std::copy (in[(std::size_t) c].begin(), in[(std::size_t) c].end(), out[(std::size_t) c].begin());
     // The reference is prepared for maxBlock == n, so drive it in n-sized chunks.
@@ -428,7 +438,13 @@ int main()
     test::group ("Delivered true peak == ceiling + the grid's closed form (two-sided, +-0.015 dB)");
     {
         struct Tone { int p, q; const char* name; };
-        const Tone tones[] { { 1, 3, "fs/3" }, { 1, 4, "fs/4" }, { 4, 11, "4fs/11" } };
+        // 2fs/5 ADDED when tapsPerPhase rose to 64. It has the LARGEST grid term of any tone below
+        // 0.46 fs at 4x and 8x (+0.436 / +0.108 against fs/3's +0.302 / +0.075), and at 32 taps it was
+        // not in this matrix because the prototype's droop took 0.775 dB off it and it could not reach
+        // the output. The pass band is flat there now, so it is the worst case and has to be a witness:
+        // a matrix chosen from the tones the OLD lowpass happened to pass is a fixture shaped by the
+        // defect it was meant to survey.
+        const Tone tones[] { { 1, 3, "fs/3" }, { 1, 4, "fs/4" }, { 4, 11, "4fs/11" }, { 2, 5, "2fs/5" } };
         for (const auto& t : tones)
             for (int F : { 2, 4, 8 })
             {
@@ -1035,19 +1051,28 @@ int main()
     // at 0.40 / 0.44 / 0.45 fs: those are ONE filter pass. The prototype is applied twice — once
     // interpolating, once decimating — so the dB double, and the real figures are the ones pinned here.
     // Two-sided on purpose: an upper budget alone would have accepted the wrong number just as happily.
-    test::group ("Round-trip droop where the header quotes it (two-sided, the doc-defect witness)");
+    //
+    // BOTH TOPOLOGIES, since the default moved from 32 taps to 64. The left column is what the limiter
+    // delivers as shipped; the right is what it delivered before, kept because it is the measurement the
+    // whole tapsPerPhase decision was made on and because a one-column table cannot tell "the default is
+    // 64" from "some number is 64". 0.45 fs is the cutoff itself and is taps-INDEPENDENT — that row is the
+    // anchor a table copied from the wrong column trips on.
+    test::group ("Round-trip droop where the header quotes it (two-sided, both topologies)");
     {
-        struct Row { int p, q; double expectDb; const char* where; };
-        const Row rows[] { { 2,  5, 0.775,  "0.40 fs (19.2 kHz at 48k)" },
-                           { 11, 25, 8.065, "0.44 fs (21.1 kHz at 48k)" },
-                           { 9, 20, 12.041, "0.45 fs (21.6 kHz at 48k)" } };
+        struct Row { int p, q; double atDefault; double at32; const char* where; };
+        const Row rows[] { { 2,  5,  0.000,  0.775, "0.40 fs (19.2 kHz at 48k)" },
+                           { 11, 25, 5.091,  8.065, "0.44 fs (21.1 kHz at 48k)" },
+                           { 9, 20, 12.041, 12.041, "0.45 fs (21.6 kHz at 48k) — the cutoff, taps-independent" } };
         for (const auto& r : rows)
         {
             const auto x = tpw::gridTone (sr, 0.10, r.p, r.q, -20.0, 0.0);
             std::vector<std::vector<float>> in { x };
-            const auto y = renderAt (in, sr, Setup { -1.0, 50.0, 1.0, 4 }, 0);
-            const double droop = tp::truePeakDbFft (x, 16) - tp::truePeakDbFft (y[0], 16);
-            test::approx (droop, r.expectDb, 0.25, std::string ("round-trip droop at ") + r.where);
+            const double now = tp::truePeakDbFft (x, 16)
+                             - tp::truePeakDbFft (renderAt (in, sr, Setup { -1.0, 50.0, 1.0, 4 }, 0)[0], 16);
+            const double was = tp::truePeakDbFft (x, 16)
+                             - tp::truePeakDbFft (renderAt (in, sr, Setup { -1.0, 50.0, 1.0, 4, 32 }, 0)[0], 16);
+            test::approx (now, r.atDefault, 0.25, std::string ("round-trip droop at ") + r.where + ", DEFAULT taps");
+            test::approx (was, r.at32,      0.25, std::string ("round-trip droop at ") + r.where + ", 32 taps (what it was)");
         }
     }
 
@@ -1382,6 +1407,42 @@ int main()
                       "and after limiting plus 2.5 s of silence the gain state is exactly 0, not a denormal");
     }
 
+    // ---------------------------------------------------------------- the budget's own construction
+    // The re-derivation of deliveredBudgetDb() (fs/3 -> the max of fs/3 and 2fs/5) SURVIVED the mutation
+    // stand: every assertion that spends the budget compares a witness against it as an UPPER bound, and
+    // a smaller budget is still large enough for all of them, so reverting the correction changed no
+    // verdict. A characterisation that no test can distinguish from a wrong one is documentation, not a
+    // characterisation — so the construction is asserted directly, and the premise it rests on (that
+    // 2fs/5 reaches the output at all) is MEASURED rather than assumed, since that premise is exactly
+    // what the old taps default made false.
+    test::group ("The delivered budget takes the worst tone the round trip passes FLAT, not fs/3 by default");
+    {
+        for (int F : { 2, 4, 8 })
+        {
+            const double third = tpw::gridBreachDb (1, 3, F), fifth = tpw::gridBreachDb (2, 5, F);
+            const auto x = tpw::gridTone (sr, 0.10, 2, 5, -20.0, 0.0);
+            std::vector<std::vector<float>> in { x };
+            const double droop = tp::truePeakDbFft (x, 16)
+                               - tp::truePeakDbFft (renderAt (in, sr, Setup { -1.0, 50.0, 1.0, F }, 0)[0], 16);
+            test::ok (droop < 0.05, "F=" + std::to_string (F) + ": PREMISE — 2fs/5 now passes FLAT ("
+                                    + dbs (droop) + " dB of droop), which is why its grid term can reach the output");
+            // EQUALITY, not a lower bound. ">=" is satisfied by any inflation of the budget, and an
+            // inflated budget weakens every other assertion in this file that spends it as a ceiling —
+            // adding 1.0 dB at 2x only passes all 232 checks harder.
+            test::approx (tpw::deliveredBudgetDb (F), std::max (third, fifth) + tpw::kModulationEnvelopeDb, 1e-9,
+                          "F=" + std::to_string (F) + ": the budget IS the larger grid term plus the envelope ("
+                          + dbs (std::max (third, fifth)) + " + " + dbs (tpw::kModulationEnvelopeDb) + ")");
+        }
+        // ...and the max is not cosmetic — neither tone wins everywhere, so a helper that hardcodes
+        // either one is wrong at some factor.
+        test::ok (tpw::gridBreachDb (2, 5, 4) > tpw::gridBreachDb (1, 3, 4),
+                  "at 4x the worse tone is 2fs/5 (+0.436) and not fs/3 (+0.301)");
+        test::ok (tpw::gridBreachDb (2, 5, 8) > tpw::gridBreachDb (1, 3, 8),
+                  "at 8x too (+0.108 against +0.075)");
+        test::ok (tpw::gridBreachDb (1, 3, 2) > tpw::gridBreachDb (2, 5, 2),
+                  "but at 2x fs/3 is still the worse one (+1.249 against +0.436) — hence a max, not a swap");
+    }
+
     // ---------------------------------------------------------------- the corner the floors do NOT cover
     // Each floor was measured with the OTHER parameter at a musical value. Both at once is a different
     // point, and it sits OUTSIDE the envelope — bringing it inside would need floors at 24 baseband
@@ -1389,8 +1450,14 @@ int main()
     // is characterised here with its number instead of being clamped away, and the header says so.
     test::group ("Both floors at once: outside the envelope, on purpose, with the number pinned");
     {
+        // AND IT MOVED WHEN tapsPerPhase ROSE. At both floors the limiter is an OS-rate clipper with an
+        // instantaneous gain, so the downsampler is re-band-limiting a signal full of steps — and a longer,
+        // sharper FIR rings more on a step. This is the one place in the suite where the new default costs
+        // rather than buys, it is measured rather than argued, and it is the reason the corner is pinned
+        // per taps count instead of against a single number. Elsewhere the same change is neutral or
+        // favourable; the ON-GRID bound, which is the only thing actually promised, is untouched either way.
         const double C = -1.0;
-        for (int F : { 2, 4, 8 })
+        auto cornerWorst = [&] (int F, int taps)
         {
             double worst = -1e9;
             std::vector<std::vector<float>> ws { tpw::clickTrain (sr, 0.12, 3.0, 26.0, 0.5),
@@ -1399,12 +1466,32 @@ int main()
             for (auto& w : ws)
             {
                 std::vector<std::vector<float>> in { w };
-                worst = std::max (worst, tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.0, 0.0, F }, 0)[0]) - C);
+                worst = std::max (worst, tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.0, 0.0, F, taps }, 0)[0]) - C);
             }
-            test::ok (worst <= tpw::deliveredBudgetDb (F) + 0.5,
+            return worst;
+        };
+        for (int F : { 2, 4, 8 })
+        {
+            const double worst = cornerWorst (F, limiter::TruePeakLimiterConfig {}.tapsPerPhase);
+            const double was   = cornerWorst (F, 32);
+            std::printf ("       F=%d at both floors: %+.4f dB over at the default, %+.4f at the old 32 taps\n",
+                         F, worst, was);
+            test::ok (worst <= tpw::deliveredBudgetDb (F) + 0.8,
                       "F=" + std::to_string (F) + ": at BOTH floors the worst witness is " + dbs (worst)
                       + " dB over — outside the " + dbs (tpw::deliveredBudgetDb (F))
                       + " dB envelope, and bounded well inside the unfloored +2.8");
+            // BOTH columns anchored to numbers, not only to each other. `worst < was + 0.40` alone is
+            // satisfied by making the two columns IDENTICAL — pass the default to both and it reads
+            // "0 < 0.40" and passes, which is a mutation that removes the comparison's whole subject.
+            const double wantNow[] = { 2.1585, 1.8683, 1.8242 }, wantWas[] = { 1.7969, 1.5874, 1.5609 };
+            const int fi = F == 2 ? 0 : (F == 4 ? 1 : 2);
+            test::approx (worst, wantNow[fi], 0.05, "F=" + std::to_string (F) + ": corner at the DEFAULT taps");
+            test::approx (was,   wantWas[fi], 0.05, "F=" + std::to_string (F) + ": corner at the OLD 32 taps");
+            test::ok (worst > was + 0.15,
+                      "F=" + std::to_string (F) + ": and the sharper default really does cost here ("
+                      + dbs (was) + " -> " + dbs (worst) + "), so the two columns are not the same run");
+            test::ok (worst < was + 0.40,
+                      "F=" + std::to_string (F) + ": ...but under 0.40 dB (+0.362 / +0.281 / +0.263 at 2x / 4x / 8x)");
             if (F == 8)
                 test::ok (worst > tpw::deliveredBudgetDb (F),
                           "and at 8x it really is outside it (" + dbs (worst) + " > " + dbs (tpw::deliveredBudgetDb (F))

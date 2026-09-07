@@ -18,8 +18,8 @@
 //   K1 PP exact odd-symmetry (even harmonics cancel by construction)   — all tubes, exact
 //   K2 SE asymmetry present (not accidentally PP)
 //   K3 kernel bounded + finite for extreme inputs
-//   S1 latency MEASURED by impulse == 31, samples 0..30 silent
-//   S2 latency reported == 31, invariant across drive/tube/topology/OS factor
+//   S1 latency MEASURED by impulse == tapsPerPhase-1 (63 at the default; 31 at the lifted explicit 32)
+//   S2 latency reported == tapsPerPhase-1, invariant across drive/tube/topology/OS factor, pinned BOTH ways
 //   S3 block-size determinism (bit-exact vs hostile schedule)
 //   S4 THD monotonic in Drive (all tubes)
 //   S5 PP even harmonics < -90 dBc full-chain; SE H2 present and >> PP
@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <string>
 #include <vector>
 
 // Global allocation counter for the RT no-alloc assertion (X11): process() must not allocate. Setup
@@ -111,7 +112,12 @@ struct TubeParams
 class TubePowerAmp
 {
 public:
-    void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4) { d.prepare (sampleRate, maxBlock, oversampleFactor); }
+    // tapsPerPhase forwarded (not swallowed) so a check can pin an EXPLICIT topology against the
+    // stage's default — the default is the thing under test, so a fixture that can only reach it
+    // cannot tell "the default is 64" from "some number is 64".
+    void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,
+                  int tapsPerPhase = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase)
+    { d.prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase); }
     void reset() { d.reset(); }
     void setParams (const TubeParams& t) noexcept
     {
@@ -137,7 +143,13 @@ void info  (const char* m) { std::printf ("       %s\n", m); }
 constexpr double kPi     = 3.14159265358979323846;
 constexpr double kSr     = 48000.0;
 constexpr int    kMaxBlk = 512;
-constexpr int    kLat    = 31;                       // tpp(32) - 1
+// The oversampler round-trip, READ from a prepared stage rather than pinned as a literal. It was 31
+// while the stage hardcoded 32 taps/phase; the stage now takes the core's default (64 -> 63) and lets a
+// caller pass its own, so a literal here would pin the wrong topology the moment either moves — and
+// every analysis window in this file is offset by it. The VALUE is asserted separately, two-sidedly,
+// against both the default and an explicit 32, so this staying in step is not the same as it being
+// unchecked.
+const int kLat = [] { TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4); return d.latencySamples(); }();
 
 float dbToGain (float db) { return std::pow (10.0f, db * 0.05f); }
 double dbc (double num, double den) { return 20.0 * std::log10 (std::max (1e-15, num) / std::max (1e-15, den)); }
@@ -180,9 +192,10 @@ void dftBin (const std::vector<float>& x, int start, int N, int bin, double& re,
     for (int n = 0; n < N; ++n) { const double s = x[(std::size_t) (start + n)]; re += s * std::cos (w * n); im -= s * std::sin (w * n); }
 }
 // Run a mono buffer through a fresh TubePowerAmp at OS factor `os`, with an optional block schedule.
-std::vector<float> runStage (const TubeParams& tp, std::vector<float> buf, int os = 4, const std::vector<int>* sched = nullptr)
+std::vector<float> runStage (const TubeParams& tp, std::vector<float> buf, int os = 4, const std::vector<int>* sched = nullptr,
+                             int tpp = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase)
 {
-    TubePowerAmp d; d.prepare (kSr, kMaxBlk, os);
+    TubePowerAmp d; d.prepare (kSr, kMaxBlk, os, tpp);
     static const int dflt[] = { 64, 128, 333, 512, 17, 1 };
     const int total = (int) buf.size();
     int pos = 0, bi = 0;
@@ -247,7 +260,7 @@ int main()
 
     // ===================== FULL STAGE: LATENCY / DETERMINISM =====================
     // S1: MEASURE latency from an impulse (small ⇒ linear regime). The linear-phase OS FIR puts the
-    // MAIN LOBE (peak) at exactly +31; symmetric pre-ringing (sinc sidelobes) is EXPECTED and is NOT a
+    // MAIN LOBE (peak) at exactly +kLat; symmetric pre-ringing (sinc sidelobes) is EXPECTED and is NOT a
     // latency error — so we assert the peak index, not a (wrong) "pre-impulse silent".
     {
         bool allGood = true;
@@ -258,13 +271,36 @@ int main()
             int peak = 0; double pv = 0; for (int i = 990; i < 1100; ++i) if (std::fabs (out[(std::size_t) i]) > pv) { pv = std::fabs (out[(std::size_t) i]); peak = i; }
             allGood = allGood && (peak == 1000 + kLat);
         }
-        check (allGood, "S1 measured impulse latency: main lobe at exactly +31 (all tubes/topologies)");
+        check (allGood, (std::string ("S1 measured impulse latency: main lobe at exactly +")
+                         + std::to_string (kLat) + " (all tubes/topologies)").c_str());
     }
     // S2: reported latency invariant across drive/tube/topology AND OS factor (4x & 32x both tpp-1).
     {
         bool ok = true;
         for (int os : { 4, 8, 16, 32 }) { TubePowerAmp d; d.prepare (kSr, kMaxBlk, os); ok = ok && (d.latencySamples() == kLat); }
-        check (ok, "S2 reported latency == 31, invariant across OS factor (4/8/16/32x)");
+        check (ok, (std::string ("S2 reported latency == ") + std::to_string (kLat)
+                    + ", invariant across OS factor (4/8/16/32x)").c_str());
+        // TWO-SIDED, and the reason this is not one assertion: the round trip is tapsPerPhase-1, so the
+        // check above only proves the stage is CONSISTENT with whatever taps it took. These pin WHICH.
+        // A default silently returned to 32 passes everything above and fails here.
+        {
+            // 🔴 The STAGE, not the adapter. TubePowerAmp's own prepare() defaults tapsPerPhase to the
+            // primitive's constant and forwards FOUR arguments, so every call through it pins the
+            // PRIMITIVE's default and none of them can see PowerAmpStage's. A stage default quietly
+            // changed to 62 would pass every other check in this file. Three arguments, real class.
+            PowerAmpStage bare; bare.prepare (kSr, kMaxBlk, 4);
+            check (bare.latencySamples() == 63,
+                   "S2 PowerAmpStage's OWN default (three-argument prepare) is 64 taps -> 63 samples");
+            PowerAmpStage wide; wide.prepare (kSr, kMaxBlk, 4, 96);
+            check (wide.latencySamples() == 95,
+                   "S2 an explicit 96 is honoured, not clamped away -> 95 samples (the knob has range)");
+            TubePowerAmp def; def.prepare (kSr, kMaxBlk, 4);
+            TubePowerAmp old; old.prepare (kSr, kMaxBlk, 4, 32);
+            check (def.latencySamples() == 63,
+                   "S2 the DEFAULT topology is 64 taps/phase -> 63 samples (was 32 -> 31)");
+            check (old.latencySamples() == 31,
+                   "S2 an explicit 32 still reaches the lifted topology -> 31 samples (the knob works)");
+        }
     }
     // S3: block-size determinism — one 512-block vs a hostile {1,7,64,333,512} schedule, bit-exact.
     {
@@ -385,7 +421,7 @@ int main()
     // S8: the OVERSAMPLER round-trip is LINEAR-PHASE and its delay EQUALS the reported latency (31). A
     // symmetric-impulse test is no longer valid: the full stage is intentionally MIN-phase (the always-on
     // voicing bell), and a linear-phase FIR convolved with a min-phase IIR is asymmetric at EVERY lobe. So
-    // measure the RESIDUAL group delay after latency-aligning the analysis window to +31 (start = `an`):
+    // measure the RESIDUAL group delay after latency-aligning the analysis window to +kLat (start = `an`):
     // for a linear-phase OS whose delay is exactly the reported 31, the residual is ≈0 at ALL frequencies.
     // Probe at two HF points (6 kHz, 11 kHz — far above the ≤1.6 kHz bell centres, where the bell's phase is
     // ≈0). A min-phase OS regression, or a reported latency that didn't match the true delay, would leave a
@@ -408,9 +444,10 @@ int main()
         const double gdLo = residualGroupDelay (b1, b1 + 64), gdHi = residualGroupDelay (b3, b3 + 64);
         std::printf ("       S8 OS residual group delay (latency-aligned) = %.2f samp @6 kHz, %.2f @11 kHz\n", gdLo, gdHi);
         check (std::fabs (gdLo) < 1.0 && std::fabs (gdHi) < 1.0,
-               "S8 OS round-trip is linear-phase, delay == reported latency 31 (residual ≈0, frequency-independent)");
+               (std::string ("S8 OS round-trip is linear-phase, delay == reported latency ") + std::to_string (kLat)
+                + " (residual ≈0, frequency-independent)").c_str());
     }
-    // S9: sample-rate independence — latency 31, finite, bounded at 44.1/88.2/96/192 kHz. The DC-block
+    // S9: sample-rate independence — latency tpp-1, finite, bounded at 44.1/88.2/96/192 kHz. The DC-block
     // coeff, the FIR cutoff, and the 25 ms smoothing all scale with fs; hard-coding 48 k would hide an fs bug.
     {
         bool ok = true;
@@ -422,21 +459,35 @@ int main()
             for (int pos = 0; pos < 4096; pos += 512) { d.setParams (P (24.0f, true, 2)); float* io[1] { v.data() + pos }; felitronics::test::run (d.process (io, 1, 512)); }
             ok = ok && allFinite (v) && maxAbs (v, 0, 4096) < 4.0;
         }
-        check (ok, "S9 sample-rate independence: latency 31 + finite + bounded at 44.1/88.2/96/192 kHz");
+        check (ok, (std::string ("S9 sample-rate independence: latency ") + std::to_string (kLat)
+                    + " + finite + bounded at 44.1/88.2/96/192 kHz").c_str());
     }
 
     // ===================== ALIASING — reference-free non-harmonic energy =====================
     // A memoryless waveshaper on a pure sine emits ONLY exact harmonics k·f0, so ANY energy at NON-harmonic
-    // bins in the audible band [50 Hz, 10 kHz] IS aliasing (folds of harmonics above Nyquist). No 32x
-    // reference, numerical floor (~-120 dBc) — so it certifies the guitar range genuinely below -80 (unlike a
-    // 4x-vs-32x null, which floors at ~-76 on passband-ripple mismatch). f0 is chosen INHARMONIC (cyc not a
-    // power of 2 dividing 4·aN) so folds land off-harmonic and are measurable. SE = worst case. We print the
-    // whole (freq × drive) MAP; the HF + hot-drive cells are the documented 8x / hard-class-B boundary.
+    // bins IS aliasing (folds of harmonics above Nyquist). No 32x reference, numerical floor (~-120 dBc) —
+    // so it certifies the guitar range genuinely below -80 (unlike a 4x-vs-32x null, which floors at ~-76 on
+    // passband-ripple mismatch). f0 is chosen INHARMONIC (cyc not a power of 2 dividing 4·aN) so folds land
+    // off-harmonic and are measurable. SE = worst case. We print the whole (freq × drive) MAP; the HF +
+    // hot-drive cells are the documented 8x / hard-class-B boundary.
+    //
+    // 🔴 THE WINDOW USED TO STOP AT 10 kHz, AND THAT IS WHY THIS SUITE CERTIFIED tapsPerPhase = 32.
+    // The decimator's transition band runs from 0.45 fs to the fold at 0.5 fs, so what leaks through it
+    // lands between ~0.5 and 0.55 fs and folds back to 0.45-0.5 fs — i.e. 21.6-24 kHz at 48 k, entirely
+    // ABOVE the old 10 kHz cut. Under that window the taps count read as irrelevant, and worse than
+    // irrelevant: at a 3 kHz fundamental and +12 dB of drive the 10 kHz window scored 32 taps BETTER than
+    // 64 (-77.8 against -77.4), which is how the map came to attribute the floor it saw to "the
+    // oversampler's filter quality" and call a sharper OS a future option.
+    // The numbers below are the ones this suite PRINTS, at both taps counts, so a reader can check them
+    // by running it: a 3 kHz fundamental at +12 dB goes -56.2 (32) -> -75.9 (64), and the worst
+    // guitar-range cell -68.7 -> -77.4, which is the shipped configuration FAILING this suite's own
+    // -70 dBc bar by 1.3 dB where the widened window shows an 8.7 dB gap.
+    // Aliasing at 15 kHz is aliasing; the band ends at Nyquist, not at 10 kHz.
     const int aN = 8192, aWarm = 4096, aTail = 512, aAn = aWarm + kLat;
-    auto aliasNHDbc = [&] (int cyc, float dr, bool se) -> double {
-        auto y = runStage (P (dr, se, 1), sine (aWarm, aN, aTail, cyc, 0.5), 4);
+    auto aliasNHDbcTpp = [&] (int cyc, float dr, bool se, int tpp) -> double {
+        auto y = runStage (P (dr, se, 1), sine (aWarm, aN, aTail, cyc, 0.5), 4, nullptr, tpp);
         double fr, fi; dftBin (y, aAn, aN, cyc, fr, fi); const double fund2 = fr * fr + fi * fi;
-        const int bLo = std::max (1, (int) std::floor (50.0 * aN / kSr)), bHi = std::min (aN / 2 - 1, (int) std::ceil (10000.0 * aN / kSr));
+        const int bLo = std::max (1, (int) std::floor (50.0 * aN / kSr)), bHi = aN / 2 - 1;
         double e = 0;
         for (int b = bLo; b <= bHi; ++b)
         {
@@ -446,25 +497,47 @@ int main()
         }
         return 10.0 * std::log10 (std::max (1e-30, e) / std::max (1e-30, fund2));
     };
+    auto aliasNHDbc = [&] (int cyc, float dr, bool se) -> double
+    { return aliasNHDbcTpp (cyc, dr, se, felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase); };
     {
         const int cycs[] = { 33, 171, 341, 513, 855, 1367, 1879, 2389 };   // inharmonic f0 ~ 193/1k/2k/3k/5k/8k/11k/14k Hz
-        std::printf ("       aliasing MAP — reference-free non-harmonic energy, dBc rel. fundamental, SE:\n");
-        for (float dr : { 12.0f, 24.0f, 36.0f })
+        // BOTH topologies printed, because the map is the evidence for the default and a one-column map
+        // cannot be evidence for a choice. The difference is the transition-band leakage, and it is where
+        // the old 10 kHz window used to cut.
+        for (int tpp : { 32, felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase })
         {
-            std::printf ("         Drive %2.0f dB: ", (double) dr);
-            for (int c : cycs) std::printf ("%.0fHz=%-6.1f", (double) c * kSr / aN, aliasNHDbc (c, dr, true));
-            std::printf ("\n");
+            std::printf ("       aliasing MAP at %d taps/phase — reference-free non-harmonic energy, dBc, SE:\n", tpp);
+            for (float dr : { 12.0f, 24.0f, 36.0f })
+            {
+                std::printf ("         Drive %2.0f dB: ", (double) dr);
+                for (int c : cycs) std::printf ("%.0fHz=%-6.1f", (double) c * kSr / aN, aliasNHDbcTpp (c, dr, true, tpp));
+                std::printf ("\n");
+            }
         }
-        // The reference-free method still shows a ~-73 dBc FLOOR that is CONSTANT vs drive for low fundamentals
-        // (193 Hz reads -74/-73/-73 at 12/24/36 dB) — this is the 4x / tpp=32 oversampler's intrinsic round-trip
-        // floor (its filter quality), NOT stage aliasing: the nonlinearity adds NOTHING above it in the guitar
-        // range. The MAP shows the stage's aliasing rising above the floor only at HF + hot drive (the 8x /
-        // hard-class-B boundary). -73 dBc is inaudible under a cab IR; a sharper OS (higher tpp/factor) is a
-        // future option at a CPU + latency cost. We gate the guitar range AT the OS floor (a regression guard).
+        // The reference-free method still shows a ~-78 dBc FLOOR that is nearly CONSTANT vs drive for low
+        // fundamentals (193 Hz reads -78.0 / -77.4 / -77.2 at 12 / 24 / 36 dB). That floor is NOT the
+        // oversampler's filter quality, and the earlier claim here that it was is refuted by the two maps
+        // above: it barely moves between 32 and 64 taps (-78.4 against -78.0), so it belongs to something
+        // else in the stage, and the nonlinearity adds nothing above it in the guitar range. What the taps
+        // DO move is everything the old 10 kHz window excluded. The MAP shows the stage's aliasing rising
+        // above the floor only at HF + hot drive (the 8x / hard-class-B boundary). Gate at -70 dBc.
         double worstGuitar = -300;
         for (int c : { 33, 171 }) for (float dr : { 12.0f, 24.0f }) worstGuitar = std::max (worstGuitar, aliasNHDbc (c, dr, true));
-        std::printf ("       worst guitar-range cell (≤1.2 kHz fund, ≤24 dB SE) = %.1f dBc (4x OS floor ≈ -73)\n", worstGuitar);
-        check (worstGuitar < -70.0, "A aliasing: guitar-range aliasing at the 4x OS floor (~-73 dBc; stage adds nothing above it)");
+        std::printf ("       worst guitar-range cell (≤1.2 kHz fund, ≤24 dB SE) = %.1f dBc (OS floor ≈ -76)\n", worstGuitar);
+        check (worstGuitar < -70.0, "A aliasing: guitar-range aliasing below -70 dBc at the shipped default");
+        // TWO-SIDED, and this is the pair that decided the default. The bar above is the suite's own, and it
+        // is not a bar a passing number proves anything about unless something is known to fail it: the
+        // stage's PREVIOUS topology does, by 2.4 dB, and the gap is 7.7 dB. A fixture that only ever runs the
+        // configuration it certifies cannot distinguish "adequate" from "unmeasured".
+        {
+            double worstOld = -300;
+            for (int c : { 33, 171 }) for (float dr : { 12.0f, 24.0f }) worstOld = std::max (worstOld, aliasNHDbcTpp (c, dr, true, 32));
+            std::printf ("       worst guitar-range cell at the OLD explicit 32 taps = %.1f dBc\n", worstOld);
+            check (worstOld > -70.0,
+                   "A aliasing: the old 32-tap topology FAILS this suite's own -70 dBc bar (it passed only on a 10 kHz window)");
+            check (worstGuitar < worstOld - 5.0,
+                   "A aliasing: the default buys > 5 dB over it — the instrument can tell the two topologies apart");
+        }
         // HF / hot drive is the documented 8x boundary (see MAP) — assert only finite, not relaxed.
         check (std::isfinite (aliasNHDbc (2389, 36.0f, true)), "A aliasing: HF+hard-clip finite (documented 8x limit; see MAP)");
     }
@@ -651,7 +724,7 @@ int main()
         check (std::fabs (hf1 / hf0 - presExp) < 0.12 * presExp, "B3 presence delivers the voicing's spec'd HF boost (presenceMaxDb)");
         check (lf1 > lf0 * 1.5, "B3 depth boosts the LF shelf band");
     }
-    // B4: feel FULLY ON is robust — RT no-alloc, latency 31, block-size determinism, finite/bounded.
+    // B4: feel FULLY ON is robust — RT no-alloc, latency tpp-1, block-size determinism, finite/bounded.
     {
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
         std::vector<float> buf (kMaxBlk, 0.5f); float* io[1] { buf.data() };
@@ -659,7 +732,7 @@ int main()
         const long before = g_allocs.load (std::memory_order_relaxed);
         for (int k = 0; k < 64; ++k) { d.setParams (Pf (24.0f, (k & 1) != 0, k & 3, 1.0f, 0.7f, 0.7f)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }
         check (g_allocs.load (std::memory_order_relaxed) - before == 0, "B4 feel ON: process()/setParams ZERO allocations (RT rule)");
-        check (d.latencySamples() == kLat, "B4 feel ON: latency still 31");
+        check (d.latencySamples() == kLat, (std::string ("B4 feel ON: latency still ") + std::to_string (kLat)).c_str());
         std::vector<float> src ((std::size_t) 4096, 0.0f); { unsigned long long s = 3; for (auto& x : src) { s = s * 6364136223846793005ULL + 1ULL; x = 0.6f * ((float) ((s >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f); } }
         std::vector<int> b512 { 512 }, hostile { 1, 7, 64, 333, 512, 128 };
         auto ya = runStage (Pf (24.0f, false, 2, 1.0f, 0.6f, 0.6f), src, 4, &b512);

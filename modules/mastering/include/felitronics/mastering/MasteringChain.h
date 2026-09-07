@@ -52,11 +52,15 @@ struct MasteringChainConfig
     double compressorLookaheadMs = 1.0;
     double limiterLookaheadMs    = 1.0;
     int    oversampleFactor      = 4;    // shared by clipper and limiter
-    // 64 rather than the stages' own default of 32, and the reason is measured. The 0.90*Nyquist
-    // prototype is a ROUND TRIP, so its loss doubles in dB, and clipper + limiter in series double it
-    // again. At 44.1 kHz with both stages at 32 taps the chain costs -1.549 dB at 17.6 kHz, -6.033 at
-    // 18.5 and -16.131 at 19.4. At 64 taps: +0.000 / -0.610 / -10.182. A signature like that is not a
-    // rounding error on a mastering chain; +64 samples of total latency buys it back.
+    // 64, which the STAGES now default to as well — this chain got there first, and stating it here is
+    // what made the chain immune to their being wrong. The 0.90*Nyquist prototype is a ROUND TRIP, so its
+    // loss doubles in dB, and clipper + limiter in series double it again. At 44.1 kHz with both stages at
+    // 32 taps the chain cost -1.549 dB at 17.6 kHz, -6.033 at 18.5 and -16.131 at 19.4. At 64 taps:
+    // +0.000 / -0.610 / -10.182. A signature like that is not a rounding error on a mastering chain;
+    // +64 samples of total latency buys it back. (The bigger reason the stages moved was not the droop at
+    // all but the stopband: at 32 taps the prototype delivered 27 dB of rejection where its own Kaiser
+    // design declares 90. See PolyphaseOversampler.h. Keeping the value spelled out here is deliberate:
+    // it is what proves this chain bit-identical across that change.)
     int    tapsPerPhase          = 64;
 
     // The compressor's key filter. > 0 Hz builds a minimum-phase high-passed copy of the compressor's
@@ -168,7 +172,7 @@ struct MasteringChainResolved
 // the sum over PRESENT stages and never moves, which is what makes a bypass toggle safe in a host.
 //
 // Bypass may not be spelled with neutral-looking numbers. Measured: a limiter with its ceiling at
-// +60 dBTP still costs the 0.90*Nyquist round trip (-0.775 dB at 0.40*fs) and its 79 samples; a
+// +60 dBTP still costs the 0.90*Nyquist round trip (+0.000 dB at 0.40*fs, 64 taps) and its 111 samples; a
 // saturator at driveDb = 0 is not linear either, because `WaveShaper` floors the drive at 1e-4.
 //
 // Which mechanism each stage gets is decided by measurement, not by uniformity:

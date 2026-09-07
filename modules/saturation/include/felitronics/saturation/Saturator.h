@@ -51,7 +51,8 @@ public:
         float dcBlockHz = 10.0f;   // DC blocker corner (in the oversampled domain)
     };
 
-    bool prepare (double sampleRate, int maxBlock, int maxChannels, int oversampleFactor = 4, int tapsPerPhase = 32)
+    bool prepare (double sampleRate, int maxBlock, int maxChannels, int oversampleFactor = 4,
+                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase)
     {
         prepared_ = false;                                             // any early return below leaves it unprepared
         // Spelled positively so a NaN FAILS. `NaN <= 0.0` is false, so the previous form accepted a
@@ -237,7 +238,8 @@ private:
 
         // 4) drive-compensate the wet, then a linear (peak-safe) dry/wet, then output trim. The dry runs
         //    through a DelayLine matching the oversampler round-trip — an undelayed dry combs the wet at
-        //    mix < 1 (31 samples ≈ −7 dB notch-ripple at 1 kHz / 48 k).
+        //    mix < 1 (63 samples at the default ≈ −5.1 dB of comb ripple at 1 kHz / 48 k; it was 31 and
+        //    −7 dB before the taps default rose, and the notch spacing halved with it).
         for (int c = 0; c < nc; ++c)
         {
             core::DelayLine& dl = dryDelay_[(std::size_t) c];

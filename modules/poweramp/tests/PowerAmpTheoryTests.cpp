@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <vector>
 
 using felitronics::poweramp::PowerAmpStage;
@@ -81,7 +82,12 @@ struct TubeParams
 class TubePowerAmp
 {
 public:
-    void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4) { d.prepare (sampleRate, maxBlock, oversampleFactor); }
+    // tapsPerPhase forwarded (not swallowed) so a check can pin an EXPLICIT topology against the
+    // stage's default — the default is the thing under test, so a fixture that can only reach it
+    // cannot tell "the default is 64" from "some number is 64".
+    void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,
+                  int tapsPerPhase = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase)
+    { d.prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase); }
     void reset() { d.reset(); }
     void setParams (const TubeParams& t) noexcept
     {
@@ -104,7 +110,13 @@ void info  (const char* m) { std::printf ("       %s\n", m); }
 constexpr double kPi     = 3.14159265358979323846;
 constexpr double kSr     = 48000.0;
 constexpr int    kMaxBlk = 512;
-constexpr int    kLat    = 31;                     // tpp(32) − 1 — the documented oversampler round-trip
+// The oversampler round-trip, READ from a prepared stage rather than pinned as a literal. It was 31
+// while the stage hardcoded 32 taps/phase; the stage now takes the core's default (64 -> 63) and lets a
+// caller pass its own, so a literal here would pin the wrong topology the moment either moves — and
+// every analysis window in this file is offset by it. The VALUE is asserted separately, two-sidedly,
+// against both the default and an explicit 32, so this staying in step is not the same as it being
+// unchecked.
+const int kLat = [] { TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4); return d.latencySamples(); }();
 
 float  dbToGain (float db) { return std::pow (10.0f, db * 0.05f); }
 double dbc (double num, double den) { return 20.0 * std::log10 (std::max (1e-15, num) / std::max (1e-15, den)); }
@@ -356,7 +368,32 @@ int main()
     {
         bool inv = true;
         for (int os : { 2, 4, 8, 16, 32 }) { TubePowerAmp d; d.prepare (kSr, kMaxBlk, os); inv = inv && (d.latencySamples() == kLat); }
-        check (inv, "TT7 reported latency == 31 (tpp−1), invariant across os factor {2,4,8,16,32}");
+        check (inv, (std::string ("TT7 reported latency == ") + std::to_string (kLat)
+                     + " (tpp−1), invariant across os factor {2,4,8,16,32}").c_str());
+        // ...and WHICH tpp, two-sided. "Invariant across the factor" is true at every taps count, so on
+        // its own it cannot see the default move. tpp−1 is asserted against both ends of the knob.
+        {
+            // The bare stage first: the adapter above forwards a taps count of its own, so going through
+            // it cannot distinguish PowerAmpStage's default from the primitive's constant.
+            PowerAmpStage bare; bare.prepare (kSr, kMaxBlk, 4);
+            check (bare.latencySamples() == 63, "TT7 PowerAmpStage's own three-argument default -> latency 63");
+            TubePowerAmp def; def.prepare (kSr, kMaxBlk, 4);
+            TubePowerAmp old; old.prepare (kSr, kMaxBlk, 4, 32);
+            check (def.latencySamples() == 63, "TT7 default tapsPerPhase is the core's 64 -> latency 63");
+            check (old.latencySamples() == 31, "TT7 explicit tapsPerPhase = 32 -> latency 31 (tpp−1 holds both ways)");
+            // Both ENDS of the clamp. Two interior points cannot distinguish a clamp from a lookup: a
+            // stage that answered `taps == 32 ? 32 : 64` passed every check above, so the range is
+            // asserted where it actually bends.
+            PowerAmpStage lo; lo.prepare (kSr, kMaxBlk, 4, 1);
+            check (lo.latencySamples() == 3, "TT7 a taps count below the oversampler's floor clamps to 4 -> latency 3");
+            PowerAmpStage hi; hi.prepare (kSr, kMaxBlk, 4, 5000);
+            check (hi.latencySamples() == 1023, "TT7 ...and above kMaxTapsPerPhase clamps to 1024 -> latency 1023");
+            // An ODD interior value. Every other point exercised here — 32, 64, 96, and both clamp
+            // results 4 and 1024 — is even, so `tpp -= tpp % 2` after the clamp passes all of them while
+            // silently giving a caller who asks for 65 a 64-tap filter and one sample less latency.
+            PowerAmpStage odd; odd.prepare (kSr, kMaxBlk, 4, 65);
+            check (odd.latencySamples() == 64, "TT7 an ODD taps count is honoured exactly: 65 -> latency 64");
+        }
 
         TubePowerAmp fresh;                                          // not prepared
         check (fresh.latencySamples() == 0, "TT7 unprepared stage reports 0 latency (host queries before prepare)");
@@ -369,7 +406,8 @@ int main()
             int peak = 0; double pv = 0; for (int i = 990; i < 1100; ++i) if (std::fabs (out[(std::size_t) i]) > pv) { pv = std::fabs (out[(std::size_t) i]); peak = i; }
             measured = measured && (peak == 1000 + kLat);
         }
-        check (measured, "TT7 reported latency == impulse-measured main lobe (+31), all tubes/topologies");
+        check (measured, (std::string ("TT7 reported latency == impulse-measured main lobe (+")
+                          + std::to_string (kLat) + "), all tubes/topologies").c_str());
     }
 
     // ===================== TT8: NaN/Inf CONTAINMENT =====================

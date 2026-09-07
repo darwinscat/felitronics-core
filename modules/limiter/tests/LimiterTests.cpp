@@ -96,6 +96,14 @@ int main()
         limiter::TruePeakLimiter lim; (void) lim.prepare (sr, 512, 2, { 1.0, 4, 32 });
         const int look = (int) std::lround (1.0 * 0.001 * sr);       // 48 baseband
         test::ok (lim.latencySamples() == (32 - 1) + look, "latency = (tpp-1) + lookahead");
+        // ...and at the DEFAULT topology, which is the one a product gets and which nothing here pinned
+        // while every call in this file spelled 32 out. 79 -> 111 samples at 48 kHz is a host-visible
+        // resynchronisation, so it is stated as a number rather than inherited from a formula.
+        limiter::TruePeakLimiter def; (void) def.prepare (sr, 512, 2, {});
+        test::ok (limiter::TruePeakLimiterConfig {}.tapsPerPhase == 64,
+                  "TruePeakLimiterConfig defaults to 64 taps/phase (was 32 — see PolyphaseOversampler.h)");
+        test::ok (def.latencySamples() == 63 + look && def.latencySamples() == 111,
+                  "default topology latency = 63 + 48 = 111 samples at 48 kHz (was 79)");
     }
 
     // --- no allocation during process() ---
