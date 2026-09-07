@@ -94,7 +94,9 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   product: over all 160 integer alignments the worst phase barely moves (−9.29 against −9.27) while the
   coherent carrier spans −3.59…−6.83, because it is an interference term between the stages. **The decimating direction has no stopband at
   all**: at phase *t = 0* the weights are `(0,1,0,0)`, a bare sample pick, so a tone above the output
-  Nyquist survives at −3 dB rms / 0.0 dB peak and folds back as TWO strong components — `44100 − g` at
+  Nyquist survives at −3 dB rms / 0.0 dB SAMPLE peak (the peak is a time-domain fact — the phase returns
+  to within ~1e-13 of `t = 0` every 147 outputs and that output simply IS an input sample; no spectral
+  line exceeds −4.67 dB) and folds back as TWO strong components — `44100 − g` at
   about −5 dB and `g − 3900` at about −7 dB — i.e. across **18.15–22.05 kHz**, not one top slice. Against the model's own
   aliasing floor the OUTPUT leg alone sits 3–24 dB below it on a high-gain capture but **up to +9.8 dB
   above it on a clean one**, at every level from 17.5 kHz up (the whole rate-match: above in 22 of 30 tone × level cells, up to

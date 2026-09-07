@@ -341,8 +341,10 @@ int main()
             std::printf ("      %6.0f Hz above the 22.05 kHz Nyquist -> rms %6.2f dB  peak %6.2f dB\n",
                          f, rmsDb, peakDb);
             ok (peakDb > -0.1, std::to_string ((int) f) + " Hz survives the decimation at FULL level "
-                               "(sample peak " + std::to_string (peakDb) + " dB — an ENVELOPE figure: no single "
-                               "spectral line exceeds -4.67 dB, the peak is where the phases align) and folds in");
+                               "(sample peak " + std::to_string (peakDb) + " dB) and folds in. The peak is a "
+                               "TIME-domain figure and no spectral line exceeds -4.67 dB: the phase returns to "
+                               "within ~1e-13 of t=0 every 147 outputs, and there the output simply IS an input "
+                               "sample -- measured 0.999657 against an input peak of exactly 1.0");
             approx (rmsDb, -3.05, 0.25, std::to_string ((int) f) + " Hz: ~3 dB of rms rejection, and that is all there is");
         }
 

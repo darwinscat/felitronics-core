@@ -87,8 +87,11 @@ pick, which attenuates nothing at any frequency:
 | 23 500 Hz | **−3.1 / −0.0** | −14.8 / −12.1 | −34.7 / −34.4 | −93.5 / −91.7 |
 | 23 900 Hz | **−3.1 / −0.0** | −15.4 / −12.4 | −42.1 / −39.5 | −92.0 / −90.6 |
 
-dB rms / sample peak, unit input. The peak is an ENVELOPE figure — no single spectral line exceeds
-−4.67 dB; it reaches 0 dB where the interpolation phases line up. What survives does not land in one place: a tone at *g* ∈ (22.05, 24) kHz
+dB rms / sample peak, unit input. The two columns measure different things and both are real. No
+single spectral LINE exceeds −4.67 dB; the sample peak reaches 0 dB for a time-domain reason — at
+`t = 0` the weights are `(0,1,0,0)`, so that output simply IS an input sample, and the phase returns
+to within ~1e-13 of 0 every 147 outputs, so one output in every 147 reproduces an input sample to
+float rounding (measured output peak 0.999657 against an input peak of exactly 1.0). What survives does not land in one place: a tone at *g* ∈ (22.05, 24) kHz
 comes back as **two** strong components — `44100 − g` at about −5 dB and `g − 3900` at about −7 dB —
 plus weaker terms near −45 dB, so the fold covers **18.15–22.05 kHz**, not just the top slice. Measured
 on the shipped kernel, 2-second coherent window:
