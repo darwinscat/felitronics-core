@@ -477,6 +477,33 @@ int main()
         test::approx (phaseDelay (44100.0, 64, 2), 3.8375, 0.05,
                       "the RIGHT channel of a stereo call has the same measured delay as the left");
 
+        // Rounding is asserted as an INVARIANT over a sweep, not as a list of rates, because the one
+        // case a list always misses is the exact half: 2 + 2*h/48000 lands on .5 at h = 24000k - 36000
+        // (12000, 36000, 60000, 84000 …), where the residual is the worst it can be and the choice of
+        // rounding rule shows most. Reporting an integer for a fractional delay costs at most half a
+        // sample; the old formula cost up to 3.3.
+        {
+            double worst = 0.0; double worstAt = 0.0;
+            for (const double host : { 8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0,
+                                       36000.0, 44100.0, 47999.0, 48001.0, 60000.0, 64000.0, 84000.0,
+                                       88200.0, 96000.0, 176400.0, 192000.0 })
+            {
+                nam::NamStage st;
+                st.prepare (host, 64);
+                const auto json = gainModel();
+                if (! load (st, json)) { test::ok (false, "model loads at every swept rate"); break; }
+                st.prepare (host, 64);
+                const double geo = 2.0 + 2.0 * host / 48000.0;
+                const double err = std::fabs ((double) st.latencySamples() - geo);
+                if (err > worst) { worst = err; worstAt = host; }
+            }
+            std::printf ("      worst reported-vs-geometry error over 18 host rates: %.4f samples (at %.0f Hz)\n",
+                         worst, worstAt);
+            test::ok (worst <= 0.5 + 1e-9,
+                      "over 18 host rates including every exact-half case, the reported integer is never "
+                      "more than 0.5 samples from the geometry (worst " + std::to_string (worst) + ")");
+        }
+
         // The gate itself: NamStage.cpp engages the resampler only past |hostSR - modelRunSR| > 0.5,
         // and nothing tested either side of that edge — a mutation widening it to 10 Hz survived.
         {
