@@ -172,9 +172,11 @@ public:
     // 44.1 kHz, 6.0000 at 96 kHz, 5.6750 at 88.2 kHz, 3.3333 at 32 kHz — the geometry to four decimals.
     //
     // The true delay is FRACTIONAL and this reports an integer, so round to nearest (the residual is
-    // ≤0.5 samples, was up to 3.3). It is also mildly frequency-dependent — the kernel's own phase
-    // adds +0.02 samples at 10 kHz and +0.61 at 20 kHz — which no single integer can express; see
-    // docs/STREAM-RESAMPLER-COST.md.
+    // ≤0.5 samples against the geometry, and was up to 3.3). It is also mildly frequency-dependent —
+    // the coherent term's GROUP delay adds +0.018 samples at 10 kHz and +0.620 at 20 kHz on top of the
+    // geometric figure — which no single integer can express, and which no consumer of this number can
+    // act on either. What consumers DO act on: OrbitCab and orbit-amp delay their dry/bypass path by
+    // this same number, so it is an audio-alignment figure there and not only a PDC one.
     int latencySamples() const noexcept
     {
         if (! prepared_ || ! resampling) return 0;   // an unprepared backend passes through — no latency

@@ -38,10 +38,11 @@ namespace felitronics::core
 // two stages rather than a property of the kernel.
 //
 // 🔴 AND THE DECIMATING DIRECTION HAS NO ANTI-ALIASING AT ALL. Going 48 → 44.1 this kernel passes a
-// tone above the output Nyquist at −3 dB rms and 0.0 dB sample PEAK — at phase t = 0 the weights are
-// (0,1,0,0), a bare sample pick, which attenuates nothing at any frequency, and the phase returns to
-// within ~1e-13 of 0 every 147 outputs, so one output in 147 simply IS an input sample. (The peak is
-// that time-domain fact; no single spectral LINE exceeds −4.67 dB.) A tone at g ∈ (22.05,
+// tone above the output Nyquist at −3 dB rms and 0.0 dB sample PEAK. The peak is a TIME-domain fact
+// with a kernel reason: at t = 0 the weights are (0,1,0,0), so |M(0)| = 1 at EVERY frequency, and the
+// phase grid has points within 1/147 of zero where |M| is still −0.002 dB — so the tone comes through
+// somewhere in every period whatever the signal's own grid does. (Across the five rows measured, no
+// single spectral LINE exceeds −4.67 dB; the peak is not one of them.) A tone at g ∈ (22.05,
 // 24) kHz comes back as TWO strong components, not one: 44100 − g at about −5 dB and g − 3900 at
 // about −7 dB (23 kHz in → 21.1 kHz at −5.33 and 19.1 kHz at −7.04), plus weaker terms near −45 dB
 // that go lower still. The STRONG pair lands across 18.15–22.05 kHz — that is where the damage is,

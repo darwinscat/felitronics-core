@@ -165,7 +165,11 @@ int main()
             std::printf ("      complex coherent gain at 100 Hz: %+.4f %+.4fi\n", c.real(), c.imag());
             ok (c.real() > 0.99, "the round trip is POSITIVE unity at 100 Hz (Re = " + std::to_string (c.real())
                                  + ") — a polarity inversion would read -1 and every magnitude test would miss it");
-            ok (std::abs (c.imag()) < 0.06, "…and its phase is just the 3.84-sample delay, nothing else");
+            // …and the phase is the DELAY, checked as a delay rather than as a loose bound on the
+            // imaginary part (that bound was 0.06 against a measured 0.0546 — held by 0.005 of luck).
+            const double W100 = 2.0 * kPi * 100.0 / H;
+            approx (-std::atan2 (c.imag(), c.real()) / W100, 3.8375, 0.05,
+                    "…and its phase encodes exactly the 3.8375-sample round-trip delay, nothing else");
         }
     }
 
@@ -328,8 +332,11 @@ int main()
 
         // produceExact()'s documented behaviour on a startup underflow is "pad with silence", and NOTHING
         // in the four suites checked it: a mutation that pads with the PREVIOUS sample instead survived
-        // every one of them. Silence and hold are audibly different at a stream start (a held sample is a
-        // DC step into the model), and this is the call NamStage uses on the output leg.
+        // every one of them. Silence and hold are audibly different at a stream start — a held sample is
+        // a DC step. NOTE, because a crew round measured it and it is worth not re-deriving: inside
+        // NamStage this branch is structurally unreachable (K_up = ceil(K_down·h/m) >= n for every n, and
+        // 165 000 calls across 11 rates x 5 block sizes x ragged lengths found no underflow). This pins
+        // the CLASS's contract, which other callers can reach; it is not a claim about the NAM path.
         {
             StreamResampler r;
             r.reset (44100.0, 48000.0, 512);
@@ -393,9 +400,9 @@ int main()
                          f, rmsDb, peakDb);
             ok (peakDb > -0.1, std::to_string ((int) f) + " Hz survives the decimation at FULL level "
                                "(sample peak " + std::to_string (peakDb) + " dB) and folds in. The peak is a "
-                               "TIME-domain figure and no spectral line exceeds -4.67 dB: the phase returns to "
-                               "within ~1e-13 of t=0 every 147 outputs, and there the output simply IS an input "
-                               "sample -- measured 0.999657 against an input peak of exactly 1.0");
+                               "TIME-domain figure, not a spectral line (no line exceeds -4.67 dB in these rows): "
+                               "|M(0)| = 1 at EVERY frequency because the weights at t=0 are (0,1,0,0), and the "
+                               "phase grid has points within 1/147 of zero where |M| is still -0.002 dB");
             approx (rmsDb, -3.05, 0.25, std::to_string ((int) f) + " Hz: ~3 dB of rms rejection, and that is all there is");
         }
 

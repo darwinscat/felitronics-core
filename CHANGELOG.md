@@ -75,10 +75,18 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   `2 + 2·hostSR/modelRunSR` host samples, now reported rounded to nearest: **6 → 4 at 44.1 kHz, 9 → 6
   at 96 kHz, 9 → 6 at 88.2 kHz, 5 → 3 at 22.05 kHz**; unchanged (0) at the model's own rate, where the
   resampler is not in the path at all. Hosts using the reported number for delay compensation move by
-  that much. **Nothing inside `rigplayer` moves**: slot alignment runs on `AlignmentTable::delayOf()` →
-  `blendDelay()`/`lagTail_`, and none of those reads `latencySamples()` at all — `RigPlayer` only
-  republishes the max of the two slots outward, and both changed identically. No audio sample changes,
-  in this stage or any other. The old tests pinned the FORMULA, which is why
+  that much — and **twice that** in the two shipped hosts, which sum a preamp and a poweramp stage
+  (4 samples at 44.1 kHz, 6 at 96). **Nothing inside `rigplayer` moves**: slot alignment runs on
+  `AlignmentTable::delayOf()` → `blendDelay()`/`lagTail_`, and none of those reads `latencySamples()`
+  at all — `RigPlayer` only republishes the max of the two slots outward, and both changed identically.
+  **No audio sample changes inside this repository. Downstream, audio does move, and it moves into
+  alignment:** OrbitCab delays its dry/bypass path by this same number
+  (`src/poweramp/PowerAmpRouter.cpp`, `src/core/CabEngine.cpp`) and orbit-amp does the same at the dry
+  end of its crossfade, so the wet path sat at the true 3.84 samples while the dry was held at the
+  reported 6 — a 2.16-sample mismatch whose first comb notch fell at ~10.2 kHz during an on↔off
+  crossfade (3.0 samples and ~16 kHz at 96 kHz). It is now 0.16 and 0.00. ⚠️ **Three OrbitCab tests pin
+  the old formula literally** (`tests/PowerAmpRouterAlignTests.cpp`, three
+  `expectEquals(L, ceil(3·sr/48000) + 3)`) and go red on the next core bump; they want the geometry. The old tests pinned the FORMULA, which is why
   nothing caught it; the new one measures the delay from the carrier phase of the shipped round trip
   (3.8375 / 6.0000 / 5.6750 samples, matching the geometry to four decimals) and asserts the reported
   integer is the nearest one to it.
@@ -94,9 +102,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   product: over all 160 integer alignments the worst phase barely moves (−9.29 against −9.27) while the
   coherent carrier spans −3.59…−6.83, because it is an interference term between the stages. **The decimating direction has no stopband at
   all**: at phase *t = 0* the weights are `(0,1,0,0)`, a bare sample pick, so a tone above the output
-  Nyquist survives at −3 dB rms / 0.0 dB SAMPLE peak (the peak is a time-domain fact — the phase returns
-  to within ~1e-13 of `t = 0` every 147 outputs and that output simply IS an input sample; no spectral
-  line exceeds −4.67 dB) and folds back as TWO strong components — `44100 − g` at
+  Nyquist survives at −3 dB rms / 0.0 dB SAMPLE peak (a time-domain fact with a kernel reason: at
+  `t = 0` the weights are `(0,1,0,0)` so |M(0)| = 1 at every frequency, and the phase grid has points
+  within 1/147 of zero where |M| is still −0.002 dB; across the measured rows no spectral line exceeds
+  −4.67 dB) and folds back as TWO strong components — `44100 − g` at
   about −5 dB and `g − 3900` at about −7 dB — i.e. across **18.15–22.05 kHz**, not one top slice. Against the model's own
   aliasing floor the OUTPUT leg alone sits 3–24 dB below it on a high-gain capture but **up to +9.8 dB
   above it on a clean one**, at every level from 17.5 kHz up (the whole rate-match: above in 22 of 30 tone × level cells, up to

@@ -116,8 +116,9 @@ conversion (`shipped − ideal`, both at 44.1 kHz):
   in every run;
 * against the **model's own aliasing floor** (what a WaveNet at 48 kHz folds down by itself, measured
   on an arm with no resampler in it), the **output leg alone** sits below it on a high-gain capture
-  (3–24 dB) but above it on a clean one at every level from 17.5 kHz up, by **up to +9.8 dB** (at
-  15.25 kHz, two of the three levels). Counting the whole rate-match,
+  (3–24 dB) but above it on a clean one at every level from 17.5 kHz up — **up to +9.8 dB, which is at
+  19 kHz and −30 dBFS**. (At 15.25 kHz it is above the floor at two of the three levels, by up to
+  +3.8 dB.) Counting the whole rate-match,
   including the model reacting to a droop-ed input, it is above the floor in **22 of 30** tone × level
   cells, by up to **+12.3 dB** — below only on the high-gain capture at 12.3–15.25 kHz;
 * driving harder does not help, and in the audible midrange it actively hurts. Per band, error over
@@ -229,3 +230,27 @@ performance: everything in §4 above (the program-material error levels, the mod
 floor per capture, the drive sweep, the demodulated bass line), and the candidate table in §5, which
 measures a kernel that is not in the tree. Those are reproducible from the protocol but nothing will
 tell you when they rot; treat them as dated measurements, not invariants.
+
+## 7. What `latencySamples()` is used for downstream — it is not only PDC
+
+`nam::NamStage::latencySamples()` changed with this measurement (6 → 4 at 44.1 kHz, 9 → 6 at 96 and
+88.2, 5 → 3 at 22.05), and inside this repository that number reaches nothing but a report:
+`RigPlayer::latencySamples()` republishes the max of its two slots outward, and slot alignment runs on
+`AlignmentTable::delayOf()` → `blendDelay()` / `lagTail_`, which never read it.
+
+**Outside this repository it aligns audio.** OrbitCab delays its dry / bypass path by exactly this
+number (`src/poweramp/PowerAmpRouter.cpp`, `src/core/CabEngine.cpp`), and orbit-amp does the same at
+the dry end of its crossfade — so the wet path was already delayed by the true 3.84 samples while the
+dry was held at the reported 6. That 2.16-sample mismatch put the first comb notch of an on↔off
+crossfade at 44100/(2·2.16) ≈ **10.2 kHz**; with the corrected number it is 0.16 samples and the notch
+moves to ~136 kHz, out of band. At 96 kHz the mismatch was 3.0 samples (notch at 16 kHz) and is now
+0.00. **So this is a fix to those crossfades, not a neutral change** — and it is an audio change in
+those products even though no sample moves inside core.
+
+Both shipped hosts also **sum two rate-matching stages** for PDC (preamp + poweramp), so the number the
+host sees moves by twice the per-stage figure: **4 samples at 44.1 kHz, 6 at 96**.
+
+And three OrbitCab tests pin the OLD formula literally
+(`tests/PowerAmpRouterAlignTests.cpp`, three `expectEquals(L, ceil(3·sr/48000) + 3)`); they go red on
+the next core bump and want the geometry `2 + 2·hostSR/modelRunSR` instead. That patch belongs in
+OrbitCab, not here, but it is a consequence of this change and not a coincidence.
