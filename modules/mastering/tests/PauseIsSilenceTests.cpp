@@ -136,7 +136,7 @@ static void collapseAgainstHonestLoop()
     for (dynamics::Mode m : modes)
         for (dynamics::Detector d : dets)
             for (double thr : { -30.0, -300.0 })       // -300 makes DIGITAL SILENCE an ACTIVE sample
-                for (int gap : kGaps)
+                for (int gap : kGapsCollapse)
                 {
                     dynamics::GainReductionParams p;
                     p.mode = m; p.detector = d; p.thresholdDb = thr; p.ratio = 4.0; p.kneeDb = 6.0;
