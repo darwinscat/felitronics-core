@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/FlushToZero.h>
+#include <felitronics/core/Math.h>
 
 #include <cmath>
 
@@ -65,6 +66,49 @@ public:
 
     // Current envelope as linear amplitude (sqrt of the mean-square in RMS mode).
     float envelope() const noexcept { return (det == Detector::Rms) ? std::sqrt (env) : env; }
+
+    // THE STORED WORD, not the reported amplitude — the two are different quantities in Rms mode, where
+    // this holds a POWER. Law 11c's silence advancement decides it has reached a fixed point by comparing
+    // this across a step, and the getter above cannot do that job: a power moving from 0x3f800001 to
+    // 0x3f800000 has both roots at exactly 1.0f, so a getter-based check would declare a state settled
+    // while it is still travelling. Exposed for that one purpose; nothing in a signal path should read it.
+    float stateWord() const noexcept { return env; }
+
+    // LAW 11c — advance through `n` samples of DIGITAL SILENCE, sample for sample, the way `process(0)`
+    // would. This is not a closed form and deliberately not one: `pow(c, n)` is a DIFFERENT number from
+    // `n` rounded multiplications, so it would buy speed with the bit-exactness the law is stated in.
+    // What makes it cheap instead is that the silent recurrence is AUTONOMOUS, so it reaches a bitwise
+    // fixed point and everything past that point is free.
+    //
+    // TWO BRANCHES COLLAPSE HERE, and both are proven rather than assumed. `in` is `|0|` in Peak mode and
+    // `0*0` in Rms mode, i.e. exactly +0.0f either way; `in > env` is therefore false for every reachable
+    // `env`, because `env` is non-negative by induction (it starts at 0, and `in + c*(env-in)` with
+    // `in >= 0`, `env >= 0`, `c` in [0,1] cannot go below 0). So the release coefficient is chosen every
+    // sample — and in Rms mode LinkedDetector sets attack == release anyway, so the choice does not even
+    // matter there.
+    //
+    // WHAT IT DOES NOT REACH IS ZERO, and the earlier draft of this comment claimed it did. Repeated
+    // multiplication by `c < 1` stalls on a SUBNORMAL: measured, at `c = 0x1.fffffep-1` the states
+    // 2^-149, 3*2^-149, 2^-126 - 2^-149 and 2^-126 (the smallest NORMAL, where the decrement is exactly
+    // half a subnormal ULP and ties-to-even rounds back up) are all fixed points, and at realistic
+    // coefficients the resting state is a subnormal too — 0x00000078 for a 5 ms release, 0x00005d9f for
+    // 1 s. What turns those into a real zero is `flushDenormals()`, once per call, on both sides of the
+    // comparison. And the horizon is a property of the TIME CONSTANT, not of the pause: measured 23 609
+    // samples to settle at 5 ms, 457 808 at 100 ms, 4 461 677 at 1 s, and NOT settled after 200 000 000
+    // at the coefficient cap. "A long gap costs the same as a short one" is true only past that horizon.
+    void advanceSilence (int n) noexcept
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const float before = env;
+            (void) process (0.0f);
+            if (core::sameBits (env, before)) return;                  // a fixed point stays fixed
+            // ...and a state that is not finite cannot come back: c*NaN is NaN, and c*Inf is Inf or (at
+            // c == 0) NaN. Two non-finite states in a row is that fact, and it stops the loop from
+            // spinning for the whole pause on something that will never move again.
+            if (! std::isfinite (env) && ! std::isfinite (before)) return;
+        }
+    }
 
     // Law 8: zap the follower state to exact zero once it decays below the subnormal-risk threshold,
     // so a long silence can't sustain subnormals (CPU spike). Call once per block.

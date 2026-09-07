@@ -84,6 +84,16 @@ public:
     // The current level (linear amplitude) without advancing anything — for metering.
     float level() const noexcept { return env_.envelope(); }
 
+    // The follower's STORED word — see EnvelopeFollower::stateWord. Law 11c's fixed-point test needs it
+    // because the amplitude above is a square root in Rms mode and hides the last bits of the power.
+    float stateWord() const noexcept { return env_.stateWord(); }
+
+    // LAW 11c — `n` samples of DIGITAL SILENCE. A zero key sample links to exactly +0.0f at every width,
+    // so this is what a silent block does to the detector regardless of how wide that silence was; the
+    // gate leaves 0 alone (`std::clamp (0, -1e6, 1e6)`), so `processSample(0.0f)` and the linked path
+    // agree on it bit for bit.
+    void advanceSilence (int n) noexcept { env_.advanceSilence (n); }
+
     // Law 8: call once per block. The state is a one-pole that decays toward zero on silence.
     void flushDenormals() noexcept { env_.flushDenormals(); }
 

@@ -91,7 +91,27 @@ public:
         // ...and the gap has to reach the INNER band too: its own per-channel SVFs freeze the same way.
         // Measured on a 7 kHz tone through the default DynamicEq mode: 0.182 out of DIGITAL SILENCE
         // (-14.8 dBFS) when this returned early instead of passing the zero width down.
-        if (nc == 0) return deq_.process (io, 0, n);
+        //
+        // LAW 11c — AND IT HAS TO REACH THE HALF THAT IS ACTUALLY RUNNING. This used to forward the gap
+        // to `deq_` whatever the mode was, which was harmless while both halves merely froze and stops
+        // being harmless the moment they advance: in SplitBand (or with `listen` on) the live detector is
+        // the LOCAL one below — `side_`, `env_`, `gr_`, `xover_` — and `deq_` is not in the signal path
+        // at all, so forwarding only there would have advanced the idle child and left the working
+        // detector frozen. Measured on the freeze this replaces, SplitBand at 7 kHz: -8.000 dB of gain
+        // reduction held through a second of gap where silence releases to -1.104, and to -0.000 through
+        // ten. The meter is written on both routes, because a stale `gainReductionDb()` after a gap is
+        // the same defect one storey up.
+        if (nc == 0)
+        {
+            if (params_.mode == DeEsserMode::DynamicEq && ! params_.listen)
+            {
+                const bool ok = deq_.process (io, 0, n);
+                grDb_ = (float) deq_.dynamicDeltaDb();
+                return ok;
+            }
+            advanceSilence (n);
+            return true;
+        }
 
         // DynamicEq mode = the surgical dynamic-EQ band (no split, no listen detour).
         if (params_.mode == DeEsserMode::DynamicEq && ! params_.listen)
@@ -119,10 +139,7 @@ public:
             }
             if (link_ == dynamics::LinkMode::MeanPower) linked = std::sqrt (sq / (float) nc);
 
-            const float lvl = env_.process (linked);
-            const float gr  = gr_.process ((float) gc_.deltaDb ((double) core::gainToDb ((double) std::max (lvl, 1.0e-9f))));   // ≤ 0 (cut)
-            grDb_ = gr;
-            const float gain = (float) core::dbToGain ((double) gr);
+            const float gain = sharedStep (linked);
 
             for (int c = 0; c < nc; ++c)
             {
@@ -136,6 +153,39 @@ public:
     }
 
 private:
+    // LAW 11c — `n` samples of DIGITAL SILENCE through the SplitBand/listen detector. The per-channel
+    // sidechain columns were dropped by `dropStoppedChannels(0)` just above, so the linked level of a
+    // silent band is exactly +0.0f; it is PINNED rather than run through the loop's own link, whose
+    // MeanPower branch would divide by a channel count of zero. Every remaining line is the line the
+    // audio loop runs, in the same order and with the same types — note this stage does NOT narrow the
+    // dB to float before the curve, where `DynamicEqBand` does, and that difference is preserved here.
+    // `xover_` is per channel and has no columns left to advance, so only its flush is owed.
+    void advanceSilence (int n) noexcept
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const float e0 = env_.stateWord(), g0 = gr_.valueDb();
+            (void) sharedStep (0.0f);       // a silent band links to exactly +0.0f at every width
+            if (core::sameBits (e0, env_.stateWord()) && core::sameBits (g0, gr_.valueDb())) break;
+            if (! std::isfinite (env_.stateWord()) && ! std::isfinite (e0)
+                && ! std::isfinite (gr_.valueDb()) && ! std::isfinite (g0)) break;
+        }
+        side_.flushDenormals(); xover_.flushDenormals(); env_.flushDenormals(); gr_.flushDenormals();
+    }
+
+    // ONE sample of the SHARED body — the detector level in, the duck gain out, the meter written on the
+    // way. Written once and called from both loops. NB this stage does NOT narrow the dB to float before
+    // the curve where `DynamicEqBand` does, and it floors the level at 1e-9 where `GainReductionPath`
+    // floors at 1e-12: three neighbouring stages, three spellings, which is exactly why the silent path
+    // reuses this one instead of growing a fourth.
+    float sharedStep (float linked) noexcept
+    {
+        const float lvl = env_.process (linked);
+        const float gr  = gr_.process ((float) gc_.deltaDb ((double) core::gainToDb ((double) std::max (lvl, 1.0e-9f))));   // ≤ 0 (cut)
+        grDb_ = gr;
+        return (float) core::dbToGain ((double) gr);
+    }
+
     static double finite (double v, double fallback) noexcept { return std::isfinite (v) ? v : fallback; }
 
     void apply (const DeEsserParams& p) noexcept

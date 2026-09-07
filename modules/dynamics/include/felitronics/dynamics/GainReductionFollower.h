@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/FlushToZero.h>
+#include <felitronics/core/Math.h>
 
 #include <cmath>
 
@@ -33,6 +34,28 @@ public:
     }
 
     float valueDb() const noexcept { return currentDb; }
+
+    // LAW 11c — `n` steps toward a target that is KNOWN CONSTANT for all of them. This is the cheap half
+    // of "a pause is silence": once the detector level has reached `core::kGainToDbFloor` the dB
+    // conversion returns the same bits for every smaller level, so the static curve behind it returns the
+    // same delta, and the whole per-sample path collapses to the one multiply-add below.
+    //
+    // IT CALLS `process()` RATHER THAN INLINING ITS ARITHMETIC, and that is the point: the coefficient
+    // choice is `|target| > |current|`, which a constant target does NOT freeze. It can flip more than
+    // once — target +1, current -2, release 0.5, attack 0 goes -2 -> -0.5 -> +1, i.e. release, attack,
+    // release — so any "pick the coefficient once" shortcut is wrong, and the follower's own branch is
+    // the only thing that gets it right. Nothing is saved by inlining it anyway; what was saved is
+    // upstream, where a log10 and a knee no longer run.
+    void advanceConstant (float targetDb, int n) noexcept
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const float before = currentDb;
+            (void) process (targetDb);
+            if (core::sameBits (currentDb, before)) return;             // a fixed point stays fixed
+            if (! std::isfinite (currentDb) && ! std::isfinite (before)) return;
+        }
+    }
 
     // Law 8: flush the follower state once it decays below the subnormal-risk threshold (release → 0),
     // and clear it if it is ever non-finite. The second half is unreachable through `Compressor` — the

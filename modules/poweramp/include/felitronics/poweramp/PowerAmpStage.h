@@ -156,6 +156,14 @@ public:
     // Host-rate latency = the oversampler round-trip (tpp-1), constant across drive/topology/factor.
     int  latencySamples() const noexcept;
 
+    // THE SHARED SUPPLY'S CURRENT DROOP, in [0, maxDroop*amount] — the rail collapse the stage is
+    // applying right now. It is a meter reading (an amp UI shows sag), and it is also the only public
+    // window onto the one piece of state this stage does NOT keep per channel: everything else here —
+    // the oversampler FIR, the DC blocker, the transformer poles, five SVF columns — belongs to a lane
+    // and is dropped when that lane stops, while this follows whichever lanes are playing. Law 11c is a
+    // claim about exactly this quantity, and a claim with no observable is not testable.
+    float sagDroop() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
@@ -337,7 +345,22 @@ struct PowerAmpStage::Impl
         if (numSamples == 0) return true;                    // no samples: no time, no edge
         const int nCh = numChannels;
         dropStoppedChannels (nCh);                           // law 11(d): the edge is clocked by numSamples
-        if (nCh == 0) return true;
+
+        // LAW 11c — A PAUSE IS SILENCE, and this stage is the SEVENTH address of that law rather than
+        // one of the five it was written for. Its shared state is not a detector: it is `sag`, ONE
+        // supply the header above deliberately keeps out of the per-channel drop because it "follows
+        // whichever channels are actually there, exactly like a linked detector" — plus thirteen
+        // block-rate parameter glides and the gate edges they drive. All of it stopped dead on a gap.
+        // Nothing new runs it: the same `processChunk` runs, at width zero, which is exactly what a
+        // silent block of the same length would do. Every per-channel loop inside it is
+        // `for (ch = 0; ch < nCh; ...)` and both oversampler ends clamp to `min(channels, channels_)`,
+        // so no plane is read and `io` is never dereferenced — while the sag demand, a `max` over zero
+        // channels seeded at 0.0f, is the +0.0f silence really would produce. Writing a second copy of
+        // the glide block here instead would have been the one thing this repository keeps paying for:
+        // a second implementation of arithmetic that has to agree for ever.
+        // NB the width-zero call skips `if (nCh == 0) return true;` and goes through the SAME chunk loop
+        // below, so the glide cadence — one step per chunk of at most maxBlock — is the cadence silence
+        // has, not one step for the whole gap.
 
         // Chunk to maxBlock so a caller passing numSamples > maxBlock is FULLY processed instead of
         // silently leaving the tail dry. State carries across chunks via the members → seamless.
@@ -593,5 +616,6 @@ inline void PowerAmpStage::reset() { impl->reset(); }
 inline void PowerAmpStage::setParams (const Params& params, const Voicing& voicing) noexcept { impl->setParams (params, voicing); }
 inline bool PowerAmpStage::process (float* const* io, int numChannels, int numSamples) noexcept { return impl->process (io, numChannels, numSamples); }
 inline int  PowerAmpStage::latencySamples() const noexcept { return impl->latencySamples(); }
+inline float PowerAmpStage::sagDroop() const noexcept { return impl->sag.droop(); }
 
 } // namespace felitronics::poweramp

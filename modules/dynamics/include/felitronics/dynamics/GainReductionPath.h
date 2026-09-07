@@ -104,6 +104,58 @@ public:
     float valueDb()       const noexcept { return grf_.valueDb(); }   // last gain delta (signed dB)
     float detectorLevel() const noexcept { return det_.level(); }     // linked level, linear amplitude
 
+    // LAW 11c — advance the WHOLE path through `n` samples of DIGITAL SILENCE. Bit for bit what
+    // `processSample(0.0f)` repeated `n` times does, and it is that same call that runs in phase one, so
+    // there is no second implementation of the arithmetic to drift.
+    //
+    // The linked level of an all-zero frame is exactly +0.0f at EVERY width, width zero included
+    // (`detail::linkAmplitudeImpl` returns 0 for `numChannels <= 0`, `|get(0)|` for 1, a max or a
+    // `sqrt(0/nc)` above that), so `processSample(0.0f)` is what a silent block does to this object no
+    // matter how wide the caller's silence was. That is what makes the pause well posed at width zero.
+    //
+    // TWO PHASES, and the split is where the money is. While the detector level is still ABOVE
+    // `core::kGainToDbFloor` the curve's input moves, so the honest call runs — a log10 and a knee per
+    // sample. At or below the floor `gainToDb` clamps, so the curve's argument, and therefore its output,
+    // is the SAME NUMBER for the rest of the pause: compute it once and hand it to the follower, which
+    // still picks its own attack/release branch per sample. The level cannot climb back out on its own
+    // (the silent recurrence is `env *= c`, non-increasing for `c` in [0,1]), so the phase boundary is
+    // crossed once and never re-crossed. Measured at 48 kHz ON THE DETECTOR THIS PATH ACTUALLY RUNS, the
+    // expensive phase is ~1.75x shorter than the settling horizon behind it: 13 046 samples against
+    // 23 393 at a 5 ms Rms window, 255 745 against 448 304 at 100 ms, 2 452 365 against 4 265 082 at 1 s.
+    // In PEAK mode phase 1 is ONE step, because `LinkedDetector` makes Peak instant (times 0, 0).
+    // An earlier draft said "3.5-19x" here. Those digits are real but they belong to a Peak follower WITH
+    // a release, which this path never has — its Peak is instant and its Rms is symmetric on the POWER,
+    // which halves the crossing. The 19 was two horizons divided by each other and meant nothing at all.
+    void advanceSilence (int n) noexcept
+    {
+        int i = 0;
+        // THE PREDICATE IS SPELLED IN DOUBLE because `gainToDb`'s clamp is: it tests `gain > 1.0e-12`
+        // on the float level PROMOTED to double, and this is the same test on the same value.
+        // BE HONEST ABOUT WHAT THAT BUYS, because the first version of this comment overstated it: it
+        // claimed the two spellings straddle a band of levels, and they do not. `(float) 1e-12` is
+        // 9.99999996e-13, BELOW the clamp, so no float at all separates `(double) x > 1e-12` from
+        // `x > (float) 1e-12` — the float spelling merely runs a few more honest iterations before it
+        // stops, and is equally correct. The cast is kept because it makes the predicate the clamp's own
+        // test rather than one that happens to agree; it is not load-bearing, and a mutation of it is an
+        // equivalent mutant, which is how the stand classifies it.
+        for (; i < n && (double) det_.level() > core::kGainToDbFloor; ++i)
+        {
+            const float e0 = det_.stateWord(), g0 = grf_.valueDb();
+            (void) processSample (0.0f);
+            if (core::sameBits (det_.stateWord(), e0) && core::sameBits (grf_.valueDb(), g0)) return;
+            if (! std::isfinite (det_.stateWord()) && ! std::isfinite (e0)) break;   // let phase 2 finish it
+        }
+        if (i >= n) return;
+
+        // The level is pinned under the floor: ONE evaluation of the same expression `step()` uses, then
+        // the follower alone. Spelling it through `gc_`/`gainToDb` rather than through a hard-coded
+        // -240 dB keeps the mode, threshold, ratio, knee and range in the answer — a threshold below the
+        // floor makes digital silence an ACTIVE sample, which the header says and a constant would lose.
+        const float target = (float) gc_.deltaDb (core::gainToDb (det_.level()));
+        grf_.advanceConstant (target, n - i);
+        det_.advanceSilence (n - i);
+    }
+
     // The curve itself, for the callers that have to READ it — a static auto-makeup asks the curve
     // what a 0 dBFS signal would get, and an offline solver asks it where the knee starts.
     const GainComputer& curve() const noexcept { return gc_; }

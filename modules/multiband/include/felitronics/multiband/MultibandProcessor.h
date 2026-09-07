@@ -132,6 +132,7 @@ private:
     {
         const int nc = numChannels;
         const int nb = splitter_.numBands();
+        const bool fallingEdge = nc < ranNc_;      // read BEFORE the ledger below moves
 
         // A channel that stops being split keeps the whole crossover tree for its column — every Svf in
         // every crossover and every allpass compensator — plus its per-band alignment delay lines. None of
@@ -142,16 +143,40 @@ private:
         // Telling it only at nc == 0 left the narrowing case leaking: stereo -> bypass -> mono -> bands
         // back on -> stereo silence emitted -16.6378 dBFS on the right, last non-zero at sample 239,
         // the whole lookahead line.
+        // ...and NOT when the width is zero, because the `nc == 0` branch below already calls every band
+        // — bypassed ones included — with exactly this `(0, n)`. While a band merely FROZE on a gap the
+        // duplicate was invisible; under law 11c it is a DOUBLE CLOCK, and the first chunk of every gap
+        // would advance a bypassed band's ballistics by 2n. Found on the diff, before it shipped.
+        //
+        // 🔴 AND THE PLANES HAVE TO EXIST. `bandPtrs_[b]` is filled ONLY in the band loop below, which
+        // `continue`s past a bypassed band — so a band bypassed since `prepare()` reached this call with
+        // a row of NULLs and the band processor dereferenced them. That is a SEGFAULT, not a wrong
+        // number, and it is on untouched `main`: prepare(2) → process(io, 2, n) → bypass a band →
+        // process(io, 1, n) crashes in `GainReductionPath::process`. ASan names the line. It was
+        // invisible because nothing in the suite narrowed the width WITH a band bypassed.
+        // What the planes should CARRY is digital silence: this band "has been receiving nothing all
+        // along" (the sentence right above), so law 11c's own answer applies to it — the falling edge
+        // lands and the ballistics spend the block on silence, rather than on whatever the previous
+        // call happened to leave in the band buffer.
+        bool edgeOk = true;
+        if (nc > 0)
         for (int b = 0; b < nb; ++b)
-            if (bypass_[(std::size_t) b])
-                for (int c = nc; c < ranNc_; ++c)
+            if (bypass_[(std::size_t) b] && fallingEdge)
+            {
+                for (int c = 0; c < nc; ++c)
                 {
-                    if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
-                        proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
-                    else
-                        (void) proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
-                    break;                          // one call per band carries the whole falling edge
+                    bandPtrs_[(std::size_t) b][(std::size_t) c] = bandData (b, c);
+                    std::fill_n (bandData (b, c), n, 0.0f);
                 }
+                // THE CHILD'S VERDICT IS NOT DISCARDED. It used to be `(void)`-cast away here, and the
+                // band loop below skips this band, so a bypassed child that REFUSED (re-prepared alone
+                // through `band(i)`, say) reported nothing at all and the composite still returned true.
+                // On `main` as well; kept honest here because law 11's whole point is a returned verdict.
+                if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
+                    proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n);
+                else
+                    edgeOk = proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), nc, n) && edgeOk;
+            }
         for (int c = nc; c < ranNc_; ++c)
         {
             splitter_.resetChannel (c);
@@ -174,15 +199,29 @@ private:
             // A BYPASSED band is stopped too — it has been receiving nothing all along, and the gap is
             // the moment its own per-channel state has to go, or it replays on un-bypass. Measured with
             // the bands bypassed during the gap: -11.83 dBFS out of digital silence.
+            //
+            // ...BUT ONLY ON THE FALLING EDGE, and this is the one place where law 11c cannot be made
+            // exact. The band loop below SKIPS a bypassed band, so during live-width silence its
+            // ballistics are frozen — bypass means frozen, and that is the composite's existing
+            // contract. A gap has to reach it anyway, because law 11a's edge is owed and law 11 has no
+            // call that carries an EDGE WITHOUT TIME: `(0, n)` is the only spelling, and it clocks. So a
+            // bypassed band spends ONE chunk of the gap where live-width silence would have spent none,
+            // and no more: measured on a compressor with a release coefficient of exactly 0.5f, one
+            // sample of gap took a bypassed band's gain reduction from -6.98969984 dB to -3.49484992
+            // where live silence leaves it at -6.98969984. Bounding it to the falling edge is the whole
+            // of what this change can honestly do; making it exact means deciding what BYPASS means —
+            // frozen, or receiving digital silence at every width — and that is a product question with
+            // a CPU bill attached, not a consequence of this law. Recorded rather than papered over.
             bool zeroOk = true;
             for (int b = 0; b < nb; ++b)
             {
+                if (bypass_[(std::size_t) b] && ! fallingEdge) continue;
                 if constexpr (std::is_void_v<decltype (proc_[0].process (bandPtrs_[0].data(), nc, n))>)
                     proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), 0, n);
                 else
                     zeroOk = proc_[(std::size_t) b].process (bandPtrs_[(std::size_t) b].data(), 0, n) && zeroOk;
             }
-            return zeroOk;
+            return zeroOk && edgeOk;
         }
 
         // 1) split into per-band planar buffers; capture the allpass-reconstructed dry for the parallel mix
@@ -248,7 +287,7 @@ private:
                 io[c][i] = anySolo ? wet : (d + mix_ * (wet - d));
             }
         }
-        return bandsOk;
+        return bandsOk && edgeOk;
     }
 
     void recomputeLatency() noexcept
