@@ -46,9 +46,9 @@ namespace felitronics::core
 // The older note here said "the driven nonlinear stage masks the interpolation images". Measured, it
 // is CONDITIONAL and it does not cover the whole error: (a) the carrier droop is not an added
 // component at all, so nothing masks it; (b) against the model's OWN aliasing floor the added
-// artifacts of the OUTPUT leg sit BELOW it on a high-gain capture and up to +9.8 dB ABOVE it on a
-// clean one from 15 kHz up (the whole rate-match is above it in 22 of 30 tone x level cells, by up to
-// +12.3 dB); (c) driving the stage harder does not help — over a 42 dB input sweep the error-to-signal
+// artifacts of the OUTPUT leg sit 3-24 dB BELOW it on a high-gain capture but ABOVE it on a clean one
+// at every level from 17.5 kHz up, by up to +9.8 dB (the whole rate-match is above it in 22 of 30
+// tone x level cells, by up to +12.3 dB); (c) driving the stage harder does not help — over a 42 dB input sweep the error-to-signal
 // ratio is FLAT in 16–22 kHz where the artifacts live, and grows +10 to +14 dB in 0–4 kHz where they
 // do not, because the nonlinearity DEMODULATES the input leg's images into the audible range: a 20 kHz
 // tone at −18 dBFS into a high-gain capture comes back with a 100 Hz line at −17.7 dBFS, 14.5 dB

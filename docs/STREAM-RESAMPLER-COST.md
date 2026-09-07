@@ -109,7 +109,8 @@ conversion (`shipped − ideal`, both at 44.1 kHz):
   in every run;
 * against the **model's own aliasing floor** (what a WaveNet at 48 kHz folds down by itself, measured
   on an arm with no resampler in it), the **output leg alone** sits below it on a high-gain capture
-  (3–24 dB) and **up to +9.8 dB above** it on a clean one from 15 kHz up. Counting the whole rate-match,
+  (3–24 dB) but above it on a clean one at every level from 17.5 kHz up, by **up to +9.8 dB** (at
+  15.25 kHz, two of the three levels). Counting the whole rate-match,
   including the model reacting to a droop-ed input, it is above the floor in **22 of 30** tone × level
   cells, by up to **+12.3 dB** — below only on the high-gain capture at 12.3–15.25 kHz;
 * driving harder does not help, and in the audible midrange it actively hurts. Per band, error over
@@ -137,7 +138,7 @@ conversion (`shipped − ideal`, both at 44.1 kHz):
   as a level; the level on real DI is the table above.
 
 So the old one-line defence fails three ways: it never covered the carrier droop at all, it is
-conditional where it does apply (below the model's own floor on a driven capture, up to +9.8 dB above
+conditional where it does apply (3–24 dB below the model's own floor on a driven capture, up to +9.8 dB above
 it on a clean one, output leg alone), and the driven stage does not mask the input leg's artifacts —
 it moves them into the part of the spectrum where nothing masks anything.
 
