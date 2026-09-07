@@ -7,6 +7,49 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **`mastering`: TARGET-LOUDNESS SOLVER, NAMED CONSTRAINTS AND THE STATISTICS BEHIND THEM
+  (`mastering::TargetLoudnessSolver`).** Hits a target integrated loudness under a stated true-peak
+  ceiling in a bounded number of renders, and refuses BY NAME instead of crushing the programme when
+  the target cannot be had.
+  - **It is one scalar search, not two loops.** `preLimiterGainDb` (g) and `limiter.ceilingDbTp` (c)
+    look like two knobs and are not: the limiter's reduction is `min(0, c - smaxDb)` and `smaxDb` is
+    taken after the gain node, so everything the limiter does depends on `d = g - c` alone and `c` is a
+    pure output scale — `y(g,c) = 10^(c/20) y(d,0)`, measured over a 3x3 grid at
+    `9.1e-07 .. 1.7e-06` on a programme peaking at 0.89. So the ceiling programmed into the limiter is
+    an OUTPUT of the solve, and the P11 inter-sample derate costs whatever the material's actually is
+    (**+0.0005 to +0.1028 dB measured in situ** on five real mixes) instead of a flat 1.2 dB off
+    every track.
+  - **New: `limiter::TruePeakLimiterTap`** — the limiter's gain-reduction trace and the reconstructed
+    peak it saw, on its OWN `F*fs` grid, plus `maxReconstructedPeakDb()`. Folding the trace to baseband
+    needs a rule and the rule belongs to whoever reads the statistic: a min-fold biases the mean by
+    **+0.0029 to +0.0080 dB** and the active fraction by up to **+0.0009** across the whole release
+    range, while `max` and the upper quantiles are untouched. A tap too short REFUSES the whole call.
+  - **New: `mastering::MasteringChainTaps`** — the chain forwards the limiter's traces, the
+    compressor's own tap and the signal at the pre-limiter node, with each stage's offset from the
+    chain's INPUT stated rather than implied, so a statistic is cropped to the window that carries
+    programme. `OfflineRenderer::render` grows one templated tap sink; there is still exactly one copy
+    of the `out[n] = y[n + D]` arithmetic.
+  - **BREAKING (behaviour), `mastering::MasteringChain`: a parameter set written BEFORE `prepare()` is
+    now KEPT.** `prepare()` ended with `pendingParams_ = params_`, which replaced the caller's pending
+    write with the last APPLIED set — defaults, on a fresh object. Measured:
+    `setParams(inputGainDb = 12)` then `prepare()` then `process()` delivered the input **unchanged**,
+    12 dB that simply did not happen, with no refusal and no way to find out. Every stage already
+    honours that order (`Compressor`, `TruePeakLimiter` and `Dither` all re-apply their stored
+    parameters inside `prepare()`); the composite was the only place that did not. The parameters are
+    now applied inside `prepare()`, so `params()` and `resolved()` describe the prepared chain rather
+    than the previous one — mid-stream they still lag a `setParams()` by up to one internal quantum,
+    which is the documented design.
+  - **A limit already broken at the least drive the search will use is UPSTREAM, and says so.** The
+    compressor's gain reduction cannot move at all (its node is before the gain), and the loudness
+    range, the peak-to-loudness ratio and the limiter's own gain reduction all get WORSE with drive —
+    so naming the loudness target as the reason points the user at the wrong number. Measured on the
+    corpus: with a 0.4 LU range allowance, an ordinary compressor setting spends **0.80 to 3.70 LU**
+    before the solver applies a single dB.
+  - **Digital silence gets `MeasurementInvalid`, not a plausible answer.** `analysis::LoudnessMeter`
+    returns the literal -120.0 when nothing passes its absolute gate, and a ceiling derived from a
+    -200 dBTP peak reading clamps to +60 dBTP — i.e. it would switch the limiter OFF and report
+    success.
+
 - **BREAKING (behaviour), `dynamics`, `deesser`, `dynamiceq`, `poweramp`, `multiband`, `core`: LAW 11c —
   A PAUSE IS SILENCE.** A call with `nch == 0, n > 0` now advances a stage's SHARED, one-per-instance
   ballistics exactly as `n` samples of digital silence at a live width would, instead of freezing them.
