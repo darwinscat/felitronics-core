@@ -14,89 +14,153 @@ namespace felitronics::core
 {
 
 //==============================================================================
-// felitronics::core::StreamResampler — streaming arbitrary-ratio resampler (cubic / Catmull-Rom).
+// felitronics::core::StreamResampler — streaming arbitrary-ratio resampler (polyphase windowed sinc).
 // Promoted from OrbitCab, where it runs a rate-locked neural (NAM) model at its native 48 kHz on any
 // host rate — host→model on the way in, model→host on the way out. feed() appends input; the
 // produce*() calls emit as many output samples as the buffered history allows, with `pos` carrying
-// the sub-sample phase across blocks — arbitrary in/out block sizes, no long-term drift. Identity
-// ratio passes the signal with a clean 2-sample delay (catmull @ t=0 reads one sample behind), and
-// EVERY ratio delays by exactly 2 of this stage's own input samples (buf holds 3 leading zeros and
-// pos starts at 1, so output k reads input position k·inPerOut − 2).
+// the sub-sample phase across blocks — arbitrary in/out block sizes, no long-term drift.
 //
-// 🔴 WHAT THIS KERNEL COSTS — MEASURED (P32), not asserted. A phase-dependent kernel is a LINEAR
-// PERIODICALLY TIME-VARYING filter, so its error is two things at once, and they are the same thing
-// seen twice: the per-phase gain M(t) has Fourier coefficients H(Ω+2πk), i.e. the "amplitude
-// modulation" and the "interpolation images" are one mechanism, not two. Round trip 44.1↔48 kHz
-// (the shipped NAM path), coherent carrier / worst phase, in dB:
+// THE KERNEL. `kTaps = 64` taps of a Kaiser-windowed sinc (β = 8.6), sampled into `kPhases = 512`
+// phase rows built once in reset(), with LINEAR interpolation between the two rows bracketing the
+// wanted phase. The window is a fixed 64 INPUT samples wide in both directions; what adapts to the
+// ratio is the CUTOFF:
+//
+//     fc = 0.99 · min(1, outRate / inRate)          in units of the INPUT Nyquist
+//
+// i.e. the kernel always band-limits to 0.99 of whichever Nyquist is lower — its own on the way up,
+// the OUTPUT's on the way down, which is what gives the decimating direction a stopband at all. On
+// the shipped 44.1 ↔ 48 kHz NAM round trip both legs land on the same 21 829.5 Hz.
+//
+// 🔴 WHY IT IS NOT THE CATMULL-ROM CUBIC ANY MORE (P32 measured the cubic; P34 replaced it). A
+// phase-dependent kernel is a LINEAR PERIODICALLY TIME-VARYING filter, so its error is two things at
+// once and they are the same thing seen twice: the per-phase gain M(t) has Fourier coefficients
+// H(Ω+2πk), i.e. the "amplitude modulation" and the "interpolation images" are one mechanism. The
+// cubic cost, one round trip 44.1↔48 kHz, coherent carrier / worst phase, in dB, was
 //     10 k −0.64/−1.16 · 15 k −2.59/−5.14 · 17.64 k −4.17/−9.27 · 20 k −5.48/−14.79
-// 🔴 That is ONE round trip. OrbitCab runs TWO NamStages IN SERIES at the host rate (preamp → EQ →
-// poweramp), i.e. FOUR of these stages, and the cascade is not the decibels doubled: measured
-// −9.03/−13.16 at 17.64 kHz and −12.09/−17.85 at 20 kHz, where doubling would say −8.35/−18.53. The
-// best phase falls from −0.61 dB to −5.20, so on that chain the top octave is down at EVERY phase.
-// `rigplayer` runs its two stages in PARALLEL and stays on the one-round-trip row.
-// The composite gain is periodic with EXACTLY 147 output samples at this ratio, so those 147 values
-// are the complete set — but they are a LINE through the two stages' phase torus, fixed by the
-// shipped priming (both stages reset together at pos = 1, len = 3), not the full 160x147 product.
-// Swept over all 160 integer alignments the shipped priming lands at or near the worst (-9.29 dB at
-// 17.64 kHz against the -9.27 here; 0.91 dB off at 20 kHz) — an observation about this priming, not a
-// bound — while the coherent carrier spans -3.59 .. -6.83 dB, being an interference term between the
-// two stages rather than a property of the kernel.
+// and its decimating direction had NO stopband at all (−3 dB rms, 0.0 dB sample peak above the output
+// Nyquist, because at phase t = 0 its weights were (0,1,0,0) — a bare sample pick). Worse than the
+// droop: a DRIVEN nonlinear stage downstream does not mask those images, it DEMODULATES them — a
+// 20 kHz tone at −18 dBFS through a high-gain capture came back with a 100 Hz line 14.5 dB LOUDER than
+// its own carrier. Full write-up and the protocol: docs/STREAM-RESAMPLER-COST.md.
 //
-// 🔴 AND THE DECIMATING DIRECTION HAS NO ANTI-ALIASING AT ALL. Going 48 → 44.1 this kernel passes a
-// tone above the output Nyquist at −3 dB rms and 0.0 dB sample PEAK. The peak is a TIME-domain fact
-// with a kernel reason: at t = 0 the weights are (0,1,0,0), so |M(0)| = 1 at EVERY frequency, and the
-// phase grid has points within 1/147 of zero where |M| is still −0.002 dB — so the tone comes through
-// somewhere in every period whatever the signal's own grid does. (Across the five rows measured, no
-// single spectral LINE exceeds −4.67 dB; the peak is not one of them.) A tone at g ∈ (22.05,
-// 24) kHz comes back as TWO strong components, not one: 44100 − g at about −5 dB and g − 3900 at
-// about −7 dB (23 kHz in → 21.1 kHz at −5.33 and 19.1 kHz at −7.04), plus weaker terms near −45 dB
-// that go lower still. The STRONG pair lands across 18.15–22.05 kHz — that is where the damage is,
-// not where it stops.
+// 🔴 LATENCY — DERIVED FROM THE GEOMETRY, then measured back. Do not guess this number; the previous
+// one was a guess ("~3 samples of lookahead per stage") and was 2.16 samples wrong. reset() primes
+// `buf` with `kTaps` leading zeros and `pos = kHalf`, so buf[q] holds input sample q − kTaps, output k
+// reads centre position kHalf + k·inPerOut, and therefore
 //
-// The older note here said "the driven nonlinear stage masks the interpolation images". Measured, it
-// is CONDITIONAL and it does not cover the whole error: (a) the carrier droop is not an added
-// component at all, so nothing masks it; (b) against the model's OWN aliasing floor the added
-// artifacts of the OUTPUT leg sit 3-24 dB BELOW it on a high-gain capture but ABOVE it on a clean one
-// at every level from 17.5 kHz up, by up to +9.8 dB (the whole rate-match is above it in 22 of 30
-// tone x level cells, by up to +12.3 dB); (c) driving the stage harder does not help — over a 42 dB input sweep the error-to-signal
-// ratio is FLAT in 16–22 kHz where the artifacts live, and grows +10 to +14 dB in 0–4 kHz where they
-// do not, because the nonlinearity DEMODULATES the input leg's images into the audible range: a 20 kHz
-// tone at −18 dBFS into a high-gain capture comes back with a 100 Hz line at −17.7 dBFS, 14.5 dB
-// LOUDER than its own carrier, against −174.6 through an ideal round trip. Whether to change the kernel is a
-// product decision, and it buys transparency with LATENCY: a 64-tap polyphase sinc at a 0.99 cutoff
-// measures 0.00 dB flat to 19 kHz with no modulation at all and is better than this kernel in EVERY
-// band on real DI through a driven capture, for +2.5 % of what the stage already spends on the model
-// and 61.4 host samples of delay against today's 3.84. A cheaper 32-tap one flattens the same two tone
-// axes but is 5 dB WORSE in the bass on program material — the cutoff decides this, not the taps. Full numbers, the
-// two-oracle protocol and the candidate table: docs/STREAM-RESAMPLER-COST.md.
+//     output k is centred on input position  k·inPerOut − kHalf     →  D = kHalf = 32
 //
-// FAMILY SPLIT vs convolution::resampleIr: THAT is the OFFLINE Kaiser windowed-sinc (≥60 dB-class,
-// message-thread, allocates) for rate-converting an impulse response on load — an IR is a
-// fingerprint and must survive intact. THIS is the cheap STREAMING rate-match for a live signal
-// path. The split still holds — but it is a COST decision, not a transparency claim, and the cost
-// above is the price. Don't swap them.
+// EVERY stage delays by exactly kHalf (32) of ITS OWN input samples — the group delay of a symmetric
+// 64-tap FIR, no more and no less. The 44.1 ↔ 48 round trip is 32 host samples (down) + 32 model
+// samples (up) converted to host rate = 32 + 32·(44100/48000) = 61.4000 host samples, 1.392 ms.
+// MEASURED back from the carrier phase at 100 Hz and 500 Hz (below the first whole-period wrap, so
+// unambiguous): 61.4000 samples, the geometry to four decimals. It was 3.8375 with the cubic.
+// The delay is mildly frequency-dependent on top of that — the coherent term's GROUP delay, which no
+// single integer can express and no consumer can act on. Callers that must align a dry path (OrbitCab,
+// orbit-amp) take this same figure, so it is an audio-alignment number there and not only PDC.
 //
-// 🔴 Fixed capacity, allocated once in reset() (message thread): feed()/produce*() never allocate,
-// lock, do IO, or throw on the audio thread. `buf` is a linear scratch holding `len` valid samples
-// at the front, compacted by memmove; `pos` is the fractional read position. Header-only so it can
-// be unit-tested directly.
+// IDENTITY RATIO. At an exactly equal in/out rate the class short-circuits to a pure delay: a 0.99
+// cutoff is a real (if gentle) low-pass, and a caller asking for no rate change must not silently get
+// one. The delay is still kHalf, so latency stays one formula for every ratio.
+//
+// FAMILY SPLIT vs convolution::resampleIr: THAT is the OFFLINE Kaiser windowed-sinc (message-thread,
+// allocates, its own cutoff criterion) for rate-converting an impulse response on load — an IR is a
+// fingerprint and must survive intact. THIS is the streaming rate-match for a live signal path. The
+// two are now the same FAMILY of kernel with different budgets; they are still not interchangeable,
+// because that one is sized for an offline one-shot and this one for a per-block audio callback.
+//
+// 🔴 Fixed capacity and the phase table, both allocated once in reset() (message thread):
+// feed()/produce*() never allocate, lock, do IO, or throw on the audio thread. `buf` is a linear
+// scratch holding `len` valid samples at the front, compacted by memmove; `pos` is the fractional read
+// position. Header-only so it can be unit-tested directly.
 //==============================================================================
 struct StreamResampler
 {
-    double inPerOut = 1.0;        // input samples advanced per output (= inRate / outRate)
-    double pos      = 1.0;        // fractional read position into buf (>=1: cubic needs buf[i-1])
-    std::vector<float> buf;       // capacity fixed in reset(); buf[0..len) valid
+    static constexpr int kTaps   = 64;             // window length in INPUT samples (even)
+    static constexpr int kHalf   = kTaps / 2;      // 32 — taps at/ahead of the read head, and D
+    static constexpr int kBehind = kHalf - 1;      // 31 — taps behind it
+    static constexpr int kPhases = 512;            // phase rows; measured error floor −105 dB (−94 at 256)
+    static constexpr double kCutoff = 0.99;        // of the lower Nyquist — the product decision (P34)
+    static constexpr double kBeta   = 8.6;         // Kaiser β → ≈87 dB stopband at 64 taps
+    static constexpr double kPi     = 3.14159265358979323846;   // repo convention: MSVC has no M_PI
+
+    double inPerOut = 1.0;              // input samples advanced per output (= inRate / outRate)
+    double pos      = (double) kHalf;   // fractional read position into buf (>= kBehind: needs buf[i-31])
+    std::vector<float> buf;             // capacity fixed in reset(); buf[0..len) valid
     int len = 0;
+    std::vector<float> tab;             // (kPhases+1) rows x kTaps, normalised per row — built in reset()
+    bool identity = false;              // exact 1:1 ratio → pure delay, no filtering (see header note)
+
+    // The delay this stage adds, in ITS OWN INPUT samples — the single source of truth for every
+    // consumer that has to align something against it. It is the group delay of the symmetric
+    // kTaps-long FIR, and it does NOT depend on the ratio: output k is centred on input k·r − kHalf
+    // (derivation in the header block above). A round trip through two stages costs
+    // delayInputSamples() of the first stage's input rate plus the same count of the second's, which
+    // is why NamStage reports kHalf·(1 + hostSR/modelRunSR) and not twice one number.
+    static constexpr double delayInputSamples() noexcept { return (double) kHalf; }
+
+    // Modified Bessel I0, series. Hand-rolled on purpose: std::cyl_bessel_i is not dependably present
+    // across the toolchains this repo builds on (MSVC, Apple clang, emscripten), and the table has to
+    // come out the same on all of them.
+    static double besselI0 (double x) noexcept
+    {
+        double sum = 1.0, term = 1.0;
+        const double h = x * 0.5;
+        for (int k = 1; k < 64; ++k)
+        {
+            term *= (h * h) / ((double) k * (double) k);
+            sum  += term;
+            if (term < 1.0e-18 * sum) break;
+        }
+        return sum;
+    }
+
+    // One tap of the continuous kernel at argument x (in input samples), cutoff fc (of input Nyquist).
+    static double kernelAt (double x, double fc) noexcept
+    {
+        const double s = (std::fabs (x) < 1.0e-12) ? fc
+                                                   : fc * std::sin (kPi * fc * x) / (kPi * fc * x);
+        const double u = x / (double) kHalf;
+        if (std::fabs (u) >= 1.0) return 0.0;                       // the window is exactly zero at the edge
+        return s * besselI0 (kBeta * std::sqrt (1.0 - u * u)) / besselI0 (kBeta);
+    }
 
     void reset (double inRate, double outRate, int capacity)
     {
+        // Contract-violation guards (message thread only — no cost on the valid path). A non-finite or
+        // non-positive rate would put inf/NaN into inPerOut, and floor(inf) converted to int is UB in
+        // the produce loop; fall back to the identity ratio, which is inert rather than undefined.
+        if (! (inRate > 0.0) || ! (outRate > 0.0) || ! std::isfinite (inRate) || ! std::isfinite (outRate))
+            inRate = outRate = 1.0;
+
         inPerOut = inRate / outRate;
-        // Contract-violation guards (message thread only — no cost on the valid path):
-        if (capacity < 0) capacity = 0;                      // negative would wrap (size_t) into a huge/UB alloc (or, small negatives, a tiny buffer)
-        if (capacity > INT_MAX - 8) capacity = INT_MAX - 8;  // keep buf.size() <= INT_MAX so the (int) buf.size() below never wraps negative
-        buf.assign ((std::size_t) capacity + 8, 0.0f);       // ALLOC here (message thread) — never in process
-        len = 3;                                             // 3 leading history zeros
-        pos = 1.0;
+        // `fabs(d) <= 0` is exact equality without tripping -Wfloat-equal, and (unlike `!(d > 0)`)
+        // it is false for a NaN — which the guard above has already excluded anyway.
+        identity = (std::fabs (inRate - outRate) <= 0.0);
+
+        if (capacity < 0) capacity = 0;                                          // negative would wrap (size_t) into a huge/UB alloc
+        if (capacity > INT_MAX - (kTaps + 8)) capacity = INT_MAX - (kTaps + 8);  // keep buf.size() <= INT_MAX so the (int) buf.size() below never wraps negative
+        buf.assign ((std::size_t) capacity + (std::size_t) kTaps + 8, 0.0f);     // ALLOC here (message thread) — never in process
+        len = kTaps;                                                             // kTaps leading history zeros
+        pos = (double) kHalf;                                                    // → output k centred on input k·r − kHalf
+
+        // The phase table. Row p holds the taps for phase t = p/kPhases; row kPhases is the t → 1 limit,
+        // present so the linear interpolation never has to wrap — a wrapped row would need a SHIFTED tap
+        // alignment, which is the classic off-by-one of this construction.
+        const double fc = kCutoff * std::min (1.0, outRate / inRate);
+        tab.assign ((std::size_t) (kPhases + 1) * (std::size_t) kTaps, 0.0f);
+        for (int p = 0; p <= kPhases; ++p)
+        {
+            const double t = (double) p / (double) kPhases;
+            double row[kTaps], s = 0.0;
+            for (int j = 0; j < kTaps; ++j) { row[j] = kernelAt ((double) (j - kBehind) - t, fc); s += row[j]; }
+            // Partition of unity per row: without it the settled DC gain would MODULATE with the phase
+            // (the raw sums drift by ~6 ppm here), which is a defect of exactly the kind this kernel
+            // exists to remove. Normalising both rows also normalises their linear interpolant.
+            const double inv = (std::fabs (s) > 0.0 ? 1.0 / s : 1.0);
+            for (int j = 0; j < kTaps; ++j)
+                tab[(std::size_t) p * (std::size_t) kTaps + (std::size_t) j] = (float) (row[j] * inv);
+        }
     }
 
     void feed (const float* in, int n)
@@ -108,26 +172,18 @@ struct StreamResampler
             in += (n - cap);
             n   = cap;
             len = 0;
-            pos = 1.0;
+            pos = (double) kBehind;
         }
-        if (len + n > cap)                                   // backstop: sized so this shouldn't trigger on the valid path
-        {
-            int drop = len + n - cap;
+        if (n > cap - len)                                   // backstop: sized so this shouldn't trigger on the valid path
+        {                                                    // (`len + n > cap` would be signed overflow at a huge capacity)
+            int drop = n - (cap - len);
             if (drop > len) drop = len;                      // never memmove a size_t-underflowing (negative) count
             std::memmove (buf.data(), buf.data() + drop, (std::size_t) (len - drop) * sizeof (float));
             len -= drop; pos -= drop;
-            if (pos < 1.0) pos = 1.0;                        // keep the read head in-bounds — a dropped-past head must not let produce read buf[i-1] below buf[0]
+            if (pos < (double) kBehind) pos = (double) kBehind;   // keep the read head in-bounds — a dropped-past head must not let produce read below buf[0]
         }
         std::copy (in, in + n, buf.data() + len);
         len += n;
-    }
-
-    static float catmull (float a, float b, float c, float d, float t)
-    {
-        const float t2 = t * t, t3 = t2 * t;
-        return 0.5f * ((2.0f * b) + (-a + c) * t
-                     + (2.0f * a - 5.0f * b + 4.0f * c - d) * t2
-                     + (-a + 3.0f * b - 3.0f * c + d) * t3);
     }
 
     int produceAvailable (float* out, int cap)
@@ -136,13 +192,41 @@ struct StreamResampler
         while (k < cap)
         {
             const int i = (int) std::floor (pos);
-            if (i + 2 >= len) break;                         // need buf[i-1..i+2]
-            out[k++] = catmull (buf[(std::size_t) (i - 1)], buf[(std::size_t) i],
-                                buf[(std::size_t) (i + 1)], buf[(std::size_t) (i + 2)],
-                                (float) (pos - i));
+            if (i + kHalf >= len) break;                     // need buf[i-kBehind .. i+kHalf]
+            if (i < kBehind) break;                          // …and the history behind it (backstop paths only)
+
+            const float* x = buf.data() + (std::size_t) (i - kBehind);
+            if (identity)
+            {
+                out[k++] = x[kBehind];                       // pure delay: THIS sample, unfiltered
+            }
+            else
+            {
+                const double fp = (pos - (double) i) * (double) kPhases;
+                int p = (int) fp;
+                if (p < 0) p = 0;
+                if (p > kPhases - 1) p = kPhases - 1;
+                const float a = (float) (fp - (double) p);
+                const float* r0 = tab.data() + (std::size_t) p * (std::size_t) kTaps;
+                const float* r1 = r0 + kTaps;
+
+                // 🔴 THE SHAPE OF THIS LOOP WAS CHOSEN BY MEASUREMENT, not by which algebra reads better.
+                // Blending the two phase rows per TAP and summing once is algebraically the same as two
+                // dot products blended by a scalar — sum_j (r0_j + a(r1_j − r0_j))·x_j = d0 + a(d1 − d0)
+                // — and the second form looks cheaper: 128 MACs against 64 MACs plus 64 lerps. It is not.
+                // Benchmarked on arm64/Apple clang at 64 taps: per-tap lerp 12.77 ns per output (10.0
+                // GMAC/s), two accumulators 16.70 ns, a hand-written four-way split 21.21 ns. A float
+                // reduction is not associative, so the compiler may not restructure it; ONE dependency
+                // chain with a fused lerp vectorises, TWO compete, and splitting it by hand only spends
+                // registers. The three are not bit-identical to each other — this is the shipped order.
+                float s = 0.0f;
+                for (int j = 0; j < kTaps; ++j) s += (r0[j] + a * (r1[j] - r0[j])) * x[j];
+                out[k++] = s;
+            }
             pos += inPerOut;
         }
-        const int keep = (int) std::floor (pos) - 1;         // keep one sample before the read head
+        int keep = (int) std::floor (pos) - kBehind;         // keep kBehind samples before the read head
+        if (keep > len) keep = len;                          // a huge ratio can step past everything buffered
         if (keep > 0)
         {
             std::memmove (buf.data(), buf.data() + keep, (std::size_t) (len - keep) * sizeof (float));
