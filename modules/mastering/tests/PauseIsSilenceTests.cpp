@@ -1229,6 +1229,51 @@ static void aRefusedBypassedChildIsReported()
     ok (! m.process (io, 1, B), "the composite reports the refusal instead of returning true");
 }
 
+// (i) THE FOLLOWER'S BRANCH IS PER SAMPLE, AND A CONSTANT TARGET DOES NOT FREEZE IT. `advanceConstant`
+//     hands the same target to `process()` every sample precisely so the attack/release choice —
+//     `|target| > |current|` — is made afresh each time; hoisting it out of the loop is the obvious
+//     "optimisation" and it is wrong. It needs a target whose SIGN differs from the current reduction,
+//     which happens when the mode changes under a live follower: every mode on its own is single-signed,
+//     so no sweep over modes can reach it, and the whole suite passed against the hoisted version.
+//     The trajectory below is chosen so the branch flips ON the zero crossing: release 0.5 takes -2 to
+//     -0.5 (still |target| < |current|), then attack takes it to +1. A hoisted coefficient gives +0.25.
+static void theFollowerBranchIsPerSample()
+{
+    group ("law 11c — a constant target does not freeze the follower's attack/release branch");
+    // A release coefficient of EXACTLY 0.5f, so the arithmetic below is exact and the expected numbers
+    // are the recurrence's own rather than a tolerance.
+    const double relMs = 1000.0 / (kFs * std::log (2.0));
+    for (double range2 : { 1.0, 4.0, 12.0 })
+    {
+        dynamics::GainReductionParams p;
+        p.detector = dynamics::Detector::Peak; p.mode = dynamics::Mode::DownExpand;
+        p.thresholdDb = -30.0; p.ratio = 4.0; p.kneeDb = 0.0; p.rangeDb = 2.0;
+        p.attackMs = 0.0; p.releaseMs = relMs;                  // instant attack, half-per-sample release
+        dynamics::GainReductionPath fast, honest;
+        fast.prepare (kFs); honest.prepare (kFs);
+        fast.setParams (p); honest.setParams (p);
+        (void) fast.processSample (0.0f); (void) honest.processSample (0.0f);
+        ok (fast.valueDb() < -1.0f, "precondition: the follower is holding a NEGATIVE reduction");
+        // ...and now the target flips sign under it.
+        p.mode = dynamics::Mode::UpCompress; p.rangeDb = range2;
+        fast.setParams (p); honest.setParams (p);
+        fast.advanceSilence (2);
+        (void) honest.processSample (0.0f); (void) honest.processSample (0.0f);
+        ok (bitsEqual (fast.valueDb(), honest.valueDb()),
+            "the collapse crosses zero exactly as the honest loop does, range " + std::to_string (range2));
+        ok (fast.valueDb() > 0.0f, "precondition: the trajectory really did cross zero — it is a boost now");
+        // ...and further, in case the flip is one sample later at another range.
+        for (int more : { 1, 3, 9, 40 })
+        {
+            fast.advanceSilence (more);
+            for (int i = 0; i < more; ++i) (void) honest.processSample (0.0f);
+            if (! bitsEqual (fast.valueDb(), honest.valueDb()))
+                ok (false, "still equal after " + std::to_string (more) + " more, range " + std::to_string (range2));
+        }
+    }
+    ok (true, "the follower's branch survives a sign change under a constant target");
+}
+
 int main()
 {
     std::printf ("law 11c — a pause is silence\n");
@@ -1257,5 +1302,6 @@ int main()
     bypassedBandResidualIsOneChunk();
     counterWideningOnASettledBand();
     aRefusedBypassedChildIsReported();
+    theFollowerBranchIsPerSample();
     return felitronics::test::report();
 }
