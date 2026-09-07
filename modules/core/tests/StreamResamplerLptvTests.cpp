@@ -224,11 +224,15 @@ int main()
     // ------------------------------------------------------------------------------------------------
     group ("BLOCK SIZE — the cost is a property of the kernel, not of the caller's buffer");
     {
-        const double ref = coherentDb (roundTripGains (17640.0, H, M, 64, kSkip, kKeep));
+        // Compare BOTH statistics, not just the carrier: a crew mutation that flipped polarity left the
+        // coherent MAGNITUDE untouched, and |mean| alone cannot see a sign. The worst phase is a
+        // different functional of the same sequence, so the pair is harder to satisfy by accident.
+        const auto ref = roundTripGains (17640.0, H, M, 64, kSkip, kKeep);
         for (int b : { 1, 17, 63, 128, 512 })
         {
             const auto g = roundTripGains (17640.0, H, M, b, kSkip, kKeep);
-            approx (coherentDb (g), ref, 0.02, "block " + std::to_string (b) + ": same carrier as block 64");
+            approx (coherentDb (g), coherentDb (ref), 0.02, "block " + std::to_string (b) + ": same carrier as block 64");
+            approx (worstDb (g),    worstDb (ref),    0.02, "block " + std::to_string (b) + ": …and the same worst phase");
         }
     }
 
