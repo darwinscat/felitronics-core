@@ -20,17 +20,21 @@
 //     very modulation being measured.)
 //
 //  2. The round-trip gain at 44100/48000 = 147/160 is periodic with EXACTLY 147 output samples, and
-//     that is a closure proof, not an observation: stage 2 advances 160/147 per output, so 147 outputs
-//     advance it by exactly 160 — a whole number of stage-1 phase periods, since stage 1 advances
-//     147/160 and repeats every 160. Every phase pair the topology can make therefore occurs inside
-//     one period, so min/max over it are CEILINGS. Asserted by comparing the statistics over 147
-//     against those over 23520 (= lcm) and by falsifying every proper divisor of 147.
+//     that is a proof, not an observation: stage 2 advances 160/147 per output, so 147 outputs advance
+//     it by exactly 160 — a whole number of stage-1 phase periods, since stage 1 advances 147/160 and
+//     repeats every 160. Asserted by comparing the statistics over 147 against those over 23520
+//     (= lcm) and by falsifying every proper divisor of 147.
+//     🔴 What those 147 pairs are NOT is the full 160x147 product: the cascade traces a LINE through
+//     the two stages' phase torus, fixed by the shipped priming. The worst-phase column is still
+//     effectively a ceiling (0.02 dB off the worst over all 160 alignments at 17.64 kHz) but the
+//     coherent carrier is an interference term that belongs to the priming — see the CLOSURE group.
 //
 //  3. The DECIMATING direction has no stopband. At phase t = 0 the Catmull-Rom weights are (0,1,0,0) —
 //     a bare sample pick, which attenuates nothing at any frequency — so a tone above the output
-//     Nyquist survives at 0 dB peak and folds. This is asserted as a FACT ABOUT THE SHIPPED KERNEL, so
-//     that a future kernel with a real stopband fails the assertion loudly and has to update the
-//     document instead of silently inheriting its claims.
+//     Nyquist survives at −3 dB rms and 0 dB sample peak (an ENVELOPE figure: no single line exceeds
+//     −4.67 dB) and folds back as TWO components, 44100−g and g−3900, i.e. across 18.15–22.05 kHz.
+//     Asserted as a FACT ABOUT THE SHIPPED KERNEL, so that a future kernel with a real stopband fails
+//     loudly and has to update the document instead of silently inheriting its claims.
 //
 // A liveness precondition runs FIRST: the same instrument on the unity ratio must read 0.00 dB where
 // the header promises transparency. An instrument that cannot read zero cannot be trusted to read −4.
