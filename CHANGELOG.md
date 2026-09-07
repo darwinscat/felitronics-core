@@ -108,9 +108,12 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   new `felitronics_core_streamresampler_lptv_tests` (75 checks) pins the table, the period-147 closure,
   the 0 dB decimation peak and the criterion itself — the round trip adds **−8.84 dBc at 17.5 kHz**, and
   a `tanh` has to be driven to **`tanh(6.2x)`** (bisected) before its own folding reaches that, so below
-  a near-square-wave drive the rate-match is the LOUDER artifact, and the candidate comparison (a 32-tap polyphase sinc: flat −0.11 dB at
-  17.64 kHz with no modulation, 16–42 dB of stopband, +0.066 %RT per mono channel, 30.7 host samples of
-  delay against today's 3.84) is in the document for the product decision.
+  a near-square-wave drive the rate-match is the LOUDER artifact. The candidate comparison is in the
+  document for the product decision — including the part the two tone axes get wrong on their own: a
+  32-tap sinc flattens both axes and is still **5 dB worse in the bass** on real DI through a driven
+  capture, because its band edge feeds the same demodulation from a different cause. A 64-tap one at a
+  0.99 cutoff is better in every band at every drive, for **+2.5 %** of what the stage already spends on
+  the model and **61.4 host samples** of delay against today's 3.84.
 
 - **BREAKING (behaviour + latency), `oversampling`, `saturation`, `limiter`, `poweramp`:** **the shipped
   `tapsPerPhase` default rises from 32 to 64, and the reason is aliasing, not the pass band.**

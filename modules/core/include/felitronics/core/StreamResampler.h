@@ -57,9 +57,11 @@ namespace felitronics::core
 // do not, because the nonlinearity DEMODULATES the input leg's images into the audible range: a 20 kHz
 // tone at −18 dBFS into a high-gain capture comes back with a 100 Hz line at −17.7 dBFS, 14.5 dB
 // LOUDER than its own carrier, against −174.6 through an ideal round trip. Whether to change the kernel is a
-// product decision (it buys transparency with latency: a 32-tap polyphase sinc measures
-// −0.11 dB flat at 17.64 kHz with no modulation and 16–42 dB of stopband, for +0.066 %RT per mono
-// channel and 30.7 host samples of round-trip delay against today's 3.84). Full numbers, the
+// product decision, and it buys transparency with LATENCY: a 64-tap polyphase sinc at a 0.99 cutoff
+// measures 0.00 dB flat to 19 kHz with no modulation at all and is better than this kernel in EVERY
+// band on real DI through a driven capture, for +2.5 % of what the stage already spends on the model
+// and 61.4 host samples of delay against today's 3.84. A cheaper 32-tap one flattens the same two tone
+// axes but is 5 dB WORSE in the bass on program material — the cutoff decides this, not the taps. Full numbers, the
 // two-oracle protocol and the candidate table: docs/STREAM-RESAMPLER-COST.md.
 //
 // FAMILY SPLIT vs convolution::resampleIr: THAT is the OFFLINE Kaiser windowed-sinc (≥60 dB-class,

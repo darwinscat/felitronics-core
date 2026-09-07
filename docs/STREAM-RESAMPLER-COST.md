@@ -160,21 +160,50 @@ modulation without removing it:
 | kernel | 10 k | 15 k | 17.64 k | 19 k | 20 k | %RT (mono, both stages) | round-trip delay |
 |---|---|---|---|---|---|---|---|
 | shipped Catmull-Rom | −0.64/−1.16 | −2.59/−5.14 | −4.17/−9.27 | −4.98/−12.20 | −5.48/−14.79 | 0.0126 | **3.84 samples** |
-| L=16 P=256 | −0.00/−0.00 | −0.20/−0.20 | −2.30/−2.34 | −5.30/−5.44 | −8.86/−9.14 | 0.0372 | 15.36 |
-| L=32 P=256 | −0.00/−0.00 | 0.00/0.00 | **−0.11/−0.11** | −1.77/−1.77 | −6.10/−6.10 | 0.0790 | 30.71 |
-| L=64 P=512 | 0.00/0.00 | 0.00/0.00 | 0.00/0.00 | −0.03/−0.03 | −2.60/−2.60 | 0.1451 | 61.41 |
+| L=16, cutoff 0.94 | −0.00/−0.00 | −0.20/−0.20 | −2.30/−2.34 | −5.30/−5.44 | −8.86/−9.14 | 0.0372 | 15.36 |
+| L=32, cutoff 0.94 | −0.00/−0.00 | 0.00/0.00 | −0.11/−0.11 | −1.77/−1.77 | −6.10/−6.10 | 0.0790 | 30.71 |
+| **L=64, cutoff 0.99** | **−0.00/−0.00** | **0.00/−0.00** | **0.00/0.00** | **0.00/0.00** | **−0.01/−0.01** | 0.1549 | 61.41 |
+| L=96, cutoff 0.99 | −0.00/−0.00 | 0.00/−0.00 | −0.00/−0.00 | 0.00/0.00 | 0.00/0.00 | 0.2450 | 92.06 |
+
+UP-leg stopband (rms/peak, dB), since a wider passband buys its transparency with near-Nyquist
+rejection: L=32/0.94 gives −15.7 / −19.9 / −26.4 / −34.7 / −42.1 at 22.1 / 22.5 / 23 / 23.5 / 23.9 kHz;
+L=64/0.99 gives −9.1 / −15.4 / −27.5 / −47.6 / −88.8; L=96/0.99 gives −11.0 / −22.9 / −52.6 / −88.1 /
+−89.9. Against the shipped −3 dB flat, any of them is a different order of thing.
+
+### 🔴 The two tone axes do NOT decide this — program material does
+
+The obvious pick from the table is the cheapest kernel that flattens both axes, i.e. L=32. On real DI
+through a driven capture it is **not a clean win**. Rendered through the same model against the same
+ideal reference, with the LTI part (the kernel's own band edge — a deliberate design choice) separated
+from the residual, error over ideal output per band:
+
+| kernel | drive | 0–1 k | 1–4 k | 4–8 k | 8–12 k | 12–16 k | 16–19 k | 19–22 k |
+|---|---|---|---|---|---|---|---|---|
+| shipped Catmull | 0 dB | −53.21 | −45.38 | −33.86 | −24.86 | −18.26 | −14.65 | −9.13 |
+| L=32, cutoff 0.94 | 0 dB | **−48.47** | **−42.41** | −33.98 | −27.61 | −20.93 | −14.11 | −12.42 |
+| **L=64, cutoff 0.99** | 0 dB | **−53.97** | **−48.01** | **−39.63** | **−33.18** | **−26.50** | **−19.34** | **−13.70** |
+
+L=32 at a 0.94 cutoff is **5 dB WORSE in the bass** than the kernel it would replace: its band edge sits
+at 20.7 kHz and removes content the reference keeps, and the driven model converts that difference into
+low frequencies by exactly the mechanism of §4 — the same demodulation from a different cause. Widen the
+cutoff to 0.99 and lengthen the kernel to keep a stopband, and it is better in **every band at every
+drive** (checked at −24, 0 and +18 dB).
+
+**So the cutoff is the deciding variable here, not the tap count** — the same axis P31 has open for the
+oversampler. A candidate judged on the two tone axes alone picks the wrong one.
 
 The %RT column above is one machine (Apple Silicon, Apple clang); absolute figures do not travel, so
 what matters is the fraction. Measured on two, with the same standard WaveNet capture at 44.1 kHz:
 
-| machine | whole `NamStage` (model included) | shipped resampler | 32-tap sinc | what the swap costs |
+| machine | whole `NamStage` (model included) | shipped resampler | 32-tap sinc | what that swap costs |
 |---|---|---|---|---|
 | arm64, Apple clang | 5.3–6.1 %RT mono | 0.0126 | 0.0790 | **+1.2 %** of the stage |
 | x86-64 i9, gcc 14.2 | 11.0–11.6 %RT mono | 0.0515 | 0.1952 | **+1.3 %** of the stage |
 
-The two-axis, stopband and delay numbers are identical on both toolchains to the digits printed here. The price is latency: 30.7 host samples (0.70 ms) against today's 3.84
-(0.087 ms). The 19–20 kHz roll-off of the sinc candidates is a chosen cutoff (0.94 of the lower
-Nyquist), not a property of the kernel.
+The two-axis, stopband and delay numbers are identical on both toolchains to the digits printed here.
+The recommended L=64 / 0.99 costs **0.1549 %RT** on the same Mac, i.e. **+2.5 %** of what the stage
+already spends on the model — and **61.4 host samples, 1.39 ms**, against today's 3.84 samples
+(0.087 ms). That latency is the whole price, and it is the part only Oleh can weigh.
 
 `rigplayer` consequences, checked in the code rather than assumed: slot alignment runs on
 `AlignmentTable::delayOf()` → `blendDelay()` / `lagTail_`, and **none of them reads
