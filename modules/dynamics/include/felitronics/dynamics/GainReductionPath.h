@@ -119,9 +119,13 @@ public:
     // is the SAME NUMBER for the rest of the pause: compute it once and hand it to the follower, which
     // still picks its own attack/release branch per sample. The level cannot climb back out on its own
     // (the silent recurrence is `env *= c`, non-increasing for `c` in [0,1]), so the phase boundary is
-    // crossed once and never re-crossed. Measured at 48 kHz, the expensive phase is 3.5-19x shorter than
-    // the settling horizon behind it: 6 632 samples against 23 609 at a 5 ms window, 132 625 against
-    // 457 808 at 100 ms, 1 324 481 against 4 461 677 at 1 s.
+    // crossed once and never re-crossed. Measured at 48 kHz ON THE DETECTOR THIS PATH ACTUALLY RUNS, the
+    // expensive phase is ~1.75x shorter than the settling horizon behind it: 13 046 samples against
+    // 23 393 at a 5 ms Rms window, 255 745 against 448 304 at 100 ms, 2 452 365 against 4 265 082 at 1 s.
+    // In PEAK mode phase 1 is ONE step, because `LinkedDetector` makes Peak instant (times 0, 0).
+    // An earlier draft said "3.5-19x" here. Those digits are real but they belong to a Peak follower WITH
+    // a release, which this path never has — its Peak is instant and its Rms is symmetric on the POWER,
+    // which halves the crossing. The 19 was two horizons divided by each other and meant nothing at all.
     void advanceSilence (int n) noexcept
     {
         int i = 0;

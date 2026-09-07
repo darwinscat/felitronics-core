@@ -23,8 +23,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     through a pause stayed wide open, and a -54 dBFS tone on the return came out at -54 where silence
     gates it to -144 — **89.99 dB, 100 % of the construction ceiling.** All of those are now 0.00 dB.
   - **Seven addresses, chosen by MECHANISM.** The five above, plus `dynamiceq::LaneDynamics` (which
-    deliberately DISENGAGED — the "dynamics were switched off" verb, not the "time passed" one; its lanes
-    now run the control loop at width zero) and `poweramp::PowerAmpStage`, whose one shared sag supply
+    deliberately DISENGAGED — the "dynamics were switched off" verb, not the "time passed" one; at width
+    zero its STEREO lane now runs the control loop on silence, while L/R/M/S take the same "this lane
+    stopped" branch they take at width one, because `laneRuns()` gates them on `nc == 2`) and
+    `poweramp::PowerAmpStage`, whose one shared sag supply
     and thirteen block-rate glides stopped dead on a gap. `multiband::MultibandProcessor` forwards a gap
     to every band exactly once — it used to forward it TWICE to a bypassed band, invisible under freeze
     and a double clock under this law.
@@ -38,6 +40,11 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     `NoiseGate` now drops a stopped lane's sidechain high-pass (law 11a, which it never had — worth
     **89.99 dB** on a narrowing as well as on a gap), and `MultibandProcessor` no longer hands a bypassed
     band a row of NULL planes on a narrowing call, **which was a segfault, not a wrong number**.
+  - **Two contract changes at width zero**, both consequences of "a pause is the same call carrying
+    silence" and both tested: a `GainReductionTap` handed to `Compressor::process` is now FILLED on a
+    zero-width call where it used to be left untouched, and an external key handed to the same call is now
+    DEREFERENCED where it previously read nothing — so a key passed at width zero must be valid for `n`
+    samples, exactly as at any other width.
   - **Cost.** The silent recurrence is autonomous, so it reaches a bitwise fixed point and the rest of the
     pause is free; and once the detector level reaches `core::kGainToDbFloor` the curve's output is a
     constant, so the per-sample work collapses to one multiply-add. Three of the seven have no such floor

@@ -1274,6 +1274,127 @@ static void theFollowerBranchIsPerSample()
     ok (true, "the follower's branch survives a sign change under a constant target");
 }
 
+// (j) THE GATE'S EXIT PREDICATE HAS FIVE TERMS, AND THREE OF THEM WERE NEVER EXERCISED. The silent loop
+//     stops when the envelope, the VCA gain, the enable ramp, the HOLD COUNTER and the open flag all
+//     stand still; drop any one and the loop can exit while that one is still moving. Two of the three
+//     untested drops cost 90 dB under ordinary configuration, and neither is reachable from the settings
+//     the group above uses.
+static void theGatesExitPredicateNeedsAllOfIt()
+{
+    group ("law 11c — NoiseGate: the pause does not exit while the HOLD counter is still running");
+    // A HOLD LONGER THAN THE DETECTOR'S PARK. At holdMs 1500 against a 20 ms release the envelope
+    // reaches its fixed point around 31 000 samples while `hold` still has ~40 000 to count — so a
+    // predicate that ignores `hold` sees a settled state and exits on the FIRST step of every call,
+    // which makes the hold expire once per call instead of once per sample. Measured on that mutation:
+    // the gap leaves the gate wide open at 1.0 where silence closes it to 3.16e-5, i.e. 90.00 dB.
+    const int B = 128, gap = 120000;
+    dynamics::NoiseGate::Config cfg;
+    cfg.floorDb = -90.0f; cfg.envAttackMs = 1.0f; cfg.envReleaseMs = 20.0f;
+    cfg.holdMs = 1500.0f; cfg.closeMs = 100.0f; cfg.sidechainHpHz = 4000.0f;
+    dynamics::NoiseGate A, Bg;
+    if (! (A.prepare (kFs, B, 2) && Bg.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    A.setConfig (cfg); Bg.setConfig (cfg); A.seedEnabled (true); Bg.seedEnabled (true);
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+    for (int k = 0; k < 24; ++k)
+    {
+        fillTone (l, k * B, 500.0, 0.8f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B, true, -40.0f));
+        fillTone (l, k * B, 500.0, 0.8f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bg.process (jo, 2, B, true, -40.0f));
+    }
+    for (int k = 0; k < 2; ++k)   // lanes to rest (4 kHz corner — see the group above)
+    {
+        std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f);
+        float* io[2] = { z1.data(), z2.data() }; run (A.process (io, 2, B, true, -40.0f));
+        std::vector<float> w1 ((std::size_t) B, 0.0f), w2 ((std::size_t) B, 0.0f);
+        float* jo[2] = { w1.data(), w2.data() }; run (Bg.process (jo, 2, B, true, -40.0f));
+    }
+    ok (A.currentCoreGain() > 0.5f, "precondition: the gate is open, and its hold outlives the detector's park");
+    for (int off = 0; off < gap; off += B)
+    {
+        const int n = std::min (B, gap - off);
+        float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, n, true, -40.0f));
+        std::vector<float> z1 ((std::size_t) n, 0.0f), z2 ((std::size_t) n, 0.0f);
+        float* jo[2] = { z1.data(), z2.data() }; run (Bg.process (jo, 2, n, true, -40.0f));
+    }
+    ok (bitsEqual (A.currentCoreGain(), Bg.currentCoreGain()), "the hold counts the gap's samples, not its calls");
+    ok (A.currentCoreGain() < 0.5f, "precondition: the hold DID expire inside the pause — the state moved");
+
+    group ("law 11c — NoiseGate: the enable ramp advances per sample through a pause, not per call");
+    // `on` TOGGLED DURING THE PAUSE, from a state where everything else has already parked. The enable
+    // crossfade is then the only thing still moving, so a predicate that ignores it exits immediately
+    // and the ramp advances one step per CALL. Measured on that mutation: 0.0159 against 1.0.
+    dynamics::NoiseGate C, D;
+    if (! (C.prepare (kFs, B, 2) && D.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    dynamics::NoiseGate::Config c2 = cfg; c2.holdMs = 5.0f; c2.enableMs = 25.0f;
+    C.setConfig (c2); D.setConfig (c2); C.seedEnabled (true); D.seedEnabled (true);
+    for (int k = 0; k < 24; ++k)
+    {
+        fillTone (l, k * B, 500.0, 0.8f); r = l; float* io[2] = { l.data(), r.data() }; run (C.process (io, 2, B, true, -40.0f));
+        fillTone (l, k * B, 500.0, 0.8f); r = l; float* jo[2] = { l.data(), r.data() }; run (D.process (jo, 2, B, true, -40.0f));
+    }
+    for (int off = 0; off < 60000; off += B)   // settle everything with the gate ON
+    {
+        const int n = std::min (B, 60000 - off);
+        float* io[2] = { nullptr, nullptr }; run (C.process (io, 0, n, true, -40.0f));
+        std::vector<float> z1 ((std::size_t) n, 0.0f), z2 ((std::size_t) n, 0.0f);
+        float* jo[2] = { z1.data(), z2.data() }; run (D.process (jo, 2, n, true, -40.0f));
+    }
+    ok (C.currentGain() < 0.5f, "precondition: the gate is closed and everything else has parked");
+    for (int off = 0; off < 4800; off += B)    // ...and NOW switch it off, mid-pause
+    {
+        const int n = std::min (B, 4800 - off);
+        float* io[2] = { nullptr, nullptr }; run (C.process (io, 0, n, false, -40.0f));
+        std::vector<float> z1 ((std::size_t) n, 0.0f), z2 ((std::size_t) n, 0.0f);
+        float* jo[2] = { z1.data(), z2.data() }; run (D.process (jo, 2, n, false, -40.0f));
+    }
+    ok (bitsEqual (C.currentGain(), D.currentGain()), "the enable ramp counts the gap's samples, not its calls");
+    ok (C.currentGain() > 0.5f, "precondition: the ramp DID travel inside the pause — the state moved");
+}
+
+// (k) THE GAIN-REDUCTION TAP AT WIDTH ZERO. On the base a zero-width call left the tap untouched; it is
+//     filled now, because the tap is a per-SAMPLE observable and a silent block of any width fills it
+//     sample by sample. That is a contract change, so it gets a test rather than a sentence — and the
+//     KEY is linked here rather than duplicated across channels, so the link is visible too.
+static void theTapAndTheKeyAtWidthZero()
+{
+    group ("law 11c — Compressor: the gain-reduction tap is filled at width zero, and the key is LINKED");
+    const int B = 128;
+    dynamics::CompressorParams p;
+    p.thresholdDb = -40.0; p.ratio = 4.0; p.kneeDb = 0.0; p.attackMs = 1.0; p.releaseMs = 250.0;
+    p.link = dynamics::LinkMode::Max;
+    dynamics::Compressor A, Bc;
+    if (! (A.prepare (kFs, B, 2) && Bc.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
+    A.setParams (p); Bc.setParams (p);
+    std::vector<float> l ((std::size_t) B), r ((std::size_t) B), k1 ((std::size_t) B), k2 ((std::size_t) B);
+    for (int blk = 0; blk < 8; ++blk)
+    {
+        fillTone (l, blk * B, 300.0, 0.9f); r = l;
+        float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
+        fillTone (l, blk * B, 300.0, 0.9f); r = l;
+        float* jo[2] = { l.data(), r.data() }; run (Bc.process (jo, 2, B));
+    }
+    // THE TWO KEY CHANNELS DIFFER, and the loud one is channel 1. A `Max` link must see it; a width-0
+    // path that read only `key[0]` would follow the quiet channel and never notice.
+    std::fill (k1.begin(), k1.end(), 0.0f);
+    fillTone (k2, 0, 300.0, 0.9f);
+    const float* key[2] = { k1.data(), k2.data() };
+    std::vector<float> tapA ((std::size_t) B, 12345.0f), tapB ((std::size_t) B, 12345.0f);
+    { float* io[2] = { nullptr, nullptr };
+      run (A.process (io, 0, B, key, 2, dynamics::GainReductionTap { tapA.data(), B })); }
+    { std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f); float* jo[2] = { z1.data(), z2.data() };
+      run (Bc.process (jo, 2, B, key, 2, dynamics::GainReductionTap { tapB.data(), B })); }
+    bool same = true, written = true, varies = false;
+    for (int i = 0; i < B; ++i)
+    {
+        same    = same && bitsEqual (tapA[(std::size_t) i], tapB[(std::size_t) i]);
+        written = written && ! bitsEqual (tapA[(std::size_t) i], 12345.0f);
+        varies  = varies || ! bitsEqual (tapA[(std::size_t) i], tapA[0]);
+    }
+    ok (written, "the tap is WRITTEN at width zero — every slot, not just the first");
+    ok (same, "and it holds the same samples a silent block of the same length would write");
+    ok (varies, "precondition: the tap carries a per-sample trajectory, not one repeated number");
+    ok (bitsEqual ((float) A.gainReductionDb(), (float) Bc.gainReductionDb()), "and the meter agrees");
+}
+
 int main()
 {
     std::printf ("law 11c — a pause is silence\n");
@@ -1303,5 +1424,7 @@ int main()
     counterWideningOnASettledBand();
     aRefusedBypassedChildIsReported();
     theFollowerBranchIsPerSample();
+    theGatesExitPredicateNeedsAllOfIt();
+    theTapAndTheKeyAtWidthZero();
     return felitronics::test::report();
 }
