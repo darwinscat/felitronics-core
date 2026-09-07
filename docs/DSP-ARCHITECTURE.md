@@ -383,8 +383,19 @@ the CPU at runtime, invisible to any build. Full write-up:
    PROGRAMME is what stopped, not the key, and `process(zeros, nch, n, key, nk)` runs the detector on the
    key, so a pause that ignored it would differ from the silence it is defined to equal.
 
-   **THE COST IS BOUNDED BY THE BALLISTICS, NOT BY THE PAUSE.** The silent recurrence is AUTONOMOUS, so it
-   reaches a bitwise fixed point and everything past that point is free; and once the detector level
+   **THE COST IS BOUNDED BY THE BALLISTICS AND BY THE CALL, NOT BY THE PAUSE — and "free past the fixed
+   point" is true of the collapsing path only.** Say the whole of it, because the short version is wrong
+   for three of the seven: `TransientShaper`, `NoiseGate` and `LaneDynamics` have no dB floor to collapse
+   against and run their full per-sample body until they park. Measured at 48 kHz, ONE zero-width call
+   covering a full minute (2 880 000 samples): `Compressor` **1.49 ms** (it collapses), `NoiseGate`
+   **0.20 ms**, `TransientShaper` **3.65 ms**, `DeEsser` **4.08 ms**, `DynamicEqBand` **6.43 ms** — three
+   of which are past a 128-sample callback's 2.67 ms budget. That is a statement about ONE CALL carrying a
+   minute, which is an offline shape: the same minute delivered the way a host delivers it, 128 samples at
+   a time, costs at most **0.00304 ms** in its worst single call, 880x inside the budget, because the
+   fixed point is reached in the first few calls and every later one exits on its first step. An RT caller
+   is safe; an offline caller that hands a whole transport jump as one call pays the numbers above once.
+   The silent recurrence is AUTONOMOUS, so it reaches a bitwise fixed point and everything past that point
+   is free; and once the detector level
    reaches `core::kGainToDbFloor` the dB conversion returns the same bits for every smaller level, so the
    curve's output is a constant and the per-sample work collapses to one multiply-add. `pow(c, n)` is
    deliberately NOT used: it is a different number from `n` rounded multiplications, and it would buy

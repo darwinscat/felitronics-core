@@ -22,9 +22,10 @@ inline double dbToGain (double dB)   noexcept { return std::pow (10.0, dB / 20.0
 // and the whole static curve behind it — returns the SAME BITS for every smaller level. A constant
 // sitting BESIDE the function instead of inside it would pin nothing: the two could drift apart in
 // silence, which is exactly what a diff round caught here. The guard against lowering it is a RUNTIME
-// test (`felitronics_core_tests`, "the gainToDb floor"), not a static_assert: `std::log10` is not
-// portably constexpr in C++20 — it is not on the MSVC row — so a compile-time assertion could only pin
-// the constant and never that the function still uses it.
+// test — `felitronics_pause_is_silence_tests`, the group "law 11c premise — gainToDb's floor is where
+// the collapse thinks it is" — and not a static_assert: `std::log10` is not portably constexpr in C++20
+// (it is not on the MSVC row), so a compile-time assertion could only pin the constant and never that
+// the function still uses it.
 inline constexpr double kGainToDbFloor = 1.0e-12;
 inline double gainToDb (double gain) noexcept { return 20.0 * std::log10 (gain > kGainToDbFloor ? gain : kGainToDbFloor); }
 

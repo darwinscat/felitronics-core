@@ -40,7 +40,12 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     band a row of NULL planes on a narrowing call, **which was a segfault, not a wrong number**.
   - **Cost.** The silent recurrence is autonomous, so it reaches a bitwise fixed point and the rest of the
     pause is free; and once the detector level reaches `core::kGainToDbFloor` the curve's output is a
-    constant, so the per-sample work collapses to one multiply-add. `pow(c, n)` is deliberately not used —
+    constant, so the per-sample work collapses to one multiply-add. Three of the seven have no such floor
+    and run their full body until they park: one zero-width call covering a MINUTE costs `Compressor`
+    1.49 ms, `NoiseGate` 0.20, `TransientShaper` 3.65, `DeEsser` 4.08 and `DynamicEqBand` 6.43 — against a
+    2.67 ms callback budget. The same minute delivered as 128-sample calls costs **0.00304 ms** in its
+    worst call, so an RT caller is unaffected and an offline caller that hands a whole transport jump as
+    one call pays it once. `pow(c, n)` is deliberately not used —
     it is a different number from `n` rounded multiplications. The horizon is a property of the TIME
     CONSTANT, not of the pause: 23 609 samples at a 5 ms release, 457 808 at 100 ms, 4 461 677 at 1 s, and
     not reached in 200 000 000 at the coefficient cap.

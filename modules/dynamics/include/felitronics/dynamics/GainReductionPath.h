@@ -125,10 +125,15 @@ public:
     void advanceSilence (int n) noexcept
     {
         int i = 0;
-        // THE PREDICATE IS SPELLED IN DOUBLE because `gainToDb`'s clamp is: it tests
-        // `gain > 1.0e-12` on the float level PROMOTED to double. Comparing against `(float) 1e-12`
-        // instead is a different threshold — the two straddle a band of levels for which the honest
-        // path still takes the log and this one would have declared the target frozen.
+        // THE PREDICATE IS SPELLED IN DOUBLE because `gainToDb`'s clamp is: it tests `gain > 1.0e-12`
+        // on the float level PROMOTED to double, and this is the same test on the same value.
+        // BE HONEST ABOUT WHAT THAT BUYS, because the first version of this comment overstated it: it
+        // claimed the two spellings straddle a band of levels, and they do not. `(float) 1e-12` is
+        // 9.99999996e-13, BELOW the clamp, so no float at all separates `(double) x > 1e-12` from
+        // `x > (float) 1e-12` — the float spelling merely runs a few more honest iterations before it
+        // stops, and is equally correct. The cast is kept because it makes the predicate the clamp's own
+        // test rather than one that happens to agree; it is not load-bearing, and a mutation of it is an
+        // equivalent mutant, which is how the stand classifies it.
         for (; i < n && (double) det_.level() > core::kGainToDbFloor; ++i)
         {
             const float e0 = det_.stateWord(), g0 = grf_.valueDb();

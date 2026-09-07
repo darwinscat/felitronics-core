@@ -64,6 +64,14 @@ bool bitsEqual (double a, double b) noexcept { return std::memcmp (&a, &b, sizeo
 // such a length would hide.
 const int kGaps[] = { 1, 2, 7, 15, 16, 17, 31, 63, 64, 65, 127, 480, 1000, 4801, 48000 };
 
+// The collapse's own list adds the interval BETWEEN the two events that bound it: with a 5 ms Rms window
+// the detector level crosses `kGainToDbFloor` at about 13 200 samples and the recurrence parks at about
+// 23 609, and phase 2 is the stretch in between. `kGaps` jumps 4 801 -> 48 000 straight over it, so a
+// silent loop that stopped one sample early was invisible: in Peak mode the level reaches zero in a
+// single step, and by 48 000 both runs are long since parked on the same word.
+const int kGapsCollapse[] = { 1, 2, 7, 15, 16, 17, 31, 63, 64, 65, 127, 480, 1000, 4801,
+                              14000, 16000, 20000, 23000, 48000 };
+
 // BRING A STAGE'S PER-CHANNEL PATH TO EXACT REST by feeding it real digital silence until its output is
 // bit-zero on every sample of a whole block. It has to be MEASURED, not counted: the fixture's first
 // version drained a fixed four blocks, which is enough for a band that CUTS and not for the same band
@@ -283,13 +291,27 @@ static void shaperInvariant()
 static void gateInvariant()
 {
     group ("law 11c — dynamics::NoiseGate: a gap equals silence of the same length");
-    for (int gap : kGaps)
+    // THE GATE'S OWN GAP LIST. `kGaps` is blind here: with a 20 ms detector release and a -40 dB
+    // threshold the gate closes at about 4 858 samples and reaches the floor by about 19 300, so every
+    // kGaps point sits either side of the only window where `coreGain` carries information — 28 of the
+    // 30 configurations passed against a gate that was never given the gap at all. These four are inside
+    // that window, and they are what makes a one-sample-early exit from the silent loop visible.
+    const int gaps[] = { 1, 7, 17, 63, 127, 480, 4801, 5200, 6000, 8000, 12000, 19000, 48000 };
+    for (int gap : gaps)
         for (bool on : { true, false })
         {
             const int B = 128;
             dynamics::NoiseGate::Config cfg;
             cfg.floorDb = -90.0f; cfg.envAttackMs = 1.0f; cfg.envReleaseMs = 20.0f;
             cfg.holdMs = 5.0f; cfg.closeMs = 300.0f;
+            // A HIGH sidechain high-pass corner, and it is the fixture's hardest constraint rather than a
+            // detail. The lanes have to reach EXACT rest before the pause (they sit upstream of the
+            // shared detector, and the gap drops them while silence rings them down) — but at the shipped
+            // 75 Hz that one-pole needs ~3 200 samples to underflow, which is 67 ms, and the gate's own
+            // 20 ms release closes long before then. At 4 kHz the lane empties inside a single block and
+            // the gate is still open, which is the only state in which both halves of this test are true
+            // at once. The shipped corner is exercised by the 11a group below, where it belongs.
+            cfg.sidechainHpHz = 4000.0f;
             dynamics::NoiseGate A, Bg;
             if (! (A.prepare (kFs, B, 2) && Bg.prepare (kFs, B, 2))) { ok (false, "prepare"); return; }
             A.setConfig (cfg); Bg.setConfig (cfg); A.seedEnabled (true); Bg.seedEnabled (true);
@@ -300,6 +322,20 @@ static void gateInvariant()
                 fillTone (l, k * B, 500.0, 0.8f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bg.process (jo, 2, B, true, -40.0f));
             }
             ok (A.currentCoreGain() > 0.5f, "precondition: the gate is OPEN before the pause");
+            // ...AND THE LANES BROUGHT TO REST. The sidechain high-pass is per-channel and sits UPSTREAM
+            // of the shared detector: the width-2 run rings it down from h0 ~ 0.117 while the width-0 run
+            // DROPS it, so without this the two disagree about law 11a and not about law 11c — measured,
+            // -0.119 dB on `currentCoreGain` at a 5 200-sample gap. The blind grid above is what hid it.
+            {
+                for (int k = 0; k < 2; ++k)
+                {
+                    std::vector<float> z1 ((std::size_t) B, 0.0f), z2 ((std::size_t) B, 0.0f);
+                    float* io[2] = { z1.data(), z2.data() }; run (A.process (io, 2, B, true, -40.0f));
+                    std::vector<float> w1 ((std::size_t) B, 0.0f), w2 ((std::size_t) B, 0.0f);
+                    float* jo[2] = { w1.data(), w2.data() }; run (Bg.process (jo, 2, B, true, -40.0f));
+                }
+                ok (A.currentCoreGain() > 0.5f, "precondition: the gate is STILL open after the drain");
+            }
             for (int off = 0; off < gap; )
             {
                 const int n = std::min (B, gap - off);
@@ -317,7 +353,9 @@ static void gateInvariant()
             run (A.process (ai, 2, B, on, -40.0f)); run (Bg.process (bi, 2, B, on, -40.0f));
             bool same = true; for (int i = 0; i < B; ++i) same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
             if (! same) ok (false, "the quiet return is bit-identical, gap " + std::to_string (gap));
-            if (gap >= 48000 && on) ok (A.currentCoreGain() < 0.5f, "precondition: a long pause CLOSED the gate — the state moved");
+            if (gap >= 19000 && on) ok (A.currentCoreGain() < 0.5f, "precondition: a long pause CLOSED the gate — the state moved");
+            if (gap == 6000 && on) ok (A.currentCoreGain() > 0.001f && A.currentCoreGain() < 0.999f,
+                                       "precondition: a 6 000-sample gap lands MID-CLOSE, where the observable is alive");
         }
     ok (true, "NoiseGate: gap == silence over every gap length and both enable states");
 }
@@ -976,6 +1014,48 @@ static void thePauseLeavesNoSubnormal()
     ok (bitsEqual (A.dynamicDeltaDb(), 0.0), "the delta is exactly 0.0 after the pause, bit for bit");
 }
 
+// The same law-8 observable one storey up, on the two stages that publish a number the flush reaches.
+// A pause that skipped its once-per-call flush leaves the follower parked on a SUBNORMAL instead of on
+// zero; past the horizon these meters must read exactly +0.0. `TransientShaper` and `NoiseGate` have no
+// equivalent window — their parked state is the detector's, which neither publishes — and that is stated
+// here rather than left as an untested claim.
+static void theGapFlushesWhereItCanBeSeen()
+{
+    group ("law 8 through law 11c — the meters read exactly +0.0 after a pause, not a subnormal");
+    const int B = 128;
+    {
+        dynamics::CompressorParams p;
+        p.thresholdDb = -40.0; p.ratio = 4.0; p.kneeDb = 0.0; p.attackMs = 1.0; p.releaseMs = 5.0;
+        dynamics::Compressor c;
+        if (! c.prepare (kFs, B, 2)) { ok (false, "prepare"); return; }
+        c.setParams (p);
+        std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+        for (int k = 0; k < 8; ++k) { fillTone (l, k * B, 300.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (c.process (io, 2, B)); }
+        ok (std::fabs (c.gainReductionDb()) > 1.0, "precondition: the compressor is holding gain reduction");
+        { float* io[2] = { nullptr, nullptr }; run (c.process (io, 0, 200000)); }
+        ok (bitsEqual ((float) c.gainReductionDb(), 0.0f), "Compressor: the meter is exactly +0.0 after the pause");
+    }
+    {
+        deesser::DeEsserParams p;
+        p.mode = deesser::DeEsserMode::SplitBand; p.fc = 7000.0; p.thresholdDb = -40.0;
+        p.ratio = 6.0; p.rangeDb = 12.0; p.attackMs = 1.0; p.releaseMs = 5.0;
+        deesser::DeEsser d;
+        if (! d.prepare (kFs, B, 2)) { ok (false, "prepare"); return; }
+        d.setParams (p);
+        std::vector<float> l ((std::size_t) B), r ((std::size_t) B);
+        for (int k = 0; k < 8; ++k) { fillTone (l, k * B, 7000.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (d.process (io, 2, B)); }
+        ok (std::fabs (d.gainReductionDb()) > 0.3, "precondition: the de-esser is holding gain reduction");
+        // TWO pauses, and the second is the one that reads. This stage publishes its meter from INSIDE
+        // the loop, before the once-per-call flush, so after a single pause it holds the parked subnormal
+        // — and so would a silent block, which is the whole claim. What the flush buys is that the NEXT
+        // call starts from a real zero: a second pause writes `0 + c*(0 - 0)` and reads exactly +0.0,
+        // where an unflushed follower would carry its subnormal straight through.
+        { float* io[2] = { nullptr, nullptr }; run (d.process (io, 0, 200000)); }
+        { float* io[2] = { nullptr, nullptr }; run (d.process (io, 0, 1)); }
+        ok (bitsEqual ((float) d.gainReductionDb(), 0.0f), "DeEsser: the meter is exactly +0.0 after the pause");
+    }
+}
+
 static void aPoisonedStateSurvivesAPause()
 {
     group ("law 11c — a NaN reaching a stage before a pause does not survive it, and does not hang it");
@@ -1056,9 +1136,15 @@ static void bypassedBandResidualIsOneChunk()
                                                  float* jo[2] = { z1.data(), z2.data() }; run (Bm.process (jo, 2, std::min (B, 48000 - off))); } }
     ok (bitsEqual ((float) Bm.bandGainReductionDb (1), (float) before),
         "live-width silence leaves a bypassed band FROZEN — that is what bypass means today");
-    const double residual = std::fabs (A.bandGainReductionDb (1) - before);
-    ok (residual > 0.0 && residual < 0.05 * std::fabs (before),
-        "a gap moves it by one chunk only: " + std::to_string (residual) + " dB of " + std::to_string (std::fabs (before)));
+    // THE ORACLE IS THE RECURRENCE, not a percentage window. A 5 % window accepts TWO chunks as easily
+    // as one — at a 400 ms release two chunks move the reduction by 0.66 % — so it would pass against a
+    // composite that clocked the bypassed band for the whole gap. `B` float steps of the follower's own
+    // release, computed here from the parameters, is what one chunk actually is.
+    const float c = (float) std::exp (-1.0 / (0.4 * kFs));       // releaseMs 400, the follower's coeff
+    float expect = (float) before;
+    for (int i = 0; i < B; ++i) expect = 0.0f + c * (expect - 0.0f);
+    ok (bitsEqual ((float) A.bandGainReductionDb (1), expect),
+        "a gap moves a bypassed band by exactly ONE chunk of release, bit for bit");
 }
 
 // (g) THE COUNTER'S WIDENING, at the only length that can see it. `ksamp_ + rem` in `int` overflows only
@@ -1165,6 +1251,7 @@ int main()
     coefficientWriteLandsInTheRemainder();
     thePauseFlushes();
     thePauseLeavesNoSubnormal();
+    theGapFlushesWhereItCanBeSeen();
     aPoisonedStateSurvivesAPause();
     multibandDoubleClockAtZeroWidth();
     bypassedBandResidualIsOneChunk();
