@@ -169,3 +169,19 @@ outward. So a kernel change moves the absolute PDC and nothing else inside the p
 both slots take the same delay. `AlignmentTable::measureAlignment()` takes the rate as an argument
 and defaults to 48 kHz, where the resampler is bypassed entirely; called at another rate it still
 measures the same processed samples.
+
+## 6. What is gated and what is only recorded here
+
+`felitronics_core_streamresampler_lptv_tests` pins, so a kernel change has to come and edit this
+document: the whole carrier / worst-phase / best-phase table, the period-147 closure and its
+minimality, block independence, the exact produced count, `produceExact`'s silence padding, all five
+decimation rows, where a 23 kHz tone lands (both components), and the criterion — the round trip adds
+−8.84 dBc at 17.5 kHz and a `tanh` has to be driven to `tanh(8x)` before its own folding reaches that.
+`felitronics_nam_tests` pins the same carriers through the real `NamStage` plumbing, and the
+round-trip delay measured two ways (impulse onset for the integer, carrier phase for the fraction).
+
+Not gated, because it needs material that cannot ship in a repository — real captures and a real
+performance: everything in §4 above (the program-material error levels, the model's own aliasing
+floor per capture, the drive sweep, the demodulated bass line), and the candidate table in §5, which
+measures a kernel that is not in the tree. Those are reproducible from the protocol but nothing will
+tell you when they rot; treat them as dated measurements, not invariants.
