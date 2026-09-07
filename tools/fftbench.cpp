@@ -116,8 +116,11 @@ static double benchNU (int irLen, int P0, int Bmax, int block, double fs, double
     {
         std::memcpy (L.data(), inL.data(), (std::size_t) block * sizeof (float));
         std::memcpy (R.data(), inR.data(), (std::size_t) block * sizeof (float));
-        l.process (L.data(), L.data(), block);
-        r.process (R.data(), R.data(), block);
+        if (! l.process (L.data(), L.data(), block) || ! r.process (R.data(), R.data(), block))
+        {   // a refused call costs nothing, and timing a no-op would report a meaningless number
+            std::fprintf (stderr, "convolver refused a block — the timing below would be meaningless\n");
+            std::exit (1);
+        }
     };
 
     for (int i = 0, w = (int) (warmSec * fs / block); i < w; ++i) once();   // pass the cold prime + warm caches
