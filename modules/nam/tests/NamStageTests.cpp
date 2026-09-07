@@ -473,9 +473,36 @@ int main()
         }
 
         // The right lane must rate-match too: a mutation that left instance 1's resamplers at the
-        // identity ratio passed everything, because nothing measured the stereo delay.
+        // identity ratio passed everything, because nothing measured the stereo delay. Phase ALONE is
+        // not enough there either — it is periodic, so an extra whole tone period on the right lane
+        // would be invisible exactly as it was on the left. Both instruments, both lanes.
         test::approx (phaseDelay (44100.0, 64, 2), 3.8375, 0.05,
-                      "the RIGHT channel of a stereo call has the same measured delay as the left");
+                      "the RIGHT channel of a stereo call has the same measured phase delay as the left");
+        {
+            nam::NamStage st;
+            st.prepare (44100.0, 64);
+            const auto json = gainModel();
+            test::ok (load (st, json), "model loads for the stereo onset");
+            st.prepare (44100.0, 64);
+            const int at = 4000;
+            int peakR = -1; double pv = 0.0; int idx = 0;
+            std::vector<float> l (64, 0.0f), r (64, 0.0f);
+            for (int off = 0; off < at + 4096; off += 64)
+            {
+                for (int i = 0; i < 64; ++i)
+                { l[(std::size_t) i] = 0.0f; r[(std::size_t) i] = ((off + i) == at) ? 1.0f : 0.0f; }
+                float* io[2] { l.data(), r.data() };
+                felitronics::test::run (st.process (io, 2, 64, false));
+                for (int i = 0; i < 64; ++i, ++idx)
+                {
+                    const double v = std::fabs ((double) r[(std::size_t) i]);
+                    if (v > pv && idx > at - 50) { pv = v; peakR = idx; }
+                }
+            }
+            test::ok (peakR - at == 4,
+                      "…and the RIGHT lane's impulse comes out where the geometry says (+"
+                      + std::to_string (peakR - at) + "), so no whole periods hide there either");
+        }
 
         // Rounding is asserted as an INVARIANT over a sweep, not as a list of rates, because the one
         // case a list always misses is the exact half: 2 + 2*h/48000 lands on .5 at h = 24000k - 36000
@@ -502,6 +529,18 @@ int main()
             test::ok (worst <= 0.5 + 1e-9,
                       "over 18 host rates including every exact-half case, the reported integer is never "
                       "more than 0.5 samples from the geometry (worst " + std::to_string (worst) + ")");
+            // …and at an exact half the BOUND accepts either neighbour, so pin the RULE itself: lround
+            // takes halves away from zero. 60 kHz gives exactly 4.5.
+            {
+                nam::NamStage half;
+                half.prepare (60000.0, 64);
+                const auto json = gainModel();
+                test::ok (load (half, json), "model loads at the exact-half rate");
+                half.prepare (60000.0, 64);
+                test::ok (half.latencySamples() == 5,
+                          "at 60 kHz the geometry is exactly 4.5 and the reported number is 5 — halves go "
+                          "away from zero, which the <=0.5 bound alone would not pin");
+            }
         }
 
         // The gate itself: NamStage.cpp engages the resampler only past |hostSR - modelRunSR| > 0.5,

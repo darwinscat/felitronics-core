@@ -151,6 +151,22 @@ int main()
         const auto low = roundTripGains (1000.0, H, M, 64, kSkip, kKeep);
         approx (coherentDb (low), 0.0, 0.01, "44.1<->48 at 1 kHz reads 0.00 dB — the droop is not an offset");
         ok (worstDb (low) > -0.01, "…and there is no modulation to speak of at 1 kHz either");
+
+        // 🔴 SIGN. Every statistic above is a magnitude, so a kernel that inverted the signal would
+        // pass all of them — a crew mutation that negated every fed sample did exactly that, and the
+        // block-size comparison cannot catch it either, because both sides of that comparison run the
+        // same (mutated) code. Only an ABSOLUTE reference sees it. At 100 Hz the round-trip delay of
+        // 3.84 samples costs just 0.055 rad, so the complex coherent gain must sit at very nearly +1.
+        {
+            const auto vlow = roundTripGains (100.0, H, M, 64, kSkip, kKeep);
+            std::complex<double> sum (0.0, 0.0);
+            for (auto v : vlow.g) sum += v;
+            const std::complex<double> c = sum / (double) vlow.g.size();
+            std::printf ("      complex coherent gain at 100 Hz: %+.4f %+.4fi\n", c.real(), c.imag());
+            ok (c.real() > 0.99, "the round trip is POSITIVE unity at 100 Hz (Re = " + std::to_string (c.real())
+                                 + ") — a polarity inversion would read -1 and every magnitude test would miss it");
+            ok (std::abs (c.imag()) < 0.06, "…and its phase is just the 3.84-sample delay, nothing else");
+        }
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -224,15 +240,26 @@ int main()
     // ------------------------------------------------------------------------------------------------
     group ("BLOCK SIZE — the cost is a property of the kernel, not of the caller's buffer");
     {
-        // Compare BOTH statistics, not just the carrier: a crew mutation that flipped polarity left the
-        // coherent MAGNITUDE untouched, and |mean| alone cannot see a sign. The worst phase is a
-        // different functional of the same sequence, so the pair is harder to satisfy by accident.
+        // 🔴 Compare the COMPLEX coherent gain, not its magnitude. A crew mutation that flipped polarity
+        // survived a |mean| comparison, and the first attempt to close that added the worst phase —
+        // which is min|g|, invariant under g -> -g just as |mean| is, so it closed nothing. The diff
+        // round caught that too. The complex mean carries the sign and the phase, so it does not.
+        auto coherent = [] (const Gains& g)
+        {
+            std::complex<double> s (0.0, 0.0);
+            for (auto v : g.g) s += v;
+            return s / (double) g.g.size();
+        };
         const auto ref = roundTripGains (17640.0, H, M, 64, kSkip, kKeep);
+        const std::complex<double> cref = coherent (ref);
         for (int b : { 1, 17, 63, 128, 512 })
         {
             const auto g = roundTripGains (17640.0, H, M, b, kSkip, kKeep);
-            approx (coherentDb (g), coherentDb (ref), 0.02, "block " + std::to_string (b) + ": same carrier as block 64");
-            approx (worstDb (g),    worstDb (ref),    0.02, "block " + std::to_string (b) + ": …and the same worst phase");
+            const std::complex<double> c = coherent (g);
+            ok (std::abs (c - cref) < 3.0e-3,
+                "block " + std::to_string (b) + ": the COMPLEX carrier matches block 64 (|delta| = "
+                + std::to_string (std::abs (c - cref)) + ") — magnitude alone would not see a sign flip");
+            approx (worstDb (g), worstDb (ref), 0.02, "block " + std::to_string (b) + ": …and so does the worst phase");
         }
     }
 
@@ -248,13 +275,14 @@ int main()
         //   after reset() len = 3, pos = 1; feed(N) -> len = N + 3; produce emits while
         //   floor(1 + k·r) + 2 < N + 3, i.e. k < N/r  ->  K = ceil(N·outRate/inRate).
         //
-        // ONE EXCEPTION, and it is arithmetic rather than a defect: when N·outRate/inRate is an exact
+        // ONE SUBTLETY, and it is arithmetic rather than a defect: when N·outRate/inRate is an exact
         // integer the last k sits precisely ON the boundary, and `pos` is a double accumulation of a
-        // ratio that is not a binary fraction (48000/44100 = 160/147 is not), so the accumulated value
-        // can land a few ULP under the boundary and emit one extra sample. Measured on exactly the two
-        // rows where the product is integral: 48000->44100 at N=160 (148 against 147) and 22050->48000
-        // at N=147 (321 against 320). So: exact everywhere, +1 allowed ONLY on that boundary — which
-        // still fails the one-sample-early mutation on every other row.
+        // ratio that is not a binary fraction (48000/44100 = 160/147 is not), so it can land a few ULP
+        // under the boundary and emit one extra sample. The first version of this test allowed +1 at
+        // every integral boundary, which the diff round pointed out is unearned where the ratio IS a
+        // binary fraction (96000/48000 = 2 accumulates exactly). So the expectation is not a closed
+        // form with slack — it is the SAME double accumulation the class does, which has no slack at
+        // all and still fails a loop that stops one sample early.
         struct RB { double in, out; };
         bool allExact = true;
         for (const RB rb : { RB {44100,48000}, RB {48000,44100}, RB {96000,48000}, RB {96000,44100},
@@ -266,17 +294,37 @@ int main()
                 std::vector<float> x ((std::size_t) N, 0.25f), o ((std::size_t) (N * 8 + 64));
                 r.feed (x.data(), N);
                 const int k = r.produceAvailable (o.data(), (int) o.size());
-                const double exact = (double) N * rb.out / rb.in;
-                const int want = (int) std::ceil (exact);
-                const bool onBoundary = std::fabs (exact - std::floor (exact + 0.5)) < 1e-9;
-                if (! (k == want || (onBoundary && k == want + 1)))
+                // predict with the class's own accumulator: emit while floor(pos) <= N, pos starts at
+                // 1.0 and advances by the same double inPerOut. No compaction happens inside a single
+                // produce call at this capacity, so a plain accumulation is exact.
+                int want = 0;
+                for (double pos = 1.0; std::floor (pos) <= (double) N; pos += rb.in / rb.out) ++want;
+                if (k != want)
                 {
                     allExact = false;
                     std::printf ("      %6.0f -> %6.0f  N=%d produced %d, derived %d\n", rb.in, rb.out, N, k, want);
                 }
             }
-        ok (allExact, "one feed of N yields EXACTLY ceil(N·outRate/inRate) outputs at every ratio and length"
-                      " (+1 only where the product is integral and `pos` lands an ULP under the boundary)");
+        ok (allExact, "one feed of N yields EXACTLY the count the class's own phase accumulator implies,"
+                      " at every ratio and length — no slack anywhere");
+
+        // SIGN, at the level of ONE stage. The round-trip sign check in LIVENESS cannot see a kernel
+        // that inverts, because both stages invert and the two cancel — which is precisely why a crew
+        // mutation that negated every fed sample survived every suite. A single stage cannot cancel
+        // with itself: a settled constant must come out as ITSELF (the weights are a partition of
+        // unity at every phase), sign included.
+        {
+            StreamResampler r;
+            r.reset (48000.0, 44100.0, 4096);
+            std::vector<float> x (2048, 0.25f), o (4096);
+            r.feed (x.data(), 2048);
+            const int k = r.produceAvailable (o.data(), (int) o.size());
+            double worstDev = 0.0;
+            for (int i = 16; i < k - 16; ++i) worstDev = std::max (worstDev, std::fabs ((double) o[(std::size_t) i] - 0.25));
+            ok (k > 1800 && worstDev < 1.0e-6,
+                "one stage passes a settled +0.25 as +0.25 (worst deviation " + std::to_string (worstDev)
+                + ") — partition of unity at every phase, sign included");
+        }
 
         // produceExact()'s documented behaviour on a startup underflow is "pad with silence", and NOTHING
         // in the four suites checked it: a mutation that pads with the PREVIOUS sample instead survived
@@ -287,8 +335,11 @@ int main()
             r.reset (44100.0, 48000.0, 512);
             std::vector<float> out (64, 0.5f);
             r.produceExact (out.data(), 64);
+            // `!(fabs(v) > 0)` would also be true for a NaN — the diff round caught that going in with
+            // the -Wfloat-equal cleanup. `fabs(v) <= 0` is true ONLY for an exact zero (fabs is never
+            // negative) and false for NaN, which is the predicate this test actually wants.
             bool allZero = true;
-            for (float v : out) allZero = allZero && ! (std::fabs (v) > 0.0f);
+            for (float v : out) allZero = allZero && (std::fabs (v) <= 0.0f);
             ok (allZero, "produceExact on a freshly reset resampler writes SILENCE, not held samples");
 
             StreamResampler r2;
@@ -297,10 +348,10 @@ int main()
             r2.feed (in.data(), 8);
             r2.produceExact (out2.data(), 200);          // 8 in -> at most 9 out, the rest is padding
             int lastNonZero = -1;
-            for (int i = 0; i < 200; ++i) if (std::fabs (out2[(std::size_t) i]) > 0.0f) lastNonZero = i;
+            for (int i = 0; i < 200; ++i) if (! (std::fabs (out2[(std::size_t) i]) <= 0.0f)) lastNonZero = i;
             bool tailSilent = true;
             for (int i = lastNonZero + 1; i < 200; ++i)
-                tailSilent = tailSilent && ! (std::fabs (out2[(std::size_t) i]) > 0.0f);
+                tailSilent = tailSilent && (std::fabs (out2[(std::size_t) i]) <= 0.0f);
             ok (lastNonZero < 12 && tailSilent,
                 "…and the tail past what the history can produce is silence too (last non-zero at "
                 + std::to_string (lastNonZero) + " of 200)");
@@ -429,9 +480,11 @@ int main()
         approx (added, -8.84, 0.05, "the round trip adds -8.84 dBc of artifacts at 17.5 kHz");
 
         // …and how hard the nonlinearity has to be driven before its OWN folding reaches that level.
+        // The crossing is BISECTED rather than read off the grid: the first version of this test
+        // asserted "the first tested drive where the floor wins", which the diff round correctly called
+        // an artefact of the grid — the crossing is between 4 and 8, not at 8.
         struct D { double drive, floorDbc; };
         const D drives[] = { D {0.25, -45.80}, D {1.0, -23.47}, D {4.0, -10.44}, D {8.0, -8.24} };
-        int firstOver = -1;
         for (int di = 0; di < 4; ++di)
         {
             const D d = drives[di];
@@ -444,11 +497,27 @@ int main()
                          d.drive, fl, added - fl);
             approx (fl, d.floorDbc, 0.05, "tanh at drive " + std::to_string (d.drive) + " folds its own "
                     + std::to_string (d.floorDbc) + " dBc");
-            if (fl > added && firstOver < 0) firstOver = di;
         }
-        ok (firstOver == 3, "the nonlinearity has to be driven all the way to tanh(8x) — a near square "
-                              "wave — before its OWN aliasing reaches what the rate-match adds; below that "
-                              "the rate-match is the LOUDER artifact, which is the opposite of masking");
+        {
+            auto floorAt = [&] (double drive)
+            {
+                const int NF = 96 * 1000;
+                std::vector<double> z ((std::size_t) NF);
+                for (int n = 0; n < NF; ++n)
+                    z[(std::size_t) n] = std::tanh (drive * std::sin (2.0 * kPi * f0 * n / M)) / std::tanh (drive);
+                return nonCarrierDbc (z, 0, NF, M, f0);
+            };
+            double lo = 1.0, hi = 16.0;
+            for (int i = 0; i < 24; ++i) { const double m = 0.5 * (lo + hi); if (floorAt (m) < added) lo = m; else hi = m; }
+            const double cross = 0.5 * (lo + hi);
+            std::printf ("      crossing: the tanh has to reach drive %.2f before it folds as much as the "
+                         "rate-match adds\n", cross);
+            approx (cross, 6.23, 0.05,
+                    "the nonlinearity has to be driven to tanh(6.2x) — the peak of a unit sine already sits "
+                    "at 0.99999, i.e. a near square wave — before its OWN aliasing reaches what the "
+                    "rate-match adds. Below that the rate-match is the LOUDER artifact, which is the "
+                    "opposite of masking");
+        }
     }
 
     return felitronics::test::report();

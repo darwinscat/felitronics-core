@@ -67,8 +67,10 @@ both reset together in `NamStage::configureRates`. Swept over all 160 integer al
 | 17 640 | −4.17 / −9.27 | −3.59 … −6.83 | −6.96 … −9.29 |
 | 20 000 | −5.48 / −14.79 | −4.47 … −13.14 | −13.17 … −15.70 |
 
-So the **worst-phase column is effectively a ceiling** (the shipped priming lands 0.02–0.9 dB off the
-alignment-wide worst), while the **coherent carrier is an interference term** — stage 2 converts part of
+So the shipped priming happens to land **at or near the alignment-wide worst** — 0.02 dB off at
+17.64 kHz, 0.91 dB off at 20 kHz — which is an observation about this priming, not a bound: the worst
+phase itself ranges over 2.3 dB (17.64 kHz) and 2.5 dB (20 kHz) across alignments. The **coherent
+carrier is an interference term** — stage 2 converts part of
 stage 1's sidebands back onto the carrier, and how much depends on the alignment. The mean over alignments
 is exactly the product of the two single-stage carriers (−5.06 dB at 17.64 kHz, −7.77 at 20 kHz), which is
 what a "two independent stages" estimate would give and why that estimate is not the cascade.
@@ -93,7 +95,9 @@ single spectral LINE exceeds −4.67 dB; the sample peak reaches 0 dB for a time
 to within ~1e-13 of 0 every 147 outputs, so one output in every 147 reproduces an input sample to
 float rounding (measured output peak 0.999657 against an input peak of exactly 1.0). What survives does not land in one place: a tone at *g* ∈ (22.05, 24) kHz
 comes back as **two** strong components — `44100 − g` at about −5 dB and `g − 3900` at about −7 dB —
-plus weaker terms near −45 dB, so the fold covers **18.15–22.05 kHz**, not just the top slice. Measured
+plus weaker terms near −45 dB. The two STRONG components land in **18.15–22.05 kHz**, not just the top
+slice; the weak ones go lower still (14.3 kHz at −42.6 dB for a 22.1 kHz input), so that band is where
+the damage is, not where it ends. Measured
 on the shipped kernel, 2-second coherent window:
 
 | tone in | components out |
@@ -136,8 +140,8 @@ conversion (`shipped − ideal`, both at 44.1 kHz):
   −18 dBFS into a high-gain capture, shipped path: **a 100 Hz line at −17.7 dBFS — 14.5 dB louder than
   the 20 kHz carrier that produced it** (−32.2). The same bin through the output leg alone is −81.8,
   and through an ideal round trip −174.6. All the IMD products of the image lattice `20000 ± 3900m`
-  fall on a 100 Hz grid, which is where they land. The clean capture does it too, 33 dB quieter
-  (−39.1 dBFS at 100 Hz). A steady 20 kHz tone is not guitar, so read this as the mechanism rather than
+  fall on a 100 Hz grid, which is where they land. The clean capture does it too, 21.4 dB quieter
+  (−39.1 dBFS at 100 Hz against the high-gain −17.7). A steady 20 kHz tone is not guitar, so read this as the mechanism rather than
   as a level; the level on real DI is the table above.
 
 So the old one-line defence fails three ways: it never covered the carrier droop at all, it is
@@ -186,7 +190,8 @@ measures the same processed samples.
 document: the whole carrier / worst-phase / best-phase table, the period-147 closure and its
 minimality, block independence, the exact produced count, `produceExact`'s silence padding, all five
 decimation rows, where a 23 kHz tone lands (both components), and the criterion — the round trip adds
-−8.84 dBc at 17.5 kHz and a `tanh` has to be driven to `tanh(8x)` before its own folding reaches that.
+−8.84 dBc at 17.5 kHz and a `tanh` has to be driven to `tanh(6.2x)` — bisected, not read off a grid —
+before its own folding reaches that.
 `felitronics_nam_tests` pins the same carriers through the real `NamStage` plumbing, and the
 round-trip delay measured two ways (impulse onset for the integer, carrier phase for the fraction).
 

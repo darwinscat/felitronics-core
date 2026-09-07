@@ -32,9 +32,10 @@ namespace felitronics::core
 // The composite gain is periodic with EXACTLY 147 output samples at this ratio, so those 147 values
 // are the complete set — but they are a LINE through the two stages' phase torus, fixed by the
 // shipped priming (both stages reset together at pos = 1, len = 3), not the full 160x147 product.
-// Swept over all 160 integer alignments the WORST phase barely moves (-9.29 dB at 17.64 kHz against
-// the -9.27 here, so that column is effectively the ceiling), while the coherent carrier spans
-// -3.59 .. -6.83 dB — it is an interference term between the two stages and belongs to the priming.
+// Swept over all 160 integer alignments the shipped priming lands at or near the worst (-9.29 dB at
+// 17.64 kHz against the -9.27 here; 0.91 dB off at 20 kHz) — an observation about this priming, not a
+// bound — while the coherent carrier spans -3.59 .. -6.83 dB, being an interference term between the
+// two stages rather than a property of the kernel.
 //
 // 🔴 AND THE DECIMATING DIRECTION HAS NO ANTI-ALIASING AT ALL. Going 48 → 44.1 this kernel passes a
 // tone above the output Nyquist at −3 dB rms and 0.0 dB sample PEAK — at phase t = 0 the weights are
@@ -42,8 +43,9 @@ namespace felitronics::core
 // within ~1e-13 of 0 every 147 outputs, so one output in 147 simply IS an input sample. (The peak is
 // that time-domain fact; no single spectral LINE exceeds −4.67 dB.) A tone at g ∈ (22.05,
 // 24) kHz comes back as TWO strong components, not one: 44100 − g at about −5 dB and g − 3900 at
-// about −7 dB (23 kHz in → 21.1 kHz at −5.33 and 19.1 kHz at −7.04), plus weaker terms near
-// −45 dB. So everything the driven stage makes above 22.05 kHz lands across 18.15–22.05 kHz.
+// about −7 dB (23 kHz in → 21.1 kHz at −5.33 and 19.1 kHz at −7.04), plus weaker terms near −45 dB
+// that go lower still. The STRONG pair lands across 18.15–22.05 kHz — that is where the damage is,
+// not where it stops.
 //
 // The older note here said "the driven nonlinear stage masks the interpolation images". Measured, it
 // is CONDITIONAL and it does not cover the whole error: (a) the carrier droop is not an added

@@ -105,8 +105,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   the nonlinearity **demodulates** the input leg's images into the audible range: a 20 kHz tone at
   −18 dBFS into a high-gain capture returns a **100 Hz line at −17.7 dBFS, 14.5 dB louder than its own
   carrier**, against −174.6 dBFS through an ideal round trip. **No kernel change here**: the header now states the cost, the
-  new `felitronics_core_streamresampler_lptv_tests` (44 checks) pins the table, the period-147 closure
-  and the 0 dB decimation peak, and the candidate comparison (a 32-tap polyphase sinc: flat −0.11 dB at
+  new `felitronics_core_streamresampler_lptv_tests` (75 checks) pins the table, the period-147 closure,
+  the 0 dB decimation peak and the criterion itself — the round trip adds **−8.84 dBc at 17.5 kHz**, and
+  a `tanh` has to be driven to **`tanh(6.2x)`** (bisected) before its own folding reaches that, so below
+  a near-square-wave drive the rate-match is the LOUDER artifact, and the candidate comparison (a 32-tap polyphase sinc: flat −0.11 dB at
   17.64 kHz with no modulation, 16–42 dB of stopband, +0.066 %RT per mono channel, 30.7 host samples of
   delay against today's 3.84) is in the document for the product decision.
 
