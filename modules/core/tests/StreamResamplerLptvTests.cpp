@@ -280,7 +280,7 @@ int main()
             std::vector<float> out (64, 0.5f);
             r.produceExact (out.data(), 64);
             bool allZero = true;
-            for (float v : out) allZero = allZero && (v == 0.0f);
+            for (float v : out) allZero = allZero && ! (std::fabs (v) > 0.0f);
             ok (allZero, "produceExact on a freshly reset resampler writes SILENCE, not held samples");
 
             StreamResampler r2;
@@ -289,9 +289,10 @@ int main()
             r2.feed (in.data(), 8);
             r2.produceExact (out2.data(), 200);          // 8 in -> at most 9 out, the rest is padding
             int lastNonZero = -1;
-            for (int i = 0; i < 200; ++i) if (out2[(std::size_t) i] != 0.0f) lastNonZero = i;
+            for (int i = 0; i < 200; ++i) if (std::fabs (out2[(std::size_t) i]) > 0.0f) lastNonZero = i;
             bool tailSilent = true;
-            for (int i = lastNonZero + 1; i < 200; ++i) tailSilent = tailSilent && (out2[(std::size_t) i] == 0.0f);
+            for (int i = lastNonZero + 1; i < 200; ++i)
+                tailSilent = tailSilent && ! (std::fabs (out2[(std::size_t) i]) > 0.0f);
             ok (lastNonZero < 12 && tailSilent,
                 "…and the tail past what the history can produce is silence too (last non-zero at "
                 + std::to_string (lastNonZero) + " of 200)");
@@ -419,9 +420,11 @@ int main()
 
         // …and how hard the nonlinearity has to be driven before its OWN folding reaches that level.
         struct D { double drive, floorDbc; };
-        double firstOver = 0.0;
-        for (const D d : { D {0.25, -45.80}, D {1.0, -23.47}, D {4.0, -10.44}, D {8.0, -8.24} })
+        const D drives[] = { D {0.25, -45.80}, D {1.0, -23.47}, D {4.0, -10.44}, D {8.0, -8.24} };
+        int firstOver = -1;
+        for (int di = 0; di < 4; ++di)
         {
+            const D d = drives[di];
             const int NF = 96 * 1000;                 // 96 = the tone's period at 48 kHz; coherent
             std::vector<double> z ((std::size_t) NF);
             for (int n = 0; n < NF; ++n)
@@ -431,9 +434,9 @@ int main()
                          d.drive, fl, added - fl);
             approx (fl, d.floorDbc, 0.05, "tanh at drive " + std::to_string (d.drive) + " folds its own "
                     + std::to_string (d.floorDbc) + " dBc");
-            if (fl > added && firstOver == 0.0) firstOver = d.drive;
+            if (fl > added && firstOver < 0) firstOver = di;
         }
-        ok (firstOver == 8.0, "the nonlinearity has to be driven all the way to tanh(8x) — a near square "
+        ok (firstOver == 3, "the nonlinearity has to be driven all the way to tanh(8x) — a near square "
                               "wave — before its OWN aliasing reaches what the rate-match adds; below that "
                               "the rate-match is the LOUDER artifact, which is the opposite of masking");
     }
