@@ -157,9 +157,15 @@ modulation without removing it:
 | L=32 P=256 | −0.00/−0.00 | 0.00/0.00 | **−0.11/−0.11** | −1.77/−1.77 | −6.10/−6.10 | 0.0790 | 30.71 |
 | L=64 P=512 | 0.00/0.00 | 0.00/0.00 | 0.00/0.00 | −0.03/−0.03 | −2.60/−2.60 | 0.1451 | 61.41 |
 
-For scale, the whole `NamStage` (model included) measures **5.3–6.1 %RT mono** at 44.1 kHz on an
-Apple-Silicon build with a standard WaveNet capture, so a 32-tap pair costs about **+1.2 %** of what
-the stage already spends. The price is latency: 30.7 host samples (0.70 ms) against today's 3.84
+The %RT column above is one machine (Apple Silicon, Apple clang); absolute figures do not travel, so
+what matters is the fraction. Measured on two, with the same standard WaveNet capture at 44.1 kHz:
+
+| machine | whole `NamStage` (model included) | shipped resampler | 32-tap sinc | what the swap costs |
+|---|---|---|---|---|
+| arm64, Apple clang | 5.3–6.1 %RT mono | 0.0126 | 0.0790 | **+1.2 %** of the stage |
+| x86-64 i9, gcc 14.2 | 11.0–11.6 %RT mono | 0.0515 | 0.1952 | **+1.3 %** of the stage |
+
+The two-axis, stopband and delay numbers are identical on both toolchains to the digits printed here. The price is latency: 30.7 host samples (0.70 ms) against today's 3.84
 (0.087 ms). The 19–20 kHz roll-off of the sinc candidates is a chosen cutoff (0.94 of the lower
 Nyquist), not a property of the kernel.
 
