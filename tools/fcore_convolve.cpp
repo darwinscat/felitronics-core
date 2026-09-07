@@ -37,7 +37,11 @@ int main (int argc, char** argv)
     conv.setIr (ir.data(), (int) ir.size());
 
     std::vector<float> out (in.size(), 0.0f);
-    conv.process (in.data(), out.data(), (int) in.size());
+    if (! conv.process (in.data(), out.data(), (int) in.size()))
+    {
+        std::fprintf (stderr, "convolver refused the call (law 11) — nothing written\n");
+        return 1;
+    }
 
     std::FILE* f = std::fopen (argv[3], "wb");
     if (! f) { std::perror ("open out"); return 2; }
