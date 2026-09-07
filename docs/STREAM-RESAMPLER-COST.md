@@ -37,17 +37,32 @@ rational-phase enumeration of the closed form, a brute-force simulation, and the
 through `NamStage`'s own plumbing (cos and sin runs combined into a per-sample complex gain — the
 class is linear, so no bucketing is needed and none is done).
 
-| f, Hz | coherent | worst phase | best phase |
-|---|---|---|---|
-| 1 000 | −0.00 | −0.00 | −0.00 |
-| 5 000 | −0.05 | −0.08 | −0.01 |
-| 8 000 | −0.28 | −0.50 | −0.05 |
-| 10 000 | −0.64 | −1.16 | −0.11 |
-| 12 000 | −1.22 | −2.28 | −0.21 |
-| 15 000 | −2.59 | −5.14 | −0.41 |
-| **17 640** | **−4.17** | **−9.27** | −0.61 |
-| 19 000 | −4.98 | −12.20 | −0.69 |
-| 20 000 | −5.48 | −14.79 | −0.74 |
+| f, Hz | coherent | worst phase | best phase | **×2: coherent** | **×2: worst** | **×2: best** |
+|---|---|---|---|---|---|---|
+| 1 000 | −0.00 | −0.00 | −0.00 | −0.00 | −0.00 | −0.00 |
+| 5 000 | −0.05 | −0.08 | −0.01 | −0.09 | −0.13 | −0.06 |
+| 8 000 | −0.28 | −0.50 | −0.05 | −0.56 | −0.79 | −0.34 |
+| 10 000 | −0.64 | −1.16 | −0.11 | −1.30 | −1.82 | −0.77 |
+| 12 000 | −1.22 | −2.28 | −0.21 | −2.53 | −3.59 | −1.48 |
+| 15 000 | −2.59 | −5.14 | −0.41 | −5.48 | −8.01 | −3.16 |
+| **17 640** | **−4.17** | **−9.27** | −0.61 | **−9.03** | **−13.16** | **−5.20** |
+| 19 000 | −4.98 | −12.20 | −0.69 | −10.91 | −15.45 | −6.30 |
+| 20 000 | −5.48 | −14.79 | −0.74 | −12.09 | −17.85 | −7.02 |
+
+**The ×2 columns are the shipped OrbitCab chain, and they are not the first three doubled.** OrbitCab
+runs TWO `NamStage`s in series at the host rate — preamp (`src/core/CabEngine.cpp`) → EQ → poweramp
+router (same file) — and `src/PluginProcessor.cpp` says so in its own comment: *"The two NAM stages
+each rate-match independently, so their latencies SUM (possible future optimisation: … a single
+round-trip instead of two)."* So the shipped path at 44.1 kHz is **four** Catmull-Rom stages, not two.
+
+Doubling the decibels would give −8.35 / −18.53 at 17.64 kHz. The cascade measures **−9.03 / −13.16**:
+the carrier is *worse* than doubling and the worst phase *better*, for the same reason the inherited
+one-round-trip table was wrong — each stage converts part of the previous one's sidebands back onto the
+carrier. What actually changes character is the **best** phase: it falls from −0.61 dB to −5.20, so the
+top octave is attenuated at *every* phase instead of only at some, and the modulation depth narrows
+from 8.7 dB to 8.0 while the whole band sinks. Two oracles agree on every cell (the shipped class in
+`NamStage`'s plumbing, and an independent brute-force double simulation); the composite period is still
+147 output samples.
 
 **The set is complete, and it belongs to the shipped priming.** At 44100/48000 = 147/160 the composite
 gain is periodic with **exactly 147 output samples**: stage 2's position advances by 160/147 per output,
@@ -164,6 +179,7 @@ modulation without removing it:
 | L=16, cutoff 0.94 | −0.00/−0.00 | −0.20/−0.20 | −2.30/−2.34 | −5.30/−5.44 | −8.86/−9.14 | 0.0372 | 15.36 |
 | L=32, cutoff 0.94 | −0.00/−0.00 | 0.00/0.00 | −0.11/−0.11 | −1.77/−1.77 | −6.10/−6.10 | 0.0790 | 30.71 |
 | **L=64, cutoff 0.99** | **−0.00/−0.00** | **0.00/−0.00** | **0.00/0.00** | **0.00/0.00** | **−0.01/−0.01** | 0.1549 | 61.41 |
+| L=64, cutoff 0.99, **×2** | −0.00/−0.00 | 0.00/−0.00 | 0.00/0.00 | 0.00/0.00 | −0.03/−0.03 | 0.3098 | 122.8 |
 | L=96, cutoff 0.99 | −0.00/−0.00 | 0.00/−0.00 | −0.00/−0.00 | 0.00/0.00 | 0.00/0.00 | 0.2450 | 92.06 |
 
 UP-leg stopband (rms/peak, dB), since a wider passband buys its transparency with near-Nyquist
@@ -192,6 +208,14 @@ drive** (checked at −24, 0 and +18 dB).
 
 **So the cutoff is the deciding variable here, not the tap count** — the same axis P31 has open for the
 oversampler. A candidate judged on the two tone axes alone picks the wrong one.
+
+**And on the shipped OrbitCab chain the case is stronger than one round trip suggests, in both
+directions.** Through two round trips the shipped kernel reaches −9.03 dB coherent and −13.16 worst at
+17.64 kHz (−12.09/−17.85 at 20 kHz), while the L=64 / 0.99 candidate stays at 0.00 / −0.03 — it does
+not accumulate at all, which is what a flat passband means. But its latency accumulates exactly:
+**2 × 61.4 = 122.8 host samples, 2.78 ms** at 44.1 kHz, and its CPU doubles to 0.3098 %RT (≈5 % of what
+two `NamStage`s spend on their models). The single-round-trip figures elsewhere in this document
+describe `rigplayer`, which runs its two `NamStage`s in PARALLEL, not in series.
 
 The %RT column above is one machine (Apple Silicon, Apple clang); absolute figures do not travel, so
 what matters is the fraction. Measured on two, with the same standard WaveNet capture at 44.1 kHz:
@@ -250,7 +274,8 @@ those products even though no sample moves inside core.
 Both shipped hosts also **sum two rate-matching stages** for PDC (preamp + poweramp), so the number the
 host sees moves by twice the per-stage figure: **4 samples at 44.1 kHz, 6 at 96**.
 
-And three OrbitCab tests pin the OLD formula literally
-(`tests/PowerAmpRouterAlignTests.cpp`, three `expectEquals(L, ceil(3·sr/48000) + 3)`); they go red on
-the next core bump and want the geometry `2 + 2·hostSR/modelRunSR` instead. That patch belongs in
-OrbitCab, not here, but it is a consequence of this change and not a coincidence.
+And three OrbitCab tests pin a number that is now known to be **wrong**
+(`tests/PowerAmpRouterAlignTests.cpp`, three `expectEquals(L, ceil(3·sr/48000) + 3)`). They will fail
+on the next core bump, and the fix there is to pin the geometry `2 + 2·hostSR/modelRunSR` — **not** to
+restore the old formula here. That patch belongs in OrbitCab, but it is a consequence of this
+measurement and not a coincidence.

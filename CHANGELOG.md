@@ -84,9 +84,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   (`src/poweramp/PowerAmpRouter.cpp`, `src/core/CabEngine.cpp`) and orbit-amp does the same at the dry
   end of its crossfade, so the wet path sat at the true 3.84 samples while the dry was held at the
   reported 6 — a 2.16-sample mismatch whose first comb notch fell at ~10.2 kHz during an on↔off
-  crossfade (3.0 samples and ~16 kHz at 96 kHz). It is now 0.16 and 0.00. ⚠️ **Three OrbitCab tests pin
-  the old formula literally** (`tests/PowerAmpRouterAlignTests.cpp`, three
-  `expectEquals(L, ceil(3·sr/48000) + 3)`) and go red on the next core bump; they want the geometry. The old tests pinned the FORMULA, which is why
+  crossfade (3.0 samples and ~16 kHz at 96 kHz). It is now 0.16 and 0.00. ⚠️ **Three OrbitCab tests pin a number that is now known to be WRONG**
+  (`tests/PowerAmpRouterAlignTests.cpp`, three `expectEquals(L, ceil(3·sr/48000) + 3)`). They will fail
+  on the next core bump, and the fix is to replace the pinned value with the geometry
+  `2 + 2·hostSR/modelRunSR` — **not** to restore the old formula in core. The old tests pinned the FORMULA, which is why
   nothing caught it; the new one measures the delay from the carrier phase of the shipped round trip
   (3.8375 / 6.0000 / 5.6750 samples, matching the geometry to four decimals) and asserts the reported
   integer is the nearest one to it.
@@ -97,7 +98,12 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   periodically time-varying filter whose per-phase gain has Fourier coefficients `H(Ω+2πk)`, so the
   "amplitude modulation" and the "interpolation images" are **one mechanism**, not two. The NAM round
   trip at 44.1 ↔ 48 kHz costs **−4.17 dB coherent and −9.27 dB worst-phase at 17.64 kHz** (−2.59/−5.14
-  at 15 kHz, −5.48/−14.79 at 20 kHz), from a composite period of exactly 147 output samples. That set
+  at 15 kHz, −5.48/−14.79 at 20 kHz), from a composite period of exactly 147 output samples. **That is
+  ONE round trip; OrbitCab runs two `NamStage`s IN SERIES** (preamp → EQ → poweramp, and its own
+  `updateLatency()` comment says so), i.e. four of these stages — measured **−9.03/−13.16 at 17.64 kHz
+  and −12.09/−17.85 at 20 kHz**, where doubling the decibels would say −8.35/−18.53. On that chain the
+  BEST phase falls from −0.61 dB to −5.20, so the top octave is down at every phase rather than only at
+  some. `rigplayer` runs its two stages in parallel and stays on the one-round-trip row. That set
   is complete for the shipped priming but is a LINE through the two stages' phase torus, not the full
   product: over all 160 integer alignments the worst phase barely moves (−9.29 against −9.27) while the
   coherent carrier spans −3.59…−6.83, because it is an interference term between the stages. **The decimating direction has no stopband at

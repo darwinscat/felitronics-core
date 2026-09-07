@@ -29,6 +29,11 @@ namespace felitronics::core
 // modulation" and the "interpolation images" are one mechanism, not two. Round trip 44.1↔48 kHz
 // (the shipped NAM path), coherent carrier / worst phase, in dB:
 //     10 k −0.64/−1.16 · 15 k −2.59/−5.14 · 17.64 k −4.17/−9.27 · 20 k −5.48/−14.79
+// 🔴 That is ONE round trip. OrbitCab runs TWO NamStages IN SERIES at the host rate (preamp → EQ →
+// poweramp), i.e. FOUR of these stages, and the cascade is not the decibels doubled: measured
+// −9.03/−13.16 at 17.64 kHz and −12.09/−17.85 at 20 kHz, where doubling would say −8.35/−18.53. The
+// best phase falls from −0.61 dB to −5.20, so on that chain the top octave is down at EVERY phase.
+// `rigplayer` runs its two stages in PARALLEL and stays on the one-round-trip row.
 // The composite gain is periodic with EXACTLY 147 output samples at this ratio, so those 147 values
 // are the complete set — but they are a LINE through the two stages' phase torus, fixed by the
 // shipped priming (both stages reset together at pos = 1, len = 3), not the full 160x147 product.
