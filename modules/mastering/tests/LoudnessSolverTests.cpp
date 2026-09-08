@@ -1586,6 +1586,206 @@ void testSurvivorsOfTheMutationStand()
     }
 }
 
+// =============================================================================================
+// THE CODE-REVIEW ROUND'S COUNTEREXAMPLES. Four inputs, each of which the solver got wrong, and three
+// of them against fixes made earlier the same day — which is why they are here rather than folded into
+// the groups above: they are the evidence that a fix is not protected by a test on its own.
+void testTheReviewRoundsCounterexamples()
+{
+    // A tone quiet enough that a warm start puts the search deep in the saturated region, where the
+    // measured slope is genuinely near zero and the ceiling is still tracking its aim. Everything about
+    // this group is that combination.
+    auto tone = [] (double seconds, double amp)
+    {
+        const int n = (int) (seconds * kFs);
+        Programme p; p.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f));
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = (float) (amp * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+            p.ch[0][(std::size_t) i] = v; p.ch[1][(std::size_t) i] = v;
+        }
+        p.bind();
+        return p;
+    };
+    auto run = [] (Rig& rig, Programme& src, Programme& dst, double startGain, double startCeiling,
+                   double target, int passes, double tol)
+    {
+        rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        rig.params.limiter.ceilingDbTp = startCeiling;
+        LoudnessRequest req;
+        req.targetLufs = target; req.maxTruePeakDbTp = -1.0; req.toleranceLu = tol;
+        req.maxPasses = passes; req.initialGainDb = startGain;
+        return rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                 src.in(), dst.out(), 2, src.frames(), req);
+    };
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("a warm start into the saturated region converges at the STANDARD budget");
+    {
+        // The search runs in `d = g - c` and `J = I - c` because `I` is not a function of `g` alone.
+        // Taken in the caller's coordinates instead, two renders 9 dB apart whose ceilings differ by
+        // 0.05 dB gave a "slope" of 0.0057 where the truth is near 1; the step went to the -60 dB clamp,
+        // the render fell under the absolute gate, and a four-render budget ended at -12.993 LUFS.
+        Programme src = tone (1.0, 0.005);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        const auto sol = run (rig, src, dst, 55.0, -1.0, -10.0, 4, 0.1);
+        // PRECONDITION: the first render really is in the saturated region — it must be far LOUDER than
+        // the target, or the search never needs the coordinates this group is about.
+        test::ok (sol.logCount >= 1 && sol.log[0].integratedLufs > -6.0,
+                  "precondition: the warm start lands in the saturated region (I = "
+                  + std::to_string (sol.logCount ? sol.log[0].integratedLufs : 0.0) + ")");
+        test::ok (sol.status == MasteringSolveStatus::Solved,
+                  std::string ("a +55 dB start reaches a -10 LUFS target in four renders (got ")
+                  + statusName (sol.status) + ")");
+        test::approx (sol.measured.integratedLufs, -10.0, 0.1, "…on target");
+        std::printf ("      warm start: %s at %.4f LUFS, gain %.3f, %d renders\n",
+                     statusName (sol.status), sol.measured.integratedLufs, sol.preLimiterGainDb, sol.passes);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("a ceiling far below the promise is not mistaken for the actuator's limit");
+    {
+        // The caller's ceiling is a STARTING POINT, and the solver may raise it to the promise. A step
+        // that MOVES to the +-60 dB clamp is a step the search has not evaluated yet; naming it called a
+        // -25 LUFS target unreachable that `g = -18.99` delivers exactly.
+        Programme src = tone (1.0, 0.5);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        const auto sol = run (rig, src, dst, 55.0, -40.0, -25.0, 32, 0.1);
+        test::ok (sol.status == MasteringSolveStatus::Solved,
+                  std::string ("the target is found, not declared out of range (got ")
+                  + statusName (sol.status) + "/" + constraintName (sol.binding) + ")");
+        test::approx (sol.measured.integratedLufs, -25.0, 0.1, "…on target");
+        // PRECONDITION: the search really did have to leave the clamp behind — the first render is at
+        // the caller's ceiling and nowhere near the answer.
+        test::ok (sol.logCount >= 2 && sol.log[0].integratedLufs < -35.0,
+                  "precondition: the first render is far from the target, at the caller's own ceiling");
+        test::ok (sol.passes <= 8, "…and it does not spend the budget bisecting a bracket that never held it ("
+                                   + std::to_string (sol.passes) + " renders)");
+        std::printf ("      low ceiling: %s at %.4f LUFS, gain %.3f, ceiling %.3f, %d renders\n",
+                     statusName (sol.status), sol.measured.integratedLufs, sol.preLimiterGainDb,
+                     sol.ceilingDbTp, sol.passes);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("the QUIET end of the gain node is named too");
+    {
+        // The actuator has two ends. Testing only the loud one lost the other entirely: a target below
+        // what -60 dB delivers came back a pass limit with nothing named.
+        Programme src = tone (2.0, 0.5);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        const auto sol = run (rig, src, dst, 0.0, -1.0, -69.0, 8, 0.1);
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable,
+                  std::string ("a target below the -60 dB end is unreachable (got ")
+                  + statusName (sol.status) + ")");
+        test::ok (sol.binding == MasteringConstraint::GainRange, "…and the gain range is what is NAMED");
+        test::approx (sol.preLimiterGainDb, -60.0, 1e-9, "…with the gain at the quiet end of the clamp");
+        // PRECONDITION: it really is out of reach, and by a margin the tolerance cannot swallow.
+        test::ok (sol.measured.integratedLufs - (-69.0) > 1.0,
+                  "precondition: -60 dB still leaves it "
+                  + std::to_string (sol.measured.integratedLufs + 69.0) + " LU too loud");
+        std::printf ("      quiet end: %s/%s at %.4f LUFS, gain %.3f\n", statusName (sol.status),
+                     constraintName (sol.binding), sol.measured.integratedLufs, sol.preLimiterGainDb);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("a tolerance finer than the search can resolve is reported as that, not as a violation");
+    {
+        // A first candidate that hits the target exactly while breaking the ceiling has an error of zero
+        // that nothing can improve on. Reading the verdict off it buried the later, clean candidates
+        // that bracketed the target — the answer became `Unreachable / TruePeakCeiling` for a render
+        // whose peak was in fact under the promise.
+        Programme src = makeMusic (2.0, 0.3, 77u);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        rig.params.bypassCompressor = false;
+        LoudnessRequest req;
+        req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+        req.toleranceLu = 1.0e-10; req.initialGainDb = 12.0; req.maxPasses = 32;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::TargetBetweenAchievable
+                  || sol.status == MasteringSolveStatus::Solved,
+                  std::string ("an unreachable TOLERANCE is not a broken limit (got ")
+                  + statusName (sol.status) + "/" + constraintName (sol.binding) + ")");
+        test::ok (sol.measured.truePeakDbTp <= -1.0 + 1e-9,
+                  "…and the delivered peak really is under the promise ("
+                  + std::to_string (sol.measured.truePeakDbTp) + " dBTP)");
+        test::approx (sol.measured.integratedLufs, -14.0, 0.001,
+                      "…with the answer as close as the actuator allows");
+        std::printf ("      tight tolerance: %s/%s at %.6f LUFS, TP %.4f, %d renders\n",
+                     statusName (sol.status), constraintName (sol.binding),
+                     sol.measured.integratedLufs, sol.measured.truePeakDbTp, sol.passes);
+    }
+}
+
+// The diverse-testing round's finding: the ACTUATOR'S LIMIT was an event, so the verdict depended on
+// the pass budget. Nothing here is about the audio — every row below delivers the same render.
+void testTheVerdictDoesNotDependOnTheBudget()
+{
+    test::group ("the actuator's limit is named by the render that reaches it, not one render later");
+    {
+        // Recording the pin only when a STEP tried to walk past the clamp needed an iteration the
+        // budget did not always have. Measured on this exact input: `maxPasses = 10` gave `PassLimit`
+        // with an empty mask at g = +60.000, `maxPasses = 11` gave `Unreachable / GainRange` — same
+        // programme, same delivered audio, two different answers to "why did you stop".
+        //
+        // SIGHTED ON BOTH BRANCHES. A budget that ends BEFORE the clamp is reached is a genuine pass
+        // limit and must stay one, so the group asserts the precondition it turns on — whether the
+        // last render actually sat at +-60 dB — and checks the verdict on each side of it.
+        struct Row { int passes; bool reachesClamp; };
+        const Row rows[] = { { 8, false }, { 9, false }, { 10, true }, { 11, true }, { 12, true } };
+
+        for (const Row& row : rows)
+        {
+            Programme src = makeMusic (6.0, 0.95, 12345u);   // the default crest, not a pinned one
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            rig.params.bypassCompressor = false;
+            LoudnessRequest req;
+            req.targetLufs = -5.3; req.maxTruePeakDbTp = -1.0; req.toleranceLu = 0.1;
+            req.maxPasses = row.passes; req.initialGainDb = 0.0;
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                               src.in(), dst.out(), 2, src.frames(), req);
+
+            const bool atClamp = sol.logCount > 0
+                              && std::fabs (sol.log[sol.logCount - 1].gainDb - 60.0) < 1.0e-6;
+            test::ok (atClamp == row.reachesClamp,
+                      "precondition: at budget " + std::to_string (row.passes)
+                      + " the last render " + (row.reachesClamp ? "sits" : "does not sit")
+                      + " at the +60 dB clamp");
+            test::ok (sol.measured.integratedLufs < -5.3 - req.toleranceLu,
+                      "…and the target is genuinely out of reach from there");
+
+            if (row.reachesClamp)
+            {
+                test::ok (sol.status == MasteringSolveStatus::TargetUnreachable,
+                          std::string ("budget ") + std::to_string (row.passes)
+                          + ": the gain range is the answer (got " + statusName (sol.status) + ")");
+                test::ok ((sol.alsoViolated & constraintBit (MasteringConstraint::GainRange)) != 0u,
+                          "…and it is NAMED, not left to the caller to infer");
+            }
+            else
+            {
+                test::ok (sol.status == MasteringSolveStatus::PassLimit,
+                          std::string ("budget ") + std::to_string (row.passes)
+                          + ": a search that never reached the clamp is still a pass limit (got "
+                          + statusName (sol.status) + ")");
+            }
+            std::printf ("      budget %2d: %-8s/%-9s g %+8.3f  I %+9.4f\n", row.passes,
+                         statusName (sol.status), constraintName (sol.binding),
+                         sol.preLimiterGainDb, sol.measured.integratedLufs);
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -1611,5 +1811,7 @@ int main()
     testAnUnmeasurableStartIsNotAnUnmeasurableProgramme();
     testTapPlumbingEdges();
     testSurvivorsOfTheMutationStand();
+    testTheReviewRoundsCounterexamples();
+    testTheVerdictDoesNotDependOnTheBudget();
     return felitronics::test::report();
 }
