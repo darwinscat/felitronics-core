@@ -111,12 +111,14 @@ namespace
         // A fixed 64 was fine for the cubic (D = 2, aperture ±2) and is NOT for this kernel: at
         // ipo = 0.5 the first analysed output still had half its window in the priming zeros, and the
         // SNR it reported was the startup transient, not the passband. That cost a round.
-        const int edge = (int) std::ceil ((StreamResampler::delayInputSamples() + StreamResampler::kHalf) / ipo) + 8;
+        const int edge = (int) std::ceil ((StreamResampler::delayInputSamples (inRate, outRate)
+                                          + StreamResampler::kHalf) / ipo) + 8;
         for (int k = edge; k + edge < K; ++k)
         {
             // out[k] targets input position k·ipo - kHalf. Asked of the class, not restated: this is
             // the number that moved when the kernel did, and hard-coding it is how it went stale before.
-            const double truev = amp * std::sin (2.0 * kPi * f * (k * ipo - StreamResampler::delayInputSamples()));
+            const double truev = amp * std::sin (2.0 * kPi * f * (k * ipo
+                                        - StreamResampler::delayInputSamples (inRate, outRate)));
             const double e = (double) out[(std::size_t) k] - truev;
             noise += e * e; sig += truev * truev; ++c;
         }

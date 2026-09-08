@@ -51,6 +51,7 @@
 
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/core/DryAligner.h>
+#include <felitronics/core/StreamResampler.h>
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/lineareq/MagnitudeCurve.h>
@@ -223,10 +224,21 @@ public:
         // whole player's PDC outward while this notch is INTERNAL to the blend. Measured on a 50/50
         // blend, worst dip across 100 Hz … 10 kHz: -50 dB unaligned against 0.00 dB aligned.
         //
-        // Capacity: it must EXCEED the delay it will ever hold (DryAligner clamps to [0, capacity-1]).
-        // The largest this can report is a 192 kHz host against a 48 kHz model — D·(1 + 4) = 160 — so
-        // 256 covers it with margin. `kMaxDelay` is 128 and would silently clamp.
-        dryLatency_.prepare(channels_, maxBlock_, 256);
+        // Capacity: it must EXCEED the delay it will ever hold — DryAligner clamps to [0, capacity-1]
+        // and does it SILENTLY, which is exactly how a downstream repository shipped a bypass path
+        // that under-delayed every host rate above 48 kHz.
+        //
+        // 🔴 THE PREVIOUS VERSION OF THESE LINES WAS THE SAME MISTAKE, WRITTEN BY THE FIX FOR IT. It
+        // said "the largest this can report is a 192 kHz host against a 48 kHz model — D·(1 + 4) = 160
+        // — so 256 covers it with margin", and that sentence is a RESTATEMENT of the round-trip
+        // formula sitting in front of a silent clamp. It was true when written and would have stopped
+        // being true the moment the kernel length became a function of the ratio (the open kTaps
+        // item), where 192 kHz costs 256 samples and 256 would clamp to 255. Ask instead — at this
+        // rate, for the only model rate this stage can ever run — and add one slot because the
+        // aligner's usable range is capacity-1.
+        const int dryCap = (int) std::ceil (felitronics::core::StreamResampler::pairDelayHostSamples (
+                                                fs_, felitronics::nam::NamStage::kModelSampleRate)) + 2;
+        dryLatency_.prepare(channels_, maxBlock_, dryCap);
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
@@ -967,7 +979,12 @@ private:
     // In HOST samples. A pack's numbers are in the model's own rate, which the stage knows once the
     // model is loaded; a measured table carries the rate it was measured at.
     int delayOfModel(std::uint64_t id, const felitronics::nam::NamStage& st) const {
-        return align_.delayOf(fileIdOfModel(id), fs_, st.modelSampleRate());
+        // Same reason as warmFor(): a pack's lag is written in the model's OWN rate, and for an
+        // untagged capture that rate is not the -1 the stage reports — it is the rate the stage will
+        // actually run it at. AlignmentTable falls back to scale 1.0 when handed a non-positive rate,
+        // which for an untagged model at 96 kHz would apply a 48 kHz lag unscaled.
+        const double runSR = felitronics::nam::NamStage::rateMatch(fs_, st.modelSampleRate()).modelRunSR;
+        return align_.delayOf(fileIdOfModel(id), fs_, runSR);
     }
 
     // The whole decision for the panel as it stands, handed to the audio thread as a request. What the
@@ -1036,7 +1053,12 @@ private:
     long long warmFor(const felitronics::nam::NamStage& st) const {
         const int pre = st.prewarmSamples();
         if (pre <= 0) return 0;
-        const double mr = st.modelSampleRate();
+        // 🔴 ASK for the rate the model will be RUN at, do not read the rate it REPORTS. An untagged
+        // capture reports -1 and NamStage runs it at kModelSampleRate anyway; the previous line here
+        // restated the normalisation with a different answer — `scale = 1.0` — and therefore
+        // under-warmed such a model by a whole receptive field at a 96 kHz host, which is exactly the
+        // guarantee the comment above says must not quietly stop holding.
+        const double mr = felitronics::nam::NamStage::rateMatch(fs_, st.modelSampleRate()).modelRunSR;
         const double scale = (mr > 0.0 && fs_ > 0.0) ? fs_ / mr : 1.0;
         return (long long) std::ceil((double) pre * scale) + (long long) st.latencySamples() + maxBlock_;
     }

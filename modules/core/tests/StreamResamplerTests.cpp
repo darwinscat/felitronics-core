@@ -89,6 +89,45 @@ int main()
             if (std::fabs (out[k] - in[k - D]) <= 0.0f) ++matched;      // BIT-exact, not a tolerance
         ok (checked > 1000 && matched == checked,
             "out[k] IS in[k-kHalf], bit for bit — the identity path copies, it does not resample");
+
+        // 🔴 …AND A RATIO THAT IS MERELY CLOSE MUST NOT TAKE THAT PATH. A mutation relaxing the
+        // identity test from exact equality to a 1 Hz tolerance survived the entire suite, because
+        // the two paths have the SAME DELAY (kHalf either way) and every existing check compares
+        // delays or bit-equality at exact unity. What separates them is FILTERING: the copy passes
+        // everything, the kernel band-limits at 0.99 of the lower Nyquist. So probe just off unity
+        // with a tone the band edge actually attenuates.
+        {
+            // The discriminator is NOT a magic frequency — the first attempt picked 23.5 kHz and
+            // failed, because at a ratio this close to unity the cutoff sits at 0.99·24 kHz = 23.76 kHz
+            // and 23.5 is still inside the passband. The sharp, frequency-free question is simply
+            // whether the two paths produce the same samples: an identity test with a tolerance would
+            // make them identical, and they must not be.
+            const double in = 48000.0, out = 47999.5;          // 0.5 Hz apart: inside a 1 Hz tolerance
+            felitronics::core::StreamResampler near, exact;
+            near .reset (in, out, 8192);
+            exact.reset (in, in,  8192);
+            ok (! near.identity && exact.identity,
+                "a ratio 0.5 Hz off unity is NOT the identity path, and exact unity is");
+
+            auto render = [] (felitronics::core::StreamResampler& r)
+            {
+                std::vector<float> x (2048), o (4096);
+                for (int i = 0; i < 2048; ++i)
+                    x[(std::size_t) i] = 0.5f * (float) std::sin (2.0 * kPi * 9000.0 * i / 48000.0);
+                r.feed (x.data(), 2048);
+                const int k = r.produceAvailable (o.data(), (int) o.size());
+                o.resize ((std::size_t) k);
+                return o;
+            };
+            const auto a2 = render (near), b3 = render (exact);
+            double worst = 0.0;
+            for (std::size_t i = 100; i < std::min (a2.size(), b3.size()) - 100; ++i)
+                worst = std::max (worst, std::fabs ((double) a2[i] - (double) b3[i]));
+            ok (worst > 1.0e-4,
+                "…and it does NOT produce what the copy path produces (worst difference "
+                + std::to_string (worst) + " on a 9 kHz tone). An identity test with a tolerance would "
+                "send this ratio down the bit-copy path and the two would agree exactly");
+        }
     }
 
     group ("upsample 44100 -> 48000 (no NaN, level kept, count ~ ratio)");

@@ -102,6 +102,42 @@ public:
     double modelLoudness()   const;   // the model's tagged loudness in dB (0 if none / no model)
     bool   modelHasLoudness() const;  // whether the loaded model carries a loudness tag
     int    latencySamples()  const;   // host-rate latency from rate-matching (0 if none / not resampling)
+
+    //--- THE RATE-MATCH, ANSWERED WITHOUT A MODEL ---------------------------------------------
+    // 🔴 WHY THIS IS PUBLIC AND STATIC. Three facts decide what a rate-match costs — the run rate a
+    // model will actually get, whether a resampler is installed at all, and the host-rate delay if one
+    // is — and until now all three lived inside an INSTANCE method that needs a loaded, prepared
+    // model. A consumer that must size a fixed delay line BEFORE any model exists therefore rewrote
+    // the arithmetic from a comment, and rewrote it wrong: a downstream bypass path capped itself at
+    // 64 samples on a formula two kernel generations stale, and silently under-delayed every host rate
+    // above 48 kHz. Restating this is the defect; asking is the fix.
+    //
+    // The ORDER of the three is part of the contract and not an implementation detail: the model rate
+    // is normalised FIRST, and the gate then sees the normalised value. An untagged model (rate <= 0)
+    // therefore runs at the default and is NOT resampled at a default-rate host — reverse the two and
+    // that case changes.
+    // 🔴 THE RATE A MODEL ACTUALLY RUNS AT, AND IT IS NOT A DEFAULT — it is the only value this class
+    // can hold. install() refuses any tagged model whose rate differs from the stage's current run
+    // rate, and that rate is only ever re-derived from a model that already passed the same refusal:
+    // a fixed point at this number. An untagged model runs here too. Measured, not inferred — every
+    // public route was tried (see the P36 report), and 44.1 kHz and 96 kHz captures are all refused.
+    //
+    // It is public because a consumer sizing a delay line before any model exists needs a CEILING,
+    // and until now it could not even name this number: a downstream repository invented a "lowest
+    // pack rate" of 8 kHz to stand in for it, and sized itself wrong. The ceiling is
+    // ceil(core::StreamResampler::pairDelayHostSamples (maxHostSR, kModelSampleRate)).
+    static constexpr double kModelSampleRate = 48000.0;
+
+    struct RateMatch
+    {
+        double modelRunSR;      // the rate the model will be run at, after normalising an unknown one
+        bool   resampling;      // whether a rate-matcher is installed at all
+        int    latencySamples;  // host-rate latency it costs; 0 when no resampler is installed
+    };
+
+    // Pure function of the two rates: no state, no model, no allocation. `modelSR` is the rate a model
+    // REPORTS (<= 0 meaning "unknown"), not one already normalised.
+    static RateMatch rateMatch (double hostSR, double modelSR) noexcept;
     // How many samples this model must be FED before its output means anything — its receptive field.
     // A network with empty buffers describes the silence it was born into for exactly this long, so
     // anything that fades a freshly loaded model in has to run it silently for this many samples

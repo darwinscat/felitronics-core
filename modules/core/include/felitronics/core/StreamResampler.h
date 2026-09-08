@@ -103,13 +103,43 @@ struct StreamResampler
     std::vector<float> tab;             // (kPhases+1) rows x kTaps, normalised per row — built in reset()
     bool identity = false;              // exact 1:1 ratio → pure delay, no filtering (see header note)
 
-    // The delay this stage adds, in ITS OWN INPUT samples — the single source of truth for every
-    // consumer that has to align something against it. It does NOT depend on the ratio and it is NOT
-    // the (N-1)/2 = 31.5 of a symmetric 64-tap FIR: output k is centred on input k·r − kHalf
-    // (derivation in the header block above). A round trip through two stages costs
-    // delayInputSamples() of the first stage's input rate plus the same count of the second's, which
-    // is why NamStage reports kHalf·(1 + hostSR/modelRunSR) and not twice one number.
-    static constexpr double delayInputSamples() noexcept { return (double) kHalf; }
+    // The delay ONE stage adds, in ITS OWN INPUT samples — the single source of truth for every
+    // consumer that has to align something against it. It is NOT the (N−1)/2 = 31.5 of a symmetric
+    // 64-tap FIR: output k is centred on input k·r − kHalf (derivation in the header block above).
+    //
+    // 🔴 IT TAKES THE RATES, AND TODAY IT IGNORES THEM. That is deliberate and it is the whole point
+    // of the signature. The kernel is a FIXED kTaps wide right now, so the delay is kHalf whatever the
+    // conversion — but the open plan item (docs/STREAM-RESAMPLER-COST.md §6.7) is to scale kTaps by
+    // max(1, inRate/outRate), which makes the delay a function of the ratio and makes the two legs of
+    // a round trip DIFFERENT: 192 kHz → 48 kHz would cost 128 input samples going down and 32 model
+    // samples coming back, not 32 and 32. Every consumer that had baked "the delay is a constant" into
+    // its own arithmetic would then be wrong, silently, exactly as one downstream repository already
+    // was. Taking the rates now costs nothing and means that change edits one body.
+    static double delayInputSamples ([[maybe_unused]] double inRate,
+                                     [[maybe_unused]] double outRate) noexcept
+    {
+        return (double) kHalf;
+    }
+
+    // What a DOWN+UP PAIR costs, in HOST samples — the composition, owned here so nobody restates it.
+    //
+    // 🔴 THIS IS GEOMETRY, NOT LATENCY. It answers "what would a pair of these cost", and at equal
+    // rates it answers 2·kHalf, because a pair really would cost that. Whether a pair is INSTALLED at
+    // all is a policy question belonging to the consumer — nam::NamStage installs one only past a
+    // 0.5 Hz difference and reports 0 below it, and that gate lives with the policy, in
+    // NamStage::rateMatch(). Reading this number as "the latency" is the mistake this split exists to
+    // make impossible.
+    //
+    // The expression order is the shipped one and is kept deliberately: `a + a·h/m`, not the tidier
+    // `a·(1 + h/m)`. They agree bit-for-bit on every rate pair measured (60 pairs, zero differences)
+    // for a reason that will EXPIRE — kHalf is a power of two, so scaling by it is exact and both
+    // spellings carry a single rounding. Make the delay ratio-dependent and that stops being true.
+    static double pairDelayHostSamples (double hostSR, double modelRunSR) noexcept
+    {
+        const double down = delayInputSamples (hostSR, modelRunSR);      // host samples, going down
+        const double up   = delayInputSamples (modelRunSR, hostSR);      // MODEL samples, coming back
+        return down + up * (hostSR / modelRunSR);                        // …converted to host samples
+    }
 
     // Modified Bessel I0, series. Hand-rolled on purpose: std::cyl_bessel_i is not dependably present
     // across the toolchains this repo builds on (MSVC, Apple clang, emscripten), and the table has to
