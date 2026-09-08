@@ -29,10 +29,15 @@ cmake_install.cmake
 # macOS
 .DS_Store
 
-# Local AI-assistant brain — kept private/local, not shipped
+# Local AI-assistant brain — kept private/local, not shipped.
+# NO TRAILING SLASH, deliberately. `.private/` matches a DIRECTORY only, and a session working in a
+# git worktree reaches the real one through a SYMLINK -- which is a file, matches nothing here, and
+# is staged by `git add -A`. That is F16 on this branch: the symlink reached the index of a PUBLIC
+# repository, and removing it did not disarm the rule that let it in. Without the slash one rule
+# covers the directory, a symlink to it, and a stray file of the same name.
 CLAUDE.md
-.claude/
-.private/
+.claude
+.private
 
 # Stray logs
 *.log
