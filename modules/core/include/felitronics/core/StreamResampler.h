@@ -103,13 +103,83 @@ struct StreamResampler
     std::vector<float> tab;             // (kPhases+1) rows x kTaps, normalised per row — built in reset()
     bool identity = false;              // exact 1:1 ratio → pure delay, no filtering (see header note)
 
-    // The delay this stage adds, in ITS OWN INPUT samples — the single source of truth for every
-    // consumer that has to align something against it. It does NOT depend on the ratio and it is NOT
-    // the (N-1)/2 = 31.5 of a symmetric 64-tap FIR: output k is centred on input k·r − kHalf
-    // (derivation in the header block above). A round trip through two stages costs
-    // delayInputSamples() of the first stage's input rate plus the same count of the second's, which
-    // is why NamStage reports kHalf·(1 + hostSR/modelRunSR) and not twice one number.
-    static constexpr double delayInputSamples() noexcept { return (double) kHalf; }
+    // The delay ONE stage adds, in ITS OWN INPUT samples — the single source of truth for every
+    // consumer that has to align something against it. It is NOT the (N−1)/2 = 31.5 of a symmetric
+    // 64-tap FIR: output k is centred on input k·r − kHalf (derivation in the header block above).
+    //
+    // 🔴 IT TAKES THE RATES, AND TODAY IT IGNORES THEM. That is deliberate and it is the whole point
+    // of the signature. The kernel is a FIXED kTaps wide right now, so the delay is kHalf whatever the
+    // conversion — but the open plan item (docs/STREAM-RESAMPLER-COST.md §6.7) is to scale kTaps by
+    // max(1, inRate/outRate), which makes the delay a function of the ratio and makes the two legs of
+    // a round trip DIFFERENT: 192 kHz → 48 kHz would cost 128 input samples going down and 32 model
+    // samples coming back, not 32 and 32. Every consumer that had baked "the delay is a constant" into
+    // its own arithmetic would then be wrong, silently, exactly as one downstream repository already
+    // was. Taking the rates now costs nothing and means that change edits one body.
+    static double delayInputSamples ([[maybe_unused]] double inRate,
+                                     [[maybe_unused]] double outRate) noexcept
+    {
+        return (double) kHalf;
+    }
+
+    // What a DOWN+UP PAIR costs, in HOST samples — the composition, owned here so nobody restates it.
+    //
+    // 🔴 THIS IS GEOMETRY, NOT LATENCY. It answers "what would a pair of these cost", and at equal
+    // rates it answers 2·kHalf, because a pair really would cost that. Whether a pair is INSTALLED at
+    // all is a policy question belonging to the consumer — nam::NamStage installs one only past a
+    // 0.5 Hz difference and reports 0 below it, and that gate lives with the policy, in
+    // NamStage::rateMatch(). Reading this number as "the latency" is the mistake this split exists to
+    // make impossible.
+    //
+    // The expression order is the shipped one and is kept deliberately: `a + a·h/m`, not the tidier
+    // `a·(1 + h/m)`. They agree bit-for-bit on every rate pair measured (60 pairs, zero differences)
+    // for a reason that will EXPIRE — kHalf is a power of two, so scaling by it is exact and both
+    // spellings carry a single rounding. Make the delay ratio-dependent (the open kTaps item) and D
+    // becomes 35, 59, 118…, where integer straddles do exist: the nearest to the audio grid is a
+    // 6930 Hz host against a 44.1 kHz model. One spelling, in one place, is the whole defence.
+    //
+    // PRECONDITION, stated as what is KEPT rather than as a wish: both rates positive and
+    // hostSR <= DBL_MAX/kHalf = 5.6177910464e306. Past that the multiplication overflows and the
+    // answer is inf even where the true one is finite. There is no lower bound to state — a subnormal
+    // quotient is absorbed by the leading kHalf, measured. A non-positive modelRunSR divides by zero,
+    // which is why nam::NamStage::rateMatch() normalises BEFORE it calls in here.
+    static double pairDelayHostSamples (double hostSR, double modelRunSR) noexcept
+    {
+        const double down = delayInputSamples (hostSR, modelRunSR);      // host samples, going down
+        const double up   = delayInputSamples (modelRunSR, hostSR);      // MODEL samples, coming back
+        // 🔴 THE GROUPING IS THE SHIPPED ONE, LITERALLY. `up * hostSR / modelRunSR` parses as
+        // `(up * hostSR) / modelRunSR`, which is what NamStage computed before this extraction
+        // (`d + d * hostSR / modelRunSR`). A crew round caught a regrouping into
+        // `up * (hostSR / modelRunSR)`; "no number moves" has to mean the arithmetic, not just the
+        // answers we sampled.
+        //
+        // WHAT THE TWO SPELLINGS ACTUALLY COST, measured rather than asserted, because the next round
+        // read the same comment and concluded the opposite. While `up` is a power of two, scaling by
+        // it is exact and round-to-nearest commutes with it, so the two are BIT-IDENTICAL: 20 000 000
+        // random positive finite pairs over exponents ±300, and the 17x9 audio grid, give zero
+        // differences. They part only at the two ends, and each spelling loses at one of them:
+        //
+        //   hostSR > DBL_MAX/kHalf = 5.6177910464e306 → `up * hostSR` overflows and THIS spelling
+        //                                        returns inf where the answer is finite: DBL_MAX
+        //                                        against DBL_MAX/2 is 96, and this returns inf.
+        //
+        // 🔴 AND THAT IS THE ONLY END, which an earlier version of this paragraph got wrong — it also
+        // claimed a loss at the bottom, where a subnormal quotient costs the parenthesised spelling
+        // ~14 digits (3.1999999999999902e-309 against 3.2000000000000001e-309). That is true of the
+        // TERM and false of this FUNCTION: `down` is 32, and adding a subnormal to 32 annihilates it,
+        // so both spellings return bit-identical 32. A comment that attributes a term's loss to the
+        // result is the same disease as a comment that outlives its code.
+        //
+        // So the parenthesised spelling is, today, strictly the wider of the two, and it is NOT used
+        // anyway — deliberately. The reasons are continuity and the future, not accuracy: this is
+        // literally the expression NamStage shipped, a crew round already caught one regrouping of it,
+        // and under `-ffp-contract=on` (this repository's build flag) `down + up*(h/m)` is an FMA
+        // candidate while `down + (up*h)/m` is not. None of that bites while D is a power of two and
+        // both are exact. It all bites at once when the open kTaps item makes D ratio-dependent — at
+        // D = 35 the two spellings differ on 17.28 % of 20 000 000 random pairs — and THAT is when the
+        // choice should be made, with the kernel change, not before it. The PRECONDITION on the
+        // declaration says what today's spelling actually keeps.
+        return down + up * hostSR / modelRunSR;                          // …converted to host samples
+    }
 
     // Modified Bessel I0, series. Hand-rolled on purpose: std::cyl_bessel_i is not dependably present
     // across the toolchains this repo builds on (MSVC, Apple clang, emscripten), and the table has to

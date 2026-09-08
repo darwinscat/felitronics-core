@@ -51,6 +51,7 @@
 
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/core/DryAligner.h>
+#include <felitronics/core/StreamResampler.h>
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/lineareq/MagnitudeCurve.h>
@@ -188,6 +189,75 @@ public:
     // its own (setColdAfterSeconds); zero or less = never.
     static constexpr double kColdAfterSeconds = 2.0;
 
+    // 🔴 THE CEILING ON A HOST RATE, and every buffer derived from one is bounded by it. Far above any
+    // audio rate — 3 MHz is sixteen times the highest a DAW offers — and its job is not to judge taste
+    // but to keep `(int) f(sampleRate)` inside int and the rings it sizes inside memory. A rate above
+    // it falls back to 48 kHz the same way a negative or non-finite one does.
+    //
+    // The VALUE is the house convention, not a new number: dynamics::Compressor::kMaxSampleRate and
+    // limiter::TruePeakLimiter::kMaxSampleRate are both 3.0e6 with the same stated reason, and
+    // eq::EqBand::prepare refuses past the same figure as a literal. That it now has a FOURTH spelling
+    // is the very disease this branch exists to treat, and consolidating the four is its own task —
+    // rigplayer links neither dynamics nor limiter, so it cannot simply ask.
+    static constexpr double kMaxSampleRate = 3.0e6;
+
+    // The ONE place a host rate is judged, so that nothing downstream re-decides it. A rate outside
+    // the accepted range becomes the factory rate rather than a refusal, which is what this class did
+    // for a non-positive rate before and what stereo::MonoBass and the dynamics detectors do too.
+    //
+    // Spelled as a RANGE and positively — the idiom TruePeakLimiter documents: `> 0.0` is false for a
+    // NaN and `<= kMaxSampleRate` is false for an infinity, so between them they exclude everything
+    // std::isfinite would have, and an isfinite here would be a clause no test could distinguish.
+    static double usableSampleRate (double hostSR) noexcept
+    {
+        return (hostSR > 0.0 && hostSR <= kMaxSampleRate) ? hostSR : 48000.0;
+    }
+
+    // 🔴 THE DRY ALIGNER'S CAPACITY, PURE — the same medicine this branch applies to the rate-match
+    // geometry, applied to the last piece of arithmetic that was still inline in prepare(). Pure and
+    // public for exactly the reasons rateMatch() is: it is the only way to pin values at rates this
+    // repository does not itself run, and the only way the FLOOR below can be gated at all. A crew
+    // round deleted that floor and every suite in the tree stayed green, because the floor's real
+    // defence — the ratchet — costs thousands of model loads to reproduce through the audio path.
+    //
+    // 🔴 WHAT THE FLOOR IS FOR, and it is NOT what an earlier comment here said. Computing the number
+    // removes the restatement but does NOT make 48 kHz a provable ceiling on the model rate:
+    // install() accepts a model within half a hertz of the current run rate and prepare() then ADOPTS
+    // it, so repeated half-hertz swaps walk the run rate away from the factory value without bound
+    // while audio is running. A LOWER run rate means a LONGER round trip, and the capacity here is
+    // derived from 48 kHz, so it can come up a slot short of a delay the stage really reports — and
+    // DryAligner clamps silently. The shipped 256 stays as a floor: the computed term can only raise
+    // it.
+    //
+    // 🔴 AND WHAT THE FLOOR BUYS DEPENDS ENTIRELY ON THE HOST RATE, which is worth stating because it
+    // is not obvious and it is not much where it matters least. The floor only binds below 333001 Hz
+    // (see the pin table in the tests); above that the computed term is the whole capacity and the
+    // floor is inert. Accepted half-hertz steps before the first silent clamp, measured:
+    //
+    //     96 kHz  : ~68 500   (the floor is doing all the work)
+    //    192 kHz  :   1112    (162 without the floor, 41021 with it — the floor buys the difference)
+    //    384 kHz  :    559    (floor inert: capacity is the computed 290)
+    //      3 MHz  :     72    (floor inert; the ratio is 62.5, so a small drop in the model rate moves
+    //                          the delay a long way)
+    //
+    // So this is a MITIGATION with a measured price, not a proof. The remaining exposure — sizing at
+    // one rate while the stage reports at another — closes properly only by re-preparing the aligner
+    // when the run rate changes, or by not letting the run rate walk at all, and both are contract
+    // questions that belong with the half-hertz tolerance in NamStage::install(), not here.
+    //
+    // 🔴 AND THE "+2" IS ONE REASON, NOT TWO. An earlier comment gave two — "capacity-1" and "ceil()
+    // of an integer leaves no headroom" — and the second does not exist: ceil(x) >= lround(x) for
+    // every x >= 0, so ceil(x)+1 already covers the request whenever the request is derived from the
+    // SAME x. The spare slot earns its place only where they are derived from DIFFERENT rates, which
+    // is the ratchet above: at 384 kHz a run rate walked to 47905.5 reports 289 while this function,
+    // asking at 48 kHz, sizes for 288 — +1 clamps, +2 does not.
+    static int dryAlignerCapacity (double hostSR) noexcept
+    {
+        const double fs = usableSampleRate (hostSR);
+        return std::max (256, (int) std::ceil (felitronics::core::StreamResampler::pairDelayHostSamples (
+                                                   fs, felitronics::nam::NamStage::kModelSampleRate)) + 2);
+    }
+
     RigPlayer() = default;
     RigPlayer(const RigPlayer&) = delete;
     RigPlayer& operator=(const RigPlayer&) = delete;
@@ -202,7 +272,27 @@ public:
         prepared_ = false;                       // law 11(b): disarm FIRST, then validate, then write
         if (numChannels < 1 || numChannels > kMaxChannels) return false;
         if (maxBlock < 1) return false;
-        fs_       = sampleRate > 0.0 ? sampleRate : 48000.0;
+        // 🔴 IN RANGE, not merely finite — and the difference is the whole point, because an earlier
+        // version of this line said `isfinite` and that is NOT the property the code below depends on.
+        // The dry-aligner capacity is `(int) ceil(<a function of fs_>)`, and an out-of-range float→int
+        // conversion is undefined: `isfinite` lets 1e300 through, and 1e300 converts just as badly as
+        // an infinity does. Measured through this very function with UBSan, before this line was
+        // widened: prepare(1e300, 64, 2) returned TRUE while firing twice — "6.66667e+296 is outside
+        // the range of representable values of type 'int'", then "signed integer overflow: 2147483647
+        // + 2". On the base commit, where the capacity was a literal, neither fired: the exposure came
+        // in with the computation, and half of it survived the fix that was written for it.
+        //
+        // The second face of the same line is not undefined at all and is worse for being legal: the
+        // capacity used to be a CONSTANT and is now a function of the argument, so the ring it sizes
+        // grew without an upper bound. Measured on the same probe — heap requested inside one
+        // prepare() call: 0 bytes at 1e11 on the base commit, 533 333 608 (508.6 MiB) here.
+        //
+        // kMaxSampleRate closes both, and it is the house number rather than a new one. Spelled as a
+        // RANGE and positively, which is the same idiom TruePeakLimiter documents: `sampleRate > 0.0`
+        // is false for a NaN and `sampleRate <= kMaxSampleRate` is false for an infinity, so the two
+        // comparisons already exclude everything `std::isfinite` would have — an explicit isfinite
+        // here would be a clause no test could ever distinguish.
+        fs_       = usableSampleRate (sampleRate);
         maxBlock_ = maxBlock;
         channels_ = numChannels;   // validated above — law 11(b) forbids the clamp that was here
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
@@ -223,10 +313,18 @@ public:
         // whole player's PDC outward while this notch is INTERNAL to the blend. Measured on a 50/50
         // blend, worst dip across 100 Hz … 10 kHz: -50 dB unaligned against 0.00 dB aligned.
         //
-        // Capacity: it must EXCEED the delay it will ever hold (DryAligner clamps to [0, capacity-1]).
-        // The largest this can report is a 192 kHz host against a 48 kHz model — D·(1 + 4) = 160 — so
-        // 256 covers it with margin. `kMaxDelay` is 128 and would silently clamp.
-        dryLatency_.prepare(channels_, maxBlock_, 256);
+        // Capacity: it must EXCEED the delay it will ever hold — DryAligner clamps to [0, capacity-1]
+        // and does it SILENTLY, which is exactly how a downstream repository shipped a bypass path
+        // that under-delayed every host rate above 48 kHz.
+        //
+        // 🔴 THE PREVIOUS VERSION OF THESE LINES WAS THE SAME MISTAKE, WRITTEN BY THE FIX FOR IT. It
+        // said "the largest this can report is a 192 kHz host against a 48 kHz model — D·(1 + 4) = 160
+        // — so 256 covers it with margin", and that sentence is a RESTATEMENT of the round-trip
+        // formula sitting in front of a silent clamp. It was true when written and would have stopped
+        // being true the moment the kernel length became a function of the ratio. Ask instead — and
+        // the asking now lives in dryAlignerCapacity(), where it can be pinned at rates this file
+        // never runs, because inline arithmetic here is exactly what could not be.
+        dryLatency_.prepare(channels_, maxBlock_, dryAlignerCapacity (fs_));
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
@@ -967,7 +1065,12 @@ private:
     // In HOST samples. A pack's numbers are in the model's own rate, which the stage knows once the
     // model is loaded; a measured table carries the rate it was measured at.
     int delayOfModel(std::uint64_t id, const felitronics::nam::NamStage& st) const {
-        return align_.delayOf(fileIdOfModel(id), fs_, st.modelSampleRate());
+        // Same reason as warmFor(): a pack's lag is written in the model's OWN rate, and for an
+        // untagged capture that rate is not the -1 the stage reports — it is the rate the stage will
+        // actually run it at. AlignmentTable falls back to scale 1.0 when handed a non-positive rate,
+        // which for an untagged model at 96 kHz would apply a 48 kHz lag unscaled.
+        const double runSR = felitronics::nam::NamStage::rateMatch(fs_, st.modelSampleRate()).modelRunSR;
+        return align_.delayOf(fileIdOfModel(id), fs_, runSR);
     }
 
     // The whole decision for the panel as it stands, handed to the audio thread as a request. What the
@@ -1036,7 +1139,12 @@ private:
     long long warmFor(const felitronics::nam::NamStage& st) const {
         const int pre = st.prewarmSamples();
         if (pre <= 0) return 0;
-        const double mr = st.modelSampleRate();
+        // 🔴 ASK for the rate the model will be RUN at, do not read the rate it REPORTS. An untagged
+        // capture reports -1 and NamStage runs it at kModelSampleRate anyway; the previous line here
+        // restated the normalisation with a different answer — `scale = 1.0` — and therefore
+        // under-warmed such a model by a whole receptive field at a 96 kHz host, which is exactly the
+        // guarantee the comment above says must not quietly stop holding.
+        const double mr = felitronics::nam::NamStage::rateMatch(fs_, st.modelSampleRate()).modelRunSR;
         const double scale = (mr > 0.0 && fs_ > 0.0) ? fs_ / mr : 1.0;
         return (long long) std::ceil((double) pre * scale) + (long long) st.latencySamples() + maxBlock_;
     }

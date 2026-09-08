@@ -34,7 +34,9 @@ namespace
 
     // Factory captures are conventionally trained at 48 kHz; the core StreamResampler converts
     // the host stream to/from this so an untagged model still runs at the historical native rate.
-    constexpr double kModelSampleRate = 48000.0;
+    // The one place this number lives is NamStage::kModelSampleRate (public, so consumers can name
+    // it). This alias exists only so the lines below stay readable.
+    constexpr double kModelSampleRate = NamStage::kModelSampleRate;
 
     // NeuralStage bounds its retire queue (the pre-extraction code kept an unbounded vector) and
     // REFUSES a swap/clear against a full one. 64 pending models is unreachable in normal use —
@@ -114,7 +116,13 @@ public:
         {
             hostSR   = sampleRate;
             maxBlock = std::max (1, maxBlockIn);
-            configureRates (expectedSR > 0.0 ? expectedSR : kModelSampleRate);
+            // 🔴 THE RAW RATE, NOT A NORMALISED ONE. This line used to spell
+            // `expectedSR > 0.0 ? expectedSR : kModelSampleRate` — a second copy of the normalisation
+            // that rateMatch() already owns — and the mutation stand proved it was not decoration:
+            // with the default pre-applied here, breaking the default INSIDE rateMatch changed nothing
+            // for an untagged model, so the suite could not see it. Hand over what the model actually
+            // reported and let the one owner decide.
+            configureRates (expectedSR);
             for (auto& m : inst)
                 if (m) m->Reset (modelRunSR, maxModelFrames);
             prepared_ = true;
@@ -162,32 +170,19 @@ public:
 
     // Host-rate latency the rate-matcher introduces (0 when not resampling).
     //
-    // 🔴 NOT A GUESS, AND NOT OURS TO RESTATE. It was `ceil(3*hostSR/modelRunSR) + 3` once — a guess
-    // at "~3 samples of lookahead per stage", 2.16 samples wrong — and P32 replaced it with the CUBIC
-    // kernel's real geometry, `2 + 2*hostSR/modelRunSR`. P34 swapped that kernel for a 64-tap
-    // polyphase windowed sinc, so the geometry moved again. Restating a class's internals here is what
-    // made this line wrong twice; ask the class instead:
+    // 🔴 THIS LINE HAS BEEN WRONG TWICE, BOTH TIMES BY RESTATING SOMEBODY ELSE'S ARITHMETIC. It was
+    // `ceil(3*hostSR/modelRunSR) + 3` once — a guess at "~3 samples of lookahead per stage", 2.16
+    // samples out — and P32 replaced it with the cubic kernel's real geometry, which P34 then made
+    // stale again by swapping the kernel. So it does not compute anything now: `configureRates()`
+    // asked `NamStage::rateMatch()` once, and this reports what it was told. The derivation lives
+    // where the geometry lives, in core::StreamResampler; the gate and the rounding live in
+    // rateMatch(); and there is exactly one copy of each.
     //
-    //     D = StreamResampler::delayInputSamples()  — every stage delays D of ITS OWN input samples
-    //     round trip = D host samples (down) + D model samples (up), the latter converted to host rate
-    //                = D · (1 + hostSR/modelRunSR)
-    //
-    // With D = 32 that is 61.4000 host samples at 44.1 kHz (was 3.8375), 96.0000 at 96 kHz, 90.8000 at
-    // 88.2 kHz, 53.3333 at 32 kHz. MEASURED back from the carrier phase of the real round trip at
-    // 100 Hz and 500 Hz, where the delay is below one whole period and therefore unambiguous: 61.4000,
-    // the geometry to four decimals. Unlike the cubic this kernel is symmetric and its phase delay is
-    // FLAT with frequency, so the old "+0.018 at 10 kHz, +0.620 at 20 kHz" group-delay caveat died
-    // with the cubic and is deliberately not restated.
-    //
-    // The true delay is FRACTIONAL and this reports an integer, so round to nearest (residual ≤ 0.5;
-    // the worst here is 0.40 at 44.1 kHz, whose first comb notch against an undelayed dry path would
-    // sit at 55 kHz, out of band). What consumers DO act on: OrbitCab and orbit-amp delay their
-    // dry/bypass path by this same number, so it is an audio-alignment figure there, not only PDC.
+    // The number IS acted on outside this repository — OrbitCab and orbit-amp delay their dry/bypass
+    // path by it — so it is an audio-alignment figure there, not only PDC.
     int latencySamples() const noexcept
     {
-        if (! prepared_ || ! resampling) return 0;   // an unprepared backend passes through — no latency
-        const double d = felitronics::core::StreamResampler::delayInputSamples();
-        return (int) std::lround (d + d * hostSR / modelRunSR);
+        return prepared_ ? rm_.latencySamples : 0;   // an unprepared backend passes through
     }
 
     //--- model info (read by the loader for NamStage's UI-mirror atomics) ----------
@@ -201,8 +196,11 @@ private:
     // while this instance is live and audio runs). modelRunSR = the loaded model's native rate.
     void configureRates (double modelSR)
     {
-        modelRunSR  = (modelSR > 0.0 ? modelSR : kModelSampleRate);
-        resampling  = std::abs (hostSR - modelRunSR) > 0.5;
+        // ONE call decides all three: the run rate, whether a resampler is installed, and what it
+        // costs. Recomputing any of them here is how they drifted apart before.
+        rm_         = NamStage::rateMatch (hostSR, modelSR);
+        modelRunSR  = rm_.modelRunSR;
+        resampling  = rm_.resampling;
         maxModelFrames = (int) std::ceil (maxBlock * (modelRunSR / std::max (8000.0, hostSR))) + 16;
         for (auto& c : ch)
         {
@@ -263,6 +261,7 @@ private:
     int    maxBlock = 512;
     bool   resampling = false;              // hostSR != model native rate
     double modelRunSR = kModelSampleRate;   // the rate the NAM instances are Reset to / run at
+    NamStage::RateMatch rm_ { kModelSampleRate, false, 0 };   // decided once per prepare(), reported after
     int    maxModelFrames = 1024;
     Ch     ch[2];
 };
@@ -540,6 +539,66 @@ bool   NamStage::hasModel()         const { return impl->stage.hasModel(); }
 double NamStage::modelSampleRate()  const { return impl->expectedSR.load  (std::memory_order_relaxed); }
 double NamStage::modelLoudness()    const { return impl->loudnessDb.load  (std::memory_order_relaxed); }
 bool   NamStage::modelHasLoudness() const { return impl->hasLoudness.load (std::memory_order_relaxed); }
+// THE ONE ANSWER. Three facts, each written down exactly once, and the order between them is part of
+// the contract rather than an accident of how the old code happened to be laid out.
+//
+//  1. NORMALISE. A model that reports no rate (<= 0) runs at the factory rate. This happens FIRST, so
+//     the gate below compares against the rate the model will ACTUALLY run at. Reverse the two and an
+//     untagged model at a 48 kHz host would be judged against 0 and come out "resampling".
+//  2. GATE. A resampler is installed only past half a hertz of difference. Below that the rates are
+//     the same clock as far as anything audible is concerned, and installing a 64-tap kernel to
+//     convert 48000 to 48000.4 would cost 64 samples of delay to no purpose.
+//  3. DERIVE, and only if one is installed. The geometry is core's — `pairDelayHostSamples` — and
+//     the rounding is ours: the true delay is fractional and a host wants an integer, so round to
+//     nearest. The residual is at most half a sample (worst on the shipped grid: 0.40 at 44.1 kHz,
+//     whose first comb notch against an undelayed dry path sits at 55 kHz, out of band).
+//
+// 🔴 NOT GUARDED, DELIBERATELY — and what an absurd hostSR does has now been measured rather than
+// reasoned about, because two earlier wordings of this paragraph were wrong about it. There are FOUR
+// regimes against a 48 kHz model, not two (m = the model rate, the delay is 32 + 32·h/m):
+//
+//   h negative      → a perfectly finite, perfectly useless number (-48000 gives exactly 0).
+//   h NaN           → fails the gate, returns 0 (the comparison itself raises FE_INVALID).
+//   h > ~3.22e12    → lround is fine, but NARROWING ITS long TO int silently invents a plausible
+//                     positive answer: h = 1e18 reports 1842981579 samples of latency, no flag raised.
+//   h > ~1.38e22    → the value passes out of long's range too: lround saturates and FE_INVALID is
+//                     raised. An INFINITE host lands in this same regime, which is why the earlier
+//                     claim that "only an infinite host" gets this far was false: a finite 1e23
+//                     reaches it identically, on every row measured.
+//
+// 🔴 AND THE ANSWER IN THE LAST TWO REGIMES IS PLATFORM-SPECIFIC, so no number is quoted for it here.
+// Measured on four rows rather than reasoned about, because an earlier draft of this paragraph quoted
+// "-1" and that is one toolchain's answer out of three:
+//
+//   arm64 macOS / x86-64 macOS (Apple libm) : lround saturates to LONG_MAX  → (int) = -1
+//   x86-64 Debian (gcc 14 + glibc)          : lround saturates to LONG_MIN  → (int) =  0
+//   x86-64 Windows (MSVC 19.44 + UCRT)      : long is 32 BITS, so lround saturates far earlier —
+//                                             even the 1e18 case, where all three POSIX rows agree on
+//                                             1842981579, reads 0 there.
+//
+// The two Mac rows and the Debian row share an ISA in one pairing and a toolchain in the other, which
+// is what identifies libm rather than the ISA as the thing that differs. On the SHIPPED grid — 16 host
+// rates x 3 model rates, up to the 3 MHz ceiling rigplayer now enforces — all four rows are
+// byte-identical, so this divergence lives strictly outside the documented domain.
+//
+// None of that is new: the base commit's latencySamples() computed `lround(d + d*hostSR/modelRunSR)`
+// with the same types and the same gate, so every one of the four regimes predates this extraction.
+// Adding a guard would be a BEHAVIOUR change wearing a refactor's clothes, while this commit promises
+// that no number moves. The one input that could divide by zero cannot reach the division: step 1
+// turns a non-positive model rate into the factory rate. A real contract for absurd host rates is a
+// separate question — and the consumer that actually sizes a buffer from this, rigplayer, no longer
+// depends on the answer: it bounds its host rate before it asks.
+NamStage::RateMatch NamStage::rateMatch (double hostSR, double modelSR) noexcept
+{
+    RateMatch r {};
+    r.modelRunSR = (modelSR > 0.0 ? modelSR : kModelSampleRate);
+    r.resampling = std::abs (hostSR - r.modelRunSR) > 0.5;
+    r.latencySamples = r.resampling
+        ? (int) std::lround (felitronics::core::StreamResampler::pairDelayHostSamples (hostSR, r.modelRunSR))
+        : 0;
+    return r;
+}
+
 int    NamStage::latencySamples()   const { return impl->stage.latencySamples(); }
 int    NamStage::prewarmSamples()   const { return impl->prewarmSamples.load (std::memory_order_relaxed); }
 

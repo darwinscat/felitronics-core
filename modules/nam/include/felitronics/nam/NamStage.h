@@ -102,6 +102,67 @@ public:
     double modelLoudness()   const;   // the model's tagged loudness in dB (0 if none / no model)
     bool   modelHasLoudness() const;  // whether the loaded model carries a loudness tag
     int    latencySamples()  const;   // host-rate latency from rate-matching (0 if none / not resampling)
+
+    //--- THE RATE-MATCH, ANSWERED WITHOUT A MODEL ---------------------------------------------
+    // 🔴 WHY THIS IS PUBLIC AND STATIC. Three facts decide what a rate-match costs — the run rate a
+    // model will actually get, whether a resampler is installed at all, and the host-rate delay if one
+    // is — and until now all three lived inside an INSTANCE method that needs a loaded, prepared
+    // model. A consumer that must size a fixed delay line BEFORE any model exists therefore rewrote
+    // the arithmetic from a comment, and rewrote it wrong: a downstream bypass path capped itself at
+    // 64 samples on a formula two kernel generations stale, and silently under-delayed every host rate
+    // above 48 kHz. Restating this is the defect; asking is the fix.
+    //
+    // The ORDER of the three is part of the contract and not an implementation detail: the model rate
+    // is normalised FIRST, and the gate then sees the normalised value. An untagged model (rate <= 0)
+    // therefore runs at the default and is NOT resampled at a default-rate host — reverse the two and
+    // that case changes.
+    // The rate a model runs at when it reports none, and in practice the rate almost every model
+    // runs at: install() refuses a tagged model whose rate differs from the stage's current run rate
+    // by more than half a hertz, and that rate is only ever re-derived from a model that already
+    // passed the same check — so a fresh stage accepts 48 kHz captures and refuses 44.1 and 96 kHz
+    // ones outright (measured: every public route was tried).
+    //
+    // ⚠️ IT IS NOT A PROVABLE CEILING, and an earlier version of this comment claimed it was. The
+    // check is a TOLERANCE, not equality: a model at 48000.5 is accepted, prepare() then adopts that
+    // rate, and the next half-hertz step is accepted against the new one. A LOWER run rate means a
+    // LONGER round trip, so sizing a buffer from this constant alone can come up short.
+    //
+    // 🔴 AND THE FIRST NUMBER PUBLISHED FOR IT MEASURED THE PROBE, NOT THE RATCHET. "65 accepted steps
+    // walked it from 48000 to 47967.5" is reproducible, but 65 is kMaxRetiredModels + 1: with no audio
+    // running between loads the retire queue fills and the next install parks as pending, so the walk
+    // stops for a reason that has nothing to do with rates. Run audio between the loads — which a
+    // plugin always does — and the walk does not stop at all: 2000 steps, no refusal. The ratchet is
+    // UNBOUNDED, which is a stronger reason to floor a derived buffer, not a weaker one.
+    //
+    // It is public because a consumer sizing a delay line before any model exists has to start
+    // somewhere, and until now it could not even name this number: a downstream repository invented a
+    // "lowest pack rate" of 8 kHz to stand in for it, and sized itself wrong.
+    static constexpr double kModelSampleRate = 48000.0;
+
+    struct RateMatch
+    {
+        double modelRunSR     = kModelSampleRate;   // the rate the model would be run at, normalised
+        bool   resampling     = false;              // whether a rate-matcher would be installed
+        int    latencySamples = 0;                  // host-rate latency it costs; 0 when none is
+    };
+
+    // Pure function of the two rates: no state, no model, no allocation. `modelSR` is the rate a model
+    // REPORTS (<= 0 meaning "unknown"), not one already normalised.
+    //
+    // It answers for the rates it is GIVEN. It does not know whether a stage would accept a model at
+    // that rate — install() has its own contract — so rateMatch(h, 44100) describes what 44.1 kHz
+    // would cost, not a configuration a fresh stage can reach.
+    //
+    // Precondition, documented rather than enforced because this extraction promises that no number
+    // moves — and stated as the range it actually KEEPS, since "positive and finite" was measured to be
+    // wider than the arithmetic supports: hostSR in (0, 3.22e12]. Outside that the answer is whatever
+    // the arithmetic gives, exactly as it did before the extraction, and there are four regimes rather
+    // than the two the .cpp used to name — they are enumerated with their thresholds at rateMatch()'s
+    // definition. The two that bite: past ~3.22e12 the narrowing of lround's long to int invents a
+    // plausible positive answer with no flag raised, and past ~1.38e22 (an infinity included) the
+    // answer is whatever that platform's lround saturates to, which is NOT the same on all of them —
+    // measured on four rows, see the .cpp. h = 0 reports 32 against a real 64.
+    static RateMatch rateMatch (double hostSR, double modelSR) noexcept;
     // How many samples this model must be FED before its output means anything — its receptive field.
     // A network with empty buffers describes the silence it was born into for exactly this long, so
     // anything that fades a freshly loaded model in has to run it silently for this many samples

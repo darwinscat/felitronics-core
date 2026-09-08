@@ -443,16 +443,41 @@ int main()
         test::ok (onsetDelay (48000.0, 64) == 0,
                   "precondition: and the impulse comes straight back out, 0 samples late");
 
-        // Every expectation below is COMPUTED from the class's own D, so the table cannot drift away
-        // from the kernel the way the hand-written 3.8375 did.
-        const double kD = felitronics::core::StreamResampler::delayInputSamples();
-        auto geoAt = [kD] (double host) { return kD + kD * host / 48000.0; };
+        // Every expectation below is ASKED of the one function that owns the composition, so the table
+        // cannot drift away from the kernel the way the hand-written 3.8375 did — and, unlike the
+        // previous version of these two lines, it cannot drift away from the SHAPE of the composition
+        // either. Writing `kD + kD*host/48000` here was itself a restatement: it would keep passing
+        // after a change that made the two legs different, which is exactly what the open kTaps-scaling
+        // item does.
+        //
+        // 🔴 THIS IS NOT THE TEST COMPARING THE CODE WITH ITSELF. What is asserted below is that the
+        // number the stage REPORTS matches a delay measured out of the SIGNAL — carrier phase, with the
+        // whole-period ambiguity resolved by an impulse onset. The helper only supplies the expectation
+        // for that independent measurement; if it lied, the signal would disagree with it.
+        // 🔴 FRACTIONAL, and the distinction is not pedantry — it cost a red suite while this was
+        // being written. The delay measured out of the SIGNAL is fractional (61.4000 at 44.1 kHz);
+        // the number the stage REPORTS is that value rounded (61). They are two different quantities
+        // and the tests below need both: the fractional one to compare against the measurement, the
+        // rounded one to compare against the report. Asking the wrong one of the two functions is a
+        // restatement in a new costume, so each is asked where it belongs.
+        auto geoAt = [] (double host)
+        {
+            return felitronics::core::StreamResampler::pairDelayHostSamples (host, 48000.0);
+        };
 
         struct Case { double host; };
         // 32 kHz is in the list ON PURPOSE: it is the row where lround and ceil disagree most visibly
         // (geometry 53.3333 -> 53 against 54). Without it the choice of rounding is untested, which a
         // crew mutation proved by swapping lround for ceil and surviving.
-        for (const Case cc : { Case { 44100.0 }, Case { 96000.0 }, Case { 88200.0 }, Case { 32000.0 } })
+        // 🔴 THE ONLY NON-TAUTOLOGICAL ORACLE IN THIS FILE, and the list grew for that reason. Since
+        // the composition became one function, every test that compares the stage's report against
+        // "the geometry" is comparing that function with itself and is green by construction. What is
+        // NOT tautological is this: a delay measured out of the SIGNAL — carrier phase for the
+        // fraction, impulse onset to resolve which whole period it belongs to — against the number the
+        // stage reports. A wrong body in the one function would be invisible everywhere else and
+        // visible here. So the measured list carries the rates that matter rather than four of them.
+        for (const Case cc : { Case { 44100.0 }, Case { 96000.0 }, Case { 88200.0 }, Case { 32000.0 },
+                               Case { 22050.0 }, Case { 64000.0 }, Case { 176400.0 }, Case { 192000.0 } })
         {
             const struct { double host, expect; } c { cc.host, geoAt (cc.host) };
             const int on = onsetDelay (c.host, 64);
@@ -531,16 +556,39 @@ int main()
                 const auto json = gainModel();
                 if (! load (st, json)) { test::ok (false, "model loads at every swept rate"); break; }
                 st.prepare (host, 64);
-                const double D = felitronics::core::StreamResampler::delayInputSamples();
-                const double geo = D + D * host / 48000.0;
+                // 🔴 THE ONE PLACE A RESTATEMENT IS THE POINT, and a crew round proved it by injecting
+                // a +1 error into the geometry that this line — when it asked core — waved through
+                // while the OLD tests caught it. An oracle's whole job is to disagree with the thing it
+                // measures, so it must not share its arithmetic. Everything else in this file asks;
+                // this computes, independently, from the two facts the header states: every stage
+                // delays kHalf of its own input samples, and the return leg is converted at h/m.
+                const double kD  = (double) felitronics::core::StreamResampler::kHalf;
+                const double geo = kD + kD * host / 48000.0;
                 const double err = std::fabs ((double) st.latencySamples() - geo);
                 if (err > worst) { worst = err; worstAt = host; }
             }
             std::printf ("      worst reported-vs-geometry error over 19 host rates: %.4f samples (at %.0f Hz)\n",
                          worst, worstAt);
+            // ⚠️ WHAT THIS LINE IS AND IS NOT — and this paragraph was itself WRONG for one commit,
+            // which is the reason it now names its own history. It used to say both sides came from
+            // the same function and that the check was therefore "a statement about ROUNDING ONLY".
+            // That was true of a version in which `geo` ASKED core for the fractional value; a crew
+            // round proved what it cost by injecting a +1 error into the geometry, which that version
+            // waved through while the older tests caught it. `geo` was restored to an independent
+            // computation — the two facts the header states, nothing shared with the thing measured —
+            // and the paragraph explaining why it need not be independent was left standing behind it.
+            //
+            // What it is NOW: an independent oracle, so it catches BOTH a wrong composition and a
+            // wrong rounding step. Measured at the close of that round, this line among them: a +1
+            // error in the geometry fails 43 checks across the suite at nam=ON pffft=ON. (The commit
+            // that restored this oracle published "21", which was already wrong when written — three
+            // independent runs put it at 31 on that tree. A count is a measurement and goes stale like
+            // any other, so it carries its configuration and its date of measurement or it carries
+            // nothing.)
             test::ok (worst <= 0.5 + 1e-9,
-                      "over 19 host rates including every exact-half case, the reported integer is never "
-                      "more than 0.5 samples from the geometry (worst " + std::to_string (worst) + ")");
+                      "over 19 host rates including every exact-half case, the REPORTED INTEGER is the "
+                      "nearest one to the fractional geometry (worst " + std::to_string (worst)
+                      + ") — a claim about the rounding step, not about the formula");
             // …and at an exact half the BOUND accepts either neighbour, so pin the RULE itself: lround
             // takes halves away from zero. 44250 Hz gives exactly 61.5 with D = 32 (32 + 32·44250/48000
             // = 32 + 29.5). The rate that used to serve here, 60 kHz, now gives a whole 72.0.
@@ -566,10 +614,150 @@ int main()
             near.prepare (48000.4, 64); past.prepare (48001.0, 64);
             test::ok (near.latencySamples() == 0,
                       "0.4 Hz off the model rate is INSIDE the gate: no resampler, no latency");
+            // 🔴 AND 0.6 — the OUTSIDE edge, a hair past it. This cell exists because a crew round
+            // widened the gate from `> 0.5` all the way to `> 0.9` and the mutant SURVIVED: the only
+            // outside pin was 48001.0, a whole hertz out, so every threshold between 0.5 and 1.0 was
+            // free. The paragraph below already claimed 48000.6 was in the fixture — it was not, and a
+            // comment naming a value the code does not have is how a hole stays open.
+            {
+                nam::NamStage past2;
+                past2.prepare (48000.6, 64);
+                const auto j3 = gainModel();
+                test::ok (load (past2, j3), "a model loads on a stage half a hertz past the gate");
+                past2.prepare (48000.6, 64);
+                test::ok (past2.latencySamples() == 64,
+                          "0.6 Hz off the model rate is OUTSIDE the gate: a resampler is installed and "
+                          "costs " + std::to_string (past2.latencySamples()) + " samples. Widening the "
+                          "threshold anywhere into (0.5, 0.6] now fails here");
+            }
+            // 🔴 …AND A HAIR ABOVE THE BOUNDARY, not merely near it. 0.6 leaves the whole interval
+            // (0.5, 0.6) free, and a later round widened the gate to 0.55 and walked through. The fix
+            // is not another arbitrary distance: pin the predicate IMMEDIATELY above the edge, and
+            // every `> 0.5 + eps` mutation with eps >= 1e-4 dies at once.
+            {
+                nam::NamStage hair;
+                hair.prepare (48000.5001, 64);
+                const auto j4 = gainModel();
+                test::ok (load (hair, j4), "a model loads a ten-thousandth of a hertz past the gate");
+                hair.prepare (48000.5001, 64);
+                test::ok (hair.latencySamples() == 64,
+                          "48000.5001 is OUTSIDE the gate and costs "
+                          + std::to_string (hair.latencySamples()) + " samples, while 48000.5 exactly "
+                          "costs none — the predicate is `> 0.5` and nothing wider");
+            }
+            // 🔴 EXACTLY 0.5 — the boundary itself, which nothing tested. A mutation flipping `> 0.5`
+            // to `>= 0.5` survived the whole suite because 48000.4 and 48001.0 stood well clear of the
+            // edge without standing on it, and the gate's own predicate is only visible AT it.
+            {
+                nam::NamStage edge;
+                edge.prepare (48000.5, 64);
+                const auto j2 = gainModel();
+                test::ok (load (edge, j2), "model loads exactly half a hertz off the model rate");
+                edge.prepare (48000.5, 64);
+                test::ok (edge.latencySamples() == 0,
+                          "EXACTLY 0.5 Hz off is INSIDE the gate — the predicate is strict `> 0.5`, so "
+                          "the boundary belongs to the no-resampler side; `>= 0.5` would report "
+                          + std::to_string (nam::NamStage::rateMatch (48000.5, 48000.0).latencySamples));
+            }
+
+            // …and the NORMALISATION, which nothing tested either: two mutations survived here, one
+            // moving the default rate an untagged model runs at, one asking the gate about the raw
+            // reported rate instead of the normalised one. Both are invisible until an UNTAGGED model
+            // is asked what it costs, because a tagged one normalises to itself.
+            {
+                const auto untagged = gainModel (nullptr);          // no sample_rate field at all
+                nam::NamStage a48, a441;
+                a48.prepare (48000.0, 64);   test::ok (load (a48, untagged), "untagged model loads at 48 kHz");
+                a48.prepare (48000.0, 64);
+                a441.prepare (44100.0, 64);  test::ok (load (a441, untagged), "…and at 44.1 kHz");
+                a441.prepare (44100.0, 64);
+                test::ok (a48.latencySamples() == 0,
+                          "an UNTAGGED model runs at the factory rate, so at a 48 kHz host it is not "
+                          "resampled at all — which is only true if the rate is normalised BEFORE the "
+                          "gate sees it. Ask the raw -1 instead and this reports "
+                          + std::to_string (nam::NamStage::rateMatch (48000.0, 48000.0).latencySamples));
+                test::ok (a441.latencySamples() == nam::NamStage::rateMatch (44100.0, nam::NamStage::kModelSampleRate).latencySamples
+                          && a441.latencySamples() > 0,
+                          "…and at 44.1 kHz it costs exactly what a model tagged at the factory rate "
+                          "costs (" + std::to_string (a441.latencySamples()) + ") — which pins WHICH "
+                          "rate the default is, not merely that there is one");
+            }
+
             test::ok (past.latencySamples() == 64,
                       "1.0 Hz off it is OUTSIDE: the resampler engages and reports its full 64 samples — "
                       "D·(1 + 48001/48000) rounds to 64, and the DISCONTINUITY at the gate is the point: "
                       "0.4 Hz costs nothing and 1.0 Hz costs 64 samples of PDC");
+        }
+    }
+
+    test::group ("THE TWO FUNCTIONS THEMSELVES — pinned directly, because nothing else varies them");
+    {
+        // 🔴 WHY THIS GROUP EXISTS. A diverse-testing round replaced `modelRunSR` inside
+        // pairDelayHostSamples with the literal 48000 and the mutant survived every suite in the
+        // repository — because every call site in the tree passes 48000, and every model that goes live
+        // in practice runs at 48000. (Not "every model that can": install() compares with a HALF-HERTZ
+        // TOLERANCE, so a fresh stage accepts 48000.5 and prepare() then adopts it — the same
+        // over-claim the header carried until it was corrected there. Correcting one copy of a
+        // sentence and not the other is this branch's own subject matter.) The same round
+        // showed rateMatch's normalisation path is only ever reached through an instance, so an
+        // untagged rate never reaches it directly either.
+        //
+        // The whole point of these two functions is to be called by consumers this repository does not
+        // contain, at rates it does not itself use. So they are pinned as PURE FUNCTIONS here, with
+        // values computed by hand from the two documented facts — kHalf per leg, the return leg
+        // converted at h/m — and not by asking the code.
+        using felitronics::core::StreamResampler;
+        struct G { double h, m, want; };
+        for (const G g : { G { 96000.0,  32000.0, 128.0 },      // 32 + 32·3
+                           G { 44100.0,  44100.0,  64.0 },      // identity ratio: still two legs
+                           G { 48000.0,  96000.0,  48.0 },      // 32 + 32·0.5
+                           G { 22050.0,  44100.0,  48.0 },      // …the same ratio, different rates
+                           G { 192000.0, 48000.0, 160.0 },      // 32 + 32·4
+                           G { 44100.0,  48000.0,  61.4 } })
+            test::approx (StreamResampler::pairDelayHostSamples (g.h, g.m), g.want, 1e-9,
+                          "pairDelayHostSamples(" + std::to_string ((int) g.h) + ", "
+                          + std::to_string ((int) g.m) + ") = " + std::to_string (g.want));
+
+        test::ok (StreamResampler::pairDelayHostSamples (96000.0, 32000.0)
+                  != StreamResampler::pairDelayHostSamples (32000.0, 96000.0),
+                  "…and the two arguments are NOT interchangeable — a swapped call at a consumer is a "
+                  "different number, not a reciprocal one, which is why the order is in the name");
+
+        // 🔴 THE DEFAULTS OF THE STRUCT ITSELF, which nothing else in the tree varies either. They are
+        // not decoration: RateMatch gained member initialisers in the same commit that pinned these
+        // functions, and that SILENTLY changed what `RateMatch r {}` means for every consumer —
+        // modelRunSR read 0 before it and reads the factory rate after, and the type stopped being
+        // trivially default-constructible. A crew round mutated the default back to 0 and the mutant
+        // survived the whole repository. The new value is the right one — a rate-match that has not
+        // been computed yet describes a stage running at the factory rate, not one running at 0 Hz —
+        // but "right and unannounced and untested" is how the restatements this branch removes got in.
+        {
+            const nam::NamStage::RateMatch d {};
+            test::ok (d.modelRunSR == nam::NamStage::kModelSampleRate && ! d.resampling
+                          && d.latencySamples == 0,
+                      "a default-constructed RateMatch reads {" + std::to_string (d.modelRunSR)
+                      + ", false, 0} — the factory rate, not zero");
+        }
+
+        // rateMatch: the three facts. One of these cells an instance really cannot reach — a rate no
+        // stage would accept — and the OTHER one it reaches every day, which an earlier version of this
+        // comment got backwards while the paragraph eight lines above had it right. prepare() hands
+        // configureRates() the RAW reported rate (NamStage.cpp, and that was the whole point of the fix
+        // there), so an untagged model arrives here as modelSR = -1 and takes the normalisation path.
+        // Two spellings of one fact in one group, already disagreeing — inside the group written to
+        // stop exactly that.
+        struct R { double h, m; double runSR; bool res; int lat; const char* what; };
+        for (const R r : { R { 44100.0,     -1.0, 48000.0, true,  61, "unknown rate normalises to the factory one" },
+                           R { 44100.0,      0.0, 48000.0, true,  61, "…and so does zero" },
+                           R { 48000.0,     -1.0, 48000.0, false,  0, "…which then is NOT resampled at a 48 kHz host" },
+                           R { 48000.0,  44100.0, 44100.0, true,  67, "a 44.1 kHz model would cost 67, whether or not a stage would take it" },
+                           R { 96000.0,  96000.0, 96000.0, false,  0, "equal rates: no resampler, no latency" },
+                           R { 48000.5,  48000.0, 48000.0, false,  0, "exactly half a hertz is inside the gate" } })
+        {
+            const auto got = nam::NamStage::rateMatch (r.h, r.m);
+            test::ok (got.modelRunSR == r.runSR && got.resampling == r.res && got.latencySamples == r.lat,
+                      std::string (r.what) + " — got {" + std::to_string (got.modelRunSR) + ", "
+                      + (got.resampling ? "true" : "false") + ", " + std::to_string (got.latencySamples) + "}");
         }
     }
 
@@ -818,10 +1006,14 @@ int main()
         stage.prepare (96000.0, 256);
         const auto json = gainModel();
         test::ok (load (stage, json), "48 kHz model loads on a 96 kHz host");
-        const int kGeo96 = (int) (felitronics::core::StreamResampler::delayInputSamples() * 3.0);   // D·(1 + 96000/48000) = 3D
+        // `delayInputSamples() * 3.0` used to stand here with a comment deriving D·(1 + 96000/48000)
+        // = 3D. That arithmetic is only true while the two legs of the round trip are the same length,
+        // and the open kTaps-scaling item makes them different — so the test would have kept passing
+        // through a change it exists to notice. Ask instead.
+        const int kGeo96 = nam::NamStage::rateMatch (96000.0, 48000.0).latencySamples;
         test::ok (stage.latencySamples() == kGeo96,
-                  "latency is the MEASURED geometry D*(1 + 96000/48000) = " + std::to_string (kGeo96)
-                  + ", not a formula anybody typed here");
+                  "a prepared stage reports what rateMatch() says for its rates (" + std::to_string (kGeo96)
+                  + "), and nothing here retypes the composition");
 
         std::vector<float> block (256);
         bool finite = true;

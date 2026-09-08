@@ -92,7 +92,7 @@ int main()
     // fails them by orders, which is what these groups are for.
     group ("DeepSeek 1.2 adapted: 44.1k -> 88.2k ramp survives to float precision at half-sample phases");
     {
-        const double D = felitronics::core::StreamResampler::delayInputSamples();
+        const double D = felitronics::core::StreamResampler::delayInputSamples (44100.0, 88200.0);
         const auto in = ramp (4096);
         const auto out = oneShot (44100.0, 88200.0, in);
         double worst = 0.0, span = 0.0;
@@ -114,7 +114,7 @@ int main()
         // still be bit-exact for an interpolating kernel and is NOT for this one — a useful reminder
         // that "integer ratio" no longer means "sample picking". It also means the whole result rides on
         // ONE table row, so a single mis-normalised row shows up here and nowhere else.
-        const double D = felitronics::core::StreamResampler::delayInputSamples();
+        const double D = felitronics::core::StreamResampler::delayInputSamples (48000.0, 16000.0);
         const auto in = ramp (4096);
         const auto out = oneShot (48000.0, 16000.0, in);
         double worst = 0.0, span = 0.0;
@@ -135,7 +135,7 @@ int main()
         const auto in = ramp (44100);
         const auto out = oneShot (44100.0, 48000.0, in);
         const double step = 44100.0 / 48000.0;
-        const double D = felitronics::core::StreamResampler::delayInputSamples();
+        const double D = felitronics::core::StreamResampler::delayInputSamples (44100.0, 48000.0);
         double worst = 0.0, worstAbs = 0.0, maxWant = 0.0;
         double firstWindow = 0.0, lastWindow = 0.0;
         int firstN = 0, lastN = 0;
@@ -211,7 +211,7 @@ int main()
         constexpr double scale = 1.0 / 1024.0;                  // keep the oracle below large-value float ulps
         for (int i = 0; i < (int) in.size(); ++i) in[(std::size_t) i] = (float) ((double) i * (double) i * scale);
         const auto out = oneShot (48000.0, 96000.0, in);
-        const double D = felitronics::core::StreamResampler::delayInputSamples();
+        const double D = felitronics::core::StreamResampler::delayInputSamples (48000.0, 96000.0);
         double worst = 0.0, span = 0.0;
         for (std::size_t k = 128; k + 128 < out.size(); ++k)
         {
