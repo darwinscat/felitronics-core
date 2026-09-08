@@ -162,25 +162,32 @@ public:
 
     // Host-rate latency the rate-matcher introduces (0 when not resampling).
     //
-    // 🔴 This used to be `ceil(3*hostSR/modelRunSR) + 3` — a guess at "~3 samples of lookahead per
-    // stage", and 2.16 samples too long at 44.1 kHz (6 reported against 3.84 real; 9 against 6.00 at
-    // 96 kHz). The geometry is exact and needs no guess: StreamResampler::reset() leaves 3 leading
-    // history zeros with pos = 1.0, so output k reads input position k·inPerOut − 2 — EVERY stage
-    // delays by exactly 2 of ITS OWN input samples. Round trip = 2 host samples (down) + 2 model
-    // samples (up), the latter converted to host rate. Measured back from the carrier phase of the
-    // shipped round trip, with the whole-period ambiguity resolved by an impulse onset: 3.8375 at
-    // 44.1 kHz, 6.0000 at 96 kHz, 5.6750 at 88.2 kHz, 3.3333 at 32 kHz — the geometry to four decimals.
+    // 🔴 NOT A GUESS, AND NOT OURS TO RESTATE. It was `ceil(3*hostSR/modelRunSR) + 3` once — a guess
+    // at "~3 samples of lookahead per stage", 2.16 samples wrong — and P32 replaced it with the CUBIC
+    // kernel's real geometry, `2 + 2*hostSR/modelRunSR`. P34 swapped that kernel for a 64-tap
+    // polyphase windowed sinc, so the geometry moved again. Restating a class's internals here is what
+    // made this line wrong twice; ask the class instead:
     //
-    // The true delay is FRACTIONAL and this reports an integer, so round to nearest (the residual is
-    // ≤0.5 samples against the geometry, and was up to 3.3). It is also mildly frequency-dependent —
-    // the coherent term's GROUP delay adds +0.018 samples at 10 kHz and +0.620 at 20 kHz on top of the
-    // geometric figure — which no single integer can express, and which no consumer of this number can
-    // act on either. What consumers DO act on: OrbitCab and orbit-amp delay their dry/bypass path by
-    // this same number, so it is an audio-alignment figure there and not only a PDC one.
+    //     D = StreamResampler::delayInputSamples()  — every stage delays D of ITS OWN input samples
+    //     round trip = D host samples (down) + D model samples (up), the latter converted to host rate
+    //                = D · (1 + hostSR/modelRunSR)
+    //
+    // With D = 32 that is 61.4000 host samples at 44.1 kHz (was 3.8375), 96.0000 at 96 kHz, 90.8000 at
+    // 88.2 kHz, 53.3333 at 32 kHz. MEASURED back from the carrier phase of the real round trip at
+    // 100 Hz and 500 Hz, where the delay is below one whole period and therefore unambiguous: 61.4000,
+    // the geometry to four decimals. Unlike the cubic this kernel is symmetric and its phase delay is
+    // FLAT with frequency, so the old "+0.018 at 10 kHz, +0.620 at 20 kHz" group-delay caveat died
+    // with the cubic and is deliberately not restated.
+    //
+    // The true delay is FRACTIONAL and this reports an integer, so round to nearest (residual ≤ 0.5;
+    // the worst here is 0.40 at 44.1 kHz, whose first comb notch against an undelayed dry path would
+    // sit at 55 kHz, out of band). What consumers DO act on: OrbitCab and orbit-amp delay their
+    // dry/bypass path by this same number, so it is an audio-alignment figure there, not only PDC.
     int latencySamples() const noexcept
     {
         if (! prepared_ || ! resampling) return 0;   // an unprepared backend passes through — no latency
-        return (int) std::lround (2.0 + 2.0 * hostSR / modelRunSR);
+        const double d = felitronics::core::StreamResampler::delayInputSamples();
+        return (int) std::lround (d + d * hostSR / modelRunSR);
     }
 
     //--- model info (read by the loader for NamStage's UI-mirror atomics) ----------

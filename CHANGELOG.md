@@ -79,6 +79,53 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     the last 32 samples; an infinity of the wrong sign disabled a constraint the caller meant to be
     unsatisfiable; and the solver did not check that its sample rate was the chain's.
 
+- **BREAKING (behaviour), `core`, `nam`: `StreamResampler`'s interpolation kernel is now a 64-tap
+  polyphase windowed sinc, not a Catmull-Rom cubic. Every model at 44.1 kHz sounds different — brighter
+  in the top octave, and without a bass artefact it should never have had.** (Read "brighter" as scoped:
+  it holds for hosts up to 96 kHz. At 176.4 and 192 kHz the fixed 64-tap window under a ~4:1 decimation
+  costs up to 0.8 dB at 20 kHz — still far better than a kernel with no anti-aliasing at all, but not
+  flat; the rows are pinned in both directions and §6.7 of the doc says so.) The cubic had no
+  anti-aliasing of any kind, and P32 measured what that cost; this is the fix, and it is not neutral.
+  - **Passband.** One round trip 44.1 ↔ 48 kHz, coherent carrier / worst phase, at 17.64 kHz:
+    **−4.17 / −9.27 dB → +0.0002 / +0.0000 dB**. At 20 kHz **−5.48 / −14.79 → −0.0133 / −0.0135**. The
+    carrier droop and the phase modulation were the same mechanism in two coordinates and both are gone:
+    modulation depth is at most **0.0004 dB** where it reached 8.7, inside the Kaiser window's own
+    derived passband ripple.
+  - **The decimating leg had no stopband at all** — a flat −3 dB rms and a **0.0 dB sample peak** above
+    the output Nyquist, because at phase t = 0 the cubic's weights were (0,1,0,0), a bare sample pick.
+    Now **−9.08 / −15.41 / −27.45 / −47.56 / −88.77 dB** at 22.1 / 22.5 / 23 / 23.5 / 23.9 kHz, and the
+    sample peak tracks the rms. A 23 kHz tone used to come back as TWO components 1.7 dB apart
+    (21.1 kHz −5.33, 19.1 kHz −7.04); they are now −27.45 and **−91.58**.
+  - **🔴 The product half: a driven nonlinearity does not MASK those images, it DEMODULATES them into
+    the bass.** Through a real high-gain capture, a 20 kHz tone at −18 dBFS came back with a 100 Hz line
+    at **−17.65 dBFS — 14.5 dB LOUDER than its own carrier**. It is now **−96.54 dBFS, 60.7 dB under the
+    carrier: the line dropped 78.9 dB.** On a clean capture, −39.07 → −117.36. Measured through the real
+    `NamStage` by one probe run against both trees.
+  - **What it costs.** Latency at 44.1 kHz goes from **3.84 to 61.40 host samples (0.087 → 1.392 ms)**,
+    derived from the kernel geometry and measured back from the carrier phase to four decimals; a host
+    summing two rate-matching stages reports **122** samples. CPU rises from 0.0129 to **0.1447 %RT**
+    for one mono round trip on arm64 and 0.0525 → 0.3239 on x86-64 gcc — **+2.3 % and +2.4 % of what the
+    whole `NamStage` already spends on its model**, i.e. the same fraction on both toolchains.
+  - **`nam::NamStage::latencySamples()` reports 61 at 44.1 kHz** (was 4), 96 at 96, 91 at 88.2, 53 at 32,
+    and it no longer restates the geometry: it asks `StreamResampler::delayInputSamples()`. Restating it
+    is how the previous formula stayed 2.16 samples wrong for a release cycle. **Consumers that delay a
+    dry/bypass path by this number must be re-checked** — the figure is 16× larger. `orbit-amp` was
+    built against this branch and its whole suite passes (seven targets, zero failures), but its
+    `src/core/BypassWire.h:37` caps the delay it can carry at 64 samples on a comment quoting a formula
+    two generations old: 44.1 kHz fits by three samples and every host above 48 kHz silently
+    under-delays its bypass path (96 samples short at 192 kHz). Fix it with the geometry, not a bigger
+    constant.
+  - **Two contract changes that are not tuning.** An exactly-equal in/out rate now short-circuits to a
+    **bit-exact copy delayed by 32 samples** (the 0.99 cutoff is a real low-pass, and a caller asking for
+    no rate change must not silently get one) — it was a 2-sample delay. And the kernel is
+    **approximating, not interpolating**: it no longer passes through its input samples, so bit-exact DC
+    and exact polynomial reproduction are gone (DC within a derived 4.6e−6, measured 3.6e−7), and an
+    integer ratio like 96 → 48 kHz is a filtered decimation instead of sample-picking.
+  - **At a 48 kHz host nothing changed, and that is gated**: the resampler is not installed at all when
+    `|hostSR − modelRunSR| ≤ 0.5`, and the render is bit-identical to the pre-change tree (verified
+    cross-tree, FNV-1a over a full render).
+  - Full measurement, both oracles and the protocol: [`docs/STREAM-RESAMPLER-COST.md`](docs/STREAM-RESAMPLER-COST.md).
+
 - **BREAKING (behaviour), `dynamics`, `deesser`, `dynamiceq`, `poweramp`, `multiband`, `core`: LAW 11c —
   A PAUSE IS SILENCE.** A call with `nch == 0, n > 0` now advances a stage's SHARED, one-per-instance
   ballistics exactly as `n` samples of digital silence at a live width would, instead of freezing them.

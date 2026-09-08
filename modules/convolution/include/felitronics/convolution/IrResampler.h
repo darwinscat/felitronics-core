@@ -39,9 +39,16 @@ struct IrResampleConfig
 
 //==============================================================================
 // Offline windowed-sinc (Kaiser) IR resampler. MESSAGE-THREAD ONLY (double math, allocates) — for
-// rate-converting an impulse response to the host SR on load. This is the >=60 dB-class resampler the
-// convolution path needs; the Catmull-Rom core::StreamResampler (streaming/NAM rate-match) is too low-SNR for
-// IRs. DC gain is normalized to 1.
+// rate-converting an impulse response to the host SR on load. DC gain is normalized to 1.
+//
+// FAMILY SPLIT vs core::StreamResampler — restated, because the other half of it changed under this
+// comment. That one used to be a Catmull-Rom cubic and "too low-SNR for IRs" was the whole argument.
+// Since P34 it is a 64-tap polyphase windowed sinc, i.e. the SAME family as this one, so the split is
+// no longer about quality. It is about BUDGET and THREAD: this is an offline one-shot that may
+// allocate, work in double and size its kernel to the job; that is a streaming rate-match on the audio
+// thread with a fixed table built in reset() and a per-block cost that has to stay inside a couple of
+// percent of a neural stage. Still not interchangeable — for the opposite reason to the one that used
+// to be written here.
 inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, double outSr,
                                       IrResampleConfig cfg = {})
 {

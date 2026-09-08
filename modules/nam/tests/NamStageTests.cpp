@@ -6,6 +6,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/nam/NamStage.h>
+#include <felitronics/core/StreamResampler.h>   // the delay geometry is ASKED of the class, never restated
 
 #include <namz.h>
 
@@ -354,10 +355,12 @@ int main()
     test::group ("latency is a MEASUREMENT, not a formula — the reported number matches the real delay");
     {
         // The old `ceil(3*hostSR/modelRunSR) + 3` was a guess and it was 2.16 samples long at 44.1 kHz;
-        // the tests pinned the formula, so nothing caught it. This one measures the delay the stage
-        // ACTUALLY has and compares. Geometry: StreamResampler::reset() leaves 3 leading zeros with
-        // pos = 1.0, so each stage delays by exactly 2 of its own input samples -> the round trip is
-        // 2 + 2*hostSR/modelRunSR host samples (3.8375 at 44.1 kHz, 6.0 at 96 kHz).
+        // the tests pinned the FORMULA, so nothing caught it. This one measures the delay the stage
+        // ACTUALLY has and compares. Geometry, asked of the class rather than restated here (restating
+        // it is how the last one went stale): reset() leaves kTaps leading zeros with pos = kHalf, so
+        // each stage delays by exactly D = StreamResampler::delayInputSamples() of its OWN input
+        // samples -> the round trip is D·(1 + hostSR/modelRunSR) host samples. With the P34 sinc kernel
+        // D = 32, i.e. 61.4 at 44.1 kHz and 96.0 at 96 kHz; with the cubic it was D = 2 and 3.8375.
         //
         // TWO instruments, because each is blind where the other sees:
         //  * PHASE gives the fraction exactly but is periodic — it cannot tell a delay from that delay
@@ -440,13 +443,18 @@ int main()
         test::ok (onsetDelay (48000.0, 64) == 0,
                   "precondition: and the impulse comes straight back out, 0 samples late");
 
-        struct Case { double host, expect; };
-        // 32 kHz is in the list ON PURPOSE: it is the only row where lround and ceil DISAGREE
-        // (geometry 3.3333 -> 3 against 4). Without it the choice of rounding is untested, which a
+        // Every expectation below is COMPUTED from the class's own D, so the table cannot drift away
+        // from the kernel the way the hand-written 3.8375 did.
+        const double kD = felitronics::core::StreamResampler::delayInputSamples();
+        auto geoAt = [kD] (double host) { return kD + kD * host / 48000.0; };
+
+        struct Case { double host; };
+        // 32 kHz is in the list ON PURPOSE: it is the row where lround and ceil disagree most visibly
+        // (geometry 53.3333 -> 53 against 54). Without it the choice of rounding is untested, which a
         // crew mutation proved by swapping lround for ceil and surviving.
-        for (const Case c : { Case { 44100.0, 3.8375 }, Case { 96000.0, 6.0 },
-                              Case { 88200.0, 5.675 },  Case { 32000.0, 10.0 / 3.0 } })
+        for (const Case cc : { Case { 44100.0 }, Case { 96000.0 }, Case { 88200.0 }, Case { 32000.0 } })
         {
+            const struct { double host, expect; } c { cc.host, geoAt (cc.host) };
             const int on = onsetDelay (c.host, 64);
             const double ph = phaseDelay (c.host, 64, 1);
             const double per = 512.0;
@@ -459,7 +467,7 @@ int main()
                       "host " + std::to_string ((int) c.host) + ": the IMPULSE comes out where the geometry "
                       "says, so no whole periods are hiding in the phase reading");
             test::approx (d, c.expect, 0.05,
-                          "host " + std::to_string ((int) c.host) + ": the delay IS 2 + 2*host/model");
+                          "host " + std::to_string ((int) c.host) + ": the delay IS D*(1 + host/model)");
             nam::NamStage st;
             st.prepare (c.host, 64);
             const auto json = gainModel();
@@ -476,7 +484,7 @@ int main()
         // identity ratio passed everything, because nothing measured the stereo delay. Phase ALONE is
         // not enough there either — it is periodic, so an extra whole tone period on the right lane
         // would be invisible exactly as it was on the left. Both instruments, both lanes.
-        test::approx (phaseDelay (44100.0, 64, 2), 3.8375, 0.05,
+        test::approx (phaseDelay (44100.0, 64, 2), geoAt (44100.0), 0.05,
                       "the RIGHT channel of a stereo call has the same measured phase delay as the left");
         {
             nam::NamStage st;
@@ -499,47 +507,52 @@ int main()
                     if (v > pv && idx > at - 50) { pv = v; peakR = idx; }
                 }
             }
-            test::ok (peakR - at == 4,
+            test::ok ((double) (peakR - at) == std::floor (geoAt (44100.0) + 0.5),
                       "…and the RIGHT lane's impulse comes out where the geometry says (+"
                       + std::to_string (peakR - at) + "), so no whole periods hide there either");
         }
 
         // Rounding is asserted as an INVARIANT over a sweep, not as a list of rates, because the one
-        // case a list always misses is the exact half: 2 + 2*h/48000 lands on .5 at h = 24000k - 36000
-        // (12000, 36000, 60000, 84000 …), where the residual is the worst it can be and the choice of
-        // rounding rule shows most. Reporting an integer for a fractional delay costs at most half a
-        // sample; the old formula cost up to 3.3.
+        // case a list always misses is the exact half — and 🔴 WHERE THAT HALF LIVES MOVED WITH THE
+        // KERNEL. With D = 2 the halves sat at h = 24000k − 36000 (12000, 36000, 60000, 84000 …); with
+        // D = 32 they sit at h = 750·(2k+1) (750, 2250, … 44250, 45750 …), and 60000 now gives exactly
+        // 72.0 — a whole number, which is to say the old exact-half case stopped being one. A sweep that
+        // simply kept its rate list would have gone quietly blind, so 44250 is in the list on purpose.
+        // Reporting an integer for a fractional delay costs at most half a sample; the old guessed
+        // formula cost up to 3.3.
         {
             double worst = 0.0; double worstAt = 0.0;
             for (const double host : { 8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0,
-                                       36000.0, 44100.0, 47999.0, 48001.0, 60000.0, 64000.0, 84000.0,
-                                       88200.0, 96000.0, 176400.0, 192000.0 })
+                                       36000.0, 44100.0, 44250.0, 47999.0, 48001.0, 60000.0, 64000.0,
+                                       84000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
             {
                 nam::NamStage st;
                 st.prepare (host, 64);
                 const auto json = gainModel();
                 if (! load (st, json)) { test::ok (false, "model loads at every swept rate"); break; }
                 st.prepare (host, 64);
-                const double geo = 2.0 + 2.0 * host / 48000.0;
+                const double D = felitronics::core::StreamResampler::delayInputSamples();
+                const double geo = D + D * host / 48000.0;
                 const double err = std::fabs ((double) st.latencySamples() - geo);
                 if (err > worst) { worst = err; worstAt = host; }
             }
-            std::printf ("      worst reported-vs-geometry error over 18 host rates: %.4f samples (at %.0f Hz)\n",
+            std::printf ("      worst reported-vs-geometry error over 19 host rates: %.4f samples (at %.0f Hz)\n",
                          worst, worstAt);
             test::ok (worst <= 0.5 + 1e-9,
-                      "over 18 host rates including every exact-half case, the reported integer is never "
+                      "over 19 host rates including every exact-half case, the reported integer is never "
                       "more than 0.5 samples from the geometry (worst " + std::to_string (worst) + ")");
             // …and at an exact half the BOUND accepts either neighbour, so pin the RULE itself: lround
-            // takes halves away from zero. 60 kHz gives exactly 4.5.
+            // takes halves away from zero. 44250 Hz gives exactly 61.5 with D = 32 (32 + 32·44250/48000
+            // = 32 + 29.5). The rate that used to serve here, 60 kHz, now gives a whole 72.0.
             {
                 nam::NamStage half;
-                half.prepare (60000.0, 64);
+                half.prepare (44250.0, 64);
                 const auto json = gainModel();
                 test::ok (load (half, json), "model loads at the exact-half rate");
-                half.prepare (60000.0, 64);
-                test::ok (half.latencySamples() == 5,
-                          "at 60 kHz the geometry is exactly 4.5 and the reported number is 5 — halves go "
-                          "away from zero, which the <=0.5 bound alone would not pin");
+                half.prepare (44250.0, 64);
+                test::ok (half.latencySamples() == 62,
+                          "at 44250 Hz the geometry is exactly 61.5 and the reported number is 62 — halves "
+                          "go away from zero, which the <=0.5 bound alone would not pin");
             }
         }
 
@@ -553,8 +566,179 @@ int main()
             near.prepare (48000.4, 64); past.prepare (48001.0, 64);
             test::ok (near.latencySamples() == 0,
                       "0.4 Hz off the model rate is INSIDE the gate: no resampler, no latency");
-            test::ok (past.latencySamples() == 4,
-                      "1.0 Hz off it is OUTSIDE: the resampler engages and reports its 4 samples");
+            test::ok (past.latencySamples() == 64,
+                      "1.0 Hz off it is OUTSIDE: the resampler engages and reports its full 64 samples — "
+                      "D·(1 + 48001/48000) rounds to 64, and the DISCONTINUITY at the gate is the point: "
+                      "0.4 Hz costs nothing and 1.0 Hz costs 64 samples of PDC");
+        }
+    }
+
+    test::group ("🔴 RATE-CHANGE NULLS — the resampler must not survive its own reconfiguration");
+    {
+        // THE MAIN DEFENCE OF P34. NamStage engages the rate-matcher only past
+        // |hostSR - modelRunSR| > 0.5, so at a 48 kHz host with a 48 kHz capture there is no resampler
+        // in the path at all — processChannel takes its `if (! resampling)` branch and StreamResampler
+        // is never called. A kernel swap therefore has to leave this output BIT-IDENTICAL, and any
+        // divergence means the change reached somewhere it was not aimed.
+        //
+        // The checksum below was computed on the BASE commit (main = 52582a8, the Catmull-Rom kernel)
+        // with this same fixture and compared against the same computation after the swap: identical.
+        // It is a FNV-1a over the raw bit patterns of every output sample, so it cannot be satisfied by
+        // anything short of bit equality — a one-ulp difference in one sample changes it completely.
+        //
+        // The signal deliberately covers what a rate-match would disturb if it were wrongly engaged:
+        // a sweep through the top octave (where the two kernels differ by 5.5 dB), a DC step, silence,
+        // and a full-scale impulse. It is 4096 samples through the FIR fixture, which is the model with
+        // memory — a gain model would hide a one-sample misalignment.
+        auto checksum = [] (double hostSR)
+        {
+            nam::NamStage stage;
+            stage.prepare (hostSR, 64);
+            const auto json = firModel();
+            if (! load (stage, json)) return (std::uint64_t) 0;
+            stage.prepare (hostSR, 64);
+
+            std::vector<float> in (4096, 0.0f);
+            for (int i = 0; i < 2048; ++i)                       // sweep 8 kHz -> 22 kHz
+            {
+                const double t = (double) i / 2048.0;
+                const double f = 8000.0 + 14000.0 * t;
+                in[(std::size_t) i] = 0.5f * (float) std::sin (2.0 * 3.14159265358979323846 * f * i / hostSR);
+            }
+            for (int i = 2048; i < 2560; ++i) in[(std::size_t) i] = 0.75f;      // DC step
+            for (int i = 2560; i < 3072; ++i) in[(std::size_t) i] = 0.0f;       // silence
+            in[3072] = 1.0f;                                                    // full-scale impulse
+
+            const auto out = runMono (stage, in, false);
+            std::uint64_t h = 1469598103934665603ull;                           // FNV-1a offset basis
+            for (float v : out)
+            {
+                std::uint32_t bits = 0;
+                std::memcpy (&bits, &v, sizeof (bits));
+                for (int byte = 0; byte < 4; ++byte)
+                {
+                    h ^= (std::uint64_t) ((bits >> (8 * byte)) & 0xffu);
+                    h *= 1099511628211ull;
+                }
+            }
+            return h;
+        };
+
+        // 🔴 WHY THE LITERAL HASH IS NOT ASSERTED HERE. The cross-tree comparison IS the acceptance and
+        // it was done: base main = 52582a8 (Catmull-Rom) and this branch both render 0x8f19a4552add60ff
+        // at 48 kHz on this machine — bit for bit — while 44.1 kHz moves from 0x8a79981a41b078b2 to
+        // 0x9ba23a94952a4fab, which is the divergence the fix is FOR. But that hash is a NAM render
+        // through Eigen: it is not expected to survive a change of toolchain or FMA contraction, so
+        // pinning the constant would buy a red CI row on another platform and prove nothing extra.
+        // What IS pinned below is the same defence in a platform-independent form.
+        const std::uint64_t got = checksum (48000.0);
+        std::printf ("      48 kHz FNV-1a over the whole render: 0x%016llx  (base main: 0x8f19a4552add60ff)\n",
+                     (unsigned long long) got);
+
+        // Precondition, so the lines below cannot pass by measuring nothing: at 44.1 kHz, where the
+        // resampler IS engaged, the same render must hash differently. Without this an all-zero render
+        // would satisfy any null test forever.
+        const std::uint64_t off = checksum (44100.0);
+        std::printf ("      44.1 kHz, where the resampler IS in the path: 0x%016llx\n", (unsigned long long) off);
+        test::ok (off != got,
+                  "precondition: the instrument is not blind — at 44.1 kHz, where the rate-match runs, "
+                  "the same render hashes differently");
+
+        // THE PORTABLE GATE. The failure this whole item defends against is the kernel leaking into a
+        // path it does not belong on, and the only route it could take is STATE: a stage that has been
+        // configured for resampling and then re-prepared at the model's own rate. configureRates()
+        // resets both StreamResamplers on every prepare, so a stage that has been through 44.1 kHz and
+        // back to 48 must render exactly what a virgin one does — bit for bit, on any toolchain.
+        {
+            nam::NamStage viaResampling;
+            viaResampling.prepare (44100.0, 64);
+            const auto json = firModel();
+            test::ok (load (viaResampling, json), "model loads on the stage that starts at 44.1 kHz");
+            viaResampling.prepare (44100.0, 64);
+
+            viaResampling.prepare (48000.0, 64);                                   // …then come back to 48 kHz
+
+            // 🔴 NOTE ON WHAT IS DELIBERATELY *NOT* DONE HERE, because getting it wrong cost a round.
+            // The obvious stronger version — run audio at 44.1 kHz before re-preparing — measures the
+            // wrong thing: the two stages then differ from sample 0, and they differ IDENTICALLY on
+            // main with the Catmull-Rom kernel (checked, cross-tree). That divergence belongs to the
+            // NAM model's own re-prewarm across a prepare(), not to the resampler, and asserting it
+            // here would pin someone else's behaviour onto this item. Recorded as a finding instead.
+            // What this gate does assert is the part that IS about the resampler: a stage whose
+            // StreamResamplers were configured for a 44.1 kHz ratio and then re-configured for 48 kHz
+            // must render exactly what one that never saw another rate does.
+
+            std::vector<float> in (1024, 0.0f);
+            for (int i = 0; i < 512; ++i)
+                in[(std::size_t) i] = 0.5f * (float) std::sin (2.0 * 3.14159265358979323846 * 19000.0 * i / 48000.0);
+            in[600] = 1.0f;
+
+            nam::NamStage virginStage;
+            virginStage.prepare (48000.0, 64);
+            test::ok (load (virginStage, json), "…and on a stage that has never seen another rate");
+            virginStage.prepare (48000.0, 64);
+
+            const auto a = runMono (viaResampling, in, false);
+            const auto c2 = runMono (virginStage, in, false);
+            bool identical = (a.size() == c2.size());
+            for (std::size_t i = 0; identical && i < a.size(); ++i)
+                identical = (std::memcmp (&a[i], &c2[i], sizeof (float)) == 0);
+            test::ok (identical && a.size() > 900,
+                      "a stage that has RUN the rate-matcher and been re-prepared at 48 kHz renders "
+                      "bit-identically to one that never did — the kernel cannot reach the path where "
+                      "|hostSR - modelRunSR| <= 0.5, by state or otherwise");
+            test::ok (viaResampling.latencySamples() == 0,
+                      "…and it reports no latency there either, which is the same claim in the number "
+                      "the host acts on");
+        }
+
+        // 🔴 AND THE FORM THAT ACTUALLY CATCHES A STALE TABLE. A diverse-testing round mutated
+        // StreamResampler::reset() to early-return when its table was already populated — a resampler
+        // that keeps designing for the ratio it saw first — and that mutant passed 345 of 345 checks
+        // across this repository, INCLUDING the gate above. The gate above cannot see it: at 48 kHz the
+        // resampler is never invoked, so `viaResampling ≡ virgin` by construction whatever the table
+        // holds. What catches it is a rate change that lands somewhere the resampler DOES run.
+        //
+        // The fixture is the GAIN model on purpose. The FIR model has two samples of history that
+        // survive NAM's own Reset across a prepare() — verified cross-tree, it does the same on main
+        // with the Catmull-Rom kernel — so a FIR-based version of this test would fail for a reason
+        // that is not the resampler's and is not this PR's to fix. A memoryless model removes that
+        // term and leaves only the question being asked.
+        {
+            const auto json = gainModel();
+            auto renderAt = [&json] (double firstRate, bool runAudio, double finalRate)
+            {
+                nam::NamStage st;
+                st.prepare (firstRate, 64);
+                if (! load (st, json)) return std::vector<float>{};
+                st.prepare (firstRate, 64);
+                if (runAudio)
+                {
+                    std::vector<float> warm (512, 0.3f);
+                    float* wio[1] { warm.data() };
+                    felitronics::test::run (st.process (wio, 1, 512, false));
+                }
+                st.prepare (finalRate, 64);
+                std::vector<float> in (1024, 0.0f);
+                for (int i = 0; i < 1024; ++i)
+                    in[(std::size_t) i] = 0.5f * (float) std::sin (2.0 * 3.14159265358979323846 * 6000.0 * i / finalRate);
+                return runMono (st, in, false);
+            };
+            struct Case { double first; bool audio; double final_; const char* what; };
+            for (const Case c : { Case { 44100.0, true,  48000.0, "ran at 44.1 kHz, then re-prepared at 48" },
+                                  Case { 44100.0, true,  44100.0, "ran at 44.1 kHz, then re-prepared at 44.1" },
+                                  Case { 44100.0, true,  96000.0, "ran at 44.1 kHz, then re-prepared at 96" },
+                                  Case { 48000.0, false, 44100.0, "loaded at 48 kHz, then prepared at 44.1" } })
+            {
+                const auto viaOther = renderAt (c.first, c.audio, c.final_);
+                const auto virginAt = renderAt (c.final_, false, c.final_);
+                bool identical = (! viaOther.empty() && viaOther.size() == virginAt.size());
+                for (std::size_t i = 0; identical && i < viaOther.size(); ++i)
+                    identical = (std::memcmp (&viaOther[i], &virginAt[i], sizeof (float)) == 0);
+                test::ok (identical,
+                          std::string ("a stage that ") + c.what + " renders bit-identically to one "
+                          "prepared there directly — reset() re-DESIGNS the kernel, it does not top it up");
+            }
         }
     }
 
@@ -608,14 +792,23 @@ int main()
         // liveness: at the model's own rate there is no resampler, so the same instrument must read 0.00.
         test::approx (carrierDb (17640.0, 48000.0, 64), 0.0, 0.01,
                       "precondition: at 48 kHz the instrument reads 0.00 dB — there is no resampler to read");
-        struct Row { double f, want; };
-        for (const Row r : { Row {10000.0, -0.64}, Row {15000.0, -2.59}, Row {17640.0, -4.17}, Row {20000.0, -5.48} })
+        // 🔴 THE NUMBERS IN THIS TABLE ARE THE ACCEPTANCE OF P34, measured where it actually ships.
+        // `was` is what this same instrument read through the same plumbing with the Catmull-Rom cubic;
+        // `want` is the sinc. The core suite reproduces both to 1e-6 with its own replica of the call
+        // pattern, and THAT agreement is a second claim worth having: it says the priming in
+        // configureRates and the priming in the replica are the same priming.
+        struct Row { double f, was, want; };
+        for (const Row r : { Row {10000.0, -0.64, -0.000054}, Row {15000.0, -2.59, +0.000003},
+                             Row {17640.0, -4.17, +0.000160}, Row {20000.0, -5.48, -0.013301} })
         {
             const double got = carrierDb (r.f, 44100.0, 64);
-            std::printf ("      %5.0f Hz through the real NamStage at 44.1 kHz: %.2f dB (core suite: %.2f)\n",
-                         r.f, got, r.want);
-            test::approx (got, r.want, 0.03,
+            std::printf ("      %5.0f Hz through the real NamStage at 44.1 kHz: %+9.6f dB (cubic read %.2f)\n",
+                         r.f, got, r.was);
+            test::approx (got, r.want, 0.002,
                           std::to_string ((int) r.f) + " Hz: the SHIPPED stage costs what the core suite says");
+            test::ok (std::fabs (got) < std::fabs (r.was) * 0.01,
+                      std::to_string ((int) r.f) + " Hz: …and that is at least 40 dB less carrier droop than "
+                      "the cubic cost at the same point of the same chain");
         }
     }
 
@@ -625,8 +818,10 @@ int main()
         stage.prepare (96000.0, 256);
         const auto json = gainModel();
         test::ok (load (stage, json), "48 kHz model loads on a 96 kHz host");
-        test::ok (stage.latencySamples() == 6,
-                  "latency is the MEASURED geometry 2 + 2*96000/48000, not the old ceil(3*r)+3 guess");
+        const int kGeo96 = (int) (felitronics::core::StreamResampler::delayInputSamples() * 3.0);   // D·(1 + 96000/48000) = 3D
+        test::ok (stage.latencySamples() == kGeo96,
+                  "latency is the MEASURED geometry D*(1 + 96000/48000) = " + std::to_string (kGeo96)
+                  + ", not a formula anybody typed here");
 
         std::vector<float> block (256);
         bool finite = true;
@@ -658,7 +853,7 @@ int main()
         const bool monoAgain = processLayout (1);
         test::ok (monoFirst && stereo && monoAgain,
                   "mono-to-stereo-to-mono re-prepare stays finite in both resampler lanes");
-        test::ok (stereoLatency == 6 && stage.latencySamples() == 6,
+        test::ok (stereoLatency == kGeo96 && stage.latencySamples() == kGeo96,
                   "layout re-prepare leaves the pinned host latency stable");
     }
 
@@ -716,18 +911,32 @@ int main()
 
     test::group ("process is RT no-alloc");
     {
-        nam::NamStage stage;
-        stage.prepare (48000.0, 512);
-        const auto json = gainModel();
-        test::ok (load (stage, json), "RT fixture model loads");
-        std::vector<float> left (512, 0.2f), right (512, -0.15f);
-        float* io[2] { left.data(), right.data() };
-        felitronics::test::run (stage.process (io, 2, 512, false));        // warm every process-reachable container first
-        const long before = g_allocs.load (std::memory_order_relaxed);
-        felitronics::test::run (stage.process (io, 2, 512, false));
-        felitronics::test::run (stage.process (io, 2, 512, true));
-        test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
-                         "NamStage::process performs no heap allocation");
+        // 🔴 TWO RATES, AND THE SECOND ONE IS THE WHOLE POINT. This test prepared only at 48 kHz, where
+        // `resampling` is false and processChannel takes its early branch — so the single check that
+        // NamStage::process never allocates was STRUCTURALLY BLIND to the resampler, before this change
+        // and after it. A crew round confirmed the hole by mutation: a resampler that allocates a copy
+        // of its table inside every decimating callback survived the entire suite. 44.1 kHz is the
+        // configuration a live rig actually runs, and it is the one where the table is read.
+        //
+        // The FIRST call after a prepare is included in the measured window on purpose: the table is
+        // built in reset(), but any lazy initialisation anywhere would land exactly there.
+        for (const double rate : { 48000.0, 44100.0 })
+        {
+            nam::NamStage stage;
+            stage.prepare (rate, 512);
+            const auto json = gainModel();
+            test::ok (load (stage, json), "RT fixture model loads at " + std::to_string ((int) rate));
+            std::vector<float> left (512, 0.2f), right (512, -0.15f);
+            float* io[2] { left.data(), right.data() };
+            felitronics::test::run (stage.process (io, 2, 512, false));    // warm every process-reachable container
+            const long before = g_allocs.load (std::memory_order_relaxed);
+            felitronics::test::run (stage.process (io, 2, 512, false));
+            felitronics::test::run (stage.process (io, 2, 512, true));
+            test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                             "NamStage::process performs no heap allocation at "
+                             + std::to_string ((int) rate) + " Hz"
+                             + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
+        }
     }
 
     return test::report();
