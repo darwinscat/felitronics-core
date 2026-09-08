@@ -133,12 +133,20 @@ struct StreamResampler
     // The expression order is the shipped one and is kept deliberately: `a + a·h/m`, not the tidier
     // `a·(1 + h/m)`. They agree bit-for-bit on every rate pair measured (60 pairs, zero differences)
     // for a reason that will EXPIRE — kHalf is a power of two, so scaling by it is exact and both
-    // spellings carry a single rounding. Make the delay ratio-dependent and that stops being true.
+    // spellings carry a single rounding. Make the delay ratio-dependent (the open kTaps item) and D
+    // becomes 35, 59, 118…, where integer straddles do exist: the nearest to the audio grid is a
+    // 6930 Hz host against a 44.1 kHz model. One spelling, in one place, is the whole defence.
     static double pairDelayHostSamples (double hostSR, double modelRunSR) noexcept
     {
         const double down = delayInputSamples (hostSR, modelRunSR);      // host samples, going down
         const double up   = delayInputSamples (modelRunSR, hostSR);      // MODEL samples, coming back
-        return down + up * (hostSR / modelRunSR);                        // …converted to host samples
+        // 🔴 THE GROUPING IS THE SHIPPED ONE, LITERALLY. `up * hostSR / modelRunSR` parses as
+        // `(up * hostSR) / modelRunSR`, which is what NamStage computed before this extraction
+        // (`d + d * hostSR / modelRunSR`). Writing `up * (hostSR / modelRunSR)` is the same value on
+        // every audio rate — 60 pairs, zero differences — and is NOT the same expression: it rounds
+        // the quotient first, and at finite extremes the two can part. A crew round caught the
+        // regrouping; "no number moves" has to mean the arithmetic, not just the answers we sampled.
+        return down + up * hostSR / modelRunSR;                          // …converted to host samples
     }
 
     // Modified Bessel I0, series. Hand-rolled on purpose: std::cyl_bessel_i is not dependably present

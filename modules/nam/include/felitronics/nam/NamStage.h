@@ -116,27 +116,40 @@ public:
     // is normalised FIRST, and the gate then sees the normalised value. An untagged model (rate <= 0)
     // therefore runs at the default and is NOT resampled at a default-rate host — reverse the two and
     // that case changes.
-    // 🔴 THE RATE A MODEL ACTUALLY RUNS AT, AND IT IS NOT A DEFAULT — it is the only value this class
-    // can hold. install() refuses any tagged model whose rate differs from the stage's current run
-    // rate, and that rate is only ever re-derived from a model that already passed the same refusal:
-    // a fixed point at this number. An untagged model runs here too. Measured, not inferred — every
-    // public route was tried (see the P36 report), and 44.1 kHz and 96 kHz captures are all refused.
+    // The rate a model runs at when it reports none, and in practice the rate almost every model
+    // runs at: install() refuses a tagged model whose rate differs from the stage's current run rate
+    // by more than half a hertz, and that rate is only ever re-derived from a model that already
+    // passed the same check — so a fresh stage accepts 48 kHz captures and refuses 44.1 and 96 kHz
+    // ones outright (measured: every public route was tried).
     //
-    // It is public because a consumer sizing a delay line before any model exists needs a CEILING,
-    // and until now it could not even name this number: a downstream repository invented a "lowest
-    // pack rate" of 8 kHz to stand in for it, and sized itself wrong. The ceiling is
-    // ceil(core::StreamResampler::pairDelayHostSamples (maxHostSR, kModelSampleRate)).
+    // ⚠️ IT IS NOT A PROVABLE CEILING, and an earlier version of this comment claimed it was. The
+    // check is a TOLERANCE, not equality: a model at 48000.5 is accepted, prepare() then adopts that
+    // rate, and the next half-hertz step is accepted against the new one. Measured: 65 such steps
+    // walked the run rate from 48000 to 47967.5. A LOWER run rate means a LONGER round trip, so
+    // sizing a buffer from this constant alone can come up short — floor it at what already shipped.
+    //
+    // It is public because a consumer sizing a delay line before any model exists has to start
+    // somewhere, and until now it could not even name this number: a downstream repository invented a
+    // "lowest pack rate" of 8 kHz to stand in for it, and sized itself wrong.
     static constexpr double kModelSampleRate = 48000.0;
 
     struct RateMatch
     {
-        double modelRunSR;      // the rate the model will be run at, after normalising an unknown one
-        bool   resampling;      // whether a rate-matcher is installed at all
-        int    latencySamples;  // host-rate latency it costs; 0 when no resampler is installed
+        double modelRunSR     = kModelSampleRate;   // the rate the model would be run at, normalised
+        bool   resampling     = false;              // whether a rate-matcher would be installed
+        int    latencySamples = 0;                  // host-rate latency it costs; 0 when none is
     };
 
     // Pure function of the two rates: no state, no model, no allocation. `modelSR` is the rate a model
     // REPORTS (<= 0 meaning "unknown"), not one already normalised.
+    //
+    // It answers for the rates it is GIVEN. It does not know whether a stage would accept a model at
+    // that rate — install() has its own contract — so rateMatch(h, 44100) describes what 44.1 kHz
+    // would cost, not a configuration a fresh stage can reach.
+    //
+    // Precondition, documented rather than enforced because this extraction promises that no number
+    // moves: hostSR positive and finite. Outside that the answer is whatever the arithmetic gives
+    // (h = 0 reports 32 against a real 64; h = inf reports -1), exactly as it did before.
     static RateMatch rateMatch (double hostSR, double modelSR) noexcept;
     // How many samples this model must be FED before its output means anything — its receptive field.
     // A network with empty buffers describes the silence it was born into for exactly this long, so

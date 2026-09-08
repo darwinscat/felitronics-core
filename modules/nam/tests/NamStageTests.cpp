@@ -556,9 +556,14 @@ int main()
                 const auto json = gainModel();
                 if (! load (st, json)) { test::ok (false, "model loads at every swept rate"); break; }
                 st.prepare (host, 64);
-                // The FRACTIONAL geometry, which is what "never more than 0.5 samples from the
-                // geometry" is about — asked of core, not restated. rateMatch() rounds; this does not.
-                const double geo = felitronics::core::StreamResampler::pairDelayHostSamples (host, 48000.0);
+                // 🔴 THE ONE PLACE A RESTATEMENT IS THE POINT, and a crew round proved it by injecting
+                // a +1 error into the geometry that this line — when it asked core — waved through
+                // while the OLD tests caught it. An oracle's whole job is to disagree with the thing it
+                // measures, so it must not share its arithmetic. Everything else in this file asks;
+                // this computes, independently, from the two facts the header states: every stage
+                // delays kHalf of its own input samples, and the return leg is converted at h/m.
+                const double kD  = (double) felitronics::core::StreamResampler::kHalf;
+                const double geo = kD + kD * host / 48000.0;
                 const double err = std::fabs ((double) st.latencySamples() - geo);
                 if (err > worst) { worst = err; worstAt = host; }
             }
@@ -642,6 +647,53 @@ int main()
                       "1.0 Hz off it is OUTSIDE: the resampler engages and reports its full 64 samples — "
                       "D·(1 + 48001/48000) rounds to 64, and the DISCONTINUITY at the gate is the point: "
                       "0.4 Hz costs nothing and 1.0 Hz costs 64 samples of PDC");
+        }
+    }
+
+    test::group ("THE TWO FUNCTIONS THEMSELVES — pinned directly, because nothing else varies them");
+    {
+        // 🔴 WHY THIS GROUP EXISTS. A diverse-testing round replaced `modelRunSR` inside
+        // pairDelayHostSamples with the literal 48000 and the mutant survived every suite in the
+        // repository — because every call site in the tree passes 48000, and every model that can go
+        // live runs at 48000. The function's second argument was, in effect, untested. The same round
+        // showed rateMatch's normalisation path is only ever reached through an instance, so an
+        // untagged rate never reaches it directly either.
+        //
+        // The whole point of these two functions is to be called by consumers this repository does not
+        // contain, at rates it does not itself use. So they are pinned as PURE FUNCTIONS here, with
+        // values computed by hand from the two documented facts — kHalf per leg, the return leg
+        // converted at h/m — and not by asking the code.
+        using felitronics::core::StreamResampler;
+        struct G { double h, m, want; };
+        for (const G g : { G { 96000.0,  32000.0, 128.0 },      // 32 + 32·3
+                           G { 44100.0,  44100.0,  64.0 },      // identity ratio: still two legs
+                           G { 48000.0,  96000.0,  48.0 },      // 32 + 32·0.5
+                           G { 22050.0,  44100.0,  48.0 },      // …the same ratio, different rates
+                           G { 192000.0, 48000.0, 160.0 },      // 32 + 32·4
+                           G { 44100.0,  48000.0,  61.4 } })
+            test::approx (StreamResampler::pairDelayHostSamples (g.h, g.m), g.want, 1e-9,
+                          "pairDelayHostSamples(" + std::to_string ((int) g.h) + ", "
+                          + std::to_string ((int) g.m) + ") = " + std::to_string (g.want));
+
+        test::ok (StreamResampler::pairDelayHostSamples (96000.0, 32000.0)
+                  != StreamResampler::pairDelayHostSamples (32000.0, 96000.0),
+                  "…and the two arguments are NOT interchangeable — a swapped call at a consumer is a "
+                  "different number, not a reciprocal one, which is why the order is in the name");
+
+        // rateMatch: the three facts, including the two an instance cannot reach — an unknown rate and
+        // a rate no stage would accept.
+        struct R { double h, m; double runSR; bool res; int lat; const char* what; };
+        for (const R r : { R { 44100.0,     -1.0, 48000.0, true,  61, "unknown rate normalises to the factory one" },
+                           R { 44100.0,      0.0, 48000.0, true,  61, "…and so does zero" },
+                           R { 48000.0,     -1.0, 48000.0, false,  0, "…which then is NOT resampled at a 48 kHz host" },
+                           R { 48000.0,  44100.0, 44100.0, true,  67, "a 44.1 kHz model would cost 67, whether or not a stage would take it" },
+                           R { 96000.0,  96000.0, 96000.0, false,  0, "equal rates: no resampler, no latency" },
+                           R { 48000.5,  48000.0, 48000.0, false,  0, "exactly half a hertz is inside the gate" } })
+        {
+            const auto got = nam::NamStage::rateMatch (r.h, r.m);
+            test::ok (got.modelRunSR == r.runSR && got.resampling == r.res && got.latencySamples == r.lat,
+                      std::string (r.what) + " — got {" + std::to_string (got.modelRunSR) + ", "
+                      + (got.resampling ? "true" : "false") + ", " + std::to_string (got.latencySamples) + "}");
         }
     }
 

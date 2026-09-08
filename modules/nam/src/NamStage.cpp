@@ -548,16 +548,18 @@ bool   NamStage::modelHasLoudness() const { return impl->hasLoudness.load (std::
 //  2. GATE. A resampler is installed only past half a hertz of difference. Below that the rates are
 //     the same clock as far as anything audible is concerned, and installing a 64-tap kernel to
 //     convert 48000 to 48000.4 would cost 64 samples of delay to no purpose.
-//  3. MEASURE, and only if one is installed. The geometry is core's — `pairDelayHostSamples` — and
+//  3. DERIVE, and only if one is installed. The geometry is core's — `pairDelayHostSamples` — and
 //     the rounding is ours: the true delay is fractional and a host wants an integer, so round to
 //     nearest. The residual is at most half a sample (worst on the shipped grid: 0.40 at 44.1 kHz,
 //     whose first comb notch against an undelayed dry path sits at 55 kHz, out of band).
 //
-// 🔴 NOT GUARDED, DELIBERATELY. A non-finite or negative hostSR produces a non-finite result here and
-// did before; adding a guard would be a BEHAVIOUR change wearing a refactor's clothes, and this commit
-// promises that no number moves. The one input that could divide by zero cannot reach the division:
-// step 1 turns a non-positive model rate into the factory rate. A real contract for absurd host rates
-// is a separate question with its own acceptance.
+// 🔴 NOT GUARDED, DELIBERATELY, and the earlier wording of this paragraph was wrong about what an
+// absurd hostSR actually does. A negative host usually produces a perfectly finite, perfectly useless
+// number; a NaN fails the gate and returns 0; only an infinite host reaches lround with something it
+// cannot represent. None of that is new — it is what the shipped code did — and adding a guard would
+// be a BEHAVIOUR change wearing a refactor's clothes, while this commit promises that no number moves.
+// The one input that could divide by zero cannot reach the division: step 1 turns a non-positive model
+// rate into the factory rate. A real contract for absurd host rates is a separate question.
 NamStage::RateMatch NamStage::rateMatch (double hostSR, double modelSR) noexcept
 {
     RateMatch r {};

@@ -203,7 +203,14 @@ public:
         prepared_ = false;                       // law 11(b): disarm FIRST, then validate, then write
         if (numChannels < 1 || numChannels > kMaxChannels) return false;
         if (maxBlock < 1) return false;
-        fs_       = sampleRate > 0.0 ? sampleRate : 48000.0;
+        // 🔴 FINITE, not merely positive — and this line is stricter than it was because THIS PR made
+        // it need to be. The dry-aligner capacity below is now `(int) ceil(<a function of fs_>)`, and an
+        // out-of-range float→int conversion is undefined: measured, an infinite fs_ converts to
+        // INT_MAX on arm64 (an 8 GiB zero-fill) and to INT_MIN on x86-64, where DryAligner's
+        // `max(2, capacity)` then yields TWO — every delay silently clamped to one sample, which is
+        // exactly the failure the capacity comment below condemns. The old literal 256 had no
+        // conversion and so no exposure. A non-finite rate now falls back like a non-positive one.
+        fs_       = (sampleRate > 0.0 && std::isfinite (sampleRate)) ? sampleRate : 48000.0;
         maxBlock_ = maxBlock;
         channels_ = numChannels;   // validated above — law 11(b) forbids the clamp that was here
         coldAfter_.store(coldSamples(coldSeconds_), std::memory_order_release);
@@ -234,10 +241,19 @@ public:
         // formula sitting in front of a silent clamp. It was true when written and would have stopped
         // being true the moment the kernel length became a function of the ratio (the open kTaps
         // item), where 192 kHz costs 256 samples and 256 would clamp to 255. Ask instead — at this
-        // rate, for the only model rate this stage can ever run — and add one slot because the
-        // aligner's usable range is capacity-1.
-        const int dryCap = (int) std::ceil (felitronics::core::StreamResampler::pairDelayHostSamples (
-                                                fs_, felitronics::nam::NamStage::kModelSampleRate)) + 2;
+        // rate — and add TWO slots: one because the aligner's usable range is capacity-1, one because
+        // ceil() of a value already at an integer leaves no headroom at all.
+        // 🔴 AND IT MAY NOT SHRINK. Computing the number removes the restatement, but it does NOT
+        // make 48 kHz a provable ceiling on the model rate: install() accepts a model within half a
+        // hertz of the current run rate and prepare() then ADOPTS it, so repeated half-hertz swaps
+        // ratchet the run rate away from the factory value — measured, 65 accepted steps walked it
+        // from 48000 to 47967.5. A lower run rate means a LONGER round trip, so a capacity derived
+        // from 48 kHz alone could be one slot short of a delay the stage really reports, and
+        // DryAligner clamps silently. Keep the shipped 256 as a floor: the computed term can only
+        // raise it, never lower it, and a future kernel that needs more gets it automatically.
+        const int dryCap = std::max (256,
+            (int) std::ceil (felitronics::core::StreamResampler::pairDelayHostSamples (
+                                 fs_, felitronics::nam::NamStage::kModelSampleRate)) + 2);
         dryLatency_.prepare(channels_, maxBlock_, dryCap);
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
