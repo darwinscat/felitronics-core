@@ -50,6 +50,7 @@
 #include <felitronics/rigplayer/ToneKnobs.h>
 
 #include <felitronics/convolution/CabConvolver.h>
+#include <felitronics/core/DryAligner.h>
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/lineareq/MagnitudeCurve.h>
@@ -211,6 +212,21 @@ public:
         prepared_ = false;                       // a refused sub-prepare leaves the player unprepared
         for (auto& f : fir_) if (! f.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
         if (! dry_.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
+        // 🔴 THE DRY PATH HAS TO BE DELAYED BY WHAT THE WET PATH COSTS, or the blend is a COMB FILTER.
+        // The mix in process() sums `a` (through the models, hence through their rate-match) with `d`
+        // (the DI, through the dry FIR only). Those two are misaligned by exactly latencySamples(), and
+        // summing them notches at fs/(2·D) with every odd multiple above it.
+        //
+        // This was ALREADY wrong before P34 and nobody had put a number on it: with the cubic's 3.84
+        // samples the first null sat at 5742 Hz. P34's 61.4 samples move it to 359 Hz — the body of a
+        // guitar, not a phasey top — and the host cannot fix it, because latencySamples() reports the
+        // whole player's PDC outward while this notch is INTERNAL to the blend. Measured on a 50/50
+        // blend, worst dip across 100 Hz … 10 kHz: -50 dB unaligned against 0.00 dB aligned.
+        //
+        // Capacity: it must EXCEED the delay it will ever hold (DryAligner clamps to [0, capacity-1]).
+        // The largest this can report is a 192 kHz host against a 48 kHz model — D·(1 + 4) = 160 — so
+        // 256 covers it with margin. `kMaxDelay` is 128 and would silently clamp.
+        dryLatency_.prepare(channels_, maxBlock_, 256);
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
@@ -773,8 +789,19 @@ public:
             // the whole economy of a blend. Taken ahead of the pre-model tone — the hardware's dry path
             // leaves at the input jack.
             const bool mixDry = dryActive_.load(std::memory_order_acquire);
-            if (mixDry)
-                for (int c = 0; c < channels_; ++c) std::copy(a[c], a[c] + count, d[c]);
+
+            // 🔴 THE DRY PATH IS DELAYED BY WHAT THE WET PATH COSTS, and the delay is taken UNCONDITIONALLY.
+            // The blend below sums `a` (through the models, hence through their rate-match) with `d`; those
+            // two are misaligned by exactly latencySamples() unless something holds the dry back, and
+            // summing them notches at fs/(2·D). See prepare() for the numbers and the history.
+            // Advancing only while the blend is ON would be the classic cold-ring bug — DryAligner.h says
+            // it in as many words: a ring fed only while a stage runs is COLD the moment it is first read
+            // and emits its latency in zeros. Turning the dry knob up would then start with D samples of
+            // silence in the dry leg. The copy costs one pass over the block when the blend is off, which
+            // is nothing beside two neural models.
+            for (int c = 0; c < channels_; ++c) std::copy(a[c], a[c] + count, d[c]);
+            dryLatency_.advance((const float* const*) d, channels_, count, latencySamples());
+            for (int c = 0; c < channels_; ++c) std::copy_n(dryLatency_.delayed(c), count, d[c]);
 
             // The knobs that sit BEFORE the distortion in the hardware, shaping what gets distorted.
             runBands(0, a, count);
@@ -995,14 +1022,23 @@ private:
     }
 
     // How many samples this model owes before it may be heard, in THIS rate: its receptive field,
-    // scaled — a 96 kHz host feeds twice as many to fill the same network — plus one block, so a slot
-    // is never marked audible for a block it is still short in.
+    // scaled — a 96 kHz host feeds twice as many to fill the same network — plus the RATE-MATCH DELAY,
+    // plus one block, so a slot is never marked audible for a block it is still short in.
+    //
+    // 🔴 THE LATENCY TERM IS NOT DECORATION, and it used to be missing. When the stage is resampling,
+    // the first latencySamples() host samples out of it are the network's response to the resampler's
+    // own leading zeros, not to the signal — so a full receptive field of REAL material needs that many
+    // more. The old expression relied on `+ maxBlock_` to absorb it silently, which worked only while
+    // that delay was 3.84 samples: P34's 64-tap kernel makes it 61.4 at 44.1 kHz, and at the 32- and
+    // 64-sample blocks live rigs run the slack stopped covering it. The effect is small against a
+    // ~6300-sample receptive field (a crossfade starting up to 1.4 ms early), but the sentence above
+    // was a GUARANTEE, and a guarantee that quietly stopped holding is worse than a smaller number.
     long long warmFor(const felitronics::nam::NamStage& st) const {
         const int pre = st.prewarmSamples();
         if (pre <= 0) return 0;
         const double mr = st.modelSampleRate();
         const double scale = (mr > 0.0 && fs_ > 0.0) ? fs_ / mr : 1.0;
-        return (long long) std::ceil((double) pre * scale) + maxBlock_;
+        return (long long) std::ceil((double) pre * scale) + (long long) st.latencySamples() + maxBlock_;
     }
 
     // The rest before a slot goes cold, in this rate's samples, for the law. Zero = never.
@@ -1359,6 +1395,7 @@ private:
     felitronics::core::StateGrid            bandGrid_[2];              // law 8 on audio time, per side
     felitronics::eq::Biquad    bq_[2][kMaxBands][kMaxChannels];
     felitronics::convolution::CabConvolver fir_[2], dry_;
+    felitronics::core::DryAligner dryLatency_;   // holds the dry path back by the models' rate-match
     std::vector<float> slotB_[kMaxChannels], dryBuf_[kMaxChannels], spare_[kMaxChannels];
 };
 

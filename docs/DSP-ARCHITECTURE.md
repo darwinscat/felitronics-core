@@ -464,7 +464,7 @@ its own JUCE-free self-tests.
 
 | Module          | What                                                                 | Build / deps / notes |
 |-----------------|---------------------------------------------------------------------|--------------|
-| `core`          | Math, `Smoother`, `ScopedFlushToZero`, `kMaxChannels` (SSOT) + size config, fixed-size ring / lock-free SPSC FIFO, `Sample` alias, `DelayLine` / `DryAligner` / `StreamResampler`, the **FFT seam** | header-only, zero deps; the shared base. `StreamResampler`'s measured cost — droop, phase modulation and a decimation with no stopband — is [`STREAM-RESAMPLER-COST.md`](STREAM-RESAMPLER-COST.md) |
+| `core`          | Math, `Smoother`, `ScopedFlushToZero`, `kMaxChannels` (SSOT) + size config, fixed-size ring / lock-free SPSC FIFO, `Sample` alias, `DelayLine` / `DryAligner` / `StreamResampler`, the **FFT seam** | header-only, zero deps; the shared base. `StreamResampler` is a 64-tap polyphase windowed sinc since P34 (it was a Catmull-Rom cubic with no anti-aliasing through v0.26.0); what the swap fixed and what it costs in latency and CPU is [`STREAM-RESAMPLER-COST.md`](STREAM-RESAMPLER-COST.md) |
 | `eq`            | matched biquads (Vicanek) + Cytomic SVF + `EqBand` + `EqEngine`      | header-only = today's `teq::` (becomes `eq`) |
 | `dynamics`      | `EnvelopeFollower` (peak/RMS, attack/release) + `GainComputer` (threshold/ratio/knee/range, downward+upward) | header-only, zero deps; **first NEW module** |
 | `analysis`      | spectrum tap (the existing `SpectrumTap`), correlation, LUFS/loudness | header-only; FFT **via the seam** |
@@ -641,7 +641,7 @@ is `src/`. Formats VST3/AU/CLAP/Standalone.
   self-register via static initializers → must be linked `WHOLE_ARCHIVE`. Two instances = preamp +
   poweramp. Effectively **JUCE-free** (NAM + std + StreamResampler). Model load is off-thread + atomic
   swap (threading in the adapter, law 1).
-- **`cab::StreamResampler` (`StreamResampler.h`):** **JUCE-free** Catmull-Rom resampler that rate-matches
+- **`cab::StreamResampler` (`StreamResampler.h`):** **JUCE-free** 64-tap polyphase windowed-sinc resampler (Catmull-Rom until P34) that rate-matches
   a model's native SR to the host SR; the only source of reported latency (0 when SRs match).
 - **IR cabinet convolution:** `cab::Convolver` (`Convolver.h`) + `cab::IRSlot` (`IRSlot.{h,cpp}`) over
   **`juce::dsp::Convolution`** in **zero-latency** mode. **JUCE-dependent** (see §6 conflicts).

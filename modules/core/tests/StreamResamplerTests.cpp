@@ -72,15 +72,23 @@ int main()
 {
     std::printf ("felitronics::core stream-resampler tests\n");
 
-    group ("identity at ratio 1 — clean 2-sample delay (catmull @ t=0)");
+    group ("identity at ratio 1 — a BIT-EXACT delay of kHalf, not a filter");
     {
+        // 🔴 A DELIBERATE SHORT-CIRCUIT, not a property of the kernel. The cutoff is 0.99 of the lower
+        // Nyquist and sinc(0.99·n) is NOT zero at integer n, so running ratio 1 through the general
+        // path would apply a real (if gentle) low-pass to a caller who asked for no rate change at all.
+        // The class detects an exactly equal in/out rate and copies. The DELAY stays kHalf, so latency
+        // is one formula for every ratio and only the filtering is skipped. It was 2 samples while the
+        // kernel was a cubic; that number was the cubic's geometry, not a promise about identity.
+        const std::size_t D = (std::size_t) felitronics::core::StreamResampler::kHalf;
         auto in  = sine (4000, 48000.0, 600.0);
         auto out = runResampler (48000.0, 48000.0, in, 512);
         ok (! anyBad (out), "no NaN/Inf at identity ratio");
         int matched = 0, checked = 0;
-        for (std::size_t k = 2; k + 2 < out.size() && k < in.size() && k < 2000; ++k, ++checked)
-            if (std::fabs (out[k] - in[k - 2]) < 1.0e-4f) ++matched;
-        ok (checked > 1000 && matched > checked - 4, "out[k] == in[k-2] over the checked run");
+        for (std::size_t k = D; k + 2 < out.size() && k < in.size() && k < 2000; ++k, ++checked)
+            if (std::fabs (out[k] - in[k - D]) <= 0.0f) ++matched;      // BIT-exact, not a tolerance
+        ok (checked > 1000 && matched == checked,
+            "out[k] IS in[k-kHalf], bit for bit — the identity path copies, it does not resample");
     }
 
     group ("upsample 44100 -> 48000 (no NaN, level kept, count ~ ratio)");
