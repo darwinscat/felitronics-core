@@ -1410,6 +1410,182 @@ void testTapPlumbingEdges()
     }
 }
 
+// =============================================================================================
+// THE MUTATION STAND'S SURVIVORS. Each group below is the INPUT that makes one surviving mutation
+// change the delivered answer — found by sweeping a 99-case battery against the clean header and each
+// mutated one, not by reasoning about the code. They are collected here rather than scattered because
+// what they have in common is where they live: outside the corpus, in the saturated regime, under three
+// seconds, or in a request whose every candidate is infeasible.
+void testSurvivorsOfTheMutationStand()
+{
+    // ---------------------------------------------------------------------------------------------
+    test::group ("a broken limit outranks 'not exactly achievable' (found by mutating the choice rule)");
+    {
+        // The two verdicts answer different questions and the wrong one used to win. `best` is the
+        // candidate DELIVERED, which when nothing is feasible is deliberately the gentlest rather than
+        // the nearest — so testing its distance to the target reported a search that had walked away
+        // from an illegal target as a resolution limit, and dropped the violations on the way.
+        Programme src = makeMusic (6.0, 0.3);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;
+        req.targetLufs = -24.0;                 // QUIETER than the first render, so the upstream guard
+        req.maxTruePeakDbTp = -1.0;             // stays out of it and the search walks down
+        req.initialGainDb = 18.0;
+        req.maxLraLossLu = 0.01;                // broken by the compressor at every gain
+        req.inputLoudnessRangeLu = 8.0;
+        req.minPlrDb = 40.0;                    // and unsatisfiable on any real programme
+        req.maxPasses = 6;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        const std::uint32_t lra = constraintBit (MasteringConstraint::LoudnessRange);
+        const std::uint32_t plr = constraintBit (MasteringConstraint::PeakToLoudness);
+        // PRECONDITION: both limits really are broken, or the ordering under test never applies.
+        test::ok ((sol.alsoViolated & lra) != 0 && (sol.alsoViolated & plr) != 0,
+                  "precondition: both limits are violated (mask 0x" + std::to_string (sol.alsoViolated) + ")");
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable,
+                  std::string ("a violated limit is reported, not 'between achievable' (got ")
+                  + statusName (sol.status) + ")");
+        test::ok (sol.binding != MasteringConstraint::None, "...and the binding limit is NAMED");
+        std::printf ("      ordering: status %s, binding %s, mask 0x%x, I %.4f\n",
+                     statusName (sol.status), constraintName (sol.binding),
+                     (unsigned) sol.alsoViolated, sol.measured.integratedLufs);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("among candidates that all break a limit, the GENTLEST is delivered, not the nearest");
+    {
+        // The same request without the unsatisfiable PLR floor: every candidate breaks the range limit,
+        // so the tie-break among infeasible candidates decides what the caller gets. Delivering the
+        // closest to a target already declared unreachable is the "push it through anyway" behaviour.
+        Programme src = makeMusic (6.0, 0.3);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;
+        req.targetLufs = -24.0; req.maxTruePeakDbTp = -1.0; req.initialGainDb = 18.0;
+        req.maxLraLossLu = 0.01; req.inputLoudnessRangeLu = 8.0; req.maxPasses = 6;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable, "all-infeasible: refused by name");
+        // PRECONDITION: the log holds more than one candidate, and they differ in range loss —
+        // otherwise "the gentlest" is a statement about a set of one (P18 F45's geometry trap).
+        test::ok (sol.logCount >= 2, "precondition: more than one candidate was rendered ("
+                                     + std::to_string (sol.logCount) + ")");
+        double best = 1e9, worst = -1e9;
+        for (int k = 0; k < sol.logCount; ++k)
+        {
+            best  = std::fmin (best,  req.inputLoudnessRangeLu - sol.log[k].loudnessRangeLu);
+            worst = std::fmax (worst, req.inputLoudnessRangeLu - sol.log[k].loudnessRangeLu);
+        }
+        const double delivered = req.inputLoudnessRangeLu - sol.measured.loudnessRangeLu;
+        test::ok (delivered <= best + 1e-9,
+                  "the delivered render is the gentlest tried (" + std::to_string (delivered)
+                  + " vs best " + std::to_string (best) + ")");
+        std::printf ("      gentlest: delivered loss %.4f, range over the log %.4f .. %.4f, %d candidates\n",
+                     delivered, best, worst, sol.logCount);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("a programme too short for a loudness RANGE does not get one invented");
+    {
+        // EBU Tech 3342 needs short-term samples, one a second. Under three seconds there are none, and
+        // `loudnessRangeLu()` answers 0.0 — which is also what "no dynamic range at all" answers. A
+        // solver that took that as a measurement would compute a range LOSS equal to the whole input
+        // range and refuse a programme it should have mastered.
+        for (double sec : { 1.0, 2.0, 2.9, 6.0 })
+        {
+            Programme src = makeMusic (sec, 0.3);
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            LoudnessRequest req;
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            req.maxLraLossLu = 0.4; req.inputLoudnessRangeLu = 6.0;   // supplied by the caller
+            req.maxPasses = 4;
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                               src.in(), dst.out(), 2, src.frames(), req);
+            char msg[176];
+            std::snprintf (msg, sizeof msg,
+                           "%.1f s: the range constraint is %s and the solve %s", sec,
+                           sec >= 3.0 ? "ACTIVE" : "off", statusName (sol.status));
+            if (sec < 3.0)
+            {
+                test::ok (! sol.measured.lraValid, std::string ("under 3 s the range is not a measurement — ") + msg);
+                test::ok (sol.status == MasteringSolveStatus::Solved, msg);
+            }
+            else
+            {
+                // PRECONDITION for the pair above: at six seconds the same field DOES flip, so the
+                // quantity being compared moves across the fixture rather than being constant.
+                test::ok (sol.measured.lraValid, std::string ("at 6 s the range IS a measurement — ") + msg);
+            }
+            std::printf ("      %.1f s: lraValid=%d LRA=%.3f status=%s I=%.4f\n",
+                         sec, (int) sol.measured.lraValid, sol.measured.loudnessRangeLu,
+                         statusName (sol.status), sol.measured.integratedLufs);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("the saturated regime: the slope guard and the idle anchor both earn their keep");
+    {
+        // Where the corpus is not. On material already dense at full scale the chain saturates near
+        // -5.3 LUFS, so a target just above that sits in the flat part of `I(g)` — the measured slope
+        // collapses toward zero and the gain is nowhere near the +-60 dB clamp. Two guards live here and
+        // nothing else in this file visits the place.
+        for (double target : { -5.4, -5.3, -2.0 })
+        {
+            Programme src = makeMusic (6.0, 0.95, 12345u, 1.0);   // dense, no transients
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            LoudnessRequest req;
+            req.targetLufs = target; req.maxTruePeakDbTp = -1.0; req.maxPasses = 10;
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                               src.in(), dst.out(), 2, src.frames(), req);
+            // PRECONDITION: the search really is in the flat region — consecutive renders move the
+            // loudness far less than they move the gain.
+            double worstSlope = 1e9;
+            for (int k = 1; k < sol.logCount; ++k)
+            {
+                const double dg = sol.log[k].gainDb - sol.log[k - 1].gainDb;
+                if (std::fabs (dg) > 0.25)
+                    worstSlope = std::fmin (worstSlope,
+                                            (sol.log[k].integratedLufs - sol.log[k - 1].integratedLufs) / dg);
+            }
+            char msg[192];
+            std::snprintf (msg, sizeof msg, "target %.1f: the search reached the flat region (slope %.4f)",
+                           target, worstSlope);
+            test::ok (worstSlope < 0.25, msg);
+            std::snprintf (msg, sizeof msg, "target %.1f: %s in %d renders, gain %.3f",
+                           target, statusName (sol.status), sol.passes, sol.preLimiterGainDb);
+            // THE VERDICT IS ASSERTED PER TARGET, not as a disjunction — a disjunction over three
+            // statuses is satisfied by every mutation of the two guards this group exists for, and it
+            // was: the first version of this group passed against both.
+            if (target < -4.0)
+            {
+                // -5.4 is INSIDE what the chain can deliver, and the search only gets there if it
+                // believes the tiny slope it measured. With a floor of 0.02 on that slope it creeps at
+                // a fiftieth of the step and runs out of renders 0.194 LU short.
+                test::ok (sol.status == MasteringSolveStatus::Solved
+                          || std::fabs (sol.measured.integratedLufs - target) < 0.16, msg);
+            }
+            else
+            {
+                // -2 is past what the chain can deliver at all, and the actuator is what stops it. That
+                // has a NAME, and naming the budget instead is a statement about the wrong thing.
+                test::ok (sol.status == MasteringSolveStatus::TargetUnreachable, msg);
+                test::ok (sol.binding == MasteringConstraint::GainRange,
+                          "…and the binding limit is the gain range, not the pass budget");
+                test::approx (std::fabs (sol.preLimiterGainDb), 60.0, 1e-9,
+                              "…with the gain really pinned at the actuator's limit");
+            }
+            std::printf ("      %s\n", msg);
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -1434,5 +1610,6 @@ int main()
     testTheAnswerDoesNotDependOnWhereItStarted();
     testAnUnmeasurableStartIsNotAnUnmeasurableProgramme();
     testTapPlumbingEdges();
+    testSurvivorsOfTheMutationStand();
     return felitronics::test::report();
 }

@@ -639,8 +639,19 @@ public:
                 if (haveAnchor && (! pOk || pg < anchorG)) { pg = anchorG; pi = anchorI; pOk = true; }
                 if (pOk && std::fabs (g - pg) > 1.0e-9)
                 {
+                    // ONLY A NON-POSITIVE OR NON-FINITE SLOPE IS REJECTED, and the floor used to be
+                    // 0.02 instead of 0. That was wrong, and a mutation of this very line is what
+                    // showed it: a slope under 0.02 is not an implausible measurement, it is the TRUTH
+                    // in the saturated region, where more drive buys almost no loudness. Rejecting it
+                    // fell back to a slope of 1 and made the search creep at 1/50 of the step the
+                    // measurement called for. Measured on material dense at full scale, target
+                    // -5.4 LUFS: with the 0.02 floor the search ran out of ten renders 0.194 LU short
+                    // and reported `PassLimit`; without it the same request SOLVED on target in nine.
+                    // The degenerate cases are already handled downstream — the clamp bounds the step
+                    // at twenty times the shift, and the bracket turns the next one into an
+                    // interpolation.
                     const double sl = (m.integratedLufs - pi) / (g - pg);
-                    if (std::isfinite (sl) && sl > 0.02 && sl <= 1.2) s = sl;
+                    if (std::isfinite (sl) && sl > 0.0 && sl <= 1.2) s = sl;
                 }
                 else if (haveLo && haveHi && std::fabs (hiG - loG) > 1.0e-9)
                     s = (hiI - loI) / (hiG - loG);
@@ -682,12 +693,19 @@ public:
             const double clG = std::clamp (nextG, -kMaxGainDb, kMaxGainDb);
             const double clC = std::clamp (nextC, -kMaxGainDb, kMaxGainDb);
             const bool pinned = (std::fabs (clG - nextG) > 1.0e-9);
+            // THE ACTUATOR'S LIMIT IS NAMED THE MOMENT IT BINDS, not only when the whole (g, c) pair
+            // stops moving. It used to be recorded inside the "nothing moved" branch, so a ceiling that
+            // was still tracking its aim kept the search alive at a gain already pinned at +-60 dB — and
+            // the verdict came back `PassLimit`, which is a statement about the BUDGET, for something
+            // that is a fact about the chain's knobs. Measured: a target of -2 LUFS on dense material
+            // reported `Unreachable / GainRange` at one budget and `PassLimit` at a larger one, on the
+            // same programme. Wanting MORE loudness with the gain clamped is unreachable whatever the
+            // ceiling does next: lowering the ceiling only makes it quieter.
+            if (pinned && shift > 0.0)
+                best.forceViolation (constraintBit (MasteringConstraint::GainRange));
             if (std::fabs (clG - g) < 1.0e-6 && std::fabs (clC - c) < 1.0e-6)
             {
-                // The actuator is where the search wanted to go and the target is still not met: that is
-                // the gain range binding, and it has a name.
-                if (pinned) best.forceViolation (constraintBit (MasteringConstraint::GainRange));
-                else        stoppedOnResolution = true;
+                if (! pinned) stoppedOnResolution = true;
                 break;
             }
             nextG = clG; nextC = clC;
@@ -700,10 +718,32 @@ public:
         // both outside tolerance, and a gain gap too small to hold anything between them, is not a
         // failure to converge and not a constraint. Saying so is the only honest verdict, and it carries
         // both sides so a caller can choose which one to take.
+        // ORDER: A BROKEN LIMIT OUTRANKS "NOT EXACTLY ACHIEVABLE", and it did not.
+        //
+        // The two verdicts answer different questions and the wrong one used to win. "The target lies
+        // between two achievable values" is a statement about the SEARCH — it needs the candidate
+        // NEAREST the target — while `best` is the candidate that gets DELIVERED, which when nothing is
+        // feasible is deliberately the gentlest rather than the nearest. Testing `best.err` therefore
+        // asked "how far is the render I am handing back from the target", got a large answer because
+        // the search had walked away from a target it could not legally reach, and reported that
+        // distance as a resolution limit — hiding the constraint violations entirely (`alsoViolated` is
+        // only filled on the unreachable path).
+        //
+        // Measured, and this is a mutation that found a defect in the CLEAN code rather than a hole in
+        // the suite: a request with `maxLraLossLu = 0.01` and `minPlrDb = 40` — both broken by every
+        // candidate — came back `TargetBetweenAchievable`, binding `None`, mask `0x0`, delivering
+        // -19.29 LUFS against a target of -24. The truth is that -24 IS reachable and costs the
+        // loudness range and the peak-to-loudness ratio the caller forbade.
+        //
+        // So: constraints first, and the between-achievable test reads the NEAREST candidate's error.
         const bool bracketClosed = haveLo && haveHi && std::fabs (hiG - loG) <= 1.0e-3
                                 && std::fabs (loI - target) > req.toleranceLu
                                 && std::fabs (hiI - target) > req.toleranceLu;
-        if (bracketClosed || (stoppedOnResolution && best.have && best.err > req.toleranceLu))
+        const bool betweenAchievable = best.nearestViolated == 0
+                                    && (bracketClosed
+                                        || (stoppedOnResolution && best.nearestHave
+                                            && best.nearestErr > req.toleranceLu));
+        if (betweenAchievable)
         {
             sol.status = MasteringSolveStatus::TargetBetweenAchievable;
             if (bracketClosed)
