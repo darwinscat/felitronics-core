@@ -1020,6 +1020,20 @@ static void testParamsWrittenBeforePrepare()
     ok (! c3.prepare (-1.0, nch, cfg), "a bad sample rate is refused");
     ok (! c3.isPrepared(), "a refused prepare leaves the chain unprepared");
     ok (c3.latencySamples() == 0, "a refused prepare reports no latency");
+
+    // RE-PREPARE with a write still pending. The keep-the-pending-set rule has two cases and only one
+    // of them is "a fresh object": a chain that has already run, is written to, and is then prepared
+    // again for a new stream must carry that write into the new stream rather than the last one it
+    // applied. It is the same line that used to discard it.
+    mastering::MasteringChain c4;
+    ok (c4.prepare (48000.0, nch, cfg), "re-prepare: first preparation");
+    { Buf z ((std::size_t) nch, std::vector<float> ((std::size_t) n, 0.05f));
+      auto p = planes (z); felitronics::test::run (c4.process (p.data(), nch, n)); }
+    mastering::MasteringChainParams later; later.inputGainDb = -6.0;
+    c4.setParams (later);                                  // pending, never applied
+    ok (c4.prepare (44100.0, nch, cfg), "re-prepare: at a new rate, with a write still pending");
+    approx (c4.params().inputGainDb, -6.0, 0.0, "re-prepare KEEPS the pending write, not the applied one");
+    approx (c4.sampleRate(), 44100.0, 0.0, "re-prepare reports the new rate");
 }
 
 //==============================================================================

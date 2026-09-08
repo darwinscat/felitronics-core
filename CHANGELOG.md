@@ -48,7 +48,36 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - **Digital silence gets `MeasurementInvalid`, not a plausible answer.** `analysis::LoudnessMeter`
     returns the literal -120.0 when nothing passes its absolute gate, and a ceiling derived from a
     -200 dBTP peak reading clamps to +60 dBTP — i.e. it would switch the limiter OFF and report
-    success.
+    success. A programme that is merely too QUIET to measure at the starting gain is a different case
+    and is bootstrapped from the peak instead: a flat tone at -71.7 LUFS is unmeasurable at 0 dB and
+    ordinary 56 dB up, and refusing it would be a verdict about the starting gain.
+  - **The answer does not depend on where the search started, and it used to.** A step that moved the
+    gain and the ceiling together is exact — it is the scale law above — but exact at a FROZEN DRIVE.
+    Measured on one programme and one request (-14 LUFS, -1 dBTP): from a 0 dB start the answer was
+    8.5 dB of drive with no limiting, PLR 11.9 and LRA 4.1; from a 55 dB start it was **47.6 dB of
+    drive, 38.05 dB of limiter gain reduction, PLR 4.6 and LRA 0.10 — also reported `Solved`.** Adding
+    `minPlrDb = 8` then made the second one `TargetUnreachable` while the first stayed Solved, so the
+    VERDICT depended on the start too. The ceiling now tracks its aim on every step, in both
+    directions, and a warm start unwinds instead of freezing. Pinned over starts of 0 to 55 dB.
+  - **`in == out` is refused.** One render in place is well defined and `OfflineRenderer` still
+    supports it; a SEARCH is not, because every pass after the first reads the previous pass's master.
+    Measured: a solve reported -22.996 LUFS and the gain it returned, applied to the untouched source,
+    gives -29.000 — the answer missed its own programme by 6.0 LU.
+  - **The request carries no delivery policy and no hidden state.** `targetLufs` and
+    `maxTruePeakDbTp` have no defaults (NaN, refused) — "-14 LUFS, -1 dBTP" is a product's decision,
+    not a core's. The input's loudness range moved out of the solver and into the request for the same
+    reason: held as solver state it outlived the programme it described, and track B was judged against
+    track A's range.
+  - **A target past the +-60 dB gain node is `TargetUnreachable` with `GainRange` named**, not a
+    pass limit: the movement test compared the UNCLAMPED step, so a saturated actuator re-rendered the
+    same point until the budget ran out — measured, 29 identical renders of a 33-render budget.
+  - Also fixed in the same pass, each found by a review round and reproduced before being acted on:
+    the tap capacity arithmetic overflowed in `int` before its cast to `long long`; the tap counters
+    advanced even when no tap was requested; `OfflineRenderer` checked the tap capacity per BLOCK, so a
+    short tap failed half way through a render with output already written; the limiter's statistics
+    window ignored the limiter's own interpolator latency, which cost the whole reaction of a peak in
+    the last 32 samples; an infinity of the wrong sign disabled a constraint the caller meant to be
+    unsatisfiable; and the solver did not check that its sample rate was the chain's.
 
 - **BREAKING (behaviour), `dynamics`, `deesser`, `dynamiceq`, `poweramp`, `multiband`, `core`: LAW 11c —
   A PAUSE IS SILENCE.** A call with `nch == 0, n > 0` now advances a stage's SHARED, one-per-instance

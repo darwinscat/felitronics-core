@@ -44,6 +44,8 @@ namespace felitronics::mastering
 // audio callback. It does not allocate inside `render()` (the scratch is sized in `prepare()`), which
 // matters because the chain underneath is RT-safe and a test that counts allocations over a whole
 // render should see none.
+//==============================================================================
+
 // The do-nothing sink the plain `render()` uses. Named rather than a lambda so the two overloads are
 // visibly the same call.
 struct NullTapSink { void operator() (const MasteringChainTaps&, long long) const noexcept {} };
@@ -104,6 +106,19 @@ public:
         if (numChannels < 1 || numChannels > maxCh_ || scratch_.empty()) return false;
         if (frames < 0) return false;
         if (frames > 0 && (in == nullptr || out == nullptr)) return false;
+        // THE TAP CAPACITY IS CHECKED FOR THE WORST BLOCK, HERE, BEFORE ANYTHING MOVES. The chain checks
+        // it per call, which is correct for the chain and wrong for a render: a capacity that covers the
+        // early blocks and not a later one fails HALF WAY, with output already written and the chain
+        // mid-stream. Measured: block 300, quantum 256, a 2000-frame programme and a 256-frame tap ran
+        // five blocks and 1244 output frames before the sixth needed 512 and refused. A render either
+        // happens or does not.
+        {
+            const long long worst = (long long) block_ + (long long) chain.internalBlock() - 1;
+            if ((taps.compressorGrDb != nullptr || taps.preLimiter != nullptr)
+                && (long long) taps.frameCapacity < worst) return false;
+            if ((taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr)
+                && (long long) taps.osCapacity < worst * (long long) chain.tapOversampleFactor()) return false;
+        }
 
         chain.reset();
         const long long D     = chain.latencySamples();

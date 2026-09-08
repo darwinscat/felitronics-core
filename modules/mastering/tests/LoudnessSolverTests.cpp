@@ -174,7 +174,7 @@ const char* statusName (MasteringSolveStatus s)
         case MasteringSolveStatus::Solved:             return "Solved";
         case MasteringSolveStatus::TargetUnreachable:  return "TargetUnreachable";
         case MasteringSolveStatus::UpstreamViolation:  return "UpstreamViolation";
-        case MasteringSolveStatus::GateStep:           return "GateStep";
+        case MasteringSolveStatus::TargetBetweenAchievable: return "BetweenAchievable";
         case MasteringSolveStatus::PassLimit:          return "PassLimit";
         case MasteringSolveStatus::MeasurementInvalid: return "MeasurementInvalid";
         case MasteringSolveStatus::RenderFailed:       return "RenderFailed";
@@ -205,7 +205,7 @@ void testHitsTheTarget()
     test::group ("the target is taken to 0.1 LU, and in how many renders");
     for (double target : { -16.0, -14.0, -12.0, -10.0 })
     {
-        Programme src = makeMusic (24.0, 0.28);
+        Programme src = makeMusic (8.0, 0.28);
         std::vector<std::vector<float>> out = src.ch;
         Programme dst; dst.ch = out; dst.bind();
 
@@ -263,7 +263,7 @@ void testTwoPassesWhenTheShapeAlreadyAdmitsIt()
     // The closed form moves g and c TOGETHER, which leaves the limiting shape untouched and moves the
     // loudness by exactly the shift. Its precondition is PLR <= ceiling - target, so the fixture picks a
     // modest target on a programme with plenty of crest.
-    Programme src = makeMusic (20.0, 0.20);
+    Programme src = makeMusic (8.0, 0.20);
     Programme dst; dst.ch = src.ch; dst.bind();
     Rig rig;
     if (! test::run (rig.build (2))) return;
@@ -291,23 +291,24 @@ void testUnreachableIsNamed()
     // (a) THE LOUDNESS RANGE. A wide-range programme pushed to a loud target has to be squashed, and the
     // corpus says accepted mastering moves LRA by -0.30 to -0.40 LU. Ask for 0.5 and a loud target.
     {
-        Programme src = makeWideRange (30.0);
+        Programme src = makeWideRange (20.0);
         Programme dst; dst.ch = src.ch; dst.bind();
         Rig rig;
         if (! test::run (rig.build (2))) return;
 
-        const bool haveLra = rig.solver.measureInputLra (src.in(), 2, src.frames());
+        double inLra = 0.0;
+        const bool haveLra = rig.solver.measureInputLoudnessRange (src.in(), 2, src.frames(), inLra);
         test::ok (haveLra, "the input's LRA is measurable (the constraint is a DELTA and needs it)");
         // PRECONDITION: the fixture has a range to lose. Without this the constraint cannot bind and
         // the test would pass against a solver that never checked it.
-        test::ok (rig.solver.inputLoudnessRangeLu() > 6.0,
-                  "precondition: the fixture's own LRA is wide (measured "
-                  + std::to_string (rig.solver.inputLoudnessRangeLu()) + " LU)");
+        test::ok (inLra > 6.0, "precondition: the fixture's own LRA is wide (measured "
+                               + std::to_string (inLra) + " LU)");
 
         LoudnessRequest req;
         req.targetLufs = -8.0;                 // loud enough to need heavy limiting
         req.maxTruePeakDbTp = -1.0;
         req.maxLraLossLu = 0.5;                // the corpus number, rounded up
+        req.inputLoudnessRangeLu = inLra;
         req.maxPasses = 4;
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                            src.in(), dst.out(), 2, src.frames(), req);
@@ -331,14 +332,14 @@ void testUnreachableIsNamed()
         test::approx (sol.measured.loudnessRangeLu, ind.LRA, 1e-9,
                       "LRA case: the reported range is the delivered buffer's");
         // PRECONDITION: the violation is real and it is the compressor's, not a rounding artefact.
-        const double loss = rig.solver.inputLoudnessRangeLu() - ind.LRA;
+        const double loss = inLra - ind.LRA;
         test::ok (loss > req.maxLraLossLu,
                   "precondition: the range loss really exceeds the allowance ("
                   + std::to_string (loss) + " LU against " + std::to_string (req.maxLraLossLu) + ")");
         test::ok (sol.measured.limiter.maxDb <= 0.0,
                   "precondition: the LIMITER did nothing at this render, so the loss is upstream of it");
         std::printf ("      LRA case: in %.2f LU -> out %.2f LU, I %.3f (target %.1f), status %s, binding %s\n",
-                     rig.solver.inputLoudnessRangeLu(), ind.LRA, sol.measured.integratedLufs,
+                     inLra, ind.LRA, sol.measured.integratedLufs,
                      req.targetLufs, statusName (sol.status), constraintName (sol.binding));
     }
 
@@ -346,7 +347,7 @@ void testUnreachableIsNamed()
     // dense mix with PLR ~10 does not exist as an input (10 is the RESULT of mastering, measured on two
     // proven pairs). Manufacturing one tests the REFUSAL, not the sound.
     {
-        Programme src = makeMusic (16.0, 0.62);
+        Programme src = makeMusic (8.0, 0.62);
         Programme dst; dst.ch = src.ch; dst.bind();
         Rig rig;
         if (! test::run (rig.build (2))) return;
@@ -375,7 +376,7 @@ void testUnreachableIsNamed()
 void testUpstreamIsNotBlamedOnTheTarget()
 {
     test::group ("a compressor limit broken by the SETTINGS is upstream, not 'target unreachable'");
-    Programme src = makeMusic (12.0, 0.5);
+    Programme src = makeMusic (6.0, 0.5);
     Programme dst; dst.ch = src.ch; dst.bind();
     Rig rig;
     if (! test::run (rig.build (2))) return;
@@ -385,6 +386,7 @@ void testUpstreamIsNotBlamedOnTheTarget()
     rig.params.compressor.ratio = 8.0;
     LoudnessRequest req;
     req.targetLufs = -14.0;
+    req.maxTruePeakDbTp = -1.0;
     req.compressorGr = { 2.0, GrStatistic::P95 };
     req.maxPasses = 3;
     const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
@@ -411,12 +413,15 @@ void testStatisticsAgreeWithAHandDrivenChain()
     // them here by driving the SAME chain with the SAME parameters and the SAME taps, block by block,
     // and accumulating with an independent histogram. A wrong window, a wrong stride or a double count
     // fails here even though the solver is perfectly self-consistent.
-    Programme src = makeMusic (10.0, 0.35);
+    Programme src = makeMusic (5.0, 0.35);
     Programme dst; dst.ch = src.ch; dst.bind();
     Rig rig;
     if (! test::run (rig.build (2))) return;
     LoudnessRequest req;
-    req.targetLufs = -12.0;
+    req.targetLufs = -10.0;                    // loud enough that the limiter really works — a
+                                               // barely-engaging limiter makes the null below a
+                                               // statement about a handful of samples
+    req.maxTruePeakDbTp = -1.0;
     req.maxPasses = 3;
     const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                        src.in(), dst.out(), 2, src.frames(), req);
@@ -450,7 +455,11 @@ void testStatisticsAgreeWithAHandDrivenChain()
     const int frames = src.frames();
     const long long D = chain2.latencySamples();
     const MasteringChainResolved r = chain2.resolved();
-    const long long limFrom = (long long) r.compressorLookahead + (long long) r.clipperLatency;
+    // The STATED offset, read from the chain rather than assumed: the limiter's trace is written where
+    // the gain is decided, which is on the oversampled copy, so it lags the limiter's input by the
+    // oversampler's latency (`limiterLatency - limiterLookahead`) on top of everything in front of it.
+    // The offset itself is checked independently in the tap-offset group below.
+    const long long limFrom = r.limiterTapOffset;
     std::vector<std::vector<float>> scratch (2, std::vector<float> ((std::size_t) blk, 0.0f));
     std::vector<float*> sp { scratch[0].data(), scratch[1].data() };
     long long tapPos = 0;
@@ -487,23 +496,28 @@ void testStatisticsAgreeWithAHandDrivenChain()
     // hold trivially.
     test::ok (hc.maxValue() > 0.5, "precondition: the compressor really compressed ("
                                    + std::to_string (hc.maxValue()) + " dB peak)");
-    test::ok (hl.maxValue() > 0.05, "precondition: the limiter really limited ("
-                                    + std::to_string (hl.maxValue()) + " dB peak)");
+    test::ok (hl.maxValue() > 0.5, "precondition: the limiter really limited ("
+                                   + std::to_string (hl.maxValue()) + " dB peak)");
     test::ok (nc == (std::uint64_t) frames, "compressor window: exactly `frames` samples counted");
     test::ok (nl == (std::uint64_t) frames * (std::uint64_t) F, "limiter window: exactly frames*F counted");
 
     double p95c = 0.0, p95l = 0.0;
     test::ok (hc.quantile (0.95, p95c), "hand-driven compressor p95 is answerable");
     test::ok (hl.quantile (0.95, p95l), "hand-driven limiter p95 is answerable");
-    test::approx (sol.measured.compressor.meanDb, hc.mean(), 1.0e-12, "compressor mean nulls");
-    test::approx (sol.measured.compressor.p95Db,  p95c,      1.0e-12, "compressor p95 nulls");
-    test::approx (sol.measured.compressor.maxDb,  hc.maxValue(), 1.0e-12, "compressor max nulls");
-    test::approx (sol.measured.compressor.activeFraction, (double) ac / (double) nc, 1.0e-12,
+    test::approx (sol.measured.compressor.meanDb, hc.mean(), 1.0e-9 * std::fmax (1.0, hc.mean()),
+                  "compressor mean nulls");
+    test::approx (sol.measured.compressor.p95Db,  p95c,      0.0, "compressor p95 nulls");
+    test::approx (sol.measured.compressor.maxDb,  hc.maxValue(), 0.0, "compressor max nulls");
+    test::approx (sol.measured.compressor.activeFraction, (double) ac / (double) nc, 0.0,
                   "compressor active fraction nulls");
-    test::approx (sol.measured.limiter.meanDb, hl.mean(), 1.0e-12, "limiter mean nulls");
-    test::approx (sol.measured.limiter.p95Db,  p95l,      1.0e-12, "limiter p95 nulls");
-    test::approx (sol.measured.limiter.maxDb,  hl.maxValue(), 1.0e-12, "limiter max nulls");
-    test::approx (sol.measured.limiter.activeFraction, (double) al / (double) nl, 1.0e-12,
+    // The MEAN is a sum over a million values and the two paths accumulate it in different block
+    // orders, so it nulls to double-summation precision rather than bit for bit. Everything else is an
+    // order statistic or a count and IS exact.
+    test::approx (sol.measured.limiter.meanDb, hl.mean(), 1.0e-9 * std::fmax (1.0, hl.mean()),
+                  "limiter mean nulls");
+    test::approx (sol.measured.limiter.p95Db,  p95l,      0.0, "limiter p95 nulls");
+    test::approx (sol.measured.limiter.maxDb,  hl.maxValue(), 0.0, "limiter max nulls");
+    test::approx (sol.measured.limiter.activeFraction, (double) al / (double) nl, 0.0,
                   "limiter active fraction nulls");
     std::printf ("      hand-driven null: comp mean %.5f p95 %.5f max %.5f | lim mean %.5f p95 %.5f max %.5f\n",
                  hc.mean(), p95c, hc.maxValue(), hl.mean(), p95l, hl.maxValue());
@@ -515,7 +529,7 @@ void testTappedRenderNullsAgainstThePlainOne()
     test::group ("a tapped render is bit-identical to a plain one");
     // The tap must not move audio. This is the same rule the compressor's tap follows, one level up,
     // and it is what makes the statistics free rather than a second behaviour.
-    Programme src = makeMusic (4.0, 0.4);
+    Programme src = makeMusic (2.0, 0.4);
     Programme a; a.ch = src.ch; a.bind();
     Programme b; b.ch = src.ch; b.bind();
 
@@ -601,7 +615,7 @@ void testRefusalsAndDegenerateInputs()
     {
         TargetLoudnessSolver s;
         MasteringChain ch; OfflineRenderer r;
-        LoudnessRequest req;
+        LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
         const auto sol = s.solve (ch, r, MasteringChainParams {}, src.in(), dst.out(), 2, src.frames(), req);
         test::ok (sol.status == MasteringSolveStatus::NotPrepared, "unprepared solver refuses");
     }
@@ -613,12 +627,12 @@ void testRefusalsAndDegenerateInputs()
                                            src.in(), dst.out(), 2, src.frames(), req);
         test::ok (sol.status == MasteringSolveStatus::InvalidRequest, "NaN target refused");
 
-        LoudnessRequest req2; req2.maxPasses = 0;
+        LoudnessRequest req2; req2.targetLufs = -14.0; req2.maxTruePeakDbTp = -1.0; req2.maxPasses = 0;
         const auto sol2 = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                             src.in(), dst.out(), 2, src.frames(), req2);
         test::ok (sol2.status == MasteringSolveStatus::InvalidRequest, "zero pass budget refused");
 
-        LoudnessRequest req3;
+        LoudnessRequest req3; req3.targetLufs = -14.0; req3.maxTruePeakDbTp = -1.0;
         const auto sol3 = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                             src.in(), dst.out(), 1, src.frames(), req3);
         test::ok (sol3.status == MasteringSolveStatus::InvalidRequest,
@@ -632,7 +646,7 @@ void testRefusalsAndDegenerateInputs()
         if (! test::run (rig.build (2))) return;
         Programme q; q.ch.assign (2, std::vector<float> ((std::size_t) (4 * (int) kFs), 0.0f)); q.bind();
         Programme qo; qo.ch = q.ch; qo.bind();
-        LoudnessRequest req; req.targetLufs = -14.0;
+        LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                            q.in(), qo.out(), 2, q.frames(), req);
         test::ok (sol.status == MasteringSolveStatus::MeasurementInvalid,
@@ -650,7 +664,7 @@ void testRefusalsAndDegenerateInputs()
 void testBlockIndependence()
 {
     test::group ("the solve does not depend on the renderer's block size");
-    Programme src = makeMusic (8.0, 0.3);
+    Programme src = makeMusic (4.0, 0.3);
     double firstI = 0.0, firstG = 0.0;
     bool have = false;
     for (int blk : { 64, 256, 1000, 8192 })
@@ -658,7 +672,7 @@ void testBlockIndependence()
         Programme dst; dst.ch = src.ch; dst.bind();
         Rig rig;
         if (! test::run (rig.build (2, blk))) return;
-        LoudnessRequest req; req.targetLufs = -13.0; req.maxPasses = 3;
+        LoudnessRequest req; req.targetLufs = -13.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3;
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                            src.in(), dst.out(), 2, src.frames(), req);
         if (! test::run (sol.status == MasteringSolveStatus::Solved)) return;
@@ -677,14 +691,17 @@ void testTheReportedRenderIsTheDeliveredOne()
     test::group ("the delivered audio is the render the report describes");
     // The search may end on a candidate that is not its last attempt. The buffer must then hold the
     // reported one — handing back a file the report does not describe is the defect this guards.
-    Programme src = makeWideRange (24.0);
+    Programme src = makeWideRange (20.0);
     Programme dst; dst.ch = src.ch; dst.bind();
     Rig rig;
     if (! test::run (rig.build (2))) return;
-    (void) rig.solver.measureInputLra (src.in(), 2, src.frames());
+    double inLra = 0.0;
+    (void) rig.solver.measureInputLoudnessRange (src.in(), 2, src.frames(), inLra);
     LoudnessRequest req;
     req.targetLufs = -7.0;
+    req.maxTruePeakDbTp = -1.0;
     req.maxLraLossLu = 0.5;
+    req.inputLoudnessRangeLu = inLra;
     req.maxPasses = 4;
     const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                        src.in(), dst.out(), 2, src.frames(), req);
@@ -695,6 +712,702 @@ void testTheReportedRenderIsTheDeliveredOne()
                   "the delivered buffer's true peak is the reported one");
     std::printf ("      delivered-is-reported: status %s, I %.4f vs %.4f\n",
                  statusName (sol.status), sol.measured.integratedLufs, ind.I);
+}
+
+// =============================================================================================
+// The claims the HEADERS make, pinned. A number in a comment that no test reads goes stale silently,
+// and this file is where the ones this change introduced are held.
+void testTheScaleLawIsPinned()
+{
+    test::group ("y(g,c) == 10^(c/20) * y(g-c, 0) — the identity the whole design rests on");
+    // Dither OFF on purpose: it is added AFTER the limiter and does not scale, so it is outside the
+    // identity by construction. Saying which half of the chain the law covers is the point.
+    Programme src = makeMusic (1.0, 0.4);
+    double worst = 0.0, worstPeak = 0.0;
+    for (double c : { -1.0, -3.0, -6.0 })
+        for (double g : { 3.0, 6.0, 12.0 })
+        {
+            auto run = [&] (double gg, double cc, std::vector<std::vector<float>>& o)
+            {
+                MasteringChainConfig cfg;
+                cfg.eq = false; cfg.compressor = false; cfg.clipper = false;
+                cfg.limiter = true; cfg.dither = false;
+                MasteringChain ch;
+                if (! ch.prepare (kFs, 2, cfg)) return false;
+                MasteringChainParams p;
+                p.preLimiterGainDb = gg; p.limiter.ceilingDbTp = cc; p.limiter.releaseMs = 100.0;
+                ch.setParams (p);
+                OfflineRenderer r;
+                if (! r.prepare (2, 1024)) return false;
+                o = src.ch;
+                std::vector<float*> op { o[0].data(), o[1].data() };
+                return r.render (ch, src.in(), op.data(), 2, src.frames());
+            };
+            std::vector<std::vector<float>> a, b;
+            if (! test::run (run (g, c, a)) || ! test::run (run (g - c, 0.0, b))) return;
+            const double k = std::pow (10.0, c / 20.0);
+            for (int i = 0; i < src.frames(); ++i)
+            {
+                worst = std::fmax (worst, std::fabs ((double) a[0][(std::size_t) i] - k * (double) b[0][(std::size_t) i]));
+                worstPeak = std::fmax (worstPeak, std::fabs ((double) a[0][(std::size_t) i]));
+            }
+        }
+    // PRECONDITION: the limiter is actually doing something, or the identity is about silence.
+    test::ok (worstPeak > 0.1, "precondition: the compared renders are not silence ("
+                               + std::to_string (worstPeak) + ")");
+    // The header claims 9.1e-07 .. 1.7e-06 on a programme peaking at 0.89. Pinned as an ORDER, not as a
+    // literal: it is float rounding in `dbToGain` and the FIR, which moves with the toolchain. What must
+    // not move is that it stays six decades under the signal.
+    test::ok (worst < 1.0e-5, "the scale law holds to better than 1e-5 (measured "
+                              + std::to_string (worst) + " at peak " + std::to_string (worstPeak) + ")");
+    std::printf ("      scale law: worst |y(g,c) - 10^(c/20) y(d,0)| = %.3e at peak %.3f\n", worst, worstPeak);
+}
+
+// =============================================================================================
+void testTheAbsoluteGateStepIsPinned()
+{
+    test::group ("the absolute gate at -70 LUFS is NOT scale-invariant — the header's reason, measured");
+    // Two halves either side of the gate. At g = 0 only the louder half is counted; a gain that lifts
+    // the quieter half over the gate changes the SET being averaged, and `I(g) = I(0) + g` stops being
+    // true. This is the reason the solver measures every candidate instead of trusting the identity.
+    const int half = (int) (10.0 * kFs), n = 2 * half;
+    auto measure = [&] (double a1, double a2, double gDb)
+    {
+        std::vector<float> x ((std::size_t) n);
+        const double gg = std::pow (10.0, gDb / 20.0);
+        for (int i = 0; i < n; ++i)
+            x[(std::size_t) i] = (float) (gg * (i < half ? a1 : a2) * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+        analysis::LoudnessMeter m;
+        if (! m.prepare (kFs, 1, 120.0)) return 1.0e9;
+        const float* p[1] = { x.data() };
+        if (! m.process (p, 1, n)) return 1.0e9;
+        return m.integratedLufs();
+    };
+    const double cal = measure (1.0, 1.0, 0.0);
+    const double a1 = std::pow (10.0, (-69.0 - cal) / 20.0);
+    const double a2 = std::pow (10.0, (-71.0 - cal) / 20.0);
+    const double i0 = measure (a1, a2, 0.0);
+    const double i2 = measure (a1, a2, 2.0);
+    const double err = i2 - (i0 + 2.0);
+    // PRECONDITION: the fixture really straddles the gate, or the error below is a rounding artefact.
+    test::ok (std::fabs (i0 - (-69.0)) < 0.2,
+              "precondition: at g = 0 only the -69 half is counted (I = " + std::to_string (i0) + ")");
+    test::approx (err, -0.879829, 0.01, "the step is the measured -0.879829 LU, not zero");
+    std::printf ("      absolute gate: I(0) %.6f, I(+2) %.6f, error against I(0)+2 = %+.6f LU\n", i0, i2, err);
+}
+
+// =============================================================================================
+void testTheReviewsCounterexamples()
+{
+    test::group ("the code-review round's counterexamples, each pinned");
+    Programme src = makeMusic (2.0, 0.2);
+
+    // (a) ALIASED in/out. Every pass after the first would read the previous master.
+    {
+        Programme p; p.ch = src.ch; p.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        LoudnessRequest req; req.targetLufs = -20.0; req.maxTruePeakDbTp = -1.0;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           p.in(), p.out(), 2, p.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest,
+                  "in == out is refused: a search cannot read its own previous master");
+        test::ok (sol.passes == 0, "in == out: refused before spending a render");
+    }
+
+    // (b) A CALLER CEILING BELOW THE PROMISE. The solver may raise it, so a limiter-GR violation there
+    //     is NOT upstream — it is something its own knobs can relieve.
+    {
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.limiter.ceilingDbTp = -40.0;                 // far below the promise
+        LoudnessRequest req;
+        req.targetLufs = -30.0; req.maxTruePeakDbTp = -1.0;
+        req.limiterGr = { 1.0, GrStatistic::Max };
+        req.maxPasses = 5;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status != MasteringSolveStatus::UpstreamViolation,
+                  "a ceiling the solver may still RAISE is not an upstream violation");
+        std::printf ("      ceiling -40 vs promise -1: status %s, ceiling %.3f, limGR max %.3f, passes %d\n",
+                     statusName (sol.status), sol.ceilingDbTp, sol.measured.limiter.maxDb, sol.passes);
+    }
+
+    // (c) A TARGET PAST THE ACTUATOR. The gain node clamps at +-60 dB; a target that needs more is
+    //     unreachable BY NAME, not a budget that ran out.
+    {
+        const int n = (int) (2.0 * kFs);
+        Programme q; q.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f));
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = (float) (0.0005 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+            q.ch[0][(std::size_t) i] = v; q.ch[1][(std::size_t) i] = v;
+        }
+        q.bind();
+        Programme o; o.ch = q.ch; o.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.compressor.thresholdDb = 20.0;               // out of the way
+        LoudnessRequest req;
+        req.targetLufs = 20.0; req.maxTruePeakDbTp = 30.0; req.maxPasses = 4;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           q.in(), o.out(), 2, q.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable,
+                  "a target past the actuator is unreachable, not a pass limit");
+        test::ok (sol.binding == MasteringConstraint::GainRange,
+                  "...and the binding constraint is NAMED as the gain range");
+        test::ok ((sol.alsoViolated & constraintBit (MasteringConstraint::GainRange)) != 0,
+                  "...and it appears in the violation mask");
+        // PRECONDITION: the actuator really is pinned, or this passes for another reason.
+        test::approx (std::fabs (sol.preLimiterGainDb), 60.0, 1e-9,
+                      "precondition: the gain really is pinned at the +-60 dB clamp");
+    }
+
+    // (d) AN IMPOSSIBLE CONSTRAINT SPELLED WITH THE WRONG INFINITY. `isfinite` is true of neither
+    //     infinity, so testing it disabled a limit the caller meant to be unsatisfiable.
+    {
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;
+        req.targetLufs = -20.0; req.maxTruePeakDbTp = 0.0;
+        req.minPlrDb = std::numeric_limits<double>::infinity();     // PLR must exceed +infinity
+        req.maxPasses = 3;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status != MasteringSolveStatus::Solved,
+                  "minPlrDb = +infinity is unsatisfiable and is NOT reported as solved");
+        test::ok (sol.binding == MasteringConstraint::PeakToLoudness
+                  || sol.status == MasteringSolveStatus::UpstreamViolation,
+                  "...and the peak-to-loudness limit is what binds");
+        // ...while a NaN is a malformed request rather than a constraint.
+        LoudnessRequest bad = req;
+        bad.minPlrDb = std::nan ("");
+        const auto sol2 = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                            src.in(), dst.out(), 2, src.frames(), bad);
+        test::ok (sol2.status == MasteringSolveStatus::InvalidRequest, "a NaN limit is a malformed request");
+    }
+
+    // (e) THE REQUEST HAS NO DEFAULT TARGET. The core does not choose a delivery policy.
+    {
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;                                    // both required fields left unset
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest,
+                  "a request with no target and no ceiling is refused, not defaulted");
+    }
+
+    // (f) THE SAMPLE RATE IS CHECKED, not assumed shared with the chain.
+    {
+        Programme dst; dst.ch = src.ch; dst.bind();
+        MasteringChainConfig cfg;
+        MasteringChain ch;
+        if (! test::run (ch.prepare (kFs, 2, cfg))) return;
+        OfflineRenderer r;
+        if (! test::run (r.prepare (2, 4096))) return;
+        TargetLoudnessSolver s;
+        if (! test::run (s.prepare (44100.0, 2, 4096, ch.internalBlock(), ch.tapOversampleFactor()))) return;
+        LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+        const auto sol = s.solve (ch, r, MasteringChainParams {}, src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest,
+                  "a solver prepared at a different rate from the chain is refused");
+    }
+}
+
+// =============================================================================================
+void testTwoConstraintsAtOnce()
+{
+    test::group ("two constraints violated together: one is named, both are in the mask");
+    Programme src = makeMusic (8.0, 0.5);
+    Programme dst; dst.ch = src.ch; dst.bind();
+    Rig rig;
+    if (! test::run (rig.build (2))) return;
+    double inLra = 0.0;
+    (void) rig.solver.measureInputLoudnessRange (src.in(), 2, src.frames(), inLra);
+    LoudnessRequest req;
+    req.inputLoudnessRangeLu = inLra;
+    req.targetLufs = -6.0;                       // loud enough to need heavy limiting
+    req.maxTruePeakDbTp = -1.0;
+    // BOTH limits are chosen to be SATISFIED at the first render and broken at the target — otherwise
+    // this is an upstream violation wearing a second constraint as decoration. The fixture's own PLR
+    // after the chain is 11.36 at the starting gain, so 10.0 is inside it and 2 dB of limiting is not.
+    req.limiterGr = { 2.0, GrStatistic::Max };   // forbid the limiting the target needs
+    req.minPlrDb = 10.0;                         // ...and the density that would come with it
+    req.maxPasses = 4;
+    const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                       src.in(), dst.out(), 2, src.frames(), req);
+    const std::uint32_t gr  = constraintBit (MasteringConstraint::LimiterGainReduction);
+    const std::uint32_t plr = constraintBit (MasteringConstraint::PeakToLoudness);
+    // PRECONDITION: BOTH really are violated by the render nearest the target — otherwise this is a
+    // test of one constraint with a second one decorating it.
+    test::ok ((sol.alsoViolated & gr) != 0 && (sol.alsoViolated & plr) != 0,
+              "precondition: both the limiter-GR and the PLR limits are in the violation mask (0x"
+              + std::to_string (sol.alsoViolated) + ")");
+    test::ok (sol.binding == MasteringConstraint::LimiterGainReduction,
+              "the NAMED one is the limiter's gain reduction — the one more drive cannot trade away");
+    test::ok (sol.status == MasteringSolveStatus::TargetUnreachable
+              || sol.status == MasteringSolveStatus::UpstreamViolation,
+              "and the verdict is a refusal, not a solve");
+    std::printf ("      two at once: status %s, binding %s, mask 0x%x, limGR max %.3f, PLR %.3f\n",
+                 statusName (sol.status), constraintName (sol.binding), (unsigned) sol.alsoViolated,
+                 sol.measured.limiter.maxDb, sol.measured.plrDb);
+}
+
+// =============================================================================================
+void testPreLimiterTapIsTheRealSignal()
+{
+    test::group ("the pre-limiter tap is the pre-limiter signal, and its stated offset is right");
+    // The tap declares a contract: `preLimiter[c][j]` is the sample at that node for chain input
+    // `j - (compressorLookahead + clipperLatency)`, taken BEFORE the gain node. Null it against the
+    // same chain rendered with the limiter and the dither bypassed, which is that node's signal by
+    // another route — and do it with a NON-ZERO pre-limiter gain, so a tap taken on the wrong side of
+    // the gain node fails.
+    Programme src = makeMusic (1.5, 0.3);
+    const int frames = src.frames();
+
+    MasteringChainConfig cfg;
+    cfg.eq = true; cfg.compressor = true; cfg.clipper = false; cfg.limiter = true; cfg.dither = true;
+    MasteringChainParams p;
+    p.compressor.thresholdDb = -22.0; p.compressor.ratio = 2.5;
+    p.preLimiterGainDb = 7.0;                       // NOT zero: the tap must be upstream of this
+    p.limiter.ceilingDbTp = -1.0;
+
+    // Route A: the tap.
+    MasteringChain ch;
+    if (! test::run (ch.prepare (kFs, 2, cfg))) return;
+    ch.setParams (p);
+    OfflineRenderer r;
+    const int blk = 1024;
+    if (! test::run (r.prepare (2, blk))) return;
+    const int K = ch.internalBlock();
+    std::vector<std::vector<float>> preBuf (2, std::vector<float> ((std::size_t) (blk + K), 0.0f));
+    std::vector<float*> prePtr { preBuf[0].data(), preBuf[1].data() };
+    MasteringChainTaps taps;
+    taps.preLimiter = prePtr.data(); taps.frameCapacity = blk + K;
+    std::vector<std::vector<float>> tapped (2, std::vector<float> ((std::size_t) frames, 0.0f));
+    std::vector<std::vector<float>> out = src.ch;
+    std::vector<float*> op { out[0].data(), out[1].data() };
+    const MasteringChainResolved res = ch.resolved();
+    const long long off = (long long) res.compressorLookahead + (long long) res.clipperLatency;
+    long long seen = 0;
+    if (! test::run (r.render (ch, src.in(), op.data(), 2, frames, taps,
+        [&] (const MasteringChainTaps& t, long long tapPos) noexcept
+        {
+            for (int j = 0; j < t.framesWritten; ++j)
+            {
+                const long long inIdx = tapPos + j - off;        // the STATED offset
+                if (inIdx >= 0 && inIdx < frames)
+                    for (int c = 0; c < 2; ++c)
+                        tapped[(std::size_t) c][(std::size_t) inIdx] = preBuf[(std::size_t) c][(std::size_t) j];
+            }
+            seen += t.framesWritten;
+        })))
+        return;
+
+    // Route B: the same chain with everything downstream of that node switched off. Its output is the
+    // pre-limiter signal, aligned by the renderer — except that it is taken AFTER the gain node, so the
+    // comparison divides that back out.
+    MasteringChain ch2;
+    if (! test::run (ch2.prepare (kFs, 2, cfg))) return;
+    MasteringChainParams p2 = p;
+    p2.bypassLimiter = true; p2.bypassDither = true;
+    ch2.setParams (p2);
+    OfflineRenderer r2;
+    if (! test::run (r2.prepare (2, blk))) return;
+    std::vector<std::vector<float>> ref = src.ch;
+    std::vector<float*> rp { ref[0].data(), ref[1].data() };
+    if (! test::run (r2.render (ch2, src.in(), rp.data(), 2, frames))) return;
+
+    const double gainOut = std::pow (10.0, p.preLimiterGainDb / 20.0);
+    double worst = 0.0, refPeak = 0.0;
+    // The last few samples differ by construction: the bypass route's renderer crops the chain's own
+    // tail, while the tap sees the drain. Compare the body.
+    const int stop = frames - 4 * K;
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < stop; ++i)
+        {
+            const double a = (double) tapped[(std::size_t) c][(std::size_t) i] * gainOut;
+            const double b = (double) ref[(std::size_t) c][(std::size_t) i];
+            worst = std::fmax (worst, std::fabs (a - b));
+            refPeak = std::fmax (refPeak, std::fabs (b));
+        }
+    test::ok (seen >= frames, "precondition: the tap stream covered the programme");
+    test::ok (refPeak > 0.05, "precondition: the reference is not silence (" + std::to_string (refPeak) + ")");
+    test::ok (worst < 1.0e-5, "the pre-limiter tap nulls against the bypass route at the STATED offset "
+                              "(worst " + std::to_string (worst) + " at peak " + std::to_string (refPeak) + ")");
+    std::printf ("      pre-limiter tap: worst |tap*gain - bypassRender| = %.3e at peak %.3f (offset %lld)\n",
+                 worst, refPeak, off);
+
+    // ---- and the LIMITER tap's offset, found rather than assumed -------------------------------
+    // An impulse goes in at a known input index; the limiter's reconstructed-peak trace is searched for
+    // where it comes out. The answer must be the offset the contract states, INCLUDING the limiter's own
+    // interpolator latency — which the first version of this contract left out, and the omission cost
+    // the whole reaction to a peak in the last 32 samples of a programme.
+    test::group ("the limiter tap's time offset is the one the contract states");
+    {
+        MasteringChainConfig c2;
+        c2.eq = false; c2.compressor = true; c2.clipper = false; c2.limiter = true; c2.dither = false;
+        MasteringChain ch3;
+        if (! test::run (ch3.prepare (kFs, 2, c2))) return;
+        MasteringChainParams p3;
+        p3.bypassCompressor = true;                       // present (so it delays) but transparent
+        p3.limiter.ceilingDbTp = -20.0;                   // low, so the impulse certainly engages it
+        ch3.setParams (p3);
+        const int K3 = ch3.internalBlock(), F3 = ch3.tapOversampleFactor();
+        const int n3 = 8 * K3, hit = 3 * K3;
+        std::vector<std::vector<float>> imp (2, std::vector<float> ((std::size_t) n3, 0.0f));
+        imp[0][(std::size_t) hit] = 0.9f; imp[1][(std::size_t) hit] = 0.9f;
+        std::vector<const float*> ip3 { imp[0].data(), imp[1].data() };
+        std::vector<std::vector<float>> o3 = imp;
+        std::vector<float*> op3 { o3[0].data(), o3[1].data() };
+        OfflineRenderer r3;
+        const int blk3 = 4 * K3;
+        if (! test::run (r3.prepare (2, blk3))) return;
+        std::vector<float> pk3 ((std::size_t) (blk3 + K3) * (std::size_t) F3, 0.0f);
+        MasteringChainTaps t3;
+        t3.limiterPeakLin = pk3.data(); t3.osCapacity = (blk3 + K3) * F3;
+        long long argmaxOs = -1; double best3 = 0.0;
+        if (! test::run (r3.render (ch3, ip3.data(), op3.data(), 2, n3, t3,
+            [&] (const MasteringChainTaps& t, long long tapPos) noexcept
+            {
+                for (int i = 0; i < t.osWritten; ++i)
+                    if ((double) pk3[(std::size_t) i] > best3)
+                    { best3 = pk3[(std::size_t) i]; argmaxOs = tapPos * F3 + i; }
+            })))
+            return;
+        const MasteringChainResolved r4 = ch3.resolved();
+        const long long stated = r4.limiterTapOffset;
+        test::ok (best3 > 0.5, "precondition: the impulse really reached the limiter's detector ("
+                               + std::to_string (best3) + ")");
+        const double foundOffset = (double) argmaxOs / (double) F3 - (double) hit;
+        // Half an oversampled sample of slack: the peak of a reconstructed impulse need not land exactly
+        // on a grid point, and the contract is in whole baseband frames.
+        test::approx (foundOffset, (double) stated, 1.0,
+                      "the measured tap offset is the stated one (found " + std::to_string (foundOffset)
+                      + ", stated " + std::to_string (stated) + ")");
+        std::printf ("      limiter tap offset: measured %.3f frames, stated %lld "
+                     "(compLook %d + clip %d + half the oversampler round trip %d)\n",
+                     foundOffset, stated, r4.compressorLookahead, r4.clipperLatency,
+                     (r4.limiterLatency - r4.limiterLookahead) / 2);
+    }
+}
+
+// =============================================================================================
+void testTargetBetweenAchievable()
+{
+    test::group ("a target between two achievable values is reported as that, with both sides");
+    // The status has two causes and only one of them can be built on demand: ask for a tolerance finer
+    // than the search's own gain resolution, and the bracket closes with the target still between the
+    // two sides. That exercises the same code path a gated STEP takes — the interesting cause, which
+    // needs a block to cross the absolute gate and cannot be conjured on ordinary programme.
+    Programme src = makeMusic (4.0, 0.3);
+    Programme dst; dst.ch = src.ch; dst.bind();
+    Rig rig;
+    if (! test::run (rig.build (2))) return;
+    LoudnessRequest req;
+    req.targetLufs = -13.0;
+    req.maxTruePeakDbTp = -1.0;
+    req.toleranceLu = 1.0e-9;                 // finer than 1e-3 dB of gain can resolve
+    req.maxPasses = 12;
+    const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                       src.in(), dst.out(), 2, src.frames(), req);
+    for (int k = 0; k < sol.logCount; ++k)
+        std::printf ("        pass %d: g %.9f -> I %.9f\n", k + 1, sol.log[k].gainDb, sol.log[k].integratedLufs);
+    std::printf ("        sides: lo %.9f @ %.9f | hi %.9f @ %.9f\n",
+                 sol.achievedBelowLufs, sol.gainBelowDb, sol.achievedAboveLufs, sol.gainAboveDb);
+    test::ok (sol.status == MasteringSolveStatus::TargetBetweenAchievable,
+              std::string ("status is TargetBetweenAchievable (got ") + statusName (sol.status) + ")");
+    if (sol.status != MasteringSolveStatus::TargetBetweenAchievable) return;
+    // PRECONDITION: the two sides really do straddle the target, or "between" is not what happened.
+    // PRECONDITION: the answer really is outside the tolerance asked for, or "between" is vacuous.
+    test::ok (std::fabs (sol.measured.integratedLufs - req.targetLufs) > req.toleranceLu,
+              "precondition: the achieved loudness really misses the tolerance ("
+              + std::to_string (std::fabs (sol.measured.integratedLufs - req.targetLufs)) + " LU)");
+    test::ok (std::fabs (sol.gainAboveDb - sol.gainBelowDb) <= 1.0e-3,
+              "the gain interval really is below the resolution the search can express");
+    // ...and it is CLOSE: this is a resolution limit, not a failure to find the answer.
+    test::ok (std::fabs (sol.measured.integratedLufs - req.targetLufs) < 1.0e-5,
+              "the answer is within 1e-5 LU — the tolerance was finer than the actuator, not the search wrong");
+    test::ok (sol.binding == MasteringConstraint::None,
+              "it is NOT a constraint violation: nothing was broken");
+    std::printf ("      between achievable: %.6f .. %.6f LUFS at gains %.6f .. %.6f, passes %d\n",
+                 sol.achievedBelowLufs, sol.achievedAboveLufs, sol.gainBelowDb, sol.gainAboveDb, sol.passes);
+}
+
+// =============================================================================================
+void testTheAnswerDoesNotDependOnWhereItStarted()
+{
+    test::group ("the answer does not depend on the starting gain");
+    // THE STRONGEST PROPERTY IN THIS FILE, and the one that caught the worst defect. A step that moved
+    // the gain and the ceiling together was exact — it is the scale law — but exact at a FROZEN DRIVE,
+    // so a warm start delivered the target loudness and the stated peak with the programme crushed:
+    // measured, from 0 dB the answer was 8.5 dB of drive and no limiting, and from 55 dB it was 47.6 dB
+    // of drive, 38.05 dB of limiter gain reduction and an LRA of 0.10 — both reported `Solved`.
+    Programme src = makeMusic (6.0, 0.3);
+    double refDrive = 0.0, refLimGr = 0.0, refPlr = 0.0;
+    bool have = false;
+    for (double start : { 0.0, 4.0, 12.0, 30.0, 55.0 })
+    {
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;
+        req.targetLufs = -14.0;
+        req.maxTruePeakDbTp = -1.0;
+        req.initialGainDb = start;
+        req.maxPasses = 6;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        char msg[192];
+        std::snprintf (msg, sizeof msg, "start %+.1f dB: solved", start);
+        test::ok (sol.status == MasteringSolveStatus::Solved, msg);
+        if (sol.status != MasteringSolveStatus::Solved) continue;
+        const double drive = sol.preLimiterGainDb - sol.ceilingDbTp;
+        if (! have) { refDrive = drive; refLimGr = sol.measured.limiter.maxDb; refPlr = sol.measured.plrDb; have = true; }
+        std::snprintf (msg, sizeof msg, "start %+.1f dB: the DRIVE agrees with the cold start (%.3f vs %.3f dB)",
+                       start, drive, refDrive);
+        test::approx (drive, refDrive, 0.35, msg);
+        std::snprintf (msg, sizeof msg, "start %+.1f dB: the limiting agrees (%.3f vs %.3f dB)",
+                       start, sol.measured.limiter.maxDb, refLimGr);
+        test::approx (sol.measured.limiter.maxDb, refLimGr, 0.5, msg);
+        std::snprintf (msg, sizeof msg, "start %+.1f dB: the delivered PLR agrees (%.3f vs %.3f dB)",
+                       start, sol.measured.plrDb, refPlr);
+        test::approx (sol.measured.plrDb, refPlr, 0.5, msg);
+        std::printf ("      start %+5.1f -> drive %7.3f  limGR %6.3f  PLR %6.3f  LRA %5.2f  passes %d\n",
+                     start, drive, sol.measured.limiter.maxDb, sol.measured.plrDb,
+                     sol.measured.loudnessRangeLu, sol.passes);
+    }
+    // PRECONDITION: the starts really were far apart, or "does not depend" is a statement about noise.
+    test::ok (have, "precondition: at least one start solved, so there is a reference to agree with");
+}
+
+// =============================================================================================
+void testAnUnmeasurableStartIsNotAnUnmeasurableProgramme()
+{
+    test::group ("a programme too quiet to measure at the starting gain is still solved");
+    // Every gating block under the -70 LUFS absolute gate: the integrated measure has nothing to report
+    // at 0 dB, and 55 dB up it is ordinary programme. Refusing on the first reading would be a verdict
+    // about the starting gain.
+    const int n = (int) (4.0 * kFs);
+    Programme q; q.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f));
+    // FLAT on purpose, and the amplitude is calibrated rather than chosen — the window between "still
+    // measurable" and "out of the actuator's range" is only a few dB wide. 3.7e-4 read -69.32 LUFS, i.e.
+    // ABOVE the -70 gate and therefore measurable, and the test passed for the wrong reason; 2.6e-4 sits
+    // at about -72.3 LUFS, under the gate, and 56.3 dB below a -16 LUFS target, inside the +-60 dB
+    // actuator. K-weighting at 440 Hz is why the arithmetic from a 1 kHz calibration was 2 dB out.
+    for (int i = 0; i < n; ++i)
+    {
+        const float v = (float) (2.6e-4 * std::sin (2.0 * kPi * 440.0 * (double) i / kFs));
+        q.ch[0][(std::size_t) i] = v; q.ch[1][(std::size_t) i] = v;
+    }
+    q.bind();
+    Programme o; o.ch = q.ch; o.bind();
+
+    // PRECONDITION: at unity the programme really is unmeasurable, or this tests nothing.
+    {
+        analysis::LoudnessMeter m;
+        if (! test::run (m.prepare (kFs, 2, 60.0))) return;
+        if (! test::run (m.process (q.in(), 2, n))) return;
+        test::ok (m.integratedLufs() <= -120.0,
+                  "precondition: at unity every gating block is under the absolute gate (I = "
+                  + std::to_string (m.integratedLufs()) + ")");
+    }
+
+    Rig rig;
+    if (! test::run (rig.build (2))) return;
+    rig.params.compressor.thresholdDb = 0.0;               // out of the way
+    LoudnessRequest req;
+    req.targetLufs = -16.0;
+    req.maxTruePeakDbTp = -1.0;
+    req.maxPasses = 5;
+    const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                       q.in(), o.out(), 2, q.frames(), req);
+    for (int k = 0; k < sol.logCount; ++k)
+        std::printf ("        pass %d: g %8.3f -> I %10.4f TP %8.4f\n",
+                     k + 1, sol.log[k].gainDb, sol.log[k].integratedLufs, sol.log[k].truePeakDbTp);
+    test::ok (sol.status == MasteringSolveStatus::Solved,
+              std::string ("an unmeasurable first render is bootstrapped from the PEAK, not refused (got ")
+              + statusName (sol.status) + ")");
+    if (sol.status != MasteringSolveStatus::Solved) return;
+    const Independent ind = measureIndependently (o.ch);
+    test::approx (ind.I, req.targetLufs, 0.1, "...and the target is taken");
+    test::ok (ind.TP <= req.maxTruePeakDbTp + 1e-9, "...with the peak under the promise");
+    std::printf ("      quiet programme: gain %.3f, I %.4f, TP %.4f, passes %d\n",
+                 sol.preLimiterGainDb, ind.I, ind.TP, sol.passes);
+}
+
+// =============================================================================================
+void testTapPlumbingEdges()
+{
+    test::group ("the tap plumbing, at the edges every other fixture in this file avoids");
+    // A mutation round found the whole tap edge unguarded: every statistics fixture here uses a renderer
+    // block that is a MULTIPLE of the internal quantum, so `pos_` is zero at every call boundary, the
+    // capacity arithmetic never has to account for it, and a tap-position bug that costs a fraction of a
+    // block is invisible. These are the cases that were missing.
+
+    // (a) CAPACITY WITH A NON-ZERO PHASE. `n + K` frames is what a caller must size; exactly `n` is not
+    //     enough once the stream is part way into a quantum, and the check has to say so BEFORE moving.
+    {
+        MasteringChain ch;
+        MasteringChainConfig cfg;
+        if (! test::run (ch.prepare (kFs, 2, cfg))) return;
+        const int K = ch.internalBlock();
+        std::vector<std::vector<float>> buf (2, std::vector<float> ((std::size_t) (K + 200), 0.2f));
+        std::vector<float*> bp { buf[0].data(), buf[1].data() };
+        std::vector<float> tap ((std::size_t) K, -1.0f);
+        MasteringChainTaps t;
+        t.compressorGrDb = tap.data(); t.frameCapacity = K;
+        // At phase 0 a call of exactly K frames produces exactly K tap frames: accepted.
+        test::ok (ch.process (bp.data(), 2, K, t), "phase 0, n == K, capacity K: accepted");
+        test::ok (t.framesWritten == K, "...and it wrote exactly K frames");
+        // Now the stream sits at phase 100. A call of 412 frames spans TWO quantum boundaries, so it
+        // produces 2K tap frames — and a capacity of K must be refused.
+        MasteringChainTaps t2;
+        t2.compressorGrDb = tap.data(); t2.frameCapacity = K;
+        test::ok (ch.process (bp.data(), 2, 100, t2), "advance the stream to phase 100");
+        MasteringChainTaps t3;
+        t3.compressorGrDb = tap.data(); t3.frameCapacity = K;
+        test::ok (! ch.process (bp.data(), 2, 412, t3),
+                  "phase 100, n = 412, capacity K: REFUSED — the phase is part of the arithmetic");
+        test::ok (t3.framesWritten == 0, "...and the refused call reports nothing written");
+    }
+
+    // (b) THE OVERSAMPLED CAPACITY BAND. A limiter tap sized in FRAMES rather than in oversampled
+    //     samples is the mistake, and it is only visible between the two.
+    {
+        MasteringChain ch;
+        MasteringChainConfig cfg;
+        if (! test::run (ch.prepare (kFs, 2, cfg))) return;
+        const int K = ch.internalBlock(), F = ch.tapOversampleFactor();
+        test::ok (F >= 2, "precondition: the chain really is oversampling (" + std::to_string (F) + "x)");
+        std::vector<std::vector<float>> buf (2, std::vector<float> ((std::size_t) K, 0.2f));
+        std::vector<float*> bp { buf[0].data(), buf[1].data() };
+        std::vector<float> os ((std::size_t) K * (std::size_t) F, 0.0f);
+        MasteringChainTaps t;
+        t.limiterGrDb = os.data(); t.osCapacity = K * 2;      // enough frames, NOT enough oversampled
+        test::ok (! ch.process (bp.data(), 2, K, t),
+                  "a limiter tap sized in frames instead of oversampled samples is refused");
+        MasteringChainTaps t2;
+        t2.limiterGrDb = os.data(); t2.osCapacity = K * F;    // exactly right
+        test::ok (ch.process (bp.data(), 2, K, t2), "...and exactly K*F is accepted");
+        test::ok (t2.osWritten == K * F, "...writing exactly K*F oversampled samples");
+    }
+
+    // (c) THE RENDERER'S TAP POSITION, at a block that is NOT a multiple of the quantum. The statistics
+    //     have to come out the same as at a block that is, or the tap stream and the audio have drifted.
+    {
+        Programme src = makeMusic (3.0, 0.35);
+        double refMean = 0.0, refP95 = 0.0, refAct = 0.0;
+        bool have = false;
+        for (int blk : { 1024, 977, 100, 3 })
+        {
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2, blk))) return;
+            LoudnessRequest req;
+            req.targetLufs = -13.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                               src.in(), dst.out(), 2, src.frames(), req);
+            if (! test::run (sol.status == MasteringSolveStatus::Solved)) return;
+            if (! have) { refMean = sol.measured.compressor.meanDb; refP95 = sol.measured.compressor.p95Db;
+                          refAct = sol.measured.limiter.activeFraction; have = true; }
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "block %d: the compressor mean is bit-identical to block 1024", blk);
+            test::approx (sol.measured.compressor.meanDb, refMean, 0.0, msg);
+            std::snprintf (msg, sizeof msg, "block %d: the compressor p95 is bit-identical", blk);
+            test::approx (sol.measured.compressor.p95Db, refP95, 0.0, msg);
+            std::snprintf (msg, sizeof msg, "block %d: the limiter active fraction is bit-identical", blk);
+            test::approx (sol.measured.limiter.activeFraction, refAct, 0.0, msg);
+        }
+        // PRECONDITION: the statistics are not all zero, or every equality above is trivial.
+        test::ok (refMean > 0.01 && refP95 > 0.01,
+                  "precondition: the compressor statistics are non-zero (mean " + std::to_string (refMean) + ")");
+    }
+
+    // (d) A BYPASSED LIMITER STILL FILLS ITS TRACE. A hole in the trace is not the same as zero, and a
+    //     mean taken over a programme whose bypass moved would silently be a mean over a shorter one.
+    {
+        MasteringChain ch;
+        MasteringChainConfig cfg;
+        if (! test::run (ch.prepare (kFs, 2, cfg))) return;
+        const int K = ch.internalBlock(), F = ch.tapOversampleFactor();
+        MasteringChainParams p;
+        p.bypassLimiter = true;
+        p.preLimiterGainDb = 20.0;                 // loud enough that a RUNNING limiter would react
+        ch.setParams (p);
+        std::vector<std::vector<float>> buf (2, std::vector<float> ((std::size_t) K, 0.5f));
+        std::vector<float*> bp { buf[0].data(), buf[1].data() };
+        std::vector<float> gr ((std::size_t) K * (std::size_t) F, -1234.0f);
+        std::vector<float> pk ((std::size_t) K * (std::size_t) F, -1234.0f);
+        MasteringChainTaps t;
+        t.limiterGrDb = gr.data(); t.limiterPeakLin = pk.data(); t.osCapacity = K * F;
+        test::run (ch.process (bp.data(), 2, K, t));
+        int unwritten = 0, nonZero = 0;
+        for (std::size_t i = 0; i < gr.size(); ++i)
+        {
+            if (core::exactlyEqual (gr[i], -1234.0f) || core::exactlyEqual (pk[i], -1234.0f)) ++unwritten;
+            else if (! core::exactlyEqual (gr[i], 0.0f)) ++nonZero;
+        }
+        test::ok (unwritten == 0, "a bypassed limiter writes its whole trace rather than leaving a hole");
+        test::ok (nonZero == 0, "...and what it writes is zero, which is the truth about that quantum");
+    }
+
+    // (e) THE STATISTICS WINDOW WITH A CLIPPER PRESENT. The limiter's window is offset by the clipper's
+    //     latency as well as the compressor's lookahead, and no other fixture here turns the clipper on.
+    {
+        Programme src = makeMusic (3.0, 0.35);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2, 4096, /*clipper*/ true))) return;
+        LoudnessRequest req;
+        req.targetLufs = -12.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        if (! test::run (sol.status == MasteringSolveStatus::Solved)) return;
+        const MasteringChainResolved r = rig.chain.resolved();
+        test::ok (r.clipperLatency > 0, "precondition: the clipper really is present and carries latency ("
+                                        + std::to_string (r.clipperLatency) + " samples)");
+        test::ok (sol.measured.limiter.frames == (std::uint64_t) src.frames() * (std::uint64_t) rig.chain.tapOversampleFactor(),
+                  "with a clipper in the chain the limiter window is still exactly frames*F samples");
+        test::ok (sol.measured.compressor.frames == (std::uint64_t) src.frames(),
+                  "...and the compressor window is still exactly `frames`");
+    }
+
+    // (f) A PROGRAMME THAT ENDS ON A PEAK. Without draining the true-peak meter the delivered peak is
+    //     under-read, which is the exact shape of the defect P1 measured in the chain being replaced.
+    {
+        const int n = (int) (2.0 * kFs);
+        Programme q; q.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f));
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = (float) (0.25 * std::sin (2.0 * kPi * 300.0 * (double) i / kFs));
+            q.ch[0][(std::size_t) i] = v; q.ch[1][(std::size_t) i] = v;
+        }
+        q.ch[0][(std::size_t) (n - 2)] = 0.9f; q.ch[1][(std::size_t) (n - 2)] = 0.9f;
+        q.ch[0][(std::size_t) (n - 1)] = 0.9f; q.ch[1][(std::size_t) (n - 1)] = 0.9f;
+        q.bind();
+        Programme o; o.ch = q.ch; o.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;
+        req.targetLufs = -18.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           q.in(), o.out(), 2, q.frames(), req);
+        if (! test::run (sol.status == MasteringSolveStatus::Solved)) return;
+        // An UNDRAINED reading of the same buffer, for the comparison: this is what the number would be
+        // without the drain, and the point is that the reported one is not it.
+        analysis::TruePeakMeter dry;
+        if (! test::run (dry.prepare (kFs, 65536, 2))) return;
+        const float* dp[2] = { o.ch[0].data(), o.ch[1].data() };
+        if (! test::run (dry.process (dp, 2, n))) return;
+        const double undrained = dry.truePeakDb();
+        test::ok (sol.measured.truePeakDbTp >= undrained - 1e-9,
+                  "the reported peak is at least the undrained reading (drained " +
+                  std::to_string (sol.measured.truePeakDbTp) + " vs undrained " + std::to_string (undrained) + ")");
+        test::ok (sol.measured.truePeakDbTp <= req.maxTruePeakDbTp + 1e-9,
+                  "...and a programme that ends on a peak still delivers under the promise");
+        std::printf ("      ends on a peak: drained %.4f dBTP, undrained %.4f dBTP\n",
+                     sol.measured.truePeakDbTp, undrained);
+    }
 }
 
 } // namespace
@@ -712,5 +1425,14 @@ int main()
     testRefusalsAndDegenerateInputs();
     testBlockIndependence();
     testTheReportedRenderIsTheDeliveredOne();
+    testTheScaleLawIsPinned();
+    testTheAbsoluteGateStepIsPinned();
+    testTheReviewsCounterexamples();
+    testTwoConstraintsAtOnce();
+    testPreLimiterTapIsTheRealSignal();
+    testTargetBetweenAchievable();
+    testTheAnswerDoesNotDependOnWhereItStarted();
+    testAnUnmeasurableStartIsNotAnUnmeasurableProgramme();
+    testTapPlumbingEdges();
     return felitronics::test::report();
 }

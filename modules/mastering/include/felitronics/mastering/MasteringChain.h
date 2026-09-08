@@ -107,16 +107,23 @@ struct MasteringChainParams
 // than hidden, because a statistic cropped to the wrong window is the defect this exists to prevent:
 //
 //   * `compressorGrDb[j]`  — the signed gain reduction the compressor's detector computed for CHAIN
-//                            INPUT SAMPLE j. Offset 0. (It is applied to the lookahead-delayed copy of
-//                            that sample, which is the compressor's own contract, not this one's.)
-//   * `preLimiter[c][j]`   — the sample at the pre-limiter node for chain input sample j, taken BEFORE
-//                            `preLimiterGainDb` is applied, so it does NOT depend on that gain. Offset
-//                            0. This is what makes a loudness solver's probe exact: everything upstream
-//                            of the gain node is a constant of the search.
+//                            INPUT SAMPLE j, i.e. `resolved().compressorTapOffset`, which is 0. (It is
+//                            applied to the lookahead-delayed copy of that sample, which is the
+//                            compressor's own contract, not this one's.)
+//   * `preLimiter[c][j]`   — the sample at the pre-limiter node, taken BEFORE `preLimiterGainDb` is
+//                            applied, so it does NOT depend on that gain: everything upstream of the
+//                            gain node is a constant of a loudness search. Its frame j is chain input
+//                            sample `j - (compressorLookahead + clipperLatency)`, NOT j — the compressor
+//                            delays the programme by its lookahead and the clipper by its own latency,
+//                            and both are still in front of this point. A bypassed compressor still
+//                            delays (its bypass is warm, through its own curve), so the offset does not
+//                            depend on the bypass flags — only on which stages are PRESENT.
 //   * `limiterGrDb`,
-//     `limiterPeakLin`     — the limiter's oversampled traces, `tapOversampleFactor()` samples per frame. Their frame j is
-//                            chain input sample `j - (compressorLookahead + clipperLatency)`, both read
-//                            from `resolved()`. Offset stated, never guessed.
+//     `limiterPeakLin`     — the limiter's oversampled traces, `tapOversampleFactor()` samples per frame.
+//                            Their frame j is chain input sample `j - resolved().limiterTapOffset`. That
+//                            offset is NOT just the stages in front: the trace is written where the gain
+//                            is decided, on the oversampled copy, so it also lags by the UP leg of the
+//                            limiter's own oversampler. `resolved()` computes it; do not re-derive it.
 //
 // A render feeds `frames` of programme and then `latencySamples()` zeros, so the tap frames that carry
 // real programme are the ones whose INPUT index is below `frames` — which is the window a statistic
@@ -150,6 +157,17 @@ struct MasteringChainResolved
     int    limiterLatency        = 0;
     int    limiterLookahead      = 0;
     int    oversampleFactor      = 0;
+    // WHERE EACH TAP'S FRAME 0 SITS IN THE CHAIN'S INPUT, in frames, so a consumer cropping a statistic
+    // to the programme does not have to derive it. Derived here BECAUSE IT IS SUBTLE and the first two
+    // attempts at it were both wrong: the limiter's trace is written where the gain is DECIDED, which is
+    // on the oversampled copy, so it lags by the UP leg of the oversampler only — half of the round trip
+    // `latencySamples()` reports, since the same prototype is used interpolating and decimating.
+    // Measured with an impulse: 79.75 frames for a 48-sample compressor lookahead at 4x/64 taps, i.e.
+    // 48 + 31.75, against 48 + 63 if the whole round trip is counted and 48 if none of it is.
+    // The half-frame is real (a reconstructed peak need not land on a grid point) and is rounded away
+    // here: the field is a window boundary, not a delay line.
+    int    compressorTapOffset   = 0;
+    int    limiterTapOffset      = 0;
     double limiterCeilingDbTp    = 0.0;
     double limiterReleaseMs      = 0.0;
     stereo::MonoBassParams monoBass {};
@@ -373,14 +391,17 @@ public:
         // order — it is the one a C-ABI facade takes — and it is the order every STAGE already honours:
         // `Compressor`, `TruePeakLimiter` and `Dither` all re-apply their stored parameters inside
         // `prepare()`. The composite was the only place that did not.
-        reset();                                       // clears state and re-arms paramsDirty_/bypassKnown_
-        // ...and APPLY here rather than at the first quantum, so `params()` and `resolved()` describe the
-        // prepared chain immediately. They report what is APPLIED, which mid-stream lags a `setParams()`
-        // by up to one quantum by design; straight after `prepare()` there is no stream yet, so a lag
-        // there is not a design, it is a stale read — and a caller sizing anything from
-        // `resolved().latencySamples` would size it from the previous preparation.
+        // APPLY, THEN RESET, and the order is the whole point. Applying is what makes `params()` and
+        // `resolved()` describe the prepared chain rather than the previous one — straight after
+        // `prepare()` there is no stream yet, so a lag there is a stale read and not the documented
+        // one-quantum automation lag. Resetting AFTERWARDS is what keeps the stream's first parameter
+        // write a SNAP rather than a glide: `eq::EqBand::reset()` snaps its smoothers, so a write that
+        // follows a reset lands instantly, and applying last would have consumed that snap on the
+        // pre-prepare set and left `prepare() -> setParams(B) -> process()` gliding into B over 30 ms.
+        // `paramsDirty_` stays armed, so the first quantum re-applies (a no-op, or the newer pending
+        // set) and that write is the first since the reset.
         applyParams();
-        paramsDirty_ = false;
+        reset();
         prepared_ = true;
         return true;
     }
@@ -423,6 +444,10 @@ public:
 
     int  latencySamples() const noexcept { return prepared_ ? latency_ : 0; }
     int  numChannels()    const noexcept { return prepared_ ? nch_ : 0; }
+    // The rate this chain was prepared at. A consumer that builds meters of its own has to agree with
+    // it, and "the caller passed the same number to both" is not a check — it is the assumption that
+    // makes a 48 kHz render get measured as 44.1 kHz with every number plausible.
+    double sampleRate()   const noexcept { return prepared_ ? fs_ : 0.0; }
     int  internalBlock()  const noexcept { return prepared_ ? K_ : 0; }
     bool isPrepared()     const noexcept { return prepared_; }
 
@@ -445,6 +470,9 @@ public:
         r.limiterLookahead    = cfg_.limiter ? lim_.lookaheadSamples() : 0;
         r.oversampleFactor    = cfg_.limiter ? lim_.oversampleFactor()
                                              : (cfg_.clipper ? cfg_.oversampleFactor : 0);
+        r.compressorTapOffset = 0;
+        r.limiterTapOffset    = r.compressorLookahead + r.clipperLatency
+                              + (cfg_.limiter ? (lim_.latencySamples() - lim_.lookaheadSamples()) / 2 : 0);
         r.limiterCeilingDbTp  = cfg_.limiter ? lim_.effectiveCeilingDbTp() : 0.0;
         r.limiterReleaseMs    = cfg_.limiter ? lim_.effectiveReleaseMs() : 0.0;
         r.monoBass            = cfg_.monoBass ? monoBass_.params() : stereo::MonoBassParams { false, 0.0f, 0.0f };
@@ -476,7 +504,11 @@ public:
         // The capacity check is against what this call WILL produce, computed before anything moves —
         // `pos_` says how far into the current quantum the stream already is, so the count is exact
         // rather than the `n + K - 1` upper bound a caller sizes its buffers by.
-        const long long willRun    = (long long) ((pos_ + numSamples) / K_);
+        // `long long` BEFORE the addition, not after. `pos_ + numSamples` is int arithmetic, and a
+        // whole-file offline call is exactly where `numSamples` approaches INT_MAX: the sum overflows,
+        // the quotient comes back negative, and a tap far too short for the call passes the check
+        // below and is then written past its end.
+        const long long willRun    = ((long long) pos_ + (long long) numSamples) / (long long) K_;
         const long long willFrames = willRun * (long long) K_;
         if ((taps.compressorGrDb != nullptr || taps.preLimiter != nullptr)
             && (long long) taps.frameCapacity < willFrames) return false;
@@ -484,7 +516,13 @@ public:
             && (long long) taps.osCapacity < willFrames * (long long) osFactor_) return false;
         if (numSamples == 0) return true;
         stageRefused_ = false;                   // this call's verdict; the quanta below OR into it
-        tap_          = &taps;                   // read by runQuantum(); cleared before returning
+        // Only borrowed when something was actually asked for. The plain three-argument form forwards a
+        // default-constructed struct, and counting quanta into it would advance an `int` toward overflow
+        // on a long offline call for a caller that never asked for a trace: 2^31 / 256 quanta is 12
+        // hours of audio at 48 kHz, which an offline whole-file call can reach.
+        const bool wantTaps = (taps.compressorGrDb != nullptr || taps.preLimiter != nullptr
+                               || taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr);
+        tap_ = wantTaps ? &taps : nullptr;       // read by runQuantum(); cleared before returning
 
         for (int off = 0; off < numSamples; )
         {

@@ -47,14 +47,24 @@ namespace felitronics::mastering
 //     TP(g, c) = c + T(d)          achieved true peak
 //     PLR(d)   = T(d) - J(d)       peak-to-loudness — INDEPENDENT OF c
 //
-// So "hit the target AND stay under the ceiling" is not a pair of loops. It is
+// WHAT THAT IS USED FOR HERE, precisely — because the identity is a REASON, not the algorithm, and an
+// earlier draft of this comment described an algorithm this class does not implement. It is used for
+// exactly two things:
+//   * the loudness loop and the ceiling loop CANNOT chase each other, because they are not two loops.
+//     Lowering the ceiling and raising the gain by the same amount leaves the limiting shape untouched,
+//     so the ceiling correction is a trim rather than a competitor to the loudness correction;
+//   * getting QUIETER is therefore an EXACT single step (see the step rule in solve()), with no slope
+//     and no model, whenever the ceiling has room to come down with it.
+// The search itself is a secant on MEASURED integrated loudness, not a closed-form inversion of `J`:
+// the identity holds before the dither and while the gated block set does not move, and neither of
+// those is guaranteed (the dither is after the limiter and does not scale; the absolute gate is not
+// scale-invariant — see below). Every candidate is rendered and measured; the identity only ever
+// chooses where to look next.
 //
-//     find the smallest d with PLR(d) <= ceiling - target;   then  c = target - J(d),  g = d + c.
-//
-// `PLR` is monotone non-increasing in d (more drive removes peaks and adds loudness), measured on three
-// real mixes: 16.53 -> 6.95, 13.17 -> 7.29 and 15.87 -> 7.34 over an 18 dB sweep, with no reversal.
-// SMALLEST d is not an aesthetic preference either: d IS how hard the limiter works, so the least d
-// that satisfies the ceiling is the most transient the programme can keep at that loudness.
+// `PLR(d)` being monotone non-increasing in d is measured rather than assumed — three real mixes,
+// 16.53 -> 6.95, 13.17 -> 7.29 and 15.87 -> 7.34 over an 18 dB sweep, no reversal — and it is why the
+// least drive that satisfies the ceiling is also the most transient the programme can keep at that
+// loudness.
 //
 // THE DERATE IS NOT A CONSTANT HERE, and that is the point. `TruePeakLimiter` bounds its own F*fs grid
 // exactly and overshoots the reconstructed peak between grid points — up to +1.22 dB in the worst
@@ -99,8 +109,13 @@ namespace felitronics::mastering
 // measurement, before the search spends a pass on it. Moving that would mean solving for the compressor
 // threshold, which is `dynamics::offline::ThresholdSolver`'s job and a different question.
 //
-// OFFLINE. `prepare()` allocates; `solve()` does not, and it is called from a worker rather than an
-// audio callback. It drives `OfflineRenderer`, which drives `MasteringChain`, so every measurement it
+// OFFLINE, AND IT ALLOCATES — said plainly because the first draft of this line said it did not, and
+// it does: every pass builds and prepares an `analysis::LoudnessMeter` sized for the programme, whose
+// gating-block store is a function of the programme's length and therefore cannot live in `prepare()`
+// where the length is unknown. That is fine here — this class is called from a worker, never from an
+// audio callback — but it is not the RT-safe promise the chain underneath makes, and a caller must not
+// read one as the other. What it does NOT do is allocate per BLOCK: the tap buffers and the render
+// scratch are sized once. It drives `OfflineRenderer`, which drives `MasteringChain`, so every measurement it
 // makes is one the chain's fixed internal quantum has already made independent of block size —
 // measured: the achieved integrated loudness of the same programme is bit-identical at renderer block
 // sizes 1, 64, 256, 977, 4096 and 65536.
@@ -130,9 +145,16 @@ enum class MasteringSolveStatus
     Solved,                 // measured within `toleranceLu` of the target, ceiling held, nothing bound
     TargetUnreachable,      // a NAMED constraint binds; the result carries the best FEASIBLE render
     UpstreamViolation,      // a limit the search cannot move is already broken — see the note above
-    GateStep,               // the target falls inside a discontinuity of the gated measure; both
-                            // sides are reported and neither is within tolerance. Honest unreachability,
-                            // and NOT a constraint violation
+    TargetBetweenAchievable,// the two sides of the smallest gain interval the search can still express
+                            // BRACKET the target and both miss the tolerance. `achievedBelowLufs` and
+                            // `achievedAboveLufs` carry them. It is honest unreachability and NOT a
+                            // constraint violation: nothing was broken, the target simply is not an
+                            // achievable value. Named for what is DETECTED rather than for a cause,
+                            // because it has two — the gated measure stepping (a block crossing the
+                            // absolute gate moves the SET being averaged, measured at 0.879829 LU on a
+                            // fixture that straddles it), and a tolerance finer than the actuator's own
+                            // resolution. The first is the interesting one and the second is the one a
+                            // test can construct on demand
     PassLimit,              // ran out of `maxPasses` while still converging. Not a verdict about the
                             // material: it is a verdict about the budget, and it says so
     MeasurementInvalid,     // the meter could not answer (no gating block, dropped blocks, non-finite)
@@ -150,10 +172,17 @@ struct TargetLoudnessSolverLimits { static constexpr int kMaxPasses = 32; };
 // enforcing the other is the shape of defect this repository keeps closing.
 enum class GrStatistic { Mean, P95, Max };
 
+// `limitDb` OFF is `+infinity` and nothing else. `isfinite` looked like the right disabling test and is
+// not: it is true of BOTH infinities and of NaN, so a caller expressing an unsatisfiable limit as
+// `-infinity` silently switched the constraint OFF and got `Solved`. Measured: `minPlrDb = +infinity`
+// — a peak-to-loudness ratio that must exceed infinity — came back Solved with nothing bound.
 struct GainReductionLimit
 {
-    double      limitDb  = std::numeric_limits<double>::infinity();   // infinity = no limit
+    double      limitDb  = std::numeric_limits<double>::infinity();   // +infinity = no limit
     GrStatistic statistic = GrStatistic::Max;
+
+    bool off()      const noexcept { return limitDb == std::numeric_limits<double>::infinity(); }
+    bool malformed() const noexcept { return std::isnan (limitDb); }
 };
 
 // A gain-reduction trace, summarised. `|GR|` throughout — the traces are SIGNED (reduction is negative),
@@ -192,11 +221,20 @@ struct MasterMeasurement
                                         // `loudnessRangeLu() == 0` cannot tell "no range" from "no data"
 };
 
+// THE REQUEST HAS NO DEFAULT TARGET, and that is an architecture decision rather than an oversight.
+// "-14 LUFS, -1 dBTP" is a delivery policy — a platform's, a label's, a taste — and the core is
+// product-neutral by rule (docs/CORE-OVERVIEW.md: targets, curves and preset tables stay in the
+// product). A core that shipped those numbers as defaults would be choosing the policy for every
+// caller who forgot to, and forgetting is silent. So both are NaN and `solve()` refuses until the
+// caller states them. `toleranceLu` DOES have a default, because it is a property of the measurement
+// rather than of the product.
 struct LoudnessRequest
 {
-    double targetLufs      = -14.0;
+    double targetLufs      = std::numeric_limits<double>::quiet_NaN();   // REQUIRED
     double toleranceLu     =   0.1;
-    double maxTruePeakDbTp =  -1.0;     // DELIVERED, measured. Not the limiter's setting — that is derived.
+    double maxTruePeakDbTp = std::numeric_limits<double>::quiet_NaN();   // REQUIRED. DELIVERED, measured —
+                                                                         // not the limiter's setting, which
+                                                                         // this class derives.
     // How far BELOW the promise to aim the delivered peak. Not decoration and not taste: the ceiling
     // loop drives the delivered peak toward its aim, and an aim of exactly `maxTruePeakDbTp` converges
     // to the boundary FROM ABOVE and never crosses it — measured, a solve stalled at -1.0000 dBTP with
@@ -215,6 +253,13 @@ struct LoudnessRequest
     // ffmpeg chain being replaced collapses it 17.4 -> 2.9. An absolute floor cannot tell those apart —
     // the catalogue's own inputs run from 3.1 to 14.2 LU — and a delta can.
     double maxLraLossLu = std::numeric_limits<double>::infinity();
+    // THE OTHER END OF THAT DELTA, and it lives in the REQUEST rather than in the solver because it is a
+    // fact about THIS programme. Held as solver state it outlived the programme it was measured on:
+    // solve A, then solve B without re-measuring, and B was judged against A's range — measured, 5.90
+    // against 5.80 was enough to turn a healthy render into an `UpstreamViolation`. NaN means "not
+    // supplied", which switches the range constraint off rather than inventing a number.
+    // `TargetLoudnessSolver::measureInputLoudnessRange()` computes it; the caller passes it back in.
+    double inputLoudnessRangeLu = std::numeric_limits<double>::quiet_NaN();
 
     // What counts as "the limiter was working" / "the compressor was working". A THRESHOLD, not a
     // comparison with zero: a release from 6 dB decays for tens of thousands of samples before it
@@ -250,10 +295,13 @@ struct LoudnessSolution
     double ceilingDbTp      = 0.0;              // ... and the ceiling the limiter was actually given
     MasterMeasurement measured {};              // of the DELIVERED render, always — never of a probe
 
-    int    passes = 0;                          // renders spent
+    // RENDERS SPENT, all of them. `maxPasses` bounds the SEARCH; delivering the chosen candidate can
+    // cost one more when the search did not end on it, so `passes` can be `maxPasses + 1` — and saying
+    // so here is cheaper than a caller discovering it from a progress bar.
+    int    passes = 0;
     double activityThresholdDb = 0.1;           // echoed, because a fraction without its threshold is not a number
 
-    // GateStep only: the two sides of the discontinuity the target fell into.
+    // TargetBetweenAchievable only: the two achievable values the target fell between.
     double achievedBelowLufs = 0.0, achievedAboveLufs = 0.0;
     double gainBelowDb = 0.0, gainAboveDb = 0.0;
 
@@ -272,6 +320,8 @@ public:
     // quantile is reported to. The tap buffers are the whole allocation and they are per RENDERER BLOCK,
     // not per programme — the traces are consumed as they arrive, so a five-minute track costs the same
     // as a five-second one.
+    TargetLoudnessSolver() noexcept { for (double& w : weights_) w = 1.0; }
+
     [[nodiscard]] bool prepare (double sampleRate, int maxChannels, int rendererBlock,
                                 int internalBlock, int oversampleFactor, double binDb = 0.01)
     {
@@ -282,7 +332,7 @@ public:
         if (! (binDb > 0.0) || ! std::isfinite (binDb)) return false;
         // A `process(n)` call writes K * floor((pos + n) / K) tap frames, which is at most n + K - 1.
         const long long cap = (long long) rendererBlock + (long long) internalBlock;
-        if (cap > (long long) std::numeric_limits<int>::max() / (oversampleFactor + 1)) return false;
+        if (cap > (long long) std::numeric_limits<int>::max() / ((long long) oversampleFactor + 1)) return false;
 
         fs_ = sampleRate;
         nch_ = maxChannels;
@@ -321,22 +371,44 @@ public:
         if (! chain.isPrepared() || numChannels != chain.numChannels() || numChannels > nch_
             || frames <= 0 || in == nullptr || out == nullptr)
             { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
+        // `in == out` IS REFUSED HERE, even though `OfflineRenderer` supports it. One render in place is
+        // well defined; a SEARCH is not, because every pass after the first would read the previous
+        // pass's master as its input. Measured: a 1 kHz tone solved to a reported -22.996 LUFS, and the
+        // gain it returned applied to the untouched source gives -29.000 — the answer misses its own
+        // programme by 6.0 LU, and every number in the report describes a programme the caller does not
+        // have. Refused rather than copied: the copy is the caller's memory to spend, and only the
+        // caller knows whether it can.
+        for (int c = 0; c < numChannels; ++c)
+            if (in[c] == out[c]) { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
         if (! std::isfinite (req.targetLufs) || ! std::isfinite (req.maxTruePeakDbTp)
             || ! std::isfinite (req.toleranceLu) || req.toleranceLu < 0.0
             || ! std::isfinite (req.activityThresholdDb) || req.activityThresholdDb < 0.0
-            || req.maxPasses < 1 || req.maxPasses > kMaxPasses)
+            || req.maxPasses < 1 || req.maxPasses > kMaxPasses
+            || req.limiterGr.malformed() || req.compressorGr.malformed()
+            || std::isnan (req.minPlrDb) || std::isnan (req.maxLraLossLu)
+            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0)
             { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
         // The tap buffers were sized for a geometry; a chain that does not match them would be measured
         // through a refused call, which is a silent zero rather than a statistic.
+        // THE RATE IS CHECKED, not assumed shared. The solver builds its own meters from `fs_`, and a
+        // caller that passed 44100 here and 48000 to the chain would get a 48 kHz render measured on a
+        // 44.1 kHz grid — every number plausible, every number wrong.
+        if (! (std::fabs (chain.sampleRate() - fs_) < 1.0e-9))
+            { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
         if (chain.internalBlock() + renderer.blockSize() > frameCap_
             || (long long) (chain.internalBlock() + renderer.blockSize()) * chain.tapOversampleFactor() > (long long) osCap_)
             { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
 
         const double target = req.targetLufs;
         const double pmax   = req.maxTruePeakDbTp;
-        // The limiter's ceiling is a MEANS; `maxTruePeakDbTp` is the promise. Starting above the promise
-        // would ship a render whose only guard is the solver's own arithmetic, which is the failure mode
-        // P1 measured in the chain this replaces. It starts at the tighter of the two and only ever falls.
+        // THE CEILING IS THE SOLVER'S, THE PROMISE IS THE CALLER'S. `params.limiter.ceilingDbTp` is a
+        // STARTING POINT; `maxTruePeakDbTp` is the bound, and the only thing this class guarantees about
+        // the delivered file. The ceiling then TRACKS the aim in both directions, capped at the promise —
+        // it can rise above what the caller set (a caller ceiling of -40 against a promise of -1 is
+        // relieved by raising it, not by refusing) and it can fall below the promise by whatever the
+        // material's between-grid overshoot turns out to be. What it can never do is exceed the promise:
+        // shipping above a stated ceiling with the interface reporting success is the exact defect P1
+        // measured 17 times in 36 in the chain this replaces.
         const double c0     = std::min (pmax, std::isfinite (params.limiter.ceilingDbTp)
                                                   ? params.limiter.ceilingDbTp : pmax);
         double g = std::isfinite (req.initialGainDb) ? req.initialGainDb : params.preLimiterGainDb;
@@ -348,6 +420,11 @@ public:
         bool haveLo = false, haveHi = false;
         double prevG = 0.0, prevI = 0.0;    // the PREVIOUS render, for a local secant
         bool   havePrev = false;
+        // Set when the search stops because it CANNOT MOVE — the step it wants is below the resolution
+        // the actuator can express — as opposed to running out of budget while still making progress.
+        // The two are different answers and used to be the same one.
+        bool   stoppedOnResolution = false;
+        bool   bootstrapped = false;        // one attempt to bring an unmeasurable programme into range
         // THE IDLE ANCHOR, and it is a measurement rather than a model. While the limiter does not
         // engage, the chain from the gain node on is a plain multiply, so `I(g) = I1 + (g - g1)` holds
         // EXACTLY up to the gain at which the limiter starts working — and that gain is `c` minus the
@@ -373,10 +450,44 @@ public:
                 { sol.status = MasteringSolveStatus::RenderFailed; sol.passes = pass + 1; return sol; }
             ++sol.passes;
 
+            // AN UNMEASURABLE FIRST RENDER IS NOT ALWAYS AN UNMEASURABLE PROGRAMME. A file quiet enough
+            // that every gating block sits under the absolute gate has no integrated loudness at the
+            // gain it was rendered at — and may have a perfectly ordinary one 55 dB up, which is inside
+            // the actuator. Measured: a flat tone at -71.69 LUFS returned `MeasurementInvalid` from a
+            // start of 0 dB and `Solved` in one render from a start of +55.7. Refusing on that is a
+            // verdict about the starting gain, not about the material.
+            //
+            // The way out uses the measurement that DID work: the peak. Bring the sample peak to a
+            // sensible distance under the promise and let the ordinary search take it from there. One
+            // attempt only — if the peak cannot be read either, there really is nothing to measure.
+            if (! m.loudnessValid && ! bootstrapped && m.samplePeakDb > -180.0 && pass + 1 < req.maxPasses)
+            {
+                bootstrapped = true;
+                if (sol.logCount < kMaxPasses)
+                {
+                    SolvePassRecord& rec = sol.log[sol.logCount++];
+                    rec.gainDb = g; rec.ceilingDb = c;
+                    rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
+                    rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
+                    rec.loudnessRangeLu = m.loudnessRangeLu;
+                }
+                // 12 dB under the promise: far enough below it that the limiter does not take over the
+                // next measurement, high enough that an ordinary programme's blocks clear the -70 gate.
+                g = std::clamp (g + ((pmax - 12.0) - m.samplePeakDb), -kMaxGainDb, kMaxGainDb);
+                continue;
+            }
             if (! m.loudnessValid)
             {
                 sol.status = MasteringSolveStatus::MeasurementInvalid;
                 sol.measured = m; sol.preLimiterGainDb = g; sol.ceilingDbTp = c;
+                if (sol.logCount < kMaxPasses)
+                {
+                    SolvePassRecord& rec = sol.log[sol.logCount++];
+                    rec.gainDb = g; rec.ceilingDb = c;
+                    rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
+                    rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
+                    rec.loudnessRangeLu = m.loudnessRangeLu;
+                }
                 return sol;
             }
 
@@ -389,6 +500,15 @@ public:
                 sol.binding = MasteringConstraint::CompressorGainReduction;
                 sol.alsoViolated |= constraintBit (MasteringConstraint::CompressorGainReduction);
                 sol.measured = m; sol.preLimiterGainDb = g; sol.ceilingDbTp = c;
+                if (sol.logCount < kMaxPasses)
+                {
+                    SolvePassRecord& rec = sol.log[sol.logCount++];
+                    rec.gainDb = g; rec.ceilingDb = c;
+                    rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
+                    rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
+                    rec.loudnessRangeLu = m.loudnessRangeLu;
+                    rec.violated = constraintBit (MasteringConstraint::CompressorGainReduction);
+                }
                 return sol;
             }
 
@@ -404,7 +524,12 @@ public:
             // applies a single dB, and every one of those tracks came back blaming the loudness target.
             // The guard is the FIRST render only, and only when the target needs MORE drive than it — a
             // quieter target unwinds the drive and can cure all three.
-            if (pass == 0 && target > m.integratedLufs)
+            // ...and only when the solver's OWN knobs cannot relieve it. `c` is capped at the promise
+            // but may still be raised toward it, and raising the ceiling is exactly what removes limiter
+            // gain reduction. Measured: a caller ceiling of -40 dBTP against a promise of -1 made the
+            // limiter pull 20 dB on the first render, and the guard called a violation "upstream" that
+            // `g = -6.996, c = -1` reaches with no gain reduction at all.
+            if (pass == 0 && target > m.integratedLufs && c >= pmax - 1.0e-9)
             {
                 const std::uint32_t worsensWithDrive =
                     constraintBit (MasteringConstraint::LimiterGainReduction)
@@ -442,8 +567,14 @@ public:
 
             best.offer (g, c, m, feasible, std::fabs (m.integratedLufs - target),
                         worstExcess (m, req), viol);
-            if (m.integratedLufs <= target) { loG = g; loI = m.integratedLufs; haveLo = true; }
-            else                            { hiG = g; hiI = m.integratedLufs; haveHi = true; }
+            // THE BRACKET ONLY EVER TIGHTENS. Overwriting each side with the most RECENT render on it
+            // is not a bracket: once the search converges from one side, the other side's record stays
+            // where it was many dB ago, and the interval never closes — which makes the "the target
+            // falls between two achievable values" verdict unreachable and turns it into a `PassLimit`.
+            // `I(g)` is increasing, so the useful sides are the LARGEST gain that undershoots and the
+            // SMALLEST that overshoots.
+            if (m.integratedLufs <= target) { if (! haveLo || g > loG) { loG = g; loI = m.integratedLufs; haveLo = true; } }
+            else                            { if (! haveHi || g < hiG) { hiG = g; hiI = m.integratedLufs; haveHi = true; } }
 
             if (onTarget && feasible)
             {
@@ -465,6 +596,16 @@ public:
             // idle is read off the limiter's reconstructed peak, which the tap reports. Past that point
             // the limiter engages and the slope drops (measured on three real mixes: 0.99 at -14 LUFS,
             // 0.68 / 0.60 / 0.49 at -10), so the exact step is claimed only inside its own domain.
+            // THERE IS NO "MOVE g AND c TOGETHER" STEP, and there used to be. Moving both by the same
+            // amount is exact — it is the scale law — but exact at a FROZEN DRIVE, and the drive is the
+            // thing the search is supposed to minimise. Measured on the same programme and the same
+            // request (-14 LUFS, -1 dBTP), with only the starting gain changed: from 0 dB the answer was
+            // 8.5 dB of drive, no limiting at all, PLR 11.9 and LRA 4.1; from 55 dB it was **47.6 dB of
+            // drive, 38.05 dB of limiter gain reduction, PLR 4.6, LRA 0.10 — and status Solved**. Same
+            // loudness, same peak, a crushed master, and no way for the caller to tell. Worse, adding
+            // `minPlrDb = 8` turned the second one into `TargetUnreachable` while the first stayed
+            // Solved: the verdict depended on where the search happened to start. The ceiling now tracks
+            // the aim on every step, in both directions, so a warm start unwinds instead of freezing.
             const bool limiterIdle = m.limiter.valid && m.limiter.maxDb <= 0.0;
             const double headroomToEngage = c - m.limiterMaxReconstructedPeakDb;   // dB of gain left before
                                                                                    // the limiter starts working
@@ -477,17 +618,6 @@ public:
             if (limiterIdle && shift <= headroomToEngage)
             {
                 nextG = g + shift;                                // exact
-            }
-            else if (shift < 0.0 && m.truePeakDbTp <= aim)
-            {
-                // GETTING QUIETER IS EXACT TOO, by a different route. `c` is a pure output scale, so
-                // moving g and c DOWN together moves I and TP by exactly that amount while leaving the
-                // limiting shape — and therefore PLR, LRA and every gain-reduction statistic — untouched.
-                // It works downward and not upward for one reason and it is not symmetry: the ceiling is
-                // the caller's delivery bound, and raising it above `maxTruePeakDbTp` would leave the
-                // render with no guard at all. It is never raised, only lowered.
-                nextG = g + shift;
-                nextC = std::min (pmax, c + shift);
             }
             else
             {
@@ -524,33 +654,74 @@ public:
                 // walked back. The curvature costs a pass either way; paying it as an honest under-step
                 // keeps the arithmetic explicable and leaves no tuned constant to go stale.
                 nextG = g + shift / s;
+                // A BRACKET IS A GUARANTEE AND A SECANT IS NOT. Once two renders straddle the target,
+                // any step outside the bracket is a step the pair already ruled out — and a secant on a
+                // gated, piecewise measure can produce exactly that. Falling back to the midpoint keeps
+                // the bracket shrinking, which is what makes a gate STEP detectable at all: without it
+                // the search wanders instead of closing on the discontinuity and could never say so.
+                if (haveLo && haveHi)
+                {
+                    const double bLo = std::fmin (loG, hiG), bHi = std::fmax (loG, hiG);
+                    if (! (nextG > bLo && nextG < bHi)) nextG = 0.5 * (bLo + bHi);
+                }
                 // ... and the ceiling TRACKS the aim, 1:1 and in both directions, because that is exactly
-                // what `c` does to the delivered peak. It used to fall only, which ratchets: one
-                // exploratory over-drive pushed it 0.5 dB below what the delivery needed and it never
-                // came back, so the limiter kept working harder than the promise asked for ever after.
-                // The cap at `pmax` is what keeps the promise; the floor is the search's own business.
+                // what `c` does to the delivered peak. Falling only would ratchet: one exploratory
+                // over-drive pushes it below what the delivery needs and it never comes back, so the
+                // limiter keeps working harder than the promise asked for ever after — which is also how
+                // a warm start used to freeze a crushed answer. The cap at `pmax` keeps the promise; the
+                // floor is the search's own business.
                 nextC = std::min (pmax, c + (aim - m.truePeakDbTp));
             }
             if (! std::isfinite (nextG) || ! std::isfinite (nextC)) break;
             nextC = std::min (nextC, pmax);      // the caller's ceiling is a bound, never a starting point
-            // A step that cannot move the actuator cannot produce a new measurement: stop rather than
-            // spend the remaining budget re-rendering the same point.
-            if (std::fabs (nextG - g) < 1.0e-6 && std::fabs (nextC - c) < 1.0e-6) break;
+            // CLAMPED BEFORE THE MOVEMENT TEST, not after it. Testing the UNCLAMPED step against the
+            // current point says "it moved" while the actuator is pinned, so the search re-renders the
+            // same point until the budget runs out and then reports `PassLimit` — a verdict about the
+            // budget for something that is a fact about the material. Measured: a target of +20 LUFS on
+            // a -63 LUFS tone rendered g = 60 three times and came back `PassLimit` with nothing bound.
+            const double clG = std::clamp (nextG, -kMaxGainDb, kMaxGainDb);
+            const double clC = std::clamp (nextC, -kMaxGainDb, kMaxGainDb);
+            const bool pinned = (std::fabs (clG - nextG) > 1.0e-9);
+            if (std::fabs (clG - g) < 1.0e-6 && std::fabs (clC - c) < 1.0e-6)
+            {
+                // The actuator is where the search wanted to go and the target is still not met: that is
+                // the gain range binding, and it has a name.
+                if (pinned) best.forceViolation (constraintBit (MasteringConstraint::GainRange));
+                else        stoppedOnResolution = true;
+                break;
+            }
+            nextG = clG; nextC = clC;
             prevG = g; prevI = m.integratedLufs; havePrev = true;
             g = nextG; c = nextC;
         }
 
         // --- no candidate met the target -----------------------------------------------------------
-        // THE GATE STEP IS ITS OWN ANSWER. Two renders straddling the target, both outside tolerance,
-        // and an actuator gap too small to hold anything between them, is not a failure to converge and
-        // not a constraint: it is the gated measure being discontinuous there. Saying so is the only
-        // honest verdict, and it carries both sides so a caller can choose.
-        if (haveLo && haveHi && std::fabs (hiG - loG) <= 1.0e-3
-            && std::fabs (loI - target) > req.toleranceLu && std::fabs (hiI - target) > req.toleranceLu)
+        // A TARGET BETWEEN TWO ACHIEVABLE VALUES IS ITS OWN ANSWER. Two renders straddling the target,
+        // both outside tolerance, and a gain gap too small to hold anything between them, is not a
+        // failure to converge and not a constraint. Saying so is the only honest verdict, and it carries
+        // both sides so a caller can choose which one to take.
+        const bool bracketClosed = haveLo && haveHi && std::fabs (hiG - loG) <= 1.0e-3
+                                && std::fabs (loI - target) > req.toleranceLu
+                                && std::fabs (hiI - target) > req.toleranceLu;
+        if (bracketClosed || (stoppedOnResolution && best.have && best.err > req.toleranceLu))
         {
-            sol.status = MasteringSolveStatus::GateStep;
-            sol.achievedBelowLufs = loI; sol.achievedAboveLufs = hiI;
-            sol.gainBelowDb = loG;       sol.gainAboveDb = hiG;
+            sol.status = MasteringSolveStatus::TargetBetweenAchievable;
+            if (bracketClosed)
+            {
+                sol.achievedBelowLufs = loI; sol.achievedAboveLufs = hiI;
+                sol.gainBelowDb       = loG; sol.gainAboveDb       = hiG;
+            }
+            else
+            {
+                // THE SEARCH COULD NOT MOVE FROM HERE, so "here" is the whole answer and both fields
+                // carry it. Reporting the two sides of a WIDE bracket instead would be a different
+                // claim — that the target lies between two gains a dB apart — and it was: the two
+                // branches ran on different rows of the same suite (a bracket on the wasm tier, one
+                // side on arm64 macOS), and only the second reported an interval the caller could act
+                // on. The condition that stopped the search is the one that gets reported.
+                sol.achievedBelowLufs = sol.achievedAboveLufs = best.m.integratedLufs;
+                sol.gainBelowDb       = sol.gainAboveDb       = best.g;
+            }
         }
         else if (best.nearestViolated != 0)
         {
@@ -569,7 +740,12 @@ public:
             // The DELIVERED render must be the one described. The last render written into `out` is the
             // last one attempted, which is not necessarily the best — re-render the reported one rather
             // than hand back a file the report does not describe.
-            if (! best.isLast)
+            // `isLast` is set by the last `offer` that WON. A candidate re-offered on equal terms does
+            // not win, so a search that ended on its own best point used to re-render it — a whole pass
+            // for a buffer that already held the right audio.
+            const bool alreadyDelivered = best.isLast
+                                       || (std::fabs (g - best.g) < 1.0e-12 && std::fabs (c - best.c) < 1.0e-12);
+            if (! alreadyDelivered)
             {
                 params.preLimiterGainDb    = best.g;
                 params.limiter.ceilingDbTp = best.c;
@@ -579,6 +755,14 @@ public:
                     { sol.status = MasteringSolveStatus::RenderFailed; return sol; }
                 ++sol.passes;
                 sol.measured = again;
+                if (sol.logCount < kMaxPasses)
+                {
+                    SolvePassRecord& rec = sol.log[sol.logCount++];
+                    rec.gainDb = best.g; rec.ceilingDb = best.c;
+                    rec.integratedLufs = again.integratedLufs; rec.truePeakDbTp = again.truePeakDbTp;
+                    rec.plrDb = again.plrDb; rec.limiterMaxGrDb = again.limiter.maxDb;
+                    rec.loudnessRangeLu = again.loudnessRangeLu; rec.violated = violatedMask (again, req);
+                }
             }
         }
         return sol;
@@ -603,6 +787,10 @@ private:
         double nearestErr = std::numeric_limits<double>::infinity();
         std::uint32_t nearestViolated = 0;
         bool nearestHave = false;
+
+        // A constraint the SEARCH ran into rather than a render — the actuator range is the only one of
+        // those, because it is a property of the chain's knobs and not of any output.
+        void forceViolation (std::uint32_t bit) noexcept { nearestViolated |= bit; nearestHave = true; }
 
         void offer (double gg, double cc, const MasterMeasurement& mm, bool feas, double e,
                     double exc, std::uint32_t viol) noexcept
@@ -631,16 +819,18 @@ private:
     {
         double e = 0.0;
         if (m.truePeakDbTp > req.maxTruePeakDbTp) e = std::fmax (e, m.truePeakDbTp - req.maxTruePeakDbTp);
-        if (std::isfinite (req.limiterGr.limitDb) && m.limiter.valid)
+        if (! req.limiterGr.off() && ! req.limiterGr.malformed() && m.limiter.valid)
         {
             const double v = (req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
                            : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db : m.limiter.maxDb;
             if (v > req.limiterGr.limitDb) e = std::fmax (e, v - req.limiterGr.limitDb);
         }
-        if (std::isfinite (req.minPlrDb) && m.plrDb < req.minPlrDb) e = std::fmax (e, req.minPlrDb - m.plrDb);
-        if (std::isfinite (req.maxLraLossLu) && inputLraValid_ && m.lraValid)
+        if (req.minPlrDb != -std::numeric_limits<double>::infinity() && m.plrDb < req.minPlrDb)
+            e = std::fmax (e, req.minPlrDb - m.plrDb);
+        if (req.maxLraLossLu != std::numeric_limits<double>::infinity()
+            && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
         {
-            const double loss = inputLraLu_ - m.loudnessRangeLu;
+            const double loss = req.inputLoudnessRangeLu - m.loudnessRangeLu;
             if (loss > req.maxLraLossLu) e = std::fmax (e, loss - req.maxLraLossLu);
         }
         return e;
@@ -666,7 +856,8 @@ private:
 
     static bool violates (const GainReductionStats& s, const GainReductionLimit& lim) noexcept
     {
-        if (! std::isfinite (lim.limitDb)) return false;
+        if (lim.off()) return false;                 // +infinity, and ONLY +infinity, means "no limit"
+        if (lim.malformed()) return false;           // NaN is refused up front; never silently permissive
         if (! s.valid) return false;                 // an unanswerable statistic is not a violation
         const double v = (lim.statistic == GrStatistic::Mean) ? s.meanDb
                        : (lim.statistic == GrStatistic::P95)  ? s.p95Db : s.maxDb;
@@ -678,11 +869,14 @@ private:
         std::uint32_t v = 0;
         if (m.truePeakDbTp > req.maxTruePeakDbTp) v |= constraintBit (MasteringConstraint::TruePeakCeiling);
         if (violates (m.limiter, req.limiterGr))  v |= constraintBit (MasteringConstraint::LimiterGainReduction);
-        if (std::isfinite (req.minPlrDb) && m.plrDb < req.minPlrDb)
+        // OFF is `-infinity` for a FLOOR and `+infinity` for a CEILING — the sign is part of the
+        // meaning, and testing `isfinite` throws it away in the direction that always says "satisfied".
+        if (req.minPlrDb != -std::numeric_limits<double>::infinity() && m.plrDb < req.minPlrDb)
             v |= constraintBit (MasteringConstraint::PeakToLoudness);
         // LRA is a DELTA against the input's, and it is only asked when both ends are measurements.
-        if (std::isfinite (req.maxLraLossLu) && inputLraValid_ && m.lraValid
-            && (inputLraLu_ - m.loudnessRangeLu) > req.maxLraLossLu)
+        if (req.maxLraLossLu != std::numeric_limits<double>::infinity()
+            && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid
+            && (req.inputLoudnessRangeLu - m.loudnessRangeLu) > req.maxLraLossLu)
             v |= constraintBit (MasteringConstraint::LoudnessRange);
         return v;
     }
@@ -718,10 +912,17 @@ private:
         // chain, never guessed. Everything outside it is the chain's priming or its drain, both of
         // which are fed zeros and therefore produce no gain reduction and no peak; counting them would
         // dilute `mean` and the active fraction by exactly the ratio a short programme cannot afford.
+        // EACH TAP'S WINDOW COMES FROM THE CHAIN, not from arithmetic here. The limiter's offset in
+        // particular is not the sum of the stages in front of it — the trace is written where the gain
+        // is decided, on the oversampled copy, so it lags by the UP leg of the limiter's own oversampler
+        // as well. Deriving it here got it wrong twice (once omitting that term entirely, once counting
+        // the whole round trip instead of half), and the cost of omitting it is the whole reaction to a
+        // peak in the programme's last samples: measured, 10.9 dB of gain reduction reported as zero.
         const MasteringChainResolved r = chain.resolved();
-        const long long compTo  = frames;
-        const long long limFrom = (long long) r.compressorLookahead + (long long) r.clipperLatency;
-        const long long limTo   = limFrom + frames;
+        const long long compFrom = r.compressorTapOffset;
+        const long long compTo   = compFrom + frames;
+        const long long limFrom  = r.limiterTapOffset;
+        const long long limTo    = limFrom + frames;
         const double activityDb = req.activityThresholdDb;
 
         MasteringChainTaps taps;
@@ -736,7 +937,7 @@ private:
             for (int j = 0; j < t.framesWritten; ++j)
             {
                 const long long s = tapPos + j;
-                if (s >= 0 && s < compTo)
+                if (s >= compFrom && s < compTo)
                 {
                     const double a = std::fabs ((double) compTap_[(std::size_t) j]);
                     compHist_.add (a);
@@ -792,6 +993,7 @@ private:
         analysis::TruePeakMeter  tm;
         const double seconds = (double) frames / fs_ + 1.0;
         if (! lm.prepare (fs_, nch, seconds)) return false;
+        for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! tm.prepare (fs_, frames > 0 ? frames : 1, nch)) return false;
         const float* p[core::kMaxChannels] {};
         for (int c = 0; c < nch; ++c) p[c] = out[c];
@@ -829,24 +1031,38 @@ private:
 
 public:
     // The input's loudness range, for the LRA constraint — which is a DELTA and therefore needs both
-    // ends. Measured once, on the caller's input, before any render. Optional: an unset input LRA
-    // simply switches that constraint off rather than making one up.
-    [[nodiscard]] bool measureInputLra (const float* const* in, int nch, int frames)
+    // ends. STATELESS on purpose: it returns the number and the caller puts it in the request, so it
+    // cannot outlive the programme it describes. Returns false, and leaves `out` alone, when the
+    // programme is too short for the measure to mean anything (EBU Tech 3342 needs short-term samples,
+    // one a second) or when the meter could not answer — because `loudnessRangeLu()` returning 0.0 is
+    // also what "no dynamic range at all" returns, and a constraint cannot tell those apart.
+    [[nodiscard]] bool measureInputLoudnessRange (const float* const* in, int nch, int frames,
+                                                  double& out) const
     {
-        inputLraValid_ = false;
         if (! prepared_ || in == nullptr || nch < 1 || nch > nch_ || frames <= 0) return false;
+        if ((double) frames / fs_ < 3.0) return false;
         analysis::LoudnessMeter lm;
         if (! lm.prepare (fs_, nch, (double) frames / fs_ + 1.0)) return false;
+        for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! lm.process (in, nch, frames)) return false;
         if (lm.gatingBlockCount() <= 0 || lm.droppedBlocks() != 0) return false;
-        if ((double) frames / fs_ < 3.0) return false;
-        inputLraLu_ = lm.loudnessRangeLu();
-        inputLraValid_ = true;
+        out = lm.loudnessRangeLu();
         return true;
     }
 
-    double inputLoudnessRangeLu() const noexcept { return inputLraLu_; }
-    bool   hasInputLoudnessRange() const noexcept { return inputLraValid_; }
+    // BS.1770 CHANNEL WEIGHTS, forwarded to every meter this class builds. Default 1.0, which is correct
+    // for mono and stereo and WRONG for surround: the standard weights Ls/Rs at 1.41 and excludes LFE
+    // entirely. Without this the solver would happily steer a 16-channel layout by an LFE-only
+    // programme that BS.1770 says has no measurable loudness at all. The host-layout-to-role mapping is
+    // product glue and stays outside, exactly as `analysis::LoudnessMeter` says.
+    void setChannelWeight (int c, double weight) noexcept
+    {
+        if (c >= 0 && c < core::kMaxChannels && std::isfinite (weight) && weight >= 0.0) weights_[c] = weight;
+    }
+    double channelWeight (int c) const noexcept
+    {
+        return (c >= 0 && c < core::kMaxChannels) ? weights_[c] : 0.0;
+    }
 
 private:
     double fs_ = 48000.0;
@@ -858,8 +1074,7 @@ private:
     std::uint64_t compActive_ = 0, limActive_ = 0, compFrames_ = 0, limFrames_ = 0;
     float  maxReconLin_ = 0.0f;
 
-    double inputLraLu_ = 0.0;
-    bool   inputLraValid_ = false;
+    double weights_[core::kMaxChannels] { };
 };
 
 } // namespace felitronics::mastering

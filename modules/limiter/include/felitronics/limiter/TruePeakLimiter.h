@@ -88,9 +88,12 @@ struct TruePeakLimiterParams
 //
 // BE HONEST ABOUT THE SIZE OF THAT, because the first draft of this comment carried an invented number
 // and the measurement is an order of magnitude smaller. Taking the MINIMUM over each group of F
-// preserves the maximum reduction exactly, so `max` and every upper quantile are untouched (measured:
-// p95 9.525000 and max 9.538984 identical either way); what it biases is the mean and the active
-// fraction, and only upward. Swept over the whole release range on a fixture built to move the gain
+// preserves the OVERALL MAXIMUM exactly — that one is a theorem, since the group maximum of the
+// magnitude is kept. NOTHING ELSE IS: a fold changes the distribution, so p95 is not preserved in
+// general and the second draft of this comment claiming "every upper quantile" was wrong. On the
+// measured fixture the two happened to agree (p95 9.525000, max 9.538984 either way), which is one
+// fixture and not a proof. What the fold biases measurably is the mean and the active fraction, and
+// only upward. Swept over the whole release range on a fixture built to move the gain
 // INSIDE a baseband sample (transient pairs, instant attack, 4×): the mean bias is **+0.0029 to
 // +0.0080 dB** and the active-fraction bias **+0.0000 to +0.0009**, at release 0.05 ms through 50 ms.
 // Small — but it is a choice, it is not zero, and it is not the caller's to discover. A caller that
