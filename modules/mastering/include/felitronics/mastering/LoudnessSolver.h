@@ -437,9 +437,15 @@ public:
         // comment was left behind in the old coordinates.) So a single idle render hands the search a
         // second exact point sitting ON the boundary of the active region, which is the anchor a local
         // secant wants: the first active render then pairs with it instead of with a point far away in
-        // the linear region. Measured, and NOT on a loud target, where mutating the anchor away changes
-        // nothing: the pass it is worth shows up in the SATURATED regime -- a -2 LUFS target takes nine
-        // renders without it and seven with.
+        // the linear region.
+        //
+        // MEASURED, AND THE PLACE IT EARNS ITS KEEP MOVED once the other defects were fixed. It is not
+        // the loud target (no change) and no longer the saturated one (a -2 LUFS target is now one
+        // render FASTER without it). It is the WARM START just above the answer: four consecutive
+        // starts from +8.30 to +8.45 dB toward a -10.5 LUFS target take three renders with the anchor
+        // and four without, every time. Over the 102-cell battery, 23 cells move and the totals are
+        // 120 renders with against 124 without -- a net win, and a small one. Two earlier numbers
+        // written here were true of code that has since changed; this one is dated to the fixes above.
         double anchorD = 0.0, anchorJ = 0.0;
         bool   haveAnchor = false;
         const double aim = pmax - (std::isfinite (req.truePeakAimDb) && req.truePeakAimDb > 0.0
@@ -836,6 +842,12 @@ public:
             // exactly — the search had 39 dB of untried ceiling and a verdict saying it had none.
             // On the QUIET side there is no such escape: `nextC` never lowers the ceiling to chase a
             // quiet target, so the gain node really is the only actuator and the pin stands.
+            //
+            // `want > 0.0` IS REDUNDANT ON THIS SIDE and kept only as the written intent: `nextC` is
+            // `min(pmax, ...)`, so `c <= pmax` always and `ceilingLeft >= 0`, hence `want > ceilingLeft`
+            // already implies `want > 0`. The mutation stand proved it — dropping the term changes no
+            // answer on any input — and it is recorded here rather than removed because the quiet arm
+            // below has no such implication and needs its own direction test to stay legible.
             const double ceilingLeft = pmax - lastC;
             if (lastG >=  kMaxGainDb - 1.0e-6 && want > 0.0 && want > ceilingLeft) pinnedDir = +1;
             if (lastG <= -kMaxGainDb + 1.0e-6 && want < 0.0) pinnedDir = -1;

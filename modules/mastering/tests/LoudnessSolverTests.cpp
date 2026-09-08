@@ -1969,6 +1969,44 @@ void testThePreMergeDiffPass()
                       "half a dB of remaining gain is still gain");
         }
 
+        // (2b) THE QUIET END'S ERROR TEST. Its loud twin is redundant — see the proof in the header —
+        //      but on this side nothing else stands between "the gain is at -60" and naming the range,
+        //      so a render that MEETS the target must not be called out of gain. Infeasible for a
+        //      different reason entirely, and THAT is what the caller needs told.
+        {
+            Programme probeDst; probeDst.ch = src.ch; probeDst.bind();
+            Rig probeRig;
+            if (! test::run (probeRig.build (2))) return;
+            probeRig.params.bypassCompressor = true; probeRig.params.bypassDither = true;
+            LoudnessRequest probeReq;
+            probeReq.targetLufs = -200.0; probeReq.maxTruePeakDbTp = -1.0; probeReq.maxPasses = 1;
+            probeReq.initialGainDb = -60.0;
+            const auto probe = probeRig.solver.solve (probeRig.chain, probeRig.renderer, probeRig.params,
+                                                      src.in(), probeDst.out(), 2, src.frames(), probeReq);
+            test::ok (probe.logCount == 1, "precondition: the quiet probe render happened");
+            if (probe.logCount != 1) return;
+
+            Programme dst2; dst2.ch = src.ch; dst2.bind();
+            Rig rig2;
+            if (! test::run (rig2.build (2))) return;
+            rig2.params.bypassCompressor = true; rig2.params.bypassDither = true;
+            LoudnessRequest req;
+            req.targetLufs = probe.log[0].integratedLufs - 0.05;   // inside the tolerance, below it
+            req.maxTruePeakDbTp = -1.0; req.toleranceLu = 0.1;
+            req.minPlrDb = 40.0;                                   // …and infeasible for another reason
+            req.maxPasses = 1; req.initialGainDb = -60.0;
+            const auto sol = rig2.solver.solve (rig2.chain, rig2.renderer, rig2.params,
+                                                src.in(), dst2.out(), 2, src.frames(), req);
+            test::ok (sol.logCount == 1 && std::fabs (sol.log[0].gainDb + 60.0) < 1.0e-6,
+                      "precondition: the render sits at the -60 dB clamp");
+            test::ok (std::fabs (sol.log[0].integratedLufs - req.targetLufs) <= req.toleranceLu,
+                      "precondition: and MEETS the target in loudness");
+            test::ok (sol.log[0].integratedLufs > req.targetLufs,
+                      "precondition: with the target BELOW it, which is the quiet arm's direction");
+            test::ok ((sol.alsoViolated & constraintBit (MasteringConstraint::GainRange)) == 0u,
+                      "the quiet end does not name the gain range for a target it hit");
+        }
+
         // (3) THE ERROR. A render at the clamp that MEETS the target in loudness is not out of range,
         //     whatever else is wrong with it — here the ceiling is broken, and THAT is the answer.
         {
@@ -2008,6 +2046,99 @@ void testThePreMergeDiffPass()
                       "a render that HIT the target is not also out of gain");
             std::printf ("      pin halves: direction, clamp and error each hold their own witness\n");
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("the idle anchor pays for itself where it actually pays");
+    {
+        // The regime is a start whose first render is still IDLE and short of the target: the search
+        // has to climb through the drive at which the limiter engages, and the anchor is the exact
+        // second point sitting on that boundary. Without it the first ACTIVE render pairs its secant
+        // with a point far away in the linear region and a pass is spent recovering.
+        //
+        // Measured over four consecutive starts, three renders with the anchor and four without, every
+        // time. Over the whole 102-cell battery 23 cells move, totalling 120 renders with against 124
+        // without — a real win, and a small one; two cells are actually faster without it.
+        for (double start : { 8.30, 8.35, 8.40, 8.45 })
+        {
+            Programme src = makeMusic (6.0, 0.3);
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            // The chain has to be the one the measurement was taken on: the limiter's release is what
+            // decides how much reduction the first warm render carries, and the default is not it.
+            rig.params.bypassCompressor = false;
+            rig.params.compressor.thresholdDb = -20.0; rig.params.compressor.ratio = 2.0;
+            rig.params.compressor.kneeDb = 6.0;
+            rig.params.compressor.attackMs = 15.0; rig.params.compressor.releaseMs = 180.0;
+            rig.params.limiter.ceilingDbTp = -1.0;
+            rig.params.limiter.releaseMs = 100.0;
+            LoudnessRequest req;
+            req.targetLufs = -10.5; req.maxTruePeakDbTp = -1.0; req.toleranceLu = 0.1;
+            req.maxPasses = 6; req.initialGainDb = start;
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                               src.in(), dst.out(), 2, src.frames(), req);
+            // PRECONDITION: the start really is above the answer and the limiter really is engaged on
+            // the first render — without both, this is an ordinary cold search and proves nothing.
+            // PRECONDITION, and it is the whole point: the first render must be IDLE — that is what
+            // establishes the anchor — and BELOW the target, so the search has to walk up through the
+            // engagement boundary the anchor sits on. Written the other way round first ("a warm start
+            // above the answer"), which is not this regime at all and made every row fail its own
+            // precondition. The measurement was right; the sentence describing it was invented.
+            test::ok (sol.logCount >= 1 && sol.log[0].integratedLufs < req.targetLufs,
+                      "precondition: the first render is below the target");
+            test::ok (sol.logCount >= 1 && sol.log[0].limiterMaxGrDb == 0.0,
+                      "precondition: and the limiter is idle on it, so an anchor exists at all");
+            char m[128];
+            std::snprintf (m, sizeof m, "start %+.2f: three renders, not four (got %d)", start, sol.passes);
+            test::ok (sol.passes <= 3, m);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("the bracket closes on BOTH knobs, not on the gain alone");
+    {
+        // The sides are keyed on drive since the coordinate rewrite, so two renders can share a gain
+        // exactly and still be a whole ceiling apart: `(60, -40)` and `(60, -1.05)`. Their gain gap is
+        // ZERO, which passes any gain-only closure test, and the pair straddles the target — so the
+        // solver announced `TargetBetweenAchievable`, "the target lies between two achievable values",
+        // for a target it simply had not walked to yet. A quiet programme reaches that geometry in
+        // three renders because the bootstrap spends the first one.
+        Programme src = tone (1.0, 1.0e-4);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        rig.params.limiter.ceilingDbTp = -40.0;
+        LoudnessRequest req;
+        req.targetLufs = -25.0; req.maxTruePeakDbTp = -1.0; req.toleranceLu = 0.1;
+        req.maxPasses = 3; req.initialGainDb = 0.0;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+
+        // PRECONDITION: the geometry this group is about is actually present — two renders with the
+        // SAME gain, DIFFERENT ceilings, straddling the target. Without it the assertion below is
+        // satisfied by any run at all.
+        bool sawSameGainDifferentCeiling = false, straddles = false;
+        for (int a = 0; a < sol.logCount && ! sawSameGainDifferentCeiling; ++a)
+            for (int b = a + 1; b < sol.logCount; ++b)
+                if (std::fabs (sol.log[a].gainDb - sol.log[b].gainDb) < 1.0e-9
+                    && std::fabs (sol.log[a].ceilingDb - sol.log[b].ceilingDb) > 1.0e-3)
+                {
+                    sawSameGainDifferentCeiling = true;
+                    straddles = (sol.log[a].integratedLufs - req.targetLufs)
+                              * (sol.log[b].integratedLufs - req.targetLufs) < 0.0;
+                    break;
+                }
+        test::ok (sawSameGainDifferentCeiling,
+                  "precondition: two renders share a gain exactly and differ in ceiling");
+        test::ok (straddles, "precondition: …and they straddle the target, so a gain-only test closes");
+        test::ok (sol.status != MasteringSolveStatus::TargetBetweenAchievable,
+                  std::string ("a zero GAIN gap across two ceilings is not a closed interval (got ")
+                  + statusName (sol.status) + ")");
+        std::printf ("      both knobs: %s at %.4f LUFS, g %+.4f c %+.4f, %d renders\n",
+                     statusName (sol.status), sol.measured.integratedLufs,
+                     sol.preLimiterGainDb, sol.ceilingDbTp, sol.passes);
     }
 }
 
