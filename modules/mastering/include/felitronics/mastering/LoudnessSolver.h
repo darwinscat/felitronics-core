@@ -416,23 +416,37 @@ public:
         double c = c0;
 
         Best best;                          // the best FEASIBLE render seen, and the best of any kind
-        double loG = 0.0, hiG = 0.0, loI = 0.0, hiI = 0.0;   // the two sides that bracket the target
+        double loD = 0.0, hiD = 0.0, loJ = 0.0, hiJ = 0.0;   // the two sides, in (drive, shape)
+        double loG = 0.0, hiG = 0.0, loC = 0.0, hiC = 0.0, loI = 0.0, hiI = 0.0;   // ...and in the caller's units, for the report
         bool haveLo = false, haveHi = false;
-        double prevG = 0.0, prevI = 0.0;    // the PREVIOUS render, for a local secant
+        double prevD = 0.0, prevJ = 0.0;    // the PREVIOUS render, in (drive, shape) coordinates
         bool   havePrev = false;
+        // Which end of the +-60 dB gain node the search wanted to pass, if any. Judged at the end.
+        int    pinnedDir = 0;
+        double lastG = 0.0, lastI = 0.0, lastC = 0.0; bool haveLastRender = false;
         // Set when the search stops because it CANNOT MOVE — the step it wants is below the resolution
         // the actuator can express — as opposed to running out of budget while still making progress.
         // The two are different answers and used to be the same one.
         bool   stoppedOnResolution = false;
         bool   bootstrapped = false;        // one attempt to bring an unmeasurable programme into range
         // THE IDLE ANCHOR, and it is a measurement rather than a model. While the limiter does not
-        // engage, the chain from the gain node on is a plain multiply, so `I(g) = I1 + (g - g1)` holds
-        // EXACTLY up to the gain at which the limiter starts working — and that gain is `c` minus the
-        // reconstructed peak the limiter itself reports. So a single idle render hands the search a
+        // engage, the chain from the gain node on is a plain multiply, so `J(d) = J1 + (d - d1)` holds
+        // EXACTLY up to the DRIVE at which the limiter starts working — and that drive is `c` minus the
+        // reconstructed peak the limiter itself reports. (In gain it was `I(g) = I1 + (g - g1)`, which
+        // is the same statement only while `c` stands still; the rewrite moved it to drive and this
+        // comment was left behind in the old coordinates.) So a single idle render hands the search a
         // second exact point sitting ON the boundary of the active region, which is the anchor a local
         // secant wants: the first active render then pairs with it instead of with a point far away in
-        // the linear region. Measured, that pairing is worth a whole pass on a loud target.
-        double anchorG = 0.0, anchorI = 0.0;
+        // the linear region.
+        //
+        // MEASURED, AND THE PLACE IT EARNS ITS KEEP MOVED once the other defects were fixed. It is not
+        // the loud target (no change) and no longer the saturated one (a -2 LUFS target is now one
+        // render FASTER without it). It is the WARM START just above the answer: four consecutive
+        // starts from +8.30 to +8.45 dB toward a -10.5 LUFS target take three renders with the anchor
+        // and four without, every time. Over the 102-cell battery, 23 cells move and the totals are
+        // 120 renders with against 124 without -- a net win, and a small one. Two earlier numbers
+        // written here were true of code that has since changed; this one is dated to the fixes above.
+        double anchorD = 0.0, anchorJ = 0.0;
         bool   haveAnchor = false;
         const double aim = pmax - (std::isfinite (req.truePeakAimDb) && req.truePeakAimDb > 0.0
                                        ? req.truePeakAimDb : 0.0);
@@ -567,14 +581,18 @@ public:
 
             best.offer (g, c, m, feasible, std::fabs (m.integratedLufs - target),
                         worstExcess (m, req), viol);
+            lastG = g; lastI = m.integratedLufs; lastC = c; haveLastRender = true;
             // THE BRACKET ONLY EVER TIGHTENS. Overwriting each side with the most RECENT render on it
             // is not a bracket: once the search converges from one side, the other side's record stays
             // where it was many dB ago, and the interval never closes — which makes the "the target
             // falls between two achievable values" verdict unreachable and turns it into a `PassLimit`.
-            // `I(g)` is increasing, so the useful sides are the LARGEST gain that undershoots and the
-            // SMALLEST that overshoots.
-            if (m.integratedLufs <= target) { if (! haveLo || g > loG) { loG = g; loI = m.integratedLufs; haveLo = true; } }
-            else                            { if (! haveHi || g < hiG) { hiG = g; hiI = m.integratedLufs; haveHi = true; } }
+            // `J(d)` is increasing, so the useful sides are the LARGEST DRIVE that undershoots and the
+            // SMALLEST that overshoots -- drive, not gain, since the rewrite: the gain and the ceiling
+            // are carried alongside only so the report can speak the caller's units.
+            if (m.integratedLufs <= target)
+            { if (! haveLo || (g - c) > loD) { loD = g - c; loJ = m.integratedLufs - c; loG = g; loC = c; loI = m.integratedLufs; haveLo = true; } }
+            else
+            { if (! haveHi || (g - c) < hiD) { hiD = g - c; hiJ = m.integratedLufs - c; hiG = g; hiC = c; hiI = m.integratedLufs; haveHi = true; } }
 
             if (onTarget && feasible)
             {
@@ -586,112 +604,190 @@ public:
             if (pass + 1 >= req.maxPasses) break;
 
             // --- choose the next (g, c) ------------------------------------------------------------
-            const double shift = target - m.integratedLufs;
-            double nextG = g, nextC = c;
+            // THE SEARCH RUNS IN THE CHAIN'S OWN COORDINATES, `d = g - c` and `J = I - c`, AND IT USED
+            // TO RUN IN `g` AND `I`. That was the same mistake the class's header exists to warn about,
+            // made one level down: `I` is not a function of `g`, it is `c + J(g - c)`, and `c` MOVES
+            // every pass while the ceiling tracks its aim. A secant taken across two renders whose
+            // ceilings differ therefore measures nothing — it divides a change that is mostly `c` by a
+            // change that is all `g`.
+            //
+            // Measured, and both of these are one defect: a 1 kHz tone at 0.005, started at +55 dB with
+            // a target of -10 LUFS, gave two renders 9 dB apart whose ceilings differed by 0.05 dB; the
+            // "slope" came out **0.0057** where the true one is near 1, the step went to the -60 dB
+            // clamp, the render fell under the absolute gate, and a four-render budget ended at
+            // **-12.993 LUFS instead of -10.000**. And a start of +55 dB with the caller's ceiling at
+            // -40 spent twenty-two renders bisecting a bracket that never contained the answer, then
+            // reported `Unreachable / GainRange` for a target that `g = -18.99, c = -1` delivers
+            // exactly.
+            //
+            // In `(d, J)` both go away, because `J` is a function of `d` alone WHEREVER THE SCALE LAW
+            // HOLDS. The exception is named rather than glossed: BS.1770's RELATIVE gate is
+            // scale-invariant, but its ABSOLUTE gate at -70 LUFS is not, so two renders with the same
+            // drive and different ceilings straddling that gate have different `J`. Measured on the
+            // gate fixture, `(g, c) = (0, -3)` and `(2, -1)` — both `d = 3` — differ by 0.874 LU. The
+            // consequence is bounded and local: it is a step whose secant is wrong near -70 LUFS, and
+            // the physical bracket below is what keeps that from becoming a wild step. Nothing in this
+            // file may claim the identity is unconditional; the header says the same at the top.
+            //
+            // The ceiling is chosen FIRST — it is the trim, and it is what makes `J` mean anything —
+            // and the step is then taken on the shape.
+            const double dNow = g - c;
+            const double jNow = m.integratedLufs - c;
+            // The ceiling tracks the aim, in both directions, capped at the promise.
+            double nextC = std::min (pmax, c + (aim - m.truePeakDbTp));
+            if (! std::isfinite (nextC)) nextC = c;
+            const double jReq = target - nextC;          // the shape has to deliver this much
+            const double dj   = jReq - jNow;
+            double nextD = dNow;
 
-            // THE EXACT STEP, and it is available more often than it looks. While the limiter is IDLE the
-            // chain from the gain node on is a plain multiply, so `I(g)` has slope exactly 1 and the whole
-            // correction is one addition — no slope estimate, no secant, no model. "Idle" is not assumed:
-            // it is read off this render's own gain-reduction trace, and the range over which it stays
-            // idle is read off the limiter's reconstructed peak, which the tap reports. Past that point
-            // the limiter engages and the slope drops (measured on three real mixes: 0.99 at -14 LUFS,
-            // 0.68 / 0.60 / 0.49 at -10), so the exact step is claimed only inside its own domain.
-            // THERE IS NO "MOVE g AND c TOGETHER" STEP, and there used to be. Moving both by the same
-            // amount is exact — it is the scale law — but exact at a FROZEN DRIVE, and the drive is the
-            // thing the search is supposed to minimise. Measured on the same programme and the same
-            // request (-14 LUFS, -1 dBTP), with only the starting gain changed: from 0 dB the answer was
-            // 8.5 dB of drive, no limiting at all, PLR 11.9 and LRA 4.1; from 55 dB it was **47.6 dB of
-            // drive, 38.05 dB of limiter gain reduction, PLR 4.6, LRA 0.10 — and status Solved**. Same
-            // loudness, same peak, a crushed master, and no way for the caller to tell. Worse, adding
-            // `minPlrDb = 8` turned the second one into `TargetUnreachable` while the first stayed
-            // Solved: the verdict depended on where the search happened to start. The ceiling now tracks
-            // the aim on every step, in both directions, so a warm start unwinds instead of freezing.
+            // "IDLE" HERE IS STRICTER THAN THE REQUEST'S `activityThresholdDb`, and deliberately so.
+            // The two words look like they should agree -- `activeFraction` counts samples with
+            // |GR| > `activityThresholdDb` -- but they gate different things. That one describes a
+            // render for the CALLER; this one licenses the exact 1:1 step below, which is an identity
+            // (`J(d) = J(d0) + (d - d0)`) and holds only while the chain is a plain multiply. A limiter
+            // doing 0.09 dB is inactive by the report's standard and NOT a plain multiply.
+            //
+            // WHAT THIS DOES NOT CLAIM is that the loose form would be harmless. Two measurements of it
+            // disagree, and the disagreement is between FIXTURES rather than between readings: on the
+            // shipped test rig, a warm start above the target moves the delivered loudness by up to
+            // 0.09 LU with the pass count unchanged; on a standalone probe over the same programme and
+            // the same targets it is bit-identical. Both were run; neither is wrong. What settles the
+            // choice is not inertness but the arithmetic: with a worst reduction of `h`, the exact step
+            // is wrong by the loudness that reduction cost (call it e, in [0, h]) and the conservative
+            // end of the bracket below is wrong by `h - e`. They are mirror images of one bound, and
+            // which is smaller is a property of the material. The identity is the thing this code can
+            // actually prove, so it is the thing it is allowed to assume.
             const bool limiterIdle = m.limiter.valid && m.limiter.maxDb <= 0.0;
-            const double headroomToEngage = c - m.limiterMaxReconstructedPeakDb;   // dB of gain left before
-                                                                                   // the limiter starts working
+            // dB of DRIVE left before the limiter starts working. `c - maxReconstructedPeak` is the same
+            // number in either coordinate system: the limiter engages at `d = -R(p)`, and
+            // `R(p) = maxReconstructedPeak - g`.
+            const double headroomToEngage = c - m.limiterMaxReconstructedPeakDb;
             if (limiterIdle && std::isfinite (headroomToEngage))
             {
-                anchorG = g + headroomToEngage;
-                anchorI = m.integratedLufs + headroomToEngage;   // exact: the idle chain is a multiply
+                anchorD = dNow + headroomToEngage;
+                anchorJ = jNow + headroomToEngage;       // exact: while idle the chain is a multiply
                 haveAnchor = true;
             }
-            if (limiterIdle && shift <= headroomToEngage)
+
+            if (limiterIdle && dj <= headroomToEngage)
             {
-                nextG = g + shift;                                // exact
+                nextD = dNow + dj;                       // exact, and it stays exact under a moving ceiling
             }
             else
             {
-                // The target is above what this drive delivers and the limiter is working, so the SHAPE
-                // has to change and a slope is needed.
-                //
-                // THE LOCAL SECANT, and it has to be local. Taking it from the two points that BRACKET
-                // the target uses whichever pair is widest, and the far one usually sits in the idle
-                // region where the slope is exactly 1 — which over-estimates it and under-steps by the
-                // same factor every time. Measured on this suite before the change: a target of -10 LUFS
-                // walked -10.74, -10.33, -10.15 and ran out of budget, each step correcting only 55 % of
-                // its own error, because the slope was read as 0.94 where it was 0.55. The two most
-                // RECENT renders are the pair that describes where the search actually is.
+                // The local secant, in the coordinates where it is a slope. Prefer the anchor when the
+                // previous render is still in the idle region: pairing an active render with an idle one
+                // reads the slope as ~1 and under-steps by that factor.
                 double s = 1.0;
-                double pg = 0.0, pi = 0.0; bool pOk = false;
-                if (havePrev) { pg = prevG; pi = prevI; pOk = true; }
-                // Prefer the anchor when the previous render is still in the idle region: pairing an
-                // active render with an idle one reads the slope as ~1 and under-steps by that factor.
-                if (haveAnchor && (! pOk || pg < anchorG)) { pg = anchorG; pi = anchorI; pOk = true; }
-                if (pOk && std::fabs (g - pg) > 1.0e-9)
+                double pd = 0.0, pj = 0.0; bool pOk = false;
+                if (havePrev) { pd = prevD; pj = prevJ; pOk = true; }
+                if (haveAnchor && (! pOk || pd < anchorD)) { pd = anchorD; pj = anchorJ; pOk = true; }
+                if (pOk && std::fabs (dNow - pd) > 1.0e-9)
                 {
-                    const double sl = (m.integratedLufs - pi) / (g - pg);
-                    if (std::isfinite (sl) && sl > 0.02 && sl <= 1.2) s = sl;
+                    // NO SMALL-SLOPE REJECTION — the bound that stays is `sl <= 1.2`, which throws away
+                    // a slope steeper than the scale law allows (`J` cannot outrun `d`), plus the
+                    // non-positive and non-finite cases. A slope under 0.02 is not an
+                    // implausible measurement, it is the TRUTH in the saturated region, where more drive
+                    // buys almost no loudness; a floor of 0.02 there fell back to 1 and crept at a
+                    // fiftieth of the step the measurement called for — measured, a -5.4 LUFS target ran
+                    // out of ten renders 0.194 LU short and reported `PassLimit` where it now SOLVES.
+                    const double sl = (jNow - pj) / (dNow - pd);
+                    if (std::isfinite (sl) && sl > 0.0 && sl <= 1.2) s = sl;
                 }
-                else if (haveLo && haveHi && std::fabs (hiG - loG) > 1.0e-9)
-                    s = (hiI - loI) / (hiG - loG);
-                s = std::clamp (s, 0.05, 1.0);
-                // A PLAIN SECANT STEP, and the reason there is no over-relaxation factor on it is worth
-                // recording: `I(g)` is CONCAVE once the limiter engages (the slope falls from 1 to about
-                // 0.2 as the drive rises — measured on three real mixes: 0.99 at -14 LUFS against
-                // 0.68 / 0.60 / 0.49 at -10), so every extrapolated step lands SHORT and a deliberate
-                // over-step to force a bracket looks obviously right. Measured, it is not: a 1.25x reach
-                // moved a -12 LUFS solve from three renders to four, because the overshoot then had to be
-                // walked back. The curvature costs a pass either way; paying it as an honest under-step
-                // keeps the arithmetic explicable and leaves no tuned constant to go stale.
-                nextG = g + shift / s;
-                // A BRACKET IS A GUARANTEE AND A SECANT IS NOT. Once two renders straddle the target,
-                // any step outside the bracket is a step the pair already ruled out — and a secant on a
-                // gated, piecewise measure can produce exactly that. Falling back to the midpoint keeps
-                // the bracket shrinking, which is what makes a gate STEP detectable at all: without it
-                // the search wanders instead of closing on the discontinuity and could never say so.
-                if (haveLo && haveHi)
+                else if (haveLo && haveHi && std::fabs (hiD - loD) > 1.0e-9)
+                    s = (hiJ - loJ) / (hiD - loD);
+                // THE FLOOR IS 0.01, NOT 0.05, AND THE DIFFERENCE IS MEASURED. In the saturated region
+                // the honest secants run 0.019, 0.013, 0.011, 0.0089 — every one of them under 0.05, so
+                // the old floor replaced the measurement with a step twenty times too small on exactly
+                // the material where the search is already struggling. What makes a small slope safe to
+                // believe is not the floor but the physical bracket below, which bounds the STEP; the
+                // floor only has to stop a slope of zero from producing infinity.
+                //
+                // Measured over the four hardest cells of the corpus battery, floor 0.05 -> 0.01: every
+                // one improves on BOTH counts, renders and accuracy — 8->7, 9->7, 10->7 renders, error
+                // 0.075->0.054, 0.097->0.072, and a -5.3 LUFS target that was a `PassLimit` 0.122 LU
+                // short now SOLVES 0.090 short. Nothing else in the battery's 102 cells moves.
+                s = std::clamp (s, 0.01, 1.0);
+                nextD = dNow + dj / s;
+                // AND THE STEP IS BOUNDED BY PHYSICS — which is what the old `sl > 0.02` guard was
+                // reaching for and getting wrong, because it bounded the SLOPE (a measurement) where
+                // the thing that needed bounding was the STEP (a decision).
+                //
+                // Precisely, since the earlier wording claimed more than the code does: a floor on the
+                // slope REMAINS (`clamp(s, 0.05, 1.0)`, so a measured 0.01 still becomes 0.05) and so
+                // does an upper rejection (`sl <= 1.2` throws away a finite, positive 1.3). What the
+                // rewrite removed is the 0.02 REJECTION threshold — a slope below it used to be
+                // discarded in favour of the default 1.0, which is the fifty-fold overstep. The floor
+                // that stayed is a bound on the step size; the bracket below is what makes it safe.
+                //
+                // Two facts bound it, and both are already measured every pass. Below the drive at which
+                // the limiter engages the chain is a plain multiply, so `J` moves 1:1 there; above it the
+                // limiter can take away anything at all. The engagement point is known on EVERY render,
+                // active or not — `headroomToEngage = c - maxReconstructedPeak` is the distance to it —
+                // so for a step DOWNWARD the answer is trapped between "the limiter gave back nothing on
+                // the way down" and "it gave back all of it":
+                //
+                //     dNow + headroom + dj   <=   answer   <=   dNow + dj        (for dj < 0)
+                //
+                // and for a step UPWARD only the lower end survives, because the slope above engagement
+                // may be anything down to zero. Without this, a slope measured in the saturated region —
+                // genuinely near zero, and now correctly so — turned a -8.96 dB requirement into a 179 dB
+                // step, landed on the -60 dB clamp, rendered digital silence and spent a pass climbing
+                // back: a four-render budget ended at -12.993 LUFS against a target of -10.000. With it,
+                // the same request solves in THREE -- the figure said four until the diff pass counted
+                // it. Getting the direction of the bound wrong is its own
+                // trap: clamping to the conservative end alone left a +55 dB warm start creeping 8 dB a
+                // render and out of budget at -8.33.
+                if (dj > 0.0)
+                    nextD = std::fmax (nextD, dNow + dj);
+                else if (dj < 0.0)
                 {
-                    const double bLo = std::fmin (loG, hiG), bHi = std::fmax (loG, hiG);
-                    if (! (nextG > bLo && nextG < bHi)) nextG = 0.5 * (bLo + bHi);
+                    const double a = dNow + dj, b = dNow + headroomToEngage + dj;
+                    nextD = std::clamp (nextD, std::fmin (a, b), std::fmax (a, b));
                 }
-                // ... and the ceiling TRACKS the aim, 1:1 and in both directions, because that is exactly
-                // what `c` does to the delivered peak. Falling only would ratchet: one exploratory
-                // over-drive pushes it below what the delivery needs and it never comes back, so the
-                // limiter keeps working harder than the promise asked for ever after — which is also how
-                // a warm start used to freeze a crushed answer. The cap at `pmax` keeps the promise; the
-                // floor is the search's own business.
-                nextC = std::min (pmax, c + (aim - m.truePeakDbTp));
+                // A BRACKET IS A GUARANTEE AND A SECANT IS NOT. The two sides are kept in `d` as well,
+                // and which side each is on is re-decided against the CURRENT requirement — an entry
+                // recorded under an older ceiling can otherwise sit on the wrong side of it.
+                if (haveLo && haveHi && (loJ - jReq) * (hiJ - jReq) < 0.0)
+                {
+                    const double bLo = std::fmin (loD, hiD), bHi = std::fmax (loD, hiD);
+                    if (! (nextD > bLo && nextD < bHi)) nextD = 0.5 * (bLo + bHi);
+                }
             }
-            if (! std::isfinite (nextG) || ! std::isfinite (nextC)) break;
-            nextC = std::min (nextC, pmax);      // the caller's ceiling is a bound, never a starting point
-            // CLAMPED BEFORE THE MOVEMENT TEST, not after it. Testing the UNCLAMPED step against the
-            // current point says "it moved" while the actuator is pinned, so the search re-renders the
-            // same point until the budget runs out and then reports `PassLimit` — a verdict about the
-            // budget for something that is a fact about the material. Measured: a target of +20 LUFS on
-            // a -63 LUFS tone rendered g = 60 three times and came back `PassLimit` with nothing bound.
+
+            double nextG = nextD + nextC;
+            // `nextC` is finite and already `<= pmax` by construction above; only `nextG` can arrive
+            // non-finite here, through `nextD`. The second half of this test and the `min (nextC, pmax)`
+            // that used to follow it were both dead — kept only the live one.
+            if (! std::isfinite (nextG)) break;
             const double clG = std::clamp (nextG, -kMaxGainDb, kMaxGainDb);
             const double clC = std::clamp (nextC, -kMaxGainDb, kMaxGainDb);
-            const bool pinned = (std::fabs (clG - nextG) > 1.0e-9);
-            if (std::fabs (clG - g) < 1.0e-6 && std::fabs (clC - c) < 1.0e-6)
+            // THE ACTUATOR'S LIMIT IS RECORDED IN BOTH DIRECTIONS AND JUDGED AT THE END, not the moment
+            // an exploratory step touches it. Recording it immediately named `GainRange` for a target the
+            // search simply had not looked at yet; testing only `shift > 0` lost the other bound
+            // entirely, so a target 3 dB below what -60 dB delivers came back as a pass limit.
+            const bool clamped = (std::fabs (clG - nextG) > 1.0e-9);
+            // ALREADY AT THE CLAMP AND STILL ASKING TO GO PAST IT. That is the actuator's limit, and it
+            // is judged on the GAIN alone: if the gain cannot rise and more loudness is wanted, the
+            // ceiling cannot rescue it — lowering it makes the render quieter and raising it is capped
+            // at the promise. Testing the pair (gain AND ceiling both still) instead let a ceiling that
+            // was merely still tracking its aim hide the pin, and the verdict came back `PassLimit`.
+            // The distinction from an exploratory touch is the `clG == g` half: a step that MOVES to the
+            // clamp is a step the search has not evaluated yet, and naming it would be a verdict about a
+            // target nobody has looked at — measured, that called a -25 LUFS target unreachable that
+            // `g = -18.99` delivers exactly.
+            // THE CEILING NEVER STANDS STILL AT 1e-6. The true peak jitters by a couple of parts in a
+            // million from render to render, so `clC` keeps moving by ~2e-6 forever and this test never
+            // fires: measured, six consecutive renders at g = +60, c = -1.11132 +- 2e-6 with identical
+            // audio, five of eleven renders carrying no information at all. The resolution that matters
+            // is the one `bracketClosed` already uses.
+            if (std::fabs (clG - g) < 1.0e-6 && std::fabs (clC - c) < 1.0e-3)
             {
-                // The actuator is where the search wanted to go and the target is still not met: that is
-                // the gain range binding, and it has a name.
-                if (pinned) best.forceViolation (constraintBit (MasteringConstraint::GainRange));
-                else        stoppedOnResolution = true;
+                if (! clamped) stoppedOnResolution = true;
                 break;
             }
             nextG = clG; nextC = clC;
-            prevG = g; prevI = m.integratedLufs; havePrev = true;
+            prevD = g - c; prevJ = m.integratedLufs - c; havePrev = true;
             g = nextG; c = nextC;
         }
 
@@ -700,10 +796,77 @@ public:
         // both outside tolerance, and a gain gap too small to hold anything between them, is not a
         // failure to converge and not a constraint. Saying so is the only honest verdict, and it carries
         // both sides so a caller can choose which one to take.
+        // ORDER: A BROKEN LIMIT OUTRANKS "NOT EXACTLY ACHIEVABLE", and it did not.
+        //
+        // The two verdicts answer different questions and the wrong one used to win. "The target lies
+        // between two achievable values" is a statement about the SEARCH — it needs the candidate
+        // NEAREST the target — while `best` is the candidate that gets DELIVERED, which when nothing is
+        // feasible is deliberately the gentlest rather than the nearest. Testing `best.err` therefore
+        // asked "how far is the render I am handing back from the target", got a large answer because
+        // the search had walked away from a target it could not legally reach, and reported that
+        // distance as a resolution limit — hiding the constraint violations entirely (`alsoViolated` is
+        // only filled on the unreachable path).
+        //
+        // Measured, and this is a mutation that found a defect in the CLEAN code rather than a hole in
+        // the suite: a request with `maxLraLossLu = 0.01` and `minPlrDb = 40` — both broken by every
+        // candidate — came back `TargetBetweenAchievable`, binding `None`, mask `0x0`, delivering
+        // -19.29 LUFS against a target of -24. The truth is that -24 IS reachable and costs the
+        // loudness range and the peak-to-loudness ratio the caller forbade.
+        //
+        // So: constraints first, and the between-achievable test reads the NEAREST candidate's error.
+        // THE ACTUATOR'S LIMIT IS A STATE, NOT AN EVENT. Recording it only when a step tried to walk
+        // past the clamp made the verdict depend on the pass BUDGET rather than on the material: the
+        // search renders at +60 dB, the budget ends, and the one extra iteration that would have
+        // noticed the pin never runs. Measured on the suite's own generator, target -5.3 LUFS: with
+        // `maxPasses = 10` the answer was `PassLimit` with an empty mask at g = +60.000, with 11 it was
+        // `Unreachable / GainRange` -- same input, same delivered audio, two different verdicts.
+        //
+        // So it is decided here from what was actually RENDERED: the last render sat at the clamp, the
+        // target is still outside tolerance, and closing the gap needs gain the range does not have.
+        // Reading the last render rather than the next STEP also keeps the extrapolation out of it --
+        // a step's direction can disagree with the measurement it was extrapolated from, and did.
+        // JUDGED ON THE LAST RENDER, both halves. Reading `best.err` for "did we succeed" while
+        // reading `lastI` for "which way is the target" mixes two different renders: `best` is the
+        // candidate that gets DELIVERED, and when nothing is feasible that is deliberately the gentlest
+        // rather than the nearest. A last render inside tolerance but breaking the ceiling would then
+        // pick up `GainRange` on top of the true-peak violation that is the real answer.
+        if (haveLastRender && best.have && std::fabs (target - lastI) > req.toleranceLu)
+        {
+            const double want = target - lastI;                 // > 0 asks for more gain
+            // THE CEILING IS AN ACTUATOR TOO, and on the loud side it has not necessarily been tried.
+            // `c` only ever tracks the true-peak aim, so a caller who starts it far below the promise
+            // leaves real loudness on the table: raising `c` by one dB raises `I` by about one, and
+            // until `c` reaches `pmax` the gain node is not the only thing that could close the gap.
+            // Measured: a start of `g = +60, c = -40` with one render's budget was called
+            // `Unreachable / GainRange` for a -25 LUFS target that `g = -18.99, c = -1.05` delivers
+            // exactly — the search had 39 dB of untried ceiling and a verdict saying it had none.
+            // On the QUIET side there is no such escape: `nextC` never lowers the ceiling to chase a
+            // quiet target, so the gain node really is the only actuator and the pin stands.
+            //
+            // `want > 0.0` IS REDUNDANT ON THIS SIDE and kept only as the written intent: `nextC` is
+            // `min(pmax, ...)`, so `c <= pmax` always and `ceilingLeft >= 0`, hence `want > ceilingLeft`
+            // already implies `want > 0`. The mutation stand proved it — dropping the term changes no
+            // answer on any input — and it is recorded here rather than removed because the quiet arm
+            // below has no such implication and needs its own direction test to stay legible.
+            const double ceilingLeft = pmax - lastC;
+            if (lastG >=  kMaxGainDb - 1.0e-6 && want > 0.0 && want > ceilingLeft) pinnedDir = +1;
+            if (lastG <= -kMaxGainDb + 1.0e-6 && want < 0.0) pinnedDir = -1;
+        }
+
+        // CLOSED ON BOTH KNOBS. The sides are keyed on drive now, but this test still compared gains
+        // only, and two renders at the SAME gain with different ceilings have a gap of exactly zero:
+        // `(60, -40)` and `(60, -1.05)` straddle a -25 LUFS target, pass the gap test, and report
+        // `TargetBetweenAchievable` for a target that is simply reachable. The interval has to be small
+        // in the coordinate the search actually moves in, which is both of them.
         const bool bracketClosed = haveLo && haveHi && std::fabs (hiG - loG) <= 1.0e-3
+                                && std::fabs (hiC - loC) <= 1.0e-3
                                 && std::fabs (loI - target) > req.toleranceLu
                                 && std::fabs (hiI - target) > req.toleranceLu;
-        if (bracketClosed || (stoppedOnResolution && best.have && best.err > req.toleranceLu))
+        const bool betweenAchievable = best.nearestViolated == 0
+                                    && (bracketClosed
+                                        || (stoppedOnResolution && best.nearestHave
+                                            && best.nearestErr > req.toleranceLu));
+        if (betweenAchievable)
         {
             sol.status = MasteringSolveStatus::TargetBetweenAchievable;
             if (bracketClosed)
@@ -723,11 +886,20 @@ public:
                 sol.gainBelowDb       = sol.gainAboveDb       = best.g;
             }
         }
-        else if (best.nearestViolated != 0)
+        else if (best.nearestViolated != 0 || (pinnedDir != 0 && best.have && best.err > req.toleranceLu))
         {
+            // THE ACTUATOR'S LIMIT IS JUDGED HERE, at the end, and in both directions. Recording it the
+            // moment an exploratory step touched +-60 dB named `GainRange` for a target the search had
+            // simply not looked at yet — measured, a start of +55 dB with the caller's ceiling at -40
+            // reported `Unreachable / GainRange` for a target that `g = -18.99` delivers exactly. And
+            // testing only the loud direction lost the quiet one: a target 3 dB below what -60 dB
+            // delivers came back a pass limit with nothing named.
+            std::uint32_t viol = best.nearestViolated;
+            if (pinnedDir != 0 && best.have && best.err > req.toleranceLu)
+                viol |= constraintBit (MasteringConstraint::GainRange);
             sol.status  = MasteringSolveStatus::TargetUnreachable;
-            sol.binding = bindingOf (best.nearestViolated);
-            sol.alsoViolated = best.nearestViolated;
+            sol.binding = bindingOf (viol);
+            sol.alsoViolated = viol;
         }
         else
         {
@@ -777,6 +949,14 @@ private:
     //                  search would have delivered if nothing constrained it, so its violations are the
     //                  ones that stopped it. ORing violations across every render tried instead would
     //                  name constraints broken by an exploratory step the search had already left.
+    // `exc == excess` COMPARES TWO DOUBLES FOR EQUALITY ON PURPOSE, and the obvious hardening is wrong.
+    // Replacing it with a tolerance window (`fabs(exc - excess) <= 1e-12`) looks strictly safer and is
+    // not: `minPlrDb` may legally be `+infinity` — the API rejects only NaN — and then every candidate's
+    // excess is `+infinity`, `fabs(inf - inf)` is NaN, every comparison against it is false, and the
+    // ranking freezes on whatever was offered first. Measured: target -20 LUFS came back at -6.014 with
+    // the gain still at its starting 0 dB, fourteen LU out, where the equality delivers -20.000 exactly.
+    // Equality is what makes the infinite case tie and fall through to the distance test.
+
     struct Best
     {
         double g = 0.0, c = 0.0, err = std::numeric_limits<double>::infinity();
@@ -788,9 +968,6 @@ private:
         std::uint32_t nearestViolated = 0;
         bool nearestHave = false;
 
-        // A constraint the SEARCH ran into rather than a render — the actuator range is the only one of
-        // those, because it is a property of the chain's knobs and not of any output.
-        void forceViolation (std::uint32_t bit) noexcept { nearestViolated |= bit; nearestHave = true; }
 
         void offer (double gg, double cc, const MasterMeasurement& mm, bool feas, double e,
                     double exc, std::uint32_t viol) noexcept

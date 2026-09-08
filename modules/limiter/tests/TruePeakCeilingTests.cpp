@@ -1600,6 +1600,43 @@ int main()
             limiter::TruePeakLimiterTap t2 { exact.data(), nullptr, (int) exact.size() };
             test::run (L.process (p, 1, n, t2));
         }
+
+        // (d) THE PEAK TRACE IS THE SAMPLE'S OWN PEAK, TAKEN BEFORE THE SLIDING WINDOW. Reporting the
+        //     sliding maximum instead leaves the same overall maximum — so a test that only checks
+        //     `maxReconstructedPeakDb()` passes either way, and one did. What separates them is the
+        //     SHAPE: an isolated impulse marks a handful of oversampled samples in the true trace and a
+        //     whole lookahead window in the sliding one.
+        {
+            limiter::TruePeakLimiter L;
+            test::ok (L.prepare (fs, 4096, 1, cfg), "tap: prepare (trace shape)");
+            limiter::TruePeakLimiterParams q; q.ceilingDbTp = -6.0; q.releaseMs = 50.0;
+            L.setParams (q);
+            const int m = 4096, hit = 2048;
+            std::vector<float> imp ((std::size_t) m, 0.0f);
+            imp[(std::size_t) hit] = 0.8f;
+            std::vector<float> pk2 ((std::size_t) m * (std::size_t) F, 0.0f);
+            float* ip[1] = { imp.data() };
+            limiter::TruePeakLimiterTap t { nullptr, pk2.data(), (int) pk2.size() };
+            test::run (L.process (ip, 1, m, t));
+
+            double top = 0.0;
+            for (float v : pk2) top = std::max (top, (double) v);
+            test::ok (top > 0.4, "precondition: the impulse reached the detector (" + std::to_string (top) + ")");
+            int above = 0;
+            for (float v : pk2) if ((double) v > 0.5 * top) ++above;
+            // The lookahead is 1 ms = 48 baseband samples = 192 oversampled ones; the interpolation FIR
+            // spreads an impulse over far fewer than that. Half the window is the separating line, and
+            // both sides of it are far from it.
+            const int lookOs = L.lookaheadSamples() * F;
+            test::ok (lookOs >= 100, "precondition: the lookahead window is wide enough to separate the two "
+                                     "(" + std::to_string (lookOs) + " oversampled samples)");
+            test::ok (above < lookOs / 2,
+                      "the peak trace marks the impulse, not the whole lookahead window (" +
+                      std::to_string (above) + " samples above half-peak, window " +
+                      std::to_string (lookOs) + ")");
+            std::printf ("      peak trace: %d oversampled samples above half-peak, lookahead window %d\n",
+                         above, lookOs);
+        }
     }
 
     return test::report();
