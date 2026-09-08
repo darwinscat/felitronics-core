@@ -212,14 +212,20 @@ public:
         prepared_ = false;                       // a refused sub-prepare leaves the player unprepared
         for (auto& f : fir_) if (! f.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
         if (! dry_.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
-        // 🔴 THE DRY PATH HAS TO BE DELAYED BY WHAT THE WET PATH COSTS, or the blend is a comb filter.
-        // The mix below sums `a` (through the models, hence through their rate-match) with `d` (through
-        // the dry FIR only). Those two are misaligned by exactly latencySamples(), and summing them
-        // notches at fs/(2·D). This was ALREADY wrong before P34 — with the cubic's 3.84 samples the
-        // first null sat at ~5.7 kHz — but nobody had put a number on it; P34's 61.4 samples move that
-        // null to 359 Hz, into the part of the spectrum a guitar actually lives in, and make it deep.
-        // Capacity 256 covers the largest rate-match this can report (192 kHz host / 48 kHz model =
-        // 160 samples); kMaxDelay is 128 and would NOT.
+        // 🔴 THE DRY PATH HAS TO BE DELAYED BY WHAT THE WET PATH COSTS, or the blend is a COMB FILTER.
+        // The mix in process() sums `a` (through the models, hence through their rate-match) with `d`
+        // (the DI, through the dry FIR only). Those two are misaligned by exactly latencySamples(), and
+        // summing them notches at fs/(2·D) with every odd multiple above it.
+        //
+        // This was ALREADY wrong before P34 and nobody had put a number on it: with the cubic's 3.84
+        // samples the first null sat at 5742 Hz. P34's 61.4 samples move it to 359 Hz — the body of a
+        // guitar, not a phasey top — and the host cannot fix it, because latencySamples() reports the
+        // whole player's PDC outward while this notch is INTERNAL to the blend. Measured on a 50/50
+        // blend, worst dip across 100 Hz … 10 kHz: -50 dB unaligned against 0.00 dB aligned.
+        //
+        // Capacity: it must EXCEED the delay it will ever hold (DryAligner clamps to [0, capacity-1]).
+        // The largest this can report is a 192 kHz host against a 48 kHz model — D·(1 + 4) = 160 — so
+        // 256 covers it with margin. `kMaxDelay` is 128 and would silently clamp.
         dryLatency_.prepare(channels_, maxBlock_, 256);
         for (int c = 0; c < kMaxChannels; ++c) {
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
@@ -783,8 +789,19 @@ public:
             // the whole economy of a blend. Taken ahead of the pre-model tone — the hardware's dry path
             // leaves at the input jack.
             const bool mixDry = dryActive_.load(std::memory_order_acquire);
-            if (mixDry)
-                for (int c = 0; c < channels_; ++c) std::copy(a[c], a[c] + count, d[c]);
+
+            // 🔴 THE DRY PATH IS DELAYED BY WHAT THE WET PATH COSTS, and the delay is taken UNCONDITIONALLY.
+            // The blend below sums `a` (through the models, hence through their rate-match) with `d`; those
+            // two are misaligned by exactly latencySamples() unless something holds the dry back, and
+            // summing them notches at fs/(2·D). See prepare() for the numbers and the history.
+            // Advancing only while the blend is ON would be the classic cold-ring bug — DryAligner.h says
+            // it in as many words: a ring fed only while a stage runs is COLD the moment it is first read
+            // and emits its latency in zeros. Turning the dry knob up would then start with D samples of
+            // silence in the dry leg. The copy costs one pass over the block when the blend is off, which
+            // is nothing beside two neural models.
+            for (int c = 0; c < channels_; ++c) std::copy(a[c], a[c] + count, d[c]);
+            dryLatency_.advance((const float* const*) d, channels_, count, latencySamples());
+            for (int c = 0; c < channels_; ++c) std::copy_n(dryLatency_.delayed(c), count, d[c]);
 
             // The knobs that sit BEFORE the distortion in the hardware, shaping what gets distorted.
             runBands(0, a, count);
@@ -892,9 +909,6 @@ public:
             // gains the pack states for this position.
             if (mixDry) {
                 if (! dryFirBypass_.load(std::memory_order_acquire)) ok = dry_.process(d, channels_, count) && ok;
-                // …and then align it to the wet path. A pure delay commutes with the dry FIR, so the
-                // order here is a readability choice, not a signal one. See prepare() for why it exists.
-                dryLatency_.advance(d, channels_, count, latencySamples());
                 const float wantDry = dryGain_.load(std::memory_order_acquire);
                 const float wantWet = wetGain_.load(std::memory_order_acquire);
                 const float decay   = std::exp(-(float) count / (float) (0.010 * fs_));

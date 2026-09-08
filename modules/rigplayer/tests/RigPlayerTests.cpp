@@ -1167,5 +1167,107 @@ int main() {
         approx(b.gainAt(1000.0), 0.5, 0.01, "loaded again, sounding again");
     }
 
+    // ================================================================================================
+    group("🔴 THE DRY/WET BLEND MUST NOT COMB — the rate-match delay belongs to BOTH legs");
+    {
+        // WHAT THIS IS FOR. The mix in process() sums `a` — which has been through the models, hence
+        // through their rate-match — with `d`, the DI. Nothing used to hold `d` back, so the two were
+        // misaligned by exactly latencySamples() and their sum was a COMB FILTER with its first null at
+        // fs/(2·D). That is not a new defect: with the Catmull-Rom cubic's 3.84 samples the null sat at
+        // 5742 Hz and nobody had put a number on it. P34's 64-tap kernel makes D = 61.4 samples and
+        // moves the null to 359 Hz — the body of a guitar, not a phasey top.
+        //
+        // 🔴 AND THE HOST CANNOT FIX IT. latencySamples() reports the whole player's PDC outward, so a
+        // DAW delays everything downstream equally; this notch is INTERNAL to the blend, between two
+        // legs of the same signal. The only place it can be fixed is here.
+        //
+        // The fixture is built so that the ONLY difference between the two legs is the models and their
+        // rate-match: the dry curve is flat, and magnitudeCurveToFir returns {} for anything under
+        // 0.05 dB, so the dry FIR is bypassed; the tone controls sit at their reference positions, so
+        // the wet FIRs are empty too; and the models are memoryless Linear gains. Anything left that is
+        // not flat across frequency is the misalignment.
+        auto combRig = [] {
+            auto rig = testRig();
+            auto& mix = rig.chain[0].blend.front();
+            mix.dryLevelDb = 0.0;                       // no dry trim: a true 50/50 at the middle
+            mix.defaultValue = "150";
+            namz::rig::BlendPosition dryEnd; dryEnd.value = "0";   dryEnd.norm = 0.0; dryEnd.dryDb = 0.0;    dryEnd.wetDb = -120.0;
+            namz::rig::BlendPosition half;   half.value   = "150"; half.norm   = 0.5; half.dryDb   = 0.0;    half.wetDb   = 0.0;
+            namz::rig::BlendPosition wetEnd; wetEnd.value = "300"; wetEnd.norm = 1.0; wetEnd.dryDb = -120.0; wetEnd.wetDb = 0.0;
+            mix.positions = { dryEnd, half, wetEnd };
+            return throughTheFormat(rig);
+        };
+
+        // 44.1 kHz on purpose: the models are tagged 48 000, so this is the rate at which NamStage
+        // engages its rate-matcher at all. At 48 kHz there is no resampler and nothing to align.
+        Bench b(combRig(), 1, 44100.0);
+        ok(b.p.setDial("mix", 150.0), "the blend knob takes the middle of its travel");
+
+        // ---- PRECONDITIONS. Without these the sweep below is a fixture that cannot fail. ----------
+        // ORDER MATTERS HERE, and the first draft got it wrong in a way worth recording: the load is
+        // posted by the Bench constructor and SERVICED from inside the audio loop, so a player that has
+        // not yet run a block still has empty slots and reports 0 samples of latency. The precondition
+        // caught it — reading "D = 0" and passing a beautifully flat sweep is exactly the blind fixture
+        // this is here to prevent — so the measurement runs first and the claim about it second.
+        const double atHalf = b.gainAt(1000.0);
+
+        const int lat = b.p.latencySamples();
+        ok(lat > 0, "precondition 1: at 44.1 kHz the WET leg really is delayed — the player reports "
+                    + std::to_string(lat) + " samples of rate-match latency. At 48 kHz this would be 0 "
+                    "and the whole group would pass while measuring nothing");
+
+        // …and the dry path is genuinely IN THE SUM. A blend that silently sat at full wet would give a
+        // beautifully flat sweep and prove nothing, which is the same shape of blindness one level up.
+        ok(b.p.setDial("mix", 300.0), "…and the knob reaches its wet end");
+        const double atWet = b.gainAt(1000.0);
+        ok(b.p.setDial("mix", 0.0), "…and its dry end");
+        const double atDry = b.gainAt(1000.0);
+        ok(b.p.setDial("mix", 150.0), "…and comes back to the middle");
+        ok(std::fabs(atHalf - atWet) > 0.2 * std::max(atHalf, atWet),
+           "precondition 2: the dry path is audibly IN the sum — 50/50 reads "
+           + std::to_string(atHalf) + " against " + std::to_string(atWet) + " at the wet end, a "
+           + std::to_string(100.0 * std::fabs(atHalf - atWet) / std::max(atHalf, atWet)) + " % difference");
+
+        // precondition 3: the two legs are COMPARABLE in level, so a null can actually form. A comb's
+        // depth is set by how equal its two arms are — |1 - g| against |1 + g| — so a blend where one
+        // leg is 40 dB below the other would ripple by a fraction of a dB even completely unaligned,
+        // and the sweep below would pass on a broken player. Measured here: dry-only "
+        // + atDry + ", wet-only " + atWet + ", i.e. within a few dB of each other.
+        std::printf("      legs at 1 kHz: dry-only %.4f, wet-only %.4f, 50/50 %.4f\n", atDry, atWet, atHalf);
+        ok(std::fabs(db(atDry) - db(atWet)) < 12.0,
+           "precondition 3: the two legs are within " + std::to_string(std::fabs(db(atDry) - db(atWet)))
+           + " dB of each other, so a misalignment CAN null them — a lopsided blend would ripple by "
+             "almost nothing however badly it were aligned");
+
+        // ---- THE SWEEP. Frequencies chosen AGAINST the defect, not on a round grid: the first three
+        // nulls of an unaligned 61.4-sample comb sit at fs/(2D)·{1,3,5} = 359 / 1077 / 1796 Hz, and the
+        // peaks between them at fs/D·{1,2} = 718 / 1436. A grid of decades would have straddled all of
+        // them and read almost flat. --------------------------------------------------------------
+        const double probes[] = { 100.0, 359.1, 500.0, 718.2, 1077.4, 1436.5, 1795.6, 3000.0, 6000.0, 10000.0 };
+        double lo = 1e9, hi = 0.0, loAt = 0.0, hiAt = 0.0;
+        for (const double f : probes) {
+            const double g = b.gainAt(f);
+            if (g < lo) { lo = g; loAt = f; }
+            if (g > hi) { hi = g; hiAt = f; }
+        }
+        std::printf("      50/50 blend at 44.1 kHz, D = %d: response spans %.4f (%.0f Hz) .. %.4f (%.0f Hz)"
+                    " = %.3f dB\n", lat, lo, loAt, hi, hiAt, db(hi) - db(lo));
+        ok(db(hi) - db(lo) < 0.5,
+           "the blend is FLAT across the comb's own null frequencies (" + std::to_string(db(hi) - db(lo))
+           + " dB of ripple over 100 Hz .. 10 kHz). MEASURED on this fixture with the alignment removed:"
+             " 9.54 dB of ripple, the minimum landing on one of the comb's nulls (359 or 1077 Hz — they"
+             " are equally deep and which reads lowest is float rounding) and the maximum at 1436 Hz,"
+             " which is the peak between them. Depth is set by how equal the legs are: dry 1.00 against"
+             " wet 0.50 gives |1-0.5| against |1+0.5| = 9.54 dB, and a true 50/50 would null completely."
+             " The threshold is 0.5 dB, a factor of nineteen under the measurement");
+
+        // …and the deepest single probe is the one the defect would have destroyed. Asserted on its own
+        // so a failure names the frequency instead of a span.
+        const double atNull = b.gainAt(359.1);
+        ok(db(atNull) - db(atHalf) > -0.5,
+           "359.1 Hz — the first null of an unaligned 61.4-sample comb — is within half a dB of 1 kHz ("
+           + std::to_string(db(atNull) - db(atHalf)) + " dB), not in a notch");
+    }
+
     return felitronics::test::report();
 }
