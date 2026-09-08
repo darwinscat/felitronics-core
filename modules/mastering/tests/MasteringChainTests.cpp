@@ -973,6 +973,70 @@ static void testResolvedReadback()
 }
 
 //==============================================================================
+// A parameter set written BEFORE prepare() has to survive it, and the readback straight after prepare()
+// has to describe the prepared chain rather than the previous one. Both were false: `prepare()` ended
+// with `pendingParams_ = params_`, which replaced the caller's pending write with the last APPLIED set.
+static void testParamsWrittenBeforePrepare()
+{
+    group ("setParams() before prepare() is KEPT, and the readback is not stale");
+
+    const int nch = 1;
+    auto cfg = fullConfig();
+    cfg.eq = false; cfg.monoBass = false; cfg.compressor = false; cfg.clipper = false;
+    cfg.limiter = false; cfg.dither = false;               // gain nodes only: the effect is unmistakable
+
+    mastering::MasteringChain chain;
+    mastering::MasteringChainParams prm;
+    prm.inputGainDb = 12.0;
+    chain.setParams (prm);                                 // BEFORE prepare
+    ok (chain.prepare (48000.0, nch, cfg), "prepare after setParams");
+    approx (chain.params().inputGainDb, 12.0, 0.0, "params() reports the set written before prepare()");
+
+    const int n = 4 * cfg.internalBlock;
+    Buf x ((std::size_t) nch, std::vector<float> ((std::size_t) n, 0.1f));
+    { auto p = planes (x); felitronics::test::run (chain.process (p.data(), nch, n)); }
+    // PRECONDITION: past the chain's latency, so the sample examined is a processed one and not priming.
+    const int probe = cfg.internalBlock + 44;
+    ok (probe < n && probe > chain.latencySamples() - 1, "precondition: the probed sample is past the priming");
+    approx ((double) x[0][(std::size_t) probe], 0.1 * std::pow (10.0, 12.0 / 20.0), 1e-6,
+            "the audio carries the gain that was set before prepare()");
+
+    // And the same value applied the other way round must give the same audio — the two orders are one
+    // behaviour, which is what "kept" means.
+    mastering::MasteringChain c2;
+    ok (c2.prepare (48000.0, nch, cfg), "prepare then setParams");
+    c2.setParams (prm);
+    Buf y ((std::size_t) nch, std::vector<float> ((std::size_t) n, 0.1f));
+    { auto p = planes (y); felitronics::test::run (c2.process (p.data(), nch, n)); }
+    long long bad = 0;
+    for (int i = 0; i < n; ++i) if (bits (x[0][(std::size_t) i]) != bits (y[0][(std::size_t) i])) ++bad;
+    ok (bad == 0, "configure-then-prepare is bit-identical to prepare-then-configure");
+
+    // A REFUSED prepare() must not adopt the pending set either — law 11(b) says a refused prepare
+    // leaves the object unusable, and an unusable object reporting new parameters is a lie about both.
+    mastering::MasteringChain c3;
+    mastering::MasteringChainParams other; other.inputGainDb = -30.0;
+    c3.setParams (other);
+    ok (! c3.prepare (-1.0, nch, cfg), "a bad sample rate is refused");
+    ok (! c3.isPrepared(), "a refused prepare leaves the chain unprepared");
+    ok (c3.latencySamples() == 0, "a refused prepare reports no latency");
+
+    // RE-PREPARE with a write still pending. The keep-the-pending-set rule has two cases and only one
+    // of them is "a fresh object": a chain that has already run, is written to, and is then prepared
+    // again for a new stream must carry that write into the new stream rather than the last one it
+    // applied. It is the same line that used to discard it.
+    mastering::MasteringChain c4;
+    ok (c4.prepare (48000.0, nch, cfg), "re-prepare: first preparation");
+    { Buf z ((std::size_t) nch, std::vector<float> ((std::size_t) n, 0.05f));
+      auto p = planes (z); felitronics::test::run (c4.process (p.data(), nch, n)); }
+    mastering::MasteringChainParams later; later.inputGainDb = -6.0;
+    c4.setParams (later);                                  // pending, never applied
+    ok (c4.prepare (44100.0, nch, cfg), "re-prepare: at a new rate, with a write still pending");
+    approx (c4.params().inputGainDb, -6.0, 0.0, "re-prepare KEEPS the pending write, not the applied one");
+    approx (c4.sampleRate(), 44100.0, 0.0, "re-prepare reports the new rate");
+}
+
+//==============================================================================
 static void testMonoBassParams()
 {
     group ("stereo::MonoBassParams — the added type is exactly the three setters");
@@ -1025,6 +1089,7 @@ int main()
     testMutationGaps();
     testRtSafety();
     testResolvedReadback();
+    testParamsWrittenBeforePrepare();
     testMonoBassParams();
     return felitronics::test::report();
 }

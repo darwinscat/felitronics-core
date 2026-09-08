@@ -13,7 +13,11 @@ target_link_libraries(felitronics_mastering INTERFACE
     felitronics::saturation
     felitronics::limiter
     felitronics::stereo
-    felitronics::dither)
+    felitronics::dither
+    # The loudness solver measures what it renders, so the module now owns a METER dependency as well as
+    # a chain of processors. It is the same argument the chain itself makes: the composite is the unit,
+    # and a solver that could not measure would be a solver a product had to finish.
+    felitronics::analysis)
 target_compile_features(felitronics_mastering INTERFACE cxx_std_20)
 
 if(FELITRONICS_BUILD_TESTS)
@@ -59,4 +63,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_pause_is_silence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_pause_is_silence_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_pause_is_silence_tests COMMAND felitronics_pause_is_silence_tests)
+
+    # P7 — the target-loudness solver, its constraints and its statistics. Separate from the chain's own
+    # suite because it tests a different KIND of claim: not "the chain computes this", but "the search
+    # lands here, in this many renders, and refuses by name when it cannot".
+    add_executable(felitronics_loudness_solver_tests tests/LoudnessSolverTests.cpp)
+    target_link_libraries(felitronics_loudness_solver_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_loudness_solver_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_loudness_solver_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_loudness_solver_tests COMMAND felitronics_loudness_solver_tests)
 endif()

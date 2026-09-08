@@ -77,6 +77,44 @@ struct TruePeakLimiterParams
 };
 
 //==============================================================================
+// THE TRACE, for a caller that needs the SHAPE of what happened rather than one instantaneous number.
+// `gainReductionDb()` is a display value: polling it at block ends samples the gain at the host's block
+// rate, which is not a property of the signal at all — the same objection `Compressor` records for its
+// own meter, one module over, and the same answer (`dynamics::GainReductionTap`).
+//
+// IT IS ON THE OVERSAMPLED GRID, and that is a decision rather than an implementation leak. The gain is
+// decided and applied once per F×fs sample (see processChunk), so F×fs is where the trace exists;
+// folding it to baseband needs a RULE, and the rule belongs to whoever reads the statistic.
+//
+// BE HONEST ABOUT THE SIZE OF THAT, because the first draft of this comment carried an invented number
+// and the measurement is an order of magnitude smaller. Taking the MINIMUM over each group of F
+// preserves the OVERALL MAXIMUM exactly — that one is a theorem, since the group maximum of the
+// magnitude is kept. NOTHING ELSE IS: a fold changes the distribution, so p95 is not preserved in
+// general and the second draft of this comment claiming "every upper quantile" was wrong. On the
+// measured fixture the two happened to agree (p95 9.525000, max 9.538984 either way), which is one
+// fixture and not a proof. What the fold biases measurably is the mean and the active fraction, and
+// only upward. Swept over the whole release range on a fixture built to move the gain
+// INSIDE a baseband sample (transient pairs, instant attack, 4×): the mean bias is **+0.0029 to
+// +0.0080 dB** and the active-fraction bias **+0.0000 to +0.0009**, at release 0.05 ms through 50 ms.
+// Small — but it is a choice, it is not zero, and it is not the caller's to discover. A caller that
+// wants a baseband curve for a display folds it itself and says which rule it used.
+//
+// `linkedPeakLin` is THE RECONSTRUCTED PEAK THE LIMITER ACTUALLY SAW — max over channels of |x| on the
+// oversampled grid, taken BEFORE the sliding window and before any gain is applied. It is the quantity
+// a mastering report means by "the highest inter-sample peak inside the chain", and it cannot be
+// recovered from the delivered file: the limiter's whole job is to remove it.
+//
+// CAPACITY IS BINDING. A non-null buffer whose capacity is short of what the call will produce REFUSES
+// the whole call, leaving audio, state and the buffers untouched — the same rule as the compressor's
+// tap, and for the same reason: a partial trace looks like data.
+struct TruePeakLimiterTap
+{
+    float* gainReductionDb = nullptr;   // signed dB (<= 0), one per OVERSAMPLED sample
+    float* linkedPeakLin   = nullptr;   // linear, one per oversampled sample, BEFORE the gain
+    int    capacity        = 0;         // in OVERSAMPLED samples; < numSamples * F refuses the call
+};
+
+//==============================================================================
 // felitronics::limiter::TruePeakLimiter — a lookahead limiter that BOUNDS EVERY SAMPLE ON ITS OWN
 // F×fs GRID. It oversamples, limits at the oversampled rate (so inter-sample peaks are real samples),
 // then downsamples — Option B, the only structure that can bound inter-sample peaks at all, since a
@@ -273,6 +311,8 @@ public:
         for (auto& d : osDelays) d.reset();
         slide.reset();
         grDb = 0.0f;
+        linkedPeakLin_ = 0.0f;                                 // a free-running maximum SINCE RESET, like
+                                                               // TruePeakMeter's — so it means "this stream"
         lastNc_ = 0;
     }
 
@@ -283,6 +323,23 @@ public:
     int    latencySamples()  const noexcept { return prepared_ ? os.latencySamples() + lookBaseband : 0; }
     double gainReductionDb() const noexcept { return grDb; }
     bool   isPrepared()      const noexcept { return prepared_; }
+
+    // The highest RECONSTRUCTED peak this limiter has seen since reset() — the channel-linked maximum of
+    // |x| on the F x fs grid, taken before the sliding window and before any gain. Free-running, exactly
+    // like `analysis::TruePeakMeter::truePeakDb()`, and for the same reason: a maximum with a ballistic
+    // on it is a display, not a measurement.
+    //
+    // IT IS NOT "THE" TRUE PEAK OF THE INPUT, and the difference is the point of reporting it separately.
+    // This is what the limiter's OWN reconstruction saw — a 0.90 x Nyquist Kaiser prototype at this
+    // instance's factor and tapsPerPhase — and it is the number that EXPLAINS the gain reduction this
+    // instance applied. A meter of a different design reads something else on the same signal, and the
+    // gap is the material's, not a defect: against `analysis::TruePeakMeter` (the spec's 12-tap filter)
+    // at 4x, measured, a 1 kHz burst train agrees to **-0.0012 dB** and a pair of adjacent full-scale
+    // impulses — maximally broadband, i.e. the worst case for two different low-passes — disagrees by
+    // **-1.4183 dB**. Report it as the limiter's reconstruction, never as the file's true peak, and use
+    // `analysis::TruePeakMeter` for the latter. It cannot be recovered from the delivered file at all:
+    // removing it is the limiter's whole job.
+    double maxReconstructedPeakDb() const noexcept { return core::gainToDb ((double) linkedPeakLin_); }
 
     // The EFFECTIVE topology, after the clamps above — a caller that asked for something outside the
     // supported range can see what it actually got instead of guessing.
@@ -305,9 +362,25 @@ public:
     // timbre rather than like a fault. Refused whole, before anything moves.
     [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples) noexcept
     {
+        return process (channels, numChannels, numSamples, TruePeakLimiterTap {});
+    }
+
+    // The full form: the same call, with the oversampled gain-reduction and reconstructed-peak traces
+    // written out. `tap.gainReductionDb == nullptr && tap.linkedPeakLin == nullptr` is off and costs
+    // nothing; a non-null tap with `tap.capacity < numSamples * oversampleFactor()` REFUSES the whole
+    // call, before anything moves. RT-safe.
+    [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples,
+                                TruePeakLimiterTap tap) noexcept
+    {
         if (numChannels < 0 || numSamples < 0) return false;
         if (! prepared_) return false;
         if (numChannels > maxCh) return false;                 // width is a LIMIT — law 11(b)
+        // Checked BEFORE anything moves, so a refused call is indistinguishable from one never made.
+        // The multiplication is in `long long` on purpose: `numSamples * F` overflows a signed int at
+        // 537 million samples per channel at 4x, which a whole-file offline call can reach, and the
+        // overflow would make a SHORT buffer compare as large enough.
+        if ((tap.gainReductionDb != nullptr || tap.linkedPeakLin != nullptr)
+            && (long long) tap.capacity < (long long) numSamples * (long long) F) return false;
         if (numSamples == 0) return true;
         const int nc = numChannels;
 
@@ -329,7 +402,14 @@ public:
         {
             const int n = std::min (numSamples - off, maxBlock_);
             for (int c = 0; c < nc; ++c) sub[(std::size_t) c] = channels[c] + off;
-            processChunk (sub, nc, n);
+            // The tap advances on the OVERSAMPLED clock, so the chunk loop has to step it by n*F and
+            // not by n. Spelled as a separate `TruePeakLimiterTap` rather than by mutating the caller's
+            // copy, so the capacity check above stays the statement about the WHOLE call that it is.
+            TruePeakLimiterTap sTap;
+            const std::size_t osOff = (std::size_t) off * (std::size_t) F;
+            if (tap.gainReductionDb != nullptr) sTap.gainReductionDb = tap.gainReductionDb + osOff;
+            if (tap.linkedPeakLin   != nullptr) sTap.linkedPeakLin   = tap.linkedPeakLin   + osOff;
+            processChunk (sub, nc, n, sTap);
             off += n;                                          // `off += maxBlock_` could step past INT_MAX
         }
         return true;
@@ -351,7 +431,7 @@ private:
     static constexpr double kMinCeilingDb        = -200.0;   // below the 24-bit floor; -1e308 overflows the
     static constexpr double kMaxCeilingDb        =   60.0;   // float cast and kills the gain permanently
 
-    void processChunk (float* const* channels, int nc, int numSamples) noexcept
+    void processChunk (float* const* channels, int nc, int numSamples, TruePeakLimiterTap tap) noexcept
     {
         const int osN = numSamples * F;
 
@@ -376,12 +456,18 @@ private:
             float linkedPeak = 0.0f;
             for (int c = 0; c < nc; ++c) { const float a = std::fabs (osBuf[(std::size_t) c][(std::size_t) i]); if (a > linkedPeak) linkedPeak = a; }
 
+            // BEFORE the sliding window and before any gain: this is the reconstructed peak the limiter
+            // saw, which is what a mastering report means and what the delivered file no longer holds.
+            if (linkedPeakLin_ < linkedPeak) linkedPeakLin_ = linkedPeak;
+            if (tap.linkedPeakLin != nullptr) tap.linkedPeakLin[(std::size_t) i] = linkedPeak;
+
             const float  smax    = slide.push (linkedPeak);
             const double smaxDb  = core::gainToDb (smax);
             double rawRedDb = ceilingDb - smaxDb;
             if (rawRedDb > 0.0) rawRedDb = 0.0;
 
             grDb = std::min ((float) rawRedDb, grDb * relCoef);   // instant attack, exponential release toward 0 dB
+            if (tap.gainReductionDb != nullptr) tap.gainReductionDb[(std::size_t) i] = grDb;
             const float gain = (float) core::dbToGain ((double) grDb);
 
             for (int c = 0; c < nc; ++c)
@@ -452,6 +538,7 @@ private:
     int    lookBaseband = 0;
     int    lastNc_ = 0;                         // channel count of the previous process() call
     float  relCoef = 0.0f, grDb = 0.0f;
+    float  linkedPeakLin_ = 0.0f;               // free-running max of the reconstructed linked peak
 };
 
 } // namespace felitronics::limiter

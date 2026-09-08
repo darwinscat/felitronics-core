@@ -1518,5 +1518,89 @@ int main()
                       "fs/3 excess at " + std::to_string ((int) rate) + " Hz matches the closed form (rate-independent)");
     }
 
+    // ------------------------------------------------------- the TRACE, and the contract it carries
+    // The tap is a new entry point with its own refusal rule, and a refusal rule reachable only through
+    // a composite one module up is a rule nothing here pins. This is the direct test.
+    test::group ("TruePeakLimiterTap — the trace, and what a short buffer does");
+    {
+        const double fs = 48000.0;
+        const int F = 4, n = 4800;
+        std::vector<float> x ((std::size_t) n, 0.0f);
+        for (int i = 0; i < n; ++i)
+            x[(std::size_t) i] = (float) (0.02 * std::sin (2.0 * 3.14159265358979323846 * 220.0 * (double) i / fs));
+        for (int i = 400; i < n; i += 800) { x[(std::size_t) i] = 3.0f; if (i + 1 < n) x[(std::size_t) i + 1] = -2.4f; }
+
+        limiter::TruePeakLimiterConfig cfg; cfg.oversampleFactor = F; cfg.lookaheadMs = 1.0;
+        limiter::TruePeakLimiterParams pp; pp.ceilingDbTp = -1.0; pp.releaseMs = 2.0;
+
+        // (a) the tap must not move audio, at all.
+        std::vector<float> a = x, b = x;
+        double reconUntapped = 0.0, reconTapped = 0.0;
+        {
+            limiter::TruePeakLimiter L;
+            test::ok (L.prepare (fs, 1024, 1, cfg), "tap: prepare (untapped reference)");
+            L.setParams (pp);
+            float* p[1] = { a.data() };
+            test::run (L.process (p, 1, n));
+            reconUntapped = L.maxReconstructedPeakDb();
+        }
+        std::vector<float> gr ((std::size_t) n * (std::size_t) F, -12345.0f);
+        std::vector<float> pk ((std::size_t) n * (std::size_t) F, -12345.0f);
+        {
+            limiter::TruePeakLimiter L;
+            test::ok (L.prepare (fs, 1024, 1, cfg), "tap: prepare (tapped)");
+            L.setParams (pp);
+            float* p[1] = { b.data() };
+            limiter::TruePeakLimiterTap t { gr.data(), pk.data(), (int) gr.size() };
+            test::run (L.process (p, 1, n, t));
+            reconTapped = L.maxReconstructedPeakDb();
+        }
+        int moved = 0;
+        for (int i = 0; i < n; ++i) if (! core::exactlyEqual (a[(std::size_t) i], b[(std::size_t) i])) ++moved;
+        test::ok (moved == 0, "tap: the tapped call is BIT-IDENTICAL to the untapped one");
+        test::approx (reconTapped, reconUntapped, 0.0,
+                      "tap: maxReconstructedPeakDb does not depend on whether a tap was passed");
+
+        // (b) LIVENESS, then the contract: every cell was written, the reduction is signed and <= 0, the
+        // reconstructed peak is non-negative, and the running max is the maximum of the trace.
+        int unwritten = 0; double worstGr = 0.0, maxPk = 0.0, minPk = 1e9;
+        for (std::size_t i = 0; i < gr.size(); ++i)
+        {
+            if (core::exactlyEqual (gr[i], -12345.0f) || core::exactlyEqual (pk[i], -12345.0f)) ++unwritten;
+            worstGr = std::min (worstGr, (double) gr[i]);
+            maxPk   = std::max (maxPk, (double) pk[i]);
+            minPk   = std::min (minPk, (double) pk[i]);
+        }
+        test::ok (unwritten == 0, "tap: every oversampled cell of both traces was written");
+        test::ok (worstGr < -1.0, "precondition: the limiter really limited (worst " + std::to_string (worstGr) + " dB)");
+        test::ok (minPk >= 0.0, "tap: the reconstructed peak is a magnitude, never negative");
+        test::approx (core::gainToDb (maxPk), reconTapped, 1e-9,
+                      "tap: maxReconstructedPeakDb() is the maximum of the linkedPeakLin trace");
+
+        // (c) a SHORT buffer refuses the whole call and touches nothing — the same rule as the
+        //     compressor's tap, and it has to be checkable without a composite in the way.
+        {
+            limiter::TruePeakLimiter L;
+            test::ok (L.prepare (fs, 1024, 1, cfg), "tap: prepare (short-buffer case)");
+            L.setParams (pp);
+            std::vector<float> c2 = x;
+            std::vector<float> shortGr (16, -12345.0f);
+            float* p[1] = { c2.data() };
+            limiter::TruePeakLimiterTap t { shortGr.data(), nullptr, (int) shortGr.size() };
+            test::ok (! L.process (p, 1, n, t), "tap: a capacity short of numSamples*F REFUSES the call");
+            int touched = 0; for (float v : shortGr) if (! core::exactlyEqual (v, -12345.0f)) ++touched;
+            test::ok (touched == 0, "tap: a refused call writes nothing into the tap");
+            int audioMoved = 0;
+            for (int i = 0; i < n; ++i) if (! core::exactlyEqual (c2[(std::size_t) i], x[(std::size_t) i])) ++audioMoved;
+            test::ok (audioMoved == 0, "tap: a refused call leaves the audio untouched");
+            test::approx (L.maxReconstructedPeakDb(), core::gainToDb (0.0), 1e-9,
+                          "tap: a refused call leaves the running peak untouched too");
+            // ...and EXACTLY at the capacity it is accepted, so the boundary is the stated one.
+            std::vector<float> exact ((std::size_t) n * (std::size_t) F, 0.0f);
+            limiter::TruePeakLimiterTap t2 { exact.data(), nullptr, (int) exact.size() };
+            test::run (L.process (p, 1, n, t2));
+        }
+    }
+
     return test::report();
 }

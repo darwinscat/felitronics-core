@@ -7,6 +7,78 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **`mastering`: TARGET-LOUDNESS SOLVER, NAMED CONSTRAINTS AND THE STATISTICS BEHIND THEM
+  (`mastering::TargetLoudnessSolver`).** Hits a target integrated loudness under a stated true-peak
+  ceiling in a bounded number of renders, and refuses BY NAME instead of crushing the programme when
+  the target cannot be had.
+  - **It is one scalar search, not two loops.** `preLimiterGainDb` (g) and `limiter.ceilingDbTp` (c)
+    look like two knobs and are not: the limiter's reduction is `min(0, c - smaxDb)` and `smaxDb` is
+    taken after the gain node, so everything the limiter does depends on `d = g - c` alone and `c` is a
+    pure output scale — `y(g,c) = 10^(c/20) y(d,0)`, measured over a 3x3 grid at
+    `9.1e-07 .. 1.7e-06` on a programme peaking at 0.89. So the ceiling programmed into the limiter is
+    an OUTPUT of the solve, and the P11 inter-sample derate costs whatever the material's actually is
+    (**+0.0005 to +0.1028 dB measured in situ** on five real mixes) instead of a flat 1.2 dB off
+    every track.
+  - **New: `limiter::TruePeakLimiterTap`** — the limiter's gain-reduction trace and the reconstructed
+    peak it saw, on its OWN `F*fs` grid, plus `maxReconstructedPeakDb()`. Folding the trace to baseband
+    needs a rule and the rule belongs to whoever reads the statistic: a min-fold biases the mean by
+    **+0.0029 to +0.0080 dB** and the active fraction by up to **+0.0009** across the whole release
+    range, while `max` and the upper quantiles are untouched. A tap too short REFUSES the whole call.
+  - **New: `mastering::MasteringChainTaps`** — the chain forwards the limiter's traces, the
+    compressor's own tap and the signal at the pre-limiter node, with each stage's offset from the
+    chain's INPUT stated rather than implied, so a statistic is cropped to the window that carries
+    programme. `OfflineRenderer::render` grows one templated tap sink; there is still exactly one copy
+    of the `out[n] = y[n + D]` arithmetic.
+  - **BREAKING (behaviour), `mastering::MasteringChain`: a parameter set written BEFORE `prepare()` is
+    now KEPT.** `prepare()` ended with `pendingParams_ = params_`, which replaced the caller's pending
+    write with the last APPLIED set — defaults, on a fresh object. Measured:
+    `setParams(inputGainDb = 12)` then `prepare()` then `process()` delivered the input **unchanged**,
+    12 dB that simply did not happen, with no refusal and no way to find out. Every stage already
+    honours that order (`Compressor`, `TruePeakLimiter` and `Dither` all re-apply their stored
+    parameters inside `prepare()`); the composite was the only place that did not. The parameters are
+    now applied inside `prepare()`, so `params()` and `resolved()` describe the prepared chain rather
+    than the previous one — mid-stream they still lag a `setParams()` by up to one internal quantum,
+    which is the documented design.
+  - **A limit already broken at the least drive the search will use is UPSTREAM, and says so.** The
+    compressor's gain reduction cannot move at all (its node is before the gain), and the loudness
+    range, the peak-to-loudness ratio and the limiter's own gain reduction all get WORSE with drive —
+    so naming the loudness target as the reason points the user at the wrong number. Measured on the
+    corpus: with a 0.4 LU range allowance, an ordinary compressor setting spends **0.80 to 3.70 LU**
+    before the solver applies a single dB.
+  - **Digital silence gets `MeasurementInvalid`, not a plausible answer.** `analysis::LoudnessMeter`
+    returns the literal -120.0 when nothing passes its absolute gate, and a ceiling derived from a
+    -200 dBTP peak reading clamps to +60 dBTP — i.e. it would switch the limiter OFF and report
+    success. A programme that is merely too QUIET to measure at the starting gain is a different case
+    and is bootstrapped from the peak instead: a flat tone at -71.7 LUFS is unmeasurable at 0 dB and
+    ordinary 56 dB up, and refusing it would be a verdict about the starting gain.
+  - **The answer does not depend on where the search started, and it used to.** A step that moved the
+    gain and the ceiling together is exact — it is the scale law above — but exact at a FROZEN DRIVE.
+    Measured on one programme and one request (-14 LUFS, -1 dBTP): from a 0 dB start the answer was
+    8.5 dB of drive with no limiting, PLR 11.9 and LRA 4.1; from a 55 dB start it was **47.6 dB of
+    drive, 38.05 dB of limiter gain reduction, PLR 4.6 and LRA 0.10 — also reported `Solved`.** Adding
+    `minPlrDb = 8` then made the second one `TargetUnreachable` while the first stayed Solved, so the
+    VERDICT depended on the start too. The ceiling now tracks its aim on every step, in both
+    directions, and a warm start unwinds instead of freezing. Pinned over starts of 0 to 55 dB.
+  - **`in == out` is refused.** One render in place is well defined and `OfflineRenderer` still
+    supports it; a SEARCH is not, because every pass after the first reads the previous pass's master.
+    Measured: a solve reported -22.996 LUFS and the gain it returned, applied to the untouched source,
+    gives -29.000 — the answer missed its own programme by 6.0 LU.
+  - **The request carries no delivery policy and no hidden state.** `targetLufs` and
+    `maxTruePeakDbTp` have no defaults (NaN, refused) — "-14 LUFS, -1 dBTP" is a product's decision,
+    not a core's. The input's loudness range moved out of the solver and into the request for the same
+    reason: held as solver state it outlived the programme it described, and track B was judged against
+    track A's range.
+  - **A target past the +-60 dB gain node is `TargetUnreachable` with `GainRange` named**, not a
+    pass limit: the movement test compared the UNCLAMPED step, so a saturated actuator re-rendered the
+    same point until the budget ran out — measured, 29 identical renders of a 33-render budget.
+  - Also fixed in the same pass, each found by a review round and reproduced before being acted on:
+    the tap capacity arithmetic overflowed in `int` before its cast to `long long`; the tap counters
+    advanced even when no tap was requested; `OfflineRenderer` checked the tap capacity per BLOCK, so a
+    short tap failed half way through a render with output already written; the limiter's statistics
+    window ignored the limiter's own interpolator latency, which cost the whole reaction of a peak in
+    the last 32 samples; an infinity of the wrong sign disabled a constraint the caller meant to be
+    unsatisfiable; and the solver did not check that its sample rate was the chain's.
+
 - **BREAKING (behaviour), `core`, `nam`: `StreamResampler`'s interpolation kernel is now a 64-tap
   polyphase windowed sinc, not a Catmull-Rom cubic. Every model at 44.1 kHz sounds different — brighter
   in the top octave, and without a bass artefact it should never have had.** (Read "brighter" as scoped:

@@ -91,6 +91,60 @@ struct MasteringChainParams
     bool bypassClipper = false, bypassLimiter = false, bypassDither = false;
 };
 
+//==============================================================================
+// THE TAPS — what a solver, a report or a meter needs and the delivered file no longer holds. Optional,
+// off by default, and shaped exactly like `dynamics::GainReductionTap`: caller-owned buffers with a
+// stated capacity, and a capacity that cannot hold the call REFUSES the whole call rather than writing
+// a prefix. A partial trace looks like data.
+//
+// THE CLOCK IS THE INTERNAL QUANTUM, NOT THE CALL. The chain only computes anything when a quantum
+// runs, so a `process(n)` call writes `framesWritten = K * (quanta this call)` tap frames, which is not
+// `n` — it can be 0, and it can exceed `n` by up to K-1. That is why the counts come back in the struct
+// and why the capacities have to cover `n + K - 1` frames rather than `n`. A caller accumulates
+// `framesWritten` across calls to know where in the stream it is.
+//
+// TAP TIME IS THE STAGE'S OWN TIME, and each stage's offset from the chain's INPUT is stated rather
+// than hidden, because a statistic cropped to the wrong window is the defect this exists to prevent:
+//
+//   * `compressorGrDb[j]`  — the signed gain reduction the compressor's detector computed for CHAIN
+//                            INPUT SAMPLE j, i.e. `resolved().compressorTapOffset`, which is 0. (It is
+//                            applied to the lookahead-delayed copy of that sample, which is the
+//                            compressor's own contract, not this one's.)
+//   * `preLimiter[c][j]`   — the sample at the pre-limiter node, taken BEFORE `preLimiterGainDb` is
+//                            applied, so it does NOT depend on that gain: everything upstream of the
+//                            gain node is a constant of a loudness search. Its frame j is chain input
+//                            sample `j - (compressorLookahead + clipperLatency)`, NOT j — the compressor
+//                            delays the programme by its lookahead and the clipper by its own latency,
+//                            and both are still in front of this point. A bypassed compressor still
+//                            delays (its bypass is warm, through its own curve), so the offset does not
+//                            depend on the bypass flags — only on which stages are PRESENT.
+//   * `limiterGrDb`,
+//     `limiterPeakLin`     — the limiter's oversampled traces, `tapOversampleFactor()` samples per frame.
+//                            Their frame j is chain input sample `j - resolved().limiterTapOffset`. That
+//                            offset is NOT just the stages in front: the trace is written where the gain
+//                            is decided, on the oversampled copy, so it also lags by the UP leg of the
+//                            limiter's own oversampler. `resolved()` computes it; do not re-derive it.
+//
+// A render feeds `frames` of programme and then `latencySamples()` zeros, so the tap frames that carry
+// real programme are the ones whose INPUT index is below `frames` — which is the window a statistic
+// must be cropped to, and the reason the offsets above are part of the contract.
+struct MasteringChainTaps
+{
+    // Per BASEBAND frame. `frameCapacity` covers both of these.
+    float*        compressorGrDb = nullptr;
+    float* const* preLimiter     = nullptr;      // numChannels planes
+    int           frameCapacity  = 0;
+
+    // Per OVERSAMPLED sample: `MasteringChain::tapOversampleFactor()` samples per frame.
+    float*        limiterGrDb    = nullptr;
+    float*        limiterPeakLin = nullptr;
+    int           osCapacity     = 0;
+
+    // OUT. Set by every accepted call, including one that ran no quantum (both zero).
+    int framesWritten = 0;
+    int osWritten     = 0;
+};
+
 // What the chain ACTUALLY applied, after every stage's own clamps and refusals. `configure` in the
 // C-ABI has to hand these back — the form's nerd block shows them — and a caller that asked for
 // something outside a stage's range can see what it got instead of guessing.
@@ -103,6 +157,17 @@ struct MasteringChainResolved
     int    limiterLatency        = 0;
     int    limiterLookahead      = 0;
     int    oversampleFactor      = 0;
+    // WHERE EACH TAP'S FRAME 0 SITS IN THE CHAIN'S INPUT, in frames, so a consumer cropping a statistic
+    // to the programme does not have to derive it. Derived here BECAUSE IT IS SUBTLE and the first two
+    // attempts at it were both wrong: the limiter's trace is written where the gain is DECIDED, which is
+    // on the oversampled copy, so it lags by the UP leg of the oversampler only — half of the round trip
+    // `latencySamples()` reports, since the same prototype is used interpolating and decimating.
+    // Measured with an impulse: 79.75 frames for a 48-sample compressor lookahead at 4x/64 taps, i.e.
+    // 48 + 31.75, against 48 + 63 if the whole round trip is counted and 48 if none of it is.
+    // The half-frame is real (a reconstructed peak need not land on a grid point) and is rounded away
+    // here: the field is a window boundary, not a delay line.
+    int    compressorTapOffset   = 0;
+    int    limiterTapOffset      = 0;
     double limiterCeilingDbTp    = 0.0;
     double limiterReleaseMs      = 0.0;
     stereo::MonoBassParams monoBass {};
@@ -288,6 +353,7 @@ public:
         }
 
         int limLat = 0;
+        osFactor_  = 1;
         if (cfg_.limiter)
         {
             limiter::TruePeakLimiterConfig lc;
@@ -296,6 +362,7 @@ public:
             lc.tapsPerPhase     = cfg_.tapsPerPhase;
             if (! lim_.prepare (fs_, K_, nch_, lc)) return false;
             limLat = lim_.latencySamples();
+            osFactor_ = lim_.oversampleFactor();      // READ BACK: a requested 1 becomes 2 in the stage
             alignLim_.prepare (nch_, K_, limLat + 2);
         }
 
@@ -316,8 +383,24 @@ public:
         // active chain sat 480 samples out of alignment.
         latency_ = K_ + compLat + clipLat + limLat;
 
-        pendingParams_ = params_;
-        paramsDirty_   = true;
+        // A PARAMETER SET WRITTEN BEFORE `prepare()` IS KEPT. This line used to read
+        // `pendingParams_ = params_`, which threw the caller's pending write away and replaced it with
+        // the last APPLIED set — defaults, on a fresh object. Measured: `setParams(inputGainDb = 12)`
+        // then `prepare()` then `process()` delivered the input unchanged, i.e. 12 dB silently did not
+        // happen, with no refusal and no way to find out. "Configure, then prepare" is not an exotic
+        // order — it is the one a C-ABI facade takes — and it is the order every STAGE already honours:
+        // `Compressor`, `TruePeakLimiter` and `Dither` all re-apply their stored parameters inside
+        // `prepare()`. The composite was the only place that did not.
+        // APPLY, THEN RESET, and the order is the whole point. Applying is what makes `params()` and
+        // `resolved()` describe the prepared chain rather than the previous one — straight after
+        // `prepare()` there is no stream yet, so a lag there is a stale read and not the documented
+        // one-quantum automation lag. Resetting AFTERWARDS is what keeps the stream's first parameter
+        // write a SNAP rather than a glide: `eq::EqBand::reset()` snaps its smoothers, so a write that
+        // follows a reset lands instantly, and applying last would have consumed that snap on the
+        // pre-prepare set and left `prepare() -> setParams(B) -> process()` gliding into B over 30 ms.
+        // `paramsDirty_` stays armed, so the first quantum re-applies (a no-op, or the newer pending
+        // set) and that write is the first since the reset.
+        applyParams();
         reset();
         prepared_ = true;
         return true;
@@ -361,8 +444,19 @@ public:
 
     int  latencySamples() const noexcept { return prepared_ ? latency_ : 0; }
     int  numChannels()    const noexcept { return prepared_ ? nch_ : 0; }
+    // The rate this chain was prepared at. A consumer that builds meters of its own has to agree with
+    // it, and "the caller passed the same number to both" is not a check — it is the assumption that
+    // makes a 48 kHz render get measured as 44.1 kHz with every number plausible.
+    double sampleRate()   const noexcept { return prepared_ ? fs_ : 0.0; }
     int  internalBlock()  const noexcept { return prepared_ ? K_ : 0; }
     bool isPrepared()     const noexcept { return prepared_; }
+
+    // The stride of the OVERSAMPLED taps, in samples per frame. It is NOT `resolved().oversampleFactor`
+    // and the two disagree on purpose: that one answers "what factor is this chain oversampling at",
+    // and reports the CLIPPER's when there is no limiter, while this one answers "how long must my
+    // limiter tap buffer be", which with no limiter is one per frame. Sizing a buffer from the wrong
+    // one of those is a refused call at best.
+    int  tapOversampleFactor() const noexcept { return prepared_ ? osFactor_ : 0; }
 
     MasteringChainResolved resolved() const noexcept
     {
@@ -376,6 +470,9 @@ public:
         r.limiterLookahead    = cfg_.limiter ? lim_.lookaheadSamples() : 0;
         r.oversampleFactor    = cfg_.limiter ? lim_.oversampleFactor()
                                              : (cfg_.clipper ? cfg_.oversampleFactor : 0);
+        r.compressorTapOffset = 0;
+        r.limiterTapOffset    = r.compressorLookahead + r.clipperLatency
+                              + (cfg_.limiter ? (lim_.latencySamples() - lim_.lookaheadSamples()) / 2 : 0);
         r.limiterCeilingDbTp  = cfg_.limiter ? lim_.effectiveCeilingDbTp() : 0.0;
         r.limiterReleaseMs    = cfg_.limiter ? lim_.effectiveReleaseMs() : 0.0;
         r.monoBass            = cfg_.monoBass ? monoBass_.params() : stereo::MonoBassParams { false, 0.0f, 0.0f };
@@ -387,13 +484,45 @@ public:
     // the prepared one; a refused call is indistinguishable from one never made.
     [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept
     {
+        MasteringChainTaps none;
+        return process (io, numChannels, numSamples, none);
+    }
+
+    // The full form: the same call, with the traces above written out. Every tap is optional; a tap
+    // whose capacity cannot hold what this call will produce REFUSES the whole call before anything
+    // moves, so a refused call is still indistinguishable from one never made. RT-safe.
+    [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples,
+                                MasteringChainTaps& taps) noexcept
+    {
+        taps.framesWritten = 0;
+        taps.osWritten     = 0;
         if (numChannels < 0 || numSamples < 0) return false;
         if (! prepared_ || io == nullptr) return false;
         if (numChannels != nch_) return false;   // the chain's width is EXACT: the stages behind it are
                                                  // prepared for it and a narrower call would leave the
                                                  // FIFO half-swapped mid-quantum
+        // The capacity check is against what this call WILL produce, computed before anything moves —
+        // `pos_` says how far into the current quantum the stream already is, so the count is exact
+        // rather than the `n + K - 1` upper bound a caller sizes its buffers by.
+        // `long long` BEFORE the addition, not after. `pos_ + numSamples` is int arithmetic, and a
+        // whole-file offline call is exactly where `numSamples` approaches INT_MAX: the sum overflows,
+        // the quotient comes back negative, and a tap far too short for the call passes the check
+        // below and is then written past its end.
+        const long long willRun    = ((long long) pos_ + (long long) numSamples) / (long long) K_;
+        const long long willFrames = willRun * (long long) K_;
+        if ((taps.compressorGrDb != nullptr || taps.preLimiter != nullptr)
+            && (long long) taps.frameCapacity < willFrames) return false;
+        if ((taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr)
+            && (long long) taps.osCapacity < willFrames * (long long) osFactor_) return false;
         if (numSamples == 0) return true;
         stageRefused_ = false;                   // this call's verdict; the quanta below OR into it
+        // Only borrowed when something was actually asked for. The plain three-argument form forwards a
+        // default-constructed struct, and counting quanta into it would advance an `int` toward overflow
+        // on a long offline call for a caller that never asked for a trace: 2^31 / 256 quanta is 12
+        // hours of audio at 48 kHz, which an offline whole-file call can reach.
+        const bool wantTaps = (taps.compressorGrDb != nullptr || taps.preLimiter != nullptr
+                               || taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr);
+        tap_ = wantTaps ? &taps : nullptr;       // read by runQuantum(); cleared before returning
 
         for (int off = 0; off < numSamples; )
         {
@@ -407,6 +536,7 @@ public:
             off  += take;
             if (pos_ == K_) { runQuantum(); pos_ = 0; }
         }
+        tap_ = nullptr;
         return ! stageRefused_;
     }
 
@@ -465,6 +595,14 @@ private:
         // --- compressor: WARM bypass through its own curve, so nothing has to be aligned --------
         if (cfg_.compressor)
         {
+            // The tap goes to the compressor's own `GainReductionTap`, not to a second implementation:
+            // the value written is the one the stage applied, by construction, and there is nothing to
+            // drift. A bypassed compressor still writes — its curve is `ratio = 1`, so the trace is
+            // exactly 0 dB, which is the truth about that quantum rather than a gap in the trace.
+            dynamics::GainReductionTap grTap {};
+            if (tap_ != nullptr && tap_->compressorGrDb != nullptr)
+                grTap = { tap_->compressorGrDb + (std::size_t) tap_->framesWritten, K_ };
+
             if (! keyBuf_.empty())
             {
                 // The key is the compressor's OWN input, same instant, minimum-phase high-passed. It is
@@ -480,10 +618,14 @@ private:
                     hpf_[c].flushDenormals();
                     key[c] = k;
                 }
-                stageRefused_ |= ! comp_.process (ch, nch_, K_, key, nch_);
+                stageRefused_ |= ! comp_.process (ch, nch_, K_, key, nch_, grTap);
             }
-            else stageRefused_ |= ! comp_.process (ch, nch_, K_);
+            else stageRefused_ |= ! comp_.process (ch, nch_, K_, nullptr, 0, grTap);
         }
+        else if (tap_ != nullptr && tap_->compressorGrDb != nullptr)
+            std::fill_n (tap_->compressorGrDb + (std::size_t) tap_->framesWritten, K_, 0.0f);   // absent
+                                                                                                // stage: 0 dB is
+                                                                                                // the truth, not a gap
 
         // --- soft clipper: skipped when bypassed, its PDC held by the aligner -------------------
         if (cfg_.clipper)
@@ -498,20 +640,52 @@ private:
             else for (int c = 0; c < nch_; ++c) std::copy_n (alignClip_.delayed (c), K_, ch[c]);
         }
 
+        // --- the pre-limiter tap, taken BEFORE the gain node -------------------------------------
+        // This is the whole point of the tap: `p` is everything the chain does that does NOT depend on
+        // `preLimiterGainDb`, so a solver holding `p` can evaluate the rest of the chain at any gain
+        // without re-running the EQ, the compressor or the clipper. Copied, not aliased — the buffer
+        // below is overwritten in place by the two stages that follow.
+        if (tap_ != nullptr && tap_->preLimiter != nullptr)
+            for (int c = 0; c < nch_; ++c)
+                std::copy_n (ch[c], K_, tap_->preLimiter[c] + (std::size_t) tap_->framesWritten);
+
         applyGain (ch, preLimGain_);
 
         // --- true-peak limiter: the one stage with no bypass of its own -------------------------
         if (cfg_.limiter)
         {
+            limiter::TruePeakLimiterTap limTap {};
+            if (tap_ != nullptr && (tap_->limiterGrDb != nullptr || tap_->limiterPeakLin != nullptr))
+            {
+                const std::size_t o = (std::size_t) tap_->osWritten;
+                if (tap_->limiterGrDb    != nullptr) limTap.gainReductionDb = tap_->limiterGrDb + o;
+                if (tap_->limiterPeakLin != nullptr) limTap.linkedPeakLin   = tap_->limiterPeakLin + o;
+                limTap.capacity = K_ * osFactor_;
+            }
             alignLim_.advance ((const float* const*) ch, nch_, K_, lim_.latencySamples());
             if (bypassChanged_.limiter) lim_.reset();
-            if (! params_.bypassLimiter) stageRefused_ |= ! lim_.process (ch, nch_, K_);
-            else for (int c = 0; c < nch_; ++c) std::copy_n (alignLim_.delayed (c), K_, ch[c]);
+            if (! params_.bypassLimiter) stageRefused_ |= ! lim_.process (ch, nch_, K_, limTap);
+            else
+            {
+                for (int c = 0; c < nch_; ++c) std::copy_n (alignLim_.delayed (c), K_, ch[c]);
+                // A BYPASSED limiter is not a hole in the trace either: it reduced nothing and saw
+                // nothing, and saying so is what keeps `mean` and the active fraction meaning what they
+                // say over a programme whose bypass moved.
+                if (limTap.gainReductionDb != nullptr) std::fill_n (limTap.gainReductionDb, K_ * osFactor_, 0.0f);
+                if (limTap.linkedPeakLin   != nullptr) std::fill_n (limTap.linkedPeakLin,   K_ * osFactor_, 0.0f);
+            }
+        }
+        else if (tap_ != nullptr)
+        {
+            const std::size_t o = (std::size_t) tap_->osWritten;
+            if (tap_->limiterGrDb    != nullptr) std::fill_n (tap_->limiterGrDb + o,    K_ * osFactor_, 0.0f);
+            if (tap_->limiterPeakLin != nullptr) std::fill_n (tap_->limiterPeakLin + o, K_ * osFactor_, 0.0f);
         }
 
         // --- dither, last, and only when it is not bypassed --------------------------------------
         if (cfg_.dither && ! params_.bypassDither) stageRefused_ |= ! dith_.process (ch, nch_, K_);
 
+        if (tap_ != nullptr) { tap_->framesWritten += K_; tap_->osWritten += K_ * osFactor_; }
         bypassChanged_ = {};
     }
 
@@ -584,6 +758,11 @@ private:
     int    nch_ = 0, K_ = 0, pos_ = 0, latency_ = 0;
     bool   prepared_ = false, paramsDirty_ = true, bypassKnown_ = false;
     bool   stageRefused_ = false;            // a stage refused a quantum — see runQuantum()
+    int    osFactor_ = 1;                    // the limiter's EFFECTIVE factor (1 when there is no limiter),
+                                             // read back rather than taken from the config: `prepare()`
+                                             // turns a requested 1 into 2 and the tap's stride is the
+                                             // number the stage actually runs at
+    MasteringChainTaps* tap_ = nullptr;      // borrowed for the duration of one process() call
 
     MasteringChainConfig cfg_ {};
     MasteringChainParams params_ {}, pendingParams_ {};
