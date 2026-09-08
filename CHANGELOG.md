@@ -37,8 +37,12 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - **`nam::NamStage::latencySamples()` reports 61 at 44.1 kHz** (was 4), 96 at 96, 91 at 88.2, 53 at 32,
     and it no longer restates the geometry: it asks `StreamResampler::delayInputSamples()`. Restating it
     is how the previous formula stayed 2.16 samples wrong for a release cycle. **Consumers that delay a
-    dry/bypass path by this number (OrbitCab, orbit-amp) must be re-checked** — the figure is 16× larger,
-    and OrbitCab's three `PowerAmpRouterAlignTests` pin a formula that moves again.
+    dry/bypass path by this number must be re-checked** — the figure is 16× larger. `orbit-amp` was
+    built against this branch and its whole suite passes (seven targets, zero failures), but its
+    `src/core/BypassWire.h:37` caps the delay it can carry at 64 samples on a comment quoting a formula
+    two generations old: 44.1 kHz fits by three samples and every host above 48 kHz silently
+    under-delays its bypass path (96 samples short at 192 kHz). Fix it with the geometry, not a bigger
+    constant.
   - **Two contract changes that are not tuning.** An exactly-equal in/out rate now short-circuits to a
     **bit-exact copy delayed by 32 samples** (the 0.99 cutoff is a real low-pass, and a caller asking for
     no rate change must not silently get one) — it was a 2-sample delay. And the kernel is
