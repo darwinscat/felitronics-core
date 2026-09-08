@@ -116,7 +116,13 @@ public:
         {
             hostSR   = sampleRate;
             maxBlock = std::max (1, maxBlockIn);
-            configureRates (expectedSR > 0.0 ? expectedSR : kModelSampleRate);
+            // 🔴 THE RAW RATE, NOT A NORMALISED ONE. This line used to spell
+            // `expectedSR > 0.0 ? expectedSR : kModelSampleRate` — a second copy of the normalisation
+            // that rateMatch() already owns — and the mutation stand proved it was not decoration:
+            // with the default pre-applied here, breaking the default INSIDE rateMatch changed nothing
+            // for an untagged model, so the suite could not see it. Hand over what the model actually
+            // reported and let the one owner decide.
+            configureRates (expectedSR);
             for (auto& m : inst)
                 if (m) m->Reset (modelRunSR, maxModelFrames);
             prepared_ = true;
