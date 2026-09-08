@@ -569,13 +569,22 @@ int main()
             }
             std::printf ("      worst reported-vs-geometry error over 19 host rates: %.4f samples (at %.0f Hz)\n",
                          worst, worstAt);
-            // ⚠️ WHAT THIS LINE IS AND IS NOT, said plainly because it changed meaning. Both sides now
-            // come from the same function — the stage reports rateMatch(), and `geo` asks core for the
-            // fractional value rateMatch() rounds — so this can no longer catch a wrong composition.
-            // It is a statement about ROUNDING ONLY: that the reporting step is a round-to-nearest and
-            // not a floor, a ceil, or a truncation, across every rate including the exact halves. That
-            // is worth keeping (a `ceil` here would pass a ≤1.0 bound and fail this one), and the group
-            // above is where a wrong composition is caught, by measurement.
+            // ⚠️ WHAT THIS LINE IS AND IS NOT — and this paragraph was itself WRONG for one commit,
+            // which is the reason it now names its own history. It used to say both sides came from
+            // the same function and that the check was therefore "a statement about ROUNDING ONLY".
+            // That was true of a version in which `geo` ASKED core for the fractional value; a crew
+            // round proved what it cost by injecting a +1 error into the geometry, which that version
+            // waved through while the older tests caught it. `geo` was restored to an independent
+            // computation — the two facts the header states, nothing shared with the thing measured —
+            // and the paragraph explaining why it need not be independent was left standing behind it.
+            //
+            // What it is NOW: an independent oracle, so it catches BOTH a wrong composition and a
+            // wrong rounding step. Measured at the close of that round, this line among them: a +1
+            // error in the geometry fails 43 checks across the suite at nam=ON pffft=ON. (The commit
+            // that restored this oracle published "21", which was already wrong when written — three
+            // independent runs put it at 31 on that tree. A count is a measurement and goes stale like
+            // any other, so it carries its configuration and its date of measurement or it carries
+            // nothing.)
             test::ok (worst <= 0.5 + 1e-9,
                       "over 19 host rates including every exact-half case, the REPORTED INTEGER is the "
                       "nearest one to the fractional geometry (worst " + std::to_string (worst)
@@ -605,9 +614,40 @@ int main()
             near.prepare (48000.4, 64); past.prepare (48001.0, 64);
             test::ok (near.latencySamples() == 0,
                       "0.4 Hz off the model rate is INSIDE the gate: no resampler, no latency");
+            // 🔴 AND 0.6 — the OUTSIDE edge, a hair past it. This cell exists because a crew round
+            // widened the gate from `> 0.5` all the way to `> 0.9` and the mutant SURVIVED: the only
+            // outside pin was 48001.0, a whole hertz out, so every threshold between 0.5 and 1.0 was
+            // free. The paragraph below already claimed 48000.6 was in the fixture — it was not, and a
+            // comment naming a value the code does not have is how a hole stays open.
+            {
+                nam::NamStage past2;
+                past2.prepare (48000.6, 64);
+                const auto j3 = gainModel();
+                test::ok (load (past2, j3), "a model loads on a stage half a hertz past the gate");
+                past2.prepare (48000.6, 64);
+                test::ok (past2.latencySamples() == 64,
+                          "0.6 Hz off the model rate is OUTSIDE the gate: a resampler is installed and "
+                          "costs " + std::to_string (past2.latencySamples()) + " samples. Widening the "
+                          "threshold anywhere into (0.5, 0.6] now fails here");
+            }
+            // 🔴 …AND A HAIR ABOVE THE BOUNDARY, not merely near it. 0.6 leaves the whole interval
+            // (0.5, 0.6) free, and a later round widened the gate to 0.55 and walked through. The fix
+            // is not another arbitrary distance: pin the predicate IMMEDIATELY above the edge, and
+            // every `> 0.5 + eps` mutation with eps >= 1e-4 dies at once.
+            {
+                nam::NamStage hair;
+                hair.prepare (48000.5001, 64);
+                const auto j4 = gainModel();
+                test::ok (load (hair, j4), "a model loads a ten-thousandth of a hertz past the gate");
+                hair.prepare (48000.5001, 64);
+                test::ok (hair.latencySamples() == 64,
+                          "48000.5001 is OUTSIDE the gate and costs "
+                          + std::to_string (hair.latencySamples()) + " samples, while 48000.5 exactly "
+                          "costs none — the predicate is `> 0.5` and nothing wider");
+            }
             // 🔴 EXACTLY 0.5 — the boundary itself, which nothing tested. A mutation flipping `> 0.5`
-            // to `>= 0.5` survived the whole suite because 48000.4 and 48000.6 straddle the edge
-            // without standing on it, and the gate's own predicate is only visible AT it.
+            // to `>= 0.5` survived the whole suite because 48000.4 and 48001.0 stood well clear of the
+            // edge without standing on it, and the gate's own predicate is only visible AT it.
             {
                 nam::NamStage edge;
                 edge.prepare (48000.5, 64);
@@ -654,8 +694,11 @@ int main()
     {
         // 🔴 WHY THIS GROUP EXISTS. A diverse-testing round replaced `modelRunSR` inside
         // pairDelayHostSamples with the literal 48000 and the mutant survived every suite in the
-        // repository — because every call site in the tree passes 48000, and every model that can go
-        // live runs at 48000. The function's second argument was, in effect, untested. The same round
+        // repository — because every call site in the tree passes 48000, and every model that goes live
+        // in practice runs at 48000. (Not "every model that can": install() compares with a HALF-HERTZ
+        // TOLERANCE, so a fresh stage accepts 48000.5 and prepare() then adopts it — the same
+        // over-claim the header carried until it was corrected there. Correcting one copy of a
+        // sentence and not the other is this branch's own subject matter.) The same round
         // showed rateMatch's normalisation path is only ever reached through an instance, so an
         // untagged rate never reaches it directly either.
         //
@@ -680,8 +723,29 @@ int main()
                   "…and the two arguments are NOT interchangeable — a swapped call at a consumer is a "
                   "different number, not a reciprocal one, which is why the order is in the name");
 
-        // rateMatch: the three facts, including the two an instance cannot reach — an unknown rate and
-        // a rate no stage would accept.
+        // 🔴 THE DEFAULTS OF THE STRUCT ITSELF, which nothing else in the tree varies either. They are
+        // not decoration: RateMatch gained member initialisers in the same commit that pinned these
+        // functions, and that SILENTLY changed what `RateMatch r {}` means for every consumer —
+        // modelRunSR read 0 before it and reads the factory rate after, and the type stopped being
+        // trivially default-constructible. A crew round mutated the default back to 0 and the mutant
+        // survived the whole repository. The new value is the right one — a rate-match that has not
+        // been computed yet describes a stage running at the factory rate, not one running at 0 Hz —
+        // but "right and unannounced and untested" is how the restatements this branch removes got in.
+        {
+            const nam::NamStage::RateMatch d {};
+            test::ok (d.modelRunSR == nam::NamStage::kModelSampleRate && ! d.resampling
+                          && d.latencySamples == 0,
+                      "a default-constructed RateMatch reads {" + std::to_string (d.modelRunSR)
+                      + ", false, 0} — the factory rate, not zero");
+        }
+
+        // rateMatch: the three facts. One of these cells an instance really cannot reach — a rate no
+        // stage would accept — and the OTHER one it reaches every day, which an earlier version of this
+        // comment got backwards while the paragraph eight lines above had it right. prepare() hands
+        // configureRates() the RAW reported rate (NamStage.cpp, and that was the whole point of the fix
+        // there), so an untagged model arrives here as modelSR = -1 and takes the normalisation path.
+        // Two spellings of one fact in one group, already disagreeing — inside the group written to
+        // stop exactly that.
         struct R { double h, m; double runSR; bool res; int lat; const char* what; };
         for (const R r : { R { 44100.0,     -1.0, 48000.0, true,  61, "unknown rate normalises to the factory one" },
                            R { 44100.0,      0.0, 48000.0, true,  61, "…and so does zero" },

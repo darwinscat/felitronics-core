@@ -554,6 +554,31 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   flush, so a mono `Svf` paid for sixteen, once per block, in the primitive every band, lane, crossover
   and probe calls.
 
+- **🔴 BREAKING (`core`): `StreamResampler::delayInputSamples()` now TAKES THE TWO RATES** —
+  `delayInputSamples (inRate, outRate)`. It ignores them today and returns `kHalf` either way; the
+  signature exists so that making the kernel length depend on the ratio (the open `kTaps` item) edits
+  one body instead of every consumer's arithmetic. The nullary form is GONE, and downstream callers
+  must pass the rates. **`felitronics-core` has no nullary caller left; `orbit-amp` has four.**
+- **`core` + `nam`: ONE OWNER FOR THE RATE-MATCH DELAY, and the restatements are gone.** The composition
+  is `core::StreamResampler::pairDelayHostSamples (hostSR, modelRunSR)` — pure geometry, "what a
+  down+up pair costs in host samples", with no opinion about whether one is installed. The POLICY is
+  `nam::NamStage::rateMatch (hostSR, modelSR) -> {modelRunSR, resampling, latencySamples}`: normalise an
+  unknown model rate, then gate at half a hertz, then round to nearest — and the ORDER of those three is
+  part of the contract. `nam::NamStage::kModelSampleRate` (48 kHz) is public, because a consumer sizing a
+  delay line before any model exists could not previously even name the number and one invented an
+  8 kHz stand-in and sized itself wrong. Seven restatements across three modules now ask instead.
+- **`rigplayer`: a host rate is judged in ONE place, and every buffer derived from one is bounded.** New
+  `RigPlayer::usableSampleRate (hostSR)` and `RigPlayer::kMaxSampleRate` (3.0e6 — the same ceiling
+  `dynamics::Compressor` and `limiter::TruePeakLimiter` already use, for the same stated reason). A rate
+  outside `(0, kMaxSampleRate]` falls back to 48 kHz exactly as a non-positive one always did. This is a
+  FIX, not a tidy-up: the dry-aligner capacity became `(int) ceil(<a function of the rate>)` earlier on
+  this branch, and a guard spelled `isfinite` does not make that conversion safe — measured through
+  `prepare()` with UBSan, `prepare(1e300, 64, 2)` returned **true** while converting out of range and
+  then overflowing `INT_MAX + 2`, and asked the heap for **16 GiB** in that one call. It now asks for
+  none. The capacity itself is `RigPlayer::dryAlignerCapacity (hostSR)`, pure and public so that it can
+  be pinned at rates this repository does not run: the floor at the shipped 256 had otherwise no test in
+  the tree that could see it at all.
+
 ## v0.29.0 — the loudness tag answers for the slot that is sounding, and the chain gives the same bits however you cut it (`rigplayer`, `mastering`)
 
 - **feat(rigplayer):** `soundingLoudness()` — the tag of the model actually carrying the sound, with

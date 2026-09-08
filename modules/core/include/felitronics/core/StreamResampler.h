@@ -136,16 +136,48 @@ struct StreamResampler
     // spellings carry a single rounding. Make the delay ratio-dependent (the open kTaps item) and D
     // becomes 35, 59, 118…, where integer straddles do exist: the nearest to the audio grid is a
     // 6930 Hz host against a 44.1 kHz model. One spelling, in one place, is the whole defence.
+    //
+    // PRECONDITION, stated as what is KEPT rather than as a wish: both rates positive and
+    // hostSR <= DBL_MAX/kHalf = 5.6177910464e306. Past that the multiplication overflows and the
+    // answer is inf even where the true one is finite. There is no lower bound to state — a subnormal
+    // quotient is absorbed by the leading kHalf, measured. A non-positive modelRunSR divides by zero,
+    // which is why nam::NamStage::rateMatch() normalises BEFORE it calls in here.
     static double pairDelayHostSamples (double hostSR, double modelRunSR) noexcept
     {
         const double down = delayInputSamples (hostSR, modelRunSR);      // host samples, going down
         const double up   = delayInputSamples (modelRunSR, hostSR);      // MODEL samples, coming back
         // 🔴 THE GROUPING IS THE SHIPPED ONE, LITERALLY. `up * hostSR / modelRunSR` parses as
         // `(up * hostSR) / modelRunSR`, which is what NamStage computed before this extraction
-        // (`d + d * hostSR / modelRunSR`). Writing `up * (hostSR / modelRunSR)` is the same value on
-        // every audio rate — 60 pairs, zero differences — and is NOT the same expression: it rounds
-        // the quotient first, and at finite extremes the two can part. A crew round caught the
-        // regrouping; "no number moves" has to mean the arithmetic, not just the answers we sampled.
+        // (`d + d * hostSR / modelRunSR`). A crew round caught a regrouping into
+        // `up * (hostSR / modelRunSR)`; "no number moves" has to mean the arithmetic, not just the
+        // answers we sampled.
+        //
+        // WHAT THE TWO SPELLINGS ACTUALLY COST, measured rather than asserted, because the next round
+        // read the same comment and concluded the opposite. While `up` is a power of two, scaling by
+        // it is exact and round-to-nearest commutes with it, so the two are BIT-IDENTICAL: 20 000 000
+        // random positive finite pairs over exponents ±300, and the 17x9 audio grid, give zero
+        // differences. They part only at the two ends, and each spelling loses at one of them:
+        //
+        //   hostSR > DBL_MAX/kHalf = 5.6177910464e306 → `up * hostSR` overflows and THIS spelling
+        //                                        returns inf where the answer is finite: DBL_MAX
+        //                                        against DBL_MAX/2 is 96, and this returns inf.
+        //
+        // 🔴 AND THAT IS THE ONLY END, which an earlier version of this paragraph got wrong — it also
+        // claimed a loss at the bottom, where a subnormal quotient costs the parenthesised spelling
+        // ~14 digits (3.1999999999999902e-309 against 3.2000000000000001e-309). That is true of the
+        // TERM and false of this FUNCTION: `down` is 32, and adding a subnormal to 32 annihilates it,
+        // so both spellings return bit-identical 32. A comment that attributes a term's loss to the
+        // result is the same disease as a comment that outlives its code.
+        //
+        // So the parenthesised spelling is, today, strictly the wider of the two, and it is NOT used
+        // anyway — deliberately. The reasons are continuity and the future, not accuracy: this is
+        // literally the expression NamStage shipped, a crew round already caught one regrouping of it,
+        // and under `-ffp-contract=on` (this repository's build flag) `down + up*(h/m)` is an FMA
+        // candidate while `down + (up*h)/m` is not. None of that bites while D is a power of two and
+        // both are exact. It all bites at once when the open kTaps item makes D ratio-dependent — at
+        // D = 35 the two spellings differ on 17.28 % of 20 000 000 random pairs — and THAT is when the
+        // choice should be made, with the kernel change, not before it. The PRECONDITION on the
+        // declaration says what today's spelling actually keeps.
         return down + up * hostSR / modelRunSR;                          // …converted to host samples
     }
 

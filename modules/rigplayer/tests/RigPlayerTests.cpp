@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -1167,6 +1168,44 @@ int main() {
         approx(b.gainAt(1000.0), 0.5, 0.01, "loaded again, sounding again");
     }
 
+    // The dry leg's applied delay, measured as a POSITION rather than inferred from a comb. Used by
+    // two groups below, so it lives out here rather than being written twice.
+    auto appliedDryDelay = [](Bench& b, double& peakOut, int blocks = 8) {
+        std::vector<float> l((std::size_t) kBlock, 0.0f), r((std::size_t) kBlock, 0.0f);
+        float* io[2] { l.data(), r.data() };
+        for (int i = 0; i < 48; ++i) {          // settle: the load is serviced from the audio loop,
+            std::fill(l.begin(), l.end(), 0.0f);  //   and the blend gains ramp
+            felitronics::test::run(b.p.process(io, 1, kBlock));
+            b.p.serviceHere();
+        }
+        int bestIdx = -1; double best = 0.0;
+        for (int blk = 0; blk < blocks; ++blk) {
+            std::fill(l.begin(), l.end(), 0.0f);
+            if (blk == 0) l[0] = 1.0f;         // one impulse, then silence
+            felitronics::test::run(b.p.process(io, 1, kBlock));
+            b.p.serviceHere();
+            for (int i = 0; i < kBlock; ++i)
+                if (std::fabs((double) l[(std::size_t) i]) > best)
+                    { best = std::fabs((double) l[(std::size_t) i]); bestIdx = blk * kBlock + i; }
+        }
+        peakOut = best;
+        return bestIdx;
+    };
+
+    // Hoisted out of the group below: the capacity group that follows measures the same rig at a
+    // different host rate, and a second copy of a fixture is a restatement like any other.
+    auto combRig = [] {
+        auto rig = testRig();
+        auto& mix = rig.chain[0].blend.front();
+        mix.dryLevelDb = 0.0;                       // no dry trim: a true 50/50 at the middle
+        mix.defaultValue = "150";
+        namz::rig::BlendPosition dryEnd; dryEnd.value = "0";   dryEnd.norm = 0.0; dryEnd.dryDb = 0.0;    dryEnd.wetDb = -120.0;
+        namz::rig::BlendPosition half;   half.value   = "150"; half.norm   = 0.5; half.dryDb   = 0.0;    half.wetDb   = 0.0;
+        namz::rig::BlendPosition wetEnd; wetEnd.value = "300"; wetEnd.norm = 1.0; wetEnd.dryDb = -120.0; wetEnd.wetDb = 0.0;
+        mix.positions = { dryEnd, half, wetEnd };
+        return throughTheFormat(rig);
+    };
+
     // ================================================================================================
     group("🔴 THE DRY/WET BLEND MUST NOT COMB — the rate-match delay belongs to BOTH legs");
     {
@@ -1186,17 +1225,6 @@ int main() {
         // 0.05 dB, so the dry FIR is bypassed; the tone controls sit at their reference positions, so
         // the wet FIRs are empty too; and the models are memoryless Linear gains. Anything left that is
         // not flat across frequency is the misalignment.
-        auto combRig = [] {
-            auto rig = testRig();
-            auto& mix = rig.chain[0].blend.front();
-            mix.dryLevelDb = 0.0;                       // no dry trim: a true 50/50 at the middle
-            mix.defaultValue = "150";
-            namz::rig::BlendPosition dryEnd; dryEnd.value = "0";   dryEnd.norm = 0.0; dryEnd.dryDb = 0.0;    dryEnd.wetDb = -120.0;
-            namz::rig::BlendPosition half;   half.value   = "150"; half.norm   = 0.5; half.dryDb   = 0.0;    half.wetDb   = 0.0;
-            namz::rig::BlendPosition wetEnd; wetEnd.value = "300"; wetEnd.norm = 1.0; wetEnd.dryDb = -120.0; wetEnd.wetDb = 0.0;
-            mix.positions = { dryEnd, half, wetEnd };
-            return throughTheFormat(rig);
-        };
 
         // 44.1 kHz on purpose: the models are tagged 48 000, so this is the rate at which NamStage
         // engages its rate-matcher at all. At 48 kHz there is no resampler and nothing to align.
@@ -1267,6 +1295,207 @@ int main() {
         ok(db(atNull) - db(atHalf) > -0.5,
            "359.1 Hz — the first null of an unaligned 61.4-sample comb — is within half a dB of 1 kHz ("
            + std::to_string(db(atNull) - db(atHalf)) + " dB), not in a notch");
+    }
+
+    // ================================================================================================
+    group("🔴 THE DRY ALIGNER'S CAPACITY, CHECKED WHERE IT IS MEAN — 384 kHz, not 44.1");
+    {
+        // WHY A SECOND RATE, AND WHY THIS ONE. The group above runs at 44.1 kHz, where the capacity is
+        // 256 and the delay asked of it is 61 — a four-fold margin, so the sizing arithmetic can be
+        // wrong by almost anything and the sweep stays flat. A diverse-testing round proved that is not
+        // a worry but a hole: TWO mutations of that arithmetic survived the entire suite — swapping the
+        // two rates, and dropping the "+ 2". Capacity has to be checked where it is MEAN.
+        //
+        // Below ~334.5 kHz it never is: the sizing is floored at the 256 that shipped, so every host
+        // rate up to there — 44.1, 96, 192 — sizes to exactly 256 whatever the arithmetic says, and
+        // both mutants are EQUIVALENT there. 384 kHz is the first grid rate past the floor, and it is
+        // where the computed term becomes the binding one.
+        //
+        // 🔴 AND THE INSTRUMENT IS THE DELAY, NOT THE COMB. A comb reading cannot see this: the "+ 2"
+        // mutant is short by exactly ONE sample, whose first null sits at fs/2 = 192 kHz, which reads
+        // -0.117 dB at 20 kHz — a quarter of the 0.5 dB threshold the group above uses, i.e. a defect
+        // that fits under its own tolerance. So this measures the quantity itself. It can, because the
+        // dry leg here is a PURE DELAY — the dry curve is flat so magnitudeCurveToFir returns {} and
+        // the dry FIR is bypassed, and the models are memoryless — which makes the position of an
+        // impulse in the output the applied delay, exactly, in samples.
+
+        // PRECONDITION 0 — the instrument reads POSITION, not merely "something arrived". At 48 kHz the
+        // models need no rate-match, the player asks for zero delay, and the impulse must come back at
+        // index zero. Without this cell a lambda that always returned the same index would pass below.
+        {
+            Bench b48(combRig(), 1, 48000.0);
+            ok(b48.p.setDial("mix", 0.0), "…the blend sits at its dry end at 48 kHz too");
+            double peak0 = 0.0;
+            const int at0 = appliedDryDelay(b48, peak0);
+            ok(b48.p.latencySamples() == 0 && at0 == 0,
+               "precondition 0: at 48 kHz the player asks for " + std::to_string(b48.p.latencySamples())
+               + " samples of dry delay and the impulse returns at index " + std::to_string(at0)
+               + " — the instrument resolves POSITION, so a shifted answer below means a shifted delay");
+        }
+
+        Bench b(combRig(), 1, 384000.0);
+        ok(b.p.setDial("mix", 0.0), "the blend sits at its dry end — the leg under test is the only one sounding");
+
+        double peak = 0.0;
+        const int measured = appliedDryDelay(b, peak);
+        const int asked    = b.p.latencySamples();
+
+        // PRECONDITION 1 — the delay asked for is the one the geometry says, and it is LARGE.
+        ok(asked == 288,
+           "precondition 1: at a 384 kHz host against a 48 kHz model the player asks the dry path for "
+           + std::to_string(asked) + " samples (geometry: 32 + 32·8 = 288, exactly an integer, which is "
+           "what makes the +2 mutant bite here and nowhere on the audio grid)");
+        // PRECONDITION 2 — and it is past what the shipped floor could hold, which is the whole point.
+        ok(asked > 255,
+           "precondition 2: " + std::to_string(asked) + " EXCEEDS the usable range of the 256 that "
+           "shipped (capacity-1 = 255), so the computed term is the binding constraint here. At 44.1 kHz "
+           "it is 61 against 255 and no sizing error can show");
+        // PRECONDITION 3 — the instrument is not reading noise.
+        ok(peak > 0.1,
+           "precondition 3: the impulse really is in the output — peak " + std::to_string(peak)
+           + ", against a wet leg held 120 dB down");
+
+        // THE CLAIM. Both surviving mutants fail exactly here, and they fail by DIFFERENT amounts, which
+        // is why the message prints the difference rather than a verdict:
+        //   swapping the rates  → 256 of capacity against 288 asked → clamped to 255, short by 33;
+        //   "+ 2" dropped to +0 → 288 of capacity against 288 asked → clamped to 287, short by 1.
+        ok(measured == asked,
+           "the dry path is delayed by EXACTLY what the player reports — asked " + std::to_string(asked)
+           + ", measured " + std::to_string(measured) + " (difference " + std::to_string(measured - asked)
+           + "). DryAligner clamps to capacity-1 SILENTLY, so a capacity that is one slot short shows up "
+             "here as a one-sample shift and nowhere else in the suite");
+
+        // A SECOND ORACLE, OF A DIFFERENT CONSTRUCTION, for the mutant that is loud enough to hear. A
+        // 33-sample misalignment at 384 kHz notches at fs/(2·33) = 5818 Hz, in band and deep; the
+        // one-sample mutant is inaudible here by construction and is caught by the line above alone.
+        ok(b.p.setDial("mix", 150.0), "…and back to a 50/50 blend for the audible half of the check");
+        const double atRef  = b.gainAt(1000.0);
+        const double atNull = b.gainAt(5818.0);
+        std::printf("      384 kHz, D = %d: 50/50 blend reads %.4f at 1 kHz, %.4f at 5818 Hz (%.3f dB)\n",
+                    asked, atRef, atNull, db(atNull) - db(atRef));
+        ok(db(atNull) - db(atRef) > -0.5,
+           "5818 Hz — the first null a 33-sample misalignment would cut, which is what a swapped pair of "
+           "rates costs at this host rate — is within half a dB of 1 kHz ("
+           + std::to_string(db(atNull) - db(atRef)) + " dB)");
+    }
+
+    // ================================================================================================
+    group("🔴 A HOST RATE OUT OF RANGE FALLS BACK — and the property is the RANGE, not finiteness");
+    {
+        // WHY. prepare() derives the dry-aligner capacity from the rate — `(int) ceil(f(fs_)) + 2` —
+        // and an out-of-range float→int conversion is undefined. The guard in front of it once said
+        // `isfinite`, which is not that property: 1e300 is perfectly finite and converts just as badly
+        // as an infinity. Measured through this very function with UBSan before the guard was widened,
+        // prepare(1e300, 64, 2) returned TRUE and fired twice — the conversion, then `INT_MAX + 2`.
+        // The same line has a second, entirely legal face: the capacity used to be a constant and is
+        // now a function of the argument, so one prepare() call asked the heap for 508.6 MiB at 1e11.
+        //
+        // A sanitizer is not in the default build, so this gates the fix by VALUE instead: latency is
+        // computed from fs_, so a rate that was NOT replaced shows up in it immediately.
+        // 🔴 AND THE BLOCKS ARE NOT OPTIONAL. The first draft of this read latencySamples() straight
+        // after prepare() and every cell passed — including the ones that were supposed to fail. The
+        // load is POSTED by the Bench constructor and SERVICED from inside the audio loop, so a player
+        // that has not yet run a block has empty slots and reports 0 whatever its rate. The
+        // precondition below is what caught it; without those two lines this whole group was a fixture
+        // that could not fail.
+        const auto rig = testRig();
+        auto latencyPreparedAt = [&rig](double rate) {
+            Bench b(rig, 1, rate);
+            std::vector<float> l((std::size_t) kBlock, 0.0f), r((std::size_t) kBlock, 0.0f);
+            float* io[2] { l.data(), r.data() };
+            for (int i = 0; i < 8; ++i) { felitronics::test::run(b.p.process(io, 1, kBlock)); b.p.serviceHere(); }
+            return b.p.latencySamples();
+        };
+        // A rate inside the range is KEPT — without this the group would pass on a guard that threw
+        // every rate away, which is the same blindness one level down.
+        ok(latencyPreparedAt(384000.0) == 288,
+           "precondition: a rate inside the range is kept — 384 kHz still reports "
+           + std::to_string(latencyPreparedAt(384000.0)) + " samples, so the guard is not simply "
+           "swallowing everything");
+        ok(RigPlayer::kMaxSampleRate == 3.0e6 && latencyPreparedAt(RigPlayer::kMaxSampleRate) == 2032,
+           "…and the ceiling itself is INSIDE the range: a host at kMaxSampleRate = "
+           + std::to_string(RigPlayer::kMaxSampleRate) + " reports "
+           + std::to_string(latencyPreparedAt(RigPlayer::kMaxSampleRate))
+           + " samples, want 2032 = 32 + 32·62.5 — so the comparison is <= and not <, and the constant "
+             "is the house 3.0e6 rather than whatever it happens to be");
+
+        // 🔴 THE TWO PURE FUNCTIONS, PINNED DIRECTLY — the same reason the nam suite pins rateMatch:
+        // nothing in this repository varies them, and one of the things they decide (the FLOOR) is
+        // invisible to every signal test in the tree. A crew round deleted the floor and the whole
+        // suite stayed green; the table below is what makes that impossible. Values computed by hand
+        // from the two documented facts — kHalf per leg, the return leg converted at h/m — plus the
+        // two spare slots, and NOT by asking the code.
+        {
+            struct C { double fs; int want; const char* why; };
+            for (const C c : { C {  44100.0,  256, "the floor: computed 64, and 64 is not what ships" },
+                               C {  96000.0,  256, "…still the floor: computed 98" },
+                               C { 192000.0,  256, "…still the floor: computed 162" },
+                               C { 333000.0,  256, "the LAST rate at which the floor binds — 32 + 222 = 254 exactly, +2 = 256" },
+                               C { 333001.0,  257, "…and the very FIRST at which the computed term takes over — one hertz, not the round thousand a first draft guessed" },
+                               C { 352800.0,  270, "32 + 352800/1500 = 267.2 -> 268 + 2" },
+                               C { 384000.0,  290, "32 + 256 = 288 exactly -> 288 + 2" },
+                               C { RigPlayer::kMaxSampleRate, 2034, "the ceiling: 32 + 2000 -> 2032 + 2" },
+                               C {     0.0,   256, "a rejected rate becomes 48 kHz, hence the floor" },
+                               C {    1e300, 256, "…and so does a finite-but-out-of-range one" } })
+                ok(RigPlayer::dryAlignerCapacity(c.fs) == c.want,
+                   "dryAlignerCapacity(" + std::to_string(c.fs) + ") = "
+                   + std::to_string(RigPlayer::dryAlignerCapacity(c.fs)) + ", want "
+                   + std::to_string(c.want) + " — " + c.why);
+
+            // …and the floor is a FLOOR, not a constant: the two neighbours above straddle it, so a
+            // suite that only ever saw 256 could not tell the two apart.
+            ok(RigPlayer::dryAlignerCapacity(333000.0) == RigPlayer::dryAlignerCapacity(44100.0)
+                   && RigPlayer::dryAlignerCapacity(334000.0) > 256,
+               "…so the computed term really does take over, and the pair 333000/334000 is where");
+
+            // 🔴 A NON-INTEGER RATE, because every other cell in this file is a whole number and a crew
+            // round exploited exactly that: a mutant that FLOORED the host rate passed the entire
+            // repository. Rates are doubles in this API and 48000.6 is a real one — it is the rate the
+            // resampling gate is pinned against one file over.
+            ok(RigPlayer::usableSampleRate(48000.6) == 48000.6,
+               "usableSampleRate(48000.6) = " + std::to_string(RigPlayer::usableSampleRate(48000.6))
+               + " — a fractional rate survives unrounded, which no integer cell can tell you");
+
+            for (const C c : { C { 48000.0, 48000, "a sane rate is kept" },
+                               C { RigPlayer::kMaxSampleRate, 3000000, "the ceiling is INSIDE the range (<=, not <)" },
+                               C { 0.0, 48000, "zero" }, C { -48000.0, 48000, "negative" },
+                               C { 1e300, 48000, "finite, out of range" },
+                               C { 3.0e6 * 1.000001, 48000, "a hair over the ceiling" } })
+                ok(RigPlayer::usableSampleRate(c.fs) == (double) c.want,
+                   "usableSampleRate(" + std::to_string(c.fs) + ") = "
+                   + std::to_string(RigPlayer::usableSampleRate(c.fs)) + " — " + c.why);
+            ok(RigPlayer::usableSampleRate(std::numeric_limits<double>::quiet_NaN()) == 48000.0
+                   && RigPlayer::usableSampleRate(std::numeric_limits<double>::infinity()) == 48000.0,
+               "…and NaN and infinity fall back too, which is what makes an explicit isfinite "
+               "redundant rather than merely unnecessary");
+        }
+
+        struct Bad { double rate; const char* name; };
+        for (const Bad r : { Bad { 0.0, "zero" }, Bad { -48000.0, "negative" },
+                             Bad { std::numeric_limits<double>::quiet_NaN(), "NaN" },
+                             Bad { std::numeric_limits<double>::infinity(), "infinite" },
+                             Bad { 1e300, "1e300 — FINITE, and the one the old guard let through" },
+                             Bad { 1e11, "1e11 — finite, and the one that asked for 508 MiB" },
+                             Bad { RigPlayer::kMaxSampleRate * 1.000001, "a hair over the ceiling" } })
+            ok(latencyPreparedAt(r.rate) == 0,
+               std::string("a ") + r.name + " host rate falls back to 48 kHz — reported latency "
+               + std::to_string(latencyPreparedAt(r.rate)) + ", the same 0 a 48 kHz host gives. With "
+               "only `isfinite` in front of it, 1e300 reported -1 and 1e11 reported 66666699");
+
+        // …and the capacity really is derived, all the way to the top of the range: the impulse comes
+        // back exactly where the player says it will, at a rate 7.8x the highest a DAW offers.
+        {
+            Bench b(combRig(), 1, RigPlayer::kMaxSampleRate);
+            ok(b.p.setDial("mix", 0.0), "…the blend sits at its dry end at 3 MHz too");
+            double peak = 0.0;
+            const int measured = appliedDryDelay(b, peak, 16);
+            const int asked    = b.p.latencySamples();
+            ok(asked == 2032 && measured == asked,
+               "at the ceiling rate the dry path is delayed by exactly what the player reports — asked "
+               + std::to_string(asked) + ", measured " + std::to_string(measured)
+               + " — so the capacity is computed correctly across the whole accepted range, not just "
+                 "at the two rates the rest of this file uses");
+        }
     }
 
     return felitronics::test::report();

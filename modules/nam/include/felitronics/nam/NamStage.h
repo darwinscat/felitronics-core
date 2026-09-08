@@ -124,9 +124,15 @@ public:
     //
     // ⚠️ IT IS NOT A PROVABLE CEILING, and an earlier version of this comment claimed it was. The
     // check is a TOLERANCE, not equality: a model at 48000.5 is accepted, prepare() then adopts that
-    // rate, and the next half-hertz step is accepted against the new one. Measured: 65 such steps
-    // walked the run rate from 48000 to 47967.5. A LOWER run rate means a LONGER round trip, so
-    // sizing a buffer from this constant alone can come up short — floor it at what already shipped.
+    // rate, and the next half-hertz step is accepted against the new one. A LOWER run rate means a
+    // LONGER round trip, so sizing a buffer from this constant alone can come up short.
+    //
+    // 🔴 AND THE FIRST NUMBER PUBLISHED FOR IT MEASURED THE PROBE, NOT THE RATCHET. "65 accepted steps
+    // walked it from 48000 to 47967.5" is reproducible, but 65 is kMaxRetiredModels + 1: with no audio
+    // running between loads the retire queue fills and the next install parks as pending, so the walk
+    // stops for a reason that has nothing to do with rates. Run audio between the loads — which a
+    // plugin always does — and the walk does not stop at all: 2000 steps, no refusal. The ratchet is
+    // UNBOUNDED, which is a stronger reason to floor a derived buffer, not a weaker one.
     //
     // It is public because a consumer sizing a delay line before any model exists has to start
     // somewhere, and until now it could not even name this number: a downstream repository invented a
@@ -148,8 +154,14 @@ public:
     // would cost, not a configuration a fresh stage can reach.
     //
     // Precondition, documented rather than enforced because this extraction promises that no number
-    // moves: hostSR positive and finite. Outside that the answer is whatever the arithmetic gives
-    // (h = 0 reports 32 against a real 64; h = inf reports -1), exactly as it did before.
+    // moves — and stated as the range it actually KEEPS, since "positive and finite" was measured to be
+    // wider than the arithmetic supports: hostSR in (0, 3.22e12]. Outside that the answer is whatever
+    // the arithmetic gives, exactly as it did before the extraction, and there are four regimes rather
+    // than the two the .cpp used to name — they are enumerated with their thresholds at rateMatch()'s
+    // definition. The two that bite: past ~3.22e12 the narrowing of lround's long to int invents a
+    // plausible positive answer with no flag raised, and past ~1.38e22 (an infinity included) the
+    // answer is whatever that platform's lround saturates to, which is NOT the same on all of them —
+    // measured on four rows, see the .cpp. h = 0 reports 32 against a real 64.
     static RateMatch rateMatch (double hostSR, double modelSR) noexcept;
     // How many samples this model must be FED before its output means anything — its receptive field.
     // A network with empty buffers describes the silence it was born into for exactly this long, so

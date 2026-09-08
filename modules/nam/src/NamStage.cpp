@@ -553,13 +553,41 @@ bool   NamStage::modelHasLoudness() const { return impl->hasLoudness.load (std::
 //     nearest. The residual is at most half a sample (worst on the shipped grid: 0.40 at 44.1 kHz,
 //     whose first comb notch against an undelayed dry path sits at 55 kHz, out of band).
 //
-// 🔴 NOT GUARDED, DELIBERATELY, and the earlier wording of this paragraph was wrong about what an
-// absurd hostSR actually does. A negative host usually produces a perfectly finite, perfectly useless
-// number; a NaN fails the gate and returns 0; only an infinite host reaches lround with something it
-// cannot represent. None of that is new — it is what the shipped code did — and adding a guard would
-// be a BEHAVIOUR change wearing a refactor's clothes, while this commit promises that no number moves.
-// The one input that could divide by zero cannot reach the division: step 1 turns a non-positive model
-// rate into the factory rate. A real contract for absurd host rates is a separate question.
+// 🔴 NOT GUARDED, DELIBERATELY — and what an absurd hostSR does has now been measured rather than
+// reasoned about, because two earlier wordings of this paragraph were wrong about it. There are FOUR
+// regimes against a 48 kHz model, not two (m = the model rate, the delay is 32 + 32·h/m):
+//
+//   h negative      → a perfectly finite, perfectly useless number (-48000 gives exactly 0).
+//   h NaN           → fails the gate, returns 0 (the comparison itself raises FE_INVALID).
+//   h > ~3.22e12    → lround is fine, but NARROWING ITS long TO int silently invents a plausible
+//                     positive answer: h = 1e18 reports 1842981579 samples of latency, no flag raised.
+//   h > ~1.38e22    → the value passes out of long's range too: lround saturates and FE_INVALID is
+//                     raised. An INFINITE host lands in this same regime, which is why the earlier
+//                     claim that "only an infinite host" gets this far was false: a finite 1e23
+//                     reaches it identically, on every row measured.
+//
+// 🔴 AND THE ANSWER IN THE LAST TWO REGIMES IS PLATFORM-SPECIFIC, so no number is quoted for it here.
+// Measured on four rows rather than reasoned about, because an earlier draft of this paragraph quoted
+// "-1" and that is one toolchain's answer out of three:
+//
+//   arm64 macOS / x86-64 macOS (Apple libm) : lround saturates to LONG_MAX  → (int) = -1
+//   x86-64 Debian (gcc 14 + glibc)          : lround saturates to LONG_MIN  → (int) =  0
+//   x86-64 Windows (MSVC 19.44 + UCRT)      : long is 32 BITS, so lround saturates far earlier —
+//                                             even the 1e18 case, where all three POSIX rows agree on
+//                                             1842981579, reads 0 there.
+//
+// The two Mac rows and the Debian row share an ISA in one pairing and a toolchain in the other, which
+// is what identifies libm rather than the ISA as the thing that differs. On the SHIPPED grid — 16 host
+// rates x 3 model rates, up to the 3 MHz ceiling rigplayer now enforces — all four rows are
+// byte-identical, so this divergence lives strictly outside the documented domain.
+//
+// None of that is new: the base commit's latencySamples() computed `lround(d + d*hostSR/modelRunSR)`
+// with the same types and the same gate, so every one of the four regimes predates this extraction.
+// Adding a guard would be a BEHAVIOUR change wearing a refactor's clothes, while this commit promises
+// that no number moves. The one input that could divide by zero cannot reach the division: step 1
+// turns a non-positive model rate into the factory rate. A real contract for absurd host rates is a
+// separate question — and the consumer that actually sizes a buffer from this, rigplayer, no longer
+// depends on the answer: it bounds its host rate before it asks.
 NamStage::RateMatch NamStage::rateMatch (double hostSR, double modelSR) noexcept
 {
     RateMatch r {};

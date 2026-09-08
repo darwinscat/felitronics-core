@@ -379,6 +379,25 @@ int main()
         const double W = 2.0 * kPi * 100.0 / H;
         ok (c.real() > 0.6, "the round trip does NOT invert (Re = " + std::to_string (c.real()) + ")");
         approx (std::abs (c), 1.0, 1.0e-4, "…and it does not change the level at 100 Hz");
+        // 🔴 THIS LITERAL IS DELIBERATE AND IT IS A GATE. DO NOT REPLACE IT WITH A CALL.
+        // The branch that owns this file spent itself removing restatements of the round-trip formula,
+        // and 61.4 is, textually, one more of them. It is not: it is the ORACLE, and an oracle that
+        // asks the thing it measures has stopped being one. The same file already learned this once —
+        // a sweep in NamStageTests was rewritten to ask core, a +1 error walked straight through it,
+        // and it had to be restored.
+        //
+        // MEASURED, not argued, so the next reader does not have to take it on trust. Inject the very
+        // change this number defends against — a JOINT shift of the kernel and the formula, which is
+        // exactly what the open kTaps item is (kTaps 64 -> 66, so kHalf and pairDelayHostSamples move
+        // together) — and count:
+        //
+        //     with the literal :  20 failures here, SIX of them these delay checks (63.3187 vs 61.4)
+        //     with a call      :  14 failures here, ZERO of them delay checks
+        //
+        // The six that vanish are the entire defence of the DELAY axis. What survives measures
+        // passband attenuation, which is a different quantity. A number computed by hand from the
+        // kernel's construction is the only thing in this repository that can see a change which moves
+        // the code and its own arithmetic in step.
         approx (-std::arg (c) / W, 61.4, 0.01,
                 "the carrier phase back-counts the delay to 61.4 samples — the geometry "
                 "kHalf·(1 + 44100/48000) = 32·1.91875, to four decimals");
