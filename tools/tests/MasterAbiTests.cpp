@@ -456,7 +456,10 @@ int main()
         std::vector<float> out ((std::size_t) lat * kNch, 0.0f);
         std::uint32_t got = 12345;
         ok (fc_master_flush (h, out.data(), 0, &got) == FC_ERR_CAPACITY, "a zero capacity");
-        ok (got == 0, "and `written` is cleared even on a refusal");
+        // NOT cleared: `written` is written only once every refusal is behind us. Clearing on entry
+        // meant a call refused for ALIASING had already put a zero into the caller's audio — a refusal
+        // that moved something, which is the one thing a refusal may not do.
+        ok (got == 12345, "and a refused call leaves `written` exactly as it was");
         ok (fc_master_flush (h, out.data(), (std::uint32_t) lat - 1, &got) == FC_ERR_CAPACITY,
             "one frame short of the latency — the core keeps no arrears, so a partial drain is a trap");
         ok (fc_master_flush (h, nullptr, (std::uint32_t) lat, &got) == FC_ERR_NULL, "a null buffer");
@@ -645,14 +648,22 @@ int main()
             const std::size_t frames = (std::size_t) (kFs * 4.0);
             auto in = tone (frames, kNch);
             std::vector<float> out (in.size(), 0.0f);
-            fc_solution sol = 0;
+            fc_solution sol = 0xABCD;
+            // A SEARCH IS NOT EXEMPT FROM THE STREAM GUARD. It used to reset the chain out from under a
+            // stream in progress and answer FC_OK, so a solve destroyed exactly what `configure` had
+            // just refused to destroy. One policy for both, and `reset` is the way out.
+            ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol)
+                    == FC_ERR_STATE, "solve is refused while a stream is in progress");
+            ok (sol == 0xABCD, "and the out-handle is untouched, so a live solution cannot be wiped by it");
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_STATE, "the guard is still armed");
+            ok (fc_master_reset (h) == FC_OK, "reset ends the stream");
             ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK,
-                "the solve returns a verdict");
+                "and now the solve returns a verdict");
             fc_solution_summary sum {}; FC_INIT (sum);
             (void) fc_solution_summary_get (sol, &sum);
-            ok (sum.status == FC_SOLVE_INVALID_REQUEST, "PRECONDITION: it refused BEFORE rendering");
-            ok (fc_master_configure (h, &p, &r) == FC_ERR_STATE,
-                "and the guard is STILL armed — a refused solve moved nothing");
+            ok (sum.status == FC_SOLVE_INVALID_REQUEST, "which is the solver's own InvalidRequest");
+            ok (fc_master_configure (h, &p, &r) == FC_OK,
+                "and a solve that refused BEFORE rendering left the chain configurable");
             fc_solution_destroy (sol);
             fc_master_destroy (h);
         }
@@ -664,9 +675,6 @@ int main()
             fc_master_params p = goodParams();
             fc_master_resolved r {}; FC_INIT (r);
             (void) fc_master_configure (h, &p, &r);
-            auto warm = tone (64, kNch);
-            (void) fc_master_process (h, warm.data(), warm.data(), 64);
-
             fc_loudness_request req {}; fc_loudness_request_default (&req);
             req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1;
             const std::size_t frames = (std::size_t) (kFs * 4.0);
@@ -690,7 +698,8 @@ int main()
             ok (fc_master_set_channel_weight (h, 2, 0.0) == FC_OK, "and zero, which is what LFE gets");
             ok (fc_master_set_channel_weight (h, -1, 1.0) == FC_ERR_RANGE, "a negative channel");
             ok (fc_master_set_channel_weight (h, 999, 1.0) == FC_ERR_RANGE, "one past the last channel");
-            ok (fc_master_set_channel_weight (h, 0, -1.0) == FC_ERR_NON_FINITE, "a negative weight");
+            ok (fc_master_set_channel_weight (h, 0, -1.0) == FC_ERR_RANGE,
+            "a negative weight is out of RANGE — calling a number you can see 'non-finite' is a lie");
             ok (fc_master_set_channel_weight (h, 0, std::numeric_limits<double>::quiet_NaN())
                     == FC_ERR_NON_FINITE, "a NaN weight");
             ok (fc_master_set_channel_weight (0, 0, 1.0) == FC_ERR_HANDLE, "and it checks the handle first");
@@ -737,6 +746,17 @@ int main()
         // mutant that dropped `toleranceLu` survived for exactly that reason.
         req.toleranceLu = 0.037;
         req.truePeakAimDb = 0.073;
+        // EVERY request field off its default. A crew round dropped ten of them one at a time and every
+        // one survived, because every fixture set target/tp/maxPasses and left the rest where the
+        // default writer had put them — the same "a field at its default cannot catch a missing
+        // mapping" that the parameter fixture had already been repaired for.
+        req.minPlrDb = 3.7;
+        req.maxLraLossLu = 7.3;
+        req.inputLoudnessRangeLu = 5.3;
+        req.activityThresholdDb = 0.37;
+        req.initialGainDb = 1.7;
+        req.limiterGr.limitDb = 17.3;    req.limiterGr.statistic = FC_GR_P95;
+        req.compressorGr.limitDb = 23.7; req.compressorGr.statistic = FC_GR_MEAN;
 
         const std::size_t frames = (std::size_t) (kFs * 6.0);
         auto in = tone (frames, kNch);
@@ -766,6 +786,10 @@ int main()
             LoudnessRequest lr {};
             lr.targetLufs = -16.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 2;
             lr.toleranceLu = 0.037; lr.truePeakAimDb = 0.073;
+            lr.minPlrDb = 3.7; lr.maxLraLossLu = 7.3; lr.inputLoudnessRangeLu = 5.3;
+            lr.activityThresholdDb = 0.37; lr.initialGainDb = 1.7;
+            lr.limiterGr.limitDb = 17.3;    lr.limiterGr.statistic = GrStatistic::P95;
+            lr.compressorGr.limitDb = 23.7; lr.compressorGr.statistic = GrStatistic::Mean;
             const float* ip[2] { in.data(), in.data() + frames };
             float*       op[2] { viaCpp.data(), viaCpp.data() + frames };
             const LoudnessSolution direct = solver.solve (chain, rend, cp, ip, op, kNch, (int) frames, lr);
@@ -801,16 +825,58 @@ int main()
             ok (sum.passes <= 2 + 1,
                 "the search spent no more than the budget the request carried (+1 for delivering)");
 
+            // EVERY field of the summary, the measurement, both gain-reduction summaries and the log —
+            // not a representative sample. A crew round crossed, zeroed or constant-folded 32 of them
+            // one at a time and every mutant survived, because the comparison read six numbers.
+            ok (sum.binding == (std::int32_t) direct.binding, "the binding constraint");
+            ok (sum.alsoViolated == direct.alsoViolated, "the violation mask");
+            ok (sum.logCount == direct.logCount, "the log length");
+            ok (sum.activityThresholdDb == direct.activityThresholdDb, "the echoed activity threshold");
+            ok (sum.achievedBelowLufs == direct.achievedBelowLufs
+                && sum.achievedAboveLufs == direct.achievedAboveLufs, "both bracketing loudnesses");
+            ok (sum.gainBelowDb == direct.gainBelowDb && sum.gainAboveDb == direct.gainAboveDb,
+                "and both bracketing gains, in the right order");
+
+            ok (meas.samplePeakDb == direct.measured.samplePeakDb, "the sample peak");
+            ok (meas.plrDb == direct.measured.plrDb, "the peak-to-loudness ratio");
+            ok (meas.limiterMaxReconstructedPeakDb == direct.measured.limiterMaxReconstructedPeakDb,
+                "the reconstructed peak the limiter saw");
+            ok (meas.latencySamples == direct.measured.latencySamples, "the latency");
+            ok (meas.gatingBlocks == direct.measured.gatingBlocks
+                && meas.droppedBlocks == direct.measured.droppedBlocks
+                && meas.nonFiniteSubHops == direct.measured.nonFiniteSubHops, "the three block counters");
+            ok (meas.loudnessValid == (direct.measured.loudnessValid ? 1 : 0)
+                && meas.lraValid == (direct.measured.lraValid ? 1 : 0), "and both validity flags");
+
+            auto sameGr = [] (const fc_gr_stats& a, const GainReductionStats& b)
+            {
+                return a.meanDb == b.meanDb && a.p95Db == b.p95Db && a.maxDb == b.maxDb
+                    && a.activeFraction == b.activeFraction && a.frames == b.frames
+                    && a.nonFinite == b.nonFinite && a.aboveRange == b.aboveRange
+                    && a.valid == (b.valid ? 1 : 0);
+            };
+            ok (sameGr (meas.compressor, direct.measured.compressor)
+                && sameGr (meas.limiter, direct.measured.limiter),
+                "every field of both gain-reduction summaries, and NOT crossed between the two");
+            ok (meas.compressor.maxDb != meas.limiter.maxDb || direct.measured.compressor.maxDb
+                                                            == direct.measured.limiter.maxDb,
+                "PRECONDITION: the two summaries differ, so a swap between them would be visible");
+
             std::vector<fc_solve_pass> log ((std::size_t) sum.logCount + 1);
             std::uint32_t written = 0;
             (void) fc_solution_log (sol, log.data(), (std::uint32_t) log.size(), &written);
             ok (written == (std::uint32_t) direct.logCount, "the log has the core's length");
             bool logSame = (written > 0);
             for (std::uint32_t i = 0; i < written; ++i)
-                if (log[i].gainDb != direct.log[i].gainDb || log[i].ceilingDb != direct.log[i].ceilingDb
-                    || log[i].integratedLufs != direct.log[i].integratedLufs
-                    || log[i].violated != direct.log[i].violated) logSame = false;
-            ok (logSame, "and every pass record crosses unchanged (gain, ceiling, loudness, mask)");
+            {
+                const SolvePassRecord& d = direct.log[i];
+                if (log[i].gainDb != d.gainDb || log[i].ceilingDb != d.ceilingDb
+                    || log[i].integratedLufs != d.integratedLufs || log[i].truePeakDbTp != d.truePeakDbTp
+                    || log[i].plrDb != d.plrDb || log[i].limiterMaxGrDb != d.limiterMaxGrDb
+                    || log[i].loudnessRangeLu != d.loudnessRangeLu
+                    || log[i].violated != d.violated) logSame = false;
+            }
+            ok (logSame, "and EVERY field of every pass record crosses unchanged — all eight");
         }
         fc_solution_destroy (sol);
         fc_master_destroy (h);
@@ -1072,6 +1138,67 @@ int main()
                 "mid-stream AND mis-versioned answers STATE — the handle's state comes first");
             fc_master_destroy (h);
         }
+    }
+
+
+    //==========================================================================
+    group ("the alignment and aliasing guards the pre-merge round found unpinned");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        (void) fc_master_configure (h, &p, &r);
+
+        // A misaligned STRUCT pointer. Only the audio pointers were pinned; the struct and scalar
+        // guards could both be deleted without a red test.
+        auto raw = std::vector<char> (sizeof (fc_master_params) + 8);
+        auto* skewParams = reinterpret_cast<fc_master_params*> (raw.data() + 1);
+        ok (fc_master_configure (h, skewParams, &r) == FC_ERR_ALIGNMENT, "a misaligned parameter struct");
+        auto rawR = std::vector<char> (sizeof (fc_master_resolved) + 8);
+        auto* skewRes = reinterpret_cast<fc_master_resolved*> (rawR.data() + 1);
+        ok (fc_master_configure (h, &p, skewRes) == FC_ERR_ALIGNMENT, "a misaligned resolved struct");
+
+        // A misaligned SCALAR out-parameter.
+        auto rawL = std::vector<char> (sizeof (std::int32_t) + 8);
+        auto* skewLat = reinterpret_cast<std::int32_t*> (rawL.data() + 1);
+        ok (fc_master_latency (h, skewLat) == FC_ERR_ALIGNMENT, "a misaligned scalar out-parameter");
+
+        // `flush` with MORE capacity than the latency: the planar stride is `capacity`, not the
+        // latency, and nothing exercised the two being different.
+        std::int32_t lat = 0; (void) fc_master_latency (h, &lat);
+        const std::uint32_t cap = (std::uint32_t) lat + 100u;
+        std::vector<float> wide ((std::size_t) cap * kNch, -7.0f);
+        std::uint32_t w = 0;
+        ok (fc_master_flush (h, wide.data(), cap, &w) == FC_OK && w == (std::uint32_t) lat,
+            "a capacity above the latency drains exactly the latency");
+        ok (wide[(std::size_t) cap - 1] == -7.0f && wide[(std::size_t) cap + 0] != -7.0f,
+            "and the planes are laid out at stride CAPACITY: the gap after plane 0 is untouched "
+            "while plane 1 starts at cap");
+        fc_master_destroy (h);
+    }
+
+    group ("the solve out-handle may not point into anything the call reads");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1;
+        const std::size_t frames = (std::size_t) (kFs * 2.0);
+        auto in = tone (frames, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames,
+                             reinterpret_cast<fc_solution*> (out.data())) == FC_ERR_SPAN,
+            "an out-handle inside the OUTPUT");
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames,
+                             reinterpret_cast<fc_solution*> (const_cast<float*> (in.data() + 8))) == FC_ERR_SPAN,
+            "an out-handle inside the INPUT — which used to zero a sample before the search read it");
+        ok (in[8] != 0.0f, "and that input sample is still what it was");
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames,
+                             reinterpret_cast<fc_solution*> (&p.bypassLimiter)) == FC_ERR_SPAN,
+            "and one inside the PARAMETER STRUCT, which used to be zeroed before the mapping read it");
+        ok (p.bypassLimiter == goodParams().bypassLimiter, "that field is still what it was too");
+        fc_master_destroy (h);
     }
 
     return felitronics::test::report();

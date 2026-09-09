@@ -68,7 +68,7 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - **`fcore_master selftest` is the acceptance, not a smoke test:** the same programme rendered
     through the C entry points and through a direct C++ call, in ONE binary on ONE machine, compared
     bit for bit — **0 of 384 000 samples differ**, with a precondition asserting the chain actually did
-    something (the output peaks at 0.8685 and moves 0.7888 away from its input). Block-independence
+    something (measured on the shipped fixture, and printed by the test rather than pinned here). Block-independence
     survives the boundary at call sizes **1, 337, 4096 and whole-file, 0 differing samples each**,
     because nothing here re-blocks anything: the call reaches `MasteringChain::process()` in one piece
     and the chain's own fixed quantum stays the only clock. It runs in the `wasm-audio` tier too.
@@ -80,7 +80,8 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     full scale**, all of it `stereo::MonoBass`, whose `reset()` snaps the width where its setter ramps
     it over 20 ms). A zeroed parameter struct is not `MasteringChainParams{}` (**287 998 of 288 000**),
     so `fc_master_params_default()` exists. And a second programme through one handle without
-    `fc_master_reset` differs from the first by **379 277 samples**.
+    `fc_master_reset` is a different render — the selftest prints the count for the fixture it
+    ran, rather than carrying a figure that a later fixture change would quietly falsify.
   - **`configure` re-prepares, and is refused once audio has been handed over.** Reading `resolved()`
     straight back from a deferred `setParams` reports the PREVIOUS parameter set — **5.0000 dB** on the
     limiter ceiling, **149.968 ms** on its release, and the core's own defaults on a fresh chain.

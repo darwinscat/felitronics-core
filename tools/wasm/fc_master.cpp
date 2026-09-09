@@ -7,7 +7,7 @@
 // NOTHING HERE COMPUTES ANYTHING. Every number handed back was produced by `felitronics::mastering` and
 // read out of it. What this file does is four things and no fifth: validate what a page can hand it,
 // translate enum codes, copy fields, and own handles. If a line of this file ever looks like DSP, it is
-// a defect, and `fcore_master --selftest` is the gate that finds it — the same programme through this
+// a defect, and `fcore_master selftest` is the gate that finds it — the same programme through this
 // ABI and through a direct C++ call, one binary, one machine, compared bit for bit.
 //
 // It compiles natively as well as under emscripten: EMSCRIPTEN_KEEPALIVE degrades to a plain extern "C",
@@ -126,6 +126,31 @@ static_assert (sizeof (MasteringChainConfig)           == 48);
 static_assert (sizeof (MasteringChainParams)           == 6544);
 static_assert (sizeof (MasteringChainResolved)         == 72);
 
+// THE PIN THAT WORKS THROUGH INHERITANCE. A structured binding cannot decompose a type whose base has
+// members, and `sizeof` is blind to a field that lands in existing padding — so between them the two
+// mechanisms above leave the whole `CompressorParams` chain unguarded. Aggregate initialisation is not
+// blind to either: brace-initialising with EXACTLY the expected list of member types compiles only
+// while that list is the whole of the type. The negative control is half the pin: without it, a
+// too-short list would still compile through value-initialisation of the rest.
+template <class T, class... A>
+concept BraceInit = requires { T { A {}... }; };
+
+static_assert (BraceInit<dynamics::GainReductionParams,
+                         dynamics::DetectorParams, dynamics::Mode,
+                         double, double, double, double, double, double>,
+               "GainReductionParams grew or lost a member — update the ABI mapping with it");
+static_assert (! BraceInit<dynamics::GainReductionParams,
+                           dynamics::DetectorParams, dynamics::Mode,
+                           double, double, double, double, double, double, double>,
+               "negative control: the pin above must be exact, not a lower bound");
+
+static_assert (BraceInit<dynamics::CompressorParams,
+                         dynamics::GainReductionParams, double, bool, double>,
+               "CompressorParams grew or lost a member — update the ABI mapping with it");
+static_assert (! BraceInit<dynamics::CompressorParams,
+                           dynamics::GainReductionParams, double, bool, double, double>,
+               "negative control");
+
 // The arity pins. Declared in a never-called function so they cost nothing and read as what they are.
 [[maybe_unused]] void layoutPins()
 {
@@ -145,8 +170,13 @@ static_assert (sizeof (MasteringChainResolved)         == 72);
     auto& [mb_en, mb_f, mb_w] = mb;
     (void) mb_en; (void) mb_f; (void) mb_w;
 
-    // `CompressorParams` inherits, so it cannot be decomposed; its BASE can, and the derived part is
-    // pinned by size below. Between them, a field added at either level is a build error.
+    // `CompressorParams` inherits, so it cannot be decomposed, and NEITHER CAN ITS BASE: the chain is
+    // `CompressorParams : GainReductionParams : DetectorParams`, and only the great-grandparent
+    // decomposes. An earlier version of this comment claimed the size pins covered the rest and that
+    // was FALSE, measured: a `bool` dropped into the padding after `mode` leaves
+    // `sizeof(GainReductionParams)` at 72, and one after `autoMakeup` leaves `sizeof(CompressorParams)`
+    // at 96 — both pins blind on exactly the type the arity check exists for, and nine mapped fields
+    // resting on them. The BraceInit pins below are what actually catch it.
     dynamics::DetectorParams det {};
     auto& [det_d, det_link, det_rms] = det;
     (void) det_d; (void) det_link; (void) det_rms;
@@ -641,9 +671,12 @@ void freeSlot (Slot& s) noexcept
     s.solution.reset();
     s.kind = Kind::Free;
     // Bump the generation so the handle just destroyed can never address the next object here. 24 bits
-    // wide, and it wraps rather than retiring the slot: 16.7 million destroys of ONE slot before a
-    // number repeats is not a budget anybody meets, while retirement was one that a per-file render
-    // loop meets in an afternoon.
+    // wide, and it WRAPS rather than retiring the slot: 16.7 million destroys of one slot before a
+    // number repeats is not a budget anybody meets, while the 8-bit retirement this replaced was one a
+    // per-file render loop meets in an afternoon (8 x 255 = 2040 objects per page load, refused creates
+    // included). Generation 0 is skipped so a handle never equals a small integer a caller might pass
+    // by accident; that costs one comparison and cannot be observed by a test, which is why it is
+    // written down here rather than pinned.
     s.gen = (s.gen + 1) & 0x00FFFFFFu;
     if (s.gen == 0u) s.gen = 1u;
 }
@@ -691,9 +724,9 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
         || ! m.chain.prepare (cfg->sampleRate, cfg->channels, cc))
     {
         // `abandonSlot`, not `freeSlot`: no handle ever left this function, so there is nothing for a
-        // stale one to alias and no reason to spend a generation. Spending one here is not free —
-        // generations are 8 bits and a slot RETIRES when they run out, so 2040 refused creates would
-        // exhaust a table that had never issued a single handle.
+        // stale one to alias and no reason to spend a generation. (With the generation at 24 bits this
+        // is no longer load-bearing — it was, at 8, where 2040 refused creates exhausted a table that
+        // had never issued a handle — but the distinction is the honest one and it costs nothing.)
         abandonSlot (g_slots[idx]);
         return FC_ERR_REFUSED_BY_CORE;
     }
@@ -751,13 +784,16 @@ FC_EXPORT fc_status fc_master_process (fc_master h, const float* in, float* out,
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
 
+    // THE HANDLE'S STATE COMES BEFORE THE NO-OP. `n == 0` moves nothing, but the contract says this
+    // handle cannot be processed at all until it is configured, and a call that answers FC_OK on a
+    // handle the header says is refused makes the sentence false for one input.
+    if (m.solverRan) return FC_ERR_STATE;   // the chain holds the SOLVER's parameters — see MasterInstance
     if (frames == 0)
     {
         // `n == 0` is the one true no-op in law 11: no time, no falling edge, nothing. It is not an
         // error, and it must not set `audioSeen` either — no audio was seen.
         return FC_OK;
     }
-    if (m.solverRan) return FC_ERR_STATE;   // the chain holds the SOLVER's parameters — see MasterInstance
     if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;   // the core takes `int`
 
     if (const fc_status st = checkAudio (in, frames, nch); st != FC_OK) return st;
@@ -784,7 +820,6 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
     const int nch = m.chain.numChannels();
     if (m.solverRan) return FC_ERR_STATE;   // as process(): the chain's configuration is not the caller's
     if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
-    *written = 0;
     if (capacity == 0) return FC_ERR_CAPACITY;
     if (capacity > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
     // A capacity below the latency cannot drain the tail, and the core keeps no arrears, so a second
@@ -793,6 +828,9 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
     if (const fc_status st = checkAudio (out, capacity, nch); st != FC_OK) return st;
     if (aliasesSpan (written, sizeof (*written), out,
                      (std::uint64_t) capacity * (std::uint64_t) nch * sizeof (float))) return FC_ERR_SPAN;
+    // CLEARED ONLY ONCE EVERY REFUSAL IS BEHIND US. Clearing on entry meant a call refused for aliasing
+    // had already written a zero into the caller's audio — a refusal that moved something.
+    *written = 0;
 
     float* pl[core::kMaxChannels] {};
     planes (out, capacity, nch, pl);
@@ -852,7 +890,9 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
     if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
-    if (frames == 0) return FC_ERR_REFUSED_BY_CORE;
+    // `frames == 0` is the CORE's answer to give (`measureInputLoudnessRange` returns false on it), the
+    // same reasoning as in `fc_master_solve`. Removing the facade's own copy of that verdict leaves the
+    // observable result identical and the policy singular.
     if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
     if (const fc_status st = checkAudio (in, frames, nch); st != FC_OK) return st;
 
@@ -883,7 +923,12 @@ FC_EXPORT fc_status fc_master_set_channel_weight (fc_master h, std::int32_t chan
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (channel < 0 || channel >= core::kMaxChannels) return FC_ERR_RANGE;
-    if (! std::isfinite (weight) || weight < 0.0) return FC_ERR_NON_FINITE;
+    if (! std::isfinite (weight)) return FC_ERR_NON_FINITE;
+    // A finite negative weight is out of RANGE, and calling it non-finite was a lie about a number the
+    // caller can see. (This is the one place the facade does bound a value: the core's own setter is a
+    // silent no-op on it, so there is no verdict to forward — the same reason non-finite fields are
+    // refused here.)
+    if (weight < 0.0) return FC_ERR_RANGE;
     auto& m = *s->master;
     if (! m.solver.isPrepared()
         && ! m.solver.prepare (m.chain.sampleRate(), m.chain.numChannels(), m.renderer.blockSize(),
@@ -900,12 +945,16 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
+    auto& m = *s->master;
+    // THE HANDLE'S STATE FIRST, and a search is not exempt from it. `configure` refuses to re-prepare
+    // over a stream in progress; `solve` used to reset the chain out from under exactly such a stream
+    // and answer FC_OK — measured, `process(64)` then a valid solve and the 64 frames in the FIFO were
+    // gone with no refusal anywhere. One policy: `fc_master_reset` is the way out of a stream, for both.
+    if (m.audioSeen) return FC_ERR_STATE;
     if (const fc_status st = checkScalarOut (out_solution); st != FC_OK) return st;
-    *out_solution = 0;
     if (const fc_status st = checkHeaderIn (params); st != FC_OK) return st;
     if (const fc_status st = checkHeaderIn (req); st != FC_OK) return st;
 
-    auto& m = *s->master;
     const int nch = m.chain.numChannels();
     // `frames == 0` is NOT refused here. The solver has its own answer for it — `InvalidRequest`, a
     // VERDICT — and this file's contract says FC_OK means a verdict was obtained and that it never
@@ -919,7 +968,16 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     // touching at all is refused, equality included.
     const std::uint64_t bytes = (std::uint64_t) frames * (std::uint64_t) nch * sizeof (float);
     if (in == out || partiallyOverlaps (in, out, bytes)) return FC_ERR_SPAN;
-    if (aliasesSpan (out_solution, sizeof (*out_solution), out, bytes)) return FC_ERR_SPAN;
+    // THE OUT-HANDLE MAY NOT POINT INTO ANY SPAN THIS CALL READS OR WRITES — not just `out`. It used to
+    // be cleared on entry, so an `out_solution` inside `in` zeroed an input SAMPLE before the search saw
+    // it (measured: the delivered audio then differed from an honest solve in 381 075 of 384 000
+    // samples), and one inside `params` zeroed a parameter FIELD before the mapping read it, after which
+    // the caller read the handle's bits back as that field's value. Nothing is written until FC_OK now,
+    // and all three spans are checked.
+    if (aliasesSpan (out_solution, sizeof (*out_solution), out, bytes)
+        || aliasesSpan (out_solution, sizeof (*out_solution), in, bytes)
+        || aliasesSpan (out_solution, sizeof (*out_solution), params, sizeof (*params))
+        || aliasesSpan (out_solution, sizeof (*out_solution), req, sizeof (*req))) return FC_ERR_SPAN;
 
     MasteringChainParams cp {};
     if (const fc_status st = toCore (*params, cp); st != FC_OK) return st;
@@ -934,6 +992,7 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     std::uint32_t sh = 0;
     const int idx = allocSlot (Kind::Solution, sh);
     if (idx < 0) return FC_ERR_EXHAUSTED;
+    // (`*out_solution` is still untouched here, and stays so until the bottom of this function.)
 
     const float* ip[core::kMaxChannels] {};
     float*       op[core::kMaxChannels] {};

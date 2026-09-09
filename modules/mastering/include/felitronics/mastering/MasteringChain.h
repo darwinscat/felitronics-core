@@ -280,7 +280,7 @@ struct MasteringChainResolved
 // to feeding the sanitised value. Bit-transparent for any finite sample within +-1e6.
 //
 // RT-safe: prepare() allocates, process()/flush() do not allocate, lock or throw, and accept any block
-// length. `sizeof(eq::EqEngine)` is ~324 KB, so the engine is held behind a pointer and this object
+// length. `sizeof(eq::EqEngine)` is 331 KiB, so the engine is held behind a pointer and this object
 // stays small enough to put on a stack.
 class MasteringChain
 {
@@ -810,7 +810,7 @@ private:
 
     std::vector<float> fifo_, keyBuf_;
 
-    std::unique_ptr<eq::EqEngine> eq_;                 // ~324 KB — behind a pointer so this object is stack-sized
+    std::unique_ptr<eq::EqEngine> eq_;                 // 331 KiB — behind a pointer so this object is stack-sized
     stereo::MonoBass              monoBass_;
     dynamics::Compressor          comp_;
     saturation::Saturator         sat_;

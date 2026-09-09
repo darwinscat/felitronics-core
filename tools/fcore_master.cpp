@@ -38,8 +38,9 @@
 //   * SAME DEFAULTS. A zeroed parameter struct is not `MasteringChainParams{}` — 287 998 of 288 000
 //     samples apart — so both paths start from `fc_master_params_default()`.
 //   * A RESET BEFORE EVERY RENDER. `OfflineRenderer` resets the chain itself; the ABI has no renderer,
-//     so a second programme through the same handle without `fc_master_reset` differs from the first by
-//     151 884 samples. The loop below resets, and the harness must too.
+//     so a second programme through the same handle without `fc_master_reset` is a different render —
+//     the check below prints the count for the fixture it actually ran, rather than carrying a number
+//     from a fixture that has since changed. The loop resets, and the harness must too.
 
 #include "fc_master_abi.h"
 

@@ -18,7 +18,7 @@
 // back was computed by the core and read out of it; where the core cannot answer, this file refuses
 // rather than inventing.
 //
-// The mechanical proof of that is `fcore_master --selftest`: the same programme rendered through this
+// The mechanical proof of that is `fcore_master selftest`: the same programme rendered through this
 // ABI and through a direct C++ call, in ONE binary on ONE machine, compared bit for bit. A facade that
 // had grown arithmetic of its own would have to be wrong in exactly the same way twice to pass it.
 //
@@ -122,11 +122,7 @@ typedef struct fc_header
 // NARROWING comes before the spans because it is the only check that can still fire: a frame count past
 // INT_MAX makes a byte span past 32 bits too, so a span check placed first would answer every such call
 // with FC_ERR_SPAN and the specific diagnosis would be unreachable.
-//
-// Two details of that are load-bearing rather than incidental. OUT-PARAMETERS COME BEFORE THE INPUT
-// STRUCTS because a call that cannot report its result must not perform it. And a struct's HEADER is
-// bounded before the struct is: bounding the whole thing first would answer FC_ERR_SPAN to a caller
-// whose real mistake was the version, which is the one field whose job is to catch exactly that.
+
 typedef enum fc_status
 {
     FC_OK                  =  0,
@@ -510,9 +506,11 @@ fc_status fc_master_create (const fc_master_config* cfg, fc_master* out);
 // next internal quantum — deliberately, so a parameter change lands at the same place in the stream
 // however the caller cut it — and `resolved()` reads the stage state, i.e. the last APPLIED set. So a
 // configure that wrote the parameters and read `resolved()` straight back would hand the caller the
-// PREVIOUS set: measured on the full chain at 48 kHz, a 5.0000 dB error on the limiter ceiling, 149.968
-// ms on its release and 120 Hz against 250 on the mono-bass corner — and on a freshly prepared chain it
-// reports the core's own defaults rather than anything the caller asked for.
+// PREVIOUS set: measured on the full chain at 48 kHz, a **5.0000 dB** error on the limiter ceiling and
+// **149.968 ms** on its release (a first set at -1 dBTP / 50 ms read back after a second at -6 / 200),
+// with the mono-bass corner reading 120 Hz where 250 had been asked for — and on a freshly prepared
+// chain it reports the core's own defaults rather than anything the caller asked for. The suite's own
+// fixture uses a different pair of sets, so the numbers here are the measurement's, not that test's.
 //
 // Applying early instead is WORSE, and that was measured too: `dither::Dither::setParams()` reseeds its
 // RNG whenever the seed changes, and `eq::EqBand::setParams()` SNAPS while uninitialised and glides
@@ -523,7 +521,7 @@ fc_status fc_master_create (const fc_master_config* cfg, fc_master* out);
 // What is left is the order the core itself blesses: "configure, then prepare" — MasteringChain.h says
 // in as many words that this is the order a C-ABI facade takes, and `prepare()` applies the pending set
 // and then resets. So this call stores the parameters and re-prepares, which makes `resolved` exact and
-// makes N calls identical to the last one alone. It costs a reallocation (the EQ engine is ~324 KB) and
+// makes N calls identical to the last one alone. It costs a reallocation (the EQ engine is 331 KiB) and
 // it is NOT real-time — it is a worker call between renders, and it says so.
 //
 // It is therefore REFUSED with FC_ERR_STATE once audio has been handed to this handle, because

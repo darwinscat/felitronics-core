@@ -1077,6 +1077,53 @@ static void testMonoBassParams()
 }
 
 //==============================================================================
+
+//==============================================================================
+// THE GATE COUNTS WHAT IT SUBSTITUTES. This belongs HERE and not only in the C-ABI suite: a consumer
+// that builds the core as a subproject never builds `tools/`, so a test that lives only there is a test
+// that consumer does not have. The counter is also the thing that makes the gate's silence visible at
+// all, and its shape is load-bearing for a different reason — see the comment at the gate itself, which
+// carries the measurement that made an earlier form of it x2.61 slower.
+static void testGateCountsItsSubstitutions()
+{
+    group ("the input gate COUNTS the samples it substitutes");
+
+    const int nch = 2, n = 4 * 256;
+    auto cfg = fullConfig();
+    cfg.eq = false; cfg.monoBass = false; cfg.compressor = false;
+    cfg.clipper = false; cfg.limiter = false; cfg.dither = false;
+
+    mastering::MasteringChain chain;
+    ok (chain.prepare (48000.0, nch, cfg), "prepared");
+    ok (chain.nonFiniteInputSamples() == 0, "a fresh chain has counted nothing");
+
+    Buf x ((std::size_t) nch, std::vector<float> ((std::size_t) n, 0.25f));
+    x[0][10] = std::numeric_limits<float>::quiet_NaN();
+    x[1][20] = std::numeric_limits<float>::infinity();
+    x[1][30] = -std::numeric_limits<float>::infinity();
+    { auto p = planes (x); felitronics::test::run (chain.process (p.data(), nch, n)); }
+    ok (chain.nonFiniteInputSamples() == 3, "three substitutions, counted exactly");
+
+    bool finite = true;
+    for (const auto& ch : x) for (float v : ch) if (! std::isfinite (v)) finite = false;
+    ok (finite, "and nothing non-finite left the chain");
+
+    // A FINITE sample outside the gate's range is CLAMPED and deliberately not counted here: the two
+    // are different events and one number cannot mean both.
+    Buf y ((std::size_t) nch, std::vector<float> ((std::size_t) n, 0.25f));
+    y[0][40] = 1.0e9f;
+    { auto p = planes (y); felitronics::test::run (chain.process (p.data(), nch, n)); }
+    ok (chain.nonFiniteInputSamples() == 3, "a clamped-but-finite sample does not move the counter");
+    // The chain delays by its internal quantum, so input sample 40 leaves at output sample 40 + K.
+    // Reading index 40 would have read the FIFO's previous contents and made this precondition a
+    // tautology — which is exactly how a blind check looks from the inside.
+    ok (y[0][40 + cfg.internalBlock] == 1.0e6f,
+        "PRECONDITION: it really was clamped, so the check above is live");
+
+    chain.reset();
+    ok (chain.nonFiniteInputSamples() == 0, "reset() clears it — the count describes ONE stream");
+}
+
 int main()
 {
     std::printf ("felitronics::mastering — chain acceptance\n");
@@ -1091,5 +1138,6 @@ int main()
     testResolvedReadback();
     testParamsWrittenBeforePrepare();
     testMonoBassParams();
+    testGateCountsItsSubstitutions();
     return felitronics::test::report();
 }

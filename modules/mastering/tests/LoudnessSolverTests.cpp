@@ -2144,6 +2144,57 @@ void testThePreMergeDiffPass()
 
 } // namespace
 
+
+//==============================================================================
+// THE LRA MEASUREMENT REFUSES A POISONED PROGRAMME. Here rather than only in the C-ABI suite: a consumer
+// building the core as a subproject never builds `tools/`, and this is a behaviour change to a public
+// method — it used to return SUCCESS on a programme its own meter had already flagged, and the meter is
+// a local, so the caller could not check for itself.
+static void testLraRefusesAPoisonedProgramme()
+{
+    test::group ("measureInputLoudnessRange refuses what the meter itself flags");
+
+    const double fs = 48000.0;
+    const int nch = 2;
+    const int frames = 30 * 48000;                       // long enough for LRA's short-term samples
+    std::vector<float> l ((std::size_t) frames), r ((std::size_t) frames);
+    for (int i = 0; i < frames; ++i)                     // 3 s loud / 3 s quiet — a real range to lose
+    {
+        const double amp = ((i / 48000) % 6 < 3) ? 0.5 : 0.03;
+        l[(std::size_t) i] = (float) (amp * std::sin (2.0 * 3.14159265358979 * 220.0 * i / fs));
+        r[(std::size_t) i] = (float) (amp * std::sin (2.0 * 3.14159265358979 * 277.0 * i / fs));
+    }
+    const float* in[2] { l.data(), r.data() };
+
+    mastering::TargetLoudnessSolver s;
+    test::ok (s.prepare (fs, nch, 1024, 256, 4), "prepared");
+
+    double clean = 0.0;
+    test::ok (s.measureInputLoudnessRange (in, nch, frames, clean), "a clean programme is measured");
+    test::approx (clean, 4.8, 0.05, "and the range is the fixture's own 4.8 LU");
+
+    // Poison every LOUD second. A poisoned sub-hop is recorded as SILENCE, silence fails the absolute
+    // gate, and the loud blocks leave the distribution the range is computed over — so the number this
+    // used to return was 21.4 LU, a range the programme does not have, with `true` beside it.
+    for (int sec = 0; sec < 30; ++sec)
+        if (sec % 6 < 3)
+            for (int i = sec * 48000; i < (sec + 1) * 48000; ++i)
+                l[(std::size_t) i] = std::numeric_limits<float>::quiet_NaN();
+
+    double poisoned = -1.0;
+    test::ok (! s.measureInputLoudnessRange (in, nch, frames, poisoned), "the poisoned one is REFUSED");
+    test::ok (poisoned == -1.0, "and the out-parameter is untouched by the refusal");
+
+    // PRECONDITION, and the whole reason this test is worth having: the number really would have moved.
+    // A fixture on which poisoning changes nothing would pass this test while proving nothing.
+    analysis::LoudnessMeter lm;
+    test::ok (lm.prepare (fs, nch, (double) frames / fs + 1.0), "an independent meter for the precondition");
+    (void) lm.process (in, nch, frames);
+    test::ok (lm.nonFiniteSubHops() > 0, "PRECONDITION: the meter really is flagging this programme");
+    test::approx (lm.loudnessRangeLu(), 21.4, 0.05,
+            "PRECONDITION: and the number it would have returned is 21.4 LU, not 4.8");
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
@@ -2170,5 +2221,6 @@ int main()
     testTheReviewRoundsCounterexamples();
     testTheVerdictDoesNotDependOnTheBudget();
     testThePreMergeDiffPass();
+    testLraRefusesAPoisonedProgramme();
     return felitronics::test::report();
 }
