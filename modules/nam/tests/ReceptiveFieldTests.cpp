@@ -137,6 +137,30 @@ int main() {
         ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", "long" } } } }) == 0,
            "…and one that is not a number is refused rather than thrown on: this file runs inside"
            " prepareModel's catch-all, where a throw would REFUSE the load");
+        // 🔴 BUT A FLOAT SPELLING IS A NUMBER. `2001.0` is not `is_number_integer()`, and NAM's own
+        // parser takes it (`get<int>()` static_casts any arithmetic node), so a guard that demands an
+        // integer refuses a capture that LOADS — and it drains for nothing. Measured: with the narrow
+        // guard the dilated reader answered 0 where base answered 3.
+        ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", 2001.0 } } } }) == 2000,
+           "a field spelled 2001.0 is read, because that is a model NAM loads");
+        ok(receptiveFieldOfLayers(wavenet({ 2 }, { 1 })["config"]) == 2, "…and the array form still reads");
+        {
+            nlohmann::json legacyFloat = { { "architecture", "WaveNet" },
+                                           { "config", { { "layers", nlohmann::json::array({
+                                                 { { "kernel_size", 2.0 },
+                                                   { "dilations", nlohmann::json::array({ 1 }) } } }) } } } };
+            ok(receptiveFieldFromConfig(legacyFloat) == 2,
+               "…and the LEGACY single kernel_size spelled as a float, which is its own guard: narrowing"
+               " it back to an integer passed every other row here");
+        }
+        {
+            nlohmann::json floaty = { { "architecture", "WaveNet" },
+                                      { "config", { { "layers", nlohmann::json::array({
+                                            { { "kernel_sizes", nlohmann::json::array({ 2.0 }) },
+                                              { "dilations",    nlohmann::json::array({ 2.0 }) } } }) } } } };
+            ok(receptiveFieldFromConfig(floaty) == 3, "…and so does a dilated stack spelled in floats,"
+                                                      " which is what the base did before this file guarded");
+        }
     }
 
     group("an architecture nothing here can read says so, rather than guessing");

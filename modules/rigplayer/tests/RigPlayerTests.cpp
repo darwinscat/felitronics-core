@@ -350,14 +350,16 @@ int main() {
         for (int k = 0; k < blocks; ++k) { std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
                                         felitronics::test::run (b.p.process(io, gapWidth, kBlock)); b.p.serviceHere(); }
 
-        double worst = 0.0;
+        // FINITENESS BESIDE THE PEAK: std::fmax IGNORES a NaN, so a return poisoned with them reads a
+        // peak of exactly zero and passes. Measured — a drain writing NaNs passed every row here.
+        double worst = 0.0; bool finite = true;
         for (int k = 0; k < blocks; ++k) {
             std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
             felitronics::test::run (b.p.process(io, 2, kBlock)); b.p.serviceHere();
-            for (float v : R) worst = std::fmax(worst, (double) std::fabs(v));
-            for (float v : L) worst = std::fmax(worst, (double) std::fabs(v));
+            for (float v : R) { worst = std::fmax(worst, (double) std::fabs(v)); finite = finite && std::isfinite(v); }
+            for (float v : L) { worst = std::fmax(worst, (double) std::fabs(v)); finite = finite && std::isfinite(v); }
         }
-        ok(worst == 0.0, std::string("silence in, exact zero out after a ") + (narrowFirst ? "NARROW" : "ZERO-WIDTH")
+        ok(finite && worst == 0.0, std::string("silence in, FINITE exact zero out after a ") + (narrowFirst ? "NARROW" : "ZERO-WIDTH")
                          + " gap — " + at + " (the ceiling here is 0.949383 = -0.45 dBFS, and this used to"
                          " read 0.518588 at 44.1 kHz and 0.499533 at 48 kHz)");
         }
@@ -473,13 +475,13 @@ int main() {
         ok(before == 0.0f, std::string("precondition: silence in, silence out BEFORE the turn — ") + c.name);
 
         b.p.setDial("gain", c.wake);                                   // …and the turn WAKES it, on silence
-        float worst = 0.0f;
+        float worst = 0.0f; bool finite = true;
         for (int k = 0; k < 60; ++k) {
             std::fill(x.begin(), x.end(), 0.0f);
             felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.serviceHere();
-            for (float v : x) worst = std::max(worst, std::abs(v));
+            for (float v : x) { worst = std::max(worst, std::abs(v)); finite = finite && std::isfinite(v); }
         }
-        ok(worst == 0.0f, std::string("silence in, exact zero out when a SLEEPING slot wakes (was 0.500000"
+        ok(finite && worst == 0.0f, std::string("silence in, FINITE exact zero out when a SLEEPING slot wakes (was 0.500000"
                                       " — a whole receptive field of the tone it was holding when it fell"
                                       " asleep) — ") + c.name);
         ok(b.p.modelLoads() == 2, std::string("…and nothing was loaded for the turn: a wake, not a swap — ") + c.name);

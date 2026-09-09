@@ -1018,6 +1018,14 @@ public:
             // first fixture read a clean zero, and it is a fixture fault, not a property of the code.
             // Width zero is law 11(d)'s clock-only call: the stage drains the lane and stops, so this
             // costs one bounded drain per sleep and nothing thereafter — a sleeping slot is still free.
+            // Measured on a real 6332-sample capture: 12.9 ms of CPU at 48 kHz and 9.3 at 44.1 for the
+            // whole sleep, and 0.0000 ms per block once the debt is spent.
+            // ⚠️ ONE CONTRACT CONSEQUENCE, stated because nobody would look for it: a cold slot's verdict
+            // is now ANDed too, and `NamStage::process` refuses for an UNPREPARED backend. A slot whose
+            // live re-prepare was refused (a low-memory `configureRates`) used to be silent-and-accepted
+            // while it slept and now fails every block instead. That is law 11's answer — a call that
+            // cannot be honoured says so — and it is not constructible in a test without exhausting
+            // memory, so it is written here rather than gated.
             ok = nam_[0].process(a, run[0] ? nch : 0, count, norm) && ok;
             ok = nam_[1].process(b, run[1] ? nch : 0, count, norm) && ok;
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.

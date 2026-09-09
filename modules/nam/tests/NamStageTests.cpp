@@ -2029,16 +2029,18 @@ int main()
                         felitronics::test::run (stage.process (io, gapWidth, kBlk, false));
                     }
 
-                    double worst = 0.0;
+                    // FINITENESS BESIDE THE PEAK, because std::fmax IGNORES a NaN: a drain writing NaNs
+                    // into the whole first returning chunk passed 960 checks, since the peak stayed 0.
+                    double worst = 0.0; bool finite = true;
                     for (int n = 0; n < fill + 4 * kBlk; n += kBlk)
                     {
                         std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
                         felitronics::test::run (stage.process (io, 2, kBlk, false));
-                        for (float v : l) worst = std::fmax (worst, (double) std::fabs (v));
-                        for (float v : r) worst = std::fmax (worst, (double) std::fabs (v));
+                        for (float v : l) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                        for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
                     }
-                    test::ok (worst == 0.0,
-                              std::string ("silence in, EXACT zero out after a ")
+                    test::ok (finite && worst == 0.0,
+                              std::string ("silence in, FINITE exact zero out after a ")
                               + (gapWidth == 1 ? "narrow" : "zero-width") + " gap — " + shape.name
                               + " at " + std::to_string ((int) fs) + " Hz");
                 }
@@ -2085,15 +2087,15 @@ int main()
                 std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
                 felitronics::test::run (stage.process (io, 1, 256, false));
             }
-            double worst = 0.0;
+            double worst = 0.0; bool finite = true;
             for (int k = 0; k < 40; ++k)
             {
                 std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
                 felitronics::test::run (stage.process (io, 2, 256, false));
-                for (float v : r) worst = std::fmax (worst, (double) std::fabs (v));
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
             }
-            test::ok (worst == 0.0, "a dense 2001-tap capture with " + what + " returns EXACT zero — the"
-                                    " field alone leaves 1.909e-08 on 46 samples");
+            test::ok (finite && worst == 0.0, "a dense 2001-tap capture with " + what + " returns FINITE"
+                                              " EXACT zero — the field alone leaves 1.909e-08 on 46 samples");
         }
 
         // 2. A RECURRENT CELL, where there is no flush length at all — the drain is NAM's own
@@ -2283,15 +2285,15 @@ int main()
                 std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
                 felitronics::test::run (stage.process (io, 1, 256, false));
             }
-            double worst = 0.0;
+            double worst = 0.0; bool finite = true;
             for (int k = 0; k < 40; ++k)
             {
                 std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
                 felitronics::test::run (stage.process (io, 2, 256, false));
-                for (float v : r) worst = std::fmax (worst, (double) std::fabs (v));
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
             }
-            test::ok (worst == 0.0, "a prepare() in the middle of a drain does not strand it — "
-                                    + std::to_string ((int) fs) + " Hz");
+            test::ok (finite && worst == 0.0, "a prepare() in the middle of a drain does not strand it — "
+                                              + std::to_string ((int) fs) + " Hz");
         }
     }
 

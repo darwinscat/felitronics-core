@@ -7,6 +7,73 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+### `nam` · `rigplayer` — a lane that stops being fed is DRAINED, not frozen (law 11a)
+
+- **`nam::NamStage` HAS a falling edge now**, and the entry that stood here — "no falling edge …
+  recorded, not silently claimed" — undersold it twice. A lane the host stops handing over used to be
+  skipped whole, so BOTH its network window and its two `core::StreamResampler`s froze and were
+  replayed on the return; and a slot the blend law puts to SLEEP was not handed to the stage at all,
+  which leaks the same way for a different reason. Measured through `rigplayer::RigPlayer`, worst
+  |out| out of DIGITAL SILENCE / tail in host samples: a memoryless capture
+  **0.518588 / 125 at 44.1 kHz** · 0.332768 / 182 at 88.2 · **0.500179 / 193 at 96** · 0.354183 / 300
+  at 176.4 · 0.453147 / 319 at 192; a 2001-tap capture **0.499533 / 2003 at 48 kHz**, where no
+  rate-matcher exists at all; and a sleeping slot **0.500000** for a whole receptive field. An absent
+  lane is now fed the digital silence it is actually receiving, for as long as its state can still be
+  heard, and a sleeping slot gets a width-zero call — **exact zero** at 8 · 22.05 · 44.1 · 48 · 88.2 ·
+  96 · 176.4 · 192 kHz, on a memoryless capture and on a real 6332-sample WaveNet, at gap widths 0 and
+  1 and on both slots.
+  - **The ceiling in `RigPlayer::process` was derived for the delay line and spent on both halves.**
+    It is 3.8x larger for the models: both slots freeze at once, so their weights SUM rather than pick,
+    and a frozen rate-matcher is not a replay — its phase rows are normalised by their SUM, so their
+    MODULUS exceeds one. The return path is linear for a Linear capture, so the ceiling
+    `A · max_n ‖h_n‖₁` is ATTAINABLE and was attained: **0.949383 (-0.45 dBFS) at 44.1 kHz, 100.00 %**
+    by the sign pattern of the worst row, where a 220 Hz sine swept over every leaving phase reaches
+    55 %. The published 0.25 / -12.0 dBFS / "in the first three samples" were the delay line's.
+  - **BREAKING (a number, not an API): `NamStage::prewarmSamples()` answers for a Linear capture.**
+    It reported **0** for an impulse response of any length — the config declares the field as a plain
+    number and nothing read it, while NAM's own answer for that architecture is zero. It now reports
+    the MEMORY, which is one less than the declared taps: a one-tap capture is a gain and still
+    answers 0. A consumer that fades a model in by this number (`RigPlayer::warmFor`) waits a real
+    interval for a real IR now, where it used to wait none.
+  - The field is no longer capped at `1<<20`: the number is SPENT now, and a cap on a spent number is
+    a silent under-drain. A `Linear` capture is also charged its partitioned-FFT ring (NAM runs one
+    past 256 taps by default, and it holds input spectra past the field — measured, 1.909e-08 on 46
+    samples of the return with a dense kernel), and a recurrent architecture is floored at half a
+    second of the RUN rate rather than trusting `GetPrewarmSamples()`, which is half a second of the
+    model's TAG and answers **1** when there is no tag.
+  - **The dilated stack's LEGACY spelling is read.** NAM takes either `kernel_sizes` (an array) or a
+    single `kernel_size` for every layer; only the array was read, so a legacy capture reported a
+    field of zero — and on a `SlimmableWavenet`, whose own answer is also zero, nothing knew it at
+    all: measured **0.462117** out of digital silence on a loaded model. A CONTAINER is now asked
+    through for the FFT ring and the recurrent floor as well, not only for the field (measured on
+    loaded models: 1.48e-08, and 0.499275 against 0.419115).
+  - **`nam::NamStage::drainedSamples()`** is new: how many samples of silence the stage has fed to
+    lanes the caller stopped handing over. It exists to be tested rather than acted on — past the debt
+    an absent lane's output is zero whether it is still clocked or not, so "it drains, and then it
+    STOPS" has no witness in the audio, and three mutations of the drain's LENGTH survived a suite of
+    960 checks before it existed.
+  - **What it COSTS, measured on a real 6332-sample capture:** a departing lane goes on costing the
+    stereo price for its drain and NOT more — the drain runs one lane-block per block, exactly what that
+    lane cost while it played, so there is no spike: **12.9 ms of CPU per stereo sleep at 48 kHz and 9.3
+    at 44.1**, and **0.0000 ms per block** once the debt is spent. A host that alternates widths every
+    block re-arms the debt each time and therefore pays for the absent lane indefinitely — that is what
+    "a pause is silence" means when the pause is one block long, not a defect.
+  - **An RT fix that came with this and outlives it:** NAM grows a `Buffer` capture's window on demand
+    INSIDE `process()`, and `Reset` pre-grows it only through a prewarm that is zero samples long for
+    a Linear capture — so the first audio call after a prepare allocated. It was dormant while
+    instance 1 was never touched on a mono host; the drain touches it. Both instances are now walked
+    once on the message thread, and the allocation counter starts at the FIRST call. It costs a real
+    capture NOTHING — a `SlimmableContainer` of plain WaveNets answers a prewarm of its own, so the walk
+    is skipped: 9.7 / 10.7 / 12.6 / 14.4 ms to prepare one, with the walk and without, identical. Where
+    it does run (a Linear capture, a true `SlimmableWavenet`) it is +1.1 ms on an 8193-tap FFT capture at
+    maxBlock 8192 and ~0 at 512.
+  - Two things this does NOT close, said plainly: an LSTM's cell has no flush length, so its drain is
+    a bound on NAM's own heuristic and not on the memory (0.419 against 0.023 for a lane clocked
+    through the whole gap); and `prepare()`/`reset()` still do not clear a network's window, so a lane
+    that is PRESENT can be handed silence and reply with 0.2246 — a stream-restart question, recorded
+    with its number rather than claimed.
+
+
 - **`nam`: THE RATE CONTRACT IS A FIXED WINDOW, AND THE CONSUMER MITIGATIONS IT FORCED ARE GONE
   (`nam::NamStage`, `rigplayer::RigPlayer`).** `install()` used to admit a model whose tag was within
   half a hertz of the rate the stage was RUNNING, and `prepare()` then adopted the accepted tag — a
@@ -558,59 +625,6 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - **`convolution::PartitionedConvolver::process` and `NonUniformConvolver::process` also return
     `bool`.** They are mono and take no channel count, so "every block-level entry point" would otherwise
     have been a claim with two exceptions.
-  - **`nam::NamStage` HAS a falling edge now**, and the entry that stood here — "no falling edge …
-    recorded, not silently claimed" — undersold it twice. A lane the host stops handing over used to be
-    skipped whole, so BOTH its network window and its two `core::StreamResampler`s froze and were
-    replayed on the return; and a slot the blend law puts to SLEEP was not handed to the stage at all,
-    which leaks the same way for a different reason. Measured through `rigplayer::RigPlayer`, worst
-    |out| out of DIGITAL SILENCE / tail in host samples: a memoryless capture
-    **0.518588 / 125 at 44.1 kHz** · 0.332768 / 182 at 88.2 · **0.500179 / 193 at 96** · 0.354183 / 300
-    at 176.4 · 0.453147 / 319 at 192; a 2001-tap capture **0.499533 / 2003 at 48 kHz**, where no
-    rate-matcher exists at all; and a sleeping slot **0.500000** for a whole receptive field. An absent
-    lane is now fed the digital silence it is actually receiving, for as long as its state can still be
-    heard, and a sleeping slot gets a width-zero call — **exact zero** at 8 · 22.05 · 44.1 · 48 · 88.2 ·
-    96 · 176.4 · 192 kHz, on a memoryless capture and on a real 6332-sample WaveNet, at gap widths 0 and
-    1 and on both slots.
-    - **The ceiling in `RigPlayer::process` was derived for the delay line and spent on both halves.**
-      It is 3.8x larger for the models: both slots freeze at once, so their weights SUM rather than pick,
-      and a frozen rate-matcher is not a replay — its phase rows are normalised by their SUM, so their
-      MODULUS exceeds one. The return path is linear for a Linear capture, so the ceiling
-      `A · max_n ‖h_n‖₁` is ATTAINABLE and was attained: **0.949383 (-0.45 dBFS) at 44.1 kHz, 100.00 %**
-      by the sign pattern of the worst row, where a 220 Hz sine swept over every leaving phase reaches
-      55 %. The published 0.25 / -12.0 dBFS / "in the first three samples" were the delay line's.
-    - **BREAKING (a number, not an API): `NamStage::prewarmSamples()` answers for a Linear capture.**
-      It reported **0** for an impulse response of any length — the config declares the field as a plain
-      number and nothing read it, while NAM's own answer for that architecture is zero. It now reports
-      the MEMORY, which is one less than the declared taps: a one-tap capture is a gain and still
-      answers 0. A consumer that fades a model in by this number (`RigPlayer::warmFor`) waits a real
-      interval for a real IR now, where it used to wait none.
-    - The field is no longer capped at `1<<20`: the number is SPENT now, and a cap on a spent number is
-      a silent under-drain. A `Linear` capture is also charged its partitioned-FFT ring (NAM runs one
-      past 256 taps by default, and it holds input spectra past the field — measured, 1.909e-08 on 46
-      samples of the return with a dense kernel), and a recurrent architecture is floored at half a
-      second of the RUN rate rather than trusting `GetPrewarmSamples()`, which is half a second of the
-      model's TAG and answers **1** when there is no tag.
-    - **The dilated stack's LEGACY spelling is read.** NAM takes either `kernel_sizes` (an array) or a
-      single `kernel_size` for every layer; only the array was read, so a legacy capture reported a
-      field of zero — and on a `SlimmableWavenet`, whose own answer is also zero, nothing knew it at
-      all: measured **0.462117** out of digital silence on a loaded model. A CONTAINER is now asked
-      through for the FFT ring and the recurrent floor as well, not only for the field (measured on
-      loaded models: 1.48e-08, and 0.499275 against 0.419115).
-    - **`nam::NamStage::drainedSamples()`** is new: how many samples of silence the stage has fed to
-      lanes the caller stopped handing over. It exists to be tested rather than acted on — past the debt
-      an absent lane's output is zero whether it is still clocked or not, so "it drains, and then it
-      STOPS" has no witness in the audio, and three mutations of the drain's LENGTH survived a suite of
-      960 checks before it existed.
-    - **An RT fix that came with this and outlives it:** NAM grows a `Buffer` capture's window on demand
-      INSIDE `process()`, and `Reset` pre-grows it only through a prewarm that is zero samples long for
-      a Linear capture — so the first audio call after a prepare allocated. It was dormant while
-      instance 1 was never touched on a mono host; the drain touches it. Both instances are now walked
-      once on the message thread, and the allocation counter starts at the FIRST call.
-    - Two things this does NOT close, said plainly: an LSTM's cell has no flush length, so its drain is
-      a bound on NAM's own heuristic and not on the memory (0.419 against 0.023 for a lane clocked
-      through the whole gap); and `prepare()`/`reset()` still do not clear a network's window, so a lane
-      that is PRESENT can be handed silence and reply with 0.2246 — a stream-restart question, recorded
-      with its number rather than claimed.
   - **`stereo::MonoBass::prepare` and `StereoWidth::prepare` return `[[nodiscard]] bool` and honour the
     `maxChannels` they take** — they used to accept it and ignore it, which is the thing law 11(b) calls
     lying about a contract. `mastering::MasteringChain::prepare` propagates the MonoBass verdict.

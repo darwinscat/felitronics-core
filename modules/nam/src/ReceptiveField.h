@@ -38,14 +38,14 @@ inline int receptiveFieldOfLayers (const nlohmann::json& cfg)
         // silence with the scalar spelling, zero with the array.
         const bool perLayer = grp.contains ("kernel_sizes") && grp["kernel_sizes"].is_array();
         const bool single   = ! perLayer && grp.contains ("kernel_size")
-                           && grp["kernel_size"].is_number_integer();
+                           && grp["kernel_size"].is_number();     // is_number(): NAM takes 2.0 as well
         if (! perLayer && ! single) continue;
         const long long ks1 = single ? grp["kernel_size"].get<long long>() : 0;
         for (std::size_t i = 0; i < ds.size(); ++i)
         {
             if (perLayer && i >= grp["kernel_sizes"].size()) break;
             const long long k = perLayer ? grp["kernel_sizes"][i].get<long long>() : ks1;
-            if (! ds[i].is_number_integer()) continue;
+            if (! ds[i].is_number()) continue;
             total += (long long) ds[i].get<long long>() * (k - 1);
         }
     }
@@ -80,9 +80,14 @@ inline int receptiveFieldOfLayers (const nlohmann::json& cfg)
 // harmless there and is deliberately left alone rather than swept into this change.
 inline int declaredReceptiveField (const nlohmann::json& cfg)
 {
-    // is_number_integer() rather than get<>() in a try: this whole file is called from inside
-    // prepareModel's catch-all, so a throw here would turn a legal-but-odd config into a REFUSED load.
-    if (! cfg.contains ("receptive_field") || ! cfg["receptive_field"].is_number_integer()) return 0;
+    // 🔴 is_number(), NOT is_number_integer(), and the difference is measured. A guard is wanted at all
+    // because this file runs inside prepareModel's catch-all and a throw there turns a legal-but-odd
+    // config into a REFUSED load. But `2.0` is a json number that is NOT an integer, and NAM's own
+    // parser takes it — `get<int>()` static_casts any arithmetic node — so a capture spelling its field
+    // `2001.0` LOADS and would then drain for nothing. The narrow guard also broke the `dilations`
+    // reader against base, which never guarded at all: base answered 3 for `"dilations":[2.0]` and the
+    // narrow version answered 0. Caught by a pre-merge round, not by the suite.
+    if (! cfg.contains ("receptive_field") || ! cfg["receptive_field"].is_number()) return 0;
     const long long rf = cfg["receptive_field"].get<long long>();
     return rf > 1 ? (int) std::min (rf - 1, (long long) std::numeric_limits<int>::max()) : 0;
 }
