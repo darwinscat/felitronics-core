@@ -68,7 +68,7 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   - **`fcore_master selftest` is the acceptance, not a smoke test:** the same programme rendered
     through the C entry points and through a direct C++ call, in ONE binary on ONE machine, compared
     bit for bit — **0 of 384 000 samples differ**, with a precondition asserting the chain actually did
-    something (the output peaks at 0.7494 and moves 0.5988 away from its input). Block-independence
+    something (the output peaks at 0.8685 and moves 0.7888 away from its input). Block-independence
     survives the boundary at call sizes **1, 337, 4096 and whole-file, 0 differing samples each**,
     because nothing here re-blocks anything: the call reaches `MasteringChain::process()` in one piece
     and the chain's own fixed quantum stays the only clock. It runs in the `wasm-audio` tier too.
@@ -80,7 +80,7 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     full scale**, all of it `stereo::MonoBass`, whose `reset()` snaps the width where its setter ramps
     it over 20 ms). A zeroed parameter struct is not `MasteringChainParams{}` (**287 998 of 288 000**),
     so `fc_master_params_default()` exists. And a second programme through one handle without
-    `fc_master_reset` differs from the first by **351 225 samples**.
+    `fc_master_reset` differs from the first by **379 277 samples**.
   - **`configure` re-prepares, and is refused once audio has been handed over.** Reading `resolved()`
     straight back from a deferred `setParams` reports the PREVIOUS parameter set — **5.0000 dB** on the
     limiter ceiling, **149.968 ms** on its release, and the core's own defaults on a fresh chain.
@@ -108,12 +108,20 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   partial sub-hop is still not refused; closing that would need a second scan of the audio.
 
 - **`mastering::MasteringChain` COUNTS the samples its input gate substitutes
-  (`nonFiniteInputSamples()`).** Splitting the branch out of `std::clamp(isfinite(v) ? v : 0.0f, ...)`
-  is bit-identical and costs nothing, and the count is what turns a plausible render of a programme
-  nobody submitted into a visible one. Counting rather than refusing is deliberate and measured: a NaN
-  through the chain is bit-identical to a sanitised sample, while refusing the call would throw away
-  every good sample travelling with it — and the size of that loss would depend on the caller's block
-  size, which is the one thing the internal quantum exists to make irrelevant.
+  (`nonFiniteInputSamples()`).** The count is what turns a plausible render of a programme nobody
+  submitted into a visible one. Counting rather than refusing is deliberate and measured: a NaN through
+  the chain is bit-identical to a sanitised sample, while refusing the call would throw away every good
+  sample travelling with it — and the size of that loss would depend on the caller's block size, which
+  is the one thing the internal quantum exists to make irrelevant.
+  - **THE SHAPE OF THE COUNTER IS NOT FREE, and the first version of it was not.** Writing it as
+    `if (! isfinite(v)) { ...; ++member; } else ...` reads as the same code and stops the compiler
+    vectorising a pass that runs over every input sample of every quantum. Measured, arm64 Release,
+    best of seven interleaved runs over 20 000 quanta of the gate loop: **1.357 ms** branchless without
+    a counter, **3.536 ms** with the branch (**x2.61**), **1.369 ms** for a branchless select plus a
+    LOCAL counter (**x1.01**) — which is what ships. Whole chain, same source against `main`'s headers
+    and against this branch's with every DSP stage off: **0.531 ms against 0.407 ms**, identical
+    checksums. The shipped form keeps the original expression `std::clamp(isfinite(v) ? v : 0.0f, ...)`
+    verbatim, so the arithmetic is unarguably unchanged.
 
 - **`mastering`: TARGET-LOUDNESS SOLVER, NAMED CONSTRAINTS AND THE STATISTICS BEHIND THEM
   (`mastering::TargetLoudnessSolver`).** Hits a target integrated loudness under a stated true-peak

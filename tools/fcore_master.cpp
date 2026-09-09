@@ -96,6 +96,8 @@ struct Args
     fc_master_params prm {};
     fc_loudness_request req {};
     std::uint32_t block = 4096;
+    struct Weight { std::int32_t channel; double value; };
+    std::vector<Weight> weights;
 };
 
 // STRICT number parsing. `atof`/`atoi` stop at the first character they do not understand and report
@@ -268,6 +270,18 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "compGrLimit"){ FC_D (a.req.compressorGr.limitDb = d); }
     if (key == "compGrStat") return parseEnumName (val, kGrSt, 3, a.req.compressorGr.statistic);
     if (key == "activityDb") { FC_D (a.req.activityThresholdDb = d); }
+
+    // `weight<N>=<w>` — the BS.1770 channel weights. The ABI grew an entry point for them and nothing
+    // called it, which made the capability reachable in principle and not in practice: a surround run
+    // through this CLI was measured at 1.0 everywhere, where the standard says Ls/Rs 1.41 and LFE 0.
+    if (key.rfind ("weight", 0) == 0)
+    {
+        long ch = 0;
+        if (! inum (key.substr (6), ch) || ! dOk) return false;
+        if (ch < 0 || ch >= core::kMaxChannels) return false;
+        a.weights.push_back ({ (std::int32_t) ch, d });
+        return true;
+    }
     #undef FC_D
     #undef FC_I
     return false;
@@ -354,6 +368,10 @@ bool abiRender (const Args& a, const std::vector<float>& in, std::size_t frames,
     fc_master h = 0;
     if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
     { std::fprintf (stderr, "create: %s\n", statusName (st)); return false; }
+
+    for (const auto& w : a.weights)
+        if (const fc_status st = fc_master_set_channel_weight (h, w.channel, w.value); st != FC_OK)
+        { std::fprintf (stderr, "weight%d: %s\n", w.channel, statusName (st)); fc_master_destroy (h); return false; }
 
     FC_INIT (res);
     if (const fc_status st = fc_master_configure (h, &a.prm, &res); st != FC_OK)
@@ -843,6 +861,9 @@ int main (int argc, char** argv)
         fc_master h = 0;
         if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
         { std::fprintf (stderr, "create: %s\n", statusName (st)); return 2; }
+        for (const auto& w : a.weights)
+            if (fc_master_set_channel_weight (h, w.channel, w.value) != FC_OK)
+            { std::fprintf (stderr, "weight%d rejected\n", w.channel); fc_master_destroy (h); return 2; }
         double lra = 0.0;
         const fc_status st = fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &lra);
         fc_master_destroy (h);
@@ -887,6 +908,9 @@ int main (int argc, char** argv)
         fc_master h = 0;
         if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
         { std::fprintf (stderr, "create: %s\n", statusName (st)); return 2; }
+        for (const auto& w : a.weights)
+            if (fc_master_set_channel_weight (h, w.channel, w.value) != FC_OK)
+            { std::fprintf (stderr, "weight%d rejected\n", w.channel); fc_master_destroy (h); return 2; }
         std::vector<float> out (in.size(), 0.0f);
         fc_solution sol = 0;
         const fc_status st = fc_master_solve (h, &a.prm, &a.req, in.data(), out.data(),

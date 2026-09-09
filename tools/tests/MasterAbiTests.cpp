@@ -1029,6 +1029,35 @@ int main()
             fc_master_destroy (h);
         }
 
+        // 4b. AN EXCLUDED CHANNEL CANNOT POISON A MEASUREMENT IT IS NOT IN. Making the counter
+        //     load-bearing for a refusal exposed that `LoudnessMeter` counted poisoned sub-hops
+        //     UNWEIGHTED, against its own documentation — so a NaN in a `w = 0` channel, which is what
+        //     BS.1770 gives LFE, refused a programme whose weighted energy was perfectly fine.
+        {
+            fc_master_config c = goodConfig();
+            c.channels = 3; c.monoBass = 0;
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "a three-channel chain");
+            const std::size_t frames = (std::size_t) (kFs * 8.0);
+            std::vector<float> in (frames * 3, 0.0f);
+            for (int ch = 0; ch < 2; ++ch)
+                for (std::size_t i = 0; i < frames; ++i)
+                    in[(std::size_t) ch * frames + i] =
+                        (float) (((i / 48000) % 2 ? 0.5 : 0.05)
+                                 * std::sin (2.0 * 3.14159265358979 * (300.0 + 90.0 * ch) * (double) i / kFs));
+            in[2 * frames + 12345] = std::numeric_limits<float>::quiet_NaN();   // poison in channel 2 ONLY
+
+            double weighted = 0.0;
+            ok (fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &weighted) == FC_ERR_REFUSED_BY_CORE,
+                "PRECONDITION: at weight 1 the poisoned channel refuses the measurement");
+            ok (fc_master_set_channel_weight (h, 2, 0.0) == FC_OK, "exclude it, as BS.1770 does for LFE");
+            double excluded = 0.0;
+            ok (fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &excluded) == FC_OK,
+                "and the measurement is accepted — the poison is in a channel that is not in it");
+            ok (excluded > 0.5, "with a real range from the two channels that ARE in it");
+            fc_master_destroy (h);
+        }
+
         // 5. The declared check order. A call that is illegal for the HANDLE says so before it says
         //    anything about the structs it carries.
         {

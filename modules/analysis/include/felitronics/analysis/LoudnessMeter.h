@@ -199,7 +199,15 @@ private:
         for (int c = 0; c < nc; ++c)
         {
             const double e = subSumSq[c];              // NaN*NaN or inf*inf — any bad sample lands here
-            if (! std::isfinite (e)) { poisoned = true; continue; }
+            // AN EXCLUDED CHANNEL CANNOT POISON A MEASUREMENT IT IS NOT IN. `nonFiniteSubHops()` is
+            // documented as counting sub-hops whose CHANNEL-WEIGHTED mean square came out non-finite,
+            // and the code counted them unweighted: a NaN in a `w = 0` channel — which is exactly what
+            // BS.1770 gives LFE — flagged a sub-hop whose weighted energy was perfectly fine. The
+            // energy path next door already reasons this way, and reasoned it first; the counter had
+            // simply not been made to agree with it. That mattered the moment the counter became
+            // load-bearing: `TargetLoudnessSolver::measureInputLoudnessRange()` now REFUSES on it, so
+            // an unweighted count would refuse a 5.1 programme over a channel the standard excludes.
+            if (! std::isfinite (e)) { if (w[c] != 0.0) poisoned = true; continue; }
             subMS += w[c] * (e / (double) subSamples);
         }
         if (poisoned && nonFiniteSubHops_ != ~std::uint64_t {}) ++nonFiniteSubHops_;
