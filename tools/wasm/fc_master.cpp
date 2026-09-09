@@ -187,6 +187,20 @@ bool inHeap (const void* p, std::uint64_t bytes) noexcept
 
 bool aligned4 (const void* p) noexcept { return (reinterpret_cast<std::uintptr_t> (p) & 0x3u) == 0; }
 
+// A SCALAR out-parameter is an address from JavaScript too, and it was the one class this file checked
+// only for null. `fc_master_latency(h, (int32_t*) heapSize)` then traps the module where every other
+// bad address is a refusal — the barrier the facade exists to provide, with a hole in it exactly where
+// the value is small enough to look harmless. Natively `inHeap` cannot answer, so this is a wasm-tier
+// guard and says so; the alignment half works everywhere.
+template <typename T>
+fc_status checkScalarOut (const T* p) noexcept
+{
+    if (p == nullptr) return FC_ERR_NULL;
+    if ((reinterpret_cast<std::uintptr_t> (p) & (alignof (T) - 1)) != 0) return FC_ERR_ALIGNMENT;
+    if (! inHeap (p, sizeof (T))) return FC_ERR_SPAN;
+    return FC_OK;
+}
+
 // A planar audio span: `channels * frames` floats starting at `p`. The product is computed in 64 bits
 // BEFORE the multiply can wrap, because on wasm32 that product IS the caller's allocation and a wrapped
 // one would hand the core a window onto unrelated heap.
@@ -216,9 +230,14 @@ fc_status checkHeaderIn (const T* p) noexcept
 {
     if (p == nullptr) return FC_ERR_NULL;
     if ((reinterpret_cast<std::uintptr_t> (p) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
-    if (! inHeap (p, sizeof (T))) return FC_ERR_SPAN;
+    // THE HEADER FIRST, THEN THE REST OF THE SPAN, and the two steps are separate on purpose. Bounding
+    // the whole struct before reading the version means a caller who got the version wrong is told
+    // FC_ERR_SPAN — the wrong diagnosis, on the one field whose job is to catch exactly that mistake.
+    // Eight bytes is what the version costs to read, so eight bytes is what is bounded first.
+    if (! inHeap (p, sizeof (fc_header))) return FC_ERR_SPAN;
     if (p->header.abiVersion != FC_MASTER_ABI_VERSION) return FC_ERR_ABI_VERSION;
     if (p->header.structSize != (std::uint32_t) sizeof (T)) return FC_ERR_STRUCT_SIZE;
+    if (! inHeap (p, sizeof (T))) return FC_ERR_SPAN;
     return FC_OK;
 }
 
@@ -510,7 +529,10 @@ struct MasterInstance
     MasteringChain       chain;
     OfflineRenderer      renderer;
     TargetLoudnessSolver solver;
-    std::uint32_t framesIn = 0, framesFlushed = 0;
+    // 64 bits, because 32 overflows on a legal stream: 4096-frame calls wrap `framesIn` after about
+    // 24 h 51 min at 48 kHz and 6 h 13 min at 192 kHz, and a counter that can read zero after having
+    // been non-zero is worse than no counter.
+    std::uint64_t framesIn = 0, framesFlushed = 0;
     bool audioSeen = false;         // set by process(); configure() refuses once this is true
 };
 
@@ -533,7 +555,12 @@ std::uint32_t packHandle (int idx, std::uint8_t gen) noexcept
 
 Slot* lookup (std::uint32_t h, Kind want) noexcept
 {
-    if (h == 0) return nullptr;
+    // `packHandle` only ever produces values in the low 16 bits, so anything above them is a value this
+    // ABI never issued. Without this line each live handle has 65 536 accepted spellings and a made-up
+    // one can destroy somebody's object; `h == 0` is then covered by the index test below, but it is
+    // spelled out because "handle 0 is never valid" is a contract sentence and not an accident of
+    // arithmetic.
+    if (h == 0 || (h >> 16) != 0u) return nullptr;
     const int idx = (int) (h & 0xFFu) - 1;
     if (idx < 0 || idx >= kMaxHandles) return nullptr;
     Slot& s = g_slots[idx];
@@ -552,6 +579,16 @@ int allocSlot (Kind kind, std::uint32_t& outHandle) noexcept
         return i;
     }
     return -1;
+}
+
+// A slot whose handle was NEVER HANDED OUT goes back untouched. `freeSlot` exists to make an issued
+// handle stale, and that costs a generation; doing it for a create that failed spends the table down
+// for nothing.
+void abandonSlot (Slot& s) noexcept
+{
+    s.master.reset();
+    s.solution.reset();
+    s.kind = Kind::Free;
 }
 
 void freeSlot (Slot& s) noexcept
@@ -580,8 +617,12 @@ void planes (float* base, std::uint32_t stride, int nch, float** out) noexcept
 
 FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* out)
 {
-    if (out == nullptr) return FC_ERR_NULL;
-    *out = 0;
+    // `*out` IS NOT TOUCHED UNTIL THE CALL SUCCEEDS. It used to be cleared on entry, which reads as the
+    // careful thing and is not: a caller reusing a variable that still holds a LIVE handle would have it
+    // wiped by a call that failed on the version field, and the object it named would then be
+    // unreachable and undestroyable. A refused call is indistinguishable from one never made — that
+    // includes its arguments.
+    if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
     if (const fc_status st = checkHeaderIn (cfg); st != FC_OK) return st;
 
     MasteringChainConfig cc {};
@@ -604,7 +645,11 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     if (! m.renderer.prepare (cfg->channels, 4096)
         || ! m.chain.prepare (cfg->sampleRate, cfg->channels, cc))
     {
-        freeSlot (g_slots[idx]);
+        // `abandonSlot`, not `freeSlot`: no handle ever left this function, so there is nothing for a
+        // stale one to alias and no reason to spend a generation. Spending one here is not free —
+        // generations are 8 bits and a slot RETIRES when they run out, so 2040 refused creates would
+        // exhaust a table that had never issued a single handle.
+        abandonSlot (g_slots[idx]);
         return FC_ERR_REFUSED_BY_CORE;
     }
     *out = h;
@@ -683,7 +728,7 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (written == nullptr) return FC_ERR_NULL;
+    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
     *written = 0;
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
@@ -709,7 +754,7 @@ FC_EXPORT fc_status fc_master_latency (fc_master h, std::int32_t* out)
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (out == nullptr) return FC_ERR_NULL;
+    if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
     *out = s->master->chain.latencySamples();
     return FC_OK;
 }
@@ -747,7 +792,7 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (out == nullptr) return FC_ERR_NULL;
+    if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
     if (frames == 0) return FC_ERR_REFUSED_BY_CORE;
@@ -770,6 +815,27 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
     return FC_OK;
 }
 
+// BS.1770 CHANNEL WEIGHTS, forwarded to the solver's meters. Not decoration and not a convenience: the
+// standard weights Ls/Rs at 1.41 and EXCLUDES LFE, and the core says in as many words that its default
+// of 1.0 everywhere is correct for mono and stereo and wrong for surround. This ABI accepts up to
+// `kMaxChannels`, so without this entry point a correct surround search could not be expressed through
+// it at all — which would make the facade a NARROWER road than the C++ API, and the thinness law is
+// about both directions. The host-layout-to-role mapping stays outside, exactly as the core says.
+FC_EXPORT fc_status fc_master_set_channel_weight (fc_master h, std::int32_t channel, double weight)
+{
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    if (channel < 0 || channel >= core::kMaxChannels) return FC_ERR_RANGE;
+    if (! std::isfinite (weight) || weight < 0.0) return FC_ERR_NON_FINITE;
+    auto& m = *s->master;
+    if (! m.solver.isPrepared()
+        && ! m.solver.prepare (m.chain.sampleRate(), m.chain.numChannels(), m.renderer.blockSize(),
+                               m.chain.internalBlock(), m.chain.tapOversampleFactor()))
+        return FC_ERR_REFUSED_BY_CORE;
+    m.solver.setChannelWeight (channel, weight);
+    return FC_OK;
+}
+
 FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params,
                                      const fc_loudness_request* req,
                                      const float* in, float* out, std::uint32_t frames,
@@ -777,7 +843,7 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (out_solution == nullptr) return FC_ERR_NULL;
+    if (const fc_status st = checkScalarOut (out_solution); st != FC_OK) return st;
     *out_solution = 0;
     if (const fc_status st = checkHeaderIn (params); st != FC_OK) return st;
     if (const fc_status st = checkHeaderIn (req); st != FC_OK) return st;
@@ -819,10 +885,22 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     g_slots[idx].solution = std::make_unique<LoudnessSolution> (
         m.solver.solve (m.chain, m.renderer, cp, ip, op, nch, (int) frames, lr));
 
-    // The search drives the renderer, which resets the chain on every pass — so the handle's streaming
-    // state is gone and its counters would be lying if they survived.
-    m.framesIn = m.framesFlushed = 0;
-    m.audioSeen = false;
+    // The search drives the renderer, which RESETS the chain on every pass — so where it ran, the
+    // handle's streaming state is gone and its counters would be lying if they survived.
+    //
+    // WHERE IT DID NOT RUN, NOTHING MAY MOVE, and this used to be unconditional. `NotPrepared` and
+    // `InvalidRequest` are returned before `OfflineRenderer::render()` is reached, so the chain still
+    // holds whatever was in its FIFO — and clearing `audioSeen` there disarmed the guard that stops
+    // `configure` from re-preparing over a live stream. Measured: `process(64)` (configure correctly
+    // refused with FC_ERR_STATE), then a solve with no target, and the very same configure was then
+    // ACCEPTED and destroyed the 64 frames. A refused call has to be indistinguishable from one never
+    // made even when what refused it was the core.
+    const MasteringSolveStatus verdict = g_slots[idx].solution->status;
+    if (verdict != MasteringSolveStatus::NotPrepared && verdict != MasteringSolveStatus::InvalidRequest)
+    {
+        m.framesIn = m.framesFlushed = 0;
+        m.audioSeen = false;
+    }
 
     *out_solution = sh;
     return FC_OK;   // A VERDICT WAS OBTAINED. Whether it is `Solved` is the summary's business.
@@ -863,7 +941,7 @@ FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::ui
 {
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (written == nullptr) return FC_ERR_NULL;
+    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
     *written = 0;
     if (cap == 0) return FC_OK;                       // asking for nothing is not an error
     if (out == nullptr) return FC_ERR_NULL;
@@ -905,8 +983,12 @@ FC_EXPORT void fc_master_config_default (fc_master_config* out)
     const MasteringChainConfig d {};
     std::memset (out, 0, sizeof (*out));
     stampHeader (out);
-    out->sampleRate            = 48000.0;      // not a core default — the core has none, and says so
-    out->channels              = 2;
+    // LEFT AT ZERO, DELIBERATELY. There is no core default for either, and writing one here would be
+    // this file choosing a geometry for every caller who forgot to — the same objection that keeps
+    // `targetLufs` and `maxTruePeakDbTp` at NaN in the request. `fc_master_create` refuses both, so a
+    // caller who forgets is told rather than silently given 48 kHz stereo.
+    out->sampleRate            = 0.0;
+    out->channels              = 0;
     out->internalBlock         = d.internalBlock;
     out->eq                    = d.eq ? 1 : 0;
     out->monoBass              = d.monoBass ? 1 : 0;

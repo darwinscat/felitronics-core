@@ -123,6 +123,12 @@ int main()
         std::memset (&c, 0xAB, sizeof c);
         fc_master_config_default (&c);
         ok (c.monoBass == 0, "the CONFIG's monoBass defaults OFF — the two defaults really do disagree");
+        // The core has no default rate and no default width, so neither does this. Writing one would be
+        // the facade choosing a geometry for every caller who forgot to state one.
+        ok (c.sampleRate == 0.0 && c.channels == 0, "and it invents NO sample rate and NO channel count");
+        fc_master hFromDefault = 0;
+        ok (fc_master_create (&c, &hFromDefault) == FC_ERR_REFUSED_BY_CORE,
+            "so a create straight from the defaults is refused rather than silently given 48 kHz stereo");
         ok (c.internalBlock == 256, "the internal quantum's default");
         ok (c.tapsPerPhase == 64, "and the oversampler's tap count");
 
@@ -144,8 +150,12 @@ int main()
         ok (fc_master_create (&c, nullptr) == FC_ERR_NULL, "a null out-handle");
 
         fc_master_config bad = c; bad.header.abiVersion = 999u;
+        h = 0xDEADBEEFu;
         ok (fc_master_create (&bad, &h) == FC_ERR_ABI_VERSION, "a version this build does not know");
-        ok (h == 0, "and the out-handle is cleared rather than left holding a stale value");
+        // NOT cleared. A caller reusing a variable that still holds a LIVE handle would otherwise have
+        // it wiped by a call that failed on the version field, leaving that object unreachable and
+        // undestroyable. A refused call is indistinguishable from one never made, arguments included.
+        ok (h == 0xDEADBEEFu, "and the out-handle is left exactly as it was");
 
         bad = c; bad.header.structSize = (std::uint32_t) sizeof (bad) + 8u;
         ok (fc_master_create (&bad, &h) == FC_ERR_STRUCT_SIZE, "a struct size that disagrees with this build");
@@ -521,6 +531,169 @@ int main()
         ok (fc_master_solve (h, &p, &req, in.data(), in.data() + 4, (std::uint32_t) 64, &sol) == FC_ERR_SPAN,
             "and so is a partial overlap");
         fc_master_destroy (h);
+    }
+
+
+    //==========================================================================
+    // Every check below was written because a MUTATION SURVIVED without it, or because a crew round
+    // named the hole. Recorded that way rather than tidied in: a test whose reason is invisible is the
+    // first one somebody deletes.
+    group ("holes the mutation stand and the review round found");
+    {
+        // 1. `reset()` must clear the non-finite counter, or it describes two streams at once.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            (void) fc_master_configure (h, &p, &r);
+            auto buf = tone (1024, kNch);
+            buf[10] = std::numeric_limits<float>::quiet_NaN();
+            (void) fc_master_process (h, buf.data(), buf.data(), 1024);
+            fc_master_stats st {}; FC_INIT (st);
+            (void) fc_master_get_stats (h, &st);
+            ok (st.nonFiniteIn == 1u, "PRECONDITION: the counter moved, so the check below is live");
+            ok (fc_master_reset (h) == FC_OK, "reset");
+            FC_INIT (st);
+            (void) fc_master_get_stats (h, &st);
+            ok (st.nonFiniteIn == 0u, "and the counter describes THIS stream, not the previous one");
+            ok (st.framesIn == 0u && st.framesFlushed == 0u, "as do the frame counters");
+            fc_master_destroy (h);
+        }
+
+        // 2. The frames x channels product must be refused where it leaves 32 bits — and the test has to
+        //    reach THAT check rather than the INT_MAX one, which fires first for a larger count.
+        //    0x40000000 frames is under INT_MAX; times 2 channels times 4 bytes it is 2^33.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            (void) fc_master_configure (h, &p, &r);
+            auto buf = tone (64, kNch);
+            ok (fc_master_process (h, buf.data(), buf.data(), 0x40000000u) == FC_ERR_SPAN,
+                "a byte span past 32 bits is SPAN, not RANGE — the two checks are different and both live");
+            ok (fc_master_process (h, buf.data(), buf.data(), 0x80000000u) == FC_ERR_RANGE,
+                "while a frame count past INT_MAX is RANGE");
+            fc_master_destroy (h);
+        }
+
+        // 3. A handle is only the value `packHandle` produced. Without the high-bit test each live
+        //    handle has 65 536 accepted spellings and a made-up one can destroy somebody's object.
+        {
+            fc_master h = make();
+            std::int32_t lat = 0;
+            ok (fc_master_latency (h, &lat) == FC_OK, "the real handle works");
+            ok (fc_master_latency (h | 0x12340000u, &lat) == FC_ERR_HANDLE,
+                "a value with bits this ABI never sets is refused, not accepted as the same handle");
+            ok (fc_master_destroy (h | 0xFFFF0000u) == FC_ERR_HANDLE, "and cannot destroy it either");
+            ok (fc_master_latency (h, &lat) == FC_OK, "the object is still there");
+            fc_master_destroy (h);
+        }
+
+        // 4. A refused create must not spend a generation: the slot never issued a handle, so there is
+        //    nothing for a stale one to alias. Without this, refused creates retire the whole table.
+        {
+            fc_master_config bad = goodConfig();
+            bad.sampleRate = -1.0;
+            fc_master h = 0;
+            int refused = 0;
+            for (int i = 0; i < 600; ++i)
+                if (fc_master_create (&bad, &h) == FC_ERR_REFUSED_BY_CORE) ++refused;
+            ok (refused == 600, "600 creates, all refused by the core");
+            const fc_master_config good = goodConfig();
+            fc_master live = 0;
+            ok (fc_master_create (&good, &live) == FC_OK,
+                "600 refused creates later the table still issues handles");
+            fc_master_destroy (live);
+        }
+
+        // 5. A solve the SOLVER refused before rendering must leave the stream alone. Measured before
+        //    the fix: process(64), then a targetless solve, and the configure that had correctly
+        //    answered FC_ERR_STATE was accepted and destroyed the 64 frames sitting in the FIFO.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            (void) fc_master_configure (h, &p, &r);
+            auto buf = tone (64, kNch);
+            ok (fc_master_process (h, buf.data(), buf.data(), 64) == FC_OK, "a partial quantum is in flight");
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_STATE, "PRECONDITION: the guard is armed");
+
+            fc_loudness_request req {}; fc_loudness_request_default (&req);   // no target: InvalidRequest
+            const std::size_t frames = (std::size_t) (kFs * 4.0);
+            auto in = tone (frames, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_solution sol = 0;
+            ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK,
+                "the solve returns a verdict");
+            fc_solution_summary sum {}; FC_INIT (sum);
+            (void) fc_solution_summary_get (sol, &sum);
+            ok (sum.status == FC_SOLVE_INVALID_REQUEST, "PRECONDITION: it refused BEFORE rendering");
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_STATE,
+                "and the guard is STILL armed — a refused solve moved nothing");
+            fc_solution_destroy (sol);
+            fc_master_destroy (h);
+        }
+
+        // 6. A solve that DID render has reset the chain, so the guard must drop with it. Both halves
+        //    are asserted, because only the pair says the condition is on the verdict and not on luck.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            (void) fc_master_configure (h, &p, &r);
+            auto warm = tone (64, kNch);
+            (void) fc_master_process (h, warm.data(), warm.data(), 64);
+
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1;
+            const std::size_t frames = (std::size_t) (kFs * 4.0);
+            auto in = tone (frames, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_solution sol = 0;
+            ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK,
+                "a real solve");
+            ok (fc_master_configure (h, &p, &r) == FC_OK,
+                "and the guard is DOWN, because the search reset the chain underneath it");
+            fc_solution_destroy (sol);
+            fc_master_destroy (h);
+        }
+
+        // 7. BS.1770 weights, without which a surround search cannot be expressed through this ABI at
+        //    all — the standard weights Ls/Rs at 1.41 and excludes LFE.
+        {
+            fc_master h = make();
+            ok (fc_master_set_channel_weight (h, 0, 1.0) == FC_OK, "a legal weight");
+            ok (fc_master_set_channel_weight (h, 1, 1.41) == FC_OK, "the surround weight");
+            ok (fc_master_set_channel_weight (h, 2, 0.0) == FC_OK, "and zero, which is what LFE gets");
+            ok (fc_master_set_channel_weight (h, -1, 1.0) == FC_ERR_RANGE, "a negative channel");
+            ok (fc_master_set_channel_weight (h, 999, 1.0) == FC_ERR_RANGE, "one past the last channel");
+            ok (fc_master_set_channel_weight (h, 0, -1.0) == FC_ERR_NON_FINITE, "a negative weight");
+            ok (fc_master_set_channel_weight (h, 0, std::numeric_limits<double>::quiet_NaN())
+                    == FC_ERR_NON_FINITE, "a NaN weight");
+            ok (fc_master_set_channel_weight (0, 0, 1.0) == FC_ERR_HANDLE, "and it checks the handle first");
+            fc_master_destroy (h);
+        }
+
+        // 8. Null scalar out-parameters, at every entry point that has one. The heap-bounds half of the
+        //    same guard cannot be exercised natively — `inHeap` has nothing to bound outside a linear
+        //    memory — and saying so is better than a test that passes for that reason.
+        {
+            fc_master h = make();
+            std::int32_t lat = 0;
+            ok (fc_master_latency (h, nullptr) == FC_ERR_NULL, "latency");
+            double lra = 0.0;
+            ok (fc_master_measure_lra (h, nullptr, 16, &lra) == FC_ERR_NULL, "measure_lra input");
+            fc_master_config c = goodConfig();
+            ok (fc_master_create (&c, nullptr) == FC_ERR_NULL, "create out-handle");
+            fc_master_params p = goodParams();
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            auto in = tone (256, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            ok (fc_master_solve (h, &p, &req, in.data(), out.data(), 256, nullptr) == FC_ERR_NULL,
+                "solve out-solution");
+            ok (fc_master_latency (h, &lat) == FC_OK, "and the handle survived all of it");
+            fc_master_destroy (h);
+        }
     }
 
     return felitronics::test::report();

@@ -109,8 +109,15 @@ typedef struct fc_header
 // STATUS
 //
 // Order is not accidental: it is the order the checks run in, which law 11 makes part of the contract
-// so that one malformed call has one answer. Handle first (nothing else can be read without it), then
-// the struct header, then the spans, then the field values, then the core.
+// so that one malformed call has one answer.
+//
+//   handle -> out-parameters (null, alignment, in-heap) -> struct headers (the first 8 bytes bounded,
+//   then version, then size, THEN the rest of the struct's span) -> audio spans -> field values -> core
+//
+// Two details of that are load-bearing rather than incidental. OUT-PARAMETERS COME BEFORE THE INPUT
+// STRUCTS because a call that cannot report its result must not perform it. And a struct's HEADER is
+// bounded before the struct is: bounding the whole thing first would answer FC_ERR_SPAN to a caller
+// whose real mistake was the version, which is the one field whose job is to catch exactly that.
 typedef enum fc_status
 {
     FC_OK                  =  0,
@@ -371,8 +378,11 @@ typedef struct fc_master_stats
 {
     fc_header header;
 
-    uint32_t framesIn;              // frames handed to fc_master_process since the last reset
-    uint32_t framesFlushed;         // frames drained by fc_master_flush since the last reset
+    // 64 bits, because 32 overflows on a legal stream: 4096-frame calls wrap after about 24 h 51 min at
+    // 48 kHz and 6 h 13 min at 192 kHz, and a counter that can read zero after having been non-zero is
+    // worse than no counter.
+    uint64_t framesIn;              // frames handed to fc_master_process since the last reset
+    uint64_t framesFlushed;         // frames drained by fc_master_flush since the last reset
     // Input samples the chain's own gate had to replace because they were not finite, read straight out
     // of `MasteringChain::nonFiniteInputSamples()`. Not recomputed here, and not derived: a second scan
     // of the audio would be a second definition of "non-finite", and the count of internal quanta —
@@ -469,7 +479,12 @@ typedef uint32_t fc_solution;
 
 // Create a chain. `cfg` carries the sample rate, the channel count and the topology; the chain is
 // prepared with the core's own default parameters, so latency and geometry are answerable at once.
-// The handle is written to `out` only on FC_OK.
+//
+// THE HANDLE IS WRITTEN ONLY ON FC_OK, and `out` is not touched at all otherwise — not even cleared.
+// Clearing on entry reads as the careful thing and is not: a caller reusing a variable that still held
+// a LIVE handle would have it wiped by a call that failed on the version field, and the object it named
+// would be unreachable and undestroyable. A COUNT out-parameter (`written`) is the opposite and IS
+// cleared first, because zero is the truthful answer for a call that wrote nothing.
 fc_status fc_master_create (const fc_master_config* cfg, fc_master* out);
 
 // Apply a parameter set and report back what the chain will actually run.
@@ -542,12 +557,25 @@ fc_status fc_master_destroy (fc_master h);
 // Stateless by construction: it returns the number and the caller puts it into the request, so it
 // cannot outlive the programme it describes.
 //
-// UNLIKE `process`, THIS REFUSES A NON-FINITE SAMPLE. A measurement has no gate to hide behind: one
+// UNLIKE `process`, THIS REFUSES A POISONED PROGRAMME. A measurement has no gate to hide behind: one
 // non-finite sample poisons the K-weighted state, its 10 ms is recorded as silence, and the meter goes
-// on returning a plausible integrated number computed over part of the programme. The core already
-// makes that visible (`nonFiniteSubHops()`), but a facade that handed the number over anyway would be
-// publishing a measurement it had been told not to trust.
+// on returning a plausible integrated number computed over part of the programme. The core makes that
+// visible (`nonFiniteSubHops()`) and now refuses on it.
+//
+// BE EXACT ABOUT THE GRANULARITY, because the obvious claim is stronger than the truth: the counter is
+// incremented when a 10 ms SUB-HOP COMPLETES, so a non-finite sample inside the final, incomplete
+// sub-hop — under 480 frames at 48 kHz — is not counted and this call returns FC_OK. Closing that would
+// mean scanning the input here, which is a second definition of "non-finite" and a second pass over the
+// audio; the honest move is to say where the line is. Everything from one completed sub-hop onward is
+// refused, which is every case that can move the number this call exists to produce.
 fc_status fc_master_measure_lra (fc_master h, const float* in, uint32_t frames, double* out);
+
+// BS.1770 CHANNEL WEIGHTS for the solver's meters. The standard weights Ls/Rs at 1.41 and EXCLUDES LFE,
+// and the core's default of 1.0 everywhere is correct for mono and stereo and wrong for surround. This
+// ABI accepts up to `kMaxChannels`, so without this a correct surround search could not be expressed
+// through it — and a facade that is a NARROWER road than the C++ API breaks the thinness law just as a
+// wider one would. The host-layout-to-role mapping stays outside, as the core says.
+fc_status fc_master_set_channel_weight (fc_master h, int32_t channel, double weight);
 
 // Run the loudness search over the whole programme. `in` and `out` are planar with stride `frames` and
 // MUST NOT be the same buffer: a search reads its input again on every pass, and rendering in place
@@ -579,7 +607,10 @@ fc_status fc_solution_destroy (fc_solution s);
 // 0.874 full scale. So a caller starts from these and overwrites what it means to change; a caller that
 // starts from zeroed memory is rendering something nobody chose.
 //
-// `header` is filled in too, so the result is immediately usable as an argument.
+// `header` is filled in too, so the result is immediately usable as an argument. NB
+// `fc_master_config_default` leaves `sampleRate` and `channels` at ZERO on purpose: the core has no
+// default for either, so writing one would be this file choosing a geometry for every caller who forgot
+// to state one. `fc_master_create` refuses both, which is how the caller finds out.
 void fc_master_params_default (fc_master_params* out);
 void fc_master_config_default (fc_master_config* out);
 void fc_loudness_request_default (fc_loudness_request* out);

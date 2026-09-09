@@ -98,6 +98,29 @@ struct Args
     std::uint32_t block = 4096;
 };
 
+// STRICT number parsing. `atof`/`atoi` stop at the first character they do not understand and report
+// nothing, so `inputGainDb=oops` becomes 0 dB and `comp.ratio=4oops` becomes 4 — a harness row computed
+// from settings nobody chose, which is the whole failure mode this CLI's strictness exists to prevent.
+bool num (const std::string& v, double& out)
+{
+    if (v.empty()) return false;
+    char* end = nullptr;
+    const double d = std::strtod (v.c_str(), &end);
+    if (end == v.c_str() || *end != '\0') return false;
+    out = d;
+    return true;
+}
+
+bool inum (const std::string& v, long& out)
+{
+    if (v.empty()) return false;
+    char* end = nullptr;
+    const long i = std::strtol (v.c_str(), &end, 10);
+    if (end == v.c_str() || *end != '\0') return false;
+    out = i;
+    return true;
+}
+
 bool parseBool (const std::string& v, std::int32_t& out)
 {
     if (v == "1" || v == "on" || v == "true")  { out = 1; return true; }
@@ -119,7 +142,11 @@ bool applyBandKey (Args& a, const std::string& key, const std::string& val)
     if (key.rfind ("band", 0) != 0) return false;
     const std::size_t dot = key.find ('.');
     if (dot == std::string::npos) return false;
-    const int idx = std::atoi (key.substr (4, dot - 4).c_str());
+    // The INDEX must be the whole of what sits between "band" and the dot. `atoi` would read `bandXYZ`
+    // as band 0 and quietly apply the value to the wrong band.
+    long idxL = 0;
+    if (! inum (key.substr (4, dot - 4), idxL)) return false;
+    const int idx = (int) idxL;
     if (idx < 0 || idx >= FC_MAX_EQ_BANDS) return false;
     const std::string f = key.substr (dot + 1);
     fc_eq_band& b = a.prm.eqBands[idx];
@@ -130,27 +157,35 @@ bool applyBandKey (Args& a, const std::string& key, const std::string& val)
     if (f == "swept")  return parseBool (val, b.swept);
     if (f == "type")   return parseEnumName (val, kTypes, 9, b.type);
     if (f == "laneon") return parseBool (val, b.lanes[0].on);
-    if (f == "freq")  { b.lanes[0].freq   = std::atof (val.c_str()); return true; }
-    if (f == "q")     { b.lanes[0].q      = std::atof (val.c_str()); return true; }
-    if (f == "gain")  { b.lanes[0].gainDb = std::atof (val.c_str()); return true; }
-    if (f == "slope") { b.lanes[0].slope  = std::atoi (val.c_str()); return true; }
+    double d = 0.0; long i = 0;
+    if (f == "freq")  { if (! num (val, d)) return false; b.lanes[0].freq   = d; return true; }
+    if (f == "q")     { if (! num (val, d)) return false; b.lanes[0].q      = d; return true; }
+    if (f == "gain")  { if (! num (val, d)) return false; b.lanes[0].gainDb = d; return true; }
+    if (f == "slope") { if (! inum (val, i)) return false; b.lanes[0].slope = (std::int32_t) i; return true; }
     return false;
 }
 
 bool applyKey (Args& a, const std::string& key, const std::string& val)
 {
-    const double  d = std::atof (val.c_str());
-    const int     i = std::atoi (val.c_str());
-
     if (applyBandKey (a, key, val)) return true;
 
-    if (key == "block")          { a.block = (std::uint32_t) (i > 0 ? i : 1); return true; }
-    if (key == "internalBlock")  { a.cfg.internalBlock = i; return true; }
-    if (key == "oversample")     { a.cfg.oversampleFactor = i; return true; }
-    if (key == "taps")           { a.cfg.tapsPerPhase = i; return true; }
-    if (key == "compLookaheadMs"){ a.cfg.compressorLookaheadMs = d; return true; }
-    if (key == "limLookaheadMs") { a.cfg.limiterLookaheadMs = d; return true; }
-    if (key == "sidechainHpfHz") { a.cfg.sidechainHpfHz = d; return true; }
+    // Every numeric key below reads through these two, so a value that is not a whole number is a
+    // refusal rather than a silent zero. `dNeeded`/`iNeeded` are false when the value did not parse;
+    // each use tests them, so one malformed value cannot slip past as "the default".
+    double d = 0.0; long i = 0;
+    const bool dOk = num (val, d);
+    const bool iOk = inum (val, i);
+    (void) dOk;
+    #define FC_D(expr) do { if (! dOk) return false; expr; return true; } while (0)
+    #define FC_I(expr) do { if (! iOk) return false; expr; return true; } while (0)
+
+    if (key == "block")          { FC_I (a.block = (std::uint32_t) (i > 0 ? i : 1)); }
+    if (key == "internalBlock")  { FC_I (a.cfg.internalBlock = i); }
+    if (key == "oversample")     { FC_I (a.cfg.oversampleFactor = i); }
+    if (key == "taps")           { FC_I (a.cfg.tapsPerPhase = i); }
+    if (key == "compLookaheadMs"){ FC_D (a.cfg.compressorLookaheadMs = d); }
+    if (key == "limLookaheadMs") { FC_D (a.cfg.limiterLookaheadMs = d); }
+    if (key == "sidechainHpfHz") { FC_D (a.cfg.sidechainHpfHz = d); }
     if (key == "eq")             return parseBool (val, a.cfg.eq);
     if (key == "monoBass")       return parseBool (val, a.cfg.monoBass);
     if (key == "compressor")     return parseBool (val, a.cfg.compressor);
@@ -158,12 +193,12 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "limiter")        return parseBool (val, a.cfg.limiter);
     if (key == "dither")         return parseBool (val, a.cfg.dither);
 
-    if (key == "inputGainDb")      { a.prm.inputGainDb = d; return true; }
-    if (key == "preLimiterGainDb") { a.prm.preLimiterGainDb = d; return true; }
+    if (key == "inputGainDb")      { FC_D (a.prm.inputGainDb = d); }
+    if (key == "preLimiterGainDb") { FC_D (a.prm.preLimiterGainDb = d); }
 
     if (key == "mb.on")    return parseBool (val, a.prm.monoBass.enabled);
-    if (key == "mb.freq")  { a.prm.monoBass.frequencyHz = (float) d; return true; }
-    if (key == "mb.width") { a.prm.monoBass.lowWidth = (float) d; return true; }
+    if (key == "mb.freq")  { FC_D (a.prm.monoBass.frequencyHz = (float) d); }
+    if (key == "mb.width") { FC_D (a.prm.monoBass.lowWidth = (float) d); }
 
     static const char* kDet[]   { "peak", "rms" };
     static const char* kLink[]  { "max", "meanpower" };
@@ -175,33 +210,37 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "comp.detector")  return parseEnumName (val, kDet,  2, a.prm.compressor.detector);
     if (key == "comp.link")      return parseEnumName (val, kLink, 2, a.prm.compressor.link);
     if (key == "comp.mode")      return parseEnumName (val, kMode, 3, a.prm.compressor.mode);
-    if (key == "comp.rmsMs")     { a.prm.compressor.rmsWindowMs = d; return true; }
-    if (key == "comp.threshold") { a.prm.compressor.thresholdDb = d; return true; }
-    if (key == "comp.ratio")     { a.prm.compressor.ratio = d; return true; }
-    if (key == "comp.knee")      { a.prm.compressor.kneeDb = d; return true; }
-    if (key == "comp.range")     { a.prm.compressor.rangeDb = d; return true; }
-    if (key == "comp.attack")    { a.prm.compressor.attackMs = d; return true; }
-    if (key == "comp.release")   { a.prm.compressor.releaseMs = d; return true; }
-    if (key == "comp.makeup")    { a.prm.compressor.makeupDb = d; return true; }
+    if (key == "comp.rmsMs")     { FC_D (a.prm.compressor.rmsWindowMs = d); }
+    if (key == "comp.threshold") { FC_D (a.prm.compressor.thresholdDb = d); }
+    if (key == "comp.ratio")     { FC_D (a.prm.compressor.ratio = d); }
+    if (key == "comp.knee")      { FC_D (a.prm.compressor.kneeDb = d); }
+    if (key == "comp.range")     { FC_D (a.prm.compressor.rangeDb = d); }
+    if (key == "comp.attack")    { FC_D (a.prm.compressor.attackMs = d); }
+    if (key == "comp.release")   { FC_D (a.prm.compressor.releaseMs = d); }
+    if (key == "comp.makeup")    { FC_D (a.prm.compressor.makeupDb = d); }
     if (key == "comp.autoMakeup")return parseBool (val, a.prm.compressor.autoMakeup);
 
     if (key == "clip.shape")  return parseEnumName (val, kShape, 4, a.prm.clipper.shape);
-    if (key == "clip.drive")  { a.prm.clipper.driveDb  = (float) d; return true; }
-    if (key == "clip.bias")   { a.prm.clipper.bias     = (float) d; return true; }
-    if (key == "clip.mix")    { a.prm.clipper.mix      = (float) d; return true; }
-    if (key == "clip.output") { a.prm.clipper.outputDb = (float) d; return true; }
-    if (key == "clip.autoComp") { a.prm.clipper.autoComp = (float) d; return true; }
-    if (key == "clip.dcBlockHz"){ a.prm.clipper.dcBlockHz = (float) d; return true; }
+    if (key == "clip.drive")  { FC_D (a.prm.clipper.driveDb  = (float) d); }
+    if (key == "clip.bias")   { FC_D (a.prm.clipper.bias     = (float) d); }
+    if (key == "clip.mix")    { FC_D (a.prm.clipper.mix      = (float) d); }
+    if (key == "clip.output") { FC_D (a.prm.clipper.outputDb = (float) d); }
+    if (key == "clip.autoComp") { FC_D (a.prm.clipper.autoComp = (float) d); }
+    if (key == "clip.dcBlockHz"){ FC_D (a.prm.clipper.dcBlockHz = (float) d); }
 
-    if (key == "lim.ceiling") { a.prm.limiter.ceilingDbTp = d; return true; }
-    if (key == "lim.release") { a.prm.limiter.releaseMs = d; return true; }
+    if (key == "lim.ceiling") { FC_D (a.prm.limiter.ceilingDbTp = d); }
+    if (key == "lim.release") { FC_D (a.prm.limiter.releaseMs = d); }
 
-    if (key == "dith.bits")    { a.prm.dither.bits = i; return true; }
+    if (key == "dith.bits")    { FC_I (a.prm.dither.bits = i); }
     if (key == "dith.shaping") return parseEnumName (val, kShap, 3, a.prm.dither.shaping);
-    if (key == "dith.seedLo")  { a.prm.dither.seedLo = (std::uint32_t) std::strtoul (val.c_str(), nullptr, 0); return true; }
-    if (key == "dith.seedHi")  { a.prm.dither.seedHi = (std::uint32_t) std::strtoul (val.c_str(), nullptr, 0); return true; }
+    if (key == "dith.seedLo")  { char* e = nullptr; const unsigned long u = std::strtoul (val.c_str(), &e, 0);
+                                 if (e == val.c_str() || *e != '\0') return false;
+                                 a.prm.dither.seedLo = (std::uint32_t) u; return true; }
+    if (key == "dith.seedHi")  { char* e = nullptr; const unsigned long u = std::strtoul (val.c_str(), &e, 0);
+                                 if (e == val.c_str() || *e != '\0') return false;
+                                 a.prm.dither.seedHi = (std::uint32_t) u; return true; }
     if (key == "dith.autoBlank") return parseBool (val, a.prm.dither.autoBlank);
-    if (key == "dith.autoBlankSamples") { a.prm.dither.autoBlankSamples = i; return true; }
+    if (key == "dith.autoBlankSamples") { FC_I (a.prm.dither.autoBlankSamples = i); }
 
     if (key == "bypass.eq")         return parseBool (val, a.prm.bypassEq);
     if (key == "bypass.monoBass")   return parseBool (val, a.prm.bypassMonoBass);
@@ -210,20 +249,22 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "bypass.limiter")    return parseBool (val, a.prm.bypassLimiter);
     if (key == "bypass.dither")     return parseBool (val, a.prm.bypassDither);
 
-    if (key == "target")     { a.req.targetLufs = d; return true; }
-    if (key == "tp")         { a.req.maxTruePeakDbTp = d; return true; }
-    if (key == "tolerance")  { a.req.toleranceLu = d; return true; }
-    if (key == "tpAim")      { a.req.truePeakAimDb = d; return true; }
-    if (key == "maxPasses")  { a.req.maxPasses = i; return true; }
-    if (key == "initialGain"){ a.req.initialGainDb = d; return true; }
-    if (key == "minPlr")     { a.req.minPlrDb = d; return true; }
-    if (key == "maxLraLoss") { a.req.maxLraLossLu = d; return true; }
-    if (key == "inputLra")   { a.req.inputLoudnessRangeLu = d; return true; }
-    if (key == "limGrLimit") { a.req.limiterGr.limitDb = d; return true; }
+    if (key == "target")     { FC_D (a.req.targetLufs = d); }
+    if (key == "tp")         { FC_D (a.req.maxTruePeakDbTp = d); }
+    if (key == "tolerance")  { FC_D (a.req.toleranceLu = d); }
+    if (key == "tpAim")      { FC_D (a.req.truePeakAimDb = d); }
+    if (key == "maxPasses")  { FC_I (a.req.maxPasses = i); }
+    if (key == "initialGain"){ FC_D (a.req.initialGainDb = d); }
+    if (key == "minPlr")     { FC_D (a.req.minPlrDb = d); }
+    if (key == "maxLraLoss") { FC_D (a.req.maxLraLossLu = d); }
+    if (key == "inputLra")   { FC_D (a.req.inputLoudnessRangeLu = d); }
+    if (key == "limGrLimit") { FC_D (a.req.limiterGr.limitDb = d); }
     if (key == "limGrStat")  return parseEnumName (val, kGrSt, 3, a.req.limiterGr.statistic);
-    if (key == "compGrLimit"){ a.req.compressorGr.limitDb = d; return true; }
+    if (key == "compGrLimit"){ FC_D (a.req.compressorGr.limitDb = d); }
     if (key == "compGrStat") return parseEnumName (val, kGrSt, 3, a.req.compressorGr.statistic);
-    if (key == "activityDb") { a.req.activityThresholdDb = d; return true; }
+    if (key == "activityDb") { FC_D (a.req.activityThresholdDb = d); }
+    #undef FC_D
+    #undef FC_I
     return false;
 }
 
@@ -511,6 +552,19 @@ int selftest (double fs, int nc)
     a.prm.compressor.attackMs    = 7.3;
     a.prm.compressor.releaseMs   = 137.0;
     a.prm.clipper.driveDb        = 3.7f;
+    // NOT at their defaults, because a field left at its default lets a MISSING mapping pass this test:
+    // the mutation stand dropped `clipper.mix` and a bypass flag and both survived a suite in which
+    // every one of those fields still held the value the default writer had put there.
+    a.prm.clipper.mix            = 0.83f;
+    a.prm.clipper.bias           = 0.07f;
+    a.prm.clipper.outputDb       = -0.7f;
+    a.prm.clipper.autoComp       = 0.37f;
+    a.prm.clipper.dcBlockHz      = 13.0f;
+    a.prm.bypassMonoBass         = 1;
+    a.prm.bypassDither           = 0;
+    a.prm.compressor.rangeDb     = 37.0;
+    a.prm.compressor.makeupDb    = 1.7;
+    a.prm.compressor.rmsWindowMs = 7.7;
     a.prm.limiter.ceilingDbTp    = -1.3;
     a.prm.limiter.releaseMs      = 77.0;
     a.prm.dither.bits            = 24;
@@ -653,8 +707,14 @@ int main (int argc, char** argv)
         if (! parseArgs (a, argc, argv, 5)) return 2;
         a.cfg.sampleRate = std::atof (argv[2]);
         a.cfg.channels   = std::atoi (argv[3]);
+        // BEFORE the read, not after: `readInterleaved` divides by the channel count, so a zero here is
+        // an integer division by zero — undefined behaviour where the contract promises a refusal.
+        if (a.cfg.channels < 1 || a.cfg.channels > core::kMaxChannels)
+        { std::fprintf (stderr, "bad channel count\n"); return 2; }
         std::vector<float> in; std::size_t frames = 0;
         if (! readInterleaved (argv[4], a.cfg.channels, in, frames)) return 2;
+        if (frames > (std::size_t) 0x7FFFFFFFu)
+        { std::fprintf (stderr, "input longer than the ABI's frame count\n"); return 2; }
         fc_master h = 0;
         if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
         { std::fprintf (stderr, "create: %s\n", statusName (st)); return 2; }
@@ -677,6 +737,11 @@ int main (int argc, char** argv)
     std::vector<float> in; std::size_t frames = 0;
     if (! readInterleaved (argv[4], nc, in, frames)) return 2;
     if (frames == 0) { std::fprintf (stderr, "empty input\n"); return 2; }
+    // The ABI counts frames in 32 bits. Narrowing silently would not merely lose length: the planar
+    // STRIDE is the frame count, so channel 1's pointer would land inside channel 0's plane and the
+    // render would be of a signal that does not exist.
+    if (frames > (std::size_t) 0x7FFFFFFFu)
+    { std::fprintf (stderr, "input longer than the ABI's frame count (%zu frames)\n", frames); return 2; }
 
     if (mode == "render")
     {
@@ -709,10 +774,20 @@ int main (int argc, char** argv)
         std::printf ("I=%.17g TP=%.17g LRA=%.17g PLR=%.17g loudnessValid=%d lraValid=%d\n",
                      meas.integratedLufs, meas.truePeakDbTp, meas.loudnessRangeLu, meas.plrDb,
                      meas.loudnessValid, meas.lraValid);
-        const bool ok = writeInterleaved (argv[5], nc, out, frames);
+        // A VERDICT IS NOT A RENDER. `InvalidRequest` and `NotPrepared` are returned before the solver
+        // touches the output, so `out` is still the zero buffer it was allocated as — writing it would
+        // hand a harness a file of the right length, full of digital silence, with exit status 0 and an
+        // existing output overwritten. The status line has already been printed; the file is not.
+        const bool delivered = (sum.status != FC_SOLVE_INVALID_REQUEST
+                             && sum.status != FC_SOLVE_NOT_PREPARED
+                             && sum.status != FC_SOLVE_RENDER_FAILED);
+        bool ok = true;
+        if (delivered) ok = writeInterleaved (argv[5], nc, out, frames);
+        else std::fprintf (stderr, "no render was delivered (status=%d) — the output file is NOT written\n",
+                           sum.status);
         fc_solution_destroy (sol);
         fc_master_destroy (h);
-        return ok ? 0 : 1;
+        return (delivered && ok) ? 0 : 1;
     }
 
     std::fprintf (stderr, "unknown mode '%s'\n", mode.c_str());
