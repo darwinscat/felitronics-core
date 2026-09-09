@@ -55,8 +55,10 @@ public:
     // 🔴 RT-safe, in place. No model loaded → clean passthrough (no-op, and an ACCEPTED call).
     // `normalize` applies the model's loudness makeup (output normalisation) when the model
     // carries a loudness tag — brings raw model output to a consistent reference level.
-    // Law 11: `numSamples` is any length (chunked internally); `numChannels` is 1 or 2 and anything
-    // else is REFUSED whole — false means nothing was touched. See DSP-ARCHITECTURE.md §2 law 11.
+    // Law 11: `numSamples` is any length (chunked internally); `numChannels` is 1 or 2, and 0 is the
+    // law-11(d) CLOCK-ONLY call — accepted, `io` may be null, and the lanes the caller stopped handing
+    // over are fed the digital silence they are receiving (see drainedSamples()). A width above 2 is
+    // REFUSED whole — false means nothing was touched. See DSP-ARCHITECTURE.md §2 law 11.
     [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples, bool normalize) noexcept;
 
     //--- model lifecycle (message thread) ----------------------------------------
@@ -240,13 +242,35 @@ public:
     // (core::DryAligner clamps to [0, capacity-1], silently). That "+1" has exactly one reason and
     // belongs to the ring, so it is not folded in here.
     static int maxLatencySamples (double hostSR) noexcept;
-    // How many samples this model must be FED before its output means anything — its receptive field.
-    // A network with empty buffers describes the silence it was born into for exactly this long, so
-    // anything that fades a freshly loaded model in has to run it silently for this many samples
-    // first. NAM answers for convnet/lstm and a container forwards to its submodel, but WaveNet does
-    // not override it — so for a WaveNet capture this is computed from the config instead of trusted
-    // as zero. 0 = no model, or an architecture nothing here can read.
+    // How many samples this model must be FED before its output means anything — its MEMORY. A network
+    // with empty buffers describes the silence it was born into for exactly this long, so anything that
+    // fades a freshly loaded model in has to run it silently for this many samples first, and anything
+    // that drains a lane the caller stopped feeding owes it the same.
+    //
+    // Where the number comes from, because three sources disagree and the answer is the largest: NAM's
+    // own `GetPrewarmSamples()` answers for ConvNet, LSTM and a plain WaveNet, and a container forwards
+    // to its ACTIVE submodel; a SlimmableWavenet answers zero (`wavenet/slimmable.h`), and `Linear`
+    // inherits the base class's zero — so the config is read here as well, one dilated convolution at a
+    // time, or the plain `receptive_field` where the architecture simply states it. 0 = no model, a
+    // capture with no memory (a one-tap gain), or an architecture nothing here can read.
+    //
+    // ⚠️ It is a MEMORY, not a tap count: an N-tap impulse response reaches back N−1 samples, so a
+    // one-tap capture answers 0. This used to answer 0 for EVERY Linear capture, whatever its length.
     int    prewarmSamples()  const;
+
+    // 🔴 THE DRAIN'S ODOMETER — how many samples of digital silence this stage has fed to lanes the
+    // caller STOPPED handing over, since it was CONSTRUCTED. It is not cleared by a load, a clear or a
+    // prepare: it belongs to the stage, not to the model, so a caller comparing two moments subtracts. A lane the host takes away is not
+    // skipped: its network window and its two rate-matchers would otherwise freeze and be replayed on
+    // the return (measured 0.518588 out of digital silence at 44.1 kHz, and 0.499533 at 48 kHz with a
+    // 2001-tap capture, where no rate-matcher exists at all). It is fed silence instead, for as long as
+    // its state can still be heard, and then it STOPS — a permanently mono host pays for one network,
+    // not two.
+    //
+    // This exists to be TESTED, not to be acted on: past the debt the lane's output is zero whether it
+    // is still being clocked or not, so "and then it stops" has no witness in the audio and a drain that
+    // ran for ever would look identical. Counted per chunk on the audio thread with a relaxed store.
+    long long drainedSamples() const;
 
 private:
     struct Impl;

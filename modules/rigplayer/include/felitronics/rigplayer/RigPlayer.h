@@ -18,7 +18,12 @@
 //     player hands out (takeLoadJob) and the host runs where it likes (run, any thread) before
 //     bringing it back (deliver): no thread of its own, no policy, no hiccup on the drawing thread.
 //   • A slot that has stood silent under an unchanged request for kColdAfterSeconds goes COLD and its
-//     model is not run — a dial parked on a capture costs one network, not two. The law owns the flag
+//     model stops being run on audio — a dial parked on a capture costs one network, not two. It is
+//     still HANDED the call, at width zero, until the stage has drained the silence it owes (law 11c);
+//     sleeping is inaudible AT THE MODEL RATE and, off it, costs the woken slot's rate-matcher latency
+//     once on the block of the wake (4.97e-03 at 44.1 kHz against a 0.1 input) — see warmFor;
+//     that is one bounded drain per sleep and nothing after it, and without it the slot replayed what
+//     it was holding when it fell asleep — 0.500000 out of digital silence. The law owns the flag
 //     (BlendState::cold) and wakes the slot, warm-up first, the moment the request changes; the model
 //     stays where it is throughout. slotCold() and coldBlocks() read it out.
 //   • A tone knob is applied as the pack describes it — a curve becomes a minimum-phase FIR, bands
@@ -782,8 +787,9 @@ public:
     int   warmBlocks()  const { return warmBlocks_.load(std::memory_order_relaxed); }
     int   mixJumps()    const { return mixJumps_.load(std::memory_order_relaxed); }
     float biggestJump() const { return biggestJump_.load(std::memory_order_relaxed); }
-    // Whether a slot is COLD right now — held, silent, its model not run (kColdAfterSeconds) — and the
-    // blocks it has slept since the last clearCounters(), for the dump beside warmBlocks().
+    // Whether a slot is COLD right now — held, silent, its model no longer run on AUDIO
+    // (kColdAfterSeconds; it is still clocked at width zero until its drain is spent) — and the blocks
+    // it has slept since the last clearCounters(), for the dump beside warmBlocks().
     bool  slotCold(int slot)   const { return slotCold_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
     int   coldBlocks(int slot) const { return coldBlocks_[(std::size_t) (slot & 1)].load(std::memory_order_relaxed); }
     void  clearCounters() {
@@ -836,11 +842,43 @@ public:
         // leaving phases at sample resolution reaches 99.99% of that. Out of DIGITAL SILENCE: up to 0.25,
         // which is -12.0 dBFS, in the first three samples of the return, none of it on the plane that stayed.
         //
-        // THIS IS THE SMALLER HALF. The models' own per-channel state freezes the same way and is worse:
-        // NamStage runs instance 1 only when a second plane is present, so on a return it continues the OLD
-        // note for one RECEPTIVE FIELD — measured ceiling 0.5 (-6.0 dBFS), and for any field of three samples
-        // or more this clear removes nothing of it. That half needs a per-channel reset threaded through
-        // NamStage and neural::NeuralStage, and is not attempted here.
+        // 🔴 THAT ARITHMETIC IS THIS LINE'S OWN AND IT DOES NOT COVER THE MODELS' HALF — a whole paragraph
+        // here used to spend it on both, and it was wrong by a factor of 3.8. Both are stated now because
+        // the two ceilings are DIFFERENT SHAPES, not one number applied twice:
+        //
+        //     the delay line   only ONE slot carries the delay (delayOf() is maxLag − lag), and the tail is
+        //                      a literal replay, so the operator's gain is exactly 1: A · w = 0.5 · 0.5.
+        //     the models       BOTH slots freeze at once, so the weights SUM rather than pick — and the
+        //                      frozen rate-matcher is not a replay: a phase row of the polyphase table is
+        //                      normalised by its SUM, not by its modulus, so its peak gain exceeds one.
+        //
+        // In one formula, with `g_s` the frozen return operator of slot s (the capture's impulse response,
+        // convolved with the rate-matcher pair where one is installed):
+        //
+        //          ceiling  =  A · Σ_s w_s · ‖g_s‖₁
+        //
+        // and it is ATTAINABLE, because the whole path is linear in the pre-gap input for a Linear capture:
+        // the return is `y[n] = Σ_k h_n[k]·x[−k]`, so `A·max_n ‖h_n‖₁` is reached exactly by the input
+        // `x[−k] = A·sign(h_n[k])`. Measured that way, `A` = 0.5, both slots at 0.5, a unit capture:
+        //
+        //     host      44100     48000    88200    96000   176400   192000
+        //     ‖h‖₁    1.898766  1.000000 1.685674 1.612676 1.505512 1.492565   (48 kHz: no rate-matcher)
+        //     ceiling 0.949383  0.500000 0.842837 0.806338 0.752756 0.746283
+        //     reached  100.00%   100.00%  100.00%  100.00%  100.00%  100.00%   by the sign pattern
+        //     a sine     55.4%    99.91%    62.4%    65.0%    69.0%    70.0%   swept over EVERY leaving phase
+        //
+        // The last row is why the number above is not the ceiling of this half: the phase sweep that closed
+        // the delay line reaches 55 % here, and would have published 0.5257. It agreed there because THAT
+        // operator is a pure delay — a property of the operator, not of the method.
+        //
+        // 🟢 THE MODELS' HALF IS CLOSED, in nam::NamStage rather than here: a lane the host stops handing
+        // over is fed the digital silence it is actually receiving, for exactly as long as its state can
+        // still be heard (its receptive field, plus the rate-matcher's tap windows at each end). Out of
+        // digital silence the return is now EXACTLY zero at 8 · 22.05 · 44.1 · 48 · 88.2 · 96 · 176.4 ·
+        // 192 kHz, with a memoryless capture and with a real 6332-sample WaveNet, at gap widths 0 and 1
+        // and on both slots. The SLEEPING slot — this file's other way of not clocking a stage — is closed
+        // beside the models below. What is not: an LSTM's recurrent cell has no finite drain, so its
+        // number is a bound on NAM's own heuristic (0.419 against 0.023 for a lane clocked throughout).
         // The comment beside those lines says the history is "advanced every block including at zero" —
         // true for the planes that are playing, which is exactly the gap. Dropping it here matches what
         // this file already does in three other places where a slot's delay line stops being valid: a
@@ -953,10 +991,12 @@ public:
             // THE SECOND CAPTURE'S COPY is taken here, after the pre-model tone and the chain trim, so
             // both models are fed the identical signal — and only now do the two part company, each
             // through its own trim: a linked setting plays its neighbour's model with less going in.
-            // A COLD SLOT IS NOT RUN — not copied into, not trimmed, not modelled, not delayed, not even
-            // mixed: the law holds its weight at exactly zero for as long as it sleeps, so the other
-            // slot IS the sound, and its buffer — whatever it holds, however old — is left out rather
-            // than multiplied by zero (a NaN times zero is a NaN, for ever). Its trim ramp resumes from
+            // A COLD SLOT IS NOT RUN ON AUDIO — not copied into, not trimmed, not modelled, not delayed,
+            // not even mixed: the law holds its weight at exactly zero for as long as it sleeps, so the
+            // other slot IS the sound, and its buffer — whatever it holds, however old — is left out
+            // rather than multiplied by zero (a NaN times zero is a NaN, for ever). What it IS handed is
+            // a width-zero call (below), so the stage can drain the silence the slot is receiving; that
+            // is law 11(d)'s clock-only call and it stops of its own accord. Its trim ramp resumes from
             // where it stopped and settles within its block, like any other gain change; its delay line
             // was cleared on the way to sleep. (The rail is checked as well as the flag: the flag says
             // what the law decided, the weights say what this block sounds like.)
@@ -967,8 +1007,29 @@ public:
             if (run[1]) for (int c = 0; c < nch; ++c) std::copy(a[c], a[c] + count, b[c]);
             if (run[0]) rampInto(a, nch, count, trims ? slotGain_[0].load(std::memory_order_acquire) : 1.0f, curSlot_[0]);
             if (run[1]) rampInto(b, nch, count, trims ? slotGain_[1].load(std::memory_order_acquire) : 1.0f, curSlot_[1]);
-            if (run[0]) ok = nam_[0].process(a, nch, count, norm) && ok;
-            if (run[1]) ok = nam_[1].process(b, nch, count, norm) && ok;
+            // 🔴 A SLEEPING SLOT IS STILL HANDED THE CALL, at width ZERO. Skipping it entirely is the
+            // SECOND way this file stops clocking a NamStage — the first is a plane the host takes away
+            // — and it has the same consequence: the slot's models and rate-matchers freeze holding
+            // whatever was playing when the law put it to sleep, and a wake hands it back. Measured on a
+            // three-knot device whose 240 capture has a 2001-sample memory: the dial parked at 150 until
+            // slot 0 slept, eight blocks of DIGITAL SILENCE, then a turn to 240 — per-block peaks
+            // 0.114 · 0.22 · 0.366 · 0.486 · 0.5 · 0.5 · 0.5 · 0.5, i.e. **0.500000 out of digital
+            // silence** for exactly one receptive field, under the law's own 0.25-per-call ramp. A
+            // TWO-knot device cannot show it: both slots end up holding the same capture, so the turn
+            // SWAPS the backend rather than waking it, and a swap has nothing to leak. That is why the
+            // first fixture read a clean zero, and it is a fixture fault, not a property of the code.
+            // Width zero is law 11(d)'s clock-only call: the stage drains the lane and stops, so this
+            // costs one bounded drain per sleep and nothing thereafter — a sleeping slot is still free.
+            // Measured on a real 6332-sample capture: 12.9 ms of CPU at 48 kHz and 9.3 at 44.1 for the
+            // whole sleep, and 0.0000 ms per block once the debt is spent.
+            // ⚠️ ONE CONTRACT CONSEQUENCE, stated because nobody would look for it: a cold slot's verdict
+            // is now ANDed too, and `NamStage::process` refuses for an UNPREPARED backend. A slot whose
+            // live re-prepare was refused (a low-memory `configureRates`) used to be silent-and-accepted
+            // while it slept and now fails every block instead. That is law 11's answer — a call that
+            // cannot be honoured says so — and it is not constructible in a test without exhausting
+            // memory, so it is written here rather than gated.
+            ok = nam_[0].process(a, run[0] ? nch : 0, count, norm) && ok;
+            ok = nam_[1].process(b, run[1] ? nch : 0, count, norm) && ok;
             // Align BEFORE the weights: during a ramp the two gains must sum to one at the SAME instant.
             // Each slot carries its own history per channel, advanced every block including at zero.
             for (int c = 0; c < nch; ++c) {
@@ -1126,6 +1187,21 @@ private:
     // was a GUARANTEE, and a guarantee that quietly stopped holding is worse than a smaller number.
     long long warmFor(const felitronics::nam::NamStage& st) const {
         const int pre = st.prewarmSamples();
+        // 🔴 AND THIS EARLY RETURN DROPS THE LATENCY TERM TOO, which is a different claim from "no
+        // field, no warm-up" and is the one that costs something. A capture with no memory still runs
+        // through a rate-matcher off the model rate, and a slot that has just been WOKEN starts by
+        // emitting that matcher's `latencySamples()` leading zeros — 61 at 44.1 kHz, 96 at 96 kHz.
+        // Returning zero here makes the law audible-immediately for exactly those captures, so the
+        // woken slot contributes a hole where a slot that never slept contributes signal. Measured
+        // against a player that never sleeps, 0.1 input, on the block of the wake: **4.97e-03 at
+        // 44.1 kHz and 7.28e-03 at 96 kHz**, and 3.76e-07 for a capture that HAS memory, which does not
+        // take this branch. Removing the early return was measured too: 96 kHz goes to exactly
+        // 0.000000000 and 44.1 to 2.87e-06, i.e. down to the rate-matcher's own resumption floor.
+        // It is NOT removed here — it moves the warm-up of every memoryless capture in every consumer,
+        // which is a decision with its own blast radius rather than a line to change in passing. What
+        // is done instead is that the guarantee it breaks no longer stands unqualified: see
+        // RigPlayerTests, "a player that sleeps sounds bit-identically to one that never does — AT THE
+        // MODEL RATE", where both the rate it holds at and the size of the divergence off it are pinned.
         if (pre <= 0) return 0;
         // 🔴 ASK for the rate the model will be RUN at, do not read the rate it REPORTS. An untagged
         // capture reports -1 and NamStage runs it at kModelSampleRate anyway; the previous line here

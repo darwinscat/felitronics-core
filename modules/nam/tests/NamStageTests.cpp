@@ -136,6 +136,72 @@ std::vector<std::uint8_t> namzV1GainModel()
     return bytes;
 }
 
+// A DENSE Linear capture, deterministic: an LCG, one step per tap. Dense is the point — NAM runs a
+// Linear capture past 256 taps through a partitioned-FFT engine (`implementation` defaults to `auto`),
+// whose ring holds input SPECTRA past the field, and a SPARSE kernel cannot see what that leaves
+// behind: measured, this kernel drained by exactly its field left 1.909e-08 on 46 samples of the
+// return, and a single-tap kernel at the same length left nothing.
+std::string denseLinearModel (int taps, const char* implementation)
+{
+    std::string w = "[";
+    std::uint32_t state = 7u;
+    char buf[32];
+    for (int i = 0; i < taps; ++i)
+    {
+        state = state * 1664525u + 1013904223u;
+        const double v = ((double) (state >> 8) / 16777216.0 - 0.5) * 2.0 / std::sqrt ((double) taps);
+        std::snprintf (buf, sizeof buf, "%.7g", v);
+        w += buf;
+        if (i + 1 < taps) w += ',';
+    }
+    w += ']';
+    std::string json = R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":)"
+                     + std::to_string (taps) + R"(,"bias":false)";
+    if (implementation != nullptr) json += std::string (R"(,"implementation":")") + implementation + R"(")";
+    return json + R"(},"weights":)" + w + R"(,"sample_rate":48000})";
+}
+
+// A one-cell LSTM with a SLOW forget gate: sigmoid(10) = 0.99995, so the cell's time constant is about
+// 22 000 samples. Weight order is the one lstmModel in the RT-alloc suite already relies on — W is
+// 4x2 row-major over gates i,f,g,o and columns (x, h), then b[i,f,g,o], then h0, c0, then the head
+// weight and bias. `tagged` decides whether the model carries a `sample_rate`, which is the whole
+// point: NAM sizes an LSTM's prewarm as 0.5 x the TAG, and an untagged one therefore answers 1.
+std::string slowLstmModel (bool tagged)
+{
+    std::string json = R"({"version":"0.5.0","architecture":"LSTM","config":{"num_layers":1,)"
+                       R"("input_size":1,"hidden_size":1},"weights":[3,0, 0,0, 0.002,0, 0,0,)"
+                       R"(  0,10,0,0,  0,0, 1,0])";
+    if (tagged) json += R"(,"sample_rate":48000)";
+    return json + "}";
+}
+
+// A Linear capture that hands back what came in `d` samples ago: `d` zero taps and then a one. It is
+// the cheapest fixture with a LONG memory, and it is also the one NAM answers zero about — the field is
+// a plain number in the config and nothing but detail::declaredReceptiveField reads it.
+std::string delayModel (int d)
+{
+    std::string w = "[";
+    for (int i = 0; i < d; ++i) w += "0.0,";
+    w += "1.0]";
+    return R"({"version":"0.5.0","architecture":"Linear","config":{"receptive_field":)" + std::to_string (d + 1)
+         + R"(,"bias":false,"implementation":"direct"},"weights":)" + w + R"(,"sample_rate":48000})";
+}
+
+// A REAL WaveNet whose memory is as long as it says. One one-channel layer, kernel 2, one dilation —
+// the weight order is rechannel; dilated conv (OLDEST tap, then newest) + bias; condition mixin;
+// residual 1x1 + bias; head rechannel; head scale. Putting the 1 on the OLDEST tap is what makes the
+// network actually reach back `dilation` samples: the shipped [1,0,0,…] fixture has BOTH convolution
+// taps at zero, so it declares a field of thousands and forgets after one sample. Measured: with
+// [1,0,…] the impulse response's last non-zero sample is 0; with [1,1,0,…] it is `dilation`.
+std::string waveNetDelayModel (int dilation)
+{
+    return std::string (R"({"version":"0.5.0","architecture":"WaveNet","config":{"layers":[{"input_size":1,)")
+         + R"("condition_size":1,"head_size":1,"head_bias":false,"channels":1,"kernel_size":2,"dilations":[)"
+         + std::to_string (dilation)
+         + R"(],"activation":"Tanh","gated":false}],"head_scale":1.0},"weights":[1,1,0,0,1,0,0,1,1],)"
+         + R"("sample_rate":48000})";
+}
+
 bool load (felitronics::nam::NamStage& stage, const std::string& json, float trimDb = 0.0f)
 {
     return stage.loadModelFromMemory (json.data(), json.size(), trimDb);
@@ -1850,6 +1916,582 @@ int main()
         test::ok (same, "…the same model again");
     }
 
+    test::group ("law 11a: a lane that stops being fed brings nothing back with it");
+    {
+        // 🔴 EVERY per-lane thing this stage holds, and there are THREE of them: the network's own
+        // window, and the two core::StreamResamplers that stand either side of it when the host rate is
+        // not the model's. A lane the host stops handing over used to be skipped whole, so all three
+        // froze and were REPLAYED on the return. Measured before the fix, worst |out| out of DIGITAL
+        // SILENCE / tail in host samples, through rigplayer::RigPlayer:
+        //
+        //     memoryless capture   44.1k 0.518588/125 · 48k 0.000000/0 · 88.2k 0.332768/182
+        //                          96k 0.500179/193 · 176.4k 0.354183/300 · 192k 0.453147/319
+        //     2001-tap capture     44.1k 0.499446/1962 · 48k 0.499533/2003 · 96k 0.500179/4193
+        //
+        // 🔴 AND THAT IS WHY THIS SWEEPS BOTH AXES. The two halves are INDEPENDENT and each has a
+        // fixture that cannot see it: at 48 kHz no rate-matcher is installed at all, so a suite pinned
+        // there (RigPlayerTests was) measures only the model's memory; and a capture whose field is one
+        // sample measures only the resamplers. The 48 kHz row with a long capture is the cell that was
+        // missing, and it was NOT clean — 0.499533 with a 2003-sample tail.
+        //
+        // The ceiling is NOT this measurement. The whole return path is linear in the pre-gap input for
+        // a Linear capture, so `y[n] = sum_k h_n[k]·x[-k]` and the ceiling is `A·max_n ||h_n||_1`,
+        // attained by the sign pattern of the worst row. At 44.1 kHz through the player that is
+        // 0.949383 (-0.45 dBFS), attained to 100.00 %, where a 220 Hz sine swept over ALL 201 leaving
+        // phases reaches 55 % of it. See rigplayer's own group for the derivation.
+        // `field` is the MEMORY the stage should report (taps − 1 for a Linear capture, and taps for a
+        // dilated stack, which keeps NAM's own +1 of margin); `reach` is how far the impulse response
+        // is measured to go, which is what proves the fixture is not blind.
+        struct Shape { const char* name; std::string json; int field; int reach; };
+        const Shape shapes[] {
+            // A Linear capture DECLARES its field and NAM answers zero for it — the path that reported
+            // prewarmSamples() == 0 for a 2001-tap impulse response until detail::declaredReceptiveField.
+            { "Linear delay(512)", delayModel (512), 512, 512 },
+            // …and a real WaveNet with the real captures' field. A dilated tap costs the same nine
+            // scalars at any distance, so 6332 samples of memory is a nine-number fixture. The weight
+            // sits on the OLDEST tap deliberately: with the shipped [1,0,0,…] shape both convolution
+            // taps are zero and the network's effective memory is ONE sample, whatever it declares.
+            { "WaveNet field 6332", waveNetDelayModel (6331), 6332, 6331 },
+        };
+
+        for (const auto& shape : shapes)
+        {
+            // PRECONDITION — the fixture's memory is MEASURED, not declared. This is the check the
+            // shipped WaveNet fixture would fail: it declares 6332 and forgets after one sample.
+            {
+                nam::NamStage stage;
+                stage.prepare (48000.0, 8192);
+                test::ok (load (stage, shape.json), std::string (shape.name) + " loads");
+                test::ok (stage.prewarmSamples() == shape.field,
+                          std::string (shape.name) + " reports its field: " + std::to_string (shape.field));
+                std::vector<float> x (8192, 0.0f);
+                float* io[1] { x.data() };
+                x[0] = 0.5f;
+                felitronics::test::run (stage.process (io, 1, 8192, false));
+                int last = -1;
+                for (int i = 0; i < 8192; ++i) if (x[(std::size_t) i] != 0.0f) last = i;
+                test::ok (last >= shape.reach,
+                          std::string ("precondition: ") + shape.name + " really remembers that far — its"
+                          " impulse response reaches sample " + std::to_string (last)
+                          + ", at least " + std::to_string (shape.reach));
+                std::fill (x.begin(), x.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, 8192, false));
+                double zero = 0.0;
+                for (float v : x) zero = std::fmax (zero, (double) std::fabs (v));
+                test::ok (zero == 0.0,
+                          std::string ("precondition: ") + shape.name + " answers digital silence with"
+                          " digital silence, so a non-zero return can only be the frozen state");
+            }
+
+            // 8000 and 22050 are not decoration: at a host rate well BELOW the model's, the ratio makes
+            // the converted term small, and what keeps the DOWN leg honest is its own tap window in host
+            // samples. Drop that term and these two rows are the ones that notice.
+            for (const double fs : { 8000.0, 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
+            {
+                // PRECONDITION — the grid straddles the rate-match gate rather than assuming it does.
+                // ASK the owner; a literal here would be the restatement rule 9u exists against.
+                const bool resampled = nam::NamStage::rateMatch (fs, nam::NamStage::kModelSampleRate).resampling;
+                test::ok (resampled == (fs != nam::NamStage::kModelSampleRate),
+                          "precondition: at " + std::to_string ((int) fs) + " Hz a rate-matcher is "
+                          + (resampled ? "INSTALLED" : "not installed"));
+
+                for (const int gapWidth : { 0, 1 })
+                {
+                    constexpr int kBlk = 256;
+                    nam::NamStage stage;
+                    stage.prepare (fs, kBlk);
+                    if (! load (stage, shape.json)) { test::ok (false, "gap fixture loads"); continue; }
+
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    float* io[2] { l.data(), r.data() };
+                    const int fill = (int) std::ceil ((double) shape.reach * fs / 48000.0) + 4 * kBlk;
+                    double phase = 0.0, charged = 0.0;
+                    for (int n = 0; n < fill; n += kBlk)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (float) (0.5 * std::sin (phase));
+                            phase += 2.0 * kPi * 220.0 / fs;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (stage.process (io, 2, kBlk, false));
+                        for (float v : r) charged = std::fmax (charged, (double) std::fabs (v));
+                    }
+                    test::ok (charged > 0.1, "precondition: the lane under test really was playing at "
+                                             + std::to_string ((int) fs) + " Hz");
+
+                    // THE GAP. Width 1 leaves lane 0 playing (zeros) and takes lane 1 away; width 0
+                    // takes both. Long enough that a lane still holding anything has time to say so.
+                    const int gap = fill + 8 * kBlk;
+                    for (int n = 0; n < gap; n += kBlk)
+                    {
+                        std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                        felitronics::test::run (stage.process (io, gapWidth, kBlk, false));
+                    }
+
+                    // FINITENESS BESIDE THE PEAK, because std::fmax IGNORES a NaN: a drain writing NaNs
+                    // into the whole first returning chunk passed 960 checks, since the peak stayed 0.
+                    double worst = 0.0; bool finite = true;
+                    for (int n = 0; n < fill + 4 * kBlk; n += kBlk)
+                    {
+                        std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                        felitronics::test::run (stage.process (io, 2, kBlk, false));
+                        for (float v : l) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                        for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                    }
+                    test::ok (finite && worst == 0.0,
+                              std::string ("silence in, FINITE exact zero out after a ")
+                              + (gapWidth == 1 ? "narrow" : "zero-width") + " gap — " + shape.name
+                              + " at " + std::to_string ((int) fs) + " Hz");
+                }
+            }
+        }
+    }
+
+    test::group ("law 11a: what a drain of exactly the receptive field does NOT flush");
+    {
+        // TWO things reach past the field, and each has a fixture that hides it.
+        //
+        // 1. THE PARTITIONED-FFT ENGINE. `implementation` defaults to `auto`, which is FFT past 256
+        //    taps — so this is the configuration a real IR-as-NAM capture ships, not an exotic one. Its
+        //    ring holds input spectra for a couple of its own blocks (256 / 512 / 1024 taps for a field
+        //    of <= 2048 / <= 8192 / more, NAM v0.5.4 linear.cpp:14-17), so a lane goes on emitting after
+        //    its field is clean. Only a DENSE kernel shows it: with a single tap all three
+        //    implementations read zero.
+        for (const double fs : { 48000.0, 44100.0 })       // …and at a rate where a rate-matcher IS installed
+        for (const char* impl : { "fft", (const char*) nullptr })
+        {
+            nam::NamStage stage;
+            stage.prepare (fs, 256);
+            const auto json = denseLinearModel (2001, impl);
+            const std::string what = std::string (impl != nullptr ? "\"fft\"" : "no `implementation` key")
+                                   + " at " + std::to_string ((int) fs) + " Hz";
+            if (! load (stage, json)) { test::ok (false, "dense Linear loads with " + what); continue; }
+            std::vector<float> l (256), r (256);
+            float* io[2] { l.data(), r.data() };
+            double phase = 0.0, charged = 0.0;
+            for (int k = 0; k < 40; ++k)
+            {
+                for (int i = 0; i < 256; ++i)
+                {
+                    const float v = (float) (0.5 * std::sin (phase));
+                    phase += 2.0 * kPi * 220.0 / fs;
+                    l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                }
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) charged = std::fmax (charged, (double) std::fabs (v));
+            }
+            test::ok (charged > 0.1, "precondition: the dense kernel really sounds with " + what);
+            for (int k = 0; k < 100; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, 256, false));
+            }
+            double worst = 0.0; bool finite = true;
+            for (int k = 0; k < 40; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+            }
+            test::ok (finite && worst == 0.0, "a dense 2001-tap capture with " + what + " returns FINITE"
+                                              " EXACT zero — the field alone leaves 1.909e-08 on 46 samples");
+        }
+
+        // 2. A RECURRENT CELL, where there is no flush length at all — the drain is NAM's own
+        //    half-second heuristic and nothing more. What IS closed here is the heuristic's own hole: it
+        //    is `0.5 x the model's TAG`, so an untagged LSTM answers ONE sample and would drain for one.
+        //    The gate is therefore "the untagged model behaves as the tagged one", not "exact zero":
+        //    exact zero is unreachable for a cell whose time constant is 22 000 samples, and saying
+        //    otherwise would be a promise the arithmetic cannot keep. Measured before the floor:
+        //    untagged 0.499222, tagged 0.419413, a lane clocked throughout 0.022842.
+        double leak[2] { 0.0, 0.0 };
+        int    reported[2] { 0, 0 };
+        for (int tagged = 0; tagged < 2; ++tagged)
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, 256);
+            const auto json = slowLstmModel (tagged != 0);
+            if (! load (stage, json)) { test::ok (false, "slow LSTM loads"); continue; }
+            reported[tagged] = stage.prewarmSamples();
+            std::vector<float> l (256), r (256);
+            float* io[2] { l.data(), r.data() };
+            double phase = 0.0;
+            for (int k = 0; k < 400; ++k)                    // ~2.1 s: the cell settles (tau ~ 22 000)
+            {
+                for (int i = 0; i < 256; ++i)
+                {
+                    const float v = (float) (0.5 * std::sin (phase));
+                    phase += 2.0 * kPi * 220.0 / 48000.0;
+                    l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                }
+                felitronics::test::run (stage.process (io, 2, 256, false));
+            }
+            for (int k = 0; k < 375; ++k)                    // 2 s of gap, lane 1 away
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, 256, false));
+            }
+            std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+            felitronics::test::run (stage.process (io, 2, 256, false));
+            for (float v : r) leak[tagged] = std::fmax (leak[tagged], (double) std::fabs (v));
+        }
+        test::ok (reported[0] == 1 && reported[1] == 24000,
+                  "precondition: NAM answers 1 for the untagged LSTM and 24000 for the tagged one, so the"
+                  " two would drain by a factor of 24000 if the drain trusted that number");
+        test::ok (leak[0] == leak[1],
+                  "…and they leak the SAME, because the drain floors at half a second of the RUN rate: "
+                  + std::to_string (leak[0]) + " against " + std::to_string (leak[1]));
+        test::ok (leak[1] < 0.45,
+                  "…and that is a bound on the heuristic, not on the cell: " + std::to_string (leak[1])
+                  + " where a lane clocked through the whole gap reads 0.022842 — no finite drain closes"
+                    " a recurrent state, and this test says so rather than promising zero");
+    }
+
+    test::group ("law 11a: a loaded CONTAINER, and the partition the small fixture cannot reach");
+    {
+        // 🔴 A CONTAINER IS ASKED THROUGH — and the synthetic JSON tests in ReceptiveFieldTests cannot
+        // establish that, because they never LOAD anything. A crew round measured both holes on a real
+        // model: a SlimmableContainer wrapping the dense 2001-tap capture returned 1.48e-08 after a gap
+        // (its Linear submodel's FFT ring, uncharged because the top-level architecture is not Linear),
+        // and one wrapping the untagged LSTM went from 0.419115 to 0.499275 (the recurrent floor, same
+        // reason). Both are runtime classification, so both are pinned here rather than there.
+        // A submodel is a WHOLE model spec (NAM v0.5.4 `container.cpp:157-166`: "has architecture,
+        // config, weights, etc."), and the container's own `weights` array is empty.
+        const auto container = [] (const std::string& inner) {
+            return R"({"version":"0.5.0","architecture":"SlimmableContainer","config":{"submodels":[)"
+                   R"({"max_value":1.0,"model":)" + inner + R"(}]},"weights":[],"sample_rate":48000})";
+        };
+        const auto json = container (denseLinearModel (2001, nullptr));
+        nam::NamStage stage;
+        stage.prepare (48000.0, 256);
+        if (! load (stage, json))
+            test::ok (false, "a SlimmableContainer of a dense Linear capture loads");
+        else
+        {
+            test::ok (stage.prewarmSamples() == 2000, "…and the container reports its submodel's field: "
+                                                      + std::to_string (stage.prewarmSamples()));
+            std::vector<float> l (256), r (256);
+            float* io[2] { l.data(), r.data() };
+            double phase = 0.0, charged = 0.0;
+            for (int k = 0; k < 40; ++k)
+            {
+                for (int i = 0; i < 256; ++i)
+                {
+                    const float v = (float) (0.5 * std::sin (phase));
+                    phase += 2.0 * kPi * 220.0 / 48000.0;
+                    l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                }
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) charged = std::fmax (charged, (double) std::fabs (v));
+            }
+            test::ok (charged > 0.1, "precondition: the container really sounds");
+            for (int k = 0; k < 100; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, 256, false));
+            }
+            double worst = 0.0; bool finite = true;
+            for (int k = 0; k < 40; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+            }
+            test::ok (finite && worst == 0.0, "a CONTAINER's submodel is charged its ring too — the field"
+                                              " alone left 1.48e-08");
+        }
+
+        // THE LARGE PARTITION. NAM's Linear FFT block is 256 / 512 / 1024 taps for a field of <= 2048 /
+        // <= 8192 / more (v0.5.4 linear.cpp:14-31), so the 2001-tap fixture above only ever exercises
+        // the SMALLEST one: a crew round shrank the charge from 2·1024 to 512 and it survived. A capture
+        // past 8192 taps runs the largest block, where the tail beyond the field reaches 2·1024 − 2.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, 256);
+            const auto big = denseLinearModel (8193, nullptr);
+            if (! load (stage, big)) { test::ok (false, "an 8193-tap dense capture loads"); }
+            else
+            {
+                std::vector<float> l (256), r (256);
+                float* io[2] { l.data(), r.data() };
+                double phase = 0.0, charged = 0.0;
+                for (int k = 0; k < 80; ++k)
+                {
+                    for (int i = 0; i < 256; ++i)
+                    {
+                        const float v = (float) (0.5 * std::sin (phase));
+                        phase += 2.0 * kPi * 220.0 / 48000.0;
+                        l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (stage.process (io, 2, 256, false));
+                    for (float v : r) charged = std::fmax (charged, (double) std::fabs (v));
+                }
+                test::ok (charged > 0.1, "precondition: the 8193-tap capture sounds");
+                for (int k = 0; k < 200; ++k)
+                {
+                    std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                    felitronics::test::run (stage.process (io, 1, 256, false));
+                }
+                double worst = 0.0; bool finite = true;
+                for (int k = 0; k < 60; ++k)
+                {
+                    std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                    felitronics::test::run (stage.process (io, 2, 256, false));
+                    for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                }
+                test::ok (finite && worst == 0.0, "…and the LARGEST FFT partition is covered by the same"
+                                                  " 2 x 1024, which is what makes 2048 the number and not 512");
+            }
+        }
+    }
+
+    test::group ("law 11a: a prepare is a departure of EVERY lane, so both owe a drain afterwards");
+    {
+        // 🔴 THE DEBT MUST NOT BE STRANDED. `configureRates` rebuilds both rate-matchers clean and Resets
+        // both networks — and a Reset does NOT clear a Linear capture's window (`Buffer::_input_buffers`
+        // survive `SetMaxBufferSize`, and Linear's prewarm is the base class's zero): measured on a dense
+        // 2001-tap capture, a tone then `prepare()` then digital silence at FULL width returns
+        // 0.224604502320. So a host that changes its buffer size while a lane is AWAY would, if the
+        // counters were cleared to zero there, hand that lane's tone back on the widen — measured
+        // 0.224604502320 with `direct` and 0.072609648108 with the FFT engine before the counters were
+        // charged instead. Both lanes owe a FULL drain after a prepare; that is what this pins.
+        for (const double fs : { 48000.0, 44100.0 })
+        {
+            nam::NamStage stage;
+            stage.prepare (fs, 256);
+            const auto json = denseLinearModel (2001, "direct");
+            if (! load (stage, json)) { test::ok (false, "dense Linear loads"); continue; }
+            std::vector<float> l (256), r (256);
+            float* io[2] { l.data(), r.data() };
+            double phase = 0.0, charged = 0.0;
+            for (int k = 0; k < 40; ++k)
+            {
+                for (int i = 0; i < 256; ++i)
+                {
+                    const float v = (float) (0.5 * std::sin (phase));
+                    phase += 2.0 * kPi * 220.0 / fs;
+                    l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                }
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) charged = std::fmax (charged, (double) std::fabs (v));
+            }
+            test::ok (charged > 0.1, "precondition: the capture sounds at " + std::to_string ((int) fs) + " Hz");
+            std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+            felitronics::test::run (stage.process (io, 1, 100, false));      // …100 samples of the drain spent
+            stage.prepare (fs, 256);                                         // …and NOW the host re-prepares
+            for (int k = 0; k < 100; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, 256, false));
+            }
+            double worst = 0.0; bool finite = true;
+            for (int k = 0; k < 40; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+            }
+            test::ok (finite && worst == 0.0, "a prepare() in the middle of a drain does not strand it — "
+                                              + std::to_string ((int) fs) + " Hz");
+        }
+    }
+
+    test::group ("law 11a: the drain's LENGTH, its lifecycle, and the shapes that hide it");
+    {
+        // 🔴 THE ODOMETER, because the audio cannot say this. Past the debt an absent lane's output is
+        // zero whether it is still being clocked or not, so "it drains, and then it STOPS" has no
+        // witness in the sound: a mutation that never decrements the debt, or rounds it up to the whole
+        // chunk, or doubles it, is INAUDIBLE. A crew round ran exactly those three and all three
+        // survived a suite of 960 checks. drainedSamples() is what closes them.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, 256);
+            // 🔴 THE DEBT IS DELIBERATELY NOT A MULTIPLE OF THE BLOCK. delayModel(514) is 515 taps, so
+            // 514 samples of memory, and the drain is 514 + 2048 = 2562 against a 256-sample block: a
+            // mutation that rounds each drained chunk up to the whole call then spends 2816, and the
+            // odometer says so. With delayModel(512) the debt was 2560 = ten blocks exactly and that
+            // mutation was invisible — measured, it survived the suite.
+            const auto json = delayModel (514);
+            test::ok (load (stage, json), "the odometer fixture loads");
+            test::ok (stage.drainedSamples() == 0, "nothing is owed before a lane has ever played");
+            std::vector<float> l (256, 0.1f), r (256, 0.1f);
+            float* io[2] { l.data(), r.data() };
+            for (int k = 0; k < 40; ++k) felitronics::test::run (stage.process (io, 1, 256, false));
+            test::ok (stage.drainedSamples() == 0,
+                      "…nor on a MONO host, where lane 1 has never carried audio and owes nothing: a debt"
+                      " armed for a lane that never played costs a real WaveNet 132 ms per load for a"
+                      " window NAM already zero-filled");
+            felitronics::test::run (stage.process (io, 2, 256, false));
+            test::ok (stage.drainedSamples() == 0, "…nor while both lanes are playing");
+            // THE NUMBER, with its derivation rather than a call to the code that computes it: the host
+            // rate IS the model rate here, so no rate-matcher is installed and the drain is the field
+            // plus the partitioned-FFT ring a Linear capture is charged — 514 + 2·1024 = 2562 per lane,
+            // and the gap below takes BOTH lanes away, so 5124. (Legal changes to either term must
+            // update this literal ON PURPOSE; that is what a literal is for in an oracle.)
+            //
+            // …and a ZERO-LENGTH call in the middle of it spends nothing and CLEARS nothing: law 11(d)
+            // is "no samples, no time, no edge", and a mutation that drops the debt there replays
+            // 0.470000 on the return. It is cut in HERE, with the drain unfinished, because after the
+            // debt is spent there is nothing left for it to clear.
+            for (int k = 0; k < 2; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 0, 256, false));
+            }
+            felitronics::test::run (stage.process (io, 0, 0, false));
+            felitronics::test::run (stage.process (io, 1, 0, false));
+            for (int k = 0; k < 58; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 0, 256, false));
+            }
+            test::ok (stage.drainedSamples() == 5124,
+                      "the drain is EXACTLY the field plus the FFT ring, per lane: 2 x (514 + 2048) = 5124,"
+                      " read " + std::to_string (stage.drainedSamples()));
+            const long long settled = stage.drainedSamples();
+            for (int k = 0; k < 60; ++k) felitronics::test::run (stage.process (io, 0, 256, false));
+            test::ok (stage.drainedSamples() == settled, "…and it STOPS: a hundred more blocks of gap owe nothing");
+
+            // A REFUSED CALL MOVES NOTHING AT ALL, the debt included — law 11's "the refused call is
+            // indistinguishable from one never made". A width above 2 and a negative length are the two
+            // ways in, and neither may spend a sample of the drain.
+            test::ok (! stage.process (io, 3, 256, false) && ! stage.process (io, 2, -1, false)
+                          && ! stage.process (io, -1, 256, false),
+                      "a malformed call is refused");
+            test::ok (stage.drainedSamples() == settled, "…and a refused call spends none of the debt");
+
+            // A ZERO-LENGTH CALL DOES NOT SPEND OR CLEAR THE DEBT — law 11(d) is "no samples, no time,
+            // no edge", and a mutation clearing the debt there replays 0.470000 on the return.
+            felitronics::test::run (stage.process (io, 0, 0, false));
+            felitronics::test::run (stage.process (io, 1, 0, false));
+            test::ok (stage.drainedSamples() == settled, "a zero-length call after it is no time either");
+
+            // WIDTHS OUT OF ORDER: 2 -> 1 -> 0 -> 1 -> 2, which is what a host does when it reconfigures
+            // a bus twice in a row. Lane 1 leaves at the 1, lane 0 at the 0, and each owes from ITS OWN
+            // departure — the debts are per lane and do not share a clock.
+            for (int k = 0; k < 4; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.3f); std::fill (r.begin(), r.end(), 0.3f);
+                felitronics::test::run (stage.process (io, 2, 256, false));
+            }
+            const long long beforeMixed = stage.drainedSamples();
+            felitronics::test::run (stage.process (io, 1, 256, false));    // lane 1 leaves: 256 of its debt
+            felitronics::test::run (stage.process (io, 0, 256, false));    // …lane 0 too, and lane 1 goes on
+            test::ok (stage.drainedSamples() == beforeMixed + 256 + 2 * 256,
+                      "widths out of order: each lane owes from its OWN departure — "
+                      + std::to_string (stage.drainedSamples() - beforeMixed) + " samples over three lane-blocks");
+
+            // A SECOND DEPARTURE RE-ARMS. Feeding a lane again is what owes the next drain; a mutation
+            // that arms the debt only once replays 0.5 on the second return.
+            for (int k = 0; k < 20; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.2f); std::fill (r.begin(), r.end(), 0.2f);
+                felitronics::test::run (stage.process (io, 2, 256, false));
+            }
+            const long long beforeSecond = stage.drainedSamples();
+            for (int k = 0; k < 60; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 0, 256, false));
+            }
+            test::ok (stage.drainedSamples() - beforeSecond == settled,
+                      "…and a SECOND departure owes the same again, exactly: "
+                      + std::to_string (stage.drainedSamples() - beforeSecond));
+        }
+
+        // A LOAD LANDING WHILE A LANE IS AWAY. The debt belongs to the backend, and a load REPLACES it,
+        // so the arriving instance owes nothing — its window is the zeros NAM filled it with. What must
+        // not happen is the arriving model speaking the DEPARTED one's audio on the widen, and what must
+        // also not happen is the new backend inheriting a debt it cannot owe.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, 256);
+            test::ok (load (stage, delayModel (514)), "the first capture loads");
+            std::vector<float> l (256, 0.4f), r (256, 0.4f);
+            float* io[2] { l.data(), r.data() };
+            for (int k = 0; k < 20; ++k) felitronics::test::run (stage.process (io, 2, 256, false));
+            std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+            felitronics::test::run (stage.process (io, 1, 256, false));      // lane 1 leaves, mid-debt
+            const long long owed = stage.drainedSamples();
+            test::ok (owed > 0, "precondition: lane 1 really was draining when the load landed");
+            test::ok (load (stage, delayModel (300)), "…and a DIFFERENT capture lands while it is away");
+            for (int k = 0; k < 40; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, 256, false));
+            }
+            test::ok (stage.drainedSamples() == owed,
+                      "the arriving backend owes NOTHING — its window is the zeros it was built with, and"
+                      " the departed one's debt went with it");
+            double worst = 0.0; bool finite = true;
+            for (int k = 0; k < 40; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 2, 256, false));
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+            }
+            test::ok (finite && worst == 0.0, "…and the widen brings back FINITE silence, not the capture"
+                                              " that left");
+        }
+
+        // SHAPES THE MAIN GROUP CANNOT SEE, each one a mutation that survived it:
+        //   · call lengths that are not the prepared block, including 1 and a remainder — a drain that
+        //     skips chunks shorter than the block replays 0.5 at blocks 1/17/63/255;
+        //   · a NON-UNITY makeup, because a drain skipped whenever the gain differs replays 1.0 with
+        //     `normalize` on and a loudness tag two doublings away from the reference;
+        //   · FINITENESS, because std::fmax IGNORES a NaN — writing NaNs into the whole first returning
+        //     chunk passed 960 checks, since a peak taken with fmax stays 0.
+        for (const int call : { 1, 17, 63, 255, 256, 257, 1000 })
+            for (const bool normalise : { false, true })
+            {
+                nam::NamStage stage;
+                stage.prepare (44100.0, 256);
+                // -24 dB of tagged loudness against the -18 dB reference is a makeup of +6 dB, so the
+                // drained lane and the live one are NOT running the same gain — the mutation this is for
+                // skips the drain exactly when they differ.
+                std::string taps = "[1.0";
+                for (int i = 0; i < 64; ++i) taps += ",0.0";          // 65 taps: 64 samples of memory
+                const auto json = R"({"version":"0.5.0","architecture":"Linear","config":)"
+                                  R"({"receptive_field":65,"bias":false,"implementation":"direct"},)"
+                                  R"("weights":)" + taps + R"(],"sample_rate":48000,)"
+                                  R"("metadata":{"loudness":-24.0}})";
+                if (! load (stage, json)) { test::ok (false, "the makeup fixture loads"); continue; }
+                std::vector<float> l ((std::size_t) call), r ((std::size_t) call);
+                float* io[2] { l.data(), r.data() };
+                double phase = 0.0, charged = 0.0;
+                for (int n = 0; n < 4096; n += call)
+                {
+                    for (int i = 0; i < call; ++i)
+                    {
+                        const float v = (float) (0.4 * std::sin (phase));
+                        phase += 2.0 * kPi * 220.0 / 44100.0;
+                        l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (stage.process (io, 2, call, normalise));
+                    for (float v : r) charged = std::fmax (charged, (double) std::fabs (v));
+                }
+                test::ok (charged > 0.1, "precondition: the makeup fixture sounds at call length "
+                                         + std::to_string (call));
+                for (int n = 0; n < 16384; n += call)
+                {
+                    std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                    felitronics::test::run (stage.process (io, 1, call, normalise));
+                }
+                double worst = 0.0; bool finite = true;
+                for (int n = 0; n < 8192; n += call)
+                {
+                    std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                    felitronics::test::run (stage.process (io, 2, call, normalise));
+                    for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                    for (float v : l) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                }
+                test::ok (finite && worst == 0.0,
+                          std::string ("silence in, FINITE exact zero out at call length ")
+                          + std::to_string (call) + (normalise ? " with the makeup ON" : " with it off"));
+            }
+    }
+
     test::group ("process is RT no-alloc");
     {
         // 🔴 TWO RATES, AND THE SECOND ONE IS THE WHOLE POINT. This test prepared only at 48 kHz, where
@@ -1875,6 +2517,59 @@ int main()
             felitronics::test::run (stage.process (io, 2, 512, true));
             test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
                              "NamStage::process performs no heap allocation at "
+                             + std::to_string ((int) rate) + " Hz"
+                             + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
+        }
+
+        // 🔴 AND THE FIRST CALL, WHICH THIS GROUP USED TO WARM AWAY. Every row here processed a block
+        // before starting the counter — "warm every process-reachable container" — so the one place NAM
+        // grows a buffer was structurally invisible: `Buffer::_update_buffers_` resizes its per-channel
+        // window on DEMAND inside process(), and `Reset` pre-grows it only through prewarm(), which runs
+        // `GetPrewarmSamples()` samples — zero for a Linear capture. Measured before the fix: 4
+        // allocations in the first width-1 call, two per instance, and instance 1's were NEW, because
+        // the drain is the first thing that ever touched it on a mono host. Counted from the very first
+        // call now, at both widths and both rates, and for both engines a Linear capture can pick.
+        for (const double rate : { 48000.0, 44100.0 })
+            for (const char* impl : { "direct", (const char*) nullptr })
+                for (const int width : { 2, 1, 0 })
+                {
+                    nam::NamStage stage;
+                    stage.prepare (rate, 512);
+                    const auto json = impl != nullptr ? delayModel (512) : denseLinearModel (2001, nullptr);
+                    test::ok (load (stage, json), "first-call fixture loads");
+                    std::vector<float> left (512, 0.2f), right (512, -0.15f);
+                    float* io[2] { left.data(), right.data() };
+                    const long before = g_allocs.load (std::memory_order_relaxed);
+                    felitronics::test::run (stage.process (io, width, 512, false));
+                    felitronics::test::run (stage.process (io, width, 512, false));
+                    test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                                     std::string ("the FIRST call after a prepare allocates nothing — width ")
+                                     + std::to_string (width) + ", "
+                                     + (impl != nullptr ? "direct" : "the FFT engine") + ", "
+                                     + std::to_string ((int) rate) + " Hz");
+                }
+
+        // 🔴 AND THE THIRD BRANCH: THE DRAIN. A lane the host stops handing over is now fed digital
+        // silence through the same processChannel, which is a code path the two rows above never enter —
+        // exactly the blindness the 44.1 kHz row was added for, one branch further in. The capture has a
+        // 512-sample memory on purpose, so the drain is long enough to be running throughout the
+        // measured window rather than finishing inside the first block. Counted, not read.
+        for (const double rate : { 48000.0, 44100.0 })
+        {
+            nam::NamStage stage;
+            stage.prepare (rate, 512);
+            const auto json = delayModel (512);
+            test::ok (load (stage, json), "drain fixture model loads at " + std::to_string ((int) rate));
+            std::vector<float> left (512, 0.2f), right (512, -0.15f);
+            float* io[2] { left.data(), right.data() };
+            const long before = g_allocs.load (std::memory_order_relaxed);   // …counted from the FIRST drain
+            felitronics::test::run (stage.process (io, 2, 512, false));
+            felitronics::test::run (stage.process (io, 0, 512, false));
+            felitronics::test::run (stage.process (io, 1, 512, false));    // lane 1 drains beside a live lane 0
+            felitronics::test::run (stage.process (nullptr, 0, 512, false));   // …and with no buffers at all
+            felitronics::test::run (stage.process (io, 2, 512, false));
+            test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                             "…nor when an absent lane is being DRAINED at "
                              + std::to_string ((int) rate) + " Hz"
                              + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
         }
