@@ -35,7 +35,43 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_abi_tests PRIVATE cxx_std_20)
     target_compile_options(felitronics_abi_tests PRIVATE ${FCORE_NO_FP_CONTRACT})
     add_test(NAME felitronics_abi_tests COMMAND felitronics_abi_tests)
+
+    # The mastering C ABI. Same arrangement as felitronics_abi_tests one block up — the shim compiles
+    # natively, so its validation, ownership and mapping layer runs under ctest, ASan and UBSan. NOT
+    # given FCORE_NO_FP_CONTRACT, for the reason spelled out at fcore_master above: this suite and the
+    # `mastering` module suite must be the same arithmetic or a comparison between them means nothing.
+    add_executable(felitronics_master_abi_tests tests/MasterAbiTests.cpp wasm/fc_master.cpp)
+    target_link_libraries(felitronics_master_abi_tests PRIVATE felitronics::mastering felitronics::analysis)
+    target_include_directories(felitronics_master_abi_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_master_abi_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_master_abi_tests COMMAND felitronics_master_abi_tests)
+
+    # The bit-exactness acceptance itself, run as a test rather than by hand: the same programme through
+    # the C ABI and through a direct C++ call, one binary, one machine, compared bit for bit — plus
+    # block-independence through the ABI and the reset discipline.
+    add_test(NAME felitronics_master_abi_selftest COMMAND fcore_master selftest)
 endif()
+
+# fcore_master — the C-ABI facade over `felitronics::mastering` (tools/fc_master_abi.h +
+# tools/wasm/fc_master.cpp) and the native CLI that drives it. Two things to notice, both load-bearing:
+#
+#  1. IT DELIBERATELY DOES **NOT** TAKE `FCORE_NO_FP_CONTRACT`. Every other target in this file carries
+#     `-ffp-contract=off` because it is part of the P0 probe's cross-toolchain contract; this one is the
+#     reference for the C++ API the DESKTOP app links, so it takes the repository's declared
+#     `-ffp-contract=on` (law 10 — the flag is STATED, never inherited by accident). Measured on one
+#     source, the two flavours differ in 203269 of 288000 samples (worst 2.03e-6). Mixing them WITHIN a
+#     binary is worse than either: two TUs built with different flags measured as AGREEING, because the
+#     linker merged the header-only instantiations and whichever TU came first won — agreement by link
+#     order, which is exactly the false-green `selftest` exists to prevent. So the whole target, both
+#     halves of the comparison included, is built one way and that way is stated here.
+#  2. THE CLI AND ITS ABI ARE SEPARATE TUs ON PURPOSE. `selftest` compares a render through the C entry
+#     points against a direct C++ call; inlining the facade into the caller would make the "ABI" half
+#     stop being an ABI at all.
+add_executable(fcore_master fcore_master.cpp wasm/fc_master.cpp)
+target_link_libraries(fcore_master PRIVATE felitronics::mastering felitronics::analysis)
+target_include_directories(fcore_master PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(fcore_master PRIVATE cxx_std_20)
 
 add_executable(fcore_convolve fcore_convolve.cpp)
 target_link_libraries(fcore_convolve PRIVATE felitronics::convolution)

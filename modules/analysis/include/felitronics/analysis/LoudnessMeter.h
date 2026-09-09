@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/Config.h>
+#include <felitronics/core/Math.h>
 #include <felitronics/analysis/KWeightingFilter.h>
 
 #include <algorithm>
@@ -199,7 +200,30 @@ private:
         for (int c = 0; c < nc; ++c)
         {
             const double e = subSumSq[c];              // NaN*NaN or inf*inf — any bad sample lands here
-            if (! std::isfinite (e)) { poisoned = true; continue; }
+            // AN EXCLUDED CHANNEL CANNOT POISON A MEASUREMENT IT IS NOT IN. `nonFiniteSubHops()` is
+            // documented as counting sub-hops whose CHANNEL-WEIGHTED mean square came out non-finite,
+            // and the code counted them unweighted: a NaN in a `w = 0` channel — which is exactly what
+            // BS.1770 gives LFE — flagged a sub-hop whose weighted energy was perfectly fine. The
+            // energy path next door already reasons this way, and reasoned it first; the counter had
+            // simply not been made to agree with it. That mattered the moment the counter became
+            // load-bearing: `TargetLoudnessSolver::measureInputLoudnessRange()` now REFUSES on it, so
+            // an unweighted count would refuse a 5.1 programme over a channel the standard excludes.
+            //
+            // EXCLUDED MEANS EXACTLY ZERO, and the comparison is exact ON PURPOSE — `core::exactlyEqual`
+            // is this repository's own name for that, written so core headers stay warning-clean under
+            // strict downstream flags (`-Wfloat-equal` is one, and it is an ERROR on the GCC rows). An
+            // epsilon would be WRONG here, not merely loose: it would silently drop a channel somebody
+            // weighted at 1e-12, and the weight is a caller's statement about the layout, not a
+            // measurement. `w[c] > 0.0` would be wrong too, and that is not obvious — the SOLVER's
+            // setter refuses a negative weight, this one refuses only a NON-FINITE one
+            // (`setChannelWeight` above), so a negative weight reaches here and it DOES contribute to
+            // the sum below. "Not zero" is the predicate; "positive" is a different one.
+            if (! std::isfinite (e))
+            {
+                const bool excluded = core::exactlyEqual (w[c], 0.0);
+                if (! excluded) poisoned = true;
+                continue;
+            }
             subMS += w[c] * (e / (double) subSamples);
         }
         if (poisoned && nonFiniteSubHops_ != ~std::uint64_t {}) ++nonFiniteSubHops_;

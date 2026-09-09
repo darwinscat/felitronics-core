@@ -60,6 +60,70 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     samples short — enough to land on the wrong side of a rounding boundary at 2999249 Hz. The `+1` has
     exactly one reason, `DryAligner`'s usable range being `capacity-1`.
 
+- **`tools`: A C-ABI FACADE OVER `mastering`, AND A CLI THAT PROVES IT ADDS NOTHING (`fc_master_*`,
+  `fcore_master`).** `felitronics::mastering` is now callable from a browser worker; the desktop
+  application links the same module AS C++ past this surface entirely, and that second half is the
+  constraint that shapes the first. What the facade duplicates is exactly two things — the enum codes
+  and the field mapping — and no arithmetic at all.
+  - **`fcore_master selftest` is the acceptance, not a smoke test:** the same programme rendered
+    through the C entry points and through a direct C++ call, in ONE binary on ONE machine, compared
+    bit for bit — **0 of 384 000 samples differ**, with a precondition asserting the chain actually did
+    something (measured on the shipped fixture, and printed by the test rather than pinned here). Block-independence
+    survives the boundary at call sizes **1, 337, 4096 and whole-file, 0 differing samples each**,
+    because nothing here re-blocks anything: the call reaches `MasteringChain::process()` in one piece
+    and the chain's own fixed quantum stays the only clock. It runs in the `wasm-audio` tier too.
+  - **Four disciplines the comparison needs, each measured rather than reasoned out.** The target does
+    NOT inherit `tools/`' `-ffp-contract=off` — the two flavours differ in **203 269 of 288 000
+    samples**, and two TUs of one binary built with different flags measured as AGREEING because the
+    linker merged the header-only instantiations, which is agreement by link order. `setParams` then
+    `prepare` is not the same render as `prepare` then `setParams` (**59 259 of 80 000 samples, 0.0715
+    full scale**, all of it `stereo::MonoBass`, whose `reset()` snaps the width where its setter ramps
+    it over 20 ms). A zeroed parameter struct is not `MasteringChainParams{}` (**287 998 of 288 000**),
+    so `fc_master_params_default()` exists. And a second programme through one handle without
+    `fc_master_reset` is a different render — the selftest prints the count for the fixture it
+    ran, rather than carrying a figure that a later fixture change would quietly falsify.
+  - **`configure` re-prepares, and is refused once audio has been handed over.** Reading `resolved()`
+    straight back from a deferred `setParams` reports the PREVIOUS parameter set — **5.0000 dB** on the
+    limiter ceiling, **149.968 ms** on its release, and the core's own defaults on a fresh chain.
+    Applying early instead is worse: `Dither::setParams` reseeds on a seed change and
+    `EqBand::setParams` snaps while uninitialised and glides after, so N configure calls with no audio
+    between them would stop equalling one call with the last set — a render that depended on how many
+    times a knob moved before the button was pressed.
+  - **Handles are an index and a generation, not pointers.** Under emscripten, destroy-then-create
+    returned the same address **19 times out of 19** with emmalloc and with dlmalloc, against **0 of
+    20** for native malloc: a pointer handle is a use-after-free the developer's machine never
+    reproduces and the shipping tier reproduces always, in a linear memory with no page to trap on.
+  - **Ranges are the core's business and the facade does not check them** — the core clamps by design
+    and reports what it clamped to, and a facade with its own range table is a second copy of every
+    stage's limits. What it does refuse is a non-finite parameter (where the core has no verdict: a NaN
+    gain becomes 0 dB silently), a bad memory span, an unknown enum code, and a struct whose version or
+    size this build does not know.
+
+- **`mastering::TargetLoudnessSolver::measureInputLoudnessRange()` now refuses a POISONED programme.**
+  It checked `gatingBlockCount` and `droppedBlocks` and not `nonFiniteSubHops`, so it returned SUCCESS
+  on a programme its own meter had already flagged — and the meter is a local, so the caller could not
+  check for itself. Measured on 30 s alternating 3 s loud / 3 s quiet with every loud second poisoned:
+  **4.8000 LU clean against 21.4000 LU poisoned, both `true`.** That number is the far end of the
+  `maxLraLossLu` DELTA, so the constraint was being judged against a range the programme does not have.
+  NB the counter's granularity is a COMPLETED 10 ms sub-hop, so a non-finite sample inside the final
+  partial sub-hop is still not refused; closing that would need a second scan of the audio.
+
+- **`mastering::MasteringChain` COUNTS the samples its input gate substitutes
+  (`nonFiniteInputSamples()`).** The count is what turns a plausible render of a programme nobody
+  submitted into a visible one. Counting rather than refusing is deliberate and measured: a NaN through
+  the chain is bit-identical to a sanitised sample, while refusing the call would throw away every good
+  sample travelling with it — and the size of that loss would depend on the caller's block size, which
+  is the one thing the internal quantum exists to make irrelevant.
+  - **THE SHAPE OF THE COUNTER IS NOT FREE, and the first version of it was not.** Writing it as
+    `if (! isfinite(v)) { ...; ++member; } else ...` reads as the same code and stops the compiler
+    vectorising a pass that runs over every input sample of every quantum. Measured, arm64 Release,
+    best of seven interleaved runs over 20 000 quanta of the gate loop: **1.357 ms** branchless without
+    a counter, **3.536 ms** with the branch (**x2.61**), **1.369 ms** for a branchless select plus a
+    LOCAL counter (**x1.01**) — which is what ships. Whole chain, same source against `main`'s headers
+    and against this branch's with every DSP stage off: **0.531 ms against 0.407 ms**, identical
+    checksums. The shipped form keeps the original expression `std::clamp(isfinite(v) ? v : 0.0f, ...)`
+    verbatim, so the arithmetic is unarguably unchanged.
+
 - **`mastering`: TARGET-LOUDNESS SOLVER, NAMED CONSTRAINTS AND THE STATISTICS BEHIND THEM
   (`mastering::TargetLoudnessSolver`).** Hits a target integrated loudness under a stated true-peak
   ceiling in a bounded number of renders, and refuses BY NAME instead of crushing the programme when
