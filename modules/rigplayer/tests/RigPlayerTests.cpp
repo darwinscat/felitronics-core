@@ -1300,21 +1300,32 @@ int main() {
     // ================================================================================================
     group("🔴 THE DRY ALIGNER'S CAPACITY, CHECKED WHERE IT IS MEAN — 384 kHz, not 44.1");
     {
-        // WHY A SECOND RATE, AND WHY THIS ONE. The group above runs at 44.1 kHz, where the capacity is
-        // 256 and the delay asked of it is 61 — a four-fold margin, so the sizing arithmetic can be
-        // wrong by almost anything and the sweep stays flat. A diverse-testing round proved that is not
-        // a worry but a hole: TWO mutations of that arithmetic survived the entire suite — swapping the
-        // two rates, and dropping the "+ 2". Capacity has to be checked where it is MEAN.
+        // WHY A SECOND RATE, AND WHY THIS ONE. The group above runs at 44.1 kHz. It used to be a
+        // four-fold margin there — capacity 256 against a delay of 61, so the sizing arithmetic could
+        // be wrong by almost anything and the sweep stayed flat — and a diverse-testing round proved
+        // that was not a worry but a hole: TWO mutations of that arithmetic survived the entire suite,
+        // swapping the two rates and dropping the "+ 2".
         //
-        // Below ~334.5 kHz it never is: the sizing is floored at the 256 that shipped, so every host
-        // rate up to there — 44.1, 96, 192 — sizes to exactly 256 whatever the arithmetic says, and
-        // both mutants are EQUIVALENT there. 384 kHz is the first grid rate past the floor, and it is
-        // where the computed term becomes the binding one.
+        // 🔴 P38 REMOVED THAT MARGIN EVERYWHERE, so the sentence above is history rather than the
+        // present: the capacity is now `maxLatencySamples(fs) + 1`, which is 62 at 44.1 kHz against a
+        // delay of 61. Usable capacity equals the bound; an individual model can request less.
+        // That makes this second rate LESS load-bearing than it
+        // was and the group is kept anyway: 384 kHz exercises a larger delay than ordinary host rates.
+        // The later 3 MHz test exercises the largest supported host.
         //
-        // 🔴 AND THE INSTRUMENT IS THE DELAY, NOT THE COMB. A comb reading cannot see this: the "+ 2"
-        // mutant is short by exactly ONE sample, whose first null sits at fs/2 = 192 kHz, which reads
-        // -0.117 dB at 20 kHz — a quarter of the 0.5 dB threshold the group above uses, i.e. a defect
-        // that fits under its own tolerance. So this measures the quantity itself. It can, because the
+        // 🔴 THAT PARAGRAPH ALSO CARRIED A FLOOR THAT NO LONGER EXISTS, and it is corrected rather
+        // than deleted because the reason it was written still holds. The old threshold was misstated:
+        // the floor bound through 333000 Hz. Capacity was floored at 256, so 44.1, 96 and 192 kHz sized to 256
+        // for the cited mutations. That mitigation lasted until P38 removed
+        // the floor; since then every rate sizes from the geometry, no rate is equivalent-by-flooring,
+        // and 384 kHz earns its place on the size of the number rather than on being past a threshold.
+        //
+        // 🔴 AND THE INSTRUMENT IS THE DELAY, NOT THE COMB. A comb reading cannot see this: the mutant
+        // that drops the spare slot is short by exactly ONE sample, whose first null sits at
+        // fs/2 = 192 kHz, which reads -0.117 dB at 20 kHz — a quarter of the 0.5 dB threshold the group
+        // above uses, i.e. a defect that fits under its own tolerance. So this measures the quantity
+        // itself. (The slot was "+ 2" when this was written and is "+ 1" since P38; the arithmetic of
+        // the sentence is unchanged — one slot is one sample either way.) It can, because the
         // dry leg here is a PURE DELAY — the dry curve is flat so magnitudeCurveToFir returns {} and
         // the dry FIR is bypassed, and the models are memoryless — which makes the position of an
         // impulse in the output the applied delay, exactly, in samples.
@@ -1343,39 +1354,56 @@ int main() {
         // PRECONDITION 1 — the delay asked for is the one the geometry says, and it is LARGE.
         ok(asked == 288,
            "precondition 1: at a 384 kHz host against a 48 kHz model the player asks the dry path for "
-           + std::to_string(asked) + " samples (geometry: 32 + 32·8 = 288, exactly an integer, which is "
-           "what makes the +2 mutant bite here and nowhere on the audio grid)");
-        // PRECONDITION 2 — and it is past what the shipped floor could hold, which is the whole point.
-        ok(asked > 255,
-           "precondition 2: " + std::to_string(asked) + " EXCEEDS the usable range of the 256 that "
-           "shipped (capacity-1 = 255), so the computed term is the binding constraint here. At 44.1 kHz "
-           "it is 61 against 255 and no sizing error can show");
+           + std::to_string(asked) + " samples (geometry: 32 + 32·8 = 288, exactly an integer; "
+           "a one-slot capacity reduction is exposed by the impulse below)");
+        // PRECONDITION 2 — capacity has no margin over the requested delay at THIS host/tag pair.
+        // In general it equals the bound plus one, not every model's request: at 48 kHz all accepted
+        // models request zero and the bound is 64. This used to read "288 exceeds the usable range of the
+        // 256 that shipped", and that floor is gone: the sizing is derived now, so the usable range is
+        // exactly what this player asks here. Asserted as the property
+        // rather than the old number, because the old number would still PASS and would no longer mean
+        // anything.
+        ok(RigPlayer::dryAlignerCapacity(384000.0) - 1 == asked,
+           "precondition 2: the capacity's usable range is " 
+           + std::to_string(RigPlayer::dryAlignerCapacity(384000.0) - 1) + " against " 
+           + std::to_string(asked) + " asked — EXACTLY equal, so any sizing error at all is visible "
+           "here. Before P38 it was 289 against 288: the floor was already inert at this rate (it "
+           "binds only below 333001) and the spare slot was the whole margin. A first draft of this "
+           "line said 255 and blamed the floor — a pre-merge round measured it false");
         // PRECONDITION 3 — the instrument is not reading noise.
         ok(peak > 0.1,
            "precondition 3: the impulse really is in the output — peak " + std::to_string(peak)
            + ", against a wet leg held 120 dB down");
 
         // THE CLAIM. Both surviving mutants fail exactly here, and they fail by DIFFERENT amounts, which
-        // is why the message prints the difference rather than a verdict:
-        //   swapping the rates  → 256 of capacity against 288 asked → clamped to 255, short by 33;
-        //   "+ 2" dropped to +0 → 288 of capacity against 288 asked → clamped to 287, short by 1.
+        // is why the message prints the difference rather than a verdict. RE-DERIVED for P38's sizing
+        // (`maxLatencySamples(fs) + 1`, the geometry taken at the accepted window's low edge 47999.5):
+        //   swapping the two rates → 32 + 32·47999.5/384000 = 35.99996 → 36, capacity 37, usable 36
+        //                            against 288 asked → clamped, SHORT BY 252;
+        //   the spare slot dropped → capacity 288, usable 287 → short by 1.
+        // The first of those was 33 samples under the old floored sizing and is 252 under this one; the
+        // second is one sample either way.
         ok(measured == asked,
            "the dry path is delayed by EXACTLY what the player reports — asked " + std::to_string(asked)
            + ", measured " + std::to_string(measured) + " (difference " + std::to_string(measured - asked)
            + "). DryAligner clamps to capacity-1 SILENTLY, so a capacity that is one slot short shows up "
-             "here as a one-sample shift and nowhere else in the suite");
+             "here as a one-sample shift; the pure capacity pins and 44.1 kHz blend also catch it");
 
-        // A SECOND ORACLE, OF A DIFFERENT CONSTRUCTION, for the mutant that is loud enough to hear. A
-        // 33-sample misalignment at 384 kHz notches at fs/(2·33) = 5818 Hz, in band and deep; the
-        // one-sample mutant is inaudible here by construction and is caught by the line above alone.
+        // A SECOND ORACLE, OF A DIFFERENT CONSTRUCTION, for the mutant that is loud enough to hear — and
+        // its frequency MOVED with the sizing, which is exactly how a second oracle goes blind. Under
+        // the old floored capacity the swap cost 33 samples and notched at fs/(2·33) = 5818 Hz; under
+        // P38's it costs 252 and notches at fs/(2·252) = 762 Hz. Probing 5818 Hz now would read a
+        // PASSBAND of the 252-sample comb (5818/762 = 7.63, between nulls) and the oracle would agree
+        // with the mutant. The one-sample mutant is inaudible here by construction and is caught by the
+        // line above alone.
         ok(b.p.setDial("mix", 150.0), "…and back to a 50/50 blend for the audible half of the check");
         const double atRef  = b.gainAt(1000.0);
-        const double atNull = b.gainAt(5818.0);
-        std::printf("      384 kHz, D = %d: 50/50 blend reads %.4f at 1 kHz, %.4f at 5818 Hz (%.3f dB)\n",
+        const double atNull = b.gainAt(762.0);
+        std::printf("      384 kHz, D = %d: 50/50 blend reads %.4f at 1 kHz, %.4f at 762 Hz (%.3f dB)\n",
                     asked, atRef, atNull, db(atNull) - db(atRef));
         ok(db(atNull) - db(atRef) > -0.5,
-           "5818 Hz — the first null a 33-sample misalignment would cut, which is what a swapped pair of "
-           "rates costs at this host rate — is within half a dB of 1 kHz ("
+           "762 Hz — the first null a 252-sample misalignment would cut, which is what a swapped pair of "
+           "rates costs at this host rate under P38's sizing — is within half a dB of 1 kHz ("
            + std::to_string(db(atNull) - db(atRef)) + " dB)");
     }
 
@@ -1420,33 +1448,79 @@ int main() {
              "is the house 3.0e6 rather than whatever it happens to be");
 
         // 🔴 THE TWO PURE FUNCTIONS, PINNED DIRECTLY — the same reason the nam suite pins rateMatch:
-        // nothing in this repository varies them, and one of the things they decide (the FLOOR) is
-        // invisible to every signal test in the tree. A crew round deleted the floor and the whole
-        // suite stayed green; the table below is what makes that impossible. Values computed by hand
-        // from the two documented facts — kHalf per leg, the return leg converted at h/m — plus the
-        // two spare slots, and NOT by asking the code.
+        // nothing in this repository varies them, and what they decide is invisible to every signal
+        // test in the tree. Values computed BY HAND from the two documented facts — kHalf per leg, the
+        // return leg converted at h/m — evaluated at the ACCEPTED WINDOW'S LOW EDGE (47999.5, the
+        // slowest model NamStage will take, hence the longest round trip), rounded to nearest, plus the
+        // one slot DryAligner's [0, capacity-1] costs. NOT by asking the code.
+        //
+        // 🔴 THIS TABLE USED TO PIN A FLOOR OF 256 AND A SPARE SLOT, AND BOTH ARE GONE WITH THE DEFECT
+        // THEY MITIGATED (P38). They existed because install() judged a model against the rate the
+        // stage was RUNNING and prepare() then adopted it, so repeated loads walked the run rate down
+        // without bound and no capacity derived from 48 kHz could be trusted. The gate's reference is
+        // the constant now, so the window is fixed and the capacity is derivable — and a mitigation
+        // that outlives its defect is just a number nobody can re-derive.
         {
             struct C { double fs; int want; const char* why; };
-            for (const C c : { C {  44100.0,  256, "the floor: computed 64, and 64 is not what ships" },
-                               C {  96000.0,  256, "…still the floor: computed 98" },
-                               C { 192000.0,  256, "…still the floor: computed 162" },
-                               C { 333000.0,  256, "the LAST rate at which the floor binds — 32 + 222 = 254 exactly, +2 = 256" },
-                               C { 333001.0,  257, "…and the very FIRST at which the computed term takes over — one hertz, not the round thousand a first draft guessed" },
-                               C { 352800.0,  270, "32 + 352800/1500 = 267.2 -> 268 + 2" },
-                               C { 384000.0,  290, "32 + 256 = 288 exactly -> 288 + 2" },
-                               C { RigPlayer::kMaxSampleRate, 2034, "the ceiling: 32 + 2000 -> 2032 + 2" },
-                               C {     0.0,   256, "a rejected rate becomes 48 kHz, hence the floor" },
-                               C {    1e300, 256, "…and so does a finite-but-out-of-range one" } })
+            for (const C c : { C {  44100.0,   62, "32 + 32*44100/47999.5 = 61.400306 -> 61, +1" },
+                               C {  96000.0,   97, "32 + 64.000667 = 96.000667 -> 96, +1" },
+                               C { 192000.0,  161, "32 + 128.001333 -> 160, +1" },
+                               C { 352800.0,  268, "32 + 235.202450 = 267.202450 -> 267, +1" },
+                               C { 384000.0,  289, "32 + 256.002667 -> 288, +1" },
+                               C { RigPlayer::kMaxSampleRate, 2033, "the ceiling: 32 + 2000.020834 -> 2032, +1" },
+                               C {     0.0,    65, "a rejected rate becomes 48 kHz: 32 + 32.000333 -> 64, +1" },
+                               C {    1e300,   65, "…and so does a finite-but-out-of-range one" } })
                 ok(RigPlayer::dryAlignerCapacity(c.fs) == c.want,
                    "dryAlignerCapacity(" + std::to_string(c.fs) + ") = "
                    + std::to_string(RigPlayer::dryAlignerCapacity(c.fs)) + ", want "
                    + std::to_string(c.want) + " — " + c.why);
 
-            // …and the floor is a FLOOR, not a constant: the two neighbours above straddle it, so a
-            // suite that only ever saw 256 could not tell the two apart.
-            ok(RigPlayer::dryAlignerCapacity(333000.0) == RigPlayer::dryAlignerCapacity(44100.0)
-                   && RigPlayer::dryAlignerCapacity(334000.0) > 256,
-               "…so the computed term really does take over, and the pair 333000/334000 is where");
+            // 🔴 THE CELL THAT SEPARATES THE TWO DERIVATIONS. Everywhere above, asking the geometry at
+            // the NOMINAL 48000 gives the same integer, so a table of round rates cannot tell "derived
+            // from the accepted window" from "derived from the nominal rate". At 2999249 Hz it can:
+            // 32 + 32*2999249/48000 = 2031.499333 rounds to 2031, while 32 + 32*2999249/47999.5 =
+            // 2031.520162 rounds to 2032 — and 2032 is what an accepted model tagged 47999.5 really
+            // reports. A ring built as `lround(nominal) + 1` therefore has a usable range of 2031 and
+            // clamps it by one sample, in silence. It is not a lone freak either: the two derivations
+            // disagree at 30256 integer hosts in [40000, 3e6], the lowest of them 96749 Hz — which is
+            // 1.3 kHz above a rate people actually run.
+            //
+            // 🔴 AND WHAT IT DOES *NOT* SAY, because the first draft of this comment said it and a
+            // review round measured it false: the capacity that SHIPPED — max(256, ceil(nominal) + 2) —
+            // was 2034 here, usable 2033, and did NOT clamp. The spare slot covered exactly this. So
+            // the cell is the gate on the NEW derivation's argument, not evidence against the old code.
+            ok(RigPlayer::dryAlignerCapacity(2999249.0) == 2033,
+               "dryAlignerCapacity(2999249) = " + std::to_string(RigPlayer::dryAlignerCapacity(2999249.0))
+                   + ", want 2033 — asking at the nominal rate would give 2032, one slot short of an "
+                     "accepted model's 2032-sample delay");
+
+            // …and the capacity is a FUNCTION of the rate, not a constant: no two neighbours in the
+            // table share a value, and a mutant returning any fixed number fails on the second cell.
+            ok(RigPlayer::dryAlignerCapacity(44100.0) < RigPlayer::dryAlignerCapacity(96000.0)
+                   && RigPlayer::dryAlignerCapacity(96000.0) < RigPlayer::dryAlignerCapacity(192000.0)
+                   && RigPlayer::dryAlignerCapacity(192000.0) < RigPlayer::dryAlignerCapacity(384000.0),
+               "…and it rises strictly with the host rate, so no constant passes this table");
+
+            // 🔴 AND THE CAPACITY IS SUFFICIENT, which the cells above do not say: a pin only says the
+            // number did not change. This says the number is RIGHT — DryAligner's usable range is
+            // capacity-1, so it must cover what the stage really reports for EVERY model the stage
+            // would accept, and the window is swept rather than sampled at its edges.
+            {
+                int checked = 0, covered = 0;
+                for (const double h : { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0,
+                                        352800.0, 384000.0, 2999249.0, RigPlayer::kMaxSampleRate })
+                    for (int k = 0; k <= 40; ++k)
+                    {
+                        const double m = 47999.5 + 0.025 * k;      // the whole accepted window
+                        ++checked;
+                        if (felitronics::nam::NamStage::rateMatch(h, m).latencySamples
+                                <= RigPlayer::dryAlignerCapacity(h) - 1)
+                            ++covered;
+                    }
+                ok(covered == checked, "the capacity's usable range covers every accepted model rate at "
+                                       "every host tried: " + std::to_string(covered) + "/"
+                                       + std::to_string(checked));
+            }
 
             // 🔴 A NON-INTEGER RATE, because every other cell in this file is a whole number and a crew
             // round exploited exactly that: a mutant that FLOORED the host rate passed the entire

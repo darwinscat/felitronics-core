@@ -213,49 +213,37 @@ public:
         return (hostSR > 0.0 && hostSR <= kMaxSampleRate) ? hostSR : 48000.0;
     }
 
-    // 🔴 THE DRY ALIGNER'S CAPACITY, PURE — the same medicine this branch applies to the rate-match
-    // geometry, applied to the last piece of arithmetic that was still inline in prepare(). Pure and
-    // public for exactly the reasons rateMatch() is: it is the only way to pin values at rates this
-    // repository does not itself run, and the only way the FLOOR below can be gated at all. A crew
-    // round deleted that floor and every suite in the tree stayed green, because the floor's real
-    // defence — the ratchet — costs thousands of model loads to reproduce through the audio path.
+    // 🔴 THE DRY ALIGNER'S CAPACITY — ASKED, NOT DERIVED, and the whole of it is now one question
+    // put to the module that owns the answer. Pure and public for the reason rateMatch() is: it is the
+    // only way to pin the number at rates this repository does not itself run.
     //
-    // 🔴 WHAT THE FLOOR IS FOR, and it is NOT what an earlier comment here said. Computing the number
-    // removes the restatement but does NOT make 48 kHz a provable ceiling on the model rate:
-    // install() accepts a model within half a hertz of the current run rate and prepare() then ADOPTS
-    // it, so repeated half-hertz swaps walk the run rate away from the factory value without bound
-    // while audio is running. A LOWER run rate means a LONGER round trip, and the capacity here is
-    // derived from 48 kHz, so it can come up a slot short of a delay the stage really reports — and
-    // DryAligner clamps silently. The shipped 256 stays as a floor: the computed term can only raise
-    // it.
+    // 🔴 WHAT USED TO BE HERE AND WHY IT IS GONE. This was
+    // `max(256, ceil(pairDelayHostSamples(fs, kModelSampleRate)) + 2)`, and both halves of that
+    // existed for ONE reason, named in its own comment: NamStage::install() accepted a model within
+    // half a hertz of the CURRENT run rate and prepare() then adopted it, so repeated loads walked the
+    // run rate away from the factory value without bound. A lower run rate is a longer round trip, so a
+    // capacity derived from 48 kHz could come up a slot short of a delay the stage really reports —
+    // and DryAligner clamps silently. The floor and the spare slot were a MITIGATION with a measured
+    // price, not a proof: the first silent clamp arrived after 82256 half-hertz steps at a 48 kHz host,
+    // 68511 at 96 kHz, 41021 at 192 kHz, 560 at 384 kHz and 72 at a 3 MHz one.
     //
-    // 🔴 AND WHAT THE FLOOR BUYS DEPENDS ENTIRELY ON THE HOST RATE, which is worth stating because it
-    // is not obvious and it is not much where it matters least. The floor only binds below 333001 Hz
-    // (see the pin table in the tests); above that the computed term is the whole capacity and the
-    // floor is inert. Accepted half-hertz steps before the first silent clamp, measured:
+    // P38 closed the walk at its source — the gate's reference is the constant now, so an accepted
+    // model's rate lies in [kModelSampleRate - kModelRateTolerance, kModelSampleRate +
+    // kModelRateTolerance] for the life of the process — and a mitigation outlives its defect only as
+    // a number nobody can re-derive. So it goes, together with the fix rather than after it.
     //
-    //     96 kHz  : ~68 500   (the floor is doing all the work)
-    //    192 kHz  :   1112    (162 without the floor, 41021 with it — the floor buys the difference)
-    //    384 kHz  :    559    (floor inert: capacity is the computed 290)
-    //      3 MHz  :     72    (floor inert; the ratio is 62.5, so a small drop in the model rate moves
-    //                          the delay a long way)
-    //
-    // So this is a MITIGATION with a measured price, not a proof. The remaining exposure — sizing at
-    // one rate while the stage reports at another — closes properly only by re-preparing the aligner
-    // when the run rate changes, or by not letting the run rate walk at all, and both are contract
-    // questions that belong with the half-hertz tolerance in NamStage::install(), not here.
-    //
-    // 🔴 AND THE "+2" IS ONE REASON, NOT TWO. An earlier comment gave two — "capacity-1" and "ceil()
-    // of an integer leaves no headroom" — and the second does not exist: ceil(x) >= lround(x) for
-    // every x >= 0, so ceil(x)+1 already covers the request whenever the request is derived from the
-    // SAME x. The spare slot earns its place only where they are derived from DIFFERENT rates, which
-    // is the ratchet above: at 384 kHz a run rate walked to 47905.5 reports 289 while this function,
-    // asking at 48 kHz, sizes for 288 — +1 clamps, +2 does not.
+    // What replaces it is not a smaller guess but the contract's own consequence:
+    // NamStage::maxLatencySamples(fs) is an upper bound on what any ACCEPTED model can report at this
+    // host, +1 because DryAligner's usable range is capacity-1 (it clamps to [0, capacity-1], and does
+    // it in silence — which is exactly how a downstream repository shipped a bypass path that
+    // under-delayed every host rate above 48 kHz). One reason for the "+1", none for anything else, and
+    // no copy of 48000 or of the half hertz on this side of the seam. The bound's floating-point
+    // environment precondition applies here too: capacity prepared to nearest at
+    // nextafter(96748.9921875, 0) carries 96, but a model prepared upward asks for 97 and clamps.
+    // See NamStage::maxLatencySamples and review plan 2; this function supplies no extra margin.
     static int dryAlignerCapacity (double hostSR) noexcept
     {
-        const double fs = usableSampleRate (hostSR);
-        return std::max (256, (int) std::ceil (felitronics::core::StreamResampler::pairDelayHostSamples (
-                                                   fs, felitronics::nam::NamStage::kModelSampleRate)) + 2);
+        return felitronics::nam::NamStage::maxLatencySamples (usableSampleRate (hostSR)) + 1;
     }
 
     RigPlayer() = default;

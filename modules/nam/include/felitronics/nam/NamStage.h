@@ -77,8 +77,12 @@ public:
     // it on a worker while its drawing thread stays free: a WaveNet costs some twenty milliseconds
     // here, which a hand on a knob feels as a hiccup. `sampleRate` and `maxBlock` are what the stage
     // was prepared with; a model prepared for other numbers is prepared again by install(), on that
-    // thread, at the old cost. Null = a bad or unsupported model, the cases loadModelFromMemory()
-    // refuses — except the rate contract, which only a stage can judge (install() refuses those).
+    // thread, at the old cost. Null = a bad or unsupported model — EVERY case loadModelFromMemory()
+    // refuses, the rate contract included: acceptsModelRate() reads no stage state, so this half can
+    // and does judge it. What that saves is the PREWARM and the rate configuration, not the parse: the
+    // tag is read off the built network (`GetExpectedSampleRate`), so both instances exist by the time
+    // the contract can be asked. An earlier wording here said "the network is never built", which is
+    // simply false and was caught by a review round rather than by a test.
     // loadModelFromMemory() IS prepareModel() followed by install(): one path, two entry points.
     struct Prepared;
     struct PreparedDeleter { void operator() (Prepared*) const noexcept; };
@@ -86,9 +90,18 @@ public:
     static PreparedModel prepareModel (const void* data, std::size_t size, double sampleRate, int maxBlock,
                                        float trimDb = 0.0f);
     // The light half: message thread, a pointer swap. False — and the stage untouched — for a null
-    // handle or a model whose native rate breaks the rate contract (see loadModelFromMemory). Accepted
-    // = guaranteed to apply, exactly as a load: immediately, or on the next drain if the retire queue
-    // is momentarily full.
+    // handle, and for the one case left that a handle cannot answer on its own: a re-preparation for
+    // THIS stage's host rate and block that the backend cannot honour (see prepare()'s refusal). The
+    // rate CONTRACT is settled in prepareModel(), so "wrong model rate" is no longer among the reasons;
+    // "a non-null handle is always installable" would be a stronger claim than the code makes and an
+    // earlier draft of this line made it. Accepted = guaranteed to apply,
+    // exactly as a load: immediately, or on the next drain if the retire queue is momentarily full.
+    // A handle prepared for a different host rate or block size is re-prepared here, and the test for
+    // that is EXACT: a tolerance there let a backend keep a rate-match computed for a host it is not
+    // installed into, and report 0 samples of latency where the policy charges 64 (and 64 where the
+    // policy charges 0 — both measured). Re-preparing a stateful LSTM also prewarms its existing cell
+    // again, even if both hosts use the direct path. A mismatched split load can therefore start from
+    // a different state than a fused load; Reset is not an idempotent state restoration in pinned NAM.
     bool   install (PreparedModel model);
     void   clearModel();
     bool   collectGarbage();          // free models retired by a swap, once audio moved past them,
@@ -116,28 +129,44 @@ public:
     // is normalised FIRST, and the gate then sees the normalised value. An untagged model (rate <= 0)
     // therefore runs at the default and is NOT resampled at a default-rate host — reverse the two and
     // that case changes.
-    // The rate a model runs at when it reports none, and in practice the rate almost every model
-    // runs at: install() refuses a tagged model whose rate differs from the stage's current run rate
-    // by more than half a hertz, and that rate is only ever re-derived from a model that already
-    // passed the same check — so a fresh stage accepts 48 kHz captures and refuses 44.1 and 96 kHz
-    // ones outright (measured: every public route was tried).
+    // The rate a model runs at when it reports none, and — within kModelRateTolerance — the rate every
+    // model this stage will accept runs at. It is a PROVABLE CEILING now, and the two sentences that
+    // used to stand here saying otherwise are the subject of this fix rather than a caveat to it.
     //
-    // ⚠️ IT IS NOT A PROVABLE CEILING, and an earlier version of this comment claimed it was. The
-    // check is a TOLERANCE, not equality: a model at 48000.5 is accepted, prepare() then adopts that
-    // rate, and the next half-hertz step is accepted against the new one. A LOWER run rate means a
-    // LONGER round trip, so sizing a buffer from this constant alone can come up short.
+    // 🔴 IT IS A FIXED WINDOW, AND IT USED TO BE A MOVING ONE — that was the whole defect. The gate
+    // compared a model's tag against the rate of whatever was live at the last prepare(), and prepare()
+    // ADOPTED the accepted tag, so a fuzz on equality was a random walk: each accepted load moved the
+    // reference the next load is judged against. Measured on the base commit, half-hertz steps down,
+    // host 48000, loop capped at 5000:
     //
-    // 🔴 AND THE FIRST NUMBER PUBLISHED FOR IT MEASURED THE PROBE, NOT THE RATCHET. "65 accepted steps
-    // walked it from 48000 to 47967.5" is reproducible, but 65 is kMaxRetiredModels + 1: with no audio
-    // running between loads the retire queue fills and the next install parks as pending, so the walk
-    // stops for a reason that has nothing to do with rates. Run audio between the loads — which a
-    // plugin always does — and the walk does not stop at all: 2000 steps, no refusal. The ratchet is
-    // UNBOUNDED, which is a stronger reason to floor a derived buffer, not a weaker one.
+    //     load only .................... 1 step      ← nothing else moves the reference
+    //     load + process() ............. 1 step      ← audio is NOT the clock
+    //     load + prepare() ............. 66 steps    ← stopped by kMaxRetiredModels, not by rates
+    //     load + process() + prepare() . 5000 steps, no refusal → run rate 45500.0
     //
-    // It is public because a consumer sizing a delay line before any model exists has to start
-    // somewhere, and until now it could not even name this number: a downstream repository invented a
-    // "lowest pack rate" of 8 kHz to stand in for it, and sized itself wrong.
+    // So the walk was clocked by prepare(), and audio only drained the retire queue — which corrects
+    // BOTH numbers this comment used to carry ("65 steps", and "run audio and the walk does not stop").
+    // The cost was not an exotic one either: a stage walked to 47900 REFUSES an ordinary 48000 capture,
+    // measured. The window moved; it never widened.
+    //
+    // The reference is now the constant itself, so no sequence of loads can move it, and a consumer may
+    // size a buffer from this number — which is what it is public for. Ask maxLatencySamples() rather
+    // than deriving one: a downstream repository invented a "lowest pack rate" of 8 kHz to stand in for
+    // this constant and sized itself wrong, and deriving from the NOMINAL rate is a second way to get
+    // the same answer wrong, because the accepted window's LOW edge is what costs the most.
     static constexpr double kModelSampleRate = 48000.0;
+
+    // The half-hertz of tag noise the gate forgives. It is the SAME number rateMatch() uses to decide
+    // whether a resampler is worth installing, and deliberately so: "this stage accepts a model exactly
+    // when a factory-rate host would not resample it" is one rule with one owner, and acceptsModelRate()
+    // below is that sentence spelled as code rather than a second copy of the 0.5.
+    //
+    // 🔴 AND rateMatch() SPENDS THIS CONSTANT RATHER THAN ITS OWN LITERAL, which it did not at first.
+    // The mutation stand is what said so: moving this number to 0.6 changed nothing anywhere, because
+    // the only thing reading it was maxLatencySamples() while the gate still carried a private 0.5.
+    // A constant that names a rule nobody consults is a restatement waiting to drift, and this one
+    // would have drifted silently in the direction that widens the accepted window.
+    static constexpr double kModelRateTolerance = 0.5;
 
     struct RateMatch
     {
@@ -163,6 +192,54 @@ public:
     // answer is whatever that platform's lround saturates to, which is NOT the same on all of them —
     // measured on four rows, see the .cpp. h = 0 reports 32 against a real 64.
     static RateMatch rateMatch (double hostSR, double modelSR) noexcept;
+
+    // 🔴 THE RATE CONTRACT, AS A PURE PREDICATE ON THE MODEL'S OWN TAG. True = this stage will take a
+    // model reporting `modelSR`; false = prepareModel() returns null for it and no stage anywhere will
+    // accept it. It depends on NOTHING but the argument — that is the fix, and it is why the check now
+    // lives in prepareModel() rather than install(): a rule that reads no stage state is not a stage's
+    // to judge, and judging it in the heavy half saves a WaveNet's twenty milliseconds of PREWARM on a
+    // model that was never going to load. Not the parse and not the network: the tag is read off the
+    // built instances, so those exist by the time this can be asked — a claim that said otherwise stood
+    // here until a review round measured it.
+    //
+    // A model that reports NO rate (<= 0) is accepted and runs at kModelSampleRate — rateMatch() owns
+    // that normalisation, and this asks it rather than repeating it. The window is therefore
+    // [kModelSampleRate - kModelRateTolerance, kModelSampleRate + kModelRateTolerance], closed at both
+    // ends, for the life of the process.
+    //
+    // ⚠️ THE ARGUMENT IS A double AND THE EDGES NEED IT. Measured: 48000.5001 is refused, but
+    // `(double)(float) 48000.5001` is exactly 48000.5 and is ACCEPTED — a tag that passes through a
+    // float anywhere upstream collapses onto the edge and widens the effective window by about two
+    // thousandths of a hertz. NAM reports the tag as a double and nothing in this repository narrows
+    // it; a consumer that does is choosing a slightly different window.
+    static bool acceptsModelRate (double modelSR) noexcept;
+
+    // An upper bound on latencySamples() over every model this stage would ACCEPT at this host rate —
+    // the number a consumer sizing a fixed delay line actually needs, and the reason it must not derive
+    // one itself. A LOWER model rate is a LONGER round trip, so the bound is taken at the accepted
+    // window's low edge, not at the nominal rate: at a 3 MHz host that difference is 0.0208 samples,
+    // which is nothing until it lands on the wrong side of a rounding boundary and a ring comes up one
+    // slot short.
+    //
+    // A BOUND rather than an attained maximum, and it has TWO gaps rather than the one an earlier
+    // wording admitted: at hostSR exactly kModelSampleRate no accepted model resamples at all, so the
+    // true maximum there is 0 and this still answers 64; and at any host too slow for a backend to be
+    // prepared at all (see prepare()'s refusal) nothing runs, so nothing attains it. It is a policy
+    // answer about rates, not a promise about a particular prepared instance. See the definition for
+    // why the bound is taken on the geometry instead of on rateMatch().
+    //
+    // Same precondition as rateMatch(): hostSR in (0, 3.22e12]. And one more that is easy to miss —
+    // THE ANSWER IS EVALUATED IN THE CALLER'S FLOATING-POINT ENVIRONMENT. A consumer that sizes a ring
+    // here and asks a MODEL for its latency on another thread gets one number only if both threads
+    // round the same way: at hostSR = nextafter(96748.9921875, 0) the geometry is 96.499999999999986
+    // to nearest and exactly 96.5 upward, so the two answers are 96 and 97 and a ring sized by the
+    // first is one short of a model prepared under the second. Nothing in this repository changes the
+    // rounding mode; a consumer that does owes itself a spare slot.
+    //
+    // A caller sizing a ring wants this PLUS ONE, because a delay line's usable range is capacity-1
+    // (core::DryAligner clamps to [0, capacity-1], silently). That "+1" has exactly one reason and
+    // belongs to the ring, so it is not folded in here.
+    static int maxLatencySamples (double hostSR) noexcept;
     // How many samples this model must be FED before its output means anything — its receptive field.
     // A network with empty buffers describes the silence it was born into for exactly this long, so
     // anything that fades a freshly loaded model in has to run it silently for this many samples
