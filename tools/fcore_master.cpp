@@ -604,7 +604,13 @@ int selftest (double fs, int nc)
     // asymmetric, so `dcBlockHz` is unmappable-for-free on any symmetric shape.
     a.prm.clipper.shape         = FC_SHAPE_ASYM;
     a.prm.dither.shaping        = FC_SHAPING_PSYCHO;
-    a.prm.dither.autoBlank      = 0;
+    // `autoBlank` STAYS ON, and this is the second time the same mistake was caught in this fixture:
+    // moving a field off its default switched off the mechanism the NEXT field controls, so
+    // `autoBlankSamples` became unmappable for free — exactly as setting `bypassMonoBass` here had
+    // earlier disabled the stage the lifecycle-order check depends on. Measured: with auto-blank off,
+    // 3777 against the default 4096 renders identically; with it on and a silent tail, they differ in
+    // 412 bytes. The OFF value is covered by the dither-only comparison instead, where it blinds nothing.
+    a.prm.dither.autoBlank      = 1;
     a.prm.dither.autoBlankSamples = 3777;
     a.prm.compressor.autoMakeup = 1;
     a.prm.eqBands[2].on         = 1;
@@ -757,19 +763,40 @@ int selftest (double fs, int nc)
     // in 433 bytes. It also exercises the corner where almost every stage is absent, which the full
     // fixture cannot.
     {
-        Args b = a;
-        b.cfg.eq = b.cfg.monoBass = b.cfg.compressor = b.cfg.clipper = b.cfg.limiter = 0;
-        b.cfg.dither = 1;
-        std::vector<float> mAbi, mCpp; fc_master_resolved rm {};
-        const bool ranM = abiRender (b, in, frames, nc, mAbi, rm) && directRender (b, in, frames, nc, mCpp);
-        check (ranM, "the dither-only render ran through both paths");
-        if (ranM)
+        // TWICE, with the auto-blank ON and OFF, because one run cannot cover both: with the blank OFF
+        // its sample count is inert, and with it ON the count is what the fixture sees. Two comparisons
+        // over one topology is what it takes for a flag AND the field it gates to be pinned at once.
+        std::vector<float> blanked;
+        for (int autoBlank = 1; autoBlank >= 0; --autoBlank)
         {
+            Args b = a;
+            b.cfg.eq = b.cfg.monoBass = b.cfg.compressor = b.cfg.clipper = b.cfg.limiter = 0;
+            b.cfg.dither = 1;
+            b.prm.dither.autoBlank = autoBlank;
+            std::vector<float> mAbi, mCpp; fc_master_resolved rm {};
+            const bool ranM = abiRender (b, in, frames, nc, mAbi, rm)
+                           && directRender (b, in, frames, nc, mCpp);
+            check (ranM, autoBlank ? "the dither-only render ran (auto-blank ON)"
+                                   : "the dither-only render ran (auto-blank OFF)");
+            if (! ranM) continue;
             double worst = 0.0;
             const std::size_t d = bitDiff (mAbi, mCpp, worst);
             char msg[160];
-            std::snprintf (msg, sizeof msg, "%zu differ, worst %.9g", d, worst);
+            std::snprintf (msg, sizeof msg, "auto-blank %s: %zu differ, worst %.9g",
+                           autoBlank ? "on" : "off", d, worst);
             check (d == 0, "a topology with almost every stage ABSENT maps identically", msg);
+            if (autoBlank) blanked = mAbi;
+            else
+            {
+                // PRECONDITION for the pair: the flag has to CHANGE the render, or both runs are the
+                // same experiment and neither pins anything about it.
+                double delta = 0.0;
+                for (std::size_t i = 0; i < mAbi.size() && i < blanked.size(); ++i)
+                    delta = std::max (delta, (double) std::fabs (mAbi[i] - blanked[i]));
+                char pre[128];
+                std::snprintf (pre, sizeof pre, "on against off differ by up to %.3g", delta);
+                check (delta > 0.0, "PRECONDITION: the auto-blank changes this render", pre);
+            }
             char lat[96];
             std::snprintf (lat, sizeof lat, "latency %d against the full chain's %d",
                            rm.latencySamples, res.latencySamples);

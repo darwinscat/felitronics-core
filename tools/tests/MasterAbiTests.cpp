@@ -662,13 +662,16 @@ int main()
             fc_solution_summary sum {}; FC_INIT (sum);
             (void) fc_solution_summary_get (sol, &sum);
             ok (sum.status == FC_SOLVE_INVALID_REQUEST, "which is the solver's own InvalidRequest");
-            ok (fc_master_configure (h, &p, &r) == FC_OK,
-                "and a solve that refused BEFORE rendering left the chain configurable");
-            // AND LEFT IT PROCESSABLE. `configure` alone cannot see the difference — it is not gated on
-            // the solved mark — so a mutant that set the mark unconditionally survived the check above.
+            // PROCESS FIRST, CONFIGURE AFTER, and the order is the whole check. `configure` CLEARS the
+            // solved mark, so asking it first and `process` second tested nothing at all — a mutant
+            // that set the mark unconditionally sailed through, because by the time `process` ran the
+            // mark had already been wiped by the check in front of it. A dead check that looks alive.
             auto blk2 = tone (256, kNch);
             ok (fc_master_process (h, blk2.data(), blk2.data(), 256) == FC_OK,
-                "and streamable: a solve that never rendered did not mark the handle as solved");
+                "a solve that never rendered did not mark the handle as solved");
+            ok (fc_master_reset (h) == FC_OK, "reset");
+            ok (fc_master_configure (h, &p, &r) == FC_OK,
+                "and the chain is configurable, as a chain that never rendered should be");
             fc_solution_destroy (sol);
             fc_master_destroy (h);
         }
