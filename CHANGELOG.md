@@ -7,6 +7,59 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+- **`nam`: THE RATE CONTRACT IS A FIXED WINDOW, AND THE CONSUMER MITIGATIONS IT FORCED ARE GONE
+  (`nam::NamStage`, `rigplayer::RigPlayer`).** `install()` used to admit a model whose tag was within
+  half a hertz of the rate the stage was RUNNING, and `prepare()` then adopted the accepted tag — a
+  fuzz on equality spelled as a moving reference, so every accepted load moved the goalposts for the
+  next one. Measured on the base commit, half-hertz steps at a 48 kHz host: `{load}` 1 step,
+  `{load, process}` 1, `{load, prepare}` 66 (stopped by the retire queue, not by rates),
+  `{load, process, prepare}` **5000 with no refusal at all**, run rate walked to 45500.0. The walk was
+  clocked by `prepare()`; audio only drained the retire queue, which corrects the two numbers the
+  header used to carry. And its cost was the opposite of what it looked like: a stage walked to 47900
+  **refuses an ordinary 48000 capture** — the window moved, it never widened.
+  - **The reference is the constant now.** `NamStage::acceptsModelRate(modelSR)` is a pure predicate on
+    the model's own tag — "this stage takes a model exactly when a factory-rate host would not resample
+    it" — so the accepted window is `[47999.5, 48000.5]` for the life of the process, whatever has been
+    loaded before. It reads no stage state, so it is settled in `prepareModel()` and a doomed model
+    never pays for its prewarm. New public surface: `kModelRateTolerance`, `acceptsModelRate`,
+    `maxLatencySamples(hostSR)`.
+  - **`install()`'s reconfiguration test is EXACT.** Two half-hertz tolerances of the same size do not
+    compose: a backend prepared for host 48000.4 and installed into a stage at 48000.6 kept a
+    rate-match computed for the wrong host and reported **0 samples of latency where the policy charges
+    64**; the mirror reported **64 where the policy charges 0**. Both now equal the policy.
+  - **The model scratch is sized for the path that RUNS**, from the real host rate. It was one ratio
+    serving two paths and wrong at both ends: with no resampler the model is clocked by the HOST, so a
+    whole `maxBlock` chunk is staged in a buffer the ratio had sized just UNDER `maxBlock` (reachable
+    at `maxBlock >= 34*hostSR`, i.e. 34 seconds in one call — which law 11(a) explicitly invites);
+    and `max(8000, hostSR)` substituted an assumed host rate, losing frames in silence below 8 kHz —
+    **-1.22 dB at a 6 kHz host, -3.00 at 4 kHz, -6.05 at 2 kHz, -9.09 at 1 kHz, 0.00 at 8 kHz exactly**.
+  - **Behaviour change where a conversion cannot be sized** — a host rate that is not positive, or so
+    slow that one block exceeds the arithmetic (about 0.023 Hz at a 512-sample block), or a `maxBlock`
+    past `(INT_MAX-16)/2`, which is doubled one line later and used to overflow there: the load is now
+    REFUSED, visibly, where it used to succeed and then produce garbage or convert an out-of-range
+    double to an `int`. Nothing shipped reaches them; `RigPlayer` maps every host outside `(0, 3e6]` to
+    the factory rate first.
+  - **What does NOT move, and it is stated because it nearly did:** `maxModelFrames` is also the block
+    handed to NAM's `Reset`, and NAM prewarms in WHOLE blocks — so it decides how many samples of
+    silence a stateful capture is warmed with, and therefore its state at the first real sample. The
+    direct branch keeps the same `+16` the old expression had, preserving equal model/host rates
+    (measured at blocks 64/256/512/1024/4096). Fractional hosts can change even an integer-tagged
+    model: host 47999.75, tag 48000, block 512 changes Reset from 529 to 528; the decaying-cell LSTM's
+    first output changes from 0.1597609967 to 0.1600718498. Larger blocks can differ by more than one.
+  - **Exact install reconfiguration also adds stateful prewarming where latency does not change.**
+    A handle prepared at 48000.1 and installed at 48000.2 (block 512) is now Reset again. NAM's LSTM
+    Reset advances the existing cell rather than restoring it: first output 0.0548291542 instead of
+    0.1600718498 for the decaying-cell fixture, with zero latency in both cases. Matching split loads
+    and fused loads still prewarm once. The behaviour is recorded by tests rather than redesigned here:
+    separating the scratch capacity from the Reset/prewarm schedule is its own task (plan P39a).
+  - **`RigPlayer::dryAlignerCapacity` lost its `max(256, …)` floor and its `+2`** — both existed only to
+    mitigate the walk, and their price was measured (first silent clamp after 82256 half-hertz steps at
+    a 48 kHz host, 68511 at 96 k, 41021 at 192 k, 560 at 384 k, 72 at 3 MHz). It is now
+    `NamStage::maxLatencySamples(usableSampleRate(fs)) + 1`: the bound asks the accepted window's LOW
+    edge, because a lower model rate is a longer round trip and the nominal rate reads up to 0.0208
+    samples short — enough to land on the wrong side of a rounding boundary at 2999249 Hz. The `+1` has
+    exactly one reason, `DryAligner`'s usable range being `capacity-1`.
+
 - **`mastering`: TARGET-LOUDNESS SOLVER, NAMED CONSTRAINTS AND THE STATISTICS BEHIND THEM
   (`mastering::TargetLoudnessSolver`).** Hits a target integrated loudness under a stated true-peak
   ceiling in a bounded number of renders, and refuses BY NAME instead of crushing the programme when

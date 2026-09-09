@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -106,9 +107,15 @@ public:
     // (resampler/scratch resizes + the NAM Reset prewarm) — sizes depend on the host's future
     // sampleRate/maxBlock, so they can't be preallocated in the ctor. A low-memory failure is
     // therefore caught HERE instead of std::terminate()-ing the host: the backend marks itself
-    // unprepared, process() degrades to a clean passthrough and latencySamples() to 0. The loader
-    // checks prepared() and fails the load honestly; a LIVE backend whose re-prepare fails keeps
-    // running as a passthrough (degraded, never a crash).
+    // unprepared and latencySamples() drops to 0. The loader checks prepared() and fails the load
+    // honestly; a LIVE backend whose re-prepare fails leaves the caller's audio ALONE.
+    //
+    // 🔴 AND IT REFUSES THAT CALL RATHER THAN CLAIMING IT — the two halves of that sentence are not the
+    // same and an earlier wording here said only the second ("degrades to a clean passthrough"), which
+    // reads as "returns true". It does not: process() returns FALSE for an unprepared backend, which is
+    // law 11's answer for a call that cannot be honoured, and a composite that ANDs its stages'
+    // verdicts (rigplayer does) therefore reports the refused block outward. The buffer is untouched
+    // either way; what the verdict adds is that the caller can tell.
     void prepare (double sampleRate, int maxBlockIn, int /*maxChannels*/) noexcept
     {
         prepared_ = false;
@@ -122,7 +129,8 @@ public:
             // with the default pre-applied here, breaking the default INSIDE rateMatch changed nothing
             // for an untagged model, so the suite could not see it. Hand over what the model actually
             // reported and let the one owner decide.
-            configureRates (expectedSR);
+            if (! configureRates (expectedSR))
+                return;                    // prepared_ stays false — see configureRates()
             for (auto& m : inst)
                 if (m) m->Reset (modelRunSR, maxModelFrames);
             prepared_ = true;
@@ -194,14 +202,74 @@ public:
 private:
     // Decide the run rate + (re)configure per-channel resamplers/scratch (prepare() only — never
     // while this instance is live and audio runs). modelRunSR = the loaded model's native rate.
-    void configureRates (double modelSR)
+    // FALSE = this configuration cannot be honoured; the caller must leave the backend unprepared.
+    [[nodiscard]] bool configureRates (double modelSR)
     {
         // ONE call decides all three: the run rate, whether a resampler is installed, and what it
         // costs. Recomputing any of them here is how they drifted apart before.
         rm_         = NamStage::rateMatch (hostSR, modelSR);
         modelRunSR  = rm_.modelRunSR;
         resampling  = rm_.resampling;
-        maxModelFrames = (int) std::ceil (maxBlock * (modelRunSR / std::max (8000.0, hostSR))) + 16;
+        // 🔴 THE SCRATCH SERVES TWO PATHS, AND ONE RATIO CANNOT SIZE BOTH. It used to be
+        // `ceil(maxBlock * modelRunSR / max(8000, hostSR)) + 16`, and that number was wrong at BOTH
+        // ends — each way silent, each way measured:
+        //
+        //   • TOO SMALL, past the end of the heap. Without a resampler the model is clocked by the
+        //     HOST: processChannel() copies a whole chunk — up to maxBlock host samples — into this
+        //     buffer, and the ratio never enters. A tag half a hertz BELOW the host is inside the
+        //     acceptance window (the gate and the resampler gate are the same half hertz), so the
+        //     ratio is just under 1 and the buffer comes out just under maxBlock. Measured with ASan
+        //     on the base commit, host 48000, tag 47999.5, maxBlock 2000000: heap-buffer-overflow,
+        //     a WRITE of 8000000 bytes into a 7999984-byte region. The threshold is maxBlock >=
+        //     34*hostSR — 34 seconds of audio in one call, which law 11(a) explicitly invites an
+        //     offline caller to pass and which this very function's own comment (see process()) says
+        //     it is guarding against.
+        //   • TOO SMALL AGAIN, and inaudibly at first, below 8 kHz: `max(8000, hostSR)` is an
+        //     ASSUMED host rate standing in for the real one, so a slower host's block converts to
+        //     more model frames than fit and produceAvailable() drops the surplus without a word.
+        //     Measured on a unity model, 100 Hz tone: -1.22 dB at a 6 kHz host, -3.00 at 4 kHz,
+        //     -6.05 at 2 kHz, -9.09 at 1 kHz, and exactly 0.00 at 8 kHz and above — the floor's own
+        //     edge. rigplayer::RigPlayer::usableSampleRate accepts every one of those rates.
+        //
+        // Ask the path that runs for its own number, with the REAL host rate. The bound
+        // that keeps the arithmetic honest is not a floor on the rate but a refusal: a frame count
+        // that will not fit in an int cannot be honoured, and this backend already has an observable
+        // way to say so — stay unprepared, which makes the loader fail the load and a live instance
+        // degrade to a clean passthrough. That is law 11(b) at the only place in this class that can
+        // still refuse; a silent substitute rate is what it replaces.
+        // ASK THE PATH THAT WILL ACTUALLY RUN — `resampling` is decided above and does not change until
+        // the next prepare(), so exactly one of these two numbers is the requirement and the other is
+        // irrelevant. Taking the max of both instead looks safer and is not: at a non-positive host
+        // rate the ratio is not a number, and a max() would quietly hand the CONVERTED path the direct
+        // path's answer — smaller than what the old floored expression gave, which is a regression
+        // wearing a fix's clothes. Here that case has no honest number, so it is refused instead.
+        //
+        // 🔴 THE CONVERTED BRANCH NEEDS ITS HOST RATE STATED, NOT INFERRED FROM THE RESULT. A guard that
+        // only looks at the frame count lets a NEGATIVE host through whenever the slack outweighs the
+        // (negative) converted term: at host -2000000, block 512, `ceil(512 * 48000 / -2000000) + 16`
+        // is 4 — a positive, perfectly representable four-frame scratch for a rate that cannot convert
+        // anything. -48000 happens to give -496 and is refused, which is exactly how a wrong rule looks
+        // right on the cell you tried. Found by a pre-merge diff round; the claim it falsified was mine.
+        if (rm_.resampling && ! (hostSR > 0.0))
+            return false;
+        // Keep +16 on the direct path: maxModelFrames is also NAM's Reset block, and whole-block
+        // prewarming makes its value observable with a stateful capture. This preserves the old block
+        // when model and host rates are equal. It does NOT preserve every integer-tagged capture at
+        // every host: host 47999.75, tag 48000, block 512 used 529 and now uses 528. A decaying-cell LSTM
+        // then starts at 0.1600718498 instead of 0.1597609967. The general direct-path change is
+        // maxBlock - ceil(maxBlock * (modelRunSR / hostSR)), not always one frame and not restricted to
+        // tags above the nominal rate. See review-p38/REPORT.md, plan 1.
+        const double frames = rm_.resampling
+                                  ? std::ceil ((double) maxBlock * (modelRunSR / hostSR)) + 16.0
+                                  : (double) maxBlock + 16.0;
+        // The ceiling is not INT_MAX but (INT_MAX-16)/2, because this number is doubled and offset
+        // again on the next line (`maxModelFrames * 2 + 16`) — a bound that only keeps its own
+        // conversion legal is a bound that overflows one line later. maxBlock rides the same
+        // arithmetic through `down.reset`, so it is held to the same ceiling.
+        constexpr double kMaxFrames = (double) ((std::numeric_limits<int>::max() - 16) / 2);
+        if (! (frames >= 1.0 && frames <= kMaxFrames && (double) maxBlock <= kMaxFrames))
+            return false;                 // refused — the caller leaves this backend unprepared
+        maxModelFrames = (int) frames;
         for (auto& c : ch)
         {
             c.down.reset (hostSR,    modelRunSR, maxBlock * 2 + 16);
@@ -209,6 +277,7 @@ private:
             c.modelIn .assign ((size_t) maxModelFrames, 0.0f);
             c.modelOut.assign ((size_t) maxModelFrames, 0.0f);
         }
+        return true;
     }
 
     // Per-channel resampler state + model-rate scratch (used only when resampling).
@@ -315,8 +384,9 @@ struct NamStage::Impl
 
     double hostSR   = 48000.0;
     int    maxBlock = 512;
-    double modelRunSR = kModelSampleRate;   // run rate configured at the last prepare() — the
-                                            // reference for the mid-stream model-rate contract
+    // There is deliberately no `modelRunSR` here any more. It existed to be the reference the
+    // mid-stream rate contract compared against, and being a MUTABLE reference for a tolerance is
+    // exactly what let the run rate walk: kModelSampleRate is the reference now, and it cannot move.
 
     void publishMirrors (double sr, double ldb, bool hl, int prewarm = 0)
     {
@@ -385,12 +455,10 @@ void NamStage::prepare (double sampleRate, int maxBlock)
     impl->hostSR   = sampleRate;
     impl->maxBlock = std::max (1, maxBlock);
 
-    // Audio is stopped here. The live model (if any) decides the run rate — remember it for the
-    // mid-stream rate contract in loadModelFromMemory() — and NeuralStage re-prepares the live
-    // backend in place (it captures the live pointer ONCE, so a concurrent message-thread swap
-    // can't split the rate-config from the Reset).
-    const double liveSR = impl->expectedSR.load (std::memory_order_relaxed);
-    impl->modelRunSR = (liveSR > 0.0 ? liveSR : kModelSampleRate);
+    // Audio is stopped here. NeuralStage re-prepares the live backend in place (it captures the live
+    // pointer ONCE, so a concurrent message-thread swap can't split the rate-config from the Reset).
+    // What this used to do as well was ADOPT the live model's rate as the reference for the next
+    // load's rate check — which made every accepted load move the goalposts. Nothing is adopted now.
     if (impl->pendingBackend != nullptr)                                // a parked load must follow the
         impl->pendingBackend->prepare (sampleRate, impl->maxBlock, 2);  // new rates before it goes live
     impl->stage.prepare ({ sampleRate, impl->maxBlock, 2 });
@@ -417,7 +485,6 @@ bool NamStage::process (float* const* io, int numChannels, int numSamples, bool 
 struct NamStage::Prepared
 {
     std::unique_ptr<NamBackend> backend;
-    double modelSR = 0.0;      // the model's own rate, for the stage's rate contract at install()
 };
 
 void NamStage::PreparedDeleter::operator() (Prepared* p) const noexcept { delete p; }
@@ -459,6 +526,14 @@ NamStage::PreparedModel NamStage::prepareModel (const void* data, std::size_t si
     if (m0->NumInputChannels() != 1 || m0->NumOutputChannels() != 1)
         return nullptr;
     const double modelSR = m0->GetExpectedSampleRate();
+    // THE RATE CONTRACT, and it is settled HERE because it reads nothing but this number. It used to
+    // live in install(), judged against the rate of whatever was live at the last prepare() — a
+    // reference that MOVED as loads were accepted, which is the ratchet this task closed. Judging it
+    // here spares a doomed model its PREWARM, which is the expensive half of everything below; it does
+    // not spare the parse or the two get_dsp() calls above, because the tag is read off the built
+    // network and there is nothing to judge until then.
+    if (! acceptsModelRate (modelSR))
+        return nullptr;
 
     // Build + prepare the new backend while it is NOT live (alloc + prewarm is fine here — and a
     // low-memory failure fails the LOAD, never the host: prepare() self-catches, see NamBackend).
@@ -469,7 +544,6 @@ NamStage::PreparedModel NamStage::prepareModel (const void* data, std::size_t si
         out->backend = std::make_unique<NamBackend> (std::move (m0), std::move (m1), trimDb, prewarmFromConfig);
     }
     catch (...) { return nullptr; }
-    out->modelSR = modelSR;
     out->backend->prepare (sampleRate, std::max (1, maxBlock), 2);
     if (! out->backend->prepared())
         return nullptr;
@@ -481,25 +555,37 @@ bool NamStage::install (PreparedModel model)
     if (model == nullptr || model->backend == nullptr)
         return false;
 
-    // Rate contract: the run rate was decided in prepare() (audio stopped) — a model whose native
-    // rate differs from it would need the resamplers reconfigured for a rate the host chain wasn't
-    // prepared for, and would report a different latency than the one the host compensated. Refuse
-    // it instead of misrepresenting it. A model that doesn't report a rate (<= 0) keeps the
-    // previous behaviour (run at modelRunSR). (Factory NAMs are 48k, so this never fires for the
-    // bundled library.)
-    if (model->modelSR > 0.0 && std::abs (model->modelSR - impl->modelRunSR) > 0.5)
-        return false;
-
+    // The rate contract was settled in prepareModel() — acceptsModelRate() reads no stage state, so a
+    // handle that exists is one this stage takes. Nothing about a rate is decided here any more.
     auto backend = std::move (model->backend);
     backend->bindNormalize (impl->normalize);
     // Prepared for other numbers than this stage runs at: the same work again, here — the rare case
     // of a rate change between the two halves, at the cost a one-call load always paid.
-    if (std::abs (backend->preparedSampleRate() - impl->hostSR) > 0.5 || backend->preparedMaxBlock() != impl->maxBlock)
-    {
+    //
+    // 🔴 THE TEST IS EXACT, AND IT USED TO BE A HALF-HERTZ TOLERANCE. Two tolerances of the same size
+    // do not compose: this one decided whether the backend's rate-match is still VALID, while
+    // rateMatch() decided what that rate-match IS, and a host rate landing between them left a backend
+    // answering for a rate it is not installed into. Measured on the base commit — backend prepared for
+    // host 48000.4 installed into a stage at 48000.6: accepted, reports 0 samples where the policy
+    // charges 64; the mirror (prepared 48000.6, stage 48000.4) reports 64 where the policy charges 0.
+    // Equality is the only spelling under which "what the stage reports IS rateMatch(hostSR, tag)"
+    // holds with no argument, and it costs a re-prepare only when a host hands two different doubles
+    // for one rate — the cost the one-call load pays every time anyway.
+    // Re-preparation also changes model state: NAM's LSTM Reset adds another prewarm to the existing
+    // cell. Prepared at 48000.1 and installed at 48000.2 (block 512), the decaying-cell fixture starts
+    // at 0.0548291542 instead of 0.1600718498, although both configurations report zero latency.
+    // A matching prepareModel+install does one prewarm; a mismatch does two. See plan 1 in the review.
+    if (backend->preparedSampleRate() != impl->hostSR || backend->preparedMaxBlock() != impl->maxBlock)
         backend->prepare (impl->hostSR, impl->maxBlock, 2);
-        if (! backend->prepared())
-            return false;
-    }
+    // 🔴 AND THE VERDICT IS CHECKED WHETHER OR NOT WE RE-PREPARED. It used to be checked only inside
+    // that branch, which was safe by an invariant nobody stated: `prepareModel()` returns null for a
+    // backend that failed to prepare, so an unprepared one could not reach here. `preparedSampleRate()`
+    // reports the rate the backend was ASKED for, not one it honoured, so a handle prepared for exactly
+    // this stage's numbers takes the skip path — and if that preparation had failed, the skip would
+    // install a passthrough that reports a model and no latency. Nothing reaches it today; the check
+    // costs a load of an already-loaded bool and stops depending on a guarantee two functions away.
+    if (! backend->prepared())
+        return false;
 
     // Accepted — from here the load is GUARANTEED to apply. Park it as the (single, last-wins)
     // pending intent and try to land it now: the normal path lands immediately; only a full
@@ -592,11 +678,45 @@ NamStage::RateMatch NamStage::rateMatch (double hostSR, double modelSR) noexcept
 {
     RateMatch r {};
     r.modelRunSR = (modelSR > 0.0 ? modelSR : kModelSampleRate);
-    r.resampling = std::abs (hostSR - r.modelRunSR) > 0.5;
+    r.resampling = std::abs (hostSR - r.modelRunSR) > kModelRateTolerance;
     r.latencySamples = r.resampling
         ? (int) std::lround (felitronics::core::StreamResampler::pairDelayHostSamples (hostSR, r.modelRunSR))
         : 0;
     return r;
+}
+
+// The rate contract, spelled ONCE and through the owner of the tolerance rather than beside it: this
+// stage takes a model exactly when a factory-rate host would run it without a resampler. The `<= 0`
+// normalisation is rateMatch()'s too, so an untagged capture is accepted here for the same reason it
+// runs at kModelSampleRate there — one sentence, one place, no second copy to fall out of step.
+bool NamStage::acceptsModelRate (double modelSR) noexcept
+{
+    return ! rateMatch (kModelSampleRate, modelSR).resampling;
+}
+
+// The worst an accepted model can cost this host — the number a consumer sizes a fixed delay line
+// from. `pairDelayHostSamples` is monotonically DECREASING in the model rate (the return leg is
+// converted at hostSR/modelSR) and the accepted window's low edge is kModelSampleRate -
+// kModelRateTolerance, so one evaluation there dominates every accepted model and no search is needed.
+// Asking at the NOMINAL rate instead — which is what a consumer does when it derives its own number
+// from kModelSampleRate — reads up to 0.0208 samples short at a 3 MHz host, and a shortfall of any
+// size is a delay line that clamps in silence.
+//
+// 🔴 IT ASKS THE GEOMETRY, NOT rateMatch(), AND THAT IS DELIBERATE. rateMatch's answer is zero
+// whenever the two rates are within half a hertz, and that gate depends on the MODEL rate as well as
+// the host's — so the window's low edge is not always the worst cell of rateMatch: at a 47999.5 Hz host
+// the low edge costs nothing while the window's HIGH edge resamples and costs 64. Taking the geometry
+// at the low edge is >= every accepted model's reported latency at every host, gate or no gate, which
+// is the property a ring needs. As a BOUND it holds everywhere; as an attained maximum it has two
+// exceptions, and both are stated because "exact" was claimed here once with only the first in mind:
+// a host at exactly kModelSampleRate, where no accepted model resamples at all and the true maximum is
+// 0 (64 slots of a ring, paid so the rule has no exception in the code); and any host so slow that no
+// backend can be PREPARED for it at all, where the stage stays at zero because it never runs. This is
+// a policy answer about rates, not a promise about a particular prepared instance.
+int NamStage::maxLatencySamples (double hostSR) noexcept
+{
+    return (int) std::lround (felitronics::core::StreamResampler::pairDelayHostSamples (
+                                  hostSR, kModelSampleRate - kModelRateTolerance));
 }
 
 int    NamStage::latencySamples()   const { return impl->stage.latencySamples(); }

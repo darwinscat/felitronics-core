@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,6 +33,8 @@ void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 namespace
 {
+constexpr double kPi = 3.14159265358979323846;   // house convention: M_PI is not portable (MSVC)
+
 std::string firModel (const char* sampleRate = "48000", const char* metadata = "")
 {
     std::string json =
@@ -54,6 +57,47 @@ std::string gainModel (const char* sampleRate = "48000", const char* metadata = 
         json += std::string (R"(,"metadata":)") + metadata;
     json += '}';
     return json;
+}
+
+// 🔴 THE ONE STATEFUL CAPTURE IN THIS FILE, AND IT EXISTS BECAUSE EVERYTHING ELSE HERE IS NOT. Every
+// other model below is a `Linear` — an FIR whose state after any prewarm on silence is exactly zeros —
+// so no fixture built on them can see how LONG the prewarm ran. That length is decided by the block
+// handed to NAM's `Reset`, which is `maxModelFrames`, so a whole class of sizing changes was invisible
+// to this suite: a mutation round ran it twice against a survivor and twice reported "equivalent",
+// which was WRONG and only became visible once this fixture existed.
+//
+// One LSTM cell, arranged so its state on silence neither settles nor explodes:
+//   W = 0 (4x2), b = [i,f,g,o] = [0, 10, 0, 0], h0 = 0, c0 = 1, head weight 1, head bias 0.
+// With W = 0 and silence, `ifgo` IS `b`, so the recurrence collapses to c <- sigmoid(10)*c and
+// h = sigmoid(0)*tanh(c) = 0.5*tanh(c): a decay with a time constant of ~20000 samples, which is the
+// same order as the half second NAM prewarms an LSTM for. The first output after the prewarm is
+// therefore 0.5*tanh(sigmoid(10)^N) with N the prewarm length — a direct readout of the Reset block.
+//
+// PORTABILITY, because a pinned value has to survive three libms: the sigmoid's argument is CONSTANT,
+// so the state is one libm result raised to an integer power by repeated multiplication. A one-ulp
+// difference in that single `exp` drifts the product by ~1e-11 over 24000 steps, four orders below the
+// ~1e-3 the mutations here move — hence the 1e-6 tolerances used against these pins.
+std::string lstmModel (const char* sampleRate = "48000")
+{
+    return std::string (R"({"version":"0.5.0","architecture":"LSTM","config":{"num_layers":1,)"
+                        R"("input_size":1,"hidden_size":1},)"
+                        R"("weights":[0,0,0,0,0,0,0,0,0,10,0,0,0,1,1,0],"sample_rate":)")
+           + sampleRate + "}";
+}
+
+// 🔴 AND THE SECOND ORACLE, OF A DIFFERENT CONSTRUCTION — the house rule, and here it is not decoration.
+// The group below pins the model's outputs as LITERALS, which is the right shape for a value that must
+// not move when the code does; this one COMPUTES what the same silence should leave behind, from the
+// two facts the fixture is built on (sigmoid(10) per sample, 0.5*tanh at the head) and a prewarm length
+// the caller states. A pin catches a number that moved; this catches a number that moved for a reason
+// the pin's author did not have in mind — and a pre-merge round wrote it precisely because the pins
+// alone let three mutants through.
+float stateAfterSilence (int samples)
+{
+    const float forget = 1.0f / (1.0f + std::exp (-10.0f));
+    float cell = 1.0f;
+    for (int i = 0; i < samples; ++i) cell *= forget;
+    return 0.5f * std::tanh (cell);
 }
 
 std::string scalarModel (int id, bool withLoudness)
@@ -761,6 +805,695 @@ int main()
         }
     }
 
+    test::group ("🔴 THE RATE CONTRACT IS A FIXED WINDOW — the reference cannot move (P38)");
+    {
+        // WHAT THE CONTRACT PROMISES, as the property and not as the threshold: in every reachable
+        // state, a model this stage holds was tagged within kModelRateTolerance of kModelSampleRate —
+        // the SAME window on the first load and on the ten-thousandth. It used to be a window around
+        // the last ACCEPTED tag, which prepare() then adopted, so the window WALKED. Measured on the
+        // base commit, half-hertz steps down, host 48000: {load} 1 step, {load, process} 1 step,
+        // {load, prepare} 66 (stopped by the retire queue, not by rates), {load, process, prepare}
+        // 5000 with no refusal at all — run rate 45500.0. The magnitude that settles it is the
+        // excursion sup|runRate - kModelSampleRate|: UNBOUNDED before, kModelRateTolerance after.
+        using nam::NamStage;
+
+        // 1. The predicate itself, at both edges. By hand: the window is closed at both ends because
+        //    the gate it delegates to refuses only PAST half a hertz, and a model that reports no rate
+        //    normalises INTO the window rather than being judged against zero.
+        struct A { double tag; bool want; const char* why; };
+        for (const A a : { A { 48000.0,    true,  "the factory rate" },
+                           A { 48000.5,    true,  "the high edge is INSIDE — the gate refuses past 0.5, not at it" },
+                           A { 47999.5,    true,  "…and so is the low edge" },
+                           A { 48000.5001, false, "a ten-thousandth of a hertz past the high edge" },
+                           A { 47999.4999, false, "…and past the low edge" },
+                           A { 44100.0,    false, "44.1 kHz, outright" },
+                           A { 96000.0,    false, "96 kHz, outright" },
+                           A { 0.0,        true,  "a model reporting no rate runs at the factory one" },
+                           A { -1.0,       true,  "…which is what an untagged capture actually reports" } })
+            test::ok (NamStage::acceptsModelRate (a.tag) == a.want,
+                      "acceptsModelRate(" + std::to_string (a.tag) + ") = "
+                      + (NamStage::acceptsModelRate (a.tag) ? "true" : "false") + " — " + a.why);
+        // 🔴 AND THE EDGE IS PINNED AT THE EDGE, not a ten-thousandth of a hertz past it. A pre-merge
+        // round found that a tolerance of 0.50001 — an excess ten times smaller than the cells
+        // above resolve — passes every one of them while admitting a tag of 48000.500005. `nextafter`
+        // is the only spelling that says "closed HERE"; 48000.5001 says "closed somewhere below here".
+        test::ok (NamStage::acceptsModelRate (48000.5) && NamStage::acceptsModelRate (47999.5)
+                      && ! NamStage::acceptsModelRate (std::nextafter (48000.5, 1.0e9))
+                      && ! NamStage::acceptsModelRate (std::nextafter (47999.5, 0.0)),
+                  "the window is closed at exactly [47999.5, 48000.5]: one ulp past either edge is "
+                  "refused; the first representable tags beyond both edges are excluded");
+        test::ok (NamStage::acceptsModelRate (std::numeric_limits<double>::quiet_NaN()),
+                  "a NaN tag is not a rate at all: it takes the untagged door, exactly as rateMatch's "
+                  "normalisation says it must — stated because the guard is `> 0.0`, which is FALSE "
+                  "for a NaN, and that is easy to read the other way round");
+
+        // 2. The same four edges through the real load path, BOTH entry points — the predicate being
+        //    right is worth nothing if the loader asks it a different question.
+        for (const A a : { A { 48000.5,    true,  "" }, A { 47999.5,    true,  "" },
+                           A { 48000.5001, false, "" }, A { 47999.4999, false, "" } })
+        {
+            char tag[32];
+            std::snprintf (tag, sizeof tag, "%.10g", a.tag);
+            const auto json = gainModel (tag);
+            NamStage one;   one.prepare (48000.0, 64);
+            const bool fused = one.loadModelFromMemory (json.data(), json.size());
+            NamStage two;   two.prepare (48000.0, 64);
+            auto handle = NamStage::prepareModel (json.data(), json.size(), 48000.0, 64);
+            const bool split = handle != nullptr && two.install (std::move (handle));
+            test::ok (fused == a.want && split == a.want,
+                      std::string ("a model tagged ") + tag + " loads=" + (fused ? "1" : "0")
+                          + " through loadModelFromMemory and " + (split ? "1" : "0")
+                          + " through prepareModel+install, want " + (a.want ? "1" : "0")
+                          + " — and the two halves agree, which is what makes the gate's new home safe");
+        }
+
+        // 3. THE LADDER, which is the defect itself: the four modes of the probe, as a test. A single
+        //    cell cannot see this — the first step is ACCEPTED in every one of them, and it is the
+        //    SECOND that separates a fixed window from a walking one.
+        {
+            struct M { bool audio, prep; const char* name; };
+            std::vector<float> l (64, 0.1f), r (64, 0.1f);
+            float* io[2] { l.data(), r.data() };
+            for (const M m : { M { false, false, "load only" },
+                               M { true,  false, "load + audio" },
+                               M { false, true,  "load + prepare" },
+                               M { true,  true,  "load + audio + prepare (what a DAW does)" } })
+            {
+                NamStage s;
+                s.prepare (48000.0, 64);
+                double asked = 48000.0;
+                int steps = 0;
+                for (int i = 0; i < 64; ++i)          // 64 is far past the 1 a fixed window allows
+                {
+                    char tag[32];
+                    std::snprintf (tag, sizeof tag, "%.10g", asked - 0.5);
+                    const auto json = gainModel (tag);
+                    if (! s.loadModelFromMemory (json.data(), json.size()))
+                        break;
+                    ++steps;
+                    asked -= 0.5;
+                    if (m.audio) test::run (s.process (io, 2, 64, false));
+                    if (m.prep)  s.prepare (48000.0, 64);
+                }
+                test::ok (steps == 1 && NamStage::acceptsModelRate (s.modelSampleRate()),
+                          std::string (m.name) + ": " + std::to_string (steps)
+                              + " accepted half-hertz steps (want 1 — the first is inside the window, "
+                                "the second is not), run rate now " + std::to_string (s.modelSampleRate()));
+            }
+        }
+
+        // 4. …AND THE COST OF THE WALK WAS THE OPPOSITE OF WHAT IT LOOKED LIKE. A walked stage did not
+        //    accept MORE, it accepted ELSEWHERE: at 47900 it refused an ordinary 48000 capture. So the
+        //    fix cannot be checked only by what it now refuses — check what it keeps.
+        {
+            NamStage s;
+            s.prepare (48000.0, 64);
+            std::vector<float> l (64, 0.1f), r (64, 0.1f);
+            float* io[2] { l.data(), r.data() };
+            int accepted = 0;
+            for (int i = 0; i < 200; ++i)             // 200 steps: enough to reach 47900 on the base
+            {
+                char tag[32];
+                std::snprintf (tag, sizeof tag, "%.10g", 48000.0 - 0.5 * (i + 1));
+                const auto json = gainModel (tag);
+                if (s.loadModelFromMemory (json.data(), json.size()))
+                    ++accepted;                       // no break: every step is ATTEMPTED, which is what
+                test::run (s.process (io, 2, 64, false));   // the claim below says, and a loop that
+                s.prepare (48000.0, 64);              // stopped at the first refusal would not say it
+            }
+            test::ok (accepted == 1, "precondition: of 200 attempted half-hertz steps exactly "
+                                         + std::to_string (accepted) + " was accepted — the first, which "
+                                         "is inside the window; the fixture is live and the walk is not");
+            const auto plain = gainModel ("48000");
+            test::ok (s.loadModelFromMemory (plain.data(), plain.size()) && s.modelSampleRate() == 48000.0,
+                      "…and after all 200 an ordinary 48000 capture still loads — on the base commit "
+                      "the stage had walked to 47900 by then and refused it");
+        }
+
+        // 5. THE INVARIANT, over sequences rather than cells: whatever order the public verbs come in,
+        //    a held model is inside the window and the reported latency IS the policy's answer for the
+        //    stage's own host rate. The second half is what F21 broke, and it is checked after EVERY
+        //    step rather than at the end, because a wrong latency heals on the next re-prepare.
+        {
+            const double hosts[] = { 48000.0, 44100.0, 96000.0, 48000.4, 48000.6, 192000.0 };
+            // 🔴 THE ALPHABET IS THE FIXTURE HERE, and a diverse-testing round showed the first draft's
+            // was blind: every tag in it lay INSIDE the window, so on the base commit — where the
+            // reference walked — the walk could only ever reach the same three rates and the window
+            // check could not fail. "47999" and "48001" are what make it bite: on the base, a held
+            // 47999.5 plus a prepare() moves the reference and 47999 is then accepted, which is exactly
+            // the state this invariant says is unreachable.
+            const char*  tags[]  = { "48000", "47999.5", "48000.5", "47999", "48001", "44100", "96000",
+                                     nullptr, "0" };
+            std::uint32_t rng = 0x38u;
+            auto next = [&rng] { rng = rng * 1664525u + 1013904223u; return rng >> 16; };
+            std::vector<float> l (64, 0.05f), r (64, 0.05f);
+            float* io[2] { l.data(), r.data() };
+            NamStage s;
+            double host = 48000.0;
+            s.prepare (host, 64);
+            int held = 0, window = 0, latency = 0;
+            for (int step = 0; step < 400; ++step)
+            {
+                // An alphabet alone does not exercise a sequence. With the original seed,
+                // main passed both invariants in all 128 held states despite the added tags.
+                // Force load(low edge), prepare, load(outside) before the random suffix.
+                if (step == 0 || step == 2)
+                {
+                    const auto json = gainModel (step == 0 ? "47999.5" : "47999");
+                    (void) s.loadModelFromMemory (json.data(), json.size());
+                }
+                else if (step == 1) s.prepare (host, 64);
+                else switch (next() % 5u)
+                {
+                    case 0: host = hosts[next() % 6u]; s.prepare (host, 64); break;
+                    case 1: { const char* t = tags[next() % 9u];
+                              const auto json = gainModel (t);
+                              (void) s.loadModelFromMemory (json.data(), json.size()); } break;
+                    case 2: test::run (s.process (io, 2, 64, false)); break;
+                    case 3: s.clearModel(); break;
+                    default: (void) s.collectGarbage(); break;
+                }
+                if (s.hasModel())
+                {
+                    ++held;
+                    if (NamStage::acceptsModelRate (s.modelSampleRate())) ++window;
+                    if (s.latencySamples() == NamStage::rateMatch (host, s.modelSampleRate()).latencySamples)
+                        ++latency;
+                }
+            }
+            test::ok (held > 100, "precondition: the sequence checked more than 100 held-model states — "
+                                  + std::to_string (held) + " of 400 steps, so the two checks below ran");
+            test::ok (window == held, "…in every one of those states the held model is inside the window ("
+                                      + std::to_string (window) + "/" + std::to_string (held) + ")");
+            test::ok (latency == held, "…and in every one the reported latency IS rateMatch(hostSR, tag) ("
+                                       + std::to_string (latency) + "/" + std::to_string (held)
+                                       + ") — the property F21 broke");
+        }
+
+        // 6. F21 SPELLED OUT AS CELLS, because the invariant above would pass on a stage that simply
+        //    re-prepared everything always. These are the cells where the two half-hertz tolerances
+        //    straddle: a backend prepared for one host installed into a stage running another.
+        {
+            struct C { double preparedFor, stageHost; int want; const char* why; };
+            for (const C c : { C { 48000.4, 48000.6, 64, "0.2 Hz apart: the skip used to keep a rate-match computed for the WRONG host — reported 0" },
+                               C { 48000.3, 48000.7, 64, "0.4 Hz apart: the same door, one step wider" },
+                               C { 48000.6, 48000.4,  0, "the MIRROR — this one used to over-report, charging 64 where the policy charges none" },
+                               C { 48000.0, 48000.6, 64, "0.6 Hz apart: outside the old tolerance, so this cell was RIGHT before and must stay right" },
+                               C { 48000.0, 48000.5,  0, "…and inside it, where the answers happen to agree" },
+                               // 🔴 THE CELL THAT SEPARATES "EXACT" FROM "A SMALLER TOLERANCE". A
+                               // pre-merge round pointed out that every row above also passes with a
+                               // 1e-6 tolerance in place of equality — the rows are all further apart
+                               // than that. These two straddle the policy's own boundary by a
+                               // quarter-millionth of a hertz on either side, so a 1e-6 test misses them.
+                               // The adjacent-double rows below resolve the boundary further.
+                               C { 48000.49999975, 48000.50000025, 64,
+                                   "half a millionth of a hertz apart, straddling the gate: exact "
+                                   "reconfigures; a 1e-6 tolerance does not" },
+                               C { 48000.5, std::nextafter (48000.5, 1.0e9), 64,
+                                   "adjacent representable hosts straddle the gate" },
+                               C { std::nextafter (48000.5, 1.0e9), 48000.5, 0,
+                                   "the adjacent-host mirror must remove the converter" } })
+            {
+                NamStage s;
+                s.prepare (c.stageHost, 64);
+                const auto json = gainModel ("48000");
+                auto handle = NamStage::prepareModel (json.data(), json.size(), c.preparedFor, 64);
+                const bool ok = handle != nullptr && s.install (std::move (handle));
+                test::ok (ok && s.latencySamples() == c.want,
+                          "prepared for host " + std::to_string (c.preparedFor) + ", installed into "
+                              + std::to_string (c.stageHost) + ": reports "
+                              + std::to_string (s.latencySamples()) + ", want " + std::to_string (c.want)
+                              + " — " + c.why);
+            }
+        }
+
+        // 7. maxLatencySamples: the consequence the contract owes a consumer sizing a ring. Values by
+        //    hand from the two documented facts — kHalf per leg, the return leg converted at h/m — at
+        //    the window's LOW edge 47999.5, rounded to nearest, and NOT by asking the code.
+        struct L { double h; int want; const char* why; };
+        for (const L x : { L {  48000.0,   64, "32 + 32*48000/47999.5 = 64.000333" },
+                           L {  44100.0,   61, "32 + 29.400306 = 61.400306" },
+                           L {  96000.0,   96, "32 + 64.000667 = 96.000667" },
+                           L { 192000.0,  160, "32 + 128.001333" },
+                           L { 384000.0,  288, "32 + 256.002667" },
+                           L { 3.0e6,    2032, "32 + 2000.020834 — the house ceiling for a host rate" },
+                           L { 2999249.0, 2032, "🔴 THE CELL THAT SEPARATES THE TWO DERIVATIONS: asking at "
+                                                "the NOMINAL 48000 gives 2031 here, and a ring sized from that "
+                                                "clamps an accepted model by one sample, in silence" } })
+            test::ok (NamStage::maxLatencySamples (x.h) == x.want,
+                      "maxLatencySamples(" + std::to_string (x.h) + ") = "
+                          + std::to_string (NamStage::maxLatencySamples (x.h)) + ", want "
+                          + std::to_string (x.want) + " — " + x.why);
+        test::ok (NamStage::maxLatencySamples (2999249.0)
+                      > nam::NamStage::rateMatch (2999249.0, nam::NamStage::kModelSampleRate).latencySamples,
+                  "…and that cell is a real difference, not a restatement: the nominal rate answers "
+                  + std::to_string (nam::NamStage::rateMatch (2999249.0, nam::NamStage::kModelSampleRate).latencySamples)
+                  + " where the window's low edge answers "
+                          + std::to_string (NamStage::maxLatencySamples (2999249.0)));
+        // Exact half-integers at the low accepted tag expose even a tiny upward nudge
+        // of the tag used to size the ring. A sweep of ordinary rates cannot see it.
+        for (const double h : { 48749.4921875, 96748.9921875, 191248.0078125, 2999218.7578125 })
+            test::ok (NamStage::maxLatencySamples (h)
+                          >= NamStage::rateMatch (h, 47999.5).latencySamples,
+                      "the bound covers a low-edge model at a half-integer rounding boundary");
+        // …and the bound really is a BOUND: sweep the window against it at every shipped host rate.
+        {
+            int checked = 0, covered = 0, hosts = 0, tightHosts = 0;
+            for (const double h : { 8000.0, 11025.0, 16000.0, 22050.0, 32000.0, 44100.0, 47999.0, 48000.0,
+                                    48000.4, 48000.6, 48001.0, 88200.0, 96000.0, 176400.0, 192000.0,
+                                    352800.0, 384000.0, 2999249.0, 3.0e6 })
+            {
+                const int bound = NamStage::maxLatencySamples (h);
+                bool attainedHere = false;
+                for (int k = 0; k <= 20; ++k)             // the whole window, in twentieths
+                {
+                    const double m = 47999.5 + 0.05 * k;
+                    const int rep = NamStage::rateMatch (h, m).latencySamples;
+                    ++checked;
+                    if (rep <= bound) ++covered;
+                    if (rep == bound) attainedHere = true;
+                }
+                ++hosts;
+                if (attainedHere) ++tightHosts;
+            }
+            test::ok (covered == checked, "the bound covers every model rate in the window at every "
+                                          "shipped host: " + std::to_string (covered) + "/"
+                                          + std::to_string (checked));
+            // 🔴 TIGHT PER HOST, NOT IN AGGREGATE. A pre-merge round pointed out that "attained
+            // somewhere" is satisfied by inflating the bound at every host but one, which is precisely
+            // the failure a tightness check exists to catch. The exception is the single host where the
+            // whole window is inside the resampling gate — hostSR exactly kModelSampleRate — and it is
+            // named rather than tolerated.
+            test::ok (tightHosts == hosts - 1,
+                      "…and the bound is attained AT EVERY HOST but one: " + std::to_string (tightHosts)
+                          + " of " + std::to_string (hosts) + ", the exception being hostSR exactly "
+                            "48000, where no accepted model resamples and the true maximum is 0");
+        }
+    }
+
+    test::group ("🔴 THE MODEL SCRATCH IS SIZED FOR THE PATH THAT RUNS, not for a ratio (P38)");
+    {
+        using nam::NamStage;
+        // The scratch used to be `ceil(maxBlock * modelRunSR / max(8000, hostSR)) + 16`, and that one
+        // number was asked to serve two paths that need different ones. Both halves were measured
+        // wrong, and both were silent.
+
+        // 🔴 HALF ONE — PAST THE END OF THE HEAP. With no resampler the model is clocked by the HOST,
+        // so a whole chunk of maxBlock host samples is copied into the scratch and the ratio never
+        // enters. A tag half a hertz BELOW the host is inside the acceptance window (the acceptance
+        // gate and the resampling gate are the same half hertz), so the ratio is just under one and
+        // the scratch came out just under maxBlock. Short by `maxBlock*(h-m)/h - 16` samples, so the
+        // first failing block is 34*hostSR = 34 SECONDS of audio in one call — which law 11(a)
+        // explicitly invites an offline caller to pass. Measured on the base commit under ASan at
+        // maxBlock 2000000: heap-buffer-overflow, a WRITE of 8000000 bytes into a 7999984-byte region.
+        // This cell is at the first undersized block rather than comfortably past it, so it also pins
+        // WHERE the threshold is; the CI sanitizer job builds nam, so the mutant dies there by name.
+        {
+            const int blk = 1632000;                      // 34 * 48000, by the derivation above
+            NamStage s;
+            s.prepare (48000.0, blk);
+            const auto json = gainModel ("47999.5");      // the window's low edge: accepted, not resampled
+            test::ok (s.loadModelFromMemory (json.data(), json.size()),
+                      "precondition: the low-edge tag loads at a 34-second block");
+            test::ok (s.latencySamples() == 0,
+                      "precondition: and it runs with NO resampler — the direct path is the one under "
+                      "test, not the converted one");
+            std::vector<float> in ((std::size_t) blk);
+            for (int i = 0; i < blk; ++i)                 // a signal whose every sample is distinct, so
+                in[(std::size_t) i] = (float) ((i % 2039) - 1019) * (1.0f / 2048.0f);   // a stale slot shows
+            std::vector<float> io = in;
+            float* p[1] { io.data() };
+            test::run (s.process (p, 1, blk, false));
+            std::size_t wrong = 0, first = 0;
+            for (std::size_t i = 0; i < in.size(); ++i)
+                if (io[i] != in[i]) { if (wrong == 0) first = i; ++wrong; }
+            test::ok (wrong == 0, "a unity capture returns a 34-second block sample for sample — "
+                                  + std::to_string (wrong) + " samples differ"
+                                  + (wrong ? ", first at " + std::to_string (first) : std::string()));
+        }
+
+        // 🔴 HALF THREE — AND WHAT REPLACED THE ASSUMED RATE IS A REFUSAL, NOT ANOTHER SUBSTITUTE.
+        // A host rate that cannot size a conversion has no honest frame count, and there are two ways
+        // to answer that: invent one — which is what `max(8000, hostSR)` did, and it cost the samples
+        // measured below — or say so. This says so, through the mechanism the class already had for a
+        // preparation it cannot honour: the backend stays unprepared, so the LOAD FAILS visibly at the
+        // call, with the stage untouched and still passing audio through.
+        //
+        // BEHAVIOUR CHANGE, stated rather than left to be discovered: at these rates a load used to
+        // SUCCEED and then produce garbage or silence, and at the far end it converted an out-of-range
+        // double to an int, which is undefined. Nothing shipped reaches them — rigplayer maps every
+        // host outside (0, 3e6] to the factory rate before the stage sees it — and with a 512-sample
+        // block the arithmetic lower limit is about 0.023 Hz; that is not a promise that allocation
+        // succeeds or that StreamResampler supports the ratio (its limit is 1e6:1).
+        {
+            struct R { double fs; bool want; const char* why; };
+            for (const R r : { R { 48000.0, true,  "the factory host, for contrast" },
+                               R {     0.0, false, "zero: there is no ratio, so there is no frame count" },
+                               R {-48000.0, false, "negative: the same, and it used to be floored to 8 kHz" },
+                               // 🔴 THE NEGATIVE HOST THAT THE ARITHMETIC ALONE LETS THROUGH, and the
+                               // reason the guard is written as a rate test rather than a frame-count
+                               // test. At -2000000 the converted term is -12 and the slack of 16 makes
+                               // it a positive, perfectly representable 4 — so a rule that inspects only
+                               // the result accepts it. -48000 gives -496 and is refused, which is how a
+                               // wrong rule looks right on the cell you happened to try; a mutation
+                               // round deleted the guard and this suite stayed green without this cell.
+                               R {-2000000.0, false, "the slack outweighs the negative converted term: 4 frames for a rate that converts nothing" },
+                               R {   -1.0e7, false, "…and it is not one freak value either" },
+                               R {   1e-30, false, "a host so slow one block converts to more frames than the arithmetic holds" },
+                               R {    0.01, false, "…and the boundary is a RATE, not a special value: 0.01 Hz is refused" },
+                               R {    1.0,  true,  "…while 1 Hz is absurd but sizeable, and IS honoured" } })
+            {
+                nam::NamStage s;
+                s.prepare (r.fs, 512);
+                const auto json = gainModel ("48000");
+                const bool ok = s.loadModelFromMemory (json.data(), json.size());
+                test::ok (ok == r.want, "a load at host " + std::to_string (r.fs) + " returns "
+                                            + (ok ? "true" : "false") + ", want "
+                                            + (r.want ? "true" : "false") + " — " + r.why);
+                std::vector<float> b (8, 0.25f);
+                float* io[1] { b.data() };
+                const bool ran = s.process (io, 1, 8, false);
+                // A REFUSED load leaves the stage empty, and an empty stage is a passthrough — that is
+                // what makes the refusal safe rather than merely honest. An ACCEPTED one is only asked
+                // to run: at a 1 Hz host it runs THROUGH a rate-matcher at a ratio of 48000, and
+                // demanding 0.25 back from that would be asserting the resampler's arithmetic in a
+                // group about refusals. (The first draft did demand it, and this row is where it fell.)
+                test::ok (ran && (ok || b[0] == 0.25f),
+                          std::string ("…the stage answers process() ") + (ok ? "with its model" : "")
+                              + (ok ? "" : "and a refused load leaves the audio alone"));
+            }
+            // 🔴 AND THE BLOCK RIDES THE SAME ARITHMETIC, so it is held to the same ceiling — which is
+            // not decoration either: `maxBlock * 2 + 16` is handed to the down-converter, and past
+            // (INT_MAX-16)/2 that expression overflowed, quietly, on the base commit. The refusal costs
+            // nothing to test because it happens BEFORE a byte is allocated.
+            {
+                nam::NamStage big;
+                big.prepare (48000.0, 1073741816);        // (INT_MAX - 16)/2 + 1
+                const auto json = gainModel ("48000");
+                test::ok (! big.loadModelFromMemory (json.data(), json.size()),
+                          "a block one past (INT_MAX-16)/2 is refused rather than doubled into an "
+                          "overflow one line later");
+                nam::NamStage ok2;
+                ok2.prepare (48000.0, 1024);
+                test::ok (ok2.loadModelFromMemory (json.data(), json.size()),
+                          "…precondition: an ordinary block at the same host still loads, so the row "
+                          "above is the ceiling and not a broken fixture");
+            }
+
+            // 🔴 AND THE SAME REFUSAL REACHES install(), WHICH IS WHERE IT WAS UNGATED. A diverse-testing
+            // round deleted install()'s verdict check and the whole suite stayed green: the check had
+            // been guarded only by an invariant two functions away (prepareModel returns null for a
+            // backend that failed), and nothing asserted the case where the RE-preparation is the one
+            // that fails. A handle prepared for a host this stage can honour, installed into a stage
+            // whose host it cannot, must be refused with the stage left empty — not installed as a
+            // model that reports itself present and passes audio through.
+            for (const double bad : { 0.0, -48000.0, 1e-30 })
+            {
+                nam::NamStage s;
+                s.prepare (bad, 64);
+                const auto json = gainModel ("48000");
+                auto handle = nam::NamStage::prepareModel (json.data(), json.size(), 48000.0, 64);
+                test::ok (handle != nullptr,
+                          "precondition: the handle itself prepares fine at 48000 — the refusal below "
+                          "belongs to the STAGE's host rate, not to the model");
+                test::ok (! s.install (std::move (handle)) && ! s.hasModel(),
+                          "a handle prepared at 48000 and installed into a stage at host "
+                              + std::to_string (bad) + " is refused, and the stage stays empty");
+                std::vector<float> b (8, 0.25f);
+                float* io[1] { b.data() };
+                test::ok (s.process (io, 1, 8, false) && b[0] == 0.25f,
+                          "…and an empty stage passes its audio through untouched");
+            }
+
+            // 🔴 THE BLOCK'S OWN CEILING, ON THE BRANCH WHERE IT IS THE ONLY THING THAT BINDS. At a host
+            // far above the model rate the converted frame count is tiny — 68 at a 1e12 Hz host — so
+            // `frames <= kMaxFrames` passes and only the clause about maxBlock stops `maxBlock * 2 + 16`
+            // from overflowing. The cell above (a 48 kHz host) cannot reach this clause at all, because
+            // there `frames` IS maxBlock. Named by a diverse-testing round, which deleted the clause and
+            // watched the suite stay green.
+            {
+                nam::NamStage far;
+                far.prepare (1e12, 1073741816);
+                const auto json = gainModel ("48000");
+                test::ok (! far.loadModelFromMemory (json.data(), json.size()),
+                          "a 1.07e9-sample block at a 1e12 Hz host is refused — the converted count is "
+                          "68 and passes, so this is the maxBlock clause and nothing else");
+                nam::NamStage near;
+                near.prepare (1e12, 1024);
+                test::ok (near.loadModelFromMemory (json.data(), json.size()),
+                          "…precondition: the same absurd host with an ordinary block still loads, so "
+                          "the row above is the block ceiling and not the host");
+            }
+
+            // The precondition without which the rows above would be worthless: an INFINITE host is a
+            // different animal and is deliberately NOT refused — its ratio is zero, which is a number,
+            // and what it then REPORTS belongs to rateMatch's documented platform-specific regimes.
+            // Stated so nobody reads this group as "absurd rates are refused".
+            nam::NamStage e;
+            e.prepare (std::numeric_limits<double>::infinity(), 512);
+            const auto json = gainModel ("48000");
+            test::ok (e.loadModelFromMemory (json.data(), json.size()),
+                      "an infinite host still loads — the refusal is about a frame count that cannot "
+                      "be represented, not about a rate looking unreasonable");
+        }
+
+        // 🔴 HALF TWO — AN ASSUMED HOST RATE, AND THE SAMPLES IT LOSES. `max(8000, hostSR)` put a
+        // substitute rate into the sizing, so below 8 kHz a block converted to more model frames than
+        // fit and produceAvailable() dropped the surplus without a word. Measured on the base commit
+        // with a unity capture and a 100 Hz tone: -1.22 dB at a 6 kHz host, -3.00 at 4 kHz, -6.05 at
+        // 2 kHz, -9.09 at 1 kHz — and exactly 0.00 at 8 kHz, the floor's own edge, which is what
+        // identified the floor rather than the resampler as the cause. Every one of those rates is
+        // accepted by rigplayer::RigPlayer::usableSampleRate.
+        {
+            struct H { double fs; double floorEdge; };
+            double worst = 0.0;
+            double atFloor = 0.0;
+            for (const double fs : { 1000.0, 2000.0, 4000.0, 6000.0, 8000.0 })
+            {
+                NamStage s;
+                s.prepare (fs, 512);
+                const auto json = gainModel ("48000");
+                test::ok (s.loadModelFromMemory (json.data(), json.size()),
+                          "precondition: a factory capture loads at a " + std::to_string ((int) fs)
+                              + " Hz host");
+                double si = 0.0, so = 0.0, corr = 0.0;
+                int counted = 0;
+                std::vector<float> l (512);
+                std::vector<float> whole, back;          // the full input and the full output, so the
+                whole.reserve (512 * 200); back.reserve (512 * 200);   // phase check can ALIGN them
+                float* p[1] { l.data() };
+                for (int off = 0; off < 512 * 200; off += 512)
+                {
+                    for (int i = 0; i < 512; ++i)
+                        l[(std::size_t) i] = (float) std::sin (2.0 * kPi * 100.0 * (off + i) / fs);
+                    whole.insert (whole.end(), l.begin(), l.end());
+                    if (off >= 512 * 100)
+                        for (int i = 0; i < 512; ++i) si += (double) l[(std::size_t) i] * l[(std::size_t) i];
+                    test::run (s.process (p, 1, 512, false));
+                    back.insert (back.end(), l.begin(), l.end());
+                    if (off >= 512 * 100)
+                    {
+                        for (int i = 0; i < 512; ++i) so += (double) l[(std::size_t) i] * l[(std::size_t) i];
+                        counted += 512;
+                    }
+                }
+                const double lossDb = 10.0 * std::log10 ((so / counted) / (si / counted));
+                // 🔴 ENERGY IS BLIND TO SIGN, and a pre-merge round said so: squaring the samples makes a
+                // polarity inversion identical to the truth. A correlation closes it — ALIGNED, because
+                // the stage is resampling here and reports 33 samples of it at a 1 kHz host, and an
+                // unaligned correlation reads NEGATIVE on a 100 Hz tone whose period is ten samples.
+                // (The first draft of this check did exactly that and failed on correct code at four of
+                // the five rates, which is what a phase-blind oracle looks like from the other side.)
+                const int lat = s.latencySamples();
+                for (std::size_t i = (std::size_t) (512 * 100 + lat); i < back.size(); ++i)
+                    corr += (double) back[i] * (double) whole[i - (std::size_t) lat];
+                test::ok (corr > 0.0, "…and the output is in PHASE with the input at "
+                                          + std::to_string ((int) fs) + " Hz once its own "
+                                          + std::to_string (lat) + " samples of rate-match delay are "
+                                          "taken out (correlation " + std::to_string (corr)
+                                          + ") — the energy figure above cannot tell an inversion "
+                                            "from a match");
+                if (fs == 8000.0) atFloor = lossDb;
+                else if (std::fabs (lossDb) > std::fabs (worst)) worst = lossDb;   // largest EXCURSION,
+                                                                                   // whatever its sign
+                test::ok (lossDb > -0.5,
+                          "a 100 Hz tone through a unity capture at a " + std::to_string ((int) fs)
+                              + " Hz host loses " + std::to_string (lossDb)
+                              + " dB, want better than -0.5 (the base commit lost up to -9.09)");
+            }
+            // 🔴 THE PRECONDITION THIS GROUP NEEDS IS ABOUT THE SWEEP'S REACH, NOT ABOUT ITS SIGN. A first
+            // draft asserted that the worst rate below 8 kHz still reads BELOW zero, and a
+            // diverse-testing round measured why that is not a property of anything under test: what is
+            // left at 1 kHz is the resampler kernel's own passband droop (-0.069 dB there, -0.045 at
+            // 2 kHz, -0.003 at 4 kHz and +0.0005 at 6 kHz — it changes SIGN across the sweep), so a
+            // flatter kernel would fail the precondition on perfectly correct code. What must be true
+            // is that the sweep straddles the rate the removed floor stood at; the residual belongs to
+            // the kernel and is asserted only as "small", by the -0.5 dB rows above.
+            test::ok (atFloor > -0.01 && std::fabs (worst) < 0.5,
+                      "precondition: the sweep straddles the old 8 kHz floor — 8 kHz itself reads "
+                      + std::to_string (atFloor) + " dB and the extreme below it reads "
+                      + std::to_string (worst) + ", both inside the kernel's own residual, so a fixture "
+                      "that only ran at or above the floor could not have seen the -9.09 dB at all");
+        }
+    }
+
+    test::group ("\U0001f534 THE RESET BLOCK IS PART OF THE CONTRACT — read out through a STATEFUL capture");
+    {
+        using nam::NamStage;
+        // WHY THIS GROUP EXISTS, and it is not a nicety. `maxModelFrames` is not only a buffer size: it
+        // is the block handed to NAM's `Reset`, and NAM prewarms in WHOLE blocks of it. So it decides
+        // how many samples of silence a capture is warmed with, and for anything with recurrent state
+        // that decides the first real output. Every other model in this file is memoryless, so this
+        // was invisible: a mutation stand ran the "+16 slack" and the "max() instead of the branch"
+        // mutants against the whole suite and called both EQUIVALENT — and both of those verdicts were
+        // wrong, which only showed once lstmModel() existed. A pre-merge round is what asked for it.
+
+        // Read the first output that carries model state: at a resampling host the leading
+        // latencySamples() outputs are the converter's own zeros.
+        auto firstOut = [] (double host, int blk, const char* tag)
+        {
+            NamStage s;
+            s.prepare (host, blk);
+            const auto json = lstmModel (tag);
+            if (! s.loadModelFromMemory (json.data(), json.size()))
+                return std::numeric_limits<double>::quiet_NaN();
+            const int lat = s.latencySamples();
+            std::vector<float> whole;
+            for (int k = 0; k < 4; ++k)
+            {
+                std::vector<float> b ((std::size_t) blk, 0.0f);
+                float* io[1] { b.data() };
+                test::run (s.process (io, 1, blk, false));
+                whole.insert (whole.end(), b.begin(), b.end());
+            }
+            return (double) whole[(std::size_t) lat];
+        };
+
+        // PRECONDITION — the instrument reads the RESET BLOCK, not just "something". Three block sizes
+        // at one host must give three DIFFERENT answers; if they did not, every assertion below would
+        // hold vacuously and the group would be decoration.
+        const double a64 = firstOut (48000.0, 64, "48000");
+        const double a512 = firstOut (48000.0, 512, "48000");
+        const double a4096 = firstOut (48000.0, 4096, "48000");
+        test::ok (std::isfinite (a64) && std::isfinite (a512) && std::isfinite (a4096)
+                      && a64 != a512 && a512 != a4096 && a64 != a4096,
+                  "precondition: the fixture FEELS the Reset block — blocks 64/512/4096 read "
+                  + std::to_string (a64) + " / " + std::to_string (a512) + " / "
+                  + std::to_string (a4096) + ", three different numbers");
+
+        // THE PINS. Values by construction: N = ceil(24000 / R) * R prewarm samples with R the Reset
+        // block, and the output is 0.5*tanh(sigmoid(10)^N). R = maxBlock + 16 on the direct path, so
+        // 80 / 528 / 4112 here. Tolerance 1e-6 — see lstmModel()'s note on why that survives three libms.
+        test::approx (a64,   0.1620296240, 1e-6, "48000 Hz, block 64: Reset block 80, prewarm 24000");
+        test::approx (a512,  0.1600718498, 1e-6, "48000 Hz, block 512: Reset block 528, prewarm 24288");
+        test::approx (a4096, 0.1574926972, 1e-6, "48000 Hz, block 4096: Reset block 4112, prewarm 24672");
+
+        // 🔴 THE SURVIVOR THIS GROUP WAS WRITTEN FOR. On the direct path the model is clocked by the
+        // HOST and the ratio never enters, so the Reset block must NOT depend on the model's tag. The
+        // mutant that sizes with `max(maxBlock, ceil(maxBlock*m/h) + 16)` breaks exactly this: at a tag
+        // above the nominal rate it reads one frame more (529 against 528 at block 512), which moves
+        // the prewarm and moves this number. That mutant survived two full mutation rounds before this
+        // assertion existed.
+        for (const int blk : { 64, 512, 4096 })
+        {
+            const double nominal = firstOut (48000.0, blk, "48000");
+            const double high    = firstOut (48000.0, blk, "48000.5");
+            const double low     = firstOut (48000.0, blk, "47999.5");
+            test::ok (nominal == high && nominal == low,
+                      "at a 48 kHz host, block " + std::to_string (blk)
+                          + ", the Reset block does NOT depend on the tag: 48000 / 48000.5 / 47999.5 "
+                            "all read " + std::to_string (nominal)
+                          + " (mutant: " + std::to_string (high) + " for the high tag)");
+        }
+
+        // …AND THE CONVERTED PATH KEEPS ITS OWN SLACK, which is the other verdict this fixture
+        // overturned. At a 96 kHz host the converted count is ceil(512*48000/96000) + 16 = 272; drop
+        // the slack and it is 256, a different prewarm and a different number. Measured on the mutant:
+        // this cell moves by ~5e-4, five hundred times the tolerance.
+        test::approx (firstOut (96000.0, 512, "48000"), 0.1602614224, 1e-6,
+                      "96 kHz host, block 512: the converted Reset block is 272, not 256");
+        test::approx (firstOut (44100.0, 512, "48000"), 0.1610591710, 1e-6,
+                      "44.1 kHz host, block 512: converted Reset block 574");
+    }
+
+    test::group ("P38 stateful prewarm and live preparation refusal");
+    {
+        using nam::NamStage;
+        const auto json = lstmModel();
+        for (const int block : { 64, 256, 512, 1024, 4096 })
+        {
+            NamStage s; s.prepare (48000.0, block);
+            test::ok (s.loadModelFromMemory (json.data(), json.size()), "stateful fixture loads");
+            float x = 0.0f; float* io[] { &x };
+            test::run (s.process (io, 1, 1, false));
+            const int resetBlock = block + 16;
+            const int warmed = ((24000 + resetBlock - 1) / resetBlock) * resetBlock;
+            test::approx (x, stateAfterSilence (warmed + 1), 2e-6,
+                          "one direct preparation advances exactly the scheduled whole blocks");
+        }
+        {
+            NamStage s; s.prepare (44100.0, 512);
+            test::ok (s.loadModelFromMemory (json.data(), json.size()), "converted stateful fixture loads");
+            std::vector<float> x (512, 0.0f); float* io[] { x.data() };
+            test::run (s.process (io, 1, 512, false));
+            // Signal pin includes the 574-frame Reset block and the converter's transient.
+            test::approx (x.back(), 0.1577584296, 2e-6, "converted preparation preserves its state trajectory");
+        }
+        {
+            // Current behavior: NAM's LSTM Reset prewarms the existing cell again. An exact
+            // host mismatch now reaches this even when both hosts use the direct path.
+            NamStage s; s.prepare (48000.2, 512);
+            auto handle = NamStage::prepareModel (json.data(), json.size(), 48000.1, 512);
+            test::ok (s.install (std::move (handle)), "same-path host mismatch installs");
+            float x = 0.0f; float* io[] { &x };
+            test::run (s.process (io, 1, 1, false));
+            test::approx (x, stateAfterSilence (2 * 24288 + 1), 2e-6,
+                          "host mismatch adds a second prewarm even without a latency change");
+        }
+        {
+            NamStage s; s.prepare (48000.0, 512);
+            auto handle = NamStage::prepareModel (json.data(), json.size(), 48000.0, 64);
+            test::ok (s.install (std::move (handle)), "block mismatch installs");
+            float x = 0.0f; float* io[] { &x };
+            test::run (s.process (io, 1, 1, false));
+            test::approx (x, stateAfterSilence (24000 + 24288 + 1), 2e-6,
+                          "block mismatch advances the state through the second prewarm");
+        }
+        {
+            NamStage s; s.prepare (47999.75, 512);
+            test::ok (s.loadModelFromMemory (json.data(), json.size()), "integer tag at fractional host loads");
+            float x = 0.0f; float* io[] { &x };
+            test::run (s.process (io, 1, 1, false));
+            test::approx (x, stateAfterSilence (24288 + 1), 2e-6,
+                          "the direct Reset block follows the host block even when the tag is higher");
+        }
+        {
+            NamStage s; s.prepare (48000.0, 64);
+            const auto unity = gainModel();
+            test::ok (s.loadModelFromMemory (unity.data(), unity.size()), "live refusal starts with a model");
+            s.prepare (0.0, 64);
+            float x = 0.25f; float* io[] { &x };
+            test::ok (! s.process (io, 1, 1, false) && x == 0.25f
+                          && s.hasModel() && s.latencySamples() == 0,
+                      "failed live reprepare refuses processing, retains the model, and preserves audio");
+            s.prepare (48000.0, 64);
+            test::ok (s.process (io, 1, 1, false) && x == 0.25f, "valid preparation recovers the live model");
+        }
+        {
+            // Compare identical architectures and equal-width tags. No wall-clock threshold:
+            // rejection before backend construction/Reset must avoid their allocations.
+            const auto rejected = lstmModel ("96000");
+            auto before = g_allocs.load();
+            auto acceptedHandle = NamStage::prepareModel (json.data(), json.size(), 48000.0, 512);
+            const auto acceptedAllocs = g_allocs.load() - before;
+            before = g_allocs.load();
+            auto rejectedHandle = NamStage::prepareModel (rejected.data(), rejected.size(), 48000.0, 512);
+            const auto rejectedAllocs = g_allocs.load() - before;
+            test::ok (acceptedHandle != nullptr && rejectedHandle == nullptr, "allocation comparison has both outcomes");
+            test::ok (rejectedAllocs < acceptedAllocs, "rate rejection avoids backend/prewarm allocations");
+        }
+    }
+
     test::group ("🔴 RATE-CHANGE NULLS — the resampler must not survive its own reconfiguration");
     {
         // THE MAIN DEFENCE OF P34. NamStage engages the rate-matcher only past
@@ -1086,11 +1819,27 @@ int main()
         const std::string junk = "{not a model";
         test::ok (nam::NamStage::prepareModel (junk.data(), junk.size(), 48000.0, 512) == nullptr, "junk prepares to nothing");
 
+        // 🔴 THIS PAIR USED TO SAY THE OPPOSITE, AND THE OLD WORDING WAS THE DEFECT'S OWN VOICE: "a 96 kHz
+        // model prepares — no stage was there to judge it". It was true only because the rate contract
+        // compared against a rate a stage CARRIED, and a rate a stage carries is a rate loads can move.
+        // The contract reads nothing but the tag now, so the heavy half judges it and the network is
+        // paid: the refusal arrives earlier, at the same place a non-mono or corrupt model is refused.
+        // MEASURED, not assumed, and stated as narrowly as it was measured: every consumer in this tree
+        // and every one found outside it reaches the load through `loadModelFromMemory` (orbitcab
+        // `CabEngine.h:107,163`, orbit-amp `NamBench.cpp:45`) or through
+        // `prepared != nullptr && install(...)` (`RigPlayer.h:1114`), and both fold a null handle and a
+        // refused install into one outcome. A loader that reported "bad file" for one and "wrong rate"
+        // for the other WOULD see the difference; none exists today.
         const auto json96 = firModel ("96000");
         auto wrong = nam::NamStage::prepareModel (json96.data(), json96.size(), 48000.0, 512);
-        test::ok (wrong != nullptr, "a 96 kHz model prepares — no stage was there to judge it");
+        test::ok (wrong == nullptr, "a 96 kHz model no longer prepares at all — the rate contract needs "
+                                    "no stage to judge it, so it is settled before the prewarm is paid");
         test::ok (! stage.install (std::move (wrong)) && stage.hasModel(),
-                  "…and a stage running at 48 kHz refuses it, keeping its model, as a load would");
+                  "…and installing the null it produced is refused, keeping the model, as a load would");
+        const auto j441 = firModel ("44100");
+        test::ok (nam::NamStage::prepareModel (j441.data(), j441.size(), 48000.0, 512) == nullptr
+                      && ! load (stage, j441) && stage.hasModel(),
+                  "…and 44.1 kHz the same way through both entry points, with the stage untouched");
 
         nam::NamStage::PreparedModel fromWorker;      // the point of the split: another thread does the work
         std::thread ([&] { fromWorker = nam::NamStage::prepareModel (json.data(), json.size(), 48000.0, 512); }).join();
