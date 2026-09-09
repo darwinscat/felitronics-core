@@ -1222,7 +1222,17 @@ public:
         if (! lm.prepare (fs_, nch, (double) frames / fs_ + 1.0)) return false;
         for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! lm.process (in, nch, frames)) return false;
-        if (lm.gatingBlockCount() <= 0 || lm.droppedBlocks() != 0) return false;
+        // `nonFiniteSubHops` belongs in this test and was missing from it, which made the function
+        // report SUCCESS on a programme its own meter had already flagged as compromised — and the
+        // meter is a local, so the caller could not check for itself. A poisoned 10 ms is recorded as
+        // silence, silence fails the absolute gate, and the blocks it was in leave the distribution
+        // the range is computed over. Measured on a 30 s programme alternating 3 s loud / 3 s quiet at
+        // 48 kHz, with every LOUD second poisoned: 4.8000 LU clean against **21.4000 LU** poisoned,
+        // both returned `true`. That number then travels into `LoudnessRequest::inputLoudnessRangeLu`
+        // as the far end of the `maxLraLossLu` DELTA, so the constraint is judged against a range the
+        // programme does not have. The same condition already guards `MasterMeasurement::loudnessValid`
+        // below; the two now agree on what "measured" means.
+        if (lm.gatingBlockCount() <= 0 || lm.droppedBlocks() != 0 || lm.nonFiniteSubHops() != 0) return false;
         out = lm.loudnessRangeLu();
         return true;
     }
