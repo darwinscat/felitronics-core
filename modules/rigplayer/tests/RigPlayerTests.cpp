@@ -72,6 +72,20 @@ std::string delayModel(int d) {
          + R"(,"bias":false,"implementation":"direct"},"weights":)" + w + R"(,"sample_rate":48000})";
 }
 
+// A REAL WaveNet whose memory is as long as it says: one one-channel layer, kernel 2, one dilation.
+// The weight order is rechannel; dilated conv (OLDEST tap, then newest) + bias; condition mixin;
+// residual 1x1 + bias; head rechannel; head scale. The 1 goes on the OLDEST tap — that is what makes
+// the network reach back `dilation` samples. With both convolution taps at zero (the shape the nam
+// module's own RT fixture ships) the impulse response's last non-zero sample is 0 whatever field the
+// config declares, which is a fixture blind to exactly the half this group exists to measure.
+std::string waveNetDelayModel(int dilation) {
+    return std::string(R"({"version":"0.5.0","architecture":"WaveNet","config":{"layers":[{"input_size":1,)")
+         + R"("condition_size":1,"head_size":1,"head_bias":false,"channels":1,"kernel_size":2,"dilations":[)"
+         + std::to_string(dilation)
+         + R"(],"activation":"Tanh","gated":false}],"head_scale":1.0},"weights":[1,1,0,0,1,0,0,1,1],)"
+         + R"("sample_rate":48000})";
+}
+
 std::vector<std::byte> bytesOf(const std::string& s) {
     const auto* p = reinterpret_cast<const std::byte*>(s.data());
     return { p, p + s.size() };
@@ -251,14 +265,27 @@ int main() {
         // weight, here 0.5 x 0.5 = 0.25. A sweep of all 218 leaving phases at SAMPLE resolution reaches
         // 0.249986 — 99.99% of that ceiling, so the number is 0.25 (-12.0 dBFS) and nothing can beat it.
         // All of it lands in the first three samples of the return, and none on the plane that stayed.
-        // The comment in the player says that
-        // history is "advanced every block including at zero", which is true only for the planes that
-        // are playing; that is the gap.
         //
-        // The fixture is built to measure the DELAY LINE and nothing else: two MEMORYLESS gain models
-        // with the alignment table set by hand, so the only per-plane state in the path is the tail.
-        // With a model that has its own memory the leak is larger and only partly this — see the note
-        // in the findings about `neural::NeuralStage`.
+        // 🔴 THAT WAS THE DELAY LINE'S CEILING AND THIS GROUP USED TO SPEND IT ON BOTH HALVES. The
+        // models' own state is a different shape and 3.8x larger — BOTH slots freeze, so the weights sum
+        // instead of picking, and a frozen rate-matcher is not a replay (its phase rows are normalised by
+        // their SUM, so their modulus exceeds one). Derived and attained: 0.949383 at 44.1 kHz, reached
+        // to 100.00% by the sign pattern of the worst return row, where a swept sine reaches 55%.
+        // See RigPlayer::process for the table and the formula.
+        //
+        // 🔴 AND THE FIXTURE WAS BLIND TWICE OVER, each blindness hiding one half.
+        //   · kFs = 48000 is the ONE rate at which no rate-matcher is installed, so the resampler half
+        //     could not appear at all: 0.518588 out of digital silence at 44.1 kHz, on this very group,
+        //     with one token changed. Hence the rate sweep.
+        //   · a capture with a one-sample field cannot show the MODEL half: at 48 kHz a 2001-tap one
+        //     read 0.499533 with a 2003-sample tail while the memoryless one read a clean zero. Hence
+        //     the second shape — and it is a real WaveNet with a real 1024-sample memory, not a
+        //     declared one: a dilated tap costs the same nine scalars at any distance, and the weight
+        //     goes on the OLDEST tap because with both taps at zero the network forgets after one
+        //     sample however long a field it advertises.
+        //
+        // The fixture still measures the DELAY LINE too: two memoryless gain models with the alignment
+        // table set by hand, so on that shape the only per-plane state in the path is the tail.
         namz::rig::Rig r;
         namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
         namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain; g.values = { "60", "240" }; g.sweep = 300;
@@ -267,8 +294,16 @@ int main() {
         namz::rig::FileEntry fc; fc.id = "late";  fc.settings = { { "gain", "240" } };
         st.device.files = { fa, fc };
         r.chain = { st };
+
+        struct Shape { const char* name; std::string json; int field; };
+        const Shape shapes[] { { "a memoryless capture", gainModel(1.0), 1 },
+                               { "a 1024-sample WaveNet", waveNetDelayModel(1023), 1024 } };
+
+        for (const auto& shape : shapes) {
         std::map<std::string, std::vector<std::byte>> files {
-            { "early", bytesOf(gainModel(1.0)) }, { "late", bytesOf(gainModel(1.0)) } };
+            { "early", bytesOf(shape.json) }, { "late", bytesOf(shape.json) } };
+        // EVERY audio rate, because 48000 is the only one where the rate-matcher is absent.
+        for (const double fs : { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 }) {
         // BOTH SLOT ASSIGNMENTS. delayOf() is maxLag - lag, so one table always puts the delay on slot 0
         // and the other on slot 1. A version of this test that used only the first passed with a fix that
         // cleared slot 0 alone — the mutation survived the whole suite, 247 checks, because slot 1 never
@@ -278,29 +313,33 @@ int main() {
         AlignmentTable table;
         table.lagByFile = flip ? std::map<std::string, int> { { "early", 3 }, { "late", 0 } }
                                : std::map<std::string, int> { { "early", 0 }, { "late", 3 } };
-        table.sampleRate = kFs;
+        table.sampleRate = fs;
 
-        Bench b(r, 2);
+        Bench b(r, 2, fs);
         b.files = files;
         b.p.setAlignment(table);
         b.p.setDial("gain", 150.0);
+        const std::string at = std::string(shape.name) + " at " + std::to_string((int) fs) + " Hz";
 
         std::vector<float> L((std::size_t) kBlock), R((std::size_t) kBlock);
         float* io[2] { L.data(), R.data() };
         double phase = 0.0, charged = 0.0;
-        for (int k = 0; k < 304; ++k) {
+        // Long enough for the crossfade to settle AND for a plane to fill the capture's memory at THIS
+        // rate — the field is model-rate samples, so a 192 kHz host needs four times as many of its own.
+        const int blocks = 96 + (int) std::ceil((double) shape.field * fs / 48000.0 / (double) kBlock);
+        for (int k = 0; k < blocks; ++k) {
             for (int i = 0; i < kBlock; ++i) {
                 L[(std::size_t) i] = 0.0f;
                 R[(std::size_t) i] = (float) (0.5 * std::sin(phase));
-                phase += 2.0 * 3.14159265358979 * 220.0 / kFs;
+                phase += 2.0 * 3.14159265358979 * 220.0 / fs;
             }
             felitronics::test::run (b.p.process(io, 2, kBlock)); b.p.serviceHere();
             for (float v : R) charged = std::fmax(charged, (double) std::fabs(v));
         }
         ok(b.p.appliedSlotDelay(flip) > 0,
-           "precondition: THIS pass's slot carries the delay, so its tail holds samples");
-        ok(! b.p.slotCold(flip), "precondition: and that slot is awake, so it is the one contributing");
-        ok(charged > 0.1, "precondition: the plane under test really was playing");
+           "precondition: THIS pass's slot carries the delay, so its tail holds samples — " + at);
+        ok(! b.p.slotCold(flip), "precondition: and that slot is awake, so it is the one contributing — " + at);
+        ok(charged > 0.1, "precondition: the plane under test really was playing — " + at);
 
         // THE GAP. `narrowFirst` picks its WIDTH: 1 plane (the P18 case — the plane under test keeps
         // playing zeros while its neighbour stops) or 0 planes (the P20 case — nothing plays at all).
@@ -308,19 +347,145 @@ int main() {
         // second defect: with one plane still playing, the plane under test drains itself and there is
         // nothing left to replay, which is why folding this into the existing loop caught nothing.
         const int gapWidth = narrowFirst ? 1 : 0;
-        for (int k = 0; k < 100; ++k) { std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
+        for (int k = 0; k < blocks; ++k) { std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
                                         felitronics::test::run (b.p.process(io, gapWidth, kBlock)); b.p.serviceHere(); }
 
         double worst = 0.0;
-        for (int k = 0; k < 20; ++k) {
+        for (int k = 0; k < blocks; ++k) {
             std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
             felitronics::test::run (b.p.process(io, 2, kBlock)); b.p.serviceHere();
             for (float v : R) worst = std::fmax(worst, (double) std::fabs(v));
             for (float v : L) worst = std::fmax(worst, (double) std::fabs(v));
         }
         ok(worst == 0.0, std::string("silence in, exact zero out after a ") + (narrowFirst ? "NARROW" : "ZERO-WIDTH")
-                         + " gap (was 0.25 = -12.0 dBFS, and 0.2317 = -12.7 dBFS)");
+                         + " gap — " + at + " (the ceiling here is 0.949383 = -0.45 dBFS, and this used to"
+                         " read 0.518588 at 44.1 kHz and 0.499533 at 48 kHz)");
         }
+        }
+        }
+    }
+
+    group("a slot the LAW puts to sleep brings nothing back with it either");
+    {
+        // 🔴 THE SECOND WAY THIS PLAYER STOPS CLOCKING A STAGE. A plane the host takes away is one; a
+        // slot the blend law puts to sleep is the other, and it used to be `if (run[s]) nam_[s].process`
+        // — the stage not called at all. Measured on this fixture before the fix: after two seconds at
+        // rest the sleeping slot held the tone, and a turn on a SILENT input replayed it at per-block
+        // peaks 0.114 · 0.22 · 0.366 · 0.486 · 0.5 · 0.5 · 0.5 · 0.5 — 0.500000 out of DIGITAL SILENCE,
+        // for exactly one receptive field, under the law's own 0.25-per-call ramp.
+        //
+        // 🔴 AND THE FIXTURE HAS TO BE BUILT AGAINST TWO TRAPS, both of which read a clean zero:
+        //   · THREE knots, not two. With two files each knot assigns the SAME capture to both slots, so
+        //     a turn SWAPS the sleeping slot's backend (a fresh instance) instead of WAKING it, and a
+        //     swap has nothing to leak. The first version of this measurement read 0.000000 for that
+        //     reason alone and the mechanism was called "not reproducible".
+        //   · the turn happens on DIGITAL SILENCE. Turning while the tone still plays hides the replay
+        //     as a discontinuity in the sound rather than showing it out of nothing.
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain;
+        g.values = { "60", "150", "240" }; g.sweep = 300;
+        st.device.controls = { g };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // TWO SHAPES, and the second is the one that can actually FAIL. With a 2001-tap capture the
+        // blend law's own warm-up (`warmFor` = field + latency + maxBlock) is longer than the memory, so
+        // a woken slot is inaudible while it drains anyway and the row passes either way — it pins the
+        // historical 0.500000 rather than the fix. A MEMORYLESS capture reports no field at all, so the
+        // warm-up is ZERO and nothing masks the leak; what freezes there is the rate-matcher, which is
+        // why that row runs at 44.1 kHz, where one is installed. Two mutations reverting this file to
+        // `if (run[s]) nam_[s].process(...)` survived the whole suite until this row existed.
+        // 🔴 AND BOTH SLOT INDICES, for the same reason the gap group runs both alignment tables: a
+        // fixture that only ever puts the sleeping slot on one index passes a fix that clears the other.
+        // Measured — a mutation reverting slot 1's line alone SURVIVED the whole suite until the second
+        // direction existed. Which index sleeps is decided by the law, not by us, so the pass asserts
+        // COVERAGE of both rather than assuming it.
+        // WHICH index sleeps is the law's business, and it is not symmetric: from a fresh player the
+        // first landing takes slot 0, so parking on the middle knot always sleeps slot 0. Slot 1 only
+        // ever sleeps after a SECOND landing, which is what the `then` column arranges — park, turn once
+        // so the middle capture's slot goes quiet, and wake it by turning back. Both turns are load-free
+        // (`modelLoads()` is asserted below), so both are WAKES rather than swaps.
+        // ALL THREE knots carry the SAME capture, so whichever slot the law puts to sleep is holding the
+        // shape under test. Handing one knot the long capture and the others a gain looked tidier and was
+        // a tautology: the precondition read `slotCold(0) ? 0 : 1` and then asserted that slot was cold,
+        // which says nothing about WHAT it holds — measured, the middle-knot pass slept a slot holding a
+        // different file than the one the fixture had loaded, so two of its four rows tested nothing.
+        struct Cold { const char* name; std::string parked; double then; double wake; double fs; };
+        const Cold cases[] {
+            { "a 2001-tap capture", delayModel(2000), -1.0, 200.0, kFs },
+            { "a 2001-tap capture, one landing further on, so the OTHER slot sleeps",
+                                    delayModel(2000), 240.0, 150.0, kFs },
+            { "a MEMORYLESS capture, where no warm-up masks it", gainModel(1.0), -1.0, 200.0, 44100.0 },
+            { "a MEMORYLESS capture, one landing further on",    gainModel(1.0), 240.0, 150.0, 44100.0 } };
+        bool sleptOn[2] { false, false };
+        for (const auto& c : cases) {
+        Bench b(r, 1, c.fs);
+        b.files = { { "early", bytesOf(c.parked) }, { "mid", bytesOf(c.parked) },
+                    { "late",  bytesOf(c.parked) } };
+        b.load(r);
+        b.p.setBlendShape({ 0.5, 0.0 });                               // STEP: one capture at a time
+        b.p.setDial("gain", 150.0);                                    // …park on the middle knot
+
+        std::vector<float> x((std::size_t) kBlock);
+        float* io[1] { x.data() };
+        double phase = 0.0, charged = 0.0;
+        const int rest = (int) std::ceil(2.0 * c.fs / kBlock);          // kColdAfterSeconds is 2 s by default
+        for (int k = 0; k < 2 * (rest + 60); ++k) {
+            if (c.then >= 0.0 && k == rest + 60) b.p.setDial("gain", c.then);
+            for (int i = 0; i < kBlock; ++i) {
+                x[(std::size_t) i] = (float) (0.5 * std::sin(phase));
+                phase += 2.0 * 3.14159265358979323846 * 220.0 / c.fs;
+            }
+            felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.serviceHere();
+            for (float v : x) charged = std::fmax(charged, (double) std::fabs(v));
+        }
+        // WHICH capture the sleeping slot holds is the thing this group is about, and reading the index
+        // off `slotCold` alone makes the precondition a tautology — it says a slot is asleep, not that
+        // the slot holding the PARKED capture is. `held()` names the model id, so the assertion below
+        // is about identity rather than about which of the two happened to be cold.
+        const int late = b.p.slotCold(0) ? 0 : 1;
+        sleptOn[(std::size_t) late] = true;
+        ok(charged > 0.1, std::string("precondition: the tone really played — ") + c.name);
+        ok(b.p.slotCold(late) && ! b.p.slotCold(late ^ 1) && ! b.p.heldFileId(late).empty(),
+           std::string("precondition: slot ") + std::to_string(late) + " is asleep holding "
+           + b.p.heldFileId(late) + ", the other awake — " + c.name);
+        ok(b.p.modelLoads() == 2, std::string("precondition: two captures were fetched — the turn below WAKES"
+                                              " a slot, it does not swap one (a swap cannot leak, and that is"
+                                              " the trap) — ") + c.name);
+
+        // DIGITAL SILENCE, long enough that a slot which is being clocked has drained. 8 blocks is
+        // 2048 samples against a 2000-sample memory.
+        // The first blocks of silence still carry the chain's own LATENCY tail — 61 samples at 44.1 kHz,
+        // where the rate-matcher is installed — AND the AWAKE slot's own memory, which is 2000 samples
+        // here because every knot carries the same capture. So the reading starts past both. Measuring
+        // from the first block reads the tone leaving, not the slot holding anything.
+        float before = 0.0f;
+        const int hush = 16 + 2 * (2001 / kBlock);           // past the AWAKE slot's own memory and latency
+        for (int k = 0; k < hush; ++k) {
+            std::fill(x.begin(), x.end(), 0.0f);
+            felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.serviceHere();
+            if (k >= hush / 2) for (float v : x) before = std::max(before, std::abs(v));
+        }
+        ok(before == 0.0f, std::string("precondition: silence in, silence out BEFORE the turn — ") + c.name);
+
+        b.p.setDial("gain", c.wake);                                   // …and the turn WAKES it, on silence
+        float worst = 0.0f;
+        for (int k = 0; k < 60; ++k) {
+            std::fill(x.begin(), x.end(), 0.0f);
+            felitronics::test::run (b.p.process(io, 1, kBlock)); b.p.serviceHere();
+            for (float v : x) worst = std::max(worst, std::abs(v));
+        }
+        ok(worst == 0.0f, std::string("silence in, exact zero out when a SLEEPING slot wakes (was 0.500000"
+                                      " — a whole receptive field of the tone it was holding when it fell"
+                                      " asleep) — ") + c.name);
+        ok(b.p.modelLoads() == 2, std::string("…and nothing was loaded for the turn: a wake, not a swap — ") + c.name);
+        }
+        ok(sleptOn[0] && sleptOn[1], "precondition on the PASS: both slot indices took a turn at sleeping,"
+                                     " so a fix that clears one of them cannot pass this group");
     }
 
     group("the rig round-trips through the pack writer and the canonical reader");

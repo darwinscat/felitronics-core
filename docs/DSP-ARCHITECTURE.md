@@ -321,6 +321,28 @@ the CPU at runtime, invisible to any build. Full write-up:
    >= `nch`.** The `nc > 0` guard survives only in its other job — keeping a negative width out of a
    half-open range — and law 11's malformed-call refusal now does that job earlier and better.
 
+   **AND WHERE THE MEMORY CANNOT BE DROPPED, IT IS DRAINED.** "Drop its sample memory" assumes the
+   memory is ours to clear, and for a delay line it is. For a stage that owns a black box it is not:
+   `nam::NamStage` holds a neural network whose window belongs to NAM (whose `Reset` allocates, and for
+   a `Linear` capture does not clear that window at all) and two `core::StreamResampler` legs beside it.
+   The third answer is to hand the stopped channel the DIGITAL SILENCE it is receiving — the same code
+   path, into the stage's own scratch, since `io` need not carry that plane and at `nch == 0` may be
+   null — until its state is provably the state of a channel that was silent all along, and then to
+   STOP. Bounded, so a permanently mono host still pays for one network rather than two: the length is
+   the model's own memory plus each rate-matcher's tap window, each counted in ITS OWN rate. Measured
+   before it, through `rigplayer::RigPlayer`, worst |out| out of digital silence: **0.518588 at
+   44.1 kHz** with a memoryless capture (the rate-matchers alone) and **0.499533 at 48 kHz** with a
+   2001-tap one (the network alone, at the one rate where no rate-matcher is installed) — two
+   independent halves, each with a fixture that cannot see the other. **The same class reaches a stage a
+   composite stops CALLING at all** for reasons of its own: `RigPlayer` skipped a slot the blend law had
+   put to sleep, which replayed **0.500000** for a whole receptive field, and hands it a width-zero call
+   now. And because "it drains, and then it stops" has no witness in the audio — past the debt the
+   output is zero either way — the stage publishes an odometer (`NamStage::drainedSamples()`) so a test
+   can see the length; three mutations of it survived a suite of 960 checks before that existed.
+   ⚠️ A recurrent cell has no flush length, so for an LSTM this is a bound on NAM's own half-second
+   heuristic and not on the memory (0.419 against 0.023 for a lane clocked throughout) — said here
+   rather than left for the next reader to find.
+
    **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
    `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`
    silently clamped `prepare(..., 4)` to 2, after which `process(io, 4, n)` was a perfectly legal call
