@@ -107,6 +107,25 @@ static_assert ((int) GrStatistic::Max  == FC_GR_MAX);
 static_assert (eq::EqEngine::kMaxBands == FC_MAX_EQ_BANDS, "the ABI mirrors every band or it mirrors none");
 static_assert (eq::kNumLanes           == FC_MAX_EQ_LANES, "same for lanes");
 
+// The SIZE pins. The comment above promised these and the first draft of this file did not have them,
+// which is the "comment that cannot be reproduced" class this repository keeps closing. They are also
+// the ONLY pin available for `dynamics::CompressorParams`, which cannot be decomposed at all — it and
+// its base both have members — so a field added to it or to `GainReductionParams` moves a number here
+// and nothing else in the build.
+static_assert (sizeof (eq::LaneParams)                 == 40);
+static_assert (sizeof (eq::DynParams)                  == 48);
+static_assert (sizeof (eq::BandParams)                 == 264);
+static_assert (sizeof (stereo::MonoBassParams)         == 12);
+static_assert (sizeof (dynamics::DetectorParams)       == 16);
+static_assert (sizeof (dynamics::GainReductionParams)  == 72);
+static_assert (sizeof (dynamics::CompressorParams)     == 96);
+static_assert (sizeof (saturation::Saturator::Params)  == 28);
+static_assert (sizeof (limiter::TruePeakLimiterParams) == 16);
+static_assert (sizeof (dither::DitherParams)           == 24);
+static_assert (sizeof (MasteringChainConfig)           == 48);
+static_assert (sizeof (MasteringChainParams)           == 6544);
+static_assert (sizeof (MasteringChainResolved)         == 72);
+
 // The arity pins. Declared in a never-called function so they cost nothing and read as what they are.
 [[maybe_unused]] void layoutPins()
 {
@@ -212,6 +231,17 @@ fc_status checkAudio (const void* p, std::uint32_t frames, int channels) noexcep
     if (bytes > (std::uint64_t) 0xFFFFFFFFu) return FC_ERR_SPAN;
     if (! inHeap (p, bytes)) return FC_ERR_SPAN;
     return FC_OK;
+}
+
+// Does a scalar out-parameter sit inside an audio span this call is about to write? The overlap rule
+// for `in`/`out` does not see this class at all, and the consequence is silent: `fc_master_flush(h,
+// out, D, (uint32_t*) out)` writes the whole drain and THEN overwrites the first sample with the frame
+// count. The caller gets audio whose first four bytes are a small integer, and nothing anywhere says so.
+bool aliasesSpan (const void* scalar, std::size_t scalarBytes, const void* span, std::uint64_t spanBytes) noexcept
+{
+    const auto a = (std::uint64_t) reinterpret_cast<std::uintptr_t> (scalar);
+    const auto b = (std::uint64_t) reinterpret_cast<std::uintptr_t> (span);
+    return (a < b + spanBytes) && (b < a + (std::uint64_t) scalarBytes);
 }
 
 // Two planar spans either coincide exactly or do not touch. A PARTIAL overlap is refused rather than
@@ -534,13 +564,29 @@ struct MasterInstance
     // been non-zero is worse than no counter.
     std::uint64_t framesIn = 0, framesFlushed = 0;
     bool audioSeen = false;         // set by process(); configure() refuses once this is true
+
+    // A SOLVE THAT RAN LEAVES THE CHAIN HOLDING THE SOLVER'S PARAMETERS, not the caller's, and standing
+    // wherever its last pass ended. Measured: `process()` straight after a solve returns FC_OK and
+    // differs from the delivered render in 558 691 of 576 000 samples, and from the CONFIGURED render in
+    // 575 998 — a third render nobody chose, out of a handle whose stats read `framesIn = 0` as if it
+    // were fresh. `reset()` does not fix it either: it clears the audio state and keeps the solver's
+    // gain and ceiling. So the handle is marked, and `process`/`flush` refuse until `configure` puts a
+    // known parameter set back. Law 11 at the handle level: a call that cannot be honoured as the caller
+    // means it is refused rather than answered with something plausible.
+    bool solverRan = false;
 };
 
 struct Slot
 {
     Kind kind = Kind::Free;
-    std::uint8_t gen = 1;           // starts at 1 so a zeroed handle is never valid
-    bool retired = false;           // generation wrapped: the slot leaves circulation rather than ABA
+    // 24 BITS OF GENERATION, and the width is the whole design rather than a spare-bits accident. An
+    // 8-bit generation forces a choice between ABA (reuse the numbers) and RETIREMENT (spend the slot),
+    // and retirement turns "8 live objects" into a LIFETIME BUDGET: 8 x 255 = 2040 create/destroy
+    // cycles per page load, after which every correct create is refused for ever. That is reachable —
+    // the reference CLI's own render loop creates a handle per programme, so a worker written from it
+    // would die on its 2041st file. At 24 bits the budget is 8 x 16.7 million and the question stops
+    // being one; a stale handle is still refused, which was the point.
+    std::uint32_t gen = 1;          // starts at 1 so a zeroed handle is never valid
     std::unique_ptr<MasterInstance> master;
     std::unique_ptr<LoudnessSolution> solution;
 };
@@ -548,24 +594,22 @@ struct Slot
 Slot g_slots[kMaxHandles];
 
 // handle = (gen << 8) | (index + 1). Zero is never valid, so a zeroed variable in JS is a refusal.
-std::uint32_t packHandle (int idx, std::uint8_t gen) noexcept
+std::uint32_t packHandle (int idx, std::uint32_t gen) noexcept
 {
-    return ((std::uint32_t) gen << 8) | (std::uint32_t) (idx + 1);
+    return ((gen & 0x00FFFFFFu) << 8) | (std::uint32_t) (idx + 1);
 }
 
 Slot* lookup (std::uint32_t h, Kind want) noexcept
 {
-    // `packHandle` only ever produces values in the low 16 bits, so anything above them is a value this
-    // ABI never issued. Without this line each live handle has 65 536 accepted spellings and a made-up
-    // one can destroy somebody's object; `h == 0` is then covered by the index test below, but it is
-    // spelled out because "handle 0 is never valid" is a contract sentence and not an accident of
-    // arithmetic.
-    if (h == 0 || (h >> 16) != 0u) return nullptr;
+    if (h == 0) return nullptr;
     const int idx = (int) (h & 0xFFu) - 1;
     if (idx < 0 || idx >= kMaxHandles) return nullptr;
     Slot& s = g_slots[idx];
     if (s.kind != want) return nullptr;
-    if (s.gen != (std::uint8_t) ((h >> 8) & 0xFFu)) return nullptr;
+    // The generation IS the "never issued" test now that it fills the rest of the word: a fabricated
+    // value differs from the live one in one of 24 bits rather than sharing the object with 65 535
+    // other spellings, which is what an 8-bit generation left behind.
+    if ((s.gen & 0x00FFFFFFu) != ((h >> 8) & 0x00FFFFFFu)) return nullptr;
     return &s;
 }
 
@@ -573,7 +617,7 @@ int allocSlot (Kind kind, std::uint32_t& outHandle) noexcept
 {
     for (int i = 0; i < kMaxHandles; ++i)
     {
-        if (g_slots[i].kind != Kind::Free || g_slots[i].retired) continue;
+        if (g_slots[i].kind != Kind::Free) continue;
         g_slots[i].kind = kind;
         outHandle = packHandle (i, g_slots[i].gen);
         return i;
@@ -596,11 +640,12 @@ void freeSlot (Slot& s) noexcept
     s.master.reset();
     s.solution.reset();
     s.kind = Kind::Free;
-    // Bump the generation so the handle just destroyed can never address the next object here. On wrap
-    // the slot RETIRES: reusing generation 1 would bring ABA back, and a facade with eight slots can
-    // afford to lose one long before a page has destroyed 255 chains.
-    if (s.gen == 0xFFu) s.retired = true;
-    else                ++s.gen;
+    // Bump the generation so the handle just destroyed can never address the next object here. 24 bits
+    // wide, and it wraps rather than retiring the slot: 16.7 million destroys of ONE slot before a
+    // number repeats is not a budget anybody meets, while retirement was one that a per-file render
+    // loop meets in an afternoon.
+    s.gen = (s.gen + 1) & 0x00FFFFFFu;
+    if (s.gen == 0u) s.gen = 1u;
 }
 
 // `MasteringChain::process` takes planar pointers; the ABI carries one pointer and a stride. Building
@@ -680,6 +725,7 @@ FC_EXPORT fc_status fc_master_configure (fc_master h, const fc_master_params* pa
         return FC_ERR_REFUSED_BY_CORE;
 
     m.framesIn = m.framesFlushed = 0;
+    m.solverRan = false;                    // a known parameter set is back in the chain
     fromCore (m.chain.resolved(), m.chain.tapOversampleFactor(), *resolved);
     return FC_OK;
 }
@@ -706,6 +752,7 @@ FC_EXPORT fc_status fc_master_process (fc_master h, const float* in, float* out,
         // error, and it must not set `audioSeen` either — no audio was seen.
         return FC_OK;
     }
+    if (m.solverRan) return FC_ERR_STATE;   // the chain holds the SOLVER's parameters — see MasterInstance
     if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;   // the core takes `int`
 
     if (const fc_status st = checkAudio (in, frames, nch); st != FC_OK) return st;
@@ -733,12 +780,15 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
 
+    if (m.solverRan) return FC_ERR_STATE;   // as process(): the chain's configuration is not the caller's
     if (capacity == 0) return FC_ERR_CAPACITY;
     if (capacity > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
     // A capacity below the latency cannot drain the tail, and the core keeps no arrears, so a second
     // call would not continue this drain — it would start another one. Refused as a whole (law 11).
     if ((std::int64_t) capacity < (std::int64_t) m.chain.latencySamples()) return FC_ERR_CAPACITY;
     if (const fc_status st = checkAudio (out, capacity, nch); st != FC_OK) return st;
+    if (aliasesSpan (written, sizeof (*written), out,
+                     (std::uint64_t) capacity * (std::uint64_t) nch * sizeof (float))) return FC_ERR_SPAN;
 
     float* pl[core::kMaxChannels] {};
     planes (out, capacity, nch, pl);
@@ -777,6 +827,9 @@ FC_EXPORT fc_status fc_master_reset (fc_master h)
     s->master->chain.reset();
     s->master->framesIn = s->master->framesFlushed = 0;
     s->master->audioSeen = false;
+    // `solverRan` is NOT cleared here, and that is the point: `reset()` clears audio state and leaves
+    // the solver's gain and ceiling standing, so a reset-then-process would still render a parameter
+    // set the caller never asked for. Only `configure` puts a known one back.
     return FC_OK;
 }
 
@@ -850,7 +903,10 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
 
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
-    if (frames == 0) return FC_ERR_REFUSED_BY_CORE;
+    // `frames == 0` is NOT refused here. The solver has its own answer for it — `InvalidRequest`, a
+    // VERDICT — and this file's contract says FC_OK means a verdict was obtained and that it never
+    // guesses a reason the core has. Refusing it here made the ABI answer for the core on one input and
+    // forward the core on every other, which is two policies for one question.
     if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
     if (const fc_status st = checkAudio (in, frames, nch); st != FC_OK) return st;
     if (const fc_status st = checkAudio (out, frames, nch); st != FC_OK) return st;
@@ -859,6 +915,7 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     // touching at all is refused, equality included.
     const std::uint64_t bytes = (std::uint64_t) frames * (std::uint64_t) nch * sizeof (float);
     if (in == out || partiallyOverlaps (in, out, bytes)) return FC_ERR_SPAN;
+    if (aliasesSpan (out_solution, sizeof (*out_solution), out, bytes)) return FC_ERR_SPAN;
 
     MasteringChainParams cp {};
     if (const fc_status st = toCore (*params, cp); st != FC_OK) return st;
@@ -900,6 +957,7 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     {
         m.framesIn = m.framesFlushed = 0;
         m.audioSeen = false;
+        m.solverRan = true;         // and now process/flush refuse until configure — see MasterInstance
     }
 
     *out_solution = sh;

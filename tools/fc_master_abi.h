@@ -111,8 +111,17 @@ typedef struct fc_header
 // Order is not accidental: it is the order the checks run in, which law 11 makes part of the contract
 // so that one malformed call has one answer.
 //
-//   handle -> out-parameters (null, alignment, in-heap) -> struct headers (the first 8 bytes bounded,
-//   then version, then size, THEN the rest of the struct's span) -> audio spans -> field values -> core
+//   handle -> the handle's STATE -> out-parameters (null, alignment, in-heap) -> struct headers (the
+//   first 8 bytes bounded, then version, then size, THEN the rest of the struct's span) -> NARROWING
+//   (a count this ABI cannot hand the core's `int`) -> audio spans and their aliases -> field values
+//   -> core
+//
+// Three details of that are load-bearing rather than incidental. THE HANDLE'S STATE comes second
+// because a call that is illegal for this handle is illegal whatever else it carries. OUT-PARAMETERS
+// come before the input structs because a call that cannot report its result must not perform it. And
+// NARROWING comes before the spans because it is the only check that can still fire: a frame count past
+// INT_MAX makes a byte span past 32 bits too, so a span check placed first would answer every such call
+// with FC_ERR_SPAN and the specific diagnosis would be unreachable.
 //
 // Two details of that are load-bearing rather than incidental. OUT-PARAMETERS COME BEFORE THE INPUT
 // STRUCTS because a call that cannot report its result must not perform it. And a struct's HEADER is
@@ -471,6 +480,14 @@ typedef struct fc_solution_summary
 // there is no unmapped page in a linear memory, so the read succeeds and returns whatever the allocator
 // has since put there. With a generation, a stale handle is a refusal (FC_ERR_HANDLE) instead.
 // Zero is never a valid handle.
+//
+// THE GENERATION IS 24 BITS WIDE, and the width is the design rather than spare space. A narrow
+// generation forces a choice between ABA (reuse the numbers) and RETIREMENT (spend the slot), and
+// retirement turns a table of eight live objects into a LIFETIME BUDGET — at 8 bits, 2040 create/destroy
+// cycles per page load, after which every correct create is refused for ever. That is reachable: the
+// reference CLI creates a handle per programme, so a worker written from it would die on its 2041st
+// file. At 24 bits the budget stops being a question and a fabricated handle still differs from the
+// live one in one of 24 bits.
 typedef uint32_t fc_master;
 typedef uint32_t fc_solution;
 
@@ -520,6 +537,13 @@ fc_status fc_master_resolved_get (fc_master h, fc_master_resolved* out);
 // Process `frames` frames. `in` and `out` are planar with stride `frames`; they may be equal, and must
 // not overlap in any other way.
 //
+// REFUSED WITH FC_ERR_STATE ON A HANDLE THAT HAS SOLVED, until `fc_master_configure` runs. A search
+// resets the chain on every pass and leaves its OWN gain and ceiling in it, standing wherever its last
+// pass ended — so a process call here renders a parameter set the caller never chose. Measured: the
+// output differs from the delivered render in 558 691 of 576 000 samples and from the CONFIGURED render
+// in 575 998. `fc_master_reset` does NOT lift the refusal, because it clears audio state and keeps the
+// solver's parameters; only a configure puts a known set back.
+//
 // BLOCK INVARIANCE SURVIVES THIS BOUNDARY because nothing here re-blocks anything: the call is handed
 // to `MasteringChain::process()` in one piece and the chain accumulates into its own fixed quantum,
 // which is the only reason "same input, same output, whatever the caller's block size" is a theorem
@@ -536,6 +560,11 @@ fc_status fc_master_process (fc_master h, const float* in, float* out, uint32_t 
 
 // Drain the chain's latency. Writes min(latencySamples(), capacity) frames into `out` (planar, stride
 // `capacity`) and reports how many through `written`.
+//
+// `written` MAY NOT POINT INTO `out`. The in/out overlap rule does not see that class at all, and the
+// consequence is silent: the drain is written and then its first sample is overwritten by the frame
+// count, so the caller gets audio whose first four bytes are a small integer. Refused with FC_ERR_SPAN.
+// Also refused on a handle that has solved, for the reason at `fc_master_process`.
 //
 // CAPACITY IS AN ARGUMENT because the caller owns the buffer — the same rule as
 // fc_probe_block_energies(out, cap). AND A CAPACITY BELOW THE LATENCY IS REFUSED, before anything moves,
@@ -583,6 +612,15 @@ fc_status fc_master_set_channel_weight (fc_master h, int32_t channel, double wei
 //
 // FC_OK means A VERDICT WAS OBTAINED. Whether the target was met is `fc_solution_summary::status`.
 // The solution handle is independent of the chain handle and outlives it; destroy it separately.
+//
+// THAT INCLUDES A DEGENERATE LENGTH: `frames == 0` is handed to the solver, which answers
+// `InvalidRequest`, rather than being refused here. Answering for the core on one input while
+// forwarding it on every other is two policies for one question, and this file's rule is that it never
+// guesses a reason the core has.
+//
+// A SOLVE THAT RAN LEAVES THE HANDLE UNUSABLE FOR STREAMING until the next `fc_master_configure` — see
+// `fc_master_process`. The delivered audio is already in `out`; a caller that wants to stream with the
+// gain the search found configures with it.
 // `params` travels with the call rather than being taken from the handle, and that is the C++
 // signature's own choice: `TargetLoudnessSolver::solve()` takes the parameter set BY VALUE and its
 // header says why — reading it back from the chain would give the last APPLIED set (a quantum stale)

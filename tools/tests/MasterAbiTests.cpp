@@ -17,6 +17,10 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/mastering/LoudnessSolver.h>
+#include <felitronics/mastering/MasteringChain.h>
+#include <felitronics/mastering/OfflineRenderer.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -73,13 +77,17 @@ fc_master make()
     return h;
 }
 
+// EVERY CHANNEL DIFFERENT, and that is not decoration: with identical planes no fault in the planar
+// addressing — a stride of zero, every plane pointed at channel 0, the two channels crossed — can
+// change a single sample, so the whole suite would be blind to a whole class while looking busy.
 std::vector<float> tone (std::size_t frames, int nch)
 {
     std::vector<float> v (frames * (std::size_t) nch, 0.0f);
     for (int c = 0; c < nch; ++c)
         for (std::size_t i = 0; i < frames; ++i)
             v[(std::size_t) c * frames + i] =
-                (float) (0.4 * std::sin (2.0 * 3.14159265358979 * 440.0 * (double) i / kFs));
+                (float) ((0.4 - 0.11 * c) * std::sin (2.0 * 3.14159265358979 * (440.0 + 137.0 * c)
+                                                      * (double) i / kFs));
     return v;
 }
 
@@ -96,7 +104,8 @@ int main()
         ok (fc_master_max_eq_bands() == FC_MAX_EQ_BANDS, "the band count the ABI mirrors");
         ok (fc_master_sizeof_params() == sizeof (fc_master_params), "sizeof(params) as this build sees it");
         ok (fc_master_sizeof_config() == sizeof (fc_master_config), "sizeof(config)");
-        ok (fc_master_max_channels() >= 2, "kMaxChannels is at least stereo");
+        ok (fc_master_max_channels() == (std::uint32_t) felitronics::core::kMaxChannels,
+            "and the channel ceiling is the CORE's, not a number this file chose");
     }
 
     //==========================================================================
@@ -215,8 +224,22 @@ int main()
         fc_solution_summary sum {}; FC_INIT (sum);
         ok (fc_solution_summary_get ((fc_solution) h, &sum) == FC_ERR_HANDLE,
             "a master handle passed to a solution getter is refused, not reinterpreted");
+        // The reverse, with a REAL solution handle. The earlier form of this check passed handle 0, which
+        // is refused before any kind test runs — a check that looked like it covered the confusion and
+        // could not have caught it.
+        fc_master_params p = goodParams();
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        const std::size_t frames = (std::size_t) (kFs * 4.0);
+        auto in = tone (frames, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+        fc_solution sol = 0;
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK
+            && sol != 0, "PRECONDITION: a real solution handle exists");
         std::int32_t lat = 0;
-        ok (fc_master_latency ((fc_master) 0, &lat) == FC_ERR_HANDLE, "and the reverse cannot even be formed");
+        ok (fc_master_latency ((fc_master) sol, &lat) == FC_ERR_HANDLE,
+            "a SOLUTION handle at a master entry point is refused, not reinterpreted");
+        ok (fc_master_destroy ((fc_master) sol) == FC_ERR_HANDLE, "and cannot be destroyed as a master");
+        ok (fc_solution_destroy (sol) == FC_OK, "while its own destroy accepts it");
         fc_master_destroy (h);
     }
 
@@ -694,6 +717,196 @@ int main()
             ok (fc_master_latency (h, &lat) == FC_OK, "and the handle survived all of it");
             fc_master_destroy (h);
         }
+    }
+
+
+    //==========================================================================
+    // The second crew round measured that none of this was covered: `solve`'s DELIVERED audio was never
+    // compared to anything, seven of the thirteen resolved fields were never read, and a handle that had
+    // solved could go straight back to `process` and render a third thing nobody asked for.
+    group ("solve: the delivered audio is the CORE's, bit for bit");
+    {
+        using namespace felitronics::mastering;
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        p.limiter.ceilingDbTp = -1.3;
+        p.compressor.thresholdDb = -17.3;
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 2;
+
+        const std::size_t frames = (std::size_t) (kFs * 6.0);
+        auto in = tone (frames, kNch);
+        std::vector<float> viaAbi (in.size(), 0.0f);
+        fc_solution sol = 0;
+        ok (fc_master_solve (h, &p, &req, in.data(), viaAbi.data(), (std::uint32_t) frames, &sol) == FC_OK,
+            "the ABI solve ran");
+        fc_solution_summary sum {}; FC_INIT (sum);
+        (void) fc_solution_summary_get (sol, &sum);
+
+        // The same search through the C++ API, with the same lifecycle order `fc_master_configure` takes.
+        MasteringChainConfig cc {};
+        cc.internalBlock = 256; cc.monoBass = true; cc.clipper = true;
+        MasteringChainParams cp {};
+        cp.limiter.ceilingDbTp = -1.3; cp.compressor.thresholdDb = -17.3;
+        MasteringChain chain;
+        OfflineRenderer rend;
+        TargetLoudnessSolver solver;
+        std::vector<float> viaCpp (in.size(), 0.0f);
+        const bool prepared = rend.prepare (kNch, 4096)
+                           && chain.prepare (kFs, kNch, cc)
+                           && solver.prepare (kFs, kNch, rend.blockSize(), chain.internalBlock(),
+                                              chain.tapOversampleFactor());
+        ok (prepared, "the direct C++ search is prepared the same way");
+        if (prepared)
+        {
+            LoudnessRequest lr {};
+            lr.targetLufs = -16.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 2;
+            const float* ip[2] { in.data(), in.data() + frames };
+            float*       op[2] { viaCpp.data(), viaCpp.data() + frames };
+            const LoudnessSolution direct = solver.solve (chain, rend, cp, ip, op, kNch, (int) frames, lr);
+            ok ((int) direct.status == sum.status, "the two verdicts agree");
+            ok (direct.preLimiterGainDb == sum.preLimiterGainDb, "and the gain, bit for bit");
+            ok (direct.ceilingDbTp == sum.ceilingDbTp, "and the ceiling");
+            std::size_t diff = 0;
+            for (std::size_t i = 0; i < viaAbi.size(); ++i)
+                if (std::memcmp (&viaAbi[i], &viaCpp[i], sizeof (float)) != 0) ++diff;
+            ok (diff == 0, "and the DELIVERED audio is bit-identical through the ABI");
+            double amp = 0.0, moved = 0.0;
+            for (std::size_t i = 0; i < viaAbi.size(); ++i)
+            {
+                amp = std::max (amp, (double) std::fabs (viaAbi[i]));
+                moved = std::max (moved, (double) std::fabs (viaAbi[i] - in[i]));
+            }
+            ok (amp > 0.05 && moved > 0.01, "PRECONDITION: the search actually rendered something");
+
+            fc_measurement meas {}; FC_INIT (meas);
+            (void) fc_solution_measurement (sol, &meas);
+            ok (meas.integratedLufs == direct.measured.integratedLufs, "the measurement crosses unchanged");
+            ok (meas.truePeakDbTp == direct.measured.truePeakDbTp, "true peak too");
+            ok (meas.loudnessRangeLu == direct.measured.loudnessRangeLu, "and the loudness range");
+
+            std::vector<fc_solve_pass> log ((std::size_t) sum.logCount + 1);
+            std::uint32_t written = 0;
+            (void) fc_solution_log (sol, log.data(), (std::uint32_t) log.size(), &written);
+            ok (written == (std::uint32_t) direct.logCount, "the log has the core's length");
+            bool logSame = (written > 0);
+            for (std::uint32_t i = 0; i < written; ++i)
+                if (log[i].gainDb != direct.log[i].gainDb || log[i].ceilingDb != direct.log[i].ceilingDb
+                    || log[i].integratedLufs != direct.log[i].integratedLufs
+                    || log[i].violated != direct.log[i].violated) logSame = false;
+            ok (logSame, "and every pass record crosses unchanged (gain, ceiling, loudness, mask)");
+        }
+        fc_solution_destroy (sol);
+        fc_master_destroy (h);
+    }
+
+    group ("solve leaves the handle holding the SOLVER's parameters, and says so");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        (void) fc_master_configure (h, &p, &r);
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1;
+        const std::size_t frames = (std::size_t) (kFs * 4.0);
+        auto in = tone (frames, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+        fc_solution sol = 0;
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK,
+            "a solve that ran");
+
+        auto blk = tone (256, kNch);
+        ok (fc_master_process (h, blk.data(), blk.data(), 256) == FC_ERR_STATE,
+            "process is REFUSED — the chain holds the solver's gain and ceiling, not the caller's");
+        std::vector<float> drain (2048 * kNch, 0.0f);
+        std::uint32_t w = 0;
+        ok (fc_master_flush (h, drain.data(), 2048, &w) == FC_ERR_STATE, "and so is flush");
+        ok (fc_master_reset (h) == FC_OK, "reset is accepted");
+        ok (fc_master_process (h, blk.data(), blk.data(), 256) == FC_ERR_STATE,
+            "and does NOT lift it: reset clears audio state and keeps the solver's parameters");
+        ok (fc_master_configure (h, &p, &r) == FC_OK, "configure is the way back");
+        ok (fc_master_process (h, blk.data(), blk.data(), 256) == FC_OK, "and process works again");
+        fc_solution_destroy (sol);
+        fc_master_destroy (h);
+    }
+
+    group ("resolved: every field is read out of the chain, not invented");
+    {
+        // Seven of these were never asserted anywhere, so a crossed or zeroed field was invisible.
+        // `tapOversampleFactor` is the sharp one: the header spends a paragraph on its NOT being
+        // `oversampleFactor`, and with a clipper but no limiter the two really do differ.
+        fc_master_config c = goodConfig();
+        c.clipper = 1; c.limiter = 0; c.oversampleFactor = 4;
+        fc_master h = 0;
+        ok (fc_master_create (&c, &h) == FC_OK, "a chain with a clipper and NO limiter");
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        ok (fc_master_configure (h, &p, &r) == FC_OK, "configured");
+        ok (r.oversampleFactor == 4, "oversampleFactor reports the CLIPPER's factor when there is no limiter");
+        ok (r.tapOversampleFactor == 1, "while the TAP stride is 1 — the two are different questions");
+        ok (r.limiterLatency == 0 && r.limiterLookahead == 0, "and the absent limiter costs no latency");
+        ok (r.clipperLatency > 0, "while the clipper's is real");
+        ok (r.latencySamples == r.internalBlock + r.compressorLookahead + r.clipperLatency + r.limiterLatency,
+            "and the total is the sum of the present stages plus the quantum");
+        ok (r.compressorTapOffset == 0, "the compressor tap sits at the chain input");
+        ok (r.limiterTapOffset == r.compressorLookahead + r.clipperLatency,
+            "and the limiter tap behind the stages in front of it");
+        fc_master_destroy (h);
+
+        fc_master_config c2 = goodConfig();
+        c2.limiter = 1; c2.clipper = 1;
+        fc_master h2 = 0;
+        ok (fc_master_create (&c2, &h2) == FC_OK, "and with a limiter present");
+        fc_master_resolved r2 {}; FC_INIT (r2);
+        ok (fc_master_configure (h2, &p, &r2) == FC_OK, "configured");
+        ok (r2.tapOversampleFactor == r2.oversampleFactor,
+            "the tap stride becomes the limiter's factor — PRECONDITION that the check above is live");
+        ok (r2.limiterLookahead > 0 && r2.limiterLatency > r2.limiterLookahead,
+            "the limiter's lookahead and its total latency are different numbers, and neither is zero");
+        fc_master_destroy (h2);
+    }
+
+    group ("a scalar out-parameter may not alias the audio it reports on");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        (void) fc_master_configure (h, &p, &r);
+        std::int32_t lat = 0; (void) fc_master_latency (h, &lat);
+        std::vector<float> out ((std::size_t) lat * kNch + 8, 0.0f);
+        // `written` pointed INTO the drain buffer: flush would write the audio and then overwrite its
+        // first sample with the frame count. The in/out overlap rule does not see this class at all.
+        auto* aliased = reinterpret_cast<std::uint32_t*> (out.data());
+        ok (fc_master_flush (h, out.data(), (std::uint32_t) lat, aliased) == FC_ERR_SPAN,
+            "flush refuses a `written` that points inside its own output");
+        std::uint32_t w = 0;
+        ok (fc_master_flush (h, out.data(), (std::uint32_t) lat, &w) == FC_OK && w == (std::uint32_t) lat,
+            "PRECONDITION: the same call with a separate `written` works");
+        fc_master_stats st {}; FC_INIT (st);
+        (void) fc_master_get_stats (h, &st);
+        ok (st.framesFlushed == (std::uint64_t) lat, "and framesFlushed counts what was drained");
+        fc_master_destroy (h);
+    }
+
+    group ("solve forwards the CORE's verdict for a degenerate length rather than answering for it");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0;
+        auto in = tone (16, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+        fc_solution sol = 0;
+        // `frames == 0` used to be an ABI refusal. The solver has its own answer for it and the contract
+        // says FC_OK means a verdict was obtained — answering for the core on one input and forwarding
+        // it on every other is two policies for one question.
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), 0, &sol) == FC_OK,
+            "zero frames still produces a VERDICT");
+        fc_solution_summary sum {}; FC_INIT (sum);
+        ok (fc_solution_summary_get (sol, &sum) == FC_OK && sum.status == FC_SOLVE_INVALID_REQUEST,
+            "and the verdict is the solver's InvalidRequest");
+        fc_solution_destroy (sol);
+        fc_master_destroy (h);
     }
 
     return felitronics::test::report();

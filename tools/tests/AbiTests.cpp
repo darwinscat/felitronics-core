@@ -159,6 +159,16 @@ int main()
 
         test::ok (fc_probe_block_energies (nullptr, 10) == 0, "a null output buffer writes nothing");
         test::ok (fc_probe_block_energies (big.data(), 0) == 0, "a zero capacity writes nothing");
+
+        // The OUTPUT is alignment-checked too, and it used not to be. The input side of this same file
+        // has refused a misaligned pointer since P0; the output side checked only the address range,
+        // which is the same rule applied in one direction. A page reads this span back as
+        // `new Float64Array(HEAPF64.buffer, ptr, n)` and that THROWS on a ptr that is not a multiple of
+        // 8, so the refusal replaces an exception in somebody's worker with a zero the caller can test.
+        const char* rawOut = reinterpret_cast<const char*> (big.data());
+        double* skewedOut = reinterpret_cast<double*> (const_cast<char*> (rawOut) + 1);
+        test::ok (fc_probe_block_energies (skewedOut, 4) == 0, "a misaligned output buffer writes nothing");
+        test::ok (big[0] != -1.0, "PRECONDITION: the aligned call above really did write, so this is a live check");
     }
 
     test::group ("the scalar entry points agree with the surface they are derived from");

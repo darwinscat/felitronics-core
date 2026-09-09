@@ -295,6 +295,10 @@ bool readInterleaved (const char* path, int nc, std::vector<float>& planar, std:
     float buf[8192];
     std::size_t got;
     while ((got = std::fread (buf, sizeof (float), 8192, f)) > 0) inter.insert (inter.end(), buf, buf + got);
+    // A READ ERROR IS NOT A SHORT FILE. Without this a truncated read becomes a successful render of a
+    // PREFIX — the harness gets a row, the row gets a number, and the number is of a programme nobody
+    // supplied. The same reason the ABI refuses rather than processing what it can.
+    if (std::ferror (f) != 0) { std::fclose (f); std::fprintf (stderr, "read error\n"); return false; }
     std::fclose (f);
     frames = inter.size() / (std::size_t) nc;
     planar.assign (frames * (std::size_t) nc, 0.0f);
@@ -324,8 +328,13 @@ bool writeInterleaved (const char* path, int nc, const std::vector<float>& plana
 // priming and the last D leave it only after the input has ended. This is `OfflineRenderer`'s formula
 // and it is re-stated rather than re-derived: the CLI cannot call that class through the C ABI, so the
 // arithmetic exists in both places and the selftest is what keeps them equal.
+// `inPlace = false` drives the OUT-OF-PLACE path — `fc_master_process(h, in, out, n)` with two distinct
+// buffers, which is what a page does (an input view and an output view) and which the in-place calls
+// never exercise: a crew round deleted the facade's `memcpy` outright and every check stayed green,
+// because nothing in this file or in the suite ever passed two different pointers with content behind
+// them. The copy is transport, but transport that is never run is transport that is never tested.
 bool abiRender (const Args& a, const std::vector<float>& in, std::size_t frames, int nc,
-                std::vector<float>& out, fc_master_resolved& res)
+                std::vector<float>& out, fc_master_resolved& res, bool inPlace = true)
 {
     fc_master h = 0;
     if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
@@ -343,6 +352,7 @@ bool abiRender (const Args& a, const std::vector<float>& in, std::size_t frames,
     // is not contiguous: it goes through a scratch buffer whose stride is the slice length, which is the
     // ABI's own layout rule applied honestly rather than by aliasing into the middle of a plane.
     std::vector<float> slice ((std::size_t) a.block * (std::size_t) nc);
+    std::vector<float> dest  ((std::size_t) a.block * (std::size_t) nc, 0.0f);
     std::size_t written = 0;
     for (std::size_t off = 0; off < frames; )
     {
@@ -350,10 +360,11 @@ bool abiRender (const Args& a, const std::vector<float>& in, std::size_t frames,
         for (int c = 0; c < nc; ++c)
             std::memcpy (slice.data() + (std::size_t) c * m, in.data() + (std::size_t) c * frames + off,
                          m * sizeof (float));
-        if (const fc_status st = fc_master_process (h, slice.data(), slice.data(), (std::uint32_t) m); st != FC_OK)
+        float* dst = inPlace ? slice.data() : dest.data();
+        if (const fc_status st = fc_master_process (h, slice.data(), dst, (std::uint32_t) m); st != FC_OK)
         { std::fprintf (stderr, "process: %s\n", statusName (st)); fc_master_destroy (h); return false; }
         for (int c = 0; c < nc; ++c)
-            std::memcpy (stream.data() + (std::size_t) c * stride + written, slice.data() + (std::size_t) c * m,
+            std::memcpy (stream.data() + (std::size_t) c * stride + written, dst + (std::size_t) c * m,
                          m * sizeof (float));
         written += m; off += m;
     }
@@ -527,9 +538,41 @@ int selftest (double fs, int nc)
     a.cfg.monoBass   = (nc == 2) ? 1 : 0;                 // stereo-only stage; exercised when it can be
     a.cfg.clipper    = 1;                                 // every stage present, so nothing is untested
 
-    // Values chosen NOT to be representable in binary32 and not to be the defaults. A parameter that
-    // survives a stray double->float narrowing unchanged (0.5, -1.0, 60) would let that narrowing pass
-    // this test, and a parameter left at its default would let a MISSING mapping pass it.
+    // EVERY field moved off its default, and none of them representable in binary32. Two separate
+    // failure modes are being closed here and both were measured: a value that survives a stray
+    // double->float narrowing unchanged (0.5, -1.0, 60) lets that narrowing pass, and a field left at
+    // its DEFAULT lets a MISSING mapping pass — because the direct path builds its parameters from the
+    // same `Args`, so a dropped field lands on the same default on both sides and the bit-compare is
+    // green. A crew round's own stand dropped nine fields this way and every one survived.
+    a.cfg.compressorLookaheadMs = 1.7;
+    a.cfg.limiterLookaheadMs    = 1.3;
+    a.cfg.tapsPerPhase          = 48;
+    a.cfg.oversampleFactor      = 2;
+    a.cfg.sidechainHpfHz        = 47.0;
+    a.cfg.internalBlock         = 128;
+    a.prm.compressor.detector   = FC_DETECTOR_RMS;     // NOT the default: a wrong-but-VALID enum
+    a.prm.compressor.link       = FC_LINK_MEAN_POWER;  // translation is invisible on default values
+    a.prm.compressor.mode       = FC_COMP_DOWN_COMPRESS;
+    a.prm.clipper.shape         = FC_SHAPE_ATAN;
+    a.prm.dither.shaping        = FC_SHAPING_PSYCHO;
+    a.prm.dither.autoBlank      = 0;
+    a.prm.dither.autoBlankSamples = 3777;
+    a.prm.compressor.autoMakeup = 1;
+    a.prm.eqBands[2].on         = 1;
+    a.prm.eqBands[2].type       = FC_FILTER_HIGH_SHELF;
+    a.prm.eqBands[2].swept      = 1;
+    a.prm.eqBands[2].lanes[3].on = 1;                  // a lane that is NOT lane 0
+    a.prm.eqBands[2].lanes[3].freq = 7331.7;
+    a.prm.eqBands[2].lanes[3].gainDb = 1.7;
+    a.prm.eqBands[2].lanes[3].q = 0.77;
+    a.prm.eqBands[2].lanes[4].on = 1;
+    a.prm.eqBands[2].lanes[4].bypass = 1;              // `bypass` is not `on`, and both are mapped
+    a.prm.eqBands[2].dyn.on     = 1;
+    a.prm.eqBands[2].dyn.rangeDb = -3.7;
+    a.prm.eqBands[2].dyn.thrDb  = -27.3;
+    a.prm.eqBands[2].dyn.thrAuto = 0;
+    a.prm.eqBands[2].dyn.atk    = 0.37;
+    a.prm.eqBands[2].dyn.rel    = 0.63;
     a.prm.inputGainDb        = -2.7;
     a.prm.preLimiterGainDb   =  1.3;
     a.prm.eqBands[0].on      = 1;
@@ -560,8 +603,11 @@ int selftest (double fs, int nc)
     a.prm.clipper.outputDb       = -0.7f;
     a.prm.clipper.autoComp       = 0.37f;
     a.prm.clipper.dcBlockHz      = 13.0f;
-    a.prm.bypassMonoBass         = 1;
-    a.prm.bypassDither           = 0;
+    // NO BYPASS FLAG IS SET IN THE MAIN SET, and that is a correction rather than an omission. An
+    // earlier draft set `bypassMonoBass` here to cover the bypass mapping — and thereby DISABLED the
+    // stage whose snap-versus-ramp is the only thing the lifecycle-order check can see, so the check
+    // that had caught `prepare`-then-`setParams` stopped catching it. A fixture that covers one thing
+    // by switching off another is not coverage. The bypass flags get their own comparison below.
     a.prm.compressor.rangeDb     = 37.0;
     a.prm.compressor.makeupDb    = 1.7;
     a.prm.compressor.rmsWindowMs = 7.7;
@@ -597,6 +643,50 @@ int selftest (double fs, int nc)
         char pre[128];
         std::snprintf (pre, sizeof pre, "output peaks at %.4f and differs from the input by up to %.4f", amp, delta);
         check (amp > 0.05 && delta > 0.01, "PRECONDITION: the chain actually did something", pre);
+    }
+
+    // --- 1b. THE OUT-OF-PLACE TRANSPORT PATH --------------------------------------------------------
+    // The one a page actually uses, and the one the in-place calls above cannot see. Deleting the
+    // facade's `memcpy` left every other check in this binary green.
+    {
+        std::vector<float> viaCopy; fc_master_resolved r2 {};
+        if (abiRender (a, in, frames, nc, viaCopy, r2, /*inPlace*/ false))
+        {
+            double worst = 0.0;
+            const std::size_t d = bitDiff (viaAbi, viaCopy, worst);
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "%zu differ, worst %.9g", d, worst);
+            check (d == 0, "in != out gives the same render as in == out", msg);
+        }
+        else check (false, "the out-of-place render ran");
+    }
+
+    // --- 1c. THE BYPASS FLAGS, in their own comparison ----------------------------------------------
+    // Separate from the main set on purpose: setting a bypass flag in the main fixture switches OFF the
+    // stage whose behaviour the lifecycle-order check depends on, so covering the flags there quietly
+    // removed a check instead of adding one.
+    {
+        Args b = a;
+        b.prm.bypassEq = 1; b.prm.bypassMonoBass = 1; b.prm.bypassCompressor = 1;
+        b.prm.bypassClipper = 1; b.prm.bypassLimiter = 1; b.prm.bypassDither = 1;
+        std::vector<float> bAbi, bCpp; fc_master_resolved rb {};
+        const bool ranB = abiRender (b, in, frames, nc, bAbi, rb) && directRender (b, in, frames, nc, bCpp);
+        check (ranB, "the all-bypassed render ran through both paths");
+        if (ranB)
+        {
+            double worst = 0.0;
+            const std::size_t d = bitDiff (bAbi, bCpp, worst);
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "%zu differ, worst %.9g", d, worst);
+            check (d == 0, "every bypass flag maps identically through the ABI", msg);
+            // And the flags must actually DO something, or this comparison passes for the wrong reason.
+            double delta = 0.0;
+            for (std::size_t i = 0; i < bAbi.size(); ++i)
+                delta = std::max (delta, (double) std::fabs (bAbi[i] - viaAbi[i]));
+            char pre[128];
+            std::snprintf (pre, sizeof pre, "bypassed vs active differ by up to %.4f", delta);
+            check (delta > 0.01, "PRECONDITION: the bypass flags changed the render", pre);
+        }
     }
 
     // --- 2. BLOCK INDEPENDENCE THROUGH THE ABI ------------------------------------------------------

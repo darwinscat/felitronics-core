@@ -137,6 +137,14 @@ FC_EXPORT int           fc_probe_dropped      (void) { return haveResult ? probe
 FC_EXPORT std::uint32_t fc_probe_block_energies (double* out, std::uint32_t cap)
 {
     if (out == nullptr || ! haveResult) return 0;
+    // ALIGNMENT, on the OUTPUT as well as the input. This file already refuses a misaligned `const
+    // float*` on the way in and used to check only the address range on the way out, which is the same
+    // rule applied in one direction — and the asymmetry is not harmless: a page reads this span back as
+    // `new Float64Array(HEAPF64.buffer, ptr, n)`, which THROWS on a `ptr` that is not a multiple of 8.
+    // A refusal here is a zero the caller can test; the alternative is an exception in somebody's
+    // worker with nothing pointing at the cause. (Found while fixing the same class in fc_master.cpp,
+    // which had it on every scalar out-parameter.)
+    if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return 0;
     const std::uint32_t n = (std::uint32_t) probe().gatingBlockCount();
     const std::uint32_t m = n < cap ? n : cap;
     if (! inHeap (out, (std::uint64_t) m * sizeof (double))) return 0;   // the output span must fit too
