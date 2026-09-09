@@ -664,6 +664,11 @@ int main()
             ok (sum.status == FC_SOLVE_INVALID_REQUEST, "which is the solver's own InvalidRequest");
             ok (fc_master_configure (h, &p, &r) == FC_OK,
                 "and a solve that refused BEFORE rendering left the chain configurable");
+            // AND LEFT IT PROCESSABLE. `configure` alone cannot see the difference — it is not gated on
+            // the solved mark — so a mutant that set the mark unconditionally survived the check above.
+            auto blk2 = tone (256, kNch);
+            ok (fc_master_process (h, blk2.data(), blk2.data(), 256) == FC_OK,
+                "and streamable: a solve that never rendered did not mark the handle as solved");
             fc_solution_destroy (sol);
             fc_master_destroy (h);
         }
@@ -744,7 +749,7 @@ int main()
         req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 2;
         // NOT the default 0.1: a field left at its default cannot catch a mapping that drops it, and a
         // mutant that dropped `toleranceLu` survived for exactly that reason.
-        req.toleranceLu = 0.037;
+        req.toleranceLu = 0.002;
         req.truePeakAimDb = 0.073;
         // EVERY request field off its default. A crew round dropped ten of them one at a time and every
         // one survived, because every fixture set target/tp/maxPasses and left the rest where the
@@ -757,6 +762,9 @@ int main()
         req.initialGainDb = 1.7;
         req.limiterGr.limitDb = 17.3;    req.limiterGr.statistic = FC_GR_P95;
         req.compressorGr.limitDb = 23.7; req.compressorGr.statistic = FC_GR_MEAN;
+        // A TOLERANCE FINER THAN THE SEARCH'S OWN STEP, so dropping it (back to the default 0.1) really
+        // does change where the search stops. At 0.037 a mutant that dropped it still converged inside
+        // both tolerances and survived — a field is only pinned where its value is the binding one.
 
         const std::size_t frames = (std::size_t) (kFs * 6.0);
         auto in = tone (frames, kNch);
@@ -785,7 +793,7 @@ int main()
         {
             LoudnessRequest lr {};
             lr.targetLufs = -16.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 2;
-            lr.toleranceLu = 0.037; lr.truePeakAimDb = 0.073;
+            lr.toleranceLu = 0.002; lr.truePeakAimDb = 0.073;
             lr.minPlrDb = 3.7; lr.maxLraLossLu = 7.3; lr.inputLoudnessRangeLu = 5.3;
             lr.activityThresholdDb = 0.37; lr.initialGainDb = 1.7;
             lr.limiterGr.limitDb = 17.3;    lr.limiterGr.statistic = GrStatistic::P95;

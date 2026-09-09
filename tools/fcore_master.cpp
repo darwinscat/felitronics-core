@@ -740,6 +740,35 @@ int selftest (double fs, int nc)
         }
     }
 
+    // --- 1d. A MINIMAL TOPOLOGY -----------------------------------------------------------------
+    // Dither alone. Two reasons, both of them measured rather than tidy: a field is only pinned in a
+    // topology where it can be SEEN, and `dither.autoBlankSamples` cannot be seen through the full
+    // chain — the limiter's tail is not exact digital zero, so the auto-blank never fires and 3777
+    // against the default 4096 renders identically. Through a dither-only chain the same pair differs
+    // in 433 bytes. It also exercises the corner where almost every stage is absent, which the full
+    // fixture cannot.
+    {
+        Args b = a;
+        b.cfg.eq = b.cfg.monoBass = b.cfg.compressor = b.cfg.clipper = b.cfg.limiter = 0;
+        b.cfg.dither = 1;
+        std::vector<float> mAbi, mCpp; fc_master_resolved rm {};
+        const bool ranM = abiRender (b, in, frames, nc, mAbi, rm) && directRender (b, in, frames, nc, mCpp);
+        check (ranM, "the dither-only render ran through both paths");
+        if (ranM)
+        {
+            double worst = 0.0;
+            const std::size_t d = bitDiff (mAbi, mCpp, worst);
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "%zu differ, worst %.9g", d, worst);
+            check (d == 0, "a topology with almost every stage ABSENT maps identically", msg);
+            char lat[96];
+            std::snprintf (lat, sizeof lat, "latency %d against the full chain's %d",
+                           rm.latencySamples, res.latencySamples);
+            check (rm.latencySamples < res.latencySamples,
+                   "PRECONDITION: the absent stages really are absent — the latency dropped", lat);
+        }
+    }
+
     // --- 2. BLOCK INDEPENDENCE THROUGH THE ABI ------------------------------------------------------
     // The chain's fixed internal quantum is what makes this a theorem rather than a hope; this checks
     // that the ABI does not route around it, which it would the moment it re-blocked anything itself.
@@ -812,6 +841,38 @@ int selftest (double fs, int nc)
         std::int32_t lat = 0;
         check (fc_master_latency (h, &lat) == FC_ERR_HANDLE, "the stale handle is refused, not aliased");
         fc_master_destroy (again);
+    }
+
+
+    // --- 5. THE CLI'S OWN ARGUMENT PARSER --------------------------------------------------------
+    // It lives in this binary and had no test at all, so its strictness was a claim in a comment. A
+    // mutation stand removed the full-parse check and nothing went red; another removed the channel
+    // check that stands in front of a division and nothing went red either.
+    {
+        Args t;
+        fc_master_config_default (&t.cfg);
+        fc_master_params_default (&t.prm);
+        fc_loudness_request_default (&t.req);
+        check (applyKey (t, "lim.ceiling", "-1.5"), "a good numeric key is accepted");
+        check (! applyKey (t, "lim.ceiling", "oops"), "a non-numeric value is REFUSED, not read as 0");
+        check (! applyKey (t, "comp.ratio", "4oops"), "and so is a numeric prefix with a tail");
+        check (! applyKey (t, "comp.ratio", ""), "and an empty value");
+        check (! applyKey (t, "block", "4294967296"),
+               "a block that cannot fit a positive int is refused — it used to narrow to 0 and HANG");
+        check (! applyKey (t, "block", "0"), "and so is a zero block");
+        check (applyKey (t, "block", "128"), "while a real one is accepted");
+        check (! applyKey (t, "band4294967296.gain", "6"),
+               "a band index past the array is refused — it used to narrow onto band 0");
+        check (! applyKey (t, "bandXYZ.gain", "6"), "and so is a non-numeric one");
+        check (applyKey (t, "band3.gain", "6"), "while a real band is accepted");
+        check (! applyKey (t, "nosuchkey", "1"), "an unknown key is an error, not a shrug");
+        check (! applyKey (t, "comp.detector", "sideways"), "and so is an unknown enum name");
+        check (applyKey (t, "comp.detector", "rms"), "while a real one is accepted");
+        double d = 0.0; long i = 0;
+        check (positional ("48000", d) && d == 48000.0, "a positional rate parses");
+        check (! positional ("48000oops", d), "and one with a tail does not");
+        check (! positional ("2x", i), "nor does a channel count with a tail");
+        check (positional ("2", i) && i == 2, "while a real one does");
     }
 
     std::printf ("%s — %d failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
