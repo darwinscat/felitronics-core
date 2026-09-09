@@ -583,21 +583,35 @@ private:
 
         // --- the gate, ahead of everything (see the header note) -------------------------------
         // The substitution is COUNTED, and the count is the whole point: a gate that silently replaces
-        // a NaN gives a caller a plausible render of a programme it never submitted. Splitting the
-        // branch out of `std::clamp(isfinite(v) ? v : 0.0f, ...)` is bit-identical — the old form
-        // clamped 0.0f, which is 0.0f — and it costs nothing, because the isfinite test was already
-        // there. Counting rather than REFUSING is deliberate: the chain's answer to a bad sample is one
-        // rule that does not depend on which stages are on (feeding a NaN is bit-identical to feeding
-        // the sanitised value), while refusing the call would throw away every good sample travelling
-        // with the bad one — and the size of that loss would depend on the caller's block size, which
-        // is the one thing the internal quantum exists to make irrelevant.
+        // a NaN gives a caller a plausible render of a programme it never submitted. Counting rather
+        // than REFUSING is deliberate: the chain's answer to a bad sample is one rule that does not
+        // depend on which stages are on (feeding a NaN is bit-identical to feeding the sanitised
+        // value), while refusing the call would throw away every good sample travelling with the bad
+        // one — and the size of that loss would depend on the caller's block size, which is the one
+        // thing the internal quantum exists to make irrelevant.
+        //
+        // 🔴 THE SHAPE OF THE COUNTER IS NOT A STYLE CHOICE, and the first version of it was wrong.
+        // Writing this as `if (! isfinite(v)) { ...; ++member; } else ...` reads as the same code and
+        // is not: a data-dependent branch and a store to a member inside the loop stop the compiler
+        // vectorising the gate, and the whole gate is a hot per-sample pass over every input sample of
+        // every quantum. MEASURED, arm64 Release, best of seven interleaved runs over 20 000 quanta:
+        // 1.357 ms for the original branchless form, **3.536 ms for the branch — x2.61** — and the
+        // commit that introduced it claimed it "costs nothing". A crew round measured x2.66
+        // independently on the whole chain. The form below keeps the ORIGINAL EXPRESSION verbatim, so
+        // the arithmetic is unarguably unchanged, and accumulates into a LOCAL that is folded in once
+        // per plane: 1.369 ms, x1.01. Free is a measurement, not an adjective.
         for (int c = 0; c < nch_; ++c)
+        {
+            std::uint32_t bad = 0;
             for (int i = 0; i < K_; ++i)
             {
                 const float v = ch[c][i];
-                if (! std::isfinite (v)) { ch[c][i] = 0.0f; ++nonFiniteIn_; }
-                else                       ch[c][i] = std::clamp (v, -1.0e6f, 1.0e6f);
+                const bool  fin = std::isfinite (v);
+                bad += fin ? 0u : 1u;
+                ch[c][i] = std::clamp (fin ? v : 0.0f, -1.0e6f, 1.0e6f);
             }
+            nonFiniteIn_ += bad;
+        }
 
         applyGain (ch, inputGain_);
 

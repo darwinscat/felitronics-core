@@ -733,6 +733,10 @@ int main()
         p.compressor.thresholdDb = -17.3;
         fc_loudness_request req {}; fc_loudness_request_default (&req);
         req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 2;
+        // NOT the default 0.1: a field left at its default cannot catch a mapping that drops it, and a
+        // mutant that dropped `toleranceLu` survived for exactly that reason.
+        req.toleranceLu = 0.037;
+        req.truePeakAimDb = 0.073;
 
         const std::size_t frames = (std::size_t) (kFs * 6.0);
         auto in = tone (frames, kNch);
@@ -761,6 +765,7 @@ int main()
         {
             LoudnessRequest lr {};
             lr.targetLufs = -16.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 2;
+            lr.toleranceLu = 0.037; lr.truePeakAimDb = 0.073;
             const float* ip[2] { in.data(), in.data() + frames };
             float*       op[2] { viaCpp.data(), viaCpp.data() + frames };
             const LoudnessSolution direct = solver.solve (chain, rend, cp, ip, op, kNch, (int) frames, lr);
@@ -784,6 +789,17 @@ int main()
             ok (meas.integratedLufs == direct.measured.integratedLufs, "the measurement crosses unchanged");
             ok (meas.truePeakDbTp == direct.measured.truePeakDbTp, "true peak too");
             ok (meas.loudnessRangeLu == direct.measured.loudnessRangeLu, "and the loudness range");
+            // `valid` is a FLAG, and a mutant that hard-coded it to 1 survived because nothing read it.
+            ok (meas.compressor.valid == (direct.measured.compressor.valid ? 1 : 0)
+                && meas.limiter.valid == (direct.measured.limiter.valid ? 1 : 0),
+                "and both gain-reduction summaries carry the core's own validity, not a constant");
+            ok (meas.limiter.maxDb == direct.measured.limiter.maxDb
+                && meas.compressor.p95Db == direct.measured.compressor.p95Db,
+                "and their numbers cross unchanged");
+            // THE PASS BUDGET REACHED THE SOLVER. Dropping `maxPasses` from the mapping left the default
+            // (4) in its place, and a search that converged inside two passes anyway did not notice.
+            ok (sum.passes <= 2 + 1,
+                "the search spent no more than the budget the request carried (+1 for delivering)");
 
             std::vector<fc_solve_pass> log ((std::size_t) sum.logCount + 1);
             std::uint32_t written = 0;
@@ -907,6 +923,126 @@ int main()
             "and the verdict is the solver's InvalidRequest");
         fc_solution_destroy (sol);
         fc_master_destroy (h);
+    }
+
+
+    //==========================================================================
+    // The pre-merge diff pass ran its own mutations and eight survived. These are the checks that would
+    // have killed them — written from the mutants, not from the code, so each one names what it kills.
+    group ("the diff pass's survivors");
+    {
+        using namespace felitronics::mastering;
+
+        // 1. `measure_lra` must be the CORE's number, not a number this file touched. A mutant adding
+        //    0.5 LU to the result survived: the only check on it was a wide interval.
+        {
+            fc_master h = make();
+            const std::size_t frames = (std::size_t) (kFs * 8.0);
+            auto in = tone (frames, kNch);
+            // THE RANGE LIVES IN CHANNEL 1 ONLY, and channel 0 is a steady tone. With the modulation in
+            // both planes, a mutant that read channel 0 for every plane measured the same range and
+            // survived — the fixture could not tell "both channels" from "channel 0 twice".
+            for (std::size_t i = 0; i < frames; ++i)
+                if ((i / 48000) % 2 == 0) in[frames + i] *= 0.05f;
+            double viaAbi = 0.0;
+            ok (fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &viaAbi) == FC_OK, "measured");
+
+            TargetLoudnessSolver solver;
+            ok (solver.prepare (kFs, kNch, 4096, 256, 4), "a direct solver for the same measurement");
+            const float* ip[2] { in.data(), in.data() + frames };
+            double direct = 0.0;
+            ok (solver.measureInputLoudnessRange (ip, kNch, (int) frames, direct), "the core measured too");
+            ok (viaAbi == direct, "and the two are the SAME NUMBER, bit for bit");
+            ok (direct > 0.5, "PRECONDITION: the fixture has a range, so an added offset would show");
+            fc_master_destroy (h);
+        }
+
+        // 2. `framesFlushed` ACCUMULATES. A mutant that made it the size of the LAST flush survived,
+        //    because nothing ever flushed twice.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            (void) fc_master_configure (h, &p, &r);
+            std::int32_t lat = 0; (void) fc_master_latency (h, &lat);
+            std::vector<float> out ((std::size_t) lat * kNch, 0.0f);
+            std::uint32_t w = 0;
+            ok (fc_master_flush (h, out.data(), (std::uint32_t) lat, &w) == FC_OK, "one flush");
+            ok (fc_master_flush (h, out.data(), (std::uint32_t) lat, &w) == FC_OK, "and another");
+            fc_master_stats st {}; FC_INIT (st);
+            (void) fc_master_get_stats (h, &st);
+            ok (st.framesFlushed == (std::uint64_t) lat * 2u,
+                "framesFlushed is the RUNNING TOTAL, not the size of the last call");
+            fc_master_destroy (h);
+        }
+
+        // 3. A solution OUTLIVES the chain that produced it. The header promises it; a mutant that
+        //    destroyed every solution along with its master survived, because nothing read one after.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -16.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1;
+            const std::size_t frames = (std::size_t) (kFs * 4.0);
+            auto in = tone (frames, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_solution sol = 0;
+            ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK,
+                "a solve");
+            fc_solution_summary before {}; FC_INIT (before);
+            ok (fc_solution_summary_get (sol, &before) == FC_OK, "readable while the master lives");
+            ok (fc_master_destroy (h) == FC_OK, "the master is destroyed");
+            fc_solution_summary after {}; FC_INIT (after);
+            ok (fc_solution_summary_get (sol, &after) == FC_OK, "and the SOLUTION is still readable");
+            ok (after.preLimiterGainDb == before.preLimiterGainDb && after.status == before.status,
+                "with the same verdict it had");
+            ok (fc_solution_destroy (sol) == FC_OK, "and it is destroyed separately, as documented");
+        }
+
+        // 4. The channel weight must REACH the solver. A mutant that dropped the forwarding survived,
+        //    because the weight tests asserted statuses and never an effect.
+        {
+            fc_master_config c = goodConfig();
+            c.channels = 3; c.monoBass = 0;                     // mono-bass is stereo-only
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "a three-channel chain");
+            const std::size_t frames = (std::size_t) (kFs * 8.0);
+            std::vector<float> in (frames * 3, 0.0f);
+            for (std::size_t i = 0; i < frames; ++i)            // content ONLY in channel 2
+                in[2 * frames + i] = (float) (((i / 48000) % 2 ? 0.5 : 0.05)
+                                              * std::sin (2.0 * 3.14159265358979 * 300.0 * (double) i / kFs));
+            double withIt = 0.0;
+            ok (fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &withIt) == FC_OK,
+                "PRECONDITION: at weight 1 the programme is measurable");
+            ok (withIt > 0.5, "PRECONDITION: and it has a real range to lose");
+            ok (fc_master_set_channel_weight (h, 2, 0.0) == FC_OK, "now exclude the only channel with audio");
+            double without = -1.0;
+            ok (fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &without) == FC_OK,
+                "the call still succeeds");
+            ok (without == 0.0 && without != withIt,
+                "but the RANGE collapses to zero — so the weight really reached the meter");
+            // ⚠️ NB the value it collapses to is `0.0`, which is also what "no dynamic range at all"
+            // reports. `measureInputLoudnessRange` cannot tell those apart — the same objection
+            // `MasterMeasurement::lraValid` exists for one level up. That is a CORE gap, recorded in
+            // the findings rather than papered over here, and this check pins today's behaviour so a
+            // future fix to it is a deliberate change rather than a surprise.
+            fc_master_destroy (h);
+        }
+
+        // 5. The declared check order. A call that is illegal for the HANDLE says so before it says
+        //    anything about the structs it carries.
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            (void) fc_master_configure (h, &p, &r);
+            auto blk = tone (256, kNch);
+            (void) fc_master_process (h, blk.data(), blk.data(), 256);
+            fc_master_params bad = p; bad.header.abiVersion = 999u;
+            ok (fc_master_configure (h, &bad, &r) == FC_ERR_STATE,
+                "mid-stream AND mis-versioned answers STATE — the handle's state comes first");
+            fc_master_destroy (h);
+        }
     }
 
     return felitronics::test::report();

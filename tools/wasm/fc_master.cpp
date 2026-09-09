@@ -706,14 +706,19 @@ FC_EXPORT fc_status fc_master_configure (fc_master h, const fc_master_params* pa
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkHeaderIn (params); st != FC_OK) return st;
-    if (const fc_status st = checkHeaderOut (resolved); st != FC_OK) return st;
-
     auto& m = *s->master;
+    // THE HANDLE'S STATE COMES SECOND, before the structs are looked at, because a call that is illegal
+    // for THIS HANDLE is illegal whatever else it carries — and the contract states the order, which is
+    // what makes one malformed call have one answer. It used to sit after the header checks, so a
+    // configure during a stream that also had a stale ABI version answered FC_ERR_ABI_VERSION and sent
+    // the caller to fix the wrong thing.
+    //
     // Re-preparing would silently discard a stream in progress. Refused, and `fc_master_reset` is how a
     // caller gets back to the head of one — see the long note in fc_master_abi.h for why this call has
     // to re-prepare at all.
     if (m.audioSeen) return FC_ERR_STATE;
+    if (const fc_status st = checkHeaderIn (params); st != FC_OK) return st;
+    if (const fc_status st = checkHeaderOut (resolved); st != FC_OK) return st;
 
     MasteringChainParams cp {};
     if (const fc_status st = toCore (*params, cp); st != FC_OK) return st;
@@ -775,12 +780,11 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
 {
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
-    *written = 0;
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
-
     if (m.solverRan) return FC_ERR_STATE;   // as process(): the chain's configuration is not the caller's
+    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
+    *written = 0;
     if (capacity == 0) return FC_ERR_CAPACITY;
     if (capacity > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
     // A capacity below the latency cannot drain the tail, and the core keeps no arrears, so a second

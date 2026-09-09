@@ -146,8 +146,10 @@ bool applyBandKey (Args& a, const std::string& key, const std::string& val)
     // as band 0 and quietly apply the value to the wrong band.
     long idxL = 0;
     if (! inum (key.substr (4, dot - 4), idxL)) return false;
+    // RANGE BEFORE THE CAST. `(int) 4294967296` is 0, so a band index far out of range would land on
+    // band 0 and quietly apply the value to the wrong band — the same shape as the `block` hang above.
+    if (idxL < 0 || idxL >= FC_MAX_EQ_BANDS) return false;
     const int idx = (int) idxL;
-    if (idx < 0 || idx >= FC_MAX_EQ_BANDS) return false;
     const std::string f = key.substr (dot + 1);
     fc_eq_band& b = a.prm.eqBands[idx];
     static const char* kTypes[] { "bell", "lowshelf", "highshelf", "highpass", "lowpass",
@@ -179,7 +181,10 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     #define FC_D(expr) do { if (! dOk) return false; expr; return true; } while (0)
     #define FC_I(expr) do { if (! iOk) return false; expr; return true; } while (0)
 
-    if (key == "block")          { FC_I (a.block = (std::uint32_t) (i > 0 ? i : 1)); }
+    // A `block` that does not fit a positive int is REFUSED. `(uint32_t) 4294967296` is 0, and a block
+    // of zero makes the render loop stop advancing — a hang, out of a typo, with no message.
+    if (key == "block")          { if (! iOk || i < 1 || i > 0x7FFFFFFF) return false;
+                                   a.block = (std::uint32_t) i; return true; }
     if (key == "internalBlock")  { FC_I (a.cfg.internalBlock = i); }
     if (key == "oversample")     { FC_I (a.cfg.oversampleFactor = i); }
     if (key == "taps")           { FC_I (a.cfg.tapsPerPhase = i); }
@@ -268,6 +273,11 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     return false;
 }
 
+// The POSITIONAL arguments deserve the same strictness as the keys: `fcore_master render 48000oops 2 …`
+// used to become 48000, and `2oops` became 2, so the whole run described a geometry nobody typed.
+bool positional (const char* text, double& out) { return num (std::string (text), out); }
+bool positional (const char* text, long& out)   { return inum (std::string (text), out); }
+
 bool parseArgs (Args& a, int argc, char** argv, int from)
 {
     fc_master_config_default (&a.cfg);
@@ -300,6 +310,11 @@ bool readInterleaved (const char* path, int nc, std::vector<float>& planar, std:
     // supplied. The same reason the ABI refuses rather than processing what it can.
     if (std::ferror (f) != 0) { std::fclose (f); std::fprintf (stderr, "read error\n"); return false; }
     std::fclose (f);
+    // A TRAILING PARTIAL FRAME IS NOT A SHORT FILE EITHER. Integer division swallowed it, so a file of
+    // 8193 floats at two channels rendered its first 4096 frames and exited 0 — a harness row for a
+    // programme that is not the one on disk. Same rule as everywhere else here: refuse, do not truncate.
+    if (inter.size() % (std::size_t) nc != 0)
+    { std::fprintf (stderr, "input is not a whole number of %d-channel frames\n", nc); return false; }
     frames = inter.size() / (std::size_t) nc;
     planar.assign (frames * (std::size_t) nc, 0.0f);
     for (std::size_t i = 0; i < frames; ++i)
@@ -499,8 +514,10 @@ std::size_t bitDiff (const std::vector<float>& a, const std::vector<float>& b, d
 }
 
 // A programme with something for every stage to do: two tones, a slow envelope so the compressor moves,
-// and periodic transients so the limiter and the clipper are not asleep. A fixture on which every stage
-// is inert would make this whole comparison pass for the wrong reason.
+// periodic transients so the limiter and the clipper are not asleep, DIFFERENT CONTENT PER CHANNEL so a
+// planar-addressing fault is visible, and a stretch of EXACT DIGITAL SILENCE at the end so the dither's
+// auto-blank has something to blank — without which `autoBlankSamples` maps for free. A fixture on which
+// a stage is inert makes the whole comparison pass for the wrong reason, one field at a time.
 std::vector<float> programme (double fs, int nc, std::size_t frames)
 {
     std::vector<float> v (frames * (std::size_t) nc, 0.0f);
@@ -512,6 +529,8 @@ std::vector<float> programme (double fs, int nc, std::size_t frames)
             double x = env * (0.6 * std::sin (2.0 * 3.14159265358979 * (220.0 + 55.0 * c) * t)
                             + 0.3 * std::sin (2.0 * 3.14159265358979 * 3100.0 * t));
             if (i % 9600 < 24) x += 0.55;                      // transients, 5 per second
+            // The last eighth is exact digital silence — the auto-blank's own trigger.
+            if (i >= frames - frames / 8) x = 0.0;
             v[(std::size_t) c * frames + i] = (float) x;
         }
     return v;
@@ -553,23 +572,36 @@ int selftest (double fs, int nc)
     a.prm.compressor.detector   = FC_DETECTOR_RMS;     // NOT the default: a wrong-but-VALID enum
     a.prm.compressor.link       = FC_LINK_MEAN_POWER;  // translation is invisible on default values
     a.prm.compressor.mode       = FC_COMP_DOWN_COMPRESS;
-    a.prm.clipper.shape         = FC_SHAPE_ATAN;
+    // ASYM with a bias, not Atan: the DC blocker only has anything to remove when the shaper is
+    // asymmetric, so `dcBlockHz` is unmappable-for-free on any symmetric shape.
+    a.prm.clipper.shape         = FC_SHAPE_ASYM;
     a.prm.dither.shaping        = FC_SHAPING_PSYCHO;
     a.prm.dither.autoBlank      = 0;
     a.prm.dither.autoBlankSamples = 3777;
     a.prm.compressor.autoMakeup = 1;
     a.prm.eqBands[2].on         = 1;
     a.prm.eqBands[2].type       = FC_FILTER_HIGH_SHELF;
-    a.prm.eqBands[2].swept      = 1;
+    // `swept` is inert unless the band is a CUT/notch/band-pass with ONLY the Stereo lane enabled
+    // (`EqBand.h:156`), so band 2 — a high shelf on lanes 3 and 4 — cannot show it and the flag mapped
+    // for free. It goes on band 0, the high-pass, which is exactly that configuration.
+    a.prm.eqBands[0].swept      = 1;
     a.prm.eqBands[2].lanes[3].on = 1;                  // a lane that is NOT lane 0
     a.prm.eqBands[2].lanes[3].freq = 7331.7;
     a.prm.eqBands[2].lanes[3].gainDb = 1.7;
     a.prm.eqBands[2].lanes[3].q = 0.77;
+    // A BYPASSED LANE MUST BE DISTINGUISHABLE FROM AN ABSENT ONE, or `bypass` is unmapped for free: a
+    // lane at its default 0 dB does nothing whether it is bypassed or not, so the flag needs a lane
+    // that WOULD be audible.
     a.prm.eqBands[2].lanes[4].on = 1;
+    a.prm.eqBands[2].lanes[4].freq = 313.7;
+    a.prm.eqBands[2].lanes[4].gainDb = 5.3;
+    a.prm.eqBands[2].lanes[4].q = 1.3;
     a.prm.eqBands[2].lanes[4].bypass = 1;              // `bypass` is not `on`, and both are mapped
     a.prm.eqBands[2].dyn.on     = 1;
-    a.prm.eqBands[2].dyn.rangeDb = -3.7;
-    a.prm.eqBands[2].dyn.thrDb  = -27.3;
+    // Engaged, not merely enabled: an absolute threshold well inside the programme's own level, and a
+    // range big enough to hear. Otherwise `thrAuto` (absolute vs relative) changes nothing measurable.
+    a.prm.eqBands[2].dyn.rangeDb = -9.3;
+    a.prm.eqBands[2].dyn.thrDb  = -20.3;
     a.prm.eqBands[2].dyn.thrAuto = 0;
     a.prm.eqBands[2].dyn.atk    = 0.37;
     a.prm.eqBands[2].dyn.rel    = 0.63;
@@ -795,8 +827,11 @@ int main (int argc, char** argv)
         if (argc < 5) { std::fprintf (stderr, "lra needs <sampleRate> <channels> <in.f32le>\n"); return 2; }
         Args a;
         if (! parseArgs (a, argc, argv, 5)) return 2;
-        a.cfg.sampleRate = std::atof (argv[2]);
-        a.cfg.channels   = std::atoi (argv[3]);
+        double sr = 0.0; long nc = 0;
+        if (! positional (argv[2], sr) || ! positional (argv[3], nc))
+        { std::fprintf (stderr, "sampleRate and channels must be numbers\n"); return 2; }
+        a.cfg.sampleRate = sr;
+        a.cfg.channels   = (std::int32_t) nc;
         // BEFORE the read, not after: `readInterleaved` divides by the channel count, so a zero here is
         // an integer division by zero — undefined behaviour where the contract promises a refusal.
         if (a.cfg.channels < 1 || a.cfg.channels > core::kMaxChannels)
@@ -819,10 +854,13 @@ int main (int argc, char** argv)
     if (argc < 6) { std::fprintf (stderr, "need <sampleRate> <channels> <in.f32le> <out.f32le>\n"); return 2; }
     Args a;
     if (! parseArgs (a, argc, argv, 6)) return 2;
-    a.cfg.sampleRate = std::atof (argv[2]);
-    a.cfg.channels   = std::atoi (argv[3]);
+    double sr = 0.0; long ncL = 0;
+    if (! positional (argv[2], sr) || ! positional (argv[3], ncL))
+    { std::fprintf (stderr, "sampleRate and channels must be numbers\n"); return 2; }
+    a.cfg.sampleRate = sr;
+    if (ncL < 1 || ncL > core::kMaxChannels) { std::fprintf (stderr, "bad channel count\n"); return 2; }
+    a.cfg.channels   = (std::int32_t) ncL;
     const int nc = a.cfg.channels;
-    if (nc < 1 || nc > core::kMaxChannels) { std::fprintf (stderr, "bad channel count\n"); return 2; }
 
     std::vector<float> in; std::size_t frames = 0;
     if (! readInterleaved (argv[4], nc, in, frames)) return 2;
