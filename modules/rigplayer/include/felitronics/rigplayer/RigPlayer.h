@@ -20,6 +20,8 @@
 //   • A slot that has stood silent under an unchanged request for kColdAfterSeconds goes COLD and its
 //     model stops being run on audio — a dial parked on a capture costs one network, not two. It is
 //     still HANDED the call, at width zero, until the stage has drained the silence it owes (law 11c);
+//     sleeping is inaudible AT THE MODEL RATE and, off it, costs the woken slot's rate-matcher latency
+//     once on the block of the wake (4.97e-03 at 44.1 kHz against a 0.1 input) — see warmFor;
 //     that is one bounded drain per sleep and nothing after it, and without it the slot replayed what
 //     it was holding when it fell asleep — 0.500000 out of digital silence. The law owns the flag
 //     (BlendState::cold) and wakes the slot, warm-up first, the moment the request changes; the model
@@ -1185,6 +1187,21 @@ private:
     // was a GUARANTEE, and a guarantee that quietly stopped holding is worse than a smaller number.
     long long warmFor(const felitronics::nam::NamStage& st) const {
         const int pre = st.prewarmSamples();
+        // 🔴 AND THIS EARLY RETURN DROPS THE LATENCY TERM TOO, which is a different claim from "no
+        // field, no warm-up" and is the one that costs something. A capture with no memory still runs
+        // through a rate-matcher off the model rate, and a slot that has just been WOKEN starts by
+        // emitting that matcher's `latencySamples()` leading zeros — 61 at 44.1 kHz, 96 at 96 kHz.
+        // Returning zero here makes the law audible-immediately for exactly those captures, so the
+        // woken slot contributes a hole where a slot that never slept contributes signal. Measured
+        // against a player that never sleeps, 0.1 input, on the block of the wake: **4.97e-03 at
+        // 44.1 kHz and 7.28e-03 at 96 kHz**, and 3.76e-07 for a capture that HAS memory, which does not
+        // take this branch. Removing the early return was measured too: 96 kHz goes to exactly
+        // 0.000000000 and 44.1 to 2.87e-06, i.e. down to the rate-matcher's own resumption floor.
+        // It is NOT removed here — it moves the warm-up of every memoryless capture in every consumer,
+        // which is a decision with its own blast radius rather than a line to change in passing. What
+        // is done instead is that the guarantee it breaks no longer stands unqualified: see
+        // RigPlayerTests, "a player that sleeps sounds bit-identically to one that never does — AT THE
+        // MODEL RATE", where both the rate it holds at and the size of the divergence off it are pinned.
         if (pre <= 0) return 0;
         // 🔴 ASK for the rate the model will be RUN at, do not read the rate it REPORTS. An untagged
         // capture reports -1 and NamStage runs it at kModelSampleRate anyway; the previous line here

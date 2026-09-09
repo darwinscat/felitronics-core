@@ -1244,13 +1244,32 @@ int main() {
         ok(b.p.slotCold(1), "…and half a second, once set, is a rest");
     }
 
-    group("a player that sleeps sounds bit-identically to one that never does — through rests and turns");
+    group("a player that sleeps sounds bit-identically to one that never does — AT THE MODEL RATE");
     {
-        // The same sine into two players, block for block: one sleeps after two seconds, one never.
-        // A cold slot is left out of the mix, not multiplied by zero, and a wake re-lands a model that
-        // has no memory of its own (a Linear gain, no alignment delay) — so not one sample may differ,
-        // resting on the lower capture (slot 1 asleep) or on the upper (slot 0 — the live buffer —
-        // asleep), nor across the turns between them.
+        // 🔴 THE TITLE NARROWED, AND THE NUMBER THAT NARROWED IT IS BELOW. This claim was made without a
+        // rate on it and measured at 48 000 only, which is the ONE host rate where no rate-matcher is
+        // installed. Off it, a woken slot differs from one that never slept by **4.97e-03 on the block
+        // of the wake** at 44.1 kHz and **7.28e-03** at 96 kHz, against a 0.1 input. That is not a
+        // regression and not a phase offset; it is the woken slot's rate-matcher emitting its
+        // `latencySamples()` leading zeros — 61 samples at 44.1, 96 at 96 kHz — while the law has
+        // ALREADY made the slot audible, because `RigPlayer::warmFor` returns early on `pre <= 0` and
+        // drops its own `latencySamples()` term for exactly the captures that have no memory.
+        //
+        // The cause is not inferred. Three independent things say it, and the group pins all three:
+        //   · a capture WITH memory does not show it (`warmFor` does not take the early return there):
+        //     3.76e-07 at 44.1 kHz on a 2001-tap capture, against 4.97e-03 on a memoryless one;
+        //   · at 96 kHz the transient is the WHOLE difference — every later block is exactly 0.00e+00 —
+        //     so it is separable from the rate-matcher's resumption phase, which is what the small
+        //     persistent floor at 44.1 (1.1e-06 … 2.8e-06) is and which no warm-up can remove;
+        //   · removing the early return was MEASURED: 96 kHz goes to exactly 0.000000000 and 44.1 to
+        //     2.87e-06, i.e. down to that floor. It is a one-token change and it is NOT made here —
+        //     it moves the warm-up of every memoryless capture in every consumer, which is a separate
+        //     decision with its own blast radius. What is not acceptable is merging the work that
+        //     proved the claim false while leaving the claim standing.
+        //
+        // So: the guarantee is stated at the model rate, the divergence off it is asserted to EXIST
+        // (a suite that pinned it at zero everywhere would be pinning something untrue) and to be
+        // confined to the block of the wake, and the next reader is told what makes it go away.
         Bench sleeps(rig), never(rig);
         sleeps.p.setBlendShape({ 0.5, 0.0 }); never.p.setBlendShape({ 0.5, 0.0 });
         never.p.setColdAfterSeconds(0.0);
@@ -1279,6 +1298,79 @@ int main() {
         sleeps.p.setDial("gain", 150.0); never.p.setDial("gain", 150.0);
         ok(both(60) == 0.0f, "…and the turn back: identical to the last sample");
         ok(sleeps.p.modelLoads() == 2 && never.p.modelLoads() == 2, "neither player loaded anything for a turn");
+
+        // …AND OFF THE MODEL RATE IT DOES NOT, which is the half this group did not say. Same protocol,
+        // rebuilt per rate, with the shape of the difference read out rather than a peak: `wake` is the
+        // block the slot comes back on, `after` is every block past it.
+        struct Off { double fs; int taps; };
+        for (const Off c : { Off { 44100.0, 1 }, Off { 96000.0, 1 }, Off { 44100.0, 2001 } }) {
+            const std::string what = std::to_string((int) c.fs) + " Hz, "
+                                   + (c.taps == 1 ? "a memoryless capture" : "a 2001-tap capture");
+            std::map<std::string, std::vector<std::byte>> files;
+            for (const char* id : { "g60", "g150", "g240", "r150" })
+                files[id] = bytesOf(c.taps == 1 ? gainModel(1.0) : delayModel(c.taps - 1));
+            Bench sl(rig, 1, c.fs), nv(rig, 1, c.fs);
+            sl.files = files; nv.files = files; sl.load(rig); nv.load(rig);
+            sl.p.setBlendShape({ 0.5, 0.0 }); nv.p.setBlendShape({ 0.5, 0.0 });
+            nv.p.setColdAfterSeconds(0.0);
+            std::vector<float> a((std::size_t) kBlock), b((std::size_t) kBlock);
+            double ph = 0.0;
+            const auto run = [&](int blocks, float* first) {
+                float worst = 0.0f;
+                for (int k = 0; k < blocks; ++k) {
+                    for (int i = 0; i < kBlock; ++i) {
+                        a[(std::size_t) i] = b[(std::size_t) i] = (float) (0.1 * std::sin(ph));
+                        ph += 2.0 * 3.14159265358979323846 * 1000.0 / c.fs;
+                    }
+                    float* ia[1] { a.data() }; float* ib[1] { b.data() };
+                    felitronics::test::run (sl.p.process(ia, 1, kBlock)); sl.p.serviceHere();
+                    felitronics::test::run (nv.p.process(ib, 1, kBlock)); nv.p.serviceHere();
+                    float w = 0.0f;
+                    for (int i = 0; i < kBlock; ++i) w = std::max(w, std::abs(a[(std::size_t) i] - b[(std::size_t) i]));
+                    if (first != nullptr && k == 0) *first = w;
+                    worst = std::max(worst, w);
+                }
+                return worst;
+            };
+            const int restOff = (int) std::ceil(2.0 * c.fs / kBlock);
+            ok(run(restOff + 60, nullptr) == 0.0f, "before any wake the two are still identical — " + what);
+            ok(sl.p.slotCold(0) || sl.p.slotCold(1), "precondition: one of them really did sleep — " + what);
+            sl.p.setDial("gain", 200.0); nv.p.setDial("gain", 200.0);
+            float wake = 0.0f;
+            const float rest2 = [&] { const float w = run(1, &wake); return w; } ();
+            (void) rest2;
+            const float after = run(restOff + 40, nullptr);
+            if (c.taps == 1) {
+                // 61 leading zeros at 44.1 kHz and 96 at 96 kHz, under the law's own 0.25-per-call ramp
+                // and a 0.1 input: 4.97e-03 and 7.28e-03 measured. The bound is deliberately loose —
+                // what this pins is that the difference EXISTS and is of that order, not its last digit.
+                // 🔴 AN UPPER BOUND ONLY, DELIBERATELY. Asserting that the difference EXISTS would pin
+                // today's defect as a requirement and FAIL the right answer: removing warmFor's early
+                // return takes this to 5.36e-07 at 44.1 kHz and to exactly 0.000000000 at 96, both
+                // measured, and that must pass here too. What is pinned is that it stays SMALL and,
+                // below, that it stays CONFINED to the block of the wake — the two properties that
+                // make it a stated cost rather than a regression. Today's reading is 4.97e-03 at
+                // 44.1 kHz and 7.28e-03 at 96, against a 0.1 input.
+                ok(wake < 2.0e-2f,
+                   "the wake block may DIFFER off the model rate, bounded, and that is expected: "
+                   + std::to_string(wake) + " — the slot's rate-matcher emitting its "
+                   + std::to_string(sl.p.latencySamples()) + " leading zeros while warmFor's `pre <= 0`"
+                   " early return has already made it audible (" + what + ")");
+            } else {
+                // This one IS a lower-bounded claim in spirit and stays true whichever way warmFor goes:
+                // a capture with memory never took the early return, so it never had the transient.
+                ok(wake < 1.0e-5f,
+                   "…and a capture WITH memory does not show it at all: " + std::to_string(wake)
+                   + " — warmFor does not take that early return there, which is what names the cause ("
+                   + what + ")");
+            }
+            if (c.fs == 96000.0)
+                ok(after == 0.0f, "…and at 96 kHz the wake block is the WHOLE of it: every later block is"
+                                  " exactly zero, so the transient is not the resampler's resumption phase");
+            else
+                ok(after < 1.0e-5f, "…and past the wake only the rate-matcher's own floor remains: "
+                                    + std::to_string(after) + " (" + what + ")");
+        }
     }
 
     group("a slot's delay line is cleared on the way to sleep, as it is on a landing");
