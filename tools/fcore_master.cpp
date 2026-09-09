@@ -50,6 +50,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -108,18 +109,26 @@ bool num (const std::string& v, double& out)
 {
     if (v.empty()) return false;
     char* end = nullptr;
+    errno = 0;
     const double d = std::strtod (v.c_str(), &end);
-    if (end == v.c_str() || *end != '\0') return false;
+    if (end == v.c_str() || *end != '\0' || errno == ERANGE) return false;
     out = d;
     return true;
 }
 
+// `errno` IS PART OF THE CHECK, and leaving it out made this guard TIER-DEPENDENT — which is exactly
+// the class the wasm row exists to catch, and it caught this one. `long` is 64 bits here and 32 bits on
+// wasm32, so `strtol("4294967296")` returns the value on the desktop row and SATURATES to LONG_MAX on
+// wasm32 with ERANGE set. Without the errno test the saturated value then passed the range check that
+// the guard is, and the block-of-zero hang the guard exists to prevent came back — on the tier the
+// facade is written for, and only there.
 bool inum (const std::string& v, long& out)
 {
     if (v.empty()) return false;
     char* end = nullptr;
+    errno = 0;
     const long i = std::strtol (v.c_str(), &end, 10);
-    if (end == v.c_str() || *end != '\0') return false;
+    if (end == v.c_str() || *end != '\0' || errno == ERANGE) return false;
     out = i;
     return true;
 }
@@ -241,11 +250,11 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
 
     if (key == "dith.bits")    { FC_I (a.prm.dither.bits = i); }
     if (key == "dith.shaping") return parseEnumName (val, kShap, 3, a.prm.dither.shaping);
-    if (key == "dith.seedLo")  { char* e = nullptr; const unsigned long u = std::strtoul (val.c_str(), &e, 0);
-                                 if (e == val.c_str() || *e != '\0') return false;
+    if (key == "dith.seedLo")  { char* e = nullptr; errno = 0; const unsigned long u = std::strtoul (val.c_str(), &e, 0);
+                                 if (e == val.c_str() || *e != '\0' || errno == ERANGE) return false;
                                  a.prm.dither.seedLo = (std::uint32_t) u; return true; }
-    if (key == "dith.seedHi")  { char* e = nullptr; const unsigned long u = std::strtoul (val.c_str(), &e, 0);
-                                 if (e == val.c_str() || *e != '\0') return false;
+    if (key == "dith.seedHi")  { char* e = nullptr; errno = 0; const unsigned long u = std::strtoul (val.c_str(), &e, 0);
+                                 if (e == val.c_str() || *e != '\0' || errno == ERANGE) return false;
                                  a.prm.dither.seedHi = (std::uint32_t) u; return true; }
     if (key == "dith.autoBlank") return parseBool (val, a.prm.dither.autoBlank);
     if (key == "dith.autoBlankSamples") { FC_I (a.prm.dither.autoBlankSamples = i); }
