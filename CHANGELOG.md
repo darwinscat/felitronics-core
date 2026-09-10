@@ -7,6 +7,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+_Nothing yet._
+
+## v0.30.0 — a pause is silence, a refusal has a name, and the chain answers through a C ABI (`core`, `nam`, `rigplayer`, `mastering`, `tools`)
+
 ### `nam` · `rigplayer` — a lane that stops being fed is DRAINED, not frozen (law 11a)
 
 - **`nam::NamStage` HAS a falling edge now**, and the entry that stood here — "no falling edge …
