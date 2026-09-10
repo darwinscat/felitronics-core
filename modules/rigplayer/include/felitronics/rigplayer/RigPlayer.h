@@ -304,7 +304,13 @@ public:
         // samples the first null sat at 5742 Hz. P34's 61.4 samples move it to 359 Hz — the body of a
         // guitar, not a phasey top — and the host cannot fix it, because latencySamples() reports the
         // whole player's PDC outward while this notch is INTERNAL to the blend. Measured on a 50/50
-        // blend, worst dip across 100 Hz … 10 kHz: -50 dB unaligned against 0.00 dB aligned.
+        // blend, ripple across 100 Hz … 10 kHz: 9.54 dB unaligned against 0.324 dB aligned — and the
+        // remaining 0.324 dB is not slop, it is the ALIGNMENT'S OWN RESIDUAL: the dry leg is delayed by
+        // the INTEGER latencySamples() (61 at 44.1 kHz) while the wet geometry is fractional (61.4000),
+        // so 0.4 sample of relative offset survives by construction. The suite prints this number every
+        // run — "response spans … = 0.324 dB" — and gates it at 0.5, so the gate passes on the residual
+        // rather than on the claim. Do not write 0.00 here again: nothing in this design can reach it
+        // while the dry delay is an integer.
         //
         // Capacity: it must EXCEED the delay it will ever hold — DryAligner clamps to [0, capacity-1]
         // and does it SILENTLY, which is exactly how a downstream repository shipped a bypass path

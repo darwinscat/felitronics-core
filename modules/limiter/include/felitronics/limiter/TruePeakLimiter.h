@@ -219,8 +219,10 @@ struct TruePeakLimiterTap
 // history, while the detector and the gain are shared, so CHANGING the count clears the state (a
 // discontinuity, which is what such a change already is) — without that, a channel that sat out a few
 // blocks came back re-emitting audio at +19.76 dB over the ceiling. Passing MORE channels than
-// prepared limits the first maxChannels of them and leaves the rest untouched: prepare for the most you
-// will ever pass.
+// prepared is REFUSED — `process()` returns false having touched nothing, because width is a LIMIT
+// under law 11(b) and a partially limited block is worse than a refused one. This paragraph used to
+// promise the opposite ("limits the first maxChannels and leaves the rest untouched"); law 11 replaced
+// that behaviour and the sentence outlived it. Prepare for the most you will ever pass.
 //
 // RT-safe: prepare() allocates; process() does no alloc/lock/throw and accepts any block length. One
 // linked gain for all channels (no image shift). Non-finite and absurd input samples are sanitised at
