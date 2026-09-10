@@ -13,11 +13,27 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   recorded, not silently claimed" — undersold it twice. A lane the host stops handing over used to be
   skipped whole, so BOTH its network window and its two `core::StreamResampler`s froze and were
   replayed on the return; and a slot the blend law puts to SLEEP was not handed to the stage at all,
-  which leaks the same way for a different reason. Measured through `rigplayer::RigPlayer`, worst
-  |out| out of DIGITAL SILENCE / tail in host samples: a memoryless capture
-  **0.518588 / 125 at 44.1 kHz** · 0.332768 / 182 at 88.2 · **0.500179 / 193 at 96** · 0.354183 / 300
-  at 176.4 · 0.453147 / 319 at 192; a 2001-tap capture **0.499533 / 2003 at 48 kHz**, where no
-  rate-matcher exists at all; and a sleeping slot **0.500000** for a whole receptive field. An absent
+  which leaks the same way for a different reason. Measured through `rigplayer::RigPlayer`
+  against the commit this fix was made on, worst |out| out of DIGITAL SILENCE **over every leaving
+  phase of the probe tone** / tail in host samples — a single leaving point is a lower bound and not a
+  size, because what comes back is whatever the frozen state was holding: a memoryless capture
+  **0.525665 / 125 at 44.1 kHz** · 0.528352 / 183 at 88.2 · **0.524339 / 193 at 96** · 0.521520 / 300
+  at 176.4 · 0.522065 / 319 at 192 — i.e. **≈0.52 wherever a rate-matcher is installed at all**, and
+  the spread an earlier single-phase table showed was the probe's own phase rather than the defect's
+  shape; a 2001-tap capture **0.499533 / 2003 at 48 kHz**, where no rate-matcher exists at all; and a
+  sleeping slot **0.500000** for a whole receptive field. ⚠️ **Those TAILS are this release's own
+  doing.** The frozen state has a closed form — a stopped pair holds `kTaps` host samples in the down leg
+  and `kTaps` model samples in the up leg — so the tail is **`kTaps·(1 + hostSR/modelRunSR)` host
+  samples, which is exactly TWICE the reported latency** (2 × 61.4 = 122.8 against a measured 125;
+  2 × 96 = 192 against 193; 2 × 160 = 320 against 319, the slack being the probe's block floor). The
+  64-tap sinc announced below therefore made the tail **sixteen times longer by construction** (64 taps
+  against the cubic's 4); on `v0.29.0` the same probe reads 10 · 13 · 12 · 20 · 20 host samples, whose
+  measured ratios of 12.5×…16.1× fall short of the 16 only because a few-sample floor is a larger share
+  of 10 than of 125. ⚠️ **The AMPLITUDE, though, did not wait for this release:** a reader upgrading from
+  `v0.29.0` already had **≈0.52 out of digital silence over 10–20 samples** from the frozen rate-matcher
+  (0.518397 at 44.1 kHz, 0.533270 at 88.2, 0.515475 at 96), on top of the delay line's 0.249992 in the
+  first 3 samples — which is all there was at 48 kHz, where no rate-matcher exists. What this release
+  lengthened is the TAIL, not the leak. An absent
   lane is now fed the digital silence it is actually receiving, for as long as its state can still be
   heard, and a sleeping slot gets a width-zero call — **exact zero** at 8 · 22.05 · 44.1 · 48 · 88.2 ·
   96 · 176.4 · 192 kHz, on a memoryless capture and on a real 6332-sample WaveNet, at gap widths 0 and
@@ -151,7 +167,9 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     ran, rather than carrying a figure that a later fixture change would quietly falsify.
   - **`configure` re-prepares, and is refused once audio has been handed over.** Reading `resolved()`
     straight back from a deferred `setParams` reports the PREVIOUS parameter set — **5.0000 dB** on the
-    limiter ceiling, **149.968 ms** on its release, and the core's own defaults on a fresh chain.
+    limiter ceiling, **150.0 ms** on its release — those are the ERRORS, not values the chain reports:
+    a first set at −1 dBTP / 50 ms read back after a second asked for −6 / 200 — and the core's own
+    defaults on a fresh chain.
     Applying early instead is worse: `Dither::setParams` reseeds on a seed change and
     `EqBand::setParams` snaps while uninitialised and glides after, so N configure calls with no audio
     between them would stop equalling one call with the last set — a render that depended on how many
@@ -290,10 +308,14 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
     summing two rate-matching stages reports **122** samples. CPU rises from 0.0129 to **0.1447 %RT**
     for one mono round trip on arm64 and 0.0525 → 0.3239 on x86-64 gcc — **+2.3 % and +2.4 % of what the
     whole `NamStage` already spends on its model**, i.e. the same fraction on both toolchains.
-  - **`nam::NamStage::latencySamples()` reports 61 at 44.1 kHz** (was 4), 96 at 96, 91 at 88.2, 53 at 32,
-    and it no longer restates the geometry: it asks `StreamResampler::delayInputSamples()`. Restating it
+  - **`nam::NamStage::latencySamples()` reports 61 at 44.1 kHz** (**6 at `v0.29.0`**; a 4 that only ever
+    existed mid-sprint, see the reported-latency entry below), 96 at 96, 91 at 88.2, 53 at 32,
+    and it no longer restates the geometry: it asks `StreamResampler::pairDelayHostSamples (hostSR,
+    modelRunSR)` (the nullary `delayInputSamples()` this line used to name is GONE — see the entry
+    below; the surviving form takes the two rates). Restating it
     is how the previous formula stayed 2.16 samples wrong for a release cycle. **Consumers that delay a
-    dry/bypass path by this number must be re-checked** — the figure is 16× larger. `orbit-amp` was
+    dry/bypass path by this number must be re-checked** — **10× larger than the number they were given**
+    (6 → 61 at 44.1 kHz) and 16× the delay that was physically there (3.8375 → 61.4000). `orbit-amp` was
     built against this branch and its whole suite passes (seven targets, zero failures), but its
     `src/core/BypassWire.h:37` caps the delay it can carry at 64 samples on a comment quoting a formula
     two generations old: 44.1 kHz fits by three samples and every host above 48 kHz silently
@@ -375,27 +397,50 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   repository: `StreamResampler.h` says the identity ratio "passes the signal with a clean 2-sample
   delay", and that is true at EVERY ratio, because `reset()` leaves 3 leading history zeros with
   `pos = 1.0`, so output *k* reads input position *k·inPerOut − 2*. The round trip is therefore
-  `2 + 2·hostSR/modelRunSR` host samples, now reported rounded to nearest: **6 → 4 at 44.1 kHz, 9 → 6
-  at 96 kHz, 9 → 6 at 88.2 kHz, 5 → 3 at 22.05 kHz**; unchanged (0) at the model's own rate, where the
-  resampler is not in the path at all. Hosts using the reported number for delay compensation move by
-  that much — and **twice that** in the two shipped hosts, which sum a preamp and a poweramp stage
-  (4 samples at 44.1 kHz, 6 at 96). **Nothing inside `rigplayer` moves**: slot alignment runs on
-  `AlignmentTable::delayOf()` → `blendDelay()`/`lagTail_`, and none of those reads `latencySamples()`
-  at all — `RigPlayer` only republishes the max of the two slots outward, and both changed identically.
-  **No audio sample changes inside this repository. Downstream, audio does move, and it moves into
-  alignment:** OrbitCab delays its dry/bypass path by this same number
+  `2 + 2·hostSR/modelRunSR` host samples for the cubic kernel that was in the path when this was
+  written — **3.8375 at 44.1 kHz, 6.0000 at 96, 5.6750 at 88.2, 2.9188 at 22.05**, which is where the
+  2.16 and the 3.3 come from. ⚠️ **That formula does NOT survive this release, and the numbers a host
+  will see are the ones in the 64-tap kernel entry above, not the ones this paragraph fixed.** The
+  kernel became a 64-tap polyphase sinc in the same release, so the geometry is now `D·(1 + hostSR/
+  modelRunSR)` with `D = kHalf = 32` and `latencySamples()` reports **61 at 44.1 kHz, 96 at 96, 91 at
+  88.2, 47 at 22.05** — **ten times what the old API reported** (6 → 61) and **sixteen times the delay
+  that was physically there** (3.8375 → 61.4000) — not the CUT this paragraph announced, which was not
+  one fraction either (6→4 and 9→6 are two thirds, 5→3 is three fifths); unchanged (0) at the
+  model's own rate, where the resampler is not in the path at all. Hosts using the reported number for
+  delay compensation move by the DIFFERENCE — **55 samples at 44.1 kHz** (6 → 61) and **87 at 96**
+  (9 → 96) — and **twice that** in the two shipped hosts, which sum a preamp and a poweramp stage
+  (**110 and 174**), landing them at 122 and 192 samples of total reported latency.
+  **Slot ALIGNMENT does not move**: it runs on `AlignmentTable::delayOf()` → `blendDelay()`/`lagTail_`,
+  and none of those reads `latencySamples()` at all. ⚠️ **But "nothing inside `rigplayer` moves" is no
+  longer true, and it stopped being true inside this release:** `RigPlayer::process` holds its own DRY
+  leg back by exactly this number (`RigPlayer.h:933`, `dryLatency_.advance (…, latencySamples())`) and
+  `warmFor()` spends it too (`RigPlayer.h:1219`), so the player's internal dry path moves with it —
+  from 6 samples to 61 at 44.1 kHz. That delay line was added in this same release, after the sentence
+  it falsifies was written. **Downstream, audio moves into alignment as well:** OrbitCab delays its dry/bypass path by this same number
   (`src/poweramp/PowerAmpRouter.cpp`, `src/core/CabEngine.cpp`) and orbit-amp does the same at the dry
   end of its crossfade, so the wet path sat at the true 3.84 samples while the dry was held at the
   reported 6 — a 2.16-sample mismatch whose first comb notch fell at ~10.2 kHz during an on↔off
-  crossfade (3.0 samples and ~16 kHz at 96 kHz). It is now 0.16 and 0.00. ⚠️ **Three OrbitCab tests pin a number that is now known to be WRONG**
+  crossfade (3.0 samples and ~16 kHz at 96 kHz). Against the SHIPPED kernel the residual a rounded
+  report leaves is **0.40 samples at 44.1 kHz and 0.00 at 96** (61.4000 against 61, 96.0000 against 96),
+  which puts the first notch at 55 kHz — **above Nyquist, so there is none in the band at all**. A host
+  summing two stages carries twice the residual (**0.80 samples**, 122.8 against 122 reported) and its
+  first notch is 27.6 kHz, still above the band.
+  ⚠️ **Three OrbitCab tests pin a number that is now known to be WRONG**
   (`tests/PowerAmpRouterAlignTests.cpp`, three `expectEquals(L, ceil(3·sr/48000) + 3)`). They will fail
-  on the next core bump, and the fix is to replace the pinned value with the geometry
-  `2 + 2·hostSR/modelRunSR` — **not** to restore the old formula in core. The old tests pinned the FORMULA, which is why
-  nothing caught it; the new one measures the delay from the carrier phase of the shipped round trip
-  (3.8375 / 6.0000 / 5.6750 samples, matching the geometry to four decimals) and asserts the reported
-  integer is the nearest one to it.
+  on the next core bump — and so would a fix that pinned `2 + 2·hostSR/modelRunSR`, which is the
+  intermediate formula this paragraph installed and the same release then replaced. **In the PRODUCT,
+  pin nothing: ask `nam::NamStage::rateMatch (hostSR, modelSR).latencySamples`** (or the stage's own
+  `latencySamples()`). ⚠️ **Not the bare geometry:** `StreamResampler::pairDelayHostSamples` answers
+  what a pair WOULD cost and returns 64 at a 48 kHz host on a 48 kHz model, where the policy installs
+  no resampler at all and the answer is 0 — geometry and policy are two owners, and the second one is
+  the one a delay line wants. In the TEST, keep measuring the delay independently, from the carrier
+  phase of the shipped round trip, as core's own suite does: an expectation computed by the code under
+  test is not an expectation. Restating a geometry by hand is exactly how the old formula stayed 2.16
+  samples wrong for a release cycle, and doing it again with a newer constant only resets the clock.
 - **`core`, docs:** **`StreamResampler`'s header claimed transparency it does not have, and now carries
-  the measurement instead.** The old justification — *"the driven nonlinear stage masks the
+  the measurement instead.** ⚠️ **Read this whole entry in the PAST tense: every cost in it is the
+  CUBIC's, and it is the case FOR the kernel change announced above, not a description of what ships.**
+  The shipped header (`StreamResampler.h:34-44`) already says it that way; only this note did not. The old justification — *"the driven nonlinear stage masks the
   interpolation images"* — had no number behind it, and the quantity that had since been measured was a
   different one. Measured (`docs/STREAM-RESAMPLER-COST.md`, new): a phase-dependent kernel is a linear
   periodically time-varying filter whose per-phase gain has Fourier coefficients `H(Ω+2πk)`, so the
@@ -423,7 +468,7 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   the nonlinearity **demodulates** the input leg's images into the audible range: a 20 kHz tone at
   −18 dBFS into a high-gain capture returns a **100 Hz line at −17.7 dBFS, 14.5 dB louder than its own
   carrier**, against −174.6 dBFS through an ideal round trip. **No kernel change here**: the header now states the cost, the
-  new `felitronics_core_streamresampler_lptv_tests` (75 checks) pins the table, the period-147 closure,
+  new `felitronics_core_streamresampler_lptv_tests` (121 checks) pins the table, the period-147 closure,
   the 0 dB decimation peak and the criterion itself — the round trip adds **−8.84 dBc at 17.5 kHz**, and
   a `tanh` has to be driven to **`tanh(6.2x)`** (bisected) before its own folding reaches that, so below
   a near-square-wave drive the rate-match is the LOUDER artifact. The candidate comparison is in the
@@ -431,7 +476,8 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   32-tap sinc flattens both axes and is still **5 dB worse in the bass** on real DI through a driven
   capture, because its band edge feeds the same demodulation from a different cause. A 64-tap one at a
   0.99 cutoff is better in every band at every drive, for **+2.5 %** of what the stage already spends on
-  the model and **61.4 host samples** of delay against today's 3.84.
+  the model and **61.4 host samples** of delay against the cubic's 3.84 — that comparison is what the
+  DECISION was made against; 61.4 is what this release ships.
 
 - **BREAKING (behaviour + latency), `oversampling`, `saturation`, `limiter`, `poweramp`:** **the shipped
   `tapsPerPhase` default rises from 32 to 64, and the reason is aliasing, not the pass band.**
@@ -457,7 +503,13 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   one tone landing in one of the kernel's nulls; the honest figure for what 64 taps give ANYWHERE in the
   fold region is the worst case below, −90.5 dB, not the null.) Worst rejection over
   the whole fold region, worst of factors 2/4/8: 32 → −26.9 dB, 48 → −51.1, 56 → −76.2, 57 → −82.6,
-  **58 → −90.7**, 59 → −89.8, 60 → −90.7, **64 → −90.5**, 96 → −94.3. Read as a knee, not a step:
+  **58 → −90.7**, 59 → −89.8, 60 → −90.7, **64 → −90.5**, 96 → −94.3 — and the region is CLOSED at the
+  fold, which takes two instruments to read. Below the knee the transition is unfinished and |H| is
+  monotone into 0.5 fs, so the supremum sits exactly AT the fold, where a sine projection cannot go
+  (it reads its own sampling phase there, ±3.01 dB at 2× and −8.17 at 8×) and the prototype's DTFT
+  can: −26.93 / −51.05 / −76.17 / −82.63. At and above the knee the worst is a SIDELOBE inside the
+  band, at 0.502–0.505 fs, where the swept projection is exact and the DTFT at the fold reads better
+  (64 taps: −99.5 at the fold against −90.46 at the sidelobe). Read as a knee, not a step:
   below ~58 the transition is genuinely unfinished, at ~58 it reaches the Kaiser window's floor and then
   RIPPLES there by about a dB, so 59 and 61 fall a tenth of a dB short while 58, 60 and 64 clear it.
   "The first taps count meeting −90.0" is therefore 58, and that integer is an artefact of a hard bar on
