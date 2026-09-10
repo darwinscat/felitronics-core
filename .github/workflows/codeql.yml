@@ -27,10 +27,26 @@ jobs:
 
       # C++ is compiled, so CodeQL needs a build to analyze — building the tests compiles every
       # module header, so the whole header-only library is covered.
+      #
+      # 🔴 `-j 4`, NOT a bare `-j`, and the number is the point. A bare `-j` means UNLIMITED parallel
+      # jobs to GNU make, not "one per core" — and CodeQL wraps the compiler in its extractor, so every
+      # translation unit costs far more memory here than in the ci workflow that uses the same spelling.
+      # Unlimited × extractor overflowed the runner: the job was killed around 50 % with everything
+      # `Terminated`, `wait: No child processes` and `The operation was canceled`, and NOT ONE compiler
+      # diagnostic — the signature of the OOM killer rather than of a build error.
+      #
+      # It went marginal, not broken, which is why it reads as flake: the last fourteen runs were green
+      # through 2026-09-08 and then failed 4 times intermittently, starting the day the C-ABI facade
+      # merged and added `fcore_master`, `felitronics_master_abi_tests` and a large `fc_master.cpp`.
+      # The build simply grew past what unbounded parallelism could hold. Re-running until green would
+      # have hidden that, and the next task to enlarge the build would have paid for it again.
+      #
+      # 4 matches the vCPU count of `ubuntu-latest`. If this ever flakes again, lower it rather than
+      # retrying — the number is a memory budget, not a speed knob.
       - name: Build the tests (compiles all headers)
         run: |
           cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON
-          cmake --build build -j
+          cmake --build build -j 4
 
       - uses: github/codeql-action/analyze@v4.37.9
         with:
