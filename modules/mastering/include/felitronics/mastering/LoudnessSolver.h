@@ -714,7 +714,9 @@ public:
                 // the thing that needed bounding was the STEP (a decision).
                 //
                 // Precisely, since the earlier wording claimed more than the code does: a floor on the
-                // slope REMAINS (`clamp(s, 0.05, 1.0)`, so a measured 0.01 still becomes 0.05) and so
+                // slope REMAINS — it is the `clamp` ten lines above, and it is the number that line
+                // executes, not a second one written out here (this paragraph said `0.05` after that
+                // line had already become `0.01`, in the same commit that lowered it) — and so
                 // does an upper rejection (`sl <= 1.2` throws away a finite, positive 1.3). What the
                 // rewrite removed is the 0.02 REJECTION threshold — a slope below it used to be
                 // discarded in favour of the default 1.0, which is the fifty-fold overstep. The floor
@@ -1162,8 +1164,10 @@ private:
     //  * the true-peak meter is DRAINED, and the drain is not given to the loudness meter. A programme
     //    ending on a peak under-reads without it: `[... 0, 1, 1]` reads +0.000000 dBTP undrained and
     //    +1.750350 once 8 zeros have gone through, and shipping the first number is precisely the
-    //    defect P1 measured in the chain this replaces (17 of 36 rows above their own ceiling, reported
-    //    as success).
+    //    defect P1 measured in the chain this replaces — rows shipping ABOVE their own ceiling while
+    //    the interface reports success. The COUNT deliberately does not live here: its owner is the
+    //    baseline harness in another repository, it moves whenever that corpus does, and nothing in
+    //    this tree can re-derive it. A number without a local owner rots and cannot be made not to.
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {
         analysis::LoudnessMeter  lm;

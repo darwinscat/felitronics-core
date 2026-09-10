@@ -21,9 +21,15 @@
 // The brief for this fixture asked for "content above 0.8 x Nyquist, where both interpolators are
 // weakest". That is true of the METERS and false of the LIMITER, and building the witness on it would
 // have produced a test that passes for the wrong reason. The limiter up- and downsamples through its
-// own Kaiser prototype cut at 0.90 x Nyquist, so its response in BASE-rate terms is 0.00 dB at
-// 0.36 fs, -0.40 at 0.40, -4.0 at 0.44, -6.0 at 0.45 (identical at every factor — the transition width
-// is constant in base-rate units). Content up there is therefore ATTENUATED ON THE WAY IN, cannot
+// own Kaiser prototype cut at 0.90 x Nyquist, and its response in BASE-rate terms rolls off towards
+// Nyquist (identical at every factor — the transition width is constant in base-rate units).
+//
+// ⚠️ THE NUMBERS THAT USED TO STAND HERE — "0.00 dB at 0.36 fs, -0.40 at 0.40, -4.0 at 0.44, -6.0 at
+// 0.45" — WERE THE 32-TAP PROTOTYPE'S, and the shipped default became 64 taps. At 64 the pass band is
+// FLAT at 0.40 fs, which is exactly the re-derivation written out below (2fs/5 now reaches the ceiling
+// and delivers +0.4359, where the old text said it could not reach it at all). Read the table below,
+// not a second copy of the response up here: this comment had no way to notice the taps had moved.
+// Content well above the pass band is still ATTENUATED ON THE WAY IN, cannot
 // reach the ceiling on the way out, and measures 6 dB BELOW the closed form rather than above it:
 // a 0.45 fs tone hot enough to demand 13 dB of limiting was delivered at -6.0 dB re ceiling. The
 // witness that actually finds the ceiling's weak point is a tone at a SMALL-DENOMINATOR fraction of
