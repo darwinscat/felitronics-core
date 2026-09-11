@@ -130,20 +130,19 @@ typedef struct fc_header
 // INT_MAX makes a byte span past 32 bits too, so a span check placed first would answer every such call
 // with FC_ERR_SPAN and the specific diagnosis would be unreachable.
 //
-// POISON COMES FIRST, AND IT IS FOR EVER. Under -fno-exceptions an exhausted heap does not come back as a
-// status: the module ABORTS inside the core, and the page receives a JavaScript RuntimeError instead of a
-// return value. What the abort does NOT do is stop the module — emscripten lets the page call again, with
-// every object wherever the abort left it — and such an instance does not fail, it LIES. Measured on
-// v0.30.0 in wasm32: an abort inside `fc_master_solve`, then `fc_master_process` on the same handle answered
-// FC_OK and rendered at the search's own pass-1 gain — +12 dB in that replay, which asked for that start
-// (`initialGainDb`; MasterAbiTests repeats the scenario) — and kMaxHandles − 1 = 7 such aborts left the
-// handle table full for good, because each reserves its solution slot before the search runs.
-// So every entry point that returns `fc_status` marks a call in progress and clears the mark only on a
-// normal return. Finding it set means an earlier call never returned — an abort, a trap, or natively an
-// exception that escaped — and from then on every such call answers FC_ERR_POISONED, writes nothing and
-// touches nothing. There is no way back inside the instance: the page discards it and instantiates a new
-// one. The entry points that return no status — the `*_default` writers and the build-identity queries —
-// read no instance state and stay callable.
+// POISON COMES FIRST, AND IT IS FOR EVER (law 11d, docs/DSP-ARCHITECTURE.md). Under -fno-exceptions an exhausted
+// heap does not come back as a status: the module ABORTS inside the core, and the page receives a JavaScript
+// RuntimeError instead of a return value. What the abort does NOT do is stop the module — emscripten lets the
+// page call again, with every object wherever the abort left it — and such an instance does not fail, it LIES.
+// Measured on v0.30.0 in wasm32: an abort inside `fc_master_solve`, then `fc_master_process` on the same handle
+// answered FC_OK and rendered at the search's own pass-1 gain — +12 dB in that replay, which asked for that
+// start (`initialGainDb`; MasterAbiTests repeats the scenario) — and kMaxHandles − 1 = 7 such aborts left the
+// handle table full for good, because each reserves its solution slot before the search runs. So every entry
+// point that returns `fc_status` marks a call in progress and clears the mark only on a normal return. Finding
+// it set means an earlier call never returned — an abort, a trap, or natively an exception that escaped — and
+// from then on every such call answers FC_ERR_POISONED, writes nothing and touches nothing. There is no way back
+// inside the instance: the page discards it and instantiates a new one. The entry points that return no status —
+// the `*_default` writers and the build-identity queries — read no instance state and stay callable.
 //
 // THE MODULE IS NOT RE-ENTRANT, and the poison is what says so. An entry point called while another is still
 // running — from a new_handler, a signal handler, anything the runtime runs inside an allocation this file made —
@@ -427,7 +426,7 @@ typedef struct fc_master_stats
 } fc_master_stats;
 
 //==============================================================================
-// WHAT A CALL WILL ASK THE HEAP FOR
+// WHAT A CALL WILL ASK THE HEAP FOR (law 11d, docs/DSP-ARCHITECTURE.md)
 //
 // On the wasm tier exhaustion is not a status (see POISON above), so a page that must not lose its worker
 // budgets BEFORE the call. Every number here but `facadeBytes` is computed by the core with the very functions

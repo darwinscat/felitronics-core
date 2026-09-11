@@ -453,6 +453,48 @@ the CPU at runtime, invisible to any build. Full write-up:
    EMITTED YET, which cannot be dropped without a hole by definition. That is **P29**, and it will state
    its own rule as a window shift, with the oversampler's phase to prove as well.
 
+   **11d. MEMORY THAT CANNOT BE HAD IS NOT A REFUSAL: EXHAUSTION IS FATAL, AND THE CORE PUBLISHES ITS DEMAND
+   INSTEAD.** Law 11b refuses an ARGUMENT that cannot be honoured. It does not refuse memory that cannot be had —
+   and on the wasm tier it could not: under `-fno-exceptions` a throwing `new` that fails aborts inside the call
+   (emsdk 6.0.9: `bad_alloc` → `abort()` → a JavaScript `RuntimeError`). Natively `bad_alloc` escapes the call — or
+   ends the process where it meets a `noexcept` boundary, and the two are one line apart: `MasteringChain::prepare`
+   allocates the EQ engine itself (an escape), then calls `EqEngine::prepare`, which is `noexcept` and allocates its
+   scratch (a `terminate`). So exhaustion is **outside the refusal contract on every row**: it ends the module's
+   usefulness and is never answered with `false` — save in `nam`, natively, whose third-party backend throws:
+   `NamStage` catches what the backend's preparation throws and stays unprepared, a refusal this law neither asks of
+   the other modules nor forbids there. This is the explicit exception to 11b, and it was chosen over nothrow
+   storage plus a status in every allocating module on measured grounds: what the core holds is a constant of its
+   CONFIGURATION plus a small fraction of the programme, a caller can read it before committing (below) and stay
+   clear of exhaustion by arithmetic, and a later move to the nothrow form is ADDITIVE — a new status code, no
+   struct moves — while making it now would cost every module the desktop products share. Two obligations replace
+   the refusal:
+
+   * **THE DEMAND.** An allocating call on the worker path can state, before it is made, a bound on how much of the
+     heap its OWN requests will occupy at once — not what the object already holds — computed by the very functions
+     its `prepare()` sizes itself with, so the bound cannot drift from the allocation; the C ABI forwards it
+     (`fc_master_need`). In 64 bits. What each number bounds is written where it is defined, because "at once" is
+     not one formula: a call that keeps what it asks for is bounded by the sum of its requests, exact on a FRESH
+     object (one already prepared keeps storage that still fits); a call that builds and frees per pass
+     (`TargetLoudnessSolver::solve`) by one pass. A call that refuses may have asked for part of its bound on the
+     way. REQUESTED bytes, not a promise that a heap can serve them: allocator headers, the standard library's own
+     alignment (MSVC's STL, in a release build, asks for `sizeof(void*) + 31` more on a block of 4096 bytes or
+     more), fragmentation and the runtime's growth step are the caller's margin. *(The C ABI states the solver's
+     calls today; `create` and `configure` — the chain's own storage — are not budgeted yet.)*
+   * **A MODULE WHOSE CALL NEVER RETURNED ANSWERS EVERY STATUS CALL WITH "DISCARD ME".** The runtime does not stop a
+     module that aborted; it answers the next call with objects wherever the abort left them. Measured on v0.30.0 in
+     wasm32: after an abort inside `fc_master_solve`, `fc_master_process` answered `FC_OK` at the search's pass-1
+     gain — +12 dB in that replay, the `initialGainDb` it asked for, which `MasterAbiTests` repeats — and seven such
+     aborts in all (`kMaxHandles − 1`) left the handle table full for good. So a boundary that cannot outlive an
+     abort marks every call in progress and, finding the mark on entry, answers `FC_ERR_POISONED` for good and
+     touches nothing — ahead of every other check, for every handle, and for a re-entrant call too, which it cannot
+     tell apart. Entry points that read no instance state (build identity, the defaults writers) stay callable.
+
+   Not promised: that a demand will be admitted, that anything survives exhaustion, or that a native host which
+   catches `bad_alloc` holds a usable object. RT law 2 is unchanged — `process()` allocates nothing — so none of
+   this reaches the audio path. Gated: the C-ABI suites pin the poison (natively, through an escaped exception) and
+   every published budget against the bytes its call requests, byte for byte, and the re-entry suite runs on the
+   wasm tier too; the abort path itself is measured, not gated.
+
 
 **These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the
 difference is worth reading rather than assuming. Today: a

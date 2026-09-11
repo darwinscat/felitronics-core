@@ -46,6 +46,10 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
   ABI hands back that the core did not compute. A `frames` past INT_MAX is `FC_ERR_RANGE`, then an unknown `op`
   `FC_ERR_ENUM`. `create` and `configure` are not budgeted yet. Both additions are additive: no struct
   moved, `FC_MASTER_ABI_VERSION` stays 1, and the header now states that rule for new codes.
+- **`docs` — law 11d: memory that cannot be had is not a refusal.** Exhaustion is fatal on every row — never a
+  `false` — and the explicit exception to 11b. In its place the core publishes a DEMAND (a bound on what an
+  allocating call holds at once, from the functions its `prepare()` sizes itself with) and the C ABI poisons a
+  module whose call never returned. The chain's own storage (`create`, `configure`) is not budgeted yet.
 - **`tools` — `fcore::Probe::prepare` answers with its meter.** It ignored the meter's return value, which
   could only fail on a channel count the probe had already checked; the meter now also refuses a store it
   cannot represent (3e8 s), and a probe that ignored that would report prepared and measure nothing — where it
