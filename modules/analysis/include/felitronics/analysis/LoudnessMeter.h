@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -30,33 +31,91 @@ namespace felitronics::analysis
 // -10 LU relative gate (a two-pass over all absolute-gated blocks — the threshold moves as more program
 // arrives, so it must NOT be a one-pass running sum).
 //
-// RT-safe: prepare() allocates the sub-hop ring + the integrated-block buffer; process() only indexes them
-// (no alloc/lock/throw). The gated measure keeps every block's energy to the end (the relative gate is a
-// two-pass), so the block store is sized for maxDurationSec of program at the prepared rate; blocks past it
-// are counted in droppedBlocks() and not kept — size for the longest program and that reads 0. Channel
+// RT-safe: prepare() — or prepareForSamples() — allocates the sub-hop ring + the integrated-block buffer;
+// process() only indexes them (no alloc/lock/throw). The gated measure keeps every block's energy to the end
+// (the relative gate is a two-pass), so the block store is sized for the prepared capacity — maxDurationSec at
+// the prepared rate, or a count of samples; blocks past it are counted in droppedBlocks() and not kept — size
+// for the longest program and that reads 0. Channel
 // weights default to 1.0 (correct for mono/stereo); set them per the BS.1770 roles (Ls/Rs = 1.41, LFE
 // excluded) for surround — the host-layout→role mapping is product glue.
 class LoudnessMeter
 {
 public:
+    // SECONDS are the convenience; the store is counted in SAMPLES — see prepareForSamples(). A NaN or negative
+    // duration reads as 0 s, exactly as it always has (std::max keeps its first argument on NaN).
     [[nodiscard]] bool prepare (double sampleRate, int numChannels, double maxDurationSec = 3600.0)
     {
+        const double rate = sampleRate > 0.0 ? sampleRate : 48000.0;
+        return prepareForSamples (sampleRate, numChannels, std::max (0.0, maxDurationSec) * rate);
+    }
+
+    // THE SAME PREPARATION, SIZED IN SAMPLES — the unit the store is actually counted in. A whole-programme
+    // caller knows its length in frames, and a trip through seconds can lose it: `frames / fs` is +inf for a
+    // finite rate the mastering chain accepts (1e-305 Hz, 2000 frames), and the store used to be sized from
+    // `(std::size_t) inf` — undefined behaviour, which answered 3 kept blocks on arm64 and wasm32 and 4 on
+    // x86-64 gcc for the same call.
+    [[nodiscard]] bool prepareForSamples (double sampleRate, int numChannels, double maxSamples)
+    {
         prepared_ = false;
-        fs = sampleRate > 0.0 ? sampleRate : 48000.0;                  // fs<=0 → subSamples 0 → /0 in finishSubHop
+        const double rate = sampleRate > 0.0 ? sampleRate : 48000.0;    // fs<=0 → subSamples 0 → /0 in finishSubHop
         if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING
+        Storage st;
+        if (! storageFor (rate, maxSamples, st)) return false;          // law 11(b): validate, THEN write
+        fs = rate;
         ch = numChannels;
         kw.prepare (fs, ch);
-        subSamples = std::max (1, (int) std::lround (0.01 * fs));      // 10 ms; a gating hop is ten of them
+        subSamples = st.subSamples;
         for (int c = 0; c < kMaxChannels; ++c) w[c] = 1.0;
         subRing.assign (kSubRing, 0.0);
-        // Sized by HOPS at this rate, not by seconds: a hop is 10 × lround (0.01·fs) samples, which is 100 ms
-        // only where fs is a multiple of 100 — elsewhere a per-second count drifts from the blocks that
-        // actually arrive. +4 blocks / +8 samples of slack cover the first block's onset and the 1 s cadence.
-        const double hops = std::ceil (std::max (0.0, maxDurationSec) * fs) / (double) (subSamples * kSubHopsPerHop);
-        blockE.assign ((std::size_t) hops + 4, 0.0);
-        stE.assign ((std::size_t) (hops / 10.0) + 8, 0.0);              // 1 short-term sample/s for LRA
+        blockE.assign (st.blocks, 0.0);
+        stE.assign (st.shortTerm, 0.0);
         reset();
         prepared_ = true;
+        return true;
+    }
+
+    // WHAT prepareForSamples() ALLOCATES — the one function it sizes itself with, so a caller budgeting memory
+    // reads the numbers the store is built from and the two cannot drift. Every byte of the meter's heap is here:
+    // the three vectors below and nothing else (the K-weighting state is inline) — asked of a FRESH meter; a prepared
+    // one keeps whatever storage still fits.
+    struct Storage
+    {
+        int         subSamples = 0;     // one 10 ms sub-hop, lround (0.01·fs) and at least 1
+        std::size_t blocks     = 0;     // 400 ms gating blocks kept for the integrated measure
+        std::size_t shortTerm  = 0;     // 3 s short-term samples kept for LRA, one a second
+        // 64 bits because the product is the point: on wasm32 a `size_t` byte count wraps long before the element
+        // counts above do.
+        std::uint64_t bytes() const noexcept
+        {
+            return (std::uint64_t) sizeof (double) * ((std::uint64_t) kSubRing + blocks + shortTerm);
+        }
+    };
+
+    // Sized by HOPS at this rate, not by seconds: a hop is 10 × lround (0.01·fs) samples, which is 100 ms only
+    // where fs is a multiple of 100 — elsewhere a per-second count drifts from the blocks that actually arrive.
+    // The +4 blocks / +8 short-term samples are MARGIN, not need: the first gating block is born on the 4th hop
+    // and the first short-term sample on the 30th, so a store sized for exactly n samples already holds every
+    // block n samples produce — LoudnessConformanceTests pins the margin by the count an OVERFEED drops, and pins
+    // the bytes by a table.
+    //
+    // FALSE, with `out` untouched, when the capacity is not REPRESENTABLE. "Finite" is not the property the
+    // arithmetic needs. The hop, ten sub-hops, is an `int`, so the sub-hop lround (0.01·fs) is bounded by
+    // kMaxSubHop — and the test is made on the COMPUTED 0.01·fs, not on fs, because near the edge that product
+    // rounds up to .5 and lround() goes with it. And every block index is an `int`, so the count is bounded by
+    // kMaxBlocks. A rate <= 0 or NaN is read as 48 kHz, exactly as prepare() reads it: the budget of a call is
+    // storageFor() with the SAME arguments.
+    [[nodiscard]] static bool storageFor (double sampleRate, double maxSamples, Storage& out) noexcept
+    {
+        const double rate   = sampleRate > 0.0 ? sampleRate : 48000.0;   // prepare()'s own substitution
+        const double subHop = 0.01 * rate;                      // a sub-hop is lround (subHop) samples
+        if (! (subHop < (double) kMaxSubHop + 0.5)) return false; // lround <= kMaxSubHop, so 10 of them fit an int
+        if (! (maxSamples >= 0.0)) return false;              // NaN and -inf fail here; +inf fails the block bound below
+        const int s = std::max (1, (int) std::lround (subHop));
+        const double hops = std::ceil (maxSamples) / (double) (s * kSubHopsPerHop);
+        if (! (hops <= (double) kMaxBlocks)) return false;
+        out.subSamples = s;
+        out.blocks     = (std::size_t) hops + 4;
+        out.shortTerm  = (std::size_t) (hops / 10.0) + 8;
         return true;
     }
 
@@ -115,9 +174,9 @@ public:
     double integratedLufs() const noexcept { return integrated(); }                                  // gated
     double loudnessRangeLu() const noexcept { return lra(); }                                        // EBU Tech 3342 (P95−P10)
 
-    // Gating blocks that arrived past maxDurationSec and were not kept. Non-zero means integratedLufs() and
-    // loudnessRangeLu() describe the first maxDurationSec of the program only — a caller that must not lose a
-    // block sizes prepare() for its longest program and checks this reads 0.
+    // Gating blocks that arrived past the prepared capacity and were not kept. Non-zero means integratedLufs() and
+    // loudnessRangeLu() describe only the part of the program that fitted — a caller that must not lose a block
+    // sizes prepare() / prepareForSamples() for its longest program and checks this reads 0.
     int droppedBlocks() const noexcept { return droppedBlocks_; }
 
     // Completed 10 ms sub-hops whose channel-weighted mean square came out NON-FINITE — the damage counter,
@@ -147,8 +206,9 @@ public:
     // would route the comparison back through log10, whose 1-ulp disagreement between libms is precisely what
     // such a check must not inherit.
     //
-    // The span is valid until the next prepare() (the only place the storage is reallocated); process() only
-    // appends, and reset() zeroes the count rather than the storage. Empty before prepare().
+    // The span is valid until the next prepare() or prepareForSamples() (the only places the storage is
+    // reallocated); process() only appends, and reset() zeroes the count rather than the storage. Empty before
+    // either.
     //
     // WHAT THIS PINS. It commits the meter to keeping every block's energy as a contiguous array of double in
     // arrival order. Retention itself is already forced by the two-pass relative gate, so the new constraint
@@ -166,6 +226,9 @@ private:
     static constexpr int kSubHopsPerHop    = 10;                                    // 10 × 10 ms = the 100 ms gating hop
     static constexpr int kMomentarySubHops = 40;                                    // 400 ms
     static constexpr int kSubRing          = 300;                                   // 3 s — the short-term window, and the ring
+    // The bounds storageFor() refuses beyond, each named for the property it protects.
+    static constexpr int kMaxSubHop        = std::numeric_limits<int>::max() / 10;  // ten sub-hops make a hop, and a hop is an int
+    static constexpr int kMaxBlocks        = std::numeric_limits<int>::max() - 4;   // every block index is an int
 
     void finishSubHop (int nc) noexcept
     {
@@ -245,7 +308,7 @@ private:
         if (subFilled >= kMomentarySubHops)                                         // a 400 ms block every 100 ms
         {
             if (blockCount < (int) blockE.size()) blockE[(std::size_t) blockCount++] = meanLastSubHops (kMomentarySubHops);
-            else ++droppedBlocks_;                                                  // past maxDurationSec: counted, not kept
+            else ++droppedBlocks_;                                                  // past the capacity: counted, not kept
         }
         if (subFilled >= kSubRing)                                                  // a 3 s short-term sample every 1 s (LRA)
         {

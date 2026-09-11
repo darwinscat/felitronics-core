@@ -330,27 +330,74 @@ public:
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
         if (rendererBlock < 1 || internalBlock < 1 || oversampleFactor < 1) return false;
         if (! (binDb > 0.0) || ! std::isfinite (binDb)) return false;
-        // A `process(n)` call writes K * floor((pos + n) / K) tap frames, which is at most n + K - 1.
-        const long long cap = (long long) rendererBlock + (long long) internalBlock;
-        if (cap > (long long) std::numeric_limits<int>::max() / ((long long) oversampleFactor + 1)) return false;
+        int frameCap = 0, osCap = 0;
+        if (! tapLayoutFor (rendererBlock, internalBlock, oversampleFactor, frameCap, osCap)) return false;
+        // The histograms' refusal BEFORE the first write (law 11(b)): a prepare() refused on its bin width allocates
+        // nothing, which is what prepareBytes() says of it. (The diverse-testing round: the tap buffers used to be
+        // assigned first, and kept.)
+        std::size_t bins = 0;
+        if (! dynamics::offline::QuantileHistogram::binsFor (0.0, kGrRangeDb, binDb, bins)) return false;
 
         fs_ = sampleRate;
         nch_ = maxChannels;
-        frameCap_ = (int) cap;
-        osCap_    = (int) (cap * (long long) oversampleFactor);
+        frameCap_ = frameCap;
+        osCap_    = osCap;
         compTap_.assign ((std::size_t) frameCap_, 0.0f);
         limTap_.assign  ((std::size_t) osCap_, 0.0f);
         limPeak_.assign ((std::size_t) osCap_, 0.0f);
         // The gain-reduction range: `GainComputer` caps its own range at 400 dB, and the limiter's is
         // bounded by its ceiling clamp. 400 covers both, and anything past it is COUNTED rather than
         // folded into the top bin, so a quantile that lands there answers `false` instead of lying.
-        if (! compHist_.prepare (0.0, 400.0, binDb)) return false;
-        if (! limHist_.prepare  (0.0, 400.0, binDb)) return false;
+        if (! compHist_.prepare (0.0, kGrRangeDb, binDb)) return false;
+        if (! limHist_.prepare  (0.0, kGrRangeDb, binDb)) return false;
         prepared_ = true;
         return true;
     }
 
     bool isPrepared() const noexcept { return prepared_; }
+
+    //==========================================================================================================
+    // THE BUDGETS — what a call will ask the heap for, computed by the very functions the call sizes itself with
+    // (tapLayoutFor, QuantileHistogram::binsFor, meterSamples, LoudnessMeter::storageFor, TruePeakMeter::storageFor),
+    // so a budget cannot drift from its allocation — exact for a FRESH object: one already prepared keeps whatever
+    // storage still fits and asks nothing for it. REQUESTED bytes: allocator headers, alignment and fragmentation
+    // are the caller's margin, and none of this is a promise that a heap can serve it. Static on purpose — a caller
+    // budgets before it prepares anything, and the rate is an argument, not state.
+    static constexpr int    kDrainFrames = 64;       // zeros the true-peak meter is drained with — see measure()
+    static constexpr double kGrRangeDb   = 400.0;    // the gain-reduction histograms' span — see prepare()
+
+    // prepare(): the tap buffers and the two histograms. 0 where prepare() refuses the same arguments.
+    static std::uint64_t prepareBytes (int rendererBlock, int internalBlock, int oversampleFactor, double binDb = 0.01) noexcept
+    {
+        if (rendererBlock < 1 || internalBlock < 1 || oversampleFactor < 1) return 0;
+        int frameCap = 0, osCap = 0;
+        if (! tapLayoutFor (rendererBlock, internalBlock, oversampleFactor, frameCap, osCap)) return 0;
+        const std::uint64_t hist = dynamics::offline::QuantileHistogram::storageBytes (0.0, kGrRangeDb, binDb);
+        if (hist == 0) return 0;
+        return (std::uint64_t) sizeof (float) * ((std::uint64_t) frameCap + 2u * (std::uint64_t) osCap) + 2u * hist;
+    }
+
+    // solve(): its PEAK. Every pass builds a loudness meter and a true-peak meter and frees them at the pass's end, so
+    // the peak is ONE pass — plus the drain buffer, which the first solve allocates and later ones reuse (after the
+    // first solve this is therefore an upper bound, by exactly `numChannels * kDrainFrames` floats). 0 for a length
+    // or a channel count solve() refuses before any pass.
+    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames) noexcept
+    {
+        if (frames <= 0 || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
+        const std::uint64_t meter = meterBytes (sampleRate, frames);
+        if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
+        return meter
+             + analysis::TruePeakMeter::storageFor (sampleRate, numChannels).bytes()
+             + (std::uint64_t) sizeof (float) * (std::uint64_t) numChannels * (std::uint64_t) kDrainFrames;
+    }
+
+    // measureInputLoudnessRange(): one loudness meter — and NOTHING for a programme too short to have a range, which it
+    // refuses before building one. (The code-review round: this budget used to promise a meter for a 1 s call that
+    // allocates none.)
+    static std::uint64_t measureRangeBytes (double sampleRate, int frames) noexcept
+    {
+        return rangeMeasurable (frames, sampleRate) ? meterBytes (sampleRate, frames) : 0u;
+    }
 
     // Render `frames` of `in` into `out` at a gain and ceiling chosen to meet `req`. `params` is the
     // caller's whole parameter set; the solver overrides exactly `preLimiterGainDb` and
@@ -1168,12 +1215,50 @@ private:
     //    the interface reports success. The COUNT deliberately does not live here: its owner is the
     //    baseline harness in another repository, it moves whenever that corpus does, and nothing in
     //    this tree can re-derive it. A number without a local owner rots and cannot be made not to.
+    // THE METER'S CAPACITY FOR A PROGRAMME, in samples: the programme plus one second of margin. The ONE place it is
+    // decided — both meters this class builds size themselves with it. In samples, and not as `frames / fs + 1`
+    // seconds, which is +inf at a finite rate the chain accepts (1e-305 Hz with 2000 frames): the store's size was
+    // then `(std::size_t) inf`, undefined behaviour, and the same ABI call kept 3 blocks on arm64 and wasm32 and 4
+    // on x86-64 gcc.
+    static double meterSamples (int frames, double sampleRate) noexcept
+    {
+        return (double) frames + std::ceil (sampleRate);
+    }
+
+    // The loudness meter a programme of `frames` is measured with — the store both meters of this class are built with.
+    // 0 for a rate prepare() refuses: the meter would read it as 48 kHz, but no measurement reaches a meter at it.
+    static std::uint64_t meterBytes (double sampleRate, int frames) noexcept
+    {
+        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate)) return 0u;
+        analysis::LoudnessMeter::Storage st;
+        return analysis::LoudnessMeter::storageFor (sampleRate, meterSamples (frames, sampleRate), st) ? st.bytes() : 0u;
+    }
+
+    // EBU Tech 3342 needs short-term samples, one a second: under 3 s of programme there is no range to measure. ONE
+    // rule, read by measureInputLoudnessRange() (which refuses before it builds a meter), by its budget, and by
+    // `lraValid`.
+    static bool rangeMeasurable (int frames, double sampleRate) noexcept
+    {
+        return frames > 0 && (double) frames / sampleRate >= 3.0;
+    }
+
+    // THE TAP BUFFERS' GEOMETRY, as the one function prepare() sizes them with. A `process(n)` call writes
+    // K * floor((pos + n) / K) tap frames, which is at most n + K - 1.
+    [[nodiscard]] static bool tapLayoutFor (int rendererBlock, int internalBlock, int oversampleFactor,
+                                            int& frameCap, int& osCap) noexcept
+    {
+        const long long cap = (long long) rendererBlock + (long long) internalBlock;
+        if (cap > (long long) std::numeric_limits<int>::max() / ((long long) oversampleFactor + 1)) return false;
+        frameCap = (int) cap;
+        osCap    = (int) (cap * (long long) oversampleFactor);
+        return true;
+    }
+
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {
         analysis::LoudnessMeter  lm;
         analysis::TruePeakMeter  tm;
-        const double seconds = (double) frames / fs_ + 1.0;
-        if (! lm.prepare (fs_, nch, seconds)) return false;
+        if (! lm.prepareForSamples (fs_, nch, meterSamples (frames, fs_))) return false;
         for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! tm.prepare (fs_, frames > 0 ? frames : 1, nch)) return false;
         const float* p[core::kMaxChannels] {};
@@ -1183,10 +1268,10 @@ private:
 
         // 64 zeros: the meter's FIR holds 12 base-rate samples, and 8 were measured to be enough to
         // deliver the whole answer. Eight times that costs nothing and leaves no argument.
-        drain_.assign ((std::size_t) nch * 64u, 0.0f);
+        drain_.assign ((std::size_t) nch * (std::size_t) kDrainFrames, 0.0f);
         const float* z[core::kMaxChannels] {};
-        for (int c = 0; c < nch; ++c) z[c] = drain_.data() + (std::size_t) c * 64u;
-        if (! tm.process (z, nch, 64)) return false;
+        for (int c = 0; c < nch; ++c) z[c] = drain_.data() + (std::size_t) c * (std::size_t) kDrainFrames;
+        if (! tm.process (z, nch, kDrainFrames)) return false;
 
         m.gatingBlocks     = lm.gatingBlockCount();
         m.droppedBlocks    = lm.droppedBlocks();
@@ -1206,7 +1291,7 @@ private:
         // LRA needs short-term samples, one a second: a programme too short for them reports 0.0 LU,
         // which is also what "no dynamic range at all" reports. Saying which one it is is the only way
         // an LRA constraint can mean anything.
-        m.lraValid         = m.loudnessValid && ((double) frames / fs_ >= 3.0);
+        m.lraValid         = m.loudnessValid && rangeMeasurable (frames, fs_);
         return true;
     }
 
@@ -1221,9 +1306,9 @@ public:
                                                   double& out) const
     {
         if (! prepared_ || in == nullptr || nch < 1 || nch > nch_ || frames <= 0) return false;
-        if ((double) frames / fs_ < 3.0) return false;
+        if (! rangeMeasurable (frames, fs_)) return false;
         analysis::LoudnessMeter lm;
-        if (! lm.prepare (fs_, nch, (double) frames / fs_ + 1.0)) return false;
+        if (! lm.prepareForSamples (fs_, nch, meterSamples (frames, fs_))) return false;   // in samples: see meterSamples()
         for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! lm.process (in, nch, frames)) return false;
         // `nonFiniteSubHops` belongs in this test and was missing from it, which made the function

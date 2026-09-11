@@ -66,20 +66,36 @@ public:
     // used to be honoured by keeping the WIDTH and dropping the RANGE, so a caller asking for 1e-6 dB
     // resolution over 360 dB got a histogram covering four of them — and then a valid-looking p95 of
     // zero for a signal at -20 dB. A measurement that cannot be made must fail where it is configured.
+    // THE BIN COUNT prepare() ALLOCATES, as the one function it sizes itself with — false exactly where prepare()
+    // refuses. `floor(span/bin) + 1` bins, so `hiDb` itself lands in the LAST bin rather than one past the end, and
+    // nothing above it does. It is not a rounding nicety: |gain change| is bounded BY `rangeDb` and reaches it exactly
+    // on saturated material, so a half-open top sent the saturated case — the one a solver meets when asked for more
+    // than the material can give — into overflow.
+    [[nodiscard]] static bool binsFor (double loDb, double hiDb, double binDb, std::size_t& out) noexcept
+    {
+        if (! std::isfinite (loDb) || ! std::isfinite (hiDb) || ! (binDb > 0.0) || ! std::isfinite (binDb)) return false;
+        if (! (hiDb > loDb)) return false;
+        const double nb = std::floor ((hiDb - loDb) / binDb) + 1.0;
+        if (! (nb >= 1.0) || nb > 4.0e6) return false;    // 32 MB ceiling; absurd resolutions are refused
+        out = (std::size_t) nb;
+        return true;
+    }
+    // ...and in bytes: 0 where prepare() refuses. What a FRESH histogram asks for — a prepared one keeps storage that
+    // still fits.
+    static std::uint64_t storageBytes (double loDb, double hiDb, double binDb) noexcept
+    {
+        std::size_t nb = 0;
+        return binsFor (loDb, hiDb, binDb, nb) ? (std::uint64_t) nb * (std::uint64_t) sizeof (BinCount) : 0u;
+    }
+
     [[nodiscard]] bool prepare (double loDb, double hiDb, double binDb)
     {
         bins_.clear();
-        if (! std::isfinite (loDb) || ! std::isfinite (hiDb) || ! (binDb > 0.0) || ! std::isfinite (binDb)) return false;
-        if (! (hiDb > loDb)) return false;
+        std::size_t nb = 0;
+        if (! binsFor (loDb, hiDb, binDb, nb)) return false;
         lo_  = loDb;
         bin_ = binDb;
-        // `floor(span/bin) + 1` bins, so `hiDb` itself lands in the LAST bin rather than one past the
-        // end, and nothing above it does. It is not a rounding nicety: |gain change| is bounded BY
-        // `rangeDb` and reaches it exactly on saturated material, so a half-open top sent the saturated
-        // case — the one a solver meets when asked for more than the material can give — into overflow.
-        const double nb = std::floor ((hiDb - lo_) / bin_) + 1.0;
-        if (! (nb >= 1.0) || nb > 4.0e6) return false;    // 32 MB ceiling; absurd resolutions are refused
-        bins_.assign ((std::size_t) nb, 0);
+        bins_.assign (nb, 0);
         reset();
         return true;
     }

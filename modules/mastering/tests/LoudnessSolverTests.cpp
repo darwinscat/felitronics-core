@@ -17,10 +17,22 @@
 #include <felitronics_test.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
+
+// The allocation counter, the module suites' idiom — a COUNT only (no bytes, so no allocator's padding to reason
+// about): P41 needs "a refused prepare() allocates nothing" counted rather than read off the source.
+static std::atomic<long long> g_allocs { 0 };
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void  operator delete   (void* p) noexcept { std::free (p); }
+void  operator delete[] (void* p) noexcept { std::free (p); }
+void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
+void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using namespace felitronics::mastering;
@@ -2195,6 +2207,93 @@ static void testLraRefusesAPoisonedProgramme()
             "PRECONDITION: and the number it would have returned is 21.4 LU, not 4.8");
 }
 
+// P41 F1 — THE METER BEHIND A SOLVE IS SIZED IN SAMPLES. `frames / fs + 1` seconds is +inf at a finite rate the
+// chain accepts, and the store's size used to be `(std::size_t) inf`: undefined behaviour whose answer depended on
+// the row — 3 kept blocks and 194 dropped on arm64 and wasm32, 4 and 193 on x86-64 gcc. The rate is absurd on
+// purpose and the chain takes it (without EQ and limiter, the two stages that refuse it); a solver that measures
+// at the rate it was given has to size its meter for the programme it was given.
+static void testTheMeterIsSizedInSamples()
+{
+    test::group ("the meter behind a solve is sized in samples, at any rate the chain accepts");
+
+    const double fs = 1.0e-305;
+    const int frames = 2000;
+    MasteringChain chain; OfflineRenderer renderer; TargetLoudnessSolver solver;
+    MasteringChainConfig cfg; cfg.eq = false; cfg.limiter = false;
+    test::ok (chain.prepare (fs, 1, cfg), "PRECONDITION: the chain accepts the rate once EQ and limiter are off");
+    test::ok (renderer.prepare (1, 1024), "renderer prepared");
+    test::ok (solver.prepare (fs, 1, 1024, chain.internalBlock(), chain.tapOversampleFactor()), "solver prepared");
+    test::ok (! std::isfinite ((double) frames / fs), "PRECONDITION: the seconds form really is +inf here");
+
+    std::vector<float> in ((std::size_t) frames), out ((std::size_t) frames, 0.0f);
+    for (int i = 0; i < frames; ++i) in[(std::size_t) i] = (i & 1) ? 0.25f : -0.25f;
+    const float* ip[1] { in.data() };
+    float*       op[1] { out.data() };
+    LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+    const LoudnessSolution s = solver.solve (chain, renderer, MasteringChainParams {}, ip, op, 1, frames, req);
+    // PRECONDITION: a meter was prepared at all. A refused solve leaves `measured` at its defaults, where "0 dropped"
+    // holds vacuously — the stand's mutant back to the seconds form now REFUSES (+inf seconds) and passed that line.
+    test::ok (s.status != MasteringSolveStatus::RenderFailed && s.passes > 0, "PRECONDITION: the solve measured something");
+    // 2000 one-sample sub-hops are 200 hops, and the first block is born on the 4th: 197 blocks. Whatever the
+    // verdict at this rate, the store must hold all of them — the defect dropped 193 or 194 of them.
+    test::ok (s.measured.droppedBlocks == 0, "no gating block is dropped: the store holds the programme");
+    test::ok (s.measured.gatingBlocks == 197, "and all 197 blocks the programme produces are kept");
+
+    double lra = -1.0;
+    (void) solver.measureInputLoudnessRange (ip, 1, frames, lra);   // the same sizing, exercised for the sanitizer rows
+    // The range measurement is sized the same way, and a SILENT programme shows it — at 1e-304 Hz, where `frames / fs`
+    // is +inf too. The programme is measured, 0 LU, as at any ordinary rate; the seconds form overran its store and
+    // refused it.
+    MasteringChain qChain; TargetLoudnessSolver qSolver;
+    test::ok (qChain.prepare (1.0e-304, 1, cfg) && qSolver.prepare (1.0e-304, 1, 1024, qChain.internalBlock(),
+                                                                    qChain.tapOversampleFactor()),
+              "PRECONDITION: chain and solver take 1e-304 Hz");
+    test::ok (! std::isfinite (100000.0 / 1.0e-304), "PRECONDITION: the seconds form is +inf at 1e-304 Hz too");
+    const std::vector<float> quiet (100000, 0.0f);
+    const float* qp[1] { quiet.data() };
+    double quietLra = -1.0;
+    test::ok (qSolver.measureInputLoudnessRange (qp, 1, 100000, quietLra) && quietLra == 0.0,
+              "100 000 silent frames at 1e-304 Hz: the range is measured, 0 LU — the store holds the programme");
+}
+
+// P41 — A BUDGET IS 0 WHERE ITS CALL REFUSES, A CHANNEL COUNT INCLUDED. The pre-merge diff pass: both helpers used to
+// turn a negative count into a huge number, and a different one on wasm32 than natively.
+static void testTheBudgetsRefuseWhatTheCallsRefuse()
+{
+    test::group ("a budget is 0 where its call refuses — channel counts included");
+    using felitronics::analysis::TruePeakMeter;
+    const int past = felitronics::core::kMaxChannels + 1;
+    test::ok (TruePeakMeter::storageFor (48000.0, 0).bytes() == 0 && TruePeakMeter::storageFor (48000.0, -1).bytes() == 0
+              && TruePeakMeter::storageFor (48000.0, past).bytes() == 0,
+              "TruePeakMeter::storageFor: 0 bytes for a channel count prepare() refuses");
+    test::ok (TruePeakMeter::storageFor (48000.0, 2).bytes() == 296, "and 296 B for stereo at 48 kHz (the ABI suite's oracle)");
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000) == 0
+              && TargetLoudnessSolver::solveBytes (48000.0, past, 48000) == 0,
+              "solveBytes: 0 for a channel count solve() refuses");
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000) == 3480, "and 3480 B for 1 s of stereo (the ABI suite's oracle)");
+    // A prepare() refused on its bin width (400 dB at 1e-7 dB is 4e9 bins, past the 4e6 ceiling) allocates NOTHING —
+    // which is what its budget says. The diverse-testing round found the tap buffers assigned before that refusal, and
+    // kept. The delta is read into a local before the check.
+    {
+        TargetLoudnessSolver fine;
+        const long long before = g_allocs.load();
+        const bool refused = ! fine.prepare (48000.0, 2, 1024, 64, 4, 1.0e-7);
+        const long long allocs = g_allocs.load() - before;
+        test::ok (refused && allocs == 0 && TargetLoudnessSolver::prepareBytes (1024, 64, 4, 1.0e-7) == 0,
+                  "a prepare() refused on its bin width allocates nothing, and its budget is 0");
+    }
+    test::ok (TargetLoudnessSolver::solveBytes (0.0, 2, 48000) == 0 && TargetLoudnessSolver::solveBytes (-1.0, 2, 48000) == 0
+              && TargetLoudnessSolver::measureRangeBytes (0.0, 480000) == 0, "and 0 for a rate the solver refuses");
+    // The true-peak meter's factor follows the RATE, and so must its budget — one rate could not tell (the diverse-
+    // testing round's mutant sized it at 48 kHz and passed). Derived: 1 s is 20 hops at any multiple of 100 Hz, so the
+    // loudness meter is 8·(300 + 24 + 10) = 2672 B; the true-peak meter at factor F is 4·12F + 4·2·12 + 4·2; the drain 512.
+    test::ok (TruePeakMeter::storageFor (96000.0, 2).bytes() == 200 && TruePeakMeter::storageFor (192000.0, 2).bytes() == 152,
+              "the true-peak meter at 96 kHz (factor 2) is 200 B, at 192 kHz (factor 1) 152 B");
+    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 200u + 512u
+              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 152u + 512u,
+              "and a 1 s solve at 96 and 192 kHz carries that meter: 3384 and 3336 B");
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
@@ -2222,5 +2321,7 @@ int main()
     testTheVerdictDoesNotDependOnTheBudget();
     testThePreMergeDiffPass();
     testLraRefusesAPoisonedProgramme();
+    testTheMeterIsSizedInSamples();
+    testTheBudgetsRefuseWhatTheCallsRefuse();
     return felitronics::test::report();
 }

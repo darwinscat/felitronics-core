@@ -33,12 +33,51 @@
 
 // RT-safety witness: every allocation in this binary is counted (the TruePeakMeter suite's pattern).
 static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+// BYTES too: the store's size is a formula, and this counter is its oracle. It counts what the CONTAINER asked for —
+// the quantity a budget states — and on libc++ and libstdc++ that is exactly what reaches operator new. MSVC's STL on
+// x86 and x64 is the exception (<xmemory>): a block of _Big_allocation_threshold = 4096 bytes or more is aligned to 32
+// by hand, and operator new is asked for _Non_user_size more — sizeof(void*) + 31, one word more under _DEBUG. That is
+// the allocator's alignment, which a budget leaves to its caller by definition, so the counter takes it back off, and
+// the check "the byte counter counts ... as ..." below fails if what it takes off is not what this STL adds. A padded
+// block starts at 4096 + the pad, and every allocation inside the windows this file measures is a std::vector's.
+// Iterator debugging (_ITERATOR_DEBUG_LEVEL > 0, the Debug default) is NOT modelled: there every container also
+// allocates a proxy of two pointers, which a counter cannot tell from a real allocation, and that same check fails by
+// name. The rows build Release, where the level is 0.
+#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
+#  if defined(_DEBUG)
+static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
+#  else
+static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
+#  endif
+#else
+static constexpr std::size_t kStlBigPad = 0;
+#endif
+static constexpr std::size_t kStlBigBlock = 4096;
+static std::atomic<long long> g_bytes { 0 };
+static long long containerBytes (std::size_t s) noexcept
+{
+    return (long long) (kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
+}
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed); return std::malloc (s ? s : 1); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
 void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
+
+// One vector's allocation, as the counter sees it. The storage is written through `volatile`: an allocation nothing
+// observes may be removed by the optimizer, operator new call and all, and a counter that then reads 0 proves nothing.
+static long long vectorRequest (std::size_t n)
+{
+    const long long before = g_bytes.load();
+    {
+        std::vector<char> v;
+        v.assign (n, 0);
+        volatile char* sink = v.data();
+        sink[0] = 1;
+    }
+    return g_bytes.load() - before;
+}
 
 using namespace felitronics;
 
@@ -476,6 +515,128 @@ int main()
             test::approx (lm.integratedLufs(), -20.0, 0.1, "the kept blocks still read the tone");
             lm.reset();
             test::ok (lm.droppedBlocks() == 0, "reset clears the count");
+        }
+    }
+
+    // --- P41: the store is sized by ONE function, in samples, and that function is TOTAL ---
+    test::group ("storageFor: one sizing function, in samples, refusing what it cannot represent");
+    {
+        using M = analysis::LoudnessMeter;
+        const double inf = std::numeric_limits<double>::infinity();
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        M::Storage s;
+        // Every one of these used to reach a float-to-size_t conversion out of range, or an out-of-range lround.
+        test::ok (! M::storageFor (48000.0, inf, s),     "+inf samples: refused");
+        test::ok (! M::storageFor (48000.0, nan, s),     "NaN samples: refused");
+        test::ok (! M::storageFor (48000.0, -1.0, s),    "negative samples: refused");
+        test::ok (! M::storageFor (48000.0, 1.0e300, s), "a finite count past the int block index: refused");
+        test::ok (! M::storageFor (inf, 1000.0, s),      "an infinite rate: refused");
+        test::ok (! M::storageFor (3.0e10, 1000.0, s),   "a rate whose hop does not fit an int: refused");
+        test::ok (s.blocks == 0 && s.shortTerm == 0,     "and a refusal leaves `out` untouched");
+        // A rate <= 0 or NaN is read as 48 kHz, as prepare() reads it — the budget of a call is storageFor() with the
+        // SAME arguments. (The diverse-testing round: it used to refuse what prepare() sizes at 48 kHz.)
+        M::Storage z, zn, ref;
+        test::ok (M::storageFor (0.0, 1000.0, z) && M::storageFor (std::numeric_limits<double>::quiet_NaN(), 1000.0, zn)
+                  && M::storageFor (48000.0, 1000.0, ref) && z.bytes() == ref.bytes() && zn.bytes() == ref.bytes()
+                  && z.subSamples == 480, "a zero or NaN rate is sized at 48 kHz, as prepare() sizes it");
+        // The rate bound IS the property, taken on the computed 0.01·fs: a round number short of it refused rates the
+        // old code handled without UB (the code-review round: 21 GHz), and a bound on fs itself admits a rate whose
+        // 0.01·fs rounds UP to .5 at the edge.
+        M::Storage s2;
+        test::ok (M::storageFor (21474836449.0, 1000.0, s2) && s2.subSamples == 214748364,
+                  "21474836449 Hz: its hop still fits an int — accepted, sub-hop 214748364");
+        test::ok (! M::storageFor (21474836450.0, 1000.0, s2), "21474836450 Hz: 0.01·fs is .5 over — refused");
+        M lmRate;
+        test::ok (lmRate.prepare (2.1e10, 1, 1.0e-6), "prepare(21 GHz, 1 µs) is accepted, as it always was");
+
+        M lm;
+        test::ok (! lm.prepare (48000.0, 2, inf),        "prepare(+inf s): REFUSED — it used to convert inf to size_t");
+        test::ok (! lm.prepare (48000.0, 2, 1.0e300),    "prepare(1e300 s): REFUSED");
+        test::ok (! lm.prepareForSamples (48000.0, 2, inf), "prepareForSamples(+inf): REFUSED");
+        // What did NOT change: a NaN or negative duration still reads as 0 s and is accepted.
+        felitronics::test::run (lm.prepare (48000.0, 2, nan));
+        felitronics::test::run (lm.prepare (48000.0, 2, -5.0));
+
+        // THE ORACLE IS A TABLE, on purpose (the one place a restatement is mandatory): prepare() and a caller's
+        // budget both READ storageFor(), so a check of one against the other cannot move when storageFor's own
+        // arithmetic does. Each row is derived by hand from `s = max(1, lround(0.01·fs))`, `hops = ⌈n⌉/(10·s)`,
+        // blocks = ⌊hops⌋ + 4, shortTerm = ⌊hops/10⌋ + 8, bytes = 8·(300 + blocks + shortTerm):
+        struct Row { double fs, n; int s; std::size_t blocks, shortTerm; std::uint64_t bytes; };
+        const Row rows[] = {
+            { 48000.0,  480000.0, 480,    104,    18,    3376 },   // hops 100
+            { 44100.0,  441000.0, 441,    104,    18,    3376 },   // hops 100
+            { 22050.0,  220500.0, 221,    103,    17,    3360 },   // lround(220.5) = 221, hops 99.77
+            {   150.0,    1500.0,   2,     79,    15,    3152 },   // lround(1.5) = 2, hops 75
+            {   149.0,       1.0,   1,      4,     8,    2496 },   // lround(1.49) = 1, hops 0.1
+            {   100.0, 3600000.0,   1, 360004, 36008, 3170496 },   // the plateau s = 1: hops 360000
+        };
+        for (const Row& r : rows)
+        {
+            M::Storage t;
+            const bool okay = M::storageFor (r.fs, r.n, t);
+            test::ok (okay && t.subSamples == r.s && t.blocks == r.blocks && t.shortTerm == r.shortTerm && t.bytes() == r.bytes,
+                      "storageFor(" + std::to_string ((long long) r.fs) + " Hz, " + std::to_string ((long long) r.n)
+                      + ") is the hand-derived row");
+        }
+
+        // THE COUNTER'S OWN RULE, checked where it is relied on: vectors just under the STL's big-block threshold, at
+        // it, and far above it count as exactly the bytes they asked for. On MSVC's STL that is its pad being taken
+        // off — the pad differs between Release and _DEBUG and between x86 and x64 — and everywhere else it is
+        // operator new being asked for exactly that. Literal sizes, not the counter's own constants.
+        for (const std::size_t n : { std::size_t { 4095 }, std::size_t { 4096 }, std::size_t { 4097 }, std::size_t { 1 } << 20 })
+        {
+            const long long got = vectorRequest (n);
+            test::ok (got == (long long) n, "the byte counter counts a " + std::to_string (n) + "-byte vector as "
+                                            + std::to_string (n) + " bytes (read " + std::to_string (got) + ")");
+        }
+
+        // THE ALLOCATION IS THE FORMULA: a fresh meter allocates exactly storageFor(...).bytes(), counted by this
+        // file's own operator new — and the seconds form is the same store as the samples form.
+        // The delta is read into a local BEFORE the check: a call's arguments are evaluated in an unspecified
+        // order, and the message is a std::string that allocates. gcc builds it first — measured on the Debian
+        // row, where reading the counter inside the call counted the message's own bytes and failed all 12.
+        for (const Row& r : rows)
+        {
+            M a;
+            const long long before = g_bytes.load();
+            felitronics::test::run (a.prepareForSamples (r.fs, 2, r.n));
+            const long long got = g_bytes.load() - before;
+            test::ok (got == (long long) r.bytes,
+                      "prepareForSamples(" + std::to_string ((long long) r.fs) + " Hz) allocates exactly the formula");
+            M b;
+            const long long before2 = g_bytes.load();
+            felitronics::test::run (b.prepare (r.fs, 2, r.n / r.fs));
+            const long long got2 = g_bytes.load() - before2;
+            test::ok (got2 == (long long) r.bytes, "and the seconds form allocates the same store");
+        }
+
+        // THE BOUNDARY FIXTURE: a store sized for EXACTLY n samples, fed exactly n, at the lengths that straddle
+        // a hop — k·hop − 1, k·hop, k·hop + 1. The precondition is the claim itself (nothing dropped), and the
+        // fixture is live (blocks were produced). Only an OVERFEED can see the +4 margin (the group above); here
+        // the margin is invisible by construction, which is what the stand measured.
+        for (const double rate : { 48000.0, 44100.0, 22050.0 })
+        {
+            const long long hop = 10LL * std::lround (0.01 * rate);
+            const int want[3] = { 36, 37, 37 };
+            for (int d = -1; d <= 1; ++d)
+            {
+                const long long n = 40 * hop + d;
+                M m;
+                felitronics::test::run (m.prepareForSamples (rate, 2, (double) n));
+                std::vector<float> buf (4096);
+                const float* ch[2] { buf.data(), buf.data() };
+                long long done = 0, idx = 0;
+                while (done < n)
+                {
+                    const int k = (int) std::min<long long> (4096, n - done);
+                    for (int i = 0; i < k; ++i) buf[(std::size_t) i] = (float) (0.1 * std::sin (2.0 * core::kPi * kToneHz * (double) idx++ / rate));
+                    felitronics::test::run (m.process (ch, 2, k));
+                    done += k;
+                }
+                test::ok (m.droppedBlocks() == 0 && m.gatingBlockCount() == want[d + 1],
+                          "a store of exactly 40·hop" + std::string (d < 0 ? "-1" : d > 0 ? "+1" : "")
+                          + " samples keeps every block it is fed (" + std::to_string (want[d + 1]) + ")");
+            }
         }
     }
 

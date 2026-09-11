@@ -5,8 +5,10 @@
 // it carries the contract, and this file carries only the unpacking of it.
 //
 // NOTHING HERE COMPUTES ANYTHING. Every number handed back was produced by `felitronics::mastering` and
-// read out of it. What this file does is four things and no fifth: validate what a page can hand it,
-// translate enum codes, copy fields, and own handles. If a line of this file ever looks like DSP, it is
+// read out of it — save `fc_need.facadeBytes`, this file's own `sizeof`, forwarded beside the core's numbers
+// and never added to them. What this file does is five things and no sixth: validate what a page can hand
+// it, translate enum codes, copy fields, own handles, and refuse every call once one has not returned (the
+// poison — see FC_GUARD). If a line of this file ever looks like DSP, it is
 // a defect, and `fcore_master selftest` is the gate that finds it — the same programme through this
 // ABI and through a direct C++ call, one binary, one machine, compared bit for bit.
 //
@@ -23,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <new>
 
@@ -623,6 +626,40 @@ struct Slot
 
 Slot g_slots[kMaxHandles];
 
+// THE CALL THAT NEVER RETURNED. Under -fno-exceptions an exhausted heap ABORTS inside a core call, and the module is
+// not stopped by it: emscripten lets the page call again, the heap is intact, and every object is wherever the abort
+// left it. Measured on this facade in wasm32 (P41): an abort inside `fc_master_solve`, then `fc_master_process` on the
+// same handle answered FC_OK and rendered at the solver's own pass-1 gain, because `solverRan` is written after the
+// solve returns — +12 dB in that replay, which asked for that start, and MasterAbiTests repeats it. And
+// kMaxHandles − 1 = 7 such solves left the handle table full for good (FC_ERR_EXHAUSTED with one live object, whether
+// the memory came back or not). An instance in that state does not fail; it LIES.
+//
+// So it is POISONED instead. Every status-returning entry point marks a call in progress on entry and clears the mark
+// only on a normal return. Finding the mark already set on entry means the previous call never returned — an abort, a
+// trap, or natively an exception that escaped — and from then on every such call answers FC_ERR_POISONED and touches
+// nothing. The way out is a new module instance. The mark survives an abort because nothing unwinds; natively it
+// survives an escaping exception because the guard, destroyed by the unwinding, sees the exception and keeps it.
+// Single-threaded by contract (law 1) and no entry point calls another, so "in progress on entry" means "abandoned" —
+// or RE-ENTERED from inside an allocation (a native new_handler), which this module does not support and cannot tell
+// apart: both are answered FC_ERR_POISONED. See "THE MODULE IS NOT RE-ENTRANT" in fc_master_abi.h.
+// `volatile`, not for threads (there are none) but because the mark's whole job is to be seen by a LATER call after
+// this one never returned: nothing obliges an optimizer to keep a store whose only reader follows an abort, so the
+// mechanism is not left to what it can prove. (The code-review round; measured kept at -O2, -O3 and -flto either way.)
+volatile bool g_inCall = false, g_poisoned = false;
+
+struct CallGuard
+{
+    const int unwinding = std::uncaught_exceptions();
+    ~CallGuard() { if (std::uncaught_exceptions() == unwinding) g_inCall = false; }
+};
+
+// The first statement of every status-returning entry point — ahead of the handle check, because an abandoned
+// module has no handle this file can vouch for.
+#define FC_GUARD                                                                    \
+    if (g_poisoned || g_inCall) { g_poisoned = true; return FC_ERR_POISONED; }     \
+    g_inCall = true;                                                                \
+    const CallGuard fcGuard_ {}
+
 // handle = (gen << 8) | (index + 1). Zero is never valid, so a zeroed variable in JS is a refusal.
 std::uint32_t packHandle (int idx, std::uint32_t gen) noexcept
 {
@@ -695,6 +732,7 @@ void planes (float* base, std::uint32_t stride, int nch, float** out) noexcept
 
 FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* out)
 {
+    FC_GUARD;
     // `*out` IS NOT TOUCHED UNTIL THE CALL SUCCEEDS. It used to be cleared on entry, which reads as the
     // careful thing and is not: a caller reusing a variable that still holds a LIVE handle would have it
     // wiped by a call that failed on the version field, and the object it named would then be
@@ -712,8 +750,8 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     if (idx < 0) return FC_ERR_EXHAUSTED;
 
     // `new` here, not in process(): the RT-safety claim is about the audio path, and this is a worker
-    // call. Under -fno-exceptions a failure aborts rather than returning — stated in fc_master_abi.h as
-    // a non-promise rather than pretended away.
+    // call. Under -fno-exceptions a failure aborts rather than returning, and the instance is then POISONED
+    // rather than left answering — see FC_GUARD above and "POISON COMES FIRST" in fc_master_abi.h.
     g_slots[idx].master = std::make_unique<MasterInstance>();
     auto& m = *g_slots[idx].master;
     m.cfg = cc;
@@ -737,6 +775,7 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
 FC_EXPORT fc_status fc_master_configure (fc_master h, const fc_master_params* params,
                                          fc_master_resolved* resolved)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     auto& m = *s->master;
@@ -770,6 +809,7 @@ FC_EXPORT fc_status fc_master_configure (fc_master h, const fc_master_params* pa
 
 FC_EXPORT fc_status fc_master_resolved_get (fc_master h, fc_master_resolved* out)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
@@ -779,6 +819,7 @@ FC_EXPORT fc_status fc_master_resolved_get (fc_master h, fc_master_resolved* out
 
 FC_EXPORT fc_status fc_master_process (fc_master h, const float* in, float* out, std::uint32_t frames)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     auto& m = *s->master;
@@ -814,6 +855,7 @@ FC_EXPORT fc_status fc_master_process (fc_master h, const float* in, float* out,
 
 FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capacity, std::uint32_t* written)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     auto& m = *s->master;
@@ -844,6 +886,7 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
 
 FC_EXPORT fc_status fc_master_latency (fc_master h, std::int32_t* out)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
@@ -853,6 +896,7 @@ FC_EXPORT fc_status fc_master_latency (fc_master h, std::int32_t* out)
 
 FC_EXPORT fc_status fc_master_get_stats (fc_master h, fc_master_stats* out)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
@@ -864,6 +908,7 @@ FC_EXPORT fc_status fc_master_get_stats (fc_master h, fc_master_stats* out)
 
 FC_EXPORT fc_status fc_master_reset (fc_master h)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     s->master->chain.reset();
@@ -877,14 +922,47 @@ FC_EXPORT fc_status fc_master_reset (fc_master h)
 
 FC_EXPORT fc_status fc_master_destroy (fc_master h)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     freeSlot (*s);
     return FC_OK;
 }
 
+// Forwarding only: every number is the core's (TargetLoudnessSolver's budgets) or this file's own `sizeof`, and
+// none is added to another here — the page sums what applies.
+FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t frames, fc_need* out)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
+    if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;   // the core takes `int`
+    auto& m = *s->master;
+    const double fs  = m.chain.sampleRate();
+    const int    nch = m.chain.numChannels();
+    std::uint64_t call = 0, facade = 0;
+    switch (op)
+    {
+        case FC_NEED_SOLVE:       call = TargetLoudnessSolver::solveBytes (fs, nch, (int) frames);
+                                  facade = sizeof (LoudnessSolution);                     break;
+        case FC_NEED_MEASURE_LRA: call = TargetLoudnessSolver::measureRangeBytes (fs, (int) frames);
+                                  facade = 0;                                             break;
+        default:                  return FC_ERR_ENUM;
+    }
+    stampHeader (out);
+    out->callBytes          = call;
+    // The arguments are the ones this file hands the solver's prepare() itself — see fc_master_solve.
+    out->solverPrepareBytes = TargetLoudnessSolver::prepareBytes (m.renderer.blockSize(), m.chain.internalBlock(),
+                                                                  m.chain.tapOversampleFactor());
+    out->facadeBytes        = facade;
+    out->solverPrepared     = m.solver.isPrepared() ? 1 : 0;
+    return FC_OK;
+}
+
 FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::uint32_t frames, double* out)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
@@ -920,6 +998,7 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
 // about both directions. The host-layout-to-role mapping stays outside, exactly as the core says.
 FC_EXPORT fc_status fc_master_set_channel_weight (fc_master h, std::int32_t channel, double weight)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (channel < 0 || channel >= core::kMaxChannels) return FC_ERR_RANGE;
@@ -943,6 +1022,7 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
                                      const float* in, float* out, std::uint32_t frames,
                                      fc_solution* out_solution)
 {
+    FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
     auto& m = *s->master;
@@ -1029,6 +1109,7 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
 
 FC_EXPORT fc_status fc_solution_summary_get (fc_solution sh, fc_solution_summary* out)
 {
+    FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
@@ -1050,6 +1131,7 @@ FC_EXPORT fc_status fc_solution_summary_get (fc_solution sh, fc_solution_summary
 
 FC_EXPORT fc_status fc_solution_measurement (fc_solution sh, fc_measurement* out)
 {
+    FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
@@ -1060,6 +1142,7 @@ FC_EXPORT fc_status fc_solution_measurement (fc_solution sh, fc_measurement* out
 FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::uint32_t cap,
                                      std::uint32_t* written)
 {
+    FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
@@ -1089,6 +1172,7 @@ FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::ui
 
 FC_EXPORT fc_status fc_solution_destroy (fc_solution sh)
 {
+    FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
     freeSlot (*s);

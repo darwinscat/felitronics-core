@@ -7,7 +7,53 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
-_Nothing yet._
+### `analysis` · `mastering` · `tools` — a meter's store is counted in samples, a call publishes what it will allocate, and an instance that aborted refuses
+
+- **`analysis::LoudnessMeter` sizes its gating-block store through ONE function, in SAMPLES:**
+  `storageFor (sampleRate, maxSamples, Storage&)`, which the new `prepareForSamples()` sizes itself with;
+  `prepare (seconds)` is now a thin wrapper and still reads a NaN or negative duration as 0 s. **A capacity
+  that cannot be represented is REFUSED** — +inf samples, a block count past the `int` index, a rate whose hop
+  overflows an `int` — where it used to reach an out-of-range float-to-`size_t` conversion. On every
+  representable input `prepare (seconds)` sizes exactly the store it always did (pinned byte for byte by a
+  hand-derived table in `LoudnessConformanceTests`).
+- **`mastering::TargetLoudnessSolver` sizes both of its meters in samples** — `frames + ceil(fs)` — and no longer
+  through `frames / fs + 1` seconds, which is +inf at a finite rate the chain accepts (without EQ and limiter),
+  where the same solve used to keep a different number of gating blocks on different platforms. Pinned:
+  `LoudnessSolverTests` keeps all 197 blocks of that programme, 0 dropped. At ordinary rates the store can now
+  differ from before by ONE block, where the trip through seconds rounded across an integer; those blocks are
+  margin, not need — the store still holds every block a programme produces — and no measurement changes.
+- **Budgets — what a call will ask the heap for, from the very functions it sizes itself with:**
+  `TargetLoudnessSolver::prepareBytes / solveBytes / measureRangeBytes`, `TruePeakMeter::storageFor`,
+  `QuantileHistogram::storageBytes`, `LoudnessMeter::Storage::bytes()`. REQUESTED bytes — allocator headers,
+  alignment and fragmentation are the caller's margin, and none of this promises that a heap can serve them.
+  Each is exact for a FRESH object — a prepared one keeps storage that still fits — and 0 (`storageFor`:
+  false) wherever the matching call refuses, a channel count included.
+- **`dynamics::offline::QuantileHistogram::prepare`, refusing, writes nothing past its disarm** (law 11(b)), now
+  that it sizes itself through `binsFor`. A refusal drops the bins, as it always did; one by the 4e6-bin ceiling
+  used to go on and leave the refused range and width behind — `binWidth()` read them, and `add()` split
+  below/above range by them — and now the last successful preparation's stay, as after every other refusal.
+- **`tools` (C ABI) — `FC_ERR_POISONED` (14).** An exhausted heap aborts a wasm module inside the core, and the
+  module is not stopped by it: the next call used to be answered by objects the abort had left half-changed.
+  Every status-returning entry point now refuses, touching nothing, once any call has failed to return (an
+  abort, a trap, natively an escaped exception); the page discards the instance. The `*_default` writers and
+  the identity queries stay callable. **The module is not re-entrant, and now says so:** a status call made
+  while another is still running — from a native `new_handler`, a signal handler — cannot be told apart from
+  the first call after an abandoned one and is answered 14 too, so a native host that used to call back in from
+  a `new_handler` now poisons the module.
+- **`tools` (C ABI) — `fc_master_need (h, op, frames, fc_need*)`**: the budgets of `solve` and `measure_lra`,
+  forwarded field by field and never summed (`callBytes`, `solverPrepareBytes`, `facadeBytes`,
+  `solverPrepared`) — `facadeBytes`, the facade's own `sizeof` of the solution record, is the one number this
+  ABI hands back that the core did not compute. A `frames` past INT_MAX is `FC_ERR_RANGE`, then an unknown `op`
+  `FC_ERR_ENUM`. `create` and `configure` are not budgeted yet. Both additions are additive: no struct
+  moved, `FC_MASTER_ABI_VERSION` stays 1, and the header now states that rule for new codes.
+- **`docs` — law 11d: memory that cannot be had is not a refusal.** Exhaustion is fatal on every row — never a
+  `false` — and the explicit exception to 11b. In its place the core publishes a DEMAND (a bound on what an
+  allocating call holds at once, from the functions its `prepare()` sizes itself with) and the C ABI poisons a
+  module whose call never returned. The chain's own storage (`create`, `configure`) is not budgeted yet.
+- **`tools` — `fcore::Probe::prepare` answers with its meter.** It ignored the meter's return value, which
+  could only fail on a channel count the probe had already checked; the meter now also refuses a store it
+  cannot represent (3e8 s), and a probe that ignored that would report prepared and measure nothing — where it
+  used to ask the heap for the impossible store.
 
 ## v0.30.0 — a pause is silence, a refusal has a name, and the chain answers through a C ABI (`core`, `nam`, `rigplayer`, `mastering`, `tools`)
 

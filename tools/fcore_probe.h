@@ -57,16 +57,19 @@ public:
     static constexpr int kOsFactor      = 4;    // \ the true-peak filter this tool is the REFERENCE for;
     static constexpr int kOsTapsPerPhase = 32;  // / see the header comment before changing either
 
-    // Audio sample rates, bounded to a range the downstream arithmetic survives. "Positive and finite" is NOT
-    // enough: LoudnessMeter sizes its hop with `lround(0.01*fs)` into an int and its block store with
-    // `ceil(maxDurationSec*fs)`, so an absurd-but-finite rate (1e300, or Number.MIN_VALUE from a page)
-    // reaches an out-of-range lround — undefined behaviour — or asks for an impossible allocation. The bounds
-    // are generous: every rate any product here will meet lies inside them by orders of magnitude.
+    // Audio sample rates, bounded to a range an audio tool can mean. "Positive and finite" is NOT enough: an
+    // absurd-but-finite rate (1e300, or Number.MIN_VALUE from a page) is no audio rate, and what each stage
+    // downstream makes of one is not this tool's to find out — the meter, for one, now REFUSES a rate whose hop
+    // overflows an int, where it used to reach an out-of-range lround (undefined behaviour). The probe refuses
+    // such a rate itself, with its own answer. The bounds are generous: every rate any product here will meet
+    // lies inside them by orders of magnitude.
     static constexpr double kMinSampleRate = 1000.0;
     static constexpr double kMaxSampleRate = 768000.0;
 
     // maxDurationSec sizes the meter's gating-block store. The default holds 4 h at any rate (1.27 MB) —
-    // droppedBlocks() reads 0 for anything shorter, and a caller checks it rather than assuming.
+    // droppedBlocks() reads 0 for anything shorter, and a caller checks it rather than assuming. A duration whose
+    // store the meter cannot represent — a block count past its int index, 3e8 s — is refused, because the meter
+    // refuses it: a probe that ignored that answer would report prepared and measure nothing.
     bool prepare (double sampleRate, int channels, double maxDurationSec = 4.0 * 3600.0)
     {
         prepared_ = false;
@@ -77,7 +80,7 @@ public:
         if (! (maxDurationSec > 0.0) || ! std::isfinite (maxDurationSec)) return false;
 
         nc_ = channels;
-        (void) lm_.prepare (sampleRate, nc_, maxDurationSec);   // a tool, not a test: the probe is best-effort
+        if (! lm_.prepare (sampleRate, nc_, maxDurationSec)) return false;
         os_.assign ((std::size_t) nc_, {});
         for (auto& o : os_) if (! o.prepare (kOsFactor, 1, kOsTapsPerPhase)) return false;
         osBuf_.assign ((std::size_t) kChunk * (std::size_t) kOsFactor, 0.0f);
