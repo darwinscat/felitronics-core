@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::analysis
@@ -71,16 +72,44 @@ class TruePeakMeter
 public:
     static constexpr int kTapsPerPhase = 12;     // 48-tap prototype at 4× — matches the spec filter length
 
+    // WHAT prepare() ALLOCATES, from the same functions it sizes itself with (factorFor, protoTapsFor): three vectors
+    // and nothing else, so a caller budgeting memory reads the numbers the meter is built from — asked of a FRESH
+    // meter; a prepared one keeps storage that still fits. All zeros for a channel count prepare() refuses, where it
+    // allocates nothing.
+    struct Storage
+    {
+        int         factor     = 4;
+        std::size_t protoTaps  = 0;     // proto_, floats
+        std::size_t histFloats = 0;     // hist_, floats
+        std::size_t posInts    = 0;     // pos_, ints
+        std::uint64_t bytes() const noexcept
+        {
+            return (std::uint64_t) sizeof (float) * (std::uint64_t) (protoTaps + histFloats)
+                 + (std::uint64_t) sizeof (int) * (std::uint64_t) posInts;
+        }
+    };
+    static Storage storageFor (double sampleRate, int maxChannels, int oversample = 0) noexcept
+    {
+        Storage st;
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) { st.factor = 0; return st; }   // prepare()'s refusal
+        st.factor     = factorFor (oversample, sampleRate > 0.0 ? sampleRate : 48000.0);   // prepare()'s own substitution
+        st.protoTaps  = protoTapsFor (st.factor);
+        st.histFloats = (std::size_t) maxChannels * (std::size_t) kTapsPerPhase;
+        st.posInts    = (std::size_t) maxChannels;
+        return st;
+    }
+
     [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/, int maxChannels) noexcept
     {
         prepared_ = false;
         fs_ = sampleRate > 0.0 ? sampleRate : 48000.0;
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         channels_ = maxChannels;
-        chooseFactor();
-        designFilter();
-        hist_.assign ((std::size_t) channels_ * (std::size_t) kTapsPerPhase, 0.0f);
-        pos_.assign  ((std::size_t) channels_, 0);
+        const Storage st = storageFor (fs_, channels_, params_.oversample);
+        chooseFactor();                                              // L_ == st.factor
+        designFilter();                                              // proto_ holds st.protoTaps
+        hist_.assign (st.histFloats, 0.0f);
+        pos_.assign  (st.posInts, 0);
         applyBallistics();
         reset();
         prepared_ = true;
@@ -179,16 +208,22 @@ public:
     }
 
 private:
+    static int factorFor (int oversample, double sampleRate) noexcept
+    {
+        if (oversample == 1 || oversample == 2 || oversample == 4) return oversample;
+        return (sampleRate < 88200.0) ? 4 : (sampleRate < 176400.0 ? 2 : 1);   // reach the spec's ~176.4/192 kHz analysis rate
+    }
+    static std::size_t protoTapsFor (int factor) noexcept { return (std::size_t) std::max (1, factor * kTapsPerPhase); }
+
     void chooseFactor() noexcept
     {
-        if (params_.oversample == 1 || params_.oversample == 2 || params_.oversample == 4) { L_ = params_.oversample; return; }
-        L_ = (fs_ < 88200.0) ? 4 : (fs_ < 176400.0 ? 2 : 1);          // reach the spec's ~176.4/192 kHz analysis rate
+        L_ = factorFor (params_.oversample, fs_);
     }
 
     void designFilter() noexcept
     {
         const int N = L_ * kTapsPerPhase;
-        proto_.assign ((std::size_t) std::max (1, N), 0.0f);
+        proto_.assign (protoTapsFor (L_), 0.0f);
         if (L_ <= 1) return;                                          // no interpolation needed at ≥ 176.4 kHz
         const double fc   = 0.5 / (double) L_;                        // cutoff at the BASE Nyquist (full true-peak bandwidth)
         const double cen  = (double) (N - 1) * 0.5;

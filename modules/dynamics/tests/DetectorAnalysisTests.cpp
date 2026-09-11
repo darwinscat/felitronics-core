@@ -270,6 +270,19 @@ static void quantileRuleIsOneRule()
         test::ok (! h.quantile (0.95, got) && got == 1234.0, "an empty histogram refuses and leaves `out` untouched");
     }
 
+    // 6b. A refusal DISARMS and writes nothing else (law 11(b)): the bins go, as they always did, and the range and
+    //     width stay the last successful preparation's. The 4e6-bin ceiling used to be tested AFTER those were
+    //     written, so a refused re-preparation left the refused ones behind for binWidth() and add() to read.
+    {
+        QuantileHistogram h; test::ok (h.prepare (0.0, 400.0, 0.01), "histogram prepared");
+        for (const double v : { 100.0, 200.0, 300.0 }) h.add (v);
+        double got = 0.0;
+        test::ok (h.quantile (0.5, got), "PRECONDITION: the prepared histogram answers");
+        test::ok (! h.prepare (0.0, 400.0, 1.0e-6), "PRECONDITION: a resolution past the bin ceiling is refused");
+        test::ok (! h.quantile (0.5, got), "the refusal disarms: the bins are gone, as they always were");
+        test::ok (h.binWidth() == 0.01, "and it wrote nothing else: the width is the last successful preparation's");
+    }
+
     // 7. Counters are 64-bit BY TYPE — a uint32 bin overflows after 24.9 hours at 48 kHz, which no test
     //    can reach in a suite that runs in a second, so the contract is asserted where it is decidable.
     static_assert (std::is_same_v<decltype (std::declval<const QuantileHistogram&>().count()), std::uint64_t>,

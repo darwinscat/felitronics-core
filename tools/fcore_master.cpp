@@ -82,6 +82,7 @@ const char* statusName (fc_status s)
         case FC_ERR_NON_FINITE:      return "NON_FINITE";
         case FC_ERR_REFUSED_BY_CORE: return "REFUSED_BY_CORE";
         case FC_ERR_EXHAUSTED:       return "EXHAUSTED";
+        case FC_ERR_POISONED:        return "POISONED";
     }
     return "?";
 }

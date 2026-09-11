@@ -245,15 +245,15 @@ int main()
             { 48000.0,  0, false, "channels 0" },
             { 48000.0, -1, false, "negative channels" },
             { 48000.0,  core::kMaxChannels + 1, false, "channels past kMaxChannels" },
-            // "Positive and finite" is not enough. LoudnessMeter sizes its hop with lround(0.01*fs) into an
-            // int and its block store with ceil(maxDurationSec*fs); an absurd-but-finite rate reaches an
-            // out-of-range lround (undefined behaviour) or demands an impossible allocation. A page can hand
-            // us Number.MIN_VALUE as easily as 48000.
+            // "Positive and finite" is not enough: an absurd-but-finite rate is no audio rate, and the probe
+            // refuses it itself rather than leave each stage to answer it differently (the meter, for one, now
+            // refuses a rate whose hop overflows an int — it used to reach an out-of-range lround, undefined
+            // behaviour). A page can hand us Number.MIN_VALUE as easily as 48000.
             { fcore::Probe::kMinSampleRate,       2, true,  "the lowest accepted rate" },
             { fcore::Probe::kMaxSampleRate,       2, true,  "the highest accepted rate" },
             { fcore::Probe::kMinSampleRate - 1.0, 2, false, "just below the lowest" },
             { fcore::Probe::kMaxSampleRate + 1.0, 2, false, "just above the highest" },
-            { 1e300,    2, false, "an absurd but finite rate (lround would be out of range)" },
+            { 1e300,    2, false, "an absurd but finite rate (its hop would overflow an int)" },
             { 5e-324,   2, false, "the smallest positive subnormal double" },
         };
         for (const auto& k : cases)
@@ -322,6 +322,8 @@ int main()
         test::ok (! p.prepare (48000.0, 2, -1.0), "negative capacity");
         test::ok (! p.prepare (48000.0, 2, std::numeric_limits<double>::quiet_NaN()), "NaN capacity");
         test::ok (! p.prepare (48000.0, 2, std::numeric_limits<double>::infinity()), "infinite capacity");
+        test::ok (! p.prepare (48000.0, 2, 3.0e8), "a capacity the meter cannot store (3e8 s: a block count past its int "
+                                                    "index) — the meter refuses it, and so does the probe");
         test::ok (p.prepare (48000.0, 2, 10.0), "a sane one is accepted");
     }
 

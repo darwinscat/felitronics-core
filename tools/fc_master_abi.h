@@ -15,8 +15,9 @@
 // surface may never become the only road to a capability: everything it can do has to be reachable
 // without it. What is duplicated here is exactly two things — the ENUM CODES and the FIELD MAPPING.
 // No arithmetic. Not one clamp, not one default, not one derived number. Every value this header hands
-// back was computed by the core and read out of it; where the core cannot answer, this file refuses
-// rather than inventing.
+// back was computed by the core and read out of it — save one, `fc_need.facadeBytes`, the facade's own
+// `sizeof`, named as such and never added to a core number; where the core cannot answer, this file
+// refuses rather than inventing.
 //
 // The mechanical proof of that is `fcore_master selftest`: the same programme rendered through this
 // ABI and through a direct C++ call, in ONE binary on ONE machine, compared bit for bit. A facade that
@@ -90,6 +91,12 @@ extern "C" {
 // EXACT size match, not ">=", for v1. A tolerant read is a promise about how future fields will be
 // laid out, and there is no future field yet to test that promise against; the first version to add
 // one states its own rule then. Refusing early costs a caller a rebuild and costs nobody a wrong render.
+//
+// A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
+// from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
+// meaning or value — so a caller built against an older header meets a code it does not know exactly
+// where it already has to handle "not FC_OK", and nothing it relied on moved. The version moves only
+// when a struct's layout does. (FC_ERR_POISONED and the FC_NEED_* ops came in this way.)
 #define FC_MASTER_ABI_VERSION 1u
 
 typedef struct fc_header
@@ -111,10 +118,10 @@ typedef struct fc_header
 // Order is not accidental: it is the order the checks run in, which law 11 makes part of the contract
 // so that one malformed call has one answer.
 //
-//   handle -> the handle's STATE -> out-parameters (null, alignment, in-heap) -> struct headers (the
-//   first 8 bytes bounded, then version, then size, THEN the rest of the struct's span) -> NARROWING
-//   (a count this ABI cannot hand the core's `int`) -> audio spans and their aliases -> field values
-//   -> core
+//   POISON -> handle -> the handle's STATE -> out-parameters (null, alignment, in-heap) -> struct
+//   headers (the first 8 bytes bounded, then version, then size, THEN the rest of the struct's span) ->
+//   NARROWING (a count this ABI cannot hand the core's `int`) -> audio spans and their aliases -> field
+//   values -> core
 //
 // Three details of that are load-bearing rather than incidental. THE HANDLE'S STATE comes second
 // because a call that is illegal for this handle is illegal whatever else it carries. OUT-PARAMETERS
@@ -122,6 +129,27 @@ typedef struct fc_header
 // NARROWING comes before the spans because it is the only check that can still fire: a frame count past
 // INT_MAX makes a byte span past 32 bits too, so a span check placed first would answer every such call
 // with FC_ERR_SPAN and the specific diagnosis would be unreachable.
+//
+// POISON COMES FIRST, AND IT IS FOR EVER. Under -fno-exceptions an exhausted heap does not come back as a
+// status: the module ABORTS inside the core, and the page receives a JavaScript RuntimeError instead of a
+// return value. What the abort does NOT do is stop the module — emscripten lets the page call again, with
+// every object wherever the abort left it — and such an instance does not fail, it LIES. Measured on
+// v0.30.0 in wasm32: an abort inside `fc_master_solve`, then `fc_master_process` on the same handle answered
+// FC_OK and rendered at the search's own pass-1 gain — +12 dB in that replay, which asked for that start
+// (`initialGainDb`; MasterAbiTests repeats the scenario) — and kMaxHandles − 1 = 7 such aborts left the
+// handle table full for good, because each reserves its solution slot before the search runs.
+// So every entry point that returns `fc_status` marks a call in progress and clears the mark only on a
+// normal return. Finding it set means an earlier call never returned — an abort, a trap, or natively an
+// exception that escaped — and from then on every such call answers FC_ERR_POISONED, writes nothing and
+// touches nothing. There is no way back inside the instance: the page discards it and instantiates a new
+// one. The entry points that return no status — the `*_default` writers and the build-identity queries —
+// read no instance state and stay callable.
+//
+// THE MODULE IS NOT RE-ENTRANT, and the poison is what says so. An entry point called while another is still
+// running — from a new_handler, a signal handler, anything the runtime runs inside an allocation this file made —
+// cannot be told apart from the first call after an abandoned one, and is answered FC_ERR_POISONED, for good. (The
+// code-review round: a native new_handler that destroyed a spare handle during `fc_master_create` used to work and
+// now poisons the module. A browser page cannot install one; a native host must not.)
 
 typedef enum fc_status
 {
@@ -141,7 +169,9 @@ typedef enum fc_status
     FC_ERR_STATE           = 10,   // the call is legal but not HERE — see the entry point's own note
     FC_ERR_NON_FINITE      = 11,   // a NaN or an infinity where the contract admits neither
     FC_ERR_REFUSED_BY_CORE = 12,   // the core returned false. This ABI does not know why, and says so
-    FC_ERR_EXHAUSTED       = 13    // no free slot in the handle table
+    FC_ERR_EXHAUSTED       = 13,   // no free slot in the handle table
+    FC_ERR_POISONED        = 14    // an earlier call into this module never returned: the instance is
+                                   // abandoned, and nothing but a new one answers — see above
 } fc_status;
 
 //==============================================================================
@@ -397,6 +427,32 @@ typedef struct fc_master_stats
 } fc_master_stats;
 
 //==============================================================================
+// WHAT A CALL WILL ASK THE HEAP FOR
+//
+// On the wasm tier exhaustion is not a status (see POISON above), so a page that must not lose its worker
+// budgets BEFORE the call. Every number here but `facadeBytes` is computed by the core with the very functions
+// its prepare() sizes itself with — a budget cannot drift from its allocation — and `facadeBytes` is the facade's
+// own `sizeof`; all are forwarded field by field, never summed: the page adds what applies. REQUESTED bytes, not a promise that a heap can serve them: allocator headers,
+// alignment and fragmentation are the page's margin to keep.
+//
+// The op is a code rather than a field per call so that the calls not yet budgeted here (create, configure —
+// the chain's own storage) can join without moving this struct.
+typedef enum fc_need_op { FC_NEED_SOLVE = 0, FC_NEED_MEASURE_LRA = 1 } fc_need_op;
+
+typedef struct fc_need
+{
+    fc_header header;
+
+    uint64_t callBytes;           // the core's PEAK request during ONE such call. A solve builds its meters per pass
+                                  // and frees them at the pass's end, so this is one pass — plus the true-peak
+                                  // drain, which the first solve keeps (so afterwards an upper bound by that drain)
+    uint64_t solverPrepareBytes;  // the search's one-time preparation — tap buffers and gain-reduction histograms —
+                                  // done lazily by the first solve, measure_lra or channel weight on the handle
+    uint64_t facadeBytes;         // this file's own object for the call: a solve's solution record; 0 for measure_lra
+    int32_t  solverPrepared;      // 1 once that preparation has happened: `solverPrepareBytes` is then already spent
+} fc_need;
+
+//==============================================================================
 // THE LOUDNESS SEARCH
 //
 // A versioned C-POD request in, an OPAQUE HANDLE out, and the per-pass log copied into a buffer the
@@ -579,6 +635,11 @@ fc_status fc_master_latency (fc_master h, int32_t* out);
 fc_status fc_master_get_stats (fc_master h, fc_master_stats* out);
 fc_status fc_master_reset (fc_master h);
 fc_status fc_master_destroy (fc_master h);
+
+// The budget of the next such call on this handle for `frames` of programme — see fc_need. A `frames` past INT_MAX
+// is refused with FC_ERR_RANGE (the core counts in `int`), and then an `op` that is not an fc_need_op with
+// FC_ERR_ENUM — narrowing before field values, as everywhere. Reads the handle and moves nothing.
+fc_status fc_master_need (fc_master h, int32_t op, uint32_t frames, fc_need* out);
 
 // The input's loudness range, for the LRA constraint — which is a DELTA and therefore needs both ends.
 // Stateless by construction: it returns the number and the caller puts it into the request, so it

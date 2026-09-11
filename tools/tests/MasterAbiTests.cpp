@@ -27,13 +27,59 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 // The allocation counter, same idiom as the module suites: a global operator new so that "process()
 // does not allocate" is COUNTED rather than read off the source.
 static std::atomic<long long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+// P41: a switch that makes the NEXT allocation fail — natively an exception, the exact analogue of the wasm abort
+// (nothing after the failing statement runs, the facade's own bookkeeping included). Exceptions only: the wasm tier
+// builds this file with -fno-exceptions, where the analogue is the abort itself and the suite cannot outlive it.
+static std::atomic<bool> g_failNextAlloc { false };
+// BYTES too: fc_master_need's budgets are held against them, so the counter counts what the CONTAINER asked for. MSVC's
+// STL on x86/x64 asks operator new for sizeof(void*) + 31 bytes more (one word more under _DEBUG) on every block of 4096
+// or more — its own alignment, which a budget leaves to the caller — and the counter takes that back off. The rule and
+// its reasons are written out in LoudnessConformanceTests.cpp; here, as there, a check fails if it is not this STL's —
+// and under iterator debugging, which neither file models (a proxy allocation per container), it fails by name.
+#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
+#  if defined(_DEBUG)
+static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
+#  else
+static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
+#  endif
+#else
+static constexpr std::size_t kStlBigPad = 0;
+#endif
+static constexpr std::size_t kStlBigBlock = 4096;
+static std::atomic<long long> g_bytes { 0 };
+static long long containerBytes (std::size_t s) noexcept
+{
+    return (long long) (kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
+}
+static void* countedNew (std::size_t s)
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed);
+#if defined(__cpp_exceptions)
+    if (g_failNextAlloc.exchange (false)) throw std::bad_alloc();
+#endif
+    return std::malloc (s ? s : 1);
+}
+// One vector's allocation, as the counter sees it — written through `volatile`, so the optimizer cannot remove it.
+static long long vectorRequest (std::size_t n)
+{
+    const long long before = g_bytes.load();
+    {
+        std::vector<char> v;
+        v.assign (n, 0);
+        volatile char* sink = v.data();
+        sink[0] = 1;
+    }
+    return g_bytes.load() - before;
+}
+void* operator new      (std::size_t s) { return countedNew (s); }
+void* operator new[]    (std::size_t s) { return countedNew (s); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
@@ -1211,6 +1257,196 @@ int main()
         ok (p.bypassLimiter == goodParams().bypassLimiter, "that field is still what it was too");
         fc_master_destroy (h);
     }
+
+    //==========================================================================
+    // P41 — THE BUDGET IS THE ALLOCATION. Every delta is read into a local BEFORE its check: a call's arguments are
+    // evaluated in an unspecified order and a message string allocates (gcc builds it first — measured).
+    group ("fc_master_need: each budget is exactly what the call allocates");
+    {
+        // The counter's own rule first (see LoudnessConformanceTests.cpp): around the STL's big-block threshold and far
+        // above it, a vector counts as exactly the bytes it asked for. Literal sizes, not the counter's own constants.
+        for (const std::size_t nb : { std::size_t { 4095 }, std::size_t { 4096 }, std::size_t { 4097 }, std::size_t { 1 } << 20 })
+        {
+            const long long got = vectorRequest (nb);
+            ok (got == (long long) nb, "the byte counter counts a " + std::to_string (nb) + "-byte vector as "
+                                       + std::to_string (nb) + " bytes (read " + std::to_string (got) + ")");
+        }
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        ok (fc_master_configure (h, &p, &r) == FC_OK, "PRECONDITION: a configured handle");
+        const std::uint32_t n = 192000;                  // 4 s at 48 kHz: measure_lra builds a meter only from 3 s
+        fc_need solve {}; FC_INIT (solve);
+        fc_need lra {};   FC_INIT (lra);
+        fc_need bad {};   FC_INIT (bad);
+        ok (fc_master_need (h, FC_NEED_SOLVE, n, &solve) == FC_OK, "the solve budget is answered");
+        ok (fc_master_need (h, FC_NEED_MEASURE_LRA, n, &lra) == FC_OK, "the measure_lra budget is answered");
+        ok (fc_master_need (h, 7, n, &bad) == FC_ERR_ENUM, "an op this ABI does not define is refused");
+        // Narrowing before the op, as the check order says: a count past INT_MAX is RANGE whatever the op, and INT_MAX
+        // itself is a count the core takes.
+        fc_need big {}; FC_INIT (big);
+        ok (fc_master_need (h, FC_NEED_SOLVE, 0x80000000u, &big) == FC_ERR_RANGE, "frames past INT_MAX: FC_ERR_RANGE");
+        ok (fc_master_need (h, 7, 0x80000000u, &big) == FC_ERR_RANGE, "and RANGE before ENUM: narrowing comes first");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 0x7FFFFFFFu, &big) == FC_OK && big.callBytes > 0, "INT_MAX frames are budgeted");
+        ok (solve.solverPrepared == 0, "PRECONDITION: the solver is not prepared yet");
+
+        // THE ORACLE, literal on purpose (the one place a restatement is mandatory). 48 kHz stereo, 4 s: the loudness
+        // meter is sized for 192000 + 48000 samples = 50 hops of 4800 → 8·(300 + 54 + 13) = 2936 B; the true-peak
+        // meter 4·48 + 4·2·12 + 4·2 = 296 B; the drain 2·64·4 = 512 B.
+        ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
+        ok (solve.callBytes == 2936u + 296u + 512u, "the solve budget is meter + true-peak meter + drain = 3744 B");
+
+        long long before = g_bytes.load();
+        const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
+        const long long prepared = g_bytes.load() - before;
+        ok (w == FC_OK, "the first weight prepares the solver");
+        ok (prepared == (long long) solve.solverPrepareBytes, "and allocates exactly `solverPrepareBytes`");
+        fc_need after {}; FC_INIT (after);
+        ok (fc_master_need (h, FC_NEED_SOLVE, n, &after) == FC_OK && after.solverPrepared == 1,
+            "and from then on the budget says the preparation is spent");
+
+        auto in = tone ((int) n, kNch);
+        double v = 0.0;
+        before = g_bytes.load();
+        (void) fc_master_measure_lra (h, in.data(), n, &v);
+        const long long lraBytes = g_bytes.load() - before;
+        ok (lraBytes == (long long) lra.callBytes, "measure_lra allocates exactly its budget");
+
+        // Under 3 s there is no range: the call refuses BEFORE it builds a meter, and its budget says so (the
+        // code-review round found it promising a meter for exactly this call).
+        fc_need shortLra {}; FC_INIT (shortLra);
+        ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 48000, &shortLra) == FC_OK && shortLra.callBytes == 0,
+            "a 1 s programme: the measure_lra budget is 0");
+        before = g_bytes.load();
+        const fc_status sr = fc_master_measure_lra (h, in.data(), 48000, &v);
+        const long long shortBytes = g_bytes.load() - before;
+        ok (sr == FC_ERR_REFUSED_BY_CORE && shortBytes == 0, "and the refused call allocates nothing");
+
+        // The range rule's own edge, at 48 kHz: exactly 3 s is measurable, one frame less is not — in the call AND in
+        // its budget, which read the same `rangeMeasurable`.
+        fc_need at3 {}, under3 {}; FC_INIT (at3); FC_INIT (under3);
+        ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 144000, &at3) == FC_OK && at3.callBytes > 0,
+            "exactly 3 s: a meter is budgeted");
+        ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 143999, &under3) == FC_OK && under3.callBytes == 0,
+            "one frame under 3 s: nothing is");
+        // A solve builds its meters whatever the length — the range rule is NOT the solve's. 1 s still costs
+        // meter + true-peak meter + drain: 8·(300 + 24 + 10) + 296 + 512 = 3480 B. A length the solve refuses costs 0.
+        fc_need s1 {}, s0 {}; FC_INIT (s1); FC_INIT (s0);
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 3480u,
+            "a 1 s solve is budgeted in full: 3480 B");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 0, &s0) == FC_OK && s0.callBytes == 0,
+            "a 0-frame solve, which the core refuses before any pass, costs 0");
+
+        std::vector<float> out (in.size(), 0.0f);
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+        fc_solution sol = 0;
+        before = g_bytes.load();
+        const fc_status sv = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
+        const long long solveBytes = g_bytes.load() - before;
+        fc_solution_summary sum {}; FC_INIT (sum);
+        ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the search rendered");
+        const long long perPass = (long long) solve.callBytes - 512;
+        ok (solveBytes == (long long) sum.passes * perPass + 512 + (long long) solve.facadeBytes,
+            "a solve allocates passes × (both meters) + the drain + the facade's record: its budget's parts");
+        (void) fc_solution_destroy (sol);
+        (void) fc_master_destroy (h);
+    }
+
+    //==========================================================================
+    // P41 — A CALL THAT NEVER RETURNED POISONS THE INSTANCE. LAST in this file on purpose: the poison belongs to the
+    // whole module and is permanent — that is the contract — so nothing may run after it in this binary.
+#if defined(__cpp_exceptions)
+    group ("a call that never returned: every later status call answers POISONED and touches nothing");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        ok (fc_master_configure (h, &p, &r) == FC_OK, "PRECONDITION: a configured handle");
+        ok (fc_master_set_channel_weight (h, 0, 1.0) == FC_OK, "PRECONDITION: the solver is prepared, so the failing "
+                                                                "allocation is INSIDE the search, after its first render");
+        const std::uint32_t n = 48000;
+        auto in = tone ((int) n, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+        req.initialGainDb = 12.0;          // pass 1 renders at a gain the caller never configured — the wasm replay
+        fc_solution earlier = 0;
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), n, &earlier) == FC_OK && earlier != 0,
+            "PRECONDITION: a solution handed out BEFORE the poison");
+        fc_solution sol = 0;
+        bool escaped = false;
+        g_failNextAlloc = true;
+        try { (void) fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol); }
+        catch (const std::bad_alloc&) { escaped = true; }
+        g_failNextAlloc = false;
+        ok (escaped, "PRECONDITION: the allocation failure escaped the entry point, as an abort would");
+        ok (sol == 0, "and no solution handle was handed out");
+
+        std::vector<float> a ((std::size_t) 64 * kNch, 0.25f), b ((std::size_t) 64 * kNch, 0.0f);
+        ok (fc_master_process (h, a.data(), b.data(), 64) == FC_ERR_POISONED,
+            "process on the same handle: POISONED — it used to render at the search's +12 dB under FC_OK");
+        bool untouched = true; for (float v : b) untouched = untouched && v == 0.0f;
+        ok (untouched, "and the output buffer is untouched");
+        std::int32_t lat = -7;
+        ok (fc_master_latency (h, &lat) == FC_ERR_POISONED && lat == -7, "latency: POISONED, out-parameter untouched");
+        ok (fc_master_configure (h, &p, &r) == FC_ERR_POISONED, "configure cannot rescue it");
+        ok (fc_master_reset (h) == FC_ERR_POISONED, "reset cannot rescue it");
+        fc_master_config cfg = goodConfig();
+        fc_master h2 = 12345u;
+        ok (fc_master_create (&cfg, &h2) == FC_ERR_POISONED && h2 == 12345u,
+            "a NEW handle is refused too — the poison is the module's, not the handle's");
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol) == FC_ERR_POISONED, "solve: POISONED");
+        ok (fc_master_destroy (h) == FC_ERR_POISONED, "even destroy: the page throws the whole instance away");
+        fc_solution_summary sb {}; FC_INIT (sb);
+        ok (fc_solution_summary_get (earlier, &sb) == FC_ERR_POISONED, "and a solution handed out before the poison too");
+        // EVERY guarded entry point, not a sample (the code-review round removed the guard from fc_solution_log and
+        // moved it behind the handle check in process — both passed a sample of seven), and POISON BEFORE HANDLE: an
+        // invalid handle after the poison answers 14, not FC_ERR_HANDLE.
+        fc_master_resolved rr {}; FC_INIT (rr);
+        fc_master_stats sst {};   FC_INIT (sst);
+        fc_need nd {};            FC_INIT (nd);
+        fc_measurement ms {};     FC_INIT (ms);
+        fc_solve_pass lg[4] {};
+        std::uint32_t wrote = 7u;
+        double lraOut = -1.0;
+        ok (fc_master_resolved_get (h, &rr) == FC_ERR_POISONED, "resolved_get: POISONED");
+        ok (fc_master_flush (h, b.data(), 64, &wrote) == FC_ERR_POISONED && wrote == 7u, "flush: POISONED, count untouched");
+        ok (fc_master_get_stats (h, &sst) == FC_ERR_POISONED, "get_stats: POISONED");
+        ok (fc_master_measure_lra (h, in.data(), n, &lraOut) == FC_ERR_POISONED && lraOut == -1.0, "measure_lra: POISONED");
+        ok (fc_master_set_channel_weight (h, 0, 1.0) == FC_ERR_POISONED, "set_channel_weight: POISONED");
+        ok (fc_master_need (h, FC_NEED_SOLVE, n, &nd) == FC_ERR_POISONED, "need: POISONED");
+        ok (fc_solution_measurement (earlier, &ms) == FC_ERR_POISONED, "solution_measurement: POISONED");
+        ok (fc_solution_log (earlier, lg, 4, &wrote) == FC_ERR_POISONED && wrote == 7u, "solution_log: POISONED");
+        ok (fc_solution_destroy (earlier) == FC_ERR_POISONED, "solution_destroy: POISONED");
+        // POISON BEFORE HANDLE, entry point by entry point: an INVALID handle after the poison answers 14, never
+        // FC_ERR_HANDLE — the code-review round moved the guard behind the handle check in `process` and a single
+        // entry point's check could not see it.
+        std::int32_t lat0 = -7;
+        ok (fc_master_latency (0, &lat0) == FC_ERR_POISONED && lat0 == -7, "latency(0): 14, out-parameter untouched");
+        fc_solution sx = 0;
+        const bool all = fc_master_process (0, a.data(), b.data(), 64)             == FC_ERR_POISONED
+                      && fc_master_flush (0, b.data(), 64, &wrote)                  == FC_ERR_POISONED
+                      && fc_master_configure (0, &p, &rr)                           == FC_ERR_POISONED
+                      && fc_master_resolved_get (0, &rr)                            == FC_ERR_POISONED
+                      && fc_master_get_stats (0, &sst)                              == FC_ERR_POISONED
+                      && fc_master_reset (0)                                        == FC_ERR_POISONED
+                      && fc_master_destroy (0)                                      == FC_ERR_POISONED
+                      && fc_master_measure_lra (0, in.data(), n, &lraOut)           == FC_ERR_POISONED
+                      && fc_master_set_channel_weight (0, 0, 1.0)                   == FC_ERR_POISONED
+                      && fc_master_solve (0, &p, &req, in.data(), out.data(), n, &sx) == FC_ERR_POISONED
+                      && fc_master_need (0, FC_NEED_SOLVE, n, &nd)                  == FC_ERR_POISONED
+                      && fc_solution_summary_get (0, &sb)                           == FC_ERR_POISONED
+                      && fc_solution_measurement (0, &ms)                           == FC_ERR_POISONED
+                      && fc_solution_log (0, lg, 4, &wrote)                         == FC_ERR_POISONED
+                      && fc_solution_destroy (0)                                    == FC_ERR_POISONED;
+        ok (all, "every status entry point with an INVALID handle answers 14 after the poison, not FC_ERR_HANDLE");
+        // The entry points without a status read no instance state and stay callable.
+        ok (fc_master_abi_version() == FC_MASTER_ABI_VERSION, "build identity still answers");
+        fc_master_params d {}; fc_master_params_default (&d);
+        ok (d.header.abiVersion == FC_MASTER_ABI_VERSION, "and the defaults writer still writes");
+    }
+#endif
 
     return felitronics::test::report();
 }

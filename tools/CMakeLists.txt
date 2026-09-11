@@ -47,6 +47,16 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_master_abi_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_master_abi_tests COMMAND felitronics_master_abi_tests)
 
+    # Re-entry poisons the module, for good — a binary of its own because the poison is permanent by contract and
+    # the suite above spends its one poisoning on a call that never returned. It needs no exceptions, so the wasm
+    # tier builds and runs it too.
+    add_executable(felitronics_master_abi_reentry_tests tests/MasterAbiReentryTests.cpp wasm/fc_master.cpp)
+    target_link_libraries(felitronics_master_abi_reentry_tests PRIVATE felitronics::mastering felitronics::analysis)
+    target_include_directories(felitronics_master_abi_reentry_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_master_abi_reentry_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_master_abi_reentry_tests COMMAND felitronics_master_abi_reentry_tests)
+
     # The bit-exactness acceptance itself, run as a test rather than by hand: the same programme through
     # the C ABI and through a direct C++ call, one binary, one machine, compared bit for bit — plus
     # block-independence through the ABI and the reset discipline.
