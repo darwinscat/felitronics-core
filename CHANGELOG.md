@@ -46,6 +46,14 @@ four partial accumulators, `(s0+s1) + (s2+s3)`, every multiply and add rounded s
   `poweramp::PowerAmpStage`, hence OrbitCab and orbit-amp. Three storage budgets moved with it (law 11d):
   `TruePeakMeter::storageFor` 296 → 392 B at 48 kHz stereo, and the solve budgets that carry it.
 
+### `wasm-audio` — the tier gets the SIMD ISA it was already tested against
+
+The `wasm-audio` preset now compiles with `-msimd128`, so `core::firDot` reaches its `wasm_f32x4_*`
+kernel instead of falling back to scalar. This is an ISA switch, not a numeric one: the summation order
+is stated in the source, `-ffast-math` stays off, and the tier's suite was measured to move not one bit
+with the flag on. Still NOT `-mrelaxed-simd` — `relaxed_madd` is implementation-defined and breaks
+determinism between machines rather than merely between tiers.
+
 ### `core` · `eq` · `dynamics` · `saturation` · `limiter` · `oversampling` · `mastering` · `tools` — the chain says what building it costs, and re-preparing it costs nothing
 
 Law 11d's remaining half (`docs/DSP-ARCHITECTURE.md`): its budgets covered the solver's calls and said in as

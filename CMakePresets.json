@@ -15,13 +15,13 @@
         {
             "name": "wasm-audio",
             "displayName": "wasm-audio — the Emscripten tier (DSP-ARCHITECTURE.md §2)",
-            "description": "Every default module built for wasm32 with exceptions and RTTI OFF and no pthreads, tests run in node. Needs emsdk on PATH ($EMSDK set by emsdk_env.sh). The link-time physics of the tier (8 MB stack, growable heap, assertions) lives in CMakeLists under if(EMSCRIPTEN); this preset carries the POLICY. -ffp-contract=off is stated even though baseline wasm has no scalar FMA to contract with, so the numeric contract survives a toolchain that grows one.",
+            "description": "Every default module built for wasm32 with exceptions and RTTI OFF and no pthreads, tests run in node. Needs emsdk on PATH ($EMSDK set by emsdk_env.sh). The link-time physics of the tier (8 MB stack, growable heap, assertions) lives in CMakeLists under if(EMSCRIPTEN); this preset carries the POLICY. -ffp-contract=off is stated even though baseline wasm has no scalar FMA to contract with, so the numeric contract survives a toolchain that grows one. -msimd128 is the ISA, not a licence to reassociate: it lets core::firDot reach its wasm kernel, and it was measured not to move a single bit of the suite (the order is stated in the source, and -ffast-math stays off, so there is nothing for a wider register to reorder). NOT -mrelaxed-simd, ever: relaxed_madd is implementation-defined and breaks determinism between MACHINES.",
             "binaryDir": "${sourceDir}/build-wasm-audio",
             "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "FELITRONICS_BUILD_TESTS": "ON",
-                "CMAKE_CXX_FLAGS": "-fno-exceptions -fno-rtti -ffp-contract=off"
+                "CMAKE_CXX_FLAGS": "-fno-exceptions -fno-rtti -ffp-contract=off -msimd128"
             }
         }
     ],
