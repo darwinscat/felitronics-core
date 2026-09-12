@@ -40,26 +40,47 @@
 #include <initializer_list>
 #include <limits>
 #include <new>
+#if defined(_MSC_VER)
+ #include <malloc.h>   // _aligned_malloc / _aligned_free
+#endif
 #include <string>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
 void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
 void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new      (std::size_t s, std::align_val_t a)
+// The over-aligned forms go through the platform's aligned allocator (as in MasteringChainTests.cpp): MSVC has no
+// std::aligned_alloc and no posix_memalign, and memory from _aligned_malloc must be released with _aligned_free —
+// std::free on it corrupts the heap. So the aligned deletes below use the matching release, as a pair.
+static void* countedAlignedNew (std::size_t s, std::size_t a)
 {
     g_allocs.fetch_add (1, std::memory_order_relaxed);
-    return std::aligned_alloc ((std::size_t) a, ((s ? s : 1) + (std::size_t) a - 1) / (std::size_t) a * (std::size_t) a);
+#if defined(_MSC_VER)
+    return _aligned_malloc (s ? s : 1, a);
+#else
+    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
+    void* p = nullptr;
+    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
+#endif
 }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return operator new (s, a); }
+static void alignedFree (void* p) noexcept
+{
+#if defined(_MSC_VER)
+    _aligned_free (p);
+#else
+    std::free (p);
+#endif
+}
+void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
+void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
 void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete   (void* p, std::align_val_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { std::free (p); }
+void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
 
 using namespace felitronics;
 using analysis::PeakMix;
