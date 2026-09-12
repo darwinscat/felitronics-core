@@ -32,6 +32,8 @@
 // acceptance by ~3e-3 dB and the failure would read as a wasm bug. Both sides go through THIS class.
 
 #include <felitronics/analysis/LoudnessMeter.h>
+#include <felitronics/analysis/StereoColumns.h>
+#include <felitronics/analysis/WaveformPeaks.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 
@@ -188,6 +190,70 @@ private:
     int                                                         nc_ = 0;
     bool                                                        prepared_ = false;
     bool                                                        finished_ = false;
+};
+
+// fcore::ShapeProbe — the waveform peaks and the stereo band of one file, the body shared VERBATIM by
+// `fcore_measure waveform|stereo|needle|correlation` and by fc_probe_shapes_run in the wasm shim. Same reason as
+// Probe above: "native and browser draw the same picture" is then a claim about one translation unit.
+//
+// A SEPARATE CLASS AND A SEPARATE ENTRY POINT, NOT AN OPTION ON Probe. The shapes need the file's total length
+// before the first sample (every bucket and column boundary depends on it), which Probe's prepare() never asked
+// for; and fc_probe_run's contract — "every call is a complete loudness measurement from scratch" — would
+// otherwise have grown configuration state that outlives a call. The loudness path is untouched.
+//
+// THE BUILD CONTRACT above is not what makes THESE bits agree: both reductions are plain binary64 in the spec's
+// order, and the one place contraction could reach — the stereo band's products — is pinned by a volatile store
+// in the header itself, which survives any contraction mode.
+class ShapeProbe
+{
+public:
+    static constexpr int kChunk = Probe::kChunk;
+
+    bool prepare (double sampleRate, int channels, std::uint64_t frames, int buckets,
+                  felitronics::analysis::PeakMix mix, int columns)
+    {
+        prepared_ = false;
+        if (channels < 1 || channels > felitronics::core::kMaxChannels) return false;
+        if (! peaks_.prepare (sampleRate, channels, frames, buckets, mix)) return false;
+        if (! stereo_.prepare (channels, frames, columns)) return false;
+        nc_ = channels;
+        prepared_ = true;
+        return true;
+    }
+
+    // Walks the input in kChunk steps, as Probe does, so the native reader's 8192-frame reads and the shim's
+    // whole-buffer call cut the stream at the same places — not that either reduction can tell.
+    //
+    // A CALL THAT CANNOT BE HONOURED IS REFUSED BEFORE ANYTHING MOVES (law 11): a null table or plane, or more frames
+    // than the prepared length has left. Both are checked here rather than left to the two classes, because by the
+    // time a later chunk reached their own checks the earlier chunks would already have been consumed.
+    bool process (const float* const* planar, int channels, long long n) noexcept
+    {
+        if (! prepared_ || channels != nc_ || n < 0) return false;
+        if (n == 0) return true;
+        if (planar == nullptr) return false;
+        for (int c = 0; c < nc_; ++c) if (planar[c] == nullptr) return false;
+        if ((std::uint64_t) n > peaks_.totalFrames() - peaks_.framesSeen()) return false;
+        const float* view[felitronics::core::kMaxChannels] {};
+        for (long long off = 0; off < n; off += kChunk)
+        {
+            const int m = (int) std::min<long long> (kChunk, n - off);
+            for (int c = 0; c < nc_; ++c) view[c] = planar[c] + off;
+            if (! peaks_.process (view, nc_, m))  return false;
+            if (! stereo_.process (view, nc_, m)) return false;
+        }
+        return true;
+    }
+
+    bool complete() const noexcept { return prepared_ && peaks_.complete() && stereo_.complete(); }
+    const felitronics::analysis::WaveformPeaks& peaks()  const noexcept { return peaks_; }
+    const felitronics::analysis::StereoColumns& stereo() const noexcept { return stereo_; }
+
+private:
+    felitronics::analysis::WaveformPeaks peaks_;
+    felitronics::analysis::StereoColumns stereo_;
+    int  nc_ = 0;
+    bool prepared_ = false;
 };
 
 } // namespace fcore

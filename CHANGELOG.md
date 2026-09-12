@@ -5,6 +5,46 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## Unreleased
+
+### `analysis` · `tools` — the waveform bars and the stereo band: one definition, two roads
+
+The site draws two pictures from audio, and each had several definitions: the waveform "peaks" came from a Java
+sidecar generator (ffmpeg to 8 kHz **s16**, integer buckets), a python script, the page's own JavaScript, and a
+client-side costume that re-scaled demo sidecars by their true peak; the stereo band's correlation had the page's,
+`fcore_measure`'s `long double` one and `CorrelationMeter`'s (a different quantity). A demo file and an uploaded one
+could be drawn by different definitions in the same interface, and both pictures looked plausible. This is the core
+half — the one definition and its two roads; moving the site's generators and page onto it is the site's work.
+
+- **`analysis::WaveformPeaks`** — a port of `computePeaksFromBuffer` / `peaksFromWav` (audio-peaks.js), bit for bit:
+  box-average decimation to ~8 kHz (`Math.round`, ties up), then max-abs per bucket; mix modes `avr` · `L` · `R`
+  (the LAST channel) · `max`; the double output and the float32 form, because the two JS functions differ exactly
+  there. **Not a metering peak**: at or below the sample peak, and neither of the core's two true peaks.
+- **`analysis::StereoColumns` / `StereoSums`** — a port of `computeStereoColumns` / `correlationOf` / `widthOf`
+  (stereo-meter.js): per column width, **uncentred** phase correlation (not Pearson's, whatever the JS comment
+  says — (1,2)/(2,1) reads 0.8) and RMS (the JS `loud`; not a loudness), `maxRms` as the unrounded double the page's
+  verdict thresholds use, and the playhead needle over any stretch. The verdict stays on the page.
+- **The spec's known properties are kept, each pinned by a witness the site's own JS computed in node**: the last
+  waveform bucket is never emitted at decLen 2007 / 1000 buckets (the boundary is 2007.0000000000002); a column
+  boundary is floor(i·(len/cols)), so frame 200 of 1206/1200 is in column 200 and the last frame can be in none; a
+  partial box is dropped; short files zero-fill buckets but shrink the column count.
+- **Contraction:** the stereo products go through `volatile` stores (law 10 now names the pin): `mid += m*m` fused on
+  arm64 reads a width of …0010 where the JS reads …0012. The pin was measured on Apple clang 21 arm64, gcc 14.2 x86-64 and gcc 14 arm64 under `on`/`fast`; the removed pin fuses where each compiler fuses, and the witnesses see it there.
+- **Roads:** `fcore::ShapeProbe`, shared by `fcore_measure waveform|stereo|needle` and the new `fc_probe_shapes_run`,
+  `fc_probe_waveform_*`, `fc_probe_stereo_*`, `fc_probe_needle` exports (names that cannot be read as
+  `fc_probe_sample_peak`, `fc_probe_tp_linear` or `fc_probe_lufs`); existing `fc_probe_*` unchanged. The wasm export
+  list is now generated from the source, as fc_master's is. A CI step diffs native against wasm (release and checked)
+  over every mix mode, bucket and column count and a mono / stereo / six-channel fixture.
+- **`fcore_measure correlation`** is the stereo band's binary64 formula over the whole file; law 9's one sanctioned
+  `long double` exception is gone, and the artifact gate lost its one named exclusion.
+- **Measured (out of tree, `.private/harness/p59a-shapes/`):** NULL site-JS vs C++ (`-ffp-contract=fast`) vs wasm on
+  560 synthetic, 35 real and 79 decoded gate items — 0 differences, 0 split mismatches. Demo road vs upload road:
+  lossless WAV/FLAC at the native rate bit-identical after PCM equality (46 of 53 files; the 7 others are float64 WAV,
+  which the site's WAV reader reads as zeros — a site finding); 21 lossy decoder pairs all inside the bound derived
+  from their own per-sample difference, including fixed-point decoders clamping a +20 dB master at 1.0. Mutation
+  stand: 31 mutants, 28 killed (the two-statement removal of the product pin only by the out-of-tree NULL); the three
+  survivors are two equivalent guards and a null check whose removal is undefined behaviour only UBSan sees.
+
 ## v0.31.0 — 2026-09-12
 
 ### `core` · `oversampling` · `analysis` — one polyphase FIR kernel for the whole tree, and five rows that agree on its bits

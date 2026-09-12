@@ -195,10 +195,10 @@ the CPU at runtime, invisible to any build. Full write-up:
    the Linux CI row and 113 in the browser. (arm64 Linux is a fourth answer — AAPCS64 mandates binary128 —
    documented, not measured here.) None of this is a toolchain bug; it is what the type is.
    **Use `double`, or compensated (Kahan / Neumaier) summation**, which is deterministic on every tier
-   because it never asks for anything but IEEE `double` arithmetic. One exception is sanctioned and is
-   written down at the point of use: the `correlation` accumulator in `tools/fcore_measure.cpp`, a
-   native-only sanity number that is explicitly *not* a cross-tier comparison surface — the cross-tier NULL
-   in CI runs `blocks`, which is `double` throughout. **This law IS enforced**, in the two halves the
+   because it never asks for anything but IEEE `double` arithmetic. **There is no exception any more.**
+   The law used to sanction one, the `correlation` accumulator in `tools/fcore_measure.cpp`; P59a found it
+   was a third definition of a number the page and the stereo band already defined, and it became their
+   binary64 formula (`analysis::StereoSums`). The artifact gate below lost its one named exclusion with it. **This law IS enforced**, in the two halves the
    `wasm-audio` job pairs everywhere: a text lint over `modules/*/include` and `modules/*/src` that lexes
    before it matches (the words appear in prose constantly, including in this paragraph) and also catches
    an L-suffixed float literal, which is a `long double` that never names itself; and an **artifact** gate,
@@ -248,6 +248,20 @@ the CPU at runtime, invisible to any build. Full write-up:
    than asserted. What stays outside it, because it is runtime state and not code: FTZ/DAZ (wasm cannot flush
    at all, so a host that flushes splits it from every native row — with NORMAL inputs, since a normal times a
    normal can land subnormal), the rounding mode, and NaN sign/payload.
+   **AND A PIN THAT IS NOT AN OVERRIDE: `analysis::StereoSums` STORES its products before it adds them** (P59a).
+   Its answers are gated against JavaScript, which never contracts, so the right number is the unfused one:
+   `mid += m*m` fused on arm64 under this law's own `on` reads a playhead width of 0x3fdffffff7c00010 where the
+   spec reads ...0012. A `volatile` store per product holds under every contraction mode, gcc's `fast` included,
+   and needs no pragma. (Only the mid and side terms can move: a product of two float32 samples is exact in
+   double, so `ll`, `rr` and `lr` could not be fused into a different number — they are stored anyway, so the
+   rule reads "every product" and nobody has to re-derive which ones are safe.) The pin holds in every
+   cell measured — Apple clang 21 arm64, gcc 14.2 x86-64 and gcc 14 arm64, `on` and `fast`, O2/O3, with and without
+   `-march=native` — while the removed pin fuses exactly where each compiler fuses: one expression under `on` on the
+   arm64 rows, two statements only under gcc's `fast` (with FMA available). The test target keeps the tree's `on`,
+   which catches the natural removal. The two-statement form is visible only to a build with gcc-style cross-statement
+   fusion AND FMA — no in-tree target, CI row or tier is one (`fcore_measure` and the wasm modules are
+   `-ffp-contract=off`), so in the tree it is defended and not gated; the out-of-tree NULL's C++ side is built
+   `-ffp-contract=fast -march=native` precisely to see it.
 
 11. **THE CALL IS A REQUEST AGAINST A PREPARED CAPACITY, AND A REQUEST THAT CANNOT BE HONOURED IN FULL
    IS REFUSED AS A WHOLE — `[[nodiscard]] bool process(...)`.** `prepare(sampleRate, maxBlock,

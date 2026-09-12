@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -32,6 +33,20 @@ extern "C"
     std::uint32_t fc_probe_os_taps        (void);
     std::uint32_t fc_probe_chunk          (void);
     std::uint32_t fc_probe_sizeof_longdouble (void);
+
+    int           fc_probe_shapes_run          (const float*, std::uint32_t, std::uint32_t, double, std::uint32_t, std::int32_t, std::uint32_t);
+    std::uint32_t fc_probe_waveform_count      (void);
+    std::uint32_t fc_probe_waveform_emitted    (void);
+    std::uint32_t fc_probe_waveform_decimation (void);
+    std::uint32_t fc_probe_waveform_peaks      (double*, std::uint32_t);
+    std::uint32_t fc_probe_waveform_peaks_f32  (float*, std::uint32_t);
+    std::uint32_t fc_probe_stereo_cols         (void);
+    int           fc_probe_stereo_is_mono      (void);
+    double        fc_probe_stereo_max_rms      (void);
+    std::uint32_t fc_probe_stereo_width        (float*, std::uint32_t);
+    std::uint32_t fc_probe_stereo_corr         (float*, std::uint32_t);
+    std::uint32_t fc_probe_stereo_rms          (float*, std::uint32_t);
+    int           fc_probe_needle              (const float*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, double*);
 }
 
 using namespace felitronics;
@@ -185,6 +200,100 @@ int main()
     {
         test::ok (fc_probe_lufs (nullptr, 10, 2, 48000.0) == -120.0, "lufs sentinel");
         test::approx (fc_probe_dbtp (nullptr, 10, 2, 48000.0), 20.0 * std::log10 (1e-9), 1e-12, "dBTP floor");
+    }
+
+    // --- P59a: the waveform peaks and the stereo band. The same two questions as the loudness path: does the C
+    //     entry point produce EXACTLY the class's bits, and does it refuse what a page can hand it. ---
+    test::group ("shapes ABI null: fc_probe_shapes_run equals a direct fcore::ShapeProbe, bit for bit");
+    {
+        const std::uint32_t n = 100003;
+        auto buf = makePlanar (n, 2, sr, false);
+        for (std::uint32_t i = 0; i < n; i += 97) buf[(std::size_t) i + n] = -buf[i];   // some anti-phase
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, 44100.0, 1100, 3, 1100) == 1, "the run was accepted");
+
+        fcore::ShapeProbe direct;
+        const float* view[2] { buf.data(), buf.data() + n };
+        test::ok (direct.prepare (44100.0, 2, n, 1100, analysis::PeakMix::Max, 1100) && direct.process (view, 2, n) && direct.complete(),
+                  "the direct run completed");
+
+        std::vector<double> pk (1100); std::vector<float> pk32 (1100), w (1100), c (1100), l (1100);
+        test::ok (fc_probe_waveform_count() == 1100 && fc_probe_waveform_peaks (pk.data(), 1100) == 1100 && fc_probe_waveform_peaks_f32 (pk32.data(), 1100) == 1100,
+                  "1100 peaks, both forms");
+        test::ok (std::memcmp (pk.data(), direct.peaks().peaks().data(), 1100 * sizeof (double)) == 0, "the double peaks are the class's bits");
+        bool f32same = true;
+        for (int i = 0; i < 1100; ++i) { const float want = direct.peaks().peakAsFloat32 (i); f32same = f32same && std::memcmp (&pk32[(std::size_t) i], &want, 4) == 0; }
+        test::ok (f32same, "the float32 peaks are the class's float32 form");
+        test::ok (fc_probe_waveform_emitted() == (std::uint32_t) direct.peaks().bucketsEmitted()
+               && fc_probe_waveform_decimation() == (std::uint32_t) direct.peaks().decimation(), "emitted count and decimation forwarded");
+
+        test::ok (fc_probe_stereo_cols() == 1100 && fc_probe_stereo_is_mono() == 0, "1100 columns, not mono");
+        test::ok (fc_probe_stereo_width (w.data(), 1100) == 1100 && fc_probe_stereo_corr (c.data(), 1100) == 1100
+               && fc_probe_stereo_rms (l.data(), 1100) == 1100, "three float32 arrays copied");
+        test::ok (std::memcmp (w.data(), direct.stereo().width().data(), 1100 * 4) == 0
+               && std::memcmp (c.data(), direct.stereo().correlation().data(), 1100 * 4) == 0
+               && std::memcmp (l.data(), direct.stereo().rms().data(), 1100 * 4) == 0, "width / corr / loud are the class's bits");
+        const double ml = fc_probe_stereo_max_rms(), dml = direct.stereo().maxRms();
+        test::ok (std::memcmp (&ml, &dml, 8) == 0, "maxLoud is the class's double");
+
+        double out3[3] {};
+        analysis::StereoColumns::Needle nd;
+        test::ok (fc_probe_needle (buf.data(), n, 2, 1000, 50000, out3) == 1
+               && analysis::StereoColumns::needle (buf.data(), buf.data() + n, n, 1000, 50000, nd)
+               && std::memcmp (&out3[0], &nd.correlation, 8) == 0 && std::memcmp (&out3[1], &nd.width, 8) == 0
+               && std::memcmp (&out3[2], &nd.rms, 8) == 0, "the needle through the ABI is the class's three doubles");
+        test::ok (fc_probe_needle (buf.data(), n, 1, 0, n, out3) == 1 && out3[0] == 1.0 && out3[1] == 0.0,
+                  "a mono needle reads channel 0 against itself: corr +1, width 0");
+    }
+
+    test::group ("fcore::ShapeProbe refuses a call it cannot honour before anything moves (law 11)");
+    {
+        // The review round found both: a null table was dereferenced before either class could refuse it, and a call
+        // one frame too long consumed its first 8192-frame chunk before the second chunk was refused — after which
+        // even the correct call failed.
+        const std::uint32_t n = 10000;
+        const auto buf = makePlanar (n, 1, sr, false);
+        const float* view[1] { buf.data() };
+        fcore::ShapeProbe sp;
+        test::ok (sp.prepare (8000.0, 1, n, 1, analysis::PeakMix::Left, 1), "prepared for 10000 frames");
+        test::ok (! sp.process (nullptr, 1, 1), "a null plane table is refused");
+        const float* nullPlane[1] { nullptr };
+        test::ok (! sp.process (nullPlane, 1, 1), "a null plane is refused");
+        test::ok (! sp.process (view, 1, (long long) n + 1), "10001 frames into 10000 is refused");
+        test::ok (sp.peaks().framesSeen() == 0 && sp.stereo().framesSeen() == 0, "... and nothing moved: both counters still 0");
+        test::ok (sp.process (view, 1, (long long) n) && sp.complete(), "the correct call then succeeds");
+    }
+
+    test::group ("the shapes ABI refuses what a page can hand it, and a refusal clears the previous result");
+    {
+        const std::uint32_t n = 4800;
+        auto buf = makePlanar (n, 2, sr, false);
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, 0, 1100) == 1, "a good run first");
+        test::ok (fc_probe_shapes_run (nullptr, n, 2, sr, 1000, 0, 1100) == 0, "null planes");
+        test::ok (fc_probe_waveform_count() == 0 && fc_probe_stereo_cols() == 0 && fc_probe_stereo_max_rms() == 0.0,
+                  "... and the previous result is gone, not served");
+        test::ok (fc_probe_shapes_run (buf.data(), 0, 2, sr, 1000, 0, 1100) == 0, "zero frames");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 0, sr, 1000, 0, 1100) == 0
+               && fc_probe_shapes_run (buf.data(), n, (std::uint32_t) core::kMaxChannels + 1, sr, 1000, 0, 1100) == 0, "a width the core does not have");
+        test::ok (fc_probe_shapes_run (buf.data() + 1, n - 1, 2, sr, 1000, 0, 1100) == 0 || (reinterpret_cast<std::uintptr_t> (buf.data() + 1) & 3u) == 0,
+                  "a misaligned float* (when the offset really is misaligned)");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, -1, 1100) == 0 && fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, 4, 1100) == 0,
+                  "a mix code that names nothing is refused, not clamped");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, sr, 0, 0, 1100) == 0 && fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, 0, 0) == 0
+               && fc_probe_shapes_run (buf.data(), n, 2, sr, 0x80000000u, 0, 1100) == 0, "0 buckets, 0 columns, a count past int");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, std::numeric_limits<double>::quiet_NaN(), 1000, 0, 1100) == 0
+               && fc_probe_shapes_run (buf.data(), n, 2, 0.0, 1000, 0, 1100) == 0, "a rate that is not a rate");
+
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, 0, 1100) == 1, "a good run again");
+        std::vector<double> pk (1000, -7.0);
+        test::ok (fc_probe_waveform_peaks (pk.data(), 10) == 10 && pk[10] == -7.0, "the capacity binds: 10 asked, 10 written, the 11th untouched");
+        test::ok (fc_probe_waveform_peaks (nullptr, 10) == 0 && fc_probe_waveform_peaks (pk.data(), 0) == 0, "null or zero capacity writes nothing");
+        std::vector<double> big (3);
+        auto* odd = reinterpret_cast<double*> (reinterpret_cast<char*> (big.data()) + 1);
+        test::ok (fc_probe_waveform_peaks (odd, 1) == 0, "a misaligned double* output is refused");
+        double out3[3] {};
+        test::ok (fc_probe_needle (buf.data(), n, 2, 10, 9, out3) == 0 && fc_probe_needle (buf.data(), n, 2, 0, n + 1, out3) == 0
+               && fc_probe_needle (buf.data(), n, 2, 0, n, nullptr) == 0, "the needle refuses from > to, a stretch past the planes, a null output");
+        test::ok (fc_probe_waveform_count() == 1000, "a needle call neither reads nor clears the shapes result");
     }
 
     return test::report();

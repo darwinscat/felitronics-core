@@ -4,9 +4,10 @@
 // DSP-ARCHITECTURE.md §2 law 9, enforced instead of merely written down: no `long double` in core code.
 // The type has no fixed meaning — measured 8 bytes / 53 mantissa bits on arm64 macOS, 16 / 64 on x86-64,
 // 16 / 113 on wasm32 — so one source file gives three different answers, and the two 16-byte answers are
-// DIFFERENT FORMATS. The law names one sanctioned exception (`tools/fcore_measure.cpp`'s native-only
-// `correlation` accumulator) and the ABI probe that measures the type on purpose; both live under tools/,
-// which this lint does not scan, so neither needs an allowlist that could rot into a loophole.
+// DIFFERENT FORMATS. The one use left in the tree is the ABI probe that measures the type on purpose
+// (`fc_probe_sizeof_longdouble`); it lives under tools/, which this lint does not scan, so it needs no allowlist
+// that could rot into a loophole. (The law used to sanction a second, `fcore_measure`'s `long double`
+// correlation accumulator; P59a made it binary64 and the exception is gone.)
 //
 // Usage: node tools/lint/check-no-long-double.mjs [--self-test] [paths...]
 //        default paths: modules/*/include and modules/*/src

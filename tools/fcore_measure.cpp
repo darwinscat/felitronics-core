@@ -11,15 +11,28 @@
 //
 //   lufs        → integrated loudness (LUFS)            ↔ ffmpeg ebur128 "I:"
 //   truepeak    → max true peak (dBTP, 4× oversampled)  ↔ ffmpeg ebur128 "Peak:" (True Peak)
-//   correlation → whole-file Pearson L/R correlation    (synthetic-validated; no clean ffmpeg single number)
+//   correlation → whole-file normalised L/R correlation ΣLR/√(ΣLL·ΣRR) — the stereo band's own formula
+//                 (analysis::StereoSums) over the whole file. Not Pearson's: nothing is centred.
 //   blocks      → the CROSS-TOOLCHAIN SURFACE: every pre-gate 400 ms gating-block energy plus the true-peak
 //                 linear maximum, as raw IEEE-754 bit patterns. Diffing two `blocks` outputs IS the parity
 //                 test — see the note at the mode itself for why the gated scalars cannot be that test.
+//   waveform    → the waveform peaks (analysis::WaveformPeaks): every bucket as a double AND as its float32
+//                 form, bit patterns. A box-averaged max-abs, at or below the sample peak — NOT `truepeak`, which
+//                 is fcore::Probe's reference true peak. [--buckets N] [--mix avr|L|R|max]
+//   stereo      → the stereo band (analysis::StereoColumns): per column width / correlation / RMS as float32
+//                 bit patterns, plus the maximum RMS as a double. RMS, not `lufs`. [--columns N]
+//   needle      → correlation / width / RMS over [from, to) as double bit patterns. --from A --to B
 //
-// Usage: fcore_measure <lufs|truepeak|correlation|blocks> <sampleRate> <channels> <raw.f32le> [--precise]
+// Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
 // The scalar modes print %.2f by default (tools/validate_ffmpeg.sh compares against ffmpeg's own two
-// decimals); `--precise` switches them to %.17g plus the exact %a form. `blocks` is always exact.
+// decimals); `--precise` switches them to %.17g plus the exact %a form. `blocks`, `waveform`, `stereo` and
+// `needle` are always exact, and the node side (tools/wasm/shapes-parity.mjs) prints the same bytes.
+//
+// DECODE TO FLOAT, NEVER TO s16. This tool reads f32le: `ffmpeg -i x -f f32le out.f32`. The waveform, stereo and needle
+// modes size the file before reading it (every boundary depends on the length), so they need a seekable file, not a pipe. An integer decode
+// (`-f s16le`, as the old sidecar generator did) clamps a lossy file's samples above 0 dBFS and quantises the
+// rest, and the peaks of that are not the peaks of the file.
 
 #include "fcore_probe.h"
 
@@ -69,10 +82,80 @@ namespace
         return u;
     }
 
+    std::uint32_t bits32 (float x) noexcept
+    {
+        std::uint32_t u;
+        std::memcpy (&u, &x, sizeof u);
+        return u;
+    }
+
     void printScalar (double v, bool precise, const char* unit)
     {
         if (precise) std::printf ("%.17g  %a  %s\n", v, v, unit);
         else         std::printf ("%.2f\n", v);
+    }
+
+    // The shape modes' options, parsed ONCE and strictly: every argument after the file is `--precise` or a known
+    // `--name value` pair, each name at most once. An unknown or misspelt flag (`--bucket 2`) is refused, not ignored,
+    // and a repeated one is refused rather than resolved — the node side of the parity check could not be relied on
+    // to resolve a repeat the same way. (The older modes keep their old, lenient reading; nothing here changes them.)
+    bool shapeOptions (int argc, char** argv, std::string& buckets, std::string& columns, std::string& mix,
+                       std::string& from, std::string& to)
+    {
+        buckets = "1000"; columns = "1200"; mix = "avr"; from = "0"; to = "";
+        bool seen[5] {};
+        for (int i = 5; i < argc; ++i)
+        {
+            if (std::strcmp (argv[i], "--precise") == 0) continue;
+            static constexpr const char* names[5] { "--buckets", "--columns", "--mix", "--from", "--to" };
+            int k = 0;
+            while (k < 5 && std::strcmp (argv[i], names[k]) != 0) ++k;
+            if (k == 5 || seen[k] || i + 1 >= argc) return false;
+            seen[k] = true;
+            std::string& dst = k == 0 ? buckets : k == 1 ? columns : k == 2 ? mix : k == 3 ? from : to;
+            dst = argv[++i];
+        }
+        return true;
+    }
+
+    // A finite, positive rate written as a plain decimal number and nothing else — `atof("8000Hz")` reads 8000.
+    bool parseRate (const char* s, double& out)
+    {
+        char* end = nullptr;
+        const double v = std::strtod (s, &end);
+        if (end == s || *end != '\0' || ! (v > 0.0) || ! std::isfinite (v)) return false;
+        out = v;
+        return true;
+    }
+
+    // A whole non-negative decimal integer, nothing else — `atoi("12x")` would read 12.
+    bool parseCount (const std::string& s, std::uint64_t& out)
+    {
+        if (s.empty() || s.size() > 18) return false;
+        std::uint64_t v = 0;
+        for (char ch : s) { if (ch < '0' || ch > '9') return false; v = v * 10 + (std::uint64_t) (ch - '0'); }
+        out = v;
+        return true;
+    }
+
+    // Frames in the file: its size over one interleaved frame. The size is read through the 64-bit file position
+    // (`long` is 32 bits on Windows, and a stereo file past 2 GiB is not exotic), and a size that is not a whole
+    // number of frames is REFUSED: a trailing partial frame is audio the measurement would silently not see.
+    bool fileFrames (std::FILE* f, int nc, std::uint64_t& out)
+    {
+#if defined(_WIN32)
+        if (_fseeki64 (f, 0, SEEK_END) != 0) return false;
+        const long long size = _ftelli64 (f);
+        if (size < 0 || _fseeki64 (f, 0, SEEK_SET) != 0) return false;
+#else
+        if (fseeko (f, 0, SEEK_END) != 0) return false;
+        const long long size = (long long) ftello (f);
+        if (size < 0 || fseeko (f, 0, SEEK_SET) != 0) return false;
+#endif
+        const std::uint64_t frameBytes = (std::uint64_t) nc * sizeof (float);
+        if ((std::uint64_t) size % frameBytes != 0) return false;
+        out = (std::uint64_t) size / frameBytes;
+        return true;
     }
 }
 
@@ -81,14 +164,16 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks> <sampleRate> <channels> <raw.f32le> [--precise]\n",
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle> <sampleRate> <channels> <raw.f32le>\n"
+            "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n",
             argv[0]);
         return 2;
     }
     const std::string mode = argv[1];
     const double fs = std::atof (argv[2]);
     const int    nc = std::atoi (argv[3]);
-    const bool precise = (argc > 5 && std::strcmp (argv[5], "--precise") == 0) || std::getenv ("FCORE_PRECISE") != nullptr;
+    bool precise = std::getenv ("FCORE_PRECISE") != nullptr;
+    for (int i = 5; i < argc; ++i) if (std::strcmp (argv[i], "--precise") == 0) precise = true;
 
     if (nc < 1 || nc > core::kMaxChannels || ! (fs > 0.0) || ! std::isfinite (fs))
     {
@@ -101,24 +186,123 @@ int main (int argc, char** argv)
 
     if (mode == "correlation")
     {
-        // NB: accumulates in `long double`, which is 8 bytes on arm64 macOS, 16 (IEEE quad) on wasm32 and
-        // 80-bit x87 on x86-64 Linux — three tiers, three answers. Fine for this native-only sanity number;
-        // it is NOT a cross-tier comparison surface, and a facade must not inherit the type.
-        long double sumLR = 0.0L, sumLL = 0.0L, sumRR = 0.0L;
+        // The stereo band's formula over the whole file, streamed — the same StereoSums a column and the needle
+        // accumulate, in binary64. (This mode used to accumulate in `long double`, a third definition of the
+        // number and law 9's one sanctioned exception; neither is left.)
+        analysis::StereoSums sums;
         streamPlanar (f, nc, [&] (const float* const* p, int n)
         {
-            for (int i = 0; i < n; ++i)
-            {
-                const long double l = p[0][i];
-                const long double r = nc > 1 ? p[1][i] : l;
-                sumLR += l * r; sumLL += l * l; sumRR += r * r;
-            }
+            const float* L = p[0];
+            const float* R = nc > 1 ? p[1] : p[0];
+            for (int i = 0; i < n; ++i) sums.add (L[i], R[i]);
         });
         std::fclose (f);
-        const long double d = std::sqrt (sumLL * sumRR);
-        const double corr = d > 1e-12L ? (double) std::clamp (sumLR / d, -1.0L, 1.0L) : 1.0;
+        const double corr = sums.correlation();
         if (precise) std::printf ("%.17g  %a\n", corr, corr);
         else         std::printf ("%.3f\n", corr);
+        return 0;
+    }
+
+    if (mode == "waveform" || mode == "stereo" || mode == "needle")
+    {
+        // Strict where the older modes are lenient: the rate and the width are checked as whole numbers here, since
+        // `atoi("4294967297")` narrows to 1 channel and `atof("8000Hz")` reads 8000, and both would measure silently.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width) || width < 1 || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        std::string sBuckets, sMix, sColumns, sFrom, sTo;
+        std::uint64_t buckets = 0, columns = 0, from = 0, to = 0;
+        if (! shapeOptions (argc, argv, sBuckets, sColumns, sMix, sFrom, sTo)
+         || ! parseCount (sBuckets, buckets) || ! parseCount (sColumns, columns) || ! parseCount (sFrom, from)
+         || (! sTo.empty() && ! parseCount (sTo, to)))
+        {
+            std::fprintf (stderr, "bad, unknown or repeated option\n");
+            std::fclose (f);
+            return 2;
+        }
+        const analysis::PeakMix mix = sMix == "avr" ? analysis::PeakMix::Average
+                                    : sMix == "L"   ? analysis::PeakMix::Left
+                                    : sMix == "R"   ? analysis::PeakMix::Right
+                                    : sMix == "max" ? analysis::PeakMix::Max
+                                    : (analysis::PeakMix) -1;
+        if (sTo.empty()) to = frames;
+
+        if (mode == "needle")
+        {
+            // The needle is over a stretch of planes already in memory; read the file whole.
+            std::vector<float> inter ((std::size_t) (frames * (std::uint64_t) nc));
+            const bool ok = std::fread (inter.data(), sizeof (float), inter.size(), f) == inter.size();
+            std::fclose (f);
+            std::vector<float> L ((std::size_t) frames), R ((std::size_t) frames);
+            for (std::uint64_t i = 0; i < frames; ++i)
+            {
+                L[(std::size_t) i] = inter[(std::size_t) (i * (std::uint64_t) nc)];
+                R[(std::size_t) i] = inter[(std::size_t) (i * (std::uint64_t) nc + (nc > 1 ? 1 : 0))];
+            }
+            analysis::StereoColumns::Needle nd;
+            if (! ok || ! analysis::StereoColumns::needle (L.data(), R.data(), frames, from, to, nd))
+            {
+                std::fprintf (stderr, "needle refused: a stretch [from, to) inside the file is required\n");
+                return 2;
+            }
+            std::printf ("# fcore needle v1 ch=%d frames=%llu from=%llu to=%llu\n", nc,
+                         (unsigned long long) frames, (unsigned long long) from, (unsigned long long) to);
+            std::printf ("corr %016llx\n",  (unsigned long long) bits (nd.correlation));
+            std::printf ("width %016llx\n", (unsigned long long) bits (nd.width));
+            std::printf ("rms %016llx\n",   (unsigned long long) bits (nd.rms));
+            return 0;
+        }
+
+        fcore::ShapeProbe shapes;
+        if (buckets > 0x7FFFFFFFu || columns > 0x7FFFFFFFu
+         || ! shapes.prepare (fs, nc, frames, (int) buckets, mix, (int) columns))
+        {
+            std::fprintf (stderr, "shapes.prepare refused (buckets/columns 1..%d, mix avr|L|R|max)\n",
+                          analysis::WaveformPeaks::kMaxBuckets);
+            std::fclose (f);
+            return 2;
+        }
+        bool ok = true;
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { ok = ok && shapes.process (p, nc, n); });
+        std::fclose (f);
+        if (! ok || ! shapes.complete())
+        {
+            std::fprintf (stderr, "the file did not deliver the frames it was sized for\n");
+            return 2;
+        }
+
+        if (mode == "waveform")
+        {
+            const auto& w = shapes.peaks();
+            std::printf ("# fcore waveform v1 sr=%016llx ch=%d frames=%llu buckets=%d mix=%s decim=%d emitted=%d\n",
+                         (unsigned long long) bits (fs), nc, (unsigned long long) frames, w.buckets(), sMix.c_str(),
+                         w.decimation(), w.bucketsEmitted());
+            for (int i = 0; i < w.buckets(); ++i)
+                std::printf ("%016llx %08lx\n", (unsigned long long) bits (w.peaks()[(std::size_t) i]),
+                             (unsigned long) bits32 (w.peakAsFloat32 (i)));
+        }
+        else
+        {
+            const auto& s = shapes.stereo();
+            std::printf ("# fcore stereo v1 ch=%d frames=%llu cols=%d mono=%d\n", nc, (unsigned long long) frames,
+                         s.columns(), s.isMono() ? 1 : 0);
+            std::printf ("maxrms %016llx\n", (unsigned long long) bits (s.maxRms()));
+            for (int i = 0; i < s.columns(); ++i)
+                std::printf ("%08lx %08lx %08lx\n", (unsigned long) bits32 (s.width()[(std::size_t) i]),
+                             (unsigned long) bits32 (s.correlation()[(std::size_t) i]),
+                             (unsigned long) bits32 (s.rms()[(std::size_t) i]));
+        }
         return 0;
     }
 

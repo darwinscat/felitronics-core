@@ -62,8 +62,8 @@ namespace
 #endif
     }
 
-    // Ptr/size validation the core cannot do for us: everything below arrives from JS.
-    bool viable (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate)
+    // The planar input span: non-null, non-empty, a width the core has, 4-byte aligned, and inside the heap.
+    bool planarSpan (const float* planar, std::uint32_t frames, std::uint32_t channels)
     {
         if (planar == nullptr || frames == 0) return false;
         if (channels < 1 || channels > (std::uint32_t) felitronics::core::kMaxChannels) return false;
@@ -74,9 +74,23 @@ namespace
         // wrapped one would hand us a window onto someone else's heap.
         const std::uint64_t bytes = (std::uint64_t) frames * (std::uint64_t) channels * sizeof (float);
         if (bytes > (std::uint64_t) 0xFFFFFFFFu) return false;
-        if (! inHeap (planar, bytes)) return false;
+        return inHeap (planar, bytes);
+    }
+
+    // Ptr/size validation the core cannot do for us: everything below arrives from JS.
+    bool viable (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate)
+    {
+        if (! planarSpan (planar, frames, channels)) return false;
         // rejects 0 / negative / NaN / +inf and the absurd-but-finite rates (see Probe::kMinSampleRate)
         return probe().prepare (sampleRate, (int) channels);
+    }
+
+    // An output span of `count` elements of `align` bytes each: non-null, aligned, inside the heap.
+    bool outSpan (const void* out, std::uint32_t count, std::uint32_t align)
+    {
+        if (out == nullptr) return false;
+        if ((reinterpret_cast<std::uintptr_t> (out) & (align - 1u)) != 0) return false;
+        return inHeap (out, (std::uint64_t) count * align);
     }
 
     // Whether the getters have a result to report. Without this the contract would be an accident of where
@@ -153,6 +167,128 @@ FC_EXPORT std::uint32_t fc_probe_block_energies (double* out, std::uint32_t cap)
     if (! inHeap (out, (std::uint64_t) m * sizeof (double))) return 0;   // the output span must fit too
     if (m > 0) std::memcpy (out, probe().gatingBlockEnergies().data(), (std::size_t) m * sizeof (double));
     return m;
+}
+
+// --- the waveform peaks and the stereo band (P59a) ---
+//
+// NAMES THAT CANNOT BE READ AS ANOTHER NUMBER OF THIS ABI. `fc_probe_waveform_*` and not `fc_probe_peaks`: this file
+// already reports two peaks, `fc_probe_sample_peak` and `fc_probe_tp_linear` (the REFERENCE true peak of
+// fcore::Probe — not analysis::TruePeakMeter, which the mastering chain runs and which reads 0.045 dB apart at
+// 44.1 kHz), and a waveform bucket is neither: a box-averaged max-abs, at or below the sample peak. And
+// `fc_probe_stereo_rms` and not `_loud`, the spec's name: it is an RMS, and it sits in the same ABI as
+// `fc_probe_lufs`.
+//
+// ONE DEFINITION, TWO ROADS. The page draws these with its own JavaScript while the sidecars come from a server-side
+// generator with a different definition; this is the road both are meant to take instead — fcore::ShapeProbe, the class
+// `fcore_measure waveform|stereo|needle` runs natively. (Moving the site onto it is the site's work.) What is computed and why each output has the type it has:
+// modules/analysis/include/felitronics/analysis/WaveformPeaks.h and StereoColumns.h.
+//
+// A SEPARATE RUN, NOT fc_probe_run WITH OPTIONS. The shapes need the file's length and three parameters before
+// the first sample, and fc_probe_run's promise is a complete loudness measurement per call with no state carried
+// between calls; a setter feeding it would be exactly that state. The loudness result is not touched by a shapes
+// run, and a shapes result is not touched by a loudness run. Same rule as haveResult: a REJECTED shapes run
+// clears the previous shapes result, so the getters below read zero rather than the last good file.
+namespace
+{
+    fcore::ShapeProbe& shapes()
+    {
+        static fcore::ShapeProbe s;
+        return s;
+    }
+    bool haveShapes = false;
+
+    template <typename T, typename Src>
+    std::uint32_t copyOut (T* out, std::uint32_t cap, std::uint32_t n, Src&& at)
+    {
+        const std::uint32_t m = n < cap ? n : cap;
+        if (m == 0 || ! outSpan (out, m, (std::uint32_t) sizeof (T))) return 0;
+        for (std::uint32_t i = 0; i < m; ++i) out[i] = at (i);
+        return m;
+    }
+}
+
+// `mix` is the PeakMix code: 0 'avr' · 1 'L' · 2 'R' · 3 'max'. Any other code is refused, not clamped. Returns 1
+// when the whole file was reduced, 0 when the arguments were refused.
+FC_EXPORT int fc_probe_shapes_run (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate,
+                                   std::uint32_t buckets, std::int32_t mix, std::uint32_t columns)
+{
+    haveShapes = false;
+    if (! planarSpan (planar, frames, channels)) return 0;
+    if (mix < 0 || mix > 3) return 0;
+    if (buckets > 0x7FFFFFFFu || columns > 0x7FFFFFFFu) return 0;   // the core's own bounds are far below; this is
+                                                                     // only the narrowing to its `int`
+    auto& s = shapes();
+    if (! s.prepare (sampleRate, (int) channels, frames, (int) buckets,
+                     (felitronics::analysis::PeakMix) mix, (int) columns)) return 0;
+    const float* view[felitronics::core::kMaxChannels] {};
+    for (std::uint32_t c = 0; c < channels; ++c) view[c] = planar + (std::size_t) c * (std::size_t) frames;
+    if (! s.process (view, (int) channels, (long long) frames) || ! s.complete()) return 0;
+    haveShapes = true;
+    return 1;
+}
+
+FC_EXPORT std::uint32_t fc_probe_waveform_count      (void) { return haveShapes ? (std::uint32_t) shapes().peaks().buckets() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_waveform_emitted    (void) { return haveShapes ? (std::uint32_t) shapes().peaks().bucketsEmitted() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_waveform_decimation (void) { return haveShapes ? (std::uint32_t) shapes().peaks().decimation() : 0u; }
+
+// Copies min(count, cap) peaks and returns how many were written — 0 for a null, misaligned or out-of-heap
+// buffer. `fc_probe_waveform_peaks` is `computePeaksFromBuffer`'s double form, read through HEAPF64;
+// `fc_probe_waveform_peaks_f32` is `peaksFromWav`'s Float32Array form, read through HEAPF32.
+FC_EXPORT std::uint32_t fc_probe_waveform_peaks (double* out, std::uint32_t cap)
+{
+    if (! haveShapes) return 0;
+    const auto p = shapes().peaks().peaks();
+    return copyOut (out, cap, (std::uint32_t) p.size(), [&] (std::uint32_t i) { return p[i]; });
+}
+
+FC_EXPORT std::uint32_t fc_probe_waveform_peaks_f32 (float* out, std::uint32_t cap)
+{
+    if (! haveShapes) return 0;
+    const auto& w = shapes().peaks();
+    return copyOut (out, cap, (std::uint32_t) w.buckets(), [&] (std::uint32_t i) { return w.peakAsFloat32 ((int) i); });
+}
+
+FC_EXPORT std::uint32_t fc_probe_stereo_cols     (void) { return haveShapes ? (std::uint32_t) shapes().stereo().columns() : 0u; }
+FC_EXPORT int           fc_probe_stereo_is_mono  (void) { return haveShapes && shapes().stereo().isMono() ? 1 : 0; }
+FC_EXPORT double        fc_probe_stereo_max_rms (void) { return haveShapes ? shapes().stereo().maxRms() : 0.0; }
+
+FC_EXPORT std::uint32_t fc_probe_stereo_width (float* out, std::uint32_t cap)
+{
+    if (! haveShapes) return 0;
+    const auto v = shapes().stereo().width();
+    return copyOut (out, cap, (std::uint32_t) v.size(), [&] (std::uint32_t i) { return v[i]; });
+}
+
+FC_EXPORT std::uint32_t fc_probe_stereo_corr (float* out, std::uint32_t cap)
+{
+    if (! haveShapes) return 0;
+    const auto v = shapes().stereo().correlation();
+    return copyOut (out, cap, (std::uint32_t) v.size(), [&] (std::uint32_t i) { return v[i]; });
+}
+
+FC_EXPORT std::uint32_t fc_probe_stereo_rms (float* out, std::uint32_t cap)
+{
+    if (! haveShapes) return 0;
+    const auto v = shapes().stereo().rms();
+    return copyOut (out, cap, (std::uint32_t) v.size(), [&] (std::uint32_t i) { return v[i]; });
+}
+
+// The playhead needle over [from, to) of a planar buffer — `correlationOf` and `widthOf`, plus the stretch's
+// RMS — written as three doubles into out3[0..2]. Stateless: it neither reads nor clears a shapes result.
+// Channel 0 is L; channel 1 is R, or channel 0 again for a mono buffer. Returns 1, or 0 with nothing written.
+FC_EXPORT int fc_probe_needle (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                               std::uint32_t from, std::uint32_t to, double* out3)
+{
+    if (! planarSpan (planar, frames, channels)) return 0;
+    if (! outSpan (out3, 3u, 8u)) return 0;
+    const float* L = planar;
+    const float* R = channels > 1 ? planar + (std::size_t) frames : planar;
+    felitronics::analysis::StereoColumns::Needle nd;
+    if (! felitronics::analysis::StereoColumns::needle (L, R, frames, from, to, nd)) return 0;
+    out3[0] = nd.correlation;
+    out3[1] = nd.width;
+    out3[2] = nd.rms;
+    return 1;
 }
 
 // Build identity, so a mismatched artifact is obvious in a report rather than a mystery.
