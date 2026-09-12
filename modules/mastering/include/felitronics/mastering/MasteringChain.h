@@ -345,13 +345,11 @@ public:
                 && clip.osBuf <= other.clip.osBuf && clip.wetBuf <= other.clip.wetBuf
                 && clip.ptrs <= other.clip.ptrs && clip.dc <= other.clip.dc
                 && clip.dryLines <= other.clip.dryLines && clip.dryDelaySamples <= other.clip.dryDelaySamples
-                && clip.os.proto <= other.clip.os.proto && clip.os.upHist <= other.clip.os.upHist
-                && clip.os.downHist <= other.clip.os.downHist && clip.os.upPos <= other.clip.os.upPos
+                && clip.os.fitsWithin (other.clip.os)
                 && lim.channels <= other.lim.channels && lim.osBufSamples <= other.lim.osBufSamples
                 && lim.osDelaySamples <= other.lim.osDelaySamples
                 && lim.slide.entries <= other.lim.slide.entries
-                && lim.os.proto <= other.lim.os.proto && lim.os.upHist <= other.lim.os.upHist
-                && lim.os.downHist <= other.lim.os.downHist && lim.os.upPos <= other.lim.os.upPos
+                && lim.os.fitsWithin (other.lim.os)
                 && alignClip.ring <= other.alignClip.ring && alignClip.scratch <= other.alignClip.scratch
                 && alignLim.ring <= other.alignLim.ring && alignLim.scratch <= other.alignLim.scratch;
         }

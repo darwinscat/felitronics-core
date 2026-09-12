@@ -1364,9 +1364,10 @@ int main()
 
         // THE ORACLE, literal on purpose (the one place a restatement is mandatory). 48 kHz stereo, 4 s: the loudness
         // meter is sized for 192000 + 48000 samples = 50 hops of 4800 → 8·(300 + 54 + 13) = 2936 B; the true-peak
-        // meter 4·48 + 4·2·12 + 4·2 = 296 B; the drain 2·64·4 = 512 B.
+        // meter 4·48 + 4·(2 ch · 2 · 12) + 4·2 = 392 B (the history ring became DOUBLE-LENGTH with P56, so
+        // core::firDot reads a contiguous window — P56; it was 296 B); the drain 2·64·4 = 512 B.
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
-        ok (solve.callBytes == 2936u + 296u + 512u, "the solve budget is meter + true-peak meter + drain = 3744 B");
+        ok (solve.callBytes == 2936u + 392u + 512u, "the solve budget is meter + true-peak meter + drain = 3840 B");
 
         long long before = g_bytes.load();
         const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
@@ -1402,10 +1403,10 @@ int main()
         ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 143999, &under3) == FC_OK && under3.callBytes == 0,
             "one frame under 3 s: nothing is");
         // A solve builds its meters whatever the length — the range rule is NOT the solve's. 1 s still costs
-        // meter + true-peak meter + drain: 8·(300 + 24 + 10) + 296 + 512 = 3480 B. A length the solve refuses costs 0.
+        // meter + true-peak meter + drain: 8·(300 + 24 + 10) + 392 + 512 = 3576 B. A length the solve refuses costs 0.
         fc_need s1 {}, s0 {}; FC_INIT (s1); FC_INIT (s0);
-        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 3480u,
-            "a 1 s solve is budgeted in full: 3480 B");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 3576u,
+            "a 1 s solve is budgeted in full: 3576 B");
         ok (fc_master_need (h, FC_NEED_SOLVE, 0, &s0) == FC_OK && s0.callBytes == 0,
             "a 0-frame solve, which the core refuses before any pass, costs 0");
 

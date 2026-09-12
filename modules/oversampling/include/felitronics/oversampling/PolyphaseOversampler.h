@@ -5,6 +5,7 @@
 
 #include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
+#include <felitronics/core/PolyphaseFir.h>
 
 #include <algorithm>
 #include <cmath>
@@ -31,7 +32,10 @@ namespace detail
 // windowed-sinc (Kaiser) FIR. Linear phase → a constant group delay (reported). For inter-sample-peak
 // detection (the true-peak limiter) and, with up+down around a process, alias-free nonlinear processing.
 // RT-safe: prepare() allocates the FIR + per-channel histories; up/downsample() do no alloc/lock/throw.
-// Scalar reference (correctness-first); a SIMD backend can replace it later behind the same API.
+// Both inner loops are `core::firDot` — ONE kernel with a nailed-down summation order, scalar / SSE2 /
+// NEON / wasm-SIMD128, the same bits on every row (P56). The coefficients are laid out for it in
+// prepare(): contiguous for downsample, phase-major for upsample, both padded with +0.0f to a multiple
+// of four; the histories became double-length backwards rings so the window is contiguous.
 //
 // WHY THE DEFAULT IS 64, AND WHAT SETS IT. The cutoff is FIXED at 0.90 x baseband Nyquist
 // (designFilter() below), so the transition band has to fit between 0.45 fs and the fold at 0.50 fs,
@@ -65,7 +69,11 @@ namespace detail
 // filter can reach: that is the FACTOR's axis, and there the total is 0.5 dB worse, because a flatter
 // pass band also delivers what had already folded. The component the taps own at every drive is the
 // transition-band leakage — the 3rd harmonic of a 0.17 fs tone sits at 0.51 fs and folds to 0.49 fs,
-// where 32 taps left it at -45.5 dBc and 64 puts it at -139.4, i.e. into the float noise.
+// where 32 taps left it at -45.5 dBc and 64 puts it at -148.0, i.e. into the float noise.
+// (That last number read -139.4 until P56 replaced the inner loop with `core::firDot`: four partial
+// accumulators take a quarter of the sequential sum's rounding steps each, so the arithmetic noise
+// floor this measurement was reading dropped ~8.6 dB. The FILTER did not change — the measurement was
+// measuring the summation, which is what a residual 90 dB under the design's own stopband does.)
 // Pass-band flatness is a COROLLARY of the same width, not a second requirement: two oversampled
 // stages in series (the real assembly — a clipper in front of a limiter) then droop under 0.04 dB to
 // 0.41 fs, against -3.25 dB at 32. The pass-band edge follows 0.45 fs - c/tpp with c = 2.385 (0.1 dB),
@@ -101,14 +109,29 @@ public:
     // answers true and sizes itself for `core::kMaxChannels`. That is a law-11(b) violation older than
     // this budget (a width it clamped is a width it lied about) and it is **P55**, not this function's to
     // fix: a budget that refused where the call succeeds would be wrong about the call in front of it.
+    // ⚠ THE COUNTS MOVED WITH P56, and the reason is `core::firDot`, not a bigger filter:
+    // the histories are DOUBLE-LENGTH rings (every sample stored twice, so the window is contiguous)
+    // and the coefficients exist twice, once contiguous for `downsample` and once phase-major for
+    // `upsample`. Both lengths are rounded up to a multiple of four, which is what lets the kernel run
+    // without a tail. Nothing here is a heuristic: it is exactly what prepare() below assigns.
     struct Storage
     {
-        std::size_t proto = 0, upHist = 0, downHist = 0;   // floats
-        std::size_t upPos = 0, downPos = 0;                // ints
+        std::size_t proto = 0, protoPhase = 0, upHist = 0, downHist = 0;   // floats
+        std::size_t upPos = 0, downPos = 0;                                // ints
         std::uint64_t bytes() const noexcept
         {
-            return (std::uint64_t) sizeof (float) * ((std::uint64_t) proto + upHist + downHist)
+            return (std::uint64_t) sizeof (float) * ((std::uint64_t) proto + protoPhase + upHist + downHist)
                  + (std::uint64_t) sizeof (int)   * ((std::uint64_t) upPos + downPos);
+        }
+        // Does an oversampler already holding `other` have room for this without asking the heap again?
+        // It lives HERE rather than being spelled out field by field at each caller, because a caller's
+        // copy of the list is a copy that can go stale: the one in `MasteringChain::Storage::fitsWithin`
+        // silently omitted `downPos`, and would have omitted `protoPhase` the moment P56 added it.
+        bool fitsWithin (const Storage& other) const noexcept
+        {
+            return proto <= other.proto && protoPhase <= other.protoPhase
+                && upHist <= other.upHist && downHist <= other.downHist
+                && upPos <= other.upPos && downPos <= other.downPos;
         }
     };
 
@@ -116,13 +139,15 @@ public:
     {
         if (factor < 2 || factor > kMaxFactor) return false;
         if (tapsPerPhase < 4 || tapsPerPhase > kMaxTapsPerPhase) return false;
-        const std::size_t ch = (std::size_t) channelsFor (maxChannels);
-        const std::size_t n  = (std::size_t) factor * (std::size_t) tapsPerPhase;
-        out.proto    = n;
-        out.upHist   = ch * (std::size_t) tapsPerPhase;
-        out.downHist = ch * n;
-        out.upPos    = ch;
-        out.downPos  = ch;
+        const std::size_t ch   = (std::size_t) channelsFor (maxChannels);
+        const std::size_t tp   = (std::size_t) core::firPadLen (tapsPerPhase);
+        const std::size_t np   = (std::size_t) core::firPadLen (factor * tapsPerPhase);
+        out.proto      = np;
+        out.protoPhase = (std::size_t) factor * tp;
+        out.upHist     = ch * 2u * tp;
+        out.downHist   = ch * 2u * np;
+        out.upPos      = ch;
+        out.downPos    = ch;
         return true;
     }
 
@@ -140,6 +165,7 @@ public:
         Storage st;
         if (! storageFor (factor, maxChannels, tapsPerPhase, st)) return false;
         L = factor; tpp = tapsPerPhase; N = L * tpp;
+        tppPad = core::firPadLen (tpp); nPad = core::firPadLen (N);
         channels_ = channelsFor (maxChannels);
         designFilter();
         upHist.assign   (st.upHist,   0.0f);
@@ -165,8 +191,8 @@ public:
     void resetChannel (int c) noexcept
     {
         if (c < 0 || c >= channels_) return;
-        std::fill_n (upHist.begin()   + (std::ptrdiff_t) c * (std::ptrdiff_t) tpp, tpp, 0.0f);
-        std::fill_n (downHist.begin() + (std::ptrdiff_t) c * (std::ptrdiff_t) N,   N,   0.0f);
+        std::fill_n (upHist.begin()   + (std::ptrdiff_t) c * (std::ptrdiff_t) (2 * tppPad), 2 * tppPad, 0.0f);
+        std::fill_n (downHist.begin() + (std::ptrdiff_t) c * (std::ptrdiff_t) (2 * nPad),   2 * nPad,   0.0f);
         upPos[(std::size_t) c]   = 0;
         downPos[(std::size_t) c] = 0;
     }
@@ -180,25 +206,28 @@ public:
     int latencySamples() const noexcept { return tpp > 0 ? tpp - 1 : 0; }
 
     // n baseband samples per channel → n*L oversampled samples. out[ch] holds n*L.
+    //
+    // The ring runs BACKWARDS: `pos` is where the NEWEST sample lives, so reading forward from it
+    // already gives the oldest-coefficient-first order the FIR wants, and every sample is stored a
+    // second time `tppPad` slots up so the window [pos, pos+tppPad) never wraps. That is what leaves
+    // the inner loop free of a wrap test — and free of everything else: see core::firDot.
     void upsample (const float* const* in, int channels, int n, float* const* out) noexcept
     {
         const int nc = channels < channels_ ? channels : channels_;
         for (int c = 0; c < nc; ++c)
         {
             int   pos  = upPos[(std::size_t) c];
-            float* h   = &upHist[(std::size_t) c * (std::size_t) tpp];
+            float* h   = &upHist[(std::size_t) c * (std::size_t) (2 * tppPad)];
             for (int m = 0; m < n; ++m)
             {
+                if (pos == 0) pos = tppPad;
+                --pos;                                            // pos = newest x[m]
                 h[pos] = in[c][m];
-                if (++pos >= tpp) pos = 0;                       // pos-1 = newest x[m]
+                h[pos + tppPad] = in[c][m];
                 for (int p = 0; p < L; ++p)
                 {
-                    float acc = 0.0f;
-                    for (int k = 0; k < tpp; ++k)
-                    {
-                        int hi = pos - 1 - k; if (hi < 0) hi += tpp;
-                        acc += proto[(std::size_t) (k * L + p)] * h[hi];
-                    }
+                    const float acc = core::firDot (&protoPhase[(std::size_t) p * (std::size_t) tppPad],
+                                                    &h[pos], tppPad);
                     out[c][m * L + p] = (float) L * acc;          // *L restores the zero-stuff gain
                 }
             }
@@ -207,19 +236,25 @@ public:
     }
 
     // n*L oversampled samples per channel → n baseband samples (lowpass + decimate). out[ch] holds n.
+    // Same backwards double-length ring as upsample; the coefficients need no repacking here, they
+    // were already contiguous — only the zero padding to a multiple of four is new.
     void downsample (const float* const* in, int channels, int n, float* const* out) noexcept
     {
         const int nc = channels < channels_ ? channels : channels_;
         for (int c = 0; c < nc; ++c)
         {
             int   pos = downPos[(std::size_t) c];
-            float* h  = &downHist[(std::size_t) c * (std::size_t) N];
+            float* h  = &downHist[(std::size_t) c * (std::size_t) (2 * nPad)];
             for (int m = 0; m < n; ++m)
             {
-                for (int p = 0; p < L; ++p) { h[pos] = in[c][m * L + p]; if (++pos >= N) pos = 0; }
-                float acc = 0.0f;
-                for (int j = 0; j < N; ++j) { int hi = pos - 1 - j; if (hi < 0) hi += N; acc += proto[(std::size_t) j] * h[hi]; }
-                out[c][m] = acc;                                  // proto sums to 1 → unity passband
+                for (int p = 0; p < L; ++p)
+                {
+                    if (pos == 0) pos = nPad;
+                    --pos;
+                    h[pos] = in[c][m * L + p];
+                    h[pos + nPad] = in[c][m * L + p];
+                }
+                out[c][m] = core::firDot (proto.data(), &h[pos], nPad);   // proto sums to 1 → unity passband
             }
             downPos[(std::size_t) c] = pos;
         }
@@ -228,7 +263,7 @@ public:
 private:
     void designFilter()
     {
-        proto.assign ((std::size_t) N, 0.0f);       // == Storage::proto, which is L*tpp by the same arithmetic
+        proto.assign ((std::size_t) nPad, 0.0f);    // == Storage::proto: N taps then the +0.0f padding
         const double fc   = 0.5 / (double) L * 0.90;              // cutoff (cycles/OS-sample), guard below baseband Nyquist
         const double cen  = (double) (N - 1) * 0.5;
         const double beta = 9.0;                                  // Kaiser ~ -90 dB stopband
@@ -246,13 +281,24 @@ private:
             sum += v;
         }
         const float inv = (float) (1.0 / sum);                   // normalize Σ → 1 (unity DC)
-        for (auto& v : proto) v *= inv;
+        for (auto& v : proto) v *= inv;                          // the padding is 0 and stays 0
+
+        // The phase-major copy upsample() reads: protoPhase[p][k] == proto[k*L + p], contiguous in k
+        // and zero-padded to tppPad. The strided gather that used to sit inside the inner loop — once
+        // per output sample, per phase, per tap — now happens exactly once, here, at prepare() time.
+        protoPhase.assign ((std::size_t) L * (std::size_t) tppPad, 0.0f);
+        for (int p = 0; p < L; ++p)
+            for (int k = 0; k < tpp; ++k)
+                protoPhase[(std::size_t) p * (std::size_t) tppPad + (std::size_t) k]
+                    = proto[(std::size_t) (k * L + p)];
     }
 
     int L = 0, tpp = 0, N = 0, channels_ = 0;
-    std::vector<float> proto;                  // N taps, Σ = 1
-    std::vector<float> upHist, downHist;       // per-channel ring histories
-    std::vector<int>   upPos, downPos;
+    int tppPad = 0, nPad = 0;                  // tpp and N rounded up to a multiple of 4 (core::firDot)
+    std::vector<float> proto;                  // N taps, Σ = 1, then +0.0f padding to nPad
+    std::vector<float> protoPhase;             // the same taps phase-major: L blocks of tppPad
+    std::vector<float> upHist, downHist;       // per-channel DOUBLE-LENGTH rings, newest-first
+    std::vector<int>   upPos, downPos;         // index of the NEWEST sample in its ring
 };
 
 } // namespace felitronics::oversampling

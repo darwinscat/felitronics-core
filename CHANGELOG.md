@@ -7,6 +7,45 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+### `core` · `oversampling` · `analysis` — one polyphase FIR kernel for the whole tree, and five rows that agree on its bits
+
+The same inner loop was written three times — `PolyphaseOversampler::upsample`, the same class's `downsample`,
+and `TruePeakMeter::process` — and between them they were **~83 % of a mastering render** (measured on a
+600 s programme: `downsample` 50 %, `upsample` 33 %). They are now one function, **`core::firDot`**, with
+four hand-written kernels (scalar / SSE2 / NEON / wasm-SIMD128) that compute the identical summation:
+four partial accumulators, `(s0+s1) + (s2+s3)`, every multiply and add rounded separately.
+
+- **The work was the REPACKING, not the kernel.** The three loops were not the same loop: two gathered
+  coefficients with a stride of `L`, one read them contiguously, and all three walked a modulo ring backwards
+  with a wrap test inside the inner loop. `prepare()` now stores the coefficients **phase-major** where the
+  gather used to be, keeps the sample history in a **double-length backwards ring** (every sample written
+  twice, so the window is always contiguous and already in the coefficients' order), and pads the run to a
+  multiple of four with `+0.0f` so there is no tail. What is left is a dot product of two contiguous spans.
+- **Speed, on the same programme.** A 60 s stereo render: **1.51 s → 0.48 s (3.15×)** on arm64 macOS
+  (NEON), **2.75 s → 1.09 s (2.52×)** on x86-64 Linux/gcc 14.2 (SSE2).
+- **Bit-identity across five rows, for the first time and now gated.** The kernel returns one constant on
+  `win` (MSVC 19.44), `deb` (gcc 14.2), `mac` (Apple clang 14.0.3), `docker --platform linux/arm64`
+  (gcc 14.4) and `wasm` (emsdk 6.0.9 in node, scalar kernel and `-msimd128` alike) — and so, measured, do
+  `PolyphaseOversampler` and `TruePeakMeter` end to end, libm-designed Kaiser coefficients included.
+  `felitronics_core_polyphasefir_tests` pins that constant, so a row that loses the property goes red.
+- **It overrides law 10 locally, and that is the point** (`docs/DSP-ARCHITECTURE.md`): `acc += a*b` is the
+  contractible form, arm64 fuses it, baseline x86-64 cannot. Before this change the two rows agreed only by
+  accident — `std::vector::operator[]` happened to block gcc's contraction under the tree's stated
+  `-ffp-contract=on`; under gcc's OWN default (`fast`, what any consumer TU of these INTERFACE targets gets)
+  arm64 and x86-64 **did** diverge, measured on all three hashes. They no longer do.
+- **The three pragmas were measured, not looked up.** gcc ignores `#pragma STDC FP_CONTRACT` in C++ and
+  needs `#pragma GCC optimize("fp-contract=off")` (which costs 1.4 % by blocking inlining); clang needs
+  `#pragma clang fp contract(off)` and must NOT be given `#pragma float_control(precise, on)`, which turns
+  contraction back **on**; MSVC takes `#pragma fp_contract(off)`. A clang build with `-ffast-math` defeats
+  all of them and nothing in a header can stop that — hence the gate.
+- **What the claim does not cover, named rather than hidden:** FTZ/DAZ (wasm cannot flush at all, and a
+  normal × normal product can land subnormal, so a flushing host splits native from wasm on NORMAL inputs),
+  the rounding mode, and NaN sign/payload — all runtime state, none reachable by writing the loop differently.
+- ⚠ **`PolyphaseOversampler`'s and `TruePeakMeter`'s output moves bit-for-bit.** The summation order changed;
+  that is the content of the change, not a regression. Downstream: `limiter::TruePeakLimiter` and
+  `poweramp::PowerAmpStage`, hence OrbitCab and orbit-amp. Three storage budgets moved with it (law 11d):
+  `TruePeakMeter::storageFor` 296 → 392 B at 48 kHz stereo, and the solve budgets that carry it.
+
 ### `core` · `eq` · `dynamics` · `saturation` · `limiter` · `oversampling` · `mastering` · `tools` — the chain says what building it costs, and re-preparing it costs nothing
 
 Law 11d's remaining half (`docs/DSP-ARCHITECTURE.md`): its budgets covered the solver's calls and said in as

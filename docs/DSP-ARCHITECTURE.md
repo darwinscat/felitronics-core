@@ -230,6 +230,24 @@ the CPU at runtime, invisible to any build. Full write-up:
    Linux row goes red on its own. (It said "unlike 8 and 9" when it was written, hours before law 9 got
    its own two gates. Law 8 remains the odd one out: a denormal stall is a property of the CPU at
    runtime and no build can see it.)
+   **THE LAW HAS EXACTLY ONE LOCAL OVERRIDE, and it is a header that turns contraction OFF for itself:**
+   `core::firDot` (`modules/core/include/felitronics/core/PolyphaseFir.h`, P56), the single polyphase-FIR
+   inner product that `oversampling::PolyphaseOversampler` and `analysis::TruePeakMeter` both run. The law
+   is right about the tree and wrong about that one loop: `acc += a*b` is the contractible form, arm64 fuses
+   it and baseline x86-64 cannot, so contraction there does not make one number better — it makes five rows
+   disagree. With the order nailed down and contraction off locally, they do not: one measured constant on
+   `win` (MSVC 19.44), `deb` (gcc 14.2), `mac` (Apple clang 14), `docker --platform linux/arm64` (gcc 14.4)
+   and `wasm` (emsdk 6.0.9). A header cannot use a flag, so it takes three pragmas, all of them measured on
+   the toolchain rather than read out of a manual: gcc ignores `#pragma STDC FP_CONTRACT` in C++ and needs
+   `#pragma GCC optimize("fp-contract=off")` (which also blocks inlining — **1.4 %** of a mastering render,
+   measured); clang needs `#pragma clang fp contract(off)` and must NOT be given
+   `#pragma float_control(precise, on)`, which turns contraction back ON; MSVC takes `#pragma fp_contract(off)`,
+   and its `float_control(push)`/`(pop)` really does save it. The override reaches only as far as the language
+   does — **a clang build with `-ffp-contract=fast` or `-ffast-math` defeats every pragma**, so the property is
+   GATED (`felitronics_core_polyphasefir_tests` pins the cross-row bits and fails on a row that fused) rather
+   than asserted. What stays outside it, because it is runtime state and not code: FTZ/DAZ (wasm cannot flush
+   at all, so a host that flushes splits it from every native row — with NORMAL inputs, since a normal times a
+   normal can land subnormal), the rounding mode, and NaN sign/payload.
 
 11. **THE CALL IS A REQUEST AGAINST A PREPARED CAPACITY, AND A REQUEST THAT CANNOT BE HONOURED IN FULL
    IS REFUSED AS A WHOLE — `[[nodiscard]] bool process(...)`.** `prepare(sampleRate, maxBlock,

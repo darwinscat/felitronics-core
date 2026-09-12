@@ -5,6 +5,7 @@
 
 #include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
+#include <felitronics/core/PolyphaseFir.h>
 
 #include <algorithm>
 #include <cmath>
@@ -70,6 +71,10 @@ struct TruePeakMeterParams
 class TruePeakMeter
 {
 public:
+    // What core::firDot needs the per-phase run to be: a multiple of four. 12 already is, so on every
+    // shipped configuration this pads by NOTHING — the constant exists to keep the layout honest, not
+    // to buy slack.
+    static constexpr int kTapsPad = core::firPadLen (12);
     static constexpr int kTapsPerPhase = 12;     // 48-tap prototype at 4× — matches the spec filter length
 
     // WHAT prepare() ALLOCATES, from the same functions it sizes itself with (factorFor, protoTapsFor): three vectors
@@ -94,7 +99,7 @@ public:
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) { st.factor = 0; return st; }   // prepare()'s refusal
         st.factor     = factorFor (oversample, sampleRate > 0.0 ? sampleRate : 48000.0);   // prepare()'s own substitution
         st.protoTaps  = protoTapsFor (st.factor);
-        st.histFloats = (std::size_t) maxChannels * (std::size_t) kTapsPerPhase;
+        st.histFloats = (std::size_t) maxChannels * 2u * (std::size_t) kTapsPad;   // DOUBLE-length ring
         st.posInts    = (std::size_t) maxChannels;
         return st;
     }
@@ -161,7 +166,7 @@ public:
         // is what makes the gap observable at all.
         for (int c = nc; c < ranNc_; ++c)
         {
-            std::fill_n (&hist_[(std::size_t) c * (std::size_t) kTapsPerPhase], kTapsPerPhase, 0.0f);
+            std::fill_n (&hist_[(std::size_t) c * 2u * (std::size_t) kTapsPad], 2 * kTapsPad, 0.0f);
             pos_[(std::size_t) c] = 0;
         }
         ranNc_ = nc;
@@ -170,7 +175,7 @@ public:
         for (int c = 0; c < nc; ++c)
         {
             int pos = pos_[(std::size_t) c];
-            float* h = &hist_[(std::size_t) c * (std::size_t) kTapsPerPhase];
+            float* h = &hist_[(std::size_t) c * 2u * (std::size_t) kTapsPad];
             for (int m = 0; m < n; ++m)
             {
                 float x = io[c][m];
@@ -178,19 +183,23 @@ public:
                 const float ax = std::fabs (x);
                 if (ax > samplePeakLin_) samplePeakLin_ = ax;
 
-                h[pos] = x; if (++pos >= kTapsPerPhase) pos = 0;     // pos-1 = newest x[m]
+                // A BACKWARDS DOUBLE-LENGTH RING: `pos` holds the NEWEST sample and every sample is
+                // stored a second time kTapsPad slots up, so the window [pos, pos+kTapsPad) is always
+                // contiguous and already in the order the phase's coefficients want. That is what lets
+                // this inner loop BE core::firDot — one kernel, one summation order, the same bits on
+                // every row (P56).
+                if (pos == 0) pos = kTapsPad;
+                --pos;                                                // pos = newest x[m]
+                h[pos] = x; h[pos + kTapsPad] = x;
                 float tp = ax;                                        // the grid sample itself (→ TP ≥ sample peak)
                 for (int p = 0; p < L_ && L_ > 1; ++p)
                 {
-                    float acc = 0.0f;
-                    for (int k = 0; k < kTapsPerPhase; ++k)
-                    {
-                        int hi = pos - 1 - k; if (hi < 0) hi += kTapsPerPhase;
-                        acc += proto_[(std::size_t) (k * L_ + p)] * h[hi];
-                    }
+                    const float acc = core::firDot (&proto_[(std::size_t) p * (std::size_t) kTapsPad],
+                                                    &h[pos], kTapsPad);
                     const float v = std::fabs ((float) L_ * acc);     // ×L restores the polyphase gain
                     if (v > tp) tp = v;
                 }
+
                 if (tp > blockMax) blockMax = tp;
 
                 if (holdSamples_ > 0)                                 // display ballistic (per sample, base rate)
@@ -213,7 +222,7 @@ private:
         if (oversample == 1 || oversample == 2 || oversample == 4) return oversample;
         return (sampleRate < 88200.0) ? 4 : (sampleRate < 176400.0 ? 2 : 1);   // reach the spec's ~176.4/192 kHz analysis rate
     }
-    static std::size_t protoTapsFor (int factor) noexcept { return (std::size_t) std::max (1, factor * kTapsPerPhase); }
+    static std::size_t protoTapsFor (int factor) noexcept { return (std::size_t) std::max (1, factor * kTapsPad); }
 
     void chooseFactor() noexcept
     {
@@ -237,10 +246,13 @@ private:
             const double r    = (double) (2 * i - (N - 1)) / (double) (N - 1);
             const double win  = detail::tpBesselI0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / i0b;
             const double v    = sinc * win;
-            proto_[(std::size_t) i] = (float) v; sum += v;
+            // PHASE-MAJOR on the way in: tap i belongs to phase i%L at index i/L, so the strided
+            // gather the inner loop used to do (proto_[k*L + p]) happens once, here, for free.
+            proto_[(std::size_t) (i % L_) * (std::size_t) kTapsPad + (std::size_t) (i / L_)] = (float) v;
+            sum += v;
         }
         const float inv = (float) (1.0 / sum);                        // Σ → 1 → each phase ≈ 1/L → unity DC after ×L
-        for (auto& v : proto_) v *= inv;
+        for (auto& v : proto_) v *= inv;                              // the +0.0f padding stays +0.0f
     }
 
     void applyBallistics() noexcept
@@ -257,8 +269,8 @@ private:
     bool prepared_ = false;                     // true only after prepare() (hist_/pos_ allocated)
     TruePeakMeterParams params_;
 
-    std::vector<float> proto_;                  // N = L*tapsPerPhase taps, Σ = 1
-    std::vector<float> hist_;                   // per-channel ring (tapsPerPhase)
+    std::vector<float> proto_;                  // L blocks of kTapsPad, PHASE-MAJOR; the N taps sum to 1
+    std::vector<float> hist_;                   // per-channel DOUBLE-LENGTH backwards ring (2*kTapsPad)
     std::vector<int>   pos_;
 
     float truePeakLin_ = 0.0f, samplePeakLin_ = 0.0f, blockTpLin_ = 0.0f;

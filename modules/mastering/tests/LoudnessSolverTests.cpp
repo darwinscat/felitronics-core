@@ -1460,6 +1460,11 @@ void testSurvivorsOfTheMutationStand()
                   std::string ("a violated limit is reported, not 'between achievable' (got ")
                   + statusName (sol.status) + ")");
         test::ok (sol.binding != MasteringConstraint::None, "...and the binding limit is NAMED");
+        // NB the DELIVERED candidate here is decided by a tie: the last two renders' PLR differ in the
+        // seventh decimal (10.990209 against 10.990210 at the time of writing), so which one is
+        // "gentlest" flips on any numerical change anywhere upstream — P56 flipped it from the -19.3015
+        // candidate to the -24.0000 one, and the three checks above, which are about the ORDERING of the
+        // verdicts, are true either way. If this line's number ever matters, the tie-break does too.
         std::printf ("      ordering: status %s, binding %s, mask 0x%x, I %.4f\n",
                      statusName (sol.status), constraintName (sol.binding),
                      (unsigned) sol.alsoViolated, sol.measured.integratedLufs);
@@ -2266,11 +2271,14 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     test::ok (TruePeakMeter::storageFor (48000.0, 0).bytes() == 0 && TruePeakMeter::storageFor (48000.0, -1).bytes() == 0
               && TruePeakMeter::storageFor (48000.0, past).bytes() == 0,
               "TruePeakMeter::storageFor: 0 bytes for a channel count prepare() refuses");
-    test::ok (TruePeakMeter::storageFor (48000.0, 2).bytes() == 296, "and 296 B for stereo at 48 kHz (the ABI suite's oracle)");
+    // 392, not the 296 this line pinned before P56, which gave the meter a DOUBLE-LENGTH history ring
+    // (every sample stored twice so core::firDot reads a contiguous window), which doubles hist_ and nothing
+    // else. 4·48 taps + 4·(2 ch · 2 · 12) + 4·2 = 192 + 192 + 8.
+    test::ok (TruePeakMeter::storageFor (48000.0, 2).bytes() == 392, "and 392 B for stereo at 48 kHz (the ABI suite's oracle)");
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000) == 0
               && TargetLoudnessSolver::solveBytes (48000.0, past, 48000) == 0,
               "solveBytes: 0 for a channel count solve() refuses");
-    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000) == 3480, "and 3480 B for 1 s of stereo (the ABI suite's oracle)");
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000) == 3576, "and 3576 B for 1 s of stereo (the ABI suite's oracle)");
     // A prepare() refused on its bin width (400 dB at 1e-7 dB is 4e9 bins, past the 4e6 ceiling) allocates NOTHING —
     // which is what its budget says. The diverse-testing round found the tap buffers assigned before that refusal, and
     // kept. The delta is read into a local before the check.
@@ -2286,12 +2294,13 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
               && TargetLoudnessSolver::measureRangeBytes (0.0, 480000) == 0, "and 0 for a rate the solver refuses");
     // The true-peak meter's factor follows the RATE, and so must its budget — one rate could not tell (the diverse-
     // testing round's mutant sized it at 48 kHz and passed). Derived: 1 s is 20 hops at any multiple of 100 Hz, so the
-    // loudness meter is 8·(300 + 24 + 10) = 2672 B; the true-peak meter at factor F is 4·12F + 4·2·12 + 4·2; the drain 512.
-    test::ok (TruePeakMeter::storageFor (96000.0, 2).bytes() == 200 && TruePeakMeter::storageFor (192000.0, 2).bytes() == 152,
-              "the true-peak meter at 96 kHz (factor 2) is 200 B, at 192 kHz (factor 1) 152 B");
-    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 200u + 512u
-              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 152u + 512u,
-              "and a 1 s solve at 96 and 192 kHz carries that meter: 3384 and 3336 B");
+    // loudness meter is 8·(300 + 24 + 10) = 2672 B; the true-peak meter at factor F is 4·12F + 4·2·2·12 + 4·2 (the
+    // middle term doubled with P56 — see the note above); the drain 512.
+    test::ok (TruePeakMeter::storageFor (96000.0, 2).bytes() == 296 && TruePeakMeter::storageFor (192000.0, 2).bytes() == 248,
+              "the true-peak meter at 96 kHz (factor 2) is 296 B, at 192 kHz (factor 1) 248 B");
+    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 296u + 512u
+              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 248u + 512u,
+              "and a 1 s solve at 96 and 192 kHz carries that meter: 3480 and 3432 B");
 }
 
 int main()
