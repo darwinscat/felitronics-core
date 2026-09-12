@@ -30,10 +30,10 @@ enum class PeakMix : int
 // |mean| of ~125 µs boxes, so it sits at or below the sample peak of its stretch — up to the rounding of the box
 // mean, which can lift a mean of equal samples a few ulps above them (2^30 frames of 1+3·2^-23 at an absurd rate
 // read 4.3e-14 over) — and further below the true peak.
-// Neither of the core's two true peaks is involved — `fcore::Probe` (the reference: 4x, 32 taps per phase, cutoff
-// 0.90 Nyquist, Kaiser 9, what `fc_probe_tp_linear` reports) or `analysis::TruePeakMeter` (the spec's own 48-tap
-// filter, what the mastering chain runs), which disagree by 0.045 dB at 44.1 kHz with no resampling at all. A
-// picture that must show a true peak next to these bars names which one it shows.
+// Neither of the core's two true-peak meters is involved, and those two must not be confused with each other either:
+// `fcore::Probe` (the 128-tap reference, what `fc_probe_tp_linear` reports) and `analysis::TruePeakMeter` (the spec's
+// 48-tap filter, what the mastering chain runs) are DIFFERENT filters and read different numbers. How far apart is
+// measured by P62, not stated here. A picture that must show a true peak next to these bars names which one it shows.
 //
 // THIS IS A PORT, AND THE SPEC IS EXECUTABLE: the site's `computePeaksFromBuffer` and `peaksFromWav`
 // (audio-peaks.js). Before this header the same picture had four definitions — a Java sidecar generator
