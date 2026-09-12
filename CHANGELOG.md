@@ -19,7 +19,8 @@ half — the one definition and its two roads; moving the site's generators and 
 - **`analysis::WaveformPeaks`** — a port of `computePeaksFromBuffer` / `peaksFromWav` (audio-peaks.js), bit for bit:
   box-average decimation to ~8 kHz (`Math.round`, ties up), then max-abs per bucket; mix modes `avr` · `L` · `R`
   (the LAST channel) · `max`; the double output and the float32 form, because the two JS functions differ exactly
-  there. **Not a metering peak**: at or below the sample peak, and neither of the core's two true peaks.
+  there. **Not a metering peak**: not above the sample peak except by the rounding of a box mean, and neither of the core's
+  two true peaks.
 - **`analysis::StereoColumns` / `StereoSums`** — a port of `computeStereoColumns` / `correlationOf` / `widthOf`
   (stereo-meter.js): per column width, **uncentred** phase correlation (not Pearson's, whatever the JS comment
   says — (1,2)/(2,1) reads 0.8) and RMS (the JS `loud`; not a loudness), `maxRms` as the unrounded double the page's
