@@ -50,6 +50,20 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_streamresampler_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_streamresampler_falsify_tests COMMAND felitronics_core_streamresampler_falsify_tests)
 
+    # P57 — the rational L:M DELIVERY resampler. Contract + planner + latency + round-trip NULL.
+    add_executable(felitronics_core_deliveryresampler_tests tests/DeliveryResamplerTests.cpp)
+    target_link_libraries(felitronics_core_deliveryresampler_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_deliveryresampler_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_deliveryresampler_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_deliveryresampler_tests COMMAND felitronics_core_deliveryresampler_tests)
+
+    # P57 — THE BAR: stopband and passband flatness measured through the converter on all 30 pairs.
+    add_executable(felitronics_core_deliveryresampler_bar_tests tests/DeliveryResamplerBarTests.cpp)
+    target_link_libraries(felitronics_core_deliveryresampler_bar_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_deliveryresampler_bar_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_deliveryresampler_bar_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_deliveryresampler_bar_tests COMMAND felitronics_core_deliveryresampler_bar_tests)
+
     add_executable(felitronics_core_dryaligner_tests tests/DryAlignerTests.cpp)   # PDC-aligned dry ring (bit-exact gate)
     target_link_libraries(felitronics_core_dryaligner_tests PRIVATE felitronics::core)
     target_include_directories(felitronics_core_dryaligner_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

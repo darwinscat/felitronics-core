@@ -5,6 +5,43 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## Unreleased
+
+### `core` — a delivery resampler: rational L:M, 146.58 dB of stopband measured through it on all 30 pairs
+
+A new primitive, **`core::DeliveryResampler`**: the rational polyphase windowed-sinc converter for the rate a
+file is DELIVERED at — 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz, every pair, both directions. Neither
+neighbour was touched or widened: `StreamResampler` interpolates between phase-table rows and floors near
+-105 dB whatever its kernel, and `resampleIr` is an IR-load one-shot. Non-integer rates are refused, not
+approximated.
+
+- **The bar, measured through the converter, not read off a formula.** Stopband >= 140 dB and ripple
+  <= 0.001 dB to 20 kHz were asked. Delivered, over all 30 directed pairs: worst line **-146.58 dB**, worst
+  ripple **0.0000013 dB**, worst absolute gain error **0.0000014 dB**; a 48 -> 44.1 -> 48 round trip nulls
+  at **-143.3 dBFS peak / -160.3 RMS** against an analytic oracle (asked: -120). The Kaiser formula does
+  not certify at this depth (asking 140 measures -139.3), so the design target is 146 dB and the transition
+  ends 6 % of its width INSIDE the Nyquist: without that margin the matrix was not even monotone in the
+  target — asking 2 dB more took the worst line from -142.0 to -139.0, through the bar.
+- **Routes are costed, not written down.** A stage's work is `K * f_in * f_out / df` with no L in it, so a
+  cascade's only lever is where the narrow transition runs. 192 -> 44.1 goes **192 -> 88.2 -> 44.1**
+  (26.99 MMAC/s, 12,792 coefficients) against 42.34 MMAC/s and 141,120 coefficients single-stage — and not
+  the textbook 192 -> 96 -> 48 -> 44.1 (29.96). 176.4 <-> 192 is where decomposition has nothing to give:
+  it goes direct, because every lower rung discards band that pair must carry. At most two stages anywhere.
+- **The passband edge is proportional** — 20.000 kHz whenever 44.1 is involved, 80 kHz on 176.4 <-> 192 —
+  and a parameter, because it is the one number that changes what the output contains.
+- **Double in the sample loop, as a named law-3 carve-out.** Narrowing only the four accumulators to float32
+  fails the bar on 13 of the 30 pairs (worst -132.19 dB), so `firDot` is not reused; bit agreement across
+  rows is not promised.
+- **Latency is an exact rational**, each stage an integer number of its own input samples (N = 2Lk + 1), and
+  it is measured back out of the carrier phase on single stages and cascades alike. `flush()` drains it;
+  law 11 holds clause by clause (long calls chunk, a stopped channel drops its memory, a gap spends the
+  clock, `process()` after `flush()` is refused).
+- **Two suites, and the instrument is itself under test.** The spectral bar suite carries four negative
+  controls — including an off-bin -138 dB image that the first, rectangular-window version of the suite read
+  as -141.3 and passed. A mutation stand of 33 mutants catches all 32 non-equivalent ones; the survivor, a
+  redundant range test, and an earlier pruning mutant are proven equivalent (144,360 and 624 plans
+  bit-identical with and without them).
+
 ## v0.31.0 — 2026-09-12
 
 ### `core` · `oversampling` · `analysis` — one polyphase FIR kernel for the whole tree, and five rows that agree on its bits
