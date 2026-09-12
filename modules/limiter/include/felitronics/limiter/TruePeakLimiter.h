@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -28,10 +29,28 @@ namespace detail
     class SlidingMax
     {
     public:
+        // What prepare() asks the heap for (law 11d): two vectors of `cap` entries. The floor is
+        // modelled here because prepare() clamps rather than refuses — the budget of a call is
+        // storageFor() with the SAME arguments.
+        struct Storage
+        {
+            std::size_t entries = 1;
+            std::uint64_t bytes() const noexcept
+            {
+                return ((std::uint64_t) sizeof (float) + (std::uint64_t) sizeof (std::int64_t))
+                     * (std::uint64_t) entries;
+            }
+        };
+        static Storage storageFor (int maxWindow) noexcept
+        {
+            Storage s; s.entries = (std::size_t) (maxWindow < 1 ? 1 : maxWindow); return s;
+        }
+
         void prepare (int maxWindow)
         {
-            cap = maxWindow < 1 ? 1 : maxWindow;
-            v.assign ((std::size_t) cap, 0.0f); ix.assign ((std::size_t) cap, 0);
+            const Storage st = storageFor (maxWindow);
+            cap = (int) st.entries;
+            v.assign (st.entries, 0.0f); ix.assign (st.entries, 0);
             W = cap;
             reset();
         }
@@ -230,55 +249,163 @@ struct TruePeakLimiterTap
 class TruePeakLimiter
 {
 public:
-    // Topology is chosen HERE and nowhere else. Returns false and leaves the limiter unprepared on an
-    // unusable stream configuration; a false return is the only way to learn that, so check it.
-    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels, const TruePeakLimiterConfig& config = {})
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the counts the scratch, the delay bank and the sliding window are actually
+    // built from and the two cannot drift. FALSE, with `out` untouched, exactly where prepare() refuses
+    // the same arguments (it IS prepare()'s gate), and a refused prepare() allocates nothing. Asked of a
+    // FRESH limiter. `maxBlock` is CLAMPED rather than refused, as prepare() clamps it, and the budget
+    // models the clamp: sizing the scratch from the uncapped argument is the defect the cap exists to
+    // prevent, and a budget that carried the uncapped number would re-introduce it on paper.
+    struct Storage
     {
-        prepared_ = false;                                     // any early return below leaves it unprepared
+        std::size_t channels    = 0;       // one oversampled scratch buffer and one delay line per channel
+        std::size_t osBufSamples = 0;      // floats in EACH scratch buffer: the capped block x the factor
+        int         osDelaySamples = 0;    // the 20 ms lookahead capacity, in OVERSAMPLED samples
+        oversampling::PolyphaseOversampler::Storage os {};
+        detail::SlidingMax::Storage slide {};
+        std::uint64_t bytes() const noexcept
+        {
+            return (std::uint64_t) channels * ((std::uint64_t) sizeof (std::vector<float>)
+                                               + (std::uint64_t) sizeof (float) * (std::uint64_t) osBufSamples
+                                               + (std::uint64_t) sizeof (float*))
+                 + core::delayBankBytes (channels, osDelaySamples)
+                 + os.bytes() + slide.bytes();
+        }
+    };
+
+    [[nodiscard]] static bool storageFor (double sampleRate, int maxBlock, int maxChannels,
+                                          const TruePeakLimiterConfig& config, Storage& out) noexcept
+    {
         // Spelled positively so NaN fails: `sampleRate <= 0.0` is FALSE for NaN, which let a NaN rate
         // through to std::lround(NaN) — undefined behaviour, and a signed overflow right after it.
         if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || sampleRate > kMaxSampleRate) return false;
         if (maxBlock < 1) return false;
         // Both ends. Only the lower bound was checked, so tapsPerPhase = INT_MAX reached N = L*tpp in
-        // the oversampler and overflowed a signed int before allocating (UBSan-confirmed, then a
-        // length_error — a terminate under the wasm tier's -fno-exceptions).
+        // the oversampler and overflowed a signed int before allocating.
         if (config.tapsPerPhase < 4 || config.tapsPerPhase > kMaxTapsPerPhase) return false;
         if (! std::isfinite (config.lookaheadMs) || config.lookaheadMs < 0.0) return false;
-
-        fs    = sampleRate;
-        // Refused rather than clamped: a silently reduced channel count would leave the surplus
-        // channels passing through this module UNLIMITED, and a silently reduced factor would run a
-        // topology the caller did not ask for. Both are the class of defect this task closes.
+        // Refused rather than clamped: a silently reduced channel count would leave the surplus channels
+        // passing through this module UNLIMITED, and a silently reduced factor would run a topology the
+        // caller did not ask for.
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
         if (config.oversampleFactor > kMaxFactor) return false;
+        Storage st;
+        const int f = oversampleFactorFor (config);
+        if (! oversampling::PolyphaseOversampler::storageFor (f, maxChannels, config.tapsPerPhase, st.os))
+            return false;
+        // A rate so low that 20 ms cannot hold the minimum lookahead would make prepare()'s clamp
+        // std::clamp(x, 2, 1) — lo > hi is undefined behaviour. Refuse instead, here and there.
+        const int maxLookBb = maxLookaheadSamplesFor (sampleRate);
+        if (maxLookBb < kMinLookaheadSamples) return false;
+        st.channels       = (std::size_t) maxChannels;
+        st.osBufSamples   = (std::size_t) blockFor (maxBlock) * (std::size_t) f;
+        st.osDelaySamples = maxLookBb * f;
+        st.slide          = detail::SlidingMax::storageFor (st.osDelaySamples + 1);
+        out = st;
+        return true;
+    }
+
+    // THE EFFECTIVE FACTOR, in one place: a requested 1 becomes 2, and anything above kMaxFactor was
+    // refused before this is asked. `MasteringChain` reads this to size a tap buffer without a limiter in
+    // hand, and reading it back off a prepared limiter has to give the same answer (pinned).
+    static int oversampleFactorFor (const TruePeakLimiterConfig& config) noexcept
+    {
+        return config.oversampleFactor < 2 ? 2 : config.oversampleFactor;
+    }
+
+    // The scratch block prepare() will actually use — the cap, in one place, so the budget cannot size
+    // itself from the uncapped argument the preparation ignores.
+    static int blockFor (int maxBlock) noexcept { return std::min (maxBlock, kMaxBlock); }
+
+    // The 20 ms capacity in BASEBAND samples — what bounds the lookahead below and sizes the rings.
+    static int maxLookaheadSamplesFor (double sampleRate) noexcept
+    {
+        return (int) std::ceil (kMaxLookaheadMs * 0.001 * sampleRate);
+    }
+
+    // THE LOOKAHEAD a config actually takes at this rate, after the 20 ms ceiling and the two-sample
+    // floor — prepare()'s own clamp chain, in ONE place.
+    static int lookaheadSamplesFor (double sampleRate, double lookaheadMs, int maxLookBaseband) noexcept
+    {
+        // Clamp in the DOUBLE domain BEFORE lround: `std::lround(1e300)` is out of range for a long, and
+        // the result of that then clamped upward landed on the MINIMUM lookahead — a caller asking for an
+        // absurd value silently got the smallest one instead of the largest.
+        const double lookMs = std::clamp (lookaheadMs, 0.0, kMaxLookaheadMs);
+        const int    n      = (int) std::lround (lookMs * 0.001 * sampleRate);
+        return std::clamp (n, kMinLookaheadSamples, maxLookBaseband);
+    }
+
+    // THE LATENCY a prepared limiter will report for this geometry, without preparing one: the
+    // oversampler's round trip plus the lookahead. `MasteringChain` sizes its dry aligner from the
+    // latency it READS BACK off the stage, and this is how a budget reaches the same number without a
+    // second derivation of it. 0 where prepare() refuses the same arguments.
+    static int latencyFor (double sampleRate, int maxBlock, int maxChannels,
+                           const TruePeakLimiterConfig& config) noexcept
+    {
+        Storage st;
+        if (! storageFor (sampleRate, maxBlock, maxChannels, config, st)) return 0;
+        return (config.tapsPerPhase - 1)
+             + lookaheadSamplesFor (sampleRate, config.lookaheadMs, maxLookaheadSamplesFor (sampleRate));
+    }
+
+    // Topology is chosen HERE and nowhere else. Returns false and leaves the limiter unprepared on an
+    // unusable stream configuration; a false return is the only way to learn that, so check it.
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels, const TruePeakLimiterConfig& config = {})
+    {
+        prepared_ = false;                                     // any early return below leaves it unprepared
+        // THE GATE IS storageFor()'s, so the budget and the preparation refuse the same arguments by
+        // construction rather than by agreement — every check that used to stand here is there, with its
+        // reasons, and nothing has been dropped: the positive NaN spelling, both ends of tapsPerPhase, the
+        // channel and factor refusals, and the 20 ms floor that would otherwise make the lookahead clamp
+        // std::clamp(x, 2, 1).
+        //
+        // ONE OBSERVABLE CHANGE COMES WITH THAT: `fs` used to be written between the rate check and the
+        // width check, so a preparation refused on its WIDTH had already replaced the rate, and
+        // `effectiveReleaseMs()` — which is not gated by `prepared_`, and is the ONLY readout here that is
+        // a function of the rate — then answered in terms of it. Measured, `prepare(96000, 64, 2)` then a
+        // refused `prepare(48000, 64, 33)` then `setParams(releaseMs = 0.01)`: 0.166667 ms before, 0.083333
+        // now, the latter being the release the limiter is actually running. (`effectiveCeilingDbTp()` is
+        // NOT affected — the ceiling is a clamp on the parameter and never sees the rate.) The new answer is
+        // law 11(b)'s; it is stated here because this header is shared with the plug-ins.
+        Storage st;
+        if (! storageFor (sampleRate, maxBlock, maxChannels, config, st)) return false;
+
+        fs    = sampleRate;
         maxCh = maxChannels;
         // CLAMPED, not refused. Since process() chunks, maxBlock is a scratch-buffer size rather than a
         // limit on what a caller may pass — and refusing a big one would fail prepare(), after which
         // process() returns the buffer UNTOUCHED, i.e. exactly the unlimited-passthrough defect this
         // task exists to close. An offline caller sizing maxBlock to a whole file is a normal thing to do.
-        maxBlock_ = std::min (maxBlock, kMaxBlock);
+        maxBlock_ = blockFor (maxBlock);
         tpp   = config.tapsPerPhase;
-        F     = config.oversampleFactor < 2 ? 2 : config.oversampleFactor;   // a requested 1 becomes 2; above kMaxFactor was refused
+        F     = oversampleFactorFor (config);                  // a requested 1 becomes 2; above kMaxFactor was refused
         if (! os.prepare (F, maxCh, tpp)) return false;        // oversampler rejected → stay unprepared
 
-        // maxBlock_, NOT maxBlock: the cap two lines up exists to bound exactly this allocation
-        // ("without a cap a hostile or mistaken prepare() could ask for gigabytes"), and sizing the
-        // buffer from the UNCAPPED argument left it doing nothing. It is reachable by ordinary use, not
-        // only by a hostile one — this header tells an offline caller that sizing maxBlock to a whole
-        // file is a normal thing to do, and a 10-minute stereo file at 48 kHz asked for 460 MB per
-        // channel instead of the 16 MB the cap allows. processChunk() already works in maxBlock_-sized
-        // pieces, so the smaller buffer is the one it was always using.
-        osBuf.assign ((std::size_t) maxCh, std::vector<float> ((std::size_t) maxBlock_ * (std::size_t) F, 0.0f));
-        osPtrs.assign ((std::size_t) maxCh, nullptr);
+        // st.osBufSamples is maxBlock_ x F, NOT maxBlock x F: the cap above exists to bound exactly this
+        // allocation ("without a cap a hostile or mistaken prepare() could ask for gigabytes"), and sizing
+        // the buffer from the UNCAPPED argument left it doing nothing. It is reachable by ordinary use,
+        // not only by a hostile one — this header tells an offline caller that sizing maxBlock to a whole
+        // file is a normal thing to do, and a 10-minute stereo file at 48 kHz asked for 460 MB per channel
+        // instead of the 16 MB the cap allows. processChunk() already works in maxBlock_-sized pieces.
+        //
+        // NO TEMPORARY: `assign(maxCh, std::vector<float>(n))` built one buffer to copy maxCh times, and
+        // that temporary alone was 524 288 B of peak nobody could see in the end state on the biggest
+        // topology the MASTERING CHAIN builds (its quantum stops at 8192). Asked of this class directly the
+        // same temporary reached 64 MiB, since the block cap above is 1 Mi samples. Resizing the outer vector and filling each buffer in place is the same end state, one
+        // allocation class fewer, and — the point — a re-preparation at the same geometry now asks for
+        // nothing at all.
+        // `reserve` BEFORE `resize`, and that is not decoration: a `resize` past the current capacity grows
+        // GEOMETRICALLY (libc++ doubles), so widening a bank of 3 buffers to 4 asked for 6 and the published
+        // number — which pays for 4 — was no longer an upper bound on what the call held at once. `reserve`
+        // asks for exactly what is needed. (The code-review round; measured 48 B over, 2 x sizeof(vector).)
+        osBuf.reserve (st.channels);
+        osBuf.resize  (st.channels);
+        for (auto& b : osBuf) b.assign (st.osBufSamples, 0.0f);
+        osPtrs.assign (st.channels, nullptr);
 
-        // A rate so low that 20 ms cannot hold the minimum lookahead would make the clamp below
-        // std::clamp(x, 2, 1) — lo > hi is undefined behaviour, and the reported lookahead would then
-        // disagree with the delay the DelayLine actually took. Refuse instead.
-        const int maxLookBb  = (int) std::ceil (kMaxLookaheadMs * 0.001 * fs);
-        if (maxLookBb < kMinLookaheadSamples) return false;
-        const int maxLookOS  = maxLookBb * F;
-        osDelays.assign ((std::size_t) maxCh, core::DelayLine {});
-        for (auto& d : osDelays) d.prepare (maxLookOS);
+        const int maxLookBb  = maxLookaheadSamplesFor (fs);
+        const int maxLookOS  = st.osDelaySamples;
+        core::prepareDelayBank (osDelays, st.channels, maxLookOS);
         slide.prepare (maxLookOS + 1);
 
         // The lookahead floor is not taste. At zero the structure degenerates into a clipper at the
@@ -288,12 +415,10 @@ public:
         // factor. (One sample is already inside at a 50 ms release; two is the value that also holds the
         // click at the release floor, which is why the pair is stated together.) At any musical lookahead
         // this clamp is invisible: it is 42 µs at 48 kHz.
-        // Clamp in the DOUBLE domain BEFORE lround: `std::lround(1e300)` is out of range for a long,
-        // and the result of that then clamped upward landed on the MINIMUM lookahead — a caller asking
-        // for an absurd value silently got the smallest one instead of the largest.
-        const double lookMs = std::clamp (config.lookaheadMs, 0.0, kMaxLookaheadMs);
-        lookBaseband = (int) std::lround (lookMs * 0.001 * fs);
-        lookBaseband = std::clamp (lookBaseband, kMinLookaheadSamples, maxLookBb);
+        // THROUGH the static, not beside it: `latencyFor()` publishes this number to a caller that has no
+        // limiter yet, and two spellings of one clamp chain is the drift law 11d's budgets exist to make
+        // impossible.
+        lookBaseband = lookaheadSamplesFor (fs, config.lookaheadMs, maxLookBb);
         const int lookOS = lookBaseband * F;
         for (auto& d : osDelays) d.setDelay (lookOS);
         slide.setWindow (lookOS + 1);                          // the window must equal the ACTUAL lookahead + the emitted sample
@@ -426,6 +551,7 @@ private:
     // by any use case. At the extremes allowed here that is 64 MB/channel; without a cap a hostile or
     // mistaken prepare() could ask for gigabytes.
     static constexpr int    kMaxBlock            = 1 << 20;
+
     static constexpr int    kMaxFactor           = 16;
     static constexpr int    kMaxTapsPerPhase     = 1024;    // N = factor*taps must stay well inside int
     static constexpr int    kMinLookaheadSamples = 2;        // measured floor — see prepare()

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::core
@@ -41,6 +42,38 @@ namespace felitronics::core
 class DryAligner
 {
 public:
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the numbers the two buffers are actually built from. Every clamp prepare()
+    // makes is made here as well, because the budget of a call is storageFor() with the SAME arguments:
+    // a caller that passes 0 channels is sized for 1, exactly as it is prepared for 1.
+    // NB a default-constructed aligner is NOT empty — its constructor already took the seed below — so
+    // preparing one for counts inside that seed asks the heap for nothing and `bytes()` is then an upper
+    // bound rather than the request. Every aligner in this tree is prepared well past it.
+    struct Storage
+    {
+        std::size_t ring = 2, scratch = 1;       // floats, both already multiplied by the channel count
+        std::uint64_t bytes() const noexcept
+        {
+            return (std::uint64_t) sizeof (float) * ((std::uint64_t) ring + (std::uint64_t) scratch);
+        }
+    };
+
+    static Storage storageFor (int numChannels, int maxBlock, int capacity) noexcept
+    {
+        const std::size_t ch = (std::size_t) std::max (1, numChannels);
+        Storage s;
+        s.ring    = ch * (std::size_t) std::max (2, capacity);
+        s.scratch = ch * (std::size_t) std::max (1, maxBlock);
+        return s;
+    }
+
+    // What the DEFAULT-CONSTRUCTED degenerate state below asks for (a 2-slot ring and a 1-sample scratch).
+    // An owner that holds an aligner BY VALUE pays this at its own construction and then, if it prepares
+    // the aligner for anything larger, hands it back — so a budget that sums an owner's requests exceeds
+    // what the owner HOLDS by exactly this much per aligner it re-sizes. Stated rather than hidden: it is
+    // the one place in the mastering chain where the sum and the peak differ.
+    static constexpr std::uint64_t constructBytes() noexcept { return (std::uint64_t) sizeof (float) * 3u; }
+
     // `capacity` must exceed any latency the tap will ever request (the delay is clamped to
     // [0, capacity-1]). Size it to the largest stage latency plus margin.
     void prepare (int numChannels, int maxBlock, int capacity)
@@ -48,8 +81,9 @@ public:
         channels_ = std::max (1, numChannels);
         cap_      = std::max (2, capacity);
         maxBlock_ = std::max (1, maxBlock);
-        ring_.assign    ((std::size_t) channels_ * (std::size_t) cap_,      0.0f);
-        scratch_.assign ((std::size_t) channels_ * (std::size_t) maxBlock_, 0.0f);
+        const Storage st = storageFor (numChannels, maxBlock, capacity);
+        ring_.assign    (st.ring,    0.0f);
+        scratch_.assign (st.scratch, 0.0f);
         pos_ = 0;
     }
 

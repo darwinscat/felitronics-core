@@ -7,6 +7,8 @@
 #include <felitronics/mastering/MasteringChain.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::mastering
@@ -67,11 +69,29 @@ public:
         // storing it, and then refusing on the next left the new WIDTH standing beside the old buffer —
         // and render() sizes its scratch pointers from the width. ASan: heap-buffer-overflow, a WRITE
         // four bytes past a 1024-byte region, after prepare(1, 256) then prepare(2, 0).
-        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
-        if (blockSize < 1) return false;
+        Storage st;
+        if (! storageFor (maxChannels, blockSize, st)) return false;
         maxCh_ = maxChannels;
         block_ = blockSize;
-        scratch_.assign ((std::size_t) maxCh_ * (std::size_t) block_, 0.0f);
+        scratch_.assign (st.scratch, 0.0f);
+        return true;
+    }
+
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the number the scratch is actually built from. FALSE, with `out` untouched,
+    // exactly where prepare() refuses the same arguments (it IS prepare()'s gate, both of them: the width
+    // and the block). Asked of a FRESH renderer; one already prepared for at least this much asks nothing.
+    struct Storage
+    {
+        std::size_t scratch = 0;       // floats: one block per channel
+        std::uint64_t bytes() const noexcept { return (std::uint64_t) sizeof (float) * (std::uint64_t) scratch; }
+    };
+
+    [[nodiscard]] static bool storageFor (int maxChannels, int blockSize, Storage& out) noexcept
+    {
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
+        if (blockSize < 1) return false;
+        out.scratch = (std::size_t) maxChannels * (std::size_t) blockSize;
         return true;
     }
 
@@ -167,5 +187,33 @@ private:
     std::vector<float> scratch_;
     int maxCh_ = 0, block_ = 0;
 };
+
+//==============================================================================
+// WHAT BUILDING A CHAIN AND A RENDERER TOGETHER ASKS THE HEAP FOR (law 11d) — the aggregate a C-ABI
+// facade's `create` needs, computed HERE because a facade is forbidden arithmetic of its own: it
+// forwards numbers the core computed, and a sum it assembled itself would be a second description of
+// this module's storage, drifting the first time a stage grows a buffer.
+//
+// It is the whole of the core's side of such a call: constructing the chain (its two dry aligners),
+// preparing it, and preparing the renderer at the block the facade chose. The facade's OWN object — its
+// instance record — is its `sizeof` and is published separately, because the page adds what applies
+// rather than being handed one number it cannot take apart.
+//
+// 0 for a geometry the chain refuses, and that is now exact rather than nearly so: `MasteringChain::
+// admits()` decides before the first allocation, so a refused `create` asks the heap for nothing.
+//
+// REQUESTED bytes, summed. It exceeds what the call HOLDS at once by `core::DryAligner::constructBytes()`
+// for each aligner the topology re-sizes — 12 bytes apiece, the seed the aligner's constructor took and
+// its preparation hands back — and by nothing else: everything else this call asks for, it keeps.
+[[nodiscard]] inline std::uint64_t createBytes (double sampleRate, int numChannels,
+                                                const MasteringChainConfig& config, int rendererBlock) noexcept
+{
+    OfflineRenderer::Storage rs;
+    if (! MasteringChain::admits (sampleRate, numChannels, config)) return 0u;
+    if (! OfflineRenderer::storageFor (numChannels, rendererBlock, rs)) return 0u;
+    return MasteringChain::constructBytes()
+         + MasteringChain::prepareBytes (sampleRate, numChannels, config)
+         + rs.bytes();
+}
 
 } // namespace felitronics::mastering

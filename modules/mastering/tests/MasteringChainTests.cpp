@@ -24,6 +24,7 @@
 // re-derives them from outside.
 
 #include <felitronics/mastering/OfflineRenderer.h>
+#include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics_test.h>
 
 #include <atomic>
@@ -32,17 +33,101 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <new>
 #include <random>
 #include <string>
 #include <vector>
 
 static std::atomic<long long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+// BYTES too, and EVERY FORM OF `new` (P41). A counter that overrides only `operator new(size_t)` and
+// `new[]` is blind to the OVER-ALIGNED form — and `eq::EqEngine` has `alignof` 64, so 331 KiB of what a
+// chain asks for, the single largest request it makes, went past such a counter unseen. That is the
+// blindness P52 names; a suite that holds a published budget against a counter cannot have it.
+//
+// The bytes are the CONTAINER's, not what reached the allocator: MSVC's STL on x86/x64 asks for
+// `sizeof(void*) + 31` more (one word more under _DEBUG) on every block of 4096 or more — its own
+// alignment, which a REQUESTED-bytes budget leaves to the caller — and this takes that back off. The rule
+// is calibrated on literal sizes below, so a check fails if this is not the STL it describes rather than
+// a byte-for-byte comparison failing with no explanation. NEITHER FILE MODELS ITERATOR DEBUGGING (MSVC's
+// `_DEBUG` adds a container-proxy allocation per container, which is not padding and cannot be subtracted
+// off a block): under it the calibration fails by name, which is the point of having one.
+#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
+#  if defined(_DEBUG)
+static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
+#  else
+static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
+#  endif
+#else
+static constexpr std::size_t kStlBigPad = 0;
+#endif
+static constexpr std::size_t kStlBigBlock = 4096;
+static std::atomic<long long> g_bytes { 0 };
+static long long containerBytes (std::size_t s) noexcept
+{
+    return (long long) (kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
+}
+static void* countedNew (std::size_t s)
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed);
+    return std::malloc (s ? s : 1);
+}
+// The over-aligned forms go through the platform's aligned allocator; `std::free` is not valid for it, so
+// the matching deletes below use the aligned release. Everything is counted the same way.
+static void* countedAlignedNew (std::size_t s, std::size_t a)
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    // RAW, not `containerBytes`. That correction exists to undo what MSVC's STL adds ON TOP of a container's
+    // own request; an over-aligned `new` in this tree is an OBJECT (`eq::EqEngine`, alignof 64) whose size is
+    // exactly `sizeof`, and taking the correction off it subtracts bytes nobody ever added. Caught by the
+    // `win` row before CI: the engine's 339 072 read as 339 033, and with it 88 of the chain's budget rows.
+    g_bytes.fetch_add ((long long) s, std::memory_order_relaxed);
+#if defined(_MSC_VER)
+    return _aligned_malloc (s ? s : 1, a);
+#else
+    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
+    void* p = nullptr;
+    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
+#endif
+}
+static void alignedFree (void* p) noexcept
+{
+#if defined(_MSC_VER)
+    _aligned_free (p);
+#else
+    std::free (p);
+#endif
+}
+void* operator new      (std::size_t s) { return countedNew (s); }
+void* operator new[]    (std::size_t s) { return countedNew (s); }
+void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
+void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
+void* operator new      (std::size_t s, const std::nothrow_t&) noexcept { return countedNew (s); }
+void* operator new[]    (std::size_t s, const std::nothrow_t&) noexcept { return countedNew (s); }
+void* operator new      (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedAlignedNew (s, (std::size_t) a); }
+void* operator new[]    (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedAlignedNew (s, (std::size_t) a); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
 void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
+void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
+
+// One vector's allocation, as the counter sees it — written through `volatile`, so the optimizer cannot
+// remove an allocation nobody observes (the lesson P41 F6 paid for).
+static long long vectorRequest (std::size_t n)
+{
+    const long long before = g_bytes.load();
+    {
+        std::vector<char> v;
+        v.assign (n, 0);
+        volatile char* sink = v.data();
+        sink[0] = 1;
+    }
+    return g_bytes.load() - before;
+}
 
 using namespace felitronics;
 using felitronics::test::ok;
@@ -77,6 +162,34 @@ int firstDiff (const Buf& a, const Buf& b) noexcept
         for (std::size_t i = 0; i < a[c].size(); ++i)
             if (bits (a[c][i]) != bits (b[c][i])) return (int) i;
     return -1;
+}
+
+// THE TOPOLOGY AXIS of the P41 budget matrix. Every optional stage is ABSENT on some row and PRESENT on
+// others, which the first version of this table did not do: it moved only the clipper, so `eq`,
+// `compressor`, `limiter` and `dither` were on in all 48 rows and `monoBass` in none. A budget that added
+// the EQ engine's 331 KiB unconditionally — for a chain that never builds one — was green on every row of
+// that matrix (found by the diverse-testing round, as a mutation that survived the whole suite).
+constexpr int kTopologies = 9;
+mastering::MasteringChainConfig topologyFor (int topo)
+{
+    mastering::MasteringChainConfig c;
+    switch (topo)
+    {
+        case 0: break;                                            // the default
+        case 1: c.clipper = true; break;
+        case 2: c.sidechainHpfHz = 80.0; break;
+        case 3: c.eq = false; break;                              // no engine at all — 331 KiB of budget
+        case 4: c.compressor = false; break;                      // no delay bank
+        case 5: c.limiter = false; break;                         // no oversampler, no aligner, tap factor 1
+        case 6: c.dither = false; break;
+        case 7: c.monoBass = true; break;                         // stereo only: refused at widths 1 and 16
+        default:                                                  // the legal maximum
+            c.clipper = true; c.sidechainHpfHz = 80.0; c.internalBlock = 8192;
+            c.oversampleFactor = 16; c.tapsPerPhase = 1024;
+            c.compressorLookaheadMs = 250.0; c.limiterLookaheadMs = 20.0;
+            break;
+    }
+    return c;
 }
 
 std::vector<float*> planes (Buf& b, int off = 0)
@@ -1124,6 +1237,509 @@ static void testGateCountsItsSubstitutions()
     ok (chain.nonFiniteInputSamples() == 0, "reset() clears it — the count describes ONE stream");
 }
 
+
+//==============================================================================
+// P41 — THE DEMAND IS THE ALLOCATION (law 11d). The chain publishes what preparing it will ask the heap
+// for, and this holds the published number against a counter that sees every form of `new`, byte for byte,
+// over rates x widths x topologies. Every delta is read into a LOCAL before its check: a call's arguments
+// are evaluated in an unspecified order and a message string allocates (gcc builds it first — measured).
+void testDemand()
+{
+    group ("P41: the chain's demand is exactly what preparing it allocates");
+
+    // THE COUNTER'S OWN RULE FIRST, on literal sizes rather than on its own constants: around the STL's
+    // big-block threshold and far above it, a vector counts as exactly the bytes it asked for. If this
+    // STL pads differently from the rule above, THIS fails with its name on it instead of a byte-for-byte
+    // comparison failing with no explanation.
+    for (const std::size_t nb : { std::size_t { 4095 }, std::size_t { 4096 }, std::size_t { 4097 }, std::size_t { 1 } << 20 })
+    {
+        const long long got = vectorRequest (nb);
+        ok (got == (long long) nb, "the byte counter counts a " + std::to_string (nb) + "-byte vector as "
+                                   + std::to_string (nb) + " bytes (read " + std::to_string (got) + ")");
+    }
+    // AND THAT IT SEES AN OVER-ALIGNED `new` AT ALL — the form `eq::EqEngine` is built through. A counter
+    // blind to it reads the default geometry's largest single request as zero and every budget below passes,
+    // which is the shape of P52 and is why this check is a PRECONDITION rather than a nicety.
+    {
+        const long long before = g_bytes.load();
+        {
+            auto e = std::make_unique<eq::EqEngine>();
+            volatile const void* sink = e.get();
+            (void) sink;
+        }
+        const long long got = g_bytes.load() - before;
+        ok (got == (long long) eq::EqEngine::objectBytes(),
+            "the counter sees the over-aligned `new` the EQ engine is built through: "
+            + std::to_string (got) + " B");
+    }
+
+    // THE MATRIX. Four rates, three widths, four topologies — the default, the clipper, the key filter,
+    // and the legal maximum. `create` on the C ABI carries the same matrix; this is the core's own side.
+    const double rates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };
+    const int    widths[] = { 1, 2, 16 };
+    int rows = 0, bad = 0, badLat = 0, badAdmit = 0, badReprep = 0;
+    long long worst = 0;
+    for (const double fs : rates)
+        for (const int nch : widths)
+            for (int topo = 0; topo < kTopologies; ++topo)
+            {
+                const mastering::MasteringChainConfig cfg = topologyFor (topo);
+                ++rows;
+                const std::uint64_t budget = mastering::MasteringChain::prepareBytes (fs, nch, cfg);
+                const bool admitted = mastering::MasteringChain::admits (fs, nch, cfg);
+
+                auto chain = std::make_unique<mastering::MasteringChain>();   // FRESH: the budget is a fresh object's
+                const long long before = g_bytes.load();
+                const bool prepared = chain->prepare (fs, nch, cfg);
+                const long long got = g_bytes.load() - before;
+
+                // ADMITS IS PREPARE'S OWN VERDICT, reached without allocating. Not "agrees usually".
+                if (admitted != prepared) ++badAdmit;
+                if (! prepared) continue;
+                if (got != (long long) budget) { ++bad; if (got > worst) worst = got; }
+                // The latencies the budget used to size the dry aligners are the ones the prepared stages
+                // report. A budget that sized an aligner from a second derivation of the latency would
+                // pass every byte check on the default topology and fail on a moved lookahead.
+                {
+                    mastering::MasteringChain::Storage st;
+                    if (! mastering::MasteringChain::storageFor (fs, nch, cfg, st)) ++badLat;
+                    if (st.latencySamples != chain->latencySamples()) ++badLat;
+                    if (st.tapOversampleFactor != chain->tapOversampleFactor()) ++badLat;
+                }
+                // RE-PREPARING AT THE SAME GEOMETRY COSTS NOTHING — published and measured.
+                const std::uint64_t again = chain->reprepareBytes (fs, nch, cfg);
+                const long long b2 = g_bytes.load();
+                const bool ok2 = chain->prepare (fs, nch, cfg);
+                const long long got2 = g_bytes.load() - b2;
+                if (! ok2 || again != 0u || got2 != 0) ++badReprep;
+            }
+    ok (rows == 4 * 3 * kTopologies, "PRECONDITION: the matrix is 4 rates x 3 widths x "
+        + std::to_string (kTopologies) + " topologies (" + std::to_string (rows) + " rows)");
+    ok (badAdmit == 0, "admits() is prepare()'s own verdict on every row, reached without allocating ("
+                       + std::to_string (badAdmit) + " disagreements)");
+    ok (bad == 0, "prepareBytes() is what a fresh prepare() allocates, byte for byte, on every row ("
+                  + std::to_string (bad) + " rows off, worst " + std::to_string (worst) + " B)");
+    ok (badLat == 0, "the latencies and the tap factor the budget computed are the ones the prepared chain "
+                     "reports (" + std::to_string (badLat) + " off)");
+    ok (badReprep == 0, "re-preparing at the same geometry asks for nothing, and says so ("
+                        + std::to_string (badReprep) + " rows off)");
+
+    // AND A RE-PREPARATION THAT GROWS IS NOT FREE. Every row above re-prepares at the geometry the chain
+    // already holds, so "the budget is 0" and "the budget is always 0" pass the same rows — a mutation that
+    // returned 0 unconditionally survived the whole suite until this. A bound, not an equality: a chain
+    // that grows keeps the containers that still fit, so it asks for LESS than a fresh one, and the header
+    // says the number is an upper bound in exactly that case.
+    {
+        mastering::MasteringChainConfig small;
+        mastering::MasteringChainConfig big = small;
+        big.internalBlock = 4096; big.clipper = true; big.oversampleFactor = 8; big.tapsPerPhase = 256;
+        auto chain = std::make_unique<mastering::MasteringChain>();
+        ok (chain->prepare (48000.0, 2, small), "PRECONDITION: a chain at the small geometry");
+        const std::uint64_t bound = chain->reprepareBytes (96000.0, 2, big);
+        const long long before = g_bytes.load();
+        const bool grew = chain->prepare (96000.0, 2, big);
+        const long long got = g_bytes.load() - before;
+        ok (grew, "PRECONDITION: it re-prepares at the bigger one");
+        ok (bound > 0u, "a re-preparation that GROWS is not published as free (" + std::to_string (bound) + " B)");
+        ok (got > 0 && (std::uint64_t) got <= bound,
+            "and what it asks for is inside the published bound (asked " + std::to_string (got)
+            + " B, bound " + std::to_string (bound) + " B)");
+    }
+
+    // THE TWO WAYS THE RE-PREPARATION BOUND WAS FOUND TO LEAK (the code-review round), each with the input
+    // that found it. Both are about a budget that answered for storage it could not see.
+    {
+        // (a) A MOVED-FROM chain keeps `prepared_` and its scalars and has given its buffers away. The
+        // budget used to recompute "what I have" from those scalars, say it fits, and publish 0 for a
+        // preparation that really allocated.
+        mastering::MasteringChainConfig bare;
+        bare.internalBlock = 64;
+        bare.eq = bare.compressor = bare.limiter = bare.dither = false;
+        mastering::MasteringChain a;
+        ok (a.prepare (48000.0, 2, bare), "PRECONDITION: a prepared chain");
+        mastering::MasteringChain b (std::move (a));
+        const std::uint64_t bound = a.reprepareBytes (48000.0, 2, bare);     // NOLINT: the point is the moved-from state
+        const long long before = g_bytes.load();
+        const bool again = a.prepare (48000.0, 2, bare);
+        const long long got = g_bytes.load() - before;
+        ok (again && got > 0, "PRECONDITION: preparing it again really does allocate (" + std::to_string (got) + " B)");
+        ok ((std::uint64_t) got <= bound, "a chain that has given its storage away does not publish 0 (bound "
+                                          + std::to_string (bound) + " B)");
+    }
+    {
+        // (b) GEOMETRIC GROWTH. Widening the limiter's per-channel scratch bank by one used to `resize`
+        // past the capacity, which doubles — so the call held two buffer objects more than the number paid
+        // for, and an "upper bound" was not one. The witness is the code-review round's own: a 3-channel
+        // chain grown to 4, everything else moving with it.
+        mastering::MasteringChainConfig c1;
+        c1.eq = c1.compressor = c1.dither = false;
+        c1.internalBlock = 16; c1.oversampleFactor = 2; c1.tapsPerPhase = 4; c1.limiterLookaheadMs = 0.0;
+        mastering::MasteringChainConfig c2 = c1;
+        c2.internalBlock = 17; c2.oversampleFactor = 3; c2.tapsPerPhase = 5;
+        auto chain = std::make_unique<mastering::MasteringChain>();
+        ok (chain->prepare (100.0, 3, c1), "PRECONDITION: a narrow chain at a low rate");
+        const std::uint64_t bound = chain->reprepareBytes (200.0, 4, c2);
+        const long long before = g_bytes.load();
+        const bool grew = chain->prepare (200.0, 4, c2);
+        const long long got = g_bytes.load() - before;
+        ok (grew, "PRECONDITION: and it grows in every dimension at once");
+        // THE BOUND IS ON WHAT THE CHAIN ASKS ITS CONTAINERS FOR, not on what they then ask the allocator.
+        // A container that has to grow applies its OWN growth policy, and that is the one thing law 11d
+        // hands to the caller in as many words ("the runtime's growth step ... the caller's margin"). The
+        // `win` row is the witness and the reason this is not an inequality: MSVC's `vector::assign` past
+        // the capacity grows by half, so a 48-float buffer asked to hold 68 asks the allocator for 72 —
+        // twice over in this very sequence, 32 B past a bound libc++ meets exactly. What IS checkable, and
+        // what the mutation stand needs, is that a growing re-preparation is not published as free.
+        // NARROWLY, about THIS chain: "a growing re-preparation is never free" is false in general, and the
+        // fix round produced the sequence — a chain prepared at K = 8192, re-prepared at K = 8, and then
+        // asked for K = 64 asks for nothing, because it never gave the big storage up. What holds is that a
+        // chain which has never held more than it holds now, and is asked for more, pays.
+        ok (bound > 0u && got > 0, "a re-preparation of a chain that never held more, growing, is not free — "
+            "and is not published as free (asked " + std::to_string (got) + " B, bound "
+            + std::to_string (bound) + " B)");
+    }
+    {
+        // AND ONE WHERE THE CHAIN'S OWN BUFFERS DO NOT MOVE. The row above grows the quantum, so the FIFO
+        // sentinel alone answers it and `fitsWithin` is never consulted — measured on the stand: a mutant
+        // that returned 0 unconditionally survived, because the sentinel short-circuited it every time.
+        // Here the rate, the width and the quantum are unchanged (FIFO identical, `keyBuf_` absent) and only
+        // the limiter's topology grows, so nothing but `fitsWithin` can see it.
+        mastering::MasteringChainConfig c1;
+        mastering::MasteringChainConfig c2 = c1;
+        c2.oversampleFactor = 16; c2.tapsPerPhase = 1024; c2.limiterLookaheadMs = 20.0;
+        auto chain = std::make_unique<mastering::MasteringChain>();
+        ok (chain->prepare (48000.0, 2, c1), "PRECONDITION: a chain at the default topology");
+        mastering::MasteringChain::Storage a {}, b {};
+        (void) mastering::MasteringChain::storageFor (48000.0, 2, c1, a);
+        (void) mastering::MasteringChain::storageFor (48000.0, 2, c2, b);
+        ok (a.fifo == b.fifo && a.keyBuf == b.keyBuf, "PRECONDITION: the chain's own buffers do not move");
+        const std::uint64_t bound = chain->reprepareBytes (48000.0, 2, c2);
+        const long long before = g_bytes.load();
+        const bool grew = chain->prepare (48000.0, 2, c2);
+        const long long got = g_bytes.load() - before;
+        ok (grew && got > 0, "PRECONDITION: growing only the limiter still allocates (" + std::to_string (got) + " B)");
+        ok (bound > 0u, "and a stage that grows behind an unchanged FIFO is not published as free");
+    }
+
+    // THE STAGES' OWN BUDGETS, ASKED DIRECTLY, at arguments no chain can reach. Three mutations survived
+    // the matrix above for this reason alone: the chain caps its quantum at 8192 (so the limiter's own
+    // 1 Mi-sample block cap is never exercised), refuses a width past `core::kMaxChannels` (so the
+    // oversampler's channel CLAMP is never exercised), and never asks a dry aligner for a capacity under 2.
+    // A budget is only pinned where its own clamps can be reached.
+    {
+        int off = 0;
+        auto measure = [&off] (const char* /*what*/, std::uint64_t budget, auto&& build)
+        {
+            const long long before = g_bytes.load();
+            const bool okPrep = build();
+            const long long got = g_bytes.load() - before;
+            if (! okPrep || got != (long long) budget) ++off;
+        };
+        {   // the limiter's block cap: a whole-file maxBlock is a normal thing for an offline caller to pass
+            limiter::TruePeakLimiterConfig lc;
+            limiter::TruePeakLimiter::Storage st;
+            const bool okSt = limiter::TruePeakLimiter::storageFor (48000.0, (1 << 20) + 7, 2, lc, st);
+            if (! okSt) ++off;
+            auto l = std::make_unique<limiter::TruePeakLimiter>();
+            measure ("limiter, block past the cap", st.bytes(),
+                     [&] { return l->prepare (48000.0, (1 << 20) + 7, 2, lc); });
+        }
+        {   // the oversampler's channel clamp — law 11(b)'s unfinished application, tracked as P55. The
+            // budget must model what prepare() DOES, not what it ought to do.
+            oversampling::PolyphaseOversampler::Storage st;
+            const bool okSt = oversampling::PolyphaseOversampler::storageFor (4, core::kMaxChannels + 1, 64, st);
+            if (! okSt) ++off;
+            auto o = std::make_unique<oversampling::PolyphaseOversampler>();
+            measure ("oversampler, width past the maximum", st.bytes(),
+                     [&] { return o->prepare (4, core::kMaxChannels + 1, 64); });
+        }
+        {   // the aligner's floors: a capacity under 2 and a block under 1 are RAISED, not refused, and the
+            // budget has to raise them too. Two channels, so the raised counts still exceed the seed the
+            // aligner's constructor took (a one-channel aligner at the floor is already the seed, and then
+            // preparing it asks for nothing — which would make this check pass whatever the floors did).
+            const core::DryAligner::Storage st = core::DryAligner::storageFor (2, 1, 0);
+            auto a = std::make_unique<core::DryAligner>();
+            const long long before = g_bytes.load();
+            a->prepare (2, 1, 0);
+            const long long got = g_bytes.load() - before;
+            if (got != (long long) st.bytes()) ++off;
+        }
+        ok (off == 0, "each stage's own budget is what preparing it directly allocates, at the arguments its "
+                      "OWN clamps live at (" + std::to_string (off) + " off)");
+    }
+
+    // AND THE CLAMPS ARE PINNED AGAINST A PROPERTY, NOT AGAINST THE ALLOCATION — which is the one thing the
+    // byte-for-byte checks above CANNOT do. `prepare()` now sizes itself THROUGH `storageFor`, so a mutation
+    // inside that function moves the budget and the allocation together and the comparison stays green: the
+    // stand proved it, with three clamps removed one at a time and the whole suite still passing. What a
+    // clamp needs is an independent statement about itself, and idempotence past the bound is the natural
+    // one: beyond the clamp the answer must stop moving.
+    {
+        limiter::TruePeakLimiterConfig lc;
+        limiter::TruePeakLimiter::Storage cap1 {}, cap2 {};
+        const bool a1 = limiter::TruePeakLimiter::storageFor (48000.0, 1 << 20, 2, lc, cap1);
+        const bool a2 = limiter::TruePeakLimiter::storageFor (48000.0, 1 << 24, 2, lc, cap2);
+        ok (a1 && a2 && cap1.bytes() == cap2.bytes() && cap1.osBufSamples == cap2.osBufSamples,
+            "the limiter's scratch stops growing at its block cap: a 16x bigger block is the same budget ("
+            + std::to_string (cap1.bytes()) + " B vs " + std::to_string (cap2.bytes()) + " B)");
+
+        oversampling::PolyphaseOversampler::Storage w1 {}, w2 {};
+        const bool b1 = oversampling::PolyphaseOversampler::storageFor (4, core::kMaxChannels, 64, w1);
+        const bool b2 = oversampling::PolyphaseOversampler::storageFor (4, core::kMaxChannels + 8, 64, w2);
+        ok (b1 && b2 && w1.bytes() == w2.bytes(),
+            "the oversampler's width stops at kMaxChannels, which is what its prepare() CLAMPS to (P55: that "
+            "clamp should be a refusal, and until it is, the budget has to describe the clamp)");
+
+        // The two smallest published clamps, which no chain reaches and which therefore had no gate at all
+        // until the fix round asked for them: a negative delay is a ring of one slot, and a window under one
+        // is a window of one. Both are what their `prepare()` does, and both are stated in `storageFor`.
+        ok (core::DelayLine::storageFor (-1).samples == 1 && core::DelayLine::storageFor (-1000).samples == 1
+            && core::DelayLine::storageFor (0).samples == 1,
+            "a negative delay budgets the one slot prepare() gives it");
+        ok (limiter::detail::SlidingMax::storageFor (0).entries == 1
+            && limiter::detail::SlidingMax::storageFor (-5).entries == 1,
+            "a window under one budgets the one entry prepare() gives it");
+
+        const core::DryAligner::Storage f0 = core::DryAligner::storageFor (2, 0, 0);
+        const core::DryAligner::Storage f1 = core::DryAligner::storageFor (2, 1, 2);
+        ok (f0.bytes() == f1.bytes() && f0.ring == 4 && f0.scratch == 2,
+            "the aligner's floors are floors: a capacity of 0 budgets the 2 slots it will be given, and a "
+            "block of 0 the 1 sample (" + std::to_string (f0.bytes()) + " B)");
+    }
+
+    // THE DELAY BANK LEAVES WHAT THE `assign` IT REPLACED LEFT. The old form built every line fresh, so a
+    // re-prepared bank had no tap; the helper re-uses the lines, and a tap that outlived a SHRINKING
+    // preparation used to index before the start of the ring (the code-review round found it, and the
+    // invariant it breaks predates this work: `prepare(8); setDelay(8); prepare(2)` on a bare DelayLine).
+    {
+        std::vector<core::DelayLine> bank;
+        core::prepareDelayBank (bank, 2, 8);
+        bank[0].setDelay (8);
+        core::prepareDelayBank (bank, 1, 2);
+        ok (bank.size() == 1 && bank[0].capacity() == 2 && bank[0].delay() == 0,
+            "a shrunk bank has the capacity asked for and NO tap, as a freshly built one does");
+        core::DelayLine d;
+        d.prepare (8);
+        d.setDelay (8);
+        d.prepare (2);
+        ok (d.delay() <= d.capacity(), "and a bare line's tap is re-clamped into the capacity it was re-prepared at");
+        float last = 0.0f;
+        for (int i = 0; i < 16; ++i) last = d.process ((float) (i + 1));
+        ok (std::isfinite (last), "PRECONDITION: reading it afterwards stays inside the ring");
+    }
+
+    // A REFUSED PREPARATION ALLOCATES NOTHING — the whole point of `admits()` being ahead of the first
+    // buffer. Each of these used to cost between 51 288 and 394 456 bytes on its way to `false` at this
+    // geometry, and up to 1 668 312 at sixteen channels and an 8192-sample quantum.
+    {
+        struct Case { const char* name; double fs; int nch; mastering::MasteringChainConfig cfg; };
+        std::vector<Case> cases;
+        auto push = [&cases] (const char* n, double fs, int nch, mastering::MasteringChainConfig c)
+        { cases.push_back (Case { n, fs, nch, c }); };
+        mastering::MasteringChainConfig d;
+        push ("a 20 Hz rate", 20.0, 2, d);
+        push ("a rate of zero", 0.0, 2, d);
+        push ("a NaN rate", std::numeric_limits<double>::quiet_NaN(), 2, d);
+        { auto c = d; c.compressorLookaheadMs = 300.0; push ("a lookahead past the compressor's 250 ms", 48000.0, 2, c); }
+        { auto c = d; c.tapsPerPhase = 2000;           push ("more taps than the oversampler designs", 48000.0, 2, c); }
+        { auto c = d; c.oversampleFactor = 32;         push ("a factor past the limiter's 16", 48000.0, 2, c); }
+        { auto c = d; c.monoBass = true;               push ("mono-bass on a mono chain", 48000.0, 1, c); }
+        { auto c = d; c.internalBlock = 4;             push ("a quantum under the floor", 48000.0, 2, c); }
+        int leaked = 0, admitted = 0;
+        for (const Case& cs : cases)
+        {
+            auto chain = std::make_unique<mastering::MasteringChain> ();
+            if (mastering::MasteringChain::admits (cs.fs, cs.nch, cs.cfg)) ++admitted;
+            const long long before = g_bytes.load();
+            const bool prepared = chain->prepare (cs.fs, cs.nch, cs.cfg);
+            const long long got = g_bytes.load() - before;
+            if (prepared || got != 0) ++leaked;
+        }
+        ok (admitted == 0, "PRECONDITION: every case above is one admits() refuses");
+        ok (leaked == 0, "a refused prepare() allocates nothing, on all " + std::to_string (cases.size())
+                         + " refusals (" + std::to_string (leaked) + " leaked)");
+    }
+
+    // THE STAGES' OWN STATICS, against prepared stages. This is what makes the chain's aligner sizing and
+    // its budget the same arithmetic the stage runs rather than a copy of it.
+    {
+        int off = 0;
+        for (const double fs : { 44100.0, 48000.0, 192000.0 })
+            for (const double look : { 0.0, 1.0, 10.0, 100.0, 250.0 })
+            {
+                dynamics::Compressor c;
+                const double maxLook = std::max (look, 1.0);
+                if (! c.prepare (fs, 256, 2, maxLook)) { ++off; continue; }
+                dynamics::CompressorParams cp; cp.lookaheadMs = look; c.setParams (cp);
+                if (c.latencySamples() != dynamics::Compressor::latencyFor (fs, 256, 2, maxLook, look)) ++off;
+
+                limiter::TruePeakLimiterConfig lc; lc.lookaheadMs = look > 20.0 ? 20.0 : look;
+                limiter::TruePeakLimiter l;
+                if (! l.prepare (fs, 256, 2, lc)) { ++off; continue; }
+                if (l.latencySamples() != limiter::TruePeakLimiter::latencyFor (fs, 256, 2, lc)) ++off;
+                if (l.oversampleFactor() != limiter::TruePeakLimiter::oversampleFactorFor (lc)) ++off;
+
+                // EVERY FACTOR, the ones BELOW two included: the saturator's own domain has a second half
+                // where the oversampler is not built at all and the latency is 0 whatever the taps say. The
+                // chain never asks for it (its `admits` requires a factor of 2 or more), so nothing else in
+                // this suite reaches it — measured on the stand, a `latencyFor` that ignored the factor
+                // entirely and answered `tpp - 1` survived the whole suite.
+                for (const int f : { -1, 0, 1, 2, 4, 16 })
+                {
+                    saturation::Saturator sat;
+                    if (! sat.prepare (fs, 256, 2, f, 64)) { ++off; continue; }
+                    if (sat.latencySamples() != saturation::Saturator::latencyFor (fs, 256, 2, f, 64)) ++off;
+                }
+            }
+        ok (off == 0, "every stage's latencyFor() is the latency the prepared stage reports ("
+                      + std::to_string (off) + " off)");
+    }
+}
+
+//==============================================================================
+// P41 — THE EQ ENGINE IS REUSED, AND THAT IS BIT-IDENTICAL. `prepare()` used to build a second 331 KiB
+// engine before releasing the first; it now re-prepares the one it has. The argument that this is safe is
+// the engine's own (`EqBand::reset()` is defined as "the state prepare() leaves it in", and the chain
+// rewrites every band straight after), but an argument is not a proof: this renders the same programme
+// through a chain prepared ONCE and through a chain prepared THREE times, with parameters written in
+// between, and nulls them sample by sample. Before the change the second chain got a brand-new engine
+// every time, so a difference here is exactly the reuse being wrong.
+void testEqEngineReuseIsBitIdentical()
+{
+    group ("P41: re-preparing reuses the EQ engine and the audio does not move");
+    constexpr int nch = 2, n = 4096;
+    const Buf x = burstThenSilence (nch, n, 900);
+
+    mastering::MasteringChainParams pa;          // a parameter set that really drives the EQ
+    pa.eqBands[0].on = true;  pa.eqBands[0].lane (eq::Lane::Stereo).gainDb = 6.0;
+    pa.eqBands[0].lane (eq::Lane::Stereo).freq = 120.0;
+    pa.eqBands[3].on = true;  pa.eqBands[3].lane (eq::Lane::Stereo).gainDb = -4.5;
+    pa.eqBands[3].lane (eq::Lane::Stereo).freq = 3200.0;
+    pa.eqBands[5].on = true;  pa.eqBands[5].type = eq::FilterType::HighShelf;
+    pa.eqBands[5].lane (eq::Lane::Stereo).gainDb = 2.5;
+    pa.eqBands[5].lane (eq::Lane::Stereo).freq = 8000.0;
+
+    // A DIFFERENT set for the chain that is re-prepared — and it MOVES THE FILTER TYPE on every band it
+    // touches, because the type is the one parameter a re-preparation carries into the next one:
+    // `EqBand::prepare()` seeds `lastType_` from the params the band is STILL HOLDING, and the first
+    // `setParams()` after a preparation takes the uninitialised branch, which does not touch it. So the
+    // `typeChanged` edge inside `updateCoeffs()` sees a different previous type in a re-used engine than in
+    // a fresh one, and if that edge cleared anything `clearAudioState()` does not already clear, the two
+    // would diverge. Without a type change in this fixture the null below would be blind to exactly that.
+    mastering::MasteringChainParams pb = pa;
+    pb.eqBands[0].type = eq::FilterType::LowShelf;
+    pb.eqBands[0].lane (eq::Lane::Stereo).gainDb = -9.0;
+    pb.eqBands[3].type = eq::FilterType::Notch;
+    pb.eqBands[3].swept = true;
+    pb.eqBands[5].type = eq::FilterType::HighPass;
+    pb.eqBands[5].bypass = true;
+    pb.eqBands[7].on = true;  pb.eqBands[7].type = eq::FilterType::Tilt;
+    pb.eqBands[7].lane (eq::Lane::Stereo).gainDb = 3.0;
+    pb.eqBands[9].on = true;  pb.eqBands[9].type = eq::FilterType::BandPass;
+    pb.eqBands[9].lane (eq::Lane::Mid).on = true;          // a lane the first set never enabled
+    pb.eqBands[9].lane (eq::Lane::Mid).freq = 600.0;
+    pb.eqBands[9].dyn.on = true;                           // and the dynamic layer, whose seams are state
+
+    for (const int topo : { 0, 1, 2 })
+    {
+        mastering::MasteringChainConfig cfg;
+        if (topo == 1) { cfg.clipper = true; cfg.sidechainHpfHz = 80.0; }
+        // TOPOLOGY 2 IS THE EQ ALONE, and it is the one that actually gates the claim: with a compressor, a
+        // limiter and a 24-bit dither downstream, a small difference in the EQ's tail can be quantised away
+        // before the float bits are compared, so a null over the full chain is weaker than it looks. Here
+        // nothing stands between the engine and the comparison. (The diverse-testing round.)
+        if (topo == 2) { cfg.compressor = false; cfg.limiter = false; cfg.dither = false; }
+
+        // AND THE FIXTURE IS LIVE: these settings have to MOVE the programme, or the null below would hold
+        // just as well over an EQ that did nothing at all.
+        {
+            Buf lit = x;
+            mastering::MasteringChain probe;
+            ok (probe.prepare (48000.0, nch, cfg), "PRECONDITION: a chain for topology " + std::to_string (topo));
+            mastering::MasteringChainParams flat = pa;
+            flat.bypassEq = true;
+            probe.setParams (flat);
+            { auto q = planes (lit); felitronics::test::run (probe.process (q.data(), nch, n)); }
+            Buf eqd = x;
+            mastering::MasteringChain probe2;
+            ok (probe2.prepare (48000.0, nch, cfg), "PRECONDITION: and its twin");
+            probe2.setParams (pa);
+            { auto q = planes (eqd); felitronics::test::run (probe2.process (q.data(), nch, n)); }
+            ok (! bitEqual (lit, eqd), "PRECONDITION: the EQ settings really move the programme, topology "
+                                       + std::to_string (topo));
+        }
+
+        Buf once = x;
+        mastering::MasteringChain a;
+        ok (a.prepare (48000.0, nch, cfg), "PRECONDITION: a chain prepared once");
+        a.setParams (pa);
+        { auto p = planes (once); felitronics::test::run (a.process (p.data(), nch, n)); }
+
+        Buf thrice = x;
+        mastering::MasteringChain b;
+        ok (b.prepare (48000.0, nch, cfg), "PRECONDITION: a chain prepared, ...");
+        b.setParams (pb);                                   // a parameter epoch that must not survive
+        { Buf junk = x; auto p = planes (junk); felitronics::test::run (b.process (p.data(), nch, 512)); }
+        ok (b.prepare (48000.0, nch, cfg), "... re-prepared after audio, ...");
+        b.setParams (pb);
+        { Buf junk = x; auto p = planes (junk); felitronics::test::run (b.process (p.data(), nch, 777)); }
+        ok (b.prepare (48000.0, nch, cfg), "... and re-prepared again");
+        b.setParams (pa);                                   // the same set the first chain ran
+        { auto p = planes (thrice); felitronics::test::run (b.process (p.data(), nch, n)); }
+
+        ok (bitEqual (once, thrice),
+            "a chain prepared three times renders bit-identically to one prepared once, topology "
+            + std::to_string (topo) + " (first difference at sample " + std::to_string (firstDiff (once, thrice)) + ")");
+    }
+
+    // AND THE GEOMETRY MUST MOVE, or the null proves less than it looks. Every preparation above is at the
+    // same rate, width and quantum, and a re-used engine that is NEVER RE-PREPARED still answers correctly
+    // there — the chain's `applyParams()` and `reset()` restore everything that matters at ONE geometry.
+    // Measured: a mutant that reached for the engine and skipped `eq_->prepare()` on re-use left the whole
+    // suite green until this row. Here the second chain is re-prepared at a DIFFERENT rate and quantum, so a
+    // stale engine is one designed for the wrong sample rate and the null says so.
+    {
+        constexpr double fsA = 48000.0, fsB = 96000.0;
+        mastering::MasteringChainConfig ca;                  // the geometry it starts at
+        mastering::MasteringChainConfig cb;                  // and the one it is moved to
+        cb.internalBlock = 512;
+        const Buf xb = burstThenSilence (nch, n, 900, 777u);
+
+        Buf direct = xb;
+        mastering::MasteringChain fresh;
+        ok (fresh.prepare (fsB, nch, cb), "PRECONDITION: a chain built straight at the second geometry");
+        fresh.setParams (pa);
+        { auto q = planes (direct); felitronics::test::run (fresh.process (q.data(), nch, n)); }
+
+        Buf moved = xb;
+        mastering::MasteringChain mover;
+        ok (mover.prepare (fsA, nch, ca), "PRECONDITION: and one that starts at the first, ...");
+        mover.setParams (pb);
+        { Buf junk = xb; auto q = planes (junk); felitronics::test::run (mover.process (q.data(), nch, 640)); }
+        ok (mover.prepare (fsB, nch, cb), "... then moves to the second");
+        mover.setParams (pa);
+        { auto q = planes (moved); felitronics::test::run (mover.process (q.data(), nch, n)); }
+
+        ok (bitEqual (direct, moved),
+            "a chain MOVED to another rate and quantum renders bit-identically to one built there (first "
+            "difference at sample " + std::to_string (firstDiff (direct, moved)) + ")");
+    }
+
+    // AND THE ENGINE REALLY IS THE SAME OBJECT — otherwise the null above would be proving nothing about
+    // the reuse, only about the engine being deterministic. A re-preparation that rebuilt it would have to
+    // ask the heap for `objectBytes()`; this asks for nothing at all.
+    {
+        mastering::MasteringChainConfig cfg;
+        auto chain = std::make_unique<mastering::MasteringChain>();
+        ok (chain->prepare (48000.0, 2, cfg), "PRECONDITION: prepared with an EQ");
+        const long long before = g_bytes.load();
+        const bool again = chain->prepare (48000.0, 2, cfg);
+        const long long got = g_bytes.load() - before;
+        ok (again && got == 0, "re-preparing asks the heap for nothing at all, engine included (read "
+                               + std::to_string (got) + " B)");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::mastering — chain acceptance\n");
@@ -1139,5 +1755,7 @@ int main()
     testParamsWrittenBeforePrepare();
     testMonoBassParams();
     testGateCountsItsSubstitutions();
+    testDemand();
+    testEqEngineReuseIsBitIdentical();
     return felitronics::test::report();
 }

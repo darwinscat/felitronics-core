@@ -290,13 +290,96 @@ public:
     static constexpr double kMaxSampleRate    = 3.0e6;
     static constexpr double kMaxGainDb        = 60.0;    // both gain nodes; beyond this is not a trim
 
-    // Returns false and leaves the chain UNPREPARED on anything it cannot honour. A false return is
-    // the only way to learn that, so check it. Spelled positively so a NaN fails: two of the stages
-    // below accept a NaN sample rate through `sampleRate <= 0.0` and go on to emit NaN, so the chain
-    // validates once, here, rather than trusting them.
-    [[nodiscard]] bool prepare (double sampleRate, int numChannels, const MasteringChainConfig& config = {})
+    //==========================================================================================================
+    // THE GEOMETRY, DECIDED WITHOUT BUILDING IT (law 11d)
+    //
+    // Every refusal `prepare()` can reach and every byte it will ask the heap for, computed in one pass and
+    // WITHOUT A SINGLE ALLOCATION — through each stage's own `storageFor`, so a stage that changes what it
+    // refuses or what it allocates changes this with it and the two cannot drift.
+    //
+    // WHY IT EXISTS: a C-ABI facade's `create` used to build the instance, prepare the renderer and let the
+    // chain allocate its way down to the first stage that refused — measured on a stereo 48 kHz default,
+    // 392 408 bytes asked for and handed back on a 20 Hz rate and 394 456 on a 300 ms compressor lookahead,
+    // and 1 668 312 for that same lookahead at sixteen channels and an 8192-sample quantum, since the cost
+    // scales with the geometry. On a tier where a failed allocation is not a refusal at all but the end of
+    // the module (law 11d). `admits()` is what lets that
+    // call refuse before it has touched the heap.
+    //
+    // THE COMPRESSOR'S AND THE LIMITER'S LATENCIES ARE IN HERE TOO, because the dry aligners are sized by
+    // them and the aligners are most of the chain's own storage. They are the stages' own statics, not a
+    // second derivation — see the note at `latency_` below on why deriving them here would be a defect.
+    struct Storage
     {
-        prepared_ = false;                                     // any early return leaves it unprepared
+        std::size_t fifo = 0, keyBuf = 0;              // floats — the quantum FIFO and the key-filter copy
+        bool eq = false, clipper = false, limiter = false;
+        eq::EqEngine::Storage             eqScratch {};
+        dynamics::Compressor::Storage     comp {};
+        saturation::Saturator::Storage    clip {};
+        limiter::TruePeakLimiter::Storage lim {};
+        core::DryAligner::Storage         alignClip {}, alignLim {};
+        int compressorLatency = 0, clipperLatency = 0, limiterLatency = 0;
+        int latencySamples = 0;                        // K + the three above, exactly as prepare() sums it
+        int tapOversampleFactor = 1;                   // the limiter's EFFECTIVE factor, 1 without a limiter
+
+        // REQUESTED bytes, on a FRESH chain: every container is empty, so each `assign` asks for exactly its
+        // size. What a chain that is already prepared asks for is `reprepareBytes()` below — a different
+        // question with a different answer.
+        std::uint64_t bytes() const noexcept
+        {
+            std::uint64_t b = (std::uint64_t) sizeof (float) * ((std::uint64_t) fifo + (std::uint64_t) keyBuf);
+            if (eq)      b += eq::EqEngine::objectBytes() + eqScratch.bytes();
+            b += comp.bytes();
+            if (clipper) b += clip.bytes() + alignClip.bytes();
+            if (limiter) b += lim.bytes()  + alignLim.bytes();
+            return b;                                  // MonoBass and Dither allocate nothing — measured
+        }
+
+        // Does a chain holding `other` already have room for this? Every count, conservatively: `assign`
+        // asks the heap for nothing when the container is already at least this long.
+        bool fitsWithin (const Storage& other) const noexcept
+        {
+            return fifo <= other.fifo && keyBuf <= other.keyBuf
+                && eq == other.eq && clipper == other.clipper && limiter == other.limiter
+                && eqScratch.scratch <= other.eqScratch.scratch
+                && comp.lines <= other.comp.lines && comp.maxLookSamples <= other.comp.maxLookSamples
+                && clip.osBuf <= other.clip.osBuf && clip.wetBuf <= other.clip.wetBuf
+                && clip.ptrs <= other.clip.ptrs && clip.dc <= other.clip.dc
+                && clip.dryLines <= other.clip.dryLines && clip.dryDelaySamples <= other.clip.dryDelaySamples
+                && clip.os.proto <= other.clip.os.proto && clip.os.upHist <= other.clip.os.upHist
+                && clip.os.downHist <= other.clip.os.downHist && clip.os.upPos <= other.clip.os.upPos
+                && lim.channels <= other.lim.channels && lim.osBufSamples <= other.lim.osBufSamples
+                && lim.osDelaySamples <= other.lim.osDelaySamples
+                && lim.slide.entries <= other.lim.slide.entries
+                && lim.os.proto <= other.lim.os.proto && lim.os.upHist <= other.lim.os.upHist
+                && lim.os.downHist <= other.lim.os.downHist && lim.os.upPos <= other.lim.os.upPos
+                && alignClip.ring <= other.alignClip.ring && alignClip.scratch <= other.alignClip.scratch
+                && alignLim.ring <= other.alignLim.ring && alignLim.scratch <= other.alignLim.scratch;
+        }
+    };
+
+    // The limiter's topology, read off the chain's config in ONE place — `prepare()`, the budget and
+    // `tapOversampleFactorFor()` all ask the limiter the same question with the same argument.
+    static limiter::TruePeakLimiterConfig limiterConfigFor (const MasteringChainConfig& config) noexcept
+    {
+        limiter::TruePeakLimiterConfig lc;
+        lc.lookaheadMs      = config.limiterLookaheadMs;
+        lc.oversampleFactor = config.oversampleFactor;
+        lc.tapsPerPhase     = config.tapsPerPhase;
+        return lc;
+    }
+
+    // The stride of the OVERSAMPLED taps this config will run at, without a prepared chain — the same
+    // number `tapOversampleFactor()` reports afterwards. A solver sizes its tap buffers by it.
+    static int tapOversampleFactorFor (const MasteringChainConfig& config) noexcept
+    {
+        return config.limiter ? limiter::TruePeakLimiter::oversampleFactorFor (limiterConfigFor (config)) : 1;
+    }
+
+    // FALSE, with `out` untouched, exactly where prepare() refuses the same arguments — it IS prepare()'s
+    // gate, and every stage's gate under it. Allocates nothing on any path.
+    [[nodiscard]] static bool storageFor (double sampleRate, int numChannels,
+                                          const MasteringChainConfig& config, Storage& out) noexcept
+    {
         if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || sampleRate > kMaxSampleRate) return false;
         if (numChannels < 1 || numChannels > core::kMaxChannels) return false;
         if (config.internalBlock < kMinInternalBlock || config.internalBlock > kMaxInternalBlock) return false;
@@ -307,8 +390,138 @@ public:
             || config.sidechainHpfHz >= 0.5 * sampleRate) return false;
         // REFUSED, not silently ignored. `stereo::MonoBass` leaves a non-stereo buffer untouched, so a
         // mono chain that reported this stage as enabled would be reporting a stage that does nothing —
-        // the class of silent no-op this plan keeps closing.
+        // the class of silent no-op this plan keeps closing. It is also the whole of MonoBass's own gate
+        // (it refuses a width outside [1, 2] and nothing else), so no stage check is missing below.
         if (config.monoBass && numChannels != 2) return false;
+
+        const int K = config.internalBlock;
+        Storage st;
+        st.fifo = (std::size_t) K * (std::size_t) numChannels;
+
+        st.eq = config.eq;
+        if (config.eq && ! eq::EqEngine::storageFor (sampleRate, K, numChannels, st.eqScratch)) return false;
+
+        // maxLookaheadMs is what sizes the ring, so it must be at least what the config asks for —
+        // otherwise the compressor CLAMPS the lookahead and reports a latency smaller than the one this
+        // chain would have computed. Same expression as prepare()'s call, because it IS that call's
+        // argument. A lookahead past the compressor's own 250 ms ceiling is refused HERE now: it used to
+        // be refused by `Compressor::prepare`, after the FIFO and the EQ engine had been allocated.
+        if (config.compressor)
+        {
+            const double maxLook = std::max (config.compressorLookaheadMs, 1.0);
+            if (! dynamics::Compressor::storageFor (sampleRate, K, numChannels, maxLook, st.comp)) return false;
+            st.compressorLatency = dynamics::Compressor::latencyFor (sampleRate, K, numChannels, maxLook,
+                                                                     config.compressorLookaheadMs);
+        }
+
+        st.clipper = config.clipper;
+        if (config.clipper)
+        {
+            if (! saturation::Saturator::storageFor (sampleRate, K, numChannels, config.oversampleFactor,
+                                                     config.tapsPerPhase, st.clip)) return false;
+            st.clipperLatency = st.clip.dryDelaySamples;
+            st.alignClip = core::DryAligner::storageFor (numChannels, K, st.clipperLatency + 2);
+        }
+
+        st.limiter = config.limiter;
+        if (config.limiter)
+        {
+            const limiter::TruePeakLimiterConfig lc = limiterConfigFor (config);
+            if (! limiter::TruePeakLimiter::storageFor (sampleRate, K, numChannels, lc, st.lim)) return false;
+            st.limiterLatency = limiter::TruePeakLimiter::latencyFor (sampleRate, K, numChannels, lc);
+            st.alignLim = core::DryAligner::storageFor (numChannels, K, st.limiterLatency + 2);
+        }
+        // Dither refuses a width outside [1, kMaxChannels] and nothing else — already checked above.
+
+        if (config.sidechainHpfHz > 0.0) st.keyBuf = (std::size_t) K * (std::size_t) numChannels;
+
+        st.latencySamples      = K + st.compressorLatency + st.clipperLatency + st.limiterLatency;
+        st.tapOversampleFactor = tapOversampleFactorFor (config);
+        out = st;
+        return true;
+    }
+
+    // WILL prepare() SUCCEED, and can the answer be had for nothing? Both: this allocates nothing on any
+    // path, which is the only reason a `create` on the C ABI can refuse an impossible geometry without
+    // first asking the heap for a third of a megabyte.
+    [[nodiscard]] static bool admits (double sampleRate, int numChannels,
+                                      const MasteringChainConfig& config) noexcept
+    {
+        Storage st;
+        return storageFor (sampleRate, numChannels, config, st);
+    }
+
+    // What a FRESH chain's prepare() asks the heap for. 0 where it refuses — such a call now allocates
+    // nothing, which is what `admits()` ahead of the first allocation buys.
+    static std::uint64_t prepareBytes (double sampleRate, int numChannels,
+                                       const MasteringChainConfig& config) noexcept
+    {
+        Storage st;
+        return storageFor (sampleRate, numChannels, config, st) ? st.bytes() : 0u;
+    }
+
+    // WHAT CONSTRUCTING A CHAIN COSTS, before any preparation: the two dry aligners, which are held BY
+    // VALUE and whose default state is a 2-slot ring and a 1-sample scratch. It is also the ONE place in
+    // this chain where a sum of requests exceeds what is held at once — `prepare()` replaces those seeds
+    // for a topology that uses them, so each aligner it re-sizes hands 12 bytes back. Stated, because a
+    // budget that is an upper bound has to say where it is not tight.
+    static constexpr std::uint64_t constructBytes() noexcept { return 2u * core::DryAligner::constructBytes(); }
+
+    // WHAT RE-PREPARING **THIS** CHAIN ASKS FOR — nothing, when the geometry it already holds covers the
+    // one being asked for, and that is the case the C ABI's `configure` is: it re-prepares at the handle's
+    // own rate, width and config. Every container is `assign`ed to a length it already has, and the EQ
+    // engine is REUSED rather than rebuilt (see prepare()), so the answer is exactly zero rather than
+    // nearly zero.
+    //
+    // Otherwise the FRESH SUM, which bounds what this chain will ask its containers for — not what they
+    // will then ask the allocator. A container that has to grow applies its own growth policy on top, and
+    // that is the margin law 11d leaves to the caller: measured on MSVC's STL, a 48-float buffer asked to
+    // hold 68 requests 72, because `assign` past the capacity grows by half. libc++ requests exactly 68.
+    // The FRESH case has no such step — every container starts empty and is asked for its size once — which
+    // is why `prepareBytes()` is exact, byte for byte, on every row of the matrix and this one is a bound.
+    //
+    // AND IT IS A BOUND IN THE OTHER DIRECTION TOO, deliberately: `fitsWithin` compares the geometry this
+    // chain was last PREPARED at, not the capacities its stages kept, because a stage does not publish what
+    // it holds. So a chain re-prepared SMALLER and then grown back inside storage it never gave up is told
+    // the fresh sum where the truth is 0 — safe (nobody over-commits by reading it), and the one direction
+    // a budget may be wrong in. The chain's own two buffers are asked directly, which is as far as this
+    // object can see.
+    [[nodiscard]] std::uint64_t reprepareBytes (double sampleRate, int numChannels,
+                                                const MasteringChainConfig& config) const noexcept
+    {
+        Storage want;
+        if (! storageFor (sampleRate, numChannels, config, want)) return 0u;   // a refused prepare() allocates nothing
+        Storage have;
+        if (! prepared_ || ! storageFor (fs_, nch_, cfg_, have)) return want.bytes();
+        if (want.eq && eq_ == nullptr) return want.bytes();                    // the engine is not there to reuse
+        // THE CHAIN'S OWN CONTAINERS ARE ASKED, not inferred from the geometry it remembers. `prepared_` and
+        // the scalars are not evidence that the storage is still there: a MOVED-FROM chain keeps both and
+        // has given its buffers away, and the budget then answered 0 for a preparation that really allocated
+        // (measured: 512 B). The FIFO is the sentinel — it is the one buffer every prepared chain holds, so
+        // an emptied one means the rest went with it. (The code-review round.)
+        //
+        // CAPACITY, not size: a vector asked for less than it holds keeps the block, so what decides whether
+        // the next `assign` reaches the heap is what it can hold. `size()` here made the answer a FALSE
+        // NON-ZERO — 424 596 B published for a preparation that asked 0 — the moment a chain had been
+        // re-prepared smaller and was growing back inside storage it never gave up. (The fix round.)
+        if (fifo_.capacity() < want.fifo || keyBuf_.capacity() < want.keyBuf) return want.bytes();
+        return want.fitsWithin (have) ? 0u : want.bytes();
+    }
+
+    // Returns false and leaves the chain UNPREPARED on anything it cannot honour. A false return is
+    // the only way to learn that, so check it. Spelled positively so a NaN fails: two of the stages
+    // below accept a NaN sample rate through `sampleRate <= 0.0` and go on to emit NaN, so the chain
+    // validates once, here, rather than trusting them.
+    //
+    // LAW 11(b), AND LAW 11(d) WITH IT: the whole verdict is reached by `storageFor()` BEFORE the first
+    // allocation, so a refused preparation has not touched the heap and a caller can have that verdict for
+    // free through `admits()`. It used to validate its own arguments here and then discover a stage's
+    // refusal several allocations in.
+    [[nodiscard]] bool prepare (double sampleRate, int numChannels, const MasteringChainConfig& config = {})
+    {
+        prepared_ = false;                                     // any early return leaves it unprepared
+        Storage st;
+        if (! storageFor (sampleRate, numChannels, config, st)) return false;
 
         cfg_ = config;
         fs_  = sampleRate;
@@ -317,14 +530,34 @@ public:
 
         // One buffer, not two: process() SWAPS the caller's samples with the quantum buffer, so the
         // slot a sample is read from is the slot the next input goes into. Latency is exactly K.
-        fifo_.assign ((std::size_t) K_ * (std::size_t) nch_, 0.0f);
+        fifo_.assign (st.fifo, 0.0f);
         pos_ = 0;
 
+        // EVERY STAGE REFUSAL BELOW IS ALREADY ANSWERED — `storageFor()` ran each stage's own gate before
+        // the line above, so none of these `return false`s is reachable from here (pinned: `admits()` and
+        // `prepare()` agree on the whole geometry matrix). They stay because a stage that grows a new
+        // refusal should fail loudly rather than silently outrun its budget.
         if (cfg_.eq)
         {
-            eq_ = std::make_unique<eq::EqEngine>();
+            // REUSED, NOT REBUILT. `eq_ = std::make_unique<eq::EqEngine>()` built a second 331 KiB engine
+            // before the first was destroyed: a transient peak bigger than everything else this call asks
+            // for put together, and the whole reason a re-preparation at an unchanged geometry asked the
+            // heap for 345 224 bytes where nothing at all was needed. The reuse is BIT-IDENTICAL rather
+            // than approximately so, and the argument is the engine's own: `EqBand::reset()` is defined as
+            // "the band is left in exactly the state prepare() leaves it in", `EqEngine::prepare()` calls
+            // it for every band, and the chain's `applyParams()` below rewrites every band's parameters
+            // into a band whose `initialized` flag that reset has just cleared — so the first write after a
+            // preparation SNAPS, exactly as it does into a fresh engine. Proven by null, not by reading:
+            // two renders, one through a chain prepared once and one through a chain prepared twice, agree
+            // sample for sample (MasteringChainTests).
+            //
+            // AND IT KEEPS THE ENGINE'S SCRATCH TOO, which a rebuild used to hand back: a chain moved from
+            // an 8192-sample quantum to a 256-sample one asked for 341 120 B before and asks for 0 now, and
+            // holds 63 488 B more for it. That is the same trade `core::prepareDelayBank` makes and the same
+            // one law 11d's budgets are stated over ("one already prepared keeps storage that still fits");
+            // a caller that must give a large geometry back destroys the chain rather than re-preparing it.
+            if (! eq_) eq_ = std::make_unique<eq::EqEngine>();
             if (! eq_->prepare (fs_, K_, nch_)) return false;   // the EQ now refuses a rate it cannot honour
-
         }
         else eq_.reset();
 
@@ -371,7 +604,7 @@ public:
 
         if (cfg_.sidechainHpfHz > 0.0)
         {
-            keyBuf_.assign ((std::size_t) K_ * (std::size_t) nch_, 0.0f);
+            keyBuf_.assign (st.keyBuf, 0.0f);
             const eq::BiquadCoeffs hc = eq::matched::highpass (cfg_.sidechainHpfHz, fs_, 0.70710678118654752);
             for (int c = 0; c < nch_; ++c) hpf_[c].setCoeffs (hc);
         }

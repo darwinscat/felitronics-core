@@ -434,21 +434,46 @@ typedef struct fc_master_stats
 // own `sizeof`; all are forwarded field by field, never summed: the page adds what applies. REQUESTED bytes, not a promise that a heap can serve them: allocator headers,
 // alignment and fragmentation are the page's margin to keep.
 //
-// The op is a code rather than a field per call so that the calls not yet budgeted here (create, configure —
-// the chain's own storage) can join without moving this struct.
-typedef enum fc_need_op { FC_NEED_SOLVE = 0, FC_NEED_MEASURE_LRA = 1 } fc_need_op;
+// The op is a code rather than a field per call, which is how `configure` joined without moving this
+// struct — and how `create`, which has no handle to ask, gets an entry point of its own below instead.
+typedef enum fc_need_op
+{
+    FC_NEED_SOLVE       = 0,
+    FC_NEED_MEASURE_LRA = 1,
+    // The chain's own storage, re-prepared. `frames` must be 0 for this op — a re-preparation has no
+    // programme length — and anything else is FC_ERR_RANGE rather than ignored.
+    FC_NEED_CONFIGURE   = 2
+} fc_need_op;
 
 typedef struct fc_need
 {
     fc_header header;
 
-    uint64_t callBytes;           // the core's PEAK request during ONE such call. A solve builds its meters per pass
-                                  // and frees them at the pass's end, so this is one pass — plus the true-peak
-                                  // drain, which the first solve keeps (so afterwards an upper bound by that drain)
+    // What the core's own requests occupy AT ONCE during one such call. What bounds it differs by op, and
+    // saying so is law 11d's own instruction ("what each number bounds is written where it is defined"):
+    //
+    //   * SOLVE — one PASS. The search builds its meters per pass and frees them at the pass's end, so
+    //     this is one pass, plus the true-peak drain the first solve keeps (afterwards an upper bound by
+    //     exactly that drain).
+    //   * MEASURE_LRA — one meter, and 0 for a programme too short to have a range, which the call
+    //     refuses before building one.
+    //   * CREATE — the SUM of what the call requests, which is what it holds: everything a create asks
+    //     for, it keeps until the instance is destroyed. It exceeds the peak by 12 bytes for each of the
+    //     chain's two dry aligners that the topology re-sizes — the seed the aligner's constructor took
+    //     and its preparation hands back — and by nothing else.
+    //   * CONFIGURE — 0 when the chain already holds the geometry it is being re-prepared at, which is
+    //     every configure this ABI can make (the rate, the width and the config are the handle's own).
+    //     The chain re-uses its EQ engine and assigns every buffer to the length it already has, so this
+    //     is exactly zero rather than nearly zero: it used to be 345 224 bytes, a second 331 KiB EQ engine
+    //     built before the first was destroyed plus three temporaries.
+    uint64_t callBytes;
     uint64_t solverPrepareBytes;  // the search's one-time preparation — tap buffers and gain-reduction histograms —
-                                  // done lazily by the first solve, measure_lra or channel weight on the handle
-    uint64_t facadeBytes;         // this file's own object for the call: a solve's solution record; 0 for measure_lra
-    int32_t  solverPrepared;      // 1 once that preparation has happened: `solverPrepareBytes` is then already spent
+                                  // done lazily by the first solve, measure_lra or channel weight on the handle.
+                                  // NEUTRAL (0) for CREATE and CONFIGURE: neither call touches the search
+    uint64_t facadeBytes;         // this file's own object for the call: a solve's solution record, an instance
+                                  // record for CREATE; 0 for measure_lra and for CONFIGURE
+    int32_t  solverPrepared;      // 1 once that preparation has happened: `solverPrepareBytes` is then already spent.
+                                  // NEUTRAL (0) for CREATE and CONFIGURE
 } fc_need;
 
 //==============================================================================
@@ -576,8 +601,10 @@ fc_status fc_master_create (const fc_master_config* cfg, fc_master* out);
 // What is left is the order the core itself blesses: "configure, then prepare" — MasteringChain.h says
 // in as many words that this is the order a C-ABI facade takes, and `prepare()` applies the pending set
 // and then resets. So this call stores the parameters and re-prepares, which makes `resolved` exact and
-// makes N calls identical to the last one alone. It costs a reallocation (the EQ engine is 331 KiB) and
-// it is NOT real-time — it is a worker call between renders, and it says so.
+// makes N calls identical to the last one alone. It COSTS NOTHING at the heap — it used to rebuild the
+// 331 KiB EQ engine and pay 345 224 bytes to change nothing, and the chain now re-uses it and assigns every
+// buffer to the length it already has (`FC_NEED_CONFIGURE` publishes the 0, and a suite pins it). It is
+// still NOT real-time — it is a worker call between renders, and it says so.
 //
 // It is therefore REFUSED with FC_ERR_STATE once audio has been handed to this handle, because
 // re-preparing would silently discard the stream. `fc_master_reset` is how a caller gets back to the
@@ -637,8 +664,36 @@ fc_status fc_master_destroy (fc_master h);
 
 // The budget of the next such call on this handle for `frames` of programme — see fc_need. A `frames` past INT_MAX
 // is refused with FC_ERR_RANGE (the core counts in `int`), and then an `op` that is not an fc_need_op with
-// FC_ERR_ENUM — narrowing before field values, as everywhere. Reads the handle and moves nothing.
+// FC_ERR_ENUM — narrowing before field values, as everywhere. FC_NEED_CONFIGURE takes `frames == 0` and
+// refuses anything else with FC_ERR_RANGE: a re-preparation has no programme length, and an ignored
+// argument is an argument a caller can be wrong about for ever. Reads the handle and moves nothing.
+//
+// IT ANSWERS A NUMBER, NEVER A PERMISSION. The handle's own state is not consulted: a solve is budgeted
+// while a stream is in progress even though `fc_master_solve` would refuse it with FC_ERR_STATE, and so is
+// a configure. That is deliberate — the cost of a call does not depend on the moment it is made, and a page
+// deciding whether to reset a stream and re-configure needs the number precisely when the call would be
+// refused. Everything this entry point is asked about belongs to a handle whose geometry was admitted at
+// `fc_master_create`, so there is nothing here that could be inadmissible. `fc_master_need_create` below is
+// the opposite case and behaves the opposite way.
 fc_status fc_master_need (fc_master h, int32_t op, uint32_t frames, fc_need* out);
+
+// THE BUDGET OF A `fc_master_create` THAT HAS NOT HAPPENED — the one budget that cannot be asked through a
+// handle, because the handle is what the call would produce.
+//
+// IT IS A DRY RUN, and that is the difference from `fc_master_need` above: every refusal `fc_master_create`
+// can reach before its first allocation is returned HERE, with the same status — a malformed or
+// wrong-version struct, a field the mapping rejects (FC_ERR_ENUM), a width or a geometry the core will not
+// build (FC_ERR_REFUSED_BY_CORE), a handle table with no free slot (FC_ERR_EXHAUSTED). So FC_OK carries a
+// budget that is ALWAYS non-zero, and a caller never has to read "0 bytes" as three different things.
+//
+// It is also the only way to ask whether a configuration is buildable WITHOUT paying for the attempt: a
+// create refused by the core used to ask the heap for 392 408 bytes on its way to saying no on the default
+// geometry, and 1 668 312 at sixteen channels and an 8192-sample quantum, on a
+// tier where an allocation that fails is not a refusal but the end of the module (law 11d).
+//
+// `frames` does not appear: a create has no programme. The solver fields come back neutral. Allocates
+// nothing itself and touches no handle.
+fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
 
 // The input's loudness range, for the LRA constraint — which is a DELTA and therefore needs both ends.
 // Stateless by construction: it returns the number and the caller puts it into the request, so it

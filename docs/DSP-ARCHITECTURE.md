@@ -475,11 +475,35 @@ the CPU at runtime, invisible to any build. Full write-up:
      (`fc_master_need`). In 64 bits. What each number bounds is written where it is defined, because "at once" is
      not one formula: a call that keeps what it asks for is bounded by the sum of its requests, exact on a FRESH
      object (one already prepared keeps storage that still fits); a call that builds and frees per pass
-     (`TargetLoudnessSolver::solve`) by one pass. A call that refuses may have asked for part of its bound on the
-     way. REQUESTED bytes, not a promise that a heap can serve them: allocator headers, the standard library's own
-     alignment (MSVC's STL, in a release build, asks for `sizeof(void*) + 31` more on a block of 4096 bytes or
-     more), fragmentation and the runtime's growth step are the caller's margin. *(The C ABI states the solver's
-     calls today; `create` and `configure` — the chain's own storage — are not budgeted yet.)*
+     (`TargetLoudnessSolver::solve`) by one pass. REQUESTED bytes, not a promise that a heap can serve them:
+     allocator headers, the standard library's own alignment (MSVC's STL, in a release build, asks for
+     `sizeof(void*) + 31` more on a block of 4096 bytes or more), fragmentation and the runtime's growth step are
+     the caller's margin.
+
+     **THE FUNCTION THAT SIZES IS THE FUNCTION THAT VALIDATES, and that is what makes "cannot drift" a
+     construction rather than a promise.** Each allocating `prepare()` in this tree now has a static
+     `storageFor(...)` beside it that answers FALSE on exactly the arguments the preparation refuses and
+     otherwise fills in the element counts the buffers are built from — and `prepare()` calls it as its own
+     gate. A budget is that function's `bytes()`. A stage cannot change what it refuses, or what it allocates,
+     without changing both at once. Where a composite needs a stage's LATENCY to size something of its own, the
+     stage publishes a static `latencyFor(...)` on the same terms and its own `prepare()` runs through it, so the
+     number a budget reads and the number the prepared object reports are one expression.
+
+     **A CALL THAT REFUSES MAY HAVE ASKED FOR PART OF ITS BOUND ON THE WAY — except where it can be decided for
+     nothing, and then it must be.** `MasteringChain::admits()` reaches the whole verdict, every stage's included,
+     without a single allocation, so `fc_master_create` refuses an impossible geometry having touched no heap at
+     all. It used to ask for 394 456 bytes on its way to saying no on the default geometry, and 1 668 312 at
+     sixteen channels and an 8192-sample quantum — on the tier where an allocation that cannot be served is
+     not a refusal but the end of the module, which is what this law is about.
+
+     **THE DEMAND IS A NUMBER, NOT A PERMISSION.** `fc_master_need` answers what a call would REQUEST and does not
+     consult the handle's state: a solve and a configure are both budgeted while a stream is in progress, though
+     either would be refused with `FC_ERR_STATE` in that moment. The cost of a call does not depend on when it is
+     made, and a caller deciding whether to reset a stream and re-configure needs the number precisely then. The
+     one exception is the call that has no handle to ask: `fc_master_need_create` is a DRY RUN, returning every
+     status the create would return before its first allocation, because the configuration it is handed has never
+     been admitted anywhere and whether it is admissible is the question only that entry point can answer — and
+     because a budget of 0 must keep meaning one thing.
    * **A MODULE WHOSE CALL NEVER RETURNED ANSWERS EVERY STATUS CALL WITH "DISCARD ME".** The runtime does not stop a
      module that aborted; it answers the next call with objects wherever the abort left them. Measured on v0.30.0 in
      wasm32: after an abort inside `fc_master_solve`, `fc_master_process` answered `FC_OK` at the search's pass-1
@@ -492,8 +516,18 @@ the CPU at runtime, invisible to any build. Full write-up:
    Not promised: that a demand will be admitted, that anything survives exhaustion, or that a native host which
    catches `bad_alloc` holds a usable object. RT law 2 is unchanged — `process()` allocates nothing — so none of
    this reaches the audio path. Gated: the C-ABI suites pin the poison (natively, through an escaped exception) and
-   every published budget against the bytes its call requests, byte for byte, and the re-entry suite runs on the
-   wasm tier too; the abort path itself is measured, not gated.
+   every published budget against the bytes its call requests, byte for byte — over a matrix of four rates, three
+   widths and NINE topologies for the chain's own storage, every optional stage absent on some row of it (with
+   only one stage moving, a budget that charged for an EQ engine a chain never builds was green on every row),
+   with a counter that installs EVERY form of `operator
+   new`, the over-aligned one included (without it the EQ engine's 331 KiB — the largest single request a create
+   makes on the default geometry — is invisible to the counter and both sides of the comparison silently omit
+   it). The suites also pin that
+   `admits()` is `prepare()`'s own verdict, that a refused preparation allocates nothing, that every stage's
+   `latencyFor()` is the latency the prepared stage reports, and — by null, over three topologies and across a
+   chain moved to another rate and quantum — that re-preparing
+   a chain, which now re-uses its EQ engine instead of building a second one, does not move a sample. The re-entry
+   suite runs on the wasm tier too; the abort path itself is measured, not gated.
 
 
 **These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the
