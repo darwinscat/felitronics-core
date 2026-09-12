@@ -131,6 +131,30 @@ half — the one definition and its two roads; moving the site's generators and 
   stand: 31 mutants, 28 killed (the two-statement removal of the product pin only by the out-of-tree NULL); the three
   survivors are two equivalent guards and a null check whose removal is undefined behaviour only UBSan sees.
 
+### `mastering` — parallel compression: `MasteringChainParams::compressorMix` (P60)
+
+The compressor stage's output is now `(1 - mix) * dry + mix * compressed`, where `dry` is the stage's own
+input delayed by exactly the compressor's lookahead through a third `core::DryAligner`. It is the chain's
+field and not the compressor's: `dynamics::Compressor` keeps dry/wet out on purpose.
+
+- **mix = 1, the default, is the chain before the field, bit for bit.** Pinned in the suite against a bare
+  compressor and the whole hand-built chain, and measured once against a render built at `bddb303`: seven
+  scenarios, every output sample and every tap, identical. `mix = 0` is the input delayed by the lookahead,
+  bit for bit, found from the input.
+- **The blend is computed in double.** The float spelling is a multiply-add the compiler may fuse, and the
+  desktop tier builds with `-ffp-contract=on` while wasm builds with `off`: measured, the float form gives
+  different bits fused and unfused at ten of eleven mixes. In double both products are exact for
+  `mix >= 2^-6`, so every row agrees.
+- **A step at the quantum boundary, not a ramp** — the same contract as the two gain nodes. It keeps
+  blending while the compressor is bypassed: skipping it there dropped the level by the whole gain
+  reduction on the quantum the bypass engaged (20.2 dB at mix 0), and a steady bypass is bit-identical
+  either way. `compressorGrDb` is still the compressed path's gain reduction at any mix.
+- **Memory:** `4 * channels * (K + lookahead + 2)` bytes more per chain with a compressor — 2 448 B for
+  the stereo 48 kHz default. `DryAligner::Storage::freshBytes()` is new: a one-channel aligner whose ring
+  fits the constructor's seed asks for nothing, which `bytes()` over-stated by 8 B.
+- **The C ABI does not carry it yet.** It waits for the ABI's version rule (P57); every params set through
+  the ABI renders at mix 1. `tools/fc_master_abi.h` records the omission as a debt.
+
 ## v0.31.0 — 2026-09-12
 
 ### `core` · `oversampling` · `analysis` — one polyphase FIR kernel for the whole tree, and five rows that agree on its bits

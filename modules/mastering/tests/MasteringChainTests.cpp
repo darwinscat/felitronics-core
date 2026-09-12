@@ -169,7 +169,7 @@ int firstDiff (const Buf& a, const Buf& b) noexcept
 // `compressor`, `limiter` and `dither` were on in all 48 rows and `monoBass` in none. A budget that added
 // the EQ engine's 331 KiB unconditionally — for a chain that never builds one — was green on every row of
 // that matrix (found by the diverse-testing round, as a mutation that survived the whole suite).
-constexpr int kTopologies = 9;
+constexpr int kTopologies = 10;
 mastering::MasteringChainConfig topologyFor (int topo)
 {
     mastering::MasteringChainConfig c;
@@ -183,6 +183,11 @@ mastering::MasteringChainConfig topologyFor (int topo)
         case 5: c.limiter = false; break;                         // no oversampler, no aligner, tap factor 1
         case 6: c.dither = false; break;
         case 7: c.monoBass = true; break;                         // stereo only: refused at widths 1 and 16
+        case 8: c.compressorLookaheadMs = 0.0; break;             // P60: at width 1 the compressor's dry
+                                                                  // aligner's ring is 2 slots — exactly the
+                                                                  // seed its constructor took, so the ring
+                                                                  // asks for nothing (the budget over-stated
+                                                                  // it by 8 B until `freshBytes()`)
         default:                                                  // the legal maximum
             c.clipper = true; c.sidechainHpfHz = 80.0; c.internalBlock = 8192;
             c.oversampleFactor = 16; c.tapsPerPhase = 1024;
@@ -1273,8 +1278,8 @@ void testDemand()
             + std::to_string (got) + " B");
     }
 
-    // THE MATRIX. Four rates, three widths, four topologies — the default, the clipper, the key filter,
-    // and the legal maximum. `create` on the C ABI carries the same matrix; this is the core's own side.
+    // THE MATRIX. Four rates, three widths, and every topology `topologyFor` names. `create` on the C ABI
+    // carries the same matrix; this is the core's own side.
     const double rates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };
     const int    widths[] = { 1, 2, 16 };
     int rows = 0, bad = 0, badLat = 0, badAdmit = 0, badReprep = 0;
@@ -1367,6 +1372,26 @@ void testDemand()
                                           + std::to_string (bound) + " B)");
     }
     {
+        // (a') ...AND ITS ALIGNER SEEDS WENT WITH IT (P60's code-review round). A one-channel compressor
+        // whose lookahead rounds to 0 samples has a 2-slot dry ring, which a FRESH chain already holds as
+        // its constructor's seed — so the fresh budget does not count it. The moved-from chain has no seed
+        // left and asks for those 8 B, and the bound used to be the fresh sum: 2284 B published, 2292 asked.
+        mastering::MasteringChainConfig mono;
+        mono.eq = mono.limiter = mono.dither = false;
+        mono.compressorLookaheadMs = 0.0;
+        mastering::MasteringChain a;
+        ok (a.prepare (48000.0, 1, mono), "PRECONDITION: a mono compressor chain with no lookahead");
+        mastering::MasteringChain b (std::move (a));
+        const std::uint64_t bound = a.reprepareBytes (48000.0, 1, mono);     // NOLINT: the moved-from state again
+        const long long before = g_bytes.load();
+        const bool again = a.prepare (48000.0, 1, mono);
+        const long long got = g_bytes.load() - before;
+        ok (again && (std::uint64_t) got > mastering::MasteringChain::prepareBytes (48000.0, 1, mono),
+            "PRECONDITION: the moved-from chain asks for more than a fresh one (" + std::to_string (got) + " B)");
+        ok ((std::uint64_t) got <= bound, "and the bound covers the seed it no longer holds (asked "
+                                          + std::to_string (got) + " B, bound " + std::to_string (bound) + " B)");
+    }
+    {
         // (b) GEOMETRIC GROWTH. Widening the limiter's per-channel scratch bank by one used to `resize`
         // past the capacity, which doubles — so the call held two buffer objects more than the number paid
         // for, and an "upper bound" was not one. The witness is the code-review round's own: a 3-channel
@@ -1420,6 +1445,33 @@ void testDemand()
         ok (grew && got > 0, "PRECONDITION: growing only the limiter still allocates (" + std::to_string (got) + " B)");
         ok (bound > 0u, "and a stage that grows behind an unchanged FIFO is not published as free");
     }
+    {
+        // AND ONE WHERE ONLY THE COMPRESSOR'S DRY ALIGNER GROWS (P60). The compressor sizes its own ring by
+        // `max(lookahead, 1 ms)`, so a lookahead moved from 0 to 0.5 ms leaves the compressor's bank exactly
+        // where it was — and the dry aligner, sized by the latency itself, goes from a 2-slot ring to a
+        // 26-slot one. Only the aligner's own row in `fitsWithin` can see that; the stand's mutant that
+        // dropped the row was green on everything else.
+        mastering::MasteringChainConfig c1;
+        c1.compressorLookaheadMs = 0.0;
+        mastering::MasteringChainConfig c2 = c1;
+        c2.compressorLookaheadMs = 0.5;
+        mastering::MasteringChain::Storage a {}, b {};
+        (void) mastering::MasteringChain::storageFor (48000.0, 2, c1, a);
+        (void) mastering::MasteringChain::storageFor (48000.0, 2, c2, b);
+        ok (a.fifo == b.fifo && a.comp.lines == b.comp.lines && a.comp.maxLookSamples == b.comp.maxLookSamples
+            && b.alignComp.ring > a.alignComp.ring,
+            "PRECONDITION: only the dry aligner's ring moves (" + std::to_string (a.alignComp.ring) + " -> "
+            + std::to_string (b.alignComp.ring) + " floats)");
+        auto chain = std::make_unique<mastering::MasteringChain>();
+        ok (chain->prepare (48000.0, 2, c1), "PRECONDITION: a chain with no compressor lookahead");
+        const std::uint64_t bound = chain->reprepareBytes (48000.0, 2, c2);
+        const long long before = g_bytes.load();
+        const bool grew = chain->prepare (48000.0, 2, c2);
+        const long long got = g_bytes.load() - before;
+        ok (grew && got > 0, "PRECONDITION: growing only the dry aligner allocates (" + std::to_string (got) + " B)");
+        ok (bound > 0u && (std::uint64_t) got <= bound,
+            "and it is not published as free (asked " + std::to_string (got) + " B, bound " + std::to_string (bound) + " B)");
+    }
 
     // THE STAGES' OWN BUDGETS, ASKED DIRECTLY, at arguments no chain can reach. Three mutations survived
     // the matrix above for this reason alone: the chain caps its quantum at 8192 (so the limiter's own
@@ -1462,7 +1514,24 @@ void testDemand()
             const long long before = g_bytes.load();
             a->prepare (2, 1, 0);
             const long long got = g_bytes.load() - before;
-            if (got != (long long) st.bytes()) ++off;
+            if (got != (long long) st.bytes() || got != (long long) st.freshBytes()) ++off;
+        }
+        {   // ...and INSIDE the seed, where `bytes()` and the request part company: one channel, a ring at its
+            // 2-slot floor. `freshBytes()` is the request — the scratch alone — and `bytes()` over-states it by
+            // the 8 B ring it does not ask for. This is the aligner a mono compressor with no lookahead gets.
+            const core::DryAligner::Storage st = core::DryAligner::storageFor (1, 256, 2);
+            auto a = std::make_unique<core::DryAligner>();
+            const long long before = g_bytes.load();
+            a->prepare (1, 256, 2);
+            const long long got = g_bytes.load() - before;
+            if (got != (long long) st.freshBytes() || st.freshBytes() != 256u * sizeof (float)
+                || st.bytes() != st.freshBytes() + 2u * sizeof (float)) ++off;
+            // Fully inside it: nothing at all.
+            const core::DryAligner::Storage seed = core::DryAligner::storageFor (1, 1, 2);
+            auto b = std::make_unique<core::DryAligner>();
+            const long long b0 = g_bytes.load();
+            b->prepare (1, 1, 2);
+            if (g_bytes.load() - b0 != 0 || seed.freshBytes() != 0u) ++off;
         }
         ok (off == 0, "each stage's own budget is what preparing it directly allocates, at the arguments its "
                       "OWN clamps live at (" + std::to_string (off) + " off)");

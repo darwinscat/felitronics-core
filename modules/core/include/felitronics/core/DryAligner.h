@@ -48,13 +48,25 @@ public:
     // a caller that passes 0 channels is sized for 1, exactly as it is prepared for 1.
     // NB a default-constructed aligner is NOT empty — its constructor already took the seed below — so
     // preparing one for counts inside that seed asks the heap for nothing and `bytes()` is then an upper
-    // bound rather than the request. Every aligner in this tree is prepared well past it.
+    // bound rather than the request. `freshBytes()` is the request itself.
     struct Storage
     {
         std::size_t ring = 2, scratch = 1;       // floats, both already multiplied by the channel count
         std::uint64_t bytes() const noexcept
         {
             return (std::uint64_t) sizeof (float) * ((std::uint64_t) ring + (std::uint64_t) scratch);
+        }
+
+        // WHAT preparing a DEFAULT-CONSTRUCTED aligner asks the heap for: each buffer that outgrows the seed
+        // is asked for its size, and one that still fits inside the seed is asked for nothing, since `assign`
+        // re-uses capacity it already holds. Not an edge nobody reaches — a ONE-channel aligner for a stage
+        // with no latency is a 2-slot ring, i.e. exactly the seed, and the mastering chain builds one for a
+        // mono compressor whose lookahead rounds to 0 samples. `bytes()` over-stated that preparation by 8 B.
+        std::uint64_t freshBytes() const noexcept
+        {
+            const std::uint64_t r = ring    > 2 ? (std::uint64_t) ring    : 0u;
+            const std::uint64_t s = scratch > 1 ? (std::uint64_t) scratch : 0u;
+            return (std::uint64_t) sizeof (float) * (r + s);
         }
     };
 
@@ -68,10 +80,11 @@ public:
     }
 
     // What the DEFAULT-CONSTRUCTED degenerate state below asks for (a 2-slot ring and a 1-sample scratch).
-    // An owner that holds an aligner BY VALUE pays this at its own construction and then, if it prepares
-    // the aligner for anything larger, hands it back — so a budget that sums an owner's requests exceeds
-    // what the owner HOLDS by exactly this much per aligner it re-sizes. Stated rather than hidden: it is
-    // the one place in the mastering chain where the sum and the peak differ.
+    // An owner that holds an aligner BY VALUE pays this at its own construction and then, for each of the
+    // two buffers it prepares LARGER than the seed, hands that buffer's share back — so a budget that sums
+    // an owner's requests exceeds what the owner HOLDS by up to this much per aligner: all 12 bytes when
+    // both buffers grow, 4 when a one-channel ring stays at its 2-slot seed (see `freshBytes()`). Stated
+    // rather than hidden: it is the one place in the mastering chain where the sum and the peak differ.
     static constexpr std::uint64_t constructBytes() noexcept { return (std::uint64_t) sizeof (float) * 3u; }
 
     // `capacity` must exceed any latency the tap will ever request (the delay is clamped to

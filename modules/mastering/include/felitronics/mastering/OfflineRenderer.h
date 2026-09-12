@@ -194,7 +194,7 @@ private:
 // forwards numbers the core computed, and a sum it assembled itself would be a second description of
 // this module's storage, drifting the first time a stage grows a buffer.
 //
-// It is the whole of the core's side of such a call: constructing the chain (its two dry aligners),
+// It is the whole of the core's side of such a call: constructing the chain (its three dry aligners),
 // preparing it, and preparing the renderer at the block the facade chose. The facade's OWN object — its
 // instance record — is its `sizeof` and is published separately, because the page adds what applies
 // rather than being handed one number it cannot take apart.
@@ -202,9 +202,10 @@ private:
 // 0 for a geometry the chain refuses, and that is now exact rather than nearly so: `MasteringChain::
 // admits()` decides before the first allocation, so a refused `create` asks the heap for nothing.
 //
-// REQUESTED bytes, summed. It exceeds what the call HOLDS at once by `core::DryAligner::constructBytes()`
-// for each aligner the topology re-sizes — 12 bytes apiece, the seed the aligner's constructor took and
-// its preparation hands back — and by nothing else: everything else this call asks for, it keeps.
+// REQUESTED bytes, summed. It exceeds what the call HOLDS at once by the part of each aligner's seed its
+// preparation hands back — 12 bytes for an aligner the topology re-sizes, 4 for a one-channel compressor
+// aligner whose lookahead rounds to 0 samples, whose 2-slot ring IS the seed and is kept — and by nothing else: everything
+// else this call asks for, it keeps.
 [[nodiscard]] inline std::uint64_t createBytes (double sampleRate, int numChannels,
                                                 const MasteringChainConfig& config, int rendererBlock) noexcept
 {

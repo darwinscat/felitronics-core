@@ -126,8 +126,8 @@ static_assert (sizeof (saturation::Saturator::Params)  == 28);
 static_assert (sizeof (limiter::TruePeakLimiterParams) == 16);
 static_assert (sizeof (dither::DitherParams)           == 24);
 static_assert (sizeof (MasteringChainConfig)           == 48);
-static_assert (sizeof (MasteringChainParams)           == 6544);
-static_assert (sizeof (MasteringChainResolved)         == 72);
+static_assert (sizeof (MasteringChainParams)           == 6552);   // + compressorMix (P60) — see below
+static_assert (sizeof (MasteringChainResolved)         == 80);     // + compressorMix (P60) — see below
 
 // THE PIN THAT WORKS THROUGH INHERITANCE. A structured binding cannot decompose a type whose base has
 // members, and `sizeof` is blind to a field that lands in existing padding — so between them the two
@@ -202,17 +202,22 @@ static_assert (! BraceInit<dynamics::CompressorParams,
     (void) k_block; (void) k_eq; (void) k_mb; (void) k_comp; (void) k_clip; (void) k_lim; (void) k_dith;
     (void) k_clook; (void) k_llook; (void) k_os; (void) k_taps; (void) k_hpf;
 
+    // `p_mix` and `r_mix` are the one pair of members this file does NOT map, and the pins name them
+    // anyway: they are what made adding the field a build break here rather than a silent gap. The C
+    // structs are short of `compressorMix` until the ABI's version rule (P57) exists, `toCore` leaves it
+    // at the core's default of 1 — bit-identical to the chain before the field — and `fromCore` does not
+    // read it. fc_master_abi.h records the same debt where a reader of the C header will see it.
     MasteringChainParams prm {};
     auto& [p_in, p_pre, p_eq, p_mb, p_comp, p_clip, p_lim, p_dith,
-           p_bE, p_bM, p_bC, p_bK, p_bL, p_bD] = prm;
+           p_bE, p_bM, p_bC, p_bK, p_bL, p_bD, p_mix] = prm;
     (void) p_in; (void) p_pre; (void) p_eq; (void) p_mb; (void) p_comp; (void) p_clip; (void) p_lim;
-    (void) p_dith; (void) p_bE; (void) p_bM; (void) p_bC; (void) p_bK; (void) p_bL; (void) p_bD;
+    (void) p_dith; (void) p_bE; (void) p_bM; (void) p_bC; (void) p_bK; (void) p_bL; (void) p_bD; (void) p_mix;
 
     MasteringChainResolved res {};
     auto& [r_lat, r_blk, r_clook, r_clip, r_lim, r_llook, r_os, r_ctap, r_ltap,
-           r_ceil, r_rel, r_mb] = res;
+           r_ceil, r_rel, r_mb, r_mix] = res;
     (void) r_lat; (void) r_blk; (void) r_clook; (void) r_clip; (void) r_lim; (void) r_llook;
-    (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb;
+    (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb; (void) r_mix;
 }
 
 //==============================================================================
