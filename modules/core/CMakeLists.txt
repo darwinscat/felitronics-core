@@ -12,6 +12,14 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_core_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_core_tests COMMAND felitronics_core_tests)
 
+    # P56 — the ONE polyphase FIR inner product. Its suite carries the cross-row bit constant, so it is
+    # the test that goes red when a row loses the no-contraction pragma or the summation order moves.
+    add_executable(felitronics_core_polyphasefir_tests tests/PolyphaseFirTests.cpp)
+    target_link_libraries(felitronics_core_polyphasefir_tests PRIVATE felitronics::core)
+    target_include_directories(felitronics_core_polyphasefir_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_core_polyphasefir_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_core_polyphasefir_tests COMMAND felitronics_core_polyphasefir_tests)
+
     add_executable(felitronics_core_fft_tests tests/FftTests.cpp)
     target_link_libraries(felitronics_core_fft_tests PRIVATE felitronics::core)
     target_include_directories(felitronics_core_fft_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

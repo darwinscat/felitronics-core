@@ -32,6 +32,7 @@
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/core/OfflineFft.h>
+#include <felitronics/core/PolyphaseFir.h>
 #include <felitronics/core/RtStreams.h>
 #include <felitronics/core/Smoother.h>
 #include <felitronics/core/StreamResampler.h>

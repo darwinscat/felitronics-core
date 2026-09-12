@@ -228,5 +228,41 @@ int main()
         test::ok (std::isfinite (m.truePeakDb()), "true-peak finite once prepared");
     }
 
+    // --- P56: the double-length history ring must be invisible ------------------------------------
+    // The meter reads its window out of a backwards ring in which every sample is stored twice. Two
+    // things break silently in that: the wrap, and the per-channel stride. Both checks are on the raw
+    // linear maximum and are EXACT — a dB comparison with a tolerance is what would hide a ring bug.
+    {
+        test::group ("TruePeakMeter: block splitting and channel count are bit-invisible");
+        const int n = 777;
+        std::vector<float> x0 ((std::size_t) n), x1 ((std::size_t) n);
+        unsigned rs = 0x5EEDu;
+        auto rnd = [&rs] { rs = rs * 1664525u + 1013904223u; return (float) (int) ((rs >> 8) ^ 0x800000u) * (1.0f / 8388608.0f) - 1.0f; };
+        for (int i = 0; i < n; ++i) { x0[(std::size_t) i] = rnd() * 0.9f; x1[(std::size_t) i] = rnd() * 0.5f; }
+
+        auto readTp = [&] (int chans, const std::vector<int>& splits)
+        {
+            analysis::TruePeakMeter m;
+            felitronics::test::run (m.prepare (48000.0, 1024, chans < 2 ? 1 : 2));
+            int at = 0;
+            for (int len : splits)
+            {
+                const float* io[2] { x0.data() + at, x1.data() + at };
+                felitronics::test::run (m.process (io, chans, len));
+                at += len;
+            }
+            return m.truePeakLinear();
+        };
+
+        const double whole = readTp (2, { n });
+        const double split = readTp (2, { 1, 2, 5, 64, 3, 200, 7, 495 });   // 777, deliberately ragged
+        const double mono  = readTp (1, { n });
+        const double monoS = readTp (1, { 13, 100, 664 });
+        test::ok (split == whole, "eight ragged blocks == one call, EXACTLY (the ring wrap)");
+        test::ok (monoS == mono,  "and the same for one channel");
+        test::ok (mono <= whole,  "channel 0 alone cannot read above the pair (it is a max over both)");
+        test::ok (whole > 0.9,    "the fixture actually has a peak to find");
+    }
+
     return test::report();
 }

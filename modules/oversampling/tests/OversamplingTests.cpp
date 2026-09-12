@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -489,6 +490,78 @@ int main()
         double maxErr = 0.0;
         for (int i = lat + 60; i < n - 10; ++i) maxErr = std::max (maxErr, (double) std::fabs (z[(std::size_t) i] - x[(std::size_t) (i - lat)]));
         test::ok (maxErr < 0.03, "8x round-trip == input delayed by latency()");
+    }
+
+    // --- P56: the DOUBLE-LENGTH ring must be invisible ---------------------------------------------
+    // Both loops now keep a backwards ring in which every sample is stored twice, and read a window
+    // that starts at a cursor which only ever decrements. Two things can break in that and nothing
+    // above would notice: the wrap, and the per-channel stride. Both checks are BIT-EXACT on purpose —
+    // "close enough" is what let a ring bug hide in the first place.
+    test::group ("Oversampler: block splitting and channel count are bit-invisible");
+    {
+        const int L = 4, n = 700, nch = 2;
+        std::vector<float> x0 ((std::size_t) n), x1 ((std::size_t) n);
+        std::uint32_t rs = 0xC0FFEEu;
+        auto rnd = [&rs] { rs = rs * 1664525u + 1013904223u; return (float) (std::int32_t) ((rs >> 8) ^ 0x800000u) * (1.0f / 8388608.0f) - 1.0f; };
+        for (int i = 0; i < n; ++i) { x0[(std::size_t) i] = rnd() * 0.7f; x1[(std::size_t) i] = rnd() * 0.7f; }
+
+        auto runUpDown = [&] (int chans, const std::vector<int>& splits, std::vector<float>& outCh0)
+        {
+            oversampling::PolyphaseOversampler os; os.prepare (L, chans, tpp);
+            std::vector<float> u0 ((std::size_t) n * L), u1 ((std::size_t) n * L);
+            std::vector<float> d0 ((std::size_t) n), d1 ((std::size_t) n);
+            int at = 0;
+            for (int len : splits)
+            {
+                const float* in[2]  { x0.data() + at, x1.data() + at };
+                float*       up[2]  { u0.data() + (std::size_t) at * L, u1.data() + (std::size_t) at * L };
+                os.upsample (in, chans, len, up);
+                const float* upc[2] { u0.data() + (std::size_t) at * L, u1.data() + (std::size_t) at * L };
+                float*       dn[2]  { d0.data() + at, d1.data() + at };
+                os.downsample (upc, chans, len, dn);
+                at += len;
+            }
+            test::ok (at == n, "the split covers the signal");
+            outCh0 = d0;
+        };
+
+        std::vector<float> whole, split, mono;
+        runUpDown (2, { n }, whole);
+        runUpDown (2, { 1, 3, 64, 7, 128, 2, 251, 244 }, split);   // 700, deliberately ragged
+        runUpDown (1, { n }, mono);
+
+        bool sameSplit = true, sameMono = true;
+        for (int i = 0; i < n; ++i)
+        {
+            if (split[(std::size_t) i] != whole[(std::size_t) i]) sameSplit = false;
+            if (mono [(std::size_t) i] != whole[(std::size_t) i]) sameMono  = false;
+        }
+        test::ok (sameSplit, "eight ragged blocks == one call, BIT for bit (the ring wrap)");
+        test::ok (sameMono,  "channel 0 alone == channel 0 of a stereo run, BIT for bit (the stride)");
+    }
+
+    // --- P56: resetChannel still clears exactly one channel's (now longer) rings --------------------
+    test::group ("Oversampler: resetChannel clears one channel and leaves the other bit-exact");
+    {
+        const int L = 4, n = 200;
+        oversampling::PolyphaseOversampler a2, b1;
+        a2.prepare (L, 2, tpp); b1.prepare (L, 2, tpp);
+        std::vector<float> x ((std::size_t) n); for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) std::sin (0.11 * i) * 0.8f;
+        std::vector<float> ua ((std::size_t) n * L), ub ((std::size_t) n * L), va ((std::size_t) n * L), vb ((std::size_t) n * L);
+        const float* in[2] { x.data(), x.data() };
+        float* o1[2] { ua.data(), ub.data() };
+        a2.upsample (in, 2, n, o1); b1.upsample (in, 2, n, o1);      // both warmed identically
+        a2.resetChannel (0);                                          // only a2's channel 0 forgets
+        float* o2[2] { va.data(), vb.data() };
+        a2.upsample (in, 2, n, o2);
+        std::vector<float> wa ((std::size_t) n * L), wb ((std::size_t) n * L);
+        float* o3[2] { wa.data(), wb.data() };
+        b1.upsample (in, 2, n, o3);
+        bool ch1Exact = true, ch0Moved = false;
+        for (std::size_t i = 0; i < vb.size(); ++i) if (vb[i] != wb[i]) ch1Exact = false;
+        for (std::size_t i = 0; i < va.size(); ++i) if (va[i] != wa[i]) ch0Moved = true;
+        test::ok (ch1Exact, "the untouched channel is bit-identical to one that was never reset");
+        test::ok (ch0Moved, "and the reset one really did forget (the check is not vacuous)");
     }
 
     runTapsTests();
