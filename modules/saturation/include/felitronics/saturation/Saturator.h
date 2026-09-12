@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::saturation
@@ -51,6 +53,65 @@ public:
         float dcBlockHz = 10.0f;   // DC blocker corner (in the oversampled domain)
     };
 
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the counts the six buffers and the dry bank are actually built from. FALSE,
+    // with `out` untouched, exactly where prepare() refuses the same arguments (it IS prepare()'s gate),
+    // and a refused prepare() allocates nothing. Asked of a FRESH saturator.
+    struct Storage
+    {
+        std::size_t osBuf = 0, wetBuf = 0;      // floats
+        std::size_t ptrs  = 0;                  // float* in EACH of the two pointer tables
+        std::size_t dc    = 0;                  // floats in EACH of the two DC-blocker state vectors
+        std::size_t dryLines = 0;               // core::DelayLine per channel
+        int         dryDelaySamples = 0;        // the oversampler round trip each of them holds
+        oversampling::PolyphaseOversampler::Storage os {};   // empty when the factor is 1
+        std::uint64_t bytes() const noexcept
+        {
+            return (std::uint64_t) sizeof (float)  * ((std::uint64_t) osBuf + wetBuf + 2u * (std::uint64_t) dc)
+                 + (std::uint64_t) sizeof (float*) * (2u * (std::uint64_t) ptrs)
+                 + core::delayBankBytes (dryLines, dryDelaySamples)
+                 + os.bytes();
+        }
+    };
+
+    [[nodiscard]] static bool storageFor (double sampleRate, int maxBlock, int maxChannels,
+                                          int oversampleFactor, int tapsPerPhase, Storage& out) noexcept
+    {
+        // Spelled positively so a NaN FAILS — see prepare() below for what a NaN rate used to produce.
+        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || maxBlock < 1) return false;
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
+        const int os = (oversampleFactor >= 2) ? oversampleFactor : 1;
+        Storage st;
+        if (os > 1 && ! oversampling::PolyphaseOversampler::storageFor (os, maxChannels, tapsPerPhase, st.os))
+            return false;
+        const std::size_t ch = (std::size_t) maxChannels;
+        st.osBuf    = ch * (std::size_t) maxBlock * (std::size_t) os;
+        st.wetBuf   = ch * (std::size_t) maxBlock;
+        st.ptrs     = ch;
+        st.dc       = ch;
+        st.dryLines = ch;
+        st.dryDelaySamples = latencyForFactor (os, tapsPerPhase);
+        out = st;
+        return true;
+    }
+
+    // THE LATENCY a prepared saturator will report for this geometry, without preparing one — the dry
+    // aligner of a composite is sized by it, and a second derivation of it is the drift law 11d's budgets
+    // exist to make impossible. 0 where prepare() refuses the same arguments.
+    //
+    // THAT IS NOT THE SAME AS WHAT `latencySamples()` READS AFTER A REFUSAL, and the difference is this
+    // class's, not this function's: `latencySamples()` is not gated by `prepared_` (unlike the compressor's
+    // and the limiter's), so after a refused preparation it still reports the topology of the last one that
+    // succeeded — 63 where this answers 0. A composite sizes itself from THIS, which is the number the
+    // preparation it is about to make will produce.
+    static int latencyFor (double sampleRate, int maxBlock, int maxChannels,
+                           int oversampleFactor, int tapsPerPhase) noexcept
+    {
+        Storage st;
+        return storageFor (sampleRate, maxBlock, maxChannels, oversampleFactor, tapsPerPhase, st)
+             ? st.dryDelaySamples : 0;
+    }
+
     bool prepare (double sampleRate, int maxBlock, int maxChannels, int oversampleFactor = 4,
                   int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase)
     {
@@ -59,24 +120,32 @@ public:
         // NaN rate, returned true, and went on to emit NaN: fsOs is NaN, so the DC blocker's
         // exp(-2π·fc/NaN) is NaN and the Asym path carries it into the output (measured on
         // prepare(NaN, 64, 1, 4, 32) — returns TRUE, output sample 40 is nan). Same shape and same
-        // reason as the guard in TruePeakLimiter::prepare.
-        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || maxBlock < 1) return false;
+        // reason as the guard in TruePeakLimiter::prepare. The gate is storageFor()'s now, so the budget
+        // and the preparation refuse the same arguments by construction rather than by agreement.
+        //
+        // ONE OBSERVABLE CHANGE COMES WITH THAT: `os_` used to be written BEFORE the oversampler was asked,
+        // so a preparation the oversampler refused (`tapsPerPhase` past 1024) left the new factor standing
+        // beside the OLD oversampler, and `latencySamples()` — which is not gated by `prepared_` — reported
+        // the round trip of a topology that was never built. Measured, `prepare(4, 64)` then `prepare(1, 64)`
+        // then a refused `prepare(4, 2000)`: 63 before, 0 now. The new answer is law 11(b)'s (a refused call
+        // touches nothing); it is stated here because this header is shared with the plug-ins.
+        Storage st;
+        if (! storageFor (sampleRate, maxBlock, maxChannels, oversampleFactor, tapsPerPhase, st)) return false;
         fs_       = sampleRate;
         maxBlock_ = maxBlock;
-        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         channels_ = maxChannels;
         os_       = (oversampleFactor >= 2) ? oversampleFactor : 1;
         if (os_ > 1 && ! ovs_.prepare (os_, channels_, tapsPerPhase)) return false;
 
-        osBuf_.assign  ((std::size_t) channels_ * (std::size_t) (maxBlock_ * os_), 0.0f);
-        wetBuf_.assign ((std::size_t) channels_ * (std::size_t) maxBlock_,         0.0f);
-        osPtrs_.assign ((std::size_t) channels_, nullptr);
-        wetPtrs_.assign((std::size_t) channels_, nullptr);
-        dcX1_.assign   ((std::size_t) channels_, 0.0f);
-        dcY1_.assign   ((std::size_t) channels_, 0.0f);
-        dryDelay_.assign ((std::size_t) channels_, core::DelayLine {});
-        const int lat = (os_ > 1) ? ovs_.latencySamples() : 0;   // align the dry to the wet's round-trip
-        for (auto& d : dryDelay_) { d.prepare (lat); d.setDelay (lat); }
+        osBuf_.assign  (st.osBuf,  0.0f);
+        wetBuf_.assign (st.wetBuf, 0.0f);
+        osPtrs_.assign (st.ptrs, nullptr);
+        wetPtrs_.assign(st.ptrs, nullptr);
+        dcX1_.assign   (st.dc, 0.0f);
+        dcY1_.assign   (st.dc, 0.0f);
+        const int lat = st.dryDelaySamples;                      // align the dry to the wet's round-trip
+        core::prepareDelayBank (dryDelay_, st.dryLines, lat);
+        for (auto& d : dryDelay_) d.setDelay (lat);
         applyParams();
         // The ledger must die with the buffers it indexes. prepare() REALLOCATES every per-channel vector
         // above, so a stale count from a wider previous life would send the next drop past the end of the
@@ -98,6 +167,13 @@ public:
     }
 
     int  latencySamples() const noexcept { return os_ > 1 ? ovs_.latencySamples() : 0; }
+
+    // The round trip an oversampler of this shape costs, in baseband samples — `PolyphaseOversampler`'s
+    // own `tpp - 1`, read here rather than restated so `latencyFor()` and a prepared object cannot differ.
+    static int latencyForFactor (int oversampleFactor, int tapsPerPhase) noexcept
+    {
+        return oversampleFactor > 1 && tapsPerPhase > 0 ? tapsPerPhase - 1 : 0;
+    }
 
     void setParams (const Params& p) noexcept { params_ = p; applyParams(); }
 

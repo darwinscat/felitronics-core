@@ -13,6 +13,8 @@
 #include <felitronics/dynamics/GainReductionPath.h>    // detector → curve → ballistics, as one object
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::dynamics
@@ -191,11 +193,24 @@ public:
     // then does nothing at all rather than half-processing. A false return is the only way to learn
     // this, so check it. What it prevents is not `std::ceil(NaN)` — that just returns NaN — but the
     // out-of-range floating-to-INTEGER conversions downstream of it, which are undefined.
-    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels, double maxLookaheadMs = 50.0)
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the numbers the bank is actually built from and the two cannot drift. FALSE,
+    // with `out` untouched, exactly where prepare() refuses the same arguments (it IS prepare()'s gate),
+    // and a refused prepare() allocates nothing. Asked of a FRESH compressor: one already prepared for at
+    // least this much keeps its bank and asks for nothing. `GainReductionPath::prepare` allocates nothing
+    // — measured, not assumed — so the bank is the whole of it.
+    struct Storage
     {
-        prepared_ = false;                                     // any early return below leaves it unprepared
+        std::size_t lines          = 0;    // one core::DelayLine per channel, held in one vector
+        int         maxLookSamples = 0;    // the ring capacity every line is prepared for
+        std::uint64_t bytes() const noexcept { return core::delayBankBytes (lines, maxLookSamples); }
+    };
+
+    [[nodiscard]] static bool storageFor (double sampleRate, int maxBlock, int maxChannels,
+                                          double maxLookaheadMs, Storage& out) noexcept
+    {
         // Spelled positively so NaN fails: `sampleRate <= 0.0` is FALSE for a NaN, which is how one
-        // reaches the undefined conversions above.
+        // reaches the undefined conversions the class comment names.
         if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || sampleRate > kMaxSampleRate) return false;
         if (maxBlock < 1) return false;                        // no scratch is sized by it, but a caller
                                                                // that passes 0 has a bug worth reporting
@@ -203,12 +218,50 @@ public:
         // refused at every process() call, i.e. a compressor that does nothing, discovered much later.
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
         if (! std::isfinite (maxLookaheadMs) || maxLookaheadMs < 0.0 || maxLookaheadMs > kMaxLookaheadMs) return false;
+        out.lines          = (std::size_t) maxChannels;
+        out.maxLookSamples = (int) std::ceil (maxLookaheadMs * 0.001 * sampleRate);
+        return true;
+    }
+
+    // THE LOOKAHEAD A PARAMETER SET ACTUALLY TAKES at this rate against a ring of `maxLookSamples` — the
+    // clamp chain apply() runs, in ONE place, which is what makes `latencyFor()` below the same number the
+    // prepared object reports rather than a second derivation of it.
+    static int lookaheadSamplesFor (double sampleRate, double lookaheadMs, int maxLookSamples) noexcept
+    {
+        // A non-finite lookahead would feed lround() undefined behaviour; clamp in the DOUBLE domain
+        // first, because std::lround(1e300) is out of range for a long before any int clamp can help.
+        const double lookMs = std::isfinite (lookaheadMs)
+                            ? (lookaheadMs < 0.0 ? 0.0 : (lookaheadMs > kMaxLookaheadMs ? kMaxLookaheadMs : lookaheadMs))
+                            : 0.0;
+        int n = (int) std::lround (lookMs * 0.001 * sampleRate);
+        if (n < 0) n = 0;
+        if (n > maxLookSamples) n = maxLookSamples;
+        return n;
+    }
+
+    // THE LATENCY a prepared compressor will report for this geometry, WITHOUT preparing one. A composite
+    // that has to size a dry aligner before its stages exist needs this number, and deriving it a second
+    // time is exactly what `MasteringChain::prepare` refuses to do — so here it is once, and the prepared
+    // object reports what this returns (pinned in the suites). 0 where prepare() refuses the same
+    // arguments, which is how `latencySamples()` reads on an unprepared compressor.
+    static int latencyFor (double sampleRate, int maxBlock, int maxChannels,
+                           double maxLookaheadMs, double lookaheadMs) noexcept
+    {
+        Storage st;
+        if (! storageFor (sampleRate, maxBlock, maxChannels, maxLookaheadMs, st)) return 0;
+        return lookaheadSamplesFor (sampleRate, lookaheadMs, st.maxLookSamples);
+    }
+
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels, double maxLookaheadMs = 50.0)
+    {
+        prepared_ = false;                                     // any early return below leaves it unprepared
+        Storage st;
+        if (! storageFor (sampleRate, maxBlock, maxChannels, maxLookaheadMs, st)) return false;
 
         fs    = sampleRate;
         maxCh = maxChannels;
-        maxLookSamples = (int) std::ceil (maxLookaheadMs * 0.001 * fs);
-        delays.assign ((std::size_t) maxCh, core::DelayLine {});
-        for (auto& d : delays) d.prepare (maxLookSamples);
+        maxLookSamples = st.maxLookSamples;
+        core::prepareDelayBank (delays, st.lines, maxLookSamples);
         path.prepare (fs);
         lookSamples = -1;                                      // force apply() to size the fresh lines
         apply (params);
@@ -364,12 +417,10 @@ private:
         // guards.
         path.setParams (p);
 
-        // A non-finite lookahead would feed lround() undefined behaviour; clamp in the DOUBLE domain
-        // first, because std::lround(1e300) is out of range for a long before any int clamp can help.
-        const double lookMs = std::isfinite (p.lookaheadMs) ? (p.lookaheadMs < 0.0 ? 0.0 : (p.lookaheadMs > kMaxLookaheadMs ? kMaxLookaheadMs : p.lookaheadMs)) : 0.0;
-        int newLook = (int) std::lround (lookMs * 0.001 * fs);
-        if (newLook < 0) newLook = 0;
-        if (newLook > maxLookSamples) newLook = maxLookSamples;
+        // THROUGH the static, not beside it: `latencyFor()` publishes this number to a caller that has no
+        // compressor yet, and two spellings of one clamp chain is exactly the drift law 11d's budgets exist
+        // to make impossible.
+        const int newLook = lookaheadSamplesFor (fs, p.lookaheadMs, maxLookSamples);
 
         // Changing the delay of a LIVE ring moves only the read pointer: raising it re-emits audio
         // already delivered, lowering it skips over some. Clear instead — a hole of zeros is the

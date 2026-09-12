@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -53,9 +54,20 @@ static constexpr std::size_t kStlBigPad = 0;
 #endif
 static constexpr std::size_t kStlBigBlock = 4096;
 static std::atomic<long long> g_bytes { 0 };
+// A PLAIN `new T` IS NOT A CONTAINER, and on this row the difference is 39 bytes. The correction above
+// undoes what MSVC's STL adds to a CONTAINER's request; a direct `new` asks for exactly `sizeof(T)` and
+// taking the correction off it subtracts bytes nobody added. A create makes two such allocations: the EQ
+// engine, which is over-aligned and therefore counted raw on its own path, and THIS FILE's instance record,
+// which is an ordinary `new` of 18 496 bytes — over the big-block threshold, and indistinguishable from a
+// container by size alone. So the test tells the counter that size (it is `fc_need::facadeBytes`, which the
+// core publishes) and the counter leaves requests of exactly it alone. The `win` row found this: every one
+// of the 48 create rows read 39 bytes short while macOS and Linux, whose STL adds nothing, were exact.
+static std::atomic<std::size_t> g_plainObjectSize { 0 };
 static long long containerBytes (std::size_t s) noexcept
 {
-    return (long long) (kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
+    if (kStlBigPad == 0) return (long long) s;
+    if (s == g_plainObjectSize.load (std::memory_order_relaxed)) return (long long) s;
+    return (long long) (s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
 }
 static void* countedNew (std::size_t s)
 {
@@ -78,12 +90,69 @@ static long long vectorRequest (std::size_t n)
     }
     return g_bytes.load() - before;
 }
+// EVERY FORM, not two. `eq::EqEngine` has `alignof` 64, so `fc_master_create` builds it through the
+// OVER-ALIGNED `operator new(size_t, align_val_t)` — 331 KiB, the single largest request a create makes,
+// invisible to a counter that overrides only the two sized forms. That blindness is P52, and a suite that
+// holds a published budget against a counter cannot have it: the create budgets below would have passed
+// while silently comparing two numbers that both left the engine out.
+static void* countedAlignedNew (std::size_t s, std::size_t a)
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    // RAW, not `containerBytes`. That correction undoes what MSVC's STL adds ON TOP of a container's own
+    // request; an over-aligned `new` here is an OBJECT (`eq::EqEngine`, alignof 64) whose size is exactly
+    // `sizeof`, and taking the correction off it subtracts bytes nobody added. The `win` row found it.
+    g_bytes.fetch_add ((long long) s, std::memory_order_relaxed);
+#if defined(__cpp_exceptions)
+    if (g_failNextAlloc.exchange (false)) throw std::bad_alloc();
+#endif
+#if defined(_MSC_VER)
+    return _aligned_malloc (s ? s : 1, a);
+#else
+    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
+    void* p = nullptr;
+    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
+#endif
+}
+// The nothrow forms take the SAME counter and the same fault switch, but answer a failure the way their
+// contract does — a null pointer, never an exception out of a noexcept function.
+static void* countedNothrowNew (std::size_t s, std::size_t a) noexcept
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    g_bytes.fetch_add (a != 0 ? (long long) s : containerBytes (s), std::memory_order_relaxed);   // raw when over-aligned — see above
+    if (g_failNextAlloc.exchange (false)) return nullptr;
+#if defined(_MSC_VER)
+    return a != 0 ? _aligned_malloc (s ? s : 1, a) : std::malloc (s ? s : 1);
+#else
+    if (a == 0) return std::malloc (s ? s : 1);
+    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
+    void* p = nullptr;
+    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
+#endif
+}
+static void alignedFree (void* p) noexcept
+{
+#if defined(_MSC_VER)
+    _aligned_free (p);
+#else
+    std::free (p);
+#endif
+}
 void* operator new      (std::size_t s) { return countedNew (s); }
 void* operator new[]    (std::size_t s) { return countedNew (s); }
+void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
+void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
+void* operator new      (std::size_t s, const std::nothrow_t&) noexcept { return countedNothrowNew (s, 0); }
+void* operator new[]    (std::size_t s, const std::nothrow_t&) noexcept { return countedNothrowNew (s, 0); }
+void* operator new      (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedNothrowNew (s, (std::size_t) a); }
+void* operator new[]    (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedNothrowNew (s, (std::size_t) a); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
 void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
+void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
+void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
 
 using felitronics::test::ok;
 using felitronics::test::approx;
@@ -95,6 +164,9 @@ namespace
 
 constexpr double kFs  = 48000.0;
 constexpr int    kNch = 2;
+
+// The topology axis of the P41 create/configure matrix — see the switch that reads it.
+constexpr int kTopologies = 9;
 
 fc_master_config goodConfig()
 {
@@ -1353,6 +1425,230 @@ int main()
         (void) fc_master_destroy (h);
     }
 
+
+    //==========================================================================
+    // P41 part 3 — THE CHAIN'S OWN SIDE OF THE FORMULA. `fc_master_need_create` is a DRY RUN of the create
+    // (every refusal it can reach before its first allocation, with the same status), and FC_NEED_CONFIGURE
+    // is the re-preparation's. Both are held against the counter byte for byte.
+    group ("fc_master_need_create: a dry run of the create, and its budget to the byte");
+    {
+        // THE MATRIX: four rates x three widths x four topologies — the default, the clipper, the key
+        // filter, and the legal maximum.
+        const double rates[]  = { 44100.0, 48000.0, 96000.0, 192000.0 };
+        const std::int32_t widths[] = { 1, 2, 16 };
+        // THE COUNTER IS TOLD WHICH SIZE IS A PLAIN OBJECT — see containerBytes(). The number is the core's,
+        // read out of a budget rather than written here, so it cannot fall out of step with the facade.
+        {
+            fc_master_config probe = goodConfig();
+            fc_need pn {}; FC_INIT (pn);
+            ok (fc_master_need_create (&probe, &pn) == FC_OK && pn.facadeBytes > 0u,
+                "PRECONDITION: the facade publishes the size of its own instance record");
+            g_plainObjectSize.store ((std::size_t) pn.facadeBytes, std::memory_order_relaxed);
+            // AND THE RULE IS CALIBRATED, on this row's own STL, rather than trusted: a plain `new` of that
+            // size counts as exactly that size, and a VECTOR of it counts as exactly its own bytes. The
+            // second is the rule's known collision — a container that happens to be exactly as long as the
+            // facade's record would be left uncorrected — and naming it here is what keeps it from being
+            // discovered as a byte-for-byte failure with no explanation.
+            const std::size_t n = (std::size_t) pn.facadeBytes;
+            const long long before = g_bytes.load();
+            {
+                void* raw = ::operator new (n);
+                volatile char* sink = static_cast<char*> (raw);
+                sink[0] = 1;
+                ::operator delete (raw, n);
+            }
+            const long long got = g_bytes.load() - before;
+            ok (got == (long long) n, "the counter reads a plain `new` of " + std::to_string (n)
+                                      + " B as " + std::to_string (n) + " B (read " + std::to_string (got) + ")");
+        }
+        int rows = 0, statusOff = 0, bytesOff = 0, zeroBudget = 0, solverOff = 0, cfgOff = 0, headerOff = 0;
+        long long worst = 0;
+        for (const double fs : rates)
+            for (const std::int32_t nch : widths)
+                for (int topo = 0; topo < kTopologies; ++topo)
+                {
+                    fc_master_config c {};
+                    fc_master_config_default (&c);
+                    c.sampleRate = fs; c.channels = nch;
+                    // EVERY OPTIONAL STAGE IS ABSENT ON SOME ROW. With only the clipper moving, a budget
+                    // that added the EQ engine's 331 KiB unconditionally — for a chain that never builds
+                    // one — was green on every row (the diverse-testing round found it as a surviving
+                    // mutation, in the core's matrix; this one carries the same axis for the facade).
+                    switch (topo)
+                    {
+                        case 0: break;                                      // the default
+                        case 1: c.clipper = 1; break;
+                        case 2: c.sidechainHpfHz = 80.0; break;
+                        case 3: c.eq = 0; break;                            // no engine at all
+                        case 4: c.compressor = 0; break;
+                        case 5: c.limiter = 0; break;
+                        case 6: c.dither = 0; break;
+                        case 7: c.monoBass = 1; break;                      // stereo only: refused at 1 and 16
+                        default:
+                            c.clipper = 1; c.sidechainHpfHz = 80.0; c.internalBlock = 8192;
+                            c.oversampleFactor = 16; c.tapsPerPhase = 1024;
+                            c.compressorLookaheadMs = 250.0; c.limiterLookaheadMs = 20.0;
+                            break;
+                    }
+                    ++rows;
+                    fc_need nd {}; FC_INIT (nd);
+                    const fc_status ns = fc_master_need_create (&c, &nd);
+                    fc_master h = 0;
+                    const long long before = g_bytes.load();
+                    const fc_status cs = fc_master_create (&c, &h);
+                    const long long got = g_bytes.load() - before;
+                    if (ns != cs) ++statusOff;
+                    if (cs != FC_OK) continue;
+                    if (nd.callBytes == 0u) ++zeroBudget;
+                    if (nd.solverPrepareBytes != 0u || nd.solverPrepared != 0) ++solverOff;
+                    // THE OUT-STRUCT'S HEADER IS PART OF THE ANSWER. A mutation that returned FC_OK with
+                    // `abiVersion = 0` left the whole suite green: every field was checked except the two
+                    // that tell a caller which ABI wrote them. (The diverse-testing round.)
+                    if (nd.header.abiVersion != FC_MASTER_ABI_VERSION
+                        || nd.header.structSize != (std::uint32_t) sizeof (fc_need)) ++headerOff;
+                    const long long budget = (long long) (nd.callBytes + nd.facadeBytes);
+                    if (got != budget) { ++bytesOff; if (got > worst) worst = got; }
+
+                    // THE RE-PREPARATION, on the same handle: published 0 and measured 0.
+                    fc_master_params p = goodParams();
+                    fc_master_resolved r {}; FC_INIT (r);
+                    fc_need cn {}; FC_INIT (cn);
+                    const fc_status cns = fc_master_need (h, FC_NEED_CONFIGURE, 0, &cn);
+                    const long long b2 = g_bytes.load();
+                    const fc_status ccs = fc_master_configure (h, &p, &r);
+                    const long long got2 = g_bytes.load() - b2;
+                    if (cns != FC_OK || ccs != FC_OK || cn.callBytes != 0u || got2 != 0
+                        || cn.facadeBytes != 0u || cn.solverPrepareBytes != 0u || cn.solverPrepared != 0) ++cfgOff;
+                    (void) fc_master_destroy (h);
+                }
+        ok (rows == 4 * 3 * kTopologies, "PRECONDITION: 4 rates x 3 widths x " + std::to_string (kTopologies)
+            + " topologies (" + std::to_string (rows) + " rows)");
+        ok (statusOff == 0, "need_create answers exactly what create answers, on every row ("
+                            + std::to_string (statusOff) + " off)");
+        ok (bytesOff == 0, "and its budget plus the facade's record is what the create allocates, byte for byte ("
+                           + std::to_string (bytesOff) + " rows off, worst " + std::to_string (worst) + " B)");
+        ok (zeroBudget == 0, "FC_OK never carries a budget of 0: the number means ONE thing on this op");
+        ok (solverOff == 0, "the solver's fields come back neutral for a create");
+        ok (headerOff == 0, "and the budget it wrote carries THIS build's header (" + std::to_string (headerOff) + " off)");
+        ok (cfgOff == 0, "a configure is published as 0 and allocates 0, on every row ("
+                         + std::to_string (cfgOff) + " off)");
+
+        // THE REFUSALS, each with the status the create gives it — and NOTHING allocated on the way to it.
+        // Every one of these used to cost between 51 288 and 394 456 bytes before it said no at this
+        // geometry, and up to 1 668 312 at sixteen channels and an 8192-sample quantum.
+        struct Refusal { const char* what; fc_status want; void (*edit) (fc_master_config&); };
+        const Refusal refusals[] = {
+            { "a 20 Hz rate",                      FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 20.0; } },
+            { "a rate of zero",                    FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 0.0; } },
+            { "a NaN rate",                        FC_ERR_NON_FINITE,      [] (fc_master_config& c) { c.sampleRate = std::numeric_limits<double>::quiet_NaN(); } },
+            { "no channels",                       FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.channels = 0; } },
+            { "more channels than the core has",   FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.channels = 999; } },
+            { "a 300 ms compressor lookahead",     FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.compressorLookaheadMs = 300.0; } },
+            { "2000 taps per phase",               FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.tapsPerPhase = 2000; } },
+            { "a factor past the limiter's 16",    FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.oversampleFactor = 32; } },
+            { "mono-bass on a mono chain",         FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.channels = 1; c.monoBass = 1; } },
+            { "a quantum under the floor",         FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.internalBlock = 4; } },
+            // The boundaries the diverse-testing round found missing: every one of them is a refusal the
+            // core states somewhere, and none of them had a row here proving the two entry points agree on
+            // it or that nothing was allocated reaching it.
+            { "a rate past the core's ceiling",     FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 3.0e6 + 1.0; } },
+            { "a quantum past the ceiling",         FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.internalBlock = 8193; } },
+            { "an oversampling factor of 1",        FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.oversampleFactor = 1; } },
+            { "three taps per phase",               FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.tapsPerPhase = 3; } },
+            { "a negative compressor lookahead",    FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.compressorLookaheadMs = -1.0; } },
+            { "a negative limiter lookahead",       FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.limiterLookaheadMs = -1.0; } },
+            { "a negative key filter",              FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sidechainHpfHz = -1.0; } },
+            { "a key filter above Nyquist",         FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sidechainHpfHz = 0.5 * kFs; } },
+            { "a non-finite key filter",            FC_ERR_NON_FINITE,      [] (fc_master_config& c) { c.sidechainHpfHz = std::numeric_limits<double>::infinity(); } },
+        };
+        int refOff = 0, refLeak = 0, refTouched = 0;
+        for (const Refusal& rf : refusals)
+        {
+            fc_master_config c = goodConfig();
+            rf.edit (c);
+            // A SENTINEL, NOT ZEROS. "The budget is left untouched" is not proved by reading 0 out of a
+            // struct that was 0 going in — an implementation that wrote zeros, or re-stamped the header,
+            // would pass. The whole struct is filled with a pattern, given a valid input header, copied,
+            // and compared byte for byte afterwards. (The diverse-testing round.)
+            fc_need nd;
+            std::memset (&nd, 0xA5, sizeof (nd));
+            FC_INIT (nd);
+            fc_need before_nd = nd;
+            const fc_status ns = fc_master_need_create (&c, &nd);
+            fc_master h = 0xDEADBEEFu;
+            const fc_master before_h = h;
+            const long long before = g_bytes.load();
+            const fc_status cs = fc_master_create (&c, &h);
+            const long long got = g_bytes.load() - before;
+            if (ns != rf.want || cs != rf.want) ++refOff;
+            if (std::memcmp (&nd, &before_nd, sizeof (nd)) != 0 || h != before_h) ++refTouched;
+            if (got != 0) ++refLeak;
+            if (cs == FC_OK) (void) fc_master_destroy (h);
+        }
+        ok (refOff == 0, "every geometry the core refuses is refused by BOTH, with the same status ("
+                         + std::to_string (refOff) + " off, over " + std::to_string (sizeof (refusals) / sizeof (refusals[0]))
+                         + " refusals)");
+        ok (refTouched == 0, "and neither out-argument is touched, byte for byte, by either call ("
+                             + std::to_string (refTouched) + " touched)");
+        ok (refLeak == 0, "and a refused create allocates NOTHING — it used to ask for 394 456 bytes on its "
+                          "way to `false` here, and 1 668 312 at sixteen channels ("
+                          + std::to_string (refLeak) + " leaked)");
+
+        // THE ARGUMENT CHECKS ARE THIS CALL'S OWN, and they come before the core's — the same order the
+        // create takes.
+        fc_master_config gc = goodConfig();
+        fc_need nd {}; FC_INIT (nd);
+        ok (fc_master_need_create (&gc, nullptr) == FC_ERR_NULL, "a null budget: FC_ERR_NULL");
+        ok (fc_master_need_create (nullptr, &nd) == FC_ERR_NULL, "a null config: FC_ERR_NULL");
+        { fc_need bad {}; FC_INIT (bad); bad.header.abiVersion = FC_MASTER_ABI_VERSION + 1u;
+          ok (fc_master_need_create (&gc, &bad) == FC_ERR_ABI_VERSION, "a budget struct from another ABI: refused"); }
+        { fc_master_config bc = gc; bc.header.structSize = 3u;
+          ok (fc_master_need_create (&bc, &nd) == FC_ERR_STRUCT_SIZE, "a config of the wrong size: refused"); }
+        { fc_master_config bc = gc; bc.sidechainHpfHz = std::numeric_limits<double>::quiet_NaN();
+          ok (fc_master_need_create (&bc, &nd) == FC_ERR_NON_FINITE,
+              "a field the mapping rejects: its own status, ahead of any geometry"); }
+
+        // THE TABLE IS PART OF THE ANSWER. With every slot taken the create answers FC_ERR_EXHAUSTED, and a
+        // budget published for it would be a number for a call that cannot be made.
+        fc_master live[8] {};
+        int made = 0;
+        for (int i = 0; i < 8; ++i) if (fc_master_create (&gc, &live[i]) == FC_OK) ++made;
+        ok (made == 8, "PRECONDITION: the handle table is full (" + std::to_string (made) + " live)");
+        fc_need full {}; FC_INIT (full);
+        fc_master extra = 0;
+        ok (fc_master_need_create (&gc, &full) == FC_ERR_EXHAUSTED && full.callBytes == 0u,
+            "with no free slot the budget is refused, exactly as the create is");
+        ok (fc_master_create (&gc, &extra) == FC_ERR_EXHAUSTED, "PRECONDITION: and the create really is refused");
+        for (int i = 0; i < made; ++i) (void) fc_master_destroy (live[i]);
+
+        // FC_NEED_CONFIGURE's OWN ARGUMENT: a re-preparation has no programme length, so a non-zero count is
+        // refused rather than ignored — narrowing before field values, as everywhere here.
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved r {}; FC_INIT (r);
+        ok (fc_master_configure (h, &p, &r) == FC_OK, "PRECONDITION: a configured handle");
+        fc_need cn {}; FC_INIT (cn);
+        ok (fc_master_need (h, FC_NEED_CONFIGURE, 1, &cn) == FC_ERR_RANGE, "a frame count with a configure: FC_ERR_RANGE");
+        ok (fc_master_need (h, FC_NEED_CONFIGURE, 0, &cn) == FC_OK && cn.callBytes == 0u, "and 0 is the count it takes");
+
+        // THE DEMAND ANSWERS A NUMBER, NEVER A PERMISSION (the decision recorded with this work). A stream in
+        // progress makes the configure itself FC_ERR_STATE; its COST is unchanged by the moment, and a page
+        // deciding whether to reset and re-configure needs the number exactly then. `fc_master_need` already
+        // behaves this way for a solve, and this is the same rule, not a second one.
+        auto audio = tone (256, kNch);
+        std::vector<float> outBuf (audio.size(), 0.0f);
+        ok (fc_master_process (h, audio.data(), outBuf.data(), 256) == FC_OK, "PRECONDITION: a stream is in progress");
+        ok (fc_master_configure (h, &p, &r) == FC_ERR_STATE, "PRECONDITION: the configure itself is refused now");
+        fc_need mid {}; FC_INIT (mid);
+        ok (fc_master_need (h, FC_NEED_CONFIGURE, 0, &mid) == FC_OK && mid.callBytes == 0u,
+            "and its budget is still answered: the demand is a number, not a permission");
+        fc_need sd {}; FC_INIT (sd);
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &sd) == FC_OK && sd.callBytes > 0u,
+            "PRECONDITION: which is what a solve's budget already does mid-stream");
+        (void) fc_master_destroy (h);
+        g_plainObjectSize.store (0, std::memory_order_relaxed);   // the exemption is this group's only
+    }
+
     //==========================================================================
     // P41 — A CALL THAT NEVER RETURNED POISONS THE INSTANCE. LAST in this file on purpose: the poison belongs to the
     // whole module and is permanent — that is the contract — so nothing may run after it in this binary.
@@ -1416,6 +1712,14 @@ int main()
         ok (fc_master_measure_lra (h, in.data(), n, &lraOut) == FC_ERR_POISONED && lraOut == -1.0, "measure_lra: POISONED");
         ok (fc_master_set_channel_weight (h, 0, 1.0) == FC_ERR_POISONED, "set_channel_weight: POISONED");
         ok (fc_master_need (h, FC_NEED_SOLVE, n, &nd) == FC_ERR_POISONED, "need: POISONED");
+        {
+            // It takes no handle at all, and is still guarded: the poison belongs to the MODULE, and a
+            // budget answered after an abandoned call would be arithmetic over objects nobody can vouch for.
+            const fc_master_config pc = goodConfig();
+            fc_need pn {}; FC_INIT (pn);
+            ok (fc_master_need_create (&pc, &pn) == FC_ERR_POISONED && pn.callBytes == 0u,
+                "need_create: POISONED, and the budget is untouched");
+        }
         ok (fc_solution_measurement (earlier, &ms) == FC_ERR_POISONED, "solution_measurement: POISONED");
         ok (fc_solution_log (earlier, lg, 4, &wrote) == FC_ERR_POISONED && wrote == 7u, "solution_log: POISONED");
         ok (fc_solution_destroy (earlier) == FC_ERR_POISONED, "solution_destroy: POISONED");
@@ -1436,6 +1740,7 @@ int main()
                       && fc_master_set_channel_weight (0, 0, 1.0)                   == FC_ERR_POISONED
                       && fc_master_solve (0, &p, &req, in.data(), out.data(), n, &sx) == FC_ERR_POISONED
                       && fc_master_need (0, FC_NEED_SOLVE, n, &nd)                  == FC_ERR_POISONED
+                      && fc_master_need_create (nullptr, nullptr)                     == FC_ERR_POISONED
                       && fc_solution_summary_get (0, &sb)                           == FC_ERR_POISONED
                       && fc_solution_measurement (0, &ms)                           == FC_ERR_POISONED
                       && fc_solution_log (0, lg, 4, &wrote)                         == FC_ERR_POISONED

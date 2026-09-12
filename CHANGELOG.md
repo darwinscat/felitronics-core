@@ -7,6 +7,97 @@ Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the proje
 
 ## Unreleased
 
+### `core` · `eq` · `dynamics` · `saturation` · `limiter` · `oversampling` · `mastering` · `tools` — the chain says what building it costs, and re-preparing it costs nothing
+
+Law 11d's remaining half (`docs/DSP-ARCHITECTURE.md`): its budgets covered the solver's calls and said in as
+many words that `create` and `configure` — the chain's own storage, and much the larger number — were **not
+budgeted yet**. They are now, and closing that turned up two things worth more than the budgets.
+
+- **A refused `fc_master_create` used to ask the heap for as much as 1 668 312 bytes on its way to saying no.** It
+  built the instance, prepared the renderer, and let the chain allocate down to the first stage that refused —
+  on the DEFAULT geometry a 20 Hz rate cost 392 408 B and a 300 ms compressor lookahead 394 456 B, even a
+  refusal on the chain's own front door cost 51 288 B, and the same lookahead refusal at 48 kHz with 16
+  channels and an 8192-sample quantum cost **1 668 312 B in 9 allocations** — the numbers scale with the
+  geometry, so the small ones are examples and not a maximum. On the wasm tier an allocation that cannot be served is not a refusal at all but
+  the end of the module, which is the whole subject of law 11d. **`MasteringChain::admits (fs, nch, cfg)`**
+  now reaches the entire verdict — every stage's own gate included — **without a single allocation**, and
+  `create` calls it before it builds anything. A refused create now allocates nothing, pinned over ten
+  refusals.
+- **`fc_master_configure` used to ask for 345 224 bytes to change nothing.** It built a SECOND 331 KiB
+  `eq::EqEngine` before releasing the first — a transient peak larger than everything else the call asks for
+  put together — plus three temporaries from copying `assign`s. The engine is now **re-used** and the
+  temporaries are gone: a re-preparation at the handle's own geometry asks the heap for **0 bytes**, measured
+  on every row of the matrix. The re-use is bit-identical, proven by null rather than by argument: a chain
+  prepared three times with parameters written in between renders the same programme sample for sample as one
+  prepared once, on three topologies — one of them the EQ alone, where no compressor, limiter or dither
+  stands between the engine and the comparison — and again across a chain MOVED to another rate and quantum.
+- **Nine headers publish what their `prepare()` allocates, through the function `prepare()` itself sizes by** —
+  `core::DelayLine`, `core::DryAligner`, `oversampling::PolyphaseOversampler`,
+  `limiter::TruePeakLimiter` (and its sliding window), `dynamics::Compressor`, `saturation::Saturator`,
+  `eq::EqEngine` (object and scratch), `mastering::OfflineRenderer`, `mastering::MasteringChain`. Each
+  `storageFor(...)` answers FALSE on exactly the arguments its `prepare()` refuses, so the budget and the
+  preparation cannot drift; `MasteringChain::prepareBytes` and `mastering::createBytes` aggregate them.
+- **`TruePeakLimiter`, `Saturator` and `Compressor` publish `latencyFor(...)`**, and their own `prepare()`
+  runs through it — so a composite sizing a dry aligner, and a budget sizing the same aligner, read the
+  number the prepared stage will report rather than deriving it a second time.
+- **Temporaries removed from three copying `assign`s** (`orbitcab` and `orbit-amp` share these modules):
+  `osBuf.assign (n, std::vector<float> (K·F))` built one buffer to copy `n` times — 524 288 B of peak on the
+  biggest topology the mastering chain builds, and 64 MiB asked of `TruePeakLimiter` directly at its own
+  block cap — and `assign (n, DelayLine {})` cost a temporary, `n` copies and then `n` reallocations.
+  `core::prepareDelayBank` builds each line at its final size instead. Same audio, bit for bit; a fresh
+  `create` is 4 120 B and 7 allocations lighter on the default topology, and a re-preparation asks for nothing.
+- **C ABI (version unchanged at 1 — no struct moves):** `fc_master_need_create (cfg, fc_need*)` and
+  `FC_NEED_CONFIGURE` for `fc_master_need`. `need_create` is a **dry run**: every refusal the create can reach
+  before its first allocation comes back with the same status, so `FC_OK` always carries a non-zero budget and
+  a caller can validate a configuration without paying for the attempt. `fc_master_need` keeps answering a
+  NUMBER rather than a permission — a configure is budgeted mid-stream, where the call itself is
+  `FC_ERR_STATE` — because the cost of a call does not depend on the moment it is made.
+- **Three repairs the review round found in the diff itself**, each with the input that found it:
+  `core::DelayLine::prepare` now re-clamps its tap into the new capacity (`prepare(8); setDelay(8);
+  prepare(2)` left a tap outside the ring and `process()` then read before its start — an invariant this
+  call has broken since it was written, which the delay bank made reachable in one more shape), and
+  `core::prepareDelayBank` clears the tap so a re-used bank ends where the `assign` it replaces ended;
+  `MasteringChain::reprepareBytes` asks the chain's OWN containers rather than trusting the geometry it
+  remembers (a MOVED-FROM chain keeps `prepared_` and its scalars and has given its buffers away — the
+  budget answered 0 for a re-preparation that really asked for 512 B); and the limiter reserves before it
+  resizes its per-channel scratch bank, which removes a growth step the chain was introducing itself
+  (a `resize` past the capacity grows geometrically, so widening 3 buffers to 4 asked for 6 — 48 B over).
+  What a container does on its OWN growth stays the caller's margin, exactly as law 11d says: the `win` row
+  measured MSVC's `assign` asking for 72 floats where 68 were wanted, which is why the bound on a GROWING
+  re-preparation is a bound and only the FRESH budget is exact.
+- **A re-preparation now KEEPS storage the old form gave back — on ONE edge, and being exact about which one
+  took a correction.** The diff pass found the retention; the fix round found that the obvious explanation for
+  it was wrong. `assign (n, DelayLine {})` did NOT free a narrower bank's rings in general — it copy-assigns
+  into the lines that survive, and a `vector` copy-assigned from a shorter one keeps its capacity, so the old
+  form retained too. The two diverge when the bank GROWS PAST ITS CAPACITY: `assign` reallocated and built
+  fresh lines from the temporary, destroying the old ones; `reserve` + `emplace_back` MOVES them and their
+  rings travel along. Measured on that edge: `Compressor::prepare (48000, 64, 1, 50 ms)` then
+  `(48000, 64, 2, 1 ms)` holds **9 880 B** where it held 472; `TruePeakLimiter::prepare (48000, 65536, 1)`
+  then `(48000, 256, 2)` holds **1 133 236 B** where it held 88 756. Separately, re-using the EQ engine means
+  a chain moved from an 8192-sample quantum to a 256-sample one asks for **0** instead of 341 120 B and holds
+  63 488 B more. This is what law 11d's budgets are stated over ("one already prepared keeps storage that
+  still fits"); a consumer that must give a large geometry back destroys the stage rather than re-preparing it.
+- **A REFUSED re-preparation no longer leaves its own arguments visible through the ungated readouts.** Moving
+  every check ahead of the first write changed three answers, all of them on calls that return `false`, and
+  all of them toward what law 11(b) asks for — a refused call touches nothing. Stated rather than left to be
+  met, because these headers are shared with the plug-ins: `eq::EqEngine::sampleRate()` reported the rate of
+  a preparation refused on its WIDTH (48000 → a refused 96000 answered 96000, now 48000);
+  `saturation::Saturator::latencySamples()` reported the round trip of a topology the oversampler had just
+  refused (63, now 0); and `limiter::TruePeakLimiter::effectiveReleaseMs()` answered in terms of a rate the
+  refused call brought (0.166667 ms, now 0.083333) — that one only, since the ceiling is a clamp on the
+  parameter and never sees the rate. Found by the diff pass and the code-review round, not by a test — no
+  suite reads those three after a refusal.
+- **Two products that were undefined are now merely large:** `saturation::Saturator`'s oversampled scratch
+  and `eq::EqEngine`'s sidechain scratch were sized by an `int` product (`maxBlock * os`, `maxBlock * ch`)
+  and are now computed in `size_t`. Past `INT_MAX` the old form was signed overflow — in practice a
+  wrapped, far too small buffer — and the new one is an honest request the heap will refuse. Only a direct
+  consumer can reach it: the mastering chain caps its quantum at 8192.
+- **The suites' allocation counters install EVERY form of `operator new`,** the over-aligned one included.
+  Without it `eq::EqEngine`'s 331 KiB — the largest single request a create makes on the default geometry;
+  at 16 channels and an 8192-sample quantum the saturator's flat scratch is 8 MiB — is invisible, and a budget
+  check would have compared two numbers that both left it out (the blindness P52 names). Pinned over 4 rates ×
+  3 widths × 4 topologies, byte for byte, for `create` and for `configure`.
+
 ### `analysis` · `mastering` · `tools` — a meter's store is counted in samples, a call publishes what it will allocate, and an instance that aborted refuses
 
 - **`analysis::LoudnessMeter` sizes its gating-block store through ONE function, in SAMPLES:**

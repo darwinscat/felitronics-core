@@ -626,6 +626,11 @@ struct Slot
 
 Slot g_slots[kMaxHandles];
 
+// The renderer's block size has NO effect on the result — the chain re-blocks everything to its own
+// quantum — so it is chosen once, here, for the solver's tap sizing and never exposed. Named rather than
+// spelled twice now that `fc_master_need_create` has to budget the very renderer `fc_master_create` builds.
+constexpr int kRendererBlock = 4096;
+
 // THE CALL THAT NEVER RETURNED. Under -fno-exceptions an exhausted heap ABORTS inside a core call, and the module is
 // not stopped by it: emscripten lets the page call again, the heap is intact, and every object is wherever the abort
 // left it. Measured on this facade in wasm32 (P41): an abort inside `fc_master_solve`, then `fc_master_process` on the
@@ -749,6 +754,28 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     const int idx = allocSlot (Kind::Master, h);
     if (idx < 0) return FC_ERR_EXHAUSTED;
 
+    // ADMITTED BEFORE ANYTHING IS BUILT (law 11d). This call used to construct the instance, prepare the
+    // renderer, and then let the chain allocate its way down to the first stage that refused — measured,
+    // on the default geometry 392 408 bytes asked for and handed straight back on a 20 Hz rate, 394 456 on a
+    // 300 ms compressor lookahead, 51 288 even when the chain refused on its own front door — and 1 668 312
+    // for that same lookahead at sixteen channels and an 8192-sample quantum, since these numbers scale
+    // with the geometry. On the wasm tier an
+    // allocation that cannot be served is not a refusal at all (law 11d), so bytes asked for on the way to
+    // saying "no" are bytes that can end the module instead.
+    //
+    // ONE CORE CALL DECIDES AND BUDGETS. `createBytes` returns 0 for exactly the geometries the core will
+    // not build, so the verdict here and the number `fc_master_need_create` publishes cannot disagree —
+    // they are the same expression. Arithmetic of this file's own is what that avoids.
+    if (mastering::createBytes (cfg->sampleRate, cfg->channels, cc, kRendererBlock) == 0u)
+    {
+        // `abandonSlot`, not `freeSlot`: no handle ever left this function, so there is nothing for a
+        // stale one to alias and no reason to spend a generation. (With the generation at 24 bits this
+        // is no longer load-bearing — it was, at 8, where 2040 refused creates exhausted a table that
+        // had never issued a handle — but the distinction is the honest one and it costs nothing.)
+        abandonSlot (g_slots[idx]);
+        return FC_ERR_REFUSED_BY_CORE;
+    }
+
     // `new` here, not in process(): the RT-safety claim is about the audio path, and this is a worker
     // call. Under -fno-exceptions a failure aborts rather than returning, and the instance is then POISONED
     // rather than left answering — see FC_GUARD above and "POISON COMES FIRST" in fc_master_abi.h.
@@ -756,15 +783,12 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     auto& m = *g_slots[idx].master;
     m.cfg = cc;
 
-    // The renderer's block size has NO effect on the result — the chain re-blocks everything to its own
-    // quantum — so it is chosen once, here, for the solver's tap sizing and never exposed.
-    if (! m.renderer.prepare (cfg->channels, 4096)
+    // Neither can refuse now — the geometry was admitted above, and that equivalence is pinned across the
+    // whole rate x width x topology matrix rather than asserted. Kept as a belt: a stage that grows a new
+    // refusal must fail loudly here rather than leave a half-built instance answering calls.
+    if (! m.renderer.prepare (cfg->channels, kRendererBlock)
         || ! m.chain.prepare (cfg->sampleRate, cfg->channels, cc))
     {
-        // `abandonSlot`, not `freeSlot`: no handle ever left this function, so there is nothing for a
-        // stale one to alias and no reason to spend a generation. (With the generation at 24 bits this
-        // is no longer load-bearing — it was, at 8, where 2040 refused creates exhausted a table that
-        // had never issued a handle — but the distinction is the honest one and it costs nothing.)
         abandonSlot (g_slots[idx]);
         return FC_ERR_REFUSED_BY_CORE;
     }
@@ -942,21 +966,65 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
     const double fs  = m.chain.sampleRate();
     const int    nch = m.chain.numChannels();
     std::uint64_t call = 0, facade = 0;
+    bool solverOp = true;                  // the solver's two fields are NEUTRAL for a configure
     switch (op)
     {
         case FC_NEED_SOLVE:       call = TargetLoudnessSolver::solveBytes (fs, nch, (int) frames);
                                   facade = sizeof (LoudnessSolution);                     break;
         case FC_NEED_MEASURE_LRA: call = TargetLoudnessSolver::measureRangeBytes (fs, (int) frames);
                                   facade = 0;                                             break;
+        // A re-preparation has no programme, so the count is not ignored — it is REQUIRED to be 0. An
+        // argument a call reads as nothing is an argument a caller can be wrong about for ever.
+        case FC_NEED_CONFIGURE:   if (frames != 0u) return FC_ERR_RANGE;
+                                  // The core's own answer about the chain in front of it: `configure`
+                                  // re-prepares at the handle's own rate, width and config, and a chain
+                                  // that already holds that geometry asks for nothing.
+                                  call = m.chain.reprepareBytes (fs, nch, m.cfg);
+                                  facade = 0; solverOp = false;                           break;
         default:                  return FC_ERR_ENUM;
     }
     stampHeader (out);
     out->callBytes          = call;
     // The arguments are the ones this file hands the solver's prepare() itself — see fc_master_solve.
-    out->solverPrepareBytes = TargetLoudnessSolver::prepareBytes (m.renderer.blockSize(), m.chain.internalBlock(),
-                                                                  m.chain.tapOversampleFactor());
+    out->solverPrepareBytes = solverOp ? TargetLoudnessSolver::prepareBytes (m.renderer.blockSize(),
+                                                                            m.chain.internalBlock(),
+                                                                            m.chain.tapOversampleFactor())
+                                       : 0u;
     out->facadeBytes        = facade;
-    out->solverPrepared     = m.solver.isPrepared() ? 1 : 0;
+    out->solverPrepared     = (solverOp && m.solver.isPrepared()) ? 1 : 0;
+    return FC_OK;
+}
+
+// A DRY RUN OF fc_master_create, and the only budget with no handle to ask — see fc_need and the note at
+// the declaration. The order is the create's own: poison, then this call's own out-pointer and the config's
+// header, then the mapping, then a free slot, then the geometry. Every one of those refusals is the status
+// the create would return, so FC_OK here means the create can only fail on the heap itself.
+FC_EXPORT fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out)
+{
+    FC_GUARD;
+    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
+    if (const fc_status st = checkHeaderIn (cfg); st != FC_OK) return st;
+
+    MasteringChainConfig cc {};
+    if (const fc_status st = toCore (*cfg, cc); st != FC_OK) return st;
+    if (cfg->channels < 1 || cfg->channels > core::kMaxChannels) return FC_ERR_REFUSED_BY_CORE;
+
+    // THE TABLE IS PART OF THE ANSWER. Without this a budget was published for a create that returns
+    // FC_ERR_EXHAUSTED with every slot taken — a number for a call that cannot be made.
+    bool haveSlot = false;
+    for (int i = 0; i < kMaxHandles && ! haveSlot; ++i) haveSlot = (g_slots[i].kind == Kind::Free);
+    if (! haveSlot) return FC_ERR_EXHAUSTED;
+
+    // The same expression `fc_master_create` decides by, so the two cannot disagree: 0 is exactly the
+    // geometries the core will not build, and it never reaches `out`.
+    const std::uint64_t call = mastering::createBytes (cfg->sampleRate, cfg->channels, cc, kRendererBlock);
+    if (call == 0u) return FC_ERR_REFUSED_BY_CORE;
+
+    stampHeader (out);
+    out->callBytes          = call;
+    out->solverPrepareBytes = 0u;                     // neutral: a create does not touch the search
+    out->facadeBytes        = sizeof (MasterInstance);
+    out->solverPrepared     = 0;
     return FC_OK;
 }
 

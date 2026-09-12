@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <atomic>
 #include <cmath>
@@ -43,24 +45,62 @@ public:
     // [[nodiscard]] and a refusal, matching TruePeakLimiter (P12) and Compressor (P2), rather than the
     // silent substitution some void prepare()s in this repo do: a caller that believes it prepared and
     // processes at the wrong rate is the failure those two exist to prevent. Spelled positively so NaN fails.
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the number the scratch is actually built from. FALSE, with `out` untouched,
+    // exactly where prepare() refuses the same arguments (it IS prepare()'s gate; the bands below repeat
+    // the same two tests and cannot refuse anything it admits). Asked of a FRESH engine.
+    //
+    // THE OBJECT IS NOT IN HERE, and that is the point of separating them: `sizeof(EqEngine)` is 331 KiB
+    // and a composite holds the engine behind a pointer, so the object is the OWNER's allocation and the
+    // scratch is the engine's own. `objectBytes()` below publishes the first.
+    struct Storage
+    {
+        std::size_t scratch = 0;      // floats: the section-input capture, maxBlock x channels
+        std::uint64_t bytes() const noexcept { return (std::uint64_t) sizeof (float) * (std::uint64_t) scratch; }
+    };
+
+    [[nodiscard]] static bool storageFor (double sampleRate, int maxBlock, int numChannels, Storage& out) noexcept
+    {
+        // Same domain test as the bands, and for the same reason: a band clamps its frequency to
+        // [10 Hz, 0.49*fs], so a rate under 20.41 Hz hands `std::clamp` a lo above its hi. Spelled
+        // positively so NaN fails.
+        if (! (std::isfinite (sampleRate) && 0.49 * sampleRate >= 10.0 && sampleRate <= 3.0e6)) return false;
+        if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING — a width
+        out.scratch = (std::size_t) (maxBlock > 0 ? maxBlock : 0) * (std::size_t) numChannels;
+        return true;                                                       // it clamped was a width it lied about
+    }
+
+    // THE ENGINE'S OWN OBJECT, which its OWNER allocates. `alignof(EqEngine)` is 64, so `make_unique`
+    // reaches the OVER-ALIGNED `operator new(size_t, align_val_t)` — a counter that overrides only
+    // `operator new(size_t)` sees none of these 331 KiB, which is exactly the blindness P52 names. Any
+    // suite holding a budget against a counter has to install the aligned forms too.
+    static constexpr std::uint64_t objectBytes() noexcept { return (std::uint64_t) sizeof (EqEngine); }
+
     [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int numChannels) noexcept
     {
         prepared_ = false;                              // any early return below leaves the engine unprepared
-        // Same domain test as the bands below, and for the same reason: a band clamps its frequency to
-        // [10 Hz, 0.49*fs], so a rate under 20.41 Hz hands `std::clamp` a lo above its hi. The engine
-        // repeats it rather than relying on the bands because it is the module's front door and refuses
-        // before allocating the scratch buffer. Spelled positively so NaN fails.
-        if (! (std::isfinite (sampleRate) && 0.49 * sampleRate >= 10.0 && sampleRate <= 3.0e6)) return false;
+        // The engine is the module's front door and refuses BEFORE allocating the scratch buffer — the
+        // gate is storageFor()'s now, so the budget and the preparation refuse the same arguments by
+        // construction rather than by agreement.
+        //
+        // ONE OBSERVABLE CHANGE COMES WITH THAT, and it is stated rather than left to be met: `fs` used to
+        // be written BETWEEN the two checks, so a preparation refused on its WIDTH had already replaced the
+        // rate, and `sampleRate()` — which is not gated by `prepared_` — reported the rate of the call that
+        // failed. `prepare(48000, 64, 2)` then `prepare(96000, 64, 0)` answered 96000; it now answers 48000.
+        // The new answer is the one law 11(b) asks for (a refused call writes nothing), and `magnitudeDb()`,
+        // which reads that field beside coefficients the refused call never touched, is the reason it
+        // matters rather than a technicality.
+        Storage st;
+        if (! storageFor (sampleRate, maxBlock, numChannels, st)) return false;
         fs = sampleRate;
-        if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING — a width
-        ch = numChannels;                                                  // it clamped was a width it lied about
+        ch = numChannels;
         maxBlock_ = maxBlock > 0 ? maxBlock : 0;
         // Sidechain scratch: the SECTION INPUT, preserved before any band touches the signal. A
         // dynamics layer must detect on this and not on a band's own input — in a series chain that
         // input is the previous bands' OUTPUT, so their moving deltas would modulate later detectors
         // at overlapping frequencies and the chain would pump. Allocated here, never in process().
         // maxBlock 0 (or a consumer that never asks) costs nothing.
-        scratch_.assign ((std::size_t) (maxBlock_ * ch), 0.0f);
+        scratch_.assign (st.scratch, 0.0f);
         for (int c = 0; c < kMaxChannels; ++c)
             scPtr_[c] = (c < ch && maxBlock_ > 0) ? scratch_.data() + (std::size_t) c * (std::size_t) maxBlock_
                                                   : nullptr;

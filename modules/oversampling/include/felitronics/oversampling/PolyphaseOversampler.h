@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace felitronics::oversampling
@@ -90,19 +92,60 @@ public:
     static constexpr int kMaxTapsPerPhase = 1024;
     static constexpr int kMaxFactor       = 64;
 
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
+    // budgeting memory reads the counts the five buffers are actually built from. FALSE, with `out`
+    // untouched, exactly where prepare() refuses the same arguments: the budget of a call is storageFor()
+    // with the SAME arguments, and a refused prepare() allocates nothing.
+    //
+    // ⚠ IT MODELS THE CHANNEL CLAMP, because prepare() clamps rather than refuses — `prepare(4, 17, 64)`
+    // answers true and sizes itself for `core::kMaxChannels`. That is a law-11(b) violation older than
+    // this budget (a width it clamped is a width it lied about) and it is **P55**, not this function's to
+    // fix: a budget that refused where the call succeeds would be wrong about the call in front of it.
+    struct Storage
+    {
+        std::size_t proto = 0, upHist = 0, downHist = 0;   // floats
+        std::size_t upPos = 0, downPos = 0;                // ints
+        std::uint64_t bytes() const noexcept
+        {
+            return (std::uint64_t) sizeof (float) * ((std::uint64_t) proto + upHist + downHist)
+                 + (std::uint64_t) sizeof (int)   * ((std::uint64_t) upPos + downPos);
+        }
+    };
+
+    [[nodiscard]] static bool storageFor (int factor, int maxChannels, int tapsPerPhase, Storage& out) noexcept
+    {
+        if (factor < 2 || factor > kMaxFactor) return false;
+        if (tapsPerPhase < 4 || tapsPerPhase > kMaxTapsPerPhase) return false;
+        const std::size_t ch = (std::size_t) channelsFor (maxChannels);
+        const std::size_t n  = (std::size_t) factor * (std::size_t) tapsPerPhase;
+        out.proto    = n;
+        out.upHist   = ch * (std::size_t) tapsPerPhase;
+        out.downHist = ch * n;
+        out.upPos    = ch;
+        out.downPos  = ch;
+        return true;
+    }
+
+    // The width prepare() will actually run at — the clamp above, in ONE place so the budget and the
+    // preparation cannot disagree about it. See P55.
+    static int channelsFor (int maxChannels) noexcept
+    {
+        return maxChannels < 1 ? 1 : (maxChannels > core::kMaxChannels ? core::kMaxChannels : maxChannels);
+    }
+
     // factor 2/4/8; tapsPerPhase = FIR taps per polyphase branch (filter length = factor*tapsPerPhase).
     // The default is the topology decision above; pass it explicitly to pin one against this default.
     bool prepare (int factor, int maxChannels, int tapsPerPhase = kDefaultTapsPerPhase)
     {
-        if (factor < 2 || factor > kMaxFactor) return false;
-        if (tapsPerPhase < 4 || tapsPerPhase > kMaxTapsPerPhase) return false;
+        Storage st;
+        if (! storageFor (factor, maxChannels, tapsPerPhase, st)) return false;
         L = factor; tpp = tapsPerPhase; N = L * tpp;
-        channels_ = maxChannels < 1 ? 1 : (maxChannels > core::kMaxChannels ? core::kMaxChannels : maxChannels);
+        channels_ = channelsFor (maxChannels);
         designFilter();
-        upHist.assign   ((std::size_t) channels_ * (std::size_t) tpp, 0.0f);
-        downHist.assign ((std::size_t) channels_ * (std::size_t) N,   0.0f);
-        upPos.assign    ((std::size_t) channels_, 0);
-        downPos.assign  ((std::size_t) channels_, 0);
+        upHist.assign   (st.upHist,   0.0f);
+        downHist.assign (st.downHist, 0.0f);
+        upPos.assign    (st.upPos,    0);
+        downPos.assign  (st.downPos,  0);
         return true;
     }
 
@@ -185,7 +228,7 @@ public:
 private:
     void designFilter()
     {
-        proto.assign ((std::size_t) N, 0.0f);
+        proto.assign ((std::size_t) N, 0.0f);       // == Storage::proto, which is L*tpp by the same arithmetic
         const double fc   = 0.5 / (double) L * 0.90;              // cutoff (cycles/OS-sample), guard below baseband Nyquist
         const double cen  = (double) (N - 1) * 0.5;
         const double beta = 9.0;                                  // Kaiser ~ -90 dB stopband
