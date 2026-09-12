@@ -52,6 +52,15 @@ namespace felitronics::mastering
 // never flushes; it feeds silence in blocks until the converter has produced what the formula needs.
 //
 // EQUAL RATES ARE A COPY: outFrames == inFrames, D = 0, and the samples are the caller's bits.
+//
+// 🔴 EVERY INPUT SAMPLE PASSES THE CHAIN'S GATE FIRST — `isfinite`, then a clamp to +-1e6, the expression
+// `MasteringChain` applies ahead of its stages — and the substitutions are counted (`nonFiniteInputSamples`). The
+// chain's gate alone is not enough once a converter stands in front of it: a windowed sinc spreads ONE NaN over its
+// whole kernel, the chain's gate then zeroes every delivered sample it reached, and a sample that costs a plain
+// render one frame cost a delivered render hundreds. With the gate here, converting a NaN is bit-identical to
+// converting the sanitised value, which is the chain's own promise carried across the conversion. It also keeps a
+// finite sample near FLT_MAX from overshooting the float range through the kernel. Bit-transparent for any finite
+// sample within +-1e6, like the chain's.
 //==============================================================================
 class DeliveryConverter
 {
@@ -76,7 +85,7 @@ public:
     struct Storage
     {
         bool ok = false;
-        std::uint64_t resampler = 0, staging = 0;
+        std::uint64_t resampler = 0, staging = 0;        // `staging` includes the gated input block
         std::uint64_t bytes() const noexcept { return ok ? resampler + staging : 0u; }
     };
     [[nodiscard]] static Storage storageFor (double inRate, double deliveryRate, int numChannels, int block) noexcept
@@ -90,7 +99,8 @@ public:
         if (perCall <= 0 || perCall > (1 << 26)) return st;
         st.resampler = rs.bytes();
         st.staging   = (std::uint64_t) sizeof (float) * (std::uint64_t) numChannels * (std::uint64_t) perCall
-                     + (std::uint64_t) sizeof (float) * (std::uint64_t) numChannels * (std::uint64_t) block;   // silence
+                     + (std::uint64_t) sizeof (float) * (std::uint64_t) numChannels * (std::uint64_t) block    // silence
+                     + (std::uint64_t) sizeof (float) * (std::uint64_t) numChannels * (std::uint64_t) block;   // gated input
         st.ok = true;
         return st;
     }
@@ -111,6 +121,8 @@ public:
         perCall_ = (int) outputBoundFor (src_.currentPlan(), block);
         staging_.assign ((std::size_t) numChannels * (std::size_t) perCall_, 0.0f);
         silence_.assign ((std::size_t) numChannels * (std::size_t) block, 0.0f);
+        gated_.assign ((std::size_t) numChannels * (std::size_t) block, 0.0f);
+        nonFinite_ = 0;
         prepared_ = true;
         return true;
     }
@@ -119,6 +131,10 @@ public:
     double latencyOutputSamples() const noexcept { return src_.latencyOutputSamples(); }
     long long trimSamples() const noexcept { return std::llround (src_.latencyOutputSamples()); }
     const core::DeliveryResampler::Plan& plan() const noexcept { return src_.currentPlan(); }
+
+    // Input samples the gate replaced because they were not finite, in the programme the last `convert()` read. A
+    // finite sample outside +-1e6 is clamped and not counted, exactly as `MasteringChain::nonFiniteInputSamples()`.
+    std::uint64_t nonFiniteInputSamples() const noexcept { return nonFinite_; }
 
     // Convert a whole programme. `out` must hold exactly deliveredFrames(inFrames) frames per channel, and
     // `outFrames` must be that number — a caller that computed its own is refused, not trusted. Every call
@@ -131,6 +147,7 @@ public:
         if (outFrames > 0 && (in == nullptr || out == nullptr)) return false;
         for (int c = 0; c < numChannels && outFrames > 0; ++c)
             if (in[c] == nullptr || out[c] == nullptr) return false;
+        nonFinite_ = 0;
         if (outFrames == 0) return true;
 
         src_.reset();
@@ -153,7 +170,22 @@ public:
         {
             const int m = (int) std::min<long long> (block_, inFrames - off);
             const float* ip[core::kMaxChannels] {};
-            for (int c = 0; c < numChannels; ++c) ip[c] = in[c] + off;
+            for (int c = 0; c < numChannels; ++c)
+            {
+                // The chain's gate, verbatim — see the class note. Branchless and folded once per plane, for the
+                // reason MasteringChain gives at its own copy.
+                float* g = gated_.data() + (std::size_t) c * (std::size_t) block_;
+                std::uint32_t bad = 0;
+                for (int i = 0; i < m; ++i)
+                {
+                    const float v = in[c][off + i];
+                    const bool  fin = std::isfinite (v);
+                    bad += fin ? 0u : 1u;
+                    g[i] = std::clamp (fin ? v : 0.0f, -1.0e6f, 1.0e6f);
+                }
+                nonFinite_ += bad;
+                ip[c] = g;
+            }
             int got = 0;
             if (! src_.process (ip, numChannels, m, sp, perCall_, got)) return false;
             take (got);
@@ -182,7 +214,8 @@ private:
     }
 
     core::DeliveryResampler src_;
-    std::vector<float> staging_, silence_;
+    std::vector<float> staging_, silence_, gated_;
+    std::uint64_t nonFinite_ = 0;
     double inRate_ = 0.0, deliveryRate_ = 0.0;
     int nch_ = 0, block_ = 0, perCall_ = 0;
     bool prepared_ = false;

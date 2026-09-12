@@ -173,7 +173,7 @@ MEXPORTS=$(grep -oE 'FC_EXPORT[[:space:]]+(void|std::uint32_t|uint32_t|fc_status
 MEXPORTS="$MEXPORTS,_malloc,_free"
 echo "--- fc_master exports: $(printf '%s\n' "$MEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ') symbols"
 # A generated list that silently came back empty would build a module with nothing in it, so it is
-# checked rather than trusted. 25 entry points at ABI v1; the guard is a floor, not the count, so
+# checked rather than trusted. 25 entry points at ABI v1, 33 at v3; the guard is a floor, not the count, so
 # appending one is not a build break.
 [ "$(printf '%s\n' "$MEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ')" -ge 27 ] \
     || { echo "*** the export list did not come out of $MSRC — refusing to link a module with no ABI"; exit 1; }

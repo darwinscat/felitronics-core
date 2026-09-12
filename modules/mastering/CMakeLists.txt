@@ -40,6 +40,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_mastering_deliveryconverter_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     add_test(NAME felitronics_mastering_deliveryconverter_tests COMMAND felitronics_mastering_deliveryconverter_tests)
 
+    # P57b — the three delivered operations (render, solve, range) as ONE composition both render paths call.
+    add_executable(felitronics_mastering_deliveredmastering_tests tests/DeliveredMasteringTests.cpp)
+    target_link_libraries(felitronics_mastering_deliveredmastering_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_mastering_deliveredmastering_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    add_test(NAME felitronics_mastering_deliveredmastering_tests COMMAND felitronics_mastering_deliveredmastering_tests)
+
     add_executable(felitronics_mastering_oracle_tests tests/MasteringOracleTests.cpp)
     target_link_libraries(felitronics_mastering_oracle_tests PRIVATE felitronics::mastering)
     target_include_directories(felitronics_mastering_oracle_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

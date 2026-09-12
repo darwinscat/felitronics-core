@@ -88,16 +88,85 @@ extern "C" {
 // not match the version's size refuses. Neither is a warning — a struct read at the wrong layout is a
 // silently plausible parameter set, which is precisely the failure this pair exists to prevent.
 //
-// EXACT size match, not ">=", for v1. A tolerant read is a promise about how future fields will be
-// laid out, and there is no future field yet to test that promise against; the first version to add
-// one states its own rule then. Refusing early costs a caller a rebuild and costs nobody a wrong render.
+// EXACT size match, not ">=", for v1 — and v1 said the first version to add a field would state its own
+// rule. v2 is that version (`fc_master_config::deliveryRate` and the delivering entry points), so the rule
+// follows, and it is written so that the NEXT bump is a row in a table rather than an event. v3 is the first
+// bump made by it — `compressorMix` (P60), two rows in the size table and a field at the end of two structs.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
 // meaning or value — so a caller built against an older header meets a code it does not know exactly
-// where it already has to handle "not FC_OK", and nothing it relied on moved. The version moves only
-// when a struct's layout does. (FC_ERR_POISONED and the FC_NEED_* ops came in this way.)
-#define FC_MASTER_ABI_VERSION 1u
+// where it already has to handle "not FC_OK", and nothing it relied on moved. (FC_ERR_POISONED and the
+// FC_NEED_* ops came in this way.)
+//
+// ------------------------------------------------------------------------------------------------------
+// THE COMPATIBILITY RULE (v2 onward)
+// ------------------------------------------------------------------------------------------------------
+// 1. WHAT MOVES THE VERSION. One number for the whole ABI, and it moves when the surface a caller may use
+//    grows: a struct with a header gains a field, OR an entry point is added. The second half is not
+//    pedantry — a page's only protection against calling an export the module does not have (a TypeError,
+//    not a status) is the loader's "module version >= page version" gate, so an entry point that arrived
+//    without a bump would pass that gate and still be missing.
+//
+// 2. WHAT A BUMP MAY DO. One logical addition, which may append fields to the END of any number of structs
+//    that begin with `fc_header` (v3, P60's `compressorMix`, is one bump that appends to `fc_master_params` and
+//    to `fc_master_resolved`). An IN field carries a default under which the call behaves exactly as the
+//    previous version did, bit for bit — `deliveryRate = 0` is v1. An OUT field is written with what the
+//    core computed.
+//
+// 3. WHAT NEVER GROWS. `fc_header`; every struct nested BY VALUE (`fc_eq_band`, `fc_compressor`, `fc_gr_limit`
+//    …) — a field inside `fc_compressor` would move everything after it in `fc_master_params`; and every element
+//    of a header-less array (`fc_solve_pass`, written with a stride of its `sizeof`). A new stage therefore
+//    arrives as fields at the end of a top-level struct, or as a NEW nested struct appended whole at the end —
+//    frozen from the version that introduced it.
+//
+// 4. NO IMPLICIT TAIL PADDING in a struct with a header: a struct whose last field ends short of its `sizeof`
+//    names the gap (`_pad0`), and the facade pins `sizeof == end of the last field`. Two reasons, neither of
+//    them about JavaScript (fc-master-layout.mjs aligns fields itself): a grown struct must be strictly BIGGER
+//    than its previous version, or a caller that bumped the layout and forgot the version is read at the old
+//    layout with no refusal; and an old caller's padding bytes are uninitialised memory that the facade copies
+//    over its defaults — a new field placed in them would be read from garbage.
+//
+// 5. THE SIZE OF EVERY (struct, version) IS ONE ROW OF `FC_MASTER_STRUCT_SIZES` below, and nowhere else. A
+//    struct that did not change in a version inherits its previous row; a struct introduced in version N has no
+//    size before N. `fc_master_sizeof(id, version)` publishes the table, 0 for a pair it does not have.
+//
+// 6. READING AN IN STRUCT. The first 8 bytes are bounded; the version must be 1..FC_MASTER_ABI_VERSION, else
+//    FC_ERR_ABI_VERSION; `structSize` must be that version's row, else FC_ERR_STRUCT_SIZE; then exactly
+//    `structSize` bytes are bounded and copied OVER THE CURRENT LAYOUT FILLED WITH ITS DEFAULTS — the same writer
+//    `fc_*_defaults` uses. Every later bound and alias check on that struct uses `structSize`, not this build's
+//    `sizeof`. A version NEWER than the build is refused, and that is a decision, not a gap: the build cannot
+//    know what the extra bytes mean, and reading a caller's intent as "whatever fits" is the silently plausible
+//    parameter set this pair of fields exists to prevent.
+//
+// 7. WRITING AN OUT STRUCT. Same checks. The caller's header is left as it is (an echo), and exactly its
+//    `structSize` bytes are written — a field past them is not written at all. Stamping this build's own
+//    version and size into a buffer laid out for an older one would advertise room the caller never allocated,
+//    and the next call through that buffer would write past it.
+//
+// 8. DEFAULTS. `void fc_*_default(out)` cannot know how big `out` is, so they are FROZEN at v1 — they stamp v1
+//    and write exactly v1's bytes, for callers compiled against v1. Everything newer uses `fc_*_defaults(out)`,
+//    which requires the caller's stamp (FC_INIT, or `Struct.init()` in JS) and writes that version's size.
+//    ⚠ A caller that fills a struct from a FROZEN writer and then sets a newer field has written it past the
+//    stamped size, where it is not read: `deliveryRate` set that way is ignored and the handle does not convert,
+//    and `compressorMix` set that way renders at mix 1. That is what rule 6 must do with a v1 struct, and it is
+//    why the JS accessor refuses a field past the stamp.
+//
+// WHAT ONE BUMP TOUCHES — each a line, and the list is the whole of it:
+//   * this file: the field(s), a row per grown struct in FC_MASTER_STRUCT_SIZES, FC_MASTER_ABI_VERSION, and
+//     the entry-point declarations if any;
+//   * tools/wasm/fc_master.cpp: the layout pins (sizeof / offsetof / arity), `toCore`/`fromCore`, the defaults
+//     writer, and the entry points — and, for a NEW struct with a header, its `AbiId` specialisation;
+//   * tools/wasm/fc-master-layout.mjs: the fields in STRUCTS and FC_MASTER_ABI_VERSION — and the copy of that
+//     file the site ships (see TRANSITION below);
+//   * tools/fcore_master.cpp: the hand mirror in `directRender`, the key=value parser, the offset table behind
+//     `fcore_master layout`, and the selftest fixture (every new field moved off its default);
+//   * tools/tests/MasterAbiTests.cpp: the version matrix.
+//
+// TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
+// shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
+// The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
+#define FC_MASTER_ABI_VERSION 3u
 
 typedef struct fc_header
 {
@@ -142,7 +211,9 @@ typedef struct fc_header
 // it set means an earlier call never returned — an abort, a trap, or natively an exception that escaped — and
 // from then on every such call answers FC_ERR_POISONED, writes nothing and touches nothing. There is no way back
 // inside the instance: the page discards it and instantiates a new one. The entry points that return no status —
-// the `*_default` writers and the build-identity queries — read no instance state and stay callable.
+// the frozen v1 `*_default` writers, `fc_master_sizeof` and the build-identity queries — read no instance state
+// and stay callable. The versioned `*_defaults` writers return a status and are therefore guarded like every other
+// such entry point: a poisoned module refuses them too.
 //
 // THE MODULE IS NOT RE-ENTRANT, and the poison is what says so. An entry point called while another is still
 // running — from a new_handler, a signal handler, anything the runtime runs inside an allocation this file made —
@@ -259,14 +330,26 @@ typedef struct fc_master_config
     int32_t oversampleFactor;
     int32_t tapsPerPhase;
     double  sidechainHpfHz;
+
+    // ---- v2 ----
+    // THE RATE THE PROGRAMME IS DELIVERED AT, and the one field that decides what kind of handle this is:
+    //   * 0 — no conversion: the chain runs at `sampleRate`, and the handle is exactly a v1 handle.
+    //   * anything else — a DELIVERING handle. The chain, the renderer and the solver run at `deliveryRate`,
+    //     and `DeliveryConverter` (SRC first, over the whole programme) stands in front of them. EQUAL RATES
+    //     INCLUDED: `deliveryRate == sampleRate` is a delivering handle whose converter copies bits, so a page
+    //     has one path — the `*_delivered` calls — whatever rate the user picked.
+    // A delivering handle has no streaming path: `fc_master_process`, `fc_master_flush` and `fc_master_solve`
+    // answer FC_ERR_STATE on it, because two lengths cannot share one planar stride. A rate pair the resampler
+    // does not support (anything but integer rates it can plan — see core::DeliveryResampler) is refused at
+    // create with FC_ERR_REFUSED_BY_CORE; a non-finite one with FC_ERR_NON_FINITE.
+    double  deliveryRate;
 } fc_master_config;
 
 //==============================================================================
 // PER-BLOCK PARAMETERS
 //
 // A field-for-field mirror of `mastering::MasteringChainParams` and everything it contains. Nothing is
-// summarised, nothing is renamed, and nothing is omitted but ONE field, named at the end of the struct as
-// the debt it is (`compressorMix`, waiting for the version rule): an ABI that exposed a "useful subset" would be
+// summarised, nothing is omitted and nothing is renamed: an ABI that exposed a "useful subset" would be
 // a road that ends, and the thinness law says this surface may not be the only road to a capability —
 // which is only true if it is not a narrower one either.
 #define FC_MAX_EQ_BANDS 24
@@ -375,20 +458,22 @@ typedef struct fc_master_params
     int32_t bypassEq, bypassMonoBass, bypassCompressor;
     int32_t bypassClipper, bypassLimiter, bypassDither;
 
-    // ⚠ NOT YET MIRRORED: `MasteringChainParams::compressorMix` (parallel compression, P60). The mirror
-    // above is short of it on purpose and for now — the field waits for the ABI's version rule (P57)
-    // rather than opening a version of its own. Until then every params set that crosses this boundary
-    // renders at the core's default mix of 1, which is bit-identical to the chain before the field
-    // existed. This is the one exception to "nothing is omitted", and it is a debt, not a design.
+    // ---- v3 ----
+    // PARALLEL COMPRESSION (P60): the compressor stage's output is `(1 - mix) * dry + mix * compressed`, the dry
+    // path aligned to the compressor's lookahead. A field of the CHAIN, not of `fc_compressor` — rule 3 of
+    // VERSIONING, and the core's own choice besides (`dynamics::Compressor` keeps dry/wet out on purpose). The
+    // default 1 renders the chain as it was before the field existed, bit for bit, so a v1 or v2 parameter set
+    // read over this build's defaults renders exactly what it did. Clamped to [0, 1] by the core and read back
+    // through `fc_master_resolved::compressorMix`; a non-finite value is refused here (FC_ERR_NON_FINITE), because
+    // the core would map it to 1 without a word.
+    double compressorMix;
 } fc_master_params;
 
 //==============================================================================
 // WHAT THE CHAIN ACTUALLY APPLIED
 //
 // A mirror of `mastering::MasteringChainResolved`. Every number in it is READ OUT of the prepared
-// chain, never recomputed here — which is what makes it worth reading at all. Short of
-// `compressorMix`, for the reason given at `fc_master_params`: the core applies 1 to every params set that
-// crosses this ABI (and resolves 0 on a topology with no compressor), so there is nothing to read back yet.
+// chain, never recomputed here — which is what makes it worth reading at all.
 typedef struct fc_master_resolved
 {
     fc_header header;
@@ -410,6 +495,11 @@ typedef struct fc_master_resolved
     // factor is this chain oversampling at" and reports the clipper's when there is no limiter, while
     // this answers "how long must my limiter tap buffer be", which with no limiter is one per frame.
     int32_t tapOversampleFactor;
+
+    // ---- v3 ----
+    // The mix the chain APPLIED — the clamped value the stage holds, not the request — and 0 on a topology with no
+    // compressor, where there is nothing to mix.
+    double compressorMix;
 } fc_master_resolved;
 
 //==============================================================================
@@ -431,6 +521,9 @@ typedef struct fc_master_stats
     // of the audio would be a second definition of "non-finite", and the count of internal quanta —
     // which an earlier draft of this struct carried — would have been this file re-deriving the chain's
     // own quantum accounting. The chain owns both; this reports one and does not invent the other.
+    // ON A DELIVERING HANDLE it is the core's count for the programme the last `*_delivered` call or converting
+    // `fc_master_measure_lra` was handed, at the source rate: the converter gates every input sample ahead of the
+    // conversion (one bad sample must not become a kernel's worth of zeroes), so the chain behind it sees none.
     uint64_t nonFiniteIn;
 } fc_master_stats;
 
@@ -469,8 +562,22 @@ typedef struct fc_need
     //   * CREATE — the SUM of what the call requests, which is what it holds: everything a create asks
     //     for, it keeps until the instance is destroyed. It exceeds the peak by the part of the seed each
     //     of the chain's three dry aligners hands back when its preparation re-sizes it — 12 bytes for
-    //     an aligner re-sized whole, 4 for a mono compressor whose lookahead rounds to 0 samples — and by
-    //     nothing else.
+    //     an aligner re-sized whole, 4 for a mono compressor whose lookahead rounds to 0 samples — and, on a
+    //     plain handle, by nothing else. A DELIVERING create also counts the converter's transient FIR
+    //     prototypes, which its preparation designs the phase tables from and frees before it builds the
+    //     histories: there the sum exceeds the peak by those too, and it is still exactly what the call requests.
+    //   * ON A DELIVERING HANDLE (`deliveryRate != 0`), SOLVE and MEASURE_LRA budget the calls that handle can
+    //     make — `fc_master_solve_delivered` and the converting `fc_master_measure_lra` — and `frames` is still
+    //     the count the caller hands IN, at the source rate. Each adds the converted programme, which the call
+    //     holds from start to end (0 at equal rates, where the input is read in place), to what the solver
+    //     builds at the DELIVERED length — so a range too short to measure is judged on the delivered length,
+    //     which is what the meter sees. `fc_master_render_delivered` has no op because it asks for nothing: it
+    //     converts into the caller's output and renders there. A delivered length past INT_MAX is FC_ERR_RANGE,
+    //     as the call itself would be.
+    //     WHAT THAT MEANS FOR A PAGE: a delivered solve lives beside THREE programme-sized buffers — the page's
+    //     input, the page's output at the delivery rate, and the converted input. Stereo 44.1 -> 192 kHz is
+    //     3,424,800 bytes per second of input, so a 2 GiB heap (emscripten's growth limit) holds about ten
+    //     minutes of it before anything else is counted; 44.1 -> 96 kHz, about nineteen.
     //   * CONFIGURE — 0 when the chain already holds the geometry it is being re-prepared at, which is
     //     every configure this ABI can make (the rate, the width and the config are the handle's own).
     //     The chain re-uses its EQ engine and assigns every buffer to the length it already has, so this
@@ -484,6 +591,7 @@ typedef struct fc_need
                                   // record for CREATE; 0 for measure_lra and for CONFIGURE
     int32_t  solverPrepared;      // 1 once that preparation has happened: `solverPrepareBytes` is then already spent.
                                   // NEUTRAL (0) for CREATE and CONFIGURE
+    int32_t  _pad0;               // the tail padding, NAMED — see rule 4 of VERSIONING. Always written 0.
 } fc_need;
 
 //==============================================================================
@@ -559,6 +667,31 @@ typedef struct fc_solution_summary
 } fc_solution_summary;
 
 //==============================================================================
+// THE SIZE TABLE — rule 5 of VERSIONING. One row per (struct, first version at that size). A bump that grows a
+// struct adds a row here and touches no other row; a bump that does not grow a struct adds nothing for it.
+//
+// The codes are part of the ABI (a page passes them to `fc_master_sizeof`) and are only ever appended.
+typedef enum fc_struct_id
+{
+    FC_STRUCT_CONFIG = 0, FC_STRUCT_PARAMS = 1, FC_STRUCT_RESOLVED = 2, FC_STRUCT_STATS = 3,
+    FC_STRUCT_NEED = 4, FC_STRUCT_REQUEST = 5, FC_STRUCT_MEASUREMENT = 6, FC_STRUCT_SUMMARY = 7
+} fc_struct_id;
+
+//      X(id,                     since, bytes)
+#define FC_MASTER_STRUCT_SIZES(X)                 \
+        X(FC_STRUCT_CONFIG,       1,       80)    \
+        X(FC_STRUCT_CONFIG,       2,       88)    \
+        X(FC_STRUCT_PARAMS,       1,     6560)    \
+        X(FC_STRUCT_PARAMS,       3,     6568)    \
+        X(FC_STRUCT_RESOLVED,     1,       80)    \
+        X(FC_STRUCT_RESOLVED,     3,       88)    \
+        X(FC_STRUCT_STATS,        1,       32)    \
+        X(FC_STRUCT_NEED,         1,       40)    \
+        X(FC_STRUCT_REQUEST,      1,      120)    \
+        X(FC_STRUCT_MEASUREMENT,  1,      208)    \
+        X(FC_STRUCT_SUMMARY,      1,       88)
+
+//==============================================================================
 // HANDLES
 //
 // A handle is an INDEX AND A GENERATION packed into 32 bits, not a pointer. A raw pointer cast to
@@ -626,6 +759,10 @@ fc_status fc_master_resolved_get (fc_master h, fc_master_resolved* out);
 
 // Process `frames` frames. `in` and `out` are planar with stride `frames`; they may be equal, and must
 // not overlap in any other way.
+//
+// REFUSED WITH FC_ERR_STATE ON A DELIVERING HANDLE (`deliveryRate != 0`), and so are `fc_master_flush` and
+// `fc_master_solve`: the output of a conversion is a different number of frames than its input, and one
+// planar stride cannot describe both. A delivering handle renders through `fc_master_render_delivered`.
 //
 // REFUSED WITH FC_ERR_STATE ON A HANDLE THAT HAS SOLVED, until `fc_master_configure` runs. A search
 // resets the chain on every pass and leaves its OWN gain and ceiling in it, standing wherever its last
@@ -720,6 +857,12 @@ fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
 // mean scanning the input here, which is a second definition of "non-finite" and a second pass over the
 // audio; the honest move is to say where the line is. Everything from one completed sub-hop onward is
 // refused, which is every case that can move the number this call exists to produce.
+//
+// ON A DELIVERING HANDLE IT CONVERTS FIRST and measures the programme at the delivery rate — the programme the
+// search will meter, so the range constraint compares a programme with itself. `frames` is the input count, and
+// the call is refused (FC_ERR_REFUSED_BY_CORE, having converted nothing) when the DELIVERED length is too short
+// to have a range. A delivered length past INT_MAX is FC_ERR_RANGE. Converting rather than refusing is the
+// cheaper road for a page: the alternative is a second, non-delivering handle — two of the eight slots.
 fc_status fc_master_measure_lra (fc_master h, const float* in, uint32_t frames, double* out);
 
 // BS.1770 CHANNEL WEIGHTS for the solver's meters. The standard weights Ls/Rs at 1.41 and EXCLUDES LFE,
@@ -752,6 +895,41 @@ fc_status fc_master_set_channel_weight (fc_master h, int32_t channel, double wei
 fc_status fc_master_solve (fc_master h, const fc_master_params* params, const fc_loudness_request* req,
                            const float* in, float* out, uint32_t frames, fc_solution* out_solution);
 
+//==============================================================================
+// THE DELIVERING HANDLE (v2) — `fc_master_config::deliveryRate != 0`. SRC FIRST: the programme is converted to
+// the delivery rate as one whole-programme operation (`mastering::DeliveryConverter`), and everything that
+// measures or limits then sees the rate that is delivered, with the dither still the last thing to touch it.
+// The composition lives in the core (`mastering::DeliveredMastering`), not here: this file forwards to it, and
+// `fcore_master selftest` compares the two bit for bit.
+//
+// Each of these answers FC_ERR_STATE on a handle that does not deliver (`deliveryRate == 0`).
+//
+// THE CHECK ORDER FOR THE TWO LENGTHS is the header's own (narrowing before spans), made explicit because there
+// are two: `inFrames`, `outFrames`, or the delivered length the core computes, past INT_MAX -> FC_ERR_RANGE;
+// only then `outFrames` != the delivered length -> FC_ERR_CAPACITY; then the spans. `in` has stride `inFrames`,
+// `out` has stride `outFrames`, and the two spans may not touch at all.
+//
+// A NON-FINITE INPUT SAMPLE is gated ahead of the conversion by the chain's own rule (NaN/inf -> 0, clamp +-1e6) and
+// counted (`fc_master_stats::nonFiniteIn`): converting a NaN is bit-identical to converting a zero in its place, as
+// processing one is on a plain handle. Without that a windowed sinc would spread one bad sample over its kernel.
+
+// The exact delivered length for `inFrames` of programme — `DeliveryConverter::deliveredFrames`, read out, never
+// recomputed: the natural `ceil(inFrames * deliveryRate / sampleRate)` in double is wrong on real lengths (147
+// frames at 44.1 -> 48 kHz is 160, and the double says 161). `*outFrames` is written only on FC_OK.
+fc_status fc_master_delivered_frames (fc_master h, uint32_t inFrames, uint32_t* outFrames);
+
+// A render at the parameters of the last `fc_master_configure`, over the whole programme. Asks the heap for
+// nothing: it converts into `out` and renders there. Refused with FC_ERR_STATE after a solve, until a configure,
+// for the reason given at `fc_master_process`.
+fc_status fc_master_render_delivered (fc_master h, const float* in, uint32_t inFrames, float* out, uint32_t outFrames);
+
+// `fc_master_solve` over the delivered programme. Everything said there holds — FC_OK is a verdict, `params`
+// travel with the call, the handle is left unusable for rendering until the next configure, a zero-length
+// programme is forwarded to the solver for its verdict. The budget is FC_NEED_SOLVE on this handle.
+fc_status fc_master_solve_delivered (fc_master h, const fc_master_params* params, const fc_loudness_request* req,
+                                     const float* in, uint32_t inFrames, float* out, uint32_t outFrames,
+                                     fc_solution* out_solution);
+
 fc_status fc_solution_summary_get (fc_solution s, fc_solution_summary* out);
 fc_status fc_solution_measurement (fc_solution s, fc_measurement* out);
 // Copies min(logCount, cap) pass records into `out` and reports how many were written. Same ownership
@@ -768,10 +946,23 @@ fc_status fc_solution_destroy (fc_solution s);
 // 0.874 full scale. So a caller starts from these and overwrites what it means to change; a caller that
 // starts from zeroed memory is rendering something nobody chose.
 //
-// `header` is filled in too, so the result is immediately usable as an argument. NB
-// `fc_master_config_default` leaves `sampleRate` and `channels` at ZERO on purpose: the core has no
+// The FROZEN writers stamp the header themselves (at v1), so their result is immediately usable as an argument;
+// the VERSIONED ones leave the caller's stamp as it is. NB both config writers leave `sampleRate` and `channels`
+// at ZERO on purpose: the core has no
 // default for either, so writing one would be this file choosing a geometry for every caller who forgot
 // to state one. `fc_master_create` refuses both, which is how the caller finds out.
+//
+// VERSIONED: `fc_*_defaults` require `out` to carry a stamped header of any version this build knows (FC_INIT,
+// or `Struct.init()` in JS), leave that header as it is, and write exactly that version's size — the only
+// writers a caller newer than v1 should use. Same refusals as any OUT struct (FC_ERR_NULL, _ALIGNMENT, _SPAN,
+// _ABI_VERSION, _STRUCT_SIZE) and guarded like every status-returning entry point.
+fc_status fc_master_params_defaults (fc_master_params* out);
+fc_status fc_master_config_defaults (fc_master_config* out);
+fc_status fc_loudness_request_defaults (fc_loudness_request* out);
+
+// FROZEN AT v1 (rule 8 of VERSIONING): these stamp v1 and write exactly v1's bytes, however large the struct the
+// caller compiled against has since become. They exist for callers built against v1 and nothing else — a v2
+// field set after one of these lies past the stamped size and is not read.
 void fc_master_params_default (fc_master_params* out);
 void fc_master_config_default (fc_master_config* out);
 void fc_loudness_request_default (fc_loudness_request* out);
@@ -781,6 +972,11 @@ void fc_loudness_request_default (fc_loudness_request* out);
 uint32_t fc_master_abi_version (void);
 uint32_t fc_master_max_channels (void);
 uint32_t fc_master_max_eq_bands (void);
+// The size table (rule 5): the bytes of struct `id` at `version`, 0 for a pair this build does not have — an
+// unknown id, a version it does not know, or a struct that did not exist yet at that version.
+uint32_t fc_master_sizeof (int32_t id, uint32_t version);
+// FROZEN AT v1, like the `_default` writers: the sizes a v1 loader compares against. A v1 page then fails on
+// the version check, which says what is wrong, instead of on a size, which would blame its own layout file.
 uint32_t fc_master_sizeof_params (void);
 uint32_t fc_master_sizeof_config (void);
 

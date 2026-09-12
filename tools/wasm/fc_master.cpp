@@ -18,6 +18,7 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/mastering/DeliveredMastering.h>
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
@@ -202,11 +203,8 @@ static_assert (! BraceInit<dynamics::CompressorParams,
     (void) k_block; (void) k_eq; (void) k_mb; (void) k_comp; (void) k_clip; (void) k_lim; (void) k_dith;
     (void) k_clook; (void) k_llook; (void) k_os; (void) k_taps; (void) k_hpf;
 
-    // `p_mix` and `r_mix` are the one pair of members this file does NOT map, and the pins name them
-    // anyway: they are what made adding the field a build break here rather than a silent gap. The C
-    // structs are short of `compressorMix` until the ABI's version rule (P57) exists, `toCore` leaves it
-    // at the core's default of 1 — bit-identical to the chain before the field — and `fromCore` does not
-    // read it. fc_master_abi.h records the same debt where a reader of the C header will see it.
+    // `p_mix` and `r_mix` arrived with P60 as a build break here, and are mapped since ABI v3 — `toCore` and
+    // `fromCore` below, at the end of `fc_master_params` and `fc_master_resolved`.
     MasteringChainParams prm {};
     auto& [p_in, p_pre, p_eq, p_mb, p_comp, p_clip, p_lim, p_dith,
            p_bE, p_bM, p_bC, p_bK, p_bL, p_bD, p_mix] = prm;
@@ -219,6 +217,172 @@ static_assert (! BraceInit<dynamics::CompressorParams,
     (void) r_lat; (void) r_blk; (void) r_clook; (void) r_clip; (void) r_lim; (void) r_llook;
     (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb; (void) r_mix;
 }
+
+//==============================================================================
+// THE ABI'S OWN LAYOUT — the pins that make VERSIONING's rules mechanical rather than a promise.
+//
+// The size table is the single source (rule 5); `sizeFor` reads it, and everything that checks a caller's
+// `structSize` goes through `sizeFor` with the caller's version. The pins below tie the table to this build's
+// structs: the newest row of every struct is its `sizeof`, a struct's rows only ever grow, no struct with a header
+// ends in implicit padding (rule 4), and every top-level field sits at the offset the version that added it published. A field
+// moved, retyped or inserted mid-struct is a build error here, not a render.
+template <typename T> struct AbiId;   // declared, never defined: an unmapped struct fails to compile
+template <> struct AbiId<fc_master_config>    { static constexpr int id = FC_STRUCT_CONFIG; };
+template <> struct AbiId<fc_master_params>    { static constexpr int id = FC_STRUCT_PARAMS; };
+template <> struct AbiId<fc_master_resolved>  { static constexpr int id = FC_STRUCT_RESOLVED; };
+template <> struct AbiId<fc_master_stats>     { static constexpr int id = FC_STRUCT_STATS; };
+template <> struct AbiId<fc_need>             { static constexpr int id = FC_STRUCT_NEED; };
+template <> struct AbiId<fc_loudness_request> { static constexpr int id = FC_STRUCT_REQUEST; };
+template <> struct AbiId<fc_measurement>      { static constexpr int id = FC_STRUCT_MEASUREMENT; };
+template <> struct AbiId<fc_solution_summary> { static constexpr int id = FC_STRUCT_SUMMARY; };
+
+constexpr std::uint32_t sizeFor (int id, std::uint32_t version) noexcept
+{
+    if (version < 1u || version > FC_MASTER_ABI_VERSION) return 0u;
+    std::uint32_t since = 0u, bytes = 0u;
+#define FC_ROW(sid, v, b) \
+    if ((int) (sid) == id && (std::uint32_t) (v) <= version && (std::uint32_t) (v) > since) { since = (v); bytes = (b); }
+    FC_MASTER_STRUCT_SIZES (FC_ROW)
+#undef FC_ROW
+    return bytes;
+}
+
+// Rows of one struct, in version order, strictly grow — and no two rows claim the same version. The ids walked are
+// the table's own, not a hand-kept range, and a struct may be ABSENT (0) before the version that introduced it
+// (rule 5) — but once it exists it never shrinks and never vanishes.
+constexpr int tableMaxId() noexcept
+{
+    int m = -1;
+#define FC_MAXID(sid, v, b) if ((int) (sid) > m) m = (int) (sid); (void) (v); (void) (b);
+    FC_MASTER_STRUCT_SIZES (FC_MAXID)
+#undef FC_MAXID
+    return m;
+}
+constexpr bool tableGrows() noexcept
+{
+    for (int id = 0; id <= tableMaxId(); ++id)
+    {
+        std::uint32_t prev = 0u;
+        for (std::uint32_t v = 1u; v <= FC_MASTER_ABI_VERSION; ++v)
+        {
+            const std::uint32_t s = sizeFor (id, v);
+            if (prev != 0u && s < prev) return false;      // shrank, or vanished after it existed
+            prev = s;
+        }
+        if (prev == 0u) return false;                      // an id with no size at the current version
+        int rows = 0;
+#define FC_COUNT(sid, v, b) if ((int) (sid) == id) { ++rows; (void) (v); (void) (b); }
+        FC_MASTER_STRUCT_SIZES (FC_COUNT)
+#undef FC_COUNT
+        // A struct whose size did not change between two rows would be a row that says nothing — or a version
+        // bump nobody can detect by size (rule 4). Counting the distinct sizes against the rows catches both.
+        int distinct = 0; std::uint32_t last = 0u;
+        for (std::uint32_t v = 1u; v <= FC_MASTER_ABI_VERSION; ++v)
+            if (const std::uint32_t s = sizeFor (id, v); s != last) { ++distinct; last = s; }
+        if (distinct != rows) return false;
+    }
+    return true;
+}
+static_assert (tableGrows(), "FC_MASTER_STRUCT_SIZES: a struct's rows must strictly grow, one row per size");
+
+template <typename T>
+constexpr bool newestRowIsSizeof() noexcept { return sizeFor (AbiId<T>::id, FC_MASTER_ABI_VERSION) == sizeof (T); }
+static_assert (newestRowIsSizeof<fc_master_config>());
+static_assert (newestRowIsSizeof<fc_master_params>());
+static_assert (newestRowIsSizeof<fc_master_resolved>());
+static_assert (newestRowIsSizeof<fc_master_stats>());
+static_assert (newestRowIsSizeof<fc_need>());
+static_assert (newestRowIsSizeof<fc_loudness_request>());
+static_assert (newestRowIsSizeof<fc_measurement>());
+static_assert (newestRowIsSizeof<fc_solution_summary>());
+
+// Rule 4: no struct with a header ends in padding the layout does not name.
+// The size of the last field is the compiler's (`sizeof (T::last)`), not a literal: a `double` retyped to `float`
+// leaves the struct's size and the field's offset where they were and opens four bytes of padding — a literal 8 here
+// would have agreed with both.
+#define FC_ENDS_AT(T, last) \
+    static_assert (sizeof (T) == offsetof (T, last) + sizeof (T::last), #T " ends in implicit padding — name it (rule 4)")
+FC_ENDS_AT (fc_master_config,    deliveryRate);
+FC_ENDS_AT (fc_master_params,    compressorMix);
+FC_ENDS_AT (fc_master_resolved,  compressorMix);
+FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
+FC_ENDS_AT (fc_need,             _pad0);
+FC_ENDS_AT (fc_loudness_request, initialGainDb);
+FC_ENDS_AT (fc_measurement,      lraValid);
+FC_ENDS_AT (fc_solution_summary, gainAboveDb);
+// and the types the table's sizes were computed from
+static_assert (sizeof (fc_master_config::deliveryRate) == 8 && sizeof (fc_master_params::compressorMix) == 8
+               && sizeof (fc_master_resolved::compressorMix) == 8);
+#undef FC_ENDS_AT
+
+// Rule 3: what never grows. A size moved here is a frozen struct that grew.
+static_assert (sizeof (fc_header) == 8);
+static_assert (sizeof (fc_eq_lane) == 40 && sizeof (fc_eq_dyn) == 48 && sizeof (fc_eq_band) == 264);
+static_assert (sizeof (fc_mono_bass) == 12 && sizeof (fc_compressor) == 88 && sizeof (fc_clipper) == 28);
+static_assert (sizeof (fc_limiter) == 16 && sizeof (fc_dither) == 24 && sizeof (fc_gr_limit) == 16);
+static_assert (sizeof (fc_solve_pass) == 64 && sizeof (fc_gr_stats) == 64);
+
+// Every top-level field at the offset it was published at. A field inserted anywhere but the end moves a number.
+#define FC_AT(T, f, off) static_assert (offsetof (T, f) == (off), #T "::" #f " moved")
+FC_AT (fc_master_config, header, 0);           FC_AT (fc_master_config, sampleRate, 8);
+FC_AT (fc_master_config, channels, 16);        FC_AT (fc_master_config, internalBlock, 20);
+FC_AT (fc_master_config, eq, 24);              FC_AT (fc_master_config, monoBass, 28);
+FC_AT (fc_master_config, compressor, 32);      FC_AT (fc_master_config, clipper, 36);
+FC_AT (fc_master_config, limiter, 40);         FC_AT (fc_master_config, dither, 44);
+FC_AT (fc_master_config, compressorLookaheadMs, 48); FC_AT (fc_master_config, limiterLookaheadMs, 56);
+FC_AT (fc_master_config, oversampleFactor, 64); FC_AT (fc_master_config, tapsPerPhase, 68);
+FC_AT (fc_master_config, sidechainHpfHz, 72);  FC_AT (fc_master_config, deliveryRate, 80);        // v2
+
+FC_AT (fc_master_params, header, 0);           FC_AT (fc_master_params, inputGainDb, 8);
+FC_AT (fc_master_params, preLimiterGainDb, 16); FC_AT (fc_master_params, eqBands, 24);
+FC_AT (fc_master_params, monoBass, 6360);      FC_AT (fc_master_params, compressor, 6376);
+FC_AT (fc_master_params, clipper, 6464);       FC_AT (fc_master_params, limiter, 6496);
+FC_AT (fc_master_params, dither, 6512);        FC_AT (fc_master_params, bypassEq, 6536);
+FC_AT (fc_master_params, bypassMonoBass, 6540); FC_AT (fc_master_params, bypassCompressor, 6544);
+FC_AT (fc_master_params, bypassClipper, 6548); FC_AT (fc_master_params, bypassLimiter, 6552);
+FC_AT (fc_master_params, bypassDither, 6556); FC_AT (fc_master_params, compressorMix, 6560);             // v3
+
+FC_AT (fc_master_resolved, header, 0);         FC_AT (fc_master_resolved, latencySamples, 8);
+FC_AT (fc_master_resolved, internalBlock, 12); FC_AT (fc_master_resolved, compressorLookahead, 16);
+FC_AT (fc_master_resolved, clipperLatency, 20); FC_AT (fc_master_resolved, limiterLatency, 24);
+FC_AT (fc_master_resolved, limiterLookahead, 28); FC_AT (fc_master_resolved, oversampleFactor, 32);
+FC_AT (fc_master_resolved, compressorTapOffset, 36); FC_AT (fc_master_resolved, limiterTapOffset, 40);
+FC_AT (fc_master_resolved, limiterCeilingDbTp, 48); FC_AT (fc_master_resolved, limiterReleaseMs, 56);
+FC_AT (fc_master_resolved, monoBass, 64);      FC_AT (fc_master_resolved, tapOversampleFactor, 76);
+FC_AT (fc_master_resolved, compressorMix, 80);                                                              // v3
+
+FC_AT (fc_master_stats, header, 0);            FC_AT (fc_master_stats, framesIn, 8);
+FC_AT (fc_master_stats, framesFlushed, 16);    FC_AT (fc_master_stats, nonFiniteIn, 24);
+
+FC_AT (fc_need, header, 0);                    FC_AT (fc_need, callBytes, 8);
+FC_AT (fc_need, solverPrepareBytes, 16);       FC_AT (fc_need, facadeBytes, 24);
+FC_AT (fc_need, solverPrepared, 32);           FC_AT (fc_need, _pad0, 36);
+
+FC_AT (fc_loudness_request, header, 0);        FC_AT (fc_loudness_request, targetLufs, 8);
+FC_AT (fc_loudness_request, toleranceLu, 16);  FC_AT (fc_loudness_request, maxTruePeakDbTp, 24);
+FC_AT (fc_loudness_request, truePeakAimDb, 32); FC_AT (fc_loudness_request, limiterGr, 40);
+FC_AT (fc_loudness_request, compressorGr, 56); FC_AT (fc_loudness_request, minPlrDb, 72);
+FC_AT (fc_loudness_request, maxLraLossLu, 80); FC_AT (fc_loudness_request, inputLoudnessRangeLu, 88);
+FC_AT (fc_loudness_request, activityThresholdDb, 96); FC_AT (fc_loudness_request, maxPasses, 104);
+FC_AT (fc_loudness_request, initialGainDb, 112);
+
+FC_AT (fc_measurement, header, 0);             FC_AT (fc_measurement, integratedLufs, 8);
+FC_AT (fc_measurement, truePeakDbTp, 16);      FC_AT (fc_measurement, samplePeakDb, 24);
+FC_AT (fc_measurement, loudnessRangeLu, 32);   FC_AT (fc_measurement, plrDb, 40);
+FC_AT (fc_measurement, compressor, 48);        FC_AT (fc_measurement, limiter, 112);
+FC_AT (fc_measurement, limiterMaxReconstructedPeakDb, 176); FC_AT (fc_measurement, latencySamples, 184);
+FC_AT (fc_measurement, gatingBlocks, 188);     FC_AT (fc_measurement, droppedBlocks, 192);
+FC_AT (fc_measurement, nonFiniteSubHops, 196); FC_AT (fc_measurement, loudnessValid, 200);
+FC_AT (fc_measurement, lraValid, 204);
+
+FC_AT (fc_solution_summary, header, 0);        FC_AT (fc_solution_summary, status, 8);
+FC_AT (fc_solution_summary, binding, 12);      FC_AT (fc_solution_summary, alsoViolated, 16);
+FC_AT (fc_solution_summary, preLimiterGainDb, 24); FC_AT (fc_solution_summary, ceilingDbTp, 32);
+FC_AT (fc_solution_summary, passes, 40);       FC_AT (fc_solution_summary, logCount, 44);
+FC_AT (fc_solution_summary, activityThresholdDb, 48); FC_AT (fc_solution_summary, achievedBelowLufs, 56);
+FC_AT (fc_solution_summary, achievedAboveLufs, 64); FC_AT (fc_solution_summary, gainBelowDb, 72);
+FC_AT (fc_solution_summary, gainAboveDb, 80);
+#undef FC_AT
 
 //==============================================================================
 // MEMORY VALIDATION — everything below arrives from a page's JavaScript.
@@ -293,8 +457,11 @@ bool partiallyOverlaps (const void* a, const void* b, std::uint64_t bytes) noexc
     return (x < y + bytes) && (y < x + bytes);
 }
 
+// Rules 6 and 7 of VERSIONING. `bytes` comes back as the size of the CALLER's version, and it is the number every
+// later check on that struct uses — a bound or an alias test taken with this build's `sizeof` would refuse a
+// legal call whose older, shorter struct sits right against the next thing in the heap.
 template <typename T>
-fc_status checkHeaderIn (const T* p) noexcept
+fc_status checkHeader (const T* p, std::uint32_t& bytes) noexcept
 {
     if (p == nullptr) return FC_ERR_NULL;
     if ((reinterpret_cast<std::uintptr_t> (p) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
@@ -303,23 +470,37 @@ fc_status checkHeaderIn (const T* p) noexcept
     // FC_ERR_SPAN — the wrong diagnosis, on the one field whose job is to catch exactly that mistake.
     // Eight bytes is what the version costs to read, so eight bytes is what is bounded first.
     if (! inHeap (p, sizeof (fc_header))) return FC_ERR_SPAN;
-    if (p->header.abiVersion != FC_MASTER_ABI_VERSION) return FC_ERR_ABI_VERSION;
-    if (p->header.structSize != (std::uint32_t) sizeof (T)) return FC_ERR_STRUCT_SIZE;
-    if (! inHeap (p, sizeof (T))) return FC_ERR_SPAN;
+    const std::uint32_t size = sizeFor (AbiId<T>::id, p->header.abiVersion);
+    if (size == 0u) return FC_ERR_ABI_VERSION;              // older than v1, or newer than this build
+    if (p->header.structSize != size) return FC_ERR_STRUCT_SIZE;
+    if (! inHeap (p, size)) return FC_ERR_SPAN;
+    bytes = size;
     return FC_OK;
 }
 
-// An OUT struct is checked the same way, because the caller states which layout it expects to be
-// written — a facade that wrote its own layout into a buffer sized for another one is the same defect
-// with the arrow reversed.
-template <typename T>
-fc_status checkHeaderOut (T* p) noexcept { return checkHeaderIn (const_cast<const T*> (p)); }
+// The defaults writers, at this build's layout — defined with the entry points that publish them.
+void writeDefaults (fc_master_config& out) noexcept;
+void writeDefaults (fc_master_params& out) noexcept;
+void writeDefaults (fc_loudness_request& out) noexcept;
 
+// An IN struct as THIS build lays it out: its defaults first, then exactly the caller's bytes over them. A v1
+// config read this way has `deliveryRate == 0` — the default, which is v1 — and never the bytes that follow the
+// caller's 80, whatever they hold.
 template <typename T>
-void stampHeader (T* p) noexcept
+T loadIn (const T* p, std::uint32_t bytes) noexcept
 {
-    p->header.abiVersion = FC_MASTER_ABI_VERSION;
-    p->header.structSize = (std::uint32_t) sizeof (T);
+    T local {};
+    writeDefaults (local);
+    std::memcpy (&local, p, bytes);
+    return local;
+}
+
+// The OUT half. The caller's header stays as it is — an echo — and exactly `bytes` are written, header excluded.
+template <typename T>
+void writeOut (T* p, const T& local, std::uint32_t bytes) noexcept
+{
+    std::memcpy (static_cast<void*> ((unsigned char*) p + sizeof (fc_header)),
+                 (const unsigned char*) &local + sizeof (fc_header), bytes - sizeof (fc_header));
 }
 
 // A parameter field the core has no verdict for. Ranges are NOT checked here — the core clamps them by
@@ -394,7 +575,10 @@ FC_MAP_ENUM (mapGrStat, GrStatistic,
 fc_status toCore (const fc_master_config& c, MasteringChainConfig& out) noexcept
 {
     if (! fin (c.sampleRate) || ! fin (c.compressorLookaheadMs)
-        || ! fin (c.limiterLookaheadMs) || ! fin (c.sidechainHpfHz)) return FC_ERR_NON_FINITE;
+        || ! fin (c.limiterLookaheadMs) || ! fin (c.sidechainHpfHz) || ! fin (c.deliveryRate)) return FC_ERR_NON_FINITE;
+    // `deliveryRate` has no core field to land in, and that is the design: it is not chain topology (a chain
+    // does not emit a variable frame count) but the choice of which core object stands in front of the chain.
+    // `fc_master_create` reads it from the struct.
     out.internalBlock         = c.internalBlock;
     out.eq                    = c.eq != 0;
     out.monoBass              = c.monoBass != 0;
@@ -494,6 +678,10 @@ fc_status toCore (const fc_master_params& p, MasteringChainParams& out) noexcept
 
     out.inputGainDb      = p.inputGainDb;
     out.preLimiterGainDb = p.preLimiterGainDb;
+    // v3. Finite is this file's check; the RANGE is the core's, which clamps to [0, 1] and reports the applied
+    // value in `resolved` — and would map a NaN to 1 without saying so, which is why a NaN stops here.
+    if (! fin (p.compressorMix)) return FC_ERR_NON_FINITE;
+    out.compressorMix    = p.compressorMix;
     out.bypassEq         = p.bypassEq         != 0;
     out.bypassMonoBass   = p.bypassMonoBass   != 0;
     out.bypassCompressor = p.bypassCompressor != 0;
@@ -529,7 +717,6 @@ fc_status toCore (const fc_loudness_request& r, LoudnessRequest& out) noexcept
 
 void fromCore (const MasteringChainResolved& r, int tapOs, fc_master_resolved& out) noexcept
 {
-    stampHeader (&out);
     out.latencySamples      = r.latencySamples;
     out.internalBlock       = r.internalBlock;
     out.compressorLookahead = r.compressorLookahead;
@@ -545,6 +732,7 @@ void fromCore (const MasteringChainResolved& r, int tapOs, fc_master_resolved& o
     out.monoBass.frequencyHz = r.monoBass.frequencyHz;
     out.monoBass.lowWidth    = r.monoBass.lowWidth;
     out.tapOversampleFactor = tapOs;
+    out.compressorMix       = r.compressorMix;          // v3
 }
 
 void fromCore (const GainReductionStats& s, fc_gr_stats& out) noexcept
@@ -557,7 +745,6 @@ void fromCore (const GainReductionStats& s, fc_gr_stats& out) noexcept
 
 void fromCore (const MasterMeasurement& m, fc_measurement& out) noexcept
 {
-    stampHeader (&out);
     out.integratedLufs  = m.integratedLufs;
     out.truePeakDbTp    = m.truePeakDbTp;
     out.samplePeakDb    = m.samplePeakDb;
@@ -597,6 +784,10 @@ struct MasterInstance
     MasteringChain       chain;
     OfflineRenderer      renderer;
     TargetLoudnessSolver solver;
+    // v2: a DELIVERING handle (`fc_master_config::deliveryRate != 0`). The chain above then runs at the delivery
+    // rate and this stands in front of it; unprepared and empty on a handle that does not deliver.
+    DeliveredMastering   delivered;
+    bool                 delivering = false;
     // 64 bits, because 32 overflows on a legal stream: 4096-frame calls wrap `framesIn` after about
     // 24 h 51 min at 48 kHz and 6 h 13 min at 192 kHz, and a counter that can read zero after having
     // been non-zero is worse than no counter.
@@ -635,6 +826,15 @@ Slot g_slots[kMaxHandles];
 // quantum — so it is chosen once, here, for the solver's tap sizing and never exposed. Named rather than
 // spelled twice now that `fc_master_need_create` has to budget the very renderer `fc_master_create` builds.
 constexpr int kRendererBlock = 4096;
+
+// The verdict and the budget of a create — ONE core expression per kind of handle, chosen by the field that
+// decides the kind. Shared by `fc_master_create` and `fc_master_need_create`, so the two cannot disagree.
+std::uint64_t createBytesFor (const fc_master_config& c, const MasteringChainConfig& cc) noexcept
+{
+    return c.deliveryRate != 0.0
+        ? DeliveredMastering::createBytes (c.sampleRate, c.deliveryRate, c.channels, cc, kRendererBlock)
+        : mastering::createBytes (c.sampleRate, c.channels, cc, kRendererBlock);
+}
 
 // THE CALL THAT NEVER RETURNED. Under -fno-exceptions an exhausted heap ABORTS inside a core call, and the module is
 // not stopped by it: emscripten lets the page call again, the heap is intact, and every object is wherever the abort
@@ -749,11 +949,15 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     // unreachable and undestroyable. A refused call is indistinguishable from one never made — that
     // includes its arguments.
     if (const fc_status st = checkScalarOut (out); st != FC_OK) return st;
-    if (const fc_status st = checkHeaderIn (cfg); st != FC_OK) return st;
+    std::uint32_t cfgBytes = 0;
+    if (const fc_status st = checkHeader (cfg, cfgBytes); st != FC_OK) return st;
+    const fc_master_config c = loadIn (cfg, cfgBytes);
 
     MasteringChainConfig cc {};
-    if (const fc_status st = toCore (*cfg, cc); st != FC_OK) return st;
-    if (cfg->channels < 1 || cfg->channels > core::kMaxChannels) return FC_ERR_REFUSED_BY_CORE;
+    if (const fc_status st = toCore (c, cc); st != FC_OK) return st;
+    if (c.channels < 1 || c.channels > core::kMaxChannels) return FC_ERR_REFUSED_BY_CORE;
+    const bool   delivering = c.deliveryRate != 0.0;
+    const double chainRate  = delivering ? c.deliveryRate : c.sampleRate;
 
     std::uint32_t h = 0;
     const int idx = allocSlot (Kind::Master, h);
@@ -770,8 +974,9 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     //
     // ONE CORE CALL DECIDES AND BUDGETS. `createBytes` returns 0 for exactly the geometries the core will
     // not build, so the verdict here and the number `fc_master_need_create` publishes cannot disagree —
-    // they are the same expression. Arithmetic of this file's own is what that avoids.
-    if (mastering::createBytes (cfg->sampleRate, cfg->channels, cc, kRendererBlock) == 0u)
+    // they are the same expression. Arithmetic of this file's own is what that avoids. A delivering handle asks
+    // the one core function that covers the chain at the delivery rate AND the converter.
+    if (createBytesFor (c, cc) == 0u)
     {
         // `abandonSlot`, not `freeSlot`: no handle ever left this function, so there is nothing for a
         // stale one to alias and no reason to spend a generation. (With the generation at 24 bits this
@@ -791,12 +996,14 @@ FC_EXPORT fc_status fc_master_create (const fc_master_config* cfg, fc_master* ou
     // Neither can refuse now — the geometry was admitted above, and that equivalence is pinned across the
     // whole rate x width x topology matrix rather than asserted. Kept as a belt: a stage that grows a new
     // refusal must fail loudly here rather than leave a half-built instance answering calls.
-    if (! m.renderer.prepare (cfg->channels, kRendererBlock)
-        || ! m.chain.prepare (cfg->sampleRate, cfg->channels, cc))
+    if (! m.renderer.prepare (c.channels, kRendererBlock)
+        || ! m.chain.prepare (chainRate, c.channels, cc)
+        || (delivering && ! m.delivered.prepare (c.sampleRate, c.deliveryRate, c.channels, kRendererBlock)))
     {
         abandonSlot (g_slots[idx]);
         return FC_ERR_REFUSED_BY_CORE;
     }
+    m.delivering = delivering;
     *out = h;
     return FC_OK;
 }
@@ -818,11 +1025,12 @@ FC_EXPORT fc_status fc_master_configure (fc_master h, const fc_master_params* pa
     // caller gets back to the head of one — see the long note in fc_master_abi.h for why this call has
     // to re-prepare at all.
     if (m.audioSeen) return FC_ERR_STATE;
-    if (const fc_status st = checkHeaderIn (params); st != FC_OK) return st;
-    if (const fc_status st = checkHeaderOut (resolved); st != FC_OK) return st;
+    std::uint32_t prmBytes = 0, resBytes = 0;
+    if (const fc_status st = checkHeader (params, prmBytes); st != FC_OK) return st;
+    if (const fc_status st = checkHeader (resolved, resBytes); st != FC_OK) return st;
 
     MasteringChainParams cp {};
-    if (const fc_status st = toCore (*params, cp); st != FC_OK) return st;
+    if (const fc_status st = toCore (loadIn (params, prmBytes), cp); st != FC_OK) return st;
 
     // NOTHING HAS MOVED UNTIL HERE. A refused call above left the chain exactly as it was, which is what
     // makes "a refused call is indistinguishable from one never made" true at this boundary too.
@@ -832,7 +1040,9 @@ FC_EXPORT fc_status fc_master_configure (fc_master h, const fc_master_params* pa
 
     m.framesIn = m.framesFlushed = 0;
     m.solverRan = false;                    // a known parameter set is back in the chain
-    fromCore (m.chain.resolved(), m.chain.tapOversampleFactor(), *resolved);
+    fc_master_resolved r {};
+    fromCore (m.chain.resolved(), m.chain.tapOversampleFactor(), r);
+    writeOut (resolved, r, resBytes);
     return FC_OK;
 }
 
@@ -841,8 +1051,11 @@ FC_EXPORT fc_status fc_master_resolved_get (fc_master h, fc_master_resolved* out
     FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
-    fromCore (s->master->chain.resolved(), s->master->chain.tapOversampleFactor(), *out);
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
+    fc_master_resolved r {};
+    fromCore (s->master->chain.resolved(), s->master->chain.tapOversampleFactor(), r);
+    writeOut (out, r, bytes);
     return FC_OK;
 }
 
@@ -857,6 +1070,7 @@ FC_EXPORT fc_status fc_master_process (fc_master h, const float* in, float* out,
     // THE HANDLE'S STATE COMES BEFORE THE NO-OP. `n == 0` moves nothing, but the contract says this
     // handle cannot be processed at all until it is configured, and a call that answers FC_OK on a
     // handle the header says is refused makes the sentence false for one input.
+    if (m.delivering) return FC_ERR_STATE;  // two lengths cannot share one stride — fc_master_render_delivered
     if (m.solverRan) return FC_ERR_STATE;   // the chain holds the SOLVER's parameters — see MasterInstance
     if (frames == 0)
     {
@@ -889,6 +1103,7 @@ FC_EXPORT fc_status fc_master_flush (fc_master h, float* out, std::uint32_t capa
     if (s == nullptr) return FC_ERR_HANDLE;
     auto& m = *s->master;
     const int nch = m.chain.numChannels();
+    if (m.delivering) return FC_ERR_STATE;  // as process(): a delivering handle has no stream to drain
     if (m.solverRan) return FC_ERR_STATE;   // as process(): the chain's configuration is not the caller's
     if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
     if (capacity == 0) return FC_ERR_CAPACITY;
@@ -928,10 +1143,17 @@ FC_EXPORT fc_status fc_master_get_stats (fc_master h, fc_master_stats* out)
     FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
-    out->framesIn      = s->master->framesIn;
-    out->framesFlushed = s->master->framesFlushed;
-    out->nonFiniteIn   = s->master->chain.nonFiniteInputSamples();
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
+    fc_master_stats v {};
+    v.framesIn      = s->master->framesIn;
+    v.framesFlushed = s->master->framesFlushed;
+    // A DELIVERING handle's programmes are gated by the converter, ahead of the conversion, so the chain behind it
+    // never sees the bad sample; the count that means "samples of the caller's programme that were replaced" is the
+    // converter's. One or the other, chosen by the handle's kind — never a sum.
+    v.nonFiniteIn   = s->master->delivering ? s->master->delivered.nonFiniteInputSamples()
+                                            : s->master->chain.nonFiniteInputSamples();
+    writeOut (out, v, bytes);
     return FC_OK;
 }
 
@@ -965,18 +1187,29 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
     FC_GUARD;
     Slot* s = lookup (h, Kind::Master);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
     if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;   // the core takes `int`
     auto& m = *s->master;
     const double fs  = m.chain.sampleRate();
     const int    nch = m.chain.numChannels();
+    // A DELIVERING HANDLE budgets the calls it can make, for the `frames` the caller hands IN — see fc_need. A
+    // delivered length the core cannot receive is the same refusal the call itself would give.
+    const double srcFs = m.delivered.sourceRate(), dstFs = m.delivered.deliveryRate();
+    if (m.delivering && op != FC_NEED_CONFIGURE)
+    {
+        const long long d = DeliveredMastering::deliveredFrames (srcFs, dstFs, (long long) frames);
+        if (d < 0 || d > 0x7FFFFFFFLL) return FC_ERR_RANGE;
+    }
     std::uint64_t call = 0, facade = 0;
     bool solverOp = true;                  // the solver's two fields are NEUTRAL for a configure
     switch (op)
     {
-        case FC_NEED_SOLVE:       call = TargetLoudnessSolver::solveBytes (fs, nch, (int) frames);
+        case FC_NEED_SOLVE:       call = m.delivering ? DeliveredMastering::solveBytes (srcFs, dstFs, nch, (long long) frames)
+                                                      : TargetLoudnessSolver::solveBytes (fs, nch, (int) frames);
                                   facade = sizeof (LoudnessSolution);                     break;
-        case FC_NEED_MEASURE_LRA: call = TargetLoudnessSolver::measureRangeBytes (fs, (int) frames);
+        case FC_NEED_MEASURE_LRA: call = m.delivering ? DeliveredMastering::measureRangeBytes (srcFs, dstFs, nch, (long long) frames)
+                                                      : TargetLoudnessSolver::measureRangeBytes (fs, (int) frames);
                                   facade = 0;                                             break;
         // A re-preparation has no programme, so the count is not ignored — it is REQUIRED to be 0. An
         // argument a call reads as nothing is an argument a caller can be wrong about for ever.
@@ -988,15 +1221,16 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
                                   facade = 0; solverOp = false;                           break;
         default:                  return FC_ERR_ENUM;
     }
-    stampHeader (out);
-    out->callBytes          = call;
+    fc_need v {};
+    v.callBytes          = call;
     // The arguments are the ones this file hands the solver's prepare() itself — see fc_master_solve.
-    out->solverPrepareBytes = solverOp ? TargetLoudnessSolver::prepareBytes (m.renderer.blockSize(),
-                                                                            m.chain.internalBlock(),
-                                                                            m.chain.tapOversampleFactor())
-                                       : 0u;
-    out->facadeBytes        = facade;
-    out->solverPrepared     = (solverOp && m.solver.isPrepared()) ? 1 : 0;
+    v.solverPrepareBytes = solverOp ? TargetLoudnessSolver::prepareBytes (m.renderer.blockSize(),
+                                                                         m.chain.internalBlock(),
+                                                                         m.chain.tapOversampleFactor())
+                                    : 0u;
+    v.facadeBytes        = facade;
+    v.solverPrepared     = (solverOp && m.solver.isPrepared()) ? 1 : 0;
+    writeOut (out, v, bytes);
     return FC_OK;
 }
 
@@ -1007,12 +1241,14 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
 FC_EXPORT fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out)
 {
     FC_GUARD;
-    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
-    if (const fc_status st = checkHeaderIn (cfg); st != FC_OK) return st;
+    std::uint32_t outBytes = 0, cfgBytes = 0;
+    if (const fc_status st = checkHeader (out, outBytes); st != FC_OK) return st;
+    if (const fc_status st = checkHeader (cfg, cfgBytes); st != FC_OK) return st;
+    const fc_master_config c = loadIn (cfg, cfgBytes);
 
     MasteringChainConfig cc {};
-    if (const fc_status st = toCore (*cfg, cc); st != FC_OK) return st;
-    if (cfg->channels < 1 || cfg->channels > core::kMaxChannels) return FC_ERR_REFUSED_BY_CORE;
+    if (const fc_status st = toCore (c, cc); st != FC_OK) return st;
+    if (c.channels < 1 || c.channels > core::kMaxChannels) return FC_ERR_REFUSED_BY_CORE;
 
     // THE TABLE IS PART OF THE ANSWER. Without this a budget was published for a create that returns
     // FC_ERR_EXHAUSTED with every slot taken — a number for a call that cannot be made.
@@ -1022,14 +1258,15 @@ FC_EXPORT fc_status fc_master_need_create (const fc_master_config* cfg, fc_need*
 
     // The same expression `fc_master_create` decides by, so the two cannot disagree: 0 is exactly the
     // geometries the core will not build, and it never reaches `out`.
-    const std::uint64_t call = mastering::createBytes (cfg->sampleRate, cfg->channels, cc, kRendererBlock);
+    const std::uint64_t call = createBytesFor (c, cc);
     if (call == 0u) return FC_ERR_REFUSED_BY_CORE;
 
-    stampHeader (out);
-    out->callBytes          = call;
-    out->solverPrepareBytes = 0u;                     // neutral: a create does not touch the search
-    out->facadeBytes        = sizeof (MasterInstance);
-    out->solverPrepared     = 0;
+    fc_need v {};
+    v.callBytes          = call;
+    v.solverPrepareBytes = 0u;                        // neutral: a create does not touch the search
+    v.facadeBytes        = sizeof (MasterInstance);
+    v.solverPrepared     = 0;
+    writeOut (out, v, outBytes);
     return FC_OK;
 }
 
@@ -1045,6 +1282,12 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
     // same reasoning as in `fc_master_solve`. Removing the facade's own copy of that verdict leaves the
     // observable result identical and the policy singular.
     if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
+    if (m.delivering)
+    {
+        const long long d = DeliveredMastering::deliveredFrames (m.delivered.sourceRate(), m.delivered.deliveryRate(),
+                                                                 (long long) frames);
+        if (d < 0 || d > 0x7FFFFFFFLL) return FC_ERR_RANGE;
+    }
     if (const fc_status st = checkAudio (in, frames, nch); st != FC_OK) return st;
 
     if (! m.solver.isPrepared()
@@ -1057,8 +1300,12 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
     double lra = 0.0;
     // A measurement has no gate to hide behind, so this one really is a refusal: the core now says false
     // when its own meter flagged the programme, and a facade that published the number anyway would be
-    // publishing a measurement it had been told not to trust.
-    if (! m.solver.measureInputLoudnessRange (pl, nch, (int) frames, lra)) return FC_ERR_REFUSED_BY_CORE;
+    // publishing a measurement it had been told not to trust. On a delivering handle the core converts
+    // first and measures the delivered programme — the one the search will meter.
+    const bool measured = m.delivering
+        ? m.delivered.measureInputLoudnessRange (m.solver, pl, nch, (long long) frames, lra)
+        : m.solver.measureInputLoudnessRange (pl, nch, (int) frames, lra);
+    if (! measured) return FC_ERR_REFUSED_BY_CORE;
     *out = lra;
     return FC_OK;
 }
@@ -1103,10 +1350,12 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     // over a stream in progress; `solve` used to reset the chain out from under exactly such a stream
     // and answer FC_OK — measured, `process(64)` then a valid solve and the 64 frames in the FIFO were
     // gone with no refusal anywhere. One policy: `fc_master_reset` is the way out of a stream, for both.
+    if (m.delivering) return FC_ERR_STATE;  // fc_master_solve_delivered: one stride cannot carry two lengths
     if (m.audioSeen) return FC_ERR_STATE;
     if (const fc_status st = checkScalarOut (out_solution); st != FC_OK) return st;
-    if (const fc_status st = checkHeaderIn (params); st != FC_OK) return st;
-    if (const fc_status st = checkHeaderIn (req); st != FC_OK) return st;
+    std::uint32_t prmBytes = 0, reqBytes = 0;
+    if (const fc_status st = checkHeader (params, prmBytes); st != FC_OK) return st;
+    if (const fc_status st = checkHeader (req, reqBytes); st != FC_OK) return st;
 
     const int nch = m.chain.numChannels();
     // `frames == 0` is NOT refused here. The solver has its own answer for it — `InvalidRequest`, a
@@ -1129,13 +1378,13 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
     // and all three spans are checked.
     if (aliasesSpan (out_solution, sizeof (*out_solution), out, bytes)
         || aliasesSpan (out_solution, sizeof (*out_solution), in, bytes)
-        || aliasesSpan (out_solution, sizeof (*out_solution), params, sizeof (*params))
-        || aliasesSpan (out_solution, sizeof (*out_solution), req, sizeof (*req))) return FC_ERR_SPAN;
+        || aliasesSpan (out_solution, sizeof (*out_solution), params, prmBytes)
+        || aliasesSpan (out_solution, sizeof (*out_solution), req, reqBytes)) return FC_ERR_SPAN;
 
     MasteringChainParams cp {};
-    if (const fc_status st = toCore (*params, cp); st != FC_OK) return st;
+    if (const fc_status st = toCore (loadIn (params, prmBytes), cp); st != FC_OK) return st;
     LoudnessRequest lr {};
-    if (const fc_status st = toCore (*req, lr); st != FC_OK) return st;
+    if (const fc_status st = toCore (loadIn (req, reqBytes), lr); st != FC_OK) return st;
 
     if (! m.solver.isPrepared()
         && ! m.solver.prepare (m.chain.sampleRate(), nch, m.renderer.blockSize(),
@@ -1185,20 +1434,23 @@ FC_EXPORT fc_status fc_solution_summary_get (fc_solution sh, fc_solution_summary
     FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
     const LoudnessSolution& v = *s->solution;
-    out->status              = (std::int32_t) v.status;
-    out->binding             = (std::int32_t) v.binding;
-    out->alsoViolated        = v.alsoViolated;
-    out->preLimiterGainDb    = v.preLimiterGainDb;
-    out->ceilingDbTp         = v.ceilingDbTp;
-    out->passes              = v.passes;
-    out->logCount            = v.logCount;
-    out->activityThresholdDb = v.activityThresholdDb;
-    out->achievedBelowLufs   = v.achievedBelowLufs;
-    out->achievedAboveLufs   = v.achievedAboveLufs;
-    out->gainBelowDb         = v.gainBelowDb;
-    out->gainAboveDb         = v.gainAboveDb;
+    fc_solution_summary o {};
+    o.status              = (std::int32_t) v.status;
+    o.binding             = (std::int32_t) v.binding;
+    o.alsoViolated        = v.alsoViolated;
+    o.preLimiterGainDb    = v.preLimiterGainDb;
+    o.ceilingDbTp         = v.ceilingDbTp;
+    o.passes              = v.passes;
+    o.logCount            = v.logCount;
+    o.activityThresholdDb = v.activityThresholdDb;
+    o.achievedBelowLufs   = v.achievedBelowLufs;
+    o.achievedAboveLufs   = v.achievedAboveLufs;
+    o.gainBelowDb         = v.gainBelowDb;
+    o.gainAboveDb         = v.gainAboveDb;
+    writeOut (out, o, bytes);
     return FC_OK;
 }
 
@@ -1207,8 +1459,11 @@ FC_EXPORT fc_status fc_solution_measurement (fc_solution sh, fc_measurement* out
     FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
-    if (const fc_status st = checkHeaderOut (out); st != FC_OK) return st;
-    fromCore (s->solution->measured, *out);
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
+    fc_measurement o {};
+    fromCore (s->solution->measured, o);
+    writeOut (out, o, bytes);
     return FC_OK;
 }
 
@@ -1253,40 +1508,219 @@ FC_EXPORT fc_status fc_solution_destroy (fc_solution sh)
 }
 
 //==============================================================================
-// DEFAULTS — the core's own, written through the same mapping every other value crosses by.
+// THE DELIVERING HANDLE (v2) — forwarding to `mastering::DeliveredMastering`, which owns the composition. This
+// file checks what a page can hand it and copies; the length arithmetic, the conversion and the render are the
+// core's, and `fcore_master selftest` calls the same class directly and compares.
 
-FC_EXPORT void fc_master_config_default (fc_master_config* out)
+namespace
+{
+// The two lengths, in the header's order: NARROWING first — either count, or the delivered length the core
+// computes, past INT_MAX — and only then a caller's `outFrames` that is not that length. A comparison, not a
+// derivation: the number `outFrames` is held against comes out of the core.
+fc_status checkDeliveredLengths (const MasterInstance& m, std::uint32_t inFrames, std::uint32_t outFrames) noexcept
+{
+    if (inFrames > (std::uint32_t) 0x7FFFFFFFu || outFrames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
+    const long long d = DeliveredMastering::deliveredFrames (m.delivered.sourceRate(), m.delivered.deliveryRate(),
+                                                             (long long) inFrames);
+    if (d < 0 || d > 0x7FFFFFFFLL) return FC_ERR_RANGE;
+    if ((long long) outFrames != d) return FC_ERR_CAPACITY;
+    return FC_OK;
+}
+}   // namespace
+
+FC_EXPORT fc_status fc_master_delivered_frames (fc_master h, std::uint32_t inFrames, std::uint32_t* outFrames)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    auto& m = *s->master;
+    if (! m.delivering) return FC_ERR_STATE;
+    if (const fc_status st = checkScalarOut (outFrames); st != FC_OK) return st;
+    if (inFrames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;
+    const long long d = DeliveredMastering::deliveredFrames (m.delivered.sourceRate(), m.delivered.deliveryRate(),
+                                                             (long long) inFrames);
+    if (d < 0 || d > 0x7FFFFFFFLL) return FC_ERR_RANGE;
+    *outFrames = (std::uint32_t) d;
+    return FC_OK;
+}
+
+FC_EXPORT fc_status fc_master_render_delivered (fc_master h, const float* in, std::uint32_t inFrames,
+                                                float* out, std::uint32_t outFrames)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    auto& m = *s->master;
+    if (! m.delivering) return FC_ERR_STATE;
+    if (m.solverRan) return FC_ERR_STATE;   // the chain holds the SOLVER's parameters — see MasterInstance
+    if (const fc_status st = checkDeliveredLengths (m, inFrames, outFrames); st != FC_OK) return st;
+    const int nch = m.chain.numChannels();
+    if (const fc_status st = checkAudio (in, inFrames, nch); st != FC_OK) return st;
+    if (const fc_status st = checkAudio (out, outFrames, nch); st != FC_OK) return st;
+    // The conversion writes `out` while it reads `in`, and the two have different strides — no overlap of any
+    // kind is meaningful, equality included.
+    const std::uint64_t inBytes  = (std::uint64_t) inFrames  * (std::uint64_t) nch * sizeof (float);
+    const std::uint64_t outBytes = (std::uint64_t) outFrames * (std::uint64_t) nch * sizeof (float);
+    if ((in == out && inBytes + outBytes > 0u) || aliasesSpan (in, inBytes, out, outBytes)) return FC_ERR_SPAN;
+
+    const float* ip[core::kMaxChannels] {};
+    float*       op[core::kMaxChannels] {};
+    for (int c = 0; c < nch; ++c)
+    {
+        ip[c] = in  + (std::size_t) c * (std::size_t) inFrames;
+        op[c] = out + (std::size_t) c * (std::size_t) outFrames;
+    }
+    if (! m.delivered.render (m.chain, m.renderer, ip, nch, (long long) inFrames, op, (long long) outFrames))
+        return FC_ERR_REFUSED_BY_CORE;
+    return FC_OK;
+}
+
+FC_EXPORT fc_status fc_master_solve_delivered (fc_master h, const fc_master_params* params,
+                                               const fc_loudness_request* req,
+                                               const float* in, std::uint32_t inFrames,
+                                               float* out, std::uint32_t outFrames,
+                                               fc_solution* out_solution)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    auto& m = *s->master;
+    if (! m.delivering) return FC_ERR_STATE;
+    if (const fc_status st = checkScalarOut (out_solution); st != FC_OK) return st;
+    std::uint32_t prmBytes = 0, reqBytes = 0;
+    if (const fc_status st = checkHeader (params, prmBytes); st != FC_OK) return st;
+    if (const fc_status st = checkHeader (req, reqBytes); st != FC_OK) return st;
+    if (const fc_status st = checkDeliveredLengths (m, inFrames, outFrames); st != FC_OK) return st;
+
+    const int nch = m.chain.numChannels();
+    if (const fc_status st = checkAudio (in, inFrames, nch); st != FC_OK) return st;
+    if (const fc_status st = checkAudio (out, outFrames, nch); st != FC_OK) return st;
+    const std::uint64_t inBytes  = (std::uint64_t) inFrames  * (std::uint64_t) nch * sizeof (float);
+    const std::uint64_t outBytes = (std::uint64_t) outFrames * (std::uint64_t) nch * sizeof (float);
+    // As `fc_master_solve`: a search cannot render over what it reads, so any touching is refused, equality included.
+    if (in == out || aliasesSpan (in, inBytes, out, outBytes)) return FC_ERR_SPAN;
+    // THE AUDIO OUTPUT MAY NOT OVERWRITE THE CALLER'S CONST STRUCTS either: they are copied before the search, so the
+    // call would succeed — and leave the caller's parameter set or request rewritten with audio (the diverse-testing
+    // round). At the caller's size, like every other check on them.
+    if (aliasesSpan (params, prmBytes, out, outBytes) || aliasesSpan (req, reqBytes, out, outBytes)) return FC_ERR_SPAN;
+    if (aliasesSpan (out_solution, sizeof (*out_solution), out, outBytes)
+        || aliasesSpan (out_solution, sizeof (*out_solution), in, inBytes)
+        || aliasesSpan (out_solution, sizeof (*out_solution), params, prmBytes)
+        || aliasesSpan (out_solution, sizeof (*out_solution), req, reqBytes)) return FC_ERR_SPAN;
+
+    MasteringChainParams cp {};
+    if (const fc_status st = toCore (loadIn (params, prmBytes), cp); st != FC_OK) return st;
+    LoudnessRequest lr {};
+    if (const fc_status st = toCore (loadIn (req, reqBytes), lr); st != FC_OK) return st;
+
+    // THE SLOT BEFORE THE SOLVER'S PREPARATION, the other way round from `fc_master_solve`: a full table is a refusal
+    // that must not have prepared anything on its way — on the wasm tier a preparation that cannot be served is not a
+    // status but the end of the module (the diverse-testing round). A refused preparation hands the slot back.
+    std::uint32_t sh = 0;
+    const int idx = allocSlot (Kind::Solution, sh);
+    if (idx < 0) return FC_ERR_EXHAUSTED;
+    if (! m.solver.isPrepared()
+        && ! m.solver.prepare (m.chain.sampleRate(), nch, m.renderer.blockSize(),
+                               m.chain.internalBlock(), m.chain.tapOversampleFactor()))
+    {
+        abandonSlot (g_slots[idx]);
+        return FC_ERR_REFUSED_BY_CORE;
+    }
+
+    const float* ip[core::kMaxChannels] {};
+    float*       op[core::kMaxChannels] {};
+    for (int c = 0; c < nch; ++c)
+    {
+        ip[c] = in  + (std::size_t) c * (std::size_t) inFrames;
+        op[c] = out + (std::size_t) c * (std::size_t) outFrames;
+    }
+    g_slots[idx].solution = std::make_unique<LoudnessSolution> (
+        m.delivered.solve (m.solver, m.chain, m.renderer, cp, ip, nch, (long long) inFrames,
+                           op, (long long) outFrames, lr));
+
+    // As `fc_master_solve`: where the search ran, the chain holds its parameters; where it did not, nothing moved.
+    const MasteringSolveStatus verdict = g_slots[idx].solution->status;
+    if (verdict != MasteringSolveStatus::NotPrepared && verdict != MasteringSolveStatus::InvalidRequest)
+    {
+        m.framesIn = m.framesFlushed = 0;
+        m.audioSeen = false;
+        m.solverRan = true;
+    }
+    *out_solution = sh;
+    return FC_OK;
+}
+
+//==============================================================================
+// DEFAULTS — the core's own, written through the same mapping every other value crosses by.
+//
+// `writeDefaults` fills THIS build's layout. The published writers are two views of it (rule 8 of VERSIONING):
+// `fc_*_defaults` write the caller's stamped version, `fc_*_default` are frozen at v1.
+
+namespace
+{
+template <typename T>
+void writeFrozenV1 (T* out) noexcept
 {
     if (out == nullptr) return;
+    T local {};
+    writeDefaults (local);
+    const std::uint32_t v1 = sizeFor (AbiId<T>::id, 1u);
+    local.header.abiVersion = 1u;
+    local.header.structSize = v1;
+    std::memcpy (static_cast<void*> (out), &local, v1);
+}
+
+template <typename T>
+fc_status writeVersioned (T* out) noexcept
+{
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
+    T local {};
+    writeDefaults (local);
+    writeOut (out, local, bytes);
+    return FC_OK;
+}
+
+void stamp (fc_header& h, std::uint32_t size) noexcept
+{
+    h.abiVersion = FC_MASTER_ABI_VERSION;
+    h.structSize = size;
+}
+
+void writeDefaults (fc_master_config& o) noexcept
+{
     const MasteringChainConfig d {};
-    std::memset (out, 0, sizeof (*out));
-    stampHeader (out);
+    std::memset (static_cast<void*> (&o), 0, sizeof (o));
+    stamp (o.header, (std::uint32_t) sizeof (o));
     // LEFT AT ZERO, DELIBERATELY. There is no core default for either, and writing one here would be
     // this file choosing a geometry for every caller who forgot to — the same objection that keeps
     // `targetLufs` and `maxTruePeakDbTp` at NaN in the request. `fc_master_create` refuses both, so a
     // caller who forgets is told rather than silently given 48 kHz stereo.
-    out->sampleRate            = 0.0;
-    out->channels              = 0;
-    out->internalBlock         = d.internalBlock;
-    out->eq                    = d.eq ? 1 : 0;
-    out->monoBass              = d.monoBass ? 1 : 0;
-    out->compressor            = d.compressor ? 1 : 0;
-    out->clipper               = d.clipper ? 1 : 0;
-    out->limiter               = d.limiter ? 1 : 0;
-    out->dither                = d.dither ? 1 : 0;
-    out->compressorLookaheadMs = d.compressorLookaheadMs;
-    out->limiterLookaheadMs    = d.limiterLookaheadMs;
-    out->oversampleFactor      = d.oversampleFactor;
-    out->tapsPerPhase          = d.tapsPerPhase;
-    out->sidechainHpfHz        = d.sidechainHpfHz;
+    o.sampleRate            = 0.0;
+    o.channels              = 0;
+    o.internalBlock         = d.internalBlock;
+    o.eq                    = d.eq ? 1 : 0;
+    o.monoBass              = d.monoBass ? 1 : 0;
+    o.compressor            = d.compressor ? 1 : 0;
+    o.clipper               = d.clipper ? 1 : 0;
+    o.limiter               = d.limiter ? 1 : 0;
+    o.dither                = d.dither ? 1 : 0;
+    o.compressorLookaheadMs = d.compressorLookaheadMs;
+    o.limiterLookaheadMs    = d.limiterLookaheadMs;
+    o.oversampleFactor      = d.oversampleFactor;
+    o.tapsPerPhase          = d.tapsPerPhase;
+    o.sidechainHpfHz        = d.sidechainHpfHz;
+    // v2. Not a core default — the core has no such field — but the ABI's encoding of "no conversion", and
+    // the value under which a v2 config is exactly a v1 config (rule 2).
+    o.deliveryRate          = 0.0;
 }
 
-FC_EXPORT void fc_master_params_default (fc_master_params* out)
+void writeDefaults (fc_master_params& o) noexcept
 {
-    if (out == nullptr) return;
+    fc_master_params* out = &o;
     const MasteringChainParams d {};
-    std::memset (out, 0, sizeof (*out));
-    stampHeader (out);
+    std::memset (static_cast<void*> (out), 0, sizeof (*out));
+    stamp (out->header, (std::uint32_t) sizeof (*out));
     out->inputGainDb      = d.inputGainDb;
     out->preLimiterGainDb = d.preLimiterGainDb;
 
@@ -1358,14 +1792,15 @@ FC_EXPORT void fc_master_params_default (fc_master_params* out)
     out->bypassClipper    = d.bypassClipper ? 1 : 0;
     out->bypassLimiter    = d.bypassLimiter ? 1 : 0;
     out->bypassDither     = d.bypassDither ? 1 : 0;
+    out->compressorMix    = d.compressorMix;            // v3: 1, the chain before the field existed
 }
 
-FC_EXPORT void fc_loudness_request_default (fc_loudness_request* out)
+void writeDefaults (fc_loudness_request& o) noexcept
 {
-    if (out == nullptr) return;
+    fc_loudness_request* out = &o;
     const LoudnessRequest d {};
-    std::memset (out, 0, sizeof (*out));
-    stampHeader (out);
+    std::memset (static_cast<void*> (out), 0, sizeof (*out));
+    stamp (out->header, (std::uint32_t) sizeof (*out));
     // The two REQUIRED fields stay NaN: the core ships no default target because "-14 LUFS, -1 dBTP" is
     // a delivery policy and the core is product-neutral by rule. Carrying them here would be this file
     // choosing that policy for every caller who forgot to.
@@ -1384,10 +1819,21 @@ FC_EXPORT void fc_loudness_request_default (fc_loudness_request* out)
     out->maxPasses              = d.maxPasses;
     out->initialGainDb          = d.initialGainDb;
 }
+}   // namespace
+
+FC_EXPORT fc_status fc_master_config_defaults (fc_master_config* out)       { FC_GUARD; return writeVersioned (out); }
+FC_EXPORT fc_status fc_master_params_defaults (fc_master_params* out)       { FC_GUARD; return writeVersioned (out); }
+FC_EXPORT fc_status fc_loudness_request_defaults (fc_loudness_request* out) { FC_GUARD; return writeVersioned (out); }
+
+FC_EXPORT void fc_master_config_default (fc_master_config* out)             { writeFrozenV1 (out); }
+FC_EXPORT void fc_master_params_default (fc_master_params* out)             { writeFrozenV1 (out); }
+FC_EXPORT void fc_loudness_request_default (fc_loudness_request* out)       { writeFrozenV1 (out); }
 
 //==============================================================================
 FC_EXPORT std::uint32_t fc_master_abi_version  (void) { return FC_MASTER_ABI_VERSION; }
 FC_EXPORT std::uint32_t fc_master_max_channels (void) { return (std::uint32_t) core::kMaxChannels; }
 FC_EXPORT std::uint32_t fc_master_max_eq_bands (void) { return (std::uint32_t) FC_MAX_EQ_BANDS; }
-FC_EXPORT std::uint32_t fc_master_sizeof_params(void) { return (std::uint32_t) sizeof (fc_master_params); }
-FC_EXPORT std::uint32_t fc_master_sizeof_config(void) { return (std::uint32_t) sizeof (fc_master_config); }
+FC_EXPORT std::uint32_t fc_master_sizeof (std::int32_t id, std::uint32_t version) { return sizeFor (id, version); }
+// Frozen at v1 — see the declaration.
+FC_EXPORT std::uint32_t fc_master_sizeof_params(void) { return sizeFor (FC_STRUCT_PARAMS, 1u); }
+FC_EXPORT std::uint32_t fc_master_sizeof_config(void) { return sizeFor (FC_STRUCT_CONFIG, 1u); }
