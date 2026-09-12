@@ -15,8 +15,10 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 #include <felitronics/analysis/SpectrumTap.h>
+#include <felitronics/analysis/StereoColumns.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
+#include <felitronics/analysis/WaveformPeaks.h>
 #include <felitronics/blend/Blend.h>
 #include <felitronics/blend/Overlay.h>
 #include <felitronics/convolution/CabConvolver.h>
