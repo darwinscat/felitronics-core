@@ -25,8 +25,9 @@
 #include <vector>
 
 static std::atomic<long long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+static std::atomic<long long> g_allocBytes { 0 };
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
@@ -512,6 +513,36 @@ static void testContract()
         (void) fresh.process (ip, 1, 600, fp, (int) of.size(), nf);
         ou.resize ((std::size_t) nu); of.resize ((std::size_t) nf);
         ok (sameBits (ou, of), "after reset() the stream is bit-identical to a fresh object's");
+    }
+
+    group ("law 11d: prepareBytes() is what a fresh prepare() actually asks the heap for");
+    {
+        // Counted at operator new, NOT recomputed from the same arithmetic: prepare() sizes itself through
+        // storageFor(), so "budget == the formula" could not see a buffer the formula forgets.
+        for (const auto& pr : { std::pair<double, double> { 48000.0, 44100.0 }, { 192000.0, 44100.0 },
+                                { 44100.0, 192000.0 }, { 176400.0, 192000.0 }, { 96000.0, 96000.0 } })
+            for (int ch : { 1, 2, 6 })
+                for (int blk : { 1, 100, 4096 })
+                {
+                    const auto p = params (pr.first, pr.second);
+                    const std::uint64_t want = DeliveryResampler::prepareBytes (p, ch, blk);
+                    DeliveryResampler r;
+                    const long long before = g_allocBytes.load();
+                    const bool accepted = r.prepare (p, ch, blk);
+                    const long long asked = g_allocBytes.load() - before;
+                    ok (accepted && want > 0u, "a valid geometry prepares and has a budget");
+                    okNoAlloc ((std::uint64_t) asked == want, "the budget is the bytes prepare() requested");
+                }
+        const auto bad = params (44100.5, 48000.0);
+        DeliveryResampler r;
+        // Both reads bracket ONLY the calls under test: ok()'s message is a std::string and allocates.
+        const long long before = g_allocBytes.load();
+        const bool refused = DeliveryResampler::prepareBytes (bad, 2, 512) == 0u && ! r.prepare (bad, 2, 512);
+        const long long after = g_allocBytes.load();
+        ok (refused, "a refused geometry budgets 0 and refuses");
+        okNoAlloc (after == before, "…and asks the heap for nothing on the way to saying no");
+        ok (DeliveryResampler::prepareBytes (params (48000.0, 44100.0), 0, 512) == 0u, "zero channels budgets 0");
+        ok (DeliveryResampler::prepareBytes (params (48000.0, 44100.0), 2, 0) == 0u, "a zero block budgets 0");
     }
 
     group ("RT-safety: process(), a long call, a gap, flush() and reset() allocate nothing");

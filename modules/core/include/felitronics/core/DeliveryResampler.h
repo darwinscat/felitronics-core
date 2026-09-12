@@ -10,6 +10,7 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <numeric>
 #include <vector>
 
@@ -385,16 +386,38 @@ struct DeliveryResampler
     }
 
     //==========================================================================
-    [[nodiscard]] bool prepare (const Params& p, int maxChannels, int maxInputBlock)
+    // WHAT prepare() ASKS THE HEAP FOR (law 11d), and the ONE function it sizes itself with — so an owner
+    // budgeting before it builds reads the numbers the buffers are actually built from, and a clamp or a
+    // refusal cannot live in one of the two and not the other. `ok == false` is exactly the set of
+    // arguments prepare() refuses, and then it asks for nothing.
+    //
+    // REQUESTED bytes, counted per `operator new`: the coefficient tables, the histories, the stage and
+    // input scratch, the transient full-length prototype `designPhases` builds and frees once per stage,
+    // and the arrays of vector headers that hold them. Not a promise that a heap can serve them —
+    // allocator headers are not counted — and a SUM, not a peak: each prototype is freed before the next
+    // stage's is made, so the peak is lower by all but the largest of them.
+    struct Storage
     {
-        // Law 11b: DISARM, VALIDATE, WRITE. Nothing below is adopted until every argument is honoured.
-        prepared = false;
+        bool ok = false;
+        Plan plan {};
+        int flushInputs = 0, sizeBlock = 0;
+        int stageBound[kMaxStages] {};
+        std::uint64_t doubles = 0, ints = 0, vectorHeaders = 0;
+        std::uint64_t bytes() const noexcept
+        {
+            return ok ? doubles * sizeof (double) + ints * sizeof (int)
+                          + vectorHeaders * sizeof (std::vector<double>)
+                      : 0u;
+        }
+    };
 
-        if (maxChannels < 1 || maxChannels > kMaxChannels) return false;
-        if (maxInputBlock < 1 || maxInputBlock > (1 << 22)) return false;
-
+    static Storage storageFor (const Params& p, int maxChannels, int maxInputBlock) noexcept
+    {
+        Storage st;
+        if (maxChannels < 1 || maxChannels > kMaxChannels) return st;
+        if (maxInputBlock < 1 || maxInputBlock > (1 << 22)) return st;
         const Plan pl = plan (p);
-        if (! pl.ok) return false;
+        if (! pl.ok) return st;
 
         // flush() pushes the whole group delay in as zeros, counted in stage-0 input samples. It is
         // computed BEFORE the scratch is sized, because the scratch has to hold a flush as well as a
@@ -407,28 +430,59 @@ struct DeliveryResampler
             for (int i = 0; i < pl.count; ++i)
                 dIn += (double) pl.stage[i].halfLen * fsIn / (double) pl.stage[i].inRate;
         }
-        const int newFlushInputs = pl.identity ? 0 : ((int) std::ceil (dIn) + 1);
-        const int sizeBlock = std::max (maxInputBlock, newFlushInputs);
+        st.flushInputs = pl.identity ? 0 : ((int) std::ceil (dIn) + 1);
+        st.sizeBlock   = std::max (maxInputBlock, st.flushInputs);
 
-        std::vector<std::vector<double>> newCoef ((std::size_t) pl.count);
-        std::vector<int> newBound ((std::size_t) pl.count);
-        long long bound = sizeBlock;
+        const std::uint64_t ch = (std::uint64_t) maxChannels;
+        long long bound = st.sizeBlock;
         for (int s = 0; s < pl.count; ++s)
         {
             const StagePlan& sp = pl.stage[s];
-            newCoef[(std::size_t) s] = designPhases (sp, p.stopbandDb);
             bound = (bound * (long long) sp.L) / (long long) sp.M + 1;     // worst case over the phase state
-            if (bound > (1 << 24)) return false;                            // absurd; refuse, do not allocate it
-            newBound[(std::size_t) s] = (int) bound;
+            if (bound > (1 << 24)) return st;                               // absurd; refuse, do not allocate it
+            st.stageBound[s] = (int) bound;
+            st.doubles += (std::uint64_t) (2LL * sp.L * sp.halfLen + 1)     // the transient prototype
+                        + (std::uint64_t) sp.L * (std::uint64_t) sp.tapsPerPhase   // its phase-major table
+                        + ch * (std::uint64_t) (2 * sp.tapsPerPhase)        // histories
+                        + ch * (std::uint64_t) bound;                       // stage scratch
         }
+        st.doubles += ch * (std::uint64_t) st.sizeBlock;                    // input scratch
+        st.ints = (std::uint64_t) pl.count;                                 // stageBound
+        // The arrays of vector headers: the coefficient tables' (built aside, then swapped in), the
+        // histories', the stage scratch's and the input scratch's. For a FRESH object — a re-prepare can
+        // reuse header arrays of the same length, and then asks for less than this.
+        st.vectorHeaders = (std::uint64_t) pl.count + 2u * (std::uint64_t) pl.count * ch + ch;
+        st.plan = pl;
+        st.ok = true;
+        return st;
+    }
+
+    [[nodiscard]] static std::uint64_t prepareBytes (const Params& p, int maxChannels, int maxInputBlock) noexcept
+    {
+        return storageFor (p, maxChannels, maxInputBlock).bytes();
+    }
+
+    //==========================================================================
+    [[nodiscard]] bool prepare (const Params& p, int maxChannels, int maxInputBlock)
+    {
+        // Law 11b: DISARM, VALIDATE, WRITE. Nothing below is adopted until every argument is honoured —
+        // and the validation IS the budget: storageFor() refuses exactly what this refuses.
+        prepared = false;
+        const Storage st = storageFor (p, maxChannels, maxInputBlock);
+        if (! st.ok) return false;
+        const Plan& pl = st.plan;
+
+        std::vector<std::vector<double>> newCoef ((std::size_t) pl.count);
+        for (int s = 0; s < pl.count; ++s)
+            newCoef[(std::size_t) s] = designPhases (pl.stage[s], p.stopbandDb);
 
         // ---- adopt
         thePlan = pl;
         channels = maxChannels;
         maxBlock = maxInputBlock;
-        flushInputs = newFlushInputs;
+        flushInputs = st.flushInputs;
         coef.swap (newCoef);
-        stageBound.swap (newBound);
+        stageBound.assign (st.stageBound, st.stageBound + pl.count);
 
         hist.assign ((std::size_t) (pl.count * maxChannels), {});
         for (int s = 0; s < pl.count; ++s)
@@ -438,10 +492,10 @@ struct DeliveryResampler
         scratch.assign ((std::size_t) (pl.count * maxChannels), {});
         for (int s = 0; s < pl.count; ++s)
             for (int c = 0; c < maxChannels; ++c)
-                scratch[(std::size_t) (s * maxChannels + c)].assign ((std::size_t) stageBound[(std::size_t) s], 0.0);
+                scratch[(std::size_t) (s * maxChannels + c)].assign ((std::size_t) st.stageBound[s], 0.0);
 
         inScratch.assign ((std::size_t) maxChannels, {});
-        for (int c = 0; c < maxChannels; ++c) inScratch[(std::size_t) c].assign ((std::size_t) sizeBlock, 0.0);
+        for (int c = 0; c < maxChannels; ++c) inScratch[(std::size_t) c].assign ((std::size_t) st.sizeBlock, 0.0);
 
         prepared = true;
         reset();

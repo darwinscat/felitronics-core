@@ -69,6 +69,7 @@
 #include <felitronics/lineareq/MagnitudeCurve.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
+#include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/measurement/CaptureGate.h>
