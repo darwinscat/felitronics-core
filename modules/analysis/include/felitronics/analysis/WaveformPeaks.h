@@ -27,9 +27,9 @@ enum class PeakMix : int
 // absolute max-abs values, after a box-average decimation to about 8 kHz.
 //
 // THESE ARE NOT PEAKS IN ANY METERING SENSE, and the name says "waveform" for that reason. A bucket is the largest
-// |mean| of ~125 µs boxes, so it sits at or below the sample peak of its stretch — up to the rounding of the box
-// mean, which can lift a mean of equal samples a few ulps above them (2^30 frames of 1+3·2^-23 at an absurd rate
-// read 4.3e-14 over) — and further below the true peak.
+// |mean| of ~125 µs boxes, so it does not exceed the sample peak of its stretch EXCEPT by the rounding of the box
+// mean — a sequential binary64 sum divided by the box's sample count, whose error grows with the number of samples a
+// box averages. A bucket read above its sample peak is that rounding, not a defect. It sits further below the true peak.
 // Neither of the core's two true-peak meters is involved, and those two must not be confused with each other either:
 // `fcore::Probe` (the 128-tap reference, what `fc_probe_tp_linear` reports) and `analysis::TruePeakMeter` (the spec's
 // 48-tap filter, what the mastering chain runs) are DIFFERENT filters and read different numbers. How far apart is

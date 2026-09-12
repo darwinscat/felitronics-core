@@ -17,7 +17,7 @@
 //                 linear maximum, as raw IEEE-754 bit patterns. Diffing two `blocks` outputs IS the parity
 //                 test — see the note at the mode itself for why the gated scalars cannot be that test.
 //   waveform    → the waveform peaks (analysis::WaveformPeaks): every bucket as a double AND as its float32
-//                 form, bit patterns. A box-averaged max-abs, at or below the sample peak — NOT `truepeak`, which
+//                 form, bit patterns. A box-averaged max-abs, not above the sample peak except by rounding — NOT `truepeak`, which
 //                 is fcore::Probe's reference true peak. [--buckets N] [--mix avr|L|R|max]
 //   stereo      → the stereo band (analysis::StereoColumns): per column width / correlation / RMS as float32
 //                 bit patterns, plus the maximum RMS as a double. RMS, not `lufs`. [--columns N]
