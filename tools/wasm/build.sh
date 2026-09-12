@@ -60,7 +60,15 @@ MASTER_INC=(-I"$ROOT/tools"
 # elsewhere), which breaks determinism between MACHINES, not merely between tiers.
 NUMERIC=(-ffp-contract=off -fno-fast-math)
 
+# -msimd128: `core::firDot`'s wasm kernel is behind `__wasm_simd128__`, so without it this module
+# silently takes the scalar one. Verified against THIS target's own acceptance, which is stricter than
+# fc_master's — a byte-for-byte diff against native `fcore_measure blocks`, every number as a raw
+# IEEE-754 bit pattern — and not inferred from fc_master: clean on 5 configurations (48k/2ch, 44.1k/1ch,
+# 96k/2ch and 44.1k/2ch fixtures, plus a 5:21 stereo programme) in both the release and the checked
+# debug build, before AND after the flag. Native runs the NEON kernel, this runs SIMD128: two different
+# hand-written kernels, identical bits. On the hot path, 865 -> 435 ms on that programme.
 COMMON=(-std=c++20 -fno-exceptions -fno-rtti "${NUMERIC[@]}" "${INC[@]}"
+        -msimd128
         --no-entry
         -sMODULARIZE=1
         -sEXPORT_NAME=createFcProbe
