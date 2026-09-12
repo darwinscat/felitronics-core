@@ -5,6 +5,53 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## Unreleased
+
+### `analysis` — `ClipDetector`: clipping is a flat top, not a loud sample
+
+A new offline analyser that reports whether delivered audio is sample-clipped, and where: every clipped run with its
+channel, start, length, sign and level, plus each channel's sample peak and DC offset. Written from the physics of a
+clamp rather than ported: a clamp turns the top of every excursion past its ceiling into a run of equal samples, so the
+evidence is FLATNESS — consecutive loud samples are not evidence (a full-scale sine and a master normalised to 0 dBFS are
+clean), and full scale plays no part (clipped and then turned down is still clipped).
+
+- **The rule.** Bands of samples within 2q (q: the file's quantum as the stream shows it, never below the true one), at a
+  local extreme that nothing within ±20 ms passes. A band is a clipped run on RAMP evidence — both sides known; entered
+  and left faster than a parabolic crest held inside the band could be (V(L) = (tau+q)·((L+1)/(L−1))² + q, derived, not
+  fitted); a coincidence chance ((r+q)/sigma)^(L−1) <= 1e-6 against the flank activity of the UNCLIPPED signal; not a
+  step from another flat level; and, for a band that is not exactly flat, met by a line rather than a turn — or on
+  CEILING evidence: at the level a ramp run of the same channel and polarity already proved. The step test is the whole
+  answer to square waves, pulse trains and sample-and-hold staircases: they jump onto their flat tops from another one.
+- **Measured on a bench clamped by construction** (every clamped run known exactly), by run length: 2 samples 99.4 %,
+  3–5 99.6 %, 6–20 99.9 %, over 20 99.8 %; every file of the "must report" bucket (84/84) — float, 16 and 24 bit,
+  TPDF-dithered, turned down by up to 40 dB, 44.1–96 kHz, one channel clamped, asymmetric clamps, a clamped passage
+  inside a louder clean file, non-finite samples. On real recordings clamped by construction across 0.5–20 dB of drive,
+  0 to −40 dB of gain afterwards and 44.1–192 kHz: 340 of 342 files, runs of 2 samples 99.7 %, longer 100.0 %. A single
+  clamped sample has no flat top and is not found (0.7 %); neither are the few short runs of a polarity that come
+  before its first ramp, since a ceiling is only proven forward.
+- **Zero false positives** on every clean signal tried: the bench's "must stay silent" bucket (104/104); 890 further
+  clean signals (full-scale sines at every sampling phase including exactly symmetric crests, 220 squares and PWMs,
+  16/24/8-bit sub-bass with long identical codes, limited and normalised masters, impulses, gates, DC, sample-and-hold);
+  52 minutes of synthetic programme; and — the set that set the chance bound — 18 full-length real tracks and stems as
+  delivered, normalised to the 16- and 24-bit rails, at 0 / −12 / −24 dB in 16 bit and at −6 dB in 24 bit (126 files).
+  Synthetic programme was clean already at a chance of 1e-3; the 72 level-shifted real files still gave 135 false runs
+  there, 19 at 1e-4, one at 1e-5 and none from 1e-6. Real crests are often flatter than a parabola (bass through an amp, a compressor); the
+  turn test is what separates those from a clamp when the band is not exactly flat.
+- **What it does not see, as numbers.** A clamp later passed through AAC (256/128 kbit/s), MP3 (320/128) or a resampler
+  (to 44.1 or 96 kHz) is no longer flat: 0 files of 18 per chain, 0 % of runs. A 20 Hz DC blocker after the clamp: 10 of
+  18 files, ~5 % of runs. Noise added after a 16-bit clamp: runs of 3+ found 96 % at ±1 LSB, 50 % at ±2, none from ±4.
+  A pure tone locked to the sample grid can hide its clamp (the stream never shows it a slow step, so q stays loose).
+- **Against the detector it replaces**, on the same bench: that one reports 48 of the 104 clean files and misses 3 of
+  the 84 clamped ones; of the 94 files where the two verdicts differ, 51 have a decided answer and this engine is right
+  on all 51 (the other 43 are the bench's open questions). On the real recordings normalised to the rail it reports 14
+  of 36 files; this engine none.
+- `process()` is read-only, allocation-free and bit-identical under any slicing; `finish()` decides the last 20 ms; no
+  libm call decides a verdict (the chance is a product, not a logarithm), so every tier agrees. A whole-file reference
+  written straight from the rule nulls the streaming engine run for run (randomised material and 4000 tiny streams in
+  the suite, 2263 corpus files out of it); a 41-mutant stand kills 40, the survivor equivalent. ASan found a ring
+  overrun no other check could see — a long flat band trimmed the window deque only at queries — now expired on every
+  push. ~13 ns/sample on arm64 (a heavily clipped 5-minute stereo file in 0.38 s).
+
 ## v0.31.0 — 2026-09-12
 
 ### `core` · `oversampling` · `analysis` — one polyphase FIR kernel for the whole tree, and five rows that agree on its bits

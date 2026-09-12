@@ -19,6 +19,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_loudness_conformance_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_loudness_conformance_tests COMMAND felitronics_loudness_conformance_tests)
 
+    add_executable(felitronics_clip_detector_tests tests/ClipDetectorTests.cpp)   # clipping by construction + a whole-file reference null
+    target_link_libraries(felitronics_clip_detector_tests PRIVATE felitronics::analysis)
+    target_include_directories(felitronics_clip_detector_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_clip_detector_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_clip_detector_tests COMMAND felitronics_clip_detector_tests)
+
     add_executable(felitronics_truepeak_conformance_tests tests/TruePeakConformanceTests.cpp)   # EBU Tech 3341 §2.6 true-peak tests 15-19
     target_link_libraries(felitronics_truepeak_conformance_tests PRIVATE felitronics::analysis)
     target_include_directories(felitronics_truepeak_conformance_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
