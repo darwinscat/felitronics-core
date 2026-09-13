@@ -133,8 +133,11 @@ public:
     long long trimSamples() const noexcept { return std::llround (src_.latencyOutputSamples()); }
     const core::DeliveryResampler::Plan& plan() const noexcept { return src_.currentPlan(); }
 
-    // Input samples the gate replaced because they were not finite, in the programme the last `convert()` read. A
-    // finite sample outside +-1e6 is clamped and not counted, exactly as `MasteringChain::nonFiniteInputSamples()`.
+    // Input samples the gate replaced because they were not finite, in the programme of THE LAST `convert()` THAT
+    // REACHED THE COUNT — that read every input sample (an empty programme reaches it with nothing to read, and counts
+    // 0). A call refused before that, or stopped while reading, leaves the previous count where it was: a caller that
+    // reads it after a refusal reads an earlier programme's, the rule `fc_solution_log` keeps for `written`. A finite
+    // sample outside +-1e6 is clamped and not counted, exactly as `MasteringChain::nonFiniteInputSamples()`.
     std::uint64_t nonFiniteInputSamples() const noexcept { return nonFinite_; }
 
     // Convert a whole programme. `out` must hold exactly deliveredFrames(inFrames) frames per channel, and
@@ -157,8 +160,7 @@ public:
         if (! prepared_ || numChannels != nch_ || inFrames < 0) return false;
         if (outFrames != deliveredFrames (inRate_, deliveryRate_, inFrames)) return false;
         if (outFrames > 0 && ! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
-        nonFinite_ = 0;
-        if (outFrames == 0) return true;
+        if (outFrames == 0) { nonFinite_ = 0; return true; }
 
         src_.reset();
         const long long T0 = src_.currentPlan().identity ? 0 : trimSamples();
@@ -176,6 +178,8 @@ public:
         float* sp[core::kMaxChannels] {};
         for (int c = 0; c < numChannels; ++c) sp[c] = staging_.data() + (std::size_t) c * (std::size_t) perCall_;
 
+        // Counted aside and published once the last input sample has been read — see `nonFiniteInputSamples`.
+        std::uint64_t counted = 0;
         for (long long off = 0; off < inFrames; off += block_)
         {
             const int m = (int) std::min<long long> (block_, inFrames - off);
@@ -193,13 +197,14 @@ public:
                     bad += fin ? 0u : 1u;
                     g[i] = std::clamp (fin ? v : 0.0f, -1.0e6f, 1.0e6f);
                 }
-                nonFinite_ += bad;
+                counted += bad;
                 ip[c] = g;
             }
             int got = 0;
             if (! src_.process (ip, numChannels, m, sp, perCall_, got)) return false;
             take (got);
         }
+        nonFinite_ = counted;
         const float* zp[core::kMaxChannels] {};
         for (int c = 0; c < numChannels; ++c) zp[c] = silence_.data() + (std::size_t) c * (std::size_t) block_;
         // The drain: silence until T0 + outFrames outputs exist. Bounded — every block of silence yields

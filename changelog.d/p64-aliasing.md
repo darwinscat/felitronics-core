@@ -29,6 +29,13 @@
   `render (…, nullptr, 0, nullptr, 0)` was a SIGSEGV on a call whose programme is legal. The rule now applies at
   every length; at two zero lengths it judges only null, so an empty programme in real tables still renders, and
   one with null tables — or with null planes in them, which used to be accepted — is refused.
+- **The non-finite input count is THE LAST CALL'S THAT REACHED THE COUNT** — stated in the same words for
+  `DeliveryConverter::nonFiniteInputSamples`, `DeliveredMastering::nonFiniteInputSamples` and
+  `fc_master_stats::nonFiniteIn`, and pinned by tests at all three. A call refused before its count (by the facade or
+  the core) leaves the previous number, the rule `fc_solution_log` keeps for `written`; one refused after it keeps its
+  own (at equal rates a range measurement refuses a poisoned programme having counted it). To make the words exact:
+  the converter publishes its count once every input sample is read, and a conversion that does not complete no
+  longer leaves a partial count behind. Not a version.
 - **`fc_solution_log`: `written` may not point into the `cap` records** (FC_ERR_SPAN), and is cleared only once
   every check is behind the call — the order `fc_master_flush` takes. It used to be cleared on entry, so a
   `written` inside the buffer took the count over a copied record on FC_OK and a zero into the buffer on a

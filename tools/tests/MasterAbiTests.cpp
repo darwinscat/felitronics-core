@@ -2759,7 +2759,37 @@ int main()
             fc_master_stats st {}; FC_INIT (st);
             ok (fc_master_get_stats (h, &st) == FC_OK && st.nonFiniteIn == 2u,
                 "and the two non-finite samples are counted as two (" + std::to_string (st.nonFiniteIn) + ")");
+
+            // THE COUNT IS THE LAST CALL'S THAT REACHED IT — the core's contract, read through the facade. Refused before
+            // its count, by this facade or by the core, a call leaves the number where it was; the next call that
+            // reaches its count replaces it.
+            const auto count = [&] { fc_master_stats s {}; FC_INIT (s); (void) fc_master_get_stats (h, &s); return s.nonFiniteIn; };
+            ok (fc_master_render_delivered (h, dirty.data(), 44100u, dirty.data(), 48000u) == FC_ERR_SPAN && count() == 2u,
+                "a render refused by the facade on its spans leaves the count at 2");
+            ok (fc_master_render_delivered (h, clean.data(), 44100u, oc.data(), 47999u) == FC_ERR_CAPACITY && count() == 2u,
+                "and one refused on its length leaves it too");
+            auto poisoned = tone (44100 * 4, kNch);                           // long enough for a range to be asked for
+            poisoned[777] = std::numeric_limits<float>::quiet_NaN();
+            double lra = -1.0;
+            ok (fc_master_measure_lra (h, poisoned.data(), 44100u * 4u, &lra) == FC_OK && count() == 1u,
+                "a range measurement that reaches its count replaces it: 1 (" + std::to_string (count()) + ")");
+            ok (fc_master_render_delivered (h, clean.data(), 44100u, oc.data(), 48000u) == FC_OK && count() == 0u,
+                "and so does the next render: 0");
             (void) fc_master_destroy (h);
+
+            // AT EQUAL RATES the range is measured on the caller's samples in place, so a poisoned programme is REFUSED —
+            // after its count, which the call keeps.
+            fc_master_config ce = deliveringConfig (48000.0, 48000.0);
+            fc_master he = 0;
+            ok (fc_master_create (&ce, &he) == FC_OK && fc_master_configure (he, &p, &r) == FC_OK,
+                "PRECONDITION: an equal-rate delivering handle");
+            auto poisoned48 = tone (48000 * 4, kNch);
+            poisoned48[777] = std::numeric_limits<float>::quiet_NaN();
+            fc_master_stats se {}; FC_INIT (se);
+            ok (fc_master_measure_lra (he, poisoned48.data(), 48000u * 4u, &lra) == FC_ERR_REFUSED_BY_CORE
+                && fc_master_get_stats (he, &se) == FC_OK && se.nonFiniteIn == 1u,
+                "at equal rates a range measurement refused AFTER its count keeps its own: 1");
+            (void) fc_master_destroy (he);
         }
     }
 

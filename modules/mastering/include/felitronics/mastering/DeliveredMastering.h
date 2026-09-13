@@ -119,9 +119,13 @@ public:
     double deliveryRate() const noexcept { return deliveryRate_; }
     const DeliveryConverter& converter() const noexcept { return conv_; }
 
-    // Non-finite input samples in the programme the last render, solve or range measurement was handed — counted by
-    // the converter's gate, or at equal rates (where the input is read in place and the chain's gate replaces them)
-    // by the same test over the input. A number about the CALLER's programme, at the source rate.
+    // Non-finite input samples in the programme of THE LAST RENDER, SOLVE OR RANGE MEASUREMENT THAT REACHED THE COUNT —
+    // counted by the converter's gate over a conversion that completed, or, where a solve or a range measurement reads
+    // the input in place at equal rates (the chain's gate then replaces the samples), by the same test over the input.
+    // A number about the CALLER's programme, at the source rate. A call refused before its count leaves the previous
+    // one where it was, so a caller that reads it after a refusal reads an earlier programme's — the rule
+    // `fc_solution_log` keeps for `written`. A call refused AFTER its count keeps its own: at equal rates a range
+    // measurement refuses a poisoned programme having counted it, and the count is then the reason.
     std::uint64_t nonFiniteInputSamples() const noexcept { return nonFinite_; }
 
     // A render at the parameters the chain already holds. `out` must be exactly `deliveredFrames(inFrames)`
@@ -240,7 +244,7 @@ private:
             src[c] = dst[c];
         }
         const bool ok = conv_.convert (in, numChannels, inFrames, dst, outFrames);
-        nonFinite_ = conv_.nonFiniteInputSamples();
+        if (ok) nonFinite_ = conv_.nonFiniteInputSamples();         // a conversion that completed — see the getter
         return ok;
     }
 

@@ -16,7 +16,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
+#include <string>
 #include <vector>
 
 static std::atomic<long long> g_allocs { 0 }, g_allocBytes { 0 };
@@ -289,11 +291,45 @@ static void testPlanes()
     }
 }
 
+// The count of non-finite input samples is THE LAST convert()'s THAT REACHED IT. A call refused before reading its
+// input leaves the previous count exactly where it was — the rule `fc_solution_log` keeps for `written` — and the next
+// call that reads its programme replaces it, an empty one with 0.
+static void testCountIsTheLastCallThatReachedIt()
+{
+    group ("nonFiniteInputSamples: the last convert() that reached its count");
+    const long long N = 4800;
+    for (const auto& pr : { std::pair<double, double> { 44100.0, 48000.0 }, { 48000.0, 48000.0 } })
+    {
+        const long long D = DeliveryConverter::deliveredFrames (pr.first, pr.second, N);
+        Planar dirty (2, N), clean (2, N), out (2, D);
+        for (long long i = 0; i < N; ++i)
+            for (int c = 0; c < 2; ++c)
+                dirty.ch[(std::size_t) c][(std::size_t) i] = clean.ch[(std::size_t) c][(std::size_t) i] = (float) std::sin (0.01 * (double) (i + c));
+        dirty.ch[0][10] = std::numeric_limits<float>::quiet_NaN();
+        dirty.ch[1][N - 1] = std::numeric_limits<float>::infinity();
+        dirty.ch[1][20] = std::numeric_limits<float>::quiet_NaN();
+        DeliveryConverter dc;
+        if (! dc.prepare (pr.first, pr.second, 2, 1024)) { ok (false, "prepared"); continue; }
+        const std::string tag = pr.first == pr.second ? "equal rates: " : "44.1 -> 48: ";
+        const float* di[2] = { dirty.ch[0].data(), dirty.ch[1].data() };
+        const float* ci[2] = { clean.ch[0].data(), clean.ch[1].data() };
+        ok (dc.convert (di, 2, N, out.ptr.data(), D) && dc.nonFiniteInputSamples() == 3u, tag + "a call that reaches its count: 3");
+        ok (! dc.convert (ci, 2, N, out.ptr.data(), D + 1) && dc.nonFiniteInputSamples() == 3u, tag + "refused on its length: still 3");
+        float* over[2] = { dirty.ch[1].data(), out.ptr[1] };                  // an output over an input
+        ok (! dc.convert (di, 2, N, over, D) && dc.nonFiniteInputSamples() == 3u, tag + "refused on its planes: still 3");
+        ok (dc.convert (ci, 2, N, out.ptr.data(), D) && dc.nonFiniteInputSamples() == 0u, tag + "the next that reaches it: 0");
+        ok (dc.convert (di, 2, N, out.ptr.data(), D) && dc.nonFiniteInputSamples() == 3u
+            && dc.convert (ci, 2, 0, out.ptr.data(), 0) && dc.nonFiniteInputSamples() == 0u,
+            tag + "and an empty programme reaches it with nothing to read: 0");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::DeliveryConverter — SRC first, whole programme\n");
     testLength();
     testConvert();
     testPlanes();
+    testCountIsTheLastCallThatReachedIt();
     return felitronics::test::report();
 }

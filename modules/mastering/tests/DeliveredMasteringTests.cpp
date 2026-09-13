@@ -534,7 +534,8 @@ static void testNonFiniteInputIsGatedBeforeTheConversion()
         ok (bc == 0u && bd == 2u, tag + "and the two non-finite samples are counted, the clamped finite one is not");
 
         // The SAME count from the range measurement, which at equal rates reads the input in place rather than
-        // converting it — the measurement itself refuses a poisoned programme, but the count is taken first.
+        // converting it — and there the measurement itself refuses the poisoned programme, but the count is taken
+        // first. (Converting, the gate has already replaced both samples, so the range is measured.)
         {
             MasteringChain ch; OfflineRenderer r; TargetLoudnessSolver sv; DeliveredMastering dm;
             const bool built = r.prepare (kNch, kBlock) && ch.prepare (pr.second, kNch, cfg) && dm.prepare (pr.first, pr.second, kNch, kBlock)
@@ -546,10 +547,39 @@ static void testNonFiniteInputIsGatedBeforeTheConversion()
             std::vector<float> dummy (1, 0.0f);
             Planes p = planes (dirty4, n4, dummy, 0);
             double v = 0.0;
-            (void) dm.measureInputLoudnessRange (sv, p.in, kNch, n4, v);
-            ok (built && dm.nonFiniteInputSamples() == 2u, tag + "the range measurement counts the same two");
+            const bool measured = dm.measureInputLoudnessRange (sv, p.in, kNch, n4, v);
+            const bool identity = pr.first == pr.second;
+            ok (built && measured != identity && dm.nonFiniteInputSamples() == 2u,
+                tag + (identity ? "the range measurement counts the same two — and refuses the programme AFTER its count, keeping it"
+                                : "the range measurement counts the same two, and measures the gated programme"));
             const float* nullPlanes[core::kMaxChannels] {};
-            ok (! dm.measureInputLoudnessRange (sv, nullPlanes, kNch, n4, v), tag + "and refuses a table of null planes");
+            ok (! dm.measureInputLoudnessRange (sv, nullPlanes, kNch, n4, v) && dm.nonFiniteInputSamples() == 2u,
+                tag + "and refuses a table of null planes BEFORE its count, leaving the previous one");
+        }
+
+        // THE COUNT IS THE LAST CALL'S THAT REACHED IT. One object through a sequence: every call refused before its
+        // count leaves the previous number exactly where it was — the rule `fc_solution_log` keeps for `written` —
+        // and the next call that reaches its count replaces it, zero included.
+        {
+            MasteringChain ch; OfflineRenderer r; TargetLoudnessSolver sv; DeliveredMastering dm;
+            const bool built = r.prepare (kNch, kBlock) && ch.prepare (pr.second, kNch, cfg) && dm.prepare (pr.first, pr.second, kNch, kBlock)
+                            && sv.prepare (pr.second, kNch, kBlock, ch.internalBlock(), ch.tapOversampleFactor());
+            std::vector<float> out ((std::size_t) (d * kNch), 0.0f);
+            Planes pd = planes (dirty, n, out, d);
+            ok (built && dm.render (ch, r, pd.in, kNch, n, pd.out, d) && dm.nonFiniteInputSamples() == 2u,
+                tag + "a render that reaches its count: 2");
+            ok (! dm.render (ch, r, pd.in, kNch, n, pd.out, d - 1) && dm.nonFiniteInputSamples() == 2u,
+                tag + "a render refused on its length leaves 2");
+            Planes over = planes (dirty, n, dirty, d);                // the output over the input
+            ok (! dm.render (ch, r, over.in, kNch, n, over.out, d) && dm.nonFiniteInputSamples() == 2u,
+                tag + "a render refused on its planes leaves 2");
+            Planes pc = planes (clean, n, out, d);
+            LoudnessRequest noTarget;
+            ok (dm.solve (sv, ch, r, MasteringChainParams {}, pc.in, kNch, n, pc.out, d, noTarget).status
+                    == MasteringSolveStatus::InvalidRequest && dm.nonFiniteInputSamples() == 2u,
+                tag + "a solve refused before its count leaves 2");
+            ok (dm.render (ch, r, pc.in, kNch, n, pc.out, d) && dm.nonFiniteInputSamples() == 0u,
+                tag + "and the next render that reaches its count replaces it: 0");
         }
     }
 }

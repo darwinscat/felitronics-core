@@ -527,9 +527,14 @@ typedef struct fc_master_stats
     // of the audio would be a second definition of "non-finite", and the count of internal quanta —
     // which an earlier draft of this struct carried — would have been this file re-deriving the chain's
     // own quantum accounting. The chain owns both; this reports one and does not invent the other.
-    // ON A DELIVERING HANDLE it is the core's count for the programme the last `*_delivered` call or converting
-    // `fc_master_measure_lra` was handed, at the source rate: the converter gates every input sample ahead of the
-    // conversion (one bad sample must not become a kernel's worth of zeroes), so the chain behind it sees none.
+    // ON A DELIVERING HANDLE it is the core's count (`DeliveredMastering::nonFiniteInputSamples`), at the source rate,
+    // for the programme of THE LAST `*_delivered` CALL OR CONVERTING `fc_master_measure_lra` THAT REACHED THE COUNT:
+    // the converter gates every input sample ahead of the conversion (one bad sample must not become a kernel's worth
+    // of zeroes), so the chain behind it sees none. A call refused before its count — by this facade, which never
+    // reaches the core then, or by the core — leaves the previous count, as a refused `fc_solution_log` leaves
+    // `written`; read it after FC_OK. A call refused AFTER its count keeps its own: at equal rates, where the input is
+    // read in place, `fc_master_measure_lra` answers FC_ERR_REFUSED_BY_CORE on a poisoned programme having counted it.
+    // Not a version: the field and its layout are v1's, and this states what it has always held.
     uint64_t nonFiniteIn;
 } fc_master_stats;
 
