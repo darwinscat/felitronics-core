@@ -243,29 +243,32 @@ public:
     }
 
     // --- the report (partial while streaming, final after finish()) ---
+    // Every accessor is total: an index outside the report (a run past storedRunCount(), a channel outside the prepared
+    // width, anything before prepare()) answers an empty run or zero rather than reading past a vector (P58 crew round).
     bool isFinished() const noexcept { return finished_; }
     bool clipped() const noexcept { return runCount_ > 0; }
     std::int64_t runCount() const noexcept { return runCount_; }
     std::int64_t storedRunCount() const noexcept { return std::min<std::int64_t> (runCount_, (std::int64_t) runs_.size()); }
     bool runsComplete() const noexcept { return runCount_ <= (std::int64_t) runs_.size(); }
-    const ClipRun& run (std::int64_t i) const noexcept { return runs_[(std::size_t) i]; }   // i < storedRunCount()
+    ClipRun run (std::int64_t i) const noexcept { return i >= 0 && i < storedRunCount() ? runs_[(std::size_t) i] : ClipRun {}; }
     std::int64_t samplesProcessed() const noexcept { return t_; }
     int channels() const noexcept { return channels_; }
 
-    double samplePeak (int c) const noexcept { return chans_[(std::size_t) c].peak; }
+    double samplePeak (int c) const noexcept { return has (c) ? chans_[(std::size_t) c].peak : 0.0; }
     double samplePeakDb (int c) const noexcept { return toDb (samplePeak (c)); }
     double samplePeak() const noexcept { double m = 0; for (const auto& ch : chans_) m = std::max (m, ch.peak); return m; }
     double samplePeakDb() const noexcept { return toDb (samplePeak()); }
     double dcOffset (int c) const noexcept                                 // mean of the finite samples
     {
+        if (! has (c)) return 0.0;
         const Channel& ch = chans_[(std::size_t) c];
         return ch.finite > 0 ? (ch.dcSum + ch.dcComp) / (double) ch.finite : 0.0;
     }
-    std::int64_t finiteSamples (int c) const noexcept { return chans_[(std::size_t) c].finite; }
-    std::int64_t nonFiniteSamples (int c) const noexcept { return chans_[(std::size_t) c].nonFinite; }
-    std::int64_t runCount (int c) const noexcept { return chans_[(std::size_t) c].runs; }
-    std::int64_t clippedSamples (int c) const noexcept { return chans_[(std::size_t) c].clippedSamples; }
-    std::int64_t longestRun (int c) const noexcept { return chans_[(std::size_t) c].longest; }
+    std::int64_t finiteSamples (int c) const noexcept { return has (c) ? chans_[(std::size_t) c].finite : 0; }
+    std::int64_t nonFiniteSamples (int c) const noexcept { return has (c) ? chans_[(std::size_t) c].nonFinite : 0; }
+    std::int64_t runCount (int c) const noexcept { return has (c) ? chans_[(std::size_t) c].runs : 0; }
+    std::int64_t clippedSamples (int c) const noexcept { return has (c) ? chans_[(std::size_t) c].clippedSamples : 0; }
+    std::int64_t longestRun (int c) const noexcept { return has (c) ? chans_[(std::size_t) c].longest : 0; }
 
 private:
     static constexpr int kPre = kFlankSteps + 1;        // samples kept before a band: y[k-1] … y[k-9]
@@ -332,6 +335,7 @@ private:
         return std::max (0, 150 - ex - std::countr_zero (mant));
     }
     static double toDb (double lin) noexcept { return lin > 1.0e-10 ? core::gainToDb (lin) : -200.0; }
+    bool has (int c) const noexcept { return c >= 0 && c < (int) chans_.size(); }
     static constexpr float kHole = std::numeric_limits<float>::quiet_NaN();
 
     // --- monotone deques over the last W finite samples (max and min), per channel ---

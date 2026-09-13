@@ -50,7 +50,12 @@ clean), and full scale plays no part (clipped and then turned down is still clip
   written straight from the rule nulls the streaming engine run for run (randomised material and 4000 tiny streams in
   the suite, 2263 corpus files out of it); a 41-mutant stand kills 40, the survivor equivalent. ASan found a ring
   overrun no other check could see — a long flat band trimmed the window deque only at queries — now expired on every
-  push. ~13 ns/sample on arm64 (a heavily clipped 5-minute stereo file in 0.38 s).
+  push. A code-review round with one mandate, "find an input that reads or writes past a buffer or carries state
+  across calls", found none: an instrumented copy asserting every ring index (the in-vector overrun ASan cannot see)
+  over 3024 lifecycle cases, and 15 million frames of stress input, reached both ring capacities exactly and never
+  past them (deque W+1 of W+2, pending ceil(W/2) of W/2+2). It did find the report accessors unchecked — a channel
+  or run index outside the report, or any call before prepare(), read past a vector; they now answer empty.
+  ~13 ns/sample on arm64 (a heavily clipped 5-minute stereo file in 0.38 s).
 
 ## v0.31.0 — 2026-09-12
 

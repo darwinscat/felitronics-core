@@ -813,6 +813,27 @@ int main()
     }
 
     // ---------------------------------------------------------------------------------------------- law 11 contract
+    test::group ("every report accessor is total: out-of-range indices and an unprepared object answer empty");
+    {
+        CD u;
+        test::ok (u.samplePeak (0) == 0.0 && u.dcOffset (0) == 0.0 && u.runCount (0) == 0 && u.longestRun (3) == 0
+                  && u.run (0).length == 0 && u.samplePeak() == 0.0, "before prepare(): zeros, no read past an empty vector");
+        const double sr = 48000; const long N = 48000;
+        std::vector<double> x ((std::size_t) N);
+        for (long n = 0; n < N; ++n) x[(std::size_t) n] = std::clamp (1.6 * std::sin (kTau2Pi * 100.0 * n / sr + 0.3), -0.5, 0.5);
+        CD d; d.setParams ({ 2 });
+        test::run (d.prepare (sr, 512, 2));
+        const auto y = deliver (x, 16);
+        const float* io[2] { y.data(), y.data() };
+        test::run (d.process (io, 2, (int) N));
+        d.finish();
+        test::ok (d.runCount() > 2 && d.storedRunCount() == 2, "the fixture overflows a two-run list");
+        test::ok (d.run (2).length == 0 && d.run (-1).length == 0 && d.run (d.runCount()).length == 0 && d.run (1).length > 0,
+                  "run(i) past the stored list, or negative: an empty run");
+        test::ok (d.samplePeak (2) == 0.0 && d.samplePeak (-1) == 0.0 && d.nonFiniteSamples (16) == 0 && d.clippedSamples (-5) == 0,
+                  "a channel outside the prepared width: zeros");
+    }
+
     test::group ("law 11: refusals, clock-only calls, stopped channels, finish, reset, prepare");
     {
         CD d;
