@@ -17,6 +17,7 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
@@ -220,8 +221,12 @@ int main()
     {
         ok (fc_master_abi_version() == FC_MASTER_ABI_VERSION, "the version this build speaks");
         ok (fc_master_max_eq_bands() == FC_MAX_EQ_BANDS, "the band count the ABI mirrors");
-        ok (fc_master_sizeof_params() == sizeof (fc_master_params), "sizeof(params) as this build sees it");
-        ok (fc_master_sizeof_config() == sizeof (fc_master_config), "sizeof(config)");
+        // FROZEN at v1, so a v1 loader fails on the version rather than on a size it would blame on its own layout.
+        ok (fc_master_sizeof_params() == 6560u, "sizeof(params) at v1 — frozen");
+        ok (fc_master_sizeof_config() == 80u, "sizeof(config) at v1 — frozen, though this build's is 88");
+        ok (fc_master_sizeof (FC_STRUCT_PARAMS, FC_MASTER_ABI_VERSION) == sizeof (fc_master_params)
+            && fc_master_sizeof (FC_STRUCT_CONFIG, FC_MASTER_ABI_VERSION) == sizeof (fc_master_config),
+            "and the size table's current row is this build's sizeof");
         ok (fc_master_max_channels() == (std::uint32_t) felitronics::core::kMaxChannels,
             "and the channel ceiling is the CORE's, not a number this file chose");
     }
@@ -236,8 +241,8 @@ int main()
         fc_master_params p {};
         std::memset (&p, 0xAB, sizeof p);      // poison, so "written" is distinguishable from "left"
         fc_master_params_default (&p);
-        ok (p.header.abiVersion == FC_MASTER_ABI_VERSION && p.header.structSize == sizeof p,
-            "the header is stamped, so the result is usable as an argument");
+        ok (p.header.abiVersion == 1u && p.header.structSize == 6560u,
+            "the header is stamped — at v1, where the frozen writer lives — so the result is usable as an argument");
         ok (p.dither.bits == 24, "dither defaults to 24 bits, not 0");
         ok (p.dither.shaping == FC_SHAPING_WEIGHTED, "and to weighted shaping, not None");
         ok ((p.dither.seedLo | p.dither.seedHi) != 0u, "and to a NON-ZERO seed");
@@ -1651,6 +1656,798 @@ int main()
     }
 
     //==========================================================================
+    // P57b — ABI v2, THE COMPATIBILITY RULE, held against bytes rather than read off the header: which versions are
+    // read, how many bytes are read and written, that a caller's header comes back as it went in, and that the
+    // frozen writers stay frozen. Every buffer below is a struct followed by CANARY bytes, because "wrote nothing
+    // past the caller's size" is only a claim until something past it is looked at.
+    group ("the version rule — what is read, what is written, and nothing past the caller's size");
+    {
+        const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
+        ok (kCur == 3u, "PRECONDITION: this group is written for v3 (v2: deliveryRate; v3: compressorMix)");
+
+        // THE TABLE (rule 5), every (struct, version) pair of today.
+        ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u, "config: 80 at v1, 88 from v2");
+        ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u, "params: 6560 at v1 and v2, 6568 from v3");
+        ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u, "resolved: 80 at v1 and v2, 88 from v3");
+        int inherit = 0;
+        for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
+            if (fc_master_sizeof (id, 1) == 0u || fc_master_sizeof (id, 2) != fc_master_sizeof (id, 1)
+                || fc_master_sizeof (id, 3) != fc_master_sizeof (id, 1)) ++inherit;
+        ok (inherit == 0, "every struct that did not grow inherits its v1 row");
+        ok (fc_master_sizeof (FC_STRUCT_CONFIG, 0) == 0u && fc_master_sizeof (FC_STRUCT_CONFIG, kCur + 1u) == 0u
+            && fc_master_sizeof (99, 1) == 0u && fc_master_sizeof (-1, 1) == 0u,
+            "and 0 for a version or an id it does not have");
+
+        // IN (rule 6): the version x size matrix, through both calls that read a config.
+        struct Row { std::uint32_t v, s; fc_status want; const char* what; };
+        const Row rows[] = {
+            { 1u, 80u, FC_OK,              "v1 at 80 bytes" },
+            { 2u, 88u, FC_OK,              "v2 at 88 bytes" },
+            { 3u, 88u, FC_OK,              "v3 at 88 bytes — the config did not grow at v3" },
+            { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
+            { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
+            { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
+            { kCur + 1u, 96u, FC_ERR_ABI_VERSION, "a version newer than this build — refused by decision" },
+        };
+        for (const Row& rw : rows)
+        {
+            fc_master_config c = goodConfig();
+            c.header.abiVersion = rw.v; c.header.structSize = rw.s;
+            fc_need nd {}; FC_INIT (nd);
+            fc_master h = 0;
+            const fc_status ns = fc_master_need_create (&c, &nd);
+            const fc_status cs = fc_master_create (&c, &h);
+            ok (ns == rw.want && cs == rw.want, std::string ("config ") + rw.what);
+            if (cs == FC_OK) (void) fc_master_destroy (h);
+        }
+
+        // ONLY THE CALLER'S BYTES ARE READ. A v1 config with a delivery rate sitting in the bytes after its 80 — which
+        // is exactly what a caller that filled the struct from a FROZEN writer and then set the v2 field has — makes
+        // a handle that does NOT deliver. The same bytes under a v2 stamp make one that does.
+        {
+            fc_master_config c = goodConfig();                              // the frozen writer: a v1 stamp
+            ok (c.header.abiVersion == 1u && c.header.structSize == 80u, "PRECONDITION: goodConfig() is a v1 struct");
+            c.deliveryRate = 96000.0;
+            fc_master h = 0; std::uint32_t d = 0;
+            ok (fc_master_create (&c, &h) == FC_OK && fc_master_delivered_frames (h, 1000u, &d) == FC_ERR_STATE,
+                "THE TRAP, pinned: `_default` then `deliveryRate` — the field lies past the stamp and is not read");
+            (void) fc_master_destroy (h);
+            FC_INIT (c);
+            ok (fc_master_create (&c, &h) == FC_OK && fc_master_delivered_frames (h, 48000u, &d) == FC_OK && d == 96000u,
+                "and under a v2 stamp the same bytes make a delivering handle");
+            (void) fc_master_destroy (h);
+        }
+
+        // THE SAME, FOR PARAMETERS, and here the new field has a value that shows: a v2 parameter set carrying a mix
+        // past its 6560 bytes renders at mix 1 — the read-back says so — and the same bytes under v3 apply 0.25.
+        {
+            fc_master h = make();
+            fc_master_resolved r {}; FC_INIT (r);
+            fc_master_params p2 = goodParams();
+            p2.header.abiVersion = 2u; p2.header.structSize = 6560u;
+            p2.compressorMix = 0.25;
+            ok (fc_master_configure (h, &p2, &r) == FC_OK && r.compressorMix == 1.0,
+                "a v2 parameter set: the mix past its 6560 bytes is not read — the chain applies 1");
+            fc_master_params p3 = p2; FC_INIT (p3);
+            ok (fc_master_configure (h, &p3, &r) == FC_OK && r.compressorMix == 0.25,
+                "and under v3 the same bytes apply 0.25");
+            (void) fc_master_destroy (h);
+        }
+
+        // THE CALLER'S SIZE BOUNDS EVERY CHECK, not only the copy: an out-handle placed right after a v2 parameter set
+        // is outside it, and a v3 caller whose struct is 8 bytes longer has it inside.
+        {
+            fc_master h = make();
+            std::vector<std::uint64_t> buf (6568u / 8u + 4u, 0u);
+            fc_master_params base = goodParams();
+            std::memcpy (buf.data(), &base, 6560u);
+            auto* pv = reinterpret_cast<fc_master_params*> (static_cast<void*> (buf.data()));
+            pv->header.abiVersion = 2u; pv->header.structSize = 6560u;
+            auto* after = reinterpret_cast<fc_solution*> (static_cast<void*> ((char*) buf.data() + 6560));
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            auto in = tone (4800, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            const fc_status s2 = fc_master_solve (h, pv, &req, in.data(), out.data(), 4800u, after);
+            ok (s2 == FC_OK, "an out-handle right after a v2 parameter set is NOT inside it: FC_OK");
+            if (s2 == FC_OK) (void) fc_solution_destroy (*after);
+            (void) fc_master_destroy (h);
+            h = make();
+            pv->header.abiVersion = 3u; pv->header.structSize = 6568u;
+            ok (fc_master_solve (h, pv, &req, in.data(), out.data(), 4800u, after) == FC_ERR_SPAN,
+                "the same address inside a v3 parameter set: SPAN");
+            (void) fc_master_destroy (h);
+        }
+
+        // OUT (rule 7): the header is an echo, and nothing past the caller's size is written — at two sizes where a
+        // struct has two (`fc_master_resolved`: 80 bytes to v2, 88 from v3) and at the one size of the others.
+        auto canaried = [] (std::size_t bytes) { std::vector<unsigned char> b (bytes + 64u, 0xC3); return b; };
+        auto intact   = [] (const std::vector<unsigned char>& b, std::size_t from)
+        { for (std::size_t i = from; i < b.size(); ++i) if (b[i] != 0xC3) return false; return true; };
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            auto rb = canaried (88u);
+            auto* r = reinterpret_cast<fc_master_resolved*> (rb.data());
+            r->header.abiVersion = 1u; r->header.structSize = 80u;
+            ok (fc_master_configure (h, &p, r) == FC_OK && r->header.abiVersion == 1u && r->header.structSize == 80u
+                && intact (rb, 80u) && r->latencySamples > 0,
+                "configure: a v1 resolved comes back stamped v1 — not this build's version — with nothing written past "
+                "its 80, where this build's `compressorMix` would go");
+            auto r3b = canaried (88u);
+            auto* r3 = reinterpret_cast<fc_master_resolved*> (r3b.data());
+            r3->header.abiVersion = 3u; r3->header.structSize = 88u;
+            ok (fc_master_configure (h, &p, r3) == FC_OK && r3->header.abiVersion == 3u && r3->compressorMix == 1.0
+                && intact (r3b, 88u), "and a v3 one gets its 88 — `compressorMix` included — and not a byte more");
+            auto rg = canaried (80u);
+            auto* r2 = reinterpret_cast<fc_master_resolved*> (rg.data());
+            r2->header.abiVersion = 1u; r2->header.structSize = 80u;
+            ok (fc_master_resolved_get (h, r2) == FC_OK && r2->header.abiVersion == 1u && intact (rg, 80u),
+                "resolved_get: the same");
+            auto sb = canaried (32u);
+            auto* st = reinterpret_cast<fc_master_stats*> (sb.data());
+            st->header.abiVersion = 1u; st->header.structSize = 32u;
+            ok (fc_master_get_stats (h, st) == FC_OK && st->header.abiVersion == 1u && intact (sb, 32u), "get_stats: the same");
+            auto nb = canaried (40u);
+            auto* nd = reinterpret_cast<fc_need*> (nb.data());
+            nd->header.abiVersion = 1u; nd->header.structSize = 40u;
+            ok (fc_master_need (h, FC_NEED_SOLVE, 48000u, nd) == FC_OK && nd->header.abiVersion == 1u
+                && nd->_pad0 == 0 && nd->callBytes > 0u && intact (nb, 40u),
+                "need: the same, and the named padding is written 0");
+            auto in = tone (48000, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            fc_solution sol = 0;
+            ok (fc_master_solve (h, &p, &req, in.data(), out.data(), 48000u, &sol) == FC_OK, "PRECONDITION: a solution");
+            auto mb = canaried (208u);
+            auto* ms = reinterpret_cast<fc_measurement*> (mb.data());
+            ms->header.abiVersion = 1u; ms->header.structSize = 208u;
+            ok (fc_solution_measurement (sol, ms) == FC_OK && ms->header.abiVersion == 1u && intact (mb, 208u),
+                "solution_measurement: the same");
+            auto ub = canaried (88u);
+            auto* su = reinterpret_cast<fc_solution_summary*> (ub.data());
+            su->header.abiVersion = 1u; su->header.structSize = 88u;
+            ok (fc_solution_summary_get (sol, su) == FC_OK && su->header.abiVersion == 1u && su->passes > 0 && intact (ub, 88u),
+                "solution_summary_get: the same");
+            (void) fc_solution_destroy (sol);
+            (void) fc_master_destroy (h);
+        }
+
+        // THE FROZEN WRITERS (rule 8) write exactly v1's bytes and a v1 stamp — COUNTED, not inferred from a formula.
+        {
+            auto cb = canaried (88u);
+            fc_master_config_default (reinterpret_cast<fc_master_config*> (cb.data()));
+            auto* c = reinterpret_cast<fc_master_config*> (cb.data());
+            std::size_t firstUntouched = cb.size();
+            for (std::size_t i = cb.size(); i-- > 0;) if (cb[i] != 0xC3) { firstUntouched = i + 1; break; }
+            ok (c->header.abiVersion == 1u && c->header.structSize == 80u && firstUntouched <= 80u && intact (cb, 80u),
+                "fc_master_config_default writes a v1 stamp and no byte at or past 80 — though this build's config is 88 ("
+                + std::to_string (firstUntouched) + ")");
+            auto pb = canaried (6568u);
+            fc_master_params_default (reinterpret_cast<fc_master_params*> (pb.data()));
+            ok (reinterpret_cast<fc_master_params*> (pb.data())->header.abiVersion == 1u && intact (pb, 6560u),
+                "fc_master_params_default: v1, 6560 bytes and none past — though this build's params are 6568");
+            auto qb = canaried (120u);
+            fc_loudness_request_default (reinterpret_cast<fc_loudness_request*> (qb.data()));
+            ok (reinterpret_cast<fc_loudness_request*> (qb.data())->header.abiVersion == 1u && intact (qb, 120u),
+                "fc_loudness_request_default: v1, 120 bytes and none past");
+        }
+
+        // THE VERSIONED WRITERS write the caller's version and nothing else.
+        {
+            auto cb = canaried (88u);
+            auto* c = reinterpret_cast<fc_master_config*> (cb.data());
+            std::memset (cb.data(), 0, 8);
+            ok (fc_master_config_defaults (c) == FC_ERR_ABI_VERSION, "an unstamped struct is refused: the writer cannot know its size");
+            c->header.abiVersion = 1u; c->header.structSize = 80u;
+            ok (fc_master_config_defaults (c) == FC_OK && c->header.abiVersion == 1u && c->header.structSize == 80u
+                && intact (cb, 80u), "a v1 stamp: 80 bytes written, the header echoed, the canaries after 80 intact");
+            fc_master_config frozen {};
+            fc_master_config_default (&frozen);
+            ok (std::memcmp ((const char*) c + 8, (const char*) &frozen + 8, 72u) == 0,
+                "and those 80 bytes are the frozen writer's 80");
+            auto vb = canaried (88u);
+            auto* v2 = reinterpret_cast<fc_master_config*> (vb.data());
+            v2->header.abiVersion = 2u; v2->header.structSize = 88u;
+            ok (fc_master_config_defaults (v2) == FC_OK && v2->deliveryRate == 0.0 && intact (vb, 88u)
+                && std::memcmp ((const char*) v2 + 8, (const char*) &frozen + 8, 72u) == 0,
+                "a v2 stamp: 88 bytes, `deliveryRate` = 0 — the value under which v2 is v1 — and nothing past");
+            v2->header.structSize = 80u;
+            ok (fc_master_config_defaults (v2) == FC_ERR_STRUCT_SIZE, "a v2 stamp with v1's size: refused");
+            ok (fc_master_config_defaults (nullptr) == FC_ERR_NULL, "null: refused");
+            fc_master_params pv {}; FC_INIT (pv);
+            fc_loudness_request qv {}; FC_INIT (qv);
+            ok (fc_master_params_defaults (&pv) == FC_OK && fc_loudness_request_defaults (&qv) == FC_OK
+                && std::isnan (qv.targetLufs) && pv.dither.bits == goodParams().dither.bits && pv.compressorMix == 1.0,
+                "the params and request writers carry the core's defaults too — `compressorMix` 1 among them");
+            auto pb2 = canaried (6568u);
+            auto* p2 = reinterpret_cast<fc_master_params*> (pb2.data());
+            p2->header.abiVersion = 2u; p2->header.structSize = 6560u;
+            ok (fc_master_params_defaults (p2) == FC_OK && p2->header.abiVersion == 2u && intact (pb2, 6560u),
+                "a v2 parameter set: 6560 bytes written, and the 8 where v3 keeps its mix untouched");
+        }
+    }
+
+    //==========================================================================
+    // v3 — `compressorMix` crosses like every other value: finite is this file's check, the range is the core's.
+    group ("v3: compressorMix — mapped, clamped by the core and read back, a NaN refused");
+    {
+        fc_master h = make();
+        fc_master_resolved r {}; FC_INIT (r);
+        fc_master_params p = goodParams(); FC_INIT (p);
+        (void) fc_master_params_defaults (&p);
+        p.compressorMix = 0.37;
+        ok (fc_master_configure (h, &p, &r) == FC_OK && r.compressorMix == (double) (float) 0.37,
+            "0.37 is applied, and the read-back is the value the stage holds (a float, as the core keeps it)");
+        p.compressorMix = 2.0;
+        ok (fc_master_configure (h, &p, &r) == FC_OK && r.compressorMix == 1.0, "2 is CLAMPED by the core to 1, and reported");
+        p.compressorMix = -1.0;
+        ok (fc_master_configure (h, &p, &r) == FC_OK && r.compressorMix == 0.0, "and -1 to 0");
+        fc_master_resolved before = r;
+        p.compressorMix = std::numeric_limits<double>::quiet_NaN();
+        ok (fc_master_configure (h, &p, &r) == FC_ERR_NON_FINITE, "a NaN is refused — the core would have made it 1 silently");
+        ok (std::memcmp (&before, &r, sizeof r) == 0, "and the refused configure moved nothing");
+        (void) fc_master_destroy (h);
+
+        fc_master_config nc = goodConfig(); nc.compressor = 0;
+        fc_master hn = 0;
+        p.compressorMix = 0.37;
+        ok (fc_master_create (&nc, &hn) == FC_OK && fc_master_configure (hn, &p, &r) == FC_OK && r.compressorMix == 0.0,
+            "with no compressor in the topology there is nothing to mix: the read-back is 0");
+        (void) fc_master_destroy (hn);
+    }
+
+    //==========================================================================
+    // P57b — THE DELIVERING HANDLE: states, lengths, spans and budgets. The bit-exactness of its renders against the
+    // core lives in `fcore_master selftest`; the budgets are here, held against the counter.
+    group ("v2: the delivering handle — refusals, the delivered length, and budgets to the byte");
+    {
+        auto deliveringConfig = [] (double fs, double dr)
+        {
+            fc_master_config c {}; FC_INIT (c);
+            (void) fc_master_config_defaults (&c);
+            c.sampleRate = fs; c.channels = kNch; c.deliveryRate = dr;
+            return c;
+        };
+
+        // CREATE: the delivering budget is the create's allocation, and a pair the resampler cannot plan is refused
+        // by both calls with nothing allocated.
+        {
+            fc_master_config c = deliveringConfig (48000.0, 96000.0);
+            fc_need nd {}; FC_INIT (nd);
+            ok (fc_master_need_create (&c, &nd) == FC_OK && nd.callBytes > 0u, "a delivering create is budgeted");
+            fc_master_config legacy = c; legacy.deliveryRate = 0.0;
+            fc_need nl {}; FC_INIT (nl);
+            ok (fc_master_need_create (&legacy, &nl) == FC_OK && nd.callBytes > nl.callBytes,
+                "and costs more than the same geometry without the converter");
+            g_plainObjectSize.store ((std::size_t) nd.facadeBytes, std::memory_order_relaxed);
+            fc_master h = 0;
+            const long long before = g_bytes.load();
+            const fc_status cs = fc_master_create (&c, &h);
+            const long long got = g_bytes.load() - before;
+            const long long budget = (long long) (nd.callBytes + nd.facadeBytes);
+            ok (cs == FC_OK && got == budget, "the delivering create allocates its budget plus the facade's record ("
+                + std::to_string (got) + " against " + std::to_string (budget) + ")");
+            (void) fc_master_destroy (h);
+            g_plainObjectSize.store (0, std::memory_order_relaxed);
+
+            struct Refusal { const char* what; double dr; fc_status want; };
+            const Refusal rs[] = {
+                { "a non-integer delivery rate", 44100.5, FC_ERR_REFUSED_BY_CORE },
+                { "a negative delivery rate",   -48000.0, FC_ERR_REFUSED_BY_CORE },
+                { "a NaN delivery rate", std::numeric_limits<double>::quiet_NaN(), FC_ERR_NON_FINITE },
+                { "an infinite delivery rate", std::numeric_limits<double>::infinity(), FC_ERR_NON_FINITE },
+            };
+            for (const Refusal& r : rs)
+            {
+                fc_master_config bc = deliveringConfig (48000.0, r.dr);
+                fc_need bn {}; FC_INIT (bn);
+                fc_master bh = 0;
+                const fc_status ns = fc_master_need_create (&bc, &bn);
+                const long long b0 = g_bytes.load();
+                const fc_status bs = fc_master_create (&bc, &bh);
+                const long long leaked = g_bytes.load() - b0;
+                ok (ns == r.want && bs == r.want && leaked == 0, std::string (r.what) + ": refused by both, nothing allocated");
+                if (bs == FC_OK) (void) fc_master_destroy (bh);
+            }
+        }
+
+        // STATE: each kind of handle refuses the other kind's calls.
+        {
+            fc_master_config c = deliveringConfig (48000.0, 44100.0);
+            fc_master dh = 0, lh = make();
+            ok (fc_master_create (&c, &dh) == FC_OK && lh != 0, "PRECONDITION: one delivering handle, one plain");
+            fc_master_params p = goodParams();
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            auto in = tone (4800, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            std::uint32_t written = 0, d = 0;
+            fc_solution sol = 0;
+            ok (fc_master_process (dh, in.data(), out.data(), 4800u) == FC_ERR_STATE
+                && fc_master_process (dh, in.data(), out.data(), 0u) == FC_ERR_STATE, "process on a delivering handle: STATE, even for 0 frames");
+            ok (fc_master_flush (dh, out.data(), 4800u, &written) == FC_ERR_STATE, "flush: STATE");
+            ok (fc_master_solve (dh, &p, &req, in.data(), out.data(), 4800u, &sol) == FC_ERR_STATE, "solve: STATE");
+            ok (fc_master_delivered_frames (lh, 4800u, &d) == FC_ERR_STATE, "delivered_frames on a plain handle: STATE");
+            ok (fc_master_render_delivered (lh, in.data(), 4800u, out.data(), 4800u) == FC_ERR_STATE, "render_delivered: STATE");
+            ok (fc_master_solve_delivered (lh, &p, &req, in.data(), 4800u, out.data(), 4800u, &sol) == FC_ERR_STATE,
+                "solve_delivered: STATE");
+            (void) fc_master_destroy (dh);
+            (void) fc_master_destroy (lh);
+        }
+
+        // THE DELIVERED LENGTH is the converter's, on every pair — forwarded, not recomputed — with the traps the
+        // converter's own suite names, and the narrowing on both sides of INT_MAX.
+        {
+            constexpr double kRates[] = { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+            constexpr std::uint32_t kLens[] = { 0u, 1u, 147u, 1000u, 176401u, 10000019u };
+            int pairs = 0, off = 0;
+            for (double a : kRates)
+                for (double b : kRates)
+                {
+                    fc_master_config c = deliveringConfig (a, b);
+                    fc_master h = 0;
+                    if (fc_master_create (&c, &h) != FC_OK) { ++off; continue; }
+                    ++pairs;
+                    for (std::uint32_t n : kLens)
+                    {
+                        std::uint32_t d = 0xFFFFFFFFu;
+                        const fc_status st = fc_master_delivered_frames (h, n, &d);
+                        if (st != FC_OK || (long long) d != felitronics::mastering::DeliveryConverter::deliveredFrames (a, b, n)) ++off;
+                    }
+                    (void) fc_master_destroy (h);
+                }
+            ok (pairs == 36 && off == 0, "every pair of the six rates (equal rates included) answers the converter's length ("
+                + std::to_string (pairs) + " pairs, " + std::to_string (off) + " off)");
+
+            fc_master_config c48 = deliveringConfig (44100.0, 48000.0);
+            fc_master h = 0;
+            std::uint32_t d = 0;
+            ok (fc_master_create (&c48, &h) == FC_OK && fc_master_delivered_frames (h, 147u, &d) == FC_OK && d == 160u,
+                "147 frames at 44.1 -> 48 kHz are 160 — the double formula says 161");
+            (void) fc_master_destroy (h);
+            fc_master_config c441 = deliveringConfig (176400.0, 44100.0);
+            ok (fc_master_create (&c441, &h) == FC_OK && fc_master_delivered_frames (h, 176401u, &d) == FC_OK && d == 44101u,
+                "176,401 frames at 176.4 -> 44.1 kHz are 44,101");
+            (void) fc_master_destroy (h);
+
+            fc_master_config up = deliveringConfig (44100.0, 192000.0);
+            ok (fc_master_create (&up, &h) == FC_OK, "PRECONDITION: a 44.1 -> 192 kHz handle");
+            std::uint32_t untouched = 0xABCDu;
+            ok (fc_master_delivered_frames (h, 0x7FFFFFFFu, &untouched) == FC_ERR_RANGE && untouched == 0xABCDu,
+                "INT_MAX input frames deliver past INT_MAX: FC_ERR_RANGE, and the out-parameter is untouched");
+            ok (fc_master_delivered_frames (h, 0x80000000u, &untouched) == FC_ERR_RANGE, "an input count past INT_MAX: FC_ERR_RANGE");
+            const std::uint32_t maxIn = (std::uint32_t) ((0x7FFFFFFFLL * 147LL) / 640LL);   // 44.1 -> 192 is 147:640 up
+            ok (fc_master_delivered_frames (h, maxIn, &d) == FC_OK && d <= 0x7FFFFFFFu
+                && fc_master_delivered_frames (h, maxIn + 1u, &d) == FC_ERR_RANGE,
+                "and the edge is exactly where the delivered length stops fitting an int");
+            ok (fc_master_delivered_frames (h, 1u, nullptr) == FC_ERR_NULL, "a null out-parameter: FC_ERR_NULL");
+            fc_need big {}; FC_INIT (big);
+            ok (fc_master_need (h, FC_NEED_SOLVE, 0x7FFFFFFFu, &big) == FC_ERR_RANGE,
+                "and a budget for a delivered length the call would refuse is refused the same way");
+            // THE COMPUTED LENGTH IS NARROWED BEFORE IT IS COMPARED. Both counts fit an int here; the delivered one
+            // does not, so the answer is RANGE — CAPACITY would send the caller to resize a buffer that cannot exist.
+            // (The mutation stand: swapping the two checks in the shared helper left every other check green.)
+            {
+                float dummy[4] {};
+                fc_master_params pp = goodParams();
+                fc_loudness_request rq {}; fc_loudness_request_default (&rq);
+                rq.targetLufs = -14.0; rq.maxTruePeakDbTp = -1.0;
+                fc_solution so = 0;
+                ok (fc_master_render_delivered (h, dummy, 0x7FFFFFFFu, dummy + 2, 1000u) == FC_ERR_RANGE,
+                    "render_delivered: a delivered length past INT_MAX is RANGE, not CAPACITY, whatever outFrames says");
+                ok (fc_master_solve_delivered (h, &pp, &rq, dummy, 0x7FFFFFFFu, dummy + 2, 1000u, &so) == FC_ERR_RANGE,
+                    "solve_delivered: the same");
+            }
+            (void) fc_master_destroy (h);
+        }
+
+        // RENDER: the order of the two lengths, the spans, and an audio path that asks the heap for nothing.
+        {
+            fc_master_config c = deliveringConfig (48000.0, 96000.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a 48 -> 96 kHz handle");
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            ok (fc_master_configure (h, &p, &r) == FC_OK, "PRECONDITION: configured");
+            const std::uint32_t n = 4800u, dn = 9600u;
+            auto in = tone (n, kNch);
+            std::vector<float> out ((std::size_t) dn * kNch, 0.0f);
+            ok (fc_master_render_delivered (h, in.data(), n, out.data(), 0x80000000u) == FC_ERR_RANGE,
+                "an outFrames past INT_MAX is RANGE — narrowing comes before the CAPACITY it would also fail");
+            ok (fc_master_render_delivered (h, in.data(), 0x80000000u, out.data(), dn) == FC_ERR_RANGE,
+                "and so is an inFrames past INT_MAX");
+            ok (fc_master_render_delivered (h, in.data(), n, out.data(), dn - 1u) == FC_ERR_CAPACITY
+                && fc_master_render_delivered (h, in.data(), n, out.data(), dn + 1u) == FC_ERR_CAPACITY,
+                "a delivered length one short or one long: CAPACITY — the stride IS the length");
+            ok (fc_master_render_delivered (h, nullptr, n, out.data(), dn) == FC_ERR_NULL
+                && fc_master_render_delivered (h, in.data(), n, nullptr, dn) == FC_ERR_NULL, "null spans: NULL");
+            std::vector<float> both ((std::size_t) dn * kNch + (std::size_t) n * kNch, 0.0f);
+            ok (fc_master_render_delivered (h, both.data(), n, both.data() + 4, dn) == FC_ERR_SPAN,
+                "an output that overlaps the input: SPAN");
+            ok (fc_master_render_delivered (h, both.data(), n, both.data(), dn) == FC_ERR_SPAN,
+                "and so does the SAME buffer, which a conversion cannot share");
+            const long long allocs = g_allocs.load();
+            const fc_status rs = fc_master_render_delivered (h, in.data(), n, out.data(), dn);
+            const long long asked = g_allocs.load() - allocs;
+            ok (rs == FC_OK && asked == 0, "the delivered render asks the heap for nothing (" + std::to_string (asked) + " requests)");
+            double peak = 0.0;
+            for (float v : out) peak = std::max (peak, (double) std::fabs (v));
+            ok (peak > 0.05, "PRECONDITION: and it rendered something");
+
+            // After a search the chain holds the SOLVER's parameters: refused until a configure puts a set back.
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            auto longIn = tone (48000, kNch);
+            std::vector<float> sOut ((std::size_t) 96000 * kNch, 0.0f);
+            fc_solution sol = 0;
+            ok (fc_master_solve_delivered (h, &p, &req, longIn.data(), 48000u, sOut.data(), 96000u, &sol) == FC_OK,
+                "PRECONDITION: a delivered solve ran");
+            ok (fc_master_render_delivered (h, in.data(), n, out.data(), dn) == FC_ERR_STATE, "then render_delivered: STATE");
+            ok (fc_master_configure (h, &p, &r) == FC_OK && fc_master_render_delivered (h, in.data(), n, out.data(), dn) == FC_OK,
+                "and a configure lifts it");
+            ok (fc_master_solve_delivered (h, &p, &req, longIn.data(), 48000u, longIn.data(), 96000u, &sol) == FC_ERR_SPAN,
+                "a delivered search over its own input: SPAN");
+            ok (fc_master_solve_delivered (h, &p, &req, longIn.data(), 48000u, sOut.data(), 96000u,
+                                           (fc_solution*) (void*) sOut.data()) == FC_ERR_SPAN,
+                "and an out-handle inside the output: SPAN");
+            (void) fc_solution_destroy (sol);
+            (void) fc_master_destroy (h);
+        }
+
+        // BUDGETS: a delivered search and a delivered range, against the counter. The literal terms are the
+        // converted programme (2 ch x delivered frames x 4 B) and the drain (2 x 64 x 4 = 512 B).
+        {
+            fc_master_config c = deliveringConfig (48000.0, 96000.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a 48 -> 96 kHz handle for the budgets");
+            ok (fc_master_set_channel_weight (h, 0, 1.0) == FC_OK, "PRECONDITION: the solver prepared");
+            const std::uint32_t n = 192000u;                     // 4 s in, 384 000 delivered
+            const long long programme = 2LL * 384000LL * 4LL;
+            fc_need solve {}; FC_INIT (solve);
+            ok (fc_master_need (h, FC_NEED_SOLVE, n, &solve) == FC_OK && solve.solverPrepared == 1,
+                "the delivered solve is budgeted, for the INPUT count");
+            fc_master_params p = goodParams();
+            fc_loudness_request req {}; fc_loudness_request_default (&req);
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            auto in = tone (n, kNch);
+            std::vector<float> out ((std::size_t) 384000 * kNch, 0.0f);
+            fc_solution sol = 0;
+            long long before = g_bytes.load();
+            const fc_status sv = fc_master_solve_delivered (h, &p, &req, in.data(), n, out.data(), 384000u, &sol);
+            const long long solveBytes = g_bytes.load() - before;
+            fc_solution_summary sum {}; FC_INIT (sum);
+            ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the delivered search rendered");
+            const long long perPass = (long long) solve.callBytes - programme - 512;
+            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + programme + 512 + (long long) solve.facadeBytes,
+                "a delivered solve allocates passes x (both meters at 96 kHz) + the converted programme + the drain + the record ("
+                + std::to_string (solveBytes) + ")");
+            (void) fc_solution_destroy (sol);
+            (void) fc_master_destroy (h);
+
+            // EQUAL RATES read the input in place: no programme term at all.
+            fc_master_config same = deliveringConfig (48000.0, 48000.0);
+            fc_master hs = 0, hl = make();
+            ok (fc_master_create (&same, &hs) == FC_OK, "PRECONDITION: an equal-rate delivering handle");
+            fc_need ns {}, nl {}; FC_INIT (ns); FC_INIT (nl);
+            ok (fc_master_need (hs, FC_NEED_SOLVE, n, &ns) == FC_OK && fc_master_need (hl, FC_NEED_SOLVE, n, &nl) == FC_OK
+                && ns.callBytes == nl.callBytes, "at equal rates the delivered solve costs what a plain one does");
+            (void) fc_master_destroy (hs);
+            (void) fc_master_destroy (hl);
+
+            // THE RANGE, JUDGED ON THE DELIVERED LENGTH. 132 300 frames at 44.1 kHz are 288 000 at 96 kHz — exactly 3 s,
+            // measurable — while the same count read as 96 kHz frames is 1.38 s and would have budgeted nothing.
+            fc_master_config lc = deliveringConfig (44100.0, 96000.0);
+            ok (fc_master_create (&lc, &h) == FC_OK && fc_master_set_channel_weight (h, 0, 1.0) == FC_OK,
+                "PRECONDITION: a 44.1 -> 96 kHz handle, solver prepared");
+            ok (felitronics::mastering::TargetLoudnessSolver::measureRangeBytes (96000.0, 132300) == 0u,
+                "PRECONDITION: the input count read at the delivery rate budgets 0 — the defect this op must not have");
+            auto lin = tone (132300u, kNch);
+            fc_need lra {}; FC_INIT (lra);
+            ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 132300u, &lra) == FC_OK && lra.callBytes > (std::uint64_t) (2 * 288000 * 4),
+                "the delivered range is budgeted: the converted programme plus a meter");
+            double v = 0.0;
+            before = g_bytes.load();
+            const fc_status ls = fc_master_measure_lra (h, lin.data(), 132300u, &v);
+            const long long lraBytes = g_bytes.load() - before;
+            ok (ls == FC_OK && lraBytes == (long long) lra.callBytes,
+                "and allocates exactly that (" + std::to_string (lraBytes) + " against " + std::to_string (lra.callBytes) + ")");
+            fc_need shortLra {}; FC_INIT (shortLra);
+            ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 132299u, &shortLra) == FC_OK && shortLra.callBytes == 0u,
+                "one input frame fewer delivers under 3 s: budgeted 0");
+            before = g_bytes.load();
+            const fc_status ss = fc_master_measure_lra (h, lin.data(), 132299u, &v);
+            const long long shortBytes = g_bytes.load() - before;
+            ok (ss == FC_ERR_REFUSED_BY_CORE && shortBytes == 0, "and refused having converted — and allocated — nothing");
+            (void) fc_master_destroy (h);
+        }
+    }
+
+    //==========================================================================
+    // P57b — THE DIVERSE-TESTING ROUND'S GAPS on the delivering handle, each one a change to the facade that left the
+    // suite green before it was here.
+    group ("v2/v3: what the diverse-testing round found untested");
+    {
+        auto deliveringConfig = [] (double fs, double dr)
+        {
+            fc_master_config c {}; FC_INIT (c);
+            (void) fc_master_config_defaults (&c);
+            c.sampleRate = fs; c.channels = kNch; c.deliveryRate = dr;
+            return c;
+        };
+        fc_loudness_request req {}; FC_INIT (req);
+        (void) fc_loudness_request_defaults (&req);
+        req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+
+        // THE LENGTH EDGE, for every call that takes one: at 44.1 -> 192 kHz, 493 250 150 input frames deliver
+        // exactly INT_MAX and 493 250 151 one more. The call's own arguments fit an int both times.
+        {
+            fc_master_config c = deliveringConfig (44100.0, 192000.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a 44.1 -> 192 kHz handle");
+            std::uint32_t d = 0;
+            ok (fc_master_delivered_frames (h, 493250150u, &d) == FC_OK && d == 0x7FFFFFFFu,
+                "493 250 150 frames deliver exactly INT_MAX");
+            fc_need atEdge {}; FC_INIT (atEdge);
+            ok (fc_master_need (h, FC_NEED_SOLVE, 493250150u, &atEdge) == FC_OK
+                && atEdge.callBytes >= 2ull * 0x7FFFFFFFull * 4ull,
+                "and its budget is answered, with the converted programme in it — not 0 at the edge");
+            float dummy[4] {};
+            fc_master_params pp = goodParams();
+            fc_solution so = 0;
+            double lra = 0.0;
+            ok (fc_master_render_delivered (h, dummy, 493250150u, dummy + 2, 1000u) == FC_ERR_CAPACITY,
+                "render_delivered at the edge: the length is narrowable, so the answer is CAPACITY, not RANGE");
+            ok (fc_master_solve_delivered (h, &pp, &req, dummy, 493250150u, dummy + 2, 1000u, &so) == FC_ERR_CAPACITY,
+                "solve_delivered at the edge: CAPACITY");
+            fc_need past {}; FC_INIT (past);
+            ok (fc_master_delivered_frames (h, 493250151u, &d) == FC_ERR_RANGE
+                && fc_master_need (h, FC_NEED_SOLVE, 493250151u, &past) == FC_ERR_RANGE
+                && fc_master_render_delivered (h, dummy, 493250151u, dummy + 2, 0x7FFFFFFFu) == FC_ERR_RANGE
+                && fc_master_solve_delivered (h, &pp, &req, dummy, 493250151u, dummy + 2, 0x7FFFFFFFu, &so) == FC_ERR_RANGE
+                && fc_master_measure_lra (h, dummy, 493250151u, &lra) == FC_ERR_RANGE,
+                "one frame past the edge: RANGE from every call, before a span is looked at");
+            (void) fc_master_destroy (h);
+
+            fc_master_config same = deliveringConfig (48000.0, 48000.0);
+            ok (fc_master_create (&same, &h) == FC_OK, "PRECONDITION: an equal-rate handle");
+            ok (fc_master_render_delivered (h, dummy, 0x7FFFFFFFu, dummy + 2, 0u) == FC_ERR_CAPACITY,
+                "equal rates, INT_MAX frames: a count the core takes — CAPACITY for the wrong outFrames, not RANGE");
+            (void) fc_master_destroy (h);
+        }
+
+        // THE SOLVE'S ALIASES, on the delivering entry point itself — it is a separate implementation of the rule.
+        {
+            fc_master_config c = deliveringConfig (48000.0, 96000.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a 48 -> 96 kHz handle");
+            auto in = tone (4800, kNch);
+            std::vector<float> out ((std::size_t) 9600 * kNch, 0.0f);
+            std::vector<std::uint64_t> buf (6568u / 8u + 4u, 0u);
+            fc_master_params base = goodParams();
+            std::memcpy (buf.data(), &base, 6560u);
+            auto* pv = reinterpret_cast<fc_master_params*> (static_cast<void*> (buf.data()));
+            pv->header.abiVersion = 2u; pv->header.structSize = 6560u;
+            auto* after = reinterpret_cast<fc_solution*> (static_cast<void*> ((char*) buf.data() + 6560));
+            const fc_status s2 = fc_master_solve_delivered (h, pv, &req, in.data(), 4800u, out.data(), 9600u, after);
+            ok (s2 == FC_OK, "an out-handle right after a v2 parameter set is outside it — FC_OK");
+            if (s2 == FC_OK) (void) fc_solution_destroy (*after);
+            (void) fc_master_destroy (h);
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a fresh one");
+            pv->header.abiVersion = 3u; pv->header.structSize = 6568u;
+            ok (fc_master_solve_delivered (h, pv, &req, in.data(), 4800u, out.data(), 9600u, after) == FC_ERR_SPAN,
+                "and inside a v3 one: SPAN");
+            fc_master_params p = goodParams();
+            fc_loudness_request rq = req;
+            ok (fc_master_solve_delivered (h, &p, &rq, in.data(), 4800u, out.data(), 9600u,
+                                           (fc_solution*) (void*) in.data()) == FC_ERR_SPAN,
+                "an out-handle inside the INPUT: SPAN");
+            ok (fc_master_solve_delivered (h, &p, &rq, in.data(), 4800u, out.data(), 9600u,
+                                           (fc_solution*) (void*) &p.eqBands[3].on) == FC_ERR_SPAN,
+                "inside the parameters: SPAN");
+            ok (fc_master_solve_delivered (h, &p, &rq, in.data(), 4800u, out.data(), 9600u,
+                                           (fc_solution*) (void*) &rq.maxPasses) == FC_ERR_SPAN,
+                "inside the request: SPAN");
+            std::vector<float> both ((std::size_t) 9600 * kNch + (std::size_t) 4800 * kNch, 0.0f);
+            fc_solution so = 0;
+            ok (fc_master_solve_delivered (h, &p, &rq, both.data(), 4800u, both.data() + 4, 9600u, &so) == FC_ERR_SPAN,
+                "an output that partly overlaps the input: SPAN");
+            fc_loudness_request bad = rq; bad.header.abiVersion = FC_MASTER_ABI_VERSION + 1u;
+            ok (fc_master_solve_delivered (h, &p, &bad, in.data(), 4800u, out.data(), 9600u, &so) == FC_ERR_ABI_VERSION,
+                "a request from a newer ABI: refused");
+            bad = rq; bad.header.structSize = 112u;
+            ok (fc_master_solve_delivered (h, &p, &bad, in.data(), 4800u, out.data(), 9600u, &so) == FC_ERR_STRUCT_SIZE,
+                "a request of the wrong size: refused");
+
+            // A SEARCH THE SOLVER REFUSED MOVED NOTHING: no target is InvalidRequest, and render_delivered stays open.
+            fc_loudness_request none {}; FC_INIT (none);
+            (void) fc_loudness_request_defaults (&none);
+            fc_master_resolved r {}; FC_INIT (r);
+            ok (fc_master_configure (h, &p, &r) == FC_OK, "PRECONDITION: configured");
+            fc_solution sv = 0;
+            fc_solution_summary sum {}; FC_INIT (sum);
+            ok (fc_master_solve_delivered (h, &p, &none, in.data(), 4800u, out.data(), 9600u, &sv) == FC_OK
+                && fc_solution_summary_get (sv, &sum) == FC_OK && sum.status == FC_SOLVE_INVALID_REQUEST,
+                "a delivered solve with no target: FC_OK carrying InvalidRequest");
+            ok (fc_master_render_delivered (h, in.data(), 4800u, out.data(), 9600u) == FC_OK,
+                "and the handle still renders: a refused search did not mark the chain as the solver's");
+            (void) fc_solution_destroy (sv);
+
+            // THE RE-PREPARATION of a delivering handle costs nothing, as a plain one's does — at the delivery rate.
+            fc_need cn {}; FC_INIT (cn);
+            const long long b0 = g_bytes.load();
+            const fc_status cs = fc_master_configure (h, &p, &r);
+            const long long got = g_bytes.load() - b0;
+            ok (fc_master_need (h, FC_NEED_CONFIGURE, 0u, &cn) == FC_OK && cn.callBytes == 0u && cs == FC_OK && got == 0,
+                "a delivering configure is budgeted 0 and allocates 0");
+            (void) fc_master_destroy (h);
+        }
+
+        // THE AUDIO OUTPUT OVER THE CALLER'S STRUCTS, the equal-rate INT_MAX edge, a measure / solve / measure
+        // sequence, and the version matrix on every OUT entry point that takes a resolved.
+        {
+            fc_master_config c = deliveringConfig (48000.0, 48000.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: an equal-rate handle");
+            std::uint32_t d = 0;
+            ok (fc_master_delivered_frames (h, 0x7FFFFFFFu, &d) == FC_OK && d == 0x7FFFFFFFu,
+                "equal rates: INT_MAX frames deliver INT_MAX — the edge is inclusive");
+            // A buffer holding the parameters and, right after them, the start of the "output".
+            std::vector<std::uint64_t> buf (6568u / 8u + 4096u, 0u);
+            fc_master_params base = goodParams(); FC_INIT (base);
+            (void) fc_master_params_defaults (&base);
+            std::memcpy (buf.data(), &base, sizeof base);
+            auto* pv = reinterpret_cast<fc_master_params*> (static_cast<void*> (buf.data()));
+            auto in = tone (4800, kNch);
+            auto* outOverParams = reinterpret_cast<float*> (static_cast<void*> ((char*) buf.data() + 6560));
+            fc_solution so = 0;
+            ok (fc_master_solve_delivered (h, pv, &req, in.data(), 4800u, outOverParams, 4800u, &so) == FC_ERR_SPAN,
+                "an output that starts inside a v3 parameter set: SPAN — the search would write audio over it");
+            fc_loudness_request rq = req;
+            std::vector<float> rqOut (4800u * kNch, 0.0f);
+            ok (fc_master_solve_delivered (h, &base, &rq, in.data(), 4800u, (float*) (void*) &rq.minPlrDb, 4800u, &so) == FC_ERR_SPAN,
+                "and one that starts inside the request: SPAN");
+            (void) fc_master_destroy (h);
+
+            fc_master_config lc = deliveringConfig (48000.0, 96000.0);
+            ok (fc_master_create (&lc, &h) == FC_OK, "PRECONDITION: a 48 -> 96 kHz handle");
+            auto prog = tone (192000u, kNch);
+            double first = -1.0, second = -2.0;
+            std::vector<float> out ((std::size_t) 384000 * kNch, 0.0f);
+            fc_solution sv = 0;
+            fc_master_params p = goodParams();
+            ok (fc_master_measure_lra (h, prog.data(), 192000u, &first) == FC_OK
+                && fc_master_solve_delivered (h, &p, &req, prog.data(), 192000u, out.data(), 384000u, &sv) == FC_OK
+                && fc_master_measure_lra (h, prog.data(), 192000u, &second) == FC_OK && first == second,
+                "measure, solve, measure: the range is the same number before and after a search");
+            (void) fc_solution_destroy (sv);
+            for (const std::uint32_t ver : { 1u, 2u, 3u })
+            {
+                std::vector<unsigned char> rb (96u, 0xC3);
+                auto* r = reinterpret_cast<fc_master_resolved*> (static_cast<void*> (rb.data()));
+                const std::uint32_t size = ver < 3u ? 80u : 88u;
+                r->header.abiVersion = ver; r->header.structSize = size;
+                bool tail = true;
+                const fc_status st1 = fc_master_resolved_get (h, r);
+                for (std::size_t i = size; i < rb.size(); ++i) tail = tail && rb[i] == 0xC3;
+                const bool stamp = r->header.abiVersion == ver && r->header.structSize == size;
+                r->header.abiVersion = ver; r->header.structSize = size;
+                const fc_status st2 = fc_master_configure (h, &p, r);
+                for (std::size_t i = size; i < rb.size(); ++i) tail = tail && rb[i] == 0xC3;
+                ok (st1 == FC_ERR_STATE || st1 == FC_OK, "PRECONDITION: resolved_get answered");
+                ok (st1 == FC_OK && st2 == FC_OK && stamp && tail,
+                    "a v" + std::to_string (ver) + " resolved through resolved_get and configure: accepted, stamp echoed, nothing past its "
+                    + std::to_string (size) + " bytes");
+            }
+            (void) fc_master_destroy (h);
+        }
+
+        // A FULL TABLE refuses a delivered search before the solver prepares anything.
+        {
+            fc_master_config c = deliveringConfig (48000.0, 44100.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a delivering handle, solver not prepared");
+            fc_master live[7] {};
+            int made = 0;
+            const fc_master_config gc = goodConfig();
+            for (auto& l : live) if (fc_master_create (&gc, &l) == FC_OK) ++made;
+            ok (made == 7, "PRECONDITION: the table is full");
+            fc_master_params p = goodParams();
+            auto in = tone (4800, kNch);
+            std::vector<float> out ((std::size_t) 4410 * kNch, 0.0f);
+            fc_solution so = 0;
+            fc_need before {}; FC_INIT (before);
+            (void) fc_master_need (h, FC_NEED_SOLVE, 4800u, &before);
+            const long long b0 = g_bytes.load();
+            const fc_status st = fc_master_solve_delivered (h, &p, &req, in.data(), 4800u, out.data(), 4410u, &so);
+            const long long got = g_bytes.load() - b0;
+            fc_need afterN {}; FC_INIT (afterN);
+            (void) fc_master_need (h, FC_NEED_SOLVE, 4800u, &afterN);
+            ok (st == FC_ERR_EXHAUSTED && got == 0 && before.solverPrepared == 0 && afterN.solverPrepared == 0,
+                "EXHAUSTED, nothing allocated, and the solver still unprepared (" + std::to_string (got) + " B)");
+            for (int i = 0; i < made; ++i) (void) fc_master_destroy (live[i]);
+            (void) fc_master_destroy (h);
+        }
+
+        // need_create ECHOES its OUT header too, whatever the config's version.
+        {
+            const fc_master_config c = deliveringConfig (48000.0, 96000.0);
+            fc_need nd {}; nd.header.abiVersion = 1u; nd.header.structSize = 40u;
+            ok (fc_master_need_create (&c, &nd) == FC_OK && nd.header.abiVersion == 1u && nd.header.structSize == 40u,
+                "need_create: a v1-stamped budget comes back stamped v1");
+        }
+
+        // compressorMix: the infinities are refused like a NaN, not clamped to the core's 1.
+        {
+            fc_master h = make();
+            fc_master_resolved r {}; FC_INIT (r);
+            fc_master_params p {}; FC_INIT (p);
+            (void) fc_master_params_defaults (&p);
+            p.compressorMix = std::numeric_limits<double>::infinity();
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_NON_FINITE, "compressorMix +inf: NON_FINITE");
+            p.compressorMix = -std::numeric_limits<double>::infinity();
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_NON_FINITE, "and -inf");
+            (void) fc_master_destroy (h);
+        }
+
+        // THE CREATE BUDGET ON A DOWNSAMPLE AND AT EQUAL RATES — the chain at the delivery rate, not at the higher one.
+        for (const auto& pr : { std::pair<double, double> { 192000.0, 44100.0 }, std::pair<double, double> { 48000.0, 48000.0 } })
+        {
+            fc_master_config c = deliveringConfig (pr.first, pr.second);
+            fc_need nd {}; FC_INIT (nd);
+            ok (fc_master_need_create (&c, &nd) == FC_OK, "PRECONDITION: budgeted");
+            g_plainObjectSize.store ((std::size_t) nd.facadeBytes, std::memory_order_relaxed);
+            fc_master h = 0;
+            const long long b0 = g_bytes.load();
+            const fc_status cs = fc_master_create (&c, &h);
+            const long long got = g_bytes.load() - b0;
+            ok (cs == FC_OK && got == (long long) (nd.callBytes + nd.facadeBytes),
+                std::to_string ((int) pr.first) + " -> " + std::to_string ((int) pr.second)
+                + ": the create allocates its budget, to the byte (" + std::to_string (got) + ")");
+            (void) fc_master_destroy (h);
+            g_plainObjectSize.store (0, std::memory_order_relaxed);
+        }
+
+        // A NON-FINITE INPUT SAMPLE on a delivering handle costs what it costs a plain one: converting a NaN is
+        // converting a zero in its place, bit for bit, and it is counted once — not smeared over a kernel.
+        {
+            fc_master_config c = deliveringConfig (44100.0, 48000.0);
+            fc_master h = 0;
+            ok (fc_master_create (&c, &h) == FC_OK, "PRECONDITION: a 44.1 -> 48 kHz handle");
+            fc_master_params p = goodParams();
+            fc_master_resolved r {}; FC_INIT (r);
+            ok (fc_master_configure (h, &p, &r) == FC_OK, "PRECONDITION: configured");
+            auto clean = tone (44100, kNch);
+            clean[1000] = 0.0f; clean[44100 + 20000] = 1.0e6f;
+            auto dirty = clean;
+            dirty[1000] = std::numeric_limits<float>::quiet_NaN();
+            dirty[44100 + 20000] = std::numeric_limits<float>::infinity();   // not finite: replaced by 0, like a NaN
+            clean[44100 + 20000] = 0.0f;
+            dirty[44100 + 30000] = 3.0e30f;                                  // finite, far outside: clamps to 1e6
+            clean[44100 + 30000] = 1.0e6f;
+            std::vector<float> oc ((std::size_t) 48000 * kNch, 0.0f), od (oc.size(), 0.0f);
+            ok (fc_master_render_delivered (h, clean.data(), 44100u, oc.data(), 48000u) == FC_OK
+                && fc_master_render_delivered (h, dirty.data(), 44100u, od.data(), 48000u) == FC_OK, "both rendered");
+            std::size_t differ = 0, nonFinite = 0;
+            for (std::size_t i = 0; i < oc.size(); ++i)
+            {
+                if (std::memcmp (&oc[i], &od[i], sizeof (float)) != 0) ++differ;
+                if (! std::isfinite (od[i])) ++nonFinite;
+            }
+            ok (differ == 0 && nonFinite == 0, "NaN, inf and 3e30 render exactly as 0, 0 and 1e6 do (" + std::to_string (differ)
+                + " samples differ)");
+            fc_master_stats st {}; FC_INIT (st);
+            ok (fc_master_get_stats (h, &st) == FC_OK && st.nonFiniteIn == 2u,
+                "and the two non-finite samples are counted as two (" + std::to_string (st.nonFiniteIn) + ")");
+            (void) fc_master_destroy (h);
+        }
+    }
+
+    //==========================================================================
     // P41 — A CALL THAT NEVER RETURNED POISONS THE INSTANCE. LAST in this file on purpose: the poison belongs to the
     // whole module and is permanent — that is the contract — so nothing may run after it in this binary.
 #if defined(__cpp_exceptions)
@@ -1745,12 +2542,23 @@ int main()
                       && fc_solution_summary_get (0, &sb)                           == FC_ERR_POISONED
                       && fc_solution_measurement (0, &ms)                           == FC_ERR_POISONED
                       && fc_solution_log (0, lg, 4, &wrote)                         == FC_ERR_POISONED
-                      && fc_solution_destroy (0)                                    == FC_ERR_POISONED;
+                      && fc_solution_destroy (0)                                    == FC_ERR_POISONED
+                      // v2/v3 — the list is EVERY entry point, so a new one joins it (the diverse-testing round
+                      // found the five below missing: removing their guard left the suite green)
+                      && fc_master_delivered_frames (0, 64u, &wrote)                == FC_ERR_POISONED
+                      && fc_master_render_delivered (0, in.data(), 64u, out.data(), 64u) == FC_ERR_POISONED
+                      && fc_master_solve_delivered (0, &p, &req, in.data(), n, out.data(), n, &sx) == FC_ERR_POISONED
+                      && fc_master_params_defaults (&p)                             == FC_ERR_POISONED
+                      && fc_master_config_defaults (nullptr)                        == FC_ERR_POISONED
+                      && fc_loudness_request_defaults (&req)                        == FC_ERR_POISONED;
         ok (all, "every status entry point with an INVALID handle answers 14 after the poison, not FC_ERR_HANDLE");
         // The entry points without a status read no instance state and stay callable.
         ok (fc_master_abi_version() == FC_MASTER_ABI_VERSION, "build identity still answers");
         fc_master_params d {}; fc_master_params_default (&d);
-        ok (d.header.abiVersion == FC_MASTER_ABI_VERSION, "and the defaults writer still writes");
+        ok (d.header.abiVersion == 1u, "and the frozen defaults writer still writes");
+        fc_master_params dv {}; FC_INIT (dv);
+        ok (fc_master_params_defaults (&dv) == FC_ERR_POISONED,
+            "while the VERSIONED one returns a status, and is guarded like every such entry point");
     }
 #endif
 

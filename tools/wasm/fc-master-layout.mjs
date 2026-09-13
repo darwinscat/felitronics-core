@@ -21,13 +21,26 @@
 // ==================================================================================================
 // `structSize` is not decoration. Every struct crossing this boundary starts with {abiVersion,
 // structSize}, this file stamps them from the size it computed, and fc_master.cpp compares that against
-// its own `sizeof` and answers FC_ERR_STRUCT_SIZE when they differ — before reading one further byte.
-// So a field added, dropped or mistyped here is a REFUSAL on the first call, not a plausible parameter
-// set. `fc_master_sizeof_params` / `fc_master_sizeof_config` are checked against it at load besides,
+// the size its table gives for this file's VERSION and answers FC_ERR_STRUCT_SIZE when they differ — before
+// reading one further byte. So a field added, dropped or mistyped here is a REFUSAL on the first call, not a
+// plausible parameter set. `fc_master_sizeof(id, version)` is checked against every struct at load besides,
 // which turns the refusal into a message that says what is wrong rather than which call noticed.
 //
-// What that does NOT catch is a permutation that preserves the total — two f64 fields swapped. Nothing
-// mechanical can; the fields below are in header order and stay that way.
+// What a size cannot catch is a permutation that preserves the total — two f64 fields swapped. That one is
+// caught by tools/wasm/layout-check.mjs, which holds every field's offset here against the offset the compiler
+// gave it (`fcore_master layout`), in both directions, under ctest.
+//
+// ==================================================================================================
+// VERSIONS (tools/fc_master_abi.h, VERSIONING — read the rule there)
+// ==================================================================================================
+// This file describes ONE version, FC_MASTER_ABI_VERSION below, and every struct it stamps is that version. A
+// module at the same version or newer reads it (a newer module reads an older caller's struct over its own
+// defaults); an older module is refused at load. `set()` and `get()` refuse any field of a struct whose header is
+// not stamped at THIS file's version and size. That is stricter than "a field past the stamp", on purpose: a page
+// written against one version has no business holding a struct of another, and the one way it comes to hold one is
+// a FROZEN v1 `_fc_*_default` writer — which the strict rule reports at the first field written (`sampleRate`),
+// instead of at the first newer one (`deliveryRate`, `compressorMix`), where the module would silently not read
+// it. Stamp with `init()` and fill with `_fc_*_defaults`.
 
 // ── the layout algorithm ──────────────────────────────────────────────────────────────────────────
 const SCALAR = { i32: 4, u32: 4, f32: 4, f64: 8, u64: 8 };
@@ -46,6 +59,7 @@ const STRUCTS = {
         ['clipper', 'i32'], ['limiter', 'i32'], ['dither', 'i32'],
         ['compressorLookaheadMs', 'f64'], ['limiterLookaheadMs', 'f64'],
         ['oversampleFactor', 'i32'], ['tapsPerPhase', 'i32'], ['sidechainHpfHz', 'f64'],
+        ['deliveryRate', 'f64'],                                // v2
     ],
 
     fc_eq_lane: [
@@ -85,6 +99,7 @@ const STRUCTS = {
         ['clipper', 'fc_clipper'], ['limiter', 'fc_limiter'], ['dither', 'fc_dither'],
         ['bypassEq', 'i32'], ['bypassMonoBass', 'i32'], ['bypassCompressor', 'i32'],
         ['bypassClipper', 'i32'], ['bypassLimiter', 'i32'], ['bypassDither', 'i32'],
+        ['compressorMix', 'f64'],                               // v3
     ],
 
     fc_master_resolved: [
@@ -94,6 +109,7 @@ const STRUCTS = {
         ['oversampleFactor', 'i32'], ['compressorTapOffset', 'i32'], ['limiterTapOffset', 'i32'],
         ['limiterCeilingDbTp', 'f64'], ['limiterReleaseMs', 'f64'],
         ['monoBass', 'fc_mono_bass'], ['tapOversampleFactor', 'i32'],
+        ['compressorMix', 'f64'],                               // v3
     ],
 
     fc_master_stats: [
@@ -104,7 +120,7 @@ const STRUCTS = {
     fc_need: [
         ['header', 'fc_header'],
         ['callBytes', 'u64'], ['solverPrepareBytes', 'u64'], ['facadeBytes', 'u64'],
-        ['solverPrepared', 'i32'],
+        ['solverPrepared', 'i32'], ['_pad0', 'i32'],            // the tail padding, named (VERSIONING rule 4)
     ],
 
     fc_gr_limit: [['limitDb', 'f64'], ['statistic', 'i32']],
@@ -148,6 +164,14 @@ const STRUCTS = {
         ['gainBelowDb', 'f64'], ['gainAboveDb', 'f64'],
     ],
 };
+
+// fc_struct_id — the codes `_fc_master_sizeof(id, version)` takes, for every struct that begins with a header.
+export const STRUCT_IDS = {
+    fc_master_config: 0, fc_master_params: 1, fc_master_resolved: 2, fc_master_stats: 3,
+    fc_need: 4, fc_loudness_request: 5, fc_measurement: 6, fc_solution_summary: 7,
+};
+
+export const structNames = () => Object.keys(STRUCTS);
 
 const layouts = new Map();
 
@@ -218,8 +242,19 @@ export class Struct {
 
     _view () { return new DataView(this.m.HEAPF32.buffer); }
 
+    // The stamp check `get` and `set` share — see VERSIONS at the top of this file.
+    _stamped (path, v) {
+        if (STRUCT_IDS[this.name] === undefined || path.startsWith('header')) return;
+        const ver = v.getUint32(this.ptr, true), size = v.getUint32(this.ptr + 4, true);
+        if (ver !== FC_MASTER_ABI_VERSION || size !== this.layout.size)
+            throw new Error(`fc-master-layout: ${this.name} is stamped v${ver}/${size} B, not this file's `
+                          + `v${FC_MASTER_ABI_VERSION}/${this.layout.size} B — stamp it with init() (and fill an input `
+                          + `struct with _${this.name}_defaults, not a frozen v1 _default writer) before '${path}'`);
+    }
+
     get (path) {
         const at = this.addr(path), t = this._t, v = this._view();
+        this._stamped(path, v);
         switch (t) {
             case 'i32': return v.getInt32(at, true);
             case 'u32': return v.getUint32(at, true);
@@ -232,6 +267,7 @@ export class Struct {
 
     set (path, value) {
         const at = this.addr(path), t = this._t, v = this._view();
+        this._stamped(path, v);
         switch (t) {
             case 'i32': v.setInt32(at, value, true); break;
             case 'u32': v.setUint32(at, value, true); break;
@@ -279,7 +315,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 1;
+export const FC_MASTER_ABI_VERSION = 3;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
@@ -298,21 +334,22 @@ export const FC_CONSTRAINT = [
     'None', 'TruePeak', 'LimiterGr', 'Plr', 'Lra', 'GainRange', 'CompressorGr',
 ];
 
-// The one check this file can make about itself before anything is rendered: the module's own `sizeof`
-// against the size computed above. Called by every loader; throws rather than returning, because a
-// mismatch here means every later refusal would be FC_ERR_STRUCT_SIZE with no explanation attached.
+// The one check this file can make about itself before anything is rendered. Called by every loader; throws
+// rather than returning, because a mismatch here means every later refusal would be FC_ERR_STRUCT_SIZE with no
+// explanation attached.
+//
+// THE VERSION FIRST, AND "AT LEAST", NOT "EQUAL": a newer module reads this file's structs (VERSIONING rule 6) and
+// has every entry point this file can call; an older one may lack both. Then EVERY struct with a header, at THIS
+// file's version, from the module's own size table.
 export function assertLayoutMatches (module) {
-    const pairs = [
-        ['fc_master_params', module._fc_master_sizeof_params()],
-        ['fc_master_config', module._fc_master_sizeof_config()],
-    ];
-    for (const [name, theirs] of pairs) {
-        const ours = sizeOf(name);
-        if (ours !== theirs)
-            throw new Error(`fc-master-layout: ${name} is ${ours} bytes here and ${theirs} in the module — `
-                          + `this file and tools/fc_master_abi.h have fallen out of step`);
-    }
     const v = module._fc_master_abi_version();
-    if (v !== FC_MASTER_ABI_VERSION)
-        throw new Error(`fc-master-layout: ABI v${v} in the module, v${FC_MASTER_ABI_VERSION} here`);
+    if (!(v >= FC_MASTER_ABI_VERSION))
+        throw new Error(`fc-master-layout: ABI v${v} in the module is older than v${FC_MASTER_ABI_VERSION} here — `
+                      + `the module cannot read this file's structs or has not got its entry points`);
+    for (const [name, id] of Object.entries(STRUCT_IDS)) {
+        const ours = sizeOf(name), theirs = module._fc_master_sizeof(id, FC_MASTER_ABI_VERSION);
+        if (ours !== theirs)
+            throw new Error(`fc-master-layout: ${name} is ${ours} bytes here and ${theirs} in the module at `
+                          + `v${FC_MASTER_ABI_VERSION} — this file and tools/fc_master_abi.h have fallen out of step`);
+    }
 }

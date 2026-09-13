@@ -3,7 +3,13 @@
 //
 // P10 acceptance: the mastering ABI compiled to wasm renders what the native reference renders.
 //
-//   node master-parity.mjs build/fcmaster.node.js ../../build/tools/fcore_master 48000 2 short.f32
+//   node master-parity.mjs build/fcmaster.node.js ../../build/tools/fcore_master 48000 2 short.f32 [delivery rates...]
+//
+// P57b adds a fourth path, the DELIVERING handle (ABI v2): `fc_master_render_delivered`, `fc_master_solve_delivered` and
+// the converting `fc_master_measure_lra`, against `fcore_master … delivery=<rate>`, at a downsample and an upsample by
+// default. Before any sample is compared, both sides must have the SAME LENGTH — the delivered one, which on an
+// upsample is longer than the input — and every sample must be finite: a tolerance on the difference cannot see a
+// prefix, and `NaN > worst` is false.
 //
 // It runs BOTH paths of the ABI — the streaming one (configure → process in 4096-frame blocks → flush →
 // drop the latency) and the search (`fc_master_solve`) — because they fail differently: a mistake in the
@@ -42,7 +48,7 @@ import { tmpdir } from 'node:os';
 import { Struct, sizeOf, assertLayoutMatches, statusName, FC_SOLVE_STATUS, FC_CONSTRAINT }
     from './fc-master-layout.mjs';
 
-const [, , modPath, nativePath, srArg, chArg, rawPath] = process.argv;
+const [, , modPath, nativePath, srArg, chArg, rawPath, ...deliveryArgs] = process.argv;
 if (!rawPath) {
     console.error('usage: node master-parity.mjs <module.js> <fcore_master> <sampleRate> <channels> <raw.f32le>');
     process.exit(2);
@@ -66,8 +72,9 @@ console.log(`fixture: ${frames} frames, ${ch} ch @ ${sr} Hz (${(frames / sr).toF
 const require = createRequire(import.meta.url);
 const M = await (require(resolve(modPath)))();
 assertLayoutMatches(M);
-console.log(`module: ABI v${M._fc_master_abi_version()}, params ${M._fc_master_sizeof_params()} B, `
-          + `config ${M._fc_master_sizeof_config()} B, maxChannels ${M._fc_master_max_channels()}, `
+const abiV = M._fc_master_abi_version();
+console.log(`module: ABI v${abiV}, params ${M._fc_master_sizeof(1, abiV)} B, `
+          + `config ${M._fc_master_sizeof(0, abiV)} B, maxChannels ${M._fc_master_max_channels()}, `
           + `maxEqBands ${M._fc_master_max_eq_bands()}`);
 
 // ── heap helpers. NO VIEW IS EVER HELD ACROSS A CALL — see the note in fc-master-layout.mjs ────────
@@ -76,12 +83,15 @@ const ok = (st, what) => { if (st !== 0) throw new Error(`${what}: ${statusName(
 function writeF32 (ptr, arr) { M.HEAPF32.set(arr, ptr >>> 2); }
 function readF32 (ptr, n) { return new Float32Array(M.HEAPF32.subarray(ptr >>> 2, (ptr >>> 2) + n)); }
 
-// A fresh handle configured from the core's own defaults, which is what the CLI does.
-function makeHandle () {
+// A fresh handle from the core's own defaults, which is what the CLI does — through the VERSIONED writer: stamped
+// first, then filled at this file's version. A frozen v1 `_fc_master_config_default` would stamp v1, and the
+// `deliveryRate` set after it would be refused by `Struct.set` (it lies past v1's 80 bytes and is never read).
+function makeHandle (deliveryRate = 0) {
     const cfgP = alloc(sizeOf('fc_master_config'));
-    M._fc_master_config_default(cfgP);
-    const cfg = new Struct(M, 'fc_master_config', cfgP);
+    const cfg = new Struct(M, 'fc_master_config', cfgP).init();
+    ok(M._fc_master_config_defaults(cfgP), 'config_defaults');
     cfg.set('sampleRate', sr).set('channels', ch);       // the two the defaults leave at zero, by design
+    cfg.set('deliveryRate', deliveryRate);
     const hP = alloc(4);
     ok(M._fc_master_create(cfgP, hP), 'create');
     const h = new DataView(M.HEAPF32.buffer).getUint32(hP, true);
@@ -90,8 +100,16 @@ function makeHandle () {
 }
 function defaultParams () {
     const p = alloc(sizeOf('fc_master_params'));
-    M._fc_master_params_default(p);
+    new Struct(M, 'fc_master_params', p).init();
+    ok(M._fc_master_params_defaults(p), 'params_defaults');
     return p;
+}
+function defaultRequest (targetLufs, tpDb) {
+    const reqP = alloc(sizeOf('fc_loudness_request'));
+    const req = new Struct(M, 'fc_loudness_request', reqP).init();
+    ok(M._fc_loudness_request_defaults(reqP), 'request_defaults');
+    req.set('targetLufs', targetLufs).set('maxTruePeakDbTp', tpDb);
+    return reqP;
 }
 
 // ── path 1: the streaming render, mirroring abiRender() ───────────────────────────────────────────
@@ -149,9 +167,7 @@ function wasmRender () {
 function wasmSolve (targetLufs, tpDb) {
     const h = makeHandle();
     const prmP = defaultParams();
-    const reqP = alloc(sizeOf('fc_loudness_request'));
-    M._fc_loudness_request_default(reqP);
-    new Struct(M, 'fc_loudness_request', reqP).set('targetLufs', targetLufs).set('maxTruePeakDbTp', tpDb);
+    const reqP = defaultRequest(targetLufs, tpDb);
 
     // The budget, before the call that cannot report an exhausted heap as a status (law 11d).
     const needP = alloc(sizeOf('fc_need'));
@@ -195,16 +211,20 @@ function wasmSolve (targetLufs, tpDb) {
 const tmp = mkdtempSync(join(tmpdir(), 'fcmaster-parity-'));
 // spawnSync rather than execFileSync: fcore_master prints its verdict on stdout and its RESOLVED
 // GEOMETRY on stderr, and both are part of what is being compared.
+// THE FILE'S LENGTH IS READ, NOT ASSUMED. It used to be de-interleaved at the input's `frames` whatever the file
+// held, which hides a tail and — on a delivered upsample, where the file is longer — reads a prefix as the whole.
 const nativeRun = (args, outFile) => {
     const r = spawnSync(resolve(nativePath), args, { encoding: 'utf8' });
     if (r.status !== 0) throw new Error(`${args[0]}: exit ${r.status}\n${r.stderr}`);
     const bytes = readFileSync(outFile);
+    if (bytes.byteLength % (4 * ch) !== 0) throw new Error(`${args[0]}: ${bytes.byteLength} B is not whole ${ch}-channel frames`);
     const f = (bytes.byteOffset % 4 === 0)
         ? new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)
         : new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    const pl = new Float32Array(frames * ch);           // interleaved on disk, planar here
-    for (let c = 0; c < ch; ++c) for (let i = 0; i < frames; ++i) pl[c * frames + i] = f[i * ch + c];
-    return { stdout: r.stdout, stderr: r.stderr, audio: pl };
+    const n = bytes.byteLength / (4 * ch);
+    const pl = new Float32Array(n * ch);                // interleaved on disk, planar here
+    for (let c = 0; c < ch; ++c) for (let i = 0; i < n; ++i) pl[c * n + i] = f[i * ch + c];
+    return { stdout: r.stdout, stderr: r.stderr, audio: pl, frames: n };
 };
 
 // ── comparison ────────────────────────────────────────────────────────────────────────────────────
@@ -214,14 +234,21 @@ const check = (pass, what, detail = '') => {
     if (!pass) ++failures;
 };
 function compareAudio (a, b, what, tol = TOL_AUDIO) {
+    // LENGTH AND FINITENESS BEFORE THE TOLERANCE. A shorter side compared over its own length passes as a prefix, and
+    // a NaN on one side never exceeds `worst` — so both are checks of their own, and either fails the comparison.
+    check(a.length === b.length, `${what}: the same length`, `wasm ${a.length} samples, native ${b.length}`);
+    let nonFinite = 0;
+    for (let i = 0; i < a.length; ++i) if (!Number.isFinite(a[i])) ++nonFinite;
+    for (let i = 0; i < b.length; ++i) if (!Number.isFinite(b[i])) ++nonFinite;
+    check(nonFinite === 0, `${what}: every sample finite`, `${nonFinite} non-finite`);
     let worst = 0, at = -1, differ = 0, peak = 0;
-    for (let i = 0; i < a.length; ++i) {
+    for (let i = 0; i < Math.min(a.length, b.length); ++i) {
         const d = Math.abs(a[i] - b[i]);
         if (d !== 0) ++differ;
-        if (d > worst) { worst = d; at = i; }
+        if (!(d <= worst)) { worst = Number.isNaN(d) ? Infinity : d; at = i; }
         if (Math.abs(b[i]) > peak) peak = Math.abs(b[i]);
     }
-    check(worst <= tol, what,
+    check(worst <= tol && a.length === b.length && nonFinite === 0, what,
           `worst ${worst.toExponential(3)} at sample ${at}, ${differ}/${a.length} differ at all, `
         + `native peaks at ${peak.toFixed(4)} (tolerance ${tol.toExponential(0)})`);
     return { worst, differ, peak };
@@ -266,7 +293,9 @@ if (l1 && l2) {
     near(S.verdict.I, Number(l2[1]), TOL_DB, 'integrated LUFS');
     near(S.verdict.TP, Number(l2[2]), TOL_DB, 'true peak dBTP');
     near(S.verdict.PLR, Number(l2[4]), TOL_DB, 'PLR dB');
+    near(S.verdict.LRA, Number(l2[3]), TOL_DB, 'loudness range LU');
     check(S.verdict.loudnessValid === Number(l2[5]), 'loudnessValid');
+    check(S.verdict.lraValid === Number(l2[6]), 'lraValid');
 }
 check(Math.abs(S.verdict.I - (-14)) <= 1.0, 'the search actually landed near the target',
       `I=${S.verdict.I.toFixed(3)} LUFS for target -14`);
@@ -286,6 +315,93 @@ console.log('\n=== 3. LRA, the one measurement that crosses on its own');
     if (n.status !== 0) throw new Error(`lra: exit ${n.status}\n${n.stderr}`);
     const nat = Number(n.stdout.trim());
     near(lra, nat, TOL_DB, 'loudness range LU');
+}
+
+console.log('\n=== 4. the DELIVERING handle (ABI v2): SRC first, render / solve / range at the delivery rate');
+// A DOWNSAMPLE AND AN UPSAMPLE whenever the source rate has both: the highest delivery rate below it and the lowest
+// above it. At 44.1 kHz there is nothing below and at 192 kHz nothing above, and the log says so rather than
+// quietly testing one direction twice.
+const RATES = [44100, 48000, 88200, 96000, 176400, 192000];
+const below = RATES.filter(r => r < sr).pop(), above = RATES.find(r => r > sr);
+const deliveryRates = deliveryArgs.length ? deliveryArgs.map(Number) : [below, above].filter(r => r !== undefined);
+if (!deliveryArgs.length && (below === undefined || above === undefined))
+    console.log(`  note: ${sr} Hz has no ${below === undefined ? 'lower' : 'higher'} delivery rate — one direction only`);
+for (const dr of deliveryRates) {
+    console.log(`\n--- ${sr} -> ${dr} Hz`);
+    // The delivered length, from the module — then the same number is demanded of the native file.
+    const h = makeHandle(dr);
+    const dP = alloc(4);
+    ok(M._fc_master_delivered_frames(h, frames, dP), 'delivered_frames');
+    const outFrames = new DataView(M.HEAPF32.buffer).getUint32(dP, true);
+    M._free(dP);
+
+    // render_delivered, at the parameters of a configure
+    const prmP = defaultParams();
+    const resP = alloc(sizeOf('fc_master_resolved'));
+    new Struct(M, 'fc_master_resolved', resP).init();
+    ok(M._fc_master_configure(h, prmP, resP), 'configure');
+    const inP = alloc(frames * ch * 4), outP = alloc(outFrames * ch * 4);
+    writeF32(inP, planar);
+    ok(M._fc_master_render_delivered(h, inP, frames, outP, outFrames), 'render_delivered');
+    const rOut = readF32(outP, outFrames * ch);
+    const rn = nativeRun(['render', String(sr), String(ch), resolve(rawPath), join(tmp, `d${dr}.f32`), `delivery=${dr}`],
+                         join(tmp, `d${dr}.f32`));
+    check(rn.frames === outFrames, 'the native render file holds the DELIVERED length',
+          `${rn.frames} frames on disk, ${outFrames} from fc_master_delivered_frames, ${frames} in`);
+    const rdd = compareAudio(rOut, rn.audio, 'delivered render agrees within tolerance');
+    check(rdd.peak > 1e-3, 'the delivered render is not silence');
+
+    // solve_delivered
+    const reqP = defaultRequest(-14, -1);
+    const needP = alloc(sizeOf('fc_need'));
+    const need = new Struct(M, 'fc_need', needP).init();
+    ok(M._fc_master_need(h, 0 /* FC_NEED_SOLVE */, frames, needP), 'need');
+    console.log(`  budget: call ${need.get('callBytes')} B (the converted programme included)`);
+    M._free(needP);
+    const solP = alloc(4);
+    ok(M._fc_master_solve_delivered(h, prmP, reqP, inP, frames, outP, outFrames, solP), 'solve_delivered');
+    const sol = new DataView(M.HEAPF32.buffer).getUint32(solP, true);
+    const sumP = alloc(sizeOf('fc_solution_summary'));
+    const sum = new Struct(M, 'fc_solution_summary', sumP).init();
+    ok(M._fc_solution_summary_get(sol, sumP), 'summary');
+    const measP = alloc(sizeOf('fc_measurement'));
+    const meas = new Struct(M, 'fc_measurement', measP).init();
+    ok(M._fc_solution_measurement(sol, measP), 'measurement');
+    const sOut = readF32(outP, outFrames * ch);
+    const sn = nativeRun(['solve', String(sr), String(ch), resolve(rawPath), join(tmp, `s${dr}.f32`),
+                          'target=-14', 'tp=-1', `delivery=${dr}`], join(tmp, `s${dr}.f32`));
+    const m1 = /status=(\S+) binding=(\S+) gain=(\S+) ceiling=(\S+) passes=(\S+)/.exec(sn.stdout);
+    const m2 = /I=(\S+) TP=(\S+) LRA=(\S+) PLR=(\S+) loudnessValid=(\S+) lraValid=(\S+)/.exec(sn.stdout);
+    check(!!m1 && !!m2, 'the native delivered solve reported a verdict');
+    if (m1 && m2) {                                       // every field section 2 compares, and the same tolerances
+        near(sum.get('status'), Number(m1[1]), 0, 'delivered solve status');
+        near(sum.get('binding'), Number(m1[2]), 0, 'binding constraint');
+        near(sum.get('passes'), Number(m1[5]), 0, 'pass count');
+        near(sum.get('preLimiterGainDb'), Number(m1[3]), TOL_DB, 'pre-limiter gain dB');
+        near(sum.get('ceilingDbTp'), Number(m1[4]), TOL_DB, 'ceiling dBTP');
+        near(meas.get('integratedLufs'), Number(m2[1]), TOL_DB, 'integrated LUFS');
+        near(meas.get('truePeakDbTp'), Number(m2[2]), TOL_DB, 'true peak dBTP');
+        near(meas.get('loudnessRangeLu'), Number(m2[3]), TOL_DB, 'loudness range LU');
+        near(meas.get('plrDb'), Number(m2[4]), TOL_DB, 'PLR dB');
+        check(meas.get('loudnessValid') === Number(m2[5]), 'loudnessValid');
+        check(meas.get('lraValid') === Number(m2[6]), 'lraValid');
+    }
+    check(sn.frames === outFrames, 'the native solve file holds the DELIVERED length', `${sn.frames} against ${outFrames}`);
+    compareAudio(sOut, sn.audio, 'delivered master agrees within tolerance');
+    ok(M._fc_solution_destroy(sol), 'solution_destroy');
+    for (const p of [sumP, measP, solP, reqP, resP, prmP, outP]) M._free(p);
+    ok(M._fc_master_destroy(h), 'destroy');
+
+    // the converting range
+    const hl = makeHandle(dr);
+    const vP = alloc(8);
+    ok(M._fc_master_measure_lra(hl, inP, frames, vP), 'measure_lra (delivering)');
+    const lra = new DataView(M.HEAPF32.buffer).getFloat64(vP, true);
+    M._free(vP); M._free(inP);
+    ok(M._fc_master_destroy(hl), 'destroy');
+    const ln = spawnSync(resolve(nativePath), ['lra', String(sr), String(ch), resolve(rawPath), `delivery=${dr}`], { encoding: 'utf8' });
+    if (ln.status !== 0) throw new Error(`lra: exit ${ln.status}\n${ln.stderr}`);
+    near(lra, Number(ln.stdout.trim()), TOL_DB, 'delivered loudness range LU');
 }
 
 rmSync(tmp, { recursive: true, force: true });

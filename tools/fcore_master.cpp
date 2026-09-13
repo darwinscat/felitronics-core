@@ -8,6 +8,10 @@
 //   fcore_master solve    <sampleRate> <channels> <in.f32le> <out.f32le> target=<LUFS> tp=<dBTP> [key=value ...]
 //   fcore_master lra      <sampleRate> <channels> <in.f32le>
 //   fcore_master selftest [sampleRate] [channels]
+//   fcore_master layout                                  — the ABI's struct offsets as JSON, for layout-check.mjs
+//
+// `delivery=<rate>` on render / solve / lra makes a DELIVERING handle (ABI v2): SRC first, and the output file
+// holds the DELIVERED length at <rate> — `fc_master_delivered_frames`, not the input's frame count.
 //
 // I/O is interleaved 32-bit-float little-endian PCM, exactly what `ffmpeg -f f32le` emits and reads and
 // what tools/fcore_measure.cpp already speaks, so a harness can put this binary in a pipeline next to
@@ -36,7 +40,8 @@
 //     `stereo::MonoBass` (its `reset()` SNAPS the width, its setter RAMPS it over 20 ms). The ABI's
 //     `configure` re-prepares, i.e. takes the first order, so the direct path here does the same.
 //   * SAME DEFAULTS. A zeroed parameter struct is not `MasteringChainParams{}` — 287 998 of 288 000
-//     samples apart — so both paths start from `fc_master_params_default()`.
+//     samples apart — so both paths start from the ABI's own defaults writer (`fc_*_defaults`, the versioned one:
+//     the frozen v1 `fc_*_default` would stamp v1 and hide every newer field from the facade).
 //   * A RESET BEFORE EVERY RENDER. `OfflineRenderer` resets the chain itself; the ABI has no renderer,
 //     so a second programme through the same handle without `fc_master_reset` is a different render —
 //     the check below prints the count for the fixture it actually ran, rather than carrying a number
@@ -44,6 +49,7 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/mastering/DeliveredMastering.h>
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
@@ -51,11 +57,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 using namespace felitronics;
@@ -102,6 +112,17 @@ struct Args
     struct Weight { std::int32_t channel; double value; };
     std::vector<Weight> weights;
 };
+
+// THE CURRENT LAYOUT'S DEFAULTS, through the VERSIONED writers. Not `fc_*_default`: those are frozen at v1 and
+// stamp v1, so a `delivery=` key written after them would lie past the stamped size and never be read — the
+// handle would not convert, and the file would come out at the source rate with exit status 0.
+bool initArgs (Args& a)
+{
+    FC_INIT (a.cfg); FC_INIT (a.prm); FC_INIT (a.req);
+    return fc_master_config_defaults (&a.cfg) == FC_OK
+        && fc_master_params_defaults (&a.prm) == FC_OK
+        && fc_loudness_request_defaults (&a.req) == FC_OK;
+}
 
 // STRICT number parsing. `atof`/`atoi` stop at the first character they do not understand and report
 // nothing, so `inputGainDb=oops` becomes 0 dB and `comp.ratio=4oops` becomes 4 — a harness row computed
@@ -204,6 +225,7 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "compLookaheadMs"){ FC_D (a.cfg.compressorLookaheadMs = d); }
     if (key == "limLookaheadMs") { FC_D (a.cfg.limiterLookaheadMs = d); }
     if (key == "sidechainHpfHz") { FC_D (a.cfg.sidechainHpfHz = d); }
+    if (key == "delivery")       { FC_D (a.cfg.deliveryRate = d); }
     if (key == "eq")             return parseBool (val, a.cfg.eq);
     if (key == "monoBass")       return parseBool (val, a.cfg.monoBass);
     if (key == "compressor")     return parseBool (val, a.cfg.compressor);
@@ -237,6 +259,7 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "comp.release")   { FC_D (a.prm.compressor.releaseMs = d); }
     if (key == "comp.makeup")    { FC_D (a.prm.compressor.makeupDb = d); }
     if (key == "comp.autoMakeup")return parseBool (val, a.prm.compressor.autoMakeup);
+    if (key == "comp.mix")       { FC_D (a.prm.compressorMix = d); }
 
     if (key == "clip.shape")  return parseEnumName (val, kShape, 4, a.prm.clipper.shape);
     if (key == "clip.drive")  { FC_D (a.prm.clipper.driveDb  = (float) d); }
@@ -305,9 +328,7 @@ bool positional (const char* text, long& out)   { return inum (std::string (text
 
 bool parseArgs (Args& a, int argc, char** argv, int from)
 {
-    fc_master_config_default (&a.cfg);
-    fc_master_params_default (&a.prm);
-    fc_loudness_request_default (&a.req);
+    if (! initArgs (a)) { std::fprintf (stderr, "the ABI refused its own defaults\n"); return false; }
     for (int i = from; i < argc; ++i)
     {
         const std::string s = argv[i];
@@ -434,12 +455,35 @@ bool abiRender (const Args& a, const std::vector<float>& in, std::size_t frames,
     return true;
 }
 
-// The same render through the C++ API, with the SAME lifecycle order the ABI takes (parameters written
-// BEFORE prepare, which is what `fc_master_configure` does when it re-prepares).
-bool directRender (const Args& a, const std::vector<float>& in, std::size_t frames, int nc,
-                   std::vector<float>& out)
+// THE DELIVERED ABI RENDER (v2) — create -> configure -> fc_master_delivered_frames -> fc_master_render_delivered.
+// There is no block loop and no latency drop here, and that is the point of the entry point: the delivered
+// length, the trim and the drain are the core's, and the output is `outFrames` long at the delivery rate.
+bool abiRenderDelivered (const Args& a, const std::vector<float>& in, std::size_t frames, int nc,
+                         std::vector<float>& out, std::size_t& outFrames, fc_master_resolved& res)
 {
-    MasteringChainConfig cc {};
+    fc_master h = 0;
+    if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
+    { std::fprintf (stderr, "create: %s\n", statusName (st)); return false; }
+    auto fail = [h] (const char* what, fc_status st) { std::fprintf (stderr, "%s: %s\n", what, statusName (st));
+                                                       fc_master_destroy (h); return false; };
+    for (const auto& w : a.weights)
+        if (const fc_status st = fc_master_set_channel_weight (h, w.channel, w.value); st != FC_OK) return fail ("weight", st);
+    FC_INIT (res);
+    if (const fc_status st = fc_master_configure (h, &a.prm, &res); st != FC_OK) return fail ("configure", st);
+    std::uint32_t d = 0;
+    if (const fc_status st = fc_master_delivered_frames (h, (std::uint32_t) frames, &d); st != FC_OK)
+        return fail ("delivered_frames", st);
+    outFrames = d;
+    out.assign ((std::size_t) d * (std::size_t) nc, 0.0f);
+    if (const fc_status st = fc_master_render_delivered (h, in.data(), (std::uint32_t) frames, out.data(), d); st != FC_OK)
+        return fail ("render_delivered", st);
+    fc_master_destroy (h);
+    return true;
+}
+
+// The ABI's config and parameters, mirrored by hand into the core's — see the note inside.
+void mirror (const Args& a, MasteringChainConfig& cc, MasteringChainParams& cp)
+{
     cc.internalBlock         = a.cfg.internalBlock;
     cc.eq                    = a.cfg.eq != 0;
     cc.monoBass              = a.cfg.monoBass != 0;
@@ -456,7 +500,6 @@ bool directRender (const Args& a, const std::vector<float>& in, std::size_t fram
     // The parameter set comes from the SAME mapper the ABI uses — through the ABI's own defaults and a
     // throwaway handle would be circular, so it is built here by hand from the same `Args`. This is the
     // one place the CLI mirrors the mapping, and the selftest is what proves the mirror is faithful.
-    MasteringChainParams cp {};
     cp.inputGainDb      = a.prm.inputGainDb;
     cp.preLimiterGainDb = a.prm.preLimiterGainDb;
     for (int b = 0; b < FC_MAX_EQ_BANDS; ++b)
@@ -510,6 +553,17 @@ bool directRender (const Args& a, const std::vector<float>& in, std::size_t fram
     cp.bypassClipper = a.prm.bypassClipper != 0;
     cp.bypassLimiter = a.prm.bypassLimiter != 0;
     cp.bypassDither = a.prm.bypassDither != 0;
+    cp.compressorMix = a.prm.compressorMix;
+}
+
+// The same render through the C++ API, with the SAME lifecycle order the ABI takes (parameters written
+// BEFORE prepare, which is what `fc_master_configure` does when it re-prepares).
+bool directRender (const Args& a, const std::vector<float>& in, std::size_t frames, int nc,
+                   std::vector<float>& out)
+{
+    MasteringChainConfig cc {};
+    MasteringChainParams cp {};
+    mirror (a, cc, cp);
 
     MasteringChain chain;
     OfflineRenderer r;
@@ -526,6 +580,200 @@ bool directRender (const Args& a, const std::vector<float>& in, std::size_t fram
         op[c] = out.data() + (std::size_t) c * frames;
     }
     return r.render (chain, ip, op, nc, (int) frames);
+}
+
+// The delivered render through the C++ API: the chain at the DELIVERY rate, and `mastering::DeliveredMastering`
+// — the very class the facade forwards to — in front of it. What the selftest compares is therefore the ABI's
+// marshalling against a core call, not a hand-written conversion against another one. The renderer and the
+// converter run at `a.block` here and at the facade's own 4096 there; both are free by contract, and a
+// difference would be a real one.
+bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::size_t frames, int nc,
+                            std::vector<float>& out, std::size_t& outFrames)
+{
+    MasteringChainConfig cc {};
+    MasteringChainParams cp {};
+    mirror (a, cc, cp);
+
+    MasteringChain chain;
+    OfflineRenderer r;
+    DeliveredMastering dm;
+    if (! r.prepare (nc, (int) a.block)) return false;
+    chain.setParams (cp);
+    if (! chain.prepare (a.cfg.deliveryRate, nc, cc)) return false;
+    if (! dm.prepare (a.cfg.sampleRate, a.cfg.deliveryRate, nc, (int) a.block)) return false;
+    const long long d = DeliveredMastering::deliveredFrames (a.cfg.sampleRate, a.cfg.deliveryRate, (long long) frames);
+    if (d < 0) return false;
+    outFrames = (std::size_t) d;
+    out.assign (outFrames * (std::size_t) nc, 0.0f);
+    const float* ip[core::kMaxChannels] {};
+    float*       op[core::kMaxChannels] {};
+    for (int c = 0; c < nc; ++c)
+    {
+        ip[c] = in.data() + (std::size_t) c * frames;
+        op[c] = out.data() + (std::size_t) c * outFrames;
+    }
+    return dm.render (chain, r, ip, nc, (long long) frames, op, d);
+}
+
+//==============================================================================
+// `fcore_master layout` — EVERY FIELD OF EVERY STRUCT the JS layout describes, at the offset THIS compiler put it,
+// for tools/wasm/layout-check.mjs to hold fc-master-layout.mjs against. A total size alone cannot see two fields
+// of one type swapped in the JS list, and that permutation writes a page's value into the wrong knob.
+//
+// The list is a transcription and says so; what keeps it honest is that `offsetof` does not compile on a field
+// that is not there, and that the checker demands the SAME SET of names in both directions — a field the JS has
+// and this list lacks is reported, and so is the reverse. Nested fields are listed under their own struct.
+#define FC_LAYOUT_FIELDS(X)                                                                                         \
+    X (fc_header, abiVersion) X (fc_header, structSize)                                                            \
+    X (fc_master_config, header) X (fc_master_config, sampleRate) X (fc_master_config, channels)                   \
+    X (fc_master_config, internalBlock) X (fc_master_config, eq) X (fc_master_config, monoBass)                    \
+    X (fc_master_config, compressor) X (fc_master_config, clipper) X (fc_master_config, limiter)                   \
+    X (fc_master_config, dither) X (fc_master_config, compressorLookaheadMs)                                       \
+    X (fc_master_config, limiterLookaheadMs) X (fc_master_config, oversampleFactor)                                \
+    X (fc_master_config, tapsPerPhase) X (fc_master_config, sidechainHpfHz) X (fc_master_config, deliveryRate)      \
+    X (fc_eq_lane, on) X (fc_eq_lane, freq) X (fc_eq_lane, q) X (fc_eq_lane, gainDb) X (fc_eq_lane, slope)         \
+    X (fc_eq_lane, bypass)                                                                                         \
+    X (fc_eq_dyn, on) X (fc_eq_dyn, rangeDb) X (fc_eq_dyn, thrDb) X (fc_eq_dyn, thrAuto) X (fc_eq_dyn, atk)        \
+    X (fc_eq_dyn, rel)                                                                                             \
+    X (fc_eq_band, on) X (fc_eq_band, type) X (fc_eq_band, swept) X (fc_eq_band, bypass) X (fc_eq_band, dyn)       \
+    X (fc_eq_band, lanes)                                                                                          \
+    X (fc_mono_bass, enabled) X (fc_mono_bass, frequencyHz) X (fc_mono_bass, lowWidth)                             \
+    X (fc_compressor, detector) X (fc_compressor, link) X (fc_compressor, rmsWindowMs) X (fc_compressor, mode)     \
+    X (fc_compressor, thresholdDb) X (fc_compressor, ratio) X (fc_compressor, kneeDb) X (fc_compressor, rangeDb)   \
+    X (fc_compressor, attackMs) X (fc_compressor, releaseMs) X (fc_compressor, makeupDb)                           \
+    X (fc_compressor, autoMakeup)                                                                                  \
+    X (fc_clipper, shape) X (fc_clipper, driveDb) X (fc_clipper, bias) X (fc_clipper, mix)                         \
+    X (fc_clipper, outputDb) X (fc_clipper, autoComp) X (fc_clipper, dcBlockHz)                                    \
+    X (fc_limiter, ceilingDbTp) X (fc_limiter, releaseMs)                                                          \
+    X (fc_dither, bits) X (fc_dither, shaping) X (fc_dither, seedLo) X (fc_dither, seedHi)                         \
+    X (fc_dither, autoBlank) X (fc_dither, autoBlankSamples)                                                       \
+    X (fc_master_params, header) X (fc_master_params, inputGainDb) X (fc_master_params, preLimiterGainDb)          \
+    X (fc_master_params, eqBands) X (fc_master_params, monoBass) X (fc_master_params, compressor)                  \
+    X (fc_master_params, clipper) X (fc_master_params, limiter) X (fc_master_params, dither)                       \
+    X (fc_master_params, bypassEq) X (fc_master_params, bypassMonoBass) X (fc_master_params, bypassCompressor)     \
+    X (fc_master_params, bypassClipper) X (fc_master_params, bypassLimiter) X (fc_master_params, bypassDither)     \
+    X (fc_master_params, compressorMix)                                                                            \
+    X (fc_master_resolved, header) X (fc_master_resolved, latencySamples) X (fc_master_resolved, internalBlock)    \
+    X (fc_master_resolved, compressorLookahead) X (fc_master_resolved, clipperLatency)                             \
+    X (fc_master_resolved, limiterLatency) X (fc_master_resolved, limiterLookahead)                                \
+    X (fc_master_resolved, oversampleFactor) X (fc_master_resolved, compressorTapOffset)                           \
+    X (fc_master_resolved, limiterTapOffset) X (fc_master_resolved, limiterCeilingDbTp)                            \
+    X (fc_master_resolved, limiterReleaseMs) X (fc_master_resolved, monoBass)                                      \
+    X (fc_master_resolved, tapOversampleFactor) X (fc_master_resolved, compressorMix)                              \
+    X (fc_master_stats, header) X (fc_master_stats, framesIn) X (fc_master_stats, framesFlushed)                   \
+    X (fc_master_stats, nonFiniteIn)                                                                               \
+    X (fc_need, header) X (fc_need, callBytes) X (fc_need, solverPrepareBytes) X (fc_need, facadeBytes)            \
+    X (fc_need, solverPrepared) X (fc_need, _pad0)                                                                 \
+    X (fc_gr_limit, limitDb) X (fc_gr_limit, statistic)                                                            \
+    X (fc_loudness_request, header) X (fc_loudness_request, targetLufs) X (fc_loudness_request, toleranceLu)       \
+    X (fc_loudness_request, maxTruePeakDbTp) X (fc_loudness_request, truePeakAimDb)                                \
+    X (fc_loudness_request, limiterGr) X (fc_loudness_request, compressorGr) X (fc_loudness_request, minPlrDb)     \
+    X (fc_loudness_request, maxLraLossLu) X (fc_loudness_request, inputLoudnessRangeLu)                            \
+    X (fc_loudness_request, activityThresholdDb) X (fc_loudness_request, maxPasses)                                \
+    X (fc_loudness_request, initialGainDb)                                                                         \
+    X (fc_solve_pass, gainDb) X (fc_solve_pass, ceilingDb) X (fc_solve_pass, integratedLufs)                       \
+    X (fc_solve_pass, truePeakDbTp) X (fc_solve_pass, plrDb) X (fc_solve_pass, limiterMaxGrDb)                     \
+    X (fc_solve_pass, loudnessRangeLu) X (fc_solve_pass, violated)                                                 \
+    X (fc_gr_stats, meanDb) X (fc_gr_stats, p95Db) X (fc_gr_stats, maxDb) X (fc_gr_stats, activeFraction)          \
+    X (fc_gr_stats, frames) X (fc_gr_stats, nonFinite) X (fc_gr_stats, aboveRange) X (fc_gr_stats, valid)          \
+    X (fc_measurement, header) X (fc_measurement, integratedLufs) X (fc_measurement, truePeakDbTp)                 \
+    X (fc_measurement, samplePeakDb) X (fc_measurement, loudnessRangeLu) X (fc_measurement, plrDb)                 \
+    X (fc_measurement, compressor) X (fc_measurement, limiter) X (fc_measurement, limiterMaxReconstructedPeakDb)    \
+    X (fc_measurement, latencySamples) X (fc_measurement, gatingBlocks) X (fc_measurement, droppedBlocks)           \
+    X (fc_measurement, nonFiniteSubHops) X (fc_measurement, loudnessValid) X (fc_measurement, lraValid)            \
+    X (fc_solution_summary, header) X (fc_solution_summary, status) X (fc_solution_summary, binding)               \
+    X (fc_solution_summary, alsoViolated) X (fc_solution_summary, preLimiterGainDb)                                \
+    X (fc_solution_summary, ceilingDbTp) X (fc_solution_summary, passes) X (fc_solution_summary, logCount)         \
+    X (fc_solution_summary, activityThresholdDb) X (fc_solution_summary, achievedBelowLufs)                        \
+    X (fc_solution_summary, achievedAboveLufs) X (fc_solution_summary, gainBelowDb)                                \
+    X (fc_solution_summary, gainAboveDb)
+
+// One line per fact: `V <abi version>`, `S <struct> <sizeof>`, `F <struct> <field> <offset>`, and for every struct
+// with a header `T <struct> <id> <fc_master_sizeof(id, current)>` — the published table, not this file's sizeof.
+int printLayout()
+{
+    std::printf ("V %u\n", fc_master_abi_version());
+    const char* last = "";
+#define FC_PRINT(T, f)                                                                              \
+    if (std::strcmp (last, #T) != 0) { std::printf ("S " #T " %zu\n", sizeof (T)); last = #T; }     \
+    std::printf ("F " #T " " #f " %zu\n", offsetof (T, f));
+    FC_LAYOUT_FIELDS (FC_PRINT)
+#undef FC_PRINT
+    const struct { const char* name; int id; } headered[] {
+        { "fc_master_config", FC_STRUCT_CONFIG }, { "fc_master_params", FC_STRUCT_PARAMS },
+        { "fc_master_resolved", FC_STRUCT_RESOLVED }, { "fc_master_stats", FC_STRUCT_STATS },
+        { "fc_need", FC_STRUCT_NEED }, { "fc_loudness_request", FC_STRUCT_REQUEST },
+        { "fc_measurement", FC_STRUCT_MEASUREMENT }, { "fc_solution_summary", FC_STRUCT_SUMMARY } };
+    for (const auto& s : headered)
+        std::printf ("T %s %d %u\n", s.name, s.id, fc_master_sizeof (s.id, fc_master_abi_version()));
+    return 0;
+}
+
+//==============================================================================
+// THE TWO FILE-WRITING COMMANDS. Functions rather than `main`'s body so the selftest can run them and read back
+// what they wrote — the file's length is part of the contract, and a length nobody reads back is a claim.
+//
+// THE DELIVERED LENGTH IS THE FILE'S LENGTH. Every buffer, the de-planarisation and the write take `outFrames`
+// on a delivering handle — a file written with the input's count would be SHORT on an upsample, and its second
+// channel would be read out of the middle of the first plane.
+
+int cmdRender (const Args& a, const std::vector<float>& in, std::size_t frames, int nc, const char* path)
+{
+    std::vector<float> out; fc_master_resolved res {};
+    std::size_t outFrames = frames;
+    if (a.cfg.deliveryRate != 0.0 ? ! abiRenderDelivered (a, in, frames, nc, out, outFrames, res)
+                                  : ! abiRender (a, in, frames, nc, out, res)) return 1;
+    if (! writeInterleaved (path, nc, out, outFrames)) return 1;
+    // The resolved geometry on stderr, so a harness can read the numbers without parsing the audio.
+    std::fprintf (stderr, "latency=%d internalBlock=%d ceiling=%.17g release=%.17g\n",
+                  res.latencySamples, res.internalBlock, res.limiterCeilingDbTp, res.limiterReleaseMs);
+    return 0;
+}
+
+int cmdSolve (const Args& a, const std::vector<float>& in, std::size_t frames, int nc, const char* path)
+{
+    const bool delivering = a.cfg.deliveryRate != 0.0;
+    fc_master h = 0;
+    if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
+    { std::fprintf (stderr, "create: %s\n", statusName (st)); return 2; }
+    for (const auto& w : a.weights)
+        if (fc_master_set_channel_weight (h, w.channel, w.value) != FC_OK)
+        { std::fprintf (stderr, "weight%d rejected\n", w.channel); fc_master_destroy (h); return 2; }
+    std::uint32_t outFrames = (std::uint32_t) frames;
+    if (delivering)
+        if (const fc_status st = fc_master_delivered_frames (h, (std::uint32_t) frames, &outFrames); st != FC_OK)
+        { std::fprintf (stderr, "delivered_frames: %s\n", statusName (st)); fc_master_destroy (h); return 1; }
+    std::vector<float> out ((std::size_t) outFrames * (std::size_t) nc, 0.0f);
+    fc_solution sol = 0;
+    const fc_status st = delivering
+        ? fc_master_solve_delivered (h, &a.prm, &a.req, in.data(), (std::uint32_t) frames,
+                                     out.data(), outFrames, &sol)
+        : fc_master_solve (h, &a.prm, &a.req, in.data(), out.data(), (std::uint32_t) frames, &sol);
+    if (st != FC_OK) { std::fprintf (stderr, "solve: %s\n", statusName (st)); fc_master_destroy (h); return 1; }
+
+    fc_solution_summary sum {}; FC_INIT (sum);
+    fc_measurement meas {};      FC_INIT (meas);
+    fc_solution_summary_get (sol, &sum);
+    fc_solution_measurement (sol, &meas);
+    std::printf ("status=%d binding=%d gain=%.17g ceiling=%.17g passes=%d\n",
+                 sum.status, sum.binding, sum.preLimiterGainDb, sum.ceilingDbTp, sum.passes);
+    std::printf ("I=%.17g TP=%.17g LRA=%.17g PLR=%.17g loudnessValid=%d lraValid=%d\n",
+                 meas.integratedLufs, meas.truePeakDbTp, meas.loudnessRangeLu, meas.plrDb,
+                 meas.loudnessValid, meas.lraValid);
+    // A VERDICT IS NOT A RENDER. `InvalidRequest` and `NotPrepared` are returned before the solver
+    // touches the output, so `out` is still the zero buffer it was allocated as — writing it would
+    // hand a harness a file of the right length, full of digital silence, with exit status 0 and an
+    // existing output overwritten. The status line has already been printed; the file is not.
+    const bool delivered = (sum.status != FC_SOLVE_INVALID_REQUEST
+                         && sum.status != FC_SOLVE_NOT_PREPARED
+                         && sum.status != FC_SOLVE_RENDER_FAILED);
+    bool ok = true;
+    if (delivered) ok = writeInterleaved (path, nc, out, outFrames);
+    else std::fprintf (stderr, "no render was delivered (status=%d) — the output file is NOT written\n",
+                       sum.status);
+    fc_solution_destroy (sol);
+    fc_master_destroy (h);
+    return (delivered && ok) ? 0 : 1;
 }
 
 //==============================================================================
@@ -578,9 +826,7 @@ int selftest (double fs, int nc)
     const auto in = programme (fs, nc, frames);
 
     Args a;
-    fc_master_config_default (&a.cfg);
-    fc_master_params_default (&a.prm);
-    fc_loudness_request_default (&a.req);
+    check (initArgs (a), "the versioned defaults writers accept a struct stamped at this build's version");
     a.cfg.sampleRate = fs;
     a.cfg.channels   = nc;
     a.cfg.monoBass   = (nc == 2) ? 1 : 0;                 // stereo-only stage; exercised when it can be
@@ -678,6 +924,9 @@ int selftest (double fs, int nc)
     a.prm.compressor.rangeDb     = 37.0;
     a.prm.compressor.makeupDb    = 1.7;
     a.prm.compressor.rmsWindowMs = 7.7;
+    // v3. Off its default like every other field, and not a binary32-exact value: at 1 a dropped mapping renders
+    // the chain before the field existed and the compare stays green.
+    a.prm.compressorMix          = 0.73;
     a.prm.limiter.ceilingDbTp    = -1.3;
     a.prm.limiter.releaseMs      = 77.0;
     a.prm.dither.bits            = 24;
@@ -887,10 +1136,13 @@ int selftest (double fs, int nc)
     // check that stands in front of a division and nothing went red either.
     {
         Args t;
-        fc_master_config_default (&t.cfg);
-        fc_master_params_default (&t.prm);
-        fc_loudness_request_default (&t.req);
+        (void) initArgs (t);
         check (applyKey (t, "lim.ceiling", "-1.5"), "a good numeric key is accepted");
+        check (applyKey (t, "delivery", "44100") && t.cfg.deliveryRate == 44100.0, "the delivery rate is a key");
+        check (! applyKey (t, "delivery", "44.1k"), "and a malformed one is refused, not read as 0 — which is no conversion");
+        check (applyKey (t, "comp.mix", "0.25") && t.prm.compressorMix == 0.25 && t.prm.clipper.mix != 0.25f,
+               "comp.mix is the CHAIN's compressor mix, not the clipper's");
+        check (! applyKey (t, "comp.mix", "x"), "and a malformed mix is refused");
         check (! applyKey (t, "lim.ceiling", "oops"), "a non-numeric value is REFUSED, not read as 0");
         check (! applyKey (t, "comp.ratio", "4oops"), "and so is a numeric prefix with a tail");
         check (! applyKey (t, "comp.ratio", ""), "and an empty value");
@@ -912,6 +1164,201 @@ int selftest (double fs, int nc)
         check (positional ("2", i) && i == 2, "while a real one does");
     }
 
+    // --- 6. ABI v2: A v1 CALLER IS A v1 CALLER ----------------------------------------------------------
+    // `a` is a v2 config with `deliveryRate = 0` written explicitly, and section 1 has already shown it renders
+    // what the direct C++ path renders. The same struct stamped v1 — and carrying 96 000 in the bytes past its
+    // 80, where a facade reading this build's `sizeof` would find a delivery rate — must render the same bits and
+    // must make a handle that does not deliver. (Against the v1 BUILD itself is the third corner of this check,
+    // and it is run outside this binary: an in-binary comparison cannot see a change both paths share.)
+    {
+        // The oracle for an older caller is the CURRENT caller with every newer field at its previous-version
+        // value, written explicitly — and the direct C++ path at those values, so the pair is not two new roads
+        // agreeing with each other.
+        Args prev = a;
+        prev.cfg.deliveryRate = 0.0;
+        prev.prm.compressorMix = 1.0;
+        std::vector<float> viaPrev, viaPrevCpp; fc_master_resolved rp {};
+        const bool ranPrev = abiRender (prev, in, frames, nc, viaPrev, rp) && directRender (prev, in, frames, nc, viaPrevCpp);
+        double wp = 0.0;
+        const std::size_t dp = ranPrev ? bitDiff (viaPrev, viaPrevCpp, wp) : 1u;
+        check (ranPrev && dp == 0, "the current caller at the previous versions' values renders the core's bits");
+        double moved = 0.0;
+        for (std::size_t i = 0; ranPrev && i < viaPrev.size(); ++i) moved = std::max (moved, (double) std::fabs (viaPrev[i] - viaAbi[i]));
+        check (moved > 1e-3, "PRECONDITION: and compressorMix 0.73 really changed the main render against mix 1");
+
+        for (const std::uint32_t ver : { 1u, 2u })
+        {
+            Args old = a;                                         // the newer fields hold NON-default values ...
+            old.cfg.header.abiVersion = ver;  old.cfg.header.structSize = ver == 1u ? 80u : 88u;
+            old.prm.header.abiVersion = ver;  old.prm.header.structSize = 6560u;
+            if (ver == 1u) old.cfg.deliveryRate = 96000.0;        // ... past the stamped size: must never be read
+            old.prm.compressorMix = 0.2;
+            std::vector<float> viaOld; fc_master_resolved ro {};
+            const bool ran = abiRender (old, in, frames, nc, viaOld, ro);
+            char what[96];
+            std::snprintf (what, sizeof what, "a v%u-stamped config and parameter set are accepted by the v%u build",
+                           ver, (unsigned) FC_MASTER_ABI_VERSION);
+            check (ran, what);
+            if (! ran) continue;
+            double worst = 0.0;
+            const std::size_t d = bitDiff (viaPrev, viaOld, worst);
+            char msg[128];
+            std::snprintf (msg, sizeof msg, "v%u: %zu of %zu samples differ, worst %.9g", ver, d, viaOld.size(), worst);
+            check (d == 0, "an older caller renders the current caller's bits at the previous values — nothing past its size was read", msg);
+        }
+        Args v1 = a;
+        v1.cfg.header.abiVersion = 1u;  v1.cfg.header.structSize = 80u;
+        v1.cfg.deliveryRate = 96000.0;
+        fc_master h = 0; std::uint32_t df = 0;
+        const bool made = fc_master_create (&v1.cfg, &h) == FC_OK;
+        check (made && fc_master_delivered_frames (h, 1000u, &df) == FC_ERR_STATE,
+               "and the delivery rate in the bytes past v1's 80 was not read: the handle does not deliver");
+        if (made) fc_master_destroy (h);
+    }
+
+    // --- 7. THE DELIVERING HANDLE, through the ABI and through the core ---------------------------------
+    // Down, up, and EQUAL rates. The direct path calls `mastering::DeliveredMastering` — the class the facade
+    // forwards to — so a difference is marshalling. At equal rates there is a stronger oracle than that: the
+    // converter copies bits, so the delivered render must be the plain render of section 1, bit for bit.
+    // DOWN is the highest delivery rate below `fs` and UP the lowest above; at 44.1 and 192 kHz one of them does not
+    // exist, and the output says so rather than running one direction twice.
+    const double kDeliveryRates[] { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+    double down = 0.0, up = 0.0;
+    for (double r : kDeliveryRates) { if (r < fs) down = r; if (r > fs && up == 0.0) up = r; }
+    if (down == 0.0 || up == 0.0)
+        std::printf ("  (note: %g Hz has no %s delivery rate — that direction is not exercised)\n", fs, down == 0.0 ? "lower" : "higher");
+    std::vector<double> pairs;
+    for (double r : { down, up, fs }) if (r != 0.0) pairs.push_back (r);
+    // A temp name no other run shares: two selftests at once (two build trees, one machine) must not read each
+    // other's files. The address of a local in this process and the clock make it unique enough for that.
+    const std::string runTag = std::to_string ((unsigned long long) (std::uintptr_t) &pairs) + "_"
+                             + std::to_string ((long long) std::chrono::steady_clock::now().time_since_epoch().count());
+    for (double dr : pairs)
+    {
+        Args b = a;
+        b.cfg.deliveryRate = dr;
+        std::vector<float> dAbi, dCpp; std::size_t nAbi = 0, nCpp = 0; fc_master_resolved rd {};
+        const bool ran = abiRenderDelivered (b, in, frames, nc, dAbi, nAbi, rd)
+                      && directRenderDelivered (b, in, frames, nc, dCpp, nCpp);
+        char what[96];
+        std::snprintf (what, sizeof what, "%g -> %g: the delivered render ran through both paths", fs, dr);
+        check (ran, what);
+        if (! ran) continue;
+        const long long expect = DeliveredMastering::deliveredFrames (fs, dr, (long long) frames);
+        char len[128];
+        std::snprintf (len, sizeof len, "ABI %zu, direct %zu, the converter's formula %lld", nAbi, nCpp, expect);
+        check ((long long) nAbi == expect && nCpp == nAbi, "the delivered length is the core's, on both paths", len);
+        double worst = 0.0;
+        const std::size_t d = bitDiff (dAbi, dCpp, worst);
+        char msg[128];
+        std::snprintf (msg, sizeof msg, "%g -> %g: %zu of %zu differ, worst %.9g", fs, dr, d, dAbi.size(), worst);
+        check (d == 0, "the delivered render through the ABI is BIT-IDENTICAL to the core's", msg);
+        double amp = 0.0;
+        for (float v : dAbi) amp = std::max (amp, (double) std::fabs (v));
+        char pre[96];
+        std::snprintf (pre, sizeof pre, "peaks at %.4f", amp);
+        check (amp > 0.05, "PRECONDITION: the delivered render is not silence", pre);
+        if (dr == fs)
+        {
+            const std::size_t e = bitDiff (dAbi, viaAbi, worst);
+            std::snprintf (msg, sizeof msg, "%zu of %zu differ, worst %.9g", e, dAbi.size(), worst);
+            check (e == 0, "EQUAL RATES: the delivered render is the plain render, bit for bit", msg);
+        }
+
+        // The file a command writes is `outFrames` long and its channels are the delivered planes — read back
+        // from disk, not inferred from the buffer that was handed to the writer.
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path (ec);
+        if (ec) { check (false, "a temp directory for the file check"); continue; }
+        const std::string path = (dir / ("fcore_master_selftest_" + runTag + "_" + std::to_string ((long long) dr) + ".f32")).string();
+        const int rc = cmdRender (b, in, frames, nc, path.c_str());
+        std::vector<float> back; std::size_t backFrames = 0;
+        const bool read = rc == 0 && readInterleaved (path.c_str(), nc, back, backFrames);
+        std::remove (path.c_str());
+        char fl[128];
+        std::snprintf (fl, sizeof fl, "rc %d, %zu frames on disk against %zu delivered", rc, backFrames, nAbi);
+        check (read && backFrames == nAbi, "the render command writes the DELIVERED length", fl);
+        if (read && backFrames == nAbi)
+        {
+            const std::size_t f = bitDiff (back, dAbi, worst);
+            std::snprintf (fl, sizeof fl, "%zu of %zu differ", f, back.size());
+            check (f == 0, "and each channel of the file is its own delivered plane", fl);
+        }
+    }
+
+    // --- 8. THE DELIVERED SEARCH AND THE DELIVERED RANGE ------------------------------------------------
+    {
+        Args b = a;
+        b.cfg.deliveryRate = pairs.front() == fs ? 48000.0 : pairs.front();
+        b.req.targetLufs = -14.0; b.req.maxTruePeakDbTp = -1.0;
+        MasteringChainConfig cc {}; MasteringChainParams cp {};
+        mirror (b, cc, cp);
+        LoudnessRequest lr {};
+        lr.targetLufs = -14.0; lr.maxTruePeakDbTp = -1.0;
+
+        fc_master h = 0;
+        const bool made = fc_master_create (&b.cfg, &h) == FC_OK;
+        check (made, "a delivering handle for the search");
+        if (made)
+        {
+            std::uint32_t d = 0;
+            (void) fc_master_delivered_frames (h, (std::uint32_t) frames, &d);
+            double lraAbi = -1.0;
+            const fc_status stL = fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &lraAbi);
+            std::vector<float> sAbi ((std::size_t) d * (std::size_t) nc, 0.0f);
+            fc_solution sol = 0;
+            const fc_status stS = fc_master_solve_delivered (h, &b.prm, &b.req, in.data(), (std::uint32_t) frames,
+                                                             sAbi.data(), d, &sol);
+            fc_solution_summary sum {}; FC_INIT (sum);
+            const bool solved = stS == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK;
+
+            // The direct path, with the facade's own geometry: its renderer block and the solver it prepares.
+            MasteringChain chain; OfflineRenderer r; TargetLoudnessSolver solver; DeliveredMastering dm;
+            const bool built = r.prepare (nc, 4096) && chain.prepare (b.cfg.deliveryRate, nc, cc)
+                            && dm.prepare (fs, b.cfg.deliveryRate, nc, 4096)
+                            && solver.prepare (b.cfg.deliveryRate, nc, r.blockSize(), chain.internalBlock(),
+                                               chain.tapOversampleFactor());
+            check (built, "the direct delivered search is built");
+            double lraCpp = -2.0;
+            const float* ip[core::kMaxChannels] {};
+            for (int c = 0; c < nc; ++c) ip[c] = in.data() + (std::size_t) c * frames;
+            const bool lraOk = built && dm.measureInputLoudnessRange (solver, ip, nc, (long long) frames, lraCpp);
+            char lm[128];
+            std::snprintf (lm, sizeof lm, "ABI %s %.17g, core %.17g", statusName (stL), lraAbi, lraCpp);
+            check (stL == FC_OK && lraOk && lraAbi == lraCpp, "the delivered range through the ABI is the core's", lm);
+
+            std::vector<float> sCpp ((std::size_t) d * (std::size_t) nc, 0.0f);
+            float* op[core::kMaxChannels] {};
+            for (int c = 0; c < nc; ++c) op[c] = sCpp.data() + (std::size_t) c * (std::size_t) d;
+            LoudnessSolution direct;
+            if (built) direct = dm.solve (solver, chain, r, cp, ip, nc, (long long) frames, op, (long long) d, lr);
+            char sm[160];
+            std::snprintf (sm, sizeof sm, "ABI %s status %d gain %.17g, core status %d gain %.17g", statusName (stS),
+                           sum.status, sum.preLimiterGainDb, (int) direct.status, direct.preLimiterGainDb);
+            check (solved && sum.status == (int) direct.status && sum.preLimiterGainDb == direct.preLimiterGainDb
+                   && sum.ceilingDbTp == direct.ceilingDbTp, "the delivered search's verdict is the core's", sm);
+            double worst = 0.0;
+            const std::size_t dd = bitDiff (sAbi, sCpp, worst);
+            std::snprintf (sm, sizeof sm, "%zu of %zu differ, worst %.9g", dd, sAbi.size(), worst);
+            check (solved && dd == 0, "and its delivered audio is bit-identical", sm);
+            if (solved) fc_solution_destroy (sol);
+            fc_master_destroy (h);
+
+            // The SOLVE command's file, read back like the render's: the delivered length, and each plane its own.
+            std::error_code ec;
+            const auto dir = std::filesystem::temp_directory_path (ec);
+            const std::string path = (dir / ("fcore_master_selftest_" + runTag + "_solve.f32")).string();
+            const int rc = ec ? -1 : cmdSolve (b, in, frames, nc, path.c_str());
+            std::vector<float> back; std::size_t backFrames = 0;
+            const bool read = rc == 0 && readInterleaved (path.c_str(), nc, back, backFrames);
+            std::remove (path.c_str());
+            char fl[128];
+            std::snprintf (fl, sizeof fl, "rc %d, %zu frames on disk against %u delivered", rc, backFrames, d);
+            check (read && backFrames == d && bitDiff (back, sAbi, worst) == 0,
+                   "the solve command writes the DELIVERED length, and the delivered master in it", fl);
+        }
+    }
+
     std::printf ("%s — %d failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -927,10 +1374,15 @@ int main (int argc, char** argv)
             "  %s render   <sampleRate> <channels> <in.f32le> <out.f32le> [key=value ...]\n"
             "  %s solve    <sampleRate> <channels> <in.f32le> <out.f32le> target=<LUFS> tp=<dBTP> [key=value ...]\n"
             "  %s lra      <sampleRate> <channels> <in.f32le>\n"
-            "  %s selftest [sampleRate] [channels]\n", argv[0], argv[0], argv[0], argv[0]);
+            "  %s selftest [sampleRate] [channels]\n"
+            "  %s layout\n"
+            "  (delivery=<rate> on render/solve/lra: SRC first, the output at <rate>)\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const std::string mode = argv[1];
+
+    if (mode == "layout") return printLayout();
 
     if (mode == "selftest")
     {
@@ -991,55 +1443,8 @@ int main (int argc, char** argv)
     if (frames > (std::size_t) 0x7FFFFFFFu)
     { std::fprintf (stderr, "input longer than the ABI's frame count (%zu frames)\n", frames); return 2; }
 
-    if (mode == "render")
-    {
-        std::vector<float> out; fc_master_resolved res {};
-        if (! abiRender (a, in, frames, nc, out, res)) return 1;
-        if (! writeInterleaved (argv[5], nc, out, frames)) return 1;
-        // The resolved geometry on stderr, so a harness can read the numbers without parsing the audio.
-        std::fprintf (stderr, "latency=%d internalBlock=%d ceiling=%.17g release=%.17g\n",
-                      res.latencySamples, res.internalBlock, res.limiterCeilingDbTp, res.limiterReleaseMs);
-        return 0;
-    }
-
-    if (mode == "solve")
-    {
-        fc_master h = 0;
-        if (const fc_status st = fc_master_create (&a.cfg, &h); st != FC_OK)
-        { std::fprintf (stderr, "create: %s\n", statusName (st)); return 2; }
-        for (const auto& w : a.weights)
-            if (fc_master_set_channel_weight (h, w.channel, w.value) != FC_OK)
-            { std::fprintf (stderr, "weight%d rejected\n", w.channel); fc_master_destroy (h); return 2; }
-        std::vector<float> out (in.size(), 0.0f);
-        fc_solution sol = 0;
-        const fc_status st = fc_master_solve (h, &a.prm, &a.req, in.data(), out.data(),
-                                              (std::uint32_t) frames, &sol);
-        if (st != FC_OK) { std::fprintf (stderr, "solve: %s\n", statusName (st)); fc_master_destroy (h); return 1; }
-
-        fc_solution_summary sum {}; FC_INIT (sum);
-        fc_measurement meas {};      FC_INIT (meas);
-        fc_solution_summary_get (sol, &sum);
-        fc_solution_measurement (sol, &meas);
-        std::printf ("status=%d binding=%d gain=%.17g ceiling=%.17g passes=%d\n",
-                     sum.status, sum.binding, sum.preLimiterGainDb, sum.ceilingDbTp, sum.passes);
-        std::printf ("I=%.17g TP=%.17g LRA=%.17g PLR=%.17g loudnessValid=%d lraValid=%d\n",
-                     meas.integratedLufs, meas.truePeakDbTp, meas.loudnessRangeLu, meas.plrDb,
-                     meas.loudnessValid, meas.lraValid);
-        // A VERDICT IS NOT A RENDER. `InvalidRequest` and `NotPrepared` are returned before the solver
-        // touches the output, so `out` is still the zero buffer it was allocated as — writing it would
-        // hand a harness a file of the right length, full of digital silence, with exit status 0 and an
-        // existing output overwritten. The status line has already been printed; the file is not.
-        const bool delivered = (sum.status != FC_SOLVE_INVALID_REQUEST
-                             && sum.status != FC_SOLVE_NOT_PREPARED
-                             && sum.status != FC_SOLVE_RENDER_FAILED);
-        bool ok = true;
-        if (delivered) ok = writeInterleaved (argv[5], nc, out, frames);
-        else std::fprintf (stderr, "no render was delivered (status=%d) — the output file is NOT written\n",
-                           sum.status);
-        fc_solution_destroy (sol);
-        fc_master_destroy (h);
-        return (delivered && ok) ? 0 : 1;
-    }
+    if (mode == "render") return cmdRender (a, in, frames, nc, argv[5]);
+    if (mode == "solve")  return cmdSolve (a, in, frames, nc, argv[5]);
 
     std::fprintf (stderr, "unknown mode '%s'\n", mode.c_str());
     return 2;

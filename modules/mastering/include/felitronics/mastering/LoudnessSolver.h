@@ -359,6 +359,40 @@ public:
     }
 
     bool isPrepared() const noexcept { return prepared_; }
+    // The rate the meters are built at — 0 until prepared. A caller that hands this solver a programme at another
+    // rate (a converted one, say) checks it here; see `DeliveredMastering`.
+    double sampleRate() const noexcept { return prepared_ ? fs_ : 0.0; }
+
+    // EVERY VERDICT `solve()` REACHES BEFORE ITS FIRST PASS that does not look at the audio pointers: `NotPrepared`,
+    // or `InvalidRequest` for a chain, a width, a length, a request, a rate or a tap geometry it will not search.
+    // One definition, read by `solve()` itself — so a caller that has to spend memory BEFORE the search (a
+    // converted programme, `DeliveredMastering`) can ask first and spend nothing on a call that would be refused.
+    // True, and `why` untouched, when the call would reach a pass.
+    [[nodiscard]] bool admits (const MasteringChain& chain, const OfflineRenderer& renderer, int numChannels, int frames,
+                               const LoudnessRequest& req, MasteringSolveStatus& why) const noexcept
+    {
+        if (! prepared_) { why = MasteringSolveStatus::NotPrepared; return false; }
+        why = MasteringSolveStatus::InvalidRequest;
+        if (! chain.isPrepared() || numChannels != chain.numChannels() || numChannels > nch_ || frames <= 0) return false;
+        if (! std::isfinite (req.targetLufs) || ! std::isfinite (req.maxTruePeakDbTp)
+            || ! std::isfinite (req.toleranceLu) || req.toleranceLu < 0.0
+            || ! std::isfinite (req.activityThresholdDb) || req.activityThresholdDb < 0.0
+            || req.maxPasses < 1 || req.maxPasses > kMaxPasses
+            || req.limiterGr.malformed() || req.compressorGr.malformed()
+            || std::isnan (req.minPlrDb) || std::isnan (req.maxLraLossLu)
+            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0) return false;
+        // The tap buffers were sized for a geometry; a chain that does not match them would be measured
+        // through a refused call, which is a silent zero rather than a statistic.
+        // THE RATE IS CHECKED, not assumed shared. The solver builds its own meters from `fs_`, and a
+        // caller that passed 44100 here and 48000 to the chain would get a 48 kHz render measured on a
+        // 44.1 kHz grid — every number plausible, every number wrong.
+        if (! (std::fabs (chain.sampleRate() - fs_) < 1.0e-9)) return false;
+        if (chain.internalBlock() + renderer.blockSize() > frameCap_
+            || (long long) (chain.internalBlock() + renderer.blockSize()) * chain.tapOversampleFactor() > (long long) osCap_)
+            return false;
+        why = MasteringSolveStatus::Solved;     // not read by a caller on `true`; restored so `why` is untouched
+        return true;
+    }
 
     //==========================================================================================================
     // THE BUDGETS — what a call will ask the heap for, computed by the very functions the call sizes itself with
@@ -418,10 +452,8 @@ public:
     {
         LoudnessSolution sol;
         sol.activityThresholdDb = req.activityThresholdDb;
-        if (! prepared_) { sol.status = MasteringSolveStatus::NotPrepared; return sol; }
-        if (! chain.isPrepared() || numChannels != chain.numChannels() || numChannels > nch_
-            || frames <= 0 || in == nullptr || out == nullptr)
-            { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
+        if (! admits (chain, renderer, numChannels, frames, req, sol.status)) return sol;
+        if (in == nullptr || out == nullptr) { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
         // `in == out` IS REFUSED HERE, even though `OfflineRenderer` supports it. One render in place is
         // well defined; a SEARCH is not, because every pass after the first would read the previous
         // pass's master as its input. Measured: a 1 kHz tone solved to a reported -22.996 LUFS, and the
@@ -431,24 +463,6 @@ public:
         // caller knows whether it can.
         for (int c = 0; c < numChannels; ++c)
             if (in[c] == out[c]) { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
-        if (! std::isfinite (req.targetLufs) || ! std::isfinite (req.maxTruePeakDbTp)
-            || ! std::isfinite (req.toleranceLu) || req.toleranceLu < 0.0
-            || ! std::isfinite (req.activityThresholdDb) || req.activityThresholdDb < 0.0
-            || req.maxPasses < 1 || req.maxPasses > kMaxPasses
-            || req.limiterGr.malformed() || req.compressorGr.malformed()
-            || std::isnan (req.minPlrDb) || std::isnan (req.maxLraLossLu)
-            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0)
-            { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
-        // The tap buffers were sized for a geometry; a chain that does not match them would be measured
-        // through a refused call, which is a silent zero rather than a statistic.
-        // THE RATE IS CHECKED, not assumed shared. The solver builds its own meters from `fs_`, and a
-        // caller that passed 44100 here and 48000 to the chain would get a 48 kHz render measured on a
-        // 44.1 kHz grid — every number plausible, every number wrong.
-        if (! (std::fabs (chain.sampleRate() - fs_) < 1.0e-9))
-            { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
-        if (chain.internalBlock() + renderer.blockSize() > frameCap_
-            || (long long) (chain.internalBlock() + renderer.blockSize()) * chain.tapOversampleFactor() > (long long) osCap_)
-            { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
 
         const double target = req.targetLufs;
         const double pmax   = req.maxTruePeakDbTp;

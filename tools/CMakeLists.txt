@@ -61,6 +61,20 @@ if(FELITRONICS_BUILD_TESTS)
     # the C ABI and through a direct C++ call, one binary, one machine, compared bit for bit — plus
     # block-independence through the ABI and the reset discipline.
     add_test(NAME felitronics_master_abi_selftest COMMAND fcore_master selftest)
+
+    # The JavaScript layout against the compiler, field by field (tools/wasm/layout-check.mjs). On the wasm tier the
+    # argument is the emscripten build of fcore_master, so the offsets checked are wasm32's — the ones a page uses.
+    # Needs node; a desktop row without it skips the test and says so rather than passing it.
+    find_program(FELITRONICS_NODE node)
+    if(FELITRONICS_NODE)
+        add_test(NAME felitronics_master_layout_check
+                 COMMAND ${FELITRONICS_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/wasm/layout-check.mjs $<TARGET_FILE:fcore_master>)
+        # And the two refusals the layout file makes for a page — the version gate and the write past a stamp.
+        add_test(NAME felitronics_master_layout_gate_tests
+                 COMMAND ${FELITRONICS_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/wasm/layout-gate-test.mjs)
+    else()
+        message(STATUS "felitronics_master_layout_check: node not found — the JS layout is not checked on this row")
+    endif()
 endif()
 
 # fcore_master — the C-ABI facade over `felitronics::mastering` (tools/fc_master_abi.h +
