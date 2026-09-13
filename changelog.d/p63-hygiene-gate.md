@@ -12,6 +12,9 @@ reported seven diagnostics, all in `LoudnessSolver.h`; `DeliveredMastering.h` ad
   defect. The meter in `measure()` is a local, zeroed by its own prepare, fed exactly one `process()` of `frames`
   samples, and its counter moves by at most one per sub-hop of at least one sample, so it cannot exceed `frames`,
   an `int`. The comment at the cast says so, and names what would break it.
+- **Every public header is now in the gate BY NAME.** `BlendKernels.h`, `BlendParams.h`, `IrBlend.h`,
+  `MatrixConvolverNupc.h` and `StateGrid.h` were reached only through other headers' includes, so dropping one
+  intermediate `#include` would have taken them out of the gate silently. None warned when named.
 - **Proof.** The gate builds warning-free on gcc 14.2 (Debian), Apple clang and emscripten 6.0.9; the full suite
   passes. Behaviour is unchanged by construction: a probe that renders, solves and measures LRA (plain, constrained,
   infeasible, delivered 44.1 -> 48 kHz) prints byte-identical results against `main`, and its `.text` section
