@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 namespace felitronics::convolution
@@ -41,6 +42,24 @@ struct IrResampleConfig
 // Offline windowed-sinc (Kaiser) IR resampler. MESSAGE-THREAD ONLY (double math, allocates) — for
 // rate-converting an impulse response to the host SR on load. DC gain is normalized to 1.
 //
+// OUTSIDE THE INPUT IS SILENCE. Every output sample divides by the weight of its WHOLE window, and a tap
+// that falls past either end of the input adds its weight but no signal: the IR is resampled as if it were
+// padded with zeros, which is what it is — a cabinet trimmed at its onset had silence before it, and the
+// convolver plays silence after its last tap. Those taps used to be skipped BEFORE their weight was added,
+// so an edge sample was divided by only the part of its window that landed on the input, and the samples
+// that were not there counted as the weighted mean of the ones that were. A cabinet's onset is its loudest
+// edge; that invented a broadband floor over the top octave, which is exactly where a cabinet is quietest.
+// What zeros cannot give back is the kernel's pre-ringing that would fall BEFORE output sample 0: an IR that
+// starts at sample 0 keeps it only by adding delay, and it costs more the more abruptly the IR starts.
+// `felitronics_convolution_resampler_tests` owns the numbers — shift invariance, and a cabinet-like IR's
+// band response against its own response and against the untruncated resample.
+//
+// A LOAD IS NEVER RESAMPLED TO NOTHING. The length is inLen*ratio rounded but at least one sample, as JUCE's
+// resampleImpulseResponse had it: a one-tap IR at 96 -> 44.1 kHz rounded to zero taps, and the loader had
+// nothing to publish. The result is empty only for a rate that is not a positive finite number, or for an
+// output `int` cannot address — longer than INT_MAX, or a ratio so small that output sample 0 alone sits
+// past it (the floor of one sample is what makes that reachable: `(int) floor(t)` would be undefined).
+//
 // FAMILY SPLIT vs core::StreamResampler — restated, because the other half of it changed under this
 // comment. That one used to be a Catmull-Rom cubic and "too low-SNR for IRs" was the whole argument.
 // Since P34 it is a 64-tap polyphase windowed sinc, i.e. the SAME family as this one, so the split is
@@ -53,12 +72,14 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
                                       IrResampleConfig cfg = {})
 {
     std::vector<float> out;
-    if (in == nullptr || inLen <= 0 || inSr <= 0.0 || outSr <= 0.0) return out;
+    if (in == nullptr || inLen <= 0 || ! (inSr > 0.0) || ! (outSr > 0.0) || ! std::isfinite (inSr)
+        || ! std::isfinite (outSr)) return out;
 
-    const double ratio  = outSr / inSr;
-    const int    outLen = (int) std::llround ((double) inLen * ratio);
-    if (outLen <= 0) return out;
-    out.assign ((std::size_t) outLen, 0.0f);
+    const double ratio = outSr / inSr;
+    if (! (ratio > 0.0) || ! std::isfinite (ratio)) return out;            // finite rates can still under/overflow here
+    const double want = (double) inLen * ratio;
+    if (! (want < (double) std::numeric_limits<int>::max())) return out;   // before the cast: a wrapped length is garbage
+    const int outLen = std::max (1, (int) std::llround (want));            // never zero taps — A LOAD IS NEVER RESAMPLED TO NOTHING
 
     // Sanitize the config — halfTaps < 1 makes the tap loop empty (an all-zero "IR"), a non-finite
     // beta/cutoffScale poisons every tap.
@@ -69,6 +90,11 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
     const double fc     = 0.5 * std::min (1.0, ratio) * cScale;            // cycles per INPUT sample
     const double i0beta = detail::besselI0 (beta);
 
+    // Every tap index is an int: the last output's input position plus the window radius has to fit.
+    const double tLast = ((double) outLen - 0.5) / ratio - 0.5;
+    if (! (tLast + (double) R + 2.0 < (double) std::numeric_limits<int>::max())) return out;
+    out.assign ((std::size_t) outLen, 0.0f);
+
     for (int n = 0; n < outLen; ++n)
     {
         const double t = ((double) n + 0.5) / ratio - 0.5;                 // output n → input position (sample-centred)
@@ -76,7 +102,6 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
         double acc = 0.0, wsum = 0.0;
         for (int k = c - R + 1; k <= c + R; ++k)
         {
-            if (k < 0 || k >= inLen) continue;
             const double xx   = t - (double) k;
             const double sinc = (std::fabs (xx) < 1e-12) ? (2.0 * fc)
                                                          : std::sin (2.0 * core::kPi * fc * xx) / (core::kPi * xx);
@@ -84,8 +109,8 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
             const double win  = (r <= -1.0 || r >= 1.0) ? 0.0
                               : detail::besselI0 (beta * std::sqrt (1.0 - r * r)) / i0beta;
             const double w    = sinc * win;
-            acc  += (double) in[k] * w;
-            wsum += w;
+            wsum += w;                                                     // the WHOLE window: OUTSIDE THE INPUT IS SILENCE
+            if (k >= 0 && k < inLen) acc += (double) in[k] * w;
         }
         out[(std::size_t) n] = (float) (! core::exactlyEqual (wsum, 0.0) ? acc / wsum : 0.0);    // normalize → unity DC (intentional exact ==)
     }

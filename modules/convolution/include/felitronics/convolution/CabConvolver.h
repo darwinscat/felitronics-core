@@ -76,6 +76,12 @@ public:
     static constexpr float  kIrNormMinDb  = -30.0f;
     static constexpr float  kIrNormMaxDb  = 30.0f;
     static constexpr double kIrRefFloorDb = -60.0;    // near-silent IR ⇒ keep g = 1 (don't amplify garbage)
+    // Two rates this close are ONE rate, and the IR is taken verbatim. A host that reports 48000.0000001 is
+    // reporting 48 kHz; resampling for it band-limits a host-rate IR at 0.95 of Nyquist and moves every tap
+    // for nothing. Relative, so it means the same thing at every rate. One part per million is far above
+    // anything a rate's own arithmetic drifts by and far below any two rates that really differ, and it is
+    // what orbit-amp's own `sameRate` already uses — the family agrees on what "the same rate" means.
+    static constexpr double kRateMatchTolerance = 1.0e-6;
 
     // maxIrSeconds sizes the NUPC partition schedule (the fixed IR-length cap — see IR-LENGTH CAP above).
     // The default matches the historical value; cab IRs are far shorter, so the cap is generous headroom.
@@ -113,7 +119,10 @@ public:
     void reset() { convolution_.reset(); }
 
     // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity,
-    // resampled to host rate. Message thread: resample + gain + the convolver's partition build all allocate.
+    // resampled to host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the
+    // convolver's partition build all allocate. A load that stages nothing (no samples, a null plane, a rate
+    // resampleIr refuses) is IGNORED whole: the playing IR, the staged taps and any pending retry stay as
+    // they were.
     void loadIR (const float* const* samples, int numChannels, int numSamples, double irSampleRate)
     {
         buildAndStage (samples, numChannels, numSamples, irSampleRate);
@@ -154,28 +163,41 @@ private:
     using Conv = felitronics::convolution::MatrixConvolverNupc<CabConvFft>;
     static constexpr int kNupcHeadPartition = 128;   // time-domain head P0 (pow2) — lineareq uses the same
 
+    // STAGED IN LOCALS, COMMITTED WHOLE. The taps, their gain and the pending retry's geometry change together
+    // or not at all. This used to overwrite `ir_` first and return on an empty result after — and with a
+    // rejected load still pending, the retry then published the OLD length from an emptied or narrowed `ir_`:
+    // a read past the end of a vector (a zero-length load; a mono load over a pending stereo one), or, with
+    // a null data pointer, a retry refused forever — isBusy() stuck true, and neither the pending IR nor the
+    // new one ever reached the convolver.
     void buildAndStage (const float* const* samples, int nch, int len, double irSr)
     {
+        if (samples == nullptr || len <= 0) return;
         nch = std::clamp (nch, 1, 2);
-        ir_.resize ((std::size_t) nch);
 
-        int outLen = len;
+        const bool sameRate = std::isfinite (irSr)
+                           && std::fabs (irSr - hostSr_) <= kRateMatchTolerance * std::max (irSr, hostSr_);
+        std::vector<std::vector<float>> staged ((std::size_t) nch);
         for (int c = 0; c < nch; ++c)                                          // resample only off host rate
         {
-            if (irSr > 0.0 && (irSr < hostSr_ || irSr > hostSr_))
-                ir_[(std::size_t) c] = felitronics::convolution::resampleIr (samples[c], len, irSr, hostSr_);
+            if (samples[c] == nullptr) return;
+            auto& ch = staged[(std::size_t) c];
+            if (irSr > 0.0 && ! sameRate)
+                ch = felitronics::convolution::resampleIr (samples[c], len, irSr, hostSr_);
             else
-                ir_[(std::size_t) c].assign (samples[c], samples[c] + len);
-            outLen = (int) ir_[(std::size_t) c].size();
+                ch.assign (samples[c], samples[c] + len);
+            if (ch.empty()) return;                                            // a rate resampleIr refuses
         }
-        if (outLen <= 0) return;
+        const int outLen = (int) staged[0].size();
 
         // Reference-unity normalization of the FINAL (resampled) IR — one common gain, all channels.
         // Skipped for a reverb IR (normalize_=false): the taps go in verbatim at their peak-normalized level.
-        const float g = normalize_ ? normalizationGain (outLen) : 1.0f;
+        const float g = normalize_ ? normalizationGain (staged, outLen) : 1.0f;
+        for (auto& ch : staged) for (float& v : ch) v *= g;
+
+        ir_.resize ((std::size_t) nch);
+        for (int c = 0; c < nch; ++c) ir_[(std::size_t) c].swap (staged[(std::size_t) c]);
         normGain_   = g;
         normGainDb_ = 20.0f * std::log10 (std::max (1.0e-6f, g));
-        for (auto& ch : ir_) for (float& v : ch) v *= g;
 
         // Publish the normalized taps to the convolver. On rejection (mid-crossfade) the retry reads back
         // from ir_ — which always holds the LATEST staged IR — so there is no dangling snapshot: a newer
@@ -205,12 +227,12 @@ private:
         return ! pendingRetry_;
     }
 
-    // 1 / (reference RMS gain) of the staged IR: G² = Σ w(f)·P(f) / Σ w(f) over the positive-
+    // 1 / (reference RMS gain) of an IR about to be staged: G² = Σ w(f)·P(f) / Σ w(f) over the positive-
     // frequency bins (DC excluded), where P(f) is the channel-mean power response |H(f)|² and
     // w(f) = 1 / (1 + (f/kIrRefShapeHz)²) is the one-pole-shaped reference's power spectrum.
     // Frequency domain (one real FFT per channel on the message thread) — equals convolving the
     // reference noise through the IR and reading the RMS ratio, without needing a signal.
-    float normalizationGain (int len) const
+    float normalizationGain (const std::vector<std::vector<float>>& taps, int len) const
     {
         // Analysis window: the first second. An IR's tail past that carries so little band energy
         // that it moves the reference gain by < 0.1 dB (measured on the factory set down to 10%
@@ -223,7 +245,7 @@ private:
         std::vector<float> padded ((std::size_t) N, 0.0f);
         std::vector<float> spec ((std::size_t) felitronics::core::fft::DefaultRealFft::spectrumFloats (N));
         std::vector<double> power ((std::size_t) (N / 2 + 1), 0.0);
-        for (const auto& ch : ir_)
+        for (const auto& ch : taps)
         {
             std::fill (padded.begin(), padded.end(), 0.0f);
             std::copy (ch.begin(), ch.begin() + std::min<std::ptrdiff_t> (cap, (std::ptrdiff_t) ch.size()),
@@ -237,7 +259,7 @@ private:
         }
 
         double num = 0.0, den = 0.0;
-        const double chInv = 1.0 / (double) std::max<std::size_t> (1, ir_.size());
+        const double chInv = 1.0 / (double) std::max<std::size_t> (1, taps.size());
         for (int k = 1; k <= N / 2; ++k)                             // DC excluded: not audio
         {
             const double f = (double) k * hostSr_ / N;

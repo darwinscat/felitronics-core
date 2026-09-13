@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // Golden coverage for the product-level cab wrapper: reference-unity gain math, direct-convolution
-// parity, mono broadcast / true-stereo publication, verbatim reverb loading, and latest-wins retry.
+// parity, mono broadcast / true-stereo publication, verbatim reverb loading, and latest-wins retry. And
+// (P67) the rate match with its tolerance, a one-tap IR off the host rate, and loads that stage nothing.
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/CabConvolver.h>
@@ -13,6 +14,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <vector>
 
 using felitronics::convolution::CabConvolver;
@@ -318,6 +320,171 @@ int main()
         for (std::size_t i = 0; i < latest.size(); ++i)
             latestWon = latestWon && impulse[i] == latest[i] && other[i] == latest[i];
         test::ok (latestWon, "retried operator is the latest IR and broadcasts to both channels");
+    }
+
+    // P67. The witness that the resampler did NOT run is the taps themselves: even at a ratio of exactly one it
+    // band-limits at 0.95 of Nyquist and moves every tap of a noise-like IR, so a verbatim copy, to the bit,
+    // cannot come out of it. The tolerance is RELATIVE — half of it at 192 kHz is 0.096 Hz, which a tolerance
+    // in hertz small enough for 48000.0000001 would resample — and twice it has to resample, both ways.
+    test::group ("P67 — rates within kRateMatchTolerance are ONE rate: the taps go in verbatim; past it they are resampled");
+    {
+        const auto ir = decayingIr (600);
+        const auto stagedAt = [&ir] (double hostRate, double irRate, bool normalize, float* gain = nullptr)
+        {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (hostRate, 512, 2, 0.05, normalize));
+            const float* banks[1] { ir.data() };
+            convolver.loadIR (banks, 1, (int) ir.size(), irRate);
+            if (gain != nullptr) *gain = convolver.irNormalizationGain();
+            return convolver.stagedTaps().size() == 1 ? convolver.stagedTaps()[0] : std::vector<float> {};
+        };
+        const double tol = CabConvolver::kRateMatchTolerance;
+        test::ok (stagedAt (48000.0000001, 48000.0, false) == ir,
+                  "a host at 48000.0000001 loads a 48 kHz IR verbatim, to the bit (the resampler did not run)");
+        test::ok (stagedAt (48000.0, 48000.0000001, false) == ir, "and a 48000.0000001 IR on a 48 kHz host, the same");
+        test::ok (stagedAt (192000.0, 192000.0 * (1.0 + 0.5 * tol), false) == ir
+                      && stagedAt (192000.0 * (1.0 + 0.5 * tol), 192000.0, false) == ir,
+                  "half the tolerance at 192 kHz (0.096 Hz), both ways: verbatim — the tolerance is relative, not in hertz");
+        const auto above = stagedAt (48000.0, 48000.0 * (1.0 + 2.0 * tol), false);
+        const auto below = stagedAt (48000.0, 48000.0 * (1.0 - 2.0 * tol), false);
+        test::ok (above.size() == ir.size() && above != ir && below.size() == ir.size() && below != ir,
+                  "twice the tolerance, both ways: resampled — same length, every tap moved");
+        float gain = 0.0f;
+        const auto normalized = stagedAt (48000.0000001, 48000.0, true, &gain);
+        bool scaled = normalized.size() == ir.size() && gain > 0.0f;
+        for (std::size_t i = 0; scaled && i < ir.size(); ++i) scaled = normalized[i] == ir[i] * gain;
+        test::ok (scaled, "normalize=true at 48000.0000001: exactly the input times the one normalization gain");
+    }
+
+    // P67. A one-tap IR off the host rate used to resample to NO taps, and the load silently did nothing: the
+    // previous cabinet kept playing. Now it stages its one tap, publishes it, and that is what plays.
+    test::group ("P67 — a one-tap IR off the host rate stages one tap and is what plays");
+    {
+        struct Rates { double host, ir; };
+        for (const Rates& rates : { Rates { 44100.0, 96000.0 }, Rates { 44100.0, 192000.0 }, Rates { 48000.0, 176400.0 },
+                                    Rates { 8000.0, 384000.0 } })
+        {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (rates.host, 128, 2, 0.05));       // normalize=true: the cabinet path
+            const std::vector<float> previous { 0.5f, 0.25f, -0.125f, 0.0625f };
+            const float* first[1] { previous.data() };
+            convolver.loadIR (first, 1, (int) previous.size(), rates.host);
+            pumpCrossfade (convolver);
+
+            const std::vector<float> tap { 0.8f };
+            const float* banks[1] { tap.data() };
+            convolver.loadIR (banks, 1, 1, rates.ir);
+            pumpCrossfade (convolver);
+            const bool flushed = convolver.flushPending();
+            const auto& staged = convolver.stagedTaps();
+            const bool one = staged.size() == 1 && staged[0].size() == 1 && std::isfinite (staged[0][0]) && staged[0][0] != 0.0f;
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "one tap at %.0f Hz on a %.0f Hz host stages one tap and publishes it",
+                           rates.ir, rates.host);
+            test::ok (one && flushed && ! convolver.hasPending() && ! convolver.isBusy(), msg);
+
+            convolver.reset();
+            std::vector<float> left (16, 0.0f), right (16, 0.0f);
+            left[0] = right[0] = 1.0f;
+            float* io[2] { left.data(), right.data() };
+            felitronics::test::run (convolver.process (io, 2, 16));
+            bool plays = one;
+            for (std::size_t i = 0; plays && i < left.size(); ++i)
+                plays = left[i] == (i == 0 ? staged[0][0] : 0.0f) && right[i] == left[i];
+            test::ok (plays, std::string (msg) + " — and it is what plays; the previous IR is gone");
+        }
+    }
+
+    // P67. A load that stages nothing used to return AFTER overwriting the retained taps, so a load still
+    // pending from mid-crossfade was retried with its OLD length over an emptied or narrowed store: a read past
+    // the end of a vector, or a retry refused forever with isBusy() stuck true. Each such load must now leave
+    // the pending one exactly as it was — its taps staged, its retry publishing, its IR the one that plays.
+    // The malformed calls go last: before the fix they crash outright, and the earlier cases fail readably.
+    test::group ("P67 — a load that stages nothing is ignored whole: the pending load survives it and plays");
+    {
+        const std::vector<float> first { 1.0f, 0.25f, 0.0f, 0.0f };
+        const std::vector<float> pendingLeft { 0.0f, 1.0f, 0.0f, 0.0f }, pendingRight { 0.0f, 0.0f, 0.5f, 0.0f };
+        enum class Nothing { zeroLength, refusedRate, negativeLength, nullArray, nullPlane };
+        const auto survives = [&] (bool stereoPending, Nothing nothing, const std::string& what)
+        {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (44100.0, 128, 2, 0.05, false));
+            const float* a[1] { first.data() };
+            convolver.loadIR (a, 1, (int) first.size(), 44100.0);
+            float l[64] {}, r[64] {};
+            float* io[2] { l, r };
+            felitronics::test::run (convolver.process (io, 2, 64));                    // the first fade is in flight
+            const float* b[2] { pendingLeft.data(), pendingRight.data() };
+            convolver.loadIR (b, stereoPending ? 2 : 1, 4, 44100.0);                   // rejected mid-fade -> pending
+            const bool pendingBefore = convolver.hasPending();
+
+            const std::vector<float> one { 0.8f };
+            const float* c[1] { one.data() };
+            const float* nullPlane[1] { nullptr };
+            switch (nothing)
+            {
+                case Nothing::zeroLength:     convolver.loadIR (c, 1, 0, 44100.0); break;
+                case Nothing::refusedRate:    convolver.loadIR (c, 1, 1, std::numeric_limits<double>::infinity()); break;
+                case Nothing::negativeLength: convolver.loadIR (c, 1, -1, 44100.0); break;
+                case Nothing::nullArray:      convolver.loadIR (nullptr, 1, 4, 44100.0); break;
+                case Nothing::nullPlane:      convolver.loadIR (nullPlane, 1, 4, 44100.0); break;
+            }
+            const auto& staged = convolver.stagedTaps();
+            const bool retained = pendingBefore && convolver.hasPending()
+                               && staged.size() == (stereoPending ? 2u : 1u) && staged[0] == pendingLeft
+                               && (! stereoPending || staged[1] == pendingRight);
+            test::ok (retained, what + ": the pending load and its staged taps are untouched");
+
+            pumpCrossfade (convolver);
+            test::ok (convolver.flushPending() && ! convolver.hasPending(), what + ": its retry publishes");
+            pumpCrossfade (convolver);
+            convolver.reset();
+            std::vector<float> left (8, 0.0f), right (8, 0.0f);
+            left[0] = right[0] = 1.0f;
+            float* render[2] { left.data(), right.data() };
+            felitronics::test::run (convolver.process (render, 2, 8));
+            bool plays = true;
+            for (std::size_t i = 0; i < pendingLeft.size(); ++i)
+                plays = plays && left[i] == pendingLeft[i] && right[i] == (stereoPending ? pendingRight[i] : pendingLeft[i]);
+            test::ok (plays, what + ": and the pending IR is what plays");
+        };
+        survives (false, Nothing::zeroLength,  "a zero-length load over a pending mono load");
+        survives (true,  Nothing::zeroLength,  "a zero-length MONO load over a pending STEREO load");
+        survives (false, Nothing::refusedRate, "a load at a rate resampleIr refuses (infinite)");
+
+        // And the load that used to stage nothing — one tap at 96 kHz — now stages, so it is the LATEST and wins.
+        {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (44100.0, 128, 2, 0.05, false));
+            const float* a[1] { first.data() };
+            convolver.loadIR (a, 1, (int) first.size(), 44100.0);
+            float l[64] {}, r[64] {};
+            float* io[2] { l, r };
+            felitronics::test::run (convolver.process (io, 2, 64));
+            const float* b[1] { pendingLeft.data() };
+            convolver.loadIR (b, 1, 4, 44100.0);
+            const std::vector<float> tap { 0.8f };
+            const float* c[1] { tap.data() };
+            convolver.loadIR (c, 1, 1, 96000.0);
+            const bool latestStaged = convolver.hasPending() && convolver.stagedTaps().size() == 1
+                                   && convolver.stagedTaps()[0].size() == 1;
+            pumpCrossfade (convolver);
+            const bool flushed = convolver.flushPending();
+            pumpCrossfade (convolver);
+            convolver.reset();
+            std::vector<float> left (8, 0.0f), right (8, 0.0f);
+            left[0] = right[0] = 1.0f;
+            float* render[2] { left.data(), right.data() };
+            felitronics::test::run (convolver.process (render, 2, 8));
+            const bool plays = latestStaged && left[0] == convolver.stagedTaps()[0][0] && left[0] != 0.0f
+                            && left[1] == 0.0f && right[0] == left[0];
+            test::ok (latestStaged && flushed && plays,
+                      "one tap at 96 kHz over a pending load stages as the latest, publishes, and is what plays");
+        }
+
+        survives (false, Nothing::negativeLength, "a negative-length load over a pending load");
+        survives (false, Nothing::nullArray,      "a load with no channel array over a pending load");
+        survives (false, Nothing::nullPlane,      "a load with a null plane over a pending load");
     }
 
     return test::report();
