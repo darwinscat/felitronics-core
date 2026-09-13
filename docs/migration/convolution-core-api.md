@@ -21,8 +21,8 @@ byte-for-byte by the adapter — they were verified line-by-line against that so
   `isBusy()` for coalescing; `latencySamples()==0`.
 - **`resampleIr(in,inLen,inSr,outSr,cfg)`** → `std::vector<float>` — offline Kaiser windowed-sinc (~80 dB),
   **DC gain normalized to 1**, the input taken as **zero outside its samples** (every output divides by its
-  whole window), and **at least one output sample** (empty only for a rate that is not a positive finite
-  number or a length/position `int` cannot address). Message-thread only (allocates, double math).
+  whole window), and **at least one output sample** (empty only for no input, a rate that is not a positive
+  finite number, or a length/position `int` cannot address). Message-thread only (allocates, double math).
 
 ## JUCE behaviour the adapter MUST replicate (verified vs `juce_Convolution.cpp`)
 

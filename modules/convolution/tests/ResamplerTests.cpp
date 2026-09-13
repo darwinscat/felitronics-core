@@ -67,7 +67,8 @@ void filterInPlace (std::vector<double>& x, const Biquad& q)
 // sample 0 and rises to its peak a few samples in. An impulse through a 70 Hz high-pass, a low bump, a
 // presence peak and an 8th-order Butterworth low-pass at 6 kHz, plus a gentle 14 kHz branch 40 dB down —
 // the floor a real cabinet keeps over the top octave, which is where the edge defect showed. NOT tapered at
-// the start: the onset IS the feature under test. The end decays past 1e-12 on its own.
+// the start: the onset IS the feature under test. At 4096 taps its end has decayed past 1e-12 on its own (the
+// band test); cut to 1024 it ends at about 7e-5, which the edge-tap check wants: signal at BOTH edges.
 std::vector<float> cabinetLikeIr (int length)
 {
     constexpr double fs = 48000.0;
@@ -399,6 +400,15 @@ int main()
         }
     }
 
+    // Rounded, not truncated, above the floor: 3 taps at 48 -> 44.1 kHz are 2.756 samples, 600 at 44.1 -> 48 are 653.06.
+    test::group ("P67 — the length is inLen*ratio rounded to the nearest sample");
+    {
+        test::ok (convolution::resampleIr (std::vector<float> { 1.0f, 0.5f, 0.25f }, 48000.0, 44100.0).size() == 3,
+                  "3 taps at 48 -> 44.1 kHz (2.756) give 3 samples");
+        test::ok (convolution::resampleIr (std::vector<float> (600, 0.1f), 44100.0, 48000.0).size() == 653,
+                  "600 taps at 44.1 -> 48 kHz (653.06) give 653 samples");
+    }
+
     // The floor of one sample is what makes a vanishing ratio reachable: output 0 of a 1e-12 ratio sits 5e11
     // input samples in, and `(int) floor(t)` there is undefined. So those, rates that are not positive finite
     // numbers, and a length past INT_MAX are REFUSED — and refused before the cast, which is the order that
@@ -411,6 +421,10 @@ int main()
                   "an infinite rate is refused, on either side");
         test::ok (convolution::resampleIr (one, nan, 48000.0).empty() && convolution::resampleIr (one, 48000.0, nan).empty(),
                   "a NaN rate is refused, on either side");
+        test::ok (convolution::resampleIr (one, 0.0, 48000.0).empty() && convolution::resampleIr (one, 48000.0, 0.0).empty(),
+                  "a zero rate is refused, on either side");
+        test::ok (convolution::resampleIr (one, -48000.0, -44100.0).empty() && convolution::resampleIr (one, -48000.0, 44100.0).empty(),
+                  "a negative rate is refused — even when the two signs make a positive ratio");
         test::ok (convolution::resampleIr (one, 1.0e300, 1.0e-300).empty(), "a ratio that underflows to zero is refused");
         test::ok (convolution::resampleIr (one, 1.0, 4294967297.0).empty(), "2^32 + 1 output samples is refused, not wrapped to one");
         test::ok (convolution::resampleIr (one, 1.0e12, 1.0).empty(), "an output position past INT_MAX is refused, not converted");

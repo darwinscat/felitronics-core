@@ -56,9 +56,10 @@ struct IrResampleConfig
 //
 // A LOAD IS NEVER RESAMPLED TO NOTHING. The length is inLen*ratio rounded but at least one sample, as JUCE's
 // resampleImpulseResponse had it: a one-tap IR at 96 -> 44.1 kHz rounded to zero taps, and the loader had
-// nothing to publish. The result is empty only for a rate that is not a positive finite number, or for an
-// output `int` cannot address — longer than INT_MAX, or a ratio so small that output sample 0 alone sits
-// past it (the floor of one sample is what makes that reachable: `(int) floor(t)` would be undefined).
+// nothing to publish. The result is empty only for no input (a null pointer or a non-positive length), a rate
+// that is not a positive finite number, or an output `int` cannot address — longer than INT_MAX samples, or a
+// ratio so small that output sample 0 alone sits past INT_MAX (the floor of one sample is what makes that
+// reachable: `(int) floor(t)` would be undefined).
 //
 // FAMILY SPLIT vs core::StreamResampler — restated, because the other half of it changed under this
 // comment. That one used to be a Catmull-Rom cubic and "too low-SNR for IRs" was the whole argument.
@@ -79,7 +80,7 @@ inline std::vector<float> resampleIr (const float* in, int inLen, double inSr, d
     if (! (ratio > 0.0) || ! std::isfinite (ratio)) return out;            // finite rates can still under/overflow here
     const double want = (double) inLen * ratio;
     if (! (want < (double) std::numeric_limits<int>::max())) return out;   // before the cast: a wrapped length is garbage
-    const int outLen = std::max (1, (int) std::llround (want));            // never zero taps — A LOAD IS NEVER RESAMPLED TO NOTHING
+    const int outLen = std::max (1, (int) std::llround (want));            // never zero taps (see above)
 
     // Sanitize the config — halfTaps < 1 makes the tap loop empty (an all-zero "IR"), a non-finite
     // beta/cutoffScale poisons every tap.

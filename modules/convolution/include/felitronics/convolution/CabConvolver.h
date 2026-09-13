@@ -121,8 +121,9 @@ public:
     // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity,
     // resampled to host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the
     // convolver's partition build all allocate. A load that stages nothing (no samples, a null plane, a rate
-    // resampleIr refuses) is IGNORED whole: the playing IR, the staged taps and any pending retry stay as
-    // they were.
+    // resampleIr refuses) is IGNORED whole: the playing IR, the staged taps, their gain and any pending retry
+    // stay as they were. A zero, negative or NaN IR rate is not one of those — it means "at the host rate",
+    // as it always has, and the taps load verbatim.
     void loadIR (const float* const* samples, int numChannels, int numSamples, double irSampleRate)
     {
         buildAndStage (samples, numChannels, numSamples, irSampleRate);
@@ -133,11 +134,12 @@ public:
     float irNormalizationGain()   const noexcept { return normGain_; }
     float irNormalizationGainDb() const noexcept { return normGainDb_; }
 
-    // The staged AUDIBLE taps of the last load — resampled to host rate + reference-unity
-    // normalized, exactly what the convolver plays (retained anyway for the reject-retry
-    // coalescing). Message thread; input for offline blend analysis (auto-polarity /
-    // interference tint). NOTE: they persist after a slot clear (the engine only gates the
-    // slot off) — callers gate on the slot's own loaded state, not on non-emptiness here.
+    // The staged AUDIBLE taps of the last load that staged any (one that stages nothing leaves them) —
+    // resampled to host rate + reference-unity normalized, exactly what the convolver plays once a
+    // pending retry has published (retained anyway for the reject-retry coalescing). Message thread;
+    // input for offline blend analysis (auto-polarity / interference tint). NOTE: they persist after a
+    // slot clear (the engine only gates the slot off) — callers gate on the slot's own loaded state, not
+    // on non-emptiness here.
     const std::vector<std::vector<float>>& stagedTaps() const noexcept { return ir_; }
 
     // RT-safe in-place convolution of `numChannels` planar channels. NUPC processes the prepared channel

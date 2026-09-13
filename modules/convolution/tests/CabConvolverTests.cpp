@@ -323,9 +323,11 @@ int main()
     }
 
     // P67. The witness that the resampler did NOT run is the taps themselves: even at a ratio of exactly one it
-    // band-limits at 0.95 of Nyquist and moves every tap of a noise-like IR, so a verbatim copy, to the bit,
-    // cannot come out of it. The tolerance is RELATIVE — half of it at 192 kHz is 0.096 Hz, which a tolerance
-    // in hertz small enough for 48000.0000001 would resample — and twice it has to resample, both ways.
+    // band-limits at 0.95 of Nyquist and moves every tap of this noise-like IR, so a verbatim copy, to the bit,
+    // cannot come out of it. The rates are LITERALS, so the documented one part per million is pinned from both
+    // sides (0.9 ppm verbatim, 1.1 ppm resampled) rather than following whatever the constant says; and it is
+    // RELATIVE — half a ppm at 192 kHz is 0.096 Hz, which a tolerance in hertz small enough for 48000.0000001
+    // would resample.
     test::group ("P67 — rates within kRateMatchTolerance are ONE rate: the taps go in verbatim; past it they are resampled");
     {
         const auto ir = decayingIr (600);
@@ -338,17 +340,22 @@ int main()
             if (gain != nullptr) *gain = convolver.irNormalizationGain();
             return convolver.stagedTaps().size() == 1 ? convolver.stagedTaps()[0] : std::vector<float> {};
         };
-        const double tol = CabConvolver::kRateMatchTolerance;
+        test::approx (CabConvolver::kRateMatchTolerance, 1.0e-6, 0.0, "the tolerance is one part per million");
         test::ok (stagedAt (48000.0000001, 48000.0, false) == ir,
                   "a host at 48000.0000001 loads a 48 kHz IR verbatim, to the bit (the resampler did not run)");
         test::ok (stagedAt (48000.0, 48000.0000001, false) == ir, "and a 48000.0000001 IR on a 48 kHz host, the same");
-        test::ok (stagedAt (192000.0, 192000.0 * (1.0 + 0.5 * tol), false) == ir
-                      && stagedAt (192000.0 * (1.0 + 0.5 * tol), 192000.0, false) == ir,
-                  "half the tolerance at 192 kHz (0.096 Hz), both ways: verbatim — the tolerance is relative, not in hertz");
-        const auto above = stagedAt (48000.0, 48000.0 * (1.0 + 2.0 * tol), false);
-        const auto below = stagedAt (48000.0, 48000.0 * (1.0 - 2.0 * tol), false);
-        test::ok (above.size() == ir.size() && above != ir && below.size() == ir.size() && below != ir,
-                  "twice the tolerance, both ways: resampled — same length, every tap moved");
+        test::ok (stagedAt (48000.0, 48000.0432, false) == ir && stagedAt (48000.0432, 48000.0, false) == ir,
+                  "0.9 ppm at 48 kHz (0.0432 Hz), both ways: verbatim");
+        test::ok (stagedAt (192000.0, 192000.096, false) == ir && stagedAt (192000.096, 192000.0, false) == ir,
+                  "0.5 ppm at 192 kHz (0.096 Hz), both ways: verbatim — relative, not in hertz");
+        const auto everyTapMoved = [&ir] (const std::vector<float>& taps)
+        {
+            bool moved = taps.size() == ir.size();
+            for (std::size_t i = 0; moved && i < ir.size(); ++i) moved = std::isfinite (taps[i]) && taps[i] != ir[i];
+            return moved;
+        };
+        test::ok (everyTapMoved (stagedAt (48000.0, 48000.0528, false)) && everyTapMoved (stagedAt (48000.0528, 48000.0, false)),
+                  "1.1 ppm at 48 kHz (0.0528 Hz), both ways: resampled — same length, every tap moved");
         float gain = 0.0f;
         const auto normalized = stagedAt (48000.0000001, 48000.0, true, &gain);
         bool scaled = normalized.size() == ir.size() && gain > 0.0f;
@@ -403,12 +410,14 @@ int main()
     test::group ("P67 — a load that stages nothing is ignored whole: the pending load survives it and plays");
     {
         const std::vector<float> first { 1.0f, 0.25f, 0.0f, 0.0f };
-        const std::vector<float> pendingLeft { 0.0f, 1.0f, 0.0f, 0.0f }, pendingRight { 0.0f, 0.0f, 0.5f, 0.0f };
-        enum class Nothing { zeroLength, refusedRate, negativeLength, nullArray, nullPlane };
-        const auto survives = [&] (bool stereoPending, Nothing nothing, const std::string& what)
+        const std::vector<float> pendingLeft { 0.0f, 0.25f, 0.0f, 0.0f }, pendingRight { 0.0f, 0.0f, 0.125f, 0.0f };
+        enum class Nothing { zeroLength, refusedRate, negativeLength, nullArray, nullPlane, nullSecondPlane };
+        // normalize=true gives the pending load a gain that is not 1, so a load that resets the gain on its way
+        // out is caught as well as one that touches the taps.
+        const auto survives = [&] (bool stereoPending, bool normalize, Nothing nothing, const std::string& what)
         {
             CabConvolver convolver;
-            felitronics::test::run (convolver.prepare (44100.0, 128, 2, 0.05, false));
+            felitronics::test::run (convolver.prepare (44100.0, 128, 2, 0.05, normalize));
             const float* a[1] { first.data() };
             convolver.loadIR (a, 1, (int) first.size(), 44100.0);
             float l[64] {}, r[64] {};
@@ -417,6 +426,8 @@ int main()
             const float* b[2] { pendingLeft.data(), pendingRight.data() };
             convolver.loadIR (b, stereoPending ? 2 : 1, 4, 44100.0);                   // rejected mid-fade -> pending
             const bool pendingBefore = convolver.hasPending();
+            const float gain = convolver.irNormalizationGain();
+            const float gainDb = convolver.irNormalizationGainDb();
 
             const std::vector<float> one { 0.8f };
             const float* c[1] { one.data() };
@@ -428,12 +439,20 @@ int main()
                 case Nothing::negativeLength: convolver.loadIR (c, 1, -1, 44100.0); break;
                 case Nothing::nullArray:      convolver.loadIR (nullptr, 1, 4, 44100.0); break;
                 case Nothing::nullPlane:      convolver.loadIR (nullPlane, 1, 4, 44100.0); break;
+                case Nothing::nullSecondPlane:
+                {
+                    const float* halfStereo[2] { one.data(), nullptr };
+                    convolver.loadIR (halfStereo, 2, 1, 44100.0);
+                    break;
+                }
             }
+            const auto scaledBy = [gain] (const std::vector<float>& v) { auto s = v; for (float& x : s) x *= gain; return s; };
             const auto& staged = convolver.stagedTaps();
-            const bool retained = pendingBefore && convolver.hasPending()
-                               && staged.size() == (stereoPending ? 2u : 1u) && staged[0] == pendingLeft
-                               && (! stereoPending || staged[1] == pendingRight);
-            test::ok (retained, what + ": the pending load and its staged taps are untouched");
+            const bool retained = pendingBefore && convolver.hasPending() && (normalize ? gain != 1.0f : gain == 1.0f)
+                               && staged.size() == (stereoPending ? 2u : 1u) && staged[0] == scaledBy (pendingLeft)
+                               && (! stereoPending || staged[1] == scaledBy (pendingRight))
+                               && convolver.irNormalizationGain() == gain && convolver.irNormalizationGainDb() == gainDb;
+            test::ok (retained, what + ": the pending load, its staged taps and its gain are untouched");
 
             pumpCrossfade (convolver);
             test::ok (convolver.flushPending() && ! convolver.hasPending(), what + ": its retry publishes");
@@ -445,12 +464,14 @@ int main()
             felitronics::test::run (convolver.process (render, 2, 8));
             bool plays = true;
             for (std::size_t i = 0; i < pendingLeft.size(); ++i)
-                plays = plays && left[i] == pendingLeft[i] && right[i] == (stereoPending ? pendingRight[i] : pendingLeft[i]);
+                plays = plays && left[i] == pendingLeft[i] * gain
+                              && right[i] == (stereoPending ? pendingRight[i] : pendingLeft[i]) * gain;
             test::ok (plays, what + ": and the pending IR is what plays");
         };
-        survives (false, Nothing::zeroLength,  "a zero-length load over a pending mono load");
-        survives (true,  Nothing::zeroLength,  "a zero-length MONO load over a pending STEREO load");
-        survives (false, Nothing::refusedRate, "a load at a rate resampleIr refuses (infinite)");
+        survives (false, false, Nothing::zeroLength,  "a zero-length load over a pending mono load");
+        survives (false, true,  Nothing::zeroLength,  "a zero-length load over a pending NORMALIZED load");
+        survives (true,  false, Nothing::zeroLength,  "a zero-length MONO load over a pending STEREO load");
+        survives (true,  true,  Nothing::refusedRate, "a load at a rate resampleIr refuses (infinite) over a pending normalized stereo load");
 
         // And the load that used to stage nothing — one tap at 96 kHz — now stages, so it is the LATEST and wins.
         {
@@ -482,9 +503,11 @@ int main()
                       "one tap at 96 kHz over a pending load stages as the latest, publishes, and is what plays");
         }
 
-        survives (false, Nothing::negativeLength, "a negative-length load over a pending load");
-        survives (false, Nothing::nullArray,      "a load with no channel array over a pending load");
-        survives (false, Nothing::nullPlane,      "a load with a null plane over a pending load");
+        survives (false, true,  Nothing::negativeLength, "a negative-length load over a pending load");
+        survives (false, false, Nothing::nullArray,      "a load with no channel array over a pending load");
+        survives (false, true,  Nothing::nullPlane,      "a load with a null plane over a pending load");
+        survives (true,  false, Nothing::nullPlane,      "a MONO load with a null plane over a pending STEREO load");
+        survives (false, true,  Nothing::nullSecondPlane, "a STEREO load whose second plane is null over a pending load");
     }
 
     return test::report();
