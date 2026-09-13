@@ -46,3 +46,6 @@ The optional compiled backends vendor third-party code (pffft, NeuralAmpModelerC
 nlohmann/json, namz) under permissive licences, recorded in `THIRD_PARTY_NOTICES.md`. Those are
 governed by their own terms and are unaffected by the policy above. New third-party dependencies
 are not added without review — see the watch-list at the bottom of that file.
+
+The Felitronics and Darwin's Cat names and logos are trademarks and are *not* covered by the code
+licence.
