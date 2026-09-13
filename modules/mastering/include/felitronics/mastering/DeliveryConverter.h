@@ -5,6 +5,7 @@
 
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DeliveryResampler.h>
+#include <felitronics/mastering/Planes.h>
 
 #include <algorithm>
 #include <climits>
@@ -139,14 +140,23 @@ public:
     // Convert a whole programme. `out` must hold exactly deliveredFrames(inFrames) frames per channel, and
     // `outFrames` must be that number — a caller that computed its own is refused, not trusted. Every call
     // starts from a reset, so two conversions of the same programme are bit-identical. No allocation.
+    //
+    // THE PLANES MUST BE `planesUsable` (Planes.h), each side at its own length, and a call that is not is refused
+    // before a sample is written. `out` is written at the delivery stride while `in` is still being read at the
+    // source one, so an output plane over an input plane overwrites programme not yet read wherever the writes run
+    // ahead of the reads, which the ratio and the offset between the planes decide: on the old check, which
+    // tested null planes only, the suite's witness (`testPlanes`) had `out[0] = in[1]` at 44.1 -> 48 kHz return true
+    // with channel 1 wrong in 25 990 of 52 245 frames — and the same call at 48 -> 44.1 came out right only because
+    // there the writes lag the reads, which is an accident of the ratio and not a contract. EQUAL RATES INCLUDED: an
+    // identity conversion with `in[c] == out[c]` copies the bits correctly in place, and is refused all the same — a
+    // rule that has to know the ratio to know whether an overlap is safe is one rule per ratio, and the delivered
+    // render in front of this class already refused it. An empty programme needs no planes.
     [[nodiscard]] bool convert (const float* const* in, int numChannels, long long inFrames,
                                 float* const* out, long long outFrames) noexcept
     {
         if (! prepared_ || numChannels != nch_ || inFrames < 0) return false;
         if (outFrames != deliveredFrames (inRate_, deliveryRate_, inFrames)) return false;
-        if (outFrames > 0 && (in == nullptr || out == nullptr)) return false;
-        for (int c = 0; c < numChannels && outFrames > 0; ++c)
-            if (in[c] == nullptr || out[c] == nullptr) return false;
+        if (outFrames > 0 && ! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
         nonFinite_ = 0;
         if (outFrames == 0) return true;
 

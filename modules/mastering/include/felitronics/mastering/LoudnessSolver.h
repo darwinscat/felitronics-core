@@ -8,6 +8,7 @@
 #include <felitronics/dynamics/offline/Quantile.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
+#include <felitronics/mastering/Planes.h>
 
 #include <algorithm>
 #include <cmath>
@@ -499,34 +500,6 @@ public:
     // rate (a converted one, say) checks it here; see `DeliveredMastering`.
     double sampleRate() const noexcept { return prepared_ ? fs_ : 0.0; }
 
-    // THE PLANES A SEARCH MAY READ AND WRITE: both tables and every plane in them non-null, and NO INPUT PLANE TOUCHING
-    // ANY OUTPUT PLANE — byte ranges, every pair, half-open. So planes edge to edge in one allocation are disjoint, a
-    // call shorter than its buffers is judged on the frames it uses, and one buffer feeding two INPUT channels is no
-    // conflict, because nothing writes it. One definition for the module: `solve()` asks it with one length for both
-    // sides, `DeliveredMastering` with a conversion's two. Two hand-written copies had already drifted apart — the
-    // solver's tested only `in[c] == out[c]` and no null plane, and let `out[0] = in[1]` through. What this does NOT
-    // judge is output planes against each other. It trusts `numChannels` — both callers have checked the width, and
-    // the tables are that long — and takes its arguments in `DeliveredMastering::planesUsable`'s order, so a
-    // forwarding call cannot swap the two lengths and still read right.
-    [[nodiscard]] static bool planesUsable (const float* const* in, float* const* out, int numChannels,
-                                            long long inFrames, long long outFrames) noexcept
-    {
-        if (in == nullptr || out == nullptr) return false;
-        const auto bytesIn  = (std::uint64_t) inFrames  * sizeof (float);
-        const auto bytesOut = (std::uint64_t) outFrames * sizeof (float);
-        for (int c = 0; c < numChannels; ++c)
-        {
-            if (in[c] == nullptr || out[c] == nullptr) return false;
-            for (int k = 0; k < numChannels; ++k)
-            {
-                const auto a = (std::uint64_t) reinterpret_cast<std::uintptr_t> (in[c]);
-                const auto b = (std::uint64_t) reinterpret_cast<std::uintptr_t> (out[k]);
-                if (a < b + bytesOut && b < a + bytesIn) return false;
-            }
-        }
-        return true;
-    }
-
     // EVERY VERDICT `solve()` REACHES BEFORE ITS FIRST PASS that does not look at the audio pointers: `NotPrepared`,
     // or `InvalidRequest` for a chain, a width, a length, a request, a rate or a tap geometry it will not search.
     // One definition, read by `solve()` itself — so a caller that has to spend memory BEFORE the search (a
@@ -621,11 +594,13 @@ public:
         // programme by 6.0 LU, and every number in the report describes a programme the caller does not
         // have. Refused rather than copied: the copy is the caller's memory to spend, and only the
         // caller knows whether it can.
-        // AND NOT ONLY CHANNEL AGAINST ITSELF: no output plane may touch ANY input plane (`planesUsable`). This
-        // used to test `in[c] == out[c]`, which let `out[0] = in[1]` through — the render writes channel 0's
-        // master where channel 1 is read next pass, and the call answered an ordinary verdict, at a plausible
-        // gain, over a master that is not the programme's (the suite's witness, testCrossChannelAliasingIsRefused).
-        // A NULL PLANE is refused by the same predicate; it used to reach the renderer and dereference it.
+        // AND NOT ONLY CHANNEL AGAINST ITSELF: no output plane may touch ANY input plane, nor another output plane
+        // (`planesUsable`, Planes.h). This used to test `in[c] == out[c]`, which let `out[0] = in[1]` through — the
+        // render writes channel 0's master where channel 1 is read next pass, and the call answered an ordinary
+        // verdict, at a plausible gain, over a master that is not the programme's — and `out[0] = out[1]`, where the
+        // second channel's render overwrites the first and the search meters one channel twice (the suite's
+        // witnesses, testCrossChannelAliasingIsRefused). A NULL PLANE is refused by the same predicate; it used to
+        // reach the renderer and dereference it.
         if (! planesUsable (in, out, numChannels, frames, frames))
             { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
 

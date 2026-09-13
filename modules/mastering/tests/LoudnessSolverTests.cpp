@@ -1279,12 +1279,13 @@ void testTheReviewsCounterexamples()
 // =============================================================================================
 // P64. The solver refused `in[c] == out[c]` and nothing else, so `out[0] = in[1]` was accepted: the render wrote
 // channel 0's master where the NEXT pass reads channel 1, and the call answered with an ordinary verdict over a master
-// that is not the programme's. The witness below is the call that did that; against the old check it prints how far
-// the answer it got is from the honest one. What must stay legal is pinned beside it, against a solve on disjoint
-// buffers, bit for bit — a refusal that grew past overlap would fail there, not here.
+// that is not the programme's — and so was `out[0] = out[1]`, the second channel's render alone where two were asked
+// for. The witnesses below are those calls; against the old check they print what they answered. What must stay legal
+// is pinned beside them, against a solve on disjoint buffers, bit for bit — a refusal that grew past overlap would fail
+// there, not here.
 void testCrossChannelAliasingIsRefused()
 {
-    test::group ("an output plane touching ANOTHER channel's input plane is refused; what never overlaps is not");
+    test::group ("an output plane touching any input plane or another output plane is refused; what never overlaps is not");
     Programme src = makeMusic (3.0, 0.2);
     const int F = src.frames();
     const auto Fz = (std::size_t) F;
@@ -1339,6 +1340,35 @@ void testCrossChannelAliasingIsRefused()
         float* out[2] = { C.data(), A.data() };
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, out, 2, F, req);
         test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0, "out[1] = in[0] is refused");
+    }
+
+    // (2b) TWO OUTPUT PLANES ON ONE BUFFER. No input is touched, and the render still cannot be right: channel 1 is
+    //      written over channel 0, the search meters channel 1 twice and steers on that, and the caller gets one
+    //      channel's master where two were asked for. Against the old check it prints what it answered.
+    {
+        std::vector<float> A = src.ch[0], B = src.ch[1], C (Fz, kSentinel);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in[2] = { A.data(), B.data() };
+        float* same[2] = { C.data(), C.data() };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, same, 2, F, req);
+        if (sol.status != MasteringSolveStatus::InvalidRequest)
+        {
+            std::size_t notCh0 = 0;
+            for (std::size_t i = 0; i < Fz; ++i) notCh0 += (C[i] != h0[i]) ? 1u : 0u;
+            std::printf ("      out[0] = out[1] was ANSWERED: status %s, gain %.4f dB (honest %.4f), reported %.3f LUFS"
+                         " (honest %.3f); the buffer differs from the honest channel-0 master in %zu of %d frames\n",
+                         statusName (sol.status), sol.preLimiterGainDb, honest.preLimiterGainDb,
+                         sol.measured.integratedLufs, honest.measured.integratedLufs, notCh0, F);
+        }
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0
+                  && std::all_of (C.begin(), C.end(), [&] (float v) { return v == kSentinel; }),
+                  "out[0] = out[1] is refused before a render, writing nothing");
+        // ...and the two output planes one frame apart, so they share all but a frame.
+        std::vector<float> pool (Fz + 1, kSentinel);
+        float* shifted[2] = { pool.data(), pool.data() + 1 };
+        const auto sol2 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, shifted, 2, F, req);
+        test::ok (sol2.status == MasteringSolveStatus::InvalidRequest && sol2.passes == 0,
+                  "and so are two output planes one frame apart");
     }
 
     // (3) An output plane that STARTS INSIDE another channel's input, one frame in: no pointer is shared, the bytes are.
@@ -1434,10 +1464,14 @@ void testCrossChannelAliasingIsRefused()
         float input8[8][3] {}; float output8[8][2] {};
         const float* in8[8] {}; float* out8[8] {};
         for (int c = 0; c < 8; ++c) { in8[c] = input8[c]; out8[c] = output8[c]; }
-        test::ok (TargetLoudnessSolver::planesUsable (in8, out8, 8, 2, 2), "eight disjoint channels are usable");
+        test::ok (planesUsable (in8, out8, 8, 2, 2), "eight disjoint channels are usable");
         out8[7] = input8[7] + 1;
-        test::ok (! TargetLoudnessSolver::planesUsable (in8, out8, 8, 2, 2),
+        test::ok (! planesUsable (in8, out8, 8, 2, 2),
                   "and eight whose last pair alone overlaps, by one float, are not");
+        out8[7] = output8[7];
+        out8[7] = out8[6] + 1;
+        test::ok (! planesUsable (in8, out8, 8, 2, 2),
+                  "and eight whose last two OUTPUT planes alone overlap, by one float, are not");
     }
 
     // (7) A NULL PLANE beside good ones. The old check caught it only by accident, where the same channel's output was

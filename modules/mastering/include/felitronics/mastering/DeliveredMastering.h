@@ -125,14 +125,16 @@ public:
     std::uint64_t nonFiniteInputSamples() const noexcept { return nonFinite_; }
 
     // A render at the parameters the chain already holds. `out` must be exactly `deliveredFrames(inFrames)`
-    // frames per channel and `outFrames` that number; `in` and `out` must not overlap. No allocation.
+    // frames per channel and `outFrames` that number; the planes must be `planesUsable` (Planes.h) — the conversion
+    // writes `out` while it still reads `in`, at another stride, and the render then runs in place over `out`. No
+    // allocation.
     [[nodiscard]] bool render (MasteringChain& chain, OfflineRenderer& renderer,
                                const float* const* in, int numChannels, long long inFrames,
                                float* const* out, long long outFrames) noexcept
     {
         if (! admits (chain, numChannels, inFrames, outFrames)) return false;
         if (renderer.blockSize() < 1 || numChannels > renderer.maxChannels()) return false;
-        if (! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
+        if (outFrames > 0 && ! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
         if (! conv_.convert (in, numChannels, inFrames, out, outFrames)) return false;
         nonFinite_ = conv_.nonFiniteInputSamples();
         const float* ro[core::kMaxChannels] {};
@@ -159,6 +161,9 @@ public:
             return solver.solve (chain, renderer, params, in, out, numChannels, 0, req);
         // THE SOLVER'S OWN VERDICT, ASKED BEFORE A BYTE IS SPENT. Its words, its order, one definition.
         if (! solver.admits (chain, renderer, numChannels, (int) outFrames, req, refused.status)) return refused;
+        // The planes, at the CALLER's two lengths — not left to the solver, which sees the converted programme and
+        // never the caller's input. (At equal rates the search reads `in` directly on every pass, so an overlap there
+        // would read its own master.)
         if (! planesUsable (in, out, numChannels, inFrames, outFrames))
             { refused.status = MasteringSolveStatus::InvalidRequest; return refused; }
 
@@ -205,18 +210,6 @@ private:
         // programme at the wrong speed and every number it reported would still look like a measurement.
         return chain.isPrepared() && chain.numChannels() == numChannels
             && std::fabs (chain.sampleRate() - deliveryRate_) < 1.0e-9;
-    }
-
-    // Non-null planes, and no input plane touching any output plane. The conversion writes `out` while it still
-    // reads `in` — at different strides — so an overlap is not an optimisation to allow but a programme that
-    // overwrites the part of itself not yet read. (At equal rates the search reads `in` directly on every pass,
-    // so there it would read its own master.) The rule is the solver's, `TargetLoudnessSolver::planesUsable` — one
-    // definition; what stays here is this class's own policy for an empty programme.
-    static bool planesUsable (const float* const* in, float* const* out, int numChannels,
-                              long long inFrames, long long outFrames) noexcept
-    {
-        if (outFrames == 0) return true;
-        return TargetLoudnessSolver::planesUsable (in, out, numChannels, inFrames, outFrames);
     }
 
     // The programme at the delivery rate, in `src`. At equal rates that is the caller's own input, read in place.

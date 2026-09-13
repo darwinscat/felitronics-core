@@ -9,8 +9,11 @@
 #include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics_test.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -167,10 +170,130 @@ static void testConvert()
         }
 }
 
+// P64. `convert` checked its planes for null and nothing else, and it writes `out` at the delivery stride while still
+// reading `in` at the source one. So an output plane over an input plane was accepted, and upsampling — where the
+// writes run AHEAD of the reads — overwrote programme not yet read. Every layout here against the same conversion
+// into buffers of its own, bit for bit; each of the two lengths used for its own side, in both directions of the
+// ratio, because a rule judged at one length misses an overlap that lies only in the longer span.
+static void testPlanes()
+{
+    group ("planes: an output over any input or another output is refused, each side at its own length");
+    const long long N = 48000;
+    for (const auto& pr : { std::pair<double, double> { 44100.0, 48000.0 }, { 48000.0, 44100.0 } })
+    {
+        const bool up = pr.second > pr.first;
+        const long long D = DeliveryConverter::deliveredFrames (pr.first, pr.second, N);
+        const auto Nz = (std::size_t) N, Dz = (std::size_t) D, M = std::max (Nz, Dz);
+        Planar src (2, N);
+        for (long long i = 0; i < N; ++i)
+        {
+            src.ch[0][(std::size_t) i] = (float) (0.3 * std::sin (0.01 * (double) i));
+            src.ch[1][(std::size_t) i] = (float) (0.3 * std::sin (0.037 * (double) i));
+        }
+        Planar honest (2, D);
+        ok (convertWith (pr.first, pr.second, src, N, honest, D, 4096), up ? "up: the honest conversion" : "down: the honest conversion");
+
+        DeliveryConverter dc;
+        if (! dc.prepare (pr.first, pr.second, 2, 4096)) { ok (false, "prepared"); continue; }
+        const auto same = [] (const float* a, const float* b, std::size_t n) { return std::memcmp (a, b, n * sizeof (float)) == 0; };
+
+        // (1) THE WITNESS: out[0] IS in[1], its buffer long enough for either length.
+        {
+            std::vector<float> A = src.ch[0], B (M, 0.25f), C (Dz, 0.25f);
+            std::copy (src.ch[1].begin(), src.ch[1].end(), B.begin());
+            const std::vector<float> B0 = B, C0 = C;
+            const float* in[2] = { A.data(), B.data() };
+            float* out[2] = { B.data(), C.data() };
+            const bool accepted = dc.convert (in, 2, N, out, D);
+            if (accepted)
+            {
+                long long wrong = 0;
+                for (std::size_t i = 0; i < Dz; ++i) wrong += (C[i] != honest.ch[1][i]) ? 1 : 0;
+                std::printf ("      %s: out[0] = in[1] was ACCEPTED; channel 1 differs from the honest conversion in %lld of %lld frames\n",
+                             up ? "up" : "down", wrong, D);
+            }
+            ok (! accepted && B == B0 && C == C0, "out[0] = in[1] is refused, and nothing is written");
+        }
+
+        // (2) THE LONGER SIDE ONLY. Upsampling, the output is the longer plane: it starts N frames before an input
+        //     plane and reaches into it. Downsampling, the input is: an output plane starts D frames into it. At the
+        //     SHORTER length both would look disjoint.
+        {
+            std::vector<float> pool (Nz + Dz + M, 0.25f), other (M, 0.25f), spare (Dz, 0.25f);
+            const float* in[2] {};
+            float* out[2] {};
+            if (up)
+            {
+                std::copy (src.ch[1].begin(), src.ch[1].end(), pool.begin() + (std::ptrdiff_t) Nz);
+                std::copy (src.ch[0].begin(), src.ch[0].end(), other.begin());
+                in[0] = other.data(); in[1] = pool.data() + Nz;
+                out[0] = pool.data(); out[1] = spare.data();                 // [0, D) reaches into [N, 2N)
+            }
+            else
+            {
+                std::copy (src.ch[0].begin(), src.ch[0].end(), pool.begin());
+                std::copy (src.ch[1].begin(), src.ch[1].end(), other.begin());
+                in[0] = pool.data(); in[1] = other.data();
+                out[0] = pool.data() + Nz + Dz; out[1] = pool.data() + Dz;   // [D, 2D) starts inside [0, N)
+            }
+            const std::vector<float> pool0 = pool;
+            ok (! dc.convert (in, 2, N, out, D) && pool == pool0,
+                up ? "up: an output plane reaching an input only past N frames is refused"
+                   : "down: an output plane starting inside an input only past D frames is refused");
+        }
+
+        // (3) LEGAL: all four planes edge to edge in one allocation, each at its own length — which a rule judged at
+        //     the LONGER length for both would refuse.
+        {
+            std::vector<float> pool (2 * Nz + 2 * Dz, 0.25f);
+            std::copy (src.ch[0].begin(), src.ch[0].end(), pool.begin());
+            std::copy (src.ch[1].begin(), src.ch[1].end(), pool.begin() + (std::ptrdiff_t) (Nz + Dz));
+            const float* in[2] = { pool.data(), pool.data() + Nz + Dz };
+            float* out[2] = { pool.data() + Nz, pool.data() + 2 * Nz + Dz };
+            ok (dc.convert (in, 2, N, out, D) && same (out[0], honest.ch[0].data(), Dz) && same (out[1], honest.ch[1].data(), Dz),
+                "planes edge to edge at their own lengths convert, bit-identical to buffers of their own");
+        }
+
+        // (3b) LEGAL: the two OUTPUT planes edge to edge, at the output length. Downsampling, the input length is the
+        //      longer one, and outputs judged at it would overlap where they do not — a case the separate buffers
+        //      above leave to wherever the allocator put them (the mutation stand).
+        {
+            std::vector<float> pool (2 * Dz, 0.25f);
+            const float* in[2] = { src.ch[0].data(), src.ch[1].data() };
+            float* out[2] = { pool.data(), pool.data() + Dz };
+            ok (dc.convert (in, 2, N, out, D) && same (out[0], honest.ch[0].data(), Dz) && same (out[1], honest.ch[1].data(), Dz),
+                "two output planes edge to edge convert, bit-identical to buffers of their own");
+        }
+
+        // (4) Two OUTPUT planes one frame apart: every frame the conversion writes lands on a sample of the other plane.
+        {
+            std::vector<float> pool (Dz + 1, 0.25f);
+            const std::vector<float> pool0 = pool;
+            const float* in[2] = { src.ch[0].data(), src.ch[1].data() };
+            float* out[2] = { pool.data(), pool.data() + 1 };
+            ok (! dc.convert (in, 2, N, out, D) && pool == pool0, "two output planes one frame apart are refused");
+        }
+
+        // (4b) Upsampling, two OUTPUT planes N frames apart: they share the last D − N frames, and only the output
+        //      length sees it — outputs judged at the shorter of the two lengths passed every line above (the review
+        //      round, by mutation).
+        if (up)
+        {
+            std::vector<float> pool (Nz + Dz, 0.25f);
+            const std::vector<float> pool0 = pool;
+            const float* in[2] = { src.ch[0].data(), src.ch[1].data() };
+            float* out[2] = { pool.data(), pool.data() + Nz };
+            ok (! dc.convert (in, 2, N, out, D) && pool == pool0,
+                "up: two output planes N frames apart, sharing only the frames past N, are refused");
+        }
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::DeliveryConverter — SRC first, whole programme\n");
     testLength();
     testConvert();
+    testPlanes();
     return felitronics::test::report();
 }
