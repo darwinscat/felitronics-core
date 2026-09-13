@@ -434,6 +434,19 @@ static void testRefusalsWriteAndAllocateNothing()
         const std::vector<float> crossBefore = cross;
         ok (! dm.render (chain, r, ipx, kNch, n, opx, d) && cross == crossBefore,
             "an output plane over ANOTHER channel's input: refused, nothing written");
+
+        // UPSAMPLING: these spans overlap only beyond the first `inFrames` of the longer output plane.
+        std::vector<float> longStride ((std::size_t) (10 * n), 0.125f);
+        const float* ipl[core::kMaxChannels] { longStride.data() + n + 1, longStride.data() + 4 * n + 4 };
+        float* opl[core::kMaxChannels] { longStride.data(), longStride.data() + 7 * n + 8 };
+        std::copy (in.begin(), in.begin() + n, const_cast<float*> (ipl[0]));
+        std::copy (in.begin() + n, in.end(), const_cast<float*> (ipl[1]));
+        const std::vector<float> longBefore = longStride;
+        ok (! dm.render (chain, r, ipl, kNch, n, opl, d) && longStride == longBefore,
+            "render: overlap only in the longer output stride is refused, nothing written");
+        const auto longSol = dm.solve (s, chain, r, params, ipl, kNch, n, opl, d, req);
+        ok (longSol.status == MasteringSolveStatus::InvalidRequest && longSol.passes == 0 && longStride == longBefore,
+            "solve: the same longer-stride overlap is InvalidRequest before a render");
     }
 
     // EQUAL RATES read the input in place, so a null input must be refused before it is read.

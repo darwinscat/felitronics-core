@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -672,6 +673,61 @@ int main()
         ok (fc_solution_log (sol, nullptr, 4, &written) == FC_ERR_NULL, "a null buffer with a non-zero capacity");
         ok (fc_solution_log (sol, log.data(), 0, &written) == FC_OK && written == 0,
             "asking for nothing is not an error");
+
+        // P65 — `written` MAY NOT POINT INTO THE RECORDS. It used to be cleared on entry and set after the copy, so a
+        // `written` inside the `cap` records took the count over one of them on FC_OK, and a zero on a refusal. At the
+        // boundary, both sides: the first and the last four bytes the span covers are refused, the four right after it
+        // and right before it are not.
+        {
+            const std::uint32_t cap = (std::uint32_t) sum.logCount;
+            ok (cap >= 2, "PRECONDITION: a log of two records or more, so the first and the last are different ones");
+            std::vector<fc_solve_pass> buf ((std::size_t) cap + 2);
+            const std::size_t total = buf.size() * sizeof (fc_solve_pass), span = (std::size_t) cap * sizeof (fc_solve_pass);
+            std::memset (buf.data(), 0xA5, total);
+            const std::vector<fc_solve_pass> pristine = buf;
+            const auto unmoved = [&] { return std::memcmp (buf.data(), pristine.data(), total) == 0; };
+            fc_solve_pass* const rec = buf.data() + 1;                 // one record of room on each side
+            const auto at = [&] (std::ptrdiff_t byte)
+            { return reinterpret_cast<std::uint32_t*> (reinterpret_cast<unsigned char*> (rec) + byte); };
+
+            ok (fc_solution_log (sol, rec, cap, at (0)) == FC_ERR_SPAN && unmoved(),
+                "`written` on the first record's first four bytes is refused, and nothing in the buffer moves");
+            ok (fc_solution_log (sol, rec, cap, at ((std::ptrdiff_t) span - 4)) == FC_ERR_SPAN && unmoved(),
+                "and on the last record's last four bytes");
+            // THE WHOLE CAPACITY, not the records the log fills: one record more than logCount, `written` on its
+            // `violated`. A check over the `n` records actually copied passed every line above and wrote the count here
+            // (the code-review round, by mutation) — a refusal that would depend on how many renders the search took.
+            ok (fc_solution_log (sol, rec, cap + 1, at ((std::ptrdiff_t) span + (std::ptrdiff_t) offsetof (fc_solve_pass, violated)))
+                    == FC_ERR_SPAN && unmoved(),
+                "and inside capacity the log does not fill");
+
+            // The same fill, because the copy is field by field: a record's four bytes of tail padding are not written.
+            std::vector<fc_solve_pass> want (cap);
+            std::memset (want.data(), 0xA5, span);
+            std::uint32_t wn = 0;
+            ok (fc_solution_log (sol, want.data(), cap, &wn) == FC_OK && wn == cap, "the log, read into a buffer of its own");
+            std::memcpy (buf.data(), pristine.data(), total);   // each check on a clean buffer, whatever the last one did
+            ok (fc_solution_log (sol, rec, cap, at ((std::ptrdiff_t) span)) == FC_OK && *at ((std::ptrdiff_t) span) == cap
+                && std::memcmp (rec, want.data(), span) == 0,
+                "`written` right AFTER the records is legal: FC_OK, the count, and every record whole");
+            std::memcpy (buf.data(), pristine.data(), total);
+            ok (fc_solution_log (sol, rec, cap, at (-4)) == FC_OK && *at (-4) == cap
+                && std::memcmp (rec, want.data(), span) == 0,
+                "and right BEFORE them");
+
+            // No span is named by cap == 0, so there is nothing for `written` to alias.
+            std::memcpy (buf.data(), pristine.data(), total);
+            ok (fc_solution_log (sol, rec, 0, at (0)) == FC_OK && *at (0) == 0u,
+                "cap == 0 names no span: `written` anywhere is FC_OK and a zero");
+
+            // A refused call leaves `written` as it was — it is cleared only once every check is behind the call.
+            std::uint32_t kept = 777u;
+            ok (fc_solution_log (sol, nullptr, 4, &kept) == FC_ERR_NULL && kept == 777u,
+                "a refusal for a null buffer leaves `written` untouched");
+            auto* const misaligned = reinterpret_cast<fc_solve_pass*> (reinterpret_cast<unsigned char*> (rec) + 4);
+            ok (fc_solution_log (sol, misaligned, 1, &kept) == FC_ERR_ALIGNMENT && kept == 777u,
+                "and so does one for alignment");
+        }
         fc_solution_destroy (sol);
 
         // A search reads its input again on every pass, so rendering in place would make every pass after
@@ -680,6 +736,58 @@ int main()
             "solving IN PLACE is refused");
         ok (fc_master_solve (h, &p, &req, in.data(), in.data() + 4, (std::uint32_t) 64, &sol) == FC_ERR_SPAN,
             "and so is a partial overlap");
+
+        // P64 — THE CORE REFUSES WHAT THE FACADE REFUSES. Output channel 0 laid over input channel 1 is, planar, `out =
+        // in + frames`: the facade refuses it on its span check. The core used to refuse only a channel against itself,
+        // and answered this call with a master read from its own previous pass — a direct C++ caller had a road the
+        // facade exists to close. The same buffer through both, then the layout one plane further on through both.
+        {
+            using namespace felitronics::mastering;
+            const std::size_t F = (std::size_t) kFs;
+            const auto t = tone (F, kNch);
+            std::vector<float> pool (4 * F, 0.25f);
+            std::copy (t.begin(), t.end(), pool.begin());
+            const std::vector<float> pristine = pool;
+            const auto unmoved = [&] { return std::memcmp (pool.data(), pristine.data(), pool.size() * sizeof (float)) == 0; };
+
+            fc_solution held = 0xABCDu;
+            ok (fc_master_solve (h, &p, &req, pool.data(), pool.data() + F, (std::uint32_t) F, &held) == FC_ERR_SPAN
+                && held == 0xABCDu && unmoved(),
+                "the facade refuses output channel 0 over input channel 1, writing nothing");
+
+            MasteringChain chain;
+            OfflineRenderer rend;
+            TargetLoudnessSolver solver;
+            const bool prepared = rend.prepare (kNch, 4096) && chain.prepare (kFs, kNch, MasteringChainConfig {})
+                               && solver.prepare (kFs, kNch, rend.blockSize(), chain.internalBlock(),
+                                                  chain.tapOversampleFactor());
+            ok (prepared, "the direct C++ search is prepared");
+            if (prepared)
+            {
+                LoudnessRequest lr {};
+                lr.targetLufs = req.targetLufs; lr.maxTruePeakDbTp = req.maxTruePeakDbTp; lr.maxPasses = req.maxPasses;
+                const float* ip[2] { pool.data(), pool.data() + F };
+                float*       op[2] { pool.data() + F, pool.data() + 2 * F };
+                const LoudnessSolution direct = solver.solve (chain, rend, MasteringChainParams {}, ip, op, kNch, (int) F, lr);
+                ok (direct.status == MasteringSolveStatus::InvalidRequest && direct.passes == 0 && unmoved(),
+                    "and the core refuses the SAME call, before a render, writing nothing");
+
+                // One plane further on the two spans are edge to edge: legal through both, and neither calls it a refusal.
+                fc_solution sol2 = 0;
+                ok (fc_master_solve (h, &p, &req, pool.data(), pool.data() + 2 * F, (std::uint32_t) F, &sol2) == FC_OK,
+                    "the facade accepts output right after input");
+                fc_solution_summary s2 {}; FC_INIT (s2);
+                ok (fc_solution_summary_get (sol2, &s2) == FC_OK && s2.status != FC_SOLVE_INVALID_REQUEST,
+                    "with a verdict that is not a refusal");
+                fc_solution_destroy (sol2);
+                std::memcpy (pool.data(), pristine.data(), pool.size() * sizeof (float));
+                const float* ip2[2] { pool.data(), pool.data() + F };
+                float*       op2[2] { pool.data() + 2 * F, pool.data() + 3 * F };
+                const LoudnessSolution direct2 = solver.solve (chain, rend, MasteringChainParams {}, ip2, op2, kNch, (int) F, lr);
+                ok (direct2.status != MasteringSolveStatus::InvalidRequest && direct2.passes > 0,
+                    "and so does the core");
+            }
+        }
         fc_master_destroy (h);
     }
 

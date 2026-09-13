@@ -210,25 +210,13 @@ private:
     // Non-null planes, and no input plane touching any output plane. The conversion writes `out` while it still
     // reads `in` — at different strides — so an overlap is not an optimisation to allow but a programme that
     // overwrites the part of itself not yet read. (At equal rates the search reads `in` directly on every pass,
-    // so there it would read its own master.)
+    // so there it would read its own master.) The rule is the solver's, `TargetLoudnessSolver::planesUsable` — one
+    // definition; what stays here is this class's own policy for an empty programme.
     static bool planesUsable (const float* const* in, float* const* out, int numChannels,
                               long long inFrames, long long outFrames) noexcept
     {
         if (outFrames == 0) return true;
-        if (in == nullptr || out == nullptr) return false;
-        const auto bytesIn  = (std::uint64_t) inFrames  * sizeof (float);
-        const auto bytesOut = (std::uint64_t) outFrames * sizeof (float);
-        for (int c = 0; c < numChannels; ++c)
-        {
-            if (in[c] == nullptr || out[c] == nullptr) return false;
-            for (int k = 0; k < numChannels; ++k)
-            {
-                const auto a = (std::uint64_t) reinterpret_cast<std::uintptr_t> (in[c]);
-                const auto b = (std::uint64_t) reinterpret_cast<std::uintptr_t> (out[k]);
-                if (a < b + bytesOut && b < a + bytesIn) return false;
-            }
-        }
-        return true;
+        return TargetLoudnessSolver::planesUsable (in, out, numChannels, inFrames, outFrames);
     }
 
     // The programme at the delivery rate, in `src`. At equal rates that is the caller's own input, read in place.
