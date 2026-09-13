@@ -28,9 +28,25 @@
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
+// BYTES as the CONTAINER asked for them, which is what storageFor() states. MSVC's STL on x86/x64 asks operator new for
+// sizeof(void*) + 31 more (one word more under _DEBUG) on a block of 4096 bytes or more, to align it by hand; that pad is
+// the allocator's, so it is taken back off here — the LoudnessConformanceTests counter, where it is explained in full.
+#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
+#  if defined(_DEBUG)
+static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
+#  else
+static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
+#  endif
+#else
+static constexpr std::size_t kStlBigPad = 0;
+#endif
 static std::atomic<long long> g_bytes { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add ((long long) s); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add ((long long) s); return std::malloc (s ? s : 1); }
+static long long containerBytes (std::size_t s) noexcept
+{
+    return (long long) (kStlBigPad != 0 && s >= 4096 + kStlBigPad ? s - kStlBigPad : s);
+}
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
@@ -898,10 +914,13 @@ int main()
         const long long b0 = g_bytes.load();
         const long al0 = g_allocs.load();
         test::run (d.prepare (sr, 512, 3));
+        // both deltas are read into locals BEFORE the check: the message is a std::string that allocates, and gcc
+        // builds a call's arguments in its own order — reading the counter inside the call counts the message too
         const long long used = g_bytes.load() - b0;
+        const long blocks = g_allocs.load() - al0;
         const auto st = CD::storageFor (sr, 3, 5000);
-        test::ok (st.ok && (long long) st.bytes() == used && g_allocs.load() - al0 == 4, "prepare() requested exactly storageFor().bytes() in four blocks ("
-                  + std::to_string (used) + " bytes)");
+        test::ok (st.ok && (long long) st.bytes() == used && blocks == 4, "prepare() requested exactly storageFor().bytes() in four blocks ("
+                  + std::to_string (used) + " bytes, " + std::to_string (blocks) + " blocks)");
         test::ok (! CD::storageFor (500.0, 3, 10).ok && ! CD::storageFor (sr, 0, 10).ok && ! CD::storageFor (sr, 3, -1).ok && CD::storageFor (sr, 3, 0).ok,
                   "storageFor() refuses exactly what prepare() refuses");
         const float* io[3] { a.data(), a.data(), a.data() };
@@ -910,7 +929,8 @@ int main()
         (void) d.process (nullptr, 0, 5000);
         d.finish();
         d.reset();
-        test::okNoAlloc (g_allocs.load() == before, "no allocation in process / clock-only / finish / reset");
+        const bool noAlloc = g_allocs.load() == before;                  // read before the message string exists
+        test::okNoAlloc (noAlloc, "no allocation in process / clock-only / finish / reset");
     }
 
     // ---------------------------------------------------------------------------------------------- what it does not see

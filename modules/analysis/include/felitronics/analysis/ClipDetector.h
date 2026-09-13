@@ -399,7 +399,7 @@ private:
                 const double d = std::fabs ((double) x - (double) ch.last);
                 if (d > 0.0 && d < ch.minStep) ch.minStep = d;
             }
-            if (x != 0.0f)
+            if (! core::exactlyEqual (x, 0.0f))
             {
                 const int k = gridExponent (x);
                 if (k > ch.latticeK)
