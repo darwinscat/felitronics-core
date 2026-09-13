@@ -60,6 +60,18 @@ MASTER_INC=(-I"$ROOT/tools"
 # elsewhere), which breaks determinism between MACHINES, not merely between tiers.
 NUMERIC=(-ffp-contract=off -fno-fast-math)
 
+SRC="$HERE/fc_probe.cpp"
+
+# The whitelist, read from the source — the fc_master rule below, applied here too since P59a added a dozen entry
+# points to this file: a name missing from -sEXPORTED_FUNCTIONS is dead-stripped and a page finds it `undefined`
+# at the moment it needs it. Floor, not count: 12 P0 entry points + 13 for the waveform peaks and stereo band.
+PEXPORTS=$(grep -oE 'FC_EXPORT[[:space:]]+(int|double|std::uint32_t)[[:space:]]+fc_probe_[a-z0-9_]+' "$SRC" \
+           | awk '{print "_" $NF}' | sort -u | paste -sd, -)
+PEXPORTS="$PEXPORTS,_malloc,_free"
+echo "--- fc_probe exports: $(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ') symbols"
+[ "$(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ')" -ge 27 ] \
+    || { echo "*** the export list did not come out of $SRC — refusing to link a module with no ABI"; exit 1; }
+
 COMMON=(-std=c++20 -fno-exceptions -fno-rtti "${NUMERIC[@]}" "${INC[@]}"
         --no-entry
         -sMODULARIZE=1
@@ -67,12 +79,10 @@ COMMON=(-std=c++20 -fno-exceptions -fno-rtti "${NUMERIC[@]}" "${INC[@]}"
         -sALLOW_MEMORY_GROWTH=1
         -sFILESYSTEM=0
         -sMALLOC=emmalloc
-        "-sEXPORTED_FUNCTIONS=['_fc_probe_run','_fc_probe_lufs','_fc_probe_dbtp','_fc_probe_tp_linear','_fc_probe_sample_peak','_fc_probe_block_count','_fc_probe_block_energies','_fc_probe_dropped','_fc_probe_os_factor','_fc_probe_os_taps','_fc_probe_chunk','_fc_probe_sizeof_longdouble','_malloc','_free']"
+        "-sEXPORTED_FUNCTIONS=[$PEXPORTS]"
         "-sEXPORTED_RUNTIME_METHODS=['HEAPF32','HEAPF64']")
         # _malloc/_free and the HEAP views are OPT-IN in emscripten 6.x — without these two lines
         # Module._malloc and Module.HEAPF32 are simply `undefined` and the page dies on first use.
-
-SRC="$HERE/fc_probe.cpp"
 
 echo "--- web (the P0 artifact)"
 em++ "${COMMON[@]}" -O3 -sENVIRONMENT=web,worker "$SRC" -o "$OUT/fcprobe.web.js"

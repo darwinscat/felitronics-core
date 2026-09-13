@@ -131,7 +131,8 @@ jobs:
   #   long double ON AN EMITTED PATH  -> caught from the ARTIFACT: on wasm32 the type is software binary128,
   #                                      so every operation is a compiler-rt libcall (__addtf3, __multf3, …)
   #                                      standing in the object file as an undefined symbol. Measured: the
-  #                                      tier's 83 objects yield exactly one hit, the sanctioned one.
+  #                                      tier's objects yield no hit, with no exclusion (the one sanctioned
+  #                                      use, fcore_measure's correlation accumulator, is binary64 since P59a).
   #   long double in code NEVER emitted -> the text lint. Same split as the thread wrap and the header lint.
   #
   # ubuntu, NOT macos, and for the parity step that is load-bearing: Apple's libm and musl (what emscripten
@@ -180,8 +181,9 @@ jobs:
         # libcall — `__addtf3`, `__multf3`, `__trunctfdf2` — and shows up as an UNDEFINED SYMBOL in the
         # object file. Measured on emsdk 6.0.9: an accumulate in `long double` emits them, `sizeof(long
         # double)` alone emits nothing (correctly — naming the type is not using it), plain `double` emits
-        # nothing. Across the tier's 83 objects exactly ONE matches: fcore_measure.cpp.o, the native-only
-        # correlation accumulator law 9 sanctions by name. Zero false positives, one named exclusion.
+        # nothing. The tier's objects match NOTHING, and nothing is excluded: the one named exclusion this step
+        # used to carry — fcore_measure.cpp.o's `long double` correlation accumulator — became the stereo band's
+        # binary64 formula in P59a, so the gate now covers that file too.
         #
         # It pairs with the text lint below exactly as `--wrap=pthread_create` pairs with the header lint:
         # this one reads EMITTED code, so no comment can fool it and a type reached through a macro or an
@@ -189,11 +191,10 @@ jobs:
         # inline), which is precisely what the text lint covers.
         run: |
           NM="$EMSDK/upstream/bin/llvm-nm"
-          if find build-wasm-audio -name '*.o' ! -name 'fcore_measure.cpp.o' -print0 \
+          if find build-wasm-audio -name '*.o' -print0 \
              | xargs -0 "$NM" --undefined-only --print-file-name \
              | grep -E ' U (__(add|sub|mul|div|neg|extend[sd]f|trunc|fix|float|eq|ne|lt|le|gt|ge|unord)tf[0-9a-z]*|(sqrt|pow|exp|log|sin|cos|tan|fabs|floor|ceil|fmod|hypot|fma)l)$'; then
             echo "^^ a wasm32 long double operation is a compiler-rt libcall — DSP-ARCHITECTURE.md §2 law 9."
-            echo "   The one sanctioned use is tools/fcore_measure.cpp's native-only correlation accumulator."
             exit 1
           fi
           echo "no long double arithmetic in any emitted object of the tier"
@@ -289,6 +290,41 @@ jobs:
           diff native.txt wasm.txt
           diff native.txt wasm-checked.txt
           echo "bit-identical: $(sed -n 's/^blocks //p' native.txt) block energies + true peak + sample peak"
+      - name: NULL test — waveform peaks, stereo band and needle, native vs wasm, bit-exact
+        # P59a: the page's waveform and stereo pictures and the sidecars that stand in for them now come from one
+        # definition (analysis::WaveformPeaks / StereoColumns via fcore::ShapeProbe), and this is the proof the
+        # two roads to it — the native CLI a server would run and the browser module — draw the same bits. Every
+        # mix mode; bucket and column counts that are the page's (1000, 1100), the spec's default (1200), one, and
+        # more than the frames hold; a mono, a stereo and a six-channel fixture at three rates; the needle over the
+        # whole file, a stretch, one frame and an empty stretch. Release and checked artifacts both.
+        run: |
+          node tools/wasm/make-fixture.mjs fix6.f32 44100 6 3
+          node tools/wasm/make-fixture.mjs fix1.f32 22050 1 2
+          M=./build-native/tools/fcore_measure
+          n=0
+          check() { f=$1; sr=$2; ch=$3; mode=$4; shift 4
+            $M "$mode" "$sr" "$ch" "$f" "$@" > shapes-native.txt
+            test -s shapes-native.txt
+            for mod in fcprobe.node.js fcprobe.debug.js; do
+              node tools/wasm/shapes-parity.mjs "tools/wasm/build/$mod" "$mode" "$sr" "$ch" "$f" "$@" > shapes-wasm.txt
+              diff shapes-native.txt shapes-wasm.txt || { echo "DIFFER: $mode $sr $ch $* ($mod)"; exit 1; }
+              n=$((n+1))
+            done; }
+          for mix in avr L R max; do for b in 1 1000 1100 100000; do
+            check fixture.f32 48000 2 waveform --buckets $b --mix $mix
+            check fix6.f32    44100 6 waveform --buckets $b --mix $mix
+            check fix1.f32    22050 1 waveform --buckets $b --mix $mix
+          done; done
+          for c in 1 1100 1200 50000; do
+            check fixture.f32 48000 2 stereo --columns $c
+            check fix6.f32    44100 6 stereo --columns $c
+            check fix1.f32    22050 1 stereo --columns $c
+          done
+          check fixture.f32 48000 2 needle
+          check fixture.f32 48000 2 needle --from 12345 --to 400000
+          check fix6.f32    44100 6 needle --from 7 --to 8
+          check fix1.f32    22050 1 needle --from 100 --to 100
+          echo "bit-identical: $n native-vs-wasm comparisons of peaks, stereo band and needle"
 
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.
