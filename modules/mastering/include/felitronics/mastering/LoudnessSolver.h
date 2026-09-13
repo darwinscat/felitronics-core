@@ -5,6 +5,7 @@
 
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
+#include <felitronics/core/Math.h>
 #include <felitronics/dynamics/offline/Quantile.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
@@ -199,7 +200,7 @@ struct GainReductionLimit
     double      limitDb  = std::numeric_limits<double>::infinity();   // +infinity = no limit
     GrStatistic statistic = GrStatistic::Max;
 
-    bool off()      const noexcept { return limitDb == std::numeric_limits<double>::infinity(); }
+    bool off()      const noexcept { return core::exactlyEqual (limitDb, std::numeric_limits<double>::infinity()); }
     bool malformed() const noexcept { return std::isnan (limitDb); }
 };
 
@@ -1182,7 +1183,7 @@ private:
             const bool better = ! have
                               || (feas && ! feasible)
                               || (feas == feasible && (feas ? (e < err)
-                                                            : (exc < excess || (exc == excess && e < err))));
+                                                            : (exc < excess || (core::exactlyEqual (exc, excess) && e < err))));
             isLast = better;
             if (! better) return;
             g = gg; c = cc; m = mm; err = e; excess = exc; have = true; feasible = feas;
@@ -1202,9 +1203,9 @@ private:
                            : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db : m.limiter.maxDb;
             if (v > req.limiterGr.limitDb) e = std::fmax (e, v - req.limiterGr.limitDb);
         }
-        if (req.minPlrDb != -std::numeric_limits<double>::infinity() && m.plrDb < req.minPlrDb)
+        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()) && m.plrDb < req.minPlrDb)
             e = std::fmax (e, req.minPlrDb - m.plrDb);
-        if (req.maxLraLossLu != std::numeric_limits<double>::infinity()
+        if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
             && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
         {
             const double loss = req.inputLoudnessRangeLu - m.loudnessRangeLu;
@@ -1248,10 +1249,10 @@ private:
         if (violates (m.limiter, req.limiterGr))  v |= constraintBit (MasteringConstraint::LimiterGainReduction);
         // OFF is `-infinity` for a FLOOR and `+infinity` for a CEILING — the sign is part of the
         // meaning, and testing `isfinite` throws it away in the direction that always says "satisfied".
-        if (req.minPlrDb != -std::numeric_limits<double>::infinity() && m.plrDb < req.minPlrDb)
+        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()) && m.plrDb < req.minPlrDb)
             v |= constraintBit (MasteringConstraint::PeakToLoudness);
         // LRA is a DELTA against the input's, and it is only asked when both ends are measurements.
-        if (req.maxLraLossLu != std::numeric_limits<double>::infinity()
+        if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
             && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid
             && (req.inputLoudnessRangeLu - m.loudnessRangeLu) > req.maxLraLossLu)
             v |= constraintBit (MasteringConstraint::LoudnessRange);
@@ -1435,7 +1436,13 @@ private:
 
         m.gatingBlocks     = lm.gatingBlockCount();
         m.droppedBlocks    = lm.droppedBlocks();
-        m.nonFiniteSubHops = lm.nonFiniteSubHops();
+        // THE uint64 FITS AN int HERE, and what bounds it is this function, not the meter's type. `lm` is a
+        // local prepared above — prepareForSamples() ends in reset(), which zeroes the counter — and it sees
+        // exactly ONE process() call, of `frames` samples (the drain feeds `tm`, never `lm`). The counter
+        // moves only in finishSubHop(), by at most one per sub-hop (its two increments are exclusive on
+        // `poisoned`), and a sub-hop is at least one sample. So it cannot exceed `frames`, an int. Feeding
+        // this meter more than once, or widening `frames`, is what would make this cast wrong.
+        m.nonFiniteSubHops = (int) lm.nonFiniteSubHops();
         m.integratedLufs   = lm.integratedLufs();
         m.loudnessRangeLu  = lm.loudnessRangeLu();
         m.truePeakDbTp     = peakDb (tm.truePeakLinear());
