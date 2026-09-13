@@ -32,7 +32,7 @@ byte-for-byte by the adapter — they were verified line-by-line against that so
 | **Normalise::yes = energy norm, −18 dB** | `calculateNormalisationFactor` (`:623`) | `g = (E<1e-8) ? 1 : 0.125/sqrt(E)`, `E = max_ch Σ ir[n]²`, then multiply |
 | **IR swap crossfades over 50 ms** | `CrossoverMixer::prepare` `smoother.reset(sr, 0.05)` (`:951`) | `crossfadeSamples = round(0.05 * hostSr)` |
 | **default convolution is zero-latency** | `Latency{0}` (`:1206`), mc-latency `0` (`:458`); OrbitCab reports only NAM latency (`PluginProcessor.cpp:810`) | keep `latencySamples()==0` → PDC + wet/dry alignment unchanged |
-| **resample only when rates differ** | `resampleImpulseResponse` ratio 1 ≈ identity | **guard: call `resampleIr` ONLY if the rates differ by more than `CabConvolver::kRateMatchTolerance` (relative 1e-6)** — our Kaiser at ratio 1 would still LPF at fc≈0.475 and color a host-rate IR, and an exact `!=` sends a host reporting 48000.0000001 through it |
+| **resample only when rates differ** | `resampleImpulseResponse` ratio 1 ≈ identity | **guard: call `resampleIr` ONLY for a KNOWN IR rate (a positive finite number) that differs from the host's by more than `CabConvolver::kRateMatchTolerance` (relative 1e-6); an unknown rate (NaN, 0, negative, ±inf) loads as is** — our Kaiser at ratio 1 would still LPF at fc≈0.475 and color a host-rate IR, and an exact `!=` sends a host reporting 48000.0000001 through it |
 
 ⚠️ **Resampler is NOT identical.** JUCE uses `ResamplingAudioSource` (linear interp + 2nd-order LPF);
 ours is Kaiser windowed-sinc (higher quality). For a **non-host-rate** IR the two won't null-test.
@@ -44,10 +44,11 @@ linear+LPF mode.) Record this as a deliberate, documented improvement.
 
 ```
 ir = decoded planar IR @ irSr
-if (|irSr - hostSr| > 1e-6 * max(irSr, hostSr))                    // skip at host rate (see guard above)
+known = irSr > 0 && isfinite(irSr)                                  // NaN, 0, negative, ±inf: unknown — as is
+if (known && |irSr - hostSr| > 1e-6 * max(irSr, hostSr))           // within 1 ppm of the host: as is too
     ir[c] = resampleIr(ir[c], irSr, hostSr)
 if (normalise == yes) g = (E<1e-8 ? 1 : 0.125/sqrt(E)),  E = max_c Σ ir[c][n]²   // byte-fallback path
-else                  g = irSr / hostSr                                            // the normal cab path
+else                  g = known ? irSr / hostSr : 1                                // the normal cab path
 multiply every ir[c] by g
 engine.setIr(ir.data(), len)            // mono  → broadcast (juce Stereo::yes)
 engine.setIr(irPtrs, nch, len)          // stereo IR → per channel

@@ -363,6 +363,45 @@ int main()
         test::ok (scaled, "normalize=true at 48000.0000001: exactly the input times the one normalization gain");
     }
 
+    // P67. An IR rate that is not a positive finite number is UNKNOWN, and an unknown rate loads the taps as is:
+    // the samples are fine, only the metadata is broken, and refusing would play silence. One rule for NaN, zero,
+    // negative and both infinities — on main +inf was the one that differed (sent to the resampler, which gave
+    // back nothing, and the load was dropped without a word).
+    test::group ("P67 — an unknown IR rate (NaN, zero, negative, +inf, -inf) loads the taps as is, and they play");
+    {
+        const std::vector<float> ir { 0.5f, -0.25f, 0.125f, 0.0625f, -0.03125f, 0.015625f };   // inside the head: plays exactly
+        const double inf = std::numeric_limits<double>::infinity();
+        struct Unknown { double rate; const char* name; };
+        for (const Unknown& unknown : { Unknown { std::numeric_limits<double>::quiet_NaN(), "NaN" }, Unknown { 0.0, "zero" },
+                                        Unknown { -48000.0, "negative" }, Unknown { inf, "+inf" }, Unknown { -inf, "-inf" } })
+            for (bool normalize : { false, true })
+            {
+                CabConvolver convolver;
+                felitronics::test::run (convolver.prepare (44100.0, 128, 2, 0.05, normalize));
+                const float* banks[1] { ir.data() };
+                convolver.loadIR (banks, 1, (int) ir.size(), unknown.rate);
+                const float gain = convolver.irNormalizationGain();
+                pumpCrossfade (convolver);
+                const bool flushed = convolver.flushPending();
+                const auto& staged = convolver.stagedTaps();
+                bool asIs = staged.size() == 1 && staged[0].size() == ir.size()
+                         && (normalize ? std::isfinite (gain) && gain > 0.0f && gain != 1.0f : gain == 1.0f);
+                for (std::size_t i = 0; asIs && i < ir.size(); ++i) asIs = staged[0][i] == ir[i] * gain;
+
+                convolver.reset();
+                std::vector<float> left (16, 0.0f), right (16, 0.0f);
+                left[0] = right[0] = 1.0f;
+                float* io[2] { left.data(), right.data() };
+                felitronics::test::run (convolver.process (io, 2, 16));
+                bool plays = asIs;
+                for (std::size_t i = 0; plays && i < left.size(); ++i)
+                    plays = left[i] == (i < ir.size() ? ir[i] * gain : 0.0f) && right[i] == left[i];
+                test::ok (asIs && flushed && ! convolver.hasPending() && plays,
+                          std::string ("an IR at rate ") + unknown.name + (normalize ? ", normalized" : "")
+                              + ": the taps load as is, publish and play");
+            }
+    }
+
     // P67. A one-tap IR off the host rate used to resample to NO taps, and the load silently did nothing: the
     // previous cabinet kept playing. Now it stages its one tap, publishes it, and that is what plays.
     test::group ("P67 — a one-tap IR off the host rate stages one tap and is what plays");
@@ -435,7 +474,7 @@ int main()
             switch (nothing)
             {
                 case Nothing::zeroLength:     convolver.loadIR (c, 1, 0, 44100.0); break;
-                case Nothing::refusedRate:    convolver.loadIR (c, 1, 1, std::numeric_limits<double>::infinity()); break;
+                case Nothing::refusedRate:    convolver.loadIR (c, 1, 1, 1.0e-5); break;     // x 4.41e9: past INT_MAX
                 case Nothing::negativeLength: convolver.loadIR (c, 1, -1, 44100.0); break;
                 case Nothing::nullArray:      convolver.loadIR (nullptr, 1, 4, 44100.0); break;
                 case Nothing::nullPlane:      convolver.loadIR (nullPlane, 1, 4, 44100.0); break;
@@ -448,7 +487,8 @@ int main()
             }
             const auto scaledBy = [gain] (const std::vector<float>& v) { auto s = v; for (float& x : s) x *= gain; return s; };
             const auto& staged = convolver.stagedTaps();
-            const bool retained = pendingBefore && convolver.hasPending() && (normalize ? gain != 1.0f : gain == 1.0f)
+            const bool retained = pendingBefore && convolver.hasPending()
+                               && (normalize ? std::isfinite (gain) && gain > 0.0f && gain != 1.0f : gain == 1.0f)
                                && staged.size() == (stereoPending ? 2u : 1u) && staged[0] == scaledBy (pendingLeft)
                                && (! stereoPending || staged[1] == scaledBy (pendingRight))
                                && convolver.irNormalizationGain() == gain && convolver.irNormalizationGainDb() == gainDb;
@@ -471,7 +511,7 @@ int main()
         survives (false, false, Nothing::zeroLength,  "a zero-length load over a pending mono load");
         survives (false, true,  Nothing::zeroLength,  "a zero-length load over a pending NORMALIZED load");
         survives (true,  false, Nothing::zeroLength,  "a zero-length MONO load over a pending STEREO load");
-        survives (true,  true,  Nothing::refusedRate, "a load at a rate resampleIr refuses (infinite) over a pending normalized stereo load");
+        survives (true,  true,  Nothing::refusedRate, "a load at 1e-5 Hz (its resample would be past INT_MAX) over a pending normalized stereo load");
 
         // And the load that used to stage nothing — one tap at 96 kHz — now stages, so it is the LATEST and wins.
         {

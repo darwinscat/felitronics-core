@@ -3,10 +3,10 @@
 `convolution::resampleIr` treated what lies past either end of an impulse response as the weighted mean of the
 samples it had, not as silence: a tap outside the input was skipped before its weight was added, so every edge
 sample was divided by only the part of its window that landed on the input. A cabinet IR starts at its onset, and
-`CabConvolver` resamples whenever the file's rate is not the host's — the ordinary case — so a 48 kHz cabinet in a
-44.1 kHz session played a broadband floor over its own top octave. Twenty-one factory cabinets, measured outside the
-tree, worst 1/6-octave band against each cabinet's own response: at 44.1 kHz +7.2 dB at 16 kHz and +25.1 dB at
-18 kHz, now +0.08 and -0.45 dB; at 96 kHz +18.5 dB at 18 kHz, now -0.12 dB.
+`CabConvolver` resamples a cabinet whose file is at another rate than the host — the ordinary case — so a 48 kHz
+cabinet in a 44.1 kHz session played a broadband floor over its own top octave. Twenty-one factory cabinets,
+measured outside the tree, worst 1/6-octave band against each cabinet's own response: at 44.1 kHz +7.2 dB at 16 kHz
+and +25.1 dB at 18 kHz, now +0.08 and -0.45 dB; at 96 kHz +18.5 dB at 18 kHz, now -0.12 dB.
 
 - **Zeros outside the input.** Every output sample divides by the weight of its whole window; a tap past either end
   adds weight, not signal. Resampling `[zeros, x, zeros]` now equals resampling `x` shifted by whole samples. What
@@ -32,12 +32,17 @@ tree, worst 1/6-octave band against each cabinet's own response: at 44.1 kHz +7.
   pending stereo one — ASan container-overflow, libc++ hardening abort), or, with a null data pointer, a retry
   refused forever, `isBusy()` stuck true and neither the pending IR nor the new one ever reaching the convolver. The
   taps, their gain and the pending geometry are now staged in locals and committed together; a zero or negative
-  length, a null channel array or plane, or a rate the resampler refuses leaves the playing IR, `stagedTaps()`, the
-  normalization gain and any pending retry exactly as they were. A zero, negative or NaN IR rate is not refused: as
-  before, it means the host rate and the taps load verbatim.
+  length, a null channel array or plane, or a known rate so far off that `resampleIr` cannot address the result (its
+  length or its last position past `INT_MAX`) leaves the playing IR, `stagedTaps()`, the normalization gain and any
+  pending retry exactly as they were.
   - **Behaviour:** after such a load `stagedTaps()` still holds the taps of the last load that staged any (it used
     to be emptied) — what the convolver plays once a pending retry has published. A null plane with a positive
     length is ignored instead of dereferenced.
+- **An unknown IR rate loads the taps as is — one rule.** A rate that is not a positive finite number (NaN, zero,
+  negative, ±inf) is unknown: the samples in the file are fine, only the metadata is broken, and refusing would drop
+  the cabinet and play silence where as-is at worst plays an impulse of the wrong length. NaN, zero and negative
+  already loaded as is on `main`; +inf went to the resampler, came back empty and the load was dropped without a
+  word.
 - **Tests.** `felitronics_convolution_resampler_tests`: shift invariance at both edges over ten rate and radius
   cases and five inputs (in front to 1e-6, behind to the bit — on `main` 1437 and 1053 misses, 3.25e-2 worst on the
   cabinet fixture), the edge taps against an independent long-double recomputation of the specification, a
@@ -45,6 +50,7 @@ tree, worst 1/6-octave band against each cabinet's own response: at 44.1 kHz +7.
   rounding and the one-sample floor at seven short IRs, and the refusals (zero, negative and non-finite rates among
   them). `felitronics_convolution_cabconvolver_tests`: the tolerance witness on literal rates, so the one part per
   million is pinned from both sides (verbatim to the bit at 48000.0000001, at 0.9 ppm and at 0.5 ppm of 192 kHz,
-  both ways; resampled at 1.1 ppm, both ways, every tap moved), a one-tap IR off-rate staging, publishing and
-  playing at four rate pairs, and nine loads that stage nothing over a pending one — taps, gain and what plays,
-  normalized and not — plus a one-tap load that wins as the latest.
+  both ways; resampled at 1.1 ppm, both ways, every tap moved), an unknown rate (NaN, zero, negative, ±inf;
+  normalized and not) loading as is and playing, a one-tap IR off-rate staging, publishing and playing at four rate
+  pairs, and nine loads that stage nothing over a pending one — taps, gain and what plays, normalized and not — plus
+  a one-tap load that wins as the latest.

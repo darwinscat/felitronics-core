@@ -120,10 +120,13 @@ public:
 
     // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity,
     // resampled to host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the
-    // convolver's partition build all allocate. A load that stages nothing (no samples, a null plane, a rate
-    // resampleIr refuses) is IGNORED whole: the playing IR, the staged taps, their gain and any pending retry
-    // stay as they were. A zero, negative or NaN IR rate is not one of those — it means "at the host rate",
-    // as it always has, and the taps load verbatim.
+    // convolver's partition build all allocate.
+    // AN UNUSABLE RATE IS AN UNKNOWN RATE, and an unknown rate loads the taps AS IS — NaN, zero, negative and
+    // both infinities alike. The samples in the file are fine, only its metadata is broken: refusing would drop
+    // the cabinet whole and play silence, where as-is at worst plays an impulse of the wrong length.
+    // A load that stages nothing (no samples, a null plane, a known rate so far off that resampleIr cannot
+    // address the result — its length or its last position past INT_MAX) is IGNORED whole: the playing IR, the
+    // staged taps, their gain and any pending retry stay as they were.
     void loadIR (const float* const* samples, int numChannels, int numSamples, double irSampleRate)
     {
         buildAndStage (samples, numChannels, numSamples, irSampleRate);
@@ -176,18 +179,19 @@ private:
         if (samples == nullptr || len <= 0) return;
         nch = std::clamp (nch, 1, 2);
 
-        const bool sameRate = std::isfinite (irSr)
-                           && std::fabs (irSr - hostSr_) <= kRateMatchTolerance * std::max (irSr, hostSr_);
+        // Only a KNOWN rate — a positive finite number — that is off the host's by more than the tolerance.
+        const bool resample = irSr > 0.0 && std::isfinite (irSr)
+                           && std::fabs (irSr - hostSr_) > kRateMatchTolerance * std::max (irSr, hostSr_);
         std::vector<std::vector<float>> staged ((std::size_t) nch);
         for (int c = 0; c < nch; ++c)                                          // resample only off host rate
         {
             if (samples[c] == nullptr) return;
             auto& ch = staged[(std::size_t) c];
-            if (irSr > 0.0 && ! sameRate)
+            if (resample)
                 ch = felitronics::convolution::resampleIr (samples[c], len, irSr, hostSr_);
             else
                 ch.assign (samples[c], samples[c] + len);
-            if (ch.empty()) return;                                            // a rate resampleIr refuses
+            if (ch.empty()) return;                                            // a result resampleIr cannot address
         }
         const int outLen = (int) staged[0].size();
 
