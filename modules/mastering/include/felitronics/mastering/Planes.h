@@ -24,10 +24,11 @@ namespace felitronics::mastering
 //   * no two OUTPUT planes' bytes touch — `[out[k], out[k] + outFrames)` against `[out[j], ...)`, k != j.
 //
 // What stays legal is what never overlaps: one buffer feeding two INPUT channels (nothing writes it), planes edge to
-// edge in one allocation, a call shorter than its buffers (judged on the frames it uses). ASK IT WITH POSITIVE LENGTHS:
-// every caller does, and says for itself what an empty programme needs. A zero length is not "touches nothing" here —
-// an empty input span whose address lies strictly inside an output span still counts as inside it — and a negative
-// one wraps into a meaningless span.
+// edge in one allocation, a call shorter than its buffers (judged on the frames it uses). THE LENGTHS ARE NON-NEGATIVE,
+// AND ZERO ONLY TOGETHER: at two zero lengths no span has a byte, so the rule judges null tables and planes and nothing
+// else — `DeliveredMastering::render` asks it so for an empty programme. One zero beside a non-zero length is not
+// "touches nothing" (an empty span whose address lies strictly inside the other still counts as inside it), and a
+// negative length wraps into a meaningless span; no caller asks either.
 //
 // ONE DEFINITION, because two hand-written copies had already drifted: the loudness search tested only
 // `in[c] == out[c]` and no null plane, and accepted `out[0] = in[1]` — a master read back as the next pass's input —

@@ -236,6 +236,20 @@ static void testRenderRefusesAndAllocatesNothing()
             || ! d2.render (c2, r2, q.in, kNch, n, q.out, d) || bitDiff (out, o2) != 0) ++off;
     }
     ok (off == 0, "blocks 1, 977 and 65536 render the same bits");
+
+    // AN EMPTY PROGRAMME IS LEGAL, AND THE PLANE RULE STILL APPLIES TO IT. The rule used to be skipped at zero
+    // frames, and the render then read the output TABLE to hand it to the renderer: a null table was a crash (on
+    // 37c95b4, SIGSEGV). In real tables it renders, as `OfflineRenderer` does at zero frames; without them, or with
+    // null planes in them, it is refused.
+    {
+        std::vector<float> none (1, 0.0f);
+        Planes real = planes (none, 0, none, 0);
+        ok (dm.render (chain, r, real.in, kNch, 0, real.out, 0), "an empty programme in real tables renders");
+        const float* nullIn[core::kMaxChannels] {};
+        float* nullOut[core::kMaxChannels] {};
+        ok (! dm.render (chain, r, nullIn, kNch, 0, nullOut, 0), "an empty programme with null planes is refused");
+        ok (! dm.render (chain, r, nullptr, kNch, 0, nullptr, 0), "and one with null tables is refused, not a crash");
+    }
 }
 
 static void testSolveAndRangeAreTheComposition()

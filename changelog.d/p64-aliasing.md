@@ -25,6 +25,10 @@
   output planes on one buffer. **A behaviour change for a direct caller:** an identity conversion (equal rates) with
   `in[c] == out[c]` copied the bits correctly in place and is refused too — whether an overlap is safe would otherwise
   depend on the ratio; `DeliveredMastering` and the C ABI already refused it, and nothing in the tree calls it so.
+- **`DeliveredMastering::render` of an empty programme skipped the plane rule** and then read the output table:
+  `render (…, nullptr, 0, nullptr, 0)` was a SIGSEGV on a call whose programme is legal. The rule now applies at
+  every length; at two zero lengths it judges only null, so an empty programme in real tables still renders, and
+  one with null tables — or with null planes in them, which used to be accepted — is refused.
 - **`fc_solution_log`: `written` may not point into the `cap` records** (FC_ERR_SPAN), and is cleared only once
   every check is behind the call — the order `fc_master_flush` takes. It used to be cleared on entry, so a
   `written` inside the buffer took the count over a copied record on FC_OK and a zero into the buffer on a

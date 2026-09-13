@@ -134,7 +134,11 @@ public:
     {
         if (! admits (chain, numChannels, inFrames, outFrames)) return false;
         if (renderer.blockSize() < 1 || numChannels > renderer.maxChannels()) return false;
-        if (outFrames > 0 && ! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
+        // THE RULE AT EVERY LENGTH, AN EMPTY PROGRAMME INCLUDED. It used to be skipped at `outFrames == 0`, and the
+        // path then ran past it into `ro[c] = out[c]` below: a null table crashed a call whose programme is legal.
+        // At two zero lengths the rule judges nothing but null — no span has a byte to overlap with — so an empty
+        // programme in real tables is rendered as before, and one without tables is refused.
+        if (! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
         if (! conv_.convert (in, numChannels, inFrames, out, outFrames)) return false;
         nonFinite_ = conv_.nonFiniteInputSamples();
         const float* ro[core::kMaxChannels] {};
