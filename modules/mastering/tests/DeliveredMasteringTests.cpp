@@ -236,6 +236,20 @@ static void testRenderRefusesAndAllocatesNothing()
             || ! d2.render (c2, r2, q.in, kNch, n, q.out, d) || bitDiff (out, o2) != 0) ++off;
     }
     ok (off == 0, "blocks 1, 977 and 65536 render the same bits");
+
+    // AN EMPTY PROGRAMME IS LEGAL, AND THE PLANE RULE STILL APPLIES TO IT. The rule used to be skipped at zero
+    // frames, and the render then read the output TABLE to hand it to the renderer: a null table was a crash (on
+    // 37c95b4, SIGSEGV). In real tables it renders, as `OfflineRenderer` does at zero frames; without them, or with
+    // null planes in them, it is refused.
+    {
+        std::vector<float> none (1, 0.0f);
+        Planes real = planes (none, 0, none, 0);
+        ok (dm.render (chain, r, real.in, kNch, 0, real.out, 0), "an empty programme in real tables renders");
+        const float* nullIn[core::kMaxChannels] {};
+        float* nullOut[core::kMaxChannels] {};
+        ok (! dm.render (chain, r, nullIn, kNch, 0, nullOut, 0), "an empty programme with null planes is refused");
+        ok (! dm.render (chain, r, nullptr, kNch, 0, nullptr, 0), "and one with null tables is refused, not a crash");
+    }
 }
 
 static void testSolveAndRangeAreTheComposition()
@@ -434,6 +448,19 @@ static void testRefusalsWriteAndAllocateNothing()
         const std::vector<float> crossBefore = cross;
         ok (! dm.render (chain, r, ipx, kNch, n, opx, d) && cross == crossBefore,
             "an output plane over ANOTHER channel's input: refused, nothing written");
+
+        // UPSAMPLING: these spans overlap only beyond the first `inFrames` of the longer output plane.
+        std::vector<float> longStride ((std::size_t) (10 * n), 0.125f);
+        const float* ipl[core::kMaxChannels] { longStride.data() + n + 1, longStride.data() + 4 * n + 4 };
+        float* opl[core::kMaxChannels] { longStride.data(), longStride.data() + 7 * n + 8 };
+        std::copy (in.begin(), in.begin() + n, const_cast<float*> (ipl[0]));
+        std::copy (in.begin() + n, in.end(), const_cast<float*> (ipl[1]));
+        const std::vector<float> longBefore = longStride;
+        ok (! dm.render (chain, r, ipl, kNch, n, opl, d) && longStride == longBefore,
+            "render: overlap only in the longer output stride is refused, nothing written");
+        const auto longSol = dm.solve (s, chain, r, params, ipl, kNch, n, opl, d, req);
+        ok (longSol.status == MasteringSolveStatus::InvalidRequest && longSol.passes == 0 && longStride == longBefore,
+            "solve: the same longer-stride overlap is InvalidRequest before a render");
     }
 
     // EQUAL RATES read the input in place, so a null input must be refused before it is read.
@@ -507,7 +534,8 @@ static void testNonFiniteInputIsGatedBeforeTheConversion()
         ok (bc == 0u && bd == 2u, tag + "and the two non-finite samples are counted, the clamped finite one is not");
 
         // The SAME count from the range measurement, which at equal rates reads the input in place rather than
-        // converting it — the measurement itself refuses a poisoned programme, but the count is taken first.
+        // converting it — and there the measurement itself refuses the poisoned programme, but the count is taken
+        // first. (Converting, the gate has already replaced both samples, so the range is measured.)
         {
             MasteringChain ch; OfflineRenderer r; TargetLoudnessSolver sv; DeliveredMastering dm;
             const bool built = r.prepare (kNch, kBlock) && ch.prepare (pr.second, kNch, cfg) && dm.prepare (pr.first, pr.second, kNch, kBlock)
@@ -519,10 +547,39 @@ static void testNonFiniteInputIsGatedBeforeTheConversion()
             std::vector<float> dummy (1, 0.0f);
             Planes p = planes (dirty4, n4, dummy, 0);
             double v = 0.0;
-            (void) dm.measureInputLoudnessRange (sv, p.in, kNch, n4, v);
-            ok (built && dm.nonFiniteInputSamples() == 2u, tag + "the range measurement counts the same two");
+            const bool measured = dm.measureInputLoudnessRange (sv, p.in, kNch, n4, v);
+            const bool identity = pr.first == pr.second;
+            ok (built && measured != identity && dm.nonFiniteInputSamples() == 2u,
+                tag + (identity ? "the range measurement counts the same two — and refuses the programme AFTER its count, keeping it"
+                                : "the range measurement counts the same two, and measures the gated programme"));
             const float* nullPlanes[core::kMaxChannels] {};
-            ok (! dm.measureInputLoudnessRange (sv, nullPlanes, kNch, n4, v), tag + "and refuses a table of null planes");
+            ok (! dm.measureInputLoudnessRange (sv, nullPlanes, kNch, n4, v) && dm.nonFiniteInputSamples() == 2u,
+                tag + "and refuses a table of null planes BEFORE its count, leaving the previous one");
+        }
+
+        // THE COUNT IS THE LAST CALL'S THAT REACHED IT. One object through a sequence: every call refused before its
+        // count leaves the previous number exactly where it was — the rule `fc_solution_log` keeps for `written` —
+        // and the next call that reaches its count replaces it, zero included.
+        {
+            MasteringChain ch; OfflineRenderer r; TargetLoudnessSolver sv; DeliveredMastering dm;
+            const bool built = r.prepare (kNch, kBlock) && ch.prepare (pr.second, kNch, cfg) && dm.prepare (pr.first, pr.second, kNch, kBlock)
+                            && sv.prepare (pr.second, kNch, kBlock, ch.internalBlock(), ch.tapOversampleFactor());
+            std::vector<float> out ((std::size_t) (d * kNch), 0.0f);
+            Planes pd = planes (dirty, n, out, d);
+            ok (built && dm.render (ch, r, pd.in, kNch, n, pd.out, d) && dm.nonFiniteInputSamples() == 2u,
+                tag + "a render that reaches its count: 2");
+            ok (! dm.render (ch, r, pd.in, kNch, n, pd.out, d - 1) && dm.nonFiniteInputSamples() == 2u,
+                tag + "a render refused on its length leaves 2");
+            Planes over = planes (dirty, n, dirty, d);                // the output over the input
+            ok (! dm.render (ch, r, over.in, kNch, n, over.out, d) && dm.nonFiniteInputSamples() == 2u,
+                tag + "a render refused on its planes leaves 2");
+            Planes pc = planes (clean, n, out, d);
+            LoudnessRequest noTarget;
+            ok (dm.solve (sv, ch, r, MasteringChainParams {}, pc.in, kNch, n, pc.out, d, noTarget).status
+                    == MasteringSolveStatus::InvalidRequest && dm.nonFiniteInputSamples() == 2u,
+                tag + "a solve refused before its count leaves 2");
+            ok (dm.render (ch, r, pc.in, kNch, n, pc.out, d) && dm.nonFiniteInputSamples() == 0u,
+                tag + "and the next render that reaches its count replaces it: 0");
         }
     }
 }

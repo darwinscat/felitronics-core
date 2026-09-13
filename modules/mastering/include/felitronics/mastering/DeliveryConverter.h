@@ -5,6 +5,7 @@
 
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DeliveryResampler.h>
+#include <felitronics/mastering/Planes.h>
 
 #include <algorithm>
 #include <climits>
@@ -132,23 +133,34 @@ public:
     long long trimSamples() const noexcept { return std::llround (src_.latencyOutputSamples()); }
     const core::DeliveryResampler::Plan& plan() const noexcept { return src_.currentPlan(); }
 
-    // Input samples the gate replaced because they were not finite, in the programme the last `convert()` read. A
-    // finite sample outside +-1e6 is clamped and not counted, exactly as `MasteringChain::nonFiniteInputSamples()`.
+    // Input samples the gate replaced because they were not finite, in the programme of THE LAST `convert()` THAT
+    // REACHED THE COUNT — that read every input sample (an empty programme reaches it with nothing to read, and counts
+    // 0). A call refused before that, or stopped while reading, leaves the previous count where it was: a caller that
+    // reads it after a refusal reads an earlier programme's, the rule `fc_solution_log` keeps for `written`. A finite
+    // sample outside +-1e6 is clamped and not counted, exactly as `MasteringChain::nonFiniteInputSamples()`.
     std::uint64_t nonFiniteInputSamples() const noexcept { return nonFinite_; }
 
     // Convert a whole programme. `out` must hold exactly deliveredFrames(inFrames) frames per channel, and
     // `outFrames` must be that number — a caller that computed its own is refused, not trusted. Every call
     // starts from a reset, so two conversions of the same programme are bit-identical. No allocation.
+    //
+    // THE PLANES MUST BE `planesUsable` (Planes.h), each side at its own length, and a call that is not is refused
+    // before a sample is written. `out` is written at the delivery stride while `in` is still being read at the
+    // source one, so an output plane over an input plane overwrites programme not yet read wherever the writes run
+    // ahead of the reads, which the ratio and the offset between the planes decide: on the old check, which
+    // tested null planes only, the suite's witness (`testPlanes`) had `out[0] = in[1]` at 44.1 -> 48 kHz return true
+    // with channel 1 wrong in 25 990 of 52 245 frames — and the same call at 48 -> 44.1 came out right only because
+    // there the writes lag the reads, which is an accident of the ratio and not a contract. EQUAL RATES INCLUDED: an
+    // identity conversion with `in[c] == out[c]` copies the bits correctly in place, and is refused all the same — a
+    // rule that has to know the ratio to know whether an overlap is safe is one rule per ratio, and the delivered
+    // render in front of this class already refused it. An empty programme needs no planes.
     [[nodiscard]] bool convert (const float* const* in, int numChannels, long long inFrames,
                                 float* const* out, long long outFrames) noexcept
     {
         if (! prepared_ || numChannels != nch_ || inFrames < 0) return false;
         if (outFrames != deliveredFrames (inRate_, deliveryRate_, inFrames)) return false;
-        if (outFrames > 0 && (in == nullptr || out == nullptr)) return false;
-        for (int c = 0; c < numChannels && outFrames > 0; ++c)
-            if (in[c] == nullptr || out[c] == nullptr) return false;
-        nonFinite_ = 0;
-        if (outFrames == 0) return true;
+        if (outFrames > 0 && ! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
+        if (outFrames == 0) { nonFinite_ = 0; return true; }
 
         src_.reset();
         const long long T0 = src_.currentPlan().identity ? 0 : trimSamples();
@@ -166,6 +178,8 @@ public:
         float* sp[core::kMaxChannels] {};
         for (int c = 0; c < numChannels; ++c) sp[c] = staging_.data() + (std::size_t) c * (std::size_t) perCall_;
 
+        // Counted aside and published once the last input sample has been read — see `nonFiniteInputSamples`.
+        std::uint64_t counted = 0;
         for (long long off = 0; off < inFrames; off += block_)
         {
             const int m = (int) std::min<long long> (block_, inFrames - off);
@@ -183,13 +197,14 @@ public:
                     bad += fin ? 0u : 1u;
                     g[i] = std::clamp (fin ? v : 0.0f, -1.0e6f, 1.0e6f);
                 }
-                nonFinite_ += bad;
+                counted += bad;
                 ip[c] = g;
             }
             int got = 0;
             if (! src_.process (ip, numChannels, m, sp, perCall_, got)) return false;
             take (got);
         }
+        nonFinite_ = counted;
         const float* zp[core::kMaxChannels] {};
         for (int c = 0; c < numChannels; ++c) zp[c] = silence_.data() + (std::size_t) c * (std::size_t) block_;
         // The drain: silence until T0 + outFrames outputs exist. Bounded — every block of silence yields

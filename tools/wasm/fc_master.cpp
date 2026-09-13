@@ -224,8 +224,15 @@ static_assert (! BraceInit<dynamics::CompressorParams,
 // The size table is the single source (rule 5); `sizeFor` reads it, and everything that checks a caller's
 // `structSize` goes through `sizeFor` with the caller's version. The pins below tie the table to this build's
 // structs: the newest row of every struct is its `sizeof`, a struct's rows only ever grow, no struct with a header
-// ends in implicit padding (rule 4), and every top-level field sits at the offset the version that added it published. A field
-// moved, retyped or inserted mid-struct is a build error here, not a render.
+// ends in implicit padding (rule 4), and every top-level field sits at the offset the version that added it published.
+// What these offset and size pins make a build error is a change that MOVES something they read: a top-level field
+// moved, a field inserted in front of others, the last field retyped (FC_ENDS_AT takes its size from the compiler), a
+// retype that shifts the field after it. A change that moves nothing builds: a field dropped into padding (an `int32_t`
+// after `fc_loudness_request::maxPasses`), or a retype that keeps every size and offset — `int32_t` to `uint32_t`, a
+// `double` narrowed to `float` in front of another `double` — except in v4's fields, which are pinned by TYPE as well
+// (beside the frozen sizes below); v1..v3's are not. Inside a frozen nested struct only the size is pinned, so two of its
+// fields swapped build too; tools/wasm/layout-check.mjs sees that one under ctest, by the offset of every field
+// `fcore_master layout` lists — it compares no types.
 template <typename T> struct AbiId;   // declared, never defined: an unmapped struct fails to compile
 template <> struct AbiId<fc_master_config>    { static constexpr int id = FC_STRUCT_CONFIG; };
 template <> struct AbiId<fc_master_params>    { static constexpr int id = FC_STRUCT_PARAMS; };
@@ -330,7 +337,8 @@ static_assert (std::is_same_v<decltype (fc_gr_trace_bucket::maxDb), double> && s
 static_assert (std::is_same_v<decltype (fc_measurement::compressorGrTraceBuckets), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceBuckets), int32_t>
                && std::is_same_v<decltype (fc_measurement::compressorGrTraceValid), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceValid), int32_t>);
 
-// Every top-level field at the offset it was published at. A field inserted anywhere but the end moves a number.
+// Every top-level field at the offset it was published at. A field inserted in front of others moves a number; one dropped
+// into padding moves none (see the top of this section).
 #define FC_AT(T, f, off) static_assert (offsetof (T, f) == (off), #T "::" #f " moved")
 FC_AT (fc_master_config, header, 0);           FC_AT (fc_master_config, sampleRate, 8);
 FC_AT (fc_master_config, channels, 16);        FC_AT (fc_master_config, internalBlock, 20);
@@ -1486,6 +1494,10 @@ FC_EXPORT fc_status fc_solution_measurement (fc_solution sh, fc_measurement* out
     return FC_OK;
 }
 
+// `written` MAY NOT POINT INTO THE RECORDS, and is cleared only once every refusal is behind the call — the order
+// `fc_master_flush` takes. It used to be cleared on entry, before `out` was checked at all: a `written` inside the
+// buffer then took a zero into the caller's records on a call refused for alignment or span, and a successful call
+// wrote the count over a record it had just copied, answering FC_OK.
 FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::uint32_t cap,
                                      std::uint32_t* written)
 {
@@ -1493,11 +1505,14 @@ FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::ui
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
+    if (cap > 0)                                      // asking for nothing is not an error, and names no span
+    {
+        if (out == nullptr) return FC_ERR_NULL;
+        if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
+        if (! inHeap (out, (std::uint64_t) cap * sizeof (fc_solve_pass))) return FC_ERR_SPAN;
+        if (aliasesSpan (written, sizeof (*written), out, (std::uint64_t) cap * sizeof (fc_solve_pass))) return FC_ERR_SPAN;
+    }
     *written = 0;
-    if (cap == 0) return FC_OK;                       // asking for nothing is not an error
-    if (out == nullptr) return FC_ERR_NULL;
-    if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
-    if (! inHeap (out, (std::uint64_t) cap * sizeof (fc_solve_pass))) return FC_ERR_SPAN;
 
     const LoudnessSolution& v = *s->solution;
     const std::uint32_t n = (std::uint32_t) v.logCount < cap ? (std::uint32_t) v.logCount : cap;

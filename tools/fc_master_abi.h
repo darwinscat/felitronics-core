@@ -527,9 +527,14 @@ typedef struct fc_master_stats
     // of the audio would be a second definition of "non-finite", and the count of internal quanta —
     // which an earlier draft of this struct carried — would have been this file re-deriving the chain's
     // own quantum accounting. The chain owns both; this reports one and does not invent the other.
-    // ON A DELIVERING HANDLE it is the core's count for the programme the last `*_delivered` call or converting
-    // `fc_master_measure_lra` was handed, at the source rate: the converter gates every input sample ahead of the
-    // conversion (one bad sample must not become a kernel's worth of zeroes), so the chain behind it sees none.
+    // ON A DELIVERING HANDLE it is the core's count (`DeliveredMastering::nonFiniteInputSamples`), at the source rate,
+    // for the programme of THE LAST `*_delivered` CALL OR CONVERTING `fc_master_measure_lra` THAT REACHED THE COUNT:
+    // the converter gates every input sample ahead of the conversion (one bad sample must not become a kernel's worth
+    // of zeroes), so the chain behind it sees none. A call refused before its count — by this facade, which never
+    // reaches the core then, or by the core — leaves the previous count, as a refused `fc_solution_log` leaves
+    // `written`; read it after FC_OK. A call refused AFTER its count keeps its own: at equal rates, where the input is
+    // read in place, `fc_master_measure_lra` answers FC_ERR_REFUSED_BY_CORE on a poisoned programme having counted it.
+    // Not a version: the field and its layout are v1's, and this states what it has always held.
     uint64_t nonFiniteIn;
 } fc_master_stats;
 
@@ -743,7 +748,9 @@ typedef uint32_t fc_solution;
 // Clearing on entry reads as the careful thing and is not: a caller reusing a variable that still held
 // a LIVE handle would have it wiped by a call that failed on the version field, and the object it named
 // would be unreachable and undestroyable. A COUNT out-parameter (`written`) is the opposite and IS
-// cleared first, because zero is the truthful answer for a call that wrote nothing.
+// cleared, because zero is the truthful answer for a call that wrote nothing — but not FIRST: only once
+// the checks on the call's arguments are behind it, since until the alias check has run it may point into
+// the very buffer the call is about to refuse. A call those checks refuse leaves it as it was.
 fc_status fc_master_create (const fc_master_config* cfg, fc_master* out);
 
 // Apply a parameter set and report back what the chain will actually run.
@@ -957,6 +964,13 @@ fc_status fc_solution_summary_get (fc_solution s, fc_solution_summary* out);
 fc_status fc_solution_measurement (fc_solution s, fc_measurement* out);
 // Copies min(logCount, cap) pass records into `out` and reports how many were written. Same ownership
 // rule as everywhere else here: the buffer is the caller's and its capacity is binding.
+//
+// Checks in the header's order: poison, the handle, `written`, then — only when `cap > 0` — `out` (null, 8-byte
+// alignment, the span in the heap, and `written` NOT INSIDE the `cap` records: FC_ERR_SPAN). `written` is set to 0
+// once every check is behind the call and to the count on FC_OK; a refused call leaves it as it was. Up to this
+// build it was cleared on entry, so a `written` inside the records put a zero into them on a refused call and the
+// count into one on FC_OK. A fix of this entry point's behaviour, not a version: VERSIONING rule 1 moves the
+// version for a new entry point or a grown struct, and this is neither.
 fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint32_t* written);
 // v4 — WHERE a stage reduced gain in the audio this solution handed back: its trace, `stage` an fc_gr_stage, copied as
 // min(buckets, cap) buckets into `out` with `written` saying how many — the log's ownership and capacity rule. Bucket k
@@ -973,10 +987,10 @@ fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint
 // code that names no stage is FC_ERR_ENUM, with `cap == 0` too. FC_OK with `written == 0` for a solution whose solve
 // attempted no render.
 //
-// `written` IS LEFT UNTOUCHED BY EVERY REFUSAL, as `fc_master_flush` leaves it — and unlike `fc_solution_log`, which
-// clears it first. Clearing first is what the general rule for a count out-parameter says, and it cannot be done here:
-// until the alias check has run, `written` may point into the buckets, and zeroing it would be a refusal that wrote into
-// the caller's buffer. It is set to 0 once every refusal is behind the call, and to the count on success.
+// `written` IS LEFT UNTOUCHED BY EVERY REFUSAL, as `fc_master_flush` and `fc_solution_log` leave it — the general rule
+// for a count out-parameter: until the alias check has run, `written` may point into the buckets, and zeroing it would
+// be a refusal that wrote into the caller's buffer. It is set to 0 once every refusal is behind the call, and to the
+// count on success.
 fc_status fc_solution_gr_trace (fc_solution s, int32_t stage, fc_gr_trace_bucket* out, uint32_t cap, uint32_t* written);
 fc_status fc_solution_destroy (fc_solution s);
 

@@ -8,6 +8,7 @@
 #include <felitronics/dynamics/offline/Quantile.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
+#include <felitronics/mastering/Planes.h>
 
 #include <algorithm>
 #include <cmath>
@@ -586,7 +587,6 @@ public:
         LoudnessSolution sol;
         sol.activityThresholdDb = req.activityThresholdDb;
         if (! admits (chain, renderer, numChannels, frames, req, sol.status)) return sol;
-        if (in == nullptr || out == nullptr) { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
         // `in == out` IS REFUSED HERE, even though `OfflineRenderer` supports it. One render in place is
         // well defined; a SEARCH is not, because every pass after the first would read the previous
         // pass's master as its input. Measured: a 1 kHz tone solved to a reported -22.996 LUFS, and the
@@ -594,8 +594,15 @@ public:
         // programme by 6.0 LU, and every number in the report describes a programme the caller does not
         // have. Refused rather than copied: the copy is the caller's memory to spend, and only the
         // caller knows whether it can.
-        for (int c = 0; c < numChannels; ++c)
-            if (in[c] == out[c]) { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
+        // AND NOT ONLY CHANNEL AGAINST ITSELF: no output plane may touch ANY input plane, nor another output plane
+        // (`planesUsable`, Planes.h). This used to test `in[c] == out[c]`, which let `out[0] = in[1]` through — the
+        // render writes channel 0's master where channel 1 is read next pass, and the call answered an ordinary
+        // verdict, at a plausible gain, over a master that is not the programme's — and `out[0] = out[1]`, where the
+        // second channel's render overwrites the first and the search meters one channel twice (the suite's
+        // witnesses, testCrossChannelAliasingIsRefused). A NULL PLANE is refused by the same predicate; it used to
+        // reach the renderer and dereference it.
+        if (! planesUsable (in, out, numChannels, frames, frames))
+            { sol.status = MasteringSolveStatus::InvalidRequest; return sol; }
 
         const double target = req.targetLufs;
         const double pmax   = req.maxTruePeakDbTp;
@@ -1292,9 +1299,12 @@ private:
     {
         const int F = chain.tapOversampleFactor();
         // Each stage's own window into the tap stream — stated by MasteringChainTaps, read from the
-        // chain, never guessed. Everything outside it is the chain's priming or its drain, both of
-        // which are fed zeros and therefore produce no gain reduction and no peak; counting them would
-        // dilute `mean` and the active fraction by exactly the ratio a short programme cannot afford.
+        // chain, never guessed. Everything outside it is the chain's priming or its drain, and neither is
+        // programme — which, and not that they are empty, is why they are left out. The drain in particular is
+        // NOT free of gain reduction: a release still running when the programme ends runs on into it, and an
+        // expanding or upward mode acts on the drain's silence itself. Counting outside the window would let the
+        // chain's latency and the programme's last moments, not the programme, move the statistics — and a short
+        // programme's the most.
         // EACH TAP'S WINDOW COMES FROM THE CHAIN, not from arithmetic here. The limiter's offset in
         // particular is not the sum of the stages in front of it — the trace is written where the gain
         // is decided, on the oversampled copy, so it lags by the UP leg of the limiter's own oversampler

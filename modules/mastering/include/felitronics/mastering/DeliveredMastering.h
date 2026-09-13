@@ -119,19 +119,29 @@ public:
     double deliveryRate() const noexcept { return deliveryRate_; }
     const DeliveryConverter& converter() const noexcept { return conv_; }
 
-    // Non-finite input samples in the programme the last render, solve or range measurement was handed — counted by
-    // the converter's gate, or at equal rates (where the input is read in place and the chain's gate replaces them)
-    // by the same test over the input. A number about the CALLER's programme, at the source rate.
+    // Non-finite input samples in the programme of THE LAST RENDER, SOLVE OR RANGE MEASUREMENT THAT REACHED THE COUNT —
+    // counted by the converter's gate over a conversion that completed, or, where a solve or a range measurement reads
+    // the input in place at equal rates (the chain's gate then replaces the samples), by the same test over the input.
+    // A number about the CALLER's programme, at the source rate. A call refused before its count leaves the previous
+    // one where it was, so a caller that reads it after a refusal reads an earlier programme's — the rule
+    // `fc_solution_log` keeps for `written`. A call refused AFTER its count keeps its own: at equal rates a range
+    // measurement refuses a poisoned programme having counted it, and the count is then the reason.
     std::uint64_t nonFiniteInputSamples() const noexcept { return nonFinite_; }
 
     // A render at the parameters the chain already holds. `out` must be exactly `deliveredFrames(inFrames)`
-    // frames per channel and `outFrames` that number; `in` and `out` must not overlap. No allocation.
+    // frames per channel and `outFrames` that number; the planes must be `planesUsable` (Planes.h) — the conversion
+    // writes `out` while it still reads `in`, at another stride, and the render then runs in place over `out`. No
+    // allocation.
     [[nodiscard]] bool render (MasteringChain& chain, OfflineRenderer& renderer,
                                const float* const* in, int numChannels, long long inFrames,
                                float* const* out, long long outFrames) noexcept
     {
         if (! admits (chain, numChannels, inFrames, outFrames)) return false;
         if (renderer.blockSize() < 1 || numChannels > renderer.maxChannels()) return false;
+        // THE RULE AT EVERY LENGTH, AN EMPTY PROGRAMME INCLUDED. It used to be skipped at `outFrames == 0`, and the
+        // path then ran past it into `ro[c] = out[c]` below: a null table crashed a call whose programme is legal.
+        // At two zero lengths the rule judges nothing but null — no span has a byte to overlap with — so an empty
+        // programme in real tables is rendered as before, and one without tables is refused.
         if (! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
         if (! conv_.convert (in, numChannels, inFrames, out, outFrames)) return false;
         nonFinite_ = conv_.nonFiniteInputSamples();
@@ -159,6 +169,9 @@ public:
             return solver.solve (chain, renderer, params, in, out, numChannels, 0, req);
         // THE SOLVER'S OWN VERDICT, ASKED BEFORE A BYTE IS SPENT. Its words, its order, one definition.
         if (! solver.admits (chain, renderer, numChannels, (int) outFrames, req, refused.status)) return refused;
+        // The planes, at the CALLER's two lengths — not left to the solver, which sees the converted programme and
+        // never the caller's input. (At equal rates the search reads `in` directly on every pass, so an overlap there
+        // would read its own master.)
         if (! planesUsable (in, out, numChannels, inFrames, outFrames))
             { refused.status = MasteringSolveStatus::InvalidRequest; return refused; }
 
@@ -207,30 +220,6 @@ private:
             && std::fabs (chain.sampleRate() - deliveryRate_) < 1.0e-9;
     }
 
-    // Non-null planes, and no input plane touching any output plane. The conversion writes `out` while it still
-    // reads `in` — at different strides — so an overlap is not an optimisation to allow but a programme that
-    // overwrites the part of itself not yet read. (At equal rates the search reads `in` directly on every pass,
-    // so there it would read its own master.)
-    static bool planesUsable (const float* const* in, float* const* out, int numChannels,
-                              long long inFrames, long long outFrames) noexcept
-    {
-        if (outFrames == 0) return true;
-        if (in == nullptr || out == nullptr) return false;
-        const auto bytesIn  = (std::uint64_t) inFrames  * sizeof (float);
-        const auto bytesOut = (std::uint64_t) outFrames * sizeof (float);
-        for (int c = 0; c < numChannels; ++c)
-        {
-            if (in[c] == nullptr || out[c] == nullptr) return false;
-            for (int k = 0; k < numChannels; ++k)
-            {
-                const auto a = (std::uint64_t) reinterpret_cast<std::uintptr_t> (in[c]);
-                const auto b = (std::uint64_t) reinterpret_cast<std::uintptr_t> (out[k]);
-                if (a < b + bytesOut && b < a + bytesIn) return false;
-            }
-        }
-        return true;
-    }
-
     // The programme at the delivery rate, in `src`. At equal rates that is the caller's own input, read in place.
     bool converted (const float* const* in, int numChannels, long long inFrames, long long outFrames,
                     std::vector<float>& programme, const float** src)
@@ -255,7 +244,7 @@ private:
             src[c] = dst[c];
         }
         const bool ok = conv_.convert (in, numChannels, inFrames, dst, outFrames);
-        nonFinite_ = conv_.nonFiniteInputSamples();
+        if (ok) nonFinite_ = conv_.nonFiniteInputSamples();         // a conversion that completed — see the getter
         return ok;
     }
 

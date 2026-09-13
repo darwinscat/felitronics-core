@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1174,6 +1175,8 @@ void testTheReviewsCounterexamples()
         test::ok (sol.passes == 0, "in == out: refused before spending a render");
     }
 
+    // (a) is a channel against itself; the same hole ACROSS channels is testCrossChannelAliasingIsRefused.
+
     // (b) A CALLER CEILING BELOW THE PROMISE. The solver may raise it, so a limiter-GR violation there
     //     is NOT upstream — it is something its own knobs can relieve.
     {
@@ -1270,6 +1273,224 @@ void testTheReviewsCounterexamples()
         const auto sol = s.solve (ch, r, MasteringChainParams {}, src.in(), dst.out(), 2, src.frames(), req);
         test::ok (sol.status == MasteringSolveStatus::InvalidRequest,
                   "a solver prepared at a different rate from the chain is refused");
+    }
+}
+
+// =============================================================================================
+// P64. The solver refused `in[c] == out[c]` and nothing else, so `out[0] = in[1]` was accepted: the render wrote
+// channel 0's master where the NEXT pass reads channel 1, and the call answered with an ordinary verdict over a master
+// that is not the programme's — and so was `out[0] = out[1]`, the second channel's render alone where two were asked
+// for. The witnesses below are those calls; against the old check they print what they answered. What must stay legal
+// is pinned beside them, against a solve on disjoint buffers, bit for bit — a refusal that grew past overlap would fail
+// there, not here.
+void testCrossChannelAliasingIsRefused()
+{
+    test::group ("an output plane touching any input plane or another output plane is refused; what never overlaps is not");
+    Programme src = makeMusic (3.0, 0.2);
+    const int F = src.frames();
+    const auto Fz = (std::size_t) F;
+    LoudnessRequest req; req.targetLufs = -12.0; req.maxTruePeakDbTp = -1.0;
+
+    // The honest answer: the programme in its own buffers, the master in others.
+    std::vector<float> h0 (Fz, 0.0f), h1 (Fz, 0.0f);
+    LoudnessSolution honest;
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        float* ho[2] = { h0.data(), h1.data() };
+        honest = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), ho, 2, F, req);
+    }
+    // PRECONDITION: the search reads its input more than once, and the two channels differ — otherwise reading
+    // channel 0's master as channel 1 would be harmless and the witness would prove nothing.
+    test::ok (honest.status == MasteringSolveStatus::Solved && honest.passes >= 2,
+              "precondition: the honest solve spends at least two renders");
+    test::ok (src.ch[0] != src.ch[1], "precondition: the two input channels differ");
+
+    const auto sameBits = [] (const float* a, const float* b, std::size_t n)
+    { return std::memcmp (a, b, n * sizeof (float)) == 0; };
+    const float kSentinel = 0.123f;
+
+    // (1) THE WITNESS: out[0] IS in[1].
+    {
+        std::vector<float> A = src.ch[0], B = src.ch[1], C (Fz, kSentinel);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in[2] = { A.data(), B.data() };
+        float* out[2] = { B.data(), C.data() };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, out, 2, F, req);
+        if (sol.status != MasteringSolveStatus::InvalidRequest)
+        {
+            std::size_t wrong = 0;
+            for (std::size_t i = 0; i < Fz; ++i) wrong += (B[i] != h0[i] || C[i] != h1[i]) ? 1u : 0u;
+            std::printf ("      out[0] = in[1] was ANSWERED: status %s, gain %.4f dB (honest %.4f), reported %.3f LUFS"
+                         " (honest %.3f); its master differs from the honest one in %zu of %d frames\n",
+                         statusName (sol.status), sol.preLimiterGainDb, honest.preLimiterGainDb,
+                         sol.measured.integratedLufs, honest.measured.integratedLufs, wrong, F);
+        }
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0,
+                  "out[0] = in[1] is refused before a render");
+        test::ok (sameBits (A.data(), src.ch[0].data(), Fz) && sameBits (B.data(), src.ch[1].data(), Fz)
+                  && std::all_of (C.begin(), C.end(), [&] (float v) { return v == kSentinel; }),
+                  "and the refusal writes nothing: both inputs and the free output are as they were");
+    }
+
+    // (2) The mirror image, out[1] IS in[0] — a check that only looked one way round would pass (1).
+    {
+        std::vector<float> A = src.ch[0], B = src.ch[1], C (Fz, kSentinel);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in[2] = { A.data(), B.data() };
+        float* out[2] = { C.data(), A.data() };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, out, 2, F, req);
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0, "out[1] = in[0] is refused");
+    }
+
+    // (2b) TWO OUTPUT PLANES ON ONE BUFFER. No input is touched, and the render still cannot be right: channel 1 is
+    //      written over channel 0, the search meters channel 1 twice and steers on that, and the caller gets one
+    //      channel's master where two were asked for. Against the old check it prints what it answered.
+    {
+        std::vector<float> A = src.ch[0], B = src.ch[1], C (Fz, kSentinel);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in[2] = { A.data(), B.data() };
+        float* same[2] = { C.data(), C.data() };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, same, 2, F, req);
+        if (sol.status != MasteringSolveStatus::InvalidRequest)
+        {
+            std::size_t notCh0 = 0;
+            for (std::size_t i = 0; i < Fz; ++i) notCh0 += (C[i] != h0[i]) ? 1u : 0u;
+            std::printf ("      out[0] = out[1] was ANSWERED: status %s, gain %.4f dB (honest %.4f), reported %.3f LUFS"
+                         " (honest %.3f); the buffer differs from the honest channel-0 master in %zu of %d frames\n",
+                         statusName (sol.status), sol.preLimiterGainDb, honest.preLimiterGainDb,
+                         sol.measured.integratedLufs, honest.measured.integratedLufs, notCh0, F);
+        }
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0
+                  && std::all_of (C.begin(), C.end(), [&] (float v) { return v == kSentinel; }),
+                  "out[0] = out[1] is refused before a render, writing nothing");
+        // ...and the two output planes one frame apart, so they share all but a frame.
+        std::vector<float> pool (Fz + 1, kSentinel);
+        float* shifted[2] = { pool.data(), pool.data() + 1 };
+        const auto sol2 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, shifted, 2, F, req);
+        test::ok (sol2.status == MasteringSolveStatus::InvalidRequest && sol2.passes == 0,
+                  "and so are two output planes one frame apart");
+    }
+
+    // (3) An output plane that STARTS INSIDE another channel's input, one frame in: no pointer is shared, the bytes are.
+    {
+        std::vector<float> pool (2 * Fz + 1, 0.0f), A = src.ch[0], C (Fz, kSentinel);
+        std::copy (src.ch[1].begin(), src.ch[1].end(), pool.begin());
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in[2] = { A.data(), pool.data() };
+        float* out[2] = { pool.data() + 1, C.data() };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, out, 2, F, req);
+        test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0,
+                  "an output plane starting one frame inside another channel's input is refused");
+        // ...and one that ENDS one frame inside it, from below.
+        const float* in2[2] = { A.data(), pool.data() + Fz };
+        float* out2[2] = { pool.data() + 1, C.data() };
+        const auto sol2 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in2, out2, 2, F, req);
+        test::ok (sol2.status == MasteringSolveStatus::InvalidRequest, "and so is one ending one frame inside it");
+        // ...and a plane one frame inside ITS OWN channel's input: pointer equality per channel, kept beside a byte test
+        // across channels only, passed every check above (the code-review round, by mutation).
+        std::vector<float> own (Fz + 1, 0.0f), B = src.ch[1];
+        std::copy (src.ch[0].begin(), src.ch[0].end(), own.begin());
+        const float* in3[2] = { own.data(), B.data() };
+        float* out3[2] = { own.data() + 1, C.data() };
+        const auto sol3 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in3, out3, 2, F, req);
+        test::ok (sol3.status == MasteringSolveStatus::InvalidRequest && sol3.passes == 0,
+                  "and so is an output plane one frame inside its own channel's input");
+    }
+
+    // (4) LEGAL: the four planes EDGE TO EDGE in one allocation, each output right after an input and right before the
+    //     next — both boundaries a `<=` would refuse. It is also the NARROW call: read as two allocations of 2F, each
+    //     input's buffer runs on past the call's F frames into the output that follows it.
+    {
+        std::vector<float> pool (4 * Fz, kSentinel);
+        std::copy (src.ch[0].begin(), src.ch[0].end(), pool.begin());
+        std::copy (src.ch[1].begin(), src.ch[1].end(), pool.begin() + (std::ptrdiff_t) (2 * Fz));
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in[2] = { pool.data(), pool.data() + 2 * Fz };
+        float* out[2] = { pool.data() + Fz, pool.data() + 3 * Fz };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, out, 2, F, req);
+        test::ok (sol.status == honest.status && sol.preLimiterGainDb == honest.preLimiterGainDb
+                  && sameBits (out[0], h0.data(), Fz) && sameBits (out[1], h1.data(), Fz),
+                  "planes edge to edge in one buffer are solved, bit-identical to disjoint buffers");
+    }
+
+    // (5) LEGAL: one buffer feeding BOTH input channels. Nothing is written into it, so nothing overlaps.
+    {
+        std::vector<float> A = src.ch[0], A2 = src.ch[0], o0 (Fz), o1 (Fz), r0 (Fz), r1 (Fz);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* shared[2] = { A.data(), A.data() };
+        float* out[2] = { o0.data(), o1.data() };
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, shared, out, 2, F, req);
+        Rig ref; if (! test::run (ref.build (2))) return;
+        const float* copies[2] = { A.data(), A2.data() };
+        float* rout[2] = { r0.data(), r1.data() };
+        const auto want = ref.solver.solve (ref.chain, ref.renderer, ref.params, copies, rout, 2, F, req);
+        test::ok (sol.status != MasteringSolveStatus::InvalidRequest && sol.status == want.status
+                  && sol.preLimiterGainDb == want.preLimiterGainDb
+                  && sameBits (o0.data(), r0.data(), Fz) && sameBits (o1.data(), r1.data(), Fz),
+                  "one buffer feeding both inputs is solved, bit-identical to two copies of it");
+    }
+
+    // (6) LEGAL: buffers REUSED across calls, the output of one the input of the next.
+    {
+        std::vector<float> A = src.ch[0], B = src.ch[1], C (Fz), D (Fz);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* in1[2] = { A.data(), B.data() };
+        float* out1[2] = { C.data(), D.data() };
+        const auto s1 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in1, out1, 2, F, req);
+        const float* in2[2] = { C.data(), D.data() };
+        float* out2[2] = { A.data(), B.data() };
+        const auto s2 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in2, out2, 2, F, req);
+        // The same two calls on a rig of their own, every buffer a fresh one: what reuse must not change.
+        std::vector<float> X = src.ch[0], Y = src.ch[1], P (Fz), Q (Fz), R (Fz), T (Fz);
+        Rig ref; if (! test::run (ref.build (2))) return;
+        const float* rin1[2] = { X.data(), Y.data() };
+        float* rout1[2] = { P.data(), Q.data() };
+        const auto r1 = ref.solver.solve (ref.chain, ref.renderer, ref.params, rin1, rout1, 2, F, req);
+        std::vector<float> P2 = P, Q2 = Q;
+        const float* rin2[2] = { P2.data(), Q2.data() };
+        float* rout2[2] = { R.data(), T.data() };
+        const auto r2 = ref.solver.solve (ref.chain, ref.renderer, ref.params, rin2, rout2, 2, F, req);
+        test::ok (s1.status != MasteringSolveStatus::InvalidRequest && s2.status != MasteringSolveStatus::InvalidRequest
+                  && s1.status == r1.status && s2.status == r2.status
+                  && s1.preLimiterGainDb == r1.preLimiterGainDb && s2.preLimiterGainDb == r2.preLimiterGainDb
+                  && sameBits (C.data(), P.data(), Fz) && sameBits (D.data(), Q.data(), Fz)
+                  && sameBits (A.data(), R.data(), Fz) && sameBits (B.data(), T.data(), Fz),
+                  "A -> B and then B -> A are two legal calls, bit-identical to the same two on fresh buffers");
+    }
+
+    // (6b) The widest call, at the predicate: eight channels, only the LAST pair touching, by one float — a loop that
+    //      stopped a channel short would pass every two-channel case above (the diverse-testing round).
+    {
+        float input8[8][3] {}; float output8[8][2] {};
+        const float* in8[8] {}; float* out8[8] {};
+        for (int c = 0; c < 8; ++c) { in8[c] = input8[c]; out8[c] = output8[c]; }
+        test::ok (planesUsable (in8, out8, 8, 2, 2), "eight disjoint channels are usable");
+        out8[7] = input8[7] + 1;
+        test::ok (! planesUsable (in8, out8, 8, 2, 2),
+                  "and eight whose last pair alone overlaps, by one float, are not");
+        out8[7] = output8[7];
+        out8[7] = out8[6] + 1;
+        test::ok (! planesUsable (in8, out8, 8, 2, 2),
+                  "and eight whose last two OUTPUT planes alone overlap, by one float, are not");
+    }
+
+    // (7) A NULL PLANE beside good ones. The old check caught it only by accident, where the same channel's output was
+    //     null too; otherwise it reached the renderer and was dereferenced (a crash, on main). LAST in this group for
+    //     that reason: run against the old header, the groups above still print.
+    {
+        std::vector<float> A = src.ch[0], B = src.ch[1], C (Fz, kSentinel), D (Fz, kSentinel);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const float* nullIn[2] = { A.data(), nullptr };
+        float* out[2] = { C.data(), D.data() };
+        const auto s1 = rig.solver.solve (rig.chain, rig.renderer, rig.params, nullIn, out, 2, F, req);
+        const float* in[2] = { A.data(), B.data() };
+        float* nullOut[2] = { nullptr, D.data() };
+        const auto s2 = rig.solver.solve (rig.chain, rig.renderer, rig.params, in, nullOut, 2, F, req);
+        test::ok (s1.status == MasteringSolveStatus::InvalidRequest && s1.passes == 0
+                  && s2.status == MasteringSolveStatus::InvalidRequest && s2.passes == 0
+                  && std::all_of (C.begin(), C.end(), [&] (float v) { return v == kSentinel; })
+                  && std::all_of (D.begin(), D.end(), [&] (float v) { return v == kSentinel; }),
+                  "a null input plane and a null output plane are each refused, writing nothing");
     }
 }
 
@@ -2705,6 +2926,7 @@ int main()
     testTheScaleLawIsPinned();
     testTheAbsoluteGateStepIsPinned();
     testTheReviewsCounterexamples();
+    testCrossChannelAliasingIsRefused();
     testTwoConstraintsAtOnce();
     testPreLimiterTapIsTheRealSignal();
     testTargetBetweenAchievable();
