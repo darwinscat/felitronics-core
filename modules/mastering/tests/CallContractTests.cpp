@@ -29,6 +29,7 @@
 #include <felitronics_test.h>
 
 #include <felitronics/analysis/LoudnessMeter.h>
+#include <felitronics/analysis/ReferenceTruePeakMeter.h>
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
@@ -226,6 +227,12 @@ ADAPT (A_TruePeakMeterBase, felitronics::analysis::TruePeakMeter, kPrepCh, true,
        { return s.truePeakDb(); },
        { return s.prepare (kFs, kMaxBlock, w); });
 
+ADAPT (A_ReferenceTruePeakMeterBase, felitronics::analysis::ReferenceTruePeakMeter, kPrepCh, true, true, false,
+       { felitronics::test::run (s.prepare (kFs, kMaxBlock, kPrepCh)); return true; },
+       { return s.process ((const float* const*) io, nch, n); },
+       { return s.truePeakDb(); },
+       { return s.prepare (kFs, kMaxBlock, w); });
+
 ADAPT (A_LoudnessMeterBase, felitronics::analysis::LoudnessMeter, kPrepCh, true, true, false,
        { felitronics::test::run (s.prepare (kFs, kPrepCh)); return true; },
        { return s.process ((const float* const*) io, nch, n); },
@@ -337,6 +344,8 @@ struct A_PowerAmp : A_PowerAmpBase { static constexpr bool hasPrepareWidth = fal
 // them whether a gap left something behind measures the memory they exist for. TruePeakMeter has a
 // per-block figure and answers honestly; LoudnessMeter has none, and says so.
 struct A_TruePeakMeter : A_TruePeakMeterBase
+{ static double blockObservable (T& s) { return s.truePeakDbBlock(); } };
+struct A_ReferenceTruePeakMeter : A_ReferenceTruePeakMeterBase
 { static double blockObservable (T& s) { return s.truePeakDbBlock(); } };
 struct A_LoudnessMeter : A_LoudnessMeterBase
 { static constexpr bool gapVisible = false; };
@@ -1226,6 +1235,7 @@ int main()
     allProperties<A_StereoWidth>();
     allProperties<A_PowerAmp>();
     allProperties<A_TruePeakMeter>();
+    allProperties<A_ReferenceTruePeakMeter>();
     allProperties<A_LoudnessMeter>();
     allProperties<A_MultibandComp>();
     allProperties<A_LinearPhaseEq>();

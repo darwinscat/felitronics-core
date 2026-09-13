@@ -89,7 +89,7 @@ endif()
 #
 # Module          Namespace               Target                Deps
 #   core          felitronics::core       felitronics::core     —            (Sample, sizes, Math, Smoother, flush)
-#   analysis      felitronics::analysis   felitronics::analysis core         (SpectrumTap; FFT via the seam)
+#   analysis      felitronics::analysis   felitronics::analysis core+oversampling (SpectrumTap; FFT via the seam; the reference true peak)
 #   dynamics      felitronics::dynamics   felitronics::dynamics  core         (EnvelopeFollower · GainComputer · Compressor · NoiseGate · AutoLeveler · TransientShaper · ChannelLinker)
 #   eq            felitronics::eq         felitronics::eq        core+analysis (matched biquads + Cytomic SVF + EqEngine)
 #
@@ -120,14 +120,15 @@ if(FELITRONICS_BUILD_TESTS)
     enable_testing()
 endif()
 
-# Order matters: dependees before dependents (analysis -> core; dynamics -> core; eq -> core + analysis).
+# Order matters: dependees before dependents (oversampling -> core; analysis -> core + oversampling; dynamics -> core;
+# eq -> core + analysis).
 add_subdirectory(modules/core)
+add_subdirectory(modules/oversampling)
 add_subdirectory(modules/analysis)
 add_subdirectory(modules/dynamics)
 add_subdirectory(modules/eq)
 add_subdirectory(modules/fftpffft)   # OPTIONAL, compiled pffft SIMD backend — before convolution, whose CabConvolver may select it
 add_subdirectory(modules/convolution)
-add_subdirectory(modules/oversampling)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
 add_subdirectory(modules/nam)   # OPTIONAL, compiled NAM backend — depends on neural + core; self-gates on FELITRONICS_WITH_NAM

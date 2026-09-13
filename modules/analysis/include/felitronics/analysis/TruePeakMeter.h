@@ -50,6 +50,14 @@ namespace detail
 // where tools/fcore_probe.h's longer 0.90 × Nyquist design spreads 0.0001. All four pass, and the spread is
 // not a correctness bug, but it is why the two designs disagree and it belongs in any decision to merge them.
 //
+// NOT THE INSTRUMENT A DELIVERED PROMISE IS AIMED WITH. A file promised "<= X dBTP" is certified by
+// `analysis::ReferenceTruePeakMeter` (what `fcore_measure` and the browser's `fc_probe` report), and a solver that
+// aimed with this meter instead certified its own reading rather than the delivered one: at 2x (88.2-176.4 kHz)
+// this meter evaluates the samples and the two quarter-sample points, at 1x (>= 176.4 kHz) the samples alone, so on
+// bright material it reads under the reference by more than any sane aim margin. How far, on which material and at
+// which rate, is pinned by felitronics_truepeak_instrument_gap_tests — the only owner of that number. This meter
+// stays the spec's filter and stays cheap; it is the right one for a live display and the wrong one for a promise.
+//
 // BS.1770-4 specifies a particular table; the Recommendation also allows an equivalent filter, so we DESIGN
 // one meeting the envelope (flat pass-band, ≥ ~60 dB image rejection) and VERIFY it against a published
 // external criterion rather than trusting a copied coefficient list: EBU Tech 3341-2023 §2.6 Table 1

@@ -264,6 +264,9 @@ handed lies inside the wasm heap instead of trapping on a pointer near the top o
   arbitrate**: on that 12 kHz fixture `ebur128` reports −0.3 dBTP while ours report −0.81 and −0.88, so both
   4× paths under-read it by about half a dB. That is a question about oversampling factor, not about which
   prototype is right.
+  *(P62, later: those figures are this spike's, on its fixtures. The gap on DELIVERED masters, at every delivery
+  rate, is pinned by `felitronics_truepeak_instrument_gap_tests`; the probe's filter now lives in
+  `analysis::ReferenceTruePeakMeter`, which `TargetLoudnessSolver` aims with.)*
 - **A single non-finite sample silently freezes the loudness.** The two paths fail differently, and only one
   of them recovers. The true peak is blind for 32 samples while the NaN sits in the polyphase ring
   (`std::max(x, NaN)` returns `x`) and then works again — feed it louder audio afterwards and it duly rises.

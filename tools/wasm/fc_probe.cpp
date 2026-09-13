@@ -172,9 +172,10 @@ FC_EXPORT std::uint32_t fc_probe_block_energies (double* out, std::uint32_t cap)
 // --- the waveform peaks and the stereo band (P59a) ---
 //
 // NAMES THAT CANNOT BE READ AS ANOTHER NUMBER OF THIS ABI. `fc_probe_waveform_*` and not `fc_probe_peaks`: this file
-// already reports two peaks, `fc_probe_sample_peak` and `fc_probe_tp_linear` (the true peak of fcore::Probe's 128-tap
-// REFERENCE filter — not analysis::TruePeakMeter's 48-tap spec filter, which the mastering chain runs: different
-// filters, different numbers, the size of the gap is P62's to measure), and a waveform bucket is neither: a
+// already reports two peaks, `fc_probe_sample_peak` and `fc_probe_tp_linear` (the true peak of the 128-tap REFERENCE
+// filter, analysis::ReferenceTruePeakMeter — the one TargetLoudnessSolver aims a delivered ceiling with — and not
+// analysis::TruePeakMeter's 48-tap spec filter: different filters, different numbers, the gap pinned by
+// felitronics_truepeak_instrument_gap_tests), and a waveform bucket is neither: a
 // box-averaged max-abs, not above the sample peak except by the rounding of a box mean. And
 // `fc_probe_stereo_rms` and not `_loud`, the spec's name: it is an RMS, and it sits in the same ABI as
 // `fc_probe_lufs`.

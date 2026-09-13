@@ -555,8 +555,7 @@ typedef struct fc_need
     // saying so is law 11d's own instruction ("what each number bounds is written where it is defined"):
     //
     //   * SOLVE — one PASS. The search builds its meters per pass and frees them at the pass's end, so
-    //     this is one pass, plus the true-peak drain the first solve keeps (afterwards an upper bound by
-    //     exactly that drain).
+    //     this is one pass.
     //   * MEASURE_LRA — one meter, and 0 for a programme too short to have a range, which the call
     //     refuses before building one.
     //   * CREATE — the SUM of what the call requests, which is what it holds: everything a create asks

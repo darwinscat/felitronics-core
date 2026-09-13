@@ -464,7 +464,8 @@ public:
     // at 4x, measured, a 1 kHz burst train agrees to **-0.0012 dB** and a pair of adjacent full-scale
     // impulses — maximally broadband, i.e. the worst case for two different low-passes — disagrees by
     // **-1.4183 dB**. Report it as the limiter's reconstruction, never as the file's true peak, and use
-    // `analysis::TruePeakMeter` for the latter. It cannot be recovered from the delivered file at all:
+    // `analysis::ReferenceTruePeakMeter` for the latter — the instrument a delivered file is certified with, so
+    // the one a promise about it is aimed with (P62). It cannot be recovered from the delivered file at all:
     // removing it is the limiter's whole job.
     double maxReconstructedPeakDb() const noexcept { return core::gainToDb ((double) linkedPeakLin_); }
 

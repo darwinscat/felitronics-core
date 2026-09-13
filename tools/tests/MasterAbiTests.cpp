@@ -1368,11 +1368,13 @@ int main()
         ok (solve.solverPrepared == 0, "PRECONDITION: the solver is not prepared yet");
 
         // THE ORACLE, literal on purpose (the one place a restatement is mandatory). 48 kHz stereo, 4 s: the loudness
-        // meter is sized for 192000 + 48000 samples = 50 hops of 4800 → 8·(300 + 54 + 13) = 2936 B; the true-peak
-        // meter 4·48 + 4·(2 ch · 2 · 12) + 4·2 = 392 B (the history ring became DOUBLE-LENGTH with P56, so
-        // core::firDot reads a contiguous window — P56; it was 296 B); the drain 2·64·4 = 512 B.
+        // meter is sized for 192000 + 48000 samples = 50 hops of 4800 → 8·(300 + 54 + 13) = 2936 B; the REFERENCE
+        // true-peak meter (P62) is, per channel, one 4x / 32-tap PolyphaseOversampler — prototype 128, phase-major copy
+        // 4·32, up ring 2·32, down ring 2·128 floats = 2304 B, plus two int cursors = 2312 B — and one shared scratch of
+        // 1024·4 floats = 16 384 B: 2·2312 + 16 384 = 21 008 B. It drains from a fixed array, so there is no drain term
+        // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer).
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
-        ok (solve.callBytes == 2936u + 392u + 512u, "the solve budget is meter + true-peak meter + drain = 3840 B");
+        ok (solve.callBytes == 2936u + 21008u, "the solve budget is meter + reference true-peak meter = 23 944 B");
 
         long long before = g_bytes.load();
         const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
@@ -1408,10 +1410,10 @@ int main()
         ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 143999, &under3) == FC_OK && under3.callBytes == 0,
             "one frame under 3 s: nothing is");
         // A solve builds its meters whatever the length — the range rule is NOT the solve's. 1 s still costs
-        // meter + true-peak meter + drain: 8·(300 + 24 + 10) + 392 + 512 = 3576 B. A length the solve refuses costs 0.
+        // meter + reference true-peak meter: 8·(300 + 24 + 10) + 21 008 = 23 680 B. A length the solve refuses costs 0.
         fc_need s1 {}, s0 {}; FC_INIT (s1); FC_INIT (s0);
-        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 3576u,
-            "a 1 s solve is budgeted in full: 3576 B");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 23680u,
+            "a 1 s solve is budgeted in full: 23 680 B");
         ok (fc_master_need (h, FC_NEED_SOLVE, 0, &s0) == FC_OK && s0.callBytes == 0,
             "a 0-frame solve, which the core refuses before any pass, costs 0");
 
@@ -1424,9 +1426,9 @@ int main()
         const long long solveBytes = g_bytes.load() - before;
         fc_solution_summary sum {}; FC_INIT (sum);
         ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the search rendered");
-        const long long perPass = (long long) solve.callBytes - 512;
-        ok (solveBytes == (long long) sum.passes * perPass + 512 + (long long) solve.facadeBytes,
-            "a solve allocates passes × (both meters) + the drain + the facade's record: its budget's parts");
+        const long long perPass = (long long) solve.callBytes;
+        ok (solveBytes == (long long) sum.passes * perPass + (long long) solve.facadeBytes,
+            "a solve allocates passes × (both meters) + the facade's record: its budget's parts");
         (void) fc_solution_destroy (sol);
         (void) fc_master_destroy (h);
     }
@@ -2100,7 +2102,7 @@ int main()
         }
 
         // BUDGETS: a delivered search and a delivered range, against the counter. The literal terms are the
-        // converted programme (2 ch x delivered frames x 4 B) and the drain (2 x 64 x 4 = 512 B).
+        // converted programme (2 ch x delivered frames x 4 B); since P62 there is no drain buffer to add.
         {
             fc_master_config c = deliveringConfig (48000.0, 96000.0);
             fc_master h = 0;
@@ -2122,9 +2124,9 @@ int main()
             const long long solveBytes = g_bytes.load() - before;
             fc_solution_summary sum {}; FC_INIT (sum);
             ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the delivered search rendered");
-            const long long perPass = (long long) solve.callBytes - programme - 512;
-            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + programme + 512 + (long long) solve.facadeBytes,
-                "a delivered solve allocates passes x (both meters at 96 kHz) + the converted programme + the drain + the record ("
+            const long long perPass = (long long) solve.callBytes - programme;
+            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + programme + (long long) solve.facadeBytes,
+                "a delivered solve allocates passes x (both meters at 96 kHz) + the converted programme + the record ("
                 + std::to_string (solveBytes) + ")");
             (void) fc_solution_destroy (sol);
             (void) fc_master_destroy (h);

@@ -154,28 +154,26 @@ struct Rig
     }
 };
 
-// An INDEPENDENT measurement of a delivered buffer: this file's own meters, drained the way the
-// solver's are, so "the statistics agree with an independent measurement of the rendered file" is a
-// null and not a re-read.
+// An INDEPENDENT measurement of a delivered buffer: this file's own meters, run on the buffer the solve
+// handed back, so "the statistics agree with an independent measurement of the rendered file" is a null
+// and not a re-read. The true peak is read by the CERTIFYING instrument (P62) — this null is the claim that
+// the number a solve reports is the certificate of the file it delivered.
 struct Independent { double I = 0.0, TP = 0.0, LRA = 0.0, sp = 0.0; int blocks = 0; };
 
 Independent measureIndependently (const std::vector<std::vector<float>>& buf)
 {
     Independent r;
     const int nch = (int) buf.size(), n = (int) buf[0].size();
-    analysis::LoudnessMeter lm; analysis::TruePeakMeter tm;
+    analysis::LoudnessMeter lm; analysis::ReferenceTruePeakMeter tm;
     if (! lm.prepare (kFs, nch, (double) n / kFs + 1.0)) return r;
     if (! tm.prepare (kFs, 65536, nch)) return r;
     std::vector<const float*> p ((std::size_t) nch);
     for (int c = 0; c < nch; ++c) p[(std::size_t) c] = buf[(std::size_t) c].data();
     if (! lm.process (p.data(), nch, n)) return r;
     if (! tm.process (p.data(), nch, n)) return r;
-    std::vector<std::vector<float>> z ((std::size_t) nch, std::vector<float> (64, 0.0f));
-    std::vector<const float*> zp ((std::size_t) nch);
-    for (int c = 0; c < nch; ++c) zp[(std::size_t) c] = z[(std::size_t) c].data();
-    (void) tm.process (zp.data(), nch, 64);
+    tm.drain();
     r.I = lm.integratedLufs(); r.TP = tm.truePeakDb(); r.LRA = lm.loudnessRangeLu();
-    r.sp = tm.samplePeakDb(); r.blocks = lm.gatingBlockCount();
+    r.sp = core::gainToDb (tm.samplePeakLinear()); r.blocks = lm.gatingBlockCount();
     return r;
 }
 
@@ -1407,7 +1405,7 @@ void testTapPlumbingEdges()
         if (! test::run (sol.status == MasteringSolveStatus::Solved)) return;
         // An UNDRAINED reading of the same buffer, for the comparison: this is what the number would be
         // without the drain, and the point is that the reported one is not it.
-        analysis::TruePeakMeter dry;
+        analysis::ReferenceTruePeakMeter dry;
         if (! test::run (dry.prepare (kFs, 65536, 2))) return;
         const float* dp[2] = { o.ch[0].data(), o.ch[1].data() };
         if (! test::run (dry.process (dp, 2, n))) return;
@@ -2266,19 +2264,22 @@ static void testTheMeterIsSizedInSamples()
 static void testTheBudgetsRefuseWhatTheCallsRefuse()
 {
     test::group ("a budget is 0 where its call refuses — channel counts included");
-    using felitronics::analysis::TruePeakMeter;
+    using felitronics::analysis::ReferenceTruePeakMeter;
     const int past = felitronics::core::kMaxChannels + 1;
-    test::ok (TruePeakMeter::storageFor (48000.0, 0).bytes() == 0 && TruePeakMeter::storageFor (48000.0, -1).bytes() == 0
-              && TruePeakMeter::storageFor (48000.0, past).bytes() == 0,
-              "TruePeakMeter::storageFor: 0 bytes for a channel count prepare() refuses");
-    // 392, not the 296 this line pinned before P56, which gave the meter a DOUBLE-LENGTH history ring
-    // (every sample stored twice so core::firDot reads a contiguous window), which doubles hist_ and nothing
-    // else. 4·48 taps + 4·(2 ch · 2 · 12) + 4·2 = 192 + 192 + 8.
-    test::ok (TruePeakMeter::storageFor (48000.0, 2).bytes() == 392, "and 392 B for stereo at 48 kHz (the ABI suite's oracle)");
+    test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 0).bytes() == 0 && ReferenceTruePeakMeter::storageFor (48000.0, -1).bytes() == 0
+              && ReferenceTruePeakMeter::storageFor (48000.0, past).bytes() == 0,
+              "ReferenceTruePeakMeter::storageFor: 0 bytes for a channel count prepare() refuses");
+    // 21 008 B, derived rather than read back: per channel one PolyphaseOversampler at 4x / 32 taps per phase —
+    // the prototype 128 floats, its phase-major copy 4·32, the up ring 2·32 and the down ring 2·128 (P56's
+    // double-length rings; the reference upsamples only, but the class allocates both), 576 floats = 2304 B, plus
+    // two int cursors, 8 B — so 2 312 B a channel; and the shared scratch, kChunk·4 = 4 096 floats = 16 384 B.
+    // (Before P62 the solver read with TruePeakMeter, 392 B, plus a 512 B drain buffer.)
+    test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 2).bytes() == 2u * 2312u + 16384u,
+              "and 21 008 B for stereo (the ABI suite's oracle)");
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000) == 0
               && TargetLoudnessSolver::solveBytes (48000.0, past, 48000) == 0,
               "solveBytes: 0 for a channel count solve() refuses");
-    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000) == 3576, "and 3576 B for 1 s of stereo (the ABI suite's oracle)");
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000) == 2672u + 21008u, "and 23 680 B for 1 s of stereo (the ABI suite's oracle)");
     // A prepare() refused on its bin width (400 dB at 1e-7 dB is 4e9 bins, past the 4e6 ceiling) allocates NOTHING —
     // which is what its budget says. The diverse-testing round found the tap buffers assigned before that refusal, and
     // kept. The delta is read into a local before the check.
@@ -2292,15 +2293,15 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     }
     test::ok (TargetLoudnessSolver::solveBytes (0.0, 2, 48000) == 0 && TargetLoudnessSolver::solveBytes (-1.0, 2, 48000) == 0
               && TargetLoudnessSolver::measureRangeBytes (0.0, 480000) == 0, "and 0 for a rate the solver refuses");
-    // The true-peak meter's factor follows the RATE, and so must its budget — one rate could not tell (the diverse-
-    // testing round's mutant sized it at 48 kHz and passed). Derived: 1 s is 20 hops at any multiple of 100 Hz, so the
-    // loudness meter is 8·(300 + 24 + 10) = 2672 B; the true-peak meter at factor F is 4·12F + 4·2·2·12 + 4·2 (the
-    // middle term doubled with P56 — see the note above); the drain 512.
-    test::ok (TruePeakMeter::storageFor (96000.0, 2).bytes() == 296 && TruePeakMeter::storageFor (192000.0, 2).bytes() == 248,
-              "the true-peak meter at 96 kHz (factor 2) is 296 B, at 192 kHz (factor 1) 248 B");
-    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 296u + 512u
-              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 248u + 512u,
-              "and a 1 s solve at 96 and 192 kHz carries that meter: 3480 and 3432 B");
+    // The cheap meter's factor followed the RATE and its budget had to follow too (the diverse-testing round's mutant
+    // sized it at 48 kHz and passed). The reference is 4x at EVERY rate, so its budget must NOT move with the rate —
+    // the opposite claim, pinned for the same reason: one rate could not tell. 1 s is 20 hops at any multiple of 100 Hz,
+    // so the loudness meter is 8·(300 + 24 + 10) = 2672 B at each of them.
+    test::ok (ReferenceTruePeakMeter::storageFor (96000.0, 2).bytes() == 21008u && ReferenceTruePeakMeter::storageFor (192000.0, 2).bytes() == 21008u,
+              "the reference true-peak meter is 21 008 B at 96 and at 192 kHz too");
+    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 21008u
+              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 21008u,
+              "and a 1 s solve at 96 and 192 kHz carries it unchanged: 23 680 B");
 }
 
 int main()

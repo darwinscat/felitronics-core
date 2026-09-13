@@ -1,9 +1,10 @@
 # felitronics::analysis — RT metering, the analyser taps and the spectrum panes (SpectrumPane, MultiResSpectrumPane);
-# offline display curves under ::offline. Header-only; depends on core.
+# offline display curves under ::offline. Header-only; depends on core, and on oversampling for the REFERENCE
+# true-peak meter (ReferenceTruePeakMeter), which is the reference because it is that oversampler.
 add_library(felitronics_analysis INTERFACE)
 add_library(felitronics::analysis ALIAS felitronics_analysis)
 target_include_directories(felitronics_analysis INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(felitronics_analysis INTERFACE felitronics::core)
+target_link_libraries(felitronics_analysis INTERFACE felitronics::core felitronics::oversampling)
 target_compile_features(felitronics_analysis INTERFACE cxx_std_20)
 
 if(FELITRONICS_BUILD_TESTS)
@@ -36,6 +37,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_truepeak_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_truepeak_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_truepeak_tests COMMAND felitronics_truepeak_tests)
+
+    add_executable(felitronics_reference_truepeak_tests tests/ReferenceTruePeakMeterTests.cpp)   # bit-for-bit the 4x/32 reference
+    target_link_libraries(felitronics_reference_truepeak_tests PRIVATE felitronics::analysis)
+    target_include_directories(felitronics_reference_truepeak_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_reference_truepeak_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_reference_truepeak_tests COMMAND felitronics_reference_truepeak_tests)
 
     add_executable(felitronics_spectrum_curve_tests tests/SpectrumCurveTests.cpp)
     target_link_libraries(felitronics_spectrum_curve_tests PRIVATE felitronics::analysis)
