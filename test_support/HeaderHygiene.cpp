@@ -22,11 +22,15 @@
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/analysis/WaveformPeaks.h>
 #include <felitronics/blend/Blend.h>
+#include <felitronics/blend/BlendKernels.h>
+#include <felitronics/blend/BlendParams.h>
+#include <felitronics/blend/IrBlend.h>
 #include <felitronics/blend/Overlay.h>
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
 #include <felitronics/core/Config.h>
@@ -40,6 +44,7 @@
 #include <felitronics/core/PolyphaseFir.h>
 #include <felitronics/core/RtStreams.h>
 #include <felitronics/core/Smoother.h>
+#include <felitronics/core/StateGrid.h>
 #include <felitronics/core/StreamResampler.h>
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dither/Dither.h>
@@ -73,7 +78,9 @@
 #include <felitronics/lineareq/MagnitudeCurve.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
+#include <felitronics/mastering/DeliveredMastering.h>
 #include <felitronics/mastering/DeliveryConverter.h>
+#include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/mastering/Planes.h>
