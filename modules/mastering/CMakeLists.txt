@@ -34,6 +34,12 @@ if(FELITRONICS_BUILD_TESTS)
     # outside — a hand-built reference chain, an independently computed alignment oracle, and the
     # measured passband table — so a defect that is consistent with the chain's own arithmetic still
     # fails here.
+    # P57 step 2 — SRC first: the whole-programme delivery conversion both render paths call.
+    add_executable(felitronics_mastering_deliveryconverter_tests tests/DeliveryConverterTests.cpp)
+    target_link_libraries(felitronics_mastering_deliveryconverter_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_mastering_deliveryconverter_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    add_test(NAME felitronics_mastering_deliveryconverter_tests COMMAND felitronics_mastering_deliveryconverter_tests)
+
     add_executable(felitronics_mastering_oracle_tests tests/MasteringOracleTests.cpp)
     target_link_libraries(felitronics_mastering_oracle_tests PRIVATE felitronics::mastering)
     target_include_directories(felitronics_mastering_oracle_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

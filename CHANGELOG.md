@@ -57,6 +57,80 @@ clean), and full scale plays no part (clipped and then turned down is still clip
   or run index outside the report, or any call before prepare(), read past a vector; they now answer empty.
   ~13 ns/sample on arm64 (a heavily clipped 5-minute stereo file in 0.38 s).
 
+### `core` — a delivery resampler: rational L:M, 146.58 dB of stopband measured through it on all 30 pairs
+
+A new primitive, **`core::DeliveryResampler`**: the rational polyphase windowed-sinc converter for the rate a
+file is DELIVERED at — 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz, every pair, both directions. Neither
+neighbour was touched or widened: `StreamResampler` interpolates between phase-table rows and floors near
+-105 dB whatever its kernel, and `resampleIr` is an IR-load one-shot. Non-integer rates are refused, not
+approximated.
+
+- **The bar, measured through the converter, not read off a formula.** Stopband >= 140 dB and ripple
+  <= 0.001 dB to 20 kHz were asked. Delivered, over all 30 directed pairs: worst line **-146.58 dB**, worst
+  ripple **0.0000013 dB**, worst absolute gain error **0.0000014 dB**; a 48 -> 44.1 -> 48 round trip nulls
+  at **-143.3 dBFS peak / -160.3 RMS** against an analytic oracle (asked: -120). The Kaiser formula does
+  not certify at this depth (asking 140 measures -139.3), so the design target is 146 dB and the transition
+  ends 6 % of its width INSIDE the Nyquist: without that margin the matrix was not even monotone in the
+  target — asking 2 dB more took the worst line from -142.0 to -139.0, through the bar.
+- **Routes are costed, not written down.** A stage's work is `K * f_in * f_out / df` with no L in it, so a
+  cascade's only lever is where the narrow transition runs. 192 -> 44.1 goes **192 -> 88.2 -> 44.1**
+  (26.99 MMAC/s, 12,792 coefficients) against 42.34 MMAC/s and 141,120 coefficients single-stage — and not
+  the textbook 192 -> 96 -> 48 -> 44.1 (29.96). 176.4 <-> 192 is where decomposition has nothing to give:
+  it goes direct, because every lower rung discards band that pair must carry. At most two stages anywhere.
+- **The passband edge is proportional** — 20.000 kHz whenever 44.1 is involved, 80 kHz on 176.4 <-> 192 —
+  and a parameter, because it is the one number that changes what the output contains.
+- **Double in the sample loop, as a named law-3 carve-out.** Narrowing only the four accumulators to float32
+  fails the bar on 13 of the 30 pairs (worst -132.19 dB), so `firDot` is not reused; bit agreement across
+  rows is not promised.
+- **Latency is an exact rational**, each stage an integer number of its own input samples (N = 2Lk + 1), and
+  it is measured back out of the carrier phase on single stages and cascades alike. `flush()` drains it;
+  law 11 holds clause by clause (long calls chunk, a stopped channel drops its memory, a gap spends the
+  clock, `process()` after `flush()` is refused).
+- **Two suites, and the instrument is itself under test.** The spectral bar suite carries four negative
+  controls — including an off-bin -138 dB image that the first, rectangular-window version of the suite read
+  as -141.3 and passed. A mutation stand of 33 mutants catches all 32 non-equivalent ones; the survivor, a
+  redundant range test, and an earlier pruning mutant are proven equivalent (144,360 and 624 plans
+  bit-identical with and without them).
+
+### `analysis` · `tools` — the waveform bars and the stereo band: one definition, two roads
+
+The site draws two pictures from audio, and each had several definitions: the waveform "peaks" came from a Java
+sidecar generator (ffmpeg to 8 kHz **s16**, integer buckets), a python script, the page's own JavaScript, and a
+client-side costume that re-scaled demo sidecars by their true peak; the stereo band's correlation had the page's,
+`fcore_measure`'s `long double` one and `CorrelationMeter`'s (a different quantity). A demo file and an uploaded one
+could be drawn by different definitions in the same interface, and both pictures looked plausible. This is the core
+half — the one definition and its two roads; moving the site's generators and page onto it is the site's work.
+
+- **`analysis::WaveformPeaks`** — a port of `computePeaksFromBuffer` / `peaksFromWav` (audio-peaks.js), bit for bit:
+  box-average decimation to ~8 kHz (`Math.round`, ties up), then max-abs per bucket; mix modes `avr` · `L` · `R`
+  (the LAST channel) · `max`; the double output and the float32 form, because the two JS functions differ exactly
+  there. **Not a metering peak**: not above the sample peak except by the rounding of a box mean, and neither of the core's
+  two true peaks.
+- **`analysis::StereoColumns` / `StereoSums`** — a port of `computeStereoColumns` / `correlationOf` / `widthOf`
+  (stereo-meter.js): per column width, **uncentred** phase correlation (not Pearson's, whatever the JS comment
+  says — (1,2)/(2,1) reads 0.8) and RMS (the JS `loud`; not a loudness), `maxRms` as the unrounded double the page's
+  verdict thresholds use, and the playhead needle over any stretch. The verdict stays on the page.
+- **The spec's known properties are kept, each pinned by a witness the site's own JS computed in node**: the last
+  waveform bucket is never emitted at decLen 2007 / 1000 buckets (the boundary is 2007.0000000000002); a column
+  boundary is floor(i·(len/cols)), so frame 200 of 1206/1200 is in column 200 and the last frame can be in none; a
+  partial box is dropped; short files zero-fill buckets but shrink the column count.
+- **Contraction:** the stereo products go through `volatile` stores (law 10 now names the pin): `mid += m*m` fused on
+  arm64 reads a width of …0010 where the JS reads …0012. The pin was measured on Apple clang 21 arm64, gcc 14.2 x86-64 and gcc 14 arm64 under `on`/`fast`; the removed pin fuses where each compiler fuses, and the witnesses see it there.
+- **Roads:** `fcore::ShapeProbe`, shared by `fcore_measure waveform|stereo|needle` and the new `fc_probe_shapes_run`,
+  `fc_probe_waveform_*`, `fc_probe_stereo_*`, `fc_probe_needle` exports (names that cannot be read as
+  `fc_probe_sample_peak`, `fc_probe_tp_linear` or `fc_probe_lufs`); existing `fc_probe_*` unchanged. The wasm export
+  list is now generated from the source, as fc_master's is. A CI step diffs native against wasm (release and checked)
+  over every mix mode, bucket and column count and a mono / stereo / six-channel fixture.
+- **`fcore_measure correlation`** is the stereo band's binary64 formula over the whole file; law 9's one sanctioned
+  `long double` exception is gone, and the artifact gate lost its one named exclusion.
+- **Measured (out of tree, `.private/harness/p59a-shapes/`):** NULL site-JS vs C++ (`-ffp-contract=fast`) vs wasm on
+  560 synthetic, 35 real and 79 decoded gate items — 0 differences, 0 split mismatches. Demo road vs upload road:
+  lossless WAV/FLAC at the native rate bit-identical after PCM equality (46 of 53 files; the 7 others are float64 WAV,
+  which the site's WAV reader reads as zeros — a site finding); 21 lossy decoder pairs all inside the bound derived
+  from their own per-sample difference, including fixed-point decoders clamping a +20 dB master at 1.0. Mutation
+  stand: 31 mutants, 28 killed (the two-statement removal of the product pin only by the out-of-tree NULL); the three
+  survivors are two equivalent guards and a null check whose removal is undefined behaviour only UBSan sees.
+
 ## v0.31.0 — 2026-09-12
 
 ### `core` · `oversampling` · `analysis` — one polyphase FIR kernel for the whole tree, and five rows that agree on its bits

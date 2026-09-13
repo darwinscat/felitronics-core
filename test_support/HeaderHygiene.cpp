@@ -16,8 +16,10 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 #include <felitronics/analysis/SpectrumTap.h>
+#include <felitronics/analysis/StereoColumns.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
 #include <felitronics/analysis/TruePeakMeter.h>
+#include <felitronics/analysis/WaveformPeaks.h>
 #include <felitronics/blend/Blend.h>
 #include <felitronics/blend/Overlay.h>
 #include <felitronics/convolution/CabConvolver.h>
@@ -28,6 +30,7 @@
 #include <felitronics/convolution/PartitionedConvolver.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
+#include <felitronics/core/DeliveryResampler.h>
 #include <felitronics/core/DryAligner.h>
 #include <felitronics/core/Fft.h>
 #include <felitronics/core/FlushToZero.h>
@@ -69,6 +72,7 @@
 #include <felitronics/lineareq/MagnitudeCurve.h>
 #include <felitronics/lineareq/MixedPhaseFir.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
+#include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/measurement/CaptureGate.h>
