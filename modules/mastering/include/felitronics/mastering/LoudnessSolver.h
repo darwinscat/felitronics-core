@@ -246,6 +246,15 @@ struct MasterMeasurement
 // caller who forgot to, and forgetting is silent. So both are NaN and `solve()` refuses until the
 // caller states them. `toleranceLu` DOES have a default, because it is a property of the measurement
 // rather than of the product.
+//
+// "-1 dBTP" WITHOUT THE NAME OF AN INSTRUMENT IS HALF A PROMISE — one quantity, two definitions, the class of
+// defect this core spent a sprint removing. The ceiling here is held as `analysis::ReferenceTruePeakMeter`
+// reads it: the instrument `fcore_measure` certifies a file with, the one this class aims with, and so the
+// one whose reading `measured.truePeakDbTp` IS. Like every BS.1770-class meter, that reference reads under
+// the band-limited peak of the signal — by up to 0.33 dB on a full-band click, pinned in
+// felitronics_truepeak_instrument_gap_tests — so another vendor's meter may read a delivered file higher than
+// the promise. That is the method's property and a decision, not a gap to close here: moving the certifying
+// instrument would move every certificate already issued.
 struct LoudnessRequest
 {
     double targetLufs      = std::numeric_limits<double>::quiet_NaN();   // REQUIRED

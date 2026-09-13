@@ -35,5 +35,10 @@ deliveries certified above -1 dBTP before, 0 after.
   a zero-padding grid); the burst rows are the grid's closed form at 96 and 192 kHz, and at 176.4 kHz and above the
   cheap meter is shown to be a sample-peak meter. The reference is not the truth either, and that is pinned too:
   0.0272 dB under it on the drums, 0.3270 dB under it on a click flat to 0.45 fs at 48 kHz.
+- **The promise names its instrument.** `LoudnessRequest`'s documentation now says what "-1 dBTP" means: the
+  ceiling as `analysis::ReferenceTruePeakMeter` (and so `fcore_measure`) reads it. Like any BS.1770-class meter the
+  reference under-reads the band-limited peak — up to 0.33 dB on a full-band click, pinned in the gap suite — so a
+  third-party meter may read a delivered file above the promise. Kept on purpose: changing the certifying instrument
+  would move every certificate already issued.
 - **`felitronics_delivered_ceiling_tests`** (new): every source rate to every delivery rate of the six solves,
   certifies at or under the promise, and reports the certificate exactly.
