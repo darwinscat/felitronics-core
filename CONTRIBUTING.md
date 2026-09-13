@@ -28,6 +28,12 @@ Ideas are not copyrightable — only their expression is — so a well-described
 can be implemented here freely. You get the fix you wanted, with credit, and the project keeps
 its options open.
 
+Describe it in prose, though — **please do not paste code into the issue**. A pasted patch brings
+the same copyright question in through the side door, and code that has been read cannot be
+unread: someone who has seen your implementation can no longer write that part independently. The
+problem, the approach and the behaviour you expect are what is useful here, and none of that needs
+a diff.
+
 ## What this policy does NOT do
 
 It takes away none of the freedoms the AGPL grants you. You may use this library, study it,
@@ -40,3 +46,6 @@ The optional compiled backends vendor third-party code (pffft, NeuralAmpModelerC
 nlohmann/json, namz) under permissive licences, recorded in `THIRD_PARTY_NOTICES.md`. Those are
 governed by their own terms and are unaffected by the policy above. New third-party dependencies
 are not added without review — see the watch-list at the bottom of that file.
+
+The Felitronics and Darwin's Cat names and logos are trademarks and are *not* covered by the code
+licence.
