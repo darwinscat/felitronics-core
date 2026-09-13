@@ -4,7 +4,7 @@
 #pragma once
 
 #include <felitronics/analysis/LoudnessMeter.h>
-#include <felitronics/analysis/TruePeakMeter.h>
+#include <felitronics/analysis/ReferenceTruePeakMeter.h>
 #include <felitronics/dynamics/offline/Quantile.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
@@ -68,7 +68,7 @@ namespace felitronics::mastering
 //
 // THE DERATE IS NOT A CONSTANT HERE, and that is the point. `TruePeakLimiter` bounds its own F*fs grid
 // exactly and overshoots the reconstructed peak between grid points — up to +1.22 dB in the worst
-// non-degenerate case at 4x, and measured IN SITU on the corpus at only +0.0005 .. +0.1028 dB, because
+// non-degenerate case at 4x, and measured IN SITU on the corpus (with the pre-P62 meter) at only +0.0005 .. +0.1028 dB, because
 // spectral tilt buys it cheaply. A fixed 1.2 dB derate would cost loudness on every track. Here the
 // delivered peak is MEASURED and enters `PLR`, so the derate is whatever the material's is, on that
 // material, and the ceiling that gets programmed into the limiter is an OUTPUT of the solve.
@@ -83,6 +83,24 @@ namespace felitronics::mastering
 // probe that re-runs only the limiter is not cheap, and a scheme that saves chain renders while
 // running the limiter saves nothing. This class therefore minimises RENDERS, states its probe cost
 // openly, and reports both numbers.
+//
+// ====================================================================================
+// WHICH TRUE-PEAK METER, AND WHY IT IS THE EXPENSIVE ONE
+// ====================================================================================
+// `maxTruePeakDbTp` is a promise about the DELIVERED file, and a delivered file is certified by
+// `analysis::ReferenceTruePeakMeter` — what `fcore_measure` and the browser's `fc_probe` report. So every
+// render is read by that class and nothing else: the ceiling is aimed, feasibility is judged and
+// `measured.truePeakDbTp` is reported on the same arithmetic the certificate runs, and the reported number
+// IS the certificate — bit for bit, on the delivered samples. This class used to read with
+// `analysis::TruePeakMeter`, the spec's short filter, and judged a render feasible by a number the
+// certificate did not agree with: that meter stops interpolating at 2x / 1x on the high delivery rates, and
+// on bright transients under-reads even at 4x. How far the two disagree is pinned by
+// felitronics_truepeak_instrument_gap_tests. A wider aim margin was the alternative and was rejected: the
+// disagreement depends on the material, so any margin is a guess about the worst programme and a tax on
+// every other one.
+// The price is the reference's filter on every pass, which is a fraction of the render the pass already
+// is — and cheaper than any scheme that aims with one meter and verifies with the other, since that scheme
+// needs an extra RENDER whenever the two disagree.
 //
 // ====================================================================================
 // WHY THE PREDICATE IS NOT `I == target`
@@ -323,6 +341,15 @@ struct MasterMeasurement
 // caller who forgot to, and forgetting is silent. So both are NaN and `solve()` refuses until the
 // caller states them. `toleranceLu` DOES have a default, because it is a property of the measurement
 // rather than of the product.
+//
+// "-1 dBTP" WITHOUT THE NAME OF AN INSTRUMENT IS HALF A PROMISE — one quantity, two definitions, the class of
+// defect this core spent a sprint removing. The ceiling here is held as `analysis::ReferenceTruePeakMeter`
+// reads it: the instrument `fcore_measure` certifies a file with, the one this class aims with, and so the
+// one whose reading `measured.truePeakDbTp` IS. Like every BS.1770-class meter, that reference reads under
+// the band-limited peak of the signal — by up to 0.33 dB on a full-band click, pinned in
+// felitronics_truepeak_instrument_gap_tests — so another vendor's meter may read a delivered file higher than
+// the promise. That is the method's property and a decision, not a gap to close here: moving the certifying
+// instrument would move every certificate already issued.
 struct LoudnessRequest
 {
     double targetLufs      = std::numeric_limits<double>::quiet_NaN();   // REQUIRED
@@ -337,6 +364,11 @@ struct LoudnessRequest
     // change in the limiter's own between-grid overshoot across one correction step, which is a few
     // thousandths of a dB; 0.05 is two decades of slack and is still an order below the 0.5 dB a
     // mastering engineer would notice.
+    // THAT ARGUMENT HOLDS ONLY BECAUSE THE AIM AND THE PROMISE ARE READ BY ONE INSTRUMENT (P62). Before, the
+    // solver read every render with `analysis::TruePeakMeter` while the delivered file was certified by the
+    // reference, and the two disagree by more than this margin on bright material and at the high delivery
+    // rates where the cheap meter stops interpolating — so a render the solver called feasible was delivered
+    // above its promise. No margin fixes that, because the disagreement is the material's: see measure().
     double truePeakAimDb   =   0.05;
 
     // Constraints. A target that needs one of these broken is REFUSED with the name, not forced through.
@@ -500,12 +532,11 @@ public:
 
     //==========================================================================================================
     // THE BUDGETS — what a call will ask the heap for, computed by the very functions the call sizes itself with
-    // (tapLayoutFor, QuantileHistogram::binsFor, meterSamples, LoudnessMeter::storageFor, TruePeakMeter::storageFor),
+    // (tapLayoutFor, QuantileHistogram::binsFor, meterSamples, LoudnessMeter::storageFor, ReferenceTruePeakMeter::storageFor),
     // so a budget cannot drift from its allocation — exact for a FRESH object: one already prepared keeps whatever
     // storage still fits and asks nothing for it. REQUESTED bytes: allocator headers, alignment and fragmentation
     // are the caller's margin, and none of this is a promise that a heap can serve it. Static on purpose — a caller
     // budgets before it prepares anything, and the rate is an argument, not state.
-    static constexpr int    kDrainFrames = 64;       // zeros the true-peak meter is drained with — see measure()
     static constexpr double kGrRangeDb   = 400.0;    // the gain-reduction histograms' span — see prepare()
 
     // prepare(): the tap buffers and the two histograms. 0 where prepare() refuses the same arguments.
@@ -519,18 +550,16 @@ public:
         return (std::uint64_t) sizeof (float) * ((std::uint64_t) frameCap + 2u * (std::uint64_t) osCap) + 2u * hist;
     }
 
-    // solve(): its PEAK. Every pass builds a loudness meter and a true-peak meter and frees them at the pass's end, so
-    // the peak is ONE pass — plus the drain buffer, which the first solve allocates and later ones reuse (after the
-    // first solve this is therefore an upper bound, by exactly `numChannels * kDrainFrames` floats). 0 for a length
+    // solve(): its PEAK. Every pass builds a loudness meter and the reference true-peak meter and frees them at the
+    // pass's end, so the peak is ONE pass. (The drain used to be a buffer of zeros the first solve allocated and later
+    // ones reused; the reference meter drains from its own fixed array, so there is nothing left over.) 0 for a length
     // or a channel count solve() refuses before any pass.
     static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames) noexcept
     {
         if (frames <= 0 || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
         const std::uint64_t meter = meterBytes (sampleRate, frames);
         if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
-        return meter
-             + analysis::TruePeakMeter::storageFor (sampleRate, numChannels).bytes()
-             + (std::uint64_t) sizeof (float) * (std::uint64_t) numChannels * (std::uint64_t) kDrainFrames;
+        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes();
     }
 
     // measureInputLoudnessRange(): one loudness meter — and NOTHING for a programme too short to have a range, which it
@@ -1340,7 +1369,8 @@ private:
     //    -17.14 LUFS against the truth of -18.17, with the only outward sign a counter nobody reads.
     //  * the true-peak meter is DRAINED, and the drain is not given to the loudness meter. A programme
     //    ending on a peak under-reads without it: `[... 0, 1, 1]` reads +0.000000 dBTP undrained and
-    //    +1.750350 once 8 zeros have gone through, and shipping the first number is precisely the
+    //    +1.833993 drained (the reference, pinned in felitronics_reference_truepeak_tests; the cheap meter
+    //    this class used before P62 read +1.750350 after 8 zeros), and shipping the first number is precisely the
     //    defect P1 measured in the chain this replaces — rows shipping ABOVE their own ceiling while
     //    the interface reports success. The COUNT deliberately does not live here: its owner is the
     //    baseline harness in another repository, it moves whenever that corpus does, and nothing in
@@ -1384,10 +1414,16 @@ private:
         return true;
     }
 
+    // How the two peaks are written in dB — the form this class has always reported (it was `TruePeakMeter`'s):
+    // `gainToDb` above 1e-10f — the float threshold, widened, so the boundary is the old one to the bit — and -200 for
+    // anything quieter. Kept on purpose when the instrument changed (P62), so
+    // the switch moves the READING and nothing about how silence is spelled to a caller that tests for it.
+    static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDb (lin) : -200.0; }
+
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {
-        analysis::LoudnessMeter  lm;
-        analysis::TruePeakMeter  tm;
+        analysis::LoudnessMeter           lm;
+        analysis::ReferenceTruePeakMeter  tm;
         if (! lm.prepareForSamples (fs_, nch, meterSamples (frames, fs_))) return false;
         for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! tm.prepare (fs_, frames > 0 ? frames : 1, nch)) return false;
@@ -1395,21 +1431,15 @@ private:
         for (int c = 0; c < nch; ++c) p[c] = out[c];
         if (! lm.process (p, nch, frames)) return false;
         if (! tm.process (p, nch, frames)) return false;
-
-        // 64 zeros: the meter's FIR holds 12 base-rate samples, and 8 were measured to be enough to
-        // deliver the whole answer. Eight times that costs nothing and leaves no argument.
-        drain_.assign ((std::size_t) nch * (std::size_t) kDrainFrames, 0.0f);
-        const float* z[core::kMaxChannels] {};
-        for (int c = 0; c < nch; ++c) z[c] = drain_.data() + (std::size_t) c * (std::size_t) kDrainFrames;
-        if (! tm.process (z, nch, kDrainFrames)) return false;
+        tm.drain();                         // its own kTapsPerPhase zeros: the whole FIR, and not given to `lm`
 
         m.gatingBlocks     = lm.gatingBlockCount();
         m.droppedBlocks    = lm.droppedBlocks();
         m.nonFiniteSubHops = lm.nonFiniteSubHops();
         m.integratedLufs   = lm.integratedLufs();
         m.loudnessRangeLu  = lm.loudnessRangeLu();
-        m.truePeakDbTp     = tm.truePeakDb();
-        m.samplePeakDb     = tm.samplePeakDb();
+        m.truePeakDbTp     = peakDb (tm.truePeakLinear());
+        m.samplePeakDb     = peakDb (tm.samplePeakLinear());
         m.plrDb            = m.truePeakDbTp - m.integratedLufs;
         // -120.0 EXACTLY is `LoudnessMeter`'s sentinel for "no gating block passed the absolute gate",
         // not a loudness: `integrated()` returns that literal from three different early exits. Treating
@@ -1475,7 +1505,7 @@ private:
     int    nch_ = 0, frameCap_ = 0, osCap_ = 0;
     bool   prepared_ = false;
 
-    std::vector<float> compTap_, limTap_, limPeak_, drain_;
+    std::vector<float> compTap_, limTap_, limPeak_;
     dynamics::offline::QuantileHistogram compHist_, limHist_;
     std::uint64_t compActive_ = 0, limActive_ = 0, compFrames_ = 0, limFrames_ = 0;
     float  maxReconLin_ = 0.0f;

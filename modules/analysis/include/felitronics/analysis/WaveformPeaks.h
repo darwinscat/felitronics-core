@@ -31,9 +31,10 @@ enum class PeakMix : int
 // mean — a sequential binary64 sum divided by the box's sample count, whose error grows with the number of samples a
 // box averages. A bucket read above its sample peak is that rounding, not a defect. It sits further below the true peak.
 // Neither of the core's two true-peak meters is involved, and those two must not be confused with each other either:
-// `fcore::Probe` (the 128-tap reference, what `fc_probe_tp_linear` reports) and `analysis::TruePeakMeter` (the spec's
-// 48-tap filter, what the mastering chain runs) are DIFFERENT filters and read different numbers. How far apart is
-// measured by P62, not stated here. A picture that must show a true peak next to these bars names which one it shows.
+// `analysis::ReferenceTruePeakMeter` (the 128-tap reference: what `fc_probe_tp_linear` reports and what a delivered
+// ceiling is aimed with) and `analysis::TruePeakMeter` (the spec's 48-tap filter, a live meter) are DIFFERENT filters and
+// read different numbers. How far apart is pinned by felitronics_truepeak_instrument_gap_tests, not stated here. A
+// picture that must show a true peak next to these bars names which one it shows.
 //
 // THIS IS A PORT, AND THE SPEC IS EXECUTABLE: the site's `computePeaksFromBuffer` and `peaksFromWav`
 // (audio-peaks.js). Before this header the same picture had four definitions — a Java sidecar generator

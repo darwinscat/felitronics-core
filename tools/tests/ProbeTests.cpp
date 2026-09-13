@@ -346,6 +346,42 @@ int main()
     // --- finish() drains the FIR. Without it a peak in the final samples is not merely imprecise, it is
     //     missing: the oversampler is causal with a 63.5-oversampled-sample group delay, so the last ~16
     //     baseband samples never leave the filter while input is still arriving. ---
+    // --- A narrowing stream (P62's review round). The probe used to keep a left-out channel's filter history and
+    //     drain it at finish(); it now measures through ReferenceTruePeakMeter, which drains a stopped channel when
+    //     it stops. For a stream that ends, the two are the same reading to the bit — pinned against the old loop,
+    //     written out by hand, because a DROPPED history (the delay-line answer) read this over as 0.95. ---
+    test::group ("a narrower call after a wider one: the left-out channel's pending peak is still measured");
+    {
+        std::vector<float> left (256, 0.0f), right (256, 0.0f), quiet (64, 0.0f);
+        for (std::size_t i = 246; i < 256; ++i) right[i] = 0.95f;
+        fcore::Probe p; p.prepare (48000.0, 2);
+        const float* both[2] { left.data(), right.data() };
+        p.process (both, 2, 256);
+        const float* mono[1] { quiet.data() };
+        p.process (mono, 1, 64);
+        p.finish();
+        double oldLoop = 0.0, sp = 0.0;                                      // the pre-P62 loop: keep, then drain
+        for (const auto* ch : { &left, &right })
+        {
+            felitronics::oversampling::PolyphaseOversampler os;
+            test::ok (os.prepare (4, 1, 32), "the hand-written oversampler prepares");
+            std::vector<float> buf ((256 + 32) * 4);
+            const float* in[1] { ch->data() };
+            float*       out[1] { buf.data() };
+            os.upsample (in, 1, 256, out);
+            const float zeros[32] {};
+            const float* zin[1] { zeros };
+            float*       zout[1] { buf.data() + 256 * 4 };
+            os.upsample (zin, 1, 32, zout);
+            for (float v : buf)  oldLoop = std::max (oldLoop, (double) std::fabs (v));
+            for (float v : *ch) sp = std::max (sp, (double) std::fabs (v));
+        }
+        oldLoop = std::max (oldLoop, sp);
+        test::ok (sameBits (p.truePeakLinear(), oldLoop), "the reading is the old loop's, bit for bit ("
+                                                          + std::to_string (p.truePeakLinear()) + ")");
+        test::ok (oldLoop > 1.0, "precondition — and it is an over the samples do not show");
+    }
+
     test::group ("finish(): a transient at the very end of the buffer is measured, not lost");
     {
         // A file that stops dead on a loud passage. Its true peak is ABOVE full scale; without draining, the
@@ -594,8 +630,8 @@ int main()
     }
 
     // --- The true-peak CONFIG is part of the parity contract. The core holds a SECOND true-peak filter with a
-    //     different length, cutoff and window; swapping to it would fail the spike by ~3e-3 dB while looking
-    //     like a wasm bug. Pin both the constants and the fact that the two really do disagree. ---
+    //     different length, cutoff and window; swapping to it would break the byte parity while looking like a
+    //     wasm bug. Pin both the constants and the fact that the two really do disagree. ---
     test::group ("true-peak config is pinned, and the core's other true-peak filter really does differ");
     {
         test::ok (fcore::Probe::kOsFactor == 4, "4× oversampling, as the reference tool has always used");
@@ -603,7 +639,8 @@ int main()
 
         // A 12 kHz sine phased to miss the sample crests: the classic inter-sample-peak fixture, and the one
         // place the two filter DESIGNS actually diverge. On a broadband impulse they now agree exactly, since
-        // both land on the sample-peak floor; on ordinary music they agree to 0.0009–0.0028 dB.
+        // both land on the sample-peak floor. How far apart they read on delivered masters, per material and rate,
+        // is felitronics_truepeak_instrument_gap_tests' to pin, not this comment's.
         const double sr = 48000.0;
         const long long n = (long long) (sr * 2);
         Planar prog (2, std::vector<float> ((std::size_t) n));

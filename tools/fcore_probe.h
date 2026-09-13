@@ -25,17 +25,21 @@
 // true-peak LINEAR maximum is likewise continuous (a 1-ulp input moves a max by at most 1 ulp) and is
 // compared directly; its dB form is derived once at the end and is for humans.
 //
-// TRUE-PEAK CONFIG IS PART OF THE CONTRACT. The core holds two different true-peak filters, and they disagree
-// by 0.0009–0.0028 dB on real audio: this path (PolyphaseOversampler at 4x, 32 taps/phase = a 128-tap
-// prototype, cutoff 0.90x Nyquist, Kaiser beta 9) and analysis::TruePeakMeter (48 taps, full base Nyquist,
-// beta 8, factor chosen by rate). A shim that reached for the "obvious" TruePeakMeter would fail the spike's
-// acceptance by ~3e-3 dB and the failure would read as a wasm bug. Both sides go through THIS class.
+// TRUE-PEAK CONFIG IS PART OF THE CONTRACT, AND IT LIVES IN ONE CLASS. The core holds two different true-peak
+// filters: analysis::ReferenceTruePeakMeter (PolyphaseOversampler at 4x, 32 taps/phase = a 128-tap prototype,
+// cutoff 0.90x Nyquist, Kaiser beta 9, at every rate) and analysis::TruePeakMeter (the spec's 12 taps/phase,
+// full base Nyquist, beta 8, factor chosen by rate). They read different numbers — how far apart is measured
+// and pinned by felitronics_truepeak_instrument_gap_tests, not written here. This probe is the REFERENCE: it
+// measures through ReferenceTruePeakMeter, which is also what TargetLoudnessSolver aims a delivered ceiling
+// with, so the file a solve delivers and the number this tool prints for it come from the same arithmetic. A
+// shim that reached for the "obvious" TruePeakMeter would disagree with both, and the failure would read as a
+// wasm bug. Both sides go through THIS class.
 
 #include <felitronics/analysis/LoudnessMeter.h>
+#include <felitronics/analysis/ReferenceTruePeakMeter.h>
 #include <felitronics/analysis/StereoColumns.h>
 #include <felitronics/analysis/WaveformPeaks.h>
 #include <felitronics/core/Config.h>
-#include <felitronics/oversampling/PolyphaseOversampler.h>
 
 #include <algorithm>
 #include <cmath>
@@ -50,14 +54,16 @@ class Probe
 {
 public:
     // The streaming step. Callers may hand process() any length: it walks the input in kChunk-frame steps
-    // internally, so a whole-file buffer costs the same bounded scratch as a stream (the true-peak scratch is
-    // kChunk*4 floats — 128 KB — not 4*frames, which would be 247 MB for a 5-minute stereo track on wasm32).
+    // internally, so a whole-file buffer costs the same bounded scratch as a stream (the true-peak meter walks
+    // its own fixed scratch — never 4*frames, which would be 247 MB for a 5-minute stereo track on wasm32).
     // Chunking cannot change the arithmetic: LoudnessMeter::process() does identical per-sample work for any
     // n, and the oversampler's ring history makes upsample() a pure function of the samples seen so far —
     // verified bit-identical for chunk sizes 1 … 100003.
     static constexpr int kChunk         = 8192;
-    static constexpr int kOsFactor      = 4;    // \ the true-peak filter this tool is the REFERENCE for;
-    static constexpr int kOsTapsPerPhase = 32;  // / see the header comment before changing either
+    // The reference filter's topology, named once in analysis::ReferenceTruePeakMeter and only re-exported here
+    // (fc_probe_os_factor/_taps, fcore_measure's banner) — a literal here would be a second copy that could drift.
+    static constexpr int kOsFactor       = felitronics::analysis::ReferenceTruePeakMeter::kFactor;
+    static constexpr int kOsTapsPerPhase = felitronics::analysis::ReferenceTruePeakMeter::kTapsPerPhase;
 
     // Audio sample rates, bounded to a range an audio tool can mean. "Positive and finite" is NOT enough: an
     // absurd-but-finite rate (1e300, or Number.MIN_VALUE from a page) is no audio rate, and what each stage
@@ -83,11 +89,7 @@ public:
 
         nc_ = channels;
         if (! lm_.prepare (sampleRate, nc_, maxDurationSec)) return false;
-        os_.assign ((std::size_t) nc_, {});
-        for (auto& o : os_) if (! o.prepare (kOsFactor, 1, kOsTapsPerPhase)) return false;
-        osBuf_.assign ((std::size_t) kChunk * (std::size_t) kOsFactor, 0.0f);
-        maxTp_ = 0.0;
-        samplePeak_ = 0.0;
+        if (! tp_.prepare (sampleRate, kChunk, nc_)) return false;     // prepare() also resets the running maxima
         prepared_ = true;
         return true;
     }
@@ -95,7 +97,13 @@ public:
     bool prepared() const noexcept { return prepared_; }
 
     // planar[c] holds n frames for channel c. Channels beyond the prepared count are ignored; fewer than
-    // prepared is honoured as-is (the meter weights only what it is given).
+    // prepared is honoured as-is (the meter weights only what it is given). A call NARROWER than the one before
+    // it stops the channels it leaves out, and the true-peak meter drains them at that moment (law 11a, and why a
+    // maximum drains rather than drops — ReferenceTruePeakMeter.h): a peak still inside their filter is measured
+    // then, exactly as finish() would have measured it, and a channel that comes back starts from silence. Before
+    // P62 the probe kept the history, so the reading of a narrowing stream that ends is unchanged, and one whose
+    // channel RETURNS no longer replays audio from before its gap. Neither caller narrows: fcore_measure and
+    // fc_probe hand every prepared channel to every call.
     void process (const float* const* planar, int channels, long long n) noexcept
     {
         if (! prepared_ || finished_ || n <= 0) return;
@@ -112,19 +120,7 @@ public:
             for (int c = 0; c < useCh; ++c) view[c] = planar[c] + off;
 
             (void) lm_.process (view, useCh, m);
-
-            for (int c = 0; c < useCh; ++c)
-            {
-                for (int i = 0; i < m; ++i)
-                    samplePeak_ = std::max (samplePeak_, (double) std::fabs (view[c][i]));
-
-                const float* in[1] { view[c] };
-                float*       out[1] { osBuf_.data() };
-                os_[(std::size_t) c].upsample (in, 1, m, out);
-                const int upN = m * kOsFactor;
-                for (int k = 0; k < upN; ++k)
-                    maxTp_ = std::max (maxTp_, (double) std::fabs (osBuf_[(std::size_t) k]));
-            }
+            (void) tp_.process (view, useCh, m);      // prepared and 1 <= useCh <= nc_: it refuses only a null plane
         }
     }
 
@@ -138,22 +134,13 @@ public:
     // A true-peak tool that reports −36 dBTP for a clipping ending is worse than no tool.
     //
     // Idempotent, and it ends the stream: process() must not be called again afterwards, because the drain
-    // has pushed silence through the filter history. Only the oversampler is drained — feeding the loudness
+    // has pushed silence through the filter history. Only the true-peak meter is drained — feeding the loudness
     // meter would append spurious silence to the program.
     void finish() noexcept
     {
         if (! prepared_ || finished_) return;
         finished_ = true;
-        float zeros[kOsTapsPerPhase] {};                  // fixed: prepare() does all allocation
-        for (int c = 0; c < nc_; ++c)
-        {
-            const float* in[1] { zeros };
-            float*       out[1] { osBuf_.data() };
-            os_[(std::size_t) c].upsample (in, 1, kOsTapsPerPhase, out);
-            const int upN = kOsTapsPerPhase * kOsFactor;
-            for (int k = 0; k < upN; ++k)
-                maxTp_ = std::max (maxTp_, (double) std::fabs (osBuf_[(std::size_t) k]));
-        }
+        tp_.drain();
     }
 
     // --- what a cross-toolchain check compares (continuous in the input samples) ---
@@ -163,8 +150,8 @@ public:
     // The true peak is never below the SAMPLE peak: the reconstructed signal passes through the samples by
     // construction. Enforcing that as a floor costs nothing and makes a whole class of filter-side mistake
     // (a mis-sized drain, a wrong prototype, a bad phase) impossible to hide.
-    double truePeakLinear() const noexcept { return std::max (maxTp_, samplePeak_); }
-    double samplePeakLinear() const noexcept { return samplePeak_; }
+    double truePeakLinear() const noexcept { return tp_.truePeakLinear(); }
+    double samplePeakLinear() const noexcept { return tp_.samplePeakLinear(); }
 
     // --- what a human reads (derived; routed through log10, so not the bit-exactness surface) ---
     double integratedLufs() const noexcept { return lm_.integratedLufs(); }
@@ -182,14 +169,11 @@ public:
     std::uint64_t nonFiniteSubHops() const noexcept { return lm_.nonFiniteSubHops(); }
 
 private:
-    felitronics::analysis::LoudnessMeter                        lm_;
-    std::vector<felitronics::oversampling::PolyphaseOversampler> os_;
-    std::vector<float>                                          osBuf_;
-    double                                                      maxTp_ = 0.0;
-    double                                                      samplePeak_ = 0.0;
-    int                                                         nc_ = 0;
-    bool                                                        prepared_ = false;
-    bool                                                        finished_ = false;
+    felitronics::analysis::LoudnessMeter          lm_;
+    felitronics::analysis::ReferenceTruePeakMeter tp_;
+    int                                           nc_ = 0;
+    bool                                          prepared_ = false;
+    bool                                          finished_ = false;
 };
 
 // fcore::ShapeProbe — the waveform peaks and the stereo band of one file, the body shared VERBATIM by

@@ -62,6 +62,22 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_compressor_mix_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_compressor_mix_tests COMMAND felitronics_compressor_mix_tests)
 
+    # P62 — how far apart the core's two true-peak meters read, on delivered masters at every delivery rate. The
+    # only owner of that number: headers that mention the gap point here instead of quoting it.
+    add_executable(felitronics_truepeak_instrument_gap_tests tests/TruePeakInstrumentGapTests.cpp)
+    target_link_libraries(felitronics_truepeak_instrument_gap_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_truepeak_instrument_gap_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_truepeak_instrument_gap_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_truepeak_instrument_gap_tests COMMAND felitronics_truepeak_instrument_gap_tests)
+
+    # P62 — every pair of source and delivery rates delivers under its promise as the CERTIFICATE reads it, and the
+    # solver's report is that certificate bit for bit.
+    add_executable(felitronics_delivered_ceiling_tests tests/DeliveredCeilingTests.cpp)
+    target_link_libraries(felitronics_delivered_ceiling_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_delivered_ceiling_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_delivered_ceiling_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_delivered_ceiling_tests COMMAND felitronics_delivered_ceiling_tests)
+
     # LAW 11 — the caller's contract, as PROPERTIES over the whole accepted and the whole rejected
     # domain of every block-level entry point in the core. It lives here rather than in a module
     # because the law is cross-module by construction: the census that produced it found three answers

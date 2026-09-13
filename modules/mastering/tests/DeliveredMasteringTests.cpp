@@ -292,11 +292,10 @@ static void testSolveAndRangeAreTheComposition()
         ok (sg.status == so.status && sg.preLimiterGainDb == so.preLimiterGainDb && sg.ceilingDbTp == so.ceilingDbTp
             && sg.passes == so.passes && sg.passes > 0, tag + "the search's verdict is the hand composition's");
         ok (bitDiff (oracle, got) == 0, tag + "and so is its delivered audio, bit for bit");
-        const long long drain = (long long) kNch * TargetLoudnessSolver::kDrainFrames * 4;
         const long long programmeBytes = identity ? 0 : (long long) kNch * d * 4;
-        const long long perPass = (long long) solveBudget - programmeBytes - drain;
-        ok (perPass > 0 && solveBytes == (long long) sg.passes * perPass + programmeBytes + drain,
-            tag + "the search allocates passes x its meters + the converted programme + the drain ("
+        const long long perPass = (long long) solveBudget - programmeBytes;
+        ok (perPass > 0 && solveBytes == (long long) sg.passes * perPass + programmeBytes,
+            tag + "the search allocates passes x its meters + the converted programme ("
             + std::to_string (solveBytes) + ")");
     }
 
