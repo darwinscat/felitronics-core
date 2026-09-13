@@ -30,6 +30,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // The allocation counter, same idiom as the module suites: a global operator new so that "process()
@@ -1011,6 +1012,36 @@ int main()
                     || log[i].violated != d.violated) logSame = false;
             }
             ok (logSame, "and EVERY field of every pass record crosses unchanged — all eight");
+
+            // v4 — both traces cross unchanged, every field of every bucket, and are not crossed between the stages.
+            fc_measurement m4 {}; FC_INIT (m4);
+            (void) fc_solution_measurement (sol, &m4);
+            ok (m4.compressorGrTraceBuckets == direct.compressorTrace.buckets && m4.limiterGrTraceBuckets == direct.limiterTrace.buckets
+                && m4.compressorGrTraceValid == (direct.compressorTrace.valid ? 1 : 0)
+                && m4.limiterGrTraceValid == (direct.limiterTrace.valid ? 1 : 0), "v4: the traces' counts and validity");
+            auto sameTrace = [&] (std::int32_t stage, const GainReductionTrace& d)
+            {
+                std::vector<fc_gr_trace_bucket> tb ((std::size_t) GainReductionTrace::kMaxBuckets + 1u);
+                std::uint32_t w = 0;
+                if (fc_solution_gr_trace (sol, stage, tb.data(), (std::uint32_t) tb.size(), &w) != FC_OK || (int) w != d.buckets || w == 0) return false;
+                for (std::uint32_t i = 0; i < w; ++i)
+                    if (tb[i].maxDb != d.bucket[i].maxDb || tb[i].meanDb != d.bucket[i].meanDb
+                        || tb[i].samples != d.bucket[i].samples || tb[i].nonFinite != d.bucket[i].nonFinite) return false;
+                return true;
+            };
+            ok (sameTrace (FC_GR_STAGE_COMPRESSOR, direct.compressorTrace) && sameTrace (FC_GR_STAGE_LIMITER, direct.limiterTrace),
+                "v4: EVERY field of every bucket of both traces crosses unchanged, compressor as compressor, limiter as limiter");
+            ok (direct.compressorTrace.bucket[0].samples != direct.limiterTrace.bucket[0].samples,
+                "PRECONDITION: the two traces differ (the limiter counts oversampled sub-samples), so a swap would show");
+            {
+                double lm = 0.0, cm = 0.0;
+                for (int i = 0; i < direct.limiterTrace.buckets; ++i) lm = std::max (lm, direct.limiterTrace.bucket[i].maxDb);
+                for (int i = 0; i < direct.compressorTrace.buckets; ++i) cm = std::max (cm, direct.compressorTrace.bucket[i].maxDb);
+                // The limiter is idle on this fixture (its constraints keep the gain down); the limiter's live case is
+                // compared in the v4 group, on a request loud enough to engage it.
+                ok (cm > 0.1, "PRECONDITION: the compressor trace is live (" + std::to_string (cm) + " dB; limiter "
+                    + std::to_string (lm) + " dB) — a comparison of zeros would pass a getter that lost its values");
+            }
         }
         fc_solution_destroy (sol);
         fc_master_destroy (h);
@@ -1419,9 +1450,14 @@ int main()
         fc_loudness_request req {}; fc_loudness_request_default (&req);
         req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
         fc_solution sol = 0;
+        // THE SOLUTION RECORD IS A PLAIN OBJECT, and since v4 it is 50 384 B — over the counter's big-block threshold, where
+        // MSVC's STL pads a CONTAINER and the counter takes that padding off. Told its size, the counter leaves it alone
+        // (as for the instance record above); untold, the `win` row would read 39 B short (the code-review round).
+        g_plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);
         before = g_bytes.load();
         const fc_status sv = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
         const long long solveBytes = g_bytes.load() - before;
+        g_plainObjectSize.store (0, std::memory_order_relaxed);
         fc_solution_summary sum {}; FC_INIT (sum);
         ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the search rendered");
         const long long perPass = (long long) solve.callBytes - 512;
@@ -1663,20 +1699,28 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 3u, "PRECONDITION: this group is written for v3 (v2: deliveryRate; v3: compressorMix)");
+        ok (kCur == 4u, "PRECONDITION: this group is written for v4 (v2: deliveryRate; v3: compressorMix; v4: the GR trace)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u, "config: 80 at v1, 88 from v2");
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u,
+            "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u, "params: 6560 at v1 and v2, 6568 from v3");
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u,
+            "params: 6560 at v1 and v2, 6568 from v3");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u, "resolved: 80 at v1 and v2, 88 from v3");
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u,
+            "resolved: 80 at v1 and v2, 88 from v3");
+        ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u, "measurement: 208 to v3, 224 from v4 — the trace's four fields");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
-            if (fc_master_sizeof (id, 1) == 0u || fc_master_sizeof (id, 2) != fc_master_sizeof (id, 1)
-                || fc_master_sizeof (id, 3) != fc_master_sizeof (id, 1)) ++inherit;
-        ok (inherit == 0, "every struct that did not grow inherits its v1 row");
+        {
+            if (id == FC_STRUCT_MEASUREMENT) continue;
+            for (std::uint32_t v = 2u; v <= kCur; ++v)
+                if (fc_master_sizeof (id, 1) == 0u || fc_master_sizeof (id, v) != fc_master_sizeof (id, 1)) ++inherit;
+        }
+        ok (inherit == 0, "every struct that did not grow inherits its v1 row, at every version");
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 0) == 0u && fc_master_sizeof (FC_STRUCT_CONFIG, kCur + 1u) == 0u
             && fc_master_sizeof (99, 1) == 0u && fc_master_sizeof (-1, 1) == 0u,
             "and 0 for a version or an id it does not have");
@@ -1687,6 +1731,7 @@ int main()
             { 1u, 80u, FC_OK,              "v1 at 80 bytes" },
             { 2u, 88u, FC_OK,              "v2 at 88 bytes" },
             { 3u, 88u, FC_OK,              "v3 at 88 bytes — the config did not grow at v3" },
+            { 4u, 88u, FC_OK,              "v4 at 88 bytes — nor at v4" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
@@ -1808,6 +1853,18 @@ int main()
             ms->header.abiVersion = 1u; ms->header.structSize = 208u;
             ok (fc_solution_measurement (sol, ms) == FC_OK && ms->header.abiVersion == 1u && intact (mb, 208u),
                 "solution_measurement: the same");
+            auto mb3 = canaried (224u);
+            auto* m3 = reinterpret_cast<fc_measurement*> (mb3.data());
+            m3->header.abiVersion = 3u; m3->header.structSize = 208u;
+            ok (fc_solution_measurement (sol, m3) == FC_OK && m3->header.abiVersion == 3u && intact (mb3, 208u),
+                "a v3 measurement: 208 bytes, and the 16 where v4 keeps the trace's counts untouched");
+            auto mb4 = canaried (224u);
+            auto* m4 = reinterpret_cast<fc_measurement*> (mb4.data());
+            m4->header.abiVersion = 4u; m4->header.structSize = 224u;
+            ok (fc_solution_measurement (sol, m4) == FC_OK && m4->header.abiVersion == 4u && intact (mb4, 224u)
+                && m4->limiterGrTraceBuckets == 1000 && m4->compressorGrTraceBuckets == 1000
+                && m4->limiterGrTraceValid == 1 && m4->compressorGrTraceValid == 1,
+                "and a v4 one gets its 224 — 1000 buckets per stage for 48000 frames, both valid — and not a byte more");
             auto ub = canaried (88u);
             auto* su = reinterpret_cast<fc_solution_summary*> (ub.data());
             su->header.abiVersion = 1u; su->header.structSize = 88u;
@@ -1870,6 +1927,153 @@ int main()
             ok (fc_master_params_defaults (p2) == FC_OK && p2->header.abiVersion == 2u && intact (pb2, 6560u),
                 "a v2 parameter set: 6560 bytes written, and the 8 where v3 keeps its mix untouched");
         }
+    }
+
+    //==========================================================================
+    // v4 — the gain-reduction trace. Its checks in the header's order, its capacity rule, and its OWNERSHIP: the trace
+    // is the solution's, so neither a second solve on the same chain handle nor destroying that handle moves it.
+    group ("v4: fc_solution_gr_trace — the header's order, the capacity rule, and a trace that outlives its chain");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_loudness_request req {}; fc_loudness_request_default (&req);
+        req.targetLufs = -4.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3;    // loud enough that the limiter works
+        const std::size_t frames = (std::size_t) (kFs * 3.0);
+        auto in = tone (frames, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+        fc_solution sol = 0;
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK, "PRECONDITION: a solution");
+
+        std::vector<fc_gr_trace_bucket> first (1001u);
+        std::uint32_t w = 777;
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, first.data(), 1001u, &w) == FC_OK && w == 1000u,
+            "1000 buckets for 3 s, written into a buffer of 1001");
+        double firstMax = 0.0;
+        for (std::uint32_t i = 0; i < w; ++i) firstMax = std::max (firstMax, first[i].maxDb);
+        ok (firstMax > 0.5, "PRECONDITION: the limiter worked on this solve (" + std::to_string (firstMax) + " dB peak)");
+        std::vector<fc_gr_trace_bucket> small (10u);
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, small.data(), 10u, &w) == FC_OK && w == 10u
+            && std::memcmp (small.data(), first.data(), 10u * sizeof (fc_gr_trace_bucket)) == 0,
+            "a buffer of 10 is FILLED to its capacity with the first 10, not overrun");
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, nullptr, 0u, &w) == FC_OK && w == 0u,
+            "asking for nothing is not an error, and `written` says 0");
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, nullptr, 4u, &w) == FC_ERR_NULL, "a null buffer with a capacity");
+        auto* odd = reinterpret_cast<fc_gr_trace_bucket*> (static_cast<void*> ((char*) first.data() + 4));
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, odd, 4u, &w) == FC_ERR_ALIGNMENT, "a buffer off the 8-byte grid");
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, first.data(), 4u, nullptr) == FC_ERR_NULL, "a null `written`");
+        {
+            // `written` INSIDE the buckets: refused with SPAN before anything is written — not the count over bucket 0.
+            std::vector<fc_gr_trace_bucket> alias (4u);
+            alias[0].samples = 4242u; alias[1].nonFinite = 4343u;
+            auto* inside  = &alias[0].samples;
+            auto* inside2 = &alias[1].nonFinite;
+            ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, alias.data(), 4u, inside) == FC_ERR_SPAN && alias[0].samples == 4242u
+                && fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, alias.data(), 4u, inside2) == FC_ERR_SPAN && alias[1].nonFinite == 4343u,
+                "`written` pointing into the buckets is SPAN, and the refusal writes nothing");
+            std::uint32_t w9 = 55u;
+            ok (fc_solution_gr_trace (sol, 9, first.data(), 4u, &w9) == FC_ERR_ENUM && w9 == 55u,
+                "and a refusal for the stage code leaves `written` as it was");
+        }
+        ok (fc_solution_gr_trace (sol, 2, first.data(), 4u, &w) == FC_ERR_ENUM && fc_solution_gr_trace (sol, -1, first.data(), 4u, &w) == FC_ERR_ENUM,
+            "a stage code that names nothing is FC_ERR_ENUM");
+        ok (fc_solution_gr_trace (sol, 7, nullptr, 0u, &w) == FC_ERR_ENUM, "... with a capacity of 0 too — never FC_OK");
+        ok (fc_solution_gr_trace (sol, 7, nullptr, 4u, &w) == FC_ERR_NULL,
+            "and the out-parameter comes before the field value: null buffer AND bad stage answer NULL (the header's order)");
+        ok (fc_solution_gr_trace (0u, FC_GR_STAGE_LIMITER, first.data(), 4u, &w) == FC_ERR_HANDLE
+            && fc_solution_gr_trace (h, FC_GR_STAGE_LIMITER, first.data(), 4u, &w) == FC_ERR_HANDLE,
+            "a null handle and a CHAIN handle are not solutions");
+
+        // THE LIVE LIMITER, bit for bit against the core. The same facade and C++ geometry as the group above, a request
+        // loud enough that BOTH stages work — without it, a getter that zeroed the limiter's values would compare equal.
+        {
+            using namespace felitronics::mastering;
+            fc_master hl = make();
+            fc_master_params pl = goodParams();
+            pl.limiter.ceilingDbTp = -1.3; pl.compressor.thresholdDb = -17.3;
+            fc_loudness_request rl {}; fc_loudness_request_default (&rl);
+            rl.targetLufs = -4.0; rl.maxTruePeakDbTp = -1.0; rl.maxPasses = 3;
+            std::vector<float> viaAbi (in.size(), 0.0f), viaCpp (in.size(), 0.0f);
+            fc_solution sl = 0;
+            ok (fc_master_solve (hl, &pl, &rl, in.data(), viaAbi.data(), (std::uint32_t) frames, &sl) == FC_OK, "PRECONDITION: the loud ABI solve ran");
+            MasteringChainConfig cc {};
+            cc.internalBlock = 256; cc.monoBass = true; cc.clipper = true;
+            MasteringChainParams cp {};
+            cp.limiter.ceilingDbTp = -1.3; cp.compressor.thresholdDb = -17.3;
+            MasteringChain chain; OfflineRenderer rend; TargetLoudnessSolver solver;
+            const bool prep = rend.prepare (kNch, 4096) && chain.prepare (kFs, kNch, cc)
+                           && solver.prepare (kFs, kNch, rend.blockSize(), chain.internalBlock(), chain.tapOversampleFactor());
+            LoudnessRequest lr {}; lr.targetLufs = -4.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 3;
+            const float* ip[2] { in.data(), in.data() + frames };
+            float*       op[2] { viaCpp.data(), viaCpp.data() + frames };
+            LoudnessSolution direct;
+            if (prep) direct = solver.solve (chain, rend, cp, ip, op, kNch, (int) frames, lr);
+            ok (prep && std::memcmp (viaAbi.data(), viaCpp.data(), viaAbi.size() * sizeof (float)) == 0,
+                "PRECONDITION: the direct search delivers the same audio");
+            for (const auto& [code, name, tr] : { std::tuple<std::int32_t, const char*, const GainReductionTrace*> { FC_GR_STAGE_LIMITER, "limiter", &direct.limiterTrace },
+                                                  std::tuple<std::int32_t, const char*, const GainReductionTrace*> { FC_GR_STAGE_COMPRESSOR, "compressor", &direct.compressorTrace } })
+            {
+                std::vector<fc_gr_trace_bucket> tb (1000u);
+                std::uint32_t wl = 0;
+                double live = 0.0; std::size_t bad = 0;
+                const bool got = fc_solution_gr_trace (sl, code, tb.data(), 1000u, &wl) == FC_OK && (int) wl == tr->buckets;
+                for (std::uint32_t i = 0; got && i < wl; ++i)
+                {
+                    live = std::max (live, tr->bucket[i].maxDb);
+                    if (std::memcmp (&tb[i].maxDb, &tr->bucket[i].maxDb, 8) != 0 || std::memcmp (&tb[i].meanDb, &tr->bucket[i].meanDb, 8) != 0
+                        || tb[i].samples != tr->bucket[i].samples || tb[i].nonFinite != tr->bucket[i].nonFinite) ++bad;
+                }
+                ok (live > 0.5, std::string ("PRECONDITION: the ") + name + " trace is live (" + std::to_string (live) + " dB)");
+                ok (got && bad == 0, std::string ("the live ") + name + " trace through the ABI is the core's, every bucket bit for bit ("
+                    + std::to_string (bad) + " differ)");
+            }
+            (void) fc_solution_destroy (sl);
+            (void) fc_master_destroy (hl);
+        }
+
+        // OWNERSHIP. A second solve on the same chain handle at another target, then the chain destroyed: the first
+        // solution's trace is the same bytes.
+        fc_master_params pc = goodParams();
+        fc_master_resolved rr {}; FC_INIT (rr);
+        ok (fc_master_configure (h, &pc, &rr) == FC_OK, "PRECONDITION: the handle configured again after its solve");
+        req.targetLufs = -20.0;
+        fc_solution sol2 = 0;
+        ok (fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol2) == FC_OK, "PRECONDITION: a second solve");
+        std::vector<fc_gr_trace_bucket> second (1000u), again (1000u);
+        (void) fc_solution_gr_trace (sol2, FC_GR_STAGE_LIMITER, second.data(), 1000u, &w);
+        ok (std::memcmp (second.data(), first.data(), 1000u * sizeof (fc_gr_trace_bucket)) != 0,
+            "PRECONDITION: the second solve's trace differs from the first's");
+        ok (fc_master_destroy (h) == FC_OK, "the chain handle destroyed");
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, again.data(), 1000u, &w) == FC_OK && w == 1000u
+            && std::memcmp (again.data(), first.data(), 1000u * sizeof (fc_gr_trace_bucket)) == 0,
+            "the FIRST solution's trace is unchanged by the second solve and by its chain's destruction");
+        (void) fc_solution_destroy (sol2);
+        (void) fc_solution_destroy (sol);
+        ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, again.data(), 1000u, &w) == FC_ERR_HANDLE, "a destroyed solution is stale");
+
+        // THE PRICE, PINNED (rule 9ф: the literal carries its derivation). A solution record is `LoudnessSolution` by value,
+        // and the two traces grew it from 2336 B to 2336 + 2 x (24 + 1000 x 24) = 50 384 B: each trace is 1000 buckets of
+        // {double, double, uint32, uint32} = 24 B plus its count, flag and two uint64 totals = 24 B. `facadeBytes` is that
+        // sizeof, so a budget that silently moved again would move this number, and a stage added or a bucket widened fails
+        // here rather than in a worker's heap.
+        {
+            fc_master hb = make();
+            fc_need nd {}; FC_INIT (nd);
+            ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK && nd.facadeBytes == 2336u + 2u * (24u + 1000u * 24u),
+                "a solution record costs 50 384 B — 2336 before the traces, plus two traces of 24 024 (" + std::to_string (nd.facadeBytes) + ")");
+            (void) fc_master_destroy (hb);
+        }
+
+        // A VERDICT BEFORE ANY RENDER carries no trace: zero buckets, not valid, and zero written.
+        fc_master h2 = make();
+        fc_loudness_request bad {}; fc_loudness_request_default (&bad);            // no target: InvalidRequest
+        fc_solution sol3 = 0;
+        ok (fc_master_solve (h2, &p, &bad, in.data(), out.data(), (std::uint32_t) frames, &sol3) == FC_OK, "PRECONDITION: a verdict");
+        fc_measurement m3 {}; FC_INIT (m3);
+        ok (fc_solution_measurement (sol3, &m3) == FC_OK && m3.limiterGrTraceBuckets == 0 && m3.compressorGrTraceBuckets == 0
+            && m3.limiterGrTraceValid == 0 && m3.compressorGrTraceValid == 0, "InvalidRequest: no buckets, not valid");
+        ok (fc_solution_gr_trace (sol3, FC_GR_STAGE_COMPRESSOR, first.data(), 1000u, &w) == FC_OK && w == 0u, "and nothing written");
+        (void) fc_solution_destroy (sol3);
+        (void) fc_master_destroy (h2);
     }
 
     //==========================================================================
@@ -2117,9 +2321,11 @@ int main()
             auto in = tone (n, kNch);
             std::vector<float> out ((std::size_t) 384000 * kNch, 0.0f);
             fc_solution sol = 0;
+            g_plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);   // the record: see above
             long long before = g_bytes.load();
             const fc_status sv = fc_master_solve_delivered (h, &p, &req, in.data(), n, out.data(), 384000u, &sol);
             const long long solveBytes = g_bytes.load() - before;
+            g_plainObjectSize.store (0, std::memory_order_relaxed);
             fc_solution_summary sum {}; FC_INIT (sum);
             ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the delivered search rendered");
             const long long perPass = (long long) solve.callBytes - programme - 512;
@@ -2520,6 +2726,10 @@ int main()
         }
         ok (fc_solution_measurement (earlier, &ms) == FC_ERR_POISONED, "solution_measurement: POISONED");
         ok (fc_solution_log (earlier, lg, 4, &wrote) == FC_ERR_POISONED && wrote == 7u, "solution_log: POISONED");
+        fc_gr_trace_bucket tb[4] {};
+        tb[0].samples = 99u;
+        ok (fc_solution_gr_trace (earlier, FC_GR_STAGE_LIMITER, tb, 4, &wrote) == FC_ERR_POISONED && wrote == 7u && tb[0].samples == 99u,
+            "solution_gr_trace (v4): POISONED, count and buckets untouched");
         ok (fc_solution_destroy (earlier) == FC_ERR_POISONED, "solution_destroy: POISONED");
         // POISON BEFORE HANDLE, entry point by entry point: an INVALID handle after the poison answers 14, never
         // FC_ERR_HANDLE — the code-review round moved the guard behind the handle check in `process` and a single
@@ -2543,6 +2753,7 @@ int main()
                       && fc_solution_measurement (0, &ms)                           == FC_ERR_POISONED
                       && fc_solution_log (0, lg, 4, &wrote)                         == FC_ERR_POISONED
                       && fc_solution_destroy (0)                                    == FC_ERR_POISONED
+                      && fc_solution_gr_trace (0, FC_GR_STAGE_LIMITER, tb, 4, &wrote) == FC_ERR_POISONED
                       // v2/v3 — the list is EVERY entry point, so a new one joins it (the diverse-testing round
                       // found the five below missing: removing their guard left the suite green)
                       && fc_master_delivered_frames (0, 64u, &wrote)                == FC_ERR_POISONED

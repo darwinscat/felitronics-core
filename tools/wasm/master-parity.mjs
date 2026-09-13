@@ -192,7 +192,21 @@ function wasmSolve (targetLufs, tpDb) {
     const meas = new Struct(M, 'fc_measurement', measP).init();
     ok(M._fc_solution_measurement(sol, measP), 'measurement');
 
+    // v4 — each stage's trace, summarised the way `fcore_master solve` prints it.
+    const traces = {};
+    for (const [label, code] of [['comp', 0], ['lim', 1]]) {
+        const cap = 1000, bP = alloc(cap * sizeOf('fc_gr_trace_bucket')), wP = alloc(4);
+        ok(M._fc_solution_gr_trace(sol, code, bP, cap, wP), `gr_trace ${label}`);
+        const dv = new DataView(M.HEAPF32.buffer);
+        const w = dv.getUint32(wP, true), stride = sizeOf('fc_gr_trace_bucket');
+        let max = 0, at = 0;
+        for (let i = 0; i < w; i++) { const m = dv.getFloat64(bP + i * stride, true); if (m > max) { max = m; at = i; } }
+        traces[label] = { buckets: w, max, at };
+        M._free(bP); M._free(wP);
+    }
     const verdict = {
+        traces,
+        compTraceValid: meas.get('compressorGrTraceValid'), limTraceValid: meas.get('limiterGrTraceValid'),
         status: sum.get('status'), binding: sum.get('binding'),
         gain: sum.get('preLimiterGainDb'), ceiling: sum.get('ceilingDbTp'), passes: sum.get('passes'),
         I: meas.get('integratedLufs'), TP: meas.get('truePeakDbTp'),
@@ -297,6 +311,21 @@ if (l1 && l2) {
     check(S.verdict.loudnessValid === Number(l2[5]), 'loudnessValid');
     check(S.verdict.lraValid === Number(l2[6]), 'lraValid');
 }
+// v4 — the traces: bucket counts, validity and where the largest GR is, exactly; its size within the tolerance.
+for (const label of ['comp', 'lim']) {
+    const m = new RegExp(`${label}Trace buckets=(\\S+) valid=(\\S+) max=(\\S+) at=(\\S+)`).exec(sNative.stdout);
+    check(!!m, `the native solve reported the ${label} trace`);
+    if (!m) continue;
+    const t = S.verdict.traces[label];
+    const valid = label === 'lim' ? S.verdict.limTraceValid : S.verdict.compTraceValid;
+    check(t.buckets === Number(m[1]) && valid === Number(m[2]), `${label} trace: bucket count and validity`,
+          `wasm ${t.buckets}/${valid}, native ${m[1]}/${m[2]}`);
+    near(t.max, Number(m[3]), TOL_DB, `${label} trace: largest bucket maximum dB`);
+    check(t.at === Number(m[4]), `${label} trace: the bucket that holds it`, `wasm ${t.at}, native ${m[4]}`);
+}
+check(Math.max(S.verdict.traces.lim.max, S.verdict.traces.comp.max) > 0.1,
+      'PRECONDITION: at least one stage\'s trace is not idle, so the comparison above is not of two zeros',
+      `comp ${S.verdict.traces.comp.max} dB, lim ${S.verdict.traces.lim.max} dB`);
 check(Math.abs(S.verdict.I - (-14)) <= 1.0, 'the search actually landed near the target',
       `I=${S.verdict.I.toFixed(3)} LUFS for target -14`);
 compareAudio(S.out, sNative.audio, 'delivered master agrees within tolerance');

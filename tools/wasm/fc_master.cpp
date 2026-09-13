@@ -308,7 +308,7 @@ FC_ENDS_AT (fc_master_resolved,  compressorMix);
 FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
 FC_ENDS_AT (fc_need,             _pad0);
 FC_ENDS_AT (fc_loudness_request, initialGainDb);
-FC_ENDS_AT (fc_measurement,      lraValid);
+FC_ENDS_AT (fc_measurement,      limiterGrTraceValid);
 FC_ENDS_AT (fc_solution_summary, gainAboveDb);
 // and the types the table's sizes were computed from
 static_assert (sizeof (fc_master_config::deliveryRate) == 8 && sizeof (fc_master_params::compressorMix) == 8
@@ -321,6 +321,14 @@ static_assert (sizeof (fc_eq_lane) == 40 && sizeof (fc_eq_dyn) == 48 && sizeof (
 static_assert (sizeof (fc_mono_bass) == 12 && sizeof (fc_compressor) == 88 && sizeof (fc_clipper) == 28);
 static_assert (sizeof (fc_limiter) == 16 && sizeof (fc_dither) == 24 && sizeof (fc_gr_limit) == 16);
 static_assert (sizeof (fc_solve_pass) == 64 && sizeof (fc_gr_stats) == 64);
+static_assert (sizeof (fc_gr_trace_bucket) == 24);                                                          // v4, frozen
+// v4's fields by TYPE as well as by offset: a `double` retyped to `float` keeps this struct's size and every offset (the
+// four bytes become padding), so neither pin above would see it, and JavaScript would read eight bytes where four were
+// written (the code-review round, by mutation).
+static_assert (std::is_same_v<decltype (fc_gr_trace_bucket::maxDb), double> && std::is_same_v<decltype (fc_gr_trace_bucket::meanDb), double>
+               && std::is_same_v<decltype (fc_gr_trace_bucket::samples), uint32_t> && std::is_same_v<decltype (fc_gr_trace_bucket::nonFinite), uint32_t>);
+static_assert (std::is_same_v<decltype (fc_measurement::compressorGrTraceBuckets), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceBuckets), int32_t>
+               && std::is_same_v<decltype (fc_measurement::compressorGrTraceValid), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceValid), int32_t>);
 
 // Every top-level field at the offset it was published at. A field inserted anywhere but the end moves a number.
 #define FC_AT(T, f, off) static_assert (offsetof (T, f) == (off), #T "::" #f " moved")
@@ -374,6 +382,10 @@ FC_AT (fc_measurement, limiterMaxReconstructedPeakDb, 176); FC_AT (fc_measuremen
 FC_AT (fc_measurement, gatingBlocks, 188);     FC_AT (fc_measurement, droppedBlocks, 192);
 FC_AT (fc_measurement, nonFiniteSubHops, 196); FC_AT (fc_measurement, loudnessValid, 200);
 FC_AT (fc_measurement, lraValid, 204);
+FC_AT (fc_measurement, compressorGrTraceBuckets, 208); FC_AT (fc_measurement, limiterGrTraceBuckets, 212);   // v4
+FC_AT (fc_measurement, compressorGrTraceValid, 216);   FC_AT (fc_measurement, limiterGrTraceValid, 220);     // v4
+FC_AT (fc_gr_trace_bucket, maxDb, 0);          FC_AT (fc_gr_trace_bucket, meanDb, 8);                        // v4
+FC_AT (fc_gr_trace_bucket, samples, 16);       FC_AT (fc_gr_trace_bucket, nonFinite, 20);                    // v4
 
 FC_AT (fc_solution_summary, header, 0);        FC_AT (fc_solution_summary, status, 8);
 FC_AT (fc_solution_summary, binding, 12);      FC_AT (fc_solution_summary, alsoViolated, 16);
@@ -1463,6 +1475,13 @@ FC_EXPORT fc_status fc_solution_measurement (fc_solution sh, fc_measurement* out
     if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
     fc_measurement o {};
     fromCore (s->solution->measured, o);
+    // v4: the traces are the solution's, not the measurement's, so they are read from it here. A caller at v1..v3
+    // gets none of these four — `writeOut` stops at its `structSize`.
+    const LoudnessSolution& v = *s->solution;
+    o.compressorGrTraceBuckets = v.compressorTrace.buckets;
+    o.limiterGrTraceBuckets    = v.limiterTrace.buckets;
+    o.compressorGrTraceValid   = v.compressorTrace.valid ? 1 : 0;
+    o.limiterGrTraceValid      = v.limiterTrace.valid ? 1 : 0;
     writeOut (out, o, bytes);
     return FC_OK;
 }
@@ -1493,6 +1512,48 @@ FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::ui
         out[i].limiterMaxGrDb  = r.limiterMaxGrDb;
         out[i].loudnessRangeLu = r.loudnessRangeLu;
         out[i].violated        = r.violated;
+    }
+    *written = n;
+    return FC_OK;
+}
+
+// v4 — the order is the header's: poison, handle, `written`, then `out` only when there is something to write
+// into (null, alignment, the span, and `written` not inside it), then `stage` — a field value, checked with `cap == 0`
+// as well, so a stage code that names nothing is never answered FC_OK. `written` is cleared only once every refusal
+// is behind us, as in `fc_master_flush`: a `written` that pointed into the buckets used to be zeroed by a call that
+// then went on to write them — and a successful call wrote the count over the first bucket's `samples`.
+FC_EXPORT fc_status fc_solution_gr_trace (fc_solution sh, std::int32_t stage, fc_gr_trace_bucket* out,
+                                          std::uint32_t cap, std::uint32_t* written)
+{
+    FC_GUARD;
+    Slot* s = lookup (sh, Kind::Solution);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
+    if (cap > 0)
+    {
+        if (out == nullptr) return FC_ERR_NULL;
+        if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
+        if (! inHeap (out, (std::uint64_t) cap * sizeof (fc_gr_trace_bucket))) return FC_ERR_SPAN;
+        if (aliasesSpan (written, sizeof (*written), out, (std::uint64_t) cap * sizeof (fc_gr_trace_bucket))) return FC_ERR_SPAN;
+    }
+    const LoudnessSolution& v = *s->solution;
+    const GainReductionTrace* t = nullptr;
+    switch (stage)                             // on the CODE, not a cast to fc_gr_stage: an int outside the enum's
+    {                                          // range is not a value of it, which is the case this must refuse
+        case FC_GR_STAGE_COMPRESSOR: t = &v.compressorTrace; break;
+        case FC_GR_STAGE_LIMITER:    t = &v.limiterTrace;    break;
+        default:                     return FC_ERR_ENUM;
+    }
+    *written = 0;
+
+    const std::uint32_t n = (std::uint32_t) t->buckets < cap ? (std::uint32_t) t->buckets : cap;
+    for (std::uint32_t i = 0; i < n; ++i)
+    {
+        const GainReductionTraceBucket& b = t->bucket[i];
+        out[i].maxDb     = b.maxDb;
+        out[i].meanDb    = b.meanDb;
+        out[i].samples   = b.samples;
+        out[i].nonFinite = b.nonFinite;
     }
     *written = n;
     return FC_OK;

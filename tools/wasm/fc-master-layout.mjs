@@ -153,6 +153,13 @@ const STRUCTS = {
         ['limiterMaxReconstructedPeakDb', 'f64'],
         ['latencySamples', 'i32'], ['gatingBlocks', 'i32'], ['droppedBlocks', 'i32'],
         ['nonFiniteSubHops', 'i32'], ['loudnessValid', 'i32'], ['lraValid', 'i32'],
+        ['compressorGrTraceBuckets', 'i32'], ['limiterGrTraceBuckets', 'i32'],            // v4
+        ['compressorGrTraceValid', 'i32'], ['limiterGrTraceValid', 'i32'],                // v4
+    ],
+
+    // v4 — one bucket of `_fc_solution_gr_trace`, header-less (read with a stride of its size, like fc_solve_pass).
+    fc_gr_trace_bucket: [
+        ['maxDb', 'f64'], ['meanDb', 'f64'], ['samples', 'u32'], ['nonFinite', 'u32'],
     ],
 
     fc_solution_summary: [
@@ -315,7 +322,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 3;
+export const FC_MASTER_ABI_VERSION = 4;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [

@@ -21,7 +21,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <random>
+#include <string>
+#include <tuple>
 #include <vector>
 
 // The allocation counter, the module suites' idiom — a COUNT only (no bytes, so no allocator's padding to reason
@@ -533,6 +537,352 @@ void testStatisticsAgreeWithAHandDrivenChain()
                   "limiter active fraction nulls");
     std::printf ("      hand-driven null: comp mean %.5f p95 %.5f max %.5f | lim mean %.5f p95 %.5f max %.5f\n",
                  hc.mean(), p95c, hc.maxValue(), hl.mean(), p95l, hl.maxValue());
+}
+
+// =============================================================================================
+// P59b — THE GAIN-REDUCTION TRACE, against a reference of a different construction: the chain driven BY HAND at the
+// settings the solver delivered, its taps collected into one |GR| array per stage, and bucketed from a table of the
+// boundaries floor(k*F/B) searched with upper_bound — no cursor, no running state shared with the solver's sink.
+// Everything compared is exact: counts, the maximum, and the mean, whose sum runs over the same values in the same
+// order inside each bucket.
+struct HandTrace
+{
+    std::vector<double> maxDb, meanDb;
+    std::vector<std::uint32_t> samples;
+};
+
+HandTrace bucketByHand (const std::vector<double>& grPerFrame, int stride, int frames)
+{
+    const int B = std::min (GainReductionTrace::kMaxBuckets, frames);
+    std::vector<std::uint64_t> bound ((std::size_t) B + 1u);
+    for (int k = 0; k <= B; ++k) bound[(std::size_t) k] = (std::uint64_t) k * (std::uint64_t) frames / (std::uint64_t) B;
+    HandTrace h;
+    h.maxDb.assign ((std::size_t) B, 0.0); h.meanDb.assign ((std::size_t) B, 0.0); h.samples.assign ((std::size_t) B, 0u);
+    for (int p = 0; p < frames; ++p)
+    {
+        const auto k = (std::size_t) (std::upper_bound (bound.begin(), bound.end(), (std::uint64_t) p) - bound.begin()) - 1u;
+        for (int q = 0; q < stride; ++q)
+        {
+            const double a = grPerFrame[(std::size_t) p * (std::size_t) stride + (std::size_t) q];
+            ++h.samples[k];
+            if (a > h.maxDb[k]) h.maxDb[k] = a;
+            h.meanDb[k] += a;
+        }
+    }
+    for (int k = 0; k < B; ++k) if (h.samples[(std::size_t) k] > 0) h.meanDb[(std::size_t) k] /= (double) h.samples[(std::size_t) k];
+    return h;
+}
+
+void testTheTraceNullsAgainstAHandDrivenChain()
+{
+    test::group ("P59b: the gain-reduction trace nulls against the chain driven by hand, bucketed another way");
+    // Three lengths: 1000 buckets over a length the bucket count does not divide, and a programme shorter than
+    // 1000 frames, which gets one bucket per frame.
+    for (const double seconds : { 5.0, 1.00007, 0.0125 })
+    {
+        Programme src = makeMusic (seconds, 0.35);
+        Programme dst; dst.ch = src.ch; dst.bind();
+        Rig rig;
+        if (! test::run (rig.build (2))) return;
+        LoudnessRequest req;
+        req.targetLufs = -10.0;
+        req.maxTruePeakDbTp = -1.0;
+        req.maxPasses = 3;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                           src.in(), dst.out(), 2, src.frames(), req);
+        const int frames = src.frames();
+        if (! test::run (sol.passes > 0)) return;
+
+        MasteringChain chain2;
+        MasteringChainConfig cfg;
+        if (! test::run (chain2.prepare (kFs, 2, cfg))) return;
+        MasteringChainParams p2 = rig.params;
+        p2.preLimiterGainDb = sol.preLimiterGainDb;
+        p2.limiter.ceilingDbTp = sol.ceilingDbTp;
+        chain2.setParams (p2);
+        chain2.reset();
+
+        const int K = chain2.internalBlock(), F = chain2.tapOversampleFactor();
+        const int blk = 1024;
+        std::vector<float> compTap ((std::size_t) (blk + K), 0.0f);
+        std::vector<float> limTap  ((std::size_t) (blk + K) * (std::size_t) F, 0.0f);
+        MasteringChainTaps taps;
+        taps.compressorGrDb = compTap.data(); taps.frameCapacity = blk + K;
+        taps.limiterGrDb    = limTap.data();  taps.osCapacity    = (blk + K) * F;
+        const long long D = chain2.latencySamples();
+        const MasteringChainResolved r = chain2.resolved();
+        std::vector<double> gc ((std::size_t) frames, -1.0), gl ((std::size_t) frames * (std::size_t) F, -1.0);
+        std::vector<std::vector<float>> scratch (2, std::vector<float> ((std::size_t) blk, 0.0f));
+        std::vector<float*> sp { scratch[0].data(), scratch[1].data() };
+        long long tapPos = 0;
+        for (long long off = 0; off < (long long) frames + D; )
+        {
+            const int m = (int) std::min<long long> ((long long) blk, (long long) frames + D - off);
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < m; ++i)
+                {
+                    const long long t = off + i;
+                    sp[(std::size_t) c][(std::size_t) i] = (t < frames) ? src.ch[(std::size_t) c][(std::size_t) t] : 0.0f;
+                }
+            if (! test::run (chain2.process (sp.data(), 2, m, taps))) return;
+            for (int j = 0; j < taps.framesWritten; ++j)
+            {
+                const long long t = tapPos + j;
+                if (t >= r.compressorTapOffset && t < r.compressorTapOffset + frames)
+                    gc[(std::size_t) (t - r.compressorTapOffset)] = std::fabs ((double) compTap[(std::size_t) j]);
+                if (t >= r.limiterTapOffset && t < r.limiterTapOffset + frames)
+                    for (int k = 0; k < F; ++k)
+                        gl[(std::size_t) (t - r.limiterTapOffset) * (std::size_t) F + (std::size_t) k]
+                            = std::fabs ((double) limTap[(std::size_t) (j * F + k)]);
+            }
+            tapPos += taps.framesWritten;
+            off += m;
+        }
+        const bool filled = std::none_of (gc.begin(), gc.end(), [] (double v) { return v < 0.0; })
+                         && std::none_of (gl.begin(), gl.end(), [] (double v) { return v < 0.0; });
+        test::ok (filled, "PRECONDITION: the hand-driven chain delivered every tap of both windows");
+
+        const std::string at = " (" + std::to_string (frames) + " frames)";
+        for (const auto& [name, trace, gr, stride] : { std::tuple<const char*, const GainReductionTrace*, const std::vector<double>*, int>
+                                                          { "compressor", &sol.compressorTrace, &gc, 1 },
+                                                      std::tuple<const char*, const GainReductionTrace*, const std::vector<double>*, int>
+                                                          { "limiter", &sol.limiterTrace, &gl, F } })
+        {
+            const HandTrace h = bucketByHand (*gr, stride, frames);
+            int bad = 0;
+            for (int k = 0; k < (int) h.maxDb.size(); ++k)
+            {
+                const auto& b = trace->bucket[k];
+                if (std::memcmp (&b.maxDb, &h.maxDb[(std::size_t) k], 8) != 0 || std::memcmp (&b.meanDb, &h.meanDb[(std::size_t) k], 8) != 0
+                    || b.samples != h.samples[(std::size_t) k] || b.nonFinite != 0u) ++bad;
+            }
+            test::ok (trace->buckets == (int) h.maxDb.size() && trace->valid && bad == 0,
+                      std::string (name) + ": " + std::to_string (trace->buckets) + " buckets, bit-identical to the hand-driven reference"
+                      + at + " — " + std::to_string (bad) + " differ");
+        }
+        const double limPeak = *std::max_element (gl.begin(), gl.end());
+        if (seconds > 1.0)
+            test::ok (limPeak > 0.5, "PRECONDITION: the limiter really worked (" + std::to_string (limPeak) + " dB peak)" + at);
+    }
+}
+
+// =============================================================================================
+// P59b — what the trace must say, on the witnesses the pre-start crew round named (astra), each re-derived here.
+Programme makeTone (int frames, int nch, double amp, double hz = 1000.0)
+{
+    Programme p; p.ch.assign ((std::size_t) nch, std::vector<float> ((std::size_t) frames, 0.0f));
+    for (int c = 0; c < nch; ++c)
+        for (int i = 0; i < frames; ++i)
+            p.ch[(std::size_t) c][(std::size_t) i] = (float) (amp * std::sin (2.0 * kPi * hz * (double) i / kFs));
+    p.bind();
+    return p;
+}
+
+Programme makeImpulse (int frames, int nch, int at, float v)
+{
+    Programme p; p.ch.assign ((std::size_t) nch, std::vector<float> ((std::size_t) frames, 0.0f));
+    for (int c = 0; c < nch; ++c) p.ch[(std::size_t) c][(std::size_t) at] = v;
+    p.bind();
+    return p;
+}
+
+double traceMax (const GainReductionTrace& t)
+{
+    double m = 0.0;
+    for (int k = 0; k < t.buckets; ++k) if (t.bucket[k].maxDb > m) m = t.bucket[k].maxDb;
+    return m;
+}
+
+// THE CROSS-CHECK OF A DIFFERENT CONSTRUCTION, where it is defined: statistics that are valid and have nothing above
+// the histogram's range (a failed p95 zeroes them — `summarise`). Then the maximum over the buckets is the histogram's
+// tracked maximum BIT FOR BIT, the sample counts add up to its frames, and the sample-weighted mean of the bucket means
+// is its mean to within summation rounding: two different summation trees over n values each at most `max`, so
+// |Δ| <= 2·n·eps·max, a bound and not a guess.
+void checkTraceAgainstStats (const GainReductionTrace& t, const GainReductionStats& st, const std::string& what)
+{
+    if (! (st.valid && st.aboveRange == 0)) { test::ok (true, what + ": statistics not comparable (invalid or above range) — skipped"); return; }
+    std::uint64_t n = 0; double weighted = 0.0;
+    for (int k = 0; k < t.buckets; ++k) { n += t.bucket[k].samples; weighted += t.bucket[k].meanDb * (double) t.bucket[k].samples; }
+    const double tm = traceMax (t);
+    test::ok (std::memcmp (&tm, &st.maxDb, 8) == 0, what + ": max over the buckets IS the statistics' max, bit for bit ("
+              + std::to_string (tm) + " dB)");
+    test::ok (n == st.frames, what + ": the bucket sample counts add up to the statistics' frames");
+    const double mean = n > 0 ? weighted / (double) n : 0.0;
+    const double bound = 2.0 * (double) n * 2.220446049250313e-16 * std::max (1.0, st.maxDb);
+    test::ok (std::fabs (mean - st.meanDb) <= bound, what + ": the weighted mean of the bucket means is the statistics' mean within "
+              + std::to_string (bound) + " (|diff| " + std::to_string (std::fabs (mean - st.meanDb)) + ")");
+}
+
+void testTheTraceBuilderCountsWhatNoAudioCanReach()
+{
+    test::group ("P59b: the trace builder — non-finite taps, sub-samples, short programmes and the boundary formula");
+    // A non-finite tap cannot come through the solver (the chain sanitises its input), so the builder is driven
+    // directly. Frames 0..9 of a 20-frame programme in 20 buckets, stride 4.
+    GainReductionTrace t;
+    {
+        GainReductionTraceBuilder b (t, 20);
+        for (int p = 0; p < 20; ++p)
+            for (int q = 0; q < 4; ++q)
+                b.add ((std::uint64_t) p, p == 3 ? (q == 1 ? std::numeric_limits<double>::quiet_NaN() : 2.0 + q)
+                                        : p == 4 && q == 0 ? std::numeric_limits<double>::infinity() : 1.0);
+        b.add (20u, 99.0);                                   // outside the programme: ignored
+        b.finish();
+    }
+    test::ok (t.buckets == 20, "a 20-frame programme gets 20 buckets, one per frame — not 1000 with trailing zeros");
+    test::ok (t.bucket[3].samples == 4 && t.bucket[3].nonFinite == 1 && t.bucket[3].maxDb == 5.0
+              && t.bucket[3].meanDb == (2.0 + 4.0 + 5.0) / 3.0,
+              "a NaN tap is counted, and excluded from the max and the mean of its bucket (max 5, mean of 2,4,5)");
+    test::ok (t.bucket[4].nonFinite == 1 && t.bucket[4].maxDb == 1.0, "so is +Inf — it does not become the max");
+    test::ok (! t.valid && t.samples == 80u && t.nonFinite == 2u, "and the trace says it is not a measurement: 80 samples, 2 non-finite");
+    test::ok (t.bucket[19].samples == 4u, "the tap one frame past the programme is not in the last bucket");
+
+    // THE BOUNDARY FORMULA (astra's witness 8): 48001 frames, 1000 buckets — bucket 500 begins at floor(500·48001/1000)
+    // = 24000, so frame 24000 is in bucket 500. floor(24000·1000/48001) would say 499.
+    GainReductionTrace u;
+    {
+        GainReductionTraceBuilder b (u, 48001);
+        for (int p = 0; p < 48001; ++p) b.add ((std::uint64_t) p, p == 24000 ? 7.0 : 0.0);
+        b.finish();
+    }
+    test::ok (u.bucket[500].maxDb == 7.0 && u.bucket[499].maxDb == 0.0, "48001 frames: frame 24000 is in bucket 500, not 499");
+    test::ok (u.bucket[999].samples == 48u + 1u && u.bucket[0].samples == 48u && u.valid,
+              "the 1-frame remainder lands in the LAST bucket (49 frames), the first holds floor(48001/1000) = 48");
+}
+
+void testTheTraceDescribesTheDeliveredRender()
+{
+    test::group ("P59b: the trace is the render in `out` — both delivery branches, the early exits, the refusals");
+    auto solveTone = [] (Rig& rig, Programme& src, Programme& dst, const LoudnessRequest& req)
+    { return rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), src.nch(), src.frames(), req); };
+
+    // THE RE-RENDER BRANCH. A 0.3 tone asked for -3 LUFS with the limiter allowed 2 dB, three passes (found by probing
+    // this rig; the crew's witness was for a different chain): the search's last pass limits 2.05 dB, it delivers an
+    // earlier candidate at 1.88 dB and RE-RENDERS it — so the last search pass is not the one in `out`. A trace taken
+    // from the last search pass, or snapshotted at every offer, reads that pass's GR.
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme src = makeTone ((int) kFs, 2, 0.3); Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req; req.targetLufs = -3.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3;
+        req.limiterGr.limitDb = 2.0;
+        const auto sol = solveTone (rig, src, dst, req);
+        bool rerendered = false;       // the last record repeats an earlier candidate's gain and ceiling: a delivery re-render
+        if (sol.logCount >= 2)
+            for (int i = 0; i + 1 < sol.logCount; ++i)
+                if (sol.log[i].gainDb == sol.log[sol.logCount - 1].gainDb && sol.log[i].ceilingDb == sol.log[sol.logCount - 1].ceilingDb) rerendered = true;
+        const double lastSearchGr = sol.logCount >= 2 ? sol.log[sol.logCount - 2].limiterMaxGrDb : -1.0;
+        test::ok (rerendered && std::fabs (lastSearchGr - sol.measured.limiter.maxDb) > 0.1,
+                  "PRECONDITION: the delivery was a RE-RENDER, and the last search pass had a different limiter GR ("
+                  + std::to_string (lastSearchGr) + " vs delivered " + std::to_string (sol.measured.limiter.maxDb) + ")");
+        test::ok (sol.limiterTrace.valid && sol.limiterTrace.buckets == 1000, "the delivered render's trace: valid, 1000 buckets");
+        checkTraceAgainstStats (sol.limiterTrace, sol.measured.limiter, "re-render branch, limiter");
+        checkTraceAgainstStats (sol.compressorTrace, sol.measured.compressor, "re-render branch, compressor");
+    }
+    // THE NO-RE-RENDER BRANCH: a search that ends on its own best point delivers the last render as it is.
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme src = makeMusic (4.0, 0.35); Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req; req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+        const auto sol = solveTone (rig, src, dst, req);
+        bool repeated = false;         // the last record repeating an earlier candidate is the re-render's signature
+        for (int i = 0; i + 1 < sol.logCount; ++i)
+            if (sol.log[i].gainDb == sol.log[sol.logCount - 1].gainDb && sol.log[i].ceilingDb == sol.log[sol.logCount - 1].ceilingDb) repeated = true;
+        test::ok (sol.logCount >= 1 && ! repeated && sol.limiterTrace.valid, "PRECONDITION: no re-render (the last candidate repeats none), a valid trace");
+        test::ok (traceMax (sol.limiterTrace) > 0.5, "PRECONDITION: the limiter worked (" + std::to_string (traceMax (sol.limiterTrace)) + " dB)");
+        checkTraceAgainstStats (sol.limiterTrace, sol.measured.limiter, "no-re-render branch, limiter");
+        checkTraceAgainstStats (sol.compressorTrace, sol.measured.compressor, "no-re-render branch, compressor");
+    }
+    // NO ACCUMULATION ACROSS RENDERS: a 0.9 tone asked for -6 LUFS with the limiter allowed 0.5 dB, three passes — an
+    // earlier pass limits 3.4 dB, the delivered one not at all, and a trace that was not reset per render would keep a
+    // peak the delivered audio does not have.
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme src = makeTone ((int) kFs, 2, 0.9); Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req; req.targetLufs = -6.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3;
+        req.limiterGr.limitDb = 0.5;
+        const auto sol = solveTone (rig, src, dst, req);
+        double earlier = 0.0;
+        for (int i = 0; i + 1 < sol.logCount; ++i) earlier = std::max (earlier, sol.log[i].limiterMaxGrDb);
+        test::ok (earlier > sol.measured.limiter.maxDb, "PRECONDITION: an earlier render limited harder than the delivered one ("
+                  + std::to_string (earlier) + " vs " + std::to_string (sol.measured.limiter.maxDb) + ")");
+        checkTraceAgainstStats (sol.limiterTrace, sol.measured.limiter, "reset per render, limiter");
+        test::ok (sol.limiterTrace.valid && traceMax (sol.limiterTrace) == sol.measured.limiter.maxDb,
+                  "and the trace's max is the DELIVERED render's (" + std::to_string (traceMax (sol.limiterTrace)) + " dB), not an earlier pass's");
+    }
+    // AN EARLY EXIT AFTER A COMPLETED RENDER still has that render's trace: 97 frames, one impulse in the LAST frame —
+    // `MeasurementInvalid` (nothing to gate), and the limiter's reaction to the final sample is in bucket 96.
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme src = makeImpulse (97, 2, 96, 0.9f); Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -20.0; req.maxPasses = 1;
+        rig.params.limiter.ceilingDbTp = -20.0;
+        const auto sol = solveTone (rig, src, dst, req);
+        test::ok (sol.status == MasteringSolveStatus::MeasurementInvalid && sol.passes == 1,
+                  std::string ("PRECONDITION: an early exit after one render (") + statusName (sol.status) + ")");
+        test::ok (sol.limiterTrace.valid && sol.limiterTrace.buckets == 97, "its trace is valid and has one bucket per frame");
+        test::ok (traceMax (sol.limiterTrace) > 1.0 && sol.limiterTrace.bucket[96].maxDb == traceMax (sol.limiterTrace),
+                  "and the GR of a peak in the programme's LAST frame is in the last bucket (" + std::to_string (sol.limiterTrace.bucket[96].maxDb) + " dB)");
+    }
+    // NO RENDER, NO TRACE. Refusals before the first pass: no buckets, not valid.
+    {
+        Programme src = makeMusic (1.0, 0.3); Programme dst; dst.ch = src.ch; dst.bind();
+        TargetLoudnessSolver unprepared; MasteringChain ch; OfflineRenderer r;
+        LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+        const auto a = unprepared.solve (ch, r, MasteringChainParams {}, src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (a.status == MasteringSolveStatus::NotPrepared && a.limiterTrace.buckets == 0 && ! a.limiterTrace.valid
+                  && a.compressorTrace.buckets == 0, "NotPrepared: no buckets, not valid");
+        Rig rig; if (! test::run (rig.build (2))) return;
+        const auto b = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), src.out(), 2, src.frames(), req);
+        test::ok (b.status == MasteringSolveStatus::InvalidRequest && b.limiterTrace.buckets == 0 && ! b.limiterTrace.valid,
+                  "InvalidRequest (in place): no buckets, not valid");
+    }
+    // A RENDER THAT DOES NOT RUN TO ITS END is not a measurement: an unprepared renderer passes `admits` (its block size
+    // is 0) and refuses the first render — `RenderFailed` at pass 1, reachable from the public surface.
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        OfflineRenderer cold;
+        Programme src = makeMusic (1.0, 0.3); Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+        const auto sol = rig.solver.solve (rig.chain, cold, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::RenderFailed && sol.passes == 1,
+                  std::string ("PRECONDITION: the cold renderer fails the first render (") + statusName (sol.status) + ")");
+        test::ok (! sol.limiterTrace.valid && ! sol.compressorTrace.valid, "and no trace claims to be a measurement");
+    }
+}
+
+void testTheTraceLocatesAnImpulse()
+{
+    test::group ("P59b: WHERE — an impulse's gain reduction sits in its own bucket, and ends where the release says");
+    // 48000 frames (buckets of 48), one impulse at frame 6000. The limiter's sliding window HOLDS the peak GR for its
+    // lookahead after the sample, then releases exponentially: G(n) = G0·c^n per oversampled sample, so it crosses
+    // the activity threshold θ after releaseMs·fs/1000·ln(G0/θ) frames. The crew's first version of this oracle ended
+    // one bucket early because it started that countdown at the impulse and not at the end of the hold (astra, 11).
+    Rig rig; if (! test::run (rig.build (2))) return;
+    const int at = 6000;
+    Programme src = makeImpulse ((int) kFs, 2, at, 0.9f); Programme dst; dst.ch = src.ch; dst.bind();
+    rig.params.limiter.ceilingDbTp = -20.0;
+    LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -20.0; req.maxPasses = 1;
+    const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+    const GainReductionTrace& t = sol.limiterTrace;
+    const MasteringChainResolved r = rig.chain.resolved();
+    const double G0 = traceMax (t), theta = req.activityThresholdDb;
+    test::ok (t.valid && t.buckets == 1000 && G0 > 10.0, "PRECONDITION: a valid trace and a limiter that worked hard (" + std::to_string (G0) + " dB)");
+    const auto bucketOf = [&] (long long frame) { return (int) ((frame + 1) * 1000LL - 1) / (int) kFs; };   // 48000 = 1000·48: exact
+    int first = -1, last = -1;
+    for (int k = 0; k < t.buckets; ++k) if (t.bucket[k].maxDb > theta) { if (first < 0) first = k; last = k; }
+    test::ok (t.bucket[bucketOf (at)].maxDb == G0, "the peak GR is in the impulse's own bucket (" + std::to_string (bucketOf (at)) + ")");
+    // The reconstruction filter spreads the impulse over a couple of frames either side: the first active frame is at
+    // most 2 before it, which here can only be bucket 124 (frame 5998..5999) or 125.
+    test::ok (first == bucketOf (at - 2) || first == bucketOf (at), "the first active bucket is the impulse's or the one before ("
+              + std::to_string (first) + ")");
+    const double holdEnd = (double) at + (double) r.limiterLookahead + 1.0;
+    const double decayFrames = r.limiterReleaseMs * 0.001 * kFs * std::log (G0 / theta);
+    const double endFrame = holdEnd + decayFrames;
+    const int lo = bucketOf ((long long) std::floor (endFrame - 2.0)), hi = bucketOf ((long long) std::ceil (endFrame + 2.0));
+    test::ok (last >= lo && last <= hi, "the last active bucket is where hold + release put it: predicted frame "
+              + std::to_string (endFrame) + " → buckets " + std::to_string (lo) + ".." + std::to_string (hi) + ", measured " + std::to_string (last));
+    int beforeActive = 0;
+    for (int k = 0; k < first; ++k) if (t.bucket[k].maxDb > 0.0) ++beforeActive;
+    test::ok (beforeActive == 0, "silence before the impulse reads exactly 0 dB in every bucket");
 }
 
 // =============================================================================================
@@ -2313,6 +2663,10 @@ int main()
     testUnreachableIsNamed();
     testUpstreamIsNotBlamedOnTheTarget();
     testStatisticsAgreeWithAHandDrivenChain();
+    testTheTraceNullsAgainstAHandDrivenChain();
+    testTheTraceBuilderCountsWhatNoAudioCanReach();
+    testTheTraceDescribesTheDeliveredRender();
+    testTheTraceLocatesAnImpulse();
     testRefusalsAndDegenerateInputs();
     testBlockIndependence();
     testTheReportedRenderIsTheDeliveredOne();
