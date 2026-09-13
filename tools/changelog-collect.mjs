@@ -33,14 +33,20 @@ if (! preview && ! /^v\d+\.\d+\.\d+$/.test(version))
     process.exit(2);
 }
 
+// `p57b` is task 57's second half and belongs right after 57, so the id is a NUMBER and an optional
+// letter — not `\b`-terminated, which is what made `p57b` and `p59b` unparseable and sorted them to the
+// end, behind p64, in the first release this tool saw.
 const rank = (name) => {
-    const m = /^p(\d+)\b/i.exec(name);
-    return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+    const m = /^p(\d+)([a-z]*)/i.exec(name);
+    return m ? [Number(m[1]), m[2].toLowerCase()] : [Number.MAX_SAFE_INTEGER, ''];
 };
 
 const files = readdirSync(dir)
     .filter(f => f.endsWith('.md') && f !== 'README.md')
-    .sort((a, b) => (rank(a) - rank(b)) || a.localeCompare(b));
+    .sort((a, b) => {
+        const [na, sa] = rank(a), [nb, sb] = rank(b);
+        return (na - nb) || sa.localeCompare(sb) || a.localeCompare(b);
+    });
 
 if (files.length === 0) { console.error('changelog.d/ holds no fragments'); process.exit(preview ? 0 : 1); }
 
