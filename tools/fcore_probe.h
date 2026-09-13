@@ -60,8 +60,10 @@ public:
     // n, and the oversampler's ring history makes upsample() a pure function of the samples seen so far —
     // verified bit-identical for chunk sizes 1 … 100003.
     static constexpr int kChunk         = 8192;
-    static constexpr int kOsFactor      = 4;    // \ the true-peak filter this tool is the REFERENCE for;
-    static constexpr int kOsTapsPerPhase = 32;  // / see the header comment before changing either
+    // The reference filter's topology, named once in analysis::ReferenceTruePeakMeter and only re-exported here
+    // (fc_probe_os_factor/_taps, fcore_measure's banner) — a literal here would be a second copy that could drift.
+    static constexpr int kOsFactor       = felitronics::analysis::ReferenceTruePeakMeter::kFactor;
+    static constexpr int kOsTapsPerPhase = felitronics::analysis::ReferenceTruePeakMeter::kTapsPerPhase;
 
     // Audio sample rates, bounded to a range an audio tool can mean. "Positive and finite" is NOT enough: an
     // absurd-but-finite rate (1e300, or Number.MIN_VALUE from a page) is no audio rate, and what each stage
@@ -95,7 +97,13 @@ public:
     bool prepared() const noexcept { return prepared_; }
 
     // planar[c] holds n frames for channel c. Channels beyond the prepared count are ignored; fewer than
-    // prepared is honoured as-is (the meter weights only what it is given).
+    // prepared is honoured as-is (the meter weights only what it is given). A call NARROWER than the one before
+    // it stops the channels it leaves out, and the true-peak meter drains them at that moment (law 11a, and why a
+    // maximum drains rather than drops — ReferenceTruePeakMeter.h): a peak still inside their filter is measured
+    // then, exactly as finish() would have measured it, and a channel that comes back starts from silence. Before
+    // P62 the probe kept the history, so the reading of a narrowing stream that ends is unchanged, and one whose
+    // channel RETURNS no longer replays audio from before its gap. Neither caller narrows: fcore_measure and
+    // fc_probe hand every prepared channel to every call.
     void process (const float* const* planar, int channels, long long n) noexcept
     {
         if (! prepared_ || finished_ || n <= 0) return;

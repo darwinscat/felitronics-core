@@ -11,7 +11,10 @@
 // class, and require
 //   * the certificate at or under the promise;
 //   * the solver's own report EQUAL to the certificate, bit for bit — the report is the certificate, not an estimate
-//     of it (before P62 the solver read with the other meter and the two were different numbers);
+//     of it (before P62 the solver read with the other meter and the two were different numbers). In dB, and so for
+//     a delivered peak above the dB floors: the solver spells anything under 1e-10 as -200, the meter's truePeakDb()
+//     floors at gainToDb's 1e-12 and fcore_measure's at 1e-9 — three spellings of silence, none of which is a file a
+//     loudness target delivers;
 //   * the loudness inside the request's tolerance.
 //
 // WHY THIS FIXTURE CAN FAIL. The material is the bright-transient programme felitronics_truepeak_instrument_gap_tests
@@ -32,6 +35,7 @@
 #include <felitronics_test.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -157,7 +161,8 @@ int main()
                          r.passes, r.integrated, r.certificate, r.reported, r.cheap);
             ok (r.status == fm::MasteringSolveStatus::Solved, pair + ": solved");
             ok (r.certificate <= req.maxTruePeakDbTp, pair + ": the certificate is at or under the promise");
-            ok (r.reported == r.certificate, pair + ": the solver's report IS the certificate, bit for bit");
+            ok (std::bit_cast<std::uint64_t> (r.reported) == std::bit_cast<std::uint64_t> (r.certificate),
+                pair + ": the solver's report IS the certificate, bit for bit");
             ok (std::fabs (r.integrated - req.targetLufs) <= req.toleranceLu, pair + ": the loudness is inside the tolerance");
             if (r.certificate > req.maxTruePeakDbTp) ++breaches;
             if (r.certificate - r.cheap > worstCheapGap) { worstCheapGap = r.certificate - r.cheap; worstPair = pair; }

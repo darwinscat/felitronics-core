@@ -68,7 +68,7 @@ namespace felitronics::mastering
 //
 // THE DERATE IS NOT A CONSTANT HERE, and that is the point. `TruePeakLimiter` bounds its own F*fs grid
 // exactly and overshoots the reconstructed peak between grid points — up to +1.22 dB in the worst
-// non-degenerate case at 4x, and measured IN SITU on the corpus at only +0.0005 .. +0.1028 dB, because
+// non-degenerate case at 4x, and measured IN SITU on the corpus (with the pre-P62 meter) at only +0.0005 .. +0.1028 dB, because
 // spectral tilt buys it cheaply. A fixed 1.2 dB derate would cost loudness on every track. Here the
 // delivered peak is MEASURED and enters `PLR`, so the derate is whatever the material's is, on that
 // material, and the ceiling that gets programmed into the limiter is an OUTPUT of the solve.
@@ -446,7 +446,7 @@ public:
         if (frames <= 0 || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
         const std::uint64_t meter = meterBytes (sampleRate, frames);
         if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
-        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, numChannels).bytes();
+        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes();
     }
 
     // measureInputLoudnessRange(): one loudness meter — and NOTHING for a programme too short to have a range, which it
@@ -1248,8 +1248,8 @@ private:
     //    -17.14 LUFS against the truth of -18.17, with the only outward sign a counter nobody reads.
     //  * the true-peak meter is DRAINED, and the drain is not given to the loudness meter. A programme
     //    ending on a peak under-reads without it: `[... 0, 1, 1]` reads +0.000000 dBTP undrained and
-    //    +1.833993 drained (the reference; the cheap meter this class used before P62 read +1.750350
-    //    after 8 zeros), and shipping the first number is precisely the
+    //    +1.833993 drained (the reference, pinned in felitronics_reference_truepeak_tests; the cheap meter
+    //    this class used before P62 read +1.750350 after 8 zeros), and shipping the first number is precisely the
     //    defect P1 measured in the chain this replaces — rows shipping ABOVE their own ceiling while
     //    the interface reports success. The COUNT deliberately does not live here: its owner is the
     //    baseline harness in another repository, it moves whenever that corpus does, and nothing in
@@ -1294,9 +1294,10 @@ private:
     }
 
     // How the two peaks are written in dB — the form this class has always reported (it was `TruePeakMeter`'s):
-    // `gainToDb` above 1e-10, and -200 for anything quieter. Kept on purpose when the instrument changed (P62), so
+    // `gainToDb` above 1e-10f — the float threshold, widened, so the boundary is the old one to the bit — and -200 for
+    // anything quieter. Kept on purpose when the instrument changed (P62), so
     // the switch moves the READING and nothing about how silence is spelled to a caller that tests for it.
-    static double peakDb (double lin) noexcept { return lin > 1.0e-10 ? core::gainToDb (lin) : -200.0; }
+    static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDb (lin) : -200.0; }
 
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {

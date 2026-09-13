@@ -22,10 +22,29 @@
 #include <string>
 #include <vector>
 
+// The byte counter counts what the CONTAINER asked for, which is the quantity a budget states. MSVC's STL on x86/x64
+// asks operator new for sizeof(void*) + 31 more on a block of 4096 bytes or more (its hand alignment, <xmemory>) —
+// the reference meter's scratch is such a block — so the counter takes that back off, exactly as
+// LoudnessConformanceTests.cpp does and for the reason written there; the first law-11d check proves the correction
+// is this STL's. Release only: iterator debugging adds proxies no counter can tell from storage.
+#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
+#  if defined(_DEBUG)
+static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
+#  else
+static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
+#  endif
+#else
+static constexpr std::size_t kStlBigPad = 0;
+#endif
+static constexpr std::size_t kStlBigBlock = 4096;
 static std::atomic<long>        g_allocs { 0 };
 static std::atomic<std::size_t> g_bytes  { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (s); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (s); return std::malloc (s ? s : 1); }
+static std::size_t containerBytes (std::size_t s) noexcept
+{
+    return kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s;
+}
+void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
+void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
 void  operator delete   (void* p) noexcept { std::free (p); }
 void  operator delete[] (void* p) noexcept { std::free (p); }
 void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
@@ -149,6 +168,20 @@ int main()
         test::ok (m.truePeakLinear() == drained, "one more drain moves nothing: the ring is already silence");
     }
 
+    // The example TargetLoudnessSolver's measuring-rig comment quotes: a programme ending `..., 0, 1, 1`.
+    test::group ("a programme ending on [0, 1, 1] reads +0 dBTP undrained and +1.833993 dBTP drained");
+    {
+        std::vector<std::vector<float>> x (1, std::vector<float> (64, 0.0f));
+        x[0][62] = 1.0f; x[0][63] = 1.0f;
+        RTP m; test::run (m.prepare (fs, 64, 1));
+        const float* p[1] { x[0].data() };
+        test::run (m.process (p, 1, 64));
+        test::ok (m.truePeakDb() == 0.0, "undrained: the sample-peak floor, exactly 0 dBTP");
+        m.drain();
+        std::printf ("    drained %.6f dBTP\n", m.truePeakDb());
+        test::approx (m.truePeakDb(), 1.833993, 5.0e-6, "drained: +1.833993 dBTP");
+    }
+
     test::group ("the sample peak is a hard floor, and dB is the dB of the linear reading");
     {
         std::vector<std::vector<float>> x (1, std::vector<float> (512, 0.0f));
@@ -159,18 +192,40 @@ int main()
         test::ok (m.truePeakDb() == core::gainToDb (m.truePeakLinear()), "truePeakDb() is gainToDb of the linear reading");
     }
 
-    test::group ("law 11a: a channel that stops is measured from silence when it returns");
+    // THE FALLING EDGE DRAINS. The review round's sequence: the right channel ends on a peak still inside the FIR,
+    // then one mono block. Dropping that history (what a delay line does under law 11a) read 0.95 where the
+    // retained-and-drained reading — the hand-rolled path, which never forgets a channel — is 1.0625: an over lost.
+    test::group ("a channel that stops is DRAINED: its peak still inside the filter is measured, and it returns silent");
     {
+        std::vector<float> left (256, 0.0f), right (256, 0.0f), quiet (256, 0.0f);
+        for (int i = 246; i < 256; ++i) right[(std::size_t) i] = 0.95f;   // an ending the grid does not show
         RTP m; test::run (m.prepare (fs, 256, 2));
-        std::vector<float> loud (256, 0.0f), quiet (256, 0.0f);
-        for (int i = 240; i < 256; ++i) loud[(std::size_t) i] = 0.9f;     // energy left inside the FIR
-        const float* both[2] { loud.data(), loud.data() };
+        const float* both[2] { left.data(), right.data() };
         test::run (m.process (both, 2, 256));
         const float* mono[1] { quiet.data() };
-        test::run (m.process (mono, 1, 256));                              // channel 1 stops
+        test::run (m.process (mono, 1, 256));                              // channel 1 stops here
+        const double atStop = m.truePeakLinear();
+        const HandRolled h = handRolled ({ left, right });                 // every channel kept, drained at the end
+        std::printf ("    reading after the stop %.9f, hand-rolled %.9f\n", atStop, h.tp);
+        test::ok (atStop == h.tp, "the stop reads exactly what keeping the channel and draining it reads");
+        test::ok (h.tp > 1.0, "precondition — that reading is an over the grid does not show");
+        m.drain();
+        test::ok (m.truePeakLinear() == atStop, "and a drain afterwards adds nothing: the stopped channel is already silent");
         const float* silent[2] { quiet.data(), quiet.data() };
         test::run (m.process (silent, 2, 256));
-        test::ok (m.truePeakLinearBlock() == 0.0, "stereo silence after the stop reads exactly zero");
+        test::ok (m.truePeakLinearBlock() == 0.0, "stereo silence after the stop reads exactly zero: nothing replays");
+    }
+
+    test::group ("a zero-width call is a pause: every channel is drained, and the block reports that tail");
+    {
+        std::vector<float> x (256, 0.0f);
+        for (int i = 246; i < 256; ++i) x[(std::size_t) i] = 0.95f;
+        RTP m; test::run (m.prepare (fs, 256, 1));
+        const float* p[1] { x.data() };
+        test::run (m.process (p, 1, 256));
+        test::run (m.process (nullptr, 0, 64));
+        test::ok (m.truePeakLinearBlock() > 1.0 && m.truePeakLinear() == m.truePeakLinearBlock(),
+                  "the pause's block reading is the drained tail, and it reached the running maximum");
     }
 
     test::group ("prepare() refuses what it cannot honour, and a refusal leaves the meter unusable");
@@ -183,7 +238,9 @@ int main()
         std::vector<float> s (64, 0.1f);
         const float* p[1] { s.data() };
         test::ok (! m.process (p, 1, 64) && ! m.isPrepared(), "after a refused prepare(), process() refuses too");
-        test::ok (! RTP::storageFor (fs, 0).ok && RTP::storageFor (fs, 0).bytes() == 0, "and the budget for a refusal is zero");
+        test::ok (! m.prepare (fs, 0, 2) && ! m.prepare (fs, -1, 2), "refuses a block of no samples");
+        test::ok (! RTP::storageFor (fs, 64, 0).ok && RTP::storageFor (fs, 64, 0).bytes() == 0 && RTP::storageFor (fs, 0, 2).bytes() == 0,
+                  "and the budget for a refusal is zero");
     }
 
     test::group ("a null plane is refused before anything moves");
@@ -196,6 +253,17 @@ int main()
     }
 
     test::group ("law 11d: prepare() asks the heap for exactly storageFor(); process() and drain() ask for nothing");
+    {
+        const std::size_t before = g_bytes.load();
+        {
+            std::vector<float> v;
+            v.assign (4096, 0.0f);                        // 16 384 B: a padded block on MSVC's STL
+            volatile float* sink = v.data();              // observed, so the allocation cannot be elided
+            sink[0] = 1.0f;
+        }
+        const std::size_t counted = g_bytes.load() - before;
+        test::ok (counted == 4096u * sizeof (float), "the byte counter counts a big vector as its container asked (" + std::to_string (counted) + ")");
+    }
     for (int nch : { 1, 2, 6, core::kMaxChannels })
     {
         const auto x = programme (nch, 5000, 11u);
@@ -203,8 +271,8 @@ int main()
         RTP m;
         test::run (m.prepare (96000.0, 5000, nch));
         const std::size_t asked = g_bytes.load() - b0;
-        test::ok (asked == RTP::storageFor (96000.0, nch).bytes(),
-                  std::to_string (nch) + " ch: " + std::to_string (asked) + " bytes allocated, budget " + std::to_string (RTP::storageFor (96000.0, nch).bytes()));
+        test::ok (asked == RTP::storageFor (96000.0, 5000, nch).bytes(),
+                  std::to_string (nch) + " ch: " + std::to_string (asked) + " bytes allocated, budget " + std::to_string (RTP::storageFor (96000.0, 5000, nch).bytes()));
         const long a0 = g_allocs.load();
         const float* p[core::kMaxChannels] {};
         for (int c = 0; c < nch; ++c) p[c] = x[(std::size_t) c].data();

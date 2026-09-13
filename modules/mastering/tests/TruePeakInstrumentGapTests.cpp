@@ -33,11 +33,13 @@
 #include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
+#include <felitronics/oversampling/PolyphaseOversampler.h>
+#include <felitronics/core/OfflineFft.h>
 #include <felitronics_test.h>
-#include <truepeak_oracle.h>
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <limits>
 #include <cstdint>
 #include <cstdio>
@@ -197,6 +199,75 @@ Planes deliver (const Planes& src, double rate)
 
 struct Reading { double r = 0.0, c = 0.0, cLin = 0.0, samplePeakLin = 0.0; int cFactor = 0; };
 
+// THE TRUTH WITHOUT A GRID OF ITS OWN. Spectral zero-padding reads the reconstruction on `pad` points per sample, and
+// the sinc cross-check at the same subdivision reads it on the SAME points — two constructions that agree because
+// they share a grid, which is CLAUDE.md's third fixture rule broken by its own oracle (the review round found both
+// 0.002 dB under the crest of the worst cell). So the grid is used only to FIND the crests: every zero-padded point
+// within 0.05 dB of the channel's zero-padded maximum (the grid's own miss is at most 0.042 dB at x16) is refined at a
+// CONTINUOUS time — a Blackman-windowed ideal sinc, half-length 512, cutoff at the base Nyquist, in double, golden
+// section over +-1/16 sample to 1e-9 of a sample. (Candidates taken from the REFERENCE filter's stream instead missed
+// the crest by 0.1 dB: that filter droops exactly where the crest is, which is the finding this group pins.) The
+// result is checked against the grid from both sides.
+double sincAt (const std::vector<float>& x, double t)
+{
+    constexpr int half = 512;
+    const long long k0 = (long long) std::floor (t) - half + 1, k1 = (long long) std::floor (t) + half;
+    double acc = 0.0;
+    for (long long k = std::max (0LL, k0); k <= std::min ((long long) x.size() - 1, k1); ++k)
+    {
+        const double u = t - (double) k;
+        if (std::fabs (u) >= (double) half) continue;
+        const double sn = std::fabs (u) < 1e-12 ? 1.0 : std::sin (kPi * u) / (kPi * u);
+        const double w  = 0.42 + 0.5 * std::cos (kPi * u / half) + 0.08 * std::cos (2.0 * kPi * u / half);
+        acc += (double) x[(std::size_t) k] * sn * w;
+    }
+    return std::fabs (acc);
+}
+
+struct Truth { double continuousDb = 0.0, gridDb = 0.0; };
+
+Truth truePeak (const Planes& p, int pad)
+{
+    Truth out;
+    double best = 0.0, grid = 0.0;
+    for (const auto& x : p)
+    {
+        // The zero-padded stream, built as test_support/truepeak_oracle.h builds it (Nyquist bin split), kept.
+        const std::size_t n = felitronics::core::offline::nextPow2 (x.size());
+        std::vector<std::complex<double>> a (n, std::complex<double> {});
+        for (std::size_t i = 0; i < x.size(); ++i) a[i] = (double) x[i];
+        felitronics::core::offline::fftInplace (a, -1);
+        const std::size_t N = (std::size_t) pad * n;
+        std::vector<std::complex<double>> b (N, std::complex<double> {});
+        for (std::size_t k = 0; k < n / 2; ++k)     b[k] = a[k];
+        for (std::size_t k = n / 2 + 1; k < n; ++k) b[N - (n - k)] = a[k];
+        b[n / 2] = a[n / 2] * 0.5; b[N - n / 2] = a[n / 2] * 0.5;
+        felitronics::core::offline::fftInplace (b, +1);
+        double top = 0.0;
+        for (const auto& v : b) top = std::max (top, std::fabs (v.real()) / (double) n);
+        grid = std::max (grid, top);
+        const double near = top * std::pow (10.0, -0.05 / 20.0);
+        for (std::size_t k = 0; k < N; ++k)
+        {
+            if (std::fabs (b[k].real()) / (double) n < near) continue;
+            const double t0 = (double) k / (double) pad;
+            if (t0 >= (double) x.size()) continue;
+            double lo = t0 - 1.0 / pad, hi = t0 + 1.0 / pad;
+            constexpr double gr = 0.6180339887498949;
+            double c = hi - gr * (hi - lo), d = lo + gr * (hi - lo), fc = sincAt (x, c), fd = sincAt (x, d);
+            while (hi - lo > 1e-9)
+            {
+                if (fc > fd) { hi = d; d = c; fd = fc; c = hi - gr * (hi - lo); fc = sincAt (x, c); }
+                else         { lo = c; c = d; fc = fd; d = lo + gr * (hi - lo); fd = sincAt (x, d); }
+            }
+            best = std::max ({ best, fc, fd, sincAt (x, t0) });
+        }
+    }
+    out.continuousDb = felitronics::core::gainToDb (best);
+    out.gridDb       = felitronics::core::gainToDb (grid);
+    return out;
+}
+
 // Both instruments, each driven the way its certifying / aiming caller drives it: the reference drained by its
 // own drain(), the cheap meter drained with the 64 zeros TargetLoudnessSolver used to feed it.
 Reading measure (const Planes& x, double rate)
@@ -235,8 +306,9 @@ constexpr double kPinned[kMaterials][6] = {
 };
 constexpr double kTolDb = 5.0e-4;
 constexpr int    kWorstMaterial = 1, kWorstRate = 0;                  // drums @ 44.1 kHz
-constexpr double kWorstTruthMinusReference = 0.025064;   // -0.637080 truth, -0.662144 reference
-constexpr double kWorstTruthMinusCheap     = 0.324539;   //                 -0.961619 cheap
+constexpr double kWorstTruthMinusReference = 0.027209;   // -0.634936 truth, -0.662144 reference
+constexpr double kWorstTruthMinusCheap     = 0.326683;   //                 -0.961619 cheap
+constexpr double kClickTruthMinusReference = 0.326990;   // the click at 48 kHz, worst offset: -0.903970 truth, -1.230960 reference
 constexpr int kOffsets = 8;
 
 Planes makeMaterial (int m, int offset)
@@ -260,6 +332,7 @@ int main()
 
     double gap[kMaterials][6] {};
     Reading at[kMaterials][6] {};
+    int worstOffset[kMaterials][6] {};
     std::printf ("  R - C, dB          ");
     for (double r : kRates) std::printf ("%11.1f", r / 1000.0);
     std::printf ("\n");
@@ -272,7 +345,7 @@ int main()
             for (int o = 0; o < (searched (m) ? kOffsets : 1); ++o)
             {
                 const Reading rd = measure (deliver (makeMaterial (m, o), kRates[k]), kRates[k]);
-                if (rd.r - rd.c > worst) { worst = rd.r - rd.c; at[m][k] = rd; }
+                if (rd.r - rd.c > worst) { worst = rd.r - rd.c; at[m][k] = rd; worstOffset[m][k] = o; }
             }
             gap[m][k] = worst;
             std::printf ("%+11.6f", worst);
@@ -321,8 +394,9 @@ int main()
                 std::string (kNames[m]) + " @ " + std::to_string ((int) kRates[k]) + ": cheap reading == sample peak");
 
     // WHY THE CHEAP METER CANNOT AIM A DELIVERED PROMISE, and why the reference is not the last word either. The
-    // worst cell against the band-limited truth, by spectral zero-padding (test_support/truepeak_oracle.h) and by
-    // its sinc cross-check, which share no construction: the drums at 44.1 kHz leave the limiter ABOVE its own
+    // worst cell against the band-limited truth, read at a continuous time (above) and cross-checked by spectral
+    // zero-padding (test_support/truepeak_oracle.h), whose own grid can only read under it, by at most its
+    // half-spacing bound -20 log10 cos(pi / (2 pad)): the drums at 44.1 kHz leave the limiter ABOVE its own
     // -1 dBTP ceiling (its downsampler's step overshoot on bright, dense material — truepeak_witnesses.h), the
     // cheap meter under-reads that by more than TargetLoudnessSolver's whole 0.05 dB aim, and the reference
     // under-reads it too, by less.
@@ -330,13 +404,32 @@ int main()
     {
         const Planes d = deliver (makeMaterial (1, 0), 44100.0);
         const Reading rd = measure (d, 44100.0);
-        const double fft  = std::max (felitronics::test::tp::truePeakDbFft (d[0], 16), felitronics::test::tp::truePeakDbFft (d[1], 16));
-        const double sinc = std::max (felitronics::test::tp::truePeakDbSinc (d[0], 256, 16, 2048), felitronics::test::tp::truePeakDbSinc (d[1], 256, 16, 2048));
-        std::printf ("    drums @ 44.1 kHz: truth %+.6f (sinc %+.6f)  reference %+.6f  cheap %+.6f dBTP\n", fft, sinc, rd.r, rd.c);
-        felitronics::test::approx (sinc, fft, 5.0e-3, "the two oracles agree");
-        felitronics::test::approx (fft - rd.r, kWorstTruthMinusReference, kTolDb, "the reference under-reads the truth by the pinned amount");
-        felitronics::test::approx (fft - rd.c, kWorstTruthMinusCheap, kTolDb, "the cheap meter under-reads it by the pinned amount");
-        ok (fft - rd.c > 0.05, "which is more than the solver's 0.05 dB aim");
+        constexpr int pad = 16;
+        const Truth tr = truePeak (d, pad);
+        const double truth = tr.continuousDb, fft = tr.gridDb;
+        const double padBound = -20.0 * std::log10 (std::cos (kPi / (2.0 * pad)));
+        std::printf ("    drums @ 44.1 kHz: truth %+.6f (zero-padded x%d %+.6f)  reference %+.6f  cheap %+.6f dBTP\n",
+                     truth, pad, fft, rd.r, rd.c);
+        ok (fft <= truth + 1.0e-5 && truth - fft <= padBound,
+            "the grid reads at or under the continuous reconstruction, and by no more than its half-spacing bound");
+        felitronics::test::approx (truth - rd.r, kWorstTruthMinusReference, kTolDb, "the reference under-reads the truth by the pinned amount");
+        felitronics::test::approx (truth - rd.c, kWorstTruthMinusCheap, kTolDb, "the cheap meter under-reads it by the pinned amount");
+        ok (truth - rd.c > 0.05, "which is more than the solver's 0.05 dB aim");
+    }
+
+    // The reference's own droop, where it is largest in this corpus: a click flat to 0.45 fs sits in the band its
+    // 0.90 x Nyquist, 32-taps-per-phase prototype attenuates. This is what ReferenceTruePeakMeter.h's "not the true
+    // peak of the signal" paragraph points at.
+    group ("the reference reads under the truth on a full-band click");
+    {
+        const Planes d = deliver (makeMaterial (4, worstOffset[4][1]), 48000.0);
+        const Reading rd = measure (d, 48000.0);
+        const Truth tr = truePeak (d, 16);
+        std::printf ("    click @ 48 kHz (offset %d/8): truth %+.6f (zero-padded x16 %+.6f)  reference %+.6f  cheap %+.6f dBTP\n",
+                     worstOffset[4][1], tr.continuousDb, tr.gridDb, rd.r, rd.c);
+        ok (tr.gridDb <= tr.continuousDb + 1.0e-5 && tr.continuousDb - tr.gridDb <= -20.0 * std::log10 (std::cos (kPi / 32.0)),
+            "the grid reads at or under the continuous reconstruction, within its bound");
+        felitronics::test::approx (tr.continuousDb - rd.r, kClickTruthMinusReference, kTolDb, "the reference under-reads it by the pinned amount");
     }
 
     return felitronics::test::report();

@@ -40,19 +40,24 @@ namespace felitronics::analysis
 // NOR IS THIS THE TRUE PEAK OF THE SIGNAL — it is the reference's reading of it. Its 0.90 x Nyquist cutoff
 // with 32 taps per phase droops near the top of the band, so on content the filter attenuates (a full-band
 // click, a tone above ~0.4 fs) a band-limited oracle reads higher than this does. That is a property of the
-// certifying instrument, which is chosen by contract, and it is recorded in the same gap suite rather than
-// argued away here.
+// certifying instrument, which is chosen by contract, and it is pinned in the same gap suite (its groups "the worst
+// cell against the truth" and "the reference reads under the truth on a full-band click") rather than argued away here.
 //
 // THE DRAIN IS THE CALLER'S TO ASK FOR, and asking is not optional for a whole-file reading. The FIR is causal
 // with a group delay of (128-1)/2 oversampled samples, so the reconstruction of the last ~16 input samples has
-// not left the filter when the input ends: a unit impulse in the final sample reads 0.000071 undrained against
-// 0.881 drained. `drain()` pushes `kTapsPerPhase` samples of digital silence through every prepared channel —
-// exactly what `fcore::Probe::finish()` always did — and after it the history IS that silence, so a stream
-// that continues is simply a stream with 32 zeros in it. One more drain adds nothing: the ring is already zero.
+// not left the filter when the input ends. The sample-peak floor does not stand in for it: a buffer ending on ten
+// samples at 0.95 reads 0.95 undrained and 1.062468 drained — an over the floor cannot see (the 4x maximum alone
+// is 0.015 undrained). `drain()` pushes `kTapsPerPhase` samples of digital silence through every prepared channel
+// — exactly what `fcore::Probe::finish()` always did — and after it the history IS that silence, so a stream that
+// continues is simply a stream with 32 zeros in it. One more drain adds nothing: the ring is already zero.
 //
-// Law 11 (DSP-ARCHITECTURE.md §2), in the house order; a narrower call is legal and a channel that stops has
-// its history dropped (law 11a), the same falling edge `TruePeakMeter` measured -0.92 dBTP out of silence
-// without. READ-ONLY: `io` is sampled, never written. RT-safe: prepare() allocates, process()/drain() do not.
+// A CHANNEL THAT STOPS IS DRAINED, NOT DROPPED. Law 11 (DSP-ARCHITECTURE.md §2) makes a narrower call legal and says
+// a stopped channel must not replay its history when it returns (11a) — for a delay line, drop it. For a running
+// MAXIMUM, dropping is wrong: the samples still inside the filter were submitted, and their reconstruction is part
+// of the reading. Dropped, a stereo stream whose right channel ends on a peak and is then followed by one mono
+// block lost an over (+0.53 dBTP read as -0.45). So the falling edge drains the stopped channel — the same 32 zeros
+// `drain()` feeds — which is what 11c asks of a pause (the channel heard silence) and leaves its history silent for
+// 11a. READ-ONLY: `io` is sampled, never written. RT-safe: prepare() allocates, process()/drain() do not.
 class ReferenceTruePeakMeter
 {
 public:
@@ -65,7 +70,7 @@ public:
 
     // WHAT prepare() ASKS THE HEAP FOR (law 11d): one `PolyphaseOversampler` per channel at the reference
     // topology, and the scratch. Asked of a FRESH meter; a prepared one keeps storage that still fits. All zeros
-    // (`ok == false`) exactly where prepare() refuses the same arguments.
+    // (`ok == false`) exactly where prepare() refuses the same arguments — which are its arguments, maxBlock included.
     struct Storage
     {
         bool          ok = false;
@@ -76,10 +81,10 @@ public:
             return oversamplerBytes + (std::uint64_t) sizeof (float) * (std::uint64_t) scratchFloats;
         }
     };
-    static Storage storageFor (double sampleRate, int maxChannels) noexcept
+    static Storage storageFor (double sampleRate, int maxBlock, int maxChannels) noexcept
     {
         Storage st;
-        if (! validRate (sampleRate) || maxChannels < 1 || maxChannels > core::kMaxChannels) return st;
+        if (! validRate (sampleRate) || maxBlock < 1 || maxChannels < 1 || maxChannels > core::kMaxChannels) return st;
         oversampling::PolyphaseOversampler::Storage one;
         if (! oversampling::PolyphaseOversampler::storageFor (kFactor, 1, kTapsPerPhase, one)) return st;
         st.oversamplerBytes = one.bytes() * (std::uint64_t) maxChannels;
@@ -88,12 +93,13 @@ public:
         return st;
     }
 
-    // The rate does not shape the filter — the reference is 4x at every rate — but it is an argument, and law
-    // 11b makes every argument binding: a rate no audio stream can have is refused, not ignored.
-    [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock*/, int maxChannels)
+    // Neither the rate nor the block shapes the filter or the storage — the reference is 4x at every rate and walks
+    // any `n` in kChunk pieces — but both are arguments, and law 11b makes every argument binding: a rate no audio
+    // stream can have, or a block of no samples, is refused rather than ignored.
+    [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels)
     {
         prepared_ = false;
-        const Storage st = storageFor (sampleRate, maxChannels);
+        const Storage st = storageFor (sampleRate, maxBlock, maxChannels);
         if (! st.ok) return false;
         for (int c = 0; c < maxChannels; ++c)
             if (! os_[(std::size_t) c].prepare (kFactor, 1, kTapsPerPhase)) return false;
@@ -138,11 +144,11 @@ public:
             if (io == nullptr) return false;
             for (int c = 0; c < nc; ++c) if (io[c] == nullptr) return false;
         }
-        for (int c = nc; c < ranNc_; ++c) os_[(std::size_t) c].reset();   // law 11a: these channels stopped
-        ranNc_ = nc;
-        if (nc == 0) return true;
-
         double blockMax = 0.0;
+        for (int c = nc; c < ranNc_; ++c) blockMax = std::max (blockMax, drainChannel (c));   // these channels stopped
+        ranNc_ = nc;
+        if (nc == 0) { maxOs_ = std::max (maxOs_, blockMax); blockMax_ = blockMax; return true; }
+
         for (int c = 0; c < nc; ++c)
         {
             const float* x = io[c];
@@ -151,10 +157,11 @@ public:
             samplePeak_ = std::max (samplePeak_, (double) grid);
             blockMax    = std::max (blockMax, (double) grid);
 
-            for (int off = 0; off < n; off += kChunk)
-            {
+            for (int off = 0; off < n; )                                   // advanced by what was taken: no
+            {                                                               // `off + kChunk` past INT_MAX
                 const int m = std::min (kChunk, n - off);
                 blockMax = std::max (blockMax, upsampleMax (c, x + off, m));
+                off += m;
             }
         }
         maxOs_    = std::max (maxOs_, blockMax);
@@ -163,17 +170,22 @@ public:
     }
 
     // See the header: `kTapsPerPhase` zeros through every PREPARED channel, folded into the running maximum.
-    // A channel that never ran, or stopped and was reset, has a zero ring and contributes exactly zero.
+    // A channel that never ran, or stopped and was drained then, has a zero ring and contributes exactly zero.
     void drain() noexcept
     {
         if (! prepared_) return;
-        const float zeros[kTapsPerPhase] {};
         for (int c = 0; c < channels_; ++c)
-            maxOs_ = std::max (maxOs_, upsampleMax (c, zeros, kTapsPerPhase));
+            maxOs_ = std::max (maxOs_, drainChannel (c));
     }
 
 private:
     static bool validRate (double fs) noexcept { return fs > 0.0 && std::isfinite (fs); }
+
+    double drainChannel (int c) noexcept
+    {
+        const float zeros[kTapsPerPhase] {};
+        return upsampleMax (c, zeros, kTapsPerPhase);
+    }
 
     // One piece of one channel through its oversampler; the maximum |x| of the 4x output. Taken as a float
     // maximum and widened once, which is the same number as widening every sample first (a maximum of floats is

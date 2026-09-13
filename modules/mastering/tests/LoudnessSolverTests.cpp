@@ -1410,9 +1410,15 @@ void testTapPlumbingEdges()
         const float* dp[2] = { o.ch[0].data(), o.ch[1].data() };
         if (! test::run (dry.process (dp, 2, n))) return;
         const double undrained = dry.truePeakDb();
-        test::ok (sol.measured.truePeakDbTp >= undrained - 1e-9,
-                  "the reported peak is at least the undrained reading (drained " +
-                  std::to_string (sol.measured.truePeakDbTp) + " vs undrained " + std::to_string (undrained) + ")");
+        dry.drain();
+        const double drained = dry.truePeakDb();
+        // `>= undrained` alone is nearly a tautology on the reference: its undrained reading already sits on the
+        // sample-peak floor and a drain can only raise a maximum, so a solver that stopped draining passed it (the
+        // P62 review round). The reported number must BE the drained reading, and the fixture must be one where
+        // the two differ.
+        test::ok (drained > undrained, "precondition — this delivered ending hides a peak only a drain reaches ("
+                                       + std::to_string (drained) + " vs " + std::to_string (undrained) + ")");
+        test::ok (sol.measured.truePeakDbTp == drained, "the reported peak IS the drained reading of the delivered buffer");
         test::ok (sol.measured.truePeakDbTp <= req.maxTruePeakDbTp + 1e-9,
                   "...and a programme that ends on a peak still delivers under the promise");
         std::printf ("      ends on a peak: drained %.4f dBTP, undrained %.4f dBTP\n",
@@ -2266,15 +2272,15 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     test::group ("a budget is 0 where its call refuses — channel counts included");
     using felitronics::analysis::ReferenceTruePeakMeter;
     const int past = felitronics::core::kMaxChannels + 1;
-    test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 0).bytes() == 0 && ReferenceTruePeakMeter::storageFor (48000.0, -1).bytes() == 0
-              && ReferenceTruePeakMeter::storageFor (48000.0, past).bytes() == 0,
+    test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 48000, 0).bytes() == 0 && ReferenceTruePeakMeter::storageFor (48000.0, 48000, -1).bytes() == 0
+              && ReferenceTruePeakMeter::storageFor (48000.0, 48000, past).bytes() == 0,
               "ReferenceTruePeakMeter::storageFor: 0 bytes for a channel count prepare() refuses");
     // 21 008 B, derived rather than read back: per channel one PolyphaseOversampler at 4x / 32 taps per phase —
     // the prototype 128 floats, its phase-major copy 4·32, the up ring 2·32 and the down ring 2·128 (P56's
     // double-length rings; the reference upsamples only, but the class allocates both), 576 floats = 2304 B, plus
     // two int cursors, 8 B — so 2 312 B a channel; and the shared scratch, kChunk·4 = 4 096 floats = 16 384 B.
     // (Before P62 the solver read with TruePeakMeter, 392 B, plus a 512 B drain buffer.)
-    test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 2).bytes() == 2u * 2312u + 16384u,
+    test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 48000, 2).bytes() == 2u * 2312u + 16384u,
               "and 21 008 B for stereo (the ABI suite's oracle)");
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000) == 0
               && TargetLoudnessSolver::solveBytes (48000.0, past, 48000) == 0,
@@ -2297,16 +2303,41 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // sized it at 48 kHz and passed). The reference is 4x at EVERY rate, so its budget must NOT move with the rate —
     // the opposite claim, pinned for the same reason: one rate could not tell. 1 s is 20 hops at any multiple of 100 Hz,
     // so the loudness meter is 8·(300 + 24 + 10) = 2672 B at each of them.
-    test::ok (ReferenceTruePeakMeter::storageFor (96000.0, 2).bytes() == 21008u && ReferenceTruePeakMeter::storageFor (192000.0, 2).bytes() == 21008u,
+    test::ok (ReferenceTruePeakMeter::storageFor (96000.0, 96000, 2).bytes() == 21008u && ReferenceTruePeakMeter::storageFor (192000.0, 192000, 2).bytes() == 21008u,
               "the reference true-peak meter is 21 008 B at 96 and at 192 kHz too");
     test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 21008u
               && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 21008u,
               "and a 1 s solve at 96 and 192 kHz carries it unchanged: 23 680 B");
 }
 
+// P62 — THE INSTRUMENT CHANGED, THE SPELLING OF SILENCE DID NOT. The solver now reads with ReferenceTruePeakMeter, whose
+// own dB accessor floors at gainToDb's 1e-12 (-240 dB); the solver keeps the -200 the pre-P62 meter reported for
+// anything under 1e-10f, so a caller that tests for it sees no change. (The mutation stand: spelling it through
+// gainToDb instead survived every suite until this group.)
+static void testSilenceIsStillSpelledMinus200()
+{
+    test::group ("a digitally silent render reports -200 dB for both peaks, as before the instrument changed");
+    Rig rig;
+    if (! test::run (rig.build (2))) return;
+    rig.params.bypassDither = true;                                        // nothing may put a sample above zero
+    const int n = (int) (1.0 * kFs);
+    Programme q; q.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f)); q.bind();
+    Programme o; o.ch = q.ch; o.bind();
+    LoudnessRequest req;
+    req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 2;
+    const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, q.in(), o.out(), 2, n, req);
+    bool silent = true;
+    for (const auto& c : o.ch) for (float v : c) silent = silent && v == 0.0f;
+    test::ok (silent, "precondition — the delivered render is digital silence");
+    test::ok (sol.passes >= 1, "precondition — a render was measured");
+    test::ok (sol.measured.truePeakDbTp == -200.0 && sol.measured.samplePeakDb == -200.0,
+              "true peak " + std::to_string (sol.measured.truePeakDbTp) + " and sample peak " + std::to_string (sol.measured.samplePeakDb));
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
+    testSilenceIsStillSpelledMinus200();
     testTappedRenderNullsAgainstThePlainOne();
     testShortTapRefusesTheWholeCall();
     testHitsTheTarget();
