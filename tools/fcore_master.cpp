@@ -681,6 +681,10 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_measurement, compressor) X (fc_measurement, limiter) X (fc_measurement, limiterMaxReconstructedPeakDb)    \
     X (fc_measurement, latencySamples) X (fc_measurement, gatingBlocks) X (fc_measurement, droppedBlocks)           \
     X (fc_measurement, nonFiniteSubHops) X (fc_measurement, loudnessValid) X (fc_measurement, lraValid)            \
+    X (fc_measurement, compressorGrTraceBuckets) X (fc_measurement, limiterGrTraceBuckets)                         \
+    X (fc_measurement, compressorGrTraceValid) X (fc_measurement, limiterGrTraceValid)                             \
+    X (fc_gr_trace_bucket, maxDb) X (fc_gr_trace_bucket, meanDb) X (fc_gr_trace_bucket, samples)                   \
+    X (fc_gr_trace_bucket, nonFinite)                                                                              \
     X (fc_solution_summary, header) X (fc_solution_summary, status) X (fc_solution_summary, binding)               \
     X (fc_solution_summary, alsoViolated) X (fc_solution_summary, preLimiterGainDb)                                \
     X (fc_solution_summary, ceilingDbTp) X (fc_solution_summary, passes) X (fc_solution_summary, logCount)         \
@@ -760,6 +764,19 @@ int cmdSolve (const Args& a, const std::vector<float>& in, std::size_t frames, i
     std::printf ("I=%.17g TP=%.17g LRA=%.17g PLR=%.17g loudnessValid=%d lraValid=%d\n",
                  meas.integratedLufs, meas.truePeakDbTp, meas.loudnessRangeLu, meas.plrDb,
                  meas.loudnessValid, meas.lraValid);
+    // v4 — each stage's trace, summarised for a harness: its bucket count, whether it is a measurement, the largest
+    // bucket maximum and the first bucket that holds it. The buckets themselves are `fc_solution_gr_trace`.
+    for (const auto& [label, code] : { std::pair<const char*, int> { "comp", FC_GR_STAGE_COMPRESSOR },
+                                       std::pair<const char*, int> { "lim",  FC_GR_STAGE_LIMITER } })
+    {
+        std::vector<fc_gr_trace_bucket> tb (1000u);
+        std::uint32_t w = 0;
+        (void) fc_solution_gr_trace (sol, code, tb.data(), (std::uint32_t) tb.size(), &w);
+        double mx = 0.0; std::uint32_t at = 0;
+        for (std::uint32_t i = 0; i < w; ++i) if (tb[i].maxDb > mx) { mx = tb[i].maxDb; at = i; }
+        const int valid = code == FC_GR_STAGE_LIMITER ? meas.limiterGrTraceValid : meas.compressorGrTraceValid;
+        std::printf ("%sTrace buckets=%u valid=%d max=%.17g at=%u\n", label, w, valid, mx, at);
+    }
     // A VERDICT IS NOT A RENDER. `InvalidRequest` and `NotPrepared` are returned before the solver
     // touches the output, so `out` is still the zero buffer it was allocated as — writing it would
     // hand a harness a file of the right length, full of digital silence, with exit status 0 and an
@@ -1341,6 +1358,33 @@ int selftest (double fs, int nc)
             const std::size_t dd = bitDiff (sAbi, sCpp, worst);
             std::snprintf (sm, sizeof sm, "%zu of %zu differ, worst %.9g", dd, sAbi.size(), worst);
             check (solved && dd == 0, "and its delivered audio is bit-identical", sm);
+
+            // v4 — the gain-reduction traces through the ABI are the core's, bit for bit, both stages, and the
+            // measurement's four trace fields say what the core's traces say.
+            {
+                fc_measurement meas {}; FC_INIT (meas);
+                const bool mOk = solved && fc_solution_measurement (sol, &meas) == FC_OK;
+                check (mOk && meas.compressorGrTraceBuckets == direct.compressorTrace.buckets
+                       && meas.limiterGrTraceBuckets == direct.limiterTrace.buckets
+                       && meas.compressorGrTraceValid == (direct.compressorTrace.valid ? 1 : 0)
+                       && meas.limiterGrTraceValid == (direct.limiterTrace.valid ? 1 : 0)
+                       && direct.limiterTrace.buckets > 0,
+                       "the trace's bucket counts and validity through the ABI are the core's");
+                std::size_t traceDiff = 0;
+                for (const auto& [code, t] : { std::pair<int, const GainReductionTrace*> { FC_GR_STAGE_COMPRESSOR, &direct.compressorTrace },
+                                               std::pair<int, const GainReductionTrace*> { FC_GR_STAGE_LIMITER,    &direct.limiterTrace } })
+                {
+                    std::vector<fc_gr_trace_bucket> tb ((std::size_t) GainReductionTrace::kMaxBuckets);
+                    std::uint32_t w = 0;
+                    if (! solved || fc_solution_gr_trace (sol, code, tb.data(), (std::uint32_t) tb.size(), &w) != FC_OK
+                        || (int) w != t->buckets) { ++traceDiff; continue; }
+                    for (std::uint32_t i = 0; i < w; ++i)
+                        if (std::memcmp (&tb[i].maxDb, &t->bucket[i].maxDb, 8) != 0 || std::memcmp (&tb[i].meanDb, &t->bucket[i].meanDb, 8) != 0
+                            || tb[i].samples != t->bucket[i].samples || tb[i].nonFinite != t->bucket[i].nonFinite) ++traceDiff;
+                }
+                std::snprintf (sm, sizeof sm, "%zu buckets differ", traceDiff);
+                check (traceDiff == 0, "and both traces through the ABI are the core's, bit for bit", sm);
+            }
             if (solved) fc_solution_destroy (sol);
             fc_master_destroy (h);
 

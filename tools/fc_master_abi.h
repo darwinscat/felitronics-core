@@ -91,7 +91,10 @@ extern "C" {
 // EXACT size match, not ">=", for v1 — and v1 said the first version to add a field would state its own
 // rule. v2 is that version (`fc_master_config::deliveryRate` and the delivering entry points), so the rule
 // follows, and it is written so that the NEXT bump is a row in a table rather than an event. v3 is the first
-// bump made by it — `compressorMix` (P60), two rows in the size table and a field at the end of two structs.
+// bump made by it — `compressorMix` (P60), two rows in the size table and a field at the end of two structs. v4 is
+// the gain-reduction trace (P59b): one entry point, `fc_solution_gr_trace`, which rule 1 says moves the version on
+// its own, the header-less bucket it copies, and the trace's bucket counts and validity at the end of `fc_measurement`
+// — one row.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -166,7 +169,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 3u
+#define FC_MASTER_ABI_VERSION 4u
 
 typedef struct fc_header
 {
@@ -295,6 +298,9 @@ typedef enum fc_constraint
     FC_CONSTRAINT_PLR = 3, FC_CONSTRAINT_LRA = 4, FC_CONSTRAINT_GAIN_RANGE = 5,
     FC_CONSTRAINT_COMPRESSOR_GR = 6
 } fc_constraint;
+
+// Which stage a gain-reduction trace is read for (v4) — `fc_solution_gr_trace`.
+typedef enum fc_gr_stage { FC_GR_STAGE_COMPRESSOR = 0, FC_GR_STAGE_LIMITER = 1 } fc_gr_stage;
 
 // Mirrors mastering::GrStatistic. Which statistic a gain-reduction limit binds is part of the limit's
 // TYPE and never a hidden convention.
@@ -598,8 +604,9 @@ typedef struct fc_need
 // THE LOUDNESS SEARCH
 //
 // A versioned C-POD request in, an OPAQUE HANDLE out, and the per-pass log copied into a buffer the
-// CALLER owns. Marshalling `mastering::LoudnessSolution` whole would be ~2.3 KiB per call of C++ enums,
-// `bool`, padding and a 32-entry log that almost every caller drops on the floor.
+// CALLER owns. Marshalling `mastering::LoudnessSolution` whole would be ~49 KiB per call — C++ enums, `bool`,
+// padding, a 32-entry log and, from v4, two 1000-bucket gain-reduction traces — most of which a caller never reads;
+// the log and the traces are copied out only on request.
 typedef struct fc_gr_limit
 {
     double  limitDb;                // +infinity = no limit. NOT "any non-finite": -infinity is an
@@ -651,7 +658,23 @@ typedef struct fc_measurement
     double  limiterMaxReconstructedPeakDb;
     int32_t latencySamples, gatingBlocks, droppedBlocks, nonFiniteSubHops;
     int32_t loudnessValid, lraValid;
+
+    // v4 — the gain-reduction traces of the same render, read with `fc_solution_gr_trace`: how many buckets each
+    // holds (min(1000, programme frames); 0 when the solve attempted no render) and whether it is a measurement
+    // (mastering::GainReductionTrace::valid — the render ran to its end, the window saw a sample, none non-finite).
+    int32_t compressorGrTraceBuckets, limiterGrTraceBuckets;
+    int32_t compressorGrTraceValid, limiterGrTraceValid;
 } fc_measurement;
+
+// One bucket of a gain-reduction trace (v4) — mastering::GainReductionTraceBucket, field for field. HEADER-LESS and
+// therefore FROZEN from v4 (rule 3): it is an element written with a stride of its `sizeof`, like `fc_solve_pass`.
+typedef struct fc_gr_trace_bucket
+{
+    double   maxDb;                 // largest finite |GR| in the bucket, dB; 0 when it saw no finite sample
+    double   meanDb;                // mean of its finite |GR|, dB; 0 when it saw none
+    uint32_t samples;               // tap samples in it — frames (compressor), frames x tapOversampleFactor (limiter)
+    uint32_t nonFinite;             // ... of which non-finite, excluded from max and mean
+} fc_gr_trace_bucket;
 
 typedef struct fc_solution_summary
 {
@@ -689,6 +712,7 @@ typedef enum fc_struct_id
         X(FC_STRUCT_NEED,         1,       40)    \
         X(FC_STRUCT_REQUEST,      1,      120)    \
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
+        X(FC_STRUCT_MEASUREMENT,  4,      224)    \
         X(FC_STRUCT_SUMMARY,      1,       88)
 
 //==============================================================================
@@ -935,6 +959,26 @@ fc_status fc_solution_measurement (fc_solution s, fc_measurement* out);
 // Copies min(logCount, cap) pass records into `out` and reports how many were written. Same ownership
 // rule as everywhere else here: the buffer is the caller's and its capacity is binding.
 fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint32_t* written);
+// v4 — WHERE a stage reduced gain in the audio this solution handed back: its trace, `stage` an fc_gr_stage, copied as
+// min(buckets, cap) buckets into `out` with `written` saying how many — the log's ownership and capacity rule. Bucket k
+// covers the programme frames [floor(k*F/B), floor((k+1)*F/B)) of F frames and B buckets — on a DELIVERING handle, frames
+// at the delivery rate, which is the rate the search ran at (B and whether the trace is a measurement are in
+// `fc_measurement`, v4); a bucket's max and mean are |GR| in dB over the same tap
+// samples the solution's gain-reduction statistics are taken over, so where those statistics are valid the maximum over
+// the buckets IS their `maxDb`.
+// The trace is the solution's: it describes the last render the search wrote into `out`, and a later solve on the
+// same chain handle, or destroying that handle, does not touch it.
+//
+// Checks in the header's order: poison, the handle, `written`, then — only when `cap > 0` — `out` (null, 8-byte
+// alignment, the span in the heap, and `written` NOT INSIDE that span: FC_ERR_SPAN), and then `stage`, a field value: a
+// code that names no stage is FC_ERR_ENUM, with `cap == 0` too. FC_OK with `written == 0` for a solution whose solve
+// attempted no render.
+//
+// `written` IS LEFT UNTOUCHED BY EVERY REFUSAL, as `fc_master_flush` leaves it — and unlike `fc_solution_log`, which
+// clears it first. Clearing first is what the general rule for a count out-parameter says, and it cannot be done here:
+// until the alias check has run, `written` may point into the buckets, and zeroing it would be a refusal that wrote into
+// the caller's buffer. It is set to 0 once every refusal is behind the call, and to the count on success.
+fc_status fc_solution_gr_trace (fc_solution s, int32_t stage, fc_gr_trace_bucket* out, uint32_t cap, uint32_t* written);
 fc_status fc_solution_destroy (fc_solution s);
 
 // THE CORE'S OWN DEFAULTS, written through the same mapping every other value crosses by.
