@@ -265,7 +265,8 @@ typedef struct fc_master_config
 // PER-BLOCK PARAMETERS
 //
 // A field-for-field mirror of `mastering::MasteringChainParams` and everything it contains. Nothing is
-// summarised, nothing is omitted and nothing is renamed: an ABI that exposed a "useful subset" would be
+// summarised, nothing is renamed, and nothing is omitted but ONE field, named at the end of the struct as
+// the debt it is (`compressorMix`, waiting for the version rule): an ABI that exposed a "useful subset" would be
 // a road that ends, and the thinness law says this surface may not be the only road to a capability —
 // which is only true if it is not a narrower one either.
 #define FC_MAX_EQ_BANDS 24
@@ -373,13 +374,21 @@ typedef struct fc_master_params
 
     int32_t bypassEq, bypassMonoBass, bypassCompressor;
     int32_t bypassClipper, bypassLimiter, bypassDither;
+
+    // ⚠ NOT YET MIRRORED: `MasteringChainParams::compressorMix` (parallel compression, P60). The mirror
+    // above is short of it on purpose and for now — the field waits for the ABI's version rule (P57)
+    // rather than opening a version of its own. Until then every params set that crosses this boundary
+    // renders at the core's default mix of 1, which is bit-identical to the chain before the field
+    // existed. This is the one exception to "nothing is omitted", and it is a debt, not a design.
 } fc_master_params;
 
 //==============================================================================
 // WHAT THE CHAIN ACTUALLY APPLIED
 //
 // A mirror of `mastering::MasteringChainResolved`. Every number in it is READ OUT of the prepared
-// chain, never recomputed here — which is what makes it worth reading at all.
+// chain, never recomputed here — which is what makes it worth reading at all. Short of
+// `compressorMix`, for the reason given at `fc_master_params`: the core applies 1 to every params set that
+// crosses this ABI (and resolves 0 on a topology with no compressor), so there is nothing to read back yet.
 typedef struct fc_master_resolved
 {
     fc_header header;
@@ -458,9 +467,10 @@ typedef struct fc_need
     //   * MEASURE_LRA — one meter, and 0 for a programme too short to have a range, which the call
     //     refuses before building one.
     //   * CREATE — the SUM of what the call requests, which is what it holds: everything a create asks
-    //     for, it keeps until the instance is destroyed. It exceeds the peak by 12 bytes for each of the
-    //     chain's two dry aligners that the topology re-sizes — the seed the aligner's constructor took
-    //     and its preparation hands back — and by nothing else.
+    //     for, it keeps until the instance is destroyed. It exceeds the peak by the part of the seed each
+    //     of the chain's three dry aligners hands back when its preparation re-sizes it — 12 bytes for
+    //     an aligner re-sized whole, 4 for a mono compressor whose lookahead rounds to 0 samples — and by
+    //     nothing else.
     //   * CONFIGURE — 0 when the chain already holds the geometry it is being re-prepared at, which is
     //     every configure this ABI can make (the rate, the width and the config are the handle's own).
     //     The chain re-uses its EQ engine and assigns every buffer to the length it already has, so this

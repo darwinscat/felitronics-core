@@ -90,6 +90,19 @@ struct MasteringChainParams
     // Runtime bypass of a PRESENT stage. Latency-neutral by construction.
     bool bypassEq = false, bypassMonoBass = false, bypassCompressor = false;
     bool bypassClipper = false, bypassLimiter = false, bypassDither = false;
+
+    // PARALLEL COMPRESSION: the compressor stage's output is `(1 - mix) * dry + mix * compressed`, where
+    // `dry` is the stage's own input delayed by exactly the compressor's lookahead. 1, the default, is the
+    // compressor alone and bit-identical to a chain without this field; 0 is the delayed input alone.
+    // Clamped to [0, 1]; a non-finite value is 1. It keeps applying while `bypassCompressor` is set — see
+    // runQuantum() for why that is the only answer without a level drop, and why it costs a steady
+    // bypass nothing. Makeup and
+    // auto-makeup ride the compressed path only, which is the parallel topology and not an oversight. It
+    // is the CHAIN's field, not the compressor's: `dynamics::Compressor` keeps dry/wet out on purpose, and
+    // an aligned dry path is exactly the kind of composition this class exists for. See runQuantum().
+    // LAST in the struct, so a positional aggregate initialiser written against the older layout still
+    // means what it meant.
+    double compressorMix = 1.0;
 };
 
 //==============================================================================
@@ -110,7 +123,11 @@ struct MasteringChainParams
 //   * `compressorGrDb[j]`  — the signed gain reduction the compressor's detector computed for CHAIN
 //                            INPUT SAMPLE j, i.e. `resolved().compressorTapOffset`, which is 0. (It is
 //                            applied to the lookahead-delayed copy of that sample, which is the
-//                            compressor's own contract, not this one's.)
+//                            compressor's own contract, not this one's.) It is the gain reduction of
+//                            the COMPRESSED path and does not move with `compressorMix`: at mix 0 it
+//                            still reads what the compressor did to a signal nobody hears. That is a
+//                            statement about the detector, and a limit on it is a limit on how hard
+//                            the compressor works — not on what reaches the output.
 //   * `preLimiter[c][j]`   — the sample at the pre-limiter node, taken BEFORE `preLimiterGainDb` is
 //                            applied, so it does NOT depend on that gain: everything upstream of the
 //                            gain node is a constant of a loudness search. Its frame j is chain input
@@ -172,13 +189,16 @@ struct MasteringChainResolved
     double limiterCeilingDbTp    = 0.0;
     double limiterReleaseMs      = 0.0;
     stereo::MonoBassParams monoBass {};
+    // The mix the compressor stage applies, after the clamp and the non-finite rule — and after the
+    // narrowing to float, so a request of 1 - 1e-9 reads back as the 1 it became. 0 without a compressor.
+    double compressorMix         = 0.0;
 };
 
 //==============================================================================
 // felitronics::mastering::MasteringChain — the mastering signal chain as ONE streaming, RT-safe,
 // block-independent object:
 //
-//     gate -> inputGain -> EQ -> [M/S mono-bass] -> compressor (opt. keyed) -> [soft clipper]
+//     gate -> inputGain -> EQ -> [M/S mono-bass] -> compressor (opt. keyed, opt. parallel) -> [soft clipper]
 //          -> preLimiterGain -> true-peak limiter -> dither
 //
 // Nothing here is new DSP. Every stage is a module that already ships and is already tested; this is
@@ -245,7 +265,10 @@ struct MasteringChainResolved
 //   * COMPRESSOR — its own parameters give an exactly transparent, WARM bypass: `ratio = 1` makes the
 //     curve's slope exactly 0, so the gain is exactly 1.0f and the signal comes out of the lookahead
 //     ring untouched, sign of zero included. Measured bit-exact against the input delayed by its own
-//     latency. The detector keeps tracking, so un-bypassing does not jump. Nothing to align.
+//     latency. The detector keeps tracking, so un-bypassing does not jump. Nothing to align. (The stage
+//     does own an aligner now, and it is not a bypass mechanism: it is `compressorMix`'s dry path, which
+//     keeps blending through a bypass — a steady bypass is untouched by it, and an engaging one does not
+//     drop.)
 //   * CLIPPER and LIMITER — skipped, with a `core::DryAligner` holding their PDC. The clipper does have
 //     a `mix = 0` bypass that is bit-exact for ordinary audio, but it normalises -0.0f to +0.0f
 //     (`dry + 0.0f * wet`), which a bit-exact null test would report, and it pays the whole oversampled
@@ -311,27 +334,43 @@ public:
     struct Storage
     {
         std::size_t fifo = 0, keyBuf = 0;              // floats — the quantum FIFO and the key-filter copy
-        bool eq = false, clipper = false, limiter = false;
+        bool eq = false, compressor = false, clipper = false, limiter = false;
         eq::EqEngine::Storage             eqScratch {};
         dynamics::Compressor::Storage     comp {};
         saturation::Saturator::Storage    clip {};
         limiter::TruePeakLimiter::Storage lim {};
-        core::DryAligner::Storage         alignClip {}, alignLim {};
+        core::DryAligner::Storage         alignComp {}, alignClip {}, alignLim {};
         int compressorLatency = 0, clipperLatency = 0, limiterLatency = 0;
         int latencySamples = 0;                        // K + the three above, exactly as prepare() sums it
         int tapOversampleFactor = 1;                   // the limiter's EFFECTIVE factor, 1 without a limiter
 
         // REQUESTED bytes, on a FRESH chain: every container is empty, so each `assign` asks for exactly its
         // size. What a chain that is already prepared asks for is `reprepareBytes()` below — a different
-        // question with a different answer.
+        // question with a different answer. The aligners are the exception to "empty" — each is held by
+        // value and constructed with a seed — which is why they are counted by `freshBytes()`.
         std::uint64_t bytes() const noexcept
         {
             std::uint64_t b = (std::uint64_t) sizeof (float) * ((std::uint64_t) fifo + (std::uint64_t) keyBuf);
-            if (eq)      b += eq::EqEngine::objectBytes() + eqScratch.bytes();
+            if (eq)         b += eq::EqEngine::objectBytes() + eqScratch.bytes();
             b += comp.bytes();
-            if (clipper) b += clip.bytes() + alignClip.bytes();
-            if (limiter) b += lim.bytes()  + alignLim.bytes();
+            if (compressor) b += alignComp.freshBytes();
+            if (clipper)    b += clip.bytes() + alignClip.freshBytes();
+            if (limiter)    b += lim.bytes()  + alignLim.freshBytes();
             return b;                                  // MonoBass and Dither allocate nothing — measured
+        }
+
+        // The same sum WITHOUT assuming any aligner still holds its constructor's seed: what a chain that
+        // was MOVED FROM asks for, since the move took the seed with it, and an upper bound for every other
+        // chain. They differ only where a buffer fits inside the seed — a one-channel compressor whose
+        // lookahead rounds to 0 samples, whose 2-slot ring a fresh chain already has and a moved-from one
+        // has to ask for (measured by the code-review round: 2292 B asked against 2284 B published).
+        std::uint64_t unseededBytes() const noexcept
+        {
+            std::uint64_t b = bytes();
+            if (compressor) b += alignComp.bytes() - alignComp.freshBytes();
+            if (clipper)    b += alignClip.bytes() - alignClip.freshBytes();
+            if (limiter)    b += alignLim.bytes()  - alignLim.freshBytes();
+            return b;
         }
 
         // Does a chain holding `other` already have room for this? Every count, conservatively: `assign`
@@ -342,6 +381,7 @@ public:
                 && eq == other.eq && clipper == other.clipper && limiter == other.limiter
                 && eqScratch.scratch <= other.eqScratch.scratch
                 && comp.lines <= other.comp.lines && comp.maxLookSamples <= other.comp.maxLookSamples
+                && alignComp.ring <= other.alignComp.ring && alignComp.scratch <= other.alignComp.scratch
                 && clip.osBuf <= other.clip.osBuf && clip.wetBuf <= other.clip.wetBuf
                 && clip.ptrs <= other.clip.ptrs && clip.dc <= other.clip.dc
                 && clip.dryLines <= other.clip.dryLines && clip.dryDelaySamples <= other.clip.dryDelaySamples
@@ -410,7 +450,9 @@ public:
             if (! dynamics::Compressor::storageFor (sampleRate, K, numChannels, maxLook, st.comp)) return false;
             st.compressorLatency = dynamics::Compressor::latencyFor (sampleRate, K, numChannels, maxLook,
                                                                      config.compressorLookaheadMs);
+            st.alignComp = core::DryAligner::storageFor (numChannels, K, st.compressorLatency + 2);
         }
+        st.compressor = config.compressor;
 
         st.clipper = config.clipper;
         if (config.clipper)
@@ -458,12 +500,12 @@ public:
         return storageFor (sampleRate, numChannels, config, st) ? st.bytes() : 0u;
     }
 
-    // WHAT CONSTRUCTING A CHAIN COSTS, before any preparation: the two dry aligners, which are held BY
+    // WHAT CONSTRUCTING A CHAIN COSTS, before any preparation: the three dry aligners, which are held BY
     // VALUE and whose default state is a 2-slot ring and a 1-sample scratch. It is also the ONE place in
     // this chain where a sum of requests exceeds what is held at once — `prepare()` replaces those seeds
-    // for a topology that uses them, so each aligner it re-sizes hands 12 bytes back. Stated, because a
-    // budget that is an upper bound has to say where it is not tight.
-    static constexpr std::uint64_t constructBytes() noexcept { return 2u * core::DryAligner::constructBytes(); }
+    // for a topology that uses them, so each buffer it re-sizes hands its share of those 12 bytes back.
+    // Stated, because a budget that is an upper bound has to say where it is not tight.
+    static constexpr std::uint64_t constructBytes() noexcept { return 3u * core::DryAligner::constructBytes(); }
 
     // WHAT RE-PREPARING **THIS** CHAIN ASKS FOR — nothing, when the geometry it already holds covers the
     // one being asked for, and that is the case the C ABI's `configure` is: it re-prepares at the handle's
@@ -471,7 +513,8 @@ public:
     // engine is REUSED rather than rebuilt (see prepare()), so the answer is exactly zero rather than
     // nearly zero.
     //
-    // Otherwise the FRESH SUM, which bounds what this chain will ask its containers for — not what they
+    // Otherwise the FRESH SUM with no aligner seed assumed (`unseededBytes()`: a moved-from chain has given
+    // its seeds away with everything else), which bounds what this chain will ask its containers for — not what they
     // will then ask the allocator. A container that has to grow applies its own growth policy on top, and
     // that is the margin law 11d leaves to the caller: measured on MSVC's STL, a 48-float buffer asked to
     // hold 68 requests 72, because `assign` past the capacity grows by half. libc++ requests exactly 68.
@@ -490,8 +533,8 @@ public:
         Storage want;
         if (! storageFor (sampleRate, numChannels, config, want)) return 0u;   // a refused prepare() allocates nothing
         Storage have;
-        if (! prepared_ || ! storageFor (fs_, nch_, cfg_, have)) return want.bytes();
-        if (want.eq && eq_ == nullptr) return want.bytes();                    // the engine is not there to reuse
+        if (! prepared_ || ! storageFor (fs_, nch_, cfg_, have)) return want.unseededBytes();
+        if (want.eq && eq_ == nullptr) return want.unseededBytes();            // the engine is not there to reuse
         // THE CHAIN'S OWN CONTAINERS ARE ASKED, not inferred from the geometry it remembers. `prepared_` and
         // the scalars are not evidence that the storage is still there: a MOVED-FROM chain keeps both and
         // has given its buffers away, and the budget then answered 0 for a preparation that really allocated
@@ -502,8 +545,8 @@ public:
         // the next `assign` reaches the heap is what it can hold. `size()` here made the answer a FALSE
         // NON-ZERO — 424 596 B published for a preparation that asked 0 — the moment a chain had been
         // re-prepared smaller and was growing back inside storage it never gave up. (The fix round.)
-        if (fifo_.capacity() < want.fifo || keyBuf_.capacity() < want.keyBuf) return want.bytes();
-        return want.fitsWithin (have) ? 0u : want.bytes();
+        if (fifo_.capacity() < want.fifo || keyBuf_.capacity() < want.keyBuf) return want.unseededBytes();
+        return want.fitsWithin (have) ? 0u : want.unseededBytes();
     }
 
     // Returns false and leaves the chain UNPREPARED on anything it cannot honour. A false return is
@@ -574,6 +617,7 @@ public:
             cp.lookaheadMs = cfg_.compressorLookaheadMs;
             comp_.setParams (cp);
             compLat = comp_.latencySamples();
+            alignComp_.prepare (nch_, K_, compLat + 2);        // the parallel-compression dry path
         }
 
         int clipLat = 0;
@@ -656,7 +700,7 @@ public:
         nonFiniteIn_ = 0;
         if (eq_) eq_->reset();
         if (cfg_.monoBass)   monoBass_.reset();
-        if (cfg_.compressor) comp_.reset();
+        if (cfg_.compressor) { comp_.reset(); alignComp_.reset(); }
         if (cfg_.clipper)  { sat_.reset();  alignClip_.reset(); }
         if (cfg_.limiter)  { lim_.reset();  alignLim_.reset(); }
         if (cfg_.dither)     dith_.reset();
@@ -720,6 +764,7 @@ public:
         r.limiterCeilingDbTp  = cfg_.limiter ? lim_.effectiveCeilingDbTp() : 0.0;
         r.limiterReleaseMs    = cfg_.limiter ? lim_.effectiveReleaseMs() : 0.0;
         r.monoBass            = cfg_.monoBass ? monoBass_.params() : stereo::MonoBassParams { false, 0.0f, 0.0f };
+        r.compressorMix       = cfg_.compressor ? (double) compMix_ : 0.0;
         return r;
     }
 
@@ -871,6 +916,12 @@ private:
             if (tap_ != nullptr && tap_->compressorGrDb != nullptr)
                 grTap = { tap_->compressorGrDb + (std::size_t) tap_->framesWritten, K_ };
 
+            // THE DRY PATH of `compressorMix`, staged BEFORE the compressor overwrites the buffer and
+            // advanced on EVERY quantum, whatever the mix and the bypass say. A ring fed only while it is
+            // being listened to replays the audio from before it stopped the moment it is listened to again:
+            // measured in `multiband::MultibandProcessor`'s parallel line, 0.25 out of digital silence.
+            alignComp_.advance ((const float* const*) ch, nch_, K_, comp_.latencySamples());
+
             if (! keyBuf_.empty())
             {
                 // The key is the compressor's OWN input, same instant, minimum-phase high-passed. It is
@@ -889,6 +940,18 @@ private:
                 stageRefused_ |= ! comp_.process (ch, nch_, K_, key, nch_, grTap);
             }
             else stageRefused_ |= ! comp_.process (ch, nch_, K_, nullptr, 0, grTap);
+
+            // THROUGH A BYPASS TOO, and the first version skipped it there (the diverse-testing round).
+            // The warm bypass does not make the compressed path transparent at once — its gain reduction
+            // RELEASES toward 0 dB over the release time — so skipping the blend on the quantum the bypass
+            // engages switched the output from `(1-m)*dry + m*wet` to `wet` in one sample: a step of the
+            // whole gain reduction, gliding back. Measured at mix 0, where the output WAS the dry signal:
+            // pressing bypass dropped it 20.2 dB (-9.03 -> -29.18 dB RMS) and it took the release to return.
+            // Blending costs a steady bypass nothing: once released the compressed sample IS the dry one,
+            // and `(1-m)*d + m*d` in the double form below is `d` for every finite float `d` and every
+            // float `m` in [0, 1], zeros signed as they were — the sum is within 2^-52 of `d`, far inside
+            // half a float ulp (checked on 69 787 776 pairs, subnormals included).
+            mixCompressorDry (ch);
         }
         else if (tap_ != nullptr && tap_->compressorGrDb != nullptr)
             std::fill_n (tap_->compressorGrDb + (std::size_t) tap_->framesWritten, K_, 0.0f);   // absent
@@ -964,6 +1027,73 @@ private:
             for (int i = 0; i < K_; ++i) ch[c][i] *= g;
     }
 
+    // PARALLEL COMPRESSION, on the compressor's output `ch` and the aligned input `alignComp_` staged.
+    //
+    // THE TWO ENDS ARE BRANCHES, NOT ARITHMETIC. At 1 nothing is touched, so the default costs nothing and
+    // "a chain that never heard of this field" holds by construction. At 0 the ring is copied, so the
+    // answer is the ring and nothing the compressor did. Neither branch is needed for the BITS, and saying
+    // otherwise would be false: `wet` is the same delayed sample times a gain that is never negative, so
+    // the two always share a sign and the blend below returns `wet` at 1 and `dry` at 0 exactly, zeros
+    // signed as they were — the mutation stand removed each branch and nothing went red. The branches are
+    // there so that no such argument about the compressor has to stay true.
+    //
+    // BETWEEN THEM, `(1 - m) * dry + m * wet` — IN DOUBLE, with `m` the float the parameter narrowed to,
+    // and the reason is law 10 rather than precision. The float spelling that `saturation::Saturator`
+    // uses is a multiply-add the compiler may fuse, and this tree builds with `-ffp-contract=on` on the
+    // desktop and `off` for wasm: MEASURED over 2^20 samples at eleven mixes, the float form gives
+    // different bits fused and unfused at ten of them (0.5 alone agrees), so a mid-mix render would differ
+    // between arm64 and baseline x86-64 and between the browser and the native build. In double both
+    // products are EXACT — a float times a float needs 48 bits, and `1 - m` times a float needs at most
+    // 24 + 29 while `m >= 2^-6` — so a fused sum and an unfused one add the same two numbers and round
+    // once: identical bits under `fast`, `on` and `off` at every mix measured. The products stay in
+    // separate statements, which `on` (the desktop tier) does not fuse and `off` (wasm) cannot, so every
+    // row this tree builds agrees at EVERY mix. `-ffp-contract=fast` can still move a bit — no row of the
+    // tree uses it, but it is gcc's own default, so a consumer's TU gets it unless it says otherwise — and
+    // only below 2^-6, where the first product rounds and a fused sum does not: the code-review round found
+    // one at m = 1.12e-7, 0x3ff8eeef against 0x3ff8eef0. No pragma is spent on that corner, because no
+    // bit-portability is promised for the chain as a whole. One narrowing at the end, which no
+    // contraction crosses. It is the float nearest the DOUBLE sum, which is not always the float nearest
+    // the exact blend — a double sum can land on a float midpoint the exact value is not on — and it is
+    // within one float ulp of it. The compressor feeding it is its own question: its gain curve runs
+    // through libm (GainReductionPath.h).
+    //
+    // A STEP, NOT A RAMP, when the value moves: it lands at the quantum boundary, exactly like the two
+    // gain nodes, so it is block-invariant for the same reason they are and it clicks for the same reason
+    // they do — a hard `Δm * (wet - dry)` edge, where a bypass toggle glides on the compressor's own ballistics.
+    // Set it before the render and neither question arises.
+    void mixCompressorDry (float* const* ch) noexcept
+    {
+        const float m = compMix_;
+        if (core::exactlyEqual (m, 1.0f)) return;
+        if (core::exactlyEqual (m, 0.0f))
+        {
+            for (int c = 0; c < nch_; ++c) std::copy_n (alignComp_.delayed (c), K_, ch[c]);
+            return;
+        }
+        const double a = 1.0 - (double) m;
+        const double b = (double) m;
+        for (int c = 0; c < nch_; ++c)
+        {
+            const float* dry = alignComp_.delayed (c);
+            float*       wet = ch[c];
+            for (int i = 0; i < K_; ++i)
+            {
+                const double pd = a * (double) dry[i];
+                const double pw = b * (double) wet[i];
+                wet[i] = (float) (pd + pw);
+            }
+        }
+    }
+
+    // [0, 1], a non-finite request is 1 — the value that changes nothing, as `gainOf` maps one to 0 dB.
+    // Not `std::clamp (mix, 0.0, 1.0)`: that hands a -0.0 back as -0.0, which renders correctly (it
+    // compares equal to 0) and then reads back from `resolved()` as a negative zero. Caught by the suite.
+    static float mixOf (double mix) noexcept
+    {
+        if (! std::isfinite (mix)) return 1.0f;
+        return mix > 0.0 ? (float) std::min (mix, 1.0) : 0.0f;
+    }
+
     struct BypassFlags { bool eq = false, monoBass = false, compressor = false, clipper = false, limiter = false, dither = false; };
 
     void applyParams() noexcept
@@ -1010,6 +1140,7 @@ private:
             }
             comp_.setParams (cp);
         }
+        compMix_ = mixOf (p.compressorMix);
 
         if (cfg_.clipper) sat_.setParams (p.clipper);
         if (cfg_.limiter) lim_.setParams (p.limiter);
@@ -1037,7 +1168,7 @@ private:
     MasteringChainParams params_ {}, pendingParams_ {};
     BypassFlags          bypassChanged_ {};
 
-    float inputGain_ = 1.0f, preLimGain_ = 1.0f;
+    float inputGain_ = 1.0f, preLimGain_ = 1.0f, compMix_ = 1.0f;
 
     std::vector<float> fifo_, keyBuf_;
 
@@ -1047,7 +1178,7 @@ private:
     saturation::Saturator         sat_;
     limiter::TruePeakLimiter      lim_;
     dither::Dither                dith_;
-    core::DryAligner              alignClip_, alignLim_;
+    core::DryAligner              alignComp_, alignClip_, alignLim_;
     eq::Biquad                    hpf_[core::kMaxChannels] {};
 };
 

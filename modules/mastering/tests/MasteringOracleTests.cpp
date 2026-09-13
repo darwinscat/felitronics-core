@@ -194,10 +194,16 @@ static void testActiveGroupDelayByPhase()
 }
 
 //==============================================================================
-// ORACLE 3 — the composition, nulled against the same stages driven by hand.
-static void testCompositionAgainstAHandBuiltChain()
+static std::vector<Buf>& lastComposition() { static std::vector<Buf> v; return v; }
+
+// ORACLE 3 — the composition, nulled against the same stages driven by hand. At three compressor mixes:
+// 1 (the chain before P60 — the hand chain runs its dry lines but blends nothing), 0 and a mid value, where
+// the hand chain's dry path is a `core::DelayLine` per channel rather than the chain's `core::DryAligner`, so
+// WHERE the dry signal is tapped, how far it is delayed and where the blend sits in the order are all
+// re-derived here rather than shared.
+static void testCompositionAgainstAHandBuiltChain (double mix)
 {
-    group ("composition — nulled against the stages driven by hand");
+    group ("composition — nulled against the stages driven by hand, compressorMix = " + std::to_string (mix));
 
     const int nch = 2, n = 24000, K = 128;
     auto cfg = cfgAll (64);
@@ -224,6 +230,7 @@ static void testCompositionAgainstAHandBuiltChain()
     p.limiter.ceilingDbTp = -1.0;
     p.limiter.releaseMs = 50.0;
     p.dither.bits = 24;
+    p.compressorMix = mix;
 
     Buf x = silence (nch, n);
     for (int i = 0; i < n; ++i)
@@ -270,6 +277,12 @@ static void testCompositionAgainstAHandBuiltChain()
     const float gIn  = (float) core::dbToGain (p.inputGainDb);
     const float gPre = (float) core::dbToGain (p.preLimiterGainDb);
 
+    // The dry path, by hand: one DelayLine per channel at the compressor's own reported latency.
+    std::vector<core::DelayLine> dryLine ((std::size_t) nch);
+    for (auto& d : dryLine) { d.prepare (comp.latencySamples()); d.setDelay (comp.latencySamples()); }
+    std::vector<float> dryBuf ((std::size_t) K * (std::size_t) nch, 0.0f);
+    const float mf = (float) mix;
+
     Buf byHand = x;
     std::vector<float> key ((std::size_t) K * (std::size_t) nch, 0.0f);
     for (int off = 0; off + K <= n; off += K)
@@ -292,7 +305,16 @@ static void testCompositionAgainstAHandBuiltChain()
             hpf[c].flushDenormals();
             kp[c] = k;
         }
+        for (int c = 0; c < nch; ++c)
+            for (int i = 0; i < K; ++i) dryBuf[(std::size_t) (c * K + i)] = dryLine[(std::size_t) c].process (ch[c][i]);
         felitronics::test::run (comp.process (ch, nch, K, kp, nch));
+        if (mf < 1.0f)
+            for (int c = 0; c < nch; ++c)
+                for (int i = 0; i < K; ++i)
+                {
+                    const double dd = dryBuf[(std::size_t) (c * K + i)];
+                    ch[c][i] = mf > 0.0f ? (float) ((1.0 - (double) mf) * dd + (double) mf * (double) ch[c][i]) : (float) dd;
+                }
         felitronics::test::run (sat.process (ch, nch, K));
         for (int c = 0; c < nch; ++c) for (int i = 0; i < K; ++i) ch[c][i] *= gPre;
         felitronics::test::run (lim.process (ch, nch, K));
@@ -308,6 +330,10 @@ static void testCompositionAgainstAHandBuiltChain()
             { ++bad; if (firstBad < 0) firstBad = i; }
     ok (bad == 0, "the chain is bit-identical to the same stages driven by hand ("
                   + std::to_string (bad) + " differ, first at " + std::to_string (firstBad) + ")");
+
+    // A mid mix that did nothing, or a mix 0 that still compressed, would pass a null against itself — so
+    // the three renders must differ from one another, which the caller checks across the calls.
+    lastComposition().push_back (viaChain);
 
     // MUTATION WITNESSES this one catches and the self-consistent tests do not: swapping two stages,
     // dropping the gate, applying inputGain after the EQ, forwarding the wrong params object, taking
@@ -525,7 +551,20 @@ int main()
     std::printf ("felitronics::mastering — oracles (nothing here trusts the chain's own arithmetic)\n");
     testLatencyFoundNotAsked();
     testActiveGroupDelayByPhase();
-    testCompositionAgainstAHandBuiltChain();
+    testCompositionAgainstAHandBuiltChain (1.0);
+    testCompositionAgainstAHandBuiltChain (0.37);
+    testCompositionAgainstAHandBuiltChain (0.0);
+    {
+        // The three nulls above are each against a hand chain built from the same `mix`. A mix the chain
+        // ignored would make all three pass against a hand chain that ignored it too — it cannot, since the
+        // hand chain blends — but the renders must also differ, or the fixture never drove the compressor.
+        const auto& v = lastComposition();
+        auto differ = [] (const Buf& a, const Buf& b) { long long d = 0;
+            for (std::size_t c = 0; c < a.size(); ++c) for (std::size_t i = 0; i < a[c].size(); ++i) d += bits (a[c][i]) != bits (b[c][i]);
+            return d; };
+        ok (v.size() == 3 && differ (v[0], v[1]) > 1000 && differ (v[1], v[2]) > 1000 && differ (v[0], v[2]) > 1000,
+            "PRECONDITION: the chain renders at mix 1, 0.37 and 0 differ pairwise");
+    }
     testPassbandPinned();
     testTwoGainNodes();
     testSidechainKey();

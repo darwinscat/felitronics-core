@@ -247,6 +247,10 @@ struct LoudnessRequest
     // Constraints. A target that needs one of these broken is REFUSED with the name, not forced through.
     GainReductionLimit limiterGr    {};                                              // off by default
     GainReductionLimit compressorGr {};                                              // UPSTREAM — see above
+    // NB with `MasteringChainParams::compressorMix < 1` this limits the COMPRESSED path's gain reduction,
+    // not what reaches the output: at mix 0 a 26 dB reduction nobody hears is still refused against a
+    // 3 dB limit. That is what the tap measures (MasteringChain.h), and a caller combining a GR budget
+    // with parallel compression owns the translation.
     double minPlrDb     = -std::numeric_limits<double>::infinity();                  // delivered TP - I
     // A DELTA, not an absolute floor, and the difference is the whole calibration: the two proven
     // input->accepted-master pairs in this project's corpus move LRA by -0.40 and -0.30 LU, while the

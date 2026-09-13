@@ -46,6 +46,16 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_mastering_oracle_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_mastering_oracle_tests COMMAND felitronics_mastering_oracle_tests)
 
+    # P60 — `compressorMix`, parallel compression. Its own binary because its three gates are claims about
+    # ONE field that the chain's suite would otherwise scatter: mix 1 is the compressor alone, mix 0 is the
+    # input found in the input, and between them the blend, within a float ulp of exact and in the double
+    # arithmetic the header states.
+    add_executable(felitronics_compressor_mix_tests tests/CompressorMixTests.cpp)
+    target_link_libraries(felitronics_compressor_mix_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_compressor_mix_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_compressor_mix_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_compressor_mix_tests COMMAND felitronics_compressor_mix_tests)
+
     # LAW 11 — the caller's contract, as PROPERTIES over the whole accepted and the whole rejected
     # domain of every block-level entry point in the core. It lives here rather than in a module
     # because the law is cross-module by construction: the census that produced it found three answers
