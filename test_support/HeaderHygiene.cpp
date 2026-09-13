@@ -10,6 +10,7 @@
 // Class templates are explicitly instantiated below (with their shipped default arguments) so warnings
 // inside template member bodies fire HERE, not only when a consumer instantiates them.
 
+#include <felitronics/analysis/ClipDetector.h>
 #include <felitronics/analysis/CorrelationMeter.h>
 #include <felitronics/analysis/KWeightingFilter.h>
 #include <felitronics/analysis/LoudnessMeter.h>
