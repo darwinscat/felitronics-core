@@ -115,4 +115,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_hum_detector_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_hum_detector_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_hum_detector_tests COMMAND felitronics_hum_detector_tests)
+    # LowEnd — wide bass (LR4 + M/S over the 10 ms grid) and the dominant low note (semitone fold of the
+    # shared frame producer). Links analysis_offline: it composes over eq::Crossover2 and stereo::MidSide,
+    # which `analysis` itself cannot depend on without closing a cycle (see the target's own note above).
+    add_executable(felitronics_low_end_tests tests/LowEndTests.cpp)
+    target_link_libraries(felitronics_low_end_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_low_end_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_low_end_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_low_end_tests COMMAND felitronics_low_end_tests)
 endif()
