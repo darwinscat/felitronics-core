@@ -63,6 +63,7 @@
 #include <felitronics/analysis/ProgrammeReport.h>
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
+#include <felitronics/analysis/BandBursts.h>
 
 #include <algorithm>
 #include <cmath>
@@ -201,7 +202,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend|bursts> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -572,6 +573,67 @@ int main (int argc, char** argv)
                      (unsigned long long) bits (le.backgroundDensity()), (unsigned long long) bits (le.peakBandEnergy()),
                      (unsigned long long) bits (le.peakBandWidthHz()), (unsigned long long) bits (le.peakShare()),
                      (unsigned long long) bits (le.totalBandEnergy()));
+        return 0;
+    }
+
+    if (mode == "bursts")
+    {
+        // analysis::BandBursts at its defaults: bursts in 5-9 kHz against the MEDIAN of a 2 s trailing
+        // ring of 10 ms hops. Everything float is a RAW IEEE-754 BIT PATTERN, as `blocks` does it, so a
+        // later wasm comparison catches a flipped bit that decimal printing would round away. The
+        // histograms print only their NON-ZERO bins, which is a complete description of an integer
+        // histogram and keeps a quiet file's output short.
+        analysis::BandBursts det;
+        const analysis::BandBurstsParams bp;              // the documented defaults
+        det.setParams (bp);
+        if (! det.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "bursts: prepare refused this configuration — the default 5-9 kHz band "
+                                  "needs a sample rate above 18368 Hz (0.49 fs must clear 9 kHz)\n");
+            std::fclose (f);
+            return 2;
+        }
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { (void) det.process (p, nc, n); });
+        std::fclose (f);
+        det.finish();
+
+        std::printf ("# fcore bursts v1 sr=%016llx ch=%d hop=%d base=%d lo=%016llx hi=%016llx "
+                     "enter=%016llx exit=%016llx chunk=%d\n",
+                     (unsigned long long) bits (fs), nc, det.hopSamples(), det.baselineHops(),
+                     (unsigned long long) bits (det.bandLowHz()), (unsigned long long) bits (det.bandHighHz()),
+                     (unsigned long long) bits (bp.enterDb), (unsigned long long) bits (bp.exitDb), kChunk);
+        std::printf ("samples %lld\n", (long long) det.samplesProcessed());
+        std::printf ("hops %lld %lld %lld %lld\n", (long long) det.hopCount(), (long long) det.eligibleHops(),
+                     (long long) det.zeroBaselineHops(), (long long) det.burstHops());
+        std::printf ("damage %lld %lld %lld\n", (long long) det.damagedHops(),
+                     (long long) det.overflowSamples(), (long long) det.firstNonFiniteAt());
+        std::printf ("tail %lld %016llx\n", (long long) det.tailPartialSamples(),
+                     (unsigned long long) bits (det.tailPartialEnergy()));
+        std::printf ("valid %d %d %d %d\n", det.eventsValid() ? 1 : 0, (int) det.eventsInvalidReason(),
+                     det.programmeEnergyValid() ? 1 : 0, (int) det.programmeEnergyInvalidReason());
+        for (int c = 0; c < det.channels(); ++c)
+            std::printf ("chan %d %016llx %lld %lld\n", c, (unsigned long long) bits (det.bandEnergy (c)),
+                         (long long) det.nonFiniteSamples (c), (long long) det.absentSamples (c));
+        std::printf ("events %lld %lld %d\n", (long long) det.eventCount(),
+                     (long long) det.storedEventCount(), det.eventsComplete() ? 1 : 0);
+        for (std::int64_t i = 0; i < det.storedEventCount(); ++i)
+        {
+            const analysis::BandBurst e = det.event (i);
+            std::printf ("e %lld %lld %lld %lld %016llx %016llx %016llx %016llx %016llx %d%d%d\n",
+                         (long long) e.start, (long long) e.length, (long long) e.peakAt, (long long) e.hops,
+                         (unsigned long long) bits (e.peakPower), (unsigned long long) bits (e.peakBaseline),
+                         (unsigned long long) bits (e.peakExcessDb), (unsigned long long) bits (e.peakWidePower),
+                         (unsigned long long) bits (e.energy),
+                         e.touchedNonFinite ? 1 : 0, e.baselineTouchedNonFinite ? 1 : 0,
+                         e.closedByFinish ? 1 : 0);
+        }
+        std::printf ("onsets %lld %lld %lld %d %lld\n", (long long) det.onsetCount(),
+                     (long long) det.intervalCount(), (long long) det.intervalOverflow(),
+                     det.modalIntervalHops(), (long long) det.modalIntervalMass());
+        for (int b = 1; b <= analysis::BandBursts::kIoiBins; ++b)
+            if (det.intervalBin (b) != 0) std::printf ("ioi %d %lld\n", b, (long long) det.intervalBin (b));
+        for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)
+            if (det.lagBin (b) != 0) std::printf ("lag %d %lld\n", b, (long long) det.lagBin (b));
         return 0;
     }
 

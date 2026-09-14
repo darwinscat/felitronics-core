@@ -17,6 +17,7 @@ target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::o
 # note on the target in modules/analysis/CMakeLists.txt. Added rather than substituted, so two branches
 # that both need it resolve to one line instead of a conflict.
 target_link_libraries(fcore_measure PRIVATE felitronics::analysis_offline)
+target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::oversampling felitronics::analysis_offline)
 target_compile_features(fcore_measure PRIVATE cxx_std_20)
 target_compile_options(fcore_measure PRIVATE ${FCORE_NO_FP_CONTRACT})
 
