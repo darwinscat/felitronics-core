@@ -926,6 +926,9 @@ int main()
                                              + std::to_string (m.g.minExactPcmBits));
             ok (m.g.offGridSamples == 0 && m.g.firstOffGridSample < 0, tag + "no sample is off the grid");
             ok (m.g.reason == ForensicsReason::Ok, tag + "and the reading is published");
+            // the same fact read as "how many low bits are always zero", about the CONTENT
+            ok (m.g.alwaysZeroLowBits (24) == 24 - d.bits && m.g.alwaysZeroLowBits (d.bits) == 0,
+                tag + std::to_string (m.g.alwaysZeroLowBits (24)) + " low bits of a 24-bit word are always zero");
         }
     }
     {

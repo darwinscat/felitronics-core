@@ -275,6 +275,15 @@ struct SampleGrid
     // is counted; -0.0 is the same value as +0.0 and is not counted twice.
     std::int64_t distinctValues = 0;
     bool distinctComplete = false;
+
+    // The same fact read the other way round: how many LOW bits of a `containerBits`-wide PCM word are
+    // always zero. A 16-bit master padded into a 24-bit container answers 8 — and answers it about the
+    // CONTENT, so it says the container is wider than the content needs, never that the container is 16.
+    // 0 when the word length is not readable, or when the container is no wider than the content.
+    int alwaysZeroLowBits (int containerBits) const noexcept
+    {
+        return minExactPcmBits > 0 && containerBits > minExactPcmBits ? containerBits - minExactPcmBits : 0;
+    }
 };
 
 struct SourceForensicsParams
@@ -405,7 +414,10 @@ public:
         if (g.floorCells < 1) g.floorCells = 1;
         const int fromCell = (int) std::ceil (p.searchFromHz / g.cellHz);
         g.firstCandidate = std::max (g.plateauCells, fromCell);         // a FULL plateau span must fit below
-        g.emptyMinBins = (int) (p.emptyMinHz / g.binHz);
+        // CEIL, not floor: this is a minimum-width GUARD, and truncating it weakens the very promise it
+        // makes (at fftOrder 9 a floor gives 187.5 Hz where 200 was asked for). A SPAN may round down —
+        // plateauSpanCells() and floorSpanCells() publish what those became — but a guard may not.
+        g.emptyMinBins = (int) std::ceil (p.emptyMinHz / g.binHz);
         // At least TWO bins, whatever emptyMinHz rounds to. With one, the claim can be made about the
         // Nyquist bin alone and reads "empty above 24000 Hz" on a 48 kHz file — vacuously true and
         // published as if it meant something (found at fftOrder 8, where binHz is 187.5 and a 200 Hz

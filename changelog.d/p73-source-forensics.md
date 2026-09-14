@@ -32,6 +32,15 @@
 - **The position near Nyquist is not attributed.** A converter's anti-alias filter, a 320 kbit/s codec and a
   genuinely band-limited master all live at 0.9-0.95 of Nyquist; `nearNyquist` marks that band and the
   instrument stops there. `nearNyquist == false` is not a claim that anything compressed the file.
+- **Two edges, and which one is the report.** The primary is whichever candidate has the stronger
+  conservative drop, so a 16 kHz codec wall inside a 20.5 kHz export filter reports the inner edge as the
+  primary and the outer as the second — but only when the shelf between them is deep. With a shallow shelf
+  the outer edge wins instead and the inner one is not reported at all: a second search BELOW the primary
+  is structurally useless, since everything above such a candidate includes the primary's own plateau.
+- **The PCM range is part of the claim.** A b-bit word carries `i/2^(b-1)` for `i` in
+  `[-2^(b-1), 2^(b-1) - 1]`, so `-1.0` is a PCM sample and `+1.0` is not, at any depth. A sample outside
+  `[-1, +1)` therefore withholds `minExactPcmBits` (reason `OutsidePcmRange`) while `gridExponent` stays
+  valid, and the signed minimum and maximum the claim rests on are published.
 - **What the grid proves, and in which direction.** `minExactPcmBits = k + 1` is the *shortest* normalised
   PCM word that holds the observed samples exactly; it does not bound the source's word length from above (a
   24-bit file carrying a padded 16-bit master is indistinguishable from a 16-bit one), and the *absence* of
