@@ -1433,20 +1433,32 @@ int main()
         p.fftOrder = 8;
         p.maxDistinctValues = 1 << 10;
         sf.setParams (p);
+        // NOTHING THAT REPORTS may stand inside a measured window, and every counter reading goes into a
+        // local first. Both halves of that were learned here: the counter read inline sits in the same
+        // call as the message string, and the evaluation order of arguments is unspecified; and a message
+        // string ITSELF allocates once it outgrows libc++'s small-string buffer — which is 22 bytes on a
+        // 64-bit target and only 10 on a 32-bit one, so "life: process" is free on macOS and a heap
+        // allocation on the wasm row, where okNoAlloc is enforced just the same. The library allocates
+        // nothing on either: measured 14 allocations in prepare(), 0 in process/finish/read on both.
         const long before = g_allocs.load();
-        ok (run (sf.prepare (kFs, 64, 2)), "life: prepare");
-        ok (g_allocs.load() > before, "life: prepare is where the heap is touched");
+        const bool prepared = sf.prepare (kFs, 64, 2);
+        const long afterPrepare = g_allocs.load();
+        ok (run (prepared), "life: prepare");
+        ok (afterPrepare > before, "life: prepare is where the heap is touched");
         std::vector<float> a (1000, 0.3f), b (1000, -0.3f);
         const float* in[2] { a.data(), b.data() };
         const long b2 = g_allocs.load();
-        ok (run (sf.process (in, 2, 1000)), "life: process");
+        const bool processed = sf.process (in, 2, 1000);
         sf.finish();
-        okNoAlloc (g_allocs.load() == b2, "life: process and finish allocate nothing");
+        const long afterFinish = g_allocs.load();
+        ok (run (processed), "life: process");
+        okNoAlloc (afterFinish == b2, "life: process and finish allocate nothing");
         const long b3 = g_allocs.load();
         (void) sf.wall (0);
         (void) sf.wall();
         (void) sf.sampleGrid (0);
-        okNoAlloc (g_allocs.load() == b3, "life: and reading the report allocates nothing");
+        const long afterRead = g_allocs.load();
+        okNoAlloc (afterRead == b3, "life: and reading the report allocates nothing");
         const auto after1 = sf.wall (0);
         sf.finish();
         ok (sf.isFinished(), "life: finish is idempotent");
