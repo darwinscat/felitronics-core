@@ -42,6 +42,11 @@
 //                 field the report publishes is here EXCEPT the law-8a trace, which exists only for the suite.
 //                 An invalid note prints as `note INVALID reason N`, never as a note name. NOT `correlation`,
 //                 which is a whole-file phase number with no band split.
+//   forensics   → what the file WAS (analysis::SourceForensics): the spectral wall per channel and for the
+//                 file (position in Hz and as a fraction of Nyquist, the drop, the transition, what comes
+//                 back above it, how far up it is empty) plus the sample grid (the coarsest dyadic grid
+//                 every sample lies on, the shortest PCM word that holds them, the distinct-value count).
+//                 Every float as a raw bit pattern, like `blocks`: a decimal would not catch a flipped bit.
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
@@ -64,6 +69,7 @@
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/SourceForensics.h>
 
 #include <algorithm>
 #include <cmath>
@@ -202,7 +208,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend|bursts> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend|bursts|forensics> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -485,6 +491,15 @@ int main (int argc, char** argv)
         if (! le.prepare (rate, kChunk, nc))
         {
             std::fprintf (stderr, "LowEnd refused this geometry (rate, channels or note range)\n");
+    if (mode == "forensics")
+    {
+        // The whole report, as bit patterns. The analyzer's own defaults are used and PRINTED, so a diff
+        // between two toolchains compares the same instrument and not two configurations of it.
+        analysis::SourceForensics fx;
+        const analysis::SourceForensicsParams fp;
+        if (! fx.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "forensics.prepare refused (sample rate 1000..768000)\n");
             std::fclose (f);
             return 2;
         }
@@ -634,6 +649,54 @@ int main (int argc, char** argv)
             if (det.intervalBin (b) != 0) std::printf ("ioi %d %lld\n", b, (long long) det.intervalBin (b));
         for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)
             if (det.lagBin (b) != 0) std::printf ("lag %d %lld\n", b, (long long) det.lagBin (b));
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { okAll = fx.process (p, nc, n) && okAll; });
+        std::fclose (f);
+        if (! okAll) { std::fprintf (stderr, "forensics: a block was refused\n"); return 2; }
+        fx.finish();
+        std::printf ("# fcore forensics v1 sr=%016llx ch=%d order=%d hop=%lld bins=%d cellhz=%016llx"
+                     " searchfrom=%016llx exempt=%d distinctlimit=%d\n",
+                     (unsigned long long) bits (fs), nc, fp.fftOrder, (long long) fx.hopSamples(), fx.bins(),
+                     (unsigned long long) bits (fx.cellHz()), (unsigned long long) bits (fx.searchFromHz()),
+                     fx.exemptCells(), fx.distinctLimit());
+        std::printf ("samples %lld tail %lld frames %lld\n", (long long) fx.samplesProcessed(),
+                     (long long) fx.tailUncoveredSamples(), (long long) fx.frames().frameCount());
+        for (int c = 0; c <= nc; ++c)                     // per channel, then the file's own aggregate
+        {
+            const analysis::SpectralWall w = c < nc ? fx.wall (c) : fx.wall();
+            std::printf ("wall %d valid=%d reason=%d sharp=%d nearnyq=%d clipped=%d trunc=%d exempted=%d"
+                         " frames=%lld/%lld\n", c, (int) w.valid, (int) w.reason, (int) w.sharp,
+                         (int) w.nearNyquist, (int) w.transitionClipped, (int) w.truncatedAtNyquist,
+                         w.exemptedCells, (long long) w.framesUsed, (long long) w.framesHoled);
+            const double ds[] = { w.cutoffHz, w.cutoffFractionOfNyquist, w.steepestHz, w.transitionEndHz,
+                                  w.transitionHz, w.plateauPower, w.floorLocalPower, w.maxAbovePower,
+                                  w.sufMaxPower, w.dropDb, w.strictDropDb, w.localDropDb, w.recoveryDb,
+                                  w.plateauSpreadDb, w.steepnessDbPerOctave, w.secondCutoffHz, w.secondDropDb,
+                                  w.secondTransitionHz, w.emptyAboveHz, w.emptyAboveFractionOfNyquist,
+                                  w.emptyThresholdPower, w.peakCellPower };
+            std::printf ("wall %d second=%d/%d empty=%d", c, (int) w.secondValid, (int) w.secondSharp,
+                         (int) w.emptyAboveValid);
+            for (double d : ds) std::printf (" %016llx", (unsigned long long) bits (d));
+            std::printf ("\n");
+        }
+        for (int c = 0; c < nc; ++c)
+        {
+            const analysis::SampleGrid g = fx.sampleGrid (c);
+            std::printf ("grid %d valid=%d reason=%d k=%d pcm=%d overunity=%d bits=%d peak=%016llx\n",
+                         c, (int) g.valid, (int) g.reason, g.gridExponent, (int) g.pcmCompatible,
+                         (int) g.peakAboveUnity, g.minExactPcmBits, (unsigned long long) bits (g.absPeak));
+            std::printf ("grid %d nonzero=%lld zero=%lld nonfinite=%lld absent=%lld offgrid=%lld"
+                         " firstoffgrid=%lld firstmaxk=%lld distinct=%lld complete=%d\n",
+                         c, (long long) g.nonZeroSamples, (long long) g.zeroSamples,
+                         (long long) g.nonFiniteSamples, (long long) g.absentSamples,
+                         (long long) g.offGridSamples, (long long) g.firstOffGridSample,
+                         (long long) g.firstMaxGridSample, (long long) g.distinctValues,
+                         (int) g.distinctComplete);
+            std::printf ("grid %d khist", c);
+            const std::int64_t* h = fx.gridExponentHistogram (c);
+            for (int k = 0; k < analysis::SourceForensics::gridExponentBuckets(); ++k)
+                std::printf (" %lld", (long long) h[(std::size_t) k]);
+            std::printf ("\n");
+        }
         return 0;
     }
 
