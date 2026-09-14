@@ -47,8 +47,13 @@ namespace felitronics::analysis
 // analysis::CorrelationMeter can), f = 1 is pure anti-phase, i.e. pure vertical.
 //   * a MONO programme is not 0/0. Its Side is exactly 0 and its Mid is positive, so f is exactly 0 and
 //     `widthValid()` is true — zero width is the RIGHT answer, not "undefined".
-//   * DIGITAL SILENCE is the 0/0, and it is the one place a zero would lie, so it does not get one:
-//     `widthReason() == NoEnergy`.
+//   * A ZERO-ENERGY LOW BAND is the 0/0, and there a zero would lie, so it does not get one:
+//     `widthReason() == NoEnergy`. Digital silence is the obvious case but NOT the only one: eq::Svf
+//     keeps its state in FLOAT, so a programme below that state's own floor filters to exact zero even
+//     though its raw energy is positive — measured, every sample at 2^-149 gives rawMidEnergy 2^-281
+//     and lowMidEnergy exactly 0. NoEnergy therefore means "no energy reached the low band", which is
+//     what the field can honestly claim; rawMidEnergy() is published beside it so the two are
+//     distinguishable.
 // NOTE this is an ENERGY fraction. `analysis::StereoSums::width` (StereoColumns.h:59) is an AMPLITUDE
 // fraction, sqrt(S)/(sqrt(M)+sqrt(S)); it is a bit-exact port of a JavaScript spec and stays as it is.
 // The amplitude form is the more sensitive of the two at small side levels (at S/M = -20 dB it reads
@@ -70,7 +75,8 @@ namespace felitronics::analysis
 //     programme really does start there — but it DOMINATES a near-zero side fraction: measured on a 4 s
 //     file of mono 82 Hz bass plus anti-phase 900 Hz, the whole-file lowSideFraction() is 1.75e-6 while
 //     the SETTLED value is 5.32e-8 (the analytic prediction is 5.3212e-8, matched to four figures from
-//     20 ms on) — the first 10 ms alone holds 97.0 % of the file's entire low Side energy. So the
+//     20 ms on) — the first 10 ms block alone holds 96.65 % of the file's entire low Side energy, and
+//     the first 100 ms 97.04 %. So the
 //     integral is the answer for "what is on this record", and the 10 ms SERIES is the answer for "how
 //     wide is the bass where it is playing": skip the first few blocks and the two agree. Nothing is
 //     dropped here on the instrument's own initiative — the coordinates are published and the consumer
@@ -90,13 +96,27 @@ namespace felitronics::analysis
 //   * ONE-SIDED, FOLDED. SpectrumFrames does not fold (bin k is bin k), so a real tone's power splits
 //     between k and N-k. The weights carry a factor 2 for 0 < k < N/2 and 1 for DC and Nyquist, which
 //     makes a band's energy a genuine mean-square contribution: a full-scale sine of amplitude A inside
-//     one band reads A^2/2, and disjoint bands add up to the windowed frame's mean square (Parseval).
+//     one band reads A^2/2.
+//     THE FULL SUM IS THE WINDOW-WEIGHTED MEAN SQUARE, AND THE TABLE IS NOT THE FULL SUM. By Parseval
+//     the folded sum over EVERY bin is sum(w*x)^2 / sum(w^2) — the mean square of x weighted by w^2,
+//     published as frameEnergy(). Disjoint bands add up to that only if they COVER the spectrum, and the
+//     published table covers [lowNoteHz, highNoteHz] alone: at the default range and 48 kHz that is
+//     1.1345 % of Nyquist, so totalBandEnergy() is the energy of the NOTE RANGE and not of the frame.
+//     bandRangeShare() is the ratio, and on a flat spectrum it equals exactly that covered fraction.
 //   * RESOLUTION IS THE OBSERVATION LENGTH, and the default is the smallest order that has any. A
 //     semitone at 30 Hz is 1.73 Hz wide; a Hann main lobe is 4 bins. At 48 kHz only fftOrder >= 17
 //     (0.366 Hz bins, 4.87 bins per band) fits the lobe inside the band, and a tone at a band centre
 //     then keeps 99.96 % of its power in its own band (measured against a direct DFT). Orders below
 //     that do not resolve the bottom of the range and `underResolvedBands()` counts them rather than
 //     hiding it. Zero-padding would not help: it interpolates a peak, it does not separate two tones.
+//   * A TRANSIENT'S BAND ENERGY IS MODULATED UP TO 3.01 dB BY WHERE IT FALLS ON THE FRAME GRID. At the
+//     default 50 % hop a click at a frame boundary is weighted w^2 = 1 by one frame and 0 by the next,
+//     while a click a quarter-window later is weighted 0.5^2 by each of two frames: 1 against 0.5, or
+//     exactly 3.0103 dB, over the same frame count. Hann is COLA at 50 % overlap for the WINDOW, not for
+//     its square, so no hop choice removes this. It is deterministic and absolute — the grid does not
+//     move with the caller's slicing, so law 8a is untouched — but it means the band energy of the click
+//     half of a kick carries up to 3 dB of grid phase, and a consumer comparing two transient-heavy
+//     programmes should know it. Steady tones are unaffected (they are present in every frame).
 //   * WHAT STILL SPREADS IS THE BAND EDGE. A tone near a semitone boundary splits roughly 50/50 between
 //     two bands, depressing the peak and raising its neighbour. The whole band table is published, so a
 //     split is visible; the peak's centroid recovers a tuning offset well inside the band (true 10/20/30
@@ -109,6 +129,15 @@ namespace felitronics::analysis
 //     argmax is published twice: `peakBand()` maximises ENERGY (what a tone does, since a tone's energy
 //     is independent of its band's width) and `peakDensityBand()` maximises DENSITY (what noise does).
 //     When the two disagree, the bottom end is noise-like rather than tonal, and that is evidence.
+//   * AND A RANGE THAT HOLDS ONLY ROUND-OFF HOLDS NOTHING. Pure DC, pure Nyquist and a signal at the
+//     float denormal floor all leave the 30..300 Hz table with a POSITIVE total that is pure transform
+//     round-off: measured, DC gives a bandRangeShare of 1.3e-34 and Nyquist 1.9e-38, and `> 0` alone
+//     then named F#3 as the dominant note of a signal that has no note at all. A double FFT resolves a
+//     bin to about 1e-15 of the largest bin in amplitude, i.e. 1e-30 in power, so a share at or below
+//     kNoteFloorShare = 1e-24 is the transform's own floor — six decades above it, and twenty-seven
+//     below the 1.1e-7 a single impulse produces. Below it the answer is NoEnergy and a reason, not a
+//     note. This is a threshold that DEFINES the instrument's resolution, published as a constant with
+//     its derivation, not a verdict on the programme.
 //   * THE DOMINANCE RATIO IS NOT A STORED FIELD, for the same reason S/M is not: the median energy of a
 //     synthetic tone in digital silence is exactly 0 and the ratio is then +inf. The report publishes
 //     `peakBandEnergy()`, `backgroundDensity()` and `peakBandWidthHz()` — divide them if you want it —
@@ -218,6 +247,7 @@ struct LowEndTrace
     std::int64_t holes         = 0;         // Block only
     double       midEnergy     = 0.0;       // Block: the LOW band's raw mid energy over the block
     double       sideEnergy    = 0.0;       // Block: the LOW band's raw side energy
+    double       frameEnergy   = 0.0;       // Frame: this frame's own window-weighted mean square
     const double* bandMid      = nullptr;   // Frame: bandCount raw per-frame band powers, mid axis
     const double* bandSide     = nullptr;   // Frame: ditto, side axis
     int          bandCount     = 0;         // Frame only
@@ -250,6 +280,9 @@ public:
     static constexpr double kMinCrossoverHz = 1.0;   // eq::Svf clamps a cutoff below 1 Hz (Svf.h:61), so
                                                      // accepting less would make crossoverHz() report a
                                                      // filter that is not the one running
+    static constexpr double kNoteFloorShare = 1.0e-24;   // below this share of frameEnergy() the note
+                                                         // range holds only the double transform's own
+                                                         // round-off — see the header note
     static constexpr double kMinNoteHz      = 1.0;   // below this the band-edge FREQUENCIES underflow the
                                                      // first moment to zero while the energies stay
                                                      // positive, and a centroid then leaves its own band
@@ -402,6 +435,7 @@ public:
         peakSide_ = -1.0; peakSideBlock_ = -1;
         peakSideAmp_ = 0.0; peakSideAmpAt_ = -1;
         usedFrames_ = 0; holedFrames_ = 0;
+        accFrameEnergy_ = 0.0; frameEnergy_ = 0.0; bandRangeShare_ = 0.0; frameTotal_ = 0.0;
         for (std::size_t i = 0; i < accMid_.size(); ++i) { accMid_[i] = 0.0; accSide_[i] = 0.0; accMoment_[i] = 0.0; }
         for (auto& b : bands_) { b.midEnergy = 0.0; b.sideEnergy = 0.0; b.energy = 0.0; b.density = 0.0; b.centroidHz = 0.0; b.centsOffset = 0.0; }
         peakBand_ = -1; peakDensityBand_ = -1; secondBand_ = -1;
@@ -641,6 +675,13 @@ public:
     double peakBandWidthHz() const noexcept { return peakBand_ >= 0 ? bands_[(std::size_t) peakBand_].widthHz : 0.0; }
     double secondBandEnergy() const noexcept { return secondBand_ >= 0 ? bands_[(std::size_t) secondBand_].energy : 0.0; }
     double totalBandEnergy() const noexcept { return totalBandEnergy_; }
+    // The frame's own window-weighted mean square, sum(w*x)^2/sum(w^2) by Parseval, folded over every
+    // bin and averaged over the used frames. The denominator totalBandEnergy() is a share OF.
+    double frameEnergy() const noexcept { return frameEnergy_; }
+    // totalBandEnergy() / frameEnergy(): how much of the frame lies inside [lowNoteHz, highNoteHz].
+    // On a FLAT spectrum this equals the fraction of Nyquist the bands cover (1.1345 % at the defaults
+    // and 48 kHz), which is what makes it a usable sanity number rather than an abstraction.
+    double bandRangeShare() const noexcept { return bandRangeShare_; }
     double peakShare() const noexcept { return peakShare_; }             // peak / total, in [0, 1]: pole-free
     // The dominance ratio is deliberately NOT a field: it is
     //   peakBandEnergy() / (backgroundDensity() * peakBandWidthHz()),
@@ -841,6 +882,18 @@ private:
             if (trace_ != nullptr) fireFrameTrace (false);
             return;
         }
+        // The frame's OWN window-weighted mean square, folded over every bin — the honest denominator
+        // for "how much of this frame is in the note range", and the number that says a range holding
+        // only round-off holds nothing.
+        double frameTotal = 0.0;
+        {
+            const int bins = frames_.bins();
+            for (int k = 0; k < bins; ++k)
+            {
+                const double fold = (k == 0 || k == bins - 1) ? 1.0 : 2.0;
+                frameTotal += (pm[k] + ps[k]) * fold;
+            }
+        }
         std::size_t at = 0;
         for (int b = 0; b < bandCount_; ++b)                            // bands ascending, bins ascending
         {
@@ -867,6 +920,9 @@ private:
             accSide_[(std::size_t) b] += es;
             accMoment_[(std::size_t) b] += mom;
         }
+        if (! std::isfinite (frameTotal)) { ++holedFrames_; if (trace_ != nullptr) fireFrameTrace (false); return; }
+        accFrameEnergy_ += frameTotal;
+        frameTotal_ = frameTotal;
         ++usedFrames_;
         if (trace_ != nullptr) fireFrameTrace (true);
     }
@@ -880,6 +936,7 @@ private:
         t.end = frames_.frameEnd();
         t.valid = used;
         t.bandCount = bandCount_;
+        t.frameEnergy = used ? frameTotal_ : 0.0;
         t.bandMid = used ? traceMid_.data() : nullptr;
         t.bandSide = used ? traceSide_.data() : nullptr;
         trace_ (traceUser_, t);
@@ -921,7 +978,13 @@ private:
             noteReason_ = LowEndReason::Overflowed;
             return;
         }
-        if (! (totalBandEnergy_ > 0.0)) { noteReason_ = LowEndReason::NoEnergy; return; }
+        frameEnergy_ = accFrameEnergy_ * inv;
+        bandRangeShare_ = frameEnergy_ > 0.0 ? totalBandEnergy_ / frameEnergy_ : 0.0;
+        // `> 0` alone is not "there is a note here": pure DC, pure Nyquist and a denormal-floor signal
+        // all leave a positive total made of transform round-off, and naming a note from it is exactly
+        // the number-that-reads-as-a-finding this instrument refuses to print.
+        if (! (totalBandEnergy_ > 0.0) || ! (bandRangeShare_ > kNoteFloorShare))
+        { noteReason_ = LowEndReason::NoEnergy; return; }
 
         // argmax twice, strictly, so a tie goes to the LOWEST band index
         peakBand_ = 0; peakDensityBand_ = 0;
@@ -985,6 +1048,7 @@ private:
     std::int64_t peakSideAmpAt_ = -1;
 
     std::int64_t usedFrames_ = 0, holedFrames_ = 0;
+    double accFrameEnergy_ = 0.0, frameEnergy_ = 0.0, bandRangeShare_ = 0.0, frameTotal_ = 0.0;
     int peakBand_ = -1, peakDensityBand_ = -1, secondBand_ = -1;
     double backgroundDensity_ = 0.0, peakShare_ = 0.0, totalBandEnergy_ = 0.0;
     LowEndReason widthReason_ = LowEndReason::NotFinished;

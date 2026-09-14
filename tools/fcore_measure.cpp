@@ -36,10 +36,12 @@
 //                 comparison catches a flipped bit that %.17g would round away. `valid 0` is never "clean":
 //                 read the reason. [--quiet-db X] [--order N]
 //   lowend      → the vinyl low end (analysis::LowEnd): the integral Mid/Side energies of the LR4 low and high
-//                 bands and of the unfiltered programme, the 10 ms side-fraction histogram, the three extremum
-//                 coordinates, and the semitone band table with the dominant note — all as raw IEEE-754 bit
-//                 patterns, so `diff` between two toolchains IS the parity test. NOT `correlation`, which is a
-//                 whole-file phase number with no band split.
+//                 bands and of the unfiltered programme, every stored 10 ms block, the side-fraction histogram,
+//                 the three extremum coordinates, and the full semitone band table with the dominant note —
+//                 as raw IEEE-754 bit patterns, so `diff` between two toolchains IS the parity test. Every
+//                 field the report publishes is here EXCEPT the law-8a trace, which exists only for the suite.
+//                 An invalid note prints as `note INVALID reason N`, never as a note name. NOT `correlation`,
+//                 which is a whole-file phase number with no band split.
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
@@ -449,6 +451,9 @@ int main (int argc, char** argv)
         R.visitValues ([] (const char* name, int ch, const analysis::ProgrammeValue& v)
                        { std::printf ("V %s %d %d %d %016llx\n", name, ch, v.valid ? 1 : 0,
                                       (int) v.reason, (unsigned long long) bits (v.value)); });
+        return 0;
+    }
+
     if (mode == "lowend")
     {
         // The vinyl low end. Streamed in kChunk steps, which is also the point: the report is bit-identical
@@ -526,22 +531,43 @@ int main (int argc, char** argv)
         std::printf ("frames used %lld holed %lld tail %lld window %lld underresolved %d\n",
                      (long long) le.usedFrames(), (long long) le.holedFrames(), (long long) le.tailUncoveredSamples(),
                      (long long) le.windowSamples(), le.underResolvedBands());
-        std::printf ("band midi centreHz midEnergy sideEnergy centroidHz\n");
+        // the 10 ms SERIES, every stored block: without it a diff cannot compare the quantity the
+        // instrument publishes per block, which is where the wide-bass answer actually lives
+        std::printf ("series index samples finite holes midEnergy sideEnergy\n");
+        for (std::int64_t i = 0; i < le.storedBlockCount(); ++i)
+        {
+            const analysis::LowEndBlock r = le.block (i);
+            std::printf ("s %lld %lld %lld %lld %016llx %016llx\n", (long long) r.index, (long long) r.samples,
+                         (long long) r.finiteSamples, (long long) r.holes,
+                         (unsigned long long) bits (r.midEnergy), (unsigned long long) bits (r.sideEnergy));
+        }
+        std::printf ("band midi centreHz widthHz binsPerBand midEnergy sideEnergy energy density centroidHz centsOffset\n");
         for (int b = 0; b < le.bandCount(); ++b)
         {
             const analysis::LowEndBand r = le.band (b);
-            std::printf ("b %d %d %016llx %016llx %016llx %016llx\n", b, r.midi,
-                         (unsigned long long) bits (r.centreHz), (unsigned long long) bits (r.midEnergy),
-                         (unsigned long long) bits (r.sideEnergy), (unsigned long long) bits (r.centroidHz));
+            std::printf ("b %d %d %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", b, r.midi,
+                         (unsigned long long) bits (r.centreHz), (unsigned long long) bits (r.widthHz),
+                         (unsigned long long) bits (r.binsPerBand), (unsigned long long) bits (r.midEnergy),
+                         (unsigned long long) bits (r.sideEnergy), (unsigned long long) bits (r.energy),
+                         (unsigned long long) bits (r.density), (unsigned long long) bits (r.centroidHz),
+                         (unsigned long long) bits (r.centsOffset));
         }
         std::printf ("peak %d %d density %d second %d\n", le.peakBand(), le.peakMidi(),
                      le.peakDensityBand(), le.secondBand());
-        std::printf ("note %s%d nominal %016llx centroid %016llx cents %016llx sidefrac %016llx\n",
-                     analysis::LowEnd::pitchClassName (le.peakMidi()), analysis::LowEnd::noteOctave (le.peakMidi()),
-                     (unsigned long long) bits (le.peakNoteHz()), (unsigned long long) bits (le.peakCentroidHz()),
-                     (unsigned long long) bits (le.peakCentsOffset()), (unsigned long long) bits (le.peakBandSideFraction()));
+        // Only when there IS a note. peakMidi() is canonically 0 for an invalid report, and feeding that
+        // through the naming functions printed "note C-1" — an invalid answer wearing a real note's name,
+        // which is precisely the number-that-reads-as-a-finding this instrument exists not to print.
+        if (le.noteValid())
+            std::printf ("note %s%d nominal %016llx centroid %016llx cents %016llx sidefrac %016llx\n",
+                         analysis::LowEnd::pitchClassName (le.peakMidi()), analysis::LowEnd::noteOctave (le.peakMidi()),
+                         (unsigned long long) bits (le.peakNoteHz()), (unsigned long long) bits (le.peakCentroidHz()),
+                         (unsigned long long) bits (le.peakCentsOffset()), (unsigned long long) bits (le.peakBandSideFraction()));
+        else
+            std::printf ("note INVALID reason %d\n", (int) le.noteReason());
         // the dominance ratio is NOT printed as one number: its denominator is exactly zero for a tone in
         // digital silence. The three numbers it is made of are printed instead.
+        std::printf ("frame %016llx rangeshare %016llx\n",
+                     (unsigned long long) bits (le.frameEnergy()), (unsigned long long) bits (le.bandRangeShare()));
         std::printf ("background %016llx peakenergy %016llx peakwidth %016llx share %016llx total %016llx\n",
                      (unsigned long long) bits (le.backgroundDensity()), (unsigned long long) bits (le.peakBandEnergy()),
                      (unsigned long long) bits (le.peakBandWidthHz()), (unsigned long long) bits (le.peakShare()),
