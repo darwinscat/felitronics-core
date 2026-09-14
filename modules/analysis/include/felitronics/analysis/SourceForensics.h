@@ -69,8 +69,9 @@ namespace felitronics::analysis
 //     sixteen, against a 24 dB default — estimator noise cannot manufacture an edge.
 //     Hence three deliberately different resolutions, each published: the edge geometry at cell
 //     resolution on median-filtered cells, the emptiness at bin resolution on raw means, and
-//     `peakCellPower` — the reference the emptiness threshold hangs from — as the loudest RAW cell, which
-//     is the conservative choice because it makes emptiness harder to claim.
+//     `peakCellPower` — the reference the emptiness threshold hangs from — as the loudest RAW cell. That
+//     reference is published, and it needs to be: a louder one raises the threshold and makes emptiness
+//     EASIER to claim, and a cell being a 17-bin mean does not stop a dominant tone from setting it.
 //   · A POSITION NEAR NYQUIST CANNOT BE ATTRIBUTED. A wall at 0.9-0.95 of Nyquist is where a converter's
 //     or an export's anti-alias filter sits, where a 320 kbit/s codec sits, and where a genuinely
 //     band-limited master sits. That band is ambiguous BY NATURE, so `nearNyquist` marks it and the
@@ -97,8 +98,10 @@ namespace felitronics::analysis
 //     256): k = 23, and a container carrying 16-bit content reads k = 15. Container and content are
 //     different questions and only the content is in the samples. (io::Wav decodes 32-bit PCM to double
 //     and keeps what a float32 path here would have discarded — see io/Wav.h.)
-//   · A sample past unity fits no normalised PCM word at any depth, so `peakAboveUnity` withholds
-//     `minExactPcmBits` while `gridExponent` stays valid.
+//   · A sample OUTSIDE [-1, +1) fits no normalised PCM word at any depth — a b-bit word carries
+//     i/2^(b-1) for i in [-2^(b-1), 2^(b-1) - 1], so -1 is representable and +1 is not — so
+//     `outsidePcmRange` withholds `minExactPcmBits` while `gridExponent` stays valid. Exactly +1.0 is
+//     therefore not a PCM word's sample, however routinely a float master's peak sits there.
 //
 // FORM. setParams / prepare / process / finish / reset, as analysis::ClipDetector. process() is READ-ONLY
 // and allocates nothing; `maxBlock` sizes NOTHING (a report must be identical for prepare(sr, 64, nch) and
@@ -132,12 +135,14 @@ namespace felitronics::analysis
 //
 // TWO NUMBERS THIS FILE DOES NOT INVENT. The quantile rule is NEAREST-RANK — the order statistic of
 // 1-based rank ceil(q*n), clamped to [1, n] — which is the rule dynamics::offline::QuantileHistogram
-// already names for this repository (Quantile.h:22), NOT analysis::LoudnessMeter's LRA rule (rank
-// (N-1)*p + 0.5, correct there because LRA is a DIFFERENCE of two percentiles and the half-bin offset
-// cancels), and NOT a third rule of its own. It is computed by integer arithmetic: ceil(q*n) in floating
-// point reads 37 instead of 36 for q = 9/10, n = 40, because 0.9 is not representable. And every dB here
-// is 10*log10 of a power RATIO, inline: core::gainToDb is 20*log10 with a floor at 1e-12, which would
-// double every number and cap the drop at 240 dB, destroying the documented +inf.
+// already names for this repository (Quantile.h:22), NOT analysis::LoudnessMeter's LRA rule (which takes
+// the bin's LOWER bound at rank (N-1)*p + 0.5, faithful to libebur128 and correct there because LRA is a
+// DIFFERENCE of two percentiles, so that half-BIN offset cancels), and NOT a third rule of its own. It is
+// computed by integer arithmetic, which simply removes the question of whether ceil(q*n) in floating point
+// can land on the wrong side of an integer (for these quantiles it does not, checked to n = 20000 — the
+// integer form needs no such check). And every dB here is 10*log10 of a power RATIO, inline:
+// core::gainToDb is an AMPLITUDE function, 20*log10 with its argument floored at 1e-12, so it would double
+// every number and clamp any ratio below 1e-12 to -240 dB.
 //
 // WHY NO CELL CAN BE NaN, so that a sort of them is not undefined behaviour. Only hole-free frames of
 // finite floats are transformed, and for those |X_k| <= N*max|x| <= 2^22 * 3.4e38, so a bin power is under
@@ -160,7 +165,7 @@ enum class ForensicsReason : std::uint8_t
     ShallowerThanMinDrop,  // the best descent in the search band does not reach minDropDb — there is no edge here
     NoNonZeroSample,       // every finite sample was exactly zero, so no sample witnesses a grid
     FinerThan24BitGrid,    // the grid is finer than 2^-23: no <= 24-bit PCM word holds the stream
-    PeakAboveUnity,        // a sample past unity fits no normalised PCM word at any depth
+    OutsidePcmRange,       // a sample outside [-1, +1) fits no normalised PCM word at any depth
 };
 
 // The canonical moments inside process() at which the report's state changes in a way a re-slicing could
@@ -194,7 +199,8 @@ struct SpectralWall
     double plateauPower = 0.0;              // the median cell of the plateau span below the STEEPEST boundary
     double floorLocalPower = 0.0;           // the median cell of the floor span just above it
     double maxAbovePower = 0.0;             // the loudest cell ANYWHERE above it — the conservative floor
-    double sufMaxPower = 0.0;               // the STRICT suffix maximum: nothing above the edge is forgiven
+    double sufMaxPower = 0.0;               // the suffix maximum of the RAW cells: nothing above the edge is
+                                            // forgiven, neither the rank nor the 3-cell median filter
     int    exemptedCells = 0;               // how many of the loudest cells above the edge the floor skipped
     double dropDb = 0.0;                    // 10log10(plateau / maxAbove); exactly +inf when nothing is above
     double strictDropDb = 0.0;              // ...and the same against sufMaxPower, forgiving nothing
@@ -210,8 +216,11 @@ struct SpectralWall
     // The second edge, measured the same way over the candidates ABOVE this one — far enough above that its
     // own plateau span is clear of this transition, or it would measure this plateau against that floor and
     // invent an edge. Nested edges are real: a 16 kHz codec wall inside a 20.5 kHz export anti-alias filter.
-    // The INNER one wins the primary (its plateau is the programme itself), so without this the outer one
-    // would be reported by nothing at all.
+    // WHICH of the two becomes the primary is decided by the conservative drop and nothing else: with a
+    // deep shelf between them the inner edge wins (its plateau is the programme itself) and the outer is
+    // published here; with a shallow shelf the OUTER edge wins instead, and then the inner one is not
+    // reported at all, because a second search below the primary is structurally useless — everything
+    // above such a candidate includes the primary's own plateau, so its conservative drop is ~0 dB.
     bool   secondValid = false;
     bool   secondSharp = false;
     double secondCutoffHz = 0.0;
@@ -226,7 +235,10 @@ struct SpectralWall
     double emptyAboveHz = 0.0;              // at BIN resolution (finer than the edge coordinates)
     double emptyAboveFractionOfNyquist = 0.0;
     double emptyThresholdPower = 0.0;       // peakCellPower * 10^(-emptyDb/10), the threshold as applied
-    double peakCellPower = 0.0;             // the reference: the loudest CELL, so a single tone cannot set it
+    // The reference the emptiness threshold hangs from: the loudest RAW cell. Read it, because the test is
+    // relative to it in the direction that matters — a LOUDER reference raises the threshold and makes
+    // emptiness EASIER to claim, and a cell is a 17-bin mean, which a dominant tone can still set.
+    double peakCellPower = 0.0;
 
     // the geometry this edge was measured with, published so the resolution is never guessed
     double binHz = 0.0, cellHz = 0.0, nyquistHz = 0.0;
@@ -240,10 +252,13 @@ struct SampleGrid
     bool valid = false;                     // a grid was witnessed (at least one finite, non-zero sample)
     ForensicsReason reason = ForensicsReason::NotFinished;   // Ok only when minExactPcmBits is readable too
     int  gridExponent = 0;                  // k in 0..149: every finite sample is an exact multiple of 2^-k
-    bool pcmCompatible = false;             // k <= 23: some normalised PCM word of at most 24 bits holds them all
-    bool peakAboveUnity = false;            // a sample past unity: no normalised PCM word at any depth
+    // k <= 23 AND every sample inside [-1, +1): some normalised PCM word of at most 24 bits holds them all.
+    // The range is part of the claim, not decoration: a b-bit word carries i/2^(b-1) for i in
+    // [-2^(b-1), 2^(b-1) - 1], so -1 IS representable and +1 is not, at any depth.
+    bool pcmCompatible = false;
+    bool outsidePcmRange = false;           // a sample at or above +1, or below -1
     int  minExactPcmBits = 0;               // k + 1, the SHORTEST exact word; 0 when not readable
-    double absPeak = 0.0;                   // the largest |sample|, which is what the unity test needs
+    double absPeak = 0.0, sampleMin = 0.0, sampleMax = 0.0;   // the range the claim rests on
 
     std::int64_t nonZeroSamples = 0, zeroSamples = 0;        // finite; zeros lie on every grid and witness none
     std::int64_t nonFiniteSamples = 0;                       // fed, but NaN or infinite
@@ -288,8 +303,8 @@ struct SourceForensicsParams
                                         // a real wall must not hide it. 0 restores the strict suffix maximum.
     double nearNyquistFraction = 0.80;  // at/above this fraction of Nyquist the position cannot be attributed
     double emptyDb = 100.0;             // "empty" is this far below the loudest cell
-    double emptyMinHz = 200.0;          // ...and must hold over at least this much spectrum, so the Nyquist
-                                        // bin alone cannot declare the top of the band empty
+    double emptyMinHz = 200.0;          // ...and must hold over at least this much spectrum (never fewer than
+                                        // two bins), so the Nyquist bin alone cannot declare the band empty
     // --- the sample grid ---
     int maxDistinctValues = 1 << 16;    // counted EXACTLY up to here (65536 = every 16-bit code); past it the
                                         // count is a lower bound. The table is sized so this limit sits at or
@@ -391,7 +406,12 @@ public:
         const int fromCell = (int) std::ceil (p.searchFromHz / g.cellHz);
         g.firstCandidate = std::max (g.plateauCells, fromCell);         // a FULL plateau span must fit below
         g.emptyMinBins = (int) (p.emptyMinHz / g.binHz);
-        if (g.emptyMinBins < 1) g.emptyMinBins = 1;
+        // At least TWO bins, whatever emptyMinHz rounds to. With one, the claim can be made about the
+        // Nyquist bin alone and reads "empty above 24000 Hz" on a 48 kHz file — vacuously true and
+        // published as if it meant something (found at fftOrder 8, where binHz is 187.5 and a 200 Hz
+        // minimum floors to a single bin). Two bins also makes the reported coordinate STRICTLY below
+        // Nyquist, which is a property the suite asserts directly.
+        if (g.emptyMinBins < 2) g.emptyMinBins = 2;
         g.exemptCells = p.exemptCells;
         g.minDropRatio = std::pow (10.0, p.minDropDb / 10.0);
         g.distinctLimit = p.maxDistinctValues;
@@ -415,7 +435,7 @@ public:
         std::size_t cells      = 0;      // double, cellCount — the raw cell means
         std::size_t smoothCells = 0;     // double, cellCount — their 3-cell median, what the edge search reads
         std::size_t suffixMax  = 0;      // double, cellCount — the forgiving floor the search uses
-        std::size_t strictMax  = 0;      // double, cellCount — and the unforgiving one, published beside it
+        std::size_t strictMax  = 0;      // double, cellCount — and the raw, unforgiving one, published beside it
         std::size_t sortScratch = 0;     // double, max(plateauCells, floorCells)
         std::size_t tableSlots = 0;      // uint32, slots * channels
         std::uint64_t bytes() const noexcept
@@ -453,12 +473,22 @@ public:
 
     void setParams (const SourceForensicsParams& p) noexcept { params_ = p; }   // takes effect at the next prepare()
     const SourceForensicsParams& params() const noexcept { return params_; }
+    // What the CURRENT measurement is being made with — the snapshot prepare() took. setParams() between
+    // prepare() and finish() must not move a published number, so the edge analysis reads this and never
+    // `params_` (found in the code-review round: minDropDb was read at finish(), so raising it afterwards
+    // turned a measured 79 dB edge from valid to invalid without a new prepare()).
+    const SourceForensicsParams& activeParams() const noexcept { return active_; }
 
     void setObserver (Observer fn, void* user) noexcept { obs_ = fn; obsUser_ = user; }
 
     [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock: nothing is sized by it*/, int maxChannels) noexcept
     {
-        prepared_ = false;                                               // law 11b: disarm, validate, write
+        // Law 11b: disarm, validate, write — and DISARM MEANS THE REPORT TOO. A failed prepare() after a
+        // finished measurement used to leave isPrepared() false while wall(0).valid stayed true, because
+        // the channel count and the finished flag survived (code-review round).
+        prepared_ = false;
+        finished_ = false;
+        channels_ = 0;
         const Geometry g = geometryFor (sampleRate, maxChannels, params_);
         const Storage st = storageFor (sampleRate, maxChannels, params_);
         if (! g.ok || ! st.ok) return false;
@@ -468,6 +498,7 @@ public:
         frames_.setParams (fp);
         if (! frames_.prepare (sampleRate, 0, maxChannels)) return false;
         geo_ = g;
+        active_ = params_;                                               // the snapshot the report is made with
         sampleRate_ = sampleRate;
         channels_ = maxChannels;
         bins_ = g.bins;
@@ -641,7 +672,8 @@ private:
         int  maxK = -1;                                        // no grid witnessed yet
         std::int64_t firstMaxK = -1;
         std::int64_t kHist[kPcmGridK + 3] {};                  // k = 0..23, then 24, then "25 or finer"
-        double absPeak = 0.0;
+        double absPeak = 0.0, minVal = 0.0, maxVal = 0.0;
+        bool rangeSeen = false;
         std::int64_t nonZero = 0, zero = 0, nonFinite = 0, absent = 0, offGrid = 0;
         std::int64_t firstOffGrid = -1;
         std::int64_t distinct = 0;
@@ -705,6 +737,9 @@ private:
         if (! std::isfinite (x)) { ++ch.nonFinite; return; }
         const double a = std::fabs ((double) x);
         if (a > ch.absPeak) ch.absPeak = a;
+        const double v = (double) x;
+        if (! ch.rangeSeen) { ch.minVal = v; ch.maxVal = v; ch.rangeSeen = true; }
+        else { if (v < ch.minVal) ch.minVal = v; if (v > ch.maxVal) ch.maxVal = v; }
         insertValue (c, valueKey (x));
         if (core::exactlyEqual (x, 0.0f)) { ++ch.zero; return; }         // on every grid, witness to none
         ++ch.nonZero;
@@ -795,13 +830,15 @@ private:
         g.distinctValues = ch.distinct;
         g.distinctComplete = ch.distinctComplete;
         g.absPeak = ch.absPeak;
-        g.peakAboveUnity = ch.absPeak > 1.0;
+        g.sampleMin = ch.minVal;
+        g.sampleMax = ch.maxVal;
+        g.outsidePcmRange = ch.rangeSeen && ! (ch.minVal >= -1.0 && ch.maxVal < 1.0);
         if (ch.maxK < 0) { g.reason = ForensicsReason::NoNonZeroSample; return g; }
         g.valid = true;
         g.gridExponent = ch.maxK;
-        g.pcmCompatible = ch.maxK <= kPcmGridK;
-        if (! g.pcmCompatible) { g.reason = ForensicsReason::FinerThan24BitGrid; return g; }
-        if (g.peakAboveUnity)  { g.reason = ForensicsReason::PeakAboveUnity; return g; }
+        g.pcmCompatible = ch.maxK <= kPcmGridK && ! g.outsidePcmRange;
+        if (ch.maxK > kPcmGridK) { g.reason = ForensicsReason::FinerThan24BitGrid; return g; }
+        if (g.outsidePcmRange)  { g.reason = ForensicsReason::OutsidePcmRange; return g; }
         g.minExactPcmBits = ch.maxK + 1;
         g.reason = ForensicsReason::Ok;
         return g;
@@ -887,21 +924,26 @@ private:
                                      ? cells_[(std::size_t) j]
                                      : med3 (cells_[(std::size_t) (j - 1)], cells_[(std::size_t) j],
                                              cells_[(std::size_t) (j + 1)]);
-        // The floor above each boundary, in one backward pass: `strict_` is the plain suffix maximum and
-        // `suffix_` is the (t+1)-th largest, t forgiving at most exemptCells cells and at most a tenth of
-        // the suffix. The top-(exemptCells+1) values are held in a fixed array of at most 17 doubles, kept
-        // descending by one insertion step — no allocation, no sort, no tie to resolve.
+        // The floor above each boundary, in one backward pass: `strict_` is the suffix maximum of the RAW
+        // cells — forgiving nothing, not even the median filter, since a 3-cell median is itself
+        // forgiveness and an "unforgiven" number computed from filtered cells would be neither (found in
+        // the code-review round: it read 27 dB of recovery where the raw suffix says 63) — and `suffix_`
+        // is the (t+1)-th largest of the FILTERED cells, t forgiving at most exemptCells of them and at
+        // most a tenth of the suffix. The top-(exemptCells+1) values are held in a fixed array of at most
+        // 17 doubles, kept descending by one insertion step — no allocation, no sort, no tie to resolve.
         {
             const int cap = geo_.exemptCells + 1;
             double top[kMaxExemptCells + 1] {};
             int held = 0;
+            double rawRun = 0.0;
             for (int j = geo_.cellCount - 1; j >= 0; --j)
             {
+                if (cells_[(std::size_t) j] > rawRun) rawRun = cells_[(std::size_t) j];
+                strict_[(std::size_t) j] = rawRun;
                 const double v = smooth_[(std::size_t) j];
                 if (held < cap) { top[held] = v; ++held; }
                 else if (v > top[cap - 1]) top[cap - 1] = v;
                 for (int i = held - 1; i > 0 && top[i] > top[i - 1]; --i) std::swap (top[i], top[i - 1]);
-                strict_[(std::size_t) j] = top[0];
                 const int above = geo_.cellCount - j;
                 int t = (above - 1) / kSuffixExemptFraction;
                 if (t > geo_.exemptCells) t = geo_.exemptCells;
@@ -922,7 +964,7 @@ private:
         // there is an edge AT ALL — otherwise a monotone-falling programme is handed the lowest boundary in
         // the band and a flat one the highest, each with a frequency that means nothing. The numbers stay
         // published; only `valid` is withheld, with the reason that says why.
-        if (! (w.dropDb >= params_.minDropDb)) { w.reason = ForensicsReason::ShallowerThanMinDrop; return w; }
+        if (! (w.dropDb >= active_.minDropDb)) { w.reason = ForensicsReason::ShallowerThanMinDrop; return w; }
         // the second edge: the same measurement, above this one's transition and clear of it by a plateau span
         Edge e2;
         const int secondFrom = std::max (e.je + geo_.plateauCells, geo_.firstCandidate);
@@ -933,8 +975,8 @@ private:
             w.secondCutoffHz = (double) e2.js * geo_.cellHz;
             w.secondDropDb = powerRatioDb (e2.plateau, e2.maxAbove);
             w.secondTransitionHz = (double) (e2.je - e2.js) * geo_.cellHz;
-            w.secondSharp = ! e2.clipped && w.secondDropDb >= params_.minDropDb
-                          && w.secondTransitionHz <= params_.maxTransitionHz;
+            w.secondSharp = ! e2.clipped && w.secondDropDb >= active_.minDropDb
+                          && w.secondTransitionHz <= active_.maxTransitionHz;
         }
         w.valid = true;
         w.reason = ForensicsReason::Ok;
@@ -1043,9 +1085,9 @@ private:
         w.steepnessDbPerOctave = (w.transitionEndHz > w.cutoffHz && w.cutoffHz > 0.0 && std::isfinite (w.dropDb))
                                ? w.dropDb / std::log2 (w.transitionEndHz / w.cutoffHz)
                                : (w.dropDb > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
-        w.sharp = ! w.transitionClipped && w.dropDb >= params_.minDropDb
-                && w.transitionHz <= params_.maxTransitionHz;
-        w.nearNyquist = w.cutoffFractionOfNyquist >= params_.nearNyquistFraction;
+        w.sharp = ! w.transitionClipped && w.dropDb >= active_.minDropDb
+                && w.transitionHz <= active_.maxTransitionHz;
+        w.nearNyquist = w.cutoffFractionOfNyquist >= active_.nearNyquistFraction;
     }
 
     // 10log10(a/b) — a power ratio, taken ONCE at the end of a linear average. b == 0 with a > 0 is
@@ -1081,7 +1123,7 @@ private:
         return sortScratch_[idx];
     }
 
-    SourceForensicsParams params_ {};
+    SourceForensicsParams params_ {}, active_ {};
     Geometry geo_ {};
     SpectrumFrames frames_ {};
     bool prepared_ = false, finished_ = false;

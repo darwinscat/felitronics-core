@@ -46,18 +46,26 @@
 // gate. Each mutant was built with the object file DELETED first and refused a verdict unless a
 // `Building CXX` line appeared: a header edited in the same SECOND as the previous build is invisible to
 // make's 1-second mtime granularity, and that alone cost three false greens elsewhere today.
-//   (1) the frame's power accumulated at the END of process() instead of at frame close  -> RED, 23 of 379
-//   (2) a holed frame accumulated anyway (the frameFinite check dropped)                  -> RED,  4 of 379
-//   (3) the aggregate dividing every channel by channel 0's frame count (pooling)         -> RED,  1 of 379
-//   (4) the k <= 23 gate removed, so a finer grid reports a PCM word length anyway        -> RED,  9 of 379
-//   (5) exact zeros no longer skipped when witnessing the grid                            -> RED, 12 of 379
-//   (6) the distinct set marked incomplete on REACHING the limit, not on a new key it      -> RED,  1 of 379
+//   (1) the frame's power accumulated at the END of process() instead of at frame close  -> RED, 22 of 422
+//   (2) a holed frame accumulated anyway (the frameFinite check dropped)                  -> RED,  4 of 422
+//   (3) the aggregate dividing every channel by channel 0's frame count (pooling)         -> RED,  1 of 422
+//   (4) the k <= 23 gate removed, so a finer grid reports a PCM word length anyway        -> RED,  5 of 422
+//   (5) exact zeros no longer skipped when witnessing the grid                            -> RED, 13 of 422
+//   (6) the distinct set marked incomplete on REACHING the limit, not on a new key it      -> RED,  1 of 422
 //       could not store
-//   (7) the plateau quantile taken as the MAXIMUM instead of the median                    -> RED, 18 of 379
-//   (8) the suffix rank replaced by the cell just above (the pre-consilium construction)   -> RED, 14 of 379
-//   (9) the top cell left as a partial cell of its own instead of absorbing the remainder  -> RED,  2 of 379
-//  (10) the grid coordinates taken after the clock advanced instead of before              -> RED,  1 of 379
-// Ten of ten red, and the baseline rebuilt green afterwards. Mutant (8) is the one that matters most: it
+//   (7) the plateau quantile taken as the MAXIMUM instead of the median                    -> RED, 17 of 422
+//   (8) the suffix rank replaced by the cell just above (the pre-consilium construction)   -> RED, 13 of 422
+//   (9) the top cell left as a partial cell of its own instead of absorbing the remainder  -> RED,  2 of 422
+//  (10) the grid coordinates taken after the clock advanced instead of before              -> RED,  1 of 422
+//  (11) the STRICT floor taken from the median-filtered cells instead of the raw ones      -> RED,  6 of 422
+//  (12) the measurement reading the PENDING parameters instead of prepare()'s snapshot     -> RED,  1 of 422
+//  (13) pcmCompatible ignoring the PCM range, so +1.0 gets a word length                   -> RED,  1 of 422
+//  (14) a failed prepare() leaving the finished report armed                               -> RED,  3 of 422
+//  (15) the emptiness minimum back to one bin, so "empty above Nyquist" can be claimed     -> RED,  1 of 422
+// Fifteen of fifteen red, and the baseline rebuilt green afterwards. (11) through (15) exist because the
+// CODE-REVIEW round found those five defects and the first ten mutants did not cover them; (11) in
+// particular came back GREEN on the first stand, which is what proved the suite had a hole there rather
+// than a gate. Mutant (8) is the one that matters most: it
 // restores the construction the design consilium killed, and it is red on the notch fixtures alone.
 // The mutant the brief names for every analyzer of this wave — moving the denormal flush to the end of
 // process() — does not exist here: this analyzer has no feedback state, no IIR and no denormal cadence,
@@ -325,8 +333,8 @@ void putB (Trace& tr, bool v) { tr.w.push_back (v ? 1u : 0u); }
 void putGrid (Trace& tr, const SampleGrid& g)
 {
     putB (tr, g.valid); put (tr, (std::int64_t) g.reason); put (tr, g.gridExponent);
-    putB (tr, g.pcmCompatible); putB (tr, g.peakAboveUnity); put (tr, g.minExactPcmBits);
-    putD (tr, g.absPeak);
+    putB (tr, g.pcmCompatible); putB (tr, g.outsidePcmRange); put (tr, g.minExactPcmBits);
+    putD (tr, g.absPeak); putD (tr, g.sampleMin); putD (tr, g.sampleMax);
     put (tr, g.nonZeroSamples); put (tr, g.zeroSamples); put (tr, g.nonFiniteSamples);
     put (tr, g.absentSamples); put (tr, g.offGridSamples); put (tr, g.firstOffGridSample);
     put (tr, g.firstMaxGridSample); put (tr, g.distinctValues); putB (tr, g.distinctComplete);
@@ -445,7 +453,14 @@ int oracleGridK (float x)
 }
 
 // Measure one mono programme with the given params.
-struct Measured { SpectralWall w; SampleGrid g; double cellHz = 0.0; };
+struct Measured
+{
+    SpectralWall w;
+    SampleGrid g;
+    double cellHz = 0.0;
+    int bins = 0, binsPerCell = 0, cellCount = 0;
+    std::vector<double> mean;                 // the published per-bin Welch mean, for the oracles below
+};
 
 Measured measure (const std::vector<float>& x, SourceForensicsParams p, double fs = kFs, int maxBlock = 512)
 {
@@ -459,7 +474,29 @@ Measured measure (const std::vector<float>& x, SourceForensicsParams p, double f
     m.w = sf.wall (0);
     m.g = sf.sampleGrid (0);
     m.cellHz = sf.cellHz();
+    m.bins = sf.bins();
+    m.binsPerCell = sf.binsPerCell();
+    m.cellCount = sf.cellCount();
+    m.mean.resize ((std::size_t) m.bins);
+    for (int b = 0; b < m.bins; ++b) m.mean[(std::size_t) b] = sf.meanPower (0, b);
     return m;
+}
+
+// The maximum RAW cell at or above the boundary `fromHz`, recomputed from the published mean spectrum.
+// This is an ORACLE for `sufMaxPower`: the same quantity taken from the median-FILTERED cells is a
+// DIFFERENT number, and the difference is the whole reason the strict floor is published at all.
+double rawCellMaxFrom (const Measured& m, double fromHz)
+{
+    const int jFrom = (int) std::llround (fromHz / m.cellHz);
+    double best = 0.0;
+    for (int j = jFrom; j < m.cellCount; ++j)
+    {
+        const int from = j * m.binsPerCell, to = j == m.cellCount - 1 ? m.bins : from + m.binsPerCell;
+        double acc = 0.0;
+        for (int b = from; b < to; ++b) acc += m.mean[(std::size_t) b];
+        best = std::max (best, acc / (double) (to - from));
+    }
+    return best;
 }
 
 SourceForensicsParams defaults()
@@ -499,6 +536,28 @@ int main()
         ok (sf.distinctTableSlots() >= (std::size_t) sf.distinctLimit() * 4u / 3u,
             "geometry: the table leaves the distinct limit at or below 3/4 load");
         ok (sf.exemptCells() == p.exemptCells, "geometry: the exemption rank is published");
+        // A published emptiness coordinate must be STRICTLY below Nyquist at EVERY order, or the claim can
+        // be "everything above Nyquist is empty" — vacuously true and read as a finding. At fftOrder 8 the
+        // 200 Hz minimum floors to one bin, which is exactly how that happened (code-review round).
+        for (int order : { 8, 9, 10, 12 })
+        {
+            SourceForensics probe;
+            auto q = defaults();
+            q.fftOrder = order;
+            probe.setParams (q);
+            ok (run (probe.prepare (kFs, 64, 1)), "empty-floor: prepare at order " + std::to_string (order));
+            std::vector<float> x (4096, 0.0f);
+            const double f = (double) (probe.bins() - 3) * probe.binHz();      // a tone in the top bins
+            for (std::size_t i = 0; i < x.size(); ++i)
+                x[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * core::kPi * f * (double) i / kFs));
+            const float* in[1] { x.data() };
+            ok (run (probe.process (in, 1, (int) x.size())), "empty-floor: process at order " + std::to_string (order));
+            probe.finish();
+            const auto w = probe.wall (0);
+            ok (! w.emptyAboveValid || w.emptyAboveHz < w.nyquistHz,
+                "empty-floor: order " + std::to_string (order) + " never claims emptiness above Nyquist itself ("
+                + std::to_string (w.emptyAboveHz) + " Hz)");
+        }
         const auto st = SourceForensics::storageFor (kFs, 2, p);
         ok (st.ok && st.bytes() > 0, "storage: published before the allocation");
         ok (st.frames.ok && st.bytes() > st.frames.bytes(), "storage: the frame producer's budget is included");
@@ -559,7 +618,11 @@ int main()
                 tag + "empty above " + std::to_string (w.emptyAboveHz));
             ok (w.plateauSpreadDb < 12.0, tag + "the plateau reference was flat (" + std::to_string (w.plateauSpreadDb) + " dB)");
             ok (w.steepnessDbPerOctave > 100.0, tag + "steepness " + std::to_string (w.steepnessDbPerOctave) + " dB/oct");
-            ok (w.recoveryDb < 30.0, tag + "nothing sustained is above it (recovery " + std::to_string (w.recoveryDb) + " dB)");
+            ok (w.strictDropDb >= w.dropDb - 30.0,
+                tag + "the raw suffix maximum is close to the forgiven one (strict "
+                    + std::to_string (w.strictDropDb) + " vs " + std::to_string (w.dropDb) + " dB)");
+            ok (core::exactlyEqual (w.sufMaxPower, rawCellMaxFrom (m, w.steepestHz)),
+                tag + "and it IS the maximum raw cell above the boundary, recomputed from the mean spectrum");
             ok (w.strictDropDb > 0.0 && w.strictDropDb <= w.dropDb,
                 tag + "the strict drop is published and is never the larger");
             ok (! w.secondValid, tag + "and there is no second edge above it");
@@ -689,6 +752,12 @@ int main()
                                           + std::to_string (m.w.recoveryDb) + " dB)");
             ok (m.w.dropDb > m.w.strictDropDb, tag + "and the strict drop shows what the rank forgave ("
                                                    + std::to_string (m.w.strictDropDb) + " dB)");
+            // The line is what separates the raw floor from the filtered one: taken from the median-filtered
+            // cells this number would be tens of dB lower and would forgive the very thing it exists to show.
+            ok (core::exactlyEqual (m.w.sufMaxPower, rawCellMaxFrom (m, m.w.steepestHz)),
+                tag + "the strict floor is the RAW maximum above the boundary, filter and rank included");
+            ok (m.w.sufMaxPower > m.w.maxAbovePower,
+                tag + "which stands above the forgiving floor the search used");
             ok (m.w.exemptedCells > 0, tag + "with the rank that was skipped");
             ok (m.w.emptyAboveValid && m.w.emptyAboveHz > 18000.0,
                 tag + "the per-BIN emptiness test sees the line itself (" + std::to_string (m.w.emptyAboveHz) + " Hz)");
@@ -720,16 +789,26 @@ int main()
             ok (m.w.cutoffHz < 5000.0, "loud line: and the argmax has indeed walked away from the wall ("
                                        + std::to_string (m.w.cutoffHz) + " Hz) — the reason `valid` exists");
         }
-        // exemptCells = 0 restores the strict suffix maximum exactly
+        // exemptCells = 0 turns the RANK off, leaving the 3-cell median as the only forgiveness there is —
+        // which is precisely why the strict number is taken from the RAW cells and not from the filtered
+        // ones: "unforgiven" computed from a median-filtered spectrum would be neither.
         {
             auto x = spectral (kLen, kFs, 23, [] (double f)
                                { return f < 16000.0 ? 1000.0 / f
                                       : (f > 18996.0 && f < 19002.0 ? 3.0e-3 : 1.0e-5); });
-            auto p = defaults();
-            p.exemptCells = 0;
-            const auto m = measure (x, p);
-            ok (core::exactlyEqual (m.w.dropDb, m.w.strictDropDb),
-                "exemptCells = 0: the forgiving and strict drops coincide");
+            auto p0 = defaults();
+            p0.exemptCells = 0;
+            const auto m0 = measure (x, p0);
+            const auto m2 = measure (x, defaults());
+            ok (m0.w.dropDb <= m2.w.dropDb,
+                "exemptCells = 0: the drop is no larger than with the rank on ("
+                + std::to_string (m0.w.dropDb) + " vs " + std::to_string (m2.w.dropDb) + " dB)");
+            ok (m0.w.dropDb >= m0.w.strictDropDb,
+                "exemptCells = 0: and the median filter's own forgiveness is what remains between the "
+                "forgiving and the raw floor (" + std::to_string (m0.w.dropDb) + " vs "
+                + std::to_string (m0.w.strictDropDb) + " dB)");
+            ok (core::exactlyEqual (m0.w.sufMaxPower, m2.w.sufMaxPower),
+                "exemptCells = 0: while the raw suffix maximum does not depend on the rank at all");
         }
     }
 
@@ -943,10 +1022,10 @@ int main()
         const auto m = measure (x, p);
         ok (! m.g.pcmCompatible, "gain: a non-dyadic gain leaves no <= 24-bit PCM grid at all");
 
-        // exactly +-1.0: k = 0, so the shortest exact word is 1 bit. Two's complement of 1 bit holds
-        // {-1, 0}, so +1.0 is one code past the top of a normalised word of ANY depth — a float master's
-        // peak sits there routinely, so it is admitted, and `absPeak` is published for the caller that
-        // cares which side of full scale it is on.
+        // exactly +-1.0. A b-bit word carries i/2^(b-1) for i in [-2^(b-1), 2^(b-1) - 1], so -1.0 IS a PCM
+        // sample and +1.0 is NOT, at any depth — however routinely a float master's peak sits there. The
+        // grid is still measured; only the word length is withheld (code-review round: this used to
+        // publish "1 bit", which no normalised word can hold).
         const float pm1[4] { 1.0f, -1.0f, 1.0f, -1.0f };
         SourceForensics one;
         one.setParams (p);
@@ -955,10 +1034,24 @@ int main()
         ok (run (one.process (in1, 1, 4)), "unity: process");
         one.finish();
         const auto g1 = one.sampleGrid (0);
-        ok (g1.valid && ! g1.peakAboveUnity && g1.reason == ForensicsReason::Ok,
-            "unity: exactly +-1.0 is not 'above unity'");
-        ok (g1.gridExponent == 0 && g1.minExactPcmBits == 1, "unity: k = 0 and the shortest exact word is 1 bit");
+        ok (g1.valid && g1.outsidePcmRange && g1.reason == ForensicsReason::OutsidePcmRange,
+            "unity: exactly +1.0 is outside every normalised PCM word's range");
+        ok (g1.gridExponent == 0 && g1.minExactPcmBits == 0,
+            "unity: the grid is measured, the word length withheld");
         approx (g1.absPeak, 1.0, 1e-12, "unity: with the peak published beside it");
+        approx (g1.sampleMax, 1.0, 1e-12, "unity: and the signed range the claim rests on");
+        approx (g1.sampleMin, -1.0, 1e-12, "unity: on both sides");
+        // -1.0 alone, however, IS a PCM sample and keeps its word length
+        const float minusOne[3] { -1.0f, -0.5f, 0.0f };
+        SourceForensics neg;
+        neg.setParams (p);
+        ok (run (neg.prepare (kFs, 64, 1)), "minus one: prepare");
+        const float* in3[1] { minusOne };
+        ok (run (neg.process (in3, 1, 3)), "minus one: process");
+        neg.finish();
+        const auto g3 = neg.sampleGrid (0);
+        ok (g3.pcmCompatible && ! g3.outsidePcmRange && g3.minExactPcmBits == 2,
+            "minus one: -1.0 is inside the range and keeps its word length");
 
         const float over[4] { 0.5f, 1.5f, -0.25f, 0.0f };
         SourceForensics ovr;
@@ -968,8 +1061,9 @@ int main()
         ok (run (ovr.process (in2, 1, 4)), "over-unity: process");
         ovr.finish();
         const auto g2 = ovr.sampleGrid (0);
-        ok (g2.valid && g2.peakAboveUnity && g2.reason == ForensicsReason::PeakAboveUnity,
+        ok (g2.valid && g2.outsidePcmRange && g2.reason == ForensicsReason::OutsidePcmRange,
             "over-unity: a sample past unity fits no normalised PCM word");
+        ok (! g2.pcmCompatible, "over-unity: and pcmCompatible says so too, not only the reason");
         ok (g2.minExactPcmBits == 0 && g2.gridExponent == 2,     // -0.25 is the finest of the four
             "over-unity: the grid is still measured, the word length withheld");
         approx (g2.absPeak, 1.5, 1e-12, "over-unity: the peak is published, since the claim rests on it");
@@ -1374,6 +1468,49 @@ int main()
         ok (sf.samplesProcessed() == 1000, "refuse: and a refused call consumes nothing");
         ok (run (sf.process (in, 0, 5)), "life: a call carrying no channels is legal (all holes)");
         ok (sf.sampleGrid (0).absentSamples == 5, "life: and its samples are counted absent");
+    }
+    {
+        // setParams() between prepare() and finish() must not move a published number: the measurement is
+        // made with the snapshot prepare() took (code-review round — minDropDb was read at finish(), so
+        // raising it afterwards turned a measured 79 dB edge from valid to invalid with no new prepare).
+        auto x = wallFixture (12000.0, -80.0);
+        SourceForensics sf;
+        auto p = defaults();
+        sf.setParams (p);
+        ok (run (sf.prepare (kFs, 512, 1)), "snapshot: prepare");
+        const float* in[1] { x.data() };
+        ok (run (sf.process (in, 1, (int) x.size())), "snapshot: process");
+        auto hostile = p;
+        hostile.minDropDb = 400.0;
+        hostile.nearNyquistFraction = 0.01;
+        hostile.maxTransitionHz = 1.0;
+        sf.setParams (hostile);                       // pending: must take effect only at the NEXT prepare
+        sf.finish();
+        const auto w = sf.wall (0);
+        ok (w.valid && w.sharp, "snapshot: the edge is still the one the snapshot's thresholds accept");
+        ok (! w.nearNyquist, "snapshot: and the pending nearNyquistFraction did not reach the report");
+        approx (sf.activeParams().minDropDb, p.minDropDb, 1e-12, "snapshot: the active parameters are published");
+        ok (core::exactlyEqual (sf.params().minDropDb, 400.0), "snapshot: while the pending ones are readable too");
+        // ...and a FAILED prepare must disarm the report, not leave a valid one behind an unprepared object
+        ok (! sf.prepare (0.0, 512, 1), "disarm: a bad prepare is refused");
+        ok (! sf.isPrepared() && ! sf.isFinished(), "disarm: and the object is unarmed");
+        ok (! sf.wall (0).valid && sf.wall (0).reason == ForensicsReason::NoChannel,
+            "disarm: the channel report goes with it");
+        ok (! sf.sampleGrid (0).valid && sf.sampleGrid (0).reason == ForensicsReason::NoChannel,
+            "disarm: and so does the grid report");
+    }
+    {
+        // WHICH nested edge becomes the primary is decided by the conservative drop and nothing else.
+        // With a SHALLOW shelf the outer edge wins and the inner one is not reported at all — a second
+        // search below the primary is structurally useless, since everything above such a candidate
+        // includes the primary's own plateau. Documented, and pinned here (code-review round).
+        auto x = spectral (kLen, kFs, 19, [] (double f)
+                           { return f < 16000.0 ? 1.0 : (f < 20500.0 ? 1.0e-2 : 1.0e-6); });
+        const auto m = measure (x, defaults());
+        ok (m.w.valid, "shallow shelf: an edge is found");
+        ok (m.w.cutoffHz > 20000.0, "shallow shelf: the OUTER edge wins on the conservative drop ("
+                                    + std::to_string (m.w.cutoffHz) + " Hz)");
+        ok (! m.w.secondValid, "shallow shelf: and nothing above it is reported as a second edge");
     }
     {
         // a replay after reset is bit-identical to a fresh object

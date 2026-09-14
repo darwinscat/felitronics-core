@@ -495,9 +495,29 @@ int main (int argc, char** argv)
     {
         // The whole report, as bit patterns. The analyzer's own defaults are used and PRINTED, so a diff
         // between two toolchains compares the same instrument and not two configurations of it.
+        // Strict where the top-level parse is lenient, like the shape modes: atoi("4294967297") narrows to
+        // one channel and atof("48000Hz") reads 48000, and both would measure silently.
+        double frate = 0.0;
+        std::uint64_t fwidth = 0;
+        if (! parseRate (argv[2], frate) || ! parseCount (argv[3], fwidth)
+            || fwidth < 1 || fwidth > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        // The file is SIZED before it is read, so an input that is not a whole number of frames, or a read
+        // that fails halfway, cannot come out as a successful measurement of a shorter programme.
+        std::uint64_t fframes = 0;
+        if (! fileFrames (f, nc, fframes))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
         analysis::SourceForensics fx;
         const analysis::SourceForensicsParams fp;
-        if (! fx.prepare (fs, kChunk, nc))
+        if (! fx.prepare (frate, kChunk, nc))
         {
             std::fprintf (stderr, "forensics.prepare refused (sample rate 1000..768000)\n");
             std::fclose (f);
@@ -650,14 +670,29 @@ int main (int argc, char** argv)
         for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)
             if (det.lagBin (b) != 0) std::printf ("lag %d %lld\n", b, (long long) det.lagBin (b));
         streamPlanar (f, nc, [&] (const float* const* p, int n) { okAll = fx.process (p, nc, n) && okAll; });
+        const bool readError = std::ferror (f) != 0;
         std::fclose (f);
         if (! okAll) { std::fprintf (stderr, "forensics: a block was refused\n"); return 2; }
+        if (readError) { std::fprintf (stderr, "forensics: the file could not be read to its end\n"); return 2; }
         fx.finish();
-        std::printf ("# fcore forensics v1 sr=%016llx ch=%d order=%d hop=%lld bins=%d cellhz=%016llx"
-                     " searchfrom=%016llx exempt=%d distinctlimit=%d\n",
-                     (unsigned long long) bits (fs), nc, fp.fftOrder, (long long) fx.hopSamples(), fx.bins(),
-                     (unsigned long long) bits (fx.cellHz()), (unsigned long long) bits (fx.searchFromHz()),
-                     fx.exemptCells(), fx.distinctLimit());
+        if ((std::uint64_t) fx.samplesProcessed() != fframes)
+        {
+            std::fprintf (stderr, "forensics: the file delivered %lld of the %llu frames it was sized for\n",
+                          (long long) fx.samplesProcessed(), (unsigned long long) fframes);
+            return 2;
+        }
+        // EVERY parameter, so two builds that differ only in a threshold cannot print the same report.
+        std::printf ("# fcore forensics v1 sr=%016llx ch=%d order=%d hop=%lld bins=%d percell=%d\n",
+                     (unsigned long long) bits (frate), nc, fp.fftOrder, (long long) fx.hopSamples(),
+                     fx.bins(), fx.binsPerCell());
+        std::printf ("params exempt=%d distinctlimit=%d plateaucells=%d floorcells=%d", fx.exemptCells(),
+                     fx.distinctLimit(), fx.plateauSpanCells(), fx.floorSpanCells());
+        const double ps[] = { fx.cellHz(), fx.binHz(), fx.searchFromHz(), fx.searchToHz(), fp.cellWidthHz,
+                              fp.searchFromHz, fp.plateauSpanHz, fp.floorSpanHz, fp.transitionStartDb,
+                              fp.transitionEndDb, fp.minDropDb, fp.maxTransitionHz, fp.nearNyquistFraction,
+                              fp.emptyDb, fp.emptyMinHz };
+        for (double d : ps) std::printf (" %016llx", (unsigned long long) bits (d));
+        std::printf ("\n");
         std::printf ("samples %lld tail %lld frames %lld\n", (long long) fx.samplesProcessed(),
                      (long long) fx.tailUncoveredSamples(), (long long) fx.frames().frameCount());
         for (int c = 0; c <= nc; ++c)                     // per channel, then the file's own aggregate
@@ -681,9 +716,11 @@ int main (int argc, char** argv)
         for (int c = 0; c < nc; ++c)
         {
             const analysis::SampleGrid g = fx.sampleGrid (c);
-            std::printf ("grid %d valid=%d reason=%d k=%d pcm=%d overunity=%d bits=%d peak=%016llx\n",
+            std::printf ("grid %d valid=%d reason=%d k=%d pcm=%d outofrange=%d bits=%d peak=%016llx"
+                         " min=%016llx max=%016llx\n",
                          c, (int) g.valid, (int) g.reason, g.gridExponent, (int) g.pcmCompatible,
-                         (int) g.peakAboveUnity, g.minExactPcmBits, (unsigned long long) bits (g.absPeak));
+                         (int) g.outsidePcmRange, g.minExactPcmBits, (unsigned long long) bits (g.absPeak),
+                         (unsigned long long) bits (g.sampleMin), (unsigned long long) bits (g.sampleMax));
             std::printf ("grid %d nonzero=%lld zero=%lld nonfinite=%lld absent=%lld offgrid=%lld"
                          " firstoffgrid=%lld firstmaxk=%lld distinct=%lld complete=%d\n",
                          c, (long long) g.nonZeroSamples, (long long) g.zeroSamples,
