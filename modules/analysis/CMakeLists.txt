@@ -35,6 +35,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_loudness_conformance_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_loudness_conformance_tests COMMAND felitronics_loudness_conformance_tests)
 
+    add_executable(felitronics_spectrum_frames_tests tests/SpectrumFramesTests.cpp)   # the shared frame producer: DFT null + law 8a
+    target_link_libraries(felitronics_spectrum_frames_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_spectrum_frames_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_spectrum_frames_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_spectrum_frames_tests COMMAND felitronics_spectrum_frames_tests)
+
     add_executable(felitronics_clip_detector_tests tests/ClipDetectorTests.cpp)   # clipping by construction + a whole-file reference null
     target_link_libraries(felitronics_clip_detector_tests PRIVATE felitronics::analysis)
     target_include_directories(felitronics_clip_detector_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

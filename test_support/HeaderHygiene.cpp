@@ -16,6 +16,7 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
+#include <felitronics/analysis/SpectrumFrames.h>
 #include <felitronics/analysis/SpectrumTap.h>
 #include <felitronics/analysis/StereoColumns.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
