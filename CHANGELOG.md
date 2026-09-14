@@ -5,7 +5,7 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
-## Unreleased
+## v0.32.0 — 2026-09-14
 
 ### `analysis` — `ClipDetector`: clipping is a flat top, not a loud sample
 
@@ -154,6 +154,266 @@ field and not the compressor's: `dynamics::Compressor` keeps dry/wet out on purp
   fits the constructor's seed asks for nothing, which `bytes()` over-stated by 8 B.
 - **The C ABI does not carry it yet.** It waits for the ABI's version rule (P57); every params set through
   the ABI renders at mix 1. `tools/fc_master_abi.h` records the omission as a debt.
+
+### `tools` · `mastering` — the C ABI's compatibility rule (v2, v3): delivery at another rate, and parallel compression
+
+`tools/fc_master_abi.h` states the rule every later ABI change follows, so that a version is a row in a table
+rather than an event, and makes the first two bumps by it.
+
+- **The rule** (VERSIONING, rules 1-8). One version for the whole ABI, moved by a struct that grows or an entry
+  point that is added. A bump appends fields to the END of structs that begin with a header, each IN field with a
+  default under which the call is the previous version bit for bit; nested structs and header-less array elements
+  never grow. Tail padding is a named field. The size of every (struct, version) is ONE row of
+  `FC_MASTER_STRUCT_SIZES`, published by `fc_master_sizeof(id, version)`. An IN struct of any known version is read
+  over this build's defaults at the CALLER's size, and every bound and alias check uses that size; a version newer
+  than the build is refused by decision. An OUT struct keeps the caller's header and gets exactly its size.
+- **The frozen writers.** `fc_*_default(out)` cannot know the caller's size, so they are frozen at v1 (stamp v1,
+  write v1's bytes); `fc_*_defaults(out)` write the caller's stamped version. A field set after a frozen writer
+  lies past the stamp and is not read — the JS accessor refuses to write or read such a struct at all, and the
+  CLI, the parity harness and the suites moved to the versioned writers. `fc_master_sizeof_params/config` are
+  frozen at v1 too, so a v1 page fails on the version, not on a size.
+- **v2 — `fc_master_config::deliveryRate`.** Non-zero makes a DELIVERING handle: SRC first, chain and solver at the
+  delivery rate, equal rates included. New entry points `fc_master_delivered_frames`, `fc_master_render_delivered`
+  and `fc_master_solve_delivered`; `fc_master_measure_lra` converts on such a handle; `process`/`flush`/`solve`
+  refuse. The composition is one core class, `mastering::DeliveredMastering`, which the facade and the selftest's
+  direct path both call. Budgets: `FC_NEED_SOLVE` / `FC_NEED_MEASURE_LRA` on a delivering handle include the
+  converted programme and judge a range on the DELIVERED length; `render_delivered` allocates nothing.
+- **v3 — `compressorMix`** (P60's field) at the end of `fc_master_params` and `fc_master_resolved`. Clamped by the
+  core and read back; a non-finite mix is refused.
+- **A non-finite input sample costs a delivered render what it costs a plain one.** `DeliveryConverter` now gates
+  every input sample with the chain's own rule (NaN/inf -> 0, clamp +-1e6) before the conversion and counts it:
+  a windowed sinc used to spread one NaN over its kernel, and the chain's gate then zeroed every delivered sample
+  it reached. Converting a NaN is bit-identical to converting a zero in its place.
+- **Refusals move nothing.** `DeliveredMastering` reaches every verdict — renderer, width, overlapping planes, and
+  everything the solver would refuse before a pass (`TargetLoudnessSolver::admits`, factored out of `solve()` with
+  no change of verdict) — before the converter writes a sample or a programme buffer is allocated.
+- **Proof.** A render, a solve and a range through a v1 build (`179e1c5`) and this one are byte-identical on the
+  same fixture; v1- and v2-stamped structs render the v3 caller's bits at the previous values; the delivered render
+  and search are bit-identical to the core on down, up and equal rates; `need` equals the counted allocation;
+  `tools/wasm/layout-check.mjs` holds every JS field offset against the compiler (wasm32 on that tier) and
+  `layout-gate-test.mjs` the JS gates; `master-parity.mjs` compares the delivered paths wasm vs native at the
+  delivered length. Product check, 30 s of music: 96 -> 44.1 kHz -14.003 LUFS / -1.044 dBTP, 192 -> 48 kHz
+  -14.003 / -1.046, measured by `fcore_measure` at the delivery rate.
+- **Site transition.** The rule cannot reach a page already shipped against v1: its loader requires `version === 1`.
+  The site moves to v3 as one release of the worker, its layout copy and the module.
+
+### `mastering` · `tools` — the gain-reduction trace: WHERE the compressor and the limiter worked (ABI v4)
+
+A loudness search used to report its gain reduction as three numbers for the whole programme — mean, p95, max. The
+solution now also carries each stage's TRACE: the delivered programme cut into uniform buckets, and per bucket the
+largest and the mean |GR|.
+
+- **`mastering::GainReductionTrace`** in `LoudnessSolution` (`compressorTrace`, `limiterTrace`), built by
+  `GainReductionTraceBuilder` in the solver's tap sink — the same tap values, windows and units the statistics use
+  (frames for the compressor, frames × `tapOversampleFactor` sub-samples for the limiter), so where the statistics
+  are valid the maximum over the buckets IS their `maxDb`, bit for bit. A maximum per bucket, not a point sample.
+  `min(1000, frames)` buckets over the programme's frames, boundaries `floor(k·F/B)`, never an empty bucket; per bucket
+  a sample count and a non-finite count, so a poisoned or empty stretch cannot read as "idle".
+- **It describes the audio in `out`.** Reset and rewritten on every render, including the delivery re-render of a
+  search that did not end on its best point; `valid` only when the render ran to its end, the window saw a sample and
+  none was non-finite; no buckets for a verdict reached before any render. It lives in the solution, so a later solve
+  does not touch it. The price is the solution's size: 2336 → 50 384 B per solution record, pinned with its formula.
+- **ABI v4** (the rule's third bump): the new entry point `fc_solution_gr_trace(solution, stage, out, cap, written)` on
+  the pattern of `fc_solution_log`, the header-less `fc_gr_trace_bucket` (frozen from v4), the `fc_gr_stage` codes,
+  and the traces' bucket counts and validity at the end of `fc_measurement` — one row of the size table (224 B from v4).
+  `fc-master-layout.mjs` is at v4; the site's copy of it must follow before a page reads the trace.
+- **Verified:** the trace nulls bit for bit against the chain driven by hand and bucketed another way (three lengths,
+  including one shorter than 1000 frames); the ABI's traces are the core's bit for bit — on a plain handle with both
+  stages live (MasterAbiTests) and on the delivered-rate path (`fcore_master selftest`, whose fixture leaves the
+  limiter idle) — and native agrees with wasm through `master-parity.mjs`; the re-render branch, the no-re-render
+  branch, an early exit, the refusals and a failed first render each carry the trace their render left; an impulse's
+  GR sits in its own bucket and ends where the limiter's hold plus release puts it. Built and run with MSVC as well.
+  Mutation stand: 22 mutants, 18 killed; the four survivors are equivalent on every reachable input (the two stages'
+  bucket counts and validity are equal by construction, the one reachable `RenderFailed` refuses before any tap, and a
+  defensive branch for a stream that goes backwards).
+
+### `analysis` · `mastering` · `tools` — one true-peak instrument aims and certifies a delivered ceiling
+
+`TargetLoudnessSolver` promised a delivered file `<= maxTruePeakDbTp`, judged every render with
+`analysis::TruePeakMeter`, and the file was certified by `fcore_measure`'s reference filter — two different
+instruments. On bright material, and at the high delivery rates where the short filter stops interpolating, the
+first read under the second by more than the solver's whole 0.05 dB aim, so a render the solver called feasible
+was delivered over its promise. Fourteen real programmes delivered at six rates, outside the tree: 12 of 84
+deliveries certified above -1 dBTP before, 0 after.
+
+- **`analysis::ReferenceTruePeakMeter`** (new). The reference true peak as a module class: `PolyphaseOversampler`
+  at 4x / 32 taps per phase at every rate, the maximum of |x| over the 4x stream floored at the sample peak, and
+  `drain()` for the FIR's tail. Law 11 in the house order; a channel that stops is DRAINED at that moment rather than
+  dropped — its pending peak was submitted and belongs to the reading, and it returns from silence — so a zero-width
+  call is a pause that drains every channel. `prepare()` refuses a non-positive block as well as a bad rate or width;
+  `storageFor (rate, maxBlock, channels)` equals what it allocates; nothing is allocated in `process()`/`drain()`.
+  `analysis` now links `oversampling` (which depends only on `core`).
+- **`fcore::Probe` measures through it.** `fcore_measure` and the browser's `fc_probe` report the same numbers,
+  byte for byte (`--precise`, 40 runs over a real corpus against the previous binary). One sequence behaves
+  differently, and neither shipped caller makes it: a channel left out of a narrower call and then given audio again
+  no longer replays its pre-gap history. A narrowing stream that simply ends reads what it read before, to the bit.
+- **The solver reads every render with the reference.** The ceiling is aimed, feasibility judged and
+  `measured.truePeakDbTp` reported on the certificate's arithmetic: the reported number is now the certificate of
+  the delivered samples, bit for bit (above the dB floors — silence is still spelled -200 dB, from the same float
+  threshold as before).
+  - **Behaviour:** a render that only the old meter called feasible now costs one more pass (10 extra passes over
+    the 84 real deliveries), and the loudness it reaches is unchanged (worst move 0.0004 LU); a pass costs 10-15 %
+    more (the reference filter on the whole programme, 60 s stereo, 44.1 -> 192 kHz).
+  - **Budgets:** `solveBytes()` — and so `FC_NEED_SOLVE` — is the loudness meter plus 21 008 B for a stereo
+    reference meter at any rate, where it was the loudness meter plus 392-296-248 B of `TruePeakMeter` plus a
+    512 B drain buffer. `TargetLoudnessSolver::kDrainFrames` is gone: nothing is drained from a buffer any more.
+- **`felitronics_truepeak_instrument_gap_tests`** (new) owns the number "how far apart the two meters read": five
+  materials (music, drums, bright noise, a 16 kHz burst at its worst phase, a click at its worst offset) delivered
+  at 44.1-192 kHz through the chain and pinned per cell. The worst is the drums at 44.1 kHz, where the cheap meter
+  reads 0.2995 dB under the reference and 0.3267 dB under the band-limited truth (read at a continuous time, not on
+  a zero-padding grid); the burst rows are the grid's closed form at 96 and 192 kHz, and at 176.4 kHz and above the
+  cheap meter is shown to be a sample-peak meter. The reference is not the truth either, and that is pinned too:
+  0.0272 dB under it on the drums, 0.3270 dB under it on a click flat to 0.45 fs at 48 kHz.
+- **The promise names its instrument.** `LoudnessRequest`'s documentation now says what "-1 dBTP" means: the
+  ceiling as `analysis::ReferenceTruePeakMeter` (and so `fcore_measure`) reads it. Like any BS.1770-class meter the
+  reference under-reads the band-limited peak — up to 0.33 dB on a full-band click, pinned in the gap suite — so a
+  third-party meter may read a delivered file above the promise. Kept on purpose: changing the certifying instrument
+  would move every certificate already issued.
+- **`felitronics_delivered_ceiling_tests`** (new): every source rate to every delivery rate of the six solves,
+  certifies at or under the promise, and reports the certificate exactly.
+
+### `mastering` — `LoudnessSolver.h` and `DeliveredMastering.h` enter the strict header gate
+
+Both headers were outside `felitronics_header_hygiene`: the solver did not compile under the downstream flag set,
+and `DeliveredMastering.h` includes it, so every mastering header built on top would have stayed out too. gcc 14.2
+reported seven diagnostics, all in `LoudnessSolver.h`; `DeliveredMastering.h` added none of its own.
+
+- **Six `-Wfloat-equal`** — the "no limit" sentinels (`GainReductionLimit::off()`, the `minPlrDb = -inf` and
+  `maxLraLossLu = +inf` tests in `worstExcess()` and `violatedMask()`) and the infeasible tie-break on equal excess
+  — now go through `core::exactlyEqual`, like the rest of core. `!=` became `! exactlyEqual`, which is the same
+  predicate for every IEEE value, NaN included.
+- **One `-Wconversion`, `uint64_t -> int` for `MasterMeasurement::nonFiniteSubHops`** — explicit cast, not a
+  defect. The meter in `measure()` is a local, zeroed by its own prepare, fed exactly one `process()` of `frames`
+  samples, and its counter moves by at most one per sub-hop of at least one sample, so it cannot exceed `frames`,
+  an `int`. The comment at the cast says so, and names what would break it.
+- **Every public header is now in the gate BY NAME.** `BlendKernels.h`, `BlendParams.h`, `IrBlend.h`,
+  `MatrixConvolverNupc.h` and `StateGrid.h` were reached only through other headers' includes, so dropping one
+  intermediate `#include` would have taken them out of the gate silently. None warned when named.
+- **Proof.** The gate builds warning-free on gcc 14.2 (Debian), Apple clang and emscripten 6.0.9; the full suite
+  passes. Behaviour is unchanged by construction: a probe that renders, solves and measures LRA (plain, constrained,
+  infeasible, delivered 44.1 -> 48 kHz) prints byte-identical results against `main`, and its `.text` section
+  compiled against `main` and against this branch (gcc 14.2 `-O3`) is byte-identical.
+
+### `mastering` · `tools` — one rule for the planes a whole-programme operation reads and writes; `fc_solution_log` refuses a `written` inside its records
+
+- **One rule, `mastering::planesUsable` (new `Planes.h`).** Tables and planes non-null; no input plane's bytes
+  touching any output plane's, every pair, half-open, EACH SIDE AT ITS OWN LENGTH (`inFrames` for the input,
+  `outFrames` for the output — a conversion's two differ, and judging both at one of them misses an overlap that lies
+  only in the longer span or refuses planes that never meet); and no two output planes touching. The loudness search
+  asks it with one length for both sides, `DeliveryConverter::convert` and `DeliveredMastering` with a conversion's
+  two. Still legal: one buffer feeding two input channels, planes edge to edge in one allocation, a call shorter than
+  its buffers, buffers reused across calls — each pinned bit for bit against buffers of their own.
+- **The loudness search refused only `in[c] == out[c]`.** `out[0] = in[1]` was accepted: the render wrote channel 0's
+  master where the next pass reads channel 1, and the call returned an ordinary verdict at a plausible gain over a
+  master that is not the programme's — in the suite's witness the aliased call answered `TargetUnreachable` where the
+  honest solve is `Solved`, at 12.2532 dB against 12.3175, reporting −10.072 LUFS against −12.093, with a delivered
+  master different in every one of 144 000 frames. `out[0] = out[1]` was accepted too: `Solved` at 12.3041 dB against
+  12.3175, with only the second channel's render left in the buffer where two channels were asked for. Both are
+  `InvalidRequest` now, before a render. A search that happens to end after ONE render over cross-aliased buffers was correct, and is refused too:
+  whether it is correct would depend on how many passes it took, the reason `in == out` was already refused. The
+  direct C++ call now refuses what the facade refuses on the same memory (`MasterAbiTests`). **Also:** a single null
+  plane beside good ones used to reach the renderer and crash; it is `InvalidRequest` now, from the same rule.
+- **`DeliveryConverter::convert` checked its planes for null only.** It writes `out` at the delivery stride while still
+  reading `in` at the source one, so an output plane over an input plane overwrote programme not yet read: at
+  44.1 → 48 kHz `out[0] = in[1]` returned true with channel 1 wrong in 25 990 of 52 245 frames of the suite's
+  witness; at 48 → 44.1 kHz it came out right only because there the writes lag the reads. Refused now, in both
+  directions, before a sample is written — so is an overlap that exists only in the longer of the two spans, and two
+  output planes on one buffer. **A behaviour change for a direct caller:** an identity conversion (equal rates) with
+  `in[c] == out[c]` copied the bits correctly in place and is refused too — whether an overlap is safe would otherwise
+  depend on the ratio; `DeliveredMastering` and the C ABI already refused it, and nothing in the tree calls it so.
+- **`DeliveredMastering::render` of an empty programme skipped the plane rule** and then read the output table:
+  `render (…, nullptr, 0, nullptr, 0)` was a SIGSEGV on a call whose programme is legal. The rule now applies at
+  every length; at two zero lengths it judges only null, so an empty programme in real tables still renders, and
+  one with null tables — or with null planes in them, which used to be accepted — is refused.
+- **The non-finite input count is THE LAST CALL'S THAT REACHED THE COUNT** — stated in the same words for
+  `DeliveryConverter::nonFiniteInputSamples`, `DeliveredMastering::nonFiniteInputSamples` and
+  `fc_master_stats::nonFiniteIn`, and pinned by tests at all three. A call refused before its count (by the facade or
+  the core) leaves the previous number, the rule `fc_solution_log` keeps for `written`; one refused after it keeps its
+  own (at equal rates a range measurement refuses a poisoned programme having counted it). To make the words exact:
+  the converter publishes its count once every input sample is read, and a conversion that does not complete no
+  longer leaves a partial count behind. Not a version.
+- **`fc_solution_log`: `written` may not point into the `cap` records** (FC_ERR_SPAN), and is cleared only once
+  every check is behind the call — the order `fc_master_flush` takes. It used to be cleared on entry, so a
+  `written` inside the buffer took the count over a copied record on FC_OK and a zero into the buffer on a
+  refusal. **A behaviour change for a caller that read `written` after a refused call:** a refusal on `out` (null,
+  alignment, span) now leaves it as it was instead of zeroing it; `cap == 0` is FC_OK with a zero, as before. The
+  refused span is the whole capacity, not the records a given log fills. Not a version: this change does not move
+  `FC_MASTER_ABI_VERSION` (VERSIONING rule 1 — no struct grew and no entry point was added).
+- Comments that said what the code does not: `renderTapped` claimed the chain's drain produces no gain reduction
+  (it carries the release, and an expanding or upward mode acts on its silence; the windows exclude it, which is
+  why the numbers were right); `fc_master.cpp` claimed a field retyped or inserted mid-struct is a build error (only
+  where the change moves an offset or a size the pins read: an `int32_t` dropped into padding, `int32_t` to
+  `uint32_t`, or a `double` narrowed to `float` before another `double` all build outside v4's type-pinned fields,
+  and layout-check compares offsets, not types). And `fc_master_abi.h` said a count out-parameter is cleared FIRST,
+  which no entry point with one does any more — including the sentence under `fc_solution_gr_trace` that contrasted
+  it with `fc_solution_log`.
+
+### `convolution` — the IR resampler stops inventing a cabinet's top octave; a one-tap IR and a nearly-equal rate load
+
+`convolution::resampleIr` treated what lies past either end of an impulse response as the weighted mean of the
+samples it had, not as silence: a tap outside the input was skipped before its weight was added, so every edge
+sample was divided by only the part of its window that landed on the input. A cabinet IR starts at its onset, and
+`CabConvolver` resamples a cabinet whose file is at another rate than the host — the ordinary case — so a 48 kHz
+cabinet in a 44.1 kHz session played a broadband floor over its own top octave. Twenty-one factory cabinets,
+measured outside the tree, worst 1/6-octave band against each cabinet's own response: at 44.1 kHz +7.2 dB at 16 kHz
+and +25.1 dB at 18 kHz, now +0.08 and -0.45 dB; at 96 kHz +18.5 dB at 18 kHz, now -0.12 dB.
+
+- **Zeros outside the input.** Every output sample divides by the weight of its whole window; a tap past either end
+  adds weight, not signal. Resampling `[zeros, x, zeros]` now equals resampling `x` shifted by whole samples. What
+  zeros cannot give back is the kernel's pre-ringing that would fall before output sample 0 — an IR that starts at
+  sample 0 keeps it only by adding delay. It is a cut of at most 0.45 dB at 18 kHz on the factory set and grows with
+  how abruptly an IR starts: the test's cabinet-like fixture reads +1.23 dB at 20 kHz at 96 kHz.
+- **At least one sample.** The length is `inLen * ratio` rounded but never zero, as JUCE's `resampleImpulseResponse`
+  had it. A one-tap IR at 96 -> 44.1 kHz rounded to nothing, and `CabConvolver` then published nothing without a
+  word: the previous cabinet kept playing. The result is empty now only for no input (a null pointer or a
+  non-positive length), a rate that is not a positive finite number, a length past `INT_MAX` — refused before the
+  cast, where 2^32 + 1 used to wrap to ONE sample — or a ratio so small that output sample 0's position is past
+  `INT_MAX` (the one-sample floor is what made that `(int) floor(t)` reachable; it is refused rather than
+  undefined).
+- **`CabConvolver::kRateMatchTolerance`** (new, relative `1e-6`, the same as orbit-amp's `sameRate`). Two rates this
+  close are one rate and the IR loads verbatim; the exact comparison sent a host reporting 48000.0000001 through the
+  resampler, which band-limits at 0.95 of Nyquist and moves every tap. Measured outside the tree on two factory
+  cabinets, against a 2048-tap resample: played verbatim 1 ppm off its rate, one reads -87.5 dB over its first 100
+  ms and the other -72 dB over its first second, where running the 64-tap resampler costs -73 and -81 dB; at 10 ppm
+  verbatim is the worse of the two.
+- **A load that stages nothing is ignored whole.** `buildAndStage` overwrote the retained taps before it knew the
+  load was empty, and returned after. With a load still pending from mid-crossfade, the retry then used the old
+  length on an emptied or narrowed store: a read past the end of a vector (a zero-length load, or a mono load over a
+  pending stereo one — ASan container-overflow, libc++ hardening abort), or, with a null data pointer, a retry
+  refused forever, `isBusy()` stuck true and neither the pending IR nor the new one ever reaching the convolver. The
+  taps, their gain and the pending geometry are now staged in locals and committed together; a zero or negative
+  length, a null channel array or plane, or a known rate so far off that `resampleIr` cannot address the result (its
+  length or its last position past `INT_MAX`) leaves the playing IR, `stagedTaps()`, the normalization gain and any
+  pending retry exactly as they were.
+  - **Behaviour:** after such a load `stagedTaps()` still holds the taps of the last load that staged any (it used
+    to be emptied) — what the convolver plays once a pending retry has published. A null plane with a positive
+    length is ignored instead of dereferenced.
+- **An unknown IR rate loads the taps as is — one rule.** A rate that is not a positive finite number (NaN, zero,
+  negative, ±inf) is unknown: the samples in the file are fine, only the metadata is broken, and refusing would drop
+  the cabinet and play silence where as-is at worst plays an impulse of the wrong length. NaN, zero and negative
+  already loaded as is on `main`; +inf went to the resampler, came back empty and the load was dropped without a
+  word.
+- **Tests.** `felitronics_convolution_resampler_tests`: shift invariance at both edges over ten rate and radius
+  cases and five inputs (in front to 1e-6, behind to the bit — on `main` 1437 and 1053 misses, 3.25e-2 worst on the
+  cabinet fixture), the edge taps against an independent long-double recomputation of the specification, a
+  hand-worked 105/104, a cabinet-like IR's bands against its own response and against the untruncated resample, the
+  rounding and the one-sample floor at seven short IRs, and the refusals (zero, negative and non-finite rates among
+  them). `felitronics_convolution_cabconvolver_tests`: the tolerance witness on literal rates, so the one part per
+  million is pinned from both sides (verbatim to the bit at 48000.0000001, at 0.9 ppm and at 0.5 ppm of 192 kHz,
+  both ways; resampled at 1.1 ppm, both ways, every tap moved), an unknown rate (NaN, zero, negative, ±inf;
+  normalized and not) loading as is and playing, a one-tap IR off-rate staging, publishing and playing at four rate
+  pairs, and nine loads that stage nothing over a pending one — taps, gain and what plays, normalized and not — plus
+  a one-tap load that wins as the latest.
+
+### `tools` — release notes move to `changelog.d/`, one file per task
+
+Every branch that changes behaviour now writes its note as a NEW FILE under `changelog.d/` instead of appending to
+`## Unreleased`. Git cannot conflict on two branches adding two different files; it conflicted on that one section
+five times in a single day, and each time cost a full rebase-build-push-wait round on work that was already green.
+
+`node tools/changelog-collect.mjs --release vX.Y.Z` folds the fragments into `CHANGELOG.md` under the new heading and
+deletes them — one commit on the release branch, where there is nobody to conflict with. `--preview` prints what the
+next release would say, which is how the accumulated notes stay readable now that they live apart.
 
 ## v0.31.0 — 2026-09-12
 
