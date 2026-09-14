@@ -123,44 +123,59 @@ double bandPowerDb (const std::vector<float>& ir, double fs, double lo, double h
     return 10.0 * std::log10 (power / (double) points);
 }
 
-// resampleIr recomputed from its SPECIFICATION at one output index, sharing no code with the header: long
-// double; the position written as (n + 1/2)*inSr/outSr - 1/2 instead of divided by a ratio; its own Bessel
-// series; sinc written as 2fc*sin(u)/u; and an explicit zero for every tap outside the input, with the window
-// sum over all 2R of them. A change to the grid, the kernel or the edge rule in the header disagrees with it.
+// resampleIr recomputed from its SPECIFICATION at one output index, sharing no code with the header: the
+// position written as (n + 1/2)*inSr/outSr - 1/2 instead of divided by a ratio; its own Bessel series; sinc
+// written as 2fc*sin(u)/u; an explicit zero for every tap outside the input, with the window sum over all 2R
+// of them; and both sums COMPENSATED (Neumaier), so the oracle's own rounding sits far under the 1e-6 it is
+// held to. In double, not a wider type — law 9: `long double` is 53 bits on the dev machine, 64 on x86-64
+// Linux and software binary128 on wasm32, so it would have bought nothing here and a libcall there. A change
+// to the grid, the kernel or the edge rule in the header disagrees with it.
+struct CompensatedSum
+{
+    double sum = 0.0, compensation = 0.0;
+    void add (double v) noexcept
+    {
+        const double next = sum + v;
+        compensation += std::fabs (sum) >= std::fabs (v) ? (sum - next) + v : (v - next) + sum;
+        sum = next;
+    }
+    double value() const noexcept { return sum + compensation; }
+};
+
 double referenceTap (const std::vector<float>& x, double inSr, double outSr, int n,
                      int halfTaps = 32, double beta = 8.0, double cutoffScale = 0.95)
 {
-    constexpr long double pi = 3.141592653589793238462643383279502884L;
-    const auto i0 = [] (long double v)
+    const auto i0 = [] (double v)
     {
-        long double sum = 1.0L, term = 1.0L;
-        const long double y = v * v / 4.0L;
+        const double y = v * v / 4.0;
+        CompensatedSum series;
+        series.add (1.0);
+        double term = 1.0;
         for (int k = 1; k < 400; ++k)
         {
-            term *= y / ((long double) k * (long double) k);
-            sum += term;
-            if (term < 1.0e-22L * sum) break;
+            term *= y / ((double) k * (double) k);
+            series.add (term);
+            if (term < 1.0e-18 * series.value()) break;
         }
-        return sum;
+        return series.value();
     };
-    const long double t  = ((long double) n + 0.5L) * (long double) inSr / (long double) outSr - 0.5L;
-    const long double fc = 0.5L * std::min (1.0L, (long double) outSr / (long double) inSr) * (long double) cutoffScale;
-    const long double c  = std::floor (t);
-    long double num = 0.0L, den = 0.0L;
+    const double t  = ((double) n + 0.5) * inSr / outSr - 0.5;
+    const double fc = 0.5 * std::min (1.0, outSr / inSr) * cutoffScale;
+    const double c  = std::floor (t);
+    CompensatedSum num, den;
     for (int j = 1 - halfTaps; j <= halfTaps; ++j)
     {
-        const long double k  = c + (long double) j;
-        const long double u  = t - k;
-        const long double arg = 2.0L * pi * fc * u;
-        const long double sinc = std::fabs (u) < 1.0e-12L ? 2.0L * fc : 2.0L * fc * std::sin (arg) / arg;
-        const long double r  = u / (long double) halfTaps;
-        const long double w  = (r <= -1.0L || r >= 1.0L) ? 0.0L
-                             : sinc * i0 ((long double) beta * std::sqrt (1.0L - r * r)) / i0 ((long double) beta);
-        den += w;
-        const bool inside = k >= 0.0L && k < (long double) x.size();
-        num += (inside ? (long double) x[(std::size_t) k] : 0.0L) * w;
+        const double k    = c + (double) j;
+        const double u    = t - k;
+        const double arg  = 2.0 * core::kPi * fc * u;
+        const double sinc = std::fabs (u) < 1.0e-12 ? 2.0 * fc : 2.0 * fc * std::sin (arg) / arg;
+        const double r    = u / (double) halfTaps;
+        const double w    = (r <= -1.0 || r >= 1.0) ? 0.0 : sinc * i0 (beta * std::sqrt (1.0 - r * r)) / i0 (beta);
+        den.add (w);
+        const bool inside = k >= 0.0 && k < (double) x.size();
+        num.add ((inside ? (double) x[(std::size_t) k] : 0.0) * w);
     }
-    return (double) (num / den);
+    return num.value() / den.value();
 }
 } // namespace
 
@@ -294,6 +309,7 @@ int main()
         const std::vector<float> inputs[] { cabinetLikeIr (1024), noiseIr (300, 5) };
         constexpr double pairs[][2] { { 48000.0, 44100.0 }, { 48000.0, 96000.0 }, { 96000.0, 44100.0 }, { 44100.0, 48000.0 } };
         int misses = 0, checked = 0;
+        double worst = 0.0;                                                // |difference| / (|ref| + 1e-3), for the record
         for (const auto& x : inputs)
             for (const auto& pr : pairs)
             {
@@ -303,11 +319,13 @@ int main()
                 {
                     if (n >= edge && n < (int) out.size() - edge) continue;
                     const double ref = referenceTap (x, pr[0], pr[1], n);
-                    if (! (std::fabs ((double) out[(std::size_t) n] - ref) <= 1.0e-6 * std::fabs (ref) + 1.0e-9)) ++misses;
+                    const double d = std::fabs ((double) out[(std::size_t) n] - ref);
+                    if (! (d <= 1.0e-6 * std::fabs (ref) + 1.0e-9)) ++misses;
+                    if (std::isfinite (d)) worst = std::max (worst, d / (std::fabs (ref) + 1.0e-3));
                     ++checked;
                 }
             }
-        std::printf ("    %d edge taps checked, %d misses\n", checked, misses);
+        std::printf ("    %d edge taps checked, %d misses; worst |difference| / (|reference| + 1e-3) = %.2e\n", checked, misses, worst);
         test::ok (checked > 0 && misses == 0, "every edge tap matches the independently recomputed specification to 1e-6");
     }
 
