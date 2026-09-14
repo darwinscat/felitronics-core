@@ -11,6 +11,12 @@ set(FCORE_NO_FP_CONTRACT $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>)
 
 add_executable(fcore_measure fcore_measure.cpp)
 target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::analysis_offline felitronics::oversampling)
+target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::oversampling)
+# The OFFLINE analyzer modes (lowend, and the siblings landing beside it) compose over eq::Crossover2 /
+# stereo::MidSide, which felitronics::analysis cannot itself depend on without closing a cycle — see the
+# note on the target in modules/analysis/CMakeLists.txt. Added rather than substituted, so two branches
+# that both need it resolve to one line instead of a conflict.
+target_link_libraries(fcore_measure PRIVATE felitronics::analysis_offline)
 target_compile_features(fcore_measure PRIVATE cxx_std_20)
 target_compile_options(fcore_measure PRIVATE ${FCORE_NO_FP_CONTRACT})
 

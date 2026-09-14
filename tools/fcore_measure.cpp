@@ -35,6 +35,11 @@
 //                 sample coordinates — every float as a raw bit pattern, like `blocks`, so a future wasm
 //                 comparison catches a flipped bit that %.17g would round away. `valid 0` is never "clean":
 //                 read the reason. [--quiet-db X] [--order N]
+//   lowend      → the vinyl low end (analysis::LowEnd): the integral Mid/Side energies of the LR4 low and high
+//                 bands and of the unfiltered programme, the 10 ms side-fraction histogram, the three extremum
+//                 coordinates, and the semitone band table with the dominant note — all as raw IEEE-754 bit
+//                 patterns, so `diff` between two toolchains IS the parity test. NOT `correlation`, which is a
+//                 whole-file phase number with no band split.
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
@@ -55,6 +60,7 @@
 
 #include <felitronics/analysis/ProgrammeReport.h>
 #include <felitronics/analysis/HumDetector.h>
+#include <felitronics/analysis/LowEnd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -193,7 +199,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -443,6 +449,77 @@ int main (int argc, char** argv)
         R.visitValues ([] (const char* name, int ch, const analysis::ProgrammeValue& v)
                        { std::printf ("V %s %d %d %d %016llx\n", name, ch, v.valid ? 1 : 0,
                                       (int) v.reason, (unsigned long long) bits (v.value)); });
+    if (mode == "lowend")
+    {
+        // The vinyl low end. Streamed in kChunk steps, which is also the point: the report is bit-identical
+        // under ANY slicing (law 8a), so the chunk size is not part of the measurement.
+        analysis::LowEndParams lp;
+        analysis::LowEnd le;
+        le.setParams (lp);
+        if (! le.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "LowEnd refused this geometry (rate, channels or note range)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool okAll = true;
+        streamPlanar (f, nc, [&] (const float* const* pp, int n) { okAll = le.process (pp, nc, n) && okAll; });
+        std::fclose (f);
+        if (! okAll || ! le.finish()) { std::fprintf (stderr, "LowEnd refused a chunk\n"); return 2; }
+
+        // Raw bit patterns, not %g: the other side of this comparison is JavaScript, whose decimal
+        // formatting is not C's, so a 16-hex-digit pattern is the one representation both sides produce
+        // identically. A decimal header would break a whole-file diff while every measured bit matched.
+        std::printf ("# fcore lowend v1 sr=%016llx ch=%d xover=%016llx order=%d hop=%lld block=%lld bands=%d chunk=%d\n",
+                     (unsigned long long) bits (fs), nc, (unsigned long long) bits (le.crossoverHz()),
+                     lp.fftOrder, (long long) le.hopSamples(), (long long) le.blockSamples(), le.bandCount(), kChunk);
+        std::printf ("reason %d %d\n", (int) le.widthReason(), (int) le.noteReason());
+        std::printf ("samples %lld finite %lld holes %lld nonfinite %lld absent %lld overflow %lld\n",
+                     (long long) le.samplesProcessed(), (long long) le.finiteSamples(), (long long) le.holeSamples(),
+                     (long long) le.nonFiniteSamples(), (long long) le.absentSamples(),
+                     (long long) le.filterNonFiniteSamples());
+        const double energies[7] = { le.lowMidEnergy(), le.lowSideEnergy(), le.highMidEnergy(), le.highSideEnergy(),
+                                     le.rawMidEnergy(), le.rawSideEnergy(), le.lowSideFraction() };
+        static const char* const enames[7] = { "lowmid", "lowside", "highmid", "highside", "rawmid", "rawside", "lowfrac" };
+        for (int i = 0; i < 7; ++i)
+            std::printf ("%s %016llx\n", enames[i], (unsigned long long) bits (energies[i]));
+        std::printf ("highfrac %016llx rawfrac %016llx\n",
+                     (unsigned long long) bits (le.highSideFraction()), (unsigned long long) bits (le.rawSideFraction()));
+        std::printf ("blocks %lld stored %lld complete %d histsamples %lld\n",
+                     (long long) le.blockCount(), (long long) le.storedBlockCount(), le.blocksComplete() ? 1 : 0,
+                     (long long) le.histogramSamples());
+        for (int i = 0; i < analysis::LowEnd::kHistogramBins; ++i)
+            std::printf ("h%02d %lld\n", i, (long long) le.histogram (i));
+        std::printf ("worst %lld %016llx %016llx\n", (long long) le.worstFractionBlock(),
+                     (unsigned long long) bits (le.worstFraction()), (unsigned long long) bits (le.worstFractionEnergy()));
+        std::printf ("peakenergy %lld %016llx %016llx\n", (long long) le.peakEnergyBlock(),
+                     (unsigned long long) bits (le.peakBlockEnergy()), (unsigned long long) bits (le.peakEnergyBlockFraction()));
+        std::printf ("peakside %lld %016llx amp %016llx at %lld\n", (long long) le.peakSideEnergyBlock(),
+                     (unsigned long long) bits (le.peakBlockSideEnergy()),
+                     (unsigned long long) bits (le.peakLowSideAmplitude()), (long long) le.peakLowSideAmplitudeAt());
+        std::printf ("frames used %lld holed %lld tail %lld window %lld underresolved %d\n",
+                     (long long) le.usedFrames(), (long long) le.holedFrames(), (long long) le.tailUncoveredSamples(),
+                     (long long) le.windowSamples(), le.underResolvedBands());
+        std::printf ("band midi centreHz midEnergy sideEnergy centroidHz\n");
+        for (int b = 0; b < le.bandCount(); ++b)
+        {
+            const analysis::LowEndBand r = le.band (b);
+            std::printf ("b %d %d %016llx %016llx %016llx %016llx\n", b, r.midi,
+                         (unsigned long long) bits (r.centreHz), (unsigned long long) bits (r.midEnergy),
+                         (unsigned long long) bits (r.sideEnergy), (unsigned long long) bits (r.centroidHz));
+        }
+        std::printf ("peak %d %d density %d second %d\n", le.peakBand(), le.peakMidi(),
+                     le.peakDensityBand(), le.secondBand());
+        std::printf ("note %s%d nominal %016llx centroid %016llx cents %016llx sidefrac %016llx\n",
+                     analysis::LowEnd::pitchClassName (le.peakMidi()), analysis::LowEnd::noteOctave (le.peakMidi()),
+                     (unsigned long long) bits (le.peakNoteHz()), (unsigned long long) bits (le.peakCentroidHz()),
+                     (unsigned long long) bits (le.peakCentsOffset()), (unsigned long long) bits (le.peakBandSideFraction()));
+        // the dominance ratio is NOT printed as one number: its denominator is exactly zero for a tone in
+        // digital silence. The three numbers it is made of are printed instead.
+        std::printf ("background %016llx peakenergy %016llx peakwidth %016llx share %016llx total %016llx\n",
+                     (unsigned long long) bits (le.backgroundDensity()), (unsigned long long) bits (le.peakBandEnergy()),
+                     (unsigned long long) bits (le.peakBandWidthHz()), (unsigned long long) bits (le.peakShare()),
+                     (unsigned long long) bits (le.totalBandEnergy()));
         return 0;
     }
 
