@@ -19,6 +19,7 @@
 // true peak is routed through log10. The surface is fc_probe_block_energies() (pre-gate, continuous) plus
 // fc_probe_tp_linear(). See tools/fcore_probe.h for why.
 
+#include "fcore_clips.h"
 #include "fcore_probe.h"
 
 #include <cstdint>
@@ -291,6 +292,128 @@ FC_EXPORT int fc_probe_needle (const float* planar, std::uint32_t frames, std::u
     out3[1] = nd.width;
     out3[2] = nd.rms;
     return 1;
+}
+
+// --- the clipped runs (P71) ---
+//
+// analysis::ClipDetector, through fcore::ClipProbe — the same adapter `fcore_measure clips` drives, so the
+// two roads share a lifecycle and not merely a report reader. See tools/fcore_clips.h for the four traps that
+// class exists to close; the two this file is responsible for are the last of them.
+//
+// ONE RUN, THEN GETTERS, like fc_probe_shapes_run and for the same reason: the capacity of the run list has
+// to be chosen before the first sample (maxRuns takes effect at prepare()), and a setter feeding fc_probe_run
+// would be exactly the state that entry point promises not to carry between calls. A REJECTED RUN CLEARS THE
+// PREVIOUS RESULT — `haveClips` is cleared before any validation, the `haveResult` / `haveShapes` discipline
+// of this file — so the getters answer zero rather than the last good file's runs.
+//
+// EVERY HEADER FIELD IS READ BACK FROM THE MEASUREMENT, NOT RECOMPUTED BY THE CALLER. fc_probe_clips_samples
+// and _channels and _rate look redundant next to the arguments the caller just passed in; they are the
+// opposite. If this shim ever fed the detector half the buffer, or the wrong width, a report whose header
+// came from the harness's own arithmetic would still diff clean against the native tool — the numbers would
+// agree because neither side asked the instrument. _delay has a second reason: it keeps JavaScript from
+// re-deriving floor(sr*20/1000), which would be a second copy of a definition that already exists in C++.
+//
+// THE CAPACITY BOUND IS NOT OPTIONAL HERE. ClipDetector::kMaxRunsLimit (1<<24) would allocate 665 MB at
+// 16 channels, and this module is built -fno-exceptions, where a failed allocation aborts the page instead of
+// refusing. fcore::ClipProbe::kMaxRuns (1<<20) is the bound both roads apply.
+namespace
+{
+    fcore::ClipProbe& clips()
+    {
+        static fcore::ClipProbe c;
+        return c;
+    }
+    bool haveClips = false;
+
+    // start, length, level, channel, sign, evidence — the fields of analysis::ClipRun, in the order the text
+    // format prints them. Doubles throughout: `start` and `length` are int64 in the core, but planarSpan()
+    // caps frames*channels*4 at 4 GiB, so a position in this ABI is below 2^30 and exact in a binary64 — while
+    // an i64 return would need -sWASM_BIGINT (which this module does not build with) and would not match the
+    // export whitelist's grep in tools/wasm/build.sh.
+    constexpr std::uint32_t kClipRunStride = 6;
+}
+
+// Measures one planar buffer end to end — prepare, the whole file, finish — and leaves the result readable by
+// the getters below. Returns 1, or 0 with every getter of this result cleared (fc_probe_clips_stride excepted:
+// it is a property of the FORMAT, not of a measurement, and answers 6 always). `maxRuns` is the run list's
+// capacity: 0 is legal and means "count them, store none" — and note that a file with no runs is then still
+// COMPLETE, because completeness is `count <= capacity`.
+//
+// The capacity bound is not re-checked here. ClipProbe::prepare() applies it, `maxRuns` widens from uint32 to
+// int64 without loss on the way in, and one rule in one place is the whole reason that constant lives in the
+// shared header — the CLI and this entry point must refuse the same set or the parity diff reports a
+// measurement failure for a disagreement about a command line.
+FC_EXPORT int fc_probe_clips_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                  double sampleRate, std::uint32_t maxRuns)
+{
+    haveClips = false;
+    if (! planarSpan (planar, frames, channels)) return 0;
+    auto& c = clips();
+    if (! c.prepare (sampleRate, (int) channels, (std::int64_t) maxRuns, (std::int64_t) frames)) return 0;
+    const float* view[felitronics::core::kMaxChannels] {};
+    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    if (! c.process (view, (int) channels, (long long) frames) || ! c.finish()) return 0;
+    haveClips = true;
+    return 1;
+}
+
+FC_EXPORT double        fc_probe_clips_rate     (void) { return haveClips ? clips().sampleRate() : 0.0; }
+FC_EXPORT std::uint32_t fc_probe_clips_channels (void) { return haveClips ? (std::uint32_t) clips().channels() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_clips_samples  (void) { return haveClips ? (std::uint32_t) clips().frames() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_clips_max_runs (void) { return haveClips ? (std::uint32_t) clips().maxRuns() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_clips_delay    (void) { return haveClips ? (std::uint32_t) clips().decisionDelay() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_clips_count    (void) { return haveClips ? (std::uint32_t) clips().runCount() : 0u; }
+FC_EXPORT std::uint32_t fc_probe_clips_stored   (void) { return haveClips ? (std::uint32_t) clips().storedRunCount() : 0u; }
+FC_EXPORT int           fc_probe_clips_complete (void) { return haveClips && clips().complete() ? 1 : 0; }
+FC_EXPORT std::uint32_t fc_probe_clips_stride   (void) { return kClipRunStride; }
+
+// The per-channel sample peak, min(channels, cap) of them, read through HEAPF64.
+FC_EXPORT std::uint32_t fc_probe_clips_peaks (double* out, std::uint32_t cap)
+{
+    if (! haveClips) return 0;
+    const auto& c = clips();
+    return copyOut (out, cap, (std::uint32_t) c.channels(), [&] (std::uint32_t i) { return c.peak ((int) i); });
+}
+
+// The runs, as many whole ones as fit, kClipRunStride doubles each.
+//
+// `cap` IS IN DOUBLES, LIKE EVERY OTHER COPIER IN THIS FILE, AND THE RETURN IS IN RUNS. That asymmetry is
+// deliberate and it is the safe way round. Seven exports here share the shape `(T* out, uint32_t cap)` —
+// fc_probe_block_energies, the two waveform copiers, the three stereo copiers, fc_probe_clips_peaks — and in
+// every one of them `cap` is the number of ELEMENTS the buffer holds. A caller who reads this file, follows
+// that convention and writes `p = _malloc(stored * 8); fc_probe_clips_runs(p, stored)` must not be handed a
+// six-fold heap overwrite — and neither outSpan() nor inHeap() could see it, because they bound the linear
+// memory and not the allocation. With `cap` in doubles that caller gets floor(stored/6) runs: too few, which
+// is visible in its own output, instead of memory corruption that is not. (The crew's review round found this
+// as a live hazard in the first shape of this entry point, where `cap` was in runs.)
+//
+// The RETURN is in runs because that is the number a reader needs, and because the two truncations must stay
+// apart: a short buffer is the caller's business, which it can see and fix, while fc_probe_clips_complete()
+// is the DETECTOR's capacity running out, which is a property of the file. A reader that conflated them would
+// call a file incomplete because it passed a small buffer.
+FC_EXPORT std::uint32_t fc_probe_clips_runs (double* out, std::uint32_t cap)
+{
+    if (! haveClips) return 0;
+    const auto& c = clips();
+    const std::uint32_t stored = (std::uint32_t) c.storedRunCount();
+    const std::uint32_t fits = cap / kClipRunStride;               // whole runs only; a partial one is not written
+    const std::uint32_t m = fits < stored ? fits : stored;
+    if (m == 0) return 0;
+    const std::uint32_t n = m * kClipRunStride;                   // m <= kMaxRuns (2^20), so this cannot wrap
+    const std::uint32_t wrote = copyOut (out, n, n, [&] (std::uint32_t i)
+    {
+        const felitronics::analysis::ClipRun r = c.run ((std::int64_t) (i / kClipRunStride));
+        switch (i % kClipRunStride)
+        {
+            case 0:  return (double) r.start;
+            case 1:  return (double) r.length;
+            case 2:  return r.level;
+            case 3:  return (double) r.channel;
+            case 4:  return (double) r.sign;
+            default: return (double) (int) r.evidence;
+        }
+    });
+    return wrote == n ? m : 0u;                                   // a refused span writes nothing and says so
 }
 
 // Build identity, so a mismatched artifact is obvious in a report rather than a mystery.

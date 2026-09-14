@@ -5,9 +5,9 @@
 // reference (ffmpeg), and the NATIVE SIDE of the P0 wasm parity check. Reads interleaved 32-bit-float
 // little-endian PCM (as ffmpeg emits with `-f f32le`).
 //
-// The measurement itself lives in fcore_probe.h, shared verbatim with the wasm shim — read that header for
-// the build contract (-ffp-contract=off here, no -mrelaxed-simd there) and for why the true-peak filter
-// config is part of that contract rather than an implementation detail.
+// The measurement itself lives in fcore_probe.h (and, for `clips`, fcore_clips.h), shared verbatim with the
+// wasm shim — read those headers for the build contract (-ffp-contract=off here, no -mrelaxed-simd there) and
+// for why the true-peak filter config is part of that contract rather than an implementation detail.
 //
 //   lufs        → integrated loudness (LUFS)            ↔ ffmpeg ebur128 "I:"
 //   truepeak    → max true peak (dBTP, 4× oversampled)  ↔ ffmpeg ebur128 "Peak:" (True Peak)
@@ -22,18 +22,26 @@
 //   stereo      → the stereo band (analysis::StereoColumns): per column width / correlation / RMS as float32
 //                 bit patterns, plus the maximum RMS as a double. RMS, not `lufs`. [--columns N]
 //   needle      → correlation / width / RMS over [from, to) as double bit patterns. --from A --to B
+//   clips       → the clipped runs (analysis::ClipDetector): how many were found, whether the list is whole,
+//                 the sample peak of each channel, and every stored run — start, length, level, channel,
+//                 polarity, evidence. Levels and peaks as bit patterns; the format lives in tools/fcore_clips_format.h
+//                 and the wasm module prints it too, so a diff IS the parity test. [--max-runs N] [--chunk N]
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
 // The scalar modes print %.2f by default (tools/validate_ffmpeg.sh compares against ffmpeg's own two
-// decimals); `--precise` switches them to %.17g plus the exact %a form. `blocks`, `waveform`, `stereo` and
-// `needle` are always exact, and the node side (tools/wasm/shapes-parity.mjs) prints the same bytes.
+// decimals); `--precise` switches them to %.17g plus the exact %a form. `blocks`, `waveform`, `stereo`,
+// `needle` and `clips` are always exact, and the node side (tools/wasm/shapes-parity.mjs for the shapes,
+// clips-parity.mjs for the runs) prints the same bytes.
 //
-// DECODE TO FLOAT, NEVER TO s16. This tool reads f32le: `ffmpeg -i x -f f32le out.f32`. The waveform, stereo and needle
-// modes size the file before reading it (every boundary depends on the length), so they need a seekable file, not a pipe. An integer decode
+// DECODE TO FLOAT, NEVER TO s16. This tool reads f32le: `ffmpeg -i x -f f32le out.f32`. The waveform, stereo, needle
+// and clips modes size the file before reading it (the first three because every boundary depends on the length, clips
+// because a short read must be a refusal rather than a clean report of a truncated file), so they need a seekable file,
+// not a pipe. An integer decode
 // (`-f s16le`, as the old sidecar generator did) clamps a lossy file's samples above 0 dBFS and quantises the
 // rest, and the peaks of that are not the peaks of the file.
 
+#include "fcore_clips_format.h"
 #include "fcore_probe.h"
 
 #include <algorithm>
@@ -42,6 +50,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -50,6 +59,14 @@ using namespace felitronics;
 namespace
 {
     constexpr int kChunk = fcore::Probe::kChunk;
+
+    // fcore::ClipProbe spells its own step as a literal rather than deriving it from fcore::Probe: it must not
+    // include fcore_probe.h, which would pull the loudness meter and the oversampler into the wasm module's
+    // clips path for a constant. This is the one translation unit that sees both, so this is where the two are
+    // tied — the `clips` mode's --chunk 8191/8192/8193 rows and the comments in fcore_clips.h about "the
+    // native reader's 8192-frame reads" all go quietly false if they ever drift apart.
+    static_assert (fcore::ClipProbe::kChunk == fcore::Probe::kChunk,
+                   "the clips adapter's step and the file reader's step must be the same number");
 
     // Reads the file in kChunk-frame steps, de-interleaving into planar scratch and handing each step to
     // `sink`. The de-interleave is a pure float permutation — exact, and identical to what the wasm side's
@@ -164,8 +181,9 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle> <sampleRate> <channels> <raw.f32le>\n"
-            "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n",
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips> <sampleRate> <channels> <raw.f32le>\n"
+            "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
+            "          [--max-runs N] [--chunk N]\n",
             argv[0]);
         return 2;
     }
@@ -200,6 +218,104 @@ int main (int argc, char** argv)
         const double corr = sums.correlation();
         if (precise) std::printf ("%.17g  %a\n", corr, corr);
         else         std::printf ("%.3f\n", corr);
+        return 0;
+    }
+
+    if (mode == "clips")
+    {
+        // THE FILE IS SIZED FIRST, AND A SHORT READ IS A REFUSAL. streamPlanar() floors a trailing partial frame,
+        // ignores what the sink answered and never looks at ferror(), so a truncated or unreadable file would
+        // otherwise be measured to its break and reported as a clean whole — an instrument certifying audio it
+        // never saw. fileFrames() refuses a size that is not a whole number of frames, the sink's verdict is kept,
+        // and the frames the probe actually consumed are compared with the frames the file holds.
+        //
+        // AN EMPTY FILE IS REFUSED, as it is in waveform|stereo|needle and in the wasm module's own input guard
+        // (fc_probe.cpp planarSpan, which rejects frames == 0). A zero-length programme has a perfectly good
+        // clip report — no runs, zero peaks — and printing it was the other candidate here; refusing wins
+        // because the most likely way to arrive at a zero-length file is truncation, and an instrument that
+        // answers "clean" to a file that lost its contents is the failure this mode is built to avoid. The
+        // zero-length stream itself is still covered, in felitronics_clips_exposure_tests, where it is a
+        // measurement and not a file.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width) || width < 1
+            || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        // Parsed with the shape modes' strictness and NOT with their parser: an unknown, misspelt or repeated
+        // option is refused rather than ignored or silently resolved, because the node side of the parity check
+        // could not be relied on to resolve it the same way.
+        //
+        // --chunk is the law-8a handle, and it is a real option rather than a test hook: the report must be the
+        // same bytes however the stream is cut into process() calls, and without a way to ask for a different
+        // cut from outside, that claim can only ever be checked from inside a test binary. 0 means "one call per
+        // read block", which is what the tool does by itself; any N >= 1 sub-slices those blocks, so the reachable
+        // calls run from a single sample up to the reader's own 8192-frame step. Calls LARGER than a read block
+        // are reached the only place they can be — felitronics_clips_exposure_tests, which drives fcore::ClipProbe
+        // (the same adapter both roads use) directly.
+        std::uint64_t maxRuns = (std::uint64_t) analysis::ClipDetectorParams {}.maxRuns, chunk = 0;
+        bool seen[2] {};
+        for (int i = 5; i < argc; ++i)
+        {
+            if (std::strcmp (argv[i], "--precise") == 0) continue;
+            const int k = std::strcmp (argv[i], "--max-runs") == 0 ? 0 : std::strcmp (argv[i], "--chunk") == 0 ? 1 : 2;
+            if (k == 2 || seen[k] || i + 1 >= argc || ! parseCount (argv[i + 1], k == 0 ? maxRuns : chunk))
+            {
+                std::fprintf (stderr, "bad, unknown or repeated option\n");
+                std::fclose (f);
+                return 2;
+            }
+            seen[k] = true;
+            ++i;
+        }
+        if (chunk > 0x7FFFFFFFu) { std::fprintf (stderr, "--chunk out of range\n"); std::fclose (f); return 2; }
+
+        fcore::ClipProbe probe;
+        if (maxRuns > (std::uint64_t) fcore::ClipProbe::kMaxRuns
+            || frames > (std::uint64_t) std::numeric_limits<std::int64_t>::max()
+            || ! probe.prepare (rate, nc, (std::int64_t) maxRuns, (std::int64_t) frames))
+        {
+            // The width is already checked twice above, so it cannot be the cause here and is not offered as one.
+            std::fprintf (stderr, "clips.prepare refused (sampleRate %g..%g, --max-runs 0..%lld)\n",
+                          analysis::ClipDetector::kMinSampleRate, analysis::ClipDetector::kMaxSampleRate,
+                          (long long) fcore::ClipProbe::kMaxRuns);
+            std::fclose (f);
+            return 2;
+        }
+        bool ok = true;
+        const long long step = chunk == 0 ? 0 : (long long) chunk;
+        streamPlanar (f, nc, [&] (const float* const* p, int n)
+        {
+            if (step == 0) { ok = ok && probe.process (p, nc, n); return; }
+            const float* view[core::kMaxChannels] {};
+            for (long long off = 0; off < n && ok; off += step)
+            {
+                const long long m = std::min<long long> (step, (long long) n - off);
+                for (int c = 0; c < nc; ++c) view[(std::size_t) c] = p[c] + off;
+                ok = ok && probe.process (view, nc, m);
+            }
+        });
+        std::fclose (f);
+        // probe.finish() is the check now: it refuses unless the frames the file was sized for, the frames the
+        // reader handed over and the samples the detector consumed are all the same number.
+        fcore::ClipsReport rep;
+        if (! ok || ! probe.finish() || ! readClips (probe, rep))
+        {
+            std::fprintf (stderr, "the file did not deliver the %llu frames it was sized for\n",
+                          (unsigned long long) frames);
+            return 2;
+        }
+        const std::string text = fcore::formatClips (rep);
+        std::fwrite (text.data(), 1, text.size(), stdout);
         return 0;
     }
 
