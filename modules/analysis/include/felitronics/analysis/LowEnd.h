@@ -155,7 +155,8 @@ enum class LowEndReason : std::uint8_t
     NoFiniteSamples,        // not one sample of the L/R pair was usable
     NoEnergy,              // every relevant energy is exactly zero — digital silence, the 0/0
     ShorterThanWindow,      // no spectral frame ever closed: the programme is shorter than the window
-    NoUsableFrames          // frames closed, but every one of them held a hole
+    NoUsableFrames,         // frames closed, but every one of them held a hole
+    Overflowed              // an accumulated band quantity left the finite range (see reduceBands)
 };
 
 // One 10 ms block of the LOW band. Raw energies; the fraction is derived so nothing is lost to it.
@@ -246,6 +247,12 @@ public:
     static constexpr double kMaxSampleRate = 768000.0;
     static constexpr int    kMaxBlocksLimit = 1 << 24;
     static constexpr int    kLobeBins      = 4;      // a Hann main lobe, in bins
+    static constexpr double kMinCrossoverHz = 1.0;   // eq::Svf clamps a cutoff below 1 Hz (Svf.h:61), so
+                                                     // accepting less would make crossoverHz() report a
+                                                     // filter that is not the one running
+    static constexpr double kMinNoteHz      = 1.0;   // below this the band-edge FREQUENCIES underflow the
+                                                     // first moment to zero while the energies stay
+                                                     // positive, and a centroid then leaves its own band
 
     //==============================================================================
     // WHAT prepare() ASKS THE HEAP FOR (law 11d), from the function prepare() sizes AND validates itself
@@ -287,9 +294,9 @@ public:
         if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return s;
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return s;
         if (p.maxBlocks < 0 || p.maxBlocks > kMaxBlocksLimit) return s;
-        if (! (p.crossoverHz > 0.0) || ! (p.crossoverHz <= 0.49 * sampleRate)) return s;   // Svf would clamp it silently
-        if (! (p.tuningHz > 0.0) || ! (p.tuningHz < sampleRate)) return s;
-        if (! (p.lowNoteHz > 0.0) || ! (p.highNoteHz > p.lowNoteHz)) return s;
+        if (! (p.crossoverHz >= kMinCrossoverHz) || ! (p.crossoverHz <= 0.49 * sampleRate)) return s;   // Svf would clamp either end silently
+        if (! (p.tuningHz >= kMinNoteHz) || ! (p.tuningHz < sampleRate)) return s;
+        if (! (p.lowNoteHz >= kMinNoteHz) || ! (p.highNoteHz > p.lowNoteHz)) return s;
         // the top band must fit under Nyquist, or its energy would be a clipped band pretending to be whole
         if (! (p.highNoteHz * kSemiUp < 0.5 * sampleRate)) return s;
 
@@ -366,7 +373,7 @@ public:
         accSide_.assign (st.bands, 0.0);
         accMoment_.assign (st.bands, 0.0);
 
-        buildBands();
+        if (! buildBands()) return false;      // law 11b: prepared_ is still false here
 
         xover_.prepare (sampleRate, kAxes);                           // two axes: Mid and Side
         xover_.setFrequency ((float) params_.crossoverHz);
@@ -448,8 +455,12 @@ public:
             float lowM = 0.0f, highM = 0.0f, lowS = 0.0f, highS = 0.0f;
             xover_.processSample (0, m, lowM, highM);
             xover_.processSample (1, s, lowS, highS);
-            // A huge finite input can overflow INSIDE the filter. Checked here, on this sample, so the
-            // grid's flush below (which also heals poison — Svf.h:161) can never erase an uncounted one.
+            // A huge finite input could overflow INSIDE the filter. DEFENSIVE: no finite float input
+            // found so far reaches it — the SVF's arithmetic is double and only its float state is at
+            // risk, and at the largest input that survives MidSide::encode (l = -r = 1.7e38, so
+            // s = 1.7e38) every output stays finite. Kept because the response is right if it ever does
+            // fire, and checked HERE, on this sample, so the grid's flush below cannot erase a poison
+            // this code has not counted. See filterNonFiniteSamples() for the case it still cannot see.
             if (! (std::isfinite (lowM) && std::isfinite (highM) && std::isfinite (lowS) && std::isfinite (highS)))
             {
                 ++filterNonFinite_;
@@ -550,6 +561,15 @@ public:
     std::int64_t holeSamples()   const noexcept { return holeSamples_; }
     std::int64_t nonFiniteSamples() const noexcept { return nonFiniteSamples_; }
     std::int64_t absentSamples() const noexcept { return absentSamples_; }   // the L/R pair was not fully fed
+    // A LOWER BOUND, not an exact count, and the mechanism is worth naming. eq::Svf computes in double
+    // but stores its integrator state in FLOAT, and that state is updated as `2*v - ic`: a v just under
+    // FLT_MAX therefore overflows the STATE while the output this code checks stays finite. The next
+    // sample would expose it — an infinite state makes the next output non-finite, which is counted here
+    // and healed — unless a StateGrid boundary falls in between, because flushDenormals() heals poison
+    // as well as denormals (Svf.h:161). Measured reachable: at fs 1000, fc 400, mono +-1.7e38 at samples
+    // 61..63 with the boundary at 64. NO MEASURED VALUE IS WRONG when that happens — the state is healed
+    // before any sample consumes it, and every published energy stays finite — but this counter reads 0.
+    // Detecting it properly needs the filter's state, which this instrument does not own.
     std::int64_t filterNonFiniteSamples() const noexcept { return filterNonFinite_; }
     // A hole feeds the documented canonical zero to the filters, so the LR4 state carries it for its
     // own settling time: blocks after lastHoleSample() are finite but not untouched. The coordinates are
@@ -681,6 +701,13 @@ private:
         if (! (a > -2000.0 && b < 2000.0)) return false;
         loMidi = (int) std::ceil (a);
         hiMidi = (int) std::floor (b);
+        // The bound came through a logarithm, so a `high` one ulp below a note's centre rounds to that
+        // centre and would admit a note ABOVE the range (measured: highNoteHz = nextafter(440, 0) still
+        // included 440 Hz). Snap both ends against the SAME noteHz() that defines a band, so the rule
+        // "every note whose centre lies in [low, high]" is exact by construction rather than to within
+        // a rounding of its own bound.
+        if (loMidi <= hiMidi && noteHz (p, loMidi) < p.lowNoteHz)  ++loMidi;
+        if (loMidi <= hiMidi && noteHz (p, hiMidi) > p.highNoteHz) --hiMidi;
         return hiMidi >= loMidi;
     }
 
@@ -699,7 +726,7 @@ private:
         first = a; count = b - a + 1;
     }
 
-    void buildBands() noexcept
+    [[nodiscard]] bool buildBands() noexcept
     {
         const int bins = frames_.bins();
         std::size_t at = 0;
@@ -711,6 +738,7 @@ private:
             int first = 0, count = 0;
             bandBins (c, binHz_, bins, first, count);
             bandCountBins_[(std::size_t) b] = count;
+            if (at + (std::size_t) count > weights_.size()) return false;   // storageFor() and this must agree
             for (int j = 0; j < count; ++j)
             {
                 const int k = first + j;
@@ -741,6 +769,7 @@ private:
             row.widthHz = hi - lo;
             row.binsPerBand = binHz_ > 0.0 ? (hi - lo) / binHz_ : 0.0;
         }
+        return at == weights_.size();
     }
 
     // Neumaier: two constant scalars per quantity, which law 7 permits explicitly and which
@@ -864,6 +893,7 @@ private:
         if (usedFrames_ <= 0)          { noteReason_ = LowEndReason::NoUsableFrames;    return; }
         const double inv = 1.0 / (double) usedFrames_;
         totalBandEnergy_ = 0.0;
+        bool bad = false;
         for (int b = 0; b < bandCount_; ++b)
         {
             LowEndBand& row = bands_[(std::size_t) b];
@@ -876,6 +906,20 @@ private:
             row.centsOffset = row.centroidHz > 0.0 && row.centreHz > 0.0
                             ? 1200.0 * std::log2 (row.centroidHz / row.centreHz) : 0.0;
             totalBandEnergy_ += row.energy;
+            if (! (std::isfinite (row.energy) && std::isfinite (row.density)
+                   && std::isfinite (row.centroidHz) && std::isfinite (row.centsOffset)))
+                bad = true;
+        }
+        // Each frame's contribution was checked finite before it was accumulated, and a float-fed band
+        // cannot sum past ~1e83 over any realistic frame count — but "cannot" there is an argument about
+        // magnitudes, and the contract is that a non-finite value never reaches a published field. So it
+        // is CHECKED: peakShare_ would be inf/inf = NaN if a total overflowed, and that is precisely the
+        // zero-that-reads-as-an-answer this instrument refuses to print.
+        if (bad || ! std::isfinite (totalBandEnergy_))
+        {
+            for (auto& row : bands_) { row.centroidHz = 0.0; row.centsOffset = 0.0; }
+            noteReason_ = LowEndReason::Overflowed;
+            return;
         }
         if (! (totalBandEnergy_ > 0.0)) { noteReason_ = LowEndReason::NoEnergy; return; }
 

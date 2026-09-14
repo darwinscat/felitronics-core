@@ -309,6 +309,26 @@ Stereo twoTone (std::size_t n, double fs, double midHz, double sideHz)
     return s;
 }
 
+// THE CENTROID INVARIANT, checked wherever a band table exists: a band with energy must put its
+// centroid strictly INSIDE its own [f*2^-1/24, f*2^+1/24), and a band without energy must report
+// exactly 0. This is the property the overlap-midpoint first moment exists to guarantee — weighting a
+// fractional edge cell by the BIN centre instead can push a centroid out of its own band — so it is
+// asserted as an invariant rather than left to the one fixture that happens to notice.
+int centroidsOutsideTheirBand (const LowEnd& le)
+{
+    int bad = 0;
+    for (int b = 0; b < le.bandCount(); ++b)
+    {
+        const analysis::LowEndBand r = le.band (b);
+        const double lo = r.centreHz * std::exp2 (-1.0 / 24.0), hi = r.centreHz * std::exp2 (1.0 / 24.0);
+        if (! (r.energy > 0.0)) { if (r.centroidHz > 0.0) ++bad; continue; }   // an empty band claims nothing
+        if (! (r.centroidHz >= lo && r.centroidHz <= hi)) ++bad;
+        if (! std::isfinite (r.centroidHz) || ! std::isfinite (r.centsOffset)) ++bad;
+        if (std::fabs (r.centsOffset) > 50.0 + 1e-6) ++bad;                    // a semitone is +-50 cents
+    }
+    return bad;
+}
+
 // Sums the LOW-band block energies over [fromBlock, toBlock), i.e. past the filter's startup.
 void settledLow (const LowEnd& le, std::int64_t fromBlock, std::int64_t toBlock, double& mid, double& side)
 {
@@ -376,6 +396,50 @@ int main()
         ok (! LowEnd::storageFor (kFs, 2, p).ok, "a negative capacity refused");
         p = base; p.fftOrder = 3;
         ok (! LowEnd::storageFor (kFs, 2, p).ok, "an fftOrder the frame producer refuses is refused here too");
+        p = base; p.crossoverHz = 0.5;
+        ok (! LowEnd::storageFor (kFs, 2, p).ok,
+            "a crossover below 1 Hz is refused rather than accepted and then silently clamped to 1 Hz by eq::Svf");
+        p = base; p.lowNoteHz = 1.0e-200; p.highNoteHz = 2.0e-200; p.tuningHz = 1.0e-200;
+        ok (! LowEnd::storageFor (kFs, 2, p).ok,
+            "a note range near zero is refused: its band-edge frequencies underflow the first moment to"
+            " zero while the energies stay positive, and a centroid would then leave its own band");
+        // the note-range rule is EXACT, not exact to within a rounding of its own logarithm
+        {
+            LowEndParams q = base; q.tuningHz = 440.0; q.lowNoteHz = 30.0;
+            q.highNoteHz = std::nextafter (440.0, 0.0);
+            const LowEnd::Storage st2 = LowEnd::storageFor (kFs, 2, q);
+            ok (st2.ok, "a range ending one ulp below A4 is accepted");
+            LowEnd le2; le2.setParams (q);
+            ok (test::run (le2.prepare (kFs, 4096, 2)), "prepare");
+            bool above = false;
+            for (int b = 0; b < le2.bandCount(); ++b) if (le2.band (b).centreHz > q.highNoteHz) above = true;
+            ok (! above, "and NO band centre lies above it — the integer bound is snapped against noteHz()"
+                " itself, not left to the rounding of a log2");
+        }
+        // an OUTSIDE oracle on the weight table's SIZE: storageFor() and buildBands() reach the same
+        // count through two different expressions, so the count is computed here a third way.
+        {
+            for (int order : { 4, 8, 12, 14 })
+            {
+                LowEndParams q = base; q.fftOrder = order;
+                const LowEnd::Storage st3 = LowEnd::storageFor (kFs, 2, q);
+                if (! st3.ok) continue;
+                const std::int64_t nn = (std::int64_t) 1 << order;
+                const double bh = kFs / (double) nn;
+                const int bins = (int) (nn / 2 + 1);
+                std::size_t want = 0;
+                for (int b = 0; b < st3.bandCount; ++b)
+                {
+                    const double c = noteHzOf (23 + b, q.tuningHz);
+                    const int ka = std::max (0, (int) std::floor (c * std::exp2 (-1.0 / 24.0) / bh + 0.5));
+                    const int kb = std::min (bins - 1, (int) std::floor (c * std::exp2 (1.0 / 24.0) / bh + 0.5));
+                    if (kb >= ka) want += (std::size_t) (kb - ka + 1);
+                }
+                ok (st3.binWeights == want, "the published weight-table size at order " + std::to_string (order)
+                    + " matches an independently computed count (" + std::to_string (st3.binWeights)
+                    + " vs " + std::to_string (want) + ")");
+            }
+        }
 
         // and prepare() refuses exactly the same arguments
         LowEnd le; le.setParams (base);
@@ -561,9 +625,15 @@ int main()
         {
             LowEnd h; h.setParams (p);
             ok (test::run (h.prepare (fs, 8192, 2)) && test::run (feed (h, x, 2)), "a second pass for the high band");
-            approx (h.highSideFraction() / wantHigh, 1.0, 0.02,
-                    "the HIGH band follows its own oracle (" + std::to_string (h.highSideFraction())
-                    + ") — so the crossover really SPLIT, it did not leak");
+            ok (h.highMidEnergy() > 0.0, "the high band's MID path is alive — without this the fraction"
+                " reads exactly 1.0, which is within 0.35 % of the oracle and would pass a loose tolerance");
+            const double wantRatio = lr4HighPower (1000.0, 120.0, fs) / lr4HighPower (60.0, 120.0, fs);
+            approx ((h.highSideEnergy() / h.highMidEnergy()) / wantRatio, 1.0, 0.02,
+                    "the HIGH band's side/MID RATIO follows its own oracle (want " + std::to_string (wantRatio)
+                    + ", got " + std::to_string (h.highSideEnergy() / h.highMidEnergy())
+                    + ") — a ratio a dead Mid path cannot fake, unlike the fraction");
+            approx (h.highSideFraction() / wantHigh, 1.0, 0.002,
+                    "and so does the fraction, at a tolerance tight enough to exclude 1.0");
         }
         ok (le.rawSideFraction() > 0.4 && le.rawSideFraction() < 0.6,
             "the UNFILTERED programme is half Side, as two equal-amplitude tones make it");
@@ -636,6 +706,7 @@ int main()
         ok (le.peakBand() == 0, "it is the peak band");
         approx (b0.centsOffset, 0.0, 0.5, "a tone at the centre reads 0 cents");
         ok (le.underResolvedBands() == 0, "no band is narrower than a Hann main lobe at this order");
+        ok (centroidsOutsideTheirBand (le) == 0, "every band's centroid lies inside its own semitone");
 
         // the same tone one order LOWER does not resolve the bottom, and the report says so
         LowEndParams q = base; q.fftOrder = 12;
@@ -683,6 +754,7 @@ int main()
                     + std::to_string (wantCentroid) + " Hz, got " + std::to_string (row.centroidHz) + " Hz)");
             ++checked;
         }
+        ok (centroidsOutsideTheirBand (le) == 0, "every band's centroid lies inside its own semitone");
         ok (checked >= 6, "the DFT null covered energy AND centroid over " + std::to_string (checked) + " bands");
     }
 
@@ -918,10 +990,29 @@ int main()
             x.l[500] = 3.0e38f; x.r[500] = 3.0e38f;                 // l+r overflows float inside encode()
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
-            ok (le.holeSamples() >= 1, "a finite input whose Mid/Side overflows is a hole, counted");
+            ok (le.holeSamples() >= 1, "a finite input whose Mid/Side ENCODE overflows is a hole, counted");
             ok (std::isfinite (le.lowMidEnergy()) && std::isfinite (le.rawMidEnergy()),
-                "and nothing non-finite reached any accumulator — promoted before squaring");
+                "and nothing non-finite reached any accumulator");
             ok (le.nonFiniteSamples() == 0, "the INPUT was finite, so it is not counted as a non-finite sample");
+        }
+        // PROMOTED BEFORE SQUARING, tested where it can actually fail. The fixture above never reaches
+        // the squaring at all: l + r overflows inside encode, so the sample becomes a hole first. An
+        // ANTI-PHASE 1.7e38 survives encode (m = 0 exactly, s = 0.5*(l-r) = 1.7e38, finite) and does get
+        // squared — and in float (1.7e38)^2 is an infinity, so a square taken before the promotion to
+        // double would publish one.
+        {
+            const std::size_t m = 600;
+            Stereo x; x.l.assign (m, 0.0f); x.r.assign (m, 0.0f);
+            for (std::size_t i = 200; i < 260; ++i) { x.l[i] = 1.7e38f; x.r[i] = -1.7e38f; }
+            LowEnd le; le.setParams (p);
+            ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
+            ok (le.holeSamples() == 0, "1.7e38 anti-phase survives the encode: not a hole");
+            ok (le.lowSideEnergy() > 1.0e70, "the enormous side energy is measured, not clamped: "
+                + std::to_string (le.lowSideEnergy()));
+            ok (std::isfinite (le.lowSideEnergy()) && std::isfinite (le.rawSideEnergy())
+                && std::isfinite (le.lowSideFraction()) && std::isfinite (le.peakLowSideAmplitude()),
+                "and every published value is FINITE — the squares were taken in double, after the promotion");
+            ok (le.widthValid(), "the measurement stands");
         }
         // a channel that disappears mid-stream is a hole for those samples, not a mono reading
         {
@@ -1080,6 +1171,9 @@ int main()
             }
             ok (bad == 0, "every one of the 40 band rows is finite and non-negative even here, got "
                 + std::to_string (bad) + " that were not");
+            ok (centroidsOutsideTheirBand (le) == 0,
+                "and every centroid is still inside its own semitone, at a 16-point window where the bands"
+                " collapse onto one or two heavily clipped bins — including bin 0's HALF cell");
             ok (le.noteValid(), "and the note report is produced rather than refused");
         }
         // hop == N (no overlap at all), fed through the widest channel count the core allows
@@ -1100,6 +1194,31 @@ int main()
             ok (le.noteReason() == LowEndReason::ShorterThanWindow, "…and the note report says exactly that");
             ok (le.widthValid(), "while the TIME path measured every sample, as it has no window");
         }
+    }
+
+    //==========================================================================
+    test::group ("the centroid invariant across the geometries most likely to break it");
+    {
+        // Constant DC (all the energy at 0 Hz, i.e. OUTSIDE every band, pushing every band onto its own
+        // lower edge), at five window orders and three sample rates — 1 kHz is the lowest the instrument
+        // accepts, where 300 Hz is a third of Nyquist and the bands are enormous in bin terms.
+        int bad = 0, cases = 0;
+        for (double fs : { 1000.0, 8000.0, 48000.0 })
+            for (int order : { 4, 6, 8, 12 })
+            {
+                LowEndParams p = base; p.fftOrder = order;
+                if (! LowEnd::storageFor (fs, 2, p).ok) continue;
+                LowEnd le; le.setParams (p);
+                if (! le.prepare (fs, 4096, 2)) { ++bad; continue; }
+                const std::size_t n = (std::size_t) (1u << order) * 3u;
+                Stereo x; x.l.assign (n, 1.0f); x.r.assign (n, 1.0f);      // pure DC, mono
+                if (! feed (le, x, 2)) { ++bad; continue; }
+                bad += centroidsOutsideTheirBand (le);
+                ++cases;
+            }
+        ok (cases >= 10, "the sweep covered " + std::to_string (cases) + " geometries");
+        ok (bad == 0, "no band with energy puts its centroid outside its own semitone, and no empty band"
+            " claims a frequency: " + std::to_string (bad) + " violations");
     }
 
     test::group ("finish() is idempotent, process() refuses after it, reset() replays identically");
@@ -1135,15 +1254,24 @@ int main()
         LowEnd le; le.setParams (p);
         ok (test::run (le.prepare (kFs, 1024, 2)), "prepare (this is the one call that allocates)");
         const float* pl[2] = { x.l.data(), x.r.data() };
+        (void) pl;
+        bool allAccepted = true;
+        std::int64_t fed = 0;
         const long before = g_allocs.load();
         for (std::size_t at = 0; at < n; at += 997)
         {
             const float* q[2] = { x.l.data() + at, x.r.data() + at };
-            (void) le.process (q, 2, (int) std::min<std::size_t> (997, n - at));
+            const int take = (int) std::min<std::size_t> (997, n - at);
+            allAccepted = le.process (q, 2, take) && allAccepted;
+            fed += take;
         }
-        (void) le.finish();
-        (void) pl;
+        allAccepted = le.finish() && allAccepted;
         const long after = g_allocs.load();
+        // asserted AFTER the counter is read, so the assertion cannot allocate inside the measured region
+        ok (allAccepted, "every call was ACCEPTED — without this a stage that had silently stopped"
+            " processing would allocate nothing and pass this group");
+        ok (le.samplesProcessed() == fed, "and it really consumed all " + std::to_string (fed) + " samples");
+        ok (le.usedFrames() > 0, "…and really transformed frames while being measured");
         test::okNoAlloc (after == before, "process() and finish() allocated nothing ("
                          + std::to_string (after - before) + " allocations)");
     }

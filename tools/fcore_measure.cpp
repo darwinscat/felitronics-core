@@ -453,19 +453,45 @@ int main (int argc, char** argv)
     {
         // The vinyl low end. Streamed in kChunk steps, which is also the point: the report is bit-identical
         // under ANY slicing (law 8a), so the chunk size is not part of the measurement.
+        // STRICT on its arguments, like the shape modes and unlike the older scalar ones: atoi("4294967297")
+        // narrows to 1 channel and atof("8000Hz") reads 8000, and either would measure something silently.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width)
+            || width < 1 || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        // …and strict on its INPUT: a file that is not a whole number of frames, or that cannot be read
+        // to the end, must not print a report and exit zero. (A directory opens successfully on macOS and
+        // then fails every read, which used to come out as an empty report and a success.)
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
         analysis::LowEndParams lp;
         analysis::LowEnd le;
         le.setParams (lp);
-        if (! le.prepare (fs, kChunk, nc))
+        if (! le.prepare (rate, kChunk, nc))
         {
             std::fprintf (stderr, "LowEnd refused this geometry (rate, channels or note range)\n");
             std::fclose (f);
             return 2;
         }
         bool okAll = true;
-        streamPlanar (f, nc, [&] (const float* const* pp, int n) { okAll = le.process (pp, nc, n) && okAll; });
+        const bool read = streamPlanar (f, nc, [&] (const float* const* pp, int n) { okAll = le.process (pp, nc, n) && okAll; });
         std::fclose (f);
-        if (! okAll || ! le.finish()) { std::fprintf (stderr, "LowEnd refused a chunk\n"); return 2; }
+        if (! read || ! okAll || ! le.finish()) { std::fprintf (stderr, "LowEnd refused a chunk, or the file could not be read\n"); return 2; }
+        if ((std::uint64_t) le.samplesProcessed() != frames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) le.samplesProcessed(), (unsigned long long) frames);
+            return 2;
+        }
 
         // Raw bit patterns, not %g: the other side of this comparison is JavaScript, whose decimal
         // formatting is not C's, so a 16-hex-digit pattern is the one representation both sides produce
