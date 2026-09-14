@@ -91,4 +91,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_multires_spectrum_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_multires_spectrum_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_multires_spectrum_tests COMMAND felitronics_multires_spectrum_tests)
+
+    # ProgrammeReport (P72) — the OFFLINE whole-programme report. Links felitronics::analysis_offline, not
+    # felitronics::analysis: it composes over eq::Crossover2 (the LR4) and the stereo primitives, and adding
+    # those to `analysis` itself would close a cycle (see the comment at that target above). The suite's own
+    # whole-file reference drives eq::Crossover2 and analysis::KWeightingFilter directly, so it needs the
+    # same surface.
+    add_executable(felitronics_programme_report_tests tests/ProgrammeReportTests.cpp)
+    target_link_libraries(felitronics_programme_report_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_programme_report_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_programme_report_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_programme_report_tests COMMAND felitronics_programme_report_tests)
 endif()

@@ -26,6 +26,10 @@
 //                 the sample peak of each channel, and every stored run — start, length, level, channel,
 //                 polarity, evidence. Levels and peaks as bit patterns; the format lives in tools/fcore_clips_format.h
 //                 and the wasm module prints it too, so a diff IS the parity test. [--max-runs N] [--chunk N]
+//   report      → the whole-programme report (analysis::ProgrammeReport): DC, silence, tail, infra-low,
+//                 stereo, PLR / LRA / short-term percentiles. Every scalar as a raw bit pattern with its
+//                 validity and reason; every count as a decimal integer. Printed through the report's own
+//                 field visitor, so the struct and this output cannot drift apart.
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
@@ -43,6 +47,8 @@
 
 #include "fcore_clips_format.h"
 #include "fcore_probe.h"
+
+#include <felitronics/analysis/ProgrammeReport.h>
 
 #include <algorithm>
 #include <cmath>
@@ -181,7 +187,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n",
             argv[0]);
@@ -316,6 +322,48 @@ int main (int argc, char** argv)
         }
         const std::string text = fcore::formatClips (rep);
         std::fwrite (text.data(), 1, text.size(), stdout);
+        return 0;
+    }
+
+    if (mode == "report")
+    {
+        // THE WHOLE-PROGRAMME REPORT. Every floating-point number goes out as a raw IEEE-754 bit pattern,
+        // exactly as `blocks` does and for the same reason: the other side of this comparison is
+        // JavaScript, which has no hex-float printing and whose decimal formatting is not C's, so a
+        // 16-hex-digit pattern is the one representation both sides produce identically and `diff` IS the
+        // parity test. `%.17g` would not do either — it round-trips, but a flipped low bit can print the
+        // same decimal on two libcs.
+        //
+        // Printed through the report's OWN field visitor rather than a list written out here, so a field
+        // added to the struct appears in this output without this block being touched — the same
+        // enumeration the law-8a gate compares through.
+        //
+        // maxBlock is kChunk because that is what streamPlanar hands over; it sizes the scratch and
+        // nothing else, so the numbers do not depend on it.
+        analysis::ProgrammeReport pr;
+        if (! pr.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "report.prepare refused (rate, channels or a parameter out of range)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool accepted = true;
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { accepted = accepted && pr.process (p, nc, n); });
+        std::fclose (f);
+        if (! accepted)
+        {
+            std::fprintf (stderr, "the report refused a call\n");
+            return 2;
+        }
+        pr.finish();
+        const auto& R = pr.report();
+        std::printf ("# fcore report v1 sr=%016llx ch=%d samples=%lld\n",
+                     (unsigned long long) bits (fs), nc, (long long) R.totalSamples);
+        R.visitCounts ([] (const char* name, int ch, std::int64_t v)
+                       { std::printf ("C %s %d %lld\n", name, ch, (long long) v); });
+        R.visitValues ([] (const char* name, int ch, const analysis::ProgrammeValue& v)
+                       { std::printf ("V %s %d %d %d %016llx\n", name, ch, v.valid ? 1 : 0,
+                                      (int) v.reason, (unsigned long long) bits (v.value)); });
         return 0;
     }
 
