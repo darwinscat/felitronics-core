@@ -19,6 +19,27 @@
 #include <felitronics/analysis/SpectrumTap.h>
 #include <felitronics/analysis/StereoColumns.h>
 #include <felitronics/analysis/offline/SpectrumCurve.h>
+
+// The five offline analyzers of the P71-P76 wave land one per branch. Each is registered here FROM THE
+// BASE COMMIT, so a header that merges is never ungated: a public header outside this TU is not covered
+// by the strict-warning gate at all, and a warning class that only fires downstream (or only under gcc)
+// is exactly what this target exists to kill. __has_include keeps the TU compiling on a branch where a
+// sibling's header does not exist yet, and keeps the five branches from all editing one line.
+#if __has_include(<felitronics/analysis/BandBursts.h>)
+ #include <felitronics/analysis/BandBursts.h>
+#endif
+#if __has_include(<felitronics/analysis/HumDetector.h>)
+ #include <felitronics/analysis/HumDetector.h>
+#endif
+#if __has_include(<felitronics/analysis/LowEnd.h>)
+ #include <felitronics/analysis/LowEnd.h>
+#endif
+#if __has_include(<felitronics/analysis/ProgrammeReport.h>)
+ #include <felitronics/analysis/ProgrammeReport.h>
+#endif
+#if __has_include(<felitronics/analysis/SourceForensics.h>)
+ #include <felitronics/analysis/SourceForensics.h>
+#endif
 #include <felitronics/analysis/TruePeakMeter.h>
 #include <felitronics/analysis/WaveformPeaks.h>
 #include <felitronics/blend/Blend.h>

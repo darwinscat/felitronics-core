@@ -7,6 +7,21 @@ target_include_directories(felitronics_analysis INTERFACE ${CMAKE_CURRENT_SOURCE
 target_link_libraries(felitronics_analysis INTERFACE felitronics::core felitronics::oversampling)
 target_compile_features(felitronics_analysis INTERFACE cxx_std_20)
 
+# felitronics::analysis_offline — the link surface for the OFFLINE analyzers (ProgrammeReport,
+# SourceForensics, HumDetector, LowEnd, BandBursts), which compose over the eq/stereo primitives
+# (eq::Crossover2 is the LR4, eq::Svf the biquad, stereo::MidSide the M/S pair) instead of hand-rolling
+# a fifth private copy of each. It CANNOT be a dependency of `analysis` itself: `eq` links
+# `felitronics::analysis` (modules/eq/CMakeLists.txt:7 — EqTypes.h:18 includes analysis/SpectrumTap.h)
+# and `stereo` links `eq`, so analysis -> eq would close a CYCLE. Separating the link surface keeps the
+# graph acyclic; the headers stay under analysis/ and the namespace stays felitronics::analysis.
+# Declared BEFORE the test block below so the analyzers' test targets can link it, and forward-referencing
+# felitronics::eq / ::stereo (added later in the top-level CMakeLists) is resolved at generate time.
+add_library(felitronics_analysis_offline INTERFACE)
+add_library(felitronics::analysis_offline ALIAS felitronics_analysis_offline)
+target_link_libraries(felitronics_analysis_offline INTERFACE
+    felitronics::analysis felitronics::eq felitronics::stereo)
+target_compile_features(felitronics_analysis_offline INTERFACE cxx_std_20)
+
 if(FELITRONICS_BUILD_TESTS)
     add_executable(felitronics_analysis_tests tests/AnalysisTests.cpp)
     target_link_libraries(felitronics_analysis_tests PRIVATE felitronics::analysis)
