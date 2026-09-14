@@ -30,6 +30,11 @@
 //                 stereo, PLR / LRA / short-term percentiles. Every scalar as a raw bit pattern with its
 //                 validity and reason; every count as a decimal integer. Printed through the report's own
 //                 field visitor, so the struct and this output cannot drift apart.
+//   hum         → mains hum (analysis::HumDetector): per channel the validity reason, the mains nominal, the
+//                 line's interpolated position / level / prominence, the comb, and the quiet stretches in
+//                 sample coordinates — every float as a raw bit pattern, like `blocks`, so a future wasm
+//                 comparison catches a flipped bit that %.17g would round away. `valid 0` is never "clean":
+//                 read the reason. [--quiet-db X] [--order N]
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
@@ -49,6 +54,7 @@
 #include "fcore_probe.h"
 
 #include <felitronics/analysis/ProgrammeReport.h>
+#include <felitronics/analysis/HumDetector.h>
 
 #include <algorithm>
 #include <cmath>
@@ -187,9 +193,10 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
-            "          [--max-runs N] [--chunk N]\n",
+            "          [--max-runs N] [--chunk N]\n"
+            "          [--quiet-db X] [--order N]\n",
             argv[0]);
         return 2;
     }
@@ -207,6 +214,78 @@ int main (int argc, char** argv)
 
     std::FILE* f = std::fopen (argv[4], "rb");
     if (! f) { std::perror ("open"); return 2; }
+
+    if (mode == "hum")
+    {
+        // The whole file through analysis::HumDetector, streamed in kChunk steps — the answer is identical at
+        // any slicing (law 8a), so the chunking is a convenience here and not part of the measurement.
+        analysis::HumDetectorParams hp;
+        for (int i = 5; i < argc; ++i)
+        {
+            if (std::strcmp (argv[i], "--quiet-db") == 0 && i + 1 < argc) hp.quietThresholdDb = std::atof (argv[++i]);
+            else if (std::strcmp (argv[i], "--order") == 0 && i + 1 < argc) hp.fftOrder = std::atoi (argv[++i]);
+        }
+        analysis::HumDetector hd;
+        hd.setParams (hp);
+        if (! hd.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "hum: prepare refused these arguments (rate %g, %d channels)\n", fs, nc);
+            std::fclose (f);
+            return 2;
+        }
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { (void) hd.process (p, nc, n); });
+        std::fclose (f);
+        hd.finish();
+        std::printf ("# fcore hum v1 sr=%016llx ch=%d order=%d n=%lld hop=%lld bin=%016llx\n",
+                     (unsigned long long) bits (fs), nc, hd.geometry().order,
+                     (long long) hd.windowSamples(), (long long) hd.hopSamples(),
+                     (unsigned long long) bits (hd.binHz()));
+        for (int c = 0; c < nc; ++c)
+        {
+            const analysis::HumReport r = hd.report (c);
+            std::printf ("ch %d valid %d reason %d mains %d base %d fobs %d fderived %d\n",
+                         c, r.valid ? 1 : 0, (int) r.reason, (int) r.mains, r.baseHarmonic,
+                         r.fundamentalObserved ? 1 : 0, r.fundamentalDerived ? 1 : 0);
+            std::printf ("ch %d f0 %016llx hz %016llx tone %016llx peakbin %016llx floor %016llx prom %016llx\n",
+                         c, (unsigned long long) bits (r.fundamentalHz), (unsigned long long) bits (r.line.hz),
+                         (unsigned long long) bits (r.line.tonePower), (unsigned long long) bits (r.line.peakBinPower),
+                         (unsigned long long) bits (r.line.floorPower), (unsigned long long) bits (r.line.prominenceDb));
+            std::printf ("ch %d frames %lld finite %lld holed %lld quiet %lld stretches %lld stored %lld complete %d tail %lld\n",
+                         c, (long long) r.frames, (long long) r.finiteFrames, (long long) r.holedFrames,
+                         (long long) r.quietFrames, (long long) r.quietStretches, (long long) r.storedStretches,
+                         r.stretchesComplete ? 1 : 0, (long long) r.tailUncoveredSamples);
+            for (int cand = 0; cand < analysis::HumDetector::kCandidates; ++cand)
+            {
+                const analysis::HumCandidate k = hd.candidate (c, cand);
+                std::printf ("ch %d cand %016llx found %d base %d f0 %016llx sobs %lld soff %lld fobs %lld sspread %016llx fspread %016llx intra %016llx stat %d pass %d harm %d low %d\n",
+                             c, (unsigned long long) bits (k.nominalHz), k.baseFound ? 1 : 0, k.baseHarmonic,
+                             (unsigned long long) bits (k.fundamentalHz),
+                             (long long) k.stretchObservations, (long long) k.stretchOffTolerance,
+                             (long long) k.frameObservations,
+                             (unsigned long long) bits (k.stretchSpreadHz), (unsigned long long) bits (k.frameSpreadHz),
+                             (unsigned long long) bits (k.maxIntraStretchSpreadHz),
+                             k.stationary ? 1 : 0, k.passed ? 1 : 0, k.harmonicsObserved, k.lowestHarmonicObserved);
+                std::printf ("ch %d cand %d window %d hz %016llx prom %016llx\n", c, cand,
+                             k.windowPeak.found ? 1 : 0, (unsigned long long) bits (k.windowPeak.hz),
+                             (unsigned long long) bits (k.windowPeak.prominenceDb));
+                for (int h = 1; h <= hp.maxHarmonic; ++h)
+                {
+                    const analysis::HumHarmonic hh = hd.harmonic (c, cand, h);
+                    std::printf ("ch %d cand %d h %d inband %d acc %d hz %016llx tone %016llx prom %016llx\n",
+                                 c, cand, h, hh.inBand ? 1 : 0, hh.peak.accepted ? 1 : 0,
+                                 (unsigned long long) bits (hh.peak.hz), (unsigned long long) bits (hh.peak.tonePower),
+                                 (unsigned long long) bits (hh.peak.prominenceDb));
+                }
+            }
+            for (std::int64_t i = 0; i < hd.storedStretchCount (c); ++i)
+            {
+                const analysis::HumStretch st = hd.stretch (c, i);
+                std::printf ("ch %d stretch %lld %lld %lld frames %lld\n", c, (long long) st.index,
+                             (long long) st.startSample, (long long) st.endSample, (long long) st.frames);
+            }
+        }
+        return 0;
+    }
 
     if (mode == "correlation")
     {

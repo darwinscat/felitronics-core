@@ -108,4 +108,11 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_programme_report_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_programme_report_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_programme_report_tests COMMAND felitronics_programme_report_tests)
+    # HumDetector — mains hum against the bass notes that look like it (49.0 / 58.3 / 61.7 Hz), plus law 8a
+    # over the whole report. Links analysis_offline: the offline analyzers' link surface (see the note above).
+    add_executable(felitronics_hum_detector_tests tests/HumDetectorTests.cpp)
+    target_link_libraries(felitronics_hum_detector_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_hum_detector_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_hum_detector_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_hum_detector_tests COMMAND felitronics_hum_detector_tests)
 endif()
