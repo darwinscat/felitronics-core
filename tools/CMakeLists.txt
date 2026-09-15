@@ -10,14 +10,11 @@
 set(FCORE_NO_FP_CONTRACT $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>)
 
 add_executable(fcore_measure fcore_measure.cpp)
-target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::analysis_offline felitronics::oversampling)
-target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::oversampling)
+target_link_libraries(fcore_measure PRIVATE felitronics::analysis_offline felitronics::oversampling)
 # The OFFLINE analyzer modes (lowend, and the siblings landing beside it) compose over eq::Crossover2 /
 # stereo::MidSide, which felitronics::analysis cannot itself depend on without closing a cycle — see the
 # note on the target in modules/analysis/CMakeLists.txt. Added rather than substituted, so two branches
 # that both need it resolve to one line instead of a conflict.
-target_link_libraries(fcore_measure PRIVATE felitronics::analysis_offline)
-target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::oversampling felitronics::analysis_offline)
 target_compile_features(fcore_measure PRIVATE cxx_std_20)
 target_compile_options(fcore_measure PRIVATE ${FCORE_NO_FP_CONTRACT})
 
@@ -37,7 +34,7 @@ if(FELITRONICS_BUILD_TESTS)
     # guards are tested — natively, because fc_probe.cpp compiles anywhere (EMSCRIPTEN_KEEPALIVE degrades to a
     # plain extern "C"). That puts the validation and the planar addressing under ctest, ASan and UBSan.
     add_executable(felitronics_abi_tests tests/AbiTests.cpp wasm/fc_probe.cpp)
-    target_link_libraries(felitronics_abi_tests PRIVATE felitronics::analysis felitronics::oversampling)
+    target_link_libraries(felitronics_abi_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
     target_include_directories(felitronics_abi_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_abi_tests PRIVATE cxx_std_20)
@@ -56,7 +53,7 @@ if(FELITRONICS_BUILD_TESTS)
     # those are built contract-off; a suite built contract-on would be pinning a third answer. -fno-fast-math
     # is stated for the same reason it is stated in tools/wasm/build.sh: nothing here may be reassociated.
     add_executable(felitronics_clips_exposure_tests tests/ClipsExposureTests.cpp wasm/fc_probe.cpp)
-    target_link_libraries(felitronics_clips_exposure_tests PRIVATE felitronics::analysis felitronics::oversampling)
+    target_link_libraries(felitronics_clips_exposure_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
     target_include_directories(felitronics_clips_exposure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_clips_exposure_tests PRIVATE cxx_std_20)

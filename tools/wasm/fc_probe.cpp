@@ -22,6 +22,9 @@
 #include "fcore_clips.h"
 #include "fcore_probe.h"
 
+#include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/ProgrammeReport.h>
+
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -421,3 +424,279 @@ FC_EXPORT std::uint32_t fc_probe_os_factor       (void) { return (std::uint32_t)
 FC_EXPORT std::uint32_t fc_probe_os_taps         (void) { return (std::uint32_t) fcore::Probe::kOsTapsPerPhase; }
 FC_EXPORT std::uint32_t fc_probe_chunk           (void) { return (std::uint32_t) fcore::Probe::kChunk; }
 FC_EXPORT std::uint32_t fc_probe_sizeof_longdouble (void) { return (std::uint32_t) sizeof (long double); }
+
+//==============================================================================
+// analysis::ProgrammeReport (P72) through the ABI.
+//
+// WHY THIS ONE IS SHAPED DIFFERENTLY FROM `clips`. ClipDetector publishes eight scalars and one list, so
+// one export per field was honest. ProgrammeReport publishes on the order of a hundred NAMED values, each
+// carrying a validity and a reason, and the report's visitor is deliberately THE ONE ENUMERATION of them
+// ("a field added here is automatically compared and automatically printed; a hand-written list in either
+// place would silently stop covering the new field, which is how a gate quietly stops being a gate").
+// One export per field would rebuild exactly that hand-written list on this side, in C++ and again in
+// JavaScript. So the rows and their NAMES both come out of the same walk: add a field to the visitor and
+// it appears in the CLI, in the module and in the parity diff, with nothing to renumber.
+//
+// The names are a NUL-separated blob in visitor order — counts first, then values — and the rows are
+// doubles in the same order. A row carries no name of its own: its name is its position. That is only
+// safe because ONE walk produces both, which is the whole reason it is shaped this way.
+namespace
+{
+    felitronics::analysis::ProgrammeReport& programme()
+    {
+        static felitronics::analysis::ProgrammeReport p;
+        return p;
+    }
+    bool haveReport = false;
+
+    constexpr std::uint32_t kReportCountStride = 2;   // channel, value
+    constexpr std::uint32_t kReportValueStride = 4;   // channel, valid, reason, value
+}
+
+FC_EXPORT int fc_probe_report_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                   double sampleRate)
+{
+    haveReport = false;
+    if (! planarSpan (planar, frames, channels)) return 0;
+    auto& p = programme();
+    if (! p.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
+    const float* view[felitronics::core::kMaxChannels] {};
+    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    if (! p.process (view, (int) channels, (int) frames)) return 0;
+    p.finish();
+    haveReport = true;
+    return 1;
+}
+
+FC_EXPORT double fc_probe_report_samples (void)
+{
+    return haveReport ? (double) programme().report().totalSamples : 0.0;
+}
+
+FC_EXPORT std::uint32_t fc_probe_report_count_rows (void)
+{
+    if (! haveReport) return 0u;
+    std::uint32_t n = 0;
+    programme().report().visitCounts ([&n] (const char*, int, std::int64_t) { ++n; });
+    return n;
+}
+
+FC_EXPORT std::uint32_t fc_probe_report_value_rows (void)
+{
+    if (! haveReport) return 0u;
+    std::uint32_t n = 0;
+    programme().report().visitValues ([&n] (const char*, int, const felitronics::analysis::ProgrammeValue&) { ++n; });
+    return n;
+}
+
+FC_EXPORT std::uint32_t fc_probe_report_stride_counts (void) { return kReportCountStride; }
+FC_EXPORT std::uint32_t fc_probe_report_stride_values (void) { return kReportValueStride; }
+
+// The field names, NUL-separated, counts first then values, in the visitor's own order. Returns the bytes
+// written, or the bytes REQUIRED when `cap` is 0 — so a caller sizes its buffer from the module rather
+// than from a number it made up.
+FC_EXPORT std::uint32_t fc_probe_report_names (char* out, std::uint32_t cap)
+{
+    if (! haveReport) return 0u;
+    std::uint32_t need = 0;
+    const auto& R = programme().report();
+    auto measure = [&need] (const char* nm) { std::uint32_t k = 0; while (nm[k] != '\0') ++k; need += k + 1u; };
+    R.visitCounts ([&] (const char* nm, int, std::int64_t) { measure (nm); });
+    R.visitValues ([&] (const char* nm, int, const felitronics::analysis::ProgrammeValue&) { measure (nm); });
+    if (cap == 0u) return need;
+    if (out == nullptr || ! outSpan (out, cap, 1) || cap < need) return 0u;
+    std::uint32_t at = 0;
+    auto emit = [&] (const char* nm) { std::uint32_t k = 0; while (nm[k] != '\0') out[at++] = nm[k++]; out[at++] = '\0'; };
+    R.visitCounts ([&] (const char* nm, int, std::int64_t) { emit (nm); });
+    R.visitValues ([&] (const char* nm, int, const felitronics::analysis::ProgrammeValue&) { emit (nm); });
+    return at;
+}
+
+// Rows into a caller-owned buffer, capacity in DOUBLES and the return in ROWS — the fc_probe_clips_runs
+// rule. A short capacity writes the prefix that fits and says how many rows that was; it never
+// half-writes a row, and a truncated read is the CALLER's business, never confused with the report's own
+// completeness.
+FC_EXPORT std::uint32_t fc_probe_report_counts (double* out, std::uint32_t cap)
+{
+    if (! haveReport || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const std::uint32_t room = cap / kReportCountStride;
+    std::uint32_t at = 0;
+    programme().report().visitCounts ([&] (const char*, int ch, std::int64_t v)
+    {
+        if (at >= room) return;
+        out[at * kReportCountStride + 0] = (double) ch;
+        out[at * kReportCountStride + 1] = (double) v;
+        ++at;
+    });
+    return at;
+}
+
+FC_EXPORT std::uint32_t fc_probe_report_values (double* out, std::uint32_t cap)
+{
+    if (! haveReport || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const std::uint32_t room = cap / kReportValueStride;
+    std::uint32_t at = 0;
+    programme().report().visitValues ([&] (const char*, int ch, const felitronics::analysis::ProgrammeValue& v)
+    {
+        if (at >= room) return;
+        out[at * kReportValueStride + 0] = (double) ch;
+        out[at * kReportValueStride + 1] = v.valid ? 1.0 : 0.0;
+        out[at * kReportValueStride + 2] = (double) (int) v.reason;
+        out[at * kReportValueStride + 3] = v.value;      // the bits, untouched — invalid is a canonical +0.0
+        ++at;
+    });
+    return at;
+}
+
+//==============================================================================
+// analysis::BandBursts (P76) through the ABI.
+//
+// Unlike `report`, this mode's text is POSITIONAL — the CLI prints fixed columns, not named fields — so
+// there is no name table to carry and the ABI is the plain shape: one scalar block in the order the CLI
+// prints it, then the three variable-length lists (per channel, events, and the two sparse histograms),
+// each into a caller-owned buffer whose capacity is mandatory.
+//
+// `enterDb` and `exitDb` are read from a default-constructed BandBurstsParams here because the detector
+// does not publish them and the CLI does exactly the same. That is the one number on this road not read
+// back out of the measurement; it is the documented default on both sides, so the diff still covers it,
+// but it is named rather than hidden.
+namespace
+{
+    felitronics::analysis::BandBursts& bursts()
+    {
+        static felitronics::analysis::BandBursts d;
+        return d;
+    }
+    bool haveBursts = false;
+
+    constexpr std::uint32_t kBurstsScalars    = 31;
+    constexpr std::uint32_t kBurstsChanStride = 4;
+    constexpr std::uint32_t kBurstsEvtStride  = 12;
+    constexpr std::uint32_t kBurstsBinStride  = 2;
+}
+
+FC_EXPORT int fc_probe_bursts_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                   double sampleRate)
+{
+    haveBursts = false;
+    if (! planarSpan (planar, frames, channels)) return 0;
+    auto& d = bursts();
+    d.setParams (felitronics::analysis::BandBurstsParams {});
+    if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
+    const float* view[felitronics::core::kMaxChannels] {};
+    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    if (! d.process (view, (int) channels, (int) frames)) return 0;
+    d.finish();
+    haveBursts = true;
+    return 1;
+}
+
+FC_EXPORT std::uint32_t fc_probe_bursts_scalars_len (void) { return kBurstsScalars; }
+FC_EXPORT std::uint32_t fc_probe_bursts_chan_stride (void) { return kBurstsChanStride; }
+FC_EXPORT std::uint32_t fc_probe_bursts_evt_stride  (void) { return kBurstsEvtStride; }
+FC_EXPORT std::uint32_t fc_probe_bursts_bin_stride  (void) { return kBurstsBinStride; }
+
+// The scalars, IN THE ORDER THE CLI PRINTS THEM. The order is the contract; the JavaScript half reads
+// them by index and must not be edited without editing this.
+FC_EXPORT std::uint32_t fc_probe_bursts_scalars (double* out, std::uint32_t cap)
+{
+    if (! haveBursts || out == nullptr || cap < kBurstsScalars || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = bursts();
+    const felitronics::analysis::BandBurstsParams bp {};
+    std::uint32_t i = 0;
+    out[i++] = d.sampleRate();
+    out[i++] = (double) d.channels();
+    out[i++] = (double) d.hopSamples();
+    out[i++] = (double) d.baselineHops();
+    out[i++] = d.bandLowHz();
+    out[i++] = d.bandHighHz();
+    out[i++] = bp.enterDb;
+    out[i++] = bp.exitDb;
+    out[i++] = (double) fcore::Probe::kChunk;
+    out[i++] = (double) d.samplesProcessed();
+    out[i++] = (double) d.hopCount();
+    out[i++] = (double) d.eligibleHops();
+    out[i++] = (double) d.zeroBaselineHops();
+    out[i++] = (double) d.burstHops();
+    out[i++] = (double) d.damagedHops();
+    out[i++] = (double) d.overflowSamples();
+    out[i++] = (double) d.firstNonFiniteAt();
+    out[i++] = (double) d.tailPartialSamples();
+    out[i++] = d.tailPartialEnergy();
+    out[i++] = d.eventsValid() ? 1.0 : 0.0;
+    out[i++] = (double) (int) d.eventsInvalidReason();
+    out[i++] = d.programmeEnergyValid() ? 1.0 : 0.0;
+    out[i++] = (double) (int) d.programmeEnergyInvalidReason();
+    out[i++] = (double) d.eventCount();
+    out[i++] = (double) d.storedEventCount();
+    out[i++] = d.eventsComplete() ? 1.0 : 0.0;
+    out[i++] = (double) d.onsetCount();
+    out[i++] = (double) d.intervalCount();
+    out[i++] = (double) d.intervalOverflow();
+    out[i++] = (double) d.modalIntervalHops();
+    out[i++] = (double) d.modalIntervalMass();
+    return i;
+}
+
+FC_EXPORT std::uint32_t fc_probe_bursts_chan (double* out, std::uint32_t cap)
+{
+    if (! haveBursts || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = bursts();
+    const std::uint32_t room = cap / kBurstsChanStride;
+    std::uint32_t at = 0;
+    for (int c = 0; c < d.channels() && at < room; ++c, ++at)
+    {
+        out[at * kBurstsChanStride + 0] = (double) c;
+        out[at * kBurstsChanStride + 1] = d.bandEnergy (c);
+        out[at * kBurstsChanStride + 2] = (double) d.nonFiniteSamples (c);
+        out[at * kBurstsChanStride + 3] = (double) d.absentSamples (c);
+    }
+    return at;
+}
+
+FC_EXPORT std::uint32_t fc_probe_bursts_events (double* out, std::uint32_t cap)
+{
+    if (! haveBursts || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = bursts();
+    const std::uint32_t room = cap / kBurstsEvtStride;
+    std::uint32_t at = 0;
+    for (std::int64_t i = 0; i < d.storedEventCount() && at < room; ++i, ++at)
+    {
+        const felitronics::analysis::BandBurst e = d.event (i);
+        double* r = out + (std::size_t) at * kBurstsEvtStride;
+        r[0] = (double) e.start;      r[1] = (double) e.length;  r[2] = (double) e.peakAt;
+        r[3] = (double) e.hops;       r[4] = e.peakPower;        r[5] = e.peakBaseline;
+        r[6] = e.peakExcessDb;        r[7] = e.peakWidePower;    r[8] = e.energy;
+        r[9]  = e.touchedNonFinite ? 1.0 : 0.0;
+        r[10] = e.baselineTouchedNonFinite ? 1.0 : 0.0;
+        r[11] = e.closedByFinish ? 1.0 : 0.0;
+    }
+    return at;
+}
+
+// The two histograms are SPARSE on the CLI — it prints only non-zero bins — so the pairs (bin, mass) are
+// what crosses, not a dense array. A dense one would make the JavaScript half decide which bins to print,
+// i.e. re-implement a rule that lives in the C++ half.
+FC_EXPORT std::uint32_t fc_probe_bursts_ioi (double* out, std::uint32_t cap)
+{
+    if (! haveBursts || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = bursts();
+    const std::uint32_t room = cap / kBurstsBinStride;
+    std::uint32_t at = 0;
+    for (int b = 1; b <= felitronics::analysis::BandBursts::kIoiBins && at < room; ++b)
+        if (d.intervalBin (b) != 0)
+        { out[at * kBurstsBinStride + 0] = (double) b; out[at * kBurstsBinStride + 1] = (double) d.intervalBin (b); ++at; }
+    return at;
+}
+
+FC_EXPORT std::uint32_t fc_probe_bursts_lag (double* out, std::uint32_t cap)
+{
+    if (! haveBursts || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = bursts();
+    const std::uint32_t room = cap / kBurstsBinStride;
+    std::uint32_t at = 0;
+    for (int b = 1; b <= felitronics::analysis::BandBursts::kMaxLag && at < room; ++b)
+        if (d.lagBin (b) != 0)
+        { out[at * kBurstsBinStride + 0] = (double) b; out[at * kBurstsBinStride + 1] = (double) d.lagBin (b); ++at; }
+    return at;
+}

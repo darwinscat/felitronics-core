@@ -35,7 +35,12 @@ echo "emcc: $(emcc --version | head -1)"
 INC=(-I"$ROOT/tools"
      -I"$ROOT/modules/core/include"
      -I"$ROOT/modules/analysis/include"
-     -I"$ROOT/modules/oversampling/include")
+     -I"$ROOT/modules/oversampling/include"
+     # The offline analyzers compose over the eq/stereo primitives (eq::Crossover2 is the LR4,
+     # stereo::MidSide the M/S pair), so the probe needs their include roots too — felitronics::analysis
+     # itself does not link them, and cannot: eq links analysis, so analysis -> eq would be a cycle.
+     -I"$ROOT/modules/eq/include"
+     -I"$ROOT/modules/stereo/include")
 
 # The mastering ABI pulls in the whole chain. This list is `felitronics::mastering`'s own link list in
 # modules/mastering/CMakeLists.txt, spelled as include paths — plus oversampling, which analysis needs.
