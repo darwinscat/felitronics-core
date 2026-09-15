@@ -276,10 +276,11 @@ public:
     // pays for one lane rather than two.
     //
     // ⚠️ WHAT IT DOES NOT REACH, both named with numbers in the header: a recurrent cell (nothing finite
-    // empties one), a capture whose CONDITIONER is a model of its own (its memory is outside the ledger —
-    // the same hole that under-drains it at a falling edge, 0.905147969723 either way), and NAM's own
-    // partitioned-FFT clock (1.1e-07 against a stage prepared a moment ago, exactly zero against one
-    // clocked to the same point).
+    // empties one) and NAM's own partitioned-FFT clock (1.1e-07 against a stage prepared a moment ago,
+    // exactly zero against one clocked to the same point). A capture whose CONDITIONER is a model of its
+    // own used to belong on that list — its memory was outside the ledger, the same hole that
+    // under-drained it at a falling edge, 0.905147969723 either way — and no longer does: the ledger
+    // counts it, so both readers of it do.
     void reset() noexcept
     {
         // NOTHING, on a backend whose preparation was refused — not even the ledgers — but the REQUEST
