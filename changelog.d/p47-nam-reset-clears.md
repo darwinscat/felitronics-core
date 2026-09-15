@@ -63,13 +63,16 @@ is PRESENT and gets the caller's own samples.
   inside a restart too. The LSTM/ConvNet row of that carve-out went the other way: at this pin a stereo
   LSTM restart of 48 000 samples allocated **nothing** through either gate, the house operator-new counter
   or Eigen's own.
-- **A restart that arrives while the backend is UNPREPARED is parked, not dropped.** `prepare()` writes the
+- **A restart that arrives while the backend is UNPREPARED writes nothing, and is not dropped.** `prepare()` writes the
   new `maxBlock` before it can refuse, so an unprepared backend can carry a block of a billion beside a
   256-sample scratch — a restart that touched it is a heap-buffer-overflow, which is why it touches
   nothing there, ledgers included. Re-arming the debt at the next prepare does not cover the lane that is
   PLAYING (its debt is overwritten on every chunk it is fed), so without the parked intent "play, a
   refused prepare, `reset()`, a prepare that succeeds, play" hands back the old stream: **242 samples** of
-  a delay(514) capture, measured. The request is honoured at the end of the prepare that can honour it.
+  a delay(514) capture, measured. The request was honoured at the end of the prepare that can honour it
+  — and `p85-p86-restart-reachable.md` in this directory has since made that bit unnecessary: every
+  successful prepare restarts, asked or not, so the parked intent is gone and the sequence is closed
+  by the stronger rule.
 - **A recurrent capture stays the NAMED exception, in the mechanism and not only in the comment.** An LSTM
   lane that has already spent its drain reads a debt of zero and is still not empty — the repository's
   slow-cell fixture leaves 0.419413 there — so a recurrent lane that ever played is charged the whole
@@ -93,4 +96,5 @@ is PRESENT and gets the caller's own samples.
   answering for the whole model); `prepare()`, which has the same stale
   window (it is where the 0.224604502320 was first measured); and `rigplayer::RigPlayer`, which has no
   restart verb at all, so a consumer reaching this stage through the player cannot yet call the fix. The
-  last two are what a consumer actually hits.
+  last two are what a consumer actually hits, and both are closed by
+  `p85-p86-restart-reachable.md` in this directory.

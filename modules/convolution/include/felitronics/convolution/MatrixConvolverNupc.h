@@ -136,8 +136,18 @@ public:
         return true;
     }
 
-    // Flush the running history (keeps the live operator). Audio thread; must not race setOperator().
-    void reset() noexcept
+    // 🔴 THE AUDIO THE CALLER FED, AND NOTHING ELSE — every buffer below is written ONLY inside
+    // process(), so this touches no field the message thread owns and cancels no swap. That is the
+    // whole difference from reset(), and it is what lets a composite restart its history on the audio
+    // thread while a filter it published a block ago is still fading in.
+    //
+    // Added for rigplayer::RigPlayer::reset() (P86), against a measured sequence: publish a tone curve,
+    // restart before the 50 ms crossfade ends, and reset() below drops the incoming operator on the
+    // floor — `cur_` stays on the OLD one and `CabConvolver::pendingRetry_` is already false after a
+    // successful publish, so nothing ever re-stages it. The knob move is lost until the next knob move.
+    // Nothing in the repository was calling reset() on a convolver that could be mid-swap before P86,
+    // which is why it stood.
+    void clearAudioState() noexcept
     {
         for (int ch = 0; ch < channels_; ++ch) { std::fill (headHist_[ch].begin(), headHist_[ch].end(), 0.0f); headPos_[ch] = 0; }
         for (int st = 0; st < numStages_; ++st)
@@ -146,9 +156,20 @@ public:
             for (int ch = 0; ch < channels_; ++ch) { std::fill (h.frame[ch].begin(), h.frame[ch].end(), 0.0f); std::fill (h.fdl[ch].begin(), h.fdl[ch].end(), 0.0f); }
             h.phase = 0; h.fdlPos = 0;
         }
+        // BOTH slots' tails, including the incoming operator's: a fade that survives this call keeps
+        // computing that operator's tail from `h.fdl`, which is now zeros, so leaving its tail behind
+        // would feed the new operator the old stream through the back door.
         for (int k = 0; k < 2; ++k)
             for (int st = 0; st < numStages_; ++st)
                 for (int ch = 0; ch < 2; ++ch) std::fill (slot_[k].tail[(std::size_t) st][(std::size_t) ch].begin(), slot_[k].tail[(std::size_t) st][(std::size_t) ch].end(), 0.0f);
+    }
+
+    // Flush the running history (keeps the live operator). Audio thread; must not race setOperator().
+    // It ALSO abandons a swap in flight — see clearAudioState() above for the half that does not, and
+    // for the measurement that made the difference worth a second verb.
+    void reset() noexcept
+    {
+        clearAudioState();
         xfadePos_ = 0;                                 // cancel any pending/active fade
         state_.store (0, std::memory_order_relaxed);   // keep cur_ (the live operator)
     }

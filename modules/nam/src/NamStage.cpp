@@ -165,14 +165,55 @@ public:
             prepared_ = true;
         }
         catch (...) {}   // bad_alloc (or a throwing NAM Reset): stay unprepared, never crash
-        // …and the restart a REFUSED prepare could not honour is honoured here, on the message thread,
-        // where a whole drain length of inference is free. It spends the debt this prepare just
-        // re-charged, i.e. at the NEW rates — the right length, because what it has to flush is what the
-        // old stream left in a network this prepare did not clear. OUTSIDE the try on purpose: reset()
-        // is noexcept, so a throw inside it terminates rather than landing in that catch, and putting it
-        // there would suggest otherwise. It is skipped when this prepare refused too, which leaves the
-        // request parked for the next one.
-        if (prepared_ && restartOwed_)
+        // 🔴 AND THE PREPARATION ENDS IN THE RESTART — ALWAYS, not only when one was asked for. This is
+        // the whole of P85 and it is three lines because P24 and P47 already wrote the mechanism: the
+        // debt `configureRates` just re-charged above is exactly what this stream left in the network,
+        // and reset() is the one thing that spends it. A prepare() is where a host restarts a stream —
+        // every path into this function is a host changing its rate or its block size, and a driver
+        // stops the stream to do either — so "prepared" and "just constructed" now mean the same state,
+        // and the two verbs of this class say one thing. What it replaces is 0.224604502320 out of
+        // DIGITAL SILENCE (−12.97 dBFS) on a dense 2001-tap capture: `::nam::DSP::Reset` calls
+        // SetMaxBufferSize and a prewarm that is ZERO samples for a `Linear`, so `Buffer`'s per-channel
+        // window survived the call — and the grow loop above pushes `maxModelFrames` zeros, which at a
+        // 64-sample block is 80 against a 2001-sample window.
+        //
+        // NO PREDICATE ON "WHAT CHANGED", deliberately: a re-prepare at the SAME rate and block is the
+        // common case (a buffer-size slider moves more often than a rate one) and is exactly where the
+        // old stream's tail was loudest — measured 0.468718945980 there, against 0.469410002232 across
+        // a rate change. A predicate would have fixed the rarer case and left the frequent one.
+        //
+        // IT IS FREE WHERE IT IS CALLED FROM ANYWHERE ELSE, which is what makes this safe to put here
+        // rather than at the four call sites. A backend reached by `prepareModel()`, by `install()`'s
+        // re-prepare, or as `NamStage::prepare()`'s parked `pendingBackend` has never been fed, so
+        // `everFed_` is false on both lanes, `configureRates` charged it nothing, and this spends
+        // nothing — a model change goes through prepare() once, or twice when `install()` finds the host's
+        // numbers moved between the halves, and pays for neither. The one backend that can be dirty is
+        // the LIVE one, and it is reached exactly once per host prepare.
+        //
+        // ⚠️ WHERE IT IS NOT FREE IT IS NOT HIDDEN EITHER: for an architecture whose own Reset already
+        // prewarms (every WaveNet), this drain is a SECOND pass over the field and roughly DOUBLES the
+        // call — a stereo real Standard measured 6.8 ms before and 12.6 ms after at 48 kHz. That is the
+        // message thread, with no callback to miss, and it is the price of one rule instead of two.
+        // Skipping it where NAM's own prewarm provably covers the ledger is a real optimisation and is
+        // registered as one rather than taken here: it is a predicate, and it would put back exactly
+        // the kind of "this case does not need it" reasoning this fix exists to remove.
+        //
+        // OUTSIDE the try on purpose: reset() is noexcept, so a throw inside it terminates rather than
+        // landing in that catch, and putting it there would suggest otherwise. Skipped when this prepare
+        // REFUSED, because chunking by a `maxBlock` a refused prepare already stored is a heap-buffer-
+        // overflow (see reset()); the next prepare that succeeds restarts instead, owed or not — which
+        // is why the `restartOwed_` bit P47 needed here is gone rather than kept as a second answer.
+        //
+        // ⚠️ AND THAT IS A NEW EXPOSURE ON THIS PATH, named rather than hidden: the drain runs NAM's own
+        // `process()`, and for the architectures whose process() allocates (`wavenet_a2_max.nam`, LSTM
+        // and ConvNet temporaries — the same carve-out reset() already inherits) a `bad_alloc` here
+        // TERMINATES, where the identical failure a few lines above, inside `Reset`/the prewarm/the grow
+        // loop, is caught and leaves the backend honestly unprepared. It is exactly the exposure those
+        // captures already carry on the audio thread every block, so it is not a new class; what is new
+        // is that a host's prepare() can now meet it. Catching it here would be worse than the risk: a
+        // half-spent drain caught and swallowed leaves a lane the ledger calls clean and the network
+        // does not, which is the one thing this whole verb exists to make impossible.
+        if (prepared_)
             reset();
     }
 
@@ -283,28 +324,24 @@ public:
     // counts it, so both readers of it do.
     void reset() noexcept
     {
-        // NOTHING, on a backend whose preparation was refused — not even the ledgers — but the REQUEST
-        // is remembered. `prepare()` writes `hostSR`/`maxBlock` before `configureRates` can refuse (law
-        // 11b's disarm-first leaves the object unusable, not consistent), so `maxBlock` can already be
-        // the NEW value while `hush_` and `modelIn` are still the old ones: chunking by it would
-        // `std::fill` past the end of `hush_` and copy past the end of `modelIn` — measured under ASan
-        // as a heap-buffer-overflow, a WRITE 0 bytes past the 1024-byte scratch. A first prepare that
-        // refuses leaves `hush_` empty outright. The ledgers must stay too: they are the only record the
-        // next SUCCESSFUL prepare re-charges the lanes from.
+        // NOTHING, on a backend whose preparation was refused — not even the ledgers. `prepare()` writes
+        // `hostSR`/`maxBlock` before `configureRates` can refuse (law 11b's disarm-first leaves the
+        // object unusable, not consistent), so `maxBlock` can already be the NEW value while `hush_` and
+        // `modelIn` are still the old ones: chunking by it would `std::fill` past the end of `hush_` and
+        // copy past the end of `modelIn` — measured under ASan as a heap-buffer-overflow, a WRITE 0
+        // bytes past the 1024-byte scratch. A first prepare that refuses leaves `hush_` empty outright.
+        // The ledgers must stay too: they are the only record the next SUCCESSFUL prepare re-charges the
+        // lanes from.
         //
-        // 🔴 AND REMEMBERING IT IS NOT DECORATION — a crew round put the sequence up. Re-arming the debt
-        // at the next prepare only helps a lane that is ABSENT, because a PRESENT lane's debt is never
-        // spent (process() overwrites it on every chunk it feeds). So without this bit, "play, a refused
-        // prepare, reset(), a prepare that succeeds, play again" would drop the restart on the floor and
-        // hand back the old stream: measured ~242 samples of a delay(514) capture, the rest of its
-        // window having been pushed out by prepare()'s own scratch warm-up. The restart is instead
-        // honoured at the end of the prepare that CAN honour it, on the message thread, where it is free.
+        // 🔴 AND THE REQUEST NEED NOT BE REMEMBERED, which it was until P85 — a `restartOwed_` bit set
+        // here and read at the end of prepare(). Every successful prepare now restarts whether one was
+        // asked for or not, so the bit had one answer for two questions and is gone. The sequence it was
+        // written for is still closed, and by the stronger rule: "play, a refused prepare, reset(), a
+        // prepare that succeeds, play again" used to hand back ~242 samples of a delay(514) capture (the
+        // rest of its window having been pushed out by prepare()'s own scratch warm-up), and the
+        // succeeding prepare flushes it now with no reset() in the sequence at all.
         if (! prepared_)
-        {
-            restartOwed_ = true;
             return;
-        }
-        restartOwed_ = false;
 
         for (int c = 0; c < 2; ++c)
         {
@@ -511,9 +548,13 @@ private:
         // — NOT zero, which is what "the Reset cleared it" would imply and what an earlier draft of this
         // line said. `DSP::Reset` does not clear a Linear capture's window at all (`Buffer::_input_buffers`
         // survive `SetMaxBufferSize`): measured on the delay fixture, a tone then `prepare()` then silence
-        // replays 0.500000, and on a dense 2001-tap kernel 0.224604502320. A host that changes its buffer
-        // size while a lane is away would otherwise strand that lane's half-spent debt at zero and hand
-        // the tone back on the widen.
+        // replays 0.500000, and on a dense 2001-tap kernel 0.224604502320.
+        // 🔴 AND SINCE P85 THIS LINE IS WHAT THE TAIL OF prepare() SPENDS. The debt charged here is the
+        // whole of what the old stream left, at the NEW rates, and prepare() ends by feeding it (see the
+        // reset() at the end of prepare()) — so the numbers above are what this used to hand back and no
+        // longer does. The charge still has to happen HERE rather than inside that restart, because the
+        // length is a property of the configuration this function has just decided; and it still has to
+        // be a FULL drain rather than a remainder, for a lane that was away with a half-spent debt.
         // …and a lane that was NEVER fed owes nothing, which is not decoration: without `everFed_` a fresh
         // load arms lane 1 on a MONO host and runs a second network for a whole drain — 132 ms of a real
         // WaveNet, per load, for a window that is already the silence state NAM zero-filled it with.
@@ -585,7 +626,6 @@ private:
     bool   recurrent_     = false;          // …and whether the field is a bound at all (LSTM)
     int    drain_[2] { 0, 0 };              // …and how much of that each lane still owes
     bool   everFed_[2] { false, false };    // …and whether it may still be holding some (see reset())
-    bool   restartOwed_ = false;            // …and whether a reset() arrived that prepare() must honour
     std::vector<float> hush_;               // the silence an absent lane is fed, and where its output goes
     Ch     ch[2];
 };

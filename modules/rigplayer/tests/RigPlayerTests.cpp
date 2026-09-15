@@ -1831,5 +1831,308 @@ int main() {
         }
     }
 
+    group("P86: reset() — the restart a product can actually call, through the player");
+    {
+        // 🔴 WHY THIS GROUP EXISTS. P47 made `nam::NamStage::reset()` an exact stream restart, and it
+        // was unreachable from the product: orbit-amp reaches a NamStage only through this class, whose
+        // `releaseResources()` is empty and which overrides no host reset, and this class had no
+        // restart verb and never called `nam_[i].reset()`. P85 opened HALF that road — `prepare()`
+        // performs the restart now, and `RigPlayer::prepare()` already forwards to it — and P86 opens
+        // the other half, the verb a host can call without reconfiguring. So the gate that matters is
+        // not "the stage flushes", which the nam suite owns, but "the player flushes, asked the way the
+        // product asks", by BOTH verbs.
+
+        // A DEVICE WITH MEMORY. The bench's own captures are memoryless gains, which cannot tell a
+        // flush from a no-op: every fixture here is a `delayModel`, whose whole output IS what it was
+        // fed `d` samples ago, so anything left behind is audible at full amplitude.
+        const auto memoryRig = [] {
+            namz::rig::Rig r;
+            namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+            namz::rig::Control g; g.name = "gain"; g.role = namz::rig::Role::Gain;
+            g.values = { "60", "150", "240" }; g.sweep = 300;
+            st.device.controls = { g };
+            namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+            namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+            namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+            st.device.files = { fe, fm, fl };
+            r.chain = { st };
+            return r;
+        }();
+
+        // 1. SILENCE IN, EXACT ZERO OUT, after the restart — at a rate where a rate-matcher IS
+        //    installed (44.1 kHz) and one where it is not (48 kHz), mono and stereo, and through BOTH
+        //    verbs: reset() is P86's, prepare() is P85's arriving at the same door.
+        for (const double fs : { 44100.0, 48000.0 })
+        for (const int nch : { 1, 2 })
+        for (int viaPrepare = 0; viaPrepare < 2; ++viaPrepare)
+        {
+            const std::string where = std::string(viaPrepare != 0 ? "prepare()" : "reset()") + " at "
+                                    + std::to_string((int) fs) + " Hz, " + std::to_string(nch) + " ch";
+            RigPlayer p;
+            if (! p.prepare(fs, kBlock, nch)) { ok(false, "the P86 fixture prepares — " + where); continue; }
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(delayModel(513)) },
+                { "mid",   bytesOf(delayModel(514)) },
+                { "late",  bytesOf(delayModel(515)) },
+            };
+            if (! p.load(memoryRig, [&files](const std::string& id) {
+                    const auto it = files.find(id);
+                    return it == files.end() ? std::vector<std::byte> {} : it->second; }))
+            { ok(false, "the P86 fixture loads — " + where); continue; }
+
+            std::vector<float> l((std::size_t) kBlock), r((std::size_t) kBlock);
+            float* io[2] { l.data(), r.data() };
+            double phase = 0.0, charged = 0.0;
+            for (int k = 0; k < 120; ++k) {                       // long enough for a capture to land
+                for (int i = 0; i < kBlock; ++i) {
+                    const float v = (float) (0.5 * std::sin(phase));
+                    phase += 2.0 * 3.14159265358979323846 * 220.0 / fs;
+                    l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                }
+                felitronics::test::run(p.process(io, nch, kBlock));
+                p.serviceHere();
+                if (k > 60) for (int i = 0; i < kBlock; ++i) charged = std::fmax(charged, (double) std::fabs(l[(std::size_t) i]));
+            }
+            ok(charged > 0.1, "precondition: the capture really sounds — " + where);
+
+            if (viaPrepare != 0) felitronics::test::run(p.prepare(fs, kBlock, nch));
+            else                 p.reset();
+
+            double worst = 0.0; bool finite = true;
+            for (int k = 0; k < 60; ++k) {
+                std::fill(l.begin(), l.end(), 0.0f); std::fill(r.begin(), r.end(), 0.0f);
+                felitronics::test::run(p.process(io, nch, kBlock));
+                p.serviceHere();
+                for (int i = 0; i < kBlock; ++i)
+                    for (const float v : { l[(std::size_t) i], r[(std::size_t) i] }) {
+                        worst = std::fmax(worst, (double) std::fabs(v));
+                        finite = finite && std::isfinite(v);
+                    }
+            }
+            ok(finite && worst == 0.0,
+               "digital silence in, FINITE EXACT ZERO out after " + where + " — worst " + std::to_string(worst));
+        }
+
+        // 2. THE TONE STACK IS STILL THERE AFTERWARDS. prepare() retires the bands (`bandRt_.count = 0`)
+        //    because their coefficients were designed for the old rate and `rebuildBands()` follows it.
+        //    Copying that line into reset() — which nothing follows — switches the tone stack OFF until
+        //    the next message-thread publish: `runBands` walks `count`, and only `rebuildBands` raises
+        //    it again. The shelf below would read 0 dB instead of its +6.
+        {
+            Bench b(rig);
+            ok(b.p.setDial("tone", 300.0), "the shelf is taken to its plus stop");
+            const double before = db(b.gainAt(10000.0) / b.gainAt(100.0));
+            b.p.reset();
+            const double after = db(b.gainAt(10000.0) / b.gainAt(100.0));
+            approx(after, shelfDb(6.0, kFs), 0.1, "a restart leaves the BANDS designed and running, not retired"
+                                                  " — the shelf still reads its +6 dB");
+            approx(after, before, 0.05, "…and reads the same as it did before the restart");
+        }
+
+        // 3. A FILTER PUBLISHED AND NOT YET LIVE SURVIVES THE RESTART. `MatrixConvolverNupc::reset()`
+        //    flushes the history AND cancels the swap, keeping `cur_` on the OLD operator — and
+        //    `CabConvolver`'s retry flag is already clear after a successful publish, so nothing ever
+        //    re-stages it. A restart landing between a knob move and the end of its 50 ms crossfade
+        //    would therefore lose the knob move for good. The restart here takes the `clearAudioState()`
+        //    half instead, which touches only what process() writes. No process() call stands between
+        //    the publish and the restart, so the operator is still merely STAGED when it arrives.
+        {
+            Bench b(rig);
+            const double refLo = b.gainAt(60.0);
+            ok(b.p.setDial("bass", 300.0), "a curve is published — +6 dB at 60 Hz");
+            b.p.reset();                                     // …before a single block has picked it up
+            approx(db(b.gainAt(60.0) / refLo), 6.0, 0.6, "a restart keeps a filter that was published and"
+                                                         " not yet live — the curve is still applied");
+            ok(b.p.curveActive(0), "…and the player still reports a FIR on the pre side");
+        }
+
+        // 4. THE PROMISE IS INDEPENDENCE. Two players fed DIFFERENT audio, restarted, then handed the
+        //    same programme: identical bits. This is what a consumer can act on, and it is what a
+        //    PARTIAL flush would break while the exact-zero gate above still passed.
+        //
+        //    🔴 AND THE FIXTURE HAS TO CARRY EVERY PLACE THAT HOLDS SAMPLES, OR IT CERTIFIES NOTHING.
+        //    The first version of this used the bench's own rig and a review round took it apart: its
+        //    captures are memoryless gains, so the MODELS could go unflushed and it still passed; its
+        //    tone dial sits at the 0 dB reference, so the BANDS were never running; and no file carries
+        //    a lag, so `blendDelay` returns before it touches `lagTail_` and an uncleared alignment
+        //    tail survived the whole suite. Four different half-flushes read green. So this one is
+        //    built with delay captures (memory), an alignment table (a real per-slot lag), the shelf
+        //    off its reference (live biquads), the curve up (a live FIR) and the blend mid-travel
+        //    (the dry ring) — and the assertions below name which of those is exercised.
+        for (const double fs : { 44100.0, 48000.0 })
+        {
+            Bench one(rig, 1, fs), two(rig, 1, fs);
+            const std::map<std::string, std::vector<std::byte>> memoryFiles {
+                { "g60",  bytesOf(delayModel(300)) }, { "g150", bytesOf(delayModel(514)) },
+                { "g240", bytesOf(delayModel(700)) }, { "r150", bytesOf(delayModel(200)) },
+            };
+            // 🔴 THE LAG HAS TO LAND ON THE SLOT THAT SOUNDS, and getting that backwards is why the
+            // first version of this fixture let an uncleared `lagTail_` through the whole suite.
+            // `AlignmentTable::delayOf` holds every model back to the SLOWEST — `max(0, latest - me)`
+            // — so the file with the LARGEST lag is the one delayed by NOTHING. Writing 7 against the
+            // capture the dial sits on therefore gave the delay to its silent neighbour, `blendDelay`
+            // returned before touching the tail, and the mutation stand said so.
+            AlignmentTable table;
+            table.lagByFile = { { "g60", 0 }, { "g150", 0 }, { "g240", 16 }, { "r150", 0 } };
+            table.sampleRate = fs;
+            bool knobs = true;
+            for (Bench* b : { &one, &two }) {
+                b->files = memoryFiles;
+                b->load(rig);                                  // …re-fetched, so the captures have MEMORY
+                b->p.setAlignment(table);
+                knobs = b->p.setDial("tone", 300.0)             // the shelf off its reference: live biquads
+                      && b->p.setDial("bass", 300.0)             // the curve up: a live FIR
+                      && b->p.setDial("mix",  150.0) && knobs;   // mid-blend: the dry ring is read
+            }
+            ok(knobs, "precondition: every knob of the independence fixture took — "
+               + std::to_string((int) fs) + " Hz");
+            std::vector<float> a((std::size_t) kBlock), c((std::size_t) kBlock);
+            float* ioA[1] { a.data() }; float* ioC[1] { c.data() };
+            double phase = 0.0; std::uint32_t noise = 12345u;
+            for (int k = 0; k < 80; ++k) {                    // one a tone, the other white noise
+                for (int i = 0; i < kBlock; ++i) {
+                    a[(std::size_t) i] = (float) (0.4 * std::sin(phase));
+                    phase += 2.0 * 3.14159265358979323846 * 311.0 / fs;
+                    noise = noise * 1664525u + 1013904223u;
+                    c[(std::size_t) i] = (float) ((double) (noise >> 8) / 16777216.0 - 0.5);
+                }
+                felitronics::test::run(one.p.process(ioA, 1, kBlock)); one.p.serviceHere();
+                felitronics::test::run(two.p.process(ioC, 1, kBlock)); two.p.serviceHere();
+            }
+            one.p.reset(); two.p.reset();
+            long long diff = 0; double p2 = 0.0, loud = 0.0;
+            for (int k = 0; k < 60; ++k) {
+                for (int i = 0; i < kBlock; ++i) {
+                    const float v = (float) (0.35 * std::sin(p2) * std::sin(0.017 * p2));
+                    p2 += 2.0 * 3.14159265358979323846 * 220.0 / fs;
+                    a[(std::size_t) i] = c[(std::size_t) i] = v;
+                }
+                felitronics::test::run(one.p.process(ioA, 1, kBlock)); one.p.serviceHere();
+                felitronics::test::run(two.p.process(ioC, 1, kBlock)); two.p.serviceHere();
+                for (int i = 0; i < kBlock; ++i) {
+                    if (a[(std::size_t) i] != c[(std::size_t) i]) ++diff;
+                    loud = std::fmax(loud, (double) std::fabs(a[(std::size_t) i]));
+                }
+            }
+            ok(loud > 0.05, "precondition: the programme after the restart really sounds — "
+               + std::to_string((int) fs) + " Hz, peak " + std::to_string(loud));
+            // …and the precondition is about the AUDIBLE slot, not about any slot: `liveMix()` is the
+            // applied weight of slot 1, so the heavier one is the one whose tail can be heard.
+            {
+                const int loud = one.p.liveMix() >= 0.5f ? 1 : 0;
+                ok(one.p.appliedSlotDelay(loud) > 0,
+                   "precondition: the slot that SOUNDS carries an alignment delay, so lagTail_ is in play"
+                   " — slot " + std::to_string(loud) + " delay " + std::to_string(one.p.appliedSlotDelay(loud))
+                   + ", weight " + std::to_string(one.p.liveMix()));
+            }
+            ok(one.p.curveActive(0), "precondition: a FIR is really running on the pre side");
+            ok(diff == 0, "a tone and white noise before the restart leave the same PLAYER behind — "
+               + std::to_string((int) fs) + " Hz (" + std::to_string(diff) + " differing samples)");
+        }
+
+        // 4b. A RESTART LANDING INSIDE A BAND RAMP LEAVES THE SAME PLAYER AS ONE LANDING AFTER IT.
+        //     This is what `clearAudioState()`'s `bandPos_ = bandLen_ = 0` and the one surviving line
+        //     of the band snap are FOR, and nothing else in this file exercised either: the mutation
+        //     stand ran "a band ramp in flight survives the restart" and "bandCur_ is left mid-glide"
+        //     and both came back green, which is a gap in the suite and not a property of the code.
+        //     Two players, the same programme: one is restarted ONE BLOCK into a long ramp, the other
+        //     after the ramp has arrived. A restart ends the parameter epoch, so the two must be
+        //     bit-identical from there on — and a ramp that survives it, or a `bandCur_` left where
+        //     the glide abandoned it, makes them differ.
+        for (const double fs : { 44100.0, 48000.0 })
+        {
+            Bench mid(rig, 1, fs), settled(rig, 1, fs);
+            // A SLOW band: the ramp length is the band's own (bandRampLength), and a big jump on a
+            // narrow bell buys the longest one the rails allow — 42.7 ms, which is 1837 samples at
+            // 44.1 kHz against the 256-sample block below.
+            ok(mid.p.setDial("tone", 0.0) && settled.p.setDial("tone", 0.0), "both start at the shelf's minus stop — "
+               + std::to_string((int) fs) + " Hz");
+            std::vector<float> a((std::size_t) kBlock), c((std::size_t) kBlock);
+            float* ioA[1] { a.data() }; float* ioC[1] { c.data() };
+            double phase = 0.0;
+            const auto feed = [&](Bench& b, float* const* io, std::vector<float>& x, int blocks, double& ph) {
+                for (int k = 0; k < blocks; ++k) {
+                    for (int i = 0; i < kBlock; ++i) {
+                        x[(std::size_t) i] = (float) (0.35 * std::sin(ph));
+                        ph += 2.0 * 3.14159265358979323846 * 220.0 / fs;
+                    }
+                    felitronics::test::run(b.p.process(io, 1, kBlock)); b.p.serviceHere();
+                }
+            };
+            double phB = 0.0;
+            feed(mid, ioA, a, 40, phase); feed(settled, ioC, c, 40, phB);
+            // …the hand moves, and the band starts travelling.
+            ok(mid.p.setDial("tone", 300.0) && settled.p.setDial("tone", 300.0), "the hand crosses the whole shelf");
+            double ph1 = phase, ph2 = phB;
+            feed(mid, ioA, a, 1, ph1);            // one block in: the ramp is in flight
+            mid.p.reset();
+            feed(settled, ioC, c, 24, ph2);       // …and this one lets it arrive first
+            settled.p.reset();
+            // 🔴 AND THE HAND MOVES AGAIN AFTER THE RESTART, which is the only thing that can see the
+            // one surviving line of the band snap. `runBands`'s arrival loop starts the NEW ramp from
+            // `bandCur_`; the restart set that to `bandTo_`, so both players begin the next glide from
+            // the same coefficients. Without it the one restarted MID-ramp begins from where its glide
+            // had got to and never reached — inaudible on its own, and a different filter trajectory.
+            // Without this line the mutation stand runs "bandCur_ is left mid-glide" and it SURVIVES.
+            ok(mid.p.setDial("tone", 60.0) && settled.p.setDial("tone", 60.0),
+               "…and the hand moves again after the restart");
+            long long diff = 0; double loud = 0.0, p3 = 0.0;
+            for (int k = 0; k < 40; ++k) {
+                for (int i = 0; i < kBlock; ++i) {
+                    const float v = (float) (0.3 * std::sin(p3) * std::sin(0.013 * p3));
+                    p3 += 2.0 * 3.14159265358979323846 * 330.0 / fs;
+                    a[(std::size_t) i] = c[(std::size_t) i] = v;
+                }
+                felitronics::test::run(mid.p.process(ioA, 1, kBlock));      mid.p.serviceHere();
+                felitronics::test::run(settled.p.process(ioC, 1, kBlock));  settled.p.serviceHere();
+                for (int i = 0; i < kBlock; ++i) {
+                    if (a[(std::size_t) i] != c[(std::size_t) i]) ++diff;
+                    loud = std::fmax(loud, (double) std::fabs(a[(std::size_t) i]));
+                }
+            }
+            ok(loud > 0.05, "precondition: the programme after the restart sounds — "
+               + std::to_string((int) fs) + " Hz, peak " + std::to_string(loud));
+            ok(diff == 0, "a restart one block INTO a band ramp leaves the same player as one after the ramp"
+                          " arrived — " + std::to_string((int) fs) + " Hz (" + std::to_string(diff)
+                          + " differing samples)");
+        }
+
+        // 5. THE GAINS LAND ON THEIR TARGETS. A restart restarts the parameter epoch as well as the
+        //    audio — `eq::EqBand::reset()` settled that for the house, and with a number: a band left
+        //    mid-ramp made a second render of the same programme differ from a fresh one by 0.51 full
+        //    scale. Nothing else in this group can see it: both sides of an independence test ramp
+        //    identically, because a ramp is a function of the block count and the target and not of
+        //    the audio. So it is asked directly — the level is moved and the restart must ARRIVE at it
+        //    rather than glide, which is what prepare() already does with the same six lines.
+        {
+            Bench b(rig);
+            b.rms(220.0, 0.25, 8, 8);                        // …a stream, so the ramps are somewhere
+            b.p.setHostInputDb(-20.0);                       // …and the hand moves, arming a glide
+            b.p.reset();
+            std::vector<float> x((std::size_t) kBlock);
+            float* io[1] { x.data() };
+            std::fill(x.begin(), x.end(), 0.5f);             // DC: whatever gain is applied IS the reading
+            felitronics::test::run(b.p.process(io, 1, kBlock));
+            const double first = std::fabs((double) x[0]) / 0.5;
+            // The capture at the default dial is the 0.5 gain (`g150`), and the pack's own levels are
+            // unity on this rig, so the only thing between input and output is the host's -20 dB.
+            approx(db(first / 0.5), -20.0, 0.5, "the first sample after a restart is AT the level the hand"
+                                                " asked for, not gliding toward it — read "
+                                                + std::to_string(db(first / 0.5)) + " dB");
+        }
+
+        // 6. IDEMPOTENT AND CHEAP WHEN THERE IS NOTHING TO DO, and callable before anything is sized.
+        {
+            RigPlayer fresh;
+            fresh.reset();                                   // unprepared: nothing to restart, no crash
+            ok(! fresh.prepared(), "a restart on an unprepared player does nothing and leaves it unprepared");
+            Bench b(rig);
+            b.p.reset(); b.p.reset();
+            std::vector<float> x((std::size_t) kBlock, 0.0f);
+            float* io[1] { x.data() };
+            ok(b.p.process(io, 1, kBlock), "…and two restarts in a row leave a prepared player playable");
+        }
+    }
+
     return felitronics::test::report();
 }

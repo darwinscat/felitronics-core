@@ -55,6 +55,43 @@ public:
     // Allocate the mono scratch for this stream and (re)configure a live model for the
     // new sample-rate / block size. Message/host thread (prepareToPlay) — never the audio
     // thread (it can allocate + prewarm the network).
+    //
+    // 🔴 WHAT IT PROMISES ABOUT STATE, AND IT IS THE SAME SENTENCE reset() MAKES: a prepared stage holds
+    // no audio the caller fed. Nothing played before this call can be heard after it — at any rate, on
+    // any shape, and whether or not the rate or the block size actually changed. "Prepared" and "just
+    // constructed" name one state, so the two verbs of this class do not have to be read against each
+    // other. The exceptions are reset()'s three, word for word, because this IS reset(): a recurrent
+    // cell, a capture whose conditioner is a model of its own, and NAM's own partitioned-FFT clock.
+    //
+    // It is NOT "silence comes out" and not, in general, bit-identity with a stage prepared a moment
+    // ago — the same two qualifications reset() carries below, for the same reasons.
+    //
+    // ⚠️ WHAT IT COSTS. Where it charges anything, the charge is reset()'s: one lane's whole drain
+    // length of inference per lane that has EVER been fed — 3.77 ms for a real Standard WaveNet at a
+    // 64-sample block, per lane. This call is already the expensive one (it allocates and prewarms the
+    // network), it is the message thread's, and it has no callback to miss. A FIRST prepare after a
+    // load costs nothing at all — nothing has been fed, so there is nothing owed — and neither does the
+    // re-prepare a model swap performs, for the same reason. The lane a permanently mono host never
+    // hands over is never charged either. For an architecture whose own Reset already PREWARMS (every
+    // WaveNet), this drain is a second pass over the field and roughly doubles the call: a stereo real
+    // Standard measured 6.5 ms before and 13.1 ms after at 48 kHz.
+    //
+    // ⚠️ AND THE COST NOW SCALES WITH THE HOST RATE, which it did not before and which no caller would
+    // guess. The drain is the field converted into HOST samples, so a rate-matched capture is charged
+    // `ceil((field + ring + taps) · hostSR/modelRunSR)` of them: measured on a delay(514) capture,
+    // stereo, 0.3 ms at 48 kHz, 7.2 ms at 192 kHz, 12.5 ms at 3 MHz, 174 ms at 1e8 Hz and 1.6 s at
+    // 1e9 Hz, and at the precondition's own ceiling the length clamps at INT_MAX − 1 per lane. Inside
+    // the rates a host offers this is nothing; a caller that prepares this stage at an arbitrary rate
+    // is buying inference proportional to it. `rigplayer::RigPlayer` is not exposed to it — its
+    // usableSampleRate() substitutes 48 kHz outside (0, 3e6] — but a direct consumer of this class is.
+    //
+    // 🔴 THIS USED TO BE THE OTHER HALF OF THE DEFECT P47 CLOSED IN reset(), and it is where the number
+    // was first measured: a tone, then this call, then digital silence at full width answered
+    // 0.224604502320 — −12.97 dBFS — on a dense 2001-tap capture at 48 kHz, because `::nam::DSP::Reset`
+    // calls SetMaxBufferSize and then a prewarm that is ZERO samples for a `Linear`, so `Buffer`'s
+    // per-channel window survived. There is deliberately no predicate on what changed: a re-prepare at
+    // the SAME rate and block is the common case (a host's buffer-size slider moves more often than its
+    // rate one), and it is exactly the case that leaked loudest.
     void prepare (double sampleRate, int maxBlock);
 
     // 🔴 THE STREAM RESTART, AND IT MEANS IT. Audio thread (or any thread with audio stopped): every
