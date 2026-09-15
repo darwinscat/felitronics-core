@@ -83,6 +83,39 @@ public:
     // what orbit-amp's own `sameRate` already uses — the family agrees on what "the same rate" means.
     static constexpr double kRateMatchTolerance = 1.0e-6;
 
+    // 🔴 THE CEILING ON A HOST RATE. Its job is not taste — 3 MHz is sixteen times the highest rate any
+    // DAW offers — but to keep every `(int) f(sampleRate)` below INSIDE int and every buffer it sizes
+    // inside memory. Two conversions in prepare() were undefined without it (the IR-sample count and the
+    // crossfade length, both from a rate this class accepted unchecked), and `normalizationGain` sized an
+    // analysis window from `lround(hostSr_)`.
+    //
+    // The VALUE is the house convention, not a new number: dynamics::Compressor::kMaxSampleRate and
+    // limiter::TruePeakLimiter::kMaxSampleRate are both 3.0e6 with the same stated reason, eq::EqBand
+    // refuses past the same figure as a literal, and rigplayer::RigPlayer spells it a fourth time while
+    // naming the duplication as its own disease. This is the fifth spelling; consolidating them is still
+    // its own task, and convolution links none of those modules, so it cannot simply ask.
+    static constexpr double kMaxSampleRate = 3.0e6;
+
+    // The IR budget prepare() will ask the backend for, as a pure function of the two arguments that
+    // decide it — PUBLIC because it is the only way to pin the saturation without building the thing it
+    // sizes: a budget of kMaxIrSamples is a 1.34 GB partition schedule (measured), which no test tier
+    // should allocate to prove an arithmetic clamp. CLAMPED IN DOUBLE, BEFORE THE CAST — the ceiling used
+    // to be applied to the result of `(long long) std::ceil(...)`, one step too late, since the conversion
+    // is undefined for an argument outside long long's range: on arm64 a `maxIrSeconds` of +inf produced
+    // LLONG_MAX and a one-sample crossfade (a hard switch, not a fade), on x86-64 it saturates the other
+    // way. Saturating in double first leaves every representable request exactly where it was.
+    // TOTAL, not merely documented: this is public, so it answers for every double a caller can type. A
+    // comment is not a precondition — `std::min (NaN, ceiling)` returns the NaN (the comparison is false,
+    // so it keeps the first argument) and converting that to int is undefined, which is the very defect
+    // this function exists to have fixed one line further up. `! (want > 0.0)` is false for a NaN and for
+    // everything at or below zero, so both leave through the same door.
+    [[nodiscard]] static int maxIrSamplesFor (double sampleRate, double maxIrSeconds) noexcept
+    {
+        const double want = std::ceil (maxIrSeconds * sampleRate);
+        if (! (want > 0.0)) return 0;
+        return (int) std::min (want, (double) Conv::kMaxIrSamples);
+    }
+
     // maxIrSeconds sizes the NUPC partition schedule (the fixed IR-length cap — see IR-LENGTH CAP above).
     // The default matches the historical value; cab IRs are far shorter, so the cap is generous headroom.
     // normalize=false skips the reference-unity RMS normalization (LOUDNESS above) — a REVERB IR is a
@@ -96,16 +129,47 @@ public:
                                 bool normalize = true)
     {
         prepared_ = false;                       // law 11: a REFUSED prepare leaves the object unusable,
+        // ...AND UNUSABLE MEANS THE WHOLE OBJECT, NOT JUST THE FLAG. The pending-retry geometry used to be
+        // cleared only on the way OUT of a successful prepare, so a refusal in between left `pendingRetry_`
+        // true — after which `isBusy()` answered true for the life of the object and `flushPending()` could
+        // never publish it, because it returns on `! prepared_`. Reachable in four calls: prepare, start a
+        // fade, load again so the convolver rejects it, then re-prepare with anything it refuses. The width
+        // refusal below could already do this; the rate and duration refusals would have widened it.
+        pendingRetry_ = false;
+        pendingLen_   = 0;
+        pendingNch_   = 0;
         if (numChannels < 1 || numChannels > 2)  // the way Compressor and TruePeakLimiter already do —
             return false;                        // otherwise a rejected re-prepare silently keeps the old one
-        hostSr_    = sampleRate > 0.0 ? sampleRate : 48000.0;
+        // 🔴 THE RATE IS BINDING TOO, and it used to be GUESSED: `sampleRate > 0.0 ? sampleRate : 48000.0`
+        // answered a rate it had not been given with the factory one, and then sized a convolver from the
+        // answer — a host at 44.1 kHz that asked with a zero got a 48 kHz crossfade and a 48 kHz IR budget
+        // and was told the object was ready. Law 11(b) says every argument prepare() takes is binding and a
+        // value it cannot honour is refused HERE, which is what Compressor and TruePeakLimiter do.
+        // Spelled as a RANGE and positively: `> 0.0` is false for a NaN and `<= kMaxSampleRate` is false for
+        // an infinity, so between them they exclude everything std::isfinite would have — and an infinity is
+        // what made `(long long) std::ceil (maxIrSeconds * hostSr_)` and `(int) std::lround (0.05 * hostSr_)`
+        // below undefined. THE UNKNOWN-RATE RULE BELOW IS NOT THIS RULE: an IR file's broken metadata is
+        // data, and loads as is; a host that cannot name its own clock is a broken call.
+        if (! (sampleRate > 0.0 && sampleRate <= kMaxSampleRate)) return false;
+        hostSr_    = sampleRate;
         channels_  = numChannels;
         maxBlock_  = std::max (1, maxBlock);                // retained for API parity — NUPC is block-independent
         normalize_ = normalize;
 
         // Fixed schedule: head kNupcHeadPartition + doubling + one uniform tail covering maxIrSamples.
-        const long long maxIr = (long long) std::ceil (std::max (0.0, maxIrSeconds) * hostSr_);
-        const int maxIrSamples = (int) std::min<long long> (maxIr, (long long) Conv::kMaxIrSamples);
+        // CLAMPED IN DOUBLE, BEFORE THE CAST — the ceiling used to be applied to the result of
+        // `(long long) std::ceil(...)`, which is one step too late: the conversion is undefined for an
+        // argument outside long long's range, so `maxIrSeconds` of 1e300 (or, once the rate was unbounded,
+        // an ordinary four seconds at an infinite rate) was undefined BEFORE anything got capped. Saturating
+        // in double first leaves every representable request exactly where it was.
+        // A DURATION HAS TO BE A NUMBER, AND NOT A NEGATIVE ONE. `std::max (0.0, NaN)` returns its first
+        // operand, so a NaN duration used to prepare successfully with a zero IR budget — which is not
+        // silence (the backend always allocates its 128-sample head, so the cab played its first 128 taps)
+        // but is certainly not what the caller asked for either, and neither is the zero a negative request
+        // was quietly turned into. Law 11(b) again: a value prepare() cannot honour is refused here. +inf
+        // is honoured and means the backend's own ceiling, which is what every huge finite value already got.
+        if (! (maxIrSeconds >= 0.0)) return false;
+        const int maxIrSamples = maxIrSamplesFor (hostSr_, maxIrSeconds);
         // juce swapped IRs over a 50 ms crossfade — match it (the migration spec's verified parity value).
         const int crossfadeSamples = std::max (1, (int) std::lround (0.05 * hostSr_));
 
@@ -245,6 +309,13 @@ private:
         // trims), and the trim drag re-runs this per mouse move — the cap keeps the drag light.
         const int cap = std::min (len, (int) std::lround (hostSr_));
         int N = 256; while (N < cap * 2 && N < (1 << 21)) N <<= 1;   // dense DTFT sampling of the IR
+        // AN ANALYSIS WINDOW CANNOT BE LONGER THAN THE TRANSFORM THAT CARRIES IT. N stops doubling at
+        // 1<<21, so above a megasample of window the two part company and the copy below ran off the end of
+        // `padded`: measured under ASan as a 12 MB heap-buffer-overflow WRITE for a 3 000 000-sample IR at a
+        // 4 MHz host — reachable through the public loadIR, and still reachable inside the 3 MHz rate
+        // ceiling. The window is the first second OR the transform, whichever is shorter; past that the
+        // truncation is the cap doing its job, not a defect.
+        const int used = std::min (cap, N);
         felitronics::core::fft::DefaultRealFft fft;
         if (! fft.prepare (N)) return 1.0f;
 
@@ -254,7 +325,7 @@ private:
         for (const auto& ch : taps)
         {
             std::fill (padded.begin(), padded.end(), 0.0f);
-            std::copy (ch.begin(), ch.begin() + std::min<std::ptrdiff_t> (cap, (std::ptrdiff_t) ch.size()),
+            std::copy (ch.begin(), ch.begin() + std::min<std::ptrdiff_t> (used, (std::ptrdiff_t) ch.size()),
                        padded.begin());
             fft.forward (padded.data(), spec.data());
             power[0]                    += (double) spec[0] * spec[0];                 // DC (unused below)
