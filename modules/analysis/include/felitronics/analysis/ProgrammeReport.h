@@ -147,20 +147,26 @@ namespace felitronics::analysis
 //     with canonical zeros for a channel the caller stopped delivering, so that edge never fires. Feeding
 //     silence is also the honest state for a whole-programme report: law 11c's "the channel heard
 //     silence", and exactly what `ReferenceTruePeakMeter::drain()` feeds a stopped channel anyway.
-// PROMISED SINCE v0.33.0, AND WITH ONE CONDITION NAMED. Bit-identity between platforms, toolchains and
-// libms holds FOR A BUILD THAT DOES NOT CONTRACT — which both shipped roads are: tools/CMakeLists.txt and
-// tools/wasm/build.sh compile with -ffp-contract=off. Measured there, not assumed: `fcore_measure report`
-// on the same programme is byte-identical across Apple clang/arm64, gcc 14/glibc x86-64 and wasm32/musl,
-// at 48 and 44.1 kHz.
-// It does NOT hold for a build that contracts. The library's own default is -ffp-contract=on (law 10), and
-// the arithmetic AROUND the deterministic calls is contractible even though the calls themselves are
-// pinned: rebuilding this tool with contraction on moves 4 lines of the report and 13 of lowend (measured
-// on Apple arm64). What core::det removed is the libm's share of the divergence, which was the part no
-// build flag could reach; the contraction share is a flag, and it is the caller's.
-// This paragraph said the opposite before v0.33.0 — no cross-platform bit-identity at all, because `log10`
-// and `pow` are not bit-portable — and that was true when it was written. `sqrt` is exactly rounded by
-// IEEE-754 and never was the problem. The filters underneath are DeterministicCrossover2 /
-// DeterministicKWeightingFilter / DeterministicLoudnessMeter for the same reason; see core::DetMath.
+// CROSS-ROW BIT-IDENTITY: MEASURED, AND NOT YET GUARANTEED BY CONSTRUCTION. Say the weaker thing,
+// because it is the true one.
+//   WHAT IS MEASURED: `fcore_measure report` on the fixtures this release ships is byte-identical across
+//   Apple clang/arm64, gcc 14/glibc x86-64 and wasm32/musl, at 48 and 44.1 kHz — every count and all 31
+//   scalars. That holds for a build that does NOT contract, which both shipped roads are
+//   (-ffp-contract=off in tools/CMakeLists.txt and tools/wasm/build.sh); rebuilt with the library's own
+//   default of contraction on, 4 lines move, because the arithmetic AROUND the deterministic calls is
+//   contractible even though the calls are pinned.
+//   WHAT IS NOT YET GUARANTEED: three derivations still reach the system libm, so an input outside the
+//   measured fixtures could still diverge. `core::offline::fftInplace` builds its stage twiddles with
+//   std::cos/std::sin (OfflineFft.h); `core::gainToDb` is std::log10 (Math.h) and the dBTP field goes
+//   through it; and ReferenceTruePeakMeter designs its oversampler taps with std::sin
+//   (PolyphaseOversampler.h). Those three are P80's scope — the audit of everything core::det did not
+//   reach — and two of them are RT modules whose bits are a shipped product's sound, so moving them is a
+//   decision and not a refactor.
+//   WHAT CHANGED IN v0.33.0: the transcendentals that DECIDE this report — every dB value, every
+//   threshold, the window every power bin is multiplied by — run through `core::det`, which is one
+//   implementation compiled into every build rather than whatever the row's libm happens to be. That was
+//   the share no build flag could reach, and before v0.33.0 this paragraph said there was no
+//   cross-platform identity at all, which was true then.
 //
 // NON-FINITE INPUT. A non-finite sample is a HOLE: a canonical 0.0f goes into every filter, the sample
 // enters no statistic, and it is counted per channel. What that invalidates is drawn along one line —
@@ -484,12 +490,23 @@ public:
         }
     };
 
+    static constexpr int kMaxBlockLimit = 1 << 24;   // see storageFor(): the product below must not wrap
+
     static Storage storageFor (double sampleRate, int maxBlock, int maxChannels,
                                const ProgrammeReportParams& p) noexcept
     {
         Storage st;
         if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return st;   // NaN fails too
-        if (maxBlock < 1 || maxChannels < 1 || maxChannels > core::kMaxChannels) return st;
+        // ⚠ maxBlock CARRIES AN UPPER BOUND, and it is not decoration. This is the one analyzer that
+        // sizes an allocation by it — scratchFloats is maxBlock * maxChannels — and on wasm32 `size_t` is
+        // 32 bits, so 1 << 28 frames at 16 channels WRAPS THAT PRODUCT TO ZERO. prepare() would then
+        // accept the wrapped budget, allocate nothing, and process() would index the scratch with the
+        // original maxBlock_: an out-of-bounds write, and a law-11d violation in the one place where
+        // law 11d is the whole point — the published budget would not be the allocated one. The bound is
+        // 1 << 24 frames, the same ceiling LowEnd puts on its own count, which is 349 seconds at 48 kHz
+        // and six times the largest block any host has ever asked for.
+        if (maxBlock < 1 || maxBlock > kMaxBlockLimit) return st;
+        if (maxChannels < 1 || maxChannels > core::kMaxChannels) return st;
         if (! (p.tailWindowMs > 0.0 && p.tailWindowMs <= 60000.0)) return st;
         if (! (p.infraLowHz >= 1.0 && p.infraLowHz <= 0.45 * sampleRate)) return st;       // Svf would CLAMP
         if (! (p.silenceThresholdDb <= 0.0 && p.silenceThresholdDb >= -400.0)) return st;
@@ -528,7 +545,14 @@ public:
     // Law 11d: disarm, validate, size with the PUBLIC storageFor(), allocate, reset.
     [[nodiscard]] bool prepare (double sampleRate, int maxBlock, int maxChannels)
     {
+        // Law 11b: disarm, validate, write — AND DISARM MEANS THE REPORT TOO, the way SourceForensics
+        // already spells it. A refused prepare() after a finished measurement used to leave isFinished()
+        // answering true and the previous report still readable, so an instance reconfigured with bad
+        // arguments kept certifying the programme before it. Found by the release round; P71 had already
+        // named the same shape a defect.
         prepared_ = false;
+        finished_ = false;
+        channels_ = 0;
         const Storage st = storageFor (sampleRate, maxBlock, maxChannels, params_);
         if (! st.ok) return false;
 
@@ -1378,10 +1402,10 @@ private:
     std::int64_t nonFiniteInput_ = 0, nonFiniteIntermediate_ = 0, kwOverflow_ = 0;
 
     StereoSums             sums_ {};
-    DeterministicKWeightingFilter kw_ {};   // deterministic coefficients
-    eq::DeterministicCrossover2 lr4_ {};   // deterministic COEFFICIENTS: this report is compared across rows
+    KWeightingType kw_ {};   // declared THROUGH the public alias, so the assertion cannot drift from the member   // deterministic coefficients
+    CrossoverType  lr4_ {};   // declared THROUGH the public alias, so the assertion cannot drift from the member   // deterministic COEFFICIENTS: this report is compared across rows
     core::StateGrid        grid_ {};
-    DeterministicLoudnessMeter          lm_ {};
+    LoudnessType   lm_ {};   // declared THROUGH the public alias, so the assertion cannot drift from the member
     ReferenceTruePeakMeter tp_ {};
 
     ProgrammeTraceEvent* trace_      = nullptr;

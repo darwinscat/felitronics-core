@@ -20,9 +20,23 @@ import { resolve } from 'node:path';
 const [, , modPath, srArg, chArg, rawPath] = process.argv;
 const refuse = msg => { console.error(msg); process.exit(2); };
 if (!modPath || !srArg || !chArg || !rawPath) refuse('usage: node report-parity.mjs <module.js> <sampleRate> <channels> <raw.f32le>');
-const sr = Number(srArg), ch = Number(chArg);
-if (!Number.isFinite(sr) || sr <= 0) refuse(`bad sampleRate: ${srArg}`);
-if (!Number.isInteger(ch) || ch < 1 || ch > 16) refuse(`bad channels: ${chArg}`);
+// THE SAME INPUT DOMAIN AS THE NATIVE TOOL, NOT A NARROWER OR WIDER ONE — the policy P71 established and
+// P77 did not carry forward until the release round found it. `Number()` is not `parseCount`/`parseRate`:
+// it reads `0x2`, `+2` and `1e0` as channel counts the native tool refuses, so those succeeded here and
+// exited 2 there. The counts are decimal digits and nothing else, as fcore_measure's parseCount is; the
+// rate mirrors strtod's grammar minus JavaScript's own literal forms. ONE RESIDUAL, the same one P71
+// documents: strtod also reads C99 hex floats, so `0x1p16` is a legal rate natively and is refused here —
+// left refused rather than reimplemented, because a refusal is an exit 2 with no output, which is loud,
+// and not the silent divergence this grammar exists to stop.
+const count = (s, name) => { if (!/^[0-9]{1,18}$/.test(s)) refuse(`bad ${name}: ${s}`); return Number(s); };
+const rateOf = s => {
+    if (!/^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/.test(s)) refuse(`bad sampleRate: ${s}`);
+    const v = Number(s);
+    if (!Number.isFinite(v) || v <= 0) refuse(`bad sampleRate: ${s}`);
+    return v;
+};
+const sr = rateOf(srArg), ch = count(chArg, 'channels');
+if (ch < 1 || ch > 16) refuse(`bad channels: ${chArg}`);
 
 const require = createRequire(import.meta.url);
 const M = await require(resolve(modPath))();

@@ -49,9 +49,10 @@ static_assert (! std::is_same_v<eq::Svf,              eq::DeterministicSvf>);
 static_assert (! std::is_same_v<eq::Crossover2,       eq::DeterministicCrossover2>);
 static_assert (! std::is_same_v<an::KWeightingFilter, an::DeterministicKWeightingFilter>);
 static_assert (! std::is_same_v<an::LoudnessMeter,    an::DeterministicLoudnessMeter>);
-// --- and the ANALYZERS OWN the deterministic ones. The assertions above check the aliases; these check
-// what the five actually hold, which is the thing the release note claims and the thing a careless edit
-// would change. decltype on the member is the only spelling that cannot drift from the member.
+// --- and the ANALYZERS OWN the deterministic ones. These assert the public aliases — and the aliases are
+// what the members are DECLARED WITH (ProgrammeReport.h: `CrossoverType lr4_`), so there is nothing for
+// them to drift from. An earlier draft declared the members with the concrete type and the aliases beside
+// them, which let a member be switched to SystemMath with the alias left intact and this gate still green.
 static_assert (std::is_same_v<an::ProgrammeReport::CrossoverType,  eq::DeterministicCrossover2>);
 static_assert (std::is_same_v<an::ProgrammeReport::KWeightingType, an::DeterministicKWeightingFilter>);
 static_assert (std::is_same_v<an::ProgrammeReport::LoudnessType,   an::DeterministicLoudnessMeter>);

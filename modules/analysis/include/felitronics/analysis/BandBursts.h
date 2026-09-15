@@ -449,7 +449,14 @@ public:
 
     [[nodiscard]] bool prepare (double sampleRate, int /*maxBlock: nothing is sized by it*/, int maxChannels) noexcept
     {
-        prepared_ = false;                                       // law 11b: disarm, validate, then write
+        // Law 11b: disarm, validate, write — AND DISARM MEANS THE REPORT TOO, the way SourceForensics
+        // already spells it. A refused prepare() after a finished measurement used to leave isFinished()
+        // answering true and the previous report still readable, so an instance reconfigured with bad
+        // arguments kept certifying the programme before it. Found by the release round; P71 had already
+        // named the same shape a defect.
+        prepared_ = false;
+        finished_ = false;
+        channels_ = 0;
         const Storage st = storageFor (sampleRate, maxChannels, params_);
         if (! st.ok) return false;
 
@@ -901,7 +908,7 @@ private:
     BandBurstsHopObserver observer_ = nullptr;
     void* observerUser_ = nullptr;
 
-    eq::DeterministicCrossover2 xLow_, xHigh_;   // deterministic coefficients (see core::DetMath)
+    CrossoverType xLow_, xHigh_;   // declared THROUGH the public alias, so the assertion cannot drift from the member   // deterministic coefficients (see core::DetMath)
     core::StateGrid  grid_;
 
     double sampleRate_   = 48000.0;
