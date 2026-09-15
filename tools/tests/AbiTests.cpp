@@ -293,6 +293,15 @@ int main()
         double out3[3] {};
         test::ok (fc_probe_needle (buf.data(), n, 2, 10, 9, out3) == 0 && fc_probe_needle (buf.data(), n, 2, 0, n + 1, out3) == 0
                && fc_probe_needle (buf.data(), n, 2, 0, n, nullptr) == 0, "the needle refuses from > to, a stretch past the planes, a null output");
+        // THE WIDTH, WHICH ONLY THIS ENTRY POINT CAN PIN. planarSpan() refuses a channel count the core
+        // does not have, and everywhere else in this ABI a prepare() refuses it a second time — so a
+        // mutation stand that deleted planarSpan's own bound left all 123 tests of this repo green
+        // (measured, P81). The needle has no prepare(): it reads plane 0 and plane 1 and returns. Here the
+        // refusal IS planarSpan's, and nothing else in the tree is watching it.
+        test::ok (fc_probe_needle (buf.data(), n, 0, 0, n, out3) == 0
+               && fc_probe_needle (buf.data(), n, felitronics::core::kMaxChannels + 1u, 0, n, out3) == 0
+               && fc_probe_needle (buf.data(), n, 0xFFFFFFFFu, 0, n, out3) == 0,
+                  "the needle refuses a width the core does not have — 0, kMaxChannels + 1, and 2^32 - 1");
         test::ok (fc_probe_waveform_count() == 1000, "a needle call neither reads nor clears the shapes result");
     }
 
