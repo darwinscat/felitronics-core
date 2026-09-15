@@ -213,16 +213,24 @@ namespace felitronics::test::alloc
     // read as a working guard while doing nothing — the class of claim this file exists to stop. The six
     // alerts are dismissed as false positives on GitHub, with this reason, where the dismissal is audited
     // and a NEW alert on this construct would still be raised.
+    // ⚠ THE PROBE DEALLOCATES THROUGH THE UNSIZED FORMS ON PURPOSE, and it is a portability rule, not a
+    // preference. `probe()` sits ABOVE the replacements at the bottom of this header, so the only
+    // declarations in scope here are the ones `<new>` provides — and the SIZED deallocation functions are
+    // declared there only when sized deallocation is enabled. Clang does not enable it by default on every
+    // row: this built on Apple clang and failed on ubuntu clang with "no matching function for call to
+    // 'operator delete'" on exactly the four sized calls. What the probe measures is the `new` side, so the
+    // deallocation spelling is free to be the portable one — aligned allocations still go back through the
+    // ALIGNED delete, which is what routes them to alignedFree rather than std::free.
     inline void probe() noexcept
     {
         constexpr std::size_t n = 128;
         const std::align_val_t a { kProbeAlign };
         auto touch = [] (void* p) noexcept { if (p != nullptr) static_cast<volatile char*> (p)[0] = 1; };
 
-        { const long long c = count.load();        void* p = ::operator new      (n);                 touch (p); ::operator delete   (p, n);    probeSeen[0] = count.load()        - c; }
-        { const long long c = count.load();        void* p = ::operator new[]    (n);                 touch (p); ::operator delete[] (p, n);    probeSeen[1] = count.load()        - c; }
-        { const long long c = alignedCount.load(); void* p = ::operator new      (n, a);              touch (p); ::operator delete   (p, n, a); probeSeen[2] = alignedCount.load() - c; }
-        { const long long c = alignedCount.load(); void* p = ::operator new[]    (n, a);              touch (p); ::operator delete[] (p, n, a); probeSeen[3] = alignedCount.load() - c; }
+        { const long long c = count.load();        void* p = ::operator new      (n);                 touch (p); ::operator delete   (p);       probeSeen[0] = count.load()        - c; }
+        { const long long c = count.load();        void* p = ::operator new[]    (n);                 touch (p); ::operator delete[] (p);       probeSeen[1] = count.load()        - c; }
+        { const long long c = alignedCount.load(); void* p = ::operator new      (n, a);              touch (p); ::operator delete   (p, a);    probeSeen[2] = alignedCount.load() - c; }
+        { const long long c = alignedCount.load(); void* p = ::operator new[]    (n, a);              touch (p); ::operator delete[] (p, a);    probeSeen[3] = alignedCount.load() - c; }
         { const long long c = count.load();        void* p = ::operator new      (n, std::nothrow);   touch (p); ::operator delete   (p);       probeSeen[4] = count.load()        - c; }
         { const long long c = count.load();        void* p = ::operator new[]    (n, std::nothrow);   touch (p); ::operator delete[] (p);       probeSeen[5] = count.load()        - c; }
         { const long long c = alignedCount.load(); void* p = ::operator new      (n, a, std::nothrow); touch (p); ::operator delete  (p, a);    probeSeen[6] = alignedCount.load() - c; }
