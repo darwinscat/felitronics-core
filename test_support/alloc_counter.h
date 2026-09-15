@@ -201,6 +201,18 @@ namespace felitronics::test::alloc
     // by an optimizer removing an allocation a counter was watching. A call to the function itself is not
     // elidable, and the `volatile` sink keeps the memory observably used. (Checked at -O3 and with LTO: no
     // elision.)
+    // CODEQL, and where the silence actually lives. `cpp/new-free-mismatch` traces the REPLACED
+    // `::operator new` down to the `std::malloc` inside it and then calls the matching `::operator delete`
+    // a malloc/delete mismatch. It is not one: these eight lines are the only way to exercise a global
+    // replacement at all, because after the replacement `::operator new` IS the counter, and the pairs are
+    // exactly what [new.delete] requires — sized with sized, aligned with aligned, nothrow with its plain
+    // partner. The rule accepts the two sized plain forms and rejects the six aligned and nothrow ones,
+    // which is the shape of a rule limitation and not of a defect.
+    // ⚠ THE SUPPRESSION IS NOT HERE, and an inline `// codeql[...]` marker was REMOVED from these lines
+    // rather than left in place: this repository's code-scanning setup does not honour them, so the marker
+    // read as a working guard while doing nothing — the class of claim this file exists to stop. The six
+    // alerts are dismissed as false positives on GitHub, with this reason, where the dismissal is audited
+    // and a NEW alert on this construct would still be raised.
     inline void probe() noexcept
     {
         constexpr std::size_t n = 128;
