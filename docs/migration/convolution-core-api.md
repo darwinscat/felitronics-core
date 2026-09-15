@@ -48,7 +48,9 @@ known = irSr > 0 && isfinite(irSr)                                  // NaN, 0, n
 if (known && |irSr - hostSr| > 1e-6 * max(irSr, hostSr))           // within 1 ppm of the host: as is too
     ir[c] = resampleIr(ir[c], irSr, hostSr)
 if (normalise == yes) g = (E<1e-8 ? 1 : 0.125/sqrt(E)),  E = max_c Σ ir[c][n]²   // byte-fallback path
-else                  g = known ? irSr / hostSr : 1                                // the normal cab path
+else                  g = resampled ? convolutionRateGain(irSr, hostSr) : 1          // P68: the density factor,
+                      //   and ONLY after a real resample — within the 1 ppm tolerance no resample runs, the tap
+                      //   density does not change, and the taps stay byte-verbatim. "known" is the wrong test here.
 multiply every ir[c] by g
 engine.setIr(ir.data(), len)            // mono  → broadcast (juce Stereo::yes)
 engine.setIr(irPtrs, nch, len)          // stereo IR → per channel

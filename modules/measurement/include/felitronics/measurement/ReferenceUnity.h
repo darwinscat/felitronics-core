@@ -23,7 +23,12 @@
 // browsing compares timbre at matched loudness and an output trim stays inside its range. Apply
 // the returned gain to the FINAL taps (post-trim, post-resample) — ONE common gain across channels
 // (stereo imaging untouched). NOT for reverb/decay IRs: RMS-normalizing a mostly-decayed tail
-// blows up the wet gain — leave those at their authored level.
+// blows up the wet gain — leave those at their authored level. WHICH IS NOT THE SAME AS LEAVING THE
+// TAPS ALONE, and P68 is the bill for that equivalence: an IR's level is a CONVOLUTION GAIN, a sum
+// over taps, so it is proportional to how many of them fit into a second. Skipping this gain on an IR
+// that was RESAMPLED to the host rate leaves its level riding the host's clock — +6.02 dB for a 48 kHz
+// IR at 96 kHz. The other half of "authored level" is `convolution::convolutionRateGain`, and a caller
+// that skips this function still owes that one.
 //
 // HOW: 1 / (reference RMS gain) of the IR: G² = Σ w(f)·P(f) / Σ w(f) over the positive-frequency
 // bins (DC excluded), where P(f) is the channel-mean power response |H(f)|² and

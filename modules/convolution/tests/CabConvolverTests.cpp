@@ -2,8 +2,11 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // Golden coverage for the product-level cab wrapper: reference-unity gain math, direct-convolution
-// parity, mono broadcast / true-stereo publication, verbatim reverb loading, and latest-wins retry. And
-// (P67) the rate match with its tolerance, a one-tap IR off the host rate, and loads that stage nothing.
+// parity, mono broadcast / true-stereo publication, verbatim reverb loading AT THE HOST'S OWN RATE, and
+// latest-wins retry. And (P67) the rate match with its tolerance, a one-tap IR off the host rate, and
+// loads that stage nothing. And (P68) the rate factor an un-normalized load carries when it IS resampled:
+// the same convolution gain at every host rate, the gain reported for it, and what the normalized path
+// reports so that "the normalized path did not move" is a measurement and not a promise.
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/CabConvolver.h>
@@ -98,9 +101,14 @@ std::vector<float> decayingIr (int length)
 
 // Independent reference for the loader's gain: direct double-precision DTFT on a linear grid,
 // deliberately unlike the shipping real-FFT implementation. Agreement pins the formula itself.
-double referenceNormalizationGainDb (const std::vector<float>& ir, double sampleRate)
+// `bins` samples [0, sampleRate/2]; its DEFAULT is a bin count, so the spacing in HERTZ widens with the
+// rate, and the weight w(f) = 1/(1 + (f/2 kHz)^2) concentrates the integrand below a couple of kHz where
+// that spacing lives. At 48 kHz the two grids (this one and the loader's zero-padded FFT) agree to 0.02 dB
+// and the sibling check allows 0.15; at 192 kHz the same 4096 bins are four times coarser in hertz and the
+// disagreement grows to 0.18 dB, which is not the loader drifting. A caller comparing across rates passes
+// a count PROPORTIONAL to the rate, so the grid is the same one in hertz at every rate.
+double referenceNormalizationGainDb (const std::vector<float>& ir, double sampleRate, int bins = 4096)
 {
-    constexpr int bins = 4096;
     constexpr double pi = 3.14159265358979323846;
     double numerator = 0.0;
     double denominator = 0.0;
@@ -121,6 +129,53 @@ double referenceNormalizationGainDb (const std::vector<float>& ir, double sample
         denominator += weight;
     }
     return -10.0 * std::log10 (std::max (1.0e-12, numerator / denominator));
+}
+
+// P68 — THE ORACLE FOR THE RATE FACTOR, and it is computed OUTSIDE the thing it measures: the magnitude
+// response at a PHYSICAL frequency, straight from the definition, sharing not a line with the resampler
+// or with the loader. Two IRs at two different rates are comparable through this and through nothing
+// else — a bin index means a different frequency at each rate, and a broadband energy sum would average
+// away exactly the frequency-dependent residue this has to see (so the assertions below read it at five
+// separate frequencies rather than once over a band).
+double magnitudeAt (const std::vector<float>& ir, double sampleRate, double hz)
+{
+    constexpr double pi = 3.14159265358979323846;
+    const auto step = std::exp (std::complex<double> (0.0, -2.0 * pi * hz / sampleRate));
+    std::complex<double> phase (1.0, 0.0), response (0.0, 0.0);
+    for (const float tap : ir) { response += (double) tap * phase; phase *= step; }
+    return std::abs (response);
+}
+
+// A fixture with THREE properties it needs and one it must not have. It carries real content at the
+// frequencies the oracle reads (a DC term plus three tones), it decays so its tail edge is 60 dB down
+// before the taps end, and — the one that matters here — it opens with `lead` samples of silence.
+// ITS LENGTH IS A DURATION AND ITS LEAD IS A TAP COUNT, and neither is a matter of taste: the decay
+// has to finish inside the taps at EVERY source rate (a fixed 4096 taps is 85 ms at 48 kHz but 43 at
+// 96, which cut this tail off at -30 dB and read 1.4e-2 dB of "error" that was nothing but the step at
+// the end), while the lead answers to the window's ONE-SIDED reach, `IrResampleConfig::halfTaps` = 32
+// INPUT SAMPLES — the same count at every rate, and exactly where the measured loss reaches zero (a
+// lone impulse at 96 -> 48 kHz loses 2.34 dB at sample 0, 0.25 dB eight samples in, 0.05 at sixteen and
+// nothing at all from thirty-one on). Twice that is used below, which is slack, not a second rule.
+// WITHOUT THAT LEAD the measurement is not about the rate factor at all: a resample drops the kernel's
+// pre-ringing that would fall before output sample 0, which costs an IR whose sample 0 is full scale
+// 2.34 dB (a lone impulse at 96 -> 48 kHz), and on THIS fixture 0.082 dB at 10 kHz with no lead against
+// 2.8e-4 dB with the lead — while the worst cell of the grid that uses it reads 5.65e-4 dB. That loss is
+// a property of the resample, older than P68 and untouched by it; a fixture that starts at full scale
+// would charge it to the rate factor and read a hundred times the real error.
+std::vector<float> rateFixture (double sampleRate, double seconds, int lead)
+{
+    constexpr double pi = 3.14159265358979323846;
+    const int body = (int) std::lround (seconds * sampleRate);
+    std::vector<float> ir ((std::size_t) (lead + body), 0.0f);
+    for (int i = 0; i < body; ++i)
+    {
+        const double t = (double) i / sampleRate;
+        const double envelope = std::exp (-(double) i / (0.0125 * sampleRate));       // 12.5 ms, in SECONDS
+        ir[(std::size_t) (lead + i)] = (float) (envelope * (0.6 + 0.3 * std::cos (2.0 * pi * 800.0 * t)
+                                                                + 0.25 * std::cos (2.0 * pi * 4500.0 * t)
+                                                                + 0.2 * std::cos (2.0 * pi * 9000.0 * t)));
+    }
+    return ir;
 }
 } // namespace
 
@@ -273,7 +328,7 @@ int main()
         test::ok (lrDiag, "rendered stereo impulse uses the distinct L/R diagonal banks");
     }
 
-    test::group ("normalize=false is a verbatim reverb path");
+    test::group ("normalize=false is a verbatim reverb path AT THE HOST'S OWN RATE");
     {
         std::vector<float> ir { 0.75f, -0.25f, 0.125f, 0.0625f };
         CabConvolver convolver;
@@ -348,14 +403,30 @@ int main()
                   "0.9 ppm at 48 kHz (0.0432 Hz), both ways: verbatim");
         test::ok (stagedAt (192000.0, 192000.096, false) == ir && stagedAt (192000.096, 192000.0, false) == ir,
                   "0.5 ppm at 192 kHz (0.096 Hz), both ways: verbatim — relative, not in hertz");
-        const auto everyTapMoved = [&ir] (const std::vector<float>& taps)
+        // "EVERY TAP MOVED" STOPPED BEING A WITNESS WHEN P68 LANDED, and this is the repair. These two
+        // loads are normalize=false PAST the tolerance, so they now also carry the rate factor
+        // (0.999998927 at 1.1 ppm) — and that scalar alone moves all 600 taps of this fixture, so the old
+        // check would have passed with the resampler deleted. A gain can only SCALE; a resample changes
+        // the SHAPE. So the witness is now "no single scalar maps the input onto these taps", which is
+        // strictly stronger than what was here and cannot be satisfied by any future gain either.
+        const auto notAScaledCopy = [&ir] (const std::vector<float>& taps)
         {
-            bool moved = taps.size() == ir.size();
-            for (std::size_t i = 0; moved && i < ir.size(); ++i) moved = std::isfinite (taps[i]) && taps[i] != ir[i];
-            return moved;
+            if (taps.size() != ir.size()) return false;
+            std::size_t loudest = 0;
+            for (std::size_t i = 0; i < ir.size(); ++i)
+                if (std::fabs (ir[i]) > std::fabs (ir[loudest])) loudest = i;
+            if (! (std::fabs (ir[loudest]) > 0.0f)) return false;
+            const double k = (double) taps[loudest] / (double) ir[loudest];      // the best a pure gain could do
+            double worst = 0.0;
+            for (std::size_t i = 0; i < ir.size(); ++i)
+            {
+                if (! std::isfinite (taps[i])) return false;
+                worst = std::max (worst, std::fabs ((double) taps[i] - k * (double) ir[i]));
+            }
+            return worst > 1.0e-6 * (double) std::fabs (ir[loudest]);
         };
-        test::ok (everyTapMoved (stagedAt (48000.0, 48000.0528, false)) && everyTapMoved (stagedAt (48000.0528, 48000.0, false)),
-                  "1.1 ppm at 48 kHz (0.0528 Hz), both ways: resampled — same length, every tap moved");
+        test::ok (notAScaledCopy (stagedAt (48000.0, 48000.0528, false)) && notAScaledCopy (stagedAt (48000.0528, 48000.0, false)),
+                  "1.1 ppm at 48 kHz (0.0528 Hz), both ways: resampled — the taps are not the input times any one number");
         float gain = 0.0f;
         const auto normalized = stagedAt (48000.0000001, 48000.0, true, &gain);
         bool scaled = normalized.size() == ir.size() && gain > 0.0f;
@@ -695,6 +766,216 @@ int main()
         // "positive and finite" check while hiding exactly the defect this group exists for.
         test::ok (armed && std::fabs ((double) g - 0.5) < 1.0e-3,
                   "a 2 097 153-sample IR at a 2 097 153 Hz host normalizes to 0.5 without writing past the transform");
+    }
+
+    // P68 — AN IR'S AUTHORED LEVEL IS A CONVOLUTION GAIN, NOT A TAP AMPLITUDE, and a convolution gain is a
+    // sum over taps: proportional to how many of them fit into a second. `resampleIr` preserves the
+    // amplitude (unity DC per output tap), so before this the same file convolved outSr/inSr times as loud
+    // — a 48 kHz spring measured +6.02 dB on a 96 kHz host and -0.74 dB on a 44.1 one, for one Mix knob.
+    // Only normalize=false could show it: the reference-unity path measures the FINAL taps and swallows
+    // the factor whole.
+    //
+    // THE TOLERANCE IS THE KERNEL'S, not a taste. What is left after the factor is taken out is the
+    // 64-tap Kaiser (beta = 8) windowed sinc's own passband ripple: its stopband is
+    // 8/0.1102 + 8.7 = 81.3 dB, so delta = 8.6e-5 and the ripple is 20*log10(1 + delta) = 0.00075 dB
+    // one-sided. Its column sums (the quantity the factor actually inverts) were measured across 64
+    // phases of every standard rate pair and stray at most 1.6e-4 dB from the ratio; the worst reading
+    // over this grid is 5.65e-4 dB. So 0.01 dB is 13x the kernel's ripple and 18x the worst reading,
+    // while the weakest mutation below moves a cell by 0.736 dB — 74 tolerances away. (The Kaiser
+    // figure is an engineering formula, not a proof, which is why the measured column sums stand beside
+    // it rather than behind it.)
+    test::group ("P68 — normalize=false: the authored convolution gain survives the host's clock");
+    {
+        // TWO BANKS ON HALF THE CELLS, and not for symmetry: with every cell mono, "apply the factor only
+        // when nch == 1" is a change to shipped sound that passes this whole file. The second bank carries
+        // its own signal (the fixture's mirror image), so a mutation that scales one plane and not the
+        // other cannot hide behind a broadcast either.
+        struct Cell { double irSr, hostSr; int channels; };
+        const Cell cells[] {
+            { 48000.0,  44100.0, 1 }, { 48000.0,  88200.0, 2 }, { 48000.0, 96000.0, 1 }, { 48000.0, 192000.0, 2 },
+            { 96000.0,  48000.0, 2 }, { 96000.0,  44100.0, 1 },                 // ratio < 1: the OTHER side
+            { 44100.0,  48000.0, 2 }, { 44100.0, 192000.0, 1 },                 // a source off the family grid
+        };
+        const double probes[] { 0.0, 100.0, 1000.0, 5000.0, 10000.0 };          // all well inside the passband
+        constexpr double tolerance = 0.01;                                       // dB — derived above
+
+        // WHAT THIS GROUP DOES NOT CERTIFY, said out loud so nobody reads it as more than it is. It reads
+        // MAGNITUDE, so a change that moved the taps in time (a reversal, a shift) is invisible here — the
+        // resampler's own shift-invariance and edge-tap groups own that. It reads up to 10 kHz, so the
+        // transition band, the images and the anti-aliasing are invisible too — the resampler's "a
+        // cabinet's top octave keeps its own level" group owns those. What is left is exactly what the
+        // rate factor is: a flat level, and whether it is the IR's own at every host rate.
+
+        double worst = 0.0;
+        double worstIr = 0.0, worstHost = 0.0, worstHz = 0.0;
+        bool gainsExact = true, allFinite = true;
+        for (const Cell& cell : cells)
+        {
+            const auto source = rateFixture (cell.irSr, 0.1, 2 * felitronics::convolution::IrResampleConfig{}.halfTaps);
+            std::vector<float> second (source.size());
+            for (std::size_t i = 0; i < source.size(); ++i) second[i] = -0.5f * source[source.size() - 1 - i];
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (cell.hostSr, 512, cell.channels, 4.0, /*normalize*/ false));
+            const float* banks[2] { source.data(), second.data() };
+            convolver.loadIR (banks, cell.channels, (int) source.size(), cell.irSr);
+
+            const float applied = convolver.irNormalizationGain();
+            gainsExact = gainsExact && applied == (float) (cell.irSr / cell.hostSr)
+                                    // ...and the dB reading is the SAME number, not a floored stand-in
+                                    && std::fabs ((double) convolver.irNormalizationGainDb()
+                                                  - 20.0 * std::log10 ((double) applied)) < 1.0e-4;
+            for (int c = 0; c < cell.channels; ++c)
+            {
+                const auto& staged = convolver.stagedTaps()[(std::size_t) c];
+                const auto& plane  = c == 0 ? source : second;
+                for (const double hz : probes)
+                {
+                    const double moved = 20.0 * std::log10 (magnitudeAt (staged, cell.hostSr, hz)
+                                                            / magnitudeAt (plane, cell.irSr, hz));
+                    allFinite = allFinite && std::isfinite (moved);
+                    if (std::fabs (moved) > worst)
+                    { worst = std::fabs (moved); worstIr = cell.irSr; worstHost = cell.hostSr; worstHz = hz; }
+                }
+            }
+        }
+        std::printf ("    %d rate pairs x %d frequencies: worst |level change| = %.2e dB at %.0f -> %.0f Hz host, "
+                     "%.0f Hz (tolerance %.2f; an uncompensated load moves the weakest cell by 0.736)\n",
+                     (int) (sizeof (cells) / sizeof (cells[0])), (int) (sizeof (probes) / sizeof (probes[0])),
+                     worst, worstIr, worstHost, worstHz, tolerance);
+        test::ok (allFinite && worst <= tolerance,
+                  "the response at every physical frequency is the IR's own, at every host rate");
+        test::ok (gainsExact, "irNormalizationGain() reports exactly irSr/hostSr on every resampled reverb load");
+    }
+
+    // The other half of the same contract — and the half that pins the DOMAIN of the change. A load that
+    // is not resampled must still hand the taps over untouched, to the bit, with a gain of exactly one:
+    // the rate factor is 1 there by construction, and "exactly 1.0f" is what says it was never applied
+    // as an approximation of 1.
+    test::group ("P68 — a load that is not resampled is still byte-verbatim with a gain of exactly one");
+    {
+        const std::vector<float> ir { 0.75f, -0.25f, 0.125f, 0.0625f, -0.5f };
+        // 48000.0432 is 0.9 ppm off — inside kRateMatchTolerance, so no resample runs — and it is there
+        // because 48000.0000001 cannot do its job alone: (float)(48000/48000.0000001) IS 1.0f, so float
+        // rounding would hand the assertion its answer and a missing `resample ?` gate would pass. At 0.9
+        // ppm the factor would be 0.99999911f, and only the gate can make it one.
+        const double asIs[] { 48000.0, 48000.0000001, 48000.0432,               // the same rate, three ways
+                              std::numeric_limits<double>::quiet_NaN(), 0.0, -48000.0,
+                              std::numeric_limits<double>::infinity(),
+                              -std::numeric_limits<double>::infinity() };      // ...and every unknown one
+        bool verbatim = true, unity = true;
+        for (const double rate : asIs)
+        {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (48000.0, 128, 2, 0.05, /*normalize*/ false));
+            const float* banks[1] { ir.data() };
+            convolver.loadIR (banks, 1, (int) ir.size(), rate);
+            verbatim = verbatim && convolver.stagedTaps()[0] == ir;
+            unity    = unity && convolver.irNormalizationGain() == 1.0f
+                             && convolver.irNormalizationGainDb() == 0.0f;
+        }
+        test::ok (verbatim, "the host's own rate, one within the tolerance, and five unusable ones: taps byte-verbatim");
+        test::ok (unity, "and the applied gain is exactly 1.0f (0.0 dB) on every one of them");
+    }
+
+
+    // P68 — THE dB DIAGNOSTIC'S FLOOR, which this change made reachable. `irNormalizationGainDb()` floors
+    // its argument so a zero cannot read as -inf; the floor was 1e-6, which sat BELOW every gain the old
+    // code could apply (the normalization clamps at -30 dB = 0.0316) and ABOVE what the rate factor can
+    // reach. A file claiming 0.024 Hz is not a real file, but it is a rate the loader accepts — P67 settled
+    // that a finite positive rate is a KNOWN rate — and it resamples one tap into two million, applying
+    // 5.0e-7. The reading said -120.0000 dB for a gain of -126.0206.
+    // THIS IS THE MOST EXPENSIVE CASE IN THE FILE AND ITS COST IS MEASURED, NOT GUESSED: 1.6 s of the
+    // binary's 2.1 s on macOS/arm64 clang, and the whole file runs 3.5 s in the CHECKED wasm row
+    // (SAFE_HEAP + assertions, which instruments every load and store across 1.28e8 window-tap
+    // iterations) — the row worth naming, because it is the one a local release build never exercises.
+    // There is no cheaper way to stand on that floor: a gain under 1e-6 needs an output of inLen/g taps
+    // and inLen is already 1, so the million is arithmetic, not a choice.
+    test::group ("P68 — an extreme accepted rate reports its true dB, not the anti-infinity floor");
+    {
+        std::vector<float> one { 1.0f };
+        CabConvolver convolver;
+        felitronics::test::run (convolver.prepare (48000.0, 128, 1, 0.05, /*normalize*/ false));
+        const float* banks[1] { one.data() };
+        convolver.loadIR (banks, 1, 1, 0.024);
+        const double applied = (double) convolver.irNormalizationGain();
+        const double reported = (double) convolver.irNormalizationGainDb();
+        std::printf ("    0.024 Hz -> 48 kHz: %d taps, gain %.6e, %.4f dB (the floor would say -120.0000)\n",
+                     (int) convolver.stagedTaps()[0].size(), applied, reported);
+        test::ok (convolver.stagedTaps()[0].size() == 2000000, "one tap at 0.024 Hz stages two million");
+        test::approx (applied, 0.024 / 48000.0, 1.0e-13, "the applied gain is the rate ratio, 5e-7");
+        test::approx (reported, 20.0 * std::log10 (0.024 / 48000.0), 1.0e-3,
+                      "and its dB reading is -126.0206, the gain that was actually applied");
+    }
+
+    // P68 — A GAIN THAT IS NOT A NUMBER MUST NOT READ AS A NUMBER. `std::max(a, b)` is `(a < b) ? b : a`
+    // and every comparison against a NaN is false, so `max(floor, NaN)` returns the FLOOR: the dB accessor
+    // answered a plausible -120.0000 for a gain that is a NaN, on the NORMALIZED path, on both sides of
+    // this change (the floor moved, so the plausible lie moved with it — -120 before, -400 after, which is
+    // how a "nothing changed here" claim gets falsified by an input nobody fixtured). A NaN tap reaches
+    // this from a float32 WAV, and the linear accessor has always told the truth about it.
+    test::group ("P68 — a NaN gain reports a NaN, not the anti-infinity floor dressed as a level");
+    {
+        std::vector<float> ir (256, 0.25f);
+        ir[0] = std::numeric_limits<float>::quiet_NaN();
+        CabConvolver convolver;
+        felitronics::test::run (convolver.prepare (48000.0, 128, 1, 0.05, /*normalize*/ true));
+        const float* banks[1] { ir.data() };
+        convolver.loadIR (banks, 1, (int) ir.size(), 48000.0);
+        test::ok (std::isnan (convolver.irNormalizationGain()), "a NaN tap makes the measured gain a NaN");
+        test::ok (std::isnan (convolver.irNormalizationGainDb()),
+                  "and the dB reading is a NaN too — not -120, and not -400 either");
+    }
+
+    // P68 — AND THE NORMALIZED PATH DID NOT MOVE, which is a claim and not an assumption. It cannot be
+    // shown by the reference-unity check above: that one runs at the host's own rate, where the rate
+    // factor is 1 and any pre-scaling would be invisible. It cannot be shown by re-normalizing either —
+    // reference-unity is HOMOGENEOUS, so scaling the taps by k before measuring them multiplies the
+    // measured gain by 1/k and the product comes out the same to within the last bits. (A mutation that
+    // applies the rate factor on the normalize=true path as well passed every other check in this file.)
+    // What DOES see it: recompute the gain here, from the resampled taps, with the loader's own resampler
+    // but nothing else of the loader's, and ask whether the number the loader reports is the gain of
+    // THOSE taps — not of taps somebody scaled first. At 192 kHz a pre-scaled measurement reads 12.04 dB
+    // away from the true one in whichever direction the scaling went, which is 120 times this group's
+    // tolerance; where that lands relative to the +-30 dB clamp depends on the IR, and for this quiet
+    // fixture it lands nowhere near it. The clamp is not what catches the mutation — the 12 dB is.
+    test::group ("P68 — a resampled normalize=true load reports the gain of the taps it actually plays");
+    {
+        // A SMOOTH, QUIET fixture, and both adjectives are load-bearing. Smooth (a one-pole decay, so
+        // |H(f)| has no peaks) because the two grids here are different — the loader's zero-padded FFT
+        // against a linear DTFT — and a peaky spectrum makes them disagree by more than the thing being
+        // measured. Quiet (x 0.05) because the loudness this is checking has to stay INSIDE the +-30 dB
+        // clamp at every rate: at 192 kHz the density adds 12 dB to the reading, and a fixture at the
+        // fixture's natural level clamps there, which would compare two guards instead of two gains.
+        std::vector<float> source ((std::size_t) (64 + 1440), 0.0f);
+        for (int i = 0; i < 1440; ++i)
+            source[(std::size_t) (64 + i)] = (float) (0.05 * std::exp (-(double) i / 48.0));
+        bool matched = true, unclamped = true;
+        for (const double hostSr : { 44100.0, 88200.0, 96000.0, 192000.0 })
+        {
+            const auto resampled = felitronics::convolution::resampleIr (source, 48000.0, hostSr);
+            const double expected = referenceNormalizationGainDb (resampled, hostSr,
+                                        (int) std::lround (4096.0 * hostSr / 48000.0));   // constant in HERTZ
+
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (hostSr, 512, 1, 4.0, /*normalize*/ true));
+            const float* banks[1] { source.data() };
+            convolver.loadIR (banks, 1, (int) source.size(), 48000.0);
+            const double reported = (double) convolver.irNormalizationGainDb();
+
+            std::printf ("    %7.0f Hz host: reported %+8.4f dB, recomputed %+8.4f dB, difference %+.4f\n",
+                         hostSr, reported, expected, reported - expected);
+            // 0.1 dB, and the headroom here is 1.9x, not the 13-74x of the first group — say so rather
+            // than let that paragraph's numbers be read as covering this one. The two grids sit a
+            // SYSTEMATIC 0.043-0.052 dB apart once the spacing is constant in hertz (it was 0.02 -> 0.18
+            // and rate-dependent before that), which is grid geometry, not drift: gcc/glibc/x86-64
+            // reproduces all four figures to the digit. What the budget has to clear is the mutation —
+            // the rate factor applied here as well — and that moves the reading by 0.736 dB at the
+            // weakest rate, 14 budgets away.
+            matched = matched && std::fabs (reported - expected) <= 0.1;
+            unclamped = unclamped && std::fabs (reported) < 29.99;             // the guard must not be in play
+        }
+        test::ok (matched && unclamped,
+                  "at 44.1 / 88.2 / 96 / 192 kHz the reported gain is the reference-unity gain of the resampled taps");
     }
 
     return test::report();

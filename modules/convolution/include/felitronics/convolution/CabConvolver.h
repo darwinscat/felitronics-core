@@ -43,6 +43,13 @@
 // usable with it off. The normalized taps are handed to the convolver verbatim (NUPC applies no gain
 // of its own), so our reference-unity gain is the single, exact loudness contract.
 //
+// THE OTHER PATH HAS A LOUDNESS CONTRACT TOO, and it is not "no gain at all". normalize=false keeps the
+// IR's authored level — and an IR's level is a CONVOLUTION GAIN, which is a sum over taps and therefore
+// proportional to how many of them fit into a second. Resampling to the host rate changes that count, so
+// keeping the authored level through a resample takes exactly one factor, irSr/hostSr (P68; the
+// arithmetic is `convolutionRateGain` in IrResampler.h). It is 1 whenever the rates match. So: one of
+// the two gains is applied at load, never both, and `irNormalizationGain()` reports whichever it was.
+//
 // THREADING: loadIR() runs on the message thread (resample + FFT-domain gain + the convolver's partition
 // build all allocate). MatrixConvolverNupc::setIr()/setOperator() build synchronously into the INACTIVE
 // slot then publish; process() picks up the new operator and crossfades it in over ~50 ms (click-free), so
@@ -121,6 +128,19 @@ public:
     // normalize=false skips the reference-unity RMS normalization (LOUDNESS above) — a REVERB IR is a
     // decay tail, not a tone-shaping cab bandpass, so RMS-normalizing its mostly-decayed length would
     // blow up the wet gain. The spring IRs are peak-normalized at bundle time; the Reverb Mix sets level.
+    // It does NOT skip the rate factor: a resampled IR is scaled by irSr/hostSr so that "its authored
+    // level" means the same loudness at 44.1, 48, 96 and 192 kHz (P68).
+    // THAT FACTOR IS NOT CLAMPED, and the guard above it is — deliberately, and the asymmetry is the
+    // point. The normalization gain is MEASURED from the IR's own content, so a pathological IR can make
+    // it anything and +-30 dB stops that. The rate factor is arithmetic on two numbers the CALLER gave
+    // us, and a clamped one would quietly deliver a different filter than the caller asked for. It spans
+    // 4.7e-10 to 4.3e9 (-186 to +192.6 dB) — what `resampleIr`'s own length and position gates leave
+    // reachable. A WAV's rate is a uint32 and nothing in this family validates it, so a garbage-but-
+    // FINITE header is the one broken metadata a real file can carry, and it now plays LOUD where it
+    // used to play quiet: a file claiming 352800 Hz on a 48 kHz host is +17.3 dB, 5e6 Hz is +40.4 dB.
+    // Both are correct by this contract — those taps really would be that loud at the rate claimed — and
+    // both are garbage. A consumer that loads UNTRUSTED files should bound the rate before it gets here,
+    // the way orbit-amp's loader already refuses anything outside 8 kHz...768 kHz.
     // Law 11(b): `numChannels` is BINDING, and this convolver's ceiling is 2, not core::kMaxChannels.
     // It used to CLAMP — prepare(..., 4) succeeded silently as a stereo convolver, after which
     // process(io, 4, n) was a perfectly well-formed call that left planes 2 and 3 DRY. An observable
@@ -182,9 +202,10 @@ public:
 
     void reset() { convolution_.reset(); }
 
-    // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity,
-    // resampled to host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the
-    // convolver's partition build all allocate.
+    // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity
+    // (or, with normalize=false, scaled by the rate factor a resample costs — LOUDNESS above), resampled to
+    // host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the convolver's
+    // partition build all allocate.
     // AN UNUSABLE RATE IS AN UNKNOWN RATE, and an unknown rate loads the taps AS IS — NaN, zero, negative and
     // both infinities alike. The samples in the file are fine, only its metadata is broken: refusing would drop
     // the cabinet whole and play silence, where as-is at worst plays an impulse of the wrong length.
@@ -196,14 +217,21 @@ public:
         buildAndStage (samples, numChannels, numSamples, irSampleRate);
     }
 
-    // The normalization applied to the last loaded IR — the exact linear gain (for references
-    // that must null against the engine) and its dB reading (diagnostics). Message thread.
+    // THE GAIN APPLIED to the last loaded IR — the exact linear factor (for references that must null
+    // against the engine) and its dB reading (diagnostics). Message thread. It is the reference-unity
+    // normalization on the normalized path and the rate factor irSr/hostSr on the verbatim one (P68);
+    // the name is historical, the contract is "what was multiplied in", which is what a null needs.
+    // Exactly 1.0f whenever nothing was applied, which on the VERBATIM path means the host's own rate
+    // (within kRateMatchTolerance) or an unknown one. The normalized path always applies something: an
+    // unknown rate there still loads the taps as is and still normalizes them.
     float irNormalizationGain()   const noexcept { return normGain_; }
     float irNormalizationGainDb() const noexcept { return normGainDb_; }
 
-    // The staged AUDIBLE taps of the last load that staged any (one that stages nothing leaves them) —
-    // resampled to host rate + reference-unity normalized, exactly what the convolver plays once a
-    // pending retry has published (retained anyway for the reject-retry coalescing). Message thread;
+    // The staged taps of the last load that staged any (one that stages nothing leaves them) — resampled
+    // to host rate + scaled by irNormalizationGain(), which is what the convolver plays once a pending
+    // retry has published, up to the IR-LENGTH CAP: a load longer than maxIrSeconds stages whole and
+    // convolves only its first maxIrSeconds, so past the cap these taps are staged, not audible.
+    // (Retained anyway for the reject-retry coalescing.) Message thread;
     // input for offline blend analysis (auto-polarity / interference tint). NOTE: they persist after a
     // slot clear (the engine only gates the slot off) — callers gate on the slot's own loaded state, not
     // on non-emptiness here.
@@ -260,14 +288,33 @@ private:
         const int outLen = (int) staged[0].size();
 
         // Reference-unity normalization of the FINAL (resampled) IR — one common gain, all channels.
-        // Skipped for a reverb IR (normalize_=false): the taps go in verbatim at their peak-normalized level.
-        const float g = normalize_ ? normalizationGain (staged, outLen) : 1.0f;
+        // Skipped for a reverb IR (normalize_=false) — but a RESAMPLED reverb IR still gets the rate
+        // factor, which is a different thing and not a normalization: the taps go in at their AUTHORED
+        // level, and an IR's authored level is a convolution gain, not a tap amplitude. Without it the
+        // spring was +6.02 dB on a 96 kHz host and -0.74 on a 44.1 one, for the same Mix knob and the
+        // same file (P68; the arithmetic and the measurements live on convolutionRateGain). Exactly 1
+        // when the rates match, so the verbatim path stays verbatim to the bit.
+        const float g = normalize_ ? normalizationGain (staged, outLen)
+                      : resample   ? (float) convolutionRateGain (irSr, hostSr_)
+                                   : 1.0f;
         for (auto& ch : staged) for (float& v : ch) v *= g;
 
         ir_.resize ((std::size_t) nch);
         for (int c = 0; c < nch; ++c) ir_[(std::size_t) c].swap (staged[(std::size_t) c]);
         normGain_   = g;
-        normGainDb_ = 20.0f * std::log10 (std::max (1.0e-6f, g));
+        // THE FLOOR IS ONLY THERE SO A ZERO CANNOT READ AS -inf, and it has to sit below every gain the
+        // loader can produce. It was 1.0e-6f, which was below the old minimum (the normalization clamps at
+        // -30 dB, i.e. 0.0316) and ABOVE the new one: the rate factor's smallest value is about 4.7e-10 —
+        // under that the output is longer than INT_MAX and resampleIr refuses the load — so an IR file
+        // claiming 0.024 Hz on a 48 kHz host applies 5.0e-7 and this reported -120.0000 dB for a gain that
+        // is -126.0206. The linear accessor was right throughout; only the diagnostic lied.
+        // ...and a NaN gets its own answer, because `std::max` cannot give it one: max(a, b) is
+        // (a < b) ? b : a, every comparison against a NaN is false, so max(floor, NaN) is the FLOOR —
+        // a finite, plausible dB reading for a gain that is not a number. (A NaN tap in the IR makes
+        // the normalization gain NaN; the taps are then NaN too, which is the real problem, but the
+        // diagnostic must not be the thing that hides it.) Reporting the NaN is the honest answer and
+        // matches the linear accessor, which has always returned it.
+        normGainDb_ = std::isfinite (g) ? 20.0f * std::log10 (std::max (1.0e-20f, g)) : g;
 
         // Publish the normalized taps to the convolver. On rejection (mid-crossfade) the retry reads back
         // from ir_ — which always holds the LATEST staged IR — so there is no dangling snapshot: a newer
