@@ -700,6 +700,8 @@ public:
         return intervalBin (m - 1) + intervalBin (m) + intervalBin (m + 1);
     }
 
+using CrossoverType = eq::DeterministicCrossover2;   // asserted by the math-policy suite
+
 private:
     struct Channel
     {

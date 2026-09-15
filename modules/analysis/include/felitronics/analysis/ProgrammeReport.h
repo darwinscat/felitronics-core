@@ -645,6 +645,13 @@ public:
     // The report. Meaningful after finish(); before it, every field is invalid and every count is zero.
     const Report& report() const noexcept { return report_; }
 
+// The types this report OWNS, named publicly so a test can assert them: the release claims these
+    // measurements are the same on every row, and that claim is exactly "these members are the
+    // deterministic spellings". An alias cannot drift from the member it is declared beside.
+    using CrossoverType  = eq::DeterministicCrossover2;
+    using KWeightingType = DeterministicKWeightingFilter;
+    using LoudnessType   = DeterministicLoudnessMeter;
+
 private:
     //==========================================================================
     // A Neumaier compensated sum: two constant scalars and one fixed recurrence, which is what law 8a's

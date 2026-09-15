@@ -412,6 +412,12 @@ jobs:
           # weakened to a wasm-only comparison. core::det made the original criterion reachable, so it is
           # the one enforced here.
           node tools/wasm/make-fixture.mjs fixture441.f32 44100 2 10   # 48 kHz one already exists above
+          # AND A PROGRAMME THAT ACTUALLY HAS HUM. On the loudness fixture HumDetector finds zero quiet
+          # frames and returns NoQuietStretch before reaching its peak search at all: 47 lines of "nothing
+          # found" satisfy `test -s` and diff clean without the measurement path ever running. This one
+          # carries a 50 Hz line with three harmonics in two quiet stretches, each longer than a whole
+          # analysis window plus a hop — which is what it takes for a frame to sit entirely inside one.
+          node tools/wasm/make-hum-fixture.mjs humfix.f32 48000 2 30
           M=./build-native/tools/fcore_measure
           n=0
           check() { mode=$1; sr=$2; ch=$3; f=$4
@@ -431,6 +437,12 @@ jobs:
             check "$mode" 48000 2 fixture.f32
             check "$mode" 44100 2 fixture441.f32
           done
+          # hum again, on the programme that reaches its measurement — and asserted to be a real finding,
+          # because a clean diff of two "nothing found" reports is the shape this whole gate exists to
+          # refuse.
+          check hum 48000 2 humfix.f32
+          grep -q '^ch 0 valid 1 reason 0 mains 1' an-native.txt \
+            || { echo "the hum fixture stopped finding its line — the gate is comparing nothing again"; exit 1; }
           echo "bit-identical: $n native-vs-wasm comparisons across five analyzers, two rates, two modules"
 
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and

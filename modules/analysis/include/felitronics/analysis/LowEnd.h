@@ -712,6 +712,8 @@ public:
     }
     static int noteOctave (int midi) noexcept { return (int) std::floor ((double) midi / 12.0) - 1; }
 
+using CrossoverType = eq::DeterministicCrossover2;   // asserted by the math-policy suite
+
 private:
     static SpectrumFramesParams framesParams (const LowEndParams& p) noexcept
     {

@@ -19,7 +19,10 @@
 // out loud when it cannot find a witness on the running row, rather than passing in silence.
 
 #include <felitronics_test.h>
+#include <felitronics/analysis/BandBursts.h>
 #include <felitronics/analysis/KWeightingFilter.h>
+#include <felitronics/analysis/LowEnd.h>
+#include <felitronics/analysis/ProgrammeReport.h>
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/core/DetMath.h>
 #include <felitronics/eq/Crossover2.h>
@@ -46,6 +49,14 @@ static_assert (! std::is_same_v<eq::Svf,              eq::DeterministicSvf>);
 static_assert (! std::is_same_v<eq::Crossover2,       eq::DeterministicCrossover2>);
 static_assert (! std::is_same_v<an::KWeightingFilter, an::DeterministicKWeightingFilter>);
 static_assert (! std::is_same_v<an::LoudnessMeter,    an::DeterministicLoudnessMeter>);
+// --- and the ANALYZERS OWN the deterministic ones. The assertions above check the aliases; these check
+// what the five actually hold, which is the thing the release note claims and the thing a careless edit
+// would change. decltype on the member is the only spelling that cannot drift from the member.
+static_assert (std::is_same_v<an::ProgrammeReport::CrossoverType,  eq::DeterministicCrossover2>);
+static_assert (std::is_same_v<an::ProgrammeReport::KWeightingType, an::DeterministicKWeightingFilter>);
+static_assert (std::is_same_v<an::ProgrammeReport::LoudnessType,   an::DeterministicLoudnessMeter>);
+static_assert (std::is_same_v<an::LowEnd::CrossoverType,           eq::DeterministicCrossover2>);
+static_assert (std::is_same_v<an::BandBursts::CrossoverType,       eq::DeterministicCrossover2>);
 
 int main()
 {
@@ -62,7 +73,12 @@ int main()
             for (int f = 10; f < 20000; ++f)
             {
                 if ((double) f >= rates[r] * 0.49) break;
-                const double x = kPi * ((double) f / rates[r]);
+                // THE PRODUCTION EXPRESSION, associated exactly as Svf.h:65 writes it. The first draft
+                // of this search used `kPi * (f / fs)`, which is a DIFFERENT double: at its first Apple
+                // witness, 681 Hz at 44.1 kHz, the two policies return the same tangent under the form
+                // the filter actually evaluates, so the witness was not a witness and everything below it
+                // demonstrated nothing.
+                const double x = kPi * (double) f / rates[r];
                 if (std::bit_cast<std::uint64_t> (core::SystemMath::tan (x))
                     != std::bit_cast<std::uint64_t> (core::DetMath::tan (x)))
                 { if (witnesses == 0) { wFs = rates[r]; wFc = (double) f; } ++witnesses; }
