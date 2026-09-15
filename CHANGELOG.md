@@ -1032,11 +1032,18 @@ budgeted yet**. They are now, and closing that turned up two things worth more t
   and are now computed in `size_t`. Past `INT_MAX` the old form was signed overflow — in practice a
   wrapped, far too small buffer — and the new one is an honest request the heap will refuse. Only a direct
   consumer can reach it: the mastering chain caps its quantum at 8192.
-- **The suites' allocation counters install EVERY form of `operator new`,** the over-aligned one included.
-  Without it `eq::EqEngine`'s 331 KiB — the largest single request a create makes on the default geometry;
-  at 16 channels and an 8192-sample quantum the saturator's flat scratch is 8 MiB — is invisible, and a budget
-  check would have compared two numbers that both left it out (the blindness P52 names). Pinned over 4 rates ×
-  3 widths × 4 topologies, byte for byte, for `create` and for `configure`.
+- **The allocation counters THIS BUDGET IS PINNED WITH install every form of `operator new`,** the
+  over-aligned one included — `MasteringChainTests` and `MasterAbiTests`, the two that carry the numbers
+  above. Without it `eq::EqEngine`'s 331 KiB — the largest single request a create makes on the default
+  geometry; at 16 channels and an 8192-sample quantum the saturator's flat scratch is 8 MiB — is invisible,
+  and a budget check would have compared two numbers that both left it out (the blindness P52 names). Pinned
+  over 4 rates × 3 widths × 4 topologies, byte for byte, for `create` and for `configure`.
+  ⚠️ **This sentence used to say "the suites' allocation counters", and that was false of the suites at
+  large.** Counted on the tree: **11 test TUs of 61** install the over-aligned form. The other 50 — among
+  them `EqEngineTests`, over the very `EqEngine` this entry names, and `LimiterTests`, `NamStageTests`,
+  `LinearPhaseEqTests` — still assert "no heap allocation" with a counter that cannot see an over-aligned
+  request. That remainder is **P52**, and it is open; the claim is corrected here rather than left standing
+  because a reader acts on it.
 
 ### `analysis` · `mastering` · `tools` — a meter's store is counted in samples, a call publishes what it will allocate, and an instance that aborted refuses
 
