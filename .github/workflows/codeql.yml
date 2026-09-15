@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 name: codeql
 
+# SCHEDULE ONLY, and the reason is a measurement rather than a preference: over the whole history of
+# this repository CodeQL has produced ZERO findings. Its query pack is aimed at taint — untrusted input
+# (a request, a file, argv) reaching a dangerous sink (SQL, a shell, a path, a buffer) — and a DSP core
+# has neither end of that flow. It still has to BUILD the tree to make its database, so it was paying a
+# full compile, on every push and every pull request, to ask questions with no subject here. What does
+# find defects in this code is already in ci.yml: the sanitizers (LSan caught a real leak in NeuralStage)
+# and the mutation stands. Kept weekly rather than deleted, because the cost of a query pack that finds
+# nothing is only a cost while it runs on the critical path, and a new dependency or a new kind of input
+# could one day give it a subject. 03:27 UTC is 05:27 local in summer, 04:27 in winter — GitHub cron has
+# no timezone. The odd minute is deliberate: scheduled jobs queue behind everyone who picked :00.
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   schedule:
-    - cron: "27 4 * * 1"   # weekly (Mon 04:27 UTC)
+    - cron: "27 3 * * 1"   # weekly, Monday
+  workflow_dispatch:       # and on demand, for the day it does have a subject
 
 jobs:
   analyze:
