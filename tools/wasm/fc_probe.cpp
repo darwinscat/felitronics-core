@@ -84,6 +84,18 @@ namespace
         return inHeap (planar, bytes);
     }
 
+    // The five offline analyzers (P77) accept an EMPTY programme and report on it — `fcore_measure report`
+    // on /dev/null prints 2109 bytes of a perfectly good empty report. planarSpan() refuses frames == 0,
+    // and rightly so for `clips`, whose emptiness is a FILE that was probably truncated; but here the
+    // caller hands over a buffer, and "no audio" is a measurement, not a truncation. Refusing it in the
+    // module while the CLI answers it is a byte-parity break, so these runs take this check instead.
+    bool planarSpanOrEmpty (const float* planar, std::uint32_t frames, std::uint32_t channels)
+    {
+        if (channels < 1 || channels > (std::uint32_t) felitronics::core::kMaxChannels) return false;
+        if (frames == 0) return true;                                  // nothing to address, nothing to bound
+        return planarSpan (planar, frames, channels);
+    }
+
     // Ptr/size validation the core cannot do for us: everything below arrives from JS.
     bool viable (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate)
     {
@@ -460,12 +472,12 @@ FC_EXPORT int fc_probe_report_run (const float* planar, std::uint32_t frames, st
                                    double sampleRate)
 {
     haveReport = false;
-    if (! planarSpan (planar, frames, channels)) return 0;
+    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& p = programme();
     if (! p.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
-    if (! p.process (view, (int) channels, (int) frames)) return 0;
+    if (frames != 0 && ! p.process (view, (int) channels, (int) frames)) return 0;
     p.finish();
     haveReport = true;
     return 1;
@@ -582,13 +594,13 @@ FC_EXPORT int fc_probe_bursts_run (const float* planar, std::uint32_t frames, st
                                    double sampleRate)
 {
     haveBursts = false;
-    if (! planarSpan (planar, frames, channels)) return 0;
+    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = bursts();
     d.setParams (felitronics::analysis::BandBurstsParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
-    if (! d.process (view, (int) channels, (int) frames)) return 0;
+    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     d.finish();
     haveBursts = true;
     return 1;
@@ -733,13 +745,13 @@ FC_EXPORT int fc_probe_hum_run (const float* planar, std::uint32_t frames, std::
                                 double sampleRate)
 {
     haveHum = false;
-    if (! planarSpan (planar, frames, channels)) return 0;
+    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = hum();
     d.setParams (felitronics::analysis::HumDetectorParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
-    if (! d.process (view, (int) channels, (int) frames)) return 0;
+    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     d.finish();
     haveHum = true;
     return 1;
@@ -875,13 +887,13 @@ FC_EXPORT int fc_probe_forensics_run (const float* planar, std::uint32_t frames,
                                       double sampleRate)
 {
     haveForensics = false;
-    if (! planarSpan (planar, frames, channels)) return 0;
+    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = forensics();
     d.setParams (felitronics::analysis::SourceForensicsParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
-    if (! d.process (view, (int) channels, (int) frames)) return 0;
+    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     d.finish();
     haveForensics = true;
     return 1;
@@ -1017,13 +1029,13 @@ FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, st
                                    double sampleRate)
 {
     haveLowEnd = false;
-    if (! planarSpan (planar, frames, channels)) return 0;
+    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = lowEnd();
     d.setParams (felitronics::analysis::LowEndParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
-    if (! d.process (view, (int) channels, (int) frames)) return 0;
+    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     if (! d.finish()) return 0;
     haveLowEnd = true;
     return 1;

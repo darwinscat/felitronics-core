@@ -52,6 +52,14 @@ if(FELITRONICS_BUILD_TESTS)
     # numbers this suite pins are the numbers `fcore_measure clips` and the wasm module produce, and both of
     # those are built contract-off; a suite built contract-on would be pinning a third answer. -fno-fast-math
     # is stated for the same reason it is stated in tools/wasm/build.sh: nothing here may be reassociated.
+    # The P77 ABI surface under adversarial arguments — natively, so ASan/UBSan see it. fc_probe.cpp
+    # compiles anywhere; EMSCRIPTEN_KEEPALIVE degrades to nothing off the wasm tier.
+    add_executable(felitronics_analysis_abi_tests tests/AnalysisAbiTests.cpp wasm/fc_probe.cpp)
+    target_link_libraries(felitronics_analysis_abi_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
+    target_include_directories(felitronics_analysis_abi_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(felitronics_analysis_abi_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_analysis_abi_tests COMMAND felitronics_analysis_abi_tests)
+
     add_executable(felitronics_clips_exposure_tests tests/ClipsExposureTests.cpp wasm/fc_probe.cpp)
     target_link_libraries(felitronics_clips_exposure_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
     target_include_directories(felitronics_clips_exposure_tests PRIVATE

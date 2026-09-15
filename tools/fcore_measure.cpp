@@ -231,6 +231,21 @@ int main (int argc, char** argv)
 
     if (mode == "hum")
     {
+        // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
+        // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
+        // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
+        // the wasm harness refuses the same strings, and a refusal that does not match on both roads is a
+        // parity break that a diff of two successful runs would never show.
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
         // The whole file through analysis::HumDetector, streamed in kChunk steps — the answer is identical at
         // any slicing (law 8a), so the chunking is a convenience here and not part of the measurement.
         analysis::HumDetectorParams hp;
@@ -420,6 +435,21 @@ int main (int argc, char** argv)
 
     if (mode == "report")
     {
+        // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
+        // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
+        // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
+        // the wasm harness refuses the same strings, and a refusal that does not match on both roads is a
+        // parity break that a diff of two successful runs would never show.
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
         // THE WHOLE-PROGRAMME REPORT. Every floating-point number goes out as a raw IEEE-754 bit pattern,
         // exactly as `blocks` does and for the same reason: the other side of this comparison is
         // JavaScript, which has no hex-float printing and whose decimal formatting is not C's, so a
@@ -583,6 +613,21 @@ int main (int argc, char** argv)
 
     if (mode == "bursts")
     {
+        // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
+        // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
+        // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
+        // the wasm harness refuses the same strings, and a refusal that does not match on both roads is a
+        // parity break that a diff of two successful runs would never show.
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
         // analysis::BandBursts at its defaults: bursts in 5-9 kHz against the MEDIAN of a 2 s trailing
         // ring of 10 ms hops. Everything float is a RAW IEEE-754 BIT PATTERN, as `blocks` does it, so a
         // later wasm comparison catches a flipped bit that decimal printing would round away. The

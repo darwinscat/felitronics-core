@@ -22,7 +22,7 @@ const refuse = msg => { console.error(msg); process.exit(2); };
 if (!modPath || !srArg || !chArg || !rawPath) refuse('usage: node report-parity.mjs <module.js> <sampleRate> <channels> <raw.f32le>');
 const sr = Number(srArg), ch = Number(chArg);
 if (!Number.isFinite(sr) || sr <= 0) refuse(`bad sampleRate: ${srArg}`);
-if (!Number.isInteger(ch) || ch < 1) refuse(`bad channels: ${chArg}`);
+if (!Number.isInteger(ch) || ch < 1 || ch > 16) refuse(`bad channels: ${chArg}`);
 
 const require = createRequire(import.meta.url);
 const M = await require(resolve(modPath))();
@@ -43,7 +43,10 @@ M.HEAPF32.set(planar, ptr >>> 2);
 const ok = M._fc_probe_report_run(ptr, frames, ch, sr) === 1;
 M._free(ptr);
 
-if (!ok) { process.stdout.write(''); process.exit(0); }
+// A refused run exits 2, as fcore_measure does. Exiting 0 with empty output would tell a caller the
+// measurement succeeded and produced nothing — and the refusals are half of what parity means: a byte
+// diff of two SUCCESSFUL runs says nothing about the inputs both roads are supposed to reject.
+if (!ok) { process.exit(2); }
 
 const strideC = M._fc_probe_report_stride_counts();
 const strideV = M._fc_probe_report_stride_values();
@@ -55,7 +58,10 @@ const nameBytes = M._fc_probe_report_names(0, 0);
 const nPtr = M._malloc(nameBytes);
 if (!nPtr) refuse('wasm OOM on the name table');
 const wrote = M._fc_probe_report_names(nPtr, nameBytes);
-const blob = Buffer.from(M.HEAPU8 ? M.HEAPU8.slice(nPtr, nPtr + wrote) : new Uint8Array(M.HEAPF64.buffer, nPtr, wrote));
+// HEAPU8 is NOT among the exported views (build.sh declares HEAPF32/HEAPF64 only), and in the CHECKED
+// module merely touching an unexported runtime property aborts — so a `M.HEAPU8 ? … : …` fallback never
+// reaches its fallback. The bytes are read through the one buffer that is exported.
+const blob = Buffer.from(new Uint8Array(M.HEAPF64.buffer, nPtr, wrote));
 M._free(nPtr);
 const names = blob.toString('latin1').split('\0').slice(0, -1);
 

@@ -262,8 +262,11 @@ namespace detail
 inline double log2 (double x) noexcept
 {
     if (std::isnan (x)) return x;
-    if (x < 0.0)  return std::numeric_limits<double>::quiet_NaN();
-    if (x == 0.0) return -std::numeric_limits<double>::infinity();
+    if (x < 0.0) return std::numeric_limits<double>::quiet_NaN();
+    // exactly zero — spelled as "not greater than zero" because the header-hygiene gate builds this under
+    // gcc's -Wfloat-equal -Werror, where an == against a literal is an error even when the equality is the
+    // point. NaN and the negatives are already gone above, so this is the zero test and nothing else.
+    if (! (x > 0.0)) return -std::numeric_limits<double>::infinity();
     if (std::isinf (x)) return x;
     if (x < 2.2250738585072014e-308) return log2 (mul (x, 18014398509481984.0)) - 54.0;   // subnormal
     double m; int e;
@@ -275,8 +278,11 @@ inline double log2 (double x) noexcept
 inline double log10 (double x) noexcept
 {
     if (std::isnan (x)) return x;
-    if (x < 0.0)  return std::numeric_limits<double>::quiet_NaN();
-    if (x == 0.0) return -std::numeric_limits<double>::infinity();
+    if (x < 0.0) return std::numeric_limits<double>::quiet_NaN();
+    // exactly zero — spelled as "not greater than zero" because the header-hygiene gate builds this under
+    // gcc's -Wfloat-equal -Werror, where an == against a literal is an error even when the equality is the
+    // point. NaN and the negatives are already gone above, so this is the zero test and nothing else.
+    if (! (x > 0.0)) return -std::numeric_limits<double>::infinity();
     if (std::isinf (x)) return x;
     if (x < 2.2250738585072014e-308) return log10 (mul (x, 18014398509481984.0)) - 16.25561652641961;
     double m; int e;
@@ -334,7 +340,7 @@ inline double tan (double x) noexcept
 inline double pow (double x, double y) noexcept
 {
     if (std::isnan (x) || std::isnan (y)) return std::numeric_limits<double>::quiet_NaN();
-    if (y == 0.0) return 1.0;
+    if (! (y < 0.0) && ! (y > 0.0)) return 1.0;   // y is exactly zero; see the note in log2() on the spelling
     if (x <= 0.0) return std::numeric_limits<double>::quiet_NaN();   // negative bases are not needed here
     const double l = log2 (x);
     double yh, yl, lh, ll;

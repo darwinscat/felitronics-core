@@ -17,6 +17,11 @@ const [, , modPath, srArg, chArg, rawPath] = process.argv;
 const refuse = m => { console.error(m); process.exit(2); };
 if (!modPath || !srArg || !chArg || !rawPath) refuse('usage: node bursts-parity.mjs <module.js> <sampleRate> <channels> <raw.f32le>');
 const sr = Number(srArg), ch = Number(chArg);
+if (!Number.isFinite(sr) || sr <= 0) refuse(`bad sampleRate: ${srArg}`);
+if (!Number.isInteger(ch) || ch < 1 || ch > 16) refuse(`bad channels: ${chArg}`);
+// Integrality is not pedantry: `1.5` passes a Number() parse, survives the frame-size check, deinterleaves
+// through fractional indices and reaches the module as 1 — a successful measurement of the wrong audio,
+// while the native tool exits 2. The refusals have to match or the diff is comparing two different runs.
 
 const require = createRequire(import.meta.url);
 const M = await require(resolve(modPath))();
@@ -35,7 +40,10 @@ if (!ptr) refuse('wasm OOM on the input');
 M.HEAPF32.set(planar, ptr >>> 2);
 const ok = M._fc_probe_bursts_run(ptr, frames, ch, sr) === 1;
 M._free(ptr);
-if (!ok) { process.stdout.write(''); process.exit(0); }
+// A refused run exits 2, as fcore_measure does. Exiting 0 with empty output would tell a caller the
+// measurement succeeded and produced nothing — and the refusals are half of what parity means: a byte
+// diff of two SUCCESSFUL runs says nothing about the inputs both roads are supposed to reject.
+if (!ok) { process.exit(2); }
 
 const strideChan = M._fc_probe_bursts_chan_stride();
 const strideEvt  = M._fc_probe_bursts_evt_stride();
