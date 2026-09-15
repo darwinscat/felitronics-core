@@ -21,6 +21,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
@@ -2492,7 +2493,720 @@ int main()
             }
     }
 
-    test::group ("process is RT no-alloc");
+    //==============================================================================================
+    // P47 — `reset()` IS THE STREAM RESTART, and these are its three gates: the silence bar, the
+    // equivalence to a stage prepared a moment ago, and the ledger the audio cannot witness.
+    //==============================================================================================
+    struct P47Shape { const char* name; std::string json; int reach; bool exactAsFresh; };
+    const P47Shape p47Shapes[] {
+        { "Linear delay(514)",   delayModel (514),                   514, true  },
+        { "dense 2001 direct",   denseLinearModel (2001, "direct"), 2000, true  },
+        // The engine a real IR-as-NAM capture actually ships — `implementation` defaults to `auto`,
+        // which is FFT past 256 taps — and the one shape that is NOT bit-identical to a freshly
+        // prepared stage afterwards. See the clock note in the second group.
+        { "dense 2001 auto/FFT", denseLinearModel (2001, nullptr),  2000, false },
+        // …and a real WaveNet, the architecture the price is paid on: a dilated tap costs the same
+        // nine scalars at any distance, so 512 samples of memory is a nine-number fixture.
+        { "WaveNet field 512",   waveNetDelayModel (511),            511, true  },
+    };
+
+    test::group ("\U0001f534 P47: nothing the caller fed before reset() can be heard after it");
+    {
+        // WHAT THIS CLOSES, with the number it was found by. `NamStage::reset()` was EMPTY: a dense
+        // 2001-tap capture that had played a tone answered digital silence with 0.224604502320, and so
+        // did the same capture through `prepare()`, because `::nam::DSP::Reset` calls SetMaxBufferSize
+        // and then a prewarm that is ZERO samples for a Linear capture, leaving `Buffer`'s window
+        // untouched. P24 closed the FALLING EDGE — a lane the host stops handing over is fed the
+        // silence it is receiving — and said in writing that the lane which is PRESENT, whose stale
+        // window speaks into the caller's own samples, was a stream-restart question. This is it.
+        //
+        // WHAT IS ASSERTED IS NOT "SILENCE OUT". A capture carrying a bias answers its own DC to digital
+        // zero whether it is fresh or restarted — a real Standard WaveNet reads 0.325557023287 — so
+        // "silence in, silence out" is a property of these BIAS-FREE fixtures, not the contract. It is
+        // what lets exact zero witness the contract here; the group after this one asserts the contract
+        // itself, where a bias has nowhere to hide.
+        //
+        // THE GRID IS P24'S OWN, and for its reason: eight rates straddling the rate-match gate in both
+        // directions, both capture shapes, both lanes — its own refuting run had a hole in this grid and
+        // read PASS where the answer was 0.499533.
+        for (const auto& shape : p47Shapes)
+            for (const double fs : { 8000.0, 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
+            {
+                long long clearedMono = 0, clearedStereo = 0;
+                for (const int width : { 1, 2 })
+                {
+                    constexpr int kBlk = 256;
+                    nam::NamStage stage;
+                    stage.prepare (fs, kBlk);
+                    if (! load (stage, shape.json)) { test::ok (false, "the restart fixture loads"); continue; }
+
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    float* io[2] { l.data(), r.data() };
+                    const int fill = (int) std::ceil ((double) shape.reach * fs / 48000.0) + 4 * kBlk;
+                    double phase = 0.0, charged = 0.0;
+                    for (int n = 0; n < fill; n += kBlk)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (float) (0.5 * std::sin (phase));
+                            phase += 2.0 * kPi * 220.0 / fs;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (stage.process (io, width, kBlk, false));
+                        for (float v : l) charged = std::fmax (charged, (double) std::fabs (v));
+                    }
+                    test::ok (charged > 0.1, std::string ("precondition: ") + shape.name
+                                             + " really was playing at " + std::to_string ((int) fs) + " Hz");
+
+                    const long long before = stage.clearedSamples();
+                    stage.reset();
+                    const long long spent = stage.clearedSamples() - before;
+                    if (width == 1) clearedMono = spent; else clearedStereo = spent;
+
+                    // …AND DIGITAL SILENCE AT FULL WIDTH, from the first sample after the restart — not
+                    // after a settling block, because the first block is where the stale window spoke.
+                    // FINITENESS BESIDE THE PEAK: std::fmax IGNORES a NaN, and a restart writing NaNs
+                    // into the first chunk would leave the peak at 0 and pass unnoticed (it did, for a
+                    // drain, across 960 checks).
+                    double worst = 0.0; bool finite = true;
+                    for (int k = 0; k < 24; ++k)
+                    {
+                        std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                        felitronics::test::run (stage.process (io, 2, kBlk, false));
+                        for (float v : l) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                        for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                    }
+                    test::ok (finite && worst == 0.0,
+                              std::string ("silence in, FINITE exact zero out from the FIRST sample after reset() — ")
+                              + shape.name + ", charged at width " + std::to_string (width)
+                              + ", " + std::to_string ((int) fs) + " Hz");
+                }
+
+                // THE RESTART SPENDS ONE LANE'S DEBT PER LANE THAT PLAYED, and the audio cannot say so:
+                // past the debt the output is zero whether a second network ran or not. A stereo charge
+                // owes exactly twice a mono one — a mutation that restarts BOTH lanes on a mono host
+                // (132 ms of a real WaveNet, for a window NAM already zero-filled) is visible here and
+                // nowhere else, and so is one that restarts only the first.
+                test::ok (clearedMono > 0 && clearedStereo == 2 * clearedMono,
+                          std::string ("the restart spends one lane's debt per lane that PLAYED — ")
+                          + shape.name + " at " + std::to_string ((int) fs) + " Hz: "
+                          + std::to_string (clearedMono) + " mono against " + std::to_string (clearedStereo) + " stereo");
+            }
+    }
+
+    test::group ("\U0001f534 P47: a restarted stage answers the next programme as one prepared a moment ago");
+    {
+        // THE CONTRACT ITSELF, not its bias-free shadow. Two stages, the same capture, the same rates:
+        // one has just been prepared, the other has PLAYED and been restarted. From the restart onward
+        // they must answer the same programme with the same BITS — which is what "the state a freshly
+        // loaded and prepared instance is in" means, and which no amount of silence-out can establish.
+        //
+        // This is also the row that pins the rate-matcher re-prime. Leave the two `core::StreamResampler`
+        // legs where the previous stream left them and their sub-sample phase is wrong for the new one:
+        // measured 1.039e-06 at 44.1 kHz, over 5091 of 5120 samples, with everything else fixed.
+        //
+        // ⚠️ AND WHAT "BIT-IDENTICAL" CAN BE ASKED OF AT ALL. NAM's answer depends on how the stream is
+        // cut into CALLS — the same property that moves a decaying cell's first sample when
+        // `maxModelFrames` changes — and a restart's chunking is its own: it ends on a short chunk
+        // whenever the debt is not a whole number of blocks. Every fixture below is block-length
+        // INDEPENDENT (measured: 0 differing at blocks 1/16/64/128/253/256/512/1024, and a never-charged
+        // stage given one ragged call is bit-identical to one given only whole blocks), which is what
+        // lets this row ask for exact equality at all. A real multi-channel WaveNet is NOT in that class:
+        // `wavenet_a1_standard.nam` reads 1.037e-06 against a stage prepared a moment ago at blocks
+        // 64…512 and exactly 0 at block 1, where its 4093-sample debt is a whole number of blocks — while
+        // a real `slimmable_wavenet.nam` is exactly 0 at 64…512 and 3.3e-06 at block 1. Two captures,
+        // opposite patterns, same cause: the arithmetic, not the state. What holds for all of them is
+        // INDEPENDENCE, which the next group asserts and which is exactly 0 everywhere.
+        //
+        // ⚠️ AND THROUGH NAM's FFT ENGINE THE RESIDUE IS A SECOND, INDEPENDENT MECHANISM. `Linear`'s
+        // partitioned implementation keeps its own `sample_index`, which counts every sample the
+        // instance has ever seen and decides where a programme falls against the partition boundaries;
+        // rewinding it means re-configuring the engine, which ALLOCATES (46 allocations, measured) and
+        // is therefore not available to a call on the audio thread. So for that one shape the assertion
+        // is the measured bound, and the exact statement is made by the independence rows below, which
+        // compare two stages whose clocks agree.
+        for (const auto& shape : p47Shapes)
+            for (const double fs : { 8000.0, 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
+            {
+                constexpr int kBlk = 256;
+                nam::NamStage fresh, restarted;
+                fresh.prepare (fs, kBlk); restarted.prepare (fs, kBlk);
+                if (! load (fresh, shape.json) || ! load (restarted, shape.json))
+                { test::ok (false, "the equivalence fixtures load"); continue; }
+
+                std::vector<float> a ((std::size_t) kBlk), b ((std::size_t) kBlk);
+                float* ioA[1] { a.data() }; float* ioB[1] { b.data() };
+                const int fill = (int) std::ceil ((double) shape.reach * fs / 48000.0) + 4 * kBlk;
+                double phase = 0.0, charged = 0.0;
+                for (int n = 0; n < fill; n += kBlk)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        const float v = (float) (0.5 * std::sin (phase));
+                        phase += 2.0 * kPi * 311.0 / fs;
+                        b[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (restarted.process (ioB, 1, kBlk, false));
+                    for (float v : b) charged = std::fmax (charged, (double) std::fabs (v));
+                }
+                test::ok (charged > 0.1, std::string ("precondition: the restarted stage really played — ")
+                                         + shape.name + " at " + std::to_string ((int) fs) + " Hz");
+                restarted.reset();
+
+                long long diff = 0; double worst = 0.0; double p2 = 0.0;
+                for (int k = 0; k < 24; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        // Silence first — the shape the acceptance bar is stated in — and then a
+                        // programme, because a stale window is audible in both and a phase is audible
+                        // only in the second.
+                        const float v = (k < 8) ? 0.0f
+                                                : (float) (0.35 * std::sin (p2) * std::sin (0.017 * p2));
+                        p2 += 2.0 * kPi * 220.0 / fs;
+                        a[(std::size_t) i] = v; b[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (fresh.process (ioA, 1, kBlk, false));
+                    felitronics::test::run (restarted.process (ioB, 1, kBlk, false));
+                    for (int i = 0; i < kBlk; ++i)
+                        if (a[(std::size_t) i] != b[(std::size_t) i])
+                        {
+                            ++diff;
+                            worst = std::fmax (worst, std::fabs ((double) a[(std::size_t) i] - (double) b[(std::size_t) i]));
+                        }
+                }
+                if (shape.exactAsFresh)
+                    test::ok (diff == 0,
+                              std::string ("a restarted stage is BIT-IDENTICAL to a freshly prepared one — ")
+                              + shape.name + " at " + std::to_string ((int) fs) + " Hz ("
+                              + std::to_string (diff) + " differing samples, worst " + std::to_string (worst) + ")");
+                else
+                    // THE BOUND IS TWO-SIDED, and both sides are measured rather than chosen. ABOVE the
+                    // engine's own residue: swept over nine block sizes x these eight rates it peaks at
+                    // 1.788139e-07 (block 128, 44.1 kHz), and a crew round reached 2.086e-07 at block
+                    // 1024 on a different charge — so a 2e-07 gate, which this row carried first, is a
+                    // literal already exceeded one block size away from the one it was read at. BELOW
+                    // the smallest defect it has to catch: the mutation that leaves the rate-matchers
+                    // alone shows 5.0e-06 at its quietest cell (22.05 kHz), five times this.
+                    test::ok (worst <= 1.0e-06,
+                              std::string ("…and through NAM's FFT engine the residue is its own partition CLOCK: ")
+                              + shape.name + " at " + std::to_string ((int) fs) + " Hz, worst "
+                              + std::to_string (worst) + " over " + std::to_string (diff) + " samples");
+            }
+    }
+
+    test::group ("\U0001f534 P47: the restart's LEDGER, and the shapes the audio cannot witness");
+    {
+        constexpr int kBlk = 256;
+
+        // 1. INDEPENDENCE, and it is EXACT for every shape including the FFT engine, because both
+        //    stages are clocked to the same point. Two stages fed DIFFERENT audio of the same length,
+        //    both restarted, then the same programme: whatever the caller fed before the restart must
+        //    make no difference at all to what comes after it.
+        for (const auto& shape : p47Shapes)
+            for (const double fs : { 44100.0, 48000.0 })
+            {
+                nam::NamStage one, two;
+                one.prepare (fs, kBlk); two.prepare (fs, kBlk);
+                if (! load (one, shape.json) || ! load (two, shape.json))
+                { test::ok (false, "the independence fixtures load"); continue; }
+
+                std::vector<float> x ((std::size_t) kBlk), y ((std::size_t) kBlk);
+                float* ioX[2] { x.data(), y.data() };
+                std::vector<float> u ((std::size_t) kBlk), v ((std::size_t) kBlk);
+                float* ioU[2] { u.data(), v.data() };
+                const int fill = (int) std::ceil ((double) shape.reach * fs / 48000.0) + 4 * kBlk;
+                double p1 = 0.0;
+                std::uint32_t rng = 12345u;
+                for (int n = 0; n < fill; n += kBlk)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        x[(std::size_t) i] = y[(std::size_t) i] = (float) (0.5 * std::sin (p1));
+                        p1 += 2.0 * kPi * 180.0 / fs;
+                        rng = rng * 1664525u + 1013904223u;                      // …and the other one hears noise
+                        u[(std::size_t) i] = v[(std::size_t) i] = (float) ((double) (rng >> 8) / 16777216.0 - 0.5);
+                    }
+                    felitronics::test::run (one.process (ioX, 2, kBlk, false));
+                    felitronics::test::run (two.process (ioU, 2, kBlk, false));
+                }
+                one.reset(); two.reset();
+
+                long long diff = 0; double p2 = 0.0;
+                for (int k = 0; k < 16; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        const float s = (float) (0.35 * std::sin (p2) * std::sin (0.017 * p2));
+                        p2 += 2.0 * kPi * 220.0 / fs;
+                        x[(std::size_t) i] = y[(std::size_t) i] = s;
+                        u[(std::size_t) i] = v[(std::size_t) i] = s;
+                    }
+                    felitronics::test::run (one.process (ioX, 2, kBlk, false));
+                    felitronics::test::run (two.process (ioU, 2, kBlk, false));
+                    for (int i = 0; i < kBlk; ++i)
+                        if (x[(std::size_t) i] != u[(std::size_t) i] || y[(std::size_t) i] != v[(std::size_t) i])
+                            ++diff;
+                }
+                test::ok (diff == 0, std::string ("a tone and white noise before the restart leave the SAME stage behind — ")
+                                     + shape.name + " at " + std::to_string ((int) fs) + " Hz ("
+                                     + std::to_string (diff) + " differing samples)");
+            }
+
+        // 2. THE NUMBERS, with their derivation rather than a call to the code that computes them. The
+        //    host rate IS the model rate here, so no rate-matcher is installed and one lane's debt is
+        //    the field plus the partitioned-FFT ring a Linear capture is charged whatever engine it
+        //    picks: 514 + 2·1024 = 2562. (A legal change to either term must update these literals ON
+        //    PURPOSE; that is what a literal is for in an oracle.)
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, kBlk);
+            test::ok (load (stage, delayModel (514)), "the ledger fixture loads");
+            test::ok (stage.clearedSamples() == 0, "nothing has been spent before anything has played");
+
+            // A stage that never played owes NOTHING — and a restart on it is not just cheap, it must
+            // change nothing at all: the lanes are the zeros NAM filled them with.
+            stage.reset();
+            test::ok (stage.clearedSamples() == 0, "…and a restart before the first sample spends nothing");
+
+            std::vector<float> l ((std::size_t) kBlk, 0.2f), r ((std::size_t) kBlk, 0.2f);
+            float* io[2] { l.data(), r.data() };
+            for (int k = 0; k < 8; ++k) felitronics::test::run (stage.process (io, 1, kBlk, false));
+            stage.reset();
+            test::ok (stage.clearedSamples() == 2562,
+                      "a MONO host restarts ONE network: 514 + 2048 = 2562, read "
+                      + std::to_string (stage.clearedSamples()));
+
+            // IDEMPOTENT: the debt is re-armed by audio being FED, so a second restart with nothing in
+            // between is free. This is what keeps the price a one-off rather than a per-call tax.
+            const long long afterFirst = stage.clearedSamples();
+            stage.reset();
+            felitronics::test::run (stage.process (io, 0, 0, false));      // law 11(d): no samples, no time
+            felitronics::test::run (stage.process (io, 1, 0, false));
+            stage.reset();
+            test::ok (stage.clearedSamples() == afterFirst,
+                      "…and a second restart, with only zero-length calls in between, spends nothing");
+
+            // MID-DRAIN: a lane that left 100 samples ago owes the REMAINDER, not a full debt again —
+            // and the lane still playing owes all of it. 2562 + (2562 − 100) = 5024.
+            for (int k = 0; k < 8; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.2f); std::fill (r.begin(), r.end(), 0.2f);
+                felitronics::test::run (stage.process (io, 2, kBlk, false));
+            }
+            std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+            felitronics::test::run (stage.process (io, 1, 100, false));    // lane 1 leaves, 100 of its debt spent
+            const long long beforeMid = stage.clearedSamples();
+            stage.reset();
+            test::ok (stage.clearedSamples() - beforeMid == 5024,
+                      "a lane mid-drain is charged only what it still owes: 2562 + (2562 - 100) = 5024, read "
+                      + std::to_string (stage.clearedSamples() - beforeMid));
+        }
+
+        // 3. A REFUSED PREPARE LEAVES A BACKEND THE RESTART MUST NOT TOUCH. `prepare()` writes the new
+        //    `maxBlock` before `configureRates` can refuse it, so an unprepared backend can carry a
+        //    block size of a billion beside buffers sized for 256: a restart that chunked by it would
+        //    write past `hush_` and past `modelIn`. It must also leave the LEDGERS alone — they are the
+        //    only record the next successful prepare re-charges from, and a lane marked clean here
+        //    would hand its tone back on the widen.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, kBlk);
+            test::ok (load (stage, delayModel (514)), "the refused-prepare fixture loads");
+            std::vector<float> l ((std::size_t) kBlk, 0.25f), r ((std::size_t) kBlk, 0.25f);
+            float* io[2] { l.data(), r.data() };
+            for (int k = 0; k < 8; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.25f); std::fill (r.begin(), r.end(), 0.25f);
+                felitronics::test::run (stage.process (io, 2, kBlk, false));
+            }
+            const long long beforeRefused = stage.clearedSamples();
+            stage.prepare (48000.0, 1 << 30);          // REFUSED: the model-frame count will not fit
+            std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+            test::ok (! stage.process (io, 2, kBlk, false), "precondition: the refused prepare left the backend UNPREPARED");
+            stage.reset();
+            test::ok (stage.clearedSamples() == beforeRefused,
+                      "a restart on an unprepared backend spends nothing — and writes nothing");
+
+            // …and the debt it refused to touch is still there for the prepare that succeeds.
+            stage.prepare (48000.0, kBlk);
+            for (int k = 0; k < 24; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 0, kBlk, false));
+            }
+            double worst = 0.0; bool finite = true;
+            for (int k = 0; k < 16; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 2, kBlk, false));
+                for (float v : l) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+                for (float v : r) { worst = std::fmax (worst, (double) std::fabs (v)); finite = finite && std::isfinite (v); }
+            }
+            test::ok (finite && worst == 0.0, "…and the prepare that SUCCEEDS still finds the debt the refusal left alone");
+        }
+
+        // 4. THE RECURRENT EXCEPTION, KEPT NAMED — and kept in the MECHANISM, not only in the comment.
+        //    An LSTM lane that has already spent its whole drain reads a debt of zero and is still not
+        //    empty: the repository's slow-cell fixture leaves 0.419413 there. Reading the debt as the
+        //    dirt would therefore restart that lane by doing nothing at all — which is what three crew
+        //    seats went for. So a recurrent lane that ever played is charged the WHOLE heuristic again
+        //    at every restart (which is also what NAM's own Reset does: prewarm, unconditionally), and
+        //    it is never marked clean, because nothing finite empties it.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, kBlk);
+            test::ok (load (stage, slowLstmModel (true)), "the slow LSTM loads");
+            test::ok (stage.prewarmSamples() == 24000, "precondition: NAM answers half a second for it: "
+                                                       + std::to_string (stage.prewarmSamples()));
+            std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+            float* io[2] { l.data(), r.data() };
+            double phase = 0.0;
+            for (int k = 0; k < 400; ++k)                        // ~2.1 s: the cell settles (tau ~ 22 000)
+            {
+                for (int i = 0; i < kBlk; ++i)
+                {
+                    const float v = (float) (0.5 * std::sin (phase));
+                    phase += 2.0 * kPi * 220.0 / 48000.0;
+                    l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                }
+                felitronics::test::run (stage.process (io, 2, kBlk, false));
+            }
+            for (int k = 0; k < 120; ++k)                        // lane 1 leaves and spends its WHOLE drain
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 1, kBlk, false));
+            }
+            test::ok (stage.drainedSamples() == 24000,
+                      "precondition: lane 1's finite debt is SPENT — " + std::to_string (stage.drainedSamples()));
+            const long long beforeLstm = stage.clearedSamples();
+            stage.reset();
+            test::ok (stage.clearedSamples() - beforeLstm == 48000,
+                      "a recurrent lane is charged the whole heuristic again, debt or no debt: 2 x 24000, read "
+                      + std::to_string (stage.clearedSamples() - beforeLstm));
+            const long long afterLstm = stage.clearedSamples();
+            stage.reset();
+            test::ok (stage.clearedSamples() - afterLstm == 48000,
+                      "…and it is never marked clean: the next restart spends the heuristic again, read "
+                      + std::to_string (stage.clearedSamples() - afterLstm));
+
+            // 🔴 AND THE UNTAGGED ONE, because on the TAGGED fixture 24000 is right for two reasons at
+            // once — NAM answers 0.5 x its tag, and the floor is 0.5 x the run rate — so no row above can
+            // tell `std::fmax (prewarm, 0.5 * modelRunSR)` from a plain `prewarm`. Untagged, NAM answers
+            // ONE sample (0.5 x -1 <= 0 -> 1) and only the floor keeps the restart honest. A crew round
+            // pointed at this; it costs one stage.
+            {
+                nam::NamStage untagged;
+                untagged.prepare (48000.0, kBlk);
+                test::ok (load (untagged, slowLstmModel (false)), "the UNTAGGED slow LSTM loads");
+                test::ok (untagged.prewarmSamples() == 1,
+                          "precondition: NAM answers ONE sample for an untagged LSTM, read "
+                          + std::to_string (untagged.prewarmSamples()));
+                std::vector<float> ul ((std::size_t) kBlk, 0.3f), ur ((std::size_t) kBlk, 0.3f);
+                float* uio[2] { ul.data(), ur.data() };
+                for (int k = 0; k < 8; ++k)
+                {
+                    std::fill (ul.begin(), ul.end(), 0.3f); std::fill (ur.begin(), ur.end(), 0.3f);
+                    felitronics::test::run (untagged.process (uio, 2, kBlk, false));
+                }
+                const long long beforeUntagged = untagged.clearedSamples();
+                untagged.reset();
+                test::ok (untagged.clearedSamples() - beforeUntagged == 48000,
+                          "…and the restart still spends half a second of the RUN rate on it, not one"
+                          " sample: 2 x 24000, read "
+                          + std::to_string (untagged.clearedSamples() - beforeUntagged));
+            }
+
+            // …and what it LEAVES is a bound on the heuristic, not a zero. Said with the number rather
+            // than promised away: DSP-ARCHITECTURE.md's law 11a says the same about the drain.
+            double leak = 0.0;
+            for (int k = 0; k < 8; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 2, kBlk, false));
+                for (float v : l) leak = std::fmax (leak, (double) std::fabs (v));
+                for (float v : r) leak = std::fmax (leak, (double) std::fabs (v));
+            }
+            test::ok (leak < 0.45, "…and a recurrent cell keeps a residue the restart cannot close: "
+                                   + std::to_string (leak) + ", where the same fixture left 0.419413 after a drain");
+        }
+        // 5. THE SHAPES THE CREW'S MUTANTS FOUND THIS SUITE BLIND TO. Each row below was written
+        //    against a surviving mutation of the shipped code, not against a reading of it.
+        //
+        // 5a. STEREO, because everything above compares a MONO stage against a fresh one. Clear only
+        //     lane 0's rate-matchers and the whole suite stayed green: silence cannot show a surviving
+        //     phase, and the independence rows give both stages the same wrong one.
+        for (const double fs : { 44100.0, 22050.0 })
+        {
+            nam::NamStage fresh, restarted;
+            fresh.prepare (fs, kBlk); restarted.prepare (fs, kBlk);
+            const auto json = delayModel (514);
+            if (! load (fresh, json) || ! load (restarted, json)) { test::ok (false, "the stereo equivalence fixtures load"); continue; }
+
+            std::vector<float> a ((std::size_t) kBlk), b ((std::size_t) kBlk), c2 ((std::size_t) kBlk), d ((std::size_t) kBlk);
+            float* ioFresh[2] { a.data(), b.data() };
+            float* ioRestart[2] { c2.data(), d.data() };
+            double phase = 0.0, charged = 0.0;
+            for (int k = 0; k < 24; ++k)
+            {
+                for (int i = 0; i < kBlk; ++i)
+                {
+                    // The two lanes are charged DIFFERENTLY: a mutation that restarts lane 0 and leaves
+                    // lane 1 needs the two to be distinguishable at all.
+                    c2[(std::size_t) i] = (float) (0.5 * std::sin (phase));
+                    d [(std::size_t) i] = (float) (0.4 * std::sin (2.0 * phase + 1.0));
+                    phase += 2.0 * kPi * 311.0 / fs;
+                }
+                felitronics::test::run (restarted.process (ioRestart, 2, kBlk, false));
+                for (float v : d) charged = std::fmax (charged, (double) std::fabs (v));
+            }
+            test::ok (charged > 0.1, "precondition: BOTH lanes really played at " + std::to_string ((int) fs) + " Hz");
+            restarted.reset();
+
+            long long diff0 = 0, diff1 = 0; double p2 = 0.0;
+            for (int k = 0; k < 24; ++k)
+            {
+                for (int i = 0; i < kBlk; ++i)
+                {
+                    const float u = (float) (0.35 * std::sin (p2) * std::sin (0.017 * p2));
+                    const float w = (float) (0.30 * std::sin (1.7 * p2 + 0.5));
+                    p2 += 2.0 * kPi * 220.0 / fs;
+                    a[(std::size_t) i] = c2[(std::size_t) i] = u;
+                    b[(std::size_t) i] = d [(std::size_t) i] = w;
+                }
+                felitronics::test::run (fresh.process (ioFresh, 2, kBlk, false));
+                felitronics::test::run (restarted.process (ioRestart, 2, kBlk, false));
+                for (int i = 0; i < kBlk; ++i)
+                {
+                    if (a[(std::size_t) i] != c2[(std::size_t) i]) ++diff0;
+                    if (b[(std::size_t) i] != d [(std::size_t) i]) ++diff1;
+                }
+            }
+            test::ok (diff0 == 0 && diff1 == 0,
+                      "BOTH lanes of a restarted stage are bit-identical to a freshly prepared one at "
+                      + std::to_string ((int) fs) + " Hz (lane 0: " + std::to_string (diff0)
+                      + ", lane 1: " + std::to_string (diff1) + ")");
+        }
+
+        // 5b. A LANE WHOSE DEBT IS ALREADY SPENT still has to be re-primed. Every row above restarts a
+        //     lane that owes something, so `if (owed == 0) continue;` in front of the rate-matcher
+        //     clears survived the whole suite: the network is silent by then, but the legs are still at
+        //     the previous stream's fractional phase. A rate where a rate-matcher EXISTS is the whole
+        //     point of the row.
+        {
+            const double fs = 44100.0;
+            nam::NamStage fresh, spent;
+            fresh.prepare (fs, kBlk); spent.prepare (fs, kBlk);
+            const auto json = delayModel (514);
+            if (! load (fresh, json) || ! load (spent, json)) test::ok (false, "the spent-debt fixtures load");
+            else
+            {
+                std::vector<float> a ((std::size_t) kBlk), b ((std::size_t) kBlk);
+                float* ioA[1] { a.data() }; float* ioB[1] { b.data() };
+                double phase = 0.0;
+                for (int k = 0; k < 24; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i) { b[(std::size_t) i] = (float) (0.5 * std::sin (phase)); phase += 2.0 * kPi * 311.0 / fs; }
+                    felitronics::test::run (spent.process (ioB, 1, kBlk, false));
+                }
+                long long last = -1;                       // …and now spend the WHOLE drain at width 0
+                while (spent.drainedSamples() != last)
+                {
+                    last = spent.drainedSamples();
+                    std::fill (b.begin(), b.end(), 0.0f);
+                    felitronics::test::run (spent.process (ioB, 0, kBlk, false));
+                }
+                const long long before = spent.clearedSamples();
+                spent.reset();
+                test::ok (spent.clearedSamples() == before,
+                          "precondition: the debt really was spent — the restart buys no inference here");
+
+                long long diff = 0; double p2 = 0.0;
+                for (int k = 0; k < 24; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        const float v = (float) (0.35 * std::sin (p2) * std::sin (0.017 * p2));
+                        p2 += 2.0 * kPi * 220.0 / fs;
+                        a[(std::size_t) i] = b[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (fresh.process (ioA, 1, kBlk, false));
+                    felitronics::test::run (spent.process (ioB, 1, kBlk, false));
+                    for (int i = 0; i < kBlk; ++i) if (a[(std::size_t) i] != b[(std::size_t) i]) ++diff;
+                }
+                test::ok (diff == 0, "…and a lane that owes NOTHING is still re-primed: bit-identical to a"
+                                     " freshly prepared stage (" + std::to_string (diff) + " differing samples)");
+            }
+        }
+
+        // 5c. A RESTART LEAVES THE LANES CLEAN FOR THE NEXT PREPARE, and nothing proved it: delete
+        //     `everFed_[c] = false` and no test noticed, because none of them does
+        //     reset() -> a successful prepare() -> a width-zero call. A lane the restart emptied owes
+        //     the next prepare NOTHING — that is what keeps a re-prepare after a restart free.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, kBlk);
+            test::ok (load (stage, delayModel (514)), "the prepare-after-restart fixture loads");
+            std::vector<float> l ((std::size_t) kBlk, 0.3f), r ((std::size_t) kBlk, 0.3f);
+            float* io[2] { l.data(), r.data() };
+            for (int k = 0; k < 8; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.3f); std::fill (r.begin(), r.end(), 0.3f);
+                felitronics::test::run (stage.process (io, 2, kBlk, false));
+            }
+            stage.reset();
+            const long long drainedBefore = stage.drainedSamples();
+            stage.prepare (48000.0, kBlk);                 // …the host changes nothing, but re-prepares
+            for (int k = 0; k < 24; ++k)
+            {
+                std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                felitronics::test::run (stage.process (io, 0, kBlk, false));
+            }
+            test::ok (stage.drainedSamples() == drainedBefore,
+                      "a prepare AFTER a restart charges nothing: the lanes are provably empty, read "
+                      + std::to_string (stage.drainedSamples() - drainedBefore) + " samples of drain");
+        }
+
+        // 5d. A RESTART THAT ARRIVED WHILE THE BACKEND WAS UNPREPARED IS NOT DROPPED. The refused
+        //     prepare above proves the restart writes nothing there; this proves it is not FORGOTTEN.
+        //     Re-arming the debt at the next prepare does not cover it, because a PRESENT lane never
+        //     spends an existing debt — so without the parked intent the stale window comes straight
+        //     back into the new stream (measured ~242 samples of a delay(514) capture).
+        {
+            nam::NamStage fresh, parked;
+            fresh.prepare (48000.0, kBlk); parked.prepare (48000.0, kBlk);
+            const auto json = delayModel (514);
+            if (! load (fresh, json) || ! load (parked, json)) test::ok (false, "the parked-restart fixtures load");
+            else
+            {
+                std::vector<float> a ((std::size_t) kBlk), b ((std::size_t) kBlk);
+                float* ioA[1] { a.data() }; float* ioB[1] { b.data() };
+                double phase = 0.0;
+                for (int k = 0; k < 24; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i) { b[(std::size_t) i] = (float) (0.5 * std::sin (phase)); phase += 2.0 * kPi * 311.0 / 48000.0; }
+                    felitronics::test::run (parked.process (ioB, 1, kBlk, false));
+                }
+                parked.prepare (48000.0, 1 << 30);          // REFUSED
+                const long long beforeParked = parked.clearedSamples();
+                parked.reset();                             // …parked, not performed
+                test::ok (parked.clearedSamples() == beforeParked, "precondition: the parked restart spent nothing yet");
+                parked.prepare (48000.0, kBlk);             // …and THIS is where it is honoured
+                test::ok (parked.clearedSamples() > beforeParked,
+                          "the restart a refused prepare could not honour is honoured by the one that can: "
+                          + std::to_string (parked.clearedSamples() - beforeParked) + " samples spent");
+
+                long long diff = 0; double p2 = 0.0;
+                for (int k = 0; k < 24; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        const float v = (float) (0.35 * std::sin (p2) * std::sin (0.017 * p2));
+                        p2 += 2.0 * kPi * 220.0 / 48000.0;
+                        a[(std::size_t) i] = b[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (fresh.process (ioA, 1, kBlk, false));
+                    felitronics::test::run (parked.process (ioB, 1, kBlk, false));
+                    for (int i = 0; i < kBlk; ++i) if (a[(std::size_t) i] != b[(std::size_t) i]) ++diff;
+                }
+                test::ok (diff == 0, "…and the stream that follows is bit-identical to a freshly prepared"
+                                     " stage's (" + std::to_string (diff) + " differing samples)");
+
+                // …AND THE PARKED INTENT IS SPENT, NOT STANDING. Leave the flag set after honouring it
+                // and every later prepare() restarts the stream again — a prepare silently becoming a
+                // restart, for a reset() the caller made once and long ago. The witness has to have
+                // audio in it: with the lanes already clean the re-run would spend nothing and the
+                // odometer could not tell.
+                const long long spentOnce = parked.clearedSamples();
+                for (int k = 0; k < 8; ++k)
+                {
+                    std::fill (b.begin(), b.end(), 0.35f);
+                    felitronics::test::run (parked.process (ioB, 1, kBlk, false));
+                }
+                parked.prepare (48000.0, kBlk);
+                test::ok (parked.clearedSamples() == spentOnce,
+                          "a prepare AFTER the parked restart was honoured is a prepare, not another"
+                          " restart: " + std::to_string (parked.clearedSamples() - spentOnce)
+                          + " further samples spent");
+            }
+        }
+
+        // 6. 🔴 WHAT THE RESTART CANNOT FLUSH, PINNED WITH ITS NUMBER — a capture whose CONDITIONER is a
+        //    whole model of its own (`config.condition_dsp`, which real A2 captures carry). Neither NAM
+        //    (`Linear::GetPrewarmSamples()` is the base class's zero) nor `detail::receptiveFieldFromConfig`
+        //    (it walks `submodels`, not `condition_dsp`) counts that model's memory, so the ledger this
+        //    restart spends is SHORT for it. This is P24's ledger and not this change: the identical
+        //    number comes back through the untouched drain, which is what the two halves below assert.
+        //    Registered rather than fixed here — correcting the ledger would move the drain, and the bar
+        //    for this task is that a programme which never calls reset() does not move a single bit.
+        {
+            const auto conditioned =
+                std::string (R"({"version":"0.5.0","architecture":"WaveNet","config":{"condition_dsp":)")
+                + delayModel (2001)
+                + R"(,"layers":[{"input_size":1,"condition_size":1,"head_size":1,"head_bias":false,)"
+                + R"("channels":1,"kernel_size":2,"dilations":[1],"activation":"Tanh","gated":false}],)"
+                + R"("head_scale":1.0},"weights":[1,0,0,1,1,0,0,1,1],"sample_rate":48000})";
+            nam::NamStage viaDrain, viaReset;
+            viaDrain.prepare (48000.0, kBlk); viaReset.prepare (48000.0, kBlk);
+            if (! load (viaDrain, conditioned) || ! load (viaReset, conditioned))
+                test::ok (false, "a WaveNet with a Linear conditioner loads");
+            else
+            {
+                test::ok (viaDrain.prewarmSamples() == 2,
+                          "precondition: the ledger sees only the network's own two samples, not the"
+                          " conditioner's 2001 — it reports " + std::to_string (viaDrain.prewarmSamples()));
+                auto charge = [&] (nam::NamStage& s)
+                {
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    float* io[2] { l.data(), r.data() };
+                    double phase = 0.0;
+                    for (int k = 0; k < 40; ++k)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (float) (0.5 * std::sin (phase));
+                            phase += 2.0 * kPi * 220.0 / 48000.0;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (s.process (io, 1, kBlk, false));
+                    }
+                };
+                auto leak = [&] (nam::NamStage& s)
+                {
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    float* io[2] { l.data(), r.data() };
+                    double worst = 0.0;
+                    for (int k = 0; k < 24; ++k)
+                    {
+                        std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
+                        felitronics::test::run (s.process (io, 1, kBlk, false));
+                        for (float v : l) worst = std::fmax (worst, (double) std::fabs (v));
+                    }
+                    return worst;
+                };
+                charge (viaDrain);
+                long long last = -1;
+                while (viaDrain.drainedSamples() != last)
+                {
+                    last = viaDrain.drainedSamples();
+                    std::vector<float> z ((std::size_t) kBlk, 0.0f);
+                    float* io[2] { z.data(), z.data() };
+                    felitronics::test::run (viaDrain.process (io, 0, kBlk, false));
+                }
+                const double afterDrain = leak (viaDrain);
+                charge (viaReset);
+                viaReset.reset();
+                const double afterReset = leak (viaReset);
+                test::ok (afterDrain > 0.9 && afterReset > 0.9,
+                          "a conditioner's memory is outside the ledger, and the restart inherits that"
+                          " EXACTLY as the drain has it: " + std::to_string (afterDrain) + " after a full"
+                          " drain against " + std::to_string (afterReset) + " after a restart");
+            }
+        }
+
+    }
+
+    test::group ("process and reset() are RT no-alloc");
     {
         // 🔴 TWO RATES, AND THE SECOND ONE IS THE WHOLE POINT. This test prepared only at 48 kHz, where
         // `resampling` is false and processChannel takes its early branch — so the single check that
@@ -2573,6 +3287,39 @@ int main()
                              + std::to_string ((int) rate) + " Hz"
                              + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
         }
+
+        // 🔴 AND THE FOURTH BRANCH: THE RESTART, which is the claim that lets `reset()` be called from
+        // the audio thread at all. It spends the same processChannel and then re-primes both
+        // rate-matcher legs — and THAT is the row with teeth: the obvious way to re-prime them is
+        // `StreamResampler::reset (rates, capacity)`, which reassigns both vectors, `shrink_to_fit()`s
+        // on the identity path and re-derives 513 x 64 windowed-sinc coefficients. It is deliberately
+        // not noexcept because it allocates, and it costs 1.756 ms for one lane's two legs.
+        // `clearAudioState()` is the state alone. Both rates, both engines a Linear capture can pick,
+        // and a WaveNet; LSTM and ConvNet stay out for the reason the header names — upstream's
+        // per-sample Eigen temporaries — exactly as the process() rows leave them out.
+        const std::pair<const char*, std::string> restartFixtures[] {
+            { "delay(512) direct",          delayModel (512) },
+            { "dense 2001, the FFT engine", denseLinearModel (2001, nullptr) },
+            { "WaveNet field 511",          waveNetDelayModel (511) },
+        };
+        for (const double rate : { 48000.0, 44100.0 })
+            for (const auto& fixture : restartFixtures)
+            {
+                const char* what = fixture.first;
+                nam::NamStage stage;
+                stage.prepare (rate, 512);
+                test::ok (load (stage, fixture.second), std::string ("the restart no-alloc fixture loads: ") + what);
+                std::vector<float> left (512, 0.2f), right (512, -0.15f);
+                float* io[2] { left.data(), right.data() };
+                felitronics::test::run (stage.process (io, 2, 512, false));    // …both lanes are now dirty
+                const long before = g_allocs.load (std::memory_order_relaxed);
+                stage.reset();                                                 // …with a debt to spend
+                stage.reset();                                                 // …and again, with none
+                test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                                 std::string ("NamStage::reset() performs no heap allocation — ") + what
+                                 + " at " + std::to_string ((int) rate) + " Hz"
+                                 + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
+            }
     }
 
     return test::report();

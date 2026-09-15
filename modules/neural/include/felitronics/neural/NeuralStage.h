@@ -24,7 +24,9 @@ namespace felitronics::neural
 // runtime-swapped thing is just an instance of it.
 //
 // Threading: process()/reset() = audio thread. prepare()/swapPrepared()/clear()/collectGarbage() =
-// message (control) thread, serialized with each other.
+// message (control) thread, serialized with each other. reset() belongs on the audio thread for the
+// same reason process() does — it touches the LIVE instance, which no other thread may — and it is the
+// one audio-thread call whose cost is not bounded by the block: see Inference.h.
 template <Inference Backend, int MaxRetired = 8>
 class NeuralStage
 {

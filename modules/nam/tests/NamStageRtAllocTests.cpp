@@ -2,7 +2,9 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // Eigen's own runtime malloc gate complements the house operator-new counter: Eigen can call its
-// aligned allocator directly, so only this guard sees every dynamic Eigen allocation in NAM process().
+// aligned allocator directly, so only this guard sees every dynamic Eigen allocation in NAM process()
+// — and in reset(), which feeds a whole receptive field through the same network and is the other
+// call the audio thread makes.
 
 #include <felitronics_test.h>
 #include <felitronics/nam/NamStage.h>
@@ -74,11 +76,19 @@ void exerciseNoEigenMalloc (const std::string& json, const char* architecture)
     Eigen::internal::set_is_malloc_allowed (false);
     felitronics::test::run (stage.process (io, 2, 64, false));
     felitronics::test::run (stage.process (io, 2, 64, true));
+    // …AND THE STREAM RESTART, which is the other thing the audio thread calls and the one that runs
+    // a whole receptive field through the network in one go. Eigen's own gate is what sees an
+    // allocation NAM makes inside that feed; the house operator-new counter in NamStageTests covers
+    // the stage's own side. Both lanes are dirty here, and the second call spends nothing — the two
+    // shapes the restart has.
+    stage.reset();
+    stage.reset();
+    felitronics::test::run (stage.process (io, 2, 64, false));
     Eigen::internal::set_is_malloc_allowed (true);
     std::printf ("    Eigen malloc gate passed: %s\n", architecture);
     std::fflush (stdout);
     felitronics::test::ok (finite (left) && finite (right),
-                           std::string (architecture) + " stays finite with Eigen malloc forbidden");
+                           std::string (architecture) + " stays finite across process() AND reset() with Eigen malloc forbidden");
 #else
     // The target defines this macro, but keep the source honest if the test is reused standalone.
     felitronics::test::ok (false, std::string (architecture) + " Eigen runtime malloc guard is enabled");
