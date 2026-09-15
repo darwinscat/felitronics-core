@@ -401,6 +401,38 @@ jobs:
           : > empty.f32 && refuse empty.f32 48000 2
           echo "bit-identical: $n native-vs-wasm comparisons of the clipped runs, refusals included"
 
+      - name: the five offline analyzers — native vs wasm, byte for byte (P77)
+        run: |
+          set -euo pipefail
+          # WHY THIS GATE CAN EXIST AT ALL. Before P79 it could not: the five analyzers computed their
+          # windows, dB values and thresholds through the SYSTEM libm, which is not the same function on
+          # every row — 4032 of 131072 Hann coefficients differ between Apple's libm and musl's at order
+          # 17, and 41 % of pow10 results over the dB range these thresholds live in. A byte diff of the
+          # two rows was therefore unattainable for hum, lowend and forensics, and the acceptance had been
+          # weakened to a wasm-only comparison. core::det made the original criterion reachable, so it is
+          # the one enforced here.
+          node tools/wasm/make-fixture.mjs fixture441.f32 44100 2 10   # 48 kHz one already exists above
+          M=./build-native/tools/fcore_measure
+          n=0
+          check() { mode=$1; sr=$2; ch=$3; f=$4
+            $M "$mode" "$sr" "$ch" "$f" > an-native.txt
+            # A clean diff of two empty files proves nothing: refuse to count a comparison with no content.
+            test -s an-native.txt
+            for mod in fcprobe.node.js fcprobe.debug.js; do
+              node "tools/wasm/$mode-parity.mjs" "tools/wasm/build/$mod" "$sr" "$ch" "$f" > an-wasm.txt
+              test -s an-wasm.txt
+              diff an-native.txt an-wasm.txt || { echo "DIFFER: $mode $sr $ch $f ($mod)"; exit 1; }
+              n=$((n+1))
+            done; }
+          # Both rates matter and not for symmetry: at 44.1 kHz the filter arguments of these analyzers
+          # (30 Hz, 9 kHz, the K-weighting corner) are ones where the system libm's tan DID differ between
+          # rows, so this is the rate that would have caught a regression in the deterministic floor.
+          for mode in report forensics hum lowend bursts; do
+            check "$mode" 48000 2 fixture.f32
+            check "$mode" 44100 2 fixture441.f32
+          done
+          echo "bit-identical: $n native-vs-wasm comparisons across five analyzers, two rates, two modules"
+
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.
   # Fails only on crash / unstable-or-non-finite designs (black cells); colour judgement stays human.
