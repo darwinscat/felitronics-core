@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/Config.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/FlushToZero.h>
 #include <felitronics/core/Math.h>
 
@@ -17,7 +18,8 @@ namespace felitronics::analysis
 // shelf, ~+4 dB) then stage 2 (the RLB high-pass, ~38 Hz). Coefficients are RECOMPUTED for the actual
 // sample rate (analog prototype + bilinear) — correct at 44.1/48/88.2/96 kHz, not a hardcoded 48 k table
 // (the usual porting bug). Per-channel double biquad state for loudness accuracy.
-class KWeightingFilter
+template <class Math = core::SystemMath>
+class BasicKWeightingFilter
 {
 public:
     struct Coeffs { double b0, b1, b2, a1, a2; };
@@ -89,9 +91,9 @@ private:
         // Stage 1 — high shelf (the published BS.1770 design constants).
         {
             const double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
-            const double K = std::tan (core::kPi * f0 / sampleRate);
-            const double Vh = std::pow (10.0, G / 20.0);
-            const double Vb = std::pow (Vh, 0.4996667741545416);
+            const double K = Math::tan (core::kPi * f0 / sampleRate);
+            const double Vh = Math::pow10 (G / 20.0);
+            const double Vb = Math::pow (Vh, 0.4996667741545416);
             const double D = 1.0 + K / Q + K * K;
             sa = { (Vh + Vb * K / Q + K * K) / D, 2.0 * (K * K - Vh) / D, (Vh - Vb * K / Q + K * K) / D,
                    2.0 * (K * K - 1.0) / D, (1.0 - K / Q + K * K) / D };
@@ -99,7 +101,7 @@ private:
         // Stage 2 — RLB high-pass.
         {
             const double f0 = 38.13547087602444, Q = 0.5003270373238773;
-            const double K = std::tan (core::kPi * f0 / sampleRate);
+            const double K = Math::tan (core::kPi * f0 / sampleRate);
             const double D = 1.0 + K / Q + K * K;
             sb = { 1.0, -2.0, 1.0, 2.0 * (K * K - 1.0) / D, (1.0 - K / Q + K * K) / D };
         }
@@ -110,5 +112,9 @@ private:
     Coeffs sa {}, sb {};
     double z1a[kMaxChannels] {}, z2a[kMaxChannels] {}, z1b[kMaxChannels] {}, z2b[kMaxChannels] {};
 };
+
+
+using KWeightingFilter = BasicKWeightingFilter<core::SystemMath>;
+using DeterministicKWeightingFilter = BasicKWeightingFilter<core::DetMath>;
 
 } // namespace felitronics::analysis

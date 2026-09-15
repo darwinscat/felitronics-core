@@ -325,6 +325,125 @@ jobs:
           check fix6.f32    44100 6 needle --from 7 --to 8
           check fix1.f32    22050 1 needle --from 100 --to 100
           echo "bit-identical: $n native-vs-wasm comparisons of peaks, stereo band and needle"
+      - name: NULL test — the clipped runs, native vs wasm, bit-exact
+        # P71: analysis::ClipDetector now has a way out (fcore::ClipProbe, `fcore_measure clips` and
+        # fc_probe_clips_*), and this is the proof the two roads report the same runs. The generated fixture
+        # above is CLEAN — its flat stretches are square waves and a hit that stops, which the detector
+        # correctly reports as clipping-free — so it is kept as the zero-run case and a second, CLAMPED
+        # generator provides the runs. Both are transcendental-free and their bytes are pinned.
+        #
+        # --chunk IS THE LAW-8a HANDLE. It is honoured by the native tool and ignored by the module (which
+        # always measures in one call), so every row below that carries it compares an N-sample-at-a-time
+        # native run against a whole-buffer wasm run: re-slicing invariance and cross-toolchain identity in
+        # the same diff. Without it both sides cut the stream at multiples of fcore::ClipProbe::kChunk and the
+        # comparison would say nothing at all about slicing.
+        run: |
+          node tools/wasm/make-clip-fixture.mjs clipfix.f32  48000 2 2
+          node tools/wasm/make-clip-fixture.mjs clipfix6.f32 44100 6 1
+          node tools/wasm/make-clip-fixture.mjs clipfix1.f32 22050 1 1
+          # Deterministic by construction, turned into a measured fact on another machine, OS and node build.
+          # The generator's passages are fractions of the length, so even the 1-second fixtures carry all
+          # seven: quiet noise, silence, a hard clamp, a clean passage, a shallow clamp, non-finite HOLES
+          # (150 / 191 / 17 of them here) and a clamped tail whose runs exist only after finish().
+          sha256sum -c - <<'SUMS'
+          fab7d41e1925e58f58462e39b7c2481dc0418b5aa28cc0b4203f3c6a710f955f  clipfix.f32
+          91de246c7f8f6fc98df1957762c87c50fbc8fda87abddff974753ef7d19ecc85  clipfix6.f32
+          b0e173a8d8f0732b0882425367f8065b11ed986b925c6a49b99aa4b32ece7171  clipfix1.f32
+          SUMS
+          M=./build-native/tools/fcore_measure
+          n=0
+          check() { f=$1; sr=$2; ch=$3; shift 3
+            $M clips "$sr" "$ch" "$f" "$@" > clips-native.txt
+            test -s clips-native.txt
+            for mod in fcprobe.node.js fcprobe.debug.js; do
+              node tools/wasm/clips-parity.mjs "tools/wasm/build/$mod" clips "$sr" "$ch" "$f" "$@" > clips-wasm.txt
+              diff clips-native.txt clips-wasm.txt || { echo "DIFFER: clips $sr $ch $f $* ($mod)"; exit 1; }
+              n=$((n+1))
+            done; }
+          # AND THE REFUSALS MUST MATCH TOO. A byte diff of two successful commands says nothing about the
+          # command lines both sides are supposed to REJECT, and a domain mismatch there is a silent
+          # disagreement: `--max-runs 4294967296` wrapped to 0 in a uint32_t parameter and came back as a
+          # cheerful `maxruns=0` report from the module while the native tool exited 2. Both sides must refuse,
+          # both must print nothing to stdout.
+          refuse() { f=$1; sr=$2; ch=$3; shift 3
+            if $M clips "$sr" "$ch" "$f" "$@" > r-native.txt 2>/dev/null; then
+              echo "NATIVE ACCEPTED what it should refuse: clips $sr $ch $f $*"; exit 1; fi
+            test ! -s r-native.txt || { echo "NATIVE printed a report and then failed: $*"; exit 1; }
+            for mod in fcprobe.node.js fcprobe.debug.js; do
+              if node tools/wasm/clips-parity.mjs "tools/wasm/build/$mod" clips "$sr" "$ch" "$f" "$@" \
+                   > r-wasm.txt 2>/dev/null; then
+                echo "WASM ACCEPTED what native refuses: clips $sr $ch $f $* ($mod)"; exit 1; fi
+              test ! -s r-wasm.txt || { echo "WASM printed a report and then failed: $* ($mod)"; exit 1; }
+              n=$((n+1))
+            done; }
+          # a file with NO clipping at all, then clamped material at three rates and three widths
+          check fixture.f32   48000 2
+          check clipfix.f32   48000 2
+          check clipfix6.f32  44100 6
+          check clipfix1.f32  22050 1
+          # the detector's own capacity running out: the count keeps counting, the list says it is short
+          # 1051 is this fixture's exact run count, so 1050/1051 straddles the completeness boundary
+          for c in 0 1 3 500 1050 1051 1052; do check clipfix.f32 48000 2 --max-runs $c; done
+          # re-slicing, across the tier
+          for k in 1 2 3 7 959 960 961 8191 8192; do check clipfix.f32 48000 2 --chunk $k; done
+          for k in 1 7 882; do check clipfix6.f32 44100 6 --chunk $k; check clipfix1.f32 22050 1 --chunk $k; done
+          refuse clipfix.f32 48000 2 --max-runs 4294967296
+          refuse clipfix.f32 48000 2 --max-runs 1048577
+          refuse clipfix.f32 48000 2 --chunk 2147483648
+          refuse clipfix.f32 48000 2 --max-runs 5 --max-runs 6
+          refuse clipfix.f32 48000 2 --bogus 1
+          refuse clipfix.f32 48000 2 --max-runs
+          refuse clipfix.f32 48000 0
+          refuse clipfix.f32 48000 17
+          refuse clipfix.f32 999 2
+          refuse clipfix.f32 768001 2
+          refuse clipfix.f32 0 2
+          : > empty.f32 && refuse empty.f32 48000 2
+          echo "bit-identical: $n native-vs-wasm comparisons of the clipped runs, refusals included"
+
+      - name: the five offline analyzers — native vs wasm, byte for byte (P77)
+        run: |
+          set -euo pipefail
+          # WHY THIS GATE CAN EXIST AT ALL. Before P79 it could not: the five analyzers computed their
+          # windows, dB values and thresholds through the SYSTEM libm, which is not the same function on
+          # every row — 4032 of 131072 Hann coefficients differ between Apple's libm and musl's at order
+          # 17, and 41 % of pow10 results over the dB range these thresholds live in. A byte diff of the
+          # two rows was therefore unattainable for hum, lowend and forensics, and the acceptance had been
+          # weakened to a wasm-only comparison. core::det made the original criterion reachable, so it is
+          # the one enforced here.
+          node tools/wasm/make-fixture.mjs fixture441.f32 44100 2 10   # 48 kHz one already exists above
+          # AND A PROGRAMME THAT ACTUALLY HAS HUM. On the loudness fixture HumDetector finds zero quiet
+          # frames and returns NoQuietStretch before reaching its peak search at all: 47 lines of "nothing
+          # found" satisfy `test -s` and diff clean without the measurement path ever running. This one
+          # carries a 50 Hz line with three harmonics in two quiet stretches, each longer than a whole
+          # analysis window plus a hop — which is what it takes for a frame to sit entirely inside one.
+          node tools/wasm/make-hum-fixture.mjs humfix.f32 48000 2 30
+          M=./build-native/tools/fcore_measure
+          n=0
+          check() { mode=$1; sr=$2; ch=$3; f=$4
+            $M "$mode" "$sr" "$ch" "$f" > an-native.txt
+            # A clean diff of two empty files proves nothing: refuse to count a comparison with no content.
+            test -s an-native.txt
+            for mod in fcprobe.node.js fcprobe.debug.js; do
+              node "tools/wasm/$mode-parity.mjs" "tools/wasm/build/$mod" "$sr" "$ch" "$f" > an-wasm.txt
+              test -s an-wasm.txt
+              diff an-native.txt an-wasm.txt || { echo "DIFFER: $mode $sr $ch $f ($mod)"; exit 1; }
+              n=$((n+1))
+            done; }
+          # Both rates matter and not for symmetry: at 44.1 kHz the filter arguments of these analyzers
+          # (30 Hz, 9 kHz, the K-weighting corner) are ones where the system libm's tan DID differ between
+          # rows, so this is the rate that would have caught a regression in the deterministic floor.
+          for mode in report forensics hum lowend bursts; do
+            check "$mode" 48000 2 fixture.f32
+            check "$mode" 44100 2 fixture441.f32
+          done
+          # hum again, on the programme that reaches its measurement — and asserted to be a real finding,
+          # because a clean diff of two "nothing found" reports is the shape this whole gate exists to
+          # refuse.
+          check hum 48000 2 humfix.f32
+          grep -q '^ch 0 valid 1 reason 0 mains 1' an-native.txt \
+            || { echo "the hum fixture stopped finding its line — the gate is comparing nothing again"; exit 1; }
+          echo "bit-identical: $n native-vs-wasm comparisons across five analyzers, two rates, two modules"
 
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.

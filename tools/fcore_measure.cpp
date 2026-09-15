@@ -5,9 +5,9 @@
 // reference (ffmpeg), and the NATIVE SIDE of the P0 wasm parity check. Reads interleaved 32-bit-float
 // little-endian PCM (as ffmpeg emits with `-f f32le`).
 //
-// The measurement itself lives in fcore_probe.h, shared verbatim with the wasm shim — read that header for
-// the build contract (-ffp-contract=off here, no -mrelaxed-simd there) and for why the true-peak filter
-// config is part of that contract rather than an implementation detail.
+// The measurement itself lives in fcore_probe.h (and, for `clips`, fcore_clips.h), shared verbatim with the
+// wasm shim — read those headers for the build contract (-ffp-contract=off here, no -mrelaxed-simd there) and
+// for why the true-peak filter config is part of that contract rather than an implementation detail.
 //
 //   lufs        → integrated loudness (LUFS)            ↔ ffmpeg ebur128 "I:"
 //   truepeak    → max true peak (dBTP, 4× oversampled)  ↔ ffmpeg ebur128 "Peak:" (True Peak)
@@ -22,19 +22,53 @@
 //   stereo      → the stereo band (analysis::StereoColumns): per column width / correlation / RMS as float32
 //                 bit patterns, plus the maximum RMS as a double. RMS, not `lufs`. [--columns N]
 //   needle      → correlation / width / RMS over [from, to) as double bit patterns. --from A --to B
+//   clips       → the clipped runs (analysis::ClipDetector): how many were found, whether the list is whole,
+//                 the sample peak of each channel, and every stored run — start, length, level, channel,
+//                 polarity, evidence. Levels and peaks as bit patterns; the format lives in tools/fcore_clips_format.h
+//                 and the wasm module prints it too, so a diff IS the parity test. [--max-runs N] [--chunk N]
+//   report      → the whole-programme report (analysis::ProgrammeReport): DC, silence, tail, infra-low,
+//                 stereo, PLR / LRA / short-term percentiles. Every scalar as a raw bit pattern with its
+//                 validity and reason; every count as a decimal integer. Printed through the report's own
+//                 field visitor, so the struct and this output cannot drift apart.
+//   hum         → mains hum (analysis::HumDetector): per channel the validity reason, the mains nominal, the
+//                 line's interpolated position / level / prominence, the comb, and the quiet stretches in
+//                 sample coordinates — every float as a raw bit pattern, like `blocks`, so a future wasm
+//                 comparison catches a flipped bit that %.17g would round away. `valid 0` is never "clean":
+//                 read the reason. [--quiet-db X] [--order N]
+//   lowend      → the vinyl low end (analysis::LowEnd): the integral Mid/Side energies of the LR4 low and high
+//                 bands and of the unfiltered programme, every stored 10 ms block, the side-fraction histogram,
+//                 the three extremum coordinates, and the full semitone band table with the dominant note —
+//                 as raw IEEE-754 bit patterns, so `diff` between two toolchains IS the parity test. Every
+//                 field the report publishes is here EXCEPT the law-8a trace, which exists only for the suite.
+//                 An invalid note prints as `note INVALID reason N`, never as a note name. NOT `correlation`,
+//                 which is a whole-file phase number with no band split.
+//
+//   forensics   → what the file WAS (analysis::SourceForensics): the spectral wall per channel and for the
+// and forensics modes size the file before reading it (the first three because every boundary depends on the length,
+// forensics so that a short read cannot come out as a successful measurement of a shorter programme), so they need a
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
 // The scalar modes print %.2f by default (tools/validate_ffmpeg.sh compares against ffmpeg's own two
-// decimals); `--precise` switches them to %.17g plus the exact %a form. `blocks`, `waveform`, `stereo` and
-// `needle` are always exact, and the node side (tools/wasm/shapes-parity.mjs) prints the same bytes.
+// decimals); `--precise` switches them to %.17g plus the exact %a form. `blocks`, `waveform`, `stereo`,
+// `needle` and `clips` are always exact, and the node side (tools/wasm/shapes-parity.mjs for the shapes,
+// clips-parity.mjs for the runs) prints the same bytes.
 //
-// DECODE TO FLOAT, NEVER TO s16. This tool reads f32le: `ffmpeg -i x -f f32le out.f32`. The waveform, stereo and needle
-// modes size the file before reading it (every boundary depends on the length), so they need a seekable file, not a pipe. An integer decode
+// DECODE TO FLOAT, NEVER TO s16. This tool reads f32le: `ffmpeg -i x -f f32le out.f32`. The waveform, stereo, needle
+// and clips modes size the file before reading it (the first three because every boundary depends on the length, clips
+// because a short read must be a refusal rather than a clean report of a truncated file), so they need a seekable file,
+// not a pipe. An integer decode
 // (`-f s16le`, as the old sidecar generator did) clamps a lossy file's samples above 0 dBFS and quantises the
 // rest, and the peaks of that are not the peaks of the file.
 
+#include "fcore_clips_format.h"
 #include "fcore_probe.h"
+
+#include <felitronics/analysis/ProgrammeReport.h>
+#include <felitronics/analysis/SourceForensics.h>
+#include <felitronics/analysis/HumDetector.h>
+#include <felitronics/analysis/LowEnd.h>
+#include <felitronics/analysis/BandBursts.h>
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +76,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -50,6 +85,14 @@ using namespace felitronics;
 namespace
 {
     constexpr int kChunk = fcore::Probe::kChunk;
+
+    // fcore::ClipProbe spells its own step as a literal rather than deriving it from fcore::Probe: it must not
+    // include fcore_probe.h, which would pull the loudness meter and the oversampler into the wasm module's
+    // clips path for a constant. This is the one translation unit that sees both, so this is where the two are
+    // tied — the `clips` mode's --chunk 8191/8192/8193 rows and the comments in fcore_clips.h about "the
+    // native reader's 8192-frame reads" all go quietly false if they ever drift apart.
+    static_assert (fcore::ClipProbe::kChunk == fcore::Probe::kChunk,
+                   "the clips adapter's step and the file reader's step must be the same number");
 
     // Reads the file in kChunk-frame steps, de-interleaving into planar scratch and handing each step to
     // `sink`. The de-interleave is a pure float permutation — exact, and identical to what the wasm side's
@@ -164,8 +207,10 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle> <sampleRate> <channels> <raw.f32le>\n"
-            "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n",
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend|bursts|forensics> <sampleRate> <channels> <raw.f32le>\n"
+            "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
+            "          [--max-runs N] [--chunk N]\n"
+            "          [--quiet-db X] [--order N]\n",
             argv[0]);
         return 2;
     }
@@ -184,6 +229,111 @@ int main (int argc, char** argv)
     std::FILE* f = std::fopen (argv[4], "rb");
     if (! f) { std::perror ("open"); return 2; }
 
+    if (mode == "hum")
+    {
+        // THE FILE IS SIZED BEFORE IT IS READ, as clips/forensics/lowend already do it. streamPlanar()
+        // floors a trailing partial frame and returns success regardless, so a file holding three floats
+        // and declared stereo was measured to its break and reported as a whole programme — an instrument
+        // certifying audio it never saw, which is the exact failure P71 says it closed. Three of the six
+        // modes had inherited the lax path; this is the third of them.
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
+        // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
+        // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
+        // the wasm harness refuses the same strings, and a refusal that does not match on both roads is a
+        // parity break that a diff of two successful runs would never show.
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
+        // The whole file through analysis::HumDetector, streamed in kChunk steps — the answer is identical at
+        // any slicing (law 8a), so the chunking is a convenience here and not part of the measurement.
+        analysis::HumDetectorParams hp;
+        for (int i = 5; i < argc; ++i)
+        {
+            if (std::strcmp (argv[i], "--quiet-db") == 0 && i + 1 < argc) hp.quietThresholdDb = std::atof (argv[++i]);
+            else if (std::strcmp (argv[i], "--order") == 0 && i + 1 < argc) hp.fftOrder = std::atoi (argv[++i]);
+        }
+        analysis::HumDetector hd;
+        hd.setParams (hp);
+        if (! hd.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "hum: prepare refused these arguments (rate %g, %d channels)\n", fs, nc);
+            std::fclose (f);
+            return 2;
+        }
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { (void) hd.process (p, nc, n); });
+        std::fclose (f);
+        hd.finish();
+        if ((std::uint64_t) hd.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) hd.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
+        std::printf ("# fcore hum v1 sr=%016llx ch=%d order=%d n=%lld hop=%lld bin=%016llx\n",
+                     (unsigned long long) bits (fs), nc, hd.geometry().order,
+                     (long long) hd.windowSamples(), (long long) hd.hopSamples(),
+                     (unsigned long long) bits (hd.binHz()));
+        for (int c = 0; c < nc; ++c)
+        {
+            const analysis::HumReport r = hd.report (c);
+            std::printf ("ch %d valid %d reason %d mains %d base %d fobs %d fderived %d\n",
+                         c, r.valid ? 1 : 0, (int) r.reason, (int) r.mains, r.baseHarmonic,
+                         r.fundamentalObserved ? 1 : 0, r.fundamentalDerived ? 1 : 0);
+            std::printf ("ch %d f0 %016llx hz %016llx tone %016llx peakbin %016llx floor %016llx prom %016llx\n",
+                         c, (unsigned long long) bits (r.fundamentalHz), (unsigned long long) bits (r.line.hz),
+                         (unsigned long long) bits (r.line.tonePower), (unsigned long long) bits (r.line.peakBinPower),
+                         (unsigned long long) bits (r.line.floorPower), (unsigned long long) bits (r.line.prominenceDb));
+            std::printf ("ch %d frames %lld finite %lld holed %lld quiet %lld stretches %lld stored %lld complete %d tail %lld\n",
+                         c, (long long) r.frames, (long long) r.finiteFrames, (long long) r.holedFrames,
+                         (long long) r.quietFrames, (long long) r.quietStretches, (long long) r.storedStretches,
+                         r.stretchesComplete ? 1 : 0, (long long) r.tailUncoveredSamples);
+            for (int cand = 0; cand < analysis::HumDetector::kCandidates; ++cand)
+            {
+                const analysis::HumCandidate k = hd.candidate (c, cand);
+                std::printf ("ch %d cand %016llx found %d base %d f0 %016llx sobs %lld soff %lld fobs %lld sspread %016llx fspread %016llx intra %016llx stat %d pass %d harm %d low %d\n",
+                             c, (unsigned long long) bits (k.nominalHz), k.baseFound ? 1 : 0, k.baseHarmonic,
+                             (unsigned long long) bits (k.fundamentalHz),
+                             (long long) k.stretchObservations, (long long) k.stretchOffTolerance,
+                             (long long) k.frameObservations,
+                             (unsigned long long) bits (k.stretchSpreadHz), (unsigned long long) bits (k.frameSpreadHz),
+                             (unsigned long long) bits (k.maxIntraStretchSpreadHz),
+                             k.stationary ? 1 : 0, k.passed ? 1 : 0, k.harmonicsObserved, k.lowestHarmonicObserved);
+                std::printf ("ch %d cand %d window %d hz %016llx prom %016llx\n", c, cand,
+                             k.windowPeak.found ? 1 : 0, (unsigned long long) bits (k.windowPeak.hz),
+                             (unsigned long long) bits (k.windowPeak.prominenceDb));
+                for (int h = 1; h <= hp.maxHarmonic; ++h)
+                {
+                    const analysis::HumHarmonic hh = hd.harmonic (c, cand, h);
+                    std::printf ("ch %d cand %d h %d inband %d acc %d hz %016llx tone %016llx prom %016llx\n",
+                                 c, cand, h, hh.inBand ? 1 : 0, hh.peak.accepted ? 1 : 0,
+                                 (unsigned long long) bits (hh.peak.hz), (unsigned long long) bits (hh.peak.tonePower),
+                                 (unsigned long long) bits (hh.peak.prominenceDb));
+                }
+            }
+            for (std::int64_t i = 0; i < hd.storedStretchCount (c); ++i)
+            {
+                const analysis::HumStretch st = hd.stretch (c, i);
+                std::printf ("ch %d stretch %lld %lld %lld frames %lld\n", c, (long long) st.index,
+                             (long long) st.startSample, (long long) st.endSample, (long long) st.frames);
+            }
+        }
+        return 0;
+    }
+
     if (mode == "correlation")
     {
         // The stereo band's formula over the whole file, streamed — the same StereoSums a column and the needle
@@ -200,6 +350,499 @@ int main (int argc, char** argv)
         const double corr = sums.correlation();
         if (precise) std::printf ("%.17g  %a\n", corr, corr);
         else         std::printf ("%.3f\n", corr);
+        return 0;
+    }
+
+    if (mode == "clips")
+    {
+        // THE FILE IS SIZED FIRST, AND A SHORT READ IS A REFUSAL. streamPlanar() floors a trailing partial frame,
+        // ignores what the sink answered and never looks at ferror(), so a truncated or unreadable file would
+        // otherwise be measured to its break and reported as a clean whole — an instrument certifying audio it
+        // never saw. fileFrames() refuses a size that is not a whole number of frames, the sink's verdict is kept,
+        // and the frames the probe actually consumed are compared with the frames the file holds.
+        //
+        // AN EMPTY FILE IS REFUSED, as it is in waveform|stereo|needle and in the wasm module's own input guard
+        // (fc_probe.cpp planarSpan, which rejects frames == 0). A zero-length programme has a perfectly good
+        // clip report — no runs, zero peaks — and printing it was the other candidate here; refusing wins
+        // because the most likely way to arrive at a zero-length file is truncation, and an instrument that
+        // answers "clean" to a file that lost its contents is the failure this mode is built to avoid. The
+        // zero-length stream itself is still covered, in felitronics_clips_exposure_tests, where it is a
+        // measurement and not a file.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width) || width < 1
+            || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        // Parsed with the shape modes' strictness and NOT with their parser: an unknown, misspelt or repeated
+        // option is refused rather than ignored or silently resolved, because the node side of the parity check
+        // could not be relied on to resolve it the same way.
+        //
+        // --chunk is the law-8a handle, and it is a real option rather than a test hook: the report must be the
+        // same bytes however the stream is cut into process() calls, and without a way to ask for a different
+        // cut from outside, that claim can only ever be checked from inside a test binary. 0 means "one call per
+        // read block", which is what the tool does by itself; any N >= 1 sub-slices those blocks, so the reachable
+        // calls run from a single sample up to the reader's own 8192-frame step. Calls LARGER than a read block
+        // are reached the only place they can be — felitronics_clips_exposure_tests, which drives fcore::ClipProbe
+        // (the same adapter both roads use) directly.
+        std::uint64_t maxRuns = (std::uint64_t) analysis::ClipDetectorParams {}.maxRuns, chunk = 0;
+        bool seen[2] {};
+        for (int i = 5; i < argc; ++i)
+        {
+            if (std::strcmp (argv[i], "--precise") == 0) continue;
+            const int k = std::strcmp (argv[i], "--max-runs") == 0 ? 0 : std::strcmp (argv[i], "--chunk") == 0 ? 1 : 2;
+            if (k == 2 || seen[k] || i + 1 >= argc || ! parseCount (argv[i + 1], k == 0 ? maxRuns : chunk))
+            {
+                std::fprintf (stderr, "bad, unknown or repeated option\n");
+                std::fclose (f);
+                return 2;
+            }
+            seen[k] = true;
+            ++i;
+        }
+        if (chunk > 0x7FFFFFFFu) { std::fprintf (stderr, "--chunk out of range\n"); std::fclose (f); return 2; }
+
+        fcore::ClipProbe probe;
+        if (maxRuns > (std::uint64_t) fcore::ClipProbe::kMaxRuns
+            || frames > (std::uint64_t) std::numeric_limits<std::int64_t>::max()
+            || ! probe.prepare (rate, nc, (std::int64_t) maxRuns, (std::int64_t) frames))
+        {
+            // The width is already checked twice above, so it cannot be the cause here and is not offered as one.
+            std::fprintf (stderr, "clips.prepare refused (sampleRate %g..%g, --max-runs 0..%lld)\n",
+                          analysis::ClipDetector::kMinSampleRate, analysis::ClipDetector::kMaxSampleRate,
+                          (long long) fcore::ClipProbe::kMaxRuns);
+            std::fclose (f);
+            return 2;
+        }
+        bool ok = true;
+        const long long step = chunk == 0 ? 0 : (long long) chunk;
+        streamPlanar (f, nc, [&] (const float* const* p, int n)
+        {
+            if (step == 0) { ok = ok && probe.process (p, nc, n); return; }
+            const float* view[core::kMaxChannels] {};
+            for (long long off = 0; off < n && ok; off += step)
+            {
+                const long long m = std::min<long long> (step, (long long) n - off);
+                for (int c = 0; c < nc; ++c) view[(std::size_t) c] = p[c] + off;
+                ok = ok && probe.process (view, nc, m);
+            }
+        });
+        std::fclose (f);
+        // probe.finish() is the check now: it refuses unless the frames the file was sized for, the frames the
+        // reader handed over and the samples the detector consumed are all the same number.
+        fcore::ClipsReport rep;
+        if (! ok || ! probe.finish() || ! readClips (probe, rep))
+        {
+            std::fprintf (stderr, "the file did not deliver the %llu frames it was sized for\n",
+                          (unsigned long long) frames);
+            return 2;
+        }
+        const std::string text = fcore::formatClips (rep);
+        std::fwrite (text.data(), 1, text.size(), stdout);
+        return 0;
+    }
+
+    if (mode == "report")
+    {
+        // THE FILE IS SIZED BEFORE IT IS READ, as clips/forensics/lowend already do it. streamPlanar()
+        // floors a trailing partial frame and returns success regardless, so a file holding three floats
+        // and declared stereo was measured to its break and reported as a whole programme — an instrument
+        // certifying audio it never saw, which is the exact failure P71 says it closed. Three of the six
+        // modes had inherited the lax path; this is the third of them.
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
+        // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
+        // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
+        // the wasm harness refuses the same strings, and a refusal that does not match on both roads is a
+        // parity break that a diff of two successful runs would never show.
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
+        // THE WHOLE-PROGRAMME REPORT. Every floating-point number goes out as a raw IEEE-754 bit pattern,
+        // exactly as `blocks` does and for the same reason: the other side of this comparison is
+        // JavaScript, which has no hex-float printing and whose decimal formatting is not C's, so a
+        // 16-hex-digit pattern is the one representation both sides produce identically and `diff` IS the
+        // parity test. `%.17g` would not do either — it round-trips, but a flipped low bit can print the
+        // same decimal on two libcs.
+        //
+        // Printed through the report's OWN field visitor rather than a list written out here, so a field
+        // added to the struct appears in this output without this block being touched — the same
+        // enumeration the law-8a gate compares through.
+        //
+        // maxBlock is kChunk because that is what streamPlanar hands over; it sizes the scratch and
+        // nothing else, so the numbers do not depend on it.
+        analysis::ProgrammeReport pr;
+        if (! pr.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "report.prepare refused (rate, channels or a parameter out of range)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool accepted = true;
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { accepted = accepted && pr.process (p, nc, n); });
+        std::fclose (f);
+        if (! accepted)
+        {
+            std::fprintf (stderr, "the report refused a call\n");
+            return 2;
+        }
+        pr.finish();
+        if ((std::uint64_t) pr.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) pr.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
+        const auto& R = pr.report();
+        std::printf ("# fcore report v1 sr=%016llx ch=%d samples=%lld\n",
+                     (unsigned long long) bits (fs), nc, (long long) R.totalSamples);
+        R.visitCounts ([] (const char* name, int ch, std::int64_t v)
+                       { std::printf ("C %s %d %lld\n", name, ch, (long long) v); });
+        R.visitValues ([] (const char* name, int ch, const analysis::ProgrammeValue& v)
+                       { std::printf ("V %s %d %d %d %016llx\n", name, ch, v.valid ? 1 : 0,
+                                      (int) v.reason, (unsigned long long) bits (v.value)); });
+        return 0;
+    }
+
+    if (mode == "lowend")
+    {
+        // The vinyl low end. Streamed in kChunk steps, which is also the point: the report is bit-identical
+        // under ANY slicing (law 8a), so the chunk size is not part of the measurement.
+        // STRICT on its arguments, like the shape modes and unlike the older scalar ones: atoi("4294967297")
+        // narrows to 1 channel and atof("8000Hz") reads 8000, and either would measure something silently.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width)
+            || width < 1 || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        // …and strict on its INPUT: a file that is not a whole number of frames, or that cannot be read
+        // to the end, must not print a report and exit zero. (A directory opens successfully on macOS and
+        // then fails every read, which used to come out as an empty report and a success.)
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        analysis::LowEndParams lp;
+        analysis::LowEnd le;
+        le.setParams (lp);
+        if (! le.prepare (rate, kChunk, nc))
+        {
+            std::fprintf (stderr, "LowEnd refused this geometry (rate, channels or note range)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool okAll = true;
+        const bool read = streamPlanar (f, nc, [&] (const float* const* pp, int n) { okAll = le.process (pp, nc, n) && okAll; });
+        std::fclose (f);
+        if (! read || ! okAll || ! le.finish()) { std::fprintf (stderr, "LowEnd refused a chunk, or the file could not be read\n"); return 2; }
+        if ((std::uint64_t) le.samplesProcessed() != frames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) le.samplesProcessed(), (unsigned long long) frames);
+            return 2;
+        }
+
+        // Raw bit patterns, not %g: the other side of this comparison is JavaScript, whose decimal
+        // formatting is not C's, so a 16-hex-digit pattern is the one representation both sides produce
+        // identically. A decimal header would break a whole-file diff while every measured bit matched.
+        std::printf ("# fcore lowend v1 sr=%016llx ch=%d xover=%016llx order=%d hop=%lld block=%lld bands=%d chunk=%d\n",
+                     (unsigned long long) bits (fs), nc, (unsigned long long) bits (le.crossoverHz()),
+                     lp.fftOrder, (long long) le.hopSamples(), (long long) le.blockSamples(), le.bandCount(), kChunk);
+        std::printf ("reason %d %d\n", (int) le.widthReason(), (int) le.noteReason());
+        std::printf ("samples %lld finite %lld holes %lld nonfinite %lld absent %lld overflow %lld\n",
+                     (long long) le.samplesProcessed(), (long long) le.finiteSamples(), (long long) le.holeSamples(),
+                     (long long) le.nonFiniteSamples(), (long long) le.absentSamples(),
+                     (long long) le.filterNonFiniteSamples());
+        const double energies[7] = { le.lowMidEnergy(), le.lowSideEnergy(), le.highMidEnergy(), le.highSideEnergy(),
+                                     le.rawMidEnergy(), le.rawSideEnergy(), le.lowSideFraction() };
+        static const char* const enames[7] = { "lowmid", "lowside", "highmid", "highside", "rawmid", "rawside", "lowfrac" };
+        for (int i = 0; i < 7; ++i)
+            std::printf ("%s %016llx\n", enames[i], (unsigned long long) bits (energies[i]));
+        std::printf ("highfrac %016llx rawfrac %016llx\n",
+                     (unsigned long long) bits (le.highSideFraction()), (unsigned long long) bits (le.rawSideFraction()));
+        std::printf ("blocks %lld stored %lld complete %d histsamples %lld\n",
+                     (long long) le.blockCount(), (long long) le.storedBlockCount(), le.blocksComplete() ? 1 : 0,
+                     (long long) le.histogramSamples());
+        for (int i = 0; i < analysis::LowEnd::kHistogramBins; ++i)
+            std::printf ("h%02d %lld\n", i, (long long) le.histogram (i));
+        std::printf ("worst %lld %016llx %016llx\n", (long long) le.worstFractionBlock(),
+                     (unsigned long long) bits (le.worstFraction()), (unsigned long long) bits (le.worstFractionEnergy()));
+        std::printf ("peakenergy %lld %016llx %016llx\n", (long long) le.peakEnergyBlock(),
+                     (unsigned long long) bits (le.peakBlockEnergy()), (unsigned long long) bits (le.peakEnergyBlockFraction()));
+        std::printf ("peakside %lld %016llx amp %016llx at %lld\n", (long long) le.peakSideEnergyBlock(),
+                     (unsigned long long) bits (le.peakBlockSideEnergy()),
+                     (unsigned long long) bits (le.peakLowSideAmplitude()), (long long) le.peakLowSideAmplitudeAt());
+        std::printf ("frames used %lld holed %lld tail %lld window %lld underresolved %d\n",
+                     (long long) le.usedFrames(), (long long) le.holedFrames(), (long long) le.tailUncoveredSamples(),
+                     (long long) le.windowSamples(), le.underResolvedBands());
+        // the 10 ms SERIES, every stored block: without it a diff cannot compare the quantity the
+        // instrument publishes per block, which is where the wide-bass answer actually lives
+        std::printf ("series index samples finite holes midEnergy sideEnergy\n");
+        for (std::int64_t i = 0; i < le.storedBlockCount(); ++i)
+        {
+            const analysis::LowEndBlock r = le.block (i);
+            std::printf ("s %lld %lld %lld %lld %016llx %016llx\n", (long long) r.index, (long long) r.samples,
+                         (long long) r.finiteSamples, (long long) r.holes,
+                         (unsigned long long) bits (r.midEnergy), (unsigned long long) bits (r.sideEnergy));
+        }
+        std::printf ("band midi centreHz widthHz binsPerBand midEnergy sideEnergy energy density centroidHz centsOffset\n");
+        for (int b = 0; b < le.bandCount(); ++b)
+        {
+            const analysis::LowEndBand r = le.band (b);
+            std::printf ("b %d %d %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", b, r.midi,
+                         (unsigned long long) bits (r.centreHz), (unsigned long long) bits (r.widthHz),
+                         (unsigned long long) bits (r.binsPerBand), (unsigned long long) bits (r.midEnergy),
+                         (unsigned long long) bits (r.sideEnergy), (unsigned long long) bits (r.energy),
+                         (unsigned long long) bits (r.density), (unsigned long long) bits (r.centroidHz),
+                         (unsigned long long) bits (r.centsOffset));
+        }
+        std::printf ("peak %d %d density %d second %d\n", le.peakBand(), le.peakMidi(),
+                     le.peakDensityBand(), le.secondBand());
+        // Only when there IS a note. peakMidi() is canonically 0 for an invalid report, and feeding that
+        // through the naming functions printed "note C-1" — an invalid answer wearing a real note's name,
+        // which is precisely the number-that-reads-as-a-finding this instrument exists not to print.
+        if (le.noteValid())
+            std::printf ("note %s%d nominal %016llx centroid %016llx cents %016llx sidefrac %016llx\n",
+                         analysis::LowEnd::pitchClassName (le.peakMidi()), analysis::LowEnd::noteOctave (le.peakMidi()),
+                         (unsigned long long) bits (le.peakNoteHz()), (unsigned long long) bits (le.peakCentroidHz()),
+                         (unsigned long long) bits (le.peakCentsOffset()), (unsigned long long) bits (le.peakBandSideFraction()));
+        else
+            std::printf ("note INVALID reason %d\n", (int) le.noteReason());
+        // the dominance ratio is NOT printed as one number: its denominator is exactly zero for a tone in
+        // digital silence. The three numbers it is made of are printed instead.
+        std::printf ("frame %016llx rangeshare %016llx\n",
+                     (unsigned long long) bits (le.frameEnergy()), (unsigned long long) bits (le.bandRangeShare()));
+        std::printf ("background %016llx peakenergy %016llx peakwidth %016llx share %016llx total %016llx\n",
+                     (unsigned long long) bits (le.backgroundDensity()), (unsigned long long) bits (le.peakBandEnergy()),
+                     (unsigned long long) bits (le.peakBandWidthHz()), (unsigned long long) bits (le.peakShare()),
+                     (unsigned long long) bits (le.totalBandEnergy()));
+        return 0;
+    }
+
+    if (mode == "bursts")
+    {
+        // THE FILE IS SIZED BEFORE IT IS READ, as clips/forensics/lowend already do it. streamPlanar()
+        // floors a trailing partial frame and returns success regardless, so a file holding three floats
+        // and declared stereo was measured to its break and reported as a whole programme — an instrument
+        // certifying audio it never saw, which is the exact failure P71 says it closed. Three of the six
+        // modes had inherited the lax path; this is the third of them.
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
+        // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
+        // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
+        // the wasm harness refuses the same strings, and a refusal that does not match on both roads is a
+        // parity break that a diff of two successful runs would never show.
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
+        // analysis::BandBursts at its defaults: bursts in 5-9 kHz against the MEDIAN of a 2 s trailing
+        // ring of 10 ms hops. Everything float is a RAW IEEE-754 BIT PATTERN, as `blocks` does it, so a
+        // later wasm comparison catches a flipped bit that decimal printing would round away. The
+        // histograms print only their NON-ZERO bins, which is a complete description of an integer
+        // histogram and keeps a quiet file's output short.
+        analysis::BandBursts det;
+        const analysis::BandBurstsParams bp;              // the documented defaults
+        det.setParams (bp);
+        if (! det.prepare (fs, kChunk, nc))
+        {
+            std::fprintf (stderr, "bursts: prepare refused this configuration — the default 5-9 kHz band "
+                                  "needs a sample rate above 18368 Hz (0.49 fs must clear 9 kHz)\n");
+            std::fclose (f);
+            return 2;
+        }
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { (void) det.process (p, nc, n); });
+        std::fclose (f);
+        det.finish();
+        if ((std::uint64_t) det.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) det.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
+
+        std::printf ("# fcore bursts v1 sr=%016llx ch=%d hop=%d base=%d lo=%016llx hi=%016llx "
+                     "enter=%016llx exit=%016llx chunk=%d\n",
+                     (unsigned long long) bits (fs), nc, det.hopSamples(), det.baselineHops(),
+                     (unsigned long long) bits (det.bandLowHz()), (unsigned long long) bits (det.bandHighHz()),
+                     (unsigned long long) bits (bp.enterDb), (unsigned long long) bits (bp.exitDb), kChunk);
+        std::printf ("samples %lld\n", (long long) det.samplesProcessed());
+        std::printf ("hops %lld %lld %lld %lld\n", (long long) det.hopCount(), (long long) det.eligibleHops(),
+                     (long long) det.zeroBaselineHops(), (long long) det.burstHops());
+        std::printf ("damage %lld %lld %lld\n", (long long) det.damagedHops(),
+                     (long long) det.overflowSamples(), (long long) det.firstNonFiniteAt());
+        std::printf ("tail %lld %016llx\n", (long long) det.tailPartialSamples(),
+                     (unsigned long long) bits (det.tailPartialEnergy()));
+        std::printf ("valid %d %d %d %d\n", det.eventsValid() ? 1 : 0, (int) det.eventsInvalidReason(),
+                     det.programmeEnergyValid() ? 1 : 0, (int) det.programmeEnergyInvalidReason());
+        for (int c = 0; c < det.channels(); ++c)
+            std::printf ("chan %d %016llx %lld %lld\n", c, (unsigned long long) bits (det.bandEnergy (c)),
+                         (long long) det.nonFiniteSamples (c), (long long) det.absentSamples (c));
+        std::printf ("events %lld %lld %d\n", (long long) det.eventCount(),
+                     (long long) det.storedEventCount(), det.eventsComplete() ? 1 : 0);
+        for (std::int64_t i = 0; i < det.storedEventCount(); ++i)
+        {
+            const analysis::BandBurst e = det.event (i);
+            std::printf ("e %lld %lld %lld %lld %016llx %016llx %016llx %016llx %016llx %d%d%d\n",
+                         (long long) e.start, (long long) e.length, (long long) e.peakAt, (long long) e.hops,
+                         (unsigned long long) bits (e.peakPower), (unsigned long long) bits (e.peakBaseline),
+                         (unsigned long long) bits (e.peakExcessDb), (unsigned long long) bits (e.peakWidePower),
+                         (unsigned long long) bits (e.energy),
+                         e.touchedNonFinite ? 1 : 0, e.baselineTouchedNonFinite ? 1 : 0,
+                         e.closedByFinish ? 1 : 0);
+        }
+        std::printf ("onsets %lld %lld %lld %d %lld\n", (long long) det.onsetCount(),
+                     (long long) det.intervalCount(), (long long) det.intervalOverflow(),
+                     det.modalIntervalHops(), (long long) det.modalIntervalMass());
+        for (int b = 1; b <= analysis::BandBursts::kIoiBins; ++b)
+            if (det.intervalBin (b) != 0) std::printf ("ioi %d %lld\n", b, (long long) det.intervalBin (b));
+        for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)
+            if (det.lagBin (b) != 0) std::printf ("lag %d %lld\n", b, (long long) det.lagBin (b));
+        return 0;
+    }
+
+    if (mode == "forensics")
+    {
+        // The whole report, as bit patterns. The analyzer's own defaults are used and PRINTED, so a diff
+        // between two toolchains compares the same instrument and not two configurations of it.
+        // Strict where the top-level parse is lenient, like the shape modes: atoi("4294967297") narrows to
+        // one channel and atof("48000Hz") reads 48000, and both would measure silently.
+        double frate = 0.0;
+        std::uint64_t fwidth = 0;
+        if (! parseRate (argv[2], frate) || ! parseCount (argv[3], fwidth)
+            || fwidth < 1 || fwidth > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        // The file is SIZED before it is read, so an input that is not a whole number of frames, or a read
+        // that fails halfway, cannot come out as a successful measurement of a shorter programme.
+        std::uint64_t fframes = 0;
+        if (! fileFrames (f, nc, fframes))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        analysis::SourceForensics fx;
+        const analysis::SourceForensicsParams fp;
+        if (! fx.prepare (frate, kChunk, nc))
+        {
+            std::fprintf (stderr, "forensics.prepare refused (sample rate 1000..768000)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool okAll = true;
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { okAll = fx.process (p, nc, n) && okAll; });
+        const bool readError = std::ferror (f) != 0;
+        std::fclose (f);
+        if (! okAll) { std::fprintf (stderr, "forensics: a block was refused\n"); return 2; }
+        if (readError) { std::fprintf (stderr, "forensics: the file could not be read to its end\n"); return 2; }
+        fx.finish();
+        if ((std::uint64_t) fx.samplesProcessed() != fframes)
+        {
+            std::fprintf (stderr, "forensics: the file delivered %lld of the %llu frames it was sized for\n",
+                          (long long) fx.samplesProcessed(), (unsigned long long) fframes);
+            return 2;
+        }
+        // EVERY parameter, so two builds that differ only in a threshold cannot print the same report.
+        std::printf ("# fcore forensics v1 sr=%016llx ch=%d order=%d hop=%lld bins=%d percell=%d\n",
+                     (unsigned long long) bits (frate), nc, fp.fftOrder, (long long) fx.hopSamples(),
+                     fx.bins(), fx.binsPerCell());
+        std::printf ("params exempt=%d distinctlimit=%d plateaucells=%d floorcells=%d", fx.exemptCells(),
+                     fx.distinctLimit(), fx.plateauSpanCells(), fx.floorSpanCells());
+        const double ps[] = { fx.cellHz(), fx.binHz(), fx.searchFromHz(), fx.searchToHz(), fp.cellWidthHz,
+                              fp.searchFromHz, fp.plateauSpanHz, fp.floorSpanHz, fp.transitionStartDb,
+                              fp.transitionEndDb, fp.minDropDb, fp.maxTransitionHz, fp.nearNyquistFraction,
+                              fp.emptyDb, fp.emptyMinHz, fp.gridOutlierFraction };
+        for (double d : ps) std::printf (" %016llx", (unsigned long long) bits (d));
+        std::printf ("\n");
+        std::printf ("samples %lld tail %lld frames %lld\n", (long long) fx.samplesProcessed(),
+                     (long long) fx.tailUncoveredSamples(), (long long) fx.frames().frameCount());
+        for (int c = 0; c <= nc; ++c)                     // per channel, then the file's own aggregate
+        {
+            const analysis::SpectralWall w = c < nc ? fx.wall (c) : fx.wall();
+            std::printf ("wall %d valid=%d reason=%d sharp=%d nearnyq=%d clipped=%d trunc=%d exempted=%d"
+                         " second=%d/%d/%d/%d secondreason=%d empty=%d emptyreason=%d frames=%lld/%lld\n",
+                         c, (int) w.valid, (int) w.reason, (int) w.sharp, (int) w.nearNyquist,
+                         (int) w.transitionClipped, (int) w.truncatedAtNyquist, w.exemptedCells,
+                         (int) w.secondValid, (int) w.secondSharp, (int) w.secondTransitionClipped,
+                         (int) w.secondTruncatedAtNyquist, (int) w.secondReason,
+                         (int) w.emptyAboveValid, (int) w.emptyAboveReason,
+                         (long long) w.framesUsed, (long long) w.framesHoled);
+            const double ds[] = { w.cutoffHz, w.cutoffFractionOfNyquist, w.steepestHz, w.transitionEndHz,
+                                  w.transitionHz, w.plateauPower, w.floorLocalPower, w.maxAbovePower,
+                                  w.sufMaxPower, w.dropDb, w.strictDropDb, w.localDropDb, w.recoveryDb,
+                                  w.plateauSpreadDb, w.steepnessDbPerOctave, w.secondCutoffHz, w.secondDropDb,
+                                  w.secondTransitionHz, w.emptyAboveHz, w.emptyAboveFractionOfNyquist,
+                                  w.emptyThresholdPower, w.peakCellPower };
+            std::printf ("wall %d values", c);
+            for (double d : ds) std::printf (" %016llx", (unsigned long long) bits (d));
+            std::printf ("\n");
+        }
+        for (int c = 0; c < nc; ++c)
+        {
+            const analysis::SampleGrid g = fx.sampleGrid (c);
+            std::printf ("grid %d valid=%d reason=%d k=%d pcm=%d outofrange=%d bits=%d robustk=%d"
+                         " robustbits=%d zerolow24=%d peak=%016llx min=%016llx max=%016llx\n",
+                         c, (int) g.valid, (int) g.reason, g.gridExponent, (int) g.pcmCompatible,
+                         (int) g.outsidePcmRange, g.minExactPcmBits, g.robustGridExponent, g.robustPcmBits,
+                         g.alwaysZeroLowBits (24), (unsigned long long) bits (g.absPeak),
+                         (unsigned long long) bits (g.sampleMin), (unsigned long long) bits (g.sampleMax));
+            std::printf ("grid %d nonzero=%lld zero=%lld nonfinite=%lld absent=%lld offgrid=%lld"
+                         " firstoffgrid=%lld firstmaxk=%lld distinct=%lld complete=%d\n",
+                         c, (long long) g.nonZeroSamples, (long long) g.zeroSamples,
+                         (long long) g.nonFiniteSamples, (long long) g.absentSamples,
+                         (long long) g.offGridSamples, (long long) g.firstOffGridSample,
+                         (long long) g.firstMaxGridSample, (long long) g.distinctValues,
+                         (int) g.distinctComplete);
+            std::printf ("grid %d khist", c);
+            const std::int64_t* h = fx.gridExponentHistogram (c);
+            for (int k = 0; k < analysis::SourceForensics::gridExponentBuckets(); ++k)
+                std::printf (" %lld", (long long) h[(std::size_t) k]);
+            std::printf ("\n");
+        }
         return 0;
     }
 

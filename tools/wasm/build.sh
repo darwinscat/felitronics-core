@@ -35,7 +35,12 @@ echo "emcc: $(emcc --version | head -1)"
 INC=(-I"$ROOT/tools"
      -I"$ROOT/modules/core/include"
      -I"$ROOT/modules/analysis/include"
-     -I"$ROOT/modules/oversampling/include")
+     -I"$ROOT/modules/oversampling/include"
+     # The offline analyzers compose over the eq/stereo primitives (eq::Crossover2 is the LR4,
+     # stereo::MidSide the M/S pair), so the probe needs their include roots too — felitronics::analysis
+     # itself does not link them, and cannot: eq links analysis, so analysis -> eq would be a cycle.
+     -I"$ROOT/modules/eq/include"
+     -I"$ROOT/modules/stereo/include")
 
 # The mastering ABI pulls in the whole chain. This list is `felitronics::mastering`'s own link list in
 # modules/mastering/CMakeLists.txt, spelled as include paths — plus oversampling, which analysis needs.
@@ -64,12 +69,15 @@ SRC="$HERE/fc_probe.cpp"
 
 # The whitelist, read from the source — the fc_master rule below, applied here too since P59a added a dozen entry
 # points to this file: a name missing from -sEXPORTED_FUNCTIONS is dead-stripped and a page finds it `undefined`
-# at the moment it needs it. Floor, not count: 12 P0 entry points + 13 for the waveform peaks and stereo band.
+# at the moment it needs it. Floor, not count: 12 P0 entry points + 13 for the waveform peaks and stereo band
+# (P59a) + 12 for the clipped runs (P71) + _malloc/_free. The floor is raised with each wave rather than left at
+# the first one, because the grep only matches a RETURN TYPE of int/double/std::uint32_t: an entry point whose
+# type drifts (to std::int64_t, say) silently leaves the list, and a floor from three waves ago cannot see it.
 PEXPORTS=$(grep -oE 'FC_EXPORT[[:space:]]+(int|double|std::uint32_t)[[:space:]]+fc_probe_[a-z0-9_]+' "$SRC" \
            | awk '{print "_" $NF}' | sort -u | paste -sd, -)
 PEXPORTS="$PEXPORTS,_malloc,_free"
 echo "--- fc_probe exports: $(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ') symbols"
-[ "$(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ')" -ge 27 ] \
+[ "$(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ')" -ge 39 ] \
     || { echo "*** the export list did not come out of $SRC — refusing to link a module with no ABI"; exit 1; }
 
 # -msimd128: `core::firDot`'s wasm kernel is behind `__wasm_simd128__`, so without it this module

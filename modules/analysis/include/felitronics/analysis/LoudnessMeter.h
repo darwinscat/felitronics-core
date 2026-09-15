@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/Config.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/analysis/KWeightingFilter.h>
 
@@ -38,7 +39,8 @@ namespace felitronics::analysis
 // for the longest program and that reads 0. Channel
 // weights default to 1.0 (correct for mono/stereo); set them per the BS.1770 roles (Ls/Rs = 1.41, LFE
 // excluded) for surround — the host-layout→role mapping is product glue.
-class LoudnessMeter
+template <class Math = core::SystemMath>
+class BasicLoudnessMeter
 {
 public:
     // SECONDS are the convenience; the store is counted in SAMPLES — see prepareForSamples(). A NaN or negative
@@ -326,12 +328,12 @@ private:
         return s / kk;
     }
 
-    static double lufsOf (double meanSquare) noexcept { return meanSquare > 1e-12 ? -0.691 + 10.0 * std::log10 (meanSquare) : -120.0; }
+    static double lufsOf (double meanSquare) noexcept { return meanSquare > 1e-12 ? -0.691 + 10.0 * Math::log10 (meanSquare) : -120.0; }
 
     double integrated() const noexcept
     {
         if (blockCount <= 0) return -120.0;
-        const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);               // energy for -70 LUFS
+        const double absT = Math::pow10 ((-70.0 + 0.691) / 10.0);               // energy for -70 LUFS
         double sum = 0.0; int cnt = 0;
         // isfinite FIRST, at every gate. `NaN > absT` is already false, but `+inf > absT` is TRUE, and one
         // +inf energy then poisons `sum`, makes relT infinite, and the second gate admits nothing — the
@@ -352,7 +354,7 @@ private:
     double lra() const noexcept
     {
         if (stCount <= 0) return 0.0;
-        const double absT = std::pow (10.0, (-70.0 + 0.691) / 10.0);                // energy for −70 LUFS
+        const double absT = Math::pow10 ((-70.0 + 0.691) / 10.0);                // energy for −70 LUFS
         double sum = 0.0; int cnt = 0;
         // isfinite first here too, and here it is not merely a wrong answer but UNDEFINED BEHAVIOUR: an
         // infinite short-term energy passes `inf >= absT`, makes relT infinite, then passes `inf >= inf`,
@@ -388,7 +390,7 @@ private:
     double fs = 48000.0; int ch = 2, subSamples = 480;
     int ranNc_ = 0;                             // channels that advanced K-weighting on the previous call
     bool prepared_ = false;                     // true only after prepare() (subRing/blockE/stE allocated)
-    KWeightingFilter kw;
+    BasicKWeightingFilter<Math> kw;
     double w[kMaxChannels] {};
     double subSumSq[kMaxChannels] {};
     int subCount = 0;
@@ -400,5 +402,9 @@ private:
     std::vector<double> stE;                                                        // 3 s short-term energies @1 s (LRA)
     int stCount = 0, stSince = 0;
 };
+
+
+using LoudnessMeter = BasicLoudnessMeter<core::SystemMath>;
+using DeterministicLoudnessMeter = BasicLoudnessMeter<core::DetMath>;
 
 } // namespace felitronics::analysis

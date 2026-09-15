@@ -10,13 +10,18 @@
 set(FCORE_NO_FP_CONTRACT $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>)
 
 add_executable(fcore_measure fcore_measure.cpp)
-target_link_libraries(fcore_measure PRIVATE felitronics::analysis felitronics::oversampling)
+target_link_libraries(fcore_measure PRIVATE felitronics::analysis_offline felitronics::oversampling)
+# The OFFLINE analyzer modes (lowend, and the siblings landing beside it) compose over eq::Crossover2 /
+# stereo::MidSide, which felitronics::analysis cannot itself depend on without closing a cycle — see the
+# note on the target in modules/analysis/CMakeLists.txt. Added rather than substituted, so two branches
+# that both need it resolve to one line instead of a conflict.
 target_compile_features(fcore_measure PRIVATE cxx_std_20)
 target_compile_options(fcore_measure PRIVATE ${FCORE_NO_FP_CONTRACT})
 
 if(FELITRONICS_BUILD_TESTS)
-    # fcore::Probe is the body shared verbatim with the wasm shim, so it is the one piece of tools/ that
-    # carries a correctness claim rather than convenience — and it gets a real suite.
+    # fcore::Probe is a body shared verbatim with the wasm shim, so it is one of the two pieces of tools/ that
+    # carry a correctness claim rather than convenience — and it gets a real suite. (The other is
+    # fcore::ClipProbe, whose suite is felitronics_clips_exposure_tests, further down.)
     add_executable(felitronics_probe_tests tests/ProbeTests.cpp)
     target_link_libraries(felitronics_probe_tests PRIVATE felitronics::analysis felitronics::oversampling)
     target_include_directories(felitronics_probe_tests PRIVATE
@@ -29,12 +34,40 @@ if(FELITRONICS_BUILD_TESTS)
     # guards are tested — natively, because fc_probe.cpp compiles anywhere (EMSCRIPTEN_KEEPALIVE degrades to a
     # plain extern "C"). That puts the validation and the planar addressing under ctest, ASan and UBSan.
     add_executable(felitronics_abi_tests tests/AbiTests.cpp wasm/fc_probe.cpp)
-    target_link_libraries(felitronics_abi_tests PRIVATE felitronics::analysis felitronics::oversampling)
+    target_link_libraries(felitronics_abi_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
     target_include_directories(felitronics_abi_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_abi_tests PRIVATE cxx_std_20)
     target_compile_options(felitronics_abi_tests PRIVATE ${FCORE_NO_FP_CONTRACT})
     add_test(NAME felitronics_abi_tests COMMAND felitronics_abi_tests)
+
+    # The EXPOSURE of analysis::ClipDetector (P71): fcore::ClipProbe, the `clips` text format and the clips
+    # entry points of the wasm ABI. Same arrangement as felitronics_abi_tests one block up — fc_probe.cpp is
+    # compiled natively, so the ABI's validation and packing run under ctest, ASan and UBSan.
+    #
+    # FCORE_NO_FP_CONTRACT IS LOAD-BEARING ON THIS TARGET, not inherited decoration. The repository declares
+    # -ffp-contract=on (top-level CMakeLists, law 10), and the one expression of this measurement a fused
+    # multiply-add can reach is ClipDetector's smooth-crest bound V = (tau + q)*stretch^2 + q — which gates a
+    # strict >=, so a 1-ulp difference creates or destroys a whole RUN rather than moving a last digit. The
+    # numbers this suite pins are the numbers `fcore_measure clips` and the wasm module produce, and both of
+    # those are built contract-off; a suite built contract-on would be pinning a third answer. -fno-fast-math
+    # is stated for the same reason it is stated in tools/wasm/build.sh: nothing here may be reassociated.
+    # The P77 ABI surface under adversarial arguments — natively, so ASan/UBSan see it. fc_probe.cpp
+    # compiles anywhere; EMSCRIPTEN_KEEPALIVE degrades to nothing off the wasm tier.
+    add_executable(felitronics_analysis_abi_tests tests/AnalysisAbiTests.cpp wasm/fc_probe.cpp)
+    target_link_libraries(felitronics_analysis_abi_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
+    target_include_directories(felitronics_analysis_abi_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(felitronics_analysis_abi_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_analysis_abi_tests COMMAND felitronics_analysis_abi_tests)
+
+    add_executable(felitronics_clips_exposure_tests tests/ClipsExposureTests.cpp wasm/fc_probe.cpp)
+    target_link_libraries(felitronics_clips_exposure_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
+    target_include_directories(felitronics_clips_exposure_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_clips_exposure_tests PRIVATE cxx_std_20)
+    target_compile_options(felitronics_clips_exposure_tests PRIVATE ${FCORE_NO_FP_CONTRACT}
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-fast-math>)
+    add_test(NAME felitronics_clips_exposure_tests COMMAND felitronics_clips_exposure_tests)
 
     # The mastering C ABI. Same arrangement as felitronics_abi_tests one block up — the shim compiles
     # natively, so its validation, ownership and mapping layer runs under ctest, ASan and UBSan. NOT
