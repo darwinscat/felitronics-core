@@ -248,12 +248,12 @@ namespace felitronics::test::alloc
         for (int i = 0; i < kForms; ++i) if (probeSeen[i] < 1) ++missing;
         if (missing == 0) return;
 
-        std::printf ("FATAL: the allocation counter is not installed for every form of `new`.\n");
+        std::fprintf (stderr, "FATAL: the allocation counter is not installed for every form of `new`.\n");
         for (int i = 0; i < kForms; ++i)
             if (probeSeen[i] < 1)
-                std::printf ("       UNCOUNTED: operator %s\n", kFormNames[i]);
-        std::printf ("       every \"no heap allocation\" claim in this suite would be measuring nothing — P52.\n");
-        std::fflush (stdout);
+                std::fprintf (stderr, "       UNCOUNTED: operator %s\n", kFormNames[i]);
+        std::fprintf (stderr, "       every \"no heap allocation\" claim in this suite would be measuring nothing — P52.\n");
+        std::fflush (stderr);
         std::abort();
     }
 
@@ -261,10 +261,17 @@ namespace felitronics::test::alloc
     // proven in THIS run, not in a comment. It is emitted here rather than from report() because report()
     // is not universal — two suites in this tree total in a harness of their own and never call it, and a
     // line that is missing in exactly the places hardest to notice is not evidence.
+    //
+    // ⚠ STDERR, AND THAT IS LOAD-BEARING. A test binary's stdout is a DATA channel for whoever runs it:
+    // `felitronics_analysis_abi_tests --storage-table` writes 425 rows of published demand there, and CI
+    // compares them BYTE FOR BYTE against the same table off the wasm module (P81's cross-tier gate).
+    // Announcing on stdout put this line at byte 1 of that file and the gate failed on the first byte —
+    // the instrument's own proof of health corrupting the answer it was measuring. Diagnostics go to
+    // stderr; the run's result goes to stdout. The verify() failure above follows the same rule.
     inline void announce()
     {
-        std::printf ("  - allocation counter: all %d forms of `new` counted, over-aligned included "
-                     "(probed one allocation through each)\n", kForms);
+        std::fprintf (stderr, "  - allocation counter: all %d forms of `new` counted, over-aligned included "
+                              "(probed one allocation through each)\n", kForms);
     }
 
     //==============================================================================
