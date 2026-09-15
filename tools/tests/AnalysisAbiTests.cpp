@@ -92,6 +92,51 @@ void hammer (Getter g, const std::string& name, std::uint32_t stride)
     // a capacity that is NOT a whole number of rows: the getter must floor it, never round up
     if (stride > 1) fenced (g, stride - 1, name + " [one short of a row]", stride);
     if (stride > 1) fenced (g, stride * 3 - 1, name + " [three rows less one]", stride);
+
+    // AND THE CAPACITY MUST ACTUALLY BIND, or nothing above tested the truncation path at all. Asking for
+    // one row and getting one row does NOT prove that: it is what a list of length one returns anyway.
+    // Learn the full length first, then ask for one row less — only then is the capacity the constraint.
+    // Measured: without this, a `room + 1` mutant in bursts_events left the suite green.
+    {
+        std::vector<double> big (4096, kCanary);
+        const std::uint32_t full = g (big.data(), (std::uint32_t) (big.size() / stride) * stride);
+        if (full >= 2)
+        {
+            const std::uint32_t want = full - 1;
+            std::vector<double> buf ((std::size_t) want * stride + 4, kCanary);
+            const std::uint32_t got = g (buf.data() + 2, want * stride);
+            bool fence = true;
+            for (int i = 0; i < 2; ++i)
+                if (buf[(std::size_t) i] != kCanary || buf[buf.size() - 1 - (std::size_t) i] != kCanary) fence = false;
+            ok (got == want, name + ": a capacity of " + std::to_string (want) + " rows against a list of "
+                             + std::to_string (full) + " returns exactly " + std::to_string (got));
+            ok (fence, name + ": and does not write past it");
+        }
+        else
+        {
+            ok (true, name + ": only " + std::to_string (full) + " row(s) on this fixture — THE TRUNCATION "
+                      "PATH IS NOT EXERCISED HERE, said out loud rather than passed in silence");
+        }
+    }
+}
+
+// White noise with PERIODIC BURSTS in the band BandBursts watches. Without them the event list holds
+// fewer than two rows, its truncation path is never exercised, and a getter mutated to write one row past
+// its capacity passes the whole suite — measured, before this fixture existed.
+std::vector<float> burstyFixture (int frames, int channels)
+{
+    std::vector<float> v ((std::size_t) frames * (std::size_t) channels, 0.0f);
+    std::uint64_t st = 0x9E3779B97F4A7C15ull;
+    const int period = frames / 6, width = frames / 30;   // ~167 ms apart, ~33 ms wide: several hops each
+    for (int i = 0; i < frames; ++i)
+    {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        const double n = (double) (st >> 11) / 9007199254740992.0 * 2.0 - 1.0;
+        const bool inBurst = (i % (period > 0 ? period : 1)) < (width > 0 ? width : 1);
+        const double a = inBurst ? 0.7 : 0.05;
+        for (int c = 0; c < channels; ++c) v[(std::size_t) c * (std::size_t) frames + (std::size_t) i] = (float) (a * n);
+    }
+    return v;
 }
 
 std::vector<float> fixture (int frames, int channels)
@@ -151,6 +196,19 @@ int main()
     for (const Mode& m : modes)
         ok (m.run (planar.data(), (std::uint32_t) frames, (std::uint32_t) ch, 48000.0) == 1,
             std::string (m.name) + "_run: accepts a real programme");
+    // bursts gets the bursty one, so its event list is long enough for a capacity to bind against.
+    {
+        // Five seconds, not one: the detector's baseline is a long moving window, and a one-second
+        // programme never establishes one, so a shorter fixture yields no events at all.
+        const int burstFrames = 5 * 48000;
+        const std::vector<float> bursty = burstyFixture (burstFrames, ch);
+        ok (fc_probe_bursts_run (bursty.data(), (std::uint32_t) burstFrames, (std::uint32_t) ch, 48000.0) == 1,
+            "bursts_run: accepts the bursty programme");
+        std::vector<double> probe (4096, 0.0);
+        const std::uint32_t events = fc_probe_bursts_events (probe.data(), 4092);
+        ok (events >= 2, "bursts: the bursty fixture yields " + std::to_string (events)
+                         + " events — enough for a capacity to bind against");
+    }
 
     hammer (fc_probe_report_counts, "report_counts", 2);
     hammer (fc_probe_report_values, "report_values", 4);
