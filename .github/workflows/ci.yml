@@ -3,25 +3,40 @@ name: ci
 
 on:
   push:
-    branches: [ main, "feat/**" ]
-  pull_request:
-  workflow_dispatch:   # manual run (e.g. to seed/refresh the quality-report branch)
+    branches: [ main ]          # NOT "feat/**": a branch with a PR was getting TWO full runs of all 13 jobs
+  pull_request:                 # for one push (measured: p81 81274f28 -> runs 34991274385 and 34991354360,
+  workflow_dispatch:            # 45 s apart). `pull_request` already covers every branch, and covers it
+                                # MERGED INTO main, which is the stricter thing to test. A branch with no PR
+                                # open simply does not burn the pool twice.
+
+# One live run per branch or PR. Without this, a push on top of a push leaves the first one running to the
+# end against code nobody will merge, and on the scarcest runners that is the whole queue.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-test:
     name: ${{ matrix.os }} pffft=${{ matrix.pffft }} nam=${{ matrix.nam }}
-    runs-on: ${{ matrix.os }}
+    # SELF-HOSTED FOR THE macOS ROWS. GitHub's hosted macos-latest is a 3-core arm64 VM and it is the
+    # scarcest runner in the pool: measured on this suite, one macOS cell is 23.9-39.6 min of which 35.6 is
+    # COMPILING (Configure 0.5, Test 3.3), against 9.6 min for the same cell on ubuntu. LafoxsMacStudio is
+    # the same ISA and the same Apple toolchain, so nothing about coverage changes - only the wait.
+    # THE FORK GATE IS NOT OPTIONAL: this repository is public, and a self-hosted runner executes whatever
+    # a pull request brings. A PR from a fork therefore keeps the hosted runner; only code that already
+    # lives in this repository runs on hardware that is not disposable.
+    runs-on: ${{ (matrix.selfHosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","macOS","ARM64","studio"]') || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:          # OFF/OFF proves the default header-only path on every toolchain. NAM is also
           - { os: ubuntu-latest,  pffft: OFF, nam: OFF }   # compiled on all three; pffft ON covers the two SIMD
-          - { os: macos-latest,   pffft: OFF, nam: OFF }   # arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
+          - { os: macos-latest,   pffft: OFF, nam: OFF, selfHosted: true }   # arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
           - { os: windows-latest, pffft: OFF, nam: OFF }   # (macos). Its cross-backend NULL suite runs on ON.
-          - { os: macos-latest,   pffft: OFF, nam: ON  }
+          - { os: macos-latest,   pffft: OFF, nam: ON,  selfHosted: true }
           - { os: windows-latest, pffft: OFF, nam: ON  }
           - { os: ubuntu-latest,  pffft: ON,  nam: ON  }
-          - { os: macos-latest,   pffft: ON,  nam: ON  }
+          - { os: macos-latest,   pffft: ON,  nam: ON,  selfHosted: true }
           # arm64 LINUX — the axis nothing above covers. Every other row confounds two variables: the two
           # arm64 rows are also the only Apple rows, so "arm64" and "Apple's toolchain" always move together
           # and a divergence cannot be attributed. It is not a hypothetical distinction — the P0 spike found
@@ -35,8 +50,30 @@ jobs:
       - uses: actions/checkout@v7   # v5 runs on Node 24 (v4 is pinned to the deprecated Node 20)
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }} -DFELITRONICS_WITH_NAM=${{ matrix.nam }}
+      - name: Toolchain
+        shell: bash
+        # A self-hosted macOS runner inherits launchd's PATH — /usr/bin:/bin:/usr/sbin:/sbin — and Homebrew
+        # is not on it, which is where that machine's cmake, ninja and node actually live (measured:
+        # `command -v cmake` empty, /opt/homebrew/bin/cmake 4.4.3 present). A hosted runner ships cmake on
+        # the default PATH, so this gap is invisible until the first self-hosted run dies at Configure with
+        # `cmake: command not found`. Prepend it where it exists; where it does not, this does nothing.
+        run: |
+          if [ -d /opt/homebrew/bin ]; then
+            echo /opt/homebrew/bin >> "$GITHUB_PATH"
+            export PATH=/opt/homebrew/bin:$PATH
+          fi
+          echo "runner: $(uname -s) $(uname -m)"
+          cmake --version | head -1
+          ninja --version 2>/dev/null && echo "(ninja, above)" || echo "(no ninja — the default generator it is)"
       - name: Build
-        run: cmake --build build --config Release -j   # --config is required by multi-config gens (VS on Windows)
+        shell: bash
+        # A BARE `-j` MEANS UNLIMITED, not "use the cores" - the same footgun 7eb0894 fixed for CodeQL and
+        # nowhere else. On a 3-core box that is a pile of compilers competing for 7 GB, which is most of why
+        # the macOS rows were 35 min of build. Ask for the cores the machine actually has.
+        run: |
+          n=$( (getconf _NPROCESSORS_ONLN || nproc || sysctl -n hw.ncpu) 2>/dev/null | head -1 )
+          echo "building with -j ${n:-4}"
+          cmake --build build --config Release -j "${n:-4}"   # --config: required by multi-config gens (VS)
       - name: Test
         # The perf-shaped suites run VERBOSE first, then everything runs normally. Two lines, and they
         # exist because `--output-on-failure` prints a test's stdout only when it FAILS — so every gate
