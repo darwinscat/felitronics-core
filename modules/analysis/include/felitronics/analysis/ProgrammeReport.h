@@ -147,8 +147,14 @@ namespace felitronics::analysis
 //     with canonical zeros for a channel the caller stopped delivering, so that edge never fires. Feeding
 //     silence is also the honest state for a whole-programme report: law 11c's "the channel heard
 //     silence", and exactly what `ReferenceTruePeakMeter::drain()` feeds a stopped channel anyway.
-// NOT PROMISED: bit-identity between platforms, toolchains or libms. `log10`, `pow` and `sqrt` are not
-// bit-portable, and the percentile bin and the loudness conversions are computed through them.
+// PROMISED SINCE v0.33.0, AND IT WAS NOT BEFORE: bit-identity between platforms, toolchains and libms.
+// This paragraph used to say the opposite, and it was true when it was written — `log10` and `pow` are not
+// bit-portable and the percentile bin and the loudness conversions run through them. They now run through
+// `core::det`, whose whole purpose is to be the same function on every row, and `sqrt` is exactly rounded
+// by IEEE-754 and never was the problem. Measured, not assumed: `fcore_measure report` on the same
+// programme is byte-identical across Apple clang/arm64, gcc 14/glibc x86-64 and wasm32/musl, at 48 and
+// 44.1 kHz. The filters underneath are DeterministicCrossover2 / DeterministicKWeightingFilter /
+// DeterministicLoudnessMeter for the same reason; see core::DetMath.
 //
 // NON-FINITE INPUT. A non-finite sample is a HOLE: a canonical 0.0f goes into every filter, the sample
 // enters no statistic, and it is counted per channel. What that invalidates is drawn along one line —

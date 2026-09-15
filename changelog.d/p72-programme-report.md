@@ -80,6 +80,10 @@ fields it damages.
 
 475 checks, green under Apple clang 21 / libc++ / arm64 and gcc 14.2 / libstdc++ / x86-64, including the
 strict header-hygiene gate (`-Wconversion -Wfloat-equal -Werror`) on both. `fcore_measure report` on a
-stereo fixture is bit-identical across those two rows — every count and all 31 scalars — which is measured
-here rather than promised: the header does not claim cross-platform bit-identity, since `log10`, `pow` and
-`sqrt` are in the derivation.
+stereo fixture is bit-identical across those two rows — every count and all 31 scalars.
+
+(When this was written the header added that cross-platform bit-identity was NOT promised, because `log10`
+and `pow` are not bit-portable. P79, later in this same release, removed that caveat: those derivations now
+run through `core::det` and the report is byte-identical across Apple clang/arm64, gcc/glibc x86-64 AND
+wasm32/musl. The sentence is corrected here rather than deleted, because the release note should not read
+as though the property had always held.)

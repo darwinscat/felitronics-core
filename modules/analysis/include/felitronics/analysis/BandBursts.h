@@ -247,9 +247,12 @@ namespace felitronics::analysis
 //   product" so that nobody has to re-derive which ones are safe. (2) A channel-count timeline is the
 //   caller's, not the audio's (`StateGrid.h:34`): re-slicing must preserve which channels are present at
 //   each absolute sample, and "omit channel 1" is a different programme from "feed channel 1 zeros".
-//   (3) `enterDb`/`exitDb` become ratios through `std::pow` in `prepare()`, which is not guaranteed
-//   correctly rounded on every libm; a 1-ulp difference there can move a hop that sits exactly on the
-//   threshold. That is a cross-tier statement, not an 8a one — within one binary the ratio is a constant.
+//   (3) WAS a caveat about `enterDb`/`exitDb` becoming ratios through `std::pow`, which is not correctly
+//   rounded on every libm, so a 1-ulp difference could move a hop sitting exactly on the threshold. Since
+//   v0.33.0 they go through `core::det::pow10` instead, which IS the same function on every row — and it
+//   mattered more than it looked: over the dB range these thresholds live in, 41 % of `std::pow(10, x)`
+//   results differ between Apple's libm and both Linux ones (measured). A threshold that moves by an ulp
+//   does not move a number by an ulp; it flips a decision.
 //
 // FORM. setParams / prepare / process / finish / reset, the shape of `analysis::ClipDetector`. Every
 // parameter takes effect at the next `prepare()`. `prepare()` disarms, validates, sizes itself through
