@@ -1040,10 +1040,15 @@ budgeted yet**. They are now, and closing that turned up two things worth more t
   over 4 rates × 3 widths × 4 topologies, byte for byte, for `create` and for `configure`.
   ⚠️ **This sentence used to say "the suites' allocation counters", and that was false of the suites at
   large.** Counted on the tree: **11 test TUs of 61** install the over-aligned form. The other 50 — among
-  them `EqEngineTests`, over the very `EqEngine` this entry names, and `LimiterTests`, `NamStageTests`,
-  `LinearPhaseEqTests` — still assert "no heap allocation" with a counter that cannot see an over-aligned
-  request. That remainder is **P52**, and it is open; the claim is corrected here rather than left standing
-  because a reader acts on it.
+  them `LimiterTests`, `NamStageTests`, `LinearPhaseEqTests` and `EqEngineTests` — assert "no heap
+  allocation" with a counter that CANNOT SEE an over-aligned request, so what they prove is narrower than
+  what they say: no call to two of the eight replaceable forms, not no call to any of them.
+  **What is NOT claimed here: that anything was actually slipping past.** Measured while closing P52 —
+  three stands, including a backtrace over all 128 binaries — no over-aligned allocation reaches any
+  `process()`, and 45 suites make none of their own at all. `EqEngineTests` is one of them: it builds
+  `EqEngine eng;` on the STACK, so the 331 KiB above is a cost a `make_unique` consumer pays, not one that
+  slipped through this suite's blind spot. The hole was real and latent, which is the honest description
+  and the reason it survived. Closing it is **P52**.
 
 ### `analysis` · `mastering` · `tools` — a meter's store is counted in samples, a call publishes what it will allocate, and an instance that aborted refuses
 
