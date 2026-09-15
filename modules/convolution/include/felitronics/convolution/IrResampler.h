@@ -192,6 +192,69 @@ struct IrResampleConfig
 };
 
 //==============================================================================
+// A RESAMPLED IR IS NOT A RESAMPLED SIGNAL, and this is the factor that tells the two apart.
+//
+// `resampleIr` below normalizes every output tap to unity DC, which preserves the WAVEFORM's
+// AMPLITUDE: tap for tap, the output carries the values the input would have had at the new rate.
+// That is what a signal wants. A convolution's gain is not an amplitude — it is a SUM over taps, so
+// it is proportional to how many of them fit into a second. The same response resampled from `inSr`
+// to `outSr` therefore convolves `outSr / inSr` times as loud: +6.02 dB for a 48 kHz IR on a 96 kHz
+// host, +5.28 at 88.2, -0.74 at 44.1, +12.04 at 192. Measured on a real 48 kHz spring IR the reading
+// matches that ratio to four decimals at every standard rate, and multiplying by the factor below
+// puts all five within 0.0002 dB of each other (P68).
+//
+// SO WHOEVER HANDS THE RESULT TO A CONVOLVER MULTIPLIES BY THIS. `CabConvolver` does it for the IRs
+// it resamples itself; a caller that resamples an IR on its own must do it too, or its wet path
+// changes level with the host's clock. It is exactly 1 when the rates match, so a load that is not
+// resampled never sees it, and 1 is also what an unusable pair of rates gets: a factor that is not a
+// positive finite number is not a compensation, and silencing or blasting an IR is a worse answer
+// than leaving it at the level it came with (the rule P67 settled for broken metadata).
+//
+// It does NOT make the resample gain-exact by itself. The density term is all it takes out; the
+// kernel's pre-ringing that would fall BEFORE output sample 0 is still dropped (see resampleIr's
+// note below), and how much that costs depends on how abruptly the IR starts and on how far its
+// first energy sits from sample 0 — not on this factor.
+//
+// AND IT IS A RIPPLE, NOT A LOSS — the sign alternates, because the kernel's nearest pre-ring lobes
+// are negative and cutting them ADDS level. A lone impulse (the sharpest onset there is) at input
+// index `lead`, DC gain after the factor, in dB:
+//
+//     lead:            0      1      2      3      4      6      8     12     16     32
+//     96 -> 48 kHz  -2.343 +0.827 +0.781 -0.340 -0.515 +0.337 -0.247 -0.119 -0.049 -0.000
+//     96 -> 44.1    -2.574 +0.653 +0.949 -0.049 -0.606 +0.327 -0.161 +0.021 +0.050 +0.000
+//     48 -> 44.1    -0.484 +0.512 -0.494 +0.389 -0.303 -0.101 +0.035 +0.063 -0.010 +0.000
+//     48 -> 192     -0.697 +0.241 -0.181 +0.153 -0.138 -0.111 -0.084 -0.038 -0.009 -0.000
+//
+// So an onset-trimmed IR can come out nearly a dB HOT as easily as quiet, and a measurement that
+// trims the front must not charge the difference here IN EITHER DIRECTION. It dies at `halfTaps`
+// input samples of lead — the window's own backward reach — and only there. A smoother onset pays
+// far less: a one-pole `exp(-n/tau)` starting at full scale with no lead loses 0.21 dB at 44.1 kHz
+// and 0.39 at 192 for tau = 1 INPUT SAMPLE (8.7 dB per sample, an impulse with a smear), but only
+// 0.004 and 0.011 dB at tau = 1 ms, which is what a real decay looks like. Pad the front if it
+// matters; the numbers above are why a measurement of this wants a lead of at least `halfTaps`.
+// TWO GATES, AND BOTH EARN THEIR KEEP. Guarding only the RESULT is not the same rule and was wrong here:
+// -48 kHz against -96 kHz divides to a perfectly finite 0.5, so a pair of NEGATIVE rates — which
+// `resampleIr` refuses outright — would have been compensated for a resample that never ran. Guarding only
+// the inputs is not enough either: two finite rates 600 decades apart still divide to an infinity or a
+// zero. Positivity covers NaN as well (every comparison against it is false), and it is the result gate
+// that answers for the infinities: inf/48000 is inf, 48000/inf is 0, inf/inf is a NaN, and all three leave
+// through the same door, which is why there is no `isfinite` on the inputs — it would be a third spelling
+// of a rule already stated twice.
+//
+// It is `resampleIr`'s RATE gate, not the loader's. `CabConvolver` decides "no resample" by its own
+// `kRateMatchTolerance` — two rates a part per million apart are ONE rate there and this is never
+// consulted — and `resampleIr` has geometry gates further down (a length or a tap position `int` cannot
+// address) that this does not repeat, so it can still answer 1e12 for a pair whose resample would be
+// refused. Nothing is scaled in that case because nothing is staged: the loader gives up on the empty
+// result before it reaches a gain.
+[[nodiscard]] inline double convolutionRateGain (double inSr, double outSr) noexcept
+{
+    if (! (inSr > 0.0) || ! (outSr > 0.0)) return 1.0;                  // NaN, zero and negatives, both sides
+    const double g = inSr / outSr;
+    return (std::isfinite (g) && g > 0.0) ? g : 1.0;                    // ...and every infinity, plus over/underflow
+}
+
+//==============================================================================
 // Offline windowed-sinc (Kaiser) IR resampler. MESSAGE-THREAD ONLY (double math, allocates) — for
 // rate-converting an impulse response to the host SR on load. DC gain is normalized to 1.
 //

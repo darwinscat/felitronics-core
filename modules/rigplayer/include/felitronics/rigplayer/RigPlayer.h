@@ -292,6 +292,11 @@ public:
         for (auto& n : nam_) n.prepare(fs_, maxBlock_);
         // Not normalised: a tone curve's broadband level is part of what the pack says, and a dry path's
         // level rides in its gain. Reference-unity RMS is for cabinets, which these are not.
+        // AND THE TAPS ARE DESIGNED AT `fs_`, WHICH IS WHY THAT IS ENOUGH. The other half of an
+        // un-normalized load's loudness contract is the rate factor the loader applies when it RESAMPLES
+        // (convolution::convolutionRateGain — P68), and these never resample: magnitudeCurveToFir designs
+        // at fs_ and loadIR is handed fs_. Hand one of these a pack's own rate instead and it silently
+        // acquires that factor, which is correct but is a different number than today's.
         prepared_ = false;                       // a refused sub-prepare leaves the player unprepared
         for (auto& f : fir_) if (! f.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;
         if (! dry_.prepare(fs_, maxBlock_, channels_, 0.1, false)) return false;

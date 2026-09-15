@@ -2,7 +2,10 @@
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
 // JUCE-free self-tests for the offline Kaiser IR resampler: unity DC gain, output length, passband
-// amplitude preservation, and stopband rejection (anti-aliasing on downsample) >= 55 dB. And what lies
+// amplitude preservation, and stopband rejection (anti-aliasing on downsample) >= 55 dB. And (P68) the
+// factor that turns this function's amplitude-preserving output into a convolution kernel of the same
+// gain, `convolutionRateGain` — exact where the rates make it exact, and 1 for every pair it cannot be
+// made from. And what lies
 // OUTSIDE the input (P67): zeros in front of or behind an IR change nothing but a whole-sample shift, the
 // edge taps are the specification recomputed independently, a cabinet's top octave keeps its own level,
 // the length never rounds to zero, and a rate or a length the arithmetic cannot carry is refused.
@@ -761,6 +764,52 @@ int main()
         bool allZero = ! out.empty();
         for (float v : out) allZero = allZero && core::sameBits (v, 0.0f);
         test::ok (allZero, "every tap is +0.0 — the weights vanished, and the guard did not divide by them");
+    }
+
+    // P68 — THE FACTOR ITSELF, at the door of the function that owns it. `resampleIr` above keeps a tap's
+    // AMPLITUDE; a convolution's gain is a sum over taps, so it keeps neither unless the density change is
+    // taken back out. That factor is one line of arithmetic, and the reason it is a named function rather
+    // than a literal in the loader is that it was ALREADY written out by hand in a second product
+    // (orbit-amp's CabinetIr.h) — the class of defect where two copies of the same arithmetic must agree
+    // forever. These are the values a caller may rely on.
+    test::group ("P68 — convolutionRateGain: the density factor, exact where it can be and total everywhere");
+    {
+        using convolution::convolutionRateGain;
+        const double inf = std::numeric_limits<double>::infinity();
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+
+        // EXACT, and spelled as literals rather than recomputed — a test that divides the same two numbers
+        // the same way agrees with any formula that happens to be there, including a wrong one.
+        test::ok (convolutionRateGain (48000.0, 96000.0)  == 0.5
+               && convolutionRateGain (96000.0, 48000.0)  == 2.0
+               && convolutionRateGain (48000.0, 192000.0) == 0.25
+               && convolutionRateGain (192000.0, 48000.0) == 4.0,
+                  "the power-of-two rate pairs are exact: 0.5, 2, 0.25, 4");
+        test::ok (convolutionRateGain (48000.0, 48000.0) == 1.0 && convolutionRateGain (44100.0, 44100.0) == 1.0,
+                  "a rate against itself is exactly 1 — the un-resampled path can never be scaled by an epsilon");
+        // This next one IS the same division on both sides, so it cannot tell a wrong formula from a right
+        // one — it is here to pin the SPELLING (that the factor is inSr/outSr and not, say, the tap-count
+        // ratio, which differs from it by up to 1.3e-3 dB). The literals above are what carry the truth.
+        test::approx (convolutionRateGain (48000.0, 44100.0), 48000.0 / 44100.0, 0.0,
+                      "and 48 -> 44.1 kHz is the ratio itself, to the bit");
+
+        // TOTAL: every double a caller can type has an answer, and the answer for a factor that is not a
+        // factor is 1 — no compensation. Returning the garbage instead would silence an IR (0) or blast it
+        // (inf), and refusing would drop a load whose SAMPLES are fine; P67 settled that broken metadata
+        // plays as is, and this is the same rule one function further in.
+        test::ok (convolutionRateGain (nan, 48000.0) == 1.0 && convolutionRateGain (48000.0, nan) == 1.0
+               && convolutionRateGain (nan, nan) == 1.0,
+                  "a NaN on either side (or both) is 1, not a NaN that would poison every tap");
+        test::ok (convolutionRateGain (0.0, 48000.0) == 1.0 && convolutionRateGain (48000.0, 0.0) == 1.0,
+                  "a zero rate is 1, not 0 (a silenced IR) and not an infinity (a blasted one)");
+        test::ok (convolutionRateGain (-48000.0, 96000.0) == 1.0 && convolutionRateGain (48000.0, -96000.0) == 1.0
+               && convolutionRateGain (-48000.0, -96000.0) == 1.0,
+                  "a negative rate is 1 — even when the two signs would have made a positive ratio");
+        test::ok (convolutionRateGain (inf, 48000.0) == 1.0 && convolutionRateGain (48000.0, inf) == 1.0
+               && convolutionRateGain (-inf, 48000.0) == 1.0 && convolutionRateGain (48000.0, -inf) == 1.0,
+                  "both infinities, on both sides, are 1");
+        test::ok (convolutionRateGain (1.0e300, 1.0e-300) == 1.0 && convolutionRateGain (1.0e-300, 1.0e300) == 1.0,
+                  "two finite rates whose ratio overflows to inf or underflows to zero are 1 as well");
     }
 
     return test::report();
