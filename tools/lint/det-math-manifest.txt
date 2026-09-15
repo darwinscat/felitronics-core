@@ -38,7 +38,7 @@ modules/blend/include/felitronics/blend/BlendKernels.h  [abs*2 cos*3 sin*2]  ret
 modules/blend/include/felitronics/blend/IrBlend.h  [pow*2]  retain-offline  dB<->linear for blend weights the user sets; the result is a written IR
 modules/blend/include/felitronics/blend/Overlay.h  [pow*2]  retain-offline  overlay curve weighting for the display of a blend
 modules/convolution/include/felitronics/convolution/CabConvolver.h  [log10*2 pow*2]  retain-rt  the RT cabinet convolver's IR normalisation floor and gain; this is OrbitCab's signal path
-modules/convolution/include/felitronics/convolution/IrResampler.h  [sin*1]  owner-decision  the resampler kernel's sinc. NOT TOUCHED BY P80 ON PURPOSE: a concurrent task (P69/P70) owns this file and its acceptance requires the output bits to stay put. Audited, listed, left alone
+modules/convolution/include/felitronics/convolution/IrResampler.h  [sin*1]  owner-decision  the resampler kernel's sinc - one call per window MISS since P70's phase memo, not one per tap. Audited by P80 and deliberately left on the system call: these are shipped bits (OrbitCab's IR at load), pinned against a frozen unmemoized kernel in ResamplerTests, so converting it is the owner's decision and an additive one
 
 # --- core: shared headers, mixed RT and offline consumers ---
 modules/core/include/felitronics/core/DeliveryResampler.h  [pow*1 sin*1]  retain-offline  the delivery-rate resampler's Kaiser beta and its 64-tap sinc, built once per prepare(). Its output is a rendered file compared by tolerance, and P57 pinned its latency by construction rather than by these coefficients
