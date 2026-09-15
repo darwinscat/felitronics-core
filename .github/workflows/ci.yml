@@ -445,6 +445,38 @@ jobs:
             || { echo "the hum fixture stopped finding its line — the gate is comparing nothing again"; exit 1; }
           echo "bit-identical: $n native-vs-wasm comparisons across five analyzers, two rates, two modules"
 
+      - name: the price of a measurement — the same demand on both tiers (P81)
+        # `fc_probe_<mode>_storage_bytes` publishes what each analyzer's storageFor() is about to ask the
+        # heap for, so a page can decide BEFORE the allocation that -fno-exceptions turns into an abort.
+        # Two things are checked here that the native suite structurally cannot:
+        #   * that the five names reached the ARTIFACT. felitronics_analysis_abi_tests compiles
+        #     fc_probe.cpp natively; an export missing from the module leaves it green and the page holding
+        #     `undefined`, and `cmp` cannot detect a function nobody called.
+        #   * that the two TIERS agree on the number. wasm32 has its own std::size_t and its own struct
+        #     layouts, so this is a cross-tier oracle — a release-vs-checked diff of one tier would happily
+        #     compare a wrong demand with itself.
+        run: |
+          set -euo pipefail
+          # build-native was configured with tests OFF (it only needed fcore_measure); turning them on
+          # re-uses its object cache and adds this one target.
+          cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
+          cmake --build build-native -j --target felitronics_analysis_abi_tests
+          ./build-native/tools/felitronics_analysis_abi_tests --storage-table > storage-native.txt
+          test -s storage-native.txt
+          # A table of nothing but refusals would compare clean and say nothing, which is the shape this
+          # repository keeps catching. Floors, not equalities, so the grid may grow — but it may not
+          # shrink: 425 rows today, of which 280 are priced.
+          [ "$(wc -l < storage-native.txt)" -ge 425 ] \
+            || { echo "the storage table lost rows — a smaller grid still compares clean"; exit 1; }
+          [ "$(grep -cv ' 0$' storage-native.txt)" -ge 280 ] \
+            || { echo "the storage table is mostly refusals — it is comparing nothing"; exit 1; }
+          for mod in fcprobe.node.js fcprobe.debug.js; do
+            node tools/wasm/storage-probe.mjs "tools/wasm/build/$mod" table > storage-wasm.txt
+            cmp storage-native.txt storage-wasm.txt || { echo "the published demand differs between tiers ($mod)"; exit 1; }
+            node tools/wasm/storage-probe.mjs "tools/wasm/build/$mod" check
+          done
+          echo "identical on both tiers: $(wc -l < storage-native.txt) rows of published demand, release and checked"
+
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.
   # Fails only on crash / unstable-or-non-finite designs (black cells); colour judgement stays human.

@@ -67,18 +67,85 @@ NUMERIC=(-ffp-contract=off -fno-fast-math)
 
 SRC="$HERE/fc_probe.cpp"
 
-# The whitelist, read from the source — the fc_master rule below, applied here too since P59a added a dozen entry
-# points to this file: a name missing from -sEXPORTED_FUNCTIONS is dead-stripped and a page finds it `undefined`
-# at the moment it needs it. Floor, not count: 12 P0 entry points + 13 for the waveform peaks and stereo band
-# (P59a) + 12 for the clipped runs (P71) + _malloc/_free. The floor is raised with each wave rather than left at
-# the first one, because the grep only matches a RETURN TYPE of int/double/std::uint32_t: an entry point whose
-# type drifts (to std::int64_t, say) silently leaves the list, and a floor from three waves ago cannot see it.
-PEXPORTS=$(grep -oE 'FC_EXPORT[[:space:]]+(int|double|std::uint32_t)[[:space:]]+fc_probe_[a-z0-9_]+' "$SRC" \
-           | awk '{print "_" $NF}' | sort -u | paste -sd, -)
-PEXPORTS="$PEXPORTS,_malloc,_free"
-echo "--- fc_probe exports: $(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ') symbols"
-[ "$(printf '%s\n' "$PEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ')" -ge 39 ] \
-    || { echo "*** the export list did not come out of $SRC — refusing to link a module with no ABI"; exit 1; }
+# THE EXPORT LIST, READ FROM THE SOURCE — and read by NAME, not by return type. `-sEXPORTED_FUNCTIONS`
+# is a whitelist, and until P81 this grep only recognised a return type of int/double/std::uint32_t, so an
+# entry point whose type drifted outside that set simply left the list — with a hand-maintained FLOOR
+# (`-ge 39`) as the only guard, which five missing names would not have moved. The extraction below reads
+# the IDENTIFIER in front of the `(` and does not care what precedes it, and the guard is now an EQUALITY
+# against the declaration count — `grep -cE '^[[:space:]]*FC_EXPORT'`, whitespace and all: a declaration the
+# extractor cannot parse fails the build instead of quietly shortening the ABI.
+#
+# CORRECTED WHILE DOING IT: this file used to say that a name missing from the list is dead-stripped and
+# the page finds it `undefined`, and that "EMSCRIPTEN_KEEPALIVE alone does NOT save it once
+# EXPORTED_FUNCTIONS is given". That is FALSE on the toolchain this repo pins. Measured on emscripten
+# 6.0.9 with these exact flags at -O3: a KEEPALIVE'd function deliberately left out of
+# -sEXPORTED_FUNCTIONS was still present on the Module and still returned its value — `EXPORT_KEEPALIVE`
+# defaults to true in src/settings.js, and KEEPALIVE adds the symbol to the export set. So the generated
+# list is a STATEMENT OF THE ABI and a sanity check that the source still has one; it is not the thing
+# standing between the page and an `undefined`. The gate that actually proves reachability is
+# tools/wasm/storage-probe.mjs and the parity harnesses, which call the names on the built artifact.
+
+# Every entry point declared in $1, one per line, with the leading underscore the linker wants. The name is
+# THE IDENTIFIER BEFORE THE FIRST `(` — `[^(]*` is what bounds it — and not the last `fc_…` on the line,
+# which is how the first version of this read and was wrong: `FC_EXPORT int fc_probe_x (void) { return
+# fc_helper (); }` yielded `_fc_helper`, a symbol that is not an entry point at all. Bounding at the first
+# `(` also settles `FC_EXPORT fc_status fc_render (…)`, where the return type itself begins with `fc_`.
+# Leading whitespace is allowed: an INDENTED declaration used to be invisible to all three scanners at
+# once — uncounted, unextracted and untype-checked — while KEEPALIVE published it anyway.
+export_names() { sed -nE 's/^[[:space:]]*FC_EXPORT[[:space:]]+[^(]*[^A-Za-z0-9_]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/_\1/p' "$1" \
+                 | LC_ALL=C sort -u; }
+
+# ONE DECLARATION PER LINE, because `sed` takes one match per line and the count below is of LINES. Two on
+# one line — `FC_EXPORT int fc_a (void) { … } FC_EXPORT std::uint64_t fc_b (void) { … }` — used to drop the
+# SECOND from the list while the counts still agreed and the type check read only the first one's return
+# type. Both gates passed; the ABI was one name short. (All three of these bypasses were found by the crew
+# review round and reproduced against the gate functions before this was written.)
+check_one_per_line() { src="$1"
+    doubled=$(awk '{ if (gsub(/FC_EXPORT/, "") > 1) print FILENAME ":" NR ": " $0 }' "$src")
+    [ -z "$doubled" ] || { echo "*** two entry points on one line — the extractor sees only the first:"; \
+                           printf '%s\n' "$doubled"; exit 1; }
+    # ...and ONE DECLARATOR per FC_EXPORT. `FC_EXPORT int fc_a (void), fc_b (void);` is one token, one
+    # line and one extracted name, so every count above agrees while `_fc_b` is simply absent from the
+    # list. The rule is the shape of a declarator: what follows a closed parameter list is a body or a
+    # semicolon, never a comma. (Wrapped argument lists are untouched — their line has no `)` at all.)
+    comma=$(grep -nE '^[[:space:]]*FC_EXPORT[^()]*\([^()]*\)[[:space:]]*,' "$src" || true)
+    [ -z "$comma" ] || { echo "*** a comma declarator — every name after the first is not exported:"; \
+                         printf '%s\n' "$comma"; exit 1; }; }
+
+# The count the extractor found against the count of declarations in the file. Equal, or the build stops:
+# a floor cannot see a name that fell out, and this can.
+#
+# `grep -c .` and NOT `wc -l` to count the names: `printf '%s\n' "$EMPTY" | wc -l` is 1, not 0, so a source
+# whose single declaration the extractor could not parse would have compared 1 against 1 and passed with an
+# EMPTY list. That is why the count is taken of NON-EMPTY LINES.
+check_exports() { src="$1"; found="$2"
+    check_one_per_line "$src"
+    declared=$(grep -cE '^[[:space:]]*FC_EXPORT' "$src")
+    [ "$declared" -gt 0 ] || { echo "*** no FC_EXPORT declarations in $src — refusing to link a module with no ABI"; exit 1; }
+    [ "$found" -eq "$declared" ] \
+        || { echo "*** $src declares $declared entry points and the extractor found $found —"; \
+             echo "    a declaration it cannot parse would silently shorten the ABI"; exit 1; }; }
+
+# THE SECOND GATE, and the reason it is not the first. Making the extraction type-independent means a
+# return type this boundary handles BADLY now reaches JavaScript instead of quietly falling off the list,
+# which is worse, not better. Measured on the pinned toolchain: a `std::uint64_t` export does cross —
+# `WASM_BIGINT` defaults to true — and arrives as a BigInt, a different numeric type from everything else
+# this ABI returns: `bigint + number` throws TypeError and JSON.stringify refuses it outright. So the set
+# of return types each ABI carries is written down and a new one has to be added here on purpose, with
+# somebody having thought about what it looks like on the page. This gate FAILS; it does not omit.
+check_return_types() { src="$1"; allowed="$2"
+    offenders=$(grep -E '^[[:space:]]*FC_EXPORT' "$src" \
+                | grep -vE "^[[:space:]]*FC_EXPORT[[:space:]]+($allowed)[[:space:]]+fc_" || true)
+    [ -z "$offenders" ] || { echo "*** $src declares an entry point whose return type this boundary does not carry:"; \
+                             printf '%s\n' "$offenders"; \
+                             echo "    add it to check_return_types once you know what it looks like in JavaScript"; exit 1; }; }
+
+PNAMES=$(export_names "$SRC")
+PFOUND=$(printf '%s\n' "$PNAMES" | grep -c . || true)
+check_exports "$SRC" "$PFOUND"
+check_return_types "$SRC" 'int|double|std::uint32_t'
+PEXPORTS="$(printf '%s\n' "$PNAMES" | paste -sd, -),_malloc,_free"
+echo "--- fc_probe exports: $PFOUND entry points (+ _malloc/_free), matching $PFOUND declarations"
 
 # -msimd128: `core::firDot`'s wasm kernel is behind `__wasm_simd128__`, so without it this module
 # silently takes the scalar one. Verified against THIS target's own acceptance, which is stricter than
@@ -137,15 +204,14 @@ done
 #==================================================================================================
 # fc_master — the MASTERING ABI (tools/fc_master_abi.h, implemented by tools/wasm/fc_master.cpp)
 #
-# Built exactly like fc_probe above and for the same reasons; only three things differ, and each is a
-# consequence of what this ABI is rather than a preference:
+# Built exactly like fc_probe above and for the same reasons; only the four things below differ, and each
+# is a consequence of what this ABI is rather than a preference:
 #
-#  1. THE EXPORT LIST IS GENERATED FROM THE SOURCE, not typed here. `-sEXPORTED_FUNCTIONS` is a
-#     whitelist: a name missing from it is dead-stripped, and the page then finds `Module._fc_…`
-#     undefined at the moment it needs it — at runtime, in a worker, with no build-time diagnostic
-#     anywhere. EMSCRIPTEN_KEEPALIVE alone does NOT save it once EXPORTED_FUNCTIONS is given. So the
-#     list is read out of the FC_EXPORT lines of fc_master.cpp: an entry point added to the ABI is
-#     exported by the fact of existing, and cannot be forgotten here.
+#  1. THE EXPORT LIST IS GENERATED FROM THE SOURCE, not typed here — the same `export_names` /
+#     `check_exports` pair the probe uses above, so an entry point added to this ABI is exported by the
+#     fact of existing and cannot be forgotten here. (This block used to claim that KEEPALIVE does not
+#     save a name left out of -sEXPORTED_FUNCTIONS. It does, on the pinned toolchain — measured; see the
+#     corrected note above the probe's list.)
 #  2. -sSTACK_SIZE=8388608. The repository's CMakeLists gives this to every emscripten build of this
 #     tree and says why (a blown wasm stack does not reliably trap — it produced WRONG ANSWERS before
 #     it produced an out-of-bounds). `MasteringChain` heap-allocates, but the solver's per-pass work
@@ -161,8 +227,10 @@ done
 #     so do the gain, the ceiling, the integrated loudness and the true peak to 17 digits. That is the
 #     kernels' own design — four partial accumulators, (s0+s1)+(s2+s3), every operation rounded
 #     separately, identical in all four — and the core gates it with
-#     `felitronics_core_polyphasefir_tests`. Which is why it goes on THIS target and not on fc_probe:
-#     the probe's acceptance is its own, and a flag is not added to a contract it was not measured on.
+#     `felitronics_core_polyphasefir_tests`. It went on THIS target first, for that reason: the probe's
+#     acceptance is its own, and a flag is not added to a contract it was not measured on. The probe
+#     carries it now too — see the -msimd128 note above its own COMMON flags, which records the separate
+#     measurement that earned it there.
 #  4. -sEXPORT_NAME=createFcMaster, so a page that loads BOTH modules gets two factories rather than
 #     one name overwriting the other. Everything else — the numeric contract, emmalloc, no filesystem,
 #     growable memory, the HEAPF32/HEAPF64 opt-in — is the probe's line for the probe's reasons.
@@ -174,17 +242,17 @@ done
 #==================================================================================================
 MSRC="$HERE/fc_master.cpp"
 
-# The whitelist, read from the source. `-o` prints one name per match, so an entry point that shares a
-# line with another is still found. _malloc/_free are the page's own, and are opt-in in emscripten 6.x.
-MEXPORTS=$(grep -oE 'FC_EXPORT[[:space:]]+(void|std::uint32_t|uint32_t|fc_status)[[:space:]]+fc_[a-z_]+' "$MSRC" \
-           | awk '{print "_" $NF}' | sort -u | paste -sd, -)
-MEXPORTS="$MEXPORTS,_malloc,_free"
-echo "--- fc_master exports: $(printf '%s\n' "$MEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ') symbols"
-# A generated list that silently came back empty would build a module with nothing in it, so it is
-# checked rather than trusted. 25 entry points at ABI v1, 33 at v3; the guard is a floor, not the count, so
-# appending one is not a build break.
-[ "$(printf '%s\n' "$MEXPORTS" | tr ',' '\n' | wc -l | tr -d ' ')" -ge 27 ] \
-    || { echo "*** the export list did not come out of $MSRC — refusing to link a module with no ABI"; exit 1; }
+# The whitelist, read from the source, by the same extractor as the probe's. The old grep here had the
+# probe's defect twice over: a return-type whitelist, and `fc_[a-z_]+` for the NAME, which excludes digits
+# — an entry point carrying a version number would not have left the list, it would have been TRUNCATED
+# into it: `fc_render_v2` becomes `fc_render_v`, and the link then fails on a symbol nobody declared.
+# _malloc/_free are the page's own, and are opt-in in emscripten 6.x.
+MNAMES=$(export_names "$MSRC")
+MFOUND=$(printf '%s\n' "$MNAMES" | grep -c . || true)
+check_exports "$MSRC" "$MFOUND"
+check_return_types "$MSRC" 'void|std::uint32_t|uint32_t|fc_status'
+MEXPORTS="$(printf '%s\n' "$MNAMES" | paste -sd, -),_malloc,_free"
+echo "--- fc_master exports: $MFOUND entry points (+ _malloc/_free), matching $MFOUND declarations"
 
 MCOMMON=(-std=c++20 -fno-exceptions -fno-rtti "${NUMERIC[@]}" "${MASTER_INC[@]}"
          -msimd128

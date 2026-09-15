@@ -69,11 +69,22 @@ namespace
 #endif
     }
 
+    // THE ONE CHANNEL PREDICATE IN THIS FILE, read by the input checks below and by the five
+    // fc_probe_<mode>_storage_bytes queries at the foot of it (P81). A second copy would be a seam the two
+    // roads could drift apart along, which is the whole class this ABI keeps closing. The range is tested
+    // BEFORE the narrowing to the analyzers' `int`: the conversion of a uint32 above INT_MAX is well defined
+    // in C++20 and would land outside [1, kMaxChannels] anyway, but a width is refused here because it IS
+    // out of range, not because a cast happened to carry it back out of range.
+    bool geometry (std::uint32_t channels)
+    {
+        return channels >= 1 && channels <= (std::uint32_t) felitronics::core::kMaxChannels;
+    }
+
     // The planar input span: non-null, non-empty, a width the core has, 4-byte aligned, and inside the heap.
     bool planarSpan (const float* planar, std::uint32_t frames, std::uint32_t channels)
     {
         if (planar == nullptr || frames == 0) return false;
-        if (channels < 1 || channels > (std::uint32_t) felitronics::core::kMaxChannels) return false;
+        if (! geometry (channels)) return false;
         if ((reinterpret_cast<std::uintptr_t> (planar) & 0x3u) != 0) return false;   // a misaligned float* reads
                                                                                      // garbage in a release build
                                                                                      // and only traps under SAFE_HEAP
@@ -92,7 +103,7 @@ namespace
     // module while the CLI answers it is a byte-parity break, so these runs take this check instead.
     bool planarSpanOrEmpty (const float* planar, std::uint32_t frames, std::uint32_t channels)
     {
-        if (channels < 1 || channels > (std::uint32_t) felitronics::core::kMaxChannels) return false;
+        if (! geometry (channels)) return false;
         if (frames == 0) return true;                                  // nothing to address, nothing to bound
         return planarSpan (planar, frames, channels);
     }
@@ -112,6 +123,16 @@ namespace
         if ((reinterpret_cast<std::uintptr_t> (out) & (align - 1u)) != 0) return false;
         return inHeap (out, (std::uint64_t) count * align);
     }
+
+    // `st.ok`, ALWAYS — never a bare `st.bytes()`. A REFUSED Storage IS NOT AN EMPTY ONE:
+    // ProgrammeReport::Storage carries a DeterministicLoudnessMeter::Storage, whose bytes() has a constant
+    // ring term (LoudnessMeter.h, `kSubRing`), so a default-constructed one reports 2400 bytes. A query that
+    // forwarded that would quote a price for a measurement that cannot happen — and only for `report`, so a
+    // test that probed the other four would not see it. (Measured on a9816e2; it is also why
+    // ProgrammeReport.h's own "all zeros where prepare() refuses" note is true of the members and not of the
+    // total.)
+    template <typename Storage>
+    double demand (const Storage& st) { return st.ok ? (double) st.bytes() : 0.0; }
 
     // Whether the getters have a result to report. Without this the contract would be an accident of where
     // Probe::prepare() happens to return: a bad sample rate is caught before the meter is touched, so the
@@ -346,9 +367,16 @@ namespace
 
     // start, length, level, channel, sign, evidence — the fields of analysis::ClipRun, in the order the text
     // format prints them. Doubles throughout: `start` and `length` are int64 in the core, but planarSpan()
-    // caps frames*channels*4 at 4 GiB, so a position in this ABI is below 2^30 and exact in a binary64 — while
-    // an i64 return would need -sWASM_BIGINT (which this module does not build with) and would not match the
-    // export whitelist's grep in tools/wasm/build.sh.
+    // caps frames*channels*4 at 4 GiB, so a position in this ABI is below 2^30 and exact in a binary64.
+    //
+    // THE REASON USED TO BE WRITTEN HERE AS "an i64 would need -sWASM_BIGINT, which this module does not
+    // build with". THAT IS FALSE on the toolchain this repo pins (emscripten 6.0.9, .github/workflows/ci.yml):
+    // `WASM_BIGINT` defaults to TRUE in its src/settings.js, so an i64 DOES cross this boundary — measured,
+    // as a JavaScript BigInt. The real reason for the double is what a BigInt then is on the page: a
+    // different NUMERIC TYPE from every other value this ABI returns. `bigint + number` throws
+    // TypeError ("Cannot mix BigInt and other types"), and JSON.stringify throws on it outright; only the
+    // comparisons happen to work. A number a caller has to add to its own byte counts, or put in a report,
+    // must not be one. (The same measurement corrected the sibling claim in tools/wasm/build.sh.)
     constexpr std::uint32_t kClipRunStride = 6;
 }
 
@@ -465,6 +493,12 @@ namespace
     }
     bool haveReport = false;
 
+    // ONE definition of the parameters this ABI measures with, read by BOTH roads — the run below and
+    // fc_probe_report_storage_bytes at the foot of this file. Two `Params {}` literals would be two
+    // definitions of the same thing, and the published price would go on matching the run only by
+    // coincidence from the moment either one grew an argument. Same constant in all five modes.
+    constexpr felitronics::analysis::ProgrammeReportParams kReportParams {};
+
     constexpr std::uint32_t kReportCountStride = 2;   // channel, value
     constexpr std::uint32_t kReportValueStride = 4;   // channel, valid, reason, value
 }
@@ -475,6 +509,10 @@ FC_EXPORT int fc_probe_report_run (const float* planar, std::uint32_t frames, st
     haveReport = false;
     if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& p = programme();
+    // Installed rather than left to the instance's own defaults, which are the same values: it makes this
+    // road READ the constant the price query reads, so the two cannot drift apart silently. The other four
+    // modes already called setParams() for their own reasons.
+    p.setParams (kReportParams);
     if (! p.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
@@ -577,10 +615,13 @@ FC_EXPORT std::uint32_t fc_probe_report_values (double* out, std::uint32_t cap)
 // prints it, then the three variable-length lists (per channel, events, and the two sparse histograms),
 // each into a caller-owned buffer whose capacity is mandatory.
 //
-// `enterDb` and `exitDb` are read from a default-constructed BandBurstsParams here because the detector
-// does not publish them and the CLI does exactly the same. That is the one number on this road not read
-// back out of the measurement; it is the documented default on both sides, so the diff still covers it,
-// but it is named rather than hidden.
+// `enterDb` and `exitDb` are read from the parameters this ABI measures with — kBurstsParams, since P81 the
+// same constant `fc_probe_bursts_run` installs and `fc_probe_bursts_storage_bytes` prices — and not from
+// the finished measurement, because the detector does not report the thresholds it used back out of the
+// report (it does publish its PENDING params through `params()`, which is a different thing: what the next
+// prepare() would take, not what this one did). The CLI reads the same defaults the same way. That is the
+// one number on this road not read back out of the measurement; it is the documented default on both
+// sides, so the diff still covers it, but it is named rather than hidden.
 namespace
 {
     felitronics::analysis::BandBursts& bursts()
@@ -589,6 +630,9 @@ namespace
         return d;
     }
     bool haveBursts = false;
+
+    // One definition, two roads — see kReportParams above.
+    constexpr felitronics::analysis::BandBurstsParams kBurstsParams {};
 
     constexpr std::uint32_t kBurstsScalars    = 31;
     constexpr std::uint32_t kBurstsChanStride = 4;
@@ -602,7 +646,7 @@ FC_EXPORT int fc_probe_bursts_run (const float* planar, std::uint32_t frames, st
     haveBursts = false;
     if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = bursts();
-    d.setParams (felitronics::analysis::BandBurstsParams {});
+    d.setParams (kBurstsParams);
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
@@ -628,7 +672,7 @@ FC_EXPORT std::uint32_t fc_probe_bursts_scalars (double* out, std::uint32_t cap)
 {
     if (! haveBursts || out == nullptr || cap < kBurstsScalars || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = bursts();
-    const felitronics::analysis::BandBurstsParams bp {};
+    const auto& bp = kBurstsParams;      // the constant the run and the price read — not a fresh default
     std::uint32_t i = 0;
     out[i++] = d.sampleRate();
     out[i++] = (double) d.channels();
@@ -745,6 +789,9 @@ namespace
     }
     bool haveHum = false;
 
+    // One definition, two roads — see kReportParams above.
+    constexpr felitronics::analysis::HumDetectorParams kHumParams {};
+
     constexpr std::uint32_t kHumScalars      = 8;
     constexpr std::uint32_t kHumChanStride   = 21;
     constexpr std::uint32_t kHumCandStride   = 19;
@@ -758,7 +805,7 @@ FC_EXPORT int fc_probe_hum_run (const float* planar, std::uint32_t frames, std::
     haveHum = false;
     if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = hum();
-    d.setParams (felitronics::analysis::HumDetectorParams {});
+    d.setParams (kHumParams);
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
@@ -783,7 +830,7 @@ FC_EXPORT std::uint32_t fc_probe_hum_scalars (double* out, std::uint32_t cap)
 {
     if (! haveHum || out == nullptr || cap < kHumScalars || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = hum();
-    const felitronics::analysis::HumDetectorParams hp {};
+    const auto& hp = kHumParams;         // the constant the run and the price read — not a fresh default
     std::uint32_t i = 0;
     out[i++] = d.sampleRate();
     out[i++] = (double) d.channels();
@@ -846,7 +893,7 @@ FC_EXPORT std::uint32_t fc_probe_hum_harm (double* out, std::uint32_t cap)
 {
     if (! haveHum || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = hum();
-    const felitronics::analysis::HumDetectorParams hp {};
+    const auto& hp = kHumParams;         // the constant the run and the price read — not a fresh default
     const std::uint32_t room = cap / kHumHarmStride;
     std::uint32_t at = 0;
     for (int c = 0; c < d.channels(); ++c)
@@ -894,6 +941,9 @@ namespace
     }
     bool haveForensics = false;
 
+    // One definition, two roads — see kReportParams above.
+    constexpr felitronics::analysis::SourceForensicsParams kFxParams {};
+
     constexpr std::uint32_t kFxScalars    = 29;
     constexpr std::uint32_t kFxWallStride = 39;
     constexpr std::uint32_t kFxGridStride = 22;
@@ -905,7 +955,7 @@ FC_EXPORT int fc_probe_forensics_run (const float* planar, std::uint32_t frames,
     haveForensics = false;
     if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
     auto& d = forensics();
-    d.setParams (felitronics::analysis::SourceForensicsParams {});
+    d.setParams (kFxParams);
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
@@ -930,7 +980,7 @@ FC_EXPORT std::uint32_t fc_probe_forensics_scalars (double* out, std::uint32_t c
 {
     if (! haveForensics || out == nullptr || cap < kFxScalars || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = forensics();
-    const felitronics::analysis::SourceForensicsParams fp {};
+    const auto& fp = kFxParams;          // the constant the run and the price read — not a fresh default
     std::uint32_t i = 0;
     out[i++] = d.sampleRate();               out[i++] = (double) d.channels();
     out[i++] = (double) fp.fftOrder;         out[i++] = (double) d.hopSamples();
@@ -1041,6 +1091,9 @@ namespace
     }
     bool haveLowEnd = false;
 
+    // One definition, two roads — see kReportParams above.
+    constexpr felitronics::analysis::LowEndParams kLeParams {};
+
     constexpr std::uint32_t kLeScalars     = 60;
     constexpr std::uint32_t kLeSeriesStride = 6;
     constexpr std::uint32_t kLeBandStride   = 11;
@@ -1056,7 +1109,7 @@ FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, st
     // measure, and it says so by exiting rather than by publishing an invalid report.)
     if (! planarSpan (planar, frames, channels)) return 0;
     auto& d = lowEnd();
-    d.setParams (felitronics::analysis::LowEndParams {});
+    d.setParams (kLeParams);
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
@@ -1081,7 +1134,7 @@ FC_EXPORT std::uint32_t fc_probe_lowend_scalars (double* out, std::uint32_t cap)
 {
     if (! haveLowEnd || out == nullptr || cap < kLeScalars || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = lowEnd();
-    const felitronics::analysis::LowEndParams lp {};
+    const auto& lp = kLeParams;          // the constant the run and the price read — not a fresh default
     std::uint32_t i = 0;
     out[i++] = d.sampleRate();            out[i++] = (double) d.channels();
     out[i++] = d.crossoverHz();           out[i++] = (double) lp.fftOrder;
@@ -1179,4 +1232,127 @@ FC_EXPORT std::uint32_t fc_probe_lowend_bands (double* out, std::uint32_t cap)
         w[9] = r.centroidHz;      w[10] = r.centsOffset;
     }
     return at;
+}
+
+//==============================================================================
+// THE PRICE OF A MEASUREMENT, ASKED BEFORE IT IS PAID (P81).
+//
+// Every one of the five analyzers above publishes what it is about to need through a public
+// `storageFor()` and only then allocates — law 11d, whose whole point is that the budget and the
+// allocation are ONE function and therefore cannot drift apart. None of the five `fc_probe_<mode>_run`
+// entry points passed that number out: JavaScript called `_run`, which went straight into an allocating
+// `prepare()`, and there was nothing to ask the price with.
+//
+// WHY THAT MATTERS HERE AND NOT NATIVELY. This module is built `-fno-exceptions` (tools/wasm/build.sh),
+// and there a failed allocation has no way to say no: `std::vector::assign` calls `operator new`, the
+// throw is compiled out, and libc++ calls abort(). The C entry point then NEVER RETURNS — a caller
+// reading `_fc_probe_hum_run(...) === 1` is not handed a 0, it is handed a thrown exception from a
+// function it was reading a status out of.
+//
+// MEASURED, and measured more narrowly than the first telling of it. With emscripten's linear memory
+// squeezed to 1 932 984 320 bytes of its 2 147 483 648 ceiling and a 64-byte input,
+// `fc_probe_hum_run (ptr, 1, 16, 768000)` produced, on the checked module, exactly this:
+// "Cannot enlarge memory, requested 2 252 435 248 bytes, but the limit is 2 147 483 648" ->
+// "bad_alloc was thrown in -fno-exceptions mode" -> "Aborted(native code called abort())". What is NOT
+// true, and was assumed before it was checked: the page does not die and the module is not poisoned. The
+// WebAssembly.RuntimeError IS catchable in JavaScript, and after catching it the module went on
+// answering — the getters of the aborted mode read 0, as the `have*` discipline promises, `_free` worked,
+// and a later affordable run at 48 kHz stereo returned 1. That recovery is an observation and not a
+// guarantee: abort() does not unwind, so whatever the allocation was half-way through is left where it
+// stood. The defect this section closes is therefore the narrow, certain one — A MEASUREMENT THAT CANNOT
+// BE PRICED AND CANNOT REFUSE — and not a crash story.
+//
+// And the prices are not small: `HumDetector::storageFor()` at 768 kHz and 16 channels asks for
+// 352 688 184 bytes, the five together for 377 423 824, against a 2 GiB ceiling that also has to hold the
+// caller's decoded input.
+//
+// WHAT THESE FIVE ANSWER, EXACTLY
+//
+//  * A DEMAND, NOT A FOOTPRINT, AND THE PAYLOAD ONLY. It is the sum of the byte counts the NEXT prepare()
+//    at this geometry will pass to `operator new`, on a fresh object. It excludes, deliberately and
+//    without apology: allocator metadata and alignment padding, fragmentation, the growth granularity of
+//    the wasm heap, THE CALLER'S OWN INPUT BUFFER (frames * channels * 4, which only the caller knows),
+//    and whatever the other four analyzers are still holding. It is also not what THIS analyzer is
+//    holding: `std::vector::assign` never gives capacity back, so an instance that has already run wider
+//    owns more than this number says (BandBursts::Storage spells the same caveat for itself), and one
+//    that has already run at THIS geometry asks for nothing at all — except SourceForensics, whose
+//    second prepare() at the same geometry asks for 688 144 of its 2 080 152 again. Measured, all of it.
+//  * A POSITIVE ANSWER IS NOT A PROMISE. This entry point cannot reserve anything, and it is a number to
+//    make a policy with, not an allocation that succeeded. That is also why the number is PUBLISHED here
+//    rather than turned into a ceiling: a browser's memory budget is a product decision belonging to the
+//    page, not a constant this file gets to invent. What the page is NOT given here is the scale to judge
+//    the number against: emscripten's own glue keeps the heap maximum to itself, and while it can be read
+//    out of the wasm bytes — tools/wasm/check-no-threads.mjs already parses that memory limit — that is a
+//    build-time reading, not something a worker does at run time. If it is ever wanted it is one more fact
+//    of module identity beside fc_probe_sizeof_longdouble, and still not a ceiling.
+//  * ZERO MEANS THE GEOMETRY IS REFUSED, and it cannot be read as a free measurement — but the reason is
+//    STRUCTURAL and not a measured minimum. An accepted geometry always buys something: four of the five
+//    size at least one record per INPUT channel, and LowEnd — which does not, its spectrum being sized for
+//    two fixed mid/side axes — still buys a band table and a block store. None of the five can be accepted
+//    and cost nothing. A grid is only
+//    a sample and says nothing about the rest of the domain: the smallest demand a fine sweep of the
+//    accepted domain FOUND is 158 240 bytes (hum, 1517 Hz, one channel), which is an observation. What
+//    the gate pins is the equivalence, not a constant — felitronics_analysis_abi_tests walks a grid of
+//    widths and rates, including each mode's own admission floor, and asserts that the query is positive
+//    exactly where `_run` is accepted. The zero is a canonical +0.0, which is what lets a caller write
+//    `need > 0` and a test write `! signbit`.
+//  * NO AUDIO POINTER AND NO FRAME COUNT, on purpose, and NOT the argument list of `_run`. The price has
+//    to be askable BEFORE the input buffer exists — that is the whole use — so these entry points neither
+//    take nor dereference one, and `_run` keeps its own buffer checks (planarSpan / planarSpanOrEmpty,
+//    and lowend's refusal of an empty programme, which is an input contract and not a geometry). What the
+//    two roads must agree about is the GEOMETRY, and that is what the gate compares. Nothing is lost by
+//    dropping the length: no preparation here is sized by the programme. The one analyzer sized by a
+//    duration, ProgrammeReport, is sized by `ProgrammeReportParams::maxDurationSec` — a fixed hour — and a
+//    longer programme overflows bounded stores and says so, it does not grow them.
+//  * THE SAME PARAMETERS AND THE SAME BLOCK AS THE RUN. Each mode's defaults are one `constexpr` constant
+//    read by both roads (kReportParams and its four siblings). `report` is the only one whose storageFor()
+//    takes a maxBlock, and it is given `fcore::Probe::kChunk` — the value fc_probe_report_run() hands to
+//    prepare(), not the caller's frame count.
+//
+// `double` AND NOT `std::uint64_t`. Not for the reason this file used to give — see the corrected note
+// above fc_probe_clips_runs: i64 does cross this boundary on the pinned toolchain, as a BigInt, and a
+// BigInt is the wrong shape for a byte count a page has to add to its own input size and put in a report:
+// `bigint + number` throws TypeError and JSON.stringify refuses it, so every use site would have to
+// convert it first — which is a conversion, and a place for a conversion to be wrong. Every demand in the
+// accepted domain is far below 2^53, so a binary64
+// carries it exactly; a `std::uint32_t` would arrive in JavaScript through a signed i32 and read negative
+// for anything past 2^31, which the 2 GiB ceiling makes reachable in principle.
+//
+// THE NAME. `_storage_bytes` and not `_need`, which is what the sibling ABI calls the same idea
+// (fc_master_need, DSP-ARCHITECTURE.md §law 11d): this side of the tree speaks `Storage` / `storageFor`,
+// and the export is named after the function whose number it is carrying.
+
+FC_EXPORT double fc_probe_report_storage_bytes (std::uint32_t channels, double sampleRate)
+{
+    if (! geometry (channels)) return 0.0;
+    return demand (felitronics::analysis::ProgrammeReport::storageFor (
+                       sampleRate, (int) fcore::Probe::kChunk, (int) channels, kReportParams));
+}
+
+FC_EXPORT double fc_probe_bursts_storage_bytes (std::uint32_t channels, double sampleRate)
+{
+    if (! geometry (channels)) return 0.0;
+    return demand (felitronics::analysis::BandBursts::storageFor (
+                       sampleRate, (int) channels, kBurstsParams));
+}
+
+FC_EXPORT double fc_probe_hum_storage_bytes (std::uint32_t channels, double sampleRate)
+{
+    if (! geometry (channels)) return 0.0;
+    return demand (felitronics::analysis::HumDetector::storageFor (
+                       sampleRate, (int) channels, kHumParams));
+}
+
+FC_EXPORT double fc_probe_forensics_storage_bytes (std::uint32_t channels, double sampleRate)
+{
+    if (! geometry (channels)) return 0.0;
+    return demand (felitronics::analysis::SourceForensics::storageFor (
+                       sampleRate, (int) channels, kFxParams));
+}
+
+FC_EXPORT double fc_probe_lowend_storage_bytes (std::uint32_t channels, double sampleRate)
+{
+    if (! geometry (channels)) return 0.0;
+    return demand (felitronics::analysis::LowEnd::storageFor (
+                       sampleRate, (int) channels, kLeParams));
 }
