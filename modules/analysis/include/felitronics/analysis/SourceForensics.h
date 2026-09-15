@@ -152,6 +152,21 @@ namespace felitronics::analysis
 // 2e90 and the accumulated sum overflows only past ~1e200 frames. The frame producer's own hole gate is
 // what keeps that true if a backend ever changes underneath.
 //
+// THREE THINGS A CALLER HAS TO KNOW ABOUT THE GEOMETRY IT CHOOSES.
+//   · A CELL IS NEVER NARROWER THAN A BIN, so `cellWidthHz` is a request: at fftOrder 8 / 48 kHz a
+//     requested 50 Hz becomes 187.5, and `cellHz()` publishes what it became. Below about fftOrder 11 at
+//     48 kHz a cell IS one bin, and then the 3-cell median that protects the edge search is a 3-BIN
+//     median, which cannot remove a Hann main lobe (4 bins) — measured: at fftOrder 10 a single sinusoid
+//     as loud as the passband takes the search off the wall entirely, exactly the failure the median and
+//     the rank exist to prevent. Read `binsPerCell()`: at 3 or more the guard holds, at 1 it does not.
+//   · `searchFromHz` IS THE WEAKER OF TWO FLOORS. The lowest candidate is
+//     max(plateauSpanCells, ceil(searchFromHz/cellHz)), so at the defaults the effective floor is 1992 Hz
+//     set by `plateauSpanHz`, and `searchFromHz` only bites once the plateau span drops below it.
+//     `searchFromHz()` publishes the floor that applies.
+//   · prepare() IS noexcept AND ALLOCATES. A geometry that asks for more memory than the process can give
+//     therefore terminates rather than returning false — `storageFor()` exists so a caller can ask first,
+//     and at fftOrder 22 with 16 channels the answer is over a gigabyte.
+//
 // RT: an OFFLINE instrument (message thread). prepare() allocates; process/finish/reset do not.
 //==============================================================================
 

@@ -42,11 +42,10 @@
 //                 field the report publishes is here EXCEPT the law-8a trace, which exists only for the suite.
 //                 An invalid note prints as `note INVALID reason N`, never as a note name. NOT `correlation`,
 //                 which is a whole-file phase number with no band split.
+//
 //   forensics   → what the file WAS (analysis::SourceForensics): the spectral wall per channel and for the
-//                 file (position in Hz and as a fraction of Nyquist, the drop, the transition, what comes
-//                 back above it, how far up it is empty) plus the sample grid (the coarsest dyadic grid
-//                 every sample lies on, the shortest PCM word that holds them, the distinct-value count).
-//                 Every float as a raw bit pattern, like `blocks`: a decimal would not catch a flipped bit.
+// and forensics modes size the file before reading it (the first three because every boundary depends on the length,
+// forensics so that a short read cannot come out as a successful measurement of a shorter programme), so they need a
 //
 // Usage: fcore_measure <mode> <sampleRate> <channels> <raw.f32le> [--precise] [mode options]
 //
@@ -66,10 +65,10 @@
 #include "fcore_probe.h"
 
 #include <felitronics/analysis/ProgrammeReport.h>
+#include <felitronics/analysis/SourceForensics.h>
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/BandBursts.h>
-#include <felitronics/analysis/SourceForensics.h>
 
 #include <algorithm>
 #include <cmath>
@@ -491,35 +490,6 @@ int main (int argc, char** argv)
         if (! le.prepare (rate, kChunk, nc))
         {
             std::fprintf (stderr, "LowEnd refused this geometry (rate, channels or note range)\n");
-    if (mode == "forensics")
-    {
-        // The whole report, as bit patterns. The analyzer's own defaults are used and PRINTED, so a diff
-        // between two toolchains compares the same instrument and not two configurations of it.
-        // Strict where the top-level parse is lenient, like the shape modes: atoi("4294967297") narrows to
-        // one channel and atof("48000Hz") reads 48000, and both would measure silently.
-        double frate = 0.0;
-        std::uint64_t fwidth = 0;
-        if (! parseRate (argv[2], frate) || ! parseCount (argv[3], fwidth)
-            || fwidth < 1 || fwidth > (std::uint64_t) core::kMaxChannels)
-        {
-            std::fprintf (stderr, "bad sampleRate/channels\n");
-            std::fclose (f);
-            return 2;
-        }
-        // The file is SIZED before it is read, so an input that is not a whole number of frames, or a read
-        // that fails halfway, cannot come out as a successful measurement of a shorter programme.
-        std::uint64_t fframes = 0;
-        if (! fileFrames (f, nc, fframes))
-        {
-            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
-            std::fclose (f);
-            return 2;
-        }
-        analysis::SourceForensics fx;
-        const analysis::SourceForensicsParams fp;
-        if (! fx.prepare (frate, kChunk, nc))
-        {
-            std::fprintf (stderr, "forensics.prepare refused (sample rate 1000..768000)\n");
             std::fclose (f);
             return 2;
         }
@@ -669,6 +639,42 @@ int main (int argc, char** argv)
             if (det.intervalBin (b) != 0) std::printf ("ioi %d %lld\n", b, (long long) det.intervalBin (b));
         for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)
             if (det.lagBin (b) != 0) std::printf ("lag %d %lld\n", b, (long long) det.lagBin (b));
+        return 0;
+    }
+
+    if (mode == "forensics")
+    {
+        // The whole report, as bit patterns. The analyzer's own defaults are used and PRINTED, so a diff
+        // between two toolchains compares the same instrument and not two configurations of it.
+        // Strict where the top-level parse is lenient, like the shape modes: atoi("4294967297") narrows to
+        // one channel and atof("48000Hz") reads 48000, and both would measure silently.
+        double frate = 0.0;
+        std::uint64_t fwidth = 0;
+        if (! parseRate (argv[2], frate) || ! parseCount (argv[3], fwidth)
+            || fwidth < 1 || fwidth > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        // The file is SIZED before it is read, so an input that is not a whole number of frames, or a read
+        // that fails halfway, cannot come out as a successful measurement of a shorter programme.
+        std::uint64_t fframes = 0;
+        if (! fileFrames (f, nc, fframes))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        analysis::SourceForensics fx;
+        const analysis::SourceForensicsParams fp;
+        if (! fx.prepare (frate, kChunk, nc))
+        {
+            std::fprintf (stderr, "forensics.prepare refused (sample rate 1000..768000)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool okAll = true;
         streamPlanar (f, nc, [&] (const float* const* p, int n) { okAll = fx.process (p, nc, n) && okAll; });
         const bool readError = std::ferror (f) != 0;
         std::fclose (f);
