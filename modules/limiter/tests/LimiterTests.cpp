@@ -6,11 +6,11 @@
 // it), transparency below the ceiling, latency, and no-allocation-in-process().
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/limiter/TruePeakLimiter.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/core/Math.h>
 
-#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -18,15 +18,6 @@
 #include <limits>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-static std::atomic<long long> g_allocBytes { 0 };   // SIZE, not just count — the maxBlock cap is about bytes
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -115,10 +106,10 @@ int main()
         limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 2, { 1.0, 4, 32 });
         limiter::TruePeakLimiterParams p; p.ceilingDbTp = -1.0;
         lim.setParams (p);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (lim.process (ch, 2, n));
         felitronics::test::run (lim.process (ch, 2, n));
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
 
@@ -250,12 +241,12 @@ int main()
     test::group ("prepare() respects its own maxBlock cap in BYTES, not only in chunking");
     {
         auto bytesFor = [] (int maxBlock) {
-            const long long before = g_allocBytes.load();
+            const long long before = alloc::rawBytes.load();
             {
                 limiter::TruePeakLimiter lim;
                 test::ok (lim.prepare (48000.0, maxBlock, 1, {}), "prepare(maxBlock = " + std::to_string (maxBlock) + ")");
             }
-            return g_allocBytes.load() - before;
+            return alloc::rawBytes.load() - before;
         };
         const long long atCap   = bytesFor (1 << 20);
         const long long overCap = bytesFor (1 << 23);          // eight times the cap

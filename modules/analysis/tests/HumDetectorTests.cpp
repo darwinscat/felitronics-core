@@ -82,9 +82,9 @@
 // state a call boundary could corrupt is the open stretch.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/HumDetector.h>
 
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -92,11 +92,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s); }
-void  operator delete (void* p) noexcept { std::free (p); }
-void  operator delete (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using analysis::HumDetector;
@@ -1500,17 +1495,17 @@ int main()
         HumDetectorParams p; p.traceCapacity = 256;
         const auto s = twoStretch (1, 50.14, 1.0e-3, true, 91);
         HumDetector d; d.setParams (p);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         ok (d.prepare (kSr, 4096, 1), "lifecycle: prepare");
-        ok (g_allocs.load() > before, "lifecycle: prepare is where the heap is touched");
+        ok (alloc::count.load() > before, "lifecycle: prepare is where the heap is touched");
         const auto v = s.ptrs (0);                                   // this vector allocates; do it before the mark
         // NOTHING that builds a message may run between the mark and the read: a std::string past libc++'s
         // small-buffer size allocates, and the counter would blame process() for the test's own prose.
-        const long mark = g_allocs.load();
+        const long long mark = alloc::count.load();
         const bool okRun = d.process (v.data(), 1, (int) s.len());
         const bool okEmpty = d.process (v.data(), 1, 0);
         d.finish();
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         ok (okRun, "lifecycle: process");
         ok (okEmpty, "lifecycle: an n == 0 call is accepted and changes nothing");
         felitronics::test::okNoAlloc (after == mark, "lifecycle: process/finish allocate nothing");

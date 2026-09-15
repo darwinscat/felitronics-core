@@ -6,23 +6,15 @@
 // untouched (frequency-selective detection); ratio=1 is a plain static bell; stereo is linked; no alloc.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/Math.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using DB   = dynamiceq::DynamicEqBand;
@@ -103,9 +95,9 @@ int main()
         DB d; felitronics::test::run (d.prepare (sr, 2)); DP p; p.freq = 3000.0; p.mode = Mode::CutWhenLoud; p.thresholdDb = -20.0; d.setParams (p);
         std::vector<float> l (512, 0.3f), r (512, -0.2f); float* io[2] { l.data(), r.data() };
         felitronics::test::run (d.process (io, 2, 512));
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (d.process (io, 2, 512)); felitronics::test::run (d.process (io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (alloc::count.load() == before, "process() did not allocate");
     }
 
     // --- stereo linked: one gain, image preserved ---

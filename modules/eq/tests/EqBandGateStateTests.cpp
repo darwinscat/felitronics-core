@@ -21,23 +21,15 @@
 // band under them was switched off.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/eq/EqBand.h>
 #include <felitronics/eq/EqEngine.h>
 #include <felitronics/eq/Svf.h>
 
-#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
 #include <vector>
-
-static std::atomic<int> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using namespace felitronics::eq;
@@ -695,9 +687,9 @@ int main()
         float* ch[4] {};
         for (int c = 0; c < 4; ++c) { v[c].assign (512, 0.1f); ch[c] = v[c].data(); }
         felitronics::test::run (b.processBlock (ch, 2, 512));                          // warm: designs, applies, settles
-        const int before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int k = 0; k < 40; ++k) felitronics::test::run (b.processBlock (ch, (k % 3 == 0) ? 1 : ((k % 3 == 1) ? 3 : 2), 512));
-        felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across 40 blocks of changing width");
+        felitronics::test::okNoAlloc (alloc::count.load() == before, "no allocation across 40 blocks of changing width");
     }
 
     return felitronics::test::report();

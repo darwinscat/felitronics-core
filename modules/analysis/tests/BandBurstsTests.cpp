@@ -55,10 +55,10 @@
 // material the flush cannot change a bit by construction (`Svf.h:172`).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/BandBursts.h>
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -68,14 +68,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using BB    = analysis::BandBursts;
@@ -787,10 +779,10 @@ static void groupContract()
         test::run (e.prepare (48000.0, 512, 2));
         Planes p (2, std::vector<float> (40000, 0.01f));
         const auto v = ptrs (p, 0);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         test::run (e.process (v.data(), 2, 40000));
         e.finish();
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         test::okNoAlloc (after == before, "process() and finish() allocate NOTHING");
     }
 

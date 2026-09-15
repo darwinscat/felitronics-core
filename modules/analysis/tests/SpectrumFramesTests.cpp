@@ -35,9 +35,9 @@
 // test needs an independent oracle beside it, or it certifies only self-consistency.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/SpectrumFrames.h>
 
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -45,11 +45,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s); }
-void  operator delete (void* p) noexcept { std::free (p); }
-void  operator delete (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using analysis::SpectrumFrames;
@@ -316,14 +311,14 @@ int main()
         SpectrumFrames sf; SpectrumFramesParams p; p.fftOrder = order; p.hop = 1 << (order - 1); sf.setParams (p);
         const auto st = SpectrumFrames::storageFor (48000.0, 2, p);
         ok (st.ok && st.bytes() > 0, "storage: published before the allocation");
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         ok (sf.prepare (48000.0, 64, 2), "lifecycle: prepare");
-        const long allocsInPrepare = g_allocs.load() - before;
+        const long long allocsInPrepare = alloc::count.load() - before;
         ok (allocsInPrepare > 0, "lifecycle: prepare is where the heap is touched");
-        const long b2 = g_allocs.load();
+        const long long b2 = alloc::count.load();
         for (int i = 0; i < 1000; ++i) { sf.push (0, 0.3f, true); sf.push (1, -0.3f, true); (void) sf.tick(); }
         sf.finish();
-        felitronics::test::okNoAlloc (g_allocs.load() == b2, "lifecycle: push/tick/finish allocate nothing");
+        felitronics::test::okNoAlloc (alloc::count.load() == b2, "lifecycle: push/tick/finish allocate nothing");
         sf.finish();
         ok (sf.isFinished(), "lifecycle: finish is idempotent");
         const std::int64_t frozen = sf.totalSamples();

@@ -13,6 +13,7 @@
 // refuses it at compile time — asserted here at runtime for visibility).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/convolution/MatrixConvolver.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/MatrixConvolverNupc.h>
@@ -30,52 +31,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <new>
 #if defined(_WIN32)
  #include <malloc.h>   // _aligned_malloc / _aligned_free (MSVC has no posix_memalign)
 #endif
 #include <string>
 #include <vector>
-
-// --- allocation counter (global operator new/delete; aligned overloads too, so SeamAllocator's aligned
-//     new is not invisible). Windows-portable per the house pattern. ---
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-static inline void* countedAlignedNew (std::size_t s, std::align_val_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    const std::size_t al = (std::size_t) a < sizeof (void*) ? sizeof (void*) : (std::size_t) a;
-   #if defined(_WIN32)
-    void* p = _aligned_malloc (s ? s : 1, al);
-   #else
-    void* p = nullptr; if (::posix_memalign (&p, al, s ? s : 1) != 0) p = nullptr;
-   #endif
-   #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-    if (p == nullptr) throw std::bad_alloc();
-   #else
-    if (p == nullptr) std::abort();   // the wasm-audio tier compiles -fno-exceptions, where `throw` is a PARSE error
-   #endif
-    return p;
-}
-static inline void countedAlignedFree (void* p) noexcept
-{
-   #if defined(_WIN32)
-    _aligned_free (p);
-   #else
-    std::free (p);
-   #endif
-}
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void  operator delete   (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
 
 using namespace felitronics;
 using Scalar = core::fft::ScalarRadix2Real;
@@ -345,10 +305,10 @@ int main()
         { const float* b[2] { irM.data(), irS.data() }; p.setOperator (McP::Topology::MSDiag, b, 2, len); }
         std::vector<float> l (512, 0.2f), rr (512, -0.1f); float* io[2] { l.data(), rr.data() };
         felitronics::test::run (p.process (io, io, 2, 512));
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (p.process (io, io, 2, 512));
         felitronics::test::run (p.process (io, io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == before, "pffft process() performed zero heap allocations");
+        test::okNoAlloc (alloc::count.load() == before, "pffft process() performed zero heap allocations");
     }
 
     // --- C1: the design/audio safety split (compile-enforced; asserted here for visibility) ---
@@ -461,10 +421,10 @@ int main()
         }
         pp->starve(); ps->starve();
         std::vector<float> fr (16384); for (auto& v : fr) v = uni();   // the test's own buffer, before the count starts
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         std::copy (fr.begin(), fr.end(), pp->frameInput()); pp->ingest (14);
         pp->buildColumns (pm, 48000.0, 4.5, 1000.0, [] (int, float, float, float) {});
-        test::okNoAlloc (g_allocs.load() == before, "the pffft pane's ingest + buildColumns allocate nothing");
+        test::okNoAlloc (alloc::count.load() == before, "the pffft pane's ingest + buildColumns allocate nothing");
     }
 
     test::group ("cross-backend NULL: MultiResSpectrumPaneT<…, PffftOrdered> == scalar (bins, stitched reads)");

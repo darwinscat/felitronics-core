@@ -15,13 +15,13 @@
 // the code rather than a claim in a comment. The next task (P3) stands on that.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/LinkedDetector.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/core/Math.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -30,15 +30,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-// global allocation counter (no-alloc-in-process proof)
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -1109,11 +1100,11 @@ int main()
         auto p = baseParams(); p.thresholdDb = -30.0; p.ratio = 4.0; p.lookaheadMs = 2.0;
         c.setParams (p);
         felitronics::test::run (c.process (io, 2, n, key, 1));                       // warm every branch before counting
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (c.process (io, 2, n, key, 1));
         felitronics::test::run (c.process (io, 2, n));
         felitronics::test::run (c.process (io, 2, n, key, 1));
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         test::okNoAlloc (after == before, "keyed and unkeyed process() performed zero heap allocations");
     }
 

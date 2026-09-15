@@ -15,22 +15,14 @@
 // whichever channels are actually there; only the frozen per-channel columns are a lie.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/dynamiceq/LaneDynamics.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
 #include <felitronics/core/Math.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <vector>
-
-static std::atomic<int> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using felitronics::test::ok;
@@ -464,9 +456,9 @@ int main()
             aud[c] = v[c].data(); sc[c] = s[c].data();
         }
         felitronics::test::run (dyn.processBand (aud, sc, 2, N, band));
-        const int before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int k = 0; k < 40; ++k) felitronics::test::run (dyn.processBand (aud, sc, (k % 3) + 1, N, band));
-        felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across 40 blocks of changing width");
+        felitronics::test::okNoAlloc (alloc::count.load() == before, "no allocation across 40 blocks of changing width");
     }
 
     return felitronics::test::report();

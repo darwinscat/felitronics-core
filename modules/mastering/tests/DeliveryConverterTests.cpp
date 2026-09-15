@@ -8,26 +8,17 @@
 
 #include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <new>
 #include <string>
 #include <vector>
-
-static std::atomic<long long> g_allocs { 0 }, g_allocBytes { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_allocBytes.fetch_add ((long long) s); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_allocBytes.fetch_add ((long long) s); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using felitronics::mastering::DeliveryConverter;
 using felitronics::test::group;
@@ -154,9 +145,9 @@ static void testConvert()
         {
             const std::uint64_t want = DeliveryConverter::prepareBytes (pr.first, pr.second, ch, 1024);
             DeliveryConverter dc;
-            const long long before = g_allocBytes.load();
+            const long long before = alloc::rawBytes.load();
             const bool prepared = dc.prepare (pr.first, pr.second, ch, 1024);
-            const long long asked = g_allocBytes.load() - before;
+            const long long asked = alloc::rawBytes.load() - before;
             ok (prepared && want > 0u, "prepared, with a budget");
             okNoAlloc ((std::uint64_t) asked == want, "prepareBytes == the bytes prepare() requested");
 
@@ -164,9 +155,9 @@ static void testConvert()
             Planar p (ch, N), o (ch, outN);
             std::vector<const float*> ip ((std::size_t) ch);
             for (int c = 0; c < ch; ++c) ip[(std::size_t) c] = p.ch[(std::size_t) c].data();
-            const long long allocs = g_allocs.load();
+            const long long allocs = alloc::count.load();
             const bool converted = dc.convert (ip.data(), ch, N, o.ptr.data(), outN);
-            const long long after = g_allocs.load();
+            const long long after = alloc::count.load();
             ok (converted, "convert accepted");
             okNoAlloc (after == allocs, "convert() allocated nothing");
         }

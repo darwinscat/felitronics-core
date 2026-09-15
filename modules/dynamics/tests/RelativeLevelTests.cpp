@@ -6,22 +6,14 @@
 // asymmetric follower measured +3.9 dB high on a +-12 dB swing — this suite fails such a build).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/dynamics/RelativeLevel.h>
 #include <felitronics/core/Math.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -294,12 +286,12 @@ int main()
     {
         dynamics::RelativeLevel rl; rl.prepare (fs);
         feed (rl, fs, core::dbToGain (-25.0), 100.0, 16);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         feed (rl, fs, core::dbToGain (-25.0), 2000.0, 16);
         rl.retuned();
         feed (rl, fs, 0.0, 500.0, 16);
         rl.flushDenormals();
-        test::okNoAlloc (g_allocs.load() == before, "no allocations on the audio path");
+        test::okNoAlloc (alloc::count.load() == before, "no allocations on the audio path");
     }
 
     return test::report();

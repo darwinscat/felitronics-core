@@ -8,23 +8,14 @@
 // SR-invariance, and no-allocation-in-process(). Never loosen these to go green.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/dynamics/NoiseGate.h>
 
-#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-// global allocation counter (no-alloc-in-process proof)
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using dynamics::NoiseGate;
@@ -215,7 +206,7 @@ int main()
         NoiseGate g; felitronics::test::run (g.prepare (kSr, N, 2));
         auto s = sine (220.0, kSr, N, 0.2);
         std::vector<float> buf ((std::size_t) N);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int b = 0; b < 50; ++b)
         {
             for (int i = 0; i < N; ++i) buf[(std::size_t) i] = s[(std::size_t) i];
@@ -224,7 +215,7 @@ int main()
             felitronics::test::run (g.applyGain (io, 1, N));
             felitronics::test::run (g.process  (io, 1, N, true, -40.0f));
         }
-        test::okNoAlloc (g_allocs.load() == before, "analyse/applyGain/process allocated nothing");
+        test::okNoAlloc (alloc::count.load() == before, "analyse/applyGain/process allocated nothing");
     }
 
     return test::report();

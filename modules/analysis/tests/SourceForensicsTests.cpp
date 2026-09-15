@@ -80,12 +80,12 @@
 // equivalent (state maintenance moved off an audio-time coordinate onto a call boundary).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/SourceForensics.h>
 #include <felitronics/core/OfflineFft.h>
 #include <felitronics/eq/Crossover2.h>
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <complex>
@@ -96,17 +96,6 @@
 #include <set>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new (std::size_t s)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    void* p = std::malloc (s == 0 ? 1 : s);
-    if (p == nullptr) std::abort();        // an allocation function may not return null; the wasm row has no exceptions
-    return p;
-}
-void  operator delete (void* p) noexcept { std::free (p); }
-void  operator delete (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using analysis::ForensicsEvent;
@@ -1708,24 +1697,24 @@ int main()
         // 64-bit target and only 10 on a 32-bit one, so "life: process" is free on macOS and a heap
         // allocation on the wasm row, where okNoAlloc is enforced just the same. The library allocates
         // nothing on either: measured 14 allocations in prepare(), 0 in process/finish/read on both.
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         const bool prepared = sf.prepare (kFs, 64, 2);
-        const long afterPrepare = g_allocs.load();
+        const long long afterPrepare = alloc::count.load();
         ok (run (prepared), "life: prepare");
         ok (afterPrepare > before, "life: prepare is where the heap is touched");
         std::vector<float> a (1000, 0.3f), b (1000, -0.3f);
         const float* in[2] { a.data(), b.data() };
-        const long b2 = g_allocs.load();
+        const long long b2 = alloc::count.load();
         const bool processed = sf.process (in, 2, 1000);
         sf.finish();
-        const long afterFinish = g_allocs.load();
+        const long long afterFinish = alloc::count.load();
         ok (run (processed), "life: process");
         okNoAlloc (afterFinish == b2, "life: process and finish allocate nothing");
-        const long b3 = g_allocs.load();
+        const long long b3 = alloc::count.load();
         (void) sf.wall (0);
         (void) sf.wall();
         (void) sf.sampleGrid (0);
-        const long afterRead = g_allocs.load();
+        const long long afterRead = alloc::count.load();
         okNoAlloc (afterRead == b3, "life: and reading the report allocates nothing");
         const auto after1 = sf.wall (0);
         sf.finish();

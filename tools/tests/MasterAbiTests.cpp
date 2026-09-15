@@ -14,6 +14,7 @@
 // browser harness.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include "fc_master_abi.h"
 
@@ -34,128 +35,23 @@
 #include <tuple>
 #include <vector>
 
-// The allocation counter, same idiom as the module suites: a global operator new so that "process()
-// does not allocate" is COUNTED rather than read off the source.
-static std::atomic<long long> g_allocs { 0 };
-// P41: a switch that makes the NEXT allocation fail — natively an exception, the exact analogue of the wasm abort
-// (nothing after the failing statement runs, the facade's own bookkeeping included). Exceptions only: the wasm tier
-// builds this file with -fno-exceptions, where the analogue is the abort itself and the suite cannot outlive it.
-static std::atomic<bool> g_failNextAlloc { false };
-// BYTES too: fc_master_need's budgets are held against them, so the counter counts what the CONTAINER asked for. MSVC's
-// STL on x86/x64 asks operator new for sizeof(void*) + 31 bytes more (one word more under _DEBUG) on every block of 4096
-// or more — its own alignment, which a budget leaves to the caller — and the counter takes that back off. The rule and
-// its reasons are written out in LoudnessConformanceTests.cpp; here, as there, a check fails if it is not this STL's —
-// and under iterator debugging, which neither file models (a proxy allocation per container), it fails by name.
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static constexpr std::size_t kStlBigBlock = 4096;
-static std::atomic<long long> g_bytes { 0 };
-// A PLAIN `new T` IS NOT A CONTAINER, and on this row the difference is 39 bytes. The correction above
-// undoes what MSVC's STL adds to a CONTAINER's request; a direct `new` asks for exactly `sizeof(T)` and
-// taking the correction off it subtracts bytes nobody added. A create makes two such allocations: the EQ
-// engine, which is over-aligned and therefore counted raw on its own path, and THIS FILE's instance record,
-// which is an ordinary `new` of 18 496 bytes — over the big-block threshold, and indistinguishable from a
-// container by size alone. So the test tells the counter that size (it is `fc_need::facadeBytes`, which the
-// core publishes) and the counter leaves requests of exactly it alone. The `win` row found this: every one
-// of the 48 create rows read 39 bytes short while macOS and Linux, whose STL adds nothing, were exact.
-static std::atomic<std::size_t> g_plainObjectSize { 0 };
-static long long containerBytes (std::size_t s) noexcept
-{
-    if (kStlBigPad == 0) return (long long) s;
-    if (s == g_plainObjectSize.load (std::memory_order_relaxed)) return (long long) s;
-    return (long long) (s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
-}
-static void* countedNew (std::size_t s)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed);
-#if defined(__cpp_exceptions)
-    if (g_failNextAlloc.exchange (false)) throw std::bad_alloc();
-#endif
-    return std::malloc (s ? s : 1);
-}
+// The allocation counter is the shared one (test_support/alloc_counter.h, included above): every form of
+// `new`, the over-aligned included. This file used to carry its own copy of it — the reference copy, in
+// fact, since it was already complete — and the counter's fault switch, its byte accounting and the
+// plain-object exemption all moved into that header verbatim, so the other sixty suites get them too.
+
 // One vector's allocation, as the counter sees it — written through `volatile`, so the optimizer cannot remove it.
 static long long vectorRequest (std::size_t n)
 {
-    const long long before = g_bytes.load();
+    const long long before = alloc::bytes.load();
     {
         std::vector<char> v;
         v.assign (n, 0);
         volatile char* sink = v.data();
         sink[0] = 1;
     }
-    return g_bytes.load() - before;
+    return alloc::bytes.load() - before;
 }
-// EVERY FORM, not two. `eq::EqEngine` has `alignof` 64, so `fc_master_create` builds it through the
-// OVER-ALIGNED `operator new(size_t, align_val_t)` — 331 KiB, the single largest request a create makes,
-// invisible to a counter that overrides only the two sized forms. That blindness is P52, and a suite that
-// holds a published budget against a counter cannot have it: the create budgets below would have passed
-// while silently comparing two numbers that both left the engine out.
-static void* countedAlignedNew (std::size_t s, std::size_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    // RAW, not `containerBytes`. That correction undoes what MSVC's STL adds ON TOP of a container's own
-    // request; an over-aligned `new` here is an OBJECT (`eq::EqEngine`, alignof 64) whose size is exactly
-    // `sizeof`, and taking the correction off it subtracts bytes nobody added. The `win` row found it.
-    g_bytes.fetch_add ((long long) s, std::memory_order_relaxed);
-#if defined(__cpp_exceptions)
-    if (g_failNextAlloc.exchange (false)) throw std::bad_alloc();
-#endif
-#if defined(_MSC_VER)
-    return _aligned_malloc (s ? s : 1, a);
-#else
-    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
-    void* p = nullptr;
-    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
-#endif
-}
-// The nothrow forms take the SAME counter and the same fault switch, but answer a failure the way their
-// contract does — a null pointer, never an exception out of a noexcept function.
-static void* countedNothrowNew (std::size_t s, std::size_t a) noexcept
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    g_bytes.fetch_add (a != 0 ? (long long) s : containerBytes (s), std::memory_order_relaxed);   // raw when over-aligned — see above
-    if (g_failNextAlloc.exchange (false)) return nullptr;
-#if defined(_MSC_VER)
-    return a != 0 ? _aligned_malloc (s ? s : 1, a) : std::malloc (s ? s : 1);
-#else
-    if (a == 0) return std::malloc (s ? s : 1);
-    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
-    void* p = nullptr;
-    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
-#endif
-}
-static void alignedFree (void* p) noexcept
-{
-#if defined(_MSC_VER)
-    _aligned_free (p);
-#else
-    std::free (p);
-#endif
-}
-void* operator new      (std::size_t s) { return countedNew (s); }
-void* operator new[]    (std::size_t s) { return countedNew (s); }
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
-void* operator new      (std::size_t s, const std::nothrow_t&) noexcept { return countedNothrowNew (s, 0); }
-void* operator new[]    (std::size_t s, const std::nothrow_t&) noexcept { return countedNothrowNew (s, 0); }
-void* operator new      (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedNothrowNew (s, (std::size_t) a); }
-void* operator new[]    (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedNothrowNew (s, (std::size_t) a); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
 
 using felitronics::test::ok;
 using felitronics::test::approx;
@@ -534,13 +430,13 @@ int main()
 
         auto buf = tone (4096, kNch);
         (void) fc_master_process (h, buf.data(), buf.data(), 4096);   // warm every lazy path first
-        const long long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int i = 0; i < 8; ++i)
             (void) fc_master_process (h, buf.data(), buf.data(), 4096);
         std::int32_t lat = 0; (void) fc_master_latency (h, &lat);
         fc_master_stats st {}; FC_INIT (st);
         (void) fc_master_get_stats (h, &st);
-        const long long after = g_allocs.load();
+        const long long after = alloc::count.load();
         okNoAlloc (after == before, "eight process() calls and two getters allocate nothing");
         ok (st.framesIn == 4096u * 9u, "and the frame counter agrees with what was handed over");
         fc_master_destroy (h);
@@ -1515,9 +1411,9 @@ int main()
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
         ok (solve.callBytes == 2936u + 21008u, "the solve budget is meter + reference true-peak meter = 23 944 B");
 
-        long long before = g_bytes.load();
+        long long before = alloc::bytes.load();
         const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
-        const long long prepared = g_bytes.load() - before;
+        const long long prepared = alloc::bytes.load() - before;
         ok (w == FC_OK, "the first weight prepares the solver");
         ok (prepared == (long long) solve.solverPrepareBytes, "and allocates exactly `solverPrepareBytes`");
         fc_need after {}; FC_INIT (after);
@@ -1526,9 +1422,9 @@ int main()
 
         auto in = tone ((int) n, kNch);
         double v = 0.0;
-        before = g_bytes.load();
+        before = alloc::bytes.load();
         (void) fc_master_measure_lra (h, in.data(), n, &v);
-        const long long lraBytes = g_bytes.load() - before;
+        const long long lraBytes = alloc::bytes.load() - before;
         ok (lraBytes == (long long) lra.callBytes, "measure_lra allocates exactly its budget");
 
         // Under 3 s there is no range: the call refuses BEFORE it builds a meter, and its budget says so (the
@@ -1536,9 +1432,9 @@ int main()
         fc_need shortLra {}; FC_INIT (shortLra);
         ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 48000, &shortLra) == FC_OK && shortLra.callBytes == 0,
             "a 1 s programme: the measure_lra budget is 0");
-        before = g_bytes.load();
+        before = alloc::bytes.load();
         const fc_status sr = fc_master_measure_lra (h, in.data(), 48000, &v);
-        const long long shortBytes = g_bytes.load() - before;
+        const long long shortBytes = alloc::bytes.load() - before;
         ok (sr == FC_ERR_REFUSED_BY_CORE && shortBytes == 0, "and the refused call allocates nothing");
 
         // The range rule's own edge, at 48 kHz: exactly 3 s is measurable, one frame less is not — in the call AND in
@@ -1563,11 +1459,11 @@ int main()
         // THE SOLUTION RECORD IS A PLAIN OBJECT, and since v4 it is 50 384 B — over the counter's big-block threshold, where
         // MSVC's STL pads a CONTAINER and the counter takes that padding off. Told its size, the counter leaves it alone
         // (as for the instance record above); untold, the `win` row would read 39 B short (the code-review round).
-        g_plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);
-        before = g_bytes.load();
+        alloc::plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);
+        before = alloc::bytes.load();
         const fc_status sv = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
-        const long long solveBytes = g_bytes.load() - before;
-        g_plainObjectSize.store (0, std::memory_order_relaxed);
+        const long long solveBytes = alloc::bytes.load() - before;
+        alloc::plainObjectSize.store (0, std::memory_order_relaxed);
         fc_solution_summary sum {}; FC_INIT (sum);
         ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the search rendered");
         const long long perPass = (long long) solve.callBytes;
@@ -1595,21 +1491,21 @@ int main()
             fc_need pn {}; FC_INIT (pn);
             ok (fc_master_need_create (&probe, &pn) == FC_OK && pn.facadeBytes > 0u,
                 "PRECONDITION: the facade publishes the size of its own instance record");
-            g_plainObjectSize.store ((std::size_t) pn.facadeBytes, std::memory_order_relaxed);
+            alloc::plainObjectSize.store ((std::size_t) pn.facadeBytes, std::memory_order_relaxed);
             // AND THE RULE IS CALIBRATED, on this row's own STL, rather than trusted: a plain `new` of that
             // size counts as exactly that size, and a VECTOR of it counts as exactly its own bytes. The
             // second is the rule's known collision — a container that happens to be exactly as long as the
             // facade's record would be left uncorrected — and naming it here is what keeps it from being
             // discovered as a byte-for-byte failure with no explanation.
             const std::size_t n = (std::size_t) pn.facadeBytes;
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             {
                 void* raw = ::operator new (n);
                 volatile char* sink = static_cast<char*> (raw);
                 sink[0] = 1;
                 ::operator delete (raw, n);
             }
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             ok (got == (long long) n, "the counter reads a plain `new` of " + std::to_string (n)
                                       + " B as " + std::to_string (n) + " B (read " + std::to_string (got) + ")");
         }
@@ -1646,9 +1542,9 @@ int main()
                     fc_need nd {}; FC_INIT (nd);
                     const fc_status ns = fc_master_need_create (&c, &nd);
                     fc_master h = 0;
-                    const long long before = g_bytes.load();
+                    const long long before = alloc::bytes.load();
                     const fc_status cs = fc_master_create (&c, &h);
-                    const long long got = g_bytes.load() - before;
+                    const long long got = alloc::bytes.load() - before;
                     if (ns != cs) ++statusOff;
                     if (cs != FC_OK) continue;
                     if (nd.callBytes == 0u) ++zeroBudget;
@@ -1666,9 +1562,9 @@ int main()
                     fc_master_resolved r {}; FC_INIT (r);
                     fc_need cn {}; FC_INIT (cn);
                     const fc_status cns = fc_master_need (h, FC_NEED_CONFIGURE, 0, &cn);
-                    const long long b2 = g_bytes.load();
+                    const long long b2 = alloc::bytes.load();
                     const fc_status ccs = fc_master_configure (h, &p, &r);
-                    const long long got2 = g_bytes.load() - b2;
+                    const long long got2 = alloc::bytes.load() - b2;
                     if (cns != FC_OK || ccs != FC_OK || cn.callBytes != 0u || got2 != 0
                         || cn.facadeBytes != 0u || cn.solverPrepareBytes != 0u || cn.solverPrepared != 0) ++cfgOff;
                     (void) fc_master_destroy (h);
@@ -1729,9 +1625,9 @@ int main()
             const fc_status ns = fc_master_need_create (&c, &nd);
             fc_master h = 0xDEADBEEFu;
             const fc_master before_h = h;
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             const fc_status cs = fc_master_create (&c, &h);
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             if (ns != rf.want || cs != rf.want) ++refOff;
             if (std::memcmp (&nd, &before_nd, sizeof (nd)) != 0 || h != before_h) ++refTouched;
             if (got != 0) ++refLeak;
@@ -1798,7 +1694,7 @@ int main()
         ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &sd) == FC_OK && sd.callBytes > 0u,
             "PRECONDITION: which is what a solve's budget already does mid-stream");
         (void) fc_master_destroy (h);
-        g_plainObjectSize.store (0, std::memory_order_relaxed);   // the exemption is this group's only
+        alloc::plainObjectSize.store (0, std::memory_order_relaxed);   // the exemption is this group's only
     }
 
     //==========================================================================
@@ -2238,16 +2134,16 @@ int main()
             fc_need nl {}; FC_INIT (nl);
             ok (fc_master_need_create (&legacy, &nl) == FC_OK && nd.callBytes > nl.callBytes,
                 "and costs more than the same geometry without the converter");
-            g_plainObjectSize.store ((std::size_t) nd.facadeBytes, std::memory_order_relaxed);
+            alloc::plainObjectSize.store ((std::size_t) nd.facadeBytes, std::memory_order_relaxed);
             fc_master h = 0;
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             const fc_status cs = fc_master_create (&c, &h);
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             const long long budget = (long long) (nd.callBytes + nd.facadeBytes);
             ok (cs == FC_OK && got == budget, "the delivering create allocates its budget plus the facade's record ("
                 + std::to_string (got) + " against " + std::to_string (budget) + ")");
             (void) fc_master_destroy (h);
-            g_plainObjectSize.store (0, std::memory_order_relaxed);
+            alloc::plainObjectSize.store (0, std::memory_order_relaxed);
 
             struct Refusal { const char* what; double dr; fc_status want; };
             const Refusal rs[] = {
@@ -2262,9 +2158,9 @@ int main()
                 fc_need bn {}; FC_INIT (bn);
                 fc_master bh = 0;
                 const fc_status ns = fc_master_need_create (&bc, &bn);
-                const long long b0 = g_bytes.load();
+                const long long b0 = alloc::bytes.load();
                 const fc_status bs = fc_master_create (&bc, &bh);
-                const long long leaked = g_bytes.load() - b0;
+                const long long leaked = alloc::bytes.load() - b0;
                 ok (ns == r.want && bs == r.want && leaked == 0, std::string (r.what) + ": refused by both, nothing allocated");
                 if (bs == FC_OK) (void) fc_master_destroy (bh);
             }
@@ -2385,9 +2281,9 @@ int main()
                 "an output that overlaps the input: SPAN");
             ok (fc_master_render_delivered (h, both.data(), n, both.data(), dn) == FC_ERR_SPAN,
                 "and so does the SAME buffer, which a conversion cannot share");
-            const long long allocs = g_allocs.load();
+            const long long allocs = alloc::count.load();
             const fc_status rs = fc_master_render_delivered (h, in.data(), n, out.data(), dn);
-            const long long asked = g_allocs.load() - allocs;
+            const long long asked = alloc::count.load() - allocs;
             ok (rs == FC_OK && asked == 0, "the delivered render asks the heap for nothing (" + std::to_string (asked) + " requests)");
             double peak = 0.0;
             for (float v : out) peak = std::max (peak, (double) std::fabs (v));
@@ -2431,11 +2327,11 @@ int main()
             auto in = tone (n, kNch);
             std::vector<float> out ((std::size_t) 384000 * kNch, 0.0f);
             fc_solution sol = 0;
-            g_plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);   // the record: see above
-            long long before = g_bytes.load();
+            alloc::plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);   // the record: see above
+            long long before = alloc::bytes.load();
             const fc_status sv = fc_master_solve_delivered (h, &p, &req, in.data(), n, out.data(), 384000u, &sol);
-            const long long solveBytes = g_bytes.load() - before;
-            g_plainObjectSize.store (0, std::memory_order_relaxed);
+            const long long solveBytes = alloc::bytes.load() - before;
+            alloc::plainObjectSize.store (0, std::memory_order_relaxed);
             fc_solution_summary sum {}; FC_INIT (sum);
             ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the delivered search rendered");
             const long long perPass = (long long) solve.callBytes - programme;
@@ -2467,17 +2363,17 @@ int main()
             ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 132300u, &lra) == FC_OK && lra.callBytes > (std::uint64_t) (2 * 288000 * 4),
                 "the delivered range is budgeted: the converted programme plus a meter");
             double v = 0.0;
-            before = g_bytes.load();
+            before = alloc::bytes.load();
             const fc_status ls = fc_master_measure_lra (h, lin.data(), 132300u, &v);
-            const long long lraBytes = g_bytes.load() - before;
+            const long long lraBytes = alloc::bytes.load() - before;
             ok (ls == FC_OK && lraBytes == (long long) lra.callBytes,
                 "and allocates exactly that (" + std::to_string (lraBytes) + " against " + std::to_string (lra.callBytes) + ")");
             fc_need shortLra {}; FC_INIT (shortLra);
             ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 132299u, &shortLra) == FC_OK && shortLra.callBytes == 0u,
                 "one input frame fewer delivers under 3 s: budgeted 0");
-            before = g_bytes.load();
+            before = alloc::bytes.load();
             const fc_status ss = fc_master_measure_lra (h, lin.data(), 132299u, &v);
-            const long long shortBytes = g_bytes.load() - before;
+            const long long shortBytes = alloc::bytes.load() - before;
             ok (ss == FC_ERR_REFUSED_BY_CORE && shortBytes == 0, "and refused having converted — and allocated — nothing");
             (void) fc_master_destroy (h);
         }
@@ -2595,9 +2491,9 @@ int main()
 
             // THE RE-PREPARATION of a delivering handle costs nothing, as a plain one's does — at the delivery rate.
             fc_need cn {}; FC_INIT (cn);
-            const long long b0 = g_bytes.load();
+            const long long b0 = alloc::bytes.load();
             const fc_status cs = fc_master_configure (h, &p, &r);
-            const long long got = g_bytes.load() - b0;
+            const long long got = alloc::bytes.load() - b0;
             ok (fc_master_need (h, FC_NEED_CONFIGURE, 0u, &cn) == FC_OK && cn.callBytes == 0u && cs == FC_OK && got == 0,
                 "a delivering configure is budgeted 0 and allocates 0");
             (void) fc_master_destroy (h);
@@ -2678,9 +2574,9 @@ int main()
             fc_solution so = 0;
             fc_need before {}; FC_INIT (before);
             (void) fc_master_need (h, FC_NEED_SOLVE, 4800u, &before);
-            const long long b0 = g_bytes.load();
+            const long long b0 = alloc::bytes.load();
             const fc_status st = fc_master_solve_delivered (h, &p, &req, in.data(), 4800u, out.data(), 4410u, &so);
-            const long long got = g_bytes.load() - b0;
+            const long long got = alloc::bytes.load() - b0;
             fc_need afterN {}; FC_INIT (afterN);
             (void) fc_master_need (h, FC_NEED_SOLVE, 4800u, &afterN);
             ok (st == FC_ERR_EXHAUSTED && got == 0 && before.solverPrepared == 0 && afterN.solverPrepared == 0,
@@ -2716,16 +2612,16 @@ int main()
             fc_master_config c = deliveringConfig (pr.first, pr.second);
             fc_need nd {}; FC_INIT (nd);
             ok (fc_master_need_create (&c, &nd) == FC_OK, "PRECONDITION: budgeted");
-            g_plainObjectSize.store ((std::size_t) nd.facadeBytes, std::memory_order_relaxed);
+            alloc::plainObjectSize.store ((std::size_t) nd.facadeBytes, std::memory_order_relaxed);
             fc_master h = 0;
-            const long long b0 = g_bytes.load();
+            const long long b0 = alloc::bytes.load();
             const fc_status cs = fc_master_create (&c, &h);
-            const long long got = g_bytes.load() - b0;
+            const long long got = alloc::bytes.load() - b0;
             ok (cs == FC_OK && got == (long long) (nd.callBytes + nd.facadeBytes),
                 std::to_string ((int) pr.first) + " -> " + std::to_string ((int) pr.second)
                 + ": the create allocates its budget, to the byte (" + std::to_string (got) + ")");
             (void) fc_master_destroy (h);
-            g_plainObjectSize.store (0, std::memory_order_relaxed);
+            alloc::plainObjectSize.store (0, std::memory_order_relaxed);
         }
 
         // A NON-FINITE INPUT SAMPLE on a delivering handle costs what it costs a plain one: converting a NaN is
@@ -2816,10 +2712,10 @@ int main()
             "PRECONDITION: a solution handed out BEFORE the poison");
         fc_solution sol = 0;
         bool escaped = false;
-        g_failNextAlloc = true;
+        alloc::failNext = true;
         try { (void) fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol); }
         catch (const std::bad_alloc&) { escaped = true; }
-        g_failNextAlloc = false;
+        alloc::failNext = false;
         ok (escaped, "PRECONDITION: the allocation failure escaped the entry point, as an abort would");
         ok (sol == 0, "and no solution handle was handed out");
 

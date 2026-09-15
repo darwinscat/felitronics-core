@@ -26,107 +26,29 @@
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
-#include <new>
 #include <random>
 #include <string>
 #include <vector>
-
-static std::atomic<long long> g_allocs { 0 };
-// BYTES too, and EVERY FORM OF `new` (P41). A counter that overrides only `operator new(size_t)` and
-// `new[]` is blind to the OVER-ALIGNED form — and `eq::EqEngine` has `alignof` 64, so 331 KiB of what a
-// chain asks for, the single largest request it makes, went past such a counter unseen. That is the
-// blindness P52 names; a suite that holds a published budget against a counter cannot have it.
-//
-// The bytes are the CONTAINER's, not what reached the allocator: MSVC's STL on x86/x64 asks for
-// `sizeof(void*) + 31` more (one word more under _DEBUG) on every block of 4096 or more — its own
-// alignment, which a REQUESTED-bytes budget leaves to the caller — and this takes that back off. The rule
-// is calibrated on literal sizes below, so a check fails if this is not the STL it describes rather than
-// a byte-for-byte comparison failing with no explanation. NEITHER FILE MODELS ITERATOR DEBUGGING (MSVC's
-// `_DEBUG` adds a container-proxy allocation per container, which is not padding and cannot be subtracted
-// off a block): under it the calibration fails by name, which is the point of having one.
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static constexpr std::size_t kStlBigBlock = 4096;
-static std::atomic<long long> g_bytes { 0 };
-static long long containerBytes (std::size_t s) noexcept
-{
-    return (long long) (kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
-}
-static void* countedNew (std::size_t s)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed);
-    return std::malloc (s ? s : 1);
-}
-// The over-aligned forms go through the platform's aligned allocator; `std::free` is not valid for it, so
-// the matching deletes below use the aligned release. Everything is counted the same way.
-static void* countedAlignedNew (std::size_t s, std::size_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    // RAW, not `containerBytes`. That correction exists to undo what MSVC's STL adds ON TOP of a container's
-    // own request; an over-aligned `new` in this tree is an OBJECT (`eq::EqEngine`, alignof 64) whose size is
-    // exactly `sizeof`, and taking the correction off it subtracts bytes nobody ever added. Caught by the
-    // `win` row before CI: the engine's 339 072 read as 339 033, and with it 88 of the chain's budget rows.
-    g_bytes.fetch_add ((long long) s, std::memory_order_relaxed);
-#if defined(_MSC_VER)
-    return _aligned_malloc (s ? s : 1, a);
-#else
-    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
-    void* p = nullptr;
-    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
-#endif
-}
-static void alignedFree (void* p) noexcept
-{
-#if defined(_MSC_VER)
-    _aligned_free (p);
-#else
-    std::free (p);
-#endif
-}
-void* operator new      (std::size_t s) { return countedNew (s); }
-void* operator new[]    (std::size_t s) { return countedNew (s); }
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
-void* operator new      (std::size_t s, const std::nothrow_t&) noexcept { return countedNew (s); }
-void* operator new[]    (std::size_t s, const std::nothrow_t&) noexcept { return countedNew (s); }
-void* operator new      (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedAlignedNew (s, (std::size_t) a); }
-void* operator new[]    (std::size_t s, std::align_val_t a, const std::nothrow_t&) noexcept { return countedAlignedNew (s, (std::size_t) a); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
 
 // One vector's allocation, as the counter sees it — written through `volatile`, so the optimizer cannot
 // remove an allocation nobody observes (the lesson P41 F6 paid for).
 static long long vectorRequest (std::size_t n)
 {
-    const long long before = g_bytes.load();
+    const long long before = alloc::bytes.load();
     {
         std::vector<char> v;
         v.assign (n, 0);
         volatile char* sink = v.data();
         sink[0] = 1;
     }
-    return g_bytes.load() - before;
+    return alloc::bytes.load() - before;
 }
 
 using namespace felitronics;
@@ -1034,7 +956,7 @@ static void testRtSafety()
     felitronics::test::run (chain.process (px, nch, 1024));
     chain.reset();
 
-    const long long before = g_allocs.load();
+    const long long before = alloc::count.load();
     setPlanes (0);
     felitronics::test::run (chain.process (px, nch, n));                            // one whole-programme call
     {
@@ -1049,7 +971,7 @@ static void testRtSafety()
     chain.flush (pt, nch, (int) tail[0].size());
     chain.reset();
     (void) chain.resolved();
-    const long long after = g_allocs.load();
+    const long long after = alloc::count.load();
     test::ok (monoRefused, "a mono call on a stereo chain is refused");
 
     okNoAlloc (after == before, "process() / flush() / setParams() / reset() / resolved() allocate nothing ("
@@ -1266,13 +1188,13 @@ void testDemand()
     // blind to it reads the default geometry's largest single request as zero and every budget below passes,
     // which is the shape of P52 and is why this check is a PRECONDITION rather than a nicety.
     {
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         {
             auto e = std::make_unique<eq::EqEngine>();
             volatile const void* sink = e.get();
             (void) sink;
         }
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (got == (long long) eq::EqEngine::objectBytes(),
             "the counter sees the over-aligned `new` the EQ engine is built through: "
             + std::to_string (got) + " B");
@@ -1294,9 +1216,9 @@ void testDemand()
                 const bool admitted = mastering::MasteringChain::admits (fs, nch, cfg);
 
                 auto chain = std::make_unique<mastering::MasteringChain>();   // FRESH: the budget is a fresh object's
-                const long long before = g_bytes.load();
+                const long long before = alloc::bytes.load();
                 const bool prepared = chain->prepare (fs, nch, cfg);
-                const long long got = g_bytes.load() - before;
+                const long long got = alloc::bytes.load() - before;
 
                 // ADMITS IS PREPARE'S OWN VERDICT, reached without allocating. Not "agrees usually".
                 if (admitted != prepared) ++badAdmit;
@@ -1313,9 +1235,9 @@ void testDemand()
                 }
                 // RE-PREPARING AT THE SAME GEOMETRY COSTS NOTHING — published and measured.
                 const std::uint64_t again = chain->reprepareBytes (fs, nch, cfg);
-                const long long b2 = g_bytes.load();
+                const long long b2 = alloc::bytes.load();
                 const bool ok2 = chain->prepare (fs, nch, cfg);
-                const long long got2 = g_bytes.load() - b2;
+                const long long got2 = alloc::bytes.load() - b2;
                 if (! ok2 || again != 0u || got2 != 0) ++badReprep;
             }
     ok (rows == 4 * 3 * kTopologies, "PRECONDITION: the matrix is 4 rates x 3 widths x "
@@ -1341,9 +1263,9 @@ void testDemand()
         auto chain = std::make_unique<mastering::MasteringChain>();
         ok (chain->prepare (48000.0, 2, small), "PRECONDITION: a chain at the small geometry");
         const std::uint64_t bound = chain->reprepareBytes (96000.0, 2, big);
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool grew = chain->prepare (96000.0, 2, big);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (grew, "PRECONDITION: it re-prepares at the bigger one");
         ok (bound > 0u, "a re-preparation that GROWS is not published as free (" + std::to_string (bound) + " B)");
         ok (got > 0 && (std::uint64_t) got <= bound,
@@ -1364,9 +1286,9 @@ void testDemand()
         ok (a.prepare (48000.0, 2, bare), "PRECONDITION: a prepared chain");
         mastering::MasteringChain b (std::move (a));
         const std::uint64_t bound = a.reprepareBytes (48000.0, 2, bare);     // NOLINT: the point is the moved-from state
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool again = a.prepare (48000.0, 2, bare);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (again && got > 0, "PRECONDITION: preparing it again really does allocate (" + std::to_string (got) + " B)");
         ok ((std::uint64_t) got <= bound, "a chain that has given its storage away does not publish 0 (bound "
                                           + std::to_string (bound) + " B)");
@@ -1383,9 +1305,9 @@ void testDemand()
         ok (a.prepare (48000.0, 1, mono), "PRECONDITION: a mono compressor chain with no lookahead");
         mastering::MasteringChain b (std::move (a));
         const std::uint64_t bound = a.reprepareBytes (48000.0, 1, mono);     // NOLINT: the moved-from state again
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool again = a.prepare (48000.0, 1, mono);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (again && (std::uint64_t) got > mastering::MasteringChain::prepareBytes (48000.0, 1, mono),
             "PRECONDITION: the moved-from chain asks for more than a fresh one (" + std::to_string (got) + " B)");
         ok ((std::uint64_t) got <= bound, "and the bound covers the seed it no longer holds (asked "
@@ -1404,9 +1326,9 @@ void testDemand()
         auto chain = std::make_unique<mastering::MasteringChain>();
         ok (chain->prepare (100.0, 3, c1), "PRECONDITION: a narrow chain at a low rate");
         const std::uint64_t bound = chain->reprepareBytes (200.0, 4, c2);
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool grew = chain->prepare (200.0, 4, c2);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (grew, "PRECONDITION: and it grows in every dimension at once");
         // THE BOUND IS ON WHAT THE CHAIN ASKS ITS CONTAINERS FOR, not on what they then ask the allocator.
         // A container that has to grow applies its OWN growth policy, and that is the one thing law 11d
@@ -1439,9 +1361,9 @@ void testDemand()
         (void) mastering::MasteringChain::storageFor (48000.0, 2, c2, b);
         ok (a.fifo == b.fifo && a.keyBuf == b.keyBuf, "PRECONDITION: the chain's own buffers do not move");
         const std::uint64_t bound = chain->reprepareBytes (48000.0, 2, c2);
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool grew = chain->prepare (48000.0, 2, c2);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (grew && got > 0, "PRECONDITION: growing only the limiter still allocates (" + std::to_string (got) + " B)");
         ok (bound > 0u, "and a stage that grows behind an unchanged FIFO is not published as free");
     }
@@ -1465,9 +1387,9 @@ void testDemand()
         auto chain = std::make_unique<mastering::MasteringChain>();
         ok (chain->prepare (48000.0, 2, c1), "PRECONDITION: a chain with no compressor lookahead");
         const std::uint64_t bound = chain->reprepareBytes (48000.0, 2, c2);
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool grew = chain->prepare (48000.0, 2, c2);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (grew && got > 0, "PRECONDITION: growing only the dry aligner allocates (" + std::to_string (got) + " B)");
         ok (bound > 0u && (std::uint64_t) got <= bound,
             "and it is not published as free (asked " + std::to_string (got) + " B, bound " + std::to_string (bound) + " B)");
@@ -1482,9 +1404,9 @@ void testDemand()
         int off = 0;
         auto measure = [&off] (const char* /*what*/, std::uint64_t budget, auto&& build)
         {
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             const bool okPrep = build();
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             if (! okPrep || got != (long long) budget) ++off;
         };
         {   // the limiter's block cap: a whole-file maxBlock is a normal thing for an offline caller to pass
@@ -1511,9 +1433,9 @@ void testDemand()
             // preparing it asks for nothing — which would make this check pass whatever the floors did).
             const core::DryAligner::Storage st = core::DryAligner::storageFor (2, 1, 0);
             auto a = std::make_unique<core::DryAligner>();
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             a->prepare (2, 1, 0);
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             if (got != (long long) st.bytes() || got != (long long) st.freshBytes()) ++off;
         }
         {   // ...and INSIDE the seed, where `bytes()` and the request part company: one channel, a ring at its
@@ -1521,17 +1443,17 @@ void testDemand()
             // the 8 B ring it does not ask for. This is the aligner a mono compressor with no lookahead gets.
             const core::DryAligner::Storage st = core::DryAligner::storageFor (1, 256, 2);
             auto a = std::make_unique<core::DryAligner>();
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             a->prepare (1, 256, 2);
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             if (got != (long long) st.freshBytes() || st.freshBytes() != 256u * sizeof (float)
                 || st.bytes() != st.freshBytes() + 2u * sizeof (float)) ++off;
             // Fully inside it: nothing at all.
             const core::DryAligner::Storage seed = core::DryAligner::storageFor (1, 1, 2);
             auto b = std::make_unique<core::DryAligner>();
-            const long long b0 = g_bytes.load();
+            const long long b0 = alloc::bytes.load();
             b->prepare (1, 1, 2);
-            if (g_bytes.load() - b0 != 0 || seed.freshBytes() != 0u) ++off;
+            if (alloc::bytes.load() - b0 != 0 || seed.freshBytes() != 0u) ++off;
         }
         ok (off == 0, "each stage's own budget is what preparing it directly allocates, at the arguments its "
                       "OWN clamps live at (" + std::to_string (off) + " off)");
@@ -1619,9 +1541,9 @@ void testDemand()
         {
             auto chain = std::make_unique<mastering::MasteringChain> ();
             if (mastering::MasteringChain::admits (cs.fs, cs.nch, cs.cfg)) ++admitted;
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             const bool prepared = chain->prepare (cs.fs, cs.nch, cs.cfg);
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             if (prepared || got != 0) ++leaked;
         }
         ok (admitted == 0, "PRECONDITION: every case above is one admits() refuses");
@@ -1801,9 +1723,9 @@ void testEqEngineReuseIsBitIdentical()
         mastering::MasteringChainConfig cfg;
         auto chain = std::make_unique<mastering::MasteringChain>();
         ok (chain->prepare (48000.0, 2, cfg), "PRECONDITION: prepared with an EQ");
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool again = chain->prepare (48000.0, 2, cfg);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (again && got == 0, "re-preparing asks the heap for nothing at all, engine included (read "
                                + std::to_string (got) + " B)");
     }

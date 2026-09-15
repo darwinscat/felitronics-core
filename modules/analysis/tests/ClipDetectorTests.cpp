@@ -13,11 +13,11 @@
 //     no allocation in process()/finish(); the published storage is the allocated storage.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/ClipDetector.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,31 +26,6 @@
 #include <string>
 #include <tuple>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-// BYTES as the CONTAINER asked for them, which is what storageFor() states. MSVC's STL on x86/x64 asks operator new for
-// sizeof(void*) + 31 more (one word more under _DEBUG) on a block of 4096 bytes or more, to align it by hand; that pad is
-// the allocator's, so it is taken back off here — the LoudnessConformanceTests counter, where it is explained in full.
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static std::atomic<long long> g_bytes { 0 };
-static long long containerBytes (std::size_t s) noexcept
-{
-    return (long long) (kStlBigPad != 0 && s >= 4096 + kStlBigPad ? s - kStlBigPad : s);
-}
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using CD = analysis::ClipDetector;
@@ -911,25 +886,25 @@ int main()
         auto x = programme (N, sr, 21); normalisePeak (x, 1.0); for (double& v : x) v *= 3.0; clampTruth (x, 0, -1, 1);
         const auto a = deliver (x, 16);
         CD d; d.setParams ({ 5000 });
-        const long long b0 = g_bytes.load();
-        const long al0 = g_allocs.load();
+        const long long b0 = alloc::bytes.load();
+        const long long al0 = alloc::count.load();
         test::run (d.prepare (sr, 512, 3));
         // both deltas are read into locals BEFORE the check: the message is a std::string that allocates, and gcc
         // builds a call's arguments in its own order — reading the counter inside the call counts the message too
-        const long long used = g_bytes.load() - b0;
-        const long blocks = g_allocs.load() - al0;
+        const long long used = alloc::bytes.load() - b0;
+        const long long blocks = alloc::count.load() - al0;
         const auto st = CD::storageFor (sr, 3, 5000);
         test::ok (st.ok && (long long) st.bytes() == used && blocks == 4, "prepare() requested exactly storageFor().bytes() in four blocks ("
                   + std::to_string (used) + " bytes, " + std::to_string (blocks) + " blocks)");
         test::ok (! CD::storageFor (500.0, 3, 10).ok && ! CD::storageFor (sr, 0, 10).ok && ! CD::storageFor (sr, 3, -1).ok && CD::storageFor (sr, 3, 0).ok,
                   "storageFor() refuses exactly what prepare() refuses");
         const float* io[3] { a.data(), a.data(), a.data() };
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (long pos = 0; pos + 777 <= N; pos += 777) { io[0] = io[1] = io[2] = a.data() + pos; (void) d.process (io, 3, 777); }
         (void) d.process (nullptr, 0, 5000);
         d.finish();
         d.reset();
-        const bool noAlloc = g_allocs.load() == before;                  // read before the message string exists
+        const bool noAlloc = alloc::count.load() == before;   // read before the message string exists
         test::okNoAlloc (noAlloc, "no allocation in process / clock-only / finish / reset");
     }
 

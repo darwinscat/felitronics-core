@@ -52,11 +52,11 @@
 // of that ABI take ELEMENTS.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include "fcore_clips_format.h"
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -65,16 +65,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-// The allocation counter. Enforced only on libc++ (felitronics_test.h says why), which is this developer
-// machine and the wasm row — so an allocation added to process() is caught HERE or not at all.
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using CD = analysis::ClipDetector;
@@ -179,7 +169,7 @@ static fcore::ClipsReport viaProbe (const Planes& p, double sr, std::int64_t max
     const std::vector<long long> lens = sliceLengths (sl, frames);
     const int nch = (int) p.size();
     const float* view[core::kMaxChannels] {};
-    const long before = g_allocs.load();
+    const long long before = alloc::count.load();
     long long at = 0;
     for (long long n : lens)
     {
@@ -188,7 +178,7 @@ static fcore::ClipsReport viaProbe (const Planes& p, double sr, std::int64_t max
         at += n;
     }
     if (! probe.finish()) return r;
-    if (noAlloc != nullptr) *noAlloc = g_allocs.load() == before;
+    if (noAlloc != nullptr) *noAlloc = alloc::count.load() == before;
     readClips (probe, r);
     return r;
 }

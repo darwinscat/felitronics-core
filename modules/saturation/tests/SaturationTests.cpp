@@ -6,10 +6,10 @@
 // full-scale drive, no-alloc in process(), and the DC blocker neutralising the asymmetric curve's offset).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/saturation/WaveShaper.h>
 #include <felitronics/saturation/Saturator.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -18,14 +18,6 @@
 #include <limits>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using Shape = saturation::WaveShaper::Shape;
@@ -415,9 +407,9 @@ int main()
         test::ok (peak < 1.10, "peak-safe: full-scale sine stays ~bounded (peak-normalised curve)");
 
         for (int i = 0; i < 512; ++i) { L[i] = 0.3f; R[i] = -0.3f; }
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (s.process (io, 2, 512)); felitronics::test::run (s.process (io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate (os=4)");
+        test::okNoAlloc (alloc::count.load() == before, "process() did not allocate (os=4)");
     }
 
     // --- Asymmetric curve -> the DC blocker removes the offset (with a contrast where it's off) ---

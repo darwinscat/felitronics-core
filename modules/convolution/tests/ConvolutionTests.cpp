@@ -6,60 +6,16 @@
 // off-by-one alignment trap), the zero-latency assertion, and a no-allocation-in-process() proof.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/convolution/PartitionedConvolver.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <new>
 #if defined(_WIN32)
  #include <malloc.h>   // _aligned_malloc / _aligned_free (MSVC has no posix_memalign)
 #endif
 #include <vector>
-
-// --- global allocation counter (proves process() does not allocate) ---
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-// Aligned overloads too — SeamAllocator uses ::operator new(size, align_val_t); without these the counter
-// goes blind to every SIMD-aligned seam buffer (a future in-process aligned alloc would then pass this test).
-// Portable: _aligned_malloc on MSVC (no posix_memalign there — the Windows CI row would fail to compile),
-// posix_memalign elsewhere, with matched frees; throws std::bad_alloc on failure (the allocator relies on it).
-static inline void* countedAlignedNew (std::size_t s, std::align_val_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    const std::size_t al = (std::size_t) a < sizeof (void*) ? sizeof (void*) : (std::size_t) a;
-   #if defined(_WIN32)
-    void* p = _aligned_malloc (s ? s : 1, al);
-   #else
-    void* p = nullptr; if (::posix_memalign (&p, al, s ? s : 1) != 0) p = nullptr;
-   #endif
-   #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-    if (p == nullptr) throw std::bad_alloc();
-   #else
-    if (p == nullptr) std::abort();   // the wasm-audio tier compiles -fno-exceptions, where `throw` is a PARSE error
-   #endif
-    return p;
-}
-static inline void countedAlignedFree (void* p) noexcept
-{
-   #if defined(_WIN32)
-    _aligned_free (p);
-   #else
-    std::free (p);
-   #endif
-}
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void  operator delete   (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
 
 using namespace felitronics;
 
@@ -179,10 +135,10 @@ int main()
         convolution::PartitionedConvolver<> conv;
         conv.prepare (P, irLen);
         conv.setIr (ir.data(), irLen);          // allocations allowed up to here
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (conv.process (x.data(), y.data(), n));
         felitronics::test::run (conv.process (x.data(), y.data(), n));   // cross a chunk boundary a few times
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
 

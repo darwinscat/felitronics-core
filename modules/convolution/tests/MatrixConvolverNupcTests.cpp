@@ -11,57 +11,18 @@
 // history (differs from a cold-started instance); topology switches both directions; no-alloc; in-place.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <new>
 #if defined(_WIN32)
  #include <malloc.h>
 #endif
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-static inline void* countedAlignedNew (std::size_t s, std::align_val_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    const std::size_t al = (std::size_t) a < sizeof (void*) ? sizeof (void*) : (std::size_t) a;
-   #if defined(_WIN32)
-    void* p = _aligned_malloc (s ? s : 1, al);
-   #else
-    void* p = nullptr; if (::posix_memalign (&p, al, s ? s : 1) != 0) p = nullptr;
-   #endif
-   #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-    if (p == nullptr) throw std::bad_alloc();
-   #else
-    if (p == nullptr) std::abort();   // the wasm-audio tier compiles -fno-exceptions, where `throw` is a PARSE error
-   #endif
-    return p;
-}
-static inline void countedAlignedFree (void* p) noexcept
-{
-   #if defined(_WIN32)
-    _aligned_free (p);
-   #else
-    std::free (p);
-   #endif
-}
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void  operator delete   (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
 
 using namespace felitronics;
 using MCN = convolution::MatrixConvolverNupc<>;
@@ -332,19 +293,19 @@ int main()
         const float* in[1] { x.data() }; float* out[1] { y.data() };
         felitronics::test::run (mc.process (in, out, 1, 2048));
         mc.setIr (h2.data(), L);                                     // stage a swap → next process crossfades
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (mc.process (in, out, 1, 2048));                              // inside the crossfade (blends both slots)
         felitronics::test::run (mc.process (in, out, 1, 2048));
-        test::okNoAlloc (g_allocs.load() == before, "mono process() zero heap allocations across a crossfade");
+        test::okNoAlloc (alloc::count.load() == before, "mono process() zero heap allocations across a crossfade");
 
         std::vector<float> f0 ((std::size_t) L, 0.001f), f1 ((std::size_t) L, 0.0005f), f2 ((std::size_t) L, 0.0005f), f3 ((std::size_t) L, -0.001f);
         MCN mf; mf.prepare (128, maxIr, 128, 2);
         { const float* bk[4] { f0.data(), f1.data(), f2.data(), f3.data() }; mf.setOperator (MCN::Topology::Full, bk, 4, L); }
         std::vector<float> xl (2048, 0.2f), xr (2048, -0.1f); const float* sin[2] { xl.data(), xr.data() }; float* sout[2] { xl.data(), xr.data() };
         felitronics::test::run (mf.process (sin, sout, 2, 2048));
-        const long before2 = g_allocs.load();
+        const long long before2 = alloc::count.load();
         felitronics::test::run (mf.process (sin, sout, 2, 2048));
-        test::okNoAlloc (g_allocs.load() == before2, "stereo Full process() zero heap allocations");
+        test::okNoAlloc (alloc::count.load() == before2, "stereo Full process() zero heap allocations");
     }
 
     // --- API surface + prepare guards ---

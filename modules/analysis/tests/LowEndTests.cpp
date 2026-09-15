@@ -74,9 +74,9 @@
 // green. Every one of them is killed by an oracle computed outside the object, and by nothing else.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/LowEnd.h>
 
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <complex>
@@ -86,11 +86,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s); }
-void  operator delete (void* p) noexcept { std::free (p); }
-void  operator delete (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using analysis::LowEnd;
@@ -1680,7 +1675,7 @@ int main()
         (void) pl;
         bool allAccepted = true;
         std::int64_t fed = 0;
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (std::size_t at = 0; at < n; at += 997)
         {
             const float* q[2] = { x.l.data() + at, x.r.data() + at };
@@ -1689,7 +1684,7 @@ int main()
             fed += take;
         }
         allAccepted = le.finish() && allAccepted;
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         // asserted AFTER the counter is read, so the assertion cannot allocate inside the measured region
         ok (allAccepted, "every call was ACCEPTED — without this a stage that had silently stopped"
             " processing would allocate nothing and pass this group");

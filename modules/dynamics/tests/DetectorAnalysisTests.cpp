@@ -17,13 +17,13 @@
 // from the one the solver used to find it.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/dynamics/offline/ThresholdSolver.h>
 #include <felitronics/core/Math.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -31,15 +31,6 @@
 #include <random>
 #include <type_traits>
 #include <vector>
-
-// global allocation counter (no-alloc-in-the-search proof)
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using namespace felitronics::dynamics;
@@ -1046,9 +1037,9 @@ static void aSearchIsAnIterationAndStateMustNotSurviveIt()
     {
         ThresholdSolver s; (void) s.prepare (kFs, n);
         (void) s.solve (key, 1, n, B, T);                        // warm any lazy state
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         (void) s.solve (key, 1, n, B, T);
-        test::okNoAlloc (g_allocs.load() == before, "solve() allocates nothing after prepare()");
+        test::okNoAlloc (alloc::count.load() == before, "solve() allocates nothing after prepare()");
     }
 }
 

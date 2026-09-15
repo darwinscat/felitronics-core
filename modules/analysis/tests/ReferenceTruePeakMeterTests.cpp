@@ -10,10 +10,10 @@
 // felitronics_truepeak_instrument_gap_tests' question; law 11 is felitronics_call_contract_tests'.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -21,34 +21,6 @@
 #include <limits>
 #include <string>
 #include <vector>
-
-// The byte counter counts what the CONTAINER asked for, which is the quantity a budget states. MSVC's STL on x86/x64
-// asks operator new for sizeof(void*) + 31 more on a block of 4096 bytes or more (its hand alignment, <xmemory>) —
-// the reference meter's scratch is such a block — so the counter takes that back off, exactly as
-// LoudnessConformanceTests.cpp does and for the reason written there; the first law-11d check proves the correction
-// is this STL's. Release only: iterator debugging adds proxies no counter can tell from storage.
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static constexpr std::size_t kStlBigBlock = 4096;
-static std::atomic<long>        g_allocs { 0 };
-static std::atomic<std::size_t> g_bytes  { 0 };
-static std::size_t containerBytes (std::size_t s) noexcept
-{
-    return kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s;
-}
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using RTP = analysis::ReferenceTruePeakMeter;
@@ -257,31 +229,31 @@ int main()
 
     test::group ("law 11d: prepare() asks the heap for exactly storageFor(); process() and drain() ask for nothing");
     {
-        const std::size_t before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         {
             std::vector<float> v;
             v.assign (4096, 0.0f);                        // 16 384 B: a padded block on MSVC's STL
             volatile float* sink = v.data();              // observed, so the allocation cannot be elided
             sink[0] = 1.0f;
         }
-        const std::size_t counted = g_bytes.load() - before;
+        const long long counted = alloc::bytes.load() - before;
         test::ok (counted == 4096u * sizeof (float), "the byte counter counts a big vector as its container asked (" + std::to_string (counted) + ")");
     }
     for (int nch : { 1, 2, 6, core::kMaxChannels })
     {
         const auto x = programme (nch, 5000, 11u);
-        const std::size_t b0 = g_bytes.load();
+        const long long b0 = alloc::bytes.load();
         RTP m;
         test::run (m.prepare (96000.0, 5000, nch));
-        const std::size_t asked = g_bytes.load() - b0;
+        const long long asked = alloc::bytes.load() - b0;
         test::ok (asked == RTP::storageFor (96000.0, 5000, nch).bytes(),
                   std::to_string (nch) + " ch: " + std::to_string (asked) + " bytes allocated, budget " + std::to_string (RTP::storageFor (96000.0, 5000, nch).bytes()));
-        const long a0 = g_allocs.load();
+        const long long a0 = alloc::count.load();
         const float* p[core::kMaxChannels] {};
         for (int c = 0; c < nch; ++c) p[c] = x[(std::size_t) c].data();
         const bool accepted = m.process (p, nch, 5000);
         m.drain();
-        const long allocated = g_allocs.load() - a0;
+        const long long allocated = alloc::count.load() - a0;
         test::run (accepted);
         test::okNoAlloc (allocated == 0, std::to_string (nch) + " ch: process() and drain() allocate nothing");
     }

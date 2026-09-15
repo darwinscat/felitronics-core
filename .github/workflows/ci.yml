@@ -262,6 +262,16 @@ jobs:
         run: |
           node tools/lint/check-det-math.mjs --self-test
           node tools/lint/check-det-math.mjs
+      - name: One allocation counter — P52, enforced
+        # The copies are gone (61 hand-rolled counters, of which 50 replaced only the two default-aligned
+        # forms and so could not see a single over-aligned allocation); this keeps them gone. It is the
+        # SOURCE half of the gate: the runtime half lives in test_support/alloc_counter.h, probes both
+        # shapes before main() and aborts the run — but a probe can only speak for a counter that was
+        # included, and this is what notices a file that hand-rolls one again instead. Lexed, not grepped:
+        # the words "operator new" are ordinary prose in this tree.
+        run: |
+          node tools/lint/check-alloc-counter.mjs --self-test
+          node tools/lint/check-alloc-counter.mjs
       - name: The gates still gate — negative controls
         # A gate nobody tries to break is a gate nobody knows still works. Both of these are cheap and both
         # would have caught a real rot: the --wrap gate depends on libc++ keeping std::thread's constructor
@@ -356,6 +366,40 @@ jobs:
           node tools/lint/check-det-math.mjs > /dev/null \
             || { echo "CONTROL FAILED: the tree did not come back clean, so controls 5-12 proved nothing"; exit 1; }
           echo "controls 5-12 ok: the libm audit fires on every rule and the tree is clean again"
+          # Control 5: the allocation counter, BOTH halves. First the lint's reach — its --self-test above
+          # proves the matcher, this proves the scan actually lands on a test file and fails the step.
+          printf 'void* operator new (unsigned long s);\n' > modules/core/tests/_lint_control.cpp
+          if node tools/lint/check-alloc-counter.mjs > /dev/null 2>&1; then
+            rm -f modules/core/tests/_lint_control.cpp
+            echo "CONTROL FAILED: a private operator new did not fail the lint"; exit 1
+          fi
+          node tools/lint/check-alloc-counter.mjs 2>&1 | grep -q "_lint_control.cpp:1" \
+            || { rm -f modules/core/tests/_lint_control.cpp; echo "CONTROL FAILED: wrong line reported"; exit 1; }
+          rm -f modules/core/tests/_lint_control.cpp
+          node tools/lint/check-alloc-counter.mjs > /dev/null
+          echo "control 5a ok: the alloc-counter lint fires on code, ignores prose, and the tree is clean again"
+          # ...and then the RUNTIME half, which is the one that actually decides whether "no heap allocation"
+          # means anything. Take the shared counter, delete its two over-aligned `operator new` lines — the
+          # exact state fifty suites were in — and require the binary to REFUSE to run. Compiled standalone
+          # with the system compiler, so it costs a second and needs no cmake.
+          mkdir -p /tmp/ac
+          # A DELTA, not `count > 0`: the startup probe already spends eight allocations, so an absolute
+          # comparison here would hold even with the vector deleted — a vacuous assertion inside the control
+          # that exists to catch vacuous assertions. (Found in the crew round.)
+          printf '#include <felitronics_test.h>\n#include <alloc_counter.h>\n#include <vector>\nint main(){ const long long b = alloc::count.load(); { std::vector<int> v(4,1); volatile int s = v[0]; (void) s; } felitronics::test::ok (alloc::count.load() > b, "the vector allocation is counted"); return felitronics::test::report(); }\n' > /tmp/ac/probe.cpp
+          c++ -std=c++20 -O2 -I test_support /tmp/ac/probe.cpp -o /tmp/ac/probe
+          /tmp/ac/probe > /dev/null || { echo "CONTROL FAILED: the intact counter does not pass its own probe"; exit 1; }
+          sed -E '/^void\* operator new .*std::align_val_t a\) +\{ return felitronics/d; /^void\* operator new\[\].*std::align_val_t a\) +\{ return felitronics/d' \
+            test_support/alloc_counter.h > /tmp/ac/alloc_counter.h
+          cmp -s test_support/alloc_counter.h /tmp/ac/alloc_counter.h \
+            && { echo "CONTROL FAILED: the mutation removed nothing — the counter no longer has the lines it names"; exit 1; }
+          c++ -std=c++20 -O2 -I /tmp/ac -I test_support /tmp/ac/probe.cpp -o /tmp/ac/probe_blind
+          if /tmp/ac/probe_blind > /tmp/ac/out.txt 2>&1; then
+            echo "CONTROL FAILED: a counter blind to the over-aligned form still ran to a clean exit"; cat /tmp/ac/out.txt; exit 1
+          fi
+          grep -q "UNCOUNTED: operator new(size_t, align_val_t)" /tmp/ac/out.txt \
+            || { echo "CONTROL FAILED: it failed for the wrong reason"; cat /tmp/ac/out.txt; exit 1; }
+          echo "control 5b ok: a counter missing the over-aligned form refuses to run at all"
       - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
         # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
         # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns

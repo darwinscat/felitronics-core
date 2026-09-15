@@ -7,6 +7,7 @@
 // (silence stays silent, no NaN). JUCE-free.
 
 #include <felitronics_test.h>   // felitronics::test::run — law 11 verdicts
+#include <alloc_counter.h>      // installs the allocation counter — EVERY form of new, over-aligned included
 #include "TestUtil.h"
 
 #include <teq/EqBand.h>
@@ -23,16 +24,6 @@
 #include <limits>
 #include <string>
 #include <vector>
-
-// RT-safety: count every heap allocation so the audio path can be asserted alloc-free (as in the
-// other module suites). Only ONE TU in this executable may replace global operator new.
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace teq;
 
@@ -525,7 +516,7 @@ void runEqEngineTests()
             R[(size_t) i] = (float) (0.08 * std::sin (2.0 * kPi * 1100.0 * (b * n + i) / fs)); } };
         for (int b = 0; b < 4; ++b) { fill (b); felitronics::test::run (band.processBlock (ch, 2, n)); }   // warm up (allocs before the snapshot are fine)
 
-        const long before = g_allocs.load (std::memory_order_relaxed);
+        const long long before = alloc::count.load (std::memory_order_relaxed);
         for (int b = 0; b < 300; ++b)
         {
             p.lane (Lane::Stereo).freq = 700.0 + 0.7 * b;                                      // keep the freq smoother moving -> designBand()/notchCascade run every block
@@ -533,8 +524,8 @@ void runEqEngineTests()
             fill (b);
             felitronics::test::run (band.processBlock (ch, 2, n));
         }
-        const long after = g_allocs.load (std::memory_order_relaxed);
-        std::printf ("      heap allocations during 300 moving 8-section blocks: %ld\n", after - before);
+        const long long after = alloc::count.load (std::memory_order_relaxed);
+        std::printf ("      heap allocations during 300 moving 8-section blocks: %lld\n", after - before);
         expectTrue (after == before, "moving high-order notch: no heap allocation in the audio path");
         expectTrue (! anyNaN (L.data(), n) && ! anyNaN (R.data(), n), "finite output");
     }
@@ -1254,7 +1245,7 @@ void runEqEngineTests()
             R[(size_t) i] = (float) (0.08 * std::sin (2.0 * kPi * 1100.0 * (b * nn + i) / fs)); } };
         for (int b = 0; b < 4; ++b) { fill (b); felitronics::test::run (band.processBlock (c, 2, nn)); }   // warm up (allocs before the snapshot are fine)
 
-        const long before = g_allocs.load (std::memory_order_relaxed);
+        const long long before = alloc::count.load (std::memory_order_relaxed);
         for (int b = 0; b < 300; ++b)
         {
             for (const Lane l : { Lane::Stereo, Lane::Left, Lane::Right, Lane::Mid, Lane::Side })
@@ -1263,8 +1254,8 @@ void runEqEngineTests()
             fill (b);
             felitronics::test::run (band.processBlock (c, 2, nn));
         }
-        const long after = g_allocs.load (std::memory_order_relaxed);
-        std::printf ("      heap allocations during 300 moving all-five-lane blocks: %ld\n", after - before);
+        const long long after = alloc::count.load (std::memory_order_relaxed);
+        std::printf ("      heap allocations during 300 moving all-five-lane blocks: %lld\n", after - before);
         expectTrue (after == before, "moving 5-lane band: no heap allocation in the audio path");
         expectTrue (! anyNaN (L.data(), nn) && ! anyNaN (R.data(), nn), "finite output");
     }

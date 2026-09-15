@@ -31,7 +31,7 @@ of the flags; it is true now, but only because of one extra link flag and with t
 | a **thread** on a live code path | `--wrap=pthread_create` → `undefined symbol: __wrap_pthread_create` | **build** (link) |
 | a thread in code never emitted | — | not caught |
 | a `std::mutex` | a lint over module headers, not the artifact | build (textual) |
-| an allocation on an **allocation-counted** path | the counter in `test_support/felitronics_test.h` | **run** |
+| an allocation on an **allocation-counted** path | the counter in `test_support/alloc_counter.h`, asserted through `okNoAlloc()` in `felitronics_test.h` | **run** |
 | a denormal stall (law 8) | **not at all** | — |
 
 **The thread claim was false until one link flag made it true, and that is worth spelling out.** Measured on
@@ -58,9 +58,10 @@ Two honest limits:
   `<thread>`, `<mutex>`, `<condition_variable>`, `<future>` and friends. That is a lint over text, not proof
   from the artifact, and it is labelled as such.
 
-**The allocation gate is a genuine gain, but read the row carefully.** `felitronics_test.h` enforces its
-allocation count only `#if defined(_LIBCPP_VERSION)` — on libstdc++ it degrades to informational, because a
-global counter cannot separate our allocations from the standard library's there. Emscripten is libc++, so
+**The allocation gate is a genuine gain, but read the row carefully.** The count comes from
+`alloc_counter.h` (every form of `new`, over-aligned included, since P52) and `felitronics_test.h` enforces
+it only `#if defined(_LIBCPP_VERSION)` — on libstdc++ it degrades to informational, because a global counter
+cannot separate our allocations from the standard library's there. Emscripten is libc++, so
 on this tier the no-alloc rule is **enforced**, where the `ubuntu-latest` rows only record it. What it is
 NOT is a blanket "no allocation in any `process()`": it fires only where a suite installs the counter and
 asserts on it. `LaneDynamics::processBand`, for one, has no such assertion — an allocation added there stays
@@ -110,8 +111,10 @@ Everything below was invisible on desktop and surfaced from one act: compiling t
 
 1. **Seven more `throw`s than the record claimed.** The core's only `throw` was known
    (`core/Fft.h`, fixed separately). The tier also compiles the *tests*, and the counted aligned
-   `operator new` in six convolution RT-safety suites plus the pffft null suite each throw `std::bad_alloc`.
-   Same guard, same reason.
+   `operator new` in six convolution RT-safety suites plus the pffft null suite each threw `std::bad_alloc`.
+   Same guard, same reason. (Those seven copies are gone since P52: the counter is one header,
+   `test_support/alloc_counter.h`, and its allocation-failure branch carries the same guard — a throw where
+   exceptions exist, the abort itself where they do not, which on this tier is the honest answer anyway.)
 
 2. **The `-fno-exceptions` failure is INSTANTIATION-dependent** — the earlier write-up said the opposite.
    Measured: `#include <felitronics/core/Fft.h>` alone under `-fno-exceptions` is **clean**; naming
