@@ -896,7 +896,7 @@ private:
     BandBurstsHopObserver observer_ = nullptr;
     void* observerUser_ = nullptr;
 
-    eq::Crossover2   xLow_, xHigh_;
+    eq::DeterministicCrossover2 xLow_, xHigh_;   // deterministic coefficients (see core::DetMath)
     core::StateGrid  grid_;
 
     double sampleRate_   = 48000.0;

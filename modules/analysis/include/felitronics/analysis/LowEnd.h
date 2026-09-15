@@ -1023,7 +1023,7 @@ private:
     std::int64_t blockSamples_ = 0;
 
     SpectrumFrames frames_;
-    eq::Crossover2 xover_;
+    eq::DeterministicCrossover2 xover_;   // deterministic coefficients (see core::DetMath)
     core::StateGrid grid_;
 
     // the clock, and the open block

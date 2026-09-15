@@ -327,4 +327,64 @@ inline double tan (double x) noexcept
     return (q & 1) ? -(c / s) : (s / c);
 }
 
+
+// x^y for x > 0, formed as exp2(y * log2 x) with the product taken exactly (the same Dekker split as
+// pow10 uses, and for the same reason). Only two call sites need a general power — the K-weighting
+// shelf constants — and both have constant operands, so this is a design-time function, never a hot one.
+inline double pow (double x, double y) noexcept
+{
+    if (std::isnan (x) || std::isnan (y)) return std::numeric_limits<double>::quiet_NaN();
+    if (y == 0.0) return 1.0;
+    if (x <= 0.0) return std::numeric_limits<double>::quiet_NaN();   // negative bases are not needed here
+    const double l = log2 (x);
+    double yh, yl, lh, ll;
+    detail::split (y, yh, yl);
+    detail::split (l, lh, ll);
+    const double hi = mul (yh, lh);
+    const double lo = mulAdd (yh, ll, mulAdd (yl, lh, mul (yl, ll)));
+    const double t  = hi + lo;
+    const double e  = (hi - t) + lo;
+    const double corr = mulAdd (mul (e, detail::kLn2), mulAdd (e, mul (0.5, detail::kLn2), 1.0), 1.0);
+    return mul (exp2 (t), corr);
+}
+
 } // namespace felitronics::core::det
+
+
+namespace felitronics::core
+{
+
+//==============================================================================
+// THE TWO COEFFICIENT-MATH POLICIES, and why they are a TYPE and not a flag.
+//
+// A filter's coefficients decide its bits; its bits decide a product's sound. eq::Svf is TabbyEQ's and
+// OrbitCab's core, so its numbers must not move — while the offline analyzers that borrow the same
+// filter need coefficients that are the same on every row. Both are true at once, so the choice travels
+// with the TYPE: eq::Svf is and stays BasicSvf<core::SystemMath>, and an analyzer spells
+// BasicSvf<core::DetMath> where it wants reproducibility.
+//
+// There is deliberately NO default on the offline side and no runtime switch: a compile-time flag would
+// reroute every consumer in a build at once (and fcore_measure links both regimes into ONE binary — its
+// `lufs` mode is the system meter and its `report` mode is the deterministic one), while a
+// setParamsDet() would be a second copy of the coefficient formula, which is the drift these policies
+// exist to prevent. static_assert in the suites pins both directions, so changing an alias is a
+// deliberate act that must also edit a test.
+struct SystemMath
+{
+    static double tan  (double x) noexcept { return std::tan (x); }
+    static double sqrt (double x) noexcept { return std::sqrt (x); }
+    static double pow10 (double x) noexcept { return std::pow (10.0, x); }
+    static double log10 (double x) noexcept { return std::log10 (x); }
+    static double pow  (double x, double y) noexcept { return std::pow (x, y); }
+};
+
+struct DetMath
+{
+    static double tan  (double x) noexcept { return det::tan (x); }
+    static double sqrt (double x) noexcept { return std::sqrt (x); }   // IEEE-exact: no det version needed
+    static double pow10 (double x) noexcept { return det::pow10 (x); }
+    static double log10 (double x) noexcept { return det::log10 (x); }
+    static double pow  (double x, double y) noexcept { return det::pow (x, y); }
+};
+
+} // namespace felitronics::core

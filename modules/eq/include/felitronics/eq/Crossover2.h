@@ -18,7 +18,8 @@ namespace felitronics::eq
 // Note (used by MultibandSplitter): that allpass is only 2nd-order — LP4+HP4 = (s⁴+1)/(s²+√2s+1)² =
 // (s²−√2s+1)/(s²+√2s+1) — so band-compensation needs a single `Svf` in AllPass mode at the same fc/Q, not
 // a second Crossover2.
-class Crossover2
+template <class Math = core::SystemMath>
+class BasicCrossover2
 {
 public:
     void prepare (double sampleRate, int numChannels) noexcept
@@ -64,7 +65,11 @@ public:
 private:
     static constexpr double kQ = 0.7071067811865476;   // 1/√2 Butterworth → cascade = 4th-order Linkwitz-Riley
     float freq_ = 1000.0f;
-    Svf lp1_, lp2_, hp1_, hp2_;
+    BasicSvf<Math> lp1_, lp2_, hp1_, hp2_;
 };
+
+
+using Crossover2 = BasicCrossover2<core::SystemMath>;
+using DeterministicCrossover2 = BasicCrossover2<core::DetMath>;
 
 } // namespace felitronics::eq

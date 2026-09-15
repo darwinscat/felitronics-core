@@ -29,3 +29,17 @@
   `prepare()`, log2(N) twiddle seeds per transform, a handful of thresholds per `setParams`, one `log10`
   per reported value. Measured cost is +0.5 ms on one order-17 window against a 20-30 ms analyzer run.
   The RT modules (`eq::Svf`, `analysis::KWeightingFilter`) are untouched by this entry.
+
+- **The coefficient math of a filter is now a TYPE, not a flag.** `eq::Svf`, `eq::Crossover2`,
+  `analysis::KWeightingFilter` and `analysis::LoudnessMeter` are templates on a math policy, with the
+  shipped names bound to `core::SystemMath` exactly as before — TabbyEQ's and OrbitCab's coefficients do
+  not move — and `eq::DeterministicSvf` and friends bound to `core::DetMath` for the offline analyzers,
+  which is what they now own. `static_assert` pins both directions, so changing an alias is a deliberate
+  act that must also edit a test.
+
+  Measured and stated rather than assumed: the two policies give a different `tan` at 7709 of 119880
+  filter arguments, and in **zero** of them does that difference reach the filter's float output over
+  8192 samples — `Svf` carries its state in float and a one-ulp difference in a double coefficient does
+  not survive the rounding. So this routing is DEFENSIVE; the cross-row divergence P79 actually removed
+  travelled the double paths (window, `log10`, `pow10`, `log2`). The suite asserts the zero, so the day a
+  change makes that path reachable it is a finding rather than a silent regression.

@@ -455,7 +455,7 @@ public:
         std::size_t   tailPendingEnergies = 0; // doubles — …and their energies, which are not always zero
         std::size_t   scratchFloats    = 0;    // maxBlock · channels — the constant-width feed
         std::size_t   shortTermEntries = 0;    // doubles: one short-term observation a second
-        LoudnessMeter::Storage          loudness {};
+        DeterministicLoudnessMeter::Storage          loudness {};
         ReferenceTruePeakMeter::Storage truePeak {};
 
         // 64 bits because the product is the point: on wasm32 a size_t byte count wraps long before the
@@ -488,7 +488,7 @@ public:
         const std::int64_t sub = std::max<std::int64_t> (1, (std::int64_t) std::lround (0.01 * sampleRate));
 
         const double maxSamples = p.maxDurationSec * sampleRate;
-        if (! LoudnessMeter::storageFor (sampleRate, maxSamples, st.loudness)) return st;
+        if (! DeterministicLoudnessMeter::storageFor (sampleRate, maxSamples, st.loudness)) return st;
         st.truePeak = ReferenceTruePeakMeter::storageFor (sampleRate, maxBlock, maxChannels);
         if (! st.truePeak.ok) return st;
 
@@ -1359,10 +1359,10 @@ private:
     std::int64_t nonFiniteInput_ = 0, nonFiniteIntermediate_ = 0, kwOverflow_ = 0;
 
     StereoSums             sums_ {};
-    KWeightingFilter       kw_ {};
-    eq::Crossover2         lr4_ {};
+    DeterministicKWeightingFilter kw_ {};   // deterministic coefficients
+    eq::DeterministicCrossover2 lr4_ {};   // deterministic COEFFICIENTS: this report is compared across rows
     core::StateGrid        grid_ {};
-    LoudnessMeter          lm_ {};
+    DeterministicLoudnessMeter          lm_ {};
     ReferenceTruePeakMeter tp_ {};
 
     ProgrammeTraceEvent* trace_      = nullptr;

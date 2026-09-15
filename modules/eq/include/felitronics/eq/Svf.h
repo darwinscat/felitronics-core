@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/FlushToZero.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/eq/EqTypes.h>
 
 #include <cmath>
@@ -18,7 +19,8 @@ namespace felitronics::eq
 // per-channel integrator state. Coefficients are BLT-prewarped (tan), so it's accurate at the
 // cutoff but — unlike the matched biquad — not Nyquist-perfect; that's the right trade for a
 // transient swept band, while static treatment bands use the matched design.
-class Svf
+template <class Math = core::SystemMath>
+class BasicSvf
 {
 public:
     static constexpr int kMaxChannels = felitronics::core::kMaxChannels;   // single source of truth: teq/EqTypes.h
@@ -56,19 +58,19 @@ public:
         if (gainDb >  60.0) gainDb =  60.0;
         if (gainDb < -60.0) gainDb = -60.0;
 
-        const double A = std::pow (10.0, gainDb / 40.0);
+        const double A = Math::pow10 (gainDb / 40.0);
         double f = freq;
         if (f < 1.0) f = 1.0;
         if (f > 0.49 * fs) f = 0.49 * fs;
-        double g = std::tan (kPi * f / fs);
+        double g = Math::tan (kPi * f / fs);
         double k = 1.0 / Q;
         constexpr double kButterworth = 1.4142135623730951;      // sqrt(2): 2-pole Butterworth damping (shelves ignore Q)
 
         switch (type)
         {
             case FilterType::Bell:      k = 1.0 / (Q * A);                    m0 = 1.0;   m1 = k * (A * A - 1.0); m2 = 0.0;           break;
-            case FilterType::LowShelf:  k = kButterworth; g /= std::sqrt (A); m0 = 1.0;   m1 = k * (A - 1.0);     m2 = (A * A - 1.0); break;
-            case FilterType::HighShelf: k = kButterworth; g *= std::sqrt (A); m0 = A * A; m1 = k * (1.0 - A) * A; m2 = (1.0 - A * A); break;
+            case FilterType::LowShelf:  k = kButterworth; g /= Math::sqrt (A); m0 = 1.0;   m1 = k * (A - 1.0);     m2 = (A * A - 1.0); break;
+            case FilterType::HighShelf: k = kButterworth; g *= Math::sqrt (A); m0 = A * A; m1 = k * (1.0 - A) * A; m2 = (1.0 - A * A); break;
             case FilterType::LowPass:                                         m0 = 0.0;   m1 = 0.0;               m2 = 1.0;           break;
             case FilterType::HighPass:                                        m0 = 1.0;   m1 = -k;                m2 = -1.0;          break;
             case FilterType::BandPass:                                        m0 = 0.0;   m1 = k;                 m2 = 0.0;           break;  // unity gain at centre
@@ -184,5 +186,12 @@ private:
     double m0 = 1.0, m1 = 0.0, m2 = 0.0;
     float  ic1[kMaxChannels] {}, ic2[kMaxChannels] {};
 };
+
+
+// The name every RT consumer already uses, bound to the system math it has always had: TabbyEQ's and
+// OrbitCab's coefficients do not move. An offline analyzer that needs the same filter to answer the same
+// on every row spells BasicSvf<core::DetMath> instead — and a static_assert in the suite pins both.
+using Svf = BasicSvf<core::SystemMath>;
+using DeterministicSvf = BasicSvf<core::DetMath>;
 
 } // namespace felitronics::eq
