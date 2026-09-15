@@ -172,19 +172,19 @@ namespace felitronics::analysis
 
 enum class ForensicsReason : std::uint8_t
 {
-    Ok = 0,
-    NotFinished,            // read before finish() — the edge analysis runs once, there
-    NoChannel,             // asked about a channel outside the prepared width
-    ShorterThanWindow,     // the programme is shorter than one FFT window: there is no spectral frame at all
-    AllFramesHoled,        // frames existed, but every one of them contained a hole
-    NoSpectralEnergy,      // the usable frames carry no power anywhere (digital silence is FINITE, not a hole)
-    InsufficientSpan,      // the spectrum is too narrow to hold one plateau span plus a candidate
-    NoDownwardEvidence,    // no boundary has more power below it than anywhere above: a flat spectrum has no edge
-    ShallowerThanMinDrop,  // the best descent in the search band does not reach minDropDb — there is no edge here
-    NoNonZeroSample,       // every finite sample was exactly zero, so no sample witnesses a grid
-    FinerThan24BitGrid,    // the grid is finer than 2^-23: no <= 24-bit PCM word holds the stream
-    OutsidePcmRange,       // a sample outside [-1, +1) fits no normalised PCM word at any depth
-    NoEmptyBand,           // nothing above any boundary stays emptyDb below the loudest cell for long enough
+    Ok                   = 0,
+    NotFinished          = 1,  // read before finish() — the edge analysis runs once, there
+    NoChannel            = 2,  // asked about a channel outside the prepared width
+    ShorterThanWindow    = 3,  // the programme is shorter than one FFT window: there is no spectral frame at all
+    AllFramesHoled       = 4,  // frames existed, but every one of them contained a hole
+    NoSpectralEnergy     = 5,  // the usable frames carry no power anywhere (digital silence is FINITE, not a hole)
+    InsufficientSpan     = 6,  // the spectrum is too narrow to hold one plateau span plus a candidate
+    NoDownwardEvidence   = 7,  // no boundary has more power below it than anywhere above: a flat spectrum has no edge
+    ShallowerThanMinDrop = 8,  // the best descent in the search band does not reach minDropDb — there is no edge here
+    NoNonZeroSample      = 9,  // every finite sample was exactly zero, so no sample witnesses a grid
+    FinerThan24BitGrid   = 10,  // the grid is finer than 2^-23: no <= 24-bit PCM word holds the stream
+    OutsidePcmRange      = 11,  // a sample outside [-1, +1) fits no normalised PCM word at any depth
+    NoEmptyBand          = 12,  // nothing above any boundary stays emptyDb below the loudest cell for long enough
 };
 
 // The canonical moments inside process() at which the report's state changes in a way a re-slicing could

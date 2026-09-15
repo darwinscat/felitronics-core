@@ -179,13 +179,13 @@ struct LowEndParams
 // reason is what carries the meaning.
 enum class LowEndReason : std::uint8_t
 {
-    Ok = 0,
-    NotFinished,            // finish() has not been called yet
-    NoFiniteSamples,        // not one sample of the L/R pair was usable
-    NoEnergy,              // every relevant energy is exactly zero — digital silence, the 0/0
-    ShorterThanWindow,      // no spectral frame ever closed: the programme is shorter than the window
-    NoUsableFrames,         // frames closed, but every one of them held a hole
-    Overflowed              // an accumulated band quantity left the finite range (see reduceBands)
+    Ok                = 0,
+    NotFinished       = 1,  // finish() has not been called yet
+    NoFiniteSamples   = 2,  // not one sample of the L/R pair was usable
+    NoEnergy          = 3,  // every relevant energy is exactly zero — digital silence, the 0/0
+    ShorterThanWindow = 4,  // no spectral frame ever closed: the programme is shorter than the window
+    NoUsableFrames    = 5,  // frames closed, but every one of them held a hole
+    Overflowed        = 6,  // an accumulated band quantity left the finite range (see reduceBands)
 };
 
 // One 10 ms block of the LOW band. Raw energies; the fraction is derived so nothing is lost to it.

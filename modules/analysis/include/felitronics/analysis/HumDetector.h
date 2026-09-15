@@ -243,17 +243,17 @@ enum class HumMains : std::uint8_t { None = 0, Hz50 = 1, Hz60 = 2 };
 
 enum class HumReason : std::uint8_t
 {
-    Ok = 0,
-    NotPrepared,                // prepare() has not been accepted
-    NotFinished,                // read before finish(); the report is not final
-    InsufficientResolution,     // bin > kMaxBinHz: 49.0 and 50.0 Hz cannot be separated at this window
-    ShorterThanWindow,          // the programme is shorter than one window, so there is no frame at all
-    AllFramesHoled,             // every frame carried a non-finite sample or an absent channel
-    NoQuietStretch,             // no frame was quiet — NOT "no hum"
-    SingleQuietStretch,         // exactly one: "stands still between stretches" is untestable by construction
-    StretchesTooShort,          // < 2 stretches hold minFramesPerObservation frames: see the header
-    CandidateNotStationary,     // a mains-compatible line WAS measured and did not stand still — not "clean"
-    CombWithoutBase             // >= 2 consistent harmonics of 50 or 60 Hz, none of them h = 1 or h = 2
+    Ok                     = 0,
+    NotPrepared            = 1,  // prepare() has not been accepted
+    NotFinished            = 2,  // read before finish(); the report is not final
+    InsufficientResolution = 3,  // bin > kMaxBinHz: 49.0 and 50.0 Hz cannot be separated at this window
+    ShorterThanWindow      = 4,  // the programme is shorter than one window, so there is no frame at all
+    AllFramesHoled         = 5,  // every frame carried a non-finite sample or an absent channel
+    NoQuietStretch         = 6,  // no frame was quiet — NOT "no hum"
+    SingleQuietStretch     = 7,  // exactly one: "stands still between stretches" is untestable by construction
+    StretchesTooShort      = 8,  // < 2 stretches hold minFramesPerObservation frames: see the header
+    CandidateNotStationary = 9,  // a mains-compatible line WAS measured and did not stand still — not "clean"
+    CombWithoutBase        = 10,  // >= 2 consistent harmonics of 50 or 60 Hz, none of them h = 1 or h = 2
 };
 
 // One measured spectral line. Evidence, never a verdict.

@@ -206,18 +206,18 @@ struct ProgrammeReportParams
 // Why a field could not be measured. Never "what is wrong with the programme".
 enum class ProgrammeReason : std::uint8_t
 {
-    None = 0,                      // the field is valid
-    MonoProgramme,                 // fewer than two prepared channels: no stereo relation exists
-    NoStereoFrames,                // prepared for stereo, but no frame carried both channels finite
-    SilentProgramme,               // the quantity needs signal and the programme has none
-    NoFiniteSamples,               // every sample of the region was a hole or absent
-    ShorterThanTailWindow,         // the programme span is shorter than tailWindowMs
-    ShorterThanLoudnessWindow,     // shorter than the window the measure is defined over
-    TooFewObservations,            // fewer than two short-term observations survived the gates
-    LoudnessCapacityExceeded,      // a store sized by maxDurationSec overflowed; the answer would be partial
-    NonFiniteInput,                // a non-finite INPUT sample reached a filter that carries it forward
-    NonFiniteIntermediate,         // a finite input overflowed a filter or an accumulator
-    ZeroDenominator                // the ratio's denominator is zero
+    None                      = 0,  // the field is valid
+    MonoProgramme             = 1,  // fewer than two prepared channels: no stereo relation exists
+    NoStereoFrames            = 2,  // prepared for stereo, but no frame carried both channels finite
+    SilentProgramme           = 3,  // the quantity needs signal and the programme has none
+    NoFiniteSamples           = 4,  // every sample of the region was a hole or absent
+    ShorterThanTailWindow     = 5,  // the programme span is shorter than tailWindowMs
+    ShorterThanLoudnessWindow = 6,  // shorter than the window the measure is defined over
+    TooFewObservations        = 7,  // fewer than two short-term observations survived the gates
+    LoudnessCapacityExceeded  = 8,  // a store sized by maxDurationSec overflowed; the answer would be partial
+    NonFiniteInput            = 9,  // a non-finite INPUT sample reached a filter that carries it forward
+    NonFiniteIntermediate     = 10,  // a finite input overflowed a filter or an accumulator
+    ZeroDenominator           = 11,  // the ratio's denominator is zero
 };
 
 // A measured scalar. `value` is a canonical +0.0 whenever `valid` is false — never a NaN.
