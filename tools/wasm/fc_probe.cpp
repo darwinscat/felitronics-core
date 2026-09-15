@@ -1029,7 +1029,11 @@ FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, st
                                    double sampleRate)
 {
     haveLowEnd = false;
-    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
+    // planarSpan, NOT planarSpanOrEmpty: `fcore_measure lowend` REFUSES an empty programme where the
+    // other four report on one, and the two roads have to refuse the same set or the diff is comparing
+    // different contracts. (That native refusal is LowEnd's own: an empty programme has no low end to
+    // measure, and it says so by exiting rather than by publishing an invalid report.)
+    if (! planarSpan (planar, frames, channels)) return 0;
     auto& d = lowEnd();
     d.setParams (felitronics::analysis::LowEndParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;

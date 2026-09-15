@@ -231,6 +231,18 @@ int main (int argc, char** argv)
 
     if (mode == "hum")
     {
+        // THE FILE IS SIZED BEFORE IT IS READ, as clips/forensics/lowend already do it. streamPlanar()
+        // floors a trailing partial frame and returns success regardless, so a file holding three floats
+        // and declared stereo was measured to its break and reported as a whole programme — an instrument
+        // certifying audio it never saw, which is the exact failure P71 says it closed. Three of the six
+        // modes had inherited the lax path; this is the third of them.
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
         // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
         // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
         // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
@@ -265,6 +277,12 @@ int main (int argc, char** argv)
         streamPlanar (f, nc, [&] (const float* const* p, int n) { (void) hd.process (p, nc, n); });
         std::fclose (f);
         hd.finish();
+        if ((std::uint64_t) hd.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) hd.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
         std::printf ("# fcore hum v1 sr=%016llx ch=%d order=%d n=%lld hop=%lld bin=%016llx\n",
                      (unsigned long long) bits (fs), nc, hd.geometry().order,
                      (long long) hd.windowSamples(), (long long) hd.hopSamples(),
@@ -435,6 +453,18 @@ int main (int argc, char** argv)
 
     if (mode == "report")
     {
+        // THE FILE IS SIZED BEFORE IT IS READ, as clips/forensics/lowend already do it. streamPlanar()
+        // floors a trailing partial frame and returns success regardless, so a file holding three floats
+        // and declared stereo was measured to its break and reported as a whole programme — an instrument
+        // certifying audio it never saw, which is the exact failure P71 says it closed. Three of the six
+        // modes had inherited the lax path; this is the third of them.
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
         // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
         // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
         // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
@@ -479,6 +509,12 @@ int main (int argc, char** argv)
             return 2;
         }
         pr.finish();
+        if ((std::uint64_t) pr.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) pr.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
         const auto& R = pr.report();
         std::printf ("# fcore report v1 sr=%016llx ch=%d samples=%lld\n",
                      (unsigned long long) bits (fs), nc, (long long) R.totalSamples);
@@ -613,6 +649,18 @@ int main (int argc, char** argv)
 
     if (mode == "bursts")
     {
+        // THE FILE IS SIZED BEFORE IT IS READ, as clips/forensics/lowend already do it. streamPlanar()
+        // floors a trailing partial frame and returns success regardless, so a file holding three floats
+        // and declared stereo was measured to its break and reported as a whole programme — an instrument
+        // certifying audio it never saw, which is the exact failure P71 says it closed. Three of the six
+        // modes had inherited the lax path; this is the third of them.
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
         // STRICT ARGUMENTS, as clips/forensics/lowend already are. The shared parse at the top of main()
         // uses atoi/atof, which read "1.5" as 1 channel and "48000Hz" as 48000 — and then measure, happily,
         // the wrong thing. These three modes are new in this release, so tightening them breaks nothing;
@@ -646,6 +694,12 @@ int main (int argc, char** argv)
         streamPlanar (f, nc, [&] (const float* const* p, int n) { (void) det.process (p, nc, n); });
         std::fclose (f);
         det.finish();
+        if ((std::uint64_t) det.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) det.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
 
         std::printf ("# fcore bursts v1 sr=%016llx ch=%d hop=%d base=%d lo=%016llx hi=%016llx "
                      "enter=%016llx exit=%016llx chunk=%d\n",

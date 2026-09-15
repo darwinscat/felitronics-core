@@ -83,7 +83,9 @@ strict header-hygiene gate (`-Wconversion -Wfloat-equal -Werror`) on both. `fcor
 stereo fixture is bit-identical across those two rows — every count and all 31 scalars.
 
 (When this was written the header added that cross-platform bit-identity was NOT promised, because `log10`
-and `pow` are not bit-portable. P79, later in this same release, removed that caveat: those derivations now
-run through `core::det` and the report is byte-identical across Apple clang/arm64, gcc/glibc x86-64 AND
-wasm32/musl. The sentence is corrected here rather than deleted, because the release note should not read
-as though the property had always held.)
+and `pow` are not bit-portable. P79, later in this same release, narrowed that caveat rather than removing
+it: those derivations run through `core::det` now, and the report is byte-identical across Apple
+clang/arm64, gcc/glibc x86-64 AND wasm32/musl — **for a build that does not contract**, which both shipped
+roads are. Rebuild the tool with the library's default `-ffp-contract=on` and 4 lines move again, because
+the arithmetic AROUND the deterministic calls is still contractible. What `core::det` removed is the share
+no build flag could reach.)
