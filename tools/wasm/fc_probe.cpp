@@ -84,7 +84,8 @@ namespace
         return inHeap (planar, bytes);
     }
 
-    // The five offline analyzers (P77) accept an EMPTY programme and report on it — `fcore_measure report`
+    // FOUR of the five offline analyzers (P77) accept an EMPTY programme and report on it — lowend does
+    // NOT, because `fcore_measure lowend` refuses it too and the two roads must refuse the same set. — `fcore_measure report`
     // on /dev/null prints 2109 bytes of a perfectly good empty report. planarSpan() refuses frames == 0,
     // and rightly so for `clips`, whose emptiness is a FILE that was probably truncated; but here the
     // caller hands over a buffer, and "no audio" is a measurement, not a truncation. Refusing it in the
@@ -476,7 +477,12 @@ FC_EXPORT int fc_probe_report_run (const float* planar, std::uint32_t frames, st
     auto& p = programme();
     if (! p.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
-    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
+    // planar is null EVEN IF the offset is zero, and an empty programme is allowed to arrive with a null
+    // pointer. JavaScript's _malloc(0) happens to return something non-null, so the manifestation is
+    // theoretical from that road — and a direct C ABI caller is not obliged to be as lucky.
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
     if (frames != 0 && ! p.process (view, (int) channels, (int) frames)) return 0;
     p.finish();
     haveReport = true;
@@ -599,7 +605,12 @@ FC_EXPORT int fc_probe_bursts_run (const float* planar, std::uint32_t frames, st
     d.setParams (felitronics::analysis::BandBurstsParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
-    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
+    // planar is null EVEN IF the offset is zero, and an empty programme is allowed to arrive with a null
+    // pointer. JavaScript's _malloc(0) happens to return something non-null, so the manifestation is
+    // theoretical from that road — and a direct C ABI caller is not obliged to be as lucky.
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
     if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     d.finish();
     haveBursts = true;
@@ -750,7 +761,12 @@ FC_EXPORT int fc_probe_hum_run (const float* planar, std::uint32_t frames, std::
     d.setParams (felitronics::analysis::HumDetectorParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
-    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
+    // planar is null EVEN IF the offset is zero, and an empty programme is allowed to arrive with a null
+    // pointer. JavaScript's _malloc(0) happens to return something non-null, so the manifestation is
+    // theoretical from that road — and a direct C ABI caller is not obliged to be as lucky.
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
     if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     d.finish();
     haveHum = true;
@@ -892,7 +908,12 @@ FC_EXPORT int fc_probe_forensics_run (const float* planar, std::uint32_t frames,
     d.setParams (felitronics::analysis::SourceForensicsParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
-    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
+    // planar is null EVEN IF the offset is zero, and an empty programme is allowed to arrive with a null
+    // pointer. JavaScript's _malloc(0) happens to return something non-null, so the manifestation is
+    // theoretical from that road — and a direct C ABI caller is not obliged to be as lucky.
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
     if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     d.finish();
     haveForensics = true;
@@ -1038,7 +1059,12 @@ FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, st
     d.setParams (felitronics::analysis::LowEndParams {});
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
-    for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
+    // planar is null EVEN IF the offset is zero, and an empty programme is allowed to arrive with a null
+    // pointer. JavaScript's _malloc(0) happens to return something non-null, so the manifestation is
+    // theoretical from that road — and a direct C ABI caller is not obliged to be as lucky.
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
     if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     if (! d.finish()) return 0;
     haveLowEnd = true;

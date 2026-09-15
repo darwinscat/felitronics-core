@@ -5,6 +5,489 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.33.0 — 2026-09-15
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### analysis · tools · wasm — the clip detector has a way out
+
+`analysis::ClipDetector` has found sample clipping since v0.28.0 and nothing outside the core could ask it.
+It can now, through the two roads every other measurement of this repo takes, and the detector itself is
+unchanged.
+
+- **`fcore_measure clips <sampleRate> <channels> <raw.f32le> [--max-runs N] [--chunk N]`** prints how many
+  runs were found, whether the list is whole, the sample peak of every channel, and each stored run — start,
+  length, level, channel, polarity, evidence. Levels, peaks and the sample rate go out as **raw IEEE-754 bit
+  patterns**, as `blocks` does, so the comparison can tell a double from its own float32 rounding: a run of
+  eleven samples at 40/64 and one at 39/64 has level 479/768 = `3fe3f55555555555`, whose float32 is
+  `3fe3f55560000000`, and `%.6f` prints 0.623698 for both. Nothing is in dB — `samplePeakDb()` routes through
+  `log10`, and libm is not bit-identical across toolchains.
+- **`fc_probe_clips_run` + eleven getters** (twelve exports) in the wasm ABI, shaped like
+  `fc_probe_shapes_run`: one run, then getters, with the run buffer owned by the caller and its capacity
+  mandatory. Each run is six doubles (`start, length, level, channel, sign, evidence`); positions are below
+  2^30 by the ABI's own span bound and so exact in a binary64. The export list is generated from the source,
+  so the twelve came along by existing. Both copiers take their capacity in **elements**, like the other
+  seven copiers of that ABI, and `fc_probe_clips_runs` answers in **runs** — a caller who passes the element
+  count it would pass to any neighbour gets too few runs, which it can see, rather than a six-fold heap
+  overwrite, which neither `outSpan` nor `SAFE_HEAP` could see.
+- **Roads:** `fcore::ClipProbe` (`tools/fcore_clips.h`), shared by both, exactly as `fcore::Probe` and
+  `fcore::ShapeProbe` are. It shares the **lifecycle**, not merely the report reader, because that is where
+  every trap of this mode lives. It is the one class here that asks for something the detector does not need —
+  the stream's length — because without it an adapter has to believe the `n` it is handed and reads past the
+  caller's buffer; and because the two roads knew the length anyway, so two duplicated "did the file deliver
+  what it was sized for" checks became one.
+- **Four ways an exposure could have certified a file it never measured**, all closed, each with a negative
+  control in the suite. (1) A report read before `finish()` is short by up to `decisionDelaySamples()` —
+  20 ms — of runs. (2) A refused `process()` does not stop `finish()`, so the detector reports a complete,
+  empty, clean file; a refusal that carried samples now poisons the measurement and clears validity on the
+  spot. (3) `isFinished()` is **not** a validity flag: `prepare()` disarms and then returns early on a refused
+  argument without clearing `finished_`, the run list or the counters — measured on this tree, a good run
+  followed by `prepare(0.0, …)` leaves `isFinished()` true, `runCount()` 1 and `samplePeak(0)` 0.625, the
+  previous file's answer behind a flag that says the measurement is done. (4) A short read: the CLI sizes the
+  file first and the adapter refuses unless the length the file was sized for, the frames the reader handed
+  over and the samples the detector consumed are all one number.
+- **Two capacities, kept apart.** `complete` is the detector's list overflowing `maxRuns` — a property of the
+  file, reported as data with the count still counting. A short copy into the caller's buffer is the caller's
+  business, and a small buffer never makes a file incomplete. Note that capacity 0 does **not** make a report
+  incomplete by itself: completeness is `count <= capacity`, so a file with no runs is complete at capacity 0.
+  `maxRuns` is bounded at 2^20 on both roads, not at `ClipDetector::kMaxRunsLimit`: 2^24 runs is 665 MiB at
+  16 channels and 768 kHz, and the module is built `-fno-exceptions`, where a failed allocation aborts the page.
+- **Law 8a is tested on the shipped adapter, not on the detector.** 140 slicing comparisons through
+  `fcore::ClipProbe` — whole, 1, 2, 3, 7, W±1, kChunk±1, past kChunk, mixed and ragged — over ten programmes
+  (T = 0, 1, W−1, W, W+1, clamped material at 8/48 kHz, one to three channels, non-finite holes, a clipped
+  tail), each also compared with a bare detector read outside the wrapper, and each with the allocation
+  counter on. Beside them an **intermediate trace**: the reference is built one sample at a time, recording
+  the exact coordinate at which every run becomes visible, and each slicing is checked at every one of its own
+  call boundaries — a comparison of final reports is not enough (`docs/LAW8-KWEIGHTING.md:78`). And beside
+  that an **outside oracle**: every one of 1368 reported runs has its level recomputed from the plane data as
+  an exact rational mean and compared bit for bit, because fourteen slicings agreeing with each other is
+  consistency and not truth.
+- **Parity:** 64 byte-identical native-vs-wasm comparisons over 69 658 runs locally (four rates from 22.05 to
+  96 kHz, one/two/six/sixteen channels, eight capacities, thirteen `--chunk` values), and a CI step that pins
+  38 of them — 26 successful diffs and 12 REFUSALS, where both roads must exit non-zero and print nothing,
+  because a byte diff of two successful commands says nothing about the command lines both sides are supposed
+  to reject. Release and checked (`SAFE_HEAP` + `ASSERTIONS=2`) artifacts both. `--chunk` is honoured natively
+  and ignored by the module, which makes each of those rows a **cross-tier law-8a test**: without it both sides
+  cut the stream at multiples of `kChunk` and the diff would say nothing about re-slicing. The comparison's
+  sharpness has its own control: one flipped bit in a level, injected into a scratch copy of the formatter, is
+  caught.
+- **A clamped fixture generator** (`tools/wasm/make-clip-fixture.mjs`), transcendental-free like its sibling —
+  the existing one is clean audio as far as this detector is concerned, so a parity run on it only proved the
+  two sides agree nothing is there. Its passages are fractions of the requested length, so even a
+  one-second fixture carries all seven, holes and clipped tail included, and its NaN is written as an explicit
+  bit pattern because `writeFloatLE(NaN)` stores an encoding ECMAScript lets the engine choose.
+- **Mutation stand, 13 of 13 red**, on isolated copies of the sources: a band closed at a call boundary, the
+  pending queue drained per call, a level rounded through float, the chunk loop without its plane offset,
+  `runsComplete()` always true, `finish()` ignoring the poison, the poison not clearing validity, the shim fed
+  half the buffer, the report published without `finish()`, the peak copier filling the caller's capacity, the
+  run copier answering in doubles, the three clocks no longer compared, and the run copier reading its capacity
+  as runs. The float-rounded level is the one every slicing comparison and the whole parity harness pass —
+  only the pinned bit pattern sees it.
+- **Green on four toolchains**: Apple clang arm64 (114/114), gcc 14.2 x86-64 on Debian (114/114), MSVC 14.44
+  (111/111) and the `wasm-audio` tier under node (113/113), where the allocation counter is enforced rather
+  than informational.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### analysis — `ProgrammeReport`: one offline pass over a delivered programme, and what it refuses to say
+
+A new offline analyzer, `felitronics::analysis::ProgrammeReport`, shaped like `analysis::ClipDetector`
+(`setParams` / `prepare` / `process` / `finish` / `reset`, `Storage` + `storageFor()` published before a byte
+is allocated). One pass produces: DC offset per channel; leading and trailing silence, both at a named
+threshold and as threshold-free exact digital silence; the tail — the energy of the last `tailWindowMs` of
+programme relative to the programme's own mean square, plus the last sample and the last sample before the
+trailing silence; the infra-low energy fraction through `eq::Crossover2`; the stereo relations (L/R balance,
+bit- and value-identity counts, the integral correlation via `analysis::StereoSums`, side/mid energy); and
+the dynamics — integrated loudness, reference true peak (`analysis::ReferenceTruePeakMeter`, 4× / 32 taps,
+drained), PLR, EBU Tech 3342 LRA, the short-term loudness percentiles and the crest factor. Also
+`fcore_measure report`, which prints every scalar as a raw IEEE-754 bit pattern with its validity and
+reason, through the report's own field visitor.
+
+**Every mean is taken over the PROGRAMME SPAN** — the first to the last frame whose loudest finite present
+channel exceeds `silenceThresholdDb` — and the tail window ends at the last such frame rather than at the
+last sample of the file. The property that buys: padding a master does not move its measurements. The DC,
+sample peak, RMS, crest factor, infra-low fraction, programme mean square, tail ratio, stereo relations and
+reference true peak of the same music padded with five seconds of silence at each end come back
+bit-identical, pinned as an allow-list so a new padding-sensitive field cannot widen the claim quietly.
+Measured over the whole file instead, every one of them moves for a reason that has nothing to do with the
+music: a 60 s programme padded to 70 s reads 0.67 dB lower, and the tail window lands entirely inside the
+padding and reads 0, so a truncated fade reports as a perfect one.
+
+The span is thresholded rather than keyed on exact zero, which was the first design and is a cliff exactly
+where masters live: a 24-bit dithered file — the dominant delivery format — has no exact zero anywhere, so
+its five "silent" seconds are ±2e-7 of dither, an exact-zero span swallows them, the RMS is diluted by
+5.4 dB and a programme cut mid-fade reads a tail ratio of 9.1e-12 instead of 1.0. What padding does still
+move is named in the header: `lastSample`, which is by definition the last sample of the file, and the
+loudness family, because BS.1770 anchors its gating blocks and 3 s windows at the start of the stream —
+anchoring the sub-meters at the first active frame would make them invariant and put this report's loudness
+at odds with `fcore_measure lufs` and every other EBU tool on the same file, which is the worse trade.
+
+**"Cannot say" is a result.** A mono file does not get a correlation of +1.0; a programme shorter than the
+tail window does not get a ratio of exactly 1.0; a programme with fewer than two gated short-term
+observations does not get an LRA of 0.0, which is also the honest answer for a constant tone. Each is
+`valid = false` with a reason and a canonical `+0.0`, never a NaN. Two shipped primitives are wrapped
+because their own defaults are verdicts rather than measurements: `StereoSums::correlation()` answers +1.0
+below its 1e-12 denominator ("silence is neutral" — right for a meter, wrong for a report), and
+`LoudnessMeter::integratedLufs()` answers −120.0 when nothing passed the gates. LRA is computed from this
+class's own short-term series rather than from `loudnessRangeLu()`, whose 0.0 cannot be told from outside
+the meter to mean "no range" or "fewer than two observations survived the gates".
+
+**The infra-low fraction is a filter, not a band, and the header says so in the arithmetic.**
+`eq::Crossover2` is LR4 — two cascaded Butterworth sections — so |LP|² = 1/(1+(f/fc)⁴)², which is −6 dB at
+the crossover, **not** the 4th-order Butterworth 1/(1+(f/fc)⁸) the request was written against. With
+fc = 30 Hz a pure 30 Hz tone reads 25 % rather than 50 %, a 40 Hz tone 5.78 % rather than 9 %, and flat
+noise 0.104 % at 48 kHz. A reader told the wrong formula would see a few per cent "below 30 Hz" on a
+bass-heavy master and conclude there was infrasound, where it is the fundamental at 40 Hz through the
+filter's skirt.
+
+**Law 8a, gated on the intermediates and not only on the result.** Every field, and every event of a
+test-only frame trace, is bit-identical under any re-split of the stream into `process()` calls — checked
+over 19 slicings, 8 `maxBlock` values and anchored random slicings, field by field through `std::bit_cast`.
+The trace exists because the finished report is not a sufficient gate, and that is measured rather than
+argued: of a 23-mutant stand, 22 die and **not one of them produces a single report-comparison failure**.
+A mutant that closes the 10 ms sub-hop at the end of `process()` leaves the report bit-identical at all 19
+slicings and all 8 `maxBlock` values; so does one that moves `eq::Crossover2::flushDenormals()` off
+`core::StateGrid`. Beside the invariance sit closed-form oracles computed outside this repository (a sine's
+crest factor is 20·log10√2 = 3.0103 dB; the LR4 magnitudes above; EBU Tech 3341's −23 dBFS tone) and an
+independent whole-file reference program that takes its percentiles by sorting rather than from a histogram
+and writes out the 3 s / 1 s cadence as literals rather than reading the header's constants — an oracle
+that imports the subject's parameters moves with a mutation of them instead of opposing it. Two real
+defects in this work were caught by that reference alone and by no invariance check.
+
+Non-finite input is a hole: a canonical zero into every filter, counted per channel, and then excluded where
+exclusion is exact (the sums stay valid) and fatal where state carries it forward (the infra-low fraction
+and the whole loudness family refuse, with the reason). Nor is a maximum exclusion-exact — the sample
+dropped for being non-finite may have been the largest — so with nothing finite the sample peak is refused
+rather than published as a comfortable zero. Finite input is not enough either: `eq::Svf` updates its
+integrators as `(float)(2·v − ic)`, and that intermediate can leave the float range even where the state is
+not growing, so a stream of finite `FLT_MAX` drives the 30 Hz crossover non-finite at sample 849 exactly,
+grid flush running (a 1.7e38 DC input does not overflow, so "the state doubles every sample" is the wrong
+mechanism to quote). The crossover's overflow and the K-weighting's are counted separately, so a refusal
+never names a filter the field does not go through. Nothing non-finite reaches an accumulator, a published
+field or the trace. Capacity overflow never refuses a call or stops a counter; it invalidates exactly the
+fields it damages.
+
+475 checks, green under Apple clang 21 / libc++ / arm64 and gcc 14.2 / libstdc++ / x86-64, including the
+strict header-hygiene gate (`-Wconversion -Wfloat-equal -Werror`) on both. `fcore_measure report` on a
+stereo fixture is bit-identical across those two rows — every count and all 31 scalars.
+
+(When this was written the header added that cross-platform bit-identity was NOT promised, because `log10`
+and `pow` are not bit-portable. P79, later in this same release, narrowed that caveat rather than removing
+it: those derivations run through `core::det` now, and the report is byte-identical across Apple
+clang/arm64, gcc/glibc x86-64 AND wasm32/musl — **on the fixtures this release ships, for a build that
+does not contract**, which both shipped roads are. Two limits are named rather than glossed: rebuilt with
+the library's default `-ffp-contract=on`, 4 lines move again, because the arithmetic AROUND the
+deterministic calls is still contractible; and three derivations still reach the system libm — the FFT's
+twiddle seeds, `core::gainToDb`, and the reference true-peak meter's tap design — so an input outside the
+measured fixtures could still diverge. Those three are the next task's scope. What `core::det` removed is
+the share no build flag could reach.)
+
+### Added
+- **`analysis::SourceForensics` — what a delivered file actually was, as far as the samples can prove it.**
+  Two families of evidence and no attribution: a long-term (Welch) **spectral wall** — where the upper band
+  limit is, in Hz *and* as a fraction of this rate's Nyquist, how deep the drop is, how wide the transition
+  is, how far the spectrum comes back above it, and how far up it is empty (the upsampling tell) — and the
+  **sample grid**: the coarsest dyadic grid `2^-k` every finite sample lies on, the shortest normalised PCM
+  word that holds them all, the distribution of `k` behind that maximum, and the count of distinct sample
+  values. Composed over the `analysis::SpectrumFrames` producer; `setParams` / `prepare` / `process` /
+  `finish` / `reset`, `Storage` + `storageFor()` published before the allocation (law 11d), `maxBlock` sizes
+  nothing, and every published field is bit-identical under arbitrary re-slicing of the stream into
+  `process()` calls (law 8a).
+- **`fcore_measure forensics`** prints the whole report, every float as a raw IEEE-754 bit pattern.
+
+### Notes
+- **A band limit is a suffix property, and its FLOOR is read past the transition.** The strict suffix
+  maximum is anchored at the transition's end, not at the winning boundary: the winner sits on the cell
+  that contains the band limit — that is what makes it the winner — so anchored there it reports a clean
+  wall with 80 dB of "recovery" above it and a strict drop near zero (measured: 805 of 2350 constructed
+  cutoffs, worst 80.4 dB, and one NEGATIVE drop).
+- **Is there a floor to reach at all?** The floor reference is the median of the span above the edge, so on
+  a stopband that is still descending it sits halfway down the descent and the transition "ends" half a
+  span past the edge: an identical 16 kHz brickwall measured 49.8 Hz of transition over a flat floor and
+  1594 Hz over one decaying at 15 dB/kHz, with `sharp` flipping false at 10 dB/kHz and true again at 25.
+  The span's two halves are now compared; disagreement means there is no single floor, the width is a lower
+  bound, and `transitionClipped` says so — a flag that was otherwise provably unreachable, so the promise
+  attached to it had never been kept.
+- **The grid's exact reading is a maximum, so a robust one is published beside it.** On float-rendered
+  material — a 16-bit programme with a float fade-out, which is every real render — the fade's samples take
+  `gridExponent` to 85 or 149 and the exact word length goes dark. `robustPcmBits` is the shortest word
+  holding all but `gridOutlierFraction` (5 % by default, set by the length of a real fade) of the non-zero
+  samples, computed from the histogram already accumulated; a tolerance of 0 makes it the exact reading.
+- **A geometry that cannot finish is refused, not discovered at finish().** The edge search sorts one
+  plateau span per candidate, so `fftOrder 22` with 0.01 Hz cells and a 12 kHz plateau span is 2.1 million
+  candidates sorting a million doubles each. `storageFor()` and `prepare()` refuse it; the default geometry
+  is 19240.
+- **A band limit is a SUFFIX property.** The obvious construction — the steepest local descent, then the
+  level just above it — reports a deep notch (a band-stop, a comb, a room null) as a 100 dB wall with a
+  one-cell transition while full-power spectrum resumes 400 Hz higher, and it can select that notch and
+  thereby discard a genuine wall above it. So the floor of the drop is the loudest cell *anywhere* above the
+  candidate, and the search maximises that conservative drop. A monotone roll-off then fails on the drop
+  itself (~10 dB) rather than on a transition-width technicality, and both negative cases are handled by one
+  mechanism.
+- **An edge that is not there is not given a frequency.** An argmax always returns something — the lowest
+  candidate on a falling spectrum, the highest on a flat one — so `minDropDb` gates whether an edge exists
+  at all: below it the report is `valid = false, ShallowerThanMinDrop`, with every number still published as
+  evidence.
+- **A narrow line above the edge is forgiven to a published rank and no further.** A 19 kHz whine or a
+  leaked pilot tone is the loudest thing above a real wall; the search therefore runs on a 3-cell
+  median-filtered copy of the cells and takes the `(t+1)`-th largest of the suffix, `t` capped by
+  `exemptCells` and by a tenth of the suffix, so the exemption self-disables near Nyquist. What was forgiven
+  is published (`sufMaxPower`, `strictDropDb`, `exemptedCells`, `recoveryDb`), and the emptiness test runs
+  on per-bin maxima, which see every line.
+- **The position near Nyquist is not attributed.** A converter's anti-alias filter, a 320 kbit/s codec and a
+  genuinely band-limited master all live at 0.9-0.95 of Nyquist; `nearNyquist` marks that band and the
+  instrument stops there. `nearNyquist == false` is not a claim that anything compressed the file.
+- **Two edges, and which one is the report.** The primary is whichever candidate has the stronger
+  conservative drop, so a 16 kHz codec wall inside a 20.5 kHz export filter reports the inner edge as the
+  primary and the outer as the second — but only when the shelf between them is deep. With a shallow shelf
+  the outer edge wins instead and the inner one is not reported at all: a second search BELOW the primary
+  is structurally useless, since everything above such a candidate includes the primary's own plateau.
+- **The PCM range is part of the claim.** A b-bit word carries `i/2^(b-1)` for `i` in
+  `[-2^(b-1), 2^(b-1) - 1]`, so `-1.0` is a PCM sample and `+1.0` is not, at any depth. A sample outside
+  `[-1, +1)` therefore withholds `minExactPcmBits` (reason `OutsidePcmRange`) while `gridExponent` stays
+  valid, and the signed minimum and maximum the claim rests on are published.
+- **What the grid proves, and in which direction.** `minExactPcmBits = k + 1` is the *shortest* normalised
+  PCM word that holds the observed samples exactly; it does not bound the source's word length from above (a
+  24-bit file carrying a padded 16-bit master is indistinguishable from a 16-bit one), and the *absence* of
+  zero low bits proves nothing at all — 16-bit dithered up into 24 reports `<= 24`, never 16. A grid finer
+  than `2^-23` is refused as a PCM word rather than reported as 32: float32's top binade is spaced `2^-24`,
+  so a 32-bit stream reads `k = 24` near full scale and `k = 31` lower down, while a 32-bit *container*
+  carrying 24-bit content reads 24 and one carrying 16-bit content reads 16.
+
+### analysis — `HumDetector`: mains hum, and the notes that look like it
+
+`analysis::HumDetector` measures mains hum: a narrow, stationary line at 50 or 60 Hz with a comb of exact
+multiples, looked for only inside the QUIET stretches of a programme, because music masks it. It reports the
+line's interpolated position in Hz, its level over the local background in dB, which harmonics were found,
+and which stretches were used — in sample coordinates. It runs on `analysis::SpectrumFrames`, is bit-identical
+under arbitrary re-slicing of the stream into `process()` calls (law 8a), and publishes its whole budget
+through `storageFor()` before allocating (law 11d). `fcore_measure hum` prints the report, every float as a
+raw bit pattern.
+
+**No answer reads as "clean" when the instrument could not look.** Seven named incompletenesses, not one of
+them a zero that could be mistaken for absence: no quiet stretch at all; exactly one (because "stands still
+between stretches" cannot be tested inside one); fewer than two stretches long enough to show the line twice;
+a window too short to separate 49.0 Hz from 50.0 Hz; every frame holed; a mains-compatible line that was
+measured and did NOT stand still; and a comb of harmonics whose base lies outside this scope. The evidence —
+positions, levels, prominences, counts, the strongest peak of each search window whether accepted or not —
+is published in every case.
+
+What separates hum from a bass note (G1 is 1.0 Hz from the mains; A#1 and B1 are 1.7 Hz from 60) is the
+position measured INSIDE the bin by a three-bin parabola, a 0.5 Hz tolerance that a drifting grid fits and a
+note cannot, and the requirement that the same line stand still across at least two quiet stretches and
+across every frame of them. The comb is reported, not required: a bass guitar's partials are near-exact
+multiples too, so gating on a harmonic count would cost a false clean and buy little.
+
+Four things in it are not obvious and are the reason it works:
+
+* **Every local maximum of the search window is examined, not the strongest one.** A bass note 1 Hz away and
+  14 dB louder owns the window's argmax; reading only that would lose the hum underneath it, with the
+  resolution paid for and unused. A lone Hann-windowed tone's sampled skirt is monotone, so enumerating
+  costs nothing in false positives.
+* **Resolution is a duration, stated in bins.** Separating two Hann main lobes 1.0 Hz apart needs 2.7 bins
+  between them — 2.0 bins is where the dip disappears — so the bin must be 0.37 Hz or finer: N = 2^17 at
+  48 kHz, a 2.73 s window. `fftOrder = 0` picks the shortest window that achieves it at the file's rate.
+* **A line must be prominent AND loud.** A ratio alone certifies arithmetic: a programme that is one pure
+  tone has a spectrum of 1e-23 elsewhere, and a maximum of that residue stands 18–37 dB over the residue
+  beside it. `minLevelDbfs` (−100 dBFS) is the other half of the test. A frame of exact digital silence is
+  excluded for the same reason — it cannot have seen anything, so it is not evidence of absence.
+* **A quiet stretch must show the line twice.** One frame is one periodogram, whose tail crosses a 10 dB gate
+  often enough that a looped or duplicated quiet passage repeated the excursion and passed stationarity with
+  it — measured, 75 of 1200 noise-only files and 68 of 1200 dither-only files. Two frames per stretch takes
+  both to zero and costs no sensitivity.
+
+The quiet gate measures the programme with the candidate bands removed, so a hum loud enough to fail the gate
+cannot censor its own detection.
+
+`mains` means a mains-COMPATIBLE stationary line was measured, not a causal claim: a synthesised 50.000 Hz
+pedal with exact harmonics can be sample-for-sample what an interference pickup leaves. Four limits no
+threshold can remove are named in the header, each with the field a consumer reads instead.
+
+### analysis — `LowEnd`: wide bass, and which note owns the bottom
+
+New offline instrument `analysis::LowEnd`, for a master headed to a lacquer. A cutter head writes the
+mono sum laterally and the difference vertically, so out-of-phase low end is physics rather than taste.
+Two halves, one clock:
+
+- **Wide bass.** An LR4 split at `crossoverHz` (default 120 Hz, `eq::Crossover2`), Mid/Side, and the
+  **side energy fraction** `S/(M+S)` of the low band — over absolute 10 ms blocks (the same
+  `lround(0.01·fs)` grid `analysis::LoudnessMeter` uses, so the two instruments name the same
+  intervals), as a duration-weighted 100-bin distribution, and integrated. A fraction and not the
+  requested `S/M` ratio because `L = −R` is a real master that makes Mid *exactly* zero; both raw
+  energies are published, so `S/M = f/(1−f)` is one line away. Mono reads exactly 0 and is **valid**;
+  digital silence is the 0/0 and reads `NoEnergy` rather than a zero that would look mono.
+  Three extremum coordinates, because they are three different questions: the worst fraction (with its
+  energy beside it, so an accidental 1.0 can be weighed), the loudest block, and the greatest **vertical
+  modulation** — the one a cutting engineer asks for first and which neither of the others identifies.
+  The high band's own Mid/Side pair and the unfiltered pair are published too; low + high is an LR4
+  allpass, not the input, and the header says so instead of implying additivity.
+- **The dominant low note.** 30–300 Hz folded to semitone bands (40 of them at A4 = 440), from the
+  shared `analysis::SpectrumFrames`, with the repository's fractional-edge power integration — but
+  computed from a precomputed per-band weight table rather than prefix sums, because a fractional edge
+  cell's power sits at the midpoint of the *overlap* and weighting it by the bin centre can place a
+  centroid outside its own band. One-sided bins are folded, so a full-scale sine inside a band reads its
+  own mean square. Both axes are analysed: an anti-phase bass note would vanish from a Mid-only
+  spectrum, and that is exactly the programme the first half is shouting about — so the peak band
+  reports its own side fraction, i.e. whether the dominant note is cuttable.
+  The background is the median **density** of the non-peak bands: semitone bands widen with frequency,
+  so under a flat spectrum the top band of the range already holds 5.02 dB more energy than the median
+  with no note present. The argmax is published twice (energy and density) and the dominance ratio is
+  deliberately not a stored field — its denominator is exactly zero for a tone in digital silence.
+
+Law 8a throughout (bit-identical under arbitrary re-slicing, stronger than law 11(a)): one integer
+clock, samples outside and channels inside, `maxBlock` sizing nothing, absolute frame and block grids,
+the denormal flush on `core::StateGrid` rather than at the end of `process()`, and no transformed tail —
+`finish()` invents no frame and names `tailUncoveredSamples()` instead. Capacity exhaustion is data: the
+block series keeps a prefix and says so while every integral, histogram and extremum keeps counting.
+`fcore_measure lowend` prints the report as raw IEEE-754 bit patterns.
+
+The suite nulls against oracles computed outside the object — the LR4 prewarped transfer function
+predicts the settled side fraction at 120/180/240/480/1000 Hz, a direct O(N²) DFT with an independently
+written band integration nulls the fold, and a full-scale sine pins the absolute calibration — because a
+re-slicing test compares the implementation with itself and cannot see a deterministically wrong
+schedule or a constant calibration error.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### analysis — `BandBursts`: bursts in a band, measured against the band's own past
+
+A new offline analyzer, `felitronics::analysis::BandBursts`, finds where one frequency band (5–9 kHz by
+default, the corners are parameters) rises above ITS OWN SURROUNDINGS: the coordinates of each burst, how
+far above it rose, and how regularly the bursts recur. It is the honest way to talk about sibilance and
+harshness without a target curve — an excess over a programme's own past needs no reference the core does
+not have, and it survives the two things that destroy a balance measurement, a different genre and a
+different overall level.
+
+**No FFT.** A band is a filter, so the band is `high` of an `eq::Crossover2` at the low corner fed into
+`low` of a second at the high corner — two LR4 skirts, zero latency, no transform per hop and no second
+source of cross-platform divergence. Group delay at the band edges (≈ 0.14 ms, 1.4 % of a 10 ms hop) is
+named in the header and deliberately not compensated.
+
+**The baseline is the MEDIAN of a trailing ring of hops, not the mean**, and that is the decision the
+module turns on. A mean baseline switches the detector off exactly where bursts are densest: a steady
+train of duty cycle `d` over a silent floor reads `1/d`, so it is invisible once `d ≥ 1/10^(enterDb/10)`
+— 25.1 % at the default 6 dB, which sixteenth-note hats are past. Three further failures were measured
+during the design round: a 50 %-duty pattern reads 3.01 dB and never fires; moving one onset 10 ms
+earlier flips it from found to missed; and 151 zeroed hops make the programme resuming at its ordinary
+level read as a 6.1 dB burst. A median is immune to all four, raises the duty bound to 50 %, makes that
+bound threshold-independent, and — because it SELECTS one of the observed hop energies rather than
+summing them — removes the summation-order and drift questions instead of answering them.
+
+**Periodicity is reported, never judged.** Onsets feed two integer histograms: the spacing of adjacent
+events, and the bounded-lag autocorrelation of the onset train. The second is not redundant — a hi-hat
+with one hit in five missing turns a clean period `P` into `P, 2P` in the first while the second still
+peaks at `P`. Both survive event-list exhaustion. The core publishes the counts and the modal spacing; it
+does not publish "this is a hi-hat" or "this is a problem".
+
+**Law 8a**, bit-identical under arbitrary re-slicing (same binary, same channel-presence timeline): one
+integer clock, the sample loop outside and the channel loop inside, hop boundaries from a counted
+`nextHopEnd_` rather than a modulo, thresholds turned into ratios once in `prepare()` so no logarithm
+decides anything, and denormal maintenance clocked by `core::StateGrid` instead of by the `process()`
+boundary. `maxBlock` sizes nothing. Law 11d: `storageFor()` publishes the whole demand before anything is
+allocated, and `process()`/`finish()` allocate nothing.
+
+Two gates that input sanitising cannot cover are named and closed: `eq::Svf` narrows its state to float,
+so a **finite** input can overflow it (successive ±3e38 make the 5 kHz high-pass emit −inf on the second
+sample), and a hop whose baseline is **exactly zero** — a silent lead-in — would otherwise open an event
+at any level and publish +∞ dB. The filter output is gated as well as the input, and a zero-baseline hop
+is not judged and is counted. Events also carry whether damage sat in the BASELINE they were measured
+against, because a burst can be manufactured entirely by a hole before it.
+
+Absolute powers in the report (`peakPower`, `bandEnergy`, …) are uncalibrated filter-output power: the LR4
+pair's passband peak is −3.99 dB at 6791 Hz at 48 kHz and moves with the sample rate (−1.11 dB at
+22.05 kHz, −4.66 at 384 kHz), so they are comparable within one prepared instrument and not across rates.
+Every ratio is immune to a GAIN — exactly, over the whole range a delivered programme occupies — and only
+partly immune to a change of SPECTRUM: when a burst and its baseline have different shapes each side is
+weighted by a different point of that rate-dependent dome, which is worth about half a dB between 44.1 and
+96 kHz. Both limits are measured and named in the header rather than claimed away.
+
+`fcore_measure bursts <rate> <channels> <raw.f32le>` prints the whole report as raw IEEE-754 bit patterns,
+the way `blocks` does, so a future wasm comparison catches a flipped bit that decimal printing would
+round away.
+
+### Added
+
+- **The five offline analyzers are callable from JavaScript, and the wasm module's answer is the native
+  tool's answer BIT FOR BIT.** `ProgrammeReport`, `SourceForensics`, `HumDetector`, `LowEnd` and
+  `BandBursts` reach `tools/wasm/fc_probe.cpp` through one `_run` entry point and caller-owned row
+  buffers with mandatory capacities, and each has a parity harness that reproduces
+  `fcore_measure <mode>` exactly — a `diff` of the two IS the test. Measured on every mode at 48 and
+  44.1 kHz, against the release module and the checked debug module: **zero differing bytes** — 1299 lines
+  of raw IEEE-754 bit patterns at 48 kHz and 1302 at 44.1, where the three extra are burst events the
+  lower rate happens to find.
+
+  This is the acceptance the task was written with. It had been weakened to a wasm-only comparison after
+  a crew seat measured that byte-exact native-vs-wasm parity was **unattainable** for `hum`, `lowend` and
+  `forensics` on the old numerics; `core::det` made the original criterion reachable, so it is the one
+  being met.
+
+- **A CI step that enforces it**, five analyzers × two rates × two modules, refusing to count a
+  comparison whose output is empty.
+
+### Fixed
+
+- `tools/wasm/build.sh` had no include root for `modules/eq` or `modules/stereo`, which three of the five
+  analyzers include from — the module could not compile at all. The same omission on the native side left
+  `felitronics_abi_tests` and `felitronics_clips_exposure_tests` linking `felitronics::analysis` when they
+  needed `felitronics::analysis_offline`.
+- `tools/CMakeLists.txt` carried **four** `target_link_libraries(fcore_measure …)` lines, a residue of
+  merging six branches that each added the one they needed. Collapsed to one.
+
+### Notes
+
+- `report` is the only mode whose text is NAMED rather than positional, and its ~100 field names cross
+  the ABI **from the module**, produced by the same visitor walk that produced the rows. The visitor is
+  deliberately the single enumeration of the report's fields; a name list rebuilt in C++ and again in
+  JavaScript would be the second and third copies of it, and the first field added would stop being
+  covered without anything failing. The same rule puts `lowend`'s note NAME on the module's side of the
+  boundary rather than rebuilding a pitch-class table in JavaScript.
+
+### Added
+
+- **`felitronics::core::det` — a transcendental floor that computes the same bits on every row.**
+  `cos`, `sin`, `tan`, `log2`, `log10`, `exp2` and `pow10`, each within 2 ulp of the correctly rounded
+  value (measured against mpmath at 60 digits, not against a libm), each pinned against FP contraction so
+  the answer does not depend on whether the row has an FMA instruction.
+
+### Changed
+
+- **The five offline analyzers and `analysis::SpectrumFrames` now measure on `core::det`, not on the
+  system libm.** They were never reproducible across rows: over the ranges they actually use, `pow10`
+  differed in 41 % of results between Apple's libm and both Linux ones, `tan` in 35 %, `log10` in 2 %,
+  and the Hann window differed in 4032 of 131072 coefficients at order 17 — which every power bin is
+  multiplied by. The odd row was not wasm but **Apple**: glibc and musl agree almost everywhere, so the
+  developer's Mac computed something neither CI nor the browser did.
+
+  `fcore_measure report|forensics|hum|lowend|bursts` on the same 10 s programme is now **byte-identical
+  across Apple clang/arm64, gcc 14/glibc x86-64 and wasm32/musl** — 1299 lines, zero differences, where
+  `lowend` alone differed in 28 lines before.
+
+- **`SpectrumFrames` builds one quadrant of its Hann window and reflects the rest by index.** The window
+  was never symmetric — `w[i] != w[N-i]` in 10314 of 16383 places, because `2*pi*i/N` and `2*pi*(N-i)/N`
+  are different doubles — on the system libm and on `det` alike, which is why no comparison between them
+  could ever have shown it. Reflecting makes the symmetry exact and costs a quarter of the calls.
+
+### Notes
+
+- The deterministic path is for COEFFICIENTS, never for a per-sample loop: a window built once in
+  `prepare()`, log2(N) twiddle seeds per transform, a handful of thresholds per `setParams`, one `log10`
+  per reported value. Measured cost is +0.5 ms on one order-17 window against a 20-30 ms analyzer run.
+  The RT modules (`eq::Svf`, `analysis::KWeightingFilter`) are untouched by this entry.
+
+- **The coefficient math of a filter is now a TYPE, not a flag.** `eq::Svf`, `eq::Crossover2`,
+  `analysis::KWeightingFilter` and `analysis::LoudnessMeter` are templates on a math policy, with the
+  shipped names bound to `core::SystemMath` exactly as before — TabbyEQ's and OrbitCab's coefficients do
+  not move — and `eq::DeterministicSvf` and friends bound to `core::DetMath` for the offline analyzers,
+  which is what they now own. `static_assert` pins both directions, so changing an alias is a deliberate
+  act that must also edit a test.
+
+  Measured and stated rather than assumed: the two policies give a different `tan` at 7709 of 119880
+  filter arguments, and in **zero** of them does that difference reach the filter's float output over
+  8192 samples — `Svf` carries its state in float and a one-ulp difference in a double coefficient does
+  not survive the rounding. So this routing is DEFENSIVE; the cross-row divergence P79 actually removed
+  travelled the double paths (window, `log10`, `pow10`, `log2`). The suite asserts the zero, so the day a
+  change makes that path reachable it is a finding rather than a silent regression.
+
 ## v0.32.0 — 2026-09-14
 
 ### `analysis` — `ClipDetector`: clipping is a flat top, not a loud sample
