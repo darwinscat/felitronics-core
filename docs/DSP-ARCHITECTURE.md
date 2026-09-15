@@ -375,6 +375,46 @@ the CPU at runtime, invisible to any build. Full write-up:
    heuristic and not on the memory (0.419 against 0.023 for a lane clocked throughout) — said here
    rather than left for the next reader to find.
 
+   **AND THE OTHER HALF IS `reset()`, WHICH IS A DIFFERENT OPERATION AND NOT A LONGER ONE.** Everything
+   above is about a lane the caller STOPPED handing over: it is still the same stream, so the answer is
+   to feed it the silence it is really receiving and let its state evolve as silence evolves it. A lane
+   that is PRESENT gets the caller's own samples, and a stale window speaking into them is not a falling
+   edge — it is a stream RESTART, and the restart verb has to do it. `felitronics::nam::NamStage::reset()`
+   was EMPTY, so it did not: a dense 2001-tap capture that had played a tone answered digital silence
+   with **0.224604502320**, and so did the same capture through `prepare()`, because `::nam::DSP::Reset`
+   calls `SetMaxBufferSize` and then a prewarm that is zero samples for a `Linear`. The two verbs differ
+   in what they restore, not in how long they run: a drain SIMULATES silence, and a restart puts the
+   stage back where a freshly loaded and prepared one is. For a finite-memory capture the two states
+   coincide and the same zero-feed reaches it. What that buys is INDEPENDENCE, and it is exact: two stages
+   fed different audio before the restart answer the next programme with the same bits, on real captures
+   and synthetic ones, at every rate. It does NOT buy bit-identity with a stage prepared a moment ago —
+   NAM's answer depends on how the stream is cut into CALLS, so a restart, whose chunking is its own,
+   lands 1.037e-06 away on a real Standard at blocks 64…512 and exactly on it for a real slimmable at the
+   same blocks. The restart additionally re-primes the
+   rate-matcher legs, because a restart re-anchors the audio-time clocks, exactly as `eq::EqBand::reset()`
+   re-anchors its `StateGrid` (leave them and the next programme runs at the previous stream's sub-sample
+   phase: 1.039e-06 at 44.1 kHz). For a RECURRENT capture they do not coincide, and the exception stays
+   named: a restart spends the heuristic again — which is what NAM's own `Reset` does — and leaves what
+   that leaves (300 samples differing from a fresh instance, worst 1.49e-07, on a real LSTM).
+
+   **A RESTART IS THE ONE AUDIO-THREAD CALL WHOSE COST IS NOT THE BLOCK'S.** It is a whole drain length
+   of inference per dirty lane — the field, the ring and the legs, so more than `prewarmSamples()`
+   reports: on an M-series core, per lane, **3.77 ms at a 64-sample block — 282 % of that callback** —
+   3.46 at 256, 3.43 at 512, against 1.3 ms for a real LSTM and 0.13 for a dense 2001-tap Linear. There is no cheaper exact mechanism to substitute: NAM's own `Reset` with the prewarm off
+   zeroes the Conv1D rings in 0.014 ms and still misses the prepared state by 4089 samples (worst 0.324),
+   because that state is a PREWARMED one, and on a `Linear` with the FFT engine it allocates 46 times. So
+   the price is published rather than hidden, and the operation is made IDEMPOTENT instead — the debt is
+   re-armed only by audio actually being fed, so a second restart with nothing in between is free and a
+   mono host pays for one lane. What a restart cannot rewind is a third-party clock: NAM's partitioned
+   `Linear` counts every sample it has ever seen, and rewinding that means re-configuring the engine,
+   which allocates; the residue peaks at 1.788139e-07 over nine block sizes x eight rates against a stage
+   prepared a moment ago and is EXACTLY ZERO against one clocked to the same point, i.e. it is the
+   engine's arithmetic and not our state. **And a restart
+   flushes what the LEDGER can see**: a capture whose conditioner is a model of its own
+   (`config.condition_dsp`) hides that model's memory from both readers of the field, so it is
+   under-flushed by exactly as much as law 11a's drain under-drains it — 0.905147969723 either way, one
+   defect in one ledger, registered against the ledger.
+
    **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
    `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`
    silently clamped `prepare(..., 4)` to 2, after which `process(io, 4, n)` was a perfectly legal call

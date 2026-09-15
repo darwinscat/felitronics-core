@@ -101,6 +101,10 @@ public:
     // never stops draining is invisible in the audio and shows up only as CPU. Counted per CHUNK, not per
     // sample — a counter inside the sample loop is how a gate killed vectorisation once already.
     void bindDrainCounter (std::atomic<long long>& counter) noexcept { drained_ = &counter; }
+    // …and the RESTART's own, kept apart from the drain's on purpose: the two mechanisms spend silence
+    // for different reasons (a falling edge against a stream restart), and one counter for both would be
+    // an oracle that cannot say which of them moved. See NamStage::clearedSamples().
+    void bindClearCounter (std::atomic<long long>& counter) noexcept { cleared_ = &counter; }
     double preparedSampleRate() const noexcept { return hostSR; }
     int    preparedMaxBlock()   const noexcept { return maxBlock; }
     ~NamBackend() noexcept { if (retireLedger != nullptr) --(*retireLedger); }
@@ -161,6 +165,15 @@ public:
             prepared_ = true;
         }
         catch (...) {}   // bad_alloc (or a throwing NAM Reset): stay unprepared, never crash
+        // …and the restart a REFUSED prepare could not honour is honoured here, on the message thread,
+        // where a whole drain length of inference is free. It spends the debt this prepare just
+        // re-charged, i.e. at the NEW rates — the right length, because what it has to flush is what the
+        // old stream left in a network this prepare did not clear. OUTSIDE the try on purpose: reset()
+        // is noexcept, so a throw inside it terminates rather than landing in that catch, and putting it
+        // there would suggest otherwise. It is skipped when this prepare refused too, which leaves the
+        // request parked for the next one.
+        if (prepared_ && restartOwed_)
+            reset();
     }
 
     bool prepared() const noexcept { return prepared_; }
@@ -226,20 +239,122 @@ public:
         return true;
     }
 
-    // 🔴 AND IT DOES NOT CLEAR ANYTHING, WHICH IS NOT WHAT THIS LINE USED TO SAY. It read "transient
-    // state cleared by prepare()'s Reset on the next play", and that is false for the architectures
-    // where it matters: `::nam::DSP::Reset` calls SetMaxBufferSize and then prewarm(), and Linear
-    // overrides neither the prewarm (the base class answers 0) nor the input buffer — `Buffer`'s
-    // per-channel window survives. Measured on a dense 2001-tap capture at 48 kHz: a tone, then
-    // `NamStage::prepare()`, then digital silence at full width returns 0.224604502320; through
-    // `reset()`, the same. (The `auto`/FFT engine reads 0.072609648108 after a prepare, because the
-    // FFT state IS rebuilt while the direct taps are not — two engines, two answers, neither zero.)
-    // What this task fixed is the half that belongs to it: a lane that is ABSENT is drained, and a
-    // prepare leaves BOTH lanes owing a full drain (see configureRates), so a re-prepare while a lane
-    // is away no longer strands the debt. A lane that is PRESENT is fed the caller's own samples and a
-    // stale window speaking into them is a stream-restart question, not a falling edge — recorded with
-    // its number rather than silently claimed.
-    void reset() noexcept {}
+    // 🔴 THE STREAM RESTART, AND IT IS THE ONE VERB HERE THAT KEEPS ITS WORD. It used to be empty, and
+    // the comment that stood here recorded why with a number: `::nam::DSP::Reset` calls
+    // SetMaxBufferSize and then prewarm(), and `Linear` overrides neither the prewarm (the base class
+    // answers 0) nor the input buffer — `Buffer`'s per-channel window survives. Measured on a dense
+    // 2001-tap capture at 48 kHz: a tone, then `NamStage::prepare()`, then digital silence at full
+    // width returns 0.224604502320; through `reset()`, the same. P24 closed the half that was a falling
+    // edge — a lane the host STOPS handing over is fed the silence it is receiving — and left this half,
+    // the lane that is PRESENT, whose stale window speaks into the caller's own samples.
+    //
+    // WHAT IT PROMISES — the whole statement, with its numbers and its three exceptions, is on the public
+    // declaration in NamStage.h. In short: every lane that carried audio is fed the digital silence it
+    // still owes, here and in full, until its state is provably the state of a lane that was silent all
+    // along. The promise is INDEPENDENCE — nothing the CALLER fed before the restart can be heard after
+    // it — which is exact and is what the suite pins. It is NOT "silence comes out" (a capture answers
+    // digital zero with its own biases: 0.001195220510 for a real Standard, 9.266554832458 for the
+    // A2-max feature set), and it is not, in general, bit-identity with a stage prepared a moment ago,
+    // because NAM's answer depends on how the stream is cut into calls: 1.037e-06 on a real Standard
+    // where this restart's last chunk is short, and exactly 0 on a real slimmable at the same blocks.
+    //
+    // WHAT IT COSTS, because this is the one house verb here that is not O(block): one lane's whole
+    // DRAIN LENGTH of inference per dirty lane — the field, plus the FFT ring a Linear is charged, plus
+    // each leg's tap window. Real Standard WaveNet on an M-series core, per lane: 3.77 ms at a
+    // 64-sample block (282 % of the callback), 3.62 at 128, 3.46 at 256, 3.43 at 512, 3.33 at 1024;
+    // the A2 container 3.0-4.0 ms; a real LSTM 1.3 ms; a dense 2001-tap Linear 0.13 ms. It allocates,
+    // locks, blocks and throws exactly where `process()` does — i.e. nowhere, for the architectures
+    // whose NAM implementation preallocates — which is NOT every Linear and WaveNet: `wavenet_a2_max.nam`
+    // from NAM's own examples allocates 4 times per sample in process() and therefore in here too
+    // (measured), beside the LSTM/ConvNet exception the header already names. There is no cheaper
+    // exact mechanism: asking NAM to Reset with its prewarm off zeroes the Conv1D rings in 0.014 ms and
+    // still misses the prepared state by 4089 samples (worst 0.324) because that state is a PREWARMED
+    // one, and on a Linear with the FFT engine it allocates 46 times.
+    //
+    // AND IT IS IDEMPOTENT, which is what keeps that price a one-off: the debt is re-armed only by audio
+    // actually being fed, so a second restart with nothing in between spends nothing, and a mono host
+    // pays for one lane rather than two.
+    //
+    // ⚠️ WHAT IT DOES NOT REACH, both named with numbers in the header: a recurrent cell (nothing finite
+    // empties one), a capture whose CONDITIONER is a model of its own (its memory is outside the ledger —
+    // the same hole that under-drains it at a falling edge, 0.905147969723 either way), and NAM's own
+    // partitioned-FFT clock (1.1e-07 against a stage prepared a moment ago, exactly zero against one
+    // clocked to the same point).
+    void reset() noexcept
+    {
+        // NOTHING, on a backend whose preparation was refused — not even the ledgers — but the REQUEST
+        // is remembered. `prepare()` writes `hostSR`/`maxBlock` before `configureRates` can refuse (law
+        // 11b's disarm-first leaves the object unusable, not consistent), so `maxBlock` can already be
+        // the NEW value while `hush_` and `modelIn` are still the old ones: chunking by it would
+        // `std::fill` past the end of `hush_` and copy past the end of `modelIn` — measured under ASan
+        // as a heap-buffer-overflow, a WRITE 0 bytes past the 1024-byte scratch. A first prepare that
+        // refuses leaves `hush_` empty outright. The ledgers must stay too: they are the only record the
+        // next SUCCESSFUL prepare re-charges the lanes from.
+        //
+        // 🔴 AND REMEMBERING IT IS NOT DECORATION — a crew round put the sequence up. Re-arming the debt
+        // at the next prepare only helps a lane that is ABSENT, because a PRESENT lane's debt is never
+        // spent (process() overwrites it on every chunk it feeds). So without this bit, "play, a refused
+        // prepare, reset(), a prepare that succeeds, play again" would drop the restart on the floor and
+        // hand back the old stream: measured ~242 samples of a delay(514) capture, the rest of its
+        // window having been pushed out by prepare()'s own scratch warm-up. The restart is instead
+        // honoured at the end of the prepare that CAN honour it, on the message thread, where it is free.
+        if (! prepared_)
+        {
+            restartOwed_ = true;
+            return;
+        }
+        restartOwed_ = false;
+
+        for (int c = 0; c < 2; ++c)
+        {
+            // A lane with no instance cannot be flushed, so its ledger is left exactly as it is rather
+            // than marked clean — the same rule as the unprepared backend above. UNREACHABLE as the
+            // class stands (prepareModel refuses a model missing either instance, so a prepared backend
+            // has both), and kept honest rather than asserted, exactly like the swap refusal in
+            // tryApplyPending below. The mutation stand says so too: removing it changes nothing any
+            // test can see, which is the signature of a branch no caller can enter.
+            if (inst[c] == nullptr)
+                continue;
+
+            // 🔴 THE DEBT IS THE DIRT — for a capture whose memory is FINITE. `drain_[c]` is exactly how
+            // much more silence this lane needs before its state is the silence state: the full length
+            // while it is playing (process() re-arms it on every chunk it feeds), the remainder while it
+            // is mid-drain, and zero for a lane that has never carried audio — which is why a mono host
+            // does not run a second network here, the hole `everFed_` closed for prepare().
+            //
+            // ⚠️ AND FOR A RECURRENT CELL IT IS NOT THE DIRT, which is the one place this reading breaks
+            // and three crew seats went for it: an LSTM lane that has already SPENT its drain reads
+            // `drain_ == 0` and is still not empty — the fixture leaves 0.419413 there. So a recurrent
+            // lane that ever played is charged the WHOLE heuristic again at every restart, which is also
+            // what NAM's own Reset does (prewarm, unconditionally, half a second of it), and it never
+            // becomes provably clean: `everFed_` stays set for one, because nothing finite empties it.
+            int owed = recurrent_ ? (everFed_[c] ? drainSamples_ : 0) : drain_[c];
+            while (owed > 0)
+            {
+                const int d = std::min (maxBlock, owed);
+                // REFILLED EVERY CHUNK, AND EVERY LANE: `processChannel` writes the model's OUTPUT back
+                // into what it was handed, so a buffer filled once would feed the network its own answer
+                // from the chunk before. The gain is 1.0f and not the live makeup — every sample of this
+                // goes into the scratch and nothing reads it.
+                std::fill (hush_.data(), hush_.data() + d, 0.0f);
+                processChannel (ch[c], inst[c].get(), hush_.data(), d, 1.0f);
+                owed -= d;
+                if (cleared_ != nullptr) cleared_->fetch_add ((long long) d, std::memory_order_relaxed);
+            }
+            // …AND THE RATE-MATCHERS ARE RE-PRIMED, not re-designed. A restart re-anchors the audio-time
+            // clocks — the same reason `eq::EqBand::reset()` re-anchors its StateGrid — and for these two
+            // legs that clock is the sub-sample phase of the model grid: leave it and the stage answers
+            // the next programme through a different fractional alignment than a fresh one, measured
+            // 1.039e-06 at 44.1 kHz. `reset (rates, capacity)` is the wrong tool for it here (it
+            // re-derives 513 x 64 coefficients, 1.77 ms, and is not noexcept); `clearAudioState()` is
+            // the state alone. Both legs, whether or not one is installed: an identity leg is inert, and
+            // a clear that depends on which path ran is a clear with two answers.
+            ch[c].down.clearAudioState();
+            ch[c].up  .clearAudioState();
+            drain_[c] = 0;
+            if (! recurrent_) everFed_[c] = false;
+        }
+    }
 
     // Host-rate latency the rate-matcher introduces (0 when not resampling).
     //
@@ -401,6 +516,10 @@ private:
         // …and a lane that was NEVER fed owes nothing, which is not decoration: without `everFed_` a fresh
         // load arms lane 1 on a MONO host and runs a second network for a whole drain — 132 ms of a real
         // WaveNet, per load, for a window that is already the silence state NAM zero-filled it with.
+        // 🔴 AND "NEVER FED" NOW HAS A SECOND WAY IN: a lane a `reset()` emptied is provably in that same
+        // state, so the restart clears `everFed_` for it and this line charges it nothing — which is what
+        // keeps a re-prepare after a restart free. A RECURRENT capture is the exception at both ends: the
+        // restart leaves its flag set, so this line goes on charging it. See reset().
         for (int c = 0; c < 2; ++c) drain_[c] = everFed_[c] ? drainSamples_ : 0;
         hush_.assign ((size_t) maxBlock, 0.0f);            // ALLOC here (message thread) — never in process
         return true;
@@ -444,6 +563,7 @@ private:
     std::unique_ptr<::nam::DSP> inst[2];
     const std::atomic<bool>*  normalize = nullptr;   // NamStage::Impl's per-call flag (bindNormalize)
     std::atomic<long long>*   drained_  = nullptr;   // …and its silence odometer (bindDrainCounter)
+    std::atomic<long long>*   cleared_  = nullptr;   // …and the restart's own (bindClearCounter)
     int*  retireLedger = nullptr;                    // attached only once live (see attachRetireLedger)
     bool  prepared_    = false;                      // false until prepare() fully succeeded
 
@@ -463,7 +583,8 @@ private:
     int    drainTail_     = 0;              // …plus what the engine holds past the field (Linear's FFT ring)
     bool   recurrent_     = false;          // …and whether the field is a bound at all (LSTM)
     int    drain_[2] { 0, 0 };              // …and how much of that each lane still owes
-    bool   everFed_[2] { false, false };    // …and whether it has ever carried audio at all
+    bool   everFed_[2] { false, false };    // …and whether it may still be holding some (see reset())
+    bool   restartOwed_ = false;            // …and whether a reset() arrived that prepare() must honour
     std::vector<float> hush_;               // the silence an absent lane is fed, and where its output goes
     Ch     ch[2];
 };
@@ -488,6 +609,11 @@ struct NamStage::Impl
 
     // How many samples of silence the live backend has fed to absent lanes — see drainedSamples().
     std::atomic<long long> drained { 0 };
+
+    // …and how many a reset() has spent restarting them — see clearedSamples(). Two mechanisms, two
+    // odometers: past the debt the audio is the same either way, so a single number could not say
+    // which of them moved.
+    std::atomic<long long> cleared { 0 };
 
     // EXACT mirror of NeuralStage's internal retire-queue count (which it doesn't expose): +1 when
     // a successful swap/clear retires the live model; -1 from the dtor of every once-live backend
@@ -601,7 +727,14 @@ void NamStage::prepare (double sampleRate, int maxBlock)
     impl->tryApplyPending();   // if the retire queue drained since the deferral, land the intent now
 }
 
-void NamStage::reset() {}   // see NamBackend::reset — it does NOT clear the network's window, measured
+// THE STREAM RESTART — the contract and the price are on NamBackend::reset(); this is the wiring.
+// It reaches only the LIVE backend, which is the only one that can be dirty: a parked load has been
+// prepared and never fed, and NeuralStage resolves the live pointer once (acquire), so a swap landing
+// beside this restarts one instance or the other and never half of each. It does NOT step the block
+// counter — that counter is what keeps the garbage collector off an instance the audio thread may be
+// inside, and a restart is not a block. It does not touch the pending intent either: a parked load is
+// something the caller asked for, not something the previous stream left behind.
+void NamStage::reset() noexcept { impl->stage.reset(); }
 
 //==============================================================================
 bool NamStage::process (float* const* io, int numChannels, int numSamples, bool normalize) noexcept
@@ -701,6 +834,7 @@ bool NamStage::install (PreparedModel model)
     auto backend = std::move (model->backend);
     backend->bindNormalize (impl->normalize);
     backend->bindDrainCounter (impl->drained);
+    backend->bindClearCounter (impl->cleared);
     // Prepared for other numbers than this stage runs at: the same work again, here — the rare case
     // of a rate change between the two halves, at the cost a one-call load always paid.
     //
@@ -864,5 +998,6 @@ int NamStage::maxLatencySamples (double hostSR) noexcept
 int    NamStage::latencySamples()   const { return impl->stage.latencySamples(); }
 int    NamStage::prewarmSamples()   const { return impl->prewarmSamples.load (std::memory_order_relaxed); }
 long long NamStage::drainedSamples() const { return impl->drained.load (std::memory_order_relaxed); }
+long long NamStage::clearedSamples() const { return impl->cleared.load (std::memory_order_relaxed); }
 
 } // namespace felitronics::nam

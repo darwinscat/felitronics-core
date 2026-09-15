@@ -100,6 +100,7 @@ struct StreamResampler
     double pos      = (double) kHalf;   // fractional read position into buf (>= kBehind: needs buf[i-31])
     std::vector<float> buf;             // capacity fixed in reset(); buf[0..len) valid
     int len = 0;
+    bool configured_ = false;           // a reset() that RAN TO THE END — see clearAudioState()
     std::vector<float> tab;             // (kPhases+1) rows x kTaps, normalised per row — built in reset()
     bool identity = false;              // exact 1:1 ratio → pure delay, no filtering (see header note)
 
@@ -236,6 +237,10 @@ struct StreamResampler
         // that produces nothing rather than one that reads an empty table: produceAvailable's first
         // test is `i + kHalf >= len`, which is true at len = 0 and breaks immediately. NamStage's
         // prepare catches and marks itself unprepared, but a standalone caller may catch and carry on.
+        // …and `configured_` goes with it, because `len` alone cannot carry that meaning: the backstop
+        // in feed() legitimately drops len to 0 on a live instance, so a restart could not tell the two
+        // apart. It is a VALIDITY bit and nothing else reads it — see clearAudioState().
+        configured_ = false;
         len = 0;
         pos = (double) kHalf;
         buf.assign ((std::size_t) capacity + (std::size_t) kTaps + 8, 0.0f);     // ALLOC here (message thread) — never in process
@@ -254,6 +259,7 @@ struct StreamResampler
             tab.clear();                    // the copy path never reads it — do not pay 128 KiB for it
             tab.shrink_to_fit();
             len = kTaps;                    // kTaps leading history zeros; the delay is kHalf either way
+            configured_ = true;
             return;
         }
 
@@ -272,6 +278,48 @@ struct StreamResampler
                 tab[(std::size_t) p * (std::size_t) kTaps + (std::size_t) j] = (float) (row[j] * inv);
         }
         len = kTaps;                                                             // kTaps leading history zeros
+        configured_ = true;
+    }
+
+    // 🔴 A STREAM RESTART FOR THE STATE ALONE — the same priming `reset()` ends on, at the price of a
+    // memset, with the rates, the capacity and the 513 x 64 coefficients left exactly as they were
+    // designed. It exists because `reset()` IS this class's prepare(): it reassigns both vectors,
+    // `shrink_to_fit()`s on the identity path (which the standard permits to REALLOCATE) and re-derives
+    // every coefficient through a windowed sinc with a Bessel evaluation per tap — measured at 1.77 ms
+    // for the two FILTERING legs of one lane, against a 1.333 ms budget at a 64-sample block. The price
+    // is the KERNEL and not the memory: at an unchanged capacity this libc++ reused both allocations and
+    // the 200-call loop allocated zero times, and the identity path (no table) costs nothing at all. The
+    // signature is deliberately not noexcept anyway, and says "message thread" above. A caller that has to restart a LIVE
+    // stream cannot pay that or risk the throw, and re-deriving a kernel is not what a restart means
+    // anyway: the coefficients belong to the rate pair, not to the audio that just ended.
+    //
+    // It carries the house's STOP name because for a resampler the stop and the restart are the same
+    // operation: it holds no parameter epoch, no ramp and no grid phase — only the samples it was fed
+    // and where it is reading them. `len = kTaps` with those taps zeroed is exactly the state reset()
+    // leaves (the leading history), and `pos = kHalf` is the canonical read head, so the delay a caller
+    // measures is unchanged; `latencySamples()` is a function of the rates and does not move.
+    void clearAudioState() noexcept
+    {
+        // 🔴 AND IT CANNOT RESURRECT WHAT reset() REFUSED, which a crew round put up as the one way this
+        // method could be worse than nothing: `reset()` leaves `len = 0` when its SECOND allocation
+        // throws — a non-empty buffer beside an absent coefficient table — and a restart that derived
+        // `len = kTaps` from `buf.size()` alone would make that object produce again, straight through
+        // a table that is not there. The validity bit is what distinguishes it.
+        //
+        // 🔴 AND THE BUFFER IS TESTED BESIDE THE BIT, because a MOVE does not clear the bit: the implicit
+        // move constructor COPIES `configured_` and steals the vectors, so a moved-from instance reads
+        // "configured" with an empty buffer, and this was the first method of this class that such an
+        // instance could not survive — `std::fill_n` on a null `data()`, caught by a later crew round
+        // under UBSan (`store to null pointer`) and ASan (`SEGV`). Every pre-P47 method is benign there:
+        // feed() appends nothing, produceAvailable() breaks on its first test. This one joins them.
+        if (! configured_ || buf.size() < (std::size_t) kTaps)
+            return;
+        // Past `len` the buffer is write-before-read (feed() appends at buf + len), so zeroing the
+        // leading taps is the whole clear however large the capacity is; a configured instance always
+        // has room for them (reset() assigns capacity + kTaps + 8).
+        len = kTaps;
+        std::fill_n (buf.data(), (std::size_t) kTaps, 0.0f);
+        pos = (double) kHalf;
     }
 
     // noexcept on the hot path is the house contract, and it is honest here: every call below is

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 // global allocation counter (no-alloc-in-process proof)
@@ -201,6 +202,96 @@ int main()
         }
         r.produceExact (tmp.data(), 32);
         felitronics::test::okNoAlloc (g_allocs.load() == before, "feed/produceAvailable/produceExact allocated nothing");
+    }
+
+    group ("\U0001f534 clearAudioState() — the stream restart WITHOUT re-deriving the kernel (P47)");
+    {
+        // WHY IT EXISTS: `reset (rates, capacity)` is this class's prepare(). It reassigns both vectors,
+        // `shrink_to_fit()`s on the identity path and re-derives 513 x 64 windowed-sinc coefficients with
+        // a Bessel evaluation per tap — 1.756 ms for the two legs of one lane, measured, and deliberately
+        // not noexcept. A caller restarting a LIVE stream (felitronics::nam::NamStage::reset) cannot pay
+        // that on the audio thread, and re-deriving a kernel is not what a restart means anyway.
+        //
+        // WHAT IT MUST BE: the state `reset()` leaves, exactly — so a restarted leg and a freshly reset
+        // one answer the same programme with the same BITS. Asserted on both paths, because the identity
+        // short-circuit and the filtering kernel keep their history differently.
+        for (const bool identity : { true, false })
+        {
+            const double inRate  = 48000.0;
+            const double outRate = identity ? 48000.0 : 44100.0;
+            const auto programme = sine (4000, inRate, 600.0);
+
+            StreamResampler restarted, freshly;
+            restarted.reset (inRate, outRate, 512);
+            freshly  .reset (inRate, outRate, 512);
+
+            // …the one that will be RESTARTED hears a different stream first.
+            {
+                const auto other = sine (3000, inRate, 311.0, 0.4f);
+                std::vector<float> tmp (2048);
+                for (int off = 0; off + 512 <= (int) other.size(); off += 512)
+                {
+                    restarted.feed (other.data() + off, 512);
+                    (void) restarted.produceAvailable (tmp.data(), (int) tmp.size());
+                }
+            }
+            const long before = g_allocs.load();
+            restarted.clearAudioState();
+            felitronics::test::okNoAlloc (g_allocs.load() == before,
+                                          std::string ("clearAudioState() allocates nothing on the ")
+                                          + (identity ? "identity" : "filtering") + " path");
+
+            std::vector<float> a (4096, 0.0f), b (4096, 0.0f);
+            int na = 0, nb = 0;
+            for (int off = 0; off + 512 <= (int) programme.size(); off += 512)
+            {
+                restarted.feed (programme.data() + off, 512);
+                na += restarted.produceAvailable (a.data() + na, (int) a.size() - na);
+                freshly  .feed (programme.data() + off, 512);
+                nb += freshly  .produceAvailable (b.data() + nb, (int) b.size() - nb);
+            }
+            int diff = 0;
+            for (int i = 0; i < std::min (na, nb); ++i) if (a[(std::size_t) i] != b[(std::size_t) i]) ++diff;
+            ok (na == nb && na > 1000 && diff == 0,
+                std::string ("a restarted leg is bit-identical to a freshly reset one on the ")
+                + (identity ? "identity" : "filtering") + " path (" + std::to_string (na) + " against "
+                + std::to_string (nb) + " samples, " + std::to_string (diff) + " differing)");
+        }
+
+        // 🔴 AND IT DOES NOT RESURRECT AN INSTANCE reset() NEVER CONFIGURED. `reset()` sets `len = 0`
+        // FIRST so that a throwing allocation leaves an object that produces NOTHING rather than one
+        // that reads an absent coefficient table; a restart that derived its length from `buf.size()`
+        // alone would undo exactly that. A default-constructed instance is the reachable half of the
+        // same state, and it must stay inert.
+        {
+            StreamResampler untouched;
+            untouched.clearAudioState();
+            std::vector<float> in (512, 0.5f), out (512, -1.0f);
+            untouched.feed (in.data(), 512);
+            const int got = untouched.produceAvailable (out.data(), (int) out.size());
+            ok (got == 0, "a resampler reset() never configured produces nothing after clearAudioState(): "
+                          + std::to_string (got) + " samples");
+        }
+
+        // …AND A MOVED-FROM INSTANCE, which is the same state reached by the one transition the validity
+        // bit does not see: the implicit move COPIES `configured_` and steals the vectors, so the corpse
+        // reads "configured" with an empty buffer. This was the first method of this class a moved-from
+        // instance could not survive — a fill through a null `data()`, which UBSan calls a store to a
+        // null pointer and ASan a SEGV. Every older method is benign there, and so is this one now.
+        {
+            StreamResampler alive;
+            alive.reset (48000.0, 44100.0, 512);
+            StreamResampler taken = std::move (alive);
+            alive.clearAudioState();
+            std::vector<float> in (512, 0.5f), out (512, -1.0f);
+            alive.feed (in.data(), 512);
+            ok (alive.produceAvailable (out.data(), (int) out.size()) == 0,
+                "a moved-FROM resampler survives clearAudioState() and still produces nothing");
+            taken.clearAudioState();
+            taken.feed (in.data(), 512);
+            ok (taken.produceAvailable (out.data(), (int) out.size()) > 0,
+                "…and the leg that took its storage still works");
+        }
     }
 
     return felitronics::test::report();

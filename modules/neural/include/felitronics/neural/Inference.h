@@ -19,7 +19,20 @@ namespace felitronics::neural
 //   prepare(sampleRate, maxBlock, maxChannels)  — off the audio thread; may allocate / prewarm.
 //   process(io, numChannels, numSamples) -> bool — RT-safe: no alloc/lock/IO/throw; in place. Law 11:
 //                                                 false = the call was REFUSED and nothing changed.
-//   reset()                                      — RT-safe state clear.
+//   reset()                                      — the STREAM RESTART: audio thread, and what it clears
+//                                                 is the audio the caller fed, so the next stream starts
+//                                                 where a freshly prepared instance would — as far as
+//                                                 the backend's own memory is finite and reachable. A
+//                                                 backend that cannot reach all of it (a recurrent cell,
+//                                                 a third party's clock) says so with a number rather
+//                                                 than promising: felitronics::nam::NamStage does, in
+//                                                 its header. RT-safe in the sense law 2 means — no alloc,
+//                                                 lock, IO or throw beyond whatever process() already
+//                                                 costs — but NOT necessarily O(the block): a backend
+//                                                 with a receptive field has to spend it, and it is the
+//                                                 backend's job to publish what that costs. The NAM one
+//                                                 does: 3.77 ms per lane for a real WaveNet at a
+//                                                 64-sample block, 282 % of that callback.
 //   latencySamples()                             — host-rate latency (incl. any backend resampling).
 //
 // NOT in the interface: model loading / parsing / paths. The adapter builds a prepared instance and

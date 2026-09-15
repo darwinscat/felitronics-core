@@ -15,17 +15,23 @@
 //
 // Threading mirrors the IR path exactly:
 //   • prepare() / loadModelFromMemory() / clearModel() / collectGarbage() — message thread.
-//   • process() — the ONLY thing the audio thread calls. 🔴 It never allocates, locks,
-//     does IO or throws. A freshly-loaded model is atomic-swapped into the live pointer;
+//   • process() and reset() — what the audio thread calls. 🔴 Neither allocates, locks,
+//     does IO or throws — for the architectures named in the next paragraph, which is the
+//     same carve-out for both. A freshly-loaded model is atomic-swapped into the live pointer;
 //     the replaced model is parked and freed on the message thread (collectGarbage) only
 //     once the audio thread has provably stepped past it — so no use-after-free and the
-//     audio thread never deletes.
+//     audio thread never deletes. process() is O(the block); reset() is NOT — see its own
+//     note below: it costs a whole drain length of inference per lane that has played.
 //
-// The no-allocation process() guarantee applies to architectures whose pinned NAM implementation
-// preallocates its work in Reset (Linear and WaveNet). LSTM at this pin returns an owning dynamic
-// Eigen hidden-state vector per sample; ConvNet constructs dynamic Eigen temporaries per block.
-// Those inherited OrbitCab behaviors are tracked upstream and are not rejected at load, preserving
-// byte-compatibility with OrbitCab.
+// The no-allocation guarantee — for process() AND for reset() — applies to architectures whose pinned
+// NAM implementation preallocates its work in Reset (Linear and WaveNet). LSTM at this pin returns an
+// owning dynamic Eigen hidden-state vector per sample; ConvNet constructs dynamic Eigen temporaries per
+// block. Those inherited OrbitCab behaviors are tracked upstream and are not rejected at load,
+// preserving byte-compatibility with OrbitCab. reset() INHERITS that carve-out — it runs the same
+// process path — rather than adding one, and at this pin it did not spend it: a stereo LSTM restart of
+// 48 000 samples allocated nothing through either gate (the house operator-new counter or Eigen's own
+// EIGEN_RUNTIME_NO_MALLOC), on the minimal fixture and on a real lstm.nam. So the carve-out is what
+// upstream's shape PERMITS, measured as unspent here; a restart is not a new exposure to it.
 //
 // The swap machinery itself (atomic live pointer, block-counter retire, message-thread GC) is
 // the shared felitronics::neural::NeuralStage — extracted from OrbitCab's original AmpStage;
@@ -50,7 +56,69 @@ public:
     // new sample-rate / block size. Message/host thread (prepareToPlay) — never the audio
     // thread (it can allocate + prewarm the network).
     void prepare (double sampleRate, int maxBlock);
-    void reset();
+
+    // 🔴 THE STREAM RESTART, AND IT MEANS IT. Audio thread (or any thread with audio stopped): every
+    // lane that carried audio is fed the digital silence it still owes, here and in full, until its
+    // state is provably the state of a lane that was silent all along.
+    //
+    // WHAT IS PROMISED IS INDEPENDENCE: nothing the CALLER fed before the restart can be heard after it.
+    // That one is EXACT and is what the suite pins — two stages fed different audio before the restart
+    // answer the next programme with the same bits, at every rate, on every shape.
+    //
+    // It is NOT "silence comes out": a capture answers digital zero with whatever its own biases make of
+    // it, fresh and restarted alike — measured on the shipped examples at 48 kHz, 0.001195220510 for a
+    // real Standard and 9.266554832458 for the A2-max feature set. Exact zero is a property of the
+    // bias-free fixtures, which is what lets them witness the promise.
+    //
+    // And it is not, in general, "bit-identical to a stage prepared a moment ago": NAM's answer depends
+    // on how the stream is CUT INTO CALLS (the same property that moves a decaying cell's first sample
+    // when `maxModelFrames` changes — see configureRates), and a restart's chunking is its own. Measured
+    // against a stage prepared a moment ago: exactly 0 for every fixture in the suite and for a real
+    // slimmable WaveNet, and 1.037e-06 for a real Standard at blocks 64…512, where the restart's last
+    // chunk is short. That residue is not audio this failed to flush — independence is exactly 0 for the
+    // same capture — and feeding the debt in whole prepared blocks removes it, which is a decision about
+    // the ledger rather than a patch.
+    //
+    // ⚠️ IT IS NOT O(THE BLOCK), and it is the only call here that is not. The price is one lane's whole
+    // DRAIN LENGTH of inference per dirty lane — the model's field, plus the partitioned-FFT ring any
+    // `Linear` capture is charged, plus each rate-matcher leg's own tap window, so it is bigger than
+    // prewarmSamples() and that getter is not an estimate of it (a 2001-tap Linear reports 2000 and is
+    // charged 4048; an untagged LSTM reports 1 and is charged 24 000). On an M-series core, per lane, a
+    // real Standard WaveNet costs 3.77 ms at a 64-sample block — 282 % of that callback — 3.46 ms at
+    // 256, 3.43 at 512; a real LSTM 1.3 ms; a dense 2001-tap Linear 0.13 ms — and it grows faster than
+    // linearly as the block SHRINKS, because NAM's per-call overhead is paid `debt / maxBlock` times: a
+    // real Standard costs 3.61 ms per lane at block 256 and 19.47 ms at block 1. It is allocation-,
+    // lock- and throw-free exactly where process() is — the same code path, so the same carve-out, and
+    // that carve-out is wider than the architecture names above suggest: `wavenet_a2_max.nam`, a WaveNet
+    // in NAM's own example set, allocates 4 times per sample in process() (1024 allocations for one
+    // stereo 256-block, measured) and therefore inside a restart too. So it is safe to call from the
+    // audio thread and it is NOT free there:
+    // at a small block a host that calls it mid-stream buys one late callback. The natural place is
+    // where prepareToPlay is — and the debt is re-armed only by audio actually being FED, so a second
+    // restart with nothing in between costs nothing, and a mono host pays for one lane, not two. (For a
+    // RECURRENT capture it is deliberately NOT idempotent — see below: each restart spends the heuristic
+    // again, because such a lane never becomes provably clean.)
+    //
+    // ⚠️ A RECURRENT CAPTURE IS THE NAMED EXCEPTION (DSP-ARCHITECTURE.md, law 11a): no finite length of
+    // silence empties an LSTM cell, so this spends NAM's own half-second heuristic and leaves what that
+    // leaves — measured 300 samples differing from a fresh instance, worst 1.49e-07, on a real capture,
+    // and 0.419413 on the repository's deliberately slow fixture. A recurrent lane is therefore never
+    // marked clean: every restart spends the heuristic again, which is what NAM's own Reset does too.
+    //
+    // ⚠️ AND IT FLUSHES WHAT THE LEDGER CAN SEE. A capture whose CONDITIONER is a whole model of its own
+    // (`config.condition_dsp`) hides that model's memory from both readers of the field: NAM answers 0
+    // for a `Linear` conditioner and `detail::receptiveFieldFromConfig` walks `submodels`, not
+    // `condition_dsp`. Such a capture is under-flushed by exactly as much here as it is under-DRAINED by
+    // law 11a's falling edge — measured on a WaveNet with a 2001-tap conditioner, 0.905147969723 after a
+    // full drain and 0.905148267746 after a restart. That is one defect in one ledger, and it is
+    // registered against the ledger rather than papered over in each of its two readers.
+    //
+    // ⚠️ AND IT CANNOT REWIND A THIRD PARTY'S CLOCK. NAM's partitioned `Linear` engine counts every
+    // sample the instance has ever seen and decides from it where the next programme falls against its
+    // partition boundaries; rewinding that means re-configuring the engine, which allocates. The residue
+    // is 1.1e-07 against a stage prepared a moment ago and EXACTLY ZERO against one clocked to the same
+    // point — the engine's own arithmetic, not state this stage kept.
+    void reset() noexcept;
 
     // 🔴 RT-safe, in place. No model loaded → clean passthrough (no-op, and an ACCEPTED call).
     // `normalize` applies the model's loudness makeup (output normalisation) when the model
@@ -271,6 +339,17 @@ public:
     // is still being clocked or not, so "and then it stops" has no witness in the audio and a drain that
     // ran for ever would look identical. Counted per chunk on the audio thread with a relaxed store.
     long long drainedSamples() const;
+
+    // 🔴 THE RESTART'S OWN ODOMETER — how many samples of digital silence `reset()` has spent, since
+    // this stage was CONSTRUCTED. Kept apart from drainedSamples() on purpose: the two mechanisms feed
+    // silence for different reasons (a lane the caller stopped handing over, against a stream restart),
+    // and one number for both would be an oracle that cannot say which of them moved.
+    //
+    // Like the drain's, this exists to be TESTED: "the full length for a lane that was playing, the
+    // remainder for one mid-drain, and NOTHING for a lane that never carried audio" has no witness in
+    // the audio — a restart that ran a second network for a mono host sounds exactly like one that did
+    // not, and costs 132 ms of a real WaveNet per call.
+    long long clearedSamples() const;
 
 private:
     struct Impl;
