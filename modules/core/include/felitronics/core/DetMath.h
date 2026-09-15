@@ -8,6 +8,33 @@
 #include <cstdint>
 #include <limits>
 
+//==============================================================================
+// A CONSUMER'S UNSAFE-MATH FLAGS UNDO EVERYTHING BELOW, so refuse to compile under the ones that say so.
+// This is a header-only library: the flags that decide whether the code below is deterministic belong to
+// whoever includes it, not to us. Measured on this tree, over 100000 points of det::pow10:
+//
+//     flag                             clang/arm64          gcc 14 x86-64
+//     (none)                           2253cf954ae4dc64     2253cf954ae4dc64   <- the reference
+//     -ffp-contract=fast               2253cf954ae4dc64     2253cf954ae4dc64   <- the volatile pin HOLDS
+//     -ffast-math                      c2c77b419859ee6b     694fb75fe048f32a   <- broken, and differently
+//     -funsafe-math-optimizations      bee2675b81d4fcd3     (same class)
+//
+// So contraction is handled (mulAdd's volatile is exactly what survives -ffp-contract=fast), and
+// REASSOCIATION is not: -fassociative-math lets the compiler rewrite the Dekker splits and the polynomial
+// accumulations into algebraically-equal, numerically-different forms, after which nothing here is the
+// same on two rows and the whole point of the file is gone silently.
+//
+// WHAT THIS GUARD CATCHES AND WHAT IT CANNOT. gcc defines __FAST_MATH__ for -ffast-math and
+// __ASSOCIATIVE_MATH__ for -funsafe-math-optimizations, so both are caught there. Clang defines
+// __FAST_MATH__ for -ffast-math but defines NOTHING for a bare -funsafe-math-optimizations (measured:
+// the only macro it moves is __FINITE_MATH_ONLY__, to 0, which is also its default). That case is
+// therefore NOT detectable at preprocessing time on the row that is both the developer's machine and the
+// wasm toolchain, and pretending otherwise would be worse than saying it: DetMathTests.cpp carries a
+// RUNTIME check of a known det::pow10 value for exactly that hole.
+#if defined(__FAST_MATH__) || defined(__ASSOCIATIVE_MATH__)
+    #error "felitronics/core/DetMath.h is being compiled with unsafe math (-ffast-math / -funsafe-math-optimizations). Reassociation rewrites the Dekker splits and polynomial accumulations here, so det:: stops being the same function on every row — which is the only reason this header exists. Compile the translation units that include it without those flags."
+#endif
+
 namespace felitronics::core::det
 {
 

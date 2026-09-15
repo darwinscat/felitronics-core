@@ -160,8 +160,15 @@ public:
     // answers disagree is worse than one that is merely wrong.
     double truePeakDb()     const noexcept
     {
+        // `det::log10`, because this value IS a bit-exactness surface after all: parity.mjs prints it as
+        // `dbtp = ...` and CI runs a plain `diff` of that text against the native run (.github/workflows/
+        // ci.yml). The comment above was written when only the block energies were compared. std::log10
+        // differs between Apple's libm, glibc's and musl's, so the printed digits were agreeing by luck.
+        // THE 1e-9 FLOOR STAYS THIS FUNCTION'S OWN. It is NOT core::kGainToDbFloor (1e-12), and swapping
+        // it for the shared one would change the number a silent file prints from -180 to -240 — a change
+        // to what the tool says, smuggled in under a change to how it rounds. One thing at a time.
         const double tp = truePeakLinear();
-        return 20.0 * std::log10 (tp > 1e-9 ? tp : 1e-9);
+        return 20.0 * felitronics::core::det::log10 (tp > 1e-9 ? tp : 1e-9);
     }
     int    droppedBlocks()  const noexcept { return lm_.droppedBlocks(); }
     // Forwarded so a caller can tell a MEASUREMENT from a best-effort number: non-zero means a

@@ -155,7 +155,14 @@ FC_EXPORT double fc_probe_lufs (const float* planar, std::uint32_t frames, std::
 
 FC_EXPORT double fc_probe_dbtp (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate)
 {
-    if (! run (planar, frames, channels, sampleRate)) return 20.0 * std::log10 (1e-9);
+    // The failure sentinel, spelled as the NUMBER it is rather than as a libm call that computes it.
+    // `20.0 * std::log10 (1e-9)` is exactly -180.0 on Apple, glibc and musl, folded and at runtime
+    // (measured, all six) — so this is bit-identical and buys two things. It stops a printed, diffed value
+    // depending on a libm at all; and it closes the constant-fold hazard, where a compiler evaluates a
+    // constant argument with its OWN high-precision arithmetic while the runtime call uses the row's libm,
+    // and the same expression yields two different doubles in one binary. The neighbouring LUFS sentinel
+    // at fc_probe_lufs() has always been a plain -120.0, which is the same decision made earlier.
+    if (! run (planar, frames, channels, sampleRate)) return -180.0;
     return probe().truePeakDb();
 }
 

@@ -334,7 +334,11 @@ private:
         const std::uint32_t mant = (bits & 0x7FFFFFu) | 0x800000u;
         return std::max (0, 150 - ex - std::countr_zero (mant));
     }
-    static double toDb (double lin) noexcept { return lin > 1.0e-10 ? core::gainToDb (lin) : -200.0; }
+    // `gainToDbDet`: the clip report is one of the outputs CI diffs byte for byte against the wasm
+    // module. THE 1e-10 GATE AND THE -200.0 SENTINEL ARE THIS CLASS'S OWN and do not move — they are a
+    // different floor from core::kGainToDbFloor on purpose, and swapping them here would change what a
+    // silent channel reports while pretending to change only how it rounds.
+    static double toDb (double lin) noexcept { return lin > 1.0e-10 ? core::gainToDbDet (lin) : -200.0; }
     bool has (int c) const noexcept { return c >= 0 && c < (int) chans_.size(); }
     static constexpr float kHole = std::numeric_limits<float>::quiet_NaN();
 

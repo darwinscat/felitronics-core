@@ -157,5 +157,61 @@ int main()
         ok (std::bit_cast<std::uint64_t> (det::sin (0.0)) == std::bit_cast<std::uint64_t> (0.0), "domain: sin(0) is exactly +0");
     }
 
+    // ---------- 6. THE UNSAFE-MATH TRIPWIRE, which no #if can be ----------
+    // DetMath.h refuses to compile under -ffast-math and, on gcc, under -funsafe-math-optimizations,
+    // because reassociation rewrites its Dekker splits and polynomial accumulations into algebraically
+    // equal, numerically different forms. Measured over 100000 points of det::pow10:
+    //
+    //     flag                          clang/arm64          gcc 14 x86-64
+    //     (none)                        2253cf954ae4dc64     2253cf954ae4dc64
+    //     -ffp-contract=fast            2253cf954ae4dc64     2253cf954ae4dc64   <- the volatile pin holds
+    //     -ffast-math                   c2c77b419859ee6b     694fb75fe048f32a   <- broken, differently
+    //     -funsafe-math-optimizations   bee2675b81d4fcd3     (same class)
+    //
+    // THE HOLE THE #error CANNOT CLOSE: clang defines NO macro for a bare -funsafe-math-optimizations
+    // (measured — the only one it moves is __FINITE_MATH_ONLY__, to 0, which is also its default), and
+    // clang is both the developer's row and the wasm toolchain. So the preprocessor cannot see that case
+    // and this runtime check is what does. It is two assertions on purpose:
+    //   · within 2 ulp of the CORRECTLY ROUNDED value (Python's decimal at 60 digits, an oracle computed
+    //     outside this tree) — that is the accuracy claim, and it is what a wrong answer violates;
+    //   · equal to a PINNED bit pattern — that is the flag claim. A build whose flags have quietly
+    //     rewritten this arithmetic still lands near the right answer; it just stops landing on the same
+    //     double as every other row, which is the entire property det:: exists to provide.
+    {
+        // TWO reference tables, because they are two different claims and collapsing them is wrong —
+        // the first draft of this test used the oracle as the pin and failed at once, correctly: det is
+        // within 2 ulp of correctly rounded, not equal to it, and at 10^-1.15 it is exactly 1 ulp off.
+        struct Ref { double x; std::uint64_t rounded; std::uint64_t det; };
+        static const Ref refs[] = {
+            //  x        correctly rounded      what det:: returns
+            { -3.0,  0x3f50624dd2f1a9fcull, 0x3f50624dd2f1a9fcull },
+            { -1.15, 0x3fb21f97ef20893bull, 0x3fb21f97ef20893cull },   // 1 ulp — det's stated accuracy, not a fault
+            { 0.6,   0x400fd93c1f526de0ull, 0x400fd93c1f526de0ull },
+            { -6.0,  0x3eb0c6f7a0b5ed8dull, 0x3eb0c6f7a0b5ed8dull },
+            { 2.5,   0x4073c3a4edfa9759ull, 0x4073c3a4edfa9759ull },
+            { -0.05, 0x3fec8520affa0a4bull, 0x3fec8520affa0a4bull },
+        };
+        // The `rounded` column is Python's decimal at 60 digits — an oracle from outside this tree.
+        // The `det` column was captured from Apple clang/arm64, gcc 14/glibc x86-64 and emcc/musl wasm32,
+        // which returned THE SAME BITS at all six points; that agreement is what makes it a pin on the
+        // build's flags rather than a photograph of one machine.
+        int worst = 0, moved = 0;
+        for (const auto& r : refs)
+        {
+            const std::uint64_t gb = std::bit_cast<std::uint64_t> (det::pow10 (r.x));
+            const std::int64_t d = (std::int64_t) gb - (std::int64_t) r.rounded;
+            const int ulp = (int) (d < 0 ? -d : d);
+            if (ulp > worst) worst = ulp;
+            if (gb != r.det) ++moved;
+        }
+        ok (worst <= 2, "oracle: det::pow10 within " + std::to_string (worst)
+                        + " ulp of the correctly rounded value at 6 points");
+        ok (moved == 0, moved == 0
+              ? "pinned: det::pow10 returns the same bits as every other row — this build's flags have not rewritten it"
+              : "PINNED VALUE MOVED at " + std::to_string (moved) + " of 6 points. If the code is unchanged, this build "
+                "is compiled with unsafe math (-ffast-math / -funsafe-math-optimizations / -Ofast). clang defines no "
+                "macro for the second of those, which is why this is a runtime check and not an #error.");
+    }
+
     return felitronics::test::report();
 }

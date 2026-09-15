@@ -1429,7 +1429,13 @@ private:
     // `gainToDb` above 1e-10f — the float threshold, widened, so the boundary is the old one to the bit — and -200 for
     // anything quieter. Kept on purpose when the instrument changed (P62), so
     // the switch moves the READING and nothing about how silence is spelled to a caller that tests for it.
-    static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDb (lin) : -200.0; }
+    // `gainToDbDet`, and it MUST move together with ReferenceTruePeakMeter::truePeakDb(). The note at the
+    // top of this class says the reported number IS the certificate, bit for bit; the certificate is that
+    // meter's dB getter, and this is the solver's. Converting one and not the other makes the two spellings
+    // of one value disagree at the last ulp — which is not a theory: it is what
+    // felitronics_delivered_ceiling_tests caught within one run of the first half of this change, on
+    // 44100->88200, 48000->96000, 48000->192000 and 88200->192000.
+    static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDbDet (lin) : -200.0; }
 
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {

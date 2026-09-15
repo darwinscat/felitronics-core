@@ -272,8 +272,20 @@ private:
         for (int i = 0; i < N; ++i)
         {
             const double x    = (double) i - cen;
+            // `det::sin`, and it moves NOT ONE BIT of any shipped filter — measured, not assumed. The taps
+            // are narrowed to float two lines down, and that narrowing throws away 29 of the bits the two
+            // libms can disagree about. On the reference 4x32 topology the system and deterministic designs
+            // differ at 18 of 128 taps IN DOUBLE (up to 2 ulp) and at ZERO of 128 in float; the same holds
+            // at 2x32, 8x32, 4x12, 2x12, 1x12, 4x16 and 2x64, and the final float arrays are byte-identical
+            // across Apple clang/arm64, gcc 14/glibc, emcc/musl and MSVC/UCRT — four libms, one answer.
+            // THE MARGIN, because "zero differences" is worth little without one: perturbing every sin()
+            // result by a deliberate k ulp leaves all 128 taps unmoved up to k = 2^24, and only past there
+            // does a tap flip. The real spread between libms is 1-3 ulp. So this is not a coincidence that
+            // could turn over on the next toolchain — it is seven orders of magnitude of headroom, and
+            // OversamplingTests pins the taps against a generated table so a future row that breaks the
+            // absorption is caught rather than discovered.
             const double sinc = (std::fabs (x) < 1e-9) ? (2.0 * fc)
-                                                       : std::sin (2.0 * core::kPi * fc * x) / (core::kPi * x);
+                                                       : core::det::sin (2.0 * core::kPi * fc * x) / (core::kPi * x);
             const double r    = (double) (2 * i - (N - 1)) / (double) (N - 1);   // ∈ [-1,1]
             const double win  = detail::besselI0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / i0b;
             const double v    = sinc * win;
