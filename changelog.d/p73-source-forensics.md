@@ -12,6 +12,27 @@
 - **`fcore_measure forensics`** prints the whole report, every float as a raw IEEE-754 bit pattern.
 
 ### Notes
+- **A band limit is a suffix property, and its FLOOR is read past the transition.** The strict suffix
+  maximum is anchored at the transition's end, not at the winning boundary: the winner sits on the cell
+  that contains the band limit — that is what makes it the winner — so anchored there it reports a clean
+  wall with 80 dB of "recovery" above it and a strict drop near zero (measured: 805 of 2350 constructed
+  cutoffs, worst 80.4 dB, and one NEGATIVE drop).
+- **Is there a floor to reach at all?** The floor reference is the median of the span above the edge, so on
+  a stopband that is still descending it sits halfway down the descent and the transition "ends" half a
+  span past the edge: an identical 16 kHz brickwall measured 49.8 Hz of transition over a flat floor and
+  1594 Hz over one decaying at 15 dB/kHz, with `sharp` flipping false at 10 dB/kHz and true again at 25.
+  The span's two halves are now compared; disagreement means there is no single floor, the width is a lower
+  bound, and `transitionClipped` says so — a flag that was otherwise provably unreachable, so the promise
+  attached to it had never been kept.
+- **The grid's exact reading is a maximum, so a robust one is published beside it.** On float-rendered
+  material — a 16-bit programme with a float fade-out, which is every real render — the fade's samples take
+  `gridExponent` to 85 or 149 and the exact word length goes dark. `robustPcmBits` is the shortest word
+  holding all but `gridOutlierFraction` (5 % by default, set by the length of a real fade) of the non-zero
+  samples, computed from the histogram already accumulated; a tolerance of 0 makes it the exact reading.
+- **A geometry that cannot finish is refused, not discovered at finish().** The edge search sorts one
+  plateau span per candidate, so `fftOrder 22` with 0.01 Hz cells and a 12 kHz plateau span is 2.1 million
+  candidates sorting a million doubles each. `storageFor()` and `prepare()` refuse it; the default geometry
+  is 19240.
 - **A band limit is a SUFFIX property.** The obvious construction — the steepest local descent, then the
   level just above it — reports a deep notch (a band-stop, a comb, a room null) as a 100 dB wall with a
   one-cell transition while full-power spectrum resumes 400 Hz higher, and it can select that notch and

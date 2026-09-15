@@ -690,7 +690,7 @@ int main (int argc, char** argv)
         const double ps[] = { fx.cellHz(), fx.binHz(), fx.searchFromHz(), fx.searchToHz(), fp.cellWidthHz,
                               fp.searchFromHz, fp.plateauSpanHz, fp.floorSpanHz, fp.transitionStartDb,
                               fp.transitionEndDb, fp.minDropDb, fp.maxTransitionHz, fp.nearNyquistFraction,
-                              fp.emptyDb, fp.emptyMinHz };
+                              fp.emptyDb, fp.emptyMinHz, fp.gridOutlierFraction };
         for (double d : ps) std::printf (" %016llx", (unsigned long long) bits (d));
         std::printf ("\n");
         std::printf ("samples %lld tail %lld frames %lld\n", (long long) fx.samplesProcessed(),
@@ -699,27 +699,31 @@ int main (int argc, char** argv)
         {
             const analysis::SpectralWall w = c < nc ? fx.wall (c) : fx.wall();
             std::printf ("wall %d valid=%d reason=%d sharp=%d nearnyq=%d clipped=%d trunc=%d exempted=%d"
-                         " frames=%lld/%lld\n", c, (int) w.valid, (int) w.reason, (int) w.sharp,
-                         (int) w.nearNyquist, (int) w.transitionClipped, (int) w.truncatedAtNyquist,
-                         w.exemptedCells, (long long) w.framesUsed, (long long) w.framesHoled);
+                         " second=%d/%d/%d/%d secondreason=%d empty=%d emptyreason=%d frames=%lld/%lld\n",
+                         c, (int) w.valid, (int) w.reason, (int) w.sharp, (int) w.nearNyquist,
+                         (int) w.transitionClipped, (int) w.truncatedAtNyquist, w.exemptedCells,
+                         (int) w.secondValid, (int) w.secondSharp, (int) w.secondTransitionClipped,
+                         (int) w.secondTruncatedAtNyquist, (int) w.secondReason,
+                         (int) w.emptyAboveValid, (int) w.emptyAboveReason,
+                         (long long) w.framesUsed, (long long) w.framesHoled);
             const double ds[] = { w.cutoffHz, w.cutoffFractionOfNyquist, w.steepestHz, w.transitionEndHz,
                                   w.transitionHz, w.plateauPower, w.floorLocalPower, w.maxAbovePower,
                                   w.sufMaxPower, w.dropDb, w.strictDropDb, w.localDropDb, w.recoveryDb,
                                   w.plateauSpreadDb, w.steepnessDbPerOctave, w.secondCutoffHz, w.secondDropDb,
                                   w.secondTransitionHz, w.emptyAboveHz, w.emptyAboveFractionOfNyquist,
                                   w.emptyThresholdPower, w.peakCellPower };
-            std::printf ("wall %d second=%d/%d empty=%d", c, (int) w.secondValid, (int) w.secondSharp,
-                         (int) w.emptyAboveValid);
+            std::printf ("wall %d values", c);
             for (double d : ds) std::printf (" %016llx", (unsigned long long) bits (d));
             std::printf ("\n");
         }
         for (int c = 0; c < nc; ++c)
         {
             const analysis::SampleGrid g = fx.sampleGrid (c);
-            std::printf ("grid %d valid=%d reason=%d k=%d pcm=%d outofrange=%d bits=%d peak=%016llx"
-                         " min=%016llx max=%016llx\n",
+            std::printf ("grid %d valid=%d reason=%d k=%d pcm=%d outofrange=%d bits=%d robustk=%d"
+                         " robustbits=%d zerolow24=%d peak=%016llx min=%016llx max=%016llx\n",
                          c, (int) g.valid, (int) g.reason, g.gridExponent, (int) g.pcmCompatible,
-                         (int) g.outsidePcmRange, g.minExactPcmBits, (unsigned long long) bits (g.absPeak),
+                         (int) g.outsidePcmRange, g.minExactPcmBits, g.robustGridExponent, g.robustPcmBits,
+                         g.alwaysZeroLowBits (24), (unsigned long long) bits (g.absPeak),
                          (unsigned long long) bits (g.sampleMin), (unsigned long long) bits (g.sampleMax));
             std::printf ("grid %d nonzero=%lld zero=%lld nonfinite=%lld absent=%lld offgrid=%lld"
                          " firstoffgrid=%lld firstmaxk=%lld distinct=%lld complete=%d\n",

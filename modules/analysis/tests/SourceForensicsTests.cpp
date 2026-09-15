@@ -46,27 +46,34 @@
 // gate. Each mutant was built with the object file DELETED first and refused a verdict unless a
 // `Building CXX` line appeared: a header edited in the same SECOND as the previous build is invisible to
 // make's 1-second mtime granularity, and that alone cost three false greens elsewhere today.
-//   (1) the frame's power accumulated at the END of process() instead of at frame close  -> RED, 22 of 422
-//   (2) a holed frame accumulated anyway (the frameFinite check dropped)                  -> RED,  4 of 422
-//   (3) the aggregate dividing every channel by channel 0's frame count (pooling)         -> RED,  1 of 422
-//   (4) the k <= 23 gate removed, so a finer grid reports a PCM word length anyway        -> RED,  5 of 422
-//   (5) exact zeros no longer skipped when witnessing the grid                            -> RED, 13 of 422
-//   (6) the distinct set marked incomplete on REACHING the limit, not on a new key it      -> RED,  1 of 422
-//       could not store
-//   (7) the plateau quantile taken as the MAXIMUM instead of the median                    -> RED, 17 of 422
-//   (8) the suffix rank replaced by the cell just above (the pre-consilium construction)   -> RED, 13 of 422
-//   (9) the top cell left as a partial cell of its own instead of absorbing the remainder  -> RED,  2 of 422
-//  (10) the grid coordinates taken after the clock advanced instead of before              -> RED,  1 of 422
-//  (11) the STRICT floor taken from the median-filtered cells instead of the raw ones      -> RED,  6 of 422
-//  (12) the measurement reading the PENDING parameters instead of prepare()'s snapshot     -> RED,  1 of 422
-//  (13) pcmCompatible ignoring the PCM range, so +1.0 gets a word length                   -> RED,  1 of 422
-//  (14) a failed prepare() leaving the finished report armed                               -> RED,  3 of 422
-//  (15) the emptiness minimum back to one bin, so "empty above Nyquist" can be claimed     -> RED,  1 of 422
-// Fifteen of fifteen red, and the baseline rebuilt green afterwards. (11) through (15) exist because the
-// CODE-REVIEW round found those five defects and the first ten mutants did not cover them; (11) in
-// particular came back GREEN on the first stand, which is what proved the suite had a hole there rather
-// than a gate. Mutant (8) is the one that matters most: it
-// restores the construction the design consilium killed, and it is red on the notch fixtures alone.
+//   ( 1) the frame's power accumulated at the END of process(), not at frame close -> RED, 26 of 499
+//   ( 2) a holed frame accumulated anyway (the frameFinite check dropped)            -> RED,  4 of 499
+//   ( 3) the aggregate dividing every channel by channel 0's frame count (pooling)   -> RED,  1 of 499
+//   ( 4) the k <= 23 gate removed, so a finer grid reports a PCM word length anyway  -> RED,  5 of 499
+//   ( 5) exact zeros no longer skipped when witnessing the grid                      -> RED, 14 of 499
+//   ( 6) the distinct set marked incomplete on REACHING the limit, not on a new key  -> RED,  1 of 499
+//   ( 7) the plateau quantile taken as the MAXIMUM instead of the median             -> RED, 25 of 499
+//   ( 8) the suffix rank replaced by the cell just above (the pre-consilium floor)   -> RED, 14 of 499
+//   ( 9) the top cell left as a partial cell instead of absorbing the remainder      -> RED,  3 of 499
+//   (10) the grid coordinates taken after the clock advanced instead of before       -> RED,  1 of 499
+//   (11) the STRICT floor taken from the median-filtered cells, not the raw ones     -> RED,  3 of 499
+//   (12) the measurement reading the PENDING parameters, not prepare()'s snapshot    -> RED,  1 of 499
+//   (13) pcmCompatible ignoring the PCM range, so +1.0 gets a word length            -> RED,  1 of 499
+//   (14) a failed prepare() leaving the finished report armed                        -> RED,  3 of 499
+//   (15) the emptiness minimum back to one bin ("empty above Nyquist")               -> RED,  2 of 499
+//   (16) the strict floor anchored at the ARGMAX instead of the transition end       -> RED,  7 of 499
+//   (17) the floor span's two halves no longer compared (transitionClipped dead)     -> RED,  2 of 499
+//   (18) the robust grid reading taking the max bucket instead of the tail budget    -> RED,  2 of 499
+//   (19) the edge search's work bound removed                                        -> RED,  2 of 499
+//   (20) the histogram's top two buckets merged again                                -> RED,  2 of 499
+// Twenty of twenty red against a clean baseline, and the baseline rebuilt green afterwards. (11)-(15)
+// exist because the CODE-REVIEW round found those defects and the first ten mutants did not cover them;
+// (16)-(20) because the DIVERSE-TESTING round found five more. TWO of them came back GREEN on their first
+// stand, and each time that proved a hole in the SUITE rather than in the code: (11) — nothing asserted
+// where the strict floor came from — and (15), where the later ceil() fix made the two-bin clamp redundant
+// at every order the suite ran, until a 768 kHz row put the clamp back under load. Mutant (8) is still the
+// one that matters most: it restores the construction the design consilium killed, and it is red on the
+// notch fixtures alone.
 // The mutant the brief names for every analyzer of this wave — moving the denormal flush to the end of
 // process() — does not exist here: this analyzer has no feedback state, no IIR and no denormal cadence,
 // so there is nothing to flush and nothing for a StateGrid to clock. Mutant (1) is its structural
@@ -83,6 +90,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <random>
 #include <set>
@@ -90,7 +98,13 @@
 #include <vector>
 
 static std::atomic<long> g_allocs { 0 };
-void* operator new (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s); }
+void* operator new (std::size_t s)
+{
+    g_allocs.fetch_add (1, std::memory_order_relaxed);
+    void* p = std::malloc (s == 0 ? 1 : s);
+    if (p == nullptr) std::abort();        // an allocation function may not return null; the wasm row has no exceptions
+    return p;
+}
 void  operator delete (void* p) noexcept { std::free (p); }
 void  operator delete (void* p, std::size_t) noexcept { std::free (p); }
 
@@ -334,6 +348,7 @@ void putGrid (Trace& tr, const SampleGrid& g)
 {
     putB (tr, g.valid); put (tr, (std::int64_t) g.reason); put (tr, g.gridExponent);
     putB (tr, g.pcmCompatible); putB (tr, g.outsidePcmRange); put (tr, g.minExactPcmBits);
+    put (tr, g.robustGridExponent); put (tr, g.robustPcmBits);
     putD (tr, g.absPeak); putD (tr, g.sampleMin); putD (tr, g.sampleMax);
     put (tr, g.nonZeroSamples); put (tr, g.zeroSamples); put (tr, g.nonFiniteSamples);
     put (tr, g.absentSamples); put (tr, g.offGridSamples); put (tr, g.firstOffGridSample);
@@ -350,9 +365,11 @@ void putWall (Trace& tr, const SpectralWall& w)
     putD (tr, w.sufMaxPower); put (tr, w.exemptedCells);
     putD (tr, w.dropDb); putD (tr, w.strictDropDb); putD (tr, w.localDropDb); putD (tr, w.recoveryDb);
     putD (tr, w.plateauSpreadDb); putD (tr, w.steepnessDbPerOctave);
-    putB (tr, w.secondValid); putB (tr, w.secondSharp);
+    putB (tr, w.secondValid); putB (tr, w.secondSharp); putB (tr, w.secondTransitionClipped);
+    putB (tr, w.secondTruncatedAtNyquist); put (tr, (std::int64_t) w.secondReason);
     putD (tr, w.secondCutoffHz); putD (tr, w.secondDropDb); putD (tr, w.secondTransitionHz);
-    putB (tr, w.emptyAboveValid); putD (tr, w.emptyAboveHz); putD (tr, w.emptyAboveFractionOfNyquist);
+    putB (tr, w.emptyAboveValid); put (tr, (std::int64_t) w.emptyAboveReason);
+    putD (tr, w.emptyAboveHz); putD (tr, w.emptyAboveFractionOfNyquist);
     putD (tr, w.emptyThresholdPower); putD (tr, w.peakCellPower);
     putD (tr, w.binHz); putD (tr, w.cellHz); putD (tr, w.nyquistHz);
     putD (tr, w.searchFromHz); putD (tr, w.searchToHz);
@@ -526,7 +543,23 @@ int main()
         ok (sf.bins() == (1 << (kOrder - 1)) + 1, "geometry: bins == N/2 + 1");
         approx (sf.binHz(), kFs / 4096.0, 1e-12, "geometry: binHz");
         approx (sf.cellHz(), (double) sf.binsPerCell() * sf.binHz(), 1e-12, "geometry: a cell is a whole number of bins");
-        ok (sf.cellHz() <= p.cellWidthHz, "geometry: the effective cell is no wider than requested");
+        // ...no wider than requested OR one bin, whichever is larger: a cell is never narrower than a bin,
+        // so at fftOrder 8 the requested 50 Hz becomes 187.5. The assertion used to be the unqualified one
+        // and passed only because this block runs at order 12.
+        ok (sf.cellHz() <= std::max (p.cellWidthHz, sf.binHz()),
+            "geometry: the effective cell is no wider than requested, or is one bin");
+        for (int order : { 8, 9, 10, 12, 14 })
+        {
+            SourceForensics g2;
+            auto q = defaults();
+            q.fftOrder = order;
+            g2.setParams (q);
+            ok (run (g2.prepare (kFs, 64, 1)), "geometry: prepare at order " + std::to_string (order));
+            ok (g2.cellHz() <= std::max (q.cellWidthHz, g2.binHz()),
+                "geometry: order " + std::to_string (order) + " cell " + std::to_string (g2.cellHz()) + " Hz");
+            ok (g2.binsPerCell() >= 1 && g2.cellCount() >= 1, "geometry: order " + std::to_string (order)
+                                                              + " has cells at all");
+        }
         ok (sf.cellCount() * sf.binsPerCell() <= sf.bins(), "geometry: the cells fit inside the bins");
         ok ((sf.cellCount() + 1) * sf.binsPerCell() > sf.bins(), "geometry: and the top cell absorbs the remainder");
         ok (sf.searchToHz() <= kFs * 0.5, "geometry: the top candidate is at or below Nyquist");
@@ -539,24 +572,41 @@ int main()
         // A published emptiness coordinate must be STRICTLY below Nyquist at EVERY order, or the claim can
         // be "everything above Nyquist is empty" — vacuously true and read as a finding. At fftOrder 8 the
         // 200 Hz minimum floors to one bin, which is exactly how that happened (code-review round).
-        for (int order : { 8, 9, 10, 12 })
+        // ...at several orders AND at the extremes of the sample-rate range: what makes the guard bite is
+        // binHz against emptyMinHz, so the case that needs the two-bin floor is a COARSE bin — order 8 at
+        // 768 kHz gives 3000 Hz bins, where the requested 200 Hz rounds up to one bin and only the floor
+        // keeps the claim off Nyquist itself.
+        struct EmptyCase { double fs; int order; };
+        const EmptyCase emptyCases[] = { { kFs, 8 }, { kFs, 9 }, { kFs, 10 }, { kFs, 12 },
+                                         { 768000.0, 8 }, { 768000.0, 10 }, { 1000.0, 8 } };
+        for (const auto& ec : emptyCases)
         {
             SourceForensics probe;
             auto q = defaults();
-            q.fftOrder = order;
+            q.fftOrder = ec.order;
+            if (ec.fs < 4000.0)                                  // every frequency parameter is bounded by
+            {                                                    // the rate, so a 1 kHz stream needs its own
+                q.cellWidthHz = ec.fs / 960.0;
+                q.plateauSpanHz = ec.fs / 24.0;
+                q.floorSpanHz = ec.fs / 24.0;
+                q.searchFromHz = ec.fs / 48.0;
+                q.emptyMinHz = ec.fs / 240.0;
+                q.maxTransitionHz = ec.fs / 32.0;      // this one is a frequency too, and 1500 > 1000 Hz
+            }
             probe.setParams (q);
-            ok (run (probe.prepare (kFs, 64, 1)), "empty-floor: prepare at order " + std::to_string (order));
+            const std::string tg = "empty-floor fs=" + std::to_string ((int) ec.fs)
+                                 + " order=" + std::to_string (ec.order) + ": ";
+            ok (run (probe.prepare (ec.fs, 64, 1)), tg + "prepare");
             std::vector<float> x (4096, 0.0f);
             const double f = (double) (probe.bins() - 3) * probe.binHz();      // a tone in the top bins
             for (std::size_t i = 0; i < x.size(); ++i)
-                x[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * core::kPi * f * (double) i / kFs));
+                x[(std::size_t) i] = (float) (0.5 * std::sin (2.0 * core::kPi * f * (double) i / ec.fs));
             const float* in[1] { x.data() };
-            ok (run (probe.process (in, 1, (int) x.size())), "empty-floor: process at order " + std::to_string (order));
+            ok (run (probe.process (in, 1, (int) x.size())), tg + "process");
             probe.finish();
             const auto w = probe.wall (0);
             ok (! w.emptyAboveValid || w.emptyAboveHz < w.nyquistHz,
-                "empty-floor: order " + std::to_string (order) + " never claims emptiness above Nyquist itself ("
-                + std::to_string (w.emptyAboveHz) + " Hz)");
+                tg + "never claims emptiness above Nyquist itself (" + std::to_string (w.emptyAboveHz) + " Hz)");
         }
         const auto st = SourceForensics::storageFor (kFs, 2, p);
         ok (st.ok && st.bytes() > 0, "storage: published before the allocation");
@@ -618,14 +668,56 @@ int main()
                 tag + "empty above " + std::to_string (w.emptyAboveHz));
             ok (w.plateauSpreadDb < 12.0, tag + "the plateau reference was flat (" + std::to_string (w.plateauSpreadDb) + " dB)");
             ok (w.steepnessDbPerOctave > 100.0, tag + "steepness " + std::to_string (w.steepnessDbPerOctave) + " dB/oct");
-            ok (w.strictDropDb >= w.dropDb - 30.0,
-                tag + "the raw suffix maximum is close to the forgiven one (strict "
-                    + std::to_string (w.strictDropDb) + " vs " + std::to_string (w.dropDb) + " dB)");
-            ok (core::exactlyEqual (w.sufMaxPower, rawCellMaxFrom (m, w.steepestHz)),
-                tag + "and it IS the maximum raw cell above the boundary, recomputed from the mean spectrum");
+
+            ok (core::exactlyEqual (w.sufMaxPower, rawCellMaxFrom (m, w.transitionEndHz)),
+                tag + "and it IS the maximum raw cell past the transition, recomputed from the mean spectrum");
+            // The assertion that pins the MEANING rather than the anchor: this fixture has NOTHING above
+            // its edge, so nothing may be reported as coming back up there. Anchored at the winning
+            // boundary instead, these two read 80 dB and 0.35 dB (measured over 2350 cutoffs).
+            ok (w.recoveryDb < 5.0, tag + "nothing comes back above it (recovery "
+                                        + std::to_string (w.recoveryDb) + " dB)");
+            ok (w.strictDropDb >= w.dropDb - 5.0, tag + "and forgiving nothing barely changes the drop ("
+                                                      + std::to_string (w.strictDropDb) + " dB)");
             ok (w.strictDropDb > 0.0 && w.strictDropDb <= w.dropDb,
                 tag + "the strict drop is published and is never the larger");
             ok (! w.secondValid, tag + "and there is no second edge above it");
+            ok (w.secondReason != ForensicsReason::Ok && w.secondReason != ForensicsReason::NotFinished,
+                tag + "which says WHY there is none (reason " + std::to_string ((int) w.secondReason) + ")");
+            ok (w.emptyAboveReason == ForensicsReason::Ok, tag + "and the emptiness test has its reason too");
+        }
+        // THE CLASS, not the instance: sweep the constructed edge across one whole cell in eleven steps.
+        // A quantity anchored at the winning boundary passes at some phases and fails at others — 34 % of
+        // 2350 cutoffs, measured — so a single fixture is not evidence about it either way.
+        {
+            SourceForensics probe;
+            probe.setParams (defaults());
+            ok (run (probe.prepare (kFs, 64, 1)), "sweep: prepare");
+            const double base = 12000.0, step = probe.cellHz() / 10.0;
+            int badRecovery = 0, badStrict = 0, notSharp = 0;
+            for (int i = 0; i < 11; ++i)
+            {
+                const auto m = measure (wallFixture (base + (double) i * step, -80.0, 41), defaults());
+                if (! (m.w.recoveryDb < 5.0)) ++badRecovery;
+                if (! (m.w.strictDropDb >= m.w.dropDb - 5.0)) ++badStrict;
+                if (! m.w.sharp) ++notSharp;
+            }
+            ok (badRecovery == 0, "sweep: " + std::to_string (badRecovery)
+                                  + " of 11 phases report a recovery above an empty stopband");
+            ok (badStrict == 0, "sweep: " + std::to_string (badStrict) + " of 11 phases lose the strict drop");
+            ok (notSharp == 0, "sweep: " + std::to_string (notSharp) + " of 11 phases lose `sharp`");
+        }
+        // the DEFAULT geometry, which the order-12 cases do not exercise: 17 bins to a cell, a 33-bin top
+        // cell, 40 cells to a plateau span. It needs a programme longer than one window to have frames.
+        {
+            auto p = defaults();
+            p.fftOrder = 14;
+            const auto m = measure (wallFixture (15000.0, -80.0, 43, kFs, 1u << 16), p);
+            ok (m.w.valid && m.w.sharp, "default geometry: the edge is found at fftOrder 14");
+            ok (std::fabs (m.w.cutoffHz - 15000.0) <= 3.0 * m.cellHz,
+                "default geometry: at " + std::to_string (m.w.cutoffHz) + " Hz");
+            ok (m.w.recoveryDb < 5.0, "default geometry: with nothing above it ("
+                                      + std::to_string (m.w.recoveryDb) + " dB)");
+            ok (m.binsPerCell == 17 && m.cellCount == 481, "default geometry: 17 bins to a cell, 481 cells");
         }
         // an edge placed EXACTLY on a cell boundary, where an off-by-one in the cell map would hide
         {
@@ -702,6 +794,68 @@ int main()
         }
     }
 
+    // ---------- 4b. a stopband that is still falling: the width is a LOWER bound, and says so ----------
+    {
+        // An identical 16 kHz brickwall, differing only in what happens ABOVE it. Measured before the fix:
+        // 49.8 Hz of transition over a flat floor and 1594 Hz over one decaying at 15 dB/kHz, with `sharp`
+        // false at 10 dB/kHz and true again at 25 — non-monotone in the stopband's slope. `floorLocal` is
+        // the MEDIAN of the span above the edge, so on a descending stopband it sits halfway down the
+        // descent; the two halves of that span are now compared, and disagreement means there is no single
+        // floor to reach.
+        double firstCut = -1.0, flatWidth = 0.0;
+        int movedCut = 0, unflaggedMidSlope = 0, inconsistentSharp = 0;
+        bool flatSharp = false;
+        const double slopes[] = { 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 60.0 };
+        for (double slope : slopes)
+        {
+            // the decay SATURATES 40 dB down, so at a steep slope the floor really does settle inside the
+            // floor span and the edge really is sharp — with a width that is the saturation distance
+            auto x = spectral (kLen, kFs, 47, [=] (double f)
+            {
+                if (f < 16000.0) return 1.0;
+                const double down = std::min (40.0, slope * (f - 16000.0) / 1000.0);
+                return std::pow (10.0, (-60.0 - down) / 20.0);
+            });
+            const auto m = measure (x, defaults());
+            if (firstCut < 0.0) { firstCut = m.w.cutoffHz; flatSharp = m.w.sharp; flatWidth = m.w.transitionHz; }
+            else if (! core::exactlyEqual (m.w.cutoffHz, firstCut)) ++movedCut;
+            if (slope >= 5.0 && slope <= 25.0 && ! m.w.transitionClipped) ++unflaggedMidSlope;
+            if (m.w.sharp && slope > 0.0)
+            {
+                const double saturationHz = 40.0 / slope * 1000.0;      // where the decay stops
+                if (m.w.transitionHz > 1.6 * saturationHz) ++inconsistentSharp;
+            }
+        }
+        ok (movedCut == 0, "slope: the cutoff is the SAME in all nine — the edge's position does not depend "
+                           "on what the stopband does above it (" + std::to_string (movedCut) + " moved)");
+        ok (flatSharp, "slope: a brickwall over a FLAT floor is sharp");
+        ok (flatWidth <= 4.0 * 46.875, "slope: and its transition is a few cells wide ("
+                                       + std::to_string (flatWidth) + " Hz)");
+        ok (unflaggedMidSlope == 0, "slope: a floor still descending across the whole span is FLAGGED, so the "
+                                    "width is read as a lower bound (" + std::to_string (unflaggedMidSlope)
+                                    + " unflagged)");
+        ok (inconsistentSharp == 0, "slope: and where it IS sharp, the width is the construction's own "
+                                    "saturation distance, not a number half a span wide ("
+                                    + std::to_string (inconsistentSharp) + " inconsistent)");
+    }
+    {
+        // ...and a genuinely WIDE transition is either measured wide or flagged as a lower bound, never
+        // published as a narrow number. A 4 kHz roll-off used to report 1892.6 Hz with no flag at all.
+        for (double width : { 2000.0, 4000.0, 6000.0 })
+        {
+            auto x = spectral (kLen, kFs, 53, [=] (double f)
+            {
+                if (f < 14000.0) return 1.0;
+                const double t = std::min (1.0, (f - 14000.0) / width);
+                return std::pow (10.0, -90.0 * t / 20.0);
+            });
+            const auto m = measure (x, defaults());
+            ok (! m.w.valid || m.w.transitionClipped || m.w.transitionHz >= 0.5 * width,
+                "wide transition " + std::to_string ((int) width) + " Hz: measured wide ("
+                + std::to_string (m.w.transitionHz) + ") or flagged as a lower bound");
+        }
+    }
+
     // ---------- 5. a notch BELOW a real wall must not steal it; nested edges report BOTH ----------
     {
         auto x = spectral (kLen, kFs, 17, [] (double f)
@@ -727,6 +881,7 @@ int main()
         ok (std::fabs (m.w.secondCutoffHz - 20500.0) <= 3.0 * m.cellHz,
             "nested: at 20.5 kHz (" + std::to_string (m.w.secondCutoffHz) + ")");
         ok (m.w.secondDropDb > 24.0, "nested: with its own drop (" + std::to_string (m.w.secondDropDb) + " dB)");
+        ok (m.w.secondReason == ForensicsReason::Ok, "nested: and a reason of its own");
     }
 
     // ---------- 6. a narrow line above a real wall: forgiven to the published rank, and no further ------
@@ -734,6 +889,13 @@ int main()
         // The line is one cell wide at the default geometry and is the loudest thing above the edge. The
         // exemption must recover the wall while the forgiveness stays visible; a line too loud to forgive
         // must cost the report its validity, NOT move the frequency.
+        // ⚠ FIXTURE COUPLING, measured: kLen is 4x the analysis window, so a `spectral()` component at
+        // fixture bin k is exactly analysis-bin-centred iff k % 4 == 0 and leaks NOTHING, and leaks a full
+        // Hann skirt otherwise. The same line at the same level measured 75.9 dB of drop at k % 4 == 0 and
+        // 42.1 dB at k % 4 == 2 — 33.7 dB decided by a fixture bin index. The line below spans bins
+        // 6484..6486 at kOrder 12, i.e. deliberately BOTH: one centred component and two leaky ones, which
+        // is the grid placed AGAINST the feature rather than on it (CLAUDE.md's second fixture property).
+        // A bare `kOrder` or `kLen` change moves every alignment, so the bounds here are loose on purpose.
         // (a) a genuine one-frequency line, up to -30 dB of the midband: the wall SURVIVES — the 3-cell
         //     median already removes a line that occupies one cell, and the suffix rank adds 1-2 dB on top
         //     of that (measured). The line is still fully visible in recoveryDb and in emptyAboveHz.
@@ -754,8 +916,8 @@ int main()
                                                    + std::to_string (m.w.strictDropDb) + " dB)");
             // The line is what separates the raw floor from the filtered one: taken from the median-filtered
             // cells this number would be tens of dB lower and would forgive the very thing it exists to show.
-            ok (core::exactlyEqual (m.w.sufMaxPower, rawCellMaxFrom (m, m.w.steepestHz)),
-                tag + "the strict floor is the RAW maximum above the boundary, filter and rank included");
+            ok (core::exactlyEqual (m.w.sufMaxPower, rawCellMaxFrom (m, m.w.transitionEndHz)),
+                tag + "the strict floor is the RAW maximum past the transition, filter and rank included");
             ok (m.w.sufMaxPower > m.w.maxAbovePower,
                 tag + "which stands above the forgiving floor the search used");
             ok (m.w.exemptedCells > 0, tag + "with the rank that was skipped");
@@ -810,6 +972,39 @@ int main()
             ok (core::exactlyEqual (m0.w.sufMaxPower, m2.w.sufMaxPower),
                 "exemptCells = 0: while the raw suffix maximum does not depend on the rank at all");
         }
+    }
+
+    // ---------- 6b. the forgiveness is bounded by its published rank ----------
+    {
+        // `top[t]` forgives the t loudest cells above the edge whatever their width, so the contract is a
+        // WIDTH — but a fixture's band is not a whole number of cells once the analysis window has leaked
+        // it sideways, so the two sides of that contract are pinned by the cases above (a one-frequency
+        // line is forgiven, a 100 Hz band is not) rather than by counting cells in a fixture. What IS
+        // exactly checkable is the bound itself.
+        auto x = spectral (kLen, kFs, 59, [] (double f)
+                           { return f < 16000.0 ? 1000.0 / f
+                                  : (f > 19000.0 && f < 19100.0 ? 1.0e-1 : 1.0e-5); });
+        const auto m = measure (x, defaults());
+        ok (m.w.exemptedCells <= defaults().exemptCells,
+            "rank bound: never more cells are forgiven than the published rank");
+        ok (! m.w.valid, "rank bound: and 100 Hz of full-level content above the edge is refused, not forgiven");
+    }
+    {
+        // The search sorts one plateau span per candidate, so a geometry can ask for work that never ends.
+        // fftOrder 22 with 0.01 Hz cells and a 12 kHz plateau span is 2.1 million candidates sorting a
+        // million doubles each. Refused at prepare, not discovered at finish.
+        auto p = defaults();
+        p.fftOrder = 22;
+        p.cellWidthHz = 0.01;
+        p.plateauSpanHz = 12000.0;
+        SourceForensics heavy;
+        heavy.setParams (p);
+        ok (! heavy.prepare (kFs, 512, 1), "work bound: a geometry that cannot finish is refused");
+        ok (! SourceForensics::storageFor (kFs, 1, p).ok, "work bound: and storageFor agrees");
+        p.cellWidthHz = 50.0;
+        p.plateauSpanHz = 2000.0;
+        heavy.setParams (p);
+        ok (run (heavy.prepare (kFs, 512, 1)), "work bound: while a sane order-22 geometry is accepted");
     }
 
     // ---------- 7. a pre-wall taper biases the edge DOWNWARD, never upward ----------
@@ -1013,6 +1208,77 @@ int main()
         std::int64_t total = 0;
         for (int k = 0; k < SourceForensics::gridExponentBuckets(); ++k) total += h[(std::size_t) k];
         ok (total == g.nonZeroSamples, "denormal: and the histogram accounts for every grid witness");
+    }
+    {
+        // A 16-BIT PROGRAMME WITH A FLOAT FADE-OUT — which is every real render. The exact reading is a
+        // MAXIMUM over every sample, so the fade's off-grid samples take it to a huge k and the three
+        // primary fields go dark; the robust reading, from the histogram already accumulated, still says 16.
+        auto x = wallFixture (12000.0, -80.0, 5, kFs, 8192);
+        fillRange (x);
+        quantise (x, 16);
+        const std::size_t fadeFrom = x.size() - x.size() / 50;         // the last 2 %, as a real fade-out is
+        for (std::size_t i = fadeFrom; i < x.size(); ++i)
+            x[i] = (float) ((double) x[i] * (1.0 - (double) (i - fadeFrom) / (double) (x.size() - fadeFrom)));
+        SourceForensics sf;
+        auto p = defaults();
+        p.fftOrder = 8;
+        p.maxDistinctValues = 1 << 20;
+        sf.setParams (p);
+        ok (run (sf.prepare (kFs, 512, 1)), "fade: prepare");
+        const float* in[1] { x.data() };
+        ok (run (sf.process (in, 1, (int) x.size())), "fade: process");
+        sf.finish();
+        const auto g = sf.sampleGrid (0);
+        ok (g.gridExponent > 23 && g.minExactPcmBits == 0,
+            "fade: the EXACT reading is dark, as it must be (k = " + std::to_string (g.gridExponent) + ")");
+        ok (g.offGridSamples > 0 && g.offGridSamples < g.nonZeroSamples / 10,
+            "fade: with the off-grid samples counted, and they are a few per cent ("
+            + std::to_string (g.offGridSamples) + " of " + std::to_string (g.nonZeroSamples) + ")");
+        ok (g.robustPcmBits == 16, "fade: and the ROBUST reading still says 16 bits (got "
+                                   + std::to_string (g.robustPcmBits) + ")");
+        ok (g.robustGridExponent == 15, "fade: on the 2^-15 grid");
+        // with a zero tolerance the robust reading IS the exact one — no second definition hiding in it
+        auto strict = p;
+        strict.gridOutlierFraction = 0.0;
+        SourceForensics sf2;
+        sf2.setParams (strict);
+        ok (run (sf2.prepare (kFs, 512, 1)), "fade: strict prepare");
+        ok (run (sf2.process (in, 1, (int) x.size())), "fade: strict process");
+        sf2.finish();
+        const auto g2 = sf2.sampleGrid (0);
+        ok (g2.robustPcmBits == 0 && g2.robustGridExponent >= 24,
+            "fade: a zero tolerance makes the robust reading the exact one");
+    }
+    {
+        // the histogram's top two buckets are SPLIT, because a 32-bit stream (k = 31) and one denormal
+        // (k = 149) are different classes and a single bucket made them indistinguishable
+        auto p = defaults();
+        p.fftOrder = 8;
+        const double q32 = std::ldexp (1.0, 31);
+        std::vector<float> deep (1024, 0.0f);
+        std::mt19937 rng (61);
+        std::uniform_int_distribution<int> code (1, 1 << 20);
+        for (auto& v : deep) v = (float) ((double) code (rng) / q32);      // 32-bit codes at about -66 dBFS
+        SourceForensics a32;
+        a32.setParams (p);
+        ok (run (a32.prepare (kFs, 512, 1)), "buckets: prepare");
+        const float* in32[1] { deep.data() };
+        ok (run (a32.process (in32, 1, (int) deep.size())), "buckets: process");
+        a32.finish();
+        const std::int64_t* h32 = a32.gridExponentHistogram (0);
+        ok (h32[SourceForensics::gridExponentBuckets() - 2] > 0
+            && h32[SourceForensics::gridExponentBuckets() - 1] == 0,
+            "buckets: a 32-bit stream lands in the 25..31 bucket, not the 32-or-finer one");
+        SourceForensics den;
+        den.setParams (p);
+        ok (run (den.prepare (kFs, 512, 1)), "buckets: denormal prepare");
+        const float one[2] { 0.5f, std::numeric_limits<float>::denorm_min() };
+        const float* inD[1] { one };
+        ok (run (den.process (inD, 1, 2)), "buckets: denormal process");
+        den.finish();
+        const std::int64_t* hD = den.gridExponentHistogram (0);
+        ok (hD[SourceForensics::gridExponentBuckets() - 1] == 1,
+            "buckets: while a denormal lands in the 32-or-finer one");
     }
     {
         // a non-dyadic gain; exactly +-1.0; a sample past unity
@@ -1374,6 +1640,8 @@ int main()
             "silence: and the answer is NoSpectralEnergy, never a cutoff at the bottom of the band");
         ok (core::exactlyEqual (w.peakCellPower, 0.0) && ! w.emptyAboveValid,
             "silence: nothing is declared empty relative to a zero reference");
+        ok (w.emptyAboveReason == ForensicsReason::NoSpectralEnergy,
+            "silence: and the emptiness test says which evidence it lacked");
     }
 
     // ---------- 13. the aggregate is the mean of the per-channel MEANS ----------
