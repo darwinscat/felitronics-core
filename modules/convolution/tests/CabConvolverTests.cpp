@@ -550,5 +550,152 @@ int main()
         survives (false, true,  Nothing::nullSecondPlane, "a STEREO load whose second plane is null over a pending load");
     }
 
+    // P69 — law 11(b) reaches the RATE too. prepare() used to answer a rate it had not been given with the
+    // factory 48 kHz (`sampleRate > 0.0 ? sampleRate : 48000.0`) and then size a crossfade and an IR budget
+    // from the answer, reporting success; and an infinite rate made two float-to-int conversions undefined
+    // ((long long) ceil(maxIrSeconds * hostSr_), and lround(0.05 * hostSr_)). A rate outside (0, kMaxSampleRate]
+    // is refused here now, and a refused prepare leaves the object unusable — which process() has to report.
+    test::group ("P69 — prepare refuses a host rate it cannot honour, and a refusal disarms the convolver");
+    {
+        const double inf = std::numeric_limits<double>::infinity(), nan = std::numeric_limits<double>::quiet_NaN();
+        struct Case { double rate; const char* what; };
+        const Case bad[] { { 0.0, "zero" }, { -48000.0, "negative" }, { nan, "NaN" }, { inf, "+inf" }, { -inf, "-inf" },
+                           { CabConvolver::kMaxSampleRate * 2.0, "twice the ceiling" },
+                           { std::nextafter (CabConvolver::kMaxSampleRate, inf), "one ulp past the ceiling" },
+                           { 1.0e300, "1e300 — finite, and what an isfinite gate would have let through" } };
+        int refused = 0, disarmed = 0;
+        for (const Case& c : bad)
+        {
+            CabConvolver cab;
+            if (! cab.prepare (c.rate, 256, 2, 4.0, true)) ++refused;
+            float l[8] {}, r[8] {};
+            float* io[2] { l, r };
+            if (! cab.process (io, 2, 8)) ++disarmed;                      // law 11: refused prepare => unusable
+        }
+        test::ok (refused == (int) (sizeof bad / sizeof bad[0]), "every rate outside (0, 3 MHz] is refused");
+        test::ok (disarmed == (int) (sizeof bad / sizeof bad[0]), "and process() refuses afterwards — the object is not armed");
+
+        test::ok (CabConvolver::kMaxSampleRate == 3.0e6,
+                  "the ceiling is the house figure — Compressor, TruePeakLimiter, EqBand and RigPlayer spell the same one");
+        CabConvolver ok1, ok2;
+        // 0.001 s, not the 4 s default: what is under test is the RATE, and four seconds AT THE CEILING is a
+        // twelve-million-tap schedule — a gigabyte of partitions to prove a comparison.
+        test::ok (ok1.prepare (CabConvolver::kMaxSampleRate, 256, 2, 0.001, true), "the ceiling itself is honoured");
+        test::ok (ok2.prepare (44100.0, 256, 2, 4.0, true), "and so is an ordinary rate");
+
+        // A REFUSED re-prepare must not leave the PREVIOUS one usable either.
+        CabConvolver rearmed;
+        const bool first = rearmed.prepare (48000.0, 256, 2, 0.25, true);
+        const bool second = rearmed.prepare (inf, 256, 2, 0.25, true);
+        float l[8] {}, r[8] {};
+        float* io[2] { l, r };
+        test::ok (first && ! second && ! rearmed.process (io, 2, 8),
+                  "a prepared convolver re-prepared with an infinite rate is left unusable, not left as it was");
+    }
+
+    // The same law, the same call, the other argument: `std::max (0.0, NaN)` returns its FIRST operand, so a
+    // NaN duration prepared successfully with a zero IR budget — a convolver holding only the backend's
+    // 128-sample head. +inf means "as much as the backend can hold", which is what every huge finite value
+    // already meant, and the saturation that gives it that meaning happens in double, BEFORE the cast that
+    // was undefined for it.
+    //
+    // THE SATURATION IS TESTED THROUGH `maxIrSamplesFor` AND NOT THROUGH `prepare`, ON PURPOSE: a budget of
+    // kMaxIrSamples is a 1.34 GB partition schedule (measured with /usr/bin/time -l), and this suite also
+    // runs on the wasm tier, whose heap default is 2 GB. The expected values here come from outside the
+    // function — 4 s at 48 kHz is 192000 by multiplication, and the ceiling is the backend's own published
+    // constant — so this is not the budget being asked to confirm itself.
+    test::group ("P69 — prepare refuses a maxIrSeconds that is not a non-negative number, and saturates the rest");
+    {
+        const double inf = std::numeric_limits<double>::infinity(), nan = std::numeric_limits<double>::quiet_NaN();
+        CabConvolver a, b, c;
+        test::ok (! a.prepare (48000.0, 256, 2, nan, true), "a NaN duration is refused");
+        test::ok (! b.prepare (48000.0, 256, 2, -1.0, true), "a negative duration is refused");
+        test::ok (! c.prepare (48000.0, 256, 2, -inf, true), "-inf is refused");
+        float l[8] {}, r[8] {};
+        float* io[2] { l, r };
+        test::ok (! a.process (io, 2, 8) && ! b.process (io, 2, 8) && ! c.process (io, 2, 8),
+                  "and each refusal leaves its convolver unusable");
+
+        constexpr int ceiling = felitronics::convolution::MatrixConvolverNupc<felitronics::convolution::CabConvFft>::kMaxIrSamples;
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, 4.0) == 192000, "4 s at 48 kHz is 192000 samples of budget");
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, 0.0) == 0, "zero seconds is zero samples");
+        CabConvolver zeroSeconds;
+        test::ok (zeroSeconds.prepare (48000.0, 256, 2, 0.0, false),
+                  "and a zero-second budget PREPARES — the backend keeps its own head, which is what it did before");
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, inf) == ceiling,
+                  "+inf saturates to the backend's ceiling instead of converting an infinity to an integer");
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, 1.0e300) == ceiling,
+                  "and so does 1e300 — the value whose cast was undefined before the clamp moved ahead of it");
+        test::ok (CabConvolver::maxIrSamplesFor (3.0e6, 1.0e12) == ceiling, "at the rate ceiling too");
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, 1.0 / 48000.0) == 1, "and one sample is one sample");
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, 1.25 / 48000.0) == 2,
+                  "a part-sample duration rounds UP — every whole-sample case alone cannot tell ceil from floor");
+    }
+
+    // A refused prepare has to leave the WHOLE object unusable, not just its flag. The pending-retry
+    // geometry outlived a refusal, and a retry that survives an unusable object can never be published:
+    // flushPending() returns on !prepared_, so isBusy() answered true for the rest of the object's life
+    // and the host's reload poll spun on it forever. Four calls reach it.
+    test::group ("P69 — a refused prepare clears the pending retry it can no longer publish");
+    {
+        std::vector<float> first { 1.0f, 0.25f, 0.0f, 0.0f }, second { 0.0f, 1.0f, 0.0f, 0.0f };
+        CabConvolver cab;
+        felitronics::test::run (cab.prepare (48000.0, 128, 2, 0.05, false));
+        const float* a[1] { first.data() };
+        const float* b[1] { second.data() };
+        cab.loadIR (a, 1, (int) first.size(), 48000.0);
+        float left[64] {}, right[64] {};
+        float* io[2] { left, right };
+        felitronics::test::run (cab.process (io, 2, 64));                  // begins the crossfade
+        cab.loadIR (b, 1, (int) second.size(), 48000.0);                   // rejected mid-fade, retained
+        const bool pendingBefore = cab.hasPending();
+        const bool refused = ! cab.prepare (std::numeric_limits<double>::infinity(), 128, 2, 0.05, false);
+        test::ok (pendingBefore && refused && ! cab.hasPending(),
+                  "the retry a refused prepare can never publish does not survive it");
+    }
+
+    // `maxIrSamplesFor` is PUBLIC, so it answers for every double, not only for the ones prepare() lets
+    // through. A comment is not a precondition: `std::min (NaN, ceiling)` keeps the NaN, and converting
+    // that to int is the same undefined conversion this whole group exists to have closed.
+    test::group ("P69 — the budget helper is total: no argument converts a non-number to an int");
+    {
+        const double inf2 = std::numeric_limits<double>::infinity(), nan2 = std::numeric_limits<double>::quiet_NaN();
+        test::ok (CabConvolver::maxIrSamplesFor (nan2, 1.0) == 0, "a NaN rate gives no budget");
+        test::ok (CabConvolver::maxIrSamplesFor (48000.0, nan2) == 0, "nor does a NaN duration");
+        test::ok (CabConvolver::maxIrSamplesFor (-inf2, 1.0) == 0 && CabConvolver::maxIrSamplesFor (48000.0, -inf2) == 0,
+                  "nor -inf on either side");
+        test::ok (CabConvolver::maxIrSamplesFor (-48000.0, 1.0) == 0 && CabConvolver::maxIrSamplesFor (48000.0, -1.0) == 0,
+                  "nor a negative rate or duration");
+        test::ok (CabConvolver::maxIrSamplesFor (0.0, 4.0) == 0, "and a zero rate is zero samples, not a conversion");
+    }
+
+    // P69 — the analysis window and the transform that carries it. `normalizationGain` takes the first
+    // second of the IR (`cap`) but sizes its FFT at `N`, which stops doubling at 1<<21; above a megasample
+    // of window the two part company and the copy ran off the end of the buffer. Measured on the base
+    // commit under AddressSanitizer as a 12 MB heap-buffer-overflow WRITE at a 4 MHz host; this is the
+    // smallest input that reaches it — one sample past 2^21, at a rate one sample past 2^21 — so the
+    // overwrite there is a single float, which only a sanitizer or a hardened allocator will notice. The
+    // IR budget is kept tiny on purpose: it is the NORMALIZATION path under test, not the partition build.
+    test::group ("P69 — the reference-gain analysis window cannot outrun its own transform");
+    {
+        constexpr int len = (1 << 21) + 1;
+        CabConvolver cab;
+        const bool armed = cab.prepare ((double) len, 64, 1, 0.001, true);
+        std::vector<float> ir ((std::size_t) len, 0.0f);
+        // The impulse is NOT at index 0, and that is the point: an amplitude of 2 anywhere inside the window
+        // gives |H(f)| = 2 at every frequency and so a reference gain of exactly 0.5, while a window
+        // truncated to nothing — or to one sample — sees only silence, falls through the near-silent floor
+        // and returns unity. A pure impulse at index 0 could not tell those apart.
+        ir[1000] = 2.0f;
+        ir[(std::size_t) len - 1] = 0.25f;                                 // one past the window's last sample
+        const float* planes[1] { ir.data() };
+        cab.loadIR (planes, 1, len, (double) len);                         // same rate: no resample, straight to normalization
+        const float g = cab.irNormalizationGain();
+        // The VALUE, not merely finiteness: an analysis that copied nothing would return unity and pass a
+        // "positive and finite" check while hiding exactly the defect this group exists for.
+        test::ok (armed && std::fabs ((double) g - 0.5) < 1.0e-3,
+                  "a 2 097 153-sample IR at a 2 097 153 Hz host normalizes to 0.5 without writing past the transform");
+    }
+
     return test::report();
 }

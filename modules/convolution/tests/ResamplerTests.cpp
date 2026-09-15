@@ -177,6 +177,63 @@ double referenceTap (const std::vector<float>& x, double inSr, double outSr, int
     }
     return num.value() / den.value();
 }
+// P70's gate: the SAME kernel with no phase memo in it — the loop exactly as it stood before the memo, so
+// the two can be compared to the last bit. This is a DIFFERENTIAL check, not a specification: what an output
+// SHOULD be is `referenceTap`'s business (and the hand-worked 105/104 case's), and this one answers a
+// different question — whether reusing a window that was computed for an earlier output changes anything.
+// The answer has to be "not one bit", because a changed tap is a changed cabinet.
+std::vector<float> resampleUnmemoized (const std::vector<float>& in, double inSr, double outSr,
+                                       convolution::IrResampleConfig cfg = {})
+{
+    std::vector<float> out;
+    const int inLen = (int) in.size();
+    if (inLen <= 0) return out;
+    const double ratio = outSr / inSr;
+    const double want = (double) inLen * ratio;
+    if (! (want < (double) std::numeric_limits<int>::max())) return out;
+    const int outLen = std::max (1, (int) std::llround (want));
+    if (outLen > convolution::kMaxResampleSamples) return out;
+    if (cfg.halfTaps > convolution::IrResampleConfig::kMaxHalfTaps) return out;
+    if (cfg.beta     > convolution::IrResampleConfig::kMaxBeta)     return out;
+    const int    R      = cfg.halfTaps < 1 ? 1 : cfg.halfTaps;
+    const double beta   = cfg.beta >= 0.0 ? cfg.beta : 8.0;
+    const double cScale = (std::isfinite (cfg.cutoffScale) && cfg.cutoffScale > 0.0 && cfg.cutoffScale <= 1.0)
+                        ? cfg.cutoffScale : 0.95;
+    const double fc     = 0.5 * std::min (1.0, ratio) * cScale;
+    const double i0beta = convolution::detail::besselI0 (beta);
+    const double tLast  = ((double) outLen - 0.5) / ratio - 0.5;
+    if (! (tLast + (double) R + 2.0 < (double) std::numeric_limits<int>::max())) return out;
+    out.assign ((std::size_t) outLen, 0.0f);
+    for (int n = 0; n < outLen; ++n)
+    {
+        const double t = ((double) n + 0.5) / ratio - 0.5;
+        const int    c = (int) std::floor (t);
+        double acc = 0.0, wsum = 0.0;
+        for (int k = c - R + 1; k <= c + R; ++k)
+        {
+            const double xx   = t - (double) k;
+            const double sinc = (std::fabs (xx) < 1e-12) ? (2.0 * fc)
+                                                         : std::sin (2.0 * core::kPi * fc * xx) / (core::kPi * xx);
+            const double r    = xx / (double) R;
+            const double win  = (r <= -1.0 || r >= 1.0) ? 0.0
+                              : convolution::detail::besselI0 (beta * std::sqrt (1.0 - r * r)) / i0beta;
+            const double w    = sinc * win;
+            wsum += w;
+            if (k >= 0 && k < inLen) acc += (double) in[(std::size_t) k] * w;
+        }
+        out[(std::size_t) n] = (float) (! core::exactlyEqual (wsum, 0.0) ? acc / wsum : 0.0);
+    }
+    return out;
+}
+
+// Bits, not `==`: `0.0f == -0.0f` is true and a NaN is equal to nothing, so both would be read wrongly here.
+int firstDifferentBit (const std::vector<float>& a, const std::vector<float>& b)
+{
+    if (a.size() != b.size()) return -1;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (! core::sameBits (a[i], b[i])) return (int) i;
+    return -2;                                                             // -2 = identical
+}
 } // namespace
 
 int main()
@@ -446,6 +503,264 @@ int main()
         test::ok (convolution::resampleIr (one, 1.0e300, 1.0e-300).empty(), "a ratio that underflows to zero is refused");
         test::ok (convolution::resampleIr (one, 1.0, 4294967297.0).empty(), "2^32 + 1 output samples is refused, not wrapped to one");
         test::ok (convolution::resampleIr (one, 1.0e12, 1.0).empty(), "an output position past INT_MAX is refused, not converted");
+    }
+
+    // P70 — the phase memo. A window depends on the output position only through xx = t - k, and where
+    // c = floor(t) >= 2R every one of those subtractions is EXACT (Sterbenz), so xx is frac - j with no
+    // rounding and two outputs with the same 64-bit frac have the same 2R weights and the same sum. The
+    // header reuses them; this says it changed nothing. Audio rates are small rationals, so the reuse is
+    // real (98% for 48 -> 44.1 kHz); a ratio with no period (48000 -> 44101) reuses nothing and must still
+    // agree. Both paths run here.
+    test::group ("P70 — the phase memo moves no bit: every output float equals the unmemoized kernel's");
+    {
+        struct Case { double inSr, outSr; int len; convolution::IrResampleConfig cfg; const char* what; };
+        convolution::IrResampleConfig d, r1, wide, b50, narrowBand, rect, huge;
+        huge.halfTaps = convolution::IrResampleConfig::kMaxHalfTaps;
+        r1.halfTaps = 1;
+        wide.halfTaps = 300;
+        b50.beta = 50.0;
+        narrowBand.cutoffScale = 1.0e-6;
+        rect.halfTaps = 2; rect.beta = 0.0; rect.cutoffScale = 1.0;
+        const Case cases[] {
+            { 48000.0,  44100.0, 4000, d,          "48 -> 44.1 kHz (913 phases, 98% reused)" },
+            { 44100.0,  48000.0, 4000, d,          "44.1 -> 48 kHz" },
+            { 48000.0,  96000.0, 2000, d,          "48 -> 96 kHz (two phases)" },
+            { 96000.0,  48000.0, 4000, d,          "96 -> 48 kHz (one phase)" },
+            { 192000.0, 44100.0, 8000, d,          "192 -> 44.1 kHz" },
+            { 44100.0, 192000.0, 3000, d,          "44.1 -> 192 kHz" },
+            { 8000.0,   48000.0, 2000, d,          "8 -> 48 kHz" },
+            // An ODD integer ratio puts t at M*n + (M-1)/2, so its phase is exactly +0.0 — the one key whose
+            // bit pattern a wrong empty-marker would read as "this bucket is free". Nothing else here has it.
+            { 16000.0,  48000.0, 700,  d,          "16 -> 48 kHz — phase exactly +0.0 (ratio 3)" },
+            { 48000.0,  16000.0, 2100, d,          "48 -> 16 kHz — the same phase the other way" },
+            { 9600.0,   48000.0, 400,  d,          "9.6 -> 48 kHz (ratio 5)" },
+            { 48000.0,  44101.0, 3000, d,          "48000 -> 44101 Hz — a ratio with no period at all" },
+            { 48000.0,  47999.5, 3000, d,          "48000 -> 47999.5 Hz — nor this one" },
+            { 48000.0,  44100.0,    1, d,          "one tap" },
+            { 48000.0,  44100.0,   70, d,          "70 taps — every output is an edge output" },
+            { 48000.0,  44100.0, 2000, r1,         "halfTaps 1" },
+            { 48000.0,  44100.0, 2000, wide,       "halfTaps 300" },
+            { 48000.0,  44100.0, 2000, b50,        "beta 50 (the series still converges to 53.04)" },
+            { 48000.0,  44100.0, 2000, narrowBand, "cutoffScale 1e-6" },
+            { 96000.0,  48000.0,  600, rect,       "a rectangular window, full band" },
+            // The two cache branches the cases above never reach. An aperiodic ratio long enough to store
+            // 4096 phases without one hit trips the GIVE-UP; a 4096-radius kernel makes each row 8193
+            // doubles, so the memo's budget stops it at 127 rows and every later phase meets a FULL store —
+            // periodic (it keeps hitting the 127) and aperiodic (it never hits at all) both run here.
+            { 48000.0,  44101.0, 6000, d,          "48000 -> 44101 Hz, 5512 outputs — the give-up fires" },
+            { 48000.0,  44101.0,  300, huge,       "halfTaps 4096, aperiodic — a full store that never hits" },
+            { 48000.0,  44100.0,  300, huge,       "halfTaps 4096, periodic — a full store that does" },
+        };
+        int checked = 0, differ = 0;
+        long long floats = 0;
+        for (const Case& cs : cases)
+        {
+            std::vector<float> x = cabinetLikeIr (cs.len);
+            if (cs.len >= 3) { x[(std::size_t) (cs.len / 3)] = 0.9f; x[(std::size_t) (cs.len - 1)] = -0.4f; }
+            const auto memoed = convolution::resampleIr (x, cs.inSr, cs.outSr, cs.cfg);
+            const auto plain  = resampleUnmemoized (x, cs.inSr, cs.outSr, cs.cfg);
+            const int at = firstDifferentBit (memoed, plain);
+            ++checked; floats += (long long) plain.size();
+            // A REFUSAL IS NOT A MATCH. Two empty vectors are trivially "identical", so a case that both
+            // paths refuse would pass this loop while testing nothing — which is exactly what happened to
+            // the two halfTaps-4096 cases when a mutant moved the ceiling to 4095.
+            if (memoed.empty()) { ++differ; std::printf ("    %s: produced nothing\n", cs.what); }
+            else if (at != -2) { ++differ; std::printf ("    %s: differs at output %d\n", cs.what, at); }
+        }
+        std::printf ("    %d rate/config cases, %lld output floats compared as bits\n", checked, floats);
+        test::ok (checked == (int) (sizeof cases / sizeof cases[0]) && floats > 0 && differ == 0,
+                  "every output float is bit-identical with the memo and without it");
+    }
+
+    // A NaN or an infinity in the SAMPLES is not the resampler's business to repair (P67: broken metadata
+    // plays as is, and so do broken samples) — but it must travel the same road either way, and a memo that
+    // reused a window across such a sample would be visible here.
+    test::group ("P70 — the memo is bit-exact on inputs that are not ordinary numbers");
+    {
+        const float poison[] { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                               -std::numeric_limits<float>::infinity(), 1.4e-45f, 3.4e38f };
+        int differ = 0, checked = 0;
+        for (float bad : poison)
+            for (double outSr : { 44100.0, 96000.0 })
+            {
+                std::vector<float> x = cabinetLikeIr (1500);
+                x[700] = bad;
+                const int at = firstDifferentBit (convolution::resampleIr (x, 48000.0, outSr),
+                                                  resampleUnmemoized (x, 48000.0, outSr));
+                ++checked;
+                if (at != -2) ++differ;
+            }
+        test::ok (checked == 10 && differ == 0, "NaN, both infinities, a subnormal and FLT_MAX in the input change nothing");
+    }
+
+    // A FIXTURE, NOT A SWEEP — the one place the memo's precondition can be SEEN. The gate is c >= 0,
+    // because that is where `frac = t - c` stops being exact: at 8 -> 48 kHz, outputs 0 (c = -1) and 6
+    // (c = 0) carry the same frac to the bit, yet five of their 64 window weights differ in the last
+    // place. On almost every input those last places vanish in the float32 result, which is why a memo
+    // that ignored the gate passed a sixteen-case differential sweep and 32 million output samples. This
+    // input is one of the ones where they do NOT vanish: it was found by trying 18.6 million random
+    // windows, and with the gate removed output 6 reads 0x1.97ee8cp-27 where it should read 0x1.97ee8ep-27.
+    // (What it pins everywhere is the equality below. Whether it also KILLS an ungated memo depends on the
+    // platform's sin, since that decides which side of a float32 boundary the difference lands on — so it
+    // is a witness on this arithmetic, and a plain differential case on any other.)
+    test::group ("P70 — the witness: an input where reusing a c < 0 phase would move a float");
+    {
+        const std::vector<float> x {
+        0x1.a5f78ap-1f, -0x1.97b31cp-1f, -0x1.6ed8fep-2f, 0x1.1035cep-1f, -0x1.e1657ep-1f, -0x1.5f58e8p-1f,
+        0x1.8ddb72p-1f, -0x1.648e56p-2f, -0x1.7c821p-3f, 0x1.de1262p-2f, 0x1.9339fep-1f, -0x1.63d3f8p-2f,
+        -0x1.7bcb82p-1f, 0x1.059744p-1f, -0x1.940482p-1f, -0x1.27ec28p-1f, 0x1.e8621cp-4f, -0x1.c3b676p-3f,
+        0x1.a33044p-2f, -0x1.3ba08ep-4f, 0x1.236a72p-2f, 0x1.5de8b2p-1f, 0x1.3c628cp-1f, 0x1.a1c6fcp-1f,
+        -0x1.42e4ap-1f, -0x1.162cd2p-2f, 0x1.76d35p-1f, 0x1.34f444p-3f, 0x1.73355p-3f, -0x1.081f24p-1f,
+        0x1.1d9ef4p-5f, 0x1.eb1a14p-1f, 0x1.5fbfap-1f
+        };
+        const auto memoed = convolution::resampleIr (x, 8000.0, 48000.0);
+        const auto plain  = resampleUnmemoized (x, 8000.0, 48000.0);
+        test::ok (memoed.size() > 6 && firstDifferentBit (memoed, plain) == -2,
+                  "output 6 of an 8 -> 48 kHz resample is its own window's answer, not output 0's");
+    }
+
+    // The differential group above proves the memo changes no ANSWER — and would go on proving it if the
+    // memo never ran at all (a `probe()` that always misses passes every one of those cases). So the memo's
+    // own contract is pinned here, directly: it hits on a repeated key, it stops storing at its capacity,
+    // and it gives up after kGiveUpPhases MISSES without a hit — including when the store filled long
+    // before, which is where counting insertions instead of misses left the give-up unreachable.
+    test::group ("P70 — the memo's own contract: it hits, it fills, and it gives up on a ratio with no period");
+    {
+        const int stride = 65;                                             // 2R + 1 at the default radius
+        convolution::detail::PhaseMemo memo (stride, 10000);
+        std::vector<double> row ((std::size_t) stride);
+        for (int i = 0; i < stride; ++i) row[(std::size_t) i] = 1.0 + (double) i;
+
+        const double phase = 0.3125;                                       // exact, so the key is stable
+        auto first = memo.probe (phase);
+        test::ok (first.row == nullptr && first.storable, "an unseen phase misses, and may be stored");
+        memo.keep (first, row.data());
+        auto again = memo.probe (phase);
+        test::ok (again.row != nullptr && again.row[0] == 1.0 && again.row[stride - 1] == (double) stride,
+                  "the same phase comes back with the same row");
+        test::ok (memo.probe (0.375).row == nullptr, "a different phase does not");
+
+        convolution::detail::PhaseMemo small (stride, 4);                  // capacity four rows
+        int roomy = 0;
+        for (int i = 0; i < 4; ++i)
+        {
+            auto p = small.probe (0.125 + (double) i);
+            if (p.storable) { small.keep (p, row.data()); ++roomy; }
+        }
+        test::ok (roomy == 4, "four rows fit");
+        test::ok (! small.probe (9.5).storable, "a fifth phase finds the store full");
+        test::ok (small.probe (0.125).row != nullptr, "and the four it kept still hit");
+
+        // The give-up, with a capacity far BELOW the threshold — the case that used to be unreachable,
+        // because the only place that counted was the insertion that no longer happens.
+        convolution::detail::PhaseMemo futile (stride, 4);
+        int stored = 0;
+        bool liveBefore = true;
+        for (int i = 0; i < convolution::detail::PhaseMemo::kGiveUpPhases + 10; ++i)
+        {
+            if (i == convolution::detail::PhaseMemo::kGiveUpPhases - 2) liveBefore = futile.live;
+            auto p = futile.probe (1.0 + (double) i * 0.5);                // every phase distinct: never a hit
+            if (p.storable) { futile.keep (p, row.data()); ++stored; }
+        }
+        test::ok (stored == 4, "it stored only its four rows");
+        test::ok (liveBefore && ! futile.live,
+                  "and gave up after kGiveUpPhases misses, though it had stopped storing at the fourth");
+        auto after = futile.probe (1.0);
+        test::ok (after.row == nullptr && ! after.storable, "a memo that has given up neither hits nor stores");
+
+        // A memo that IS hitting never gives up, however many misses it also takes.
+        convolution::detail::PhaseMemo mixed (stride, 8);
+        auto seed = mixed.probe (0.5);
+        mixed.keep (seed, row.data());
+        for (int i = 0; i < convolution::detail::PhaseMemo::kGiveUpPhases + 10; ++i)
+        {
+            (void) mixed.probe (0.5);                                      // a hit
+            (void) mixed.probe (100.0 + (double) i);                       // and a miss
+        }
+        test::ok (mixed.live, "a memo that hits keeps working, however many misses come with the hits");
+    }
+
+    // P69 — the allocation bound. The length gate only ever kept the arithmetic addressable: INT_MAX samples
+    // is 8.6 GB asked of the heap in one call, on the message thread, and a file rate does not have to be
+    // absurd to ask for it. (The ACCEPTING side of this boundary is not tested here on purpose: an output of
+    // exactly kMaxResampleSamples is a 64 MiB allocation and a billion window evaluations. What keeps the
+    // bound from being set too LOW is every other group in this file.)
+    test::group ("P69 — an output past kMaxResampleSamples is refused, not allocated");
+    {
+        const std::vector<float> one { 0.8f };
+        test::ok (convolution::kMaxResampleSamples == (1 << 24), "the bound is 16.7M samples — 64 MiB of float per channel");
+        test::ok (convolution::resampleIr (one, 1.0, (double) convolution::kMaxResampleSamples + 1.0).empty(),
+                  "one sample more than the bound is refused");
+        // And the bound itself is SERVED — the assertion that keeps it from being set too low. Two taps and a
+        // rectangular window, so the 16.7M outputs cost a fraction of a second rather than a billion Bessel
+        // series; the 64 MiB it allocates is the point of the number.
+        convolution::IrResampleConfig cheap;
+        cheap.halfTaps = 1; cheap.beta = 0.0;
+        const auto atBound = convolution::resampleIr (one, 1.0, (double) convolution::kMaxResampleSamples, cheap);
+        test::ok ((int) atBound.size() == convolution::kMaxResampleSamples, "the bound itself is served, to the sample");
+        test::ok (! convolution::resampleIr (one, 1.0, 1000.0).empty(), "and an ordinary ratio is not");
+        test::ok (convolution::resampleIr (std::vector<float> (48000, 0.1f), 1.2, 48000.0).empty(),
+                  "a 1.2 Hz file rate against a 48 kHz host (7.7 GB at 1.92e9 samples) is refused");
+        test::ok (convolution::resampleIr (std::vector<float> (1000, 0.1f), 0.001, 48000.0).empty(),
+                  "so is a 1 mHz one (4.8e10 samples)");
+    }
+
+    // P69 — the config. A value that is not a request is repaired; a request this implementation will not
+    // serve is refused, because answering it with a smaller kernel would be a different filter than the
+    // caller asked for. beta's ceiling is where the 64-term Bessel series stops meeting its OWN convergence
+    // test (53.038057): past it the series returns a number that is silently wrong — 1.2e-12 relative at 64,
+    // 9.3e-5 at 90 — and only overflows to inf, and the window to NaN, at about 1.36e4.
+    test::group ("P69 — the config's ceilings: a kernel past them is refused, a non-request is repaired");
+    {
+        const std::vector<float> x (2000, 0.25f);
+        const double inf = std::numeric_limits<double>::infinity(), nan = std::numeric_limits<double>::quiet_NaN();
+        convolution::IrResampleConfig cfg;
+
+        test::ok (convolution::IrResampleConfig::kMaxHalfTaps == 4096 && convolution::IrResampleConfig::kMaxBeta == 53.0,
+                  "the ceilings are 4096 taps of radius and beta 53 — the numbers the header argues for");
+        cfg = {}; cfg.halfTaps = convolution::IrResampleConfig::kMaxHalfTaps;
+        const auto atRadiusCeiling = convolution::resampleIr (std::vector<float> (200, 0.2f), 48000.0, 44100.0, cfg);
+        test::ok (! atRadiusCeiling.empty(), "the radius ceiling itself is SERVED, not refused");
+        cfg = {}; cfg.halfTaps = convolution::IrResampleConfig::kMaxHalfTaps + 1;
+        test::ok (convolution::resampleIr (x, 48000.0, 44100.0, cfg).empty(), "halfTaps one past the ceiling is refused");
+        cfg = {}; cfg.halfTaps = 1000000;
+        test::ok (convolution::resampleIr (x, 48000.0, 44100.0, cfg).empty(), "and a millionfold one is not a billion-cycle loop");
+        cfg = {}; cfg.beta = 53.04;
+        test::ok (convolution::resampleIr (x, 48000.0, 44100.0, cfg).empty(), "a beta past where the series converges is refused");
+        cfg = {}; cfg.beta = 1.0e300;
+        test::ok (convolution::resampleIr (x, 48000.0, 44100.0, cfg).empty(), "beta 1e300 — finite, and what the isfinite gate let through");
+        cfg = {}; cfg.beta = inf;
+        test::ok (convolution::resampleIr (x, 48000.0, 44100.0, cfg).empty(), "an infinite beta is refused by the same range");
+
+        cfg = {}; cfg.beta = 53.0;
+        auto atCeiling = convolution::resampleIr (x, 48000.0, 44100.0, cfg);
+        bool allFinite = ! atCeiling.empty();
+        for (float v : atCeiling) allFinite = allFinite && std::isfinite (v);
+        test::ok (allFinite, "beta exactly 53 is served, and every tap of it is a number");
+
+        cfg = {}; cfg.beta = nan;
+        const auto nanBeta = convolution::resampleIr (x, 48000.0, 44100.0, cfg);
+        cfg = {}; cfg.beta = -1.0;
+        const auto negBeta = convolution::resampleIr (x, 48000.0, 44100.0, cfg);
+        const auto plain   = convolution::resampleIr (x, 48000.0, 44100.0);
+        test::ok (firstDifferentBit (nanBeta, plain) == -2 && firstDifferentBit (negBeta, plain) == -2,
+                  "a NaN or negative beta is not a request, and is repaired to the default — exactly it");
+    }
+
+    // NAMED, MEASURED, AND DELIBERATELY NOT REPAIRED. `cutoffScale`'s range (0, 1] is ratified, and a
+    // subnormal inside it still underflows the product: fc = 0.5 * min(1, ratio) * 5e-324 rounds to zero,
+    // every weight with it, and the sum-is-zero guard then emits an all-zero IR. That is a hole — an IR of
+    // silence is an answer where there is none — but repairing it means refusing a value the ratified range
+    // accepts, which is its own decision and not this task's. What is pinned here is what the code does
+    // TODAY, so that the hole cannot change shape unnoticed: zeros, and not NaNs.
+    test::group ("P69 — a cutoffScale so small that fc underflows: all-zero, not NaN (a named hole, pinned)");
+    {
+        convolution::IrResampleConfig cfg;
+        cfg.cutoffScale = std::numeric_limits<double>::denorm_min();       // 5e-324, inside the ratified range
+        const auto out = convolution::resampleIr (std::vector<float> (300, 0.5f), 48000.0, 48000.0, cfg);
+        bool allZero = ! out.empty();
+        for (float v : out) allZero = allZero && core::sameBits (v, 0.0f);
+        test::ok (allZero, "every tap is +0.0 — the weights vanished, and the guard did not divide by them");
     }
 
     return test::report();
