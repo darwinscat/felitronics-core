@@ -12,7 +12,7 @@ on:
 # One live run per branch or PR. Without this, a push on top of a push leaves the first one running to the
 # end against code nobody will merge, and on the scarcest runners that is the whole queue.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
