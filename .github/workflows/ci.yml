@@ -301,7 +301,12 @@ jobs:
           # 11 is THE regression this lint was written after: reverting LoudnessSolver::peakDb to the
           # system spelling breaks "the solver's report IS the certificate, bit for bit". The first
           # version of the lint PASSED on it, because carrier calls were checked only inside the zone.
-          sed -i 's|core::gainToDbDet (lin) : -200.0|core::gainToDb (lin) : -200.0|' "$SOLV"
+          sed -i 's|core::gainToDbDet (lin)|core::gainToDb (lin)|' "$SOLV"
+          # And prove the mutation LANDED: an earlier version of this control keyed on `... : -200.0`,
+          # which a refactor renamed to kPeakDbSilence, so the sed matched nothing and the lint's pass
+          # read as a working gate. A stand that does not verify its own mutation is wired to nothing.
+          grep -q 'core::gainToDb (lin)' "$SOLV" \
+            || { det_restore; echo "CONTROL BROKEN (11): the sed planted nothing"; exit 1; }
           det_control 11 "LoudnessSolver::peakDb reverted to the system spelling" "$SOLV"
           # 12: the matcher used to read one line at a time, so a call whose parenthesis sat on the next
           # line was not a call at all — in the zone, with no marker needed, because nothing was recorded.

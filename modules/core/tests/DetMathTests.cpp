@@ -210,11 +210,60 @@ int main()
         }
         ok (worst <= 2, "oracle: det::pow10 within " + std::to_string (worst)
                         + " ulp of the correctly rounded value at 6 points");
-        ok (moved == 0, moved == 0
-              ? "pinned: det::pow10 returns the same bits as every other row — this build's flags have not rewritten it"
-              : "PINNED VALUE MOVED at " + std::to_string (moved) + " of 6 points. If the code is unchanged, this build "
-                "is compiled with unsafe math (-ffast-math / -funsafe-math-optimizations / -Ofast). clang defines no "
-                "macro for the second of those, which is why this is a runtime check and not an #error.");
+        ok (moved == 0, "pinned: det::pow10 returns the reference bits at those 6 points");
+
+        // AND THE DENSE PIN, because six points is not a pin. An adversarial round dropped the `volatile`
+        // from ONE step of exp2Frac — the single likeliest wrong edit in this file, since it reads as a
+        // tidy-up — and det::pow10 changed across 100000 arguments while all six points above still
+        // matched. A sparse pin tests the six values somebody happened to choose; this tests the function.
+        //
+        // THE ARGUMENTS ARE BUILT FROM INTEGERS, exactly. `(i - N/2) / 4096.0` is representable for every
+        // i, so the argument stream is identical on every row BY CONSTRUCTION — where a sweep written as
+        // `lo + i * step` would be a contractible multiply-add and would make arm64 and a non-FMA x86-64
+        // build disagree about the INPUT. That mistake was made once here already, and it looked exactly
+        // like det:: being non-portable.
+        //
+        // The eight values below were captured on Apple clang/arm64, gcc 14/glibc x86-64 (-march=native,
+        // contraction live) and emcc/musl wasm32, which returned the same eight.
+        {
+            auto mix = [] (std::uint64_t h, double v)
+            { return (h ^ std::bit_cast<std::uint64_t> (v)) * 1099511628211ull; };
+            const int N = 100000;
+            std::uint64_t hCos = 1469598103934665603ull, hSin = hCos, hTan = hCos,
+                          hL2 = hCos, hL10 = hCos, hE2 = hCos, hP10 = hCos, hPow = hCos;
+            for (int i = 0; i < N; ++i)
+            {
+                const double t  = (double) (i - N / 2) / 4096.0;
+                const double u  = (double) (i + 1) / 8192.0;
+                const double db = (double) (i - N / 2) / 512.0;
+                hCos = mix (hCos, det::cos (t));   hSin = mix (hSin, det::sin (t));
+                hTan = mix (hTan, det::tan (t));   hL2  = mix (hL2,  det::log2 (u));
+                hL10 = mix (hL10, det::log10 (u)); hE2  = mix (hE2,  det::exp2 (t));
+                hP10 = mix (hP10, det::pow10 (db / 20.0));
+                hPow = mix (hPow, det::pow (u, t));
+            }
+            struct Pin { const char* name; std::uint64_t got, want; };
+            const Pin pins[] = {
+                { "cos",   hCos, 0x7d4385d092968bb2ull }, { "sin",   hSin, 0x15d3bf218d00b6acull },
+                { "tan",   hTan, 0x4539178d5ff966abull }, { "log2",  hL2,  0x1bbdfc745d669ce7ull },
+                { "log10", hL10, 0x74abd6c9f016d15dull }, { "exp2",  hE2,  0x390f967aca102148ull },
+                { "pow10", hP10, 0x90d3565674dd9a20ull }, { "pow",   hPow, 0xb2d816ef180685ecull },
+            };
+            int drift = 0;
+            for (const auto& q : pins)
+                if (q.got != q.want)
+                {
+                    ++drift;
+                    std::printf ("      det::%-6s over %d arguments: %016llx, pinned %016llx\n",
+                                 q.name, N, (unsigned long long) q.got, (unsigned long long) q.want);
+                }
+            ok (drift == 0, drift == 0
+                  ? "dense pin: all eight det:: functions reproduce their reference checksum over 100000 arguments"
+                  : std::to_string (drift) + " of 8 det:: functions DRIFTED over 100000 arguments. Either this "
+                    "build has unsafe-math flags (clang defines no macro for a bare -funsafe-math-optimizations "
+                    "off ARM, so the #error cannot see that one), or an edit to DetMath.h changed what it "
+                    "computes — check that every multiply-add still goes through mulAdd()/mul().");
+        }
     }
 
     return felitronics::test::report();

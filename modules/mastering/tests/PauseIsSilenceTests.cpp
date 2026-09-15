@@ -132,6 +132,21 @@ static void floorPremise()
     ok (bitsEqual (core::gainToDbDet (1.0e-30), atDet), "every level under the floor gives the SAME bits");
     ok (! bitsEqual (core::gainToDbDet (core::kGainToDbFloor * 2.0), atDet), "and a level ABOVE it does not");
     ok (std::fabs (atDet - (-240.0)) < 1.0e-9, "the deterministic floor is -240 dB as well");
+
+    // A NaN LEVEL MUST CLAMP, NOT PROPAGATE, and both spellings must agree that it does. The clamp is
+    // `gain > kGainToDbFloor ? gain : kGainToDbFloor`, whose false branch catches NaN because every
+    // comparison with NaN is false. Written the "obvious" way — `std::max (gain, floor)` — it does NOT:
+    // std::max returns its first argument when the comparison fails, so a NaN comes straight back out and
+    // the conversion returns NaN instead of the floor. An adversarial round made exactly that edit to the
+    // deterministic spelling and the whole 123-test suite stayed green, because nothing asked.
+    ok (bitsEqual (core::gainToDb (std::numeric_limits<double>::quiet_NaN()), at),
+        "a NaN level clamps to the floor in the system spelling, bit for bit");
+    ok (bitsEqual (core::gainToDbDet (std::numeric_limits<double>::quiet_NaN()), atDet),
+        "...and in the deterministic one");
+    ok (bitsEqual (core::gainToDb (-std::numeric_limits<double>::infinity()), at),
+        "-inf clamps too");
+    ok (bitsEqual (core::gainToDbDet (-std::numeric_limits<double>::infinity()), atDet),
+        "...in both spellings");
 }
 
 //==============================================================================

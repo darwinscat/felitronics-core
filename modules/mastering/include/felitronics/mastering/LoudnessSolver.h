@@ -458,6 +458,15 @@ public:
     static constexpr double kMaxGainDb = 60.0;      // MasteringChain::kMaxGainDb — the search's actuator range
     static constexpr int    kMaxPasses = TargetLoudnessSolverLimits::kMaxPasses;
 
+    // WHERE THIS CLASS STOPS REPORTING A dB AND STARTS REPORTING A SENTINEL. peakDb() below is the only
+    // user; the constant is public so a test can pin WHERE it is, not merely that silence reads -200.
+    // Digital silence sits below any plausible gate, so a test using silence alone cannot tell this value
+    // from one ten times larger — an adversarial round raised it to 1e-9f and the whole suite stayed green
+    // while the report and the certificate disagreed by 6 dB at a peak between the two. The float spelling
+    // widened to double is deliberate and predates P80: it keeps the boundary exactly where it was.
+    static constexpr double kPeakDbGate    = (double) 1.0e-10f;
+    static constexpr double kPeakDbSilence = -200.0;
+
     // `maxFrames` and `maxChannels` size the tap buffers; `binDb` is the resolution every gain-reduction
     // quantile is reported to. The tap buffers are the whole allocation and they are per RENDERER BLOCK,
     // not per programme — the traces are consumed as they arrive, so a five-minute track costs the same
@@ -1445,7 +1454,7 @@ private:
     // reads -240 there. Below the float gate the two therefore differ BY DESIGN, and deliberately — the
     // -200 sentinel is this class's published answer for silence and LoudnessSolverTests pins it. The
     // identity is over peaks above that gate, which is every peak a delivered file has.
-    static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDbDet (lin) : -200.0; }
+    static double peakDb (double lin) noexcept { return lin > kPeakDbGate ? core::gainToDbDet (lin) : kPeakDbSilence; }
 
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {

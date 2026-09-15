@@ -70,6 +70,30 @@ import { fileURLToPath } from 'node:url';
 // whole gate as a side effect, printed its verdict and could exit the importing process.
 const RUN_AS_PROGRAM = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 
+// The marker check needs the opposite view from the matcher: comments KEPT, strings blanked. Reading the
+// raw line instead let a string literal containing "// libm-ok:" authorise the call beside it, which an
+// adversarial round used. Everything here is deliberately the mirror of stripNonCode().
+export function stripStringsKeepComments (src)
+{
+    let out = '';
+    const blank = (s) => s.replace(/[^\n]/g, ' ');
+    for (let i = 0; i < src.length;)
+    {
+        const two = src.slice(i, i + 2);
+        if (two === '//') { const e = src.indexOf('\n', i); const end = e < 0 ? src.length : e; out += src.slice(i, end); i = end; continue; }
+        if (two === '/*') { const e = src.indexOf('*/', i + 2); const end = e < 0 ? src.length : e + 2; out += src.slice(i, end); i = end; continue; }
+        if (src[i] === '\'' && /[0-9a-fA-F]/.test(src[i - 1] || '') && /[0-9a-fA-F]/.test(src[i + 1] || '')) { out += ' '; i++; continue; }
+        if (src[i] === '"' || src[i] === '\'')
+        {
+            const q = src[i]; let j = i + 1;
+            while (j < src.length && src[j] !== q && src[j] !== '\n') { if (src[j] === '\\') j++; j++; }
+            const end = Math.min(j + 1, src.length); out += blank(src.slice(i, end)); i = end; continue;
+        }
+        out += src[i]; i++;
+    }
+    return out;
+}
+
 //==============================================================================
 // THE LEXER. Reused wholesale from check-no-long-double.mjs, and for the same reason: the words this
 // lint matches occur constantly in PROSE. `core::det`'s own header says "std::cos" a dozen times while
@@ -122,7 +146,10 @@ const FN_ALT = SCALAR.join('|');
 // matcher misses it entirely. Measured — `return std::cos\n    (x);` scanned as zero hits, in the zone,
 // with no marker needed because no call was recorded. Everything below therefore matches against the whole
 // stripped TEXT and derives the line number from the match index.
-const CALL_RE   = new RegExp(`(?<![A-Za-z0-9_])(?:(std::|::)|(?<![.>:]))(${FN_ALT})(f?)\\s*\\(`, 'g');
+// `\\)?\\s*\\(` after the name: `(std::cos)(x)` is a legal call that wraps the name in parentheses — it
+// suppresses macro expansion and reads as a deliberate way round a name — and without this it matched
+// nothing at all. Measured: an adversarial round used exactly that spelling to move a printed dBTP.
+const CALL_RE   = new RegExp(`(?<![A-Za-z0-9_])(?:(std::|::)|(?<![.>:]))(${FN_ALT})(f?)\\s*\\)?\\s*\\(`, 'g');
 const CPLX_RE   = new RegExp(`(?<![A-Za-z0-9_])std::(${COMPLEX_FNS.join('|')})\\s*\\(`, 'g');
 // std::abs and std::sqrt on a COMPLEX are hypot and a complex square root; the scalar overloads are exact
 // and deliberately ungoverned, so these are matched only where the file spells std::complex at all.
@@ -340,7 +367,7 @@ export function scanCarriers (text, names)
     const own = new Set();
     for (const m of code.matchAll(new RegExp(`(?:^|\\n)[^\\n]*?\\b(?:double|float|int|auto)\\s+(${alt})\\s*\\(`, 'g')))
         own.add(m[1]);
-    const re = new RegExp(`(?:(?<![A-Za-z0-9_])core::(${alt})|(?<![A-Za-z0-9_.>:])(${alt}))\\s*\\(`, 'g');
+    const re = new RegExp(`(?:(?<![A-Za-z0-9_])core::(${alt})|(?<![A-Za-z0-9_.>:])(${alt}))\\s*\\)?\\s*\\(`, 'g');
     for (const m of code.matchAll(re))
     {
         const lineStart = code.lastIndexOf('\n', m.index) + 1;
@@ -414,6 +441,9 @@ function selfTest ()
         ['std::complex<double> z; auto r = std::sqrt (z);',                               1],   // complex sqrt IS transcendental
         ['double r = std::sqrt (x);',                                                     0],   // scalar sqrt is exact — never governed
         ['inline double cos (double x)\n{ return 1.0; }',                                 0],   // definition split over lines
+        // --- the bypasses the ADVERSARIAL round executed, each now a case ---
+        ['double y = (std::cos)(x);',                                                     1],   // the name in parentheses
+        ['double y = (std::cos) (x);',                                                    1],
     ];
     let bad = 0;
     for (const [src, want] of cases)
@@ -432,14 +462,29 @@ function selfTest ()
         ['const double d = p->gainToDb (x);',       0],
         ['const double d = other::gainToDb (x);',   0],   // another namespace's function of the same name
         ['const double d = core::gainToDb\n    (x);', 1],  // ( on the next line, the carrier half
+        ['const double d = (core::gainToDb)(x);',   1],   // ...and with the name in parentheses
     ];
     for (const [src, want] of carrierCases)
     {
         const got = scanCarriers(src, ['gainToDb', 'dbToGain']).length;
         if (got !== want) { console.error(`  SELF-TEST FAIL (carrier): wanted ${want}, got ${got} for: ${JSON.stringify(src)}`); bad++; }
     }
-    if (bad) { console.error(`det-math lint self-test: ${bad} of ${cases.length + carrierCases.length} cases wrong`); process.exit(1); }
-    console.log(`det-math lint self-test: ${cases.length + carrierCases.length}/${cases.length + carrierCases.length} cases correct`);
+    // The MARKER lexer is the mirror of the matcher's: comments kept, strings blanked. A string that
+    // contains "// libm-ok:" must not authorise the call beside it — an adversarial round used exactly
+    // that, and the check was reading the raw line.
+    const markerCases = [
+        ['double y = std::cos (x);   // libm-ok: a real comment',  true ],
+        ['const char* s = "// libm-ok: not a comment";',           false],
+        ['const char* s = "/* libm-ok: nor this */";',             false],
+    ];
+    for (const [src, want] of markerCases)
+    {
+        const got = /\/\/[^\n]*libm-ok:/.test(stripStringsKeepComments(src));
+        if (got !== want) { console.error(`  SELF-TEST FAIL (marker): wanted ${want}, got ${got} for: ${JSON.stringify(src)}`); bad++; }
+    }
+    const total = cases.length + carrierCases.length + markerCases.length;
+    if (bad) { console.error(`det-math lint self-test: ${bad} of ${total} cases wrong`); process.exit(1); }
+    console.log(`det-math lint self-test: ${total}/${total} cases correct`);
 }
 
 //==============================================================================
@@ -461,7 +506,7 @@ const exceptionUses = new Map();
 for (const f of files)
 {
     const text = readFileSync(f, 'utf8');
-    const rawLines = text.split('\n');
+    const markerLines = stripStringsKeepComments(text).split('\n');   // comments kept, strings blanked
     const hits = scanText(text);
     const carrierHits = IMPLEMENTATION.has(f) ? [] : scanCarriers(text, carrierNames);
     // CARRIER CALLS COUNT TOWARDS THE MANIFEST TOO, and this is not tidiness. Without it the rule only
@@ -482,7 +527,7 @@ for (const f of files)
             // The marker must be ON the calling line, and the exception must be recorded. Either alone
             // is not enough: a comment anyone can type is not an approval, and an approval nobody can see
             // at the call site is not a warning.
-            const marked = /\/\/[^\n]*libm-ok:/.test(rawLines[h.line - 1] || '');
+            const marked = /\/\/[^\n]*libm-ok:/.test(markerLines[h.line - 1] || '');
             const listed = ZONE_EXCEPTIONS.find(e => e.file === f && e.fn === h.fn);
             if (marked && listed) { usedExceptions.add(f + '::' + h.fn); exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
             if (marked && ! listed)
@@ -494,7 +539,7 @@ for (const f of files)
         for (const h of carrierHits)
         {
             const c = CARRIERS.find(x => x.name === h.fn);
-            const marked = /\/\/[^\n]*libm-ok:/.test(rawLines[h.line - 1] || '');
+            const marked = /\/\/[^\n]*libm-ok:/.test(markerLines[h.line - 1] || '');
             const listed = ZONE_EXCEPTIONS.find(e => e.file === f && e.fn === h.fn);
             if (marked && listed) { usedExceptions.add(f + '::' + h.fn); exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
             violations.push({ f, line: h.line, rule: 'CARRIER',
@@ -562,6 +607,11 @@ else
                                  + (closure.has(f) ? ` THIS FILE IS REACHABLE BY #include FROM A PARITY ENTRY POINT (${ENTRY_POINTS.join(', ')}), so it is compiled into the binaries whose outputs CI diffs — read it before classifying it.`
                                                    : ` It is not reachable from any parity entry point, so this is bookkeeping rather than a hazard — but it is still a decision somebody made.`)
                                  + ` Add a line to ${MANIFEST_PATH} (--propose prints a starting one, marked UNCLASSIFIED so it cannot pass by accident).` }); continue; }
+        // `--propose` emits a placeholder reason. Changing only the DISPOSITION in front of it and leaving
+        // the placeholder made the gate green with nobody having written anything — measured.
+        if (/^<.*>$/.test(e.reason) || e.reason.includes('why they stay system'))
+            violations.push({ f, line: hits[0].line, rule: 'MANIFEST',
+                              msg: `the manifest entry still carries --propose's placeholder reason. The disposition is not the classification; the sentence after it is.` });
         if (e.disposition === 'UNCLASSIFIED')
             violations.push({ f, line: hits[0].line, rule: 'MANIFEST', msg: `manifest entry is still UNCLASSIFIED — someone has to say what these calls are and why they stay` });
         else if (! DISPOSITIONS.has(e.disposition))
