@@ -189,7 +189,10 @@ int main()
         RTP m; test::run (m.prepare (fs, 512, 1));
         feed (m, x, 512);
         test::ok (m.truePeakLinear() >= 0.5 && m.samplePeakLinear() == 0.5, "the impulse reads at least its own sample");
-        test::ok (m.truePeakDb() == core::gainToDb (m.truePeakLinear()), "truePeakDb() is gainToDb of the linear reading");
+        // `gainToDbDet`, which is what truePeakDb() now calls. Written as `core::gainToDb` this assertion
+        // still PASSED — det and the system libm agree at this fixture's peak — so it was a sentence that
+        // had become false about the code while staying green, which is worse than a red test.
+        test::ok (m.truePeakDb() == core::gainToDbDet (m.truePeakLinear()), "truePeakDb() is gainToDbDet of the linear reading");
     }
 
     // THE FALLING EDGE DRAINS. The review round's sequence: the right channel ends on a peak still inside the FIR,

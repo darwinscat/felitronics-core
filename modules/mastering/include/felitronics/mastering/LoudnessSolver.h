@@ -1288,7 +1288,12 @@ private:
         m.latencySamples = chain.latencySamples();
         m.compressor = summarise (compHist_, compActive_, compFrames_);
         m.limiter    = summarise (limHist_,  limActive_,  limFrames_);
-        m.limiterMaxReconstructedPeakDb = core::gainToDb ((double) maxReconLin_);
+        // `gainToDbDet` for the same reason as peakDb() above, and this one is the stronger case of the two:
+        // the field crosses the C ABI into the browser (fc_master_abi.h, fc_master.cpp) AND it is read back
+        // as a DECISION — `headroomToEngage = ceiling - m.limiterMaxReconstructedPeakDb` a few hundred lines
+        // up — so on the system spelling the solver could take a different branch on Apple than on the row
+        // that rendered the same file. The LINEAR peak it converts is the limiter's own, and stays RT.
+        m.limiterMaxReconstructedPeakDb = core::gainToDbDet ((double) maxReconLin_);
         return measure (out, nch, frames, m);
     }
 
@@ -1459,6 +1464,16 @@ private:
         // `poisoned`), and a sub-hop is at least one sample. So it cannot exceed `frames`, an int. Feeding
         // this meter more than once, or widening `frames`, is what would make this cast wrong.
         m.nonFiniteSubHops = (int) lm.nonFiniteSubHops();
+        // THIS MEASUREMENT MIXES THE TWO MATH POLICIES, on purpose and worth saying out loud. The two peak
+        // fields below go through `peakDb`, which P80 put on `core::det`, because they are the certificate
+        // and the certificate is compared bit for bit. The two loudness fields here come from
+        // `analysis::LoudnessMeter`, which is `BasicLoudnessMeter<core::SystemMath>` — the SYSTEM policy —
+        // so they are NOT the same bits on every row, and `plrDb` below subtracts one from the other.
+        // That is consistent with what this class is measured against: tools/wasm/master-parity.mjs states
+        // a TOLERANCE (1e-5 in sample value, 1e-3 dB in the reported numbers), not byte identity, because
+        // the two roads render at two roundings by construction. ProgrammeReport, which IS byte-diffed,
+        // uses `DeterministicLoudnessMeter` instead. Moving this one would change the solver's SEARCH, not
+        // just its report, so it is a decision rather than a tidy-up — recorded here, not done in passing.
         m.integratedLufs   = lm.integratedLufs();
         m.loudnessRangeLu  = lm.loudnessRangeLu();
         m.truePeakDbTp     = peakDb (tm.truePeakLinear());
