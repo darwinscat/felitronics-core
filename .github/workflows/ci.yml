@@ -3,25 +3,41 @@ name: ci
 
 on:
   push:
-    branches: [ main, "feat/**" ]
-  pull_request:
-  workflow_dispatch:   # manual run (e.g. to seed/refresh the quality-report branch)
+    branches: [ main ]          # NOT "feat/**": a branch with a PR was getting TWO full runs of all 13 jobs
+  pull_request:                 # for one push (measured: p81 81274f28 -> runs 34991274385 and 34991354360,
+  workflow_dispatch:            # 45 s apart). `pull_request` already covers every branch, and covers it
+                                # MERGED INTO main, which is the stricter thing to test. A branch with no PR
+                                # open simply does not burn the pool twice.
+
+# One live run per branch or PR. Without this, a push on top of a push leaves the first one running to the
+# end against code nobody will merge, and on the scarcest runners that is the whole queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-test:
     name: ${{ matrix.os }} pffft=${{ matrix.pffft }} nam=${{ matrix.nam }}
-    runs-on: ${{ matrix.os }}
+    # SELF-HOSTED FOR THE macOS ROWS. GitHub's hosted macos-latest is a 3-core arm64 VM and it is the
+    # scarcest runner in the pool: measured on this suite, one macOS cell is 23.9-39.6 min of which 35.6 is
+    # COMPILING (Configure 0.5, Test 3.3), against 9.6 min for the same cell on ubuntu. LafoxsMacStudio is
+    # the same ISA and the same Apple toolchain, so nothing about coverage changes - only the wait.
+    # THE FORK GATE IS NOT OPTIONAL: this repository is public, and a self-hosted runner executes whatever
+    # a pull request brings. A PR from a fork therefore keeps the hosted runner; only code that already
+    # lives in this repository runs on hardware that is not disposable.
+    runs-on: ${{ (matrix.selfHosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","macOS","ARM64","studio"]') || matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:          # OFF/OFF proves the default header-only path on every toolchain. NAM is also
           - { os: ubuntu-latest,  pffft: OFF, nam: OFF }   # compiled on all three; pffft ON covers the two SIMD
-          - { os: macos-latest,   pffft: OFF, nam: OFF }   # arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
+          - { os: macos-latest,   pffft: OFF, nam: OFF, selfHosted: true }   # arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
           - { os: windows-latest, pffft: OFF, nam: OFF }   # (macos). Its cross-backend NULL suite runs on ON.
-          - { os: macos-latest,   pffft: OFF, nam: ON  }
+          - { os: macos-latest,   pffft: OFF, nam: ON,  selfHosted: true }
           - { os: windows-latest, pffft: OFF, nam: ON  }
           - { os: ubuntu-latest,  pffft: ON,  nam: ON  }
-          - { os: macos-latest,   pffft: ON,  nam: ON  }
+          - { os: macos-latest,   pffft: ON,  nam: ON,  selfHosted: true }
           # arm64 LINUX — the axis nothing above covers. Every other row confounds two variables: the two
           # arm64 rows are also the only Apple rows, so "arm64" and "Apple's toolchain" always move together
           # and a divergence cannot be attributed. It is not a hypothetical distinction — the P0 spike found
@@ -35,8 +51,30 @@ jobs:
       - uses: actions/checkout@v7   # v5 runs on Node 24 (v4 is pinned to the deprecated Node 20)
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }} -DFELITRONICS_WITH_NAM=${{ matrix.nam }}
+      - name: Toolchain
+        shell: bash
+        # A self-hosted macOS runner inherits launchd's PATH — /usr/bin:/bin:/usr/sbin:/sbin — and Homebrew
+        # is not on it, which is where that machine's cmake, ninja and node actually live (measured:
+        # `command -v cmake` empty, /opt/homebrew/bin/cmake 4.4.3 present). A hosted runner ships cmake on
+        # the default PATH, so this gap is invisible until the first self-hosted run dies at Configure with
+        # `cmake: command not found`. Prepend it where it exists; where it does not, this does nothing.
+        run: |
+          if [ -d /opt/homebrew/bin ]; then
+            echo /opt/homebrew/bin >> "$GITHUB_PATH"
+            export PATH=/opt/homebrew/bin:$PATH
+          fi
+          echo "runner: $(uname -s) $(uname -m)"
+          cmake --version | head -1
+          ninja --version 2>/dev/null && echo "(ninja, above)" || echo "(no ninja — the default generator it is)"
       - name: Build
-        run: cmake --build build --config Release -j   # --config is required by multi-config gens (VS on Windows)
+        shell: bash
+        # A BARE `-j` MEANS UNLIMITED, not "use the cores" - the same footgun 7eb0894 fixed for CodeQL and
+        # nowhere else. On a 3-core box that is a pile of compilers competing for 7 GB, which is most of why
+        # the macOS rows were 35 min of build. Ask for the cores the machine actually has.
+        run: |
+          n=$( (getconf _NPROCESSORS_ONLN || nproc || sysctl -n hw.ncpu) 2>/dev/null | head -1 )
+          echo "building with -j ${n:-4}"
+          cmake --build build --config Release -j "${n:-4}"   # --config: required by multi-config gens (VS)
       - name: Test
         # The perf-shaped suites run VERBOSE first, then everything runs normally. Two lines, and they
         # exist because `--output-on-failure` prints a test's stdout only when it FAILS — so every gate
@@ -57,6 +95,7 @@ jobs:
   sanitizers:
     name: ubuntu-clang-asan-ubsan
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Configure (ASan + UBSan, hard-fail on any UB)
@@ -72,7 +111,7 @@ jobs:
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
-        run: cmake --build build-san -j
+        run: cmake --build build-san -j 4
       - name: Test
         env:
           # LSan (Linux-only; macOS has no LeakSanitizer) → this job is where leaks fail the build. It caught
@@ -93,6 +132,7 @@ jobs:
   gcc-14:
     name: ubuntu-gcc-14
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Install g++-14
@@ -101,7 +141,7 @@ jobs:
         env: { CC: gcc-14, CXX: g++-14 }
         run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON
       - name: Build
-        run: cmake --build build-gcc14 -j
+        run: cmake --build build-gcc14 -j 4
       - name: Test
         run: |
           ctest --test-dir build-gcc14 -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
@@ -142,6 +182,7 @@ jobs:
   wasm-audio:
     name: wasm-audio-tier
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Install emsdk 6.0.9
@@ -324,7 +365,7 @@ jobs:
         run: |
           cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
                 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
-          cmake --build build-wasm-checked -j
+          cmake --build build-wasm-checked -j 4
           ctest --test-dir build-wasm-checked -j4 --output-on-failure -E spectrum_pane_perf
       - name: The P0 spike artifacts still build
         run: ./tools/wasm/build.sh
@@ -337,7 +378,7 @@ jobs:
         # prove nothing, and the libsoxr precedent is exactly a clean build that died at runtime.
         run: |
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
-          cmake --build build-native -j --target fcore_measure
+          cmake --build build-native -j 4 --target fcore_measure
           node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
           # The generator claims to be deterministic by construction; this turns that into a MEASURED fact
           # on a different machine, OS and node build than the one it was written on. Recorded from two
@@ -520,7 +561,7 @@ jobs:
           # build-native was configured with tests OFF (it only needed fcore_measure); turning them on
           # re-uses its object cache and adds this one target.
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
-          cmake --build build-native -j --target felitronics_analysis_abi_tests
+          cmake --build build-native -j 4 --target felitronics_analysis_abi_tests
           ./build-native/tools/felitronics_analysis_abi_tests --storage-table > storage-native.txt
           test -s storage-native.txt
           # A table of nothing but refusals would compare clean and say nothing, which is the shape this
@@ -543,12 +584,13 @@ jobs:
   eqviz:
     name: eqviz-quality-pictures
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
       - name: Build eqviz
-        run: cmake --build build -j --target eqviz
+        run: cmake --build build -j 4 --target eqviz
       - name: Render quality maps
         run: mkdir -p eqviz-out && ./build/tools/eqviz eqviz-out --fs 44100,48000,96000,192000
       - uses: actions/upload-artifact@v7
@@ -564,6 +606,7 @@ jobs:
     name: publish-quality-atlas
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -571,7 +614,7 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
       - name: Build eqviz
-        run: cmake --build build -j --target eqviz
+        run: cmake --build build -j 4 --target eqviz
       - name: Render the atlas
         run: |
           mkdir -p atlas
