@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/analysis/SpectrumFrames.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Config.h>
 
 #include <algorithm>
@@ -589,9 +590,9 @@ public:
 
         sampleRate_ = sampleRate;
         channels_   = maxChannels;
-        quietLin_   = std::pow (10.0, cfg_.quietThresholdDb / 10.0);
-        promLin_    = std::pow (10.0, cfg_.minProminenceDb / 10.0);
-        levelLin_   = std::pow (10.0, cfg_.minLevelDbfs / 10.0);
+        quietLin_   = core::det::pow10 (cfg_.quietThresholdDb / 10.0);
+        promLin_    = core::det::pow10 (cfg_.minProminenceDb / 10.0);
+        levelLin_   = core::det::pow10 (cfg_.minLevelDbfs / 10.0);
         harmTolHz_  = cfg_.harmonicToleranceBins * geom_.binHz;
 
         band_.assign (st.bandDoubles, 0.0);
@@ -1004,10 +1005,10 @@ private:
         {
             *windowPeakOut = window;
             if (window.found && window.peakBinPower > 0.0 && window.floorPower > 0.0)
-                windowPeakOut->prominenceDb = 10.0 * std::log10 (window.peakBinPower / window.floorPower);
+                windowPeakOut->prominenceDb = 10.0 * core::det::log10 (window.peakBinPower / window.floorPower);
         }
         if (best.found && best.peakBinPower > 0.0 && best.floorPower > 0.0)
-            best.prominenceDb = 10.0 * std::log10 (best.peakBinPower / best.floorPower);
+            best.prominenceDb = 10.0 * core::det::log10 (best.peakBinPower / best.floorPower);
         return best;
     }
 
@@ -1016,7 +1017,7 @@ private:
     static double parabolicDelta (double a, double b, double cc) noexcept
     {
         if (! (a > 0.0) || ! (b > 0.0) || ! (cc > 0.0)) return 0.0;
-        const double la = std::log10 (a), lb = std::log10 (b), lc = std::log10 (cc);
+        const double la = core::det::log10 (a), lb = core::det::log10 (b), lc = core::det::log10 (cc);
         const double den = la - 2.0 * lb + lc;
         if (! (den < 0.0)) return 0.0;                         // not a maximum in the log domain
         const double d = 0.5 * (la - lc) / den;

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/analysis/SpectrumFrames.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
 
@@ -477,12 +478,12 @@ public:
         if ((std::uint64_t) g.cellCount * (std::uint64_t) std::max (g.plateauCells, g.floorCells) > kMaxSearchWork)
             return g;
         g.exemptCells = p.exemptCells;
-        g.minDropRatio = std::pow (10.0, p.minDropDb / 10.0);
+        g.minDropRatio = core::det::pow10 (p.minDropDb / 10.0);
         g.distinctLimit = p.maxDistinctValues;
         g.tableSlots = core::offline::nextPow2 ((std::size_t) g.distinctLimit * 4u / 3u + 1u);
-        g.startRatio = std::pow (10.0, -p.transitionStartDb / 10.0);
-        g.endRatio   = std::pow (10.0,  p.transitionEndDb   / 10.0);
-        g.emptyRatio = std::pow (10.0, -p.emptyDb / 10.0);
+        g.startRatio = core::det::pow10 (-p.transitionStartDb / 10.0);
+        g.endRatio   = core::det::pow10 (p.transitionEndDb   / 10.0);
+        g.emptyRatio = core::det::pow10 (-p.emptyDb / 10.0);
         g.ok = true;
         return g;
     }
@@ -1203,7 +1204,7 @@ private:
         // a real drop over it is infinitely steep — the documented value there is +inf, not a 0.0 that
         // reads as "flat", and 0/0 is never produced.
         w.steepnessDbPerOctave = (w.transitionEndHz > w.cutoffHz && w.cutoffHz > 0.0 && std::isfinite (w.dropDb))
-                               ? w.dropDb / std::log2 (w.transitionEndHz / w.cutoffHz)
+                               ? w.dropDb / core::det::log2 (w.transitionEndHz / w.cutoffHz)
                                : (w.dropDb > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
         w.sharp = ! w.transitionClipped && w.dropDb >= active_.minDropDb
                 && w.transitionHz <= active_.maxTransitionHz;
@@ -1212,7 +1213,7 @@ private:
 
     // 10log10(a/b) — a power ratio, taken ONCE at the end of a linear average. b == 0 with a > 0 is
     // legitimately +inf (that IS the value); 0/0 is never asked, the callers exclude it.
-    static double powerRatioDb (double a, double b) noexcept { return 10.0 * std::log10 (a / b); }
+    static double powerRatioDb (double a, double b) noexcept { return 10.0 * core::det::log10 (a / b); }
 
     // Sort a COPY of cells [from, to) into the scratch and answer how many landed there; every quantile of
     // that span is then an integer index into it (pick()), so one span costs one sort and the accumulator

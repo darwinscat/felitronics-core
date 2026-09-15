@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -165,6 +166,165 @@ inline double sin (double x) noexcept
         case 2:  return -detail::polySin (r);
         default: return -detail::polyCos (r);
     }
+}
+
+
+//==============================================================================
+// THE LOGARITHMIC AND EXPONENTIAL HALF.
+//
+// These are where the divergence is worst, and it is not the dB VALUES that make it dangerous — it is
+// the dB THRESHOLDS. Measured over -120..+12 dB, 41 % of pow10 results differ between Apple's libm and
+// both Linux ones; every silenceThresholdDb, quietThresholdDb, enterDb, exitDb and minDropDb in this
+// library is built from one of them. A reported number that moves by an ulp moves by an ulp. A
+// threshold that moves by an ulp moves a DECISION: a block lands inside the gate on one row and outside
+// it on the next, and the two rows then disagree by a whole block of loudness, not by a bit.
+
+namespace detail
+{
+    inline constexpr double kLog2E     = 1.44269504088896338700e+00;
+    inline constexpr double kLog10E    = 4.34294481903251816668e-01;
+    inline constexpr double kLog10_2Hi = 3.01029920578002929688e-01;   // 20 bits: e * Hi is EXACT for |e| < 2^32
+    inline constexpr double kLog10_2Lo = 7.50859782655262350275e-08;
+    inline constexpr double kLog2_10Hi = 3.32192808389663696289e+00;   // 26 bits, for the Dekker product
+    inline constexpr double kLog2_10Lo = 1.09907253849796945458e-08;
+    inline constexpr double kLn2       = 6.93147180559945286227e-01;
+    inline constexpr double kSqrt2     = 1.41421356237309514547e+00;
+    inline constexpr double kSplit     = 134217729.0;                  // 2^27 + 1, Veltkamp
+
+    // atanh(f) * 2 on |f| <= (sqrt2-1)/(sqrt2+1) = 0.1716, series to f^21 (tail below 1e-17).
+    inline double log1pSeries (double f) noexcept
+    {
+        const double f2 = mul (f, f);
+        double p = 1.0 / 21.0;
+        p = mulAdd (p, f2, 1.0 / 19.0);
+        p = mulAdd (p, f2, 1.0 / 17.0);
+        p = mulAdd (p, f2, 1.0 / 15.0);
+        p = mulAdd (p, f2, 1.0 / 13.0);
+        p = mulAdd (p, f2, 1.0 / 11.0);
+        p = mulAdd (p, f2, 1.0 /  9.0);
+        p = mulAdd (p, f2, 1.0 /  7.0);
+        p = mulAdd (p, f2, 1.0 /  5.0);
+        p = mulAdd (p, f2, 1.0 /  3.0);
+        p = mulAdd (p, f2, 1.0);
+        return mul (2.0, mul (f, p));
+    }
+
+    // x = m * 2^e with m in [sqrt2/2, sqrt2), so |(m-1)/(m+1)| <= 0.1716 and the series above converges.
+    inline void decompose (double x, double& m, int& e) noexcept
+    {
+        const std::uint64_t b = std::bit_cast<std::uint64_t> (x);
+        e = (int) ((b >> 52) & 0x7ff) - 1022;
+        m = std::bit_cast<double> ((b & 0x800fffffffffffffull) | 0x3fe0000000000000ull);   // m in [0.5, 1)
+        if (m < kSqrt2 * 0.5) { m = mul (m, 2.0); --e; }
+    }
+
+    // Veltkamp split: x = hi + lo with hi carrying 26 significant bits, so hi * (a 26-bit constant) is
+    // EXACT. The subtractions cannot be contracted (no multiply-add pattern), so no pin is needed here.
+    inline void split (double x, double& hi, double& lo) noexcept
+    {
+        const double t = mul (kSplit, x);
+        hi = t - (t - x);
+        lo = x - hi;
+    }
+
+    // 2^f on |f| <= 0.5, Taylor in f*ln2 to the 13th term.
+    inline double exp2Frac (double f) noexcept
+    {
+        const double y = mul (f, kLn2);
+        double p = 1.0 / 6227020800.0;                      // 1/13!
+        p = mulAdd (p, y, 1.0 / 479001600.0);               // 1/12!
+        p = mulAdd (p, y, 1.0 / 39916800.0);                // 1/11!
+        p = mulAdd (p, y, 1.0 / 3628800.0);                 // 1/10!
+        p = mulAdd (p, y, 1.0 / 362880.0);                  // 1/9!
+        p = mulAdd (p, y, 1.0 / 40320.0);                   // 1/8!
+        p = mulAdd (p, y, 1.0 / 5040.0);                    // 1/7!
+        p = mulAdd (p, y, 1.0 / 720.0);                     // 1/6!
+        p = mulAdd (p, y, 1.0 / 120.0);                     // 1/5!
+        p = mulAdd (p, y, 1.0 / 24.0);                      // 1/4!
+        p = mulAdd (p, y, 1.0 / 6.0);                       // 1/3!
+        p = mulAdd (p, y, 0.5);                             // 1/2!
+        p = mulAdd (p, y, 1.0);
+        return mulAdd (p, y, 1.0);
+    }
+
+    // 2^k as an exact double, k an integer in [-1074, 1023]. Subnormal results are built by halving.
+    inline double pow2i (int k) noexcept
+    {
+        if (k >= 1024)  return std::numeric_limits<double>::infinity();
+        if (k >= -1022) return std::bit_cast<double> ((std::uint64_t) (k + 1023) << 52);
+        if (k < -1074)  return 0.0;
+        return std::bit_cast<double> ((std::uint64_t) 1 << (k + 1074));   // subnormal 2^k, exact
+    }
+} // namespace detail
+
+// log2 / log10 for x > 0. Zero, negative and non-finite are refused, never answered with a plausible
+// number: -inf for log(0) is the mathematically right answer, and it is given; a NaN argument stays NaN.
+inline double log2 (double x) noexcept
+{
+    if (std::isnan (x)) return x;
+    if (x < 0.0)  return std::numeric_limits<double>::quiet_NaN();
+    if (x == 0.0) return -std::numeric_limits<double>::infinity();
+    if (std::isinf (x)) return x;
+    if (x < 2.2250738585072014e-308) return log2 (mul (x, 18014398509481984.0)) - 54.0;   // subnormal
+    double m; int e;
+    detail::decompose (x, m, e);
+    const double f = (m - 1.0) / (m + 1.0);
+    return mulAdd (detail::log1pSeries (f), detail::kLog2E, (double) e);
+}
+
+inline double log10 (double x) noexcept
+{
+    if (std::isnan (x)) return x;
+    if (x < 0.0)  return std::numeric_limits<double>::quiet_NaN();
+    if (x == 0.0) return -std::numeric_limits<double>::infinity();
+    if (std::isinf (x)) return x;
+    if (x < 2.2250738585072014e-308) return log10 (mul (x, 18014398509481984.0)) - 16.25561652641961;
+    double m; int e;
+    detail::decompose (x, m, e);
+    const double f = (m - 1.0) / (m + 1.0);
+    const double lm = mul (detail::log1pSeries (f), detail::kLog10E);
+    // e * Hi is exact (20-bit Hi), so the only rounding is in the two sums.
+    return mulAdd ((double) e, detail::kLog10_2Hi, mulAdd ((double) e, detail::kLog10_2Lo, lm));
+}
+
+inline double exp2 (double x) noexcept
+{
+    if (std::isnan (x)) return x;
+    if (x >= 1024.0) return std::numeric_limits<double>::infinity();
+    if (x <= -1075.0) return 0.0;
+    const double kd = (double) (long long) (x + (x >= 0.0 ? 0.5 : -0.5));
+    const double f  = x - kd;
+    return mul (detail::exp2Frac (f), detail::pow2i ((int) kd));
+}
+
+// 10^x. The exponent is formed as an EXACT Dekker product before it reaches exp2: a plain
+// exp2(x * log2(10)) loses the low bits of the product, and at 60 dB that is ~14 ulp in the result —
+// which is the whole point, since this function's output is a threshold.
+inline double pow10 (double x) noexcept
+{
+    if (std::isnan (x)) return x;
+    if (x >= 308.26) return std::numeric_limits<double>::infinity();
+    if (x <= -324.0) return 0.0;
+    double xh, xl;
+    detail::split (x, xh, xl);
+    const double hi = mul (xh, detail::kLog2_10Hi);                        // exact: 26 bits * 26 bits
+    const double lo = mulAdd (xh, detail::kLog2_10Lo,
+                       mulAdd (xl, detail::kLog2_10Hi, mul (xl, detail::kLog2_10Lo)));
+    const double t  = hi + lo;
+    const double e  = (hi - t) + lo;                                       // the bits the sum dropped
+    // 2^(t+e) = 2^t * 2^e, and |e| is tiny, so two terms of 2^e are more than enough.
+    const double corr = mulAdd (mul (e, detail::kLn2), mulAdd (e, mul (0.5, detail::kLn2), 1.0), 1.0);
+    return mul (exp2 (t), corr);
+}
+
+// tan from the same reduction. Poles are poles: tan(pi/2_d) is a huge finite number, as it should be.
+inline double tan (double x) noexcept
+{
+    if (! (std::fabs (x) < detail::kMaxArg)) return std::numeric_limits<double>::quiet_NaN();
+    int q = 0;
+    const double r = detail::reduce (x, q);
+    const double s = detail::polySin (r), c = detail::polyCos (r);
+    return (q & 1) ? -(c / s) : (s / c);
 }
 
 } // namespace felitronics::core::det

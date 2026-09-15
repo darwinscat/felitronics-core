@@ -7,6 +7,7 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
 #include <felitronics/analysis/StereoColumns.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/core/StateGrid.h>
@@ -524,7 +525,7 @@ public:
         channels_      = maxChannels;
         tailSamples_   = st.tailSamples;
         subHopSamples_ = st.subHopSamples;
-        silenceThr_    = std::pow (10.0, params_.silenceThresholdDb / 20.0);
+        silenceThr_    = core::det::pow10 (params_.silenceThresholdDb / 20.0);
 
         tailSq_.assign (st.tailRingEnergies, 0.0);
         tailN_.assign (st.tailRingCounts, 0);
@@ -998,7 +999,7 @@ private:
     //==========================================================================
     static double lufsOf (double meanSquare) noexcept
     {
-        return meanSquare > 1e-12 ? -0.691 + 10.0 * std::log10 (meanSquare) : kSilenceFloorLufs;
+        return meanSquare > 1e-12 ? -0.691 + 10.0 * core::det::log10 (meanSquare) : kSilenceFloorLufs;
     }
 
     static int binOf (double meanSquare) noexcept
@@ -1096,7 +1097,7 @@ private:
             const double rms    = std::sqrt (meanSq);
             P.dcOffset      = good (ch.dc.value() / (double) spanCount);
             P.rms           = good (rms);
-            P.crestFactorDb = rms > 0.0 ? good (20.0 * std::log10 (ch.peak / rms))
+            P.crestFactorDb = rms > 0.0 ? good (20.0 * core::det::log10 (ch.peak / rms))
                                         : bad (ProgrammeReason::SilentProgramme);
             P.infraLowFraction = ! inputClean      ? bad (ProgrammeReason::NonFiniteInput)
                                : ! ch.lowFinite    ? bad (ProgrammeReason::NonFiniteIntermediate)
@@ -1122,7 +1123,7 @@ private:
             const double rms    = std::sqrt (meanSq);
             R.programmeMeanSquare = good (meanSq);
             R.rms                 = good (rms);
-            R.crestFactorDb = rms > 0.0 ? good (20.0 * std::log10 (totalPeak / rms))
+            R.crestFactorDb = rms > 0.0 ? good (20.0 * core::det::log10 (totalPeak / rms))
                                         : bad (ProgrammeReason::SilentProgramme);
             R.infraLowFraction = ! inputClean   ? bad (ProgrammeReason::NonFiniteInput)
                                : ! allLowFinite ? bad (ProgrammeReason::NonFiniteIntermediate)
@@ -1201,7 +1202,7 @@ private:
         R.stereoCorrelation = denom > 1e-12 ? good (sums_.correlation())
                                             : bad (ProgrammeReason::SilentProgramme);
         R.stereoBalanceDb   = (sums_.ll > 0.0 && sums_.rr > 0.0)
-                            ? good (10.0 * std::log10 (sums_.ll / sums_.rr))
+                            ? good (10.0 * core::det::log10 (sums_.ll / sums_.rr))
                             : bad (ProgrammeReason::SilentProgramme);
         R.stereoSideToMidRatio = sums_.mid > 0.0 ? good (sums_.side / sums_.mid)
                                                  : bad (ProgrammeReason::SilentProgramme);

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/core/StateGrid.h>
@@ -455,8 +456,8 @@ public:
         baselineHops_ = st.baselineHops;
 
         // The thresholds become RATIOS here, once, so that no logarithm ever takes part in a decision.
-        enterRatio_ = std::pow (10.0, params_.enterDb / 10.0);
-        exitRatio_  = std::pow (10.0, params_.exitDb  / 10.0);
+        enterRatio_ = core::det::pow10 (params_.enterDb / 10.0);
+        exitRatio_  = core::det::pow10 (params_.exitDb  / 10.0);
 
         xLow_.prepare  (sampleRate, maxChannels);
         xHigh_.prepare (sampleRate, maxChannels);
@@ -787,7 +788,7 @@ private:
         e.peakPower     = peakNum_ / hop;
         e.peakBaseline  = peakDen_ / hop;
         e.peakWidePower = peakWide_ / hop;
-        e.peakExcessDb  = peakDen_ > 0.0 ? 10.0 * std::log10 (peakNum_ / peakDen_) : 0.0;
+        e.peakExcessDb  = peakDen_ > 0.0 ? 10.0 * core::det::log10 (peakNum_ / peakDen_) : 0.0;
         if (eventCount_ < (std::int64_t) events_.size()) events_[(std::size_t) eventCount_] = e;
         ++eventCount_;              // law 11: exhaustion is DATA — the count and both histograms go on
         inEvent_ = false;

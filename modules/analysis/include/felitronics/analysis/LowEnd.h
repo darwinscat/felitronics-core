@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/analysis/SpectrumFrames.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/eq/Crossover2.h>
@@ -729,15 +730,15 @@ private:
 
     static double noteHz (const LowEndParams& p, int midi) noexcept
     {
-        return p.tuningHz * std::exp2 ((double) (midi - 69) / 12.0);
+        return p.tuningHz * core::det::exp2 ((double) (midi - 69) / 12.0);
     }
 
     // The band set: every MIDI note whose CENTRE lies inside [lowNoteHz, highNoteHz]. Computed from the
     // parameters alone, once, so it is not a function of the data or of the slicing.
     static bool midiRange (const LowEndParams& p, int& loMidi, int& hiMidi) noexcept
     {
-        const double a = 69.0 + 12.0 * std::log2 (p.lowNoteHz  / p.tuningHz);
-        const double b = 69.0 + 12.0 * std::log2 (p.highNoteHz / p.tuningHz);
+        const double a = 69.0 + 12.0 * core::det::log2 (p.lowNoteHz  / p.tuningHz);
+        const double b = 69.0 + 12.0 * core::det::log2 (p.highNoteHz / p.tuningHz);
         if (! std::isfinite (a) || ! std::isfinite (b)) return false;
         if (! (a > -2000.0 && b < 2000.0)) return false;
         loMidi = (int) std::ceil (a);
@@ -961,7 +962,7 @@ private:
             const double mom = accMoment_[(std::size_t) b] * inv;
             row.centroidHz = row.energy > 0.0 ? mom / row.energy : 0.0;
             row.centsOffset = row.centroidHz > 0.0 && row.centreHz > 0.0
-                            ? 1200.0 * std::log2 (row.centroidHz / row.centreHz) : 0.0;
+                            ? 1200.0 * core::det::log2 (row.centroidHz / row.centreHz) : 0.0;
             totalBandEnergy_ += row.energy;
             if (! (std::isfinite (row.energy) && std::isfinite (row.density)
                    && std::isfinite (row.centroidHz) && std::isfinite (row.centsOffset)))
