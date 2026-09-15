@@ -97,6 +97,10 @@ void hammer (Getter g, const std::string& name, std::uint32_t stride)
     // one row and getting one row does NOT prove that: it is what a list of length one returns anyway.
     // Learn the full length first, then ask for one row less — only then is the capacity the constraint.
     // Measured: without this, a `room + 1` mutant in bursts_events left the suite green.
+    // The guard is not cosmetic: stride 0 marks a getter that writes a fixed-length block rather than
+    // rows, and dividing by it is UB — clang folded it away and gcc trapped with SIGFPE, which is how
+    // this was found, on the second row and not the first.
+    if (stride > 1)
     {
         std::vector<double> big (4096, kCanary);
         const std::uint32_t full = g (big.data(), (std::uint32_t) (big.size() / stride) * stride);
