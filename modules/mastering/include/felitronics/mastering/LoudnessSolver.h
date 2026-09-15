@@ -1440,6 +1440,11 @@ private:
     // of one value disagree at the last ulp — which is not a theory: it is what
     // felitronics_delivered_ceiling_tests caught within one run of the first half of this change, on
     // 44100->88200, 48000->96000, 48000->192000 and 88200->192000.
+    // AND THE EQUIVALENCE HAS A FLOOR, which "bit for bit" alone does not say. This function keeps its own
+    // 1e-10f gate and its -200.0 sentinel; the meter's getter clamps at core::kGainToDbFloor (1e-12) and
+    // reads -240 there. Below the float gate the two therefore differ BY DESIGN, and deliberately — the
+    // -200 sentinel is this class's published answer for silence and LoudnessSolverTests pins it. The
+    // identity is over peaks above that gate, which is every peak a delivered file has.
     static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDbDet (lin) : -200.0; }
 
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)

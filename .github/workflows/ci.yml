@@ -274,10 +274,11 @@ jobs:
           MANH=modules/analysis/include/felitronics/analysis/PlotMap.h
           OFF=modules/core/include/felitronics/core/OfflineFft.h
           MANIFEST=tools/lint/det-math-manifest.txt
+          SOLV=modules/mastering/include/felitronics/mastering/LoudnessSolver.h
           # Restore ONLY the files these controls touch. A bare `git checkout -- .` would also discard
           # anything else in the tree, which is harmless on a CI checkout and destructive if a human runs
           # this block locally to see what it does — and someone will.
-          det_restore () { git checkout -- "$ZONEH" "$MANH" "$OFF" "$MANIFEST"; }
+          det_restore () { git checkout -- "$ZONEH" "$MANH" "$OFF" "$MANIFEST" "$SOLV"; }
           det_control () {  # det_control <n> <what> <expected substring>
             if node tools/lint/check-det-math.mjs > /dev/null 2>&1; then
               det_restore; echo "CONTROL FAILED ($1): the lint PASSED with $2 planted"; exit 1; fi
@@ -297,9 +298,18 @@ jobs:
           det_control 9 "a libm-ok marker with no ZONE_EXCEPTIONS entry behind it" "no entry for it in ZONE_EXCEPTIONS"
           sed -i 's|   // libm-ok: hypot, see ZONE_EXCEPTIONS||' "$OFF"
           det_control 10 "an allowed exception whose marker was deleted" "[ZONE-EXCEPTION-ROT]"
+          # 11 is THE regression this lint was written after: reverting LoudnessSolver::peakDb to the
+          # system spelling breaks "the solver's report IS the certificate, bit for bit". The first
+          # version of the lint PASSED on it, because carrier calls were checked only inside the zone.
+          sed -i 's|core::gainToDbDet (lin) : -200.0|core::gainToDb (lin) : -200.0|' "$SOLV"
+          det_control 11 "LoudnessSolver::peakDb reverted to the system spelling" "$SOLV"
+          # 12: the matcher used to read one line at a time, so a call whose parenthesis sat on the next
+          # line was not a call at all — in the zone, with no marker needed, because nothing was recorded.
+          printf '\nnamespace { inline double p80c (double x) { return std::cos\n    (x); } }\n' >> "$ZONEH"
+          det_control 12 "a call split between its name and its parenthesis" "$ZONEH"
           node tools/lint/check-det-math.mjs > /dev/null \
-            || { echo "CONTROL FAILED: the tree did not come back clean, so controls 5-10 proved nothing"; exit 1; }
-          echo "controls 5-10 ok: the libm audit fires on every rule and the tree is clean again"
+            || { echo "CONTROL FAILED: the tree did not come back clean, so controls 5-12 proved nothing"; exit 1; }
+          echo "controls 5-12 ok: the libm audit fires on every rule and the tree is clean again"
       - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
         # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
         # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns

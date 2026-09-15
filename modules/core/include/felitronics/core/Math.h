@@ -14,8 +14,11 @@ namespace felitronics::core
 
 constexpr double kPi = 3.14159265358979323846;
 
-// dB <-> linear amplitude (20·log10). `double` on purpose: these are offline / coefficient-design /
-// GUI helpers, never the per-sample loop (Law 3 carve-out). The floor keeps log10 finite.
+// dB <-> linear amplitude (20·log10). `double` on purpose (Law 3 carve-out), and the floor keeps log10
+// finite. THESE ARE NOT COEFFICIENT-ONLY HELPERS, whatever this comment used to say: `gainToDb` runs once
+// per sample in dynamics/GainReductionPath.h, deesser/DeEsser.h and dynamiceq/DynamicEqBand.h, and both
+// of them run once per OVERSAMPLED sample inside limiter/TruePeakLimiter.h's loop. That is the reason
+// neither moved to the deterministic floor in P80 and why `gainToDbDet` is a separate function below.
 inline double dbToGain (double dB)   noexcept { return std::pow (10.0, dB / 20.0); }
 
 // THE FLOOR `gainToDb` PUTS UNDER ITS ARGUMENT IS LOAD-BEARING, so it is named and then USED rather than
@@ -53,14 +56,17 @@ inline double gainToDb (double gain) noexcept { return 20.0 * std::log10 (detail
 // WHY THIS IS A SECOND FUNCTION AND NOT A POLICY ON THE FIRST. `gainToDb` is called ONCE PER SAMPLE on
 // four real paths — dynamics/GainReductionPath.h:173, deesser/DeEsser.h:184, dynamiceq/DynamicEqBand.h:169
 // and, worst, limiter/TruePeakLimiter.h:594, which is inside the OVERSAMPLED loop of the module that is
-// most of a render's cost. `det::log10` is ~2.9x a system call, so routing the shared function through a
+// most of a render's cost. `det::log10` is 7.4x a system call and `gainToDbDet` 4.6x `gainToDb` (measured
+// here; the ~2.9x quoted elsewhere is det::cos, a cheaper function), so routing the shared function through a
 // policy would tax every one of those to make a handful of reported values reproducible. The split is by
-// CONSUMER, not by function, and the lint (tools/lint/check-det-math.mjs) is what keeps it that way.
+// CONSUMER, not by function, and the lint (tools/lint/check-det-math.mjs) is what keeps it that way —
+// it treats a call to `gainToDb` as a libm call, because that is exactly what it is.
 inline double gainToDbDet (double gain) noexcept { return 20.0 * det::log10 (detail::gainToDbFloor (gain)); }
 
 // Fast 20*log10 for DETECTOR paths — accurate to ~0.001 dB and several times cheaper than
 // std::log10, which is enough for deciding how hard to compress and nowhere near enough for
-// measurement. Use gainToDb() for anything a user reads as a number.
+// measurement. Use gainToDb() for a number a user reads off THIS machine, and gainToDbDet() for one that
+// is compared against another row's — see the two functions above.
 //
 // A float is m * 2^e with m in [1,2), both free from its bit pattern, so ln(x) = e*ln2 + ln(m) and
 // only ln(m) needs work. On that interval the atanh series in t = (m-1)/(m+1) converges fast — t is

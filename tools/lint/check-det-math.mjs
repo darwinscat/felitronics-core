@@ -11,8 +11,9 @@
 //
 // WHY THIS IS NOT A LIST OF CALL SITES, WHICH IS THE OBVIOUS DESIGN AND THE WRONG ONE.
 // The analyzers whose output is diffed byte-for-byte against the wasm module contain, today, ZERO direct
-// system transcendental calls — all sixteen of their transcendental calls already spell `det::`. Their
-// entire remaining exposure was INDIRECT, through four ordinary-looking functions:
+// system transcendental calls — all thirty of their transcendental calls already spell `det::` (11 pow10,
+// 11 log10, 4 log2, 2 sin, 1 exp2, 1 cos). Their entire remaining exposure was INDIRECT, through four
+// ordinary-looking functions:
 //     core::gainToDb / core::dbToGain      (std::log10 / std::pow)
 //     core::offline::fftInplace            (std::cos / std::sin twiddle seeds)
 //     PolyphaseOversampler::designFilter   (std::sin FIR taps)
@@ -62,6 +63,12 @@
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Everything below the matcher runs ONLY when this file is invoked as a program. Without this an
+// `import` of it — which the self-test cases and any harness that wants scanText() must do — ran the
+// whole gate as a side effect, printed its verdict and could exit the importing process.
+const RUN_AS_PROGRAM = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 
 //==============================================================================
 // THE LEXER. Reused wholesale from check-no-long-double.mjs, and for the same reason: the words this
@@ -79,6 +86,11 @@ export function stripNonCode (src)
         if (two === '//') { const e = src.indexOf('\n', i); const end = e < 0 ? src.length : e; out += blank(src.slice(i, end)); i = end; continue; }
         const raw = /^(?:u8|u|U|L)?R"([^()\\ \t\n]{0,16})\(/.exec(src.slice(i, i + 24));
         if (raw) { const close = ')' + raw[1] + '"'; const e = src.indexOf(close, i + raw[0].length); const end = e < 0 ? src.length : e + close.length; out += blank(src.slice(i, end)); i = end; continue; }
+        // A ' BETWEEN DIGITS IS A SEPARATOR, NOT A CHARACTER LITERAL. `if (n < 1'000) return std::cos(x);`
+        // otherwise opens a "literal" that swallows the rest of the line, and the call in it vanishes —
+        // measured: that exact line scanned as zero hits before this case existed.
+        if (src[i] === '\'' && /[0-9a-fA-F]/.test(src[i - 1] || '') && /[0-9a-fA-F]/.test(src[i + 1] || ''))
+        { out += ' '; i++; continue; }
         if (src[i] === '"' || src[i] === '\'')
         {
             const q = src[i]; let j = i + 1;
@@ -106,13 +118,26 @@ const COMPLEX_FNS = ['polar','arg','proj'];
 
 const FN_ALT = SCALAR.join('|');
 // std::fn( / ::fn( / bare fn( — but not a member call (x.fn / p->fn) and not some_other_ns::fn(.
-const CALL_RE   = new RegExp(`(?<![A-Za-z0-9_])(?:(std::|::)|(?<![.>:]))(${FN_ALT})f?[ \\t]*\\(`, 'g');
-const CPLX_RE   = new RegExp(`(?<![A-Za-z0-9_])std::(${COMPLEX_FNS.join('|')})[ \\t]*\\(`, 'g');
-const CPLX_ABS  = /(?<![A-Za-z0-9_])std::abs[ \t]*\(/g;
-const DET_RE    = new RegExp(`(?<![A-Za-z0-9_])det::(${FN_ALT})[ \\t]*\\(`, 'g');
+// `\s*` and not `[ \t]*`: a call may put its opening parenthesis on the NEXT LINE, and a line-by-line
+// matcher misses it entirely. Measured — `return std::cos\n    (x);` scanned as zero hits, in the zone,
+// with no marker needed because no call was recorded. Everything below therefore matches against the whole
+// stripped TEXT and derives the line number from the match index.
+const CALL_RE   = new RegExp(`(?<![A-Za-z0-9_])(?:(std::|::)|(?<![.>:]))(${FN_ALT})(f?)\\s*\\(`, 'g');
+const CPLX_RE   = new RegExp(`(?<![A-Za-z0-9_])std::(${COMPLEX_FNS.join('|')})\\s*\\(`, 'g');
+// std::abs and std::sqrt on a COMPLEX are hypot and a complex square root; the scalar overloads are exact
+// and deliberately ungoverned, so these are matched only where the file spells std::complex at all.
+const CPLX_OVER = /(?<![A-Za-z0-9_])std::(abs|sqrt)\s*\(/g;
+// `pow10` is deliberately absent from SCALAR — it is not a libm name, so there is no `std::pow10` to ban.
+// But `det::pow10` exists and is the single most-used deterministic call in the analyzers, so the det side
+// has to know it or every count this file prints is short by a third.
+const DET_RE    = new RegExp(`(?<![A-Za-z0-9_])det::(${FN_ALT}|pow10)\\s*\\(`, 'g');
 // A DEFINITION is not a call. `inline double cos (double x) noexcept` names the function being defined;
 // counting it made `core` read as 33 sites when it has 20. The tell is a return type right before the name.
-const DEFN_RE = /(?:^|[;{}(,]|\b(?:static|inline|constexpr|friend|virtual|explicit))\s*(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:double|float|int|long|short|char|bool|auto|void|size_t|std::size_t|T)\s*[&*]?\s*$/;
+// A DEFINITION is not a call. The return type must begin the LINE (after keywords): anchored only at a
+// `(`/`,`/`;` it also matched `g(T * std::cos(x))`, where `T *` is a multiplication — measured as zero
+// hits. `T` as a bare type name is dropped for the same reason; template code spells it in a signature
+// that starts the line anyway.
+const DEFN_RE = /^\s*(?:\[\[[^\]]*\]\]\s*)?(?:(?:static|inline|constexpr|friend|virtual|explicit|template\s*<[^>]*>)\s+)*(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:double|float|int|long|short|char|bool|auto|void|size_t|std::size_t)\s*[&*]?\s*$/;
 
 //==============================================================================
 // THE CARRIERS — ordinary functions in this tree that REACH libm. A call to one of these from inside the
@@ -135,7 +160,7 @@ const IMPLEMENTATION = new Set([
 ]);
 
 const ENTRY_POINTS = [
-    'tools/wasm/fc_probe.cpp',     // the wasm probe — CI diffs its lufs/dbtp text against the native CLI
+    'tools/wasm/fc_probe.cpp',     // the wasm probe — CI diffs its stdout against the native CLI's
     'tools/wasm/fc_master.cpp',    // the mastering ABI
     'tools/fcore_measure.cpp',     // the native CLI, the other side of every one of those diffs
 ];
@@ -164,13 +189,21 @@ const ZONE = new Set([
     // that `diff native.txt wasm.txt` compares, with its own floor and, until P80, its own std::log10.
     'tools/fcore_probe.h',
     'tools/fcore_clips.h',
+    // The wasm entry point itself. It PRINTS the numbers CI diffs (parity.mjs renders its lufs/dbtp as
+    // text and the step runs a plain `diff`), and until P80 it computed one of them with a constant
+    // `20.0 * std::log10 (1e-9)` — a libm call in the last place anyone would look for one.
+    'tools/wasm/fc_probe.cpp',
 ]);
+// A NOTE ON WHAT fc_probe.cpp's MEMBERSHIP RESTS ON, because an earlier comment here got it wrong: what CI
+// byte-diffs from this binary is its STDOUT — the block energies and the true peak as a LINEAR bit pattern.
+// `dbtp` is printed only under --debug and only to stderr. The file is in the zone because the numbers it
+// prints on the diffed path come from here, not because every getter it exposes is diffed.
 
 // IN-ZONE EXCEPTIONS, each of which had to be argued rather than waved through. A line in the zone may
 // call libm only if it carries a `// libm-ok: <reason>` marker AND appears here; a marker without an
 // entry is red, and an entry whose marker has gone is red. Two locks, because one of them is a comment.
 const ZONE_EXCEPTIONS = [
-    { file: 'modules/core/include/felitronics/core/OfflineFft.h', fn: 'abs',
+    { file: 'modules/core/include/felitronics/core/OfflineFft.h', fn: 'abs', count: 1,
       why: '`std::abs(std::complex<double>)` IS std::hypot — measured, identical checksums to an explicit hypot on Apple, glibc and musl, and three DIFFERENT checksums between those rows. There is no det::hypot to move it to, and sqrt(norm(z)) is not a rewrite, it is a different (less accurate, differently-overflowing) function. It is recorded rather than converted because magSpectrum feeds analysis/offline/SpectrumCurve and measurement/CaptureGate, neither of which is in a byte diff: the analyzers that ARE diffed take their magnitudes from SpectrumFrames, which uses re*re+im*im and calls no libm at all.' },
 ];
 const INCLUDE_ROOTS = [];   // filled from modules/*/include below
@@ -208,13 +241,23 @@ function computeZone ()
     {
         const f = queue.shift();
         let text; try { text = readFileSync(f, 'utf8'); } catch { continue; }
-        const code = stripNonCode(text);
+        // Comments only. stripNonCode() also blanks STRING literals, and `#include "fcore_probe.h"` IS a
+        // string literal — so every quoted include vanished before this regex saw it, and the closure
+        // silently lost the tools' own headers, which is where the parity surface lives.
+        const code = text.replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '))
+                         .replace(/\/\/[^\n]*/g, m => m.replace(/[^\n]/g, ' '));
         for (const m of code.matchAll(/#[ \t]*include[ \t]*[<"]([^">]+)[">]/g))
         {
             const inc = m[1];
             let p = null;
             if (inc.startsWith('felitronics/')) p = resolveInclude(inc);
-            else { const sib = join(dirname(f), inc); if (existsSync(sib)) p = sib; }     // tools' own headers
+            else
+            {
+                const sib = join(dirname(f), inc);
+                // beside the file, then on the tools include path: tools/wasm/fc_probe.cpp includes
+                // "fcore_probe.h", which lives in tools/ and arrives through -I, not as a sibling.
+                p = existsSync(sib) ? sib : (existsSync(join('tools', inc)) ? join('tools', inc) : null);
+            }
             if (p && ! zone.has(p)) { zone.add(p); queue.push(p); }
         }
     }
@@ -235,46 +278,78 @@ function enclosing (lines, n)
     return '?';
 }
 
+// Line number from a match index, without splitting the text into lines (which is what made the matcher
+// blind to a call whose parenthesis sits on the next line).
+function lineAt (text, idx) { let n = 1; for (let i = 0; i < idx; i++) if (text[i] === '\n') n++; return n; }
+
+// The enclosing function, for the DIAGNOSTIC and for reading the manifest — never for deciding whether a
+// call is allowed.
+function enclosingAt (text, idx)
+{
+    const upto = text.slice(0, idx).split('\n');
+    return enclosing(upto, upto.length - 1);
+}
+
 export function scanText (text, opts = {})
 {
     const code = stripNonCode(text);
-    const lines = code.split('\n');
     const hits = [];
     const hasComplex = /std::complex/.test(code);
-    lines.forEach((line, i) =>
+    const push = (m, fn, ns, kind, suffix) =>
+        hits.push({ line: lineAt(code, m.index), fn: fn + (suffix || ''), ns, kind, scope: enclosingAt(code, m.index) });
+
+    CALL_RE.lastIndex = 0;
+    for (const m of code.matchAll(CALL_RE))
     {
-        for (const m of line.matchAll(CALL_RE))
-        {
-            if (DEFN_RE.test(line.slice(0, m.index))) continue;                 // a definition, not a call
-            // det::log2(...) inside DetMath's own log2 is recursion in the deterministic implementation,
-            // not a libm call. Only the implementation file can contain these.
-            hits.push({ line: i + 1, fn: m[2], ns: m[1] || '', kind: 'scalar', scope: enclosing(lines, i) });
-        }
-        for (const m of line.matchAll(CPLX_RE))
-            hits.push({ line: i + 1, fn: m[1], ns: 'std::', kind: 'complex', scope: enclosing(lines, i) });
-        if (hasComplex && opts.complexAbs !== false)
-            for (const m of line.matchAll(CPLX_ABS))
-                hits.push({ line: i + 1, fn: 'abs', ns: 'std::', kind: 'complex-abs', scope: enclosing(lines, i) });
-    });
+        const lineStart = code.lastIndexOf('\n', m.index) + 1;
+        if (DEFN_RE.test(code.slice(lineStart, m.index))) continue;          // a definition, not a call
+        // The `f` suffix is KEPT in the name. Normalising `sinf` to `sin` would let one be swapped for the
+        // other without moving a manifest line, and they are different functions with different rounding.
+        push (m, m[2], m[1] || '', 'scalar', m[3]);
+    }
+    CPLX_RE.lastIndex = 0;
+    for (const m of code.matchAll(CPLX_RE)) push (m, m[1], 'std::', 'complex');
+    if (hasComplex && opts.complexAbs !== false)
+    {
+        CPLX_OVER.lastIndex = 0;
+        for (const m of code.matchAll(CPLX_OVER)) push (m, m[1], 'std::', 'complex-overload');
+    }
     return hits;
 }
 
+// A CALL to a carrier — `core::gainToDb(x)` or the unqualified `gainToDb(x)`. NOT `o.gainToDb(x)`,
+// `p->gainToDb(x)` or `other::gainToDb(x)`: all three matched before the lookbehind below, because the
+// suffix alone was enough and the qualification was optional.
+//
+// AND NOT A FILE'S OWN FUNCTION OF THE SAME NAME. `dynamics/NoiseGate.h`, `poweramp/PowerAmpStage.h` and
+// `nam/src/NamStage.cpp` each define a private `static float dbToGain (float)` and call it unqualified.
+// Counting those as `core::dbToGain` put four phantom carrier calls into NoiseGate's manifest line and
+// two into NamStage's — a manifest that says a file reaches libm through a function it never calls is
+// wrong in the direction that matters, because it reads as an audited fact. Their own `std::pow` is
+// already counted as a direct call; this only stops it being counted twice under someone else's name.
 export function scanCarriers (text, names)
 {
     const code = stripNonCode(text);
-    const lines = code.split('\n');
     const hits = [];
+    if (! names.length) return hits;
+    // TWO alternatives, not one with an optional prefix: a single `(?:core::)?` followed by a lookbehind
+    // that forbids `::` rejects `core::gainToDb` as well, which silently disables this whole rule. Either
+    // the call is explicitly `core::NAME`, or it is a bare NAME with nothing qualifying it.
     const alt = names.join('|');
-    if (! alt) return hits;
-    const re = new RegExp(`(?<![A-Za-z0-9_])(?:core::)?(${alt})[ \\t]*\\(`, 'g');
-    lines.forEach((line, i) =>
+    // Names this file DEFINES itself: an unqualified call to one of them is a call to the local one.
+    const own = new Set();
+    for (const m of code.matchAll(new RegExp(`(?:^|\\n)[^\\n]*?\\b(?:double|float|int|auto)\\s+(${alt})\\s*\\(`, 'g')))
+        own.add(m[1]);
+    const re = new RegExp(`(?:(?<![A-Za-z0-9_])core::(${alt})|(?<![A-Za-z0-9_.>:])(${alt}))\\s*\\(`, 'g');
+    for (const m of code.matchAll(re))
     {
-        for (const m of line.matchAll(re))
-        {
-            if (DEFN_RE.test(line.slice(0, m.index))) continue;
-            hits.push({ line: i + 1, fn: m[1], scope: enclosing(lines, i) });
-        }
-    });
+        const lineStart = code.lastIndexOf('\n', m.index) + 1;
+        if (DEFN_RE.test(code.slice(lineStart, m.index))) continue;
+        const qualified = m[1] !== undefined;
+        const name = m[1] || m[2];
+        if (! qualified && own.has(name)) continue;          // the file's own function of that name
+        hits.push({ line: lineAt(code, m.index), fn: name, scope: enclosingAt(code, m.index) });
+    }
     return hits;
 }
 
@@ -332,6 +407,13 @@ function selfTest ()
         ['auto z = std::polar (1.0, -w);',                                                1],   // hidden cos+sin
         ['std::complex<double> c; double m = std::abs (c);',                              1],   // hidden hypot
         ['double m = std::abs (x);',                                                      0],   // no <complex> in the TU
+        // --- the holes a review round found, each now a case so it cannot reopen ---
+        ['double y = std::cos\n    (x);',                                                 1],   // ( on the NEXT line
+        ['double y = g(T * std::cos (x));',                                               1],   // `T *` is a multiply, not a return type
+        ["double y = (n < 1'000) ? std::cos (x) : 0.0;",                                  1],   // digit separator is not a char literal
+        ['std::complex<double> z; auto r = std::sqrt (z);',                               1],   // complex sqrt IS transcendental
+        ['double r = std::sqrt (x);',                                                     0],   // scalar sqrt is exact — never governed
+        ['inline double cos (double x)\n{ return 1.0; }',                                 0],   // definition split over lines
     ];
     let bad = 0;
     for (const [src, want] of cases)
@@ -346,6 +428,10 @@ function selfTest ()
         ['inline double gainToDb (double g) noexcept { return 0.0; }', 0],
         ['// gainToDb is mentioned here in prose',  0],
         ['const double d = core::gainToDbDet (x);', 0],   // the DETERMINISTIC spelling is not a carrier
+        ['const double d = o.gainToDb (x);',        0],   // a MEMBER of the same name is not this function
+        ['const double d = p->gainToDb (x);',       0],
+        ['const double d = other::gainToDb (x);',   0],   // another namespace's function of the same name
+        ['const double d = core::gainToDb\n    (x);', 1],  // ( on the next line, the carrier half
     ];
     for (const [src, want] of carrierCases)
     {
@@ -358,6 +444,8 @@ function selfTest ()
 
 //==============================================================================
 const args = process.argv.slice(2);
+if (! RUN_AS_PROGRAM) { /* imported for its matcher; the gate below is not ours to run */ }
+else {
 if (args.includes('--self-test')) { selfTest(); process.exit(0); }
 
 const closure = computeZone();          // rule 4's net — NOT the ban set; see the note at the top
@@ -368,6 +456,7 @@ const violations = [];
 const inventory = [];
 const perFile = new Map();
 const usedExceptions = new Set();
+const exceptionUses = new Map();
 
 for (const f of files)
 {
@@ -375,8 +464,14 @@ for (const f of files)
     const rawLines = text.split('\n');
     const hits = scanText(text);
     const carrierHits = IMPLEMENTATION.has(f) ? [] : scanCarriers(text, carrierNames);
-    if (hits.length) perFile.set(f, hits);
-    for (const h of hits) inventory.push({ f, ...h });
+    // CARRIER CALLS COUNT TOWARDS THE MANIFEST TOO, and this is not tidiness. Without it the rule only
+    // looked inside the zone, and a file outside it could be reverted from `gainToDbDet` to `gainToDb`
+    // with the gate still green — measured on LoudnessSolver::peakDb, which is the one place the
+    // certificate and the report must agree bit for bit, i.e. exactly the regression this lint was
+    // written after. They are spelled `name()` so they cannot collide with a scalar of the same name.
+    const all = hits.concat (carrierHits.map (h => ({ ...h, fn: h.fn + '()', ns: '', kind: 'carrier' })));
+    if (all.length) perFile.set(f, all);
+    for (const h of all) inventory.push({ f, ...h });
 
     if (IMPLEMENTATION.has(f)) continue;                 // det:: itself and the dB definitions
 
@@ -389,7 +484,7 @@ for (const f of files)
             // at the call site is not a warning.
             const marked = /\/\/[^\n]*libm-ok:/.test(rawLines[h.line - 1] || '');
             const listed = ZONE_EXCEPTIONS.find(e => e.file === f && e.fn === h.fn);
-            if (marked && listed) { usedExceptions.add(f + '::' + h.fn); continue; }
+            if (marked && listed) { usedExceptions.add(f + '::' + h.fn); exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
             if (marked && ! listed)
             { violations.push({ f, line: h.line, rule: 'ZONE',
                                 msg: `${h.ns}${h.fn}() carries a "libm-ok" marker but there is no entry for it in ZONE_EXCEPTIONS. A marker is a note to a reader; the entry is where the argument has to be written down.` }); continue; }
@@ -401,7 +496,7 @@ for (const f of files)
             const c = CARRIERS.find(x => x.name === h.fn);
             const marked = /\/\/[^\n]*libm-ok:/.test(rawLines[h.line - 1] || '');
             const listed = ZONE_EXCEPTIONS.find(e => e.file === f && e.fn === h.fn);
-            if (marked && listed) { usedExceptions.add(f + '::' + h.fn); continue; }
+            if (marked && listed) { usedExceptions.add(f + '::' + h.fn); exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
             violations.push({ f, line: h.line, rule: 'CARRIER',
                               msg: `${h.fn}() in the deterministic zone (scope ${h.scope}) — ${c.why}. It reads as ordinary arithmetic and is a libm call: that is the whole reason this rule exists, because the analyzers here contain no direct std:: call at all and were exposed entirely through functions that look like this one.` });
         }
@@ -411,9 +506,15 @@ for (const f of files)
 // AND THE EXCEPTIONS MUST NOT ROT EITHER. One that no longer matches anything is an argument left
 // standing for a call that is gone — exactly the stale allowance this lint exists to prevent elsewhere.
 for (const e of ZONE_EXCEPTIONS)
-    if (! usedExceptions.has(e.file + '::' + e.fn))
+{
+    const used = exceptionUses.get(e.file + '::' + e.fn) || 0;
+    if (used === 0)
         violations.push({ f: e.file, line: 0, rule: 'ZONE-EXCEPTION-ROT',
                           msg: `ZONE_EXCEPTIONS allows ${e.fn}() here, but no marked call to it was found. Either the call went away (remove the entry) or its "// libm-ok:" marker did (put it back) — an unused allowance is how a list stops meaning anything.` });
+    else if (used !== e.count)
+        violations.push({ f: e.file, line: 0, rule: 'ZONE-EXCEPTION-ROT',
+                          msg: `ZONE_EXCEPTIONS allows ${e.count} marked ${e.fn}() call(s) here and found ${used}. The written argument is about specific calls; another one needs its own, not a share of this one.` });
+}
 
 // Rule 4 — THE CARRIER LIST MUST NOT ROT. A carrier that no longer reaches libm would forbid something
 // harmless forever; one deleted from this list while still reaching libm would let the real thing through.
@@ -423,10 +524,22 @@ for (const c of CARRIERS)
     if (! existsSync(c.defined))
     { violations.push({ f: c.defined, line: 0, rule: 'CARRIER-ROT', msg: `carrier ${c.name} names a file that does not exist` }); continue; }
     const body = stripNonCode(readFileSync(c.defined, 'utf8'));
-    const defLine = body.split('\n').findIndex(l => new RegExp(`\\b${c.name}\\b[ \\t]*\\(`).test(l) && DEFN_RE.test(l.slice(0, l.indexOf(c.name))));
+    const lines = body.split('\n');
+    const defLine = lines.findIndex(l => new RegExp(`\\b${c.name}\\b\\s*\\(`).test(l) && DEFN_RE.test(l.slice(0, l.indexOf(c.name))));
     if (defLine < 0)
         violations.push({ f: c.defined, line: 0, rule: 'CARRIER-ROT',
                           msg: `carrier ${c.name} is declared in this lint but no definition of it was found in ${c.defined}. Either it moved (update CARRIERS) or it is gone (remove it) — a carrier list nobody checks is a list that stops being true.` });
+    else
+    {
+        // AND THE BODY MUST STILL REACH libm. Checking only that a definition EXISTS leaves the other
+        // half of the rot: a carrier that was converted to det:: would go on forbidding something
+        // harmless in the zone forever, and the comment above claimed this was checked when it was not.
+        // The window is the definition line plus the few that can hold a one-expression body.
+        const window = lines.slice(defLine, defLine + 6).join('\n');
+        if (scanText(window).length === 0)
+            violations.push({ f: c.defined, line: defLine + 1, rule: 'CARRIER-ROT',
+                              msg: `carrier ${c.name} no longer calls a system transcendental in its first lines. If it was converted, it is not a carrier any more — remove it from CARRIERS, or the zone keeps refusing a call that is now safe.` });
+    }
 }
 
 // Rule 3 — the manifest, for everything outside the zone.
@@ -472,7 +585,8 @@ else
 if (args.includes('--report'))
 {
     console.log(`# det-math inventory — ${inventory.length} governed calls in ${perFile.size} files`);
-    console.log(`# deterministic zone: ${zone.size} files, the #include closure of ${ENTRY_POINTS.join(', ')}`);
+    console.log(`# deterministic zone: ${zone.size} files (a written list — see ZONE; the #include closure of`);
+    console.log(`#   ${ENTRY_POINTS.join(', ')} is the DISCOVERY net, not the zone)`);
     for (const h of inventory) console.log(`${h.f}:${h.line}\t${h.ns}${h.fn}\t${h.scope}\t${zone.has(h.f) ? 'ZONE' : 'outside'}`);
     process.exit(0);
 }
@@ -496,3 +610,4 @@ if (violations.length)
     process.exit(1);
 }
 console.log(`det-math: ${inventory.length} governed libm calls in ${perFile.size} files; ${zone.size}-file deterministic zone is clean (direct + carriers); manifest matches.`);
+}

@@ -121,6 +121,17 @@ static void floorPremise()
     ok (bitsEqual (core::gainToDb (core::kGainToDbFloor * 0.5), at), "...including one just under it");
     ok (! bitsEqual (core::gainToDb (core::kGainToDbFloor * 2.0), at), "and a level ABOVE it does not");
     ok (std::fabs (at - (-240.0)) < 1.0e-9, "the floor is -240 dB, which is what the headers say");
+
+    // AND THE DETERMINISTIC SPELLING CLAMPS AT THE SAME PLACE. Math.h says gainToDbDet "inherits this
+    // proof" because both go through one `detail::gainToDbFloor` — but inheriting by READING is how a
+    // retyped constant survives a review, which is the failure that paragraph was written about in the
+    // first place. So it is asserted, not read.
+    const double atDet = core::gainToDbDet (core::kGainToDbFloor);
+    ok (bitsEqual (core::gainToDbDet (0.0), atDet), "gainToDbDet(0) is its floor value, bit for bit");
+    ok (bitsEqual (core::gainToDbDet (-1.0), atDet), "a negative level clamps there too");
+    ok (bitsEqual (core::gainToDbDet (1.0e-30), atDet), "every level under the floor gives the SAME bits");
+    ok (! bitsEqual (core::gainToDbDet (core::kGainToDbFloor * 2.0), atDet), "and a level ABOVE it does not");
+    ok (std::fabs (atDet - (-240.0)) < 1.0e-9, "the deterministic floor is -240 dB as well");
 }
 
 //==============================================================================

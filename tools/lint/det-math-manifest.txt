@@ -30,7 +30,7 @@ modules/analysis/include/felitronics/analysis/MultiResSpectrumPane.h  [cos*1 exp
 modules/analysis/include/felitronics/analysis/MultiResSpectrumPaneFast.h  [cos*1 exp2*1 log10*1 log2*4 pow*2]  retain-local  the same pane with a precomputed plan; same pixels, same reasoning
 modules/analysis/include/felitronics/analysis/PlotMap.h  [log10*5 pow*1]  retain-local  frequency<->x pixel mapping for a plot. xToFreq() does return a PARAMETER value when a user drags, but the parameter is the user's gesture, not a measurement anyone compares across rows
 modules/analysis/include/felitronics/analysis/SpectrumPane.h  [cos*1 log10*1 log2*1]  retain-local  the simple pane: one Hann window, one dB conversion, one tilt — all for drawing
-modules/analysis/include/felitronics/analysis/TruePeakMeter.h  [pow*1 sin*1]  retain-rt  the LIVE meter (12 taps/phase, built for a moving needle), not the reference instrument a file is certified with. Its taps and decay ballistic are RT and shipped; ReferenceTruePeakMeter is the one in the zone
+modules/analysis/include/felitronics/analysis/TruePeakMeter.h  [gainToDb()*1 pow*1 sin*1]  retain-rt  the LIVE meter (12 taps/phase, built for a moving needle), not the reference instrument a file is certified with. Its taps and decay ballistic are RT and shipped; ReferenceTruePeakMeter is the one in the zone
 modules/analysis/include/felitronics/analysis/offline/SpectrumCurve.h  [log10*2 pow*3]  retain-offline  offline log-spaced display curve: band edges and dB. Consumed by blend/Overlay and the UI; no parity harness reads it
 
 # --- blend / convolution: offline IR work, tolerance-compared ---
@@ -53,17 +53,17 @@ modules/dynamics/include/felitronics/dynamics/EnvelopeFollower.h  [exp*1]  retai
 modules/dynamics/include/felitronics/dynamics/GainReductionFollower.h  [exp*1]  retain-rt  the same coefficient for the gain-reduction follower
 modules/dynamics/include/felitronics/dynamics/NoiseGate.h  [exp*1 pow*3]  retain-rt  gate thresholds (dB->linear) and ballistics coefficients
 modules/dynamics/include/felitronics/dynamics/RelativeLevel.h  [exp*1 log10*1]  retain-rt  a relative-level detector's coefficient and its dB readout
-modules/dynamics/include/felitronics/dynamics/TransientShaper.h  [exp*1]  retain-rt  the shaper's envelope coefficient
+modules/dynamics/include/felitronics/dynamics/TransientShaper.h  [dbToGain()*1 exp*1]  retain-rt  the shaper's envelope coefficient
 
 # --- eq: the biggest group, and all of it is coefficient design for shipped filters ---
 modules/eq/include/felitronics/eq/EqBand.h  [abs*1 polar*1 sin*1]  retain-rt  Butterworth Q design and the z^-1 phasor for a band's response. std::polar is cos+sin in disguise, which is why the lint governs it
 modules/eq/include/felitronics/eq/EqEngine.h  [abs*3 log10*2]  retain-rt  the composite magnitude response in dB, for the curve the user sees and for the engine's own fitting
-modules/eq/include/felitronics/eq/MatchedBiquad.h  [abs*25 cos*10 cosh*1 exp*7 log10*1 polar*1 pow*9 sin*12 tan*3]  retain-rt  TabbyEQ's filter design, all of it: matched-pole placement, shelf solving, notch cascades, bandpass cascades. These transcendentals ARE the coefficients, and the coefficients ARE the product's sound. 25 of the 69 are std::abs on a complex (hypot) reached through the response evaluation
+modules/eq/include/felitronics/eq/MatchedBiquad.h  [abs*25 cos*10 cosh*1 exp*7 log10*1 polar*1 pow*9 sin*12 sqrt*19 tan*3]  retain-rt  TabbyEQ's filter design, all of it: matched-pole placement, shelf solving, notch cascades, bandpass cascades. These transcendentals ARE the coefficients, and the coefficients ARE the product's sound. The 25 std::abs are a MIX — most are scalar magnitude on a coefficient, and only the ones taking a std::complex are hypot; the 19 std::sqrt include complex square roots in the pole solver (:400, :641), which scalar IEEE exactness does not cover
 modules/eq/include/felitronics/eq/MultibandSplitter.h  [pow*1]  retain-rt  the default band frequencies, laid out geometrically
 
 # --- limiter / saturation / poweramp: shipped audio, some of it per sample ---
-modules/limiter/include/felitronics/limiter/TruePeakLimiter.h  [exp*1 log*1]  retain-rt  the release coefficient. NOTE the limiter's other libm reach is through core::gainToDb and core::dbToGain INSIDE its oversampled per-sample loop — a carrier, not a direct call, and the reason gainToDb was not converted in place
-modules/saturation/include/felitronics/saturation/Saturator.h  [exp*1 pow*1]  retain-rt  drive and bias mapping for the saturator
+modules/limiter/include/felitronics/limiter/TruePeakLimiter.h  [dbToGain()*1 exp*1 gainToDb()*2 log*1]  retain-rt  the release coefficient. NOTE the limiter's other libm reach is through core::gainToDb and core::dbToGain INSIDE its oversampled per-sample loop — a carrier, not a direct call, and the reason gainToDb was not converted in place
+modules/saturation/include/felitronics/saturation/Saturator.h  [dbToGain()*2 exp*1 pow*1]  retain-rt  drive and bias mapping for the saturator
 modules/saturation/include/felitronics/saturation/WaveShaper.h  [atan*2 tanh*6]  retain-rt  PER-SAMPLE libm on the audio path: tanh and atan ARE the waveshaping curve. Nothing deterministic can go here at any price — det has no tanh or atan, and the cost would be paid every sample
 modules/poweramp/include/felitronics/poweramp/PowerAmpStage.h  [exp*4 pow*2 tanh*1]  retain-rt  power-amp stage curve and bias, per sample on the shaping path
 modules/poweramp/include/felitronics/poweramp/SagEnvelope.h  [exp*3]  retain-rt  supply-sag envelope coefficients
@@ -91,6 +91,18 @@ modules/rigplayer/include/felitronics/rigplayer/SectionBiquad.h  [cos*1 log10*1 
 modules/rigplayer/include/felitronics/rigplayer/ToneKnobs.h  [pow*1]  retain-rt  knob-to-gain taper
 
 # --- tools that are not on the parity surface ---
-tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1]  retain-local  a developer visualiser; it draws curves and nobody diffs its output
+tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1 sqrt*10]  retain-local  a developer visualiser; it draws curves and nobody diffs its output
 tools/fcore_master.cpp  [sin*3]  retain-local  test-signal generation inside the mastering CLI's own fixtures, not a measured value
 tools/fftbench.cpp  [exp*6]  retain-local  benchmark input generation
+
+
+# --- carrier-only files: no direct std:: call, but they reach libm through core::gainToDb /
+# --- core::dbToGain. This group is why the lint tracks carriers at all: a by-name inventory
+# --- of `std::` shows nothing here, and every one of these is a shipped per-sample path.
+modules/deesser/include/felitronics/deesser/DeEsser.h  [dbToGain()*1 gainToDb()*1]  retain-rt  the de-esser reads its level in dB and writes its gain back in linear, once PER SAMPLE in sharedStep(); both conversions are shipped audio
+modules/dynamiceq/include/felitronics/dynamiceq/DynamicEqBand.h  [gainToDb()*1]  retain-rt  one gainToDb PER SAMPLE in sharedStep(), narrowed to float before the curve; shipped audio
+modules/dynamics/include/felitronics/dynamics/Compressor.h  [dbToGain()*1]  retain-rt  dbToGain on the per-sample makeup/output path
+modules/dynamics/include/felitronics/dynamics/GainReductionPath.h  [gainToDb()*2]  retain-rt  the canonical per-sample site: step() is "a log10 and a knee per sample" in its own words, and advanceSilence() evaluates the same expression once at the floor. This is the path that makes gainToDb untouchable
+modules/dynamics/include/felitronics/dynamics/offline/DetectorAnalysis.h  [gainToDb()*3]  retain-offline  offline, but the histogram conversion at :169 runs per sample and the whole point of the class is to model the SHIPPED chain exactly; converting the final peak/RMS alone would make it a mixed-policy answer that is deterministic nowhere
+modules/dynamics/include/felitronics/dynamics/offline/ThresholdSolver.h  [gainToDb()*1]  retain-offline  one gainToDb per frame feeding a > statisticsGateDb decision; it drives the SHIPPED GainReductionPath, so it must read what that path reads
+modules/mastering/include/felitronics/mastering/MasteringChain.h  [dbToGain()*1]  retain-rt  dbToGain for the chain gain, applied to audio

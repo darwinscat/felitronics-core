@@ -287,7 +287,11 @@ int main()
         test::ok (p.truePeakLinear() == 0.0, "and silence has no true peak");
         test::ok (std::isfinite (p.integratedLufs()), "integratedLufs() stays finite on silence");
         test::approx (p.integratedLufs(), -120.0, 1e-12, "silence reads the −120 sentinel");
-        test::ok (p.truePeakDb() == 20.0 * std::log10 (1e-9), "true-peak dB clamps rather than returning −inf");
+        // `det::log10`, which is what Probe::truePeakDb() now calls. Spelled `std::log10` this passed —
+        // both give exactly -180.0 at 1e-9 — while asserting an identity between two different functions.
+        // That is the third assertion of this shape found in P80; the other two were in
+        // ReferenceTruePeakMeterTests and in the solver/certificate pair.
+        test::ok (p.truePeakDb() == 20.0 * felitronics::core::det::log10 (1e-9), "true-peak dB clamps rather than returning −inf");
     }
 
     test::group ("negative lengths are ignored rather than read out of bounds");

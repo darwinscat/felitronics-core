@@ -180,18 +180,22 @@ int main()
     {
         // TWO reference tables, because they are two different claims and collapsing them is wrong —
         // the first draft of this test used the oracle as the pin and failed at once, correctly: det is
-        // within 2 ulp of correctly rounded, not equal to it, and at 10^-1.15 it is exactly 1 ulp off.
+        // within 2 ulp of correctly rounded, not equal to it, and at 10^0.6 it is exactly 1 ulp off.
         struct Ref { double x; std::uint64_t rounded; std::uint64_t det; };
         static const Ref refs[] = {
             //  x        correctly rounded      what det:: returns
             { -3.0,  0x3f50624dd2f1a9fcull, 0x3f50624dd2f1a9fcull },
-            { -1.15, 0x3fb21f97ef20893bull, 0x3fb21f97ef20893cull },   // 1 ulp — det's stated accuracy, not a fault
-            { 0.6,   0x400fd93c1f526de0ull, 0x400fd93c1f526de0ull },
+            { -1.15, 0x3fb21f97ef20893cull, 0x3fb21f97ef20893cull },
+            { 0.6,   0x400fd93c1f526ddfull, 0x400fd93c1f526de0ull },   // 1 ulp — det's stated accuracy, not a fault
             { -6.0,  0x3eb0c6f7a0b5ed8dull, 0x3eb0c6f7a0b5ed8dull },
             { 2.5,   0x4073c3a4edfa9759ull, 0x4073c3a4edfa9759ull },
             { -0.05, 0x3fec8520affa0a4bull, 0x3fec8520affa0a4bull },
         };
-        // The `rounded` column is Python's decimal at 60 digits — an oracle from outside this tree.
+        // The `rounded` column is Python's decimal at 90 digits, computed from `Decimal.from_float(x)` —
+        // THE BINARY64 ARGUMENT THE CALL ACTUALLY RECEIVES, not the decimal literal it was written as.
+        // Those are different numbers and the first draft used the wrong one: it made 10^-1.15 look 1 ulp
+        // wrong when det is correctly rounded there, and hid that the 1-ulp case is 10^0.6. An oracle read
+        // at a different input than the code under test is not an oracle.
         // The `det` column was captured from Apple clang/arm64, gcc 14/glibc x86-64 and emcc/musl wasm32,
         // which returned THE SAME BITS at all six points; that agreement is what makes it a pin on the
         // build's flags rather than a photograph of one machine.

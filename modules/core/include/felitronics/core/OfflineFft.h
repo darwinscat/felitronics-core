@@ -20,7 +20,8 @@
 // measurement + analysis test suites).
 //==============================================================================
 
-#include <felitronics/core/Math.h>   // felitronics::core::kPi
+#include <felitronics/core/DetMath.h>   // core::det::cos / core::det::sin — the stage seeds below
+#include <felitronics/core/Math.h>      // felitronics::core::kPi
 
 #include <complex>
 #include <cstddef>
@@ -61,12 +62,14 @@ inline void fftInplace (std::vector<std::complex<double>>& a, int sign) noexcept
         // THE STAGE SEEDS ARE THE TRANSFORM'S ONLY libm INPUT, and they are deterministic on purpose: this
         // routine's output is diffed byte for byte between the native CLI and the wasm module, and
         // std::cos/std::sin are not the same function on those two rows. There are 2*log2(N) of these per
-        // transform — 40 calls at N = 2^20 against ~21 million butterflies — so the ~2.9x per-call cost of
+        // transform — 40 calls at N = 2^20 against 10485760 butterflies — so the ~3.5x per-call cost of
         // `det` is unmeasurable here, and it buys the property by construction instead of by luck.
-        // MEASURED, on this tree: converting these changed NOTHING on any row. The 20 seed angles are ones
-        // where Apple's, glibc's and musl's libm already agreed with each other and with `det`, so the
-        // checksum of a 2^16 transform is identical before and after on all three. That is the point — the
-        // agreement was not guaranteed, it was observed, and now it does not need to be observed again.
+        // MEASURED, on this tree: converting these changed NOTHING on any row. A 2^16 transform — whose 16
+        // seed angles are the ones that measurement actually exercised — hashes identically before and
+        // after on Apple, glibc and musl, at both contraction settings. That is the point: the agreement
+        // was observed, not guaranteed, and now it does not need to be observed again. Note the scope, as
+        // the first draft of this comment did not: it establishes those angles, not every angle a larger
+        // transform would ask for.
         const std::complex<double> wlen (core::det::cos (ang), core::det::sin (ang));
         for (std::size_t i = 0; i < n; i += len)
         {

@@ -32,8 +32,10 @@ namespace fcore
 // agree on a fractional rate. The integers are plain decimal — every one of them is bounded by the frame
 // count, so it is below 2^32 and prints identically through printf("%lld") and JavaScript's String(Number).
 //
-// NOTHING IS IN dB. samplePeakDb() routes through core::gainToDb → log10, and libm is not bit-identical
-// across toolchains; a dB column would break the diff while every measured bit matched.
+// NOTHING IS IN dB. samplePeakDb() is a log10 conversion, and this format carries linear bits instead so
+// the diff cannot be broken by one. (P80 moved that getter to core::gainToDbDet, which IS bit-identical
+// across toolchains — so the original reason has weakened, but the decision stands on its own: a linear
+// bit pattern is the measured quantity and a dB column would be a derived one.)
 // A report that is not `ok` formats as NOTHING, not as a plausible empty report. readClips() already returns
 // false and clears its output, but a caller can forget a bool; it cannot forget an empty stdout, and the
 // alternative — printing `runs 0 / complete 1` for a measurement that never happened — is the certificate of

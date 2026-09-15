@@ -24,14 +24,31 @@
 // accumulations into algebraically-equal, numerically-different forms, after which nothing here is the
 // same on two rows and the whole point of the file is gone silently.
 //
-// WHAT THIS GUARD CATCHES AND WHAT IT CANNOT. gcc defines __FAST_MATH__ for -ffast-math and
-// __ASSOCIATIVE_MATH__ for -funsafe-math-optimizations, so both are caught there. Clang defines
-// __FAST_MATH__ for -ffast-math but defines NOTHING for a bare -funsafe-math-optimizations (measured:
-// the only macro it moves is __FINITE_MATH_ONLY__, to 0, which is also its default). That case is
-// therefore NOT detectable at preprocessing time on the row that is both the developer's machine and the
-// wasm toolchain, and pretending otherwise would be worse than saying it: DetMathTests.cpp carries a
-// RUNTIME check of a known det::pow10 value for exactly that hole.
-#if defined(__FAST_MATH__) || defined(__ASSOCIATIVE_MATH__)
+// WHAT THIS GUARD CATCHES AND WHAT IT CANNOT, measured on this tree's three compilers:
+//
+//     flag                          gcc 14              clang/arm64          emcc/wasm32
+//     -ffast-math                   __FAST_MATH__       __FAST_MATH__        __FAST_MATH__
+//     -funsafe-math-optimizations   __ASSOCIATIVE_MATH__ __ARM_FP_FAST       (NOTHING)
+//                                   + __RECIPROCAL_MATH__
+//     /fp:fast (MSVC)               _M_FP_FAST
+//
+// So every row but one is caught at preprocessing time. The exception is a clang target that is not ARM —
+// in this tree, the wasm row — where a bare -funsafe-math-optimizations moves no macro at all (it leaves
+// __FINITE_MATH_ONLY__ at its default 0, which says nothing). An earlier draft of this comment claimed
+// clang defined nothing anywhere; on arm64 it defines __ARM_FP_FAST, and a review round measured it.
+// __ARM_FP_FAST is checked only after confirming it is absent at baseline and under -ffp-contract=fast,
+// -ffp-contract=on, -O3, -ffinite-math-only and -fno-signed-zeros, so it cannot refuse an ordinary build.
+//
+// For the hole that remains, DetMathTests.cpp carries a RUNTIME pin of a known det::pow10 value. Note what
+// that reaches — it tests the flags of ITS OWN translation unit, so it protects this library's builds and
+// says nothing about a downstream consumer's TU compiled differently. For that consumer the #error is the
+// only guard, and on a non-ARM clang it has the gap just described.
+// MSVC is a shipped row and spells it differently: /fp:fast defines _M_FP_FAST, which neither GNU macro
+// covers. It is detectable, so it is detected rather than left to the runtime pin.
+// `-freciprocal-math` gets its own name for the same reason: it rewrites `a / b` as `a * (1/b)`, and the
+// series below divide (log2's (m-1)/(m+1), tan's s/c, the reciprocal factorials).
+#if defined(__FAST_MATH__) || defined(__ASSOCIATIVE_MATH__) || defined(__RECIPROCAL_MATH__) \
+ || defined(_M_FP_FAST) || defined(__ARM_FP_FAST)
     #error "felitronics/core/DetMath.h is being compiled with unsafe math (-ffast-math / -funsafe-math-optimizations). Reassociation rewrites the Dekker splits and polynomial accumulations here, so det:: stops being the same function on every row — which is the only reason this header exists. Compile the translation units that include it without those flags."
 #endif
 
