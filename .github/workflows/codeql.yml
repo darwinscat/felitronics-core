@@ -20,6 +20,7 @@ jobs:
   analyze:
     name: CodeQL (C++)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       security-events: write   # upload the analysis to the Security tab
       contents: read

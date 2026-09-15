@@ -26,6 +26,7 @@ jobs:
     # a pull request brings. A PR from a fork therefore keeps the hosted runner; only code that already
     # lives in this repository runs on hardware that is not disposable.
     runs-on: ${{ (matrix.selfHosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","macOS","ARM64","studio"]') || matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +95,7 @@ jobs:
   sanitizers:
     name: ubuntu-clang-asan-ubsan
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Configure (ASan + UBSan, hard-fail on any UB)
@@ -130,6 +132,7 @@ jobs:
   gcc-14:
     name: ubuntu-gcc-14
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Install g++-14
@@ -179,6 +182,7 @@ jobs:
   wasm-audio:
     name: wasm-audio-tier
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Install emsdk 6.0.9
@@ -580,6 +584,7 @@ jobs:
   eqviz:
     name: eqviz-quality-pictures
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - name: Configure
@@ -601,6 +606,7 @@ jobs:
     name: publish-quality-atlas
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
