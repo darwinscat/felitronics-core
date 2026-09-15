@@ -154,9 +154,14 @@ namespace felitronics::analysis
 //   scalars. That holds for a build that does NOT contract, which both shipped roads are
 //   (-ffp-contract=off in tools/CMakeLists.txt and tools/wasm/build.sh); rebuilt with the library's own
 //   default of contraction on, 4 lines move, because the arithmetic AROUND the deterministic calls is
-//   contractible even though the calls are pinned. RE-MEASURED after P80, on the same fixture: `report`
-//   is byte-identical Apple-vs-wasm and Apple-vs-glibc, and `forensics`, `hum`, `lowend` and `bursts`
-//   are byte-identical Apple-vs-wasm at both rates too.
+//   contractible even though the calls are pinned.
+//   WIDENED BY P80, because two rates on one fixture is a narrow thing to rest a promise on. 114 further
+//   comparisons, Apple clang/arm64 against wasm32/musl, every one byte-identical: `report`, `forensics`,
+//   `hum`, `lowend` and `bursts` at 44.1, 48, 88.2, 96, 176.4 and 192 kHz in mono, stereo and 6 channels
+//   (90), and those five plus `clips` on four edge-shaped inputs — a ONE-FRAME file, a three-frame file,
+//   a second of exact digital silence, and a programme carrying a NaN and an +inf (24). The refusal set
+//   was compared too, not just the successful runs: native and wasm exit with the same status on every
+//   one of them. `report` is also byte-identical Apple-vs-glibc on the shipped fixture.
 //   WHAT P80 CLOSED: the three derivations this paragraph used to name as open. All three now reach
 //   `core::det` instead of the system libm, and none of them moved a bit of anything shipped:
 //     · `core::offline::fftInplace`'s stage twiddles are det::cos/det::sin. The 2*log2(N) seed angles are

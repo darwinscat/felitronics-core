@@ -467,6 +467,18 @@ static void runReferenceTapPin()
     test::ok (! allSame, "the recovered taps are not all one value (the comparison is not vacuous)");
     int nonZero = 0; for (int i = 0; i < N; ++i) if (tap[(std::size_t) i] != 0u) ++nonZero;
     test::ok (nonZero > N / 2, "and most of them are non-zero (" + std::to_string (nonZero) + " of " + std::to_string (N) + ")");
+
+    // THE PROTOTYPE IS A PALINDROME, and saying so is the honest way to bound what the pin above proves.
+    // A linear-phase FIR is symmetric by construction, so tap[i] == tap[N-1-i] — which means a recovery
+    // that read the taps in REVERSE order would compare equal to the table and the pin would not notice.
+    // That particular error is harmless (a reversed palindrome is the same filter), and the indexing
+    // errors that are NOT harmless — a wrong phase offset, a wrong stride — scramble rather than reverse
+    // and are caught by `covered == N` plus the comparison. This assertion covers the remaining piece: it
+    // is a property of the DESIGN, so a filter that stopped being linear-phase would fail here rather
+    // than silently become a different animal that still matched 128 pinned words.
+    int asym = 0;
+    for (int i = 0; i < N / 2; ++i) if (tap[(std::size_t) i] != tap[(std::size_t) (N - 1 - i)]) ++asym;
+    test::ok (asym == 0, "the recovered prototype is symmetric, as a linear-phase design must be");
 }
 
 int main()
