@@ -129,8 +129,12 @@ public:
     // The maximum of the last accepted process() call alone, oversampled and grid, for a caller that asks what
     // one block contained. It includes whatever of the previous block the FIR was still carrying.
     double truePeakLinearBlock() const noexcept { return blockMax_; }
-    double truePeakDb()      const noexcept { return core::gainToDb (truePeakLinear()); }
-    double truePeakDbBlock() const noexcept { return core::gainToDb (blockMax_); }
+    // THE DETERMINISTIC dB SPELLING, because this is the instrument a delivered file is CERTIFIED with and
+    // its readings are compared across rows. The linear getters above are the bit surface this class
+    // promises; these two are the same value in dB, and there is no reason for the conversion to be the
+    // one part of the certificate that depends on which libm the reader happened to build against.
+    double truePeakDb()      const noexcept { return core::gainToDbDet (truePeakLinear()); }
+    double truePeakDbBlock() const noexcept { return core::gainToDbDet (blockMax_); }
 
     [[nodiscard]] bool process (const float* const* io, int numChannels, int n) noexcept
     {

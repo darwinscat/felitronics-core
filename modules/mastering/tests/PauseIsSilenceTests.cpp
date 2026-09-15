@@ -121,6 +121,32 @@ static void floorPremise()
     ok (bitsEqual (core::gainToDb (core::kGainToDbFloor * 0.5), at), "...including one just under it");
     ok (! bitsEqual (core::gainToDb (core::kGainToDbFloor * 2.0), at), "and a level ABOVE it does not");
     ok (std::fabs (at - (-240.0)) < 1.0e-9, "the floor is -240 dB, which is what the headers say");
+
+    // AND THE DETERMINISTIC SPELLING CLAMPS AT THE SAME PLACE. Math.h says gainToDbDet "inherits this
+    // proof" because both go through one `detail::gainToDbFloor` — but inheriting by READING is how a
+    // retyped constant survives a review, which is the failure that paragraph was written about in the
+    // first place. So it is asserted, not read.
+    const double atDet = core::gainToDbDet (core::kGainToDbFloor);
+    ok (bitsEqual (core::gainToDbDet (0.0), atDet), "gainToDbDet(0) is its floor value, bit for bit");
+    ok (bitsEqual (core::gainToDbDet (-1.0), atDet), "a negative level clamps there too");
+    ok (bitsEqual (core::gainToDbDet (1.0e-30), atDet), "every level under the floor gives the SAME bits");
+    ok (! bitsEqual (core::gainToDbDet (core::kGainToDbFloor * 2.0), atDet), "and a level ABOVE it does not");
+    ok (std::fabs (atDet - (-240.0)) < 1.0e-9, "the deterministic floor is -240 dB as well");
+
+    // A NaN LEVEL MUST CLAMP, NOT PROPAGATE, and both spellings must agree that it does. The clamp is
+    // `gain > kGainToDbFloor ? gain : kGainToDbFloor`, whose false branch catches NaN because every
+    // comparison with NaN is false. Written the "obvious" way — `std::max (gain, floor)` — it does NOT:
+    // std::max returns its first argument when the comparison fails, so a NaN comes straight back out and
+    // the conversion returns NaN instead of the floor. An adversarial round made exactly that edit to the
+    // deterministic spelling and the whole 123-test suite stayed green, because nothing asked.
+    ok (bitsEqual (core::gainToDb (std::numeric_limits<double>::quiet_NaN()), at),
+        "a NaN level clamps to the floor in the system spelling, bit for bit");
+    ok (bitsEqual (core::gainToDbDet (std::numeric_limits<double>::quiet_NaN()), atDet),
+        "...and in the deterministic one");
+    ok (bitsEqual (core::gainToDb (-std::numeric_limits<double>::infinity()), at),
+        "-inf clamps too");
+    ok (bitsEqual (core::gainToDbDet (-std::numeric_limits<double>::infinity()), atDet),
+        "...in both spellings");
 }
 
 //==============================================================================

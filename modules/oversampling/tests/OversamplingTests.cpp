@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -378,6 +379,108 @@ int runTapsTests()
     return 0;
 }
 
+//==============================================================================
+// THE REFERENCE PROTOTYPE, PINNED. P80 moved designFilter() from std::sin to core::det::sin, and the
+// claim attached to that change is not "it is better" but "it moved NOTHING": the taps are narrowed to
+// float, and that narrowing throws away 29 of the bits the two libms can disagree about.
+//
+// THESE 128 CONSTANTS ARE THE OLD PATH'S OUTPUT, NOT THIS PATH'S. They were dumped from the system-sin
+// design at a9816e2 and are byte-identical on four independent libms — Apple clang/arm64, gcc 14 +
+// glibc x86-64, emcc/musl wasm32 and MSVC/UCRT x86-64 — so they are an oracle computed OUTSIDE the code
+// under test, not a photograph of it. A table regenerated from the code it guards would pass forever.
+//
+// WHAT IT CATCHES, and it is two different things:
+//   · that the deterministic design still lands on the same floats the shipped one did — i.e. that no
+//     bit of TabbyEQ's or OrbitCab's true-peak reading moved when P80 touched this file;
+//   · and that a future row whose narrowing does NOT absorb the difference is caught here rather than
+//     discovered in a parity diff. Measured margin: perturbing every sin() result by a deliberate k ulp
+//     leaves all 128 taps unmoved up to k = 2^24, while the real spread between libms is 1-3 ulp.
+//
+// The taps are read back through the PUBLIC API, so this tests the class and not a copy of its formula:
+// a single 1.0f in the history makes core::firDot's sum one product plus zeros, and adding 0.0f is
+// exact, so each downsample() output IS one tap. downsample() picks them up strided by L, hence the
+// four passes at the four phase offsets.
+static const std::uint32_t kReferenceProto4x32[128] = {
+        0x36719320u, 0x35d43594u, 0xb6d237d7u, 0xb7955c31u, 0xb7d346ccu, 0xb7968a21u,
+        0x37204084u, 0x3852897cu, 0x38abd9efu, 0x389fa9ffu, 0x377f3451u, 0xb8ba2134u,
+        0xb9450da7u, 0xb9614000u, 0xb8f997e7u, 0x38c11223u, 0x39af3aaeu, 0x39f685dau,
+        0x39c55ea3u, 0x37d4ceb7u, 0xb9f32f07u, 0xba5e54eau, 0xba634f5au, 0xb9ce715au,
+        0x39eb6e12u, 0x3aa89b17u, 0x3ad6abb1u, 0x3a98ffd2u, 0xb8aec466u, 0xbad40735u,
+        0xbb2dac71u, 0xbb226f45u, 0xba6c67c9u, 0x3acac2e2u, 0x3b741965u, 0x3b8f50efu,
+        0x3b37051bu, 0xba2b10beu, 0xbb935b9bu, 0xbbdcec3cu, 0xbbbf1ca9u, 0xbad0dde8u,
+        0x3b8fc215u, 0x3c17a857u, 0x3c26a368u, 0x3bbec2d9u, 0xbb2780d0u, 0xbc398764u,
+        0xbc821607u, 0xbc531e69u, 0xbb15a024u, 0x3c445c1eu, 0x3cbdaf17u, 0x3cc8aeb4u,
+        0x3c50e8d7u, 0xbc1a4e02u, 0xbd08362fu, 0xbd3e83c3u, 0xbd1bdd69u, 0xbb32289bu,
+        0x3d63aaf9u, 0x3dfe1321u, 0x3e3d257eu, 0x3e619376u, 0x3e619376u, 0x3e3d257eu,
+        0x3dfe1321u, 0x3d63aaf9u, 0xbb32289bu, 0xbd1bdd69u, 0xbd3e83c3u, 0xbd08362fu,
+        0xbc1a4e02u, 0x3c50e8d7u, 0x3cc8aeb4u, 0x3cbdaf17u, 0x3c445c1eu, 0xbb15a024u,
+        0xbc531e69u, 0xbc821607u, 0xbc398764u, 0xbb2780d0u, 0x3bbec2d9u, 0x3c26a368u,
+        0x3c17a857u, 0x3b8fc215u, 0xbad0dde8u, 0xbbbf1ca9u, 0xbbdcec3cu, 0xbb935b9bu,
+        0xba2b10beu, 0x3b37051bu, 0x3b8f50efu, 0x3b741965u, 0x3acac2e2u, 0xba6c67c9u,
+        0xbb226f45u, 0xbb2dac71u, 0xbad40735u, 0xb8aec466u, 0x3a98ffd2u, 0x3ad6abb1u,
+        0x3aa89b17u, 0x39eb6e12u, 0xb9ce715au, 0xba634f5au, 0xba5e54eau, 0xb9f32f07u,
+        0x37d4ceb7u, 0x39c55ea3u, 0x39f685dau, 0x39af3aaeu, 0x38c11223u, 0xb8f997e7u,
+        0xb9614000u, 0xb9450da7u, 0xb8ba2134u, 0x377f3451u, 0x389fa9ffu, 0x38abd9efu,
+        0x3852897cu, 0x37204084u, 0xb7968a21u, 0xb7d346ccu, 0xb7955c31u, 0xb6d237d7u,
+        0x35d43594u, 0x36719320u,
+};
+
+static void runReferenceTapPin()
+{
+    test::group ("the reference 4x32 prototype is bit-identical to the pre-det design (four libms)");
+    const int L = 4, tpp = 32, N = L * tpp;
+    oversampling::PolyphaseOversampler os;
+    const bool prepared = os.prepare (L, 1, tpp);
+    test::ok (prepared, "prepare 4x32");
+    if (! prepared) return;
+
+    std::vector<std::uint32_t> tap ((std::size_t) N, 0u);
+    std::vector<bool> got ((std::size_t) N, false);
+    for (int p = 0; p < L; ++p)
+    {
+        os.reset();
+        std::vector<float> in ((std::size_t) N * L, 0.0f); in[(std::size_t) p] = 1.0f;
+        std::vector<float> out ((std::size_t) N, 0.0f);
+        const float* ip[1] { in.data() }; float* op[1] { out.data() };
+        os.downsample (ip, 1, N, op);
+        for (int i = 0; i < N; ++i)
+        {
+            const int idx = i * L + (L - 1 - p);
+            if (idx < N) { std::memcpy (&tap[(std::size_t) idx], &out[(std::size_t) i], 4); got[(std::size_t) idx] = true; }
+        }
+    }
+    // The recovery must have covered every tap, or "all taps match" would be a claim about a subset.
+    int covered = 0; for (int i = 0; i < N; ++i) if (got[(std::size_t) i]) ++covered;
+    test::ok (covered == N, "all " + std::to_string (N) + " taps were recovered (" + std::to_string (covered) + ")");
+
+    int differ = 0, firstBad = -1;
+    for (int i = 0; i < N; ++i)
+        if (tap[(std::size_t) i] != kReferenceProto4x32[i]) { if (firstBad < 0) firstBad = i; ++differ; }
+    if (differ != 0)
+        std::printf ("      first difference at tap %d: got %08x, pinned %08x (%d of %d differ)\n",
+                     firstBad, tap[(std::size_t) firstBad], kReferenceProto4x32[firstBad], differ, N);
+    test::ok (differ == 0, "every tap equals the system-designed table dumped on four libms before P80");
+
+    // AND THE PIN MUST BE ABLE TO FAIL. A comparison against a table is worth nothing if the recovery
+    // silently returns the table itself, or zeros, or the same value for every tap.
+    bool allSame = true; for (int i = 1; i < N; ++i) if (tap[(std::size_t) i] != tap[0]) { allSame = false; break; }
+    test::ok (! allSame, "the recovered taps are not all one value (the comparison is not vacuous)");
+    int nonZero = 0; for (int i = 0; i < N; ++i) if (tap[(std::size_t) i] != 0u) ++nonZero;
+    test::ok (nonZero > N / 2, "and most of them are non-zero (" + std::to_string (nonZero) + " of " + std::to_string (N) + ")");
+
+    // THE PROTOTYPE IS A PALINDROME, and saying so is the honest way to bound what the pin above proves.
+    // A linear-phase FIR is symmetric by construction, so tap[i] == tap[N-1-i] — which means a recovery
+    // that read the taps in REVERSE order would compare equal to the table and the pin would not notice.
+    // That particular error is harmless (a reversed palindrome is the same filter), and the indexing
+    // errors that are NOT harmless — a wrong phase offset, a wrong stride — scramble rather than reverse
+    // and are caught by `covered == N` plus the comparison. This assertion covers the remaining piece: it
+    // is a property of the DESIGN, so a filter that stopped being linear-phase would fail here rather
+    // than silently become a different animal that still matched 128 pinned words.
+    int asym = 0;
+    for (int i = 0; i < N / 2; ++i) if (tap[(std::size_t) i] != tap[(std::size_t) (N - 1 - i)]) ++asym;
+    test::ok (asym == 0, "the recovered prototype is symmetric, as a linear-phase design must be");
+}
+
 int main()
 {
     std::printf ("felitronics::oversampling tests\n");
@@ -565,6 +668,7 @@ int main()
     }
 
     runTapsTests();
+    runReferenceTapPin();
 
     return test::report();
 }

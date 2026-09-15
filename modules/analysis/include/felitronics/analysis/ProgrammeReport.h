@@ -155,18 +155,40 @@ namespace felitronics::analysis
 //   (-ffp-contract=off in tools/CMakeLists.txt and tools/wasm/build.sh); rebuilt with the library's own
 //   default of contraction on, 4 lines move, because the arithmetic AROUND the deterministic calls is
 //   contractible even though the calls are pinned.
-//   WHAT IS NOT YET GUARANTEED: three derivations still reach the system libm, so an input outside the
-//   measured fixtures could still diverge. `core::offline::fftInplace` builds its stage twiddles with
-//   std::cos/std::sin (OfflineFft.h); `core::gainToDb` is std::log10 (Math.h) and the dBTP field goes
-//   through it; and ReferenceTruePeakMeter designs its oversampler taps with std::sin
-//   (PolyphaseOversampler.h). Those three are P80's scope — the audit of everything core::det did not
-//   reach — and two of them are RT modules whose bits are a shipped product's sound, so moving them is a
-//   decision and not a refactor.
+//   WIDENED BY P80, because two rates on one fixture is a narrow thing to rest a promise on. 114 further
+//   comparisons, Apple clang/arm64 against wasm32/musl, every one byte-identical: `report`, `forensics`,
+//   `hum`, `lowend` and `bursts` at 44.1, 48, 88.2, 96, 176.4 and 192 kHz in mono, stereo and 6 channels
+//   (90), and those five plus `clips` on four edge-shaped inputs — a ONE-FRAME file, a three-frame file,
+//   a second of exact digital silence, and a programme carrying a NaN and an +inf (24). The refusal set
+//   was compared too, not just the successful runs: native and wasm exit with the same status on every
+//   one of them. `report` is also byte-identical Apple-vs-glibc on the shipped fixture.
+//   WHAT P80 CLOSED: the three derivations this paragraph used to name as open. All three now reach
+//   `core::det` instead of the system libm, and none of them moved a bit of anything shipped:
+//     · `core::offline::fftInplace`'s stage twiddles are det::cos/det::sin. The 2*log2(N) seed angles are
+//       ones where Apple, glibc and musl already agreed with each other and with det, so the transform's
+//       output is unchanged on every row — the agreement was observed before and is built in now.
+//     · the dBTP field goes through `core::gainToDbDet`. `core::gainToDb` itself did NOT move and must
+//       not: it runs once per sample on four paths, worst of them inside TruePeakLimiter's oversampled
+//       loop. The split is by CONSUMER, and tools/lint/check-det-math.mjs is what keeps it that way.
+//     · PolyphaseOversampler designs its taps with det::sin. The taps are narrowed to float, which
+//       discards 29 of the bits the libms can disagree about: measured, the 4x32 prototype is
+//       byte-identical across Apple clang/arm64, gcc 14/glibc, emcc/musl AND MSVC/UCRT, before and after,
+//       and OversamplingTests pins all 128 of them against the pre-change table.
+//   WHAT IS STILL NOT GUARANTEED, and it is no longer a libm question:
+//     · CONTRACTION. The 4 lines above still move under -ffp-contract=on (re-measured after P80:
+//       integratedLufs, plrDb, shortTermP50, shortTermP95). Both shipped roads state contraction off;
+//       nothing here claims identity for a build that does not.
+//     · A CONSUMER'S UNSAFE MATH. -ffast-math or -funsafe-math-optimizations in a translation unit that
+//       includes DetMath.h rewrites its Dekker splits and polynomial accumulations, and det stops being
+//       one function. DetMath.h refuses to compile under the flags that can be detected; clang defines no
+//       macro for a bare -funsafe-math-optimizations, so DetMathTests carries a runtime pin for that hole.
+//     · `std::abs` on a complex in `core::offline::magSpectrum` is `hypot`, which no det:: function
+//       replaces. It is out of this report's path (the analyzers take their magnitudes from
+//       SpectrumFrames, which squares and sums), and it is recorded in the lint's ZONE_EXCEPTIONS.
 //   WHAT CHANGED IN v0.33.0: the transcendentals that DECIDE this report — every dB value, every
-//   threshold, the window every power bin is multiplied by — run through `core::det`, which is one
-//   implementation compiled into every build rather than whatever the row's libm happens to be. That was
-//   the share no build flag could reach, and before v0.33.0 this paragraph said there was no
-//   cross-platform identity at all, which was true then.
+//   threshold, the window every power bin is multiplied by — moved to `core::det`. That was the share no
+//   build flag could reach, and before v0.33.0 this paragraph said there was no cross-platform identity
+//   at all, which was true then.
 //
 // NON-FINITE INPUT. A non-finite sample is a HOLE: a canonical 0.0f goes into every filter, the sample
 // enters no statistic, and it is counted per channel. What that invalidates is drawn along one line —
@@ -1269,7 +1291,11 @@ private:
                                   // gainToDb FLOORS at kGainToDbFloor, so a peak at or under 1e-12 would
                                   // publish -240.0 dBTP as a valid reading rather than a floored one.
                                   : ! (tpLin > core::kGainToDbFloor) ? bad (ProgrammeReason::SilentProgramme)
-                                  :                              good (core::gainToDb (tpLin));
+                                  // `gainToDbDet`, not `gainToDb`: this number is PRINTED and then diffed
+                                  // byte for byte against the wasm module's, and std::log10 is not the same
+                                  // function on those two rows. The shared `gainToDb` stays where it is —
+                                  // it runs once per oversampled sample inside the limiter.
+                                  :                              good (core::gainToDbDet (tpLin));
         R.truePeakDbtp = tpDb;
 
         // --- integrated loudness: -120.0 is the meter's "nothing passed the gates" SENTINEL ---

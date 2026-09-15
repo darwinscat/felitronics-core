@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/core/Config.h>
+#include <felitronics/core/DetMath.h>   // core::det::sin — named directly, not borrowed via Math.h
 #include <felitronics/core/Math.h>
 #include <felitronics/core/PolyphaseFir.h>
 
@@ -272,8 +273,27 @@ private:
         for (int i = 0; i < N; ++i)
         {
             const double x    = (double) i - cen;
+            // `det::sin`, and on the topologies this class can actually build it moves not one bit —
+            // measured, not assumed. The taps are narrowed to float two lines down, and that narrowing
+            // throws away 29 of the bits the libms can disagree about. On the reference 4x32 the system and
+            // deterministic designs differ at 18 of 128 taps IN DOUBLE (up to 2 ulp) and at ZERO of 128 in
+            // float; the same at 2x32, 8x32, 4x12, 2x12, 4x16 and 2x64, and the final float arrays are
+            // byte-identical across Apple clang/arm64, gcc 14/glibc, emcc/musl and MSVC/UCRT.
+            // `sum` DOES keep the double differences — it accumulates `v`, not the narrowed tap — and it
+            // reaches every tap through `inv`. That is why `inv` was compared too, and it is bit-identical
+            // on all four rows; the narrowing absorbs the difference on that path as well, it is not
+            // assumed to.
+            // THE MARGIN, because "zero differences" is worth little without one: perturbing every sin()
+            // result by a deliberate k ulp, both coherently and with alternating signs, leaves all 128 taps
+            // unmoved through k = 2^20; the first single tap moves at 2^24 (alternating), and it takes 2^26
+            // to move tens of them. Against a real spread of 1-3 ulp between libms that is about six orders
+            // of magnitude of headroom. (An earlier draft said seven, from the coherent pattern alone —
+            // the alternating one is the sharper test and a review round ran it.) That is the measured
+            // headroom on THESE parameters, not a proof for every filter this class could be asked for:
+            // OversamplingTests pins the 128 reference taps against the pre-det table so a row where the
+            // absorption fails is caught rather than discovered.
             const double sinc = (std::fabs (x) < 1e-9) ? (2.0 * fc)
-                                                       : std::sin (2.0 * core::kPi * fc * x) / (core::kPi * x);
+                                                       : core::det::sin (2.0 * core::kPi * fc * x) / (core::kPi * x);
             const double r    = (double) (2 * i - (N - 1)) / (double) (N - 1);   // ∈ [-1,1]
             const double win  = detail::besselI0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / i0b;
             const double v    = sinc * win;

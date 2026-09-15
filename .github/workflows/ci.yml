@@ -210,6 +210,17 @@ jobs:
         run: |
           node tools/lint/check-no-long-double.mjs --self-test
           node tools/lint/check-no-long-double.mjs
+      - name: The libm audit — no system transcendental on a path that crosses a row
+        # P80. The system libm is not the same function on every row: measured over the ranges this
+        # library uses, Apple's and glibc's log10 differ at 4325 of 200000 points, their pow10 at 41 %.
+        # Every dB threshold is built from pow10, so a threshold that moves by an ulp moves a DECISION.
+        # This lint keeps the values that cross a boundary on core::det, and — the half that matters —
+        # keeps them off the CARRIERS, ordinary functions like core::gainToDb that reach libm without
+        # ever spelling `std::`. The analyzers it defends contain no direct std:: call at all; they were
+        # exposed entirely through those, which is why a grep-shaped lint would pass and prove nothing.
+        run: |
+          node tools/lint/check-det-math.mjs --self-test
+          node tools/lint/check-det-math.mjs
       - name: The gates still gate — negative controls
         # A gate nobody tries to break is a gate nobody knows still works. Both of these are cheap and both
         # would have caught a real rot: the --wrap gate depends on libc++ keeping std::thread's constructor
@@ -255,6 +266,55 @@ jobs:
             echo "CONTROL FAILED: sizeof(long double) alone now emits a libcall — the gate would false-positive on the ABI probe"; exit 1
           fi
           echo "control 4 ok: long double arithmetic still lowers to a tf libcall, and sizeof() alone still does not"
+          # Controls 5-10: the libm audit. Its --self-test above proves the MATCHER; these prove the RULES,
+          # and each one is a way this lint could go quietly dead. The carrier control (6) is the one that
+          # matters most: the analyzers it defends contain no direct `std::` call, so a lint that only
+          # caught control 5 would pass forever while the real exposure walked in through gainToDb.
+          ZONEH=modules/analysis/include/felitronics/analysis/HumDetector.h
+          MANH=modules/analysis/include/felitronics/analysis/PlotMap.h
+          OFF=modules/core/include/felitronics/core/OfflineFft.h
+          MANIFEST=tools/lint/det-math-manifest.txt
+          SOLV=modules/mastering/include/felitronics/mastering/LoudnessSolver.h
+          # Restore ONLY the files these controls touch. A bare `git checkout -- .` would also discard
+          # anything else in the tree, which is harmless on a CI checkout and destructive if a human runs
+          # this block locally to see what it does — and someone will.
+          det_restore () { git checkout -- "$ZONEH" "$MANH" "$OFF" "$MANIFEST" "$SOLV"; }
+          det_control () {  # det_control <n> <what> <expected substring>
+            if node tools/lint/check-det-math.mjs > /dev/null 2>&1; then
+              det_restore; echo "CONTROL FAILED ($1): the lint PASSED with $2 planted"; exit 1; fi
+            node tools/lint/check-det-math.mjs 2>&1 | grep -qF "$3" \
+              || { det_restore; echo "CONTROL FAILED ($1): fired but did not report '$3'"; exit 1; }
+            det_restore; echo "control $1 ok: $2 is caught"
+          }
+          printf '\nnamespace { inline double p80c (double x) { return std::cos (x); } }\n' >> "$ZONEH"
+          det_control 5 "a direct std::cos in a deterministic-zone header" "$ZONEH"
+          printf '\nnamespace { inline double p80c (double x) { return felitronics::core::gainToDb (x); } }\n' >> "$ZONEH"
+          det_control 6 "a CARRIER call (gainToDb) in the zone — the indirect half a grep cannot see" "[CARRIER]"
+          printf '\nnamespace { inline double p80c (double x) { return std::tanh (x); } }\n' >> "$MANH"
+          det_control 7 "a new libm call in a manifested file" "the calls in this file CHANGED"
+          printf 'modules/core/include/felitronics/core/Config.h  [cos*1]  retain-local  planted\n' >> "$MANIFEST"
+          det_control 8 "a stale manifest entry for a file with no calls" "no libm calls left"
+          printf '\nnamespace { inline double p80c (double x) { return std::cos (x); } }   // libm-ok: unbacked\n' >> "$ZONEH"
+          det_control 9 "a libm-ok marker with no ZONE_EXCEPTIONS entry behind it" "no entry for it in ZONE_EXCEPTIONS"
+          sed -i 's|   // libm-ok: hypot, see ZONE_EXCEPTIONS||' "$OFF"
+          det_control 10 "an allowed exception whose marker was deleted" "[ZONE-EXCEPTION-ROT]"
+          # 11 is THE regression this lint was written after: reverting LoudnessSolver::peakDb to the
+          # system spelling breaks "the solver's report IS the certificate, bit for bit". The first
+          # version of the lint PASSED on it, because carrier calls were checked only inside the zone.
+          sed -i 's|core::gainToDbDet (lin)|core::gainToDb (lin)|' "$SOLV"
+          # And prove the mutation LANDED: an earlier version of this control keyed on `... : -200.0`,
+          # which a refactor renamed to kPeakDbSilence, so the sed matched nothing and the lint's pass
+          # read as a working gate. A stand that does not verify its own mutation is wired to nothing.
+          grep -q 'core::gainToDb (lin)' "$SOLV" \
+            || { det_restore; echo "CONTROL BROKEN (11): the sed planted nothing"; exit 1; }
+          det_control 11 "LoudnessSolver::peakDb reverted to the system spelling" "$SOLV"
+          # 12: the matcher used to read one line at a time, so a call whose parenthesis sat on the next
+          # line was not a call at all — in the zone, with no marker needed, because nothing was recorded.
+          printf '\nnamespace { inline double p80c (double x) { return std::cos\n    (x); } }\n' >> "$ZONEH"
+          det_control 12 "a call split between its name and its parenthesis" "$ZONEH"
+          node tools/lint/check-det-math.mjs > /dev/null \
+            || { echo "CONTROL FAILED: the tree did not come back clean, so controls 5-12 proved nothing"; exit 1; }
+          echo "controls 5-12 ok: the libm audit fires on every rule and the tree is clean again"
       - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
         # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
         # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns

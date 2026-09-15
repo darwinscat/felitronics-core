@@ -20,7 +20,8 @@
 // measurement + analysis test suites).
 //==============================================================================
 
-#include <felitronics/core/Math.h>   // felitronics::core::kPi
+#include <felitronics/core/DetMath.h>   // core::det::cos / core::det::sin — the stage seeds below
+#include <felitronics/core/Math.h>      // felitronics::core::kPi
 
 #include <complex>
 #include <cstddef>
@@ -58,7 +59,18 @@ inline void fftInplace (std::vector<std::complex<double>>& a, int sign) noexcept
     for (std::size_t len = 2; len <= n; len <<= 1)
     {
         const double ang = (double) sign * 2.0 * core::kPi / (double) len;
-        const std::complex<double> wlen (std::cos (ang), std::sin (ang));
+        // THE STAGE SEEDS ARE THE TRANSFORM'S ONLY libm INPUT, and they are deterministic on purpose: this
+        // routine's output is diffed byte for byte between the native CLI and the wasm module, and
+        // std::cos/std::sin are not the same function on those two rows. There are 2*log2(N) of these per
+        // transform — 40 calls at N = 2^20 against 10485760 butterflies — so the ~3.5x per-call cost of
+        // `det` is unmeasurable here, and it buys the property by construction instead of by luck.
+        // MEASURED, on this tree: converting these changed NOTHING on any row. A 2^16 transform — whose 16
+        // seed angles are the ones that measurement actually exercised — hashes identically before and
+        // after on Apple, glibc and musl, at both contraction settings. That is the point: the agreement
+        // was observed, not guaranteed, and now it does not need to be observed again. Note the scope, as
+        // the first draft of this comment did not: it establishes those angles, not every angle a larger
+        // transform would ask for.
+        const std::complex<double> wlen (core::det::cos (ang), core::det::sin (ang));
         for (std::size_t i = 0; i < n; i += len)
         {
             std::complex<double> w (1.0, 0.0);            // twiddle recurrence — floor ~-208 dB at 2^20 (see header)
@@ -111,7 +123,15 @@ inline std::vector<double> magSpectrum (std::span<const double> x, std::size_t n
     for (std::size_t i = 0; i < x.size() && i < nfft; ++i) X[i] = x[i];
     detail::fftInplace (X, -1);
     std::vector<double> m (nfft / 2);
-    for (std::size_t i = 0; i < nfft / 2; ++i) m[i] = std::abs (X[i]);
+    // `std::abs` on a complex IS `std::hypot` — measured identical to an explicit hypot call on Apple,
+    // glibc and musl, and those three rows then give three DIFFERENT answers over 200000 points. There is
+    // no det::hypot to move it to, and sqrt(norm(z)) is a different function (less accurate, overflows
+    // differently), not a rewrite of this one. It stays system because magSpectrum's consumers —
+    // analysis/offline/SpectrumCurve and measurement/CaptureGate — are not in a byte diff; the analyzers
+    // that ARE diffed take their magnitudes from SpectrumFrames, which squares and sums and calls no libm
+    // at all. tools/lint/check-det-math.mjs holds this argument in ZONE_EXCEPTIONS, where it has to keep
+    // being true to stay allowed, and the marker below is what makes it visible at the call itself.
+    for (std::size_t i = 0; i < nfft / 2; ++i) m[i] = std::abs (X[i]);   // libm-ok: hypot, see ZONE_EXCEPTIONS
     return m;
 }
 

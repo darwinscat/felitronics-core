@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <felitronics/core/DetMath.h>   // felitronics::core::det — the deterministic dB spelling below
+
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -12,8 +14,11 @@ namespace felitronics::core
 
 constexpr double kPi = 3.14159265358979323846;
 
-// dB <-> linear amplitude (20·log10). `double` on purpose: these are offline / coefficient-design /
-// GUI helpers, never the per-sample loop (Law 3 carve-out). The floor keeps log10 finite.
+// dB <-> linear amplitude (20·log10). `double` on purpose (Law 3 carve-out), and the floor keeps log10
+// finite. THESE ARE NOT COEFFICIENT-ONLY HELPERS, whatever this comment used to say: `gainToDb` runs once
+// per sample in dynamics/GainReductionPath.h, deesser/DeEsser.h and dynamiceq/DynamicEqBand.h, and both
+// of them run once per OVERSAMPLED sample inside limiter/TruePeakLimiter.h's loop. That is the reason
+// neither moved to the deterministic floor in P80 and why `gainToDbDet` is a separate function below.
 inline double dbToGain (double dB)   noexcept { return std::pow (10.0, dB / 20.0); }
 
 // THE FLOOR `gainToDb` PUTS UNDER ITS ARGUMENT IS LOAD-BEARING, so it is named and then USED rather than
@@ -27,11 +32,41 @@ inline double dbToGain (double dB)   noexcept { return std::pow (10.0, dB / 20.0
 // (it is not on the MSVC row), so a compile-time assertion could only pin the constant and never that
 // the function still uses it.
 inline constexpr double kGainToDbFloor = 1.0e-12;
-inline double gainToDb (double gain) noexcept { return 20.0 * std::log10 (gain > kGainToDbFloor ? gain : kGainToDbFloor); }
+
+// AND THE CLAMP ITSELF IS NOW WRITTEN ONCE, for the reason the paragraph above gives about the constant.
+// There are two spellings of this conversion below — the system one, whose bits are a shipped product's
+// sound, and the deterministic one, whose bits are compared across rows — and a floor RETYPED into the
+// second could drift from the first in silence, which is the exact failure the paragraph above describes
+// one level up. Law 11c's collapse is pinned to this predicate by a runtime test; both spellings inherit
+// that proof rather than each needing its own.
+namespace detail
+{
+    inline double gainToDbFloor (double gain) noexcept { return gain > kGainToDbFloor ? gain : kGainToDbFloor; }
+}
+
+inline double gainToDb (double gain) noexcept { return 20.0 * std::log10 (detail::gainToDbFloor (gain)); }
+
+// THE SAME CONVERSION FOR A NUMBER THAT LEAVES THIS MACHINE. `gainToDb` above is `std::log10`, and that is
+// not one function across rows: measured over the ranges this library uses, Apple's and glibc's log10
+// disagree at 4325 of 200000 points and glibc's and musl's at 4278. A reported dB that moves by an ulp is
+// a printed digit that moves, and the analyzers' outputs are diffed BYTE FOR BYTE between the native CLI
+// and the wasm module — so a value destined for a report goes through `det::log10`, one implementation
+// compiled into every build, and a value destined for the audio path does not.
+//
+// WHY THIS IS A SECOND FUNCTION AND NOT A POLICY ON THE FIRST. `gainToDb` is called ONCE PER SAMPLE on
+// four real paths — dynamics/GainReductionPath.h:173, deesser/DeEsser.h:184, dynamiceq/DynamicEqBand.h:169
+// and, worst, limiter/TruePeakLimiter.h:594, which is inside the OVERSAMPLED loop of the module that is
+// most of a render's cost. `det::log10` is 7.4x a system call and `gainToDbDet` 4.6x `gainToDb` (measured
+// here; the ~2.9x quoted elsewhere is det::cos, a cheaper function), so routing the shared function through a
+// policy would tax every one of those to make a handful of reported values reproducible. The split is by
+// CONSUMER, not by function, and the lint (tools/lint/check-det-math.mjs) is what keeps it that way —
+// it treats a call to `gainToDb` as a libm call, because that is exactly what it is.
+inline double gainToDbDet (double gain) noexcept { return 20.0 * det::log10 (detail::gainToDbFloor (gain)); }
 
 // Fast 20*log10 for DETECTOR paths — accurate to ~0.001 dB and several times cheaper than
 // std::log10, which is enough for deciding how hard to compress and nowhere near enough for
-// measurement. Use gainToDb() for anything a user reads as a number.
+// measurement. Use gainToDb() for a number a user reads off THIS machine, and gainToDbDet() for one that
+// is compared against another row's — see the two functions above.
 //
 // A float is m * 2^e with m in [1,2), both free from its bit pattern, so ln(x) = e*ln2 + ln(m) and
 // only ln(m) needs work. On that interval the atanh series in t = (m-1)/(m+1) converges fast — t is

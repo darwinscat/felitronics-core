@@ -160,8 +160,17 @@ public:
     // answers disagree is worse than one that is merely wrong.
     double truePeakDb()     const noexcept
     {
+        // `det::log10`. BE ACCURATE ABOUT WHY, because the first version of this comment was not: this
+        // value is NOT on the byte-diffed surface. parity.mjs prints `dbtp` only under --debug and only to
+        // stderr; what CI diffs is stdout, which carries the true peak as a LINEAR bit pattern. The reason
+        // to convert it is simpler and still good — it is a number a human reads from the CLI and from the
+        // browser, and std::log10 differs between Apple's libm, glibc's and musl's, so the two would print
+        // different digits for one file. It closes a discrepancy a user could see, not a parity hole.
+        // THE 1e-9 FLOOR STAYS THIS FUNCTION'S OWN. It is NOT core::kGainToDbFloor (1e-12), and swapping
+        // it for the shared one would change the number a silent file prints from -180 to -240 — a change
+        // to what the tool says, smuggled in under a change to how it rounds. One thing at a time.
         const double tp = truePeakLinear();
-        return 20.0 * std::log10 (tp > 1e-9 ? tp : 1e-9);
+        return 20.0 * felitronics::core::det::log10 (tp > 1e-9 ? tp : 1e-9);
     }
     int    droppedBlocks()  const noexcept { return lm_.droppedBlocks(); }
     // Forwarded so a caller can tell a MEASUREMENT from a best-effort number: non-zero means a

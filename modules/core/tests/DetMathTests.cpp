@@ -157,5 +157,114 @@ int main()
         ok (std::bit_cast<std::uint64_t> (det::sin (0.0)) == std::bit_cast<std::uint64_t> (0.0), "domain: sin(0) is exactly +0");
     }
 
+    // ---------- 6. THE UNSAFE-MATH TRIPWIRE, which no #if can be ----------
+    // DetMath.h refuses to compile under -ffast-math and, on gcc, under -funsafe-math-optimizations,
+    // because reassociation rewrites its Dekker splits and polynomial accumulations into algebraically
+    // equal, numerically different forms. Measured over 100000 points of det::pow10:
+    //
+    //     flag                          clang/arm64          gcc 14 x86-64
+    //     (none)                        2253cf954ae4dc64     2253cf954ae4dc64
+    //     -ffp-contract=fast            2253cf954ae4dc64     2253cf954ae4dc64   <- the volatile pin holds
+    //     -ffast-math                   c2c77b419859ee6b     694fb75fe048f32a   <- broken, differently
+    //     -funsafe-math-optimizations   bee2675b81d4fcd3     (same class)
+    //
+    // THE HOLE THE #error CANNOT CLOSE: clang defines NO macro for a bare -funsafe-math-optimizations
+    // (measured — the only one it moves is __FINITE_MATH_ONLY__, to 0, which is also its default), and
+    // clang is both the developer's row and the wasm toolchain. So the preprocessor cannot see that case
+    // and this runtime check is what does. It is two assertions on purpose:
+    //   · within 2 ulp of the CORRECTLY ROUNDED value (Python's decimal at 60 digits, an oracle computed
+    //     outside this tree) — that is the accuracy claim, and it is what a wrong answer violates;
+    //   · equal to a PINNED bit pattern — that is the flag claim. A build whose flags have quietly
+    //     rewritten this arithmetic still lands near the right answer; it just stops landing on the same
+    //     double as every other row, which is the entire property det:: exists to provide.
+    {
+        // TWO reference tables, because they are two different claims and collapsing them is wrong —
+        // the first draft of this test used the oracle as the pin and failed at once, correctly: det is
+        // within 2 ulp of correctly rounded, not equal to it, and at 10^0.6 it is exactly 1 ulp off.
+        struct Ref { double x; std::uint64_t rounded; std::uint64_t det; };
+        static const Ref refs[] = {
+            //  x        correctly rounded      what det:: returns
+            { -3.0,  0x3f50624dd2f1a9fcull, 0x3f50624dd2f1a9fcull },
+            { -1.15, 0x3fb21f97ef20893cull, 0x3fb21f97ef20893cull },
+            { 0.6,   0x400fd93c1f526ddfull, 0x400fd93c1f526de0ull },   // 1 ulp — det's stated accuracy, not a fault
+            { -6.0,  0x3eb0c6f7a0b5ed8dull, 0x3eb0c6f7a0b5ed8dull },
+            { 2.5,   0x4073c3a4edfa9759ull, 0x4073c3a4edfa9759ull },
+            { -0.05, 0x3fec8520affa0a4bull, 0x3fec8520affa0a4bull },
+        };
+        // The `rounded` column is Python's decimal at 90 digits, computed from `Decimal.from_float(x)` —
+        // THE BINARY64 ARGUMENT THE CALL ACTUALLY RECEIVES, not the decimal literal it was written as.
+        // Those are different numbers and the first draft used the wrong one: it made 10^-1.15 look 1 ulp
+        // wrong when det is correctly rounded there, and hid that the 1-ulp case is 10^0.6. An oracle read
+        // at a different input than the code under test is not an oracle.
+        // The `det` column was captured from Apple clang/arm64, gcc 14/glibc x86-64 and emcc/musl wasm32,
+        // which returned THE SAME BITS at all six points; that agreement is what makes it a pin on the
+        // build's flags rather than a photograph of one machine.
+        int worst = 0, moved = 0;
+        for (const auto& r : refs)
+        {
+            const std::uint64_t gb = std::bit_cast<std::uint64_t> (det::pow10 (r.x));
+            const std::int64_t d = (std::int64_t) gb - (std::int64_t) r.rounded;
+            const int ulp = (int) (d < 0 ? -d : d);
+            if (ulp > worst) worst = ulp;
+            if (gb != r.det) ++moved;
+        }
+        ok (worst <= 2, "oracle: det::pow10 within " + std::to_string (worst)
+                        + " ulp of the correctly rounded value at 6 points");
+        ok (moved == 0, "pinned: det::pow10 returns the reference bits at those 6 points");
+
+        // AND THE DENSE PIN, because six points is not a pin. An adversarial round dropped the `volatile`
+        // from ONE step of exp2Frac — the single likeliest wrong edit in this file, since it reads as a
+        // tidy-up — and det::pow10 changed across 100000 arguments while all six points above still
+        // matched. A sparse pin tests the six values somebody happened to choose; this tests the function.
+        //
+        // THE ARGUMENTS ARE BUILT FROM INTEGERS, exactly. `(i - N/2) / 4096.0` is representable for every
+        // i, so the argument stream is identical on every row BY CONSTRUCTION — where a sweep written as
+        // `lo + i * step` would be a contractible multiply-add and would make arm64 and a non-FMA x86-64
+        // build disagree about the INPUT. That mistake was made once here already, and it looked exactly
+        // like det:: being non-portable.
+        //
+        // The eight values below were captured on Apple clang/arm64, gcc 14/glibc x86-64 (-march=native,
+        // contraction live) and emcc/musl wasm32, which returned the same eight.
+        {
+            auto mix = [] (std::uint64_t h, double v)
+            { return (h ^ std::bit_cast<std::uint64_t> (v)) * 1099511628211ull; };
+            const int N = 100000;
+            std::uint64_t hCos = 1469598103934665603ull, hSin = hCos, hTan = hCos,
+                          hL2 = hCos, hL10 = hCos, hE2 = hCos, hP10 = hCos, hPow = hCos;
+            for (int i = 0; i < N; ++i)
+            {
+                const double t  = (double) (i - N / 2) / 4096.0;
+                const double u  = (double) (i + 1) / 8192.0;
+                const double db = (double) (i - N / 2) / 512.0;
+                hCos = mix (hCos, det::cos (t));   hSin = mix (hSin, det::sin (t));
+                hTan = mix (hTan, det::tan (t));   hL2  = mix (hL2,  det::log2 (u));
+                hL10 = mix (hL10, det::log10 (u)); hE2  = mix (hE2,  det::exp2 (t));
+                hP10 = mix (hP10, det::pow10 (db / 20.0));
+                hPow = mix (hPow, det::pow (u, t));
+            }
+            struct Pin { const char* name; std::uint64_t got, want; };
+            const Pin pins[] = {
+                { "cos",   hCos, 0x7d4385d092968bb2ull }, { "sin",   hSin, 0x15d3bf218d00b6acull },
+                { "tan",   hTan, 0x4539178d5ff966abull }, { "log2",  hL2,  0x1bbdfc745d669ce7ull },
+                { "log10", hL10, 0x74abd6c9f016d15dull }, { "exp2",  hE2,  0x390f967aca102148ull },
+                { "pow10", hP10, 0x90d3565674dd9a20ull }, { "pow",   hPow, 0xb2d816ef180685ecull },
+            };
+            int drift = 0;
+            for (const auto& q : pins)
+                if (q.got != q.want)
+                {
+                    ++drift;
+                    std::printf ("      det::%-6s over %d arguments: %016llx, pinned %016llx\n",
+                                 q.name, N, (unsigned long long) q.got, (unsigned long long) q.want);
+                }
+            ok (drift == 0, drift == 0
+                  ? "dense pin: all eight det:: functions reproduce their reference checksum over 100000 arguments"
+                  : std::to_string (drift) + " of 8 det:: functions DRIFTED over 100000 arguments. Either this "
+                    "build has unsafe-math flags (clang defines no macro for a bare -funsafe-math-optimizations "
+                    "off ARM, so the #error cannot see that one), or an edit to DetMath.h changed what it "
+                    "computes — check that every multiply-add still goes through mulAdd()/mul().");
+        }
+    }
+
     return felitronics::test::report();
 }

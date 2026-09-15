@@ -178,7 +178,9 @@ Independent measureIndependently (const std::vector<std::vector<float>>& buf)
     if (! tm.process (p.data(), nch, n)) return r;
     tm.drain();
     r.I = lm.integratedLufs(); r.TP = tm.truePeakDb(); r.LRA = lm.loudnessRangeLu();
-    r.sp = core::gainToDb (tm.samplePeakLinear()); r.blocks = lm.gatingBlockCount();
+    // gainToDbDet, matching `r.TP` above (ReferenceTruePeakMeter::truePeakDb is deterministic since P80).
+    // Two spellings of one meter's readings inside one struct is how a false comparison gets written later.
+    r.sp = core::gainToDbDet (tm.samplePeakLinear()); r.blocks = lm.gatingBlockCount();
     return r;
 }
 
@@ -2903,6 +2905,23 @@ static void testSilenceIsStillSpelledMinus200()
     test::ok (sol.passes >= 1, "precondition — a render was measured");
     test::ok (sol.measured.truePeakDbTp == -200.0 && sol.measured.samplePeakDb == -200.0,
               "true peak " + std::to_string (sol.measured.truePeakDbTp) + " and sample peak " + std::to_string (sol.measured.samplePeakDb));
+
+    // AND WHERE THE SENTINEL STOPS. The check above uses digital silence, which is below any gate anyone
+    // might type — so it cannot tell this class's threshold from one ten times larger. An adversarial round
+    // raised it from 1e-10f to 1e-9f and every one of the 123 tests stayed green, while a peak of 2e-10
+    // made the solver report -200 where the certificate read -193.98. These pin the LOCATION: a level just
+    // inside the gate is a measurement, one just outside it is the sentinel, and the boundary is the
+    // constant the header publishes.
+    using Solver = felitronics::mastering::TargetLoudnessSolver;
+    const double justIn  = std::nextafter (Solver::kPeakDbGate, 1.0);      // the smallest level ABOVE the gate
+    const double justOut = Solver::kPeakDbGate;                            // the gate itself is NOT above it
+    test::ok (std::fabs (Solver::kPeakDbGate - 1.0e-10) < 1.0e-16,
+              "the gate is at 1e-10 (float-widened), where this class has always put it");
+    test::ok (core::gainToDbDet (justIn) < -190.0 && core::gainToDbDet (justIn) > -210.0,
+              "a level just inside the gate converts to a real dB near -200, not to the sentinel");
+    test::ok (core::gainToDbDet (justIn) != Solver::kPeakDbSilence,
+              "...and that dB is DISTINGUISHABLE from the sentinel, so the two branches cannot be confused");
+    test::ok (! (justOut > Solver::kPeakDbGate), "the gate is exclusive: the boundary level itself reads as silence");
 }
 
 int main()

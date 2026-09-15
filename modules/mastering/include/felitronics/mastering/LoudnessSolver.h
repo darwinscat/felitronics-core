@@ -458,6 +458,15 @@ public:
     static constexpr double kMaxGainDb = 60.0;      // MasteringChain::kMaxGainDb — the search's actuator range
     static constexpr int    kMaxPasses = TargetLoudnessSolverLimits::kMaxPasses;
 
+    // WHERE THIS CLASS STOPS REPORTING A dB AND STARTS REPORTING A SENTINEL. peakDb() below is the only
+    // user; the constant is public so a test can pin WHERE it is, not merely that silence reads -200.
+    // Digital silence sits below any plausible gate, so a test using silence alone cannot tell this value
+    // from one ten times larger — an adversarial round raised it to 1e-9f and the whole suite stayed green
+    // while the report and the certificate disagreed by 6 dB at a peak between the two. The float spelling
+    // widened to double is deliberate and predates P80: it keeps the boundary exactly where it was.
+    static constexpr double kPeakDbGate    = (double) 1.0e-10f;
+    static constexpr double kPeakDbSilence = -200.0;
+
     // `maxFrames` and `maxChannels` size the tap buffers; `binDb` is the resolution every gain-reduction
     // quantile is reported to. The tap buffers are the whole allocation and they are per RENDERER BLOCK,
     // not per programme — the traces are consumed as they arrive, so a five-minute track costs the same
@@ -1288,7 +1297,12 @@ private:
         m.latencySamples = chain.latencySamples();
         m.compressor = summarise (compHist_, compActive_, compFrames_);
         m.limiter    = summarise (limHist_,  limActive_,  limFrames_);
-        m.limiterMaxReconstructedPeakDb = core::gainToDb ((double) maxReconLin_);
+        // `gainToDbDet` for the same reason as peakDb() above, and this one is the stronger case of the two:
+        // the field crosses the C ABI into the browser (fc_master_abi.h, fc_master.cpp) AND it is read back
+        // as a DECISION — `headroomToEngage = ceiling - m.limiterMaxReconstructedPeakDb` a few hundred lines
+        // up — so on the system spelling the solver could take a different branch on Apple than on the row
+        // that rendered the same file. The LINEAR peak it converts is the limiter's own, and stays RT.
+        m.limiterMaxReconstructedPeakDb = core::gainToDbDet ((double) maxReconLin_);
         return measure (out, nch, frames, m);
     }
 
@@ -1429,7 +1443,18 @@ private:
     // `gainToDb` above 1e-10f — the float threshold, widened, so the boundary is the old one to the bit — and -200 for
     // anything quieter. Kept on purpose when the instrument changed (P62), so
     // the switch moves the READING and nothing about how silence is spelled to a caller that tests for it.
-    static double peakDb (double lin) noexcept { return lin > (double) 1.0e-10f ? core::gainToDb (lin) : -200.0; }
+    // `gainToDbDet`, and it MUST move together with ReferenceTruePeakMeter::truePeakDb(). The note at the
+    // top of this class says the reported number IS the certificate, bit for bit; the certificate is that
+    // meter's dB getter, and this is the solver's. Converting one and not the other makes the two spellings
+    // of one value disagree at the last ulp — which is not a theory: it is what
+    // felitronics_delivered_ceiling_tests caught within one run of the first half of this change, on
+    // 44100->88200, 48000->96000, 48000->192000 and 88200->192000.
+    // AND THE EQUIVALENCE HAS A FLOOR, which "bit for bit" alone does not say. This function keeps its own
+    // 1e-10f gate and its -200.0 sentinel; the meter's getter clamps at core::kGainToDbFloor (1e-12) and
+    // reads -240 there. Below the float gate the two therefore differ BY DESIGN, and deliberately — the
+    // -200 sentinel is this class's published answer for silence and LoudnessSolverTests pins it. The
+    // identity is over peaks above that gate, which is every peak a delivered file has.
+    static double peakDb (double lin) noexcept { return lin > kPeakDbGate ? core::gainToDbDet (lin) : kPeakDbSilence; }
 
     bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
     {
@@ -1453,6 +1478,16 @@ private:
         // `poisoned`), and a sub-hop is at least one sample. So it cannot exceed `frames`, an int. Feeding
         // this meter more than once, or widening `frames`, is what would make this cast wrong.
         m.nonFiniteSubHops = (int) lm.nonFiniteSubHops();
+        // THIS MEASUREMENT MIXES THE TWO MATH POLICIES, on purpose and worth saying out loud. The two peak
+        // fields below go through `peakDb`, which P80 put on `core::det`, because they are the certificate
+        // and the certificate is compared bit for bit. The two loudness fields here come from
+        // `analysis::LoudnessMeter`, which is `BasicLoudnessMeter<core::SystemMath>` — the SYSTEM policy —
+        // so they are NOT the same bits on every row, and `plrDb` below subtracts one from the other.
+        // That is consistent with what this class is measured against: tools/wasm/master-parity.mjs states
+        // a TOLERANCE (1e-5 in sample value, 1e-3 dB in the reported numbers), not byte identity, because
+        // the two roads render at two roundings by construction. ProgrammeReport, which IS byte-diffed,
+        // uses `DeterministicLoudnessMeter` instead. Moving this one would change the solver's SEARCH, not
+        // just its report, so it is a decision rather than a tidy-up — recorded here, not done in passing.
         m.integratedLufs   = lm.integratedLufs();
         m.loudnessRangeLu  = lm.loudnessRangeLu();
         m.truePeakDbTp     = peakDb (tm.truePeakLinear());
