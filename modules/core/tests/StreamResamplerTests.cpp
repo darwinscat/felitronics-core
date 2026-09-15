@@ -226,9 +226,9 @@ int main()
                     (void) restarted.produceAvailable (tmp.data(), (int) tmp.size());
                 }
             }
-            const long before = g_allocs.load();
+            const long long before = alloc::count.load();
             restarted.clearAudioState();
-            felitronics::test::okNoAlloc (g_allocs.load() == before,
+            felitronics::test::okNoAlloc (alloc::count.load() == before,
                                           std::string ("clearAudioState() allocates nothing on the ")
                                           + (identity ? "identity" : "filtering") + " path");
 

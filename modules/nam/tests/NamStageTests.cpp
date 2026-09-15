@@ -3305,10 +3305,10 @@ int main()
                 std::vector<float> left (512, 0.2f), right (512, -0.15f);
                 float* io[2] { left.data(), right.data() };
                 felitronics::test::run (stage.process (io, 2, 512, false));    // …both lanes are now dirty
-                const long before = g_allocs.load (std::memory_order_relaxed);
+                const long long before = felitronics::test::alloc::count.load();
                 stage.reset();                                                 // …with a debt to spend
                 stage.reset();                                                 // …and again, with none
-                test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                test::okNoAlloc (felitronics::test::alloc::count.load() == before,
                                  std::string ("NamStage::reset() performs no heap allocation — ") + what
                                  + " at " + std::to_string ((int) rate) + " Hz"
                                  + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
