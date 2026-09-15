@@ -12,22 +12,13 @@
 #include <felitronics/core/StreamResampler.h>
 
 #include "felitronics_test.h"
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <utility>
 #include <vector>
-
-// global allocation counter (no-alloc-in-process proof)
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using felitronics::core::StreamResampler;
 using felitronics::test::approx;
@@ -194,14 +185,14 @@ int main()
         r.reset (44100.0, 48000.0, 512 * 2 + 16);                // ALLOC lives here, message thread
         auto in = sine (512 * 8, 44100.0, 220.0);
         std::vector<float> tmp ((std::size_t) (512 * 4 + 16));
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int blk = 0; blk < 8; ++blk)
         {
             r.feed (in.data() + (std::size_t) (blk * 512), 512);
             (void) r.produceAvailable (tmp.data(), (int) tmp.size());
         }
         r.produceExact (tmp.data(), 32);
-        felitronics::test::okNoAlloc (g_allocs.load() == before, "feed/produceAvailable/produceExact allocated nothing");
+        felitronics::test::okNoAlloc (alloc::count.load() == before, "feed/produceAvailable/produceExact allocated nothing");
     }
 
     group ("\U0001f534 clearAudioState() — the stream restart WITHOUT re-deriving the kernel (P47)");

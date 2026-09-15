@@ -6,20 +6,13 @@
 // audio thread); process() does no alloc/delete; latency follows the model; the retire queue is bounded.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/neural/NeuralStage.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -89,9 +82,9 @@ int main()
         float a[512], b[512]; for (int i = 0; i < 512; ++i) { a[i] = 0.2f; b[i] = 0.2f; }
         float* io[2] { a, b };
         GainInference::dtors.store (0);
-        const long beforeNew = g_allocs.load();
+        const long long beforeNew = alloc::count.load();
         felitronics::test::run (stage.process (io, 2, 512)); felitronics::test::run (stage.process (io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == beforeNew, "process() did not allocate");
+        test::okNoAlloc (alloc::count.load() == beforeNew, "process() did not allocate");
         test::ok (GainInference::dtors.load() == 0, "process() did not delete");
     }
 

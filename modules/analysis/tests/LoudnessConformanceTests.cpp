@@ -19,11 +19,11 @@
 // Grown from the Looper Cat conformance suite that gated the product's move onto this meter.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/Math.h>
 #include <felitronics/analysis/LoudnessMeter.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -31,52 +31,18 @@
 #include <utility>
 #include <vector>
 
-// RT-safety witness: every allocation in this binary is counted (the TruePeakMeter suite's pattern).
-static std::atomic<long> g_allocs { 0 };
-// BYTES too: the store's size is a formula, and this counter is its oracle. It counts what the CONTAINER asked for —
-// the quantity a budget states — and on libc++ and libstdc++ that is exactly what reaches operator new. MSVC's STL on
-// x86 and x64 is the exception (<xmemory>): a block of _Big_allocation_threshold = 4096 bytes or more is aligned to 32
-// by hand, and operator new is asked for _Non_user_size more — sizeof(void*) + 31, one word more under _DEBUG. That is
-// the allocator's alignment, which a budget leaves to its caller by definition, so the counter takes it back off, and
-// the check "the byte counter counts ... as ..." below fails if what it takes off is not what this STL adds. A padded
-// block starts at 4096 + the pad, and every allocation inside the windows this file measures is a std::vector's.
-// Iterator debugging (_ITERATOR_DEBUG_LEVEL > 0, the Debug default) is NOT modelled: there every container also
-// allocates a proxy of two pointers, which a counter cannot tell from a real allocation, and that same check fails by
-// name. The rows build Release, where the level is 0.
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static constexpr std::size_t kStlBigBlock = 4096;
-static std::atomic<long long> g_bytes { 0 };
-static long long containerBytes (std::size_t s) noexcept
-{
-    return (long long) (kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s);
-}
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_bytes.fetch_add (containerBytes (s), std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-
 // One vector's allocation, as the counter sees it. The storage is written through `volatile`: an allocation nothing
 // observes may be removed by the optimizer, operator new call and all, and a counter that then reads 0 proves nothing.
 static long long vectorRequest (std::size_t n)
 {
-    const long long before = g_bytes.load();
+    const long long before = alloc::bytes.load();
     {
         std::vector<char> v;
         v.assign (n, 0);
         volatile char* sink = v.data();
         sink[0] = 1;
     }
-    return g_bytes.load() - before;
+    return alloc::bytes.load() - before;
 }
 
 using namespace felitronics;
@@ -481,9 +447,9 @@ int main()
         std::vector<float> l (4800, 0.3f), r (4800, -0.2f);
         const float* io[2] { l.data(), r.data() };
         felitronics::test::run (lm.process (io, 2, 4800));                                   // warm: the first hop
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int i = 0; i < 40; ++i) felitronics::test::run (lm.process (io, 2, 4800));     // 4 s: hops, blocks and short-term samples all fire
-        const bool noAlloc = (g_allocs.load() == before);
+        const bool noAlloc = (alloc::count.load() == before);
         test::okNoAlloc (noAlloc, "40 hops of process() did not allocate");
         test::ok (std::isfinite (lm.integratedLufs()), "and the meter still reads");
     }
@@ -598,15 +564,15 @@ int main()
         for (const Row& r : rows)
         {
             M a;
-            const long long before = g_bytes.load();
+            const long long before = alloc::bytes.load();
             felitronics::test::run (a.prepareForSamples (r.fs, 2, r.n));
-            const long long got = g_bytes.load() - before;
+            const long long got = alloc::bytes.load() - before;
             test::ok (got == (long long) r.bytes,
                       "prepareForSamples(" + std::to_string ((long long) r.fs) + " Hz) allocates exactly the formula");
             M b;
-            const long long before2 = g_bytes.load();
+            const long long before2 = alloc::bytes.load();
             felitronics::test::run (b.prepare (r.fs, 2, r.n / r.fs));
-            const long long got2 = g_bytes.load() - before2;
+            const long long got2 = alloc::bytes.load() - before2;
             test::ok (got2 == (long long) r.bytes, "and the seconds form allocates the same store");
         }
 

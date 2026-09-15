@@ -6,24 +6,15 @@
 // and no-allocation-in-process().
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/dynamics/Compressor.h>
 #include <felitronics/core/Math.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <vector>
-
-// global allocation counter (no-alloc-in-process proof)
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -129,10 +120,10 @@ int main()
         prep (comp, fs, n, 2, 10.0);
         dynamics::CompressorParams p; p.thresholdDb = -30.0; p.ratio = 4.0; p.lookaheadMs = 2.0;
         comp.setParams (p);                      // allocations allowed up to here
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (comp.process (ch, 2, n));
         felitronics::test::run (comp.process (ch, 2, n));
-        const long after = g_allocs.load();
+        const long long after = alloc::count.load();
         test::okNoAlloc (after == before, "process() performed zero heap allocations");
     }
 

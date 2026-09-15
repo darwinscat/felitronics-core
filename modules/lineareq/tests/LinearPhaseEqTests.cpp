@@ -9,22 +9,14 @@
 //       and applies the bell's gain to a tone; (6) process() never allocates; latency = N/2.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/Math.h>
 #include <felitronics/lineareq/LinearPhaseEq.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using LPE = lineareq::LinearPhaseEq;
@@ -127,9 +119,9 @@ int main()
         eq::BandParams b[1]; b[0].on = true; b[0].type = eq::FilterType::Bell; b[0].lane (eq::Lane::Stereo).freq = 2000.0; b[0].lane (eq::Lane::Stereo).gainDb = -4.0; e.setBands (b, 1);
         std::vector<float> L (512, 0.3f), R (512, -0.2f); float* io[2] { L.data(), R.data() };
         felitronics::test::run (e.process (io, 2, 512));
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (e.process (io, 2, 512)); felitronics::test::run (e.process (io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (alloc::count.load() == before, "process() did not allocate");
         test::ok (e.latencySamples() == N / 2, "latencySamples() == N/2");
     }
 

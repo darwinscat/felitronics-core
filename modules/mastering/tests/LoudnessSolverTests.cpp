@@ -15,9 +15,9 @@
 
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -28,16 +28,6 @@
 #include <string>
 #include <tuple>
 #include <vector>
-
-// The allocation counter, the module suites' idiom — a COUNT only (no bytes, so no allocator's padding to reason
-// about): P41 needs "a refused prepare() allocates nothing" counted rather than read off the source.
-static std::atomic<long long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using namespace felitronics::mastering;
@@ -2864,9 +2854,9 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // kept. The delta is read into a local before the check.
     {
         TargetLoudnessSolver fine;
-        const long long before = g_allocs.load();
+        const long long before = alloc::count.load();
         const bool refused = ! fine.prepare (48000.0, 2, 1024, 64, 4, 1.0e-7);
-        const long long allocs = g_allocs.load() - before;
+        const long long allocs = alloc::count.load() - before;
         test::ok (refused && allocs == 0 && TargetLoudnessSolver::prepareBytes (1024, 64, 4, 1.0e-7) == 0,
                   "a prepare() refused on its bin width allocates nothing, and its budget is 0");
     }

@@ -14,24 +14,14 @@
 
 #include <felitronics/core/DeliveryResampler.h>
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
-#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <new>
 #include <vector>
-
-static std::atomic<long long> g_allocs { 0 };
-static std::atomic<long long> g_allocBytes { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); g_allocBytes.fetch_add ((long long) s, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using felitronics::core::DeliveryResampler;
 using felitronics::core::exactlyEqual;
@@ -527,18 +517,18 @@ static void testContract()
                     const auto p = params (pr.first, pr.second);
                     const std::uint64_t want = DeliveryResampler::prepareBytes (p, ch, blk);
                     DeliveryResampler r;
-                    const long long before = g_allocBytes.load();
+                    const long long before = alloc::rawBytes.load();
                     const bool accepted = r.prepare (p, ch, blk);
-                    const long long asked = g_allocBytes.load() - before;
+                    const long long asked = alloc::rawBytes.load() - before;
                     ok (accepted && want > 0u, "a valid geometry prepares and has a budget");
                     okNoAlloc ((std::uint64_t) asked == want, "the budget is the bytes prepare() requested");
                 }
         const auto bad = params (44100.5, 48000.0);
         DeliveryResampler r;
         // Both reads bracket ONLY the calls under test: ok()'s message is a std::string and allocates.
-        const long long before = g_allocBytes.load();
+        const long long before = alloc::rawBytes.load();
         const bool refused = DeliveryResampler::prepareBytes (bad, 2, 512) == 0u && ! r.prepare (bad, 2, 512);
-        const long long after = g_allocBytes.load();
+        const long long after = alloc::rawBytes.load();
         ok (refused, "a refused geometry budgets 0 and refuses");
         okNoAlloc (after == before, "…and asks the heap for nothing on the way to saying no");
         ok (DeliveryResampler::prepareBytes (params (48000.0, 44100.0), 0, 512) == 0u, "zero channels budgets 0");
@@ -554,14 +544,14 @@ static void testContract()
         float* op[2] = { out.data(), out.data() };
         int n = 0;
         (void) r.process (ip, 2, 1024, op, (int) out.size(), n);
-        const long long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int k = 0; k < 4; ++k) (void) r.process (ip, 2, 1024, op, (int) out.size(), n);
         (void) r.process (ip, 2, 4096, op, (int) out.size(), n);         // chunked
         (void) r.process (ip, 1, 1024, op, (int) out.size(), n);         // falling edge
         (void) r.process (nullptr, 0, 100000, nullptr, 0, n);            // gap, closed-form clock
         (void) r.flush (2, op, (int) out.size(), n);
         r.reset();
-        okNoAlloc (g_allocs.load() == before, "none of those allocated");
+        okNoAlloc (alloc::count.load() == before, "none of those allocated");
     }
 }
 

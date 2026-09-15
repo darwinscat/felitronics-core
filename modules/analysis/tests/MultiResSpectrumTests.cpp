@@ -9,9 +9,9 @@
 // depend on the UI rate. Adversarial cases come from the design consilium (codex + deepseek + Fable).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/MultiResSpectrumPane.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -19,14 +19,6 @@
 #include <limits>
 #include <memory>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using felitronics::test::ok;
@@ -685,12 +677,12 @@ int main()
         count = 0; p.buildColumns (z, fs, 0.0, 1000.0, [&] (int, float, float, float) { ++count; });
         ok (count == 257, "a zero-width map still emits the minimum 257 columns");
 
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         streamFrames (p, [&] { return r.uni(); }, 3);
         p.starve();
         p.buildColumns (pm, fs, 4.5, 1000.0, [] (int, float, float, float) {});
         (void) p.readDb (1000.0, fs); (void) p.tierAt (1000.0, fs);
-        test::okNoAlloc (g_allocs.load() == before, "ingest / starve / buildColumns / reads allocate nothing");
+        test::okNoAlloc (alloc::count.load() == before, "ingest / starve / buildColumns / reads allocate nothing");
     }
 
     return test::report();

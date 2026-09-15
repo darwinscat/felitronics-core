@@ -5,6 +5,7 @@
 // because its parser is registered from linear.cpp, also guards the WHOLE_ARCHIVE link contract.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/nam/NamStage.h>
 #include <felitronics/core/StreamResampler.h>   // the delay geometry is ASKED of the class, never restated
 
@@ -23,14 +24,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t size) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (size ? size : 1); }
-void* operator new[]    (std::size_t size) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (size ? size : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 namespace
 {
@@ -1550,12 +1543,12 @@ int main()
             // Compare identical architectures and equal-width tags. No wall-clock threshold:
             // rejection before backend construction/Reset must avoid their allocations.
             const auto rejected = lstmModel ("96000");
-            auto before = g_allocs.load();
+            auto before = alloc::count.load();
             auto acceptedHandle = NamStage::prepareModel (json.data(), json.size(), 48000.0, 512);
-            const auto acceptedAllocs = g_allocs.load() - before;
-            before = g_allocs.load();
+            const auto acceptedAllocs = alloc::count.load() - before;
+            before = alloc::count.load();
             auto rejectedHandle = NamStage::prepareModel (rejected.data(), rejected.size(), 48000.0, 512);
-            const auto rejectedAllocs = g_allocs.load() - before;
+            const auto rejectedAllocs = alloc::count.load() - before;
             test::ok (acceptedHandle != nullptr && rejectedHandle == nullptr, "allocation comparison has both outcomes");
             test::ok (rejectedAllocs < acceptedAllocs, "rate rejection avoids backend/prewarm allocations");
         }
@@ -3226,10 +3219,10 @@ int main()
             std::vector<float> left (512, 0.2f), right (512, -0.15f);
             float* io[2] { left.data(), right.data() };
             felitronics::test::run (stage.process (io, 2, 512, false));    // warm every process-reachable container
-            const long before = g_allocs.load (std::memory_order_relaxed);
+            const long long before = alloc::count.load (std::memory_order_relaxed);
             felitronics::test::run (stage.process (io, 2, 512, false));
             felitronics::test::run (stage.process (io, 2, 512, true));
-            test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+            test::okNoAlloc (alloc::count.load (std::memory_order_relaxed) == before,
                              "NamStage::process performs no heap allocation at "
                              + std::to_string ((int) rate) + " Hz"
                              + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));
@@ -3253,10 +3246,10 @@ int main()
                     test::ok (load (stage, json), "first-call fixture loads");
                     std::vector<float> left (512, 0.2f), right (512, -0.15f);
                     float* io[2] { left.data(), right.data() };
-                    const long before = g_allocs.load (std::memory_order_relaxed);
+                    const long long before = alloc::count.load (std::memory_order_relaxed);
                     felitronics::test::run (stage.process (io, width, 512, false));
                     felitronics::test::run (stage.process (io, width, 512, false));
-                    test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+                    test::okNoAlloc (alloc::count.load (std::memory_order_relaxed) == before,
                                      std::string ("the FIRST call after a prepare allocates nothing — width ")
                                      + std::to_string (width) + ", "
                                      + (impl != nullptr ? "direct" : "the FFT engine") + ", "
@@ -3276,13 +3269,13 @@ int main()
             test::ok (load (stage, json), "drain fixture model loads at " + std::to_string ((int) rate));
             std::vector<float> left (512, 0.2f), right (512, -0.15f);
             float* io[2] { left.data(), right.data() };
-            const long before = g_allocs.load (std::memory_order_relaxed);   // …counted from the FIRST drain
+            const long long before = alloc::count.load (std::memory_order_relaxed);   // …counted from the FIRST drain
             felitronics::test::run (stage.process (io, 2, 512, false));
             felitronics::test::run (stage.process (io, 0, 512, false));
             felitronics::test::run (stage.process (io, 1, 512, false));    // lane 1 drains beside a live lane 0
             felitronics::test::run (stage.process (nullptr, 0, 512, false));   // …and with no buffers at all
             felitronics::test::run (stage.process (io, 2, 512, false));
-            test::okNoAlloc (g_allocs.load (std::memory_order_relaxed) == before,
+            test::okNoAlloc (alloc::count.load (std::memory_order_relaxed) == before,
                              "…nor when an absent lane is being DRAINED at "
                              + std::to_string ((int) rate) + " Hz"
                              + (rate == 48000.0 ? " (no resampler in the path)" : " (resampler ACTIVE)"));

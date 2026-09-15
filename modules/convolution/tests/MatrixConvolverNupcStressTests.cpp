@@ -11,60 +11,21 @@
 // reproducer (seed + config).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/NonUniformConvolver.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <new>
 #if defined(_WIN32)
  #include <malloc.h>
 #endif
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-static inline void* countedAlignedNew (std::size_t s, std::align_val_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-    const std::size_t al = (std::size_t) a < sizeof (void*) ? sizeof (void*) : (std::size_t) a;
-   #if defined(_WIN32)
-    void* p = _aligned_malloc (s ? s : 1, al);
-   #else
-    void* p = nullptr; if (::posix_memalign (&p, al, s ? s : 1) != 0) p = nullptr;
-   #endif
-   #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-    if (p == nullptr) throw std::bad_alloc();
-   #else
-    if (p == nullptr) std::abort();   // the wasm-audio tier compiles -fno-exceptions, where `throw` is a PARSE error
-   #endif
-    return p;
-}
-static inline void countedAlignedFree (void* p) noexcept
-{
-   #if defined(_WIN32)
-    _aligned_free (p);
-   #else
-    std::free (p);
-   #endif
-}
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, a); }
-void  operator delete   (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { countedAlignedFree (p); }
 
 using namespace felitronics;
 using MCN = convolution::MatrixConvolverNupc<>;
@@ -251,8 +212,8 @@ int main()
         MCN mf; mf.prepare (128, 131072, 128, 2); mf.setOperator (MCN::Topology::Full, bk, 4, L);
         std::vector<float> l (4096, 0.1f), rr (4096, -0.1f); const float* sin[2] { l.data(), rr.data() }; float* so[2] { l.data(), rr.data() };
         felitronics::test::run (mf.process (sin, so, 2, 4096));
-        const long before = g_allocs.load(); felitronics::test::run (mf.process (sin, so, 2, 4096));
-        test::okNoAlloc (g_allocs.load() == before, "no heap allocation in a stress Full process()");
+        const long long before = alloc::count.load(); felitronics::test::run (mf.process (sin, so, 2, 4096));
+        test::okNoAlloc (alloc::count.load() == before, "no heap allocation in a stress Full process()");
 
         // NaN in must not crash or hang (output may be NaN — we only require it returns + doesn't corrupt state)
         std::vector<float> xn ((std::size_t) N, 0.1f); xn[(std::size_t) 3000] = std::numeric_limits<float>::quiet_NaN();

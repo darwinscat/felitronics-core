@@ -18,6 +18,7 @@
 // of defect this suite exists to catch.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <ebu_tech3341_truepeak.h>
 
 #include "fcore_probe.h"
@@ -27,22 +28,12 @@
 #include <felitronics/core/Math.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
-
-// RT-safety witness: every allocation in this binary is counted (the LoudnessMeter suite's pattern).
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -735,9 +726,9 @@ int main()
         fcore::Probe p; p.prepare (48000.0, 2);
         const auto base = ptrs (prog);
         p.process (base.data(), 2, 4800);                       // warm: first hop, first block
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         p.process (base.data(), 2, (long long) prog[0].size()); // every internal chunk step, hops and blocks
-        test::okNoAlloc (g_allocs.load() == before, "a full pass through process() allocated nothing");
+        test::okNoAlloc (alloc::count.load() == before, "a full pass through process() allocated nothing");
         test::ok (std::isfinite (p.integratedLufs()), "and it still reads");
     }
 

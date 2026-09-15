@@ -69,11 +69,11 @@
 // not rebuild, and the stand would then report the OLD binary's result as the mutant's.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/ProgrammeReport.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -83,14 +83,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using PR     = analysis::ProgrammeReport;
@@ -140,7 +132,7 @@ static Out run (const Planes& p, double fs, int maxBlock, const std::vector<int>
     a.setTraceBuffer (buf.data(), buf.size());
 
     const std::size_t frames = p.empty() ? 0u : p[0].size();
-    const long before = g_allocs.load();
+    const long long before = alloc::count.load();
     std::size_t at = 0, k = 0;
     while (at < frames)
     {
@@ -150,7 +142,7 @@ static Out run (const Planes& p, double fs, int maxBlock, const std::vector<int>
         at += (std::size_t) n;
     }
     a.finish();
-    o.allocsInProcess = g_allocs.load() - before;
+    o.allocsInProcess = alloc::count.load() - before;
     o.R = a.report();
     o.traceOverflow = a.traceOverflow();
     o.trace.assign (buf.begin(), buf.begin() + (std::size_t) a.traceCount());
@@ -536,9 +528,9 @@ static void testStorageAndRefusals()
         // which is what "a prepared one keeps storage that still fits" has to mean.
         PR a;
         a.setParams (pm);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         test::run (a.prepare (kFs, 512, 2));
-        const long first = g_allocs.load() - before;
+        const long long first = alloc::count.load() - before;
         test::ok (first > 0, "a fresh prepare() allocates (" + std::to_string (first) + " requests)");
         // THE DELTA IS CAPTURED BEFORE test::ok IS CALLED, and that is not style. `test::ok` takes a
         // std::string, so the message allocates; the order in which a compiler evaluates the two arguments
@@ -546,9 +538,9 @@ static void testStorageAndRefusals()
         // under gcc 14.2/libstdc++ on deb, i.e. it failed on one row for a reason that has nothing to do
         // with prepare(). An isolated probe with no strings in it reads 0 on both, which is what is
         // actually being asserted here.
-        const long mid = g_allocs.load();
+        const long long mid = alloc::count.load();
         test::run (a.prepare (kFs, 512, 2));
-        const long again = g_allocs.load() - mid;
+        const long long again = alloc::count.load() - mid;
         test::ok (again == 0, "the same prepare() again asks the heap for nothing (got "
                               + std::to_string (again) + ")");
 
@@ -1502,7 +1494,7 @@ static void testEdges()
         test::run (a.prepare (kFs, 1024, 2));
         a.setTraceBuffer (buf.data(), buf.size());
         const auto v = ptrs (p, 0);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (std::size_t at = 0; at < p[0].size(); )
         {
             const int n = (int) std::min<std::size_t> (997, p[0].size() - at);
@@ -1511,12 +1503,12 @@ static void testEdges()
             at += (std::size_t) n;
         }
         a.finish();
-        const long calls = g_allocs.load() - before;
+        const long long calls = alloc::count.load() - before;
         // `ptrs` itself allocates a vector per call, so the count is taken against a run that does the same
         // work without the analyzer: what is asserted is that the analyzer adds nothing.
         long baseline = 0;
         {
-            const long b0 = g_allocs.load();
+            const long long b0 = alloc::count.load();
             for (std::size_t at = 0; at < p[0].size(); )
             {
                 const int n = (int) std::min<std::size_t> (997, p[0].size() - at);
@@ -1524,7 +1516,7 @@ static void testEdges()
                 (void) vv;
                 at += (std::size_t) n;
             }
-            baseline = g_allocs.load() - b0;
+            baseline = alloc::count.load() - b0;
         }
         test::okNoAlloc (calls == baseline, "process() + finish() allocate nothing of their own (got "
                                             + std::to_string (calls) + " against " + std::to_string (baseline) + ")");

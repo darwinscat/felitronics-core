@@ -9,40 +9,15 @@
 
 #include <felitronics/mastering/DeliveredMastering.h>
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <new>
 #include <string>
 #include <vector>
-
-// The counter counts what a CONTAINER asked for. MSVC's STL on x86/x64 asks operator new for sizeof(void*) + 31 bytes
-// more on every block of 4096 or more — its own alignment — and the counter takes that back off; the rule and its
-// measurement are MasteringChainTests.cpp's (the `win` row found it there first).
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static long long containerBytes (std::size_t s) noexcept
-{
-    return (long long) (kStlBigPad != 0 && s >= 4096 + kStlBigPad ? s - kStlBigPad : s);
-}
-static std::atomic<long long> g_allocs { 0 }, g_bytes { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1); g_bytes.fetch_add (containerBytes (s)); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using namespace felitronics::mastering;
@@ -220,9 +195,9 @@ static void testRenderRefusesAndAllocatesNothing()
     ok (! dm.render (chain, r, p.in, 1, n, p.out, d), "a width that is not the converter's is refused");
     ok (! unprepared.render (chain, r, p.in, kNch, n, p.out, d), "an unprepared converter is refused");
 
-    const long long allocs = g_allocs.load();
+    const long long allocs = alloc::count.load();
     const bool rendered = dm.render (chain, r, p.in, kNch, n, p.out, d);
-    const long long asked = g_allocs.load() - allocs;
+    const long long asked = alloc::count.load() - allocs;
     ok (rendered && asked == 0, "the render asks the heap for nothing (" + std::to_string (asked) + ")");
 
     // THE CONVERTER'S BLOCK IS FREE — the class's own and the renderer's.
@@ -289,9 +264,9 @@ static void testSolveAndRangeAreTheComposition()
         const long long identity = (pr.a == pr.b) ? 1 : 0;
         const std::uint64_t lraBudget = DeliveredMastering::measureRangeBytes (pr.a, pr.b, kNch, n);
         double lra = -2.0;
-        long long before = g_bytes.load();
+        long long before = alloc::bytes.load();
         const bool lra2 = dm.measureInputLoudnessRange (s2, pg.in, kNch, n, lra);
-        const long long lraBytes = g_bytes.load() - before;
+        const long long lraBytes = alloc::bytes.load() - before;
         ok (lra1 && lra2 && lra == lraOracle, tag + "the range is the hand composition's, exactly");
         ok (lraBytes == (long long) lraBudget, tag + "and allocates its budget (" + std::to_string (lraBytes) + " against "
             + std::to_string (lraBudget) + ")");
@@ -300,9 +275,9 @@ static void testSolveAndRangeAreTheComposition()
             tag + "which is the meter at the delivered length plus the converted programme — none at equal rates");
 
         const std::uint64_t solveBudget = DeliveredMastering::solveBytes (pr.a, pr.b, kNch, n);
-        before = g_bytes.load();
+        before = alloc::bytes.load();
         const LoudnessSolution sg = dm.solve (s2, c2, r2, params, pg.in, kNch, n, pg.out, d, req);
-        const long long solveBytes = g_bytes.load() - before;
+        const long long solveBytes = alloc::bytes.load() - before;
         ok (sg.status == so.status && sg.preLimiterGainDb == so.preLimiterGainDb && sg.ceilingDbTp == so.ceilingDbTp
             && sg.passes == so.passes && sg.passes > 0, tag + "the search's verdict is the hand composition's");
         ok (bitDiff (oracle, got) == 0, tag + "and so is its delivered audio, bit for bit");
@@ -327,9 +302,9 @@ static void testSolveAndRangeAreTheComposition()
         double v = 0.0;
         ok (DeliveredMastering::measureRangeBytes (a, b, kNch, 132300) > 0u && dm.measureInputLoudnessRange (s, p.in, kNch, 132300, v),
             "3 s delivered: budgeted and measured");
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool refused = ! dm.measureInputLoudnessRange (s, p.in, kNch, 132299, v);
-        const long long asked = g_bytes.load() - before;
+        const long long asked = alloc::bytes.load() - before;
         ok (DeliveredMastering::measureRangeBytes (a, b, kNch, 132299) == 0u && refused && asked == 0,
             "one frame short: budgeted 0, refused, nothing allocated");
     }
@@ -350,11 +325,11 @@ static void testSolveRefusals()
     std::vector<float> out ((std::size_t) (d * kNch), 0.0f);
     Planes p = planes (in, n, out, d);
     const MasteringChainParams params;
-    long long before = g_bytes.load();
+    long long before = alloc::bytes.load();
     const auto st1 = unprepared.solve (s, chain, r, params, p.in, kNch, n, p.out, d, req).status;
     const auto st2 = dm.solve (s, wrongRate, r, params, p.in, kNch, n, p.out, d, req).status;
     const auto st3 = dm.solve (s, chain, r, params, p.in, kNch, n, p.out, d + 1, req).status;
-    const long long asked = g_bytes.load() - before;
+    const long long asked = alloc::bytes.load() - before;
     ok (st1 == MasteringSolveStatus::NotPrepared, "an unprepared converter: NotPrepared");
     ok (st2 == MasteringSolveStatus::InvalidRequest, "a chain at the source rate: InvalidRequest");
     ok (st3 == MasteringSolveStatus::InvalidRequest, "a delivered length that is not the converter's: InvalidRequest");
@@ -368,9 +343,9 @@ static void testSolveRefusals()
     for (double aim : { std::numeric_limits<double>::quiet_NaN(), -0.01, std::numeric_limits<double>::infinity() })
     {
         LoudnessRequest bad = req; bad.truePeakAimDb = aim;
-        const long long b0 = g_bytes.load();
+        const long long b0 = alloc::bytes.load();
         const auto st = dm.solve (s, chain, r, params, p.in, kNch, n, p.out, d, bad).status;
-        const long long asked = g_bytes.load() - b0;
+        const long long asked = alloc::bytes.load() - b0;
         ok (! s.admits (chain, r, kNch, (int) d, bad, why) && why == MasteringSolveStatus::InvalidRequest
             && st == MasteringSolveStatus::InvalidRequest && asked == 0,
             "a true-peak aim of " + std::to_string (aim) + ": refused by admits and by the delivered solve, nothing allocated");
@@ -400,9 +375,9 @@ static void testRefusalsWriteAndAllocateNothing()
     {
         std::vector<float> out = sentinel;
         Planes p = planes (in, n, out, d);
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         const bool accepted = call (p);
-        const long long asked = g_bytes.load() - before;
+        const long long asked = alloc::bytes.load() - before;
         ok (! accepted && out == sentinel && asked == 0,
             std::string (what) + ": refused, the output untouched, nothing allocated (" + std::to_string (asked) + " B)");
     };
@@ -421,10 +396,10 @@ static void testRefusalsWriteAndAllocateNothing()
                                                != MasteringSolveStatus::InvalidRequest; });
     {
         double v = -1.0;
-        const long long before = g_bytes.load();
+        const long long before = alloc::bytes.load();
         Planes p = planes (in, n, const_cast<std::vector<float>&> (sentinel), d);
         const bool measured = dm.measureInputLoudnessRange (sWrongRate, p.in, kNch, n, v);
-        const long long asked = g_bytes.load() - before;
+        const long long asked = alloc::bytes.load() - before;
         ok (! measured && v == -1.0 && asked == 0,
             "a range measured by a solver at the SOURCE rate is refused — it would meter 96 kHz samples on a 48 kHz grid");
     }
@@ -596,11 +571,11 @@ static void testCreateBudget()
 
     const std::uint64_t budget = DeliveredMastering::createBytes (48000.0, 96000.0, kNch, MasteringChainConfig {}, kBlock);
     const std::uint64_t chainOnly = createBytes (96000.0, kNch, MasteringChainConfig {}, kBlock);
-    const long long before = g_bytes.load();
+    const long long before = alloc::bytes.load();
     {
         DeliveredMastering dm;
         const bool okPrep = dm.prepare (48000.0, 96000.0, kNch, kBlock);
-        const long long got = g_bytes.load() - before;
+        const long long got = alloc::bytes.load() - before;
         ok (okPrep && got == (long long) (budget - chainOnly), "preparing the converter allocates its part of the budget, to the byte ("
             + std::to_string (got) + ")");
     }

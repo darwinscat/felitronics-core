@@ -38,6 +38,7 @@
 //   B1-B9 sag / presence / depth / virtual load / output transformer / dynamic bias
 
 #include <felitronics_test.h>   // felitronics::test::run — law 11 verdicts
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>
@@ -48,19 +49,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <limits>
-#include <new>
 #include <string>
 #include <vector>
-
-// Global allocation counter for the RT no-alloc assertion (X11): process() must not allocate. Setup
-// (prepare/vectors) runs before the counter is read, so only the bracketed process() calls are measured.
-namespace { std::atomic<long> g_allocs { 0 }; }
-void* operator new      (std::size_t n)         { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (n ? n : 1); }
-void* operator new[]    (std::size_t n)         { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (n ? n : 1); }
-void  operator delete   (void* p)      noexcept { std::free (p); }
-void  operator delete[] (void* p)      noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using felitronics::poweramp::PowerAmpStage;
 using felitronics::poweramp::SagEnvelope;
@@ -664,10 +654,10 @@ int main()
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
         std::vector<float> buf (kMaxBlk, 0.2f); float* io[1] { buf.data() };
         for (int w = 0; w < 8; ++w) { d.setParams (P (24.0f, false, 1)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }   // warm up (not counted)
-        const long before = g_allocs.load (std::memory_order_relaxed);
+        const long long before = alloc::count.load (std::memory_order_relaxed);
         for (int k = 0; k < 64; ++k) { d.setParams (P (24.0f, (k & 1) != 0, k & 3)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }   // vary params + topology too
-        const long allocs = g_allocs.load (std::memory_order_relaxed) - before;
-        std::printf ("       X11 heap allocations across 64 process()+setParams calls = %ld\n", allocs);
+        const long long allocs = alloc::count.load (std::memory_order_relaxed) - before;
+        std::printf ("       X11 heap allocations across 64 process()+setParams calls = %lld\n", allocs);
         check (allocs == 0, "X11 process()/setParams perform ZERO heap allocations (the RT rule, asserted)");
     }
     // X12: non-finite PARAMS (NaN driveDb / Inf outputDb — a bad preset or non-parameter-system caller) must
@@ -729,9 +719,9 @@ int main()
         TubePowerAmp d; d.prepare (kSr, kMaxBlk, 4);
         std::vector<float> buf (kMaxBlk, 0.5f); float* io[1] { buf.data() };
         for (int w = 0; w < 16; ++w) { d.setParams (Pf (24.0f, false, 2, 1.0f, 1.0f, 1.0f)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }
-        const long before = g_allocs.load (std::memory_order_relaxed);
+        const long long before = alloc::count.load (std::memory_order_relaxed);
         for (int k = 0; k < 64; ++k) { d.setParams (Pf (24.0f, (k & 1) != 0, k & 3, 1.0f, 0.7f, 0.7f)); felitronics::test::run (d.process (io, 1, kMaxBlk)); }
-        check (g_allocs.load (std::memory_order_relaxed) - before == 0, "B4 feel ON: process()/setParams ZERO allocations (RT rule)");
+        check (alloc::count.load (std::memory_order_relaxed) - before == 0, "B4 feel ON: process()/setParams ZERO allocations (RT rule)");
         check (d.latencySamples() == kLat, (std::string ("B4 feel ON: latency still ") + std::to_string (kLat)).c_str());
         std::vector<float> src ((std::size_t) 4096, 0.0f); { unsigned long long s = 3; for (auto& x : src) { s = s * 6364136223846793005ULL + 1ULL; x = 0.6f * ((float) ((s >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f); } }
         std::vector<int> b512 { 512 }, hostile { 1, 7, 64, 333, 512, 128 };

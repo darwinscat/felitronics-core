@@ -25,56 +25,16 @@
 
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
-#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
-#include <new>
 #include <random>
 #include <string>
 #include <vector>
-
-// The allocation counter the RT check reads. Counting only — the budgets are pinned in MasteringChainTests.
-static std::atomic<long long> g_allocs { 0 };
-// No `throw` anywhere in here: the wasm-audio tier builds with -fno-exceptions (it caught the first draft).
-void* operator new   (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[] (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new   (std::size_t s, const std::nothrow_t&) noexcept { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[] (std::size_t s, const std::nothrow_t&) noexcept { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-// The OVER-ALIGNED forms too — the EQ engine is built through one, and a counter without them cannot see an
-// aligned allocation the mix path might grow (the code-review round). Same allocator as MasteringChainTests.
-static void* alignedNew (std::size_t s, std::align_val_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-#if defined(_MSC_VER)
-    return _aligned_malloc (s ? s : 1, (std::size_t) a);
-#else
-    const std::size_t al = (std::size_t) a < sizeof (void*) ? sizeof (void*) : (std::size_t) a;
-    void* p = nullptr;
-    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
-#endif
-}
-static void alignedFree (void* p) noexcept
-{
-#if defined(_MSC_VER)
-    _aligned_free (p);
-#else
-    std::free (p);
-#endif
-}
-void* operator new   (std::size_t s, std::align_val_t a) { return alignedNew (s, a); }
-void* operator new[] (std::size_t s, std::align_val_t a) { return alignedNew (s, a); }
-void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using felitronics::test::ok;
@@ -744,7 +704,7 @@ static void testNoAllocation()
     felitronics::test::run (chain.process (px, nch, 1024));           // warm-up, outside the counted region
     chain.reset();
 
-    const long long before = g_allocs.load();
+    const long long before = alloc::count.load();
     at (0);    felitronics::test::run (chain.process (px, nch, 5000));
     chain.setParams (p0);
     at (5000); felitronics::test::run (chain.process (px, nch, 5000));
@@ -753,7 +713,7 @@ static void testNoAllocation()
     chain.setParams (pm);
     at (15000); felitronics::test::run (chain.process (px, nch, 5000));
     (void) chain.resolved();
-    const long long after = g_allocs.load();
+    const long long after = alloc::count.load();
     okNoAlloc (after == before, "process() at mix 0.5, 0, 1 and 0.37 with the changes between allocates nothing ("
                                 + std::to_string (after - before) + ")");
 }

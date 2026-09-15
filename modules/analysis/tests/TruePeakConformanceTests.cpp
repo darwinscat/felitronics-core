@@ -24,6 +24,7 @@
 // reconstruction — not a clamp on the input samples, which +-1.0 would survive. Design-neutral either way.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <ebu_tech3341_truepeak.h>
 
 #include <felitronics/analysis/TruePeakMeter.h>
@@ -35,15 +36,6 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-
-// RT-safety witness: every allocation in this binary is counted (the LoudnessMeter suite's pattern).
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using namespace felitronics::test::ebu3341;
@@ -185,12 +177,12 @@ int main()
         analysis::TruePeakMeter m;
         felitronics::test::run (m.prepare (48000.0, 1024, 2));
         const float* io[2] { ch.data(), ch.data() };
-        const long before = g_allocs.load (std::memory_order_relaxed);
+        const long long before = alloc::count.load (std::memory_order_relaxed);
         felitronics::test::run (m.process (io, 2, (int) ch.size()));
         // Snapshot the verdict BEFORE calling the harness: okNoAlloc takes a std::string, whose temporary is
         // long enough to heap-allocate, and the order in which the two arguments are evaluated is
         // unspecified. Reading the counter inside the call is a coin flip on the compiler.
-        const bool noAlloc = (g_allocs.load (std::memory_order_relaxed) == before);
+        const bool noAlloc = (alloc::count.load (std::memory_order_relaxed) == before);
         test::okNoAlloc (noAlloc, "a whole Table 1 signal through process() allocates nothing");
     }
 

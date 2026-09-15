@@ -14,24 +14,16 @@
 // channel — a zero-latency convolver then outputs exactly that column of the matrix (yL,yR) = (h_XL, h_XR).
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/Math.h>
 #include <felitronics/lineareq/LinearPhaseEq.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
 
-#include <atomic>
 #include <complex>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -218,9 +210,9 @@ int main()
         e.setBands (full, 2);
         std::vector<float> L (512, 0.2f), R (512, -0.1f); float* io[2] { L.data(), R.data() };
         felitronics::test::run (e.process (io, 2, 512));                                            // consume the fade-in
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (e.process (io, 2, 512)); felitronics::test::run (e.process (io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate on the Full matrix path");
+        test::okNoAlloc (alloc::count.load() == before, "process() did not allocate on the Full matrix path");
     }
 
     // --- (5) NON-STEREO bus: the v2 rule (nc != 2 => ST lane only) holds in the FIR path too ---

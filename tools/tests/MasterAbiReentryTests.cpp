@@ -13,35 +13,25 @@
 // out would have been a lie.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include "fc_master_abi.h"
 
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <new>
-
-static std::atomic<bool> g_reenterOnNextAlloc { false };
 static fc_master    g_target       = 0;
 static fc_status    g_inner        = FC_OK;
 static int          g_innerCalls   = 0;
 static std::int32_t g_innerLatency = -7;
 
-static void* hookedNew (std::size_t s)
+// Re-entry from INSIDE an allocation, through the shared counter's one-shot hook (alloc::onNext). It used
+// to be this file's own `operator new`, which replaced the two default-aligned forms only — so the create
+// it arms would have missed its turn entirely had the first allocation been the over-aligned one.
+static void reenterFromInsideAnAllocation() noexcept
 {
-    if (g_reenterOnNextAlloc.exchange (false))
-    {
-        g_inner = fc_master_latency (g_target, &g_innerLatency);
-        ++g_innerCalls;
-    }
-    return std::malloc (s ? s : 1);
+    g_inner = fc_master_latency (g_target, &g_innerLatency);
+    ++g_innerCalls;
 }
-void* operator new      (std::size_t s) { return hookedNew (s); }
-void* operator new[]    (std::size_t s) { return hookedNew (s); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 int main()
 {
@@ -63,7 +53,7 @@ int main()
 
     g_target = h;
     fc_master h2 = 0;
-    g_reenterOnNextAlloc = true;                        // the next allocation is inside fc_master_create
+    alloc::onNext = &reenterFromInsideAnAllocation;     // the next allocation is inside fc_master_create
     const fc_status outer = fc_master_create (&cfg, &h2);
     ok (g_innerCalls == 1, "PRECONDITION: an entry point really was called from inside another");
     ok (g_inner == FC_ERR_POISONED && g_innerLatency == -7, "the inner call answers POISONED and writes nothing");

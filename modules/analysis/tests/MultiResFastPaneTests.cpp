@@ -23,11 +23,11 @@
 // would pass while shipping a broken pane.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/MultiResSpectrumPane.h>
 #include <felitronics/analysis/MultiResSpectrumPaneFast.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -37,14 +37,6 @@
 #include <string>
 #include <tuple>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using felitronics::test::ok;
@@ -439,7 +431,7 @@ int main()
         Rng r;
         for (int t = 0; t < 3; ++t) { for (int i = 0; i < N; ++i) f->frameInput()[i] = (float) r.uni(); f->ingest (14); }
         f->buildColumns (pm, fs, 4.5, 1000.0, [] (int, float, float, float) {});
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int i = 0; i < N; ++i) f->frameInput()[i] = (float) r.uni();
         f->ingest (14);
         f->starve();
@@ -447,7 +439,7 @@ int main()
         pm.width = 640.0f;                                                 // forces a full plan rebuild
         f->buildColumns (pm, fs, 4.5, 1000.0, [] (int, float, float, float) {});
         (void) f->readDb (1000.0, fs); (void) f->tierAt (1000.0, fs);
-        test::okNoAlloc (g_allocs.load() == before, "ingest / starve / buildColumns / plan rebuild / reads allocate nothing");
+        test::okNoAlloc (alloc::count.load() == before, "ingest / starve / buildColumns / plan rebuild / reads allocate nothing");
     }
 
     return test::report();

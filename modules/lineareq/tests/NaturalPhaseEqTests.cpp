@@ -9,21 +9,13 @@
 //   (5) process() never allocates (RT-safe) and runs mono + stereo.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/lineareq/NaturalPhaseEq.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using NPE = lineareq::NaturalPhaseEq;
@@ -98,14 +90,14 @@ int main()
         std::vector<float> lch (512, 0.1f), rch (512, -0.1f);
         float* io[2] { lch.data(), rch.data() };
         felitronics::test::run (np.process (io, 2, 512));                                     // consume the initial fade-in
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (np.process (io, 2, 512));
         float* mono[1] { lch.data() };
         // LAW 11(c): a stereo-prepared natural-phase EQ convolves a 2x2 matrix, so a 1-plane call cannot
         // be honoured. It used to be accepted and do NOTHING (the matrix convolver dropped it, void), and
         // this line called that "the mono path". It is a refusal now, and it says so.
         const bool monoRefused = ! np.process (mono, 1, 512);   // recorded here, ASSERTED after the snapshot:
-        const long after = g_allocs.load();                     // test::ok builds a std::string and allocates
+        const long long after = alloc::count.load();   // test::ok builds a std::string and allocates
         test::ok (monoRefused, "a mono call on a STEREO-prepared engine is refused (law 11c)");
         test::okNoAlloc (after == before, "process() performed zero heap allocations (stereo + mono)");
         bool finite = true; for (float v : lch) finite = finite && std::isfinite (v);

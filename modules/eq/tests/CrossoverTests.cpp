@@ -7,23 +7,15 @@
 // allpass — by nulling one `Svf` AllPass against a full `Crossover2` low+high.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/Math.h>
 #include <felitronics/eq/Svf.h>
 #include <felitronics/eq/Crossover2.h>
 #include <felitronics/eq/MultibandSplitter.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 static constexpr double kQ = 0.7071067811865476;
@@ -115,9 +107,9 @@ int main()
     {
         eq::MultibandSplitter<4> mb; mb.prepare (sr, 1); mb.setNumBands (4);
         float band[4]; mb.splitSample (0, 0.5f, band);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int i = 0; i < 512; ++i) mb.splitSample (0, 0.1f, band);
-        test::okNoAlloc (g_allocs.load() == before, "splitSample() did not allocate");
+        test::okNoAlloc (alloc::count.load() == before, "splitSample() did not allocate");
     }
 
     // --- Svf AllPass |H|≈1 across Q / freq / rate (confirms m1=-2k is correct off-Butterworth) ---

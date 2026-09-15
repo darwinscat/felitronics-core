@@ -14,6 +14,7 @@
 // invisible to a diff of two successful runs.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 
 #include <atomic>
 #include <cmath>
@@ -37,40 +38,11 @@
 // spelled here rather than shared because `operator new` has to be defined once per PROGRAM and each of
 // these suites is its own. MEASURED, not assumed: this suite was green on macOS and on deb and failed
 // eleven checks on `win` — the calibration below caught it first and by itself, reporting a 4096-double
-// vector as 32807 bytes, and the five budgets were each over by an exact multiple of 39.
-#if defined(_MSVC_STL_VERSION) && (defined(_M_IX86) || defined(_M_X64))
-#  if defined(_DEBUG)
-static constexpr std::size_t kStlBigPad = 2 * sizeof (void*) + 31;
-#  else
-static constexpr std::size_t kStlBigPad = sizeof (void*) + 31;
-#  endif
-#else
-static constexpr std::size_t kStlBigPad = 0;
-#endif
-static constexpr std::size_t kStlBigBlock = 4096;
-static std::size_t containerBytes (std::size_t s) noexcept
-{
-    return kStlBigPad != 0 && s >= kStlBigBlock + kStlBigPad ? s - kStlBigPad : s;
-}
-namespace { std::atomic<unsigned long long> g_bytes {0}; std::atomic<unsigned> g_calls {0}; std::atomic<bool> g_on {false}; }
-// std::abort() and not a null return: these are the THROWING allocation functions, and a replacement that
-// returns null on failure has a vector walking into construction through it. -fno-exceptions is the wasm
-// build's flag, not this one's, but a test binary is no place to invent a second allocation-failure
-// protocol either. (The suites this idiom is copied from return the null; that is the one thing here not
-// copied from them.)
-static void* counted (std::size_t s)
-{
-    if (g_on.load()) { g_bytes.fetch_add (containerBytes (s)); g_calls.fetch_add (1); }
-    void* p = std::malloc (s ? s : 1);
-    if (p == nullptr) std::abort();
-    return p;
-}
-void* operator new (std::size_t s)   { return counted (s); }
-void* operator new[] (std::size_t s) { return counted (s); }
-void operator delete   (void* p) noexcept { std::free (p); }
-void operator delete[] (void* p) noexcept { std::free (p); }
-void operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
+// P52: the allocation counter is `test_support/alloc_counter.h` — ONE definition per executable, and it
+// installs EVERY replaceable form, the over-aligned ones included. The private copy that used to live here
+// replaced only the two default-aligned forms, so an over-aligned request (core::AlignedVector, and every
+// analyzer scratch that rides one) was invisible to the very oracle this file exists to be. The MSVC
+// container-padding correction it carried is in the shared header too, as `alloc::containerBytes`.
 
 // The independent side of the P81 oracle: the core's own storageFor(), called here with the arguments the
 // shim is supposed to pass. Not an independent implementation of the formula — a second copy of THAT is
@@ -311,10 +283,11 @@ constexpr double        kFirstSr = 768000.0;
 template <typename F>
 unsigned long long asked (F&& f)
 {
-    g_bytes.store (0); g_calls.store (0); g_on.store (true);
+    // A DELTA, not a reset: the shared counter is always armed and other TUs in this binary may be
+    // allocating around us, so what this measures is what `f` added — which is what the budget is about.
+    const long long before = felitronics::test::alloc::bytes.load();
     f();
-    g_on.store (false);
-    return g_bytes.load();
+    return (unsigned long long) (felitronics::test::alloc::bytes.load() - before);
 }
 
 // %.17g and not %.0f. A rate of 1000.5 printed through %.0f reads "1000" — which is exactly how a
@@ -344,8 +317,10 @@ void theByteCounterCountsWhatWasAsked()
     ok (counted == 4096ull * sizeof (double),
         "the byte counter reports a 4096-double vector as " + std::to_string (counted)
         + " bytes, which is what its container asked for"
-        + (kStlBigPad != 0 ? "  [after taking back this STL's " + std::to_string (kStlBigPad)
-                             + "-byte big-block padding]" : ""));
+        + (felitronics::test::alloc::kStlBigPad != 0
+               ? "  [after taking back this STL's " + std::to_string (felitronics::test::alloc::kStlBigPad)
+                 + "-byte big-block padding]"
+               : ""));
 }
 
 // ---- before a single measurement has run ---------------------------------------------------------

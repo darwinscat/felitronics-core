@@ -28,59 +28,19 @@
 // The reference below stores its own products, so it stays the spec's arithmetic under any flag.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/analysis/StereoColumns.h>
 #include <felitronics/analysis/WaveformPeaks.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
-#include <new>
-#if defined(_MSC_VER)
- #include <malloc.h>   // _aligned_malloc / _aligned_free
-#endif
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-// The over-aligned forms go through the platform's aligned allocator (as in MasteringChainTests.cpp): MSVC has no
-// std::aligned_alloc and no posix_memalign, and memory from _aligned_malloc must be released with _aligned_free —
-// std::free on it corrupts the heap. So the aligned deletes below use the matching release, as a pair.
-static void* countedAlignedNew (std::size_t s, std::size_t a)
-{
-    g_allocs.fetch_add (1, std::memory_order_relaxed);
-#if defined(_MSC_VER)
-    return _aligned_malloc (s ? s : 1, a);
-#else
-    const std::size_t al = a < sizeof (void*) ? sizeof (void*) : a;
-    void* p = nullptr;
-    return posix_memalign (&p, al, s ? s : 1) == 0 ? p : nullptr;
-#endif
-}
-static void alignedFree (void* p) noexcept
-{
-#if defined(_MSC_VER)
-    _aligned_free (p);
-#else
-    std::free (p);
-#endif
-}
-void* operator new      (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
-void* operator new[]    (std::size_t s, std::align_val_t a) { return countedAlignedNew (s, (std::size_t) a); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete   (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete   (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
-void  operator delete[] (void* p, std::size_t, std::align_val_t) noexcept { alignedFree (p); }
 
 using namespace felitronics;
 using analysis::PeakMix;
@@ -639,12 +599,12 @@ int main()
         test::run (w.prepare (48000.0, 2, 70000, 1100, PeakMix::Max));
         test::run (s.prepare (2, 70000, 1100));
         const auto v = ptrs (p);
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         const bool a = w.process (v.data(), 2, 70000);
         const bool b = s.process (v.data(), 2, 70000);
         StereoColumns::Needle nd;
         const bool c = StereoColumns::needle (p[0].data(), p[1].data(), 70000, 0, 70000, nd);
-        test::okNoAlloc (g_allocs.load() == before && a && b && c, "WaveformPeaks::process, StereoColumns::process and needle() allocate nothing");
+        test::okNoAlloc (alloc::count.load() == before && a && b && c, "WaveformPeaks::process, StereoColumns::process and needle() allocate nothing");
     }
 
     return test::report();

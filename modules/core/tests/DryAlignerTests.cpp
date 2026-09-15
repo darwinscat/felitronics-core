@@ -8,22 +8,14 @@
 // tap change, or channel cross-talk in the shared-cursor multi-channel ring.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/DryAligner.h>
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 
@@ -250,12 +242,12 @@ int main()
         std::vector<float> l (512, 0.25f), r (512, -0.5f);
         const float* io[2] = { l.data(), r.data() };
         a.advance (io, 2, 512, 100);                        // warm call
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         a.advance (io, 2, 512, 100);
         a.advance (io, 2, 512, 3000);                       // tap jump — still no realloc
         a.reset();
         a.advance (io, 2, 512, 0);
-        test::okNoAlloc (g_allocs.load() == before, "advance()/reset() did not allocate");
+        test::okNoAlloc (alloc::count.load() == before, "advance()/reset() did not allocate");
     }
 
     return test::report();

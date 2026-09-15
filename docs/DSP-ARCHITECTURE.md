@@ -79,8 +79,8 @@ product exists (no point paying embedded's CI tax early).
 `-fno-exceptions -fno-rtti`, runs the whole self-test suite in node, and audits every emitted `.wasm`
 for shared memory or thread-shaped imports. So: an exception or RTTI use is a **compile** error; an
 incompatible dependency is a compile/link error; an allocation in `process()` is a **runtime** failure
-(emscripten is libc++, so the alloc counter in `felitronics_test.h` actually enforces there, unlike the
-libstdc++ rows). **A thread on a live code path is a LINK error** — but only because the tier links
+(emscripten is libc++, so the alloc counter — `test_support/alloc_counter.h`, asserted through
+`felitronics_test.h`'s `okNoAlloc` — actually enforces there, unlike the libstdc++ rows). **A thread on a live code path is a LINK error** — but only because the tier links
 `--wrap=pthread_create`: on its own, emscripten without `-pthread` links pthread *stubs* returning
 `ENOTSUP`, so `std::thread` compiles, links and merely aborts at runtime (measured, emsdk 6.0.9). What
 the wrap still cannot see: a thread in code never emitted (an unused inline, an uninstantiated template),
@@ -604,7 +604,11 @@ the CPU at runtime, invisible to any build. Full write-up:
 
 **These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the
 difference is worth reading rather than assuming. Today: a
-no-allocation test on the paths that install an allocation counter, a compile-only `-fno-exceptions` /
+no-allocation test on the paths that install an allocation counter — one counter, in
+`test_support/alloc_counter.h`, which replaces every form of `new` including the over-aligned one, probes
+one allocation through each of the eight before `main()` and aborts naming any that went uncounted, and is
+kept the only one by a lint (P52; before it, 50 of 61 private counters could not see an over-aligned
+allocation at all) — a compile-only `-fno-exceptions` /
 `-fno-rtti` probe over every public header on the Clang/GCC rows (MSVC spells the flags differently and is
 not a gate for it), an **Emscripten** (`wasm-audio`) build + node run, a **`long double` scan** over
 `modules/*/include` and `modules/*/src` paired with an **artifact** gate over the tier's objects (law 9),

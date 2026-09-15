@@ -19,6 +19,7 @@
 // trivially recovers. The precondition says the fixture is live; the assertion says the code is right.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/StateGrid.h>
 #include <felitronics/core/Smoother.h>
 #include <felitronics/eq/EqBand.h>
@@ -27,19 +28,10 @@
 #include <felitronics/eq/EqEngine.h>
 #include <felitronics/stereo/MonoBass.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <vector>
-
-static std::atomic<int> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using felitronics::test::ok;
@@ -886,12 +878,12 @@ int main()
         std::vector<float> v[2]; float* ch[2] {};
         for (int c = 0; c < 2; ++c) { v[c].assign (4096, 0.1f); ch[c] = v[c].data(); }
         felitronics::test::run (b.processBlock (ch, 2, 4096));
-        const int before = g_allocs.load();
+        const long long before = alloc::count.load();
         for (int k = 0; k < 20; ++k) felitronics::test::run (b.processBlock (ch, 2, 4096));
         b.reset();
         b.clearAudioState();
         for (int k = 0; k < 20; ++k) felitronics::test::run (b.processBlock (ch, 2, 1));
-        felitronics::test::okNoAlloc (g_allocs.load() == before, "no allocation across the segment loop, reset() and clearAudioState()");
+        felitronics::test::okNoAlloc (alloc::count.load() == before, "no allocation across the segment loop, reset() and clearAudioState()");
     }
 
     return felitronics::test::report();

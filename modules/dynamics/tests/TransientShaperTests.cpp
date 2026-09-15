@@ -7,22 +7,14 @@
 // follows the lookahead; process() never allocates; a linked gain preserves the stereo image.
 
 #include <felitronics_test.h>
+#include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/core/Math.h>
 #include <felitronics/dynamics/TransientShaper.h>
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-static std::atomic<long> g_allocs { 0 };
-void* operator new      (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void* operator new[]    (std::size_t s) { g_allocs.fetch_add (1, std::memory_order_relaxed); return std::malloc (s ? s : 1); }
-void  operator delete   (void* p) noexcept { std::free (p); }
-void  operator delete[] (void* p) noexcept { std::free (p); }
-void  operator delete   (void* p, std::size_t) noexcept { std::free (p); }
-void  operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 using namespace felitronics;
 using TS = dynamics::TransientShaper;
@@ -107,9 +99,9 @@ int main()
         TS ts; felitronics::test::run (ts.prepare (sr, 512, 2)); TP p; p.attackDb = 6.0; p.sustainDb = -6.0; ts.setParams (p);
         std::vector<float> l (512, 0.2f), r (512, -0.1f); float* io[2] { l.data(), r.data() };
         felitronics::test::run (ts.process (io, 2, 512));
-        const long before = g_allocs.load();
+        const long long before = alloc::count.load();
         felitronics::test::run (ts.process (io, 2, 512)); felitronics::test::run (ts.process (io, 2, 512));
-        test::okNoAlloc (g_allocs.load() == before, "process() did not allocate");
+        test::okNoAlloc (alloc::count.load() == before, "process() did not allocate");
     }
 
     // --- linked gain preserves the stereo image ---
