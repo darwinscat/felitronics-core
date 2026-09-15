@@ -109,7 +109,7 @@ jobs:
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
-        run: cmake --build build-san -j
+        run: cmake --build build-san -j 4
       - name: Test
         env:
           # LSan (Linux-only; macOS has no LeakSanitizer) → this job is where leaks fail the build. It caught
@@ -138,7 +138,7 @@ jobs:
         env: { CC: gcc-14, CXX: g++-14 }
         run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON
       - name: Build
-        run: cmake --build build-gcc14 -j
+        run: cmake --build build-gcc14 -j 4
       - name: Test
         run: |
           ctest --test-dir build-gcc14 -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
@@ -361,7 +361,7 @@ jobs:
         run: |
           cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
                 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
-          cmake --build build-wasm-checked -j
+          cmake --build build-wasm-checked -j 4
           ctest --test-dir build-wasm-checked -j4 --output-on-failure -E spectrum_pane_perf
       - name: The P0 spike artifacts still build
         run: ./tools/wasm/build.sh
@@ -374,7 +374,7 @@ jobs:
         # prove nothing, and the libsoxr precedent is exactly a clean build that died at runtime.
         run: |
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
-          cmake --build build-native -j --target fcore_measure
+          cmake --build build-native -j 4 --target fcore_measure
           node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
           # The generator claims to be deterministic by construction; this turns that into a MEASURED fact
           # on a different machine, OS and node build than the one it was written on. Recorded from two
@@ -557,7 +557,7 @@ jobs:
           # build-native was configured with tests OFF (it only needed fcore_measure); turning them on
           # re-uses its object cache and adds this one target.
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
-          cmake --build build-native -j --target felitronics_analysis_abi_tests
+          cmake --build build-native -j 4 --target felitronics_analysis_abi_tests
           ./build-native/tools/felitronics_analysis_abi_tests --storage-table > storage-native.txt
           test -s storage-native.txt
           # A table of nothing but refusals would compare clean and say nothing, which is the shape this
@@ -585,7 +585,7 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
       - name: Build eqviz
-        run: cmake --build build -j --target eqviz
+        run: cmake --build build -j 4 --target eqviz
       - name: Render quality maps
         run: mkdir -p eqviz-out && ./build/tools/eqviz eqviz-out --fs 44100,48000,96000,192000
       - uses: actions/upload-artifact@v7
@@ -608,7 +608,7 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
       - name: Build eqviz
-        run: cmake --build build -j --target eqviz
+        run: cmake --build build -j 4 --target eqviz
       - name: Render the atlas
         run: |
           mkdir -p atlas
