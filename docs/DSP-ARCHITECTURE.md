@@ -410,10 +410,16 @@ the CPU at runtime, invisible to any build. Full write-up:
    which allocates; the residue peaks at 1.788139e-07 over nine block sizes x eight rates against a stage
    prepared a moment ago and is EXACTLY ZERO against one clocked to the same point, i.e. it is the
    engine's arithmetic and not our state. **And a restart
-   flushes what the LEDGER can see**: a capture whose conditioner is a model of its own
-   (`config.condition_dsp`) hides that model's memory from both readers of the field, so it is
-   under-flushed by exactly as much as law 11a's drain under-drains it — 0.905147969723 either way, one
-   defect in one ledger, registered against the ledger.
+   flushes what the LEDGER can see** — so the ledger has to answer for the WHOLE model. A capture whose
+   conditioner is a model of its own (`config.condition_dsp`) hid that model's memory from both readers
+   of the field, and was under-flushed by exactly as much as law 11a's drain under-drained it —
+   0.905147969723 either way, one defect in one ledger. It was corrected in the ledger and both readers
+   moved together: `detail::receptiveFieldFromConfig` adds a conditioner's memory to the network's own
+   IN SERIES, because the conditioner's output is the network's conditioning input, and the two other
+   questions the ledger answers — whether anything in the tree is recurrent, and whether anything in it
+   is charged NAM's partitioned-FFT ring — walk the same branch. On NAM's own shipped captures the
+   whole change moves one number: +1 sample of drain on the two that carry a conditioner, and a
+   byte-identical render on every other.
 
    **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
    `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`

@@ -86,10 +86,11 @@ is PRESENT and gets the caller's own samples.
   against a stage prepared a moment ago, and is EXACTLY ZERO against one clocked to the same point — the
   engine's own arithmetic, not state this stage kept); and a capture
   whose conditioner is a model of its own (`config.condition_dsp`), whose memory neither NAM nor
-  `detail::receptiveFieldFromConfig` counts. That last one is a hole in the LEDGER and not in this verb:
+  `detail::receptiveFieldFromConfig` counted at the time. That last one is a hole in the LEDGER and not in this verb:
   the identical number comes back through the untouched drain — **0.905147969723** after a full drain
   against 0.905148267746 after a restart — and a test now pins both halves of it.
-- **Not fixed here, registered:** the conditioner ledger above; `prepare()`, which has the same stale
+- **Not fixed here, registered:** the conditioner ledger above (now closed — see the entry on the ledger
+  answering for the whole model); `prepare()`, which has the same stale
   window (it is where the 0.224604502320 was first measured); and `rigplayer::RigPlayer`, which has no
   restart verb at all, so a consumer reaching this stage through the player cannot yet call the fix. The
   last two are what a consumer actually hits.

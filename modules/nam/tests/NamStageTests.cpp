@@ -196,6 +196,32 @@ std::string waveNetDelayModel (int dilation)
          + R"("sample_rate":48000})";
 }
 
+// 🔴 A WaveNet WHOSE MEMORY IS ONLY REACHABLE THROUGH ITS CONDITIONER — the shape the ledger could not
+// see. `condition_dsp` is a whole model of its own and NAM builds it with `get_dsp` like any other
+// (v0.5.4 `wavenet/model.cpp:844`); its output is the network's conditioning INPUT, so the two
+// memories are in SERIES.
+//
+// TWO layers, dilations {1, d}, and that is not decoration: the condition enters a layer AFTER that
+// layer's convolution (`z = conv(input) + input_mixin(condition)`, `wavenet/model.cpp:196-204`, the
+// mixin being a memoryless Conv1x1), so with ONE layer the conditioner's memory would sit in PARALLEL
+// with the stack's and `max` would be indistinguishable from the sum. With two, the deepest path is
+// conditioner → layer 0's mixin → residual → layer 1's dilated convolution, and the model reaches
+// back `c + d`. Measured through this stage on the {2500, 2500} row: the impulse's last non-zero
+// sample is 5000, where the same fixture without a conditioner reaches 2501.
+//
+// Every bias is zero, so the model's silence state is EXACTLY zero and a residue shows as one. The
+// nine-weight fixture this suite already carries does NOT have that property — its convolution bias is
+// 1, so it answers digital silence with tanh(1) = 0.761594176292 and a tone through its conditioner
+// with tanh(1.5) = 0.905148, which is the number the defect was registered under.
+std::string conditionedWaveNet (const std::string& conditioner, int d)
+{
+    return std::string (R"({"version":"0.5.0","architecture":"WaveNet","config":{"condition_dsp":)") + conditioner
+         + R"(,"layers":[{"input_size":1,"condition_size":1,"head_size":1,"head_bias":false,)"
+         + R"("channels":1,"kernel_size":2,"dilations":[1,)" + std::to_string (d)
+         + R"(],"activation":"Tanh","gated":false}],"head_scale":1.0},)"
+         + R"("weights":[1, 1,0,0, 1, 1,0, 1,0,0, 1, 1,0, 1, 1],"sample_rate":48000})";
+}
+
 bool load (felitronics::nam::NamStage& stage, const std::string& json, float trimDb = 0.0f)
 {
     return stage.loadModelFromMemory (json.data(), json.size(), trimDb);
@@ -1946,6 +1972,24 @@ int main()
             // sits on the OLDEST tap deliberately: with the shipped [1,0,0,…] shape both convolution
             // taps are zero and the network's effective memory is ONE sample, whatever it declares.
             { "WaveNet field 6332", waveNetDelayModel (6331), 6332, 6331 },
+            // 🔴 …AND A CAPTURE WHOSE CONDITIONER IS A MODEL OF ITS OWN, which is the shape neither
+            // reader of the ledger could see: NAM answers 2501 for it (its `Linear` conditioner
+            // contributes ZERO to `mPrewarmSamples` — `wavenet/model.cpp:616` on a base-class zero) and
+            // the registry answered 2502, for a model whose impulse reaches sample 5000. The lane
+            // drained 2502 and replayed the rest.
+            // BOTH lengths are past the 2048-sample partitioned-FFT ring ON PURPOSE. That ring is
+            // charged for any `Linear` anywhere in the tree, the conditioner included, and it is wide
+            // enough to cover a SHORT conditioner all by itself — at c = 2001 a ledger that walks the
+            // conditioner and then discards its field still drains 2 + 2048 and leaves nothing behind,
+            // so a fixture that size cannot fail for the defect it is written about.
+            { "WaveNet + Linear conditioner, series 5000", conditionedWaveNet (delayModel (2500), 2500), 5002, 5000 },
+            // …and the same seam through the engine that holds SPECTRA rather than samples. The
+            // conditioner here is the dense kernel at its `auto` default, i.e. NAM's partitioned FFT,
+            // and its ring smears the response past the field: 2287, against 2001 for the identical
+            // kernel spelled `direct`. The field alone (2003) does not cover that; the field plus the
+            // ring (4051) does — which is the row that fails if `partitionedTailSamples` is left behind
+            // while the field is taught.
+            { "WaveNet + dense FFT conditioner", conditionedWaveNet (denseLinearModel (2001, nullptr), 1), 2003, 2287 },
         };
 
         for (const auto& shape : shapes)
@@ -2501,6 +2545,11 @@ int main()
         // …and a real WaveNet, the architecture the price is paid on: a dilated tap costs the same
         // nine scalars at any distance, so 512 samples of memory is a nine-number fixture.
         { "WaveNet field 512",   waveNetDelayModel (511),            511, true  },
+        // 🔴 …AND THE CAPTURE WHOSE CONDITIONER IS A MODEL OF ITS OWN. The restart spends the same
+        // ledger the drain does, so it inherited the same hole and by the same amount — 0.905147969723
+        // after a full drain against 0.905148267746 after a restart, one defect in one ledger. Both
+        // lengths past the 2048 ring, for the reason spelled out on the drain row.
+        { "WaveNet + Linear conditioner", conditionedWaveNet (delayModel (2500), 2500), 5000, true },
     };
 
     test::group ("\U0001f534 P47: nothing the caller fed before reset() can be heard after it");
@@ -3124,14 +3173,151 @@ int main()
             }
         }
 
-        // 6. 🔴 WHAT THE RESTART CANNOT FLUSH, PINNED WITH ITS NUMBER — a capture whose CONDITIONER is a
-        //    whole model of its own (`config.condition_dsp`, which real A2 captures carry). Neither NAM
-        //    (`Linear::GetPrewarmSamples()` is the base class's zero) nor `detail::receptiveFieldFromConfig`
-        //    (it walks `submodels`, not `condition_dsp`) counts that model's memory, so the ledger this
-        //    restart spends is SHORT for it. This is P24's ledger and not this change: the identical
-        //    number comes back through the untouched drain, which is what the two halves below assert.
-        //    Registered rather than fixed here — correcting the ledger would move the drain, and the bar
-        //    for this task is that a programme which never calls reset() does not move a single bit.
+        // 6. 🔴 THE CONDITIONER IS IN THE LEDGER NOW, AND BOTH OF ITS READERS SPEND IT. A capture whose
+        //    CONDITIONER is a whole model of its own (`config.condition_dsp`, which NAM builds with
+        //    `get_dsp` like any other model — v0.5.4 `wavenet/model.cpp:844`) used to hide that model's
+        //    memory from both: NAM answers ZERO for a `Linear` conditioner and
+        //    `detail::receptiveFieldFromConfig` walked `submodels`, not `condition_dsp`.
+        //    The two readers were short by EXACTLY the same amount, which is what said it was one
+        //    defect in one ledger rather than two: 0.905147969723 after a full drain against
+        //    0.905148267746 after a restart, on the nine-weight fixture 6b keeps.
+        //    P87 taught the registry the branch, in all three of its functions at once. The grid —
+        //    eight rates, both widths, both readers — is where the conditioned rows now sit in the two
+        //    groups above; what is asserted HERE is the pair, on one fixture, on both lanes, against
+        //    the only oracle that is independent of the fixture's own arithmetic: a stage that never
+        //    saw the programme at all.
+        {
+            const auto conditioned = conditionedWaveNet (delayModel (2500), 2500);
+            // THE NUMBER FIRST. The network's own 2502 plus the conditioner's 2500 — a SUM, because
+            // the conditioner is in series with the stack, not an alternative to it.
+            {
+                nam::NamStage ledger;
+                ledger.prepare (48000.0, kBlk);
+                if (! load (ledger, conditioned))
+                    test::ok (false, "a WaveNet with a Linear conditioner loads");
+                else
+                    test::ok (ledger.prewarmSamples() == 5002,
+                              "the ledger counts the conditioner's memory IN SERIES with the network's"
+                              " — 2502 + 2500 — and it reports " + std::to_string (ledger.prewarmSamples())
+                              + "; NAM's own answer for this capture is 2501");
+            }
+
+            // …AND THE AUDIO, which is what separates the sum from the two arithmetics that report the
+            // same 2502 here: a walk that DISCARDS the conditioner's field, and a worst-of instead of a
+            // sum. Either drains 2502 + the 2048 ring = 4550 for a model that reaches sample 5000, and
+            // the 450 samples it replays land in the rows below. (6b separates those two by number.)
+            for (const int lane : { 0, 1 })
+            {
+                nam::NamStage fresh, viaDrain, viaReset;
+                fresh.prepare (48000.0, kBlk); viaDrain.prepare (48000.0, kBlk); viaReset.prepare (48000.0, kBlk);
+                if (! load (fresh, conditioned) || ! load (viaDrain, conditioned) || ! load (viaReset, conditioned))
+                { test::ok (false, "the conditioned drain/restart fixtures load"); continue; }
+
+                auto charge = [&] (nam::NamStage& s)
+                {
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    float* io[2] { l.data(), r.data() };
+                    double phase = 0.0, peak = 0.0;
+                    for (int n = 0; n < 6144 + 4 * kBlk; n += kBlk)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (float) (0.5 * std::sin (phase));
+                            phase += 2.0 * kPi * 220.0 / 48000.0;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (s.process (io, 2, kBlk, false));
+                        for (float v : (lane == 0 ? l : r)) peak = std::fmax (peak, (double) std::fabs (v));
+                    }
+                    return peak;
+                };
+                // Silence for eight blocks, then a programme: a stale window is audible in the first and
+                // a wrong internal phase only in the second, and the fixture's own silence state is
+                // exactly zero (every bias is), so the first half can be read as a peak as well.
+                auto answer = [&] (nam::NamStage& s)
+                {
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk), out;
+                    float* io[2] { l.data(), r.data() };
+                    double p = 0.0;
+                    for (int k = 0; k < 24; ++k)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (k < 8) ? 0.0f
+                                                    : (float) (0.35 * std::sin (p) * std::sin (0.017 * p));
+                            p += 2.0 * kPi * 220.0 / 48000.0;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (s.process (io, 2, kBlk, false));
+                        const std::vector<float>& src = lane == 0 ? l : r;
+                        out.insert (out.end(), src.begin(), src.end());
+                    }
+                    return out;
+                };
+
+                // TWO STATEMENTS, NOT ONE `&&`. `charge()` is what puts the audio in, and `&&` SHORT
+                // CIRCUITS: with both calls in one expression a false left-hand side would leave
+                // `viaReset` never charged, and the two equalities below would then compare an unplayed
+                // stage against `fresh` and pass trivially. A precondition that can disarm the
+                // assertions it guards is worse than none.
+                const double chargedDrain = charge (viaDrain);
+                const double chargedReset = charge (viaReset);
+                test::ok (chargedDrain > 0.1 && chargedReset > 0.1,
+                          "precondition: lane " + std::to_string (lane) + " really was playing in BOTH"
+                          " fixtures (" + std::to_string (chargedDrain) + ", " + std::to_string (chargedReset) + ")");
+
+                // THE DEPARTURE, and the loop is BOUNDED: a drain that never stops has to FAIL here
+                // rather than hang. 7050 samples of debt is 28 blocks.
+                long long last = -1; int blocks = 0;
+                while (viaDrain.drainedSamples() != last && blocks < 200)
+                {
+                    last = viaDrain.drainedSamples();
+                    std::vector<float> z ((std::size_t) kBlk, 0.0f);
+                    float* io[2] { z.data(), z.data() };
+                    felitronics::test::run (viaDrain.process (io, 0, kBlk, false));
+                    ++blocks;
+                }
+                test::ok (blocks < 200, "…and the drain of a conditioned capture STOPS (" + std::to_string (blocks)
+                                        + " blocks of gap)");
+                viaReset.reset();
+
+                const auto ref = answer (fresh), drained = answer (viaDrain), restarted = answer (viaReset);
+                long long dDrain = 0, dReset = 0;
+                double peakDrain = 0.0, peakReset = 0.0;
+                bool finite = true;
+                for (std::size_t i = 0; i < ref.size(); ++i)
+                {
+                    if (drained  [i] != ref[i]) ++dDrain;
+                    if (restarted[i] != ref[i]) ++dReset;
+                    // FINITENESS BESIDE THE PEAK: std::fmax IGNORES a NaN, so a peak of 0 is not on its
+                    // own evidence of silence.
+                    finite = finite && std::isfinite (drained[i]) && std::isfinite (restarted[i]);
+                    if (i < (std::size_t) (8 * kBlk))
+                    {
+                        peakDrain = std::fmax (peakDrain, (double) std::fabs (drained  [i]));
+                        peakReset = std::fmax (peakReset, (double) std::fabs (restarted[i]));
+                    }
+                }
+                test::ok (finite && peakDrain == 0.0 && peakReset == 0.0,
+                          "a conditioned capture answers digital silence with FINITE exact zero — after a"
+                          " full drain and after a restart alike, lane " + std::to_string (lane)
+                          + " (drain " + std::to_string (peakDrain) + ", restart " + std::to_string (peakReset)
+                          + ", where the unfixed ledger left 0.905148)");
+                test::ok (dDrain == 0 && dReset == 0,
+                          "…and the programme that follows is bit-identical to a stage that never played,"
+                          " through BOTH readers of the one ledger — lane " + std::to_string (lane)
+                          + ": " + std::to_string (dDrain) + " differing after the drain, "
+                          + std::to_string (dReset) + " after the restart");
+            }
+        }
+
+        // 6b. THE FIXTURE THE DEFECT WAS REGISTERED ON, kept — because it is the one whose ARITHMETIC
+        //     separates the two wrong answers, and because what it leaves behind is not zero and never
+        //     was. Its convolution bias is 1, so it answers digital silence with tanh(1) = 0.761594176292
+        //     whatever its history, and the 0.905148 the defect was measured at is tanh(1 + 0.5): the
+        //     conditioner's 2001-sample delay handing a live tone to a network that had "finished"
+        //     draining. A peak threshold on this fixture is a cliff between 0.76 and 0.91, so what is
+        //     asserted is equality with a stage that never played.
         {
             const auto conditioned =
                 std::string (R"({"version":"0.5.0","architecture":"WaveNet","config":{"condition_dsp":)")
@@ -3139,15 +3325,19 @@ int main()
                 + R"(,"layers":[{"input_size":1,"condition_size":1,"head_size":1,"head_bias":false,)"
                 + R"("channels":1,"kernel_size":2,"dilations":[1],"activation":"Tanh","gated":false}],)"
                 + R"("head_scale":1.0},"weights":[1,0,0,1,1,0,0,1,1],"sample_rate":48000})";
-            nam::NamStage viaDrain, viaReset;
-            viaDrain.prepare (48000.0, kBlk); viaReset.prepare (48000.0, kBlk);
-            if (! load (viaDrain, conditioned) || ! load (viaReset, conditioned))
+            nam::NamStage fresh, viaDrain, viaReset;
+            fresh.prepare (48000.0, kBlk); viaDrain.prepare (48000.0, kBlk); viaReset.prepare (48000.0, kBlk);
+            if (! load (fresh, conditioned) || ! load (viaDrain, conditioned) || ! load (viaReset, conditioned))
                 test::ok (false, "a WaveNet with a Linear conditioner loads");
             else
             {
-                test::ok (viaDrain.prewarmSamples() == 2,
-                          "precondition: the ledger sees only the network's own two samples, not the"
-                          " conditioner's 2001 — it reports " + std::to_string (viaDrain.prewarmSamples()));
+                // 🔴 THE ROW THAT TELLS THE TWO WRONG ARITHMETICS APART. The network's own memory here
+                // is 2 and the conditioner's is 2001: a walk that DISCARDS the conditioner's field
+                // answers 2, a worst-of answers 2001, and the series sum answers 2003. Before P87 this
+                // read 2 — the comment that stood here said so and called it a precondition.
+                test::ok (viaDrain.prewarmSamples() == 2003,
+                          "the ledger reads 2 + 2001: a discard would read 2, a worst-of 2001, and it"
+                          " reports " + std::to_string (viaDrain.prewarmSamples()));
                 auto charge = [&] (nam::NamStage& s)
                 {
                     std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
@@ -3164,36 +3354,86 @@ int main()
                         felitronics::test::run (s.process (io, 1, kBlk, false));
                     }
                 };
-                auto leak = [&] (nam::NamStage& s)
+                auto answer = [&] (nam::NamStage& s)
                 {
-                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk), out;
                     float* io[2] { l.data(), r.data() };
-                    double worst = 0.0;
                     for (int k = 0; k < 24; ++k)
                     {
                         std::fill (l.begin(), l.end(), 0.0f); std::fill (r.begin(), r.end(), 0.0f);
                         felitronics::test::run (s.process (io, 1, kBlk, false));
-                        for (float v : l) worst = std::fmax (worst, (double) std::fabs (v));
+                        out.insert (out.end(), l.begin(), l.end());
                     }
-                    return worst;
+                    return out;
                 };
                 charge (viaDrain);
-                long long last = -1;
-                while (viaDrain.drainedSamples() != last)
+                long long last = -1; int blocks = 0;
+                while (viaDrain.drainedSamples() != last && blocks < 200)
                 {
                     last = viaDrain.drainedSamples();
                     std::vector<float> z ((std::size_t) kBlk, 0.0f);
                     float* io[2] { z.data(), z.data() };
                     felitronics::test::run (viaDrain.process (io, 0, kBlk, false));
+                    ++blocks;
                 }
-                const double afterDrain = leak (viaDrain);
                 charge (viaReset);
                 viaReset.reset();
-                const double afterReset = leak (viaReset);
-                test::ok (afterDrain > 0.9 && afterReset > 0.9,
-                          "a conditioner's memory is outside the ledger, and the restart inherits that"
-                          " EXACTLY as the drain has it: " + std::to_string (afterDrain) + " after a full"
-                          " drain against " + std::to_string (afterReset) + " after a restart");
+                const auto ref = answer (fresh), drained = answer (viaDrain), restarted = answer (viaReset);
+                long long dDrain = 0, dReset = 0; double peak = 0.0; bool finite = true;
+                for (std::size_t i = 0; i < ref.size(); ++i)
+                {
+                    if (drained  [i] != ref[i]) ++dDrain;
+                    if (restarted[i] != ref[i]) ++dReset;
+                    finite = finite && std::isfinite (drained[i]) && std::isfinite (restarted[i]);
+                    peak = std::fmax (peak, (double) std::fabs (drained[i]));
+                }
+                test::ok (finite && dDrain == 0 && dReset == 0,
+                          "…and a capture that answers silence with its own DC is judged against a stage"
+                          " that never played, not against zero: " + std::to_string (dDrain)
+                          + " differing after the drain and " + std::to_string (dReset) + " after the"
+                          " restart, at a level of " + std::to_string (peak) + " — tanh(1), where the"
+                          " unfixed ledger left tanh(1.5) = 0.905148");
+            }
+        }
+
+        // 6c. AND A CONDITIONER THAT IS RECURRENT MAKES THE CAPTURE RECURRENT. An LSTM cell's state
+        //     enters every layer through the memoryless mixin, so no finite length of silence empties
+        //     the model either — which is law 11a's named exception, and it is reached here through
+        //     `detail::isRecurrent`, the second of the registry's three functions. The audio cannot
+        //     witness this (a recurrent lane never becomes provably clean), so the ledger does: a
+        //     recurrent lane is never marked clean, therefore a SECOND restart with nothing fed in
+        //     between spends the heuristic again, where a non-recurrent one spends nothing.
+        //     This is the row that fails if the field is taught and `isRecurrent` is left behind.
+        {
+            nam::NamStage stage;
+            stage.prepare (48000.0, kBlk);
+            if (! load (stage, conditionedWaveNet (slowLstmModel (true), 1)))
+                test::ok (false, "a WaveNet with an LSTM conditioner loads");
+            else
+            {
+                std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                float* io[2] { l.data(), r.data() };
+                double phase = 0.0;
+                for (int k = 0; k < 8; ++k)
+                {
+                    for (int i = 0; i < kBlk; ++i)
+                    {
+                        const float v = (float) (0.5 * std::sin (phase));
+                        phase += 2.0 * kPi * 220.0 / 48000.0;
+                        l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                    }
+                    felitronics::test::run (stage.process (io, 1, kBlk, false));
+                }
+                const long long before = stage.clearedSamples();
+                stage.reset();
+                const long long first = stage.clearedSamples() - before;
+                stage.reset();                       // nothing fed in between
+                const long long second = stage.clearedSamples() - before - first;
+                test::ok (first > 0 && second == first,
+                          "an LSTM conditioner makes the capture recurrent, so the restart stops being"
+                          " idempotent for it: " + std::to_string (first) + " samples spent by the first"
+                          " restart and " + std::to_string (second) + " by a second with nothing fed in"
+                          " between (a capture the ledger thinks is finite spends 0 there)");
             }
         }
 

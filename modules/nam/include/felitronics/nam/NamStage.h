@@ -105,13 +105,18 @@ public:
     // and 0.419413 on the repository's deliberately slow fixture. A recurrent lane is therefore never
     // marked clean: every restart spends the heuristic again, which is what NAM's own Reset does too.
     //
-    // ⚠️ AND IT FLUSHES WHAT THE LEDGER CAN SEE. A capture whose CONDITIONER is a whole model of its own
-    // (`config.condition_dsp`) hides that model's memory from both readers of the field: NAM answers 0
-    // for a `Linear` conditioner and `detail::receptiveFieldFromConfig` walks `submodels`, not
-    // `condition_dsp`. Such a capture is under-flushed by exactly as much here as it is under-DRAINED by
-    // law 11a's falling edge — measured on a WaveNet with a 2001-tap conditioner, 0.905147969723 after a
-    // full drain and 0.905148267746 after a restart. That is one defect in one ledger, and it is
-    // registered against the ledger rather than papered over in each of its two readers.
+    // ⚠️ AND IT FLUSHES WHAT THE LEDGER CAN SEE — which now includes a capture's CONDITIONER. A
+    // `config.condition_dsp` is a whole model of its own and NAM builds it with `get_dsp` like any
+    // other; its memory used to be outside the ledger, because NAM answers 0 for a `Linear` conditioner
+    // and `detail::receptiveFieldFromConfig` walked `submodels`, not `condition_dsp`. Such a capture was
+    // under-flushed here by exactly as much as law 11a's falling edge under-drained it — measured on a
+    // WaveNet with a 2001-sample conditioner, 0.905147969723 after a full drain and 0.905148267746 after
+    // a restart. One defect in one ledger, and it was corrected in the LEDGER, so both readers moved
+    // together: the registry now adds the conditioner's memory to the network's, in series, and the same
+    // fixture answers digital silence with the model's own silence state through either verb.
+    // ONE SHAPE THE LEDGER STILL CANNOT SEE is registered with its number in `ReceptiveField.h` — the
+    // hybrid slimmable-wrapper, whose real config hides under `config.model` and which reads zero here
+    // however long its stack is. It is named as one rather than as the end of a list.
     //
     // ⚠️ AND IT CANNOT REWIND A THIRD PARTY'S CLOCK. NAM's partitioned `Linear` engine counts every
     // sample the instance has ever seen and decides from it where the next programme falls against its
