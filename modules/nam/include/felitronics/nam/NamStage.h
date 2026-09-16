@@ -172,9 +172,11 @@ public:
     // reading the ledger sets aside now adds `detail::kUnreadShapeCeiling` (48 000 samples) ONCE to what
     // it did read, plus the 2048-sample ring — measured through this call at 39.7 ms per lane (256 block)
     // on the most expensive real capture rewrapped, 44.5 ms at 64, and 4.5 ms on the wrapped slimmable.
-    // A dead number cannot inflate it, and the price of that is stated in `ReceptiveField.h`: a LIVE model
-    // hidden where the ledger cannot see it, with a field longer than the allowance, drains short by the
-    // difference. The rule fires on none of the 1229 distinct captures on the author's machine.
+    // A dead number it CANNOT place cannot inflate it; a dead number it DOES place still can, as before
+    // (a wrapped form's own decoy stack) — and a LIVE memory it cannot place, longer than the allowance,
+    // drains short by the difference. Both doors are named in `ReceptiveField.h`, and which one stays open
+    // is a registered policy question. The rule fires on none of the 1229 distinct captures on the
+    // author's machine.
     //
     // ⚠️ AND IT CANNOT REWIND A THIRD PARTY'S CLOCK. NAM's partitioned `Linear` engine counts every
     // sample the instance has ever seen and decides from it where the next programme falls against its
