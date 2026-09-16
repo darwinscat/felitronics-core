@@ -273,6 +273,35 @@ public:
                     processChannel (ch[c], inst[c].get(), hush_.data(), d, g);
                     drain_[c] -= d;
                     if (drained_ != nullptr) drained_->fetch_add ((long long) d, std::memory_order_relaxed);
+                    // 🔴 …AND A DRAIN THAT RAN ALL THE WAY MAKES THE LANE CLEAN IN THE LEDGER TOO, which
+                    // until P90 it did not. `everFed_` was set by every fed chunk above and cleared ONLY
+                    // by reset(), so a lane that had just spent its whole debt here was still marked
+                    // "may be holding audio" and `configureRates` charged it a FULL drain again at the
+                    // next prepare() — the stage paying twice for one departure. P85 registered it as a
+                    // cost and measured it on a fixture (2562 spent, 5124 charged); on the real captures
+                    // the wasted lane is 4093 samples for `wavenet_a1_standard`, 6347 for `A2` and 2047
+                    // for `slimmable_wavenet`, and the re-prepare that spends it measures 14.7 ms
+                    // against the 7.4 ms the same call costs with nothing owed.
+                    //
+                    // IT IS THE SAME CLAIM reset() ALREADY RESTS ON, not a new one: `drain_[c] == 0`
+                    // means exactly "this lane has been fed the silence it owed", and reset() reads that
+                    // very counter (`owed = drain_[c]`) to decide it has nothing to spend. What reset()
+                    // does that this path does not is clear the two rate-matcher legs — and that is NOT
+                    // a hole here, for two reasons. The first is that this is a PAUSE and not a restart
+                    // (law 11c): the stream continued, with zeros, so the legs' sub-sample phase is
+                    // exactly where it would have been, and for a lane that comes BACK that continuity
+                    // is the correct state — re-anchoring it here would be the 1.039e-06 divergence
+                    // reset() documents, introduced deliberately. The second is that it does not matter
+                    // to the only reader: `configureRates` has already re-derived both legs, coefficients
+                    // AND state, before it consults `everFed_` at all, and reset() clears them
+                    // unconditionally whether or not it spends a sample.
+                    //
+                    // A RECURRENT CAPTURE KEEPS ITS FLAG, and the exclusion is copied from reset()'s own
+                    // line rather than reasoned about again: no finite length of silence empties an LSTM
+                    // cell, so `drain_ == 0` is not cleanliness for one and it never becomes provably
+                    // clean. Measured, the lstm fixture drains 24000 here and is charged 24000 again —
+                    // and must be.
+                    if (drain_[c] == 0 && ! recurrent_) everFed_[c] = false;
                 }
             }
             off += n;                                      // `off += maxBlock` could step past INT_MAX

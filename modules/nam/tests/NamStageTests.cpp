@@ -2681,6 +2681,83 @@ int main()
                       + std::to_string (stage.drainedSamples() - beforeSecond));
         }
 
+        // 🔴 P90: A LANE THAT DRAINED ALL THE WAY IS NOT CHARGED AGAIN BY THE NEXT prepare(). The
+        // odometer above pins what the falling edge SPENDS; nothing pinned what the next prepare CHARGES
+        // for it, and the two disagreed: `everFed_` was cleared only by reset(), so a lane that had just
+        // spent its whole 2562 still read "may be holding audio" and `configureRates` billed it 2562
+        // again — P85's own note put the number on it (5124 where 2562 is owed) and registered it as a
+        // cost. Nothing in this file noticed, because every prepare()-charge assertion above either feeds
+        // BOTH lanes to the end or reads the falling edge's odometer instead.
+        //
+        // THREE ROWS, and each is a different wrong fix's failure:
+        //   · FULL drain, then prepare — the defect itself. Only lane 0, still playing, owes: 2562.
+        //   · PARTIAL drain, then prepare — the lane is NOT clean, and must be charged in full. This is
+        //     what catches a fix that clears the flag when the edge STARTS rather than when it ENDS:
+        //     that one passes the first row and hands a half-drained lane to the next stream.
+        //   · a RECURRENT capture, full edge, then prepare — the lane is never clean and must still be
+        //     charged. This catches a fix that forgot reset()'s own exclusion.
+        {
+            // The first two rows share delayModel(514): 2562 per lane at 48 kHz with a 256-sample block,
+            // derived above, and deliberately not a multiple of the block.
+            constexpr long long kLane = 2562;
+            for (const bool full : { true, false })
+            {
+                nam::NamStage stage;
+                stage.prepare (48000.0, 256);
+                test::ok (load (stage, delayModel (514)), "the P90 ledger fixture loads");
+                std::vector<float> l (256, 0.1f), r (256, 0.1f);
+                float* io[2] { l.data(), r.data() };
+                for (int k = 0; k < 8; ++k) felitronics::test::run (stage.process (io, 2, 256, false));
+
+                // Lane 1 leaves; lane 0 keeps playing. `full` runs the gap past the whole debt,
+                // otherwise it stops four blocks in — 1024 of 2562, strictly inside.
+                const long long d0 = stage.drainedSamples();
+                const int gap = full ? 40 : 4;
+                for (int k = 0; k < gap; ++k) felitronics::test::run (stage.process (io, 1, 256, false));
+                const long long spent = stage.drainedSamples() - d0;
+                test::ok (full ? spent == kLane : (spent > 0 && spent < kLane),
+                          std::string ("precondition: lane 1's falling edge spent ") + std::to_string (spent)
+                          + (full ? " — all of its 2562" : " — strictly part of its 2562"));
+
+                const long long c0 = stage.clearedSamples();
+                stage.prepare (48000.0, 256);
+                const long long charged = stage.clearedSamples() - c0;
+                if (full)
+                    test::ok (charged == kLane,
+                              "a lane that drained ALL the way is not charged again: the prepare spends lane 0's"
+                              " 2562 alone, read " + std::to_string (charged)
+                              + " (the base commit spent 5124 — the clean lane billed a second time)");
+                else
+                    test::ok (charged == 2 * kLane,
+                              "…but a lane caught PART-way is still owed its whole drain: 2 x 2562 = 5124, read "
+                              + std::to_string (charged)
+                              + " — a flag cleared when the edge STARTS would have charged 2562 here");
+            }
+
+            // THE RECURRENT ROW. 24000 per lane is NAM's own half-second heuristic at 48 kHz, pinned
+            // above; the gap below is far past it, and the lane must be charged anyway.
+            nam::NamStage stage;
+            stage.prepare (48000.0, 256);
+            if (! load (stage, slowLstmModel (true))) test::ok (false, "the P90 recurrent fixture loads");
+            else
+            {
+                std::vector<float> l (256, 0.2f), r (256, 0.2f);
+                float* io[2] { l.data(), r.data() };
+                for (int k = 0; k < 8; ++k) felitronics::test::run (stage.process (io, 2, 256, false));
+                const long long d0 = stage.drainedSamples();
+                for (int k = 0; k < 200; ++k) felitronics::test::run (stage.process (io, 1, 256, false));
+                test::ok (stage.drainedSamples() - d0 == 24000,
+                          "precondition: the recurrent lane's falling edge spent its whole heuristic, read "
+                          + std::to_string (stage.drainedSamples() - d0));
+                const long long c0 = stage.clearedSamples();
+                stage.prepare (48000.0, 256);
+                test::ok (stage.clearedSamples() - c0 == 48000,
+                          "…and a RECURRENT lane is charged again regardless — nothing finite empties the cell,"
+                          " so a spent drain is not cleanliness for it: 2 x 24000, read "
+                          + std::to_string (stage.clearedSamples() - c0));
+            }
+        }
+
         // A LOAD LANDING WHILE A LANE IS AWAY. The debt belongs to the backend, and a load REPLACES it,
         // so the arriving instance owes nothing — its window is the zeros NAM filled it with. What must
         // not happen is the arriving model speaking the DEPARTED one's audio on the widen, and what must
