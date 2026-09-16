@@ -59,4 +59,14 @@ independence at exactly 0 — and this tree's own `Buffer`-based fixtures leak o
 would have approved a blanket skip. Found on the way and registered: the alignment ceiling
 `kBlendMaxDelay` is 128 samples, so a 64-sample lag at 48 kHz is clamped to half at 192 kHz (P99).
 
-Independence (P47/P85) is unchanged: exactly 0 on every capture.
+Independence (P47/P85) is unchanged: nothing the caller fed is audible after a restart — exactly 0
+across 384 rows of NAM's own captures through the player. One number did move, and it is not
+independence: since a lane drained to the end is no longer drained again by `prepare()`, two stages fed
+the same audio but a different channel-width history now differ after a prepare by the drain's own
+chunking residue — up to 2.4e-06 on `slimmable_wavenet` at a 17-sample block, 0 on `A2` — where they
+used to be identical.
+
+Found by the adversarial round and registered, not this branch's: a lane that comes back after its drain
+has run out resumes at a frozen sub-sample phase, so at a non-integer rate ratio it differs from a lane
+fed silence throughout by 0.114 on `wavenet_a1_standard` at 44.1 kHz (P101); and `RigPlayer::prepare()`
+accepts positive rates far below any audio rate (1e-3 Hz) that its stages cannot honour (P102).

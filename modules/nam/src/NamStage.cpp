@@ -289,15 +289,32 @@ public:
                     // IT IS THE SAME CLAIM reset() ALREADY RESTS ON, not a new one: `drain_[c] == 0`
                     // means exactly "this lane has been fed the silence it owed", and reset() reads that
                     // very counter (`owed = drain_[c]`) to decide it has nothing to spend. What reset()
-                    // does that this path does not is clear the two rate-matcher legs — and that is NOT
-                    // a hole here, for two reasons. The first is that this is a PAUSE and not a restart
-                    // (law 11c): the stream continued, with zeros, so the legs' sub-sample phase is
-                    // exactly where it would have been, and for a lane that comes BACK that continuity
-                    // is the correct state — re-anchoring it here would be the 1.039e-06 divergence
-                    // reset() documents, introduced deliberately. The second is that it does not matter
-                    // to the only reader: `configureRates` has already re-derived both legs, coefficients
-                    // AND state, before it consults `everFed_` at all, and reset() clears them
-                    // unconditionally whether or not it spends a sample.
+                    // does that this path does not is clear the two rate-matcher legs, and this line
+                    // leaves them alone because it does not change how the edge clocks anything — it
+                    // only stops the NEXT prepare() from billing the lane again. Neither reader of the
+                    // flag can tell: `configureRates` has already re-derived both legs, coefficients AND
+                    // state, before it consults `everFed_`, and reset() clears them unconditionally
+                    // whether or not it spends a sample.
+                    //
+                    // ⚠️ WHAT THE LEGS HOLD AFTER THE EDGE IS NOT "WHERE A SILENT STREAM WOULD BE", and a
+                    // first draft of this note said it was. That is true only while the drain runs: once
+                    // it is spent the lane is no longer clocked at all, so its sub-sample phase FREEZES,
+                    // and at a non-integer rate ratio a lane that comes back resumes at a different
+                    // fractional alignment than a lane fed digital silence throughout. Measured, 200
+                    // blocks away: 4.4e-07 at 96 kHz (a whole ratio) and 0.114 at 44.1 kHz on
+                    // `wavenet_a1_standard`, 0.050 on `slimmable_wavenet`. That is P24's bounded drain,
+                    // older than this line, and registered as P101; clearing the legs here would not
+                    // mend it (an adversarial round measured that 1.36e-03 WORSE at 96 kHz).
+                    //
+                    // ⚠️ AND THIS LINE ADDS A DEPENDENCE ON WIDTH HISTORY, stated because it is a number
+                    // that moved. A lane emptied here is left untouched by the next prepare() and so
+                    // equals a freshly prepared lane bit for bit; a lane that was never away is drained BY
+                    // that prepare, in its own chunking, and carries that chunking's residue. Two stages
+                    // fed the same audio but a different channel-width history therefore differ after a
+                    // prepare by that residue — 2.4e-06 on `slimmable_wavenet` at a 17-sample block,
+                    // 1.6e-07 on `wavenet_a1_standard`, 0 on `A2` — where before this line they were
+                    // identical. Independence is untouched (nothing the caller FED is audible), and the
+                    // residue is exactly the one P98 would remove.
                     //
                     // A RECURRENT CAPTURE KEEPS ITS FLAG, and the exclusion is copied from reset()'s own
                     // line rather than reasoned about again: no finite length of silence empties an LSTM
