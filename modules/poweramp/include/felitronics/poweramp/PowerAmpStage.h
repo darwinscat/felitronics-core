@@ -4,11 +4,13 @@
 #pragma once
 
 #include <felitronics/eq/Svf.h>
+#include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <memory>
@@ -140,8 +142,16 @@ public:
     // count touches, and it carries separate two-sided checks at an explicit 32 and 96 for the topology
     // itself. OrbitCab's own copy keeps its 32 and passes it explicitly, so its sound and its host
     // latency are unaffected by this default.
+    //
+    // `topology` (P31) picks the oversampler: Kaiser (the default, above) or Cascade — CascadeOversampler,
+    // flat to 20 kHz at every rate, round trip 131 samples at 44.1 kHz and 76 at 48 kHz (4x), from the rate
+    // rather than from `tapsPerPhase`. Clamped like everything else here, never refused: under Cascade the
+    // factor is rounded DOWN to a power of two (3 -> 2, 12 -> 8), and the rate the filter is designed for
+    // is clamped into [1 kHz, 3 MHz] (every rate up to 44.1 kHz shares one geometry, so the low clamp
+    // changes no tap). Read latencySamples() back — it reports what was built.
     void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,
-                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase);
+                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase,
+                  oversampling::Topology topology = oversampling::Topology::Kaiser);
     void reset();
 
     // Set the controls + the product-chosen voicing. RT-safe: stores targets (and copies the plain-
@@ -198,7 +208,7 @@ struct PowerAmpStage::Impl
     int    os         = 4;                          // oversampling factor (4 shipping; test may set 32)
     int    tpp        = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // FIR taps/phase → (tpp-1)-sample round trip
 
-    felitronics::oversampling::PolyphaseOversampler ovs;
+    felitronics::oversampling::Oversampler ovs;
     std::vector<float> osBuf[kMaxCh];               // maxBlock*os per channel (caller-owned OS scratch)
     float*             osPtr[kMaxCh] { nullptr, nullptr };
 
@@ -232,16 +242,22 @@ struct PowerAmpStage::Impl
     bool  ranPres_ = false, ranDepth_ = false, ranMid_ = false;   // and which of this stage's own gates
     bool  ranLoad_ = false, ranIron_  = false, ranSag_ = false;   // were open on the previous CHUNK
 
-    void prepare (double sr, int mb, int osFactor, int tapsPerPhase)
+    void prepare (double sr, int mb, int osFactor, int tapsPerPhase, felitronics::oversampling::Topology topology)
     {
+        using felitronics::oversampling::Topology;
+        using felitronics::oversampling::CascadeOversampler;
         sampleRate = sr;
         maxBlock   = std::max (1, mb);
         os         = std::clamp (osFactor, 2, 32);
+        if (topology == Topology::Cascade) os = (int) std::bit_floor ((unsigned) os);
         // Clamped rather than refused, because prepare() returns void here and always has: a rejected
         // taps count would leave the stage unprepared with no way to say so, which is the worse failure.
         tpp        = std::clamp (tapsPerPhase, kMinTpp,
                                  felitronics::oversampling::PolyphaseOversampler::kMaxTapsPerPhase);
-        ovs.prepare (os, kMaxCh, tpp);
+        const double designRate = (std::isfinite (sr) && sr > 0.0)
+                                ? std::clamp (sr, CascadeOversampler::kMinSampleRate, CascadeOversampler::kMaxSampleRate)
+                                : CascadeOversampler::kEdgeRate;
+        (void) ovs.prepare (topology, designRate, os, kMaxCh, tpp);   // cannot refuse: every argument is clamped
         for (int ch = 0; ch < kMaxCh; ++ch)
         {
             osBuf[ch].assign ((std::size_t) (maxBlock * os), 0.0f);
@@ -611,7 +627,8 @@ struct PowerAmpStage::Impl
 inline PowerAmpStage::PowerAmpStage() : impl (std::make_unique<Impl>()) {}
 inline PowerAmpStage::~PowerAmpStage() = default;
 
-inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor, int tapsPerPhase) { impl->prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase); }
+inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor, int tapsPerPhase,
+                                    oversampling::Topology topology) { impl->prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase, topology); }
 inline void PowerAmpStage::reset() { impl->reset(); }
 inline void PowerAmpStage::setParams (const Params& params, const Voicing& voicing) noexcept { impl->setParams (params, voicing); }
 inline bool PowerAmpStage::process (float* const* io, int numChannels, int numSamples) noexcept { return impl->process (io, numChannels, numSamples); }

@@ -7,6 +7,7 @@
 #include <felitronics/core/Math.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/FlushToZero.h>
+#include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 
 #include <algorithm>
@@ -86,6 +87,11 @@ struct TruePeakLimiterConfig
     double lookaheadMs      = 1.0;
     int    oversampleFactor = 4;     // ≥ 2; a requested 1 becomes 2 — there is no 1× path
     int    tapsPerPhase     = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // ≥ 4
+    // Which oversampler (P31). Kaiser — PolyphaseOversampler, the default. Cascade — CascadeOversampler:
+    // flat to 20 kHz at every rate, a power-of-two factor only, a longer round trip (131 samples at
+    // 44.1 kHz 4x). `tapsPerPhase` is range-checked under both and used only by Kaiser. What the cascade
+    // changes about the ceiling is stated under WHAT IT DOES NOT PROMISE, below.
+    oversampling::Topology topology = oversampling::Topology::Kaiser;
 };
 
 // PER-BLOCK parameters — safe to change at any time, from the audio thread, mid-stream.
@@ -261,7 +267,7 @@ public:
         std::size_t channels    = 0;       // one oversampled scratch buffer and one delay line per channel
         std::size_t osBufSamples = 0;      // floats in EACH scratch buffer: the capped block x the factor
         int         osDelaySamples = 0;    // the 20 ms lookahead capacity, in OVERSAMPLED samples
-        oversampling::PolyphaseOversampler::Storage os {};
+        oversampling::Oversampler::Storage os {};
         detail::SlidingMax::Storage slide {};
         std::uint64_t bytes() const noexcept
         {
@@ -291,7 +297,7 @@ public:
         if (config.oversampleFactor > kMaxFactor) return false;
         Storage st;
         const int f = oversampleFactorFor (config);
-        if (! oversampling::PolyphaseOversampler::storageFor (f, maxChannels, config.tapsPerPhase, st.os))
+        if (! oversampling::Oversampler::storageFor (config.topology, sampleRate, f, maxChannels, config.tapsPerPhase, st.os))
             return false;
         // A rate so low that 20 ms cannot hold the minimum lookahead would make prepare()'s clamp
         // std::clamp(x, 2, 1) — lo > hi is undefined behaviour. Refuse instead, here and there.
@@ -344,7 +350,8 @@ public:
     {
         Storage st;
         if (! storageFor (sampleRate, maxBlock, maxChannels, config, st)) return 0;
-        return (config.tapsPerPhase - 1)
+        return oversampling::Oversampler::latencyFor (config.topology, sampleRate, oversampleFactorFor (config),
+                                                      config.tapsPerPhase)
              + lookaheadSamplesFor (sampleRate, config.lookaheadMs, maxLookaheadSamplesFor (sampleRate));
     }
 
@@ -379,7 +386,7 @@ public:
         maxBlock_ = blockFor (maxBlock);
         tpp   = config.tapsPerPhase;
         F     = oversampleFactorFor (config);                  // a requested 1 becomes 2; above kMaxFactor was refused
-        if (! os.prepare (F, maxCh, tpp)) return false;        // oversampler rejected → stay unprepared
+        if (! os.prepare (config.topology, fs, F, maxCh, tpp)) return false;   // rejected → stay unprepared
 
         // st.osBufSamples is maxBlock_ x F, NOT maxBlock x F: the cap above exists to bound exactly this
         // allocation ("without a cap a hostile or mistaken prepare() could ask for gigabytes"), and sizing
@@ -657,7 +664,7 @@ private:
     bool prepared_ = false;                     // true only after a fully-successful prepare()
     TruePeakLimiterParams params;
 
-    oversampling::PolyphaseOversampler os;
+    oversampling::Oversampler os;
     std::vector<std::vector<float>>    osBuf;
     std::vector<float*>                osPtrs;
     std::vector<core::DelayLine>       osDelays;

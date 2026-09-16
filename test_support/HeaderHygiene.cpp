@@ -134,6 +134,8 @@
 #include <felitronics/rigplayer/SectionBiquad.h>
 #include <felitronics/rigplayer/ToneKnobs.h>
 #endif
+#include <felitronics/oversampling/CascadeOversampler.h>
+#include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
