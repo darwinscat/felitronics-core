@@ -490,6 +490,9 @@ static void runCascadeTopology()
         test::ok (! lim.prepare (500.0, 512, 2, cfg) && ! limiter::TruePeakLimiter::storageFor (500.0, 512, 2, cfg, st)
                   && limiter::TruePeakLimiter::latencyFor (500.0, 512, 2, cfg) == 0 && lim.prepare (500.0, 512, 2, k500),
                   "500 Hz: refused under the cascade (its rate window starts at the core's 8 kHz), accepted under Kaiser as before");
+        limiter::TruePeakLimiter edge;
+        test::ok (edge.prepare (core::kMinSampleRate, 512, 2, cfg) && ! edge.prepare (std::nextafter (core::kMinSampleRate, 0.0), 512, 2, cfg),
+                  "and the cascade limiter's floor is exactly the core's 8 kHz — accepted there, refused one representable rate below");
 
         // 20 kHz below the ceiling passes as itself under the cascade; the Kaiser round trip takes 15.5 dB.
         auto level20k = [&] (Topology topo)

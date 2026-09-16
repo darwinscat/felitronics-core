@@ -355,7 +355,7 @@ static void runRefusalTests()
         test::ok (a1 == a2, std::string ("and the refused call left the coefficients and rings untouched: ") + b.why);
         if (b.ch >= 1 && b.ch <= core::kMaxChannels) test::ok (! design && d.latencySamples == 777, std::string ("designFor refuses it too: ") + b.why);
     }
-    test::ok (CascadeOversampler::kMinSampleRate == core::kMinSampleRate, "the floor IS the core's one floor (P51), not a copy of its value");
+    test::ok (CascadeOversampler::kMinSampleRate == core::kMinSampleRate, "the floor equals the core's one floor (P51)");
     test::ok (CascadeOversampler {}.prepare (core::kMinSampleRate, 64, core::kMaxChannels), "the edges themselves are accepted (8 kHz, 64x, kMaxChannels)");
     test::ok (CascadeOversampler {}.prepare (3.0e6, 2, 1), "and 3 MHz");
 

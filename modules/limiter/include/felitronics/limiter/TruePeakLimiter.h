@@ -218,8 +218,9 @@ struct TruePeakLimiterTap
 //     nothing moves. test_support's deliveredBudgetDbFlatTo() enumerates it from the band edge;
 //   * the modulation envelope HOLDS — every dense witness and every click train at releases from 100 ms
 //     down to 0.1 ms lands inside grid + 1.15 dB: worst 1.344 dB at 2x and 44.1 kHz; at 48 kHz 0.997 at 4x
-//     and 0.938 at 8x (against 1.586 and 1.258 — both a hair above the Kaiser totals quoted above, which were
-//     stated for releases >= 1 ms); and at 44.1 kHz, 4x and 8x, the cascade's DENSE excess is lower than
+//     and 0.938 at 8x, inside budgets of 1.586 and 1.258 (these two excesses are a hair above the Kaiser
+//     totals quoted above, which were stated for releases >= 1 ms); and at 44.1 kHz, 4x and 8x, the cascade's
+//     DENSE excess is lower than
 //     Kaiser's (0.49 / 0.48 dB against 0.81 / 0.75);
 //   * both floors at once: 2.03 / 1.42 / 1.37 dB at 2x / 4x / 8x and 44.1 kHz (Kaiser 2.16 / 1.87 / 1.83),
 //     2.17 / 1.85 / 1.79 at 48 kHz — outside the envelope, as under Kaiser, and pinned.

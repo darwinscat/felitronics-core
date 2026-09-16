@@ -66,7 +66,7 @@ namespace felitronics::oversampling
 //
 // WHAT IT DELIVERS, pinned in CascadeOversamplerTests (both composites recovered through the public API):
 // over 14 rates from 8 kHz to 768 kHz and factors 2..64, images and aliases of anything below fs/2 at
-// -91.0 dB or lower and one pass within 0.0042 dB of flat up to the band edge; over EVERY taps count the
+// -91.0 dB or lower and one pass within 0.0043 dB of flat up to the band edge; over EVERY taps count the
 // rule can produce (110 of them, 16..125), -90.9 dB and 0.0049 dB — the rule's real margin; and a
 // palindromic composite.
 //
@@ -80,8 +80,8 @@ namespace felitronics::oversampling
 // transition, not the structure — strictness with a 2.05 kHz transition costs about 250 taps at 2 fs
 // whatever the topology (Kaiser's length estimate; the rule builds 250). Above 44.1 kHz the transition
 // widens and the price falls, but its two halves cross at different rates: the MULTIPLY count drops below
-// the fixed-cutoff design's from about 46 kHz (348 at 48 kHz against 512), the LATENCY only from about
-// 50 kHz (4x: 76 at 48 kHz against 63; 28 at 88.2 kHz).
+// the fixed-cutoff design's almost at once (508 at 44.7 kHz, 348 at 48 kHz, against 512), the LATENCY only
+// from 50.5 kHz (4x: 76 at 48 kHz against 63; 28 at 88.2 kHz).
 //
 // WHAT IT IS NOT FOR. The certified true-peak reference (`analysis::ReferenceTruePeakMeter`) is
 // PolyphaseOversampler at 4x/32 by contract, and stays so. Factors that are not powers of two are

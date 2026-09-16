@@ -73,9 +73,9 @@ namespace detail
 // oversampling::CascadeOversampler, just as strict, a Kaiser 2x stage sized from the sample rate and then
 // halfbands — which Saturator, TruePeakLimiter and PowerAmpStage take on request (oversampling::Topology).
 // Its price is latency, not CPU: 131 base samples at 44.1 kHz 4x against 63 here, for about the same
-// multiply count (572 against 512). Above 44.1 kHz it gets cheaper — in multiplies from about 46 kHz (348 at
-// 48 kHz), in latency only from about 50 kHz (76 at 48 kHz, 28 at 88.2). Switching the stages' DEFAULTS is a
-// step of its own. Since nothing here moved, neither the taps table below nor
+// multiply count (572 against 512). Above 44.1 kHz it gets cheaper — in multiplies almost at once (508 at
+// 44.7 kHz, 348 at 48), in latency only from 50.5 kHz (76 at 48 kHz, 28 at 88.2). Switching the stages'
+// DEFAULTS is a step of its own. Since nothing here moved, neither the taps table below nor
 // test_support's deliveredBudgetDb() needed re-deriving; the cascade's budget is deliveredBudgetDbFlatTo().
 //
 // WHY THE DEFAULT IS 64, AND WHAT SETS IT. The cutoff is FIXED at 0.90 x baseband Nyquist

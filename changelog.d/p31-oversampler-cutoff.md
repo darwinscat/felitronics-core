@@ -11,14 +11,14 @@ design is therefore **strict** — the transition must finish below fs/2.
 
 - **`oversampling::CascadeOversampler`** keeps the guard and moves the band edge: a Kaiser 2x stage whose
   length and cutoff follow from the sample rate by a measured rule, then halfband 2x stages. Images and
-  aliases of anything below fs/2 at **−91 dB or lower**, one pass within **0.0042 dB** up to 20 kHz, over
+  aliases of anything below fs/2 at **−91 dB or lower**, one pass within **0.0043 dB** up to 20 kHz, over
   14 rates from 8 kHz to 768 kHz and factors 2–64 — and **−90.9 dB / 0.0049 dB over every one of the 110
   first-stage lengths the rule can produce**. Powers of two only, rates 8 kHz (the core's floor, P51) to 3 MHz; refuses (law 11b)
   what it cannot build.
 - **The price is latency, not CPU**: **131 base samples at 44.1 kHz 4x** (63 for the Kaiser stage) for
   about the same multiply count (572 against 512). Above 44.1 kHz it gets cheaper, but the two halves cross
-  at different rates: in multiplies from about 46 kHz (348 at 48 kHz), in latency only from about 50 kHz
-  (**76 at 48 kHz, 28 at 88.2 kHz**).
+  at different rates: in multiplies almost at once (508 at 44.7 kHz, 348 at 48 kHz), in latency only from
+  50.5 kHz (**76 at 48 kHz, 28 at 88.2 kHz**).
 - **A halfband first stage — the cheaper-looking cascade — cannot do this**, at any length:
   H(f) + H(Fs/2 − f) = 1 makes its image rejection at fs − a equal its pass-band deviation at a. A 79 + 23
   pair that loses 0.41 dB at 20 kHz leaves that tone's image at −32.5 dB; one flat to 20 kHz still passes
@@ -44,7 +44,7 @@ design is therefore **strict** — the transition must finish below fs/2.
   (16x: 0.027 → 0.033); the 1.15 dB modulation envelope holds (worst 1.344 dB at 2x, inside 2.399), and at
   44.1 kHz, 4x and 8x, the dense excess is lower than Kaiser's (0.49 / 0.48 against 0.81 / 0.75 dB).
 - **The shipped wasm module carries it without being able to use it**: `fcmaster.web.wasm` grows by about
-  12 KB (222 389 → 234 488 B against the main this branch sits on), because the chain's stages now
+  12 KB (222 389 → 234 728 B against the main this branch sits on), because the chain's stages now
   contain the switch, while `fc_master_config` cannot select the cascade. The chain's output does not move:
   `fcore_master` render (with and without the clipper) and solve are bit-identical to main's at 44.1 and
   48 kHz. `fcprobe.web.wasm` is unchanged.
