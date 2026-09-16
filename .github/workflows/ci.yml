@@ -636,6 +636,58 @@ jobs:
           : > empty.f32 && refuse empty.f32 48000 2
           echo "bit-identical: $n native-vs-wasm comparisons of the clipped runs, refusals included"
 
+      - name: NULL test — the streaming surface, native vs wasm, bit-exact (P120)
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
+        # The fc_stream_* handles (fcore::StreamProbe: the deterministic loudness meter and the clip detector, fed
+        # piece by piece and read between the pieces) against `fcore_measure stream`, which drives the same class
+        # without the ABI. Every line after every piece is compared: momentary, short-term and integrated LUFS as
+        # bit patterns, the samples consumed, and the runs decided so far — then finish() and the runs only it
+        # decides. The native reference is this job's contract-off fcore_measure; fcore_master is not a reference,
+        # it is built with contraction, and the detector's run existence depends on it.
+        #
+        # 88200 IS THE ROW THAT MATTERS. The system-libm meter (the one fc_probe_run still uses) gives different
+        # block energies natively and in wasm there; the deterministic one must not. 44100 and 48000 beside it.
+        run: |
+          set -euo pipefail
+          for sr in 44100 48000 88200; do
+            node tools/wasm/make-fixture.mjs      "stream-fix$sr.f32"  "$sr" 2 10
+            node tools/wasm/make-clip-fixture.mjs "stream-clip$sr.f32" "$sr" 2 2
+          done
+          sha256sum -c - <<'SUMS'
+          00b8afdc735b206b80ba349fd64afc81052f5c45477ed64c540ddf7f3f630bd3  stream-fix44100.f32
+          ad4b9513d9d9b88827a07116d36ceafa5c73a7602239c8e4ff6d49c6e2beac39  stream-fix48000.f32
+          c6d50a1b6a60b07b4ccc0531269a4d8f770de12378e02bf2b84021f101d00c1a  stream-fix88200.f32
+          df41196bcac8e77c9e5eecee7b0a807ad672ed76733d63723eee63a37da65c3f  stream-clip44100.f32
+          fab7d41e1925e58f58462e39b7c2481dc0418b5aa28cc0b4203f3c6a710f955f  stream-clip48000.f32
+          2043d1f4c2346cab191e380c931fdaac4786575d9e7995a4d570cbbeaa7f81aa  stream-clip88200.f32
+          SUMS
+          M=./build-native/tools/fcore_measure
+          n=0
+          check() { f=$1; sr=$2; shift 2
+            $M stream "$sr" 2 "$f" "$@" > stream-native.txt
+            test -s stream-native.txt
+            # A clean diff of silence proves nothing: the integrated reading must not be the -120 floor.
+            ! grep '^at ' stream-native.txt | tail -1 | grep -q ' i c05e000000000000 ' \
+              || { echo "integrated is the -120 floor on $f — the comparison is comparing nothing"; exit 1; }
+            for mod in fcprobe.node.js fcprobe.debug.js; do
+              node tools/wasm/stream-parity.mjs "tools/wasm/build/$mod" stream "$sr" 2 "$f" "$@" > stream-wasm.txt
+              test -s stream-wasm.txt
+              diff stream-native.txt stream-wasm.txt || { echo "DIFFER: stream $sr $f $* ($mod)"; exit 1; }
+              n=$((n+1))
+            done; }
+          for sr in 44100 48000 88200; do
+            for k in 4096 4095 $((sr / 100)) 100000; do
+              check "stream-fix$sr.f32"  "$sr" --chunk "$k"
+              check "stream-clip$sr.f32" "$sr" --chunk "$k"
+              # the clamped fixture must have runs, and runs that only finish() decides
+              grep -q '^run ' stream-native.txt || { echo "no runs on stream-clip$sr.f32"; exit 1; }
+              before=$(grep '^at ' stream-native.txt | tail -1 | sed 's/.* runs //')
+              after=$(sed -n 's/^finish runs //p' stream-native.txt)
+              [ "$after" -gt "$before" ] || { echo "finish() decided no runs on stream-clip$sr.f32 ($before -> $after)"; exit 1; }
+            done
+          done
+          echo "bit-identical: $n native-vs-wasm comparisons of the streaming surface, read after every piece"
+
       - name: the five offline analyzers — native vs wasm, byte for byte (P77)
         if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         run: |

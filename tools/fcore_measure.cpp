@@ -26,6 +26,11 @@
 //                 the sample peak of each channel, and every stored run — start, length, level, channel,
 //                 polarity, evidence. Levels and peaks as bit patterns; the format lives in tools/fcore_clips_format.h
 //                 and the wasm module prints it too, so a diff IS the parity test. [--max-runs N] [--chunk N]
+//   stream      → the streaming surface (fcore::StreamProbe, tools/fcore_stream.h): the file fed in pieces of
+//                 --chunk N frames (default 4096) and, after EACH piece, the deterministic meter's momentary,
+//                 short-term and integrated LUFS as bit patterns, the samples consumed, the blocks dropped and
+//                 the runs decided so far; then finish() and the runs only it decides. The wasm module prints
+//                 the same bytes through its fc_stream_* handles (tools/wasm/stream-parity.mjs). [--chunk N]
 //   report      → the whole-programme report (analysis::ProgrammeReport): DC, silence, tail, infra-low,
 //                 stereo, PLR / LRA / short-term percentiles. Every scalar as a raw bit pattern with its
 //                 validity and reason; every count as a decimal integer. Printed through the report's own
@@ -63,6 +68,7 @@
 
 #include "fcore_clips_format.h"
 #include "fcore_probe.h"
+#include "fcore_stream.h"
 
 #include <felitronics/analysis/ProgrammeReport.h>
 #include <felitronics/analysis/SourceForensics.h>
@@ -207,7 +213,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|report|hum|lowend|bursts|forensics> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|forensics> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -448,6 +454,100 @@ int main (int argc, char** argv)
         }
         const std::string text = fcore::formatClips (rep);
         std::fwrite (text.data(), 1, text.size(), stdout);
+        return 0;
+    }
+
+    if (mode == "stream")
+    {
+        // Sized first and read WHOLE, then cut into pieces of exactly --chunk frames with a shorter last one —
+        // the schedule stream-parity.mjs cuts on its side, so the two roads read between the same samples. (The
+        // 8192-frame reader of the other modes would restart the schedule at every read block.) An empty file and
+        // a partial frame are refused, as `clips` refuses them. Nothing is printed until the whole run succeeded:
+        // a refusal is an empty stdout, never a plausible prefix.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width) || width < 1
+            || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        std::uint64_t chunk = 4096;
+        bool seen = false;
+        for (int i = 5; i < argc; ++i)
+        {
+            if (std::strcmp (argv[i], "--precise") == 0) continue;
+            if (std::strcmp (argv[i], "--chunk") != 0 || seen || i + 1 >= argc || ! parseCount (argv[i + 1], chunk))
+            {
+                std::fprintf (stderr, "bad, unknown or repeated option\n");
+                std::fclose (f);
+                return 2;
+            }
+            seen = true;
+            ++i;
+        }
+        if (chunk < 1 || chunk > 0x7FFFFFFFu) { std::fprintf (stderr, "--chunk out of range\n"); std::fclose (f); return 2; }
+
+        std::vector<float> inter ((std::size_t) (frames * (std::uint64_t) nc));
+        const bool whole = std::fread (inter.data(), sizeof (float), inter.size(), f) == inter.size();
+        std::fclose (f);
+        if (! whole) { std::fprintf (stderr, "the file did not deliver the %llu frames it was sized for\n", (unsigned long long) frames); return 2; }
+        std::vector<std::vector<float>> planes ((std::size_t) nc, std::vector<float> ((std::size_t) frames));
+        for (std::uint64_t i = 0; i < frames; ++i)
+            for (int c = 0; c < nc; ++c)
+                planes[(std::size_t) c][(std::size_t) i] = inter[(std::size_t) (i * (std::uint64_t) nc + (std::uint64_t) c)];
+
+        fcore::StreamProbe sp;
+        if (! sp.prepare (rate, nc))
+        {
+            std::fprintf (stderr, "stream.prepare refused (sampleRate %g..%g)\n",
+                          analysis::ClipDetector::kMinSampleRate, analysis::ClipDetector::kMaxSampleRate);
+            return 2;
+        }
+        std::string out;
+        char line[256];
+        std::snprintf (line, sizeof line, "# fcore stream v1 sr=%016llx ch=%d chunk=%llu\n",
+                       (unsigned long long) bits (rate), nc, (unsigned long long) chunk);
+        out += line;
+        std::int64_t read = 0;
+        auto drain = [&]
+        {
+            const auto& d = sp.detector();
+            for (; read < d.storedRunCount(); ++read)
+            {
+                const analysis::ClipRun u = d.run (read);
+                std::snprintf (line, sizeof line, "run %lld %lld %016llx %d %d %d\n", (long long) u.start,
+                               (long long) u.length, (unsigned long long) bits (u.level), u.channel, u.sign,
+                               (int) u.evidence);
+                out += line;
+            }
+        };
+        const float* view[core::kMaxChannels] {};
+        for (std::uint64_t at = 0; at < frames; at += chunk)
+        {
+            const std::uint64_t m = std::min (chunk, frames - at);
+            for (int c = 0; c < nc; ++c) view[c] = planes[(std::size_t) c].data() + at;
+            if (! sp.process (view, (int) m)) { std::fprintf (stderr, "stream.process refused at frame %llu\n", (unsigned long long) at); return 2; }
+            const auto& lm = sp.meter();
+            std::snprintf (line, sizeof line, "at %lld m %016llx s %016llx i %016llx dropped %d runs %lld\n",
+                           (long long) sp.samples(), (unsigned long long) bits (lm.momentaryLufs()),
+                           (unsigned long long) bits (lm.shortTermLufs()), (unsigned long long) bits (lm.integratedLufs()),
+                           lm.droppedBlocks(), (long long) sp.detector().runCount());
+            out += line;
+            drain();
+        }
+        if (! sp.finish()) { std::fprintf (stderr, "stream.finish refused\n"); return 2; }
+        std::snprintf (line, sizeof line, "finish runs %lld\n", (long long) sp.detector().runCount());
+        out += line;
+        drain();
+        std::fwrite (out.data(), 1, out.size(), stdout);
         return 0;
     }
 

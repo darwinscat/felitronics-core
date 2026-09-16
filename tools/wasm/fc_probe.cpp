@@ -21,6 +21,7 @@
 
 #include "fcore_clips.h"
 #include "fcore_probe.h"
+#include "fcore_stream.h"
 
 #include <felitronics/analysis/BandBursts.h>
 #include <felitronics/analysis/HumDetector.h>
@@ -30,6 +31,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #if defined(__EMSCRIPTEN__)
@@ -160,9 +162,10 @@ namespace
 // A REJECTED CALL CLEARS THE PREVIOUS RESULT: the getters read zero after a failure, never the last good run.
 // That is enforced by a flag rather than left to fall out of where Probe::prepare() returns — a bad sample
 // rate is caught before the meter is touched, so without the flag a caller who ignored the return value would
-// be served the previous file's numbers. Every exported entry point below is a complete measurement from
-// scratch: calling fc_probe_lufs() after fc_probe_run() re-runs the whole thing, and the getters then
-// describe THAT run.
+// be served the previous file's numbers. Each of fc_probe_run, fc_probe_lufs and fc_probe_dbtp is a complete
+// measurement from scratch: calling fc_probe_lufs() after fc_probe_run() re-runs the whole thing, and the
+// getters then describe THAT run. (The fc_stream_* handles further down are the one road here that carries a
+// measurement across calls, and they do it on purpose.)
 FC_EXPORT int fc_probe_run (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate)
 {
     return run (planar, frames, channels, sampleRate) ? 1 : 0;
@@ -386,6 +389,20 @@ namespace
     // comparisons happen to work. A number a caller has to add to its own byte counts, or put in a report,
     // must not be one. (The same measurement corrected the sibling claim in tools/wasm/build.sh.)
     constexpr std::uint32_t kClipRunStride = 6;
+
+    // Field k of a run in that order — ONE packing, read by fc_probe_clips_runs and by fc_stream_clips.
+    double clipRunField (const felitronics::analysis::ClipRun& r, std::uint32_t k) noexcept
+    {
+        switch (k)
+        {
+            case 0:  return (double) r.start;
+            case 1:  return (double) r.length;
+            case 2:  return r.level;
+            case 3:  return (double) r.channel;
+            case 4:  return (double) r.sign;
+            default: return (double) (int) r.evidence;
+        }
+    }
 }
 
 // Measures one planar buffer end to end — prepare, the whole file, finish — and leaves the result readable by
@@ -457,18 +474,154 @@ FC_EXPORT std::uint32_t fc_probe_clips_runs (double* out, std::uint32_t cap)
     const std::uint32_t n = m * kClipRunStride;                   // m <= kMaxRuns (2^20), so this cannot wrap
     const std::uint32_t wrote = copyOut (out, n, n, [&] (std::uint32_t i)
     {
-        const felitronics::analysis::ClipRun r = c.run ((std::int64_t) (i / kClipRunStride));
-        switch (i % kClipRunStride)
-        {
-            case 0:  return (double) r.start;
-            case 1:  return (double) r.length;
-            case 2:  return r.level;
-            case 3:  return (double) r.channel;
-            case 4:  return (double) r.sign;
-            default: return (double) (int) r.evidence;
-        }
+        return clipRunField (c.run ((std::int64_t) (i / kClipRunStride)), i % kClipRunStride);
     });
     return wrote == n ? m : 0u;                                   // a refused span writes nothing and says so
+}
+
+//==============================================================================
+// THE STREAMING SURFACE (P120): loudness and clipped runs of a stream handed over piece by piece and read
+// BETWEEN the pieces — fcore::StreamProbe (tools/fcore_stream.h), the class `fcore_measure stream` drives too.
+// Read that header for why the meter is analysis::DeterministicLoudnessMeter and not the one fc_probe_run uses.
+//
+//   h = fc_stream_create (sampleRate, channels)          0 when refused
+//   fc_stream_process (h, planar, frames)                1, or 0 — and a refused piece that carried samples
+//                                                        poisons the stream: every reader below answers 0
+//   fc_stream_loudness (h, out)                          fc_stream_loudness_fields() doubles: momentary,
+//                                                        short-term, integrated (LUFS), samples consumed,
+//                                                        gating blocks dropped past the one-hour store
+//   fc_stream_clips_count (h)                            runs decided so far, stored or not
+//   fc_stream_clips (h, from, out, cap)                  stored runs from index `from`, as fc_probe_clips_runs
+//   fc_stream_finish (h)                                 decides the last runs; the stream takes no more audio
+//   fc_stream_destroy (h)
+//
+// HANDLES, NOT A SINGLETON, because two streams must be measurable at once. A HANDLE IS A NUMBER, NEVER AN
+// ADDRESS: a page hands it back, and an address handed back would be dereferenced whatever it was — stale after
+// destroy, forged, or the 0 of a create that failed. So it is a serial looked up in a fixed table and never
+// reused, and every entry point refuses one it does not know, which is planarSpan()'s "the call is refused, the
+// module does not die" applied to the handle.
+//
+// AT MOST kMaxStreams AT ONCE. The page needs two. The bound is what a page can make the module hold: one stream
+// asks for 3.1 MB at 48 kHz stereo and 29.5 MB at 768 kHz and 16 channels (the detector's deques, pending queue
+// and 65536-run list, plus the meter's hour — measured natively), and this module is -fno-exceptions, where an
+// allocation that fails aborts instead of refusing. Sixteen at the extreme stay far inside the 2 GiB heap.
+namespace
+{
+    constexpr int kMaxStreams = 16;
+    constexpr std::uint32_t kStreamLoudnessFields = 5;
+
+    struct StreamSlot
+    {
+        fcore::StreamProbe* probe  = nullptr;
+        std::uint32_t       handle = 0;
+    };
+    StreamSlot streamSlots[kMaxStreams] {};
+    std::uint32_t lastStreamHandle = 0;
+
+    fcore::StreamProbe* streamOf (std::uint32_t h) noexcept
+    {
+        if (h == 0) return nullptr;
+        for (const auto& s : streamSlots) if (s.handle == h) return s.probe;
+        return nullptr;
+    }
+}
+
+FC_EXPORT std::uint32_t fc_stream_create (double sampleRate, std::uint32_t channels)
+{
+    if (! geometry (channels)) return 0u;
+    StreamSlot* slot = nullptr;
+    for (auto& s : streamSlots) if (s.probe == nullptr) { slot = &s; break; }
+    if (slot == nullptr) return 0u;
+    auto* p = new (std::nothrow) fcore::StreamProbe;
+    if (p == nullptr) return 0u;
+    if (! p->prepare (sampleRate, (int) channels)) { delete p; return 0u; }
+    // Never 0 and never a live handle — a wrap past 2^32 creates would otherwise hand out a number in use.
+    do { ++lastStreamHandle; } while (lastStreamHandle == 0u || streamOf (lastStreamHandle) != nullptr);
+    slot->probe = p;
+    slot->handle = lastStreamHandle;
+    return slot->handle;
+}
+
+// `frames` samples of each of the stream's channels, planar as everywhere in this file. frames == 0 carries
+// nothing and destroys nothing.
+FC_EXPORT int fc_stream_process (std::uint32_t h, const float* planar, std::uint32_t frames)
+{
+    fcore::StreamProbe* s = streamOf (h);
+    if (s == nullptr) return 0;
+    if (frames == 0) return s->process (nullptr, 0) ? 1 : 0;
+    const std::uint32_t channels = (std::uint32_t) s->channels();
+    if (! planarSpan (planar, frames, channels)) { s->poison(); return 0; }
+    const float* view[felitronics::core::kMaxChannels] {};
+    for (std::uint32_t c = 0; c < channels; ++c) view[c] = planar + (std::size_t) c * (std::size_t) frames;
+    // planarSpan() bounds frames*channels*4 by 4 GiB, so frames is below 2^30 and fits the instruments' int.
+    return s->process (view, (int) frames) ? 1 : 0;
+}
+
+FC_EXPORT std::uint32_t fc_stream_loudness_fields (void) { return kStreamLoudnessFields; }
+
+// Writes fc_stream_loudness_fields() doubles into `out` and returns 1, or writes nothing and returns 0.
+FC_EXPORT int fc_stream_loudness (std::uint32_t h, double* out)
+{
+    const fcore::StreamProbe* s = streamOf (h);
+    if (s == nullptr || ! s->valid() || ! outSpan (out, kStreamLoudnessFields, 8u)) return 0;
+    const auto& m = s->meter();
+    out[0] = m.momentaryLufs();
+    out[1] = m.shortTermLufs();
+    out[2] = m.integratedLufs();
+    out[3] = (double) s->samples();
+    out[4] = (double) m.droppedBlocks();
+    return 1;
+}
+
+// Every run decided so far, including the ones past the list's capacity. A double, like every count here that
+// a stream of unbounded length can grow.
+FC_EXPORT double fc_stream_clips_count (std::uint32_t h)
+{
+    const fcore::StreamProbe* s = streamOf (h);
+    return s != nullptr && s->valid() ? (double) s->detector().runCount() : 0.0;
+}
+
+FC_EXPORT std::uint32_t fc_stream_clips_stride (void) { return kClipRunStride; }
+
+// The stored runs from index `from` on, as many whole ones as fit — `cap` IN DOUBLES and the return IN RUNS,
+// the fc_probe_clips_runs rule and for its reason. A reader polls with `from` = the runs it already holds; 0
+// means nothing new (or a refusal), never a short run.
+FC_EXPORT std::uint32_t fc_stream_clips (std::uint32_t h, std::uint32_t from, double* out, std::uint32_t cap)
+{
+    const fcore::StreamProbe* s = streamOf (h);
+    if (s == nullptr || ! s->valid()) return 0u;
+    const auto& d = s->detector();
+    const std::int64_t stored = d.storedRunCount();
+    if ((std::int64_t) from >= stored) return 0u;
+    const std::uint32_t left = (std::uint32_t) (stored - (std::int64_t) from);   // stored <= 65536
+    const std::uint32_t fits = cap / kClipRunStride;
+    const std::uint32_t m = fits < left ? fits : left;
+    if (m == 0) return 0u;
+    const std::uint32_t n = m * kClipRunStride;
+    const std::uint32_t wrote = copyOut (out, n, n, [&] (std::uint32_t i)
+    {
+        return clipRunField (d.run ((std::int64_t) from + (std::int64_t) (i / kClipRunStride)), i % kClipRunStride);
+    });
+    return wrote == n ? m : 0u;
+}
+
+FC_EXPORT int fc_stream_finish (std::uint32_t h)
+{
+    fcore::StreamProbe* s = streamOf (h);
+    return s != nullptr && s->finish() ? 1 : 0;
+}
+
+FC_EXPORT int fc_stream_destroy (std::uint32_t h)
+{
+    if (h == 0) return 0;
+    for (auto& s : streamSlots)
+        if (s.handle == h)
+        {
+            delete s.probe;
+            s = StreamSlot {};
+            return 1;
+        }
+    return 0;
 }
 
 // Build identity, so a mismatched artifact is obvious in a report rather than a mystery.
