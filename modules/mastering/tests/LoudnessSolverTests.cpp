@@ -2787,8 +2787,8 @@ static void testLraRefusesAPoisonedProgramme()
 //
 // It REPLACES P41 F1's solve at 1e-305 Hz, which is no longer reachable: at 8000 Hz and above `frames / fs` is at most
 // INT_MAX / 8000 s, finite, so the seconds form cannot overflow here any more. The property itself — a store sized in
-// SAMPLES holds the programme whatever the rate — is pinned on the meter, which still takes any rate
-// (LoudnessConformanceTests, "P41 F1, re-homed").
+// SAMPLES holds the programme — is pinned on the meter at the floor (LoudnessConformanceTests, "P41 F1, re-homed");
+// since P103 the meter refuses such a rate itself.
 // MUTATIONS KILLED: the floor removed; `>` for `>=`; 1000 for 8000; the budget's own copy of the test left at `> 0`.
 static void testTheRateFloor()
 {

@@ -25,8 +25,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -515,26 +518,26 @@ int main()
         M lmRate;
         test::ok (lmRate.prepare (2.1e10, 1, 1.0e-6), "prepare(21 GHz, 1 µs) is accepted, as it always was");
 
-        // P41 F1, RE-HOMED (P51). The solver sizes the meter behind a solve in SAMPLES, because `frames / fs` seconds is
-        // +inf at an absurd finite rate and the store used to be `(std::size_t) inf` — 3 kept blocks on arm64 and
-        // wasm32, 4 on x86-64 gcc, for one call. That was pinned by a solve at 1e-305 Hz, which the search refuses
-        // since P51 (its floor is 8000 Hz, where `frames / fs` stays finite). The property lives here now, on the one
-        // class that still takes such a rate: sized in samples, the store holds the programme; asked in seconds, the
-        // same capacity is +inf and is refused rather than converted.
+        // P41 F1, RE-HOMED TWICE (P51, P103). The solver sizes the meter behind a solve in SAMPLES, because `frames / fs`
+        // seconds was +inf at an absurd finite rate and the store used to be `(std::size_t) inf` — 3 kept blocks on arm64
+        // and wasm32, 4 on x86-64 gcc, for one call. It was pinned by a solve at 1e-305 Hz (refused by the search since
+        // P51), then by this meter at that rate — which the meter itself refuses since P103 (the group below). At the
+        // floor the seconds form is finite and a trip through it costs nothing: ceil((n / 8000) · 8000) is never below
+        // n (checked over four million n), so there is no rounding witness left to pin. What is left is the capacity the
+        // solver asks for, at the floor — it holds the programme — and +inf seconds, refused rather than converted.
         {
-            const double tiny = 1.0e-305;
-            const int frames = 2000;
-            test::ok (! std::isfinite ((double) frames / tiny), "PRECONDITION: the seconds form is +inf at 1e-305 Hz");
+            const double fs = M::kMinSampleRate;
+            const int frames = 160000;                      // 200 hops of 800 samples
             M byTime;
-            test::ok (! byTime.prepare (tiny, 1, (double) frames / tiny + 1.0), "in seconds (+inf): refused, not converted");
+            test::ok (! byTime.prepare (fs, 1, inf), "at the floor, in seconds (+inf): refused, not converted");
             M bySamples;
-            test::ok (bySamples.prepareForSamples (tiny, 1, (double) frames + std::ceil (tiny)),
-                      "in samples, frames + ceil(fs) — the solver's own capacity: accepted");
+            test::ok (bySamples.prepareForSamples (fs, 1, (double) frames + std::ceil (fs)),
+                      "at the floor, in samples, frames + ceil(fs) — the solver's own capacity: accepted");
             std::vector<float> x ((std::size_t) frames);
             for (int i = 0; i < frames; ++i) x[(std::size_t) i] = (i & 1) ? 0.25f : -0.25f;
             const float* xp[1] { x.data() };
             test::run (bySamples.process (xp, 1, frames));
-            // one-sample sub-hops: 2000 of them are 200 hops, and the first block is born on the 4th — 197 blocks
+            // 80-sample sub-hops: 160000 samples are 200 hops, and the first block is born on the 4th — 197 blocks
             test::ok (bySamples.droppedBlocks() == 0 && bySamples.gatingBlockCount() == 197,
                       "and it holds all 197 blocks the programme produces (dropped "
                       + std::to_string (bySamples.droppedBlocks()) + ")");
@@ -553,13 +556,16 @@ int main()
         // arithmetic does. Each row is derived by hand from `s = max(1, lround(0.01·fs))`, `hops = ⌈n⌉/(10·s)`,
         // blocks = ⌊hops⌋ + 4, shortTerm = ⌊hops/10⌋ + 8, bytes = 8·(300 + blocks + shortTerm):
         struct Row { double fs, n; int s; std::size_t blocks, shortTerm; std::uint64_t bytes; };
+        // (Since P103 the rows sit at 8000 Hz and up, with the same block counts they had at 150, 149 and 100 Hz. The
+        // plateau `max(1, ·)` is out of reach now: the smallest sub-hop an accepted rate has is 80 samples, and a rate
+        // <= 0 reads as 48 kHz.)
         const Row rows[] = {
-            { 48000.0,  480000.0, 480,    104,    18,    3376 },   // hops 100
-            { 44100.0,  441000.0, 441,    104,    18,    3376 },   // hops 100
-            { 22050.0,  220500.0, 221,    103,    17,    3360 },   // lround(220.5) = 221, hops 99.77
-            {   150.0,    1500.0,   2,     79,    15,    3152 },   // lround(1.5) = 2, hops 75
-            {   149.0,       1.0,   1,      4,     8,    2496 },   // lround(1.49) = 1, hops 0.1
-            {   100.0, 3600000.0,   1, 360004, 36008, 3170496 },   // the plateau s = 1: hops 360000
+            { 48000.0,    480000.0, 480,    104,    18,    3376 },   // hops 100
+            { 44100.0,    441000.0, 441,    104,    18,    3376 },   // hops 100
+            { 22050.0,    220500.0, 221,    103,    17,    3360 },   // lround(220.5) = 221, hops 99.77
+            {  8050.0,     60750.0,  81,     79,    15,    3152 },   // lround(80.5) = 81, hops 75
+            {  8049.0,        80.0,  80,      4,     8,    2496 },   // lround(80.49) = 80, hops 0.1
+            {  8000.0, 288000000.0,  80, 360004, 36008, 3170496 },   // the floor: hops 360000
         };
         for (const Row& r : rows)
         {
@@ -628,6 +634,111 @@ int main()
                           "a store of exactly 40·hop" + std::string (d < 0 ? "-1" : d > 0 ? "+1" : "")
                           + " samples keeps every block it is fed (" + std::to_string (want[d + 1]) + ")");
             }
+        }
+    }
+
+    // --- P103: the meter's own rate floor, and a refusal that leaves nothing of the previous programme ---
+    test::group ("P103: a rate in (0, 8000) Hz is refused, a rate <= 0 is still 48 kHz, and a refusal disarms");
+    {
+        using M = analysis::LoudnessMeter;
+        const double inf = std::numeric_limits<double>::infinity();
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        test::ok (M::kMinSampleRate == 8000.0, "the floor is 8000 Hz — a literal pin");
+
+        // What a never-prepared meter answers, bit for bit — the reference every refusal is held to.
+        auto bits = [] (double v) { std::uint64_t u = 0; std::memcpy (&u, &v, sizeof u); return u; };
+        auto sameAsFresh = [&] (const M& m) {
+            const M fresh;
+            return bits (m.momentaryLufs())  == bits (fresh.momentaryLufs())
+                && bits (m.shortTermLufs())  == bits (fresh.shortTermLufs())
+                && bits (m.integratedLufs()) == bits (fresh.integratedLufs())
+                && bits (m.loudnessRangeLu()) == bits (fresh.loudnessRangeLu())
+                && m.droppedBlocks() == fresh.droppedBlocks() && m.nonFiniteSubHops() == fresh.nonFiniteSubHops()
+                && m.gatingBlockCount() == fresh.gatingBlockCount()
+                && m.gatingBlockEnergies().size() == fresh.gatingBlockEnergies().size();
+        };
+        // A previous programme that leaves EVERY reading non-trivial: 12 s of tone into 10 s of capacity (blocks
+        // dropped, a range), one NaN sample in it (a poisoned sub-hop), the last 400 ms loud (momentary).
+        auto played = [&] () {
+            M m;
+            felitronics::test::run (m.prepare (48000.0, 2, 10.0));
+            long long idx = 0;
+            feedSine (m, 48000.0, kToneHz, -30.0, 6.0, idx);
+            std::vector<float> bad (480, 0.1f);
+            bad[7] = std::numeric_limits<float>::quiet_NaN();
+            const float* bp[2] { bad.data(), bad.data() };
+            felitronics::test::run (m.process (bp, 2, 480));
+            feedSine (m, 48000.0, kToneHz, -20.0, 6.0, idx);
+            return m;
+        };
+        {
+            const M m = played();
+            test::ok (! sameAsFresh (m) && m.droppedBlocks() > 0 && m.nonFiniteSubHops() > 0 && m.gatingBlockCount() > 0
+                      && std::isfinite (m.integratedLufs()) && m.loudnessRangeLu() > 0.0,
+                      "PRECONDITION: the previous programme is readable through every reading (dropped "
+                      + std::to_string (m.droppedBlocks()) + ", non-finite " + std::to_string (m.nonFiniteSubHops()) + ")");
+        }
+
+        struct Bad { double fs; int nch; double samples; const char* what; };
+        const Bad bad[] {
+            { 7999.0,                       2, 48000.0, "7999 Hz" },
+            { std::nextafter (8000.0, 0.0), 2, 48000.0, "one ulp under 8000 Hz" },
+            { 3300.0,                       2, 48000.0, "3300 Hz, where the shelf is unstable" },
+            { 44.1,                         2, 48000.0, "44.1 — kilohertz passed as hertz" },
+            { 1.0e-300,                     2, 48000.0, "1e-300 Hz" },
+            { 5.0e-324,                     2, 48000.0, "the smallest subnormal" },
+            { inf,                          2, 48000.0, "+inf" },
+            { 48000.0,                      0, 48000.0, "zero channels (an old refusal)" },
+            { 48000.0, core::kMaxChannels + 1, 48000.0, "one channel too many (an old refusal)" },
+            { 48000.0,                      2, inf,     "+inf samples (an old refusal)" },
+        };
+        for (const Bad& b : bad)
+        {
+            M m = played();
+            test::ok (! m.prepareForSamples (b.fs, b.nch, b.samples), std::string ("refused: ") + b.what);
+            test::ok (sameAsFresh (m), std::string ("and every reading is a fresh meter's: ") + b.what);
+            std::vector<float> z (480, 0.25f);
+            const float* zp[2] { z.data(), z.data() };
+            test::ok (! m.process (zp, 2, 480), std::string ("and process() is refused: ") + b.what);
+            M byTime = played();
+            test::ok (! byTime.prepare (b.fs, b.nch, b.samples / 48000.0) && sameAsFresh (byTime),
+                      std::string ("the seconds form says the same, and disarms too: ") + b.what);
+            if (b.nch == 2 && std::isfinite (b.samples))
+            {
+                M::Storage st;
+                test::ok (! M::storageFor (b.fs, b.samples, st), std::string ("storageFor agrees: ") + b.what);
+            }
+        }
+
+        // ACCEPTED: the floor and above as themselves; a rate that is NOT GIVEN — <= 0, NaN — as 48 kHz, which is the
+        // published default and is left alone. "Read as 48 kHz" is checked on the readings, not only on the store: the
+        // same programme measures bit-identically on a meter prepared at 48000.
+        long long ref0 = 0;
+        M ref;
+        felitronics::test::run (ref.prepare (48000.0, 2, 10.0));
+        feedSine (ref, 48000.0, 997.0, -18.0, 4.0, ref0);
+        struct Good { double fs; bool as48k; const char* what; };
+        const Good good[] {
+            { 8000.0,                        false, "8000 Hz, the floor itself" },
+            { std::nextafter (8000.0, 1e9),  false, "one ulp over the floor" },
+            { 0.0,                           true,  "0 — not given" },
+            { -0.0,                          true,  "-0 — not given" },
+            { -48000.0,                      true,  "a negative rate — not given" },
+            { -inf,                          true,  "-inf — not given" },
+            { nan,                           true,  "NaN — not given" },
+        };
+        for (const Good& g : good)
+        {
+            M m = played();
+            M::Storage st;
+            test::ok (m.prepareForSamples (g.fs, 2, 480000.0) && M::storageFor (g.fs, 480000.0, st),
+                      std::string ("accepted, and storageFor agrees: ") + g.what);
+            if (! g.as48k) continue;
+            long long i0 = 0;
+            feedSine (m, 48000.0, 997.0, -18.0, 4.0, i0);
+            test::ok (st.subSamples == 480 && bits (m.integratedLufs()) == bits (ref.integratedLufs())
+                          && bits (m.momentaryLufs()) == bits (ref.momentaryLufs()),
+                      std::string ("and it measures as 48 kHz, bit for bit: ") + g.what);
         }
     }
 

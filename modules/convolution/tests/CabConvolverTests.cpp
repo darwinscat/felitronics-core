@@ -16,7 +16,9 @@
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -543,10 +545,16 @@ int main()
             const std::vector<float> one { 0.8f };
             const float* c[1] { one.data() };
             const float* nullPlane[1] { nullptr };
+            // A KNOWN rate whose resample resampleIr refuses by length: 8000 Hz into this fixture's 44.1 kHz is x5.5125,
+            // and 3 043 487 taps become 16 777 222 > kMaxResampleSamples (2^24). (It was one tap at 1e-5 Hz — x4.41e9,
+            // past INT_MAX — until P105 made a rate under 8000 Hz unknown, which loads as is.)
+            std::vector<float> tooLong;
+            if (nothing == Nothing::refusedRate) tooLong.assign (3043487, 0.5f);
+            const float* longPlane[1] { tooLong.data() };
             switch (nothing)
             {
                 case Nothing::zeroLength:     convolver.loadIR (c, 1, 0, 44100.0); break;
-                case Nothing::refusedRate:    convolver.loadIR (c, 1, 1, 1.0e-5); break;     // x 4.41e9: past INT_MAX
+                case Nothing::refusedRate:    convolver.loadIR (longPlane, 1, (int) tooLong.size(), 8000.0); break;
                 case Nothing::negativeLength: convolver.loadIR (c, 1, -1, 44100.0); break;
                 case Nothing::nullArray:      convolver.loadIR (nullptr, 1, 4, 44100.0); break;
                 case Nothing::nullPlane:      convolver.loadIR (nullPlane, 1, 4, 44100.0); break;
@@ -583,7 +591,7 @@ int main()
         survives (false, false, Nothing::zeroLength,  "a zero-length load over a pending mono load");
         survives (false, true,  Nothing::zeroLength,  "a zero-length load over a pending NORMALIZED load");
         survives (true,  false, Nothing::zeroLength,  "a zero-length MONO load over a pending STEREO load");
-        survives (true,  true,  Nothing::refusedRate, "a load at 1e-5 Hz (its resample would be past INT_MAX) over a pending normalized stereo load");
+        survives (true,  true,  Nothing::refusedRate, "a load at 8000 Hz whose resample would be past 2^24 taps, over a pending normalized stereo load");
 
         // And the load that used to stage nothing — one tap at 96 kHz — now stages, so it is the LATEST and wins.
         {
@@ -862,7 +870,8 @@ int main()
         const double asIs[] { 48000.0, 48000.0000001, 48000.0432,               // the same rate, three ways
                               std::numeric_limits<double>::quiet_NaN(), 0.0, -48000.0,
                               std::numeric_limits<double>::infinity(),
-                              -std::numeric_limits<double>::infinity() };      // ...and every unknown one
+                              -std::numeric_limits<double>::infinity(),      // ...and every unknown one —
+                              44.1, 1000.0, 7999.0, std::nextafter (8000.0, 0.0) };   // under the floor too (P105)
         bool verbatim = true, unity = true;
         for (const double rate : asIs)
         {
@@ -874,38 +883,79 @@ int main()
             unity    = unity && convolver.irNormalizationGain() == 1.0f
                              && convolver.irNormalizationGainDb() == 0.0f;
         }
-        test::ok (verbatim, "the host's own rate, one within the tolerance, and five unusable ones: taps byte-verbatim");
+        test::ok (verbatim, "the host's own rate, one within the tolerance, and nine unusable ones: taps byte-verbatim");
         test::ok (unity, "and the applied gain is exactly 1.0f (0.0 dB) on every one of them");
     }
 
 
-    // P68 — THE dB DIAGNOSTIC'S FLOOR, which this change made reachable. `irNormalizationGainDb()` floors
-    // its argument so a zero cannot read as -inf; the floor was 1e-6, which sat BELOW every gain the old
-    // code could apply (the normalization clamps at -30 dB = 0.0316) and ABOVE what the rate factor can
-    // reach. A file claiming 0.024 Hz is not a real file, but it is a rate the loader accepts — P67 settled
-    // that a finite positive rate is a KNOWN rate — and it resamples one tap into two million, applying
-    // 5.0e-7. The reading said -120.0000 dB for a gain of -126.0206.
-    // THIS IS THE MOST EXPENSIVE CASE IN THE FILE AND ITS COST IS MEASURED, NOT GUESSED: 1.6 s of the
-    // binary's 2.1 s on macOS/arm64 clang, and the whole file runs 3.5 s in the CHECKED wasm row
-    // (SAFE_HEAP + assertions, which instruments every load and store across 1.28e8 window-tap
-    // iterations) — the row worth naming, because it is the one a local release build never exercises.
-    // There is no cheaper way to stand on that floor: a gain under 1e-6 needs an output of inLen/g taps
-    // and inLen is already 1, so the million is arithmetic, not a choice.
-    test::group ("P68 — an extreme accepted rate reports its true dB, not the anti-infinity floor");
+    // P68 — THE dB DIAGNOSTIC'S FLOOR. `irNormalizationGainDb()` floors its argument so a zero cannot read as -inf;
+    // the floor was 1e-6, and P68 made the rate factor reach under it: a file claiming 0.024 Hz resampled one tap
+    // into two million and applied 5.0e-7, which read -120.0000 dB for a gain of -126.0206 (and cost 1.6 s of this
+    // binary). Since P105 a rate under 8000 Hz is unknown and loads as is, so the smallest factor the loader can
+    // apply is 8000 / 3e6 on a 3 MHz host — -51.48 dB, above both floors. The row stands on that minimum, and the
+    // old 0.024 Hz file is pinned in the P105 group below as the unknown load it now is.
+    test::group ("P68 / P105 — the smallest rate factor reports its true dB");
     {
         std::vector<float> one { 1.0f };
         CabConvolver convolver;
-        felitronics::test::run (convolver.prepare (48000.0, 128, 1, 0.05, /*normalize*/ false));
+        felitronics::test::run (convolver.prepare (CabConvolver::kMaxSampleRate, 128, 1, 0.05, /*normalize*/ false));
         const float* banks[1] { one.data() };
-        convolver.loadIR (banks, 1, 1, 0.024);
+        convolver.loadIR (banks, 1, 1, 8000.0);
         const double applied = (double) convolver.irNormalizationGain();
         const double reported = (double) convolver.irNormalizationGainDb();
-        std::printf ("    0.024 Hz -> 48 kHz: %d taps, gain %.6e, %.4f dB (the floor would say -120.0000)\n",
+        std::printf ("    8000 Hz -> 3 MHz: %d taps, gain %.6e, %.4f dB\n",
                      (int) convolver.stagedTaps()[0].size(), applied, reported);
-        test::ok (convolver.stagedTaps()[0].size() == 2000000, "one tap at 0.024 Hz stages two million");
-        test::approx (applied, 0.024 / 48000.0, 1.0e-13, "the applied gain is the rate ratio, 5e-7");
-        test::approx (reported, 20.0 * std::log10 (0.024 / 48000.0), 1.0e-3,
-                      "and its dB reading is -126.0206, the gain that was actually applied");
+        test::ok (convolver.stagedTaps()[0].size() == 375, "one tap at 8000 Hz on a 3 MHz host stages 375");
+        test::ok (applied == (double) (float) (8000.0 / 3.0e6), "the applied gain is the rate ratio, 8000 / 3e6, exactly as a float");
+        test::approx (reported, 20.0 * std::log10 (8000.0 / 3.0e6), 1.0e-3, "and its dB reading is -51.4806, the gain that was applied");
+    }
+
+    // P105 — A HEADER RATE UNDER 8000 Hz IS BROKEN METADATA, AND BROKEN METADATA PLAYS AS IS (P67's rule, one rule).
+    // 44.1 is kilohertz written as hertz: trusted, it resampled a 4096-tap cabinet into 4 458 231 taps on a 48 kHz
+    // host. Each such load is held to the NaN load — the rule's own "unknown" — on everything a caller can read:
+    // the staged taps, both gain accessors, and what the convolver plays; on both paths.
+    test::group ("P105 — an IR rate under 8000 Hz is an unknown rate: the load is the NaN load, bit for bit");
+    {
+        std::vector<float> ir (257);
+        std::uint32_t seed = 11u;
+        for (float& v : ir) { seed = seed * 1664525u + 1013904223u; v = (float) ((double) (seed >> 8) / 16777216.0 - 0.5); }
+        ir[0] = 1.0f;
+        std::vector<float> x (4096);
+        for (float& v : x) { seed = seed * 1664525u + 1013904223u; v = (float) ((double) (seed >> 8) / 16777216.0 - 0.5) * 0.5f; }
+        struct Heard { std::vector<std::vector<float>> taps; float gain, gainDb; std::vector<float> l, r; };
+        const auto load = [&] (double rate, bool normalize) {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (48000.0, 256, 2, 0.05, normalize));
+            const float* banks[1] { ir.data() };
+            convolver.loadIR (banks, 1, (int) ir.size(), rate);
+            pumpCrossfade (convolver);
+            convolver.reset();
+            Heard h { convolver.stagedTaps(), convolver.irNormalizationGain(), convolver.irNormalizationGainDb(), x, x };
+            renderVariableBlocks (convolver, h.l, h.r);
+            return h;
+        };
+        const auto bitsOf = [] (float v) { std::uint32_t u = 0; std::memcpy (&u, &v, sizeof u); return u; };
+        const double broken[] { 44.1, 7999.0, std::nextafter (8000.0, 0.0), 1000.0, 0.024, 1.0e-5, 5.0e-324 };
+        for (const bool normalize : { false, true })
+        {
+            const Heard ref = load (std::numeric_limits<double>::quiet_NaN(), normalize);
+            test::ok (ref.taps.size() == 1 && ref.taps[0].size() == ir.size(),
+                      std::string ("PRECONDITION: the NaN load stages the taps as they are") + (normalize ? " (normalized)" : ""));
+            for (const double rate : broken)
+            {
+                const Heard h = load (rate, normalize);
+                const std::string what = std::to_string (rate) + " Hz" + (normalize ? ", normalized" : ", verbatim");
+                test::ok (h.taps == ref.taps, "the staged taps are the NaN load's: " + what);
+                test::ok (bitsOf (h.gain) == bitsOf (ref.gain) && bitsOf (h.gainDb) == bitsOf (ref.gainDb),
+                          "both gain readings are the NaN load's: " + what);
+                test::ok (h.l == ref.l && h.r == ref.r, "and it plays the NaN load, sample for sample: " + what);
+            }
+            // THE FLOOR ITSELF IS KNOWN: 8000 Hz resamples (x6 into 48 kHz), and on the verbatim path carries the rate factor.
+            const Heard at = load (8000.0, normalize);
+            test::ok (at.taps[0].size() == ir.size() * 6, "8000 Hz is a known rate: 257 taps become 1542");
+            if (! normalize)
+                test::ok (at.gain == (float) (8000.0 / 48000.0), "and the verbatim path applies the rate factor, 1/6");
+        }
     }
 
     // P68 — A GAIN THAT IS NOT A NUMBER MUST NOT READ AS A NUMBER. `std::max(a, b)` is `(a < b) ? b : a`

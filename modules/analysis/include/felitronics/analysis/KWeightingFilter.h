@@ -27,8 +27,8 @@ public:
     // The shelf's design frequency (BS.1770's published constant). Named because the core's rate floor is
     // derived from it: below 2 x kShelfHz the bilinear tan() is past its pole — the shelf is aliased, and wherever
     // tan() comes out negative ((f0, 2 f0), (f0/2, 2 f0/3), …) unstable. This
-    // filter itself still accepts any rate — the entries that take a rate from outside refuse one below
-    // core::kMinSampleRate, and the assertion keeps that floor above the edge.
+    // filter itself still accepts any rate — its prepare() cannot refuse, and its one owner, LoudnessMeter, refuses a
+    // rate below core::kMinSampleRate before it prepares one (P103) — and the assertion keeps that floor above the edge.
     static constexpr double kShelfHz = 1681.974450955533;
 
     void prepare (double sampleRate, int numChannels) noexcept

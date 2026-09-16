@@ -43,6 +43,12 @@ template <class Math = core::SystemMath>
 class BasicLoudnessMeter
 {
 public:
+    // THE LOWEST RATE THIS METER MEASURES AT — the core's floor (P103; the entries that call it have had it since
+    // P51). Below twice the K-weighting shelf the filter is aliased and, in most of that range, unstable: a 0 dBFS
+    // 400 Hz sine read +3043 LUFS at 3300 Hz. A rate <= 0 or NaN is not "wrong", it is "not given", and still reads
+    // as 48 kHz — the published default; a rate in (0, kMinSampleRate) is refused. storageFor() decides it.
+    static constexpr double kMinSampleRate = core::kMinSampleRate;
+
     // SECONDS are the convenience; the store is counted in SAMPLES — see prepareForSamples(). A NaN or negative
     // duration reads as 0 s, exactly as it always has (std::max keeps its first argument on NaN).
     [[nodiscard]] bool prepare (double sampleRate, int numChannels, double maxDurationSec = 3600.0)
@@ -52,18 +58,23 @@ public:
     }
 
     // THE SAME PREPARATION, SIZED IN SAMPLES — the unit the store is actually counted in. A whole-programme
-    // caller knows its length in frames, and a trip through seconds can lose it: `frames / fs` is +inf for a
-    // finite rate this meter accepts (1e-305 Hz, 2000 frames — the mastering chain took it too, before P51 gave
-    // the chain and the solver an 8 kHz floor; this class has none), and the store used to be sized from
-    // `(std::size_t) inf` — undefined behaviour, which answered 3 kept blocks on arm64 and wasm32 and 4 on
-    // x86-64 gcc for the same call.
+    // caller knows its length in frames. (A trip through seconds used to be able to lose it: `frames / fs` was
+    // +inf at a finite rate this meter accepted before P103 — 1e-305 Hz, 2000 frames — and the store was sized
+    // from `(std::size_t) inf`, undefined behaviour that kept 3 blocks on arm64 and wasm32 and 4 on x86-64 gcc
+    // for the same call. At the floor `frames / fs` is at most INT_MAX / 8000 s.)
+    //
+    // A REFUSED CALL LEAVES NOTHING OF THE PREVIOUS PROGRAMME READABLE (law 11b), whichever check refused it:
+    // `reset()` runs FIRST, before any of them, so every reading below answers what a never-prepared meter
+    // answers. (Before P103 a refusal only cleared the flag, and momentaryLufs(), integratedLufs(),
+    // gatingBlockEnergies() and droppedBlocks() went on serving the previous programme.)
     [[nodiscard]] bool prepareForSamples (double sampleRate, int numChannels, double maxSamples)
     {
         prepared_ = false;
+        reset();
         const double rate = sampleRate > 0.0 ? sampleRate : 48000.0;    // fs<=0 → subSamples 0 → /0 in finishSubHop
         if (numChannels < 1 || numChannels > kMaxChannels) return false;   // law 11(b): BINDING
         Storage st;
-        if (! storageFor (rate, maxSamples, st)) return false;          // law 11(b): validate, THEN write
+        if (! storageFor (sampleRate, maxSamples, st)) return false;    // law 11(b): validate, THEN write
         fs = rate;
         ch = numChannels;
         kw.prepare (fs, ch);
@@ -106,9 +117,11 @@ public:
     // kMaxSubHop — and the test is made on the COMPUTED 0.01·fs, not on fs, because near the edge that product
     // rounds up to .5 and lround() goes with it. And every block index is an `int`, so the count is bounded by
     // kMaxBlocks. A rate <= 0 or NaN is read as 48 kHz, exactly as prepare() reads it: the budget of a call is
-    // storageFor() with the SAME arguments.
+    // storageFor() with the SAME arguments. A rate in (0, kMinSampleRate) is refused, and it is decided HERE and
+    // only here, BEFORE that substitution — prepare() and prepareForSamples() refuse through this function.
     [[nodiscard]] static bool storageFor (double sampleRate, double maxSamples, Storage& out) noexcept
     {
+        if (sampleRate > 0.0 && sampleRate < kMinSampleRate) return false;   // NaN, <= 0 and +inf are not in it
         const double rate   = sampleRate > 0.0 ? sampleRate : 48000.0;   // prepare()'s own substitution
         const double subHop = 0.01 * rate;                      // a sub-hop is lround (subHop) samples
         if (! (subHop < (double) kMaxSubHop + 0.5)) return false; // lround <= kMaxSubHop, so 10 of them fit an int
@@ -239,8 +252,8 @@ private:
         // is a deterministic 10 ms of AUDIO (lround(0.01*fs) samples); the end of process() is wherever the
         // caller happened to cut the stream. Flushing there would make the numbers depend on the host's
         // block size, and this repo claims — and tests — that they do not (tools/tests/ProbeTests.cpp:212,
-        // bit-exact across call sizes 1 … 100 003). It also fails outright at low rates: this meter takes any
-        // rate (the probe took 1 kHz before P51), and at 1 kHz a single 8192-sample call spans 8.2 s. And the
+        // bit-exact across call sizes 1 … 100 003). It also failed outright at low rates: this meter took any
+        // rate before P103 (the probe took 1 kHz before P51), and at 1 kHz a single 8192-sample call spans 8.2 s. And the
         // interval to beat is not the RLB's 2.85 s but the SHELF's 90 ms (4 324 samples at 48 kHz) — 8192
         // samples is already 170 ms, so a per-host-block flush would let the shelf sit subnormal for half of
         // every silent block. Here the arrears can never exceed 10 ms of audio at any rate, and the cost is
