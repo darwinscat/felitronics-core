@@ -6,7 +6,9 @@
 #include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace felitronics::oversampling
 {
@@ -29,6 +31,12 @@ enum class Topology { Kaiser, Cascade };
 // `tapsPerPhase` configures Kaiser only. Under Cascade it is still RANGE-CHECKED ([4, kMaxTapsPerPhase]),
 // so the set of arguments a stage refuses does not shrink when the topology changes; it is otherwise not
 // used — the cascade takes its lengths from the rate.
+//
+// THE CASCADE LIVES ON THE HEAP, and only when it is chosen. Held by value it would have added ~500 bytes
+// to every Saturator and TruePeakLimiter whether or not anyone asked for it (measured: 432 -> 936 and
+// 408 -> 912, MasteringChain 18016 -> 19024), which is a change to the default. A vector of zero or one
+// keeps the switch copyable and costs the Kaiser path its 24 bytes; the object it allocates is counted
+// in Storage::heapObjects, so a stage's published budget still equals what its prepare() asks for.
 class Oversampler
 {
 public:
@@ -37,10 +45,14 @@ public:
         Topology topology = Topology::Kaiser;
         PolyphaseOversampler::Storage kaiser {};     // empty under Cascade
         CascadeOversampler::Storage   cascade {};    // empty under Kaiser
-        std::uint64_t bytes() const noexcept { return kaiser.bytes() + cascade.bytes(); }
+        std::size_t heapObjects = 0;                 // CascadeOversampler instances the switch allocates (0 or 1)
+        std::uint64_t bytes() const noexcept
+        {
+            return kaiser.bytes() + cascade.bytes() + (std::uint64_t) heapObjects * sizeof (CascadeOversampler);
+        }
         bool fitsWithin (const Storage& other) const noexcept
         {
-            return kaiser.fitsWithin (other.kaiser) && cascade.fitsWithin (other.cascade);
+            return kaiser.fitsWithin (other.kaiser) && cascade.fitsWithin (other.cascade) && heapObjects <= other.heapObjects;
         }
     };
 
@@ -57,6 +69,7 @@ public:
         {
             if (tapsPerPhase < 4 || tapsPerPhase > PolyphaseOversampler::kMaxTapsPerPhase) return false;
             if (! CascadeOversampler::storageFor (sampleRate, factor, maxChannels, st.cascade)) return false;
+            st.heapObjects = 1;
         }
         out = st;
         return true;
@@ -77,40 +90,42 @@ public:
         if (topology == Topology::Kaiser)
         {
             if (! kaiser_.prepare (factor, maxChannels, tapsPerPhase)) return false;
-            cascade_ = CascadeOversampler {};
+            std::vector<CascadeOversampler>().swap (cascade_);        // frees; allocates nothing
         }
         else
         {
             Storage st;
             if (! storageFor (topology, sampleRate, factor, maxChannels, tapsPerPhase, st)) return false;
-            if (! cascade_.prepare (sampleRate, factor, maxChannels)) return false;
+            if (cascade_.empty()) cascade_.emplace_back();
+            if (! cascade_.front().prepare (sampleRate, factor, maxChannels)) return false;
             kaiser_ = PolyphaseOversampler {};
         }
         topology_ = topology;
         return true;
     }
 
-    void reset() noexcept                { if (topology_ == Topology::Kaiser) kaiser_.reset(); else cascade_.reset(); }
-    void resetChannel (int c) noexcept   { if (topology_ == Topology::Kaiser) kaiser_.resetChannel (c); else cascade_.resetChannel (c); }
-    int  factor() const noexcept         { return topology_ == Topology::Kaiser ? kaiser_.factor() : cascade_.factor(); }
-    int  latencySamples() const noexcept { return topology_ == Topology::Kaiser ? kaiser_.latencySamples() : cascade_.latencySamples(); }
+    // Invariant: topology_ == Cascade implies cascade_ holds exactly one prepared object.
+    void reset() noexcept                { if (topology_ == Topology::Kaiser) kaiser_.reset(); else cascade_.front().reset(); }
+    void resetChannel (int c) noexcept   { if (topology_ == Topology::Kaiser) kaiser_.resetChannel (c); else cascade_.front().resetChannel (c); }
+    int  factor() const noexcept         { return topology_ == Topology::Kaiser ? kaiser_.factor() : cascade_.front().factor(); }
+    int  latencySamples() const noexcept { return topology_ == Topology::Kaiser ? kaiser_.latencySamples() : cascade_.front().latencySamples(); }
     Topology topology() const noexcept   { return topology_; }
 
     void upsample (const float* const* in, int channels, int n, float* const* out) noexcept
     {
         if (topology_ == Topology::Kaiser) kaiser_.upsample (in, channels, n, out);
-        else                               cascade_.upsample (in, channels, n, out);
+        else                               cascade_.front().upsample (in, channels, n, out);
     }
     void downsample (const float* const* in, int channels, int n, float* const* out) noexcept
     {
         if (topology_ == Topology::Kaiser) kaiser_.downsample (in, channels, n, out);
-        else                               cascade_.downsample (in, channels, n, out);
+        else                               cascade_.front().downsample (in, channels, n, out);
     }
 
 private:
     Topology             topology_ = Topology::Kaiser;
     PolyphaseOversampler kaiser_;
-    CascadeOversampler   cascade_;
+    std::vector<CascadeOversampler> cascade_;    // empty, or the one prepared cascade
 };
 
 } // namespace felitronics::oversampling

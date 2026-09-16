@@ -479,9 +479,9 @@ public:
     // on it is a display, not a measurement.
     //
     // IT IS NOT "THE" TRUE PEAK OF THE INPUT, and the difference is the point of reporting it separately.
-    // This is what the limiter's OWN reconstruction saw — a 0.90 x Nyquist Kaiser prototype at this
-    // instance's factor and tapsPerPhase — and it is the number that EXPLAINS the gain reduction this
-    // instance applied. A meter of a different design reads something else on the same signal, and the
+    // This is what the limiter's OWN reconstruction saw — under Kaiser a 0.90 x Nyquist prototype at this
+    // instance's factor and tapsPerPhase, under Cascade the cascade's interpolator — and it is the number
+    // that EXPLAINS the gain reduction this instance applied. A meter of a different design reads something else on the same signal, and the
     // gap is the material's, not a defect: against `analysis::TruePeakMeter` (the spec's 12-tap filter)
     // at 4x, measured, a 1 kHz burst train agrees to **-0.0012 dB** and a pair of adjacent full-scale
     // impulses — maximally broadband, i.e. the worst case for two different low-passes — disagrees by

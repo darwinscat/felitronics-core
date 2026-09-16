@@ -25,6 +25,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace felitronics;
@@ -183,8 +184,11 @@ static void runRuleTests()
 
     // The table the header prints, pinned — a change of rule has to edit it on purpose.
     struct Row { double fs; int t, lat; };
+    // The last two rows are the FLOOR (kMinFirstTaps): the rule alone would build 14 and 13 taps per phase
+    // there, still under -90 but by 0.7 dB instead of 2.3 — so the floor is a margin, and it is pinned
+    // rather than left to a strictness bar it happens not to cross (a mutation stand removed it unseen).
     const Row rows[] = { { 44100.0, 125, 131 }, { 48000.0, 70, 76 }, { 88200.0, 22, 28 }, { 96000.0, 21, 27 },
-                         { 32000.0, 125, 131 }, { 192000.0, 16, 22 } };
+                         { 32000.0, 125, 131 }, { 192000.0, 16, 22 }, { 384000.0, 16, 22 }, { 768000.0, 16, 22 } };
     for (const auto& r : rows)
     {
         CascadeOversampler::Design d;
@@ -488,6 +492,35 @@ static void runTopologyTests()
     test::ok (! ov.prepare (oversampling::Topology::Kaiser, 48000.0, 4, 1, 2), "a refused Kaiser preparation...");
     test::ok (ov.topology() == oversampling::Topology::Cascade && ov.latencySamples() == latC, "...leaves the cascade in place");
     test::ok (ov.prepare (oversampling::Topology::Kaiser, 48000.0, 4, 1, 64) && ov.latencySamples() == 63, "and a successful one switches");
+
+    // The default must not pay for the option: the cascade is held on the heap, only when chosen, and the
+    // switch stays copyable (the stages that embed it are copied and moved by callers).
+    test::ok (sizeof (oversampling::Oversampler) <= sizeof (oversampling::PolyphaseOversampler) + 40,
+              "the switch costs the Kaiser path at most 40 bytes of object size (" + std::to_string (sizeof (oversampling::Oversampler))
+              + " against " + std::to_string (sizeof (oversampling::PolyphaseOversampler)) + ")");
+    test::ok (std::is_copy_constructible_v<oversampling::Oversampler> && std::is_copy_assignable_v<oversampling::Oversampler>,
+              "and it is copyable, as PolyphaseOversampler is");
+    {
+        namespace alloc = test::alloc;
+        using oversampling::Topology;
+        oversampling::Oversampler sw;
+        oversampling::Oversampler::Storage bk, bc;
+        (void) oversampling::Oversampler::storageFor (Topology::Kaiser, 44100.0, 4, 2, 64, bk);
+        (void) oversampling::Oversampler::storageFor (Topology::Cascade, 44100.0, 4, 2, 64, bc);
+        auto asked = [&] (Topology t) { const long long b0 = alloc::bytes.load(); (void) sw.prepare (t, 44100.0, 4, 2, 64); return alloc::bytes.load() - b0; };
+        const long long k1 = asked (Topology::Kaiser);
+        const long long c1 = asked (Topology::Cascade);
+        const long long c2 = asked (Topology::Cascade);
+        const long long k2 = asked (Topology::Kaiser);
+        test::ok (k1 == (long long) bk.bytes() && bk.heapObjects == 0, "Kaiser asks for exactly its budget, no heap object ("
+                  + std::to_string (k1) + " B)");
+        test::ok (c1 == (long long) bc.bytes() && bc.heapObjects == 1, "Cascade asks for exactly its budget, the heap object included ("
+                  + std::to_string (c1) + " B)");
+        test::ok (c2 == 0, "re-preparing the same cascade asks for nothing (" + std::to_string (c2) + " B)");
+        test::ok (k2 <= (long long) bk.bytes(), "and switching back asks for no more than Kaiser's budget (" + std::to_string (k2) + " B)");
+        oversampling::Oversampler copy = sw;
+        test::ok (copy.latencySamples() == sw.latencySamples() && copy.topology() == Topology::Kaiser, "a copy is the same switch");
+    }
 }
 
 int main()

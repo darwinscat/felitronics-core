@@ -137,7 +137,7 @@ public:
     // refused — this prepare() returns void and always has, so a rejected value would leave the stage
     // unprepared with no way to say so. That is deliberately UNLIKE `Saturator` and `TruePeakLimiter`,
     // whose prepare() returns bool and therefore refuses; a caller that needs the refusal should read
-    // latencySamples() back and compare, since it is tapsPerPhase - 1 by construction. NB the golden battery lifted from
+    // latencySamples() back and compare, since under Kaiser it is tapsPerPhase - 1 by construction. NB the golden battery lifted from
     // OrbitCab runs at the DEFAULT, not at the old 32: what it pins is the stage's structure (processing
     // order, guards, chunk boundaries, block-size determinism, the feel gate), none of which the taps
     // count touches, and it carries separate two-sided checks at an explicit 32 and 96 for the topology
