@@ -53,7 +53,8 @@ public:
 
     // THE SAME PREPARATION, SIZED IN SAMPLES — the unit the store is actually counted in. A whole-programme
     // caller knows its length in frames, and a trip through seconds can lose it: `frames / fs` is +inf for a
-    // finite rate the mastering chain accepts (1e-305 Hz, 2000 frames), and the store used to be sized from
+    // finite rate this meter accepts (1e-305 Hz, 2000 frames — the mastering chain took it too, before P51 gave
+    // the chain and the solver an 8 kHz floor; this class has none), and the store used to be sized from
     // `(std::size_t) inf` — undefined behaviour, which answered 3 kept blocks on arm64 and wasm32 and 4 on
     // x86-64 gcc for the same call.
     [[nodiscard]] bool prepareForSamples (double sampleRate, int numChannels, double maxSamples)
@@ -238,11 +239,12 @@ private:
         // is a deterministic 10 ms of AUDIO (lround(0.01*fs) samples); the end of process() is wherever the
         // caller happened to cut the stream. Flushing there would make the numbers depend on the host's
         // block size, and this repo claims — and tests — that they do not (tools/tests/ProbeTests.cpp:212,
-        // bit-exact across call sizes 1 … 100 003). It also fails outright at low rates: the probe accepts
-        // 1 kHz, where a single 8192-sample call spans 8.2 s. And the interval to beat is not the RLB's
-        // 2.85 s but the SHELF's 90 ms (4 324 samples at 48 kHz) — 8192 samples is already 170 ms, so a
-        // per-host-block flush would let the shelf sit subnormal for half of every silent block. Here the
-        // arrears can never exceed 10 ms of audio at any rate, and the cost is ~100 flushes a second.
+        // bit-exact across call sizes 1 … 100 003). It also fails outright at low rates: this meter takes any
+        // rate (the probe took 1 kHz before P51), and at 1 kHz a single 8192-sample call spans 8.2 s. And the
+        // interval to beat is not the RLB's 2.85 s but the SHELF's 90 ms (4 324 samples at 48 kHz) — 8192
+        // samples is already 170 ms, so a per-host-block flush would let the shelf sit subnormal for half of
+        // every silent block. Here the arrears can never exceed 10 ms of audio at any rate, and the cost is
+        // ~100 flushes a second.
         kw.flushDenormals();
 
         // Non-finite energy is caught HERE — the first place it exists — per CHANNEL, and the poisoned

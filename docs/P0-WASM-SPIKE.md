@@ -237,7 +237,8 @@ the oversampler maximum while `truePeakLinear()` applied the new floor, so the t
 disagreed on exactly the signals the floor exists for. Both now derive from one value.
 
 Also hardened while there, all of it facing input a page computes: the sample rate is bounded to
-1 kHz … 768 kHz (positive-and-finite is not enough — `lround(0.01*fs)` on 1e300 is out of range, and a page
+1 kHz … 768 kHz (8 kHz … 768 kHz since P51 — 1 kHz sat inside the band where K-weighting is unstable)
+(positive-and-finite is not enough — `lround(0.01*fs)` on 1e300 is out of range, and a page
 can pass `Number.MIN_VALUE` as easily as 48000), `maxDurationSec` is validated, a non-positive channel count
 is refused rather than silently recording invented silent blocks, and the C ABI checks that the span it was
 handed lies inside the wasm heap instead of trapping on a pointer near the top of linear memory.

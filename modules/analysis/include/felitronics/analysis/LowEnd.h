@@ -274,7 +274,7 @@ public:
                                                      // analysis::LoudnessMeter builds (LoudnessMeter.h:110),
                                                      // so the two instruments name the same intervals.
     static constexpr int    kHistogramBins = 100;    // the side fraction over [0, 1], fixed edges
-    static constexpr double kMinSampleRate = 1000.0;
+    static constexpr double kMinSampleRate = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate = 768000.0;
     static constexpr int    kMaxBlocksLimit = 1 << 24;
     static constexpr int    kLobeBins      = 4;      // a Hann main lobe, in bins
@@ -609,8 +609,11 @@ public:
     // sample would expose it — an infinite state makes the next output non-finite, which is counted here
     // and healed — unless a StateGrid boundary falls in between, because flushDenormals() heals poison
     // as well as denormals (Svf.h:161). Measured reachable: at fs 1000, fc 400, mono +-1.7e38 at samples
-    // 61..63 with the boundary at 64. NO MEASURED VALUE IS WRONG when that happens — the state is healed
-    // before any sample consumes it, and every published energy stays finite — but this counter reads 0.
+    // 61..63 with the boundary at 64 — a rate below the core's floor since P51, and the same case at fs 8000,
+    // fc 3200: the filter sees only tan(pi fc / fs), the same double for both pairs, and the grid period is 64
+    // samples at any rate (P51 checked it: the two crossovers' outputs over that burst are bit-identical, and this
+    // counter reads 0 at 8 kHz). NO MEASURED VALUE IS WRONG when that happens — the state is healed before any
+    // sample consumes it, and every published energy stays finite — but this counter reads 0.
     // Detecting it properly needs the filter's state, which this instrument does not own.
     std::int64_t filterNonFiniteSamples() const noexcept { return filterNonFinite_; }
     // A hole feeds the documented canonical zero to the filters, so the LR4 state carries it for its

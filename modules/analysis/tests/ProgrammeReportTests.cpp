@@ -494,6 +494,19 @@ static void testStorageAndRefusals()
 
         test::ok (! PR::storageFor (0.0, 512, 2, pm).ok,            "a zero rate is refused");
         test::ok (! PR::storageFor (std::numeric_limits<double>::quiet_NaN(), 512, 2, pm).ok, "a NaN rate is refused");
+        // P51 — the floor. This class holds the K-weighting shelf, whose pole leaves the unit circle below 3364 Hz,
+        // and it took 1000 Hz until the core's floor replaced its own copy.
+        test::ok (PR::kMinSampleRate == 8000.0 && PR::storageFor (8000.0, 512, 2, pm).ok,
+                  "the floor is 8000 Hz, and 8000 itself is accepted");
+        test::ok (! PR::storageFor (std::nextafter (8000.0, 0.0), 512, 2, pm).ok && ! PR::storageFor (3300.0, 512, 2, pm).ok
+                  && ! PR::storageFor (1000.0, 512, 2, pm).ok && ! PR::storageFor (44.1, 512, 2, pm).ok,
+                  "one ulp under it, 3300 (the shelf past Nyquist), 1000 (the old floor) and 44.1 are refused");
+        {
+            PR q;
+            test::ok (q.prepare (kFs, 512, 2), "PRECONDITION: a prepared report");
+            test::ok (! q.prepare (std::nextafter (8000.0, 0.0), 512, 2) && ! q.isPrepared(),
+                      "and a refused rate disarms it (law 11b) — it does not stay on its 48 kHz build");
+        }
         test::ok (! PR::storageFor (kFs, 0, 2, pm).ok,              "maxBlock 0 is refused");
         test::ok (! PR::storageFor (kFs, 512, 0, pm).ok,            "0 channels is refused");
         test::ok (! PR::storageFor (kFs, 512, core::kMaxChannels + 1, pm).ok, "too many channels is refused");

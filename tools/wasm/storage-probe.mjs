@@ -4,7 +4,7 @@
 // The wasm side of P81's `fc_probe_<mode>_storage_bytes` — the price of a measurement, asked before it is
 // paid.
 //
-//   node storage-probe.mjs build/fcprobe.node.js table    # the same 425 rows the native tier prints
+//   node storage-probe.mjs build/fcprobe.node.js table    # the same 475 rows the native tier prints
 //   node storage-probe.mjs build/fcprobe.node.js check    # the assertions that only this tier can make
 //
 // WHY A HARNESS OF ITS OWN, WHEN felitronics_analysis_abi_tests ALREADY HAMMERS THESE FUNCTIONS. That
@@ -56,8 +56,8 @@ for (const m of MODES) {
 
 // The table the native tier prints, row for row. Integer rates only — see the header.
 const TABLE_WIDTHS = [1, 2, 6, 16, 17];
-const TABLE_RATES = [999, 1000, 2000, 8000, 11025, 22050, 44100, 48000, 88200,
-                     96000, 176400, 192000, 352800, 384000, 705600, 768000, 768001];
+const TABLE_RATES = [999, 1000, 7999, 8000, 11025, 12000, 16000, 22050, 44100, 48000,
+                     88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000, 768001];
 
 if (cmd === 'table') {
     let out = '';
@@ -109,7 +109,9 @@ ok(scalarsBefore === scalarsAfter && scalarsBefore.length > 0,
 // accepted a geometry priced at zero: `_run` skips `process()` when frames is 0, so an unprepared
 // analyzer still reached `finish()`, still set its flag and still answered 1. Measured in the native
 // suite and replayed here on a module built from the mutated source, where this check passed 10/10.
-const RATES = [0, -1, 999, 1000, 1000.5, 1999.999, 2000, 8000, 18367, 18368, 44100, 48000,
+// The low bound is the core's 8000 Hz (P51): 8000 - 2**-40 is the double one ulp under it. 44.1 is the unit error
+// the floor exists for; 1000 was the old floor (999 the row under it) and 2000 forensics' own — all refusals now.
+const RATES = [0, -1, 44.1, 999, 1000, 2000, 7999, 8000 - 2 ** -40, 8000, 8130.5, 18367, 18368, 44100, 48000,
                96000, 192000, 768000, 768000.5, Infinity, -Infinity, NaN];
 const WIDTHS = [0, 1, 2, 6, 16, 17, 0xFFFFFFFF];
 const COUNTS = [0, 64, FRAMES];
@@ -141,7 +143,10 @@ M._free(scratch);
 // the canonical zero, and the headline number, IN THIS TIER — wasm32 sizes its own structs
 for (const m of MODES) ok(Object.is(query[m](2, 0), 0), `${m}: a refused geometry quotes +0.0, not -0.0 or NaN`);
 ok(query.hum(16, 768000) === 352688184, `hum(16, 768000) is 352688184 here too, not ${query.hum(16, 768000)}`);
-ok(query.hum(1, 1000.5) === 164904, `hum(1, 1000.5) is 164904 here too — a fractional rate survives the boundary`);
+ok(query.hum(1, 8130.5) === 1110776, `hum(1, 8130.5) is 1110776 here too — a fractional rate survives the boundary`);
+for (const m of MODES)
+    ok(query[m](2, 8000 - 2 ** -40) === 0 && query[m](2, 44.1) === 0,
+       `${m}: one ulp under the 8000 Hz floor and 44.1 are refused here too`);
 
 M._free(ptr);
 console.log(`${checks} checks, ${bad} failures`);

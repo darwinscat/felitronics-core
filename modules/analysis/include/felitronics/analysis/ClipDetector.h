@@ -130,7 +130,7 @@ public:
     static constexpr double kRoughTurnRatio  = 0.4;     // a band that is not exactly flat: outward steps may grow by <= 40 %
     static constexpr int    kMinRampLength   = 3;
     static constexpr int    kMinCeilingLength = 2;
-    static constexpr double kMinSampleRate   = 1000.0;
+    static constexpr double kMinSampleRate   = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate   = 768000.0;
     static constexpr int    kMaxRunsLimit    = 1 << 24;
 

@@ -4,7 +4,7 @@
 // HumDetector self-tests — mains hum against the notes that look like it, and law 8a over the whole report.
 //
 //   · GEOMETRY pinned by HAND-COMPUTED numbers, not by the function the object sizes itself with: an auto
-//     order of 17 at 48 kHz / 18 at 96 kHz / 13 at 4 kHz, and every derived bin extent at the test rate
+//     order of 17 at 48 kHz / 18 at 96 kHz / 15 at 12 kHz, and every derived bin extent at the test rate
 //   · the MONOTONE-SKIRT oracle: a direct double DFT of a Hann-windowed 49.0 Hz tone, computed outside the
 //     object, showing the sampled skirt has NO interior local maximum — which is what lets the detector
 //     enumerate every local maximum without reading a note's sidelobe as a 50 Hz line
@@ -103,12 +103,25 @@ using analysis::HumReport;
 namespace
 {
 
-// 3000 Hz is chosen so that the AUTO order (13, N = 8192) gives bin = 3000/8192 = 0.3662109375 Hz — bit for
-// bit the bin of the production configuration (48000 / 2^17) and the same 2.731 s window, at a sixteenth of
-// the FFT cost. The suite therefore runs at the resolution the instrument actually ships with, and the
-// 49.0-vs-50.0 separation it is tested on is the real 2.73 bins rather than an easier number.
-constexpr double kSr = 3000.0;
-constexpr double kBin = kSr / 8192.0;
+// 12000 Hz is chosen so that the AUTO order (15, N = 32768) gives bin = 12000/32768 = 0.3662109375 Hz — bit for
+// bit the bin of the production configuration (48000 / 2^17) and the same 2.731 s window, at a quarter of the
+// FFT cost. The suite therefore runs at the resolution the instrument actually ships with, and the 49.0-vs-50.0
+// separation it is tested on is the real 2.73 bins rather than an easier number.
+//
+// IT WAS 3000 Hz (N = 8192, a sixteenth of the cost), and the fixtures below were designed there. P51 put the
+// core's rate floor at 8000 Hz, so the suite moved to the lowest rate that keeps the production bin exactly, and
+// the fixtures moved WITHOUT BEING REDESIGNED: every Hz parameter, every bin extent and every window in seconds
+// is what it was (the geometry block below pins the same 1351 band bins), and the NOISE is the 3 kHz noise —
+// the same draws, from the same seeds, band-limited and interpolated x4 (Sig::noise). White noise drawn at
+// 12 kHz would have kept the mean square and spread it over four times the band: every per-bin background 6 dB
+// lower, so every line the fixtures set against that bed would have stood 6 dB prouder than it was designed to.
+// Measured: 50.14 Hz at 1e-3 over the 3e-4 bed, window-peak prominence 46.78 dB at 3 kHz and here, 52.92 dB with
+// white noise at 12 kHz (mean of 20 seeds); the noise-only fixture's window peaks -105.2 dBFS at 3 kHz and here,
+// -111.1 with white noise.
+constexpr double kSr = 12000.0;
+constexpr int    kUp = 4;                            // kSr / the rate the fixtures were designed at
+constexpr double kDesignSr = kSr / kUp;              // 3000 Hz
+constexpr double kBin = kSr / 32768.0;
 
 //------------------------------------------------------------------------------------------------------------
 // THE MATERIAL. Planar float, built by adding tones and noise over sample ranges, so a "quiet stretch" is an
@@ -138,25 +151,33 @@ struct Sig
             for (auto& c : ch) c[i] += (float) (amp * std::sin (ph));
         }
     }
+    // White noise over [from, to): the 3 kHz fixture's draws — one per design sample per channel, in that order,
+    // exactly as they were drawn when the suite ran at 3 kHz — interpolated x4 by `upsample`.
     void noise (std::size_t from, std::size_t to, double amp, unsigned seed)
     {
+        const std::size_t hi2 = std::min (to, len());
+        if (hi2 <= from) return;
+        const std::size_t m = (hi2 - from + kUp - 1) / kUp;
         std::mt19937 rng (seed);
         std::uniform_real_distribution<double> u (-1.0, 1.0);
-        for (std::size_t i = from; i < std::min (to, len()); ++i)
-            for (auto& c : ch) c[i] += (float) (amp * u (rng));
+        std::vector<std::vector<double>> base (ch.size(), std::vector<double> (m));
+        for (std::size_t k = 0; k < m; ++k)
+            for (auto& b : base) b[k] = amp * u (rng);
+        for (std::size_t c = 0; c < ch.size(); ++c) upsample (base[c], from, hi2, c);
     }
     // Steeply tilted background: white noise through `poles` cascaded one-poles, scaled to an exact RMS,
-    // so the level is a parameter and the SLOPE across the floor window is the thing being tested.
+    // so the level is a parameter and the SLOPE across the floor window is the thing being tested. Built at the
+    // design rate, as it was, and interpolated like `noise`.
     void redNoise (std::size_t from, std::size_t to, double rms, double cutoffHz, int poles, unsigned seed)
     {
         const std::size_t hi2 = std::min (to, len());
         if (hi2 <= from) return;
-        const std::size_t n = hi2 - from;
+        const std::size_t n = (hi2 - from + kUp - 1) / kUp;
         std::mt19937 rng (seed);
         std::uniform_real_distribution<double> u (-1.0, 1.0);
         std::vector<double> t (n);
         for (auto& v : t) v = u (rng);
-        const double a = std::exp (-2.0 * core::kPi * cutoffHz / kSr);
+        const double a = std::exp (-2.0 * core::kPi * cutoffHz / kDesignSr);
         for (int pp = 0; pp < poles; ++pp)
         {
             double z = 0.0;
@@ -165,7 +186,43 @@ struct Sig
         double ss = 0.0;
         for (double v : t) ss += v * v;
         const double g = ss > 0.0 ? rms / std::sqrt (ss / (double) n) : 0.0;
-        for (std::size_t i = 0; i < n; ++i) for (auto& c : ch) c[from + i] += (float) (g * t[i]);
+        for (auto& v : t) v *= g;
+        for (std::size_t c = 0; c < ch.size(); ++c) upsample (t, from, hi2, c);
+    }
+    // Band-limited x4 interpolation of design-rate samples into channel c over [from, hi2): a Kaiser-windowed sinc
+    // (beta 8, 24 design samples each side), so y[from + kUp*k] == base[k] and the spectrum below the design
+    // Nyquist is the design spectrum. Samples outside [0, base.size()) are absent rather than zero-extended into
+    // the neighbouring range: a loud segment does not spill into the quiet one beside it.
+    void upsample (const std::vector<double>& base, std::size_t from, std::size_t hi2, std::size_t c)
+    {
+        constexpr int half = 24;
+        constexpr double beta = 8.0;
+        auto kaiser = [] (double x) {                       // I0(beta sqrt(1 - x^2)) / I0(beta), |x| <= 1
+            auto i0 = [] (double z) { double sum = 1.0, term = 1.0; for (int k = 1; k < 40; ++k)
+                                      { term *= (z / (2.0 * k)) * (z / (2.0 * k)); sum += term; } return sum; };
+            return i0 (beta * std::sqrt (std::max (0.0, 1.0 - x * x))) / i0 (beta);
+        };
+        double h[kUp][2 * half] {};
+        for (int ph = 0; ph < kUp; ++ph)
+            for (int j = 0; j < 2 * half; ++j)
+            {
+                const double t = (double) (j - half + 1) - (double) ph / kUp;     // design samples from the output
+                h[ph][j] = ph == 0 ? (j == half - 1 ? 1.0 : 0.0)       // exact on the design grid
+                                   : std::sin (core::kPi * t) / (core::kPi * t) * kaiser (t / half);
+            }
+        const long m = (long) base.size();
+        for (std::size_t i = 0; i < hi2 - from; ++i)
+        {
+            const long k0 = (long) (i / kUp);
+            const int ph = (int) (i % kUp);
+            double acc = 0.0;
+            for (int j = 0; j < 2 * half; ++j)
+            {
+                const long k = k0 + (long) j - half + 1;
+                if (k >= 0 && k < m) acc += base[(std::size_t) k] * h[ph][j];
+            }
+            ch[c][from + i] += (float) acc;
+        }
     }
     void dc (std::size_t from, std::size_t to, double d)
     {
@@ -180,10 +237,10 @@ struct Sig
 };
 
 // Geometry of the standard two-stretch fixture: three quiet frames, a loud gap, three more quiet frames.
-constexpr std::size_t kN = 8192, kHop = 4096;
-constexpr std::size_t kQuietA0 = 0,                  kQuietA1 = kN + 2 * kHop;          // 16384
-constexpr std::size_t kLoud0   = kQuietA1,           kLoud1   = kQuietA1 + 4 * kHop;    // 32768
-constexpr std::size_t kQuietB0 = kLoud1,             kQuietB1 = kLoud1 + kN + 2 * kHop; // 49152
+constexpr std::size_t kN = 32768, kHop = 16384;
+constexpr std::size_t kQuietA0 = 0,                  kQuietA1 = kN + 2 * kHop;          //  65536
+constexpr std::size_t kLoud0   = kQuietA1,           kLoud1   = kQuietA1 + 4 * kHop;    // 131072
+constexpr std::size_t kQuietB0 = kLoud1,             kQuietB1 = kLoud1 + kN + 2 * kHop; // 196608
 constexpr std::size_t kLen     = kQuietB1;
 
 // A fixture whose quiet stretches carry `hz` (plus an exact comb when `harmonics`), under a noise bed.
@@ -291,7 +348,12 @@ Out runSliced (const Sig& s, const HumDetectorParams& p, const std::vector<int>&
     Out o;
     HumDetector d;
     d.setParams (p);
-    if (! d.prepare (kSr, maxBlock, s.channels())) { o.put (std::uint64_t (0xDEAD)); return o; }
+    if (! d.prepare (kSr, maxBlock, s.channels()))
+    {
+        felitronics::test::ok (false, "runSliced: prepare REFUSED — every comparison below would be of two refusals");
+        o.put (std::uint64_t (0xDEAD));
+        return o;
+    }
     const std::size_t total = s.len();
     std::size_t at = 0, si = 0;
     bool allOk = true;
@@ -313,9 +375,20 @@ Out runSliced (const Sig& s, const HumDetectorParams& p, const std::vector<int>&
 HumReport once (const Sig& s, const HumDetectorParams& p, HumDetector& d)
 {
     d.setParams (p);                                           // the helper used to drop `p` on the floor
-    if (! d.prepare (kSr, 4096, s.channels())) return HumReport {};
+    // A REFUSAL IS LOUD. A default HumReport reads `mains == None`, which is exactly what a dozen rows below
+    // assert — so a helper that returned it quietly would turn every one of them green without measuring
+    // anything (P51 found that shape: the rate floor moved under this suite and those rows stayed green).
+    if (! d.prepare (kSr, 4096, s.channels()))
+    {
+        felitronics::test::ok (false, "once: prepare REFUSED — the rows that read this report measured nothing");
+        return HumReport {};
+    }
     const auto v = s.ptrs (0);
-    if (! d.process (v.data(), s.channels(), (int) s.len())) return HumReport {};
+    if (! d.process (v.data(), s.channels(), (int) s.len()))
+    {
+        felitronics::test::ok (false, "once: process REFUSED");
+        return HumReport {};
+    }
     d.finish();
     return d.report (0);
 }
@@ -343,15 +416,17 @@ int main()
         const auto g441 = HumDetector::geometryFor (44100.0, p);
         ok (g441.ok && g441.order == 17, "geometry: AUTO picks order 17 at 44.1 kHz");
         const auto g = HumDetector::geometryFor (kSr, p);
-        ok (g.ok && g.order == 13 && g.n == 8192 && g.hop == 4096, "geometry: order 13 / N 8192 / hop 4096 at 4 kHz");
-        ok (g.bins == 4097, "geometry: 4097 bins");
+        ok (g.ok && g.order == 15 && g.n == 32768 && g.hop == 16384, "geometry: order 15 / N 32768 / hop 16384 at 12 kHz");
+        ok (g.bins == 16385, "geometry: 16385 bins");
+        // EVERY NUMBER FROM HERE TO THE STORAGE ROW IS WHAT IT WAS AT 3 kHz / order 13 (before P51): the bin is the
+        // same 0.3662109375 Hz, and each extent below is an Hz parameter divided by it.
         // topHz = (60 + 0.5)*8 + 2*bin + 10 + bin = 495.0986..., / bin = 1351.9 -> 1352
         ok (g.bandLo == 2 && g.bandHi == 1352 && g.bandBins == 1351,
-            "geometry: the accumulated band is bins 2..1015 (got " + std::to_string (g.bandLo) + ".."
+            "geometry: the accumulated band is bins 2..1352 (got " + std::to_string (g.bandLo) + ".."
             + std::to_string (g.bandHi) + ")");
         // margin = 3 + 10 + bin = 13.366; (50 - margin)/bin = 100.03 -> 100; (120 + margin)/bin = 364.2 -> 365
         ok (g.stretchLo == 100 && g.stretchHi == 365 && g.stretchBins == 266,
-            "geometry: the active-stretch band is bins 74..274 (got " + std::to_string (g.stretchLo) + ".."
+            "geometry: the active-stretch band is bins 100..365 (got " + std::to_string (g.stretchLo) + ".."
             + std::to_string (g.stretchHi) + ")");
         ok (g.floorSpanBins == 28 && g.floorExcludeBins == 5 && g.floorPairs == 23,
             "geometry: 28 background bins minus 5 excluded leaves 23 pairs");
@@ -360,7 +435,7 @@ int main()
         // the resolution bound is a SEPARATION, and this rate meets it with the production margin
         approx (HumDetector::kMinNoteSeparationHz / g.binHz, 2.731, 0.001,
                 "geometry: 49.0 and 50.0 Hz are 2.73 bins apart here, as at 48 kHz / 2^17");
-        HumDetectorParams coarse = p; coarse.fftOrder = 12;   // bin 0.732: 1.37 bins, a merged pair
+        HumDetectorParams coarse = p; coarse.fftOrder = 14;   // bin 0.732: 1.37 bins, a merged pair
         ok (! HumDetector::geometryFor (kSr, coarse).ok
             || HumDetector::geometryFor (kSr, coarse).binHz > HumDetector::kMaxBinHz,
             "geometry: one order coarser does not meet the separation");
@@ -379,12 +454,15 @@ int main()
         HumDetectorParams bad = p;
         ok (! HumDetector::geometryFor (0.0, p).ok, "refuse: sample rate zero");
         ok (! HumDetector::geometryFor (std::numeric_limits<double>::quiet_NaN(), p).ok, "refuse: rate NaN");
-        ok (! HumDetector::geometryFor (999.0, p).ok, "refuse: rate below the bound");
+        ok (! HumDetector::geometryFor (std::nextafter (HumDetector::kMinSampleRate, 0.0), p).ok, "refuse: one ulp below the rate floor");
+        ok (! HumDetector::geometryFor (44.1, p).ok, "refuse: a rate in kilohertz");
+        ok (HumDetector::kMinSampleRate == 8000.0 && HumDetector::geometryFor (8000.0, p).ok,
+            "the floor is 8000 Hz (P51), and 8000 itself is accepted");
         ok (! HumDetector::geometryFor (768001.0, p).ok, "refuse: rate above the bound");
         bad = p; bad.fftOrder = 3;            ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: order 3");
         bad = p; bad.fftOrder = 23;           ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: order 23");
         bad = p; bad.hop = -1;                ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: negative hop");
-        bad = p; bad.hop = 8193;              ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: hop past the window");
+        bad = p; bad.hop = (int) kN + 1;      ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: hop past the window");
         bad = p; bad.toleranceHz = 0.0;       ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: zero tolerance");
         bad = p; bad.searchHz = 0.1;          ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: search inside the tolerance");
         bad = p; bad.floorExcludeHz = 20.0;   ok (! HumDetector::geometryFor (kSr, bad).ok, "refuse: exclusion wider than the span");
@@ -408,7 +486,7 @@ int main()
     //    lone Hann-windowed tone has no interior maximum on the bin grid. |W(m+f)| holds |sin(pi f)| fixed
     //    across bins and falls as 1/|m+f|^3, so it must not. Direct double DFT of the windowed 49.0 Hz tone.
     {
-        const int n = 8192;
+        const int n = (int) kN;
         std::vector<double> w ((std::size_t) n);
         for (int i = 0; i < n; ++i) w[(std::size_t) i] = 0.5 - 0.5 * std::cos (2.0 * core::kPi * i / (double) n);
         const int lo = (int) std::floor (47.0 / kBin), hi = (int) std::ceil (53.0 / kBin);
@@ -490,14 +568,14 @@ int main()
         ok (r.harmonicsObserved >= 3, "hum: " + std::to_string (r.harmonicsObserved) + " harmonics of the comb were found");
         ok (r.quietStretches == 2, "hum: exactly two quiet stretches (" + std::to_string (r.quietStretches) + ")");
         ok (r.storedStretches == 2 && r.stretchesComplete, "hum: and both are in the list");
-        // The coordinates are EXACT, computed from the fixture: frames start every 4096 and span 8192, the
-        // loud gap is [16384, 32768), so the last quiet frame of A starts at 8192 and the first of B at 32768.
+        // The coordinates are EXACT, computed from the fixture: frames start every 16384 and span 32768, the
+        // loud gap is [65536, 131072), so the last quiet frame of A starts at 32768 and the first of B at 131072.
         const auto s0 = d.stretch (0, 0), s1 = d.stretch (0, 1);
-        ok (s0.index == 0 && s0.startSample == 0 && s0.endSample == 16384 && s0.frames == 3,
-            "hum: stretch 0 is exactly [0, 16384) over 3 frames (got [" + std::to_string (s0.startSample) + ", "
+        ok (s0.index == 0 && s0.startSample == 0 && s0.endSample == 65536 && s0.frames == 3,
+            "hum: stretch 0 is exactly [0, 65536) over 3 frames (got [" + std::to_string (s0.startSample) + ", "
             + std::to_string (s0.endSample) + ") over " + std::to_string (s0.frames) + ")");
-        ok (s1.index == 1 && s1.startSample == 32768 && s1.endSample == 49152 && s1.frames == 3,
-            "hum: stretch 1 is exactly [32768, 49152) over 3 frames (got [" + std::to_string (s1.startSample)
+        ok (s1.index == 1 && s1.startSample == 131072 && s1.endSample == 196608 && s1.frames == 3,
+            "hum: stretch 1 is exactly [131072, 196608) over 3 frames (got [" + std::to_string (s1.startSample)
             + ", " + std::to_string (s1.endSample) + ") over " + std::to_string (s1.frames) + ")");
         ok (r.quietFrames == 6 && r.eligibleStretches == 2,
             "hum: 6 quiet frames, both stretches eligible (" + std::to_string (r.quietFrames) + ", "
@@ -716,7 +794,7 @@ int main()
         }
         // a coarser window than the pair needs
         {
-            HumDetectorParams cp = p; cp.fftOrder = 11;              // bin 1.95 Hz: 49.0 and 50.0 merge
+            HumDetectorParams cp = p; cp.fftOrder = 13;              // bin 1.46 Hz: 49.0 and 50.0 merge
             HumDetector d; const auto s = twoStretch (1, 50.1, 1.0e-3, true);
             d.setParams (cp);
             ok (d.prepare (kSr, 512, 1), "ladder: a coarse order still prepares");
@@ -1413,9 +1491,9 @@ int main()
         p.maxStretches = 64;
         const auto s = twoStretch (2, 50.14, 1.0e-3, true, 71);
         const std::vector<std::vector<int>> slicings = {
-            { (int) kLen }, { 1 }, { 2 }, { 3 }, { 4093 }, { (int) kHop - 1 }, { (int) kHop }, { (int) kHop + 1 },
-            { (int) kN - 1 }, { (int) kN }, { (int) kN + 1 }, { 512 }, { 65536 },
-            { 0, 1, 0, 4095, 0, 700 },
+            { (int) kLen }, { 1 }, { 2 }, { 3 }, { 16381 }, { (int) kHop - 1 }, { (int) kHop }, { (int) kHop + 1 },
+            { (int) kN - 1 }, { (int) kN }, { (int) kN + 1 }, { 2048 }, { 262144 },
+            { 0, 1, 0, 16383, 0, 2800 },
             // exactly on the transitions: the end of stretch A, the end of the loud gap, the last hop
             { (int) kQuietA1, (int) (kLoud1 - kQuietA1), (int) (kLen - kLoud1) },
         };
@@ -1430,7 +1508,7 @@ int main()
         for (unsigned seed = 0; seed < 6; ++seed)
         {
             std::mt19937 rng (seed + 101u);
-            std::uniform_int_distribution<int> dist (1, 6000);
+            std::uniform_int_distribution<int> dist (1, 24000);
             std::vector<int> sl;
             for (int i = 0; i < 64; ++i) sl.push_back (dist (rng));
             if (runSliced (s, p, sl, 512) != ref) ++ragged;

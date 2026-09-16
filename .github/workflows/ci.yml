@@ -540,7 +540,14 @@ jobs:
           refuse clipfix.f32 48000 2 --max-runs
           refuse clipfix.f32 48000 0
           refuse clipfix.f32 48000 17
-          refuse clipfix.f32 999 2
+          # THE RATE FLOOR, FROM BOTH SIDES (P51: the core's 8000 Hz; it was 1000 here, with `999` the row).
+          # The refusal rows see the floor move down; they cannot see it move UP, so 8000 itself is a comparison
+          # that must produce a report. 44.1 is the mistake the floor exists for: kilohertz passed as hertz.
+          refuse clipfix.f32 7999 2
+          refuse clipfix.f32 7999.999999999999 2
+          refuse clipfix.f32 44.1 2
+          refuse clipfix.f32 1000 2
+          check  clipfix.f32 8000 2
           refuse clipfix.f32 768001 2
           refuse clipfix.f32 0 2
           : > empty.f32 && refuse empty.f32 48000 2
@@ -610,10 +617,11 @@ jobs:
           test -s storage-native.txt
           # A table of nothing but refusals would compare clean and say nothing, which is the shape this
           # repository keeps catching. Floors, not equalities, so the grid may grow — but it may not
-          # shrink: 425 rows today, of which 280 are priced.
-          [ "$(wc -l < storage-native.txt)" -ge 425 ] \
+          # shrink: 475 rows today, of which 284 are priced. (P51 moved the rate floor to 8000 Hz: the 1000 Hz
+          # rows went to zero, the 2000 Hz rows left the grid, and 7999 / 12000 / 16000 joined — 425 / 280 before.)
+          [ "$(wc -l < storage-native.txt)" -ge 475 ] \
             || { echo "the storage table lost rows — a smaller grid still compares clean"; exit 1; }
-          [ "$(grep -cv ' 0$' storage-native.txt)" -ge 280 ] \
+          [ "$(grep -cv ' 0$' storage-native.txt)" -ge 284 ] \
             || { echo "the storage table is mostly refusals — it is comparing nothing"; exit 1; }
           for mod in fcprobe.node.js fcprobe.debug.js; do
             node tools/wasm/storage-probe.mjs "tools/wasm/build/$mod" table > storage-wasm.txt

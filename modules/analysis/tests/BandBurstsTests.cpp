@@ -740,6 +740,14 @@ static void groupContract()
     { Params p = par; bad.push_back ({ "sampleRate 0",          0.0, 2, p }); }
     { Params p = par; bad.push_back ({ "sampleRate NaN",        std::numeric_limits<double>::quiet_NaN(), 2, p }); }
     { Params p = par; bad.push_back ({ "sampleRate too low",    999.0, 2, p }); }
+    // P51 — THE RATE FLOOR, WHERE THIS CLASS CAN SEE IT. At the default band its own floor is 18368 Hz, so the core's
+    // 8000 is invisible; a band that ends at 3 kHz fits below Nyquist at 7999 Hz, and only the floor refuses it (both
+    // rows are ACCEPTED on origin/main). No kilohertz row here: at 44.1 Hz this class refuses its own hop first, so
+    // such a row would pass for that reason and prove nothing about the floor.
+    { Params p = par; p.bandLowHz = 1000.0; p.bandHighHz = 3000.0;
+                                                       bad.push_back ({ "one ulp under the rate floor, a band that fits", std::nextafter (8000.0, 0.0), 2, p }); }
+    { Params p = par; p.bandLowHz = 1000.0; p.bandHighHz = 3000.0;
+                                                       bad.push_back ({ "7999 Hz, a band that fits",   7999.0, 2, p }); }
     { Params p = par; bad.push_back ({ "channels 0",            48000.0, 0, p }); }
     { Params p = par; bad.push_back ({ "channels too many",     48000.0, core::kMaxChannels + 1, p }); }
     { Params p = par; p.bandHighHz = p.bandLowHz;      bad.push_back ({ "band hi == lo",      48000.0, 2, p }); }
@@ -768,6 +776,12 @@ static void groupContract()
         if (st.ok || accepted || st.bytes() != 0) { ++leak; test::ok (false, std::string ("must refuse: ") + b.what); }
     }
     test::ok (leak == 0, std::to_string (bad.size()) + " malformed configurations refused by BOTH storageFor and prepare");
+    {
+        Params p = par; p.bandLowHz = 1000.0; p.bandHighHz = 3000.0;
+        BB e; e.setParams (p);
+        test::ok (BB::kMinSampleRate == 8000.0 && BB::storageFor (8000.0, 2, p).ok && e.prepare (8000.0, 512, 2),
+                  "the floor is 8000 Hz (P51), and 8000 itself is accepted by both, with that band");
+    }
 
     // The published storage is the allocated storage, and prepare() is the only allocator. Counted here
     // rather than derived: `okNoAlloc` is only strict on libc++, which is this row.

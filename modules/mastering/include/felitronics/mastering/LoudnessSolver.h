@@ -5,6 +5,7 @@
 
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
+#include <felitronics/core/Config.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/dynamics/offline/Quantile.h>
 #include <felitronics/mastering/MasteringChain.h>
@@ -457,6 +458,11 @@ class TargetLoudnessSolver
 public:
     static constexpr double kMaxGainDb = 60.0;      // MasteringChain::kMaxGainDb — the search's actuator range
     static constexpr int    kMaxPasses = TargetLoudnessSolverLimits::kMaxPasses;
+    // The lowest rate the search measures at — the core's floor (P51). Below twice the K-weighting shelf the meters
+    // this class builds are aliased and, in most of that range, unstable (a 0 dBFS sine read +3043 LUFS at 3300 Hz),
+    // and below 8000 Hz what arrives is a
+    // rate in kilohertz or a broken header: on origin/main a search handed 88.2 reported Solved at -14 LUFS.
+    static constexpr double kMinSampleRate = core::kMinSampleRate;
 
     // WHERE THIS CLASS STOPS REPORTING A dB AND STARTS REPORTING A SENTINEL. peakDb() below is the only
     // user; the constant is public so a test can pin WHERE it is, not merely that silence reads -200.
@@ -477,7 +483,7 @@ public:
                                 int internalBlock, int oversampleFactor, double binDb = 0.01)
     {
         prepared_ = false;
-        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate)) return false;
+        if (! rateAdmitted (sampleRate)) return false;
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;
         if (rendererBlock < 1 || internalBlock < 1 || oversampleFactor < 1) return false;
         if (! (binDb > 0.0) || ! std::isfinite (binDb)) return false;
@@ -578,7 +584,9 @@ public:
     // allocates none.)
     static std::uint64_t measureRangeBytes (double sampleRate, int frames) noexcept
     {
-        return rangeMeasurable (frames, sampleRate) ? meterBytes (sampleRate, frames) : 0u;
+        // The rate first: rangeMeasurable() divides by it. (The answer was 0 either way — meterBytes() refuses the
+        // same rates — but a division by a zero rate is not a question this budget should have to ask.)
+        return rateAdmitted (sampleRate) && rangeMeasurable (frames, sampleRate) ? meterBytes (sampleRate, frames) : 0u;
     }
 
     // Render `frames` of `in` into `out` at a gain and ceiling chosen to meet `req`. `params` is the
@@ -1400,21 +1408,30 @@ private:
     //    the interface reports success. The COUNT deliberately does not live here: its owner is the
     //    baseline harness in another repository, it moves whenever that corpus does, and nothing in
     //    this tree can re-derive it. A number without a local owner rots and cannot be made not to.
+    // THE RATE THIS CLASS MEASURES AT — the one test, read by prepare() and by every budget, so the two cannot disagree
+    // about a rate. NaN and -inf fail the first comparison; +inf fails the second.
+    static bool rateAdmitted (double sampleRate) noexcept
+    {
+        return sampleRate >= kMinSampleRate && std::isfinite (sampleRate);
+    }
+
     // THE METER'S CAPACITY FOR A PROGRAMME, in samples: the programme plus one second of margin. The ONE place it is
     // decided — both meters this class builds size themselves with it. In samples, and not as `frames / fs + 1`
-    // seconds, which is +inf at a finite rate the chain accepts (1e-305 Hz with 2000 frames): the store's size was
-    // then `(std::size_t) inf`, undefined behaviour, and the same ABI call kept 3 blocks on arm64 and wasm32 and 4
-    // on x86-64 gcc.
+    // seconds, which was +inf at a finite rate the chain used to accept (1e-305 Hz with 2000 frames): the store's
+    // size was then `(std::size_t) inf`, undefined behaviour, and the same ABI call kept 3 blocks on arm64 and wasm32
+    // and 4 on x86-64 gcc. Since P51 no such rate reaches this class (`frames / fs` is at most INT_MAX / 8000 s), and
+    // the property is pinned where it still can be reached — `LoudnessMeter::prepareForSamples`, which takes any rate.
     static double meterSamples (int frames, double sampleRate) noexcept
     {
         return (double) frames + std::ceil (sampleRate);
     }
 
     // The loudness meter a programme of `frames` is measured with — the store both meters of this class are built with.
-    // 0 for a rate prepare() refuses: the meter would read it as 48 kHz, but no measurement reaches a meter at it.
+    // 0 for a rate prepare() refuses: the meter itself would take it (and read a rate <= 0 as 48 kHz), but no
+    // measurement reaches a meter at it.
     static std::uint64_t meterBytes (double sampleRate, int frames) noexcept
     {
-        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate)) return 0u;
+        if (! rateAdmitted (sampleRate)) return 0u;
         analysis::LoudnessMeter::Storage st;
         return analysis::LoudnessMeter::storageFor (sampleRate, meterSamples (frames, sampleRate), st) ? st.bytes() : 0u;
     }

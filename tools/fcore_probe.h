@@ -69,27 +69,35 @@ public:
     // absurd-but-finite rate (1e300, or Number.MIN_VALUE from a page) is no audio rate, and what each stage
     // downstream makes of one is not this tool's to find out — the meter, for one, now REFUSES a rate whose hop
     // overflows an int, where it used to reach an out-of-range lround (undefined behaviour). The probe refuses
-    // such a rate itself, with its own answer. The bounds are generous: every rate any product here will meet
-    // lies inside them by orders of magnitude.
-    static constexpr double kMinSampleRate = 1000.0;
+    // such a rate itself, with its own answer.
+    // THE FLOOR IS THE CORE'S (P51, core::kMinSampleRate = 8000), and it is not generous: it used to be 1000 here,
+    // which sat INSIDE the band where the K-weighting shelf is past Nyquist — this probe read +3048.86 LUFS for the
+    // CI fixture at 3300 Hz. Every analyzer behind the probe ABI reads the same constant. The ceiling is the
+    // offline measurers' own.
+    static constexpr double kMinSampleRate = felitronics::core::kMinSampleRate;
     static constexpr double kMaxSampleRate = 768000.0;
 
     // maxDurationSec sizes the meter's gating-block store. The default holds 4 h at any rate (1.27 MB) —
     // droppedBlocks() reads 0 for anything shorter, and a caller checks it rather than assuming. A duration whose
     // store the meter cannot represent — a block count past its int index, 3e8 s — is refused, because the meter
     // refuses it: a probe that ignored that answer would report prepared and measure nothing.
+    // A REFUSAL LEAVES THE PROBE AS A FRESH ONE (law 11b), getters included: every refusal below drops the two
+    // meters back to default-constructed ones, so a caller who ignored the `false` reads what a probe that was never
+    // prepared reads (-120 LUFS, a zero peak, no blocks) and not the previous file. P51 made this matter: 1000..7999 Hz
+    // used to RE-prepare the meters, and is a refusal now. (fc_probe's `haveResult` and fcore_measure's fresh probe
+    // already kept their own callers safe; this is for everyone else.)
     bool prepare (double sampleRate, int channels, double maxDurationSec = 4.0 * 3600.0)
     {
         prepared_ = false;
         finished_ = false;
         // The compound test rejects 0, negatives, NaN and +inf, and then the absurd-but-finite rates too.
-        if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return false;
-        if (channels < 1 || channels > felitronics::core::kMaxChannels) return false;
-        if (! (maxDurationSec > 0.0) || ! std::isfinite (maxDurationSec)) return false;
+        if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)
+            || channels < 1 || channels > felitronics::core::kMaxChannels
+            || ! (maxDurationSec > 0.0) || ! std::isfinite (maxDurationSec)) return refuse();
 
         nc_ = channels;
-        if (! lm_.prepare (sampleRate, nc_, maxDurationSec)) return false;
-        if (! tp_.prepare (sampleRate, kChunk, nc_)) return false;     // prepare() also resets the running maxima
+        if (! lm_.prepare (sampleRate, nc_, maxDurationSec)) return refuse();
+        if (! tp_.prepare (sampleRate, kChunk, nc_)) return refuse();     // prepare() also resets the running maxima
         prepared_ = true;
         return true;
     }
@@ -178,6 +186,14 @@ public:
     std::uint64_t nonFiniteSubHops() const noexcept { return lm_.nonFiniteSubHops(); }
 
 private:
+    bool refuse()
+    {
+        lm_ = felitronics::analysis::LoudnessMeter {};
+        tp_ = felitronics::analysis::ReferenceTruePeakMeter {};
+        nc_ = 0;
+        return false;
+    }
+
     felitronics::analysis::LoudnessMeter          lm_;
     felitronics::analysis::ReferenceTruePeakMeter tp_;
     int                                           nc_ = 0;
@@ -202,13 +218,30 @@ class ShapeProbe
 public:
     static constexpr int kChunk = Probe::kChunk;
 
+    // THE RATE FLOOR IS THE PROBE'S (P51), checked here and not in WaveformPeaks, which mirrors a page's JavaScript
+    // and only derives a decimation from the rate. Nothing below it is unstable in these two reductions; it is
+    // refused so that one ABI gives one answer about a rate — `fc_probe_shapes_run` was the only run entry that took
+    // 44.1. ONLY the floor: the shapes keep no ceiling of their own (WaveformPeaks refuses only a decimation past an
+    // int), so a rate above Probe::kMaxSampleRate that Probe refuses is still drawn — a difference that predates P51
+    // and is not its to close.
+    // And a refusal RESETS THE PARTS (law 11b): `peaks()` and `stereo()` are public, and a refused call must not leave
+    // them on the previous file — not their flags and not their data. Asking a part for zero channels would only clear
+    // its flag (the diff-pass round: the old peaks, frame count, columns and RMS stayed readable), so each part is
+    // replaced by a fresh one, as Probe replaces its meters; a refused ShapeProbe reads like a new one.
     bool prepare (double sampleRate, int channels, std::uint64_t frames, int buckets,
                   felitronics::analysis::PeakMix mix, int columns)
     {
         prepared_ = false;
-        if (channels < 1 || channels > felitronics::core::kMaxChannels) return false;
-        if (! peaks_.prepare (sampleRate, channels, frames, buckets, mix)) return false;
-        if (! stereo_.prepare (channels, frames, columns)) return false;
+        if (! (sampleRate >= Probe::kMinSampleRate)                             // NaN fails too
+            || channels < 1 || channels > felitronics::core::kMaxChannels
+            || ! peaks_.prepare (sampleRate, channels, frames, buckets, mix)
+            || ! stereo_.prepare (channels, frames, columns))
+        {
+            peaks_  = felitronics::analysis::WaveformPeaks {};
+            stereo_ = felitronics::analysis::StereoColumns {};
+            nc_ = 0;
+            return false;
+        }
         nc_ = channels;
         prepared_ = true;
         return true;

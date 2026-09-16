@@ -173,6 +173,17 @@ static void testPlan()
     ok (! DeliveryResampler::plan (params (std::numeric_limits<double>::infinity(), 48000.0)).ok, "infinity is refused");
     ok (! DeliveryResampler::plan (params (1.0e300, 48000.0)).ok, "a finite rate llround cannot hold is refused");
     ok (! DeliveryResampler::plan (params (100.0, 48000.0)).ok, "an absurdly low rate is refused");
+    // P51 — THE FLOOR IS THE CORE'S 8000 Hz (it was a literal 1000 here), on both sides and at the boundary, because
+    // this plan is the one verdict a delivering mastering handle takes on its SOURCE rate: the chain runs at the
+    // delivery rate and never sees it. 4000 and 7999 were plannable on origin/main.
+    ok (felitronics::core::kMinSampleRate == 8000.0, "the core's floor is 8000 Hz");
+    ok (! DeliveryResampler::plan (params (7999.0, 48000.0)).ok && ! DeliveryResampler::plan (params (48000.0, 7999.0)).ok,
+        "7999 Hz is refused, as the source and as the destination");
+    ok (! DeliveryResampler::plan (params (4000.0, 48000.0)).ok && ! DeliveryResampler::plan (params (1000.0, 48000.0)).ok,
+        "and so are 4000 and the old floor, 1000");
+    ok (DeliveryResampler::plan (params (8000.0, 48000.0)).ok && DeliveryResampler::plan (params (48000.0, 8000.0)).ok
+            && DeliveryResampler::plan (params (8000.0, 8000.0)).ok,
+        "8000 itself is planned, either way and to itself");
     ok (! DeliveryResampler::plan (params (44099.0, 48000.0)).ok, "a ratio past kMaxRatioTerm is refused");
     for (double pf : { std::nextafter (1.0, 0.0), 0.999999, 0.9999999999 })
     {

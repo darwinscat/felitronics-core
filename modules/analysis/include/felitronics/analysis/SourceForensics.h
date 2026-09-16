@@ -368,7 +368,7 @@ struct SourceForensicsParams
 class SourceForensics
 {
 public:
-    static constexpr double kMinSampleRate = 1000.0;
+    static constexpr double kMinSampleRate = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate = 768000.0;
     static constexpr int    kMinFftOrder   = 8;
     static constexpr int    kMaxFftOrder   = 22;

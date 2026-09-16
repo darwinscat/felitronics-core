@@ -136,7 +136,8 @@ namespace felitronics::analysis
 // paired median of its neighbours is small but not small enough, and if the two quiet stretches carry the
 // SAME noise — a looped passage, a repeated room tone, a silent section duplicated by an editor — the
 // excursion repeats exactly and passes the stationarity test with it. MEASURED, 1200 noise-only files per
-// cell at 4 kHz (`minFramesPerObservation` = 1, i.e. the rule off), reported as mains:
+// cell at 4 kHz (a rate below the core's floor since P51), with `minFramesPerObservation` = 1, i.e. the rule off,
+// reported as mains:
 //                                        10 dB   12 dB   14 dB   16 dB
 //   one frame per stretch, independent        0       0       0       0
 //   one frame per stretch, IDENTICAL noise   75       5       0       0
@@ -149,7 +150,8 @@ namespace felitronics::analysis
 // The price is named rather than paid silently: fewer than two eligible stretches is
 // `valid = false, StretchesTooShort`, never "no hum". At 48 kHz two frames is N + hop = 4.1 s of quiet.
 // A LOOPED passage whose period puts a line inside the tolerance is NOT a false positive and is not treated
-// as one: a buffer repeated every 997 samples at 4 kHz really does carry a stationary line at 60.18 Hz with
+// as one: a buffer repeated every 997 samples at 4 kHz (below the floor since P51; the arithmetic is the point)
+// really does carry a stationary line at 60.18 Hz with
 // an exact harmonic comb, and no spectral instrument can call that anything else. The header's first
 // paragraph is the answer to it: `mains` is a mains-COMPATIBLE line, not a causal claim.
 //
@@ -382,7 +384,7 @@ public:
     static constexpr double kMinSeparationBins = 2.7;
     static constexpr double kMaxBinHz          = kMinNoteSeparationHz / kMinSeparationBins;   // 0.370 Hz
     // ... and nothing is gained below this: a window finer than 0.01 Hz (100 s) measures the grid's own
-    // wander rather than a line, and its background sort would dominate the runtime (order 22 at 1 kHz took
+    // wander rather than a line, and its background sort would dominate the runtime (order 22 at 1 kHz — before P51 — took
     // 114 s for two frames before this bound existed).
     static constexpr double kMinBinHz          = 0.01;
     static constexpr int    kMinHarmonic       = 1;
@@ -393,7 +395,7 @@ public:
     static constexpr double kMaxSpanHz         = 100000.0;   // the largest any Hz parameter may be (see geometryFor)
     // Bounded like every other measurer in this module (ClipDetector.h:132): it also keeps binHz far from zero,
     // so every `(int) ceil(hz / binHz)` below is a small number rather than an undefined narrowing of +inf.
-    static constexpr double kMinSampleRate     = 1000.0;
+    static constexpr double kMinSampleRate     = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate     = 768000.0;
 
     // The geometry every size and every window is derived from — ONE function, shared by storageFor() and
@@ -433,7 +435,7 @@ public:
     {
         Geometry g;
         if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return g;   // NaN fails too
-        // Each Hz parameter is bounded as well as finite: `bin` can be as small as 1000/2^22, so an
+        // Each Hz parameter is bounded as well as finite: `bin` can be as small as kMinSampleRate/2^22, so an
         // unbounded numerator would make a bin index exceed `int` long before it reached infinity.
         if (! (p.toleranceHz > 0.0) || ! (p.toleranceHz <= kMaxSpanHz)) return g;
         if (! (p.searchHz >= p.toleranceHz) || ! (p.searchHz <= kMaxSpanHz)) return g;

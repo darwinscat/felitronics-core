@@ -347,7 +347,7 @@ class BandBursts
 public:
     static constexpr int    kIoiBins         = 512;     // adjacent-onset spacings, one hop per bin
     static constexpr int    kMaxLag          = 512;     // onset autocorrelation, lags 1..512 hops
-    static constexpr double kMinSampleRate   = 1000.0;
+    static constexpr double kMinSampleRate   = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate   = 768000.0;
     static constexpr double kMinHopMs        = 1.0;
     static constexpr double kMaxHopMs        = 1000.0;

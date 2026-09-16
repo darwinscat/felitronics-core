@@ -316,7 +316,7 @@ struct ProgrammeTraceEvent
 class ProgrammeReport
 {
 public:
-    static constexpr double kMinSampleRate      = 1000.0;
+    static constexpr double kMinSampleRate      = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate      = 768000.0;
     static constexpr int    kShortTermSubHops   = 300;    // 3 s of 10 ms sub-hops — the short-term window
     static constexpr int    kObservationHops    = 100;    // one short-term observation a second (libebur128's cadence)

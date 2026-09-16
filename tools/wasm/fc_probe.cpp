@@ -112,7 +112,8 @@ namespace
     bool viable (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate)
     {
         if (! planarSpan (planar, frames, channels)) return false;
-        // rejects 0 / negative / NaN / +inf and the absurd-but-finite rates (see Probe::kMinSampleRate)
+        // rejects 0 / negative / NaN / +inf, every rate below the core's 8 kHz floor and the absurd-but-finite
+        // ones above 768 kHz (see Probe::kMinSampleRate)
         return probe().prepare (sampleRate, (int) channels);
     }
 
@@ -1298,7 +1299,9 @@ FC_EXPORT std::uint32_t fc_probe_lowend_bands (double* out, std::uint32_t cap)
 //    two fixed mid/side axes — still buys a band table and a block store. None of the five can be accepted
 //    and cost nothing. A grid is only
 //    a sample and says nothing about the rest of the domain: the smallest demand a fine sweep of the
-//    accepted domain FOUND is 158 240 bytes (hum, 1517 Hz, one channel), which is an observation. What
+//    accepted domain FOUND is 416 792 bytes (report, 8050 Hz, one channel; 158 240 — hum at 1517 Hz — before
+//    P51 moved the rate floor to 8 kHz, and the same sweep reproduces that number on the old tree), which is
+//    an observation. What
 //    the gate pins is the equivalence, not a constant — felitronics_analysis_abi_tests walks a grid of
 //    widths and rates, including each mode's own admission floor, and asserts that the query is positive
 //    exactly where `_run` is accepted. The zero is a canonical +0.0, which is what lets a caller write

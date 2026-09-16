@@ -568,6 +568,28 @@ static void testCreateBudget()
         "the sum of the two core budgets, at the DELIVERY rate for the chain");
     ok (DeliveredMastering::createBytes (48000.0, 44100.5, kNch, cfg, kBlock) == 0u, "a rate the resampler cannot plan: 0");
     ok (DeliveredMastering::createBytes (48000.0, 96000.0, 0, cfg, kBlock) == 0u, "a width the chain refuses: 0");
+    // P51 — THE RATE FLOOR ON BOTH RATES. The chain is built at the delivery rate, so the source rate reaches no floor
+    // but the converter's; each side is refused on its own, and every budget of the class agrees.
+    ok (DeliveredMastering::createBytes (7999.0, 48000.0, kNch, cfg, kBlock) == 0u
+            && DeliveredMastering::createBytes (48000.0, 7999.0, kNch, cfg, kBlock) == 0u,
+        "7999 Hz as the source or as the delivery: 0");
+    ok (DeliveredMastering::createBytes (8000.0, 48000.0, kNch, cfg, kBlock) > 0u
+            && DeliveredMastering::createBytes (48000.0, 8000.0, kNch, cfg, kBlock) > 0u,
+        "8000 Hz either way: a budget");
+    ok (DeliveredMastering::deliveredFrames (7999.0, 48000.0, 7999) < 0 && DeliveredMastering::deliveredFrames (8000.0, 48000.0, 8000) == 48000,
+        "the delivered length says the same: none from 7999, one second from 8000");
+    ok (DeliveredMastering::solveBytes (4000.0, 48000.0, kNch, 4000 * 10) == 0u
+            && DeliveredMastering::measureRangeBytes (4000.0, 48000.0, kNch, 4000 * 10) == 0u
+            && DeliveredMastering::prepareBytes (4000.0, 48000.0, kNch, kBlock) == 0u,
+        "and the other budgets of a 4000 Hz source are 0 — it was planned, and budgeted, on origin/main");
+    {
+        DeliveredMastering dm;
+        ok (dm.prepare (48000.0, 96000.0, kNch, kBlock), "PRECONDITION: a prepared delivery");
+        ok (dm.sourceRate() == 48000.0 && dm.deliveryRate() == 96000.0, "PRECONDITION: its rates are readable");
+        ok (! dm.prepare (7999.0, 48000.0, kNch, kBlock) && ! dm.isPrepared(), "a refused source rate disarms it (law 11b)");
+        ok (dm.sourceRate() == 0.0 && dm.deliveryRate() == 0.0 && ! dm.converter().isPrepared(),
+            "and the previous build's rates are not readable after it — 0, as before any prepare");
+    }
 
     const std::uint64_t budget = DeliveredMastering::createBytes (48000.0, 96000.0, kNch, MasteringChainConfig {}, kBlock);
     const std::uint64_t chainOnly = createBytes (96000.0, kNch, MasteringChainConfig {}, kBlock);
