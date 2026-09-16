@@ -30,7 +30,7 @@
 //   fc_probe.cpp: a `const float* const*` across the wasm boundary would mean building a table of i32
 //   offsets in the heap and exporting HEAPU32 to write it, for no gain — and AudioBuffer.getChannelData(c)
 //   is already planar, so the page does one HEAPF32.set() per channel and no de-interleave loop.
-// * NO CALLBACKS. The block loop lives in JS inside the worker; nothing here calls back into the host.
+// * ONE CALLBACK per handle, `fc_master_set_progress`; on wasm without one, `Module.onProgress(msg)` (false/throw = stop).
 // * `uint32_t` frame counts. wasm32 is a 32-bit target and a signed frame count invites an overflow
 //   that cannot happen on the 64-bit machine this core was written on.
 // * EVERY entry point returns `fc_status`. Nothing returns a value in band with an error.
@@ -169,7 +169,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 4u
+#define FC_MASTER_ABI_VERSION 5u
 
 typedef struct fc_header
 {
@@ -243,8 +243,9 @@ typedef enum fc_status
     FC_ERR_NON_FINITE      = 11,   // a NaN or an infinity where the contract admits neither
     FC_ERR_REFUSED_BY_CORE = 12,   // the core returned false. This ABI does not know why, and says so
     FC_ERR_EXHAUSTED       = 13,   // no free slot in the handle table
-    FC_ERR_POISONED        = 14    // an earlier call into this module never returned: the instance is
+    FC_ERR_POISONED        = 14,   // an earlier call into this module never returned: the instance is
                                    // abandoned, and nothing but a new one answers — see above
+    FC_ERR_CANCELLED       = 15
 } fc_status;
 
 //==============================================================================
@@ -878,6 +879,26 @@ fc_status fc_master_need (fc_master h, int32_t op, uint32_t frames, fc_need* out
 // `frames` does not appear: a create has no programme. The solver fields come back neutral. Allocates
 // nothing itself and touches no handle.
 fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
+
+typedef enum fc_progress_stage
+{
+    FC_PROGRESS_CONVERT = 0, FC_PROGRESS_LRA = 1, FC_PROGRESS_PASS = 2, FC_PROGRESS_FINAL = 3
+} fc_progress_stage;
+
+typedef struct fc_progress
+{
+    int32_t       stage;
+    int32_t       pass;
+    int32_t       maxPasses;
+    int32_t       hasRecord;
+    double        fraction;
+    fc_solve_pass record;
+} fc_progress;
+
+typedef int32_t (*fc_progress_fn) (void* context, const fc_progress* event);
+
+// fn: stage, pass/maxPasses, fraction 0..1, record at 1; nonzero continues, 0 stops (FC_ERR_CANCELLED); must not call in or throw.
+fc_status fc_master_set_progress (fc_master h, fc_progress_fn fn, void* context);
 
 // The input's loudness range, for the LRA constraint — which is a DELTA and therefore needs both ends.
 // Stateless by construction: it returns the number and the caller puts it into the request, so it

@@ -93,6 +93,7 @@ const char* statusName (fc_status s)
         case FC_ERR_REFUSED_BY_CORE: return "REFUSED_BY_CORE";
         case FC_ERR_EXHAUSTED:       return "EXHAUSTED";
         case FC_ERR_POISONED:        return "POISONED";
+        case FC_ERR_CANCELLED:       return "CANCELLED";
     }
     return "?";
 }
@@ -685,6 +686,8 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_measurement, compressorGrTraceValid) X (fc_measurement, limiterGrTraceValid)                             \
     X (fc_gr_trace_bucket, maxDb) X (fc_gr_trace_bucket, meanDb) X (fc_gr_trace_bucket, samples)                   \
     X (fc_gr_trace_bucket, nonFinite)                                                                              \
+    X (fc_progress, stage) X (fc_progress, pass) X (fc_progress, maxPasses) X (fc_progress, hasRecord)             \
+    X (fc_progress, fraction) X (fc_progress, record)                                                              \
     X (fc_solution_summary, header) X (fc_solution_summary, status) X (fc_solution_summary, binding)               \
     X (fc_solution_summary, alsoViolated) X (fc_solution_summary, preLimiterGainDb)                                \
     X (fc_solution_summary, ceilingDbTp) X (fc_solution_summary, passes) X (fc_solution_summary, logCount)         \

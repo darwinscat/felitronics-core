@@ -1748,20 +1748,25 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 4u, "PRECONDITION: this group is written for v4 (v2: deliveryRate; v3: compressorMix; v4: the GR trace)");
+        ok (kCur == 5u, "PRECONDITION: this group is written for v5 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+                        "v5: fc_master_set_progress, no struct grew)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u,
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u,
             "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u,
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u,
             "params: 6560 at v1 and v2, 6568 from v3");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u,
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u,
             "resolved: 80 at v1 and v2, 88 from v3");
         ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
-            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u, "measurement: 208 to v3, 224 from v4 — the trace's four fields");
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 5) == 224u,
+            "measurement: 208 to v3, 224 from v4 — the trace's four fields");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
         {
@@ -1781,6 +1786,7 @@ int main()
             { 2u, 88u, FC_OK,              "v2 at 88 bytes" },
             { 3u, 88u, FC_OK,              "v3 at 88 bytes — the config did not grow at v3" },
             { 4u, 88u, FC_OK,              "v4 at 88 bytes — nor at v4" },
+            { 5u, 88u, FC_OK,              "v5 at 88 bytes — nor at v5" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },

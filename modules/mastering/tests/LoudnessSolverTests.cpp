@@ -187,6 +187,7 @@ const char* statusName (MasteringSolveStatus s)
         case MasteringSolveStatus::RenderFailed:       return "RenderFailed";
         case MasteringSolveStatus::NotPrepared:        return "NotPrepared";
         case MasteringSolveStatus::InvalidRequest:     return "InvalidRequest";
+        case MasteringSolveStatus::Cancelled:          return "Cancelled";
     }
     return "?";
 }

@@ -162,6 +162,11 @@ const STRUCTS = {
         ['maxDb', 'f64'], ['meanDb', 'f64'], ['samples', 'u32'], ['nonFinite', 'u32'],
     ],
 
+    fc_progress: [
+        ['stage', 'i32'], ['pass', 'i32'], ['maxPasses', 'i32'], ['hasRecord', 'i32'],
+        ['fraction', 'f64'], ['record', 'fc_solve_pass'],
+    ],
+
     fc_solution_summary: [
         ['header', 'fc_header'],
         ['status', 'i32'], ['binding', 'i32'], ['alsoViolated', 'u32'],
@@ -322,14 +327,14 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 4;
+export const FC_MASTER_ABI_VERSION = 5;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
     'FC_OK', 'FC_ERR_HANDLE', 'FC_ERR_ABI_VERSION', 'FC_ERR_STRUCT_SIZE', 'FC_ERR_NULL',
     'FC_ERR_ALIGNMENT', 'FC_ERR_SPAN', 'FC_ERR_ENUM', 'FC_ERR_RANGE', 'FC_ERR_CAPACITY',
     'FC_ERR_STATE', 'FC_ERR_NON_FINITE', 'FC_ERR_REFUSED_BY_CORE', 'FC_ERR_EXHAUSTED',
-    'FC_ERR_POISONED',
+    'FC_ERR_POISONED', 'FC_ERR_CANCELLED',
 ];
 export const statusName = s => FC_STATUS[s] ?? `FC_STATUS(${s})`;
 

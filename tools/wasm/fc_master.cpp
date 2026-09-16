@@ -329,6 +329,9 @@ static_assert (sizeof (fc_mono_bass) == 12 && sizeof (fc_compressor) == 88 && si
 static_assert (sizeof (fc_limiter) == 16 && sizeof (fc_dither) == 24 && sizeof (fc_gr_limit) == 16);
 static_assert (sizeof (fc_solve_pass) == 64 && sizeof (fc_gr_stats) == 64);
 static_assert (sizeof (fc_gr_trace_bucket) == 24);                                                          // v4, frozen
+static_assert (sizeof (fc_progress) == 88 && offsetof (fc_progress, stage) == 0 && offsetof (fc_progress, pass) == 4
+               && offsetof (fc_progress, maxPasses) == 8 && offsetof (fc_progress, hasRecord) == 12
+               && offsetof (fc_progress, fraction) == 16 && offsetof (fc_progress, record) == 24);
 // v4's fields by TYPE as well as by offset: a `double` retyped to `float` keeps this struct's size and every offset (the
 // four bytes become padding), so neither pin above would see it, and JavaScript would read eight bytes where four were
 // written (the code-review round, by mutation).
@@ -823,6 +826,9 @@ struct MasterInstance
     // known parameter set back. Law 11 at the handle level: a call that cannot be honoured as the caller
     // means it is refused rather than answered with something plausible.
     bool solverRan = false;
+
+    fc_progress_fn progressFn = nullptr;
+    void*          progressContext = nullptr;
 };
 
 struct Slot
@@ -955,6 +961,100 @@ void planes (float* base, std::uint32_t stride, int nch, float** out) noexcept
     for (int c = 0; c < nch; ++c) out[c] = base + (std::size_t) c * (std::size_t) stride;
 }
 
+}   // namespace
+
+static_assert ((int) ProgressStage::Convert       == FC_PROGRESS_CONVERT
+               && (int) ProgressStage::LoudnessRange == FC_PROGRESS_LRA
+               && (int) ProgressStage::SearchPass    == FC_PROGRESS_PASS
+               && (int) ProgressStage::FinalRender   == FC_PROGRESS_FINAL);
+
+#if defined(__EMSCRIPTEN__)
+EM_JS (int, fc_js_progress, (int stage, int pass, int maxPasses, double fraction, int hasRecord,
+                             double gainDb, double ceilingDb, double integratedLufs, double truePeakDbTp,
+                             double plrDb, double limiterMaxGrDb, double loudnessRangeLu, int violated), {
+    if (typeof Module["onProgress"] !== "function") return 1;
+    const msg = { stage: ["convert", "lra", "pass", "final"][stage], pass: pass, maxPasses: maxPasses,
+                  fraction: fraction };
+    if (hasRecord)
+        msg.record = { gainDb: gainDb, ceilingDb: ceilingDb, integratedLufs: integratedLufs,
+                       truePeakDbTp: truePeakDbTp, plrDb: plrDb, limiterMaxGrDb: limiterMaxGrDb,
+                       loudnessRangeLu: loudnessRangeLu, violated: violated >>> 0 };
+    try { return Module["onProgress"](msg) === false ? 0 : 1; }
+    catch (e) { return 0; }
+});
+#endif
+
+namespace
+{
+struct ProgressState
+{
+    fc_progress_fn fn = nullptr;
+    void*          context = nullptr;
+    bool           stopped = false;
+};
+
+bool progressToHost (void* context, const ProgressEvent& e) noexcept
+{
+    auto& st = *static_cast<ProgressState*> (context);
+    fc_progress ev {};
+    ev.stage     = (std::int32_t) e.stage;
+    ev.pass      = e.pass;
+    ev.maxPasses = e.maxPasses;
+    ev.fraction  = e.fraction;
+    if (const SolvePassRecord* r = e.record)
+    {
+        ev.hasRecord              = 1;
+        ev.record.gainDb          = r->gainDb;
+        ev.record.ceilingDb       = r->ceilingDb;
+        ev.record.integratedLufs  = r->integratedLufs;
+        ev.record.truePeakDbTp    = r->truePeakDbTp;
+        ev.record.plrDb           = r->plrDb;
+        ev.record.limiterMaxGrDb  = r->limiterMaxGrDb;
+        ev.record.loudnessRangeLu = r->loudnessRangeLu;
+        ev.record.violated        = r->violated;
+    }
+    st.stopped = st.fn (st.context, &ev) == 0;
+    return ! st.stopped;
+}
+
+#if defined(__EMSCRIPTEN__)
+bool progressToModule (void* context, const ProgressEvent& e) noexcept
+{
+    const SolvePassRecord* r = e.record;
+    const int go = fc_js_progress ((int) e.stage, e.pass, e.maxPasses, e.fraction, r != nullptr ? 1 : 0,
+                                   r != nullptr ? r->gainDb : 0.0,          r != nullptr ? r->ceilingDb : 0.0,
+                                   r != nullptr ? r->integratedLufs : 0.0,  r != nullptr ? r->truePeakDbTp : 0.0,
+                                   r != nullptr ? r->plrDb : 0.0,           r != nullptr ? r->limiterMaxGrDb : 0.0,
+                                   r != nullptr ? r->loudnessRangeLu : 0.0, r != nullptr ? (int) r->violated : 0);
+    if (go == 0) static_cast<ProgressState*> (context)->stopped = true;
+    return go != 0;
+}
+#endif
+
+ProgressCallback progressFor (const MasterInstance& m, ProgressState& state) noexcept
+{
+    state.fn = m.progressFn;
+    state.context = m.progressContext;
+    if (state.fn != nullptr) return ProgressCallback { &progressToHost, &state };
+#if defined(__EMSCRIPTEN__)
+    return ProgressCallback { &progressToModule, &state };
+#else
+    return ProgressCallback {};
+#endif
+}
+
+fc_status cancelledSolve (MasterInstance& m, Slot& slot) noexcept
+{
+    const bool rendered = slot.solution->passes > 0;
+    abandonSlot (slot);
+    if (rendered)
+    {
+        m.framesIn = m.framesFlushed = 0;
+        m.audioSeen = false;
+        m.solverRan = true;
+    }
+    return FC_ERR_CANCELLED;
+}
 }   // namespace
 
 //==============================================================================
@@ -1322,9 +1422,12 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
     // when its own meter flagged the programme, and a facade that published the number anyway would be
     // publishing a measurement it had been told not to trust. On a delivering handle the core converts
     // first and measures the delivered programme — the one the search will meter.
+    ProgressState progress;
+    const ProgressCallback report = progressFor (m, progress);
     const bool measured = m.delivering
-        ? m.delivered.measureInputLoudnessRange (m.solver, pl, nch, (long long) frames, lra)
-        : m.solver.measureInputLoudnessRange (pl, nch, (int) frames, lra);
+        ? m.delivered.measureInputLoudnessRange (m.solver, pl, nch, (long long) frames, lra, report)
+        : m.solver.measureInputLoudnessRange (pl, nch, (int) frames, lra, report);
+    if (progress.stopped) return FC_ERR_CANCELLED;
     if (! measured) return FC_ERR_REFUSED_BY_CORE;
     *out = lra;
     return FC_OK;
@@ -1336,6 +1439,16 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
 // `kMaxChannels`, so without this entry point a correct surround search could not be expressed through
 // it at all — which would make the facade a NARROWER road than the C++ API, and the thinness law is
 // about both directions. The host-layout-to-role mapping stays outside, exactly as the core says.
+FC_EXPORT fc_status fc_master_set_progress (fc_master h, fc_progress_fn fn, void* context)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    s->master->progressFn      = fn;
+    s->master->progressContext = fn != nullptr ? context : nullptr;
+    return FC_OK;
+}
+
 FC_EXPORT fc_status fc_master_set_channel_weight (fc_master h, std::int32_t channel, double weight)
 {
     FC_GUARD;
@@ -1424,8 +1537,10 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
         op[c] = out + (std::size_t) c * (std::size_t) frames;
     }
 
+    ProgressState progress;
     g_slots[idx].solution = std::make_unique<LoudnessSolution> (
-        m.solver.solve (m.chain, m.renderer, cp, ip, op, nch, (int) frames, lr));
+        m.solver.solve (m.chain, m.renderer, cp, ip, op, nch, (int) frames, lr, progressFor (m, progress)));
+    if (g_slots[idx].solution->status == MasteringSolveStatus::Cancelled) return cancelledSolve (m, g_slots[idx]);
 
     // The search drives the renderer, which RESETS the chain on every pass — so where it ran, the
     // handle's streaming state is gone and its counters would be lying if they survived.
@@ -1710,9 +1825,11 @@ FC_EXPORT fc_status fc_master_solve_delivered (fc_master h, const fc_master_para
         ip[c] = in  + (std::size_t) c * (std::size_t) inFrames;
         op[c] = out + (std::size_t) c * (std::size_t) outFrames;
     }
+    ProgressState progress;
     g_slots[idx].solution = std::make_unique<LoudnessSolution> (
         m.delivered.solve (m.solver, m.chain, m.renderer, cp, ip, nch, (long long) inFrames,
-                           op, (long long) outFrames, lr));
+                           op, (long long) outFrames, lr, progressFor (m, progress)));
+    if (g_slots[idx].solution->status == MasteringSolveStatus::Cancelled) return cancelledSolve (m, g_slots[idx]);
 
     // As `fc_master_solve`: where the search ran, the chain holds its parameters; where it did not, nothing moved.
     const MasteringSolveStatus verdict = g_slots[idx].solution->status;

@@ -106,6 +106,7 @@
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/mastering/Planes.h>
+#include <felitronics/mastering/Progress.h>
 #include <felitronics/measurement/CaptureGate.h>
 #include <felitronics/measurement/Convolve.h>
 #include <felitronics/measurement/Deconvolve.h>

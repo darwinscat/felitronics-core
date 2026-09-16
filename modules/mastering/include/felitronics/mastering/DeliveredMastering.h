@@ -8,6 +8,7 @@
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
+#include <felitronics/mastering/Progress.h>
 
 #include <climits>
 #include <cmath>
@@ -161,6 +162,15 @@ public:
                             const float* const* in, int numChannels, long long inFrames,
                             float* const* out, long long outFrames, const LoudnessRequest& req)
     {
+        return solve (solver, chain, renderer, params, in, numChannels, inFrames, out, outFrames, req, ProgressCallback {});
+    }
+
+    LoudnessSolution solve (TargetLoudnessSolver& solver, MasteringChain& chain, OfflineRenderer& renderer,
+                            const MasteringChainParams& params,
+                            const float* const* in, int numChannels, long long inFrames,
+                            float* const* out, long long outFrames, const LoudnessRequest& req,
+                            const ProgressCallback& progress)
+    {
         LoudnessSolution refused;
         refused.activityThresholdDb = req.activityThresholdDb;
         if (! prepared_) { refused.status = MasteringSolveStatus::NotPrepared; return refused; }
@@ -169,7 +179,7 @@ public:
         // AN EMPTY PROGRAMME IS THE SOLVER'S TO ANSWER, not this class's: it answers `InvalidRequest` before any
         // pass, and answering for it here would be a second policy for one question.
         if (outFrames == 0)
-            return solver.solve (chain, renderer, params, in, out, numChannels, 0, req);
+            return solver.solve (chain, renderer, params, in, out, numChannels, 0, req, progress);
         // THE SOLVER'S OWN VERDICT, ASKED BEFORE A BYTE IS SPENT. Its words, its order, one definition.
         if (! solver.admits (chain, renderer, numChannels, (int) outFrames, req, refused.status)) return refused;
         // The planes, at the CALLER's two lengths — not left to the solver, which sees the converted programme and
@@ -180,9 +190,13 @@ public:
 
         const float* src[core::kMaxChannels] {};
         std::vector<float> programme;
-        if (! converted (in, numChannels, inFrames, outFrames, programme, src))
-            { refused.status = MasteringSolveStatus::InvalidRequest; return refused; }
-        return solver.solve (chain, renderer, params, src, out, numChannels, (int) outFrames, req);
+        ProgressClock clock (progress);
+        if (! converted (in, numChannels, inFrames, outFrames, programme, src, clock))
+        {
+            refused.status = clock.stopped() ? MasteringSolveStatus::Cancelled : MasteringSolveStatus::InvalidRequest;
+            return refused;
+        }
+        return solver.solve (chain, renderer, params, src, out, numChannels, (int) outFrames, req, progress);
     }
 
     // The input's loudness range, measured on the DELIVERED programme — the one the search will meter, so the
@@ -190,6 +204,13 @@ public:
     // would refuse a range for that length.
     [[nodiscard]] bool measureInputLoudnessRange (const TargetLoudnessSolver& solver, const float* const* in,
                                                   int numChannels, long long inFrames, double& out)
+    {
+        return measureInputLoudnessRange (solver, in, numChannels, inFrames, out, ProgressCallback {});
+    }
+
+    [[nodiscard]] bool measureInputLoudnessRange (const TargetLoudnessSolver& solver, const float* const* in,
+                                                  int numChannels, long long inFrames, double& out,
+                                                  const ProgressCallback& progress)
     {
         if (! prepared_ || ! solver.isPrepared()) return false;
         if (! (std::fabs (solver.sampleRate() - deliveryRate_) < 1.0e-9)) return false;   // meters at the delivery rate
@@ -200,8 +221,9 @@ public:
         if (TargetLoudnessSolver::measureRangeBytes (deliveryRate_, (int) d) == 0u) return false;
         const float* src[core::kMaxChannels] {};
         std::vector<float> programme;
-        if (! converted (in, numChannels, inFrames, d, programme, src)) return false;
-        return solver.measureInputLoudnessRange (src, numChannels, (int) d, out);
+        ProgressClock clock (progress);
+        if (! converted (in, numChannels, inFrames, d, programme, src, clock)) return false;
+        return solver.measureInputLoudnessRange (src, numChannels, (int) d, out, progress);
     }
 
 private:
@@ -225,7 +247,7 @@ private:
 
     // The programme at the delivery rate, in `src`. At equal rates that is the caller's own input, read in place.
     bool converted (const float* const* in, int numChannels, long long inFrames, long long outFrames,
-                    std::vector<float>& programme, const float** src)
+                    std::vector<float>& programme, const float** src, ProgressClock& clock)
     {
         if (identity_)
         {
@@ -246,7 +268,7 @@ private:
             dst[c] = programme.data() + (std::size_t) c * (std::size_t) outFrames;
             src[c] = dst[c];
         }
-        const bool ok = conv_.convert (in, numChannels, inFrames, dst, outFrames);
+        const bool ok = conv_.convert (in, numChannels, inFrames, dst, outFrames, clock);
         if (ok) nonFinite_ = conv_.nonFiniteInputSamples();         // a conversion that completed — see the getter
         return ok;
     }
