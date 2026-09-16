@@ -13,6 +13,9 @@
 #
 #   fcprobe.web.js/.wasm    -sENVIRONMENT=web,worker — EXACTLY what P0 specifies. This is the artifact whose
 #                           size is reported and which the page loads; the no-threads claim is made about it.
+#   fcprobe.web.mjs         the same line plus -sEXPORT_ES6=1, as fcmaster.web.mjs: the ES-module glue a module
+#                           worker can `import`. It writes fcprobe.web.wasm too; the .js above stays for
+#                           probe.html, which loads it with a classic <script>.
 #   fcprobe.node.js/.wasm   -sENVIRONMENT=node — the same wasm with node glue, so the parity harness runs
 #                           without a browser (and so CI can). The script verifies the two .wasm files are
 #                           BYTE-IDENTICAL, which is what lets a parity result proven on one transfer to the
@@ -167,34 +170,44 @@ COMMON=(-std=c++20 -fno-exceptions -fno-rtti "${NUMERIC[@]}" "${INC[@]}"
         # _malloc/_free and the HEAP views are OPT-IN in emscripten 6.x — without these two lines
         # Module._malloc and Module.HEAPF32 are simply `undefined` and the page dies on first use.
 
-echo "--- web (the P0 artifact)"
-em++ "${COMMON[@]}" -O3 -sENVIRONMENT=web,worker "$SRC" -o "$OUT/fcprobe.web.js"
-
+# Node first: both web builds below write the SAME fcprobe.web.wasm, so each is compared against node's
+# the moment it lands — a check run once after both would only see the second.
 echo "--- node (same wasm, node glue — for the parity harness)"
 em++ "${COMMON[@]}" -O3 -sENVIRONMENT=node "$SRC" -o "$OUT/fcprobe.node.js"
+
+same_as_node () {
+    echo "=== fcprobe.web.wasm from $1 must be byte-identical to node's (ENVIRONMENT/EXPORT_ES6 shape glue, not code)"
+    local a b
+    a=$(shasum -a 256 "$OUT/fcprobe.web.wasm"  | cut -d' ' -f1)
+    b=$(shasum -a 256 "$OUT/fcprobe.node.wasm" | cut -d' ' -f1)
+    echo "  web  $a"
+    echo "  node $b"
+    [ "$a" = "$b" ] && echo "  IDENTICAL" || { echo "  *** DIFFER — a parity result on one does not transfer to the other"; exit 1; }
+}
+
+echo "--- web (the P0 artifact, classic glue for probe.html)"
+em++ "${COMMON[@]}" -O3 -sENVIRONMENT=web,worker "$SRC" -o "$OUT/fcprobe.web.js"
+same_as_node fcprobe.web.js
+
+echo "--- web ES module (for a module worker)"
+em++ "${COMMON[@]}" -O3 -sENVIRONMENT=web,worker -sEXPORT_ES6=1 "$SRC" -o "$OUT/fcprobe.web.mjs"
+same_as_node fcprobe.web.mjs
 
 echo "--- debug (SAFE_HEAP + assertions + stack checks)"
 em++ "${COMMON[@]}" -O1 -g -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2 \
      -sENVIRONMENT=node "$SRC" -o "$OUT/fcprobe.debug.js"
 
 echo
-echo "=== the two release .wasm must be byte-identical (ENVIRONMENT shapes glue, not code)"
-a=$(shasum -a 256 "$OUT/fcprobe.web.wasm"  | cut -d' ' -f1)
-b=$(shasum -a 256 "$OUT/fcprobe.node.wasm" | cut -d' ' -f1)
-echo "  web  $a"
-echo "  node $b"
-[ "$a" = "$b" ] && echo "  IDENTICAL" || { echo "  *** DIFFER — a parity result on one does not transfer to the other"; exit 1; }
-
-echo
 echo "=== no threads, proven from the artifact rather than from the page loading"
 # Parses the wasm memory section directly, so this checks something on every machine — the earlier
 # wasm-objdump step silently checked NOTHING wherever that tool was not installed, which is most machines.
 node "$HERE/check-no-threads.mjs" "$OUT/fcprobe.web.wasm" "$OUT/fcprobe.web.js"
+node "$HERE/check-no-threads.mjs" "$OUT/fcprobe.web.wasm" "$OUT/fcprobe.web.mjs"
 
 echo
 echo "=== size (acceptance criterion 2)"
 printf "  %-22s %10s %10s %10s\n" file raw gzip brotli
-for f in fcprobe.web.wasm fcprobe.web.js; do
+for f in fcprobe.web.wasm fcprobe.web.js fcprobe.web.mjs; do
     raw=$(wc -c < "$OUT/$f")
     gz=$(gzip -9 -c "$OUT/$f" | wc -c)
     br=$(brotli -q 11 -c "$OUT/$f" 2>/dev/null | wc -c || echo "n/a")
