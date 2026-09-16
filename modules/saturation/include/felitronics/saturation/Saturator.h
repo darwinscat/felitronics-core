@@ -149,6 +149,10 @@ public:
         channels_ = maxChannels;
         os_       = (oversampleFactor >= 2) ? oversampleFactor : 1;
         if (os_ > 1 && ! ovs_.prepare (topology, sampleRate, os_, channels_, tapsPerPhase)) return false;
+        // A factor of 1 builds no oversampler, so it holds none: whatever an earlier preparation built (the
+        // Kaiser buffers, or the heap-held cascade) is released here rather than kept beside a budget that
+        // says the oversampler half is empty. Assigning a fresh switch only frees.
+        if (os_ == 1) ovs_ = oversampling::Oversampler {};
 
         osBuf_.assign  (st.osBuf,  0.0f);
         wetBuf_.assign (st.wetBuf, 0.0f);

@@ -502,6 +502,22 @@ static void runCascadeTopologyTests()
             float peak = 0.0f; for (float v : b) peak = std::max (peak, std::fabs (v));
             test::ok (peak == 0.0f, "a channel that left and returns on silence plays exact zero (peak " + std::to_string (peak) + ")");
         }
+        // A factor-1 preparation releases the oversampler: preparing the cascade again after it asks for at least
+        // the oversampler's whole budget (had it been kept, the switch would re-prepare into its old buffers and
+        // ask for next to nothing).
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 2, 4, 64, Topology::Cascade);
+            (void) s.prepare (44100.0, 256, 2, 1, 64, Topology::Cascade);
+            saturation::Saturator::Storage b;
+            (void) saturation::Saturator::storageFor (44100.0, 256, 2, 4, 64, b, Topology::Cascade);
+            const long long before = alloc::bytes.load();
+            const bool okAgain = s.prepare (44100.0, 256, 2, 4, 64, Topology::Cascade);
+            const long long asked = alloc::bytes.load() - before;
+            test::ok (okAgain && asked >= (long long) b.os.bytes(),
+                      "after a factor-1 preparation the oversampler was released: preparing it again asks for its whole "
+                      + std::to_string (b.os.bytes()) + " B (" + std::to_string (asked) + ")");
+        }
         // moved-from: reads as the class reads it, and never dereferences the stolen cascade
         {
             saturation::Saturator s;

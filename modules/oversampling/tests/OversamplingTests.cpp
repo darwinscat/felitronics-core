@@ -601,6 +601,39 @@ static void runCutoffAxisTests()
         test::ok (! refused, "PRECONDITION: every probe prepared");
     }
 
+    // THE WHOLE FOLD REGION, densely (the P21 tail: `worstFoldDb` above steps 0.02 fs past 0.62 fs, against a
+    // sidelobe spacing of 1/64 fs, so "worst over [0.5, L/2]" was not measured literally there). The prototype
+    // comes out of the public API — upsampling an impulse returns L times it — and its zero-phase response is
+    // evaluated at 1/32 of a sidelobe over the entire region. (A quarter-lobe step, the first draft, read
+    // -91.08 at 2x where the truth is -90.48: sampling a lobe four times under-reads its peak by up to 0.7 dB,
+    // which is the direction that lets a bound pass for the wrong reason. The dense maximum is therefore also
+    // required to agree with the time-domain probe above, which walks the transition end finely.)
+    test::group ("the fold region, densely: the stopband the design declares holds all the way to L/2");
+    {
+        for (int factor : { 2, 4, 8 })
+        {
+            oversampling::PolyphaseOversampler os;
+            (void) os.prepare (factor, 1);
+            const int N = factor * oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;
+            std::vector<float> x ((std::size_t) N, 0.0f), y ((std::size_t) N * (std::size_t) factor);
+            x[0] = 1.0f;
+            const float* in[1] { x.data() }; float* out[1] { y.data() };
+            os.upsample (in, 1, N, out);
+            std::vector<double> h ((std::size_t) N);
+            for (int i = 0; i < N; ++i) h[(std::size_t) i] = (double) y[(std::size_t) i] / (double) factor;
+            double worst = -1e9;
+            const double stepOs = 1.0 / (32.0 * (double) N);           // 1/32 of a sidelobe, OS-normalised
+            for (double nuOs = 0.5 / factor; nuOs <= 0.5; nuOs += stepOs)
+                worst = std::max (worst, db (std::fabs (zeroPhase (h, nuOs))));
+            std::printf ("       factor %d, 64 taps: worst |H| over the WHOLE fold region, dense = %.2f dB\n", factor, worst);
+            test::ok (worst <= -90.0, "factor " + std::to_string (factor)
+                                      + ": no point of [0.5, L/2] fs rises above the declared -90 dB (" + std::to_string (worst) + ")");
+            const double probe = tapsprobe::worstFoldDb (factor, -1);
+            test::approx (worst, probe, 0.05, "factor " + std::to_string (factor)
+                          + ": and the dense maximum is the one the time-domain probe finds (the worst sits at the transition)");
+        }
+    }
+
     test::group ("the cutoff axis (P31): a HALFBAND first stage can never be strict — the identity, and its price");
     {
         const auto hb = halfband (31, 9.0);                     // 127 taps: the halfband that is flat to 20 kHz
