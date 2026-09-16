@@ -5,6 +5,75 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.35.0 — 2026-09-16
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### analysis — the loudness meter refuses a rate below 8000 Hz itself, and a refused prepare forgets the last programme
+
+**What `analysis::LoudnessMeter` now promises about the rate:** a rate of 8000 Hz and up
+(`LoudnessMeter::kMinSampleRate`, the core's floor) is measured; a rate in (0, 8000) is refused by
+`prepare()`, `prepareForSamples()` and `storageFor()` alike; a rate that is **not given** — zero, negative,
+NaN — still reads as 48 kHz, exactly as published. +inf is refused, as it was. Since P51 every entry that
+hands the meter a rate from outside already refused these rates; now a direct C++ caller gets the same answer
+instead of a K-weighting filter past Nyquist (a 0 dBFS 400 Hz sine read +3043 LUFS at 3300 Hz).
+`KWeightingFilter::prepare()` cannot refuse and still takes any rate; the meter is its only owner.
+
+**A refused prepare now disarms the meter completely** — a change on the OLD refusals too (a channel count
+outside 1…16, a capacity that cannot be represented), not only on the new one. Before, a refusal cleared only
+the prepared flag, and `momentaryLufs()`, `shortTermLufs()`, `integratedLufs()`, `loudnessRangeLu()`,
+`droppedBlocks()`, `nonFiniteSubHops()` and `gatingBlockEnergies()` went on answering for the previous
+programme. Now every one of them answers what a never-prepared meter answers.
+
+Nothing changes for a successful prepare: a verdict-and-readings oracle over 3663 rates is bit-identical
+outside (0, 8000) Hz, including zero, negative, NaN and +inf. The conformance table that sized the store at
+150, 149 and 100 Hz now does it at 8050, 8049 and 8000 Hz with the same block counts.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### convolution — an IR whose header claims a rate under 8000 Hz loads as is, like any other broken rate
+
+**What `convolution::CabConvolver::loadIR` now promises about the IR's rate:** a KNOWN rate is a finite rate of
+8000 Hz (`core::kMinSampleRate`) or more, and only a known rate off the host's is resampled. Everything else —
+NaN, zero, negative, ±inf, and now any rate under 8000 Hz — is UNKNOWN, and an unknown rate loads the taps as
+they are, with no rate factor (P67's rule: the samples are fine, only the metadata is broken, and refusing
+would play silence). Above, nothing changed.
+
+**Why:** a header that says 44.1 is kilohertz written as hertz, and it was trusted: a 4096-tap cabinet on a
+48 kHz host was resampled x1088 into 4 458 231 taps — measured 3.76 s of `loadIR`, now 0.2 ms — and on the
+verbatim (reverb) path scaled by the rate factor as well. Now it is the NaN load, bit for bit — the staged taps, `irNormalizationGain()`,
+`irNormalizationGainDb()` and what the convolver plays, on both paths.
+
+**What that moves, and what it does not:** the rate factor on the verbatim path now starts at 8000 / 3e6 =
+2.67e-3 (−51.48 dB, an 8 kHz IR on a 3 MHz host) instead of about 4.7e-10. A 4096-tap cabinet at any known
+rate costs at most x375 of itself now (a 3 MHz host); on a 48 kHz host it is x6 and 25 ms at 8001 Hz. What a
+known rate can still ask for is unchanged and is bounded by the resampler's 2^24-tap output, not by the rate:
+an 8001 Hz IR of 2.8 million taps (a 350-second file) took 17.4 s of `loadIR` on a 48 kHz host, measured.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### tools · wasm — loudness and clipped runs of a stream, read between the pieces
+
+**`fc_probe` gains a streaming surface** for two instruments that were already streaming:
+`analysis::DeterministicLoudnessMeter` and `analysis::ClipDetector`, behind one class, `fcore::StreamProbe`
+(`tools/fcore_stream.h`). A page opens a stream with `fc_stream_create (rate, channels)`, feeds planar PCM
+with `fc_stream_process`, and between pieces reads `fc_stream_loudness` (momentary, short-term and integrated
+LUFS, samples consumed, gating blocks dropped past the one-hour store), `fc_stream_clips_count` and
+`fc_stream_clips (h, from, out, cap)` — the runs decided so far, polled by index. `fc_stream_finish` decides the
+last runs; `fc_stream_destroy` frees the stream. Nothing in either instrument changed.
+
+**Handles, not a singleton**, so two streams run at once — at most 16. A handle is a serial looked up in a table
+and never reused, so a stale, forged or failed handle is refused rather than dereferenced. Buffers are checked
+as the rest of `fc_probe` checks them, `cap` is in doubles and the return in runs as in
+`fc_probe_clips_runs`, and a refused piece that carried samples poisons the stream: every reader answers 0.
+
+**The deterministic meter, not the system one** that `fc_probe_run` uses: the system meter's block energies
+differ between native and wasm at 8000, 88200 and 192000 Hz. `fcore_measure stream` prints the same bytes as
+`tools/wasm/stream-parity.mjs`, and CI diffs them at 44100, 48000 and 88200 Hz on the release and checked
+modules. `felitronics_stream_abi_tests` feeds pieces of 1, 4096 and random sizes through three handles at once
+and requires the same integrated loudness, bit for bit, and the same runs as the same instruments given the
+whole buffer in one call.
+
 ## v0.34.0 — 2026-09-16
 
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
