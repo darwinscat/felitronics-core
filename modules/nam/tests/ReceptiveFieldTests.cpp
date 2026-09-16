@@ -631,6 +631,37 @@ int main() {
             ok(receptiveFieldFromConfig(booleans) == 3,
                "…and a dilation spelled `true` is the 1 that NAM builds from it: "
                + std::to_string(receptiveFieldFromConfig(booleans)));
+            booleans["config"]["layers"][0]["dilations"] = nlohmann::json::array({ false, true });
+            ok(receptiveFieldFromConfig(booleans) == 2,
+               "…and one spelled `false` is the 0 NAM builds from it, not a 1: "
+               + std::to_string(receptiveFieldFromConfig(booleans)));
+            // 🔴 AND A NEGATIVE PAST THE INT IS REFUSED TOO, not read as a negative (P92). NAM's `get<int>()`
+            // wraps `-4294967196` to 100 — a slimmable carrying it LOADS and reaches 100 — so reading it as a
+            // negative number and clamping it to 0 would answer zero for that memory. Found by a mutant
+            // that dropped the lower bound and survived the suite; `-1e300` is the same bound on the float
+            // path, where dropping it is an undefined cast besides.
+            nlohmann::json negativePast = { { "architecture", "WaveNet" },
+                                            { "config", { { "layers", nlohmann::json::array({
+                                                  { { "kernel_size", 2 },
+                                                    { "dilations", nlohmann::json::array({ -4294967196LL }) } } }) } } } };
+            ok(receptiveFieldFromConfig(negativePast) == 48000,
+               "a dilation below the int is refused and costs the allowance: "
+               + std::to_string(receptiveFieldFromConfig(negativePast)));
+            ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", -1e300 } } } }) == 48000,
+               "…and so is a field of -1e300, whose cast would be undefined");
+            // …AND THE KEY GUARDS INSIDE THE HEAD READERS AND THE PER-LAYER KERNELS, each of which stands
+            // between a const `operator[]` and a key or an index that is not there — undefined behaviour,
+            // not a zero. Each was removed by a mutant that the suite did not notice.
+            nlohmann::json headNoKernel = wavenet({ 2 }, { 1 });
+            headNoKernel["config"]["layers"][0]["head"] = { { "out_channels", 1 } };
+            ok(receptiveFieldFromConfig(headNoKernel) == 2,
+               "a layer head with no `kernel_size` is the legacy kernel of 1, read without indexing it");
+            nlohmann::json postNoKernels = wavenet({ 2 }, { 1 });
+            postNoKernels["config"]["head"] = { { "channels", 1 } };
+            ok(receptiveFieldFromConfig(postNoKernels) == 2,
+               "…and a post-stack head with no `kernel_sizes` adds nothing, read without indexing it");
+            ok(receptiveFieldFromConfig(wavenet({ 2 }, { 1, 2 })) == 2,
+               "…and `kernel_sizes` shorter than `dilations` stops at the last kernel instead of reading past it");
             // …and an ACCUMULATION past it: four layer arrays that each clamp to INT_MAX still sum
             // inside the type, because the running total is clamped after every one.
             nlohmann::json accumulating = { { "architecture", "WaveNet" },
