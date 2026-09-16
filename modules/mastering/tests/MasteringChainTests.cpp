@@ -886,6 +886,52 @@ static void testMutationGaps()
         ok (c.prepare (48000.0, 2, cfg), "...and the same EQ-only topology prepares at a real rate");
     }
 
+    // ---- (3b) THE RATE FLOOR IS THE CHAIN'S OWN, NOT A STAGE'S (P51) -------------------------------
+    // Before P51 a low rate was refused by whichever stage happened to be on — the limiter above 50 Hz, the EQ
+    // above 20.4 Hz — so a chain without them took 1e-305 Hz. The floor is tested on the topology where NOTHING
+    // else refuses (no EQ, no limiter), at the boundary from both sides, and in its unit-error form: a rate in
+    // kilohertz. 88.2 is the one the default topology used to take and "solve".
+    // MUTATIONS KILLED: the floor removed (`> 0.0`), spelled `>` (8000 refused), and 1000 instead of 8000.
+    {
+        ok (mastering::MasteringChain::kMinSampleRate == 8000.0 && core::kMinSampleRate == 8000.0,
+            "the floor is 8000 Hz — a literal pin, since every row below reads the constant");
+        mastering::MasteringChainConfig bare;
+        bare.eq = bare.limiter = false;
+        const double lo = mastering::MasteringChain::kMinSampleRate;
+        struct Row { double fs; bool want; const char* what; };
+        const Row rows[] {
+            { lo,                             true,  "8000 Hz, the floor itself, is a rate" },
+            { std::nextafter (lo, 0.0),       false, "one ulp under the floor" },
+            { 7999.0,                         false, "7999 Hz" },
+            { 3300.0,                         false, "3300 Hz, where the K-weighting shelf is past Nyquist" },
+            { 1000.0,                         false, "1000 Hz, the probe's old floor" },
+            { 88.2,                           false, "88.2 — a rate in kilohertz" },
+            { 44.1,                           false, "44.1 — a rate in kilohertz" },
+            { 1.0e-305,                       false, "1e-305 Hz, which this topology used to take" },
+            { std::nextafter (lo, 1.0e9),     true,  "one ulp over the floor" },
+        };
+        for (const Row& r : rows)
+        {
+            mastering::MasteringChain c;
+            ok (c.prepare (48000.0, 2, bare), std::string ("PRECONDITION: a good prepare before: ") + r.what);
+            const bool got = c.prepare (r.fs, 2, bare);
+            ok (got == r.want, std::string (r.want ? "accepted: " : "refused: ") + r.what);
+            // Law 11(b): a refusal DISARMS — the chain does not stay on its 48 kHz build.
+            ok (c.isPrepared() == r.want && (r.want || c.latencySamples() == 0),
+                std::string ("and the chain's state says the same: ") + r.what);
+            // One verdict, three ways of asking it.
+            ok (mastering::MasteringChain::admits (r.fs, 2, bare) == r.want
+                    && (mastering::MasteringChain::prepareBytes (r.fs, 2, bare) > 0u) == r.want
+                    && (mastering::createBytes (r.fs, 2, bare, 4096) > 0u) == r.want,
+                std::string ("admits, prepareBytes and createBytes agree: ") + r.what);
+        }
+        // and the default topology — the one the C ABI creates — says the same at the boundary
+        const mastering::MasteringChainConfig def {};
+        ok (mastering::MasteringChain::admits (lo, 2, def) && ! mastering::MasteringChain::admits (std::nextafter (lo, 0.0), 2, def)
+                && ! mastering::MasteringChain::admits (88.2, 2, def),
+            "the default topology: 8000 in, one ulp under and 88.2 out");
+    }
+
     // ---- (4) THE RENDERER'S FORMULA, NULLED AGAINST ITS OWN DEFINITION -------------------------
     // out[n] == y[n + D], where y is the chain's output for the input followed by D ZEROS. Computed
     // here independently of render(), so a drain that feeds the wrong thing fails even though every
@@ -1324,10 +1370,12 @@ void testDemand()
         mastering::MasteringChainConfig c2 = c1;
         c2.internalBlock = 17; c2.oversampleFactor = 3; c2.tapsPerPhase = 5;
         auto chain = std::make_unique<mastering::MasteringChain>();
-        ok (chain->prepare (100.0, 3, c1), "PRECONDITION: a narrow chain at a low rate");
-        const std::uint64_t bound = chain->reprepareBytes (200.0, 4, c2);
+        // At the rate floor and twice it (P51: this pair was 100 -> 200 Hz, below the floor now). The buffers this
+        // row is about are sized by the quantum and the width; the rate only has to double.
+        ok (chain->prepare (mastering::MasteringChain::kMinSampleRate, 3, c1), "PRECONDITION: a narrow chain at the lowest rate");
+        const std::uint64_t bound = chain->reprepareBytes (2.0 * mastering::MasteringChain::kMinSampleRate, 4, c2);
         const long long before = alloc::bytes.load();
-        const bool grew = chain->prepare (200.0, 4, c2);
+        const bool grew = chain->prepare (2.0 * mastering::MasteringChain::kMinSampleRate, 4, c2);
         const long long got = alloc::bytes.load() - before;
         ok (grew, "PRECONDITION: and it grows in every dimension at once");
         // THE BOUND IS ON WHAT THE CHAIN ASKS ITS CONTAINERS FOR, not on what they then ask the allocator.
@@ -1529,6 +1577,8 @@ void testDemand()
         { cases.push_back (Case { n, fs, nch, c }); };
         mastering::MasteringChainConfig d;
         push ("a 20 Hz rate", 20.0, 2, d);
+        { auto c = d; c.eq = c.limiter = false; push ("one ulp under the rate floor, no stage that would refuse it",
+                                                      std::nextafter (mastering::MasteringChain::kMinSampleRate, 0.0), 2, c); }
         push ("a rate of zero", 0.0, 2, d);
         push ("a NaN rate", std::numeric_limits<double>::quiet_NaN(), 2, d);
         { auto c = d; c.compressorLookaheadMs = 300.0; push ("a lookahead past the compressor's 250 ms", 48000.0, 2, c); }

@@ -115,8 +115,11 @@ public:
     }
 
     bool   isPrepared()   const noexcept { return prepared_; }
-    double sourceRate()   const noexcept { return sourceRate_; }
-    double deliveryRate() const noexcept { return deliveryRate_; }
+    // 0 until prepared, and 0 again after a refused prepare (law 11b) — as `TargetLoudnessSolver::sampleRate()` and
+    // `MasteringChain::sampleRate()` answer. A caller that checks these to decide whether to re-prepare must not read
+    // the previous build's rates after a refusal (the P51 review: 48000 / 96000 were readable after `7999 -> 48000`).
+    double sourceRate()   const noexcept { return prepared_ ? sourceRate_ : 0.0; }
+    double deliveryRate() const noexcept { return prepared_ ? deliveryRate_ : 0.0; }
     const DeliveryConverter& converter() const noexcept { return conv_; }
 
     // Non-finite input samples in the programme of THE LAST RENDER, SOLVE OR RANGE MEASUREMENT THAT REACHED THE COUNT —

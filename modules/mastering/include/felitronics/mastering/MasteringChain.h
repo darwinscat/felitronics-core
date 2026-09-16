@@ -310,6 +310,10 @@ class MasteringChain
 public:
     static constexpr int    kMaxInternalBlock = 8192;
     static constexpr int    kMinInternalBlock = 8;
+    // The rate range. The floor is the core's (P51, core::kMinSampleRate — and the ONLY stage-independent one: before
+    // it, what refused a low rate was whichever stage happened to be on, the limiter above 50 Hz and the EQ above
+    // 20.4 Hz, so a chain with both off took 1e-305 Hz). The ceiling is this class's own.
+    static constexpr double kMinSampleRate    = core::kMinSampleRate;
     static constexpr double kMaxSampleRate    = 3.0e6;
     static constexpr double kMaxGainDb        = 60.0;    // both gain nodes; beyond this is not a trim
 
@@ -418,7 +422,7 @@ public:
     [[nodiscard]] static bool storageFor (double sampleRate, int numChannels,
                                           const MasteringChainConfig& config, Storage& out) noexcept
     {
-        if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || sampleRate > kMaxSampleRate) return false;
+        if (! (sampleRate >= kMinSampleRate) || ! std::isfinite (sampleRate) || sampleRate > kMaxSampleRate) return false;
         if (numChannels < 1 || numChannels > core::kMaxChannels) return false;
         if (config.internalBlock < kMinInternalBlock || config.internalBlock > kMaxInternalBlock) return false;
         if (config.oversampleFactor < 2 || config.tapsPerPhase < 4) return false;

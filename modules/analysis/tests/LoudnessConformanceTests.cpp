@@ -515,6 +515,31 @@ int main()
         M lmRate;
         test::ok (lmRate.prepare (2.1e10, 1, 1.0e-6), "prepare(21 GHz, 1 µs) is accepted, as it always was");
 
+        // P41 F1, RE-HOMED (P51). The solver sizes the meter behind a solve in SAMPLES, because `frames / fs` seconds is
+        // +inf at an absurd finite rate and the store used to be `(std::size_t) inf` — 3 kept blocks on arm64 and
+        // wasm32, 4 on x86-64 gcc, for one call. That was pinned by a solve at 1e-305 Hz, which the search refuses
+        // since P51 (its floor is 8000 Hz, where `frames / fs` stays finite). The property lives here now, on the one
+        // class that still takes such a rate: sized in samples, the store holds the programme; asked in seconds, the
+        // same capacity is +inf and is refused rather than converted.
+        {
+            const double tiny = 1.0e-305;
+            const int frames = 2000;
+            test::ok (! std::isfinite ((double) frames / tiny), "PRECONDITION: the seconds form is +inf at 1e-305 Hz");
+            M byTime;
+            test::ok (! byTime.prepare (tiny, 1, (double) frames / tiny + 1.0), "in seconds (+inf): refused, not converted");
+            M bySamples;
+            test::ok (bySamples.prepareForSamples (tiny, 1, (double) frames + std::ceil (tiny)),
+                      "in samples, frames + ceil(fs) — the solver's own capacity: accepted");
+            std::vector<float> x ((std::size_t) frames);
+            for (int i = 0; i < frames; ++i) x[(std::size_t) i] = (i & 1) ? 0.25f : -0.25f;
+            const float* xp[1] { x.data() };
+            test::run (bySamples.process (xp, 1, frames));
+            // one-sample sub-hops: 2000 of them are 200 hops, and the first block is born on the 4th — 197 blocks
+            test::ok (bySamples.droppedBlocks() == 0 && bySamples.gatingBlockCount() == 197,
+                      "and it holds all 197 blocks the programme produces (dropped "
+                      + std::to_string (bySamples.droppedBlocks()) + ")");
+        }
+
         M lm;
         test::ok (! lm.prepare (48000.0, 2, inf),        "prepare(+inf s): REFUSED — it used to convert inf to size_t");
         test::ok (! lm.prepare (48000.0, 2, 1.0e300),    "prepare(1e300 s): REFUSED");

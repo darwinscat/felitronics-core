@@ -70,6 +70,13 @@ using namespace felitronics;
 using CD = analysis::ClipDetector;
 using Planes = std::vector<std::vector<float>>;
 
+// THE RATE MOST OF THIS SUITE MEASURES AT: the lowest one the detector takes, where the decision window is
+// W = floor(8000 * 20 / 1000) = 160 samples. It was 1 kHz (W = 20) until P51 put the core's rate floor at 8 kHz;
+// every coordinate below that names W is written in terms of kW, and the pinned witness's quiet tail is three windows
+// long, as it was (60 samples at W = 20, 480 here).
+static constexpr double    kRate = CD::kMinSampleRate;
+static constexpr long long kW    = 160;
+
 // The C ABI, declared here rather than included: fc_probe.cpp has no header, and writing the prototypes out
 // is what makes this a test OF AN ABI instead of a test of a C++ class that happens to sit behind one. A
 // signature that drifts fails to link, which is the diagnosis.
@@ -213,7 +220,7 @@ static fcore::ClipsReport bareWhole (const Planes& p, double sr, std::int64_t ma
 
 //================================================================================================ material
 
-// THE PINNED WITNESS, on a 1/64 grid at 1 kHz (W = 20 samples, so every prefix of it is cheap to test).
+// THE PINNED WITNESS, on a 1/64 grid at kRate (W = 160 samples; it was 1 kHz and W = 20 before P51).
 // A linear approach of 10/64 per sample, a plateau of twelve, and a linear departure. With the plateau
 // exactly flat the mean is 40/64 = 0.625 — a dyadic number, which survives a float round-trip unchanged and
 // therefore witnesses nothing about the last bits. With ONE plateau sample at 39/64 the mean is 479/768,
@@ -234,7 +241,7 @@ static Planes pinnedWitness (bool oneOdd)
     for (int k = -2; k <= 2; ++k) put (k * 10);
     for (int i = 0; i < 12; ++i) put (i == 11 && oneOdd ? 39 : 40);       // the plateau
     for (int k = 2; k >= -2; --k) put (k * 10);
-    for (int i = 0; i < 30; ++i) { put (0); put (-3); }                   // 20 ms of quiet, so the run is decided
+    for (long long i = 0; i < 3 * kW / 2; ++i) { put (0); put (-3); }      // 60 ms of quiet, so the run is decided
     return { x };
 }
 
@@ -276,7 +283,7 @@ static void theFormatIsBitwise()
     test::group ("the format is bitwise, so one flipped bit changes a character");
     const Planes w = pinnedWitness (true);
     const long long n = (long long) w[0].size();
-    const fcore::ClipsReport r = viaProbe (w, 1000.0, 1 << 16, { { 0 }, 0, "whole" }, n);
+    const fcore::ClipsReport r = viaProbe (w, kRate, 1 << 16, { { 0 }, 0, "whole" }, n);
     test::ok (r.ok && r.runs.size() == 1, "the pinned witness has exactly one run (" + std::to_string (r.runs.size()) + ")");
     if (r.runs.size() != 1) return;
 
@@ -296,12 +303,13 @@ static void theFormatIsBitwise()
     const std::string text = fcore::formatClips (r);
     test::ok (text.find ("run 9 12 3fe3f55555555555 0 1 1\n") != std::string::npos,
               "the run line carries the level as its bit pattern");
-    test::ok (text.find ("# fcore clips v1 sr=408f400000000000 ch=1 frames=") == 0,
-              "the header's sample rate is a bit pattern too (1000.0 = 408f400000000000)");
-    test::ok (text.find ("delay=20\n") != std::string::npos, "and the decision delay it was measured with");
+    test::ok (text.find ("# fcore clips v1 sr=40bf400000000000 ch=1 frames=") == 0,
+              "the header's sample rate is a bit pattern too (8000.0 = 40bf400000000000)");
+    test::ok (b64 (8000.0) == 0x40bf400000000000ull, "…and that IS 8000.0's pattern");
+    test::ok (text.find ("delay=160\n") != std::string::npos, "and the decision delay it was measured with");
 
     // An exactly flat plateau has a dyadic mean, which is why the odd sample is there at all.
-    const fcore::ClipsReport flat = viaProbe (pinnedWitness (false), 1000.0, 1 << 16, { { 0 }, 0, "whole" }, n);
+    const fcore::ClipsReport flat = viaProbe (pinnedWitness (false), kRate, 1 << 16, { { 0 }, 0, "whole" }, n);
     test::ok (flat.runs.size() == 1 && b64 (flat.runs[0].level) == b64 (0.625),
               "an exactly flat plateau's level is 0.625 exactly — dyadic, and no witness of rounding");
 }
@@ -311,21 +319,21 @@ static void lawEightA()
     test::group ("law 8a: the report cannot see where the stream was cut — through the SHIPPED adapter");
     const std::vector<Slicing> slicings {
         { { 0 }, 0, "whole" },        { { 1 }, 0, "1" },            { { 2 }, 0, "2" },
-        { { 3 }, 0, "3" },            { { 7 }, 0, "7 (prime)" },    { { 19 }, 0, "W-1" },
-        { { 20 }, 0, "W" },           { { 21 }, 0, "W+1" },         { { 8191 }, 0, "kChunk-1" },
+        { { 3 }, 0, "3" },            { { 7 }, 0, "7 (prime)" },    { { kW - 1 }, 0, "W-1" },
+        { { kW }, 0, "W" },           { { kW + 1 }, 0, "W+1" },     { { 8191 }, 0, "kChunk-1" },
         { { 8192 }, 0, "kChunk" },    { { 8193 }, 0, "kChunk+1" },  { { 40000 }, 0, "> kChunk" },
-        { { 1, 8192, 3, 20 }, 0, "mixed" },
+        { { 1, 8192, 3, kW }, 0, "mixed" },
         { {}, 12345, "ragged (seed 12345)" }, { {}, 999, "ragged (seed 999)" },
     };
 
     struct Case { long long n; double sr; int ch; unsigned seed; bool holes, tail; const char* what; };
     const std::vector<Case> cases {
-        { 0,      1000.0, 1, 1, false, false, "T = 0 (an empty stream is a measurement)" },
-        { 1,      1000.0, 1, 1, false, false, "T = 1" },
-        { 19,     1000.0, 1, 1, false, false, "T = W-1" },
-        { 20,     1000.0, 1, 1, false, false, "T = W" },
-        { 21,     1000.0, 1, 1, false, false, "T = W+1" },
-        { 231,    1000.0, 1, 1, false, true,  "the pinned witness's length" },
+        { 0,      kRate, 1, 1, false, false, "T = 0 (an empty stream is a measurement)" },
+        { 1,      kRate, 1, 1, false, false, "T = 1" },
+        { kW - 1, kRate, 1, 1, false, false, "T = W-1" },
+        { kW,     kRate, 1, 1, false, false, "T = W" },
+        { kW + 1, kRate, 1, 1, false, false, "T = W+1" },
+        { -1,     kRate, 1, 1, false, true,  "the pinned witness" },
         { 24000,  8000.0, 2, 7, false, true,  "8 kHz stereo, clamped, clipped tail" },
         { 24000,  8000.0, 2, 7, true,  true,  "…with non-finite holes" },
         { 24000,  8000.0, 3, 9, true,  false, "three channels, quiet tail" },
@@ -335,7 +343,7 @@ static void lawEightA()
     int compared = 0;
     for (const Case& k : cases)
     {
-        const Planes p = k.n == 231 ? pinnedWitness (true)
+        const Planes p = k.n < 0 ? pinnedWitness (true)
                                     : clampedProgramme (k.n, k.sr, k.ch, k.seed, k.holes, k.tail);
         const long long n = (long long) p[0].size();
         // The oracle first, and it is NOT the whole-in-one-call slicing of the adapter: a bare detector,
@@ -371,14 +379,14 @@ static void lawEightA()
 static void aChannelThatDisappears()
 {
     test::group ("a channel that disappears mid-stream is a hole, not an error (law 11a)");
-    const Planes p = clampedProgramme (4800, 1000.0, 2, 17, false, true);
+    const Planes p = clampedProgramme (4800, kRate, 2, 17, false, true);
     const long long n = (long long) p[0].size(), gone = n / 2;
 
     auto drive = [&] (const std::vector<long long>& firstHalf, const std::vector<long long>& secondHalf)
     {
         fcore::ClipProbe probe;
         fcore::ClipsReport r;
-        if (! probe.prepare (1000.0, 2, 1 << 16, n)) return r;
+        if (! probe.prepare (kRate, 2, 1 << 16, n)) return r;
         const float* view[core::kMaxChannels] {};
         long long at = 0;
         for (int half = 0; half < 2; ++half)
@@ -407,14 +415,14 @@ static void aChannelThatDisappears()
     for (const auto& u : base.runs) if (u.channel == 1 && u.start >= gone) noneLate = false;
     test::ok (noneLate, "no run of the vanished channel starts after it vanished");
     test::ok (base.peak.size() == 2 && base.peak[1] > 0.0, "its peak is the peak of the samples it did send");
-    for (long long step : { (long long) 1, (long long) 3, (long long) 17, (long long) 20, (long long) 512, (long long) 8192 })
+    for (long long step : { (long long) 1, (long long) 3, (long long) 17, kW, (long long) 512, (long long) 8192 })
         test::ok (sameReport (base, drive (cut (gone, step), cut (n - gone, step))),
                   "the same report when each half is cut into " + std::to_string (step) + "-sample calls");
 
     // channels == 0 — every channel a hole — is legal, and then the plane table need not exist at all.
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 16, 100));
+        test::run (probe.prepare (kRate, 2, 16, 100));
         test::ok (probe.process (nullptr, 0, 100), "channels == 0 with a null plane table is accepted");
         test::run (probe.finish());
         test::ok (probe.valid() && probe.frames() == 100 && probe.runCount() == 0 && probe.peak (0) == 0.0,
@@ -424,7 +432,7 @@ static void aChannelThatDisappears()
     {
         fcore::ClipProbe probe;
         const float* view[2] { p[0].data(), p[1].data() };
-        test::run (probe.prepare (1000.0, 2, 16, n));
+        test::run (probe.prepare (kRate, 2, 16, n));
         test::ok (! probe.process (view, 3, 10), "a width wider than the preparation is refused");
         test::ok (! probe.finish(), "…and poisons the measurement, because the audio of that call is missing");
     }
@@ -490,17 +498,23 @@ static void ratesAndTheirWindows()
     test::ok (b64 ((double) (float) 48000.1) == 0x40e7700340000000ull, "…and those two patterns do differ");
     test::ok (frac.decisionDelay == 960, "its window is floor(48000.1 * 20 / 1000) = 960");
 
-    // THE WINDOW'S OWN STEP. floor(sr/50) changes at 1050, so 1049.9 and 1050 must not report the same delay
-    // — a rate rounded anywhere on the way in would make them equal.
-    test::ok (viaProbe (p, 1049.9, 16, { { 0 }, 0, "whole" }, n).decisionDelay == 20, "1049.9 -> a 20-sample window");
-    test::ok (viaProbe (p, 1050.0, 16, { { 0 }, 0, "whole" }, n).decisionDelay == 21, "1050.0 -> 21");
+    // THE WINDOW'S OWN STEP. floor(sr/50) changes at 8050, so 8049.9 and 8050 must not report the same delay
+    // — a rate rounded anywhere on the way in would make them equal. (1049.9 / 1050 before P51.)
+    test::ok (viaProbe (p, 8049.9, 16, { { 0 }, 0, "whole" }, n).decisionDelay == 160, "8049.9 -> a 160-sample window");
+    test::ok (viaProbe (p, 8050.0, 16, { { 0 }, 0, "whole" }, n).decisionDelay == 161, "8050.0 -> 161");
 
-    // THE ENDS OF THE RANGE, and one step past each.
-    test::ok (viaProbe (p, 1000.0, 16, { { 0 }, 0, "whole" }, n).ok, "kMinSampleRate is accepted");
+    // THE ENDS OF THE RANGE, and one step past each. The floor as a LITERAL too (P51): every other row reads kRate,
+    // which would move with the constant and see nothing.
+    test::ok (CD::kMinSampleRate == 8000.0 && core::kMinSampleRate == 8000.0, "the floor is 8000 Hz");
+    test::ok (viaProbe (p, 8000.0, 16, { { 0 }, 0, "whole" }, n).decisionDelay == 160,
+              "kMinSampleRate is accepted, with a 160-sample window");
     test::ok (viaProbe (p, 768000.0, 16, { { 0 }, 0, "whole" }, n).decisionDelay == 15360,
               "kMaxSampleRate is accepted, with a 15360-sample window");
     fcore::ClipProbe probe;
-    test::ok (! probe.prepare (std::nextafter (1000.0, 0.0), 1, 16, n), "one ulp below the minimum is refused");
+    test::ok (! probe.prepare (std::nextafter (8000.0, 0.0), 1, 16, n), "one ulp below the minimum is refused");
+    test::ok (! probe.prepare (7999.0, 1, 16, n) && ! probe.prepare (1000.0, 1, 16, n),
+              "7999 and the old floor, 1000, are refused");
+    test::ok (! probe.prepare (44.1, 1, 16, n), "and so is a rate in kilohertz — the mistake the floor is for");
     test::ok (! probe.prepare (std::nextafter (768000.0, 2e6), 1, 16, n), "one ulp above the maximum is refused");
     test::ok (! probe.prepare (std::numeric_limits<double>::quiet_NaN(), 1, 16, n), "NaN is refused");
     test::ok (! probe.prepare (std::numeric_limits<double>::infinity(), 1, 16, n), "infinity is refused");
@@ -575,13 +589,13 @@ static void runsOnTheChunkBoundary()
         Planes p { std::vector<float> ((std::size_t) pl.pad, 0.0f) };
         p[0].insert (p[0].end(), w[0].begin(), w[0].end());
         const long long n = (long long) p[0].size();
-        const fcore::ClipsReport base = viaProbe (p, 1000.0, 1 << 16, { { 0 }, 0, "whole" }, n);
+        const fcore::ClipsReport base = viaProbe (p, kRate, 1 << 16, { { 0 }, 0, "whole" }, n);
         test::ok (base.ok && base.runs.size() == 1 && base.runs[0].start == pl.pad + 9
                   && base.runs[0].length == 12 && b64 (base.runs[0].level) == 0x3fe3f55555555555ull,
                   std::string ("the run is found where it was put, level unchanged — it ") + pl.what);
         for (const Slicing& sl : std::vector<Slicing> { { { 1 } }, { { 8191 } }, { { 8192 } }, { { 8193 } },
-                                                        { { 20 } }, { {}, 4242, "ragged" } })
-            test::ok (sameReport (base, viaProbe (p, 1000.0, 1 << 16, sl, n)),
+                                                        { { kW } }, { {}, 4242, "ragged" } })
+            test::ok (sameReport (base, viaProbe (p, kRate, 1 << 16, sl, n)),
                       std::string ("…and under every slicing when it ") + pl.what);
     }
 }
@@ -596,14 +610,14 @@ static void theTraceOfDecisions()
     // exact coordinate at which every run becomes visible — and each slicing is then checked against that
     // reference AT EVERY ONE OF ITS OWN CALL BOUNDARIES. A run appended one call early or one call late is
     // caught there even when finish() would later hide it.
-    const Planes p = clampedProgramme (2400, 1000.0, 2, 42, true, true);
+    const Planes p = clampedProgramme (2400, kRate, 2, 42, true, true);
     const long long n = (long long) p[0].size();
 
     std::vector<std::vector<analysis::ClipRun>> trace ((std::size_t) n + 1);
     std::vector<std::int64_t> counts ((std::size_t) n + 1, 0);
     {
         CD d;
-        test::run (d.prepare (1000.0, 8192, 2));
+        test::run (d.prepare (kRate, 8192, 2));
         for (long long i = 0; i < n; ++i)
         {
             const auto v = ptrsAt (p, (std::size_t) i);
@@ -620,11 +634,11 @@ static void theTraceOfDecisions()
     test::ok (transitions > 4, "and it moves at more than a handful of coordinates (" + std::to_string (transitions) + ")");
 
     for (const Slicing& sl : std::vector<Slicing> { { { 2 }, 0, "2" }, { { 3 }, 0, "3" }, { { 7 }, 0, "7" },
-                                                    { { 19 }, 0, "19" }, { { 20 }, 0, "20" }, { { 21 }, 0, "21" },
+                                                    { { kW - 1 }, 0, "W-1" }, { { kW }, 0, "W" }, { { kW + 1 }, 0, "W+1" },
                                                     { { 256 }, 0, "256" }, { {}, 777, "ragged" } })
     {
         CD d;
-        test::run (d.prepare (1000.0, 8192, 2));
+        test::run (d.prepare (kRate, 8192, 2));
         long long at = 0;
         bool same = true;
         for (long long step : sliceLengths (sl, n))
@@ -646,7 +660,7 @@ static void theTraceOfDecisions()
 static void noCertificateWithoutAMeasurement()
 {
     test::group ("no road can certify a file it did not measure");
-    const Planes p = clampedProgramme (2400, 1000.0, 2, 5, false, true);
+    const Planes p = clampedProgramme (2400, kRate, 2, 5, false, true);
     const long long n = (long long) p[0].size();
     const auto v = ptrsAt (p, 0);
 
@@ -654,7 +668,7 @@ static void noCertificateWithoutAMeasurement()
     //     report at all — not a short one.
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 1 << 16, n));
+        test::run (probe.prepare (kRate, 2, 1 << 16, n));
         test::run (probe.process (v.data(), 2, n));
         test::ok (! probe.valid(), "an unfinished measurement is not valid");
         test::ok (probe.runCount() == 0 && probe.storedRunCount() == 0 && ! probe.complete()
@@ -662,7 +676,7 @@ static void noCertificateWithoutAMeasurement()
                   "and every accessor answers zero rather than a partial truth");
         // A report value that already holds a good answer must be CLEARED by the refusal, or the refusal is
         // worse than useless: the caller reads the previous file.
-        fcore::ClipsReport reused = viaProbe (p, 1000.0, 1 << 16, { { 0 }, 0, "whole" }, n);
+        fcore::ClipsReport reused = viaProbe (p, kRate, 1 << 16, { { 0 }, 0, "whole" }, n);
         test::ok (reused.ok && reused.runCount > 0, "a good report to reuse");
         test::ok (! readClips (probe, reused), "readClips refuses an unfinished probe");
         test::ok (! reused.ok && reused.runCount == 0 && reused.runs.empty(),
@@ -679,14 +693,14 @@ static void noCertificateWithoutAMeasurement()
     //     looked at. Asserted here for the bare detector too, so the reason is on the record.
     {
         CD bare;
-        test::run (bare.prepare (1000.0, 8192, 2));
+        test::run (bare.prepare (kRate, 8192, 2));
         test::ok (! bare.process (v.data(), 9, 4), "the detector refuses a width it was not prepared for");
         bare.finish();
         test::ok (bare.isFinished() && bare.runCount() == 0 && bare.runsComplete() && bare.samplePeak (0) == 0.0,
                   "…and then finishes anyway, reporting a complete, empty, clean file — this is the trap");
 
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 1 << 16, n));
+        test::run (probe.prepare (kRate, 2, 1 << 16, n));
         test::ok (! probe.process (v.data(), 9, 4), "the adapter refuses it too");
         test::ok (! probe.finish(), "and then refuses to finish: a poisoned measurement has no result");
         test::ok (! probe.valid() && probe.runCount() == 0, "so nothing can be read out of it");
@@ -699,7 +713,7 @@ static void noCertificateWithoutAMeasurement()
     //      call, or a caller that probes a width with n == 0, loses a perfectly good measurement.
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 1 << 16, n));
+        test::run (probe.prepare (kRate, 2, 1 << 16, n));
         test::run (probe.process (v.data(), 2, n));
         test::run (probe.finish());
         const std::int64_t was = probe.runCount();
@@ -719,7 +733,7 @@ static void noCertificateWithoutAMeasurement()
     //      clocks agree. Without this assertion the flag in finish() would be indistinguishable from dead code.
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 1 << 16, n));
+        test::run (probe.prepare (kRate, 2, 1 << 16, n));
         test::run (probe.process (v.data(), 2, n));
         test::ok (! probe.process (v.data(), 9, 4), "the whole stream, then one malformed call");
         test::ok (! probe.finish() && ! probe.valid(),
@@ -732,13 +746,13 @@ static void noCertificateWithoutAMeasurement()
     // that no length-free adapter can refuse it).
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 16, n));
+        test::run (probe.prepare (kRate, 2, 16, n));
         test::ok (! probe.process (v.data(), 2, n + 1), "one frame more than the stream holds is refused");
         test::ok (! probe.finish(), "…and poisons: it carried samples that were not consumed");
     }
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 16, n));
+        test::run (probe.prepare (kRate, 2, 16, n));
         test::ok (! probe.process (v.data(), 2, std::numeric_limits<long long>::max()),
                   "and so is a length that would overflow the sample clock");
         test::ok (! probe.finish(), "…which is the same refusal, reached before any pointer arithmetic");
@@ -746,7 +760,7 @@ static void noCertificateWithoutAMeasurement()
     // A stream that stops short has no report either: the three clocks must agree.
     {
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 16, n));
+        test::run (probe.prepare (kRate, 2, 16, n));
         test::run (probe.process (v.data(), 2, n - 1));
         test::ok (! probe.finish(), "a file that delivered one frame less than it was sized for is refused");
         test::ok (! probe.valid(), "…and publishes nothing");
@@ -755,7 +769,7 @@ static void noCertificateWithoutAMeasurement()
     // (c) A REFUSED prepare() LEAVES THE PREVIOUS ANSWER BEHIND isFinished(). Measured, not assumed.
     {
         CD bare;
-        test::run (bare.prepare (1000.0, 8192, 2));
+        test::run (bare.prepare (kRate, 8192, 2));
         test::run (bare.process (v.data(), 2, n));
         bare.finish();
         const std::int64_t was = bare.runCount();
@@ -765,7 +779,7 @@ static void noCertificateWithoutAMeasurement()
                   "and the refusal leaves isFinished() true with the old count — why the adapter has its own flag");
 
         fcore::ClipProbe probe;
-        test::run (probe.prepare (1000.0, 2, 1 << 16, n));
+        test::run (probe.prepare (kRate, 2, 1 << 16, n));
         test::run (probe.process (v.data(), 2, n));
         test::run (probe.finish());
         test::ok (probe.valid() && probe.runCount() == was, "the adapter agrees on the count");
@@ -781,13 +795,13 @@ static void noCertificateWithoutAMeasurement()
         fcore::ClipProbe probe;
         for (int pass = 0; pass < 2; ++pass)
         {
-            test::run (probe.prepare (1000.0, 2, 1 << 16, n));
+            test::run (probe.prepare (kRate, 2, 1 << 16, n));
             test::run (probe.process (v.data(), 2, n));
             test::run (probe.finish());
         }
         fcore::ClipsReport again;
         test::ok (readClips (probe, again), "a second measurement on the same adapter");
-        test::ok (sameReport (again, bareWhole (p, 1000.0, 1 << 16, n)), "…is bit-identical to the first");
+        test::ok (sameReport (again, bareWhole (p, kRate, 1 << 16, n)), "…is bit-identical to the first");
     }
 }
 
@@ -825,7 +839,7 @@ static void capacityIsData()
         const Planes one = pinnedWitness (true);
         Planes wide ((std::size_t) core::kMaxChannels, one[0]);
         const long long wn = (long long) one[0].size();
-        const fcore::ClipsReport all = viaProbe (wide, 1000.0, 1 << 16, { { 0 }, 0, "whole" }, wn);
+        const fcore::ClipsReport all = viaProbe (wide, kRate, 1 << 16, { { 0 }, 0, "whole" }, wn);
         test::ok (all.ok && all.runCount == core::kMaxChannels && all.complete,
                   "sixteen channels, sixteen simultaneous runs (" + std::to_string (all.runCount) + ")");
         bool ordered = true;
@@ -833,13 +847,13 @@ static void capacityIsData()
             if (all.runs[i].channel != (int) i || all.runs[i].start != 9
                 || b64 (all.runs[i].level) != 0x3fe3f55555555555ull) ordered = false;
         test::ok (ordered, "in channel order, each at start 9 with the pinned level");
-        const fcore::ClipsReport cut = viaProbe (wide, 1000.0, core::kMaxChannels - 1, { { 0 }, 0, "whole" }, wn);
+        const fcore::ClipsReport cut = viaProbe (wide, kRate, core::kMaxChannels - 1, { { 0 }, 0, "whole" }, wn);
         test::ok (cut.runCount == core::kMaxChannels && cut.storedRunCount == core::kMaxChannels - 1 && ! cut.complete,
                   "one short of sixteen: all counted, fifteen stored, incomplete");
         bool prefix = true;
         for (std::size_t i = 0; i < cut.runs.size(); ++i) if (! sameRun (cut.runs[i], all.runs[i])) prefix = false;
         test::ok (prefix, "and the fifteen are the first fifteen channels, unchanged");
-        test::ok (sameReport (cut, viaProbe (wide, 1000.0, core::kMaxChannels - 1, { { 3 }, 0, "3" }, wn)),
+        test::ok (sameReport (cut, viaProbe (wide, kRate, core::kMaxChannels - 1, { { 3 }, 0, "3" }, wn)),
                   "the same run is dropped under a different slicing");
     }
     test::ok (! fcore::ClipProbe {}.prepare (8000.0, 2, fcore::ClipProbe::kMaxRuns + 1, 1000),

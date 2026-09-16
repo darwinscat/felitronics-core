@@ -2779,53 +2779,77 @@ static void testLraRefusesAPoisonedProgramme()
             "PRECONDITION: and the number it would have returned is 21.4 LU, not 4.8");
 }
 
-// P41 F1 — THE METER BEHIND A SOLVE IS SIZED IN SAMPLES. `frames / fs + 1` seconds is +inf at a finite rate the
-// chain accepts, and the store's size used to be `(std::size_t) inf`: undefined behaviour whose answer depended on
-// the row — 3 kept blocks and 194 dropped on arm64 and wasm32, 4 and 193 on x86-64 gcc. The rate is absurd on
-// purpose and the chain takes it (without EQ and limiter, the two stages that refuse it); a solver that measures
-// at the rate it was given has to size its meter for the programme it was given.
-static void testTheMeterIsSizedInSamples()
+// P51 — THE SEARCH MEASURES AT NO RATE BELOW THE CORE'S FLOOR. Before P51 it took any finite rate > 0: a chain at
+// 88.2 (kilohertz passed as hertz) came back Solved at -14 LUFS, and one at 3363 Hz TargetUnreachable at the -60 dB rail,
+// chasing +2448 LUFS from a K-weighting shelf past Nyquist. The rows are at the boundary from both sides, in the
+// unit-error form and in the non-finite ones; every budget answers 0 exactly where prepare() refuses, and a refusal
+// disarms a solver that was prepared before it (law 11b).
+//
+// It REPLACES P41 F1's solve at 1e-305 Hz, which is no longer reachable: at 8000 Hz and above `frames / fs` is at most
+// INT_MAX / 8000 s, finite, so the seconds form cannot overflow here any more. The property itself — a store sized in
+// SAMPLES holds the programme whatever the rate — is pinned on the meter, which still takes any rate
+// (LoudnessConformanceTests, "P41 F1, re-homed").
+// MUTATIONS KILLED: the floor removed; `>` for `>=`; 1000 for 8000; the budget's own copy of the test left at `> 0`.
+static void testTheRateFloor()
 {
-    test::group ("the meter behind a solve is sized in samples, at any rate the chain accepts");
+    test::group ("P51: the search refuses a rate below 8000 Hz, and every budget says so");
 
-    const double fs = 1.0e-305;
-    const int frames = 2000;
+    test::ok (TargetLoudnessSolver::kMinSampleRate == 8000.0, "the floor is 8000 Hz — a literal pin");
+    const double lo = TargetLoudnessSolver::kMinSampleRate;
+    const double inf = std::numeric_limits<double>::infinity();
+    struct Row { double fs; bool want; const char* what; };
+    const Row rows[] {
+        { lo,                         true,  "8000 Hz, the floor itself" },
+        { std::nextafter (lo, 1.0e9), true,  "one ulp over the floor" },
+        { 48000.0,                    true,  "48 kHz" },
+        { std::nextafter (lo, 0.0),   false, "one ulp under the floor" },
+        { 7999.0,                     false, "7999 Hz" },
+        { 3363.0,                     false, "3363 Hz, where the shelf is just past Nyquist" },
+        { 1000.0,                     false, "1000 Hz" },
+        { 88.2,                       false, "88.2 — kilohertz passed as hertz" },
+        { 44.1,                       false, "44.1 — kilohertz passed as hertz" },
+        { 1.0e-305,                   false, "1e-305 Hz, P41 F1's rate" },
+        { 5.0e-324,                   false, "the smallest subnormal" },
+        { 0.0,                        false, "zero" },
+        { -48000.0,                   false, "a negative rate" },
+        { std::nan (""),              false, "NaN" },
+        { inf,                        false, "+inf" },
+        { -inf,                       false, "-inf" },
+    };
+    for (const Row& r : rows)
+    {
+        TargetLoudnessSolver solver;
+        test::ok (solver.prepare (48000.0, 2, 1024, 256, 4), std::string ("PRECONDITION: prepared at 48 kHz before: ") + r.what);
+        const bool got = solver.prepare (r.fs, 2, 1024, 256, 4);
+        test::ok (got == r.want, std::string (r.want ? "accepted: " : "refused: ") + r.what);
+        test::ok (solver.isPrepared() == r.want && (r.want ? solver.sampleRate() == r.fs : solver.sampleRate() == 0.0),
+                  std::string ("and a refusal disarms — no 48 kHz build left standing: ") + r.what);
+        // THE BUDGETS SHARE THE VERDICT. 240 x 8000 frames — four minutes at the floor, 40 s at 48 kHz — so the range
+        // is measurable at every accepted rate.
+        const int frames = 240 * 8000;
+        test::ok ((TargetLoudnessSolver::solveBytes (r.fs, 2, frames) > 0u) == r.want,
+                  std::string ("solveBytes is 0 exactly where prepare() refuses: ") + r.what);
+        test::ok ((TargetLoudnessSolver::measureRangeBytes (r.fs, frames) > 0u) == r.want,
+                  std::string ("measureRangeBytes likewise: ") + r.what);
+    }
+
+    // And end to end: a chain the search could be handed at a refused rate does not exist to hand it — the chain has the
+    // same floor — while one at the floor solves.
     MasteringChain chain; OfflineRenderer renderer; TargetLoudnessSolver solver;
     MasteringChainConfig cfg; cfg.eq = false; cfg.limiter = false;
-    test::ok (chain.prepare (fs, 1, cfg), "PRECONDITION: the chain accepts the rate once EQ and limiter are off");
-    test::ok (renderer.prepare (1, 1024), "renderer prepared");
-    test::ok (solver.prepare (fs, 1, 1024, chain.internalBlock(), chain.tapOversampleFactor()), "solver prepared");
-    test::ok (! std::isfinite ((double) frames / fs), "PRECONDITION: the seconds form really is +inf here");
-
+    test::ok (! chain.prepare (std::nextafter (lo, 0.0), 1, cfg), "the chain refuses one ulp under the floor too, with no stage on that would");
+    test::ok (chain.prepare (lo, 1, cfg) && renderer.prepare (1, 1024)
+                  && solver.prepare (lo, 1, 1024, chain.internalBlock(), chain.tapOversampleFactor()),
+              "PRECONDITION: chain, renderer and solver at 8000 Hz");
+    const int frames = 10 * 8000;
     std::vector<float> in ((std::size_t) frames), out ((std::size_t) frames, 0.0f);
-    for (int i = 0; i < frames; ++i) in[(std::size_t) i] = (i & 1) ? 0.25f : -0.25f;
+    for (int i = 0; i < frames; ++i) in[(std::size_t) i] = 0.25f * (float) std::sin (2.0 * 3.141592653589793 * 400.0 * i / lo);
     const float* ip[1] { in.data() };
     float*       op[1] { out.data() };
     LoudnessRequest req; req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
     const LoudnessSolution s = solver.solve (chain, renderer, MasteringChainParams {}, ip, op, 1, frames, req);
-    // PRECONDITION: a meter was prepared at all. A refused solve leaves `measured` at its defaults, where "0 dropped"
-    // holds vacuously — the stand's mutant back to the seconds form now REFUSES (+inf seconds) and passed that line.
-    test::ok (s.status != MasteringSolveStatus::RenderFailed && s.passes > 0, "PRECONDITION: the solve measured something");
-    // 2000 one-sample sub-hops are 200 hops, and the first block is born on the 4th: 197 blocks. Whatever the
-    // verdict at this rate, the store must hold all of them — the defect dropped 193 or 194 of them.
-    test::ok (s.measured.droppedBlocks == 0, "no gating block is dropped: the store holds the programme");
-    test::ok (s.measured.gatingBlocks == 197, "and all 197 blocks the programme produces are kept");
-
-    double lra = -1.0;
-    (void) solver.measureInputLoudnessRange (ip, 1, frames, lra);   // the same sizing, exercised for the sanitizer rows
-    // The range measurement is sized the same way, and a SILENT programme shows it — at 1e-304 Hz, where `frames / fs`
-    // is +inf too. The programme is measured, 0 LU, as at any ordinary rate; the seconds form overran its store and
-    // refused it.
-    MasteringChain qChain; TargetLoudnessSolver qSolver;
-    test::ok (qChain.prepare (1.0e-304, 1, cfg) && qSolver.prepare (1.0e-304, 1, 1024, qChain.internalBlock(),
-                                                                    qChain.tapOversampleFactor()),
-              "PRECONDITION: chain and solver take 1e-304 Hz");
-    test::ok (! std::isfinite (100000.0 / 1.0e-304), "PRECONDITION: the seconds form is +inf at 1e-304 Hz too");
-    const std::vector<float> quiet (100000, 0.0f);
-    const float* qp[1] { quiet.data() };
-    double quietLra = -1.0;
-    test::ok (qSolver.measureInputLoudnessRange (qp, 1, 100000, quietLra) && quietLra == 0.0,
-              "100 000 silent frames at 1e-304 Hz: the range is measured, 0 LU — the store holds the programme");
+    test::ok (s.measured.loudnessValid && std::isfinite (s.measured.integratedLufs) && s.measured.integratedLufs < 0.0,
+              "at the floor the search measures a finite, negative loudness (" + std::to_string (s.measured.integratedLufs) + " LUFS)");
 }
 
 // P41 — A BUDGET IS 0 WHERE ITS CALL REFUSES, A CHANNEL COUNT INCLUDED. The pre-merge diff pass: both helpers used to
@@ -2947,7 +2971,7 @@ int main()
     testTheVerdictDoesNotDependOnTheBudget();
     testThePreMergeDiffPass();
     testLraRefusesAPoisonedProgramme();
-    testTheMeterIsSizedInSamples();
+    testTheRateFloor();
     testTheBudgetsRefuseWhatTheCallsRefuse();
     return felitronics::test::report();
 }

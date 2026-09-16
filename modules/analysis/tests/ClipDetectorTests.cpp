@@ -556,10 +556,14 @@ int main()
         test::ok (equal == files && runs > 1000, msg);
     }
 
-    test::group ("the reference null on tiny streams (W = 20 samples): window edges, stream edges, holes, dense ceilings");
+    test::group ("the reference null on short streams (W = 160 samples): window edges, stream edges, holes, dense ceilings");
     {
-        // Short streams at 1 kHz put every run within reach of a window edge, a stream edge or a hole, and a dense
-        // pattern of two-sample flats at a proven ceiling followed by an overshoot fills the pending queue to its bound.
+        // Short streams at the lowest accepted rate put every run within reach of a window edge, a stream edge or a hole,
+        // and a dense pattern of two-sample flats at a proven ceiling followed by an overshoot crowds the pending queue.
+        // (This ran at 1 kHz, W = 20, with streams of 20..420 samples, until P51 put the rate floor at 8 kHz. The
+        // streams are W..21W as before, and so is every lasting feature inside them — see `up` below.)
+        constexpr double sr = CD::kMinSampleRate;
+        const long W = (long) (sr * CD::kWindowMs / 1000.0);
         std::mt19937 rng (1158);
         std::uniform_real_distribution<double> U (0.0, 1.0);
         int items = 0, equal = 0; long refRuns = 0;
@@ -567,7 +571,7 @@ int main()
         for (int it = 0; it < 4000; ++it)
         {
             const int nch = 1 + (int) (U (rng) * 2.0);
-            const long N = 20 + (long) (U (rng) * 400.0);
+            const long N = W + (long) (U (rng) * 20.0 * (double) W);
             Planes planes;
             for (int c = 0; c < nch; ++c)
             {
@@ -577,7 +581,12 @@ int main()
                 while ((long) x.size() < N)
                 {
                     const int kind = (int) (U (rng) * 8.0);
-                    const int len = 1 + (int) (U (rng) * 10.0);
+                    // Every feature that LASTS is as long in time as it was at 1 kHz — `up` samples per millisecond —
+                    // so a window holds as many of them as it did; the one- and two-sample events (a dip, an
+                    // overshoot) stay one and two samples. Unscaled, the same generator gave 1569 reference runs
+                    // instead of the 1 kHz suite's 7484: a 160-sample neighbourhood almost always held a pass.
+                    const int up = (int) (W / 20);
+                    const int len = up * (1 + (int) (U (rng) * 10.0));
                     if (kind == 0) for (int i = 0; i < len; ++i) x.push_back (cur);                                 // flat where it is
                     else if (kind == 1) { cur = (U (rng) < 0.5 ? P : -P); for (int i = 0; i < len; ++i) x.push_back (cur); }   // flat at a ceiling
                     else if (kind == 2) { const double to = U (rng) * 2.0 - 1.0; for (int i = 1; i <= len; ++i) x.push_back (cur + (to - cur) * i / len); cur = to; }
@@ -596,51 +605,95 @@ int main()
                 if (U (rng) < 0.3) { const std::size_t at = (std::size_t) (U (rng) * (double) N); f[at] = U (rng) < 0.5 ? nan : (U (rng) < 0.5 ? inf : -inf); }
                 planes.push_back (f);
             }
-            const auto ref = reference (planes, 1000.0);
-            const Report r = runEngine (planes, 1000.0, it % 3 == 0 ? 1 : -1, (unsigned) it);
+            const auto ref = reference (planes, sr);
+            const Report r = runEngine (planes, sr, it % 3 == 0 ? 1 : -1, (unsigned) it);
             ++items; refRuns += (long) ref.size();
             if (sameRuns (ref, sortedRuns (r))) ++equal;
             else if (items - equal <= 3) std::printf ("    tiny-stream null differs on item %d: reference %zu runs, engine %zu\n", it, ref.size(), r.runs.size());
         }
-        char msg[128]; std::snprintf (msg, sizeof msg, "%d of %d tiny streams identical (%ld reference runs)", equal, items, refRuns);
-        test::ok (equal == items && refRuns > 2000, msg);
+        char msg[128]; std::snprintf (msg, sizeof msg, "%d of %d short streams identical (%ld reference runs)", equal, items, refRuns);
+        test::ok (equal == items && refRuns > 7484, msg);          // at least what the 1 kHz suite covered
     }
 
     test::group ("a neighbour equal to the band's lowest sample is flat with it, not below it");
     {
-        // On a 1/64 grid (q = 1/64, tau = 2/64) at 1 kHz: a ramp of 12 proves a ceiling at 40, then the greedy scan ends a band
+        // On a 1/64 grid (q = 1/64, tau = 2/64) at 8 kHz: a ramp of 12 proves a ceiling at 40, then the greedy scan ends a band
         // {36, 38} at 38 because 39 would widen it past tau, and starts {39, 38, 40, 40} — whose lowest sample IS its left
-        // neighbour. That band sits at the ceiling, but it is no top: its left side is level with it.
+        // neighbour. That band sits at the ceiling, but it is no top: its left side is level with it. (At 1 kHz before P51.
+        // The quiet between the parts, and after them, is three windows long, as it was: 60 samples there, 480 here.)
         const double g = 1.0 / 64.0;
         std::vector<float> x;
         auto put = [&] (std::initializer_list<int> v) { for (int u : v) x.push_back ((float) (u * g)); };
         put ({ 0, 1, 0, -1, -10, 0, 10, 20, 30, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 30, 20, 10, 0, -10, 0 });   // the grid shown, a ramp run at 40
-        for (int i = 0; i < 30; ++i) put ({ 0, -3 });
+        const long W = (long) (CD::kMinSampleRate * CD::kWindowMs / 1000.0);
+        for (long i = 0; i < 3 * W / 2; ++i) put ({ 0, -3 });
         put ({ 30, 36, 38, 39, 38, 40, 40, 30, 20, 10, 0, -10, 0 });
-        for (int i = 0; i < 30; ++i) put ({ -3, 0 });
-        const Report r = runEngine ({ x }, 1000.0, 1);
-        const auto ref = reference ({ x }, 1000.0);
+        for (long i = 0; i < 3 * W / 2; ++i) put ({ -3, 0 });
+        const Report r = runEngine ({ x }, CD::kMinSampleRate, 1);
+        const auto ref = reference ({ x }, CD::kMinSampleRate);
         test::ok (r.runs.size() == 1 && std::get<1> (r.runs[0]) == 9 && std::get<2> (r.runs[0]) == 12 && sameRuns (ref, sortedRuns (r)),
                   "only the proven run is reported (" + std::to_string (r.runs.size()) + " runs)");
     }
 
     test::group ("the pending queue holds every candidate a window can end: a full queue never decides early");
     {
-        // W = 20 samples at 1 kHz, so W/2 + 1 two-sample bands can end inside one window. After a ramp proves a ceiling at
+        // W = 160 samples at 8 kHz, so W/2 + 1 two-sample bands can end inside one window. After a ramp proves a ceiling at
         // 40, pairs at 40 and 30 alternate — every pair at 40 sits at the ceiling — and then one sample at 50 passes it, within
-        // the window of all of them. Eight bands pending is more than a queue of W/4 + 2 would hold.
+        // the window of all of them. The row carries as many bands as its construction allows (4 * pairs + 2 < W): 78 of
+        // them, more than any queue short of W/2 - 2 holds — so a queue of W/4 + 2 = 42, or of W/2 - 3, decides early.
         // Decided on their full window the pairs are rejected; decided early, before the 50 arrives, they would not be.
+        // (At 1 kHz before P51: W = 20, eight bands by the same formula. The quiet around the pairs keeps its proportions:
+        // 1.5 windows before them, 3 after, so the 50 passes the pairs and not the run. The review round measured that
+        // the first move's row — (W/4 + 2)/2 + 1 = 22 pairs, 44 bands — let the W/2 - 3 queue live at 8 kHz, where the
+        // old row had killed it.)
         const double g = 1.0 / 64.0;
+        const long W = (long) (CD::kMinSampleRate * CD::kWindowMs / 1000.0);
         std::vector<float> x;
         auto put = [&] (std::initializer_list<int> v) { for (int u : v) x.push_back ((float) (u * g)); };
         put ({ 0, 1, 0, -1, -10, 0, 10, 20, 30, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 30, 20, 10, 0, -10, 0 });
-        for (int i = 0; i < 15; ++i) put ({ 0, -3 });
-        for (int i = 0; i < 4; ++i) put ({ 40, 40, 30, 30 });                                        // eight bands end in 16 samples
+        for (long i = 0; i < 3 * W / 4; ++i) put ({ 0, -3 });
+        const long pairs = (W - 3) / 4;                                                              // 39 of each: 78 bands
+        for (long i = 0; i < pairs; ++i) put ({ 40, 40, 30, 30 });                                   // ... ending in 156 samples
         put ({ 20, 50, 10, 0 });                                                                     // passed within the window of every one
-        for (int i = 0; i < 30; ++i) put ({ -3, 0 });
-        const Report r = runEngine ({ x }, 1000.0, 1);
-        test::ok (r.runs.size() == 1 && std::get<1> (r.runs[0]) == 9 && sameRuns (reference ({ x }, 1000.0), sortedRuns (r)),
+        for (long i = 0; i < 3 * W / 2; ++i) put ({ -3, 0 });
+        test::ok (2 * pairs > W / 2 - 3 && 4 * pairs + 2 < W,
+                  "PRECONDITION: more bands than a W/2 - 3 queue holds, and all of them inside one window of the 50");
+        const Report r = runEngine ({ x }, CD::kMinSampleRate, 1);
+        test::ok (r.runs.size() == 1 && std::get<1> (r.runs[0]) == 9 && sameRuns (reference ({ x }, CD::kMinSampleRate), sortedRuns (r)),
                   "only the proven run is reported (" + std::to_string (r.runs.size()) + " runs)");
+    }
+
+    test::group ("the window's deques hold a whole window: a strictly falling stretch of W + 1 samples");
+    {
+        // A MONOTONE STRETCH ONE SAMPLE LONGER THAN THE WINDOW keeps every sample in the max-deque, so a ring one slot
+        // short overwrites its head — and the head is the only sample that says the flat top after it was passed.
+        // The diverse-testing round of P51 found that the move from 1 kHz to 8 kHz had lost this: at W = 20 the clamped
+        // programme's arcs held monotone stretches of 27..53 samples and a W-slot deque failed there (ASan); at W = 160
+        // no moved fixture did, and the mutant `dequeCapacityFor -> W` lived. This fixture is the round's witness: the
+        // falling stretch is exactly W + 1 samples, 1 code a step, so the window max sits at its head; eleven fast steps
+        // then approach a flat top BELOW the stretch's second sample. The right answer is no run at all, at any rate.
+        // (A W + 1 ring is exact — after expiry at most W entries remain before a push — so W + 2 has one spare.)
+        const double g = 1.0 / 64.0;
+        for (double sr : { CD::kMinSampleRate, 44100.0, 48000.0, 192000.0 })
+        {
+            const long W = (long) (sr * CD::kWindowMs / 1000.0);
+            std::vector<float> x;
+            auto put = [&] (long code) { x.push_back ((float) ((double) code * g)); };
+            for (long c : { 0L, 1L, 0L, -1L }) put (c);                                  // q = one code
+            const long slow = W + 1 - 11;
+            long v = 50 + slow;
+            for (long i = 0; i < slow; ++i) put (v--);                                     // the head of the window's max
+            v += 1;
+            for (int i = 1; i <= 11; ++i) put (v - 20 * i);                                // W + 1 strictly falling in all
+            for (int i = 0; i < 12; ++i) put (40);                                         // the top, under the 2nd sample
+            for (long c : { 30L, 20L, 10L, 0L, -10L, 0L }) put (c);
+            for (long i = 0; i < 3 * W / 2; ++i) { put (0); put (-3); }
+            const Report r = runEngine ({ x }, sr, 0);
+            const Report rs = runEngine ({ x }, sr, -1, 11);
+            test::ok (r.runs.empty() && rs.runs.empty() && reference ({ x }, sr).empty(),
+                      "no run at " + std::to_string ((int) sr) + " Hz (W = " + std::to_string (W) + "): the engine, sliced "
+                      "and whole, and the reference (" + std::to_string (r.runs.size()) + " runs)");
+        }
     }
 
     test::group ("a stream edge proves nothing: a signal cut into digital silence at the start or the end is not a clamp");
@@ -830,8 +883,11 @@ int main()
         CD d;
         const float z[4] {}; const float* io[2] { z, z };
         test::ok (! d.process (io, 1, 4), "unprepared: refused");
-        test::ok (! d.prepare (0.0, 64, 2) && ! d.prepare (std::numeric_limits<double>::quiet_NaN(), 64, 2) && ! d.prepare (999.0, 64, 2)
+        test::ok (! d.prepare (0.0, 64, 2) && ! d.prepare (std::numeric_limits<double>::quiet_NaN(), 64, 2)
+                  && ! d.prepare (std::nextafter (CD::kMinSampleRate, 0.0), 64, 2) && ! d.prepare (44.1, 64, 2)
                   && ! d.prepare (768001.0, 64, 2) && ! d.prepare (48000, 64, 0) && ! d.prepare (48000, 64, core::kMaxChannels + 1), "prepare refuses what it cannot honour");
+        test::ok (CD::kMinSampleRate == 8000.0 && d.prepare (8000.0, 64, 2) && d.decisionDelaySamples() == 160,
+                  "the rate floor is 8000 Hz (P51), and 8000 itself is accepted — with its 160-sample window");
         test::run (d.prepare (48000, 64, 2));
         d.setParams ({ -1 });
         test::ok (! d.prepare (48000, 64, 2) && ! d.process (io, 1, 4), "a refused prepare leaves the object unusable, not on its previous build");
@@ -896,7 +952,7 @@ int main()
         const auto st = CD::storageFor (sr, 3, 5000);
         test::ok (st.ok && (long long) st.bytes() == used && blocks == 4, "prepare() requested exactly storageFor().bytes() in four blocks ("
                   + std::to_string (used) + " bytes, " + std::to_string (blocks) + " blocks)");
-        test::ok (! CD::storageFor (500.0, 3, 10).ok && ! CD::storageFor (sr, 0, 10).ok && ! CD::storageFor (sr, 3, -1).ok && CD::storageFor (sr, 3, 0).ok,
+        test::ok (! CD::storageFor (std::nextafter (CD::kMinSampleRate, 0.0), 3, 10).ok && ! CD::storageFor (sr, 0, 10).ok && ! CD::storageFor (sr, 3, -1).ok && CD::storageFor (sr, 3, 0).ok,
                   "storageFor() refuses exactly what prepare() refuses");
         const float* io[3] { a.data(), a.data(), a.data() };
         const long long before = alloc::count.load();

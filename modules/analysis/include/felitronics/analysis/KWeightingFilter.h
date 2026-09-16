@@ -24,6 +24,13 @@ class BasicKWeightingFilter
 public:
     struct Coeffs { double b0, b1, b2, a1, a2; };
 
+    // The shelf's design frequency (BS.1770's published constant). Named because the core's rate floor is
+    // derived from it: below 2 x kShelfHz the bilinear tan() is past its pole — the shelf is aliased, and wherever
+    // tan() comes out negative ((f0, 2 f0), (f0/2, 2 f0/3), …) unstable. This
+    // filter itself still accepts any rate — the entries that take a rate from outside refuse one below
+    // core::kMinSampleRate, and the assertion keeps that floor above the edge.
+    static constexpr double kShelfHz = 1681.974450955533;
+
     void prepare (double sampleRate, int numChannels) noexcept
     {
         fs = sampleRate;
@@ -90,7 +97,7 @@ private:
     {
         // Stage 1 — high shelf (the published BS.1770 design constants).
         {
-            const double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
+            const double f0 = kShelfHz, G = 3.999843853973347, Q = 0.7071752369554196;
             const double K = Math::tan (core::kPi * f0 / sampleRate);
             const double Vh = Math::pow10 (G / 20.0);
             const double Vb = Math::pow (Vh, 0.4996667741545416);
@@ -113,6 +120,11 @@ private:
     double z1a[kMaxChannels] {}, z2a[kMaxChannels] {}, z1b[kMaxChannels] {}, z2b[kMaxChannels] {};
 };
 
+
+// P51: the core's rate floor has to stay clear of the edge where the shelf goes unstable. The margin is the
+// floor's own business (see core::kMinSampleRate); what is asserted is only that it is not INSIDE the band.
+static_assert (core::kMinSampleRate > 2.0 * BasicKWeightingFilter<core::SystemMath>::kShelfHz,
+               "core::kMinSampleRate admits rates at which the K-weighting shelf is past Nyquist");
 
 using KWeightingFilter = BasicKWeightingFilter<core::SystemMath>;
 using DeterministicKWeightingFilter = BasicKWeightingFilter<core::DetMath>;

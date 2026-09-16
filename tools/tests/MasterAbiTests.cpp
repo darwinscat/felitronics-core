@@ -1608,6 +1608,22 @@ int main()
             { "a negative key filter",              FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sidechainHpfHz = -1.0; } },
             { "a key filter above Nyquist",         FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sidechainHpfHz = 0.5 * kFs; } },
             { "a non-finite key filter",            FC_ERR_NON_FINITE,      [] (fc_master_config& c) { c.sidechainHpfHz = std::numeric_limits<double>::infinity(); } },
+            // P51 — THE RATE FLOOR, 8000 Hz, and the one row that sees it alone: with the limiter and the EQ off no
+            // stage refuses a low rate, so a create that took one ulp under the floor would have nothing else to
+            // stop it. The rest are the mistakes the floor is for; every one of them was CREATED on origin/main.
+            { "one ulp under the rate floor, no stage that refuses", FC_ERR_REFUSED_BY_CORE,
+              [] (fc_master_config& c) { c.sampleRate = std::nextafter (8000.0, 0.0); c.eq = 0; c.limiter = 0; } },
+            { "7999 Hz",                            FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 7999.0; } },
+            { "88.2 — kilohertz passed as hertz",   FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 88.2; } },
+            { "44.1 with the limiter off",          FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 44.1; c.limiter = 0; } },
+            { "3300 Hz, where the K-weighting is past Nyquist", FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { c.sampleRate = 3300.0; } },
+            // A DELIVERING handle runs its chain at the DELIVERY rate, so the chain's floor never sees the source —
+            // the resampler's plan is what refuses it, on both sides. THE STAMP IS RE-WRITTEN FIRST: goodConfig() is a
+            // v1 struct, and `deliveryRate` past a v1 stamp is not read (the trap pinned in the v2 group below) — these
+            // rows were plain handles, refused or not for the wrong reason, until they said so.
+            { "delivering from 7999 Hz",            FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { FC_INIT (c); c.sampleRate = 7999.0; c.deliveryRate = 48000.0; } },
+            { "delivering from 4000 Hz",            FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { FC_INIT (c); c.sampleRate = 4000.0; c.deliveryRate = 48000.0; } },
+            { "delivering to 7999 Hz",              FC_ERR_REFUSED_BY_CORE, [] (fc_master_config& c) { FC_INIT (c); c.deliveryRate = 7999.0; } },
         };
         int refOff = 0, refLeak = 0, refTouched = 0;
         for (const Refusal& rf : refusals)
@@ -1641,6 +1657,33 @@ int main()
         ok (refLeak == 0, "and a refused create allocates NOTHING — it used to ask for 394 456 bytes on its "
                           "way to `false` here, and 1 668 312 at sixteen channels ("
                           + std::to_string (refLeak) + " leaked)");
+
+        // AND THE FLOOR ITSELF IS A RATE, on every kind of handle — `>=`, not `>`. Both calls, and both say OK.
+        {
+            struct Accept { const char* what; double sr, dr; };
+            const Accept accepts[] = { { "a plain handle at 8000 Hz", 8000.0, 0.0 },
+                                       { "delivering 8000 -> 48000", 8000.0, 48000.0 },
+                                       { "delivering 48000 -> 8000", 48000.0, 8000.0 },
+                                       { "delivering 8000 -> 8000", 8000.0, 8000.0 } };
+            for (const Accept& a : accepts)
+            {
+                fc_master_config c = goodConfig();
+                FC_INIT (c);                                        // a stamp under which `deliveryRate` is read
+                c.sampleRate = a.sr; c.deliveryRate = a.dr;
+                fc_need an {}; FC_INIT (an);
+                fc_master h = 0;
+                const bool okNeed = fc_master_need_create (&c, &an) == FC_OK && an.callBytes > 0u;
+                const bool okMade = fc_master_create (&c, &h) == FC_OK;
+                ok (okNeed && okMade, std::string ("accepted at the floor: ") + a.what);
+                // and it is the KIND of handle the row names: a delivering one answers the delivered length — one
+                // second in, one second out
+                std::uint32_t d = 0;
+                const fc_status ds = okMade ? fc_master_delivered_frames (h, (std::uint32_t) a.sr, &d) : FC_ERR_HANDLE;
+                ok (a.dr == 0.0 ? ds == FC_ERR_STATE : (ds == FC_OK && d == (std::uint32_t) a.dr),
+                    std::string ("and it is the handle the row names: ") + a.what);
+                if (okMade) (void) fc_master_destroy (h);
+            }
+        }
 
         // THE ARGUMENT CHECKS ARE THIS CALL'S OWN, and they come before the core's — the same order the
         // create takes.

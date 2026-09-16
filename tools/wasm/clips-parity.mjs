@@ -49,7 +49,7 @@ for (let i = 0; i < rest.length; i++) {
 //     `1e3`, `1000.` and `+1000`. `Number()` accepts exactly those and the same rejections, EXCEPT for
 //     JavaScript's own literal forms (`0b1`, `0o7`, `1_0`, `Infinity`) and the empty string, which strtod does
 //     not read — so those are refused explicitly rather than left to agree by luck. ONE RESIDUAL, measured:
-//     strtod also reads C99 hex floats, so `0x1p10` is a legal 1024 Hz natively and is refused here. It is
+//     strtod also reads C99 hex floats, so `0x1p13` is a legal 8192 Hz natively and is refused here. It is
 //     left refused rather than reimplemented: a spelling nobody types, and a refusal on this side is an
 //     exit 2 with no output, which is loud — not the silent divergence the bounds below exist to stop. The
 //     same goes for strtod's leading whitespace: `" 48000"` measures natively and is refused here.

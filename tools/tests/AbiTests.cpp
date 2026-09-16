@@ -136,6 +136,11 @@ int main()
         test::ok (fc_probe_run (buf.data(), 1024, 2, 5e-324) == 0, "the smallest positive subnormal double");
         test::ok (fc_probe_run (buf.data(), 1024, 2, fcore::Probe::kMinSampleRate - 1.0) == 0, "below the accepted range");
         test::ok (fc_probe_run (buf.data(), 1024, 2, fcore::Probe::kMaxSampleRate + 1.0) == 0, "above the accepted range");
+        // P51, as literals — the two rows above read the constant and would move with it.
+        test::ok (fcore::Probe::kMinSampleRate == 8000.0, "the probe's floor is 8000 Hz");
+        test::ok (fc_probe_run (buf.data(), 1024, 2, 7999.0) == 0 && fc_probe_run (buf.data(), 1024, 2, 3300.0) == 0
+                  && fc_probe_run (buf.data(), 1024, 2, 1000.0) == 0 && fc_probe_run (buf.data(), 1024, 2, 44.1) == 0,
+                  "7999, 3300 (the shelf past Nyquist), 1000 (the old floor) and 44.1 are refused");
 
         // A misaligned float* reads garbage in a release wasm build and only traps under -sSAFE_HEAP.
         const char* raw = reinterpret_cast<const char*> (buf.data());
@@ -261,6 +266,29 @@ int main()
         test::ok (! sp.process (view, 1, (long long) n + 1), "10001 frames into 10000 is refused");
         test::ok (sp.peaks().framesSeen() == 0 && sp.stereo().framesSeen() == 0, "... and nothing moved: both counters still 0");
         test::ok (sp.process (view, 1, (long long) n) && sp.complete(), "the correct call then succeeds");
+        // P51 / LAW 11b: a refusal disarms the PARTS too — `peaks()` and `stereo()` are public. On origin/main a NaN
+        // rate reached WaveformPeaks and disarmed it; the rate floor now refuses first, so the probe does it itself —
+        // and for the width refusal, which never reached the parts at all.
+        for (const auto& bad : { std::pair<double, int> { 7999.0, 1 }, { 44.1, 1 }, { std::nan (""), 1 }, { 8000.0, 0 } })
+        {
+            fcore::ShapeProbe q;
+            test::ok (q.prepare (8000.0, 1, n, 1, analysis::PeakMix::Left, 1) && q.process (view, 1, (long long) n)
+                      && q.complete(), "PRECONDITION: a complete picture");
+            const fcore::ShapeProbe fresh;
+            test::ok (! q.prepare (bad.first, bad.second, n, 1, analysis::PeakMix::Left, 1)
+                      && ! q.complete() && ! q.peaks().prepared() && ! q.stereo().prepared()
+                      && ! q.peaks().complete() && ! q.stereo().complete(),
+                      "a refused prepare leaves neither part on the previous picture (rate "
+                      + std::to_string (bad.first) + ", width " + std::to_string (bad.second) + ")");
+            // AND NOT THEIR DATA: the flags alone were cleared at first, and the old peaks, frame count, columns and
+            // RMS stayed readable (the diff-pass round). A refused probe reads like a fresh one.
+            test::ok (q.peaks().peaks().size() == fresh.peaks().peaks().size() && q.peaks().framesSeen() == 0
+                      && q.peaks().bucketsEmitted() == fresh.peaks().bucketsEmitted()
+                      && q.stereo().framesSeen() == 0 && q.stereo().columns() == fresh.stereo().columns()
+                      && q.stereo().maxRms() == fresh.stereo().maxRms(),
+                      "and nothing of the previous picture is readable through the parts (rate "
+                      + std::to_string (bad.first) + ", width " + std::to_string (bad.second) + ")");
+        }
     }
 
     test::group ("the shapes ABI refuses what a page can hand it, and a refusal clears the previous result");
@@ -282,6 +310,24 @@ int main()
                && fc_probe_shapes_run (buf.data(), n, 2, sr, 0x80000000u, 0, 1100) == 0, "0 buckets, 0 columns, a count past int");
         test::ok (fc_probe_shapes_run (buf.data(), n, 2, std::numeric_limits<double>::quiet_NaN(), 1000, 0, 1100) == 0
                && fc_probe_shapes_run (buf.data(), n, 2, 0.0, 1000, 0, 1100) == 0, "a rate that is not a rate");
+        // P51 — THE PROBE ABI'S ONE FLOOR, on the one run entry that used to take any positive rate: the shapes
+        // accepted 44.1 while every other run entry refused it. One ulp under 8000 and the kilohertz spellings are
+        // refused now; 8000 itself is drawn.
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, 44.1, 1000, 0, 1100) == 0
+               && fc_probe_shapes_run (buf.data(), n, 2, 192.0, 1000, 0, 1100) == 0, "a rate in kilohertz is refused");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, std::nextafter (8000.0, 0.0), 1000, 0, 1100) == 0
+               && fc_probe_shapes_run (buf.data(), n, 2, 7999.0, 1000, 0, 1100) == 0, "one ulp under 8000 Hz, and 7999, are refused");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, 8000.0, 1000, 0, 1100) == 1, "8000 Hz itself is drawn");
+        {
+            fcore::ShapeProbe fl;
+            test::ok (! fl.prepare (std::nextafter (8000.0, 0.0), 1, n, 1, analysis::PeakMix::Left, 1)
+                      && fl.prepare (8000.0, 1, n, 1, analysis::PeakMix::Left, 1),
+                      "fcore::ShapeProbe says the same about the boundary");
+            // ONLY the floor moved: the shapes keep no ceiling of their own, so a rate Probe refuses above 768 kHz
+            // is still drawn. Stated so a later change makes it a decision rather than an accident.
+            test::ok (fl.prepare (1.0e6, 1, n, 1, analysis::PeakMix::Left, 1),
+                      "and above Probe's 768 kHz ceiling the shapes still draw (a difference that predates P51)");
+        }
 
         test::ok (fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, 0, 1100) == 1, "a good run again");
         std::vector<double> pk (1000, -7.0);

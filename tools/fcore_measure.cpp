@@ -769,7 +769,8 @@ int main (int argc, char** argv)
         const analysis::SourceForensicsParams fp;
         if (! fx.prepare (frate, kChunk, nc))
         {
-            std::fprintf (stderr, "forensics.prepare refused (sample rate 1000..768000)\n");
+            std::fprintf (stderr, "forensics.prepare refused (sample rate %g..%g)\n",
+                          analysis::SourceForensics::kMinSampleRate, analysis::SourceForensics::kMaxSampleRate);
             std::fclose (f);
             return 2;
         }
@@ -911,8 +912,8 @@ int main (int argc, char** argv)
         if (buckets > 0x7FFFFFFFu || columns > 0x7FFFFFFFu
          || ! shapes.prepare (fs, nc, frames, (int) buckets, mix, (int) columns))
         {
-            std::fprintf (stderr, "shapes.prepare refused (buckets/columns 1..%d, mix avr|L|R|max)\n",
-                          analysis::WaveformPeaks::kMaxBuckets);
+            std::fprintf (stderr, "shapes.prepare refused (sample rate from %g, buckets/columns 1..%d, mix avr|L|R|max)\n",
+                          fcore::Probe::kMinSampleRate, analysis::WaveformPeaks::kMaxBuckets);
             std::fclose (f);
             return 2;
         }
@@ -952,7 +953,8 @@ int main (int argc, char** argv)
     fcore::Probe probe;
     if (! probe.prepare (fs, nc))
     {
-        std::fprintf (stderr, "probe.prepare failed\n");
+        std::fprintf (stderr, "probe.prepare refused (sample rate %g..%g)\n",
+                      fcore::Probe::kMinSampleRate, fcore::Probe::kMaxSampleRate);
         std::fclose (f);
         return 2;
     }

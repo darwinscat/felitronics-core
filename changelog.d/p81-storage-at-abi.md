@@ -55,7 +55,8 @@ where `_run` is accepted and every refused row must leave its getters silent; an
 are deliberate, written down so nobody "fixes" them. `tools/wasm/storage-probe.mjs` makes the assertions
 only the wasm tier can make — starting with the one no native test can, that all five names reached the
 artifact — and prints the demand table that `felitronics_analysis_abi_tests --storage-table` prints
-natively: 425 rows, byte-identical across the two tiers, on the release and the checked module alike.
+natively: 425 rows, byte-identical across the two tiers, on the release and the checked module alike. (P51, in
+the same release, moved the rate floor under this gate: 596 checks, 90 refused geometries and 475 rows since.)
 
 Twenty-six mutants were run against it and twenty-three died. **The crew's testing round found the hole
 the first twenty missed**: with `_run` ignoring what `prepare()` returned, the whole suite stayed green

@@ -565,23 +565,16 @@ int main()
         // binHz against emptyMinHz, so the case that needs the two-bin floor is a COARSE bin — order 8 at
         // 768 kHz gives 3000 Hz bins, where the requested 200 Hz rounds up to one bin and only the floor
         // keeps the claim off Nyquist itself.
+        // (The low extreme was 1000 Hz, with its own scaled-down parameters because every frequency parameter is
+        // bounded by the rate. It is the core's floor now, P51, where the defaults already fit.)
         struct EmptyCase { double fs; int order; };
         const EmptyCase emptyCases[] = { { kFs, 8 }, { kFs, 9 }, { kFs, 10 }, { kFs, 12 },
-                                         { 768000.0, 8 }, { 768000.0, 10 }, { 1000.0, 8 } };
+                                         { 768000.0, 8 }, { 768000.0, 10 }, { SourceForensics::kMinSampleRate, 8 } };
         for (const auto& ec : emptyCases)
         {
             SourceForensics probe;
             auto q = defaults();
             q.fftOrder = ec.order;
-            if (ec.fs < 4000.0)                                  // every frequency parameter is bounded by
-            {                                                    // the rate, so a 1 kHz stream needs its own
-                q.cellWidthHz = ec.fs / 960.0;
-                q.plateauSpanHz = ec.fs / 24.0;
-                q.floorSpanHz = ec.fs / 24.0;
-                q.searchFromHz = ec.fs / 48.0;
-                q.emptyMinHz = ec.fs / 240.0;
-                q.maxTransitionHz = ec.fs / 32.0;      // this one is a frequency too, and 1500 > 1000 Hz
-            }
             probe.setParams (q);
             const std::string tg = "empty-floor fs=" + std::to_string ((int) ec.fs)
                                  + " order=" + std::to_string (ec.order) + ": ";
@@ -1891,7 +1884,10 @@ int main()
         sf.setParams (p);
         ok (! sf.prepare (0.0, 64, 1), "refuse: a zero sample rate");
         ok (! sf.prepare (std::numeric_limits<double>::infinity(), 64, 1), "refuse: a non-finite sample rate");
-        ok (! sf.prepare (999.0, 64, 1), "refuse: a sample rate below the floor");
+        ok (! sf.prepare (std::nextafter (SourceForensics::kMinSampleRate, 0.0), 64, 1), "refuse: one ulp below the rate floor");
+        ok (! sf.prepare (44.1, 64, 1), "refuse: a rate in kilohertz");
+        ok (SourceForensics::kMinSampleRate == 8000.0 && run (sf.prepare (8000.0, 64, 1)),
+            "the floor is 8000 Hz (P51), and 8000 itself is accepted");
         ok (! sf.prepare (kFs, 64, 0), "refuse: zero channels");
         ok (! sf.prepare (kFs, 64, core::kMaxChannels + 1), "refuse: too many channels");
         ok (! SourceForensics::storageFor (kFs, 0, p).ok, "refuse: storageFor agrees about the channel count");

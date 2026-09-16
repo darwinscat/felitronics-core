@@ -25,8 +25,8 @@
 //     8/(3N) by Parseval, bandRangeShare() is the fraction of Nyquist the bands cover (1.1345 % at the
 //     defaults), peakShare() is the widest band's width over the range's, and the grid's own tilt is
 //     10*log10(2^(20/12)) = 5.0172 dB — all closed forms, none of them read off the implementation.
-//   · THE EXACT HISTOGRAM CONTENTS on a 61-sample fixture: bin 50 holds 61 SAMPLES, which is what
-//     separates duration-weighting from one-count-per-block (2) and from a full-weighted partial (120).
+//   · THE EXACT HISTOGRAM CONTENTS on a 121-sample fixture: bin 50 holds 121 SAMPLES, which is what
+//     separates duration-weighting from one-count-per-block (2) and from a full-weighted partial (240).
 //   · THE CROSSOVER'S EDGE: |H|^2 = 1/4 in each branch at fc, so low + high is HALF the input power,
 //     which is the LR4 allpass caveat stated as a number rather than a warning.
 //
@@ -45,7 +45,8 @@
 //     window end, a StateGrid tick (64) and a block edge; and across three prepared maxBlock values.
 //
 // MUTANT PASS — run once, not asserted, and recorded here because a gate that has never been red is not
-// a gate. Each mutant was built with the object file DELETED first: a header edited in the same SECOND
+// a gate. (Run on the suite's pre-P51 geometry, 6 kHz / order 14; see kFs for the move to 12 kHz.)
+// Each mutant was built with the object file DELETED first: a header edited in the same SECOND
 // as the previous build is invisible to make's 1-second mtime granularity, and the stand refuses a
 // verdict unless a `Building CXX` line appeared (this cost three false greens elsewhere today).
 //   ( 1) frame consumed at the end of process() instead of on the sample that closed it -> RED, 34 of 492
@@ -97,6 +98,16 @@ namespace
 {
 
 constexpr double kPi = core::kPi;
+
+// The test geometry: fs = 12000 with fftOrder 15 gives 0.3662 Hz bins — the SAME bin width, and so the same
+// semitone-vs-lobe geometry, as the default 2^17 at 48 kHz, for 1/4 of the samples.
+// IT WAS 6000 Hz / order 14 until P51 put the core's rate floor at 8000 Hz. The suite moved by a factor of two in
+// the SAMPLE GRID: every order is one higher, every sample count twice what it was, a 10 ms block is 120 samples
+// instead of 60 — so every bin width, window in seconds, band extent and block duration is what the fixtures were
+// designed against. The exceptions are the rows that ran at the lowest accepted rate, 1 kHz: they run at 8 kHz now
+// (the centroid sweep, the crossover's edge, the largest geometry), with their own orders.
+constexpr double kFs = 12000.0;
+constexpr std::int64_t kB = 120;                 // lround (0.01 * kFs): one 10 ms block
 
 //==============================================================================
 // --- the outside oracles ---
@@ -164,6 +175,44 @@ void dftBand (const std::vector<float>& x, std::size_t from, int n, double fs,
 //==============================================================================
 // --- fixtures ---
 
+// Gaussian noise as the 6 kHz suite drew it — the same draws from the same seed, one per 6 kHz sample — and
+// interpolated x2 to kFs by a Kaiser-windowed sinc (beta 8, 24 taps each side; exact on the 6 kHz grid). Drawn at
+// 12 kHz instead, the noise would keep its variance and spread it over twice the band: every per-bin level 3 dB
+// lower and a different realisation, which is what the band-statistics rows below were balanced on.
+std::vector<float> designRateNoise (std::size_t n, unsigned seed, float sigma)
+{
+    constexpr int up = 2, half = 24;
+    constexpr double beta = 8.0;
+    const std::size_t m = (n + up - 1) / up;
+    std::mt19937 rng (seed);
+    std::normal_distribution<float> g (0.0f, sigma);
+    std::vector<double> base (m);
+    for (auto& v : base) v = (double) g (rng);
+    auto i0 = [] (double z) { double sum = 1.0, term = 1.0; for (int k = 1; k < 40; ++k)
+                              { term *= (z / (2.0 * k)) * (z / (2.0 * k)); sum += term; } return sum; };
+    double h[2 * half] {};                                   // the half-sample phase; phase 0 is the identity
+    for (int j = 0; j < 2 * half; ++j)
+    {
+        const double t = (double) (j - half + 1) - 0.5;
+        const double x = t / half;
+        h[j] = std::sin (kPi * t) / (kPi * t) * i0 (beta * std::sqrt (std::max (0.0, 1.0 - x * x))) / i0 (beta);
+    }
+    std::vector<float> out (n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const long k0 = (long) (i / up);
+        if (i % up == 0) { out[i] = (float) base[(std::size_t) k0]; continue; }
+        double acc = 0.0;
+        for (int j = 0; j < 2 * half; ++j)
+        {
+            const long k = k0 + (long) j - half + 1;
+            if (k >= 0 && k < (long) m) acc += base[(std::size_t) k] * h[j];
+        }
+        out[i] = (float) acc;
+    }
+    return out;
+}
+
 struct Stereo { std::vector<float> l, r; };
 
 // Non-stationary and structured, with a fixed seed: a flat tone is a weak witness of invariance.
@@ -176,10 +225,10 @@ Stereo fixture (std::size_t n, unsigned seed, std::int64_t hop, std::int64_t win
     s.l.assign (n, 0.0f); s.r.assign (n, 0.0f);
     for (std::size_t i = 0; i < n; ++i)
     {
-        const double t = (double) i / 6000.0;
+        const double t = (double) i / kFs;
         const double env = i < n / 11 ? 0.0                                 // lead silence
                          : i > n * 9 / 10 ? 0.01                            // a quiet tail
-                         : (i % 4801 < 200 ? 1.0 : 0.3);                    // bursts against a bed
+                         : (i % 9602 < 400 ? 1.0 : 0.3);                    // bursts against a bed
         const double bass = 0.6 * std::sin (2.0 * kPi * 82.41 * t) + 0.25 * std::sin (2.0 * kPi * 123.9 * t);
         const double mid  = 0.3 * std::sin (2.0 * kPi * 517.0 * t);
         s.l[i] = (float) (env * (bass + mid + 0.15 * (double) u (rng)));
@@ -355,11 +404,8 @@ int main()
     using test::ok;
     using test::approx;
 
-    // The test geometry: fs = 6000 with fftOrder 14 gives 0.3662 Hz bins — the SAME bin width, and so
-    // the same semitone-vs-lobe geometry, as the default 2^17 at 48 kHz, for 1/8 of the samples.
-    constexpr double kFs = 6000.0;
     LowEndParams base;
-    base.fftOrder = 14;                 // N = 16384, 2.73 s at 6 kHz
+    base.fftOrder = 15;                 // N = 32768, 2.73 s at 12 kHz
     base.hop = 0;                       // N/2
     base.crossoverHz = 120.0;
     base.maxBlocks = 1 << 14;
@@ -370,7 +416,7 @@ int main()
         const LowEnd::Storage st = LowEnd::storageFor (kFs, 2, base);
         ok (st.ok, "storageFor accepts the default geometry");
         ok (st.bandCount == 40, "30..300 Hz at A4=440 is 40 semitone bands (MIDI 23..62), got " + std::to_string (st.bandCount));
-        ok (st.blockSamples == 60, "10 ms at 6 kHz is lround(0.01*fs) = 60 samples, got " + std::to_string (st.blockSamples));
+        ok (st.blockSamples == 120, "10 ms at 12 kHz is lround(0.01*fs) = 120 samples, got " + std::to_string (st.blockSamples));
         ok (st.frames.ok && st.frames.bytes() > 0, "the nested SpectrumFrames ask is part of the budget");
         ok (st.bytes() > st.frames.bytes(), "the total exceeds the nested part");
         ok (st.accDoubles == 3u * (std::size_t) st.bandCount, "three per-band accumulators are budgeted");
@@ -385,6 +431,9 @@ int main()
         LowEndParams p = base;
         ok (! LowEnd::storageFor (0.0, 2, p).ok, "sampleRate 0 refused");
         ok (! LowEnd::storageFor (std::numeric_limits<double>::quiet_NaN(), 2, p).ok, "NaN sampleRate refused");
+        ok (! LowEnd::storageFor (std::nextafter (LowEnd::kMinSampleRate, 0.0), 2, p).ok && ! LowEnd::storageFor (44.1, 2, p).ok,
+            "one ulp under the rate floor refused, and a rate in kilohertz (P51)");
+        ok (LowEnd::kMinSampleRate == 8000.0 && LowEnd::storageFor (8000.0, 2, p).ok, "the floor is 8000 Hz, and 8000 itself is accepted");
         ok (! LowEnd::storageFor (kFs, 0, p).ok, "0 channels refused");
         ok (! LowEnd::storageFor (kFs, core::kMaxChannels + 1, p).ok, "too many channels refused");
         p = base; p.crossoverHz = std::numeric_limits<double>::quiet_NaN();
@@ -426,11 +475,11 @@ int main()
         // an OUTSIDE oracle on the weight table's SIZE: storageFor() and buildBands() reach the same
         // count through two different expressions, so the count is computed here a third way.
         {
-            for (int order : { 4, 8, 12, 14 })
+            for (int order : { 5, 9, 13, 15 })
             {
                 LowEndParams q = base; q.fftOrder = order;
                 const LowEnd::Storage st3 = LowEnd::storageFor (kFs, 2, q);
-                if (! st3.ok) continue;
+                if (! st3.ok) { ok (false, "storageFor refused order " + std::to_string (order)); continue; }
                 const std::int64_t nn = (std::int64_t) 1 << order;
                 const double bh = kFs / (double) nn;
                 const int bins = (int) (nn / 2 + 1);
@@ -461,7 +510,7 @@ int main()
     //==========================================================================
     test::group ("the width matrix — silence, mono, hard-left, anti-phase");
     {
-        const std::size_t n = 3000;                     // 0.5 s: 50 blocks, shorter than one window
+        const std::size_t n = 6000;                     // 0.5 s: 50 blocks, shorter than one window
         LowEndParams p = base;
         struct Case { const char* name; double lgain, rgain; double wantFrac; bool wantValid; };
         const Case cases[] = {
@@ -692,7 +741,7 @@ int main()
         // A tone exactly at the centre of the LOWEST band, where the semitone is only 4.87 bins wide.
         LowEndParams p = base;
         const double c0 = noteHzOf (23, 440.0);                    // B0, 30.8677 Hz
-        const std::size_t n = 1u << 15;                            // two frames at hop N/2
+        const std::size_t n = 1u << 16;                            // two frames at hop N/2
         Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
         for (std::size_t i = 0; i < n; ++i)
         {
@@ -716,11 +765,11 @@ int main()
         ok (centroidsOutsideTheirBand (le) == 0, "every band's centroid lies inside its own semitone");
 
         // the same tone one order LOWER does not resolve the bottom, and the report says so
-        LowEndParams q = base; q.fftOrder = 12;
+        LowEndParams q = base; q.fftOrder = 13;
         LowEnd lo; lo.setParams (q);
-        ok (test::run (lo.prepare (kFs, 1 << 13, 2)) && test::run (feed (lo, x, 2)), "prepare+feed at order 12");
+        ok (test::run (lo.prepare (kFs, 1 << 13, 2)) && test::run (feed (lo, x, 2)), "prepare+feed at order 13");
         ok (lo.underResolvedBands() > 0,
-            "at order 12 the low bands are narrower than the lobe, and underResolvedBands() names it: "
+            "at order 13 the low bands are narrower than the lobe, and underResolvedBands() names it: "
             + std::to_string (lo.underResolvedBands()));
     }
 
@@ -728,8 +777,8 @@ int main()
     test::group ("the band fold against a direct DFT");
     {
         LowEndParams p = base;
-        p.fftOrder = 12;                                    // N = 4096: one frame, and an O(N^2) DFT is affordable
-        const std::size_t n = 1u << 12;                     // exactly one frame, [0, N)
+        p.fftOrder = 13;                                    // N = 8192: one frame, and an O(N^2) DFT is affordable
+        const std::size_t n = 1u << 13;                     // exactly one frame, [0, N)
         std::mt19937 rng (20260914u);
         std::uniform_real_distribution<float> u (-0.5f, 0.5f);
         Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
@@ -769,7 +818,7 @@ int main()
     test::group ("the dominant note — placement, the runner-up, the centroid's cents");
     {
         LowEndParams p = base;
-        const std::size_t n = 1u << 15;
+        const std::size_t n = 1u << 16;
         // E2 (MIDI 40) loud, A2 (MIDI 45) quieter: the peak and the runner-up are both known
         const double e2 = noteHzOf (40, 440.0), a2 = noteHzOf (45, 440.0);
         Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
@@ -834,10 +883,9 @@ int main()
         // energy than the median band, with no note present. This is why the background is a median of
         // DENSITIES and why the density argmax is published beside the energy argmax.
         {
-            std::mt19937 rng (7u);
-            std::normal_distribution<float> g (0.0f, 0.25f);
-            Stereo y; y.l.assign (n, 0.0f); y.r.assign (n, 0.0f);
-            for (std::size_t i = 0; i < n; ++i) { const float v = g (rng); y.l[i] = v; y.r[i] = v; }
+            Stereo y;
+            y.l = designRateNoise (n, 7u, 0.25f);
+            y.r = y.l;
             LowEnd d; d.setParams (p);
             ok (test::run (d.prepare (kFs, 1 << 13, 2)) && test::run (feed (d, y, 2)), "prepare+feed white noise");
             const double top = d.band (d.bandCount() - 1).energy, bottom = d.band (0).energy;
@@ -853,6 +901,10 @@ int main()
             for (int b = 0; b < d.bandCount(); ++b) if (b != d.peakBand()) dens.push_back (d.band (b).density);
             std::sort (dens.begin(), dens.end());
             const std::size_t k = dens.size();
+            // A refused prepare leaves no bands, and a median of nothing is an out-of-range read — which is how the
+            // P51 rate floor first showed up in this suite: a segfault that hid every later failure. Said, not read.
+            ok (k >= 2, "the table has bands to take a median of (" + std::to_string (k) + ")");
+            if (k < 2) return test::report();
             const double wantMedian = (k % 2) == 1 ? dens[k / 2] : 0.5 * (dens[k / 2 - 1] + dens[k / 2]);
             ok (std::bit_cast<std::uint64_t> (d.backgroundDensity()) == std::bit_cast<std::uint64_t> (wantMedian),
                 "backgroundDensity() is bit-exactly the median DENSITY of the non-peak bands");
@@ -870,10 +922,10 @@ int main()
     test::group ("law 8a — the trace AND the whole report, bit-exact under 16 slicings and 3 maxBlocks");
     {
         LowEndParams p = base;
-        p.fftOrder = 14;
+        p.fftOrder = 15;
         p.maxBlocks = 1 << 12;
-        const std::int64_t W = 1 << 14, H = W / 2, B = 60;
-        const std::size_t n = (std::size_t) (W + H + 4321);         // several frames, a ragged tail
+        const std::int64_t W = 1 << 15, H = W / 2, B = kB;
+        const std::size_t n = (std::size_t) (W + H + 8642);         // several frames, a ragged tail
         const Stereo x = fixture (n, 424242u, H, W, B);
 
         const std::vector<std::vector<int>> slicings = {
@@ -885,7 +937,7 @@ int main()
             { (int) W + 1 },                                        // larger than any maxBlock below
             { 64 },                                                 // every call boundary IS a StateGrid tick
             { 63, 1, 129, 5 },                                      // boundaries straddling the grid
-            { 5, 1, 4000, 13, 1, 777, 2 },                          // ragged, fixed
+            { 5, 1, 8000, 13, 1, 1554, 2 },                         // ragged, fixed
             { (int) H, 1, (int) B, 3, (int) W, 11 },                // boundaries ON hop / block / window ends
         };
         const std::vector<std::uint64_t> want = run (x, p, kFs, 2, slicings[0], 1 << 13);
@@ -918,14 +970,14 @@ int main()
     //==========================================================================
     test::group ("the tail, and the lengths around every boundary");
     {
-        LowEndParams p = base; p.fftOrder = 12;                     // W = 4096, H = 2048
-        const std::int64_t W = 1 << 12, H = W / 2, B = 60;
+        LowEndParams p = base; p.fftOrder = 13;                     // W = 8192, H = 4096
+        const std::int64_t W = 1 << 13, H = W / 2, B = kB;
         for (std::int64_t T : { (std::int64_t) 0, (std::int64_t) 1, B - 1, B, B + 1,
                                 W - 1, W, W + H - 1, W + H, W + H + 1 })
         {
             const Stereo x = fixture ((std::size_t) std::max<std::int64_t> (T, 1), 9u, H, W, B);
             LowEnd le; le.setParams (p);
-            ok (test::run (le.prepare (kFs, 1 << 12, 2)), "prepare");
+            ok (test::run (le.prepare (kFs, 1 << 13, 2)), "prepare");
             if (T > 0)
             {
                 const float* pl[2] = { x.l.data(), x.r.data() };
@@ -965,25 +1017,25 @@ int main()
     //==========================================================================
     test::group ("holes — non-finite samples, a filter overflow, and a channel that disappears");
     {
-        LowEndParams p = base; p.fftOrder = 12;
-        const std::int64_t W = 1 << 12;
+        LowEndParams p = base; p.fftOrder = 13;
+        const std::int64_t W = 1 << 13;
         const std::size_t n = (std::size_t) (2 * W);
         {
-            Stereo x = fixture (n, 5u, W / 2, W, 60);
-            x.l[100] = std::numeric_limits<float>::quiet_NaN();
-            x.r[201] = std::numeric_limits<float>::infinity();
-            x.l[3000] = -std::numeric_limits<float>::infinity();
+            Stereo x = fixture (n, 5u, W / 2, W, kB);
+            x.l[200] = std::numeric_limits<float>::quiet_NaN();
+            x.r[402] = std::numeric_limits<float>::infinity();
+            x.l[6000] = -std::numeric_limits<float>::infinity();
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 1 << 13, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
             ok (le.nonFiniteSamples() == 3, "three non-finite samples counted, got " + std::to_string (le.nonFiniteSamples()));
             ok (le.holeSamples() == 3, "and they are the three holes");
             ok (le.finiteSamples() == (std::int64_t) n - 3, "the rest reached the accumulators");
-            ok (le.firstHoleSample() == 100 && le.lastHoleSample() == 3000, "the hole coordinates are published");
+            ok (le.firstHoleSample() == 200 && le.lastHoleSample() == 6000, "the hole coordinates are published");
             ok (std::isfinite (le.lowSideEnergy()) && std::isfinite (le.lowMidEnergy()),
                 "no non-finite value reached an accumulator");
             ok (le.widthValid(), "the width is still measured from what was usable");
             // the block holding a hole is marked, and its neighbours are not
-            const analysis::LowEndBlock holed = le.block (100 / 60);
+            const analysis::LowEndBlock holed = le.block (200 / kB);
             ok (! holed.valid && holed.holes == 1, "the block holding the NaN is marked invalid with its hole count");
             ok (le.block (0).valid, "and block 0 is untouched");
             // a frame holding a hole is discarded whole, not guessed
@@ -992,9 +1044,9 @@ int main()
         }
         // a FILTER overflow from finite input: 3e38 is finite, its square is not, and neither is l+r
         {
-            Stereo x; x.l.assign (2000, 0.0f); x.r.assign (2000, 0.0f);
-            for (std::size_t i = 0; i < 2000; ++i) { x.l[i] = 0.1f; x.r[i] = 0.1f; }
-            x.l[500] = 3.0e38f; x.r[500] = 3.0e38f;                 // l+r overflows float inside encode()
+            Stereo x; x.l.assign (4000, 0.0f); x.r.assign (4000, 0.0f);
+            for (std::size_t i = 0; i < 4000; ++i) { x.l[i] = 0.1f; x.r[i] = 0.1f; }
+            x.l[1000] = 3.0e38f; x.r[1000] = 3.0e38f;               // l+r overflows float inside encode()
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
             ok (le.holeSamples() >= 1, "a finite input whose Mid/Side ENCODE overflows is a hole, counted");
@@ -1008,9 +1060,9 @@ int main()
         // squared — and in float (1.7e38)^2 is an infinity, so a square taken before the promotion to
         // double would publish one.
         {
-            const std::size_t m = 600;
+            const std::size_t m = 1200;
             Stereo x; x.l.assign (m, 0.0f); x.r.assign (m, 0.0f);
-            for (std::size_t i = 200; i < 260; ++i) { x.l[i] = 1.7e38f; x.r[i] = -1.7e38f; }
+            for (std::size_t i = 400; i < 520; ++i) { x.l[i] = 1.7e38f; x.r[i] = -1.7e38f; }
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
             ok (le.holeSamples() == 0, "1.7e38 anti-phase survives the encode: not a hole");
@@ -1023,27 +1075,27 @@ int main()
         }
         // a channel that disappears mid-stream is a hole for those samples, not a mono reading
         {
-            Stereo x = fixture (1200, 6u, 2048, 4096, 60);
+            Stereo x = fixture (2400, 6u, 4096, 8192, kB);
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, 2)), "prepare");
             const float* both[2] = { x.l.data(), x.r.data() };
-            const float* one[1] = { x.l.data() + 600 };
-            ok (test::run (le.process (both, 2, 600)), "600 stereo samples");
-            ok (test::run (le.process (one, 1, 600)), "then 600 with only the left channel");
+            const float* one[1] = { x.l.data() + 1200 };
+            ok (test::run (le.process (both, 2, 1200)), "1200 stereo samples");
+            ok (test::run (le.process (one, 1, 1200)), "then 1200 with only the left channel");
             ok (test::run (le.finish()), "finish");
-            ok (le.absentSamples() == 600, "the 600 samples missing their right channel are ABSENT, counted apart from non-finite: "
+            ok (le.absentSamples() == 1200, "the 1200 samples missing their right channel are ABSENT, counted apart from non-finite: "
                 + std::to_string (le.absentSamples()));
             ok (le.nonFiniteSamples() == 0, "and none of them is called a non-finite sample");
-            ok (le.finiteSamples() == 600, "only the stereo half reached the accumulators — a missing R is NOT R = 0, which would read 50 % wide");
+            ok (le.finiteSamples() == 1200, "only the stereo half reached the accumulators — a missing R is NOT R = 0, which would read 50 % wide");
         }
     }
 
     //==========================================================================
     test::group ("capacity exhaustion is data — the prefix, the flag, and the counters that keep going");
     {
-        LowEndParams p = base; p.fftOrder = 12; p.maxBlocks = 5;
-        const std::size_t n = 1200;                                  // 20 blocks of 60
-        const Stereo x = fixture (n, 11u, 2048, 4096, 60);
+        LowEndParams p = base; p.fftOrder = 13; p.maxBlocks = 5;
+        const std::size_t n = 2400;                                  // 20 blocks of 120
+        const Stereo x = fixture (n, 11u, 4096, 8192, kB);
         LowEnd le; le.setParams (p);
         ok (test::run (le.prepare (kFs, 4096, 2)), "prepare with room for 5 blocks");
         const float* pl[2] = { x.l.data(), x.r.data() };
@@ -1052,7 +1104,7 @@ int main()
         ok (le.blockCount() == 20, "every block was counted: " + std::to_string (le.blockCount()));
         ok (le.storedBlockCount() == 5, "five were stored");
         ok (! le.blocksComplete(), "and the report says the series is a prefix");
-        ok (le.histogramSamples() > 5 * 60, "the histogram kept accumulating past the capacity: "
+        ok (le.histogramSamples() > 5 * kB, "the histogram kept accumulating past the capacity: "
             + std::to_string (le.histogramSamples()));
         ok (le.worstFractionBlock() >= 0, "and so did the extrema");
         ok (le.widthValid(), "the measurement was not abandoned");
@@ -1069,7 +1121,7 @@ int main()
     //==========================================================================
     test::group ("the extrema are three different questions, and ties go to the earliest");
     {
-        LowEndParams p = base; p.fftOrder = 12;
+        LowEndParams p = base; p.fftOrder = 13;
         // THREE REGIMES, 20 blocks each, because an LR4 RINGS ACROSS BLOCK BOUNDARIES: a loud block's
         // tail dominates the mid energy of the quiet block right after it, so a one-block regime does
         // not measure what it looks like it measures. The coordinates are read from the SETTLED middle.
@@ -1077,7 +1129,7 @@ int main()
         //   blocks 20..39  quiet ANTI-PHASE   -> fraction 1,   energy 5e-5
         //   blocks 40..59  loud HALF-PANNED   -> fraction 0.5, energy 0.25, and the largest SIDE energy
         // so each of the three extrema is won by a different regime, by construction.
-        const std::int64_t B = 60;
+        const std::int64_t B = kB;
         const std::size_t n = (std::size_t) (60 * B);
         Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
         for (std::size_t i = 0; i < n; ++i)
@@ -1141,12 +1193,12 @@ int main()
     //==========================================================================
     test::group ("the hostile corners of the parameter space that storageFor() still ACCEPTS");
     {
-        const std::size_t n = 2400;
-        const Stereo x = fixture (n, 13u, 2048, 4096, 60);
+        const std::size_t n = 4800;
+        const Stereo x = fixture (n, 13u, 4096, 8192, kB);
         // maxBlocks == 0: a legal capacity. Nothing is stored, everything is still counted, and no
         // accessor reads past an empty vector.
         {
-            LowEndParams p = base; p.fftOrder = 12; p.maxBlocks = 0;
+            LowEndParams p = base; p.fftOrder = 13; p.maxBlocks = 0;
             ok (LowEnd::storageFor (kFs, 2, p).ok, "maxBlocks 0 is accepted");
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
@@ -1185,7 +1237,7 @@ int main()
         }
         // hop == N (no overlap at all), fed through the widest channel count the core allows
         {
-            LowEndParams p = base; p.fftOrder = 12; p.hop = 1 << 12;
+            LowEndParams p = base; p.fftOrder = 13; p.hop = 1 << 13;
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, core::kMaxChannels)), "prepare for kMaxChannels");
             std::vector<std::vector<float>> ch ((std::size_t) core::kMaxChannels, std::vector<float> (n, 0.0f));
@@ -1197,7 +1249,7 @@ int main()
             ok (test::run (le.process (pp.data(), core::kMaxChannels, (int) n)) && test::run (le.finish()), "feed 16 channels");
             ok (le.analysedChannels() == 2, "only the L/R pair was analysed — channels 2.. take no part");
             ok (le.usedFrames() + le.holedFrames() == 0,
-                "2400 samples cannot fill a 4096 window, so no frame closed at all");
+                "4800 samples cannot fill an 8192 window, so no frame closed at all");
             ok (le.noteReason() == LowEndReason::ShorterThanWindow, "…and the note report says exactly that");
             ok (le.widthValid(), "while the TIME path measured every sample, as it has no window");
         }
@@ -1207,14 +1259,15 @@ int main()
     test::group ("the centroid invariant across the geometries most likely to break it");
     {
         // Constant DC (all the energy at 0 Hz, i.e. OUTSIDE every band, pushing every band onto its own
-        // lower edge), at five window orders and three sample rates — 1 kHz is the lowest the instrument
-        // accepts, where 300 Hz is a third of Nyquist and the bands are enormous in bin terms.
+        // lower edge), at four window orders and three sample rates — 8 kHz is the lowest the instrument
+        // accepts (P51; it was 1 kHz, where 300 Hz was a third of Nyquist), and at order 4 its bin is 500 Hz, so
+        // the 30..300 Hz range lies in bin 0's half cell [0, 250) and the lower edge of bin 1.
         int bad = 0, cases = 0;
-        for (double fs : { 1000.0, 8000.0, 48000.0 })
+        for (double fs : { 8000.0, 16000.0, 48000.0 })
             for (int order : { 4, 6, 8, 12 })
             {
                 LowEndParams p = base; p.fftOrder = order;
-                if (! LowEnd::storageFor (fs, 2, p).ok) continue;
+                if (! LowEnd::storageFor (fs, 2, p).ok) { ok (false, "the sweep's geometry was refused"); continue; }
                 LowEnd le; le.setParams (p);
                 if (! le.prepare (fs, 4096, 2)) { ++bad; continue; }
                 const std::size_t n = (std::size_t) (1u << order) * 3u;
@@ -1223,7 +1276,7 @@ int main()
                 bad += centroidsOutsideTheirBand (le);
                 ++cases;
             }
-        ok (cases >= 10, "the sweep covered " + std::to_string (cases) + " geometries");
+        ok (cases == 12, "the sweep covered " + std::to_string (cases) + " geometries");
         ok (bad == 0, "no band with energy puts its centroid outside its own semitone, and no empty band"
             " claims a frequency: " + std::to_string (bad) + " violations");
     }
@@ -1307,9 +1360,9 @@ int main()
         }
         // the denormal floor also falsifies "digital silence is the ONE place width reads NoEnergy"
         {
-            Stereo x; x.l.assign (4096, std::bit_cast<float> ((std::uint32_t) 1u));
+            Stereo x; x.l.assign (8192, std::bit_cast<float> ((std::uint32_t) 1u));
             x.r = x.l;
-            LowEnd q; LowEndParams pp = base; pp.fftOrder = 12; q.setParams (pp);
+            LowEnd q; LowEndParams pp = base; pp.fftOrder = 13; q.setParams (pp);
             ok (test::run (q.prepare (kFs, 4096, 2)) && test::run (feed (q, x, 2)), "prepare+feed");
             ok (q.rawMidEnergy() > 0.0, "the RAW energy of a 2^-149 programme is positive");
             ok (std::bit_cast<std::uint64_t> (q.lowMidEnergy()) == std::bit_cast<std::uint64_t> (0.0),
@@ -1348,21 +1401,21 @@ int main()
     //==========================================================================
     test::group ("the histogram is duration-weighted, asserted on its exact contents");
     {
-        // 61 samples at 6 kHz: blocks of 60 and 1. L = 1, R = 0 makes Mid and Side identical inputs to
+        // 121 samples at 12 kHz: blocks of 120 and 1. L = 1, R = 0 makes Mid and Side identical inputs to
         // two identical filter columns, so their energies are bit-equal and the fraction is EXACTLY 0.5
         // at every sample. One count per block would give 2; weighting the partial block as full would
-        // give 120; the duration-weighted answer is 61.
-        LowEndParams p = base; p.fftOrder = 12;
-        Stereo x; x.l.assign (61, 1.0f); x.r.assign (61, 0.0f);
+        // give 240; the duration-weighted answer is 121.
+        LowEndParams p = base; p.fftOrder = 13;
+        Stereo x; x.l.assign (121, 1.0f); x.r.assign (121, 0.0f);
         LowEnd le; le.setParams (p);
         ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
         ok (le.blockCount() == 2, "two blocks");
-        ok (le.block (0).samples == 60 && le.block (1).samples == 1, "of 60 and 1 samples");
+        ok (le.block (0).samples == 120 && le.block (1).samples == 1, "of 120 and 1 samples");
         ok (std::bit_cast<std::uint64_t> (le.block (0).midEnergy) == std::bit_cast<std::uint64_t> (le.block (0).sideEnergy),
             "Mid and Side are BIT-equal, so the fraction is exactly 0.5 — the premise");
-        ok (le.histogram (50) == 61, "histogram bin 50 holds 61 SAMPLES (not 2 blocks, not 120), got "
+        ok (le.histogram (50) == 121, "histogram bin 50 holds 121 SAMPLES (not 2 blocks, not 240), got "
             + std::to_string (le.histogram (50)));
-        ok (le.histogramSamples() == 61, "and the total weight is 61");
+        ok (le.histogramSamples() == 121, "and the total weight is 121");
         std::int64_t elsewhere = 0;
         for (int b = 0; b < LowEnd::kHistogramBins; ++b) if (b != 50) elsewhere += le.histogram (b);
         ok (elsewhere == 0, "every other bin is empty");
@@ -1373,13 +1426,15 @@ int main()
     {
         // The claim the header makes about the LR4 allpass, measured: |H_lp|^2 = |H_hp|^2 = 1/4 at fc, so
         // each branch carries an eighth of a unit sine's mean square and the two POWERS sum to a half.
-        for (double fc : { 20.0, 490.0 })
+        // At the lowest accepted rate, with a low crossover (20 Hz) and one at the top of the range (0.49 fs). (It was
+        // 1 kHz with 490 Hz before P51.)
+        for (double fc : { 20.0, 3920.0 })
         {
-            constexpr double fs = 1000.0;
+            constexpr double fs = 8000.0;
             LowEndParams p = base; p.fftOrder = 12; p.crossoverHz = fc;
             p.lowNoteHz = 30.0; p.highNoteHz = 300.0;
             if (! LowEnd::storageFor (fs, 2, p).ok) { ok (false, "storageFor refused fc " + std::to_string (fc)); continue; }
-            const std::size_t n = 40000;
+            const std::size_t n = 320000;
             Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
             for (std::size_t i = 0; i < n; ++i)
             {
@@ -1424,8 +1479,8 @@ int main()
     //==========================================================================
     test::group ("musical material — a moving bass line, harmonics, and a note on the band boundary");
     {
-        LowEndParams p = base; p.fftOrder = 14; p.hop = 1 << 14;      // hop == N: one frame per window, no overlap
-        const std::int64_t N = 1 << 14;
+        LowEndParams p = base; p.fftOrder = 15; p.hop = 1 << 15;      // hop == N: one frame per window, no overlap
+        const std::int64_t N = 1 << 15;
         // A MOVING LINE. Six non-overlapping frames: E1 three times, B1 twice, E2 once. A bin-centred
         // Hann tone contributes exactly 1/2 to its own band, and frames are averaged LINEARLY, so the
         // energies must be 3/6, 2/6 and 1/6 of a half. Summing frames, or averaging in dB, gives neither.
@@ -1501,11 +1556,17 @@ int main()
     test::group ("a kick drum is reported as the band it lands in, and nothing calls it wrong");
     {
         // The trap the request named. A kick's fundamental is not a note but lives in the same bins.
-        LowEndParams p = base; p.fftOrder = 14; p.hop = 1 << 14;
-        const std::int64_t N = 1 << 14;
+        LowEndParams p = base; p.fftOrder = 15; p.hop = 1 << 15;
+        const std::int64_t N = 1 << 15;
         Stereo x; x.l.assign ((std::size_t) N, 0.0f); x.r.assign ((std::size_t) N, 0.0f);
         const std::int64_t n0 = N / 4;
-        x.l[(std::size_t) n0] = 1.0f; x.r[(std::size_t) n0] = 1.0f;          // the click
+        // THE CLICK is 2, not 1. A bin's power is |X_k|^2 / (N sum w^2): for an impulse |X_k|^2 = A^2 w(n0)^2 does
+        // not grow with N, so its power per bin falls as A^2 / N^2, while a tone's |X_k|^2 grows as N^2 and its
+        // power does not move. The suite's N doubled with the move to 12 kHz, so a click of 2 is the click the
+        // 6 kHz suite measured against this kick. Measured: at 1.0 the background moved -15.0 %, at 2.0 -28.77 %,
+        // and the 6 kHz suite's own reading was -28.75 % — the margin over the 10 % bar is the row's, not the grid's.
+        const float click = 2.0f;
+        x.l[(std::size_t) n0] = click; x.r[(std::size_t) n0] = click;
         for (std::int64_t i = n0; i < N; ++i)
         {
             const double tt = (double) (i - n0) / kFs;
@@ -1524,7 +1585,7 @@ int main()
         // and the background median is TRANSIENT-sensitive, which is a property to know rather than hide
         {
             Stereo y = x;
-            y.l[(std::size_t) n0] -= 1.0f; y.r[(std::size_t) n0] -= 1.0f;      // the same kick, no click
+            y.l[(std::size_t) n0] -= click; y.r[(std::size_t) n0] -= click;    // the same kick, no click
             LowEnd q; q.setParams (p);
             ok (test::run (q.prepare (kFs, 1 << 13, 2)) && test::run (feed (q, y, 2)), "prepare+feed without the click");
             ok (q.peakMidi() == 33, "still A1");
@@ -1541,9 +1602,9 @@ int main()
         // The exclusion promise, tested by POISONING the extra channels rather than merely populating
         // them: a 16-channel run whose first two planes are bit-identical to a stereo run must produce a
         // bit-identical report, with no holes and no holed frames.
-        LowEndParams p = base; p.fftOrder = 12;
-        const std::size_t n = 3 * 4096;
-        Stereo x = fixture (n, 4242u, 2048, 4096, 60);
+        LowEndParams p = base; p.fftOrder = 13;
+        const std::size_t n = 3 * 8192;
+        Stereo x = fixture (n, 4242u, 4096, 8192, kB);
         std::vector<std::uint64_t> want, got;
         {
             LowEnd le; le.setParams (p);
@@ -1573,10 +1634,10 @@ int main()
     //==========================================================================
     test::group ("a channel that disappears and RETURNS, on the boundaries that matter");
     {
-        LowEndParams p = base; p.fftOrder = 12;                 // W = 4096, H = 2048, B = 60
-        const std::size_t n = 8192;
-        const Stereo x = fixture (n, 606u, 2048, 4096, 60);
-        for (std::int64_t hole : { (std::int64_t) 60, (std::int64_t) 64, (std::int64_t) 4096 })
+        LowEndParams p = base; p.fftOrder = 13;                 // W = 8192, H = 4096, B = 120
+        const std::size_t n = 16384;
+        const Stereo x = fixture (n, 606u, 4096, 8192, kB);
+        for (std::int64_t hole : { kB, (std::int64_t) 64, (std::int64_t) 8192 })
         {
             LowEnd le; le.setParams (p);
             ok (test::run (le.prepare (kFs, 4096, 2)), "prepare");
@@ -1592,7 +1653,7 @@ int main()
             ok (le.nonFiniteSamples() == 0, "and it is not called non-finite" + tag);
             ok (le.finiteSamples() == (std::int64_t) n - 1, "every other sample was measured" + tag);
             ok (le.firstHoleSample() == hole && le.lastHoleSample() == hole, "the coordinate is published" + tag);
-            ok (! le.block (hole / 60).valid && le.block (hole / 60).holes == 1,
+            ok (! le.block (hole / kB).valid && le.block (hole / kB).holes == 1,
                 "the block holding it is marked, and only that one" + tag);
             // the crossover was advanced with the canonical zero, so an EXPLICIT-zero reference must
             // agree bit for bit — that is what "a documented canonical hole" has to mean
@@ -1615,17 +1676,20 @@ int main()
         // fftOrder 22 at the lowest accepted rate: check the ARITHMETIC (shifts, counts, byte products)
         // without transforming 4 194 304 samples.
         LowEndParams p = base; p.fftOrder = 22;
-        const LowEnd::Storage st = LowEnd::storageFor (1000.0, 2, p);
-        ok (st.ok, "fftOrder 22 at 1 kHz is accepted");
+        // (The lowest accepted rate is the core's 8 kHz since P51; it was 1 kHz. The frame store does not depend
+        // on the rate: 2 axes x (4 + 1 + 8·½) bytes per point plus 8 + 16 per point once, and 16 for the two
+        // Nyquist-inclusive power rows — 176 160 784 at N = 2^22.)
+        const LowEnd::Storage st = LowEnd::storageFor (LowEnd::kMinSampleRate, 2, p);
+        ok (st.ok, "fftOrder 22 at 8 kHz is accepted");
         ok (st.bandCount == 40, "still 40 bands");
-        ok (st.blockSamples == 10, "10 ms at 1 kHz is 10 samples");
+        ok (st.blockSamples == 80, "10 ms at 8 kHz is 80 samples");
         ok (st.frames.bytes() == 176160784u, "the nested frame store is 176160784 bytes, got "
             + std::to_string (st.frames.bytes()));
         ok (st.bytes() > st.frames.bytes() && st.bytes() < (std::uint64_t) 1 << 31,
             "and the total is larger but still representable: " + std::to_string (st.bytes()));
         // the weight table's size against an independently computed count, at the extreme order
         const std::int64_t nn = (std::int64_t) 1 << 22;
-        const double bh = 1000.0 / (double) nn;
+        const double bh = LowEnd::kMinSampleRate / (double) nn;
         const int bins = (int) (nn / 2 + 1);
         std::size_t expect = 0;
         for (int b = 0; b < st.bandCount; ++b)
@@ -1641,9 +1705,9 @@ int main()
 
     test::group ("finish() is idempotent, process() refuses after it, reset() replays identically");
     {
-        LowEndParams p = base; p.fftOrder = 12;
-        const std::size_t n = 1u << 13;
-        const Stereo x = fixture (n, 31u, 2048, 4096, 60);
+        LowEndParams p = base; p.fftOrder = 13;
+        const std::size_t n = 1u << 14;
+        const Stereo x = fixture (n, 31u, 4096, 8192, kB);
         LowEnd le; le.setParams (p);
         ok (test::run (le.prepare (kFs, 4096, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
         std::vector<std::uint64_t> first;
@@ -1666,9 +1730,9 @@ int main()
     //==========================================================================
     test::group ("no allocation in process() or finish()");
     {
-        LowEndParams p = base; p.fftOrder = 12;
-        const std::size_t n = 1u << 13;
-        const Stereo x = fixture (n, 77u, 2048, 4096, 60);
+        LowEndParams p = base; p.fftOrder = 13;
+        const std::size_t n = 1u << 14;
+        const Stereo x = fixture (n, 77u, 4096, 8192, kB);
         LowEnd le; le.setParams (p);
         ok (test::run (le.prepare (kFs, 1024, 2)), "prepare (this is the one call that allocates)");
         const float* pl[2] = { x.l.data(), x.r.data() };

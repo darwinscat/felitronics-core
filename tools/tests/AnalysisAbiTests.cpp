@@ -397,17 +397,35 @@ void theShimQuotesTheCoreBudget()
         ok (m.query (48000u, 2.0) == 0.0,
             std::string (m.name) + "_storage_bytes(48000, 2) is refused — the first argument is the WIDTH");
 
-    // Each mode has its own admission floor, and they are not the same floor. A grid that only visits
-    // 44.1/48 kHz cannot tell the five apart at all, and a shim wired to the wrong analyzer would sail
-    // through it; these rows are where the five actually disagree about what they will measure.
+    // THE SHARED FLOOR (P51): every mode reads the core's 8000 Hz, so these rows sit on it from both sides for each
+    // of the five — a shim wired to the wrong analyzer, or an analyzer whose alias drifted, disagrees here first.
+    // Bursts is priced at neither: its own band floor lies above the shared one (next row).
+    const double floorHz = felitronics::core::kMinSampleRate, under = std::nextafter (floorHz, 0.0);
+    ok (floorHz == 8000.0, "the shared floor is 8000 Hz — a literal pin");
+    for (const Priced& m : priced)
+    {
+        const bool band = std::string (m.name) == "bursts";
+        ok (m.query (2u, under) == 0.0 && (band || m.query (2u, floorHz) > 0.0) && m.query (2u, 44.1) == 0.0,
+            std::string (m.name) + ": refused one ulp under 8000 Hz and at 44.1"
+            + (band ? " (and its own band floor is higher still)" : ", priced at 8000"));
+    }
+    // Each mode may ALSO have an admission floor of its own, above the shared one or below it. Only bursts' is above
+    // it at the parameters this ABI measures with; forensics' 2 kHz plateau span used to be the one below, and is
+    // now subsumed. A grid that only visits 44.1/48 kHz cannot see either.
     ok (fc_probe_bursts_storage_bytes (2u, 18367.0) == 0.0 && fc_probe_bursts_storage_bytes (2u, 18368.0) > 0.0,
         "bursts: refused at 18367 Hz and priced at 18368 — its own 9 kHz band decides that, not a shared bound");
-    ok (fc_probe_forensics_storage_bytes (2u, 1999.999) == 0.0 && fc_probe_forensics_storage_bytes (2u, 2000.0) > 0.0,
-        "forensics: refused at 1999.999 Hz and priced at 2000 — its 2 kHz plateau span decides that");
-    ok (fc_probe_hum_storage_bytes (1u, 1000.0) == 164912.0,
-        "hum(1, 1000) is exactly 164912 bytes — the rate is read as given, not rounded to an integer of hops");
-    ok (fc_probe_hum_storage_bytes (1u, 1000.5) == 164904.0,
-        "hum(1, 1000.5) is exactly 164904 — a FRACTIONAL rate, which a shim narrowing the rate would lose");
+    ok (fc_probe_forensics_storage_bytes (2u, 1999.999) == 0.0 && fc_probe_forensics_storage_bytes (2u, 2000.0) == 0.0,
+        "forensics: its 2 kHz plateau span no longer decides anything — the shared floor refuses both sides of it");
+    // A FRACTIONAL RATE, which a shim narrowing the rate to an integer would lose — and chosen so that it loses it
+    // whichever way it narrows. With N = 2^15 (the AUTO order at these rates) and bin = fs / N:
+    //   bandHi    = ceil ((60.5 * 8 + 3 * bin + 10) / bin)   1995 at 8130, 1994 at 8130.5 and 8131
+    //   stretchHi = ceil ((120 + 13 + bin) / bin)             538 at 8130 and 8130.5, 537 at 8131
+    // so each half-hertz step drops one double (8 B) from a different row. (The witness was 1000 / 1000.5 Hz
+    // before P51, below the floor now.)
+    ok (fc_probe_hum_storage_bytes (1u, 8130.0) == 1110784.0,
+        "hum(1, 8130) is exactly 1110784 bytes — the rate is read as given");
+    ok (fc_probe_hum_storage_bytes (1u, 8130.5) == 1110776.0 && fc_probe_hum_storage_bytes (1u, 8131.0) == 1110768.0,
+        "hum(1, 8130.5) is exactly 1110776 — neither 8130's price nor 8131's (1110768): a FRACTIONAL rate survives");
 }
 
 // ---- refused geometries ---------------------------------------------------------------------------
@@ -426,7 +444,8 @@ void refusedGeometriesQuoteACanonicalZero()
 
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
-    const double badRates[] = { 0.0, -0.0, -1.0, 999.0, 768000.5, inf, -inf, nan, 1.0e300 };
+    const double badRates[] = { 0.0, -0.0, -1.0, 44.1, 999.0, 7999.0, std::nextafter (felitronics::core::kMinSampleRate, 0.0),
+                                768000.5, inf, -inf, nan, 1.0e300 };
     const std::uint32_t badWidths[] = { 0u, 17u, 99u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu };
     for (const Priced& m : priced)
     {
@@ -528,13 +547,16 @@ void theRefusalSetsAgree()
     const std::vector<float> planar = fixture ((int) frames, felitronics::core::kMaxChannels);
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
-    // The rows that matter are the ones where the five DISAGREE — each analyzer's own admission floor —
+    // The rows that matter are the ones where the five DISAGREE — bursts' own admission floor, above the shared one
+    // since P51 (999, 1000 and 2000 now refuse in all five) —
     // and the ones adjacent to a bound, where a `<` written for a `<=` lives. std::nextafter walks to the
     // neighbouring representable double, which is a finer step than any decimal literal can spell.
-    const double lo = 1000.0, hi = 768000.0;
-    const double rates[] = { 0.0, -1.0, -48000.0, 999.0,
-                             std::nextafter (lo, 0.0), lo, std::nextafter (lo, hi), 1000.5,
-                             1999.999, 2000.0, 8000.0, 11025.0, 18367.0, 18368.0, 44100.0, 48000.0,
+    // The low bound is the core's (P51); 999, 1000 and 2000 stay as rows — the old floor and forensics' own, both
+    // below it now — and 44.1 is the unit error the floor exists for.
+    const double lo = felitronics::core::kMinSampleRate, hi = 768000.0;
+    const double rates[] = { 0.0, -1.0, -48000.0, 44.1, 999.0, 1000.0, 2000.0,
+                             std::nextafter (lo, 0.0), lo, std::nextafter (lo, hi), 8130.5,
+                             11025.0, 18367.0, 18368.0, 44100.0, 48000.0,
                              96000.0, 192000.0, 705600.0,
                              std::nextafter (hi, 0.0), hi, std::nextafter (hi, inf), 768000.5,
                              inf, -inf, nan };
@@ -576,7 +598,7 @@ void theRefusalSetsAgree()
                 }
     ok (disagreed == 0, "the price and the run agree about every one of " + std::to_string (rows)
                         + " rows — five modes, twenty-six rates, nine widths and three programme lengths; "
-                        "each mode's own admission floor and both neighbours of both bounds among them");
+                        "bursts' own admission floor and both neighbours of both shared bounds among them");
     ok (spoke == 0, "and every refused run of those left its getters silent");
 }
 
@@ -611,8 +633,11 @@ std::vector<double> snapshot()
 void printStorageTable()
 {
     const std::uint32_t widths[] = { 1u, 2u, 6u, 16u, 17u };
-    const double rates[] = { 999.0, 1000.0, 2000.0, 8000.0, 11025.0, 22050.0, 44100.0, 48000.0, 88200.0,
-                             96000.0, 176400.0, 192000.0, 352800.0, 384000.0, 705600.0, 768000.0, 768001.0 };
+    // 999 and 1000 straddle the probe's pre-P51 floor and are both refused now; 7999 / 8000 straddle the core's.
+    // 12000 and 16000 are priced rates below 22050 — where the analyzers' own geometry changes most — and they
+    // replace what 1000 and 2000 used to price. storage-probe.mjs's TABLE_RATES is this list.
+    const double rates[] = { 999.0, 1000.0, 7999.0, 8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 44100.0, 48000.0,
+                             88200.0, 96000.0, 176400.0, 192000.0, 352800.0, 384000.0, 705600.0, 768000.0, 768001.0 };
     for (const Priced& m : priced)
         for (std::uint32_t ch : widths)
             for (double sr : rates)

@@ -246,12 +246,52 @@ int main()
             { fcore::Probe::kMaxSampleRate + 1.0, 2, false, "just above the highest" },
             { 1e300,    2, false, "an absurd but finite rate (its hop would overflow an int)" },
             { 5e-324,   2, false, "the smallest positive subnormal double" },
+            // P51 — the floor is the core's 8000 Hz, as LITERALS: the two symbolic rows above move with the constant
+            // and would not see it drop back to 1000. 3300 is where the K-weighting shelf is past Nyquist (this probe
+            // read +3048.86 LUFS for the CI fixture there); 44.1 and 192 are rates passed in kilohertz.
+            { 8000.0,                        2, true,  "8000 Hz, the floor itself" },
+            { std::nextafter (8000.0, 0.0),  2, false, "one ulp under 8000 Hz" },
+            { 7999.0,                        2, false, "7999 Hz" },
+            { 3300.0,                        2, false, "3300 Hz" },
+            { 1000.0,                        2, false, "1000 Hz, the floor before P51" },
+            { 44.1,                          2, false, "44.1 — kilohertz passed as hertz" },
+            { 192.0,                         2, false, "192 — kilohertz passed as hertz" },
         };
         for (const auto& k : cases)
         {
             fcore::Probe p;
             test::ok (p.prepare (k.sr, k.ch) == k.want, std::string ("prepare: ") + k.what);
             test::ok (p.prepared() == k.want, std::string ("prepared() agrees: ") + k.what);
+        }
+    }
+
+    // P51 / LAW 11b — A REFUSED prepare() READS LIKE A FRESH PROBE. Rates from 1000 to 7999 Hz used to re-prepare the
+    // meters; they are refusals now, and without the disarm the getters went on serving the previous file (the review
+    // round measured it on ShapeProbe's parts; Probe's meters had the same exposure). Every refusal path, including the
+    // ones that predate P51.
+    test::group ("a refused prepare() leaves nothing of the previous file readable");
+    {
+        const fcore::Probe fresh;
+        const auto prog = makeProgram (48000.0, 2, 3.0);
+        const auto view = ptrs (prog);
+        struct Bad { double sr; int ch; double dur; const char* what; };
+        const Bad bads[] { { 7999.0, 2, 60.0, "7999 Hz" }, { 44.1, 2, 60.0, "44.1" },
+                           { std::nan (""), 2, 60.0, "NaN" }, { 48000.0, 0, 60.0, "no channels" },
+                           { 48000.0, 2, 3.0e8, "a store the meter cannot hold" } };
+        for (const Bad& b : bads)
+        {
+            fcore::Probe p;
+            test::ok (p.prepare (48000.0, 2), std::string ("PRECONDITION: prepared, before ") + b.what);
+            p.process (view.data(), 2, (long long) prog[0].size());
+            p.finish();
+            test::ok (p.gatingBlockCount() > 0 && p.truePeakLinear() > 0.5,
+                      std::string ("PRECONDITION: a measured file, before ") + b.what);
+            test::ok (! p.prepare (b.sr, b.ch, b.dur) && ! p.prepared(), std::string ("refused: ") + b.what);
+            test::ok (p.gatingBlockCount() == fresh.gatingBlockCount() && p.gatingBlockEnergies().empty()
+                      && p.truePeakLinear() == fresh.truePeakLinear() && p.samplePeakLinear() == fresh.samplePeakLinear()
+                      && p.integratedLufs() == fresh.integratedLufs() && p.droppedBlocks() == fresh.droppedBlocks()
+                      && p.nonFiniteSubHops() == fresh.nonFiniteSubHops(),
+                      std::string ("and every getter reads what a fresh probe reads: ") + b.what);
         }
     }
 

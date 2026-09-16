@@ -309,7 +309,12 @@ struct DeliveryResampler
 
         // Integer rates only — the ratio has to be exact. The range test comes FIRST, so `llround`
         // never sees a value it cannot represent; then an equality test rejects 44100.5.
-        if (p.inRate < 1000.0 || p.outRate < 1000.0 || p.inRate > 3.0e6 || p.outRate > 3.0e6) return best;
+        // THE FLOOR IS NOT THIS CLASS'S OWN NUMBER. Representability needs only some finite bound; the one
+        // used is the core's audio-rate floor (P51, Config.h), because this plan is the ONE verdict every
+        // delivering mastering handle takes on both of its rates — a chain runs at the DELIVERY rate, so the
+        // chain's own floor never sees the source rate, and before P51 this line let `7999 -> 48000` in.
+        if (p.inRate < kMinSampleRate || p.outRate < kMinSampleRate || p.inRate > 3.0e6 || p.outRate > 3.0e6)
+            return best;
         const long long a = (long long) std::llround (p.inRate);
         const long long b = (long long) std::llround (p.outRate);
         if (! exactlyEqual ((double) a, p.inRate) || ! exactlyEqual ((double) b, p.outRate)) return best;

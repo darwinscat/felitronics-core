@@ -319,6 +319,11 @@ typedef struct fc_master_config
 {
     fc_header header;
 
+    // IN HERTZ, 8000 AND UP (P51: the core's floor, core::kMinSampleRate), and at most the chain's 3 MHz. A rate
+    // below the floor is refused at create with FC_ERR_REFUSED_BY_CORE, and so is `fc_master_need_create`'s dry
+    // run of it — on every topology: the floor is the chain's own, not a stage's. The mistake it exists for is a
+    // rate in KILOHERTZ: 88.2 or 96 used to make a handle whose search "solved" a garbage master. A non-finite
+    // rate is FC_ERR_NON_FINITE. (There is no core default: 0, what `fc_master_config_defaults` writes, is refused.)
     double  sampleRate;
     int32_t channels;
 
@@ -347,7 +352,9 @@ typedef struct fc_master_config
     // A delivering handle has no streaming path: `fc_master_process`, `fc_master_flush` and `fc_master_solve`
     // answer FC_ERR_STATE on it, because two lengths cannot share one planar stride. A rate pair the resampler
     // does not support (anything but integer rates it can plan — see core::DeliveryResampler) is refused at
-    // create with FC_ERR_REFUSED_BY_CORE; a non-finite one with FC_ERR_NON_FINITE.
+    // create with FC_ERR_REFUSED_BY_CORE; a non-finite one with FC_ERR_NON_FINITE. BOTH RATES have the 8 kHz
+    // floor (P51), and on a delivering handle it is the resampler's plan that holds it for `sampleRate`: the
+    // chain runs at the delivery rate and never sees the source.
     double  deliveryRate;
 } fc_master_config;
 
