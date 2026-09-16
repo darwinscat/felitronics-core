@@ -1423,8 +1423,8 @@ private:
     // decided — both meters this class builds size themselves with it. In samples, and not as `frames / fs + 1`
     // seconds, which was +inf at a finite rate the chain used to accept (1e-305 Hz with 2000 frames): the store's
     // size was then `(std::size_t) inf`, undefined behaviour, and the same ABI call kept 3 blocks on arm64 and wasm32
-    // and 4 on x86-64 gcc. Since P51 no such rate reaches this class (`frames / fs` is at most INT_MAX / 8000 s), and
-    // the property is pinned where it still can be reached — `LoudnessMeter::prepareForSamples`, which takes any rate.
+    // and 4 on x86-64 gcc. Since P51 no such rate reaches this class (`frames / fs` is at most INT_MAX / 8000 s), and since
+    // P103 none reaches the meter either; LoudnessConformanceTests pins what is left of the property at the floor.
     static double meterSamples (int frames, double sampleRate) noexcept
     {
         return (double) frames + std::ceil (sampleRate);

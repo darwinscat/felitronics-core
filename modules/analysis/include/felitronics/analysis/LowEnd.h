@@ -271,7 +271,7 @@ public:
 
     static constexpr double kBlockMs      = 10.0;    // NOT a parameter. The grid is shared: it is
                                                      // lround(0.01*fs) samples, exactly the sub-hop
-                                                     // analysis::LoudnessMeter builds (LoudnessMeter.h:110),
+                                                     // analysis::LoudnessMeter builds (LoudnessMeter::storageFor),
                                                      // so the two instruments name the same intervals.
     static constexpr int    kHistogramBins = 100;    // the side fraction over [0, 1], fixed edges
     static constexpr double kMinSampleRate = core::kMinSampleRate;   // P51: the core's floor, one number

@@ -135,7 +135,7 @@ namespace felitronics::analysis
 //   THE MEDIAN ALSO REMOVES AN ARITHMETIC QUESTION INSTEAD OF ANSWERING IT. It is a SELECTION, not an
 //   accumulation: the baseline is always one of the observed hop energies, bit for bit, so there is no
 //   summation order to pin, no compensation to argue about and no drift over a million hops. The window
-//   sum it replaces would have needed all three — `LoudnessMeter.h:320` recomputes its window from the
+//   sum it replaces would have needed all three — `LoudnessMeter::meanLastSubHops` recomputes its window from the
 //   ring every hop for exactly that reason, and note it walks newest→oldest, one more convention that
 //   would have needed its own pinned test (and whose reversal no re-slicing test can see, because both
 //   orders are slicing-invariant). None of it is needed here. `baselineHops/2` is the upper median for an

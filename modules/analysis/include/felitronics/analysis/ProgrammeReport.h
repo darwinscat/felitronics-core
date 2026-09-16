@@ -115,7 +115,7 @@ namespace felitronics::analysis
 //     told apart. EBU Tech 3342 is computed here from this class's own short-term series, where the gated
 //     count is known exactly. The two agree to about 0.3 LU wherever both are defined — not bitwise, and
 //     the reason is worth knowing: the meter sums its short-term window newest-first
-//     (LoudnessMeter.h:325) and this class oldest-first, so the two orders leave different residues. The
+//     (LoudnessMeter::meanLastSubHops) and this class oldest-first, so the two orders leave different residues. The
 //     suite pins the agreement at that tolerance.
 //
 // FORM. setParams / prepare / process / finish / reset, like `analysis::ClipDetector`. `process()` is
@@ -320,7 +320,7 @@ public:
     static constexpr double kMaxSampleRate      = 768000.0;
     static constexpr int    kShortTermSubHops   = 300;    // 3 s of 10 ms sub-hops — the short-term window
     static constexpr int    kObservationHops    = 100;    // one short-term observation a second (libebur128's cadence)
-    static constexpr int    kHistogramBins      = 1000;   // -70 … +30 LUFS in 0.1 LU bins (LoudnessMeter.h:366-385)
+    static constexpr int    kHistogramBins      = 1000;   // -70 … +30 LUFS in 0.1 LU bins (LoudnessMeter::lra)
     static constexpr double kHistogramFloorLufs = -70.0;
     static constexpr double kHistogramBinLu     = 0.1;
     // The BS.1770 absolute gate, -70 LUFS, as ENERGY: 10^((-70 + 0.691)/10). Written as a literal rather
@@ -1020,7 +1020,7 @@ private:
     }
 
     // A short-term (3 s) observation. The window sum is RECOMPUTED from the ring — never carried as
-    // `sum += new - old`, which is deterministic but drifts over a long programme (LoudnessMeter.h:320-327
+    // `sum += new - old`, which is deterministic but drifts over a long programme (LoudnessMeter::meanLastSubHops
     // recomputes for the same reason).
     void observeShortTerm() noexcept
     {

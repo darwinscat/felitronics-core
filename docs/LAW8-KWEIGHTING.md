@@ -69,7 +69,7 @@ per-host-block flush would leave the shelf sitting subnormal through half of eve
 the sub-hop the margin is 9×, at every rate, by construction.
 
 `LoudnessMeter::process()` also never clamps `n`, and `fcore::Probe` documented rates down to 1 kHz (8 kHz since
-P51; the meter itself still takes any rate), where a single 8192-sample call spans 8.2 seconds. A cadence tied to
+P51, and the meter itself since P103), where a single 8192-sample call spans 8.2 seconds. A cadence tied to
 the caller cannot be made safe.
 
 ---
@@ -117,10 +117,11 @@ without it.
   among them), of `mastering::TargetLoudnessSolver` and of the mastering chain and delivery resampler under
   `fc_master_create`; a `static_assert` in `KWeightingFilter.h` keeps it above twice the shelf. Measured on
   origin/main before the change: the probe read the CI fixture at **+3048.86 LUFS** at 3300 Hz, and a search at
-  3363 Hz rode its −60 dB rail chasing +2448 LUFS. The shelf's pole radius is 0.43 at 8 kHz. **Still open:** the
-  meter and the filter themselves take any rate (and the meter reads a rate ≤ 0 as 48 kHz); a direct C++ caller
-  below 3364 Hz still gets an aliased filter, and an unstable one in 1682–3364 Hz and 841–1121 Hz. That is a
-  contract question, registered in the plan (P103) rather than decided here.
+  3363 Hz rode its −60 dB rail chasing +2448 LUFS. The shelf's pole radius is 0.43 at 8 kHz. **And for the meter
+  itself (P103):** `analysis::LoudnessMeter` refuses a rate in (0, 8000) Hz — a rate ≤ 0 or NaN is "not given"
+  and still reads as 48 kHz. `KWeightingFilter::prepare` cannot refuse and still takes any rate; the meter is its
+  one owner, and a direct C++ caller of the bare filter below 3364 Hz still gets an aliased filter, and an
+  unstable one in 1682–3364 Hz and 841–1121 Hz.
 - ~~**Other unflushed recursive state**, found in the same audit and left alone on purpose.~~
   **CLOSED — the audit was finished, and this paragraph was wrong about the most expensive item in it.**
   All of `core::Smoother`, `poweramp`'s coefficient smoothers, `rigplayer`'s gain ramps and
