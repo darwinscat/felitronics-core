@@ -2642,6 +2642,192 @@ int main() {
     }
 
     // ------------------------------------------------------------------------------------------
+    // THE WIRING, pinned where only the player can see it. An adversarial round ran 44 mutants against
+    // this branch; the code held on every input it tried, and seven mutants survived this file because
+    // every fixture above either loads ONE capture into every file (so a slot index passed to the wrong
+    // stage answers the same), or restarts a slot that settled long ago (so its count is far past any
+    // new need), or carries no alignment table where a landing is pending. The three groups below are
+    // those three blind spots, each with the input the round found.
+    namz::rig::Rig tri;
+    {
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        tri.chain = { st };
+    }
+    struct Tri {
+        RigPlayer p;
+        std::map<std::string, std::vector<std::byte>> files;
+        std::vector<float> x;
+        float* io[1];
+        Tri(const namz::rig::Rig& rig, const std::string& e, const std::string& m, const std::string& l,
+            double fs) : x((std::size_t) kBlock, 0.1f) {
+            io[0] = x.data();
+            files = { { "early", bytesOf(e) }, { "mid", bytesOf(m) }, { "late", bytesOf(l) } };
+            felitronics::test::run (p.prepare(fs, kBlock, 1));
+            p.load(rig, [this](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+        }
+        void block(bool service = true) {
+            felitronics::test::run (p.process(io, 1, kBlock));
+            if (service) p.serviceHere();
+        }
+        void run(int n) { for (int k = 0; k < n; ++k) block(); }
+    };
+
+    // 1. AN AUDIBLE SLOT WITH A REAL FIELD STAYS AUDIBLE — including one that has only JUST become
+    //    audible when the rate goes up, and across two restarts in a row. Every restart fixture above
+    //    that checks audibility uses a memoryless capture, whose need is zero and whose predicate cannot
+    //    fail; and a slot that settled long ago has fed far past any new need. Measured on the wrong
+    //    twins: an inverted predicate muted both slots, `>` for `>=` re-armed them on the SECOND
+    //    restart, and keeping an audible slot's old count warmed it for 7 blocks at 96 kHz and muted it
+    //    outright at 192 kHz.
+    group("P89: a pair that is AUDIBLE stays audible through any restart — just-audible included");
+    {
+        struct Seq { const char* name; std::vector<std::pair<char, double>> steps; };   // 'r' reset, 'p' prepare(rate)
+        const Seq seqs[] {
+            { "reset",                     { { 'r', 0.0 } } },
+            { "prepare(same)",             { { 'p', 48000.0 } } },
+            { "prepare(96k)",              { { 'p', 96000.0 } } },
+            { "prepare(192k)",             { { 'p', 192000.0 } } },
+            { "reset, reset",              { { 'r', 0.0 }, { 'r', 0.0 } } },
+            { "prepare(same) twice",       { { 'p', 48000.0 }, { 'p', 48000.0 } } },
+            { "prepare(96k), reset",       { { 'p', 96000.0 }, { 'r', 0.0 } } },
+            { "prepare(96k), prepare(44.1k)", { { 'p', 96000.0 }, { 'p', 44100.0 } } },
+        };
+        for (const bool justAudible : { true, false })
+        for (const auto& q : seqs) {
+            Tri t(tri, delayModel(2000), delayModel(2000), delayModel(2000), kFs);
+            t.p.setDial("gain", 105.0);                    // between two knots: both slots sound
+            // Stop on the first block that warms nobody AFTER BOTH slots hold a model and one of them
+            // was still warming — the instant the second landing has just crossed its need, which is
+            // where a kept count is shortest. The two slots land one after the other, so "the first quiet
+            // block" alone can fall between the landings, with only one capture in the player.
+            int warmed = 0;
+            for (int k = 0; k < 200; ++k) {
+                t.p.clearCounters();
+                t.block();
+                const bool bothHeld = ! t.p.heldFileId(0).empty() && ! t.p.heldFileId(1).empty();
+                if (t.p.warmBlocks() > 0) { if (bothHeld) warmed = k + 1; }
+                else if (warmed > 0 && justAudible) break;
+            }
+            if (! justAudible) t.run(64);
+            const bool both = ! t.p.heldFileId(0).empty() && ! t.p.heldFileId(1).empty()
+                           && (justAudible || (t.p.liveMix() > 0.05f && t.p.liveMix() < 0.95f));
+            for (const auto& [verb, rate] : q.steps) {
+                if (verb == 'r') t.p.reset();
+                else felitronics::test::run (t.p.prepare(rate, kBlock, 1));
+            }
+            t.p.clearCounters();
+            const float mixBefore = t.p.liveMix();
+            t.run(30);
+            const std::string label = std::string(q.name) + (justAudible ? ", just audible" : ", settled");
+            ok(warmed > 0 && both, "precondition: both slots landed and warmed — " + label);
+            // A just-audible pair is still gliding to its target weight, so only the settled rows can
+            // also say "the weight does not move"; "nobody is re-armed" is the claim for both.
+            ok(t.p.warmBlocks() == 0 && (justAudible || std::abs(t.p.liveMix() - mixBefore) < 1e-6f),
+               "no slot is re-armed" + std::string(justAudible ? "" : " and the weight does not move") + " ("
+               + std::to_string(t.p.warmBlocks()) + " warming blocks, mix " + std::to_string(mixBefore) + " -> "
+               + std::to_string(t.p.liveMix()) + ") — " + label);
+        }
+    }
+
+    // 2. SLOTS HOLDING CAPTURES WITH DIFFERENT FIELDS. Each slot's warm-up must come from ITS OWN
+    //    stage: with one capture in every file, restating slot 1 from slot 0's stage answers the same
+    //    number and the mix-up is invisible. Here the files differ (2000 / 500 / 1000 samples of reach),
+    //    a slot is put to sleep holding one of them, the rate changes, and the wake is compared with a
+    //    player that ran the same sequence at the new rate from the start. Both slot indices take a turn
+    //    at sleeping, because a stage mix-up is invisible on whichever index it maps to itself.
+    group("P89: each slot's warm-up is restated from ITS OWN capture, not its neighbour's");
+    {
+        struct Case { double then; double wake; };
+        const Case parks[] { { -1.0, 200.0 }, { 240.0, 150.0 } };       // the second puts the OTHER slot to sleep
+        bool sleptOn[2] { false, false };
+        for (const auto& c : parks)
+        for (const double to : { 96000.0, 22050.0 }) {
+            const auto drive = [&c](Tri& t, double fs, bool changeTo, double newRate) {
+                t.p.setBlendShape({ 0.5, 0.0 });
+                t.p.setColdAfterSeconds(0.25);
+                t.p.setDial("gain", 150.0);
+                const int rest = (int) std::ceil(0.4 * fs / kBlock);
+                t.run(rest);
+                if (c.then >= 0.0) { t.p.setDial("gain", c.then); t.run(rest); }
+                const int sleeper = t.p.slotCold(0) ? 0 : t.p.slotCold(1) ? 1 : -1;
+                if (changeTo) felitronics::test::run (t.p.prepare(newRate, kBlock, 1));
+                t.p.clearCounters();
+                t.p.setDial("gain", c.wake);
+                t.run((int) std::ceil(0.5 * newRate / kBlock));
+                return std::pair<int, int> { sleeper, t.p.warmBlocks() };
+            };
+            Tri a(tri, delayModel(2000), delayModel(500), delayModel(1000), kFs);
+            const auto got = drive(a, kFs, true, to);
+            Tri b(tri, delayModel(2000), delayModel(500), delayModel(1000), to);
+            const auto want = drive(b, to, false, to);
+            const std::string at = "sleeper " + std::to_string(got.first) + ", 48000 -> " + std::to_string((int) to);
+            if (got.first >= 0) sleptOn[(std::size_t) got.first] = true;
+            ok(got.first >= 0 && got.first == want.first
+                   && a.p.heldFileId(0) != a.p.heldFileId(1),
+               "precondition: the same slot slept in both players, and the two slots hold DIFFERENT captures — " + at);
+            ok(got.second == want.second && got.second > 0,
+               "the woken slot warms for its own capture's field at the new rate (" + std::to_string(got.second)
+               + " blocks against " + std::to_string(want.second) + ") — " + at);
+        }
+        ok(sleptOn[0] && sleptOn[1], "precondition on the PASS: both slot indices took a turn at sleeping");
+    }
+
+    // 3. DELAYS THAT DIFFER PER FILE, with a load IN FLIGHT and with a landing PENDING across the
+    //    prepare. The sounding slot must keep the delay of the capture it HOLDS, not the one the dial is
+    //    reaching for (taking the staged number would retime a live signal), and a pending landing must
+    //    bring its own capture's delay at the new rate (the straddle group above checks only its warm-up).
+    group("P89: a load in flight or a landing pending across a prepare keeps each capture's OWN delay");
+    {
+        AlignmentTable t;
+        t.sampleRate = 48000.0;
+        t.lagByFile = { { "early", 0 }, { "mid", 30 }, { "late", 64 } };   // delays 64 / 34 / 0 at 48 kHz
+        const auto hand = [](const std::string& id, double fs) {
+            const int d48 = id == "early" ? 64 : id == "mid" ? 34 : 0;
+            return std::clamp((int) std::lround(d48 * fs / 48000.0), 0, RigPlayer::kMaxDelay);
+        };
+        for (const double to : { 44100.0, 96000.0, 22050.0 })
+        for (const bool pending : { false, true }) {
+            Tri p(tri, gainModel(0.25), gainModel(0.5), gainModel(1.0), kFs);
+            p.p.setAlignment(t);
+            p.p.setBlendShape({ 0.5, 0.0 });
+            p.p.setDial("gain", 60.0);
+            p.run(60);
+            const std::string sounding = p.p.liveMix() < 0.5f ? p.p.heldFileId(0) : p.p.heldFileId(1);
+            const int soundingSlot = p.p.liveMix() < 0.5f ? 0 : 1;
+            p.p.setDial("gain", pending ? 150.0 : 240.0);
+            p.block(false);                                // the law asks; nothing is delivered yet
+            if (pending) p.p.serviceHere();                // …or it IS delivered and not yet taken
+            felitronics::test::run (p.p.prepare(to, kBlock, 1));
+            const std::string at = std::string(pending ? "landing pending" : "load in flight") + ", 48000 -> "
+                                 + std::to_string((int) to);
+            ok(sounding == "early", "precondition: the sounding capture before the turn is 'early' — " + at);
+            ok(p.p.appliedSlotDelay(soundingSlot) == hand(sounding, to),
+               "the sounding slot keeps ITS capture's delay at the new rate (" + std::to_string(p.p.appliedSlotDelay(soundingSlot))
+               + ", want " + std::to_string(hand(sounding, to)) + ") — " + at);
+            if (pending) {
+                p.block(false);                            // …the audio thread takes the landing
+                const int other = soundingSlot ^ 1;
+                const std::string landed = p.p.heldFileId(other);
+                ok(! landed.empty() && landed != sounding,
+                   "precondition: the pending capture landed in the other slot (" + landed + ") — " + at);
+                ok(p.p.appliedSlotDelay(other) == hand(landed, to),
+                   "…and it lands with ITS delay at the new rate (" + std::to_string(p.p.appliedSlotDelay(other))
+                   + ", want " + std::to_string(hand(landed, to)) + ") — " + at);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
     group("P89: a restart snaps the slot trim THROUGH the switch that turns trims off");
     {
         // 🔴 THE ORACLE IS THE SWITCH'S OWN MEANING, not a level read off one player. `setInputTrims`

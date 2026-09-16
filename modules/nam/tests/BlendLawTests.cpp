@@ -448,5 +448,82 @@ int main() {
         ok(z[0] == 1.0f && z[3] == 4.0f, "no delay changes nothing at all");
     }
 
+    // ------------------------------------------------------------------------------------------
+    // P89 — blendRestated() pinned AT THE LAW, where every one of its rules is one line and can be
+    // stated exactly. The player's suite reaches this verb only through `warmBlocks()`, an OR over both
+    // slots, and an adversarial round showed what that costs: an inverted predicate, `>` for `>=`, a
+    // re-arm dropped, an audible slot left with its old count, and a truncated rest count all survived
+    // the player's whole suite. Each row below is the one input that separates the rule from its wrong
+    // twin.
+    group("P89: blendRestated keeps the ANSWER of fed >= need, and nothing else of the count");
+    {
+        const auto landed = [](long long need, long long fed, long long still) {
+            BlendState s;
+            blendLanded(s, 0, 7, need);
+            s.fed[0] = fed;
+            s.still[0] = still;
+            return s;
+        };
+
+        // AUDIBLE, and the new need is LARGER — a rate went up. Keeping the old count would leave
+        // fed < need and mute a sounding capture; the rule gives it the new need exactly.
+        {
+            auto s = landed(2256, 2304, 0);
+            blendRestated(s, 0, 4352, 2.0);
+            ok(s.need[0] == 4352 && s.fed[0] == 4352 && blendAudible(s, 0),
+               "an audible slot whose need grows stays audible, fed = the NEW need (" + std::to_string(s.fed[0])
+               + " of " + std::to_string(s.need[0]) + ") — keeping the old 2304 would have muted it");
+        }
+        // AUDIBLE AT EXACTLY THE BOUNDARY. `fed == need` is audible (`>=`), and it is also exactly what
+        // every restatement leaves behind — so a `>` here would re-arm every slot on its SECOND restart.
+        {
+            auto s = landed(2256, 2256, 0);
+            blendRestated(s, 0, 2256, 1.0);
+            blendRestated(s, 0, 2256, 1.0);
+            ok(s.fed[0] == 2256 && blendAudible(s, 0),
+               "fed == need is audible, and stays so across two restarts in a row (" + std::to_string(s.fed[0]) + ")");
+        }
+        // WARMING — one sample short. It is re-armed to zero: the restart flushed its network.
+        {
+            auto s = landed(2256, 2255, 0);
+            blendRestated(s, 0, 2256, 1.0);
+            ok(s.fed[0] == 0 && ! blendAudible(s, 0),
+               "a slot one sample short of its need is re-armed to ZERO, not credited (" + std::to_string(s.fed[0]) + ")");
+            blendRestated(s, 0, 4352, 2.0);
+            ok(s.fed[0] == 0 && s.need[0] == 4352, "…and a second restart keeps it re-armed at the new need");
+        }
+        // AN EMPTY SLOT is left exactly as it is.
+        {
+            BlendState s;
+            s.need[1] = 5; s.fed[1] = 3; s.still[1] = 9;
+            blendRestated(s, 1, 100, 2.0);
+            ok(s.need[1] == 5 && s.fed[1] == 3 && s.still[1] == 9, "a slot holding no model has no ledger to restate");
+        }
+        // THE REST COUNT is converted by ROUNDING. 3 x 0.5 = 1.5 rounds to 2 and truncates to 1; 5 x 0.3
+        // = 1.5 again from the other side of a float. Truncation measured one block of sleep late.
+        {
+            auto s = landed(0, 0, 3);
+            blendRestated(s, 0, 0, 0.5);
+            ok(s.still[0] == 2, "the rest count is rounded to nearest, not truncated: 3 x 0.5 -> " + std::to_string(s.still[0]));
+            auto t = landed(0, 0, 7);
+            blendRestated(t, 0, 0, 1.0);
+            ok(t.still[0] == 7, "…and is untouched at a ratio of exactly one (" + std::to_string(t.still[0]) + ")");
+            auto u = landed(0, 0, 7);
+            blendRestated(u, 0, 0, std::nan(""));
+            auto v = landed(0, 0, 7);
+            blendRestated(v, 0, 0, 0.0);
+            ok(u.still[0] == 7 && v.still[0] == 7, "…and is left alone when there is no rate to convert from (NaN, 0)");
+        }
+        // AND NOTHING ELSE MOVES — the fields blendLanded() would have cleared and a restart must not.
+        {
+            auto s = landed(2256, 100, 0);
+            s.inFlight[0] = true; s.cold[0] = true; s.refused[0] = 42; s.asked[0] = 9; s.x = 0.37;
+            blendRestated(s, 0, 4352, 2.0);
+            ok(s.held[0] == 7 && s.inFlight[0] && s.cold[0] && s.refused[0] == 42 && s.asked[0] == 9
+                   && std::abs(s.x - 0.37) < 1e-12,
+               "a restatement leaves the held model, a load in flight, a sleep, a refusal and the weight alone");
+        }
+    }
+
     return felitronics::test::report();
 }
