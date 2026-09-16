@@ -2377,19 +2377,21 @@ int main() {
     // ------------------------------------------------------------------------------------------
     group("P89: the per-slot ALIGNMENT DELAY is restated at the new rate too");
     {
-        // A table measured at 48 kHz, so `delayOf` has a rate to scale FROM. The pack's captures land
-        // 64 samples apart there; at 96 kHz that is 128 host samples and at 24 kHz it is 32.
+        // A table measured at 48 kHz, so `delayOf` has a rate to scale FROM. Every real file owes 64
+        // samples there against a "ghost" entry that lands latest — so whichever capture a slot holds,
+        // and whichever slot is silent, its delay is 64 x the rate ratio. A table where some file owed 0
+        // would let a stale number and a restated one agree on exactly the slot a check happened to read.
         const auto rig = throughTheFormat(testRig());
         AlignmentTable t;
         t.sampleRate = 48000.0;
-        t.lagByFile = { { "g60", 0 }, { "g150", 64 }, { "g240", 0 }, { "r150", 0 } };
+        t.lagByFile = { { "g60", 0 }, { "g150", 0 }, { "g240", 0 }, { "r150", 0 }, { "ghost", 64 } };
 
         // ⚠️ AND THE TOP OF THE GRID IS A CLAMP, NOT A SCALING — registered here because the fixture
-        // found it. `AlignmentTable::delayOf` clamps to `nam::kBlendMaxDelay`, which is 128 SAMPLES and
-        // therefore a duration that shrinks with the rate: 2.67 ms at 48 kHz, 0.67 ms at 192 kHz. A pack
-        // whose captures land 64 samples apart at 48 kHz asks for 256 at 192 kHz and silently gets 128,
-        // so the pair is aligned at 48 and 96 kHz and combs at 192. That is a bound in the wrong unit —
-        // the same defect this file's band ramps were cured of — and it is NOT P89's to move: it is a
+        // found it (P99). `AlignmentTable::delayOf` clamps to `nam::kBlendMaxDelay`, which is 128 SAMPLES
+        // and therefore a duration that shrinks with the rate: 2.67 ms at 48 kHz, 0.67 ms at 192 kHz. A
+        // pack whose captures land 64 samples apart at 48 kHz asks for 256 at 192 kHz and silently gets
+        // 128, so the pair is aligned at 48 and 96 kHz and combs at 192. That is a bound in the wrong unit
+        // — the same defect this file's band ramps were cured of — and it is NOT P89's to move: it is a
         // constant in BlendLaw.h with its own consumers. Pinned at its real value so the day it changes,
         // this says so.
         struct Case { double fs; int want; };
@@ -2401,17 +2403,98 @@ int main() {
             b.p.setDial("gain", 60.0);
             b.rms(220.0, 0.2, 24, 8);                       // land a model, so a slot holds something
             felitronics::test::run (b.p.prepare(c.fs, kBlock, 1));
+            b.fs = c.fs;
 
             // `delayOf` is the arithmetic; what is asserted is that prepare() RAN it. The reference is
             // the table's own number scaled by hand, not a second call into the player.
             const int hand = std::clamp((int) std::lround(64.0 * c.fs / 48000.0), 0, RigPlayer::kMaxDelay);
-            (void) 0;
             ok(hand == c.want, "precondition: the hand-scaled delay at " + std::to_string((int) c.fs)
                                + " Hz is " + std::to_string(c.want) + " (" + std::to_string(hand) + ")");
-            const int applied = std::max(b.p.appliedSlotDelay(0), b.p.appliedSlotDelay(1));
-            ok(applied == c.want, "prepare() restates the applied slot delay at " + std::to_string((int) c.fs)
-                                  + " Hz: want " + std::to_string(c.want) + ", got " + std::to_string(applied)
-                                  + " (the base commit kept 64 at every rate — the number measured for 48 kHz)");
+            ok(b.p.appliedSlotDelay(0) == c.want && b.p.appliedSlotDelay(1) == c.want,
+               "prepare() restates BOTH applied slot delays at " + std::to_string((int) c.fs)
+               + " Hz: want " + std::to_string(c.want) + ", got " + std::to_string(b.p.appliedSlotDelay(0))
+               + " and " + std::to_string(b.p.appliedSlotDelay(1))
+               + " (the base commit kept 64 at every rate — the number measured for 48 kHz)");
+
+            // 🔴 …AND THEY STAY RESTATED ONCE AUDIO RUNS, which the line above cannot see. A SILENT slot
+            // takes its delay from the STAGED one (`pendDelay_`) on every block, so a prepare() that
+            // restated the applied delay but not the staged one looks right until the first block — and
+            // then snaps the silent slot back to the old rate's number while the sounding one keeps the
+            // new, splitting the pair by exactly the error this group is about. Measured: without the
+            // staged half, this suite passed whole.
+            b.rms(220.0, 0.2, 16, 4);
+            ok(b.p.appliedSlotDelay(0) == c.want && b.p.appliedSlotDelay(1) == c.want,
+               "…and both are still " + std::to_string(c.want) + " after blocks have run at "
+               + std::to_string((int) c.fs) + " Hz (got " + std::to_string(b.p.appliedSlotDelay(0)) + " and "
+               + std::to_string(b.p.appliedSlotDelay(1)) + ")");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // A LANDING THAT STRADDLES THE prepare(). `loadSlot()` runs on the message thread and latches the
+    // incoming model's warm-up and delay at the rate of that moment; the audio thread takes them on its
+    // next block. A prepare() between those two instants would hand the law a warm-up measured for the
+    // rate that has just gone — the base defect, for exactly the slot that is changing capture. The
+    // other groups never reach this: the grid asserts no load happened, and the warm-up-depth group
+    // consumes its landing before it restarts. Measured: without the restatement of the pending
+    // landing, this suite passed whole.
+    group("P89: a landing delivered before a rate change and taken after it warms at the NEW rate");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // `straddle`: the landing is delivered at `from` and taken at `to`. Otherwise the player is
+        // moved to `to` first and the same turn is made there — the reference. Both count the warm-up
+        // from the block that takes the landing.
+        const auto warmOfLanding = [&r](double from, double to, bool straddle, bool* pending) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(delayModel(2000)) }, { "mid", bytesOf(delayModel(2000)) },
+                { "late",  bytesOf(delayModel(2000)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(from, kBlock, 1));
+            p.load(r, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setDial("gain", 150.0);
+            std::vector<float> x((std::size_t) kBlock, 0.1f);
+            float* io[1] { x.data() };
+            const auto block = [&] { felitronics::test::run (p.process(io, 1, kBlock)); };
+            for (int k = 0; k < 40; ++k) { block(); p.serviceHere(); }   // mid and late land and warm
+            if (! straddle) felitronics::test::run (p.prepare(to, kBlock, 1));
+            const long long loads = p.modelLoads();
+            const std::string before = p.heldFileId(0) + "|" + p.heldFileId(1);
+            p.setDial("gain", 60.0);                       // wants "early", which is not loaded yet
+            block();                                       // …the law asks for it
+            p.serviceHere();                               // …and it is delivered: landFlag_ is up
+            *pending = p.modelLoads() == loads + 1
+                    && p.heldFileId(0) + "|" + p.heldFileId(1) == before;   // …and NOT yet taken
+            if (straddle) felitronics::test::run (p.prepare(to, kBlock, 1));
+            p.clearCounters();
+            for (int k = 0; k < 96; ++k) { block(); p.serviceHere(); }
+            return p.warmBlocks();
+        };
+        for (const auto& pair : { std::pair<double, double> { 48000.0, 96000.0 },
+                                  std::pair<double, double> { 96000.0, 48000.0 },
+                                  std::pair<double, double> { 44100.0, 192000.0 } }) {
+            bool pendingA = false, pendingB = false;
+            const int straddled = warmOfLanding(pair.first, pair.second, true,  &pendingA);
+            const int reference = warmOfLanding(pair.first, pair.second, false, &pendingB);
+            const std::string at = std::to_string((int) pair.first) + " -> " + std::to_string((int) pair.second);
+            ok(pendingA && pendingB, "precondition: the landing was delivered and NOT yet taken when the"
+                                     " rate changed — " + at);
+            ok(straddled == reference && straddled > 0,
+               "a landing taken after a rate change warms as one made at the new rate (" + std::to_string(straddled)
+               + " blocks against " + std::to_string(reference) + ") — " + at);
         }
     }
 

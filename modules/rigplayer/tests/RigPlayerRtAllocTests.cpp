@@ -248,8 +248,11 @@ int main() {
             felitronics::test::okNoAlloc(turning == 0, std::string("…and 24 blocks across a published turn allocate nothing (")
                              + std::to_string(turning) + ") — " + c.name);
 
-            // DIGITAL SILENCE, long enough that a slot falls asleep and is clocked at width zero: the
-            // cold path runs different code (a drain, a width-zero call) and is on the audio thread too.
+            // DIGITAL SILENCE. What this does NOT do is put a slot to sleep — sleep is a property of a
+            // WEIGHT at rest under an unchanged request, not of the input, and 24 blocks are a fraction of
+            // the cold window anyway. An earlier version of this comment claimed it reached the cold path;
+            // a drain-path allocation planted to check that claim passed the whole gate. The cold path and
+            // the dropped-lane drain have their own group below.
             const long long hush = allocsAcross([&] {
                 std::fill(d.l.begin(), d.l.end(), 0.0f);
                 std::fill(d.r.begin(), d.r.end(), 0.0f);
@@ -258,6 +261,63 @@ int main() {
             });
             felitronics::test::okNoAlloc(hush == 0, std::string("…and 24 blocks of silence allocate nothing (") + std::to_string(hush)
                           + ") — " + c.name);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 🔴 THE TWO PATHS THIS PLAYER RUNS ONLY WHEN SOMETHING STOPS, and they are the ones a gate built
+    // from steady blocks never enters. (1) A slot the law puts to SLEEP is handed a width-zero call and
+    // its stage feeds itself the silence it still owes (law 11c) — reachable only after a whole cold
+    // window at rest under an unchanged request. (2) A host that drops from stereo to mono leaves lane 1
+    // to drain on its falling edge, in every stage, the same way. Measured before this group existed: an
+    // allocation planted inside NamStage's falling-edge drain passed all 29 checks of this file.
+    group("the SLEEP transition and a DROPPED lane — the drain paths — allocate nothing");
+    {
+        struct Case { const char* name; std::string json; double fs; };
+        const Case cases[] {
+            { "a 2001-tap capture, 48 kHz",              delayModel(2000),  48000.0 },
+            { "a 2001-tap capture, 44.1 kHz (resampling)", delayModel(2000), 44100.0 },
+            { "a WaveNet, 96 kHz (resampling)",          waveNetModel(512), 96000.0 },
+        };
+        for (const auto& c : cases) {
+            {   // (1) the sleep transition, with the drain that follows it inside the window
+                Bench b(c.json, c.fs, 2);
+                b.p.setBlendShape({ 0.5, 0.0 });           // STEP: the neighbour sits at exactly zero
+                b.p.setDial("gain", 150.0);
+                Driver d; double ph = 0.0; d.fill(0.3, ph, c.fs);
+                const int rest = (int) std::ceil((RigPlayer::kColdAfterSeconds - 0.2) * c.fs / kBlock);
+                for (int k = 0; k < rest; ++k) { felitronics::test::run (b.p.process(d.io, 2, kBlock)); b.p.serviceHere(); }
+                const bool awakeBefore = ! b.p.slotCold(0) && ! b.p.slotCold(1);
+                const int window = (int) std::ceil(0.6 * c.fs / kBlock);   // spans the 2 s line and the drain after it
+                const long long seen = allocsAcross([&] {
+                    for (int k = 0; k < window; ++k) felitronics::test::run (b.p.process(d.io, 2, kBlock));
+                });
+                const bool asleepAfter = b.p.slotCold(0) || b.p.slotCold(1);
+                ok(awakeBefore && asleepAfter,
+                   std::string("precondition: a slot fell asleep INSIDE the measured window — ") + c.name);
+                felitronics::test::okNoAlloc(seen == 0,
+                   std::string("a slot falling asleep, and draining at width zero, allocates nothing (")
+                   + std::to_string(seen) + ") — " + c.name);
+            }
+            {   // (2) stereo -> mono -> nothing: lane 1 drains first, then lane 0
+                Bench b(c.json, c.fs, 2);
+                b.p.setDial("gain", 150.0);
+                b.settle(40);
+                Driver d; double ph = 0.0; d.fill(0.3, ph, c.fs);
+                for (int k = 0; k < 8; ++k) felitronics::test::run (b.p.process(d.io, 2, kBlock));
+                const long long mono = allocsAcross([&] {
+                    for (int k = 0; k < 48; ++k) felitronics::test::run (b.p.process(d.io, 1, kBlock));
+                });
+                felitronics::test::okNoAlloc(mono == 0,
+                   std::string("a host dropping to MONO — lane 1 draining — allocates nothing (")
+                   + std::to_string(mono) + ") — " + c.name);
+                const long long gap = allocsAcross([&] {
+                    for (int k = 0; k < 48; ++k) felitronics::test::run (b.p.process(d.io, 0, kBlock));
+                });
+                felitronics::test::okNoAlloc(gap == 0,
+                   std::string("…and a GAP — both lanes draining — allocates nothing (")
+                   + std::to_string(gap) + ") — " + c.name);
+            }
         }
     }
 
