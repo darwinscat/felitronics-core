@@ -489,7 +489,12 @@ jobs:
           # All cores: the one test that must not share the machine — the wall-clock gate — is excluded right
           # here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is checked,
           # which makes this the slowest test run in the workflow; capping it at 4 left deb three-quarters idle.
-          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E spectrum_pane_perf
+          # Also excluded: the two exhaustive mastering sweeps. Under SAFE_HEAP they are the whole tail of this
+          # step — measured on deb, each alone on a core for over four minutes while the other eighteen sat idle,
+          # because one test cannot be split by -j. They add nothing here: the same sweeps already ran in this
+          # workflow, for their numbers in the release wasm suite and for memory safety natively under ASan,
+          # which is the stronger instrument.
+          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E 'spectrum_pane_perf|delivered_ceiling|loudness_solver'
       - name: The P0 spike artifacts still build
         if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         run: ./tools/wasm/build.sh
