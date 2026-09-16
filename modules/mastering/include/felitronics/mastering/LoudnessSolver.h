@@ -463,6 +463,10 @@ public:
     // and below 8000 Hz what arrives is a
     // rate in kilohertz or a broken header: on origin/main a search handed 88.2 reported Solved at -14 LUFS.
     static constexpr double kMinSampleRate = core::kMinSampleRate;
+    // And the highest — the chain's (P104). The search measures what a MasteringChain renders, at the chain's rate
+    // (admits() checks that), so a rate the chain refuses has nothing to measure; before P104 prepare() took any
+    // finite rate over the floor, 1e300 included, while solveBytes() answered 0 there.
+    static constexpr double kMaxSampleRate = MasteringChain::kMaxSampleRate;
 
     // WHERE THIS CLASS STOPS REPORTING A dB AND STARTS REPORTING A SENTINEL. peakDb() below is the only
     // user; the constant is public so a test can pin WHERE it is, not merely that silence reads -200.
@@ -1409,10 +1413,10 @@ private:
     //    baseline harness in another repository, it moves whenever that corpus does, and nothing in
     //    this tree can re-derive it. A number without a local owner rots and cannot be made not to.
     // THE RATE THIS CLASS MEASURES AT — the one test, read by prepare() and by every budget, so the two cannot disagree
-    // about a rate. NaN and -inf fail the first comparison; +inf fails the second.
+    // about a rate. NaN fails both comparisons, -inf the first and +inf the second.
     static bool rateAdmitted (double sampleRate) noexcept
     {
-        return sampleRate >= kMinSampleRate && std::isfinite (sampleRate);
+        return sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate;
     }
 
     // THE METER'S CAPACITY FOR A PROGRAMME, in samples: the programme plus one second of margin. The ONE place it is

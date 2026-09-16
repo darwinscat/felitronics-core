@@ -912,8 +912,8 @@ int main (int argc, char** argv)
         if (buckets > 0x7FFFFFFFu || columns > 0x7FFFFFFFu
          || ! shapes.prepare (fs, nc, frames, (int) buckets, mix, (int) columns))
         {
-            std::fprintf (stderr, "shapes.prepare refused (sample rate from %g, buckets/columns 1..%d, mix avr|L|R|max)\n",
-                          fcore::Probe::kMinSampleRate, analysis::WaveformPeaks::kMaxBuckets);
+            std::fprintf (stderr, "shapes.prepare refused (sample rate %g..%g, buckets/columns 1..%d, mix avr|L|R|max)\n",
+                          fcore::Probe::kMinSampleRate, fcore::Probe::kMaxSampleRate, analysis::WaveformPeaks::kMaxBuckets);
             std::fclose (f);
             return 2;
         }

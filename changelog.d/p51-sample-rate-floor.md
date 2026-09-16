@@ -20,10 +20,10 @@ compared as `sampleRate >= kMinSampleRate` (8000 is a rate; NaN is not):
   surface did not grow, and the refusal comes from the core the facade already asks.
 - **The probe ABI and `fcore_measure`:** `fcore::Probe`, `fcore::ShapeProbe` and the six analyzers behind
   `fc_probe_*` — `ClipDetector`, `ProgrammeReport`, `HumDetector`, `LowEnd`, `SourceForensics`,
-  `BandBursts` — take 8000 Hz and up (to 768 kHz; the shapes have no ceiling). The six analyzers and the probe had a floor of 1000 Hz, each
+  `BandBursts` — take 8000 Hz and up (to 768 kHz). The six analyzers and the probe had a floor of 1000 Hz, each
   in its own copy, and the shapes had none; each class keeps its `kMinSampleRate` name, and every one is
   now the core's constant. `fc_probe_<mode>_storage_bytes` answers 0 below the floor. The ceilings did not
-  move, and the shapes still keep none (a rate Probe refuses above 768 kHz is still drawn). `fcore_measure`'s
+  move here; the two that were missing — the shapes' and the search's — are P104's note. `fcore_measure`'s
   `correlation` and `needle` modes do not read the rate and still take any finite positive one; every other mode
   refuses below 8000 and names the range.
   A refused `fcore::Probe` or `ShapeProbe` now reads like a fresh one — its meters and its peak and stereo parts
