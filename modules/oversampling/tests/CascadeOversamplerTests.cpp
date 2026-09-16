@@ -401,7 +401,10 @@ static void runStorageAndRtTests()
             co.upsample (in, 2, n, up);
             co.downsample (upc, 2, n, dn);
         }
-        test::okNoAlloc (alloc::count.load() == c0, "no allocation across n = 1, 63, 64, 65, 1000");
+        // Read the counter BEFORE the call: the message argument is a std::string built in the same argument
+        // list, it allocates, and gcc evaluates it first (a refusal check below was red on gcc for exactly this).
+        const bool none = alloc::count.load() == c0;
+        test::okNoAlloc (none, "no allocation across n = 1, 63, 64, 65, 1000");
     }
 }
 
@@ -567,8 +570,10 @@ static void runTopologyTests()
     oversampling::PolyphaseOversampler::Storage s2;
     test::ok (oversampling::Oversampler::storageFor (oversampling::Topology::Kaiser, std::numeric_limits<double>::quiet_NaN(), 4, 40, 64, s1)
               == oversampling::PolyphaseOversampler::storageFor (4, 40, 64, s2), "Kaiser ignores the rate and clamps channels, as before");
-    test::ok (! oversampling::Oversampler::storageFor (oversampling::Topology::Cascade, 44100.0, 4, 1, 2000, s1),
-              "Cascade still range-checks tapsPerPhase, so the refusal set does not shrink with the topology");
+    test::ok (! oversampling::Oversampler::storageFor (oversampling::Topology::Cascade, 44100.0, 4, 1, 2000, s1)
+              && ! oversampling::Oversampler::storageFor (oversampling::Topology::Cascade, 44100.0, 4, 1, 3, s1)
+              && oversampling::Oversampler::storageFor (oversampling::Topology::Cascade, 44100.0, 4, 1, 4, s1),
+              "Cascade still range-checks tapsPerPhase at BOTH ends (3 and 2000 refused, 4 accepted), so the refusal set does not shrink with the topology");
     test::ok (! oversampling::Oversampler::storageFor (oversampling::Topology::Cascade, 44100.0, 3, 1, 64, s1),
               "Cascade refuses a factor that is not a power of two");
 
@@ -625,7 +630,8 @@ static void runTopologyTests()
         oversampling::Oversampler fresh;
         const long long f0 = alloc::bytes.load();
         const bool refused = ! fresh.prepare (Topology::Cascade, 44100.0, 3, 1, 64);
-        test::ok (refused && alloc::bytes.load() - f0 == 0, "a refused cascade preparation allocates nothing (not even the heap object)");
+        const long long refusedBytes = alloc::bytes.load() - f0;      // read before the message string exists
+        test::ok (refused && refusedBytes == 0, "a refused cascade preparation allocates nothing (not even the heap object)");
         oversampling::Oversampler live, twin;
         (void) live.prepare (Topology::Kaiser, 44100.0, 4, 1, 64);
         (void) twin.prepare (Topology::Kaiser, 44100.0, 4, 1, 64);
@@ -641,6 +647,10 @@ static void runTopologyTests()
         test::ok (! bc.fitsWithin (bk) && ! bk.fitsWithin (bc), "a cascade budget does not fit a Kaiser one, nor the reverse");
         oversampling::Oversampler::Storage noHeap = bc; noHeap.heapObjects = 0;
         test::ok (noHeap.fitsWithin (bc) && ! bc.fitsWithin (noHeap), "and the heap object is part of the comparison");
+        oversampling::Oversampler::Storage c4, c8;
+        (void) oversampling::Oversampler::storageFor (Topology::Cascade, 44100.0, 4, 2, 64, c4);
+        (void) oversampling::Oversampler::storageFor (Topology::Cascade, 44100.0, 8, 2, 64, c8);
+        test::ok (c4.fitsWithin (c8) && ! c8.fitsWithin (c4), "and two CASCADE budgets are ordered by their cascade halves (4x fits 8x, not the reverse)");
         oversampling::Oversampler copy = sw;                     // sw holds the cascade here
         std::vector<float> ci (50, 0.0f), co1 (200), co2 (200);
         for (int i = 0; i < 50; ++i) ci[(std::size_t) i] = (float) std::cos (0.4 * i);

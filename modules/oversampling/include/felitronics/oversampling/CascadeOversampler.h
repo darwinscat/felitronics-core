@@ -60,7 +60,7 @@ namespace felitronics::oversampling
 //     smooth rule can place it. At 9.5 the floor is ~-94.6 and the -90 point sits on the skirt (3.01 to
 //     3.13 fs/t on the same stand). It costs ~4 % of taps.
 //   * halfband lengths by stage: 27, 23, 23, 15, 15 (beta 9.5) — the shortest that keep the cascade at the
-//     stage-1 floor (a shorter one at stage 2, 23 taps, reads -80.5).
+//     stage-1 floor (the design stand read a 23-tap stage 2 at -80.5; the suite's strictness bar fails it).
 //   * decimation phases are chosen so that the round trip is an INTEGER number of base samples and the
 //     composite response is symmetric about it; latency is reported exactly.
 //
@@ -78,7 +78,7 @@ namespace felitronics::oversampling
 //
 // THE PRICE IS LATENCY, not CPU: 131 base samples at 44.1 kHz against 63. That is the width of the
 // transition, not the structure — strictness with a 2.05 kHz transition costs about 250 taps at 2 fs
-// whatever the topology — and above 44.1 kHz the transition widens and the price falls below the
+// whatever the topology (Kaiser's length estimate; the rule builds 250) — and above 44.1 kHz the transition widens and the price falls below the
 // fixed-cutoff design's.
 //
 // WHAT IT IS NOT FOR. The certified true-peak reference (`analysis::ReferenceTruePeakMeter`) is

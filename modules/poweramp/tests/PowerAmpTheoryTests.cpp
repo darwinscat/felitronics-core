@@ -32,7 +32,8 @@
 //   TT6 autoComp  — autoComp=1 ⇒ small-signal gain Drive-invariant (comp=|slope|⁻¹ cancels the slope);
 //                   tiny-signal drive sweep RMS window < 0.1 dB. autoComp=0 ⇒ no compensation ⇒ RMS
 //                   grows monotonically ≈ +Δdrive dB (near-linear tiny signal).
-//   TT7 Latency   — latency = oversampler round-trip = tapsPerPhase−1 = 31, INVARIANT across os factor;
+//   TT7 Latency   — latency = oversampler round-trip = tapsPerPhase−1 = 31, INVARIANT across os factor
+//                   (under the default Kaiser oversampler — TT10 is the cascade, where it is not);
 //                   0 before prepare (host queries early). Reported == impulse-measured main lobe.
 //   TT8 NaN/Inf   — flushDenormals + the isfinite gates flush state each block ⇒ a poison burst is
 //                   contained: output finite within ≤2 valid blocks. NaN driveDb/Inf outputDb/NaN
@@ -498,7 +499,8 @@ int main()
         bool facOk = true;
         for (int os : { 2, 4, 8, 16, 32 }) facOk = facOk && latOf (kSr, os) == CascadeOversampler::latencyFor (kSr, os);
         check (facOk, "TT10 cascade latency == CascadeOversampler::latencyFor at every factor 2..32 (it is NOT factor-invariant)");
-        check (latOf (kSr, 4) == 76 && latOf (44100.0, 4) == 131, "TT10 cascade 4x latency: 76 at 48 kHz, 131 at 44.1 kHz");
+        check (latOf (kSr, 4) == 76 && latOf (44100.0, 4) == 131 && latOf (kSr, 32) == 80 && latOf (44100.0, 32) == 135,
+               "TT10 cascade latency: 76 (4x) and 80 (32x) at 48 kHz, 131 and 135 at 44.1 kHz — 4x and 32x are NOT sample-aligned");
         check (latOf (kSr, 3) == CascadeOversampler::latencyFor (kSr, 2) && latOf (kSr, 12) == CascadeOversampler::latencyFor (kSr, 8)
                && latOf (kSr, 64) == CascadeOversampler::latencyFor (kSr, 32) && latOf (kSr, 1) == CascadeOversampler::latencyFor (kSr, 2),
                "TT10 a factor that is not a power of two is rounded DOWN (3->2, 12->8), and the [2,32] clamp still applies (64->32, 1->2)");

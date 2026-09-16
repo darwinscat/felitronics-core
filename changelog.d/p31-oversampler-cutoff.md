@@ -34,6 +34,10 @@ design is therefore **strict** — the transition must finish below fs/2.
   `PowerAmpStage` rounds the factor down to a power of two and clamps the design rate, as it clamps
   everything, and under the cascade its 4x and 32x are no longer sample-aligned (76 and 80 at 48 kHz).
 - **The switch costs the default 32 bytes per stage** (the cascade is heap-held, only when chosen).
+- **One source-level change for a product that reads budgets field by field**: the oversampler half of
+  `Saturator::Storage` and `TruePeakLimiter::Storage` is now `oversampling::Oversampler::Storage` (the Kaiser
+  fields live under `.kaiser`); `bytes()` and `fitsWithin()` are unchanged, and nothing in the tree reads
+  deeper. `PowerAmpStage.h` now includes `<bit>` (C++20, which every module already requires).
 - **The limiter's ceiling under the cascade**, measured with the ceiling suite's own witnesses: at
   44.1 kHz 4fs/9 is now delivered flat, so the grid allowance at 8x rises from 0.108 to **0.133 dB**
   (16x: 0.027 → 0.033); the 1.15 dB modulation envelope holds (worst 1.344 dB at 2x, inside 2.399), and at

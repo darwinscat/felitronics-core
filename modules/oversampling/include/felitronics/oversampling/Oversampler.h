@@ -32,10 +32,11 @@ enum class Topology { Kaiser, Cascade };
 // so the set of arguments a stage refuses does not shrink when the topology changes; it is otherwise not
 // used — the cascade takes its lengths from the rate.
 //
-// THE CASCADE LIVES ON THE HEAP, and only when it is chosen. Held by value it would have added ~500 bytes
-// to every Saturator and TruePeakLimiter whether or not anyone asked for it (measured: 432 -> 936 and
-// 408 -> 912, MasteringChain 18016 -> 19024), which is a change to the default. A vector of zero or one
-// keeps the switch copyable and costs the Kaiser path its 24 bytes; the object it allocates is counted
+// THE CASCADE LIVES ON THE HEAP, and only when it is chosen. Held by value it added about half a kilobyte
+// (sizeof (CascadeOversampler)) to every Saturator and TruePeakLimiter whether or not anyone asked for it,
+// and twice that to a MasteringChain — a change to the default. A vector of zero or one keeps the switch
+// copyable and costs the Kaiser path 32 bytes (sizeof (Oversampler) 200 against 168; Saturator 432 -> 464,
+// TruePeakLimiter 408 -> 440, MasteringChain 18016 -> 18080 on arm64); the object it allocates is counted
 // in Storage::heapObjects, so a stage's published budget still equals what its prepare() asks for.
 class Oversampler
 {

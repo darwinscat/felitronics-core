@@ -433,8 +433,8 @@ static void runCascadeTopologyTests()
                   && saturation::Saturator::latencyFor (44100.0, 512, 2, 3, 64, Topology::Cascade) == 0,
                   "a factor of 3 is refused under the cascade, by prepare, storageFor and latencyFor alike");
         test::ok (s.prepare (44100.0, 512, 2, 3, 64), "and still accepted under Kaiser — the default's refusal set did not move");
-        test::ok (! s.prepare (44100.0, 512, 2, 4, 2000, Topology::Cascade),
-                  "tapsPerPhase is still range-checked under the cascade (2000 refused), so no argument became free");
+        test::ok (! s.prepare (44100.0, 512, 2, 4, 2000, Topology::Cascade) && ! s.prepare (44100.0, 512, 2, 4, 3, Topology::Cascade),
+                  "tapsPerPhase is still range-checked under the cascade (2000 and 3 refused, as under Kaiser), so no argument became free");
         test::ok (s.prepare (44100.0, 512, 2, 1, 2000, Topology::Cascade) && s.latencySamples() == 0,
                   "and at factor 1 there is no oversampler, so the topology is moot — exactly as tapsPerPhase was");
         // The cascade designs from the RATE, so under it the rate window is [1 kHz, 3 MHz]; the Kaiser stage

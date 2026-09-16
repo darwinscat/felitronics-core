@@ -88,7 +88,7 @@ struct TruePeakLimiterConfig
     int    oversampleFactor = 4;     // ≥ 2; a requested 1 becomes 2 — there is no 1× path
     int    tapsPerPhase     = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // ≥ 4
     // Which oversampler (P31). Kaiser — PolyphaseOversampler, the default. Cascade — CascadeOversampler:
-    // flat to 20 kHz at every rate, a power-of-two factor only, a longer round trip (131 samples at
+    // flat to 20 kHz at every rate, a power-of-two factor only (3, 5, 6 ... are refused, not clamped), a longer round trip (131 samples at
     // 44.1 kHz 4x). `tapsPerPhase` is range-checked under both and used only by Kaiser. The cascade also
     // narrows the accepted rates to [1 kHz, 3 MHz]; Kaiser goes as low as 20 ms still holds two samples.
     // What the cascade changes about the ceiling is stated under WHAT IT DOES NOT PROMISE, below.
@@ -248,7 +248,8 @@ struct TruePeakLimiterTap
 // the whole tpp × factor surface is pinned by felitronics_oversampling_tests.
 //
 // WHAT IS CLAMPED, all of it visible rather than silent (oversampleFactor(), lookaheadSamples(),
-// effectiveReleaseMs(), effectiveCeilingDbTp()): the oversampling factor into [2, 16]; the lookahead
+// effectiveReleaseMs(), effectiveCeilingDbTp()): the oversampling factor into [2, 16] (under Topology::Cascade
+// a factor in that range that is not a power of two is REFUSED instead — it has no cascade); the lookahead
 // into [2 baseband samples, 20 ms]; the release time constant to at least 8 baseband samples and to
 // strictly less than an infinite hold; the ceiling into [-200, +60] dBTP. The two floors are measured —
 // the smallest values that keep the witness matrix inside the figures above — and both sit far below any

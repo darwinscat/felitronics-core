@@ -167,7 +167,7 @@ flush fires once per `process()` call: measured on a −160 dBFS input, −7.5 d
 same constant, as `SagEnvelope` and the power-aware guard in `MultiResSpectrumPane`) · `TubeStage` (memoryless) · `poweramp`'s `gApplied`/`postApplied` (linear ramps,
 land exactly) · every `EnvelopeFollower` owner (Compressor, NoiseGate, DeEsser, DynamicEqBand,
 LaneDynamics, TransientShaper) · `DelayLine` / `DryAligner` / `StreamResampler` (no recursion) ·
-`Fft` / `Pffft*` / `MatrixConvolver*` / `IrResampler` / `PolyphaseOversampler` / `BlendKernels` (FIR and
+`Fft` / `Pffft*` / `MatrixConvolver*` / `IrResampler` / `PolyphaseOversampler` / `CascadeOversampler` / `BlendKernels` (FIR and
 transforms — no decaying recursion) · `TruePeakMeter` and `SpectrumPane` (settled in the F1 pass) ·
 `measurement` / `blend` / `lineareq` / `io` (offline or FIR).
 
