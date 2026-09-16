@@ -82,21 +82,7 @@ bool countingNever(const nlohmann::json&) { predCalls.fetch_add(1); return false
 
 // Nesting chains, built as TEXT and parsed, because that is how a hostile file arrives: nlohmann parses
 // and destroys iteratively, so only the reader's recursion is under test here.
-std::string conditionerChain(int depth) {
-    std::string s;
-    for (int i = 0; i < depth; ++i) s += R"({"architecture":"WaveNet","config":{"layers":[1],"condition_dsp":)";
-    s += R"({"architecture":"Linear","config":{"receptive_field":3}})";
-    for (int i = 0; i < depth; ++i) s += "}}";
-    return s;
-}
-std::string containerChain(int depth) {
-    std::string s;
-    for (int i = 0; i < depth; ++i) s += R"({"architecture":"SlimmableContainer","config":{"submodels":[{"model":)";
-    s += R"({"architecture":"Linear","config":{"receptive_field":3}})";
-    for (int i = 0; i < depth; ++i) s += "}]}}";
-    return s;
-}
-// …and the axis P92 ADDED: dead `model` keys, which NAM unwraps exactly once and then ignores.
+// The axis P92 ADDED: dead `model` keys, which NAM unwraps exactly once and then ignores.
 std::string wrapperChain(int depth) {
     std::string s = R"({"architecture":"WaveNet","config":)";
     for (int i = 0; i < depth; ++i) s += R"({"layers":[{"kernel_size":2,"dilations":[1]}],"model":)";
