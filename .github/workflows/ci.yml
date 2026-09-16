@@ -300,7 +300,12 @@ jobs:
           echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
           echo "PATH=$PATH"   >> "$GITHUB_ENV"
       - name: Configure + build the tier
-        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio
+        # -j on the command line, not the preset's `"jobs": 0`: that means the native tool's default, and for
+        # the Makefiles this tier gets it is a BARE -j — unlimited. Measured on the v0.35.0 release run: all 137
+        # objects started compiling within 5 s, 90 of them within the first second; on deb, during the same
+        # step of the main run after it, the runner's user held 16.9 GB resident at load average 80 on 20
+        # threads.
+        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio -j "$(nproc)"
       - name: Run the suite in node
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
         # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
