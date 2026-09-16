@@ -35,8 +35,9 @@ constexpr int kMaxBlockSize = 8192;
 // THE LOWEST SAMPLE RATE THE CORE TAKES AS AUDIO (P51). NOT a size and NOT a tier knob like the two above: a
 // validity floor, and one number for every entry that takes a rate a caller could have got wrong — the loudness
 // search (mastering::TargetLoudnessSolver), the mastering chain and the delivery resampler under the C ABI's
-// `fc_master_create`, and the probe ABI's measurers (fcore::Probe, fcore::ShapeProbe and the analysis classes
-// behind it). Each keeps its own name for it (`X::kMinSampleRate`), and every one of them is THIS constant, because
+// `fc_master_create`, the probe ABI's measurers (fcore::Probe, fcore::ShapeProbe and the analysis classes
+// behind it), and oversampling::CascadeOversampler (P31) — with it every nonlinear stage prepared under
+// oversampling::Topology::Cascade. Each keeps its own name for it (`X::kMinSampleRate`), and every one of them is THIS constant, because
 // the floor used to be three answers to one question: any rate > 0 (the search), whatever the chain's stages
 // happened to refuse (above 50 Hz with the limiter on, 20.4 Hz with only the EQ, nothing without either), and
 // 1000 Hz (the probe and its analyzers, in seven copies). The CEILINGS stay per class, with their own reasons

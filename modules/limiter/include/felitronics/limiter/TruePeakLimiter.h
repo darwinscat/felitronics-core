@@ -7,6 +7,7 @@
 #include <felitronics/core/Math.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/FlushToZero.h>
+#include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 
 #include <algorithm>
@@ -74,7 +75,8 @@ namespace detail
 }
 
 //==============================================================================
-// TOPOLOGY, fixed for the life of a prepared stream. These three decide the FIR design, the buffer
+// TOPOLOGY, fixed for the life of a prepared stream. These four decide the FIR design (under Cascade together
+// with the sample rate), the buffer
 // sizes and the reported latency, so none of them can be a per-block parameter: changing the factor
 // has no state-preserving mapping between a live 2×/4×/8× history, and changing the lookahead moves
 // latencySamples(), which in any host is a resynchronisation event rather than automation. They live
@@ -86,6 +88,13 @@ struct TruePeakLimiterConfig
     double lookaheadMs      = 1.0;
     int    oversampleFactor = 4;     // ≥ 2; a requested 1 becomes 2 — there is no 1× path
     int    tapsPerPhase     = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // ≥ 4
+    // Which oversampler (P31). Kaiser — PolyphaseOversampler, the default. Cascade — CascadeOversampler:
+    // flat to 20 kHz at every rate, a power-of-two factor only (3, 5, 6 ... are refused, not clamped), a longer round trip (131 samples at
+    // 44.1 kHz 4x). `tapsPerPhase` is range-checked under both and used only by Kaiser. The cascade also
+    // narrows the accepted rates to [8 kHz, 3 MHz] (the core's floor, P51); Kaiser goes as low as 20 ms still
+    // holds two samples.
+    // What the cascade changes about the ceiling is stated under WHAT IT DOES NOT PROMISE, below.
+    oversampling::Topology topology = oversampling::Topology::Kaiser;
 };
 
 // PER-BLOCK parameters — safe to change at any time, from the audio thread, mid-stream.
@@ -200,6 +209,24 @@ struct TruePeakLimiterTap
 // hard-limited master and ~0.3 dB for ordinary material, at 4× or 8× alike — and if you need a
 // GUARANTEE rather than a budget, measure the delivered peak and close the loop on it.
 //
+// UNDER Topology::Cascade (P31; `TruePeakLimiterConfig::topology`) the same witnesses were run through
+// oversampling::CascadeOversampler, and three things are different (felitronics_limiter_ceiling_tests,
+// the "Cascade topology" groups):
+//   * the grid term keeps its closed form, but the round trip is flat to 20 kHz, so at 44.1 kHz it now
+//     DELIVERS 4fs/9 (0.4444 fs), and that becomes the worst tone at 8x (+0.133 against 2fs/5's +0.108)
+//     and at 16x (+0.033). fs/3 and 2fs/5 still win at 2x and 4x, and at 48 kHz (flat to 0.4167 fs)
+//     nothing moves. test_support's deliveredBudgetDbFlatTo() enumerates it from the band edge;
+//   * the modulation envelope HOLDS — every dense witness and every click train at releases from 100 ms
+//     down to 0.1 ms lands inside grid + 1.15 dB: worst 1.344 dB at 2x and 44.1 kHz; at 48 kHz 0.997 at 4x
+//     and 0.938 at 8x, inside budgets of 1.586 and 1.258 (these two excesses are a hair above the Kaiser
+//     totals quoted above, which were stated for releases >= 1 ms); and at 44.1 kHz, 4x and 8x, the cascade's
+//     DENSE excess is lower than
+//     Kaiser's (0.49 / 0.48 dB against 0.81 / 0.75);
+//   * both floors at once: 2.03 / 1.42 / 1.37 dB at 2x / 4x / 8x and 44.1 kHz (Kaiser 2.16 / 1.87 / 1.83),
+//     2.17 / 1.85 / 1.79 at 48 kHz — outside the envelope, as under Kaiser, and pinned.
+// And the round trip is 131 base samples at 44.1 kHz 4x (76 at 48 kHz) plus the lookahead, where the
+// table below and its droop are Kaiser's: under the cascade 20 kHz passes flat at every rate.
+//
 // ALWAYS IN THE PATH, even when nothing is being limited: the 0.90 × Nyquist prototype is applied TWICE,
 // once interpolating and once decimating, so the top of the band is attenuated by |H|² — the dB figures
 // of one pass, DOUBLED. Measured on the round trip (and derived independently from designFilter()'s
@@ -226,7 +253,8 @@ struct TruePeakLimiterTap
 // the whole tpp × factor surface is pinned by felitronics_oversampling_tests.
 //
 // WHAT IS CLAMPED, all of it visible rather than silent (oversampleFactor(), lookaheadSamples(),
-// effectiveReleaseMs(), effectiveCeilingDbTp()): the oversampling factor into [2, 16]; the lookahead
+// effectiveReleaseMs(), effectiveCeilingDbTp()): the oversampling factor into [2, 16] (under Topology::Cascade
+// a factor in that range that is not a power of two is REFUSED instead — it has no cascade); the lookahead
 // into [2 baseband samples, 20 ms]; the release time constant to at least 8 baseband samples and to
 // strictly less than an infinite hold; the ceiling into [-200, +60] dBTP. The two floors are measured —
 // the smallest values that keep the witness matrix inside the figures above — and both sit far below any
@@ -261,7 +289,7 @@ public:
         std::size_t channels    = 0;       // one oversampled scratch buffer and one delay line per channel
         std::size_t osBufSamples = 0;      // floats in EACH scratch buffer: the capped block x the factor
         int         osDelaySamples = 0;    // the 20 ms lookahead capacity, in OVERSAMPLED samples
-        oversampling::PolyphaseOversampler::Storage os {};
+        oversampling::Oversampler::Storage os {};
         detail::SlidingMax::Storage slide {};
         std::uint64_t bytes() const noexcept
         {
@@ -291,7 +319,7 @@ public:
         if (config.oversampleFactor > kMaxFactor) return false;
         Storage st;
         const int f = oversampleFactorFor (config);
-        if (! oversampling::PolyphaseOversampler::storageFor (f, maxChannels, config.tapsPerPhase, st.os))
+        if (! oversampling::Oversampler::storageFor (config.topology, sampleRate, f, maxChannels, config.tapsPerPhase, st.os))
             return false;
         // A rate so low that 20 ms cannot hold the minimum lookahead would make prepare()'s clamp
         // std::clamp(x, 2, 1) — lo > hi is undefined behaviour. Refuse instead, here and there.
@@ -344,7 +372,8 @@ public:
     {
         Storage st;
         if (! storageFor (sampleRate, maxBlock, maxChannels, config, st)) return 0;
-        return (config.tapsPerPhase - 1)
+        return oversampling::Oversampler::latencyFor (config.topology, sampleRate, oversampleFactorFor (config),
+                                                      config.tapsPerPhase)
              + lookaheadSamplesFor (sampleRate, config.lookaheadMs, maxLookaheadSamplesFor (sampleRate));
     }
 
@@ -379,7 +408,7 @@ public:
         maxBlock_ = blockFor (maxBlock);
         tpp   = config.tapsPerPhase;
         F     = oversampleFactorFor (config);                  // a requested 1 becomes 2; above kMaxFactor was refused
-        if (! os.prepare (F, maxCh, tpp)) return false;        // oversampler rejected → stay unprepared
+        if (! os.prepare (config.topology, fs, F, maxCh, tpp)) return false;   // rejected → stay unprepared
 
         // st.osBufSamples is maxBlock_ x F, NOT maxBlock x F: the cap above exists to bound exactly this
         // allocation ("without a cap a hostile or mistaken prepare() could ask for gigabytes"), and sizing
@@ -457,9 +486,9 @@ public:
     // on it is a display, not a measurement.
     //
     // IT IS NOT "THE" TRUE PEAK OF THE INPUT, and the difference is the point of reporting it separately.
-    // This is what the limiter's OWN reconstruction saw — a 0.90 x Nyquist Kaiser prototype at this
-    // instance's factor and tapsPerPhase — and it is the number that EXPLAINS the gain reduction this
-    // instance applied. A meter of a different design reads something else on the same signal, and the
+    // This is what the limiter's OWN reconstruction saw — under Kaiser a 0.90 x Nyquist prototype at this
+    // instance's factor and tapsPerPhase, under Cascade the cascade's interpolator — and it is the number
+    // that EXPLAINS the gain reduction this instance applied. A meter of a different design reads something else on the same signal, and the
     // gap is the material's, not a defect: against `analysis::TruePeakMeter` (the spec's 12-tap filter)
     // at 4x, measured, a 1 kHz burst train agrees to **-0.0012 dB** and a pair of adjacent full-scale
     // impulses — maximally broadband, i.e. the worst case for two different low-passes — disagrees by
@@ -657,7 +686,7 @@ private:
     bool prepared_ = false;                     // true only after a fully-successful prepare()
     TruePeakLimiterParams params;
 
-    oversampling::PolyphaseOversampler os;
+    oversampling::Oversampler os;
     std::vector<std::vector<float>>    osBuf;
     std::vector<float*>                osPtrs;
     std::vector<core::DelayLine>       osDelays;

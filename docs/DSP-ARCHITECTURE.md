@@ -232,7 +232,9 @@ the CPU at runtime, invisible to any build. Full write-up:
    runtime and no build can see it.)
    **THE LAW HAS EXACTLY ONE LOCAL OVERRIDE, and it is a header that turns contraction OFF for itself:**
    `core::firDot` (`modules/core/include/felitronics/core/PolyphaseFir.h`, P56), the single polyphase-FIR
-   inner product that `oversampling::PolyphaseOversampler` and `analysis::TruePeakMeter` both run. The law
+   inner product that `oversampling::PolyphaseOversampler`, `oversampling::CascadeOversampler` (P31) and
+   `analysis::TruePeakMeter` all run. (The cascade has the one sum outside it — its halfband decimator's
+   centre tap — and adds a value halved and STORED a sample earlier, so no contraction can join the two.) The law
    is right about the tree and wrong about that one loop: `acc += a*b` is the contractible form, arm64 fuses
    it and baseline x86-64 cannot, so contraction there does not make one number better — it makes five rows
    disagree. With the order nailed down and contraction off locally, they do not: one measured constant on

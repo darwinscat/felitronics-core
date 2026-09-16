@@ -56,6 +56,7 @@
 #include <truepeak_witnesses.h>
 
 #include <felitronics/limiter/TruePeakLimiter.h>
+#include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/FlushToZero.h>
@@ -250,7 +251,8 @@ private:
 // something else. Defaulted to the shipped value; passed explicitly only where the OLD topology is the
 // point of the check.
 struct Setup { double ceilingDb = -1.0, releaseMs = 50.0, lookaheadMs = 1.0; int factor = 4;
-               int taps = limiter::TruePeakLimiterConfig {}.tapsPerPhase; };
+               int taps = limiter::TruePeakLimiterConfig {}.tapsPerPhase;
+               oversampling::Topology topology = oversampling::Topology::Kaiser; };
 
 // Render through the REAL class. The drain matters and is not padding: the limiter delays by
 // latencySamples(), so without it the tail of the witness never comes out, the buffer stops
@@ -263,7 +265,7 @@ static std::vector<std::vector<float>> renderAt (const std::vector<std::vector<f
     const int nch = (int) in.size(), n = (int) in[0].size();
     limiter::TruePeakLimiter lim;
     const int maxBlock = block > 0 ? block : n;
-    (void) lim.prepare (sr, maxBlock, nch, { s.lookaheadMs, s.factor, s.taps });   // topology is prepare-time only now
+    (void) lim.prepare (sr, maxBlock, nch, { s.lookaheadMs, s.factor, s.taps, s.topology });   // topology is prepare-time only now
     limiter::TruePeakLimiterParams p;
     p.ceilingDbTp = s.ceilingDb; p.releaseMs = s.releaseMs;
     lim.setParams (p);
@@ -314,6 +316,231 @@ static int firstDifference (const std::vector<float>& a, const std::vector<float
 }
 
 static std::string dbs (double v) { char b[32]; std::snprintf (b, sizeof b, "%+.4f", v); return b; }
+
+//==============================================================================
+// THE CASCADE TOPOLOGY (P31). Everything above runs the shipped default; this runs the same witnesses
+// through `oversampling::Topology::Cascade`, which is flat to 20 kHz at every rate, and states what that
+// changes about the ceiling: the grid term's worst tone at 44.1 kHz (4fs/9 is delivered now), nothing at
+// 48 kHz, and — measured, not assumed — not the modulation envelope.
+static void runCascadeTopology()
+{
+    using oversampling::Topology;
+    const double C = -1.0;
+    auto cascade = [] (double c, double rel, int F) { Setup s { c, rel, 1.0, F }; s.topology = Topology::Cascade; return s; };
+    auto edgeOf = [] (double sr) { oversampling::CascadeOversampler::Design d;
+                                   (void) oversampling::CascadeOversampler::designFor (sr, 4, d); return d.bandEdgeHz / sr; };
+
+    test::group ("Cascade topology: the budget enumeration reproduces Kaiser's, and moves only where the band does");
+    for (int F : { 2, 4, 8, 16 })
+        test::approx (tpw::deliveredBudgetDbFlatTo (F, 0.40), tpw::deliveredBudgetDb (F), 1e-12,
+                      "F=" + std::to_string (F) + ": enumerated to Kaiser's flat edge == the named budget");
+    // The enumeration really runs to q = 64: a band flat to 0.471 fs delivers 8fs/17, whose grid term wins at
+    // 16x — a search stopped at small denominators would have answered 4fs/9 (0.0331) here.
+    test::approx (tpw::deliveredBudgetDbFlatTo (16, 0.471) - tpw::kModulationEnvelopeDb, tpw::gridBreachDb (8, 17, 16), 1e-12,
+                  "flat to 0.471 fs at 16x: the worst tone is 8fs/17 (" + dbs (tpw::gridBreachDb (8, 17, 16)) + ")");
+    test::ok (tpw::gridBreachDb (8, 17, 16) > tpw::gridBreachDb (4, 9, 16), "(and it does beat 4fs/9 there)");
+    const double wantAt441[] = { 1.2494, 0.4359, 0.1330, 0.0331 };
+    const int    factors[]   = { 2, 4, 8, 16 };
+    for (int i = 0; i < 4; ++i)
+    {
+        test::approx (tpw::deliveredBudgetDbFlatTo (factors[i], edgeOf (44100.0)) - tpw::kModulationEnvelopeDb, wantAt441[i], 5e-5,
+                      "44.1 kHz, F=" + std::to_string (factors[i]) + ": the cascade's grid allowance");
+        test::approx (tpw::deliveredBudgetDbFlatTo (factors[i], edgeOf (48000.0)), tpw::deliveredBudgetDbFlatTo (factors[i], 0.40), 1e-12,
+                      "48 kHz, F=" + std::to_string (factors[i]) + ": unchanged from Kaiser's");
+    }
+
+    test::group ("Cascade topology: delivered true peak == ceiling + the grid's closed form, 4fs/9 included at 44.1 kHz");
+    {
+        struct Tone { int p, q; const char* name; };
+        const Tone tones[] { { 1, 3, "fs/3" }, { 2, 5, "2fs/5" }, { 4, 9, "4fs/9" } };
+        for (const auto& t : tones)
+            for (int F : { 2, 4, 8 })
+            {
+                const int M = tpw::gridPhaseCount (t.p, t.q, F);
+                double worst = -1e9;
+                for (int k = 0; k < 2 * M; ++k)
+                {
+                    const auto x = tpw::gridTone (44100.0, 0.05, t.p, t.q, 12.0, (double) k / (double) (2 * M));
+                    std::vector<std::vector<float>> in { x };
+                    worst = std::max (worst, tp::truePeakDbFft (renderAt (in, 44100.0, cascade (C, 50.0, F), 0)[0]));
+                }
+                test::approx (worst - C, tpw::gridBreachDb (t.p, t.q, F), 0.015,
+                              std::string ("44.1 kHz ") + t.name + " at F=" + std::to_string (F) + ": " + dbs (worst - C)
+                              + " == the closed form " + dbs (tpw::gridBreachDb (t.p, t.q, F)));
+            }
+        // And at 48 kHz 4fs/9 is past the cascade's band edge, so it is NOT delivered at its grid term.
+        const int M = tpw::gridPhaseCount (4, 9, 8);
+        double worst48 = -1e9;
+        for (int k = 0; k < 2 * M; ++k)
+        {
+            std::vector<std::vector<float>> in { tpw::gridTone (48000.0, 0.05, 4, 9, 12.0, (double) k / (double) (2 * M)) };
+            worst48 = std::max (worst48, tp::truePeakDbFft (renderAt (in, 48000.0, cascade (C, 50.0, 8), 0)[0]));
+        }
+        test::ok (worst48 - C < 0.0, "48 kHz: 4fs/9 is attenuated on the way in and stays under the ceiling (" + dbs (worst48 - C) + ")");
+    }
+
+    test::group ("Cascade topology: every transient and dense witness lands inside the derived budget, at 44.1 and 48 kHz");
+    for (double sr : { 44100.0, 48000.0 })
+        for (int F : { 2, 4, 8 })
+        {
+            const double budget = tpw::deliveredBudgetDbFlatTo (F, edgeOf (sr));
+            const std::string tag = std::to_string ((int) sr) + " Hz F=" + std::to_string (F);
+            double worst = -1e9;
+            for (double makeup : { 64.0, 76.0, 88.0 })
+            {
+                std::vector<std::vector<float>> in { tpw::clickTrain (sr, 0.15, 3.0, -60.0 + makeup, 0.5) };
+                const double got = tp::truePeakDbFft (renderAt (in, sr, cascade (-2.2, 50.0, F), 0)[0], 16);
+                test::ok (got <= -2.2 + budget && got > -2.2 - 1.5, tag + " makeup " + dbs (makeup) + ": click train delivered "
+                          + dbs (got) + " within (" + dbs (-3.7) + ", " + dbs (-2.2 + budget) + "]");
+            }
+            for (double rel : { 100.0, 50.0, 1.0, 0.1 })
+            {
+                std::vector<std::vector<float>> dense { tpw::denseNoise (sr, 0.20, 10.0) };
+                std::vector<std::vector<float>> click { tpw::clickTrain (sr, 0.15, 3.0, 26.0, 0.5) };
+                worst = std::max (worst, tp::truePeakDbFft (renderAt (dense, sr, cascade (C, rel, F), 0)[0]) - C);
+                worst = std::max (worst, tp::truePeakDbFft (renderAt (click, sr, cascade (C, rel, F), 0)[0]) - C);
+            }
+            std::printf ("       cascade %s: worst dense/click excess %+.4f dB, budget %+.4f\n", tag.c_str(), worst, budget);
+            test::ok (worst <= budget, tag + ": dense noise and clicks at releases 100 .. 0.1 ms stay inside the budget ("
+                                       + dbs (worst) + " <= " + dbs (budget) + ")");
+            test::ok (worst > 0.3, tag + ": and the modulation term is really there (" + dbs (worst) + ")");
+        }
+
+    test::group ("Cascade topology: at 4x and 8x the dense excess is LOWER than Kaiser's (44.1 kHz)");
+    {
+        // Pinned both ways, per topology, so the comparison cannot pass by the two columns being one run.
+        const double wantC[] = { 0.4882, 0.4809 }, wantK[] = { 0.8099, 0.7453 };
+        for (int fi = 0; fi < 2; ++fi)
+        {
+            const int F = 4 << fi;
+            double dc = -1e9, dk = -1e9;
+            for (double rel : { 100.0, 50.0, 1.0 })
+            {
+                std::vector<std::vector<float>> in { tpw::denseNoise (44100.0, 0.20, 10.0) };
+                Setup k { C, rel, 1.0, F };
+                dc = std::max (dc, tp::truePeakDbFft (renderAt (in, 44100.0, cascade (C, rel, F), 0)[0]) - C);
+                dk = std::max (dk, tp::truePeakDbFft (renderAt (in, 44100.0, k, 0)[0]) - C);
+            }
+            std::printf ("       44.1 kHz F=%d dense excess: cascade %+.4f, Kaiser %+.4f\n", F, dc, dk);
+            test::approx (dc, wantC[fi], 0.05, "F=" + std::to_string (F) + ": the cascade's dense excess");
+            test::approx (dk, wantK[fi], 0.05, "F=" + std::to_string (F) + ": Kaiser's, at the same rate");
+            test::ok (dc < dk - 0.2, "F=" + std::to_string (F) + ": the cascade's is lower by more than 0.2 dB");
+        }
+    }
+
+    test::group ("Cascade topology: both floors at once — outside the envelope, as with Kaiser, and pinned");
+    {
+        // Measured: 44.1 kHz 2.029 / 1.422 / 1.368 at 2x / 4x / 8x (Kaiser 2.163 / 1.871 / 1.827 at the same
+        // rate), 48 kHz 2.170 / 1.846 / 1.789 (Kaiser 2.159 / 1.868 / 1.824). A sharper decimator does not
+        // ring more at the floors here; at 44.1 kHz it rings less, because the steps' energy above 20 kHz is
+        // what the Kaiser one lets through its wider transition.
+        const double want441[] = { 2.0287, 1.4218, 1.3679 }, want48[] = { 2.1701, 1.8464, 1.7888 };
+        const double kaiser441[] = { 2.1627, 1.8711, 1.8266 };
+        for (int fi = 0; fi < 3; ++fi)
+            for (double sr : { 44100.0, 48000.0 })
+            {
+                const int F = 2 << fi;
+                double worst = -1e9;
+                for (auto w : { tpw::clickTrain (sr, 0.12, 3.0, 26.0, 0.5), tpw::denseNoise (sr, 0.12, 10.0), tpw::denseNoise (sr, 0.12, 20.0) })
+                {
+                    std::vector<std::vector<float>> in { w };
+                    Setup s { C, 0.0, 0.0, F }; s.topology = Topology::Cascade;
+                    worst = std::max (worst, tp::truePeakDbFft (renderAt (in, sr, s, 0)[0]) - C);
+                }
+                test::approx (worst, sr == 44100.0 ? want441[fi] : want48[fi], 0.05,
+                              std::to_string ((int) sr) + " Hz F=" + std::to_string (F) + ": the cascade's corner");
+                if (sr == 44100.0)
+                {
+                    double wk = -1e9;
+                    for (auto w : { tpw::clickTrain (sr, 0.12, 3.0, 26.0, 0.5), tpw::denseNoise (sr, 0.12, 10.0), tpw::denseNoise (sr, 0.12, 20.0) })
+                    {
+                        std::vector<std::vector<float>> in { w };
+                        wk = std::max (wk, tp::truePeakDbFft (renderAt (in, sr, Setup { C, 0.0, 0.0, F }, 0)[0]) - C);
+                    }
+                    test::approx (wk, kaiser441[fi], 0.05, "44100 Hz F=" + std::to_string (F) + ": Kaiser's corner at the same rate");
+                }
+            }
+    }
+
+    test::group ("Cascade topology: latency, refusals, the top of the band, and bit-exact block invariance");
+    {
+        limiter::TruePeakLimiterConfig cfg; cfg.topology = Topology::Cascade; cfg.lookaheadMs = 1.0;
+        limiter::TruePeakLimiter lim;
+        test::ok (lim.prepare (44100.0, 512, 2, cfg), "44.1 kHz 4x cascade prepares");
+        const int look = lim.lookaheadSamples();
+        test::ok (lim.latencySamples() == 131 + look && lim.latencySamples() == limiter::TruePeakLimiter::latencyFor (44100.0, 512, 2, cfg),
+                  "latency is the cascade's 131 plus the lookahead (" + std::to_string (lim.latencySamples()) + "), and latencyFor agrees");
+        {   // a requested 1x is the clamped 2x — and latencyFor has to price the 2x the preparation builds
+            limiter::TruePeakLimiterConfig one = cfg; one.oversampleFactor = 1;
+            limiter::TruePeakLimiter l1;
+            test::ok (l1.prepare (44100.0, 512, 2, one) && l1.oversampleFactor() == 2
+                      && l1.latencySamples() == limiter::TruePeakLimiter::latencyFor (44100.0, 512, 2, one)
+                      && l1.latencySamples() == oversampling::CascadeOversampler::latencyFor (44100.0, 2) + l1.lookaheadSamples(),
+                      "a requested 1x under the cascade: latencyFor prices the 2x that is built (" + std::to_string (l1.latencySamples()) + ")");
+        }
+        limiter::TruePeakLimiterConfig odd = cfg; odd.oversampleFactor = 3;
+        limiter::TruePeakLimiter::Storage st;
+        test::ok (! lim.prepare (44100.0, 512, 2, odd) && ! limiter::TruePeakLimiter::storageFor (44100.0, 512, 2, odd, st)
+                  && limiter::TruePeakLimiter::latencyFor (44100.0, 512, 2, odd) == 0,
+                  "a factor of 3 is refused under the cascade (prepare, storageFor and latencyFor agree)");
+        test::ok (lim.latencySamples() == 0, "...and a refused prepare leaves the limiter unprepared, as it always did");
+        limiter::TruePeakLimiterConfig kodd = odd; kodd.topology = Topology::Kaiser;
+        test::ok (lim.prepare (44100.0, 512, 2, kodd), "while Kaiser at 3x still prepares — the default's refusal set is unchanged");
+        limiter::TruePeakLimiterConfig k500 = cfg; k500.topology = Topology::Kaiser;
+        test::ok (! lim.prepare (500.0, 512, 2, cfg) && ! limiter::TruePeakLimiter::storageFor (500.0, 512, 2, cfg, st)
+                  && limiter::TruePeakLimiter::latencyFor (500.0, 512, 2, cfg) == 0 && lim.prepare (500.0, 512, 2, k500),
+                  "500 Hz: refused under the cascade (its rate window starts at the core's 8 kHz), accepted under Kaiser as before");
+        limiter::TruePeakLimiter edge;
+        test::ok (edge.prepare (core::kMinSampleRate, 512, 2, cfg) && ! edge.prepare (std::nextafter (core::kMinSampleRate, 0.0), 512, 2, cfg),
+                  "and the cascade limiter's floor is exactly the core's 8 kHz — accepted there, refused one representable rate below");
+
+        // 20 kHz below the ceiling passes as itself under the cascade; the Kaiser round trip takes 15.5 dB.
+        auto level20k = [&] (Topology topo)
+        {
+            const double fs = 44100.0; const int n = 44100;
+            std::vector<float> x ((std::size_t) n);
+            for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) (0.1 * std::sin (2.0 * 3.14159265358979323846 * 20000.0 / fs * i));
+            std::vector<std::vector<float>> in { x };
+            Setup s { -1.0, 50.0, 1.0, 4 }; s.topology = topo;
+            const auto y = renderAt (in, fs, s, 0);
+            double sum = 0.0; for (int i = 20000; i < 40000; ++i) sum += (double) y[0][(std::size_t) i] * y[0][(std::size_t) i];
+            return 20.0 * std::log10 (std::sqrt (sum / 20000.0) * std::sqrt (2.0) / 0.1);
+        };
+        const double lc = level20k (Topology::Cascade), lk = level20k (Topology::Kaiser);
+        std::printf ("       20 kHz at -20 dBFS through the idle limiter, 44.1 kHz: cascade %+.4f dB, Kaiser %+.2f dB\n", lc, lk);
+        test::ok (std::fabs (lc) < 0.02, "44.1 kHz: 20 kHz passes the idle cascade limiter flat (" + dbs (lc) + ")");
+        test::ok (lk < -15.0, "where the Kaiser round trip takes " + dbs (lk));
+
+        // Block-size invariance, bit-exact, under the cascade.
+        const auto dense = tpw::denseNoise (44100.0, 0.25, 8.0);
+        std::vector<std::vector<float>> in { dense, dense };
+        for (auto& v : in[1]) v *= -0.7f;
+        Setup s { -1.0, 20.0, 1.0, 4 }; s.topology = Topology::Cascade;
+        const auto whole = renderAt (in, 44100.0, s, 0);
+        bool same = true;
+        for (int blk : { 1, 63, 512 })
+        {
+            const auto part = renderAt (in, 44100.0, s, blk);
+            for (int c = 0; c < 2; ++c) same &= firstDifference (whole[(std::size_t) c], part[(std::size_t) c]) < 0;
+        }
+        test::ok (same, "blocks of 1, 63 and 512 give the whole-file render bit for bit");
+        // ...and the second channel is ITS OWN channel: with one linked gain and ch1 = -0.7 ch0 going in,
+        // ch1 = -0.7 ch0 comes out (a decimator that read ch0 for both planes rendered the same bits every
+        // block size, so the invariance above could not see it).
+        double worstLink = 0.0;
+        for (std::size_t i = 0; i < whole[0].size(); ++i)
+            worstLink = std::max (worstLink, (double) std::fabs (whole[1][i] + 0.7f * whole[0][i]));
+        test::ok (worstLink < 1e-5, "the stereo output keeps ch1 = -0.7 ch0 through the cascade (worst " + std::to_string (worstLink) + ")");
+
+        // moved-from: the limiter reads through the same switch
+        limiter::TruePeakLimiter a;
+        (void) a.prepare (44100.0, 512, 1, cfg);
+        limiter::TruePeakLimiter b = std::move (a);
+        test::ok (b.latencySamples() == 131 + b.lookaheadSamples(), "a moved-to cascade limiter keeps its latency");
+        a.reset();                                                     // NOLINT: use after move is the test
+        test::ok (true, "and reset() on the moved-from one returns (it used to dereference an empty vector)");
+    }
+}
 
 //==============================================================================
 int main()
@@ -1638,6 +1865,8 @@ int main()
                          above, lookOs);
         }
     }
+
+    runCascadeTopology();
 
     return test::report();
 }

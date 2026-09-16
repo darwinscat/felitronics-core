@@ -9,7 +9,9 @@
 #include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/saturation/WaveShaper.h>
 #include <felitronics/saturation/Saturator.h>
+#include <felitronics/oversampling/CascadeOversampler.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -336,6 +338,274 @@ namespace nulltest
         return out;
     }
 } // namespace nulltest
+
+//==============================================================================
+// THE CASCADE TOPOLOGY (P31). `prepare(..., Topology::Cascade)` swaps the 0.45 fs Kaiser oversampler for
+// oversampling::CascadeOversampler — as strict, flat to 20 kHz. What that must and must not change here.
+namespace cascadeprobe
+{
+    constexpr int kW = 16384, kWarm = 32768;
+
+    inline void fft (std::vector<double>& re, std::vector<double>& im)
+    {
+        const std::size_t n = re.size();
+        for (std::size_t i = 1, j = 0; i < n; ++i)
+        {
+            std::size_t bit = n >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) { std::swap (re[i], re[j]); std::swap (im[i], im[j]); }
+        }
+        for (std::size_t len = 2; len <= n; len <<= 1)
+        {
+            const double ang = -2.0 * core::kPi / (double) len;
+            for (std::size_t i = 0; i < n; i += len)
+                for (std::size_t k = 0; k < len / 2; ++k)
+                {
+                    const double wr = std::cos (ang * (double) k), wi = std::sin (ang * (double) k);
+                    const std::size_t a = i + k, b = i + k + len / 2;
+                    const double vr = re[b] * wr - im[b] * wi, vi = re[b] * wi + im[b] * wr;
+                    re[b] = re[a] - vr; im[b] = im[a] - vi;
+                    re[a] += vr;        im[a] += vi;
+                }
+        }
+    }
+
+    // One sine exactly on bin `bin` of a kW window; the stage runs for kWarm first. Returns |X| per bin
+    // (single-sided amplitude), read over the last kW samples.
+    inline std::vector<double> spectrum (double fs, oversampling::Topology topo, Shape shape, float driveDb, float bias,
+                                         int bin, double amp)
+    {
+        std::vector<float> x ((std::size_t) (kW + kWarm));
+        for (std::size_t i = 0; i < x.size(); ++i)
+            x[i] = (float) (amp * std::sin (2.0 * core::kPi * (double) bin / kW * (double) i + 0.1));
+        saturation::Saturator s;
+        (void) s.prepare (fs, 512, 1, 4, 64, topo);
+        saturation::Saturator::Params p; p.shape = shape; p.driveDb = driveDb; p.bias = bias; p.mix = 1.0f;
+        s.setParams (p);
+        for (std::size_t o = 0; o < x.size(); o += 512)
+        {
+            float* io[1] { x.data() + o };
+            felitronics::test::run (s.process (io, 1, (int) std::min<std::size_t> (512, x.size() - o)));
+        }
+        std::vector<double> re ((std::size_t) kW), im ((std::size_t) kW, 0.0);
+        for (int i = 0; i < kW; ++i) re[(std::size_t) i] = (double) x[(std::size_t) (kWarm + i)];
+        fft (re, im);
+        std::vector<double> m ((std::size_t) kW / 2 + 1);
+        for (std::size_t i = 0; i < m.size(); ++i) m[i] = 2.0 * std::hypot (re[i], im[i]) / (double) kW;
+        return m;
+    }
+    // every bin in [3, hi] that is not a harmonic of f0 below Nyquist, dB re the fundamental
+    inline double nonHarmonicDbc (const std::vector<double>& m, int f0, int hi)
+    {
+        double e = 0.0;
+        for (int b = 3; b <= hi; ++b) if (b % f0 != 0) e += m[(std::size_t) b] * m[(std::size_t) b];
+        return 10.0 * std::log10 (e / (m[(std::size_t) f0] * m[(std::size_t) f0]) + 1e-300);
+    }
+    // everything in [3, hi] except `skip`, dB re a full-scale sine
+    inline double garbageDbfs (const std::vector<double>& m, int skip, int hi)
+    {
+        double e = 0.0;
+        for (int b = 3; b <= hi; ++b) if (b != skip) e += m[(std::size_t) b] * m[(std::size_t) b];
+        return 10.0 * std::log10 (e + 1e-300);
+    }
+}
+
+static void runCascadeTopologyTests()
+{
+    using oversampling::Topology;
+    using namespace cascadeprobe;
+    namespace alloc = felitronics::test::alloc;
+
+    test::group ("Saturator, Topology::Cascade: latency, refusals and the budget follow the topology");
+    {
+        saturation::Saturator s;
+        test::ok (s.prepare (44100.0, 512, 2, 4, 64, Topology::Cascade), "44.1 kHz 4x stereo prepares");
+        const int want = oversampling::CascadeOversampler::latencyFor (44100.0, 4);
+        test::ok (want == 131 && s.latencySamples() == want
+                  && saturation::Saturator::latencyFor (44100.0, 512, 2, 4, 64, Topology::Cascade) == want,
+                  "latency is the cascade's own 131, and latencyFor says so before preparing ("
+                  + std::to_string (s.latencySamples()) + ")");
+        test::ok (saturation::Saturator::latencyFor (44100.0, 512, 2, 4, 64) == 63, "while the default still reads 63");
+        test::ok (saturation::Saturator::latencyForFactor (4, 64) == 63 && saturation::Saturator::latencyForFactor (1, 64) == 0
+                  && saturation::Saturator::latencyForFactor (4, 0) == 0 && saturation::Saturator::latencyForFactor (32, 12) == 11,
+                  "latencyForFactor (Kaiser's formula, public, no in-tree caller left) is still tpp - 1 above factor 1");
+        saturation::Saturator::Storage st;
+        test::ok (! s.prepare (44100.0, 512, 2, 3, 64, Topology::Cascade)
+                  && ! saturation::Saturator::storageFor (44100.0, 512, 2, 3, 64, st, Topology::Cascade)
+                  && saturation::Saturator::latencyFor (44100.0, 512, 2, 3, 64, Topology::Cascade) == 0,
+                  "a factor of 3 is refused under the cascade, by prepare, storageFor and latencyFor alike");
+        test::ok (s.prepare (44100.0, 512, 2, 3, 64), "and still accepted under Kaiser — the default's refusal set did not move");
+        test::ok (! s.prepare (44100.0, 512, 2, 4, 2000, Topology::Cascade) && ! s.prepare (44100.0, 512, 2, 4, 3, Topology::Cascade),
+                  "tapsPerPhase is still range-checked under the cascade (2000 and 3 refused, as under Kaiser), so no argument became free");
+        test::ok (s.prepare (44100.0, 512, 2, 1, 2000, Topology::Cascade) && s.latencySamples() == 0,
+                  "and at factor 1 there is no oversampler, so the topology is moot — exactly as tapsPerPhase was");
+        // The cascade designs from the RATE, so under it the rate window is [8 kHz, 3 MHz]; the Kaiser stage
+        // never looked at the rate and keeps accepting what it accepted.
+        test::ok (! s.prepare (500.0, 512, 2, 4, 64, Topology::Cascade)
+                  && ! saturation::Saturator::storageFor (500.0, 512, 2, 4, 64, st, Topology::Cascade)
+                  && saturation::Saturator::latencyFor (500.0, 512, 2, 4, 64, Topology::Cascade) == 0,
+                  "500 Hz is refused under the cascade (prepare, storageFor, latencyFor)");
+        test::ok (s.prepare (500.0, 512, 2, 4, 64) && s.latencySamples() == 63, "and accepted under Kaiser, as before");
+        test::ok (s.prepare (core::kMinSampleRate, 512, 2, 4, 64, Topology::Cascade)
+                  && ! s.prepare (std::nextafter (core::kMinSampleRate, 0.0), 512, 2, 4, 64, Topology::Cascade)
+                  && ! s.prepare (3.1e6, 512, 2, 4, 64, Topology::Cascade),
+                  "the core's 8 kHz floor (P51) is the cascade's, to the last representable rate below it; 3.1 MHz is past its ceiling");
+
+        for (Topology topo : { Topology::Kaiser, Topology::Cascade })
+        {
+            saturation::Saturator::Storage b;
+            const bool okB = saturation::Saturator::storageFor (48000.0, 256, 2, 8, 64, b, topo);
+            saturation::Saturator fresh;
+            const long long before = alloc::bytes.load();
+            const bool okP = fresh.prepare (48000.0, 256, 2, 8, 64, topo);
+            const long long got = alloc::bytes.load() - before;
+            test::ok (okB && okP && got == (long long) b.bytes(),
+                      std::string (topo == Topology::Kaiser ? "Kaiser" : "Cascade") + ": prepare() asked for exactly the published "
+                      + std::to_string (b.bytes()) + " B (" + std::to_string (got) + ")");
+        }
+    }
+
+    test::group ("Saturator, Topology::Cascade: reset, a channel that leaves and returns, and a moved-from stage");
+    {
+        auto burst = [] (std::vector<float>& v) { for (std::size_t i = 0; i < v.size(); ++i) v[i] = (float) (0.9 * std::sin (0.9 * (double) i)); };
+        saturation::Saturator::Params p; p.driveDb = 12.0f; p.mix = 1.0f;
+        // reset(): what was inside the cascade must not come back out of silence
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 1, 4, 64, Topology::Cascade);
+            s.setParams (p);
+            std::vector<float> x (256); burst (x);
+            float* io[1] { x.data() };
+            felitronics::test::run (s.process (io, 1, 256));
+            s.reset();
+            std::vector<float> z (512, 0.0f);
+            float* zo[1] { z.data() };
+            felitronics::test::run (s.process (zo, 1, 512));
+            float peak = 0.0f; for (float v : z) peak = std::max (peak, std::fabs (v));
+            test::ok (peak == 0.0f, "after reset() silence comes out as exact zero (peak " + std::to_string (peak) + ")");
+        }
+        // a channel that leaves and returns replays nothing (law 11a)
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 2, 4, 64, Topology::Cascade);
+            s.setParams (p);
+            std::vector<float> l (256), r (256); burst (l); burst (r);
+            float* st2[2] { l.data(), r.data() };
+            felitronics::test::run (s.process (st2, 2, 256));
+            std::vector<float> m (256, 0.0f);
+            float* mono[1] { m.data() };
+            felitronics::test::run (s.process (mono, 1, 256));
+            std::vector<float> a (512, 0.0f), b (512, 0.0f);
+            float* back[2] { a.data(), b.data() };
+            felitronics::test::run (s.process (back, 2, 512));
+            float peak = 0.0f; for (float v : b) peak = std::max (peak, std::fabs (v));
+            test::ok (peak == 0.0f, "a channel that left and returns on silence plays exact zero (peak " + std::to_string (peak) + ")");
+        }
+        // A factor-1 preparation releases the oversampler: preparing the cascade again after it asks for at least
+        // the oversampler's whole budget (had it been kept, the switch would re-prepare into its old buffers and
+        // ask for next to nothing).
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 2, 4, 64, Topology::Cascade);
+            (void) s.prepare (44100.0, 256, 2, 1, 64, Topology::Cascade);
+            saturation::Saturator::Storage b;
+            (void) saturation::Saturator::storageFor (44100.0, 256, 2, 4, 64, b, Topology::Cascade);
+            const long long before = alloc::bytes.load();
+            const bool okAgain = s.prepare (44100.0, 256, 2, 4, 64, Topology::Cascade);
+            const long long asked = alloc::bytes.load() - before;
+            test::ok (okAgain && asked >= (long long) b.os.bytes(),
+                      "after a factor-1 preparation the oversampler was released: preparing it again asks for its whole "
+                      + std::to_string (b.os.bytes()) + " B (" + std::to_string (asked) + ")");
+        }
+        // moved-from: reads as the class reads it, and never dereferences the stolen cascade
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 1, 4, 64, Topology::Cascade);
+            saturation::Saturator t = std::move (s);
+            test::ok (t.latencySamples() == 131, "the moved-to stage keeps its cascade (latency 131)");
+            s.reset();                                                 // NOLINT: use after move is the test
+            test::ok (s.latencySamples() == 0, "a moved-from cascade stage reports 0 and survives reset() (it used to crash)");
+        }
+    }
+
+    test::group ("Saturator, Topology::Cascade: the dry path is delayed by the round trip that was built");
+    for (double fs : { 44100.0, 48000.0 })
+        for (Topology topo : { Topology::Kaiser, Topology::Cascade })
+        {
+            // A band-limited multitone at a level where the curve is linear to 1e-4, half dry and half wet: the
+            // output is the input delayed by latencySamples(), sample for sample, or the mix is misaligned. A
+            // 1 kHz RMS check cannot see a 131-sample misalignment (|cos(pi*131/44.1)| = 0.996); this can.
+            const int n = 8192;
+            std::vector<float> x ((std::size_t) n);
+            for (int i = 0; i < n; ++i)
+            {
+                double v = 0.0;
+                for (double f : { 211.0, 1733.0, 5021.0, 11003.0, 16993.0 }) v += std::sin (2.0 * core::kPi * f / fs * i + f);
+                x[(std::size_t) i] = (float) (0.01 * v);
+            }
+            std::vector<float> y = x; float* ch[1] { y.data() };
+            saturation::Saturator sat;
+            (void) sat.prepare (fs, n, 1, 4, 64, topo);
+            saturation::Saturator::Params p; p.driveDb = 0.0f; p.autoComp = 0.0f; p.mix = 0.5f;
+            sat.setParams (p);
+            felitronics::test::run (sat.process (ch, 1, n));
+            const int L = sat.latencySamples();
+            double err = 0.0;
+            for (int i = 1024; i + L < n; ++i) err = std::max (err, (double) std::fabs (y[(std::size_t) (i + L)] - x[(std::size_t) i]));
+            test::ok (err < 2e-4, std::to_string ((int) fs) + " Hz " + (topo == Topology::Kaiser ? "Kaiser" : "Cascade")
+                                  + ", mix 0.5: output == input delayed by " + std::to_string (L) + " (max error "
+                                  + std::to_string (err) + ")");
+        }
+
+    test::group ("Saturator, Topology::Cascade: the top of the band survives, and the guard band still holds");
+    {
+        const double fs = 44100.0;
+        const int b1k = (int) std::lround (1000.0 * kW / fs), b20k = (int) std::lround (20000.0 * kW / fs);
+        auto topGain = [&] (Topology topo)
+        {
+            const auto lo = spectrum (fs, topo, Shape::Tanh, 6.0f, 0.0f, b1k, 0.1);
+            const auto hi = spectrum (fs, topo, Shape::Tanh, 6.0f, 0.0f, b20k, 0.1);
+            return 20.0 * std::log10 (hi[(std::size_t) b20k] / lo[(std::size_t) b1k]);
+        };
+        const double gc = topGain (Topology::Cascade), gk = topGain (Topology::Kaiser);
+        std::printf ("       44.1 kHz, tanh +6 dB: 20 kHz against 1 kHz — cascade %+.4f dB, Kaiser %+.2f dB\n", gc, gk);
+        test::ok (std::fabs (gc) < 0.02, "20 kHz comes out at the level 1 kHz does under the cascade (" + std::to_string (gc) + " dB)");
+        test::ok (gk < -15.0, "where the Kaiser stage takes " + std::to_string (gk) + " dB off it");
+
+        // Aliasing at the header's operating point, worst over nine tones (0.150 .. 0.190 fs): the cascade is
+        // strict, so it may not be worse than the Kaiser stage — measured -122.4 against -120.8 dBc in total,
+        // and -137.7 against -120.8 inside 0..20 kHz (both columns printed below).
+        double totC = -1e9, inC = -1e9, totK = -1e9, inK = -1e9;
+        for (int k = 0; k < 9; ++k)
+        {
+            const int b = (int) std::lround ((0.150 + 0.005 * k) * kW);
+            const auto mc = spectrum (fs, Topology::Cascade, Shape::Tanh, 6.0f, 0.0f, b, 0.9);
+            const auto mk = spectrum (fs, Topology::Kaiser,  Shape::Tanh, 6.0f, 0.0f, b, 0.9);
+            totC = std::max (totC, nonHarmonicDbc (mc, b, kW / 2));
+            inC  = std::max (inC,  nonHarmonicDbc (mc, b, b20k));
+            totK = std::max (totK, nonHarmonicDbc (mk, b, kW / 2));
+            inK  = std::max (inK,  nonHarmonicDbc (mk, b, b20k));
+        }
+        std::printf ("       tanh +6 dB, worst of nine tones: cascade %.1f dBc (%.1f in 0..20 kHz), Kaiser %.1f dBc (%.1f in 0..20 kHz)\n",
+                     totC, inC, totK, inK);
+        test::ok (totC < -118.0 && inC < -130.0, "the cascade's total non-harmonic energy stays under -118 dBc, and under -130 in the audio band");
+        test::ok (totC < totK + 1.0 && inC < inK, "and it is no worse than the Kaiser stage's (" + std::to_string (totK)
+                                                   + " total, " + std::to_string (inK) + " in band)");
+
+        // The reason the guard band exists: content at 0.48 fs (in the don't-care band) through the asymmetric
+        // curve. An ideal oversampler puts NOTHING in 0..20 kHz here; a halfband first stage flat to 20 kHz put
+        // -56 dBFS there (P31 stand). Liveness first: the same probe does see the factor axis when it is there
+        // (the 9th harmonic of 0.45 fs folds INSIDE 4x to 0.05 fs at high drive).
+        const int b48 = (int) std::lround (0.48 * kW), b45 = (int) std::lround (0.45 * kW);
+        const double live = garbageDbfs (spectrum (fs, Topology::Cascade, Shape::Tanh, 30.0f, 0.0f, b45, 0.3), b45, b20k);
+        const double imd  = garbageDbfs (spectrum (fs, Topology::Cascade, Shape::Asym, 12.0f, 0.2f, b48, 0.1), b48, b20k);
+        std::printf ("       0.48 fs at -20 dBFS through Asym +12 dB: %.1f dBFS in 0..20 kHz (liveness, factor axis: %.1f)\n", imd, live);
+        test::ok (live > -110.0, "PRECONDITION: the probe reads garbage where the factor axis puts it (" + std::to_string (live) + " dBFS)");
+        test::ok (imd < -130.0, "don't-care content leaves under -130 dBFS in the audio band — no image intermodulation ("
+                                + std::to_string (imd) + ")");
+    }
+}
 
 int main()
 {
@@ -698,6 +968,8 @@ int main()
         test::ok (silentBlocksAllZero ((int) (3.75 * fs) / block),
                   "still exactly zero at 5 s of silence");
     }
+
+    runCascadeTopologyTests();
 
     return test::report();
 }

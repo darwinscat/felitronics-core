@@ -211,6 +211,10 @@ const ZONE = new Set([
     // the shared floor those analyzers stand on
     'modules/core/include/felitronics/core/OfflineFft.h',
     'modules/oversampling/include/felitronics/oversampling/PolyphaseOversampler.h',
+    // P31: not diffed by a parity harness today (no tool builds it), but it promises the same filter bits on
+    // every row — its suite pins them by hash on each one — and it sits in fc_master's include closure
+    // through Saturator.h. A system sine in its design would break that promise silently; here it is red.
+    'modules/oversampling/include/felitronics/oversampling/CascadeOversampler.h',
     // and the tools that PRINT the diffed text. The long-double lint deliberately skips tools/; for this
     // lint that would be a hole exactly on the surface being defended — fcore_probe.h computes the dBTP
     // that `diff native.txt wasm.txt` compares, with its own floor and, until P80, its own std::log10.

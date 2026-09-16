@@ -4,6 +4,7 @@
 #pragma once
 
 #include <felitronics/saturation/WaveShaper.h>
+#include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
@@ -35,6 +36,15 @@ namespace felitronics::saturation
 // may exceed the maxBlock passed to prepare() — process() chunks internally, state carries across chunks.
 // With oversampling the stage reports a round-trip latency.
 //
+// THE OVERSAMPLER IS A CHOICE (P31), made at prepare(): `Topology::Kaiser` (the default, and the only one
+// for a factor that is not a power of two) is PolyphaseOversampler — cutoff fixed at 0.45 fs, round trip
+// tapsPerPhase - 1, and at 44.1 kHz -1.80 dB at 19 kHz and -15.55 at 20 kHz. `Topology::Cascade` is
+// CascadeOversampler — just as strict, flat to 20 kHz at every rate, lengths from the sample rate, round
+// trip 131 samples at 44.1 kHz and 76 at 48 kHz (4x). The dry path is delayed by whichever round trip was
+// built, so a mix < 1 stays comb-free under both. Under Cascade `tapsPerPhase` is range-checked and
+// otherwise unused, and the RATE is binding: the cascade designs itself from it and refuses one outside
+// [1 kHz, 3 MHz] — a window the Kaiser stage, which never looked at the rate, does not have.
+//
 // Poison-hardened: non-finite params fall back to defaults (applyParams), each input sample is
 // sanitized at the gate (NaN/Inf → 0, huge finite → ±1e6 clamp) so one bad sample can't lodge in the
 // oversampler/DC/dry-delay state, and the DC-blocker state flushes non-finite values per block. All
@@ -64,7 +74,7 @@ public:
         std::size_t dc    = 0;                  // floats in EACH of the two DC-blocker state vectors
         std::size_t dryLines = 0;               // core::DelayLine per channel
         int         dryDelaySamples = 0;        // the oversampler round trip each of them holds
-        oversampling::PolyphaseOversampler::Storage os {};   // empty when the factor is 1
+        oversampling::Oversampler::Storage os {};            // empty when the factor is 1
         std::uint64_t bytes() const noexcept
         {
             return (std::uint64_t) sizeof (float)  * ((std::uint64_t) osBuf + wetBuf + 2u * (std::uint64_t) dc)
@@ -75,14 +85,15 @@ public:
     };
 
     [[nodiscard]] static bool storageFor (double sampleRate, int maxBlock, int maxChannels,
-                                          int oversampleFactor, int tapsPerPhase, Storage& out) noexcept
+                                          int oversampleFactor, int tapsPerPhase, Storage& out,
+                                          oversampling::Topology topology = oversampling::Topology::Kaiser) noexcept
     {
         // Spelled positively so a NaN FAILS — see prepare() below for what a NaN rate used to produce.
         if (! (sampleRate > 0.0) || ! std::isfinite (sampleRate) || maxBlock < 1) return false;
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return false;   // law 11(b): BINDING
         const int os = (oversampleFactor >= 2) ? oversampleFactor : 1;
         Storage st;
-        if (os > 1 && ! oversampling::PolyphaseOversampler::storageFor (os, maxChannels, tapsPerPhase, st.os))
+        if (os > 1 && ! oversampling::Oversampler::storageFor (topology, sampleRate, os, maxChannels, tapsPerPhase, st.os))
             return false;
         const std::size_t ch = (std::size_t) maxChannels;
         st.osBuf    = ch * (std::size_t) maxBlock * (std::size_t) os;
@@ -90,7 +101,7 @@ public:
         st.ptrs     = ch;
         st.dc       = ch;
         st.dryLines = ch;
-        st.dryDelaySamples = latencyForFactor (os, tapsPerPhase);
+        st.dryDelaySamples = os > 1 ? oversampling::Oversampler::latencyFor (topology, sampleRate, os, tapsPerPhase) : 0;
         out = st;
         return true;
     }
@@ -105,15 +116,17 @@ public:
     // succeeded — 63 where this answers 0. A composite sizes itself from THIS, which is the number the
     // preparation it is about to make will produce.
     static int latencyFor (double sampleRate, int maxBlock, int maxChannels,
-                           int oversampleFactor, int tapsPerPhase) noexcept
+                           int oversampleFactor, int tapsPerPhase,
+                           oversampling::Topology topology = oversampling::Topology::Kaiser) noexcept
     {
         Storage st;
-        return storageFor (sampleRate, maxBlock, maxChannels, oversampleFactor, tapsPerPhase, st)
+        return storageFor (sampleRate, maxBlock, maxChannels, oversampleFactor, tapsPerPhase, st, topology)
              ? st.dryDelaySamples : 0;
     }
 
     bool prepare (double sampleRate, int maxBlock, int maxChannels, int oversampleFactor = 4,
-                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase)
+                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase,
+                  oversampling::Topology topology = oversampling::Topology::Kaiser)
     {
         prepared_ = false;                                             // any early return below leaves it unprepared
         // Spelled positively so a NaN FAILS. `NaN <= 0.0` is false, so the previous form accepted a
@@ -130,12 +143,16 @@ public:
         // then a refused `prepare(4, 2000)`: 63 before, 0 now. The new answer is law 11(b)'s (a refused call
         // touches nothing); it is stated here because this header is shared with the plug-ins.
         Storage st;
-        if (! storageFor (sampleRate, maxBlock, maxChannels, oversampleFactor, tapsPerPhase, st)) return false;
+        if (! storageFor (sampleRate, maxBlock, maxChannels, oversampleFactor, tapsPerPhase, st, topology)) return false;
         fs_       = sampleRate;
         maxBlock_ = maxBlock;
         channels_ = maxChannels;
         os_       = (oversampleFactor >= 2) ? oversampleFactor : 1;
-        if (os_ > 1 && ! ovs_.prepare (os_, channels_, tapsPerPhase)) return false;
+        if (os_ > 1 && ! ovs_.prepare (topology, sampleRate, os_, channels_, tapsPerPhase)) return false;
+        // A factor of 1 builds no oversampler, so it holds none: whatever an earlier preparation built (the
+        // Kaiser buffers, or the heap-held cascade) is released here rather than kept beside a budget that
+        // says the oversampler half is empty. Assigning a fresh switch only frees.
+        if (os_ == 1) ovs_ = oversampling::Oversampler {};
 
         osBuf_.assign  (st.osBuf,  0.0f);
         wetBuf_.assign (st.wetBuf, 0.0f);
@@ -168,8 +185,8 @@ public:
 
     int  latencySamples() const noexcept { return os_ > 1 ? ovs_.latencySamples() : 0; }
 
-    // The round trip an oversampler of this shape costs, in baseband samples — `PolyphaseOversampler`'s
-    // own `tpp - 1`, read here rather than restated so `latencyFor()` and a prepared object cannot differ.
+    // The round trip a KAISER oversampler of this shape costs, in baseband samples — `PolyphaseOversampler`'s
+    // own `tpp - 1`. Kaiser only: the topology-aware answer is latencyFor(), which the budget now reads.
     static int latencyForFactor (int oversampleFactor, int tapsPerPhase) noexcept
     {
         return oversampleFactor > 1 && tapsPerPhase > 0 ? tapsPerPhase - 1 : 0;
@@ -352,7 +369,7 @@ private:
 
     Params      params_ {};
     WaveShaper  shaper_ {};
-    oversampling::PolyphaseOversampler ovs_;
+    oversampling::Oversampler ovs_;
 
     double fs_ = 0.0;
     int    maxBlock_ = 0, channels_ = 0, os_ = 1;

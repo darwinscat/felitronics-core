@@ -4,11 +4,13 @@
 #pragma once
 
 #include <felitronics/eq/Svf.h>
+#include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <memory>
@@ -34,14 +36,16 @@
 //     fingerprint, load/transformer corners). A product ships its own preset table (OrbitCab keeps
 //     kTubeVoicings {6L6, EL34, EL84, KT88}) and passes the chosen entry into setParams(). Trusted
 //     data: finite by contract (a constexpr table), not sanitized per block.
-//   • Params — the user-facing control values (Drive/Output/topology + the [0,1] feel amounts).
+//   • Params — the user-facing control values (Drive/Output/PP-SE topology + the [0,1] feel amounts; the
+//     OVERSAMPLER topology is a separate, prepare-time choice — see prepare()).
 //     UNTRUSTED: sanitized at the setParams() gate (isfinite + clamp), because a bad preset or a
 //     non-parameter-system caller would otherwise poison the OS/DC/IIR state with NaN — permanently.
 //
 // 🔴 RT rule: process() never allocates, locks, does IO or throws. All state/buffers are heap-
 // allocated in prepare() behind a pImpl, NOT by-value members — the by-value stage member stays tiny
 // and Windows' 1 MB audio-thread stack is never at risk (the MSVC rule). prepare() is message/host
-// thread only. Latency = the oversampler round-trip (tapsPerPhase−1), constant across factor.
+// thread only. Latency = the oversampler round-trip: under the default Kaiser topology tapsPerPhase−1,
+// constant across factor; under Topology::Cascade (P31) the cascade's, from the rate and the factor.
 //
 // TAPS. The stage used to hardcode 32 taps/phase with no way for a caller to say otherwise, and its own
 // aliasing gate (PowerAmpGoldenTests, "reference-free non-harmonic energy") declared that adequate. It
@@ -127,21 +131,31 @@ public:
 
     // Allocate state for this stream / block size. Message/host thread (prepareToPlay) — never
     // the audio thread. `oversampleFactor` defaults to 4 (the shipping value); a test may pass a
-    // higher factor (e.g. 32) to build an alias-free reference for null comparison. Latency is
-    // tapsPerPhase-1 regardless of factor, so 4x and 32x stay sample-aligned. `tapsPerPhase` takes the
+    // higher factor (e.g. 32) to build an alias-free reference for null comparison. Under the default
+    // Kaiser topology latency is tapsPerPhase-1 regardless of factor, so 4x and 32x stay sample-aligned
+    // (under Cascade they do not — see `topology` below). `tapsPerPhase` takes the
     // core's own default (see the TAPS note above and PolyphaseOversampler.h for its derivation);
     // passing it explicitly pins a topology against that default. It is CLAMPED to [4, 1024], not
     // refused — this prepare() returns void and always has, so a rejected value would leave the stage
     // unprepared with no way to say so. That is deliberately UNLIKE `Saturator` and `TruePeakLimiter`,
     // whose prepare() returns bool and therefore refuses; a caller that needs the refusal should read
-    // latencySamples() back and compare, since it is tapsPerPhase - 1 by construction. NB the golden battery lifted from
+    // latencySamples() back and compare, since under Kaiser it is tapsPerPhase - 1 by construction. NB the golden battery lifted from
     // OrbitCab runs at the DEFAULT, not at the old 32: what it pins is the stage's structure (processing
     // order, guards, chunk boundaries, block-size determinism, the feel gate), none of which the taps
     // count touches, and it carries separate two-sided checks at an explicit 32 and 96 for the topology
     // itself. OrbitCab's own copy keeps its 32 and passes it explicitly, so its sound and its host
     // latency are unaffected by this default.
+    //
+    // `topology` (P31) picks the oversampler: Kaiser (the default, above) or Cascade — CascadeOversampler,
+    // flat to 20 kHz at every rate, round trip 131 samples at 44.1 kHz and 76 at 48 kHz (4x), from the rate
+    // rather than from `tapsPerPhase`. Clamped like everything else here, never refused: under Cascade the
+    // factor is rounded DOWN to a power of two (3 -> 2, 12 -> 8), and the rate the filter is designed for
+    // is clamped into [8 kHz, 3 MHz] (every rate up to 44.1 kHz shares one geometry, so the low clamp
+    // changes no tap); a rate that is not a finite positive number — NaN, +-inf, 0, negative — gets the
+    // 44.1 kHz geometry (the one every rate up to 44.1 kHz shares) rather than being clamped to an end. Read latencySamples() back — it reports what was built.
     void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,
-                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase);
+                  int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase,
+                  oversampling::Topology topology = oversampling::Topology::Kaiser);
     void reset();
 
     // Set the controls + the product-chosen voicing. RT-safe: stores targets (and copies the plain-
@@ -153,7 +167,9 @@ public:
     // gave REFUSES the whole call — false means nothing was touched.
     [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept;
 
-    // Host-rate latency = the oversampler round-trip (tpp-1), constant across drive/topology/factor.
+    // Host-rate latency = the oversampler round-trip, constant across drive and PP/SE. Under Kaiser it is
+    // tpp-1 at every factor; under Topology::Cascade it is CascadeOversampler's for the rate and the factor
+    // (76 at 48 kHz 4x, 80 at 32x), so a 4x stage and a 32x reference are no longer sample-aligned there.
     int  latencySamples() const noexcept;
 
     // THE SHARED SUPPLY'S CURRENT DROOP, in [0, maxDroop*amount] — the rail collapse the stage is
@@ -196,9 +212,9 @@ struct PowerAmpStage::Impl
     double sampleRate = 0.0;
     int    maxBlock   = 0;
     int    os         = 4;                          // oversampling factor (4 shipping; test may set 32)
-    int    tpp        = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // FIR taps/phase → (tpp-1)-sample round trip
+    int    tpp        = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // FIR taps/phase → (tpp-1)-sample round trip under Kaiser
 
-    felitronics::oversampling::PolyphaseOversampler ovs;
+    felitronics::oversampling::Oversampler ovs;
     std::vector<float> osBuf[kMaxCh];               // maxBlock*os per channel (caller-owned OS scratch)
     float*             osPtr[kMaxCh] { nullptr, nullptr };
 
@@ -232,16 +248,22 @@ struct PowerAmpStage::Impl
     bool  ranPres_ = false, ranDepth_ = false, ranMid_ = false;   // and which of this stage's own gates
     bool  ranLoad_ = false, ranIron_  = false, ranSag_ = false;   // were open on the previous CHUNK
 
-    void prepare (double sr, int mb, int osFactor, int tapsPerPhase)
+    void prepare (double sr, int mb, int osFactor, int tapsPerPhase, felitronics::oversampling::Topology topology)
     {
+        using felitronics::oversampling::Topology;
+        using felitronics::oversampling::CascadeOversampler;
         sampleRate = sr;
         maxBlock   = std::max (1, mb);
         os         = std::clamp (osFactor, 2, 32);
+        if (topology == Topology::Cascade) os = (int) std::bit_floor ((unsigned) os);
         // Clamped rather than refused, because prepare() returns void here and always has: a rejected
         // taps count would leave the stage unprepared with no way to say so, which is the worse failure.
         tpp        = std::clamp (tapsPerPhase, kMinTpp,
                                  felitronics::oversampling::PolyphaseOversampler::kMaxTapsPerPhase);
-        ovs.prepare (os, kMaxCh, tpp);
+        const double designRate = (std::isfinite (sr) && sr > 0.0)
+                                ? std::clamp (sr, CascadeOversampler::kMinSampleRate, CascadeOversampler::kMaxSampleRate)
+                                : CascadeOversampler::kEdgeRate;
+        (void) ovs.prepare (topology, designRate, os, kMaxCh, tpp);   // cannot refuse: every argument is clamped
         for (int ch = 0; ch < kMaxCh; ++ch)
         {
             osBuf[ch].assign ((std::size_t) (maxBlock * os), 0.0f);
@@ -611,7 +633,8 @@ struct PowerAmpStage::Impl
 inline PowerAmpStage::PowerAmpStage() : impl (std::make_unique<Impl>()) {}
 inline PowerAmpStage::~PowerAmpStage() = default;
 
-inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor, int tapsPerPhase) { impl->prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase); }
+inline void PowerAmpStage::prepare (double sampleRate, int maxBlock, int oversampleFactor, int tapsPerPhase,
+                                    oversampling::Topology topology) { impl->prepare (sampleRate, maxBlock, oversampleFactor, tapsPerPhase, topology); }
 inline void PowerAmpStage::reset() { impl->reset(); }
 inline void PowerAmpStage::setParams (const Params& params, const Voicing& voicing) noexcept { impl->setParams (params, voicing); }
 inline bool PowerAmpStage::process (float* const* io, int numChannels, int numSamples) noexcept { return impl->process (io, numChannels, numSamples); }
