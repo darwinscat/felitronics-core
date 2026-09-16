@@ -420,6 +420,19 @@ the CPU at runtime, invisible to any build. Full write-up:
    is charged NAM's partitioned-FFT ring — walk the same branch. On NAM's own shipped captures the
    whole change moves one number: +1 sample of drain on the two that carry a conditioner, and a
    byte-identical render on every other.
+   **And where the ledger cannot PLACE a shape, it answers a CEILING, never zero** (P92). The ledger
+   promises an upper bound, so "I do not know" has a natural answer, and the costs are asymmetric: an
+   understated number is the previous sound coming out of digital silence, an overstated one is
+   inference nobody hears. The measured case was NAM's slimmable wrapper, whose real config sits under
+   `config.model` where nothing read it: 0 samples flushed for a model reaching 2046. The rule is keyed
+   on SHAPE — an object carrying a model's vocabulary under a key the ledger does not read — and never
+   on NAM's own dispatch, so it fires under any key name. It costs `kUnreadShapeCeiling` = 48 000
+   samples plus the ring, measured through `reset()` at 39.7 ms per lane on the most expensive real
+   capture rewrapped (256 block, 48 kHz); it fires on none of 2369 real captures. The same rule closed two further members of the class:
+   the ledger's three sources are MAXED, never chained, so a stray key can no longer silence a
+   declared field (a 5000-tap `Linear` with a readable stray `layers` read 2, reaching 4999). And the
+   walk is bounded at 64 levels of nesting, past which it answers the ceiling as well — a 205 KB file
+   used to take the host down on a 512 KiB thread.
 
    **AND `prepare()` PERFORMS THAT RESTART TOO, ALWAYS — THE TWO VERBS NAME ONE STATE.** A prepared stage
    holds no audio the caller fed, on any rate, on any shape, and whether or not the rate or the block

@@ -222,6 +222,34 @@ std::string conditionedWaveNet (const std::string& conditioner, int d)
          + R"("weights":[1, 1,0,0, 1, 1,0, 1,0,0, 1, 1,0, 1, 1],"sample_rate":48000})";
 }
 
+// 🔴 A SLIMMABLE WaveNet — AND THE SAME ONE WRAPPED, which is the shape the ledger read as ZERO (P92).
+// NAM has no registered "SlimmableWavenet"; the WaveNet parser delegates when a TOP-LEVEL
+// `layers[i].slimmable.method` marker is present (`wavenet/model.cpp:1205-1229`), and the delegate takes
+// the real config from `config.model` when that key is there (`wavenet/slimmable.cpp:543`). So the
+// WRAPPED form below carries a decoy top-level `layers` with nothing but the marker, and its whole stack
+// under `config.model` — and it LOADS, and it is the same network: the impulse reaches `d` either way.
+// NAM's own `GetPrewarmSamples()` is `return 0` for the architecture (`wavenet/slimmable.h:66`), so the
+// registry is the ONLY answer this stage has, and before P92 it answered 2 + (d − 1) for the flat form
+// and 0 for the wrapped one.
+// Every bias is zero, so the silence state is EXACTLY zero, as for `conditionedWaveNet`; the inner layer
+// carries its own marker with `allowed_channels` because `SlimmableWavenet` refuses a model where no
+// array is slimmable (`wavenet/slimmable.cpp:391`). The same shape was measured on NAM's own shipped
+// `example_models/slimmable_wavenet.nam`, rewrapped: 2047 flat, 0 wrapped, impulse 2046 both ways.
+std::string slimmableWaveNet (int d, bool wrapped)
+{
+    const std::string inner =
+        std::string (R"({"layers":[{"input_size":1,"condition_size":1,"head_size":1,"head_bias":false,)")
+        + R"("channels":1,"kernel_size":2,"dilations":[)" + std::to_string (d)
+        + R"(],"activation":"Tanh","gated":false,)"
+        + R"("slimmable":{"method":"slice_channels_uniform","kwargs":{"allowed_channels":[1]}}}],)"
+        + R"("head_scale":1.0})";
+    const std::string cfg = wrapped
+        ? R"({"layers":[{"slimmable":{"method":"slice_channels_uniform"}}],"model":)" + inner + "}"
+        : inner;
+    return R"({"version":"0.7.0","architecture":"WaveNet","config":)" + cfg
+         + R"(,"weights":[1,1,0,0,1,0,0,1,1],"sample_rate":48000})";
+}
+
 bool load (felitronics::nam::NamStage& stage, const std::string& json, float trimDb = 0.0f)
 {
     return stage.loadModelFromMemory (json.data(), json.size(), trimDb);
@@ -1990,6 +2018,13 @@ int main()
             // ring (4051) does — which is the row that fails if `partitionedTailSamples` is left behind
             // while the field is taught.
             { "WaveNet + dense FFT conditioner", conditionedWaveNet (denseLinearModel (2001, nullptr), 1), 2003, 2287 },
+            // 🔴 …AND THE SLIMMABLE WRAPPER (P92), flat and wrapped: the same network, reaching the same
+            // sample, where the ledger read 2501 for one and ZERO for the other — and NAM answers zero for
+            // both, so nothing raised it. The wrapped field is the CEILING: a shape the registry cannot
+            // place answers `kUnreadShapeCeiling`, never 0. 2500 is past the 2048 ring on purpose, so a
+            // mutation that charges the ring for the shape and forgets the field still drains short.
+            { "slimmable WaveNet, flat",    slimmableWaveNet (2500, false),  2501, 2500 },
+            { "slimmable WaveNet, WRAPPED", slimmableWaveNet (2500, true),  48000, 2500 },
         };
 
         for (const auto& shape : shapes)
@@ -2870,6 +2905,11 @@ int main()
         // after a full drain against 0.905148267746 after a restart, one defect in one ledger. Both
         // lengths past the 2048 ring, for the reason spelled out on the drain row.
         { "WaveNet + Linear conditioner", conditionedWaveNet (delayModel (2500), 2500), 5000, true },
+        // 🔴 …AND THE SLIMMABLE WRAPPER (P92). The restart spends the same ledger the drain does, and on
+        // the wrapped form that ledger was ZERO: a restart that fed nothing. Both forms, so a fix that
+        // moves only one of them is a row, not a guess.
+        { "slimmable WaveNet, flat",    slimmableWaveNet (2500, false), 2500, true },
+        { "slimmable WaveNet, WRAPPED", slimmableWaveNet (2500, true),  2500, true },
     };
 
     test::group ("\U0001f534 P47: nothing the caller fed before reset() can be heard after it");
@@ -3765,6 +3805,142 @@ int main()
                           " idempotent for it: " + std::to_string (first) + " samples spent by the first"
                           " restart and " + std::to_string (second) + " by a second with nothing fed in"
                           " between (a capture the ledger thinks is finite spends 0 there)");
+            }
+        }
+
+        // 7. 🔴 P92 — THE SLIMMABLE WRAPPER, WHOSE LEDGER WAS ZERO, THROUGH BOTH OF ITS READERS AND ON
+        //    BOTH LANES. Row 6's template on purpose: a drain and a restart, lane 0 and lane 1, judged
+        //    against the one oracle that is independent of the ledger's arithmetic — a stage that never
+        //    saw the programme. The fixture is bias-free, so its silence state is exactly zero and the
+        //    first half can be read as a peak as well; the unfixed ledger drained NOTHING here and
+        //    replayed the whole 2500-sample window.
+        {
+            constexpr int kWrappedDebt = 48000 + 2048;   // the ceiling, and the ring a shape the registry
+                                                         // cannot place is charged (ReceptiveField.h)
+            // THE NUMBERS FIRST, with their derivation rather than a call to the code that computes
+            // them. 48 kHz, so no rate-matcher and one lane's debt is the field plus the ring. The flat
+            // form is 2 + (2500 − 1) = 2501 and owes no ring, because nothing in it is a Linear and
+            // nothing in it is a shape the registry cannot place.
+            for (const bool wrapped : { false, true })
+            {
+                nam::NamStage ledger;
+                ledger.prepare (48000.0, kBlk);
+                if (! load (ledger, slimmableWaveNet (2500, wrapped)))
+                { test::ok (false, "the slimmable ledger fixture loads"); continue; }
+                const int wantField = wrapped ? 48000 : 2501;
+                const long long wantDebt = wrapped ? kWrappedDebt : 2501;
+                test::ok (ledger.prewarmSamples() == wantField,
+                          std::string (wrapped ? "the WRAPPED" : "the flat")
+                          + " slimmable WaveNet reports " + std::to_string (ledger.prewarmSamples())
+                          + (wrapped ? " — the ceiling, where the unfixed ledger reported 0 and NAM reports 0"
+                                     : " — 2 + 2499, and NAM reports 0 for it"));
+                std::vector<float> l ((std::size_t) kBlk, 0.2f), r ((std::size_t) kBlk, 0.2f);
+                float* io[2] { l.data(), r.data() };
+                for (int k = 0; k < 8; ++k) felitronics::test::run (ledger.process (io, 1, kBlk, false));
+                ledger.reset();
+                test::ok (ledger.clearedSamples() == wantDebt,
+                          std::string ("…and a MONO restart spends exactly one lane's debt: ")
+                          + std::to_string (wantDebt) + ", read " + std::to_string (ledger.clearedSamples()));
+            }
+
+            const auto wrappedJson = slimmableWaveNet (2500, true);
+            for (const int lane : { 0, 1 })
+            {
+                nam::NamStage fresh, viaDrain, viaReset;
+                fresh.prepare (48000.0, kBlk); viaDrain.prepare (48000.0, kBlk); viaReset.prepare (48000.0, kBlk);
+                if (! load (fresh, wrappedJson) || ! load (viaDrain, wrappedJson) || ! load (viaReset, wrappedJson))
+                { test::ok (false, "the wrapped slimmable drain/restart fixtures load"); continue; }
+
+                auto charge = [&] (nam::NamStage& s)
+                {
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk);
+                    float* io[2] { l.data(), r.data() };
+                    double phase = 0.0, peak = 0.0;
+                    for (int n = 0; n < 2500 + 4 * kBlk; n += kBlk)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (float) (0.5 * std::sin (phase));
+                            phase += 2.0 * kPi * 220.0 / 48000.0;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (s.process (io, 2, kBlk, false));
+                        for (float v : (lane == 0 ? l : r)) peak = std::fmax (peak, (double) std::fabs (v));
+                    }
+                    return peak;
+                };
+                auto answer = [&] (nam::NamStage& s)
+                {
+                    std::vector<float> l ((std::size_t) kBlk), r ((std::size_t) kBlk), out;
+                    float* io[2] { l.data(), r.data() };
+                    double p = 0.0;
+                    for (int k = 0; k < 24; ++k)
+                    {
+                        for (int i = 0; i < kBlk; ++i)
+                        {
+                            const float v = (k < 12) ? 0.0f
+                                                     : (float) (0.35 * std::sin (p) * std::sin (0.017 * p));
+                            p += 2.0 * kPi * 220.0 / 48000.0;
+                            l[(std::size_t) i] = v; r[(std::size_t) i] = v;
+                        }
+                        felitronics::test::run (s.process (io, 2, kBlk, false));
+                        const std::vector<float>& src = lane == 0 ? l : r;
+                        out.insert (out.end(), src.begin(), src.end());
+                    }
+                    return out;
+                };
+
+                // Two statements, not one `&&` — see row 6: a short circuit would leave `viaReset` unplayed
+                // and the equalities below would compare an idle stage against `fresh` and pass.
+                const double chargedDrain = charge (viaDrain);
+                const double chargedReset = charge (viaReset);
+                test::ok (chargedDrain > 0.1 && chargedReset > 0.1,
+                          "precondition: lane " + std::to_string (lane) + " of the wrapped slimmable really was"
+                          " playing in BOTH fixtures (" + std::to_string (chargedDrain) + ", "
+                          + std::to_string (chargedReset) + ")");
+
+                // THE DEPARTURE, BOUNDED — and the bound is sized for the ceiling rather than copied from
+                // row 6: 50 048 samples of debt is 196 blocks of 256, so row 6's 200 would be a cliff one
+                // settle-iteration wide. A drain that never stops still FAILS here rather than hangs.
+                long long last = -1; int blocks = 0;
+                while (viaDrain.drainedSamples() != last && blocks < 400)
+                {
+                    last = viaDrain.drainedSamples();
+                    std::vector<float> z ((std::size_t) kBlk, 0.0f);
+                    float* io[2] { z.data(), z.data() };
+                    felitronics::test::run (viaDrain.process (io, 0, kBlk, false));
+                    ++blocks;
+                }
+                test::ok (blocks < 400 && viaDrain.drainedSamples() == 2 * (long long) kWrappedDebt,
+                          "…and its drain spends the CEILING on both lanes and STOPS: "
+                          + std::to_string (viaDrain.drainedSamples()) + " samples over " + std::to_string (blocks)
+                          + " blocks of gap, where the unfixed ledger spent 0");
+                viaReset.reset();
+
+                const auto ref = answer (fresh), drained = answer (viaDrain), restarted = answer (viaReset);
+                long long dDrain = 0, dReset = 0;
+                double peakDrain = 0.0, peakReset = 0.0;
+                bool finite = true;
+                for (std::size_t i = 0; i < ref.size(); ++i)
+                {
+                    if (drained  [i] != ref[i]) ++dDrain;
+                    if (restarted[i] != ref[i]) ++dReset;
+                    finite = finite && std::isfinite (drained[i]) && std::isfinite (restarted[i]);
+                    if (i < (std::size_t) (12 * kBlk))
+                    {
+                        peakDrain = std::fmax (peakDrain, (double) std::fabs (drained  [i]));
+                        peakReset = std::fmax (peakReset, (double) std::fabs (restarted[i]));
+                    }
+                }
+                test::ok (finite && peakDrain == 0.0 && peakReset == 0.0,
+                          "the WRAPPED slimmable answers digital silence with FINITE exact zero — after a full"
+                          " drain and after a restart alike, lane " + std::to_string (lane)
+                          + " (drain " + std::to_string (peakDrain) + ", restart " + std::to_string (peakReset) + ")");
+                test::ok (dDrain == 0 && dReset == 0,
+                          "…and the programme that follows is bit-identical to a stage that never played,"
+                          " through BOTH readers — lane " + std::to_string (lane) + ": "
+                          + std::to_string (dDrain) + " differing after the drain, "
+                          + std::to_string (dReset) + " after the restart");
             }
         }
 

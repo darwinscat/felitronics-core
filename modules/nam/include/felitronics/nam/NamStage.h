@@ -163,9 +163,15 @@ public:
     // a restart. One defect in one ledger, and it was corrected in the LEDGER, so both readers moved
     // together: the registry now adds the conditioner's memory to the network's, in series, and the same
     // fixture answers digital silence with the model's own silence state through either verb.
-    // ONE SHAPE THE LEDGER STILL CANNOT SEE is registered with its number in `ReceptiveField.h` — the
-    // hybrid slimmable-wrapper, whose real config hides under `config.model` and which reads zero here
-    // however long its stack is. It is named as one rather than as the end of a list.
+    // ⚠️ AND WHERE THE LEDGER CANNOT PLACE A SHAPE, IT CHARGES A CEILING, NEVER ZERO (P92). The hybrid
+    // slimmable wrapper — its real config under `config.model`, loaded by NAM, read by nothing here —
+    // was the measured case: 0 samples flushed for a model reaching 2046, on NAM's own shipped
+    // `slimmable_wavenet.nam` rewrapped. Such a shape now costs `detail::kUnreadShapeCeiling` (48 000
+    // samples) plus the 2048-sample ring per dirty lane — measured through this call, 39.7 ms per lane at
+    // a 256 block on the most expensive real capture rewrapped (44.5 ms at 64), and 4.5 ms on the wrapped
+    // slimmable itself. No shipped
+    // capture is that shape — across 2369 on the author's machine the rule fires on none — so the price
+    // is the rule's, not a regression's. See `ReceptiveField.h`.
     //
     // ⚠️ AND IT CANNOT REWIND A THIRD PARTY'S CLOCK. NAM's partitioned `Linear` engine counts every
     // sample the instance has ever seen and decides from it where the next programme falls against its

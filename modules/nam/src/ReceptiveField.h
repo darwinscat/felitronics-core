@@ -8,7 +8,8 @@
 // but the SlimmableContainer of WaveNets that nearly every capture is answers zero
 // (`wavenet/slimmable.h`), and `Linear` inherits the base class's zero. Hence this: the receptive
 // field read straight off the config — one dilated convolution at a time where there are layers to
-// walk, and the plain `receptive_field` number where the architecture simply states it.
+// walk, the plain `receptive_field` number where the architecture simply states it, and a named
+// CEILING where the config is a shape this file cannot place at all.
 //
 // 🔴 WHAT THIS FILE PROMISES IS AN UPPER BOUND ON THE MEMORY OF THE WHOLE MODEL, NOT THE FIELD OF ITS
 // STACK. A .nam config nests whole models in two places, and NAM builds both by handing the sub-node
@@ -17,7 +18,10 @@
 //   `config.condition_dsp`      — the CONDITIONER, which is always RUNNING       (wavenet/model.cpp:844)
 // Those two are the complete list at this pin: they are the only `get_dsp()` calls in the library
 // outside `get_dsp.cpp` itself, and the third one (`wavenet/slimmable.cpp:442`) rebuilds that SAME
-// `condition_dsp` node. A container is answered for with the WORST of its submodels, because any of
+// `condition_dsp` node. (A THIRD place a whole config can hang — the slimmable wrapper's `config.model`,
+// handed to `parse_config_json` rather than to `get_dsp()` — is the reason for the ceiling rule below,
+// and it is deliberately NOT added to this list by name: see `forEachUnplacedConfig`.)
+// A container is answered for with the WORST of its submodels, because any of
 // them can be the one playing. A conditioner is answered for with a SUM, because it is in SERIES:
 // `_process_condition` runs the raw input through it and the layer arrays are then processed against
 // its output (`wavenet/model.cpp:699-729, :749-761`), so the network's window reaches back through
@@ -49,18 +53,37 @@
 // reaches 102 and both answer 166; {d=1,hk=100}+{d=8,hk=2} reaches 101 and both answer 110. Over in
 // every case, and never looser than the number NAM would have used on its own.
 //
-// ⚠️ ONE SHAPE THIS FILE STILL ANSWERS ZERO FOR — registered rather than guessed at, and named as ONE
-// rather than as the end of a list, because nobody has proved the list closed. The HYBRID SLIMMABLE
-// WRAPPER: there is no registered `"SlimmableWavenet"` architecture, so the route in is `"WaveNet"`,
-// whose parser delegates when a TOP-LEVEL `config.layers[i].slimmable.method` marker is present
-// (`wavenet/model.cpp:1205-1229`), and the parser it delegates to then unwraps the REAL config from
-// `config.model` (`wavenet/slimmable.cpp:543`). A config carrying both the marker and `config.model`
-// therefore loads, and everything this file reads is in the half it does not look at. The hole is the
-// model's WHOLE field, not a corner of it: measured on one whose inner stack has a single dilation of
-// 200, NAM answers 0, this file answers 0, and the impulse reaches sample 200. Reading it means
-// restating NAM's own dispatch heuristic in order to know when `config.model` is the config at all,
-// which is the restatement rule 9u exists against — so it is a number in the plan, not a branch here.
-// No capture in NAM's own `example_models/` is that shape.
+// 🔴 AND WHAT IT ANSWERS FOR A CONFIG IT CANNOT PLACE: A CEILING, NEVER ZERO. This file promises a
+// BOUND and not an exact value, so "I do not know" has a natural answer and it is not zero. The costs
+// are asymmetric and so is the rule: an understated number is the tail of the previous sound coming
+// out of digital silence, an overstated one is inference nobody hears. `kUnreadShapeCeiling` below is
+// that answer, with its measured price beside it.
+//
+// WHAT MADE THE RULE NECESSARY — measured on a REAL SHIPPED CAPTURE, not a toy. There is no registered
+// `"SlimmableWavenet"` architecture, so the route in is `"WaveNet"`, whose parser delegates when a
+// TOP-LEVEL `config.layers[i].slimmable.method` marker is present (`wavenet/model.cpp:1205-1229`), and
+// the parser it delegates to then takes the REAL config from `config.model` when that key is there and
+// from the config itself when it is not (`wavenet/slimmable.cpp:543`). A config carrying both the
+// marker and `config.model` therefore loads, and everything this file used to read was in the half NAM
+// ignores. Take NAM's own `example_models/slimmable_wavenet.nam`, move its config under `config.model`,
+// leave a top-level `layers` carrying nothing but the marker, and it is the same capture making the
+// same sound: the impulse reaches sample 2046 either way, NAM's own `GetPrewarmSamples()` is `return 0`
+// for the architecture (`wavenet/slimmable.h:66`) so `NamStage.cpp:78`'s max() raises nothing, and this
+// file answered 2047 for the flat file and ZERO for the wrapped one. All three readers were blind
+// together: with an LSTM conditioner inside the wrapper `isRecurrent` went true → FALSE while the
+// impulse never died, and with a dense `Linear` conditioner the ring went 2048 → 0 and the field
+// 4047 → 0 for a model reaching 4042.
+//
+// AND THE RULE IS NOT A PATCH FOR THAT ONE ADDRESS. The same class — a config whose memory this file
+// cannot derive, answered with a number anyway — had two further members on `main`, both measured on
+// loaded models with real weights:
+//   a `Linear` of 5000 dense taps carrying a READABLE stray `layers` array answered 2 for an impulse
+//   reaching 4999, because `own == 0` was a CHAIN and a non-zero stack reading suppressed the declared
+//   field (the very shape the comment in `fieldOfConfig` used to condemn between the other two);
+//   a `ConvNet` carrying a NON-EMPTY dead `layers` array answered 0 where NAM's field is 256, because
+//   `convNetField`'s suppression had been fixed for the EMPTY array only.
+// Both are closed here by one rule rather than two branches: THE THREE SOURCES ARE MAXED, NEVER
+// CHAINED, and no reader may silence another. See `fieldOfConfig`.
 
 #include <nlohmann/json.hpp>
 
@@ -227,14 +250,18 @@ inline int receptiveFieldOfLayers (const nlohmann::json& cfg)
 // conditioner; it does not hide it behind a SlimmableWavenet, which answers zero for everything.
 inline int convNetField (const nlohmann::json& cfg)
 {
-    // A WaveNet keeps its dilations one level down, inside `layers`; reading a top-level `dilations`
-    // on a config whose `layers` this file can walk would be reading a key NAM never looks at there.
-    // 🔴 A NON-EMPTY ARRAY, and not merely the KEY's presence: NAM's ConvNet parser never reads
-    // `layers` (`convnet.cpp:349-355`), so a ConvNet carrying a dead `"layers": []` had its whole stack
-    // suppressed here — the same shape of mistake as a chain that lets one reader silence another.
-    // Measured on one that loads: as a slimmable capture's conditioner, where NAM answers zero and this
-    // file is the only answer, the lane drained 102 for a model reaching 131 and handed back 29 samples.
-    if (cfg.contains ("layers") && cfg["layers"].is_array() && ! cfg["layers"].empty()) return 0;
+    // 🔴 NO `layers` GATE, AND THE REASON IS THE MAX THAT CALLS THIS. A gate stood here — "a WaveNet
+    // keeps its dilations inside `layers`, so a top-level `dilations` beside real layers is a key NAM
+    // never looks at there" — and it was a READER SILENCING ANOTHER, the same mistake as a chain. P87
+    // took it back for an EMPTY `layers` (a ConvNet carrying `"layers": []` drained 102 for a model
+    // reaching 131, as a slimmable capture's conditioner); it still fired for a NON-EMPTY one, and NAM's
+    // ConvNet parser reads `layers` at no length at all (`convnet.cpp:326-338`), so a ConvNet carrying
+    // `"layers":[{}]` LOADS and this answered 0 where NAM's field is 256. The gate existed to keep a
+    // WaveNet's stack from being counted twice; `receptiveFieldFromConfig` now takes the MAX of the
+    // readers, which cannot count anything twice, so there is nothing left for a gate to protect.
+    // What moves is a synthetic row — a WaveNet with a 2-sample stack and a stray top-level
+    // `dilations:[1000]` now answers 1001 — and no real capture: across 2369 of them no config carries a
+    // top-level `dilations`.
     if (! cfg.contains ("dilations") || ! cfg["dilations"].is_array()) return 0;
     long long total = 0;
     for (const auto& entry : cfg["dilations"])
@@ -295,6 +322,143 @@ inline const nlohmann::json* conditionerOf (const nlohmann::json& cfg)
     return cond.is_object() ? &cond : nullptr;
 }
 
+//======================================================================================================
+// 🔴 THE ANSWER FOR A CONFIG THIS FILE CANNOT PLACE, AND WHAT IT COSTS.
+//
+// THE NUMBER. 48 000 samples. It is a POLICY constant and not a derivation, so it is named, measured
+// and justified rather than explained: it is 7.6x the longest field any real capture has (A2.nam's
+// 6347), one second at 48 kHz and a quarter of one at 192 kHz — which in TIME is still 1.9x A2's
+// 132 ms, because a capture built to cover the same milliseconds at a higher rate needs proportionally
+// more samples of field.
+//
+// THE PRICE, MEASURED, because it is SPENT and not displayed. `configureRates` sizes `drainSamples_`
+// from this number and `reset()` drives that many samples of silence through the network — and
+// `reset()` is documented callable from the AUDIO thread, so this lands there, once per departure, per
+// lane. Timed through `NamStage::reset()` itself on NAM's shipped captures, each made slimmable at full
+// width and then WRAPPED, so the ledger charges 48 000 + the 2048 ring = 50 048 samples; M-series core,
+// 48 kHz, one mono restart, median of seven:
+//     capture                    as shipped             wrapped, block 256    block 64    block 1024
+//     `wavenet_a1_standard.nam`  4093 samples  3.44 ms  39.7 ms               44.5 ms     37.5 ms
+//     `A2.nam` (its submodel)    6347 samples  3.06 ms  24.1 ms
+//     `slimmable_wavenet.nam`    2047 samples  0.19 ms   4.5 ms
+// So about 40 ms per lane is the worst a real capture would pay if it arrived in a shape this file
+// cannot place — some 80 ms for a stereo restart, fifteen 256-sample callbacks at 48 kHz. That is a
+// dropout, and it is the price of the rule; the alternative was 2046 samples of the previous sound.
+// The comparison against NAM's own half-second heuristic for an unbounded memory holds only up to
+// 96 kHz: 48 000 is 2x it at 48 kHz, 1x at 96 kHz and HALF of it at 192 kHz. Said plainly rather than
+// rounded, because a stale comparison in a comment is this project's documented systemic leak.
+//
+// WHY NOT RATE-AWARE. Two of NAM's nine shipped captures — `my_model.nam` and
+// `wavenet_a1_standard.nam` — carry NO `sample_rate` key at all (verified: their top-level keys are
+// `architecture, config, version, weights`), so a rate-aware ceiling needs an absolute constant for the
+// missing case anyway, which is two numbers where one does. And this file runs at
+// `NamStage.cpp:831`, BEFORE `acceptsModelRate` and before `modelRunSR` exists.
+// WHY NOT GEOMETRIC. Nothing in a config bounds a dilated architecture: nine scalars write
+// `dilations:[2000000]` (see the cap note in `receptiveFieldOfLayers`). There is no geometric bound on
+// a config you could not read.
+constexpr int kUnreadShapeCeiling = 48000;
+
+// 🔴 AND HOW DEEP THIS FILE WILL FOLLOW A CONFIG BEFORE IT CALLS THAT "CANNOT PLACE" TOO.
+// This is a CRASH GUARD and it is measured. The walks below recurse once per nesting level, and a
+// `.nam` is user data: nlohmann 3.12 parses and destroys ITERATIVELY (its parser drives an explicit
+// `states` vector), so a 100 000-deep file arrives intact and only this file's recursion dies on it.
+// Measured on the code as it stood, nesting through `condition_dsp` alone: 60 000 levels survive on
+// the 8 MiB main stack and 80 000 SIGSEGVs; on a 512 KiB worker stack — which is what a plain
+// `std::thread` gets, and `prepareModel` is "any thread but the audio thread" — 4 000 survive and
+// 6 000 die, on about 205 KB of JSON. `prepareModel`'s `catch (...)` cannot catch a SIGSEGV and the
+// 64 MiB unpack guard is three orders of magnitude above the trigger.
+// That exposure predates this file's unplaced-config walk but is WIDENED by it, because an unplaced
+// key name is chosen by whoever wrote the file rather than by NAM — and NAM itself unwraps `config.model`
+// exactly ONCE (`wavenet/slimmable.cpp:543` is not recursive), so a chain of dead `model` keys is a
+// file NAM loads happily and this file used to be asked to walk. 64 is 32x the deepest nesting any real
+// capture has (2: a container's submodel that carries a conditioner) and about 7.7 KB of stack, three
+// orders of magnitude below the smallest stack this ships on. Past it the answer is the ceiling, which
+// is the same thing this file says about every other shape it cannot read.
+constexpr int kMaxConfigNesting = 64;
+
+// THE ПРИЗНАК: an object that DESCRIBES A MODEL, judged only by the vocabulary THIS file answers in.
+// It deliberately knows nothing about which parser NAM would hand the node to — that heuristic is
+// upstream's, a second copy of it would have to track upstream forever, and rule 9u exists because this
+// project has paid for such copies three times. All this says is: *here is a description of memory, and
+// I cannot place it in the topology I understand.*
+//
+// `model` is in the list because it is NAM's OWN name for a nested node in both places it nests one
+// (`container.cpp:161`, `slimmable.cpp:543`); `config` catches a whole model node. Nothing here is
+// keyed on the slimmable marker, on `slice_channels_uniform`, or on where NAM looks — remove the
+// wrapper's key name from a config and the признак still fires on its shape.
+inline bool looksLikeModelDescription (const nlohmann::json& v)
+{
+    if (! v.is_object()) return false;
+    return (v.contains ("config")        && v["config"].is_object())
+        || (v.contains ("model")         && v["model"].is_object())
+        || (v.contains ("layers")        && v["layers"].is_array())
+        || (v.contains ("dilations")     && v["dilations"].is_array())
+        || (v.contains ("submodels")     && v["submodels"].is_array())
+        || (v.contains ("condition_dsp") && v["condition_dsp"].is_object())
+        ||  v.contains ("receptive_field");
+}
+
+// The keys this file ACCOUNTS FOR at a config, and at one of its layer-array entries. Everything else
+// at those two positions is a place a model could hang that nothing here walks. Stated as what IS read
+// rather than as what is not, because the second list has no end.
+inline bool isReadConfigKey (const std::string& k)
+{
+    return k == "layers" || k == "dilations" || k == "head" || k == "receptive_field"
+        || k == "condition_dsp" || k == "submodels";
+}
+
+inline bool isReadLayerKey (const std::string& k)
+{
+    return k == "dilations" || k == "kernel_sizes" || k == "kernel_size" || k == "head";
+}
+
+// 🔴 THE ONE WALK OVER THE CONFIGS THIS FILE CANNOT PLACE — and it being ONE is the point, not tidiness.
+// `receptiveFieldFromConfig`, `isRecurrent` and `partitionedTailSamples` all reach the unplaced nodes
+// through this function, so they cannot disagree about WHICH nodes exist. Three functions answering
+// differently about one model is the class this whole line of work exists to close, and the hybrid was
+// a measured instance of it: field blind, ring blind, recurrence blind, all at once.
+//
+// WHERE IT LOOKS. At a config's own keys, and at the keys of each entry in its `layers` array. Those
+// are the two positions this file walks, and a description of memory hanging off either is one it is
+// not reading. It does NOT descend into arbitrary sub-objects: `metadata` — which sits on the MODEL
+// node, a sibling of `config`, and is never visited from here — carries a real capture's free-form
+// user tree (`training.data.latency.calibration...`), and a scan that went hunting through unschema'd
+// JSON for words that look like a stack would invent memory for data nothing builds. `config` has a
+// schema and `metadata` has not; that is the line, and it is structural rather than a survey result.
+//
+// THE COST TODAY IS ZERO AND IT IS MEASURED, NOT ASSUMED: over 2369 real captures on this machine —
+// 589 112 model nodes and 393 082 layer entries, NAM's own examples and namz's conformance vectors
+// included — this walk visits nothing at all. The only object-valued config key that ever occurs is
+// `condition_dsp`, which is read; every layer-entry object is a layer FEATURE (`head1x1`, `layer1x1`,
+// the eight `*_film` objects, `activation`, `slimmable`) and not one of them carries the vocabulary.
+// Scanning the layer entries was argued against twice in the round on the grounds that a model there
+// would be a new NAM dispatch and therefore a number in the plan; it is scanned anyway, because that
+// argument was equally true of `config.model` until it was measured, and because a false fire here is
+// an over-charge, which is the side the rule has already chosen.
+inline void forEachUnplacedConfig (const nlohmann::json& cfg,
+                                   void (*visit) (const nlohmann::json&, void*), void* ctx)
+{
+    if (! cfg.is_object()) return;                       // `config: null / [] / 7` is not iterated
+    for (const auto& item : cfg.items())
+    {
+        if (isReadConfigKey (item.key())) continue;
+        if (looksLikeModelDescription (item.value())) { visit (item.value(), ctx); continue; }
+        // …and an ARRAY of them, which is the `submodels` shape under a name this file does not know.
+        if (item.value().is_array())
+            for (const auto& entry : item.value())
+                if (looksLikeModelDescription (entry)) visit (entry, ctx);
+    }
+    if (! cfg.contains ("layers") || ! cfg["layers"].is_array()) return;
+    for (const auto& grp : cfg["layers"])
+    {
+        if (! grp.is_object()) continue;
+        for (const auto& item : grp.items())
+            if (! isReadLayerKey (item.key()) && looksLikeModelDescription (item.value()))
+                visit (item.value(), ctx);
+    }
+}
+//======================================================================================================
+
 // 🔴 AND THE PART OF THE MEMORY THAT IS NOT THE FIELD AT ALL. A Linear capture is not always run tap
 // by tap: NAM picks a partitioned-FFT convolution for anything past 256 taps unless the config says
 // otherwise (`implementation`, default `auto` — NAM v0.5.4 `linear.cpp:14-17, 100-108`), and that
@@ -307,6 +471,8 @@ inline const nlohmann::json* conditionerOf (const nlohmann::json& cfg)
 // as one: named, pinned to the tag, and gated by a test with a dense kernel, because there is no
 // owner here to ask.
 inline bool anyNestedModel (const nlohmann::json& model, bool (*pred) (const nlohmann::json&));
+inline bool anyNestedInConfig (const nlohmann::json& cfg, bool (*pred) (const nlohmann::json&), int depth);
+inline bool anyUnplacedConfig (const nlohmann::json& model);
 
 inline bool isLinearArchitecture (const nlohmann::json& model)
 {
@@ -316,6 +482,12 @@ inline bool isLinearArchitecture (const nlohmann::json& model)
 
 inline int partitionedTailSamples (const nlohmann::json& model)
 {
+    // 🔴 AND IT IS CHARGED FOR A SHAPE THIS FILE COULD NOT PLACE, unconditionally. The ring is ADDED
+    // to the field (`NamStage.cpp:543`, `field + drainTail_`), so the ceiling does not cover it: a
+    // wrapper hiding a `Linear` would take the ceiling for the field and still lose the ring. 2048
+    // samples is 43 µs; the alternative is a lane that drains its whole ceiling and still emits.
+    // It is also what keeps the THREE readers moving together on the признак, which is the property
+    // the joint rows in the suite exist to hold.
     // A CONTAINER IS ASKED THROUGH, exactly as the field is. `receptiveFieldFromConfig` recurses into
     // `submodels` and this must too, or a container of Linear captures reports the top-level
     // architecture (SlimmableContainer), is charged no ring, and drains short on whichever submodel is
@@ -329,7 +501,8 @@ inline int partitionedTailSamples (const nlohmann::json& model)
     // at all: an over-drain of 2048 samples is a few milliseconds of one lane once per departure, and
     // the alternative is this file second-guessing NAM's own `auto` rule (`linear.cpp:100-108`), which
     // is exactly the restatement rule 9u exists against.
-    return (isLinearArchitecture (model) || anyNestedModel (model, isLinearArchitecture)) ? 2 * 1024 : 0;
+    return (isLinearArchitecture (model) || anyNestedModel (model, isLinearArchitecture)
+            || anyUnplacedConfig (model)) ? 2 * 1024 : 0;
 }
 
 // Whether the architecture carries a RECURRENT cell, whose state no finite length of silence empties.
@@ -345,42 +518,146 @@ inline bool isLstmArchitecture (const nlohmann::json& model)
         && model["architecture"].get<std::string>() == "LSTM";
 }
 
+// 🔴 AND IT IS DELIBERATELY *NOT* FORCED TRUE FOR A SHAPE THIS FILE COULD NOT PLACE, which is the one
+// place the ceiling rule stops. Recurrence is a claim about the KIND of state — "no finite silence
+// empties it" — and not about a magnitude, and the arithmetic says it buys nothing here anyway:
+// `configureRates` spends `fmax(prewarm, 0.5 * modelRunSR)` for a recurrent capture
+// (`NamStage.cpp:539`), and with `prewarm` at the 48 000 ceiling that is 48 000 for EVERY model rate
+// up to 96 kHz — i.e. for every capture that exists. What the flag WOULD buy is permanent: a recurrent
+// lane is re-charged the whole drain on every `reset()` and its `everFed_` is never cleared
+// (`NamStage.cpp:369, :393`), so every later `prepare()` re-charges it too, forever. Zero drain length,
+// unbounded repeated cost. So it stays a READ fact — and "read" still means read through the unplaced
+// node: the walker below goes there, so an `architecture:"LSTM"` under a wrapper is found. What is left
+// uncovered is a recurrent model whose config says so in a vocabulary this file has never seen; that
+// one gets 48 000 samples, which is twice NAM's own heuristic at 48 kHz, and then is marked clean.
 inline bool isRecurrent (const nlohmann::json& model)
 {
     return isLstmArchitecture (model) || anyNestedModel (model, isLstmArchitecture);
 }
 
-// True when ANY model NESTED in this one, at any depth, satisfies `pred` — the two nesting keys are
-// the ones named at the top of this file, and BOTH are walked here because a predicate that reached
-// only half the tree is the same defect in a different function. The container switches by level and
-// any of them can be the one speaking; the conditioner is always running. Either way the answer has
-// to be the worst case over the tree, which is the same rule receptiveFieldFromConfig applies to the
-// field.
+// True when ANY model NESTED in this one, at any depth, satisfies `pred` — the nesting keys are the
+// ones named at the top of this file, and ALL of them are walked here because a predicate that reached
+// only part of the tree is the same defect in a different function. The container switches by level and
+// any of them can be the one speaking; the conditioner is always running; a config this file could not
+// place may hold either. Either way the answer has to be the worst case over the tree, which is the
+// same rule receptiveFieldFromConfig applies to the field.
+inline bool anyNestedInModel (const nlohmann::json& model, bool (*pred) (const nlohmann::json&), int depth);
+
 inline bool anyNestedModel (const nlohmann::json& model, bool (*pred) (const nlohmann::json&))
 {
-    if (! model.contains ("config")) return false;
-    const auto& cfg = model["config"];
-    if (const nlohmann::json* cond = conditionerOf (cfg))
-        if (pred (*cond) || anyNestedModel (*cond, pred))
-            return true;
-    if (! cfg.contains ("submodels") || ! cfg["submodels"].is_array()) return false;
-    for (const auto& sub : cfg["submodels"])
-        if (sub.contains ("model") && (pred (sub["model"]) || anyNestedModel (sub["model"], pred)))
-            return true;
-    return false;
+    return anyNestedInModel (model, pred, 0);
 }
+
+namespace unplaced
+{
+// The visitor's context. A function pointer plus a `void*` rather than a template, so the walk stays
+// ONE function with ONE definition of "unplaced" for every reader that uses it.
+struct PredScan { bool (*pred) (const nlohmann::json&); int depth; bool hit; };
+
+inline void scanPred (const nlohmann::json& v, void* ctx)
+{
+    auto* s = static_cast<PredScan*> (ctx);
+    if (s->hit) return;
+    // 🔴 ONE READING OF AN UNPLACED NODE, AND IT COVERS BOTH THINGS THE NODE MIGHT BE. An unplaced
+    // object may be a MODEL NODE (`architecture` + `config`) or a RAW CONFIG — the wrapper's
+    // `config.model` is the latter (`wavenet/slimmable.cpp:543` hands it straight to
+    // `parse_config_json`, which reads `model_json["layers"]`). Deciding which NAM would build is
+    // restating NAM's dispatch, so it is read as a raw config, full stop: if it is really a model node,
+    // its own `config` key is not one this file reads at a config, so the walk reaches it as an
+    // unplaced child one level down. `pred` is applied directly first, because a raw config has no
+    // `architecture` for it to read and a model node does.
+    // 🔴 AND NOT TWO READINGS, which is what this first said and it was a HANG. Reading the node both
+    // as a model (through `v["config"]`) and as a raw config (which reaches `v["config"]` again as an
+    // unplaced child) visits every level twice by two paths, and the work grows like Fibonacci: measured
+    // on `{"layers":[1],"config":{"layers":[1],"config":…}}`, 1.07 ms at 16 levels, 7.93 ms at 20,
+    // 19.1 ms at 22 — about 1.6x per level, which is some 10^6 seconds at the 64-level guard, from a
+    // file of 1.5 KB. One reading visits each node once.
+    if (s->pred (v) || anyNestedInConfig (v, s->pred, s->depth + 1))
+        s->hit = true;
+}
+} // namespace unplaced
+
+inline bool anyNestedInConfig (const nlohmann::json& cfg, bool (*pred) (const nlohmann::json&), int depth)
+{
+    if (depth > kMaxConfigNesting) return false;   // past the guard nothing is READ; the FIELD answers the ceiling
+    if (const nlohmann::json* cond = conditionerOf (cfg))
+        if (pred (*cond) || anyNestedInModel (*cond, pred, depth + 1))
+            return true;
+    if (cfg.contains ("submodels") && cfg["submodels"].is_array())
+        for (const auto& sub : cfg["submodels"])
+            if (sub.contains ("model") && (pred (sub["model"]) || anyNestedInModel (sub["model"], pred, depth + 1)))
+                return true;
+    unplaced::PredScan s { pred, depth, false };
+    forEachUnplacedConfig (cfg, unplaced::scanPred, &s);
+    return s.hit;
+}
+
+inline bool anyNestedInModel (const nlohmann::json& model, bool (*pred) (const nlohmann::json&), int depth)
+{
+    return model.contains ("config") ? anyNestedInConfig (model["config"], pred, depth) : false;
+}
+
+inline int fieldOfConfig (const nlohmann::json& cfg, int depth, bool& ceilinged);
 
 inline int receptiveFieldFromConfig (const nlohmann::json& model)
 {
-    if (! model.contains ("config")) return 0;
-    const auto& cfg = model["config"];
+    bool ceilinged = false;
+    return model.contains ("config") ? fieldOfConfig (model["config"], 0, ceilinged) : 0;
+}
+
+// 🔴 WHETHER THE FIELD TOOK THE CEILING ANYWHERE IN THE TREE — asked OF THE FIELD'S OWN WALK, not of a
+// second walk that tries to agree with it. The first version of this was a separate scan of the top
+// config only, and it diverged on both axes a separate scan can: a container whose SUBMODEL carried an
+// unplaced node read 48 000 for the field and 0 for the ring, and past the nesting guard the field said
+// "I stopped reading" while the ring, having stopped reading too, said "I read, and there is no Linear"
+// — measured on a `condition_dsp` chain: ring 2048 at 65 levels, 0 at 66. Deriving the answer from the
+// function that decides the ceiling makes that divergence unwritable rather than untested.
+inline bool anyUnplacedConfig (const nlohmann::json& model)
+{
+    bool ceilinged = false;
+    if (model.contains ("config")) (void) fieldOfConfig (model["config"], 0, ceilinged);
+    return ceilinged;
+}
+
+namespace unplaced
+{
+// Tallies what the configs this file could not place are worth, and remembers that there WAS one.
+struct FieldScan { long long total; int depth; bool* ceilinged; bool local; };
+
+inline void scanField (const nlohmann::json& v, void* ctx)
+{
+    auto* s = static_cast<FieldScan*> (ctx);
+    s->local = true;                 // THIS node carries one: floor THIS node's answer
+    *s->ceilinged = true;            // …and the tree took the ceiling somewhere: the ring reads this
+    // ONE reading, for the reason and with the measured hang stated at `scanPred`: a model node's
+    // `config` is reached as an unplaced child of the node read as a raw config.
+    // ACROSS nodes, and against what the top level read, the composition is a SUM. Two seats of the
+    // round argued for a max on the grounds that NAM builds exactly one of the two halves at this pin
+    // (`wavenet/slimmable.cpp:543` picks one) — which is true, and is precisely the upstream fact rule
+    // 9u forbids depending on. Not knowing whether an unplaced node is an ALTERNATIVE to what was read
+    // or a STAGE IN SERIES with it, this takes series, because series is the worse of the two. It costs
+    // nothing on the shape that made the rule: the wrapper's decoy top level reads 0.
+    s->total = clampCount (s->total + (long long) fieldOfConfig (v, s->depth + 1, *s->ceilinged));
+}
+} // namespace unplaced
+
+inline int fieldOfConfig (const nlohmann::json& cfg, int depth, bool& ceilinged)
+{
+    // 🔴 PAST THE NESTING GUARD THE ANSWER IS THE CEILING, not zero and not a crash — see
+    // `kMaxConfigNesting`. "I stopped reading" is a case of "I do not know", and the rule for that is
+    // already written. This also changes a RELEASED answer for a config nested deeper than 64 through
+    // `condition_dsp` or `submodels`: it used to read its real (small) number and now reads 48 000.
+    // The deepest nesting any real capture has is 2, and the same shape at 6 000 deep used to take the
+    // process down on a 512 KiB thread, so the shift is from a crash-or-a-number to a bound.
+    if (depth > kMaxConfigNesting) { ceilinged = true; return kUnreadShapeCeiling; }
     // A container holds several models and switches between them by level; any of them can be the
     // one speaking, so the longest memory is the one that has to be waited out.
     long long worst = 0;
     if (cfg.contains ("submodels") && cfg["submodels"].is_array())
         for (const auto& sub : cfg["submodels"])
             if (sub.contains ("model"))
-                worst = std::max (worst, (long long) receptiveFieldFromConfig (sub["model"]));
+                worst = std::max (worst, (long long) (sub["model"].contains ("config")
+                                                          ? fieldOfConfig (sub["model"]["config"], depth + 1, ceilinged) : 0));
     // 🔴 AND THE CONTAINER BRANCH DOES NOT RETURN HERE, because NAM dispatches on the `architecture`
     // STRING and never on shape (`get_dsp.cpp:261`): a `"WaveNet"` carrying a stray `submodels` array
     // LOADS, and every key this file reads is in the half a `return` would skip. Measured on one — a
@@ -393,21 +670,42 @@ inline int receptiveFieldFromConfig (const nlohmann::json& model)
     // reader a 24 000-sample floor and a restart that is never idempotent again, for a tree whose only
     // instance reaches back 500.
     //
-    // The layers are asked FIRST and the two declarations are the fallback, not the other way round: a
-    // WaveNet config may carry `receptive_field` as well, and the dilated stack is the one that
-    // describes what it does — maxing there would drain a real capture for a stale number. The other
-    // two are MAXED against each other rather than chained, because a chain lets the ConvNet reader
-    // SUPPRESS the declared one: a `Linear` carrying a stray `dilations` array loads (its parser reads
-    // neither key, `linear.cpp:306-316`) and a first-non-zero chain answered 2 for a 4999-sample
-    // impulse response that answered 4999 without the stray key. A max cannot take anything away.
-    long long own = receptiveFieldOfLayers (cfg);
-    if (own == 0) own = std::max ((long long) convNetField (cfg), (long long) declaredReceptiveField (cfg));
+    // 🔴 THE THREE SOURCES ARE MAXED, NEVER CHAINED, AND NO READER MAY SILENCE ANOTHER.
+    // This line used to read `own = layers; if (own == 0) own = max(convNet, declared);` — a chain,
+    // and the comment that stood here condemned exactly that pattern between the other two while
+    // leaving it in place ABOVE them. It cost two measured leaks on loaded models with real weights:
+    //   a `Linear` of 5000 dense taps carrying a READABLE stray `layers` array (its parser reads
+    //   neither `layers` nor `dilations`, `linear.cpp:306-316`, so the file LOADS) answered 2 where
+    //   the impulse reaches 4999 — a drain of 2 + 2048 against a model that needs 4999, i.e. 2949
+    //   samples of the previous sound handed back out of digital silence;
+    //   a `Linear` carrying a stray `dilations` array answered 2 for the same reason before P87 split
+    //   the lower two — the row is still in the suite, and this closes the half above it.
+    // The chain's stated justification was that "maxing would drain a real capture for a stale number":
+    // under the ratified asymmetry that is the CHEAP side, and it is also empty in fact — across 2369
+    // real captures on this machine (589 112 model nodes) no config carries `receptive_field` or a
+    // top-level `dilations` at all, so no shipped capture can pay for the max. What moves instead is
+    // a synthetic row: a WaveNet carrying a stale `receptive_field` of 99999 beside a 9-sample stack
+    // now answers 99998 rather than 9.
+    const long long own = std::max ((long long) receptiveFieldOfLayers (cfg),
+                                    std::max ((long long) convNetField (cfg),
+                                              (long long) declaredReceptiveField (cfg)));
     // …AND THE CONDITIONER IS ADDED TO IT, because it is in series (see the top of this file). The sum
     // is taken in long long: both addends are already individually clamped to INT_MAX, so an int
     // addition here is undefined behaviour for a config a unit test can write down.
     const nlohmann::json* cond = conditionerOf (cfg);
-    const long long total = std::max (worst,
-                                      own + (cond != nullptr ? (long long) receptiveFieldFromConfig (*cond) : 0LL));
+    const long long condField = cond != nullptr && cond->contains ("config")
+                              ? (long long) fieldOfConfig ((*cond)["config"], depth + 1, ceilinged) : 0LL;
+    // …AND THE CONFIGS THIS FILE COULD NOT PLACE. See `forEachUnplacedConfig`. The ceiling is a FLOOR
+    // on the whole answer and not an alternative to it: a node that reads as something is charged that
+    // something AND at least the ceiling, so the branch can never be short, and there is no
+    // "was it readable?" predicate to get wrong — `receptiveFieldOfLayers` returns 0 both for "there is
+    // nothing here" and for "there are layers whose dilations I could not read", so that predicate does
+    // not exist to be asked. The price is measured beside the constant: on the wrapped
+    // `slimmable_wavenet.nam` that made the rule, the ceiling and its ring cost 4.5 ms of one lane per departure.
+    unplaced::FieldScan u { 0, depth, &ceilinged, false };
+    forEachUnplacedConfig (cfg, unplaced::scanField, &u);
+    long long total = std::max (worst, clampCount (own + condField + u.total));
+    if (u.local) total = std::max (total, (long long) kUnreadShapeCeiling);
     return (int) std::min (total, (long long) std::numeric_limits<int>::max());
 }
 } // namespace felitronics::nam::detail

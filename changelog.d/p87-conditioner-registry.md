@@ -68,6 +68,7 @@ drain against **0.905148267746** after a restart, on the same capture.
   `config.layers[i].slimmable` marker and the real config then hides under `config.model`. It loads, NAM
   answers 0 and the registry answers 0 however long its stack is (measured 314 samples of leak on one).
   Reading it means restating NAM's dispatch heuristic, which is its own decision and its own number.
+  *(Closed by P92 without that restatement — see `p92-unplaced-shape-ceiling.md`.)*
 - **And one that is not this module's at all, registered with its reproducer:** a `condition_dsp` that is
   a `SlimmableContainer` with a WaveNet submodel, or a slimmable WaveNet, **crashes the host on load** —
   a null write inside NAM's own `WaveNet::_set_condition_array` during `DSP::prewarm()`, because neither
