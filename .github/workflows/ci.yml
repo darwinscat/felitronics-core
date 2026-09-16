@@ -121,10 +121,14 @@ jobs:
         #
         # An empty selection is refused by COUNTING it, once, rather than per line: a selection can be
         # nothing but a timing suite (a pull request touching only fftpffft), which the first line runs and
-        # the second then rightly finds empty.
+        # the second then rightly finds empty. A row built WITHOUT an option is different: for a pull request
+        # that touches only nam, rigplayer or fftpffft it has nothing to run, and that is a skip, not a red
+        # (before, --no-tests=error failed four rows on it). A row with every option ON still refuses zero —
+        # there the same filter must match, so zero means the filter is broken.
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
+          ALL_OPTIONS: ${{ matrix.pffft == 'ON' && matrix.nam == 'ON' }}
         shell: bash
         run: |
           PERF='^(felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests)$'
@@ -133,6 +137,9 @@ jobs:
           if [ "$SCOPE_MODE" = selected ]; then
             SEL=(-R "$SCOPE_REGEX")
             found=$(ctest --test-dir build -C Release -N "${SEL[@]}" | tr -d '\r' | sed -n 's/^Total Tests: *//p')
+            if [ "$found" = 0 ] && [ "$ALL_OPTIONS" != true ]; then
+              echo "none of the selected tests is built with pffft=${{ matrix.pffft }} nam=${{ matrix.nam }} - nothing to run here"; exit 0
+            fi
             [ "$found" -gt 0 ] || { echo "::error::the selection matched no test here (found: '$found')"; exit 1; }
           fi
           n=$( (getconf _NPROCESSORS_ONLN || nproc || sysctl -n hw.ncpu) 2>/dev/null | head -1 )
@@ -298,11 +305,14 @@ jobs:
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
         # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
         # code, and it already runs natively in build-test. Without it the suite can use every core.
+        # No --no-tests=error: this tier builds neither nam, rigplayer nor fftpffft, so a pull request touching
+        # only those selects nothing that exists here, and that is not a failure. The empty-FILTER guard lives
+        # where the same selection must match: the build-test rows with every option ON.
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
         run: |
-          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
+          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX"); fi
           ctest --preset wasm-audio -j "$(nproc)" -E spectrum_pane_perf "${SEL[@]}"
       - name: No threads — audited on EVERY emitted .wasm, not one sample
         run: node tools/wasm/check-no-threads.mjs --all build-wasm-audio
