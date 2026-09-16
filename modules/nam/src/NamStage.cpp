@@ -283,8 +283,9 @@ public:
                     // next prepare() — the stage paying twice for one departure. P85 registered it as a
                     // cost and measured it on a fixture (2562 spent, 5124 charged); on the real captures
                     // the wasted lane is 4093 samples for `wavenet_a1_standard`, 6347 for `A2` and 2047
-                    // for `slimmable_wavenet`, and the re-prepare that spends it measures 14.7 ms
-                    // against the 7.4 ms the same call costs with nothing owed.
+                    // for `slimmable_wavenet`. With the other lane still playing (so still owed), the
+                    // re-prepare measured 14.7 ms with the clean lane billed and 12.7 ms without, on
+                    // `wavenet_a1_standard` — against 7.4 ms for the same call with nothing owed at all.
                     //
                     // IT IS THE SAME CLAIM reset() ALREADY RESTS ON, not a new one: `drain_[c] == 0`
                     // means exactly "this lane has been fed the silence it owed", and reset() reads that

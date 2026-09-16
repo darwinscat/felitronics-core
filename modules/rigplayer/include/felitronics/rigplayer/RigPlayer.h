@@ -1357,8 +1357,8 @@ private:
     //   · THE ALIGNMENT DELAYS — `pendDelay_` and `slotDelay_`, which AlignmentTable::delayOf scales by
     //     the host rate, and which only stageDelays() and a landing ever wrote. Left stale, the two
     //     captures of one device are held apart by a number measured for a different rate, so the
-    //     crossfade combs by (ratio − 1) x the delay until the dial happens to visit a knot — a delay
-    //     lands only where the slot is silent, and nothing after a prepare() makes it silent again.
+    //     crossfade combs by (ratio − 1) x the delay. A staged delay lands only on a slot at weight zero,
+    //     so a SOUNDING slot kept the stale number until the dial moved it to silence.
     //
     // WHY THE TWO DELAYS ARE DERIVED FROM DIFFERENT MODELS, which looks like an inconsistency and is the
     // point: `pendDelay_` is the PLAN's — the model the dial is asking for — because that is what a
@@ -1387,9 +1387,11 @@ private:
     //
     // `still` is the one count here that is RESCALED rather than recomputed — see nam::blendRestated for
     // why it is exact for that count and a trap for `need`. The ratio needs the rate the ledger was
-    // COUNTED in, and that is not `fs_` from before this call: prepare() writes `fs_` before the
-    // sub-prepares that can still refuse, and a refused prepare leaves the player unable to process, so
-    // the ledger never advanced at the rate it wrote. `ledgerFs_` moves only here, at the end of a
+    // COUNTED in, and that is not reliably `fs_` from before this call: prepare() writes `fs_` ahead of
+    // two sub-prepares whose refusal it honours by returning false (no input reaches that refusal today,
+    // since their channel and rate arguments are validated first — the order is what is relied on, not
+    // the luck), and a refused prepare leaves the player unable to process, so the ledger never advanced
+    // at the rate it wrote. `ledgerFs_` moves only here, at the end of a
     // prepare that succeeded — and it moves even with no pack loaded, because a pack loaded afterwards
     // counts at the rate prepared now.
     void restateInHostSamples() {
