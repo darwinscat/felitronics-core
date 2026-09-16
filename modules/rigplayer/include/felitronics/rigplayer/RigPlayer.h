@@ -1371,11 +1371,26 @@ private:
     // next block. A prepare() landing between those two instants would hand the law a warm-up and a
     // delay measured for the rate that has just gone. The model itself is fine — it is re-prepared —
     // so only the two numbers need restating, and they are restated from the stage that now holds it.
+    //
+    // ⚠️ AND A FORGET IN FLIGHT MEANS THERE IS NO LEDGER TO RESTATE. load() and unload() post `forget_`
+    // and rebuild `models_` at once, but the audio thread wipes `blend_` only on its NEXT block — so a
+    // prepare() in that window finds `blend_.held[]` naming the PREVIOUS pack's models, as indices into a
+    // `models_` that now belongs to the new one. Resolving them here reads the old slot's delay out of
+    // the NEW pack's table: measured, a pack whose table owed 96 was applied to both slots of the pack
+    // before it. That is muted and heals within a block, and it is still a change to base behaviour in a
+    // window this function was never written for — so it stands back, and leaves the audio thread to
+    // wipe what it was always going to wipe. The PLAN's delays are still restated: `plan_` is the new
+    // pack's, and they are exactly what that first block will snap into place.
     void restateInHostSamples() {
         if (! loaded_) return;
         // The plan's delays first: stageDelays() is the one place that arithmetic is spelled.
         stageDelays();
-        for (int i = 0; i < 2; ++i) {
+        // The guard covers `blend_` and nothing else. A landing pending below belongs to the NEW pack if
+        // it exists at all — unload() voids the old one before posting the forget, and no job for the new
+        // pack can be taken before the audio thread has run once — so it is restated either way, rather
+        // than leaning on that ordering to make a skip harmless.
+        const bool forgetting = forget_.load(std::memory_order_acquire);
+        for (int i = 0; i < 2 && ! forgetting; ++i) {
             // `blend_` is the audio thread's, read here under the contract that says the two never run
             // at once — the same licence prepare() already uses to zero `bandRt_[s].count`.
             if (blend_.held[i] == 0) continue;

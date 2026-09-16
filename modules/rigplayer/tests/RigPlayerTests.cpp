@@ -2415,6 +2415,67 @@ int main() {
     }
 
     // ------------------------------------------------------------------------------------------
+    // ⚠️ A prepare() BETWEEN A load() AND THE NEXT BLOCK. load() posts a forget and rebuilds `models_`,
+    // but the audio thread wipes `blend_` only on its next block — so in that window `blend_.held[]`
+    // still names the PREVIOUS pack's models, as indices into a `models_` that now belongs to the new
+    // one. Restating the ledger there would resolve an old id against the new pack's table and store
+    // that delay for a slot the audio thread is about to empty. It is muted and would heal within a
+    // block, but it is a change to base behaviour in a window this fix was never aimed at — so the
+    // restatement stands back there, and this pins it doing so.
+    group("P89: a prepare() between load() and the next block does not resolve the OLD pack's ids");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        std::map<std::string, std::vector<std::byte>> files {
+            { "early", bytesOf(gainModel(0.25)) }, { "mid", bytesOf(gainModel(0.5)) },
+            { "late",  bytesOf(gainModel(1.0)) } };
+        RigPlayer p;
+        felitronics::test::run (p.prepare(kFs, kBlock, 1));
+        const auto source = [&files](const std::string& id) {
+            const auto it = files.find(id);
+            return it == files.end() ? std::vector<std::byte> {} : it->second;
+        };
+        p.load(r, source);                                 // pack A: no alignment, every delay is 0
+        p.setDial("gain", 150.0);
+        std::vector<float> x((std::size_t) kBlock, 0.1f);
+        float* io[1] { x.data() };
+        for (int k = 0; k < 24; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+        const int a0 = p.appliedSlotDelay(0), a1 = p.appliedSlotDelay(1);
+        ok(a0 == 0 && a1 == 0 && ! p.heldFileId(0).empty() && ! p.heldFileId(1).empty(),
+           "precondition: pack A has landed in both slots with no delay ("
+           + std::to_string(a0) + ", " + std::to_string(a1) + ")");
+
+        // Pack B: the SAME file names, so an old id resolves to a real entry of the new table — and a
+        // table that delays every one of them, so a cross-pack resolution cannot land on zero by luck.
+        p.load(r, source);
+        AlignmentTable t;
+        t.sampleRate = kFs;
+        t.lagByFile = { { "early", 0 }, { "mid", 0 }, { "late", 0 }, { "ghost", 96 } };
+        p.setAlignment(t);                                 // every real file now owes 96 against "ghost"
+        felitronics::test::run (p.prepare(kFs, kBlock, 1));   // …and NO block in between
+
+        ok(p.appliedSlotDelay(0) == a0 && p.appliedSlotDelay(1) == a1,
+           "the applied delays are what they were before the prepare, not pack B's 96 read through pack"
+           " A's ids (" + std::to_string(p.appliedSlotDelay(0)) + ", "
+           + std::to_string(p.appliedSlotDelay(1)) + ")");
+
+        // …and once the audio thread HAS run, the new pack's delays arrive through the ordinary path.
+        for (int k = 0; k < 48; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+        ok(p.appliedSlotDelay(0) == 96 || p.appliedSlotDelay(1) == 96,
+           "…and pack B's own delays land through the ordinary path once blocks run ("
+           + std::to_string(p.appliedSlotDelay(0)) + ", " + std::to_string(p.appliedSlotDelay(1)) + ")");
+    }
+
+    // ------------------------------------------------------------------------------------------
     group("P89: a restart snaps the slot trim THROUGH the switch that turns trims off");
     {
         // 🔴 THE ORACLE IS THE SWITCH'S OWN MEANING, not a level read off one player. `setInputTrims`
