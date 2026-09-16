@@ -94,7 +94,10 @@ jobs:
   # job (Linux/Clang-specific flags) rather than a 4th OS-matrix row.
   sanitizers:
     name: ubuntu-clang-asan-ubsan
-    runs-on: ubuntu-latest
+    # SELF-HOSTED ON deb for the same reason the macOS rows are on the Studio: this row was 19.7-28.1 min
+    # on a 4-core hosted VM, and deb has 20 threads. The fork gate is the same one: a pull request whose
+    # head is not in this repository keeps the hosted runner.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","deb"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -111,7 +114,7 @@ jobs:
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
-        run: cmake --build build-san -j 4
+        run: cmake --build build-san -j "$(nproc)"
       - name: Test
         env:
           # LSan (Linux-only; macOS has no LeakSanitizer) → this job is where leaks fail the build. It caught
@@ -181,7 +184,10 @@ jobs:
   # docs/P0-WASM-SPIKE.md has the numbers.
   wasm-audio:
     name: wasm-audio-tier
-    runs-on: ubuntu-latest
+    # SELF-HOSTED ON deb for the same reason the macOS rows are on the Studio: this row was 19.7-28.1 min
+    # on a 4-core hosted VM, and deb has 20 threads. The fork gate is the same one: a pull request whose
+    # head is not in this repository keeps the hosted runner.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","deb"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -192,9 +198,19 @@ jobs:
         # `--branch 6.0.9` pins the CLONE too. Without it `--depth 1` fetches emsdk master — the installer
         # and the release manifest — and only the SDK *version argument* would be pinned, which is not the
         # same thing and would have made the word "pinned" here false.
+        # A SELF-HOSTED RUNNER KEEPS $HOME, so a second run would find the clone already there and git would
+        # refuse. Reuse an installed 6.0.9; install only on a machine that has none. A DIFFERENT version
+        # already in place fails loudly on purpose — moving the toolchain is a deliberate act.
         run: |
-          git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
-          "$HOME/emsdk/emsdk" install 6.0.9
+          VER="$HOME/emsdk/upstream/emscripten/emscripten-version.txt"
+          if grep -qs '"6.0.9"' "$VER"; then
+            echo "emsdk 6.0.9 already in $HOME/emsdk — reusing it"
+          elif [ -e "$HOME/emsdk" ]; then
+            echo "::error::$HOME/emsdk exists but is not 6.0.9 ($(cat "$VER" 2>/dev/null)) — refusing to overwrite a toolchain"; exit 1
+          else
+            git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+            "$HOME/emsdk/emsdk" install 6.0.9
+          fi
           "$HOME/emsdk/emsdk" activate 6.0.9
           source "$HOME/emsdk/emsdk_env.sh"
           echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
@@ -409,7 +425,7 @@ jobs:
         run: |
           cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
                 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
-          cmake --build build-wasm-checked -j 4
+          cmake --build build-wasm-checked -j "$(nproc)"
           ctest --test-dir build-wasm-checked -j4 --output-on-failure -E spectrum_pane_perf
       - name: The P0 spike artifacts still build
         run: ./tools/wasm/build.sh
@@ -422,7 +438,7 @@ jobs:
         # prove nothing, and the libsoxr precedent is exactly a clean build that died at runtime.
         run: |
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
-          cmake --build build-native -j 4 --target fcore_measure
+          cmake --build build-native -j "$(nproc)" --target fcore_measure
           node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
           # The generator claims to be deterministic by construction; this turns that into a MEASURED fact
           # on a different machine, OS and node build than the one it was written on. Recorded from two
@@ -605,7 +621,7 @@ jobs:
           # build-native was configured with tests OFF (it only needed fcore_measure); turning them on
           # re-uses its object cache and adds this one target.
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
-          cmake --build build-native -j 4 --target felitronics_analysis_abi_tests
+          cmake --build build-native -j "$(nproc)" --target felitronics_analysis_abi_tests
           ./build-native/tools/felitronics_analysis_abi_tests --storage-table > storage-native.txt
           test -s storage-native.txt
           # A table of nothing but refusals would compare clean and say nothing, which is the shape this
