@@ -353,6 +353,11 @@ public:
             for (int s = 0; s < 2; ++s) { rebuildCurves(s); rebuildBands(s); }
             rebuildDry();
         }
+        // …AND EVERYTHING THIS PLAYER COUNTS IN HOST SAMPLES IS RESTATED IN THE NEW ONES. See
+        // restateInHostSamples(): the FIRs and the bands above were the half of a rate change anybody
+        // would think of, and the warm-up ledger and the two alignment delays were the half nothing
+        // touched.
+        restateInHostSamples();
         return true;
     }
     // 🔴 THE STREAM RESTART, AND UNTIL P86 THIS CLASS DID NOT HAVE ONE. A consumer reaching a
@@ -1227,22 +1232,27 @@ private:
     // read here are the ones process() reads, spelling for spelling, so that "a restart leaves the
     // player where prepare() leaves it" is true by construction.
     //
-    // ⚠️ AND IT CARRIES ONE SMALL DEFECT OF prepare()'s, REGISTERED RATHER THAN FIXED HERE — with the
-    // reasoning corrected, because the first draft of this note got it wrong. `curSlot_[i]` is snapped
-    // to the pack's per-file trim even when `inputTrims_` is OFF, and process() then ramps from there
-    // to unity; a freshly CONSTRUCTED player starts at unity and does not. Measured by an adversarial
-    // round on a −6 dB trim with trims off: the first sample after a restart is −5.99 dB and it takes
-    // about 43 ms to come within 0.3 dB of unity, identically for both verbs. The draft said fixing it
-    // would put the two verbs back in disagreement — that is FALSE, and this shared body is why: both
-    // verbs read it here, so `trims ? slotGain_[i] : 1.0f` would correct both at once. It is left
-    // alone because it moves RELEASED behaviour of prepare() and belongs to whoever takes that
-    // decision, not because it cannot be fixed in one place. P86 does make it reachable more often:
-    // a host that restarts at every transport stop now meets it at every start.
+    // 🔴 AND THE SLOT TRIM IS SNAPPED THROUGH THE SWITCH THAT TURNS IT OFF, which it was not until P89.
+    // `curSlot_[i]` used to be snapped to the pack's per-file trim whatever `inputTrims_` said, and
+    // process() reads that same switch every block (`trims ? slotGain_[i] : 1.0f`), so with trims OFF
+    // both verbs landed the ramp on a value the audio path was never going to travel to and then ramped
+    // AWAY from it to unity. A freshly CONSTRUCTED player starts at unity and does not. Measured by an
+    // adversarial round on a −6 dB trim with trims off: the first sample after a restart is −5.99 dB and
+    // it takes about 43 ms to come within 0.3 dB of unity, identically for both verbs — a restart that
+    // audibly ducked the slot it was restarting. P86 made it reachable at every transport start.
+    //
+    // The earlier note here registered this rather than fixing it, on the ground that a fix would put
+    // prepare() and reset() back in disagreement. That was FALSE, and this shared body is exactly why:
+    // both verbs snap through these lines, so spelling the switch once corrects both at once and keeps
+    // "a restart leaves the player where prepare() leaves it" true by construction. The spelling below is
+    // process()'s, character for character, which is the property that makes the agreement reviewable
+    // rather than remembered.
     void snapGains() noexcept {
+        const bool trims = inputTrims_.load(std::memory_order_acquire);
         curIn_    = inGain_.load(std::memory_order_relaxed);
         curOut_   = outGain_.load(std::memory_order_relaxed);
         curChain_ = chainGain_.load(std::memory_order_relaxed);
-        for (int i = 0; i < 2; ++i) curSlot_[i] = slotGain_[i].load(std::memory_order_relaxed);
+        for (int i = 0; i < 2; ++i) curSlot_[i] = trims ? slotGain_[i].load(std::memory_order_relaxed) : 1.0f;
         curDry_   = dryGain_.load(std::memory_order_relaxed);
         curWet_   = wetGain_.load(std::memory_order_relaxed);
     }
@@ -1308,6 +1318,61 @@ private:
     void stageDelays() {
         for (int i = 0; i < 2; ++i)
             pendDelay_[(std::size_t) i].store(delayOfModel(modelIdOf(plan_.file[i]), nam_[i]), std::memory_order_release);
+    }
+
+    // 🔴 EVERY NUMBER THIS PLAYER HOLDS IN HOST SAMPLES, RESTATED AT THE RATE IT NOW RUNS AT. This is
+    // prepare()'s other half, and until P89 it did not exist.
+    //
+    // WHAT prepare() PROMISES ABOUT HOST-DEPENDENT STATE, which is the sentence the mechanism below
+    // serves: after it returns, NOTHING the player will act on is expressed in the samples of a rate it
+    // is no longer running at. The rate-designed things were already covered — the FIRs are redesigned,
+    // the bands redesigned and retired, the dry aligner re-sized, both stages re-prepared, the cold
+    // threshold recomputed from its SECONDS. What was not covered is everything that is a COUNT of host
+    // samples, and there are two such families, both written once and read for ever:
+    //
+    //   · THE WARM-UP LEDGER — `blend_.need[i]`, latched from warmFor() at the landing, and read again at
+    //     every WAKE of a cold slot. See nam::blendRestated, which owns the numbers and the reasoning:
+    //     the warm-up did not depend on the new rate at all, so a slot woken after 48 -> 96 kHz warmed
+    //     for half the field it owes, and after 48 -> 192 for a quarter.
+    //   · THE ALIGNMENT DELAYS — `pendDelay_` and `slotDelay_`, which AlignmentTable::delayOf scales by
+    //     the host rate, and which only stageDelays() and a landing ever wrote. Left stale, the two
+    //     captures of one device are held apart by a number measured for a different rate, so the
+    //     crossfade combs by (ratio − 1) x the delay until the dial happens to visit a knot — a delay
+    //     lands only where the slot is silent, and nothing after a prepare() makes it silent again.
+    //
+    // WHY THE TWO DELAYS ARE DERIVED FROM DIFFERENT MODELS, which looks like an inconsistency and is the
+    // point: `pendDelay_` is the PLAN's — the model the dial is asking for — because that is what a
+    // staged retime is, while `slotDelay_` is the delay of the model actually IN the slot. In the common
+    // case they name one capture and get one number. When a load is in flight they do not, and taking
+    // both from the plan would apply the incoming model's delay to the one still playing. Snapping
+    // `slotDelay_` outright is right here and only here: prepare() is never concurrent with process(),
+    // clearAudioState() has just zeroed `lagTail_`, so there is no signal to splice and no click to hide
+    // from — which is the same reason snapGains() snaps rather than ramps.
+    //
+    // ⚠️ AND A LANDING CAN BE IN FLIGHT ACROSS THIS CALL. `loadSlot()` runs on the message thread and
+    // latches `landWarm_`/`landDelay_` at the rate of the moment; the audio thread consumes them on its
+    // next block. A prepare() landing between those two instants would hand the law a warm-up and a
+    // delay measured for the rate that has just gone. The model itself is fine — it is re-prepared —
+    // so only the two numbers need restating, and they are restated from the stage that now holds it.
+    void restateInHostSamples() {
+        if (! loaded_) return;
+        // The plan's delays first: stageDelays() is the one place that arithmetic is spelled.
+        stageDelays();
+        for (int i = 0; i < 2; ++i) {
+            // `blend_` is the audio thread's, read here under the contract that says the two never run
+            // at once — the same licence prepare() already uses to zero `bandRt_[s].count`.
+            if (blend_.held[i] == 0) continue;
+            felitronics::nam::blendRestated(blend_, i, warmFor(nam_[(std::size_t) i]));
+            const int d = std::clamp(delayOfModel(blend_.held[i], nam_[(std::size_t) i]), 0, kMaxDelay);
+            slotDelay_[(std::size_t) i].store(d, std::memory_order_relaxed);
+        }
+        if (landFlag_.load(std::memory_order_acquire)) {
+            const int ls = landSlot_.load(std::memory_order_relaxed) & 1;
+            landWarm_ .store(warmFor(nam_[(std::size_t) ls]), std::memory_order_relaxed);
+            landDelay_.store(std::clamp(delayOfModel(landModel_.load(std::memory_order_relaxed),
+                                                     nam_[(std::size_t) ls]), 0, kMaxDelay),
+                             std::memory_order_relaxed);
+        }
     }
 
     void setRequest(std::uint64_t want0, std::uint64_t want1, float targetB) {

@@ -2134,5 +2134,238 @@ int main() {
         }
     }
 
+    // ==========================================================================================
+    // P89 — WHAT A prepare() LEAVES EXPRESSED IN THE SAMPLES OF A RATE THAT IS GONE.
+    //
+    // The player counts two things in HOST samples and used to write both once and read them for ever:
+    // the blend law's warm-up debt (`need`, latched from warmFor() at the landing) and the two per-slot
+    // alignment delays (AlignmentTable::delayOf scales by the host rate). prepare() rebuilt everything
+    // that was DESIGNED for a rate — the FIRs, the bands, the dry aligner, both stages, the cold
+    // threshold — and nothing that was COUNTED in one.
+    //
+    // ⚠️ THE ONE-POINT FIXTURE WOULD HAVE PASSED. 44.1 <-> 48 kHz reads exactly right at a 256-sample
+    // block, and so does 88.2 <-> 96: the warm-up was frozen at the LANDING rate, so the error is the
+    // ratio of the two rates, and the two pairs a fixture would reach for first are the two where that
+    // ratio is ~1. The grid below is what makes the defect visible at all, and it is P85's lesson with a
+    // second set of numbers.
+    group("P89: a slot woken after a RATE CHANGE warms for the field the NEW rate owes");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // THE FIELD THE LEDGER REPORTS, WHICH IS NOT THE TAP COUNT. `delayModel(2000)` declares
+        // `receptive_field: 2001`, and NamStage::prewarmSamples() answers 2000 — the house convention is
+        // the model's REACH BACK, taps minus the sample it is answering for, and NamStage.h says so of
+        // this very shape ("a 2001-tap Linear reports 2000"). Writing 2001 here agreed with the measured
+        // player at every rate on the grid EXCEPT 96 kHz, where the doubling and the ceil push the extra
+        // sample across a block boundary — an off-by-one that only a grid can see, and the reason this
+        // oracle is spelled out rather than read back off warmFor().
+        constexpr int kField = 2000;
+
+        // One player, driven to the state the measurement needs: parked so the neighbour slot falls
+        // asleep, then hushed so the waking turn lands on silence. Returns the host samples of warm-up
+        // the law actually held the woken slot for, or -1 if the turn turned out to be a SWAP rather
+        // than a wake — a load re-lands the slot and would answer a different question.
+        struct Warm {
+            RigPlayer p;
+            std::map<std::string, std::vector<std::byte>> files;
+            double fs; int block; double phase = 0.0;
+            Warm(const namz::rig::Rig& rig, const std::string& nam, double sampleRate, int blk)
+                : fs(sampleRate), block(blk) {
+                files = { { "early", bytesOf(nam) }, { "mid", bytesOf(nam) }, { "late", bytesOf(nam) } };
+                felitronics::test::run (p.prepare(fs, block, 1));
+                p.load(rig, [this](const std::string& id) {
+                    const auto it = files.find(id);
+                    return it == files.end() ? std::vector<std::byte> {} : it->second;
+                });
+                p.setBlendShape({ 0.5, 0.0 });             // STEP: the neighbour sits at exactly zero
+            }
+            void run(int blocks, double a) {
+                std::vector<float> x((std::size_t) block);
+                for (int b = 0; b < blocks; ++b) {
+                    for (int i = 0; i < block; ++i) {
+                        x[(std::size_t) i] = (float) (a * std::sin(phase));
+                        phase += 2.0 * 3.14159265358979323846 * 220.0 / fs;
+                        if (phase > 6.283185307179586) phase -= 6.283185307179586;
+                    }
+                    float* io[1] { x.data() };
+                    felitronics::test::run (p.process(io, 1, block));
+                    p.serviceHere();
+                }
+            }
+            void parkAndSleep() {
+                p.setDial("gain", 150.0);
+                run((int) std::ceil(2.6 * fs / block), 0.5);   // past kColdAfterSeconds
+                run((int) std::ceil(0.3 * fs / block), 0.0);   // …then hush
+            }
+            long long wake() {
+                p.clearCounters();
+                const long long loadsBefore = p.modelLoads();
+                p.setDial("gain", 200.0);                      // BETWEEN knots: a wake, not a swap
+                run((int) std::ceil(1.5 * fs / block), 0.0);
+                if (p.modelLoads() != loadsBefore) return -1;
+                return (long long) p.warmBlocks() * block;
+            }
+        };
+
+        // THE ORACLE IS SPELLED HERE, not read back off the player. warmFor()'s three terms are the
+        // model's field converted into host samples, the rate-matcher's latency, and one block; the law
+        // counts a block as warming while `fed < need`, and `fed` advances by one block per call. This
+        // is an independent statement of the same arithmetic, so a mutation that changes warmFor() and
+        // the differential together still fails here.
+        const auto owed = [](double fs, int block, int latency) {
+            const long long need = (long long) std::ceil((double) kField * fs / 48000.0)
+                                 + (long long) latency + (long long) block;
+            return ((need + block - 1) / block - 1) * block;
+        };
+
+        const double rates[] { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+        const int blocks[] { 64, 256 };
+        int cells = 0, matched = 0, oracled = 0, skipped = 0;
+        double worstRatio = 1.0;
+        for (const int blk : blocks)
+        for (const double f1 : rates)
+        for (const double f2 : rates) {
+            if (f1 == f2) continue;
+            Warm a(r, delayModel(2000), f1, blk);
+            a.parkAndSleep();
+            const bool slept = a.p.slotCold(0) || a.p.slotCold(1);
+            felitronics::test::run (a.p.prepare(f2, blk, 1));       // …the host changes its rate
+            const long long got = a.wake();
+
+            Warm b(r, delayModel(2000), f2, blk);                   // …against one that never moved
+            b.parkAndSleep();
+            const long long want = b.wake();
+
+            ++cells;
+            if (! slept || got < 0 || want < 0) { ++skipped; continue; }
+            if (got == want) ++matched;
+            else worstRatio = std::max(worstRatio, want > 0 ? std::max((double) got / (double) want,
+                                                                      (double) want / (double) got) : 1.0);
+            if (got == owed(f2, blk, b.p.latencySamples())) ++oracled;
+        }
+        ok(skipped == 0, "precondition: every cell actually slept and woke without a load ("
+                         + std::to_string(cells - skipped) + " of " + std::to_string(cells) + ")");
+        ok(matched == cells,
+           "a player whose rate CHANGED warms exactly as long as one prepared at that rate from the start"
+           " (" + std::to_string(matched) + " of " + std::to_string(cells) + " cells; worst ratio "
+           + std::to_string(worstRatio) + " — on the base commit 85 cells under-warmed, 48 -> 96 kHz to"
+           " HALF the field and 48 -> 192 to a quarter, while 44.1 <-> 48 read exactly right)");
+        ok(oracled == cells,
+           "…and the length is the one warmFor()'s three terms ask for, stated independently here ("
+           + std::to_string(oracled) + " of " + std::to_string(cells) + ")");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    group("P89: the per-slot ALIGNMENT DELAY is restated at the new rate too");
+    {
+        // A table measured at 48 kHz, so `delayOf` has a rate to scale FROM. The pack's captures land
+        // 64 samples apart there; at 96 kHz that is 128 host samples and at 24 kHz it is 32.
+        const auto rig = throughTheFormat(testRig());
+        AlignmentTable t;
+        t.sampleRate = 48000.0;
+        t.lagByFile = { { "g60", 0 }, { "g150", 64 }, { "g240", 0 }, { "r150", 0 } };
+
+        // ⚠️ AND THE TOP OF THE GRID IS A CLAMP, NOT A SCALING — registered here because the fixture
+        // found it. `AlignmentTable::delayOf` clamps to `nam::kBlendMaxDelay`, which is 128 SAMPLES and
+        // therefore a duration that shrinks with the rate: 2.67 ms at 48 kHz, 0.67 ms at 192 kHz. A pack
+        // whose captures land 64 samples apart at 48 kHz asks for 256 at 192 kHz and silently gets 128,
+        // so the pair is aligned at 48 and 96 kHz and combs at 192. That is a bound in the wrong unit —
+        // the same defect this file's band ramps were cured of — and it is NOT P89's to move: it is a
+        // constant in BlendLaw.h with its own consumers. Pinned at its real value so the day it changes,
+        // this says so.
+        struct Case { double fs; int want; };
+        const Case cases[] { { 48000.0, 64 }, { 96000.0, 128 }, { 44100.0, 59 },
+                             { 192000.0, felitronics::nam::kBlendMaxDelay } };
+        for (const auto& c : cases) {
+            Bench b(rig, 1, 48000.0);
+            b.p.setAlignment(t);
+            b.p.setDial("gain", 60.0);
+            b.rms(220.0, 0.2, 24, 8);                       // land a model, so a slot holds something
+            felitronics::test::run (b.p.prepare(c.fs, kBlock, 1));
+
+            // `delayOf` is the arithmetic; what is asserted is that prepare() RAN it. The reference is
+            // the table's own number scaled by hand, not a second call into the player.
+            const int hand = std::clamp((int) std::lround(64.0 * c.fs / 48000.0), 0, RigPlayer::kMaxDelay);
+            (void) 0;
+            ok(hand == c.want, "precondition: the hand-scaled delay at " + std::to_string((int) c.fs)
+                               + " Hz is " + std::to_string(c.want) + " (" + std::to_string(hand) + ")");
+            const int applied = std::max(b.p.appliedSlotDelay(0), b.p.appliedSlotDelay(1));
+            ok(applied == c.want, "prepare() restates the applied slot delay at " + std::to_string((int) c.fs)
+                                  + " Hz: want " + std::to_string(c.want) + ", got " + std::to_string(applied)
+                                  + " (the base commit kept 64 at every rate — the number measured for 48 kHz)");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    group("P89: a restart snaps the slot trim THROUGH the switch that turns trims off");
+    {
+        // 🔴 THE ORACLE IS THE SWITCH'S OWN MEANING, not a level read off one player. `setInputTrims`
+        // promises exactly one thing: the pack's per-file `input_db` stops being applied. So with trims
+        // OFF, a pack whose linked entry carries −6 dB must sound IDENTICAL to one whose entry carries
+        // 0 dB — before a restart and, which is the half that was false, after one.
+        //
+        // Comparing a restarted player against its own settled level instead would have measured the
+        // restart's other transients (the tone curve's 1024-tap FIR is flushed too, and rings in over
+        // 0.48 dB on the first block) and called the trim defect part of them. Two players restarted the
+        // same way share every one of those and differ only in the number under test.
+        auto rigTrimmed = testRig();                       // …files[4] is the link: "g60" at −6 dB
+        auto rigFlat    = testRig();
+        ok(rigTrimmed.chain[0].device.files.size() == 5
+           && std::abs(rigTrimmed.chain[0].device.files[4].inputDb + 6.0) < 1e-9,
+           "precondition: the pack's linked entry really carries a −6 dB trim");
+        rigFlat.chain[0].device.files[4].inputDb = 0.0;    // …the same pack with nothing to switch off
+        const auto trimmed = throughTheFormat(rigTrimmed);
+        const auto flat    = throughTheFormat(rigFlat);
+
+        for (const bool viaPrepare : { false, true }) {
+            Bench a(trimmed, 1, kFs), b(flat, 1, kFs);
+            for (auto* p : { &a, &b }) {
+                p->p.setInputTrims(false);                 // …the switch under test, OFF
+                p->p.setDial("gain", 0.0);                 // …parked on the linked knot
+                p->rms(220.0, 0.2, 32, 8);                 // …settled, so the ramp has arrived
+            }
+            ok(std::abs(db(a.gainAt(220.0, 0.2, 8, 8)) - db(b.gainAt(220.0, 0.2, 8, 8))) < 0.02,
+               "precondition: with trims OFF the two packs already sound the same before any restart");
+
+            if (viaPrepare) { felitronics::test::run (a.p.prepare(kFs, kBlock, 1));
+                              felitronics::test::run (b.p.prepare(kFs, kBlock, 1)); }
+            else            { a.p.reset(); b.p.reset(); }
+
+            // The FIRST block after the restart is where a wrong snap is loudest: the ramp starts there
+            // and takes ~43 ms to travel back to unity.
+            const double first = db(a.gainAt(220.0, 0.2, 0, 1)) - db(b.gainAt(220.0, 0.2, 0, 1));
+            ok(std::abs(first) < 0.02,
+               std::string("with trims OFF the pack's −6 dB trim is invisible on the first block after a ")
+               + (viaPrepare ? "prepare()" : "reset()") + " too (" + std::to_string(first)
+               + " dB; the base commit snapped to the trim regardless of the switch and read −5.99 dB)");
+
+            // …and across the whole ramp, which is where the old behaviour spent its 43 ms.
+            const double ramp = db(a.gainAt(220.0, 0.2, 0, 8)) - db(b.gainAt(220.0, 0.2, 0, 8));
+            ok(std::abs(ramp) < 0.02, std::string("…and across the ramp that followed it (")
+                                      + std::to_string(ramp) + " dB)");
+        }
+
+        // …and with trims ON the trim is still applied, so the fix switched something off rather than
+        // deleting it. Same two packs, same restart, opposite expectation.
+        {
+            Bench a(trimmed, 1, kFs), b(flat, 1, kFs);
+            for (auto* p : { &a, &b }) { p->p.setInputTrims(true); p->p.setDial("gain", 0.0);
+                                        p->rms(220.0, 0.2, 32, 8); }
+            a.p.reset(); b.p.reset();
+            const double d = db(a.gainAt(220.0, 0.2, 8, 16)) - db(b.gainAt(220.0, 0.2, 8, 16));
+            approx(d, -6.0, 0.05, "with trims ON the −6 dB trim is still there after a restart ("
+                                  + std::to_string(d) + " dB)");
+        }
+    }
+
     return felitronics::test::report();
 }
