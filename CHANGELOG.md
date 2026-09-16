@@ -5,6 +5,938 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.34.0 — 2026-09-16
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### oversampling · saturation · limiter · poweramp — a strict oversampler that is flat to 20 kHz, as an option
+
+`PolyphaseOversampler` centres a fixed cutoff at 0.45 fs, and at 44.1 kHz that sits below the top of the
+audio band: **one round trip costs −1.80 dB at 19 kHz and −15.55 dB at 20 kHz**, and more taps make
+20 kHz worse (−13.71 at 32, −19.17 at 120). The cutoff is not an oversight, and its derivation is now in
+the header: the class wraps a nonlinearity, so an image of content between 20 kHz and fs/2 that the
+interpolator only partly rejects is multiplied with that content and lands in the audio band. The
+design is therefore **strict** — the transition must finish below fs/2.
+
+- **`oversampling::CascadeOversampler`** keeps the guard and moves the band edge: a Kaiser 2x stage whose
+  length and cutoff follow from the sample rate by a measured rule, then halfband 2x stages. Images and
+  aliases of anything below fs/2 at **−91 dB or lower**, one pass within **0.0043 dB** up to 20 kHz, over
+  14 rates from 8 kHz to 768 kHz and factors 2–64 — and **−90.9 dB / 0.0049 dB over every one of the 110
+  first-stage lengths the rule can produce**. Powers of two only, rates 8 kHz (the core's floor, P51) to 3 MHz; refuses (law 11b)
+  what it cannot build.
+- **The price is latency, not CPU**: **131 base samples at 44.1 kHz 4x** (63 for the Kaiser stage) for
+  about the same multiply count (572 against 512). Above 44.1 kHz it gets cheaper, but the two halves cross
+  at different rates: in multiplies almost at once (508 at 44.7 kHz, 348 at 48 kHz), in latency only from
+  50.5 kHz (**76 at 48 kHz, 28 at 88.2 kHz**).
+- **A halfband first stage — the cheaper-looking cascade — cannot do this**, at any length:
+  H(f) + H(Fs/2 − f) = 1 makes its image rejection at fs − a equal its pass-band deviation at a. A 79 + 23
+  pair that loses 0.41 dB at 20 kHz leaves that tone's image at −32.5 dB; one flat to 20 kHz still passes
+  don't-care content's images at −58 / −35 / −22 dB (r = 0.46 / 0.47 / 0.48) — both pinned in
+  `felitronics_oversampling_tests`. Through a single-ended tube stage at +12 dB that is −48 … −56 dBFS of
+  intermodulation in the audio band (its 2nd-order line at 0.9–1.8 kHz) from −20 dBFS of content at
+  0.48–0.49 fs, against under −150 for the strict designs (P31 stand, not a test).
+- **`oversampling::Topology`** (`Kaiser` | `Cascade`) and `oversampling::Oversampler`, which is either.
+  `Saturator::prepare`, `TruePeakLimiterConfig::topology` and `PowerAmpStage::prepare` take it; **the
+  default is `Kaiser` everywhere, and under it nothing changes** — same refusals, same latency, same bits
+  (the whole suite passes unchanged). Under `Cascade`: `tapsPerPhase` is still range-checked and
+  otherwise unused; the rate becomes binding (a Saturator or limiter at 500 Hz is refused under the
+  cascade, accepted under Kaiser); the Saturator's dry path is delayed by the cascade's round trip;
+  `PowerAmpStage` rounds the factor down to a power of two and clamps the design rate, as it clamps
+  everything, and under the cascade its 4x and 32x are no longer sample-aligned (76 and 80 at 48 kHz).
+- **The switch costs the default 32 bytes per stage** (the cascade is heap-held, only when chosen).
+- **One source-level change for a product that reads budgets field by field**: the oversampler half of
+  `Saturator::Storage` and `TruePeakLimiter::Storage` is now `oversampling::Oversampler::Storage` (the Kaiser
+  fields live under `.kaiser`); `bytes()` and `fitsWithin()` are unchanged, and nothing in the tree reads
+  deeper. `PowerAmpStage.h` now includes `<bit>` (C++20, which every module already requires).
+- **The limiter's ceiling under the cascade**, measured with the ceiling suite's own witnesses: at
+  44.1 kHz 4fs/9 is now delivered flat, so the grid allowance at 8x rises from 0.108 to **0.133 dB**
+  (16x: 0.027 → 0.033); the 1.15 dB modulation envelope holds (worst 1.344 dB at 2x, inside 2.399), and at
+  44.1 kHz, 4x and 8x, the dense excess is lower than Kaiser's (0.49 / 0.48 against 0.81 / 0.75 dB).
+- **The shipped wasm module carries it without being able to use it**: `fcmaster.web.wasm` grows by about
+  12 KB (222 389 → 234 728 B against the main this branch sits on), because the chain's stages now
+  contain the switch, while `fc_master_config` cannot select the cascade. The chain's output does not move:
+  `fcore_master` render (with and without the clipper) and solve are bit-identical to main's at 44.1 and
+  48 kHz. `fcprobe.web.wasm` is unchanged.
+- **Unchanged on purpose**: `ReferenceTruePeakMeter` stays `PolyphaseOversampler` at 4x/32 — it is the
+  certified unit — and no stage's default moved. `MasteringChain` and the wasm ABI do not offer the
+  topology.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### nam · neural · core — `reset()` restarts the stream, and the price of it is published
+
+`felitronics::nam::NamStage::reset()` was EMPTY, and the comment above it recorded what that cost with a
+number: a dense 2001-tap capture that had played a tone answered **digital silence with 0.224604502320**,
+and through `reset()` the same. The house verb means a stream RESTART — `eq::EqBand` separated it from
+`clearAudioState()` for exactly this reason — so a stale network window speaking into the first receptive
+field of the next stream was the defect and not the design. P24 closed the half that is a falling edge (a
+lane the host stops handing over is fed the silence it is receiving); this is the other half, the lane that
+is PRESENT and gets the caller's own samples.
+
+- **What it now promises is INDEPENDENCE:** nothing the caller fed before the restart can be heard after
+  it. Every lane that carried audio is fed the digital silence it still owes, in the call, in full, until
+  its state is provably the state of a lane that was silent all along. That promise is **exact** — two
+  stages fed different audio before the restart answer the next programme with the same bits, on real
+  captures and synthetic ones, at every rate and both widths.
+  What it does **not** promise is silence out: a capture answers digital zero with whatever its own biases
+  make of it, fresh and restarted alike — measured on NAM's shipped examples at 48 kHz, **0.001195220510**
+  for a real Standard and **9.266554832458** for the A2-max feature set. Exact zero is a property of the
+  bias-free fixtures, which is what lets them witness the promise.
+  Nor, in general, bit-identity with a stage prepared a moment ago: NAM's answer depends on how the stream
+  is **cut into calls**, and a restart's chunking is its own. Measured against a stage prepared a moment
+  ago: exactly 0 for every fixture in the suite and for a real `slimmable_wavenet`, and **1.037e-06** for a
+  real Standard at blocks 64…512, where the restart's last chunk is short — with independence still
+  exactly 0 for that same capture, so it is the arithmetic and not the state.
+- **The rate-matchers are re-primed too**, because a restart re-anchors the audio-time clocks the way
+  `eq::EqBand::reset()` re-anchors its `StateGrid`. Leave the two `core::StreamResampler` legs where the
+  previous stream left them and the next programme runs at its sub-sample phase: **1.039e-06 over 5091 of
+  5120 samples at 44.1 kHz**, with everything else fixed.
+- **NEW API, `core::StreamResampler::clearAudioState()`** — the leg's state alone (zero history, `len`,
+  `pos`), keeping the rates, the capacity and the 513 × 64 coefficients. `reset (rates, capacity)` is that
+  class's `prepare()`: it reassigns both vectors, `shrink_to_fit()`s on the identity path and re-derives
+  every coefficient through a windowed sinc with a Bessel evaluation per tap — **1.77 ms** for one lane's
+  two filtering legs (the price is the kernel, not the memory: at an unchanged capacity the allocations are
+  reused), and deliberately not `noexcept`. A live stream cannot restart through that; `clearAudioState()`
+  is 10 ns. It cannot
+  resurrect a refused configuration either: `reset()` leaves `len = 0` when its second allocation throws,
+  and a restart that took its length from the buffer's size alone would put that object back to work
+  through a coefficient table that is not there, so the class now carries an explicit validity bit.
+- **NEW API, `NamStage::clearedSamples()`** — the restart's own odometer, kept apart from
+  `drainedSamples()`. The audio cannot witness "the full length for a lane that was playing, the remainder
+  for one mid-drain, and NOTHING for a lane that never played": past the debt the output is zero either
+  way. A mutation that spends one sample less than the debt survives every audio gate in the suite and is
+  caught only here.
+- **`NamStage::reset()` is now `noexcept`, and it is an AUDIO-THREAD call whose cost is not the block's:**
+  a whole drain length of inference per dirty lane — the field, plus the partitioned-FFT ring any `Linear`
+  is charged, plus each rate-matcher leg's tap window, so it is bigger than `prewarmSamples()` and that
+  getter is not an estimate of it. On an M-series core, per lane, a real Standard WaveNet is
+  **3.77 ms at a 64-sample block — 282 % of that callback** — 3.46 at 256, 3.43 at 512; a real LSTM 1.3 ms;
+  a dense 2001-tap `Linear` 0.13 ms. It allocates, locks and throws exactly where `process()` does (nowhere
+  for `Linear`/WaveNet; upstream's per-sample Eigen temporaries for LSTM/ConvNet), and it is IDEMPOTENT —
+  the debt is re-armed only by audio actually being fed, so a second restart with nothing in between costs
+  nothing and a mono host pays for one lane (for a RECURRENT capture it is deliberately not idempotent —
+  see below). It also grows faster than linearly as the block shrinks, because NAM's per-call overhead is
+  paid `debt / maxBlock` times: a real Standard is 3.61 ms per lane at block 256 and **19.47 ms at block
+  1**. There is no cheaper exact mechanism to substitute: NAM's own `Reset` with the prewarm off zeroes
+  the Conv1D rings in 0.014 ms and still misses the prepared state by **4089 samples, worst 0.324**, and on
+  a `Linear` with the FFT engine it allocates 46 times.
+  The allocation carve-out is `process()`'s — the same code path, inherited and not added — and it is wider
+  than the header's architecture names suggested: `wavenet_a2_max.nam`, a WaveNet in NAM's own example set,
+  allocates **4 times per sample** in `process()` (1024 for one stereo 256-block, measured) and therefore
+  inside a restart too. The LSTM/ConvNet row of that carve-out went the other way: at this pin a stereo
+  LSTM restart of 48 000 samples allocated **nothing** through either gate, the house operator-new counter
+  or Eigen's own.
+- **A restart that arrives while the backend is UNPREPARED writes nothing, and is not dropped.** `prepare()` writes the
+  new `maxBlock` before it can refuse, so an unprepared backend can carry a block of a billion beside a
+  256-sample scratch — a restart that touched it is a heap-buffer-overflow, which is why it touches
+  nothing there, ledgers included. Re-arming the debt at the next prepare does not cover the lane that is
+  PLAYING (its debt is overwritten on every chunk it is fed), so without the parked intent "play, a
+  refused prepare, `reset()`, a prepare that succeeds, play" hands back the old stream: **242 samples** of
+  a delay(514) capture, measured. The request was honoured at the end of the prepare that can honour it
+  — and `p85-p86-restart-reachable.md` in this directory has since made that bit unnecessary: every
+  successful prepare restarts, asked or not, so the parked intent is gone and the sequence is closed
+  by the stronger rule.
+- **A recurrent capture stays the NAMED exception, in the mechanism and not only in the comment.** An LSTM
+  lane that has already spent its drain reads a debt of zero and is still not empty — the repository's
+  slow-cell fixture leaves 0.419413 there — so a recurrent lane that ever played is charged the whole
+  half-second heuristic again at every restart (which is what NAM's own `Reset` does) and is never marked
+  clean. What that leaves is measured, not promised away: 300 samples differing from a fresh instance,
+  worst 1.49e-07, on a real capture.
+- **Scope, by byte comparison against v0.33.0:** 6 082 560 samples over six captures × eight rates × three
+  block sizes, with loads, clears, mid-stream re-prepares, refused calls, zero-length calls and width
+  changes — **byte-identical** where `reset()` is not called. Where it is, 8.394 % of those samples move, by
+  up to 0.586079 full scale, and that movement is the fix. On v0.33.0 the same run with `reset()` called
+  three times per cell is byte-identical to the run without it, which is the defect stated as a measurement.
+- **What the restart does NOT reach, each named with its number** rather than promised away: a recurrent
+  cell; NAM's partitioned-FFT clock (swept over nine block sizes x eight rates it peaks at **1.788139e-07**
+  against a stage prepared a moment ago, and is EXACTLY ZERO against one clocked to the same point — the
+  engine's own arithmetic, not state this stage kept); and a capture
+  whose conditioner is a model of its own (`config.condition_dsp`), whose memory neither NAM nor
+  `detail::receptiveFieldFromConfig` counted at the time. That last one is a hole in the LEDGER and not in this verb:
+  the identical number comes back through the untouched drain — **0.905147969723** after a full drain
+  against 0.905148267746 after a restart — and a test now pins both halves of it.
+- **Not fixed here, registered:** the conditioner ledger above (now closed — see the entry on the ledger
+  answering for the whole model); `prepare()`, which has the same stale
+  window (it is where the 0.224604502320 was first measured); and `rigplayer::RigPlayer`, which has no
+  restart verb at all, so a consumer reaching this stage through the player cannot yet call the fix. The
+  last two are what a consumer actually hits, and both are closed by
+  `p85-p86-restart-reachable.md` in this directory.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### core · analysis · mastering · tools — one sample-rate floor, 8000 Hz, and a rate in kilohertz is refused
+
+**What each entry now promises about the rate** — one number, `felitronics::core::kMinSampleRate = 8000.0`,
+compared as `sampleRate >= kMinSampleRate` (8000 is a rate; NaN is not):
+
+- **`mastering::TargetLoudnessSolver`** measures at 8000 Hz and up. `prepare()` refuses a lower rate and
+  disarms; `solveBytes()` and `measureRangeBytes()` answer 0 exactly there. It took any finite rate > 0.
+- **`mastering::MasteringChain`** is built at 8000 Hz up to its own 3 MHz, on every topology — the floor is the
+  chain's, not a stage's. Before, what refused a low rate was whichever stage happened to be on (the limiter
+  above 50 Hz, the EQ above 20.4 Hz), so a chain without both took 1e-305 Hz. `admits`, `prepareBytes`,
+  `reprepareBytes` and `mastering::createBytes` say the same.
+- **`core::DeliveryResampler::plan`** plans integer rates from 8000 Hz (its literal floor was 1000), so
+  `mastering::DeliveryConverter` and `DeliveredMastering` refuse a SOURCE or a DELIVERY rate below 8000 — in
+  `prepare()`, in every budget, and in `deliveredFrames()`, which answers -1 there. This is the line that covers a delivering handle's source rate: its chain
+  runs at the delivery rate and never sees the source.
+- **The mastering C ABI:** `fc_master_create` and `fc_master_need_create` answer `FC_ERR_REFUSED_BY_CORE` for
+  `sampleRate` (or a non-zero `deliveryRate`) below 8000, with nothing allocated. No ABI version change: the
+  surface did not grow, and the refusal comes from the core the facade already asks.
+- **The probe ABI and `fcore_measure`:** `fcore::Probe`, `fcore::ShapeProbe` and the six analyzers behind
+  `fc_probe_*` — `ClipDetector`, `ProgrammeReport`, `HumDetector`, `LowEnd`, `SourceForensics`,
+  `BandBursts` — take 8000 Hz and up (to 768 kHz). The six analyzers and the probe had a floor of 1000 Hz, each
+  in its own copy, and the shapes had none; each class keeps its `kMinSampleRate` name, and every one is
+  now the core's constant. `fc_probe_<mode>_storage_bytes` answers 0 below the floor. The ceilings did not
+  move here; the two that were missing — the shapes' and the search's — are P104's note. `fcore_measure`'s
+  `correlation` and `needle` modes do not read the rate and still take any finite positive one; every other mode
+  refuses below 8000 and names the range.
+  A refused `fcore::Probe` or `ShapeProbe` now reads like a fresh one — its meters and its peak and stereo parts
+  are replaced by new ones, and their memory is released — instead of serving the previous file (the rates that
+  used to re-prepare them are refusals now), and
+  `DeliveredMastering::sourceRate()` / `deliveryRate()` read 0 after a refused prepare, as the chain's and the
+  search's rates already did.
+
+**What starts to be refused, and why that is a finding and not a loss.** Every call below 8000 Hz that was
+accepted before — the probe and the analyzers between 1000 and 7999 Hz; the chain, the search and
+`fc_master_create` anywhere below 8000 their stages let through (60, 88.2, 96, 192 Hz on the default
+topology; 44.1 with the limiter off); delivering handles from or to 1000…7999 Hz; the shapes at any positive
+rate their decimation could hold. Measured on the tree before this change:
+
+- the BS.1770 K-weighting shelf is designed at 1681.97 Hz, so below 3364 Hz it is past Nyquist — aliased
+  everywhere there, and **unstable** wherever the bilinear tan() comes out negative (1682–3364 Hz, 841–1121 Hz,
+  …): `fcore_measure lufs 3300 2 fixture.f32` (the CI fixture) printed **+3048.86 LUFS**; a 0 dBFS 400 Hz sine
+  reads −3.72 LUFS at 48 kHz and +3043 LUFS at 3300 Hz;
+- a search at 3363 Hz answered TargetUnreachable **at its −60 dB gain rail**, chasing +2448 LUFS;
+- a search at **88.2 Hz** — 88.2 kHz spelled in kilohertz — answered **Solved at −14.0 LUFS**, exit 0, with a
+  whole mastering chain running a thousand times too slow; 384 and 768 did the same; `fcore_master render 96`
+  wrote its file with no status at all.
+
+8000 Hz is the lowest standard audio rate, so no real programme sits below it, and it is clear of the shelf's
+edge (its pole radius is 0.43 at 8 kHz, 0.99997 at 3364 Hz). A `static_assert` in `KWeightingFilter.h` keeps
+the floor above twice the shelf. **Not changed:** `analysis::LoudnessMeter` and `KWeightingFilter` still take any
+rate, and the meter still reads a rate ≤ 0 as 48 kHz; every caller that takes a rate from outside is floored
+above them, and the meter's own contract is a separate decision. A page that builds a Web Audio context below
+8 kHz on purpose is refused too.
+
+**Tests that ran below the floor moved above it, with their fixtures kept:** `HumDetectorTests` from 3 kHz to
+12 kHz (order 15 — the same 0.366 Hz bin; the noise is the 3 kHz draws, interpolated, and every measured
+prominence moved by at most 2e-4 dB), `LowEndTests` from 6 kHz to 12 kHz (order +1, every sample count ×2, the
+noise of its band-statistics rows interpolated, the kick's click scaled to its per-bin power; the fixtures that
+are only compared with an oracle computed from the same samples draw fresh noise), `ClipDetectorTests`'
+short-stream null and pending-queue rows and `ClipsExposureTests` from 1 kHz (W = 20) to 8 kHz (W = 160), their
+quiet gaps kept at the same number of windows. P41 F1's solve at 1e-305 Hz is unreachable
+now; its property — a meter sized in samples — is pinned on `LoudnessMeter::prepareForSamples`, which still
+takes such a rate. **CI:** the clips gate refuses 7999, one ulp under 8000, 44.1 and 1000, and measures 8000;
+the price table's rates are 999, 1000, 7999, 8000, 11025, 12000, 16000 … and its floors are 475 rows / 284
+priced (425 / 280 before — the 1000 Hz rows are refusals now, and the 2000 Hz rows left the grid).
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### test_support · tools — one allocation counter, and it proves itself before the suite runs
+
+"`process()` does not allocate" is the repo's oldest RT claim and it was being measured by sixty-one
+private instruments, fifty of which could not see the allocations that matter most.
+
+A suite proves that claim by replacing the global allocation functions and reading a delta. The set to
+replace is **eight**, not two: C++17 routes any object whose `alignof` exceeds
+`__STDCPP_DEFAULT_NEW_ALIGNMENT__` (16 on every desktop row, **8** on wasm32) through
+`operator new(std::size_t, std::align_val_t)`, a different function. On `v0.33.0` the idiom had been copied
+into 61 translation units; **11 installed the over-aligned form and 50 did not**, and both kinds said "no
+heap allocation in the audio path" in the same words. `core::SeamAllocator<64>` — and through it every
+convolver buffer — goes that way, and so does `eq::EqEngine`, whose `alignof` is 64 and whose own header
+already said a two-form counter would not see its 331 KiB.
+
+The hole was **latent**, and that is part of the finding rather than a softening of it: re-measuring with a
+fixed instrument found nothing that had fallen through (see the last bullet). `modules/eq/tests/` is the
+sharpest case — the suite the blindness would have hurt most makes zero over-aligned allocations of its
+own, because it puts the engine on the stack.
+
+- **`test_support/alloc_counter.h`** is now the only counter in the tree: all eight `new`s and all twelve
+  `delete`s, the byte accounting (including MSVC's container padding and the plain-object exemption the
+  `win` row found), a one-shot fault switch and a one-shot re-entry hook. The 61 copies are gone —
+  **1390 lines deleted from the 61 suites against 348 added**, and one 363-line header in their place. Including the header IS installing it; there is no macro,
+  because a macro can be forgotten and a forgotten one is silent, whereas including it twice in one
+  executable is a duplicate-symbol link error on every linker in the matrix.
+- **The instrument is proven in the run whose conclusions depend on it.** Before `main()`, the header asks
+  the counter for one allocation through **each of the eight forms** and requires the number to move; any
+  that goes unseen is named and the run aborts. Not a check the suite could fail to reach, and not in
+  `report()` — two suites here total in a harness of their own and never call it. Eight probes rather than
+  two because the distinction is not the obvious one: *deleting* a form is harmless (the standard's
+  defaults forward `new[]`→`new`, nothrow→throwing, array-aligned→scalar-aligned, so the allocation is
+  still counted — measured on libc++, libstdc++ and the UCRT alike), while a form that is **present and
+  stops counting** is exactly the original defect in a new shape. One mutation per form: eight of eight
+  red, each naming itself.
+- **`tools/lint/check-alloc-counter.mjs`** keeps it that way: a private `operator new` anywhere under
+  `modules/`, `tools/` or `test_support/` fails CI by name. Lexed rather than grepped — the words
+  "operator new" are ordinary prose in this tree — with a 32-case self-test and two negative controls in
+  the workflow, one for the lint's reach and one that deletes the two over-aligned lines from the shared
+  counter and requires the binary to refuse to run. It anchors on the operator rather than on the return
+  type and decides scope by brace depth, because a return-type matcher lets through every replacement whose
+  signature is spelled differently — a newline after `void*`, a `[[nodiscard]]`, a trailing return type —
+  and falsely flags a class's own allocator.
+- **What the fixed instrument then found, stated as a number rather than a reassurance.** Every
+  over-aligned allocation in the tree was traced: 1741 distinct call stacks across all 128 test binaries.
+  They come from `prepare()`, `setIr()` and `Bank::build()` — `AlignedVector::assign` under a convolver's
+  `prepare` accounts for 1305 of them — and **not one stack names `process`, `analyse` or `applyGain`**.
+  A second stand gave each over-aligned allocation a weight of 10⁶, so one landing inside a measured
+  region could not be absorbed by a tolerance; exactly two suites moved, and both were among the eleven
+  whose counters already saw them. So the blindness was real and nothing had slipped through it.
+
+**What the counter still cannot see is named in the header** rather than left to be discovered: it replaces
+the C++ allocation functions, not `malloc`, and `pffft.c` calls one directly. Measured rather than assumed —
+with `--wrap=malloc,calloc,realloc` on the gcc row, 200 `process()` calls through
+`MatrixConvolver<PffftRealFft>` make **zero** C allocations (four in the whole run, all inside `prepare`).
+
+No audio moved: the full verbose output of all 132 tests is identical to `v0.33.0` apart from wall-clock
+timings, on arm64 macOS and on MSVC alike, and all 128 `N checks, M failures` lines match line for line.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### convolution — 🔴 SOUND CHANGE: an un-normalized IR keeps its level across sample rates
+
+`CabConvolver` prepared with `normalize=false` convolved **louder in proportion to the host's sample
+rate**. A 48 kHz IR played **+6.02 dB** hotter in a 96 kHz session than in a 48 kHz one, **+5.28** at
+88.2, **+12.04** at 192, and **−0.74** at 44.1 — the same file, the same knob, a different clock. It now
+plays at the same level at every rate, which **moves shipped sound** by exactly those figures. **Nothing
+changes for a load that is not resampled** — the IR already at the host's rate (within the 1 ppm match
+tolerance), or one whose rate is unknown — where the multiplier is exactly 1 and the staged taps are
+byte-identical to what v0.33.0 published. A 48 kHz host is NOT by itself such a case: a 96 kHz IR played
+6.02 dB quiet there and now does not.
+
+- **Why it happened.** `resampleIr` normalizes each output tap to unity DC, which preserves a WAVEFORM's
+  amplitude — right for a signal, and what the function is for. A convolution's gain is not an amplitude:
+  it is a sum over taps, so it is proportional to how many of them fit into a second. Resampling 48 → 96 kHz
+  produces twice as many taps of the same amplitude, hence twice the gain. JUCE's convolver applies exactly
+  this factor on exactly this branch — `juce_Convolution.cpp:790-792` in 8.0.14: `normalise == yes` measures
+  the resampled taps, `else` calls `resampled.applyGain (originalSampleRate / processSpec.sampleRate)`. The
+  interim JUCE backend this replaced therefore had it; the replacement carried over the normalized half of
+  that `if` and not the other one.
+- **And this repo's own spec said so.** `docs/migration/convolution-core-api.md:30` — the parity table whose
+  file header calls it "the authoritative spec … without changing the sound" — has carried the row
+  **`Normalise::no still applies a gain | makeEngine, applyGain(irSr/hostSr) (:792) | after any resample,
+  multiply IR by irSr/hostSr`** since the migration was written. The requirement was not missed for want of
+  being written down: nothing ever checked a row of that table, and the same file's pseudocode ten lines
+  later contradicted it ("every KNOWN rate" where the table says "after any resample"). The pseudocode is
+  corrected here; the table was right all along. And the golden-test tier that spec defines for a
+  non-host-rate IR is `Normalise::yes` — the one tier that structurally cannot show this.
+- **Why only this path.** With `normalize=true` the reference-unity gain is measured from the FINAL,
+  resampled taps, so it absorbs the factor whole. The defect was visible only on the one path nobody
+  measured that way.
+- **The fix** is one factor, `irSr/hostSr`, applied where the loader already applies its one gain. It is
+  named — `convolution::convolutionRateGain(inSr, outSr)`, beside the resampler — because a second copy of
+  this arithmetic was already written by hand in a shipped product, which is the class of defect where two
+  copies must agree forever. A caller that resamples an IR itself should use it instead of spelling it again.
+  Rates it cannot make a factor from (a NaN, a zero, a negative, an infinity, or a finite pair whose quotient
+  overflows) return 1 — the same rates `resampleIr` refuses get no compensation.
+- **The factor is NOT clamped, and its sibling is.** The normalization gain is measured from the IR's own
+  content, so ±30 dB stops a pathological IR blasting; the rate factor is arithmetic on two numbers the
+  caller supplied, and clamping it would quietly deliver a different filter than the caller asked for. It
+  spans 4.7e−10 to 4.3e9 (−186 to **+192.6 dB**), which is what `resampleIr`'s length and position gates
+  leave reachable. A WAV's rate is a `uint32` and nothing in this family validates it, so a garbage-but-
+  **finite** header is the one broken metadata a real file can carry — and it now plays LOUD where it used
+  to play quiet: a file claiming 352800 Hz on a 48 kHz host is +17.3 dB, one claiming 5e6 Hz is +40.4 dB.
+  Both are correct by this contract and both are garbage. A consumer that loads untrusted files should
+  bound the rate before this, the way orbit-amp's loader already refuses anything outside 8 kHz…768 kHz.
+- **What it does NOT fix.** The density term is all it removes. A resample still drops the kernel's
+  pre-ringing that would fall before output sample 0, and what that costs depends on the onset, not on this
+  factor — and it is a RIPPLE, not a loss: the kernel's nearest pre-ring lobes are negative, so cutting
+  them ADDS level. Measured on a lone impulse at input index `lead`, 96 → 44.1 kHz: **−2.57 dB** at lead 0,
+  **+0.65** at 1, **+0.95** at 2, −0.05 at 3, −0.61 at 4, and so on down to exactly nothing from `halfTaps`
+  (32 input samples) of lead onward, which is the window's own backward reach. A smoother onset pays far
+  less: a one-pole `exp(−n/τ)` at full scale with no lead loses 0.21 dB at 44.1 kHz for τ = 1 input sample
+  and 0.004 dB for τ = 1 ms, which is what a real decay looks like. It is older than this change and
+  untouched by it, but it is the one case where an **onset-trimmed** IR's level still moves with the rate —
+  so a measurement that trims the front must not charge it here **in either direction**.
+- **A diagnostic that had gone stale.** `irNormalizationGainDb()` floored its argument at 1e−6, which sat
+  below everything the old code could apply (the normalization clamps at −30 dB) and above what this one
+  can: an IR file claiming 0.024 Hz on a 48 kHz host applies 5.0e−7 and the reading said −120.0000 dB for a
+  gain that is −126.0206. The floor is now below anything the loader can produce — **and a NaN gain now
+  reports a NaN**, which is the one reading that did move on the normalized path: `std::max(a, b)` is
+  `(a < b) ? b : a` and every comparison against a NaN is false, so `max(floor, NaN)` returned the FLOOR,
+  a plausible −120.0000 dB for a gain that is not a number (a NaN tap in a float32 WAV is enough). The
+  linear accessor was right throughout.
+- **`irNormalizationGain()` now reports whichever gain was applied** — reference-unity on the normalized
+  path, the rate factor on the verbatim one — and is still exactly `1.0f` when nothing was applied. The name
+  is historical; the contract is "what was multiplied in", which is what a reference nulling against the
+  engine needs.
+- **One deliberate departure from the JUCE branch cited above:** JUCE applies the factor even when its
+  resampler early-returned unchanged (equal rates), so it multiplies by a number that is only approximately
+  1. This applies it only after a real resample, which is what keeps the byte-verbatim guarantee at matched
+  rates. The two differ by at most `kRateMatchTolerance` relative — **8.7e−6 dB** — and the spec table's own
+  wording ("after any resample") is the one this follows.
+- **Pinned by** a property over eight rate pairs × five physical frequencies (44.1 / 48 / 88.2 / 96 / 192 kHz
+  hosts, 44.1 / 48 / 96 kHz sources), read by a DTFT that shares no code with the loader, at a tolerance of
+  0.01 dB — **13×** the 64-tap Kaiser kernel's own passband ripple (β = 8 → δ = 8.6e−5 → 0.00075 dB), **18×**
+  the worst reading over the grid (5.65e−4 dB), and **74× below** the 0.736 dB the weakest cell moves without
+  the fix. The kernel's column sums — the quantity the factor actually inverts — were measured across 64
+  phases of every standard rate pair and stray at most 1.6e−4 dB from the ratio, which is the part of that
+  argument that is a measurement rather than an engineering formula. Fifteen mutations of the change are each
+  caught, among them "remove it", "invert it", "apply it only when upsampling", "apply it only to mono",
+  "apply it on the normalized path too", "pre-scale the taps before the normalization is measured" and
+  "delete the resample and keep the gain" — that last one is why an existing P67 assertion was rewritten:
+  "every tap moved" stopped witnessing that the resampler ran the moment a gain could move every tap by
+  itself, so the witness is now "no single scalar maps the input onto these taps".
+
+### convolution — the bounds the IR resampler did not have, and the fifteenfold it did not need to cost
+
+**`convolution::resampleIr` is 12-22x faster, and not one output bit moved.** `besselI0` ran once per tap:
+37.7 ms for a one-second IR at 44.1 kHz, 164.6 ms at 192 kHz, on the message thread, every cabinet change.
+Measured split of that loop: the Bessel series 78% of it, `std::sin` 13%. What replaces it is not a table
+and not an approximation — it is an EXACT memo on the fractional phase, so the kernel arithmetic is
+untouched and the answer is the same double it always was:
+
+* a tap's weight depends on the output position only through `xx = t - k`, and the window's indices are
+  `c + j` for the same offsets `j` about `c = floor(t)`;
+* `frac = t - c` is EXACT for every `c >= 0` (at zero it is `t`; above it, Sterbenz), so `t` IS `c + frac`
+  and the exact real behind every `xx` is `frac - j` — the SAME real for two outputs that share a `frac`,
+  whatever their `c`. IEEE subtraction is correctly rounded, so both produce the same double from it. `xx`
+  itself need not be representable; only the sameness of the number being rounded matters.
+* `c < 0` is excluded because `frac` is not exact there: at 8 -> 48 kHz outputs 0 and 6 carry the same
+  `frac` to the bit and five of their 64 weights still differ in the last place. A fixture in the suite
+  holds an input where that difference reaches the float32 result.
+
+It pays because audio rates are small rationals: a one-second 48 -> 44.1 kHz resample has 913 distinct
+phases for 44100 outputs and reuses 98% of its windows, and 48 -> 96 kHz has two. A rate with no period at
+all (a corrupt file rate, 48000 -> 44101) reuses nothing, and the memo gives up after 4096 misses without a
+hit rather than make that case slower — measured 1.0x. Measured after: 2.7 ms at 44.1 kHz, 8.0 ms at
+192 kHz. The suite runs every case through a frozen copy of the un-memoized kernel and compares every
+output float as bits.
+
+**Bounds that were missing.**
+
+* **`kMaxResampleSamples` (16.7M samples, 64 MiB of float per channel).** The old length gate only kept the
+  arithmetic addressable, so a result one sample under `INT_MAX` was 8.6 GB asked of the heap in a single
+  call, on the message thread — and a file rate does not have to be absurd to ask: 1.2 Hz against a 48 kHz
+  host is a ratio of 40000, and a one-second IR then wants 7.7 GB. An output past the bound is REFUSED, the
+  rule P67 already ratified for a result that cannot be addressed. The figure equals
+  `MatrixConvolverNupc::kMaxIrSamples` on purpose: the resampler can produce anything the convolver can hold.
+* **`IrResampleConfig` has ranges.** `beta` was gated by `isfinite` where a RANGE was meant, so `beta = 1e300`
+  passed and the 64-term series returned a silently wrong number (it only overflows to `+inf`, and the window
+  to NaN, at about 1.36e4 — long past where its answers stopped being answers). `kMaxBeta = 53.0` is where
+  that series stops meeting its OWN convergence test, measured at 53.038057. `kMaxHalfTaps = 4096` bounds one
+  output's tap loop, which `halfTaps = 1e9` did not. A value that is not a REQUEST (a NaN, a negative beta, a
+  radius below one) is repaired as before; a request past a ceiling is refused, because answering it with a
+  smaller kernel would hand back a filter the caller did not ask for.
+* The vector overload checks a length before narrowing it to `int`.
+
+**`CabConvolver::prepare` refuses what it cannot honour (law 11(b)), where it used to guess.** A rate that
+was not given was answered with the factory 48 kHz and a convolver was then sized from the answer; an
+infinite rate made two float-to-int conversions undefined (on arm64 that produced `LLONG_MAX` and a
+one-sample "crossfade", i.e. a hard switch). The rate must now be in `(0, kMaxSampleRate = 3e6]` — the house
+figure — and `maxIrSeconds` must be a non-negative number; the IR budget saturates in double BEFORE the cast,
+through the public `maxIrSamplesFor`, which is total for every argument. A refused prepare now also clears
+the pending-retry geometry it can no longer publish: that survived a refusal, and `isBusy()` then answered
+true for the life of the object while `flushPending()` could never publish, because it returns on
+`! prepared_`. The clear happens before every refusal, so a refused WIDTH (`prepare(..., 4)`) drops a
+pending load too, which it did not before — three behaviour changes in this call, all three named.
+
+**An out-of-bounds write in the reference-gain path.** `normalizationGain` took the first second of the IR
+as its analysis window but sized its transform at `N`, which stops doubling at 1<<21; above a megasample of
+window the two parted company and the copy ran off the end of the buffer — measured under AddressSanitizer
+as a 12 MB heap-buffer-overflow WRITE for a 3 000 000-sample IR at a 4 MHz host, reachable through the public
+`loadIR`. The window is now the first second OR the transform, whichever is shorter.
+
+### core · analysis · oversampling · tools — the three libm derivations, closed, and the lint that keeps them closed
+
+v0.33.0 named three places where a number that crosses a platform boundary was still derived through the
+system libm, and left them open. All three are closed here, none of them moved a bit of any shipped audio,
+and the audit that found them is a gate rather than a reading: `tools/lint/check-det-math.mjs` plus
+`tools/lint/det-math-manifest.txt` enumerate every governed transcendental call in the tree — 331 of them
+across 61 files — classify each one, and go red when a call is added, removed, or swapped for another.
+
+**The oversampler did not need the frozen tap table the plan assumed.** `PolyphaseOversampler::designFilter`
+moves to `det::sin` outright: the taps are narrowed to float, and that narrowing discards 29 of the bits the
+libms can disagree about. The system and deterministic designs differ at 18 of 128 taps in double and at
+zero of 128 in float, and the final float arrays are byte-identical across Apple clang/arm64, gcc 14/glibc,
+emcc/musl and MSVC/UCRT. The margin is not luck: perturbing every `sin()` by a deliberate k ulp leaves all
+128 taps unmoved up to k = 2^24, against a real spread of one to three. The tests pin all 128 taps against
+the table the OLD path produced on those four rows.
+
+**The FFT needed its seeds converted and nothing else.** `core::offline::fftInplace` takes its stage seeds
+from `det::cos`/`det::sin`; the butterfly is left alone, because it was measured not to contract under
+`-ffp-contract=on` on any row, with both controls in place (an FMA canary that fuses in the same build, and
+a 1-ulp twiddle perturbation that moves the checksum). Pinning O(N log N) products against a flag no shipped
+road uses would have been a real cost for nothing. Note the scope of what was OBSERVED, because it is not
+the scope of what now holds: the before-and-after hash equality was taken on a 2^16 transform, whose 16 seed
+angles are the ones that measurement exercised, while the consumers run at order 17 by default and
+`HumDetector`'s AUTO order reaches 21 at 768 kHz. Cross-row agreement at those larger sizes is not observed,
+it is by construction — `det` is one implementation compiled into every row — and that is the whole reason
+for converting the seeds rather than measuring them again. `core::fft::ScalarRadix2Real` keeps its system seeds by
+decision, listed in the manifest as `retain-rt`: that one is the partitioned convolver's, i.e. shipped audio,
+and a deterministic route there is an additive class beside it, not a replacement.
+
+**`gainToDb` was worse than described, and the shared function does not move at all.** It is called once per
+sample on four paths, worst of them inside `TruePeakLimiter`'s oversampled loop, in the module that is most
+of a render, and `det::log10` is 7.4x a system call. So the CONSUMERS move instead: `core::gainToDbDet` sits
+beside `core::gainToDb`, sharing the one floor constant, and the programme report, the clip detector, the
+reference true-peak meter and the loudness solver call it. `gainToDb` itself is bit-identical and the same
+speed before and after.
+
+**Three rounds against the work, and each found something the reading could not.** The gate did not catch
+the regression it was written after — reverting `LoudnessSolver::peakDb` to `core::gainToDb` left the lint
+green, because carrier calls were only checked inside the deterministic zone; carrier calls now join the
+manifest's multiset. The matcher had four evasions and the manifest four phantom entries. The `det::` pin
+was six points, which is not a pin: dropping one `volatile` from `exp2Frac` changed `det::pow10` across
+100 000 arguments while all six pinned values still matched, so the pin is now a dense per-function checksum
+captured on three rows. A NaN clamp written as `std::max (gain, floor)` returns NaN instead of the floor
+with the whole suite green. A solver gate pinned only through digital silence let its threshold be raised
+tenfold while a peak of 2e-10 made the report read -200 dB and the certificate -193.98.
+
+### tools · analysis — the price of a measurement, asked before it is paid
+
+`fc_probe_report_storage_bytes`, `_bursts_`, `_hum_`, `_forensics_` and `_lowend_storage_bytes` publish,
+through the wasm ABI, the number each offline analyzer already computes for itself before it allocates a
+byte (law 11d). Until now nothing carried it out of the module: JavaScript called `_run`, which went
+straight into an allocating `prepare()`, and there was no way to ask the price first. The prices are not
+small — `HumDetector` at 768 kHz and 16 channels asks for 352 688 184 bytes, the five together for
+377 423 824, against a linear memory that stops at 2 GiB and also has to hold the caller's decoded input.
+
+Each query takes the GEOMETRY only — `(channels, sampleRate)` — because the whole use is to ask before the
+input buffer exists; `_run` keeps its own buffer checks, and a price above zero is not a promise about a
+particular call. A refused geometry quotes a canonical `+0.0`. The answer is a `double`, not the
+`std::uint64_t` the budget is accounted in: an i64 does cross this boundary on the pinned toolchain, as a
+BigInt, and a BigInt is the wrong shape for a number a page has to add to its own input size and put in a
+report — `bigint + number` throws and `JSON.stringify` refuses it, so every use site would need a
+conversion first.
+
+What the module does today when the allocation fails was measured rather than assumed, and the assumption
+was wrong in both directions. It is worse than a bad return value: `-fno-exceptions` turns the failed
+`operator new` into `abort()`, so the C entry point never returns at all — the caller reading
+`_fc_probe_hum_run(...) === 1` is handed a thrown `WebAssembly.RuntimeError` instead of a status. It is
+also not the death of the page: that error is catchable, and after catching it the module went on
+answering, with the aborted mode's getters reading 0 as the `have*` discipline promises. No ceiling on
+geometry was added — what a page can afford is the page's number, not this file's.
+
+Also in this change, found while building the gate for it:
+
+- **The export whitelist in `tools/wasm/build.sh` had four ways past it**, none of which its guard could
+  see: it recognised only a return type of `int|double|std::uint32_t`, it matched the declaration at
+  column zero, and its guard was a hand-written floor (`-ge 39` against 86 actual entry points). So an
+  indented declaration was invisible to every scanner at once while `EMSCRIPTEN_KEEPALIVE` exported it
+  anyway; two declarations on one line dropped the second from the list with the counts still agreeing;
+  a one-line body calling another `fc_*` function exported the wrong symbol; and a comma declarator
+  (`FC_EXPORT int fc_a (void), fc_b (void);`) is one token, one line and one name while the second is
+  simply absent. All four were reproduced against the gate before they were fixed. Both ABIs' lists are now read as the identifier
+  before the first `(`, one declaration AND one declarator per line are enforced, and the count is
+  checked for EQUALITY against the declarations; a second gate refuses a return type the boundary does not carry rather than
+  dropping it. `fc_master`'s copy had the type defect too, plus a name pattern without digits that would
+  have TRUNCATED `fc_render_v2` into the list rather than omitting it.
+- **Two rationales in the tree were false** and are corrected with the measurement that settled them:
+  `-sWASM_BIGINT` is ON by default in emscripten 6.0.9, and `EMSCRIPTEN_KEEPALIVE` does keep a function
+  that is missing from `-sEXPORTED_FUNCTIONS`.
+- **`planarSpan()`'s channel bound was pinned by nothing in the repository.** Deleting it left all 123
+  tests green, because every other entry point refuses the width a second time in `prepare()` — every one
+  but `fc_probe_needle`, which has no `prepare()`. `felitronics_abi_tests` now pins it there.
+- The five modes' default parameters are one `constexpr` constant each, read by the run, by the price and
+  by the result getters that used to construct their own.
+
+The gate: `felitronics_analysis_abi_tests` goes from 389 checks to 575 — the allocation a first run
+actually asks for against the published demand, measured at the WIDEST geometry the ABI has and equal to
+the byte; the price against the core's own `storageFor()` at every width and rate, each row asserted
+positive so it cannot pass as `0 == 0`; a canonical `+0.0` on 75 refused geometries; a grid of five modes
+by twenty-six rates by nine widths by three programme lengths, where the price must be positive exactly
+where `_run` is accepted and every refused row must leave its getters silent; and the asymmetries that
+are deliberate, written down so nobody "fixes" them. `tools/wasm/storage-probe.mjs` makes the assertions
+only the wasm tier can make — starting with the one no native test can, that all five names reached the
+artifact — and prints the demand table that `felitronics_analysis_abi_tests --storage-table` prints
+natively: 425 rows, byte-identical across the two tiers, on the release and the checked module alike. (P51, in
+the same release, moved the rate floor under this gate: 596 checks, 90 refused geometries and 475 rows since.)
+
+Twenty-six mutants were run against it and twenty-three died. **The crew's testing round found the hole
+the first twenty missed**: with `_run` ignoring what `prepare()` returned, the whole suite stayed green
+while an empty programme at a refused geometry was ACCEPTED and its getters served the previous
+programme's numbers — `_run` skips `process()` when there are no frames, so an unprepared analyzer still
+reached `finish()`. Both grids had a single non-zero programme length. They now walk an empty one, a
+short one and a full one, in both tiers, and the mutant of that line dies in four of the five modes —
+in lowend it is equivalent, because `planarSpan` refuses an empty programme before `prepare()` is reached. Two more
+survivors from the same round — an allocation that only happens above two channels, and one that only
+happens away from 48 kHz — are what moved the allocation oracle to the widest geometry. The three that
+survive are equivalent and named where they live: removing `setParams (kReportParams)` from report's run,
+where the constant holds the instance's own defaults; hard-coding the width in the lowend query, whose
+demand does not depend on it; and masking the low three bits off every price, since every demand in the
+accepted domain is a multiple of eight. Six mutants of the build gate were killed too — the indented
+declaration, the two on one line, the comma declarator, the empty extraction, the unsupported return
+type, and the name taken from a body call.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### nam · rigplayer · convolution — a prepared stage holds no audio, and a player can ask for a restart
+
+P47 made `felitronics::nam::NamStage::reset()` an exact stream restart, and no product could call it.
+Two doors stood in the way, and each was half the same defect. This opens both.
+
+- **`NamStage::prepare()` now performs that restart, ALWAYS.** It carried the identical stale window —
+  `::nam::DSP::Reset` calls `SetMaxBufferSize` and then a prewarm that is ZERO samples for a `Linear`,
+  so `Buffer`'s per-channel input window survived the call. Measured over eight host rates x two block
+  sizes x three capture shapes x {re-prepare at the same rate, re-prepare at a different one}, both
+  lanes PRESENT: **72 of 96 cells answered digital silence with something, worst 0.567861497402**, and
+  0 of 96 do now. A prepared stage and a just-constructed one name one state, so the two verbs of the
+  class say one thing.
+  There is deliberately **no predicate on what changed**: a re-prepare at the SAME rate and block is the
+  common case — a host's buffer-size slider moves more often than its rate one, and a driver stops the
+  stream for either — and it is where the leak was loudest (0.468718945980 at 48 kHz, against
+  0.469410002232 across a rate change). A "fix it only when something moved" predicate leaves 8 of those
+  96 cells leaking, which the mutation stand shows as red.
+  The mechanism is P24's ledger and P47's drain, unchanged: `configureRates` charges every lane that has
+  EVER been fed a full debt at the new rates, and the tail of `prepare()` spends it. So a first prepare
+  after a load costs nothing, and a model change costs nothing either: it prepares a never-fed backend in
+  `prepareModel()`, and again in `install()` when the host's numbers moved between the two halves. The `restartOwed_` bit P47 needed
+  is **deleted**: once every successful prepare restarts, a parked request has no second question to
+  answer, and the sequence it was written for is closed by the stronger rule.
+- **THE PRICE, published rather than hidden.** For an architecture whose own `Reset` already prewarms
+  (every WaveNet), the drain is a SECOND pass over the field and roughly doubles the call: on an
+  M-series core, a stereo real Standard WaveNet `prepare()` on a dirty stage goes **6.5 ms → 13.1 ms**
+  at 48 kHz and 7.6 → 14.2 at a 64-sample block; a real LSTM 2.5 → 5.8. That is the message thread, with
+  no callback to miss. A first `prepare()` after a load does not move (7.16 → 7.25 ms), which is what
+  `everFed_` buys and what the suite gates. Skipping the drain where NAM's own prewarm provably covers
+  the ledger is a real optimisation and is registered as one rather than taken here — it is a predicate.
+  One consequence is stated because it is a number that moved: against a stage prepared a moment ago, a
+  real Standard WaveNet used to be **exactly 0** and is now **1.1e-06**, because the extra drain re-chunks
+  a network NAM had already flushed and NAM's answer depends on how the stream is cut into calls. That is
+  the same residue `reset()` publishes. INDEPENDENCE — the promise — stays exactly 0 on every capture.
+- **`rigplayer::RigPlayer::reset()` — the verb a product can actually call.** The class had none, and
+  orbit-amp reaches a `NamStage` only through it (`releaseResources()` is empty there and no host reset
+  is overridden). It restarts both model slots (including one the blend law has put to SLEEP), the three
+  convolvers **bypassed or not** — a bypassed one is skipped, so its history freezes and is replayed when
+  the curve comes back — the dry path's alignment ring, the per-slot whole-sample alignment tails, the
+  band filters, the audio-time grid and the scratch; and it SNAPS the gain ramps, as `eq::EqBand::reset()`
+  does and for the reason that file records with a number. `prepare()` now calls the same two private
+  bodies, so the two verbs cannot drift.
+  It deliberately does **not** touch the blend law's state — a restart is not a device change. Re-arming
+  the law's warm-up ledger would not deliver its invariant anyway: with `fed = 0` on both slots the law
+  ramps its gain down over four blocks, so a by-hypothesis wrong-sounding network is audible regardless,
+  and what it buys is a hole — 18 blocks, 192 ms, at every restart. Re-arming only the sounding slot is
+  worse: the law rails the goal to the neighbour and plays a full spurious crossfade to the other capture
+  and back. The price of the verb is FOUR networks, not one: two stages, each up to two lanes.
+- **`convolution::MatrixConvolverNupc::clearAudioState()` (new, additive).** `reset()` there zeroed the
+  history AND cancelled a swap in flight (`xfadePos_ = 0; state_ = 0`, keeping `cur_`), so a filter
+  published a block ago and still crossfading in was dropped — and `CabConvolver::pendingRetry_` is
+  already false after a successful publish, so nothing ever re-staged it: the knob move was lost until the
+  next knob move. `clearAudioState()` is the history alone, touching only buffers `process()` writes, so
+  a composite can restart on the audio thread without losing a filter or racing the message thread.
+  `CabConvolver` forwards it. (The verb itself is fixed in the same release — see the P88 entry: `reset()`
+  now ADOPTS the publication instead of dropping it, in all three convolvers. That removes the reason
+  `RigPlayer::reset()` reaches for `clearAudioState()`, which leaves a fade running and so does not give a
+  restart's independence mid-fade; switching the player is registered as its own task.)
+
+Green: macOS/clang `ctest` 131/131 with `-DFELITRONICS_WITH_NAM=ON`, deb/gcc-14.2 131/131.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### nam — the ledger answers for the WHOLE model, conditioner and heads included
+
+`felitronics::nam::detail` is one registry with three questions — how far a capture's memory reaches,
+whether anything in it is recurrent, and whether anything in it is charged NAM's partitioned-FFT ring —
+and **two readers spend its answers**: law 11a's drain (a lane the host stops handing over is fed silence
+for that long) and P47's stream restart. It walked `config.submodels` and stopped there, so a capture
+whose **CONDITIONER is a whole model of its own** (`config.condition_dsp`, which NAM builds with `get_dsp`
+like any other model) hid that model's memory from both. The two were short by exactly the same amount,
+which is what said it was one defect in one ledger rather than two: **0.905147969723** left after a full
+drain against **0.905148267746** after a restart, on the same capture.
+
+- **The composition is a SUM, and that is the number rather than the wording.** The conditioner's output
+  is the network's conditioning input, so the two memories are in SERIES — which is also how NAM's own
+  arithmetic composes them. Measured from outside the registry, on a loaded two-layer stack with a
+  2500-sample Linear conditioner: the impulse's last non-zero sample is **5000**, where the same stack
+  without a conditioner reaches 2501 and a worst-of would have answered 2502.
+  What the registry promises is an **upper bound**, and the slack is named: the condition enters a layer
+  AFTER that layer's own convolution, so the true reach is `Mₒ + H + max(0, M_c − L₀)` and the answer is
+  `Mₒ + H + M_c + 1` — over by `L₀ + 1`, never short.
+- **All three questions walk the branch, not one of them.** A `Linear` conditioner is charged the
+  2048-sample ring (its instance owns the same engine, and its ring feeds the layer arrays through the
+  mixin); an `LSTM` conditioner makes the whole capture recurrent, because the cell's state enters every
+  layer through a memoryless 1×1 and no finite silence empties it. A mutation stand confirmed each of the
+  four one-function-only variants goes red, as do "walk it but discard the field" and "worst-of instead
+  of the sum".
+- **And two more branches of the same config were not being read**, both of which the sum needs in order
+  to be an upper bound at all. A layer array ends in a causal head rechannel whose kernel is the layer's
+  own `head.kernel_size`, worth `kernel − 1` samples — `example_models/A2.nam` spells it 16 — and a
+  post-stack `config.head` is worth `Σ(kᵢ − 1)`. A `ConvNet` keeps its whole stack in a TOP-LEVEL
+  `dilations` array and answered **zero**. Each is normally hidden by NAM's own answer, which `NamStage`
+  raises this number with; none of them is hidden behind a **slimmable** WaveNet, which answers zero for
+  everything. Measured on ones that load: a slimmable WaveNet with a 16-tap head reads 2 against an
+  impulse reaching 16, and one with a ConvNet conditioner reads 2 against an impulse reaching 15.
+- **The area of the change, bit-for-bit.** Rendered through both readers at 44.1 / 48 / 96 kHz, NAM's nine
+  shipped example captures are **byte-identical** except the two that carry a conditioner, whose drain
+  grows by **one sample** (`wavenet_a2_max` 31 → 32, `wavenet_condition_dsp` 45 → 46).
+- **The answer is monotone, and it took a review round to make that true.** The first cut of this change
+  added the ConvNet reader as a link in a first-non-zero CHAIN, ahead of the declared-field reader — and
+  a chain can take a number away. A `Linear` capture carrying a stray `dilations` array loads (its parser
+  reads neither key) and the chain answered **2** for a 4999-sample impulse response that answers 4999
+  without the stray key: a lane draining 2050 where it needs 4999, i.e. a regression introduced by the
+  fix. The three sources are now the stack, then the WORST of the other two. In the same round the
+  container branch stopped RETURNING: NAM dispatches on the `architecture` string and never on shape, so
+  a `"WaveNet"` carrying a stray `submodels` array loads with its whole stack behind that return
+  (measured: 1 answered for a model reaching 4200), and the return also made `isRecurrent` charge a
+  conditioner the field was ignoring — the very divergence this change exists to close. Both are gated.
+  With those two, every term is added and none is replaced, so no capture can drain shorter than before.
+  The one named exception is a number that is not representable at all: a field spelled `1e300` is now
+  REFUSED rather than cast, because the cast is undefined behaviour.
+- **A dead key must never silence a live reader, and a diverse-testing round found two more of those.**
+  NAM's ConvNet parser does not read `layers`, so a ConvNet carrying `"layers": []` had its whole stack
+  suppressed — behind a slimmable capture's conditioner, where NAM answers zero, that drained 102 for a
+  model reaching 131 and handed back 29 samples. And a boolean is a number to `get<int>()` but not to
+  `is_number()`: NAM loads `"dilations":[true,true]` as `[1,1]` and answers 3 for it, where this file
+  answered nothing. Both gated.
+- **A value that does not fit an `int` is now REFUSED rather than clamped**, because the model NAM built
+  does not contain it: `"dilations":[4294967396]` builds a network whose dilation is 100, and clamping to
+  INT_MAX made `reset()` spend 2 147 483 646 samples — a measured **23.7 s of synchronous audio-thread
+  work** — for a capture that remembers a hundred. Refused reads as absent, and NAM's own answer covers
+  what it did build.
+- **The gates were checked by mutation, twice, in an isolated copy of the tree:** 21 variants of this
+  file, 20 red. The one survivor is an `is_object()` guard proved equivalent (nlohmann's `contains()` is
+  false for every non-object, without throwing). A sweep of 3200 generated loadable configs found no
+  answer short of the model's measured impulse reach outside law 11a's named recurrent exception.
+- **Not fixed here, registered:** the hybrid slimmable-wrapper shape, where NAM dispatches on a top-level
+  `config.layers[i].slimmable` marker and the real config then hides under `config.model`. It loads, NAM
+  answers 0 and the registry answers 0 however long its stack is (measured 314 samples of leak on one).
+  Reading it means restating NAM's dispatch heuristic, which is its own decision and its own number.
+  *(Closed by P92 without that restatement — see `p92-unplaced-shape-ceiling.md`.)*
+- **And one that is not this module's at all, registered with its reproducer:** a `condition_dsp` that is
+  a `SlimmableContainer` with a WaveNet submodel, or a slimmable WaveNet, **crashes the host on load** —
+  a null write inside NAM's own `WaveNet::_set_condition_array` during `DSP::prewarm()`, because neither
+  class overrides `SetMaxBufferSize` and the conditioner path is the one place that is the only call they
+  get. Reproduces on pure `nam::get_dsp` + `DSP::Reset` with none of this code in the path, and
+  `prepareModel`'s catch-all cannot catch a SIGSEGV.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### convolution · lineareq — a restart keeps the operator the caller published, in all three swap-safe convolvers
+
+A swap-safe convolver publishes an operator from the message thread and the audio thread adopts it at the
+END of its crossfade, so between those two moments the live slot still names the PREVIOUS operator. All
+three `reset()` bodies wiped the publication flag and kept that slot: the operator the caller had already
+replaced came back, and nothing was left to re-stage the new one — `setIr()` had already returned true, and
+a consumer's retry flag is clear after a successful publish. On those bodies each class's new independence
+gate reads the OLD operator in every cell {Pending, Crossfading} x {mono, stereo} x both slot parities
+(a worst sample **7.494e-01** `ConvolutionEngine`, **1.017e+00** `MatrixConvolver`, **1.927e+00**
+`MatrixConvolverNupc`, from a restart made after the fade settled). The promise those bodies carried was
+already the right one — "flush the tail, not revert the EQ" — and reverting to a superseded operator is
+exactly reverting the EQ. Law 11e in `docs/DSP-ARCHITECTURE.md` states the rule.
+
+- **Through the product classes** — `lineareq::LinearPhaseEq` and `NaturalPhaseEq` at 48 kHz, a +12 dB
+  bell at 1 kHz published over a settled flat curve, the host restarting before a block picked it up — the
+  gain at 1 kHz read **+0.00 dB** at 1, 2 and 4 channels (above two channels each channel has its own
+  convolver, staged then published) and now reads +12 dB (gated to 0.2 dB). When the curve was the FIRST
+  one ever published, the EQ answered **exactly zero** (the fixture's -600 dB floor) until the next band
+  move, because the live slot still held the zero taps `prepare()` leaves; it now plays the bell. A restart
+  with the move in flight now answers the next programme with the same bits as a restart after it settled
+  — a level alone cannot tell `reset()` from an EQ that forwards to `clearAudioState()`, which reaches the
+  same curve 20 ms later. `LinearPhaseEq` is also gated through an M/S move (the MSDiag operator, different
+  L and R), by level and by independence. The shipped products did not reach this — each re-publishes
+  after a re-prepare, and orbit-amp drains silence rather than calling `reset()`, naming this defect as one
+  of its two reasons (`src/core/CabinetIr.h:220-222`; the other, the concurrency contract, stays) — so it
+  was latent in the products and live in the API.
+- **`reset()` now ENDS a swap in flight in favour of the new operator** in
+  `convolution::{ConvolutionEngine, MatrixConvolver, MatrixConvolverNupc}`: `cur_` moves to the published
+  slot and the state returns to Idle, so `isBusy()` is false at once and the consumer may publish again.
+  An operator merely STAGED and not yet published (`stageOperator()` without `publishStaged()`) is
+  untouched — it has not been accepted, and the later publish still finds it. The rule is scoped to the
+  restart; `prepare()` still discards everything, by contract.
+- **WHAT MAKES ADOPTION RIGHT IS LAW 11a INDEPENDENCE, NOT CLICK-FREEDOM.** A half-finished fade is a
+  dependency on what came before: two convolvers holding the same published operator, one mid-fade and one
+  settled, would answer the next programme differently for up to the length of the fade. Through
+  `CabConvolver`, a restart one block into a 50 ms fade and one after it settled now differ in **no** sample.
+  **The price is at the seam and it is published** (the engine's suite prints every number here): flushing
+  the history is itself a cut — the previous stream's tail stops mid-decay — so the first sample after
+  `reset()` steps whichever slot is live, **1.8203e-01** on DC 0.5 into a settled 700-tap operator.
+  Adoption puts the new head tap where the old one was at that sample, so it moves the step by at most the
+  head-tap difference times the input, in EITHER direction: **7.3203e-01** for a pair whose head tap flips
+  +0.70 -> -0.40, **1.3933e-01** for a +1 dB broadband move and **2.2018e-01** for a -1 dB one, and exactly
+  the flush for a change that leaves the head tap alone. That difference IS the change the caller asked for.
+- **`clearAudioState()` is now on all three** (it was on `MatrixConvolverNupc` alone). It is the history
+  and nothing else: it decides nothing about the operator and leaves a crossfade running from where it was
+  — which is exactly why it does NOT give independence mid-fade: through `CabConvolver`, a clear one block
+  into a 50 ms fade and a clear after it settled differ in exactly the fade's remainder, **2143 of 5120**
+  samples a channel (worst 4.186e-01), and the engine's own suite shows 383 of 1600 between two clears
+  inside one fade. `rigplayer::RigPlayer::reset()` calls this verb, a choice made when `reset()` still
+  dropped the filter; switching it is registered as its own task, not taken here. `reset()` is built from
+  `clearAudioState()` in every class, so the two verbs cannot drift.
+- **`ConvolutionEngine`'s per-channel `buildIr()` no longer zeroes the staged slot's cached tail.** That
+  was a MESSAGE-thread write into a history buffer the audio thread also writes — the same `0.0f`, so
+  nothing could be lost, but a data race all the same (put back, ThreadSanitizer reports it), and the one
+  thing that made `clearAudioState()`'s promise untrue for this class; its two siblings never write a tail
+  off the audio thread. It is redundant: `primeTail()` overwrites that buffer whole at fade start for every
+  channel being processed, and a channel NOT being processed was zeroed when it dropped out and is cold,
+  for which zero is the right value. Byte-identical output across the change, measured against the tree
+  before it over 24 cells of {no reset, reset at Idle} x width {1, 2, 2->1->2, 2->0->2} x block size.
+- **The memory order is the one the new write needs.** `reset()` writes `cur_`, which the loader reads
+  after acquiring `state_`, so the Idle store is a RELEASE store; and it is made only when a swap was
+  actually in flight, because an unconditional `store(0)` would wipe a publication that landed between the
+  load and the store. A new real-thread gate, `ConvolutionRestartRaceTests` (outside the wasm-audio tier,
+  like core's RtStreams suite), loses **none** of its publications, where the bodies before lose **all** of
+  them and the fixed bodies with the store made unconditional lose **12–95 %** per route in every run
+  measured (macOS/arm64, Debian/x86-64 with gcc, Windows/x64 with MSVC). With that and the tail write gone,
+  `reset()` no longer races a single-producer loader at all: ThreadSanitizer, a loader publishing in a loop
+  beside process / reset / clearAudioState on all three classes, reports **0** races against **54–62** on
+  the bodies before; the release store put back to relaxed draws **63–71**, and the tail write put back
+  **2** (Apple clang needs `-fno-builtin` for the last — it does not instrument a `std::fill` otherwise,
+  and a first run here was blind to exactly that; gcc 14 sees it as is). The documented "must not run
+  concurrently" contract is kept until a sanitizer row carries that.
+- Gates, as a property and not a point: `{Pending, Crossfading} x {mono, stereo} x both slot parities`
+  and, for the matrix siblings, every topology with four distinct banks and different L/R inputs, with
+  **law 11a independence** as the oracle (two convolvers fed different audio of different lengths, one
+  restarted with the publication in flight and one after it settled, answer the next programme — longer
+  than the whole FDL span — bit for bit), plus the published operator certified from OUTSIDE the class
+  against a reference convolution; `clearAudioState()` mid-fade (still busy, ends on the sample it always
+  would have, history gone, lands on the new operator, and not independent of where it was called); for
+  the engine, the seam bound and no allocation in either verb; the product classes above; `CabConvolver`'s
+  two verbs side by side, the clear by exactly the fade it left running; a fuzz of random publish /
+  process / reset / clearAudioState interleavings on all three classes against a settled shadow of the
+  same class (with a random width and a reference convolution for the engine), red on the first seed of
+  every class before the fix; and the real-thread race gate above. A mutation stand over **17** mutants and
+  9 test binaries (the engine, matrix, Nupc, gate-state, `CabConvolver`, fuzz, race, `LinearPhaseEq` and
+  `NaturalPhaseEq` suites) is red on every one — including "adopt but leave the state in flight" (the
+  operator rolls back one fade later), "`cur_ = 0` instead of `1 - cur_`" (caught only at the second slot
+  parity), "leave the FDL", "leave the frame", "forget one slot's cached tail", "the adopted slot's
+  topology slips", "the clear restarts the fade", "an EQ forwards `reset()` to `clearAudioState()`", "the
+  Idle store made unconditional" (caught by the race gate alone) and each class's pre-P88 body. Four more
+  are green on the suites by design: a dropped `ranNc_ = 0` and a dropped `xfadePos_ = 0` are truly
+  equivalent; the release store put back to relaxed and the tail write put back are races that only
+  ThreadSanitizer sees (above).
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### rigplayer · nam — a prepare restates what it counts, and a drained lane is not billed twice
+
+`RigPlayer::prepare()` rebuilt everything the host rate DESIGNS — filters, rings, both stages, the
+cold threshold kept in seconds — and nothing the host rate COUNTS. This closes that half, and one
+double charge in `NamStage`.
+
+- **A woken slot now warms for the field the NEW rate owes.** The blend law's warm-up debt was latched
+  from `warmFor()` when a model landed and read for ever after, including by the wake of a sleeping
+  slot. Measured through the player on a 6x6 host-rate grid, two block sizes and three capture shapes:
+  the warm-up after a rate change did not depend on the new rate at all. **48 → 96 kHz warmed a slot
+  for 2048 host samples where 4096 are owed — half the field; 48 → 192 kHz a quarter; 192 → 48 kHz held
+  a slot silent four times too long.** Of 180 cells, 85 under-warmed, 85 over-warmed and 10 read right
+  — eight of those 44.1 ↔ 48 kHz, so the pair a fixture reaches for first could not see it. **180 of 180
+  now match a player prepared at the new rate from the start.**
+- **The ledger is restated by the rule each count's algebra allows**, in a new law verb,
+  `nam::blendRestated()` — not `blendLanded()`, which would also clear a load in flight, a sleep and a
+  refusal. The debt is RECOMPUTED: it is not homogeneous in the rate (the rate-matcher's latency is 0 at
+  48 kHz, 61 at 44.1, 96 at 96, and the block term does not scale), so rescaling it is a second copy of
+  `warmFor()` with a different answer. The progress is mapped by its PREDICATE: an audible slot stays
+  audible, a warming slot starts over. Scaling it by the rate ratio is the trap — 96 → 48 kHz turns a
+  just-audible slot inaudible for any block over 96 samples and plays a spurious full crossfade. The rest
+  count IS rescaled: it is pure elapsed time, so the ratio is exact, and is 1 where nothing moved.
+- **A restart inside a warm-up re-arms it, at any rate — `reset()` included.** Both verbs flush every
+  network, and the law went on crediting a warming slot the field it heard before the flush. Restarting
+  1, 2 and 3 blocks into a 2001-tap field left 14, 13 and 12 blocks of warm-up against the 15 a restart
+  at the landing costs. A warming slot is at weight zero, so re-arming it is silent; an AUDIBLE slot is
+  still not re-armed, for the reasons P85 gave.
+  *This supersedes the P85 note above that `RigPlayer::reset()` does not touch the blend law's state:
+  it does not, except for this.*
+- **The rest a slot has served survives a restart.** It was left in the old rate's samples against a
+  threshold recomputed in the new: 48 → 96 kHz slept 0.73 s late, 96 → 48 kHz after one block. A first
+  draft zeroed it instead — a behaviour change at the UNCHANGED rate, postponing every parked dial's sleep
+  by two seconds at each restart — and was caught before it shipped.
+- **The per-slot alignment delays are restated too** — they are host samples, written only by a knob, a
+  table or a landing — and **a landing delivered before a rate change and taken after it** warms and
+  aligns at the new rate. A `prepare()` between `load()` and the next block leaves the previous pack's
+  model ids alone: they index a model list that now belongs to the new pack.
+- **Slot trims switched OFF stay off across a restart.** The snap ignored `setInputTrims(false)`, so
+  a restart ducked the slot to the pack's trim and ramped back over ~43 ms (−4.29 dB on the first block
+  of a −6 dB entry). The shared body fixes `prepare()` and `reset()` at once.
+- **`NamStage`: a lane whose falling-edge drain ran to the end is not billed again by the next
+  `prepare()`.** Only a restart cleared its "may be holding audio" flag, so the next prepare charged a
+  whole drain for a clean lane: 4093 samples for `wavenet_a1_standard`, 6347 for `A2`, and the
+  re-prepare measured 14.7 ms where 12.7 is owed. A PARTLY drained lane is still charged in full, and a
+  recurrent one always is. *This supersedes the P85 note above that `configureRates` charges every lane
+  that has EVER been fed.*
+- **`rigplayer` has a permanent RT allocation gate** (`RigPlayerRtAllocTests`), on the shared counter
+  that sees all eight forms of `new`: `process()` on five shapes, across a turn, through a slot falling
+  asleep and draining, a host dropping to mono and to a gap, a call four times the block; `reset()`; the
+  per-block read-outs. Its control plants an allocation and must read one more than the same window
+  without it.
+
+**Registered, not taken:** skipping `prepare()`'s second warm-up pass for architectures whose `Reset`
+already clears their state (P98). With the drain removed outright, every capture NAM ships keeps
+independence at exactly 0 — and this tree's own `Buffer`-based fixtures leak on 72 of 96 cells, worst
+0.567861. NAM's example set has no such capture in any tree, so a check against real captures alone
+would have approved a blanket skip. Found on the way and registered: the alignment ceiling
+`kBlendMaxDelay` is 128 samples, so a 64-sample lag at 48 kHz is clamped to half at 192 kHz (P99).
+
+Independence (P47/P85) is unchanged: nothing the caller fed is audible after a restart — exactly 0
+across 384 rows of NAM's own captures through the player. One number did move, and it is not
+independence: since a lane drained to the end is no longer drained again by `prepare()`, two stages fed
+the same audio but a different channel-width history now differ after a prepare by the drain's own
+chunking residue — up to 2.4e-06 on `slimmable_wavenet` at a 17-sample block, 0 on `A2` — where they
+used to be identical.
+
+Found by the adversarial round and registered, not this branch's: a lane that comes back after its drain
+has run out resumes at a frozen sub-sample phase, so at a non-integer rate ratio it differs from a lane
+fed silence throughout by 0.114 on `wavenet_a1_standard` at 44.1 kHz (P101); and `RigPlayer::prepare()`
+accepts positive rates far below any audio rate (1e-3 Hz) that its stages cannot honour (P102).
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### nam — what the ledger cannot place costs ONE allowance: never zero, never the face value
+
+`felitronics::nam::detail`'s receptive-field registry promises an **upper bound** on a capture's memory,
+and two readers spend its answer: law 11a's drain and P47's stream restart feed a lane that much digital
+silence. Where it could not read a shape it answered **zero**, which is the tail of the previous sound
+coming out of silence. It now answers what it read, plus one named allowance.
+
+- **The measured case is NAM's own shipped capture.** `example_models/slimmable_wavenet.nam` with its
+  config moved under `config.model`, and a top-level `layers` carrying nothing but the slimmable marker,
+  **loads** (NAM's WaveNet parser delegates on the marker and the delegate reads `config.model`), makes
+  the same sound, and its impulse reaches sample 2046 either way. The registry answered **2047** for the
+  flat file and **0** for the wrapped one, and NAM's own answer for the architecture is `return 0`. All
+  three questions were blind together: an LSTM conditioner inside the wrapper read as not recurrent, and a
+  dense `Linear` one lost its 2048-sample ring.
+- **Three events mean "cannot place", all read off the config and none off NAM's dispatch:** an object
+  carrying a model's vocabulary under a key the registry does not read (at a config, a layer entry or a
+  submodel entry, singly or in an array — under any key name); a value that is there and cannot be read
+  (a slimmable dilation of `4294967396`, which NAM builds as 100, answered 0); and a reading the registry
+  sets aside (a declared field beside a stack). Each adds `kUnreadShapeCeiling` = **48 000 samples**,
+  **once per tree**, to what the registry did read, and charges the ring. It fires on **none** of the
+  1229 distinct captures on the author's machine; the flat shipped slimmable still reads 2047.
+- **Why once, why added, why not the face value** — each is a measured failure of the alternative. An
+  allowance per node turned a 1.6 MB file of 30-byte dead siblings into an **INT_MAX** drain; a max at the
+  root let a known 100 001-sample stack swallow the allowance of an unreadable stage in series with it;
+  and trusting the face value of a dead `"receptive_field": 2147483647` beside a real Standard's stack —
+  a file NAM loads unchanged — made `reset()` run for **about half an hour per lane** (2³¹ samples at 0.79–0.89 µs each).
+- **The price, measured through `NamStage::reset()`** on real captures rewrapped, per lane at 48 kHz:
+  **39.7 ms** on `wavenet_a1_standard` at a 256 block (44.5 ms at 64), **24.1 ms** on A2's submodel,
+  **4.5 ms** on the slimmable itself. On shapes that ship: identity.
+- **What moved, on purpose, and only in synthetic rows:** a stale `receptive_field` beside a stack
+  (9 → 48 009), a stray top-level `dilations` beside `layers` (2 → 48 002), refused values (1e300,
+  `4294967396`, a string) from "absent" to the allowance. **Closed on the way:** a 5000-tap `Linear`
+  carrying a readable stray `layers` array answered 2 (reach 4999; now 48 002), and a `ConvNet` carrying a
+  non-empty dead `layers` array answered 0 (NAM: 256; now 256).
+- **What it does not close, stated rather than hidden — two doors, and shutting either opens the other.**
+  A LIVE memory the registry cannot place and that is LONGER than the allowance drains short by the
+  difference (a wrapped model with an inner field of 60 000; a 60 001-tap `Linear` whose declared field is
+  set aside beside a dead `layers` array) — the longest real field is 6347. And a DEAD number the registry
+  PLACES is still trusted at face value, exactly as before: a lower reading with no stack beside it (a dead
+  `dilations:[2e9]` beside a `Linear`'s declared field), the wrapped form's own decoy stack, a `layers`
+  array on an architecture that never reads it. Which door stays open is registered as a policy question.
+  A differential fuzz of 2 000 loadable configs against NAM found no short answer outside these two and
+  the recurrent exception. Separately, NAM's own recursive copy of the config takes the host down on a
+  file about 2 000 levels deep before the registry runs. The only new recursion — looking for an
+  architecture through unplaced nodes — is bounded at 32 unplaced hops; the nesting the registry already
+  walked is read exactly as before, and a guard on it was measured to drain a 65-deep conditioner chain
+  short.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### mastering · tools — the search and the shapes get the ceilings their neighbours already had
+
+**What each entry now promises about the rate, from above:**
+
+- **`mastering::TargetLoudnessSolver`** measures up to 3 MHz — `kMaxSampleRate`, which is
+  `MasteringChain::kMaxSampleRate`: the search measures what a chain renders, at the chain's rate. `prepare()`
+  refuses a higher rate and disarms, and `solveBytes()` / `measureRangeBytes()` answer 0 there. It took any
+  finite rate over the floor: at 1e300 Hz `prepare()` said yes while `solveBytes()` said 0, and one ulp over
+  3 MHz it prepared for a chain that cannot exist.
+- **`fcore::ShapeProbe` and `fc_probe_shapes_run`** take 8000 Hz to 768 kHz — `fcore::Probe`'s range. They
+  kept no ceiling and drew a 1 MHz file that every other run entry of the probe ABI refuses. `fcore_measure
+  waveform` / `stereo` refuse above 768 kHz too, and name the range.
+
+Nothing changes at or under either ceiling: a verdict oracle over 3817 rates and 39 entries finds differences
+only in the search's and the shapes' entries, only above their ceilings, and only from an acceptance to a
+refusal.
+
 ## v0.33.0 — 2026-09-15
 
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
