@@ -122,7 +122,12 @@ jobs:
           # teardown — now fixed (~NeuralStage frees it; a ctors==dtors test guards it on every platform).
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build-san --output-on-failure
+        # No wall-clock gate here, and therefore every core. spectrum_pane_perf compares timings; under ASan it
+        # measures the instrumentation, and on deb — a machine other sessions build on — it measures THEM: it
+        # failed exactly that way while four other builds were running. The gate keeps running where it means
+        # something, in the build-test matrix. Without it, the 132 tests may run together, and the five that
+        # take 290, 229, 119, 104 and 92 s under ASan stop queueing behind each other.
+        run: ctest --test-dir build-san -j "$(nproc)" --output-on-failure -E spectrum_pane_perf
 
   # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
   # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
@@ -219,7 +224,9 @@ jobs:
         run: cmake --preset wasm-audio && cmake --build --preset wasm-audio
       - name: Run the suite in node
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
-        run: ctest --preset wasm-audio
+        # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
+        # code, and it already runs natively in build-test. Without it the suite can use every core.
+        run: ctest --preset wasm-audio -j "$(nproc)" -E spectrum_pane_perf
       - name: No threads — audited on EVERY emitted .wasm, not one sample
         run: node tools/wasm/check-no-threads.mjs --all build-wasm-audio
       - name: No threading header in a public module header
