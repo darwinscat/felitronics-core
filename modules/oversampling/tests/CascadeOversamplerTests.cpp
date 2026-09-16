@@ -26,6 +26,7 @@
 #include <limits>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace felitronics;
@@ -558,6 +559,22 @@ static void runTopologyTests()
         test::ok (k2 <= (long long) bk.bytes(), "and switching back asks for no more than Kaiser's budget (" + std::to_string (k2) + " B)");
         oversampling::Oversampler copy = sw;
         test::ok (copy.latencySamples() == sw.latencySamples() && copy.topology() == Topology::Kaiser, "a copy is the same switch");
+
+        // A MOVED-FROM cascade switch keeps its topology tag and loses its object. It must read as unprepared
+        // and ignore calls, not dereference the empty vector (it did: SIGSEGV on latencySamples()).
+        oversampling::Oversampler src;
+        (void) src.prepare (Topology::Cascade, 48000.0, 4, 1, 64);
+        oversampling::Oversampler dst = std::move (src);
+        std::vector<float> xin (64, 0.5f), xup (256, 7.0f), xdn (64, 7.0f);
+        const float* ii[1] { xin.data() }; float* uo[1] { xup.data() };
+        const float* ui[1] { xup.data() }; float* dno[1] { xdn.data() };
+        src.upsample (ii, 1, 64, uo); src.downsample (ui, 1, 64, dno); src.reset(); src.resetChannel (0);   // NOLINT: use after move is the test
+        test::ok (src.latencySamples() == 0 && src.factor() == 0 && xup[0] == 7.0f && xdn[0] == 7.0f,
+                  "a moved-from cascade switch reads as unprepared and its calls touch nothing");
+        test::ok (dst.latencySamples() == 76 && dst.factor() == 4, "and the moved-to switch is the prepared cascade");
+        oversampling::Oversampler again;
+        again = std::move (dst);
+        test::ok (again.latencySamples() == 76 && dst.latencySamples() == 0, "move assignment behaves the same way");
     }
 }
 

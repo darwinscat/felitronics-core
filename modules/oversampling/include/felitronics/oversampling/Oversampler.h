@@ -104,25 +104,49 @@ public:
         return true;
     }
 
-    // Invariant: topology_ == Cascade implies cascade_ holds exactly one prepared object.
-    void reset() noexcept                { if (topology_ == Topology::Kaiser) kaiser_.reset(); else cascade_.front().reset(); }
-    void resetChannel (int c) noexcept   { if (topology_ == Topology::Kaiser) kaiser_.resetChannel (c); else cascade_.front().resetChannel (c); }
-    int  factor() const noexcept         { return topology_ == Topology::Kaiser ? kaiser_.factor() : cascade_.front().factor(); }
-    int  latencySamples() const noexcept { return topology_ == Topology::Kaiser ? kaiser_.latencySamples() : cascade_.front().latencySamples(); }
-    Topology topology() const noexcept   { return topology_; }
+    // Under Cascade every call goes through `cascade()`, which is null when the vector is empty — and it IS
+    // empty in a MOVED-FROM switch, whose topology_ was copied while the vector was stolen. A moved-from
+    // switch therefore reads as unprepared (latency 0, factor 0, calls are no-ops) instead of dereferencing
+    // an empty vector: measured as a SIGSEGV on `latencySamples()` of a moved-from Saturator before this.
+    void reset() noexcept
+    {
+        if (topology_ == Topology::Kaiser) kaiser_.reset();
+        else if (auto* c = cascade()) c->reset();
+    }
+    void resetChannel (int ch) noexcept
+    {
+        if (topology_ == Topology::Kaiser) kaiser_.resetChannel (ch);
+        else if (auto* c = cascade()) c->resetChannel (ch);
+    }
+    int factor() const noexcept
+    {
+        if (topology_ == Topology::Kaiser) return kaiser_.factor();
+        const auto* c = cascade();
+        return c != nullptr ? c->factor() : 0;
+    }
+    int latencySamples() const noexcept
+    {
+        if (topology_ == Topology::Kaiser) return kaiser_.latencySamples();
+        const auto* c = cascade();
+        return c != nullptr ? c->latencySamples() : 0;
+    }
+    Topology topology() const noexcept { return topology_; }
 
     void upsample (const float* const* in, int channels, int n, float* const* out) noexcept
     {
         if (topology_ == Topology::Kaiser) kaiser_.upsample (in, channels, n, out);
-        else                               cascade_.front().upsample (in, channels, n, out);
+        else if (auto* c = cascade()) c->upsample (in, channels, n, out);
     }
     void downsample (const float* const* in, int channels, int n, float* const* out) noexcept
     {
         if (topology_ == Topology::Kaiser) kaiser_.downsample (in, channels, n, out);
-        else                               cascade_.front().downsample (in, channels, n, out);
+        else if (auto* c = cascade()) c->downsample (in, channels, n, out);
     }
 
 private:
+    CascadeOversampler*       cascade() noexcept       { return cascade_.empty() ? nullptr : &cascade_.front(); }
+    const CascadeOversampler* cascade() const noexcept { return cascade_.empty() ? nullptr : &cascade_.front(); }
+
     Topology             topology_ = Topology::Kaiser;
     PolyphaseOversampler kaiser_;
     std::vector<CascadeOversampler> cascade_;    // empty, or the one prepared cascade
