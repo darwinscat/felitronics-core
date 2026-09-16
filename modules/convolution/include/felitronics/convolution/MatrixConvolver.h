@@ -44,7 +44,9 @@ namespace felitronics::convolution
 // CONTRACTS mirror ConvolutionEngine: prepare() allocates (message thread, RT-UNSAFE); setOperator()/setIr()
 // are RT-UNSAFE single-producer message-thread (must not race reset()); process() is RT-safe (no
 // alloc/lock/throw), zero latency; isBusy() is true while a swap is crossfading (the host coalesces);
-// reset() flushes history (the next swap fades in from silence) but keeps the live operator. The FFT is the compile-time
+// reset() flushes history (the next swap fades in from silence) and keeps the operator the caller last
+// PUBLISHED — a swap in flight is ended in favour of the new one, never dropped — while clearAudioState()
+// is the history alone, leaving a fade to run. The FFT is the compile-time
 // backend seam (no hot-path vtable). Stereo only (2 output channels); the class is intentionally not
 // channel-parameterised — the 2×2 matrix IS its reason to exist.
 template <core::fft::RealFftBackend Fft = core::fft::DefaultRealFft>
@@ -101,16 +103,45 @@ public:
         return true;
     }
 
-    // Flush the running history (next swap fades in from silence) but KEEP the live operator. Cancels a pending
-    // swap. Audio thread (or externally synced); must not run concurrently with setOperator().
-    void reset() noexcept
+    // 🔴 THE AUDIO THE CALLER FED, AND NOTHING ELSE: the running history, and no decision about which
+    // operator is live. Every buffer below is written only inside process() — `Bank` holds IR data and is
+    // not touched here — so this races nothing and cancels no swap: a fade in flight goes on, over an empty
+    // history. BOTH slots' cached tails go, because a surviving fade blends the other slot's tail into
+    // every output sample and would otherwise replay pre-restart audio through the incoming operator.
+    // It does NOT give independence from where in a fade it was called — that is reset()'s promise;
+    // ConvolutionEngine::clearAudioState() measures the same mechanism in that class.
+    void clearAudioState() noexcept
     {
         std::fill (frameL_.begin(), frameL_.end(), 0.0f);
         std::fill (fdlL_.begin(),   fdlL_.end(),   0.0f);
         if (! mono_) { std::fill (frameR_.begin(), frameR_.end(), 0.0f); std::fill (fdlR_.begin(), fdlR_.end(), 0.0f); }
         for (int k = 0; k < 2; ++k) slot_[k].resetTails();
-        xfadePos_ = 0; phase_ = 0; fdlPos_ = 0;   // keep cur_ (the live operator)
-        state_.store (0, std::memory_order_relaxed);
+        phase_ = 0; fdlPos_ = 0;
+    }
+
+    // Flush the running history (next swap fades in from silence) and KEEP THE OPERATOR THE CALLER LAST
+    // PUBLISHED, including one still crossfading in: a swap in flight is ENDED IN FAVOUR OF THE NEW
+    // operator, not dropped. `cur_` flips only at fade end, so keeping it would put the PREVIOUS operator
+    // back and nothing would re-stage the published one — the same defect, and the same reasoning, as
+    // ConvolutionEngine::reset() states at length (law 11a independence, and the price at the seam: the
+    // flush cuts the stream in any case, and the hand-over moves that step by at most the head-tap
+    // difference). On the body this replaces, the suite's independence group reads the OLD operator in every
+    // cell (every topology, both parities), a worst sample 1.017e+00 away from the settled restart.
+    // An operator that is STAGED BUT NOT PUBLISHED (stageOperator() without publishStaged(), so state_ == 0)
+    // is deliberately untouched: it has not been accepted yet, `cur_` must not move, and the later publish
+    // still finds it — measured, the publish lands.
+    // Audio thread (or externally synced); must not run concurrently with setOperator().
+    void reset() noexcept
+    {
+        clearAudioState();
+        const int s = state_.load (std::memory_order_acquire);   // pairs with publishStaged()'s release store
+        if (s == 0) return;                                      // nothing in flight, and nothing is stored:
+                                                                 // an unconditional store(0) would wipe a
+                                                                 // publication landing between load and store
+        cur_ = 1 - cur_;                                         // the published slot becomes the live one
+        xfadePos_ = 0;
+        state_.store (0, std::memory_order_release);             // release: setOperator() reads `cur_` after
+                                                                 // acquiring this store (see stageOperator)
     }
 
     static constexpr int latencySamples() noexcept { return 0; }

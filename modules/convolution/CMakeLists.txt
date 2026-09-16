@@ -70,4 +70,25 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_convolution_gatestate_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_convolution_gatestate_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_convolution_gatestate_tests COMMAND felitronics_convolution_gatestate_tests)
+
+    # A restart with an operator published and not yet adopted (P88, law 11e): random interleavings of
+    # publish / process / reset / clearAudioState on all three swap-safe convolvers, against a settled shadow.
+    add_executable(felitronics_convolution_restart_fuzz_tests tests/ConvolutionRestartFuzzTests.cpp)
+    target_link_libraries(felitronics_convolution_restart_fuzz_tests PRIVATE felitronics::convolution)
+    target_include_directories(felitronics_convolution_restart_fuzz_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_convolution_restart_fuzz_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_convolution_restart_fuzz_tests COMMAND felitronics_convolution_restart_fuzz_tests)
+
+    # …and the one hazard of that restart only REAL threads reach: reset() spinning beside a publishing
+    # loader. Outside the wasm-audio tier by construction, like core's RtStreams suite — that tier is
+    # single-threaded by contract, and this tree wraps pthread_create there, so a std::thread fails the link.
+    if(NOT EMSCRIPTEN)
+        add_executable(felitronics_convolution_restart_race_tests tests/ConvolutionRestartRaceTests.cpp)
+        target_link_libraries(felitronics_convolution_restart_race_tests PRIVATE felitronics::convolution)
+        target_include_directories(felitronics_convolution_restart_race_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+        target_compile_features(felitronics_convolution_restart_race_tests PRIVATE cxx_std_20)
+        find_package(Threads REQUIRED)
+        target_link_libraries(felitronics_convolution_restart_race_tests PRIVATE Threads::Threads)
+        add_test(NAME felitronics_convolution_restart_race_tests COMMAND felitronics_convolution_restart_race_tests)
+    endif()
 endif()

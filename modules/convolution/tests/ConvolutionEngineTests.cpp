@@ -8,10 +8,13 @@
 #include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/PartitionedConvolver.h>   // reference convolver for the null tests
+#include <felitronics/core/Math.h>                         // core::sameBits — a bitwise compare, not ==
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <utility>
 #if defined(_WIN32)
  #include <malloc.h>   // _aligned_malloc / _aligned_free (MSVC has no posix_memalign)
 #endif
@@ -20,6 +23,8 @@
 using namespace felitronics;
 
 struct Lcg { unsigned long long s; float next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (float) ((s >> 40) & 0xffff) / 32768.0f - 1.0f; } };
+
+static std::string sci (double v) { char b[32]; std::snprintf (b, sizeof b, "%.3e", v); return b; }
 
 static double maxDeriv (const std::vector<float>& y, int from, int to)
 {
@@ -249,6 +254,292 @@ int main()
         test::ok (eng.setIr (iC.data(), irLenR), "post-reset swap accepted");
         run (warmXf + Pr + 8);
         test::ok (! eng.isBusy(), "post-reset swap settles within the SHORT fade (history was flushed, not re-armed long)");
+    }
+
+    // --- 🔴 P88: reset() KEEPS AN OPERATOR PUBLISHED BUT NOT YET ADOPTED — the property, both parities ---
+    // reset() promises "flush the tail", not "revert the EQ", and that promise covers a publication the
+    // audio thread has not picked up yet (law 11e). The body before P88 kept `cur_` on the OLD slot and
+    // wiped `state_`, so a published operator was dropped with nothing left to re-stage it — setIr() had
+    // already said true. On that body this group reads the OLD operator in every cell, a worst sample
+    // 7.494e-01 from the settled restart. The group above tests the promise only from Idle,
+    // the one state where it cannot fail.
+    // THE ORACLE IS LAW 11a INDEPENDENCE, not a head tap: two engines fed DIFFERENT audio for DIFFERENT
+    // lengths — so `phase_` and `fdlPos_` differ too — one restarted with the publication still in flight
+    // and one restarted after it settled, must answer the next programme with IDENTICAL BITS. A head-tap
+    // probe alone passes a restart that forgets the FDL or the frame; this does not, and the programme is
+    // longer than the whole FDL span so a single stale partition shows. The channels get DIFFERENT inputs,
+    // so a restart that mixed them up would show too. Both slot parities run, because `cur_ = 0` instead
+    // of `cur_ = 1 - cur_` is right half the time — the mutation stand catches that mutant only at parity 1.
+    // Every cell is also certified from OUTSIDE the class against a PartitionedConvolver holding the
+    // PUBLISHED IR, and checked NOT to be the previous one.
+    test::group ("ConvolutionEngine reset keeps a published-but-unadopted IR (law 11a independence)");
+    {
+        const int Pk = 64, irMaxK = 1024, irLenK = 700, xfK = 128;
+        const int coldK   = ((irMaxK - Pk + Pk - 1) / Pk) * Pk;   // maxParts·P — the whole FDL span
+        const int settleK = xfK + Pk + 8;
+        const int progN   = xfK + 17 * Pk;                        // past the FDL span: a stale partition shows
+        Lcg rk { 1234 };
+        std::vector<float> iA (irLenK), iA2 (irLenK), iB (irLenK), iC (irLenK);
+        for (auto& v : iA)  v = 0.05f * rk.next();
+        for (auto& v : iA2) v = 0.05f * rk.next();
+        for (auto& v : iB)  v = 0.05f * rk.next();
+        for (auto& v : iC)  v = 0.05f * rk.next();
+        iA[0] = 0.70f; iA2[0] = 0.31f; iB[0] = -0.40f;            // distinct heads: says which operator is live
+        // [0]/[1] = left/right; D = the engine under test, R = the reference, fed different audio
+        std::vector<float> preD[2] { std::vector<float> (coldK + 700),  std::vector<float> (coldK + 700) };
+        std::vector<float> preR[2] { std::vector<float> (coldK + 1100), std::vector<float> (coldK + 1100) };
+        std::vector<float> prog[2] { std::vector<float> (progN), std::vector<float> (progN) };
+        for (auto& ch : preD) for (auto& v : ch) v = 0.5f * rk.next();
+        for (auto& ch : preR) for (auto& v : ch) v = 0.4f * rk.next();
+        for (auto& ch : prog) for (auto& v : ch) v = 0.3f * rk.next();
+
+        // mode 0 = restart with the publication PENDING · 1 = restart mid-CROSSFADE · 2 = the reference,
+        // which lets the publication settle before restarting.
+        const auto render = [&] (int nch, int parity, int mode, std::vector<float>& L, std::vector<float>& R,
+                                 bool* busyOut, bool* acceptOut)
+        {
+            convolution::ConvolutionEngine<> e;
+            felitronics::test::run (e.prepare (Pk, irMaxK, xfK, nch));
+            const std::vector<float>* pre = (mode == 2) ? preR : preD;
+            const int blk = 128;
+            std::vector<float> jl (pre[0].size() + (std::size_t) blk, 0.0f), jr (jl.size(), 0.0f);
+            int fed = 0;
+            const auto feed = [&] (int k)                          // rendered into scratch — only `prog` is compared
+            {
+                for (int done = 0; done < k; )
+                {
+                    const int m = std::min (blk, k - done);
+                    const int at = (fed + done) % (int) pre[0].size();
+                    const int mm = std::min (m, (int) pre[0].size() - at);
+                    const float* in[2]  { pre[0].data() + at, pre[1].data() + at };
+                    float*       out[2] { jl.data(), jr.data() };
+                    felitronics::test::run (e.process (in, out, nch, mm));
+                    done += mm;
+                }
+                fed += k;
+            };
+            if (parity == 1) { test::ok (e.setIr (iA2.data(), irLenK), "parity pre-swap accepted"); feed (settleK); }
+            test::ok (e.setIr (iA.data(), irLenK), "operator A accepted");
+            feed ((int) pre[0].size());                            // warm the whole FDL and settle on A
+            test::ok (e.setIr (iB.data(), irLenK), "operator B published");
+            if (mode == 1) feed (xfK / 2);                         // … and picked up: mid-crossfade
+            if (mode == 2) feed (settleK);                         // … and settled: the reference state
+            e.reset();
+            if (busyOut != nullptr) *busyOut = e.isBusy();          // Idle immediately: no swap is left owing
+            L.assign (prog[0].size(), 0.0f); R.assign (prog[0].size(), 0.0f);
+            for (int done = 0; done < progN; )
+            {
+                const int m = std::min (blk, progN - done);
+                const float* in[2]  { prog[0].data() + done, prog[1].data() + done };
+                float*       out[2] { L.data() + done, R.data() + done };
+                felitronics::test::run (e.process (in, out, nch, m));
+                done += m;
+            }
+            if (acceptOut != nullptr) *acceptOut = e.setIr (iC.data(), irLenK);   // a NEW publication, at once
+        };
+
+        const auto reference = [&] (const std::vector<float>& ir, int ch)
+        {
+            convolution::PartitionedConvolver<> pc; pc.prepare (Pk, irMaxK); pc.setIr (ir.data(), irLenK);
+            std::vector<float> y (prog[ch].size(), 0.0f);
+            felitronics::test::run (pc.process (prog[ch].data(), y.data(), progN));
+            return y;
+        };
+        const std::vector<float> yB[2] { reference (iB, 0), reference (iB, 1) };
+        const std::vector<float> yA[2] { reference (iA, 0), reference (iA, 1) };
+
+        for (int nch = 1; nch <= 2; ++nch)
+            for (int parity = 0; parity <= 1; ++parity)
+            {
+                std::vector<float> refL, refR;
+                render (nch, parity, 2, refL, refR, nullptr, nullptr);
+                const std::string cell = "  [" + std::to_string (nch) + " ch, slot parity " + std::to_string (parity) + "]";
+                for (int mode = 0; mode <= 1; ++mode)
+                {
+                    std::vector<float> dut[2]; bool busy = true, accepts = false;
+                    render (nch, parity, mode, dut[0], dut[1], &busy, &accepts);
+                    const std::vector<float>* ref[2] { &refL, &refR };
+                    bool same = true; double worst = 0.0, eB = 0.0, eA = 0.0;
+                    for (int c = 0; c < nch; ++c)
+                        for (int i = 0; i < progN; ++i)
+                        {
+                            const float d = dut[c][(std::size_t) i];
+                            same  = same && core::sameBits (d, (*ref[c])[(std::size_t) i]);
+                            worst = std::max (worst, (double) std::fabs (d - (*ref[c])[(std::size_t) i]));
+                            eB    = std::max (eB, (double) std::fabs (d - yB[c][(std::size_t) i]));
+                            eA    = std::max (eA, (double) std::fabs (d - yA[c][(std::size_t) i]));
+                        }
+                    const std::string what = (mode == 0 ? "Pending" : "Crossfading");
+                    test::ok (same, "restarted at " + what + ", bit-identical to a settled restart" + cell + " (worst " + sci (worst) + ")");
+                    test::ok (eB < 1e-6, "  …and it answers as the PUBLISHED IR" + cell + " (" + sci (eB) + ")");
+                    test::ok (eA > 1e-2, "  …and not as the previous one" + cell + " (" + sci (eA) + ")");
+                    test::ok (! busy, "  …and Idle right after reset(), so the consumer may publish again" + cell);
+                    test::ok (accepts, "  …and a new publication is accepted at once" + cell);
+                }
+            }
+    }
+
+    // --- 🔴 P88: clearAudioState() is the history ALONE — it decides nothing about the operator ---
+    // The verb that leaves a fade running (reset() ends it) — running FROM WHERE IT WAS: the fade ends on the
+    // sample it was always going to end on (`xfadePos_ = 0` inside this verb would restart it, and a review
+    // round showed that surviving the first version of the sibling groups). It must still erase every trace
+    // of the old stream, INCLUDING the incoming slot's cached tail, which is blended into every output sample
+    // while the fade runs: two engines with different pasts, cleared at the same fade position, answer the
+    // same bits.
+    // What it does NOT give is independence from WHERE in the fade it was called — that is reset()'s promise,
+    // and the last check says so with a number, because a composite choosing between the two verbs needs it.
+    test::group ("ConvolutionEngine clearAudioState leaves the swap alone and the history gone");
+    {
+        const int Pc = 64, irMaxC = 1024, irLenC = 700, xfC = 512;   // a long fade: the restart lands inside it
+        const int coldC = ((irMaxC - Pc + Pc - 1) / Pc) * Pc;
+        const int progC = xfC + 17 * Pc;
+        Lcg rc { 99 };
+        std::vector<float> iA (irLenC), iB (irLenC);
+        for (auto& v : iA) v = 0.05f * rc.next();
+        for (auto& v : iB) v = 0.05f * rc.next();
+        iA[0] = 0.70f; iB[0] = -0.40f;
+        std::vector<float> preD[2] { std::vector<float> (coldC + 500), std::vector<float> (coldC + 500) };
+        std::vector<float> preR[2] { std::vector<float> (coldC + 900), std::vector<float> (coldC + 900) };
+        std::vector<float> prog[2] { std::vector<float> (progC), std::vector<float> (progC) };
+        for (auto& ch : preD) for (auto& v : ch) v = 0.5f * rc.next();
+        for (auto& ch : preR) for (auto& v : ch) v = 0.4f * rc.next();
+        for (auto& ch : prog) for (auto& v : ch) v = 0.3f * rc.next();
+
+        const auto render = [&] (int nch, const std::vector<float>* pre, int intoFade, std::vector<float>* out,
+                                 bool* busyOut, bool* busyOneShort, bool* busyOnTime)
+        {
+            convolution::ConvolutionEngine<> e;
+            felitronics::test::run (e.prepare (Pc, irMaxC, xfC, nch));
+            std::vector<float> jl (pre[0].size(), 0.0f), jr (pre[0].size(), 0.0f);
+            const auto feed = [&] (int from, int k)
+            {
+                const float* in[2]  { pre[0].data() + from, pre[1].data() + from };
+                float*       o[2]   { jl.data(), jr.data() };
+                felitronics::test::run (e.process (in, o, nch, k));
+            };
+            test::ok (e.setIr (iA.data(), irLenC), "A accepted");
+            feed (0, (int) pre[0].size() - xfC);
+            test::ok (e.setIr (iB.data(), irLenC), "B published");
+            feed ((int) pre[0].size() - xfC, intoFade);             // into the fade
+            e.clearAudioState();
+            if (busyOut != nullptr) *busyOut = e.isBusy();           // the fade is NOT cancelled
+            out[0].assign ((std::size_t) progC, 0.0f); out[1].assign ((std::size_t) progC, 0.0f);
+            const int remaining = xfC - intoFade;                    // the fade ends on this sample, not later
+            const auto run = [&] (int from, int k)
+            {
+                const float* in[2]  { prog[0].data() + from, prog[1].data() + from };
+                float*       o[2]   { out[0].data() + from, out[1].data() + from };
+                felitronics::test::run (e.process (in, o, nch, k));
+            };
+            run (0, remaining - 1);   *busyOneShort = e.isBusy();
+            run (remaining - 1, 1);   *busyOnTime   = e.isBusy();
+            run (remaining, progC - remaining);
+        };
+        for (int nch = 1; nch <= 2; ++nch)
+        {
+            const std::string cell = "  [" + std::to_string (nch) + " ch]";
+            std::vector<float> a[2], b[2], late[2];
+            bool a0 = false, a1 = false, a2 = true, b0 = false, b1 = false, b2 = true, l0 = false, l1 = false, l2 = true;
+            render (nch, preD, xfC / 4, a, &a0, &a1, &a2);
+            render (nch, preR, xfC / 4, b, &b0, &b1, &b2);
+            render (nch, preD, xfC / 2, late, &l0, &l1, &l2);
+            test::ok (a0 && b0 && l0, "clearAudioState() leaves the crossfade in flight (still busy)" + cell);
+            test::ok (a1 && b1 && l1 && ! a2 && ! b2 && ! l2, "…and it ends on the sample it was always going to end on, not later" + cell);
+            bool same = true; double worst = 0.0, apart = 0.0;
+            int apartCount = 0;
+            for (int c = 0; c < nch; ++c)
+                for (int i = 0; i < progC; ++i)
+                {
+                    same   = same && core::sameBits (a[c][(std::size_t) i], b[c][(std::size_t) i]);
+                    worst  = std::max (worst, (double) std::fabs (a[c][(std::size_t) i] - b[c][(std::size_t) i]));
+                    apart  = std::max (apart, (double) std::fabs (a[c][(std::size_t) i] - late[c][(std::size_t) i]));
+                    if (! core::sameBits (a[c][(std::size_t) i], late[c][(std::size_t) i])) ++apartCount;
+                }
+            std::printf ("      [%d ch] clearAudioState at %d vs %d samples into a %d-sample fade: %d of %d samples differ, worst %.4e\n",
+                         nch, xfC / 4, xfC / 2, xfC, apartCount, nch * progC, apart);
+            test::ok (same, "two histories, one fade position, identical bits — no trace of either stream" + cell + " (worst " + sci (worst) + ")");
+            // …and the fade it left alone still lands on the published operator, on both channels.
+            double tailErr = 0.0;
+            for (int c = 0; c < nch; ++c)
+            {
+                convolution::PartitionedConvolver<> refB; refB.prepare (Pc, irMaxC); refB.setIr (iB.data(), irLenC);
+                std::vector<float> yB ((std::size_t) progC, 0.0f);
+                felitronics::test::run (refB.process (prog[c].data(), yB.data(), progC));
+                for (int i = xfC + 2 * Pc; i < progC; ++i) tailErr = std::max (tailErr, (double) std::fabs (a[c][(std::size_t) i] - yB[(std::size_t) i]));
+            }
+            test::ok (tailErr < 1e-6, "the surviving fade completes onto the published operator" + cell + " (" + sci (tailErr) + ")");
+            test::ok (apart > 1e-3, "…but it is NOT independent of where in the fade it was called — reset() is" + cell + " (" + sci (apart) + ")");
+        }
+    }
+
+    // --- 🔴 P88: the price of adoption is at the SEAM — bounded by the head-tap difference, either way ---
+    // The flush itself cuts the stream (the previous tail stops mid-decay), so the first sample after reset()
+    // steps whichever slot is live. Adoption replaces the old head tap with the new one at that sample, so
+    // on DC it moves the step by AT MOST |Δh0|·|x| — in EITHER direction: a +1 dB move happens to shrink it
+    // here and a -1 dB move grows it (a review round caught the text claiming an interactive change never
+    // grows it). The first check is the one that tells adoption from the old drop: the first post-reset
+    // sample IS the published operator's head.
+    test::group ("ConvolutionEngine reset seam: the step moves by at most the head-tap difference");
+    {
+        const int Ps = 64, irMaxS = 1024, irLenS = 700, xfS = 128;
+        const int coldS = ((irMaxS - Ps + Ps - 1) / Ps) * Ps;
+        const float dcIn = 0.5f;
+        Lcg rs { 5 };
+        std::vector<float> iA (irLenS); for (auto& v : iA) v = 0.05f * rs.next();
+        iA[0] = 0.70f;
+        const auto scaled = [&] (float g) { auto t = iA; for (auto& v : t) v *= g; return t; };
+        std::vector<float> sameHead = iA;                         // a shape change that leaves the head tap alone
+        for (int i = 1; i < irLenS; ++i) sameHead[(std::size_t) i] += 0.002f * (float) std::sin (0.01 * i);
+        std::vector<float> flipped = iA; flipped[0] = -0.40f;     // two ARBITRARY operators
+        const auto step = [&] (const std::vector<float>* publish, float* firstOut)
+        {
+            convolution::ConvolutionEngine<> e;
+            felitronics::test::run (e.prepare (Ps, irMaxS, xfS, 1));
+            std::vector<float> dc ((std::size_t) coldS + 1600, dcIn), y (dc.size(), 0.0f);
+            e.setIr (iA.data(), irLenS);
+            felitronics::test::run (e.process (dc.data(), y.data(), (int) dc.size()));
+            const double last = y[dc.size() - 1];
+            if (publish != nullptr) test::ok (e.setIr (publish->data(), irLenS), "seam publish accepted");
+            e.reset();
+            float in = dcIn, out = 0.0f;
+            felitronics::test::run (e.process (&in, &out, 1));
+            *firstOut = out;
+            return std::fabs ((double) out - last);
+        };
+        float f0 = 0.0f;
+        const double flushOnly = step (nullptr, &f0);
+        std::printf ("      seam step, flush alone: %.4e\n", flushOnly);
+        test::ok (flushOnly > 1e-2, "the flush alone already steps at the seam (" + sci (flushOnly) + ")");
+        const std::vector<float> up = scaled (1.122f), down = scaled (0.891f);
+        const std::pair<const char*, const std::vector<float>*> pairs[] {
+            { "same head tap", &sameHead }, { "+1 dB", &up }, { "-1 dB", &down }, { "head tap flipped", &flipped } };
+        for (const auto& [label, ir] : pairs)
+        {
+            float first = 0.0f;
+            const double st = step (ir, &first);
+            const double bound = std::fabs ((double) (*ir)[0] - (double) iA[0]) * dcIn;
+            std::printf ("      seam step, adopting (%s): %.4e\n", label, st);
+            test::ok (core::sameBits (first, (*ir)[0] * dcIn), std::string ("first sample after reset() is the PUBLISHED head (") + label + ")");
+            test::ok (std::fabs (st - flushOnly) <= bound + 1e-6, std::string ("the step moves by at most |Δh0|·x (") + label + ": "
+                                                                    + sci (st) + " vs flush " + sci (flushOnly) + ", bound " + sci (bound) + ")");
+        }
+    }
+
+    // --- P88: no allocation in reset() / clearAudioState() (both are audio-thread verbs) ---
+    test::group ("ConvolutionEngine reset/clearAudioState allocate nothing");
+    {
+        convolution::ConvolutionEngine<> eng; eng.prepare (P, irMax, xfade, 2);
+        std::vector<float> in (512, 0.2f), outL (512, 0.0f), outR (512, 0.0f);
+        const float* ins[2]  { in.data(), in.data() };
+        float*       outs[2] { outL.data(), outR.data() };
+        eng.setIr (irA.data(), irLen);
+        felitronics::test::run (eng.process (ins, outs, 2, 512));
+        eng.setIr (irB.data(), irLen);                      // a publication in flight, so the adopt path runs
+        const long long before = alloc::count.load();
+        eng.reset();
+        eng.clearAudioState();
+        const long long after = alloc::count.load();
+        test::okNoAlloc (after == before, "reset() and clearAudioState() performed zero heap allocations");
     }
 
     // --- unprepared-engine guards (regression: a consumer's ctor pushed an IR before prepare()) ---
