@@ -870,6 +870,14 @@ int main() {
            "65 conditioners into a 60 001-tap Linear are read to the end: 60 000, as base answered");
         ok(isRecurrent(nlohmann::json::parse(conditionersInto(70, R"({"architecture":"LSTM","config":{"hidden_size":3}})"))),
            "…and an LSTM at the end of 70 conditioners is still recurrent, as base answered");
+        {
+            std::string nested;
+            for (int i = 0; i < 70; ++i) nested += R"({"architecture":"SlimmableContainer","config":{"submodels":[{"model":)";
+            nested += R"({"architecture":"LSTM","config":{"hidden_size":3}})";
+            for (int i = 0; i < 70; ++i) nested += "}]}}";
+            ok(isRecurrent(nlohmann::json::parse(nested)),
+               "…and so is one at the end of 70 nested containers — neither axis base walked is counted");
+        }
 
         // 🔴 THE UNPLACED AXIS IS GUARDED, and only it — the one recursion P92 added. Within the guard an
         // LSTM is found; past it the walk stops and recurrence is not assumed; the field carries the
