@@ -2740,46 +2740,86 @@ int main() {
     }
 
     // 2. SLOTS HOLDING CAPTURES WITH DIFFERENT FIELDS. Each slot's warm-up must come from ITS OWN
-    //    stage: with one capture in every file, restating slot 1 from slot 0's stage answers the same
-    //    number and the mix-up is invisible. Here the files differ (2000 / 500 / 1000 samples of reach),
-    //    a slot is put to sleep holding one of them, the rate changes, and the wake is compared with a
-    //    player that ran the same sequence at the new rate from the start. Both slot indices take a turn
-    //    at sleeping, because a stage mix-up is invisible on whichever index it maps to itself.
+    //    stage: with one capture in every slot, restating slot 1 from slot 0's stage answers the same
+    //    number and the mix-up is invisible. That is harder to arrange than it sounds — slots follow the
+    //    PARITY of a knot, so on a three-knot dial a sleeping slot 1 always holds the same capture as
+    //    slot 0 (at an end knot both slots carry that knot), and the first version of this group, built
+    //    on `tri`, passed with the mix-up planted. Four knots give each index a middle knot whose silent
+    //    neighbour is a DIFFERENT capture: parked on 120, slot 0 sleeps on "c" beside "b"; parked on 180,
+    //    slot 1 sleeps on "d" beside "c". Each wake is a turn that asks for the same two captures, so it
+    //    wakes the sleeper rather than loading into it — a landing would compute its own warm-up from the
+    //    right stage whatever the restatement did.
     group("P89: each slot's warm-up is restated from ITS OWN capture, not its neighbour's");
     {
-        struct Case { double then; double wake; };
-        const Case parks[] { { -1.0, 200.0 }, { 240.0, 150.0 } };       // the second puts the OTHER slot to sleep
-        bool sleptOn[2] { false, false };
-        for (const auto& c : parks)
-        for (const double to : { 96000.0, 22050.0 }) {
-            const auto drive = [&c](Tri& t, double fs, bool changeTo, double newRate) {
-                t.p.setBlendShape({ 0.5, 0.0 });
-                t.p.setColdAfterSeconds(0.25);
-                t.p.setDial("gain", 150.0);
-                const int rest = (int) std::ceil(0.4 * fs / kBlock);
-                t.run(rest);
-                if (c.then >= 0.0) { t.p.setDial("gain", c.then); t.run(rest); }
-                const int sleeper = t.p.slotCold(0) ? 0 : t.p.slotCold(1) ? 1 : -1;
-                if (changeTo) felitronics::test::run (t.p.prepare(newRate, kBlock, 1));
-                t.p.clearCounters();
-                t.p.setDial("gain", c.wake);
-                t.run((int) std::ceil(0.5 * newRate / kBlock));
-                return std::pair<int, int> { sleeper, t.p.warmBlocks() };
-            };
-            Tri a(tri, delayModel(2000), delayModel(500), delayModel(1000), kFs);
-            const auto got = drive(a, kFs, true, to);
-            Tri b(tri, delayModel(2000), delayModel(500), delayModel(1000), to);
-            const auto want = drive(b, to, false, to);
-            const std::string at = "sleeper " + std::to_string(got.first) + ", 48000 -> " + std::to_string((int) to);
-            if (got.first >= 0) sleptOn[(std::size_t) got.first] = true;
-            ok(got.first >= 0 && got.first == want.first
-                   && a.p.heldFileId(0) != a.p.heldFileId(1),
-               "precondition: the same slot slept in both players, and the two slots hold DIFFERENT captures — " + at);
-            ok(got.second == want.second && got.second > 0,
-               "the woken slot warms for its own capture's field at the new rate (" + std::to_string(got.second)
-               + " blocks against " + std::to_string(want.second) + ") — " + at);
+        namz::rig::Rig quad;
+        {
+            namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+            namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+            gc.values = { "60", "120", "180", "240" }; gc.sweep = 300;
+            st.device.controls = { gc };
+            const char* ids[] { "a", "b", "c", "d" };
+            const char* at[]  { "60", "120", "180", "240" };
+            for (int k = 0; k < 4; ++k) {
+                namz::rig::FileEntry f; f.id = ids[k]; f.settings = { { "gain", at[k] } };
+                st.device.files.push_back(f);
+            }
+            quad.chain = { st };
         }
-        ok(sleptOn[0] && sleptOn[1], "precondition on the PASS: both slot indices took a turn at sleeping");
+        struct Case { double park, wake; int sleeper; const char* asleep; };
+        const Case cases[] { { 120.0, 165.0, 0, "c" }, { 180.0, 220.0, 1, "d" } };
+        // Returns {sleeper, pure wake?, held pair before the wake, warming blocks after it}.
+        struct Out { int sleeper; bool pure; std::string held; int warm; };
+        const auto drive = [&quad](const Case& c, double fs, double to) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "a", bytesOf(delayModel(2000)) }, { "b", bytesOf(delayModel(500)) },
+                { "c", bytesOf(delayModel(1000)) }, { "d", bytesOf(delayModel(1500)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(fs, kBlock, 1));
+            p.load(quad, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            std::vector<float> x((std::size_t) kBlock, 0.1f);
+            float* io[1] { x.data() };
+            const auto run = [&](int n) {
+                for (int k = 0; k < n; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+            };
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setColdAfterSeconds(0.25);
+            p.setDial("gain", c.park);
+            run((int) std::ceil(0.6 * fs / kBlock));
+            Out o;
+            o.sleeper = p.slotCold(0) ? 0 : p.slotCold(1) ? 1 : -1;
+            o.held = p.heldFileId(0) + "|" + p.heldFileId(1);
+            if (to != fs) felitronics::test::run (p.prepare(to, kBlock, 1));
+            const long long loads = p.modelLoads();
+            p.clearCounters();
+            p.setDial("gain", c.wake);
+            run((int) std::ceil(0.5 * to / kBlock));
+            o.pure = p.modelLoads() == loads && p.heldFileId(0) + "|" + p.heldFileId(1) == o.held;
+            o.warm = p.warmBlocks();
+            return o;
+        };
+        for (const auto& c : cases)
+        for (const double to : { 96000.0, 22050.0 }) {
+            const Out got  = drive(c, kFs, to);
+            const Out want = drive(c, to, to);
+            const std::string at = "slot " + std::to_string(c.sleeper) + " asleep on '" + c.asleep + "', held "
+                                 + got.held + ", 48000 -> " + std::to_string((int) to);
+            const auto sleeperHolds = [&](const Out& o) {
+                const auto bar = o.held.find('|');
+                const std::string mine  = c.sleeper == 0 ? o.held.substr(0, bar) : o.held.substr(bar + 1);
+                const std::string other = c.sleeper == 0 ? o.held.substr(bar + 1) : o.held.substr(0, bar);
+                return mine == c.asleep && other != mine;
+            };
+            ok(got.sleeper == c.sleeper && want.sleeper == c.sleeper && sleeperHolds(got) && sleeperHolds(want)
+                   && got.pure && want.pure,
+               "precondition: the intended slot slept on its own capture beside a DIFFERENT one, and the turn"
+               " woke it without loading — " + at);
+            ok(got.warm == want.warm && got.warm > 0,
+               "the woken slot warms for its own capture's field at the new rate (" + std::to_string(got.warm)
+               + " blocks against " + std::to_string(want.warm) + ") — " + at);
+        }
     }
 
     // 3. DELAYS THAT DIFFER PER FILE, with a load IN FLIGHT and with a landing PENDING across the
