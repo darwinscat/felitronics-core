@@ -218,12 +218,10 @@ class ShapeProbe
 public:
     static constexpr int kChunk = Probe::kChunk;
 
-    // THE RATE FLOOR IS THE PROBE'S (P51), checked here and not in WaveformPeaks, which mirrors a page's JavaScript
-    // and only derives a decimation from the rate. Nothing below it is unstable in these two reductions; it is
-    // refused so that one ABI gives one answer about a rate — `fc_probe_shapes_run` was the only run entry that took
-    // 44.1. ONLY the floor: the shapes keep no ceiling of their own (WaveformPeaks refuses only a decimation past an
-    // int), so a rate above Probe::kMaxSampleRate that Probe refuses is still drawn — a difference that predates P51
-    // and is not its to close.
+    // THE RATE RANGE IS THE PROBE'S (the floor since P51, the ceiling since P104), checked here and not in
+    // WaveformPeaks, which mirrors a page's JavaScript and only derives a decimation from the rate. Nothing outside it
+    // is unstable in these two reductions; it is refused so that one ABI gives one answer about a rate —
+    // `fc_probe_shapes_run` was the only run entry that took 44.1, and the only one that drew 1 MHz.
     // And a refusal RESETS THE PARTS (law 11b): `peaks()` and `stereo()` are public, and a refused call must not leave
     // them on the previous file — not their flags and not their data. Asking a part for zero channels would only clear
     // its flag (the diff-pass round: the old peaks, frame count, columns and RMS stayed readable), so each part is
@@ -232,7 +230,7 @@ public:
                   felitronics::analysis::PeakMix mix, int columns)
     {
         prepared_ = false;
-        if (! (sampleRate >= Probe::kMinSampleRate)                             // NaN fails too
+        if (! (sampleRate >= Probe::kMinSampleRate && sampleRate <= Probe::kMaxSampleRate)   // NaN fails too
             || channels < 1 || channels > felitronics::core::kMaxChannels
             || ! peaks_.prepare (sampleRate, channels, frames, buckets, mix)
             || ! stereo_.prepare (channels, frames, columns))

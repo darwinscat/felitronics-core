@@ -2792,16 +2792,24 @@ static void testLraRefusesAPoisonedProgramme()
 // MUTATIONS KILLED: the floor removed; `>` for `>=`; 1000 for 8000; the budget's own copy of the test left at `> 0`.
 static void testTheRateFloor()
 {
-    test::group ("P51: the search refuses a rate below 8000 Hz, and every budget says so");
+    test::group ("P51 / P104: the search refuses a rate outside 8000 Hz .. 3 MHz, and every budget says so");
 
     test::ok (TargetLoudnessSolver::kMinSampleRate == 8000.0, "the floor is 8000 Hz — a literal pin");
+    test::ok (TargetLoudnessSolver::kMaxSampleRate == 3.0e6 && TargetLoudnessSolver::kMaxSampleRate == MasteringChain::kMaxSampleRate,
+              "the ceiling is 3 MHz, the chain's — a literal pin");
     const double lo = TargetLoudnessSolver::kMinSampleRate;
+    const double hi = TargetLoudnessSolver::kMaxSampleRate;
     const double inf = std::numeric_limits<double>::infinity();
     struct Row { double fs; bool want; const char* what; };
     const Row rows[] {
         { lo,                         true,  "8000 Hz, the floor itself" },
         { std::nextafter (lo, 1.0e9), true,  "one ulp over the floor" },
         { 48000.0,                    true,  "48 kHz" },
+        { hi,                         true,  "3 MHz, the ceiling itself" },
+        { std::nextafter (hi, 0.0),   true,  "one ulp under the ceiling" },
+        { std::nextafter (hi, 1.0e9), false, "one ulp over the ceiling (P104: accepted before, with a budget)" },
+        { 1.0e300,                    false, "1e300 Hz (P104: accepted before, with a zero budget)" },
+        { std::numeric_limits<double>::max(), false, "the largest double" },
         { std::nextafter (lo, 0.0),   false, "one ulp under the floor" },
         { 7999.0,                     false, "7999 Hz" },
         { 3363.0,                     false, "3363 Hz, where the shelf is just past Nyquist" },
@@ -2824,9 +2832,9 @@ static void testTheRateFloor()
         test::ok (got == r.want, std::string (r.want ? "accepted: " : "refused: ") + r.what);
         test::ok (solver.isPrepared() == r.want && (r.want ? solver.sampleRate() == r.fs : solver.sampleRate() == 0.0),
                   std::string ("and a refusal disarms — no 48 kHz build left standing: ") + r.what);
-        // THE BUDGETS SHARE THE VERDICT. 240 x 8000 frames — four minutes at the floor, 40 s at 48 kHz — so the range
+        // THE BUDGETS SHARE THE VERDICT. 12 million frames — 25 minutes at the floor, 4 s at the ceiling — so the range
         // is measurable at every accepted rate.
-        const int frames = 240 * 8000;
+        const int frames = 12'000'000;
         test::ok ((TargetLoudnessSolver::solveBytes (r.fs, 2, frames) > 0u) == r.want,
                   std::string ("solveBytes is 0 exactly where prepare() refuses: ") + r.what);
         test::ok ((TargetLoudnessSolver::measureRangeBytes (r.fs, frames) > 0u) == r.want,

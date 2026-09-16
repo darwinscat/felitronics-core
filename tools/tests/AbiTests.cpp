@@ -269,7 +269,8 @@ int main()
         // P51 / LAW 11b: a refusal disarms the PARTS too — `peaks()` and `stereo()` are public. On origin/main a NaN
         // rate reached WaveformPeaks and disarmed it; the rate floor now refuses first, so the probe does it itself —
         // and for the width refusal, which never reached the parts at all.
-        for (const auto& bad : { std::pair<double, int> { 7999.0, 1 }, { 44.1, 1 }, { std::nan (""), 1 }, { 8000.0, 0 } })
+        for (const auto& bad : { std::pair<double, int> { 7999.0, 1 }, { 44.1, 1 }, { std::nan (""), 1 }, { 1.0e6, 1 },
+                                 { 8000.0, 0 } })
         {
             fcore::ShapeProbe q;
             test::ok (q.prepare (8000.0, 1, n, 1, analysis::PeakMix::Left, 1) && q.process (view, 1, (long long) n)
@@ -318,15 +319,22 @@ int main()
         test::ok (fc_probe_shapes_run (buf.data(), n, 2, std::nextafter (8000.0, 0.0), 1000, 0, 1100) == 0
                && fc_probe_shapes_run (buf.data(), n, 2, 7999.0, 1000, 0, 1100) == 0, "one ulp under 8000 Hz, and 7999, are refused");
         test::ok (fc_probe_shapes_run (buf.data(), n, 2, 8000.0, 1000, 0, 1100) == 1, "8000 Hz itself is drawn");
+        test::ok (fc_probe_shapes_run (buf.data(), n, 2, 768000.0, 1000, 0, 1100) == 1
+               && fc_probe_shapes_run (buf.data(), n, 2, std::nextafter (768000.0, 1.0e9), 1000, 0, 1100) == 0
+               && fc_probe_shapes_run (buf.data(), n, 2, std::numeric_limits<double>::infinity(), 1000, 0, 1100) == 0,
+                  "P104: 768 kHz is drawn, one ulp over it and +inf are refused");
         {
             fcore::ShapeProbe fl;
             test::ok (! fl.prepare (std::nextafter (8000.0, 0.0), 1, n, 1, analysis::PeakMix::Left, 1)
                       && fl.prepare (8000.0, 1, n, 1, analysis::PeakMix::Left, 1),
                       "fcore::ShapeProbe says the same about the boundary");
-            // ONLY the floor moved: the shapes keep no ceiling of their own, so a rate Probe refuses above 768 kHz
-            // is still drawn. Stated so a later change makes it a decision rather than an accident.
-            test::ok (fl.prepare (1.0e6, 1, n, 1, analysis::PeakMix::Left, 1),
-                      "and above Probe's 768 kHz ceiling the shapes still draw (a difference that predates P51)");
+            // P104 — AND THE CEILING IS THE PROBE'S: before it the shapes kept none, and drew 1 MHz while Probe
+            // refused it.
+            test::ok (fcore::Probe::kMaxSampleRate == 768000.0, "the probe's ceiling is 768 kHz — a literal pin");
+            test::ok (fl.prepare (768000.0, 1, n, 1, analysis::PeakMix::Left, 1)
+                      && ! fl.prepare (std::nextafter (768000.0, 1.0e9), 1, n, 1, analysis::PeakMix::Left, 1)
+                      && ! fl.prepare (1.0e6, 1, n, 1, analysis::PeakMix::Left, 1),
+                      "768 kHz is drawn; one ulp over it and 1 MHz are refused, as Probe refuses them");
         }
 
         test::ok (fc_probe_shapes_run (buf.data(), n, 2, sr, 1000, 0, 1100) == 1, "a good run again");
