@@ -86,7 +86,7 @@
 // above `kUnreadShapeCeiling`): WHAT THIS FILE PLACES, IT TRUSTS; FOR WHAT IT CANNOT PLACE — AN UNREAD
 // CONFIG, A REFUSED VALUE, A READING IT SETS ASIDE — IT CHARGES ONE ALLOWANCE, NEVER THE FACE VALUE AND
 // NEVER NOTHING. The review rounds that shaped it measured both failures of the simpler rules: face
-// value turned a few dead bytes into a 32-minute `reset()`, and an allowance charged per node turned a
+// value turned a few dead bytes into a half-hour `reset()`, and an allowance charged per node turned a
 // 1.6 MB file into INT_MAX.
 
 #include <nlohmann/json.hpp>
@@ -350,22 +350,36 @@ inline const nlohmann::json* conditionerOf (const nlohmann::json& cfg)
 // WHY ONCE, AND WHY ADDED RATHER THAN MAXED — each is the answer to a measured failure of the other.
 //   A floor at EVERY node that carried an unplaced child made the allowance ADDITIVE across siblings:
 //   a 30-byte dead `{"layers":[],"m":{"layers":[]}}` cost a full 48 000 each, so 50 000 of them — a
-//   1.6 MB file NAM loads in microseconds — drained INT_MAX, which is some 28 minutes per lane of a
+//   1.6 MB file NAM loads in microseconds — drained INT_MAX, which is about half an hour per lane of a
 //   real Standard inside `reset()`. Ignorance of N things is one ignorance, not N.
 //   A floor as a MAX at the root lets a large known part SWALLOW the allowance: a read stack of
 //   100 000 in series with an unreadable stage answers 100 000, i.e. the unknown stage is charged
 //   ZERO — the one answer the rule forbids. Added, it is 148 000.
 //
-// WHY NOT FACE VALUE. An unplaced or discarded number may be DEAD — NAM never builds it — and a dead
+// WHY NOT FACE VALUE. An unplaced or set-aside number may be DEAD — NAM never builds it — and a dead
 // number is not bounded by anything: `"receptive_field": 2147483647` beside a real Standard's stack is
-// a file NAM loads unchanged, and trusting it made `reset()` spend some 32 minutes per lane. NAM
+// a file NAM loads unchanged, and trusting it made `reset()` spend about half an hour per lane. NAM
 // allocates a LIVE stack of that length and refuses the load; a dead one costs NAM nothing. This file
-// cannot tell the two apart without restating NAM's dispatch (rule 9u), so it trusts neither — which
-// has a stated price: a LIVE model hidden in an unplaced node, whose field is longer than the
-// allowance, is under-drained by the difference. The longest field of any real capture is 6347.
-// (What this rule does NOT close is the same door where it already stood: two of this file's lower
-// readers that both read a number are MAXED, as P87 ratified, so a dead `dilations:[2e9]` beside a
-// `Linear`'s declared field still drains two billion samples. That is registered, not changed here.)
+// cannot tell the two apart without restating NAM's dispatch (rule 9u), so it trusts neither.
+//
+// 🔴 AND THE RULE HAS TWO DOORS, BOTH MEASURED, AND NEITHER CAN BE SHUT WITHOUT OPENING THE OTHER.
+// (A differential fuzz of 2 000 loadable configs against NAM found no short answer outside these and
+// the recurrent exception; these are what it found.)
+//   D1 — a LIVE memory this file cannot place is charged the allowance, so one LONGER than the allowance
+//     drains short by the difference: a wrapped model whose inner field is 60 000 drains 50 048 (the
+//     row that measures it leaked 9 952 samples); a 60 001-tap `Linear` carrying a dead readable
+//     `layers` array has its declared field SET ASIDE for the stack and drains 50 050. The longest field
+//     of any real capture is 6347.
+//   D2 — a DEAD number this file PLACES is trusted at face value, as it was before this rule: a lower
+//     reading with no stack beside it (the two lower readings are maxed, as P87 ratified — a dead
+//     `dilations:[2e9]` beside a `Linear`'s declared field), the wrapped form's own decoy stack (its
+//     top-level `layers` are placed, and NAM builds from `config.model` instead — a decoy spelling
+//     `dilations:[2000000]` drains two million samples), a `layers` array on an architecture that never
+//     reads it. Base answered the same numbers for all of them.
+// Treating EVERY uncertain config as unplaceable (dropping its own reading too) shuts D2 and widens D1
+// to a live stack that merely has a dead sibling; trusting face value shuts D1 and reopens the
+// half-hour `reset()` on 30 dead bytes. Which door stays open is a policy decision, and it is
+// registered as one.
 //
 // THE NUMBER. 48 000 samples, a POLICY constant: 7.6x the longest field any real capture has
 // (A2.nam's 6347), one second at 48 kHz and a quarter of one at 192 kHz — which in TIME is still 1.9x
@@ -565,8 +579,9 @@ inline int partitionedTailSamples (const nlohmann::json& model)
     // (`carriesAllowance`) rather than from a second one that tries to agree with it. The ring is ADDED
     // to the field (`NamStage.cpp:543`, `field + drainTail_`), so the allowance does not cover it, and a
     // node this file could not place may be a `Linear` whose architecture nobody can see. 2048 samples is
-    // about 1.8 ms of a real Standard's inference; a first draft that asked a separate scan here diverged
-    // from the field twice (a submodel's unplaced node; the far side of a guard).
+    // under 2 ms of a real Standard's inference (1.6 ms at a 256 block, 1.8 at 64); a first draft that
+    // asked a separate scan here diverged from the field twice (a submodel's unplaced node; the far side
+    // of a guard).
     return (isLinearArchitecture (model) || anyNestedModel (model, isLinearArchitecture)
             || carriesAllowance (model)) ? 2 * 1024 : 0;
 }
@@ -687,7 +702,7 @@ inline long long placedField (const nlohmann::json& cfg, bool& unknown)
     // the defect: a 5000-tap `Linear` carrying a readable stray `layers` array answered 2 for an impulse
     // reaching 4999, on a loaded model. Trusting the larger instead (a max) closed that and opened a
     // worse door: `"receptive_field": 2147483647` beside a real Standard's stack loads unchanged, and
-    // `reset()` then ran for some 32 minutes per lane. So a discarded reading is neither: it is a thing
+    // `reset()` then ran for about half an hour per lane. So a discarded reading is neither: it is a thing
     // this file could not place, and it costs the allowance. The two LOWER readings are maxed against
     // each other as P87 ratified — a chain there let the ConvNet reader silence the declared one.
     bool refused = false;

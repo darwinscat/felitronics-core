@@ -431,14 +431,15 @@ the CPU at runtime, invisible to any build. Full write-up:
    (a declared field beside a stack) — and each adds `kUnreadShapeCeiling` = 48 000 samples ONCE per
    tree to what the ledger did read. Once, because an allowance per node turned a 1.6 MB file into an
    INT_MAX drain; added, because a max let a large known part swallow the unknown's share; and never
-   the face value, because a dead number costs NAM nothing and was spent here as a 32-minute `reset()`.
+   the face value, because a dead number costs NAM nothing and was spent here as a half-hour `reset()`.
    The price is measured through `reset()`: 39.7 ms per lane on the most expensive real capture
    rewrapped (256 block, 48 kHz). It fires on none of the author's 1229 distinct captures. What it does
-   NOT close is stated with it: a live model hidden where the ledger cannot see it, longer than the
-   allowance, drains short by the difference; the two lower readings are still maxed as P87 ratified,
-   so a dead `dilations:[2e9]` beside a `Linear`'s declared field still drains two billion samples; and
-   NAM's own recursive copy of the config takes the host down on a deep enough file (about 2 000 levels,
-   134 KB, on a 512 KiB thread) before the ledger runs at all.
+   NOT close is stated with it, as two doors of which shutting either opens the other: a LIVE memory the
+   ledger cannot place, longer than the allowance, drains short by the difference; and a DEAD number the
+   ledger PLACES (a lower reading with no stack, the wrapped form's own decoy stack) is trusted at face
+   value, as before — which door stays open is a registered policy question. Separately, NAM's own
+   recursive copy of the config takes the host down on a deep enough file (about 2 000 levels, 134 KB,
+   on a 512 KiB thread) before the ledger runs at all.
 
    **AND `prepare()` PERFORMS THAT RESTART TOO, ALWAYS — THE TWO VERBS NAME ONE STATE.** A prepared stage
    holds no audio the caller fed, on any rate, on any shape, and whether or not the rate or the block

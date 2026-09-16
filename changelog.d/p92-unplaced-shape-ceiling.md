@@ -25,7 +25,7 @@ coming out of silence. It now answers what it read, plus one named allowance.
   allowance per node turned a 1.6 MB file of 30-byte dead siblings into an **INT_MAX** drain; a max at the
   root let a known 100 001-sample stack swallow the allowance of an unreadable stage in series with it;
   and trusting the face value of a dead `"receptive_field": 2147483647` beside a real Standard's stack —
-  a file NAM loads unchanged — made `reset()` run for **some 32 minutes per lane**.
+  a file NAM loads unchanged — made `reset()` run for **about half an hour per lane** (2³¹ samples at 0.79–0.89 µs each).
 - **The price, measured through `NamStage::reset()`** on real captures rewrapped, per lane at 48 kHz:
   **39.7 ms** on `wavenet_a1_standard` at a 256 block (44.5 ms at 64), **24.1 ms** on A2's submodel,
   **4.5 ms** on the slimmable itself. On shapes that ship: identity.
@@ -34,11 +34,16 @@ coming out of silence. It now answers what it read, plus one named allowance.
   `4294967396`, a string) from "absent" to the allowance. **Closed on the way:** a 5000-tap `Linear`
   carrying a readable stray `layers` array answered 2 (reach 4999; now 48 002), and a `ConvNet` carrying a
   non-empty dead `layers` array answered 0 (NAM: 256; now 256).
-- **What it does not close, stated rather than hidden:** a LIVE model hidden where the registry cannot
-  see it, with a field longer than the allowance, drains short by the difference (the longest real field
-  is 6347); a dead `dilations:[2e9]` beside a `Linear`'s declared field still drains two billion samples,
-  as it did before (the two lower readings stay maxed, as P87 ratified); and NAM's own recursive copy of
-  the config takes the host down on a file about 2 000 levels deep before the registry runs. The only new
-  recursion — looking for an architecture through unplaced nodes — is bounded at 32 unplaced hops; the
-  nesting the registry already walked is read exactly as before, and a guard on it was measured to drain
-  a 65-deep conditioner chain short.
+- **What it does not close, stated rather than hidden — two doors, and shutting either opens the other.**
+  A LIVE memory the registry cannot place and that is LONGER than the allowance drains short by the
+  difference (a wrapped model with an inner field of 60 000; a 60 001-tap `Linear` whose declared field is
+  set aside beside a dead `layers` array) — the longest real field is 6347. And a DEAD number the registry
+  PLACES is still trusted at face value, exactly as before: a lower reading with no stack beside it (a dead
+  `dilations:[2e9]` beside a `Linear`'s declared field), the wrapped form's own decoy stack, a `layers`
+  array on an architecture that never reads it. Which door stays open is registered as a policy question.
+  A differential fuzz of 2 000 loadable configs against NAM found no short answer outside these two and
+  the recurrent exception. Separately, NAM's own recursive copy of the config takes the host down on a
+  file about 2 000 levels deep before the registry runs. The only new recursion — looking for an
+  architecture through unplaced nodes — is bounded at 32 unplaced hops; the nesting the registry already
+  walked is read exactly as before, and a guard on it was measured to drain a 65-deep conditioner chain
+  short.

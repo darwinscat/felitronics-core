@@ -209,7 +209,7 @@ int main() {
         // COSTS THE ALLOWANCE (P92, moved on purpose; this row asserted 9). The stack describes what a
         // WaveNet does, and a declared number beside it may be dead; trusting it at face value (a max)
         // was measured to be a door: `receptive_field: 2147483647` beside a real Standard's stack loads
-        // unchanged and made `reset()` run for some 32 minutes per lane. Ignoring it (the old chain) was
+        // unchanged and made `reset()` run for about half an hour per lane. Ignoring it (the old chain) was
         // the other door, the row below. So a reading set aside is a thing this file could not place.
         nlohmann::json both = wavenet({ 3 }, { 4 });
         both["config"]["receptive_field"] = 99999;
@@ -735,6 +735,25 @@ int main() {
             ok(receptiveFieldFromConfig(wrapped(deep)) == 48000,
                "a wrapped stack of 100 001 is charged the allowance, not its face value — the price of a"
                " rule that a dead key cannot inflate: " + std::to_string(receptiveFieldFromConfig(wrapped(deep))));
+            // …and the same price on the other path the rule does not trust: a declared field SET ASIDE
+            // beside a (dead) stack. A 60 001-tap Linear with a readable stray `layers` array drains the
+            // stack's 2 plus the allowance — short of its 60 000 by 9 950, measured (door D1).
+            nlohmann::json setAside = linear(60001);
+            setAside["config"]["layers"] = nlohmann::json::array({
+                { { "kernel_size", 2 }, { "dilations", nlohmann::json::array({ 1 }) } } });
+            ok(receptiveFieldFromConfig(setAside) == 2 + 48000,
+               "a declared field longer than the allowance, set aside beside a stack, is charged the allowance"
+               " (door D1, registered): " + std::to_string(receptiveFieldFromConfig(setAside)));
+            // 🔴 AND THE OTHER DOOR (D2), pinned so that changing the policy moves this row on purpose: a
+            // DEAD number the file PLACES is trusted at face value, as base did. The wrapped form's decoy
+            // `layers` are placed — NAM builds from `config.model` — so a decoy spelling a two-million
+            // dilation drains two million samples, plus the allowance for the unplaced config beside it.
+            nlohmann::json decoy = wrapped(realSlimmableConfig());
+            decoy["config"]["layers"][0]["kernel_size"] = 2;
+            decoy["config"]["layers"][0]["dilations"] = nlohmann::json::array({ 2000000 });
+            ok(receptiveFieldFromConfig(decoy) == 2000001 + 48000,
+               "a dead decoy stack in the wrapped form is placed and trusted (door D2, registered — base"
+               " answered 2 000 001): " + std::to_string(receptiveFieldFromConfig(decoy)));
             nlohmann::json deadHuge = wavenet({ 2 }, { 100 });
             deadHuge["config"]["notes"] = { { "receptive_field", 2147483647 } };
             ok(receptiveFieldFromConfig(deadHuge) == 101 + 48000,
