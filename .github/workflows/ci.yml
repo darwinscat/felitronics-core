@@ -102,22 +102,48 @@ jobs:
           echo "building with -j ${n:-4}"
           cmake --build build --config Release -j "${n:-4}"   # --config: required by multi-config gens (VS)
       - name: Test
-        # The perf-shaped suites run VERBOSE first, then everything runs normally. Two lines, and they
-        # exist because `--output-on-failure` prints a test's stdout only when it FAILS — so every gate
+        # The perf-shaped suites run VERBOSE and ALONE first, then everything else runs in parallel.
+        #
+        # Verbose, because `--output-on-failure` prints a test's stdout only when it FAILS — so every gate
         # that compares timings is invisible in a green run, and you cannot tell a gate from an ornament.
         # That bit twice in one day: when the new arm64 row went red nobody could see what ratio it had
         # measured, and when the pane gate was repaired nobody could see whether it now passed by 2.2x or
         # by 1.02x. Same red on a real failure (the verbose run fails first and prints everything); on a
         # green run, the numbers are in the log. `-R` matching nothing exits 0, so the pffft=OFF rows just
         # skip that one. Costs ~3 s.
+        #
+        # Alone, because a timing means something only on a machine doing nothing else. Everything else in
+        # parallel, because it used to run one test at a time on machines with 4 and 24 cores: measured on
+        # #206, this step took 4.1-5.0 min on the 24-core studio and 4.3-6.1 min on the 4-core hosted rows,
+        # while the longest single test is 31-60 s. The ASan and wasm rows have always run the whole suite
+        # with -j, so the suite already tolerates it. The timing suites stay out of the parallel line: they
+        # have run, and there they would measure their neighbours.
+        #
+        # An empty selection is refused by COUNTING it, once, rather than per line: a selection can be
+        # nothing but a timing suite (a pull request touching only fftpffft), which the first line runs and
+        # the second then rightly finds empty. A row built WITHOUT an option is different: for a pull request
+        # that touches only nam, rigplayer or fftpffft it has nothing to run, and that is a skip, not a red
+        # (before, --no-tests=error failed four rows on it). A row with every option ON still refuses zero —
+        # there the same filter must match, so zero means the filter is broken.
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
+          ALL_OPTIONS: ${{ matrix.pffft == 'ON' && matrix.nam == 'ON' }}
         shell: bash
         run: |
-          ctest --test-dir build -C Release -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
-          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
-          ctest --test-dir build -C Release --output-on-failure "${SEL[@]}"   # -C likewise (no-op on single-config)
+          PERF='^(felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests)$'
+          ctest --test-dir build -C Release -V -R "$PERF"
+          SEL=()
+          if [ "$SCOPE_MODE" = selected ]; then
+            SEL=(-R "$SCOPE_REGEX")
+            found=$(ctest --test-dir build -C Release -N "${SEL[@]}" | tr -d '\r' | sed -n 's/^Total Tests: *//p')
+            if [ "$found" = 0 ] && [ "$ALL_OPTIONS" != true ]; then
+              echo "none of the selected tests is built with pffft=${{ matrix.pffft }} nam=${{ matrix.nam }} - nothing to run here"; exit 0
+            fi
+            [ "$found" -gt 0 ] || { echo "::error::the selection matched no test here (found: '$found')"; exit 1; }
+          fi
+          n=$( (getconf _NPROCESSORS_ONLN || nproc || sysctl -n hw.ncpu) 2>/dev/null | head -1 )
+          ctest --test-dir build -C Release -j "${n:-4}" --output-on-failure -E "$PERF" "${SEL[@]}"   # -C: no-op on single-config
 
   # Dedicated ASan + UBSan job. UBSan makes platform-divergent UB LOUD on x86-64 (integer /0, signed
   # overflow, OOB shift, null store) that is SILENT on the dev machine (Apple-Silicon ARM64) — the exact
@@ -193,10 +219,18 @@ jobs:
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
+        # The same two lines as build-test, and for the same reasons: timing suites verbose and alone, the rest
+        # in parallel, an empty selection refused by counting it.
         run: |
-          ctest --test-dir build-gcc14 -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
-          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
-          ctest --test-dir build-gcc14 --output-on-failure "${SEL[@]}"
+          PERF='^(felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests)$'
+          ctest --test-dir build-gcc14 -V -R "$PERF"
+          SEL=()
+          if [ "$SCOPE_MODE" = selected ]; then
+            SEL=(-R "$SCOPE_REGEX")
+            found=$(ctest --test-dir build-gcc14 -N "${SEL[@]}" | sed -n 's/^Total Tests: *//p')
+            [ "$found" -gt 0 ] || { echo "::error::the selection matched no test here (found: '$found')"; exit 1; }
+          fi
+          ctest --test-dir build-gcc14 -j "$(nproc)" --output-on-failure -E "$PERF" "${SEL[@]}"
 
   # wasm-audio — the tier DSP-ARCHITECTURE.md §2 declares, GATED here instead of aspirational. Builds every
   # default module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole suite in node, and
@@ -266,16 +300,24 @@ jobs:
           echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
           echo "PATH=$PATH"   >> "$GITHUB_ENV"
       - name: Configure + build the tier
-        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio
+        # -j on the command line, not the preset's `"jobs": 0`: that means the native tool's default, and for
+        # the Makefiles this tier gets it is a BARE -j — unlimited. Measured on the v0.35.0 release run: all 137
+        # objects started compiling within 5 s, 90 of them within the first second; on deb, during the same
+        # step of the main run after it, the runner's user held 16.9 GB resident at load average 80 on 20
+        # threads.
+        run: cmake --preset wasm-audio && cmake --build --preset wasm-audio -j "$(nproc)"
       - name: Run the suite in node
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
         # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
         # code, and it already runs natively in build-test. Without it the suite can use every core.
+        # No --no-tests=error: this tier builds neither nam, rigplayer nor fftpffft, so a pull request touching
+        # only those selects nothing that exists here, and that is not a failure. The empty-FILTER guard lives
+        # where the same selection must match: the build-test rows with every option ON.
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
         run: |
-          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
+          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX"); fi
           ctest --preset wasm-audio -j "$(nproc)" -E spectrum_pane_perf "${SEL[@]}"
       - name: No threads — audited on EVERY emitted .wasm, not one sample
         run: node tools/wasm/check-no-threads.mjs --all build-wasm-audio
@@ -489,7 +531,12 @@ jobs:
           # All cores: the one test that must not share the machine — the wall-clock gate — is excluded right
           # here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is checked,
           # which makes this the slowest test run in the workflow; capping it at 4 left deb three-quarters idle.
-          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E spectrum_pane_perf
+          # Also excluded: the three exhaustive sweeps (two mastering, one clip detector). Under SAFE_HEAP they are the whole tail of this
+          # step — measured on deb, each alone on a core for over four minutes while the other eighteen sat idle,
+          # because one test cannot be split by -j. They add nothing here: the same sweeps already ran in this
+          # workflow, for their numbers in the release wasm suite and for memory safety natively under ASan,
+          # which is the stronger instrument.
+          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E 'spectrum_pane_perf|delivered_ceiling|loudness_solver|clip_detector'
       - name: The P0 spike artifacts still build
         if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         run: ./tools/wasm/build.sh
