@@ -89,8 +89,9 @@ struct TruePeakLimiterConfig
     int    tapsPerPhase     = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // ≥ 4
     // Which oversampler (P31). Kaiser — PolyphaseOversampler, the default. Cascade — CascadeOversampler:
     // flat to 20 kHz at every rate, a power-of-two factor only, a longer round trip (131 samples at
-    // 44.1 kHz 4x). `tapsPerPhase` is range-checked under both and used only by Kaiser. What the cascade
-    // changes about the ceiling is stated under WHAT IT DOES NOT PROMISE, below.
+    // 44.1 kHz 4x). `tapsPerPhase` is range-checked under both and used only by Kaiser. The cascade also
+    // narrows the accepted rates to [1 kHz, 3 MHz]; Kaiser goes as low as 20 ms still holds two samples.
+    // What the cascade changes about the ceiling is stated under WHAT IT DOES NOT PROMISE, below.
     oversampling::Topology topology = oversampling::Topology::Kaiser;
 };
 

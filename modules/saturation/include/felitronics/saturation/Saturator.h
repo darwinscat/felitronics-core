@@ -42,7 +42,8 @@ namespace felitronics::saturation
 // CascadeOversampler — just as strict, flat to 20 kHz at every rate, lengths from the sample rate, round
 // trip 131 samples at 44.1 kHz and 76 at 48 kHz (4x). The dry path is delayed by whichever round trip was
 // built, so a mix < 1 stays comb-free under both. Under Cascade `tapsPerPhase` is range-checked and
-// otherwise unused.
+// otherwise unused, and the RATE is binding: the cascade designs itself from it and refuses one outside
+// [1 kHz, 3 MHz] — a window the Kaiser stage, which never looked at the rate, does not have.
 //
 // Poison-hardened: non-finite params fall back to defaults (applyParams), each input sample is
 // sanitized at the gate (NaN/Inf → 0, huge finite → ±1e6 clamp) so one bad sample can't lodge in the

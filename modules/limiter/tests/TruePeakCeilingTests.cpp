@@ -473,6 +473,10 @@ static void runCascadeTopology()
         test::ok (lim.latencySamples() == 0, "...and a refused prepare leaves the limiter unprepared, as it always did");
         limiter::TruePeakLimiterConfig kodd = odd; kodd.topology = Topology::Kaiser;
         test::ok (lim.prepare (44100.0, 512, 2, kodd), "while Kaiser at 3x still prepares — the default's refusal set is unchanged");
+        limiter::TruePeakLimiterConfig k500 = cfg; k500.topology = Topology::Kaiser;
+        test::ok (! lim.prepare (500.0, 512, 2, cfg) && ! limiter::TruePeakLimiter::storageFor (500.0, 512, 2, cfg, st)
+                  && limiter::TruePeakLimiter::latencyFor (500.0, 512, 2, cfg) == 0 && lim.prepare (500.0, 512, 2, k500),
+                  "500 Hz: refused under the cascade (its rate window starts at 1 kHz), accepted under Kaiser as before");
 
         // 20 kHz below the ceiling passes as itself under the cascade; the Kaiser round trip takes 15.5 dB.
         auto level20k = [&] (Topology topo)

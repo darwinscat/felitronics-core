@@ -12,8 +12,9 @@ design is therefore **strict** — the transition must finish below fs/2.
 - **`oversampling::CascadeOversampler`** keeps the guard and moves the band edge: a Kaiser 2x stage whose
   length and cutoff follow from the sample rate by a measured rule, then halfband 2x stages. Images and
   aliases of anything below fs/2 at **−91 dB or lower**, one pass within **0.0043 dB** up to 20 kHz, over
-  14 rates from 8 kHz to 768 kHz and factors 2–16. Powers of two only; refuses (law 11b) what it cannot
-  build.
+  14 rates from 8 kHz to 768 kHz and factors 2–64 — and **−90.9 dB / 0.0049 dB over every one of the 110
+  first-stage lengths the rule can produce**. Powers of two only, rates 1 kHz–3 MHz; refuses (law 11b)
+  what it cannot build.
 - **The price is latency, not CPU**: **131 base samples at 44.1 kHz 4x** (63 for the Kaiser stage) for
   about the same multiply count; **76 at 48 kHz, 28 at 88.2 kHz**, where it is also cheaper than the
   Kaiser stage.
@@ -28,8 +29,11 @@ design is therefore **strict** — the transition must finish below fs/2.
   `Saturator::prepare`, `TruePeakLimiterConfig::topology` and `PowerAmpStage::prepare` take it; **the
   default is `Kaiser` everywhere, and under it nothing changes** — same refusals, same latency, same bits
   (the whole suite passes unchanged). Under `Cascade`: `tapsPerPhase` is still range-checked and
-  otherwise unused; the Saturator's dry path is delayed by the cascade's round trip; `PowerAmpStage`
-  rounds the factor down to a power of two and clamps the design rate, as it clamps everything.
+  otherwise unused; the rate becomes binding (a Saturator or limiter at 500 Hz is refused under the
+  cascade, accepted under Kaiser); the Saturator's dry path is delayed by the cascade's round trip;
+  `PowerAmpStage` rounds the factor down to a power of two and clamps the design rate, as it clamps
+  everything, and under the cascade its 4x and 32x are no longer sample-aligned (76 and 80 at 48 kHz).
+- **The switch costs the default 32 bytes per stage** (the cascade is heap-held, only when chosen).
 - **The limiter's ceiling under the cascade**, measured with the ceiling suite's own witnesses: at
   44.1 kHz 4fs/9 is now delivered flat, so the grid allowance at 8x rises from 0.108 to **0.133 dB**
   (16x: 0.027 → 0.033); the 1.15 dB modulation envelope holds (worst 1.344 dB at 2x, inside 2.399), and at

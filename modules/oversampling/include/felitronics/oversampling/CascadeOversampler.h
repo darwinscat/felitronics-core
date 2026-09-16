@@ -39,8 +39,9 @@ namespace felitronics::oversampling
 // Stage 1 is NOT a halfband, and cannot be: a halfband's transition is centred ON its quarter rate (for
 // stage 1 that is fs/2 itself), since H(f) + H(Fs/2 - f) = 1 makes its image rejection at fs - a equal to
 // its pass-band deviation at a. A pair of halfbands (79 + 23 taps) that loses 0.41 dB at 20 kHz leaves
-// that tone's image at -32.5 dB; through a waveshaper at +6 dB of drive that is -34 dBc of aliasing
-// against -141 for the strict design (P31 findings, the stand's T1).
+// that tone's image at -32.5 dB (both pinned in OversamplingTests, "the cutoff axis"). What that costs
+// through a waveshaper was measured by the P31 design stand, not by the suite: -34 dBc of aliasing at
+// +6 dB of drive, against -141 for the fixed-cutoff design.
 //
 // THE DESIGN RULE, computed in designFor() from the sample rate and nothing else:
 //   * band edge fp = 20 kHz, or 20/44.1 of fs below 44.1 kHz (so every rate up to 44.1 kHz gets the
@@ -51,18 +52,23 @@ namespace felitronics::oversampling
 //     fs/t: one pass is within 0.005 dB at (kPassA0 + kPassA1/t) below the cutoff, and |H| stays under
 //     -90 dB from (kStopB0 + kStopB1/t) above it, for every t from 12 to 240 (the fitted bounds sit above
 //     the measured distances at every point). So the stop edge lands just under fs/2 and 20 kHz is flat.
+//     The constants come from the P31 design stand; what the suite pins is their OUTCOME, at every one of
+//     the 110 taps counts the rule can produce.
 //   * beta is 9.5, not the 9 of PolyphaseOversampler, and the reason is the RULE: a beta-9 window's floor
 //     ripples around -90 dB itself (that header's "59 taps is worse than 58"), so the -90 point jumps
-//     between sidelobes as t moves (measured 2.87 .. 3.64 fs/t) and no smooth rule can place it. At 9.5
-//     the floor is ~-94.6 and the -90 point sits on the skirt (3.01 .. 3.13 fs/t). It costs ~4 % of taps.
+//     between sidelobes as t moves (the stand read it wandering between about 2.9 and 3.6 fs/t) and no
+//     smooth rule can place it. At 9.5 the floor is ~-94.6 and the -90 point sits on the skirt (3.01 to
+//     3.13 fs/t on the same stand). It costs ~4 % of taps.
 //   * halfband lengths by stage: 27, 23, 23, 15, 15 (beta 9.5) — the shortest that keep the cascade at the
 //     stage-1 floor (a shorter one at stage 2, 23 taps, reads -80.5).
 //   * decimation phases are chosen so that the round trip is an INTEGER number of base samples and the
 //     composite response is symmetric about it; latency is reported exactly.
 //
-// WHAT IT DELIVERS, pinned in CascadeOversamplerTests over 14 rates from 8 kHz to 768 kHz and factors 2..16
-// (both composites recovered through the public API): images and aliases of anything below fs/2 at
-// -91.0 dB or lower; one pass within 0.0043 dB of flat up to the band edge; a palindromic composite.
+// WHAT IT DELIVERS, pinned in CascadeOversamplerTests (both composites recovered through the public API):
+// over 14 rates from 8 kHz to 768 kHz and factors 2..64, images and aliases of anything below fs/2 at
+// -91.0 dB or lower and one pass within 0.0043 dB of flat up to the band edge; over EVERY taps count the
+// rule can produce (110 of them, 16..125), -90.9 dB and 0.0049 dB — the rule's real margin; and a
+// palindromic composite.
 //
 //        rate     stage-1 t   4x latency    firDot MAC per base sample, 4x (PolyphaseOversampler: 512)
 //        44.1 k      125         131             572
@@ -81,7 +87,9 @@ namespace felitronics::oversampling
 //
 // LAW 11(b): unlike PolyphaseOversampler (whose channel CLAMP is P55), prepare() REFUSES a channel count
 // outside [1, core::kMaxChannels], a factor that is not a power of two in [2, kMaxFactor], and a rate
-// outside [kMinSampleRate, kMaxSampleRate] — and a refused call touches nothing.
+// outside [kMinSampleRate, kMaxSampleRate] — and a refused call touches nothing. A stage that offers this
+// topology inherits the rate window: PolyphaseOversampler never looked at the rate, so under Cascade a
+// Saturator or a limiter refuses rates below 1 kHz that it accepts under Kaiser.
 // LAW 2 (P56): every inner loop is `core::firDot`. The one sum outside it — the halfband decimator's
 // centre tap — adds a value that was halved and STORED a sample earlier, so no contraction can fuse the
 // multiply into the add (the tree builds -ffp-contract=on; gcc's `fast` fuses across statements).
@@ -120,7 +128,7 @@ public:
         int    taps[kMaxStages] = {};               // every stage's length (stage 1: 2t; the rest: 4m+3)
         int    decimationPhase[kMaxStages] = {};    // 0 or 1: which of the two input samples a decimator emits at
         int    latencySamples = 0;                  // round trip, base samples, exact
-        long   upLegTwice = 0;                      // the UP leg alone, in top-rate samples, times two (it may be a half)
+        int    upLegTwice = 0;                      // the UP leg alone, in top-rate samples, times two (it may be a half)
     };
 
     [[nodiscard]] static bool designFor (double sampleRate, int factor, Design& out) noexcept
@@ -166,7 +174,7 @@ public:
                 d.latencySamples = (int) (total / factor);
                 long up = 0; span = factor;
                 for (int k = 0; k < d.stages; ++k) { span /= 2; up += (long) span * (long) (d.taps[k] - 1); }
-                d.upLegTwice = up;
+                d.upLegTwice = (int) up;
                 for (int k = 0; k < d.stages; ++k) d.decimationPhase[k] = (mask >> k) & 1;
             }
         }

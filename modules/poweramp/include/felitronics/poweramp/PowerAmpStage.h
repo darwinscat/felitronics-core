@@ -130,8 +130,9 @@ public:
 
     // Allocate state for this stream / block size. Message/host thread (prepareToPlay) — never
     // the audio thread. `oversampleFactor` defaults to 4 (the shipping value); a test may pass a
-    // higher factor (e.g. 32) to build an alias-free reference for null comparison. Latency is
-    // tapsPerPhase-1 regardless of factor, so 4x and 32x stay sample-aligned. `tapsPerPhase` takes the
+    // higher factor (e.g. 32) to build an alias-free reference for null comparison. Under the default
+    // Kaiser topology latency is tapsPerPhase-1 regardless of factor, so 4x and 32x stay sample-aligned
+    // (under Cascade they do not — see `topology` below). `tapsPerPhase` takes the
     // core's own default (see the TAPS note above and PolyphaseOversampler.h for its derivation);
     // passing it explicitly pins a topology against that default. It is CLAMPED to [4, 1024], not
     // refused — this prepare() returns void and always has, so a rejected value would leave the stage
@@ -209,7 +210,7 @@ struct PowerAmpStage::Impl
     double sampleRate = 0.0;
     int    maxBlock   = 0;
     int    os         = 4;                          // oversampling factor (4 shipping; test may set 32)
-    int    tpp        = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // FIR taps/phase → (tpp-1)-sample round trip
+    int    tpp        = felitronics::oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;   // FIR taps/phase → (tpp-1)-sample round trip under Kaiser
 
     felitronics::oversampling::Oversampler ovs;
     std::vector<float> osBuf[kMaxCh];               // maxBlock*os per channel (caller-owned OS scratch)

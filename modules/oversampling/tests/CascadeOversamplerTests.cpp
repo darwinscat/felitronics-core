@@ -75,7 +75,7 @@ namespace
     // The composite interpolation filter G (at F fs), normalised so that G(0) = 1.
     std::vector<double> upComposite (CascadeOversampler& co)
     {
-        const int F = co.factor(), n = 2048;
+        const int F = co.factor(), n = F >= 32 ? 512 : 2048;      // the composite spans < 200 base samples
         std::vector<float> x ((std::size_t) n, 0.0f), y ((std::size_t) n * (std::size_t) F);
         x[0] = 1.0f;
         const float* in[1] { x.data() }; float* out[1] { y.data() };
@@ -89,7 +89,7 @@ namespace
     // The composite decimation filter D (at F fs), recovered phase by phase; index m*F - p (+ F - 1).
     std::vector<double> downComposite (CascadeOversampler& co)
     {
-        const int F = co.factor(), n = 1024;
+        const int F = co.factor(), n = F >= 32 ? 512 : 1024;
         std::vector<double> d ((std::size_t) n * (std::size_t) F, 0.0);
         for (int p = 0; p < F; ++p)
         {
@@ -146,7 +146,7 @@ static void runRuleTests()
     double worstStrict = -1e9, worstEdge = 0.0, worstSym = 0.0;
     bool allPrepared = true, allSymmetric = true;
     for (double fs : rates)
-        for (int F : { 2, 4, 8, 16 })
+        for (int F : { 2, 4, 8, 16, 32, 64 })
         {
             CascadeOversampler co;
             if (! co.prepare (fs, F, 1)) { allPrepared = false; continue; }
@@ -173,14 +173,43 @@ static void runRuleTests()
                              std::max (ru.edgeDevDb, rd.edgeDevDb));
             }
         }
-    std::printf ("       over %zu rates x 4 factors: worst strict %.2f dB, worst one-pass deviation to the edge %.5f dB, "
+    std::printf ("       over %zu rates x 6 factors: worst strict %.2f dB, worst one-pass deviation to the edge %.5f dB, "
                  "worst asymmetry %.1e\n", sizeof rates / sizeof rates[0], worstStrict, worstEdge, worstSym);
-    test::ok (allPrepared, "every rate from 8 kHz to 768 kHz and every factor 2..16 prepares");
+    test::ok (allPrepared, "every rate from 8 kHz to 768 kHz and every factor 2..64 prepares");
     test::ok (worstStrict <= -90.0, "STRICT: nothing at or above fs/2 comes through either path above -90 dB ("
                                     + std::to_string (worstStrict) + ")");
     test::ok (worstStrict > -95.0, "and the reading is not vacuous — the design sits near its bar, not at the float floor");
     test::ok (worstEdge <= 0.005, "FLAT: one pass stays within 0.005 dB up to the band edge (" + std::to_string (worstEdge) + ")");
     test::ok (allSymmetric, "LINEAR PHASE: every composite interpolator is a palindrome");
+
+    // EVERY taps count the rule can produce, not only the ones fourteen rates happen to reach (they reach
+    // eight). Stage 1 alone (F = 2) is what the rule sizes; the first rate that yields each t is the probe.
+    {
+        std::vector<std::pair<int, double>> firstRate;
+        for (double fs = CascadeOversampler::kMinSampleRate; fs <= CascadeOversampler::kMaxSampleRate; fs *= 1.0005)
+        {
+            CascadeOversampler::Design d;
+            if (! CascadeOversampler::designFor (fs, 2, d)) continue;
+            bool seen = false;
+            for (const auto& fr : firstRate) seen = seen || fr.first == d.firstTapsPerPhase;
+            if (! seen) firstRate.emplace_back (d.firstTapsPerPhase, fs);
+        }
+        double wS = -1e9, wE = 0.0; int tS = 0, tMin = 1 << 30, tMax = 0;
+        for (const auto& [t, fs] : firstRate)
+        {
+            CascadeOversampler co;
+            (void) co.prepare (fs, 2, 1);
+            const Reading r = read (upComposite (co), fs, 2, co.design().bandEdgeHz);
+            if (r.strictDb > wS) { wS = r.strictDb; tS = t; }
+            wE = std::max (wE, r.edgeDevDb);
+            tMin = std::min (tMin, t); tMax = std::max (tMax, t);
+        }
+        std::printf ("       every reachable taps count (%zu, %d..%d): worst strict %.2f dB (t %d), worst edge %.5f dB\n",
+                     firstRate.size(), tMin, tMax, wS, tS, wE);
+        test::ok (firstRate.size() == 110 && tMin == 16 && tMax == 125, "the rule produces 110 taps counts, 16..125, over 1 kHz..3 MHz");
+        test::ok (wS <= -90.0 && wE <= 0.005, "and every one of them is strict and flat to its band edge ("
+                                              + std::to_string (wS) + " dB, " + std::to_string (wE) + " dB)");
+    }
 
     // The table the header prints, pinned — a change of rule has to edit it on purpose.
     struct Row { double fs; int t, lat; };
@@ -303,6 +332,15 @@ static void runRefusalTests()
         const bool prep = co.prepare (b.fs, b.F, b.ch);
         test::ok (! prep && ! budget && st.coeffs == 12345, std::string ("refused: ") + b.why + " (prepare and storageFor agree, out untouched)");
         test::ok (co.latencySamples() == latBefore && co.factor() == 2, std::string ("and the refused call left the previous preparation standing: ") + b.why);
+        // ...and its bits: the object that saw the refusal and one that never did produce the same stream.
+        CascadeOversampler twin;
+        (void) twin.prepare (48000.0, 2, 2);
+        std::vector<float> xs (300), a1 (600), a2 (600);
+        for (int i = 0; i < 300; ++i) xs[(std::size_t) i] = (float) std::sin (0.17 * i);
+        const float* ix1[1] { xs.data() }; float* oo1[1] { a1.data() }; float* oo2[1] { a2.data() };
+        co.upsample (ix1, 1, 300, oo1);
+        twin.upsample (ix1, 1, 300, oo2);
+        test::ok (a1 == a2, std::string ("and the refused call left the coefficients and rings untouched: ") + b.why);
         if (b.ch >= 1 && b.ch <= core::kMaxChannels) test::ok (! design && d.latencySamples == 777, std::string ("designFor refuses it too: ") + b.why);
     }
     test::ok (CascadeOversampler {}.prepare (1000.0, 64, core::kMaxChannels), "the edges themselves are accepted (1 kHz, 64x, kMaxChannels)");

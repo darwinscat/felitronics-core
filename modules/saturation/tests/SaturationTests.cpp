@@ -437,6 +437,15 @@ static void runCascadeTopologyTests()
                   "tapsPerPhase is still range-checked under the cascade (2000 refused), so no argument became free");
         test::ok (s.prepare (44100.0, 512, 2, 1, 2000, Topology::Cascade) && s.latencySamples() == 0,
                   "and at factor 1 there is no oversampler, so the topology is moot — exactly as tapsPerPhase was");
+        // The cascade designs from the RATE, so under it the rate window is [1 kHz, 3 MHz]; the Kaiser stage
+        // never looked at the rate and keeps accepting what it accepted.
+        test::ok (! s.prepare (500.0, 512, 2, 4, 64, Topology::Cascade)
+                  && ! saturation::Saturator::storageFor (500.0, 512, 2, 4, 64, st, Topology::Cascade)
+                  && saturation::Saturator::latencyFor (500.0, 512, 2, 4, 64, Topology::Cascade) == 0,
+                  "500 Hz is refused under the cascade (prepare, storageFor, latencyFor)");
+        test::ok (s.prepare (500.0, 512, 2, 4, 64) && s.latencySamples() == 63, "and accepted under Kaiser, as before");
+        test::ok (s.prepare (1000.0, 512, 2, 4, 64, Topology::Cascade) && ! s.prepare (3.1e6, 512, 2, 4, 64, Topology::Cascade),
+                  "1 kHz is the cascade's floor; 3.1 MHz is past its ceiling");
 
         for (Topology topo : { Topology::Kaiser, Topology::Cascade })
         {
