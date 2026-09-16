@@ -150,7 +150,8 @@ public:
     // rather than from `tapsPerPhase`. Clamped like everything else here, never refused: under Cascade the
     // factor is rounded DOWN to a power of two (3 -> 2, 12 -> 8), and the rate the filter is designed for
     // is clamped into [1 kHz, 3 MHz] (every rate up to 44.1 kHz shares one geometry, so the low clamp
-    // changes no tap). Read latencySamples() back — it reports what was built.
+    // changes no tap); a rate that is not a finite positive number — NaN, +-inf, 0, negative — designs as
+    // 44.1 kHz rather than being clamped to an end. Read latencySamples() back — it reports what was built.
     void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,
                   int tapsPerPhase = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase,
                   oversampling::Topology topology = oversampling::Topology::Kaiser);

@@ -145,7 +145,7 @@ static void runRuleTests()
     const double rates[] = { 8000.0, 22050.0, 32000.0, 44100.0, 46000.0, 48000.0, 50000.0, 64000.0,
                              88200.0, 96000.0, 176400.0, 192000.0, 384000.0, 768000.0 };
     double worstStrict = -1e9, worstEdge = 0.0, worstSym = 0.0;
-    bool allPrepared = true, allSymmetric = true;
+    bool allPrepared = true, allSymmetric = true, upLegOk = true;
     for (double fs : rates)
         for (int F : { 2, 4, 8, 16, 32, 64 })
         {
@@ -165,6 +165,9 @@ static void runRuleTests()
             for (std::size_t i = lo, j = hi; i < j; ++i, --j) asym = std::max (asym, std::fabs (g[i] - g[j]));
             worstSym = std::max (worstSym, asym);
             if (asym > 1e-6) allSymmetric = false;
+            // ...and its centre is where the design says the UP leg ends (the offset a consumer would crop
+            // an oversampled trace by — the one number here no other check reads).
+            if ((long) (lo + hi) != (long) d.upLegTwice) upLegOk = false;
             if (F == 4 && (fs == 44100.0 || fs == 48000.0 || fs == 88200.0 || fs == 96000.0))
             {
                 int mac = 2 * core::firPadLen (d.firstTapsPerPhase) + core::firPadLen (d.taps[0]);
@@ -182,6 +185,7 @@ static void runRuleTests()
     test::ok (worstStrict > -95.0, "and the reading is not vacuous — the design sits near its bar, not at the float floor");
     test::ok (worstEdge <= 0.005, "FLAT: one pass stays within 0.005 dB up to the band edge (" + std::to_string (worstEdge) + ")");
     test::ok (allSymmetric, "LINEAR PHASE: every composite interpolator is a palindrome");
+    test::ok (upLegOk, "and Design::upLegTwice is twice its centre, in top-rate samples, at every rate and factor");
 
     // EVERY taps count the rule can produce, not only the ones fourteen rates happen to reach (they reach
     // eight). Stage 1 alone (F = 2) is what the rule sizes; the first rate that yields each t is the probe.
@@ -453,6 +457,56 @@ static void runStreamingTests()
     fresh.upsample (ifr, 1, 100, ofr);
     test::ok (std::equal (fa.begin(), fa.end(), sa.begin() + 400), "and the reset one equals a fresh channel");
     test::ok (! std::equal (fa.begin(), fa.end(), sa.begin()), "(the comparison is not vacuous)");
+
+    // THE DOWN PATH per channel, with DIFFERENT content: every channel of a stereo decimator equals a mono one
+    // fed the same samples (a decimator that read channel 0 for every channel passed everything above).
+    {
+        const int Fd = 8, nd = 300;
+        CascadeOversampler st2, m0, m1;
+        (void) st2.prepare (48000.0, Fd, 2); (void) m0.prepare (48000.0, Fd, 1); (void) m1.prepare (48000.0, Fd, 1);
+        std::vector<float> u0 ((std::size_t) (nd * Fd)), u1 ((std::size_t) (nd * Fd));
+        for (int i = 0; i < nd * Fd; ++i) { u0[(std::size_t) i] = (float) std::sin (0.013 * i); u1[(std::size_t) i] = (float) std::cos (0.029 * i + 1.0); }
+        std::vector<float> s0 ((std::size_t) nd), s1 ((std::size_t) nd), r0 ((std::size_t) nd), r1 ((std::size_t) nd);
+        const float* si[2] { u0.data(), u1.data() }; float* so[2] { s0.data(), s1.data() };
+        st2.downsample (si, 2, nd, so);
+        const float* a0[1] { u0.data() }; float* b0[1] { r0.data() };
+        const float* a1[1] { u1.data() }; float* b1[1] { r1.data() };
+        m0.downsample (a0, 1, nd, b0); m1.downsample (a1, 1, nd, b1);
+        test::ok (s0 == r0 && s1 == r1 && s0 != s1, "a stereo decimator is two mono ones, channel for channel, on different content");
+    }
+
+    // Channels past the prepared count are not touched, both ways (the consumers refuse such calls first;
+    // this is the class's own promise, and without the clamp it indexes rings that do not exist).
+    {
+        CascadeOversampler one;
+        (void) one.prepare (44100.0, 4, 1);
+        std::vector<float> c0 (64, 0.25f), c1 (64, 0.5f), u0 (256, 0.0f), u1 (256, 9.0f), d0 (64, 0.0f), d1 (64, 9.0f);
+        const float* in2[2] { c0.data(), c1.data() }; float* up2[2] { u0.data(), u1.data() };
+        one.upsample (in2, 2, 64, up2);
+        const float* uin[2] { u0.data(), u0.data() }; float* dn2[2] { d0.data(), d1.data() };
+        one.downsample (uin, 2, 64, dn2);
+        bool untouched = true;
+        for (float v : u1) untouched = untouched && v == 9.0f;
+        for (float v : d1) untouched = untouched && v == 9.0f;
+        test::ok (untouched, "a call wider than the preparation leaves the extra channel's output untouched, up and down");
+    }
+
+    // resetChannel outside [0, channels) is a no-op on a PREPARED object — the other channels continue bit for
+    // bit. (An out-of-range index would write outside the rings; the sanitizer row sees that, this sees the rest.)
+    {
+        CascadeOversampler p2, q2;
+        (void) p2.prepare (44100.0, 4, 2); (void) q2.prepare (44100.0, 4, 2);
+        std::vector<float> in (200); for (int i = 0; i < 200; ++i) in[(std::size_t) i] = (float) std::sin (0.3 * i);
+        std::vector<float> pa (800), pb (800), qa (800), qb (800);
+        const float* ii[2] { in.data(), in.data() };
+        float* po[2] { pa.data(), pb.data() }; float* qo[2] { qa.data(), qb.data() };
+        p2.upsample (ii, 2, 100, po); q2.upsample (ii, 2, 100, qo);
+        p2.resetChannel (-1); p2.resetChannel (2); p2.resetChannel (1 << 20);
+        const float* ii2[2] { in.data() + 100, in.data() + 100 };
+        float* po2[2] { pa.data() + 400, pb.data() + 400 }; float* qo2[2] { qa.data() + 400, qb.data() + 400 };
+        p2.upsample (ii2, 2, 100, po2); q2.upsample (ii2, 2, 100, qo2);
+        test::ok (pa == qa && pb == qb, "resetChannel(-1), (channels) and (huge) change nothing on a prepared object");
+    }
 }
 
 static void runBitPins()
@@ -462,8 +516,10 @@ static void runBitPins()
     // the designed doubles or the narrowing differ fails here by name rather than drifting.
     test::group ("CascadeOversampler: the designed filters are the same bits on every row");
     struct Pin { double fs; int F; std::uint64_t hash; };
+    // 32x and 64x reach the last two halfband stages, which nothing at 16x and below runs.
     const Pin pins[] = { { 44100.0, 4, 0x06a22c34de9944d0ull }, { 48000.0, 8, 0x9cf934f564435a4full },
-                         { 96000.0, 2, 0x0893f7c6b2fa244dull }, { 8000.0, 16, 0x641a714e44beaeb5ull } };
+                         { 96000.0, 2, 0x0893f7c6b2fa244dull }, { 8000.0, 16, 0x641a714e44beaeb5ull },
+                         { 44100.0, 32, 0xf54ec22e379c6f60ull }, { 48000.0, 64, 0x487c11a907b74918ull } };
     for (const auto& p : pins)
     {
         CascadeOversampler co;
@@ -551,14 +607,72 @@ static void runTopologyTests()
         const long long c1 = asked (Topology::Cascade);
         const long long c2 = asked (Topology::Cascade);
         const long long k2 = asked (Topology::Kaiser);
+        const long long c3 = asked (Topology::Cascade);
         test::ok (k1 == (long long) bk.bytes() && bk.heapObjects == 0, "Kaiser asks for exactly its budget, no heap object ("
                   + std::to_string (k1) + " B)");
         test::ok (c1 == (long long) bc.bytes() && bc.heapObjects == 1, "Cascade asks for exactly its budget, the heap object included ("
                   + std::to_string (c1) + " B)");
         test::ok (c2 == 0, "re-preparing the same cascade asks for nothing (" + std::to_string (c2) + " B)");
-        test::ok (k2 <= (long long) bk.bytes(), "and switching back asks for no more than Kaiser's budget (" + std::to_string (k2) + " B)");
-        oversampling::Oversampler copy = sw;
-        test::ok (copy.latencySamples() == sw.latencySamples() && copy.topology() == Topology::Kaiser, "a copy is the same switch");
+        // A switch RELEASES the topology it leaves: going back asks for the whole budget again, which it
+        // would not if the old buffers (or the heap object) had been kept.
+        test::ok (k2 == (long long) bk.bytes(), "switching back to Kaiser asks for its whole budget again — the Kaiser buffers were released ("
+                  + std::to_string (k2) + " B)");
+        test::ok (c3 == (long long) bc.bytes(), "and back to Cascade asks for the whole cascade budget, heap object included — it was released too ("
+                  + std::to_string (c3) + " B)");
+
+        // A REFUSED preparation touches nothing: it allocates nothing on a fresh switch, and a live Kaiser
+        // switch that is refused a cascade still runs its Kaiser bits.
+        oversampling::Oversampler fresh;
+        const long long f0 = alloc::bytes.load();
+        const bool refused = ! fresh.prepare (Topology::Cascade, 44100.0, 3, 1, 64);
+        test::ok (refused && alloc::bytes.load() - f0 == 0, "a refused cascade preparation allocates nothing (not even the heap object)");
+        oversampling::Oversampler live, twin;
+        (void) live.prepare (Topology::Kaiser, 44100.0, 4, 1, 64);
+        (void) twin.prepare (Topology::Kaiser, 44100.0, 4, 1, 64);
+        test::ok (! live.prepare (Topology::Cascade, 44100.0, 3, 1, 64) && live.topology() == Topology::Kaiser && live.latencySamples() == 63,
+                  "a refused cascade leaves a live Kaiser switch in place");
+        std::vector<float> xi (100, 0.0f), l1 (400), l2 (400);
+        for (int i = 0; i < 100; ++i) xi[(std::size_t) i] = (float) std::sin (0.2 * i);
+        const float* xip[1] { xi.data() }; float* lo1[1] { l1.data() }; float* lo2[1] { l2.data() };
+        live.upsample (xip, 1, 100, lo1); twin.upsample (xip, 1, 100, lo2);
+        test::ok (l1 == l2 && l1[50] != 0.0f, "...with its coefficients and rings intact (bit-identical to a twin)");
+
+        // Storage ordering sees the cascade half and the heap object, not only the Kaiser half.
+        test::ok (! bc.fitsWithin (bk) && ! bk.fitsWithin (bc), "a cascade budget does not fit a Kaiser one, nor the reverse");
+        oversampling::Oversampler::Storage noHeap = bc; noHeap.heapObjects = 0;
+        test::ok (noHeap.fitsWithin (bc) && ! bc.fitsWithin (noHeap), "and the heap object is part of the comparison");
+        oversampling::Oversampler copy = sw;                     // sw holds the cascade here
+        std::vector<float> ci (50, 0.0f), co1 (200), co2 (200);
+        for (int i = 0; i < 50; ++i) ci[(std::size_t) i] = (float) std::cos (0.4 * i);
+        const float* cip[1] { ci.data() }; float* cop1[1] { co1.data() }; float* cop2[1] { co2.data() };
+        copy.upsample (cip, 1, 50, cop1); sw.upsample (cip, 1, 50, cop2);
+        test::ok (copy.topology() == Topology::Cascade && copy.latencySamples() == sw.latencySamples() && co1 == co2,
+                  "a copy of a cascade switch is a deep copy: same topology, same latency, same bits");
+
+        // reset() and resetChannel() under the cascade reach the CASCADE: after either, the stream equals a
+        // fresh switch's (a switch that routed them to its idle Kaiser member passed everything above).
+        {
+            oversampling::Oversampler dirty, clean;
+            (void) dirty.prepare (Topology::Cascade, 48000.0, 4, 2, 64);
+            (void) clean.prepare (Topology::Cascade, 48000.0, 4, 2, 64);
+            std::vector<float> noise (200);
+            for (int i = 0; i < 200; ++i) noise[(std::size_t) i] = (float) std::sin (1.7 * i) * 0.8f;
+            std::vector<float> junk (800), o1 (400), o2 (400), o3 (400), o4 (400);
+            const float* ni[2] { noise.data(), noise.data() }; float* jo[2] { junk.data(), junk.data() + 400 };
+            dirty.upsample (ni, 2, 100, jo);
+            dirty.reset();
+            const float* ti[2] { noise.data() + 100, noise.data() + 100 };
+            float* d2[2] { o1.data(), o2.data() }; float* c2o[2] { o3.data(), o4.data() };
+            dirty.upsample (ti, 2, 100, d2); clean.upsample (ti, 2, 100, c2o);
+            test::ok (o1 == o3 && o2 == o4, "reset() under the cascade clears the cascade");
+            dirty.upsample (ni, 2, 100, jo);
+            dirty.resetChannel (0);
+            oversampling::Oversampler clean2;
+            (void) clean2.prepare (Topology::Cascade, 48000.0, 4, 1, 64);
+            float* d3[2] { o1.data(), o2.data() }; float* c3o[1] { o3.data() };
+            dirty.upsample (ti, 2, 100, d3); clean2.upsample (ti, 1, 100, c3o);
+            test::ok (o1 == o3, "and resetChannel(0) under the cascade clears channel 0 of the cascade");
+        }
 
         // A MOVED-FROM cascade switch keeps its topology tag and loses its object. It must read as unprepared
         // and ignore calls, not dereference the empty vector (it did: SIGSEGV on latencySamples()).

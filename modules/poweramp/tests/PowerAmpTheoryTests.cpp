@@ -504,12 +504,32 @@ int main()
                "TT10 a factor that is not a power of two is rounded DOWN (3->2, 12->8), and the [2,32] clamp still applies (64->32, 1->2)");
         check (latOf (500.0, 4) == CascadeOversampler::latencyFor (1000.0, 4) && latOf (500.0, 4) == latOf (44100.0, 4)
                && latOf (1.0e7, 4) == CascadeOversampler::latencyFor (3.0e6, 4)
-               && latOf (std::numeric_limits<double>::quiet_NaN(), 4) == CascadeOversampler::latencyFor (44100.0, 4),
-               "TT10 the design rate is clamped into [1 kHz, 3 MHz] (a NaN designs as 44.1 kHz), so the cascade is always built");
+               && latOf (std::numeric_limits<double>::quiet_NaN(), 4) == CascadeOversampler::latencyFor (44100.0, 4)
+               && latOf (std::numeric_limits<double>::infinity(), 4) == CascadeOversampler::latencyFor (44100.0, 4)
+               && latOf (-std::numeric_limits<double>::infinity(), 4) == CascadeOversampler::latencyFor (44100.0, 4)
+               && latOf (0.0, 4) == CascadeOversampler::latencyFor (44100.0, 4),
+               "TT10 the design rate is clamped into [1 kHz, 3 MHz], and a non-finite or non-positive one (NaN, +-inf, 0) designs as 44.1 kHz");
         check (latOf (kSr, 4, 1) == latOf (kSr, 4, 5000), "TT10 tapsPerPhase does not reach the cascade (clamped either way, unused)");
         {
             PowerAmpStage k; k.prepare (kSr, kMaxBlk, 3);
             check (k.latencySamples() == 63, "TT10 ...while the DEFAULT topology still takes a factor of 3 as it is (latency 63)");
+            // Latency cannot tell 3x from 2x under Kaiser (tpp-1 either way), so the OUTPUT has to: a hot tone
+            // aliases differently at 3x than at 2x. Were the Kaiser factor rounded as the cascade's is, the two
+            // renders would be the same bits.
+            auto render = [] (int os, Topology topo)
+            {
+                PowerAmpStage d; d.prepare (kSr, kMaxBlk, os, 64, topo);
+                felitronics::poweramp::Params pp; pp.driveDb = 24.0f;
+                d.setParams (pp, felitronics::poweramp::Voicing {});
+                std::vector<float> x (2048);
+                for (int i = 0; i < 2048; ++i) x[(std::size_t) i] = (float) (0.7 * std::sin (2.0 * kPi * 7000.0 / kSr * i));
+                for (int pos = 0; pos < 2048; pos += kMaxBlk) { float* io[1] { x.data() + pos }; felitronics::test::run (d.process (io, 1, kMaxBlk)); }
+                return x;
+            };
+            check (render (3, Topology::Kaiser) != render (2, Topology::Kaiser),
+                   "TT10 under Kaiser a factor of 3 really runs at 3 (its render differs from 2x's)");
+            check (render (3, Topology::Cascade) == render (2, Topology::Cascade),
+                   "TT10 under the cascade a factor of 3 IS 2x, bit for bit");
         }
 
         // Physical delay == reported, for every tube and topology, under the cascade at both rates.

@@ -272,21 +272,22 @@ int main()
     test::group ("prepare() asks for exactly its published budget under both oversampler topologies");
     {
         std::uint64_t kaiserBytes = 0, cascadeBytes = 0;
-        for (auto topo : { oversampling::Topology::Kaiser, oversampling::Topology::Cascade })
-        {
-            limiter::TruePeakLimiterConfig cfg; cfg.oversampleFactor = 8; cfg.topology = topo;
-            limiter::TruePeakLimiter::Storage st;
-            const bool okSt = limiter::TruePeakLimiter::storageFor (44100.0, 1024, 2, cfg, st);
-            limiter::TruePeakLimiter lim;
-            const long long before = alloc::bytes.load();
-            const bool okP = lim.prepare (44100.0, 1024, 2, cfg);
-            const long long got = alloc::bytes.load() - before;
-            const bool kaiser = topo == oversampling::Topology::Kaiser;
-            test::ok (okSt && okP && got == (long long) st.bytes(),
-                      std::string (kaiser ? "Kaiser" : "Cascade") + " 8x: asked " + std::to_string (got) + " B, published "
-                      + std::to_string (st.bytes()) + " B");
-            (kaiser ? kaiserBytes : cascadeBytes) = st.bytes();
-        }
+        for (double rate : { 44100.0, 48000.0, 96000.0 })     // the cascade designs FROM the rate: one rate proves one design
+            for (auto topo : { oversampling::Topology::Kaiser, oversampling::Topology::Cascade })
+            {
+                limiter::TruePeakLimiterConfig cfg; cfg.oversampleFactor = 8; cfg.topology = topo;
+                limiter::TruePeakLimiter::Storage st;
+                const bool okSt = limiter::TruePeakLimiter::storageFor (rate, 1024, 2, cfg, st);
+                limiter::TruePeakLimiter lim;
+                const long long before = alloc::bytes.load();
+                const bool okP = lim.prepare (rate, 1024, 2, cfg);
+                const long long got = alloc::bytes.load() - before;
+                const bool kaiser = topo == oversampling::Topology::Kaiser;
+                test::ok (okSt && okP && got == (long long) st.bytes(),
+                          std::to_string ((int) rate) + " Hz " + (kaiser ? "Kaiser" : "Cascade") + " 8x: asked " + std::to_string (got)
+                          + " B, published " + std::to_string (st.bytes()) + " B");
+                if (rate == 44100.0) (kaiser ? kaiserBytes : cascadeBytes) = st.bytes();
+            }
         test::ok (kaiserBytes != cascadeBytes, "and the two budgets really are different topologies ("
                                                + std::to_string (kaiserBytes) + " vs " + std::to_string (cascadeBytes) + " B)");
     }

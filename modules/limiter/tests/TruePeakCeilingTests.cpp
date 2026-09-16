@@ -334,6 +334,11 @@ static void runCascadeTopology()
     for (int F : { 2, 4, 8 })
         test::approx (tpw::deliveredBudgetDbFlatTo (F, 0.40), tpw::deliveredBudgetDb (F), 1e-12,
                       "F=" + std::to_string (F) + ": enumerated to Kaiser's flat edge == the named budget");
+    // The enumeration really runs to q = 64: a band flat to 0.471 fs delivers 8fs/17, whose grid term wins at
+    // 16x — a search stopped at small denominators would have answered 4fs/9 (0.0331) here.
+    test::approx (tpw::deliveredBudgetDbFlatTo (16, 0.471) - tpw::kModulationEnvelopeDb, tpw::gridBreachDb (8, 17, 16), 1e-12,
+                  "flat to 0.471 fs at 16x: the worst tone is 8fs/17 (" + dbs (tpw::gridBreachDb (8, 17, 16)) + ")");
+    test::ok (tpw::gridBreachDb (8, 17, 16) > tpw::gridBreachDb (4, 9, 16), "(and it does beat 4fs/9 there)");
     const double wantAt441[] = { 1.2494, 0.4359, 0.1330, 0.0331 };
     const int    factors[]   = { 2, 4, 8, 16 };
     for (int i = 0; i < 4; ++i)
@@ -465,6 +470,14 @@ static void runCascadeTopology()
         const int look = lim.lookaheadSamples();
         test::ok (lim.latencySamples() == 131 + look && lim.latencySamples() == limiter::TruePeakLimiter::latencyFor (44100.0, 512, 2, cfg),
                   "latency is the cascade's 131 plus the lookahead (" + std::to_string (lim.latencySamples()) + "), and latencyFor agrees");
+        {   // a requested 1x is the clamped 2x — and latencyFor has to price the 2x the preparation builds
+            limiter::TruePeakLimiterConfig one = cfg; one.oversampleFactor = 1;
+            limiter::TruePeakLimiter l1;
+            test::ok (l1.prepare (44100.0, 512, 2, one) && l1.oversampleFactor() == 2
+                      && l1.latencySamples() == limiter::TruePeakLimiter::latencyFor (44100.0, 512, 2, one)
+                      && l1.latencySamples() == oversampling::CascadeOversampler::latencyFor (44100.0, 2) + l1.lookaheadSamples(),
+                      "a requested 1x under the cascade: latencyFor prices the 2x that is built (" + std::to_string (l1.latencySamples()) + ")");
+        }
         limiter::TruePeakLimiterConfig odd = cfg; odd.oversampleFactor = 3;
         limiter::TruePeakLimiter::Storage st;
         test::ok (! lim.prepare (44100.0, 512, 2, odd) && ! limiter::TruePeakLimiter::storageFor (44100.0, 512, 2, odd, st)
@@ -508,6 +521,21 @@ static void runCascadeTopology()
             for (int c = 0; c < 2; ++c) same &= firstDifference (whole[(std::size_t) c], part[(std::size_t) c]) < 0;
         }
         test::ok (same, "blocks of 1, 63 and 512 give the whole-file render bit for bit");
+        // ...and the second channel is ITS OWN channel: with one linked gain and ch1 = -0.7 ch0 going in,
+        // ch1 = -0.7 ch0 comes out (a decimator that read ch0 for both planes rendered the same bits every
+        // block size, so the invariance above could not see it).
+        double worstLink = 0.0;
+        for (std::size_t i = 0; i < whole[0].size(); ++i)
+            worstLink = std::max (worstLink, (double) std::fabs (whole[1][i] + 0.7f * whole[0][i]));
+        test::ok (worstLink < 1e-5, "the stereo output keeps ch1 = -0.7 ch0 through the cascade (worst " + std::to_string (worstLink) + ")");
+
+        // moved-from: the limiter reads through the same switch
+        limiter::TruePeakLimiter a;
+        (void) a.prepare (44100.0, 512, 1, cfg);
+        limiter::TruePeakLimiter b = std::move (a);
+        test::ok (b.latencySamples() == 131 + b.lookaheadSamples(), "a moved-to cascade limiter keeps its latency");
+        a.reset();                                                     // NOLINT: use after move is the test
+        test::ok (true, "and reset() on the moved-from one returns (it used to dereference an empty vector)");
     }
 }
 

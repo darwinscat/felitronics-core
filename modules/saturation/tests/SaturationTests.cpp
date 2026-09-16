@@ -461,6 +461,53 @@ static void runCascadeTopologyTests()
         }
     }
 
+    test::group ("Saturator, Topology::Cascade: reset, a channel that leaves and returns, and a moved-from stage");
+    {
+        auto burst = [] (std::vector<float>& v) { for (std::size_t i = 0; i < v.size(); ++i) v[i] = (float) (0.9 * std::sin (0.9 * (double) i)); };
+        saturation::Saturator::Params p; p.driveDb = 12.0f; p.mix = 1.0f;
+        // reset(): what was inside the cascade must not come back out of silence
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 1, 4, 64, Topology::Cascade);
+            s.setParams (p);
+            std::vector<float> x (256); burst (x);
+            float* io[1] { x.data() };
+            felitronics::test::run (s.process (io, 1, 256));
+            s.reset();
+            std::vector<float> z (512, 0.0f);
+            float* zo[1] { z.data() };
+            felitronics::test::run (s.process (zo, 1, 512));
+            float peak = 0.0f; for (float v : z) peak = std::max (peak, std::fabs (v));
+            test::ok (peak == 0.0f, "after reset() silence comes out as exact zero (peak " + std::to_string (peak) + ")");
+        }
+        // a channel that leaves and returns replays nothing (law 11a)
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 2, 4, 64, Topology::Cascade);
+            s.setParams (p);
+            std::vector<float> l (256), r (256); burst (l); burst (r);
+            float* st2[2] { l.data(), r.data() };
+            felitronics::test::run (s.process (st2, 2, 256));
+            std::vector<float> m (256, 0.0f);
+            float* mono[1] { m.data() };
+            felitronics::test::run (s.process (mono, 1, 256));
+            std::vector<float> a (512, 0.0f), b (512, 0.0f);
+            float* back[2] { a.data(), b.data() };
+            felitronics::test::run (s.process (back, 2, 512));
+            float peak = 0.0f; for (float v : b) peak = std::max (peak, std::fabs (v));
+            test::ok (peak == 0.0f, "a channel that left and returns on silence plays exact zero (peak " + std::to_string (peak) + ")");
+        }
+        // moved-from: reads as the class reads it, and never dereferences the stolen cascade
+        {
+            saturation::Saturator s;
+            (void) s.prepare (44100.0, 256, 1, 4, 64, Topology::Cascade);
+            saturation::Saturator t = std::move (s);
+            test::ok (t.latencySamples() == 131, "the moved-to stage keeps its cascade (latency 131)");
+            s.reset();                                                 // NOLINT: use after move is the test
+            test::ok (s.latencySamples() == 0, "a moved-from cascade stage reports 0 and survives reset() (it used to crash)");
+        }
+    }
+
     test::group ("Saturator, Topology::Cascade: the dry path is delayed by the round trip that was built");
     for (double fs : { 44100.0, 48000.0 })
         for (Topology topo : { Topology::Kaiser, Topology::Cascade })
