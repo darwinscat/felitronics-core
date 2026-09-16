@@ -19,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 using felitronics::test::approx;
@@ -2262,6 +2263,114 @@ int main() {
         ok(oracled == cells,
            "…and the length is the one warmFor()'s three terms ask for, stated independently here ("
            + std::to_string(oracled) + " of " + std::to_string(cells) + ")");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 🔴 A RESTART LANDING INSIDE A WARM-UP, which is the case every other fixture here steps over: the
+    // groups above park a slot until it is fully warm or fully asleep and only then change the rate. A
+    // slot caught MID-FIELD is different in kind, and it was wrong at an UNCHANGED rate too — so this is
+    // not a rate-change test that happens to use one rate, it is the other half of the same defect.
+    //
+    // What is wrong: `prepare()` flushes every network (NamStage::prepare ends in its own restart), so
+    // afterwards the slot's model holds NOTHING. The law's ledger, left alone, still credits it every
+    // sample it heard before the flush — so a slot that was one block short of audible is marked audible
+    // one block later, having fed one block of real material into an empty network. That is invariant 3
+    // broken by a whole receptive field, and it costs nothing to close: a warming slot is at weight zero
+    // by construction, so re-arming it is inaudible.
+    //
+    // ⚠️ AND THIS IS THE FIXTURE THAT KILLS THE PLAUSIBLE WRONG FIX. Carrying the warm-up across a
+    // restart PROPORTIONALLY — rescaling `fed` alongside `need` so the fraction is preserved — passes
+    // every other assertion in this file, because every other fixture restarts a slot that is already
+    // warm or already asleep, where a preserved fraction and a re-arm agree. Measured: that mutation
+    // survives the whole suite without this group and fails it with.
+    group("P89: a restart INSIDE a warm-up re-arms it — the field heard before the flush is not credited");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // `partial` blocks of warm-up are spent, THEN the restart. The whole field must be owed again.
+        // Both verbs, because they are one shared promise, and several depths so a fixture cannot sit on
+        // the one place a remainder happens to equal a full field.
+        // THE ORACLE IS A DIFFERENTIAL AGAINST DEPTH ZERO, not a predicted absolute, and that is
+        // deliberate: `warmBlocks()` is an OR over BOTH slots, so the absolute after a restart mixes the
+        // re-landing slot with whatever its neighbour is doing and is not a number this file can
+        // predict. What it CAN say is that the answer must not depend on how much of the field was
+        // spent before the restart — a restart eight blocks into a warm-up must cost exactly what a
+        // restart at the instant of the landing costs. Carrying the progress across makes the answer
+        // fall as the depth rises, which is precisely the reading this compares away.
+        const auto warmAfterRestart = [&r](const char* verb, int partial) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(delayModel(2000)) }, { "mid", bytesOf(delayModel(2000)) },
+                { "late",  bytesOf(delayModel(2000)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(kFs, kBlock, 1));
+            p.load(r, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setDial("gain", 150.0);
+
+            std::vector<float> x((std::size_t) kBlock);
+            float* io[1] { x.data() };
+            double phase = 0.0;
+            const auto drive = [&](int blocks) {
+                for (int b = 0; b < blocks; ++b) {
+                    for (int i = 0; i < kBlock; ++i) {
+                        x[(std::size_t) i] = (float) (0.3 * std::sin(phase));
+                        phase += 2.0 * 3.14159265358979323846 * 220.0 / kFs;
+                        if (phase > 6.283185307179586) phase -= 6.283185307179586;
+                    }
+                    felitronics::test::run (p.process(io, 1, kBlock));
+                    p.serviceHere();
+                }
+            };
+
+            drive(24);                                     // both models land and go warm
+            p.setDial("gain", 60.0);                       // …a turn, so a slot re-lands and starts warming
+            drive(2);
+            p.clearCounters();
+            drive(partial);                                // …part of the field, and no more
+            const int spent = p.warmBlocks();
+
+            p.clearCounters();
+            if (std::string(verb) == "reset") p.reset();
+            else felitronics::test::run (p.prepare(kFs, kBlock, 1));
+            drive(64);                                     // …long enough for any warm-up to finish
+            const int after = p.warmBlocks();
+
+            return std::pair<int, int> { spent, after };
+        };
+
+        for (const char* verb : { "reset", "prepare" }) {
+            const auto base = warmAfterRestart(verb, 0);   // …the restart at the instant of the landing
+            ok(base.second > 0, std::string("precondition: a restart at depth 0 owes a warm-up at all (")
+                                + std::to_string(base.second) + " blocks) — " + verb);
+            // ⚠️ THE DEPTHS MUST STAY STRICTLY INSIDE THE FIELD, and 8 does not. This capture's warm-up
+            // is 2000 + 256 = 2256 samples = 8.8 blocks, of which the landing itself has already spent
+            // one or two by the time the count starts; a restart at depth 8 therefore lands AFTER the
+            // slot went audible, where "re-arm" and "carry the progress" agree and the row proves
+            // nothing. It read 8 against 15 for that reason and not because the fix had missed it.
+            for (const int partial : { 1, 2, 3 }) {
+                const auto got = warmAfterRestart(verb, partial);
+                ok(got.first > 0 && got.first <= partial,
+                   std::string("precondition: the restart really lands mid-warm-up (")
+                   + std::to_string(got.first) + " blocks spent of " + std::to_string(partial)
+                   + " driven) — " + verb);
+                ok(got.second == base.second,
+                   std::string("a ") + verb + "() " + std::to_string(partial) + " blocks into a warm-up"
+                   " costs exactly what one at depth 0 costs (" + std::to_string(got.second) + " against "
+                   + std::to_string(base.second) + ") — the field heard before the flush is not credited");
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------

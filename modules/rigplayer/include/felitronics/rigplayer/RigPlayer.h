@@ -464,6 +464,23 @@ public:
         for (int s = 0; s < 2; ++s)
             for (int k = 0; k < bandRt_[s].count; ++k) bandCur_[s][k] = bandTo_[s][k];
         snapGains();
+        // 🔴 …AND A SLOT CAUGHT MID-WARM-UP IS RE-ARMED, exactly as prepare() re-arms it. This restart has
+        // just flushed both networks, so a slot that was part-way through its receptive field is holding
+        // NOTHING — and the law, left alone, goes on crediting it every sample it heard before the
+        // flush, marking it audible with one block of real material in an empty network. That is
+        // invariant 3 broken by up to a whole field, and unlike the ALREADY-WARM case it costs nothing
+        // to close: a warming slot is at weight zero by construction, so re-arming it is inaudible.
+        // Measured on a 2001-tap capture at a 256-sample block, restarting 1, 4 and 8 blocks into the
+        // field: the warm-up that followed was 14, 11 and 8 blocks against the 15 a restart at the
+        // instant of the landing costs — it fell with the depth, which is the progress being carried.
+        //
+        // THE NEED IS HANDED BACK UNCHANGED, which is what separates this call from prepare()'s: the
+        // rate has not moved, so `warmFor` would answer the same number, and re-deriving it here would
+        // be a second copy of that arithmetic rather than a use of it. blendRestated() maps `fed` by its
+        // predicate either way — an audible slot stays audible, a warming one starts over — so the two
+        // verbs share this sentence without sharing a rate argument.
+        for (int i = 0; i < 2; ++i)
+            felitronics::nam::blendRestated(blend_, i, blend_.need[(std::size_t) i]);
     }
 
     bool   prepared()   const { return prepared_; }
