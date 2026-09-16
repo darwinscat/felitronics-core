@@ -69,6 +69,18 @@ if(FELITRONICS_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-fast-math>)
     add_test(NAME felitronics_clips_exposure_tests COMMAND felitronics_clips_exposure_tests)
 
+    # The streaming surface of the same ABI (P120): the fc_stream_* handles over fcore::StreamProbe, fed in pieces,
+    # against the same two instruments handed the whole buffer. Contract-off for the clips suite's reason — the
+    # detector's smooth-crest bound decides whether a run exists, and both parity roads are built this way.
+    add_executable(felitronics_stream_abi_tests tests/StreamAbiTests.cpp wasm/fc_probe.cpp)
+    target_link_libraries(felitronics_stream_abi_tests PRIVATE felitronics::analysis_offline felitronics::oversampling)
+    target_include_directories(felitronics_stream_abi_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_stream_abi_tests PRIVATE cxx_std_20)
+    target_compile_options(felitronics_stream_abi_tests PRIVATE ${FCORE_NO_FP_CONTRACT}
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-fast-math>)
+    add_test(NAME felitronics_stream_abi_tests COMMAND felitronics_stream_abi_tests)
+
     # The mastering C ABI. Same arrangement as felitronics_abi_tests one block up — the shim compiles
     # natively, so its validation, ownership and mapping layer runs under ctest, ASan and UBSan. NOT
     # given FCORE_NO_FP_CONTRACT, for the reason spelled out at fcore_master above: this suite and the
