@@ -61,7 +61,9 @@ public:
     // any shape, and whether or not the rate or the block size actually changed. "Prepared" and "just
     // constructed" name one state, so the two verbs of this class do not have to be read against each
     // other. The exceptions are reset()'s three, word for word, because this IS reset(): a recurrent
-    // cell, a capture whose conditioner is a model of its own, and NAM's own partitioned-FFT clock.
+    // cell, memory the ledger cannot see past its allowance (see reset()), and NAM's own
+    // partitioned-FFT clock. (A capture whose conditioner is a model of its own was the second one until
+    // P87 put conditioners in the ledger.)
     //
     // It is NOT "silence comes out" and not, in general, bit-identity with a stage prepared a moment
     // ago — the same two qualifications reset() carries below, for the same reasons.
@@ -163,15 +165,16 @@ public:
     // a restart. One defect in one ledger, and it was corrected in the LEDGER, so both readers moved
     // together: the registry now adds the conditioner's memory to the network's, in series, and the same
     // fixture answers digital silence with the model's own silence state through either verb.
-    // ⚠️ AND WHERE THE LEDGER CANNOT PLACE A SHAPE, IT CHARGES A CEILING, NEVER ZERO (P92). The hybrid
-    // slimmable wrapper — its real config under `config.model`, loaded by NAM, read by nothing here —
-    // was the measured case: 0 samples flushed for a model reaching 2046, on NAM's own shipped
-    // `slimmable_wavenet.nam` rewrapped. Such a shape now costs `detail::kUnreadShapeCeiling` (48 000
-    // samples) plus the 2048-sample ring per dirty lane — measured through this call, 39.7 ms per lane at
-    // a 256 block on the most expensive real capture rewrapped (44.5 ms at 64), and 4.5 ms on the wrapped
-    // slimmable itself. No shipped
-    // capture is that shape — across 2369 on the author's machine the rule fires on none — so the price
-    // is the rule's, not a regression's. See `ReceptiveField.h`.
+    // ⚠️ AND WHERE THE LEDGER CANNOT PLACE SOMETHING, IT CHARGES ONE ALLOWANCE — NEVER ZERO, NEVER THE
+    // FACE VALUE (P92). The measured case was NAM's slimmable wrapper, whose real config sits under
+    // `config.model` where nothing read it: 0 samples flushed for a model reaching 2046, on NAM's own
+    // shipped `slimmable_wavenet.nam` rewrapped. An unread config, a value that cannot be read, or a
+    // reading the ledger sets aside now adds `detail::kUnreadShapeCeiling` (48 000 samples) ONCE to what
+    // it did read, plus the 2048-sample ring — measured through this call at 39.7 ms per lane (256 block)
+    // on the most expensive real capture rewrapped, 44.5 ms at 64, and 4.5 ms on the wrapped slimmable.
+    // A dead number cannot inflate it, and the price of that is stated in `ReceptiveField.h`: a LIVE model
+    // hidden where the ledger cannot see it, with a field longer than the allowance, drains short by the
+    // difference. The rule fires on none of the 1229 distinct captures on the author's machine.
     //
     // ⚠️ AND IT CANNOT REWIND A THIRD PARTY'S CLOCK. NAM's partitioned `Linear` engine counts every
     // sample the instance has ever seen and decides from it where the next programme falls against its

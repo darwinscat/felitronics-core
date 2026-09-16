@@ -24,7 +24,7 @@ using felitronics::nam::detail::isRecurrent;
 using felitronics::nam::detail::convNetField;
 using felitronics::nam::detail::anyNestedModel;
 using felitronics::nam::detail::kUnreadShapeCeiling;
-using felitronics::nam::detail::kMaxConfigNesting;
+using felitronics::nam::detail::kMaxUnplacedHops;
 
 namespace {
 
@@ -103,6 +103,22 @@ std::string wrapperChain(int depth) {
     s += R"({"layers":[{"kernel_size":2,"dilations":[1]}]})";
     for (int i = 0; i < depth; ++i) s += "}";
     return s + "}";
+}
+// An LSTM model node `hops` unplaced configs down: {"layers":[], "m": {"layers":[], "m": … LSTM}}.
+std::string lstmUnderUnplaced(int hops) {
+    std::string s = R"({"architecture":"WaveNet","config":{"layers":[])";
+    for (int i = 1; i < hops; ++i) s += R"(,"m":{"layers":[])";
+    s += R"(,"m":{"architecture":"LSTM","config":{"hidden_size":3}})";
+    for (int i = 1; i < hops; ++i) s += "}";
+    return s + "}}";
+}
+// A plain chain of WaveNets through `condition_dsp`, ending in a Linear of `taps` — a model NAM loads.
+std::string conditionersInto(int depth, const std::string& leaf) {
+    std::string s;
+    for (int i = 0; i < depth; ++i) s += R"({"architecture":"WaveNet","config":{"layers":[1],"condition_dsp":)";
+    s += leaf;
+    for (int i = 0; i < depth; ++i) s += "}}";
+    return s;
 }
 // The shape that made the first draft of the walk EXPONENTIAL: every level a node that is both a raw
 // config and a model node, so a walk that read it both ways visited each level by two paths.
@@ -189,27 +205,28 @@ int main() {
            "…and it is NOT capped at 1<<20 = 1048576, which is where a spent number becomes a defect");
         ok(receptiveFieldOfLayers(wavenet({ 2 }, { 2000000 })["config"]) == 2000001,
            "…the same for a dilated stack that reaches back further than the old cap");
-        // 🔴 A config may carry both, and the answer is the LARGER — MOVED BY P92, on purpose. This row
-        // used to assert 9 under "the stack is the one that describes what the network does, and maxing
-        // would drain a real capture for a stale number". Two things retired that reasoning. The ruling:
-        // the registry answers an UPPER BOUND, and a stale number drained is the cheap side of an
-        // asymmetric cost. And the measurement: the chain it protected (`own = layers; if (own == 0) …`)
-        // let a READABLE stray `layers` array silence a `Linear`'s declared field — 2 for a 5000-tap
-        // capture whose impulse reaches 4999, on a loaded model — which is the row below. No real
-        // capture pays for the max: across 2369 on the author's machine, no config carries
-        // `receptive_field` beside `layers` (or at all).
+        // 🔴 A config may carry both, and the stack is the reading — BUT THE DECLARATION IT SETS ASIDE
+        // COSTS THE ALLOWANCE (P92, moved on purpose; this row asserted 9). The stack describes what a
+        // WaveNet does, and a declared number beside it may be dead; trusting it at face value (a max)
+        // was measured to be a door: `receptive_field: 2147483647` beside a real Standard's stack loads
+        // unchanged and made `reset()` run for some 32 minutes per lane. Ignoring it (the old chain) was
+        // the other door, the row below. So a reading set aside is a thing this file could not place.
         nlohmann::json both = wavenet({ 3 }, { 4 });
         both["config"]["receptive_field"] = 99999;
-        ok(receptiveFieldFromConfig(both) == 99998,
-           "a declared number beside a stack is MAXED with it, never out-voted: "
-           + std::to_string(receptiveFieldFromConfig(both)) + " (was 9 before P92)");
+        ok(receptiveFieldFromConfig(both) == 9 + 48000,
+           "a declared number beside a stack is not trusted and not ignored: the stack's 9 plus the"
+           " allowance — read " + std::to_string(receptiveFieldFromConfig(both)) + " (was 9 before P92)");
+        both["config"]["receptive_field"] = 2147483647;
+        ok(receptiveFieldFromConfig(both) == 9 + 48000,
+           "…and a DEAD one at INT_MAX costs the same allowance, not 2^31 samples of audio-thread work");
         {
             nlohmann::json strayLayers = linear(5000);
             strayLayers["config"]["layers"] = nlohmann::json::array({
                 { { "kernel_size", 2 }, { "dilations", nlohmann::json::array({ 1 }) } } });
-            ok(receptiveFieldFromConfig(strayLayers) == 4999,
+            ok(receptiveFieldFromConfig(strayLayers) == 2 + 48000,
                "…which is what closes a Linear carrying a READABLE stray `layers` array: its parser reads"
-               " neither key, the file loads, and the chain answered 2 for a 4999-sample memory — read "
+               " neither key, the file loads, the chain answered 2 for a 4999-sample memory, and the"
+               " declared field it sets aside now costs the allowance — read "
                + std::to_string(receptiveFieldFromConfig(strayLayers)));
         }
         ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", 0 } } } }) == 0,
@@ -241,9 +258,10 @@ int main() {
            "…and one holding neither is charged neither");
         ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", -5 } } } }) == 0,
            "…and a negative one is not carried into a length");
-        ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", "long" } } } }) == 0,
-           "…and one that is not a number is refused rather than thrown on: this file runs inside"
-           " prepareModel's catch-all, where a throw would REFUSE the load");
+        ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", "long" } } } }) == 48000,
+           "…and one that is not a number is refused rather than thrown on — this file runs inside"
+           " prepareModel's catch-all, where a throw would REFUSE the load — and a value that is THERE"
+           " and cannot be read is the allowance, not zero (P92; this row asserted 0)");
         // 🔴 BUT A FLOAT SPELLING IS A NUMBER. `2001.0` is not `is_number_integer()`, and NAM's own
         // parser takes it (`get<int>()` static_casts any arithmetic node), so a guard that demands an
         // integer refuses a capture that LOADS — and it drains for nothing. Measured: with the narrow
@@ -525,23 +543,23 @@ int main() {
         ok(receptiveFieldFromConfig(convnet({ })) == 0, "…and an empty stack is zero, not one");
         ok(receptiveFieldFromConfig(conditionedBy(convnet({ 1, 2, 4, 8 }), { 2 }, { 1 })) == 18,
            "…and a ConvNet CONDITIONER is added like any other: 2 + 16");
-        // 🔴 A top-level `dilations` beside real `layers` is READ, and MAXED — MOVED BY P92, on purpose.
-        // It is still true that NAM's WaveNet parser never looks there. This row used to assert 2, and the
-        // gate behind it (`convNetField` returns 0 when `layers` is non-empty) existed so a WaveNet's
-        // stack would not be counted twice. The readers are now MAXED, which cannot count anything twice,
-        // and the gate was a reader silencing another: a ConvNet carrying a NON-EMPTY dead `layers`
-        // array — its parser never reads the key, so the file loads — answered 0 where NAM's field is
-        // 256. The over-charge here is the price, and it is on a synthetic row: across 2369 real
-        // captures no config carries a top-level `dilations` beside `layers`.
+        // 🔴 A top-level `dilations` beside real `layers` is set aside, and COSTS THE ALLOWANCE (P92,
+        // moved on purpose; this row asserted 2). NAM's WaveNet parser never looks there, and the stack
+        // is the reading; but a reading set aside is one this file cannot place — see the declared row
+        // above for why neither trusting it nor ignoring it is safe.
         {
             nlohmann::json both = wavenet({ 2 }, { 1 });
             both["config"]["dilations"] = nlohmann::json::array({ 1000 });
-            ok(receptiveFieldFromConfig(both) == 1001,
-               "…and a stray top-level `dilations` beside real `layers` is maxed with them, not suppressed: "
+            ok(receptiveFieldFromConfig(both) == 2 + 48000,
+               "…and a stray top-level `dilations` beside real `layers` is the stack plus the allowance: "
                + std::to_string(receptiveFieldFromConfig(both)) + " (was 2 before P92)");
+            // …and the gate that used to suppress this reader for a NON-EMPTY `layers` is gone: NAM's
+            // ConvNet parser never reads `layers`, so a ConvNet carrying `"layers":[{}]` LOADS, and this
+            // answered 0 where NAM's field is 256. An entry with no dilations reads as no stack, so
+            // nothing is set aside and nothing is charged.
             nlohmann::json deadNonEmpty = convnet({ 1, 2, 4, 8, 16, 32, 64, 128 });
             deadNonEmpty["config"]["layers"] = nlohmann::json::array({ nlohmann::json::object() });
-            ok(receptiveFieldFromConfig(deadNonEmpty) == 256,
+            ok(receptiveFieldFromConfig(deadNonEmpty) == 256 && partitionedTailSamples(deadNonEmpty) == 0,
                "…which is what closes a ConvNet carrying a NON-EMPTY dead `layers`: 1 + 255, as NAM computes"
                " it, where the gate answered 0 — read " + std::to_string(receptiveFieldFromConfig(deadNonEmpty)));
         }
@@ -560,22 +578,26 @@ int main() {
         }
         // 🔴 A NUMBER THAT DOES NOT FIT IS REFUSED, NOT CAST. `is_number()` is deliberately wide (NAM's
         // own `get<int>()` takes `2001.0`), but static_casting a float that is out of the integer's
-        // range is UNDEFINED BEHAVIOUR, and this repository's CI has a hard-fail UBSan job. A refusal
-        // reads as absent — the same answer this file already gives a field spelled as a string.
-        ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", 1e300 } } } }) == 0,
-           "a field of 1e300 is refused, not cast: the cast is UB and the answer would be a number"
-           " nobody can trust");
+        // range is UNDEFINED BEHAVIOUR, and this repository's CI has a hard-fail UBSan job.
+        // 🔴 AND A REFUSAL IS THE ALLOWANCE, NOT "ABSENT" (P92; these rows asserted the value without the
+        // refused entry). "Absent" relied on NAM's own number covering what NAM built, and a slimmable
+        // WaveNet answers `return 0`: `dilations:[4294967396]` loads as dilation 100, reaches 100, and
+        // this file answered 0 for it.
+        ok(receptiveFieldFromConfig({ { "architecture", "Linear" }, { "config", { { "receptive_field", 1e300 } } } }) == 48000,
+           "a field of 1e300 is refused, not cast — the cast is UB — and charged the allowance");
         {
             nlohmann::json hugeHead = { { "architecture", "WaveNet" },
                                         { "config", { { "layers", nlohmann::json::array({
                                               { { "kernel_size", 2 }, { "dilations", nlohmann::json::array({ 1 }) },
                                                 { "head", { { "out_channels", 1 }, { "kernel_size", 1e300 },
                                                             { "bias", false } } } } }) } } } };
-            ok(receptiveFieldFromConfig(hugeHead) == 2, "…and so is a head kernel of 1e300");
+            ok(receptiveFieldFromConfig(hugeHead) == 2 + 48000,
+               "…and so is a head kernel of 1e300: the stack's 2 plus the allowance");
             nlohmann::json hugeConv = { { "architecture", "ConvNet" },
                                         { "config", { { "channels", 1 },
                                                       { "dilations", nlohmann::json::array({ 1e300, 4 }) } } } };
-            ok(receptiveFieldFromConfig(hugeConv) == 5, "…and one dilation of 1e300 is skipped, not carried");
+            ok(receptiveFieldFromConfig(hugeConv) == 5 + 48000,
+               "…and one dilation of 1e300 is skipped, not carried, and costs the allowance beside its neighbour's 5");
             // …and a product that would overflow is CLAMPED, not wrapped. 2e9 x 2e9 is 4e18, past int
             // and past a careless long long accumulation; a wrap here would answer a NEGATIVE field.
             nlohmann::json overflowing = { { "architecture", "WaveNet" },
@@ -590,13 +612,13 @@ int main() {
             // whose dilation is 100 — a file that loads. Clamping to INT_MAX would be an upper bound
             // that is true and useless, and it is SPENT: 2 147 483 646 samples of inference, a measured
             // 23.7 s of synchronous audio-thread work in reset(), for a model that remembers a hundred.
-            // Refused reads as absent, and NAM's own answer then covers what it did build.
+            // Refused is the allowance: NAM's own answer covers what it built only where NAM answers.
             nlohmann::json pastTheInt = { { "architecture", "WaveNet" },
                                           { "config", { { "layers", nlohmann::json::array({
                                                 { { "kernel_size", 2 },
                                                   { "dilations", nlohmann::json::array({ 4294967396LL, 4 }) } } }) } } } };
-            ok(receptiveFieldFromConfig(pastTheInt) == 5,
-               "a dilation past the int is refused and its neighbour still counts: "
+            ok(receptiveFieldFromConfig(pastTheInt) == 5 + 48000,
+               "a dilation past the int is refused, its neighbour still counts, and the refusal costs the allowance: "
                + std::to_string(receptiveFieldFromConfig(pastTheInt)));
             // 🔴 AND A BOOLEAN IS A NUMBER TO NAM. `get<int>(true)` is 1 — measured — so NAM loads
             // `"dilations":[true,true]` as `[1,1]` and answers 3 for it, while `is_number()` says no and
@@ -640,13 +662,15 @@ int main() {
         }
     }
 
-    group("P92: a config this file cannot place answers a CEILING, never zero");
+    group("P92: what this file cannot place costs ONE allowance — never the face value, never zero");
     {
-        // 🔴 WHAT THE REGISTRY PROMISES, FIRST. An UPPER BOUND on the memory of the whole model, and
-        // therefore, for a shape it cannot place, a named ceiling — not zero, because zero is the tail of
-        // the previous sound leaking out of silence, and the ceiling is only inference nobody hears.
-        // The number is a POLICY literal; a legal change to it must update these rows on purpose.
-        ok(kUnreadShapeCeiling == 48000, "the ceiling is 48 000 samples");
+        // 🔴 WHAT THE REGISTRY PROMISES, FIRST. An UPPER BOUND on the memory of the whole model. What it
+        // PLACES it trusts; for anything it cannot place — an unread config, a refused value, a reading
+        // it sets aside — it adds ONE allowance for the whole tree. Not zero: zero is the previous sound
+        // coming out of silence. Not the face value: a dead number is unbounded and is spent on the audio
+        // thread. The number is a POLICY literal; a legal change to it must update these rows on purpose.
+        ok(kUnreadShapeCeiling == 48000 && kMaxUnplacedHops == 32,
+           "the allowance is 48 000 samples, and the recurrence walk follows 32 unplaced hops");
 
         // THE SHAPE THAT MADE THE RULE — NAM's own shipped capture, rewrapped. It LOADS (the WaveNet
         // parser delegates on the top-level marker and the delegate reads `config.model`), it is the same
@@ -655,14 +679,13 @@ int main() {
         const auto wrap = wrapped(realSlimmableConfig());
         ok(receptiveFieldFromConfig(flat) == 2047 && partitionedTailSamples(flat) == 0 && ! isRecurrent(flat),
            "the FLAT shipped slimmable is unchanged: field 2047 (2*1023 + 1, by hand), no ring, not recurrent");
-        ok(receptiveFieldFromConfig(wrap) == 48000,
-           "the WRAPPED one answers the ceiling, where it answered 0 — read "
-           + std::to_string(receptiveFieldFromConfig(wrap)));
+        ok(receptiveFieldFromConfig(wrap) == 48000 && partitionedTailSamples(wrap) == 2048 && ! isRecurrent(wrap),
+           "the WRAPPED one answers the allowance and the ring, where it answered 0 — read "
+           + std::to_string(receptiveFieldFromConfig(wrap)) + ", ring " + std::to_string(partitionedTailSamples(wrap)));
 
-        // 🔴 THE JOINT ROW — one model, all three readers, one assertion. This is the row a fix made in
-        // ONE of the three functions fails: the wrapper hides a conditioner that is a container of a
-        // Linear and an LSTM, so the field, the ring and the recurrence ALL move together or the row is
-        // red. Before P92 all three read nothing: 0, 0, false.
+        // 🔴 THE JOINT ROW — one model, all three readers, one assertion. A fix made in ONE of the three
+        // functions fails it: the wrapper hides a conditioner that is a container of a Linear and an LSTM.
+        // Before P92 all three read nothing: 0, 0, false.
         {
             nlohmann::json inner = realSlimmableConfig();
             inner["condition_dsp"] = { { "architecture", "SlimmableContainer" },
@@ -671,7 +694,7 @@ int main() {
                                              { { "model", { { "architecture", "LSTM" } } } } }) } } } };
             const auto model = wrapped(inner);
             ok(receptiveFieldFromConfig(model) == 48000 && partitionedTailSamples(model) == 2048 && isRecurrent(model),
-               "one wrapped model, three answers, all three THROUGH the wrapper: field "
+               "one wrapped model, three answers, all three moved by the wrapper: field "
                + std::to_string(receptiveFieldFromConfig(model)) + ", ring "
                + std::to_string(partitionedTailSamples(model)) + ", recurrent "
                + std::to_string((int) isRecurrent(model)));
@@ -682,59 +705,101 @@ int main() {
                "a wrapper is NOT declared recurrent for being a wrapper — recurrence stays a read fact");
         }
 
-        // THE RING IS CHARGED FOR THE SHAPE ITSELF, with no Linear anywhere in it: it is ADDED to the field
-        // at the stage, so the ceiling does not cover it.
-        ok(partitionedTailSamples(wrap) == 2048 && ! isRecurrent(wrap),
-           "the wrapped slimmable is charged the ring and is not recurrent: ring "
-           + std::to_string(partitionedTailSamples(wrap)));
-
-        // 🔴 THE CEILING IS A FLOOR, NOT A CAP. A wrapped stack LONGER than the ceiling keeps its own
-        // number; truncating it at 48 000 would be the under-drain this whole line exists against.
+        // 🔴 ONCE — measured failure of the per-node floor: a 30-byte dead sibling cost a full allowance
+        // EACH, and 50 000 of them (a 1.6 MB file NAM loads) drained INT_MAX.
+        for (const int n : { 1, 10, 1000 })
+        {
+            nlohmann::json many = wavenet({ 2 }, { 100 });
+            for (int i = 0; i < n; ++i)
+                many["config"]["dead" + std::to_string(i)] = { { "layers", nlohmann::json::array() },
+                                                               { "m", { { "layers", nlohmann::json::array() } } } };
+            ok(receptiveFieldFromConfig(many) == 101 + 48000,
+               std::to_string(n) + " unplaced siblings cost the allowance ONCE: "
+               + std::to_string(receptiveFieldFromConfig(many)));
+        }
+        // 🔴 ADDED, NOT MAXED — measured failure of a max at the root: a known 100 001 swallowed the
+        // allowance of an unreadable stage in series with it, i.e. charged that stage zero.
+        {
+            nlohmann::json known = wavenet({ 2 }, { 100000 });
+            known["config"]["stage"] = { { "layers", nlohmann::json::array() } };
+            ok(receptiveFieldFromConfig(known) == 100001 + 48000,
+               "a read stack of 100 001 plus an unreadable stage is 148 001, not 100 001: "
+               + std::to_string(receptiveFieldFromConfig(known)));
+        }
+        // 🔴 NOT THE FACE VALUE — measured failure of trusting it: a dead key costs nothing to NAM and
+        // was spent as 2^31 samples here. This is also the rule's stated PRICE: a LIVE wrapped model
+        // longer than the allowance is under-drained by the difference. No real capture is (6347 max).
         {
             nlohmann::json deep = { { "layers", nlohmann::json::array({
                                         { { "kernel_size", 2 }, { "dilations", nlohmann::json::array({ 100000 }) } } }) } };
-            ok(receptiveFieldFromConfig(wrapped(deep)) == 100001,
-               "a wrapped stack of 100 001 is not cut to the ceiling: "
-               + std::to_string(receptiveFieldFromConfig(wrapped(deep))));
-            // …and ACROSS the two halves the composition is a SUM, because this file does not know
-            // whether the unplaced node is an alternative to what it read or a stage in series with it.
-            // A real top-level stack of 11 plus the wrapped 100 001 is 100 012.
-            nlohmann::json both = wrapped(deep);
-            both["config"]["layers"] = nlohmann::json::array({
-                { { "kernel_size", 2 }, { "dilations", nlohmann::json::array({ 10 }) },
-                  { "slimmable", { { "method", "slice_channels_uniform" } } } } });
-            ok(receptiveFieldFromConfig(both) == 100012,
-               "…and a readable top level is ADDED to it, series being the worse composition: "
-               + std::to_string(receptiveFieldFromConfig(both)));
+            ok(receptiveFieldFromConfig(wrapped(deep)) == 48000,
+               "a wrapped stack of 100 001 is charged the allowance, not its face value — the price of a"
+               " rule that a dead key cannot inflate: " + std::to_string(receptiveFieldFromConfig(wrapped(deep))));
+            nlohmann::json deadHuge = wavenet({ 2 }, { 100 });
+            deadHuge["config"]["notes"] = { { "receptive_field", 2147483647 } };
+            ok(receptiveFieldFromConfig(deadHuge) == 101 + 48000,
+               "…and a dead `receptive_field` of INT_MAX under an unread key costs the same allowance: "
+               + std::to_string(receptiveFieldFromConfig(deadHuge)));
         }
 
         // A NODE THAT CARRIES THE VOCABULARY AND READS AS NOTHING is the plainest "I do not know". Where
-        // zero happens to be honest (`receptive_field: 1` is a gain), the ceiling is an over-charge, and
-        // the rule has already chosen that side.
+        // zero would be honest (`receptive_field: 1` is a gain) the allowance is an over-charge, and the
+        // rule has already chosen that side.
         ok(receptiveFieldFromConfig(wrapped({ { "layers", nlohmann::json::array() } })) == 48000
                && receptiveFieldFromConfig(wrapped({ { "receptive_field", 1 } })) == 48000
                && receptiveFieldFromConfig(wrapped({ { "dilations", nlohmann::json::array({ "x" }) } })) == 48000,
-           "an unplaced node that reads as NOTHING answers the ceiling, not zero");
+           "an unplaced node that reads as NOTHING costs the allowance, not zero");
+
+        // A REFUSED VALUE on the architecture where nothing else answers: a slimmable dilation past the
+        // int, which NAM builds as 100 and whose impulse reaches 100. It answered 0.
+        {
+            nlohmann::json refused = realSlimmableConfig();
+            refused["layers"][0]["dilations"] = nlohmann::json::array({ 4294967396LL });
+            ok(receptiveFieldFromConfig(flatSlimmable(refused)) == 48000
+                   && partitionedTailSamples(flatSlimmable(refused)) == 2048,
+               "a slimmable spelling a dilation past the int costs the allowance and the ring — it answered 0");
+        }
 
         // 🔴 THE CLASS, NOT THE ADDRESS. Nothing below is spelled the way NAM spells its wrapper today.
         {
             ok(receptiveFieldFromConfig(wrapped(realSlimmableConfig(), "future_wrapper")) == 48000,
-               "the same config under a key NAM does not use still answers the ceiling");
+               "the same config under a key NAM does not use still costs the allowance");
             nlohmann::json asArray = flatSlimmable({ { "layers", nlohmann::json::array() } });
             asArray["config"]["variants"] = nlohmann::json::array({ realSlimmableConfig(), realSlimmableConfig() });
             ok(receptiveFieldFromConfig(asArray) == 48000 && partitionedTailSamples(asArray) == 2048,
-               "…and so does an ARRAY of configs under such a key — the `submodels` shape by another name: "
-               + std::to_string(receptiveFieldFromConfig(asArray)));
+               "…and so does an ARRAY of configs under such a key — the `submodels` shape by another name");
             nlohmann::json asNode = flatSlimmable({ { "layers", nlohmann::json::array() } });
             asNode["config"]["alt"] = { { "architecture", "LSTM" }, { "config", { { "hidden_size", 3 } } } };
             ok(receptiveFieldFromConfig(asNode) == 48000 && isRecurrent(asNode),
-               "…and a whole MODEL NODE under such a key is walked for its architecture too");
+               "…and a whole MODEL NODE under such a key is walked for its architecture");
+            nlohmann::json outer = flatSlimmable({ { "layers", nlohmann::json::array() } });
+            outer["config"]["outer"] = { { "model", realSlimmableConfig() } };
+            ok(receptiveFieldFromConfig(outer) == 48000,
+               "…and a wrapper of a wrapper, whose only vocabulary word is `model`");
+            nlohmann::json hidden = flatSlimmable({ { "layers", nlohmann::json::array() } });
+            hidden["config"]["x"] = { { "architecture", "WaveNet" },
+                                      { "config", { { "weird", { { "architecture", "LSTM" },
+                                                                 { "config", { { "hidden_size", 3 } } } } } } } };
+            ok(isRecurrent(hidden),
+               "…and a model node's config is walked even when it carries no vocabulary word — an LSTM one"
+               " level further down is still found");
             nlohmann::json inLayer = flat;
             inLayer["config"]["layers"][0]["sidechain"] = { { "layers", nlohmann::json::array({
                 { { "kernel_size", 2 }, { "dilations", nlohmann::json::array({ 70000 }) } } }) } };
-            ok(receptiveFieldFromConfig(inLayer) == 2047 + 70001,
-               "…and a config hanging off a LAYER ENTRY is placed in series with the stack it rides on, and"
-               " floored: " + std::to_string(receptiveFieldFromConfig(inLayer)));
+            ok(receptiveFieldFromConfig(inLayer) == 2047 + 48000,
+               "…and a config hanging off a LAYER ENTRY is the allowance on top of the stack it rides on: "
+               + std::to_string(receptiveFieldFromConfig(inLayer)));
+            nlohmann::json inLayerArray = flat;
+            inLayerArray["config"]["layers"][0]["sidechains"] = nlohmann::json::array({
+                { { "layers", nlohmann::json::array() } } });
+            ok(receptiveFieldFromConfig(inLayerArray) == 2047 + 48000,
+               "…and an ARRAY of them there too");
+            nlohmann::json inSubmodel = { { "architecture", "SlimmableContainer" },
+                                          { "config", { { "submodels", nlohmann::json::array({
+                                                { { "max_value", 1.0 }, { "model", linear(2) },
+                                                  { "extra", { { "layers", nlohmann::json::array() } } } } }) } } } };
+            ok(receptiveFieldFromConfig(inSubmodel) == 1 + 48000 && partitionedTailSamples(inSubmodel) == 2048,
+               "…and one hanging off a SUBMODEL ENTRY beside its `model`");
         }
 
         // 🔴 AND WHERE IT MUST NOT FIRE — identity, because a false fire is ~40 ms of a real capture.
@@ -782,58 +847,62 @@ int main() {
             nlohmann::json scalarWrap = flatSlimmable({ { "layers", nlohmann::json::array() }, { "model", 7 } });
             quiet = quiet && receptiveFieldFromConfig(scalarWrap) == 0;
             ok(quiet, "`config: null / [] / 7`, a top-level array and a scalar `model` all answer 0 without throwing");
+            // …and the two shapes where NOT iterating is a decision rather than a no-op: an ARRAY config
+            // and an ARRAY layer entry. NAM cannot load either (its parsers index them by key and throw),
+            // so the answer is never spent; iterating would read their elements as unplaced configs.
+            const nlohmann::json arrayConfig = { { "architecture", "WaveNet" },
+                                                 { "config", nlohmann::json::array({
+                                                       { { "layers", nlohmann::json::array() } } }) } };
+            const nlohmann::json arrayEntry = { { "architecture", "WaveNet" },
+                                                { "config", { { "layers", nlohmann::json::array({
+                                                      nlohmann::json::array({ { { "layers", nlohmann::json::array() } } }) }) } } } };
+            ok(receptiveFieldFromConfig(arrayConfig) == 0 && receptiveFieldFromConfig(arrayEntry) == 0,
+               "an array config and an array layer entry are not iterated: "
+               + std::to_string(receptiveFieldFromConfig(arrayConfig)) + " / "
+               + std::to_string(receptiveFieldFromConfig(arrayEntry)));
         }
 
-        // 🔴 THE NESTING GUARD — measured as a CRASH before, so asserted as the absence of one, on a
-        // std::thread: its default stack is 512 KiB on macOS, 1 MiB on Windows and 8 MiB on glibc, and
-        // 100 000 levels killed the reader on every one of them (on 8 MiB it died at 80 000). Past 64
-        // levels the answer is the ceiling, and the RING goes with it: the first draft let the field say
-        // "I stopped reading" while the ring, having stopped too, said "no Linear here" — 2048 at 65
-        // levels and 0 at 66.
-        {
-            struct Row { const char* name; std::string (*build)(int); };
-            const Row rows[] { { "condition_dsp", conditionerChain }, { "submodels", containerChain } };
-            for (const auto& row : rows)
-            {
-                nlohmann::json at64 = nlohmann::json::parse(row.build(kMaxConfigNesting));
-                nlohmann::json at65 = nlohmann::json::parse(row.build(kMaxConfigNesting + 1));
-                nlohmann::json at66 = nlohmann::json::parse(row.build(kMaxConfigNesting + 2));
-                ok(receptiveFieldFromConfig(at64) == 2 && partitionedTailSamples(at64) == 2048,
-                   std::string("a ") + row.name + " chain 64 deep is still READ: field 2, ring 2048");
-                ok(receptiveFieldFromConfig(at65) == 48000 && partitionedTailSamples(at65) == 2048
-                       && receptiveFieldFromConfig(at66) == 48000 && partitionedTailSamples(at66) == 2048,
-                   std::string("…and past the guard the field AND the ring answer for what was not read (")
-                   + row.name + "): ring " + std::to_string(partitionedTailSamples(at65)) + " / "
-                   + std::to_string(partitionedTailSamples(at66)));
-            }
-            ok(kMaxConfigNesting == 64, "the guard is 64 levels, 32x the deepest real capture");
+        // 🔴 THE AXES BASE WALKED ARE NOT TRUNCATED. A first draft guarded ALL nesting at 64 levels and
+        // answered the allowance past it — which is SHORT of a model NAM loads: 65 WaveNets chained
+        // through `condition_dsp` into a 60 001-tap Linear drained 50 243 where base drained 62 243, and
+        // a restarted lane replayed 1.95484 out of silence. These axes are read as base read them.
+        ok(receptiveFieldFromConfig(nlohmann::json::parse(conditionersInto(65, R"({"architecture":"Linear","config":{"receptive_field":60001}})"))) == 60000,
+           "65 conditioners into a 60 001-tap Linear are read to the end: 60 000, as base answered");
+        ok(isRecurrent(nlohmann::json::parse(conditionersInto(70, R"({"architecture":"LSTM","config":{"hidden_size":3}})"))),
+           "…and an LSTM at the end of 70 conditioners is still recurrent, as base answered");
 
-            int field[3] { -1, -1, -1 }, ring[3] { -1, -1, -1 };
-            bool rec[3] { true, true, true };
+        // 🔴 THE UNPLACED AXIS IS GUARDED, and only it — the one recursion P92 added. Within the guard an
+        // LSTM is found; past it the walk stops and recurrence is not assumed; the field carries the
+        // allowance either way. And a 100 000-hop file is walked on a worker thread without a crash: a
+        // std::thread's default stack is 512 KiB on macOS, 1 MiB on Windows, 8 MiB on glibc, and the
+        // unguarded walk died at ~1000 hops on the smallest of them.
+        {
+            const auto near = nlohmann::json::parse(lstmUnderUnplaced(kMaxUnplacedHops));
+            const auto far  = nlohmann::json::parse(lstmUnderUnplaced(kMaxUnplacedHops + 1));
+            ok(isRecurrent(near) && ! isRecurrent(far)
+                   && receptiveFieldFromConfig(near) == 48000 && receptiveFieldFromConfig(far) == 48000
+                   && partitionedTailSamples(far) == 2048,
+               "an LSTM 32 unplaced hops down is found, one 33 hops down is not assumed, and both cost the"
+               " allowance and the ring");
+            int field = -1, ring = -1;
+            bool rec = true;
             std::thread worker([&] {
-                std::string (* const builds[3])(int) { conditionerChain, containerChain, wrapperChain };
-                for (int i = 0; i < 3; ++i)
-                {
-                    const nlohmann::json hostile = nlohmann::json::parse(builds[i](100000));
-                    field[i] = receptiveFieldFromConfig(hostile);
-                    ring[i]  = partitionedTailSamples(hostile);
-                    rec[i]   = isRecurrent(hostile);
-                }
+                const nlohmann::json hostile = nlohmann::json::parse(wrapperChain(100000));
+                field = receptiveFieldFromConfig(hostile);
+                ring  = partitionedTailSamples(hostile);
+                rec   = isRecurrent(hostile);
             });
             worker.join();
-            ok(field[0] == 48000 && field[1] == 48000 && field[2] >= 48000
-                   && ring[0] == 2048 && ring[1] == 2048 && ring[2] == 2048 && ! rec[0] && ! rec[1] && ! rec[2],
-               "100 000 levels of condition_dsp, submodels and dead `model` keys, on a worker thread: no crash,"
-               " and the ceiling — fields " + std::to_string(field[0]) + " / " + std::to_string(field[1])
-               + " / " + std::to_string(field[2]));
+            ok(field == 2 + 48000 && ring == 2048 && ! rec,
+               "100 000 dead `model` keys, on a worker thread: no crash, the top stack's 2 plus the allowance —"
+               " read " + std::to_string(field));
         }
 
-        // 🔴 AND LINEAR, NOT EXPONENTIAL. The first draft read an unplaced node twice — as a model node
+        // 🔴 AND LINEAR, NOT EXPONENTIAL. A first draft read an unplaced node twice — as a model node
         // through its `config`, and as a raw config whose `config` key is itself unplaced — so every
-        // level was reached by two paths, and the work grew like Fibonacci: 19 ms at 22 levels, some
-        // 10^6 seconds at the guard, from a 1.5 KB file. Asked two ways: by COUNTING the predicate calls
-        // of the walk the ring and the recurrence use (deterministic), and by bounding the field's time at
-        // a depth where the doubled walk takes seconds and the single one microseconds.
+        // level was reached by two paths and the work grew about 1.6x per level. Asked two ways: by
+        // COUNTING the predicate calls (deterministic), and by bounding the time within the guard, where
+        // the doubled walk takes seconds and the single one microseconds.
         {
             const nlohmann::json chain30 = nlohmann::json::parse(doubleReadingChain(30));
             predCalls.store(0);
@@ -841,16 +910,12 @@ int main() {
             ok(predCalls.load() <= 2 * 30 + 8,
                "the walk asks each level ONCE: " + std::to_string(predCalls.load())
                + " predicate calls over 30 levels (the doubled walk asks about 1.6^30)");
-            const nlohmann::json chain36 = nlohmann::json::parse(doubleReadingChain(36));
+            const nlohmann::json chain32 = nlohmann::json::parse(doubleReadingChain(kMaxUnplacedHops));
             const auto t0 = std::chrono::steady_clock::now();
-            const int f36 = receptiveFieldFromConfig(chain36);
+            const bool r32 = isRecurrent(chain32);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            ok(f36 == 48000 && ms < 250.0,
-               "…and so does the field: 36 levels in " + std::to_string(ms) + " ms (the doubled walk took ~14 s"
-               " here; the single one takes microseconds)");
-            const nlohmann::json chainAtGuard = nlohmann::json::parse(doubleReadingChain(kMaxConfigNesting + 8));
-            ok(receptiveFieldFromConfig(chainAtGuard) == 48000 && partitionedTailSamples(chainAtGuard) == 2048,
-               "…and a chain PAST the guard finishes at all, which the doubled walk would not in a lifetime");
+            ok(! r32 && ms < 250.0 && receptiveFieldFromConfig(chain32) == 48000,
+               "…and 32 hops take " + std::to_string(ms) + " ms (the doubled walk takes seconds here)");
         }
     }
 
