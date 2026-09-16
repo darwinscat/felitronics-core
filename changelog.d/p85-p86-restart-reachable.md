@@ -48,12 +48,15 @@ Two doors stood in the way, and each was half the same defect. This opens both.
   and what it buys is a hole — 18 blocks, 192 ms, at every restart. Re-arming only the sounding slot is
   worse: the law rails the goal to the neighbour and plays a full spurious crossfade to the other capture
   and back. The price of the verb is FOUR networks, not one: two stages, each up to two lanes.
-- **`convolution::MatrixConvolverNupc::clearAudioState()` (new, additive).** `reset()` there zeroes the
-  history AND cancels a swap in flight (`xfadePos_ = 0; state_ = 0`, keeping `cur_`), so a filter
-  published a block ago and still crossfading in is dropped — and `CabConvolver::pendingRetry_` is
-  already false after a successful publish, so nothing ever re-stages it: the knob move is lost until the
+- **`convolution::MatrixConvolverNupc::clearAudioState()` (new, additive).** `reset()` there zeroed the
+  history AND cancelled a swap in flight (`xfadePos_ = 0; state_ = 0`, keeping `cur_`), so a filter
+  published a block ago and still crossfading in was dropped — and `CabConvolver::pendingRetry_` is
+  already false after a successful publish, so nothing ever re-staged it: the knob move was lost until the
   next knob move. `clearAudioState()` is the history alone, touching only buffers `process()` writes, so
   a composite can restart on the audio thread without losing a filter or racing the message thread.
-  `reset()` is now that plus the two cancel lines. `CabConvolver` forwards it.
+  `CabConvolver` forwards it. (The verb itself is fixed in the same release — see the P88 entry: `reset()`
+  now ADOPTS the publication instead of dropping it, in all three convolvers. That removes the reason
+  `RigPlayer::reset()` reaches for `clearAudioState()`, which leaves a fade running and so does not give a
+  restart's independence mid-fade; switching the player is registered as its own task.)
 
 Green: macOS/clang `ctest` 131/131 with `-DFELITRONICS_WITH_NAM=ON`, deb/gcc-14.2 131/131.
