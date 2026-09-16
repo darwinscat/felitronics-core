@@ -426,7 +426,10 @@ jobs:
           cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
                 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
           cmake --build build-wasm-checked -j "$(nproc)"
-          ctest --test-dir build-wasm-checked -j4 --output-on-failure -E spectrum_pane_perf
+          # All cores: the one test that must not share the machine — the wall-clock gate — is excluded right
+          # here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is checked,
+          # which makes this the slowest test run in the workflow; capping it at 4 left deb three-quarters idle.
+          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E spectrum_pane_perf
       - name: The P0 spike artifacts still build
         run: ./tools/wasm/build.sh
       - name: NULL test — native vs wasm, bit-exact, on a GENERATED fixture
