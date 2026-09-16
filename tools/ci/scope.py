@@ -16,7 +16,8 @@ Prints a summary and, under GitHub Actions, writes to $GITHUB_OUTPUT:
 
 Every mapping is DERIVED, none is listed by hand -- in this repository a hand list is the first thing to go
 stale:
-    test    -> module   the CMakeLists.txt under modules/<m>/ that declares it with add_test(NAME ...)
+    test    -> module   the CMakeLists.txt under modules/<m>/ that declares it with add_test(NAME ...); a name
+                        built from a variable (a foreach over test files) matches any value of that variable
     module  -> users    #include <felitronics/<m>/...> anywhere in modules/<user>/ (headers, sources, tests)
     tools   -> modules  the same includes read from tools/, then closed forward through the modules' own
 
@@ -32,7 +33,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INCLUDE = re.compile(r'#\s*include\s*[<"]felitronics/([a-z0-9]+)/')
-ADD_TEST = re.compile(r'add_test\s*\(\s*NAME\s+([A-Za-z0-9_]+)')
+ADD_TEST = re.compile(r'add_test\s*\(\s*NAME\s+([A-Za-z0-9_${}]+)')
+VARIABLE = re.compile(r'\$\{[^}]*\}')
 SOURCE_SUFFIXES = {'.h', '.hpp', '.cpp', '.cc', '.inl'}
 
 
@@ -53,7 +55,11 @@ def included_modules(directory):
 def declared_tests(directory):
     names = set()
     for cml in directory.rglob('CMakeLists.txt'):
-        names |= set(ADD_TEST.findall(cml.read_text(encoding='utf-8', errors='replace')))
+        for name in ADD_TEST.findall(cml.read_text(encoding='utf-8', errors='replace')):
+            # rigplayer names its tests felitronics_rigplayer_${tl}_tests: read literally that was the prefix
+            # alone, which matches no test, so its four suites silently left every selection. Stand for any
+            # value of the variable instead -- selecting too much is visible, selecting too little is green.
+            names.add(VARIABLE.sub('[A-Za-z0-9_]*', name))
     return names
 
 
