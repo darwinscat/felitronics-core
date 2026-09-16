@@ -67,14 +67,24 @@ public:
     // ago — the same two qualifications reset() carries below, for the same reasons.
     //
     // ⚠️ WHAT IT COSTS. Where it charges anything, the charge is reset()'s: one lane's whole drain
-    // length of inference per lane that has EVER been fed — 3.77 ms for a real Standard WaveNet at a
-    // 64-sample block, per lane. This call is already the expensive one (it allocates and prewarms the
+    // length of inference per lane that may still be holding audio — fed since it was last emptied —
+    // 3.77 ms for a real Standard WaveNet at a 64-sample block, per lane. A lane whose falling-edge
+    // drain ran to the end HAS been emptied and is not charged (P90: it used to be, a second time). This call is already the expensive one (it allocates and prewarms the
     // network), it is the message thread's, and it has no callback to miss. A FIRST prepare after a
     // load costs nothing at all — nothing has been fed, so there is nothing owed — and neither does the
     // re-prepare a model swap performs, for the same reason. The lane a permanently mono host never
     // hands over is never charged either. For an architecture whose own Reset already PREWARMS (every
     // WaveNet), this drain is a second pass over the field and roughly doubles the call: a stereo real
     // Standard measured 6.5 ms before and 13.1 ms after at 48 kHz.
+    //
+    // ⚠️ AND THAT SECOND PASS IS SKIPPABLE ONLY PER ARCHITECTURE — measured, and registered as P98 rather
+    // than taken. With the drain removed outright, every capture in NAM's own example set keeps
+    // independence at exactly 0 (and its 3.58e-07 residue against a fresh stage vanishes), because a
+    // WaveNet's `SetMaxBufferSize` zeroes its rings; this file's own fixtures then leak on 72 of 96 grid
+    // cells, worst 0.567861, because a `Buffer`-based capture (Linear, ConvNet) keeps its window through
+    // `Reset`. The real example set contains no such capture anywhere in any tree, so a check run only on
+    // real captures would have called a blanket skip safe. The predicate belongs to the receptive-field
+    // registry, which already walks the tree.
     //
     // ⚠️ AND THE COST NOW SCALES WITH THE HOST RATE, which it did not before and which no caller would
     // guess. The drain is the field converted into HOST samples, so a rate-matched capture is charged

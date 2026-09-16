@@ -376,8 +376,10 @@ public:
     // WHAT IT DELIBERATELY DOES NOT TOUCH, because none of it is audio the caller fed:
     //   · THE BLEND LAW's state — which capture is held, which is wanted, the applied weight, the cold
     //     flags, a load in flight, a load refused. A restart is not a device change. In particular it
-    //     does NOT re-arm `fed[]`. The case for re-arming is that after `nam_[i].reset()` the network
-    //     is back in the just-landed state, so the law's ledger reads "warm" for a flushed network.
+    //     does NOT re-arm `fed[]` for a slot that is ALREADY AUDIBLE — a slot still WARMING is the one
+    //     exception, re-armed below, see the end of this function and nam::blendRestated. The case for
+    //     re-arming an audible slot is that after `nam_[i].reset()` the network is back in the
+    //     just-landed state, so the law's ledger reads "warm" for a flushed network.
     //     The case against won, on three counts, and the third is the one that decides it:
     //       (1) invariant 3 protects the stream's CONSISTENCY — a slot that missed the last 132 ms
     //           beside one that heard it. A restart zeroes the past of both slots AND the dry ring
@@ -409,11 +411,9 @@ public:
     // lanes — so a stereo host with both slots sounding pays 4 x that stage's figure (a real Standard
     // WaveNet is 3.77 ms per lane at a 64-sample block). It is idempotent exactly as the stage's is:
     // the debt is re-armed only by audio actually being fed, a sleeping slot mid-drain pays only the
-    // remainder, and a mono host pays for half of it. A lane that drained ALL the way at a falling edge
-    // is the one place that is not tight: it is provably clean and is charged a full drain anyway,
-    // because `everFed_` is cleared by a restart and not by a completed drain — measured, a lane that
-    // had just spent its whole 2562 is charged again, so the next prepare spends 5124 and not 2562.
-    // Cost only, and registered against that ledger rather than papered over here. Callable from the audio thread — nothing here
+    // remainder, and a mono host pays for half of it — and a lane whose falling-edge drain already ran
+    // to the end pays nothing: until P90 it was charged a whole drain a second time (5124 where 2562 was
+    // owed), because only a restart cleared the stage's "may be holding audio" flag. Callable from the audio thread — nothing here
     // allocates, locks, throws or touches a field the message thread owns — and NOT free there. The
     // natural place is where prepareToPlay is; `prepare()` already performs this restart itself.
     void reset() noexcept {

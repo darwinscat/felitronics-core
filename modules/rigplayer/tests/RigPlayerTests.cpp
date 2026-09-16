@@ -2144,11 +2144,12 @@ int main() {
     // that was DESIGNED for a rate — the FIRs, the bands, the dry aligner, both stages, the cold
     // threshold — and nothing that was COUNTED in one.
     //
-    // ⚠️ THE ONE-POINT FIXTURE WOULD HAVE PASSED. 44.1 <-> 48 kHz reads exactly right at a 256-sample
-    // block, and so does 88.2 <-> 96: the warm-up was frozen at the LANDING rate, so the error is the
-    // ratio of the two rates, and the two pairs a fixture would reach for first are the two where that
-    // ratio is ~1. The grid below is what makes the defect visible at all, and it is P85's lesson with a
-    // second set of numbers.
+    // ⚠️ THE ONE-POINT FIXTURE WOULD HAVE PASSED. On the base commit this grid read 85 cells under-warm,
+    // 85 over-warm and exactly 10 right — eight of those 10 are 44.1 <-> 48 kHz, the pair a fixture would
+    // reach for first, and the other two are 88.2 <-> 96 on the WaveNet at a 256-sample block. The
+    // warm-up was frozen at the LANDING rate, so the error follows the ratio of the two rates, and the
+    // obvious pairs are where that ratio is ~1. The grid below is what makes the defect visible at all,
+    // and it is P85's lesson with a second set of numbers.
     group("P89: a slot woken after a RATE CHANGE warms for the field the NEW rate owes");
     {
         namz::rig::Rig r;

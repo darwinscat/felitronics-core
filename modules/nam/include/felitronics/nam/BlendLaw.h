@@ -231,7 +231,7 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
     s.refused[slot] = 0;                 // what landed is real; whatever was refused may be asked anew
 }
 
-// 🔴 THE HOST RATE MOVED, AND HALF THIS LEDGER IS IN HOST SAMPLES. `need` is a count of host samples
+// 🔴 THE HOST RATE MOVED, AND THREE OF THIS LEDGER'S NUMBERS ARE HOST SAMPLES. `need` is a count of them
 // (NamStage::prewarmSamples() converted, plus the rate-matcher's latency, plus one block — see
 // rigplayer::RigPlayer::warmFor), and until P89 nothing recomputed it when the host handed the player a
 // new rate: it was written once, at the landing, and read for ever after — including by the WAKE at the
@@ -239,16 +239,18 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
 //
 // WHAT THAT COST, measured through the player on a 6x6 grid of host rates, two block sizes and three
 // shapes (a 2001-tap Linear, an untagged one, a WaveNet): the warm-up a woken slot is held for does not
-// depend on the new rate AT ALL — it is frozen at the rate the model landed at, so the ratio of what the
-// law demands to what the field actually needs is exactly fs_landed/fs_now. 48 -> 96 kHz warms a slot for
-// 2048 host samples where 4096 are owed — half a field, which is invariant 3 broken in the direction the
-// law calls the bad one. 48 -> 192 kHz warms for a quarter. The other direction over-warms by the same
-// factor: 192 -> 48 kHz holds a slot silent four times longer than it needs.
+// depend on the new rate AT ALL. It is, sample for sample, the warm-up the slot had at the rate its model
+// landed at — so the error tracks fs_landed/fs_now (roughly: the latency and block terms do not scale, so
+// 44.1 -> 96 kHz reads 0.469 where the bare ratio is 0.459). 48 -> 96 kHz warms a slot for 2048 host
+// samples where 4096 are owed — half a field, which is invariant 3 broken in the direction the law calls
+// the bad one. 48 -> 192 kHz warms for a quarter. The other direction over-warms: 192 -> 48 kHz holds a
+// slot silent four times longer than it needs.
 //
-// ⚠️ AND A ONE-POINT FIXTURE WOULD HAVE CALLED IT CLEAN. 44.1 <-> 48 kHz — the two rates nearly every
-// session on earth uses — reads a ratio of 1.000 at a 256-sample block, and so does 88.2 <-> 96. Of the
-// 180 cells measured, 85 under-warm, 95 over-warm, and the handful that read exactly right are the ones a
-// single fixture would have sat on. This is P85's lesson with a second set of numbers.
+// ⚠️ AND A ONE-POINT FIXTURE WOULD HAVE CALLED IT CLEAN. Of the 180 cells, 85 under-warm, 85 over-warm,
+// and exactly 10 read right — eight of them 44.1 <-> 48 kHz, the two rates nearly every session on earth
+// uses, and the other two 88.2 <-> 96 on the WaveNet at a 256-sample block. A fixture reaching for the
+// obvious pair sits on the one place the defect is invisible. This is P85's lesson with a second set of
+// numbers.
 //
 // WHAT THIS VERB DOES, and it is NOT blendLanded(). A restart is not a landing: it must not clear
 // `inFlight` (a second load could then be asked for a slot that already has one out), nor `cold`, nor

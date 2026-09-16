@@ -196,7 +196,10 @@ public:
         // message thread, with no callback to miss, and it is the price of one rule instead of two.
         // Skipping it where NAM's own prewarm provably covers the ledger is a real optimisation and is
         // registered as one rather than taken here: it is a predicate, and it would put back exactly
-        // the kind of "this case does not need it" reasoning this fix exists to remove.
+        // the kind of "this case does not need it" reasoning this fix exists to remove. P90 measured the
+        // split (see NamStage.h, "SKIPPABLE ONLY PER ARCHITECTURE"): exact for every WaveNet NAM ships,
+        // a 0.568 leak for a Linear — so the predicate is structural, belongs to the receptive-field
+        // registry, and is P98.
         //
         // OUTSIDE the try on purpose: reset() is noexcept, so a throw inside it terminates rather than
         // landing in that catch, and putting it there would suggest otherwise. Skipped when this prepare
