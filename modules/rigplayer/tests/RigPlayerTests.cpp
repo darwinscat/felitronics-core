@@ -19,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 using felitronics::test::approx;
@@ -2131,6 +2132,800 @@ int main() {
             std::vector<float> x((std::size_t) kBlock, 0.0f);
             float* io[1] { x.data() };
             ok(b.p.process(io, 1, kBlock), "…and two restarts in a row leave a prepared player playable");
+        }
+    }
+
+    // ==========================================================================================
+    // P89 — WHAT A prepare() LEAVES EXPRESSED IN THE SAMPLES OF A RATE THAT IS GONE.
+    //
+    // The player counts two things in HOST samples and used to write both once and read them for ever:
+    // the blend law's warm-up debt (`need`, latched from warmFor() at the landing) and the two per-slot
+    // alignment delays (AlignmentTable::delayOf scales by the host rate). prepare() rebuilt everything
+    // that was DESIGNED for a rate — the FIRs, the bands, the dry aligner, both stages, the cold
+    // threshold — and nothing that was COUNTED in one.
+    //
+    // ⚠️ THE ONE-POINT FIXTURE WOULD HAVE PASSED. On the base commit this grid read 85 cells under-warm,
+    // 85 over-warm and exactly 10 right — eight of those 10 are 44.1 <-> 48 kHz, the pair a fixture would
+    // reach for first, and the other two are 88.2 <-> 96 on the WaveNet at a 256-sample block. The
+    // warm-up was frozen at the LANDING rate, so the error follows the ratio of the two rates, and the
+    // obvious pairs are where that ratio is ~1. The grid below is what makes the defect visible at all,
+    // and it is P85's lesson with a second set of numbers.
+    group("P89: a slot woken after a RATE CHANGE warms for the field the NEW rate owes");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // THE FIELD THE LEDGER REPORTS, WHICH IS NOT THE TAP COUNT. `delayModel(2000)` declares
+        // `receptive_field: 2001`, and NamStage::prewarmSamples() answers 2000 — the house convention is
+        // the model's REACH BACK, taps minus the sample it is answering for, and NamStage.h says so of
+        // this very shape ("a 2001-tap Linear reports 2000"). Writing 2001 here agreed with the measured
+        // player at every rate on the grid EXCEPT 96 kHz, where the doubling and the ceil push the extra
+        // sample across a block boundary — an off-by-one that only a grid can see, and the reason this
+        // oracle is spelled out rather than read back off warmFor().
+        constexpr int kField = 2000;
+
+        // One player, driven to the state the measurement needs: parked so the neighbour slot falls
+        // asleep, then hushed so the waking turn lands on silence. Returns the host samples of warm-up
+        // the law actually held the woken slot for, or -1 if the turn turned out to be a SWAP rather
+        // than a wake — a load re-lands the slot and would answer a different question.
+        struct Warm {
+            RigPlayer p;
+            std::map<std::string, std::vector<std::byte>> files;
+            double fs; int block; double phase = 0.0;
+            Warm(const namz::rig::Rig& rig, const std::string& nam, double sampleRate, int blk)
+                : fs(sampleRate), block(blk) {
+                files = { { "early", bytesOf(nam) }, { "mid", bytesOf(nam) }, { "late", bytesOf(nam) } };
+                felitronics::test::run (p.prepare(fs, block, 1));
+                p.load(rig, [this](const std::string& id) {
+                    const auto it = files.find(id);
+                    return it == files.end() ? std::vector<std::byte> {} : it->second;
+                });
+                p.setBlendShape({ 0.5, 0.0 });             // STEP: the neighbour sits at exactly zero
+            }
+            void run(int blocks, double a) {
+                std::vector<float> x((std::size_t) block);
+                for (int b = 0; b < blocks; ++b) {
+                    for (int i = 0; i < block; ++i) {
+                        x[(std::size_t) i] = (float) (a * std::sin(phase));
+                        phase += 2.0 * 3.14159265358979323846 * 220.0 / fs;
+                        if (phase > 6.283185307179586) phase -= 6.283185307179586;
+                    }
+                    float* io[1] { x.data() };
+                    felitronics::test::run (p.process(io, 1, block));
+                    p.serviceHere();
+                }
+            }
+            void parkAndSleep() {
+                p.setDial("gain", 150.0);
+                run((int) std::ceil(2.6 * fs / block), 0.5);   // past kColdAfterSeconds
+                run((int) std::ceil(0.3 * fs / block), 0.0);   // …then hush
+            }
+            long long wake() {
+                p.clearCounters();
+                const long long loadsBefore = p.modelLoads();
+                p.setDial("gain", 200.0);                      // BETWEEN knots: a wake, not a swap
+                run((int) std::ceil(1.5 * fs / block), 0.0);
+                if (p.modelLoads() != loadsBefore) return -1;
+                return (long long) p.warmBlocks() * block;
+            }
+        };
+
+        // THE ORACLE IS SPELLED HERE, not read back off the player. warmFor()'s three terms are the
+        // model's field converted into host samples, the rate-matcher's latency, and one block; the law
+        // counts a block as warming while `fed < need`, and `fed` advances by one block per call. This
+        // is an independent statement of the same arithmetic, so a mutation that changes warmFor() and
+        // the differential together still fails here.
+        const auto owed = [](double fs, int block, int latency) {
+            const long long need = (long long) std::ceil((double) kField * fs / 48000.0)
+                                 + (long long) latency + (long long) block;
+            return ((need + block - 1) / block - 1) * block;
+        };
+
+        const double rates[] { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+        const int blocks[] { 64, 256 };
+        int cells = 0, matched = 0, oracled = 0, skipped = 0;
+        double worstRatio = 1.0;
+        for (const int blk : blocks)
+        for (const double f1 : rates)
+        for (const double f2 : rates) {
+            if (f1 == f2) continue;
+            Warm a(r, delayModel(2000), f1, blk);
+            a.parkAndSleep();
+            const bool slept = a.p.slotCold(0) || a.p.slotCold(1);
+            felitronics::test::run (a.p.prepare(f2, blk, 1));       // …the host changes its rate
+            const long long got = a.wake();
+
+            Warm b(r, delayModel(2000), f2, blk);                   // …against one that never moved
+            b.parkAndSleep();
+            const long long want = b.wake();
+
+            ++cells;
+            if (! slept || got < 0 || want < 0) { ++skipped; continue; }
+            if (got == want) ++matched;
+            else worstRatio = std::max(worstRatio, want > 0 ? std::max((double) got / (double) want,
+                                                                      (double) want / (double) got) : 1.0);
+            if (got == owed(f2, blk, b.p.latencySamples())) ++oracled;
+        }
+        ok(skipped == 0, "precondition: every cell actually slept and woke without a load ("
+                         + std::to_string(cells - skipped) + " of " + std::to_string(cells) + ")");
+        ok(matched == cells,
+           "a player whose rate CHANGED warms exactly as long as one prepared at that rate from the start"
+           " (" + std::to_string(matched) + " of " + std::to_string(cells) + " cells; worst ratio "
+           + std::to_string(worstRatio) + " — on the base commit 85 cells under-warmed, 48 -> 96 kHz to"
+           " HALF the field and 48 -> 192 to a quarter, while 44.1 <-> 48 read exactly right)");
+        ok(oracled == cells,
+           "…and the length is the one warmFor()'s three terms ask for, stated independently here ("
+           + std::to_string(oracled) + " of " + std::to_string(cells) + ")");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // 🔴 A RESTART LANDING INSIDE A WARM-UP, which is the case every other fixture here steps over: the
+    // groups above park a slot until it is fully warm or fully asleep and only then change the rate. A
+    // slot caught MID-FIELD is different in kind, and it was wrong at an UNCHANGED rate too — so this is
+    // not a rate-change test that happens to use one rate, it is the other half of the same defect.
+    //
+    // What is wrong: `prepare()` flushes every network (NamStage::prepare ends in its own restart), so
+    // afterwards the slot's model holds NOTHING. The law's ledger, left alone, still credits it every
+    // sample it heard before the flush — so a slot that was one block short of audible is marked audible
+    // one block later, having fed one block of real material into an empty network. That is invariant 3
+    // broken by a whole receptive field, and it costs nothing to close: a warming slot is at weight zero
+    // by construction, so re-arming it is inaudible.
+    //
+    // ⚠️ AND THIS IS THE FIXTURE THAT KILLS THE PLAUSIBLE WRONG FIX. Carrying the warm-up across a
+    // restart PROPORTIONALLY — rescaling `fed` alongside `need` so the fraction is preserved — passes
+    // every other assertion in this file, because every other fixture restarts a slot that is already
+    // warm or already asleep, where a preserved fraction and a re-arm agree. Measured: that mutation
+    // survives the whole suite without this group and fails it with.
+    group("P89: a restart INSIDE a warm-up re-arms it — the field heard before the flush is not credited");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // `partial` blocks of warm-up are spent, THEN the restart. The whole field must be owed again.
+        // Both verbs, because they are one shared promise, and several depths so a fixture cannot sit on
+        // the one place a remainder happens to equal a full field.
+        // THE ORACLE IS A DIFFERENTIAL AGAINST DEPTH ZERO, not a predicted absolute, and that is
+        // deliberate: `warmBlocks()` is an OR over BOTH slots, so the absolute after a restart mixes the
+        // re-landing slot with whatever its neighbour is doing and is not a number this file can
+        // predict. What it CAN say is that the answer must not depend on how much of the field was
+        // spent before the restart — a restart eight blocks into a warm-up must cost exactly what a
+        // restart at the instant of the landing costs. Carrying the progress across makes the answer
+        // fall as the depth rises, which is precisely the reading this compares away.
+        const auto warmAfterRestart = [&r](const char* verb, int partial) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(delayModel(2000)) }, { "mid", bytesOf(delayModel(2000)) },
+                { "late",  bytesOf(delayModel(2000)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(kFs, kBlock, 1));
+            p.load(r, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setDial("gain", 150.0);
+
+            std::vector<float> x((std::size_t) kBlock);
+            float* io[1] { x.data() };
+            double phase = 0.0;
+            const auto drive = [&](int blocks) {
+                for (int b = 0; b < blocks; ++b) {
+                    for (int i = 0; i < kBlock; ++i) {
+                        x[(std::size_t) i] = (float) (0.3 * std::sin(phase));
+                        phase += 2.0 * 3.14159265358979323846 * 220.0 / kFs;
+                        if (phase > 6.283185307179586) phase -= 6.283185307179586;
+                    }
+                    felitronics::test::run (p.process(io, 1, kBlock));
+                    p.serviceHere();
+                }
+            };
+
+            drive(24);                                     // both models land and go warm
+            p.setDial("gain", 60.0);                       // …a turn, so a slot re-lands and starts warming
+            drive(2);
+            p.clearCounters();
+            drive(partial);                                // …part of the field, and no more
+            const int spent = p.warmBlocks();
+
+            p.clearCounters();
+            if (std::string(verb) == "reset") p.reset();
+            else felitronics::test::run (p.prepare(kFs, kBlock, 1));
+            drive(64);                                     // …long enough for any warm-up to finish
+            const int after = p.warmBlocks();
+
+            return std::pair<int, int> { spent, after };
+        };
+
+        for (const char* verb : { "reset", "prepare" }) {
+            const auto base = warmAfterRestart(verb, 0);   // …the restart at the instant of the landing
+            ok(base.second > 0, std::string("precondition: a restart at depth 0 owes a warm-up at all (")
+                                + std::to_string(base.second) + " blocks) — " + verb);
+            // ⚠️ THE DEPTHS MUST STAY STRICTLY INSIDE THE FIELD, and 8 does not. This capture's warm-up
+            // is 2000 + 256 = 2256 samples = 8.8 blocks, of which the landing itself has already spent
+            // one or two by the time the count starts; a restart at depth 8 therefore lands AFTER the
+            // slot went audible, where "re-arm" and "carry the progress" agree and the row proves
+            // nothing. It read 8 against 15 for that reason and not because the fix had missed it.
+            for (const int partial : { 1, 2, 3 }) {
+                const auto got = warmAfterRestart(verb, partial);
+                ok(got.first > 0 && got.first <= partial,
+                   std::string("precondition: the restart really lands mid-warm-up (")
+                   + std::to_string(got.first) + " blocks spent of " + std::to_string(partial)
+                   + " driven) — " + verb);
+                ok(got.second == base.second,
+                   std::string("a ") + verb + "() " + std::to_string(partial) + " blocks into a warm-up"
+                   " costs exactly what one at depth 0 costs (" + std::to_string(got.second) + " against "
+                   + std::to_string(base.second) + ") — the field heard before the flush is not credited");
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    group("P89: the per-slot ALIGNMENT DELAY is restated at the new rate too");
+    {
+        // A table measured at 48 kHz, so `delayOf` has a rate to scale FROM. Every real file owes 64
+        // samples there against a "ghost" entry that lands latest — so whichever capture a slot holds,
+        // and whichever slot is silent, its delay is 64 x the rate ratio. A table where some file owed 0
+        // would let a stale number and a restated one agree on exactly the slot a check happened to read.
+        const auto rig = throughTheFormat(testRig());
+        AlignmentTable t;
+        t.sampleRate = 48000.0;
+        t.lagByFile = { { "g60", 0 }, { "g150", 0 }, { "g240", 0 }, { "r150", 0 }, { "ghost", 64 } };
+
+        // ⚠️ AND THE TOP OF THE GRID IS A CLAMP, NOT A SCALING — registered here because the fixture
+        // found it (P99). `AlignmentTable::delayOf` clamps to `nam::kBlendMaxDelay`, which is 128 SAMPLES
+        // and therefore a duration that shrinks with the rate: 2.67 ms at 48 kHz, 0.67 ms at 192 kHz. A
+        // pack whose captures land 64 samples apart at 48 kHz asks for 256 at 192 kHz and silently gets
+        // 128, so the pair is aligned at 48 and 96 kHz and combs at 192. That is a bound in the wrong unit
+        // — the same defect this file's band ramps were cured of — and it is NOT P89's to move: it is a
+        // constant in BlendLaw.h with its own consumers. Pinned at its real value so the day it changes,
+        // this says so.
+        struct Case { double fs; int want; };
+        const Case cases[] { { 48000.0, 64 }, { 96000.0, 128 }, { 44100.0, 59 },
+                             { 192000.0, felitronics::nam::kBlendMaxDelay } };
+        for (const auto& c : cases) {
+            Bench b(rig, 1, 48000.0);
+            b.p.setAlignment(t);
+            b.p.setDial("gain", 60.0);
+            b.rms(220.0, 0.2, 24, 8);                       // land a model, so a slot holds something
+            felitronics::test::run (b.p.prepare(c.fs, kBlock, 1));
+            b.fs = c.fs;
+
+            // `delayOf` is the arithmetic; what is asserted is that prepare() RAN it. The reference is
+            // the table's own number scaled by hand, not a second call into the player.
+            const int hand = std::clamp((int) std::lround(64.0 * c.fs / 48000.0), 0, RigPlayer::kMaxDelay);
+            ok(hand == c.want, "precondition: the hand-scaled delay at " + std::to_string((int) c.fs)
+                               + " Hz is " + std::to_string(c.want) + " (" + std::to_string(hand) + ")");
+            ok(b.p.appliedSlotDelay(0) == c.want && b.p.appliedSlotDelay(1) == c.want,
+               "prepare() restates BOTH applied slot delays at " + std::to_string((int) c.fs)
+               + " Hz: want " + std::to_string(c.want) + ", got " + std::to_string(b.p.appliedSlotDelay(0))
+               + " and " + std::to_string(b.p.appliedSlotDelay(1))
+               + " (the base commit kept 64 at every rate — the number measured for 48 kHz)");
+
+            // 🔴 …AND THEY STAY RESTATED ONCE AUDIO RUNS, which the line above cannot see. A SILENT slot
+            // takes its delay from the STAGED one (`pendDelay_`) on every block, so a prepare() that
+            // restated the applied delay but not the staged one looks right until the first block — and
+            // then snaps the silent slot back to the old rate's number while the sounding one keeps the
+            // new, splitting the pair by exactly the error this group is about. Measured: without the
+            // staged half, this suite passed whole.
+            b.rms(220.0, 0.2, 16, 4);
+            ok(b.p.appliedSlotDelay(0) == c.want && b.p.appliedSlotDelay(1) == c.want,
+               "…and both are still " + std::to_string(c.want) + " after blocks have run at "
+               + std::to_string((int) c.fs) + " Hz (got " + std::to_string(b.p.appliedSlotDelay(0)) + " and "
+               + std::to_string(b.p.appliedSlotDelay(1)) + ")");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // A LANDING THAT STRADDLES THE prepare(). `loadSlot()` runs on the message thread and latches the
+    // incoming model's warm-up and delay at the rate of that moment; the audio thread takes them on its
+    // next block. A prepare() between those two instants would hand the law a warm-up measured for the
+    // rate that has just gone — the base defect, for exactly the slot that is changing capture. The
+    // other groups never reach this: the grid asserts no load happened, and the warm-up-depth group
+    // consumes its landing before it restarts. Measured: without the restatement of the pending
+    // landing, this suite passed whole.
+    group("P89: a landing delivered before a rate change and taken after it warms at the NEW rate");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // `straddle`: the landing is delivered at `from` and taken at `to`. Otherwise the player is
+        // moved to `to` first and the same turn is made there — the reference. Both count the warm-up
+        // from the block that takes the landing.
+        const auto warmOfLanding = [&r](double from, double to, bool straddle, bool* pending) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(delayModel(2000)) }, { "mid", bytesOf(delayModel(2000)) },
+                { "late",  bytesOf(delayModel(2000)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(from, kBlock, 1));
+            p.load(r, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setDial("gain", 150.0);
+            std::vector<float> x((std::size_t) kBlock, 0.1f);
+            float* io[1] { x.data() };
+            const auto block = [&] { felitronics::test::run (p.process(io, 1, kBlock)); };
+            for (int k = 0; k < 40; ++k) { block(); p.serviceHere(); }   // mid and late land and warm
+            if (! straddle) felitronics::test::run (p.prepare(to, kBlock, 1));
+            const long long loads = p.modelLoads();
+            const std::string before = p.heldFileId(0) + "|" + p.heldFileId(1);
+            p.setDial("gain", 60.0);                       // wants "early", which is not loaded yet
+            block();                                       // …the law asks for it
+            p.serviceHere();                               // …and it is delivered: landFlag_ is up
+            *pending = p.modelLoads() == loads + 1
+                    && p.heldFileId(0) + "|" + p.heldFileId(1) == before;   // …and NOT yet taken
+            if (straddle) felitronics::test::run (p.prepare(to, kBlock, 1));
+            p.clearCounters();
+            for (int k = 0; k < 96; ++k) { block(); p.serviceHere(); }
+            return p.warmBlocks();
+        };
+        for (const auto& pair : { std::pair<double, double> { 48000.0, 96000.0 },
+                                  std::pair<double, double> { 96000.0, 48000.0 },
+                                  std::pair<double, double> { 44100.0, 192000.0 } }) {
+            bool pendingA = false, pendingB = false;
+            const int straddled = warmOfLanding(pair.first, pair.second, true,  &pendingA);
+            const int reference = warmOfLanding(pair.first, pair.second, false, &pendingB);
+            const std::string at = std::to_string((int) pair.first) + " -> " + std::to_string((int) pair.second);
+            ok(pendingA && pendingB, "precondition: the landing was delivered and NOT yet taken when the"
+                                     " rate changed — " + at);
+            ok(straddled == reference && straddled > 0,
+               "a landing taken after a rate change warms as one made at the new rate (" + std::to_string(straddled)
+               + " blocks against " + std::to_string(reference) + ") — " + at);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // THE REST COUNT, which is the one host-sample count here that is RESCALED rather than recomputed.
+    // It is pure elapsed time, so a restart must preserve the time a slot has already rested — at a new
+    // rate by converting it, and at an UNCHANGED rate by leaving it exactly alone. Three behaviours are
+    // told apart by one measurement, the seconds from the restart until the parked neighbour sleeps:
+    //   · the base commit left the count in the old rate's samples — 48 -> 96 kHz slept late, and
+    //     96 -> 48 slept at once;
+    //   · the first draft of this fix ZEROED it — every restart, same rate included, postponed sleep
+    //     by a whole cold window;
+    //   · converting it keeps every row equal to the same-rate one.
+    group("P89: the time a slot has already RESTED survives a restart — converted, never reset");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // Park at `from`, rest `rested` seconds (under the cold window), restart into `to` by `verb`,
+        // then return the SECONDS until a slot falls asleep. The part before the restart is identical
+        // for every row that starts at the same rate, so rows compare on the part after it.
+        const auto secondsToSleep = [&r](double from, double to, const char* verb, double rested) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(gainModel(0.25)) }, { "mid", bytesOf(gainModel(0.5)) },
+                { "late",  bytesOf(gainModel(1.0)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(from, kBlock, 1));
+            p.load(r, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setDial("gain", 150.0);
+            std::vector<float> x((std::size_t) kBlock, 0.1f);
+            float* io[1] { x.data() };
+            const int restBlocks = (int) std::lround(rested * from / kBlock);
+            for (int k = 0; k < restBlocks; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+            if (p.slotCold(0) || p.slotCold(1)) return -1.0;           // slept BEFORE the restart: row is void
+            if (std::string(verb) == "reset") p.reset();
+            else felitronics::test::run (p.prepare(to, kBlock, 1));
+            for (int k = 1; k < (int) (4.0 * to / kBlock); ++k) {
+                felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere();
+                if (p.slotCold(0) || p.slotCold(1)) return (double) (k * kBlock) / to;
+            }
+            return 99.0;                                                // never slept
+        };
+
+        const double same = secondsToSleep(48000.0, 48000.0, "prepare", 1.5);
+        // ⚠️ THIS IS THE ASSERTION THAT CATCHES ZEROING, and it has to be an ABSOLUTE one: a count
+        // zeroed at every restart moves every row below by the same whole window, so the differentials
+        // all still agree with each other and pass. Only "a same-rate restart leaves the rest alone"
+        // stated against the clock can see it. Measured on the zeroing draft: 2.005 s here.
+        ok(same > 0.0 && same < 1.0,
+           "a same-rate prepare() after 1.5 s of rest still sleeps within the ~0.5 s the 2 s window has"
+           " left (" + std::to_string(same) + " s) — zeroing the count read 2.005 s, postponing every"
+           " parked dial's sleep by a whole window at every restart");
+        const double viaReset = secondsToSleep(48000.0, 48000.0, "reset", 1.5);
+        approx(viaReset, same, 0.012, "…and a reset() leaves the rest where a same-rate prepare() does");
+
+        struct Row { double from, to; const char* what; };
+        // Measured on a count left in the old rate's samples: 48 -> 96 slept 1.267 s against 0.533
+        // (0.73 s late), 96 -> 48 slept after ONE block against 0.515, 48 -> 192 slept 1.10 s late, and
+        // even 44.1 -> 48 was 0.12 s late.
+        const Row rows[] { { 48000.0, 96000.0,  "48 -> 96 kHz" },
+                           { 96000.0, 48000.0,  "96 -> 48 kHz" },
+                           { 48000.0, 192000.0, "48 -> 192 kHz" },
+                           { 44100.0, 48000.0,  "44.1 -> 48 kHz" } };
+        for (const auto& row : rows) {
+            const double sameHere = secondsToSleep(row.from, row.from, "prepare", 1.5);
+            const double moved    = secondsToSleep(row.from, row.to,   "prepare", 1.5);
+            // Two blocks of the coarser grid: the two rows quantize the same instant differently.
+            const double tol = 2.0 * kBlock / std::min(row.from, row.to) + 1.0e-9;
+            approx(moved, sameHere, tol,
+                   std::string("the rest already served is converted, not stranded: ") + row.what);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // ⚠️ A prepare() BETWEEN A load() AND THE NEXT BLOCK. load() posts a forget and rebuilds `models_`,
+    // but the audio thread wipes `blend_` only on its next block — so in that window `blend_.held[]`
+    // still names the PREVIOUS pack's models, as indices into a `models_` that now belongs to the new
+    // one. Restating the ledger there would resolve an old id against the new pack's table and store
+    // that delay for a slot the audio thread is about to empty. It is muted and would heal within a
+    // block, but it is a change to base behaviour in a window this fix was never aimed at — so the
+    // restatement stands back there, and this pins it doing so.
+    group("P89: a prepare() between load() and the next block does not resolve the OLD pack's ids");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        std::map<std::string, std::vector<std::byte>> files {
+            { "early", bytesOf(gainModel(0.25)) }, { "mid", bytesOf(gainModel(0.5)) },
+            { "late",  bytesOf(gainModel(1.0)) } };
+        RigPlayer p;
+        felitronics::test::run (p.prepare(kFs, kBlock, 1));
+        const auto source = [&files](const std::string& id) {
+            const auto it = files.find(id);
+            return it == files.end() ? std::vector<std::byte> {} : it->second;
+        };
+        p.load(r, source);                                 // pack A: no alignment, every delay is 0
+        p.setDial("gain", 150.0);
+        std::vector<float> x((std::size_t) kBlock, 0.1f);
+        float* io[1] { x.data() };
+        for (int k = 0; k < 24; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+        const int a0 = p.appliedSlotDelay(0), a1 = p.appliedSlotDelay(1);
+        ok(a0 == 0 && a1 == 0 && ! p.heldFileId(0).empty() && ! p.heldFileId(1).empty(),
+           "precondition: pack A has landed in both slots with no delay ("
+           + std::to_string(a0) + ", " + std::to_string(a1) + ")");
+
+        // Pack B: the SAME file names, so an old id resolves to a real entry of the new table — and a
+        // table that delays every one of them, so a cross-pack resolution cannot land on zero by luck.
+        p.load(r, source);
+        AlignmentTable t;
+        t.sampleRate = kFs;
+        t.lagByFile = { { "early", 0 }, { "mid", 0 }, { "late", 0 }, { "ghost", 96 } };
+        p.setAlignment(t);                                 // every real file now owes 96 against "ghost"
+        felitronics::test::run (p.prepare(kFs, kBlock, 1));   // …and NO block in between
+
+        ok(p.appliedSlotDelay(0) == a0 && p.appliedSlotDelay(1) == a1,
+           "the applied delays are what they were before the prepare, not pack B's 96 read through pack"
+           " A's ids (" + std::to_string(p.appliedSlotDelay(0)) + ", "
+           + std::to_string(p.appliedSlotDelay(1)) + ")");
+
+        // …and once the audio thread HAS run, the new pack's delays arrive through the ordinary path.
+        for (int k = 0; k < 48; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+        ok(p.appliedSlotDelay(0) == 96 || p.appliedSlotDelay(1) == 96,
+           "…and pack B's own delays land through the ordinary path once blocks run ("
+           + std::to_string(p.appliedSlotDelay(0)) + ", " + std::to_string(p.appliedSlotDelay(1)) + ")");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // THE WIRING, pinned where only the player can see it. An adversarial round ran 44 mutants against
+    // this branch; the code held on every input it tried, and seven mutants survived this file because
+    // every fixture above either loads ONE capture into every file (so a slot index passed to the wrong
+    // stage answers the same), or restarts a slot that settled long ago (so its count is far past any
+    // new need), or carries no alignment table where a landing is pending. The three groups below are
+    // those three blind spots, each with the input the round found.
+    namz::rig::Rig tri;
+    {
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        tri.chain = { st };
+    }
+    struct Tri {
+        RigPlayer p;
+        std::map<std::string, std::vector<std::byte>> files;
+        std::vector<float> x;
+        float* io[1];
+        Tri(const namz::rig::Rig& rig, const std::string& e, const std::string& m, const std::string& l,
+            double fs) : x((std::size_t) kBlock, 0.1f) {
+            io[0] = x.data();
+            files = { { "early", bytesOf(e) }, { "mid", bytesOf(m) }, { "late", bytesOf(l) } };
+            felitronics::test::run (p.prepare(fs, kBlock, 1));
+            p.load(rig, [this](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+        }
+        void block(bool service = true) {
+            felitronics::test::run (p.process(io, 1, kBlock));
+            if (service) p.serviceHere();
+        }
+        void run(int n) { for (int k = 0; k < n; ++k) block(); }
+    };
+
+    // 1. AN AUDIBLE SLOT WITH A REAL FIELD STAYS AUDIBLE — including one that has only JUST become
+    //    audible when the rate goes up, and across two restarts in a row. Every restart fixture above
+    //    that checks audibility uses a memoryless capture, whose need is zero and whose predicate cannot
+    //    fail; and a slot that settled long ago has fed far past any new need. Measured on the wrong
+    //    twins: an inverted predicate muted both slots, `>` for `>=` re-armed them on the SECOND
+    //    restart, and keeping an audible slot's old count warmed it for 7 blocks at 96 kHz and muted it
+    //    outright at 192 kHz.
+    group("P89: a pair that is AUDIBLE stays audible through any restart — just-audible included");
+    {
+        struct Seq { const char* name; std::vector<std::pair<char, double>> steps; };   // 'r' reset, 'p' prepare(rate)
+        const Seq seqs[] {
+            { "reset",                     { { 'r', 0.0 } } },
+            { "prepare(same)",             { { 'p', 48000.0 } } },
+            { "prepare(96k)",              { { 'p', 96000.0 } } },
+            { "prepare(192k)",             { { 'p', 192000.0 } } },
+            { "reset, reset",              { { 'r', 0.0 }, { 'r', 0.0 } } },
+            { "prepare(same) twice",       { { 'p', 48000.0 }, { 'p', 48000.0 } } },
+            { "prepare(96k), reset",       { { 'p', 96000.0 }, { 'r', 0.0 } } },
+            { "prepare(96k), prepare(44.1k)", { { 'p', 96000.0 }, { 'p', 44100.0 } } },
+        };
+        for (const bool justAudible : { true, false })
+        for (const auto& q : seqs) {
+            Tri t(tri, delayModel(2000), delayModel(2000), delayModel(2000), kFs);
+            t.p.setDial("gain", 105.0);                    // between two knots: both slots sound
+            // Stop on the first block that warms nobody AFTER BOTH slots hold a model and one of them
+            // was still warming — the instant the second landing has just crossed its need, which is
+            // where a kept count is shortest. The two slots land one after the other, so "the first quiet
+            // block" alone can fall between the landings, with only one capture in the player.
+            int warmed = 0;
+            for (int k = 0; k < 200; ++k) {
+                t.p.clearCounters();
+                t.block();
+                const bool bothHeld = ! t.p.heldFileId(0).empty() && ! t.p.heldFileId(1).empty();
+                if (t.p.warmBlocks() > 0) { if (bothHeld) warmed = k + 1; }
+                else if (warmed > 0 && justAudible) break;
+            }
+            if (! justAudible) t.run(64);
+            const bool both = ! t.p.heldFileId(0).empty() && ! t.p.heldFileId(1).empty()
+                           && (justAudible || (t.p.liveMix() > 0.05f && t.p.liveMix() < 0.95f));
+            for (const auto& [verb, rate] : q.steps) {
+                if (verb == 'r') t.p.reset();
+                else felitronics::test::run (t.p.prepare(rate, kBlock, 1));
+            }
+            t.p.clearCounters();
+            const float mixBefore = t.p.liveMix();
+            t.run(30);
+            const std::string label = std::string(q.name) + (justAudible ? ", just audible" : ", settled");
+            ok(warmed > 0 && both, "precondition: both slots landed and warmed — " + label);
+            // A just-audible pair is still gliding to its target weight, so only the settled rows can
+            // also say "the weight does not move"; "nobody is re-armed" is the claim for both.
+            ok(t.p.warmBlocks() == 0 && (justAudible || std::abs(t.p.liveMix() - mixBefore) < 1e-6f),
+               "no slot is re-armed" + std::string(justAudible ? "" : " and the weight does not move") + " ("
+               + std::to_string(t.p.warmBlocks()) + " warming blocks, mix " + std::to_string(mixBefore) + " -> "
+               + std::to_string(t.p.liveMix()) + ") — " + label);
+        }
+    }
+
+    // 2. SLOTS HOLDING CAPTURES WITH DIFFERENT FIELDS. Each slot's warm-up must come from ITS OWN
+    //    stage: with one capture in every slot, restating slot 1 from slot 0's stage answers the same
+    //    number and the mix-up is invisible. That is harder to arrange than it sounds — slots follow the
+    //    PARITY of a knot, so on a three-knot dial a sleeping slot 1 always holds the same capture as
+    //    slot 0 (at an end knot both slots carry that knot), and the first version of this group, built
+    //    on `tri`, passed with the mix-up planted. Four knots give each index a middle knot whose silent
+    //    neighbour is a DIFFERENT capture: parked on 120, slot 0 sleeps on "c" beside "b"; parked on 180,
+    //    slot 1 sleeps on "d" beside "c". Each wake is a turn that asks for the same two captures, so it
+    //    wakes the sleeper rather than loading into it — a landing would compute its own warm-up from the
+    //    right stage whatever the restatement did.
+    group("P89: each slot's warm-up is restated from ITS OWN capture, not its neighbour's");
+    {
+        namz::rig::Rig quad;
+        {
+            namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+            namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+            gc.values = { "60", "120", "180", "240" }; gc.sweep = 300;
+            st.device.controls = { gc };
+            const char* ids[] { "a", "b", "c", "d" };
+            const char* at[]  { "60", "120", "180", "240" };
+            for (int k = 0; k < 4; ++k) {
+                namz::rig::FileEntry f; f.id = ids[k]; f.settings = { { "gain", at[k] } };
+                st.device.files.push_back(f);
+            }
+            quad.chain = { st };
+        }
+        struct Case { double park, wake; int sleeper; const char* asleep; };
+        const Case cases[] { { 120.0, 165.0, 0, "c" }, { 180.0, 220.0, 1, "d" } };
+        // Returns {sleeper, pure wake?, held pair before the wake, warming blocks after it}.
+        struct Out { int sleeper; bool pure; std::string held; int warm; };
+        const auto drive = [&quad](const Case& c, double fs, double to) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "a", bytesOf(delayModel(2000)) }, { "b", bytesOf(delayModel(500)) },
+                { "c", bytesOf(delayModel(1000)) }, { "d", bytesOf(delayModel(1500)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(fs, kBlock, 1));
+            p.load(quad, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            std::vector<float> x((std::size_t) kBlock, 0.1f);
+            float* io[1] { x.data() };
+            const auto run = [&](int n) {
+                for (int k = 0; k < n; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+            };
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setColdAfterSeconds(0.25);
+            p.setDial("gain", c.park);
+            run((int) std::ceil(0.6 * fs / kBlock));
+            Out o;
+            o.sleeper = p.slotCold(0) ? 0 : p.slotCold(1) ? 1 : -1;
+            o.held = p.heldFileId(0) + "|" + p.heldFileId(1);
+            if (to != fs) felitronics::test::run (p.prepare(to, kBlock, 1));
+            const long long loads = p.modelLoads();
+            p.clearCounters();
+            p.setDial("gain", c.wake);
+            run((int) std::ceil(0.5 * to / kBlock));
+            o.pure = p.modelLoads() == loads && p.heldFileId(0) + "|" + p.heldFileId(1) == o.held;
+            o.warm = p.warmBlocks();
+            return o;
+        };
+        for (const auto& c : cases)
+        for (const double to : { 96000.0, 22050.0 }) {
+            const Out got  = drive(c, kFs, to);
+            const Out want = drive(c, to, to);
+            const std::string at = "slot " + std::to_string(c.sleeper) + " asleep on '" + c.asleep + "', held "
+                                 + got.held + ", 48000 -> " + std::to_string((int) to);
+            const auto sleeperHolds = [&](const Out& o) {
+                const auto bar = o.held.find('|');
+                const std::string mine  = c.sleeper == 0 ? o.held.substr(0, bar) : o.held.substr(bar + 1);
+                const std::string other = c.sleeper == 0 ? o.held.substr(bar + 1) : o.held.substr(0, bar);
+                return mine == c.asleep && other != mine;
+            };
+            ok(got.sleeper == c.sleeper && want.sleeper == c.sleeper && sleeperHolds(got) && sleeperHolds(want)
+                   && got.pure && want.pure,
+               "precondition: the intended slot slept on its own capture beside a DIFFERENT one, and the turn"
+               " woke it without loading — " + at);
+            ok(got.warm == want.warm && got.warm > 0,
+               "the woken slot warms for its own capture's field at the new rate (" + std::to_string(got.warm)
+               + " blocks against " + std::to_string(want.warm) + ") — " + at);
+        }
+    }
+
+    // 3. DELAYS THAT DIFFER PER FILE, with a load IN FLIGHT and with a landing PENDING across the
+    //    prepare. The sounding slot must keep the delay of the capture it HOLDS, not the one the dial is
+    //    reaching for (taking the staged number would retime a live signal), and a pending landing must
+    //    bring its own capture's delay at the new rate (the straddle group above checks only its warm-up).
+    group("P89: a load in flight or a landing pending across a prepare keeps each capture's OWN delay");
+    {
+        AlignmentTable t;
+        t.sampleRate = 48000.0;
+        t.lagByFile = { { "early", 0 }, { "mid", 30 }, { "late", 64 } };   // delays 64 / 34 / 0 at 48 kHz
+        const auto hand = [](const std::string& id, double fs) {
+            const int d48 = id == "early" ? 64 : id == "mid" ? 34 : 0;
+            return std::clamp((int) std::lround(d48 * fs / 48000.0), 0, RigPlayer::kMaxDelay);
+        };
+        for (const double to : { 44100.0, 96000.0, 22050.0 })
+        for (const bool pending : { false, true }) {
+            Tri p(tri, gainModel(0.25), gainModel(0.5), gainModel(1.0), kFs);
+            p.p.setAlignment(t);
+            p.p.setBlendShape({ 0.5, 0.0 });
+            p.p.setDial("gain", 60.0);
+            p.run(60);
+            const std::string sounding = p.p.liveMix() < 0.5f ? p.p.heldFileId(0) : p.p.heldFileId(1);
+            const int soundingSlot = p.p.liveMix() < 0.5f ? 0 : 1;
+            p.p.setDial("gain", pending ? 150.0 : 240.0);
+            p.block(false);                                // the law asks; nothing is delivered yet
+            if (pending) p.p.serviceHere();                // …or it IS delivered and not yet taken
+            felitronics::test::run (p.p.prepare(to, kBlock, 1));
+            const std::string at = std::string(pending ? "landing pending" : "load in flight") + ", 48000 -> "
+                                 + std::to_string((int) to);
+            ok(sounding == "early", "precondition: the sounding capture before the turn is 'early' — " + at);
+            ok(p.p.appliedSlotDelay(soundingSlot) == hand(sounding, to),
+               "the sounding slot keeps ITS capture's delay at the new rate (" + std::to_string(p.p.appliedSlotDelay(soundingSlot))
+               + ", want " + std::to_string(hand(sounding, to)) + ") — " + at);
+            if (pending) {
+                p.block(false);                            // …the audio thread takes the landing
+                const int other = soundingSlot ^ 1;
+                const std::string landed = p.p.heldFileId(other);
+                ok(! landed.empty() && landed != sounding,
+                   "precondition: the pending capture landed in the other slot (" + landed + ") — " + at);
+                ok(p.p.appliedSlotDelay(other) == hand(landed, to),
+                   "…and it lands with ITS delay at the new rate (" + std::to_string(p.p.appliedSlotDelay(other))
+                   + ", want " + std::to_string(hand(landed, to)) + ") — " + at);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    group("P89: a restart snaps the slot trim THROUGH the switch that turns trims off");
+    {
+        // 🔴 THE ORACLE IS THE SWITCH'S OWN MEANING, not a level read off one player. `setInputTrims`
+        // promises exactly one thing: the pack's per-file `input_db` stops being applied. So with trims
+        // OFF, a pack whose linked entry carries −6 dB must sound IDENTICAL to one whose entry carries
+        // 0 dB — before a restart and, which is the half that was false, after one.
+        //
+        // Comparing a restarted player against its own settled level instead would have measured the
+        // restart's other transients (the tone curve's 1024-tap FIR is flushed too, and rings in over
+        // 0.48 dB on the first block) and called the trim defect part of them. Two players restarted the
+        // same way share every one of those and differ only in the number under test.
+        auto rigTrimmed = testRig();                       // …files[4] is the link: "g60" at −6 dB
+        auto rigFlat    = testRig();
+        ok(rigTrimmed.chain[0].device.files.size() == 5
+           && std::abs(rigTrimmed.chain[0].device.files[4].inputDb + 6.0) < 1e-9,
+           "precondition: the pack's linked entry really carries a −6 dB trim");
+        rigFlat.chain[0].device.files[4].inputDb = 0.0;    // …the same pack with nothing to switch off
+        const auto trimmed = throughTheFormat(rigTrimmed);
+        const auto flat    = throughTheFormat(rigFlat);
+
+        for (const bool viaPrepare : { false, true }) {
+            Bench a(trimmed, 1, kFs), b(flat, 1, kFs);
+            for (auto* p : { &a, &b }) {
+                p->p.setInputTrims(false);                 // …the switch under test, OFF
+                p->p.setDial("gain", 0.0);                 // …parked on the linked knot
+                p->rms(220.0, 0.2, 32, 8);                 // …settled, so the ramp has arrived
+            }
+            ok(std::abs(db(a.gainAt(220.0, 0.2, 8, 8)) - db(b.gainAt(220.0, 0.2, 8, 8))) < 0.02,
+               "precondition: with trims OFF the two packs already sound the same before any restart");
+
+            if (viaPrepare) { felitronics::test::run (a.p.prepare(kFs, kBlock, 1));
+                              felitronics::test::run (b.p.prepare(kFs, kBlock, 1)); }
+            else            { a.p.reset(); b.p.reset(); }
+
+            // The FIRST block after the restart is where a wrong snap is loudest: the ramp starts there
+            // and takes ~43 ms to travel back to unity.
+            const double first = db(a.gainAt(220.0, 0.2, 0, 1)) - db(b.gainAt(220.0, 0.2, 0, 1));
+            ok(std::abs(first) < 0.02,
+               std::string("with trims OFF the pack's −6 dB trim is invisible on the first block after a ")
+               + (viaPrepare ? "prepare()" : "reset()") + " too (" + std::to_string(first)
+               + " dB; the base commit snapped to the trim regardless of the switch and read −5.99 dB)");
+
+            // …and across the whole ramp, which is where the old behaviour spent its 43 ms.
+            const double ramp = db(a.gainAt(220.0, 0.2, 0, 8)) - db(b.gainAt(220.0, 0.2, 0, 8));
+            ok(std::abs(ramp) < 0.02, std::string("…and across the ramp that followed it (")
+                                      + std::to_string(ramp) + " dB)");
+        }
+
+        // …and with trims ON the trim is still applied, so the fix switched something off rather than
+        // deleting it. Same two packs, same restart, opposite expectation.
+        {
+            Bench a(trimmed, 1, kFs), b(flat, 1, kFs);
+            for (auto* p : { &a, &b }) { p->p.setInputTrims(true); p->p.setDial("gain", 0.0);
+                                        p->rms(220.0, 0.2, 32, 8); }
+            a.p.reset(); b.p.reset();
+            const double d = db(a.gainAt(220.0, 0.2, 8, 16)) - db(b.gainAt(220.0, 0.2, 8, 16));
+            approx(d, -6.0, 0.05, "with trims ON the −6 dB trim is still there after a restart ("
+                                  + std::to_string(d) + " dB)");
         }
     }
 

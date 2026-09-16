@@ -429,22 +429,44 @@ the CPU at runtime, invisible to any build. Full write-up:
    0.567861497402**, with both lanes PRESENT. There is deliberately no predicate on what changed: a
    re-prepare at the SAME numbers is the common case — a host's buffer-size slider moves more often than
    its rate one, and a driver stops the stream for either — and it was the case that leaked loudest.
-   The mechanism is the drain above, not a second one: `configureRates` charges every lane that has ever
-   been fed, and the tail of `prepare()` spends it, so a first prepare after a load costs nothing and a
+   The mechanism is the drain above, not a second one: `configureRates` charges every lane that may still
+   be holding audio — fed since it was last emptied, whether by a restart or by a falling-edge drain that
+   ran to the end (a recurrent lane is never emptied, so it is always charged) — and the tail of
+   `prepare()` spends it, so a first prepare after a load costs nothing and a
    model change (which prepares a never-fed backend, in `prepareModel()` and again in `install()` when the
    host's numbers moved between the halves) costs nothing either. Where it does cost, it
    is the message thread and the price is published: for an architecture whose own `Reset` already
    prewarms, the drain is a SECOND pass over the field and roughly doubles the call — a stereo real
-   Standard WaveNet measured 6.5 ms before and 13.1 ms after at 48 kHz.
+   Standard WaveNet measured 6.5 ms before and 13.1 ms after at 48 kHz. Skipping that pass is sound only
+   per architecture, and that was measured rather than argued: with the drain removed, every capture NAM
+   ships keeps independence at exactly 0, while this tree's own `Buffer`-based fixtures leak on 72 of 96
+   cells again. NAM's example set has no such capture in any tree, so a check against real captures alone
+   would have approved a blanket skip. The predicate is structural and belongs to the receptive-field
+   registry (P98).
+
+   **AND A PREPARE RESTATES WHAT IT COUNTS, NOT ONLY WHAT IT DESIGNS.** After `RigPlayer::prepare()`
+   nothing the player acts on is expressed in the samples of a rate it no longer runs at. Rebuilding the
+   rate-DESIGNED state — filters, rings, stages, a threshold kept in seconds — was never the whole of it:
+   the blend law's warm-up debt, its rest count, the two per-slot alignment delays and a landing in
+   flight are COUNTS of host samples, and they were written once and read for ever. Measured on a 6x6
+   rate grid: a slot woken after 48 -> 96 kHz warmed for half the field it owed, and 44.1 <-> 48 kHz —
+   the pair a fixture reaches for first — read exactly right. Each count is restated by the rule its own
+   algebra allows: the debt RECOMPUTED (it is not homogeneous in the rate), the warm-up progress mapped
+   by its PREDICATE (audible stays audible, warming starts over), the rest count RESCALED (it is pure
+   elapsed time, so the ratio is exact and is 1 where nothing moved).
 
    **AND A COMPOSITE OWES ITS CONSUMER THE SAME VERB.** `rigplayer::RigPlayer` had none, so a product
    reaching a `NamStage` through it — which is how orbit-amp reaches one — could not call the restart at
    all. `RigPlayer::reset()` is that verb: both model slots, the three convolvers (bypassed or not — a
    bypassed one is skipped, so its history freezes and is replayed), the dry path's alignment ring, the
-   per-slot alignment tails, the band filters and the scratch. It does NOT touch the blend law's state:
-   a restart is not a device change, and re-arming the law's warm-up ledger would not deliver invariant 3
-   anyway (the law ramps its gain down over four blocks, so an unfed network is audible regardless) while
-   costing 192 ms of hole at every restart. Its price is FOUR networks, not one. And it reaches a
+   per-slot alignment tails, the band filters and the scratch. It leaves the blend law's state alone with
+   ONE exception: a restart is not a device change, and re-arming the warm-up of a slot that is already
+   AUDIBLE would not deliver invariant 3 anyway (the law ramps its gain down over four blocks, so an unfed
+   network is audible regardless) while costing 192 ms of hole at every restart. A slot still WARMING is
+   the exception, and it is re-armed: it is at weight zero by construction, so re-arming it is silent,
+   and its network has just been flushed, so crediting it the field it heard before the flush would mark
+   it audible with up to a whole field missing (`nam::blendRestated`, P89). Its price is FOUR networks,
+   not one. And it reaches a
    convolver through `clearAudioState()` rather than `reset()`: the latter also cancels a swap in flight,
    which silently discards a filter published a block ago and still fading in.
 

@@ -196,7 +196,10 @@ public:
         // message thread, with no callback to miss, and it is the price of one rule instead of two.
         // Skipping it where NAM's own prewarm provably covers the ledger is a real optimisation and is
         // registered as one rather than taken here: it is a predicate, and it would put back exactly
-        // the kind of "this case does not need it" reasoning this fix exists to remove.
+        // the kind of "this case does not need it" reasoning this fix exists to remove. P90 measured the
+        // split (see NamStage.h, "SKIPPABLE ONLY PER ARCHITECTURE"): exact for every WaveNet NAM ships,
+        // a 0.568 leak for a Linear — so the predicate is structural, belongs to the receptive-field
+        // registry, and is P98.
         //
         // OUTSIDE the try on purpose: reset() is noexcept, so a throw inside it terminates rather than
         // landing in that catch, and putting it there would suggest otherwise. Skipped when this prepare
@@ -273,6 +276,53 @@ public:
                     processChannel (ch[c], inst[c].get(), hush_.data(), d, g);
                     drain_[c] -= d;
                     if (drained_ != nullptr) drained_->fetch_add ((long long) d, std::memory_order_relaxed);
+                    // 🔴 …AND A DRAIN THAT RAN ALL THE WAY MAKES THE LANE CLEAN IN THE LEDGER TOO, which
+                    // until P90 it did not. `everFed_` was set by every fed chunk above and cleared ONLY
+                    // by reset(), so a lane that had just spent its whole debt here was still marked
+                    // "may be holding audio" and `configureRates` charged it a FULL drain again at the
+                    // next prepare() — the stage paying twice for one departure. P85 registered it as a
+                    // cost and measured it on a fixture (2562 spent, 5124 charged); on the real captures
+                    // the wasted lane is 4093 samples for `wavenet_a1_standard`, 6347 for `A2` and 2047
+                    // for `slimmable_wavenet`. With the other lane still playing (so still owed), the
+                    // re-prepare measured 14.7 ms with the clean lane billed and 12.7 ms without, on
+                    // `wavenet_a1_standard` — against 7.4 ms for the same call with nothing owed at all.
+                    //
+                    // IT IS THE SAME CLAIM reset() ALREADY RESTS ON, not a new one: `drain_[c] == 0`
+                    // means exactly "this lane has been fed the silence it owed", and reset() reads that
+                    // very counter (`owed = drain_[c]`) to decide it has nothing to spend. What reset()
+                    // does that this path does not is clear the two rate-matcher legs, and this line
+                    // leaves them alone because it does not change how the edge clocks anything — it
+                    // only stops the NEXT prepare() from billing the lane again. Neither reader of the
+                    // flag can tell: `configureRates` has already re-derived both legs, coefficients AND
+                    // state, before it consults `everFed_`, and reset() clears them unconditionally
+                    // whether or not it spends a sample.
+                    //
+                    // ⚠️ WHAT THE LEGS HOLD AFTER THE EDGE IS NOT "WHERE A SILENT STREAM WOULD BE", and a
+                    // first draft of this note said it was. That is true only while the drain runs: once
+                    // it is spent the lane is no longer clocked at all, so its sub-sample phase FREEZES,
+                    // and at a non-integer rate ratio a lane that comes back resumes at a different
+                    // fractional alignment than a lane fed digital silence throughout. Measured, 200
+                    // blocks away: 4.4e-07 at 96 kHz (a whole ratio) and 0.114 at 44.1 kHz on
+                    // `wavenet_a1_standard`, 0.050 on `slimmable_wavenet`. That is P24's bounded drain,
+                    // older than this line, and registered as P101; clearing the legs here would not
+                    // mend it (an adversarial round measured that 1.36e-03 WORSE at 96 kHz).
+                    //
+                    // ⚠️ AND THIS LINE ADDS A DEPENDENCE ON WIDTH HISTORY, stated because it is a number
+                    // that moved. A lane emptied here is left untouched by the next prepare() and so
+                    // equals a freshly prepared lane bit for bit; a lane that was never away is drained BY
+                    // that prepare, in its own chunking, and carries that chunking's residue. Two stages
+                    // fed the same audio but a different channel-width history therefore differ after a
+                    // prepare by that residue — 2.4e-06 on `slimmable_wavenet` at a 17-sample block,
+                    // 1.6e-07 on `wavenet_a1_standard`, 0 on `A2` — where before this line they were
+                    // identical. Independence is untouched (nothing the caller FED is audible), and the
+                    // residue is exactly the one P98 would remove.
+                    //
+                    // A RECURRENT CAPTURE KEEPS ITS FLAG, and the exclusion is copied from reset()'s own
+                    // line rather than reasoned about again: no finite length of silence empties an LSTM
+                    // cell, so `drain_ == 0` is not cleanliness for one and it never becomes provably
+                    // clean. Measured, the lstm fixture drains 24000 here and is charged 24000 again —
+                    // and must be.
+                    if (drain_[c] == 0 && ! recurrent_) everFed_[c] = false;
                 }
             }
             off += n;                                      // `off += maxBlock` could step past INT_MAX

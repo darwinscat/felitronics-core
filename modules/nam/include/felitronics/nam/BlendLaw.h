@@ -40,6 +40,7 @@
 // passes, as it must; a dial parked on a capture costs one.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace felitronics::nam {
@@ -77,13 +78,16 @@ struct BlendLoad {
 
 struct BlendState {
     BlendModelId held[kBlendSlots] {};
-    long long    fed[kBlendSlots] {};    // samples of real signal since this model landed
-    long long    need[kBlendSlots] {};   // …and how many it must have before it may be heard
+    // `fed` is read only through `fed >= need`, and blendRestated() keeps the ANSWER rather than the
+    // count across a restart — so for a slot that was already audible it is `need`, not a tally.
+    long long    fed[kBlendSlots] {};    // samples of real signal since this model landed (see above)
+    long long    need[kBlendSlots] {};   // …and how many it must have before it may be heard (host samples)
     bool         inFlight[kBlendSlots] {};
     // COLD: the slot stood at exactly zero, holding the wanted model, fed, under an unchanged request,
     // for BlendPolicy::coldAfterSamples. The host does not run a cold slot's model (it stays held —
     // nothing is unloaded), and the law counts the slot unfed while it sleeps. It wakes on the next
-    // change of request, re-landed with the same model and the same need: a warm-up, never a load.
+    // change of request, re-landed with the same model and its need as it stands then — restated at the
+    // host's current rate if a prepare() came between (blendRestated): a warm-up, never a load.
     bool         cold[kBlendSlots] {};
     long long    still[kBlendSlots] {};  // samples at exactly zero under an unchanged request, so far
     BlendRequest last;                   // the request the previous block was stepped with
@@ -228,6 +232,89 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
     s.still[slot] = 0;
     s.asked[slot] = 0;
     s.refused[slot] = 0;                 // what landed is real; whatever was refused may be asked anew
+}
+
+// 🔴 THE HOST RATE MOVED, AND THREE OF THIS LEDGER'S NUMBERS ARE HOST SAMPLES. `need` is a count of them
+// (NamStage::prewarmSamples() converted, plus the rate-matcher's latency, plus one block — see
+// rigplayer::RigPlayer::warmFor), and until P89 nothing recomputed it when the host handed the player a
+// new rate: it was written once, at the landing, and read for ever after — including by the WAKE at the
+// top of blendStep(), which re-arms a cold slot with `s.need[i]` exactly as it stands.
+//
+// WHAT THAT COST, measured through the player on a 6x6 grid of host rates, two block sizes and three
+// shapes (a 2001-tap Linear, an untagged one, a WaveNet): the warm-up a woken slot is held for does not
+// depend on the new rate AT ALL. It is, sample for sample, the warm-up the slot had at the rate its model
+// landed at — so the error tracks fs_landed/fs_now (roughly: the latency and block terms do not scale, so
+// 44.1 -> 96 kHz reads 0.469 where the bare ratio is 0.459). 48 -> 96 kHz warms a slot for 2048 host
+// samples where 4096 are owed — half a field, which is invariant 3 broken in the direction the law calls
+// the bad one. 48 -> 192 kHz warms for a quarter. The other direction over-warms: 192 -> 48 kHz holds a
+// slot silent four times longer than it needs.
+//
+// ⚠️ AND A ONE-POINT FIXTURE WOULD HAVE CALLED IT CLEAN. Of the 180 cells, 85 under-warm, 85 over-warm,
+// and exactly 10 read right — eight of them 44.1 <-> 48 kHz, the two rates nearly every session on earth
+// uses, and the other two 88.2 <-> 96 on the WaveNet at a 256-sample block. A fixture reaching for the
+// obvious pair sits on the one place the defect is invisible. This is P85's lesson with a second set of
+// numbers.
+//
+// WHAT THIS VERB DOES, and it is NOT blendLanded(). A restart is not a landing: it must not clear
+// `inFlight` (a second load could then be asked for a slot that already has one out), nor `cold`, nor
+// `refused` (a capture that deterministically fails would be asked for again — the storm the law exists
+// to prevent). It restates the three numbers that are in host samples and nothing else:
+//
+//   · `need` is recomputed by the caller, at the NEW rate, from the model actually in the slot, and
+//     handed in. It is not RESCALED from the old one: `need` is not homogeneous in the rate — only the
+//     receptive-field term scales, while the rate-matcher's latency is 0 at 48 kHz, 61 at 44.1 and 96 at
+//     96 kHz, and the `+ maxBlock` term does not scale at all. Rescaling would be a restatement of
+//     warmFor() with a different answer, which is the disease this tree keeps curing.
+//
+//   · `fed` is mapped BY ITS PREDICATE, not by its value, and that is the whole of the design. The only
+//     thing anything reads `fed` for is `fed >= need` (audible(), and the wasFed gate in blendStep), so
+//     what must be preserved across a restart is the ANSWER to that question, not the count:
+//       - a slot that was AUDIBLE stays audible (`fed = need`). Re-arming it to zero would mute a
+//         sounding capture at every prepare() — and RigPlayer::reset()'s three reasons for not re-arming
+//         `fed` transfer to a rate change one for one, the third most of all: the law would ramp the
+//         weight down over four blocks, so the by-hypothesis wrong network is audible anyway, and what
+//         the re-arm buys is a HOLE (fade-out, mute for a whole field, fade-in) at every transport start.
+//       - a slot that was still WARMING is re-armed to zero, and this is free rather than a cost: such a
+//         slot is at weight zero by construction (a landing happens only at zero, and the goal rails away
+//         from an unsafe slot), and the restart has just FLUSHED its network — so crediting it the field
+//         it heard before the flush is the very defect above, in its worst form. It is also the one thing
+//         here that was wrong at an UNCHANGED rate too.
+//     ⚠️ SCALING `fed` BY THE RATE RATIO IS THE TRAP, and it flips the predicate rather than preserving
+//     it: 96 -> 48 kHz on a slot that had just become audible gives `fed·0.5 = pre/2 + 48 + B/2` against
+//     `need = pre/2 + B`, which is short whenever the block exceeds 96 samples — i.e. always. The slot
+//     goes inaudible, the law rails the goal to its neighbour, and a spurious full crossfade plays.
+//
+//   · `still` is RESCALED by `timeScale` (new rate / the rate the ledger was counted in), and here —
+//     alone of the three — rescaling is the exact answer rather than the trap. `still` is nothing but
+//     accumulated host samples of elapsed time at rest (`still += blockSamples`), with no latency term
+//     and no block term, so it IS homogeneous in the rate: multiplying by the ratio preserves the
+//     elapsed time exactly. Left alone, a partial count in the old rate's units is measured against
+//     `coldAfterSamples`, which the host DOES recompute — 192 -> 48 kHz puts a slot to sleep at once,
+//     48 -> 192 postpones it by up to a cold window.
+//     ⚠️ ZEROING IT WAS THE FIRST DRAFT, and it was a behaviour change hiding as a cleanup: at an
+//     UNCHANGED rate — every same-rate prepare(), which is the common case, and every reset() — it
+//     postponed sleep by a whole cold window at each call, so a host restarting at every transport
+//     start ran a parked dial's second network for two extra seconds each time. The ratio is exactly 1
+//     there, so rescaling changes nothing where nothing changed.
+//
+// Message thread (prepare) or any thread with audio stopped (reset), under the caller's "never
+// concurrent with process()" contract — the one under which RigPlayer::prepare() already zeroes its band
+// count and clears its audio state. Arithmetic only: no allocation, no lock, no throw.
+inline void blendRestated(BlendState& s, int slot, long long need, double timeScale) noexcept {
+    if (slot < 0 || slot >= kBlendSlots) return;
+    if (s.held[slot] == 0) return;              // an empty slot has no ledger to restate
+    const bool wasAudible = s.fed[slot] >= s.need[slot];
+    s.need[slot] = std::max(0LL, need);
+    s.fed[slot]  = wasAudible ? s.need[slot] : 0;
+    // A scale that is not a positive finite number means "no rate to convert from": leave the count.
+    // There is deliberately no `timeScale != 1.0` shortcut: it is a float equality, which gcc's
+    // -Wfloat-equal refuses in this header (clang lets it through, which is how it got written), and it
+    // bought nothing. Multiplying a double by exactly 1.0 is exact for every double, and the count
+    // converts to one exactly below 2^53 samples — about 95 years at 3 MHz, which is the bound that
+    // matters, because with the cold window disabled (`coldAfterSamples <= 0`) a slot never goes cold and
+    // `still` grows for as long as it rests.
+    if (timeScale > 0.0 && timeScale < 1.0e9)
+        s.still[slot] = (long long) std::llround((double) s.still[slot] * timeScale);
 }
 
 // A load that could not be honoured (unreadable file, wrong rate). The slot keeps whatever it had,

@@ -353,6 +353,11 @@ public:
             for (int s = 0; s < 2; ++s) { rebuildCurves(s); rebuildBands(s); }
             rebuildDry();
         }
+        // …AND EVERYTHING THIS PLAYER COUNTS IN HOST SAMPLES IS RESTATED IN THE NEW ONES. See
+        // restateInHostSamples(): the FIRs and the bands above were the half of a rate change anybody
+        // would think of, and the warm-up ledger and the two alignment delays were the half nothing
+        // touched.
+        restateInHostSamples();
         return true;
     }
     // 🔴 THE STREAM RESTART, AND UNTIL P86 THIS CLASS DID NOT HAVE ONE. A consumer reaching a
@@ -371,8 +376,10 @@ public:
     // WHAT IT DELIBERATELY DOES NOT TOUCH, because none of it is audio the caller fed:
     //   · THE BLEND LAW's state — which capture is held, which is wanted, the applied weight, the cold
     //     flags, a load in flight, a load refused. A restart is not a device change. In particular it
-    //     does NOT re-arm `fed[]`. The case for re-arming is that after `nam_[i].reset()` the network
-    //     is back in the just-landed state, so the law's ledger reads "warm" for a flushed network.
+    //     does NOT re-arm `fed[]` for a slot that is ALREADY AUDIBLE — a slot still WARMING is the one
+    //     exception, re-armed below, see the end of this function and nam::blendRestated. The case for
+    //     re-arming an audible slot is that after `nam_[i].reset()` the network is back in the
+    //     just-landed state, so the law's ledger reads "warm" for a flushed network.
     //     The case against won, on three counts, and the third is the one that decides it:
     //       (1) invariant 3 protects the stream's CONSISTENCY — a slot that missed the last 132 ms
     //           beside one that heard it. A restart zeroes the past of both slots AND the dry ring
@@ -404,11 +411,10 @@ public:
     // lanes — so a stereo host with both slots sounding pays 4 x that stage's figure (a real Standard
     // WaveNet is 3.77 ms per lane at a 64-sample block). It is idempotent exactly as the stage's is:
     // the debt is re-armed only by audio actually being fed, a sleeping slot mid-drain pays only the
-    // remainder, and a mono host pays for half of it. A lane that drained ALL the way at a falling edge
-    // is the one place that is not tight: it is provably clean and is charged a full drain anyway,
-    // because `everFed_` is cleared by a restart and not by a completed drain — measured, a lane that
-    // had just spent its whole 2562 is charged again, so the next prepare spends 5124 and not 2562.
-    // Cost only, and registered against that ledger rather than papered over here. Callable from the audio thread — nothing here
+    // remainder, and a mono host pays for half of it — and a lane whose falling-edge drain already ran
+    // to the end pays nothing here (its debt is spent). Until P90 such a lane was billed again by the NEXT
+    // prepare() — 5124 where 2562 was owed — because only a restart cleared the stage's "may be holding
+    // audio" flag; this verb itself never charged it. Callable from the audio thread — nothing here
     // allocates, locks, throws or touches a field the message thread owns — and NOT free there. The
     // natural place is where prepareToPlay is; `prepare()` already performs this restart itself.
     void reset() noexcept {
@@ -459,6 +465,23 @@ public:
         for (int s = 0; s < 2; ++s)
             for (int k = 0; k < bandRt_[s].count; ++k) bandCur_[s][k] = bandTo_[s][k];
         snapGains();
+        // 🔴 …AND A SLOT CAUGHT MID-WARM-UP IS RE-ARMED, exactly as prepare() re-arms it. This restart has
+        // just flushed both networks, so a slot that was part-way through its receptive field is holding
+        // NOTHING — and the law, left alone, goes on crediting it every sample it heard before the
+        // flush, marking it audible with one block of real material in an empty network. That is
+        // invariant 3 broken by up to a whole field, and unlike the ALREADY-WARM case it costs nothing
+        // to close: a warming slot is at weight zero by construction, so re-arming it is inaudible.
+        // Measured on a 2001-tap capture at a 256-sample block, restarting 1, 2 and 3 blocks into the
+        // field: the warm-up that followed was 14, 13 and 12 blocks against the 15 a restart at the
+        // instant of the landing costs — it fell with the depth, which is the progress being carried.
+        //
+        // THE NEED IS HANDED BACK UNCHANGED, which is what separates this call from prepare()'s: the
+        // rate has not moved, so `warmFor` would answer the same number, and re-deriving it here would
+        // be a second copy of that arithmetic rather than a use of it. blendRestated() maps `fed` by its
+        // predicate either way — an audible slot stays audible, a warming one starts over — so the two
+        // verbs share this sentence without sharing a rate argument.
+        for (int i = 0; i < 2; ++i)
+            felitronics::nam::blendRestated(blend_, i, blend_.need[(std::size_t) i], 1.0);
     }
 
     bool   prepared()   const { return prepared_; }
@@ -739,8 +762,9 @@ public:
     // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay
     // travels with a model and is applied at the one instant its slot is silent — weight exactly zero
     // — never as a splice on a live signal. So a table handed in BEFORE playing lands with the first
-    // loads; one that arrives mid-mix waits until the dial visits a knot. A host that has the bytes in
-    // hand should measure before it plays.
+    // loads; one that arrives mid-mix waits until the dial visits a knot, or until the next prepare(),
+    // which lands it on every slot at once because a prepare leaves nothing to splice (see
+    // restateInHostSamples). A host that has the bytes in hand should measure before it plays.
     void setAlignment(AlignmentTable table) {
         align_ = std::move(table);
         if (loaded_) stageDelays();
@@ -1227,22 +1251,28 @@ private:
     // read here are the ones process() reads, spelling for spelling, so that "a restart leaves the
     // player where prepare() leaves it" is true by construction.
     //
-    // ⚠️ AND IT CARRIES ONE SMALL DEFECT OF prepare()'s, REGISTERED RATHER THAN FIXED HERE — with the
-    // reasoning corrected, because the first draft of this note got it wrong. `curSlot_[i]` is snapped
-    // to the pack's per-file trim even when `inputTrims_` is OFF, and process() then ramps from there
-    // to unity; a freshly CONSTRUCTED player starts at unity and does not. Measured by an adversarial
-    // round on a −6 dB trim with trims off: the first sample after a restart is −5.99 dB and it takes
-    // about 43 ms to come within 0.3 dB of unity, identically for both verbs. The draft said fixing it
-    // would put the two verbs back in disagreement — that is FALSE, and this shared body is why: both
-    // verbs read it here, so `trims ? slotGain_[i] : 1.0f` would correct both at once. It is left
-    // alone because it moves RELEASED behaviour of prepare() and belongs to whoever takes that
-    // decision, not because it cannot be fixed in one place. P86 does make it reachable more often:
-    // a host that restarts at every transport stop now meets it at every start.
+    // 🔴 AND THE SLOT TRIM IS SNAPPED THROUGH THE SWITCH THAT TURNS IT OFF, which it was not until P89.
+    // `curSlot_[i]` used to be snapped to the pack's per-file trim whatever `inputTrims_` said, and
+    // process() reads that same switch every block (`trims ? slotGain_[i] : 1.0f`), so with trims OFF
+    // both verbs landed the ramp on a value the audio path was never going to travel to and then ramped
+    // AWAY from it to unity. A freshly CONSTRUCTED player starts at unity and does not. Measured by an
+    // adversarial round on a −6 dB trim with trims off: the first sample after a restart is −5.99 dB and
+    // it takes about 43 ms to come within 0.3 dB of unity, identically for both verbs — a restart that
+    // audibly ducked the slot it was restarting. P86 made it reachable at every transport start.
+    //
+    // The earlier note here registered this rather than fixing it, on the ground that a fix would put
+    // prepare() and reset() back in disagreement. That was FALSE, and this shared body is exactly why:
+    // both verbs snap through these lines, so spelling the switch once corrects both at once and keeps
+    // "a restart leaves the player where prepare() leaves it" true by construction. The switch is read
+    // the way process() reads it (`inputTrims_`, acquire) and chooses between the same two values
+    // (`slotGain_[i]` or unity); only the load order of the gain itself differs, `relaxed` here against
+    // `acquire` there, which is harmless for a lone float read under the stopped-audio contract.
     void snapGains() noexcept {
+        const bool trims = inputTrims_.load(std::memory_order_acquire);
         curIn_    = inGain_.load(std::memory_order_relaxed);
         curOut_   = outGain_.load(std::memory_order_relaxed);
         curChain_ = chainGain_.load(std::memory_order_relaxed);
-        for (int i = 0; i < 2; ++i) curSlot_[i] = slotGain_[i].load(std::memory_order_relaxed);
+        for (int i = 0; i < 2; ++i) curSlot_[i] = trims ? slotGain_[i].load(std::memory_order_relaxed) : 1.0f;
         curDry_   = dryGain_.load(std::memory_order_relaxed);
         curWet_   = wetGain_.load(std::memory_order_relaxed);
     }
@@ -1308,6 +1338,88 @@ private:
     void stageDelays() {
         for (int i = 0; i < 2; ++i)
             pendDelay_[(std::size_t) i].store(delayOfModel(modelIdOf(plan_.file[i]), nam_[i]), std::memory_order_release);
+    }
+
+    // 🔴 EVERY NUMBER THIS PLAYER HOLDS IN HOST SAMPLES, RESTATED AT THE RATE IT NOW RUNS AT. This is
+    // prepare()'s other half, and until P89 it did not exist.
+    //
+    // WHAT prepare() PROMISES ABOUT HOST-DEPENDENT STATE, which is the sentence the mechanism below
+    // serves: after it returns, NOTHING the player will act on is expressed in the samples of a rate it
+    // is no longer running at. The rate-designed things were already covered — the FIRs are redesigned,
+    // the bands redesigned and retired, the dry aligner re-sized, both stages re-prepared, the cold
+    // threshold recomputed from its SECONDS. What was not covered is everything that is a COUNT of host
+    // samples, and there are two such families, both written once and read for ever:
+    //
+    //   · THE WARM-UP LEDGER — `blend_.need[i]`, latched from warmFor() at the landing, and read again at
+    //     every WAKE of a cold slot. See nam::blendRestated, which owns the numbers and the reasoning:
+    //     the warm-up did not depend on the new rate at all, so a slot woken after 48 -> 96 kHz warmed
+    //     for half the field it owes, and after 48 -> 192 for a quarter.
+    //   · THE ALIGNMENT DELAYS — `pendDelay_` and `slotDelay_`, which AlignmentTable::delayOf scales by
+    //     the host rate, and which only stageDelays() and a landing ever wrote. Left stale, the two
+    //     captures of one device are held apart by a number measured for a different rate, so the
+    //     crossfade combs by (ratio − 1) x the delay. A staged delay lands only on a slot at weight zero,
+    //     so a SOUNDING slot kept the stale number until the dial moved it to silence.
+    //
+    // WHY THE TWO DELAYS ARE DERIVED FROM DIFFERENT MODELS, which looks like an inconsistency and is the
+    // point: `pendDelay_` is the PLAN's — the model the dial is asking for — because that is what a
+    // staged retime is, while `slotDelay_` is the delay of the model actually IN the slot. In the common
+    // case they name one capture and get one number. When a load is in flight they do not, and taking
+    // both from the plan would apply the incoming model's delay to the one still playing. Snapping
+    // `slotDelay_` outright is right here and only here: prepare() is never concurrent with process(),
+    // clearAudioState() has just zeroed `lagTail_`, so there is no signal to splice and no click to hide
+    // from — which is the same reason snapGains() snaps rather than ramps.
+    //
+    // ⚠️ AND A LANDING CAN BE IN FLIGHT ACROSS THIS CALL. `loadSlot()` runs on the message thread and
+    // latches `landWarm_`/`landDelay_` at the rate of the moment; the audio thread consumes them on its
+    // next block. A prepare() landing between those two instants would hand the law a warm-up and a
+    // delay measured for the rate that has just gone. The model itself is fine — it is re-prepared —
+    // so only the two numbers need restating, and they are restated from the stage that now holds it.
+    //
+    // ⚠️ AND A FORGET IN FLIGHT MEANS THERE IS NO LEDGER TO RESTATE. load() and unload() post `forget_`
+    // and rebuild `models_` at once, but the audio thread wipes `blend_` only on its NEXT block — so a
+    // prepare() in that window finds `blend_.held[]` naming the PREVIOUS pack's models, as indices into a
+    // `models_` that now belongs to the new one. Resolving them here reads the old slot's delay out of
+    // the NEW pack's table: measured, a pack whose table owed 96 was applied to both slots of the pack
+    // before it. That is muted and heals within a block, and it is still a change to base behaviour in a
+    // window this function was never written for — so it stands back, and leaves the audio thread to
+    // wipe what it was always going to wipe. The PLAN's delays are still restated: `plan_` is the new
+    // pack's, and they are exactly what that first block will snap into place.
+    //
+    // `still` is the one count here that is RESCALED rather than recomputed — see nam::blendRestated for
+    // why it is exact for that count and a trap for `need`. The ratio needs the rate the ledger was
+    // COUNTED in, and that is not reliably `fs_` from before this call: prepare() writes `fs_` ahead of
+    // two sub-prepares whose refusal it honours by returning false (no input reaches that refusal today,
+    // since their channel and rate arguments are validated first — the order is what is relied on, not
+    // the luck), and a refused prepare leaves the player unable to process, so the ledger never advanced
+    // at the rate it wrote. `ledgerFs_` moves only here, at the end of a
+    // prepare that succeeded — and it moves even with no pack loaded, because a pack loaded afterwards
+    // counts at the rate prepared now.
+    void restateInHostSamples() {
+        const double timeScale = ledgerFs_ > 0.0 ? fs_ / ledgerFs_ : 1.0;
+        ledgerFs_ = fs_;
+        if (! loaded_) return;
+        // The plan's delays first: stageDelays() is the one place that arithmetic is spelled.
+        stageDelays();
+        // The guard covers `blend_` and nothing else. A landing pending below belongs to the NEW pack if
+        // it exists at all — unload() voids the old one before posting the forget, and no job for the new
+        // pack can be taken before the audio thread has run once — so it is restated either way, rather
+        // than leaning on that ordering to make a skip harmless.
+        const bool forgetting = forget_.load(std::memory_order_acquire);
+        for (int i = 0; i < 2 && ! forgetting; ++i) {
+            // `blend_` is the audio thread's, read here under the contract that says the two never run
+            // at once — the same licence prepare() already uses to zero `bandRt_[s].count`.
+            if (blend_.held[i] == 0) continue;
+            felitronics::nam::blendRestated(blend_, i, warmFor(nam_[(std::size_t) i]), timeScale);
+            const int d = std::clamp(delayOfModel(blend_.held[i], nam_[(std::size_t) i]), 0, kMaxDelay);
+            slotDelay_[(std::size_t) i].store(d, std::memory_order_relaxed);
+        }
+        if (landFlag_.load(std::memory_order_acquire)) {
+            const int ls = landSlot_.load(std::memory_order_relaxed) & 1;
+            landWarm_ .store(warmFor(nam_[(std::size_t) ls]), std::memory_order_relaxed);
+            landDelay_.store(std::clamp(delayOfModel(landModel_.load(std::memory_order_relaxed),
+                                                     nam_[(std::size_t) ls]), 0, kMaxDelay),
+                             std::memory_order_relaxed);
+        }
     }
 
     void setRequest(std::uint64_t want0, std::uint64_t want1, float targetB) {
@@ -1671,6 +1783,7 @@ private:
 
     // both, by contract
     double fs_ = 48000.0;
+    double ledgerFs_ = 0.0;      // the rate blend_'s host-sample counts are in; 0 = never prepared (restateInHostSamples)
     int    maxBlock_ = 0, channels_ = 1;
     bool   prepared_ = false;
 
