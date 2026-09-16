@@ -21,7 +21,7 @@ namespace felitronics::oversampling
 //              THE DEFAULT everywhere, and the only one for a factor that is not a power of two.
 //   Cascade  — CascadeOversampler: strict, flat to 20 kHz at every rate, lengths derived from the sample
 //              rate. Round trip 131 base samples at 44.1 kHz, 76 at 48 kHz, 28 at 88.2 kHz (4x).
-//              Powers of two only.
+//              Powers of two only; rates [8 kHz, 3 MHz].
 enum class Topology { Kaiser, Cascade };
 
 // One member that is either, for a stage that offers both. Under Kaiser it IS PolyphaseOversampler — the
@@ -43,7 +43,6 @@ class Oversampler
 public:
     struct Storage
     {
-        Topology topology = Topology::Kaiser;
         PolyphaseOversampler::Storage kaiser {};     // empty under Cascade
         CascadeOversampler::Storage   cascade {};    // empty under Kaiser
         std::size_t heapObjects = 0;                 // CascadeOversampler instances the switch allocates (0 or 1)
@@ -61,7 +60,6 @@ public:
                                           int tapsPerPhase, Storage& out) noexcept
     {
         Storage st;
-        st.topology = topology;
         if (topology == Topology::Kaiser)
         {
             if (! PolyphaseOversampler::storageFor (factor, maxChannels, tapsPerPhase, st.kaiser)) return false;
@@ -76,12 +74,18 @@ public:
         return true;
     }
 
-    // The round trip a preparation with these arguments will report, without preparing one. Under Kaiser
-    // this is the formula every stage already used (tapsPerPhase - 1, independent of the factor and the
-    // rate); 0 where the cascade refuses.
+    // The round trip a preparation with these arguments will report, without preparing one — and 0, under
+    // EITHER topology, where that preparation would be refused. Under Kaiser it is the formula every stage
+    // already used (tapsPerPhase - 1, independent of the factor and the rate); every stage asks only after
+    // its own budget accepted the same arguments, so the refusal half changes no caller's number.
     static int latencyFor (Topology topology, double sampleRate, int factor, int tapsPerPhase) noexcept
     {
-        if (topology == Topology::Kaiser) return tapsPerPhase > 0 ? tapsPerPhase - 1 : 0;
+        if (topology == Topology::Kaiser)
+        {
+            PolyphaseOversampler::Storage s;
+            return PolyphaseOversampler::storageFor (factor, 1, tapsPerPhase, s) ? tapsPerPhase - 1 : 0;
+        }
+        if (tapsPerPhase < 4 || tapsPerPhase > PolyphaseOversampler::kMaxTapsPerPhase) return 0;
         return CascadeOversampler::latencyFor (sampleRate, factor);
     }
 

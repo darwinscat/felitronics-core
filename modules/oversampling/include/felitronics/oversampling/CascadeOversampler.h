@@ -58,7 +58,7 @@ namespace felitronics::oversampling
 //     ripples around -90 dB itself (that header's "59 taps is worse than 58"), so the -90 point jumps
 //     between sidelobes as t moves (the stand read it wandering between about 2.9 and 3.6 fs/t) and no
 //     smooth rule can place it. At 9.5 the floor is ~-94.6 and the -90 point sits on the skirt (3.01 to
-//     3.13 fs/t on the same stand). It costs ~4 % of taps.
+//     3.13 fs/t on the same stand), at a cost the stand put at ~4 % of taps.
 //   * halfband lengths by stage: 27, 23, 23, 15, 15 (beta 9.5) — the shortest that keep the cascade at the
 //     stage-1 floor (the design stand read a 23-tap stage 2 at -80.5; the suite's strictness bar fails it).
 //   * decimation phases are chosen so that the round trip is an INTEGER number of base samples and the
@@ -66,7 +66,7 @@ namespace felitronics::oversampling
 //
 // WHAT IT DELIVERS, pinned in CascadeOversamplerTests (both composites recovered through the public API):
 // over 14 rates from 8 kHz to 768 kHz and factors 2..64, images and aliases of anything below fs/2 at
-// -91.0 dB or lower and one pass within 0.0043 dB of flat up to the band edge; over EVERY taps count the
+// -91.0 dB or lower and one pass within 0.0042 dB of flat up to the band edge; over EVERY taps count the
 // rule can produce (110 of them, 16..125), -90.9 dB and 0.0049 dB — the rule's real margin; and a
 // palindromic composite.
 //
@@ -78,8 +78,10 @@ namespace felitronics::oversampling
 //
 // THE PRICE IS LATENCY, not CPU: 131 base samples at 44.1 kHz against 63. That is the width of the
 // transition, not the structure — strictness with a 2.05 kHz transition costs about 250 taps at 2 fs
-// whatever the topology (Kaiser's length estimate; the rule builds 250) — and above 44.1 kHz the transition widens and the price falls below the
-// fixed-cutoff design's.
+// whatever the topology (Kaiser's length estimate; the rule builds 250). Above 44.1 kHz the transition
+// widens and the price falls, but its two halves cross at different rates: the MULTIPLY count drops below
+// the fixed-cutoff design's from about 46 kHz (348 at 48 kHz against 512), the LATENCY only from about
+// 50 kHz (4x: 76 at 48 kHz against 63; 28 at 88.2 kHz).
 //
 // WHAT IT IS NOT FOR. The certified true-peak reference (`analysis::ReferenceTruePeakMeter`) is
 // PolyphaseOversampler at 4x/32 by contract, and stays so. Factors that are not powers of two are
@@ -87,12 +89,15 @@ namespace felitronics::oversampling
 //
 // LAW 11(b): unlike PolyphaseOversampler (whose channel CLAMP is P55), prepare() REFUSES a channel count
 // outside [1, core::kMaxChannels], a factor that is not a power of two in [2, kMaxFactor], and a rate
-// outside [kMinSampleRate, kMaxSampleRate] — and a refused call touches nothing. A stage that offers this
-// topology inherits the rate window: PolyphaseOversampler never looked at the rate, so under Cascade a
-// Saturator or a limiter refuses rates below 1 kHz that it accepts under Kaiser.
+// outside [kMinSampleRate, kMaxSampleRate] ([8 kHz, 3 MHz]: the core's floor, P51, and the real-time stages'
+// ceiling) — and a refused call touches nothing. A stage that offers this topology inherits the rate window:
+// PolyphaseOversampler never looked at the rate, so under Cascade a Saturator or a limiter refuses rates below
+// 8 kHz that it accepts under Kaiser. (No tap depends on where the floor is: every rate up to 44.1 kHz gets
+// the same geometry.)
 // LAW 2 (P56): every inner loop is `core::firDot`. The one sum outside it — the halfband decimator's
 // centre tap — adds a value that was halved and STORED a sample earlier, so no contraction can fuse the
-// multiply into the add (the tree builds -ffp-contract=on; gcc's `fast` fuses across statements).
+// multiply into the add (the tree builds -ffp-contract=on; gcc's `fast` fuses across statements). Halving is
+// exact above the subnormal range, so a fusion would move bits only there — the store makes it moot.
 // Coefficients are designed with core::det::sin and core::det::mul, so the doubles are the same on every
 // row before they are narrowed.
 // RT-safe: prepare() allocates; upsample()/downsample() do no alloc/lock/throw and take any n (they walk
@@ -104,7 +109,7 @@ public:
     static constexpr int    kMaxStages      = 6;           // log2 (kMaxFactor)
     static constexpr double kBandEdgeHz     = 20000.0;
     static constexpr double kEdgeRate       = 44100.0;     // below this rate the edge is 20/44.1 of fs
-    static constexpr double kMinSampleRate  = 1000.0;
+    static constexpr double kMinSampleRate  = core::kMinSampleRate;   // P51: the core's one floor (8 kHz)
     static constexpr double kMaxSampleRate  = 3.0e6;
     static constexpr double kBeta           = 9.5;
     static constexpr double kPassA0 = 2.745, kPassA1 = 1.4;    // one pass within 0.005 dB, in fs/t below the cutoff

@@ -264,7 +264,8 @@ int main()
         check (allGood, (std::string ("S1 measured impulse latency: main lobe at exactly +")
                          + std::to_string (kLat) + " (all tubes/topologies)").c_str());
     }
-    // S2: reported latency invariant across drive/tube/topology AND OS factor (4x & 32x both tpp-1).
+    // S2: reported latency invariant across drive/tube/PP-SE topology AND OS factor (4x & 32x both tpp-1, under the
+    //     default Kaiser oversampler; the cascade's latency does depend on the factor — TT10).
     {
         bool ok = true;
         for (int os : { 4, 8, 16, 32 }) { TubePowerAmp d; d.prepare (kSr, kMaxBlk, os); ok = ok && (d.latencySamples() == kLat); }

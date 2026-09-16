@@ -38,6 +38,9 @@
 //   TT8 NaN/Inf   — flushDenormals + the isfinite gates flush state each block ⇒ a poison burst is
 //                   contained: output finite within ≤2 valid blocks. NaN driveDb/Inf outputDb/NaN
 //                   autoComp ⇒ setParams sanitize gate falls back (0 dB / autoComp 1) ⇒ finite, alive.
+//   TT10 Cascade  — the Topology::Cascade oversampler (P31): its latency per factor and rate (NOT factor-
+//                   invariant), the factor/rate clamps, the impulse at the reported latency, 20 kHz, and no
+//                   image IMD from don't-care content.
 //   TT9 Determ.   — same schedule twice from reset ⇒ BIT-identical. Block-size invariance: feel OFF is
 //                   bit-exact across schedules; feel ON carries the KNOWN ~1e-2 "B9" feel-layer block
 //                   discrepancy — PINNED (≤2e-2) and reported, NOT chased (a documented deviation).
@@ -504,13 +507,13 @@ int main()
         check (latOf (kSr, 3) == CascadeOversampler::latencyFor (kSr, 2) && latOf (kSr, 12) == CascadeOversampler::latencyFor (kSr, 8)
                && latOf (kSr, 64) == CascadeOversampler::latencyFor (kSr, 32) && latOf (kSr, 1) == CascadeOversampler::latencyFor (kSr, 2),
                "TT10 a factor that is not a power of two is rounded DOWN (3->2, 12->8), and the [2,32] clamp still applies (64->32, 1->2)");
-        check (latOf (500.0, 4) == CascadeOversampler::latencyFor (1000.0, 4) && latOf (500.0, 4) == latOf (44100.0, 4)
+        check (latOf (500.0, 4) == CascadeOversampler::latencyFor (CascadeOversampler::kMinSampleRate, 4) && latOf (500.0, 4) == latOf (44100.0, 4)
                && latOf (1.0e7, 4) == CascadeOversampler::latencyFor (3.0e6, 4)
                && latOf (std::numeric_limits<double>::quiet_NaN(), 4) == CascadeOversampler::latencyFor (44100.0, 4)
                && latOf (std::numeric_limits<double>::infinity(), 4) == CascadeOversampler::latencyFor (44100.0, 4)
                && latOf (-std::numeric_limits<double>::infinity(), 4) == CascadeOversampler::latencyFor (44100.0, 4)
                && latOf (0.0, 4) == CascadeOversampler::latencyFor (44100.0, 4),
-               "TT10 the design rate is clamped into [1 kHz, 3 MHz], and a non-finite or non-positive one (NaN, +-inf, 0) designs as 44.1 kHz");
+               "TT10 the design rate is clamped into [8 kHz, 3 MHz], and a non-finite or non-positive one (NaN, +-inf, 0) gets the 44.1 kHz geometry");
         check (latOf (kSr, 4, 1) == latOf (kSr, 4, 5000), "TT10 tapsPerPhase does not reach the cascade (clamped either way, unused)");
         {
             PowerAmpStage k; k.prepare (kSr, kMaxBlk, 3);

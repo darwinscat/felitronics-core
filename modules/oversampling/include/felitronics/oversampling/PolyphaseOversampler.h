@@ -73,7 +73,8 @@ namespace detail
 // oversampling::CascadeOversampler, just as strict, a Kaiser 2x stage sized from the sample rate and then
 // halfbands — which Saturator, TruePeakLimiter and PowerAmpStage take on request (oversampling::Topology).
 // Its price is latency, not CPU: 131 base samples at 44.1 kHz 4x against 63 here, for about the same
-// multiply count; at 48 kHz and above it is cheaper than this class. Switching the stages' DEFAULTS is a
+// multiply count (572 against 512). Above 44.1 kHz it gets cheaper — in multiplies from about 46 kHz (348 at
+// 48 kHz), in latency only from about 50 kHz (76 at 48 kHz, 28 at 88.2). Switching the stages' DEFAULTS is a
 // step of its own. Since nothing here moved, neither the taps table below nor
 // test_support's deliveredBudgetDb() needed re-deriving; the cascade's budget is deliveredBudgetDbFlatTo().
 //
@@ -120,7 +121,8 @@ namespace detail
 // 2.505 (0.05 dB), 2.723 (0.01 dB), so a WIDER flat band is bought hyperbolically: 0.42 fs costs 80
 // taps, 0.43 costs 128, 0.44 costs 239. Do not buy it that way — 20 kHz at 44.1 kHz is 0.4535 fs, ABOVE
 // the fixed cutoff, so no tapsPerPhase reaches it and more taps make it WORSE (-27.4 dB at 32 against
-// -31.1 at 64). Widening the audible band is the CUTOFF's axis, not this one.
+// -31.1 at 64, TWO stages in series — one round trip is the -13.71 / -15.55 above). Widening the audible
+// band is the CUTOFF's axis, not this one — and since P31 that axis is a separate class, CascadeOversampler.
 // Cost, both linear in tapsPerPhase: the FIR (measured 2.09x for the clipper+limiter pair, 2.13 %RT ->
 // 4.44 %RT at 48 kHz stereo 4x) and the reported latency (tapsPerPhase - 1 baseband samples).
 class PolyphaseOversampler

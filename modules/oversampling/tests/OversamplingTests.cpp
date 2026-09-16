@@ -654,6 +654,7 @@ static void runCutoffAxisTests()
         test::approx (at19, -1.80, 0.02, "44.1 kHz: 19 kHz loses 1.80 dB over one round trip");
         test::approx (at20, -15.55, 0.02, "44.1 kHz: 20 kHz loses 15.55 dB");
         test::approx (at20t32, -13.71, 0.02, "44.1 kHz: 20 kHz at 32 taps loses 13.71 dB");
+        test::approx (at20t120, -19.17, 0.02, "44.1 kHz: 20 kHz at 120 taps loses 19.17 dB");
         test::ok (at20t120 < at20 - 2.0 && at20 < at20t32 - 1.0,
                   "and MORE taps make 20 kHz WORSE (32 -> 64 -> 120: " + std::to_string (at20t32) + ", "
                   + std::to_string (at20) + ", " + std::to_string (at20t120) + ") — a cutoff axis, not a taps one");

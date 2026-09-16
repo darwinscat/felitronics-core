@@ -331,7 +331,7 @@ static void runCascadeTopology()
                                    (void) oversampling::CascadeOversampler::designFor (sr, 4, d); return d.bandEdgeHz / sr; };
 
     test::group ("Cascade topology: the budget enumeration reproduces Kaiser's, and moves only where the band does");
-    for (int F : { 2, 4, 8 })
+    for (int F : { 2, 4, 8, 16 })
         test::approx (tpw::deliveredBudgetDbFlatTo (F, 0.40), tpw::deliveredBudgetDb (F), 1e-12,
                       "F=" + std::to_string (F) + ": enumerated to Kaiser's flat edge == the named budget");
     // The enumeration really runs to q = 64: a band flat to 0.471 fs delivers 8fs/17, whose grid term wins at
@@ -489,7 +489,7 @@ static void runCascadeTopology()
         limiter::TruePeakLimiterConfig k500 = cfg; k500.topology = Topology::Kaiser;
         test::ok (! lim.prepare (500.0, 512, 2, cfg) && ! limiter::TruePeakLimiter::storageFor (500.0, 512, 2, cfg, st)
                   && limiter::TruePeakLimiter::latencyFor (500.0, 512, 2, cfg) == 0 && lim.prepare (500.0, 512, 2, k500),
-                  "500 Hz: refused under the cascade (its rate window starts at 1 kHz), accepted under Kaiser as before");
+                  "500 Hz: refused under the cascade (its rate window starts at the core's 8 kHz), accepted under Kaiser as before");
 
         // 20 kHz below the ceiling passes as itself under the cascade; the Kaiser round trip takes 15.5 dB.
         auto level20k = [&] (Topology topo)

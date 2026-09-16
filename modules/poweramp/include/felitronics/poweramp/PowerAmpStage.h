@@ -36,7 +36,8 @@
 //     fingerprint, load/transformer corners). A product ships its own preset table (OrbitCab keeps
 //     kTubeVoicings {6L6, EL34, EL84, KT88}) and passes the chosen entry into setParams(). Trusted
 //     data: finite by contract (a constexpr table), not sanitized per block.
-//   • Params — the user-facing control values (Drive/Output/topology + the [0,1] feel amounts).
+//   • Params — the user-facing control values (Drive/Output/PP-SE topology + the [0,1] feel amounts; the
+//     OVERSAMPLER topology is a separate, prepare-time choice — see prepare()).
 //     UNTRUSTED: sanitized at the setParams() gate (isfinite + clamp), because a bad preset or a
 //     non-parameter-system caller would otherwise poison the OS/DC/IIR state with NaN — permanently.
 //
@@ -149,7 +150,7 @@ public:
     // flat to 20 kHz at every rate, round trip 131 samples at 44.1 kHz and 76 at 48 kHz (4x), from the rate
     // rather than from `tapsPerPhase`. Clamped like everything else here, never refused: under Cascade the
     // factor is rounded DOWN to a power of two (3 -> 2, 12 -> 8), and the rate the filter is designed for
-    // is clamped into [1 kHz, 3 MHz] (every rate up to 44.1 kHz shares one geometry, so the low clamp
+    // is clamped into [8 kHz, 3 MHz] (every rate up to 44.1 kHz shares one geometry, so the low clamp
     // changes no tap); a rate that is not a finite positive number — NaN, +-inf, 0, negative — gets the
     // 44.1 kHz geometry (the one every rate up to 44.1 kHz shares) rather than being clamped to an end. Read latencySamples() back — it reports what was built.
     void prepare (double sampleRate, int maxBlock, int oversampleFactor = 4,

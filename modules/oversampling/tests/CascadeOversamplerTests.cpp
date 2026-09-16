@@ -145,7 +145,7 @@ static void runRuleTests()
     const double rates[] = { 8000.0, 22050.0, 32000.0, 44100.0, 46000.0, 48000.0, 50000.0, 64000.0,
                              88200.0, 96000.0, 176400.0, 192000.0, 384000.0, 768000.0 };
     double worstStrict = -1e9, worstEdge = 0.0, worstSym = 0.0;
-    bool allPrepared = true, allSymmetric = true, upLegOk = true;
+    bool allPrepared = true, allSymmetric = true, upLegOk = true, macOk = true;
     for (double fs : rates)
         for (int F : { 2, 4, 8, 16, 32, 64 })
         {
@@ -175,6 +175,8 @@ static void runRuleTests()
                 std::printf ("       %6.0f Hz 4x: t %3d, latency %3d, MAC %3d, strict %.2f dB, edge %.4f dB\n",
                              fs, d.firstTapsPerPhase, d.latencySamples, mac, std::max (ru.strictDb, rd.strictDb),
                              std::max (ru.edgeDevDb, rd.edgeDevDb));
+                const int wantMac = fs == 44100.0 ? 572 : (fs == 48000.0 ? 348 : 156);
+                if (mac != wantMac) macOk = false;
             }
         }
     std::printf ("       over %zu rates x 6 factors: worst strict %.2f dB, worst one-pass deviation to the edge %.5f dB, "
@@ -186,6 +188,10 @@ static void runRuleTests()
     test::ok (worstEdge <= 0.005, "FLAT: one pass stays within 0.005 dB up to the band edge (" + std::to_string (worstEdge) + ")");
     test::ok (allSymmetric, "LINEAR PHASE: every composite interpolator is a palindrome");
     test::ok (upLegOk, "and Design::upLegTwice is twice its centre, in top-rate samples, at every rate and factor");
+    // The multiply count the header prints: firDot lengths per base sample, up + down, padding included. The
+    // fixed-cutoff stage at 4x/64 is 4 * 64 up + 256 down.
+    constexpr int kaiserMac = 4 * 64 + core::firPadLen (4 * 64);
+    test::ok (macOk && kaiserMac == 512, "4x multiply count: 572 / 348 / 156 / 156 at 44.1 / 48 / 88.2 / 96 kHz, against 512 for the Kaiser stage");
 
     // EVERY taps count the rule can produce, not only the ones fourteen rates happen to reach (they reach
     // eight). Stage 1 alone (F = 2) is what the rule sizes; the first rate that yields each t is the probe.
@@ -211,7 +217,7 @@ static void runRuleTests()
         }
         std::printf ("       every reachable taps count (%zu, %d..%d): worst strict %.2f dB (t %d), worst edge %.5f dB\n",
                      firstRate.size(), tMin, tMax, wS, tS, wE);
-        test::ok (firstRate.size() == 110 && tMin == 16 && tMax == 125, "the rule produces 110 taps counts, 16..125, over 1 kHz..3 MHz");
+        test::ok (firstRate.size() == 110 && tMin == 16 && tMax == 125, "the rule produces 110 taps counts, 16..125, over 8 kHz..3 MHz");
         test::ok (wS <= -90.0 && wE <= 0.005, "and every one of them is strict and flat to its band edge ("
                                               + std::to_string (wS) + " dB, " + std::to_string (wE) + " dB)");
     }
@@ -320,7 +326,8 @@ static void runRefusalTests()
     struct Case { double fs; int F, ch; const char* why; };
     const Case bad[] = {
         { nan, 4, 1, "NaN rate" }, { inf, 4, 1, "infinite rate" }, { -44100.0, 4, 1, "negative rate" }, { 0.0, 4, 1, "zero rate" },
-        { 999.0, 4, 1, "rate below 1 kHz" }, { 3.0e6 + 1.0, 4, 1, "rate above 3 MHz" },
+        { std::nextafter (core::kMinSampleRate, 0.0), 4, 1, "rate just below the core's 8 kHz floor" }, { 1000.0, 4, 1, "1 kHz" },
+        { 3.0e6 + 1.0, 4, 1, "rate above 3 MHz" },
         { 44100.0, 0, 1, "factor 0" }, { 44100.0, 1, 1, "factor 1" }, { 44100.0, 3, 1, "factor 3 (not a power of two)" },
         { 44100.0, 6, 1, "factor 6" }, { 44100.0, 128, 1, "factor 128" }, { 44100.0, -4, 1, "factor -4" },
         { 44100.0, 4, 0, "no channels" }, { 44100.0, 4, core::kMaxChannels + 1, "channels past kMaxChannels (NOT clamped)" },
@@ -348,7 +355,8 @@ static void runRefusalTests()
         test::ok (a1 == a2, std::string ("and the refused call left the coefficients and rings untouched: ") + b.why);
         if (b.ch >= 1 && b.ch <= core::kMaxChannels) test::ok (! design && d.latencySamples == 777, std::string ("designFor refuses it too: ") + b.why);
     }
-    test::ok (CascadeOversampler {}.prepare (1000.0, 64, core::kMaxChannels), "the edges themselves are accepted (1 kHz, 64x, kMaxChannels)");
+    test::ok (CascadeOversampler::kMinSampleRate == core::kMinSampleRate, "the floor IS the core's one floor (P51), not a copy of its value");
+    test::ok (CascadeOversampler {}.prepare (core::kMinSampleRate, 64, core::kMaxChannels), "the edges themselves are accepted (8 kHz, 64x, kMaxChannels)");
     test::ok (CascadeOversampler {}.prepare (3.0e6, 2, 1), "and 3 MHz");
 
     // Unprepared calls are no-ops, not bad indices.
@@ -576,6 +584,18 @@ static void runTopologyTests()
               "Cascade still range-checks tapsPerPhase at BOTH ends (3 and 2000 refused, 4 accepted), so the refusal set does not shrink with the topology");
     test::ok (! oversampling::Oversampler::storageFor (oversampling::Topology::Cascade, 44100.0, 3, 1, 64, s1),
               "Cascade refuses a factor that is not a power of two");
+    {
+        using oversampling::Topology; using OS = oversampling::Oversampler;
+        test::ok (OS::latencyFor (Topology::Kaiser, 44100.0, 4, 64) == 63 && OS::latencyFor (Topology::Kaiser, 44100.0, 1, 64) == 0
+                  && OS::latencyFor (Topology::Kaiser, 44100.0, 4, 2000) == 0 && OS::latencyFor (Topology::Kaiser, 44100.0, 4, 3) == 0
+                  && OS::latencyFor (Topology::Cascade, 44100.0, 4, 3) == 0 && OS::latencyFor (Topology::Cascade, 44100.0, 4, 2000) == 0
+                  && OS::latencyFor (Topology::Cascade, 44100.0, 4, 64) == 131,
+                  "latencyFor answers 0 wherever the preparation would be refused, under EITHER topology");
+        OS sw; (void) sw.prepare (Topology::Cascade, 44100.0, 4, 1, 64);
+        test::ok (! sw.prepare (Topology::Cascade, 44100.0, 4, 1, 2000) && ! sw.prepare (Topology::Cascade, 44100.0, 4, 1, 3)
+                  && sw.latencySamples() == 131 && sw.topology() == Topology::Cascade,
+                  "the switch's own prepare() refuses a bad tapsPerPhase under the cascade, and touches nothing");
+    }
 
     oversampling::Oversampler ov;
     CascadeOversampler co;
@@ -595,6 +615,8 @@ static void runTopologyTests()
 
     // The default must not pay for the option: the cascade is held on the heap, only when chosen, and the
     // switch stays copyable (the stages that embed it are copied and moved by callers).
+    std::printf ("       sizeof: Oversampler %zu, PolyphaseOversampler %zu, CascadeOversampler %zu (heap-held)\n",
+                 sizeof (oversampling::Oversampler), sizeof (oversampling::PolyphaseOversampler), sizeof (CascadeOversampler));
     test::ok (sizeof (oversampling::Oversampler) <= sizeof (oversampling::PolyphaseOversampler) + 40,
               "the switch costs the Kaiser path at most 40 bytes of object size (" + std::to_string (sizeof (oversampling::Oversampler))
               + " against " + std::to_string (sizeof (oversampling::PolyphaseOversampler)) + ")");

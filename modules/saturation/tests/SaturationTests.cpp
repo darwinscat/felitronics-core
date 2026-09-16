@@ -427,6 +427,9 @@ static void runCascadeTopologyTests()
                   "latency is the cascade's own 131, and latencyFor says so before preparing ("
                   + std::to_string (s.latencySamples()) + ")");
         test::ok (saturation::Saturator::latencyFor (44100.0, 512, 2, 4, 64) == 63, "while the default still reads 63");
+        test::ok (saturation::Saturator::latencyForFactor (4, 64) == 63 && saturation::Saturator::latencyForFactor (1, 64) == 0
+                  && saturation::Saturator::latencyForFactor (4, 0) == 0 && saturation::Saturator::latencyForFactor (32, 12) == 11,
+                  "latencyForFactor (Kaiser's formula, public, no in-tree caller left) is still tpp - 1 above factor 1");
         saturation::Saturator::Storage st;
         test::ok (! s.prepare (44100.0, 512, 2, 3, 64, Topology::Cascade)
                   && ! saturation::Saturator::storageFor (44100.0, 512, 2, 3, 64, st, Topology::Cascade)
@@ -437,15 +440,17 @@ static void runCascadeTopologyTests()
                   "tapsPerPhase is still range-checked under the cascade (2000 and 3 refused, as under Kaiser), so no argument became free");
         test::ok (s.prepare (44100.0, 512, 2, 1, 2000, Topology::Cascade) && s.latencySamples() == 0,
                   "and at factor 1 there is no oversampler, so the topology is moot — exactly as tapsPerPhase was");
-        // The cascade designs from the RATE, so under it the rate window is [1 kHz, 3 MHz]; the Kaiser stage
+        // The cascade designs from the RATE, so under it the rate window is [8 kHz, 3 MHz]; the Kaiser stage
         // never looked at the rate and keeps accepting what it accepted.
         test::ok (! s.prepare (500.0, 512, 2, 4, 64, Topology::Cascade)
                   && ! saturation::Saturator::storageFor (500.0, 512, 2, 4, 64, st, Topology::Cascade)
                   && saturation::Saturator::latencyFor (500.0, 512, 2, 4, 64, Topology::Cascade) == 0,
                   "500 Hz is refused under the cascade (prepare, storageFor, latencyFor)");
         test::ok (s.prepare (500.0, 512, 2, 4, 64) && s.latencySamples() == 63, "and accepted under Kaiser, as before");
-        test::ok (s.prepare (1000.0, 512, 2, 4, 64, Topology::Cascade) && ! s.prepare (3.1e6, 512, 2, 4, 64, Topology::Cascade),
-                  "1 kHz is the cascade's floor; 3.1 MHz is past its ceiling");
+        test::ok (s.prepare (core::kMinSampleRate, 512, 2, 4, 64, Topology::Cascade)
+                  && ! s.prepare (std::nextafter (core::kMinSampleRate, 0.0), 512, 2, 4, 64, Topology::Cascade)
+                  && ! s.prepare (3.1e6, 512, 2, 4, 64, Topology::Cascade),
+                  "the core's 8 kHz floor (P51) is the cascade's, to the last representable rate below it; 3.1 MHz is past its ceiling");
 
         for (Topology topo : { Topology::Kaiser, Topology::Cascade })
         {
@@ -554,8 +559,8 @@ static void runCascadeTopologyTests()
 
         // Aliasing at the header's operating point, worst over nine tones (0.150 .. 0.190 fs): the cascade is
         // strict, so it may not be worse than the Kaiser stage — measured -122.4 against -120.8 dBc in total,
-        // and -137.7 against -120.8 inside 0..20 kHz.
-        double totC = -1e9, inC = -1e9, totK = -1e9;
+        // and -137.7 against -120.8 inside 0..20 kHz (both columns printed below).
+        double totC = -1e9, inC = -1e9, totK = -1e9, inK = -1e9;
         for (int k = 0; k < 9; ++k)
         {
             const int b = (int) std::lround ((0.150 + 0.005 * k) * kW);
@@ -564,10 +569,13 @@ static void runCascadeTopologyTests()
             totC = std::max (totC, nonHarmonicDbc (mc, b, kW / 2));
             inC  = std::max (inC,  nonHarmonicDbc (mc, b, b20k));
             totK = std::max (totK, nonHarmonicDbc (mk, b, kW / 2));
+            inK  = std::max (inK,  nonHarmonicDbc (mk, b, b20k));
         }
-        std::printf ("       tanh +6 dB, worst of nine tones: cascade %.1f dBc (%.1f in 0..20 kHz), Kaiser %.1f dBc\n", totC, inC, totK);
+        std::printf ("       tanh +6 dB, worst of nine tones: cascade %.1f dBc (%.1f in 0..20 kHz), Kaiser %.1f dBc (%.1f in 0..20 kHz)\n",
+                     totC, inC, totK, inK);
         test::ok (totC < -118.0 && inC < -130.0, "the cascade's total non-harmonic energy stays under -118 dBc, and under -130 in the audio band");
-        test::ok (totC < totK + 1.0, "and it is no worse than the Kaiser stage's (" + std::to_string (totK) + ")");
+        test::ok (totC < totK + 1.0 && inC < inK, "and it is no worse than the Kaiser stage's (" + std::to_string (totK)
+                                                   + " total, " + std::to_string (inK) + " in band)");
 
         // The reason the guard band exists: content at 0.48 fs (in the don't-care band) through the asymmetric
         // curve. An ideal oversampler puts NOTHING in 0..20 kHz here; a halfband first stage flat to 20 kHz put

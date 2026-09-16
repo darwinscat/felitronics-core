@@ -75,7 +75,8 @@ namespace detail
 }
 
 //==============================================================================
-// TOPOLOGY, fixed for the life of a prepared stream. These three decide the FIR design, the buffer
+// TOPOLOGY, fixed for the life of a prepared stream. These four decide the FIR design (under Cascade together
+// with the sample rate), the buffer
 // sizes and the reported latency, so none of them can be a per-block parameter: changing the factor
 // has no state-preserving mapping between a live 2×/4×/8× history, and changing the lookahead moves
 // latencySamples(), which in any host is a resynchronisation event rather than automation. They live
@@ -90,7 +91,8 @@ struct TruePeakLimiterConfig
     // Which oversampler (P31). Kaiser — PolyphaseOversampler, the default. Cascade — CascadeOversampler:
     // flat to 20 kHz at every rate, a power-of-two factor only (3, 5, 6 ... are refused, not clamped), a longer round trip (131 samples at
     // 44.1 kHz 4x). `tapsPerPhase` is range-checked under both and used only by Kaiser. The cascade also
-    // narrows the accepted rates to [1 kHz, 3 MHz]; Kaiser goes as low as 20 ms still holds two samples.
+    // narrows the accepted rates to [8 kHz, 3 MHz] (the core's floor, P51); Kaiser goes as low as 20 ms still
+    // holds two samples.
     // What the cascade changes about the ceiling is stated under WHAT IT DOES NOT PROMISE, below.
     oversampling::Topology topology = oversampling::Topology::Kaiser;
 };
@@ -214,9 +216,11 @@ struct TruePeakLimiterTap
 //     DELIVERS 4fs/9 (0.4444 fs), and that becomes the worst tone at 8x (+0.133 against 2fs/5's +0.108)
 //     and at 16x (+0.033). fs/3 and 2fs/5 still win at 2x and 4x, and at 48 kHz (flat to 0.4167 fs)
 //     nothing moves. test_support's deliveredBudgetDbFlatTo() enumerates it from the band edge;
-//   * the modulation envelope HOLDS — every dense, click and release witness lands inside grid + 1.15 dB
-//     (worst 1.344 dB at 2x and 44.1 kHz; 0.700 at 8x against 1.283) — and at 4x and 8x the cascade's
-//     dense excess is lower than Kaiser's (0.49 / 0.48 dB against 0.81 / 0.75 at 44.1 kHz);
+//   * the modulation envelope HOLDS — every dense witness and every click train at releases from 100 ms
+//     down to 0.1 ms lands inside grid + 1.15 dB: worst 1.344 dB at 2x and 44.1 kHz; at 48 kHz 0.997 at 4x
+//     and 0.938 at 8x (against 1.586 and 1.258 — both a hair above the Kaiser totals quoted above, which were
+//     stated for releases >= 1 ms); and at 44.1 kHz, 4x and 8x, the cascade's DENSE excess is lower than
+//     Kaiser's (0.49 / 0.48 dB against 0.81 / 0.75);
 //   * both floors at once: 2.03 / 1.42 / 1.37 dB at 2x / 4x / 8x and 44.1 kHz (Kaiser 2.16 / 1.87 / 1.83),
 //     2.17 / 1.85 / 1.79 at 48 kHz — outside the envelope, as under Kaiser, and pinned.
 // And the round trip is 131 base samples at 44.1 kHz 4x (76 at 48 kHz) plus the lookahead, where the
