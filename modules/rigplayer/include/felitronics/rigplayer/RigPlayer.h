@@ -480,7 +480,7 @@ public:
         // predicate either way — an audible slot stays audible, a warming one starts over — so the two
         // verbs share this sentence without sharing a rate argument.
         for (int i = 0; i < 2; ++i)
-            felitronics::nam::blendRestated(blend_, i, blend_.need[(std::size_t) i]);
+            felitronics::nam::blendRestated(blend_, i, blend_.need[(std::size_t) i], 1.0);
     }
 
     bool   prepared()   const { return prepared_; }
@@ -1381,7 +1381,17 @@ private:
     // window this function was never written for — so it stands back, and leaves the audio thread to
     // wipe what it was always going to wipe. The PLAN's delays are still restated: `plan_` is the new
     // pack's, and they are exactly what that first block will snap into place.
+    //
+    // `still` is the one count here that is RESCALED rather than recomputed — see nam::blendRestated for
+    // why it is exact for that count and a trap for `need`. The ratio needs the rate the ledger was
+    // COUNTED in, and that is not `fs_` from before this call: prepare() writes `fs_` before the
+    // sub-prepares that can still refuse, and a refused prepare leaves the player unable to process, so
+    // the ledger never advanced at the rate it wrote. `ledgerFs_` moves only here, at the end of a
+    // prepare that succeeded — and it moves even with no pack loaded, because a pack loaded afterwards
+    // counts at the rate prepared now.
     void restateInHostSamples() {
+        const double timeScale = ledgerFs_ > 0.0 ? fs_ / ledgerFs_ : 1.0;
+        ledgerFs_ = fs_;
         if (! loaded_) return;
         // The plan's delays first: stageDelays() is the one place that arithmetic is spelled.
         stageDelays();
@@ -1394,7 +1404,7 @@ private:
             // `blend_` is the audio thread's, read here under the contract that says the two never run
             // at once — the same licence prepare() already uses to zero `bandRt_[s].count`.
             if (blend_.held[i] == 0) continue;
-            felitronics::nam::blendRestated(blend_, i, warmFor(nam_[(std::size_t) i]));
+            felitronics::nam::blendRestated(blend_, i, warmFor(nam_[(std::size_t) i]), timeScale);
             const int d = std::clamp(delayOfModel(blend_.held[i], nam_[(std::size_t) i]), 0, kMaxDelay);
             slotDelay_[(std::size_t) i].store(d, std::memory_order_relaxed);
         }
@@ -1768,6 +1778,7 @@ private:
 
     // both, by contract
     double fs_ = 48000.0;
+    double ledgerFs_ = 0.0;      // the rate blend_'s host-sample counts are in; 0 = never prepared (restateInHostSamples)
     int    maxBlock_ = 0, channels_ = 1;
     bool   prepared_ = false;
 

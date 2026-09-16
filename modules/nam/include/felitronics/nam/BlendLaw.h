@@ -40,6 +40,7 @@
 // passes, as it must; a dial parked on a capture costs one.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace felitronics::nam {
@@ -252,7 +253,7 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
 // WHAT THIS VERB DOES, and it is NOT blendLanded(). A restart is not a landing: it must not clear
 // `inFlight` (a second load could then be asked for a slot that already has one out), nor `cold`, nor
 // `refused` (a capture that deterministically fails would be asked for again — the storm the law exists
-// to prevent). It restates the two numbers that are in host samples and nothing else:
+// to prevent). It restates the three numbers that are in host samples and nothing else:
 //
 //   · `need` is recomputed by the caller, at the NEW rate, from the model actually in the slot, and
 //     handed in. It is not RESCALED from the old one: `need` is not homogeneous in the rate — only the
@@ -278,21 +279,31 @@ inline void blendLanded(BlendState& s, int slot, BlendModelId model, long long p
 //     `need = pre/2 + B`, which is short whenever the block exceeds 96 samples — i.e. always. The slot
 //     goes inaudible, the law rails the goal to its neighbour, and a spurious full crossfade plays.
 //
-//   · `still` is zeroed. It counts host samples at rest against `coldAfterSamples`, which the host DOES
-//     recompute at the new rate, so a partial count in the old rate's units is measured against the new
-//     rate's threshold. The error is bounded by one cold window and self-corrects, but a restart restarts
-//     the rest the same way it restarts the parameter epoch — the law's own list of what starts this
-//     count over simply predates there being a restart verb to put on it.
+//   · `still` is RESCALED by `timeScale` (new rate / the rate the ledger was counted in), and here —
+//     alone of the three — rescaling is the exact answer rather than the trap. `still` is nothing but
+//     accumulated host samples of elapsed time at rest (`still += blockSamples`), with no latency term
+//     and no block term, so it IS homogeneous in the rate: multiplying by the ratio preserves the
+//     elapsed time exactly. Left alone, a partial count in the old rate's units is measured against
+//     `coldAfterSamples`, which the host DOES recompute — 192 -> 48 kHz puts a slot to sleep at once,
+//     48 -> 192 postpones it by up to a cold window.
+//     ⚠️ ZEROING IT WAS THE FIRST DRAFT, and it was a behaviour change hiding as a cleanup: at an
+//     UNCHANGED rate — every same-rate prepare(), which is the common case, and every reset() — it
+//     postponed sleep by a whole cold window at each call, so a host restarting at every transport
+//     start ran a parked dial's second network for two extra seconds each time. The ratio is exactly 1
+//     there, so rescaling changes nothing where nothing changed.
 //
-// Message thread, under the caller's "never concurrent with process()" contract — the same one under
-// which RigPlayer::prepare() already zeroes its band count and clears its audio state.
-inline void blendRestated(BlendState& s, int slot, long long need) {
+// Message thread (prepare) or any thread with audio stopped (reset), under the caller's "never
+// concurrent with process()" contract — the one under which RigPlayer::prepare() already zeroes its band
+// count and clears its audio state. Arithmetic only: no allocation, no lock, no throw.
+inline void blendRestated(BlendState& s, int slot, long long need, double timeScale) noexcept {
     if (slot < 0 || slot >= kBlendSlots) return;
     if (s.held[slot] == 0) return;              // an empty slot has no ledger to restate
     const bool wasAudible = s.fed[slot] >= s.need[slot];
     s.need[slot] = std::max(0LL, need);
     s.fed[slot]  = wasAudible ? s.need[slot] : 0;
-    s.still[slot] = 0;
+    // A scale that is not a positive finite number means "no rate to convert from": leave the count.
+    if (timeScale > 0.0 && timeScale < 1.0e9 && timeScale != 1.0)
+        s.still[slot] = (long long) std::llround((double) s.still[slot] * timeScale);
 }
 
 // A load that could not be honoured (unreadable file, wrong rate). The slot keeps whatever it had,

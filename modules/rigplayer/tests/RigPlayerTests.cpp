@@ -2415,6 +2415,88 @@ int main() {
     }
 
     // ------------------------------------------------------------------------------------------
+    // THE REST COUNT, which is the one host-sample count here that is RESCALED rather than recomputed.
+    // It is pure elapsed time, so a restart must preserve the time a slot has already rested — at a new
+    // rate by converting it, and at an UNCHANGED rate by leaving it exactly alone. Three behaviours are
+    // told apart by one measurement, the seconds from the restart until the parked neighbour sleeps:
+    //   · the base commit left the count in the old rate's samples — 48 -> 96 kHz slept late, and
+    //     96 -> 48 slept at once;
+    //   · the first draft of this fix ZEROED it — every restart, same rate included, postponed sleep
+    //     by a whole cold window;
+    //   · converting it keeps every row equal to the same-rate one.
+    group("P89: the time a slot has already RESTED survives a restart — converted, never reset");
+    {
+        namz::rig::Rig r;
+        namz::rig::Stage st; st.kind = namz::rig::StageKind::Nam; st.rawKind = "nam";
+        namz::rig::Control gc; gc.name = "gain"; gc.role = namz::rig::Role::Gain;
+        gc.values = { "60", "150", "240" }; gc.sweep = 300;
+        st.device.controls = { gc };
+        namz::rig::FileEntry fe; fe.id = "early"; fe.settings = { { "gain", "60" } };
+        namz::rig::FileEntry fm; fm.id = "mid";   fm.settings = { { "gain", "150" } };
+        namz::rig::FileEntry fl; fl.id = "late";  fl.settings = { { "gain", "240" } };
+        st.device.files = { fe, fm, fl };
+        r.chain = { st };
+
+        // Park at `from`, rest `rested` seconds (under the cold window), restart into `to` by `verb`,
+        // then return the SECONDS until a slot falls asleep. The part before the restart is identical
+        // for every row that starts at the same rate, so rows compare on the part after it.
+        const auto secondsToSleep = [&r](double from, double to, const char* verb, double rested) {
+            std::map<std::string, std::vector<std::byte>> files {
+                { "early", bytesOf(gainModel(0.25)) }, { "mid", bytesOf(gainModel(0.5)) },
+                { "late",  bytesOf(gainModel(1.0)) } };
+            RigPlayer p;
+            felitronics::test::run (p.prepare(from, kBlock, 1));
+            p.load(r, [&files](const std::string& id) {
+                const auto it = files.find(id);
+                return it == files.end() ? std::vector<std::byte> {} : it->second;
+            });
+            p.setBlendShape({ 0.5, 0.0 });
+            p.setDial("gain", 150.0);
+            std::vector<float> x((std::size_t) kBlock, 0.1f);
+            float* io[1] { x.data() };
+            const int restBlocks = (int) std::lround(rested * from / kBlock);
+            for (int k = 0; k < restBlocks; ++k) { felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere(); }
+            if (p.slotCold(0) || p.slotCold(1)) return -1.0;           // slept BEFORE the restart: row is void
+            if (std::string(verb) == "reset") p.reset();
+            else felitronics::test::run (p.prepare(to, kBlock, 1));
+            for (int k = 1; k < (int) (4.0 * to / kBlock); ++k) {
+                felitronics::test::run (p.process(io, 1, kBlock)); p.serviceHere();
+                if (p.slotCold(0) || p.slotCold(1)) return (double) (k * kBlock) / to;
+            }
+            return 99.0;                                                // never slept
+        };
+
+        const double same = secondsToSleep(48000.0, 48000.0, "prepare", 1.5);
+        // ⚠️ THIS IS THE ASSERTION THAT CATCHES ZEROING, and it has to be an ABSOLUTE one: a count
+        // zeroed at every restart moves every row below by the same whole window, so the differentials
+        // all still agree with each other and pass. Only "a same-rate restart leaves the rest alone"
+        // stated against the clock can see it. Measured on the zeroing draft: 2.005 s here.
+        ok(same > 0.0 && same < 1.0,
+           "a same-rate prepare() after 1.5 s of rest still sleeps within the ~0.5 s the 2 s window has"
+           " left (" + std::to_string(same) + " s) — zeroing the count read 2.005 s, postponing every"
+           " parked dial's sleep by a whole window at every restart");
+        const double viaReset = secondsToSleep(48000.0, 48000.0, "reset", 1.5);
+        approx(viaReset, same, 0.012, "…and a reset() leaves the rest where a same-rate prepare() does");
+
+        struct Row { double from, to; const char* what; };
+        // Measured on a count left in the old rate's samples: 48 -> 96 slept 1.267 s against 0.533
+        // (0.73 s late), 96 -> 48 slept after ONE block against 0.515, 48 -> 192 slept 1.10 s late, and
+        // even 44.1 -> 48 was 0.12 s late.
+        const Row rows[] { { 48000.0, 96000.0,  "48 -> 96 kHz" },
+                           { 96000.0, 48000.0,  "96 -> 48 kHz" },
+                           { 48000.0, 192000.0, "48 -> 192 kHz" },
+                           { 44100.0, 48000.0,  "44.1 -> 48 kHz" } };
+        for (const auto& row : rows) {
+            const double sameHere = secondsToSleep(row.from, row.from, "prepare", 1.5);
+            const double moved    = secondsToSleep(row.from, row.to,   "prepare", 1.5);
+            // Two blocks of the coarser grid: the two rows quantize the same instant differently.
+            const double tol = 2.0 * kBlock / std::min(row.from, row.to) + 1.0e-9;
+            approx(moved, sameHere, tol,
+                   std::string("the rest already served is converted, not stranded: ") + row.what);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
     // ⚠️ A prepare() BETWEEN A load() AND THE NEXT BLOCK. load() posts a forget and rebuilds `models_`,
     // but the audio thread wipes `blend_` only on its next block — so in that window `blend_.held[]`
     // still names the PREVIOUS pack's models, as indices into a `models_` that now belongs to the new
