@@ -38,6 +38,35 @@ namespace detail
 // prepare(): contiguous for downsample, phase-major for upsample, both padded with +0.0f to a multiple
 // of four; the histories became double-length backwards rings so the window is contiguous.
 //
+// WHY THE CUTOFF IS 0.90 x NYQUIST — THE GUARD BAND (P31; the constant stood without a derivation until
+// then). A plain resampler may leave a DON'T-CARE band between the top of the audio band and the fold —
+// a converter's halfband runs 0.4535..0.5465 fs — because nothing after it can tell an image there from
+// silence. This class is not a plain resampler: it wraps a NONLINEARITY (a waveshaper, a tube stage, a
+// limiter's gain computer). Content at r*fs between 0.4535 and 0.5 fs has its image at (1-r)*fs; an image
+// the interpolator only partly rejects is MULTIPLIED with the content by the nonlinearity, and the
+// products land inside the audio band: the 2nd order at (1-2r) fs (a difference tone at 0-4 kHz), the
+// 3rd at (3r-1) fs (under 20 kHz while r <= 0.4845), and next to any louder in-band tone b on the
+// sidebands fs-2c +- k*b. So the design is STRICT: the image of content ANYWHERE below fs/2 is rejected,
+// and the transition band has to FINISH below fs/2. Centring the cutoff at 0.45 fs is what puts the end
+// of a 64-tap, beta-9 transition there.
+// Exposure — content gain plus image gain, one pass up, i.e. what reaches the nonlinearity — at
+// r = 0.46 / 0.47 / 0.48:
+//
+//        this design, 4x / 64 taps                               -109 / -117 / -136 dB
+//        a halfband 2x stage flat to 20 kHz (127 taps, beta 9)    -58 /  -35 /  -22 dB
+//
+// A HALFBAND FIRST STAGE CAN NEVER BE STRICT, at any length, and that is an identity rather than a
+// sizing: a centre tap of 1/2 with zero even-offset taps makes H(f) + H(Fs/2 - f) = 1 exactly, so the
+// image of a tone at a (at fs - a) has amplitude 1 - H(a). Image rejection at fs - a IS the pass-band
+// deviation at a, and the transition is centred ON fs/2. (A pair of 79- and 23-tap halfbands that loses
+// 0.41 dB at 20 kHz leaves that tone's image at -32.5 dB, not at -90.)
+//
+// WHAT THE GUARD BAND COSTS — at 44.1 kHz, and only there: one round trip reads -1.80 dB at 19 kHz and
+// -15.55 at 20 kHz (0.4535 fs, above the cutoff), and more taps make 20 kHz WORSE, because a steeper
+// filter cuts harder past a cutoff that does not move (-13.71 at 32). At 48 kHz 20 kHz reads -0.15 dB; at
+// 88.2 kHz nothing. The class has no sample rate, so "20 kHz" exists here only as a fraction of fs.
+// Every figure in this paragraph is printed and pinned by OversamplingTests ("the cutoff axis").
+//
 // WHY THE DEFAULT IS 64, AND WHAT SETS IT. The cutoff is FIXED at 0.90 x baseband Nyquist
 // (designFilter() below), so the transition band has to fit between 0.45 fs and the fold at 0.50 fs,
 // and tapsPerPhase is the only thing that decides whether it does. The design DECLARES its own target
@@ -265,9 +294,9 @@ private:
     void designFilter()
     {
         proto.assign ((std::size_t) nPad, 0.0f);    // == Storage::proto: N taps then the +0.0f padding
-        const double fc   = 0.5 / (double) L * 0.90;              // cutoff (cycles/OS-sample), guard below baseband Nyquist
+        const double fc   = 0.5 / (double) L * 0.90;              // cutoff (cycles/OS-sample): the GUARD BAND — see WHY THE CUTOFF IS 0.90
         const double cen  = (double) (N - 1) * 0.5;
-        const double beta = 9.0;                                  // Kaiser ~ -90 dB stopband
+        const double beta = 9.0;                                  // Kaiser ~ -90 dB stopband: a DECLARATION; the taps are derived from it
         const double i0b  = detail::besselI0 (beta);
         double sum = 0.0;
         for (int i = 0; i < N; ++i)

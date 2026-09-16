@@ -5,7 +5,7 @@
 // (correct + alias-free), inter-sample-peak revelation (the limiter's reason to exist), the
 // up→down round-trip == a delayed identity, and — since this module owns the shipped tapsPerPhase
 // default — what that default actually buys: the declared stopband, the aliasing it stops, and the
-// pass-band droop of two oversampled stages in series.
+// pass-band droop of two oversampled stages in series — and, since P31, why the CUTOFF sits where it does.
 
 #include <felitronics_test.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
@@ -481,6 +481,188 @@ static void runReferenceTapPin()
     test::ok (asym == 0, "the recovered prototype is symmetric, as a linear-phase design must be");
 }
 
+//==============================================================================
+// THE CUTOFF AXIS (P31) — every figure in the header's "WHY THE CUTOFF IS 0.90" paragraph, measured here
+// and pinned, so that paragraph is a printout of this group rather than a quotation. Two halves:
+//   * what the GUARD BAND buys — exposure (content gain + image gain, one pass UP, i.e. what reaches the
+//     nonlinearity) for content in the don't-care band, through the class's public API;
+//   * why a HALFBAND cannot buy the same thing — the identity H(f) + H(Fs/2 - f) = 1, on a halfband built
+//     here, since the class has none and the claim is about every halfband;
+//   * and what the guard band COSTS — the round trip at 19 and 20 kHz, per sample rate.
+namespace cutoffaxis
+{
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr int    kSettle = 4096;
+
+    // Coherent amplitude of `nu` (cycles per sample of THIS buffer) over exactly `len` samples from `off`.
+    // Every caller picks `len` so that nu*len is an integer.
+    inline double ampAt (const std::vector<float>& x, double nu, int off, int len)
+    {
+        double re = 0.0, im = 0.0;
+        for (int i = 0; i < len; ++i)
+        {
+            const double ph = 2.0 * kPi * nu * (double) (off + i);
+            re += (double) x[(std::size_t) (off + i)] * std::cos (ph);
+            im += (double) x[(std::size_t) (off + i)] * std::sin (ph);
+        }
+        return 2.0 * std::hypot (re, im) / (double) len;
+    }
+    inline double db (double a) { return 20.0 * std::log10 (std::max (1e-300, a)); }
+
+    // One round trip at a PHYSICAL frequency. The window is fs/10 samples, so every multiple of 10 Hz is an
+    // exact bin at 44.1, 48 and 88.2 kHz — which tapsprobe's fixed 10 000-sample window cannot say about
+    // 20 000 / 44 100 = 200 / 441.
+    inline double roundTripHzDb (double fs, double hz, int factor, int taps, bool& refused)
+    {
+        oversampling::PolyphaseOversampler os;
+        if (! os.prepare (factor, 1, taps)) { refused = true; return 1e9; }
+        const int w = (int) std::lround (fs / 10.0), n = kSettle + w;
+        std::vector<float> x ((std::size_t) n), osb ((std::size_t) n * (std::size_t) factor);
+        for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) std::sin (2.0 * kPi * hz / fs * (double) i);
+        const float* in[1] { x.data() }; float* mid[1] { osb.data() };
+        os.upsample (in, 1, n, mid);
+        const float* mc[1] { osb.data() }; float* out[1] { x.data() };
+        os.downsample (mc, 1, n, out);
+        return db (ampAt (x, hz / fs, kSettle, w));
+    }
+
+    // ONE pass up: the tone's own gain and its first image's, both read IN THE OVERSAMPLED STREAM — the
+    // stream the nonlinearity sees. `nu` is baseband-normalised and a multiple of 1e-4, the window 10 000.
+    inline void upGains (int factor, int taps, double nu, double& sigDb, double& imgDb, bool& refused)
+    {
+        oversampling::PolyphaseOversampler os;
+        sigDb = imgDb = 1e9;
+        if (! os.prepare (factor, 1, taps)) { refused = true; return; }
+        const int w = 10000, n = kSettle + w;
+        std::vector<float> x ((std::size_t) n), osb ((std::size_t) n * (std::size_t) factor);
+        for (int i = 0; i < n; ++i) x[(std::size_t) i] = (float) std::sin (2.0 * kPi * nu * (double) i);
+        const float* in[1] { x.data() }; float* out[1] { osb.data() };
+        os.upsample (in, 1, n, out);
+        sigDb = db (ampAt (osb, nu / factor,          kSettle * factor, w * factor));
+        imgDb = db (ampAt (osb, (1.0 - nu) / factor,  kSettle * factor, w * factor));
+    }
+
+    // A halfband 2x prototype of length 4m+3: centre 1/2, even offsets structurally zero, odd offsets a
+    // Kaiser-windowed sinc scaled to sum to 1/2. sin(pi t / 2) is +-1 for odd t, so no sine is needed.
+    inline std::vector<double> halfband (int m, double beta)
+    {
+        const int n = 4 * m + 3, c = 2 * m + 1;
+        auto i0 = [] (double x) { double s = 1.0, t = 1.0; for (int k = 1; k < 64; ++k) { t *= x * x * 0.25 / ((double) k * k); s += t; if (t < 1e-17 * s) break; } return s; };
+        std::vector<double> h ((std::size_t) n, 0.0);
+        double odd = 0.0;
+        for (int j = 0; j < n; ++j)
+        {
+            const int t = j - c, at = t < 0 ? -t : t;
+            if (at % 2 == 0) continue;
+            const double r = (double) (2 * j - (n - 1)) / (double) (n - 1);
+            const double v = ((at - 1) / 2 % 2 == 0 ? 1.0 : -1.0) / (kPi * (double) at)
+                           * i0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / i0 (beta);
+            h[(std::size_t) j] = v; odd += v;
+        }
+        for (auto& v : h) v *= 0.5 / odd;
+        h[(std::size_t) c] = 0.5;
+        return h;
+    }
+    // Zero-phase amplitude at `nu` cycles per sample of the filter's own (2x) stream.
+    inline double zeroPhase (const std::vector<double>& h, double nu)
+    {
+        const double c = 0.5 * (double) (h.size() - 1);
+        double a = 0.0;
+        for (std::size_t k = 0; k < h.size(); ++k) a += h[k] * std::cos (2.0 * kPi * nu * ((double) k - c));
+        return a;
+    }
+}
+
+static void runCutoffAxisTests()
+{
+    using namespace cutoffaxis;
+
+    test::group ("the cutoff axis (P31): what the guard band BUYS — exposure of don't-care content");
+    {
+        bool refused = false;
+        double s, i;
+        // Liveness: the probe reads a flat pass band as 0 dB with a buried image, and reads the design's own
+        // cutoff anchor (-6.02 dB for one pass) — an instrument that could only say "small" fails here.
+        upGains (4, 64, 0.20, s, i, refused);
+        test::approx (s, 0.0, 0.01, "PRECONDITION: a 0.20 fs tone goes up flat");
+        test::ok (i < -90.0, "PRECONDITION: and its image is buried (" + std::to_string (i) + " dB)");
+        upGains (4, 64, 0.45, s, i, refused);
+        test::approx (s, -6.02, 0.05, "PRECONDITION: the probe reads the cutoff anchor, -6.02 dB for one pass");
+
+        const double r[] = { 0.46, 0.47, 0.48 }, pinned[] = { -109.0, -117.0, -136.0 };
+        for (int k = 0; k < 3; ++k)
+        {
+            upGains (4, 64, r[k], s, i, refused);
+            std::printf ("       r = %.2f: content %7.2f dB, image %7.2f dB, exposure %7.2f dB\n", r[k], s, i, s + i);
+            test::ok (i <= -90.0, "r = " + std::to_string (r[k]) + ": the image of don't-care content is rejected at the "
+                                  "design's own stopband (" + std::to_string (i) + " dB) — the design is STRICT");
+            test::approx (s + i, pinned[k], 1.0, "r = " + std::to_string (r[k]) + ": exposure as the header states it");
+        }
+        test::ok (! refused, "PRECONDITION: every probe prepared");
+    }
+
+    test::group ("the cutoff axis (P31): a HALFBAND first stage can never be strict — the identity, and its price");
+    {
+        const auto hb = halfband (31, 9.0);                     // 127 taps: the halfband that is flat to 20 kHz
+        double worst = 0.0;
+        for (int k = 0; k <= 2500; ++k)
+        {
+            const double nu = 0.25 * (double) k / 2500.0;
+            worst = std::max (worst, std::fabs (zeroPhase (hb, nu) + zeroPhase (hb, 0.5 - nu) - 1.0));
+        }
+        test::ok (worst < 1e-12, "H(f) + H(Fs/2 - f) = 1 at every f (worst residual " + std::to_string (worst) + ")");
+        test::approx (zeroPhase (hb, 0.25), 0.5, 1e-12, "so the transition is centred ON the fold: H(fs/2) = 1/2 exactly");
+
+        const double fs = 44100.0;
+        test::ok (std::fabs (db (zeroPhase (hb, 20000.0 / (2.0 * fs)))) < 0.001,
+                  "the 127-tap halfband is flat at 20 kHz (one pass within 0.001 dB)");
+        const double r[] = { 0.46, 0.47, 0.48 }, pinned[] = { -58.0, -35.0, -22.0 };
+        for (int k = 0; k < 3; ++k)
+        {
+            const double content = db (std::fabs (zeroPhase (hb, r[k] / 2.0)));
+            const double image   = db (std::fabs (zeroPhase (hb, (1.0 - r[k]) / 2.0)));
+            std::printf ("       halfband 127, r = %.2f: content %7.2f dB, image %7.2f dB, exposure %7.2f dB\n",
+                         r[k], content, image, content + image);
+            test::approx (content + image, pinned[k], 1.5, "r = " + std::to_string (r[k])
+                          + ": the halfband's exposure as the header states it — its image is 1 - H(content)");
+        }
+
+        // The pair the header names: 79 + 23 taps, -0.41 dB round trip at 20 kHz, image of that tone at -32.5.
+        const auto h1 = halfband (19, 9.0), h2 = halfband (5, 9.0);
+        const double a1 = zeroPhase (h1, 20000.0 / (2.0 * fs)), a2 = zeroPhase (h2, 20000.0 / (4.0 * fs));
+        const double rt = 2.0 * (db (a1) + db (a2));
+        const double img = db (1.0 - a1) + db (std::fabs (zeroPhase (h2, (fs - 20000.0) / (4.0 * fs))));
+        std::printf ("       halfband 79 + 23 at 20 kHz: round trip %.3f dB, image of the tone %.2f dB\n", rt, img);
+        test::approx (rt, -0.41, 0.01, "the 79+23 pair loses 0.41 dB at 20 kHz over a round trip");
+        test::approx (img, -32.5, 0.3, "and therefore leaves that tone's image at -32.5 dB, not at -90");
+    }
+
+    test::group ("the cutoff axis (P31): what the guard band COSTS — the top of the audio band, per rate");
+    {
+        bool refused = false;
+        test::approx (roundTripHzDb (44100.0, 1000.0, 4, 64, refused), 0.0, 0.001,
+                      "PRECONDITION: 1 kHz goes round flat (the probe is not reading a loss of its own)");
+        const double at19 = roundTripHzDb (44100.0, 19000.0, 4, 64, refused);
+        const double at20 = roundTripHzDb (44100.0, 20000.0, 4, 64, refused);
+        const double at20t32 = roundTripHzDb (44100.0, 20000.0, 4, 32, refused);
+        const double at20t120 = roundTripHzDb (44100.0, 20000.0, 4, 120, refused);
+        const double at48 = roundTripHzDb (48000.0, 20000.0, 4, 64, refused);
+        const double at88 = roundTripHzDb (88200.0, 20000.0, 4, 64, refused);
+        std::printf ("       44.1 kHz round trip: 19 k %.2f, 20 k %.2f dB (64 taps); 20 k at 32 taps %.2f, at 120 %.2f\n",
+                     at19, at20, at20t32, at20t120);
+        std::printf ("       20 kHz at 48 kHz %.3f dB, at 88.2 kHz %.4f dB\n", at48, at88);
+        test::approx (at19, -1.80, 0.02, "44.1 kHz: 19 kHz loses 1.80 dB over one round trip");
+        test::approx (at20, -15.55, 0.02, "44.1 kHz: 20 kHz loses 15.55 dB");
+        test::approx (at20t32, -13.71, 0.02, "44.1 kHz: 20 kHz at 32 taps loses 13.71 dB");
+        test::ok (at20t120 < at20 - 2.0 && at20 < at20t32 - 1.0,
+                  "and MORE taps make 20 kHz WORSE (32 -> 64 -> 120: " + std::to_string (at20t32) + ", "
+                  + std::to_string (at20) + ", " + std::to_string (at20t120) + ") — a cutoff axis, not a taps one");
+        test::approx (at48, -0.15, 0.02, "48 kHz: 20 kHz loses 0.15 dB");
+        test::ok (std::fabs (at88) < 0.001, "88.2 kHz: 20 kHz passes flat");
+        test::ok (! refused, "PRECONDITION: every probe prepared");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::oversampling tests\n");
@@ -669,6 +851,7 @@ int main()
 
     runTapsTests();
     runReferenceTapPin();
+    runCutoffAxisTests();
 
     return test::report();
 }
