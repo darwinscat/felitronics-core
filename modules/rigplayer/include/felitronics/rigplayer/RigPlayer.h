@@ -412,8 +412,9 @@ public:
     // WaveNet is 3.77 ms per lane at a 64-sample block). It is idempotent exactly as the stage's is:
     // the debt is re-armed only by audio actually being fed, a sleeping slot mid-drain pays only the
     // remainder, and a mono host pays for half of it — and a lane whose falling-edge drain already ran
-    // to the end pays nothing: until P90 it was charged a whole drain a second time (5124 where 2562 was
-    // owed), because only a restart cleared the stage's "may be holding audio" flag. Callable from the audio thread — nothing here
+    // to the end pays nothing here (its debt is spent). Until P90 such a lane was billed again by the NEXT
+    // prepare() — 5124 where 2562 was owed — because only a restart cleared the stage's "may be holding
+    // audio" flag; this verb itself never charged it. Callable from the audio thread — nothing here
     // allocates, locks, throws or touches a field the message thread owns — and NOT free there. The
     // natural place is where prepareToPlay is; `prepare()` already performs this restart itself.
     void reset() noexcept {
@@ -761,8 +762,9 @@ public:
     // The models' measured offsets (AlignmentTable.h), for a pack that does not carry its own. A delay
     // travels with a model and is applied at the one instant its slot is silent — weight exactly zero
     // — never as a splice on a live signal. So a table handed in BEFORE playing lands with the first
-    // loads; one that arrives mid-mix waits until the dial visits a knot. A host that has the bytes in
-    // hand should measure before it plays.
+    // loads; one that arrives mid-mix waits until the dial visits a knot, or until the next prepare(),
+    // which lands it on every slot at once because a prepare leaves nothing to splice (see
+    // restateInHostSamples). A host that has the bytes in hand should measure before it plays.
     void setAlignment(AlignmentTable table) {
         align_ = std::move(table);
         if (loaded_) stageDelays();
@@ -1261,9 +1263,10 @@ private:
     // The earlier note here registered this rather than fixing it, on the ground that a fix would put
     // prepare() and reset() back in disagreement. That was FALSE, and this shared body is exactly why:
     // both verbs snap through these lines, so spelling the switch once corrects both at once and keeps
-    // "a restart leaves the player where prepare() leaves it" true by construction. The spelling below is
-    // process()'s, character for character, which is the property that makes the agreement reviewable
-    // rather than remembered.
+    // "a restart leaves the player where prepare() leaves it" true by construction. The switch is read
+    // the way process() reads it (`inputTrims_`, acquire) and chooses between the same two values
+    // (`slotGain_[i]` or unity); only the load order of the gain itself differs, `relaxed` here against
+    // `acquire` there, which is harmless for a lone float read under the stopped-audio contract.
     void snapGains() noexcept {
         const bool trims = inputTrims_.load(std::memory_order_acquire);
         curIn_    = inGain_.load(std::memory_order_relaxed);

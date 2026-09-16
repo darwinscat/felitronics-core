@@ -69,7 +69,9 @@ public:
     // ⚠️ WHAT IT COSTS. Where it charges anything, the charge is reset()'s: one lane's whole drain
     // length of inference per lane that may still be holding audio — fed since it was last emptied —
     // 3.77 ms for a real Standard WaveNet at a 64-sample block, per lane. A lane whose falling-edge
-    // drain ran to the end HAS been emptied and is not charged (P90: it used to be, a second time). This call is already the expensive one (it allocates and prewarms the
+    // drain ran to the end HAS been emptied and is not charged (P90: it used to be, a second time) —
+    // unless the capture is RECURRENT, which no finite drain empties, so it is charged every time (see
+    // reset() below). This call is already the expensive one (it allocates and prewarms the
     // network), it is the message thread's, and it has no callback to miss. A FIRST prepare after a
     // load costs nothing at all — nothing has been fed, so there is nothing owed — and neither does the
     // re-prepare a model swap performs, for the same reason. The lane a permanently mono host never

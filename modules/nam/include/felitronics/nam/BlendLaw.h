@@ -78,13 +78,16 @@ struct BlendLoad {
 
 struct BlendState {
     BlendModelId held[kBlendSlots] {};
-    long long    fed[kBlendSlots] {};    // samples of real signal since this model landed
-    long long    need[kBlendSlots] {};   // …and how many it must have before it may be heard
+    // `fed` is read only through `fed >= need`, and blendRestated() keeps the ANSWER rather than the
+    // count across a restart — so for a slot that was already audible it is `need`, not a tally.
+    long long    fed[kBlendSlots] {};    // samples of real signal since this model landed (see above)
+    long long    need[kBlendSlots] {};   // …and how many it must have before it may be heard (host samples)
     bool         inFlight[kBlendSlots] {};
     // COLD: the slot stood at exactly zero, holding the wanted model, fed, under an unchanged request,
     // for BlendPolicy::coldAfterSamples. The host does not run a cold slot's model (it stays held —
     // nothing is unloaded), and the law counts the slot unfed while it sleeps. It wakes on the next
-    // change of request, re-landed with the same model and the same need: a warm-up, never a load.
+    // change of request, re-landed with the same model and its need as it stands then — restated at the
+    // host's current rate if a prepare() came between (blendRestated): a warm-up, never a load.
     bool         cold[kBlendSlots] {};
     long long    still[kBlendSlots] {};  // samples at exactly zero under an unchanged request, so far
     BlendRequest last;                   // the request the previous block was stepped with
@@ -306,9 +309,10 @@ inline void blendRestated(BlendState& s, int slot, long long need, double timeSc
     // A scale that is not a positive finite number means "no rate to convert from": leave the count.
     // There is deliberately no `timeScale != 1.0` shortcut: it is a float equality, which gcc's
     // -Wfloat-equal refuses in this header (clang lets it through, which is how it got written), and it
-    // bought nothing — `still` is bounded by the cold window plus a block (a slot that reaches the window
-    // goes cold, and a cold slot's count restarts at zero), so it is far below 2^53, where the product
-    // with exactly 1.0 and the round are both exact and the count comes back unchanged.
+    // bought nothing. Multiplying a double by exactly 1.0 is exact for every double, and the count
+    // converts to one exactly below 2^53 samples — about 95 years at 3 MHz, which is the bound that
+    // matters, because with the cold window disabled (`coldAfterSamples <= 0`) a slot never goes cold and
+    // `still` grows for as long as it rests.
     if (timeScale > 0.0 && timeScale < 1.0e9)
         s.still[slot] = (long long) std::llround((double) s.still[slot] * timeScale);
 }
