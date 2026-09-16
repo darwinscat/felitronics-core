@@ -43,7 +43,8 @@
 // 🔴 RT rule: process() never allocates, locks, does IO or throws. All state/buffers are heap-
 // allocated in prepare() behind a pImpl, NOT by-value members — the by-value stage member stays tiny
 // and Windows' 1 MB audio-thread stack is never at risk (the MSVC rule). prepare() is message/host
-// thread only. Latency = the oversampler round-trip (tapsPerPhase−1), constant across factor.
+// thread only. Latency = the oversampler round-trip: under the default Kaiser topology tapsPerPhase−1,
+// constant across factor; under Topology::Cascade (P31) the cascade's, from the rate and the factor.
 //
 // TAPS. The stage used to hardcode 32 taps/phase with no way for a caller to say otherwise, and its own
 // aliasing gate (PowerAmpGoldenTests, "reference-free non-harmonic energy") declared that adequate. It
@@ -163,7 +164,9 @@ public:
     // gave REFUSES the whole call — false means nothing was touched.
     [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept;
 
-    // Host-rate latency = the oversampler round-trip (tpp-1), constant across drive/topology/factor.
+    // Host-rate latency = the oversampler round-trip, constant across drive and PP/SE. Under Kaiser it is
+    // tpp-1 at every factor; under Topology::Cascade it is CascadeOversampler's for the rate and the factor
+    // (76 at 48 kHz 4x, 80 at 32x), so a 4x stage and a 32x reference are no longer sample-aligned there.
     int  latencySamples() const noexcept;
 
     // THE SHARED SUPPLY'S CURRENT DROOP, in [0, maxDroop*amount] — the rail collapse the stage is

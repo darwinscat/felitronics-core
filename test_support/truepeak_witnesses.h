@@ -146,6 +146,30 @@ inline double deliveredBudgetDb (int factor)
     return std::max (gridBreachDb (1, 3, factor), gridBreachDb (2, 5, factor)) + kModulationEnvelopeDb;
 }
 
+// THE SAME ALLOWANCE, DERIVED RATHER THAN NAMED, for a round trip that is flat up to `flatEdge` (a fraction
+// of fs): the worst grid term over every fs*p/q with q <= 64 and p/q <= flatEdge, plus the envelope. Written
+// for oversampling::Topology::Cascade (P31), which is flat to 20 kHz at every rate — i.e. to 0.4535 fs at
+// 44.1 kHz, which DELIVERS 4fs/9 (0.4444 fs) and moves the worst tone at 8x and 16x to it:
+//
+//        factor          2          4          8         16
+//        Kaiser      1.2494     0.4359     0.1076     0.0268      (fs/3, 2fs/5, 2fs/5, 2fs/5)
+//        edge .4535  1.2494     0.4359     0.1330     0.0331      (fs/3, 2fs/5, 4fs/9, 4fs/9)
+//
+// and at 48 kHz (edge 0.4167) it is the Kaiser row again. The same envelope is kept, and that is a
+// measurement, not an inheritance: the ceiling suite runs its dense, click and release witnesses through
+// the cascade at 44.1 and 48 kHz and every one lands inside this sum (worst 1.344 dB, 2x, 44.1 kHz, against
+// 2.399; at 8x and 44.1 kHz 0.700 against the raised 1.283). The enumeration reproduces deliveredBudgetDb() for Kaiser's own flat band
+// (checked there), so the two cannot quietly disagree about what "worst" means.
+inline double deliveredBudgetDbFlatTo (int factor, double flatEdge)
+{
+    double worst = 0.0;
+    for (int q = 2; q <= 64; ++q)
+        for (int p = 1; p < q; ++p)
+            if (std::gcd (p, q) == 1 && (double) p <= flatEdge * (double) q)
+                worst = std::max (worst, gridBreachDb (p, q, factor));
+    return worst + kModulationEnvelopeDb;
+}
+
 // The taper, borrowed rather than re-spelled. 10 ms at both ends, raised cosine, indexed from the end
 // on the way out so the two ramps mirror exactly (see the EBU header for why that distinction is not
 // cosmetic). Both oracles in `truepeak_oracle.h` REQUIRE the ends to be silent.

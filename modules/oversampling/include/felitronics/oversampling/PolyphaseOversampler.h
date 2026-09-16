@@ -67,6 +67,16 @@ namespace detail
 // 88.2 kHz nothing. The class has no sample rate, so "20 kHz" exists here only as a fraction of fs.
 // Every figure in this paragraph is printed and pinned by OversamplingTests ("the cutoff axis").
 //
+// THE DECISION (P31, 2026-09-16, Oleh): this class keeps its guard band, its cutoff and its bits. It is
+// the certified true-peak reference at 4x/32 (analysis::ReferenceTruePeakMeter) and every stage's
+// default, and a moved cutoff would move both. Flat-to-20-kHz is a SEPARATE topology —
+// oversampling::CascadeOversampler, just as strict, a Kaiser 2x stage sized from the sample rate and then
+// halfbands — which Saturator, TruePeakLimiter and PowerAmpStage take on request (oversampling::Topology).
+// Its price is latency, not CPU: 131 base samples at 44.1 kHz 4x against 63 here, for about the same
+// multiply count; at 48 kHz and above it is cheaper than this class. Switching the stages' DEFAULTS is a
+// step of its own. Since nothing here moved, neither the taps table below nor
+// test_support's deliveredBudgetDb() needed re-deriving; the cascade's budget is deliveredBudgetDbFlatTo().
+//
 // WHY THE DEFAULT IS 64, AND WHAT SETS IT. The cutoff is FIXED at 0.90 x baseband Nyquist
 // (designFilter() below), so the transition band has to fit between 0.45 fs and the fold at 0.50 fs,
 // and tapsPerPhase is the only thing that decides whether it does. The design DECLARES its own target

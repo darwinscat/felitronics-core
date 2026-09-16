@@ -206,6 +206,21 @@ struct TruePeakLimiterTap
 // hard-limited master and ~0.3 dB for ordinary material, at 4× or 8× alike — and if you need a
 // GUARANTEE rather than a budget, measure the delivered peak and close the loop on it.
 //
+// UNDER Topology::Cascade (P31; `TruePeakLimiterConfig::topology`) the same witnesses were run through
+// oversampling::CascadeOversampler, and three things are different (felitronics_limiter_ceiling_tests,
+// the "Cascade topology" groups):
+//   * the grid term keeps its closed form, but the round trip is flat to 20 kHz, so at 44.1 kHz it now
+//     DELIVERS 4fs/9 (0.4444 fs), and that becomes the worst tone at 8x (+0.133 against 2fs/5's +0.108)
+//     and at 16x (+0.033). fs/3 and 2fs/5 still win at 2x and 4x, and at 48 kHz (flat to 0.4167 fs)
+//     nothing moves. test_support's deliveredBudgetDbFlatTo() enumerates it from the band edge;
+//   * the modulation envelope HOLDS — every dense, click and release witness lands inside grid + 1.15 dB
+//     (worst 1.344 dB at 2x and 44.1 kHz; 0.700 at 8x against 1.283) — and at 4x and 8x the cascade's
+//     dense excess is lower than Kaiser's (0.49 / 0.48 dB against 0.81 / 0.75 at 44.1 kHz);
+//   * both floors at once: 2.03 / 1.42 / 1.37 dB at 2x / 4x / 8x and 44.1 kHz (Kaiser 2.16 / 1.87 / 1.83),
+//     2.17 / 1.85 / 1.79 at 48 kHz — outside the envelope, as under Kaiser, and pinned.
+// And the round trip is 131 base samples at 44.1 kHz 4x (76 at 48 kHz) plus the lookahead, where the
+// table below and its droop are Kaiser's: under the cascade 20 kHz passes flat at every rate.
+//
 // ALWAYS IN THE PATH, even when nothing is being limited: the 0.90 × Nyquist prototype is applied TWICE,
 // once interpolating and once decimating, so the top of the band is attenuated by |H|² — the dB figures
 // of one pass, DOUBLED. Measured on the round trip (and derived independently from designFilter()'s

@@ -42,6 +42,7 @@
 //                   discrepancy — PINNED (≤2e-2) and reported, NOT chased (a documented deviation).
 
 #include <felitronics_test.h>   // felitronics::test::run — law 11 verdicts
+#include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/poweramp/SagEnvelope.h>
 #include <felitronics/poweramp/TubeStage.h>
@@ -483,6 +484,108 @@ int main()
         std::printf ("       TT9 block-schedule diff: feel ON = %.2e   +load/iron/bias = %.2e (theory: exactly 0)\n", detOnA, detOnB);
         info ("TT9 NOTE: the feel layer is block-size BIT-EXACT in-bounds; the golden's 'B9 ~1e-2' is an OOB-window artifact (see FINDING above).");
         check (detOnA < 1e-6 && detOnB < 1e-6, "TT9 feel-ON block-size invariance is bit-exact (no real B9 deviation; golden's ~1e-2 is OOB-window)");
+    }
+
+    // ===================== TT10: Topology::Cascade (P31) =====================
+    // The stage can wrap oversampling::CascadeOversampler instead of the 0.45 fs Kaiser one: as strict,
+    // flat to 20 kHz. Theory: the latency is the cascade's (from the RATE and the factor, no longer
+    // factor-invariant), every argument is still clamped rather than refused, 20 kHz survives at 44.1 kHz,
+    // and don't-care content (0.45 .. 0.5 fs) leaves no image intermodulation in the audio band.
+    {
+        using felitronics::oversampling::Topology;
+        using felitronics::oversampling::CascadeOversampler;
+        auto latOf = [] (double sr, int os, int tpp = 64) { PowerAmpStage d; d.prepare (sr, kMaxBlk, os, tpp, Topology::Cascade); return d.latencySamples(); };
+        bool facOk = true;
+        for (int os : { 2, 4, 8, 16, 32 }) facOk = facOk && latOf (kSr, os) == CascadeOversampler::latencyFor (kSr, os);
+        check (facOk, "TT10 cascade latency == CascadeOversampler::latencyFor at every factor 2..32 (it is NOT factor-invariant)");
+        check (latOf (kSr, 4) == 76 && latOf (44100.0, 4) == 131, "TT10 cascade 4x latency: 76 at 48 kHz, 131 at 44.1 kHz");
+        check (latOf (kSr, 3) == CascadeOversampler::latencyFor (kSr, 2) && latOf (kSr, 12) == CascadeOversampler::latencyFor (kSr, 8)
+               && latOf (kSr, 64) == CascadeOversampler::latencyFor (kSr, 32) && latOf (kSr, 1) == CascadeOversampler::latencyFor (kSr, 2),
+               "TT10 a factor that is not a power of two is rounded DOWN (3->2, 12->8), and the [2,32] clamp still applies (64->32, 1->2)");
+        check (latOf (500.0, 4) == CascadeOversampler::latencyFor (1000.0, 4) && latOf (500.0, 4) == latOf (44100.0, 4)
+               && latOf (1.0e7, 4) == CascadeOversampler::latencyFor (3.0e6, 4)
+               && latOf (std::numeric_limits<double>::quiet_NaN(), 4) == CascadeOversampler::latencyFor (44100.0, 4),
+               "TT10 the design rate is clamped into [1 kHz, 3 MHz] (a NaN designs as 44.1 kHz), so the cascade is always built");
+        check (latOf (kSr, 4, 1) == latOf (kSr, 4, 5000), "TT10 tapsPerPhase does not reach the cascade (clamped either way, unused)");
+        {
+            PowerAmpStage k; k.prepare (kSr, kMaxBlk, 3);
+            check (k.latencySamples() == 63, "TT10 ...while the DEFAULT topology still takes a factor of 3 as it is (latency 63)");
+        }
+
+        // Physical delay == reported, for every tube and topology, under the cascade at both rates.
+        bool measured = true;
+        for (double sr : { 44100.0, kSr })
+            for (int t = 0; t < 4; ++t) for (bool se : { false, true })
+            {
+                PowerAmpStage d; d.prepare (sr, kMaxBlk, 4, 64, Topology::Cascade);
+                felitronics::poweramp::Params pp; pp.driveDb = 6.0f; pp.singleEnded = se; pp.autoComp = 1.0f;
+                std::vector<float> imp (4096, 0.0f); imp[1000] = 1e-3f;
+                for (int pos = 0; pos < 4096; pos += 256)
+                {
+                    d.setParams (pp, kTubeVoicings[(std::size_t) t]);
+                    float* io[1] { imp.data() + pos };
+                    felitronics::test::run (d.process (io, 1, 256));
+                }
+                int peak = 0; double pv = 0;
+                for (int i = 990; i < 1300; ++i) if (std::fabs (imp[(std::size_t) i]) > pv) { pv = std::fabs (imp[(std::size_t) i]); peak = i; }
+                measured = measured && (peak == 1000 + d.latencySamples());
+            }
+        check (measured, "TT10 cascade: reported latency == impulse-measured main lobe, all tubes/topologies, 44.1 and 48 kHz");
+
+        // Spectra: a whole-window FFT, tones exactly on bins, 32768 samples of warm-up (the DC blocker).
+        constexpr int W = 16384, warm = 32768;
+        auto spectrum = [] (double sr, bool se, float driveDb, int bin, double amp)
+        {
+            std::vector<float> x ((std::size_t) (W + warm));
+            for (std::size_t i = 0; i < x.size(); ++i) x[i] = (float) (amp * std::sin (2.0 * kPi * bin / W * (double) i + 0.1));
+            PowerAmpStage d; d.prepare (sr, kMaxBlk, 4, 64, Topology::Cascade);
+            felitronics::poweramp::Params pp; pp.driveDb = driveDb; pp.singleEnded = se;
+            d.setParams (pp, felitronics::poweramp::Voicing {});
+            for (std::size_t o = 0; o < x.size(); o += (std::size_t) kMaxBlk)
+            {
+                float* io[1] { x.data() + o };
+                felitronics::test::run (d.process (io, 1, (int) std::min<std::size_t> ((std::size_t) kMaxBlk, x.size() - o)));
+            }
+            std::vector<double> re ((std::size_t) W), im ((std::size_t) W, 0.0);
+            for (int i = 0; i < W; ++i) re[(std::size_t) i] = x[(std::size_t) (warm + i)];
+            for (std::size_t i = 1, j = 0; i < (std::size_t) W; ++i)
+            {
+                std::size_t bit = (std::size_t) W >> 1;
+                for (; j & bit; bit >>= 1) j ^= bit;
+                j ^= bit;
+                if (i < j) { std::swap (re[i], re[j]); std::swap (im[i], im[j]); }
+            }
+            for (std::size_t len = 2; len <= (std::size_t) W; len <<= 1)
+                for (std::size_t i = 0; i < (std::size_t) W; i += len)
+                    for (std::size_t k = 0; k < len / 2; ++k)
+                    {
+                        const double a = -2.0 * kPi * (double) k / (double) len, wr = std::cos (a), wi = std::sin (a);
+                        const std::size_t u = i + k, v = i + k + len / 2;
+                        const double vr = re[v] * wr - im[v] * wi, vi = re[v] * wi + im[v] * wr;
+                        re[v] = re[u] - vr; im[v] = im[u] - vi; re[u] += vr; im[u] += vi;
+                    }
+            std::vector<double> m ((std::size_t) W / 2 + 1);
+            for (std::size_t i = 0; i < m.size(); ++i) m[i] = 2.0 * std::hypot (re[i], im[i]) / W;
+            return m;
+        };
+        auto garbage = [] (const std::vector<double>& m, int skip, int hi)
+        { double e = 0.0; for (int b = 3; b <= hi; ++b) if (b != skip) e += m[(std::size_t) b] * m[(std::size_t) b]; return 10.0 * std::log10 (e + 1e-300); };
+
+        const double sr = 44100.0;
+        const int b1k = (int) std::lround (1000.0 * W / sr), b20k = (int) std::lround (20000.0 * W / sr);
+        const auto lo = spectrum (sr, false, 0.0f, b1k, 0.01), hi = spectrum (sr, false, 0.0f, b20k, 0.01);
+        const double top = 20.0 * std::log10 (hi[(std::size_t) b20k] / lo[(std::size_t) b1k]);
+        std::printf ("       TT10 44.1 kHz, small signal: 20 kHz against 1 kHz = %+.4f dB under the cascade\n", top);
+        check (std::fabs (top) < 0.02, "TT10 cascade at 44.1 kHz: 20 kHz passes the stage at the level 1 kHz does");
+
+        const int b48 = (int) std::lround (0.48 * W), b45 = (int) std::lround (0.45 * W);
+        const double imdSE = garbage (spectrum (sr, true, 12.0f, b48, 0.1), b48, b20k);
+        const double imdPP = garbage (spectrum (sr, false, 12.0f, b48, 0.1), b48, b20k);
+        const double live  = garbage (spectrum (sr, true, 12.0f, b45, 0.1), b45, b20k);
+        std::printf ("       TT10 0.48 fs at -20 dBFS, +12 dB: SE %.1f, PP %.1f dBFS in 0..20 kHz; 0.45 fs SE (factor axis) %.1f\n", imdSE, imdPP, live);
+        check (live > -125.0, "TT10 PRECONDITION: the probe sees the factor axis (0.45 fs, 9th harmonic folding inside 4x)");
+        check (imdSE < -135.0 && imdPP < -135.0,
+               "TT10 don't-care content (0.48 fs) leaves no image intermodulation in 0..20 kHz (SE and PP under -135 dBFS)");
     }
 
     // This runner keeps its own counter, so a failure recorded by the SHARED harness — which is where
