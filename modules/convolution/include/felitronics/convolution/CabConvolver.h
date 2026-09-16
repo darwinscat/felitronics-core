@@ -5,6 +5,7 @@
 
 #include <felitronics/convolution/MatrixConvolverNupc.h>  // JUCE-free cab convolution backend (non-uniform/Gardner)
 #include <felitronics/convolution/IrResampler.h>          // resample-on-load (message thread, one-shot)
+#include <felitronics/core/Config.h>                       // core::kMinSampleRate — the lowest KNOWN IR rate (P105)
 #include <felitronics/core/Fft.h>                          // DefaultRealFft — analysis FFT + the scalar fallback backend
 
 #if defined(FELITRONICS_WITH_PFFFT)
@@ -133,14 +134,15 @@ public:
     // THAT FACTOR IS NOT CLAMPED, and the guard above it is — deliberately, and the asymmetry is the
     // point. The normalization gain is MEASURED from the IR's own content, so a pathological IR can make
     // it anything and +-30 dB stops that. The rate factor is arithmetic on two numbers the CALLER gave
-    // us, and a clamped one would quietly deliver a different filter than the caller asked for. It spans
-    // 4.7e-10 to 4.3e9 (-186 to +192.6 dB) — what `resampleIr`'s own length and position gates leave
-    // reachable. A WAV's rate is a uint32 and nothing in this family validates it, so a garbage-but-
-    // FINITE header is the one broken metadata a real file can carry, and it now plays LOUD where it
-    // used to play quiet: a file claiming 352800 Hz on a 48 kHz host is +17.3 dB, 5e6 Hz is +40.4 dB.
+    // us, and a clamped one would quietly deliver a different filter than the caller asked for. From below it
+    // starts at 8000 / 3e6 = 2.67e-3 (-51.48 dB): an IR rate under core::kMinSampleRate is UNKNOWN and is not
+    // resampled at all (P105; before it the factor reached 4.7e-10, -186 dB, where `resampleIr`'s length gate
+    // stopped it). From above it still reaches 4.3e9 (+192.6 dB), what `resampleIr`'s position gate leaves.
+    // A WAV's rate is a uint32 and nothing in this family validates it from above, so a garbage-but-FINITE
+    // high header plays LOUD: a file claiming 352800 Hz on a 48 kHz host is +17.3 dB, 5e6 Hz is +40.4 dB.
     // Both are correct by this contract — those taps really would be that loud at the rate claimed — and
-    // both are garbage. A consumer that loads UNTRUSTED files should bound the rate before it gets here,
-    // the way orbit-amp's loader already refuses anything outside 8 kHz...768 kHz.
+    // both are garbage. A consumer that loads UNTRUSTED files should bound the rate from above before it gets
+    // here, the way orbit-amp's loader refuses anything outside 8 kHz...768 kHz.
     // Law 11(b): `numChannels` is BINDING, and this convolver's ceiling is 2, not core::kMaxChannels.
     // It used to CLAMP — prepare(..., 4) succeeded silently as a stereo convolver, after which
     // process(io, 4, n) was a perfectly well-formed call that left planes 2 and 3 DRY. An observable
@@ -217,8 +219,8 @@ public:
     // (or, with normalize=false, scaled by the rate factor a resample costs — LOUDNESS above), resampled to
     // host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the convolver's
     // partition build all allocate.
-    // AN UNUSABLE RATE IS AN UNKNOWN RATE, and an unknown rate loads the taps AS IS — NaN, zero, negative and
-    // both infinities alike. The samples in the file are fine, only its metadata is broken: refusing would drop
+    // AN UNUSABLE RATE IS AN UNKNOWN RATE, and an unknown rate loads the taps AS IS — NaN, zero, negative, both
+    // infinities, and since P105 any rate under core::kMinSampleRate (8000 Hz) alike. The samples in the file are fine, only its metadata is broken: refusing would drop
     // the cabinet whole and play silence, where as-is at worst plays an impulse of the wrong length.
     // A load that stages nothing (no samples, a null plane, a known rate so far off that resampleIr cannot
     // address the result — its length or its last position past INT_MAX) is IGNORED whole: the playing IR, the
@@ -282,8 +284,10 @@ private:
         if (samples == nullptr || len <= 0) return;
         nch = std::clamp (nch, 1, 2);
 
-        // Only a KNOWN rate — a positive finite number — that is off the host's by more than the tolerance.
-        const bool resample = irSr > 0.0 && std::isfinite (irSr)
+        // Only a KNOWN rate — a finite number at the core's floor or above — that is off the host's by more than the
+        // tolerance. Under the floor a header rate is broken metadata, as NaN is (P105): 44.1 is kilohertz written as
+        // hertz, and trusting it resampled a 4096-tap cabinet into 4 458 231 taps and 3.9 s of CPU on a 48 kHz host.
+        const bool resample = irSr >= core::kMinSampleRate && std::isfinite (irSr)
                            && std::fabs (irSr - hostSr_) > kRateMatchTolerance * std::max (irSr, hostSr_);
         std::vector<std::vector<float>> staged ((std::size_t) nch);
         for (int c = 0; c < nch; ++c)                                          // resample only off host rate
@@ -315,10 +319,10 @@ private:
         normGain_   = g;
         // THE FLOOR IS ONLY THERE SO A ZERO CANNOT READ AS -inf, and it has to sit below every gain the
         // loader can produce. It was 1.0e-6f, which was below the old minimum (the normalization clamps at
-        // -30 dB, i.e. 0.0316) and ABOVE the new one: the rate factor's smallest value is about 4.7e-10 —
-        // under that the output is longer than INT_MAX and resampleIr refuses the load — so an IR file
-        // claiming 0.024 Hz on a 48 kHz host applies 5.0e-7 and this reported -120.0000 dB for a gain that
-        // is -126.0206. The linear accessor was right throughout; only the diagnostic lied.
+        // -30 dB, i.e. 0.0316) and ABOVE the one P68 made reachable: the rate factor then went down to about
+        // 4.7e-10, so an IR file claiming 0.024 Hz on a 48 kHz host applied 5.0e-7 and this reported
+        // -120.0000 dB for a gain of -126.0206. Since P105 such a header is unknown and the factor's smallest
+        // value is 8000 / 3e6 (-51.48 dB), well above either floor; 1e-20 stays, below everything.
         // ...and a NaN gets its own answer, because `std::max` cannot give it one: max(a, b) is
         // (a < b) ? b : a, every comparison against a NaN is false, so max(floor, NaN) is the FLOOR —
         // a finite, plausible dB reading for a gain that is not a number. (A NaN tap in the IR makes
