@@ -76,15 +76,74 @@ public:
         return true;
     }
 
-    // Clears the running history (so the next swap fades in from silence) but KEEPS the current IR slot — reset
-    // means "flush the tail", not "revert the EQ". Cancels any pending swap. Audio thread (or externally
-    // synced); must not run concurrently with setIr().
-    void reset() noexcept
+    // 🔴 THE AUDIO THE CALLER FED, AND NOTHING ELSE — the running history, and no decision about which
+    // IR is live. Nothing below is touched by setIr(), the one message-thread verb this can run beside
+    // (buildIr() no longer writes a cached tail — see there), so it races nothing and cancels no swap: a
+    // fade in flight goes on from where it was, now over an empty history.
+    // BOTH slots' cached tails go, not just the live one: while a fade runs, the other slot's tail is
+    // blended into every output sample, so leaving it would replay pre-restart audio through the incoming
+    // operator for up to P samples.
+    // WHAT THIS VERB DOES NOT GIVE is independence from WHERE in a fade it was called — the fade it leaves
+    // running is state the next programme hears. A restart that owes law 11a calls reset(), which ends the
+    // fade. Measured by this class's own suite, a clear 128 and a clear 256 samples into a 512-sample fade
+    // answer the same programme differently in 383 of 1600 samples (worst 1.6556e-01), where a reset()
+    // with the swap in flight answers exactly as a reset() after it settled (the independence group).
+    void clearAudioState() noexcept
     {
         for (int c = 0; c < channels_; ++c) chan_[c].reset();
         ranNc_ = 0;                               // nothing has run, so nothing can be stopping
-        xfadePos_ = 0; phase_ = 0; fdlPos_ = 0;   // keep cur_ (the live IR slot)
-        state_.store (0, std::memory_order_relaxed);
+        phase_ = 0; fdlPos_ = 0;
+    }
+
+    // Clears the running history (so the next swap fades in from silence) but KEEPS THE IR THE CALLER LAST
+    // PUBLISHED — reset() means "flush the tail", not "revert the EQ", and THAT PROMISE COVERS A PUBLICATION
+    // THE AUDIO THREAD HAS NOT PICKED UP YET: a restart never loses an accepted publication (law 11e;
+    // prepare() is a re-initialisation and discards everything, by contract). So a swap in flight is ENDED
+    // IN FAVOUR OF THE NEW OPERATOR, not abandoned — `cur_` flips only at fade end, so keeping it would put
+    // the PREVIOUS IR back, and nothing would ever re-stage the published one (setIr() already said true,
+    // and a consumer's retry flag is clear after a successful publish). On the body this replaces, the
+    // suite's independence group reads the OLD operator in every cell {Pending, Crossfading} x
+    // {mono, stereo} x both slot parities, a worst sample 7.494e-01 away from the settled restart.
+    //
+    // WHAT MAKES ADOPTION RIGHT IS LAW 11a INDEPENDENCE, NOT CLICK-FREEDOM: a restart must answer the next
+    // programme with bits that do not depend on what came before, and a half-finished fade is precisely
+    // such a dependency — two engines holding the same published operator, one mid-fade and one settled,
+    // would answer differently for up to `xfadeLen_` samples.
+    // THE PRICE IS AT THE SEAM AND IT IS NOT ZERO. Flushing the history is itself a cut — the previous
+    // stream's tail stops mid-decay — so the first sample after reset() steps whichever slot is live: on
+    // DC 0.5 into a settled 700-tap operator, 1.8203e-01 with nothing in flight. Adopting puts the new head
+    // tap where the old one was at that sample, so it moves the step by AT MOST |Δh0|·|x|, in EITHER
+    // direction: 7.3203e-01 for a pair whose head tap flips +0.70 -> -0.40, 1.3933e-01 for a +1 dB
+    // broadband move and 2.2018e-01 for a -1 dB one, and the flush exactly for a shape change that leaves
+    // the head tap alone. That difference IS the change the caller asked for; refusing to make it does not
+    // avoid a step, it plays the wrong operator and never plays the right one. The house precedent is
+    // `eq::EqBand::reset()`, which SNAPS a pending design onto the target rather than dropping it or playing
+    // out its ramp.
+    // Audio thread (or externally synced); must not run concurrently with setIr().
+    void reset() noexcept
+    {
+        clearAudioState();
+        // The acquire pairs with setIr()'s release store, so a slot adopted at Pending is fully built. (The
+        // 1 -> 2 store in process() is relaxed: a reset() on the audio thread makes this load on that same
+        // thread, and one that is "externally synced" gets its ordering from that synchronisation.)
+        const int s = state_.load (std::memory_order_acquire);
+        if (s == 0) return;                 // nothing in flight — and NOTHING IS STORED: an unconditional
+                                            // store(0) would wipe a publication landing between the load
+                                            // and the store, the same loss through a race instead of a
+                                            // sequence. At Idle the flush above is all the work there is.
+        cur_ = 1 - cur_;                    // the published slot becomes the live one
+        xfadePos_ = 0;                      // hygiene: process() re-arms the clock at the next fade start
+        // RELEASE, not relaxed: setIr() reads `cur_` after acquiring this store, and `cur_` is written just
+        // above. Relaxed would let the message thread see Idle with a stale `cur_` and build the next IR
+        // into the slot that is now LIVE, overwriting coefficients the audio thread is reading.
+        // With the store made only here and no cached tail written off the audio thread, reset() no longer
+        // races a single-producer loader at all: ThreadSanitizer, a loader publishing in a loop beside
+        // process() / reset() / clearAudioState(), reports no race on this class — nor on its two swap-safe
+        // siblings once they carry the same rule — against 54–62 across the three before P88 (Apple clang
+        // with -fno-builtin — without it a std::fill write is not instrumented and the run is blind to the
+        // tail write — and gcc 14 alike). That is a measurement, not yet the contract above, which stays until
+        // a sanitizer row carries it. The store's CONDITION is gated by a real-thread test (law 11e).
+        state_.store (0, std::memory_order_release);
     }
 
     static constexpr int latencySamples() noexcept { return 0; }
@@ -189,8 +248,16 @@ private:
             for (int k = 0; k < 2; ++k) std::fill (pendingTail[k].begin(), pendingTail[k].end(), 0.0f);
         }
 
-        // Message thread: build slot k's head + tail spectra (allocates a scratch). Zeroes that slot's
-        // cached tail — it is recomputed from the warm shared FDL on the next chunk after the swap.
+        // Message thread: build slot k's head + tail spectra (allocates a scratch). It does NOT touch that
+        // slot's cached tail, which is audio-thread state: primeTail() overwrites it whole at fade start
+        // for every channel being processed, and a channel that is NOT being processed has had it zeroed
+        // by the drop-out path in process() (or by prepare()) and is cold, for which zero is the right
+        // value. Zeroing it here instead put a MESSAGE-thread write into a history buffer that the audio
+        // thread also writes — the same 0.0f, so nothing could be lost, but a data race all the same, and
+        // one that made clearAudioState()'s promise untrue: with this write put back, ThreadSanitizer reports
+        // it against the history clear under a loader stress (2 reports a run, Apple clang -fno-builtin and
+        // gcc 14 alike). Measured byte-identical against the body before the change over width transitions
+        // x {no reset, reset at Idle} x block sizes.
         void buildIr (int k, const float* ir, int len, int P, int maxParts, int specF, Fft& fft)
         {
             if (P <= 0) return;                 // unprepared engine — nothing to build (also guards the /P below)
@@ -213,7 +280,6 @@ private:
                 fft.forward (part.data(), &irSpec[k][(std::size_t) j * (std::size_t) specF]);
             }
             numParts[k] = parts;
-            std::fill (pendingTail[k].begin(), pendingTail[k].end(), 0.0f);
         }
     };
 

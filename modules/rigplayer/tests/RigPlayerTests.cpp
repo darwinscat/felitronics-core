@@ -1930,12 +1930,13 @@ int main() {
             approx(after, before, 0.05, "…and reads the same as it did before the restart");
         }
 
-        // 3. A FILTER PUBLISHED AND NOT YET LIVE SURVIVES THE RESTART. `MatrixConvolverNupc::reset()`
-        //    flushes the history AND cancels the swap, keeping `cur_` on the OLD operator — and
-        //    `CabConvolver`'s retry flag is already clear after a successful publish, so nothing ever
-        //    re-stages it. A restart landing between a knob move and the end of its 50 ms crossfade
-        //    would therefore lose the knob move for good. The restart here takes the `clearAudioState()`
-        //    half instead, which touches only what process() writes. No process() call stands between
+        // 3. A FILTER PUBLISHED AND NOT YET LIVE SURVIVES THE RESTART. When this was written,
+        //    `MatrixConvolverNupc::reset()` flushed the history AND cancelled the swap, keeping `cur_` on
+        //    the OLD operator — and `CabConvolver`'s retry flag is already clear after a successful
+        //    publish, so nothing ever re-staged it: a restart landing between a knob move and the end of
+        //    its 50 ms crossfade lost the knob move for good. The restart here takes the
+        //    `clearAudioState()` half, which touches only what process() writes; `reset()` now adopts the
+        //    publication instead (law 11e), and which of the two the player should call is P110. No process() call stands between
         //    the publish and the restart, so the operator is still merely STAGED when it arrives.
         {
             Bench b(rig);

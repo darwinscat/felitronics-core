@@ -12,8 +12,9 @@ audits every emitted artifact.
 **Result: 74 of 74 suites pass in node, zero warnings, and all 78 emitted `.wasm` audit clean.** A second,
 checked configuration (`SAFE_HEAP` + `ASSERTIONS=2` + stack-overflow checks) runs the same tree and is green
 over its 73 non-perf suites — the perf suite is excluded there, and the artifact audit runs over the release
-build. The one suite absent from both is `felitronics_core_rtstreams_tests`, which needs real threads and is
-excluded by construction rather than left permanently red.
+build. The suites absent from both are the ones that need real threads — `felitronics_core_rtstreams_tests`
+and, since P88, `felitronics_convolution_restart_race_tests` — excluded by construction rather than left
+permanently red.
 
 ---
 

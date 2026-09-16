@@ -38,8 +38,9 @@ namespace felitronics::lineareq
 //
 // Latency = N/2 (the FIR group delay; the convolver adds 0) — 2048…65536 samples, so this is an OFFLINE /
 // MASTERING tool, not for live monitoring. CONTRACTS: setBands()/buildFir()/prepare() are message-thread
-// (host-serialised — a single producer); reset() is audio-thread (or externally synced) and cancels any
-// pending swap. To change quality (N) re-prepare(). RT-safe: process() never allocates/locks/throws.
+// (host-serialised — a single producer); reset() is audio-thread (or externally synced) and ENDS a swap in
+// flight by adopting the operator last published (P88), so a curve published a block ago survives a host
+// restart. To change quality (N) re-prepare(). RT-safe: process() never allocates/locks/throws.
 template <core::fft::RealFftBackend AudioFft = core::fft::DefaultRealFft>
 class BasicLinearPhaseEq
 {

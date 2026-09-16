@@ -486,9 +486,14 @@ the CPU at runtime, invisible to any build. Full write-up:
    the exception, and it is re-armed: it is at weight zero by construction, so re-arming it is silent,
    and its network has just been flushed, so crediting it the field it heard before the flush would mark
    it audible with up to a whole field missing (`nam::blendRestated`, P89). Its price is FOUR networks,
-   not one. And it reaches a
-   convolver through `clearAudioState()` rather than `reset()`: the latter also cancels a swap in flight,
-   which silently discards a filter published a block ago and still fading in.
+   not one. And it reaches a convolver through `clearAudioState()` rather than `reset()`, because when
+   this was written `reset()` there DISCARDED a filter published a block ago and still fading in. P88
+   closed that in the verb itself (11e), and that removes the reason for the choice: `clearAudioState()`
+   leaves a fade RUNNING, so it does not give this verb's own independence while one is in flight
+   (measured through `CabConvolver`, 2143 of 5120 samples a channel differ between a clear one block into
+   a 50 ms fade and a clear after it settled; the same two `reset()` calls differ in none), and `reset()`
+   no longer races a loader (measured under ThreadSanitizer, not yet the contract — 11e). Switching the
+   player to `reset()` is registered as its own task rather than taken here.
 
    **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
    `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`
@@ -675,6 +680,40 @@ the CPU at runtime, invisible to any build. Full write-up:
    chain moved to another rate and quantum — that re-preparing
    a chain, which now re-uses its EQ engine instead of building a second one, does not move a sample. The re-entry
    suite runs on the wasm tier too; the abort path itself is measured, not gated.
+
+   **11e. A RESTART NEVER LOSES AN ACCEPTED PUBLICATION — IT ADOPTS IT.** A swap-safe convolver publishes an
+   operator from the message thread (`setIr()`/`setOperator()` return true) and the audio thread adopts it
+   at the END of a crossfade, so between those two moments the live slot still names the PREVIOUS operator.
+   All three of `convolution::{ConvolutionEngine, MatrixConvolver, MatrixConvolverNupc}::reset()` used to
+   wipe the publication flag and keep that slot, which silently reverted to the operator the caller had
+   already replaced, with nothing left to re-stage it — `setIr()` had already said true, and a consumer's
+   retry flag is clear after a successful publish. On those bodies each class's independence group reads the
+   OLD operator in every cell {Pending, Crossfading} x {mono, stereo} x both slot parities (a worst sample
+   7.494e-01, 1.017e+00 and 1.927e+00 from the settled restart), and through `lineareq::LinearPhaseEq` a +12
+   dB bell published over a flat curve read +0.00 dB after the restart — and exactly zero output (the
+   fixture's -600 dB floor) when it was the first curve ever published. `reset()` now ENDS a swap in flight
+   in favour of the new operator: `cur_` moves to the published slot and the state returns to Idle, so the
+   consumer may publish again at once. The rule is scoped to the RESTART: `prepare()` is a re-initialisation
+   and discards everything by contract, which is why every consumer re-publishes after it. What makes
+   adoption right is 11a INDEPENDENCE, not click-freedom: a half-finished fade is a dependency on what came
+   before, and two engines holding the same published operator — one mid-fade, one settled — would otherwise
+   answer the next programme differently for up to the length of the fade. The price is at the seam and it
+   is published: flushing the history is itself a cut (1.8203e-01 on DC 0.5 into a settled 700-tap
+   operator), and adoption puts the new head tap where the old one was, which moves that step by at most the
+   head-tap difference times the input — in EITHER direction (7.3203e-01 for a pair whose head tap flips
+   +0.70 -> -0.40; 1.3933e-01 for a +1 dB broadband move and 2.2018e-01 for a -1 dB one; exactly the flush
+   for a change that leaves the head tap alone). An operator merely STAGED and not yet published
+   (`stageOperator()` without `publishStaged()`) is untouched: it has not been accepted, so the later
+   publish still finds it. The Idle store is made ONLY when a swap was in flight, and it is a release store
+   because the loader reads `cur_` after acquiring it; with no cached tail written off the audio thread
+   either, `reset()` no longer races a single-producer loader at all — ThreadSanitizer, a loader publishing
+   in a loop beside process / reset / clearAudioState on all three classes, reports 0 races against 54–62 on
+   the bodies before (Apple clang needs `-fno-builtin`, or a `std::fill` write goes uninstrumented; gcc 14
+   sees it as is). The documented "must not run concurrently" contract stays until a sanitizer row carries
+   that; the store's condition is gated already — with it removed, a real-thread test loses 12–95 % of
+   publications in every run. `clearAudioState()` is the history alone and leaves a fade running, which is
+   exactly why it does NOT give independence mid-fade. The house precedent is `eq::EqBand::reset()`, which
+   SNAPS a pending design onto the target rather than dropping it or playing out its ramp.
 
 
 **These laws are CI-enforced for the funded tiers, not aspirational** — but not all of them, and the

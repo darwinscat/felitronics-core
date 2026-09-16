@@ -426,10 +426,12 @@ public:
         // the state, not the counter). A slot whose re-prepare was REFUSED writes nothing, and needs no
         // parked intent: the next prepare() that CAN honour it restarts of its own accord.
         for (auto& n : nam_) n.reset();
-        // …AND THE FILTERS' HISTORY WITHOUT CANCELLING THEIR SWAP. `reset()` on these would also drop
-        // an IR published a block ago and still fading in — a tone-knob move lost for good, because
-        // the retry flag is already clear after a successful publish. clearAudioState() exists for
-        // exactly this call.
+        // …AND THE FILTERS' HISTORY. When this was written, `reset()` on these also dropped an IR
+        // published a block ago and still fading in — a tone-knob move lost for good, because the retry
+        // flag is already clear after a successful publish — and clearAudioState() was added for this
+        // call. `reset()` now adopts that IR instead (law 11e), and clearAudioState() leaves the fade
+        // running, which a restart mid-fade answers differently from one after it settled (law 11a).
+        // Which verb this call should use is registered on its own (P110), not changed here.
         for (auto& f : fir_) f.clearAudioState();
         dry_.clearAudioState();
         dryLatency_.reset();             // the dry leg's ring: a LITERAL replay of the previous stream
