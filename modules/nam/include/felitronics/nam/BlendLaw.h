@@ -304,7 +304,12 @@ inline void blendRestated(BlendState& s, int slot, long long need, double timeSc
     s.need[slot] = std::max(0LL, need);
     s.fed[slot]  = wasAudible ? s.need[slot] : 0;
     // A scale that is not a positive finite number means "no rate to convert from": leave the count.
-    if (timeScale > 0.0 && timeScale < 1.0e9 && timeScale != 1.0)
+    // There is deliberately no `timeScale != 1.0` shortcut: it is a float equality, which gcc's
+    // -Wfloat-equal refuses in this header (clang lets it through, which is how it got written), and it
+    // bought nothing — `still` is bounded by the cold window plus a block (a slot that reaches the window
+    // goes cold, and a cold slot's count restarts at zero), so it is far below 2^53, where the product
+    // with exactly 1.0 and the round are both exact and the count comes back unchanged.
+    if (timeScale > 0.0 && timeScale < 1.0e9)
         s.still[slot] = (long long) std::llround((double) s.still[slot] * timeScale);
 }
 
