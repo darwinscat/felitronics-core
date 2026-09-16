@@ -17,6 +17,7 @@
 #include <felitronics_test.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/convolution/PartitionedConvolver.h>
 #include <felitronics/core/Math.h>
 
@@ -201,5 +202,7 @@ int main()
     fuzz<Engine> ("ConvolutionEngine", 120, 120);
     felitronics::test::group ("MatrixConvolver — random publish / process / reset / clearAudioState");
     fuzz<Matrix<convolution::MatrixConvolver<>>> ("MatrixConvolver", 120, 120);
+    felitronics::test::group ("MatrixConvolverNupc — random publish / process / reset / clearAudioState");
+    fuzz<Matrix<convolution::MatrixConvolverNupc<>>> ("MatrixConvolverNupc", 40, 120);
     return felitronics::test::report();
 }

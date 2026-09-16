@@ -10,6 +10,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/convolution/CabConvolver.h>
+#include <felitronics/core/Math.h>
 
 #include <algorithm>
 #include <cmath>
@@ -976,6 +977,91 @@ int main()
         }
         test::ok (matched && unclamped,
                   "at 44.1 / 88.2 / 96 / 192 kHz the reported gain is the reference-unity gain of the resampled taps");
+    }
+
+    // P88 (law 11e). A restart one block into a 50 ms IR fade and a restart after the fade settled must
+    // answer the next programme with the same bits — that is what reset() promises now that it ADOPTS the
+    // publication instead of dropping it. clearAudioState() is the verb that leaves the fade running, so for
+    // it the two DIFFER: that is its documented contract, and a composite choosing between the two verbs
+    // (rigplayer::RigPlayer does) is choosing exactly this. Measured before P88, reset() lost the filter
+    // outright: the restart one block in played the OLD IR.
+    test::group ("P88 — reset() mid-fade is independent of the fade position; clearAudioState() is not");
+    {
+        const double fs = 48000.0;
+        const int blk = 256;
+        std::vector<float> irA (2000), irB (2000);
+        unsigned seed = 17u;
+        const auto noise = [&seed] { seed = seed * 1664525u + 1013904223u; return (float) ((int) (seed >> 8) % 2001 - 1000) * 0.001f; };
+        for (auto& v : irA) v = 0.02f * noise();
+        for (auto& v : irB) v = 0.02f * noise();
+        irA[0] = 0.8f; irB[0] = -0.5f;
+        const auto render = [&] (int blocksIntoFade, bool useReset, int nch)
+        {
+            CabConvolver convolver;
+            felitronics::test::run (convolver.prepare (fs, blk, nch, 0.05, false));
+            const float* a[1] { irA.data() };
+            convolver.loadIR (a, 1, (int) irA.size(), fs);
+            std::vector<float> l ((std::size_t) blk), r ((std::size_t) blk);
+            unsigned s1 = 3u;
+            const auto block = [&]
+            {
+                for (int i = 0; i < blk; ++i)
+                {
+                    s1 = s1 * 1664525u + 1013904223u;
+                    l[(std::size_t) i] = (float) ((int) (s1 >> 8) % 2001 - 1000) * 0.0003f;
+                    r[(std::size_t) i] = -0.5f * l[(std::size_t) i];
+                }
+                float* io[2] { l.data(), r.data() };
+                felitronics::test::run (convolver.process (io, nch, blk));
+            };
+            for (int i = 0; i < 40; ++i) block();                            // A settled
+            const float* b[1] { irB.data() };
+            convolver.loadIR (b, 1, (int) irB.size(), fs);                   // published: a 50 ms fade to B
+            for (int i = 0; i < blocksIntoFade; ++i) block();
+            if (useReset) convolver.reset(); else convolver.clearAudioState();
+            std::vector<float> out;
+            unsigned s2 = 11u;
+            for (int k = 0; k < 20; ++k)
+            {
+                for (int i = 0; i < blk; ++i)
+                {
+                    s2 = s2 * 1664525u + 1013904223u;
+                    l[(std::size_t) i] = (float) ((int) (s2 >> 8) % 2001 - 1000) * 0.0003f;
+                    r[(std::size_t) i] = 0.7f * l[(std::size_t) i];
+                }
+                float* io[2] { l.data(), r.data() };
+                felitronics::test::run (convolver.process (io, nch, blk));
+                out.insert (out.end(), l.begin(), l.end());
+                if (nch == 2) out.insert (out.end(), r.begin(), r.end());
+            }
+            return out;
+        };
+        for (int nch = 1; nch <= 2; ++nch)
+        {
+            const std::string cell = " [" + std::to_string (nch) + " ch]";
+            const std::vector<float> resetEarly = render (1, true, nch), resetLate = render (30, true, nch);
+            const std::vector<float> clearEarly = render (1, false, nch), clearLate = render (30, false, nch);
+            int resetDiff = 0, clearDiff = 0;
+            double clearWorst = 0.0;
+            for (std::size_t i = 0; i < resetEarly.size(); ++i)
+            {
+                if (! felitronics::core::sameBits (resetEarly[i], resetLate[i])) ++resetDiff;
+                if (! felitronics::core::sameBits (clearEarly[i], clearLate[i])) ++clearDiff;
+                clearWorst = std::max (clearWorst, (double) std::fabs (clearEarly[i] - clearLate[i]));
+            }
+            std::printf ("      [%d ch] clearAudioState: %d samples differ, worst %.3e\n", nch, clearDiff, clearWorst);
+            test::ok (resetDiff == 0, "reset() one block into the fade == reset() after it settled, every bit" + cell
+                                      + " (" + std::to_string (resetDiff) + " samples differ)");
+            // …and by exactly the fade it left running: 50 ms is 2400 samples, one block (256) of it had played,
+            // and the last fade sample already weighs the new filter 1 — so 2143 samples a channel, no more (a
+            // clear that RESTARTED the fade would differ longer) and no fewer (one that ended it early, shorter).
+            const int fadeLen = (int) std::lround (0.05 * fs);
+            test::ok (clearDiff == nch * (fadeLen - blk - 1), "clearAudioState() leaves the fade running from where it was, so there"
+                                                              " the two differ for exactly its remainder" + cell
+                                                              + " (" + std::to_string (clearDiff) + " samples)");
+            // The late restart comes after B's fade finished, so B is its live filter: equal bits say the early
+            // restart plays B too, not the A it used to fall back to.
+        }
     }
 
     return test::report();

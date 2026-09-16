@@ -23,6 +23,7 @@
 #include <felitronics_test.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/MatrixConvolver.h>
+#include <felitronics/convolution/MatrixConvolverNupc.h>
 #include <felitronics/core/Math.h>
 
 #include <atomic>
@@ -125,12 +126,17 @@ int main()
     {
         using Eng = convolution::ConvolutionEngine<core::fft::DefaultRealFft, 1>;
         using Mat = convolution::MatrixConvolver<>;
+        using Nup = convolution::MatrixConvolverNupc<>;
         const long e  = lostPublications<Eng> ("ConvolutionEngine, setIr", Via::setIr, n);
         const long m1 = lostPublications<Mat> ("MatrixConvolver, setOperator", Via::setOperator, n);
         const long m2 = lostPublications<Mat> ("MatrixConvolver, stage + publish", Via::stageThenPublish, n);
+        const long u1 = lostPublications<Nup> ("MatrixConvolverNupc, setOperator", Via::setOperator, n);
+        const long u2 = lostPublications<Nup> ("MatrixConvolverNupc, stage + publish", Via::stageThenPublish, n);
         felitronics::test::ok (e == 0,  "ConvolutionEngine: none lost, none refused (" + std::to_string (e) + ")");
         felitronics::test::ok (m1 == 0, "MatrixConvolver via setOperator: none lost, none refused (" + std::to_string (m1) + ")");
         felitronics::test::ok (m2 == 0, "MatrixConvolver via stage + publish: none lost, none refused (" + std::to_string (m2) + ")");
+        felitronics::test::ok (u1 == 0, "MatrixConvolverNupc via setOperator: none lost, none refused (" + std::to_string (u1) + ")");
+        felitronics::test::ok (u2 == 0, "MatrixConvolverNupc via stage + publish: none lost, none refused (" + std::to_string (u2) + ")");
     }
     return felitronics::test::report();
 }

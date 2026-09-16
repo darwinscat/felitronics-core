@@ -203,10 +203,14 @@ public:
     void reset() { convolution_.reset(); }
 
     // The history alone — the audio the caller fed — leaving a staged or fading IR swap exactly where
-    // it is. This is what a STREAM RESTART wants from a convolver: reset() above also cancels the swap,
-    // and a composite that restarts while a filter it published a block ago is still fading in would
-    // lose that filter for good (see MatrixConvolverNupc::clearAudioState for the measurement).
-    // Touches only buffers the audio thread writes inside process(), so it races nothing here either.
+    // it is. reset() above ENDS a swap in flight by adopting the filter the caller last published (P88;
+    // before that it dropped it, and a knob move was lost until the next knob move). Either verb keeps the
+    // filter now, and neither races a loader in the convolver below (measured under ThreadSanitizer, not
+    // yet the contract — law 11e). What separates them is law 11a:
+    // reset() ends the fade, so a restart one block into it and a restart after it settled answer the next
+    // programme identically; this verb leaves the fade running, so they do not — measured here, 2143 of
+    // 5120 samples a channel differ (worst 4.186e-01) one block into a 50 ms fade. Reach for this one when the swap
+    // must be left where it is.
     void clearAudioState() noexcept { convolution_.clearAudioState(); }
 
     // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity
