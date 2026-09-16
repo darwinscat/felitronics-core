@@ -16,8 +16,34 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # WHICH TESTS THIS CHANGE NEEDS — by subject, derived from the tree (tools/ci/scope.py says how).
+  # A pull request that touches only prose runs nothing; one that touches only modules/ runs those modules and
+  # everything that includes them; anything else — tools/, CMake, CI — and anything that is not a pull request
+  # runs everything. A release branch therefore always gets the whole matrix before its tag.
+  scope:
+    name: scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode:  ${{ steps.plan.outputs.mode }}
+      regex: ${{ steps.plan.outputs.regex }}
+      abi:   ${{ steps.plan.outputs.abi }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2   # a pull_request checkout is the merge commit: HEAD^1 is the base it merges into
+      - id: plan
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            python3 tools/ci/scope.py HEAD^1 HEAD
+          else
+            python3 tools/ci/scope.py --all
+          fi
+
   build-test:
     name: ${{ matrix.os }} pffft=${{ matrix.pffft }} nam=${{ matrix.nam }}
+    needs: scope
+    if: needs.scope.outputs.mode != 'none'
     # SELF-HOSTED FOR THE macOS ROWS. GitHub's hosted macos-latest is a 3-core arm64 VM and it is the
     # scarcest runner in the pool: measured on this suite, one macOS cell is 23.9-39.6 min of which 35.6 is
     # COMPILING (Configure 0.5, Test 3.3), against 9.6 min for the same cell on ubuntu. LafoxsMacStudio is
@@ -84,9 +110,14 @@ jobs:
         # by 1.02x. Same red on a real failure (the verbose run fails first and prints everything); on a
         # green run, the numbers are in the log. `-R` matching nothing exits 0, so the pffft=OFF rows just
         # skip that one. Costs ~3 s.
+        env:
+          SCOPE_MODE: ${{ needs.scope.outputs.mode }}
+          SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
+        shell: bash
         run: |
           ctest --test-dir build -C Release -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
-          ctest --test-dir build -C Release --output-on-failure   # -C likewise (no-op on single-config)
+          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
+          ctest --test-dir build -C Release --output-on-failure "${SEL[@]}"   # -C likewise (no-op on single-config)
 
   # Dedicated ASan + UBSan job. UBSan makes platform-divergent UB LOUD on x86-64 (integer /0, signed
   # overflow, OOB shift, null store) that is SILENT on the dev machine (Apple-Silicon ARM64) — the exact
@@ -94,7 +125,12 @@ jobs:
   # job (Linux/Clang-specific flags) rather than a 4th OS-matrix row.
   sanitizers:
     name: ubuntu-clang-asan-ubsan
-    runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.mode != 'none'
+    # SELF-HOSTED ON deb for the same reason the macOS rows are on the Studio: this row was 19.7-28.1 min
+    # on a 4-core hosted VM, and deb has 20 threads. The fork gate is the same one: a pull request whose
+    # head is not in this repository keeps the hosted runner.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","deb"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -111,7 +147,7 @@ jobs:
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
-        run: cmake --build build-san -j 4
+        run: cmake --build build-san -j "$(nproc)"
       - name: Test
         env:
           # LSan (Linux-only; macOS has no LeakSanitizer) → this job is where leaks fail the build. It caught
@@ -119,7 +155,16 @@ jobs:
           # teardown — now fixed (~NeuralStage frees it; a ctors==dtors test guards it on every platform).
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build-san --output-on-failure
+        # No wall-clock gate here, and therefore every core. spectrum_pane_perf compares timings; under ASan it
+        # measures the instrumentation, and on deb — a machine other sessions build on — it measures THEM: it
+        # failed exactly that way while four other builds were running. The gate keeps running where it means
+        # something, in the build-test matrix. Without it, the 132 tests may run together, and the five that
+        # take 290, 229, 119, 104 and 92 s under ASan stop queueing behind each other.
+          SCOPE_MODE: ${{ needs.scope.outputs.mode }}
+          SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
+        run: |
+          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
+          ctest --test-dir build-san -j "$(nproc)" --output-on-failure -E spectrum_pane_perf "${SEL[@]}"
 
   # Dedicated gcc-14 job. The matrix above has no "compiler" dimension — each OS row takes whatever its
   # image ships — so the newest GCC is simply not built anywhere: ubuntu-latest defaults to g++-13. That is
@@ -131,6 +176,8 @@ jobs:
   # reason as the sanitizers above: the flags are toolchain-specific.
   gcc-14:
     name: ubuntu-gcc-14
+    needs: scope
+    if: needs.scope.outputs.mode != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -143,9 +190,13 @@ jobs:
       - name: Build
         run: cmake --build build-gcc14 -j 4
       - name: Test
+        env:
+          SCOPE_MODE: ${{ needs.scope.outputs.mode }}
+          SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
         run: |
           ctest --test-dir build-gcc14 -V -R 'felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests'
-          ctest --test-dir build-gcc14 --output-on-failure
+          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
+          ctest --test-dir build-gcc14 --output-on-failure "${SEL[@]}"
 
   # wasm-audio — the tier DSP-ARCHITECTURE.md §2 declares, GATED here instead of aspirational. Builds every
   # default module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole suite in node, and
@@ -181,7 +232,12 @@ jobs:
   # docs/P0-WASM-SPIKE.md has the numbers.
   wasm-audio:
     name: wasm-audio-tier
-    runs-on: ubuntu-latest
+    needs: scope
+    if: needs.scope.outputs.mode != 'none'
+    # SELF-HOSTED ON deb for the same reason the macOS rows are on the Studio: this row was 19.7-28.1 min
+    # on a 4-core hosted VM, and deb has 20 threads. The fork gate is the same one: a pull request whose
+    # head is not in this repository keeps the hosted runner.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","deb"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -192,9 +248,19 @@ jobs:
         # `--branch 6.0.9` pins the CLONE too. Without it `--depth 1` fetches emsdk master — the installer
         # and the release manifest — and only the SDK *version argument* would be pinned, which is not the
         # same thing and would have made the word "pinned" here false.
+        # A SELF-HOSTED RUNNER KEEPS $HOME, so a second run would find the clone already there and git would
+        # refuse. Reuse an installed 6.0.9; install only on a machine that has none. A DIFFERENT version
+        # already in place fails loudly on purpose — moving the toolchain is a deliberate act.
         run: |
-          git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
-          "$HOME/emsdk/emsdk" install 6.0.9
+          VER="$HOME/emsdk/upstream/emscripten/emscripten-version.txt"
+          if grep -qs '"6.0.9"' "$VER"; then
+            echo "emsdk 6.0.9 already in $HOME/emsdk — reusing it"
+          elif [ -e "$HOME/emsdk" ]; then
+            echo "::error::$HOME/emsdk exists but is not 6.0.9 ($(cat "$VER" 2>/dev/null)) — refusing to overwrite a toolchain"; exit 1
+          else
+            git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+            "$HOME/emsdk/emsdk" install 6.0.9
+          fi
           "$HOME/emsdk/emsdk" activate 6.0.9
           source "$HOME/emsdk/emsdk_env.sh"
           echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
@@ -203,7 +269,14 @@ jobs:
         run: cmake --preset wasm-audio && cmake --build --preset wasm-audio
       - name: Run the suite in node
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
-        run: ctest --preset wasm-audio
+        # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
+        # code, and it already runs natively in build-test. Without it the suite can use every core.
+        env:
+          SCOPE_MODE: ${{ needs.scope.outputs.mode }}
+          SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
+        run: |
+          SEL=(); if [ "$SCOPE_MODE" = selected ]; then SEL=(-R "$SCOPE_REGEX" --no-tests=error); fi
+          ctest --preset wasm-audio -j "$(nproc)" -E spectrum_pane_perf "${SEL[@]}"
       - name: No threads — audited on EVERY emitted .wasm, not one sample
         run: node tools/wasm/check-no-threads.mjs --all build-wasm-audio
       - name: No threading header in a public module header
@@ -401,6 +474,9 @@ jobs:
             || { echo "CONTROL FAILED: it failed for the wrong reason"; cat /tmp/ac/out.txt; exit 1; }
           echo "control 5b ok: a counter missing the over-aligned form refuses to run at all"
       - name: Checked build — SAFE_HEAP + assertions + stack-overflow checks
+        # Only for the whole matrix. A change confined to modules/ leaves the wasm PLUMBING as it was; its
+        # memory errors in module code are the ASan row's job, natively. The release branch runs this always.
+        if: needs.scope.outputs.mode == 'all'
         # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
         # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns
         # a blown stack from "wrong answers, then memory access out of bounds" into a named diagnosis.
@@ -409,11 +485,16 @@ jobs:
         run: |
           cmake --preset wasm-audio -B build-wasm-checked -DFELITRONICS_WASM_ASSERTIONS=2 \
                 -DCMAKE_EXE_LINKER_FLAGS="-sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2"
-          cmake --build build-wasm-checked -j 4
-          ctest --test-dir build-wasm-checked -j4 --output-on-failure -E spectrum_pane_perf
+          cmake --build build-wasm-checked -j "$(nproc)"
+          # All cores: the one test that must not share the machine — the wall-clock gate — is excluded right
+          # here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is checked,
+          # which makes this the slowest test run in the workflow; capping it at 4 left deb three-quarters idle.
+          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E spectrum_pane_perf
       - name: The P0 spike artifacts still build
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         run: ./tools/wasm/build.sh
       - name: NULL test — native vs wasm, bit-exact, on a GENERATED fixture
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         # No private audio in a public repo: the fixture is synthesised from an integer PRNG with no
         # transcendental in sight, so it is byte-identical on any engine. The comparison surface is the
         # pre-gate 400 ms block-energy vector, not the scalar LUFS — a gated scalar is discontinuous in its
@@ -422,7 +503,7 @@ jobs:
         # prove nothing, and the libsoxr precedent is exactly a clean build that died at runtime.
         run: |
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
-          cmake --build build-native -j 4 --target fcore_measure
+          cmake --build build-native -j "$(nproc)" --target fcore_measure
           node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
           # The generator claims to be deterministic by construction; this turns that into a MEASURED fact
           # on a different machine, OS and node build than the one it was written on. Recorded from two
@@ -436,6 +517,7 @@ jobs:
           diff native.txt wasm-checked.txt
           echo "bit-identical: $(sed -n 's/^blocks //p' native.txt) block energies + true peak + sample peak"
       - name: NULL test — waveform peaks, stereo band and needle, native vs wasm, bit-exact
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         # P59a: the page's waveform and stereo pictures and the sidecars that stand in for them now come from one
         # definition (analysis::WaveformPeaks / StereoColumns via fcore::ShapeProbe), and this is the proof the
         # two roads to it — the native CLI a server would run and the browser module — draw the same bits. Every
@@ -471,6 +553,7 @@ jobs:
           check fix1.f32    22050 1 needle --from 100 --to 100
           echo "bit-identical: $n native-vs-wasm comparisons of peaks, stereo band and needle"
       - name: NULL test — the clipped runs, native vs wasm, bit-exact
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         # P71: analysis::ClipDetector now has a way out (fcore::ClipProbe, `fcore_measure clips` and
         # fc_probe_clips_*), and this is the proof the two roads report the same runs. The generated fixture
         # above is CLEAN — its flat stretches are square waves and a hit that stops, which the detector
@@ -554,6 +637,7 @@ jobs:
           echo "bit-identical: $n native-vs-wasm comparisons of the clipped runs, refusals included"
 
       - name: the five offline analyzers — native vs wasm, byte for byte (P77)
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         run: |
           set -euo pipefail
           # WHY THIS GATE CAN EXIST AT ALL. Before P79 it could not: the five analyzers computed their
@@ -598,6 +682,7 @@ jobs:
           echo "bit-identical: $n native-vs-wasm comparisons across five analyzers, two rates, two modules"
 
       - name: the price of a measurement — the same demand on both tiers (P81)
+        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
         # `fc_probe_<mode>_storage_bytes` publishes what each analyzer's storageFor() is about to ask the
         # heap for, so a page can decide BEFORE the allocation that -fno-exceptions turns into an abort.
         # Two things are checked here that the native suite structurally cannot:
@@ -612,7 +697,7 @@ jobs:
           # build-native was configured with tests OFF (it only needed fcore_measure); turning them on
           # re-uses its object cache and adds this one target.
           cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
-          cmake --build build-native -j 4 --target felitronics_analysis_abi_tests
+          cmake --build build-native -j "$(nproc)" --target felitronics_analysis_abi_tests
           ./build-native/tools/felitronics_analysis_abi_tests --storage-table > storage-native.txt
           test -s storage-native.txt
           # A table of nothing but refusals would compare clean and say nothing, which is the shape this
