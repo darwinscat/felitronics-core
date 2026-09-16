@@ -343,15 +343,27 @@ int main() {
         // Through `::operator new` and not `new T`: a new-expression is elidable from -O1 — and USING
         // the result does not protect it — so a `new float[…]` here can vanish and leave this control
         // silently vacuous, which is the same blindness in a new coat.
-        const long long planted = allocsAcross([&] {
-            for (int k = 0; k < 24; ++k) {
-                felitronics::test::run (b.p.process(d.io, 2, kBlock));
-                if (k == 11) { void* p = ::operator new(sizeof(float) * (std::size_t) kBlock);
-                               ::operator delete(p); }
-            }
-        });
-        ok(planted == 1, "one planted allocation inside 24 blocks reads as exactly one ("
-                         + std::to_string(planted) + ") — the zeroes above are measurements, not a dead gate");
+        //
+        // AND IT IS A DIFFERENCE, NOT A COUNT, because this assertion is a hard `ok` on every stdlib
+        // while the zeroes above are `okNoAlloc` — enforced only where the harness can separate our
+        // allocations from the standard library's. Where a stdlib allocates inside `process()` itself,
+        // "the planted window reads exactly one" would fail for a reason that has nothing to do with the
+        // gate. The identical window without the plant is the baseline, so the control proves the
+        // counter sees ONE MORE, whatever the library around it does.
+        const auto window = [&](bool plant) {
+            return allocsAcross([&] {
+                for (int k = 0; k < 24; ++k) {
+                    felitronics::test::run (b.p.process(d.io, 2, kBlock));
+                    if (plant && k == 11) { void* p = ::operator new(sizeof(float) * (std::size_t) kBlock);
+                                            ::operator delete(p); }
+                }
+            });
+        };
+        const long long base = window(false);
+        const long long planted = window(true);
+        ok(planted - base == 1, "one planted allocation inside 24 blocks reads as exactly one more ("
+                                + std::to_string(planted) + " against " + std::to_string(base)
+                                + ") — the zeroes above are measurements, not a dead gate");
 
         // …and the OVER-ALIGNED form separately, because that is the half fifty suites in this tree
         // could not see and the half this player's convolvers actually use.
