@@ -24,7 +24,7 @@ double charge in `NamStage`.
   count IS rescaled: it is pure elapsed time, so the ratio is exact, and is 1 where nothing moved.
 - **A restart inside a warm-up re-arms it, at any rate — `reset()` included.** Both verbs flush every
   network, and the law went on crediting a warming slot the field it heard before the flush. Restarting
-  1, 4 and 8 blocks into a 2001-tap field left 14, 11 and 8 blocks of warm-up against the 15 a restart
+  1, 2 and 3 blocks into a 2001-tap field left 14, 13 and 12 blocks of warm-up against the 15 a restart
   at the landing costs. A warming slot is at weight zero, so re-arming it is silent; an AUDIBLE slot is
   still not re-armed, for the reasons P85 gave.
   *This supersedes the P85 note above that `RigPlayer::reset()` does not touch the blend law's state:

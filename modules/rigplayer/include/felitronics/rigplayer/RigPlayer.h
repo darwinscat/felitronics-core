@@ -471,8 +471,8 @@ public:
         // flush, marking it audible with one block of real material in an empty network. That is
         // invariant 3 broken by up to a whole field, and unlike the ALREADY-WARM case it costs nothing
         // to close: a warming slot is at weight zero by construction, so re-arming it is inaudible.
-        // Measured on a 2001-tap capture at a 256-sample block, restarting 1, 4 and 8 blocks into the
-        // field: the warm-up that followed was 14, 11 and 8 blocks against the 15 a restart at the
+        // Measured on a 2001-tap capture at a 256-sample block, restarting 1, 2 and 3 blocks into the
+        // field: the warm-up that followed was 14, 13 and 12 blocks against the 15 a restart at the
         // instant of the landing costs — it fell with the depth, which is the progress being carried.
         //
         // THE NEED IS HANDED BACK UNCHANGED, which is what separates this call from prepare()'s: the
