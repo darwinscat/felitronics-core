@@ -421,6 +421,33 @@ the CPU at runtime, invisible to any build. Full write-up:
    whole change moves one number: +1 sample of drain on the two that carry a conditioner, and a
    byte-identical render on every other.
 
+   **AND `prepare()` PERFORMS THAT RESTART TOO, ALWAYS — THE TWO VERBS NAME ONE STATE.** A prepared stage
+   holds no audio the caller fed, on any rate, on any shape, and whether or not the rate or the block
+   size actually changed. This is the second half of the same defect: the 0.224604502320 above was first
+   measured through `prepare()`, and over a grid of eight host rates x two block sizes x three capture
+   shapes x {re-prepare at the same rate, re-prepare at a different one}, **72 of 96 cells leaked, worst
+   0.567861497402**, with both lanes PRESENT. There is deliberately no predicate on what changed: a
+   re-prepare at the SAME numbers is the common case — a host's buffer-size slider moves more often than
+   its rate one, and a driver stops the stream for either — and it was the case that leaked loudest.
+   The mechanism is the drain above, not a second one: `configureRates` charges every lane that has ever
+   been fed, and the tail of `prepare()` spends it, so a first prepare after a load costs nothing and a
+   model change (which prepares a never-fed backend, in `prepareModel()` and again in `install()` when the
+   host's numbers moved between the halves) costs nothing either. Where it does cost, it
+   is the message thread and the price is published: for an architecture whose own `Reset` already
+   prewarms, the drain is a SECOND pass over the field and roughly doubles the call — a stereo real
+   Standard WaveNet measured 6.5 ms before and 13.1 ms after at 48 kHz.
+
+   **AND A COMPOSITE OWES ITS CONSUMER THE SAME VERB.** `rigplayer::RigPlayer` had none, so a product
+   reaching a `NamStage` through it — which is how orbit-amp reaches one — could not call the restart at
+   all. `RigPlayer::reset()` is that verb: both model slots, the three convolvers (bypassed or not — a
+   bypassed one is skipped, so its history freezes and is replayed), the dry path's alignment ring, the
+   per-slot alignment tails, the band filters and the scratch. It does NOT touch the blend law's state:
+   a restart is not a device change, and re-arming the law's warm-up ledger would not deliver invariant 3
+   anyway (the law ramps its gain down over four blocks, so an unfed network is audible regardless) while
+   costing 192 ms of hole at every restart. Its price is FOUR networks, not one. And it reaches a
+   convolver through `clearAudioState()` rather than `reset()`: the latter also cancels a swap in flight,
+   which silently discards a filter published a block ago and still fading in.
+
    **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
    `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`
    silently clamped `prepare(..., 4)` to 2, after which `process(io, 4, n)` was a perfectly legal call

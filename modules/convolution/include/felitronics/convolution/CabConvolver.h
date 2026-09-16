@@ -202,6 +202,13 @@ public:
 
     void reset() { convolution_.reset(); }
 
+    // The history alone — the audio the caller fed — leaving a staged or fading IR swap exactly where
+    // it is. This is what a STREAM RESTART wants from a convolver: reset() above also cancels the swap,
+    // and a composite that restarts while a filter it published a block ago is still fading in would
+    // lose that filter for good (see MatrixConvolverNupc::clearAudioState for the measurement).
+    // Touches only buffers the audio thread writes inside process(), so it races nothing here either.
+    void clearAudioState() noexcept { convolution_.clearAudioState(); }
+
     // Load an IR (mono broadcasts to both channels — juce Stereo::yes parity) — normalized to reference-unity
     // (or, with normalize=false, scaled by the rate factor a resample costs — LOUDNESS above), resampled to
     // host rate unless within kRateMatchTolerance of it. Message thread: resample + gain + the convolver's

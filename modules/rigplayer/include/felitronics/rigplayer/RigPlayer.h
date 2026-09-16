@@ -333,10 +333,10 @@ public:
             slotB_[c].assign((std::size_t) maxBlock_, 0.0f);
             dryBuf_[c].assign((std::size_t) maxBlock_, 0.0f);
             spare_[c].assign((std::size_t) maxBlock_, 0.0f);
-            for (auto& t : lagTail_) t[c].fill(0.0f);
         }
-        for (auto& side : bq_) for (auto& band : side) for (auto& b : band) b.reset();
-        for (auto& g : bandGrid_) g.reset();             // a stream restart re-anchors the audio-time grid
+        // The half of a restart that does not depend on the rate, spelled ONCE — see reset(), which is
+        // the other caller. The two verbs used to be able to drift; a shared body is what stops them.
+        clearAudioState();
         // ...AND RETIRES THE BANDS THEMSELVES, which cancelling the ramp alone does not. `bandTo_` and
         // `bandCur_` survive a prepare() otherwise, `rebuildBands` republishes the same COUNT, and
         // `takeBands` re-initialises only the bands beyond that count — so the first block after a
@@ -346,16 +346,8 @@ public:
         // prepare(): 5951 samples differ, worst 0.54. Zeroing the count makes every band re-appear AT
         // its coefficients on the first block, which is what a restart means. prepare() is
         // contractually never concurrent with process().
-        for (int s = 0; s < 2; ++s) {
-            bandRt_[s].count = 0;
-            for (int k = 0; k < kMaxBands; ++k) bandPos_[s][k] = bandLen_[s][k] = 0;
-        }
-        curIn_    = inGain_.load(std::memory_order_relaxed);
-        curOut_   = outGain_.load(std::memory_order_relaxed);
-        curChain_ = chainGain_.load(std::memory_order_relaxed);
-        for (int i = 0; i < 2; ++i) curSlot_[i] = slotGain_[i].load(std::memory_order_relaxed);
-        curDry_ = dryGain_.load(std::memory_order_relaxed);
-        curWet_ = wetGain_.load(std::memory_order_relaxed);
+        for (int s = 0; s < 2; ++s) bandRt_[s].count = 0;
+        snapGains();
         prepared_ = true;
         if (loaded_) {                                   // the FIRs and the bands were designed for the old rate
             for (int s = 0; s < 2; ++s) { rebuildCurves(s); rebuildBands(s); }
@@ -363,6 +355,112 @@ public:
         }
         return true;
     }
+    // 🔴 THE STREAM RESTART, AND UNTIL P86 THIS CLASS DID NOT HAVE ONE. A consumer reaching a
+    // `nam::NamStage` through this player — which is how the product reaches it — had no way to ask
+    // for the restart P47 made exact: there was no verb here, and nothing called `nam_[i].reset()`.
+    // So the fix existed and could not be spent. This is the door.
+    //
+    // WHAT IT PROMISES: nothing the caller fed before this call can be heard after it. Every place in
+    // this player that holds samples is emptied — both models and their rate-matchers, the three
+    // convolvers (bypassed or not — a bypassed one is SKIPPED, so its history freezes and is replayed
+    // when the curve comes back), the dry path's alignment ring, the two per-slot whole-sample
+    // alignment tails, the band filters, and the block scratch. The exceptions are the NAM stage's
+    // three, word for word, because they are its: a recurrent cell, a capture whose conditioner is a
+    // model of its own, and NAM's own partitioned-FFT clock.
+    //
+    // WHAT IT DELIBERATELY DOES NOT TOUCH, because none of it is audio the caller fed:
+    //   · THE BLEND LAW's state — which capture is held, which is wanted, the applied weight, the cold
+    //     flags, a load in flight, a load refused. A restart is not a device change. In particular it
+    //     does NOT re-arm `fed[]`. The case for re-arming is that after `nam_[i].reset()` the network
+    //     is back in the just-landed state, so the law's ledger reads "warm" for a flushed network.
+    //     The case against won, on three counts, and the third is the one that decides it:
+    //       (1) invariant 3 protects the stream's CONSISTENCY — a slot that missed the last 132 ms
+    //           beside one that heard it. A restart zeroes the past of both slots AND the dry ring
+    //           together, so there is nothing for the incoming slot to be inconsistent with;
+    //       (2) every other stage here (the convolvers, the bands, the dry ring) restarts to the zero
+    //           state and is heard on the very next block. A model is not special;
+    //       (3) re-arming would not even deliver the invariant. With `fed = 0` on both slots the law
+    //           holds the weight and ramps its gain DOWN over 1/maxDeltaPerBlock = 4 blocks, so the
+    //           by-hypothesis wrong-sounding network is audible anyway, at up to unity, for those four
+    //           blocks. What it buys is a hole: simulated on a 6859-sample field at 48 kHz with a
+    //           512-sample block, 18 blocks disturbed — 43 ms of fade-out, 107 ms of mute, 43 ms of
+    //           fade-in — at every restart. Re-arming only the SOUNDING slot is worse still: the law
+    //           rails the goal to the neighbour (`unsafe0 && ! unsafe1` -> goal 1.0) and plays a full
+    //           spurious crossfade to the other capture and back.
+    //     `blendLanded()` is in any case the wrong tool for it: it also clears `inFlight` (a second
+    //     load could then be asked for a slot that already has one out), `cold`, `still` and `refused`
+    //     (a capture that deterministically fails would be asked for again — the storm the law exists
+    //     to prevent).
+    //   · the request, the pack, the alignment table, the dials, the host's trims, the gains' TARGETS.
+    //
+    // WHAT IT SNAPS rather than clears: the gain ramps and the band ramps. Those are control history,
+    // not audio, but a restart restarts the parameter epoch too — `eq::EqBand::reset()` settled this
+    // for the house, and it settled it with a number: a band left mid-ramp made a second render of the
+    // same programme differ from a fresh one by 0.51 FULL SCALE. The numbers snapped to are exactly
+    // the ones prepare() snaps to, so the two verbs agree by construction rather than by review.
+    //
+    // ⚠️ THE PRICE IS FOUR NETWORKS, not one. Each `NamStage` charges a whole drain length of inference
+    // per lane that has been fed, and this player holds TWO of them, each of which can be running two
+    // lanes — so a stereo host with both slots sounding pays 4 x that stage's figure (a real Standard
+    // WaveNet is 3.77 ms per lane at a 64-sample block). It is idempotent exactly as the stage's is:
+    // the debt is re-armed only by audio actually being fed, a sleeping slot mid-drain pays only the
+    // remainder, and a mono host pays for half of it. A lane that drained ALL the way at a falling edge
+    // is the one place that is not tight: it is provably clean and is charged a full drain anyway,
+    // because `everFed_` is cleared by a restart and not by a completed drain — measured, a lane that
+    // had just spent its whole 2562 is charged again, so the next prepare spends 5124 and not 2562.
+    // Cost only, and registered against that ledger rather than papered over here. Callable from the audio thread — nothing here
+    // allocates, locks, throws or touches a field the message thread owns — and NOT free there. The
+    // natural place is where prepareToPlay is; `prepare()` already performs this restart itself.
+    void reset() noexcept {
+        if (! prepared_) return;         // nothing is sized yet, so there is no state to restart
+        // THE EXPENSIVE HALF, and the reason this verb exists. Both slots, including one the law has
+        // put to SLEEP: a cold slot is handed a width-zero call rather than run, so its networks hold
+        // whatever was playing when it fell asleep, and the stage's own ledger knows exactly how much
+        // of that is left (a spent drain is not a clean lane for a recurrent capture — the stage reads
+        // the state, not the counter). A slot whose re-prepare was REFUSED writes nothing, and needs no
+        // parked intent: the next prepare() that CAN honour it restarts of its own accord.
+        for (auto& n : nam_) n.reset();
+        // …AND THE FILTERS' HISTORY WITHOUT CANCELLING THEIR SWAP. `reset()` on these would also drop
+        // an IR published a block ago and still fading in — a tone-knob move lost for good, because
+        // the retry flag is already clear after a successful publish. clearAudioState() exists for
+        // exactly this call.
+        for (auto& f : fir_) f.clearAudioState();
+        dry_.clearAudioState();
+        dryLatency_.reset();             // the dry leg's ring: a LITERAL replay of the previous stream
+        clearAudioState();
+        // THE BANDS SNAP, THEY DO NOT RETIRE. prepare() zeroes `bandRt_.count` because its
+        // coefficients were designed for the old rate and `rebuildBands()` follows it; here the rate
+        // has not moved and nothing follows, so zeroing the count would leave the tone stack switched
+        // OFF until the next message-thread publish — `runBands` walks `count`, and only
+        // `rebuildBands` ever raises it again (a load, a prepare, a knob). What a restart owes these
+        // is the RAMP, and `clearAudioState()` above has already ended it: `bandPos_ == bandLen_ == 0`
+        // makes `runBandSegment` take its ARRIVED path on the next block, and that path writes both
+        // `bq.c` and `bandCur_` from `bandTo_` before the first sample is filtered.
+        //
+        // 🔴 SO THIS LINE IS THE ONLY PART OF THAT SNAP THAT IS NOT ALREADY DONE, and it was four
+        // assignments until a review round traced which of them anything reads. `runBands`'s arrival
+        // loop reads `bandCur_` to start the NEXT ramp from — BEFORE the arrived path overwrites it —
+        // so a target published AFTER this restart would otherwise glide from coefficients the filter
+        // abandoned mid-travel and never actually reached. Writing `bandTo_`, `bandFrom_` or `bq.c`
+        // here was decoration: between two process() calls `bandTo_[s][k] == bandRt_[s].c[k]` already
+        // holds for every band in the set, and the other two are overwritten before they are read.
+        //
+        // ⚠️ AND THE TWO VERBS DIFFER IN ONE WINDOW, which is stated because an adversarial round
+        // measured it rather than because anyone would guess it: a set published by the message thread
+        // AFTER the last block and BEFORE this call has not been taken yet, so this restart snaps the
+        // set the audio thread still holds and `takeBands` then re-initialises only bands past
+        // `rt.count` — an existing band whose coefficients changed therefore GLIDES to them over its
+        // declared ramp. `prepare()` zeroes the count instead, so there every band re-appears AT its
+        // target. Measured on a 60 Hz Q10 bell with a 2048-sample ramp: 10239 of 10240 samples differ
+        // from a player whose band had settled, worst 0.031 against a 0.338 peak. That is an ordinary
+        // 43 ms knob glide and not a leak — a restart LANDING inside a ramp is bit-identical to one
+        // after it settled, which is what this line buys — but "every band arrives at its target" is
+        // false in that one window and is not claimed here.
+        for (int s = 0; s < 2; ++s)
+            for (int k = 0; k < bandRt_[s].count; ++k) bandCur_[s][k] = bandTo_[s][k];
+        snapGains();
+    }
+
     bool   prepared()   const { return prepared_; }
     double sampleRate() const { return fs_; }
     int    channels()   const { return channels_; }
@@ -1096,6 +1194,59 @@ public:
     }
 
 private:
+    // ------------------------------------------------------- the restart, where both verbs share ----
+
+    // What a restart clears that does NOT depend on the rate: the per-slot alignment tails, the band
+    // filters' memory, the audio-time grid the band ramps are maintained on, any ramp in flight, and
+    // the record of how wide the previous call was. prepare() and reset() both call it, which is the
+    // point — the two used to be able to disagree about what a restart means, and a shared body is a
+    // cheaper guarantee than a review.
+    //
+    // `ranNch_ = 0` is the one line prepare() did not have. Nothing has run since a restart, so nothing
+    // can be STOPPING — the same sentence `eq::EqBand::clearAudioState()` spells for its own `ran*`
+    // ledgers. It is inert in prepare() (the tails it guards have just been zeroed, so the fill it
+    // would trigger writes zeros over zeros) and it is honest, which is why it is here and not only in
+    // reset().
+    void clearAudioState() noexcept {
+        for (int c = 0; c < kMaxChannels; ++c)
+            for (auto& t : lagTail_) t[(std::size_t) c].fill(0.0f);
+        for (auto& side : bq_) for (auto& band : side) for (auto& b : band) b.reset();
+        for (auto& g : bandGrid_) g.reset();             // a stream restart re-anchors the audio-time grid
+        for (int s = 0; s < 2; ++s)
+            for (int k = 0; k < kMaxBands; ++k) bandPos_[s][k] = bandLen_[s][k] = 0;
+        ranNch_ = 0;
+        for (int c = 0; c < kMaxChannels; ++c) {
+            std::fill(slotB_[c].begin(),  slotB_[c].end(),  0.0f);
+            std::fill(dryBuf_[c].begin(), dryBuf_[c].end(), 0.0f);
+            std::fill(spare_[c].begin(),  spare_[c].end(),  0.0f);
+        }
+    }
+
+    // Every smoothed gain lands ON its target. A restart restarts the parameter epoch as well as the
+    // audio — see reset() for the house precedent and the 0.51 full scale that bought it. The targets
+    // read here are the ones process() reads, spelling for spelling, so that "a restart leaves the
+    // player where prepare() leaves it" is true by construction.
+    //
+    // ⚠️ AND IT CARRIES ONE SMALL DEFECT OF prepare()'s, REGISTERED RATHER THAN FIXED HERE — with the
+    // reasoning corrected, because the first draft of this note got it wrong. `curSlot_[i]` is snapped
+    // to the pack's per-file trim even when `inputTrims_` is OFF, and process() then ramps from there
+    // to unity; a freshly CONSTRUCTED player starts at unity and does not. Measured by an adversarial
+    // round on a −6 dB trim with trims off: the first sample after a restart is −5.99 dB and it takes
+    // about 43 ms to come within 0.3 dB of unity, identically for both verbs. The draft said fixing it
+    // would put the two verbs back in disagreement — that is FALSE, and this shared body is why: both
+    // verbs read it here, so `trims ? slotGain_[i] : 1.0f` would correct both at once. It is left
+    // alone because it moves RELEASED behaviour of prepare() and belongs to whoever takes that
+    // decision, not because it cannot be fixed in one place. P86 does make it reachable more often:
+    // a host that restarts at every transport stop now meets it at every start.
+    void snapGains() noexcept {
+        curIn_    = inGain_.load(std::memory_order_relaxed);
+        curOut_   = outGain_.load(std::memory_order_relaxed);
+        curChain_ = chainGain_.load(std::memory_order_relaxed);
+        for (int i = 0; i < 2; ++i) curSlot_[i] = slotGain_[i].load(std::memory_order_relaxed);
+        curDry_   = dryGain_.load(std::memory_order_relaxed);
+        curWet_   = wetGain_.load(std::memory_order_relaxed);
+    }
+
     // ------------------------------------------------------------------ the decision, applied ----
 
     static std::string degreeValue(double degrees, int sweep) {
