@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace felitronics::mastering
@@ -1218,10 +1219,11 @@ private:
         return clock.finish (&rec);
     }
 
-    static LoudnessSolution& cancelled (LoudnessSolution& sol) noexcept
+    // `sol` as Cancelled, moved into the return value.
+    static LoudnessSolution cancelled (LoudnessSolution& sol) noexcept
     {
         sol.status = MasteringSolveStatus::Cancelled;
-        return sol;
+        return std::move (sol);
     }
 
     // Two candidates, and keeping them apart is what makes the verdict mean something.

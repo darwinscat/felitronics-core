@@ -2366,6 +2366,41 @@ int main()
             (void) fc_solution_destroy (sol);
             (void) fc_master_destroy (h);
         }
+
+        // A solve stopped on its first pass's record allocates exactly its budget, on a plain and on a delivering handle.
+        {
+            struct StopOnRecord { static std::int32_t fn (void*, const fc_progress* e) { return e->hasRecord != 0 ? 0 : 1; } };
+            for (const double dr : { 0.0, 96000.0 })
+            {
+                fc_master_config c {}; FC_INIT (c);
+                (void) fc_master_config_defaults (&c);
+                c.sampleRate = kFs; c.channels = kNch; c.deliveryRate = dr;
+                fc_master h = 0;
+                const std::uint32_t n = 65536u;
+                const std::uint32_t outN = dr == 0.0 ? n : 2u * n;
+                fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+                fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+                req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0; req.grTraceBuckets = 65536;
+                fc_need nb {}; FC_INIT (nb);
+                const bool ready = fc_master_create (&c, &h) == FC_OK && fc_master_set_channel_weight (h, 0, 1.0) == FC_OK
+                                && fc_master_set_progress (h, &StopOnRecord::fn, nullptr) == FC_OK
+                                && fc_master_need_solve (h, &req, n, &nb) == FC_OK && nb.solverPrepared == 1;
+                auto in = tone (n, kNch);
+                std::vector<float> out ((std::size_t) outN * kNch, 0.0f);
+                fc_solution sol = 0;
+                alloc::plainObjectSize.store ((std::size_t) nb.facadeBytes, std::memory_order_relaxed);
+                const long long before = alloc::bytes.load();
+                const fc_status sv = ! ready ? FC_ERR_STATE
+                                   : dr == 0.0 ? fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol)
+                                               : fc_master_solve_delivered (h, &p, &req, in.data(), n, out.data(), outN, &sol);
+                const long long got = alloc::bytes.load() - before;
+                alloc::plainObjectSize.store (0, std::memory_order_relaxed);
+                ok (ready && sv == FC_ERR_CANCELLED && got == (long long) (nb.callBytes + nb.facadeBytes),
+                    std::string (dr == 0.0 ? "plain" : "48 -> 96 kHz") + ": stopped on the first record, " + std::to_string (got)
+                    + " B allocated against a budget of " + std::to_string (nb.callBytes + nb.facadeBytes) + " B");
+                (void) fc_master_destroy (h);
+            }
+        }
     }
 
     //==========================================================================

@@ -844,6 +844,94 @@ void testTheTraceBucketsAreTheRequests()
     }
 }
 
+// A solve stopped at any event, or refused after a render, holds its traces once: the call allocates the meters of the
+// passes it measured and the two traces, and returns the traces intact.
+struct StopAt
+{
+    ProgressStage stage = ProgressStage::SearchPass;
+    int pass = 1;
+    enum class When { Never, Begin, Render, Measure, Record } when = When::Never;
+    bool seen = false;
+};
+
+bool stopAt (void* context, const ProgressEvent& e)
+{
+    auto& s = *static_cast<StopAt*> (context);
+    if (s.when == StopAt::When::Never || e.stage != s.stage || e.pass != s.pass) return true;
+    const bool hit = (s.when == StopAt::When::Begin   && e.fraction == 0.0 && e.record == nullptr)
+                  || (s.when == StopAt::When::Render  && e.fraction > 0.0 && e.fraction < 0.4)
+                  || (s.when == StopAt::When::Measure && e.fraction > 0.6 && e.fraction < 1.0)
+                  || (s.when == StopAt::When::Record  && e.record != nullptr);
+    s.seen = s.seen || hit;
+    return ! hit;
+}
+
+void testAStoppedOrRefusedSolveHoldsItsTracesOnce()
+{
+    test::group ("a solve stopped at any event, or refused after a render, allocates its traces once and returns them");
+    const int frames = 65536, B = 65536;
+    const std::uint64_t budget = TargetLoudnessSolver::solveBytes (kFs, 1, frames, B);
+    const long long traces = 2LL * (long long) GainReductionTrace::bytesFor (B, frames);
+    const long long perPass = (long long) budget - traces;
+    test::ok (budget == 4215696u && traces == 4194304LL, "PRECONDITION: mono, 65536 frames and buckets: a budget of "
+              + std::to_string (budget) + " B, the traces " + std::to_string (traces) + " B");
+
+    using When = StopAt::When;
+    struct Case
+    {
+        const char* what;
+        Programme src;
+        LoudnessRequest req;
+        StopAt stop;
+        MasteringSolveStatus want;
+        int measured;                  // passes whose meters the call built
+    };
+    auto request = [] (double target, int passes)
+    {
+        LoudnessRequest r; r.targetLufs = target; r.maxTruePeakDbTp = -1.0; r.maxPasses = passes; r.grTraceBuckets = 65536;
+        return r;
+    };
+    auto mono = [] (Programme p) { p.ch.resize (1); p.bind(); return p; };
+    auto stopped = [] (ProgressStage st, int pass, When w) { StopAt s; s.stage = st; s.pass = pass; s.when = w; return s; };
+    LoudnessRequest reRender = request (-3.0, 2);
+    reRender.limiterGr.limitDb = 1.5; reRender.initialGainDb = 11.0;
+    LoudnessRequest upstream = request (-10.0, 4);
+    upstream.compressorGr.limitDb = 0.0;
+    const Programme music = mono (makeMusic ((double) frames / kFs, 0.35));
+    const Programme tone = makeTone (frames, 1, 0.3);
+    Programme silence; silence.ch.assign (1, std::vector<float> ((std::size_t) frames, 0.0f)); silence.bind();
+    std::vector<Case> cases {
+        { "stopped on the first pass's record", music, request (-10.0, 4), stopped (ProgressStage::SearchPass, 1, When::Record), MasteringSolveStatus::Cancelled, 1 },
+        { "stopped as the second pass begins", music, request (-10.0, 4), stopped (ProgressStage::SearchPass, 2, When::Begin), MasteringSolveStatus::Cancelled, 1 },
+        { "stopped inside the second pass's render", music, request (-10.0, 4), stopped (ProgressStage::SearchPass, 2, When::Render), MasteringSolveStatus::Cancelled, 1 },
+        { "stopped inside the second pass's measurement", music, request (-10.0, 4), stopped (ProgressStage::SearchPass, 2, When::Measure), MasteringSolveStatus::Cancelled, 2 },
+        { "stopped as the final render begins", tone, reRender, stopped (ProgressStage::FinalRender, 3, When::Begin), MasteringSolveStatus::Cancelled, 2 },
+        { "stopped inside the final render", tone, reRender, stopped (ProgressStage::FinalRender, 3, When::Render), MasteringSolveStatus::Cancelled, 2 },
+        { "stopped on the final render's record", tone, reRender, stopped (ProgressStage::FinalRender, 3, When::Record), MasteringSolveStatus::Cancelled, 3 },
+        { "not stopped: the re-render delivered", tone, reRender, StopAt {}, MasteringSolveStatus::TargetUnreachable, 3 },
+        { "refused after two renders: MeasurementInvalid", silence, request (-10.0, 4), StopAt {}, MasteringSolveStatus::MeasurementInvalid, 2 },
+        { "refused after a render: UpstreamViolation", music, upstream, StopAt {}, MasteringSolveStatus::UpstreamViolation, 1 },
+    };
+    for (Case& cs : cases)
+    {
+        Rig rig;
+        if (! test::run (rig.build (1))) return;
+        Programme dst; dst.ch = cs.src.ch; dst.bind();
+        const ProgressCallback cb { &stopAt, &cs.stop };
+        const long long before = alloc::bytes.load();
+        const LoudnessSolution sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, cs.src.in(), dst.out(), 1, frames, cs.req, cb);
+        const long long got = alloc::bytes.load() - before;
+        const std::string at = std::string (cs.what) + ": ";
+        test::ok (cs.stop.when == When::Never || cs.stop.seen, "PRECONDITION: " + at + "the event was reached");
+        test::ok (sol.status == cs.want, at + "the status (" + std::string (statusName (sol.status)) + ")");
+        test::ok (got == (long long) cs.measured * perPass + traces,
+                  at + std::to_string (got) + " B allocated, " + std::to_string (cs.measured) + " x the meters + the traces");
+        test::ok (sol.limiterTrace.buckets == B && sol.limiterTrace.bucket.size() == (std::size_t) B
+                  && sol.compressorTrace.bucket.size() == (std::size_t) B, at + "the traces are returned whole");
+        if (cs.measured == 1) test::ok (got <= (long long) budget, at + "within the budget of " + std::to_string (budget) + " B");
+    }
+}
+
 void testTheTraceDescribesTheDeliveredRender()
 {
     test::group ("P59b: the trace is the render in `out` — both delivery branches, the early exits, the refusals");
@@ -3717,6 +3805,7 @@ int main()
     testTheTraceNullsAgainstAHandDrivenChain();
     testTheTraceBuilderCountsWhatNoAudioCanReach();
     testTheTraceBucketsAreTheRequests();
+    testAStoppedOrRefusedSolveHoldsItsTracesOnce();
     testTheTraceDescribesTheDeliveredRender();
     testTheTraceLocatesAnImpulse();
     testRefusalsAndDegenerateInputs();
