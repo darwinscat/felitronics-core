@@ -27,6 +27,7 @@
 #include <random>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 using namespace felitronics;
@@ -559,12 +560,12 @@ void testStatisticsAgreeWithAHandDrivenChain()
 struct HandTrace
 {
     std::vector<double> maxDb, meanDb;
-    std::vector<std::uint32_t> samples;
+    std::vector<std::uint64_t> samples;
 };
 
-HandTrace bucketByHand (const std::vector<double>& grPerFrame, int stride, int frames)
+HandTrace bucketByHand (const std::vector<double>& grPerFrame, int stride, int frames, int requested)
 {
-    const int B = std::min (GainReductionTrace::kMaxBuckets, frames);
+    const int B = std::min (requested, frames);
     std::vector<std::uint64_t> bound ((std::size_t) B + 1u);
     for (int k = 0; k <= B; ++k) bound[(std::size_t) k] = (std::uint64_t) k * (std::uint64_t) frames / (std::uint64_t) B;
     HandTrace h;
@@ -587,10 +588,14 @@ HandTrace bucketByHand (const std::vector<double>& grPerFrame, int stride, int f
 void testTheTraceNullsAgainstAHandDrivenChain()
 {
     test::group ("P59b: the gain-reduction trace nulls against the chain driven by hand, bucketed another way");
-    // Three lengths: 1000 buckets over a length the bucket count does not divide, and a programme shorter than
-    // 1000 frames, which gets one bucket per frame.
-    for (const double seconds : { 5.0, 1.00007, 0.0125 })
+    // Three lengths at the default 1000 buckets: a length the bucket count does not divide, and a programme shorter
+    // than 1000 frames, which gets one bucket per frame. And the caller's own counts: 1 and 65536 over 240 000 frames,
+    // 777 over a length it does not divide, 65536 over 600 frames (one bucket per frame).
+    struct Case { double seconds; int buckets; };
+    for (const Case cs : { Case { 5.0, 1000 }, Case { 1.00007, 1000 }, Case { 0.0125, 1000 },
+                           Case { 5.0, 1 }, Case { 5.0, 65536 }, Case { 1.00007, 777 }, Case { 0.0125, 65536 } })
     {
+        const double seconds = cs.seconds;
         Programme src = makeMusic (seconds, 0.35);
         Programme dst; dst.ch = src.ch; dst.bind();
         Rig rig;
@@ -599,6 +604,7 @@ void testTheTraceNullsAgainstAHandDrivenChain()
         req.targetLufs = -10.0;
         req.maxTruePeakDbTp = -1.0;
         req.maxPasses = 3;
+        req.grTraceBuckets = cs.buckets;
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                            src.in(), dst.out(), 2, src.frames(), req);
         const int frames = src.frames();
@@ -653,21 +659,22 @@ void testTheTraceNullsAgainstAHandDrivenChain()
                          && std::none_of (gl.begin(), gl.end(), [] (double v) { return v < 0.0; });
         test::ok (filled, "PRECONDITION: the hand-driven chain delivered every tap of both windows");
 
-        const std::string at = " (" + std::to_string (frames) + " frames)";
+        const std::string at = " (" + std::to_string (frames) + " frames, " + std::to_string (cs.buckets) + " requested)";
         for (const auto& [name, trace, gr, stride] : { std::tuple<const char*, const GainReductionTrace*, const std::vector<double>*, int>
                                                           { "compressor", &sol.compressorTrace, &gc, 1 },
                                                       std::tuple<const char*, const GainReductionTrace*, const std::vector<double>*, int>
                                                           { "limiter", &sol.limiterTrace, &gl, F } })
         {
-            const HandTrace h = bucketByHand (*gr, stride, frames);
-            int bad = 0;
-            for (int k = 0; k < (int) h.maxDb.size(); ++k)
+            const HandTrace h = bucketByHand (*gr, stride, frames, cs.buckets);
+            const bool sized = trace->buckets == (int) h.maxDb.size() && trace->bucket.size() == h.maxDb.size();
+            int bad = sized ? 0 : -1;
+            for (int k = 0; sized && k < (int) h.maxDb.size(); ++k)
             {
-                const auto& b = trace->bucket[k];
+                const auto& b = trace->bucket[(std::size_t) k];
                 if (std::memcmp (&b.maxDb, &h.maxDb[(std::size_t) k], 8) != 0 || std::memcmp (&b.meanDb, &h.meanDb[(std::size_t) k], 8) != 0
                     || b.samples != h.samples[(std::size_t) k] || b.nonFinite != 0u) ++bad;
             }
-            test::ok (trace->buckets == (int) h.maxDb.size() && trace->valid && bad == 0,
+            test::ok (sized && trace->valid && bad == 0,
                       std::string (name) + ": " + std::to_string (trace->buckets) + " buckets, bit-identical to the hand-driven reference"
                       + at + " — " + std::to_string (bad) + " differ");
         }
@@ -758,6 +765,86 @@ void testTheTraceBuilderCountsWhatNoAudioCanReach()
     test::ok (u.bucket[500].maxDb == 7.0 && u.bucket[499].maxDb == 0.0, "48001 frames: frame 24000 is in bucket 500, not 499");
     test::ok (u.bucket[999].samples == 48u + 1u && u.bucket[0].samples == 48u && u.valid,
               "the 1-frame remainder lands in the LAST bucket (49 frames), the first holds floor(48001/1000) = 48");
+}
+
+// M2 — THE BUCKET COUNT IS THE REQUEST'S. Refused outside 1..65536 before anything is allocated, with a budget of 0; at the
+// two edges a render; the storage a solve allocates is its budget's trace term, to the byte; and the counts are 64 bits —
+// one bucket fed 2^32 + 5 samples, the case 32-bit counts wrapped to 5 while the trace still read valid.
+void testTheTraceBucketsAreTheRequests()
+{
+    test::group ("M2: grTraceBuckets — refused outside 1..65536, budgeted to the byte, counted in 64 bits");
+    static_assert (std::is_same_v<decltype (GainReductionTraceBucket::samples), std::uint64_t>
+                   && std::is_same_v<decltype (GainReductionTraceBucket::nonFinite), std::uint64_t>);
+    Programme src = makeMusic (5.0, 0.35);
+    const int frames = src.frames();
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        for (const int b : { 0, -1, std::numeric_limits<int>::min(), 65537, std::numeric_limits<int>::max() })
+        {
+            Programme dst; dst.ch = src.ch; dst.bind();
+            LoudnessRequest req; req.targetLufs = -12.0; req.maxTruePeakDbTp = -1.0; req.grTraceBuckets = b;
+            const long long before = alloc::count.load();
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, frames, req);
+            const long long allocs = alloc::count.load() - before;
+            test::ok (sol.status == MasteringSolveStatus::InvalidRequest && sol.passes == 0 && allocs == 0
+                      && sol.limiterTrace.buckets == 0 && sol.limiterTrace.bucket.empty() && sol.compressorTrace.bucket.empty()
+                      && TargetLoudnessSolver::solveBytes (kFs, 2, frames, b) == 0u,
+                      "grTraceBuckets " + std::to_string (b) + ": InvalidRequest before any pass, nothing allocated, a budget of 0");
+        }
+    }
+    for (const int b : { 1, 65536 })
+    {
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req; req.targetLufs = -12.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3; req.grTraceBuckets = b;
+        const std::uint64_t budget = TargetLoudnessSolver::solveBytes (kFs, 2, frames, b);
+        const long long traces = 2LL * (long long) b * 32LL;
+        const long long before = alloc::bytes.load();
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, frames, req);
+        const long long got = alloc::bytes.load() - before;
+        const long long perPass = (long long) budget - traces;
+        test::ok (sol.passes > 0 && sol.limiterTrace.buckets == b && sol.compressorTrace.buckets == b && sol.limiterTrace.valid
+                  && sol.limiterTrace.bucket.size() == (std::size_t) b,
+                  "grTraceBuckets " + std::to_string (b) + " over " + std::to_string (frames) + " frames: a render, " + std::to_string (b) + " buckets per stage");
+        test::ok (perPass > 0 && got == (long long) sol.passes * perPass + traces,
+                  "and the solve allocates passes x its meters + two traces of " + std::to_string (traces / 2) + " B ("
+                  + std::to_string (got) + " B over " + std::to_string (sol.passes) + " passes)");
+    }
+
+    // 2^32 + 5 samples into one bucket. With 32-bit counts: samples 5, the mean the sum over 5, and `valid` true.
+    {
+        GainReductionTrace t;
+        const std::uint64_t n = (1ULL << 32) + 5u;
+        {
+            GainReductionTraceBuilder b (t, 1, 1);
+            for (std::uint64_t i = 0; i < n; ++i) b.add (0u, 1.0);
+            b.finish();
+        }
+        test::ok (t.buckets == 1 && t.bucket[0].samples == n && t.bucket[0].nonFinite == 0u && t.samples == n
+                  && core::exactlyEqual (t.bucket[0].meanDb, 1.0) && core::exactlyEqual (t.bucket[0].maxDb, 1.0) && t.valid,
+                  "one bucket fed 2^32 + 5 samples of 1 dB counts " + std::to_string (t.bucket[0].samples) + " and means "
+                  + std::to_string (t.bucket[0].meanDb) + " dB");
+    }
+    // 65536 buckets over INT_MAX frames: each bucket's first and last frame land in it, by floor(k*F/B).
+    {
+        GainReductionTrace t;
+        const std::uint64_t F = (std::uint64_t) std::numeric_limits<int>::max(), B = 65536u;
+        int misplaced = 0;
+        {
+            GainReductionTraceBuilder b (t, std::numeric_limits<int>::max(), 65536);
+            for (std::uint64_t k = 0; k < B; ++k)
+            {
+                const std::uint64_t first = k * F / B, last = (k + 1) * F / B - 1;
+                b.add (first, (double) k);
+                b.add (last, (double) k + 0.5);
+            }
+            b.finish();
+        }
+        for (std::uint64_t k = 0; k < B; ++k)
+            if (t.bucket[(std::size_t) k].samples != 2u || ! core::exactlyEqual (t.bucket[(std::size_t) k].maxDb, (double) k + 0.5)) ++misplaced;
+        test::ok (t.buckets == 65536 && t.samples == 2u * B && misplaced == 0,
+                  "65536 buckets over INT_MAX frames: every bucket's first and last frame land in it (" + std::to_string (misplaced) + " misplaced)");
+    }
 }
 
 void testTheTraceDescribesTheDeliveredRender()
@@ -1038,23 +1125,45 @@ void testBlockIndependence()
 {
     test::group ("the solve does not depend on the renderer's block size");
     Programme src = makeMusic (4.0, 0.3);
-    double firstI = 0.0, firstG = 0.0;
-    bool have = false;
-    for (int blk : { 64, 256, 1000, 8192 })
+    // The traces at a caller's bucket count, compared bit for bit. At -13 LUFS the compressor works and the limiter does
+    // not; at -6 LUFS the limiter works too.
+    auto sameTrace = [] (const GainReductionTrace& a, const GainReductionTrace& b)
     {
-        Programme dst; dst.ch = src.ch; dst.bind();
-        Rig rig;
-        if (! test::run (rig.build (2, blk))) return;
-        LoudnessRequest req; req.targetLufs = -13.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3;
-        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
-                                           src.in(), dst.out(), 2, src.frames(), req);
-        if (! test::run (sol.status == MasteringSolveStatus::Solved)) return;
-        if (! have) { firstI = sol.measured.integratedLufs; firstG = sol.preLimiterGainDb; have = true; }
-        char msg[128];
-        std::snprintf (msg, sizeof msg, "block %d: the achieved loudness is bit-identical to block 64", blk);
-        test::approx (sol.measured.integratedLufs, firstI, 0.0, msg);
-        std::snprintf (msg, sizeof msg, "block %d: the applied gain is bit-identical to block 64", blk);
-        test::approx (sol.preLimiterGainDb, firstG, 0.0, msg);
+        bool same = a.buckets == b.buckets && a.buckets == 4099 && a.valid == b.valid;
+        for (int k = 0; same && k < a.buckets; ++k)
+        {
+            const auto& x = a.bucket[(std::size_t) k];
+            const auto& y = b.bucket[(std::size_t) k];
+            same = std::memcmp (&x.maxDb, &y.maxDb, 8) == 0 && std::memcmp (&x.meanDb, &y.meanDb, 8) == 0 && x.samples == y.samples;
+        }
+        return same;
+    };
+    for (const double target : { -13.0, -6.0 })
+    {
+        double firstI = 0.0, firstG = 0.0;
+        bool have = false;
+        LoudnessSolution first;
+        for (int blk : { 64, 256, 1000, 8192 })
+        {
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2, blk))) return;
+            LoudnessRequest req; req.targetLufs = target; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3; req.grTraceBuckets = 4099;
+            auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
+                                         src.in(), dst.out(), 2, src.frames(), req);
+            if (target < -10.0 && ! test::run (sol.status == MasteringSolveStatus::Solved)) return;
+            if (! have) { firstI = sol.measured.integratedLufs; firstG = sol.preLimiterGainDb; first = std::move (sol); have = true; continue; }
+            char msg[160];
+            std::snprintf (msg, sizeof msg, "%g LUFS, block %d: the achieved loudness is bit-identical to block 64", target, blk);
+            test::approx (sol.measured.integratedLufs, firstI, 0.0, msg);
+            std::snprintf (msg, sizeof msg, "%g LUFS, block %d: the applied gain is bit-identical to block 64", target, blk);
+            test::approx (sol.preLimiterGainDb, firstG, 0.0, msg);
+            std::snprintf (msg, sizeof msg, "%g LUFS, block %d: both 4099-bucket traces are bit-identical to block 64's", target, blk);
+            test::ok (sameTrace (sol.compressorTrace, first.compressorTrace) && sameTrace (sol.limiterTrace, first.limiterTrace), msg);
+        }
+        const double live = target < -10.0 ? traceMax (first.compressorTrace) : traceMax (first.limiterTrace);
+        test::ok (live > 0.5, std::string ("PRECONDITION: at ") + std::to_string ((int) target) + " LUFS the "
+                  + (target < -10.0 ? "compressor" : "limiter") + " trace is live (" + std::to_string (live) + " dB)");
     }
 }
 
@@ -1134,6 +1243,175 @@ void testTheScaleLawIsPinned()
     test::ok (worst < 1.0e-5, "the scale law holds to better than 1e-5 (measured "
                               + std::to_string (worst) + " at peak " + std::to_string (worstPeak) + ")");
     std::printf ("      scale law: worst |y(g,c) - 10^(c/20) y(d,0)| = %.3e at peak %.3f\n", worst, worstPeak);
+}
+
+// =============================================================================================
+// M2 — THE SAME GRID UNDER THE LIMITER'S DUAL RELEASE. Both envelopes read only the required reduction, so the gain trace
+// is still a function of the drive alone. The slow envelope binds where a reduction held for its whole window is followed
+// by less than the fast envelope keeps: so the music fixture at a lower level, under a 1 kHz tone held 300 ms and
+// silent 200 ms — and the grid's renders with the dual release off, to show it binds at every point.
+void testTheScaleLawHoldsUnderTheDualRelease()
+{
+    test::group ("M2: y(g,c) == 10^(c/20) * y(g-c, 0) under the dual release, on the same 3x3 grid");
+    Programme src = makeMusic (1.0, 0.2);
+    for (int i = 0; i < src.frames(); ++i)
+        if (std::fmod ((double) i / kFs, 0.5) < 0.3)
+            for (int c = 0; c < 2; ++c)
+                src.ch[(std::size_t) c][(std::size_t) i] += (float) (0.9 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+    src.bind();
+    auto run = [&] (double gg, double cc, bool dual, std::vector<std::vector<float>>& o)
+    {
+        MasteringChainConfig cfg;
+        cfg.eq = false; cfg.compressor = false; cfg.clipper = false;
+        cfg.limiter = true; cfg.dither = false;
+        MasteringChain ch;
+        if (! ch.prepare (kFs, 2, cfg)) return false;
+        MasteringChainParams p;
+        p.preLimiterGainDb = gg; p.limiter.ceilingDbTp = cc;
+        p.limiter.releaseMs = 25.0; p.limiter.dualRelease = dual; p.limiter.slowReleaseMs = 200.0;
+        ch.setParams (p);
+        OfflineRenderer r;
+        if (! r.prepare (2, 1024)) return false;
+        o = src.ch;
+        std::vector<float*> op { o[0].data(), o[1].data() };
+        return r.render (ch, src.in(), op.data(), 2, src.frames());
+    };
+    double worst = 0.0, worstPeak = 0.0;
+    int bound = 0;
+    for (double c : { -1.0, -3.0, -6.0 })
+        for (double g : { 3.0, 6.0, 12.0 })
+        {
+            std::vector<std::vector<float>> a, b, off;
+            if (! test::run (run (g, c, true, a)) || ! test::run (run (g - c, 0.0, true, b)) || ! test::run (run (g, c, false, off))) return;
+            const double k = std::pow (10.0, c / 20.0);
+            bool differs = false;
+            for (int i = 0; i < src.frames(); ++i)
+            {
+                worst = std::fmax (worst, std::fabs ((double) a[0][(std::size_t) i] - k * (double) b[0][(std::size_t) i]));
+                worstPeak = std::fmax (worstPeak, std::fabs ((double) a[0][(std::size_t) i]));
+                differs = differs || a[0][(std::size_t) i] != off[0][(std::size_t) i];
+            }
+            bound += differs ? 1 : 0;
+        }
+    test::ok (worstPeak > 0.1, "PRECONDITION: the compared renders are not silence (" + std::to_string (worstPeak) + ")");
+    test::ok (bound == 9, "PRECONDITION: the slow envelope changes the render at every point of the grid (" + std::to_string (bound) + " of 9)");
+    test::ok (worst < 1.0e-5, "the scale law holds to better than 1e-5 under the dual release (measured "
+                              + std::to_string (worst) + " at peak " + std::to_string (worstPeak) + ")");
+    std::printf ("      scale law, dual release: worst |y(g,c) - 10^(c/20) y(d,0)| = %.3e at peak %.3f\n", worst, worstPeak);
+}
+
+// M2 — THE REDUCTION IS MONOTONE IN DRIVE UNDER THE DUAL RELEASE, pointwise: the limiter's gain-reduction tap over a drive
+// sweep never gives back reduction as the drive rises. Read through the chain's own tap, on a programme with bass, a held
+// tone whose level crosses the ceiling within the sweep, dense noise and transients. And the three statistics the
+// search's drive bound reads (mean, p95, max) with it. The tone and the bass are held 300 ms and the bass drops to a
+// third for 200 ms, so the slow envelope binds on each release in the upper part of the sweep.
+void testTheReductionIsMonotoneInDriveUnderTheDualRelease()
+{
+    test::group ("M2: under the dual release the limiter's reduction is monotone in drive, sample by sample");
+    const int frames = (int) (kFs * 2.0);
+    Programme src; src.ch.assign (2, std::vector<float> ((std::size_t) frames, 0.0f));
+    std::uint64_t seed = 0x2545F4914F6CDD1DULL;
+    for (int i = 0; i < frames; ++i)
+    {
+        const double t = (double) i / kFs;
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        const double noise = (double) ((seed >> 40) & 0xffff) / 32768.0 - 1.0;
+        const bool on = std::fmod (t, 0.5) < 0.3;
+        const double held = on ? 0.35 * std::sin (2.0 * kPi * 1000.0 * t) : 0.0;
+        const double bass = (on ? 0.4 : 0.13) * std::sin (2.0 * kPi * 55.0 * t);
+        const double burst = (t > 1.2 && t < 1.5) ? 0.25 * noise : 0.0;
+        const double click = (i % 5760 < 3) ? 0.5 : 0.0;
+        for (int c = 0; c < 2; ++c) src.ch[(std::size_t) c][(std::size_t) i] = (float) (held + bass + burst + click * (c == 0 ? 1.0 : -1.0));
+    }
+    src.bind();
+
+    auto tap = [&] (double drive, std::vector<float>& gr)
+    {
+        MasteringChainConfig cfg;
+        cfg.eq = false; cfg.compressor = false; cfg.clipper = false; cfg.dither = false;
+        MasteringChain chain;
+        if (! chain.prepare (kFs, 2, cfg)) return false;
+        MasteringChainParams p;
+        p.preLimiterGainDb = drive; p.limiter.ceilingDbTp = -1.0;
+        p.limiter.releaseMs = 25.0; p.limiter.dualRelease = true; p.limiter.slowReleaseMs = 200.0;
+        chain.setParams (p);
+        chain.reset();
+        const int K = chain.internalBlock(), F = chain.tapOversampleFactor(), blk = 1024;
+        std::vector<float> limTap ((std::size_t) (blk + K) * (std::size_t) F, 0.0f);
+        MasteringChainTaps taps; taps.limiterGrDb = limTap.data(); taps.osCapacity = (blk + K) * F;
+        const MasteringChainResolved r = chain.resolved();
+        const long long D = chain.latencySamples();
+        gr.assign ((std::size_t) frames * (std::size_t) F, 1.0f);
+        std::vector<std::vector<float>> scratch (2, std::vector<float> ((std::size_t) blk, 0.0f));
+        long long tapPos = 0;
+        for (long long off = 0; off < (long long) frames + D; )
+        {
+            const int m = (int) std::min<long long> (blk, (long long) frames + D - off);
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < m; ++i)
+                    scratch[(std::size_t) c][(std::size_t) i] = off + i < frames ? src.ch[(std::size_t) c][(std::size_t) (off + i)] : 0.0f;
+            float* sp[2] { scratch[0].data(), scratch[1].data() };
+            if (! chain.process (sp, 2, m, taps)) return false;
+            for (int j = 0; j < taps.framesWritten; ++j)
+            {
+                const long long t = tapPos + j - r.limiterTapOffset;
+                if (t >= 0 && t < frames)
+                    for (int k = 0; k < F; ++k) gr[(std::size_t) t * (std::size_t) F + (std::size_t) k] = limTap[(std::size_t) (j * F + k)];
+            }
+            tapPos += taps.framesWritten; off += m;
+        }
+        return std::none_of (gr.begin(), gr.end(), [] (float v) { return v > 0.0f; });
+    };
+    struct Stats { double mean = 0.0, p95 = 0.0, max = 0.0; };
+    auto stats = [] (std::vector<float> gr)
+    {
+        Stats st;
+        for (float& v : gr) { v = -v; st.mean += (double) v; st.max = std::max (st.max, (double) v); }
+        st.mean /= (double) gr.size();
+        std::sort (gr.begin(), gr.end());
+        st.p95 = (double) gr[(std::size_t) (0.95 * (double) (gr.size() - 1))];
+        return st;
+    };
+    std::vector<float> prev;
+    Stats prevSt;
+    std::size_t reversals = 0, samples = 0;
+    int statReversals = 0, steps = 0;
+    for (double drive = -3.0; drive <= 12.0 + 1e-9; drive += 0.75)
+    {
+        std::vector<float> gr;
+        if (! test::run (tap (drive, gr))) return;
+        const Stats st = stats (gr);
+        if (! prev.empty())
+        {
+            for (std::size_t i = 0; i < gr.size(); ++i) if (gr[i] > prev[i]) ++reversals;
+            samples += gr.size();
+            statReversals += (st.mean < prevSt.mean) + (st.p95 < prevSt.p95) + (st.max < prevSt.max);
+            ++steps;
+        }
+        prev = std::move (gr); prevSt = st;
+    }
+    // PRECONDITION: the sweep crosses from an idle limiter to a hard-working one, and the slow envelope works in it.
+    std::vector<float> atTop, single;
+    test::run (tap (12.0, atTop));
+    {
+        MasteringChainConfig cfg; cfg.eq = false; cfg.compressor = false; cfg.clipper = false; cfg.dither = false;
+        MasteringChain a, b;
+        MasteringChainParams p; p.preLimiterGainDb = 12.0; p.limiter.ceilingDbTp = -1.0; p.limiter.releaseMs = 25.0; p.limiter.slowReleaseMs = 200.0;
+        p.limiter.dualRelease = true;
+        const bool prepA = a.prepare (kFs, 2, cfg); a.setParams (p);
+        p.limiter.dualRelease = false;
+        const bool prepB = b.prepare (kFs, 2, cfg); b.setParams (p);
+        OfflineRenderer r; const bool prepR = r.prepare (2, 1024);
+        std::vector<std::vector<float>> oa = src.ch, ob = src.ch;
+        std::vector<float*> pa { oa[0].data(), oa[1].data() }, pb { ob[0].data(), ob[1].data() };
+        const bool rendered = prepA && prepB && prepR && r.render (a, src.in(), pa.data(), 2, frames) && r.render (b, src.in(), pb.data(), 2, frames);
+        test::ok (rendered && oa != ob, "PRECONDITION: at the top of the sweep the slow envelope changes the render");
+    }
+    test::ok (! atTop.empty() && stats (atTop).max > 6.0, "PRECONDITION: the top of the sweep reduces by more than 6 dB ("
+              + std::to_string (atTop.empty() ? 0.0 : stats (atTop).max) + ")");
+    test::ok (steps == 20 && reversals == 0, "over 20 steps of 0.75 dB, no tap sample gives back reduction (" + std::to_string (reversals)
+              + " of " + std::to_string (samples) + ")");
+    test::ok (statReversals == 0, "and the mean, p95 and max of |GR| never fall as the drive rises");
 }
 
 // =============================================================================================
@@ -3320,7 +3598,7 @@ static void testTheRateFloor()
         // THE BUDGETS SHARE THE VERDICT. 12 million frames — 25 minutes at the floor, 4 s at the ceiling — so the range
         // is measurable at every accepted rate.
         const int frames = 12'000'000;
-        test::ok ((TargetLoudnessSolver::solveBytes (r.fs, 2, frames) > 0u) == r.want,
+        test::ok ((TargetLoudnessSolver::solveBytes (r.fs, 2, frames, GainReductionTrace::kDefaultBuckets) > 0u) == r.want,
                   std::string ("solveBytes is 0 exactly where prepare() refuses: ") + r.what);
         test::ok ((TargetLoudnessSolver::measureRangeBytes (r.fs, frames) > 0u) == r.want,
                   std::string ("measureRangeBytes likewise: ") + r.what);
@@ -3362,10 +3640,14 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // (Before P62 the solver read with TruePeakMeter, 392 B, plus a 512 B drain buffer.)
     test::ok (ReferenceTruePeakMeter::storageFor (48000.0, 48000, 2).bytes() == 2u * 2312u + 16384u,
               "and 21 008 B for stereo (the ABI suite's oracle)");
-    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000) == 0
-              && TargetLoudnessSolver::solveBytes (48000.0, past, 48000) == 0,
+    const int kB = GainReductionTrace::kDefaultBuckets;
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000, kB) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000, kB) == 0
+              && TargetLoudnessSolver::solveBytes (48000.0, past, 48000, kB) == 0,
               "solveBytes: 0 for a channel count solve() refuses");
-    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000) == 2672u + 21008u, "and 23 680 B for 1 s of stereo (the ABI suite's oracle)");
+    // The two traces: 1000 buckets of {double, double, uint64, uint64} = 32 B each, 2 x 32 000 = 64 000 B.
+    test::ok (sizeof (GainReductionTraceBucket) == 32u, "a trace bucket is 32 B");
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB) == 2672u + 21008u + 64000u,
+              "and 87 680 B for 1 s of stereo at the default 1000 buckets (the ABI suite's oracle)");
     // A prepare() refused on its bin width (400 dB at 1e-7 dB is 4e9 bins, past the 4e6 ceiling) allocates NOTHING —
     // which is what its budget says. The diverse-testing round found the tap buffers assigned before that refusal, and
     // kept. The delta is read into a local before the check.
@@ -3377,7 +3659,7 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
         test::ok (refused && allocs == 0 && TargetLoudnessSolver::prepareBytes (1024, 64, 4, 1.0e-7) == 0,
                   "a prepare() refused on its bin width allocates nothing, and its budget is 0");
     }
-    test::ok (TargetLoudnessSolver::solveBytes (0.0, 2, 48000) == 0 && TargetLoudnessSolver::solveBytes (-1.0, 2, 48000) == 0
+    test::ok (TargetLoudnessSolver::solveBytes (0.0, 2, 48000, kB) == 0 && TargetLoudnessSolver::solveBytes (-1.0, 2, 48000, kB) == 0
               && TargetLoudnessSolver::measureRangeBytes (0.0, 480000) == 0, "and 0 for a rate the solver refuses");
     // The cheap meter's factor followed the RATE and its budget had to follow too (the diverse-testing round's mutant
     // sized it at 48 kHz and passed). The reference is 4x at EVERY rate, so its budget must NOT move with the rate —
@@ -3385,9 +3667,9 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // so the loudness meter is 8·(300 + 24 + 10) = 2672 B at each of them.
     test::ok (ReferenceTruePeakMeter::storageFor (96000.0, 96000, 2).bytes() == 21008u && ReferenceTruePeakMeter::storageFor (192000.0, 192000, 2).bytes() == 21008u,
               "the reference true-peak meter is 21 008 B at 96 and at 192 kHz too");
-    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000) == 2672u + 21008u
-              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000) == 2672u + 21008u,
-              "and a 1 s solve at 96 and 192 kHz carries it unchanged: 23 680 B");
+    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000, kB) == 2672u + 21008u + 64000u
+              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000, kB) == 2672u + 21008u + 64000u,
+              "and a 1 s solve at 96 and 192 kHz carries it unchanged: 87 680 B");
 }
 
 // P62 — THE INSTRUMENT CHANGED, THE SPELLING OF SILENCE DID NOT. The solver now reads with ReferenceTruePeakMeter, whose
@@ -3444,12 +3726,15 @@ int main()
     testStatisticsAgreeWithAHandDrivenChain();
     testTheTraceNullsAgainstAHandDrivenChain();
     testTheTraceBuilderCountsWhatNoAudioCanReach();
+    testTheTraceBucketsAreTheRequests();
     testTheTraceDescribesTheDeliveredRender();
     testTheTraceLocatesAnImpulse();
     testRefusalsAndDegenerateInputs();
     testBlockIndependence();
     testTheReportedRenderIsTheDeliveredOne();
     testTheScaleLawIsPinned();
+    testTheScaleLawHoldsUnderTheDualRelease();
+    testTheReductionIsMonotoneInDriveUnderTheDualRelease();
     testTheAbsoluteGateStepIsPinned();
     testTheReviewsCounterexamples();
     testCrossChannelAliasingIsRefused();

@@ -75,15 +75,16 @@ public:
     }
 
     // solve(): the converted programme, held for the whole call, plus the search's own PEAK at the delivered
-    // length (one pass — see `TargetLoudnessSolver::solveBytes`). 0 where the call converts nothing: an empty or
-    // unrepresentable programme, which the solver refuses before any pass.
+    // length (one pass and the request's `grTraceBuckets` traces — see `TargetLoudnessSolver::solveBytes`). 0 where
+    // the call converts nothing: an empty or unrepresentable programme, or a bucket count the solver refuses before
+    // any pass.
     [[nodiscard]] static std::uint64_t solveBytes (double sourceRate, double deliveryRate, int numChannels,
-                                                   long long inFrames) noexcept
+                                                   long long inFrames, int grTraceBuckets) noexcept
     {
         const long long d = deliveredFrames (sourceRate, deliveryRate, inFrames);
         if (d <= 0 || d > INT_MAX || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
-        return programmeBytes (sourceRate, deliveryRate, numChannels, d)
-             + TargetLoudnessSolver::solveBytes (deliveryRate, numChannels, (int) d);
+        const std::uint64_t search = TargetLoudnessSolver::solveBytes (deliveryRate, numChannels, (int) d, grTraceBuckets);
+        return search == 0u ? 0u : programmeBytes (sourceRate, deliveryRate, numChannels, d) + search;
     }
 
     // measureInputLoudnessRange(): the converted programme and one meter — and NOTHING for a delivered length too

@@ -38,14 +38,16 @@ namespace felitronics::mastering
 //     rawRedDb = min (0, -(g - c) - smaxDb(p))
 //
 // depends on g and c ONLY through the difference. Write `d = g - c` (the DRIVE, in dB above the
-// ceiling); the release recursion `grDb = min(rawRed, grDb*relCoef)` reads only `rawRed`, so the whole
-// gain trace is a function of d alone, and the output is
+// ceiling); the release recursion `grDb = min(rawRed, grDb*relCoef)` reads only `rawRed` — and so do both envelopes
+// of the limiter's `dualRelease` — so the whole gain trace is a function of d alone, and the output is
 //
 //     y(g, c) = 10^(c/20) * y(d, 0)
 //
 // i.e. c is a pure output SCALE and d is the entire SHAPE. Measured on this tree over a 3x3 grid of
 // (g, c): max |y(g,c) - 10^(c/20) y(d,0)| = 9.1e-07 .. 1.7e-06 on a programme peaking at 0.89, which is
-// float rounding in `dbToGain` and the FIR, not a structural gap. Consequences, and they are the design:
+// float rounding in `dbToGain` and the FIR, not a structural gap; under the dual release, on the same grid and a
+// programme where the slow envelope binds at every point, 5.754e-07 (printed by felitronics_loudness_solver_tests).
+// Consequences, and they are the design:
 //
 //     I(g, c)  = c + J(d)          achieved integrated loudness
 //     TP(g, c) = c + T(d)          achieved true peak
@@ -228,9 +230,10 @@ struct GainReductionStats
 // show. The same tap values the statistics see, in the same window (each stage's own tap offset), in the same units:
 // frames for the compressor, frames × `tapOversampleFactor` sub-samples for the limiter.
 //
-// BUCKET k covers the programme frames [floor(k·F/B), floor((k+1)·F/B)) for F frames and B = min(kMaxBuckets, F)
-// buckets — integer arithmetic, and never an empty bucket: a programme shorter than kMaxBuckets frames gets one
-// bucket per frame, not trailing zeros that would read as "the stage did not work". Frame p of the programme is tap
+// BUCKET k covers the programme frames [floor(k·F/B), floor((k+1)·F/B)) for F frames and B = min(requested, F)
+// buckets, `requested` being `LoudnessRequest::grTraceBuckets` — integer arithmetic, and never an empty bucket: a
+// programme shorter than the request gets one bucket per frame, not trailing zeros that would read as "the stage did
+// not work". Frame p of the programme is tap
 // sample p + the stage's tap offset, so a bucket is in the time of the INPUT the gain was decided for, exactly as
 // the statistics are; on the delivered-rate path (`DeliveredMastering`) that input is the converted programme, so
 // the frames are delivered-rate frames.
@@ -238,28 +241,42 @@ struct GainReductionTraceBucket
 {
     double        maxDb     = 0.0;  // largest finite |GR| in the bucket; 0 when it saw no finite sample
     double        meanDb    = 0.0;  // sequential sum of its finite |GR| / their count; 0 when it saw none
-    std::uint32_t samples   = 0;    // tap samples that landed in it, finite or not
-    std::uint32_t nonFinite = 0;    // ... of which were NaN or infinite: excluded from max and mean, and COUNTED,
+    std::uint64_t samples   = 0;    // tap samples that landed in it, finite or not
+    std::uint64_t nonFinite = 0;    // ... of which were NaN or infinite: excluded from max and mean, and COUNTED,
                                     // because a max that skips a NaN silently reads 0 — "the stage was idle"
 };
 
 struct GainReductionTrace
 {
-    static constexpr int kMaxBuckets = 1000;
+    static constexpr int kDefaultBuckets = 1000;     // LoudnessRequest::grTraceBuckets' default
+    static constexpr int kMaxBuckets     = 65536;    // the largest request admitted
 
-    int           buckets   = 0;    // min(kMaxBuckets, programme frames) of the last render ATTEMPTED; 0 when none was
+    int           buckets   = 0;    // min(requested, programme frames) of the last render ATTEMPTED; 0 when none was
     // TRUE ONLY WHEN THE TRACE IS A MEASUREMENT: a render ran to its end for this solution, the stage's window saw
     // at least one sample, and none of them was non-finite. False on a refusal before any render (buckets 0), on a
     // render the renderer abandoned (RenderFailed from the render itself), and on a poisoned tap — in which case the
     // numbers are best effort and `nonFinite` says where. Like `GainReductionStats::valid`, not a nicety.
     bool          valid     = false;
     std::uint64_t samples   = 0, nonFinite = 0;
-    GainReductionTraceBucket bucket[kMaxBuckets] {};
+    std::vector<GainReductionTraceBucket> bucket;   // `buckets` entries
+
+    // The bucket count of a trace of `requested` buckets over `frames` frames: min(requested, frames); 0 when either is not positive.
+    static int bucketsFor (int requested, int frames) noexcept
+    {
+        return frames > 0 && requested > 0 ? std::min (requested, frames) : 0;
+    }
+    // What the bucket storage of one such trace asks the heap for.
+    static std::uint64_t bytesFor (int requested, int frames) noexcept
+    {
+        return (std::uint64_t) bucketsFor (requested, frames) * (std::uint64_t) sizeof (GainReductionTraceBucket);
+    }
 };
 
 // THE TRACE'S THREE STEPS, as one small object the solver's tap sink drives — public so the one path no audio can
 // reach through the solver (a non-finite tap: the chain sanitises its input) can be tested directly.
-//   * construction — before a render: every bucket zero, `valid` false, the bucket count for this programme;
+//   * construction — before a render: the storage assigned to bucketsFor(requested, frames) buckets, `requested`
+//     clamped to [1, kMaxBuckets], every bucket zero, `valid` false. Storage that already holds that many buckets is
+//     reused, so a solve allocates its traces on its first render only;
 //   * `add(frame, a)` — per tap sample, in stream order: `a` is |GR| in dB for programme frame `frame`; it counts the
 //     sample, and either its non-finite count or its running max and SUM (the mean is divided out once, at the end);
 //   * `finish()` — after a render that ran to its end: the means, the totals, and `valid`. A render that did not run
@@ -269,11 +286,13 @@ struct GainReductionTrace
 class GainReductionTraceBuilder
 {
 public:
-    GainReductionTraceBuilder (GainReductionTrace& trace, int programmeFrames) noexcept
+    GainReductionTraceBuilder (GainReductionTrace& trace, int programmeFrames,
+                               int requestedBuckets = GainReductionTrace::kDefaultBuckets)
         : t (trace), frames (programmeFrames > 0 ? (std::uint64_t) programmeFrames : 0u)
     {
-        for (auto& b : t.bucket) b = GainReductionTraceBucket {};
-        t.buckets   = programmeFrames > 0 ? std::min (GainReductionTrace::kMaxBuckets, programmeFrames) : 0;
+        t.buckets   = GainReductionTrace::bucketsFor (std::clamp (requestedBuckets, 1, GainReductionTrace::kMaxBuckets),
+                                                      programmeFrames);
+        t.bucket.assign ((std::size_t) t.buckets, GainReductionTraceBucket {});
         t.valid     = false;
         t.samples   = 0;
         t.nonFinite = 0;
@@ -285,7 +304,7 @@ public:
         if (t.buckets <= 0 || frame >= frames) return;
         if (frame < start) { k = 0; start = 0; end = bucketEnd (0); }       // the stream never goes back; defensive
         while (frame >= end && k + 1 < (std::uint64_t) t.buckets) { ++k; start = end; end = bucketEnd (k); }
-        GainReductionTraceBucket& b = t.bucket[k];
+        GainReductionTraceBucket& b = t.bucket[(std::size_t) k];
         ++b.samples;
         if (! std::isfinite (a)) { ++b.nonFinite; return; }
         if (a > b.maxDb) b.maxDb = a;
@@ -297,8 +316,8 @@ public:
         std::uint64_t samples = 0, nonFinite = 0;
         for (int i = 0; i < t.buckets; ++i)
         {
-            GainReductionTraceBucket& b = t.bucket[i];
-            const std::uint32_t finite = b.samples - b.nonFinite;
+            GainReductionTraceBucket& b = t.bucket[(std::size_t) i];
+            const std::uint64_t finite = b.samples - b.nonFinite;
             b.meanDb = finite > 0 ? b.meanDb / (double) finite : 0.0;
             samples   += b.samples;
             nonFinite += b.nonFinite;
@@ -408,6 +427,10 @@ struct LoudnessRequest
     // measurements. Four leaves one spare for a programme that also has to bring its ceiling down.
     int    maxPasses = 4;
     double initialGainDb = std::numeric_limits<double>::quiet_NaN();   // NaN = use the params' own
+
+    // How many buckets each gain-reduction trace of the solution holds: min(this, programme frames). 1 ..
+    // GainReductionTrace::kMaxBuckets; anything else is InvalidRequest. The traces' storage is counted in solveBytes().
+    int    grTraceBuckets = GainReductionTrace::kDefaultBuckets;
 };
 
 // One render the search made. The whole trace is returned, not just the winner: a caller that has to
@@ -449,8 +472,8 @@ struct LoudnessSolution
     // WHERE each stage worked, over the audio handed back in `out` (P59b) — see GainReductionTrace. Written by every
     // render and reset at the start of each, so it always describes the LAST render, and the last render is the one
     // in `out`: the search re-renders the winner when it did not end on it. It lives here, with the solution, and
-    // not in the solver, because a solution outlives the next solve. The price is its size: ~48 KiB per solution,
-    // carried by value.
+    // not in the solver, because a solution outlives the next solve. Each holds `grTraceBuckets` buckets at most, on
+    // the heap, allocated by the solve's first render.
     GainReductionTrace compressorTrace {};
     GainReductionTrace limiterTrace {};
 };
@@ -539,7 +562,8 @@ public:
             || req.maxPasses < 1 || req.maxPasses > kMaxPasses
             || req.limiterGr.malformed() || req.compressorGr.malformed()
             || std::isnan (req.minPlrDb) || std::isnan (req.maxLraLossLu)
-            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0) return false;
+            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0
+            || ! traceBucketsAdmitted (req.grTraceBuckets)) return false;
         // The tap buffers were sized for a geometry; a chain that does not match them would be measured
         // through a refused call, which is a silent zero rather than a statistic.
         // THE RATE IS CHECKED, not assumed shared. The solver builds its own meters from `fs_`, and a
@@ -574,15 +598,25 @@ public:
     }
 
     // solve(): its PEAK. Every pass builds a loudness meter and the reference true-peak meter and frees them at the
-    // pass's end, so the peak is ONE pass. (The drain used to be a buffer of zeros the first solve allocated and later
-    // ones reused; the reference meter drains from its own fixed array, so there is nothing left over.) 0 for a length
-    // or a channel count solve() refuses before any pass.
-    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames) noexcept
+    // pass's end, so the peak is ONE pass — plus the solution's two gain-reduction traces of `grTraceBuckets`
+    // (`LoudnessRequest::grTraceBuckets`), which the first render allocates and the solution keeps. (The drain used to
+    // be a buffer of zeros the first solve allocated and later ones reused; the reference meter drains from its own
+    // fixed array, so there is nothing left over.) 0 for a length, a channel count or a bucket count solve() refuses
+    // before any pass.
+    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames, int grTraceBuckets) noexcept
     {
         if (frames <= 0 || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
+        if (! traceBucketsAdmitted (grTraceBuckets)) return 0u;
         const std::uint64_t meter = meterBytes (sampleRate, frames);
         if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
-        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes();
+        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes()
+             + 2u * GainReductionTrace::bytesFor (grTraceBuckets, frames);
+    }
+
+    // The request's bucket count, as admits() judges it.
+    static bool traceBucketsAdmitted (int grTraceBuckets) noexcept
+    {
+        return grTraceBuckets >= 1 && grTraceBuckets <= GainReductionTrace::kMaxBuckets;
     }
 
     // measureInputLoudnessRange(): one loudness meter — and NOTHING for a programme too short to have a range, which it
@@ -1445,8 +1479,8 @@ private:
         maxReconLin_ = 0.0f;
         // The traces are reset with the histograms, at the same place and for the same reason: whatever they held
         // described a render that is about to be overwritten in `out`.
-        GainReductionTraceBuilder compTrace (sol.compressorTrace, frames);
-        GainReductionTraceBuilder limTrace  (sol.limiterTrace, frames);
+        GainReductionTraceBuilder compTrace (sol.compressorTrace, frames, req.grTraceBuckets);
+        GainReductionTraceBuilder limTrace  (sol.limiterTrace, frames, req.grTraceBuckets);
         if (! renderTapped (chain, renderer, in, out, nch, frames, req, compTrace, limTrace, clock)) return false;
         compTrace.finish();
         limTrace.finish();

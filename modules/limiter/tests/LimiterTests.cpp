@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -40,6 +41,138 @@ static double rmsTail (const std::vector<float>& v, double frac)
     for (int i = from; i < (int) v.size(); ++i) { s += (double) v[i] * v[i]; ++c; }
     return c ? std::sqrt (s / c) : 0.0;
 }
+
+//==============================================================================
+// THE DUAL RELEASE (M2), against a reference of a different construction: the gain law recomputed from the limiter's own
+// reconstructed-peak tap, its two windows maxima taken offline by van Herk / Gil-Werman (prefix and suffix maxima over
+// blocks of the window's length) rather than by the class's deque, the switches of `dualRelease` applied where the
+// contract puts them, and the poison flush at every chunk end. Compared with the gain-reduction tap bit for bit.
+namespace dual
+{
+// max over x[i-W+1 .. i], the samples before 0 absent.
+std::vector<float> windowMax (const std::vector<float>& x, int W)
+{
+    const std::size_t n = x.size(), w = (std::size_t) W;
+    std::vector<float> g (n), h (n), out (n);
+    for (std::size_t i = 0; i < n; ++i) g[i] = (i % w == 0) ? x[i] : std::max (g[i - 1], x[i]);
+    for (std::size_t i = n; i-- > 0;) h[i] = (i + 1 == n || (i + 1) % w == 0) ? x[i] : std::max (h[i + 1], x[i]);
+    for (std::size_t i = 0; i < n; ++i) out[i] = (i + 1 < w) ? g[i] : std::max (h[i + 1 - w], g[i]);
+    return out;
+}
+
+float coefFor (double ms, double fs, int F)
+{
+    const double t = std::max (ms * 0.001 * fs * (double) F, 8.0 * (double) F);
+    float c = (float) std::exp (-1.0 / t);
+    if (! (c < 1.0f)) c = std::nextafterf (1.0f, 0.0f);
+    return c;
+}
+
+struct Segment { int baseband; bool dual; };   // a stretch of the stream processed with `dualRelease` as given
+
+struct Run
+{
+    std::vector<float> gr, peak;               // the class's taps, OVERSAMPLED
+    std::vector<float> out;                    // channel 0 of the output
+    double ceiling = 0.0;
+    int F = 0, look = 0;
+    bool ok = false;
+};
+
+// Streams `x` (mono) through a limiter in blocks of `block` baseband samples, `dualRelease` switched per segment.
+Run render (const std::vector<float>& x, double fs, double ceilingDb, double relMs, double slowMs,
+            const std::vector<Segment>& segs, int block)
+{
+    Run r;
+    limiter::TruePeakLimiter lim;
+    if (! lim.prepare (fs, block, 1, {})) return r;
+    r.F = lim.oversampleFactor(); r.look = lim.lookaheadSamples();
+    const int n = (int) x.size();
+    r.gr.assign ((std::size_t) n * (std::size_t) r.F, 0.0f); r.peak = r.gr; r.out = x;
+    int at = 0;
+    for (const Segment& sg : segs)
+    {
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = ceilingDb; p.releaseMs = relMs; p.slowReleaseMs = slowMs; p.dualRelease = sg.dual;
+        lim.setParams (p);
+        r.ceiling = lim.effectiveCeilingDbTp();
+        for (int done = 0; done < sg.baseband; )
+        {
+            const int m = std::min (block, sg.baseband - done);
+            float* io[1] { r.out.data() + at };
+            limiter::TruePeakLimiterTap tap;
+            tap.gainReductionDb = r.gr.data() + (std::size_t) at * (std::size_t) r.F;
+            tap.linkedPeakLin   = r.peak.data() + (std::size_t) at * (std::size_t) r.F;
+            tap.capacity        = m * r.F;
+            if (! lim.process (io, 1, m, tap)) return r;
+            at += m; done += m;
+        }
+    }
+    r.ok = at == n;
+    return r;
+}
+
+// The contract's gain law over the tap's peaks. `chunkOs` is where the class flushes: the ends of its process chunks.
+std::vector<float> reference (const Run& r, double fs, double relMs, double slowMs, const std::vector<Segment>& segs, int block)
+{
+    const std::size_t n = r.peak.size();
+    const std::vector<float> smax = windowMax (r.peak, r.look * r.F + 1);
+    std::vector<float> raw (n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        double v = r.ceiling - core::gainToDb ((double) smax[i]);
+        if (v > 0.0) v = 0.0;
+        raw[i] = (float) v;
+    }
+    const int W = limiter::TruePeakLimiter::slowWindowSamplesFor (fs, r.F);
+    const std::vector<float> held = windowMax (raw, W);
+    const float cF = coefFor (relMs, fs, r.F), cS = coefFor (slowMs, fs, r.F);
+    std::vector<float> gr (n);
+    float grF = 0.0f, grS = 0.0f;
+    bool on = false;
+    std::size_t onAt = 0, i = 0;
+    for (const Segment& sg : segs)
+    {
+        if (sg.dual && ! on) { grS = 0.0f; onAt = i; }
+        else if (! sg.dual && on) grF = std::min (grF, grS);
+        on = sg.dual;
+        for (int done = 0; done < sg.baseband; )
+        {
+            const int m = std::min (block, sg.baseband - done);
+            for (std::size_t k = 0; k < (std::size_t) m * (std::size_t) r.F; ++k, ++i)
+            {
+                grF = std::min (raw[i], grF * cF);
+                float g = grF;
+                if (on)
+                {
+                    grS = std::min (i + 1 - onAt >= (std::size_t) W ? held[i] : 0.0f, grS * cS);
+                    g = std::min (grF, grS);
+                }
+                gr[i] = g;
+            }
+            core::flushPoison (grF);
+            core::flushPoison (grS);
+            done += m;
+        }
+    }
+    return gr;
+}
+
+std::size_t differ (const std::vector<float>& a, const std::vector<float>& b)
+{
+    std::size_t d = a.size() == b.size() ? 0u : 1u + std::max (a.size(), b.size());
+    for (std::size_t i = 0; i < std::min (a.size(), b.size()); ++i) if (std::memcmp (&a[i], &b[i], sizeof (float)) != 0) ++d;
+    return d;
+}
+
+// A 1 kHz tone at 48 kHz holds a crest in every millisecond of lookahead, so its required reduction does not return to
+// 0 dB while it sounds: the one fixture on which the slow envelope's window fills.
+void tone (std::vector<float>& x, double fs, double from, double seconds, double amp)
+{
+    const int a = (int) std::lround (from * fs), b = (int) std::lround ((from + seconds) * fs);
+    for (int i = a; i < b && i < (int) x.size(); ++i)
+        x[(std::size_t) i] = (float) (amp * std::sin (2.0 * core::kPi * 1000.0 * (double) i / fs));
+}
+}   // namespace dual
 
 int main()
 {
@@ -290,6 +423,162 @@ int main()
             }
         test::ok (kaiserBytes != cascadeBytes, "and the two budgets really are different topologies ("
                                                + std::to_string (kaiserBytes) + " vs " + std::to_string (cascadeBytes) + " B)");
+    }
+
+    // M2 — THE DUAL RELEASE. The reference above, bit for bit, over tone stretches of 20, 45, 60, 200 and 500 ms at two
+    // depths, silence between, dense noise, switches on and off mid-stream, and blocks of 1, 7, 480 and 4096 samples.
+    test::group ("dual release: the gain law nulls against an offline reference, switches and chunk ends included");
+    {
+        const int n = (int) (sr * 3.0);
+        std::vector<float> x ((std::size_t) n, 0.0f);
+        dual::tone (x, sr, 0.05, 0.020, 0.9);
+        dual::tone (x, sr, 0.20, 0.045, 0.9);
+        dual::tone (x, sr, 0.40, 0.060, 0.9);
+        dual::tone (x, sr, 0.60, 0.200, 0.9);
+        dual::tone (x, sr, 0.80, 0.500, 0.6);
+        unsigned long long seed = 7;
+        for (int i = (int) (1.6 * sr); i < (int) (2.2 * sr); ++i)
+        {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            x[(std::size_t) i] = 0.9f * ((float) ((seed >> 40) & 0xffff) / 32768.0f - 1.0f);
+        }
+        dual::tone (x, sr, 2.3, 0.4, 0.9);
+        const std::vector<dual::Segment> schedules[] {
+            { { n, true } },
+            { { (int) (0.70 * sr), true }, { (int) (0.90 * sr), false }, { n - (int) (1.60 * sr), true } },
+            { { (int) (0.32 * sr), false }, { (int) (0.61 * sr), true }, { n - (int) (0.93 * sr), false } },
+            // switched on 30 ms before a held tone ends, twice: the window counts from the switch
+            { { (int) (1.27 * sr), false }, { (int) (0.90 * sr), true }, { (int) (0.50 * sr), false }, { n - (int) (2.67 * sr), true } },
+        };
+        std::size_t worst = 0;
+        bool allRan = true, slowWorked = false;
+        for (std::size_t si = 0; si < std::size (schedules); ++si)
+            for (int block : { 1, 7, 480, 4096 })
+            {
+                const dual::Run r = dual::render (x, sr, -6.0, 20.0, 180.0, schedules[si], block);
+                allRan = allRan && r.ok;
+                if (! r.ok) continue;
+                worst = std::max (worst, dual::differ (r.gr, dual::reference (r, sr, 20.0, 180.0, schedules[si], block)));
+                if (si == 0 && block == 4096)
+                {
+                    const dual::Run single = dual::render (x, sr, -6.0, 20.0, 180.0, { { n, false } }, block);
+                    slowWorked = single.ok && dual::differ (single.out, r.out) > 0;
+                }
+            }
+        test::ok (allRan, "PRECONDITION: every schedule rendered at every block size");
+        test::ok (slowWorked, "PRECONDITION: the slow envelope changes the output of this fixture");
+        test::ok (worst == 0, "the gain-reduction tap is the reference's, bit for bit, on 4 schedules x 4 block sizes ("
+                              + std::to_string (worst) + " samples differ at worst)");
+    }
+
+    // KNOWN ANSWERS. After the tone stops, the required reduction is 0 dB and the applied one decays by exactly one
+    // coefficient per oversampled sample: the slow one after a stretch longer than the window, the fast one after a
+    // shorter stretch — the window counted in the reduction REQUIRED, not in the tone, and from the switch that turned
+    // the dual release on: switched on 30 ms before a 200 ms tone ends, the fast one.
+    test::group ("dual release: after a held reduction the slow release, after a short one the fast release");
+    {
+        const double C = -6.0, fast = 20.0, slow = 180.0;
+        const int F = 4;
+        const float cF = dual::coefFor (fast, sr, F), cS = dual::coefFor (slow, sr, F);
+        const int W = limiter::TruePeakLimiter::slowWindowSamplesFor (sr, F);
+        test::ok (W == 2400 * F, "the window is 50 ms at 48 kHz: 2400 baseband samples x 4 = 9600 oversampled");
+        struct Case { double seconds, onAt; };
+        for (const Case cs : { Case { 0.200, 0.0 }, Case { 0.030, 0.0 }, Case { 0.200, 0.170 } })
+        {
+            const double seconds = cs.seconds;
+            const int n = (int) (sr * (seconds + 0.5)), on = (int) (sr * cs.onAt);
+            std::vector<float> x ((std::size_t) n, 0.0f);
+            dual::tone (x, sr, 0.0, seconds, 0.9);
+            const dual::Run r = on > 0 ? dual::render (x, sr, C, fast, slow, { { on, false }, { n - on, true } }, 512)
+                                       : dual::render (x, sr, C, fast, slow, { { n, true } }, 512);
+            if (! test::run (r.ok)) continue;
+            // the last oversampled sample whose required reduction is below 0 dB, recomputed from the peaks
+            const std::vector<float> smax = dual::windowMax (r.peak, r.look * F + 1);
+            std::size_t last = 0, run = 0, longest = 0;
+            for (std::size_t i = 0; i < smax.size(); ++i)
+            {
+                const bool reducing = r.ceiling - core::gainToDb ((double) smax[i]) < 0.0;
+                if (reducing) { last = i; ++run; longest = std::max (longest, run); } else run = 0;
+            }
+            const std::size_t t1 = last + 1 + 480, t2 = t1 + 1920;           // 2.5 ms and 12.5 ms into the release
+            const double ratio = (double) r.gr[t2] / (double) r.gr[t1];
+            const bool held = longest >= (std::size_t) W && cs.onAt == 0.0;
+            const double want = std::pow ((double) (held ? cS : cF), (double) (t2 - t1));
+            const double other = std::pow ((double) (held ? cF : cS), (double) (t2 - t1));
+            const std::string at = std::to_string ((int) (seconds * 1000.0)) + " ms of tone"
+                                 + (cs.onAt > 0.0 ? ", dual release on 30 ms before its end" : "") + ": the reduction held for "
+                                 + std::to_string ((double) longest / (sr * F) * 1000.0) + " ms";
+            test::ok ((longest >= (std::size_t) W) == (seconds > 0.1), "PRECONDITION: " + at);
+            test::ok (r.gr[t1] < -0.5f, "PRECONDITION: the release starts deep (" + std::to_string (r.gr[t1]) + " dB)");
+            std::printf ("      %s: ratio %.9f, slow^n %.9f, fast^n %.9f\n", at.c_str(), ratio, (double) std::pow ((double) cS, (double) (t2 - t1)),
+                         (double) std::pow ((double) cF, (double) (t2 - t1)));
+            test::ok (std::fabs (ratio / want - 1.0) < 1.0e-4 && std::fabs (ratio / other - 1.0) > 1.0e-2,
+                      at + " — over 1920 oversampled samples the reduction falls by " + std::to_string (ratio) + ", the "
+                      + (held ? "slow" : "fast") + " coefficient's " + std::to_string (want) + ", not the other's " + std::to_string (other));
+        }
+    }
+
+    // THE DEFAULT IS THE SINGLE RELEASE, whatever the slow release holds; and the getters.
+    test::group ("dual release: off is the single release whatever slowReleaseMs holds; the readbacks");
+    {
+        const int n = (int) (sr * 1.0);
+        std::vector<float> x ((std::size_t) n, 0.0f);
+        dual::tone (x, sr, 0.1, 0.4, 0.9);
+        const dual::Run a = dual::render (x, sr, -6.0, 20.0, 180.0, { { n, false } }, 1024);
+        const dual::Run b = dual::render (x, sr, -6.0, 20.0, 3.0,   { { n, false } }, 1024);
+        test::ok (a.ok && b.ok && dual::differ (a.out, b.out) == 0 && dual::differ (a.gr, b.gr) == 0,
+                  "with dualRelease off, a slow release of 180 ms and of 3 ms render the same bits");
+        test::ok (limiter::TruePeakLimiterParams {}.dualRelease == false, "dualRelease is off by default");
+
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, 64, 1, {});
+        limiter::TruePeakLimiterParams p;
+        lim.setParams (p);
+        test::ok (lim.effectiveSlowReleaseMs() == 0.0, "off: effectiveSlowReleaseMs() is 0");
+        p.dualRelease = true; p.slowReleaseMs = 180.0; lim.setParams (p);
+        test::ok (std::fabs (lim.effectiveSlowReleaseMs() - 180.0) < 0.5, "on: the slow release it runs, ~180 ms ("
+                  + std::to_string (lim.effectiveSlowReleaseMs()) + ")");
+        p.slowReleaseMs = 0.0; lim.setParams (p);
+        test::approx (lim.effectiveSlowReleaseMs(), 8.0 / sr * 1000.0, 1.0e-3, "on: floored at 8 baseband samples, like the fast release");
+        p.slowReleaseMs = std::numeric_limits<double>::quiet_NaN(); lim.setParams (p);
+        test::ok (std::fabs (lim.effectiveSlowReleaseMs() - 200.0) < 0.5, "a NaN slow release falls back to the default 200 ms ("
+                  + std::to_string (lim.effectiveSlowReleaseMs()) + ")");
+
+        limiter::TruePeakLimiter::Storage st;
+        const bool okSt = limiter::TruePeakLimiter::storageFor (96000.0, 64, 2, { 1.0, 8, 64 }, st);
+        test::ok (okSt && st.slowWindow.entries == (std::size_t) limiter::TruePeakLimiter::slowWindowSamplesFor (96000.0, 8)
+                  && st.slowWindow.entries == 4800u * 8u, "the budget holds the window: 50 ms at 96 kHz x 8 = 38 400 entries");
+    }
+
+    // RT: switching the dual release on and off and processing with it allocates nothing.
+    test::group ("dual release: no allocation in process() or setParams(), and the slow state flushes to exact zero");
+    {
+        const int n = 512;
+        std::vector<float> a ((std::size_t) n), b ((std::size_t) n);
+        for (int i = 0; i < n; ++i) a[(std::size_t) i] = b[(std::size_t) i] = (float) (0.9 * std::sin (2.0 * core::kPi * 1000.0 * i / sr));
+        float* ch[2] { a.data(), b.data() };
+        limiter::TruePeakLimiter lim; (void) lim.prepare (sr, n, 2, {});
+        limiter::TruePeakLimiterParams p; p.ceilingDbTp = -6.0; p.dualRelease = true;
+        const long long before = alloc::count.load();
+        lim.setParams (p);
+        for (int k = 0; k < 40; ++k) felitronics::test::run (lim.process (ch, 2, n));
+        p.dualRelease = false; lim.setParams (p);
+        felitronics::test::run (lim.process (ch, 2, n));
+        p.dualRelease = true; lim.setParams (p);
+        felitronics::test::run (lim.process (ch, 2, n));
+        test::okNoAlloc (alloc::count.load() == before, "zero heap allocations across switches and blocks");
+
+        // A reduction held long enough for the slow envelope, then 8 s of silence: the slow state decays past the flush
+        // floor and reads exactly 0 — without the flush it would still be a few 1e-17 dB.
+        for (int k = 0; k < 40; ++k)
+        {
+            for (int i = 0; i < n; ++i) a[(std::size_t) i] = b[(std::size_t) i] = (float) (0.9 * std::sin (2.0 * core::kPi * 1000.0 * (k * n + i) / sr));
+            felitronics::test::run (lim.process (ch, 2, n));
+        }
+        const double deep = lim.gainReductionDb();
+        std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
+        for (int k = 0; k < (int) (8.0 * sr) / n; ++k) felitronics::test::run (lim.process (ch, 2, n));
+        test::ok (deep < -3.0 && lim.gainReductionDb() == 0.0, "after the held reduction (" + std::to_string (deep)
+                  + " dB) and 8 s of silence the applied reduction is exactly 0 (" + std::to_string (lim.gainReductionDb()) + ")");
     }
 
     return test::report();

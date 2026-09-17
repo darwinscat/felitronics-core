@@ -100,6 +100,8 @@ const STRUCTS = {
         ['bypassEq', 'i32'], ['bypassMonoBass', 'i32'], ['bypassCompressor', 'i32'],
         ['bypassClipper', 'i32'], ['bypassLimiter', 'i32'], ['bypassDither', 'i32'],
         ['compressorMix', 'f64'],                               // v3
+        ['limiterDualRelease', 'i32'], ['_pad0', 'i32'],        // v6 — the padding named (VERSIONING rule 4)
+        ['limiterSlowReleaseMs', 'f64'],                        // v6
     ],
 
     fc_master_resolved: [
@@ -110,6 +112,7 @@ const STRUCTS = {
         ['limiterCeilingDbTp', 'f64'], ['limiterReleaseMs', 'f64'],
         ['monoBass', 'fc_mono_bass'], ['tapOversampleFactor', 'i32'],
         ['compressorMix', 'f64'],                               // v3
+        ['limiterSlowReleaseMs', 'f64'],                        // v6
     ],
 
     fc_master_stats: [
@@ -132,6 +135,7 @@ const STRUCTS = {
         ['limiterGr', 'fc_gr_limit'], ['compressorGr', 'fc_gr_limit'],
         ['minPlrDb', 'f64'], ['maxLraLossLu', 'f64'], ['inputLoudnessRangeLu', 'f64'],
         ['activityThresholdDb', 'f64'], ['maxPasses', 'i32'], ['initialGainDb', 'f64'],
+        ['grTraceBuckets', 'i32'], ['_pad0', 'i32'],            // v6 — the padding named (VERSIONING rule 4)
     ],
 
     fc_solve_pass: [
@@ -160,6 +164,11 @@ const STRUCTS = {
     // v4 — one bucket of `_fc_solution_gr_trace`, header-less (read with a stride of its size, like fc_solve_pass).
     fc_gr_trace_bucket: [
         ['maxDb', 'f64'], ['meanDb', 'f64'], ['samples', 'u32'], ['nonFinite', 'u32'],
+    ],
+
+    // v6 — one bucket of `_fc_solution_gr_trace64`, the core's 64-bit counts; header-less, like fc_gr_trace_bucket.
+    fc_gr_trace_bucket64: [
+        ['maxDb', 'f64'], ['meanDb', 'f64'], ['samples', 'u64'], ['nonFinite', 'u64'],
     ],
 
     fc_progress: [
@@ -327,7 +336,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 5;
+export const FC_MASTER_ABI_VERSION = 6;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
