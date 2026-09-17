@@ -966,14 +966,15 @@ void planes (float* base, std::uint32_t stride, int nch, float** out) noexcept
 static_assert ((int) ProgressStage::Convert       == FC_PROGRESS_CONVERT
                && (int) ProgressStage::LoudnessRange == FC_PROGRESS_LRA
                && (int) ProgressStage::SearchPass    == FC_PROGRESS_PASS
-               && (int) ProgressStage::FinalRender   == FC_PROGRESS_FINAL);
+               && (int) ProgressStage::FinalRender   == FC_PROGRESS_FINAL
+               && (int) ProgressStage::Render        == FC_PROGRESS_RENDER);
 
 #if defined(__EMSCRIPTEN__)
 EM_JS (int, fc_js_progress, (int stage, int pass, int maxPasses, double fraction, int hasRecord,
                              double gainDb, double ceilingDb, double integratedLufs, double truePeakDbTp,
                              double plrDb, double limiterMaxGrDb, double loudnessRangeLu, int violated), {
     if (typeof Module["onProgress"] !== "function") return 1;
-    const msg = { stage: ["convert", "lra", "pass", "final"][stage], pass: pass, maxPasses: maxPasses,
+    const msg = { stage: ["convert", "lra", "pass", "final", "render"][stage], pass: pass, maxPasses: maxPasses,
                   fraction: fraction };
     if (hasRecord)
         msg.record = { gainDb: gainDb, ceilingDb: ceilingDb, integratedLufs: integratedLufs,
@@ -1761,8 +1762,11 @@ FC_EXPORT fc_status fc_master_render_delivered (fc_master h, const float* in, st
         ip[c] = in  + (std::size_t) c * (std::size_t) inFrames;
         op[c] = out + (std::size_t) c * (std::size_t) outFrames;
     }
-    if (! m.delivered.render (m.chain, m.renderer, ip, nch, (long long) inFrames, op, (long long) outFrames))
-        return FC_ERR_REFUSED_BY_CORE;
+    ProgressState progress;
+    const bool rendered = m.delivered.render (m.chain, m.renderer, ip, nch, (long long) inFrames,
+                                              op, (long long) outFrames, progressFor (m, progress));
+    if (progress.stopped) return FC_ERR_CANCELLED;
+    if (! rendered) return FC_ERR_REFUSED_BY_CORE;
     return FC_OK;
 }
 

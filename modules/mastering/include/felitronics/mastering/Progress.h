@@ -15,7 +15,8 @@ enum class ProgressStage
     Convert       = 0,
     LoudnessRange = 1,
     SearchPass    = 2,
-    FinalRender   = 3
+    FinalRender   = 3,
+    Render        = 4
 };
 
 struct ProgressEvent

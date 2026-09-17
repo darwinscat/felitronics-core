@@ -140,6 +140,16 @@ public:
                                const float* const* in, int numChannels, long long inFrames,
                                float* const* out, long long outFrames) noexcept
     {
+        return render (chain, renderer, in, numChannels, inFrames, out, outFrames, ProgressCallback {});
+    }
+
+    // As above, reporting through `progress`: `ProgressStage::Convert` over the conversion, then
+    // `ProgressStage::Render` over the render, each pass/maxPasses 0 and its own 0..1 fraction. A stopped
+    // callback ends the call at the point it stopped and returns false; nothing is rolled back.
+    [[nodiscard]] bool render (MasteringChain& chain, OfflineRenderer& renderer,
+                               const float* const* in, int numChannels, long long inFrames,
+                               float* const* out, long long outFrames, const ProgressCallback& progress) noexcept
+    {
         if (! admits (chain, numChannels, inFrames, outFrames)) return false;
         if (renderer.blockSize() < 1 || numChannels > renderer.maxChannels()) return false;
         // THE RULE AT EVERY LENGTH, AN EMPTY PROGRAMME INCLUDED. It used to be skipped at `outFrames == 0`, and the
@@ -147,11 +157,15 @@ public:
         // At two zero lengths the rule judges nothing but null — no span has a byte to overlap with — so an empty
         // programme in real tables is rendered as before, and one without tables is refused.
         if (! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
-        if (! conv_.convert (in, numChannels, inFrames, out, outFrames)) return false;
+        ProgressClock clock (progress);
+        if (! conv_.convert (in, numChannels, inFrames, out, outFrames, clock)) return false;
         nonFinite_ = conv_.nonFiniteInputSamples();
         const float* ro[core::kMaxChannels] {};
         for (int c = 0; c < numChannels; ++c) ro[c] = out[c];
-        return renderer.render (chain, ro, out, numChannels, (int) outFrames);
+        if (! clock.begin (ProgressStage::Render, 0, 0, outFrames + chain.latencySamples(), outFrames)) return false;
+        MasteringChainTaps none;
+        if (! renderer.render (chain, ro, out, numChannels, (int) outFrames, none, NullTapSink {}, &clock)) return false;
+        return clock.finish();
     }
 
     // The loudness search over the delivered programme. Refusals of this class's own are the solver's verdict

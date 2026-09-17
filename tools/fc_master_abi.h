@@ -882,7 +882,8 @@ fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
 
 typedef enum fc_progress_stage
 {
-    FC_PROGRESS_CONVERT = 0, FC_PROGRESS_LRA = 1, FC_PROGRESS_PASS = 2, FC_PROGRESS_FINAL = 3
+    FC_PROGRESS_CONVERT = 0, FC_PROGRESS_LRA = 1, FC_PROGRESS_PASS = 2, FC_PROGRESS_FINAL = 3,
+    FC_PROGRESS_RENDER = 4
 } fc_progress_stage;
 
 typedef struct fc_progress

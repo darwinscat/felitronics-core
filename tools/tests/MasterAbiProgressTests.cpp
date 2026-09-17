@@ -280,6 +280,78 @@ static void testDelivered()
     (void) fc_master_destroy (h); (void) fc_master_destroy (g);
 }
 
+static void testRenderDelivered()
+{
+    group ("fc_master_render_delivered 48 -> 44.1 kHz: CONVERT then RENDER, a stop, the same bits");
+    const auto audio = programme (kFs, kFrames);
+
+    const fc_master plainH = makeHandle (44100.0);
+    uint32_t d = 0;
+    ok (plainH != 0u && fc_master_delivered_frames (plainH, kFrames, &d) == FC_OK, "PRECONDITION: a delivering handle");
+    std::vector<float> plainOut ((std::size_t) d * kNch);
+    ok (fc_master_render_delivered (plainH, audio.data(), kFrames, plainOut.data(), d) == FC_OK,
+        "PRECONDITION: rendered with no callback");
+
+    const fc_master h = makeHandle (44100.0);
+    Recorder r;
+    (void) fc_master_set_progress (h, &Recorder::fn, &r);
+    std::vector<float> out ((std::size_t) d * kNch);
+    ok (fc_master_render_delivered (h, audio.data(), kFrames, out.data(), d) == FC_OK
+        && sameBytes (plainOut.data(), out.data(), out.size() * sizeof (float)),
+        "the same bits with a callback");
+
+    int latency = 0;
+    (void) fc_master_latency (h, &latency);
+    const double convUnits = (double) kFrames, convBound = kFrames / 100.0;
+    const double rendUnits = (double) d + latency, rendBound = d / 100.0;
+    int stages = 0, shape = 0, gaps = 0;
+    for (std::size_t i = 0; i < r.seen.size(); ++i)
+    {
+        const fc_progress& e = r.seen[i];
+        if (e.stage != FC_PROGRESS_CONVERT && e.stage != FC_PROGRESS_RENDER) ++shape;
+        if (e.pass != 0 || e.maxPasses != 0 || e.hasRecord != 0) ++shape;
+        if (e.fraction == 0.0)
+        {
+            ++stages;
+            if (i > 0 && r.seen[i - 1].fraction != 1.0) ++shape;
+        }
+        else
+        {
+            const fc_progress& p = r.seen[i - 1];
+            if (e.stage != p.stage || ! (e.fraction > p.fraction)) ++shape;
+            const double units = e.stage == FC_PROGRESS_CONVERT ? convUnits : rendUnits;
+            const double bound = e.stage == FC_PROGRESS_CONVERT ? convBound : rendBound;
+            if ((e.fraction - p.fraction) * units > bound * (1.0 + 1e-9)) ++gaps;
+        }
+    }
+    ok (stages == 2 && shape == 0 && ! r.seen.empty() && r.seen.front().stage == FC_PROGRESS_CONVERT
+        && r.seen.back().stage == FC_PROGRESS_RENDER && r.seen.back().fraction == 1.0,
+        "CONVERT then RENDER, each from exactly 0 to exactly 1 (" + std::to_string (r.seen.size()) + " events)");
+    ok (gaps == 0, "no two events of a stage more than 1 % of its programme apart");
+
+    std::size_t convertEvents = 0;
+    while (convertEvents < r.seen.size() && r.seen[convertEvents].stage == FC_PROGRESS_CONVERT) ++convertEvents;
+    ok (convertEvents > 0 && convertEvents < r.seen.size(), "PRECONDITION: both stages seen");
+
+    for (const long long at : { 0LL, (long long) convertEvents, (long long) r.seen.size() - 1 })
+    {
+        const fc_master g = makeHandle (44100.0);
+        Recorder s; s.stopAt = at;
+        (void) fc_master_set_progress (g, &Recorder::fn, &s);
+        std::vector<float> stopped ((std::size_t) d * kNch);
+        const fc_status st = fc_master_render_delivered (g, audio.data(), kFrames, stopped.data(), d);
+        const std::string where = "stop at event " + std::to_string (at);
+        ok (st == FC_ERR_CANCELLED && (long long) s.seen.size() == at + 1, where + ": FC_ERR_CANCELLED, nothing after");
+        (void) fc_master_set_progress (g, nullptr, nullptr);
+        std::vector<float> retry ((std::size_t) d * kNch);
+        ok (fc_master_render_delivered (g, audio.data(), kFrames, retry.data(), d) == FC_OK
+            && sameBytes (plainOut.data(), retry.data(), retry.size() * sizeof (float)),
+            where + ": the same handle then renders to the same bits");
+        (void) fc_master_destroy (g);
+    }
+    (void) fc_master_destroy (plainH); (void) fc_master_destroy (h);
+}
+
 int main()
 {
     std::printf ("fc_master — progress and cancellation through the C ABI\n");
@@ -288,5 +360,6 @@ int main()
     testStop();
     testRange();
     testDelivered();
+    testRenderDelivered();
     return felitronics::test::report();
 }
