@@ -960,7 +960,7 @@ int selftest (double fs, int nc)
     a.prm.compressorMix          = 0.73;
     a.prm.limiter.ceilingDbTp    = -1.3;
     a.prm.limiter.releaseMs      = 77.0;
-    // v6. On in the main set so that no render here maps them for free; section 1e is where the slow envelope works.
+    // v6
     a.prm.limiterDualRelease     = 1;
     a.prm.limiterSlowReleaseMs   = 173.7;
     a.req.grTraceBuckets         = 4099;
@@ -1090,11 +1090,8 @@ int selftest (double fs, int nc)
         }
     }
 
-    // --- 1e. THE DUAL RELEASE, on a programme where the slow envelope works (v6) ---------------------------
-    // The main programme never holds a reduction for the slow envelope's window, so there the two fields map for free.
-    // A 1 kHz tone — a crest in every millisecond of lookahead — at 400 ms loud and 200 ms quiet, driven hard: the
-    // reduction is held through each loud stretch and released through each quiet one. The fields must change this
-    // render (both preconditions), and a v5-stamped parameter set must not read them.
+    // --- 1e. THE DUAL RELEASE (v6), on a 1 kHz tone 400 ms loud and 200 ms quiet: mapped identically, changing the
+    // render, and not read from a v5-stamped parameter set.
     {
         std::vector<float> held (frames * (std::size_t) nc, 0.0f);
         for (int c = 0; c < nc; ++c)

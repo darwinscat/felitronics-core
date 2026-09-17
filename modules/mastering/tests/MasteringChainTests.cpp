@@ -369,8 +369,7 @@ static void testBlockInvariance()
         ok (a && b && bitEqual (refK, gotK), "bit-identical at internalBlock = " + std::to_string (K));
     }
 
-    // THE LIMITER'S DUAL RELEASE carries its two envelopes and its window across quanta. A 1 kHz tone held 300 ms, then
-    // the loud programme at -26 dB for 200 ms, driven 9 dB into the limiter, so the slow envelope binds on every release.
+    // The limiter's dual release, on a fixture where it changes the render.
     {
         Buf x = loudProgramme (nch, n);
         for (int i = 0; i < n; ++i)
@@ -1084,7 +1083,7 @@ static void testResolvedReadback()
     ok (r.latencySamples == r.internalBlock + r.compressorLookahead + r.clipperLatency + r.limiterLatency,
         "latency == internal quantum + the sum of the present stages' own reported latencies");
 
-    // The dual release on: the slow release the limiter runs, read out of it, the floor included.
+    // The dual release on: the limiter's own readback, the floor included.
     for (const double slowMs : { 180.0, 0.0 })
     {
         prm.limiter.dualRelease = true; prm.limiter.slowReleaseMs = slowMs;

@@ -192,8 +192,7 @@ struct MasteringChainResolved
     // The mix the compressor stage applies, after the clamp and the non-finite rule — and after the
     // narrowing to float, so a request of 1 - 1e-9 reads back as the 1 it became. 0 without a compressor.
     double compressorMix         = 0.0;
-    // The limiter's slow release, as `TruePeakLimiter::effectiveSlowReleaseMs()`: 0 without a limiter or while its
-    // `dualRelease` is off.
+    // `TruePeakLimiter::effectiveSlowReleaseMs()`; 0 without a limiter.
     double limiterSlowReleaseMs  = 0.0;
 };
 

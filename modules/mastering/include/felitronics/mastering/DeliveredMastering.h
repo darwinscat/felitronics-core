@@ -75,9 +75,8 @@ public:
     }
 
     // solve(): the converted programme, held for the whole call, plus the search's own PEAK at the delivered
-    // length (one pass and the request's `grTraceBuckets` traces — see `TargetLoudnessSolver::solveBytes`). 0 where
-    // the call converts nothing: an empty or unrepresentable programme, or a bucket count the solver refuses before
-    // any pass.
+    // length (one pass — see `TargetLoudnessSolver::solveBytes`). 0 where the call converts nothing: an empty or
+    // unrepresentable programme, which the solver refuses before any pass. `grTraceBuckets` as there.
     [[nodiscard]] static std::uint64_t solveBytes (double sourceRate, double deliveryRate, int numChannels,
                                                    long long inFrames, int grTraceBuckets) noexcept
     {

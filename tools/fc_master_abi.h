@@ -94,11 +94,8 @@ extern "C" {
 // bump made by it — `compressorMix` (P60), two rows in the size table and a field at the end of two structs. v4 is
 // the gain-reduction trace (P59b): one entry point, `fc_solution_gr_trace`, which rule 1 says moves the version on
 // its own, the header-less bucket it copies, and the trace's bucket counts and validity at the end of `fc_measurement`
-// — one row. v5 is `fc_master_set_progress`, an entry point and no row. v6 is M2, one bump for the release: the
-// limiter's dual release (two fields at the end of `fc_master_params`, the slow release it runs at the end of
-// `fc_master_resolved`), the trace's bucket count asked in the request (`grTraceBuckets` at the end of
-// `fc_loudness_request`), 64-bit bucket counts (`fc_gr_trace_bucket64`, copied by `fc_solution_gr_trace64`), and the
-// budget of a solve for a given request (`fc_master_need_solve`) — three rows and two entry points.
+// — one row. v6: the limiter's dual release (`fc_master_params`, `fc_master_resolved`), `grTraceBuckets`
+// (`fc_loudness_request`), `fc_solution_gr_trace64` and `fc_master_need_solve` — three rows, two entry points.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -487,13 +484,10 @@ typedef struct fc_master_params
     double compressorMix;
 
     // ---- v6 ----
-    // THE LIMITER'S DUAL RELEASE — `limiter::TruePeakLimiterParams::dualRelease` and `slowReleaseMs`, fields of the
-    // limiter that land here because `fc_limiter` is nested by value and frozen (rule 3). 0, the default, is the
-    // single release of `limiter.releaseMs`, bit for bit, whatever `limiterSlowReleaseMs` holds; any other value
-    // switches it on, `limiter.releaseMs` then being the fast envelope's. `limiterSlowReleaseMs` is floored by the core
-    // and read back through `fc_master_resolved::limiterSlowReleaseMs`; a non-finite one is FC_ERR_NON_FINITE.
+    // `limiter::TruePeakLimiterParams::dualRelease` (0 off, any other value on) and `slowReleaseMs` in ms; a non-finite
+    // `limiterSlowReleaseMs` is FC_ERR_NON_FINITE.
     int32_t limiterDualRelease;
-    int32_t _pad0;                  // named, always written 0 (rule 4)
+    int32_t _pad0;                  // written 0
     double  limiterSlowReleaseMs;
 } fc_master_params;
 
@@ -530,7 +524,7 @@ typedef struct fc_master_resolved
     double compressorMix;
 
     // ---- v6 ----
-    // The slow release the limiter runs, after the core's floor — 0 without a limiter or while the dual release is off.
+    // The limiter's slow release in ms after the core's floor; 0 without a limiter or with the dual release off.
     double limiterSlowReleaseMs;
 } fc_master_resolved;
 
@@ -591,10 +585,9 @@ typedef struct fc_need
     // What the core's own requests occupy AT ONCE during one such call. What bounds it differs by op, and
     // saying so is law 11d's own instruction ("what each number bounds is written where it is defined"):
     //
-    //   * SOLVE — one PASS and the solution's two gain-reduction traces. The search builds its meters per pass and
-    //     frees them at the pass's end; the traces are allocated by its first render and kept by the solution. Through
-    //     `fc_master_need` the traces are those of a request at the default 1000 buckets (`grTraceBuckets`, v6);
-    //     `fc_master_need_solve` budgets the request it is given.
+    //   * SOLVE — one PASS. The search builds its meters per pass and frees them at the pass's end, so
+    //     this is one pass. Plus the solution's two gain-reduction traces: at 1000 buckets through `fc_master_need`,
+    //     at the request's `grTraceBuckets` through `fc_master_need_solve`.
     //   * MEASURE_LRA — one meter, and 0 for a programme too short to have a range, which the call
     //     refuses before building one.
     //   * CREATE — the SUM of what the call requests, which is what it holds: everything a create asks
@@ -637,8 +630,7 @@ typedef struct fc_need
 //
 // A versioned C-POD request in, an OPAQUE HANDLE out, and the per-pass log copied into a buffer the
 // CALLER owns. `mastering::LoudnessSolution` holds C++ enums, `bool`, padding, a 32-entry log and, from v4, two
-// gain-reduction traces of up to 65 536 buckets each — most of which a caller never reads; the log and the traces are
-// copied out only on request.
+// gain-reduction traces — most of which a caller never reads; the log and the traces are copied out only on request.
 typedef struct fc_gr_limit
 {
     double  limitDb;                // +infinity = no limit. NOT "any non-finite": -infinity is an
@@ -666,10 +658,9 @@ typedef struct fc_loudness_request
     double  initialGainDb;          // NaN = use the params' own
 
     // ---- v6 ----
-    // How many buckets each gain-reduction trace of the solution holds: min(grTraceBuckets, programme frames).
-    // 1..65536; the default 1000 is v4's trace, bit for bit. Anything else is the core's `InvalidRequest`, a verdict.
+    // Buckets per gain-reduction trace: min(grTraceBuckets, programme frames). 1..65536, else the core's InvalidRequest.
     int32_t grTraceBuckets;
-    int32_t _pad0;                  // named, always written 0 (rule 4)
+    int32_t _pad0;                  // written 0
 } fc_loudness_request;
 
 typedef struct fc_solve_pass
@@ -698,8 +689,7 @@ typedef struct fc_measurement
     int32_t loudnessValid, lraValid;
 
     // v4 — the gain-reduction traces of the same render, read with `fc_solution_gr_trace`: how many buckets each
-    // holds (min(grTraceBuckets, programme frames), grTraceBuckets 1000 before v6; 0 when the solve attempted no render)
-    // and whether it is a measurement
+    // holds (min(grTraceBuckets, programme frames); 0 when the solve attempted no render) and whether it is a measurement
     // (mastering::GainReductionTrace::valid — the render ran to its end, the window saw a sample, none non-finite).
     int32_t compressorGrTraceBuckets, limiterGrTraceBuckets;
     int32_t compressorGrTraceValid, limiterGrTraceValid;
@@ -715,14 +705,13 @@ typedef struct fc_gr_trace_bucket
     uint32_t nonFinite;             // ... of which non-finite, excluded from max and mean
 } fc_gr_trace_bucket;
 
-// One bucket of a gain-reduction trace with the core's 64-bit counts (v6) — mastering::GainReductionTraceBucket, field
-// for field. Header-less and frozen from v6, like `fc_gr_trace_bucket`; `fc_solution_gr_trace64` writes it.
+// v6 — `fc_gr_trace_bucket` with 64-bit counts: mastering::GainReductionTraceBucket, field for field. Header-less, frozen.
 typedef struct fc_gr_trace_bucket64
 {
     double   maxDb;                 // largest finite |GR| in the bucket, dB; 0 when it saw no finite sample
     double   meanDb;                // mean of its finite |GR|, dB; 0 when it saw none
-    uint64_t samples;               // tap samples in it — frames (compressor), frames x tapOversampleFactor (limiter)
-    uint64_t nonFinite;             // ... of which non-finite, excluded from max and mean
+    uint64_t samples;               // tap samples in it
+    uint64_t nonFinite;             // ... of which non-finite
 } fc_gr_trace_bucket64;
 
 typedef struct fc_solution_summary
@@ -902,12 +891,8 @@ fc_status fc_master_destroy (fc_master h);
 // the opposite case and behaves the opposite way.
 fc_status fc_master_need (fc_master h, int32_t op, uint32_t frames, fc_need* out);
 
-// v6 — FC_NEED_SOLVE for THIS request: the budget of `fc_master_solve`, or of `fc_master_solve_delivered` on a
-// delivering handle, whose traces hold `req->grTraceBuckets` buckets (FC_NEED_SOLVE through `fc_master_need` assumes the
-// default 1000). The same number, never a permission, as `fc_master_need`: a request the core would refuse is not
-// refused here, and a bucket count outside 1..65536 answers `callBytes` 0, the budget of a solve the core refuses
-// before any pass. Checks in the header's order: poison, the handle, `out`'s header, `req`'s header, then `frames`
-// (FC_ERR_RANGE past INT_MAX, or a delivered length past it). Reads the handle and moves nothing.
+// v6 — FC_NEED_SOLVE for `req`'s `grTraceBuckets` (`fc_master_need` budgets 1000); `callBytes` 0 for a count outside
+// 1..65536. Checks: poison, the handle, `out`'s header, `req`'s header, `frames` (FC_ERR_RANGE as `fc_master_need`).
 fc_status fc_master_need_solve (fc_master h, const fc_loudness_request* req, uint32_t frames, fc_need* out);
 
 // THE BUDGET OF A `fc_master_create` THAT HAS NOT HAPPENED — the one budget that cannot be asked through a
@@ -1062,16 +1047,15 @@ fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint
 // Checks in the header's order: poison, the handle, `written`, then — only when `cap > 0` — `out` (null, 8-byte
 // alignment, the span in the heap, and `written` NOT INSIDE that span: FC_ERR_SPAN), and then `stage`, a field value: a
 // code that names no stage is FC_ERR_ENUM, with `cap == 0` too. FC_OK with `written == 0` for a solution whose solve
-// attempted no render. THEN THE NARROWING of the buckets it would write: a `samples` or `nonFinite` count past 32 bits
-// is FC_ERR_RANGE, with nothing written — the core counts in 64 bits since v6, and `fc_solution_gr_trace64` copies them.
+// attempted no render. Then a `samples` or `nonFinite` count past 32 bits in the buckets it would write: FC_ERR_RANGE,
+// nothing written.
 //
 // `written` IS LEFT UNTOUCHED BY EVERY REFUSAL, as `fc_master_flush` and `fc_solution_log` leave it — the general rule
 // for a count out-parameter: until the alias check has run, `written` may point into the buckets, and zeroing it would
 // be a refusal that wrote into the caller's buffer. It is set to 0 once every refusal is behind the call, and to the
 // count on success.
 fc_status fc_solution_gr_trace (fc_solution s, int32_t stage, fc_gr_trace_bucket* out, uint32_t cap, uint32_t* written);
-// v6 — `fc_solution_gr_trace` with the core's 64-bit counts: the same checks in the same order, the same capacity rule
-// in BUCKETS, the same `written` rule, and no narrowing.
+// v6 — `fc_solution_gr_trace` into `fc_gr_trace_bucket64`, without the 32-bit check.
 fc_status fc_solution_gr_trace64 (fc_solution s, int32_t stage, fc_gr_trace_bucket64* out, uint32_t cap, uint32_t* written);
 fc_status fc_solution_destroy (fc_solution s);
 

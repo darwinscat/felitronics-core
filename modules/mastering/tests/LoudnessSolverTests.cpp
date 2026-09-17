@@ -588,9 +588,8 @@ HandTrace bucketByHand (const std::vector<double>& grPerFrame, int stride, int f
 void testTheTraceNullsAgainstAHandDrivenChain()
 {
     test::group ("P59b: the gain-reduction trace nulls against the chain driven by hand, bucketed another way");
-    // Three lengths at the default 1000 buckets: a length the bucket count does not divide, and a programme shorter
-    // than 1000 frames, which gets one bucket per frame. And the caller's own counts: 1 and 65536 over 240 000 frames,
-    // 777 over a length it does not divide, 65536 over 600 frames (one bucket per frame).
+    // Three lengths: 1000 buckets over a length the bucket count does not divide, and a programme shorter than
+    // 1000 frames, which gets one bucket per frame. And the request's counts 1, 777 and 65536.
     struct Case { double seconds; int buckets; };
     for (const Case cs : { Case { 5.0, 1000 }, Case { 1.00007, 1000 }, Case { 0.0125, 1000 },
                            Case { 5.0, 1 }, Case { 5.0, 65536 }, Case { 1.00007, 777 }, Case { 0.0125, 65536 } })
@@ -767,9 +766,7 @@ void testTheTraceBuilderCountsWhatNoAudioCanReach()
               "the 1-frame remainder lands in the LAST bucket (49 frames), the first holds floor(48001/1000) = 48");
 }
 
-// M2 — THE BUCKET COUNT IS THE REQUEST'S. Refused outside 1..65536 before anything is allocated, with a budget of 0; at the
-// two edges a render; the storage a solve allocates is its budget's trace term, to the byte; and the counts are 64 bits —
-// one bucket fed 2^32 + 5 samples, the case 32-bit counts wrapped to 5 while the trace still read valid.
+// grTraceBuckets: refused outside 1..65536 with nothing allocated; a solve's allocation at 1 and 65536; 64-bit counts.
 void testTheTraceBucketsAreTheRequests()
 {
     test::group ("M2: grTraceBuckets — refused outside 1..65536, budgeted to the byte, counted in 64 bits");
@@ -811,7 +808,7 @@ void testTheTraceBucketsAreTheRequests()
                   + std::to_string (got) + " B over " + std::to_string (sol.passes) + " passes)");
     }
 
-    // 2^32 + 5 samples into one bucket. With 32-bit counts: samples 5, the mean the sum over 5, and `valid` true.
+    // 2^32 + 5 samples into one bucket.
     {
         GainReductionTrace t;
         const std::uint64_t n = (1ULL << 32) + 5u;
@@ -825,7 +822,7 @@ void testTheTraceBucketsAreTheRequests()
                   "one bucket fed 2^32 + 5 samples of 1 dB counts " + std::to_string (t.bucket[0].samples) + " and means "
                   + std::to_string (t.bucket[0].meanDb) + " dB");
     }
-    // 65536 buckets over INT_MAX frames: each bucket's first and last frame land in it, by floor(k*F/B).
+    // 65536 buckets over INT_MAX frames: each bucket's first and last frame land in it.
     {
         GainReductionTrace t;
         const std::uint64_t F = (std::uint64_t) std::numeric_limits<int>::max(), B = 65536u;
@@ -1125,8 +1122,7 @@ void testBlockIndependence()
 {
     test::group ("the solve does not depend on the renderer's block size");
     Programme src = makeMusic (4.0, 0.3);
-    // The traces at a caller's bucket count, compared bit for bit. At -13 LUFS the compressor works and the limiter does
-    // not; at -6 LUFS the limiter works too.
+    // And the 4099-bucket traces; at -6 LUFS the limiter works.
     auto sameTrace = [] (const GainReductionTrace& a, const GainReductionTrace& b)
     {
         bool same = a.buckets == b.buckets && a.buckets == 4099 && a.valid == b.valid;
@@ -1246,10 +1242,7 @@ void testTheScaleLawIsPinned()
 }
 
 // =============================================================================================
-// M2 — THE SAME GRID UNDER THE LIMITER'S DUAL RELEASE. Both envelopes read only the required reduction, so the gain trace
-// is still a function of the drive alone. The slow envelope binds where a reduction held for its whole window is followed
-// by less than the fast envelope keeps: so the music fixture at a lower level, under a 1 kHz tone held 300 ms and
-// silent 200 ms — and the grid's renders with the dual release off, to show it binds at every point.
+// The scale law on the same 3x3 grid under the limiter's dual release, on a fixture where it changes every render.
 void testTheScaleLawHoldsUnderTheDualRelease()
 {
     test::group ("M2: y(g,c) == 10^(c/20) * y(g-c, 0) under the dual release, on the same 3x3 grid");
@@ -1300,11 +1293,8 @@ void testTheScaleLawHoldsUnderTheDualRelease()
     std::printf ("      scale law, dual release: worst |y(g,c) - 10^(c/20) y(d,0)| = %.3e at peak %.3f\n", worst, worstPeak);
 }
 
-// M2 — THE REDUCTION IS MONOTONE IN DRIVE UNDER THE DUAL RELEASE, pointwise: the limiter's gain-reduction tap over a drive
-// sweep never gives back reduction as the drive rises. Read through the chain's own tap, on a programme with bass, a held
-// tone whose level crosses the ceiling within the sweep, dense noise and transients. And the three statistics the
-// search's drive bound reads (mean, p95, max) with it. The tone and the bass are held 300 ms and the bass drops to a
-// third for 200 ms, so the slow envelope binds on each release in the upper part of the sweep.
+// Under the dual release the limiter's gain-reduction tap never gives back reduction as the drive rises, sample by
+// sample, and neither do its mean, p95 and max.
 void testTheReductionIsMonotoneInDriveUnderTheDualRelease()
 {
     test::group ("M2: under the dual release the limiter's reduction is monotone in drive, sample by sample");
@@ -3644,7 +3634,7 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 0, 48000, kB) == 0 && TargetLoudnessSolver::solveBytes (48000.0, -1, 48000, kB) == 0
               && TargetLoudnessSolver::solveBytes (48000.0, past, 48000, kB) == 0,
               "solveBytes: 0 for a channel count solve() refuses");
-    // The two traces: 1000 buckets of {double, double, uint64, uint64} = 32 B each, 2 x 32 000 = 64 000 B.
+    // Two traces of 1000 x 32 B.
     test::ok (sizeof (GainReductionTraceBucket) == 32u, "a trace bucket is 32 B");
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB) == 2672u + 21008u + 64000u,
               "and 87 680 B for 1 s of stereo at the default 1000 buckets (the ABI suite's oracle)");

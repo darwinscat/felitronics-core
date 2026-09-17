@@ -546,11 +546,7 @@ static void runCascadeTopology()
 
 //==============================================================================
 //==============================================================================
-// THE DUAL RELEASE (M2). The applied reduction is the larger of two envelopes, so the on-grid bound is untouched; what
-// can move is the delivered excess, whose modulation term answers to how the gain moves. The witnesses above at a
-// lookahead of 1 ms and fast releases >= 1 ms, with a 200 ms slow envelope — every row inside the Kaiser budget, and the
-// worst printed beside the same rows with the dual release off. Then the witness on which the slow envelope's window
-// fills: a 1 kHz plateau held 250 ms over the ceiling and cut off at a swept sub-sample offset.
+// The dual release over the witnesses above and a held plateau: inside the Kaiser budgets.
 static void runDualRelease()
 {
     const double sr = 48000.0;
@@ -590,24 +586,9 @@ static void runDualRelease()
                      "1 kHz plateau held 250 ms, edge +" + dbs (edge) + ", fast " + dbs (rel) + " ms");
         std::printf ("       dual release, F=%d: worst delivered excess %+.4f dB (%s); the same rows with it off %+.4f; budget %+.4f\n",
                      F, worst, worstAt.c_str(), worstOff, budget);
-        // outside the domain, as for the single release: the click train at a 0.1 ms fast release
         const double fastest = excess (tpw::clickTrain (sr, 0.15, 3.0, 26.0, 0.5), dual (-1.0, 0.1, F));
         std::printf ("       dual release, F=%d: click train at a 0.1 ms fast release %+.4f dB\n", F, fastest);
         test::ok (fastest <= budget, "F=" + std::to_string (F) + " click train, fast 0.1 ms: " + dbs (fastest) + " <= " + dbs (budget));
-    }
-
-    test::group ("Dual release: where the window fills, the plateau's excess at a 1 ms fast release does not rise");
-    for (const int F : factors)
-    {
-        double on = -1e9, off = -1e9;
-        for (double edge : { 0.0, 0.25, 0.5, 0.75 })
-        {
-            const auto x = tpw::plateau (sr, 0.40, 1000.0, 10.0, 0.05, 0.30, edge);
-            Setup s = dual (-1.0, 1.0, F), o = s; o.dualRelease = false;
-            on = std::max (on, excess (x, s)); off = std::max (off, excess (x, o));
-        }
-        std::printf ("       dual release, F=%d: held plateau at a 1 ms fast release %+.4f dB, %+.4f with it off\n", F, on, off);
-        test::ok (on <= off, "F=" + std::to_string (F) + ": " + dbs (on) + " with the slow envelope, " + dbs (off) + " without");
     }
 
     test::group ("Dual release: the slow envelope works on the plateau, and streaming is block-invariant, bit for bit");

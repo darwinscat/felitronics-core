@@ -1407,8 +1407,8 @@ int main()
         // true-peak meter (P62) is, per channel, one 4x / 32-tap PolyphaseOversampler — prototype 128, phase-major copy
         // 4·32, up ring 2·32, down ring 2·128 floats = 2304 B, plus two int cursors = 2312 B — and one shared scratch of
         // 1024·4 floats = 16 384 B: 2·2312 + 16 384 = 21 008 B. It drains from a fixed array, so there is no drain term
-        // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer). And the solution's two gain-reduction
-        // traces (v6), 1000 buckets of {double, double, uint64, uint64} each: 2·1000·32 = 64 000 B.
+        // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer).
+        // And two traces of 1000 x 32 B: 64 000 B.
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
         ok (solve.callBytes == 2936u + 21008u + 64000u, "the solve budget is meter + reference true-peak meter + two traces = 87 944 B");
 
@@ -1459,8 +1459,7 @@ int main()
         req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
         fc_solution sol = 0;
         // THE SOLUTION RECORD IS A PLAIN OBJECT, told to the counter so that MSVC's container padding is never taken off
-        // it (as for the instance record above). From v4 to v5 it held the traces and was 50 384 B, over the big-block
-        // threshold; since v6 the traces are on the heap and counted as the containers they are.
+        // it (as for the instance record above).
         alloc::plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);
         before = alloc::bytes.load();
         const fc_status sv = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
@@ -2113,9 +2112,7 @@ int main()
         (void) fc_solution_destroy (sol);
         ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, again.data(), 1000u, &w) == FC_ERR_HANDLE, "a destroyed solution is stale");
 
-        // THE PRICE, PINNED (rule 9ф: the literal carries its derivation). A solution record is `LoudnessSolution` by value:
-        // 2336 B and its two traces, and since v6 a trace's buckets are on the heap and in `callBytes`, so a trace in the
-        // record is its count, flag and two uint64 totals (24 B) and a vector — the same size at any bucket count.
+        // THE PRICE, PINNED: a solution record is 2336 B and two `GainReductionTrace`s, their buckets not included.
         {
             using felitronics::mastering::GainReductionTrace;
             fc_master hb = make();
@@ -2141,8 +2138,7 @@ int main()
     }
 
     //==========================================================================
-    // v6 — M2. The dual release crosses like every other value; the trace's bucket count is the request's; its 64-bit counts
-    // have an entry point of their own; and a solve for a given request has a budget of its own, to the byte.
+    // v6
     group ("v6: the dual release, grTraceBuckets, fc_solution_gr_trace64 and fc_master_need_solve");
     {
         using namespace felitronics::mastering;
@@ -2172,7 +2168,7 @@ int main()
             };
             p.limiterDualRelease = 1; p.limiterSlowReleaseMs = 180.0;
             const double want180 = directSlow (180.0);
-            // Not 180 exactly: the coefficient is a float, and the release it runs is read back from it.
+            // The effective release, read back from a float coefficient.
             ok (fc_master_configure (h, &p, &r) == FC_OK && r.limiterSlowReleaseMs == want180 && std::fabs (want180 - 180.0) < 0.5,
                 "on, the slow release the core runs, read out of it (180 ms asked, " + std::to_string (r.limiterSlowReleaseMs) + " read)");
             p.limiterDualRelease = -7;
@@ -2209,8 +2205,7 @@ int main()
             (void) fc_master_destroy (h);
         }
 
-        // THE TRACE'S BUCKET COUNT, against the core: 4096 buckets over 3 s, both stages working, every bucket bit for bit
-        // through both copiers — and the 64-bit one's checks in the header's order.
+        // 4096 buckets through both copiers against the core, and the 64-bit copier's checks.
         {
             const std::size_t frames = (std::size_t) (kFs * 3.0);
             auto in = tone (frames, kNch);
@@ -2284,7 +2279,7 @@ int main()
             ok (fc_solution_gr_trace64 (h, FC_GR_STAGE_LIMITER, b64.data(), 4u, &w) == FC_ERR_HANDLE, "a chain handle is not a solution");
             (void) fc_solution_destroy (sol);
 
-            // A v5 request: the count past its 120 bytes is not read — 1000 buckets. The same bytes under v6 are.
+            // A v5 request: the count past its 120 bytes is not read.
             fc_master_params pc {}; FC_INIT (pc); (void) fc_master_params_defaults (&pc);
             fc_master_resolved rr {}; FC_INIT (rr);
             fc_loudness_request q5 = req; q5.header.abiVersion = 5u; q5.header.structSize = 120u;
@@ -2312,8 +2307,8 @@ int main()
             (void) fc_master_destroy (h);
         }
 
-        // THE BUDGET OF A SOLVE FOR A REQUEST: FC_NEED_SOLVE's at the default, the traces' difference at another count, 0 for a
-        // count the core refuses, the header's checks — and the allocation of a 65 536-bucket solve, to the byte.
+        // fc_master_need_solve: FC_NEED_SOLVE's at 1000, the traces' difference at 65536, 0 for a refused count, the checks,
+        // and a 65 536-bucket solve's allocation.
         {
             fc_master h = make();
             const std::uint32_t n = 192000u;

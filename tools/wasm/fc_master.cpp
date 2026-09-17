@@ -128,8 +128,8 @@ static_assert (sizeof (saturation::Saturator::Params)  == 28);
 static_assert (sizeof (limiter::TruePeakLimiterParams) == 32);   // + dualRelease, slowReleaseMs (v6)
 static_assert (sizeof (dither::DitherParams)           == 24);
 static_assert (sizeof (MasteringChainConfig)           == 48);
-static_assert (sizeof (MasteringChainParams)           == 6568);   // + compressorMix (P60), the limiter's dual release (v6)
-static_assert (sizeof (MasteringChainResolved)         == 88);     // + compressorMix (P60), limiterSlowReleaseMs (v6)
+static_assert (sizeof (MasteringChainParams)           == 6568);   // + compressorMix (P60) — see below
+static_assert (sizeof (MasteringChainResolved)         == 88);     // + compressorMix (P60) — see below
 
 // THE PIN THAT WORKS THROUGH INHERITANCE. A structured binding cannot decompose a type whose base has
 // members, and `sizeof` is blind to a field that lands in existing padding — so between them the two
@@ -341,7 +341,7 @@ static_assert (std::is_same_v<decltype (fc_gr_trace_bucket::maxDb), double> && s
                && std::is_same_v<decltype (fc_gr_trace_bucket::samples), uint32_t> && std::is_same_v<decltype (fc_gr_trace_bucket::nonFinite), uint32_t>);
 static_assert (std::is_same_v<decltype (fc_measurement::compressorGrTraceBuckets), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceBuckets), int32_t>
                && std::is_same_v<decltype (fc_measurement::compressorGrTraceValid), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceValid), int32_t>);
-// v6's fields by type, for the same reason.
+// v6's fields by type.
 static_assert (std::is_same_v<decltype (fc_master_params::limiterDualRelease), int32_t> && std::is_same_v<decltype (fc_master_params::_pad0), int32_t>
                && std::is_same_v<decltype (fc_master_params::limiterSlowReleaseMs), double>
                && std::is_same_v<decltype (fc_master_resolved::limiterSlowReleaseMs), double>
@@ -705,7 +705,7 @@ fc_status toCore (const fc_master_params& p, MasteringChainParams& out) noexcept
     if (! fin (p.limiter.ceilingDbTp) || ! fin (p.limiter.releaseMs)) return FC_ERR_NON_FINITE;
     out.limiter.ceilingDbTp = p.limiter.ceilingDbTp;
     out.limiter.releaseMs   = p.limiter.releaseMs;
-    // v6. Finite is this file's check; the floor is the core's, read back in `resolved`.
+    // v6
     if (! fin (p.limiterSlowReleaseMs)) return FC_ERR_NON_FINITE;
     out.limiter.dualRelease   = p.limiterDualRelease != 0;
     out.limiter.slowReleaseMs = p.limiterSlowReleaseMs;
@@ -754,7 +754,7 @@ fc_status toCore (const fc_loudness_request& r, LoudnessRequest& out) noexcept
     out.activityThresholdDb   = r.activityThresholdDb;
     out.maxPasses             = r.maxPasses;
     out.initialGainDb         = r.initialGainDb;
-    out.grTraceBuckets        = r.grTraceBuckets;     // v6: the range is the core's verdict
+    out.grTraceBuckets        = r.grTraceBuckets;     // v6
     return FC_OK;
 }
 
@@ -1324,8 +1324,7 @@ FC_EXPORT fc_status fc_master_destroy (fc_master h)
 
 namespace
 {
-// A solve's budget on this handle's kind of handle — the core's one expression for it, at `frames` in and the request's
-// trace size.
+// FC_NEED_SOLVE's `callBytes` on this handle, for `frames` in and `grTraceBuckets`.
 std::uint64_t solveBudget (const MasterInstance& m, std::uint32_t frames, int grTraceBuckets) noexcept
 {
     const int nch = m.chain.numChannels();
@@ -1388,8 +1387,7 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
     return FC_OK;
 }
 
-// v6 — FC_NEED_SOLVE for a given request. The same fields, from the same core functions, as `fc_master_need`; the one
-// difference is the trace size, read from the caller's request at its own version (a v1..v5 request is 1000).
+// v6 — `fc_master_need`'s FC_NEED_SOLVE with the request's `grTraceBuckets` (1000 for a request older than v6).
 FC_EXPORT fc_status fc_master_need_solve (fc_master h, const fc_loudness_request* req, std::uint32_t frames, fc_need* out)
 {
     FC_GUARD;
@@ -1712,13 +1710,12 @@ FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::ui
 
 namespace
 {
-// v4 and v6 — the order is the header's: poison (at the entry point), handle, `written`, then `out` only when there is
-// something to write into (null, alignment, the span in BUCKETS of `Bucket`, and `written` not inside it), then
-// `stage` — a field value, checked with `cap == 0` as well, so a stage code that names nothing is never answered
-// FC_OK — then the narrowing of the counts the call would write, which only v4's 32-bit bucket can refuse. `written`
-// is cleared only once every refusal is behind us, as in `fc_master_flush`: a `written` that pointed into the buckets
-// used to be zeroed by a call that then went on to write them — and a successful call wrote the count over the first
-// bucket's `samples`.
+// v4 — the order is the header's: poison, handle, `written`, then `out` only when there is something to write
+// into (null, alignment, the span, and `written` not inside it), then `stage` — a field value, checked with `cap == 0`
+// as well, so a stage code that names nothing is never answered FC_OK. `written` is cleared only once every refusal
+// is behind us, as in `fc_master_flush`: a `written` that pointed into the buckets used to be zeroed by a call that
+// then went on to write them — and a successful call wrote the count over the first bucket's `samples`.
+// v6 — the same for either bucket type, then a count the bucket type cannot hold: FC_ERR_RANGE.
 template <typename Bucket>
 fc_status copyTrace (fc_solution sh, std::int32_t stage, Bucket* out, std::uint32_t cap, std::uint32_t* written) noexcept
 {
@@ -2074,7 +2071,7 @@ void writeDefaults (fc_master_params& o) noexcept
     out->bypassLimiter    = d.bypassLimiter ? 1 : 0;
     out->bypassDither     = d.bypassDither ? 1 : 0;
     out->compressorMix    = d.compressorMix;            // v3: 1, the chain before the field existed
-    out->limiterDualRelease   = d.limiter.dualRelease ? 1 : 0;   // v6: 0, the single release
+    out->limiterDualRelease   = d.limiter.dualRelease ? 1 : 0;   // v6
     out->limiterSlowReleaseMs = d.limiter.slowReleaseMs;
 }
 
@@ -2101,7 +2098,7 @@ void writeDefaults (fc_loudness_request& o) noexcept
     out->activityThresholdDb    = d.activityThresholdDb;
     out->maxPasses              = d.maxPasses;
     out->initialGainDb          = d.initialGainDb;
-    out->grTraceBuckets         = d.grTraceBuckets;     // v6: 1000, v4's trace
+    out->grTraceBuckets         = d.grTraceBuckets;     // v6
 }
 }   // namespace
 
