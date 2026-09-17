@@ -368,6 +368,31 @@ static void testBlockInvariance()
         const Buf gotK = runPartition (c2, prm, x, partPrimes (n), b);
         ok (a && b && bitEqual (refK, gotK), "bit-identical at internalBlock = " + std::to_string (K));
     }
+
+    // The limiter's dual release, on a fixture where it changes the render.
+    {
+        Buf x = loudProgramme (nch, n);
+        for (int i = 0; i < n; ++i)
+            if (std::fmod ((double) i / 48000.0, 0.5) < 0.3)
+                for (int c = 0; c < nch; ++c)
+                    x[(std::size_t) c][(std::size_t) i] = (float) (0.9 * std::sin (2.0 * kPi * 1000.0 * i / 48000.0));
+            else
+                for (int c = 0; c < nch; ++c) x[(std::size_t) c][(std::size_t) i] *= 0.05f;
+        auto dualPrm = prm;
+        dualPrm.preLimiterGainDb = 9.0;
+        dualPrm.limiter.releaseMs = 20.0; dualPrm.limiter.dualRelease = true; dualPrm.limiter.slowReleaseMs = 180.0;
+        auto singlePrm = dualPrm; singlePrm.limiter.dualRelease = false;
+        bool a = false, b = false;
+        const Buf ref = runPartition (cfg, dualPrm, x, partWhole (n), a);
+        const Buf single = runPartition (cfg, singlePrm, x, partWhole (n), b);
+        ok (a && b && ! bitEqual (ref, single), "PRECONDITION: the dual release changes this render");
+        for (const auto& part : { partOne (n), partPrimes (n), partRandom (n, 5u, 3000), partFixed (n, 257) })
+        {
+            bool c = false;
+            const Buf got = runPartition (cfg, dualPrm, x, part, c);
+            ok (c && bitEqual (ref, got), "dual release: bit-identical on a partition of " + std::to_string (part.size()) + " calls");
+        }
+    }
 }
 
 //==============================================================================
@@ -1052,10 +1077,25 @@ static void testResolvedReadback()
     approx ((double) r.monoBass.frequencyHz, 20.0, 1e-4, "a mono-bass corner below the floor comes back clamped");
     ok (r.limiterLookahead == 48, "resolved limiter lookahead in samples (1 ms at 48 kHz)");
     ok (r.compressorLookahead == 48, "resolved compressor lookahead in samples");
+    ok (r.limiterSlowReleaseMs == 0.0, "the dual release off: the resolved slow release is 0");
 
     // The identity the whole latency contract rests on, stated in one line.
     ok (r.latencySamples == r.internalBlock + r.compressorLookahead + r.clipperLatency + r.limiterLatency,
         "latency == internal quantum + the sum of the present stages' own reported latencies");
+
+    // The dual release on: the limiter's own readback, the floor included.
+    for (const double slowMs : { 180.0, 0.0 })
+    {
+        prm.limiter.dualRelease = true; prm.limiter.slowReleaseMs = slowMs;
+        chain.setParams (prm);
+        { auto p = planes (x); felitronics::test::run (chain.process (p.data(), nch, cfg.internalBlock)); }
+        limiter::TruePeakLimiter lim;
+        felitronics::test::run (lim.prepare (48000.0, cfg.internalBlock, nch, { cfg.limiterLookaheadMs, cfg.oversampleFactor, cfg.tapsPerPhase }));
+        lim.setParams (prm.limiter);
+        const double got = chain.resolved().limiterSlowReleaseMs;
+        ok (got == lim.effectiveSlowReleaseMs() && got > 0.0, "the dual release on at " + std::to_string (slowMs)
+            + " ms: resolved " + std::to_string (got) + " ms, the limiter's own readback");
+    }
 }
 
 //==============================================================================

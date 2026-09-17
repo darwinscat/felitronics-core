@@ -252,7 +252,8 @@ private:
 // point of the check.
 struct Setup { double ceilingDb = -1.0, releaseMs = 50.0, lookaheadMs = 1.0; int factor = 4;
                int taps = limiter::TruePeakLimiterConfig {}.tapsPerPhase;
-               oversampling::Topology topology = oversampling::Topology::Kaiser; };
+               oversampling::Topology topology = oversampling::Topology::Kaiser;
+               bool dualRelease = false; double slowReleaseMs = 200.0; };
 
 // Render through the REAL class. The drain matters and is not padding: the limiter delays by
 // latencySamples(), so without it the tail of the witness never comes out, the buffer stops
@@ -268,6 +269,7 @@ static std::vector<std::vector<float>> renderAt (const std::vector<std::vector<f
     (void) lim.prepare (sr, maxBlock, nch, { s.lookaheadMs, s.factor, s.taps, s.topology });   // topology is prepare-time only now
     limiter::TruePeakLimiterParams p;
     p.ceilingDbTp = s.ceilingDb; p.releaseMs = s.releaseMs;
+    p.dualRelease = s.dualRelease; p.slowReleaseMs = s.slowReleaseMs;
     lim.setParams (p);
     const int drain = lim.latencySamples() + 64;
     std::vector<std::vector<float>> out ((std::size_t) nch, std::vector<float> ((std::size_t) (n + drain), 0.0f));
@@ -543,6 +545,67 @@ static void runCascadeTopology()
 }
 
 //==============================================================================
+//==============================================================================
+// The dual release over the witnesses above and a held plateau: inside the Kaiser budgets.
+static void runDualRelease()
+{
+    const double sr = 48000.0;
+    auto dual = [] (double c, double rel, int F) { Setup s { c, rel, 1.0, F }; s.dualRelease = true; return s; };
+    const int factors[3] { 2, 4, 8 };
+    auto excess = [&] (const std::vector<float>& x, const Setup& s)
+    {
+        std::vector<std::vector<float>> in { x };
+        return tp::truePeakDbFft (renderAt (in, sr, s, 0)[0]) - s.ceilingDb;
+    };
+
+    test::group ("Dual release: the witness matrix with a 200 ms slow envelope, inside the same budgets");
+    for (const int F : factors)
+    {
+        const double budget = tpw::deliveredBudgetDb (F);
+        double worst = -1e9, worstOff = -1e9;
+        std::string worstAt;
+        auto row = [&] (const std::vector<float>& x, const Setup& s, const std::string& what)
+        {
+            Setup off = s; off.dualRelease = false;
+            const double over = excess (x, s);
+            worstOff = std::max (worstOff, excess (x, off));
+            if (over > worst) { worst = over; worstAt = what; }
+            test::ok (over <= budget, "F=" + std::to_string (F) + " " + what + ": " + dbs (over) + " <= " + dbs (budget));
+        };
+        for (double rel : { 100.0, 50.0, 1.0 })
+            row (tpw::denseNoise (sr, 0.20, 10.0), dual (-1.0, rel, F), "dense noise, fast release " + dbs (rel) + " ms");
+        row (tpw::denseNoise (sr, 0.20, 10.0, 0x9E3779B97F4A7C15ULL, 0.9), dual (-1.0, 50.0, F), "dense one-pole 0.9, fast 50 ms");
+        for (double makeup : { 64.0, 76.0, 88.0 })
+            row (tpw::clickTrain (sr, 0.15, 3.0, -60.0 + makeup, 0.5), dual (-2.2, 50.0, F), "click train, makeup " + dbs (makeup) + " dB");
+        const int M = tpw::gridPhaseCount (1, 3, F);
+        for (int k = 0; k < 2 * M; ++k)
+            row (tpw::gridTone (sr, 0.05, 1, 3, 12.0, (double) k / (double) (2 * M)), dual (-1.0, 50.0, F), "fs/3 tone, phase " + std::to_string (k));
+        for (double edge : { 0.0, 0.25, 0.5, 0.75 })
+            for (double rel : { 50.0, 1.0 })
+                row (tpw::plateau (sr, 0.40, 1000.0, 10.0, 0.05, 0.30, edge), dual (-1.0, rel, F),
+                     "1 kHz plateau held 250 ms, edge +" + dbs (edge) + ", fast " + dbs (rel) + " ms");
+        std::printf ("       dual release, F=%d: worst delivered excess %+.4f dB (%s); the same rows with it off %+.4f; budget %+.4f\n",
+                     F, worst, worstAt.c_str(), worstOff, budget);
+        const double fastest = excess (tpw::clickTrain (sr, 0.15, 3.0, 26.0, 0.5), dual (-1.0, 0.1, F));
+        std::printf ("       dual release, F=%d: click train at a 0.1 ms fast release %+.4f dB\n", F, fastest);
+        test::ok (fastest <= budget, "F=" + std::to_string (F) + " click train, fast 0.1 ms: " + dbs (fastest) + " <= " + dbs (budget));
+    }
+
+    test::group ("Dual release: the slow envelope works on the plateau, and streaming is block-invariant, bit for bit");
+    {
+        const auto x = tpw::plateau (sr, 0.40, 1000.0, 10.0, 0.05, 0.30, 0.25);
+        std::vector<std::vector<float>> in { x };
+        Setup on = dual (-1.0, 20.0, 4), off = on; off.dualRelease = false;
+        const auto whole = renderAt (in, sr, on, 0), single = renderAt (in, sr, off, 0);
+        test::ok (firstDifference (whole[0], single[0]) >= 0, "PRECONDITION: the dual release changes the plateau's render");
+        for (int b : { 1, 7, 64, 512 })
+        {
+            const int d = firstDifference (whole[0], renderAt (in, sr, on, b)[0]);
+            test::ok (d < 0, "dual release, block " + std::to_string (b) + " == one-shot" + (d < 0 ? "" : " (differs at " + std::to_string (d) + ")"));
+        }
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::limiter true-peak CEILING PROOF\n");
@@ -1867,6 +1930,7 @@ int main()
     }
 
     runCascadeTopology();
+    runDualRelease();
 
     return test::report();
 }

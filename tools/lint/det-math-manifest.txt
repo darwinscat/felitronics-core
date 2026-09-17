@@ -92,7 +92,7 @@ modules/rigplayer/include/felitronics/rigplayer/ToneKnobs.h  [pow*1]  retain-rt 
 
 # --- tools that are not on the parity surface ---
 tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1 sqrt*10]  retain-local  a developer visualiser; it draws curves and nobody diffs its output
-tools/fcore_master.cpp  [sin*3]  retain-local  test-signal generation inside the mastering CLI's own fixtures, not a measured value
+tools/fcore_master.cpp  [sin*4]  retain-local  test-signal generation inside the mastering CLI's own fixtures, not a measured value
 tools/fftbench.cpp  [exp*6]  retain-local  benchmark input generation
 
 

@@ -102,6 +102,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_master_abi_reentry_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_master_abi_reentry_tests COMMAND felitronics_master_abi_reentry_tests)
 
+    add_executable(felitronics_master_abi_progress_tests tests/MasterAbiProgressTests.cpp wasm/fc_master.cpp)
+    target_link_libraries(felitronics_master_abi_progress_tests PRIVATE felitronics::mastering felitronics::analysis)
+    target_include_directories(felitronics_master_abi_progress_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_master_abi_progress_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_master_abi_progress_tests COMMAND felitronics_master_abi_progress_tests)
+
     # The bit-exactness acceptance itself, run as a test rather than by hand: the same programme through
     # the C ABI and through a direct C++ call, one binary, one machine, compared bit for bit — plus
     # block-independence through the ABI and the reset discipline.

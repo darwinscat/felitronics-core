@@ -5,6 +5,7 @@
 
 #include <felitronics/core/Config.h>
 #include <felitronics/mastering/MasteringChain.h>
+#include <felitronics/mastering/Progress.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -121,6 +122,13 @@ public:
     bool render (MasteringChain& chain, const float* const* in, float* const* out,
                  int numChannels, int frames, MasteringChainTaps& taps, TapSink&& sink)
     {
+        return render (chain, in, out, numChannels, frames, taps, sink, nullptr);
+    }
+
+    template <class TapSink>
+    bool render (MasteringChain& chain, const float* const* in, float* const* out,
+                 int numChannels, int frames, MasteringChainTaps& taps, TapSink&& sink, ProgressClock* clock)
+    {
         if (block_ < 1) return false;                   // a refused prepare() leaves it unusable
         if (! chain.isPrepared() || numChannels != chain.numChannels()) return false;
         if (numChannels < 1 || numChannels > maxCh_ || scratch_.empty()) return false;
@@ -151,7 +159,7 @@ public:
         long long tapPos = 0;
         for (long long off = 0; off < total; )
         {
-            const int m = (int) std::min<long long> ((long long) block_, total - off);
+            const int m = (int) std::min<long long> (clock != nullptr ? clock->piece (block_) : block_, total - off);
 
             // Read the whole slice into scratch BEFORE writing anything back, so `in == out` is safe
             // even at D == 0. Past the end of the input the chain is fed zeros — which is what "flush"
@@ -179,6 +187,7 @@ public:
             sink (taps, tapPos);
             tapPos += taps.framesWritten;
             off += m;
+            if (clock != nullptr && ! clock->advance (m)) return false;
         }
         return true;
     }

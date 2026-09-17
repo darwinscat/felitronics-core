@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 
@@ -124,11 +125,11 @@ static_assert (sizeof (dynamics::DetectorParams)       == 16);
 static_assert (sizeof (dynamics::GainReductionParams)  == 72);
 static_assert (sizeof (dynamics::CompressorParams)     == 96);
 static_assert (sizeof (saturation::Saturator::Params)  == 28);
-static_assert (sizeof (limiter::TruePeakLimiterParams) == 16);
+static_assert (sizeof (limiter::TruePeakLimiterParams) == 32);   // + dualRelease, slowReleaseMs (v6)
 static_assert (sizeof (dither::DitherParams)           == 24);
 static_assert (sizeof (MasteringChainConfig)           == 48);
-static_assert (sizeof (MasteringChainParams)           == 6552);   // + compressorMix (P60) — see below
-static_assert (sizeof (MasteringChainResolved)         == 80);     // + compressorMix (P60) — see below
+static_assert (sizeof (MasteringChainParams)           == 6568);   // + compressorMix (P60) — see below
+static_assert (sizeof (MasteringChainResolved)         == 88);     // + compressorMix (P60) — see below
 
 // THE PIN THAT WORKS THROUGH INHERITANCE. A structured binding cannot decompose a type whose base has
 // members, and `sizeof` is blind to a field that lands in existing padding — so between them the two
@@ -190,8 +191,8 @@ static_assert (! BraceInit<dynamics::CompressorParams,
     (void) c_shape; (void) c_drive; (void) c_bias; (void) c_mix; (void) c_out; (void) c_auto; (void) c_dc;
 
     limiter::TruePeakLimiterParams lim {};
-    auto& [lim_ceil, lim_rel] = lim;
-    (void) lim_ceil; (void) lim_rel;
+    auto& [lim_ceil, lim_rel, lim_dual, lim_slow] = lim;
+    (void) lim_ceil; (void) lim_rel; (void) lim_dual; (void) lim_slow;
 
     dither::DitherParams dit {};
     auto& [dit_bits, dit_shape, dit_seed, dit_blank, dit_blankn] = dit;
@@ -213,9 +214,9 @@ static_assert (! BraceInit<dynamics::CompressorParams,
 
     MasteringChainResolved res {};
     auto& [r_lat, r_blk, r_clook, r_clip, r_lim, r_llook, r_os, r_ctap, r_ltap,
-           r_ceil, r_rel, r_mb, r_mix] = res;
+           r_ceil, r_rel, r_mb, r_mix, r_slow] = res;
     (void) r_lat; (void) r_blk; (void) r_clook; (void) r_clip; (void) r_lim; (void) r_llook;
-    (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb; (void) r_mix;
+    (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb; (void) r_mix; (void) r_slow;
 }
 
 //==============================================================================
@@ -310,11 +311,11 @@ static_assert (newestRowIsSizeof<fc_solution_summary>());
 #define FC_ENDS_AT(T, last) \
     static_assert (sizeof (T) == offsetof (T, last) + sizeof (T::last), #T " ends in implicit padding — name it (rule 4)")
 FC_ENDS_AT (fc_master_config,    deliveryRate);
-FC_ENDS_AT (fc_master_params,    compressorMix);
-FC_ENDS_AT (fc_master_resolved,  compressorMix);
+FC_ENDS_AT (fc_master_params,    limiterSlowReleaseMs);
+FC_ENDS_AT (fc_master_resolved,  limiterSlowReleaseMs);
 FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
 FC_ENDS_AT (fc_need,             _pad0);
-FC_ENDS_AT (fc_loudness_request, initialGainDb);
+FC_ENDS_AT (fc_loudness_request, _pad0);
 FC_ENDS_AT (fc_measurement,      limiterGrTraceValid);
 FC_ENDS_AT (fc_solution_summary, gainAboveDb);
 // and the types the table's sizes were computed from
@@ -329,6 +330,10 @@ static_assert (sizeof (fc_mono_bass) == 12 && sizeof (fc_compressor) == 88 && si
 static_assert (sizeof (fc_limiter) == 16 && sizeof (fc_dither) == 24 && sizeof (fc_gr_limit) == 16);
 static_assert (sizeof (fc_solve_pass) == 64 && sizeof (fc_gr_stats) == 64);
 static_assert (sizeof (fc_gr_trace_bucket) == 24);                                                          // v4, frozen
+static_assert (sizeof (fc_gr_trace_bucket64) == 32);                                                        // v6, frozen
+static_assert (sizeof (fc_progress) == 88 && offsetof (fc_progress, stage) == 0 && offsetof (fc_progress, pass) == 4
+               && offsetof (fc_progress, maxPasses) == 8 && offsetof (fc_progress, hasRecord) == 12
+               && offsetof (fc_progress, fraction) == 16 && offsetof (fc_progress, record) == 24);
 // v4's fields by TYPE as well as by offset: a `double` retyped to `float` keeps this struct's size and every offset (the
 // four bytes become padding), so neither pin above would see it, and JavaScript would read eight bytes where four were
 // written (the code-review round, by mutation).
@@ -336,6 +341,13 @@ static_assert (std::is_same_v<decltype (fc_gr_trace_bucket::maxDb), double> && s
                && std::is_same_v<decltype (fc_gr_trace_bucket::samples), uint32_t> && std::is_same_v<decltype (fc_gr_trace_bucket::nonFinite), uint32_t>);
 static_assert (std::is_same_v<decltype (fc_measurement::compressorGrTraceBuckets), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceBuckets), int32_t>
                && std::is_same_v<decltype (fc_measurement::compressorGrTraceValid), int32_t> && std::is_same_v<decltype (fc_measurement::limiterGrTraceValid), int32_t>);
+// v6's fields by type.
+static_assert (std::is_same_v<decltype (fc_master_params::limiterDualRelease), int32_t> && std::is_same_v<decltype (fc_master_params::_pad0), int32_t>
+               && std::is_same_v<decltype (fc_master_params::limiterSlowReleaseMs), double>
+               && std::is_same_v<decltype (fc_master_resolved::limiterSlowReleaseMs), double>
+               && std::is_same_v<decltype (fc_loudness_request::grTraceBuckets), int32_t> && std::is_same_v<decltype (fc_loudness_request::_pad0), int32_t>);
+static_assert (std::is_same_v<decltype (fc_gr_trace_bucket64::maxDb), double> && std::is_same_v<decltype (fc_gr_trace_bucket64::meanDb), double>
+               && std::is_same_v<decltype (fc_gr_trace_bucket64::samples), uint64_t> && std::is_same_v<decltype (fc_gr_trace_bucket64::nonFinite), uint64_t>);
 
 // Every top-level field at the offset it was published at. A field inserted in front of others moves a number; one dropped
 // into padding moves none (see the top of this section).
@@ -357,6 +369,8 @@ FC_AT (fc_master_params, dither, 6512);        FC_AT (fc_master_params, bypassEq
 FC_AT (fc_master_params, bypassMonoBass, 6540); FC_AT (fc_master_params, bypassCompressor, 6544);
 FC_AT (fc_master_params, bypassClipper, 6548); FC_AT (fc_master_params, bypassLimiter, 6552);
 FC_AT (fc_master_params, bypassDither, 6556); FC_AT (fc_master_params, compressorMix, 6560);             // v3
+FC_AT (fc_master_params, limiterDualRelease, 6568); FC_AT (fc_master_params, _pad0, 6572);               // v6
+FC_AT (fc_master_params, limiterSlowReleaseMs, 6576);                                                     // v6
 
 FC_AT (fc_master_resolved, header, 0);         FC_AT (fc_master_resolved, latencySamples, 8);
 FC_AT (fc_master_resolved, internalBlock, 12); FC_AT (fc_master_resolved, compressorLookahead, 16);
@@ -366,6 +380,7 @@ FC_AT (fc_master_resolved, compressorTapOffset, 36); FC_AT (fc_master_resolved, 
 FC_AT (fc_master_resolved, limiterCeilingDbTp, 48); FC_AT (fc_master_resolved, limiterReleaseMs, 56);
 FC_AT (fc_master_resolved, monoBass, 64);      FC_AT (fc_master_resolved, tapOversampleFactor, 76);
 FC_AT (fc_master_resolved, compressorMix, 80);                                                              // v3
+FC_AT (fc_master_resolved, limiterSlowReleaseMs, 88);                                                       // v6
 
 FC_AT (fc_master_stats, header, 0);            FC_AT (fc_master_stats, framesIn, 8);
 FC_AT (fc_master_stats, framesFlushed, 16);    FC_AT (fc_master_stats, nonFiniteIn, 24);
@@ -381,6 +396,7 @@ FC_AT (fc_loudness_request, compressorGr, 56); FC_AT (fc_loudness_request, minPl
 FC_AT (fc_loudness_request, maxLraLossLu, 80); FC_AT (fc_loudness_request, inputLoudnessRangeLu, 88);
 FC_AT (fc_loudness_request, activityThresholdDb, 96); FC_AT (fc_loudness_request, maxPasses, 104);
 FC_AT (fc_loudness_request, initialGainDb, 112);
+FC_AT (fc_loudness_request, grTraceBuckets, 120); FC_AT (fc_loudness_request, _pad0, 124);                 // v6
 
 FC_AT (fc_measurement, header, 0);             FC_AT (fc_measurement, integratedLufs, 8);
 FC_AT (fc_measurement, truePeakDbTp, 16);      FC_AT (fc_measurement, samplePeakDb, 24);
@@ -394,6 +410,8 @@ FC_AT (fc_measurement, compressorGrTraceBuckets, 208); FC_AT (fc_measurement, li
 FC_AT (fc_measurement, compressorGrTraceValid, 216);   FC_AT (fc_measurement, limiterGrTraceValid, 220);     // v4
 FC_AT (fc_gr_trace_bucket, maxDb, 0);          FC_AT (fc_gr_trace_bucket, meanDb, 8);                        // v4
 FC_AT (fc_gr_trace_bucket, samples, 16);       FC_AT (fc_gr_trace_bucket, nonFinite, 20);                    // v4
+FC_AT (fc_gr_trace_bucket64, maxDb, 0);        FC_AT (fc_gr_trace_bucket64, meanDb, 8);                      // v6
+FC_AT (fc_gr_trace_bucket64, samples, 16);     FC_AT (fc_gr_trace_bucket64, nonFinite, 24);                  // v6
 
 FC_AT (fc_solution_summary, header, 0);        FC_AT (fc_solution_summary, status, 8);
 FC_AT (fc_solution_summary, binding, 12);      FC_AT (fc_solution_summary, alsoViolated, 16);
@@ -687,6 +705,10 @@ fc_status toCore (const fc_master_params& p, MasteringChainParams& out) noexcept
     if (! fin (p.limiter.ceilingDbTp) || ! fin (p.limiter.releaseMs)) return FC_ERR_NON_FINITE;
     out.limiter.ceilingDbTp = p.limiter.ceilingDbTp;
     out.limiter.releaseMs   = p.limiter.releaseMs;
+    // v6
+    if (! fin (p.limiterSlowReleaseMs)) return FC_ERR_NON_FINITE;
+    out.limiter.dualRelease   = p.limiterDualRelease != 0;
+    out.limiter.slowReleaseMs = p.limiterSlowReleaseMs;
 
     if (! mapShaping (p.dither.shaping, out.dither.shaping)) return FC_ERR_ENUM;
     out.dither.bits             = p.dither.bits;
@@ -732,6 +754,7 @@ fc_status toCore (const fc_loudness_request& r, LoudnessRequest& out) noexcept
     out.activityThresholdDb   = r.activityThresholdDb;
     out.maxPasses             = r.maxPasses;
     out.initialGainDb         = r.initialGainDb;
+    out.grTraceBuckets        = r.grTraceBuckets;     // v6
     return FC_OK;
 }
 
@@ -753,6 +776,7 @@ void fromCore (const MasteringChainResolved& r, int tapOs, fc_master_resolved& o
     out.monoBass.lowWidth    = r.monoBass.lowWidth;
     out.tapOversampleFactor = tapOs;
     out.compressorMix       = r.compressorMix;          // v3
+    out.limiterSlowReleaseMs = r.limiterSlowReleaseMs;  // v6
 }
 
 void fromCore (const GainReductionStats& s, fc_gr_stats& out) noexcept
@@ -823,6 +847,9 @@ struct MasterInstance
     // known parameter set back. Law 11 at the handle level: a call that cannot be honoured as the caller
     // means it is refused rather than answered with something plausible.
     bool solverRan = false;
+
+    fc_progress_fn progressFn = nullptr;
+    void*          progressContext = nullptr;
 };
 
 struct Slot
@@ -955,6 +982,101 @@ void planes (float* base, std::uint32_t stride, int nch, float** out) noexcept
     for (int c = 0; c < nch; ++c) out[c] = base + (std::size_t) c * (std::size_t) stride;
 }
 
+}   // namespace
+
+static_assert ((int) ProgressStage::Convert       == FC_PROGRESS_CONVERT
+               && (int) ProgressStage::LoudnessRange == FC_PROGRESS_LRA
+               && (int) ProgressStage::SearchPass    == FC_PROGRESS_PASS
+               && (int) ProgressStage::FinalRender   == FC_PROGRESS_FINAL
+               && (int) ProgressStage::Render        == FC_PROGRESS_RENDER);
+
+#if defined(__EMSCRIPTEN__)
+EM_JS (int, fc_js_progress, (int stage, int pass, int maxPasses, double fraction, int hasRecord,
+                             double gainDb, double ceilingDb, double integratedLufs, double truePeakDbTp,
+                             double plrDb, double limiterMaxGrDb, double loudnessRangeLu, int violated), {
+    if (typeof Module["onProgress"] !== "function") return 1;
+    const msg = { stage: ["convert", "lra", "pass", "final", "render"][stage], pass: pass, maxPasses: maxPasses,
+                  fraction: fraction };
+    if (hasRecord)
+        msg.record = { gainDb: gainDb, ceilingDb: ceilingDb, integratedLufs: integratedLufs,
+                       truePeakDbTp: truePeakDbTp, plrDb: plrDb, limiterMaxGrDb: limiterMaxGrDb,
+                       loudnessRangeLu: loudnessRangeLu, violated: violated >>> 0 };
+    try { return Module["onProgress"](msg) === false ? 0 : 1; }
+    catch (e) { return 0; }
+});
+#endif
+
+namespace
+{
+struct ProgressState
+{
+    fc_progress_fn fn = nullptr;
+    void*          context = nullptr;
+    bool           stopped = false;
+};
+
+bool progressToHost (void* context, const ProgressEvent& e) noexcept
+{
+    auto& st = *static_cast<ProgressState*> (context);
+    fc_progress ev {};
+    ev.stage     = (std::int32_t) e.stage;
+    ev.pass      = e.pass;
+    ev.maxPasses = e.maxPasses;
+    ev.fraction  = e.fraction;
+    if (const SolvePassRecord* r = e.record)
+    {
+        ev.hasRecord              = 1;
+        ev.record.gainDb          = r->gainDb;
+        ev.record.ceilingDb       = r->ceilingDb;
+        ev.record.integratedLufs  = r->integratedLufs;
+        ev.record.truePeakDbTp    = r->truePeakDbTp;
+        ev.record.plrDb           = r->plrDb;
+        ev.record.limiterMaxGrDb  = r->limiterMaxGrDb;
+        ev.record.loudnessRangeLu = r->loudnessRangeLu;
+        ev.record.violated        = r->violated;
+    }
+    st.stopped = st.fn (st.context, &ev) == 0;
+    return ! st.stopped;
+}
+
+#if defined(__EMSCRIPTEN__)
+bool progressToModule (void* context, const ProgressEvent& e) noexcept
+{
+    const SolvePassRecord* r = e.record;
+    const int go = fc_js_progress ((int) e.stage, e.pass, e.maxPasses, e.fraction, r != nullptr ? 1 : 0,
+                                   r != nullptr ? r->gainDb : 0.0,          r != nullptr ? r->ceilingDb : 0.0,
+                                   r != nullptr ? r->integratedLufs : 0.0,  r != nullptr ? r->truePeakDbTp : 0.0,
+                                   r != nullptr ? r->plrDb : 0.0,           r != nullptr ? r->limiterMaxGrDb : 0.0,
+                                   r != nullptr ? r->loudnessRangeLu : 0.0, r != nullptr ? (int) r->violated : 0);
+    if (go == 0) static_cast<ProgressState*> (context)->stopped = true;
+    return go != 0;
+}
+#endif
+
+ProgressCallback progressFor (const MasterInstance& m, ProgressState& state) noexcept
+{
+    state.fn = m.progressFn;
+    state.context = m.progressContext;
+    if (state.fn != nullptr) return ProgressCallback { &progressToHost, &state };
+#if defined(__EMSCRIPTEN__)
+    return ProgressCallback { &progressToModule, &state };
+#else
+    return ProgressCallback {};
+#endif
+}
+
+fc_status cancelledSolve (MasterInstance& m, Slot& slot) noexcept
+{
+    const bool rendered = slot.solution->passes > 0;
+    abandonSlot (slot);
+    if (rendered)
+    {
+        m.framesIn = m.framesFlushed = 0;
+        m.audioSeen = false;
+        m.solverRan = true;
+    }
+    return FC_ERR_CANCELLED;
+}
 }   // namespace
 
 //==============================================================================
@@ -1200,6 +1322,18 @@ FC_EXPORT fc_status fc_master_destroy (fc_master h)
     return FC_OK;
 }
 
+namespace
+{
+// FC_NEED_SOLVE's `callBytes` on this handle, for `frames` in and `grTraceBuckets`.
+std::uint64_t solveBudget (const MasterInstance& m, std::uint32_t frames, int grTraceBuckets) noexcept
+{
+    const int nch = m.chain.numChannels();
+    return m.delivering
+        ? DeliveredMastering::solveBytes (m.delivered.sourceRate(), m.delivered.deliveryRate(), nch, (long long) frames, grTraceBuckets)
+        : TargetLoudnessSolver::solveBytes (m.chain.sampleRate(), nch, (int) frames, grTraceBuckets);
+}
+}   // namespace
+
 // Forwarding only: every number is the core's (TargetLoudnessSolver's budgets) or this file's own `sizeof`, and
 // none is added to another here — the page sums what applies.
 FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t frames, fc_need* out)
@@ -1225,8 +1359,7 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
     bool solverOp = true;                  // the solver's two fields are NEUTRAL for a configure
     switch (op)
     {
-        case FC_NEED_SOLVE:       call = m.delivering ? DeliveredMastering::solveBytes (srcFs, dstFs, nch, (long long) frames)
-                                                      : TargetLoudnessSolver::solveBytes (fs, nch, (int) frames);
+        case FC_NEED_SOLVE:       call = solveBudget (m, frames, GainReductionTrace::kDefaultBuckets);
                                   facade = sizeof (LoudnessSolution);                     break;
         case FC_NEED_MEASURE_LRA: call = m.delivering ? DeliveredMastering::measureRangeBytes (srcFs, dstFs, nch, (long long) frames)
                                                       : TargetLoudnessSolver::measureRangeBytes (fs, (int) frames);
@@ -1251,6 +1384,34 @@ FC_EXPORT fc_status fc_master_need (fc_master h, std::int32_t op, std::uint32_t 
     v.facadeBytes        = facade;
     v.solverPrepared     = (solverOp && m.solver.isPrepared()) ? 1 : 0;
     writeOut (out, v, bytes);
+    return FC_OK;
+}
+
+// v6 — `fc_master_need`'s FC_NEED_SOLVE with the request's `grTraceBuckets` (1000 for a request older than v6).
+FC_EXPORT fc_status fc_master_need_solve (fc_master h, const fc_loudness_request* req, std::uint32_t frames, fc_need* out)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    std::uint32_t outBytes = 0, reqBytes = 0;
+    if (const fc_status st = checkHeader (out, outBytes); st != FC_OK) return st;
+    if (const fc_status st = checkHeader (req, reqBytes); st != FC_OK) return st;
+    if (frames > (std::uint32_t) 0x7FFFFFFFu) return FC_ERR_RANGE;   // the core takes `int`
+    auto& m = *s->master;
+    if (m.delivering)
+    {
+        const long long d = DeliveredMastering::deliveredFrames (m.delivered.sourceRate(), m.delivered.deliveryRate(),
+                                                                 (long long) frames);
+        if (d < 0 || d > 0x7FFFFFFFLL) return FC_ERR_RANGE;
+    }
+    const fc_loudness_request r = loadIn (req, reqBytes);
+    fc_need v {};
+    v.callBytes          = solveBudget (m, frames, r.grTraceBuckets);
+    v.solverPrepareBytes = TargetLoudnessSolver::prepareBytes (m.renderer.blockSize(), m.chain.internalBlock(),
+                                                               m.chain.tapOversampleFactor());
+    v.facadeBytes        = sizeof (LoudnessSolution);
+    v.solverPrepared     = m.solver.isPrepared() ? 1 : 0;
+    writeOut (out, v, outBytes);
     return FC_OK;
 }
 
@@ -1322,9 +1483,12 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
     // when its own meter flagged the programme, and a facade that published the number anyway would be
     // publishing a measurement it had been told not to trust. On a delivering handle the core converts
     // first and measures the delivered programme — the one the search will meter.
+    ProgressState progress;
+    const ProgressCallback report = progressFor (m, progress);
     const bool measured = m.delivering
-        ? m.delivered.measureInputLoudnessRange (m.solver, pl, nch, (long long) frames, lra)
-        : m.solver.measureInputLoudnessRange (pl, nch, (int) frames, lra);
+        ? m.delivered.measureInputLoudnessRange (m.solver, pl, nch, (long long) frames, lra, report)
+        : m.solver.measureInputLoudnessRange (pl, nch, (int) frames, lra, report);
+    if (progress.stopped) return FC_ERR_CANCELLED;
     if (! measured) return FC_ERR_REFUSED_BY_CORE;
     *out = lra;
     return FC_OK;
@@ -1336,6 +1500,16 @@ FC_EXPORT fc_status fc_master_measure_lra (fc_master h, const float* in, std::ui
 // `kMaxChannels`, so without this entry point a correct surround search could not be expressed through
 // it at all — which would make the facade a NARROWER road than the C++ API, and the thinness law is
 // about both directions. The host-layout-to-role mapping stays outside, exactly as the core says.
+FC_EXPORT fc_status fc_master_set_progress (fc_master h, fc_progress_fn fn, void* context)
+{
+    FC_GUARD;
+    Slot* s = lookup (h, Kind::Master);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    s->master->progressFn      = fn;
+    s->master->progressContext = fn != nullptr ? context : nullptr;
+    return FC_OK;
+}
+
 FC_EXPORT fc_status fc_master_set_channel_weight (fc_master h, std::int32_t channel, double weight)
 {
     FC_GUARD;
@@ -1424,8 +1598,10 @@ FC_EXPORT fc_status fc_master_solve (fc_master h, const fc_master_params* params
         op[c] = out + (std::size_t) c * (std::size_t) frames;
     }
 
+    ProgressState progress;
     g_slots[idx].solution = std::make_unique<LoudnessSolution> (
-        m.solver.solve (m.chain, m.renderer, cp, ip, op, nch, (int) frames, lr));
+        m.solver.solve (m.chain, m.renderer, cp, ip, op, nch, (int) frames, lr, progressFor (m, progress)));
+    if (g_slots[idx].solution->status == MasteringSolveStatus::Cancelled) return cancelledSolve (m, g_slots[idx]);
 
     // The search drives the renderer, which RESETS the chain on every pass — so where it ran, the
     // handle's streaming state is gone and its counters would be lying if they survived.
@@ -1532,15 +1708,17 @@ FC_EXPORT fc_status fc_solution_log (fc_solution sh, fc_solve_pass* out, std::ui
     return FC_OK;
 }
 
+namespace
+{
 // v4 — the order is the header's: poison, handle, `written`, then `out` only when there is something to write
 // into (null, alignment, the span, and `written` not inside it), then `stage` — a field value, checked with `cap == 0`
 // as well, so a stage code that names nothing is never answered FC_OK. `written` is cleared only once every refusal
 // is behind us, as in `fc_master_flush`: a `written` that pointed into the buckets used to be zeroed by a call that
 // then went on to write them — and a successful call wrote the count over the first bucket's `samples`.
-FC_EXPORT fc_status fc_solution_gr_trace (fc_solution sh, std::int32_t stage, fc_gr_trace_bucket* out,
-                                          std::uint32_t cap, std::uint32_t* written)
+// v6 — the same for either bucket type, then a count the bucket type cannot hold: FC_ERR_RANGE.
+template <typename Bucket>
+fc_status copyTrace (fc_solution sh, std::int32_t stage, Bucket* out, std::uint32_t cap, std::uint32_t* written) noexcept
 {
-    FC_GUARD;
     Slot* s = lookup (sh, Kind::Solution);
     if (s == nullptr) return FC_ERR_HANDLE;
     if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
@@ -1548,8 +1726,8 @@ FC_EXPORT fc_status fc_solution_gr_trace (fc_solution sh, std::int32_t stage, fc
     {
         if (out == nullptr) return FC_ERR_NULL;
         if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
-        if (! inHeap (out, (std::uint64_t) cap * sizeof (fc_gr_trace_bucket))) return FC_ERR_SPAN;
-        if (aliasesSpan (written, sizeof (*written), out, (std::uint64_t) cap * sizeof (fc_gr_trace_bucket))) return FC_ERR_SPAN;
+        if (! inHeap (out, (std::uint64_t) cap * sizeof (Bucket))) return FC_ERR_SPAN;
+        if (aliasesSpan (written, sizeof (*written), out, (std::uint64_t) cap * sizeof (Bucket))) return FC_ERR_SPAN;
     }
     const LoudnessSolution& v = *s->solution;
     const GainReductionTrace* t = nullptr;
@@ -1559,19 +1737,38 @@ FC_EXPORT fc_status fc_solution_gr_trace (fc_solution sh, std::int32_t stage, fc
         case FC_GR_STAGE_LIMITER:    t = &v.limiterTrace;    break;
         default:                     return FC_ERR_ENUM;
     }
+    const std::uint32_t n = (std::uint32_t) t->buckets < cap ? (std::uint32_t) t->buckets : cap;
+    using Count = decltype (Bucket::samples);
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (t->bucket[i].samples > (std::uint64_t) std::numeric_limits<Count>::max()
+            || t->bucket[i].nonFinite > (std::uint64_t) std::numeric_limits<Count>::max()) return FC_ERR_RANGE;
     *written = 0;
 
-    const std::uint32_t n = (std::uint32_t) t->buckets < cap ? (std::uint32_t) t->buckets : cap;
     for (std::uint32_t i = 0; i < n; ++i)
     {
         const GainReductionTraceBucket& b = t->bucket[i];
         out[i].maxDb     = b.maxDb;
         out[i].meanDb    = b.meanDb;
-        out[i].samples   = b.samples;
-        out[i].nonFinite = b.nonFinite;
+        out[i].samples   = (Count) b.samples;
+        out[i].nonFinite = (Count) b.nonFinite;
     }
     *written = n;
     return FC_OK;
+}
+}   // namespace
+
+FC_EXPORT fc_status fc_solution_gr_trace (fc_solution sh, std::int32_t stage, fc_gr_trace_bucket* out,
+                                          std::uint32_t cap, std::uint32_t* written)
+{
+    FC_GUARD;
+    return copyTrace (sh, stage, out, cap, written);
+}
+
+FC_EXPORT fc_status fc_solution_gr_trace64 (fc_solution sh, std::int32_t stage, fc_gr_trace_bucket64* out,
+                                            std::uint32_t cap, std::uint32_t* written)
+{
+    FC_GUARD;
+    return copyTrace (sh, stage, out, cap, written);
 }
 
 FC_EXPORT fc_status fc_solution_destroy (fc_solution sh)
@@ -1646,8 +1843,11 @@ FC_EXPORT fc_status fc_master_render_delivered (fc_master h, const float* in, st
         ip[c] = in  + (std::size_t) c * (std::size_t) inFrames;
         op[c] = out + (std::size_t) c * (std::size_t) outFrames;
     }
-    if (! m.delivered.render (m.chain, m.renderer, ip, nch, (long long) inFrames, op, (long long) outFrames))
-        return FC_ERR_REFUSED_BY_CORE;
+    ProgressState progress;
+    const bool rendered = m.delivered.render (m.chain, m.renderer, ip, nch, (long long) inFrames,
+                                              op, (long long) outFrames, progressFor (m, progress));
+    if (progress.stopped) return FC_ERR_CANCELLED;
+    if (! rendered) return FC_ERR_REFUSED_BY_CORE;
     return FC_OK;
 }
 
@@ -1710,9 +1910,11 @@ FC_EXPORT fc_status fc_master_solve_delivered (fc_master h, const fc_master_para
         ip[c] = in  + (std::size_t) c * (std::size_t) inFrames;
         op[c] = out + (std::size_t) c * (std::size_t) outFrames;
     }
+    ProgressState progress;
     g_slots[idx].solution = std::make_unique<LoudnessSolution> (
         m.delivered.solve (m.solver, m.chain, m.renderer, cp, ip, nch, (long long) inFrames,
-                           op, (long long) outFrames, lr));
+                           op, (long long) outFrames, lr, progressFor (m, progress)));
+    if (g_slots[idx].solution->status == MasteringSolveStatus::Cancelled) return cancelledSolve (m, g_slots[idx]);
 
     // As `fc_master_solve`: where the search ran, the chain holds its parameters; where it did not, nothing moved.
     const MasteringSolveStatus verdict = g_slots[idx].solution->status;
@@ -1869,6 +2071,8 @@ void writeDefaults (fc_master_params& o) noexcept
     out->bypassLimiter    = d.bypassLimiter ? 1 : 0;
     out->bypassDither     = d.bypassDither ? 1 : 0;
     out->compressorMix    = d.compressorMix;            // v3: 1, the chain before the field existed
+    out->limiterDualRelease   = d.limiter.dualRelease ? 1 : 0;   // v6
+    out->limiterSlowReleaseMs = d.limiter.slowReleaseMs;
 }
 
 void writeDefaults (fc_loudness_request& o) noexcept
@@ -1894,6 +2098,7 @@ void writeDefaults (fc_loudness_request& o) noexcept
     out->activityThresholdDb    = d.activityThresholdDb;
     out->maxPasses              = d.maxPasses;
     out->initialGainDb          = d.initialGainDb;
+    out->grTraceBuckets         = d.grTraceBuckets;     // v6
 }
 }   // namespace
 

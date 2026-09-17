@@ -1025,7 +1025,7 @@ int main()
                 && m4.limiterGrTraceValid == (direct.limiterTrace.valid ? 1 : 0), "v4: the traces' counts and validity");
             auto sameTrace = [&] (std::int32_t stage, const GainReductionTrace& d)
             {
-                std::vector<fc_gr_trace_bucket> tb ((std::size_t) GainReductionTrace::kMaxBuckets + 1u);
+                std::vector<fc_gr_trace_bucket> tb ((std::size_t) std::max (d.buckets, 0) + 1u);   // one past the trace: `w` is not the capacity
                 std::uint32_t w = 0;
                 if (fc_solution_gr_trace (sol, stage, tb.data(), (std::uint32_t) tb.size(), &w) != FC_OK || (int) w != d.buckets || w == 0) return false;
                 for (std::uint32_t i = 0; i < w; ++i)
@@ -1408,8 +1408,9 @@ int main()
         // 4·32, up ring 2·32, down ring 2·128 floats = 2304 B, plus two int cursors = 2312 B — and one shared scratch of
         // 1024·4 floats = 16 384 B: 2·2312 + 16 384 = 21 008 B. It drains from a fixed array, so there is no drain term
         // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer).
+        // And two traces of 1000 x 32 B: 64 000 B.
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
-        ok (solve.callBytes == 2936u + 21008u, "the solve budget is meter + reference true-peak meter = 23 944 B");
+        ok (solve.callBytes == 2936u + 21008u + 64000u, "the solve budget is meter + reference true-peak meter + two traces = 87 944 B");
 
         long long before = alloc::bytes.load();
         const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
@@ -1445,10 +1446,11 @@ int main()
         ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 143999, &under3) == FC_OK && under3.callBytes == 0,
             "one frame under 3 s: nothing is");
         // A solve builds its meters whatever the length — the range rule is NOT the solve's. 1 s still costs
-        // meter + reference true-peak meter: 8·(300 + 24 + 10) + 21 008 = 23 680 B. A length the solve refuses costs 0.
+        // meter + reference true-peak meter + two traces: 8·(300 + 24 + 10) + 21 008 + 64 000 = 87 680 B. A length the
+        // solve refuses costs 0.
         fc_need s1 {}, s0 {}; FC_INIT (s1); FC_INIT (s0);
-        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 23680u,
-            "a 1 s solve is budgeted in full: 23 680 B");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 87680u,
+            "a 1 s solve is budgeted in full: 87 680 B");
         ok (fc_master_need (h, FC_NEED_SOLVE, 0, &s0) == FC_OK && s0.callBytes == 0,
             "a 0-frame solve, which the core refuses before any pass, costs 0");
 
@@ -1456,9 +1458,8 @@ int main()
         fc_loudness_request req {}; fc_loudness_request_default (&req);
         req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
         fc_solution sol = 0;
-        // THE SOLUTION RECORD IS A PLAIN OBJECT, and since v4 it is 50 384 B — over the counter's big-block threshold, where
-        // MSVC's STL pads a CONTAINER and the counter takes that padding off. Told its size, the counter leaves it alone
-        // (as for the instance record above); untold, the `win` row would read 39 B short (the code-review round).
+        // THE SOLUTION RECORD IS A PLAIN OBJECT, told to the counter so that MSVC's container padding is never taken off
+        // it (as for the instance record above).
         alloc::plainObjectSize.store ((std::size_t) solve.facadeBytes, std::memory_order_relaxed);
         before = alloc::bytes.load();
         const fc_status sv = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
@@ -1466,9 +1467,10 @@ int main()
         alloc::plainObjectSize.store (0, std::memory_order_relaxed);
         fc_solution_summary sum {}; FC_INIT (sum);
         ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the search rendered");
-        const long long perPass = (long long) solve.callBytes;
-        ok (solveBytes == (long long) sum.passes * perPass + (long long) solve.facadeBytes,
-            "a solve allocates passes × (both meters) + the facade's record: its budget's parts");
+        const long long traces = 2LL * 1000LL * 32LL;
+        const long long perPass = (long long) solve.callBytes - traces;
+        ok (solveBytes == (long long) sum.passes * perPass + traces + (long long) solve.facadeBytes,
+            "a solve allocates passes × (both meters) + its two traces + the facade's record: its budget's parts");
         (void) fc_solution_destroy (sol);
         (void) fc_master_destroy (h);
     }
@@ -1748,24 +1750,33 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 4u, "PRECONDITION: this group is written for v4 (v2: deliveryRate; v3: compressorMix; v4: the GR trace)");
+        ok (kCur == 6u, "PRECONDITION: this group is written for v6 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+                        "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u,
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 6) == 88u,
             "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u,
-            "params: 6560 at v1 and v2, 6568 from v3");
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 6) == 6584u,
+            "params: 6560 at v1 and v2, 6568 from v3, 6584 from v6");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u,
-            "resolved: 80 at v1 and v2, 88 from v3");
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 6) == 96u,
+            "resolved: 80 at v1 and v2, 88 from v3, 96 from v6");
         ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
-            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u, "measurement: 208 to v3, 224 from v4 — the trace's four fields");
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 5) == 224u
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u,
+            "measurement: 208 to v3, 224 from v4 — the trace's four fields");
+        ok (fc_master_sizeof (FC_STRUCT_REQUEST, 1) == 120u && fc_master_sizeof (FC_STRUCT_REQUEST, 5) == 120u
+            && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u,
+            "request: 120 to v5, 128 from v6 — `grTraceBuckets` and its named padding");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
         {
-            if (id == FC_STRUCT_MEASUREMENT) continue;
+            if (id == FC_STRUCT_MEASUREMENT || id == FC_STRUCT_REQUEST) continue;
             for (std::uint32_t v = 2u; v <= kCur; ++v)
                 if (fc_master_sizeof (id, 1) == 0u || fc_master_sizeof (id, v) != fc_master_sizeof (id, 1)) ++inherit;
         }
@@ -1781,6 +1792,8 @@ int main()
             { 2u, 88u, FC_OK,              "v2 at 88 bytes" },
             { 3u, 88u, FC_OK,              "v3 at 88 bytes — the config did not grow at v3" },
             { 4u, 88u, FC_OK,              "v4 at 88 bytes — nor at v4" },
+            { 5u, 88u, FC_OK,              "v5 at 88 bytes — nor at v5" },
+            { 6u, 88u, FC_OK,              "v6 at 88 bytes — nor at v6" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
@@ -1936,7 +1949,7 @@ int main()
             auto pb = canaried (6568u);
             fc_master_params_default (reinterpret_cast<fc_master_params*> (pb.data()));
             ok (reinterpret_cast<fc_master_params*> (pb.data())->header.abiVersion == 1u && intact (pb, 6560u),
-                "fc_master_params_default: v1, 6560 bytes and none past — though this build's params are 6568");
+                "fc_master_params_default: v1, 6560 bytes and none past — though this build's params are 6584");
             auto qb = canaried (120u);
             fc_loudness_request_default (reinterpret_cast<fc_loudness_request*> (qb.data()));
             ok (reinterpret_cast<fc_loudness_request*> (qb.data())->header.abiVersion == 1u && intact (qb, 120u),
@@ -2099,16 +2112,15 @@ int main()
         (void) fc_solution_destroy (sol);
         ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, again.data(), 1000u, &w) == FC_ERR_HANDLE, "a destroyed solution is stale");
 
-        // THE PRICE, PINNED (rule 9ф: the literal carries its derivation). A solution record is `LoudnessSolution` by value,
-        // and the two traces grew it from 2336 B to 2336 + 2 x (24 + 1000 x 24) = 50 384 B: each trace is 1000 buckets of
-        // {double, double, uint32, uint32} = 24 B plus its count, flag and two uint64 totals = 24 B. `facadeBytes` is that
-        // sizeof, so a budget that silently moved again would move this number, and a stage added or a bucket widened fails
-        // here rather than in a worker's heap.
+        // THE PRICE, PINNED: a solution record is 2336 B and two `GainReductionTrace`s, their buckets not included.
         {
+            using felitronics::mastering::GainReductionTrace;
             fc_master hb = make();
             fc_need nd {}; FC_INIT (nd);
-            ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK && nd.facadeBytes == 2336u + 2u * (24u + 1000u * 24u),
-                "a solution record costs 50 384 B — 2336 before the traces, plus two traces of 24 024 (" + std::to_string (nd.facadeBytes) + ")");
+            ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK && nd.facadeBytes == 2336u + 2u * sizeof (GainReductionTrace)
+                && sizeof (GainReductionTrace) == (24u + sizeof (GainReductionTrace::bucket) + 7u) / 8u * 8u,
+                "a solution record costs 2336 B plus two traces of " + std::to_string (sizeof (GainReductionTrace)) + " B, buckets not included ("
+                + std::to_string (nd.facadeBytes) + ")");
             (void) fc_master_destroy (hb);
         }
 
@@ -2123,6 +2135,272 @@ int main()
         ok (fc_solution_gr_trace (sol3, FC_GR_STAGE_COMPRESSOR, first.data(), 1000u, &w) == FC_OK && w == 0u, "and nothing written");
         (void) fc_solution_destroy (sol3);
         (void) fc_master_destroy (h2);
+    }
+
+    //==========================================================================
+    // v6
+    group ("v6: the dual release, grTraceBuckets, fc_solution_gr_trace64 and fc_master_need_solve");
+    {
+        using namespace felitronics::mastering;
+        auto canaried = [] (std::size_t bytes) { std::vector<unsigned char> b (bytes + 64u, 0xC3); return b; };
+        auto intact   = [] (const std::vector<unsigned char>& b, std::size_t from)
+        { for (std::size_t i = from; i < b.size(); ++i) if (b[i] != 0xC3) return false; return true; };
+
+        // THE DUAL RELEASE: off by default, mapped when on, floored by the core and read back out of it, a NaN refused.
+        {
+            fc_master h = make();
+            fc_master_resolved r {}; FC_INIT (r);
+            fc_master_params p {}; FC_INIT (p);
+            ok (fc_master_params_defaults (&p) == FC_OK && p.limiterDualRelease == 0 && p._pad0 == 0
+                && p.limiterSlowReleaseMs == felitronics::limiter::TruePeakLimiterParams {}.slowReleaseMs,
+                "the defaults writer: the dual release off, the core's slow release, the padding 0");
+            ok (fc_master_configure (h, &p, &r) == FC_OK && r.limiterSlowReleaseMs == 0.0, "off, the resolved slow release is 0");
+
+            // The same chain through C++, for the number the core reads back.
+            MasteringChainConfig cc {}; cc.internalBlock = 256; cc.monoBass = true; cc.clipper = true;
+            auto directSlow = [&] (double slowMs)
+            {
+                MasteringChain chain;
+                MasteringChainParams cp {};
+                cp.limiter.dualRelease = true; cp.limiter.slowReleaseMs = slowMs;
+                chain.setParams (cp);
+                return chain.prepare (kFs, kNch, cc) ? chain.resolved().limiterSlowReleaseMs : -1.0;
+            };
+            p.limiterDualRelease = 1; p.limiterSlowReleaseMs = 180.0;
+            const double want180 = directSlow (180.0);
+            // The effective release, read back from a float coefficient.
+            ok (fc_master_configure (h, &p, &r) == FC_OK && r.limiterSlowReleaseMs == want180 && std::fabs (want180 - 180.0) < 0.5,
+                "on, the slow release the core runs, read out of it (180 ms asked, " + std::to_string (r.limiterSlowReleaseMs) + " read)");
+            p.limiterDualRelease = -7;
+            ok (fc_master_configure (h, &p, &r) == FC_OK && r.limiterSlowReleaseMs == want180, "any non-zero flag is on");
+            p.limiterDualRelease = 1; p.limiterSlowReleaseMs = 0.0;
+            const double wantFloor = directSlow (0.0);
+            ok (fc_master_configure (h, &p, &r) == FC_OK && r.limiterSlowReleaseMs == wantFloor && wantFloor > 0.16 && wantFloor < 0.17,
+                "a slow release of 0 is floored by the core at 8 samples and read back (" + std::to_string (r.limiterSlowReleaseMs) + " ms)");
+            p.limiterSlowReleaseMs = std::numeric_limits<double>::quiet_NaN();
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_NON_FINITE, "a NaN slow release: NON_FINITE");
+            p.limiterDualRelease = 0; p.limiterSlowReleaseMs = std::numeric_limits<double>::infinity();
+            ok (fc_master_configure (h, &p, &r) == FC_ERR_NON_FINITE, "and an infinite one with the dual release off, too");
+
+            // A v5 parameter set: the two fields past its 6568 bytes are not read. The same bytes under v6 are.
+            fc_master_params p5 = p;
+            p5.limiterDualRelease = 1; p5.limiterSlowReleaseMs = 180.0;
+            p5.header.abiVersion = 5u; p5.header.structSize = 6568u;
+            ok (fc_master_configure (h, &p5, &r) == FC_OK && r.limiterSlowReleaseMs == 0.0,
+                "a v5 parameter set: the dual release past its 6568 bytes is not read — the limiter runs its single release");
+            FC_INIT (p5);
+            ok (fc_master_configure (h, &p5, &r) == FC_OK && r.limiterSlowReleaseMs == want180, "and under v6 the same bytes switch it on");
+
+            // A v5 resolved gets its 88 and not a byte more; a v6 one gets its 96.
+            auto rb = canaried (96u);
+            auto* r5 = reinterpret_cast<fc_master_resolved*> (rb.data());
+            r5->header.abiVersion = 5u; r5->header.structSize = 88u;
+            ok (fc_master_configure (h, &p5, r5) == FC_OK && r5->header.structSize == 88u && intact (rb, 88u),
+                "configure: a v5 resolved, nothing written past its 88 where v6 keeps the slow release");
+            auto rb6 = canaried (96u);
+            auto* r6 = reinterpret_cast<fc_master_resolved*> (rb6.data());
+            r6->header.abiVersion = 6u; r6->header.structSize = 96u;
+            ok (fc_master_configure (h, &p5, r6) == FC_OK && r6->limiterSlowReleaseMs == want180 && intact (rb6, 96u),
+                "and a v6 one gets its 96, the slow release included");
+            (void) fc_master_destroy (h);
+        }
+
+        // 4096 buckets through both copiers against the core, and the 64-bit copier's checks.
+        {
+            const std::size_t frames = (std::size_t) (kFs * 3.0);
+            auto in = tone (frames, kNch);
+            fc_master h = make();
+            fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+            p.limiter.ceilingDbTp = -1.3; p.compressor.thresholdDb = -17.3;
+            fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+            ok (req.grTraceBuckets == 1000 && req._pad0 == 0, "the request's defaults writer: 1000 buckets, the padding 0");
+            req.targetLufs = -4.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 3; req.grTraceBuckets = 4096;
+            std::vector<float> viaAbi (in.size(), 0.0f), viaCpp (in.size(), 0.0f);
+            fc_solution sol = 0;
+            ok (fc_master_solve (h, &p, &req, in.data(), viaAbi.data(), (std::uint32_t) frames, &sol) == FC_OK, "PRECONDITION: a solution");
+
+            MasteringChainConfig cc {}; cc.internalBlock = 256; cc.monoBass = true; cc.clipper = true;
+            MasteringChainParams cp {}; cp.limiter.ceilingDbTp = -1.3; cp.compressor.thresholdDb = -17.3;
+            MasteringChain chain; OfflineRenderer rend; TargetLoudnessSolver solver;
+            const bool prep = rend.prepare (kNch, 4096) && chain.prepare (kFs, kNch, cc)
+                           && solver.prepare (kFs, kNch, rend.blockSize(), chain.internalBlock(), chain.tapOversampleFactor());
+            LoudnessRequest lr {}; lr.targetLufs = -4.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 3; lr.grTraceBuckets = 4096;
+            const float* ip[2] { in.data(), in.data() + frames };
+            float*       op[2] { viaCpp.data(), viaCpp.data() + frames };
+            LoudnessSolution direct;
+            if (prep) direct = solver.solve (chain, rend, cp, ip, op, kNch, (int) frames, lr);
+            ok (prep && std::memcmp (viaAbi.data(), viaCpp.data(), viaAbi.size() * sizeof (float)) == 0,
+                "PRECONDITION: the direct search delivers the same audio");
+            fc_measurement m {}; FC_INIT (m);
+            ok (fc_solution_measurement (sol, &m) == FC_OK && m.limiterGrTraceBuckets == 4096 && m.compressorGrTraceBuckets == 4096
+                && m.limiterGrTraceValid == 1 && m.compressorGrTraceValid == 1, "the measurement: 4096 buckets per stage, both valid");
+            for (const auto& [code, name, tr] : { std::tuple<std::int32_t, const char*, const GainReductionTrace*> { FC_GR_STAGE_LIMITER, "limiter", &direct.limiterTrace },
+                                                  std::tuple<std::int32_t, const char*, const GainReductionTrace*> { FC_GR_STAGE_COMPRESSOR, "compressor", &direct.compressorTrace } })
+            {
+                std::vector<fc_gr_trace_bucket64> t64 (4097u);
+                std::vector<fc_gr_trace_bucket>   t32 (4096u);
+                std::uint32_t w64 = 0, w32 = 0;
+                const bool got = fc_solution_gr_trace64 (sol, code, t64.data(), 4097u, &w64) == FC_OK && w64 == 4096u
+                              && fc_solution_gr_trace (sol, code, t32.data(), 4096u, &w32) == FC_OK && w32 == 4096u
+                              && tr->buckets == 4096 && tr->bucket.size() == 4096u;
+                double live = 0.0; std::size_t bad = 0;
+                for (std::uint32_t i = 0; got && i < 4096u; ++i)
+                {
+                    const GainReductionTraceBucket& b = tr->bucket[i];
+                    live = std::max (live, b.maxDb);
+                    if (std::memcmp (&t64[i].maxDb, &b.maxDb, 8) != 0 || std::memcmp (&t64[i].meanDb, &b.meanDb, 8) != 0
+                        || t64[i].samples != b.samples || t64[i].nonFinite != b.nonFinite
+                        || std::memcmp (&t32[i].maxDb, &b.maxDb, 8) != 0 || std::memcmp (&t32[i].meanDb, &b.meanDb, 8) != 0
+                        || (std::uint64_t) t32[i].samples != b.samples || (std::uint64_t) t32[i].nonFinite != b.nonFinite) ++bad;
+                }
+                ok (live > 0.5, std::string ("PRECONDITION: the ") + name + " trace is live (" + std::to_string (live) + " dB)");
+                ok (got && bad == 0, std::string ("the ") + name + " trace at 4096 buckets, through both copiers, is the core's bit for bit ("
+                    + std::to_string (bad) + " differ)");
+            }
+
+            std::vector<fc_gr_trace_bucket64> b64 (16u);
+            std::uint32_t w = 555u;
+            ok (fc_solution_gr_trace64 (sol, FC_GR_STAGE_LIMITER, b64.data(), 10u, &w) == FC_OK && w == 10u
+                && b64[0].samples == direct.limiterTrace.bucket[0].samples && b64[10].samples == 0u,
+                "the capacity is in BUCKETS: 10 asked, 10 written, the 11th untouched");
+            ok (fc_solution_gr_trace64 (sol, FC_GR_STAGE_LIMITER, nullptr, 0u, &w) == FC_OK && w == 0u, "asking for nothing: FC_OK, 0 written");
+            w = 555u;
+            ok (fc_solution_gr_trace64 (sol, FC_GR_STAGE_LIMITER, nullptr, 4u, &w) == FC_ERR_NULL && w == 555u, "a null buffer with a capacity: NULL");
+            auto* odd = reinterpret_cast<fc_gr_trace_bucket64*> (static_cast<void*> ((char*) b64.data() + 4));
+            ok (fc_solution_gr_trace64 (sol, FC_GR_STAGE_LIMITER, odd, 4u, &w) == FC_ERR_ALIGNMENT && w == 555u, "off the 8-byte grid: ALIGNMENT");
+            ok (fc_solution_gr_trace64 (sol, FC_GR_STAGE_LIMITER, b64.data(), 4u, nullptr) == FC_ERR_NULL, "a null `written`: NULL");
+            b64[1].samples = 4242u;
+            auto* inside = reinterpret_cast<std::uint32_t*> (static_cast<void*> (&b64[1].samples));
+            ok (fc_solution_gr_trace64 (sol, FC_GR_STAGE_LIMITER, b64.data(), 4u, inside) == FC_ERR_SPAN && b64[1].samples == 4242u,
+                "`written` inside the buckets: SPAN, and nothing written");
+            ok (fc_solution_gr_trace64 (sol, 2, b64.data(), 4u, &w) == FC_ERR_ENUM && fc_solution_gr_trace64 (sol, 7, nullptr, 0u, &w) == FC_ERR_ENUM
+                && w == 555u, "a stage that names nothing: ENUM, with a capacity of 0 too, `written` untouched");
+            ok (fc_solution_gr_trace64 (sol, 7, nullptr, 4u, &w) == FC_ERR_NULL, "the out-parameter before the field value: NULL");
+            ok (fc_solution_gr_trace64 (h, FC_GR_STAGE_LIMITER, b64.data(), 4u, &w) == FC_ERR_HANDLE, "a chain handle is not a solution");
+            (void) fc_solution_destroy (sol);
+
+            // A v5 request: the count past its 120 bytes is not read.
+            fc_master_params pc {}; FC_INIT (pc); (void) fc_master_params_defaults (&pc);
+            fc_master_resolved rr {}; FC_INIT (rr);
+            fc_loudness_request q5 = req; q5.header.abiVersion = 5u; q5.header.structSize = 120u;
+            std::vector<float> out (in.size(), 0.0f);
+            ok (fc_master_configure (h, &pc, &rr) == FC_OK && fc_master_solve (h, &p, &q5, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK
+                && fc_solution_measurement (sol, &m) == FC_OK && m.limiterGrTraceBuckets == 1000,
+                "a v5 request: `grTraceBuckets` past its 120 bytes is not read — 1000 buckets");
+            (void) fc_solution_destroy (sol);
+
+            // The count's range is the core's verdict, delivered with FC_OK.
+            struct Row { std::int32_t buckets; bool admitted; int want; };
+            for (const Row rw : { Row { 0, false, 0 }, Row { -1, false, 0 }, Row { std::numeric_limits<std::int32_t>::min(), false, 0 },
+                                  Row { 65537, false, 0 }, Row { 1, true, 1 }, Row { 65536, true, 65536 } })
+            {
+                fc_loudness_request q = req; q.grTraceBuckets = rw.buckets; q.maxPasses = 1;
+                fc_solution_summary su {}; FC_INIT (su);
+                const bool solved = fc_master_configure (h, &pc, &rr) == FC_OK
+                                 && fc_master_solve (h, &p, &q, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK
+                                 && fc_solution_summary_get (sol, &su) == FC_OK && fc_solution_measurement (sol, &m) == FC_OK;
+                ok (solved && (su.status == FC_SOLVE_INVALID_REQUEST) == ! rw.admitted && m.limiterGrTraceBuckets == rw.want,
+                    "grTraceBuckets " + std::to_string (rw.buckets) + ": " + (rw.admitted ? "a render" : "InvalidRequest, no trace")
+                    + " (" + std::to_string (m.limiterGrTraceBuckets) + " buckets)");
+                (void) fc_solution_destroy (sol);
+            }
+            (void) fc_master_destroy (h);
+        }
+
+        // fc_master_need_solve: FC_NEED_SOLVE's at 1000, the traces' difference at 65536, 0 for a refused count, the checks,
+        // and a 65 536-bucket solve's allocation.
+        {
+            fc_master h = make();
+            const std::uint32_t n = 192000u;
+            fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+            fc_need base {}, same {}, big {}, zero {}; FC_INIT (base); FC_INIT (same); FC_INIT (big); FC_INIT (zero);
+            ok (fc_master_need (h, FC_NEED_SOLVE, n, &base) == FC_OK && fc_master_need_solve (h, &req, n, &same) == FC_OK
+                && same.callBytes == base.callBytes && same.facadeBytes == base.facadeBytes && same.solverPrepareBytes == base.solverPrepareBytes
+                && same.solverPrepared == base.solverPrepared && same._pad0 == 0,
+                "at the default 1000 buckets it is FC_NEED_SOLVE's budget, field for field");
+            req.grTraceBuckets = 65536;
+            ok (fc_master_need_solve (h, &req, n, &big) == FC_OK && big.callBytes == base.callBytes + 2u * (65536u - 1000u) * 32u,
+                "65 536 buckets: two traces of 65 536 x 32 B in place of 1000 x 32 B");
+            req.grTraceBuckets = 0;
+            ok (fc_master_need_solve (h, &req, n, &zero) == FC_OK && zero.callBytes == 0u, "a count the core refuses: FC_OK, callBytes 0");
+            req.grTraceBuckets = 4096;
+            fc_need s1 {}, d1 {}; FC_INIT (s1); FC_INIT (d1);
+            ok (fc_master_need_solve (h, &req, 1000u, &s1) == FC_OK && fc_master_need (h, FC_NEED_SOLVE, 1000u, &d1) == FC_OK
+                && s1.callBytes == d1.callBytes && s1.callBytes > 0u,
+                "4096 buckets over 1000 frames hold one bucket per frame — the budget of 1000 buckets");
+            fc_loudness_request q5 = req; q5.header.abiVersion = 5u; q5.header.structSize = 120u;
+            fc_need n5 {}; FC_INIT (n5);
+            ok (fc_master_need_solve (h, &q5, n, &n5) == FC_OK && n5.callBytes == base.callBytes,
+                "a v5 request is budgeted at its 1000 buckets, whatever lies past its 120 bytes");
+            fc_loudness_request bad = req; bad.header.abiVersion = 0u;
+            ok (fc_master_need_solve (h, &bad, n, &big) == FC_ERR_ABI_VERSION, "a request of version 0: ABI_VERSION");
+            ok (fc_master_need_solve (h, nullptr, n, &big) == FC_ERR_NULL && fc_master_need_solve (h, &req, n, nullptr) == FC_ERR_NULL,
+                "a null request or out: NULL");
+            fc_need badOut {}; FC_INIT (badOut); badOut.header.structSize = 32u;
+            ok (fc_master_need_solve (h, &bad, n, &badOut) == FC_ERR_STRUCT_SIZE, "`out` before `req`: a bad out and a bad request answer STRUCT_SIZE");
+            ok (fc_master_need_solve (h, &req, 0x80000000u, &big) == FC_ERR_RANGE, "frames past INT_MAX: RANGE");
+            ok (fc_master_need_solve (0u, &req, n, &big) == FC_ERR_HANDLE, "a null handle: HANDLE");
+
+            ok (fc_master_set_channel_weight (h, 0, 1.0) == FC_OK, "PRECONDITION: the solver prepared");
+            req.grTraceBuckets = 65536;
+            fc_need nb {}; FC_INIT (nb);
+            ok (fc_master_need_solve (h, &req, n, &nb) == FC_OK, "PRECONDITION: budgeted");
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+            fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+            auto in = tone (n, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_solution sol = 0;
+            alloc::plainObjectSize.store ((std::size_t) nb.facadeBytes, std::memory_order_relaxed);
+            const long long before = alloc::bytes.load();
+            const fc_status sv = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
+            const long long got = alloc::bytes.load() - before;
+            alloc::plainObjectSize.store (0, std::memory_order_relaxed);
+            fc_solution_summary sum {}; FC_INIT (sum);
+            fc_measurement m {}; FC_INIT (m);
+            ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0 && fc_solution_measurement (sol, &m) == FC_OK
+                && m.limiterGrTraceBuckets == 65536, "PRECONDITION: the search rendered, 65 536 buckets");
+            const long long traces = 2LL * 65536LL * 32LL;
+            const long long perPass = (long long) nb.callBytes - traces;
+            ok (perPass > 0 && got == (long long) sum.passes * perPass + traces + (long long) nb.facadeBytes,
+                "a 65 536-bucket solve allocates passes x its meters + two traces of 2 097 152 B + the record (" + std::to_string (got) + ")");
+            (void) fc_solution_destroy (sol);
+            (void) fc_master_destroy (h);
+        }
+
+        // A solve stopped on its first pass's record allocates exactly its budget, on a plain and on a delivering handle.
+        {
+            struct StopOnRecord { static std::int32_t fn (void*, const fc_progress* e) { return e->hasRecord != 0 ? 0 : 1; } };
+            for (const double dr : { 0.0, 96000.0 })
+            {
+                fc_master_config c {}; FC_INIT (c);
+                (void) fc_master_config_defaults (&c);
+                c.sampleRate = kFs; c.channels = kNch; c.deliveryRate = dr;
+                fc_master h = 0;
+                const std::uint32_t n = 65536u;
+                const std::uint32_t outN = dr == 0.0 ? n : 2u * n;
+                fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+                fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+                req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0; req.grTraceBuckets = 65536;
+                fc_need nb {}; FC_INIT (nb);
+                const bool ready = fc_master_create (&c, &h) == FC_OK && fc_master_set_channel_weight (h, 0, 1.0) == FC_OK
+                                && fc_master_set_progress (h, &StopOnRecord::fn, nullptr) == FC_OK
+                                && fc_master_need_solve (h, &req, n, &nb) == FC_OK && nb.solverPrepared == 1;
+                auto in = tone (n, kNch);
+                std::vector<float> out ((std::size_t) outN * kNch, 0.0f);
+                fc_solution sol = 0;
+                alloc::plainObjectSize.store ((std::size_t) nb.facadeBytes, std::memory_order_relaxed);
+                const long long before = alloc::bytes.load();
+                const fc_status sv = ! ready ? FC_ERR_STATE
+                                   : dr == 0.0 ? fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol)
+                                               : fc_master_solve_delivered (h, &p, &req, in.data(), n, out.data(), outN, &sol);
+                const long long got = alloc::bytes.load() - before;
+                alloc::plainObjectSize.store (0, std::memory_order_relaxed);
+                ok (ready && sv == FC_ERR_CANCELLED && got == (long long) (nb.callBytes + nb.facadeBytes),
+                    std::string (dr == 0.0 ? "plain" : "48 -> 96 kHz") + ": stopped on the first record, " + std::to_string (got)
+                    + " B allocated against a budget of " + std::to_string (nb.callBytes + nb.facadeBytes) + " B");
+                (void) fc_master_destroy (h);
+            }
+        }
     }
 
     //==========================================================================
@@ -2377,9 +2655,10 @@ int main()
             alloc::plainObjectSize.store (0, std::memory_order_relaxed);
             fc_solution_summary sum {}; FC_INIT (sum);
             ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the delivered search rendered");
-            const long long perPass = (long long) solve.callBytes - programme;
-            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + programme + (long long) solve.facadeBytes,
-                "a delivered solve allocates passes x (both meters at 96 kHz) + the converted programme + the record ("
+            const long long traces = 2LL * 1000LL * 32LL;
+            const long long perPass = (long long) solve.callBytes - programme - traces;
+            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + traces + programme + (long long) solve.facadeBytes,
+                "a delivered solve allocates passes x (both meters at 96 kHz) + two traces + the converted programme + the record ("
                 + std::to_string (solveBytes) + ")");
             (void) fc_solution_destroy (sol);
             (void) fc_master_destroy (h);

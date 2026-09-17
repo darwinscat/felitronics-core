@@ -274,7 +274,7 @@ static void testSolveAndRangeAreTheComposition()
                          + (identity ? 0u : (std::uint64_t) (kNch * d * 4)),
             tag + "which is the meter at the delivered length plus the converted programme — none at equal rates");
 
-        const std::uint64_t solveBudget = DeliveredMastering::solveBytes (pr.a, pr.b, kNch, n);
+        const std::uint64_t solveBudget = DeliveredMastering::solveBytes (pr.a, pr.b, kNch, n, req.grTraceBuckets);
         before = alloc::bytes.load();
         const LoudnessSolution sg = dm.solve (s2, c2, r2, params, pg.in, kNch, n, pg.out, d, req);
         const long long solveBytes = alloc::bytes.load() - before;
@@ -282,9 +282,10 @@ static void testSolveAndRangeAreTheComposition()
             && sg.passes == so.passes && sg.passes > 0, tag + "the search's verdict is the hand composition's");
         ok (bitDiff (oracle, got) == 0, tag + "and so is its delivered audio, bit for bit");
         const long long programmeBytes = identity ? 0 : (long long) kNch * d * 4;
-        const long long perPass = (long long) solveBudget - programmeBytes;
-        ok (perPass > 0 && solveBytes == (long long) sg.passes * perPass + programmeBytes,
-            tag + "the search allocates passes x its meters + the converted programme ("
+        const long long traceBytes = 2LL * (long long) GainReductionTrace::bytesFor (req.grTraceBuckets, (int) d);
+        const long long perPass = (long long) solveBudget - programmeBytes - traceBytes;
+        ok (perPass > 0 && traceBytes == 2LL * 1000LL * 32LL && solveBytes == (long long) sg.passes * perPass + traceBytes + programmeBytes,
+            tag + "the search allocates passes x its meters + its two 1000-bucket traces + the converted programme ("
             + std::to_string (solveBytes) + ")");
     }
 
@@ -578,7 +579,7 @@ static void testCreateBudget()
         "8000 Hz either way: a budget");
     ok (DeliveredMastering::deliveredFrames (7999.0, 48000.0, 7999) < 0 && DeliveredMastering::deliveredFrames (8000.0, 48000.0, 8000) == 48000,
         "the delivered length says the same: none from 7999, one second from 8000");
-    ok (DeliveredMastering::solveBytes (4000.0, 48000.0, kNch, 4000 * 10) == 0u
+    ok (DeliveredMastering::solveBytes (4000.0, 48000.0, kNch, 4000 * 10, GainReductionTrace::kDefaultBuckets) == 0u
             && DeliveredMastering::measureRangeBytes (4000.0, 48000.0, kNch, 4000 * 10) == 0u
             && DeliveredMastering::prepareBytes (4000.0, 48000.0, kNch, kBlock) == 0u,
         "and the other budgets of a 4000 Hz source are 0 — it was planned, and budgeted, on origin/main");

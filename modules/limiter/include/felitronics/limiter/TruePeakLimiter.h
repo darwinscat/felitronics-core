@@ -101,7 +101,13 @@ struct TruePeakLimiterConfig
 struct TruePeakLimiterParams
 {
     double ceilingDbTp = -1.0;       // output true-peak ceiling (dBTP) — see the derate note below
-    double releaseMs   = 100.0;
+    double releaseMs   = 100.0;      // ms; with `dualRelease`, the fast envelope's
+    // Off: one envelope, `releaseMs`. On: a second envelope — instant attack, release `slowReleaseMs` — whose input is
+    // the least, over the last TruePeakLimiter::kSlowWindowMs, of the largest reduction required within
+    // TruePeakLimiter::kSlowBridgeMs; the reduction applied is the larger of the two envelopes'. Switching on starts
+    // the slow envelope and its windows from 0 dB; switching off continues the fast envelope from the reduction applied.
+    bool   dualRelease   = false;
+    double slowReleaseMs = 200.0;    // ms; floored like `releaseMs`
 };
 
 //==============================================================================
@@ -154,6 +160,7 @@ struct TruePeakLimiterTap
 // emitted sample is necessarily inside its own detector window and the release branch can only keep
 // MORE reduction than required, so on that grid the bound is algebra, not a heuristic — which is the
 // whole difference between this and a lookahead gain ramp.
+// Under `dualRelease` the applied reduction is the larger of the two envelopes', so the same bound holds.
 //
 // ====================================================================================
 // WHAT IT DOES NOT PROMISE — read before setting a ceiling from a platform's number.
@@ -203,6 +210,8 @@ struct TruePeakLimiterTap
 // inside would need floors at 24 baseband samples (0.5 ms), which is a musical setting and would change
 // the sound of a legitimate one — so the corner is documented instead of clamped away. The only thing
 // proven for every input is the on-grid bound.
+//
+// UNDER `dualRelease` the same witnesses stay inside the same budgets (felitronics_limiter_ceiling_tests, "Dual release").
 //
 // SO: a product ceiling needs a DERATE, or a loop closed on measured true peak. Setting ceilingDbTp
 // to C does not deliver C dBTP. Over the characterised domain, budget ~1.2 dB for a bright, dense,
@@ -291,13 +300,14 @@ public:
         int         osDelaySamples = 0;    // the 20 ms lookahead capacity, in OVERSAMPLED samples
         oversampling::Oversampler::Storage os {};
         detail::SlidingMax::Storage slide {};
+        detail::SlidingMax::Storage slowWindow {}, slowBridge {};   // the dual release's windows, on or off
         std::uint64_t bytes() const noexcept
         {
             return (std::uint64_t) channels * ((std::uint64_t) sizeof (std::vector<float>)
                                                + (std::uint64_t) sizeof (float) * (std::uint64_t) osBufSamples
                                                + (std::uint64_t) sizeof (float*))
                  + core::delayBankBytes (channels, osDelaySamples)
-                 + os.bytes() + slide.bytes();
+                 + os.bytes() + slide.bytes() + slowWindow.bytes() + slowBridge.bytes();
         }
     };
 
@@ -329,8 +339,21 @@ public:
         st.osBufSamples   = (std::size_t) blockFor (maxBlock) * (std::size_t) f;
         st.osDelaySamples = maxLookBb * f;
         st.slide          = detail::SlidingMax::storageFor (st.osDelaySamples + 1);
+        st.slowWindow     = detail::SlidingMax::storageFor (windowSamplesFor (kSlowWindowMs, sampleRate, f));
+        st.slowBridge     = detail::SlidingMax::storageFor (windowSamplesFor (kSlowBridgeMs, sampleRate, f));
         out = st;
         return true;
+    }
+
+    // The dual release's windows, in ms — see TruePeakLimiterParams::dualRelease.
+    static constexpr double kSlowBridgeMs = 20.0;
+    static constexpr double kSlowWindowMs = 70.0;
+
+    // A window of `ms` in OVERSAMPLED samples, the current sample included: `ms` rounded to baseband samples, at least
+    // one, times `factor`.
+    static int windowSamplesFor (double ms, double sampleRate, int factor) noexcept
+    {
+        return std::max (1, (int) std::lround (ms * 0.001 * sampleRate)) * factor;
     }
 
     // THE EFFECTIVE FACTOR, in one place: a requested 1 becomes 2, and anything above kMaxFactor was
@@ -436,6 +459,9 @@ public:
         const int maxLookOS  = st.osDelaySamples;
         core::prepareDelayBank (osDelays, st.channels, maxLookOS);
         slide.prepare (maxLookOS + 1);
+        slowWindow_ = (int) st.slowWindow.entries;
+        slowWin.prepare (slowWindow_);
+        bridgeWin.prepare ((int) st.slowBridge.entries);
 
         // The lookahead floor is not taste. At zero the structure degenerates into a clipper at the
         // oversampled rate: +2.05 dB over the ceiling, measured, and unlike the terms above that one has
@@ -466,6 +492,10 @@ public:
         for (auto& b : osBuf) std::fill (b.begin(), b.end(), 0.0f);
         for (auto& d : osDelays) d.reset();
         slide.reset();
+        slowWin.reset();
+        bridgeWin.reset();
+        slowFill_ = 0;
+        grSlowDb  = 0.0f;
         grDb = 0.0f;
         linkedPeakLin_ = 0.0f;                                 // a free-running maximum SINCE RESET, like
                                                                // TruePeakMeter's — so it means "this stream"
@@ -477,7 +507,7 @@ public:
     // All of these read as "nothing prepared" after a failed prepare(), rather than reporting the
     // topology of whatever was prepared before it — a stale latency is worse than an obvious zero.
     int    latencySamples()  const noexcept { return prepared_ ? os.latencySamples() + lookBaseband : 0; }
-    double gainReductionDb() const noexcept { return grDb; }
+    double gainReductionDb() const noexcept { return dual_ ? std::min (grDb, grSlowDb) : grDb; }
     bool   isPrepared()      const noexcept { return prepared_; }
 
     // The highest RECONSTRUCTED peak this limiter has seen since reset() — the channel-linked maximum of
@@ -504,6 +534,8 @@ public:
     int    lookaheadSamples()  const noexcept { return prepared_ ? lookBaseband : 0; }
     double effectiveReleaseMs()   const noexcept { return relMsEffective; }
     double effectiveCeilingDbTp() const noexcept { return ceilingDb; }
+    // The slow release in ms after the floor; 0 while `dualRelease` is off.
+    double effectiveSlowReleaseMs() const noexcept { return dual_ ? slowMsEffective : 0.0; }
 
     // Audio thread, in place (baseband). RT-safe. `numSamples` may exceed the maxBlock passed to
     // prepare() — chunked internally, state carries across chunks, so the result is bit-identical to
@@ -625,8 +657,17 @@ private:
             if (rawRedDb > 0.0) rawRedDb = 0.0;
 
             grDb = std::min ((float) rawRedDb, grDb * relCoef);   // instant attack, exponential release toward 0 dB
-            if (tap.gainReductionDb != nullptr) tap.gainReductionDb[(std::size_t) i] = grDb;
-            const float gain = (float) core::dbToGain ((double) grDb);
+            float gr = grDb;
+            if (dual_)
+            {
+                // Samples before the reset or the switch count as 0 dB.
+                const float held = slowWin.push (- bridgeWin.push (- (float) rawRedDb));
+                if (slowFill_ < slowWindow_) ++slowFill_;
+                grSlowDb = std::min (slowFill_ < slowWindow_ ? 0.0f : held, grSlowDb * relCoefSlow);
+                gr = std::min (grDb, grSlowDb);
+            }
+            if (tap.gainReductionDb != nullptr) tap.gainReductionDb[(std::size_t) i] = gr;
+            const float gain = (float) core::dbToGain ((double) gr);
 
             for (int c = 0; c < nc; ++c)
             {
@@ -643,6 +684,7 @@ private:
         // two behave identically on every reachable state. Kept as the house-standard form for recursive
         // state; the thing that actually closed the poison defect is the gate.
         core::flushPoison (grDb);
+        core::flushPoison (grSlowDb);
     }
 
     void apply (const TruePeakLimiterParams& p) noexcept
@@ -663,7 +705,18 @@ private:
         // at both conformance rates and every factor; with both parameters on their floors at once the
         // corner is outside it, and that is documented in the header rather than clamped away. 167 µs at
         // 48 kHz, i.e. far below any musical release.
-        const double relMs = std::isfinite (p.releaseMs) ? p.releaseMs : 100.0;
+        releaseFor (std::isfinite (p.releaseMs) ? p.releaseMs : 100.0, relCoef, relMsEffective);
+        releaseFor (std::isfinite (p.slowReleaseMs) ? p.slowReleaseMs : TruePeakLimiterParams {}.slowReleaseMs,
+                    relCoefSlow, slowMsEffective);
+
+        if (p.dualRelease && ! dual_)       { slowWin.reset(); bridgeWin.reset(); slowFill_ = 0; grSlowDb = 0.0f; }
+        else if (! p.dualRelease && dual_)  grDb = std::min (grDb, grSlowDb);
+        dual_ = p.dualRelease;
+    }
+
+    // A release in ms: its coefficient per OVERSAMPLED sample, and the release in ms that coefficient runs.
+    void releaseFor (double relMs, float& coef, double& effectiveMs) const noexcept
+    {
         const double tMin  = (double) kMinReleaseSamples * (double) F;         // in OVERSAMPLED samples
         const double t     = std::max (relMs * 0.001 * fs * (double) F, tMin);
         // relCoef must stay STRICTLY below 1, or the release stops existing: measured, a release of
@@ -672,10 +725,10 @@ private:
         // the largest float below 1 keeps recovery monotone without touching any normal setting (the
         // coefficient is left in float on purpose — a double would change the arithmetic and with it
         // every existing sample).
-        relCoef = (float) std::exp (-1.0 / t);
-        if (! (relCoef < 1.0f)) relCoef = std::nextafterf (1.0f, 0.0f);
-        const double tEff = (relCoef > 0.0f) ? -1.0 / std::log ((double) relCoef) : 0.0;
-        relMsEffective = tEff / (0.001 * fs * (double) F);
+        coef = (float) std::exp (-1.0 / t);
+        if (! (coef < 1.0f)) coef = std::nextafterf (1.0f, 0.0f);
+        const double tEff = (coef > 0.0f) ? -1.0 / std::log ((double) coef) : 0.0;
+        effectiveMs = tEff / (0.001 * fs * (double) F);
     }
 
     double fs = 48000.0;
@@ -691,11 +744,15 @@ private:
     std::vector<float*>                osPtrs;
     std::vector<core::DelayLine>       osDelays;
     detail::SlidingMax                 slide;
+    detail::SlidingMax                 slowWin, bridgeWin;   // the dual release's windows
 
-    double ceilingDb = -1.0, relMsEffective = 100.0;
+    double ceilingDb = -1.0, relMsEffective = 100.0, slowMsEffective = 200.0;
     int    lookBaseband = 0;
     int    lastNc_ = 0;                         // channel count of the previous process() call
+    int    slowWindow_ = 1, slowFill_ = 0;      // slowWin's length, and the samples it has seen, capped at it
+    bool   dual_ = false;
     float  relCoef = 0.0f, grDb = 0.0f;
+    float  relCoefSlow = 0.0f, grSlowDb = 0.0f;
     float  linkedPeakLin_ = 0.0f;               // free-running max of the reconstructed linked peak
 };
 

@@ -93,6 +93,7 @@ const char* statusName (fc_status s)
         case FC_ERR_REFUSED_BY_CORE: return "REFUSED_BY_CORE";
         case FC_ERR_EXHAUSTED:       return "EXHAUSTED";
         case FC_ERR_POISONED:        return "POISONED";
+        case FC_ERR_CANCELLED:       return "CANCELLED";
     }
     return "?";
 }
@@ -271,6 +272,8 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
 
     if (key == "lim.ceiling") { FC_D (a.prm.limiter.ceilingDbTp = d); }
     if (key == "lim.release") { FC_D (a.prm.limiter.releaseMs = d); }
+    if (key == "lim.dual")    return parseBool (val, a.prm.limiterDualRelease);
+    if (key == "lim.slowRelease") { FC_D (a.prm.limiterSlowReleaseMs = d); }
 
     if (key == "dith.bits")    { FC_I (a.prm.dither.bits = i); }
     if (key == "dith.shaping") return parseEnumName (val, kShap, 3, a.prm.dither.shaping);
@@ -304,6 +307,8 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "compGrLimit"){ FC_D (a.req.compressorGr.limitDb = d); }
     if (key == "compGrStat") return parseEnumName (val, kGrSt, 3, a.req.compressorGr.statistic);
     if (key == "activityDb") { FC_D (a.req.activityThresholdDb = d); }
+    if (key == "grTraceBuckets") { if (! iOk || i < -0x7FFFFFFFL - 1L || i > 0x7FFFFFFFL) return false;
+                                   a.req.grTraceBuckets = (std::int32_t) i; return true; }
 
     // `weight<N>=<w>` — the BS.1770 channel weights. The ABI grew an entry point for them and nothing
     // called it, which made the capability reachable in principle and not in practice: a surround run
@@ -542,6 +547,8 @@ void mirror (const Args& a, MasteringChainConfig& cc, MasteringChainParams& cp)
     cp.clipper.dcBlockHz = a.prm.clipper.dcBlockHz;
     cp.limiter.ceilingDbTp = a.prm.limiter.ceilingDbTp;
     cp.limiter.releaseMs = a.prm.limiter.releaseMs;
+    cp.limiter.dualRelease = a.prm.limiterDualRelease != 0;
+    cp.limiter.slowReleaseMs = a.prm.limiterSlowReleaseMs;
     cp.dither.bits = a.prm.dither.bits;
     cp.dither.shaping = (dither::NoiseShaping) a.prm.dither.shaping;
     cp.dither.seed = ((std::uint64_t) a.prm.dither.seedHi << 32) | (std::uint64_t) a.prm.dither.seedLo;
@@ -652,7 +659,8 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_params, clipper) X (fc_master_params, limiter) X (fc_master_params, dither)                       \
     X (fc_master_params, bypassEq) X (fc_master_params, bypassMonoBass) X (fc_master_params, bypassCompressor)     \
     X (fc_master_params, bypassClipper) X (fc_master_params, bypassLimiter) X (fc_master_params, bypassDither)     \
-    X (fc_master_params, compressorMix)                                                                            \
+    X (fc_master_params, compressorMix) X (fc_master_params, limiterDualRelease) X (fc_master_params, _pad0)       \
+    X (fc_master_params, limiterSlowReleaseMs)                                                                     \
     X (fc_master_resolved, header) X (fc_master_resolved, latencySamples) X (fc_master_resolved, internalBlock)    \
     X (fc_master_resolved, compressorLookahead) X (fc_master_resolved, clipperLatency)                             \
     X (fc_master_resolved, limiterLatency) X (fc_master_resolved, limiterLookahead)                                \
@@ -660,6 +668,7 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_resolved, limiterTapOffset) X (fc_master_resolved, limiterCeilingDbTp)                            \
     X (fc_master_resolved, limiterReleaseMs) X (fc_master_resolved, monoBass)                                      \
     X (fc_master_resolved, tapOversampleFactor) X (fc_master_resolved, compressorMix)                              \
+    X (fc_master_resolved, limiterSlowReleaseMs)                                                                   \
     X (fc_master_stats, header) X (fc_master_stats, framesIn) X (fc_master_stats, framesFlushed)                   \
     X (fc_master_stats, nonFiniteIn)                                                                               \
     X (fc_need, header) X (fc_need, callBytes) X (fc_need, solverPrepareBytes) X (fc_need, facadeBytes)            \
@@ -670,7 +679,7 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_loudness_request, limiterGr) X (fc_loudness_request, compressorGr) X (fc_loudness_request, minPlrDb)     \
     X (fc_loudness_request, maxLraLossLu) X (fc_loudness_request, inputLoudnessRangeLu)                            \
     X (fc_loudness_request, activityThresholdDb) X (fc_loudness_request, maxPasses)                                \
-    X (fc_loudness_request, initialGainDb)                                                                         \
+    X (fc_loudness_request, initialGainDb) X (fc_loudness_request, grTraceBuckets) X (fc_loudness_request, _pad0)  \
     X (fc_solve_pass, gainDb) X (fc_solve_pass, ceilingDb) X (fc_solve_pass, integratedLufs)                       \
     X (fc_solve_pass, truePeakDbTp) X (fc_solve_pass, plrDb) X (fc_solve_pass, limiterMaxGrDb)                     \
     X (fc_solve_pass, loudnessRangeLu) X (fc_solve_pass, violated)                                                 \
@@ -685,6 +694,10 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_measurement, compressorGrTraceValid) X (fc_measurement, limiterGrTraceValid)                             \
     X (fc_gr_trace_bucket, maxDb) X (fc_gr_trace_bucket, meanDb) X (fc_gr_trace_bucket, samples)                   \
     X (fc_gr_trace_bucket, nonFinite)                                                                              \
+    X (fc_gr_trace_bucket64, maxDb) X (fc_gr_trace_bucket64, meanDb) X (fc_gr_trace_bucket64, samples)             \
+    X (fc_gr_trace_bucket64, nonFinite)                                                                            \
+    X (fc_progress, stage) X (fc_progress, pass) X (fc_progress, maxPasses) X (fc_progress, hasRecord)             \
+    X (fc_progress, fraction) X (fc_progress, record)                                                              \
     X (fc_solution_summary, header) X (fc_solution_summary, status) X (fc_solution_summary, binding)               \
     X (fc_solution_summary, alsoViolated) X (fc_solution_summary, preLimiterGainDb)                                \
     X (fc_solution_summary, ceilingDbTp) X (fc_solution_summary, passes) X (fc_solution_summary, logCount)         \
@@ -769,9 +782,10 @@ int cmdSolve (const Args& a, const std::vector<float>& in, std::size_t frames, i
     for (const auto& [label, code] : { std::pair<const char*, int> { "comp", FC_GR_STAGE_COMPRESSOR },
                                        std::pair<const char*, int> { "lim",  FC_GR_STAGE_LIMITER } })
     {
-        std::vector<fc_gr_trace_bucket> tb (1000u);
+        const int buckets = code == FC_GR_STAGE_LIMITER ? meas.limiterGrTraceBuckets : meas.compressorGrTraceBuckets;
+        std::vector<fc_gr_trace_bucket64> tb ((std::size_t) std::max (buckets, 0));
         std::uint32_t w = 0;
-        (void) fc_solution_gr_trace (sol, code, tb.data(), (std::uint32_t) tb.size(), &w);
+        (void) fc_solution_gr_trace64 (sol, code, tb.data(), (std::uint32_t) tb.size(), &w);
         double mx = 0.0; std::uint32_t at = 0;
         for (std::uint32_t i = 0; i < w; ++i) if (tb[i].maxDb > mx) { mx = tb[i].maxDb; at = i; }
         const int valid = code == FC_GR_STAGE_LIMITER ? meas.limiterGrTraceValid : meas.compressorGrTraceValid;
@@ -946,6 +960,10 @@ int selftest (double fs, int nc)
     a.prm.compressorMix          = 0.73;
     a.prm.limiter.ceilingDbTp    = -1.3;
     a.prm.limiter.releaseMs      = 77.0;
+    // v6
+    a.prm.limiterDualRelease     = 1;
+    a.prm.limiterSlowReleaseMs   = 173.7;
+    a.req.grTraceBuckets         = 4099;
     a.prm.dither.bits            = 24;
     a.prm.dither.seedLo          = 0x748fea9bu;
     a.prm.dither.seedHi          = 0x853c49e6u;
@@ -1072,6 +1090,47 @@ int selftest (double fs, int nc)
         }
     }
 
+    // --- 1e. THE DUAL RELEASE (v6), on a 1 kHz tone 400 ms loud and 200 ms quiet: mapped identically, changing the
+    // render, and not read from a v5-stamped parameter set.
+    {
+        std::vector<float> held (frames * (std::size_t) nc, 0.0f);
+        for (int c = 0; c < nc; ++c)
+            for (std::size_t i = 0; i < frames; ++i)
+            {
+                const double t = (double) i / fs;
+                const double amp = std::fmod (t, 0.6) < 0.4 ? 0.9 : 0.3;
+                held[(std::size_t) c * frames + i] = (float) (amp * std::sin (2.0 * 3.14159265358979 * (1000.0 + 7.0 * c) * t));
+            }
+        Args b = a;
+        b.prm.preLimiterGainDb = 12.0;
+        auto render = [&] (const Args& x, std::vector<float>& viaAbiX, std::vector<float>& viaCppX)
+        {
+            fc_master_resolved rx {};
+            return abiRender (x, held, frames, nc, viaAbiX, rx) && directRender (x, held, frames, nc, viaCppX);
+        };
+        std::vector<float> dAbi, dCpp, offAbi, offCpp, slowAbi, slowCpp, v5Abi, v5Cpp;
+        Args off = b;  off.prm.limiterDualRelease = 0;
+        Args slow = b; slow.prm.limiterSlowReleaseMs = 200.0;
+        Args v5 = b;   v5.prm.header.abiVersion = 5u; v5.prm.header.structSize = 6568u;
+        const bool ran = render (b, dAbi, dCpp) && render (off, offAbi, offCpp) && render (slow, slowAbi, slowCpp)
+                      && render (v5, v5Abi, v5Cpp);
+        check (ran, "the dual-release renders ran through both paths");
+        if (ran)
+        {
+            double worst = 0.0;
+            char msg[160];
+            std::size_t d = bitDiff (dAbi, dCpp, worst) + bitDiff (offAbi, offCpp, worst) + bitDiff (slowAbi, slowCpp, worst);
+            std::snprintf (msg, sizeof msg, "%zu differ", d);
+            check (d == 0, "the dual release maps identically through the ABI — on, off, and at another slow release", msg);
+            const std::size_t onOff = bitDiff (dAbi, offAbi, worst), slowMoved = bitDiff (dAbi, slowAbi, worst);
+            std::snprintf (msg, sizeof msg, "on against off: %zu differ; 173.7 against 200 ms: %zu differ", onOff, slowMoved);
+            check (onOff > 0 && slowMoved > 0, "PRECONDITION: the flag and the slow release both change this render", msg);
+            d = bitDiff (v5Abi, offAbi, worst);
+            std::snprintf (msg, sizeof msg, "%zu differ from the dual release off", d);
+            check (d == 0, "a v5-stamped parameter set does not read the two fields past its 6568 bytes", msg);
+        }
+    }
+
     // --- 2. BLOCK INDEPENDENCE THROUGH THE ABI ------------------------------------------------------
     // The chain's fixed internal quantum is what makes this a theorem rather than a hope; this checks
     // that the ABI does not route around it, which it would the moment it re-blocked anything itself.
@@ -1194,6 +1253,7 @@ int selftest (double fs, int nc)
         Args prev = a;
         prev.cfg.deliveryRate = 0.0;
         prev.prm.compressorMix = 1.0;
+        prev.prm.limiterDualRelease = 0;
         std::vector<float> viaPrev, viaPrevCpp; fc_master_resolved rp {};
         const bool ranPrev = abiRender (prev, in, frames, nc, viaPrev, rp) && directRender (prev, in, frames, nc, viaPrevCpp);
         double wp = 0.0;
@@ -1312,6 +1372,7 @@ int selftest (double fs, int nc)
         mirror (b, cc, cp);
         LoudnessRequest lr {};
         lr.targetLufs = -14.0; lr.maxTruePeakDbTp = -1.0;
+        lr.grTraceBuckets = b.req.grTraceBuckets;
 
         fc_master h = 0;
         const bool made = fc_master_create (&b.cfg, &h) == FC_OK;
@@ -1368,19 +1429,23 @@ int selftest (double fs, int nc)
                        && meas.limiterGrTraceBuckets == direct.limiterTrace.buckets
                        && meas.compressorGrTraceValid == (direct.compressorTrace.valid ? 1 : 0)
                        && meas.limiterGrTraceValid == (direct.limiterTrace.valid ? 1 : 0)
-                       && direct.limiterTrace.buckets > 0,
-                       "the trace's bucket counts and validity through the ABI are the core's");
+                       && direct.limiterTrace.buckets == b.req.grTraceBuckets,
+                       "the trace's bucket counts (the request's, v6) and validity through the ABI are the core's");
                 std::size_t traceDiff = 0;
                 for (const auto& [code, t] : { std::pair<int, const GainReductionTrace*> { FC_GR_STAGE_COMPRESSOR, &direct.compressorTrace },
                                                std::pair<int, const GainReductionTrace*> { FC_GR_STAGE_LIMITER,    &direct.limiterTrace } })
                 {
-                    std::vector<fc_gr_trace_bucket> tb ((std::size_t) GainReductionTrace::kMaxBuckets);
-                    std::uint32_t w = 0;
-                    if (! solved || fc_solution_gr_trace (sol, code, tb.data(), (std::uint32_t) tb.size(), &w) != FC_OK
-                        || (int) w != t->buckets) { ++traceDiff; continue; }
+                    std::vector<fc_gr_trace_bucket64> tb ((std::size_t) t->buckets);
+                    std::vector<fc_gr_trace_bucket>   t4 ((std::size_t) t->buckets);
+                    std::uint32_t w = 0, w4 = 0;
+                    if (! solved || fc_solution_gr_trace64 (sol, code, tb.data(), (std::uint32_t) tb.size(), &w) != FC_OK
+                        || fc_solution_gr_trace (sol, code, t4.data(), (std::uint32_t) t4.size(), &w4) != FC_OK
+                        || (int) w != t->buckets || w4 != w) { ++traceDiff; continue; }
                     for (std::uint32_t i = 0; i < w; ++i)
                         if (std::memcmp (&tb[i].maxDb, &t->bucket[i].maxDb, 8) != 0 || std::memcmp (&tb[i].meanDb, &t->bucket[i].meanDb, 8) != 0
-                            || tb[i].samples != t->bucket[i].samples || tb[i].nonFinite != t->bucket[i].nonFinite) ++traceDiff;
+                            || tb[i].samples != t->bucket[i].samples || tb[i].nonFinite != t->bucket[i].nonFinite
+                            || std::memcmp (&t4[i].maxDb, &t->bucket[i].maxDb, 8) != 0 || std::memcmp (&t4[i].meanDb, &t->bucket[i].meanDb, 8) != 0
+                            || (std::uint64_t) t4[i].samples != t->bucket[i].samples || (std::uint64_t) t4[i].nonFinite != t->bucket[i].nonFinite) ++traceDiff;
                 }
                 std::snprintf (sm, sizeof sm, "%zu buckets differ", traceDiff);
                 check (traceDiff == 0, "and both traces through the ABI are the core's, bit for bit", sm);

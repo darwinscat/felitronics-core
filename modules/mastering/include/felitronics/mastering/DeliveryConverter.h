@@ -6,6 +6,7 @@
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DeliveryResampler.h>
 #include <felitronics/mastering/Planes.h>
+#include <felitronics/mastering/Progress.h>
 
 #include <algorithm>
 #include <climits>
@@ -157,10 +158,18 @@ public:
     [[nodiscard]] bool convert (const float* const* in, int numChannels, long long inFrames,
                                 float* const* out, long long outFrames) noexcept
     {
+        ProgressClock silent (ProgressCallback {});
+        return convert (in, numChannels, inFrames, out, outFrames, silent);
+    }
+
+    [[nodiscard]] bool convert (const float* const* in, int numChannels, long long inFrames,
+                                float* const* out, long long outFrames, ProgressClock& clock) noexcept
+    {
         if (! prepared_ || numChannels != nch_ || inFrames < 0) return false;
         if (outFrames != deliveredFrames (inRate_, deliveryRate_, inFrames)) return false;
         if (outFrames > 0 && ! planesUsable (in, out, numChannels, inFrames, outFrames)) return false;
         if (outFrames == 0) { nonFinite_ = 0; return true; }
+        if (! clock.begin (ProgressStage::Convert, 0, 0, inFrames, inFrames)) return false;
 
         src_.reset();
         const long long T0 = src_.currentPlan().identity ? 0 : trimSamples();
@@ -180,9 +189,9 @@ public:
 
         // Counted aside and published once the last input sample has been read — see `nonFiniteInputSamples`.
         std::uint64_t counted = 0;
-        for (long long off = 0; off < inFrames; off += block_)
+        for (long long off = 0; off < inFrames; )
         {
-            const int m = (int) std::min<long long> (block_, inFrames - off);
+            const int m = (int) std::min<long long> (clock.piece (block_), inFrames - off);
             const float* ip[core::kMaxChannels] {};
             for (int c = 0; c < numChannels; ++c)
             {
@@ -203,6 +212,8 @@ public:
             int got = 0;
             if (! src_.process (ip, numChannels, m, sp, perCall_, got)) return false;
             take (got);
+            off += m;
+            if (! clock.advance (m)) return false;
         }
         nonFinite_ = counted;
         const float* zp[core::kMaxChannels] {};
@@ -216,7 +227,7 @@ public:
             if (! src_.process (zp, numChannels, block_, sp, perCall_, got)) return false;
             take (got);
         }
-        return true;
+        return clock.finish();
     }
 
 private:

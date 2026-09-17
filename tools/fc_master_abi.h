@@ -30,7 +30,7 @@
 //   fc_probe.cpp: a `const float* const*` across the wasm boundary would mean building a table of i32
 //   offsets in the heap and exporting HEAPU32 to write it, for no gain — and AudioBuffer.getChannelData(c)
 //   is already planar, so the page does one HEAPF32.set() per channel and no de-interleave loop.
-// * NO CALLBACKS. The block loop lives in JS inside the worker; nothing here calls back into the host.
+// * ONE CALLBACK per handle, `fc_master_set_progress`; on wasm without one, `Module.onProgress(msg)` (false/throw = stop).
 // * `uint32_t` frame counts. wasm32 is a 32-bit target and a signed frame count invites an overflow
 //   that cannot happen on the 64-bit machine this core was written on.
 // * EVERY entry point returns `fc_status`. Nothing returns a value in band with an error.
@@ -94,7 +94,8 @@ extern "C" {
 // bump made by it — `compressorMix` (P60), two rows in the size table and a field at the end of two structs. v4 is
 // the gain-reduction trace (P59b): one entry point, `fc_solution_gr_trace`, which rule 1 says moves the version on
 // its own, the header-less bucket it copies, and the trace's bucket counts and validity at the end of `fc_measurement`
-// — one row.
+// — one row. v6: the limiter's dual release (`fc_master_params`, `fc_master_resolved`), `grTraceBuckets`
+// (`fc_loudness_request`), `fc_solution_gr_trace64` and `fc_master_need_solve` — three rows, two entry points.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -169,7 +170,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 4u
+#define FC_MASTER_ABI_VERSION 6u
 
 typedef struct fc_header
 {
@@ -243,8 +244,9 @@ typedef enum fc_status
     FC_ERR_NON_FINITE      = 11,   // a NaN or an infinity where the contract admits neither
     FC_ERR_REFUSED_BY_CORE = 12,   // the core returned false. This ABI does not know why, and says so
     FC_ERR_EXHAUSTED       = 13,   // no free slot in the handle table
-    FC_ERR_POISONED        = 14    // an earlier call into this module never returned: the instance is
+    FC_ERR_POISONED        = 14,   // an earlier call into this module never returned: the instance is
                                    // abandoned, and nothing but a new one answers — see above
+    FC_ERR_CANCELLED       = 15
 } fc_status;
 
 //==============================================================================
@@ -480,6 +482,13 @@ typedef struct fc_master_params
     // through `fc_master_resolved::compressorMix`; a non-finite value is refused here (FC_ERR_NON_FINITE), because
     // the core would map it to 1 without a word.
     double compressorMix;
+
+    // ---- v6 ----
+    // `limiter::TruePeakLimiterParams::dualRelease` (0 off, any other value on) and `slowReleaseMs` in ms; a non-finite
+    // `limiterSlowReleaseMs` is FC_ERR_NON_FINITE.
+    int32_t limiterDualRelease;
+    int32_t _pad0;                  // written 0
+    double  limiterSlowReleaseMs;
 } fc_master_params;
 
 //==============================================================================
@@ -513,6 +522,10 @@ typedef struct fc_master_resolved
     // The mix the chain APPLIED — the clamped value the stage holds, not the request — and 0 on a topology with no
     // compressor, where there is nothing to mix.
     double compressorMix;
+
+    // ---- v6 ----
+    // The limiter's slow release in ms after the core's floor; 0 without a limiter or with the dual release off.
+    double limiterSlowReleaseMs;
 } fc_master_resolved;
 
 //==============================================================================
@@ -573,7 +586,8 @@ typedef struct fc_need
     // saying so is law 11d's own instruction ("what each number bounds is written where it is defined"):
     //
     //   * SOLVE — one PASS. The search builds its meters per pass and frees them at the pass's end, so
-    //     this is one pass.
+    //     this is one pass. Plus the solution's two gain-reduction traces: at 1000 buckets through `fc_master_need`,
+    //     at the request's `grTraceBuckets` through `fc_master_need_solve`.
     //   * MEASURE_LRA — one meter, and 0 for a programme too short to have a range, which the call
     //     refuses before building one.
     //   * CREATE — the SUM of what the call requests, which is what it holds: everything a create asks
@@ -615,9 +629,8 @@ typedef struct fc_need
 // THE LOUDNESS SEARCH
 //
 // A versioned C-POD request in, an OPAQUE HANDLE out, and the per-pass log copied into a buffer the
-// CALLER owns. Marshalling `mastering::LoudnessSolution` whole would be ~49 KiB per call — C++ enums, `bool`,
-// padding, a 32-entry log and, from v4, two 1000-bucket gain-reduction traces — most of which a caller never reads;
-// the log and the traces are copied out only on request.
+// CALLER owns. `mastering::LoudnessSolution` holds C++ enums, `bool`, padding, a 32-entry log and, from v4, two
+// gain-reduction traces — most of which a caller never reads; the log and the traces are copied out only on request.
 typedef struct fc_gr_limit
 {
     double  limitDb;                // +infinity = no limit. NOT "any non-finite": -infinity is an
@@ -643,6 +656,11 @@ typedef struct fc_loudness_request
     double  activityThresholdDb;
     int32_t maxPasses;
     double  initialGainDb;          // NaN = use the params' own
+
+    // ---- v6 ----
+    // Buckets per gain-reduction trace: min(grTraceBuckets, programme frames). 1..65536, else the core's InvalidRequest.
+    int32_t grTraceBuckets;
+    int32_t _pad0;                  // written 0
 } fc_loudness_request;
 
 typedef struct fc_solve_pass
@@ -671,7 +689,7 @@ typedef struct fc_measurement
     int32_t loudnessValid, lraValid;
 
     // v4 — the gain-reduction traces of the same render, read with `fc_solution_gr_trace`: how many buckets each
-    // holds (min(1000, programme frames); 0 when the solve attempted no render) and whether it is a measurement
+    // holds (min(grTraceBuckets, programme frames); 0 when the solve attempted no render) and whether it is a measurement
     // (mastering::GainReductionTrace::valid — the render ran to its end, the window saw a sample, none non-finite).
     int32_t compressorGrTraceBuckets, limiterGrTraceBuckets;
     int32_t compressorGrTraceValid, limiterGrTraceValid;
@@ -686,6 +704,15 @@ typedef struct fc_gr_trace_bucket
     uint32_t samples;               // tap samples in it — frames (compressor), frames x tapOversampleFactor (limiter)
     uint32_t nonFinite;             // ... of which non-finite, excluded from max and mean
 } fc_gr_trace_bucket;
+
+// v6 — `fc_gr_trace_bucket` with 64-bit counts: mastering::GainReductionTraceBucket, field for field. Header-less, frozen.
+typedef struct fc_gr_trace_bucket64
+{
+    double   maxDb;                 // largest finite |GR| in the bucket, dB; 0 when it saw no finite sample
+    double   meanDb;                // mean of its finite |GR|, dB; 0 when it saw none
+    uint64_t samples;               // tap samples in it
+    uint64_t nonFinite;             // ... of which non-finite
+} fc_gr_trace_bucket64;
 
 typedef struct fc_solution_summary
 {
@@ -717,11 +744,14 @@ typedef enum fc_struct_id
         X(FC_STRUCT_CONFIG,       2,       88)    \
         X(FC_STRUCT_PARAMS,       1,     6560)    \
         X(FC_STRUCT_PARAMS,       3,     6568)    \
+        X(FC_STRUCT_PARAMS,       6,     6584)    \
         X(FC_STRUCT_RESOLVED,     1,       80)    \
         X(FC_STRUCT_RESOLVED,     3,       88)    \
+        X(FC_STRUCT_RESOLVED,     6,       96)    \
         X(FC_STRUCT_STATS,        1,       32)    \
         X(FC_STRUCT_NEED,         1,       40)    \
         X(FC_STRUCT_REQUEST,      1,      120)    \
+        X(FC_STRUCT_REQUEST,      6,      128)    \
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
         X(FC_STRUCT_MEASUREMENT,  4,      224)    \
         X(FC_STRUCT_SUMMARY,      1,       88)
@@ -861,6 +891,10 @@ fc_status fc_master_destroy (fc_master h);
 // the opposite case and behaves the opposite way.
 fc_status fc_master_need (fc_master h, int32_t op, uint32_t frames, fc_need* out);
 
+// v6 — FC_NEED_SOLVE for `req`'s `grTraceBuckets` (`fc_master_need` budgets 1000); `callBytes` 0 for a count outside
+// 1..65536. Checks: poison, the handle, `out`'s header, `req`'s header, `frames` (FC_ERR_RANGE as `fc_master_need`).
+fc_status fc_master_need_solve (fc_master h, const fc_loudness_request* req, uint32_t frames, fc_need* out);
+
 // THE BUDGET OF A `fc_master_create` THAT HAS NOT HAPPENED — the one budget that cannot be asked through a
 // handle, because the handle is what the call would produce.
 //
@@ -878,6 +912,27 @@ fc_status fc_master_need (fc_master h, int32_t op, uint32_t frames, fc_need* out
 // `frames` does not appear: a create has no programme. The solver fields come back neutral. Allocates
 // nothing itself and touches no handle.
 fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
+
+typedef enum fc_progress_stage
+{
+    FC_PROGRESS_CONVERT = 0, FC_PROGRESS_LRA = 1, FC_PROGRESS_PASS = 2, FC_PROGRESS_FINAL = 3,
+    FC_PROGRESS_RENDER = 4
+} fc_progress_stage;
+
+typedef struct fc_progress
+{
+    int32_t       stage;
+    int32_t       pass;
+    int32_t       maxPasses;
+    int32_t       hasRecord;
+    double        fraction;
+    fc_solve_pass record;
+} fc_progress;
+
+typedef int32_t (*fc_progress_fn) (void* context, const fc_progress* event);
+
+// fn: stage, pass/maxPasses, fraction 0..1, record at 1; nonzero continues, 0 stops (FC_ERR_CANCELLED); must not call in or throw.
+fc_status fc_master_set_progress (fc_master h, fc_progress_fn fn, void* context);
 
 // The input's loudness range, for the LRA constraint — which is a DELTA and therefore needs both ends.
 // Stateless by construction: it returns the number and the caller puts it into the request, so it
@@ -992,13 +1047,16 @@ fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint
 // Checks in the header's order: poison, the handle, `written`, then — only when `cap > 0` — `out` (null, 8-byte
 // alignment, the span in the heap, and `written` NOT INSIDE that span: FC_ERR_SPAN), and then `stage`, a field value: a
 // code that names no stage is FC_ERR_ENUM, with `cap == 0` too. FC_OK with `written == 0` for a solution whose solve
-// attempted no render.
+// attempted no render. Then a `samples` or `nonFinite` count past 32 bits in the buckets it would write: FC_ERR_RANGE,
+// nothing written.
 //
 // `written` IS LEFT UNTOUCHED BY EVERY REFUSAL, as `fc_master_flush` and `fc_solution_log` leave it — the general rule
 // for a count out-parameter: until the alias check has run, `written` may point into the buckets, and zeroing it would
 // be a refusal that wrote into the caller's buffer. It is set to 0 once every refusal is behind the call, and to the
 // count on success.
 fc_status fc_solution_gr_trace (fc_solution s, int32_t stage, fc_gr_trace_bucket* out, uint32_t cap, uint32_t* written);
+// v6 — `fc_solution_gr_trace` into `fc_gr_trace_bucket64`, without the 32-bit check.
+fc_status fc_solution_gr_trace64 (fc_solution s, int32_t stage, fc_gr_trace_bucket64* out, uint32_t cap, uint32_t* written);
 fc_status fc_solution_destroy (fc_solution s);
 
 // THE CORE'S OWN DEFAULTS, written through the same mapping every other value crosses by.

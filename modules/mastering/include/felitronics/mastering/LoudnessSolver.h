@@ -11,11 +11,13 @@
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/mastering/Planes.h>
+#include <felitronics/mastering/Progress.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace felitronics::mastering
@@ -37,8 +39,8 @@ namespace felitronics::mastering
 //     rawRedDb = min (0, -(g - c) - smaxDb(p))
 //
 // depends on g and c ONLY through the difference. Write `d = g - c` (the DRIVE, in dB above the
-// ceiling); the release recursion `grDb = min(rawRed, grDb*relCoef)` reads only `rawRed`, so the whole
-// gain trace is a function of d alone, and the output is
+// ceiling); the release recursion `grDb = min(rawRed, grDb*relCoef)` reads only `rawRed`, as do both envelopes of
+// the limiter's `dualRelease`, so the whole gain trace is a function of d alone, and the output is
 //
 //     y(g, c) = 10^(c/20) * y(d, 0)
 //
@@ -181,7 +183,8 @@ enum class MasteringSolveStatus
     MeasurementInvalid,     // the meter could not answer (no gating block, dropped blocks, non-finite)
     RenderFailed,           // the chain or the renderer refused a call
     NotPrepared,
-    InvalidRequest
+    InvalidRequest,
+    Cancelled
 };
 
 // The pass budget's ceiling, named here because `LoudnessSolution` carries an array of that length and
@@ -226,8 +229,8 @@ struct GainReductionStats
 // show. The same tap values the statistics see, in the same window (each stage's own tap offset), in the same units:
 // frames for the compressor, frames × `tapOversampleFactor` sub-samples for the limiter.
 //
-// BUCKET k covers the programme frames [floor(k·F/B), floor((k+1)·F/B)) for F frames and B = min(kMaxBuckets, F)
-// buckets — integer arithmetic, and never an empty bucket: a programme shorter than kMaxBuckets frames gets one
+// BUCKET k covers the programme frames [floor(k·F/B), floor((k+1)·F/B)) for F frames and B = min(grTraceBuckets, F)
+// buckets — integer arithmetic, and never an empty bucket: a programme shorter than grTraceBuckets frames gets one
 // bucket per frame, not trailing zeros that would read as "the stage did not work". Frame p of the programme is tap
 // sample p + the stage's tap offset, so a bucket is in the time of the INPUT the gain was decided for, exactly as
 // the statistics are; on the delivered-rate path (`DeliveredMastering`) that input is the converted programme, so
@@ -236,28 +239,41 @@ struct GainReductionTraceBucket
 {
     double        maxDb     = 0.0;  // largest finite |GR| in the bucket; 0 when it saw no finite sample
     double        meanDb    = 0.0;  // sequential sum of its finite |GR| / their count; 0 when it saw none
-    std::uint32_t samples   = 0;    // tap samples that landed in it, finite or not
-    std::uint32_t nonFinite = 0;    // ... of which were NaN or infinite: excluded from max and mean, and COUNTED,
+    std::uint64_t samples   = 0;    // tap samples that landed in it, finite or not
+    std::uint64_t nonFinite = 0;    // ... of which were NaN or infinite: excluded from max and mean, and COUNTED,
                                     // because a max that skips a NaN silently reads 0 — "the stage was idle"
 };
 
 struct GainReductionTrace
 {
-    static constexpr int kMaxBuckets = 1000;
+    static constexpr int kDefaultBuckets = 1000;     // LoudnessRequest::grTraceBuckets' default
+    static constexpr int kMaxBuckets     = 65536;    // the largest request admitted
 
-    int           buckets   = 0;    // min(kMaxBuckets, programme frames) of the last render ATTEMPTED; 0 when none was
+    int           buckets   = 0;    // min(grTraceBuckets, programme frames) of the last render ATTEMPTED; 0 when none was
     // TRUE ONLY WHEN THE TRACE IS A MEASUREMENT: a render ran to its end for this solution, the stage's window saw
     // at least one sample, and none of them was non-finite. False on a refusal before any render (buckets 0), on a
     // render the renderer abandoned (RenderFailed from the render itself), and on a poisoned tap — in which case the
     // numbers are best effort and `nonFinite` says where. Like `GainReductionStats::valid`, not a nicety.
     bool          valid     = false;
     std::uint64_t samples   = 0, nonFinite = 0;
-    GainReductionTraceBucket bucket[kMaxBuckets] {};
+    std::vector<GainReductionTraceBucket> bucket;   // `buckets` entries
+
+    // min(requested, frames); 0 when either is not positive.
+    static int bucketsFor (int requested, int frames) noexcept
+    {
+        return frames > 0 && requested > 0 ? std::min (requested, frames) : 0;
+    }
+    // The bytes of that many buckets.
+    static std::uint64_t bytesFor (int requested, int frames) noexcept
+    {
+        return (std::uint64_t) bucketsFor (requested, frames) * (std::uint64_t) sizeof (GainReductionTraceBucket);
+    }
 };
 
 // THE TRACE'S THREE STEPS, as one small object the solver's tap sink drives — public so the one path no audio can
 // reach through the solver (a non-finite tap: the chain sanitises its input) can be tested directly.
-//   * construction — before a render: every bucket zero, `valid` false, the bucket count for this programme;
+//   * construction — before a render: bucketsFor(requested, frames) buckets, `requested` clamped to [1, kMaxBuckets],
+//     every bucket zero, `valid` false, the storage reused when it already holds that many;
 //   * `add(frame, a)` — per tap sample, in stream order: `a` is |GR| in dB for programme frame `frame`; it counts the
 //     sample, and either its non-finite count or its running max and SUM (the mean is divided out once, at the end);
 //   * `finish()` — after a render that ran to its end: the means, the totals, and `valid`. A render that did not run
@@ -267,11 +283,13 @@ struct GainReductionTrace
 class GainReductionTraceBuilder
 {
 public:
-    GainReductionTraceBuilder (GainReductionTrace& trace, int programmeFrames) noexcept
+    GainReductionTraceBuilder (GainReductionTrace& trace, int programmeFrames,
+                               int requestedBuckets = GainReductionTrace::kDefaultBuckets)
         : t (trace), frames (programmeFrames > 0 ? (std::uint64_t) programmeFrames : 0u)
     {
-        for (auto& b : t.bucket) b = GainReductionTraceBucket {};
-        t.buckets   = programmeFrames > 0 ? std::min (GainReductionTrace::kMaxBuckets, programmeFrames) : 0;
+        t.buckets   = GainReductionTrace::bucketsFor (std::clamp (requestedBuckets, 1, GainReductionTrace::kMaxBuckets),
+                                                      programmeFrames);
+        t.bucket.assign ((std::size_t) t.buckets, GainReductionTraceBucket {});
         t.valid     = false;
         t.samples   = 0;
         t.nonFinite = 0;
@@ -283,7 +301,7 @@ public:
         if (t.buckets <= 0 || frame >= frames) return;
         if (frame < start) { k = 0; start = 0; end = bucketEnd (0); }       // the stream never goes back; defensive
         while (frame >= end && k + 1 < (std::uint64_t) t.buckets) { ++k; start = end; end = bucketEnd (k); }
-        GainReductionTraceBucket& b = t.bucket[k];
+        GainReductionTraceBucket& b = t.bucket[(std::size_t) k];
         ++b.samples;
         if (! std::isfinite (a)) { ++b.nonFinite; return; }
         if (a > b.maxDb) b.maxDb = a;
@@ -295,8 +313,8 @@ public:
         std::uint64_t samples = 0, nonFinite = 0;
         for (int i = 0; i < t.buckets; ++i)
         {
-            GainReductionTraceBucket& b = t.bucket[i];
-            const std::uint32_t finite = b.samples - b.nonFinite;
+            GainReductionTraceBucket& b = t.bucket[(std::size_t) i];
+            const std::uint64_t finite = b.samples - b.nonFinite;
             b.meanDb = finite > 0 ? b.meanDb / (double) finite : 0.0;
             samples   += b.samples;
             nonFinite += b.nonFinite;
@@ -406,6 +424,10 @@ struct LoudnessRequest
     // measurements. Four leaves one spare for a programme that also has to bring its ceiling down.
     int    maxPasses = 4;
     double initialGainDb = std::numeric_limits<double>::quiet_NaN();   // NaN = use the params' own
+
+    // Buckets per gain-reduction trace of the solution: min(this, programme frames). 1..GainReductionTrace::kMaxBuckets,
+    // else InvalidRequest.
+    int    grTraceBuckets = GainReductionTrace::kDefaultBuckets;
 };
 
 // One render the search made. The whole trace is returned, not just the winner: a caller that has to
@@ -447,8 +469,7 @@ struct LoudnessSolution
     // WHERE each stage worked, over the audio handed back in `out` (P59b) — see GainReductionTrace. Written by every
     // render and reset at the start of each, so it always describes the LAST render, and the last render is the one
     // in `out`: the search re-renders the winner when it did not end on it. It lives here, with the solution, and
-    // not in the solver, because a solution outlives the next solve. The price is its size: ~48 KiB per solution,
-    // carried by value.
+    // not in the solver, because a solution outlives the next solve.
     GainReductionTrace compressorTrace {};
     GainReductionTrace limiterTrace {};
 };
@@ -537,7 +558,8 @@ public:
             || req.maxPasses < 1 || req.maxPasses > kMaxPasses
             || req.limiterGr.malformed() || req.compressorGr.malformed()
             || std::isnan (req.minPlrDb) || std::isnan (req.maxLraLossLu)
-            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0) return false;
+            || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0
+            || ! traceBucketsAdmitted (req.grTraceBuckets)) return false;
         // The tap buffers were sized for a geometry; a chain that does not match them would be measured
         // through a refused call, which is a silent zero rather than a statistic.
         // THE RATE IS CHECKED, not assumed shared. The solver builds its own meters from `fs_`, and a
@@ -575,12 +597,22 @@ public:
     // pass's end, so the peak is ONE pass. (The drain used to be a buffer of zeros the first solve allocated and later
     // ones reused; the reference meter drains from its own fixed array, so there is nothing left over.) 0 for a length
     // or a channel count solve() refuses before any pass.
-    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames) noexcept
+    // Plus the solution's two traces of `grTraceBuckets` buckets, which the first render allocates; 0 for a bucket
+    // count solve() refuses.
+    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames, int grTraceBuckets) noexcept
     {
         if (frames <= 0 || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
+        if (! traceBucketsAdmitted (grTraceBuckets)) return 0u;
         const std::uint64_t meter = meterBytes (sampleRate, frames);
         if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
-        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes();
+        return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes()
+             + 2u * GainReductionTrace::bytesFor (grTraceBuckets, frames);
+    }
+
+    // The request's bucket count, as admits() judges it.
+    static bool traceBucketsAdmitted (int grTraceBuckets) noexcept
+    {
+        return grTraceBuckets >= 1 && grTraceBuckets <= GainReductionTrace::kMaxBuckets;
     }
 
     // measureInputLoudnessRange(): one loudness meter — and NOTHING for a programme too short to have a range, which it
@@ -602,9 +634,18 @@ public:
     // stores the caller's UNCLAMPED request while the chain applies a clamped one. A search that read
     // its own actuator through either of those would be measuring a number it did not apply.
     LoudnessSolution solve (MasteringChain& chain, OfflineRenderer& renderer,
-                            MasteringChainParams params,
+                            const MasteringChainParams& params,
                             const float* const* in, float* const* out,
                             int numChannels, int frames, const LoudnessRequest& req)
+    {
+        return solve (chain, renderer, params, in, out, numChannels, frames, req, ProgressCallback {});
+    }
+
+    LoudnessSolution solve (MasteringChain& chain, OfflineRenderer& renderer,
+                            MasteringChainParams params,
+                            const float* const* in, float* const* out,
+                            int numChannels, int frames, const LoudnessRequest& req,
+                            const ProgressCallback& progress)
     {
         LoudnessSolution sol;
         sol.activityThresholdDb = req.activityThresholdDb;
@@ -675,11 +716,17 @@ public:
         // written here were true of code that has since changed; this one is dated to the fixes above.
         double anchorD = 0.0, anchorJ = 0.0;
         bool   haveAnchor = false;
+        DriveBound bound;
         const double aim = pmax - (std::isfinite (req.truePeakAimDb) && req.truePeakAimDb > 0.0
                                        ? req.truePeakAimDb : 0.0);
 
+        ProgressClock clock (progress);
+        const long long passUnits = 2LL * (long long) frames + (long long) chain.latencySamples();
+
         for (int pass = 0; pass < req.maxPasses; ++pass)
         {
+            if (! clock.begin (ProgressStage::SearchPass, pass + 1, req.maxPasses, passUnits, frames))
+                return cancelled (sol);
             g = std::clamp (g, -kMaxGainDb, kMaxGainDb);
             c = std::clamp (c, -kMaxGainDb, kMaxGainDb);
             params.preLimiterGainDb      = g;
@@ -687,8 +734,12 @@ public:
             chain.setParams (params);
 
             MasterMeasurement m;
-            if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, m, sol))
-                { sol.status = MasteringSolveStatus::RenderFailed; sol.passes = pass + 1; return sol; }
+            if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, m, sol, clock))
+            {
+                sol.status = clock.stopped() ? MasteringSolveStatus::Cancelled : MasteringSolveStatus::RenderFailed;
+                sol.passes = pass + 1;
+                return sol;
+            }
             ++sol.passes;
 
             // AN UNMEASURABLE FIRST RENDER IS NOT ALWAYS AN UNMEASURABLE PROGRAMME. A file quiet enough
@@ -704,14 +755,7 @@ public:
             if (! m.loudnessValid && ! bootstrapped && m.samplePeakDb > -180.0 && pass + 1 < req.maxPasses)
             {
                 bootstrapped = true;
-                if (sol.logCount < kMaxPasses)
-                {
-                    SolvePassRecord& rec = sol.log[sol.logCount++];
-                    rec.gainDb = g; rec.ceilingDb = c;
-                    rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
-                    rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
-                    rec.loudnessRangeLu = m.loudnessRangeLu;
-                }
+                if (! keepRecord (sol, clock, g, c, m, 0u)) return cancelled (sol);
                 // 12 dB under the promise: far enough below it that the limiter does not take over the
                 // next measurement, high enough that an ordinary programme's blocks clear the -70 gate.
                 g = std::clamp (g + ((pmax - 12.0) - m.samplePeakDb), -kMaxGainDb, kMaxGainDb);
@@ -721,14 +765,7 @@ public:
             {
                 sol.status = MasteringSolveStatus::MeasurementInvalid;
                 sol.measured = m; sol.preLimiterGainDb = g; sol.ceilingDbTp = c;
-                if (sol.logCount < kMaxPasses)
-                {
-                    SolvePassRecord& rec = sol.log[sol.logCount++];
-                    rec.gainDb = g; rec.ceilingDb = c;
-                    rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
-                    rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
-                    rec.loudnessRangeLu = m.loudnessRangeLu;
-                }
+                if (! keepRecord (sol, clock, g, c, m, 0u)) return cancelled (sol);
                 return sol;
             }
 
@@ -741,15 +778,8 @@ public:
                 sol.binding = MasteringConstraint::CompressorGainReduction;
                 sol.alsoViolated |= constraintBit (MasteringConstraint::CompressorGainReduction);
                 sol.measured = m; sol.preLimiterGainDb = g; sol.ceilingDbTp = c;
-                if (sol.logCount < kMaxPasses)
-                {
-                    SolvePassRecord& rec = sol.log[sol.logCount++];
-                    rec.gainDb = g; rec.ceilingDb = c;
-                    rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
-                    rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
-                    rec.loudnessRangeLu = m.loudnessRangeLu;
-                    rec.violated = constraintBit (MasteringConstraint::CompressorGainReduction);
-                }
+                if (! keepRecord (sol, clock, g, c, m, constraintBit (MasteringConstraint::CompressorGainReduction)))
+                    return cancelled (sol);
                 return sol;
             }
 
@@ -783,28 +813,15 @@ public:
                     sol.binding = bindingOf (up);
                     sol.alsoViolated = viol;
                     sol.measured = m; sol.preLimiterGainDb = g; sol.ceilingDbTp = c;
-                    if (sol.logCount < kMaxPasses)
-                    {
-                        SolvePassRecord& rec0 = sol.log[sol.logCount++];
-                        rec0.gainDb = g; rec0.ceilingDb = c;
-                        rec0.integratedLufs = m.integratedLufs; rec0.truePeakDbTp = m.truePeakDbTp;
-                        rec0.plrDb = m.plrDb; rec0.limiterMaxGrDb = m.limiter.maxDb;
-                        rec0.loudnessRangeLu = m.loudnessRangeLu; rec0.violated = viol;
-                    }
+                    if (! keepRecord (sol, clock, g, c, m, viol)) return cancelled (sol);
                     return sol;
                 }
             }
 
-            if (sol.logCount < kMaxPasses)
-            {
-                SolvePassRecord& rec = sol.log[sol.logCount++];
-                rec.gainDb = g; rec.ceilingDb = c;
-                rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
-                rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
-                rec.loudnessRangeLu = m.loudnessRangeLu; rec.violated = viol;
-            }
+            if (! keepRecord (sol, clock, g, c, m, viol)) return cancelled (sol);
             const bool onTarget = std::fabs (m.integratedLufs - target) <= req.toleranceLu;
             const bool feasible = (viol == 0);
+            bound.add (g, c, m, aim, pmax, req, viol);
 
             best.offer (g, c, m, feasible, std::fabs (m.integratedLufs - target),
                         worstExcess (m, req), viol);
@@ -863,8 +880,6 @@ public:
             // The ceiling tracks the aim, in both directions, capped at the promise.
             double nextC = std::min (pmax, c + (aim - m.truePeakDbTp));
             if (! std::isfinite (nextC)) nextC = c;
-            const double jReq = target - nextC;          // the shape has to deliver this much
-            const double dj   = jReq - jNow;
             double nextD = dNow;
 
             // "IDLE" HERE IS STRICTER THAN THE REQUEST'S `activityThresholdDb`, and deliberately so.
@@ -895,6 +910,11 @@ public:
                 anchorJ = jNow + headroomToEngage;       // exact: while idle the chain is a multiply
                 haveAnchor = true;
             }
+            // A render the limiter will work on, after an idle one, is aimed `overshootAt` its drive under the aim.
+            if (limiterIdle && std::isfinite (headroomToEngage) && (target - nextC) - jNow > headroomToEngage)
+                nextC = std::min (nextC, aim - bound.overshootAt (dNow + (target - nextC) - jNow));
+            const double jReq = target - nextC;          // the shape has to deliver this much
+            const double dj   = jReq - jNow;
 
             if (limiterIdle && dj <= headroomToEngage)
             {
@@ -982,6 +1002,14 @@ public:
                     const double bLo = std::fmin (loD, hiD), bHi = std::fmax (loD, hiD);
                     if (! (nextD > bLo && nextD < bHi)) nextD = 0.5 * (bLo + bHi);
                 }
+            }
+            // DriveBound::wants the step: `probe` replaces it, or `closed` ends the search.
+            if (bound.wants (nextD))
+            {
+                bound.acted = true;
+                if (best.have && best.feasible && bound.closed (best.m.integratedLufs, target, req.toleranceLu)) break;
+                nextD = bound.probe (req, pass + 2 >= req.maxPasses);
+                nextC = std::min (pmax, aim - bound.overshootAt (bound.cap.d));
             }
 
             double nextG = nextD + nextC;
@@ -1095,7 +1123,17 @@ public:
                                     && (bracketClosed
                                         || (stoppedOnResolution && best.nearestHave
                                             && best.nearestErr > req.toleranceLu));
-        if (betweenAchievable)
+        // Once the drive bound has acted: `TargetUnreachable`, `binding` from what `cap` broke.
+        if (bound.acted)
+        {
+            std::uint32_t viol = best.nearestViolated | bound.capViol;
+            if (pinnedDir != 0 && best.have && best.err > req.toleranceLu)
+                viol |= constraintBit (MasteringConstraint::GainRange);
+            sol.status  = MasteringSolveStatus::TargetUnreachable;
+            sol.binding = bindingOf (bound.capViol);
+            sol.alsoViolated = viol;
+        }
+        else if (betweenAchievable)
         {
             sol.status = MasteringSolveStatus::TargetBetweenAchievable;
             if (bracketClosed)
@@ -1148,28 +1186,46 @@ public:
                                        || (std::fabs (g - best.g) < 1.0e-12 && std::fabs (c - best.c) < 1.0e-12);
             if (! alreadyDelivered)
             {
+                if (! clock.begin (ProgressStage::FinalRender, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
+                    return cancelled (sol);
                 params.preLimiterGainDb    = best.g;
                 params.limiter.ceilingDbTp = best.c;
                 chain.setParams (params);
                 MasterMeasurement again;
-                if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, again, sol))
-                    { sol.status = MasteringSolveStatus::RenderFailed; return sol; }
+                if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, again, sol, clock))
+                {
+                    if (clock.stopped()) { ++sol.passes; return cancelled (sol); }
+                    sol.status = MasteringSolveStatus::RenderFailed;
+                    return sol;
+                }
                 ++sol.passes;
                 sol.measured = again;
-                if (sol.logCount < kMaxPasses)
-                {
-                    SolvePassRecord& rec = sol.log[sol.logCount++];
-                    rec.gainDb = best.g; rec.ceilingDb = best.c;
-                    rec.integratedLufs = again.integratedLufs; rec.truePeakDbTp = again.truePeakDbTp;
-                    rec.plrDb = again.plrDb; rec.limiterMaxGrDb = again.limiter.maxDb;
-                    rec.loudnessRangeLu = again.loudnessRangeLu; rec.violated = violatedMask (again, req);
-                }
+                if (! keepRecord (sol, clock, best.g, best.c, again, violatedMask (again, req))) return cancelled (sol);
             }
         }
         return sol;
     }
 
 private:
+    static bool keepRecord (LoudnessSolution& sol, ProgressClock& clock, double g, double c,
+                            const MasterMeasurement& m, std::uint32_t violated) noexcept
+    {
+        SolvePassRecord rec;
+        rec.gainDb = g; rec.ceilingDb = c;
+        rec.integratedLufs = m.integratedLufs; rec.truePeakDbTp = m.truePeakDbTp;
+        rec.plrDb = m.plrDb; rec.limiterMaxGrDb = m.limiter.maxDb;
+        rec.loudnessRangeLu = m.loudnessRangeLu; rec.violated = violated;
+        if (sol.logCount < kMaxPasses) sol.log[sol.logCount++] = rec;
+        return clock.finish (&rec);
+    }
+
+    // `sol` as Cancelled, moved into the return value.
+    static LoudnessSolution cancelled (LoudnessSolution& sol) noexcept
+    {
+        sol.status = MasteringSolveStatus::Cancelled;
+        return std::move (sol);
+    }
+
     // Two candidates, and keeping them apart is what makes the verdict mean something.
     //   * `best`     — what gets DELIVERED. A feasible render always beats an infeasible one, whatever
     //                  their errors: handing back the render that broke the limit because it was 0.02 LU
@@ -1215,6 +1271,126 @@ private:
             isLast = better;
             if (! better) return;
             g = gg; c = cc; m = mm; err = e; excess = exc; have = true; feasible = feas;
+        }
+    };
+
+    // The limits that grow with drive, in the order of DriveBound's excesses.
+    static constexpr std::uint32_t kDriveBound = constraintBit (MasteringConstraint::LimiterGainReduction)
+                                               | constraintBit (MasteringConstraint::PeakToLoudness)
+                                               | constraintBit (MasteringConstraint::LoudnessRange);
+    static constexpr MasteringConstraint kDriveBoundConstraint[3] {
+        MasteringConstraint::LimiterGainReduction, MasteringConstraint::PeakToLoudness, MasteringConstraint::LoudnessRange };
+
+    // The overshoot `truePeakDbTp - c` assumed for a working render when none is measured at or under its drive.
+    static constexpr double kFirstLimitingOvershootDb = 0.15;
+
+    // THE DRIVE BOUND over the renders made, in drive `d = g - c`: `ok` is the largest drive that broke no `kDriveBound` limit,
+    // `cap` the smallest that broke one, each with every limit's excess (> 0 where violatedMask() flags it, NaN when off or
+    // unmeasured); `cap` also with what it broke and `capAimedI`, its loudness at the ceiling its true peak asks for. A bracket
+    // is `ok` under `cap`. The bound only chooses renders; each is measured and judged like any other.
+    struct DriveBound
+    {
+        struct End { double d = 0.0; double e[3] {}; bool have = false; };
+
+        End ok, cap;
+        std::uint32_t capViol = 0;
+        double capAimedI = 0.0, engageD = 0.0;
+        bool   okIdle = false, haveEngage = false;
+        bool   acted = false;                        // it chose a render or ended the search
+        int    lastSide = 0, streak = 0;             // the end last moved (-1 `ok`, +1 `cap`), and how often in a row
+        double activeD[kMaxPasses] {}, activeOvershoot[kMaxPasses] {};
+        int    nActive = 0;
+
+        void add (double g, double c, const MasterMeasurement& m, double aim, double pmax, const LoudnessRequest& req,
+                  std::uint32_t viol) noexcept
+        {
+            const double d = g - c;
+            const bool idle = m.limiter.valid && m.limiter.maxDb <= 0.0;
+            const double engage = g - m.limiterMaxReconstructedPeakDb;
+            if (std::isfinite (engage)) { engageD = engage; haveEngage = true; }
+            if (m.limiter.valid && m.limiter.maxDb > 0.0 && nActive < kMaxPasses)
+            {
+                activeD[nActive] = d;
+                activeOvershoot[nActive] = std::fmax (0.0, m.truePeakDbTp - c);
+                ++nActive;
+            }
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            double e[3] = { nan, nan, nan };
+            if (! req.limiterGr.off() && ! req.limiterGr.malformed() && m.limiter.valid)
+                e[0] = ((req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
+                      : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db
+                                                                        : m.limiter.maxDb) - req.limiterGr.limitDb;
+            if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()))
+                e[1] = req.minPlrDb - m.plrDb;
+            if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
+                && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
+                e[2] = (req.inputLoudnessRangeLu - m.loudnessRangeLu) - req.maxLraLossLu;
+
+            const std::uint32_t broke = viol & kDriveBound;
+            int moved = 0;
+            if (broke == 0u)
+            {
+                if (! ok.have || d > ok.d) { set (ok, d, e); okIdle = idle; moved = -1; }
+            }
+            else if (! cap.have || d < cap.d)
+            {
+                set (cap, d, e); moved = +1;
+                capViol   = broke;
+                capAimedI = (m.integratedLufs - c) + std::min (pmax, c + (aim - m.truePeakDbTp));
+            }
+            if (moved == 0) return;
+            streak   = (moved == lastSide) ? streak + 1 : 1;
+            lastSide = moved;
+        }
+
+        // A bracket exists and `nextD` is not under `cap`.
+        bool wants (double nextD) const noexcept
+        {
+            return ok.have && cap.have && ok.d < cap.d && nextD >= cap.d;
+        }
+
+        // `capAimedI` is under the target's tolerance and within `tol` of `feasibleI`.
+        bool closed (double feasibleI, double target, double tol) const noexcept
+        {
+            return capAimedI < target - tol && capAimedI - feasibleI <= tol;
+        }
+
+        // Held `margin = min (toleranceLu, width / 2)` inside the bracket: the smallest regula-falsi root over what `cap` broke,
+        // from `engageD` when `ok` is idle under it, the still end's excess halved `streak - 1` times; the midpoint when an
+        // excess is not measured. `margin` lower for the last render allowed.
+        double probe (const LoudnessRequest& req, bool lastRender) const noexcept
+        {
+            const double w = cap.d - ok.d, margin = std::min (req.toleranceLu, 0.5 * w);
+            const double dl = (okIdle && haveEngage && engageD > ok.d && engageD < cap.d) ? engageD : ok.d;
+            double next = cap.d;
+            for (int k = 0; k < 3; ++k)
+            {
+                if ((capViol & constraintBit (kDriveBoundConstraint[k])) == 0u) continue;
+                double el = ok.e[k], eh = cap.e[k];
+                if (! (el <= 0.0 && eh > 0.0)) { next = ok.d + 0.5 * w; break; }
+                if (streak >= 2 && lastSide < 0) eh = std::ldexp (eh, 1 - streak);
+                if (streak >= 2 && lastSide > 0) el = std::ldexp (el, 1 - streak);
+                next = std::fmin (next, dl - el * (cap.d - dl) / (eh - el));
+            }
+            if (lastRender) next -= margin;
+            return std::clamp (next, ok.d + margin, cap.d - margin);
+        }
+
+        // The largest overshoot measured on a working render at or under drive `d`, else kFirstLimitingOvershootDb.
+        double overshootAt (double d) const noexcept
+        {
+            double o = -1.0;
+            for (int i = 0; i < nActive; ++i)
+                if (activeD[i] <= d) o = std::fmax (o, activeOvershoot[i]);
+            return o >= 0.0 ? o : kFirstLimitingOvershootDb;
+        }
+
+    private:
+        static void set (End& s, double d, const double e[3]) noexcept
+        {
+            s.d = d;
+            std::copy (e, e + 3, s.e);
+            s.have = true;
         }
     };
 
@@ -1291,7 +1467,7 @@ private:
     // frames — the render is `frames` long by contract, and the drain is inside it.
     bool renderPass (MasteringChain& chain, OfflineRenderer& renderer, const MasteringChainParams& params,
                      const float* const* in, float* const* out, int nch, int frames,
-                     const LoudnessRequest& req, MasterMeasurement& m, LoudnessSolution& sol)
+                     const LoudnessRequest& req, MasterMeasurement& m, LoudnessSolution& sol, ProgressClock& clock)
     {
         (void) params;
         compHist_.reset();
@@ -1300,9 +1476,9 @@ private:
         maxReconLin_ = 0.0f;
         // The traces are reset with the histograms, at the same place and for the same reason: whatever they held
         // described a render that is about to be overwritten in `out`.
-        GainReductionTraceBuilder compTrace (sol.compressorTrace, frames);
-        GainReductionTraceBuilder limTrace  (sol.limiterTrace, frames);
-        if (! renderTapped (chain, renderer, in, out, nch, frames, req, compTrace, limTrace)) return false;
+        GainReductionTraceBuilder compTrace (sol.compressorTrace, frames, req.grTraceBuckets);
+        GainReductionTraceBuilder limTrace  (sol.limiterTrace, frames, req.grTraceBuckets);
+        if (! renderTapped (chain, renderer, in, out, nch, frames, req, compTrace, limTrace, clock)) return false;
         compTrace.finish();
         limTrace.finish();
 
@@ -1315,14 +1491,15 @@ private:
         // up — so on the system spelling the solver could take a different branch on Apple than on the row
         // that rendered the same file. The LINEAR peak it converts is the limiter's own, and stays RT.
         m.limiterMaxReconstructedPeakDb = core::gainToDbDet ((double) maxReconLin_);
-        return measure (out, nch, frames, m);
+        return measure (out, nch, frames, m, clock);
     }
 
     // The render, through `OfflineRenderer`'s OWN loop with a tap sink — not a second copy of the
     // alignment arithmetic. The sink below is the only thing this class adds to a plain render.
     bool renderTapped (MasteringChain& chain, OfflineRenderer& renderer,
                        const float* const* in, float* const* out, int nch, int frames,
-                       const LoudnessRequest& req, GainReductionTraceBuilder& compTrace, GainReductionTraceBuilder& limTrace)
+                       const LoudnessRequest& req, GainReductionTraceBuilder& compTrace, GainReductionTraceBuilder& limTrace,
+                       ProgressClock& clock)
     {
         const int F = chain.tapOversampleFactor();
         // Each stage's own window into the tap stream — stated by MasteringChainTaps, read from the
@@ -1379,7 +1556,7 @@ private:
                     }
             }
         };
-        return renderer.render (chain, in, out, nch, frames, taps, sink);
+        return renderer.render (chain, in, out, nch, frames, taps, sink, &clock);
     }
 
     static GainReductionStats summarise (const dynamics::offline::QuantileHistogram& h,
@@ -1477,27 +1654,33 @@ private:
     // identity is over peaks above that gate, which is every peak a delivered file has.
     static double peakDb (double lin) noexcept { return lin > kPeakDbGate ? core::gainToDbDet (lin) : kPeakDbSilence; }
 
-    bool measure (float* const* out, int nch, int frames, MasterMeasurement& m)
+    bool measure (float* const* out, int nch, int frames, MasterMeasurement& m, ProgressClock& clock)
     {
         analysis::LoudnessMeter           lm;
         analysis::ReferenceTruePeakMeter  tm;
         if (! lm.prepareForSamples (fs_, nch, meterSamples (frames, fs_))) return false;
         for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
         if (! tm.prepare (fs_, frames > 0 ? frames : 1, nch)) return false;
-        const float* p[core::kMaxChannels] {};
-        for (int c = 0; c < nch; ++c) p[c] = out[c];
-        if (! lm.process (p, nch, frames)) return false;
-        if (! tm.process (p, nch, frames)) return false;
+        for (int off = 0; off < frames; )
+        {
+            const int n = clock.piece (frames - off);
+            const float* p[core::kMaxChannels] {};
+            for (int c = 0; c < nch; ++c) p[c] = out[c] + off;
+            if (! lm.process (p, nch, n)) return false;
+            if (! tm.process (p, nch, n)) return false;
+            off += n;
+            if (! clock.advance (n)) return false;
+        }
         tm.drain();                         // its own kTapsPerPhase zeros: the whole FIR, and not given to `lm`
 
         m.gatingBlocks     = lm.gatingBlockCount();
         m.droppedBlocks    = lm.droppedBlocks();
         // THE uint64 FITS AN int HERE, and what bounds it is this function, not the meter's type. `lm` is a
         // local prepared above — prepareForSamples() ends in reset(), which zeroes the counter — and it sees
-        // exactly ONE process() call, of `frames` samples (the drain feeds `tm`, never `lm`). The counter
-        // moves only in finishSubHop(), by at most one per sub-hop (its two increments are exclusive on
+        // exactly `frames` samples, in one call or in the clock's pieces (the drain feeds `tm`, never `lm`). The
+        // counter moves only in finishSubHop(), by at most one per sub-hop (its two increments are exclusive on
         // `poisoned`), and a sub-hop is at least one sample. So it cannot exceed `frames`, an int. Feeding
-        // this meter more than once, or widening `frames`, is what would make this cast wrong.
+        // this meter more than `frames`, or widening `frames`, is what would make this cast wrong.
         m.nonFiniteSubHops = (int) lm.nonFiniteSubHops();
         // THIS MEASUREMENT MIXES THE TWO MATH POLICIES, on purpose and worth saying out loud. The two peak
         // fields below go through `peakDb`, which P80 put on `core::det`, because they are the certificate
@@ -1538,12 +1721,29 @@ public:
     [[nodiscard]] bool measureInputLoudnessRange (const float* const* in, int nch, int frames,
                                                   double& out) const
     {
+        return measureInputLoudnessRange (in, nch, frames, out, ProgressCallback {});
+    }
+
+    [[nodiscard]] bool measureInputLoudnessRange (const float* const* in, int nch, int frames,
+                                                  double& out, const ProgressCallback& progress) const
+    {
         if (! prepared_ || in == nullptr || nch < 1 || nch > nch_ || frames <= 0) return false;
         if (! rangeMeasurable (frames, fs_)) return false;
         analysis::LoudnessMeter lm;
         if (! lm.prepareForSamples (fs_, nch, meterSamples (frames, fs_))) return false;   // in samples: see meterSamples()
         for (int c = 0; c < nch; ++c) lm.setChannelWeight (c, weights_[c]);
-        if (! lm.process (in, nch, frames)) return false;
+        ProgressClock clock (progress);
+        if (! clock.begin (ProgressStage::LoudnessRange, 0, 0, frames, frames)) return false;
+        for (int off = 0; off < frames; )
+        {
+            const int n = clock.piece (frames - off);
+            const float* p[core::kMaxChannels] {};
+            for (int c = 0; c < nch; ++c) p[c] = in[c] + off;
+            if (! lm.process (p, nch, n)) return false;
+            off += n;
+            if (! clock.advance (n)) return false;
+        }
+        if (! clock.finish()) return false;
         // `nonFiniteSubHops` belongs in this test and was missing from it, which made the function
         // report SUCCESS on a programme its own meter had already flagged as compromised — and the
         // meter is a local, so the caller could not check for itself. A poisoned 10 ms is recorded as
