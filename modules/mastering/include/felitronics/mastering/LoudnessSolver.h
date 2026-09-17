@@ -165,8 +165,7 @@ inline constexpr std::uint32_t constraintBit (MasteringConstraint c) noexcept
 enum class MasteringSolveStatus
 {
     Solved,                 // measured within `toleranceLu` of the target, ceiling held, nothing bound
-    TargetUnreachable,      // a NAMED constraint binds; the result carries the best FEASIBLE render — for a limit that
-                            // grows with drive, the loudest the search found to keep it (TargetLoudnessSolver::DriveBound)
+    TargetUnreachable,      // a NAMED constraint binds; the result carries the best FEASIBLE render
     UpstreamViolation,      // a limit the search cannot move is already broken — see the note above
     TargetBetweenAchievable,// the two sides of the smallest gain interval the search can still express
                             // BRACKET the target and both miss the tolerance. `achievedBelowLufs` and
@@ -687,7 +686,7 @@ public:
         // written here were true of code that has since changed; this one is dated to the fixes above.
         double anchorD = 0.0, anchorJ = 0.0;
         bool   haveAnchor = false;
-        DriveBound bound;                   // the drive the constraints that grow with drive allow — see DriveBound
+        DriveBound bound;
         const double aim = pmax - (std::isfinite (req.truePeakAimDb) && req.truePeakAimDb > 0.0
                                        ? req.truePeakAimDb : 0.0);
 
@@ -771,11 +770,13 @@ public:
             // gain reduction. Measured: a caller ceiling of -40 dBTP against a promise of -1 made the
             // limiter pull 20 dB on the first render, and the guard called a violation "upstream" that
             // `g = -6.996, c = -1` reaches with no gain reduction at all.
-            // A render whose limiter is idle is judged at any ceiling: neither knob moves a limit it breaks.
-            if (pass == 0 && target > m.integratedLufs
-                && (c >= pmax - 1.0e-9 || (m.limiter.valid && m.limiter.maxDb <= 0.0)))
+            if (pass == 0 && target > m.integratedLufs && c >= pmax - 1.0e-9)
             {
-                const std::uint32_t up = viol & kDriveBound;
+                const std::uint32_t worsensWithDrive =
+                    constraintBit (MasteringConstraint::LimiterGainReduction)
+                  | constraintBit (MasteringConstraint::PeakToLoudness)
+                  | constraintBit (MasteringConstraint::LoudnessRange);
+                const std::uint32_t up = viol & worsensWithDrive;
                 if (up != 0)
                 {
                     sol.status  = MasteringSolveStatus::UpstreamViolation;
@@ -790,11 +791,7 @@ public:
             if (! keepRecord (sol, clock, g, c, m, viol)) return cancelled (sol);
             const bool onTarget = std::fabs (m.integratedLufs - target) <= req.toleranceLu;
             const bool feasible = (viol == 0);
-            {
-                double e[kDriveBoundCount];
-                driveExcess (m, req, e);
-                bound.add (g, c, m, aim, pmax, e, viol & kDriveBound);
-            }
+            bound.add (g, c, m, aim, pmax, req, viol);
 
             best.offer (g, c, m, feasible, std::fabs (m.integratedLufs - target),
                         worstExcess (m, req), viol);
@@ -883,29 +880,13 @@ public:
                 anchorJ = jNow + headroomToEngage;       // exact: while idle the chain is a multiply
                 haveAnchor = true;
             }
-
-            // THE BOUND IS THE SEARCH'S LIMIT, not a filter on its results. While `DriveBound::binds` — the smallest
-            // drive that broke a constraint in `kDriveBound` is not louder than the target's tolerance, at the ceiling
-            // its own peak asks for — the next render is `DriveBound::probe`, inside the bracket, aimed `overshootAt`
-            // the bracket's upper end below the aim, and the search stops once `DriveBound::closed` holds for the
-            // loudest feasible render seen.
-            // A RENDER WHOSE LIMITER WILL WORK after an idle one is aimed `overshootAt` below the aim.
-            double boundD = 0.0;
-            const bool bounded = bound.binds (target, req);
-            if (bounded)
-            {
-                if (best.have && best.feasible && bound.closed (best.m.integratedLufs, target, req.toleranceLu)) break;
-                boundD = bound.probe (req, pass + 2 >= req.maxPasses);
-                nextC  = std::min (pmax, aim - bound.overshootAt (bound.cap.d));
-            }
-            else if (limiterIdle && std::isfinite (headroomToEngage) && (target - nextC) - jNow > headroomToEngage)
+            // A render the limiter will work on, after an idle one, is aimed `overshootAt` its drive under the aim.
+            if (limiterIdle && std::isfinite (headroomToEngage) && (target - nextC) - jNow > headroomToEngage)
                 nextC = std::min (nextC, aim - bound.overshootAt (dNow + (target - nextC) - jNow));
             const double jReq = target - nextC;          // the shape has to deliver this much
             const double dj   = jReq - jNow;
 
-            if (bounded)
-                nextD = boundD;
-            else if (limiterIdle && dj <= headroomToEngage)
+            if (limiterIdle && dj <= headroomToEngage)
             {
                 nextD = dNow + dj;                       // exact, and it stays exact under a moving ceiling
             }
@@ -991,6 +972,14 @@ public:
                     const double bLo = std::fmin (loD, hiD), bHi = std::fmax (loD, hiD);
                     if (! (nextD > bLo && nextD < bHi)) nextD = 0.5 * (bLo + bHi);
                 }
+            }
+            // DriveBound::wants the step: `probe` replaces it, or `closed` ends the search.
+            if (bound.wants (nextD))
+            {
+                bound.acted = true;
+                if (best.have && best.feasible && bound.closed (best.m.integratedLufs, target, req.toleranceLu)) break;
+                nextD = bound.probe (req, pass + 2 >= req.maxPasses);
+                nextC = std::min (pmax, aim - bound.overshootAt (bound.cap.d));
             }
 
             double nextG = nextD + nextC;
@@ -1104,16 +1093,14 @@ public:
                                     && (bracketClosed
                                         || (stoppedOnResolution && best.nearestHave
                                             && best.nearestErr > req.toleranceLu));
-        // A BOUND THAT BINDS IS THE VERDICT: `TargetUnreachable`, `binding` the constraint broken at the bound's
-        // smallest breaking drive (bindingOf() among several broken there), `alsoViolated` that render's drive
-        // constraints with the nearest render's mask and the actuator's pin.
-        if (bound.binds (target, req))
+        // Once the drive bound has acted: `TargetUnreachable`, `binding` from what `cap` broke.
+        if (bound.acted)
         {
-            std::uint32_t viol = best.nearestViolated | bound.capViolated();
+            std::uint32_t viol = best.nearestViolated | bound.capViol;
             if (pinnedDir != 0 && best.have && best.err > req.toleranceLu)
                 viol |= constraintBit (MasteringConstraint::GainRange);
             sol.status  = MasteringSolveStatus::TargetUnreachable;
-            sol.binding = bindingOf (bound.capViolated());
+            sol.binding = bindingOf (bound.capViol);
             sol.alsoViolated = viol;
         }
         else if (betweenAchievable)
@@ -1256,63 +1243,35 @@ private:
         }
     };
 
-    // THE CONSTRAINTS THAT GROW WITH DRIVE, in the index order of `DriveBound`'s excesses. The compressor's gain
-    // reduction is not one of them: it is decided before the gain node and does not move with the drive.
+    // The limits that grow with drive, in the order of DriveBound's excesses.
     static constexpr std::uint32_t kDriveBound = constraintBit (MasteringConstraint::LimiterGainReduction)
                                                | constraintBit (MasteringConstraint::PeakToLoudness)
                                                | constraintBit (MasteringConstraint::LoudnessRange);
-    static constexpr int kDriveBoundCount = 3;
-    static constexpr MasteringConstraint kDriveBoundConstraint[kDriveBoundCount] {
+    static constexpr MasteringConstraint kDriveBoundConstraint[3] {
         MasteringConstraint::LimiterGainReduction, MasteringConstraint::PeakToLoudness, MasteringConstraint::LoudnessRange };
 
-    // The delivered true peak's overshoot over the ceiling assumed for a render whose limiter works, when no working
-    // render at or under its drive has been measured. With the default `truePeakAimDb` such a render stays under the
-    // promise wherever the material's overshoot is at most 0.20 dB.
+    // The overshoot `truePeakDbTp - c` assumed for a working render when none is measured at or under its drive.
     static constexpr double kFirstLimitingOvershootDb = 0.15;
 
-    // Each `kDriveBound` constraint's excess on one render, in its own units: positive exactly where violatedMask()
-    // flags it, NaN where the constraint is off or its statistic is not a measurement.
-    static void driveExcess (const MasterMeasurement& m, const LoudnessRequest& req, double e[kDriveBoundCount]) noexcept
-    {
-        const double nan = std::numeric_limits<double>::quiet_NaN();
-        e[0] = e[1] = e[2] = nan;
-        if (! req.limiterGr.off() && ! req.limiterGr.malformed() && m.limiter.valid)
-            e[0] = ((req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
-                  : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db : m.limiter.maxDb) - req.limiterGr.limitDb;
-        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()))
-            e[1] = req.minPlrDb - m.plrDb;
-        if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
-            && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
-            e[2] = (req.inputLoudnessRangeLu - m.loudnessRangeLu) - req.maxLraLossLu;
-    }
-
-    // THE DRIVE BOUND. Every `kDriveBound` constraint is taken to grow with the drive `d = g - c`: once a render breaks
-    // one, every larger drive is taken to break it. Kept from every render the search measures:
-    //   * `ok`, the largest drive that broke none of them, and `cap`, the smallest that broke one — each with its
-    //     excesses; `cap` with its mask and `capAimedI`, its loudness at the ceiling its own true peak asks for;
-    //   * `engageD`, the drive at which the limiter starts working (`g - limiterMaxReconstructedPeakDb`), and the
-    //     excesses of an idle render that broke none — under `engageD` the chain after the gain node is a multiply, so
-    //     they hold up to it;
-    //   * every working render's drive and overshoot `truePeakDbTp - c`.
-    // `ok` only rises and `cap` only falls, so a render against that order — none broken at or above `cap`, or one
-    // broken at or below `ok` — leaves `ok` at or above `cap` for the rest of the call, and the bound has no bracket.
+    // THE DRIVE BOUND over the renders made, in drive `d = g - c`: `ok` is the largest drive that broke no `kDriveBound` limit,
+    // `cap` the smallest that broke one, each with every limit's excess (> 0 where violatedMask() flags it, NaN when off or
+    // unmeasured); `cap` also with what it broke and `capAimedI`, its loudness at the ceiling its true peak asks for. A bracket
+    // is `ok` under `cap`. The bound only chooses renders; each is measured and judged like any other.
     struct DriveBound
     {
-        struct Side { double d = 0.0; double e[kDriveBoundCount] {}; bool have = false; };
+        struct End { double d = 0.0; double e[3] {}; bool have = false; };
 
-        Side ok, cap;
+        End ok, cap;
         std::uint32_t capViol = 0;
-        double capAimedI = 0.0;
-        double idleE[kDriveBoundCount] {};
-        bool   haveIdleE = false;
-        double engageD = 0.0;
-        bool   haveEngage = false;
-        int    lastSide = 0, streak = 0;             // the end the last update moved (-1 `ok`, +1 `cap`), and how many in a row
+        double capAimedI = 0.0, engageD = 0.0;
+        bool   okIdle = false, haveEngage = false;
+        bool   acted = false;                        // it chose a render or ended the search
+        int    lastSide = 0, streak = 0;             // the end last moved (-1 `ok`, +1 `cap`), and how often in a row
         double activeD[kMaxPasses] {}, activeOvershoot[kMaxPasses] {};
         int    nActive = 0;
 
-        void add (double g, double c, const MasterMeasurement& m, double aim, double pmax,
-                  const double e[kDriveBoundCount], std::uint32_t driveViol) noexcept
+        void add (double g, double c, const MasterMeasurement& m, double aim, double pmax, const LoudnessRequest& req,
+                  std::uint32_t viol) noexcept
         {
             const double d = g - c;
             const bool idle = m.limiter.valid && m.limiter.maxDb <= 0.0;
@@ -1324,16 +1283,28 @@ private:
                 activeOvershoot[nActive] = std::fmax (0.0, m.truePeakDbTp - c);
                 ++nActive;
             }
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            double e[3] = { nan, nan, nan };
+            if (! req.limiterGr.off() && ! req.limiterGr.malformed() && m.limiter.valid)
+                e[0] = ((req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
+                      : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db
+                                                                        : m.limiter.maxDb) - req.limiterGr.limitDb;
+            if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()))
+                e[1] = req.minPlrDb - m.plrDb;
+            if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
+                && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
+                e[2] = (req.inputLoudnessRangeLu - m.loudnessRangeLu) - req.maxLraLossLu;
+
+            const std::uint32_t broke = viol & kDriveBound;
             int moved = 0;
-            if (driveViol == 0)
+            if (broke == 0u)
             {
-                if (idle) { std::copy (e, e + kDriveBoundCount, idleE); haveIdleE = true; }
-                if (! ok.have || d > ok.d) { set (ok, d, e); moved = -1; }
+                if (! ok.have || d > ok.d) { set (ok, d, e); okIdle = idle; moved = -1; }
             }
             else if (! cap.have || d < cap.d)
             {
                 set (cap, d, e); moved = +1;
-                capViol   = driveViol;
+                capViol   = broke;
                 capAimedI = (m.integratedLufs - c) + std::min (pmax, c + (aim - m.truePeakDbTp));
             }
             if (moved == 0) return;
@@ -1341,67 +1312,40 @@ private:
             lastSide = moved;
         }
 
-        // The bracket's lower end: `ok`, or `engageD` when that is larger and under `cap` — carrying an idle render's
-        // excesses, or without one only the limiter statistic's (0 at `engageD`). False when the larger of the two is
-        // not under `cap`, or there is neither.
-        bool lower (Side& lo, const LoudnessRequest& req) const noexcept
+        // A bracket exists and `nextD` is not under `cap`.
+        bool wants (double nextD) const noexcept
         {
-            lo = ok;
-            if (haveEngage && cap.have && engageD < cap.d && (! lo.have || engageD > lo.d))
-            {
-                lo.d = engageD;
-                lo.have = true;
-                for (int k = 0; k < kDriveBoundCount; ++k)
-                    lo.e[k] = haveIdleE ? idleE[k] : std::numeric_limits<double>::quiet_NaN();
-                if (! haveIdleE && ! req.limiterGr.off() && ! req.limiterGr.malformed()) lo.e[0] = -req.limiterGr.limitDb;
-            }
-            return lo.have && cap.have && lo.d < cap.d;
+            return ok.have && cap.have && ok.d < cap.d && nextD >= cap.d;
         }
 
-        std::uint32_t capViolated() const noexcept { return capViol; }
-
-        // The bound decides the next render: a breaking drive is known, it has a lower end, and `cap` at its aimed ceiling
-        // is not louder than `target` plus the tolerance.
-        bool binds (double target, const LoudnessRequest& req) const noexcept
-        {
-            Side lo;
-            return cap.have && capAimedI <= target + req.toleranceLu && lower (lo, req);
-        }
-
-        // Closed: `cap` at its aimed ceiling is quieter than `target` minus `tol`, and `feasibleI`, the loudest feasible
-        // render, is within `tol` of it.
+        // `capAimedI` is under the target's tolerance and within `tol` of `feasibleI`.
         bool closed (double feasibleI, double target, double tol) const noexcept
         {
             return capAimedI < target - tol && capAimedI - feasibleI <= tol;
         }
 
-        // The next drive, inside the bracket (call only while binds()): regula falsi on the excess of each constraint
-        // `cap` breaks, the smallest root, the excess at the end that has not moved for `streak` >= 2 updates halved
-        // `streak - 1` times (Illinois), lowered by `margin = min (toleranceLu, width / 2)` dB when it is the last
-        // render the budget allows, and held `margin` inside either end; the midpoint when an end's excess is not known.
+        // Held `margin = min (toleranceLu, width / 2)` inside the bracket: the smallest regula-falsi root over what `cap` broke,
+        // from `engageD` when `ok` is idle under it, the still end's excess halved `streak - 1` times; the midpoint when an
+        // excess is not measured. `margin` lower for the last render allowed.
         double probe (const LoudnessRequest& req, bool lastRender) const noexcept
         {
-            Side lo;
-            (void) lower (lo, req);
-            const double w = cap.d - lo.d;
-            double root = cap.d;
-            bool known = true;
-            for (int k = 0; k < kDriveBoundCount; ++k)
+            const double w = cap.d - ok.d, margin = std::min (req.toleranceLu, 0.5 * w);
+            const double dl = (okIdle && haveEngage && engageD > ok.d && engageD < cap.d) ? engageD : ok.d;
+            double next = cap.d;
+            for (int k = 0; k < 3; ++k)
             {
                 if ((capViol & constraintBit (kDriveBoundConstraint[k])) == 0u) continue;
-                double el = lo.e[k], eh = cap.e[k];
-                if (! (el <= 0.0 && eh > 0.0)) { known = false; break; }
+                double el = ok.e[k], eh = cap.e[k];
+                if (! (el <= 0.0 && eh > 0.0)) { next = ok.d + 0.5 * w; break; }
                 if (streak >= 2 && lastSide < 0) eh = std::ldexp (eh, 1 - streak);
                 if (streak >= 2 && lastSide > 0) el = std::ldexp (el, 1 - streak);
-                root = std::fmin (root, std::isfinite (eh) ? lo.d - el * w / (eh - el) : lo.d);
+                next = std::fmin (next, dl - el * (cap.d - dl) / (eh - el));
             }
-            if (! known) return lo.d + 0.5 * w;
-            const double margin = std::min (req.toleranceLu, 0.5 * w);
-            return std::clamp (lastRender ? root - margin : root, lo.d + margin, cap.d - margin);
+            if (lastRender) next -= margin;
+            return std::clamp (next, ok.d + margin, cap.d - margin);
         }
 
-        // The overshoot a render at drive `d` is aimed with: the largest measured on a working render at or under `d`,
-        // kFirstLimitingOvershootDb when there is none.
+        // The largest overshoot measured on a working render at or under drive `d`, else kFirstLimitingOvershootDb.
         double overshootAt (double d) const noexcept
         {
             double o = -1.0;
@@ -1411,10 +1355,10 @@ private:
         }
 
     private:
-        static void set (Side& s, double d, const double e[kDriveBoundCount]) noexcept
+        static void set (End& s, double d, const double e[3]) noexcept
         {
             s.d = d;
-            std::copy (e, e + kDriveBoundCount, s.e);
+            std::copy (e, e + 3, s.e);
             s.have = true;
         }
     };

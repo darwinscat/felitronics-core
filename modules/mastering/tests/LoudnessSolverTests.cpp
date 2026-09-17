@@ -2943,8 +2943,10 @@ void testTheBoundIsTheSearchsLimit()
     }
 
     // ---------------------------------------------------------------------------------------------
-    test::group ("M1: a limit that does not bind changes nothing — the same renders and the same audio, bit for bit");
+    test::group ("M1: when the search without a limit solves on a render that keeps it, the search with the limit is the same, bit for bit");
     {
+        const double inf = std::numeric_limits<double>::infinity();
+        const std::uint32_t driveBits = grBit | lraBit | constraintBit (MasteringConstraint::PeakToLoudness);
         const auto sameRun = [] (const LoudnessSolution& a, const LoudnessSolution& b,
                                  const std::vector<std::vector<float>>& ao, const std::vector<std::vector<float>>& bo)
         {
@@ -2960,55 +2962,173 @@ void testTheBoundIsTheSearchsLimit()
                 same = std::memcmp (ao[c].data(), bo[c].data(), ao[c].size() * sizeof (float)) == 0;
             return same;
         };
-        // (1)–(2) limits no render can break, beside none at all: a cold start that crosses into limiting, a warm start.
-        for (int which = 0; which < 2; ++which)
+        // The delivered render keeps every limit of `req`, read off its measurement.
+        const auto keeps = [] (const LoudnessSolution& s, const LoudnessRequest& req)
         {
-            Programme src = which == 0 ? makeMusic (4.0, 0.28) : makeMusic (3.0, 0.3);
-            LoudnessRequest plain;
-            plain.targetLufs = which == 0 ? -10.0 : -14.0; plain.maxTruePeakDbTp = -1.0;
-            plain.maxPasses = which == 0 ? 4 : 6;
-            if (which == 1) plain.initialGainDb = 55.0;
-            LoudnessRequest loose = plain;
-            loose.maxLraLossLu = 50.0; loose.inputLoudnessRangeLu = 20.0;
-            loose.limiterGr = { 300.0, GrStatistic::Max };
-            loose.minPlrDb = -300.0;
+            const MasterMeasurement& m = s.measured;
+            const double gr = (req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
+                            : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db : m.limiter.maxDb;
+            return (req.limiterGr.off() || (m.limiter.valid && gr <= req.limiterGr.limitDb))
+                && m.plrDb >= req.minPlrDb
+                && (! std::isfinite (req.inputLoudnessRangeLu) || ! m.lraValid
+                    || req.inputLoudnessRangeLu - m.loudnessRangeLu <= req.maxLraLossLu);
+        };
+        const auto check = [&] (const char* what, const Programme& src, const LoudnessRequest& limited, bool brokenOnTheWay,
+                                auto&& tweak)
+        {
+            LoudnessRequest plain = limited;
+            plain.limiterGr = {}; plain.minPlrDb = -inf; plain.maxLraLossLu = inf;
+            const int nch = src.nch();
             Programme a; a.ch = src.ch; a.bind();
             Programme b; b.ch = src.ch; b.bind();
             Rig ra, rb;
-            if (! test::run (ra.build (2)) || ! test::run (rb.build (2))) return;
-            const auto sa = ra.solver.solve (ra.chain, ra.renderer, ra.params, src.in(), a.out(), 2, src.frames(), plain);
-            const auto sb = rb.solver.solve (rb.chain, rb.renderer, rb.params, src.in(), b.out(), 2, src.frames(), loose);
-            test::ok (sa.status == MasteringSolveStatus::Solved && sa.passes >= 2,
-                      std::string ("precondition: the plain request solves after a search (") + statusName (sa.status) + ", "
-                      + std::to_string (sa.passes) + " renders)");
-            test::ok (sameRun (sa, sb, a.ch, b.ch), which == 0 ? "a cold start: limits nothing breaks change nothing"
-                                                               : "a +55 dB warm start: limits nothing breaks change nothing");
+            if (! test::run (ra.build (nch)) || ! test::run (rb.build (nch))) return;
+            tweak (ra.params); tweak (rb.params);
+            const auto sa = ra.solver.solve (ra.chain, ra.renderer, ra.params, src.in(), a.out(), nch, src.frames(), plain);
+            const auto sb = rb.solver.solve (rb.chain, rb.renderer, rb.params, src.in(), b.out(), nch, src.frames(), limited);
+            test::ok (sa.status == MasteringSolveStatus::Solved && keeps (sa, limited),
+                      std::string ("precondition, ") + what + ": without the limit it solves on a render that keeps it ("
+                      + statusName (sa.status) + ", " + std::to_string (sa.passes) + " renders)");
+            bool broke = false;
+            for (int k = 0; k < sb.logCount; ++k) broke = broke || (sb.log[k].violated & driveBits) != 0u;
+            test::ok (broke == brokenOnTheWay, std::string ("precondition, ") + what
+                      + (brokenOnTheWay ? ": a render on the way breaks the limit" : ": no render breaks the limit"));
+            char msg[320];
+            std::snprintf (msg, sizeof msg, "%s: the same search (without %s/%d renders/%.6f LUFS, with %s/%d/%.6f)", what,
+                           statusName (sa.status), sa.passes, sa.measured.integratedLufs,
+                           statusName (sb.status), sb.passes, sb.measured.integratedLufs);
+            test::ok (sameRun (sa, sb, a.ch, b.ch), msg);
+            std::printf ("      %s\n", msg);
+        };
+        const auto none = [] (MasteringChainParams&) {};
+
+        // Limits no render can break, on a cold start that crosses into limiting and on a +55 dB warm start.
+        {
+            LoudnessRequest req;
+            req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+            req.maxLraLossLu = 50.0; req.inputLoudnessRangeLu = 20.0;
+            req.limiterGr = { 300.0, GrStatistic::Max }; req.minPlrDb = -300.0;
+            check ("loose limits, a cold start", makeMusic (4.0, 0.28), req, false, none);
+            req.targetLufs = -14.0; req.maxPasses = 6; req.initialGainDb = 55.0;
+            check ("loose limits, a +55 dB warm start", makeMusic (3.0, 0.3), req, false, none);
         }
-        // (3) a REAL limit, broken by the renders on the way down to a target that keeps it.
+        // A loudness-range limit broken on the way down to a target that keeps it.
         {
             Programme src = makeWideRange (12.0);
             Rig probe;
             if (! test::run (probe.build (2))) return;
             double inLra = 0.0;
             if (! test::run (probe.solver.measureInputLoudnessRange (src.in(), 2, src.frames(), inLra))) return;
-            LoudnessRequest plain;
-            plain.targetLufs = -14.0; plain.maxTruePeakDbTp = -1.0; plain.maxPasses = 6; plain.initialGainDb = 20.0;
-            LoudnessRequest bounded = plain;
-            bounded.maxLraLossLu = 2.05; bounded.inputLoudnessRangeLu = inLra;
-            Programme a; a.ch = src.ch; a.bind();
-            Programme b; b.ch = src.ch; b.bind();
-            Rig ra, rb;
-            if (! test::run (ra.build (2)) || ! test::run (rb.build (2))) return;
-            ra.params.bypassCompressor = true; rb.params.bypassCompressor = true;
-            const auto sa = ra.solver.solve (ra.chain, ra.renderer, ra.params, src.in(), a.out(), 2, src.frames(), plain);
-            const auto sb = rb.solver.solve (rb.chain, rb.renderer, rb.params, src.in(), b.out(), 2, src.frames(), bounded);
-            printLog (sb);
-            bool brokeOnTheWay = false;
-            for (int k = 0; k < sb.logCount; ++k) brokeOnTheWay = brokeOnTheWay || (sb.log[k].violated & lraBit) != 0u;
-            test::ok (brokeOnTheWay && sb.status == MasteringSolveStatus::Solved,
-                      std::string ("precondition: renders on the way break the limit and the target keeps it (")
-                      + statusName (sb.status) + ")");
-            test::ok (sameRun (sa, sb, a.ch, b.ch), "a limit broken only on the way to a target that keeps it changes nothing");
+            LoudnessRequest req;
+            req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 6; req.initialGainDb = 20.0;
+            req.maxLraLossLu = 2.05; req.inputLoudnessRangeLu = inLra;
+            check ("a range limit broken on the way down", src, req, true,
+                   [] (MasteringChainParams& p) { p.bypassCompressor = true; });
+        }
+        // THE REVIEW ROUND'S WITNESSES (codex astra).
+        // (1) A peak-to-loudness floor on a mono 1 kHz tone, 10 s at -69 and 10 s at -71 LUFS: at the first gain the absolute
+        //     gate keeps the quiet half out, and a louder render lets it in and RAISES the ratio — while the limiter is idle.
+        {
+            const int half = (int) (10.0 * kFs), n = 2 * half;
+            const auto tone = [&] (double a1, double a2)
+            {
+                Programme p; p.ch.assign (1, std::vector<float> ((std::size_t) n));
+                for (int i = 0; i < n; ++i)
+                    p.ch[0][(std::size_t) i] = (float) ((i < half ? a1 : a2) * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+                p.bind();
+                return p;
+            };
+            const Programme unit = tone (1.0, 1.0);
+            analysis::LoudnessMeter lm;
+            if (! test::run (lm.prepare (kFs, 1, 30.0)) || ! test::run (lm.process (unit.in(), 1, n))) return;
+            const double cal = lm.integratedLufs();
+            LoudnessRequest req;
+            req.targetLufs = -65.0; req.maxTruePeakDbTp = -1.0; req.minPlrDb = 3.45;
+            check ("a peak-to-loudness floor the absolute gate lifts",
+                   tone (std::pow (10.0, (-69.0 - cal) / 20.0), std::pow (10.0, (-71.0 - cal) / 20.0)), req, true,
+                   [] (MasteringChainParams& p) { p.bypassCompressor = true; p.bypassDither = true; p.limiter.ceilingDbTp = -3.0; });
+        }
+        // (2) A render inside the target's tolerance that breaks the limit, followed by one that keeps it.
+        {
+            LoudnessRequest req;
+            req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.toleranceLu = 0.1; req.maxPasses = 8;
+            req.initialGainDb = 11.734739575; req.limiterGr = { 2.211, GrStatistic::Max };
+            check ("a limit broken inside the tolerance", makeMusic (1.0, 0.5), req, true, none);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    test::group ("M1: a 0 dB gain-reduction limit — kept where the limiter starts working, never crawled past");
+    {
+        // The review round's witness (codex astra): its first render limits 0.009 dB, the next keeps 0 dB on target. The
+        // search before M1 solved it in two renders.
+        {
+            Programme src = makeMusic (4.0, 0.5);
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            rig.params.limiter.ceilingDbTp = -1.1;
+            LoudnessRequest req;
+            req.targetLufs = -12.4; req.maxTruePeakDbTp = -1.0; req.toleranceLu = 0.1; req.maxPasses = 8;
+            req.initialGainDb = 6.03; req.limiterGr = { 0.0, GrStatistic::Max };
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+            printLog (sol);
+            test::ok (sol.logCount >= 1 && sol.log[0].limiterMaxGrDb > 0.0, "precondition: the first render limits");
+            const Independent ind = measureIndependently (dst.ch);
+            test::ok (sol.status == MasteringSolveStatus::Solved && sol.measured.limiter.valid && sol.measured.limiter.maxDb <= 0.0
+                      && std::fabs (ind.I - req.targetLufs) <= req.toleranceLu && sol.passes <= 2,
+                      std::string ("Solved on a render that limits nothing, in the two renders it took before M1 (got ")
+                      + statusName (sol.status) + ", " + std::to_string (sol.passes) + " renders, GR "
+                      + std::to_string (sol.measured.limiter.maxDb) + " dB, " + std::to_string (ind.I) + " LUFS)");
+        }
+        // A target past the drive the limiter starts working at: the answer is that drive, and a search that holds its
+        // probes a margin ABOVE a root sitting exactly there crawls down on the forbidden side for the whole budget.
+        {
+            Programme src = makeMusic (4.0, 0.5);
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            LoudnessRequest req;
+            req.targetLufs = -8.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 10;
+            req.limiterGr = { 0.0, GrStatistic::Max };
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+            printLog (sol);
+            test::ok (sol.logCount >= 1 && sol.log[0].limiterMaxGrDb <= 0.0 && sol.log[0].integratedLufs < req.targetLufs - 3.0,
+                      "precondition: the first render is idle and more than 3 LU under the target");
+            test::ok (sol.status == MasteringSolveStatus::TargetUnreachable && sol.binding == MasteringConstraint::LimiterGainReduction
+                      && sol.measured.limiter.valid && sol.measured.limiter.maxDb <= 0.0,
+                      std::string ("refused by name, delivering a render that limits nothing (got ") + statusName (sol.status) + "/"
+                      + constraintName (sol.binding) + ", GR " + std::to_string (sol.measured.limiter.maxDb) + " dB)");
+            // The root lands on the drive the limiter starts working at, where the excess is exactly 0: taken there, six
+            // renders close the bracket, the delivery re-render included; bisecting instead takes nine.
+            test::ok (sol.passes <= 6, "closed in six renders (" + std::to_string (sol.passes) + ")");
+            const int k = certificateOf (sol, req, grBit);
+            test::ok (k >= 0 && sol.log[0].integratedLufs + 3.0 < sol.measured.integratedLufs,
+                      "the log holds a render breaking the limit no more than the tolerance louder than the delivered one, "
+                      "which is not the first render");
+        }
+        // A 1 dB limit on the maximum, which grows 1:1 with drive past the limiter's start: regula falsi lands exactly on the
+        // boundary, and a probe not held inside the bracket breaks the limit by a rounding at every render.
+        {
+            Programme src = makeMusic (1.0, 0.5);
+            Programme dst; dst.ch = src.ch; dst.bind();
+            Rig rig;
+            if (! test::run (rig.build (2))) return;
+            LoudnessRequest req;
+            req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 8;
+            req.limiterGr = { 1.0, GrStatistic::Max };
+            const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+            printLog (sol);
+            test::ok (sol.logCount >= 1 && sol.log[0].limiterMaxGrDb <= 0.0 && sol.log[0].integratedLufs < req.targetLufs - 3.0,
+                      "precondition: the first render is idle and more than 3 LU under the target");
+            test::ok (sol.status == MasteringSolveStatus::TargetUnreachable && sol.binding == MasteringConstraint::LimiterGainReduction
+                      && sol.measured.limiter.valid && sol.measured.limiter.maxDb <= 1.0
+                      && sol.log[0].integratedLufs + 3.0 < sol.measured.integratedLufs,
+                      std::string ("refused by name, delivering a render inside the limit and not the first one (got ")
+                      + statusName (sol.status) + ", GR " + std::to_string (sol.measured.limiter.maxDb) + " dB, "
+                      + std::to_string (sol.measured.integratedLufs) + " LUFS)");
+            test::ok (certificateOf (sol, req, grBit) >= 0,
+                      "the log holds a render breaking the limit no more than the tolerance louder than the delivered one");
         }
     }
 
@@ -3030,29 +3150,6 @@ void testTheBoundIsTheSearchsLimit()
         test::ok (sol.status == MasteringSolveStatus::UpstreamViolation && sol.binding == MasteringConstraint::LimiterGainReduction
                   && sol.passes == 1,
                   std::string ("UpstreamViolation / LimiterGainReduction after one render (got ") + statusName (sol.status) + "/"
-                  + constraintName (sol.binding) + ", " + std::to_string (sol.passes) + ")");
-    }
-    {
-        // An IDLE first render under a ceiling below the promise: the compressor spends the range, and no gain and no
-        // ceiling gives it back.
-        Programme src = makeWideRange (12.0);
-        Programme dst; dst.ch = src.ch; dst.bind();
-        Rig rig;
-        if (! test::run (rig.build (2))) return;
-        rig.params.limiter.ceilingDbTp = -0.5;
-        double inLra = 0.0;
-        if (! test::run (rig.solver.measureInputLoudnessRange (src.in(), 2, src.frames(), inLra))) return;
-        LoudnessRequest req;
-        req.targetLufs = -8.0; req.maxTruePeakDbTp = 0.0; req.maxPasses = 6;
-        req.maxLraLossLu = 1.05; req.inputLoudnessRangeLu = inLra;
-        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
-        test::ok (sol.logCount >= 1 && sol.log[0].limiterMaxGrDb <= 0.0 && sol.log[0].ceilingDb < req.maxTruePeakDbTp
-                  && (sol.log[0].violated & constraintBit (MasteringConstraint::LoudnessRange)) != 0u
-                  && sol.log[0].integratedLufs < req.targetLufs,
-                  "precondition: the first render is idle, under a ceiling below the promise, breaks the range limit and is under the target");
-        test::ok (sol.status == MasteringSolveStatus::UpstreamViolation && sol.binding == MasteringConstraint::LoudnessRange
-                  && sol.passes == 1,
-                  std::string ("UpstreamViolation / LoudnessRange after one render (got ") + statusName (sol.status) + "/"
                   + constraintName (sol.binding) + ", " + std::to_string (sol.passes) + ")");
     }
 

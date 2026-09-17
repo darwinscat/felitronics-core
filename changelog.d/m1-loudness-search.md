@@ -5,19 +5,18 @@
 **`mastering::TargetLoudnessSolver`**, for the three limits that grow with drive — the limiter's gain reduction, the
 peak-to-loudness ratio and the loudness-range loss:
 
-- **A target that needs such a limit broken is answered at the limit.** Once a render breaks one, the next renders
-  bracket the largest drive that keeps it — between the loudest render that kept it (or the drive the limiter starts
-  working at) and the quietest that broke it, by regula falsi on the limit's own statistic — and the call delivers the
-  loudest render that keeps it as `TargetUnreachable`, with `binding` the limit broken at the smallest breaking drive.
-  The search stops when that render is within `toleranceLu` of the smallest breaking one at the ceiling its true peak
-  asks for — unless that one is inside the target's tolerance, where a render that keeps the limit is still `Solved` —
-  or at `maxPasses`. It used to step on loudness alone and deliver the feasible render it happened to have: after a
-  first render at the starting gain, that render — the source at its own level.
-- **A limit the target keeps changes nothing**: the renders and the audio are bit-identical to the same request
-  without it. A limit the first render already breaks is still `UpstreamViolation`, and now also under a ceiling below
-  the promise when the limiter is idle on that render — neither knob moves it there. A limit whose statistic is not
-  monotone in drive can end the search short of it; the delivered render keeps every limit whenever a render that
-  keeps them was seen, and `Solved` still means the delivered render keeps them all.
+- **A target past such a limit is answered at the limit.** When the next step asks for a drive at or past the
+  smallest one a render broke a limit at, the search renders inside the bracket between that render and the loudest
+  one that kept every limit instead — regula falsi on the limit's own statistic, held inside the bracket, the
+  midpoint where a statistic is not measured — and delivers the loudest render that keeps them as
+  `TargetUnreachable`, `binding` what the smallest breaking drive broke. It stops once the breaking render, at the ceiling its true peak asks for, is under the
+  target's tolerance and within `toleranceLu` of that render, or at `maxPasses`. It used to step on loudness alone and
+  deliver the feasible render it happened to have: after a first render at the starting gain, the source at its own
+  level. Nothing is assumed about how a limit moves with drive beyond where to look: every render the bound chooses is
+  measured, and a render that keeps a limit above one that broke it ends the bracket.
+- **Whenever the search without the limit solves on a render that keeps it, the search with the limit is the same
+  search**, render for render and bit for bit. Without a render that kept every limit there is no bracket, and the
+  search is the one before.
 - **The first render whose limiter works, after an idle one, is aimed 0.15 dB under the aim**, or by the largest
   overshoot measured on a working render at or under its drive. It used to be aimed at the promise itself, land over
   it by the between-sample overshoot and spend a render on the correction: on the suite's programme a -12 LUFS target
