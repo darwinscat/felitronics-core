@@ -5,6 +5,35 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.38.0 — 2026-09-18
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### tools — the EQ's curve through the C ABI; v7
+
+**`fc_master_eq_curve (params, sampleRate, lane, band, freqHz, count, outDb, cap, written)`.** The magnitude
+response, in dB, of a parameter set's EQ at frequencies the caller names — `eq::EqEngine::magnitudeDbFor`, read
+out. No handle and no render: the parameters travel with the call, so the curve is answerable while a knob is
+moving, and the call asks the heap for nothing.
+
+`lane` is an `fc_eq_axis` (`FC_EQ_AXIS_STEREO`, `_LEFT`, `_RIGHT`, `_MID`, `_SIDE` — `eq::Axis`, where the four
+domain axes each fold the Stereo lane in and `STEREO` is that lane alone); a code that names no axis is
+`FC_ERR_ENUM`. `band` is −1 for the whole bank, or 0..`FC_MAX_EQ_BANDS`−1 for one band, anything else
+`FC_ERR_RANGE`. `sampleRate` is held to the `eq` module's own domain — `FC_ERR_NON_FINITE` for a non-finite
+rate, `FC_ERR_REFUSED_BY_CORE` for one outside it. The buffer is the caller's and `cap` is binding: the call
+writes all `count` values or none, so `cap` below `count` is `FC_ERR_CAPACITY` and `count == 0` is
+`FC_ERR_RANGE`; a non-finite frequency anywhere in the grid is `FC_ERR_NON_FINITE` before anything is written.
+No two of `freqHz`, `outDb` and `written` may touch — all three pairs `FC_ERR_SPAN`, `written` inside the grid
+included, since the grid is the caller's `const`; `written` is left as it was by every refusal.
+`params.bypassEq` and each band's `dyn` are not read, and neither can refuse the call: the curve is the static
+response of the bands, so a `dyn` the caller never filled is not this call's business.
+
+**C ABI v7.** One entry point and no struct, so no row moves in the size table and every struct keeps its v6
+size. `fc-master-layout.mjs` is v7 and exports `FC_EQ_AXIS` — the lane names in the order `fc_eq_axis` declares
+them, so the index is the code `lane` takes and a consumer needs no hand-written copy of that order.
+`layout-check.mjs` reads the `FC_EQ_AXIS_*` codes out of `tools/fc_master_abi.h` and holds the array against
+them entry by entry — declaration order, value and spelling — so a permutation in the header fails the check.
+
 ## v0.37.0 — 2026-09-18
 
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
