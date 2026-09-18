@@ -1497,7 +1497,11 @@ FC_EXPORT fc_status fc_master_eq_curve (const fc_master_params* params, double s
     const std::uint64_t outBytes = (std::uint64_t) cap   * sizeof (double);
     if (const fc_status st = checkDoubleSpan (freqHz, inBytes);  st != FC_OK) return st;
     if (const fc_status st = checkDoubleSpan (outDb,  outBytes); st != FC_OK) return st;
+    // NO TWO OF THE THREE MAY TOUCH. `written` inside the GRID is the pair that is not a matter of taste: the
+    // grid is the caller's `const`, and the store that clears `written` lands in it before the curve is read
+    // — measured, `written` at the grid's fourth byte answered FC_OK and 0 dB where the band gives +6.
     if (aliasesSpan (freqHz, (std::size_t) inBytes, outDb, outBytes)) return FC_ERR_SPAN;
+    if (aliasesSpan (written, sizeof (*written), freqHz, inBytes)) return FC_ERR_SPAN;
     if (aliasesSpan (written, sizeof (*written), outDb, outBytes)) return FC_ERR_SPAN;
 
     eq::Axis axis {};
@@ -1505,7 +1509,13 @@ FC_EXPORT fc_status fc_master_eq_curve (const fc_master_params* params, double s
     if (band < -1 || band >= FC_MAX_EQ_BANDS) return FC_ERR_RANGE;
     if (! fin (sampleRate)) return FC_ERR_NON_FINITE;
 
-    const fc_master_params p = loadIn (params, bytes);
+    fc_master_params p = loadIn (params, bytes);
+    // `dyn` IS NOT READ, AND THAT HAS TO HOLD FOR THE MAPPING TOO. `toCore` refuses a non-finite field of it, so
+    // each band's block is put back to what the defaults writer writes before the one mapping runs: a struct
+    // this call was told to ignore cannot refuse it. The mapping itself stays the one every other call uses.
+    fc_master_params dflt {};
+    writeDefaults (dflt);
+    for (int b = 0; b < FC_MAX_EQ_BANDS; ++b) p.eqBands[b].dyn = dflt.eqBands[b].dyn;
     MasteringChainParams cp {};
     if (const fc_status st = toCore (p, cp); st != FC_OK) return st;
     // THE WHOLE GRID BEFORE ANY OF IT IS ANSWERED: `magnitudeDbFor` answers a finite number for a non-finite

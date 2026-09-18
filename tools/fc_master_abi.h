@@ -938,21 +938,24 @@ fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
 // `band` is −1 for the whole bank — the product over every band, an off or bypassed one contributing unity —
 // or 0..FC_MAX_EQ_BANDS−1 for that band alone. Anything else is FC_ERR_RANGE.
 //
-// TWO FIELDS OF `params` ARE NOT READ, and the curve does not move with them: `bypassEq`, which switches the
-// chain's stage rather than the bands, and each band's `dyn` — this is the static response. Everything else
-// crosses by the mapping every other call uses, so this call is refused exactly where `fc_master_configure`
-// is (a filter type that names nothing FC_ERR_ENUM, a non-finite field FC_ERR_NON_FINITE).
+// TWO FIELDS OF `params` ARE NOT READ, and the curve neither moves with them NOR IS REFUSED FOR THEM:
+// `bypassEq`, which switches the chain's stage rather than the bands, and each band's `dyn` — this is the
+// static response, so a `dyn` left unfilled or non-finite is not this call's business, on or off. Everything
+// else crosses by the mapping every other call uses, so this call is refused exactly where
+// `fc_master_configure` is (a filter type that names nothing FC_ERR_ENUM, a non-finite field
+// FC_ERR_NON_FINITE).
 //
 // THE BUFFER IS THE CALLER'S and `cap` is binding: the call writes all `count` values or none, so a `cap`
 // below `count` is FC_ERR_CAPACITY, and `count == 0` is FC_ERR_RANGE. A non-finite frequency is
 // FC_ERR_NON_FINITE, and the whole grid is read for one before anything is written; every finite frequency
-// is evaluated as it stands and never clamped. `freqHz` and `outDb` may not touch, and `written` may not
-// point into `outDb` — FC_ERR_SPAN.
+// is evaluated as it stands and never clamped. NO TWO OF `freqHz`, `outDb` AND `written` MAY TOUCH — all
+// three pairs are FC_ERR_SPAN, `written` inside the GRID included: `freqHz` is the caller's `const`, and the
+// store that clears `written` would land in it before the curve is read.
 //
 // Checks in the header's order: poison, `written`, `params`' header and span, `count` and `cap`, the two
-// spans and their overlaps, then the field values — `lane`, `band`, `sampleRate`, the parameter set, the
-// grid — and then the core. `written` is set to 0 once every refusal is behind the call and to `count` on
-// FC_OK; a refused call leaves it as it was, as `fc_master_flush` and `fc_solution_log` leave it.
+// spans and their three overlaps, then the field values — `lane`, `band`, `sampleRate`, the parameter set,
+// the grid — and then the core. `written` is set to 0 once every refusal is behind the call and to `count`
+// on FC_OK; a refused call leaves it as it was, as `fc_master_flush` and `fc_solution_log` leave it.
 fc_status fc_master_eq_curve (const fc_master_params* params, double sampleRate, int32_t lane, int32_t band,
                               const double* freqHz, uint32_t count, double* outDb, uint32_t cap, uint32_t* written);
 

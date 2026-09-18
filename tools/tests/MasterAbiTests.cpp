@@ -3260,6 +3260,24 @@ int main()
             { q.eqBands[b].dyn.on = 1; q.eqBands[b].dyn.rangeDb = -12.0; }
             ok (ask (q, FC_EQ_AXIS_LEFT, -1) == FC_OK && worstAgainst (axisCurve[1]) <= 0.0,
                 "bypassEq and dyn move nothing: the curve is the same bits");
+
+            // AND A `dyn` THE CALLER NEVER FILLED. A block this call does not read may not refuse it either, on
+            // or off — otherwise a page drawing a curve has to supply the one struct it was told to ignore.
+            for (const int on : { 0, 1 })
+            {
+                fc_master_params z = lr;
+                for (int b = 0; b < FC_MAX_EQ_BANDS; ++b)
+                {
+                    z.eqBands[b].dyn.on      = on;
+                    z.eqBands[b].dyn.rangeDb = std::numeric_limits<double>::quiet_NaN();
+                    z.eqBands[b].dyn.thrDb   = std::numeric_limits<double>::infinity();
+                    z.eqBands[b].dyn.atk     = -std::numeric_limits<double>::infinity();
+                    z.eqBands[b].dyn.rel     = std::numeric_limits<double>::quiet_NaN();
+                }
+                ok (ask (z, FC_EQ_AXIS_LEFT, -1) == FC_OK && written == nf && worstAgainst (axisCurve[1]) <= 0.0,
+                    std::string ("a non-finite `dyn` (on = ") + std::to_string (on)
+                    + ") neither refuses the call nor moves the curve");
+            }
         }
 
         // A BAND SWITCHED OFF, OR BYPASSED, CONTRIBUTES UNITY — the same curve as one that was never placed.
@@ -3378,6 +3396,29 @@ int main()
                 refused (FC_ERR_NON_FINITE,
                          fc_master_eq_curve (&bad, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
                          "a non-finite field of the parameter set");
+            }
+
+            // NO TWO OF THE THREE MAY TOUCH, and `written` INSIDE THE GRID is the pair that is not a matter of
+            // taste: `freqHz` is the caller's `const`, and a `*written` landing in it before the curve is
+            // evaluated answers FC_OK for a frequency nobody asked about. Three placements — the low half of the
+            // first frequency, its high half (the one that moves the value), and the second frequency.
+            {
+                std::vector<double> g (2, 1000.0);
+                const std::vector<double> gWas = g;
+                std::vector<double> outv (2, -1.0);
+                for (const std::size_t at : { (std::size_t) 0, (std::size_t) 4, (std::size_t) 8 })
+                {
+                    auto* w2 = reinterpret_cast<std::uint32_t*> (reinterpret_cast<unsigned char*> (g.data()) + at);
+                    const fc_status st = fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_STEREO, 0,
+                                                             g.data(), 2u, outv.data(), 2u, w2);
+                    bool gridIntact = true, outIntact = true;
+                    for (std::size_t i = 0; i < g.size(); ++i)
+                        gridIntact = gridIntact && std::fabs (g[i] - gWas[i]) <= 0.0;
+                    for (double v : outv) outIntact = outIntact && std::fabs (v + 1.0) <= 0.0;
+                    ok (st == FC_ERR_SPAN && gridIntact && outIntact,
+                        std::string ("`written` at byte ") + std::to_string (at)
+                        + " of the grid: refused, and neither the grid nor the buffer is written");
+                }
             }
 
             // ALIGNMENT AND ALIASING. The grid and the buffer may not touch, and `written` may not point into

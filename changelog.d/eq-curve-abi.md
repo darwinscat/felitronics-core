@@ -14,9 +14,10 @@ domain axes each fold the Stereo lane in and `STEREO` is that lane alone); a cod
 rate, `FC_ERR_REFUSED_BY_CORE` for one outside it. The buffer is the caller's and `cap` is binding: the call
 writes all `count` values or none, so `cap` below `count` is `FC_ERR_CAPACITY` and `count == 0` is
 `FC_ERR_RANGE`; a non-finite frequency anywhere in the grid is `FC_ERR_NON_FINITE` before anything is written.
-`freqHz` and `outDb` may not touch and `written` may not point into `outDb` (`FC_ERR_SPAN`); `written` is left
-as it was by every refusal. `params.bypassEq` and each band's `dyn` are not read — the curve is the static
-response of the bands.
+No two of `freqHz`, `outDb` and `written` may touch — all three pairs `FC_ERR_SPAN`, `written` inside the grid
+included, since the grid is the caller's `const`; `written` is left as it was by every refusal.
+`params.bypassEq` and each band's `dyn` are not read, and neither can refuse the call: the curve is the static
+response of the bands, so a `dyn` the caller never filled is not this call's business.
 
 **C ABI v7.** One entry point and no struct, so no row moves in the size table and every struct keeps its v6
 size. `fc-master-layout.mjs` is v7 and exports `FC_EQ_AXIS` — the lane names in the order `fc_eq_axis` declares
