@@ -96,6 +96,7 @@ extern "C" {
 // its own, the header-less bucket it copies, and the trace's bucket counts and validity at the end of `fc_measurement`
 // — one row. v6: the limiter's dual release (`fc_master_params`, `fc_master_resolved`), `grTraceBuckets`
 // (`fc_loudness_request`), `fc_solution_gr_trace64` and `fc_master_need_solve` — three rows, two entry points.
+// v7: `fc_master_eq_curve` — one entry point, no struct, and therefore no row.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -170,7 +171,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 6u
+#define FC_MASTER_ABI_VERSION 7u
 
 typedef struct fc_header
 {
@@ -263,6 +264,14 @@ typedef enum fc_filter_type
     FC_FILTER_HIGH_PASS = 3, FC_FILTER_LOW_PASS = 4, FC_FILTER_BAND_PASS = 5,
     FC_FILTER_NOTCH = 6, FC_FILTER_ALL_PASS = 7, FC_FILTER_TILT = 8
 } fc_filter_type;
+
+// The stereo axis a curve is read on (v7) — `eq::Axis`, which is NOT `eq::Lane`: the four domain axes each fold
+// the Stereo lane in, and FC_EQ_AXIS_STEREO is the Stereo lane alone. `fc_master_eq_curve` takes these codes.
+typedef enum fc_eq_axis
+{
+    FC_EQ_AXIS_STEREO = 0, FC_EQ_AXIS_LEFT = 1, FC_EQ_AXIS_RIGHT = 2,
+    FC_EQ_AXIS_MID = 3, FC_EQ_AXIS_SIDE = 4
+} fc_eq_axis;
 
 typedef enum fc_detector { FC_DETECTOR_PEAK = 0, FC_DETECTOR_RMS = 1 } fc_detector;
 
@@ -912,6 +921,40 @@ fc_status fc_master_need_solve (fc_master h, const fc_loudness_request* req, uin
 // `frames` does not appear: a create has no programme. The solver fields come back neutral. Allocates
 // nothing itself and touches no handle.
 fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
+
+//==============================================================================
+// THE EQ CURVE (v7) — the magnitude response of a parameter set's EQ, in dB, at frequencies the caller names.
+// `eq::EqEngine::magnitudeDbFor`, read out: the response the chain's EQ runs, and no arithmetic of this file's.
+//
+// NO HANDLE AND NO RENDER. The parameters travel with the call, so the curve is answerable while a knob is
+// moving. It asks the heap for nothing.
+//
+// `sampleRate` IN HERTZ, and the `eq` module's own domain decides it — not the chain's floor, since no chain
+// is built: a non-finite rate is FC_ERR_NON_FINITE, a rate the module will not honour FC_ERR_REFUSED_BY_CORE.
+//
+// `lane` is an `fc_eq_axis`; a code that names no axis is FC_ERR_ENUM. The five are five curves and are never
+// folded into one.
+//
+// `band` is −1 for the whole bank — the product over every band, an off or bypassed one contributing unity —
+// or 0..FC_MAX_EQ_BANDS−1 for that band alone. Anything else is FC_ERR_RANGE.
+//
+// TWO FIELDS OF `params` ARE NOT READ, and the curve does not move with them: `bypassEq`, which switches the
+// chain's stage rather than the bands, and each band's `dyn` — this is the static response. Everything else
+// crosses by the mapping every other call uses, so this call is refused exactly where `fc_master_configure`
+// is (a filter type that names nothing FC_ERR_ENUM, a non-finite field FC_ERR_NON_FINITE).
+//
+// THE BUFFER IS THE CALLER'S and `cap` is binding: the call writes all `count` values or none, so a `cap`
+// below `count` is FC_ERR_CAPACITY, and `count == 0` is FC_ERR_RANGE. A non-finite frequency is
+// FC_ERR_NON_FINITE, and the whole grid is read for one before anything is written; every finite frequency
+// is evaluated as it stands and never clamped. `freqHz` and `outDb` may not touch, and `written` may not
+// point into `outDb` — FC_ERR_SPAN.
+//
+// Checks in the header's order: poison, `written`, `params`' header and span, `count` and `cap`, the two
+// spans and their overlaps, then the field values — `lane`, `band`, `sampleRate`, the parameter set, the
+// grid — and then the core. `written` is set to 0 once every refusal is behind the call and to `count` on
+// FC_OK; a refused call leaves it as it was, as `fc_master_flush` and `fc_solution_log` leave it.
+fc_status fc_master_eq_curve (const fc_master_params* params, double sampleRate, int32_t lane, int32_t band,
+                              const double* freqHz, uint32_t count, double* outDb, uint32_t cap, uint32_t* written);
 
 typedef enum fc_progress_stage
 {

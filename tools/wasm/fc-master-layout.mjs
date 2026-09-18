@@ -336,7 +336,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 6;
+export const FC_MASTER_ABI_VERSION = 7;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [

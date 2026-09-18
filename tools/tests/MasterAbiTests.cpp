@@ -18,11 +18,13 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/eq/EqEngine.h>
 #include <felitronics/mastering/DeliveryConverter.h>
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -30,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <string>
 #include <tuple>
@@ -106,6 +109,108 @@ std::vector<float> tone (std::size_t frames, int nch)
                 (float) ((0.4 - 0.11 * c) * std::sin (2.0 * 3.14159265358979 * (440.0 + 137.0 * c)
                                                       * (double) i / kFs));
     return v;
+}
+
+//==============================================================================
+// v7 — THE EQ CURVE AND ITS ORACLE.
+//
+// The curve is held against AUDIO: the same bands are driven through `eq::EqEngine` and the steady-state
+// gain of a sine is measured. The two sides share the numbers in `CurveBand` and nothing else — the ABI's
+// C struct and the core's own `BandParams` are written from them separately, so the mapping the curve goes
+// through is not the mapping the oracle goes through.
+struct CurveBand
+{
+    int    lane;                    // the index into `fc_eq_band::lanes`, which is eq::Lane's order
+    int    type;                    // fc_filter_type
+    double freqHz, q, gainDb;
+    int    slope;
+};
+
+void placeBand (fc_eq_band& fb, felitronics::eq::BandParams& cb, const CurveBand& s)
+{
+    fb.on = 1; fb.type = s.type; fb.swept = 0; fb.bypass = 0;
+    for (int l = 0; l < FC_MAX_EQ_LANES; ++l) { fb.lanes[l].on = 0; fb.lanes[l].bypass = 0; }
+    fb.lanes[s.lane].on     = 1;
+    fb.lanes[s.lane].freq   = s.freqHz;
+    fb.lanes[s.lane].q      = s.q;
+    fb.lanes[s.lane].gainDb = s.gainDb;
+    fb.lanes[s.lane].slope  = s.slope;
+
+    cb = felitronics::eq::BandParams {};
+    cb.on   = true;
+    cb.type = (felitronics::eq::FilterType) s.type;
+    for (int l = 0; l < felitronics::eq::kNumLanes; ++l) cb.lanes[l].on = false;
+    cb.lanes[s.lane].on     = true;
+    cb.lanes[s.lane].freq   = s.freqHz;
+    cb.lanes[s.lane].Q      = s.q;
+    cb.lanes[s.lane].gainDb = s.gainDb;
+    cb.lanes[s.lane].slope  = s.slope;
+}
+
+// Which axis the measurement reads, and how the two channels are driven to isolate it. Mono runs a
+// ONE-channel engine, where the band runs its Stereo lane and nothing else; Left/Right run two
+// independent channels; Mid and Side drive L = R and L = −R, so the other domain is exactly zero.
+enum class Drive { Mono, Left, Right, Mid, Side };
+
+double domain (Drive d, double l, double r)
+{
+    switch (d)
+    {
+        case Drive::Mono:  case Drive::Left: return l;
+        case Drive::Right: return r;
+        case Drive::Mid:   return 0.5 * (l + r);
+        case Drive::Side:  return 0.5 * (l - r);
+    }
+    return l;
+}
+
+// The measured magnitude, in dB, at each frequency of `freqs`. Every frequency is a multiple of fs/N, so
+// N samples hold a whole number of periods and the ratio of the two sums is the steady-state gain.
+std::vector<double> measuredCurve (const felitronics::eq::BandParams* bands, int n, double fs,
+                                   const std::vector<double>& freqs, Drive d)
+{
+    namespace E = felitronics::eq;
+    const int nch = (d == Drive::Mono) ? 1 : 2;
+    const int N   = 4800;
+    std::vector<double> out (freqs.size(), std::numeric_limits<double>::quiet_NaN());
+
+    auto eng = std::make_unique<E::EqEngine>();
+    if (! eng->prepare (fs, N, nch)) return out;
+    for (int i = 0; i < E::EqEngine::kMaxBands; ++i)
+        eng->setBand (i, i < n ? bands[i] : E::BandParams {});
+
+    std::vector<float> L ((std::size_t) N), R ((std::size_t) N);
+    for (std::size_t fi = 0; fi < freqs.size(); ++fi)
+    {
+        const double dp = 2.0 * felitronics::core::kPi * freqs[fi] / fs;
+        auto fill = [&]
+        {
+            for (int k = 0; k < N; ++k)
+            {
+                const double v = 0.25 * std::sin (dp * (double) k);
+                L[(std::size_t) k] = (float) v;
+                R[(std::size_t) k] = (float) (d == Drive::Side ? -v : d == Drive::Mid ? v : 0.7 * v);
+            }
+        };
+        float* ch[2] = { L.data(), R.data() };
+        eng->reset();
+        for (int b = 0; b < 5; ++b) { fill(); if (! eng->process (ch, nch, N)) return out; }
+
+        fill();
+        std::vector<double> before ((std::size_t) N);
+        for (int k = 0; k < N; ++k) before[(std::size_t) k] = domain (d, L[(std::size_t) k], R[(std::size_t) k]);
+        if (! eng->process (ch, nch, N)) return out;
+
+        double si = 0.0, so = 0.0;
+        for (int k = 0; k < N; ++k)
+        {
+            const double o = domain (d, L[(std::size_t) k], R[(std::size_t) k]);
+            si += before[(std::size_t) k] * before[(std::size_t) k];
+            so += o * o;
+        }
+        out[fi] = 10.0 * std::log10 (so / si);
+    }
+    return out;
 }
 
 }   // namespace
@@ -1750,28 +1855,32 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 6u, "PRECONDITION: this group is written for v6 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
-                        "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew)");
+        ok (kCur == 7u, "PRECONDITION: this group is written for v7 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+                        "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
+                        "v7: fc_master_eq_curve, no struct grew)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 6) == 88u,
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 6) == 88u
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 7) == 88u,
             "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 6) == 6584u,
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 6) == 6584u
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 7) == 6584u,
             "params: 6560 at v1 and v2, 6568 from v3, 6584 from v6");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 6) == 96u,
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 6) == 96u
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 7) == 96u,
             "resolved: 80 at v1 and v2, 88 from v3, 96 from v6");
         ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
             && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 5) == 224u
-            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u,
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 7) == 224u,
             "measurement: 208 to v3, 224 from v4 — the trace's four fields");
         ok (fc_master_sizeof (FC_STRUCT_REQUEST, 1) == 120u && fc_master_sizeof (FC_STRUCT_REQUEST, 5) == 120u
-            && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u,
+            && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u && fc_master_sizeof (FC_STRUCT_REQUEST, 7) == 128u,
             "request: 120 to v5, 128 from v6 — `grTraceBuckets` and its named padding");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
@@ -1794,6 +1903,7 @@ int main()
             { 4u, 88u, FC_OK,              "v4 at 88 bytes — nor at v4" },
             { 5u, 88u, FC_OK,              "v5 at 88 bytes — nor at v5" },
             { 6u, 88u, FC_OK,              "v6 at 88 bytes — nor at v6" },
+            { 7u, 88u, FC_OK,              "v7 at 88 bytes — nor at v7" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
@@ -3008,6 +3118,300 @@ int main()
                 && fc_master_get_stats (he, &se) == FC_OK && se.nonFiniteIn == 1u,
                 "at equal rates a range measurement refused AFTER its count keeps its own: 1");
             (void) fc_master_destroy (he);
+        }
+    }
+
+    //==========================================================================
+    // v7 — THE EQ CURVE. Held against audio: `measuredCurve` drives the same bands through `eq::EqEngine` and
+    // measures the steady-state gain of a sine at each frequency of the grid.
+    group ("v7: fc_master_eq_curve — the curve is the response the EQ runs");
+    {
+        namespace E = felitronics::eq;
+        constexpr double kEqFs = 48000.0;
+        // Every frequency is a multiple of 48000/4800 = 10 Hz, which is what makes the oracle's window hold a
+        // whole number of periods.
+        const std::vector<double> grid { 120.0, 400.0, 1000.0, 3000.0, 9000.0 };
+        const std::uint32_t nf = (std::uint32_t) grid.size();
+
+        std::vector<double> got (grid.size(), 0.0);
+        std::uint32_t written = 0xFFFFFFFFu;
+        auto ask = [&] (const fc_master_params& pp, std::int32_t lane, std::int32_t band)
+        {
+            got.assign (grid.size(), 0.0);
+            written = 0xFFFFFFFFu;
+            return fc_master_eq_curve (&pp, kEqFs, lane, band, grid.data(), nf,
+                                       got.data(), (std::uint32_t) got.size(), &written);
+        };
+        auto worstAgainst = [&] (const std::vector<double>& want)
+        {
+            double w = 0.0;
+            for (std::size_t i = 0; i < want.size(); ++i)
+                w = std::max (w, std::fabs (got[i] - want[i]));
+            return w;
+        };
+
+        // ---- fixture LR: two Stereo bands, one Left band, one Right band. No M/S lane, so the Left and Right
+        // axes ARE what channel 0 and channel 1 run, and a ONE-channel engine runs the Stereo axis alone.
+        fc_master_params lr {}; FC_INIT (lr);
+        ok (fc_master_params_defaults (&lr) == FC_OK, "PRECONDITION: a parameter set at this build's version");
+        E::BandParams lrCore[4];
+        const CurveBand lrSrc[4] = {
+            { 0, FC_FILTER_BELL,       1000.0, 1.4,   6.0, 12 },
+            { 0, FC_FILTER_HIGH_PASS,   200.0, 0.707, 0.0, 12 },
+            { 1, FC_FILTER_BELL,       3000.0, 3.0,   8.0, 12 },
+            { 2, FC_FILTER_HIGH_SHELF, 4000.0, 0.7,  -5.0, 12 },
+        };
+        for (int i = 0; i < 4; ++i) placeBand (lr.eqBands[i], lrCore[i], lrSrc[i]);
+
+        // ---- fixture MS: a Stereo band, a Mid band and a Side band. No L/R lane, so a pure-Mid and a
+        // pure-Side drive isolate those two axes exactly.
+        fc_master_params ms {}; FC_INIT (ms);
+        ok (fc_master_params_defaults (&ms) == FC_OK, "PRECONDITION: the second parameter set");
+        E::BandParams msCore[3];
+        const CurveBand msSrc[3] = {
+            { 0, FC_FILTER_BELL,      9000.0, 1.0, -4.0, 12 },
+            { 3, FC_FILTER_LOW_SHELF,  250.0, 0.8,  5.0, 12 },
+            { 4, FC_FILTER_BELL,      1000.0, 2.5, -7.0, 12 },
+        };
+        for (int i = 0; i < 3; ++i) placeBand (ms.eqBands[i], msCore[i], msSrc[i]);
+
+        const double kTol = 0.005;     // dB, against a measurement in steady state
+        double worst = 0.0;
+        struct Row { const fc_master_params* p; const E::BandParams* bands; int n; Drive drive; std::int32_t axis;
+                     const char* what; };
+        const Row rows[] = {
+            { &lr, lrCore, 4, Drive::Mono,  FC_EQ_AXIS_STEREO, "Stereo: the Stereo lane alone, on a mono bus" },
+            { &lr, lrCore, 4, Drive::Left,  FC_EQ_AXIS_LEFT,   "Left: the Stereo lane times the Left lane" },
+            { &lr, lrCore, 4, Drive::Right, FC_EQ_AXIS_RIGHT,  "Right: the Stereo lane times the Right lane" },
+            { &ms, msCore, 3, Drive::Mid,   FC_EQ_AXIS_MID,    "Mid: a pure-Mid drive" },
+            { &ms, msCore, 3, Drive::Side,  FC_EQ_AXIS_SIDE,   "Side: a pure-Side drive" },
+        };
+        std::vector<std::vector<double>> axisCurve;
+        for (const Row& rw : rows)
+        {
+            const std::vector<double> meas = measuredCurve (rw.bands, rw.n, kEqFs, grid, rw.drive);
+            const fc_status st = ask (*rw.p, rw.axis, -1);
+            axisCurve.push_back (got);
+            bool finite = true;
+            for (double v : meas) finite = finite && std::isfinite (v);
+            const double w = worstAgainst (meas);
+            worst = std::max (worst, w);
+            ok (st == FC_OK && written == nf && finite && w <= kTol,
+                std::string ("measured null — ") + rw.what + " (worst " + std::to_string (w) + " dB)");
+        }
+        std::printf ("      worst curve-vs-measurement error over %zu points: %.6g dB\n",
+                     grid.size() * (sizeof rows / sizeof rows[0]), worst);
+
+        // THE FIVE AXES ARE FIVE CURVES. Fixture LR places its bands on the Stereo, Left and Right lanes, so
+        // the three differ where they are placed; fixture MS does the same for Mid and Side.
+        {
+            const std::size_t at120 = 0, at1k = 2, at3k = 3, at9k = 4;
+            ok (std::fabs (axisCurve[1][at3k] - axisCurve[0][at3k]) > 1.0
+                && std::fabs (axisCurve[2][at9k] - axisCurve[0][at9k]) > 1.0
+                && std::fabs (axisCurve[1][at3k] - axisCurve[2][at3k]) > 1.0,
+                "Stereo, Left and Right are three different curves where their bands sit");
+            ok (std::fabs (axisCurve[3][at1k] - axisCurve[4][at1k]) > 1.0,
+                "and Mid and Side at 1 kHz");
+            const fc_status st = ask (ms, FC_EQ_AXIS_STEREO, -1);
+            ok (st == FC_OK && std::fabs (got[at120] - axisCurve[3][at120]) > 1.0
+                && std::fabs (got[at1k] - axisCurve[4][at1k]) > 1.0,
+                "the Stereo axis of a set with Mid and Side lanes is neither of them");
+        }
+
+        // ONE BAND AT A TIME. Each per-band curve is the response of that band alone — measured for two of
+        // them — and the whole bank is their product, which in dB is their sum.
+        {
+            const std::vector<double> only0 = measuredCurve (&lrCore[0], 1, kEqFs, grid, Drive::Mono);
+            ok (ask (lr, FC_EQ_AXIS_STEREO, 0) == FC_OK && worstAgainst (only0) <= kTol,
+                "band 0 alone on the Stereo axis matches an engine carrying only that band");
+            const std::vector<double> only2 = measuredCurve (&lrCore[2], 1, kEqFs, grid, Drive::Left);
+            ok (ask (lr, FC_EQ_AXIS_LEFT, 2) == FC_OK && worstAgainst (only2) <= kTol,
+                "band 2 alone on the Left axis, likewise");
+
+            std::vector<double> sum (grid.size(), 0.0);
+            for (std::int32_t b = 0; b < FC_MAX_EQ_BANDS; ++b)
+            {
+                ok (ask (lr, FC_EQ_AXIS_LEFT, b) == FC_OK && written == nf,
+                    std::string ("band ") + std::to_string (b) + " answers on its own");
+                for (std::size_t i = 0; i < sum.size(); ++i) sum[i] += got[i];
+            }
+            ok (ask (lr, FC_EQ_AXIS_LEFT, -1) == FC_OK && worstAgainst (sum) <= 1e-9,
+                "band = -1 is the sum in dB of all 24 bands — the ones that are off contributing exactly 0");
+        }
+
+        // A parameter set with nothing on is exactly unity at every frequency.
+        {
+            fc_master_params flat {}; FC_INIT (flat);
+            ok (fc_master_params_defaults (&flat) == FC_OK, "PRECONDITION: the core's own defaults");
+            double m = 0.0;
+            for (std::int32_t axis = FC_EQ_AXIS_STEREO; axis <= FC_EQ_AXIS_SIDE; ++axis)
+            {
+                ok (ask (flat, axis, -1) == FC_OK, "a default parameter set answers on every axis");
+                for (double v : got) m = std::max (m, std::fabs (v));
+            }
+            ok (m <= 1e-12, "and every band being off is 0 dB everywhere, on all five");
+        }
+
+        // `bypassEq` and the dynamics are not read — the contract says so, so it is pinned.
+        {
+            fc_master_params q = lr;
+            q.bypassEq = 1;
+            for (int b = 0; b < FC_MAX_EQ_BANDS; ++b)
+            { q.eqBands[b].dyn.on = 1; q.eqBands[b].dyn.rangeDb = -12.0; }
+            ok (ask (q, FC_EQ_AXIS_LEFT, -1) == FC_OK && worstAgainst (axisCurve[1]) <= 0.0,
+                "bypassEq and dyn move nothing: the curve is the same bits");
+        }
+
+        // A BAND SWITCHED OFF, OR BYPASSED, CONTRIBUTES UNITY — the same curve as one that was never placed.
+        {
+            fc_master_params q = lr;
+            q.eqBands[2].on = 0;                      // the Left band, off
+            const fc_status s1 = ask (q, FC_EQ_AXIS_LEFT, -1);
+            const std::vector<double> off = got;
+            q.eqBands[2].on = 1; q.eqBands[2].bypass = 1;
+            const fc_status s2 = ask (q, FC_EQ_AXIS_LEFT, -1);
+            double d = 0.0;
+            for (std::size_t i = 0; i < got.size(); ++i) d = std::max (d, std::fabs (got[i] - off[i]));
+            q.eqBands[2].bypass = 0; q.eqBands[2].lanes[1].bypass = 1;
+            const fc_status s3 = ask (q, FC_EQ_AXIS_LEFT, -1);
+            double dl = 0.0;
+            for (std::size_t i = 0; i < got.size(); ++i) dl = std::max (dl, std::fabs (got[i] - off[i]));
+            ok (s1 == FC_OK && s2 == FC_OK && s3 == FC_OK && d <= 0.0 && dl <= 0.0,
+                "off, point-bypassed and lane-bypassed are one answer: unity");
+            ok (std::fabs (off[3] - axisCurve[1][3]) > 1.0, "PRECONDITION: and that answer is not the placed one");
+        }
+
+        // IT ASKS THE HEAP FOR NOTHING.
+        {
+            (void) ask (lr, FC_EQ_AXIS_LEFT, -1);                  // warm any lazy path first
+            const long long before = alloc::count.load();
+            for (int i = 0; i < 8; ++i) (void) ask (lr, FC_EQ_AXIS_LEFT, -1);
+            okNoAlloc (alloc::count.load() == before, "eight curves allocate nothing");
+        }
+
+        // ---- THE REFUSALS. `written` carries a sentinel into every one of them and must still carry it out,
+        // and the buffer carries a canary that must survive.
+        {
+            std::vector<double> buf (grid.size(), -12345.0);
+            const std::vector<double> canary = buf;
+            std::uint32_t w = 0x5A5A5A5Au;
+            auto refused = [&] (fc_status want, fc_status st, const char* what)
+            {
+                bool intact = true;
+                for (std::size_t i = 0; i < buf.size(); ++i) intact = intact && std::fabs (buf[i] - canary[i]) <= 0.0;
+                ok (st == want && w == 0x5A5A5A5Au && intact,
+                    std::string (what) + ": refused, `written` untouched, nothing written");
+            };
+
+            refused (FC_ERR_CAPACITY,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf - 1u, &w),
+                     "a cap below the count");
+            refused (FC_ERR_RANGE,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), 0u, buf.data(), nf, &w),
+                     "a grid of no frequencies");
+            refused (FC_ERR_ENUM,
+                     fc_master_eq_curve (&lr, kEqFs, -1, -1, grid.data(), nf, buf.data(), nf, &w),
+                     "an axis code below the first");
+            refused (FC_ERR_ENUM,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_SIDE + 1, -1, grid.data(), nf, buf.data(), nf, &w),
+                     "an axis code past the last");
+            refused (FC_ERR_RANGE,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -2, grid.data(), nf, buf.data(), nf, &w),
+                     "a band index below -1");
+            refused (FC_ERR_RANGE,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, FC_MAX_EQ_BANDS, grid.data(), nf, buf.data(), nf, &w),
+                     "a band index past the last");
+
+            for (const double bad : { std::numeric_limits<double>::quiet_NaN(),
+                                      std::numeric_limits<double>::infinity(),
+                                      -std::numeric_limits<double>::infinity() })
+            {
+                refused (FC_ERR_NON_FINITE,
+                         fc_master_eq_curve (&lr, bad, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                         "a non-finite sample rate");
+                // THE LAST frequency of the grid, so a call that wrote as it went would have written every
+                // earlier point before meeting it.
+                std::vector<double> g = grid;
+                g.back() = bad;
+                refused (FC_ERR_NON_FINITE,
+                         fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, g.data(), nf, buf.data(), nf, &w),
+                         "a non-finite frequency, last in the grid");
+            }
+
+            // The `eq` module's own domain: it clamps a band's frequency into [10, 0.49*rate], so a rate under
+            // 20.408163... Hz has no such interval, and 3 MHz is its ceiling.
+            for (const double bad : { 0.0, -48000.0, 20.0, 3.0e6 + 1.0 })
+                refused (FC_ERR_REFUSED_BY_CORE,
+                         fc_master_eq_curve (&lr, bad, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                         "a sample rate the eq module will not honour");
+            {
+                std::vector<double> eight (grid.size(), 0.0);
+                std::uint32_t w8 = 0u;
+                ok (fc_master_eq_curve (&lr, 8000.0, FC_EQ_AXIS_MID, -1, grid.data(), nf, eight.data(), nf, &w8) == FC_OK
+                    && w8 == nf && std::isfinite (eight[0]),
+                    "and 8 kHz, which is inside it, answers");
+            }
+
+            refused (FC_ERR_NULL,
+                     fc_master_eq_curve (nullptr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                     "a null parameter set");
+            refused (FC_ERR_NULL,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, nullptr, nf, buf.data(), nf, &w),
+                     "a null grid");
+            refused (FC_ERR_NULL,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, nullptr, nf, &w),
+                     "a null buffer");
+            {
+                fc_master_params bad = lr; bad.header.abiVersion = FC_MASTER_ABI_VERSION + 1u;
+                refused (FC_ERR_ABI_VERSION,
+                         fc_master_eq_curve (&bad, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                         "a parameter set from a newer ABI");
+                bad = lr; bad.header.structSize = (std::uint32_t) sizeof (bad) - 8u;
+                refused (FC_ERR_STRUCT_SIZE,
+                         fc_master_eq_curve (&bad, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                         "a parameter set claiming another size");
+                bad = lr; bad.eqBands[0].type = FC_FILTER_TILT + 1;
+                refused (FC_ERR_ENUM,
+                         fc_master_eq_curve (&bad, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                         "a filter type that names nothing");
+                bad = lr; bad.eqBands[0].lanes[0].q = std::numeric_limits<double>::quiet_NaN();
+                refused (FC_ERR_NON_FINITE,
+                         fc_master_eq_curve (&bad, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, &w),
+                         "a non-finite field of the parameter set");
+            }
+
+            // ALIGNMENT AND ALIASING. The grid and the buffer may not touch, and `written` may not point into
+            // the buffer — the rule `fc_master_flush` and `fc_solution_log` follow.
+            {
+                std::vector<double> big (grid.size() + 2u, 0.0);
+                refused (FC_ERR_SPAN,
+                         fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, big.data(), nf, big.data() + 1, nf, &w),
+                         "a grid overlapping the buffer");
+                ok (fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf,
+                                        big.data(), nf, (std::uint32_t*) big.data()) == FC_ERR_SPAN,
+                    "`written` inside the buffer: refused");
+                auto* mis = reinterpret_cast<double*> (reinterpret_cast<unsigned char*> (big.data()) + 4);
+                refused (FC_ERR_ALIGNMENT,
+                         fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf - 1u, mis, nf - 1u, &w),
+                         "a buffer that is not 8-byte aligned");
+                refused (FC_ERR_ALIGNMENT,
+                         fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, mis, nf - 1u, big.data(), nf, &w),
+                         "a grid that is not 8-byte aligned");
+                bool untouched = true;
+                for (double v : big) untouched = untouched && std::fabs (v) <= 0.0;
+                ok (untouched, "and none of those four wrote a byte of the buffer they were handed");
+            }
+            refused (FC_ERR_NULL,
+                     fc_master_eq_curve (&lr, kEqFs, FC_EQ_AXIS_MID, -1, grid.data(), nf, buf.data(), nf, nullptr),
+                     "a null `written`");
+        }
+
+        // A CALLER STILL AT v1 reads the same curve: the eq bands are v1's own fields.
+        {
+            fc_master_params old = lr;
+            old.header.abiVersion = 1u; old.header.structSize = 6560u;
+            ok (ask (old, FC_EQ_AXIS_LEFT, -1) == FC_OK && written == nf && worstAgainst (axisCurve[1]) <= 0.0,
+                "a v1-stamped parameter set answers the same bits");
         }
     }
 
