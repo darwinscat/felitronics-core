@@ -18,6 +18,7 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/eq/EqEngine.h>
 #include <felitronics/mastering/DeliveredMastering.h>
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
@@ -69,6 +70,12 @@ static_assert ((int) eq::FilterType::BandPass  == FC_FILTER_BAND_PASS);
 static_assert ((int) eq::FilterType::Notch     == FC_FILTER_NOTCH);
 static_assert ((int) eq::FilterType::AllPass   == FC_FILTER_ALL_PASS);
 static_assert ((int) eq::FilterType::Tilt      == FC_FILTER_TILT);
+
+static_assert ((int) eq::Axis::Stereo == FC_EQ_AXIS_STEREO);
+static_assert ((int) eq::Axis::Left   == FC_EQ_AXIS_LEFT);
+static_assert ((int) eq::Axis::Right  == FC_EQ_AXIS_RIGHT);
+static_assert ((int) eq::Axis::Mid    == FC_EQ_AXIS_MID);
+static_assert ((int) eq::Axis::Side   == FC_EQ_AXIS_SIDE);
 
 static_assert ((int) dynamics::Detector::Peak      == FC_DETECTOR_PEAK);
 static_assert ((int) dynamics::Detector::Rms       == FC_DETECTOR_RMS);
@@ -473,6 +480,18 @@ fc_status checkAudio (const void* p, std::uint32_t frames, int channels) noexcep
     return FC_OK;
 }
 
+// A span of doubles — a caller's frequency grid or the curve written back into its buffer. The three questions
+// `checkAudio` asks, at a double's alignment, and the 32-bit bound folded in for the same reason: on wasm32 the
+// byte count IS the caller's allocation.
+fc_status checkDoubleSpan (const void* p, std::uint64_t bytes) noexcept
+{
+    if (p == nullptr) return FC_ERR_NULL;
+    if ((reinterpret_cast<std::uintptr_t> (p) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
+    if (bytes > (std::uint64_t) 0xFFFFFFFFu) return FC_ERR_SPAN;
+    if (! inHeap (p, bytes)) return FC_ERR_SPAN;
+    return FC_OK;
+}
+
 // Does a scalar out-parameter sit inside an audio span this call is about to write? The overlap rule
 // for `in`/`out` does not see this class at all, and the consequence is silent: `fc_master_flush(h,
 // out, D, (uint32_t*) out)` writes the whole drain and THEN overwrites the first sample with the frame
@@ -571,6 +590,13 @@ FC_MAP_ENUM (mapFilterType, eq::FilterType,
     FC_CASE (FC_FILTER_NOTCH,      eq::FilterType::Notch)
     FC_CASE (FC_FILTER_ALL_PASS,   eq::FilterType::AllPass)
     FC_CASE (FC_FILTER_TILT,       eq::FilterType::Tilt))
+
+FC_MAP_ENUM (mapAxis, eq::Axis,
+    FC_CASE (FC_EQ_AXIS_STEREO, eq::Axis::Stereo)
+    FC_CASE (FC_EQ_AXIS_LEFT,   eq::Axis::Left)
+    FC_CASE (FC_EQ_AXIS_RIGHT,  eq::Axis::Right)
+    FC_CASE (FC_EQ_AXIS_MID,    eq::Axis::Mid)
+    FC_CASE (FC_EQ_AXIS_SIDE,   eq::Axis::Side))
 
 FC_MAP_ENUM (mapDetector, dynamics::Detector,
     FC_CASE (FC_DETECTOR_PEAK, dynamics::Detector::Peak)
@@ -1448,6 +1474,63 @@ FC_EXPORT fc_status fc_master_need_create (const fc_master_config* cfg, fc_need*
     v.facadeBytes        = sizeof (MasterInstance);
     v.solverPrepared     = 0;
     writeOut (out, v, outBytes);
+    return FC_OK;
+}
+
+// v7 — the EQ's magnitude response on one axis, from a parameter set and nothing else. Every number written is
+// `eq::EqEngine::magnitudeDbFor`'s; the parameter set crosses by the `toCore` every other call uses, so the
+// refusals are `fc_master_configure`'s, and the rate is held to the `eq` module's own domain — its prepare()'s
+// gate, asked of no engine, since this call builds none.
+FC_EXPORT fc_status fc_master_eq_curve (const fc_master_params* params, double sampleRate,
+                                        std::int32_t lane, std::int32_t band,
+                                        const double* freqHz, std::uint32_t count,
+                                        double* outDb, std::uint32_t cap, std::uint32_t* written)
+{
+    FC_GUARD;
+    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (params, bytes); st != FC_OK) return st;
+    if (count == 0u) return FC_ERR_RANGE;
+    if (cap < count) return FC_ERR_CAPACITY;                      // all of it or none of it — law 11
+
+    const std::uint64_t inBytes  = (std::uint64_t) count * sizeof (double);
+    const std::uint64_t outBytes = (std::uint64_t) cap   * sizeof (double);
+    if (const fc_status st = checkDoubleSpan (freqHz, inBytes);  st != FC_OK) return st;
+    if (const fc_status st = checkDoubleSpan (outDb,  outBytes); st != FC_OK) return st;
+    // NO TWO OF THE THREE MAY TOUCH. `written` inside the GRID is the pair that is not a matter of taste: the
+    // grid is the caller's `const`, and the store that clears `written` lands in it before the curve is read
+    // — measured, `written` at the grid's fourth byte answered FC_OK and 0 dB where the band gives +6.
+    if (aliasesSpan (freqHz, (std::size_t) inBytes, outDb, outBytes)) return FC_ERR_SPAN;
+    if (aliasesSpan (written, sizeof (*written), freqHz, inBytes)) return FC_ERR_SPAN;
+    if (aliasesSpan (written, sizeof (*written), outDb, outBytes)) return FC_ERR_SPAN;
+
+    eq::Axis axis {};
+    if (! mapAxis (lane, axis)) return FC_ERR_ENUM;
+    if (band < -1 || band >= FC_MAX_EQ_BANDS) return FC_ERR_RANGE;
+    if (! fin (sampleRate)) return FC_ERR_NON_FINITE;
+
+    fc_master_params p = loadIn (params, bytes);
+    // `dyn` IS NOT READ, AND THAT HAS TO HOLD FOR THE MAPPING TOO. `toCore` refuses a non-finite field of it, so
+    // each band's block is put back to what the defaults writer writes before the one mapping runs: a struct
+    // this call was told to ignore cannot refuse it. The mapping itself stays the one every other call uses.
+    fc_master_params dflt {};
+    writeDefaults (dflt);
+    for (int b = 0; b < FC_MAX_EQ_BANDS; ++b) p.eqBands[b].dyn = dflt.eqBands[b].dyn;
+    MasteringChainParams cp {};
+    if (const fc_status st = toCore (p, cp); st != FC_OK) return st;
+    // THE WHOLE GRID BEFORE ANY OF IT IS ANSWERED: `magnitudeDbFor` answers a finite number for a non-finite
+    // frequency, so a curve written as far as the bad point would be a plausible one.
+    for (std::uint32_t i = 0; i < count; ++i)
+        if (! fin (freqHz[i])) return FC_ERR_NON_FINITE;
+    eq::EqEngine::Storage store {};
+    if (! eq::EqEngine::storageFor (sampleRate, 0, 1, store)) return FC_ERR_REFUSED_BY_CORE;
+    *written = 0;
+
+    const eq::BandParams* bands = band < 0 ? cp.eqBands : cp.eqBands + band;
+    const int numBands          = band < 0 ? FC_MAX_EQ_BANDS : 1;
+    for (std::uint32_t i = 0; i < count; ++i)
+        outDb[i] = eq::EqEngine::magnitudeDbFor (bands, numBands, freqHz[i], sampleRate, axis);
+    *written = count;
     return FC_OK;
 }
 
