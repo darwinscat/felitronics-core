@@ -5,6 +5,83 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.37.0 — 2026-09-18
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### mastering — the loudness search stops at the limit it may not break
+
+**`mastering::TargetLoudnessSolver`**, for the three limits that grow with drive — the limiter's gain reduction, the
+peak-to-loudness ratio and the loudness-range loss:
+
+- **A target past such a limit is answered at the limit.** When the next step asks for a drive at or past the
+  smallest one a render broke a limit at, the search renders inside the bracket between that render and the loudest
+  one that kept every limit instead — regula falsi on the limit's own statistic, held inside the bracket, the
+  midpoint where a statistic is not measured — and delivers the loudest render that keeps them as
+  `TargetUnreachable`, `binding` what the smallest breaking drive broke. It stops once the breaking render, at the ceiling its true peak asks for, is under the
+  target's tolerance and within `toleranceLu` of that render, or at `maxPasses`. It used to step on loudness alone and
+  deliver the feasible render it happened to have: after a first render at the starting gain, the source at its own
+  level. Nothing is assumed about how a limit moves with drive beyond where to look: every render the bound chooses is
+  measured, and a render that keeps a limit above one that broke it ends the bracket.
+- **Whenever the search without the limit solves on a render that keeps it, the search with the limit is the same
+  search**, render for render and bit for bit. Without a render that kept every limit there is no bracket, and the
+  search is the one before.
+- **The first render whose limiter works, after an idle one, is aimed 0.15 dB under the aim**, or by the largest
+  overshoot measured on a working render at or under its drive. It used to be aimed at the promise itself, land over
+  it by the between-sample overshoot and spend a render on the correction: on the suite's programme a -12 LUFS target
+  now takes two renders where it took three.
+
+No field and no ABI change.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### limiter · mastering · tools — the limiter's dual release, the caller's gain-reduction trace size; C ABI v6
+
+**`limiter::TruePeakLimiter` — dual release.** `TruePeakLimiterParams::dualRelease` (off) and `slowReleaseMs` (200 ms).
+On, a second envelope with instant attack and release `slowReleaseMs` takes as input the least, over the last 70 ms
+(`kSlowWindowMs`), of the largest reduction required within 20 ms (`kSlowBridgeMs`); the applied reduction is the larger
+of the two envelopes', and `releaseMs` is the fast one's. Both envelopes read only the required reduction, so the
+loudness search's scale law and the reduction's monotonicity in drive hold. Off, the output is the single release bit
+for bit, whatever `slowReleaseMs` holds. Switching on starts the slow envelope and its windows from 0 dB; switching off
+continues the fast envelope from the applied reduction. `effectiveSlowReleaseMs()` (0 while off) and
+`MasteringChainResolved::limiterSlowReleaseMs`. Both windows are prepared whether or not it is on
+(`Storage::slowWindow`, `slowBridge`).
+
+**`mastering::TargetLoudnessSolver` — the trace's size is the caller's.** `LoudnessRequest::grTraceBuckets`: 1000 by
+default, 1..65536, otherwise `InvalidRequest` before any pass. Each trace holds min(grTraceBuckets, frames) buckets on
+the heap (`GainReductionTrace::bucket`, `kDefaultBuckets`, `kMaxBuckets`); a bucket's `samples` and `nonFinite` are
+64-bit. `solveBytes (fs, nch, frames, grTraceBuckets)` and `DeliveredMastering::solveBytes (…, grTraceBuckets)` count
+both traces. At 1000 buckets the trace is the one before, bit for bit.
+
+**C ABI v6.** `fc_master_params` gains `limiterDualRelease`, `_pad0`, `limiterSlowReleaseMs` (6584 B);
+`fc_master_resolved` gains `limiterSlowReleaseMs` (96 B); `fc_loudness_request` gains `grTraceBuckets`, `_pad0`
+(128 B). `fc_solution_gr_trace64` copies `fc_gr_trace_bucket64`; `fc_solution_gr_trace` answers `FC_ERR_RANGE` for a
+count past 32 bits. `fc_master_need_solve (h, req, frames, out)` budgets a solve for a request; `FC_NEED_SOLVE` budgets
+1000 buckets. `fc-master-layout.mjs` is v6; `fcore_master` takes `lim.dual=`, `lim.slowRelease=`, `grTraceBuckets=`.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### mastering · tools — progress and cancellation of the whole-programme calls; C ABI v5
+
+**`felitronics/mastering/Progress.h`.** `ProgressCallback { bool (*fn) (void* context, const ProgressEvent&); void* context; }`,
+taken by new overloads of `TargetLoudnessSolver::solve` / `measureInputLoudnessRange` and `DeliveredMastering::solve` /
+`measureInputLoudnessRange`. An event carries the stage (`Convert`, `LoudnessRange`, `SearchPass`, `FinalRender`), the
+render's number and its bound, the fraction of the stage — exactly 0 first, exactly 1 last, no two events more than 1 %
+of the programme's frames apart — and, on a render's last event, its log record. `true` continues, `false` stops:
+`solve` answers the new `MasteringSolveStatus::Cancelled`, the range measurements `false`, and the same call made again
+gives the same result. The overloads without a callback are unchanged, and the results are the same bits either way.
+
+**C ABI v5.** `fc_master_set_progress (h, fc_progress_fn fn, void* context)` sets a handle's callback; it receives an
+`fc_progress` (stage, pass, maxPasses, fraction, hasRecord, record) and returns 0 to stop, and the call then answers
+`FC_ERR_CANCELLED` (15). On the wasm tier a handle without one calls `Module.onProgress(msg)` when that is a function;
+`false` or an exception stops. No struct with a header grew. Checked on a real 5:21 stereo programme in node by
+`tools/wasm/progress-check.mjs`.
+
+**The render, too.** `DeliveredMastering::render` gained the same `progress` overload as its siblings, reporting
+`Convert` then a new `Render` stage — no log record, since there is no search. `fc_master_render_delivered` takes the
+handle's callback the same way `fc_master_solve_delivered` and `fc_master_measure_lra` already did (a new code,
+`FC_PROGRESS_RENDER`; no struct grew) and cancels the same way. Checked in `tools/tests/MasterAbiProgressTests.cpp`.
+
 ## v0.36.0 — 2026-09-16
 
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
