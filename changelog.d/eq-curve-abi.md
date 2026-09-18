@@ -19,4 +19,7 @@ as it was by every refusal. `params.bypassEq` and each band's `dyn` are not read
 response of the bands.
 
 **C ABI v7.** One entry point and no struct, so no row moves in the size table and every struct keeps its v6
-size. `fc-master-layout.mjs` is v7.
+size. `fc-master-layout.mjs` is v7 and exports `FC_EQ_AXIS` — the lane names in the order `fc_eq_axis` declares
+them, so the index is the code `lane` takes and a consumer needs no hand-written copy of that order.
+`layout-check.mjs` reads the `FC_EQ_AXIS_*` codes out of `tools/fc_master_abi.h` and holds the array against
+them entry by entry — declaration order, value and spelling — so a permutation in the header fails the check.

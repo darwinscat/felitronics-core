@@ -355,6 +355,12 @@ export const FC_CONSTRAINT = [
     'None', 'TruePeak', 'LimiterGr', 'Plr', 'Lra', 'GainRange', 'CompressorGr',
 ];
 
+// fc_eq_axis (v7), in the order the header declares it: the INDEX is the code `_fc_master_eq_curve` takes for
+// `lane`. The order, the length and the spelling are held against that enum by layout-check.mjs, which reads
+// `FC_EQ_AXIS_*` out of tools/fc_master_abi.h and compares it entry by entry — a permutation in the header is a
+// failure there, not a silent disagreement here. This is the one list of lane names a consumer needs.
+export const FC_EQ_AXIS = ['Stereo', 'Left', 'Right', 'Mid', 'Side'];
+
 // The one check this file can make about itself before anything is rendered. Called by every loader; throws
 // rather than returning, because a mismatch here means every later refusal would be FC_ERR_STRUCT_SIZE with no
 // explanation attached.
