@@ -51,3 +51,8 @@ nothing. Zero of 89 rows are now unpinned.
 
 **`fcore_master` can drive it**: `band<i>.dyn.on`, `.dyn.range`, `.dyn.thr`, `.dyn.thrAuto`, `.dyn.atk`,
 `.dyn.rel`.
+
+**Not yet accepted by ear, and shipping that way on purpose.** Oleh listened to the A/B on 2026-09-21 — it
+works, but a dynamic point is hard to hear on programme material, so this feature is lightly tested where
+only ears can test it. That listening continues in TabbyEQ, where the same dynamics are still experimental;
+until it concludes, treat the feature as one the measurements vouch for and the ear does not yet.
