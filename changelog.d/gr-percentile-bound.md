@@ -36,15 +36,31 @@ zero and zero holds any reduction limit), and then walks the bracket that render
 search did not spend — `DriveBound::probe`, the same one the ordinary search uses — so what comes back is the LOUDEST
 render that holds the limit rather than the quietest. Measured on this tree, 0.40 to 0.81 LU above the idle point; on
 the three mixes this was built for, 0.4 to 1.8. It is all taken after the search, so a solve that finds its own
-holding render is unchanged render for render and bit for bit, and with the budget exhausted the idle render is still
-what comes back — the one case where a quiet render is delivered on purpose, because the guarantee outranks the
+holding render is unchanged render for render and bit for bit — the idle render included, which is why its ceiling
+moves only where the margin cannot absorb the meters' disagreement. With the budget exhausted the idle render is
+still what comes back: the one case where a quiet render is delivered on purpose, because the guarantee outranks the
 loudness.
 - `pairFor` is the one place a drive becomes a `(gain, ceiling)` pair: `d = g - c` and the two are clamped to ±60 dB
   one number at a time, so a ceiling picked for the true-peak aim alone put the gain past its clamp and the drive
   RENDERED was not the drive chosen. The ceiling is chosen for the drive, inside the window that keeps the gain in
-  range and at or under the promise, less the between-grid overshoot already measured (a quarter of a decibel on a
-  15 kHz tone, five times the aim's own margin); where that window is empty no pair expresses the drive and the
-  rescue is not taken.
+  range and at or under the promise; where that window is empty no pair expresses the drive and the rescue is not
+  taken. Where the window forces the ceiling up, the delivered peak can pass the promise — that is reported rather
+  than hidden (below).
+- The certifying meter does not read the peak the limiter aims at; `DriveBound::overshootAt` measures the
+  difference on the renders the search made (0.02 dB on this tree's music, 0.25 dB on a 15 kHz tone). Every PROBE
+  subtracts it from its ceiling, as the ordinary search does. The IDLE render subtracts it only where it exceeds
+  `truePeakAimDb`, the margin that exists to absorb it: below that size the ceiling is the aim exactly, because a
+  ceiling moved by a fraction of a margin that already covers it moves the render — and a `Solved` that render
+  reached becomes a `TargetUnreachable` a hair outside the tolerance.
+- A probe that breaks a limit the bracket is about is a FAILED probe: it moves `cap` and is not offered as the
+  render to deliver. `Best` ranks infeasible candidates by the worst excess across all constraints, so a reduction
+  broken by a millionth of a decibel ranked gentler than a peak broken by a tenth, and the render handed back broke
+  the very limit the verdict named.
+- `alsoViolated` now carries what the DELIVERED render breaks as well as what stopped the search. Where nothing
+  holds every constraint the render handed back breaks something of its own, and a caller told only why the search
+  stopped was not told its file is above the promise.
+- "The loudest render that holds the limit" is the contract only where the loudness is a measurement: renders under
+  the absolute gate all read the meter's -120 sentinel, tie, and the first one offered is kept.
 - A render taken aside need not have a measurable loudness: the reduction comes off the tap and the peak off the peak
   meter, so a render under the absolute gate still holds the limit and is still the answer, though never `Solved`.
   `violatedMask` and `worstExcess` no longer judge the peak-to-loudness ratio without one.

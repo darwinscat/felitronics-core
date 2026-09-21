@@ -1209,9 +1209,18 @@ public:
         // the actuator admits.
         //
         // THE DRIVE IS EXPRESSED BY `pairFor`, which chooses the ceiling for the drive rather than for the aim;
-        // where no `(g, c)` pair expresses it the rescue is not taken. The ceiling asked for is the aim less the
-        // overshoot already measured, here and at every probe: at the engagement drive the delivered peak IS the
-        // ceiling as the limiter's own oversampler reads it, and the certifying meter reads that much above.
+        // where no `(g, c)` pair expresses it the rescue is not taken.
+        //
+        // THE CEILING ASKED FOR IS THE AIM, and the aim less the difference already measured only where that
+        // difference is larger than the aim's own margin. The certifying meter does not read the peak the
+        // limiter aims at — `DriveBound::overshootAt` is that difference, measured on the renders the search
+        // made, and it is a MEASUREMENT here rather than a mechanism: it is 0.02 dB on this tree's music and
+        // 0.25 dB on a 15 kHz tone. `truePeakAimDb` exists to absorb it, so below that size nothing is
+        // subtracted — a ceiling moved by a fraction of a margin that already covers it would move a render the
+        // previous build delivered, and a target that render reached. Above it the margin is not enough and the
+        // whole measured difference comes off, which puts the predicted peak back at the aim.
+        // (Every PROBE subtracts it unconditionally — see the walk below: its limiter is working, so its peak
+        // is pinned to its ceiling plus that difference, which is the same rule the ordinary search uses.)
         //
         // IT RUNS AFTER THE SEARCH, so a search that finds its own `ok` never reaches it and is unchanged,
         // render for render and bit for bit. Neither the idle render nor the probes after it are steps of the
@@ -1241,13 +1250,18 @@ public:
         double rg = 0.0, rc = 0.0;
         if (best.have && bound.cap.have && ! bound.ok.have && bound.haveEngage
             && bound.engageD < bound.cap.d
-            && pairFor (rescueD, std::fmin (pmax, aim - bound.overshootAt (bound.cap.d)), pmax, rg, rc))
+            && pairFor (rescueD, std::fmin (pmax, aim - overshootPastAim (bound, req)), pmax, rg, rc))
         {
             rescued = true;
             // One render taken ASIDE from the loudness search. Renders `(ag, ac)`, records it, moves `bound`
             // and the delivered candidate, and never `Best::nearest*`. False on a refusal, with `sol.status`
             // already set to the one the caller must return.
-            auto aside = [&] (double ag, double ac, MasterMeasurement& am, std::uint32_t& av) -> bool
+            // `offerIt` false for a PROBE that breaks a `kDriveBound` limit: such a probe has failed at the one
+            // thing it was sent to do and may not be delivered over a render that did it — every comparison in
+            // `Best` among infeasible candidates is by the WORST excess across all constraints, and a reduction
+            // broken by a millionth of a decibel ranks gentler than a peak broken by a tenth. The idle render is
+            // always offered: it is the fallback the guarantee rests on.
+            auto aside = [&] (double ag, double ac, MasterMeasurement& am, std::uint32_t& av, bool offerIt = true) -> bool
             {
                 if (! clock.begin (ProgressStage::SearchPass, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
                 { sol.status = MasteringSolveStatus::Cancelled; return false; }
@@ -1269,7 +1283,8 @@ public:
                 av = violatedMask (am, req);
                 if (! keepRecord (sol, clock, ag, ac, am, av)) { sol.status = MasteringSolveStatus::Cancelled; return false; }
                 bound.add (ag, ac, am, aim, pmax, req, av);
-                best.offerAside (ag, ac, am, av == 0, std::fabs (am.integratedLufs - target), worstExcess (am, req));
+                if (offerIt || (av & kDriveBound) == 0u)
+                    best.offerAside (ag, ac, am, av == 0, std::fabs (am.integratedLufs - target), worstExcess (am, req));
                 return true;
             };
             // A render that holds the limit AND lands on the target is simply the answer — which takes a
@@ -1298,7 +1313,7 @@ public:
                 if (std::fabs (ng - g) < 1.0e-6 && std::fabs (nc - c) < 1.0e-3) break;
                 MasterMeasurement pm;
                 std::uint32_t pv = 0;
-                if (! aside (ng, nc, pm, pv)) return sol;
+                if (! aside (ng, nc, pm, pv, false)) return sol;
                 if (solvedBy (pm, pv))
                 {
                     sol.status = MasteringSolveStatus::Solved;
@@ -1387,7 +1402,11 @@ public:
         // Once the drive bound has acted: `TargetUnreachable`, `binding` from what `cap` broke.
         if (bound.acted)
         {
-            std::uint32_t viol = best.nearestViolated | bound.capViol;
+            // AND WHAT THE DELIVERED RENDER ITSELF BREAKS. `nearestViolated | capViol` is what stopped the
+            // SEARCH; the render handed back is chosen by a different rule and, where nothing holds every
+            // constraint, breaks something of its own. A caller told only why the search stopped would not be
+            // told that the file it received is above the promise.
+            std::uint32_t viol = best.nearestViolated | bound.capViol | violatedMask (best.m, req);
             if (pinnedDir != 0 && best.have && best.err > req.toleranceLu)
                 viol |= constraintBit (MasteringConstraint::GainRange);
             sol.status  = MasteringSolveStatus::TargetUnreachable;
@@ -1524,12 +1543,14 @@ private:
             consider (gg, cc, mm, feas, e, exc);
         }
 
-        // A render taken ASIDE from the search — the bracket rescue's. It may be DELIVERED and it may not say
-        // which violations stopped the search, so `nearest*` never sees it: a feasible probe landing nearer the
-        // target than any render the search made would otherwise empty `nearestViolated` and rename the verdict.
-        // `e` IS NOT A DISTANCE when the render has no measurable loudness; it only breaks ties among feasible
-        // candidates, and this one is the only feasible candidate whenever it is offered (a search render with
-        // no violation would have given `DriveBound` its `ok` and this block would not have run).
+        // A render taken ASIDE from the search — the bracket rescue's and the probes after it. It may be
+        // DELIVERED and it may not say which violations stopped the search, so `nearest*` never sees it: a
+        // feasible probe landing nearer the target than any render the search made would otherwise empty
+        // `nearestViolated` and rename the verdict.
+        // `e` IS NOT A DISTANCE when the render has no measurable loudness: every such render reads the meter's
+        // -120 sentinel, so two of them tie and the FIRST one offered stays. "The loudest render that holds the
+        // limit" is therefore the contract only where the loudness is a measurement; where it is not, nothing
+        // here can order two candidates and the one that arrived first is kept.
         void offerAside (double gg, double cc, const MasterMeasurement& mm, bool feas, double e, double exc) noexcept
         {
             consider (gg, cc, mm, feas, e, exc);
@@ -1693,6 +1714,17 @@ private:
             s.have = true;
         }
     };
+
+    // WHAT THE IDLE RENDER'S CEILING OWES THE PROMISE: the measured difference between the certifying meter's
+    // reading and the ceiling the limiter aims at, LESS the aim's own margin, and never below zero. The margin
+    // exists to absorb that difference, so a difference it covers costs the render nothing; one it does not is
+    // taken off in full. `DriveBound::overshootAt` answers `kFirstLimitingOvershootDb` where no working render
+    // was made at or under the capping drive, which is the same assumption the ordinary search makes.
+    static double overshootPastAim (const DriveBound& bound, const LoudnessRequest& req) noexcept
+    {
+        const double over = bound.overshootAt (bound.cap.d);       // `admits()` bounds the aim: finite, and >= 0
+        return over > req.truePeakAimDb ? over : 0.0;
+    }
 
     // How far past its limit the worst violated constraint is, in that constraint's own units (dB or
     // LU). Zero when nothing is violated. It is a RANKING, not a physical quantity — the units are only

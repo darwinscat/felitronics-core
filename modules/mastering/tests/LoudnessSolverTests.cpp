@@ -4475,11 +4475,11 @@ static void testTheRescueThenFindsTheBoundary()
                      walked.passes);
     }
 
-    // EVERY RENDER TAKEN ASIDE AIMS ITS CEILING BY THE OVERSHOOT ALREADY MEASURED, not by the aim alone —
-    // the idle one as much as the probes after it. A 15 kHz tone's reconstructed peak runs a QUARTER of a
-    // decibel above the limiter's own grid, five times the aim's margin, so a ceiling left at the aim would
-    // deliver that quarter of a decibel above the promise. Two passes, so the idle render is the one delivered
-    // and it is its own ceiling under test.
+    // EVERY RENDER TAKEN ASIDE AIMS ITS CEILING BY THE DIFFERENCE ALREADY MEASURED between the certifying
+    // meter and the ceiling the limiter aims at — the idle one as much as the probes after it. On a 15 kHz tone
+    // that difference is a QUARTER of a decibel, five times the aim's own margin, so a ceiling left at the aim
+    // would deliver that quarter of a decibel above the promise. Two passes, so the idle render is the one
+    // delivered and it is its own ceiling under test.
     {
         Programme src = makeTone ((int) (2.0 * kFs), 2, 0.7, 15000.0);
         Rig rig; if (! test::run (rig.build (2))) return;
@@ -4494,8 +4494,11 @@ static void testTheRescueThenFindsTheBoundary()
                   "its ceiling is pulled under the aim by the overshoot measured on the working renders ("
                   + std::to_string (sol.ceilingDbTp) + " against an aim of " + std::to_string (aim) + ")");
         const Independent ind = measureIndependently (dst.ch);
-        test::ok (sol.measured.truePeakDbTp <= -1.0 && ind.TP <= -1.0,
-                  "so the delivered peak is still under the promise (" + std::to_string (ind.TP) + ")");
+        // AT THE AIM, not on the promise: the whole measured difference comes off, so the margin the aim exists
+        // to be is still there. Subtracting only the part past the margin would land the peak on -1.0 exactly.
+        test::ok (sol.measured.truePeakDbTp <= aim && ind.TP <= aim,
+                  "so the delivered peak lands at the aim, its margin intact (" + std::to_string (ind.TP)
+                  + " against an aim of " + std::to_string (aim) + ")");
     }
 
     // WITH NO BRACKET THERE IS NOTHING TO WALK. When the idle render breaks the limit too — a ratio floor no
@@ -4555,8 +4558,10 @@ static void testTheRescueThenFindsTheBoundary()
         test::ok (one.passes == 2 && one.measured.limiter.valid && one.measured.limiter.maxDb < 0.001,
                   "PRECONDITION: one pass and the idle render, the exhausted budget's answer ("
                   + std::to_string (one.measured.integratedLufs) + " LUFS)");
+        // A thousandth of a LU, not a bit: the two searches reach the same idle drive by different trajectories,
+        // so the gain they compute for it differs in its last places and the loudness with it.
         test::ok (many.measured.limiter.valid && many.measured.limiter.maxDb <= r.limitDb
-                  && many.measured.integratedLufs >= one.measured.integratedLufs - 1.0e-9
+                  && many.measured.integratedLufs >= one.measured.integratedLufs - 1.0e-3
                   && many.passes <= 8 + 1,
                   "and eight passes buy a render that still holds it and is never quieter ("
                   + std::to_string (many.measured.integratedLufs) + " against "
@@ -4593,6 +4598,87 @@ static void testTheRescueThenFindsTheBoundary()
                   + " >= 14.3, reduction " + std::to_string (sol.measured.limiter.maxDb) + " <= 1)");
         std::printf ("      two at once: %s/%s, PLR %.4f, GR %.4f, %d renders\n", statusName (sol.status),
                      constraintName (sol.binding), sol.measured.plrDb, sol.measured.limiter.maxDb, sol.passes);
+    }
+}
+
+
+// =============================================================================================
+// THE RESCUE AND ITS PROBES AGAINST THE TWO THINGS THEY MAY NOT DO: move a target the previous build
+// reached, and hand back a render that breaks the very limit the verdict names.
+static void testTheAsideRendersKeepTheirTwoPromises()
+{
+    test::group ("a render taken aside may not move a reached target, nor break the limit it names");
+
+    // (1) A TARGET THE IDLE RENDER ITSELF REACHES. One pass of search, and the idle render lands inside the
+    //     tolerance: that is a `Solved`, and nothing about how its ceiling is chosen may take it away.
+    {
+        Programme src = makeMusic (4.0, 0.30, 777u, 2.4);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -15.72; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 1.0; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.status == MasteringSolveStatus::Solved,
+                  "the idle render reaches the target and the verdict says so ("
+                  + std::string (statusName (sol.status)) + " at " + std::to_string (sol.measured.integratedLufs) + ")");
+        test::ok (std::fabs (sol.measured.integratedLufs - req.targetLufs) <= req.toleranceLu
+                  && sol.measured.truePeakDbTp <= req.maxTruePeakDbTp,
+                  "inside the tolerance and under the promise (" + std::to_string (sol.measured.integratedLufs)
+                  + " LUFS, " + std::to_string (sol.measured.truePeakDbTp) + " dBTP)");
+    }
+
+    // (2) A PROBE MAY NOT DISPLACE A RENDER THAT HOLDS THE NAMED LIMIT. Near-Nyquist material through a hot
+    //     upstream gain: the idle drive needs a gain past the clamp, so its ceiling is forced up the window,
+    //     and a probe that breaks the reduction limit by a hair used to be ranked gentler than it.
+    {
+        Programme src = makeTone (96000, 2, 0.7, 15000.0);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.inputGainDb = 60.0; rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = 0.0; req.maxTruePeakDbTp = -2.7; req.truePeakAimDb = 1.0;
+        req.maxPasses = 8; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 0.1; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        std::printf ("      aside promises: %s/%s GR %.6f TP %.6f, %d renders\n", statusName (sol.status),
+                     constraintName (sol.binding), sol.measured.limiter.maxDb, sol.measured.truePeakDbTp, sol.passes);
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb <= req.limiterGr.limitDb,
+                  "the delivered render holds the reduction limit the verdict names ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " against 0.1)");
+        // ... and it is a PROBE that holds it, not the idle render: a probe that breaks something OTHER than
+        // what the bracket is about is still a candidate, and this one is the louder of the two.
+        test::ok (sol.measured.limiter.maxDb > 0.0,
+                  "and it is one of the probes, not the idle render the walk started from ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " dB of reduction)");
+        // EIGHT PASSES ARE NOT ENOUGH HERE for a render that holds BOTH, and what comes back is above the
+        // promise by a twentieth of a decibel. That is reported: the delivered render's own violations are in
+        // `alsoViolated` beside what stopped the search, so nothing is handed over a stated ceiling in silence.
+        const Independent ind = measureIndependently (dst.ch);
+        test::ok (std::fabs (ind.TP - sol.measured.truePeakDbTp) < 0.01,
+                  "PRECONDITION: the buffer handed back IS the reported render (" + std::to_string (ind.TP) + ")");
+        test::ok (sol.measured.truePeakDbTp > req.maxTruePeakDbTp
+                  && (sol.alsoViolated & constraintBit (MasteringConstraint::TruePeakCeiling)) != 0u,
+                  "and what it DOES break — the promise, by " + std::to_string (sol.measured.truePeakDbTp - req.maxTruePeakDbTp)
+                  + " dB — is named in `alsoViolated`");
+
+        // WITH THE BUDGET FOR IT the walk reaches a render that holds both. The bracket is closing on it: at
+        // eight passes the reduction is 0.045 dB of a 0.1 limit, at twelve it is 0.097 and the peak is under.
+        {
+            Rig big; if (! test::run (big.build (2))) return;
+            big.params.inputGainDb = 60.0; big.params.bypassCompressor = true; big.params.bypassDither = true;
+            Programme bd; bd.ch = src.ch; bd.bind();
+            LoudnessRequest q = req; q.maxPasses = 12;
+            const auto s2 = big.solver.solve (big.chain, big.renderer, big.params, src.in(), bd.out(), 2, src.frames(), q);
+            const Independent bi = measureIndependently (bd.ch);
+            test::ok (s2.measured.limiter.valid && s2.measured.limiter.maxDb <= q.limiterGr.limitDb
+                      && s2.measured.truePeakDbTp <= q.maxTruePeakDbTp && bi.TP <= q.maxTruePeakDbTp,
+                      "twelve passes hold both (" + std::to_string (s2.measured.limiter.maxDb) + " dB of 0.1, "
+                      + std::to_string (bi.TP) + " dBTP of -2.7)");
+            test::ok (s2.measured.limiter.maxDb > sol.measured.limiter.maxDb,
+                      "and land closer to the boundary than eight did (" + std::to_string (s2.measured.limiter.maxDb)
+                      + " against " + std::to_string (sol.measured.limiter.maxDb) + ")");
+        }
     }
 }
 
@@ -4642,5 +4728,6 @@ int main()
     testTheDeliveredRenderHoldsTheNamedLimit();
     testTheRescuesOwnEdges();
     testTheRescueThenFindsTheBoundary();
+    testTheAsideRendersKeepTheirTwoPromises();
     return felitronics::test::report();
 }
