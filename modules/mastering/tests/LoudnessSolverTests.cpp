@@ -4219,6 +4219,177 @@ static void testTheDeliveredRenderHoldsTheNamedLimit()
     }
 }
 
+
+// =============================================================================================
+// THE RESCUE'S OWN EDGES — the three the review round found, each a case where the render handed back is
+// NOT the one the promise names.
+static void testTheRescuesOwnEdges()
+{
+    test::group ("the bracket rescue: an unmeasurable idle render, a clamped drive, and whose violations name the verdict");
+
+    // (1) THE IDLE RENDER'S LOUDNESS NEED NOT BE MEASURABLE. Digital near-silence with one full-scale sample:
+    //     the idle drive is set by that sample, and at that drive every gating block of the programme sits
+    //     under the absolute gate. The reduction is still measured — it comes off the tap, not off the meter —
+    //     so the render still HOLDS the limit, and the promise is about holding.
+    {
+        const int n = 50400;
+        Programme src;
+        src.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f));
+        for (int c = 0; c < 2; ++c)
+        {
+            for (int i = 0; i < n; ++i)
+                src.ch[(std::size_t) c][(std::size_t) i] =
+                    (float) (0.0001 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+            src.ch[(std::size_t) c][(std::size_t) (n - 1)] = 0.9f;
+        }
+        src.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -60.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 12.0; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, n, req);
+        test::ok (sol.logCount > 0
+                  && (sol.log[0].violated & constraintBit (MasteringConstraint::LimiterGainReduction)) != 0u,
+                  "PRECONDITION: an unmeasurable idle render — the warm start breaks the 12 dB limit");
+        // The scenario is only the scenario while the delivered render's loudness is NOT a measurement: a
+        // change that made it one would make this row prove something else without saying so.
+        test::ok (! sol.measured.loudnessValid,
+                  "PRECONDITION: and the render that holds it has no measurable loudness");
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb <= req.limiterGr.limitDb,
+                  "the delivered render holds the limit even though its loudness is not a measurement ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " dB against 12)");
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable
+                  && sol.binding == MasteringConstraint::LimiterGainReduction,
+                  "and the verdict is the limit, not `Solved` — that one takes a loudness measurement");
+        std::printf ("      unmeasurable idle: %s/%s %d renders, GR %.4f, I %.3f, valid %d\n",
+                     statusName (sol.status), constraintName (sol.binding), sol.passes,
+                     sol.measured.limiter.maxDb, sol.measured.integratedLufs, sol.measured.loudnessValid ? 1 : 0);
+    }
+
+    // (2) THE DRIVE HAS TO SURVIVE BOTH CLAMPS. `d = g - c`, and the pair is clamped to +-60 dB one number at a
+    //     time: a ceiling chosen for the true-peak aim alone can push the gain the drive needs past the clamp,
+    //     after which the drive actually rendered is not the drive that was chosen and the limiter works.
+    {
+        const int n = (int) (2.0 * kFs);
+        Programme src = makeTone (n, 2, 0.5);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        rig.params.inputGainDb = 60.0;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.truePeakAimDb = 10.0;
+        req.maxPasses = 4; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 1.0; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, n, req);
+        test::ok (sol.logCount > 0
+                  && (sol.log[0].violated & constraintBit (MasteringConstraint::LimiterGainReduction)) != 0u,
+                  "PRECONDITION: a clamped drive — the warm start breaks the 1 dB limit");
+        // ... and only while the gain really is against its clamp, which is what makes the ceiling have to
+        // move off the aim.
+        test::ok (sol.preLimiterGainDb <= -TargetLoudnessSolver::kMaxGainDb + 1.0e-6
+                  && sol.ceilingDbTp > req.maxTruePeakDbTp - req.truePeakAimDb,
+                  "PRECONDITION: the delivered gain sits on the -60 dB clamp and the ceiling is off the aim ("
+                  + std::to_string (sol.preLimiterGainDb) + ", " + std::to_string (sol.ceilingDbTp) + ")");
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb <= req.limiterGr.limitDb,
+                  "the delivered render holds the limit with the gain against its clamp ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " dB against 1)");
+        test::ok (sol.measured.truePeakDbTp <= req.maxTruePeakDbTp && sol.ceilingDbTp <= req.maxTruePeakDbTp,
+                  "and neither its peak nor its ceiling passes the promise");
+        std::printf ("      clamped drive: %s/%s %d renders, GR %.4f, g %.3f c %.3f, TP %.4f\n",
+                     statusName (sol.status), constraintName (sol.binding), sol.passes,
+                     sol.measured.limiter.maxDb, sol.preLimiterGainDb, sol.ceilingDbTp, sol.measured.truePeakDbTp);
+    }
+
+    // (3) THE RESCUE RENDER IS NOT A STEP OF THE SEARCH, so it may not decide which violations stopped it:
+    //     `Best::nearest*` is the search's own record, and a feasible probe landing nearer the target than any
+    //     of the search's renders used to empty it and rename the verdict a budget limit.
+    {
+        Programme src = makeMusic (3.0, 0.891, 20260921u);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -30.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1; req.initialGainDb = 6.0;
+        req.limiterGr.limitDb = 1.0; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.logCount > 0
+                  && (sol.log[0].violated & constraintBit (MasteringConstraint::LimiterGainReduction)) != 0u,
+                  "PRECONDITION: the one search render breaks the 1 dB limit");
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb <= req.limiterGr.limitDb,
+                  "the delivered render holds the limit (" + std::to_string (sol.measured.limiter.maxDb) + " dB)");
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable
+                  && sol.binding == MasteringConstraint::LimiterGainReduction
+                  && (sol.alsoViolated & constraintBit (MasteringConstraint::LimiterGainReduction)) != 0u,
+                  "and the verdict is still the LIMIT, not the budget (" + std::string (statusName (sol.status))
+                  + "/" + constraintName (sol.binding) + ")");
+        std::printf ("      verdict name: %s/%s %d renders, GR %.4f\n", statusName (sol.status),
+                     constraintName (sol.binding), sol.passes, sol.measured.limiter.maxDb);
+    }
+
+    // (4) WHERE NO `(g, c)` PAIR EXPRESSES THE IDLE DRIVE the rescue is not taken at all. A hot upstream gain
+    //     puts the engagement drive 54 dB down, and a promise of -20 dBTP caps the ceiling far below the -5.99
+    //     that drive would need to keep the gain inside +-60: the window is empty. The limit then goes unheld —
+    //     the actuator has no render to offer — but the promise is NOT traded for it: a ceiling above
+    //     `maxTruePeakDbTp` is the one thing this class never does.
+    {
+        const int n = (int) (2.0 * kFs);
+        Programme src = makeTone (n, 2, 0.5);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        rig.params.inputGainDb = 60.0;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -30.0; req.maxTruePeakDbTp = -20.0; req.maxPasses = 2; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 1.0; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, n, req);
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb > req.limiterGr.limitDb,
+                  "PRECONDITION: no expressible pair — the limit goes unheld ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " dB against 1)");
+        const Independent ind = measureIndependently (dst.ch);
+        test::ok (sol.ceilingDbTp <= req.maxTruePeakDbTp && sol.measured.truePeakDbTp <= req.maxTruePeakDbTp
+                  && ind.TP <= req.maxTruePeakDbTp,
+                  "and the promise still holds: ceiling " + std::to_string (sol.ceilingDbTp) + ", peak "
+                  + std::to_string (ind.TP) + " against " + std::to_string (req.maxTruePeakDbTp));
+        std::printf ("      no expressible pair: %s/%s %d renders, GR %.4f, c %.3f, TP %.4f\n",
+                     statusName (sol.status), constraintName (sol.binding), sol.passes,
+                     sol.measured.limiter.maxDb, sol.ceilingDbTp, ind.TP);
+    }
+
+    // (5) `Solved` TAKES A LOUDNESS MEASUREMENT, which holding a limit does not. -120 LUFS is the meter's
+    //     sentinel for "no gating block passed the absolute gate", so a target written there sits at distance
+    //     zero from every unmeasurable render — and the rescue's is one.
+    {
+        const int n = 50400;
+        Programme src;
+        src.ch.assign (2, std::vector<float> ((std::size_t) n, 0.0f));
+        for (int c = 0; c < 2; ++c)
+        {
+            for (int i = 0; i < n; ++i)
+                src.ch[(std::size_t) c][(std::size_t) i] =
+                    (float) (0.0001 * std::sin (2.0 * kPi * 1000.0 * (double) i / kFs));
+            src.ch[(std::size_t) c][(std::size_t) (n - 1)] = 0.9f;
+        }
+        src.bind();
+        Rig rig; if (! test::run (rig.build (2))) return;
+        rig.params.bypassCompressor = true; rig.params.bypassDither = true;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -120.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 12.0; req.limiterGr.statistic = GrStatistic::Max;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, n, req);
+        test::ok (! sol.measured.loudnessValid
+                  && core::exactlyEqual (sol.measured.integratedLufs, req.targetLufs),
+                  "PRECONDITION: the delivered render reads the sentinel, exactly the target ("
+                  + std::to_string (sol.measured.integratedLufs) + ")");
+        test::ok (sol.status != MasteringSolveStatus::Solved,
+                  "a render with no measurable loudness is never `Solved`, whatever its number says ("
+                  + std::string (statusName (sol.status)) + ")");
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb <= req.limiterGr.limitDb,
+                  "while it still HOLDS the limit (" + std::to_string (sol.measured.limiter.maxDb) + " dB)");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
@@ -4263,5 +4434,6 @@ int main()
     testThePercentileLimitAndItsReadBack();
     testTheDefaultQuantileChangesNothing();
     testTheDeliveredRenderHoldsTheNamedLimit();
+    testTheRescuesOwnEdges();
     return felitronics::test::report();
 }

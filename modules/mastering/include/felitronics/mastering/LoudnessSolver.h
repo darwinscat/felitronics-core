@@ -1203,28 +1203,45 @@ public:
         // that drive is the missing end, and one render at it is taken here.
         //
         // THE CONDITIONS, all of them: at least one render was made, one broke a `kDriveBound` limit, none held
-        // one, and the engagement drive is known and lies UNDER the breaking render's — that last is the test
-        // that there is drive to give back, since with the limiter already idle there the chain is a plain
-        // multiply below it and every drive under it breaks the limit too.
+        // one, the engagement drive is known and lies UNDER the breaking render's — that is the test that there
+        // is drive to give back, since with the limiter already idle there the chain is a plain multiply below
+        // it and every drive under it breaks the limit too — and the drive can be expressed as a `(g, c)` pair
+        // the actuator admits.
+        //
+        // THE DRIVE HAS TO SURVIVE BOTH CLAMPS. `d = g - c` and the two are clamped to +-60 dB one number at a
+        // time, so a ceiling chosen for the true-peak aim alone can put the gain the drive needs past the clamp
+        // — and the drive then RENDERED is not the drive chosen, with the limiter working at it. The ceiling is
+        // therefore picked for the drive, inside the window that keeps the gain in range and at or under the
+        // promise. Inside that window `rescueD + rc` is in range by construction, so the pair expresses the
+        // drive exactly; where the window is EMPTY no pair does and the rescue is not taken.
         //
         // IT RUNS AFTER THE SEARCH, so a search that finds its own `ok` never reaches it and is unchanged,
-        // render for render and bit for bit. The render is not a step of the loudness search and is not
-        // recorded as one: it moves `bound` and `best` and nothing else, so `pinnedDir` and the bracket sides
-        // below still describe the search proper. It does not refine the boundary afterwards — what comes back
-        // is the idle render, which holds the limit and is quieter than the loudest render that would.
+        // render for render and bit for bit. The render is not a step of the loudness search: it moves `bound`
+        // and the DELIVERED candidate and nothing else — never `Best::nearest*`, which is what names the
+        // violations that stopped the search — so `pinnedDir` and the bracket sides below still describe the
+        // search proper. It does not refine the boundary afterwards: what comes back is the idle render, which
+        // holds the limit and is quieter than the loudest render that would.
+        //
+        // ITS LOUDNESS NEED NOT BE MEASURABLE. The reduction is read off the tap and the peak off the peak
+        // meter, neither of which needs a gating block, so a render below the absolute gate still HOLDS the
+        // limit and is still the answer — the promise is about holding. What it cannot then be is `Solved`.
         //
         // THE COST is one render, and two where no render holds the limit at all: the idle render does not
         // become the answer either, `out` holds it rather than the reported candidate, and the delivery
         // re-render below puts that back.
         const double rescueD = bound.engageD - kIdleDriveMarginDb;
+        const double rcLo = std::fmax (-kMaxGainDb, -kMaxGainDb - rescueD);
+        const double rcHi = std::fmin (std::fmin (kMaxGainDb, kMaxGainDb - rescueD), pmax);
+        // At the engagement drive the delivered peak IS the ceiling — that is what engagement means — so the
+        // ceiling the aim asks for is the one that lands the peak where the aim wants it, when the window
+        // admits it. `fmin`/`fmax` and not `clamp`, whose behaviour is undefined for an empty window.
+        const double rc = std::fmin (std::fmax (std::fmin (pmax, aim), rcLo), rcHi);
+        const double rg = std::clamp (rescueD + rc, -kMaxGainDb, kMaxGainDb);
         if (best.have && bound.cap.have && ! bound.ok.have && bound.haveEngage
-            && std::isfinite (rescueD) && bound.engageD < bound.cap.d)
+            && std::isfinite (rescueD) && bound.engageD < bound.cap.d
+            && rcLo <= rcHi)
         {
             rescued = true;
-            // At the engagement drive the delivered peak IS the ceiling — that is what engagement means — so
-            // the ceiling the aim asks for is the one that lands the peak where the aim wants it.
-            const double rc = std::clamp (std::min (pmax, aim), -kMaxGainDb, kMaxGainDb);
-            const double rg = std::clamp (rescueD + rc, -kMaxGainDb, kMaxGainDb);
             if (! clock.begin (ProgressStage::SearchPass, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
                 return cancelled (sol);
             params.preLimiterGainDb    = rg;
@@ -1243,19 +1260,17 @@ public:
             // what is in the buffer.
             best.isLast = false;
             g = rg; c = rc;
-            const std::uint32_t rv = rm.loudnessValid ? violatedMask (rm, req) : 0u;
+            const std::uint32_t rv = violatedMask (rm, req);
             if (! keepRecord (sol, clock, rg, rc, rm, rv)) return cancelled (sol);
-            if (rm.loudnessValid)
+            bound.add (rg, rc, rm, aim, pmax, req, rv);
+            best.offerAside (rg, rc, rm, rv == 0, std::fabs (rm.integratedLufs - target), worstExcess (rm, req));
+            // A programme whose idle drive already delivers the target is SOLVED by this render — which takes a
+            // loudness measurement, unlike holding the limit.
+            if (rv == 0 && rm.loudnessValid && std::fabs (rm.integratedLufs - target) <= req.toleranceLu)
             {
-                bound.add (rg, rc, rm, aim, pmax, req, rv);
-                best.offer (rg, rc, rm, rv == 0, std::fabs (rm.integratedLufs - target), worstExcess (rm, req), rv);
-                // A programme whose idle drive already delivers the target is SOLVED by this render.
-                if (rv == 0 && std::fabs (rm.integratedLufs - target) <= req.toleranceLu)
-                {
-                    sol.status = MasteringSolveStatus::Solved;
-                    sol.preLimiterGainDb = rg; sol.ceilingDbTp = rc; sol.measured = rm;
-                    return sol;
-                }
+                sol.status = MasteringSolveStatus::Solved;
+                sol.preLimiterGainDb = rg; sol.ceilingDbTp = rc; sol.measured = rm;
+                return sol;
             }
         }
 
@@ -1466,16 +1481,34 @@ private:
         bool nearestHave = false;
 
 
+        // A render the SEARCH made: it may be delivered, and its violations may name what stopped the search.
         void offer (double gg, double cc, const MasterMeasurement& mm, bool feas, double e,
                     double exc, std::uint32_t viol) noexcept
         {
             if (! nearestHave || e < nearestErr) { nearestErr = e; nearestViolated = viol; nearestHave = true; }
-            // WHEN NOTHING IS FEASIBLE, THE ANSWER IS THE GENTLEST RENDER, NOT THE CLOSEST ONE. Picking
-            // the closest to a target that has already been declared unreachable delivers the most
-            // crushed render there is AND a refusal to go with it — which is the "push it through
-            // anyway" behaviour with a warning label. The tie-break among infeasible candidates is
-            // therefore the WORST constraint excess, in the constraint's own units, and only then the
-            // distance to the target.
+            consider (gg, cc, mm, feas, e, exc);
+        }
+
+        // A render taken ASIDE from the search — the bracket rescue's. It may be DELIVERED and it may not say
+        // which violations stopped the search, so `nearest*` never sees it: a feasible probe landing nearer the
+        // target than any render the search made would otherwise empty `nearestViolated` and rename the verdict.
+        // `e` IS NOT A DISTANCE when the render has no measurable loudness; it only breaks ties among feasible
+        // candidates, and this one is the only feasible candidate whenever it is offered (a search render with
+        // no violation would have given `DriveBound` its `ok` and this block would not have run).
+        void offerAside (double gg, double cc, const MasterMeasurement& mm, bool feas, double e, double exc) noexcept
+        {
+            consider (gg, cc, mm, feas, e, exc);
+        }
+
+    private:
+        // WHEN NOTHING IS FEASIBLE, THE ANSWER IS THE GENTLEST RENDER, NOT THE CLOSEST ONE. Picking
+        // the closest to a target that has already been declared unreachable delivers the most
+        // crushed render there is AND a refusal to go with it — which is the "push it through
+        // anyway" behaviour with a warning label. The tie-break among infeasible candidates is
+        // therefore the WORST constraint excess, in the constraint's own units, and only then the
+        // distance to the target.
+        void consider (double gg, double cc, const MasterMeasurement& mm, bool feas, double e, double exc) noexcept
+        {
             const bool better = ! have
                               || (feas && ! feasible)
                               || (feas == feasible && (feas ? (e < err)
@@ -1622,7 +1655,8 @@ private:
             const double v = grStatisticValue (m.limiter, req.limiterGr);
             if (v > req.limiterGr.limitDb) e = std::fmax (e, v - req.limiterGr.limitDb);
         }
-        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()) && m.plrDb < req.minPlrDb)
+        if (m.loudnessValid && ! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity())
+            && m.plrDb < req.minPlrDb)
             e = std::fmax (e, req.minPlrDb - m.plrDb);
         if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
             && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
@@ -1668,7 +1702,13 @@ private:
         if (violates (m.limiter, req.limiterGr))  v |= constraintBit (MasteringConstraint::LimiterGainReduction);
         // OFF is `-infinity` for a FLOOR and `+infinity` for a CEILING — the sign is part of the
         // meaning, and testing `isfinite` throws it away in the direction that always says "satisfied".
-        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()) && m.plrDb < req.minPlrDb)
+        // AND IT NEEDS A LOUDNESS MEASUREMENT: `plrDb` is `truePeakDbTp - integratedLufs`, so without one it
+        // is not a ratio and may not be judged — the same rule `lraValid` already carries for the range below.
+        // It cannot change an answer today and is not claimed to: the only caller that can reach it with an
+        // invalid measurement is the bracket rescue, and there `integratedLufs` is the meter's -120 sentinel,
+        // which makes `plrDb` large and a FLOOR satisfied either way.
+        if (m.loudnessValid && ! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity())
+            && m.plrDb < req.minPlrDb)
             v |= constraintBit (MasteringConstraint::PeakToLoudness);
         // LRA is a DELTA against the input's, and it is only asked when both ends are measurements.
         if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
