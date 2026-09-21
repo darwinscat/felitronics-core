@@ -4447,18 +4447,26 @@ static void testTheRescueThenFindsTheBoundary()
         }
         Rig rig; if (! test::run (rig.build (src.nch()))) return;
         Programme dst; dst.ch = src.ch; dst.bind();
-        walked = solve (r, 8, src, dst, rig);
+        // A BUDGET THE WALK CANNOT EXHAUST, so what stops it is the closing bracket and not the pass count.
+        // Where the budget is what runs out, whether the delivered render is the idle one or a probe turns on
+        // the pass the SEARCH happens to converge on, which is a float trajectory and differs between rows of
+        // the matrix — a threshold pinned on that is a pin on the arithmetic, not on this code.
+        walked = solve (r, 32, src, dst, rig);
         const double heldIdle = grStatisticValue (idle.measured.limiter, lim);
         const double heldWalk = grStatisticValue (walked.measured.limiter, lim);
         const std::string at = std::string (r.what) + ": ";
         test::ok (idle.measured.limiter.valid && heldIdle <= r.limitDb && heldIdle < 0.001,
                   "PRECONDITION: " + at + "one pass of budget delivers the idle render (" + std::to_string (heldIdle)
                   + " dB of reduction, " + std::to_string (idle.measured.integratedLufs) + " LUFS)");
+        test::ok (walked.passes < 32, "PRECONDITION: " + at + "the walk stops on its own, not on the budget ("
+                                       + std::to_string (walked.passes) + " renders of 32)");
         test::ok (walked.status == MasteringSolveStatus::TargetUnreachable
                   && walked.binding == MasteringConstraint::LimiterGainReduction
                   && walked.measured.limiter.valid && heldWalk <= r.limitDb,
                   at + "with budget left the delivered render still holds the limit (" + std::to_string (heldWalk)
                      + " dB against " + std::to_string (r.limitDb) + ")");
+        test::ok (walked.measured.integratedLufs >= idle.measured.integratedLufs - 1.0e-3,
+                  at + "and is never quieter than the idle render it started from");
         test::ok (walked.measured.integratedLufs - idle.measured.integratedLufs >= r.minLouderLu,
                   at + "and is louder than the idle render by at least " + std::to_string (r.minLouderLu)
                      + " LU (" + std::to_string (walked.measured.integratedLufs) + " against "
@@ -4539,6 +4547,24 @@ static void testTheRescueThenFindsTheBoundary()
                   + std::to_string (sol.measured.limiter.maxDb) + " dB)");
     }
 
+    // THE LAST PROBE THE BUDGET ALLOWS IS PLACED TO HOLD — `DriveBound::probe` pulls it a further margin inside
+    // the bracket when it is the last one — so the walk never spends a render it must then throw away. A probe
+    // that overshoots is discarded (it broke the limit the bracket is about), `best` is left on an earlier
+    // render, and the delivery re-render below costs a second pass past the budget. `passes <= maxPasses + 1`
+    // is that stated as an invariant: the budget, plus the one idle render, and nothing over.
+    {
+        Programme src = make (1);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        const Row r { "one probe", 1, -10.0, 1.0, 20.0, 0.0, GrStatistic::Max, false, 0.05 };
+        const auto sol = solve (r, 8, src, dst, rig);
+        test::ok (sol.passes <= 8 + 1 && sol.logCount == sol.passes,
+                  "the walk spends the budget and the idle render, and nothing over ("
+                  + std::to_string (sol.passes) + " renders of 8)");
+        test::ok (sol.measured.limiter.valid && sol.measured.limiter.maxDb <= r.limitDb,
+                  "and what it delivers holds the limit (" + std::to_string (sol.measured.limiter.maxDb) + " dB)");
+    }
+
     // WHERE THE SEARCH SPENDS THE WHOLE BUDGET there is nothing to walk with and the idle render is what comes
     // back — the one case where a quiet render is delivered on purpose, because the guarantee outranks the
     // loudness. Whether a given programme exhausts a given budget is a float trajectory and is not pinned; what
@@ -4578,7 +4604,7 @@ static void testTheRescueThenFindsTheBoundary()
         Rig rig; if (! test::run (rig.build (2))) return;
         Programme dst; dst.ch = src.ch; dst.bind();
         LoudnessRequest req;
-        req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 8; req.initialGainDb = 20.0;
+        req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 32; req.initialGainDb = 20.0;
         req.limiterGr.limitDb = 1.0; req.limiterGr.statistic = GrStatistic::Max;
         req.minPlrDb = 14.3;
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
