@@ -136,6 +136,7 @@ const STRUCTS = {
         ['minPlrDb', 'f64'], ['maxLraLossLu', 'f64'], ['inputLoudnessRangeLu', 'f64'],
         ['activityThresholdDb', 'f64'], ['maxPasses', 'i32'], ['initialGainDb', 'f64'],
         ['grTraceBuckets', 'i32'], ['_pad0', 'i32'],            // v6
+        ['limiterGrQuantile', 'f64'], ['compressorGrQuantile', 'f64'],   // v8
     ],
 
     fc_solve_pass: [
@@ -336,7 +337,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 7;
+export const FC_MASTER_ABI_VERSION = 8;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [

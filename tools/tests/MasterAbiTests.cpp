@@ -67,6 +67,13 @@ namespace
 constexpr double kFs  = 48000.0;
 constexpr int    kNch = 2;
 
+// The two quantile histograms a solve leaves in its solution (`GainReductionSummariser`) — a ONE-TIME allocation of the
+// first render, like the traces, and 0.01 dB over 400 dB on every row. Spelled through the histogram's own sizing
+// function so a range or a bin width that moves moves this with it.
+const std::uint64_t kGrWindowBytes =
+    2u * felitronics::dynamics::offline::QuantileHistogram::storageBytes (
+             0.0, felitronics::mastering::TargetLoudnessSolver::kGrRangeDb, 0.01);
+
 // The topology axis of the P41 create/configure matrix — see the switch that reads it.
 constexpr int kTopologies = 9;
 
@@ -1515,7 +1522,9 @@ int main()
         // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer).
         // And two traces of 1000 x 32 B: 64 000 B.
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
-        ok (solve.callBytes == 2936u + 21008u + 64000u, "the solve budget is meter + reference true-peak meter + two traces = 87 944 B");
+        // And, since the quantile read-back (`fc_solution_gr_quantile`), the two window histograms the solution keeps.
+        ok (solve.callBytes == 2936u + 21008u + 64000u + kGrWindowBytes,
+            "the solve budget is meter + reference true-peak meter + two traces + two window histograms = 727 960 B");
 
         long long before = alloc::bytes.load();
         const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
@@ -1554,8 +1563,8 @@ int main()
         // meter + reference true-peak meter + two traces: 8·(300 + 24 + 10) + 21 008 + 64 000 = 87 680 B. A length the
         // solve refuses costs 0.
         fc_need s1 {}, s0 {}; FC_INIT (s1); FC_INIT (s0);
-        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 87680u,
-            "a 1 s solve is budgeted in full: 87 680 B");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 87680u + kGrWindowBytes,
+            "a 1 s solve is budgeted in full: 727 696 B");
         ok (fc_master_need (h, FC_NEED_SOLVE, 0, &s0) == FC_OK && s0.callBytes == 0,
             "a 0-frame solve, which the core refuses before any pass, costs 0");
 
@@ -1573,9 +1582,11 @@ int main()
         fc_solution_summary sum {}; FC_INIT (sum);
         ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the search rendered");
         const long long traces = 2LL * 1000LL * 32LL;
-        const long long perPass = (long long) solve.callBytes - traces;
-        ok (solveBytes == (long long) sum.passes * perPass + traces + (long long) solve.facadeBytes,
-            "a solve allocates passes × (both meters) + its two traces + the facade's record: its budget's parts");
+        const long long perPass = (long long) solve.callBytes - traces - (long long) kGrWindowBytes;
+        ok (solveBytes == (long long) sum.passes * perPass + traces + (long long) kGrWindowBytes
+                          + (long long) solve.facadeBytes,
+            "a solve allocates passes × (both meters) + its two traces + its window histograms + the facade's record: "
+            "its budget's parts");
         (void) fc_solution_destroy (sol);
         (void) fc_master_destroy (h);
     }
@@ -1855,33 +1866,36 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 7u, "PRECONDITION: this group is written for v7 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+        ok (kCur == 8u, "PRECONDITION: this group is written for v8 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
                         "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
-                        "v7: fc_master_eq_curve, no struct grew)");
+                        "v7: fc_master_eq_curve, no struct grew; v8: the request's two quantiles and "
+                        "fc_solution_gr_quantile)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 6) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 7) == 88u,
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 7) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 8) == 88u,
             "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 6) == 6584u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 7) == 6584u,
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 7) == 6584u && fc_master_sizeof (FC_STRUCT_PARAMS, 8) == 6584u,
             "params: 6560 at v1 and v2, 6568 from v3, 6584 from v6");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 6) == 96u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 7) == 96u,
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 7) == 96u && fc_master_sizeof (FC_STRUCT_RESOLVED, 8) == 96u,
             "resolved: 80 at v1 and v2, 88 from v3, 96 from v6");
         ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
             && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 5) == 224u
-            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 7) == 224u,
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 7) == 224u
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 8) == 224u,
             "measurement: 208 to v3, 224 from v4 — the trace's four fields");
         ok (fc_master_sizeof (FC_STRUCT_REQUEST, 1) == 120u && fc_master_sizeof (FC_STRUCT_REQUEST, 5) == 120u
-            && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u && fc_master_sizeof (FC_STRUCT_REQUEST, 7) == 128u,
-            "request: 120 to v5, 128 from v6 — `grTraceBuckets` and its named padding");
+            && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u && fc_master_sizeof (FC_STRUCT_REQUEST, 7) == 128u
+            && fc_master_sizeof (FC_STRUCT_REQUEST, 8) == 144u,
+            "request: 120 to v5, 128 from v6 — `grTraceBuckets` and its named padding — 144 from v8, the two quantiles");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
         {
@@ -1904,6 +1918,7 @@ int main()
             { 5u, 88u, FC_OK,              "v5 at 88 bytes — nor at v5" },
             { 6u, 88u, FC_OK,              "v6 at 88 bytes — nor at v6" },
             { 7u, 88u, FC_OK,              "v7 at 88 bytes — nor at v7" },
+            { 8u, 88u, FC_OK,              "v8 at 88 bytes — nor at v8" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
@@ -2222,14 +2237,19 @@ int main()
         (void) fc_solution_destroy (sol);
         ok (fc_solution_gr_trace (sol, FC_GR_STAGE_LIMITER, again.data(), 1000u, &w) == FC_ERR_HANDLE, "a destroyed solution is stale");
 
-        // THE PRICE, PINNED: a solution record is 2336 B and two `GainReductionTrace`s, their buckets not included.
+        // THE PRICE, PINNED: a solution record is 2368 B, two `GainReductionTrace`s and two `QuantileHistogram`s,
+        // neither one's store included. (2336 before the percentile work: each of the measurement's two stage
+        // summaries gained the quantile it was read at and the fraction it was read for, 16 B apiece.)
         {
             using felitronics::mastering::GainReductionTrace;
             fc_master hb = make();
             fc_need nd {}; FC_INIT (nd);
-            ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK && nd.facadeBytes == 2336u + 2u * sizeof (GainReductionTrace)
+            using felitronics::dynamics::offline::QuantileHistogram;
+            ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK
+                && nd.facadeBytes == 2368u + 2u * sizeof (GainReductionTrace) + 2u * sizeof (QuantileHistogram)
                 && sizeof (GainReductionTrace) == (24u + sizeof (GainReductionTrace::bucket) + 7u) / 8u * 8u,
-                "a solution record costs 2336 B plus two traces of " + std::to_string (sizeof (GainReductionTrace)) + " B, buckets not included ("
+                "a solution record costs 2368 B plus two traces of " + std::to_string (sizeof (GainReductionTrace))
+                + " B and two window histograms of " + std::to_string (sizeof (QuantileHistogram)) + " B, neither one's store included ("
                 + std::to_string (nd.facadeBytes) + ")");
             (void) fc_master_destroy (hb);
         }
@@ -2470,9 +2490,11 @@ int main()
             ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0 && fc_solution_measurement (sol, &m) == FC_OK
                 && m.limiterGrTraceBuckets == 65536, "PRECONDITION: the search rendered, 65 536 buckets");
             const long long traces = 2LL * 65536LL * 32LL;
-            const long long perPass = (long long) nb.callBytes - traces;
-            ok (perPass > 0 && got == (long long) sum.passes * perPass + traces + (long long) nb.facadeBytes,
-                "a 65 536-bucket solve allocates passes x its meters + two traces of 2 097 152 B + the record (" + std::to_string (got) + ")");
+            const long long perPass = (long long) nb.callBytes - traces - (long long) kGrWindowBytes;
+            ok (perPass > 0 && got == (long long) sum.passes * perPass + traces + (long long) kGrWindowBytes
+                               + (long long) nb.facadeBytes,
+                "a 65 536-bucket solve allocates passes x its meters + two traces of 2 097 152 B + its window histograms "
+                "+ the record (" + std::to_string (got) + ")");
             (void) fc_solution_destroy (sol);
             (void) fc_master_destroy (h);
         }
@@ -2766,10 +2788,11 @@ int main()
             fc_solution_summary sum {}; FC_INIT (sum);
             ok (sv == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK && sum.passes > 0, "PRECONDITION: the delivered search rendered");
             const long long traces = 2LL * 1000LL * 32LL;
-            const long long perPass = (long long) solve.callBytes - programme - traces;
-            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + traces + programme + (long long) solve.facadeBytes,
-                "a delivered solve allocates passes x (both meters at 96 kHz) + two traces + the converted programme + the record ("
-                + std::to_string (solveBytes) + ")");
+            const long long perPass = (long long) solve.callBytes - programme - traces - (long long) kGrWindowBytes;
+            ok (perPass > 0 && solveBytes == (long long) sum.passes * perPass + traces + (long long) kGrWindowBytes
+                               + programme + (long long) solve.facadeBytes,
+                "a delivered solve allocates passes x (both meters at 96 kHz) + two traces + its window histograms + the "
+                "converted programme + the record (" + std::to_string (solveBytes) + ")");
             (void) fc_solution_destroy (sol);
             (void) fc_master_destroy (h);
 
@@ -3118,6 +3141,187 @@ int main()
                 && fc_master_get_stats (he, &se) == FC_OK && se.nonFiniteIn == 1u,
                 "at equal rates a range measurement refused AFTER its count keeps its own: 1");
             (void) fc_master_destroy (he);
+        }
+    }
+
+    //==========================================================================
+    // v8 — THE GAIN-REDUCTION PERCENTILE: the `q` each limit binds, and `fc_solution_gr_quantile`. Two things
+    // are pinned here and nowhere else — that the two new fields REACH the core, a mapping dropped on either of
+    // them leaving a valid default behind, and the entry point's own check order.
+    group ("v8: the gain-reduction quantiles — the request's two fields, and fc_solution_gr_quantile");
+    {
+        using namespace felitronics::mastering;
+
+        // THE DEFAULTS WRITER carries the core's own 0.95, and a request older than v8 is read with it.
+        {
+            fc_loudness_request d {}; FC_INIT (d);
+            const LoudnessRequest cd;
+            ok (fc_loudness_request_defaults (&d) == FC_OK
+                && d.limiterGrQuantile == cd.limiterGr.quantile && d.compressorGrQuantile == cd.compressorGr.quantile
+                && d.limiterGrQuantile == 0.95,
+                "the versioned defaults writer: both quantiles are the core's 0.95");
+            fc_loudness_request v1 {}; fc_loudness_request_default (&v1);
+            ok (v1.header.abiVersion == 1u && v1.header.structSize == 120u,
+                "PRECONDITION: the frozen writer still stamps v1 at 120 bytes");
+        }
+
+        // THE FIELDS REACH THE CORE, proven by a refusal only the core makes: `q` outside (0, 1] is
+        // `InvalidRequest`, which crosses back as FC_OK plus a verdict. A dropped mapping would leave 0.95 in the
+        // core's request and the solve would run.
+        {
+            const std::uint32_t n = 48000u;
+            auto in = tone (n, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+            const double bad[] = { 0.0, -0.25, 1.0000001, std::numeric_limits<double>::quiet_NaN(),
+                                   std::numeric_limits<double>::infinity() };
+            for (const double q : bad)
+                for (int which = 0; which < 2; ++which)
+                {
+                    fc_master h = make();
+                    fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+                    req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0;
+                    (which == 0 ? req.limiterGrQuantile : req.compressorGrQuantile) = q;
+                    fc_solution sol = 0;
+                    fc_solution_summary sum {}; FC_INIT (sum);
+                    const fc_status st = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
+                    const bool refused = st == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK
+                                      && sum.status == FC_SOLVE_INVALID_REQUEST && sum.passes == 0;
+                    ok (refused, std::string (which == 0 ? "limiterGrQuantile" : "compressorGrQuantile") + " = "
+                                 + std::to_string (q) + ": the core refuses the request (a dropped mapping would solve)");
+                    if (st == FC_OK) (void) fc_solution_destroy (sol);
+                    (void) fc_master_destroy (h);
+                }
+            // A v6 request carries them past its 128 bytes, where they are not read — the trap rule 8 names.
+            {
+                fc_master h = make();
+                fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+                req.targetLufs = -14.0; req.maxTruePeakDbTp = -1.0; req.limiterGrQuantile = -1.0;
+                req.header.abiVersion = 6u; req.header.structSize = 128u;
+                fc_solution sol = 0;
+                fc_solution_summary sum {}; FC_INIT (sum);
+                ok (fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol) == FC_OK
+                    && fc_solution_summary_get (sol, &sum) == FC_OK && sum.status != FC_SOLVE_INVALID_REQUEST,
+                    "a v6 request: the quantile past its 128 bytes is not read, and 0.95 is what the core gets");
+                (void) fc_solution_destroy (sol);
+                (void) fc_master_destroy (h);
+            }
+        }
+
+        // THE READ-BACK IS THE CORE'S OWN NUMBER, at every fraction and on both stages, and it is the number an
+        // FC_GR_PERCENTILE limit was judged by. The direct solve is the same request through C++.
+        {
+            const std::uint32_t n = 4u * 48000u;
+            auto in = tone (n, kNch);
+            std::vector<float> out (in.size(), 0.0f), outC (in.size(), 0.0f);
+            fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+            fc_loudness_request req {}; FC_INIT (req); (void) fc_loudness_request_defaults (&req);
+            req.targetLufs = -9.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+            req.limiterGr.limitDb = 2.0; req.limiterGr.statistic = FC_GR_PERCENTILE;
+            req.limiterGrQuantile = 0.62; req.compressorGrQuantile = 0.31;
+
+            fc_master h = make();
+            fc_solution sol = 0;
+            const fc_status st = fc_master_solve (h, &p, &req, in.data(), out.data(), n, &sol);
+            fc_solution_summary sum {}; FC_INIT (sum);
+            fc_measurement meas {}; FC_INIT (meas);
+            const bool solved = st == FC_OK && fc_solution_summary_get (sol, &sum) == FC_OK
+                             && fc_solution_measurement (sol, &meas) == FC_OK;
+            ok (solved && sum.passes > 0 && meas.limiter.valid, "PRECONDITION: the search rendered and measured");
+
+            // The same thing directly, through the C++ the facade forwards to.
+            MasteringChain chain; OfflineRenderer r; TargetLoudnessSolver solver;
+            MasteringChainConfig cc {}; MasteringChainParams cp {};
+            const fc_master_config gc = goodConfig();
+            cc.internalBlock = gc.internalBlock; cc.eq = gc.eq != 0; cc.monoBass = gc.monoBass != 0;
+            cc.compressor = gc.compressor != 0; cc.clipper = gc.clipper != 0; cc.limiter = gc.limiter != 0;
+            cc.dither = gc.dither != 0;
+            cc.compressorLookaheadMs = gc.compressorLookaheadMs; cc.limiterLookaheadMs = gc.limiterLookaheadMs;
+            cc.oversampleFactor = gc.oversampleFactor; cc.tapsPerPhase = gc.tapsPerPhase;
+            cc.sidechainHpfHz = gc.sidechainHpfHz;
+            LoudnessRequest lr;
+            lr.targetLufs = -9.0; lr.maxTruePeakDbTp = -1.0; lr.maxPasses = 4;
+            lr.limiterGr.limitDb = 2.0; lr.limiterGr.statistic = GrStatistic::Percentile;
+            lr.limiterGr.quantile = 0.62; lr.compressorGr.quantile = 0.31;
+            const bool built = r.prepare (kNch, 4096) && chain.prepare (gc.sampleRate, kNch, cc)
+                            && solver.prepare (gc.sampleRate, kNch, r.blockSize(), chain.internalBlock(),
+                                               chain.tapOversampleFactor());
+            const float* ip[16] {}; float* op[16] {};
+            for (int c = 0; c < kNch; ++c) { ip[c] = in.data() + (std::size_t) c * n; op[c] = outC.data() + (std::size_t) c * n; }
+            LoudnessSolution direct;
+            if (built) direct = solver.solve (chain, r, cp, ip, op, kNch, (int) n, lr);
+            ok (built && direct.passes == sum.passes && direct.status == (MasteringSolveStatus) sum.status,
+                "PRECONDITION: the direct C++ solve is the same search");
+
+            int diff = 0, refusedDiff = 0, answered = 0;
+            double biggest = 0.0;
+            for (const int stage : { FC_GR_STAGE_COMPRESSOR, FC_GR_STAGE_LIMITER })
+                for (const double q : { 0.05, 0.31, 0.5, 0.62, 0.95, 1.0 })
+                {
+                    double want = 0.0, got = 0.0;
+                    const bool coreOk = direct.grQuantile (stage == FC_GR_STAGE_LIMITER ? GrStage::Limiter
+                                                                                        : GrStage::Compressor, q, want);
+                    const fc_status qs = fc_solution_gr_quantile (sol, stage, q, &got);
+                    if (coreOk != (qs == FC_OK)) ++refusedDiff;
+                    else if (coreOk && std::memcmp (&want, &got, sizeof (double)) != 0) ++diff;
+                    if (qs == FC_OK) { ++answered; if (got > biggest) biggest = got; }
+                }
+            // ANSWERED, and not only agreed on: twelve refusals agree with twelve refusals.
+            ok (answered == 12 && biggest > 0.0,
+                "PRECONDITION: all twelve readings were ANSWERED and the trace is live (largest "
+                + std::to_string (biggest) + " dB)");
+            ok (solved && diff == 0 && refusedDiff == 0,
+                "twelve readings through the ABI are the core's, bit for bit (" + std::to_string (diff)
+                + " differ, " + std::to_string (refusedDiff) + " disagree about answerability)");
+            double judged = 0.0;
+            ok (solved && fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, req.limiterGrQuantile, &judged) == FC_OK
+                && judged >= 0.0 && judged <= meas.limiter.maxDb,
+                "and the reading at the limit's own q sits inside the render it describes (" + std::to_string (judged)
+                + " dB, maximum " + std::to_string (meas.limiter.maxDb) + ")");
+
+            // THE CHECK ORDER, and `outDb` untouched by every refusal — the rule every out-parameter here follows.
+            double sink = 12345.0;
+            ok (fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 0.5, nullptr) == FC_ERR_NULL
+                && fc_solution_gr_quantile (sol, 7, 0.5, &sink) == FC_ERR_ENUM
+                && fc_solution_gr_quantile (sol, -1, 0.5, &sink) == FC_ERR_ENUM
+                && fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, std::numeric_limits<double>::quiet_NaN(), &sink) == FC_ERR_NON_FINITE
+                && fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, std::numeric_limits<double>::infinity(), &sink) == FC_ERR_NON_FINITE
+                && fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 0.0, &sink) == FC_ERR_RANGE
+                && fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 1.5, &sink) == FC_ERR_RANGE
+                && sink == 12345.0,
+                "null, enum, non-finite and range are named apart, and none of them writes `outDb`");
+            // THE ENUM BEFORE THE VALUE: a call that is wrong in both ways is answered for the stage.
+            ok (fc_solution_gr_quantile (sol, 7, std::numeric_limits<double>::quiet_NaN(), &sink) == FC_ERR_ENUM
+                && sink == 12345.0, "a call wrong in both: the stage is the answer, as the header's order says");
+            // A misaligned `outDb`, and the handle before everything.
+            {
+                std::vector<unsigned char> raw (sizeof (double) + 8u, 0u);
+                auto* mis = reinterpret_cast<double*> (static_cast<void*> (raw.data() + 1));
+                ok (fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 0.5, mis) == FC_ERR_ALIGNMENT,
+                    "a misaligned `outDb`: ALIGNMENT");
+            }
+            (void) fc_solution_destroy (sol);
+            ok (fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 0.5, &sink) == FC_ERR_HANDLE && sink == 12345.0,
+                "a destroyed solution is stale, and still writes nothing");
+            (void) fc_master_destroy (h);
+        }
+
+        // A SOLUTION THAT RENDERED NOTHING has no distribution and says so, rather than answering 0.
+        {
+            fc_master h = make();
+            fc_loudness_request bad {}; fc_loudness_request_default (&bad);       // no target: InvalidRequest
+            auto in = tone (4800, kNch);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_master_params p {}; FC_INIT (p); (void) fc_master_params_defaults (&p);
+            fc_solution sol = 0;
+            double sink = -5.0;
+            ok (fc_master_solve (h, &p, &bad, in.data(), out.data(), 4800u, &sol) == FC_OK
+                && fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 0.5, &sink) == FC_ERR_REFUSED_BY_CORE
+                && fc_solution_gr_quantile (sol, FC_GR_STAGE_COMPRESSOR, 0.5, &sink) == FC_ERR_REFUSED_BY_CORE
+                && sink == -5.0,
+                "a verdict before any render: both stages refuse and write nothing");
+            (void) fc_solution_destroy (sol);
+            (void) fc_master_destroy (h);
         }
     }
 
@@ -3557,6 +3761,7 @@ int main()
                       && fc_solution_log (0, lg, 4, &wrote)                         == FC_ERR_POISONED
                       && fc_solution_destroy (0)                                    == FC_ERR_POISONED
                       && fc_solution_gr_trace (0, FC_GR_STAGE_LIMITER, tb, 4, &wrote) == FC_ERR_POISONED
+                      && fc_solution_gr_quantile (0, FC_GR_STAGE_LIMITER, 0.5, &lraOut) == FC_ERR_POISONED   // v8
                       // v2/v3 — the list is EVERY entry point, so a new one joins it (the diverse-testing round
                       // found the five below missing: removing their guard left the suite green)
                       && fc_master_delivered_frames (0, 64u, &wrote)                == FC_ERR_POISONED

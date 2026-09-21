@@ -38,6 +38,12 @@ namespace
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kFs = 48000.0;
 
+// The two quantile histograms a solve leaves in its solution — a ONE-TIME allocation of the first render, not a
+// per-pass one. Spelled through the histogram's own sizing function so a bin width or a range that moves moves
+// this with it.
+const long long kGrWindowBytes =
+    2LL * (long long) dynamics::offline::QuantileHistogram::storageBytes (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01);
+
 // ---------------------------------------------------------------------------------------------
 // Programme generators. NONE of them is a plateau of identical gating blocks: that shape flips every
 // block across the absolute gate at once and makes the gated measure jump by a whole LU, which would
@@ -475,10 +481,26 @@ void testStatisticsAgreeWithAHandDrivenChain()
     taps.compressorGrDb = compTap.data(); taps.frameCapacity = blk + K;
     taps.limiterGrDb    = limTap.data();  taps.osCapacity    = (blk + K) * F;
 
+    // The hand reference keeps the two bases apart itself: `hc`/`hl` are the WINDOW distributions the quantiles
+    // are read on — 4 ms of tap samples averaged into one entry, the last window over its own length — while the
+    // mean, the maximum and the active fraction are taken over tap SAMPLES, as they always were.
     dynamics::offline::QuantileHistogram hc, hl;
     if (! test::run (hc.prepare (0.0, 400.0, 0.01))) return;
     if (! test::run (hl.prepare (0.0, 400.0, 0.01))) return;
     std::uint64_t ac = 0, al = 0, nc = 0, nl = 0;
+    double sumC = 0.0, sumL = 0.0, maxC = 0.0, maxL = 0.0, winC = 0.0, winL = 0.0;
+    long long nWinC = 0, nWinL = 0;
+    const long long wC = std::llround (0.004 * kFs), wL = std::llround (0.004 * kFs * (double) F);
+    const auto feedC = [&] (double a)
+    {
+        sumC += a; ++nc; if (a > maxC) maxC = a; if (a > 0.1) ++ac;
+        winC += a; if (++nWinC >= wC) { hc.add (winC / (double) nWinC); winC = 0.0; nWinC = 0; }
+    };
+    const auto feedL = [&] (double a)
+    {
+        sumL += a; ++nl; if (a > maxL) maxL = a; if (a > 0.1) ++al;
+        winL += a; if (++nWinL >= wL) { hl.add (winL / (double) nWinL); winL = 0.0; nWinL = 0; }
+    };
 
     const int frames = src.frames();
     const long long D = chain2.latencySamples();
@@ -506,49 +528,58 @@ void testStatisticsAgreeWithAHandDrivenChain()
             const long long s = tapPos + j;
             if (s >= 0 && s < frames)
             {
-                const double a = std::fabs ((double) compTap[(std::size_t) j]);
-                hc.add (a); if (a > 0.1) ++ac; ++nc;
+                feedC (std::fabs ((double) compTap[(std::size_t) j]));
             }
             if (s >= limFrom && s < limFrom + frames)
                 for (int k = 0; k < F; ++k)
-                {
-                    const double a = std::fabs ((double) limTap[(std::size_t) (j * F + k)]);
-                    hl.add (a); if (a > 0.1) ++al; ++nl;
-                }
+                    feedL (std::fabs ((double) limTap[(std::size_t) (j * F + k)]));
         }
         tapPos += taps.framesWritten;
         off += m;
     }
+    if (nWinC > 0) hc.add (winC / (double) nWinC);       // the partial last window, over its own length
+    if (nWinL > 0) hl.add (winL / (double) nWinL);
 
     // PRECONDITION: the traces are LIVE. Zero gain reduction everywhere would make every equality below
     // hold trivially.
-    test::ok (hc.maxValue() > 0.5, "precondition: the compressor really compressed ("
-                                   + std::to_string (hc.maxValue()) + " dB peak)");
-    test::ok (hl.maxValue() > 0.5, "precondition: the limiter really limited ("
-                                   + std::to_string (hl.maxValue()) + " dB peak)");
+    test::ok (maxC > 0.5, "precondition: the compressor really compressed (" + std::to_string (maxC) + " dB peak)");
+    test::ok (maxL > 0.5, "precondition: the limiter really limited (" + std::to_string (maxL) + " dB peak)");
     test::ok (nc == (std::uint64_t) frames, "compressor window: exactly `frames` samples counted");
     test::ok (nl == (std::uint64_t) frames * (std::uint64_t) F, "limiter window: exactly frames*F counted");
 
     double p95c = 0.0, p95l = 0.0;
     test::ok (hc.quantile (0.95, p95c), "hand-driven compressor p95 is answerable");
     test::ok (hl.quantile (0.95, p95l), "hand-driven limiter p95 is answerable");
-    test::approx (sol.measured.compressor.meanDb, hc.mean(), 1.0e-9 * std::fmax (1.0, hc.mean()),
+    const double meanC = sumC / (double) nc, meanL = sumL / (double) nl;
+    test::approx (sol.measured.compressor.meanDb, meanC, 1.0e-9 * std::fmax (1.0, meanC),
                   "compressor mean nulls");
     test::approx (sol.measured.compressor.p95Db,  p95c,      0.0, "compressor p95 nulls");
-    test::approx (sol.measured.compressor.maxDb,  hc.maxValue(), 0.0, "compressor max nulls");
+    test::approx (sol.measured.compressor.maxDb,  maxC, 0.0, "compressor max nulls");
     test::approx (sol.measured.compressor.activeFraction, (double) ac / (double) nc, 0.0,
                   "compressor active fraction nulls");
     // The MEAN is a sum over a million values and the two paths accumulate it in different block
     // orders, so it nulls to double-summation precision rather than bit for bit. Everything else is an
     // order statistic or a count and IS exact.
-    test::approx (sol.measured.limiter.meanDb, hl.mean(), 1.0e-9 * std::fmax (1.0, hl.mean()),
+    test::approx (sol.measured.limiter.meanDb, meanL, 1.0e-9 * std::fmax (1.0, meanL),
                   "limiter mean nulls");
     test::approx (sol.measured.limiter.p95Db,  p95l,      0.0, "limiter p95 nulls");
-    test::approx (sol.measured.limiter.maxDb,  hl.maxValue(), 0.0, "limiter max nulls");
+    test::approx (sol.measured.limiter.maxDb,  maxL, 0.0, "limiter max nulls");
     test::approx (sol.measured.limiter.activeFraction, (double) al / (double) nl, 0.0,
                   "limiter active fraction nulls");
+    // AND THE READ-BACK IS THE SAME INSTRUMENT. `grQuantile` must answer off the same distribution the limits
+    // were judged on, at any q — a second definition here is exactly the defect QuantileHistogram exists to stop.
+    int qBad = 0;
+    for (const double q : { 0.05, 0.5, 0.95, 0.99, 1.0 })
+    {
+        double want = 0.0, got = 0.0;
+        if (! hc.quantile (q, want) || ! sol.grQuantile (GrStage::Compressor, q, got)
+            || ! core::exactlyEqual (want, got)) ++qBad;
+        if (! hl.quantile (q, want) || ! sol.grQuantile (GrStage::Limiter, q, got)
+            || ! core::exactlyEqual (want, got)) ++qBad;
+    }
+    test::ok (qBad == 0, "grQuantile nulls against the hand-built window distribution at five q, both stages");
     std::printf ("      hand-driven null: comp mean %.5f p95 %.5f max %.5f | lim mean %.5f p95 %.5f max %.5f\n",
-                 hc.mean(), p95c, hc.maxValue(), hl.mean(), p95l, hl.maxValue());
+                 meanC, p95c, maxC, meanL, p95l, maxL);
 }
 
 // =============================================================================================
@@ -799,12 +830,12 @@ void testTheTraceBucketsAreTheRequests()
         const long long before = alloc::bytes.load();
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, frames, req);
         const long long got = alloc::bytes.load() - before;
-        const long long perPass = (long long) budget - traces;
+        const long long perPass = (long long) budget - traces - kGrWindowBytes;
         test::ok (sol.passes > 0 && sol.limiterTrace.buckets == b && sol.compressorTrace.buckets == b && sol.limiterTrace.valid
                   && sol.limiterTrace.bucket.size() == (std::size_t) b,
                   "grTraceBuckets " + std::to_string (b) + " over " + std::to_string (frames) + " frames: a render, " + std::to_string (b) + " buckets per stage");
-        test::ok (perPass > 0 && got == (long long) sol.passes * perPass + traces,
-                  "and the solve allocates passes x its meters + two traces of " + std::to_string (traces / 2) + " B ("
+        test::ok (perPass > 0 && got == (long long) sol.passes * perPass + traces + kGrWindowBytes,
+                  "and the solve allocates passes x its meters + its window histograms + two traces of " + std::to_string (traces / 2) + " B ("
                   + std::to_string (got) + " B over " + std::to_string (sol.passes) + " passes)");
     }
 
@@ -872,9 +903,11 @@ void testAStoppedOrRefusedSolveHoldsItsTracesOnce()
     const int frames = 65536, B = 65536;
     const std::uint64_t budget = TargetLoudnessSolver::solveBytes (kFs, 1, frames, B);
     const long long traces = 2LL * (long long) GainReductionTrace::bytesFor (B, frames);
-    const long long perPass = (long long) budget - traces;
-    test::ok (budget == 4215696u && traces == 4194304LL, "PRECONDITION: mono, 65536 frames and buckets: a budget of "
-              + std::to_string (budget) + " B, the traces " + std::to_string (traces) + " B");
+    const long long perPass = (long long) budget - traces - kGrWindowBytes;
+    test::ok (budget == 4855712u && traces == 4194304LL && kGrWindowBytes == 640016LL,
+              "PRECONDITION: mono, 65536 frames and buckets: a budget of "
+              + std::to_string (budget) + " B, the traces " + std::to_string (traces) + " B, the window histograms "
+              + std::to_string (kGrWindowBytes) + " B");
 
     using When = StopAt::When;
     struct Case
@@ -924,8 +957,9 @@ void testAStoppedOrRefusedSolveHoldsItsTracesOnce()
         const std::string at = std::string (cs.what) + ": ";
         test::ok (cs.stop.when == When::Never || cs.stop.seen, "PRECONDITION: " + at + "the event was reached");
         test::ok (sol.status == cs.want, at + "the status (" + std::string (statusName (sol.status)) + ")");
-        test::ok (got == (long long) cs.measured * perPass + traces,
-                  at + std::to_string (got) + " B allocated, " + std::to_string (cs.measured) + " x the meters + the traces");
+        test::ok (got == (long long) cs.measured * perPass + traces + kGrWindowBytes,
+                  at + std::to_string (got) + " B allocated, " + std::to_string (cs.measured)
+                     + " x the meters + the traces + the window histograms");
         test::ok (sol.limiterTrace.buckets == B && sol.limiterTrace.bucket.size() == (std::size_t) B
                   && sol.compressorTrace.bucket.size() == (std::size_t) B, at + "the traces are returned whole");
         if (cs.measured == 1) test::ok (got <= (long long) budget, at + "within the budget of " + std::to_string (budget) + " B");
@@ -3012,7 +3046,13 @@ void testThePreMergeDiffPass()
             req.maxPasses = 1; req.initialGainDb = 60.0;
             const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params,
                                                src.in(), dst.out(), 2, src.frames(), req);
-            test::ok (sol.logCount == 1
+            // THREE records, not one, and the two extra ones are the bracket rescue's honest worst case. No
+            // render held the peak-to-loudness floor, so the rescue spent its render at the drive the limiter
+            // idles at — and this programme's ratio is ~0 dB limited or not, so a 40 dB floor is out of reach
+            // there too and that render does not become the answer. `out` then holds it rather than the
+            // reported candidate, and the delivery re-render is the third. The search's own render is `log[0]`
+            // and is the one this group is about.
+            test::ok (sol.logCount == 3
                       && std::fabs (sol.log[0].integratedLufs - req.targetLufs) <= req.toleranceLu,
                       "precondition: the render at the clamp MEETS the target in loudness");
             test::ok ((sol.alsoViolated & constraintBit (MasteringConstraint::PeakToLoudness)) != 0u,
@@ -3724,8 +3764,10 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
               "solveBytes: 0 for a channel count solve() refuses");
     // Two traces of 1000 x 32 B.
     test::ok (sizeof (GainReductionTraceBucket) == 32u, "a trace bucket is 32 B");
-    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB) == 2672u + 21008u + 64000u,
-              "and 87 680 B for 1 s of stereo at the default 1000 buckets (the ABI suite's oracle)");
+    test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB)
+                  == 2672u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes,
+              "and 727 696 B for 1 s of stereo at the default 1000 buckets — meter, reference true-peak meter, two "
+              "traces and the two window histograms (the ABI suite's oracle)");
     // A prepare() refused on its bin width (400 dB at 1e-7 dB is 4e9 bins, past the 4e6 ceiling) allocates NOTHING —
     // which is what its budget says. The diverse-testing round found the tap buffers assigned before that refusal, and
     // kept. The delta is read into a local before the check.
@@ -3745,9 +3787,10 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // so the loudness meter is 8·(300 + 24 + 10) = 2672 B at each of them.
     test::ok (ReferenceTruePeakMeter::storageFor (96000.0, 96000, 2).bytes() == 21008u && ReferenceTruePeakMeter::storageFor (192000.0, 192000, 2).bytes() == 21008u,
               "the reference true-peak meter is 21 008 B at 96 and at 192 kHz too");
-    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000, kB) == 2672u + 21008u + 64000u
-              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000, kB) == 2672u + 21008u + 64000u,
-              "and a 1 s solve at 96 and 192 kHz carries it unchanged: 87 680 B");
+    const std::uint64_t oneSecond = 2672u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes;
+    test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000, kB) == oneSecond
+              && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000, kB) == oneSecond,
+              "and a 1 s solve at 96 and 192 kHz carries it unchanged: 727 696 B");
 }
 
 // P62 — THE INSTRUMENT CHANGED, THE SPELLING OF SILENCE DID NOT. The solver now reads with ReferenceTruePeakMeter, whose
@@ -3791,6 +3834,391 @@ static void testSilenceIsStillSpelledMinus200()
     test::ok (! (justOut > Solver::kPeakDbGate), "the gate is exclusive: the boundary level itself reads as silence");
 }
 
+
+// =============================================================================================
+// THE PERCENTILE, on a trace built by hand so the answer is known before the code runs. The two fixtures below
+// carry the same TOTAL |GR| — same sum, same sample mean — and differ only in how it is spread, which is the one
+// thing the window definition is supposed to see and a sample-wise quantile cannot.
+static void testThePercentileIsAWindowAndNotASample()
+{
+    test::group ("the percentile: a chain of clicks does not move it, a steady reduction of the same mean does");
+    const long long W = grQuantileWindowSamples (kFs);                 // 4 ms at 48 kHz
+    test::ok (W == 192, "PRECONDITION: the 4 ms window is " + std::to_string (W) + " tap samples at 48 kHz");
+    test::ok (grQuantileWindowSamples (kFs * 4.0) == 4 * W && grQuantileWindowSamples (8000.0) == 32,
+              "and it follows the TAP rate — four times as many sub-samples at 4x, 32 at the 8 kHz floor");
+    test::ok (grQuantileWindowSamples (0.0) == 1 && grQuantileWindowSamples (-1.0) == 1
+              && grQuantileWindowSamples (std::numeric_limits<double>::quiet_NaN()) == 1,
+              "a rate that rounds the window away still has a window of one sample");
+
+    // 100 windows. CLICKS: one sample of 60 dB in each of the first 20 windows, silence elsewhere — a mean of
+    // 60/192 = 0.3125 dB in those windows. SQUEEZE: those same 20 windows held flat at 0.3125 dB. Same sum, same
+    // sample mean; the SAMPLE maximum differs by construction and is what `Max` is for.
+    const int windows = 100, loud = 20;
+    const double spike = 60.0, flat = spike / (double) W;
+    const auto build = [&] (bool clicks, GainReductionStats& s, dynamics::offline::QuantileHistogram& h)
+    {
+        if (! h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01)) return false;
+        GainReductionSummariser g (h, W, 0.1);
+        for (int w = 0; w < windows; ++w)
+            for (long long i = 0; i < W; ++i)
+                g.add (w < loud ? (clicks ? (i == 0 ? spike : 0.0) : flat) : 0.0);
+        s = g.finish (0.95);
+        return true;
+    };
+    GainReductionStats sc, sq;
+    dynamics::offline::QuantileHistogram hc, hq;
+    if (! test::run (build (true, sc, hc)) || ! test::run (build (false, sq, hq))) return;
+
+    test::ok (sc.valid && sq.valid && sc.frames == (std::uint64_t) (windows * W) && sq.frames == sc.frames,
+              "both traces are measurements over the same " + std::to_string (sc.frames) + " tap samples");
+    test::approx (sc.meanDb, sq.meanDb, 1.0e-12, "and carry the same MEAN |GR| — the fixtures differ only in spread");
+    test::ok (sc.maxDb > 59.0 && std::fabs (sq.maxDb - flat) < 1.0e-12,
+              "the sample MAXIMUM separates them, as a sample statistic must (" + std::to_string (sc.maxDb)
+              + " dB against " + std::to_string (sq.maxDb) + ")");
+
+    // 20 of 100 windows carry anything, so the 0.95 quantile sits inside the loud fifth in BOTH, and the clicks'
+    // windows average the same 0.3125 dB the squeeze holds: at every q the two agree. What must NOT happen is the
+    // clicks reading like a 60 dB reduction, which a sample-wise quantile at q = 0.999 does.
+    double qc = 0.0, qq = 0.0;
+    test::ok (hc.quantile (0.95, qc) && hq.quantile (0.95, qq), "both 0.95 quantiles are answerable");
+    test::approx (sc.p95Db, sq.p95Db, 0.011, "the p95 of the clicks and of the steady squeeze agree to a bin ("
+                  + std::to_string (sc.p95Db) + " against " + std::to_string (sq.p95Db) + ")");
+    test::ok (sc.p95Db < 1.0, "and neither reads the click's height: the p95 is " + std::to_string (sc.p95Db)
+                              + " dB, not " + std::to_string (spike));
+
+    // THE OTHER HALF OF THE CLAIM: the same 20 windows held at ten times the level move the percentile tenfold.
+    {
+        dynamics::offline::QuantileHistogram h;
+        if (! test::run (h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01))) return;
+        GainReductionSummariser g (h, W, 0.1);
+        for (int w = 0; w < windows; ++w)
+            for (long long i = 0; i < W; ++i) g.add (w < loud ? 10.0 * flat : 0.0);
+        const GainReductionStats s = g.finish (0.95);
+        test::ok (s.valid && s.p95Db > 9.0 * sq.p95Db,
+                  "ten times the sustained reduction is ten times the p95 (" + std::to_string (s.p95Db)
+                  + " against " + std::to_string (sq.p95Db) + ")");
+    }
+
+    // THE LAST WINDOW IS SHORT AND IS AVERAGED OVER ITS OWN LENGTH, not over W — and it is an entry like any
+    // other. Two full windows of 0 dB and a trailing HALF window of 8 dB: three entries, the last one 8, so the
+    // 0.95 quantile is 8 and the 0.5 quantile is 0.
+    {
+        dynamics::offline::QuantileHistogram h;
+        if (! test::run (h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01))) return;
+        GainReductionSummariser g (h, W, 0.1);
+        for (long long i = 0; i < 2 * W; ++i) g.add (0.0);
+        for (long long i = 0; i < W / 2; ++i) g.add (8.0);
+        const GainReductionStats s = g.finish (0.95);
+        double hi = 0.0, mid = 0.0;
+        test::ok (h.count() == 3u && h.quantile (0.95, hi) && h.quantile (0.5, mid),
+                  "a partial last window is an entry: " + std::to_string (h.count()) + " entries for 2.5 windows");
+        test::approx (hi, 8.0, 0.011, "and it carries its own mean, 8 dB, not 8/2");
+        test::approx (mid, 0.0, 0.011, "while the median is still the silence");
+        test::approx (s.meanDb, 8.0 * 0.5 / 2.5, 1.0e-12, "the sample MEAN is over samples and is unmoved by the window");
+    }
+
+    // THE DENOMINATOR IS THE WHOLE PROGRAMME. The same 20 loud windows inside 100 and inside 1000: a reduction
+    // in the first, silence in the second. A denominator counting only the windows the stage worked in would
+    // read one number for both.
+    {
+        dynamics::offline::QuantileHistogram h;
+        if (! test::run (h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01))) return;
+        GainReductionSummariser g (h, W, 0.1);
+        for (int w = 0; w < 1000; ++w)
+            for (long long i = 0; i < W; ++i) g.add (w < loud ? flat : 0.0);
+        const GainReductionStats s = g.finish (0.95);
+        test::ok (s.valid && s.p95Db <= 0.011 && sq.p95Db > 0.3,
+                  "20 loud windows in 1000 put the p95 in the silence (" + std::to_string (s.p95Db)
+                  + "), the same 20 in 100 do not (" + std::to_string (sq.p95Db) + ")");
+    }
+
+    // `quantileDb` is the number a limit is judged by, read at `quantileQ`.
+    {
+        dynamics::offline::QuantileHistogram h;
+        if (! test::run (h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01))) return;
+        GainReductionSummariser g (h, W, 0.1);
+        for (int w = 0; w < windows; ++w)
+            for (long long i = 0; i < W; ++i) g.add (w < loud ? flat : 0.0);
+        const GainReductionStats s = g.finish (0.5);
+        double want = 0.0;
+        test::ok (h.quantile (0.5, want) && core::exactlyEqual (s.quantileDb, want) && core::exactlyEqual (s.quantileQ, 0.5),
+                  "`quantileDb` is the distribution's own answer at `quantileQ`");
+        GainReductionLimit lim; lim.limitDb = 1.0; lim.statistic = GrStatistic::Percentile; lim.quantile = 0.5;
+        test::ok (core::exactlyEqual (grStatisticValue (s, lim), s.quantileDb),
+                  "and it is what a Percentile limit reads");
+        lim.statistic = GrStatistic::P95;
+        test::ok (core::exactlyEqual (grStatisticValue (s, lim), s.p95Db), "while P95 still reads the 0.95 quantile");
+    }
+    {
+        // Everything past the histogram's top: no quantile is answerable, and the stats say so rather than
+        // reporting the top of the range.
+        dynamics::offline::QuantileHistogram h;
+        if (! test::run (h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01))) return;
+        GainReductionSummariser g (h, W, 0.1);
+        for (long long i = 0; i < W; ++i) g.add (TargetLoudnessSolver::kGrRangeDb + 10.0);
+        const GainReductionStats s = g.finish (0.5);
+        test::ok (! s.valid && s.aboveRange == 1u && std::isnan (s.quantileDb),
+                  "a window past the histogram's top: not a measurement, counted, and the quantile is NaN");
+        GainReductionLimit lim; lim.limitDb = 1.0; lim.statistic = GrStatistic::Percentile; lim.quantile = 0.5;
+        test::ok (! (grStatisticValue (s, lim) > lim.limitDb),
+                  "and an unanswerable quantile is not a violation: every comparison against NaN is false");
+    }
+    {
+        // ONE window past the top out of a hundred, which is the case the block above cannot reach: the p95 is
+        // still answerable — rank 95 of 100 lands in range — while q = 1 asks for the overflow and does not.
+        // A `quantileDb` written from the failed call's untouched output would read 0 dB here, a plausible
+        // number for a render that reduced 300, and no other fixture in this file can tell those apart.
+        dynamics::offline::QuantileHistogram h;
+        if (! test::run (h.prepare (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01))) return;
+        GainReductionSummariser g (h, W, 0.1);
+        for (int w = 0; w < 100; ++w)
+            for (long long i = 0; i < W; ++i) g.add (w == 99 ? TargetLoudnessSolver::kGrRangeDb + 10.0 : 3.0);
+        const GainReductionStats s = g.finish (1.0);
+        double p = 0.0, top = 0.0;
+        test::ok (s.valid && s.aboveRange == 1u && h.quantile (0.95, p) && ! h.quantile (1.0, top),
+                  "PRECONDITION: the p95 is answerable and q = 1 is not");
+        test::approx (s.p95Db, 3.0, 0.011, "the p95 is the reduction the render actually made");
+        test::ok (std::isnan (s.quantileDb),
+                  "and `quantileDb` at the unanswerable q is NaN, not the 0 dB an untouched output would leave ("
+                  + std::to_string (s.quantileDb) + ")");
+        GainReductionLimit lim; lim.limitDb = 1.0; lim.statistic = GrStatistic::Percentile; lim.quantile = 1.0;
+        test::ok (! (grStatisticValue (s, lim) > lim.limitDb),
+                  "so a 1 dB Percentile limit at that q is not a violation, where a 0 would have said `kept`");
+    }
+}
+
+// =============================================================================================
+// THE PERCENTILE AS A LIMIT, end to end, and the reading that goes with it: a `Percentile` limit at q = 0.95 is
+// an alias of `P95` on the same render, and `grQuantile` at the limit's own q is the number the limit was
+// judged by.
+static void testThePercentileLimitAndItsReadBack()
+{
+    test::group ("a Percentile limit at 0.95 IS the P95 limit, and the read-back is what it was judged by");
+    Programme src = makeMusic (4.0, 0.34);
+    const auto run = [&] (GrStatistic st, double q, double limitDb, LoudnessSolution& sol, Programme& dst)
+    {
+        Rig rig;
+        if (! rig.build (2)) return false;
+        dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -9.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 5;
+        req.limiterGr.limitDb = limitDb; req.limiterGr.statistic = st; req.limiterGr.quantile = q;
+        sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        return true;
+    };
+    LoudnessSolution a, b;
+    Programme da, db;
+    if (! test::run (run (GrStatistic::P95, 0.95, 1.0, a, da)) || ! test::run (run (GrStatistic::Percentile, 0.95, 1.0, b, db))) return;
+    bool same = a.status == b.status && a.passes == b.passes
+             && core::exactlyEqual (a.preLimiterGainDb, b.preLimiterGainDb)
+             && core::exactlyEqual (a.ceilingDbTp, b.ceilingDbTp);
+    for (std::size_t c = 0; same && c < da.ch.size(); ++c)
+        same = std::memcmp (da.ch[c].data(), db.ch[c].data(), da.ch[c].size() * sizeof (float)) == 0;
+    test::ok (same, "P95 and Percentile at q = 0.95: the same search, the same audio, bit for bit ("
+                    + std::string (statusName (a.status)) + ", " + std::to_string (a.passes) + " renders)");
+    test::ok (a.measured.limiter.valid && core::exactlyEqual (a.measured.limiter.p95Db, b.measured.limiter.quantileDb),
+              "and the two read one number: p95 " + std::to_string (a.measured.limiter.p95Db));
+
+    // A LOWER FRACTION IS A LOOSER LIMIT on the same trace.
+    LoudnessSolution lo; Programme dlo;
+    if (! test::run (run (GrStatistic::Percentile, 0.5, 1.0, lo, dlo))) return;
+    test::ok (lo.measured.limiter.valid && lo.measured.limiter.quantileDb <= lo.measured.limiter.p95Db,
+              "the 0.5 quantile of the same render is at or under its 0.95 (" + std::to_string (lo.measured.limiter.quantileDb)
+              + " against " + std::to_string (lo.measured.limiter.p95Db) + ")");
+
+    // THE READ-BACK IS THE JUDGE'S OWN NUMBER — the same bits, at the limit's q and at every other, on both
+    // stages.
+    int bad = 0;
+    for (const double q : { 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0 })
+    {
+        double v = 0.0;
+        if (! b.grQuantile (GrStage::Limiter, q, v)) ++bad;
+        if (! b.grQuantile (GrStage::Compressor, q, v)) ++bad;
+    }
+    double judged = 0.0;
+    test::ok (bad == 0 && b.grQuantile (GrStage::Limiter, 0.95, judged)
+              && core::exactlyEqual (judged, b.measured.limiter.quantileDb),
+              "grQuantile answers at seven fractions on both stages, and at the limit's own it IS the judged number");
+
+    // THE REFUSALS, and `outDb` untouched by every one of them.
+    double sink = 12345.0;
+    const bool refused = ! b.grQuantile (GrStage::Limiter, 0.0, sink)
+                      && ! b.grQuantile (GrStage::Limiter, -0.5, sink)
+                      && ! b.grQuantile (GrStage::Limiter, 1.5, sink)
+                      && ! b.grQuantile (GrStage::Limiter, std::numeric_limits<double>::quiet_NaN(), sink)
+                      && ! b.grQuantile (GrStage::Limiter, std::numeric_limits<double>::infinity(), sink)
+                      && ! b.grQuantile (GrStage::Limiter, -std::numeric_limits<double>::infinity(), sink);
+    test::ok (refused && core::exactlyEqual (sink, 12345.0),
+              "q outside (0, 1], and every non-finite q, are refused and write nothing");
+    {
+        LoudnessSolution none;                                  // no render: nothing to answer from
+        double v = 7.0;
+        test::ok (! none.grQuantile (GrStage::Limiter, 0.5, v) && ! none.grQuantile (GrStage::Compressor, 0.5, v)
+                  && core::exactlyEqual (v, 7.0),
+                  "a solution that rendered nothing refuses every quantile and writes nothing");
+    }
+
+    // A REQUEST WITH A `q` OUTSIDE (0, 1] IS `InvalidRequest`, whatever the statistic — one rule for the field —
+    // and it is reached before any pass.
+    for (const double q : { 0.0, -0.1, 1.0000001, std::numeric_limits<double>::quiet_NaN(),
+                            std::numeric_limits<double>::infinity() })
+        for (int which = 0; which < 2; ++which)
+        {
+            Rig rig; if (! test::run (rig.build (2))) return;
+            Programme dst; dst.ch = src.ch; dst.bind();
+            LoudnessRequest req;
+            req.targetLufs = -12.0; req.maxTruePeakDbTp = -1.0;
+            (which == 0 ? req.limiterGr.quantile : req.compressorGr.quantile) = q;
+            const long long before = alloc::count.load();
+            const auto s = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+            const long long allocs = alloc::count.load() - before;
+            test::ok (s.status == MasteringSolveStatus::InvalidRequest && s.passes == 0 && allocs == 0,
+                      std::string (which == 0 ? "limiterGr" : "compressorGr") + ".quantile = " + std::to_string (q)
+                      + ": InvalidRequest before any pass, nothing allocated");
+        }
+    // ... and q = 1 is INSIDE the interval: the interval is half-open at 0, not at 1.
+    {
+        LoudnessSolution one; Programme done;
+        if (! test::run (run (GrStatistic::Percentile, 1.0, 100.0, one, done))) return;
+        // q = 1 is the largest WINDOW mean, which sits between the 0.95 quantile and the largest SAMPLE — the
+        // two bases again, and the reason it is not the sample maximum is the averaging inside the window.
+        double top = 0.0;
+        test::ok (one.status != MasteringSolveStatus::InvalidRequest && one.measured.limiter.valid
+                  && one.grQuantile (GrStage::Limiter, 1.0, top)
+                  && core::exactlyEqual (top, one.measured.limiter.quantileDb)
+                  && top >= one.measured.limiter.p95Db && top <= one.measured.limiter.maxDb,
+                  "q = 1 is admitted and is the largest WINDOW mean: " + std::to_string (top) + " dB, between the p95 "
+                  + std::to_string (one.measured.limiter.p95Db) + " and the sample maximum "
+                  + std::to_string (one.measured.limiter.maxDb));
+    }
+}
+
+// =============================================================================================
+// THE DEFAULTS. `q` defaults to 0.95 and the statistic to `Max`, so a `q` nothing reads may move no bit of the
+// render and no reported statistic.
+static void testTheDefaultQuantileChangesNothing()
+{
+    test::group ("the default request: q is 0.95, the statistic is Max, and moving q changes no bit of the render");
+    const LoudnessRequest d;
+    test::ok (core::exactlyEqual (d.limiterGr.quantile, 0.95) && core::exactlyEqual (d.compressorGr.quantile, 0.95)
+              && d.limiterGr.statistic == GrStatistic::Max && d.compressorGr.statistic == GrStatistic::Max,
+              "PRECONDITION: the defaults are Max at q = 0.95");
+    Programme src = makeMusic (3.0, 0.4);
+    const auto render = [&] (double q, LoudnessSolution& sol, Programme& dst)
+    {
+        Rig rig;
+        if (! rig.build (2)) return false;
+        dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -11.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 5;
+        req.limiterGr.quantile = q; req.compressorGr.quantile = q;      // the statistics stay Max
+        sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        return true;
+    };
+    LoudnessSolution a, b;
+    Programme da, db;
+    if (! test::run (render (0.95, a, da)) || ! test::run (render (0.17, b, db))) return;
+    bool same = a.status == b.status && a.passes == b.passes
+             && core::exactlyEqual (a.preLimiterGainDb, b.preLimiterGainDb)
+             && core::exactlyEqual (a.ceilingDbTp, b.ceilingDbTp)
+             && core::exactlyEqual (a.measured.limiter.p95Db, b.measured.limiter.p95Db)
+             && core::exactlyEqual (a.measured.limiter.maxDb, b.measured.limiter.maxDb);
+    for (std::size_t c = 0; same && c < da.ch.size(); ++c)
+        same = std::memcmp (da.ch[c].data(), db.ch[c].data(), da.ch[c].size() * sizeof (float)) == 0;
+    test::ok (same, "a `q` nothing reads moves no bit of the render and no reported statistic ("
+                    + std::string (statusName (a.status)) + ", " + std::to_string (a.passes) + " renders)");
+    test::ok (! core::exactlyEqual (a.measured.limiter.quantileDb, b.measured.limiter.quantileDb),
+              "PRECONDITION: the field WAS read — the reported quantile moved with it ("
+              + std::to_string (a.measured.limiter.quantileDb) + " against " + std::to_string (b.measured.limiter.quantileDb) + ")");
+}
+
+// =============================================================================================
+// THE BRACKET RESCUE, on its own case: a start above the boundary of a limit that grows with drive, and a target
+// that stays above it, so the search converges on the target and every render it makes breaks the limit. The
+// claim is that when `TargetUnreachable` names a constraint, the render handed back HOLDS it.
+static void testTheDeliveredRenderHoldsTheNamedLimit()
+{
+    test::group ("a warm start above a gain-reduction limit: the delivered render holds the limit it names");
+    struct Row { const char* what; int kind; double target, limitDb, startDb; GrStatistic st; double q; };
+    // `kind` picks the generator INSIDE the loop: a `Programme` holds cached plane pointers into its own
+    // vectors, so one copied into a table describes storage that no longer exists.
+    const auto make = [] (int kind)
+    {
+        switch (kind)
+        {
+            case 1:  return makeMusic (4.0, 0.30, 777u, 2.4);
+            case 2:  return makeWideRange (5.0);
+            case 3:  return makeTone ((int) (2.0 * kFs), 2, 0.5);
+            default: return makeMusic (4.0, 0.42, 4242u);
+        }
+    };
+    const Row rows[] {
+        { "dense music, Max 1 dB",     0, -8.0, 1.0, 20.0, GrStatistic::Max,        0.95 },
+        { "dense music, p95 0.5 dB",   0, -8.0, 0.5, 20.0, GrStatistic::P95,        0.95 },
+        { "sparser music, Max 1 dB",   1, -10.0, 1.0, 20.0, GrStatistic::Max,       0.95 },
+        { "wide-range, q = 0.8",       2, -8.0, 0.5, 20.0, GrStatistic::Percentile, 0.8  },
+        { "a 1 kHz tone, Mean 0.5 dB", 3, -3.0, 0.5, 20.0, GrStatistic::Mean,       0.95 },
+    };
+    for (const Row& r : rows)
+    {
+        Programme src = make (r.kind);
+        Rig rig; if (! test::run (rig.build (src.nch()))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = r.target; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4;
+        req.initialGainDb = r.startDb;
+        req.limiterGr.limitDb = r.limitDb; req.limiterGr.statistic = r.st; req.limiterGr.quantile = r.q;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(),
+                                           src.nch(), src.frames(), req);
+        const std::string at = std::string (r.what) + ": ";
+        // PRECONDITIONS, both of them: the warm start really is above the boundary, and the target really does
+        // need more limiting than the limit allows. Without the second the search finds its own way back under
+        // the limit and the row proves nothing about the rescue.
+        test::ok (sol.logCount > 0
+                  && (sol.log[0].violated & constraintBit (MasteringConstraint::LimiterGainReduction)) != 0u,
+                  "PRECONDITION: " + at + "the warm start breaks the limit");
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable
+                  && sol.binding == MasteringConstraint::LimiterGainReduction,
+                  at + "the verdict names the limiter's gain reduction (" + statusName (sol.status) + "/"
+                     + constraintName (sol.binding) + ")");
+        const double held = grStatisticValue (sol.measured.limiter, req.limiterGr);
+        test::ok (sol.measured.limiter.valid && held <= req.limiterGr.limitDb,
+                  at + "and the DELIVERED render holds it: " + std::to_string (held) + " dB against a limit of "
+                     + std::to_string (r.limitDb));
+        // The audio in `out` is the audio the report describes.
+        const Independent ind = measureIndependently (dst.ch);
+        test::ok (std::fabs (ind.I - sol.measured.integratedLufs) < 0.01 && ind.TP <= req.maxTruePeakDbTp,
+                  at + "the buffer handed back IS that render (" + std::to_string (ind.I) + " against "
+                     + std::to_string (sol.measured.integratedLufs) + " LUFS), and under the promise");
+        std::printf ("      %-28s %s/%s  %d renders, GR %.4f dB <= %.2f, I %.3f\n", r.what, statusName (sol.status),
+                     constraintName (sol.binding), sol.passes, held, r.limitDb, sol.measured.integratedLufs);
+    }
+
+    // AND IT COSTS ONE RENDER, ONLY THERE: the same programme and target with the limit switched OFF runs the
+    // search it always ran.
+    {
+        Programme src = makeMusic (4.0, 0.42, 4242u);
+        const auto go = [&] (bool limited, LoudnessSolution& sol, Programme& dst)
+        {
+            Rig rig; if (! rig.build (2)) return false;
+            dst.ch = src.ch; dst.bind();
+            LoudnessRequest req;
+            req.targetLufs = -8.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4; req.initialGainDb = 20.0;
+            if (limited) req.limiterGr.limitDb = 1.0;
+            sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+            return true;
+        };
+        LoudnessSolution plain, limited; Programme dp, dl;
+        if (! test::run (go (false, plain, dp)) || ! test::run (go (true, limited, dl))) return;
+        test::ok (plain.passes > 0 && plain.passes <= 4,
+                  std::string ("PRECONDITION: without the limit the same request runs ") + std::to_string (plain.passes)
+                  + " renders (" + statusName (plain.status) + ")");
+        test::ok (limited.passes == plain.passes + 1 && limited.status == MasteringSolveStatus::TargetUnreachable,
+                  "the rescue is exactly one render more than the search that did not need it ("
+                  + std::to_string (limited.passes) + " against " + std::to_string (plain.passes) + ")");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
@@ -3831,5 +4259,9 @@ int main()
     testTheRateFloor();
     testTheBudgetsRefuseWhatTheCallsRefuse();
     testTheBoundIsTheSearchsLimit();
+    testThePercentileIsAWindowAndNotASample();
+    testThePercentileLimitAndItsReadBack();
+    testTheDefaultQuantileChangesNothing();
+    testTheDeliveredRenderHoldsTheNamedLimit();
     return felitronics::test::report();
 }

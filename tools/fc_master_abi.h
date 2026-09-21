@@ -97,6 +97,8 @@ extern "C" {
 // — one row. v6: the limiter's dual release (`fc_master_params`, `fc_master_resolved`), `grTraceBuckets`
 // (`fc_loudness_request`), `fc_solution_gr_trace64` and `fc_master_need_solve` — three rows, two entry points.
 // v7: `fc_master_eq_curve` — one entry point, no struct, and therefore no row.
+// v8: the gain-reduction PERCENTILE — the `q` each limit binds at the end of `fc_loudness_request` (one row) and
+// `fc_solution_gr_quantile`, the general read-back that replaces a fixed field per fraction.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -171,7 +173,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 7u
+#define FC_MASTER_ABI_VERSION 8u
 
 typedef struct fc_header
 {
@@ -315,7 +317,23 @@ typedef enum fc_gr_stage { FC_GR_STAGE_COMPRESSOR = 0, FC_GR_STAGE_LIMITER = 1 }
 
 // Mirrors mastering::GrStatistic. Which statistic a gain-reduction limit binds is part of the limit's
 // TYPE and never a hidden convention.
-typedef enum fc_gr_statistic { FC_GR_MEAN = 0, FC_GR_P95 = 1, FC_GR_MAX = 2 } fc_gr_statistic;
+//
+// FC_GR_PERCENTILE (v8) reads the fraction in `fc_loudness_request`'s `limiterGrQuantile` /
+// `compressorGrQuantile` — there and not in `fc_gr_limit`, which is nested BY VALUE and may never grow (rule 3).
+typedef enum fc_gr_statistic
+{
+    FC_GR_MEAN = 0, FC_GR_P95 = 1, FC_GR_MAX = 2, FC_GR_PERCENTILE = 3
+} fc_gr_statistic;
+
+// WHAT A GAIN-REDUCTION QUANTILE IS, once. |GR| is averaged over a fixed 4 ms WINDOW and the quantile is taken
+// over those windows — one entry per window of the WHOLE programme, the last one over its own length, the silent
+// ones counted like any other. So a chain of single clicks does not move it and a sustained reduction does. The
+// window is fixed in the core and is not a knob: it is part of what the number means.
+//   * `p95Db` in `fc_gr_stats` is that distribution's 0.95 quantile;
+//   * an FC_GR_PERCENTILE limit is judged on the same distribution at its own `q`;
+//   * `fc_solution_gr_quantile` answers from the same distribution at any `q`, so a reading and the limit it is
+//     read against are the same number.
+// `FC_GR_MEAN` and `FC_GR_MAX` are SAMPLE statistics and are not windowed.
 
 //==============================================================================
 // TOPOLOGY — fixed for the life of a handle
@@ -670,6 +688,14 @@ typedef struct fc_loudness_request
     // Buckets per gain-reduction trace: min(grTraceBuckets, programme frames). 1..65536, else the core's InvalidRequest.
     int32_t grTraceBuckets;
     int32_t _pad0;                  // written 0
+
+    // ---- v8 ----
+    // The fraction an FC_GR_PERCENTILE limit binds, one per stage. In (0, 1] and finite, else the core's
+    // InvalidRequest — WHATEVER the statistic, so the field has one rule rather than one per statistic. The
+    // default is 0.95, which makes an FC_GR_PERCENTILE limit an FC_GR_P95 one, and is what a request older than
+    // v8 is read with.
+    double  limiterGrQuantile;
+    double  compressorGrQuantile;
 } fc_loudness_request;
 
 typedef struct fc_solve_pass
@@ -680,6 +706,10 @@ typedef struct fc_solve_pass
     uint32_t violated;              // bitmask over (1 << (fc_constraint - 1))
 } fc_solve_pass;
 
+// `mastering::GainReductionStats`, field for field. TWO BASES: `meanDb`, `maxDb` and `activeFraction` are over
+// tap SAMPLES, `p95Db` is the 0.95 quantile of the 4 ms WINDOW distribution (see fc_gr_statistic), and
+// `aboveRange` counts WINDOWS past the histogram's top — the count that makes a quantile unanswerable. Nested by
+// value and therefore FROZEN (rule 3): a quantile at any other fraction comes from `fc_solution_gr_quantile`.
 typedef struct fc_gr_stats
 {
     double   meanDb, p95Db, maxDb, activeFraction;
@@ -761,6 +791,7 @@ typedef enum fc_struct_id
         X(FC_STRUCT_NEED,         1,       40)    \
         X(FC_STRUCT_REQUEST,      1,      120)    \
         X(FC_STRUCT_REQUEST,      6,      128)    \
+        X(FC_STRUCT_REQUEST,      8,      144)    \
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
         X(FC_STRUCT_MEASUREMENT,  4,      224)    \
         X(FC_STRUCT_SUMMARY,      1,       88)
@@ -1103,6 +1134,17 @@ fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint
 fc_status fc_solution_gr_trace (fc_solution s, int32_t stage, fc_gr_trace_bucket* out, uint32_t cap, uint32_t* written);
 // v6 — `fc_solution_gr_trace` into `fc_gr_trace_bucket64`, without the 32-bit check.
 fc_status fc_solution_gr_trace64 (fc_solution s, int32_t stage, fc_gr_trace_bucket64* out, uint32_t cap, uint32_t* written);
+// v8 — the q-quantile of a stage's |GR| over the audio this solution handed back, BY THE DEFINITION ITS LIMITS
+// WERE JUDGED BY (see fc_gr_statistic): a reading at the same `q` as an FC_GR_PERCENTILE limit is that limit's own
+// number, to the bit. `stage` is an fc_gr_stage, as for the trace; `q` is in (0, 1] and finite.
+//
+// Checks in the header's order: poison, the handle, `outDb` (null, 8-byte alignment, the span in the heap), then the
+// field values — `stage`, FC_ERR_ENUM for a code that names no stage, then `q`, FC_ERR_NON_FINITE for a NaN or an
+// infinity and FC_ERR_RANGE for a finite `q` outside (0, 1]. FC_ERR_REFUSED_BY_CORE where the distribution cannot
+// answer: a stage whose statistics are not a measurement (`fc_gr_stats::valid` 0 — no render, a poisoned tap, an
+// empty window) or a quantile lying past the top of the histogram (`fc_gr_stats::aboveRange`). `*outDb` is written
+// only on FC_OK, and a refusal leaves it exactly as it was.
+fc_status fc_solution_gr_quantile (fc_solution s, int32_t stage, double q, double* outDb);
 fc_status fc_solution_destroy (fc_solution s);
 
 // THE CORE'S OWN DEFAULTS, written through the same mapping every other value crosses by.
