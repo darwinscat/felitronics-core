@@ -5,6 +5,160 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.39.0 — 2026-09-21
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### tools — every enum code and every field domain of the mastering ABI, published once and held against real calls
+
+**No ABI change.** `FC_MASTER_ABI_VERSION` stays 8 and no struct moves: what follows is metadata a page reads
+out of `tools/wasm/fc-master-layout.mjs`, beside the layouts that already live there.
+
+**Ten enum lists, all of them.** `FC_FILTER_TYPE`, `FC_DETECTOR`, `FC_LINK_MODE`, `FC_COMP_MODE`, `FC_SHAPE`,
+`FC_NOISE_SHAPING`, `FC_GR_STATISTIC` (with `Percentile`), `FC_GR_STAGE` and `FC_PROGRESS_STAGE` join
+`FC_EQ_AXIS`, each an array whose INDEX is the code, and `FC_ENUMS` says which header enum each one mirrors.
+`layout-check.mjs` reads the enumerators out of `tools/fc_master_abi.h` and compares every list entry by entry
+— declaration order, value and letters — so a code added, renumbered or permuted in the header fails there
+instead of silently renaming a menu. Consumers held five of these by hand and had just drifted on the sixth.
+
+**`FC_DOMAINS` — 89 rows, one per input field** of `fc_master_config`, `fc_master_params` (the EQ bands, the
+mono bass, the compressor, the clipper, the limiter and the dither) and `fc_loudness_request`. Each row carries
+the unit, the admitted interval, what a value outside it does — `refuse` with the FC_ERR_* that names it,
+`clamp`, `verdict` (`fc_master_solve` answers FC_OK and the SUMMARY carries `FC_SOLVE_INVALID_REQUEST`), `free`
+where the code bounds nothing and only finiteness is checked, or `any` — what a non-finite value does, where
+the applied value can be read back, and what the domain depends on. Bounds that move with the sample rate are
+written as `0.49*sr` / `8000/sr` and evaluated by `domainBound (bound, sampleRate)`; the four that depend on
+another FIELD say so rather than averaging (the mono-bass stage narrows the width to exactly 2; the oversample
+factor stops at 16 with the limiter, 64 with the clipper alone and nowhere with neither; the compressor's
+250 ms lookahead ceiling is that stage's own). **Silent clamps are marked**, because the difference decides an
+interface: a refusal arrives on the call that made it, a clamp arrives as nothing at all. No field of this ABI
+has a list-valued domain — `oversampleFactor` admits every integer in its interval and `dither.bits` refuses
+nothing — and the table says so instead of inventing one. Bounds that move with the oversample factor as well
+as the rate are written `0.49*sr*os`, and `domainBound (bound, sampleRate, oversampleFactor)` evaluates all
+three forms. `layout-check.mjs` holds the table against the struct layouts in both directions: a row must name
+a value field that exists, and EVERY input field of the three structs must have a row, so a field added in a
+later version cannot arrive without a domain.
+
+**`FC_CONSTRAINT_BITS` and `constraintsOf (mask)`** — `fc_solution_summary.alsoViolated` is a bitmask whose bit
+`i` is `FC_CONSTRAINT[i + 1]`, with `binding` included in it. The list is derived from `FC_CONSTRAINT` rather
+than written out, and `layout-check.mjs` holds the core's `constraintBit()` expression against what it assumes;
+`fc_constraint` and `fc_solve_status` join the enums pinned to the header, and a reordering of the C++
+`MasteringConstraint` behind them is already a build error in the facade's static asserts.
+
+**Two rows the first draft got wrong, both found by review and both reproduced through the ABI before they were
+changed.** `initialGainDb` said "no bound"; the search clamps the starting gain to the chain's own ±60 dB
+before its first render, and at `maxPasses = 1` a request of 100 comes back as 60 in the summary — so the row
+is a clamp now, read back through `summary.preLimiterGainDb`. `clipper.dcBlockHz` said it had no ceiling; the
+corner is clamped to `0.49*sr*os`, measured as 100000 Hz applying as 94080 at 48 kHz and 4×.
+
+**`felitronics_master_domains_tests`** holds the table against the running ABI with a real C-ABI call per
+bound, at two sample rates for every rate-dependent row. The table is the test's ARGUMENT and every probe is
+derived from its own numbers, so a bound moved there without the code moving with it lands on the wrong side of
+the real boundary. A clamp is pinned by READING BACK what was applied — `fc_master_resolved` where it publishes
+one, `fc_master_eq_curve` for the EQ lane fields, the rendered audio for the rest — and asserting that the value
+at the bound and beyond it are the same number while one step inside it is a different one; acceptance alone
+would pass against a clamp anywhere at all. A refusal is probed twice — one step out and WELL out — because a
+bound moved INWARDS still refuses one step past itself, and that near probe alone could not tell a delivery
+floor of 8000 Hz from one of 22050.
+
+**The step is the RESOLUTION OF WHAT ANSWERS, not a fixed fraction.** A whole number steps by 1; a status is
+sharp, so a refusal steps by a billionth; a read-back is not, and each field states its own (`stepRel` /
+`stepAbs`) — which is how tightly that bound is pinned. Where a bound is unreachable at ordinary settings the
+field also states the parameter set that reaches it: the compressor's 400 dB range cap needs a threshold far
+under the programme, the time constants need a step above the point where the ballistics stop being
+distinguishable from instant, and the dither has to be off wherever the quantiser step is coarser than the
+probe.
+
+**The four `eqBands[].dyn` rows cannot be pinned here, and the reason is now a checked fact.** `eq::EqBand`
+applies a delta that a producer pushes in through `setLaneDeltaDb`, and the engine the mastering chain drives
+has none — so those fields are carried and clamped and change nothing this ABI renders. A named check renders
+with the band dynamics armed and with `dyn.on` cleared and requires the two to be identical; if a producer is
+ever wired in, that check goes red and the four rows become pinnable like any other clamp. They are the whole
+of the list the run prints of clamps nothing can pin.
+
+1280 checks; a planted-mutation round over the table killed 56 of 59, and all three survivors are a row DEMOTED
+to a weaker claim, which the suite's header names as what it does not catch. Sixteen more planted violations —
+an enum permuted in the header, a list shortened, a row naming a field that no longer exists, an input field
+with no row, `constraintBit()` rewritten — are all caught by `layout-check.mjs`.
+
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
+### mastering · tools — the gain-reduction percentile, a general quantile read-back, and a bound that is a guarantee; C ABI v8
+
+**A gain-reduction quantile is a WINDOW statistic now — a behaviour change, and `p95Db` moves with it.**
+`GainReductionStats::p95Db` used to be the 0.95 quantile over tap SAMPLES; it is now the 0.95 quantile over the
+programme cut into fixed 4 ms windows, each window contributing the MEAN `|GR|` over it (`GainReductionSummariser`,
+`kGrQuantileWindowSeconds`). A single click is averaged down inside its window and no longer moves a percentile; a
+sustained reduction does. The last window is short and is averaged over its own length, so it is an entry like any
+other, and EVERY window of the programme is an entry — the silent ones included, because the denominator of "the p95 of
+the gain reduction" is the programme and not the part of it the stage worked in. The window is fixed in the core and is
+not a request field: it is part of what the number means, and two callers with two windows would be comparing different
+quantities under one name. `GainReductionStats::aboveRange` therefore counts WINDOWS past the histogram's top.
+`meanDb`, `maxDb` and `activeFraction` are unchanged sample statistics, and `GrStatistic::Max` stays sample-wise.
+
+**`GrStatistic::Percentile`.** A fourth statistic beside `Mean`, `P95` and `Max`, with its fraction in
+`GainReductionLimit::quantile` — in (0, 1] and finite, else `InvalidRequest` before any pass, whatever the statistic.
+The default is 0.95, so a `Percentile` limit at its default is the `P95` limit, bit for bit. `grStatisticValue` is the
+one function that reads a statistic off a summary. `GainReductionStats::quantileDb` is the number the limit was
+judged by — NaN where the distribution cannot answer, which is "an unanswerable statistic is not a violation" in
+arithmetic rather than in a second branch.
+
+**`LoudnessSolution::grQuantile (stage, q, outDb)`.** The q-quantile of a stage's `|GR|`, read off the very
+distribution the limits were judged on, so a reading and its limit are the same number and a reading can say how close
+a render came. Each solution owns its two distributions (`compressorGrWindows`, `limiterGrWindows`), written by every
+render like the traces, so a later solve cannot move a number already reported. `solveBytes (…, binDb = 0.01)` and
+`DeliveredMastering::solveBytes (…, binDb)` count them: 640 016 B at the default bin width, making a 1 s stereo solve
+727 696 B against 87 680 B before.
+
+**`TargetUnreachable` now delivers a render that HOLDS the constraint it names.** `DriveBound` can only guarantee a
+limit that grows with drive once it has seen a render holding one — it brackets `ok`, the loudest render that broke
+nothing, under `cap`, the quietest that broke something. A search that started past the boundary and ended there never
+got an `ok`, and what came back was the gentlest BROKEN render carrying the broken limit's name. The search now spends
+ONE render at the drive the limiter idles at (`kIdleDriveMarginDb` under the engagement point, where the reduction is
+zero and zero holds any reduction limit), and then walks the bracket that render completes with whatever budget the
+search did not spend — `DriveBound::probe`, the same one the ordinary search uses — so what comes back is the LOUDEST
+render that holds the limit rather than the quietest. Measured on this tree, 0.40 to 0.81 LU above the idle point; on
+the three mixes this was built for, 0.4 to 1.8. It is all taken after the search, so a solve that finds its own
+holding render is unchanged render for render and bit for bit — the idle render included, which is why its ceiling
+moves only where the margin cannot absorb the meters' disagreement. With the budget exhausted the idle render is
+still what comes back: the one case where a quiet render is delivered on purpose, because the guarantee outranks the
+loudness.
+- `pairFor` is the one place a drive becomes a `(gain, ceiling)` pair: `d = g - c` and the two are clamped to ±60 dB
+  one number at a time, so a ceiling picked for the true-peak aim alone put the gain past its clamp and the drive
+  RENDERED was not the drive chosen. The ceiling is chosen for the drive, inside the window that keeps the gain in
+  range and at or under the promise; where that window is empty no pair expresses the drive and the rescue is not
+  taken. Where the window forces the ceiling up, the delivered peak can pass the promise — that is reported rather
+  than hidden (below).
+- The certifying meter does not read the peak the limiter aims at; `DriveBound::overshootAt` measures the
+  difference on the renders the search made (0.02 dB on this tree's music, 0.25 dB on a 15 kHz tone). Every PROBE
+  subtracts it from its ceiling, as the ordinary search does. The IDLE render subtracts it only where it exceeds
+  `truePeakAimDb`, the margin that exists to absorb it: below that size the ceiling is the aim exactly, because a
+  ceiling moved by a fraction of a margin that already covers it moves the render — and a `Solved` that render
+  reached becomes a `TargetUnreachable` a hair outside the tolerance.
+- A probe that breaks a limit the bracket is about is a FAILED probe: it moves `cap` and is not offered as the
+  render to deliver. `Best` ranks infeasible candidates by the worst excess across all constraints, so a reduction
+  broken by a millionth of a decibel ranked gentler than a peak broken by a tenth, and the render handed back broke
+  the very limit the verdict named.
+- `alsoViolated` now carries what the DELIVERED render breaks as well as what stopped the search. Where nothing
+  holds every constraint the render handed back breaks something of its own, and a caller told only why the search
+  stopped was not told its file is above the promise.
+- "The loudest render that holds the limit" is the contract only where the loudness is a measurement: renders under
+  the absolute gate all read the meter's -120 sentinel, tie, and the first one offered is kept.
+- A render taken aside need not have a measurable loudness: the reduction comes off the tap and the peak off the peak
+  meter, so a render under the absolute gate still holds the limit and is still the answer, though never `Solved`.
+  `violatedMask` and `worstExcess` no longer judge the peak-to-loudness ratio without one.
+- None of these renders enters `Best::nearest*`, so `binding` is read from `cap` — what was broken at the smallest
+  drive that broke anything, which the walk has just tightened — and the rest go into `alsoViolated`.
+The `TargetUnreachable` line in the header says all this instead of "the best FEASIBLE render".
+
+**C ABI v8.** `fc_loudness_request` gains `limiterGrQuantile` and `compressorGrQuantile` (144 B), defaulting to 0.95;
+at their defaults a call is v7's. `FC_GR_PERCENTILE = 3` joins `fc_gr_statistic`. `fc_solution_gr_quantile (s, stage,
+q, outDb)` answers the same distribution at any `q` — one entry point rather than a field per fraction — refusing with
+`FC_ERR_ENUM` for a stage code that names nothing, `FC_ERR_NON_FINITE` for a non-finite `q`, `FC_ERR_RANGE` for a
+finite `q` outside (0, 1] and `FC_ERR_REFUSED_BY_CORE` where the distribution cannot answer, and writing `*outDb` only
+on `FC_OK`. `fc-master-layout.mjs` is v8; `fcore_master` takes `limGrQ=`, `compGrQ=` and `percentile` for
+`limGrStat=` / `compGrStat=`.
+
 ## v0.38.0 — 2026-09-18
 
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
