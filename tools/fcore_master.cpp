@@ -194,7 +194,15 @@ bool applyBandKey (Args& a, const std::string& key, const std::string& val)
     if (f == "swept")  return parseBool (val, b.swept);
     if (f == "type")   return parseEnumName (val, kTypes, 9, b.type);
     if (f == "laneon") return parseBool (val, b.lanes[0].on);
+    // The point's dynamics. `dyn.range` carries the DIRECTION in its sign: negative cuts as the band
+    // gets loud, positive boosts. 0 is no dynamics whatever `dyn.on` says.
+    if (f == "dyn.on")      return parseBool (val, b.dyn.on);
+    if (f == "dyn.thrAuto") return parseBool (val, b.dyn.thrAuto);
     double d = 0.0; long i = 0;
+    if (f == "dyn.range") { if (! num (val, d)) return false; b.dyn.rangeDb = d; return true; }
+    if (f == "dyn.thr")   { if (! num (val, d)) return false; b.dyn.thrDb   = d; return true; }
+    if (f == "dyn.atk")   { if (! num (val, d)) return false; b.dyn.atk     = d; return true; }
+    if (f == "dyn.rel")   { if (! num (val, d)) return false; b.dyn.rel     = d; return true; }
     if (f == "freq")  { if (! num (val, d)) return false; b.lanes[0].freq   = d; return true; }
     if (f == "q")     { if (! num (val, d)) return false; b.lanes[0].q      = d; return true; }
     if (f == "gain")  { if (! num (val, d)) return false; b.lanes[0].gainDb = d; return true; }

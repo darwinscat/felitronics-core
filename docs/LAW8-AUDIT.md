@@ -231,7 +231,9 @@ would otherwise run the new topology on the old coefficients for up to 63 sample
 
 **Still per call, measured and left for their own pass** — same mechanism, different owners:
 `deesser::DeEsser` (1 735 samples of 336 000 slicing-dependent, worst 1.97e-17), `dynamiceq::DynamicEqBand`
-(5 844, worst 2.46e-16), `dynamiceq::LaneDynamics` (its 16-sample control grid restarts at every call),
+(5 844, worst 2.46e-16), `dynamiceq::LaneDynamics` (its 16-sample control grid restarts at every call —
+`mastering::MasteringChain`, which drives one per EQ band, always calls it with exactly the internal
+quantum, so that restart lands on the same absolute sample whatever the caller's block size),
 `dynamics::Compressor` / `NoiseGate` / `TransientShaper` (their followers), `multiband::MultibandProcessor`,
 `poweramp::PowerAmpStage`, `rigplayer::RigPlayer`, `limiter::TruePeakLimiter` (its internal chunk loop is
 anchored at the call, not at audio time), and the offline `EnvelopeAnalyzer` / `ThresholdSolver`, which

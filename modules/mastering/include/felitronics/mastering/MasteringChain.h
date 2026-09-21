@@ -8,6 +8,7 @@
 #include <felitronics/core/Math.h>
 #include <felitronics/dither/Dither.h>
 #include <felitronics/dynamics/Compressor.h>
+#include <felitronics/dynamiceq/LaneDynamics.h>
 #include <felitronics/eq/EqEngine.h>
 #include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/limiter/TruePeakLimiter.h>
@@ -203,6 +204,13 @@ struct MasteringChainResolved
 //     gate -> inputGain -> EQ -> [M/S mono-bass] -> compressor (opt. keyed, opt. parallel) -> [soft clipper]
 //          -> preLimiterGain -> true-peak limiter -> dither
 //
+// The EQ stage is `eq::EqEngine`'s band bank with `dynamiceq::LaneDynamics` driving each point's
+// per-lane delta seam, so `eqBands[].dyn` is live here: a point with `dyn.on` and a non-zero
+// `dyn.rangeDb` moves with the programme. It costs no latency and, with every point unarmed, renders
+// exactly as the engine's own band loop. The producer's 16-sample control grid restarts at every CALL
+// and is block-invariant here for the same reason every other stage is: the call is always the
+// internal quantum, so the restart lands on the same absolute sample whatever the caller does.
+//
 // Nothing here is new DSP. Every stage is a module that already ships and is already tested; this is
 // the composition, and the composition is where the defects live. `OfflineRenderer` is a thin wrapper
 // over this — "run to the end, flush, cut the latency" — and not the other way round, so a live
@@ -340,6 +348,10 @@ public:
     struct Storage
     {
         std::size_t fifo = 0, keyBuf = 0;              // floats — the quantum FIFO and the key-filter copy
+        // `dynamiceq::LaneDynamics` objects, one per EQ band — the EQ stage's dynamics producers. They are
+        // held in ONE array so the count is the whole of their cost: `LaneDynamics::prepare` asks the heap
+        // for nothing of its own, so the array is the stage's entire dynamics allocation. 0 without an EQ.
+        std::size_t dynBands = 0;
         bool eq = false, compressor = false, clipper = false, limiter = false;
         eq::EqEngine::Storage             eqScratch {};
         dynamics::Compressor::Storage     comp {};
@@ -357,7 +369,8 @@ public:
         std::uint64_t bytes() const noexcept
         {
             std::uint64_t b = (std::uint64_t) sizeof (float) * ((std::uint64_t) fifo + (std::uint64_t) keyBuf);
-            if (eq)         b += eq::EqEngine::objectBytes() + eqScratch.bytes();
+            if (eq)         b += eq::EqEngine::objectBytes() + eqScratch.bytes()
+                                 + (std::uint64_t) dynBands * (std::uint64_t) sizeof (dynamiceq::LaneDynamics);
             b += comp.bytes();
             if (compressor) b += alignComp.freshBytes();
             if (clipper)    b += clip.bytes() + alignClip.freshBytes();
@@ -385,7 +398,7 @@ public:
         {
             return fifo <= other.fifo && keyBuf <= other.keyBuf
                 && eq == other.eq && clipper == other.clipper && limiter == other.limiter
-                && eqScratch.scratch <= other.eqScratch.scratch
+                && eqScratch.scratch <= other.eqScratch.scratch && dynBands <= other.dynBands
                 && comp.lines <= other.comp.lines && comp.maxLookSamples <= other.comp.maxLookSamples
                 && alignComp.ring <= other.alignComp.ring && alignComp.scratch <= other.alignComp.scratch
                 && clip.osBuf <= other.clip.osBuf && clip.wetBuf <= other.clip.wetBuf
@@ -444,6 +457,9 @@ public:
 
         st.eq = config.eq;
         if (config.eq && ! eq::EqEngine::storageFor (sampleRate, K, numChannels, st.eqScratch)) return false;
+        // One producer per band, unconditionally: `dyn.on` is a per-block parameter, so a chain that sized
+        // this by what is armed today would have to allocate the moment a band is armed.
+        if (config.eq) st.dynBands = (std::size_t) eq::EqEngine::kMaxBands;
 
         // maxLookaheadMs is what sizes the ring, so it must be at least what the config asks for —
         // otherwise the compressor CLAMPS the lookahead and reports a latency smaller than the one this
@@ -552,6 +568,7 @@ public:
         // NON-ZERO — 424 596 B published for a preparation that asked 0 — the moment a chain had been
         // re-prepared smaller and was growing back inside storage it never gave up. (The fix round.)
         if (fifo_.capacity() < want.fifo || keyBuf_.capacity() < want.keyBuf) return want.unseededBytes();
+        if (dyn_.capacity() < want.dynBands) return want.unseededBytes();
         return want.fitsWithin (have) ? 0u : want.unseededBytes();
     }
 
@@ -605,8 +622,13 @@ public:
             // a caller that must give a large geometry back destroys the chain rather than re-preparing it.
             if (! eq_) eq_ = std::make_unique<eq::EqEngine>();
             if (! eq_->prepare (fs_, K_, nch_)) return false;   // the EQ now refuses a rate it cannot honour
+            // The dynamics producers, one per band. REUSED like the engine: `resize` to a length the
+            // vector already holds asks the heap for nothing, and each producer's own `prepare()` is
+            // defined to leave it exactly as a fresh one.
+            dyn_.resize ((std::size_t) eq::EqEngine::kMaxBands);
+            for (auto& d : dyn_) if (! d.prepare (fs_, nch_)) return false;
         }
-        else eq_.reset();
+        else { eq_.reset(); dyn_ = {}; }
 
         if (cfg_.monoBass && ! monoBass_.prepare (fs_, K_, nch_)) return false;   // it is stereo-only, and
                                                                                  // says so now — law 11(b)
@@ -705,6 +727,7 @@ public:
         pos_ = 0;
         nonFiniteIn_ = 0;
         if (eq_) eq_->reset();
+        for (auto& d : dyn_) d.reset();
         if (cfg_.monoBass)   monoBass_.reset();
         if (cfg_.compressor) { comp_.reset(); alignComp_.reset(); }
         if (cfg_.clipper)  { sat_.reset();  alignClip_.reset(); }
@@ -899,10 +922,31 @@ private:
         applyGain (ch, inputGain_);
 
         // --- EQ (zero latency: bypass is simply not calling it) --------------------------------
+        // Every band is driven through its own `dynamiceq::LaneDynamics`, which is `eq::EqEngine::process`'s
+        // band loop with a producer for the delta seam each band exposes. A producer whose point is not
+        // armed runs the band over the WHOLE quantum in one call, so an unarmed chain renders exactly as
+        // the engine's own loop does.
+        //
+        // THE DETECTOR KEY IS THE SECTION INPUT, not each band's own input: in a series bank a band's input
+        // is the previous bands' output, and detecting on that lets one band's moving delta modulate the
+        // next band's detector. It is captured before any band runs, and only while some point is armed —
+        // a null key is what a producer reads as "not engaged", which is what every unarmed chain gets.
+        //
+        // ZERO LATENCY, so this stage stays a bypass-by-not-calling one: a producer applies the delta it
+        // derived from the PREVIOUS control chunk, so no sample is read before it is written.
         if (eq_ != nullptr)
         {
-            if (! params_.bypassEq) stageRefused_ |= ! eq_->process (ch, nch_, K_);
-            else if (bypassChanged_.eq) eq_->clearAudioState();   // a STOP, not a stream restart
+            if (! params_.bypassEq)
+            {
+                const float* const* key = dynArmed_ ? eq_->captureSectionInput (ch, nch_, K_) : nullptr;
+                for (int i = 0; i < eq::EqEngine::kMaxBands; ++i)
+                    stageRefused_ |= ! dyn_[(std::size_t) i].processBand (ch, key, nch_, K_, eq_->bandAt (i));
+            }
+            else if (bypassChanged_.eq)
+            {
+                eq_->clearAudioState();                 // a STOP, not a stream restart
+                for (auto& d : dyn_) d.reset();         // ...and the detectors that fed it stop with it
+            }
         }
 
         // --- M/S mono-bass (zero latency) ------------------------------------------------------
@@ -1128,6 +1172,17 @@ private:
 
         if (eq_)
             for (int i = 0; i < eq::EqEngine::kMaxBands; ++i) eq_->setBand (i, p.eqBands[i]);
+        // The producers take the CALLER's band parameters, not the band's clamped copy: each applies the
+        // same rails to its own probe and ballistics. `dynArmed_` is the predicate a producer engages on,
+        // spelled here so the capture above and the engagement below cannot disagree — a non-finite range
+        // is NOT zero and therefore arms, exactly as it does inside the producer.
+        dynArmed_ = false;
+        for (std::size_t i = 0; i < dyn_.size(); ++i)
+        {
+            const eq::DynParams& d = p.eqBands[i].dyn;
+            dyn_[i].setParams (p.eqBands[i]);
+            dynArmed_ = dynArmed_ || (d.on && ! (std::fabs (d.rangeDb) <= 0.0));
+        }
         if (cfg_.monoBass) monoBass_.setParams (p.monoBass);
 
         if (cfg_.compressor)
@@ -1163,6 +1218,7 @@ private:
     double fs_ = 48000.0;
     int    nch_ = 0, K_ = 0, pos_ = 0, latency_ = 0;
     bool   prepared_ = false, paramsDirty_ = true, bypassKnown_ = false;
+    bool   dynArmed_ = false;                // some point's dynamics are engaged — see applyParams()
     bool   stageRefused_ = false;            // a stage refused a quantum — see runQuantum()
     int    osFactor_ = 1;                    // the limiter's EFFECTIVE factor (1 when there is no limiter),
                                              // read back rather than taken from the config: `prepare()`
@@ -1180,6 +1236,8 @@ private:
     std::vector<float> fifo_, keyBuf_;
 
     std::unique_ptr<eq::EqEngine> eq_;                 // 331 KiB — behind a pointer so this object is stack-sized
+    // One per EQ band, on the heap for the same reason the engine is: 24 of them is ~60 KiB.
+    std::vector<dynamiceq::LaneDynamics> dyn_;
     stereo::MonoBass              monoBass_;
     dynamics::Compressor          comp_;
     saturation::Saturator         sat_;
