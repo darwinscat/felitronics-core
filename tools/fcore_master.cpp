@@ -246,7 +246,7 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     static const char* kMode[]  { "downcompress", "upcompress", "downexpand" };
     static const char* kShape[] { "tanh", "atan", "cubic", "asym" };
     static const char* kShap[]  { "none", "weighted", "psycho" };
-    static const char* kGrSt[]  { "mean", "p95", "max" };
+    static const char* kGrSt[]  { "mean", "p95", "max", "percentile" };
 
     if (key == "comp.detector")  return parseEnumName (val, kDet,  2, a.prm.compressor.detector);
     if (key == "comp.link")      return parseEnumName (val, kLink, 2, a.prm.compressor.link);
@@ -303,9 +303,11 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "maxLraLoss") { FC_D (a.req.maxLraLossLu = d); }
     if (key == "inputLra")   { FC_D (a.req.inputLoudnessRangeLu = d); }
     if (key == "limGrLimit") { FC_D (a.req.limiterGr.limitDb = d); }
-    if (key == "limGrStat")  return parseEnumName (val, kGrSt, 3, a.req.limiterGr.statistic);
+    if (key == "limGrStat")  return parseEnumName (val, kGrSt, 4, a.req.limiterGr.statistic);
     if (key == "compGrLimit"){ FC_D (a.req.compressorGr.limitDb = d); }
-    if (key == "compGrStat") return parseEnumName (val, kGrSt, 3, a.req.compressorGr.statistic);
+    if (key == "compGrStat") return parseEnumName (val, kGrSt, 4, a.req.compressorGr.statistic);
+    if (key == "limGrQ")     { FC_D (a.req.limiterGrQuantile = d); }
+    if (key == "compGrQ")    { FC_D (a.req.compressorGrQuantile = d); }
     if (key == "activityDb") { FC_D (a.req.activityThresholdDb = d); }
     if (key == "grTraceBuckets") { if (! iOk || i < -0x7FFFFFFFL - 1L || i > 0x7FFFFFFFL) return false;
                                    a.req.grTraceBuckets = (std::int32_t) i; return true; }
@@ -680,6 +682,7 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_loudness_request, maxLraLossLu) X (fc_loudness_request, inputLoudnessRangeLu)                            \
     X (fc_loudness_request, activityThresholdDb) X (fc_loudness_request, maxPasses)                                \
     X (fc_loudness_request, initialGainDb) X (fc_loudness_request, grTraceBuckets) X (fc_loudness_request, _pad0)  \
+    X (fc_loudness_request, limiterGrQuantile) X (fc_loudness_request, compressorGrQuantile)                        \
     X (fc_solve_pass, gainDb) X (fc_solve_pass, ceilingDb) X (fc_solve_pass, integratedLufs)                       \
     X (fc_solve_pass, truePeakDbTp) X (fc_solve_pass, plrDb) X (fc_solve_pass, limiterMaxGrDb)                     \
     X (fc_solve_pass, loudnessRangeLu) X (fc_solve_pass, violated)                                                 \
@@ -964,6 +967,12 @@ int selftest (double fs, int nc)
     a.prm.limiterDualRelease     = 1;
     a.prm.limiterSlowReleaseMs   = 173.7;
     a.req.grTraceBuckets         = 4099;
+    // v8, off their defaults like every other field, and the statistics moved with them so the numbers are read
+    // rather than merely carried.
+    a.req.limiterGr.statistic    = FC_GR_PERCENTILE;
+    a.req.compressorGr.statistic = FC_GR_PERCENTILE;
+    a.req.limiterGrQuantile      = 0.877;
+    a.req.compressorGrQuantile   = 0.611;
     a.prm.dither.bits            = 24;
     a.prm.dither.seedLo          = 0x748fea9bu;
     a.prm.dither.seedHi          = 0x853c49e6u;
@@ -1373,6 +1382,10 @@ int selftest (double fs, int nc)
         LoudnessRequest lr {};
         lr.targetLufs = -14.0; lr.maxTruePeakDbTp = -1.0;
         lr.grTraceBuckets = b.req.grTraceBuckets;
+        lr.limiterGr.statistic    = GrStatistic::Percentile;    // v8
+        lr.compressorGr.statistic = GrStatistic::Percentile;
+        lr.limiterGr.quantile     = b.req.limiterGrQuantile;
+        lr.compressorGr.quantile  = b.req.compressorGrQuantile;
 
         fc_master h = 0;
         const bool made = fc_master_create (&b.cfg, &h) == FC_OK;
@@ -1449,6 +1462,35 @@ int selftest (double fs, int nc)
                 }
                 std::snprintf (sm, sizeof sm, "%zu buckets differ", traceDiff);
                 check (traceDiff == 0, "and both traces through the ABI are the core's, bit for bit", sm);
+            }
+
+            // v8 — the quantile read-back is the core's own, at every fraction and on both stages, and it refuses
+            // where the core refuses. `fc_solution_gr_quantile` states no definition of its own, so this is the
+            // whole of the acceptance for it.
+            {
+                std::size_t qDiff = 0;
+                for (const auto& [code, st] : { std::pair<int, GrStage> { FC_GR_STAGE_COMPRESSOR, GrStage::Compressor },
+                                                std::pair<int, GrStage> { FC_GR_STAGE_LIMITER,    GrStage::Limiter } })
+                    for (const double q : { 0.05, 0.5, 0.611, 0.877, 0.95, 1.0 })
+                    {
+                        double want = 0.0, got = 0.0;
+                        const bool coreOk = direct.grQuantile (st, q, want);
+                        const fc_status qs = solved ? fc_solution_gr_quantile (sol, code, q, &got)
+                                                    : FC_ERR_HANDLE;
+                        if (coreOk != (qs == FC_OK) || (coreOk && std::memcmp (&want, &got, 8) != 0)) ++qDiff;
+                    }
+                std::snprintf (sm, sizeof sm, "%zu of 12 readings differ", qDiff);
+                check (solved && qDiff == 0, "the quantile read-back through the ABI is the core's, bit for bit", sm);
+                double sink = 12345.0;
+                const fc_status qNan = solved ? fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER,
+                                                                         std::numeric_limits<double>::quiet_NaN(), &sink)
+                                              : FC_ERR_HANDLE;
+                const fc_status qHi  = solved ? fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 1.5, &sink) : FC_ERR_HANDLE;
+                const fc_status qLo  = solved ? fc_solution_gr_quantile (sol, FC_GR_STAGE_LIMITER, 0.0, &sink) : FC_ERR_HANDLE;
+                const fc_status qEnum = solved ? fc_solution_gr_quantile (sol, 7, 0.5, &sink) : FC_ERR_HANDLE;
+                check (qNan == FC_ERR_NON_FINITE && qHi == FC_ERR_RANGE && qLo == FC_ERR_RANGE
+                       && qEnum == FC_ERR_ENUM && sink == 12345.0,
+                       "and its refusals are named apart and write nothing");
             }
             if (solved) fc_solution_destroy (sol);
             fc_master_destroy (h);

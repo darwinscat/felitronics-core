@@ -322,7 +322,7 @@ FC_ENDS_AT (fc_master_params,    limiterSlowReleaseMs);
 FC_ENDS_AT (fc_master_resolved,  limiterSlowReleaseMs);
 FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
 FC_ENDS_AT (fc_need,             _pad0);
-FC_ENDS_AT (fc_loudness_request, _pad0);
+FC_ENDS_AT (fc_loudness_request, compressorGrQuantile);
 FC_ENDS_AT (fc_measurement,      limiterGrTraceValid);
 FC_ENDS_AT (fc_solution_summary, gainAboveDb);
 // and the types the table's sizes were computed from
@@ -353,6 +353,9 @@ static_assert (std::is_same_v<decltype (fc_master_params::limiterDualRelease), i
                && std::is_same_v<decltype (fc_master_params::limiterSlowReleaseMs), double>
                && std::is_same_v<decltype (fc_master_resolved::limiterSlowReleaseMs), double>
                && std::is_same_v<decltype (fc_loudness_request::grTraceBuckets), int32_t> && std::is_same_v<decltype (fc_loudness_request::_pad0), int32_t>);
+// v8's fields by type.
+static_assert (std::is_same_v<decltype (fc_loudness_request::limiterGrQuantile), double>
+               && std::is_same_v<decltype (fc_loudness_request::compressorGrQuantile), double>);
 static_assert (std::is_same_v<decltype (fc_gr_trace_bucket64::maxDb), double> && std::is_same_v<decltype (fc_gr_trace_bucket64::meanDb), double>
                && std::is_same_v<decltype (fc_gr_trace_bucket64::samples), uint64_t> && std::is_same_v<decltype (fc_gr_trace_bucket64::nonFinite), uint64_t>);
 
@@ -404,6 +407,7 @@ FC_AT (fc_loudness_request, maxLraLossLu, 80); FC_AT (fc_loudness_request, input
 FC_AT (fc_loudness_request, activityThresholdDb, 96); FC_AT (fc_loudness_request, maxPasses, 104);
 FC_AT (fc_loudness_request, initialGainDb, 112);
 FC_AT (fc_loudness_request, grTraceBuckets, 120); FC_AT (fc_loudness_request, _pad0, 124);                 // v6
+FC_AT (fc_loudness_request, limiterGrQuantile, 128); FC_AT (fc_loudness_request, compressorGrQuantile, 136); // v8
 
 FC_AT (fc_measurement, header, 0);             FC_AT (fc_measurement, integratedLufs, 8);
 FC_AT (fc_measurement, truePeakDbTp, 16);      FC_AT (fc_measurement, samplePeakDb, 24);
@@ -625,7 +629,8 @@ FC_MAP_ENUM (mapShaping, dither::NoiseShaping,
 FC_MAP_ENUM (mapGrStat, GrStatistic,
     FC_CASE (FC_GR_MEAN, GrStatistic::Mean)
     FC_CASE (FC_GR_P95,  GrStatistic::P95)
-    FC_CASE (FC_GR_MAX,  GrStatistic::Max))
+    FC_CASE (FC_GR_MAX,  GrStatistic::Max)
+    FC_CASE (FC_GR_PERCENTILE, GrStatistic::Percentile))
 
 #undef FC_CASE
 #undef FC_MAP_ENUM
@@ -781,6 +786,10 @@ fc_status toCore (const fc_loudness_request& r, LoudnessRequest& out) noexcept
     out.maxPasses             = r.maxPasses;
     out.initialGainDb         = r.initialGainDb;
     out.grTraceBuckets        = r.grTraceBuckets;     // v6
+    // v8. Copied, never judged: the range (0, 1] is the core's, and it refuses with `InvalidRequest` — the
+    // verdict `fc_master_solve` forwards. A NaN is not refused here either, for the reason the note above gives.
+    out.limiterGr.quantile    = r.limiterGrQuantile;
+    out.compressorGr.quantile = r.compressorGrQuantile;
     return FC_OK;
 }
 
@@ -1854,6 +1863,33 @@ FC_EXPORT fc_status fc_solution_gr_trace64 (fc_solution sh, std::int32_t stage, 
     return copyTrace (sh, stage, out, cap, written);
 }
 
+// v8 — the stage code is read as `copyTrace` reads it (a switch on the CODE: an int outside the enum's range is
+// not a value of it), and `q` is then a field value like any other. Everything past that is the core's:
+// `LoudnessSolution::grQuantile` owns the admitted range of `q`, the "not a measurement" rule and the histogram.
+// `*outDb` is untouched by every refusal.
+FC_EXPORT fc_status fc_solution_gr_quantile (fc_solution sh, std::int32_t stage, double q, double* outDb)
+{
+    FC_GUARD;
+    Slot* s = lookup (sh, Kind::Solution);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    if (const fc_status st = checkScalarOut (outDb); st != FC_OK) return st;
+    GrStage gs = GrStage::Compressor;
+    switch (stage)
+    {
+        case FC_GR_STAGE_COMPRESSOR: gs = GrStage::Compressor; break;
+        case FC_GR_STAGE_LIMITER:    gs = GrStage::Limiter;    break;
+        default:                     return FC_ERR_ENUM;
+    }
+    // A NON-FINITE `q` IS ITS OWN STATUS: the core answers `false` to both, so without this a NaN and a 1.5 are
+    // told the same nothing.
+    if (! std::isfinite (q)) return FC_ERR_NON_FINITE;
+    if (! felitronics::mastering::grQuantileAdmitted (q)) return FC_ERR_RANGE;
+    double v = 0.0;
+    if (! s->solution->grQuantile (gs, q, v)) return FC_ERR_REFUSED_BY_CORE;
+    *outDb = v;
+    return FC_OK;
+}
+
 FC_EXPORT fc_status fc_solution_destroy (fc_solution sh)
 {
     FC_GUARD;
@@ -2182,6 +2218,8 @@ void writeDefaults (fc_loudness_request& o) noexcept
     out->maxPasses              = d.maxPasses;
     out->initialGainDb          = d.initialGainDb;
     out->grTraceBuckets         = d.grTraceBuckets;     // v6
+    out->limiterGrQuantile      = d.limiterGr.quantile;    // v8
+    out->compressorGrQuantile   = d.compressorGr.quantile;
 }
 }   // namespace
 

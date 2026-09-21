@@ -166,7 +166,10 @@ inline constexpr std::uint32_t constraintBit (MasteringConstraint c) noexcept
 enum class MasteringSolveStatus
 {
     Solved,                 // measured within `toleranceLu` of the target, ceiling held, nothing bound
-    TargetUnreachable,      // a NAMED constraint binds; the result carries the best FEASIBLE render
+    TargetUnreachable,      // a NAMED constraint binds. The result carries the best render that HOLDS that
+                            // constraint whenever one exists — the search spends one render at the drive the
+                            // limiter idles at to find one (the bracket rescue in solve()) — and the gentlest
+                            // BROKEN render only when no render holds it at any drive
     UpstreamViolation,      // a limit the search cannot move is already broken — see the note above
     TargetBetweenAchievable,// the two sides of the smallest gain interval the search can still express
                             // BRACKET the target and both miss the tolerance. `achievedBelowLufs` and
@@ -194,7 +197,17 @@ struct TargetLoudnessSolverLimits { static constexpr int kMaxPasses = 32; };
 // Which statistic a gain-reduction limit binds. Part of the limit's TYPE, never a hidden convention:
 // "max 6 dB of limiting" and "p95 under 6 dB" are different products, and a field named for one while
 // enforcing the other is the shape of defect this repository keeps closing.
-enum class GrStatistic { Mean, P95, Max };
+//
+// `Percentile` reads the same distribution as `P95` at `GainReductionLimit::quantile`; both are WINDOW
+// statistics (GainReductionSummariser). `Mean` and `Max` are SAMPLE statistics.
+enum class GrStatistic { Mean, P95, Max, Percentile };
+
+// Which stage a gain-reduction reading is taken from. A solution carries one distribution per stage.
+enum class GrStage { Compressor, Limiter };
+
+// The fractions a quantile may be asked for: (0, 1], finite. ONE predicate, read by the request's admission and
+// by every read-back, so a `q` the search refuses is a `q` the read-back refuses. NaN fails both comparisons.
+inline bool grQuantileAdmitted (double q) noexcept { return q > 0.0 && q <= 1.0; }
 
 // `limitDb` OFF is `+infinity` and nothing else. `isfinite` looked like the right disabling test and is
 // not: it is true of BOTH infinities and of NaN, so a caller expressing an unsatisfiable limit as
@@ -204,6 +217,9 @@ struct GainReductionLimit
 {
     double      limitDb  = std::numeric_limits<double>::infinity();   // +infinity = no limit
     GrStatistic statistic = GrStatistic::Max;
+    // The fraction `GrStatistic::Percentile` binds; at 0.95 it is `P95`. Admitted WHATEVER the statistic — one
+    // rule for the field, not one per statistic — so a `q` outside (0, 1] or not finite is `InvalidRequest`.
+    double      quantile = 0.95;
 
     bool off()      const noexcept { return core::exactlyEqual (limitDb, std::numeric_limits<double>::infinity()); }
     bool malformed() const noexcept { return std::isnan (limitDb); }
@@ -213,14 +229,119 @@ struct GainReductionLimit
 // and a mean over signed values is a different number that nobody wants.
 struct GainReductionStats
 {
-    double meanDb        = 0.0;
-    double p95Db         = 0.0;
-    double maxDb         = 0.0;
+    double meanDb        = 0.0;     // over TAP SAMPLES
+    double p95Db         = 0.0;     // the 0.95 quantile of the WINDOW distribution — see GainReductionSummariser
+    double maxDb         = 0.0;     // over TAP SAMPLES
     double activeFraction = 0.0;    // fraction of samples with |GR| > activityThresholdDb
-    std::uint64_t frames = 0;
-    std::uint64_t nonFinite = 0;    // a poisoned trace: the numbers above are best effort, not measurement
-    std::uint64_t aboveRange = 0;   // values past the histogram's top — quantiles are then not answerable
+    std::uint64_t frames = 0;       // tap samples in the stage's programme window
+    std::uint64_t nonFinite = 0;    // ... of which non-finite: a poisoned trace, and the numbers above are then
+                                    // best effort, not measurement
+    std::uint64_t aboveRange = 0;   // WINDOWS past the histogram's top — quantiles are then not answerable
     bool valid = false;             // false ⇒ every number above is a placeholder, not a measurement
+    // The quantile the request's limit for THIS stage binds, read at that limit's own `q` on the distribution
+    // `p95Db` comes from — the number a `GrStatistic::Percentile` limit is judged by, and what
+    // `LoudnessSolution::grQuantile` answers at the same `q`. NaN where the distribution cannot answer there,
+    // so every comparison against a limit is false: an unanswerable statistic is not a violation.
+    double quantileDb = std::numeric_limits<double>::quiet_NaN();
+    double quantileQ  = 0.0;        // ... and the fraction it was read at
+};
+
+// THE NUMBER A LIMIT IS JUDGED BY. `lim` must be the limit whose `quantile` the stats were summarised at;
+// `GainReductionStats::quantileQ` says which that was.
+inline double grStatisticValue (const GainReductionStats& s, const GainReductionLimit& lim) noexcept
+{
+    switch (lim.statistic)
+    {
+        case GrStatistic::Mean:       return s.meanDb;
+        case GrStatistic::P95:        return s.p95Db;
+        case GrStatistic::Max:        return s.maxDb;
+        case GrStatistic::Percentile: return s.quantileDb;      // NaN where it is not answerable
+    }
+    return s.maxDb;
+}
+
+// THE QUANTILE WINDOW — 4 ms. Every quantile of a gain-reduction trace is taken over the programme cut into
+// windows of this length, one entry per window, the entry being the MEAN |GR| over it. So a single click is
+// averaged down inside its window and a sustained reduction is not. It is fixed in the core and is not a
+// request field: it is part of what the number means, and two windows would be two quantities under one name.
+inline constexpr double kGrQuantileWindowSeconds = 0.004;
+
+// That window in tap samples at `tapRate` — the compressor's tap runs at the sample rate, the limiter's at
+// `sampleRate * tapOversampleFactor`. At least one, so a rate that rounds the window away still has one.
+inline long long grQuantileWindowSamples (double tapRate) noexcept
+{
+    if (! (tapRate > 0.0) || ! std::isfinite (tapRate)) return 1;
+    const double n = std::floor (kGrQuantileWindowSeconds * tapRate + 0.5);
+    return n >= 1.0 ? (long long) n : 1;
+}
+
+// A STAGE'S TAP, SUMMARISED — and the one place the two bases are kept apart:
+//   * `meanDb`, `maxDb` and `activeFraction` are SAMPLE statistics, over every tap sample of the stage's
+//     programme window;
+//   * every QUANTILE is read on the window distribution: the programme cut into `windowSamples` stretches, one
+//     entry per stretch, the entry being the MEAN |GR| over it. The last stretch is averaged over ITS OWN
+//     length and is an entry like any other, and EVERY window of the programme is an entry, the silent ones
+//     included — the denominator is the programme, not the part of it the stage worked in.
+// A non-finite sample is COUNTED and poisons its window's entry, which the histogram counts as non-finite in
+// turn; the numbers are best effort from there and `valid` says so.
+// Public like GainReductionTraceBuilder, so the definition is testable on a constructed trace.
+class GainReductionSummariser
+{
+public:
+    // `windows` is RESET here and filled as the samples arrive: it is the distribution the limits are judged on
+    // and the one `LoudnessSolution::grQuantile` answers from. A `windowSamples` under 1 is one.
+    GainReductionSummariser (dynamics::offline::QuantileHistogram& windows, long long windowSamples,
+                             double activityThresholdDb) noexcept
+        : h_ (windows), w_ (windowSamples > 0 ? windowSamples : 1), activity_ (activityThresholdDb)
+    {
+        h_.reset();
+    }
+
+    // One tap sample — |GR| in dB, non-negative — in stream order.
+    void add (double a) noexcept
+    {
+        ++frames_;
+        if (std::isfinite (a))
+        {
+            sum_ += a; ++finite_;
+            if (a > max_) max_ = a;
+            if (a > activity_) ++active_;
+        }
+        else ++nonFinite_;
+        winSum_ += a;
+        ++winN_;
+        if (winN_ >= w_) flush();
+    }
+
+    // The partial last window, then the summary. `q` is the fraction this stage's limit binds.
+    GainReductionStats finish (double q) noexcept
+    {
+        if (winN_ > 0) flush();
+        GainReductionStats s;
+        s.frames     = frames_;
+        s.nonFinite  = nonFinite_;
+        s.aboveRange = h_.aboveRange();
+        s.quantileQ  = q;
+        if (frames_ == 0 || h_.count() == 0) return s;
+        double p95 = 0.0;
+        if (! h_.quantile (0.95, p95)) return s;     // out of range: NOT reported as a plausible number
+        s.meanDb = finite_ > 0 ? sum_ / (double) finite_ : 0.0;
+        s.p95Db  = p95;
+        s.maxDb  = max_;
+        s.activeFraction = (double) active_ / (double) frames_;
+        double qv = 0.0;
+        if (grQuantileAdmitted (q) && h_.quantile (q, qv)) s.quantileDb = qv;
+        s.valid = (s.nonFinite == 0);
+        return s;
+    }
+
+private:
+    void flush() noexcept { h_.add (winSum_ / (double) winN_); winSum_ = 0.0; winN_ = 0; }
+
+    dynamics::offline::QuantileHistogram& h_;
+    long long w_ = 1, winN_ = 0;
+    double winSum_ = 0.0, sum_ = 0.0, max_ = 0.0, activity_ = 0.0;
+    std::uint64_t frames_ = 0, finite_ = 0, nonFinite_ = 0, active_ = 0;
 };
 
 // THE SAME TAPS, RESOLVED IN TIME (P59b). `GainReductionStats` says how much a stage worked over the whole programme;
@@ -452,8 +573,9 @@ struct LoudnessSolution
     MasterMeasurement measured {};              // of the DELIVERED render, always — never of a probe
 
     // RENDERS SPENT, all of them. `maxPasses` bounds the SEARCH; delivering the chosen candidate can
-    // cost one more when the search did not end on it, so `passes` can be `maxPasses + 1` — and saying
-    // so here is cheaper than a caller discovering it from a progress bar.
+    // cost one more when the search did not end on it, and the bracket rescue (see solve()) costs one
+    // more again, so `passes` can be `maxPasses + 2` — and saying so here is cheaper than a caller
+    // discovering it from a progress bar.
     int    passes = 0;
     double activityThresholdDb = 0.1;           // echoed, because a fraction without its threshold is not a number
 
@@ -472,6 +594,24 @@ struct LoudnessSolution
     // not in the solver, because a solution outlives the next solve.
     GainReductionTrace compressorTrace {};
     GainReductionTrace limiterTrace {};
+
+    // THE DISTRIBUTION EVERY QUANTILE OF THIS SOLUTION IS READ FROM, one per stage — the histogram the search
+    // judged this render's gain-reduction limits on, of the LAST render, which is the one in `out`. Written by
+    // every render and reset at the start of each, like the traces above, and owned HERE: a later solve on the
+    // same solver, or destroying it, does not touch them.
+    dynamics::offline::QuantileHistogram compressorGrWindows {}, limiterGrWindows {};
+
+    // The q-quantile of a stage's |GR|, by the one definition (GainReductionSummariser): a reading here and a
+    // `GrStatistic::Percentile` limit at the same `q` are the same number. False, and `outDb` untouched, for a
+    // `q` outside (0, 1] or not finite, for a stage whose statistics are not a measurement, and for a quantile
+    // the distribution cannot answer (values past the histogram's top).
+    [[nodiscard]] bool grQuantile (GrStage stage, double q, double& outDb) const noexcept
+    {
+        const bool lim = (stage == GrStage::Limiter);
+        const GainReductionStats& s = lim ? measured.limiter : measured.compressor;
+        if (! grQuantileAdmitted (q) || ! s.valid) return false;
+        return (lim ? limiterGrWindows : compressorGrWindows).quantile (q, outDb);
+    }
 };
 
 class TargetLoudnessSolver
@@ -557,6 +697,7 @@ public:
             || ! std::isfinite (req.activityThresholdDb) || req.activityThresholdDb < 0.0
             || req.maxPasses < 1 || req.maxPasses > kMaxPasses
             || req.limiterGr.malformed() || req.compressorGr.malformed()
+            || ! grQuantileAdmitted (req.limiterGr.quantile) || ! grQuantileAdmitted (req.compressorGr.quantile)
             || std::isnan (req.minPlrDb) || std::isnan (req.maxLraLossLu)
             || ! std::isfinite (req.truePeakAimDb) || req.truePeakAimDb < 0.0
             || ! traceBucketsAdmitted (req.grTraceBuckets)) return false;
@@ -597,16 +738,20 @@ public:
     // pass's end, so the peak is ONE pass. (The drain used to be a buffer of zeros the first solve allocated and later
     // ones reused; the reference meter drains from its own fixed array, so there is nothing left over.) 0 for a length
     // or a channel count solve() refuses before any pass.
-    // Plus the solution's two traces of `grTraceBuckets` buckets, which the first render allocates; 0 for a bucket
-    // count solve() refuses.
-    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames, int grTraceBuckets) noexcept
+    // Plus the solution's two traces of `grTraceBuckets` buckets and its two quantile histograms, which the first
+    // render allocates; 0 for a bucket count or a bin width solve() refuses. `binDb` is the one prepare() was
+    // given, because the histograms the solution keeps are copies of the ones prepare() sized.
+    static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames, int grTraceBuckets,
+                                     double binDb = 0.01) noexcept
     {
         if (frames <= 0 || numChannels < 1 || numChannels > core::kMaxChannels) return 0u;
         if (! traceBucketsAdmitted (grTraceBuckets)) return 0u;
+        const std::uint64_t hist = dynamics::offline::QuantileHistogram::storageBytes (0.0, kGrRangeDb, binDb);
+        if (hist == 0) return 0u;
         const std::uint64_t meter = meterBytes (sampleRate, frames);
         if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
         return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes()
-             + 2u * GainReductionTrace::bytesFor (grTraceBuckets, frames);
+             + 2u * GainReductionTrace::bytesFor (grTraceBuckets, frames) + 2u * hist;
     }
 
     // The request's bucket count, as admits() judges it.
@@ -717,6 +862,7 @@ public:
         double anchorD = 0.0, anchorJ = 0.0;
         bool   haveAnchor = false;
         DriveBound bound;
+        bool rescued = false;               // the bracket rescue spent its render — see after the loop
         const double aim = pmax - (std::isfinite (req.truePeakAimDb) && req.truePeakAimDb > 0.0
                                        ? req.truePeakAimDb : 0.0);
 
@@ -1048,6 +1194,136 @@ public:
             g = nextG; c = nextC;
         }
 
+        // --- the bracket rescue --------------------------------------------------------------------
+        // THE BRACKET'S SECOND END. `DriveBound` can guarantee a limit that grows with drive only once it has
+        // seen a render holding one: it brackets `ok`, the loudest render that broke nothing, under `cap`, the
+        // quietest that broke something. A search that starts past the boundary and ends there is handed `cap`
+        // and never an `ok`, and what it delivers is the gentlest BROKEN render. Below the drive at which the
+        // limiter engages there is no gain reduction at all, and no reduction holds any reduction limit, so
+        // that drive is the missing end, and one render at it is taken here.
+        //
+        // THE CONDITIONS, all of them: at least one render was made, one broke a `kDriveBound` limit, none held
+        // one, the engagement drive is known and lies UNDER the breaking render's — that is the test that there
+        // is drive to give back, since with the limiter already idle there the chain is a plain multiply below
+        // it and every drive under it breaks the limit too — and the drive can be expressed as a `(g, c)` pair
+        // the actuator admits.
+        //
+        // THE DRIVE IS EXPRESSED BY `pairFor`, which chooses the ceiling for the drive rather than for the aim;
+        // where no `(g, c)` pair expresses it the rescue is not taken.
+        //
+        // THE CEILING ASKED FOR IS THE AIM, and the aim less the difference already measured only where that
+        // difference is larger than the aim's own margin. The certifying meter does not read the peak the
+        // limiter aims at — `DriveBound::overshootAt` is that difference, measured on the renders the search
+        // made, and it is a MEASUREMENT here rather than a mechanism: it is 0.02 dB on this tree's music and
+        // 0.25 dB on a 15 kHz tone. `truePeakAimDb` exists to absorb it, so below that size nothing is
+        // subtracted — a ceiling moved by a fraction of a margin that already covers it would move a render the
+        // previous build delivered, and a target that render reached. Above it the margin is not enough and the
+        // whole measured difference comes off, which puts the predicted peak back at the aim.
+        // (Every PROBE subtracts it unconditionally — see the walk below: its limiter is working, so its peak
+        // is pinned to its ceiling plus that difference, which is the same rule the ordinary search uses.)
+        //
+        // IT RUNS AFTER THE SEARCH, so a search that finds its own `ok` never reaches it and is unchanged,
+        // render for render and bit for bit. Neither the idle render nor the probes after it are steps of the
+        // loudness search: they move `bound` and the DELIVERED candidate and nothing else — never
+        // `Best::nearest*` — so `pinnedDir` and the bracket sides below still describe the search proper.
+        //
+        // THEN THE BOUNDARY, with whatever the search did not spend. The idle render is `ok` and the search's
+        // gentlest broken one is `cap`, which is the bracket the ordinary search would have had, so the probe
+        // between them is the ordinary `DriveBound::probe` and the answer is the LOUDEST render that holds the
+        // limit rather than the quietest. The refinement stops when the budget runs out, when a probe cannot be
+        // expressed, or when the step falls under the actuator's resolution; with no budget left at all the
+        // idle render is what comes back, which is the one case where a quiet render is delivered on purpose.
+        //
+        // A PROBE'S LOUDNESS NEED NOT BE MEASURABLE. The reduction is read off the tap and the peak off the
+        // peak meter, neither of which needs a gating block, so a render below the absolute gate still HOLDS
+        // the limit and is still the answer — the promise is about holding. What it cannot then be is `Solved`.
+        //
+        // AND `binding` IS READ FROM `cap`: `bound.acted` is set here, so the verdict names what was broken at
+        // the SMALLEST drive that broke anything — the boundary the refinement has just tightened — and not
+        // what the render nearest the target happened to break. The rest go into `alsoViolated`.
+        //
+        // THE COST is one render plus the spare budget, and one more where no render holds the limit at all:
+        // the idle render does not become the answer either, `out` holds it rather than the reported candidate,
+        // and the delivery re-render below puts that back.
+        const int searchPasses = sol.passes;
+        const double rescueD = bound.engageD - kIdleDriveMarginDb;
+        double rg = 0.0, rc = 0.0;
+        if (best.have && bound.cap.have && ! bound.ok.have && bound.haveEngage
+            && bound.engageD < bound.cap.d
+            && pairFor (rescueD, std::fmin (pmax, aim - overshootPastAim (bound, req)), pmax, rg, rc))
+        {
+            rescued = true;
+            // One render taken ASIDE from the loudness search. Renders `(ag, ac)`, records it, moves `bound`
+            // and the delivered candidate, and never `Best::nearest*`. False on a refusal, with `sol.status`
+            // already set to the one the caller must return.
+            // `offerIt` false for a PROBE that breaks a `kDriveBound` limit: such a probe has failed at the one
+            // thing it was sent to do and may not be delivered over a render that did it — every comparison in
+            // `Best` among infeasible candidates is by the WORST excess across all constraints, and a reduction
+            // broken by a millionth of a decibel ranks gentler than a peak broken by a tenth. The idle render is
+            // always offered: it is the fallback the guarantee rests on.
+            auto aside = [&] (double ag, double ac, MasterMeasurement& am, std::uint32_t& av, bool offerIt = true) -> bool
+            {
+                if (! clock.begin (ProgressStage::SearchPass, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
+                { sol.status = MasteringSolveStatus::Cancelled; return false; }
+                params.preLimiterGainDb    = ag;
+                params.limiter.ceilingDbTp = ac;
+                chain.setParams (params);
+                if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, am, sol, clock))
+                {
+                    ++sol.passes;
+                    sol.status = clock.stopped() ? MasteringSolveStatus::Cancelled : MasteringSolveStatus::RenderFailed;
+                    return false;
+                }
+                ++sol.passes;
+                // `out` now holds THIS render, so the delivery test below must read it and not the search's
+                // last step: `best.isLast` is cleared and set again only by an offer that wins, and `g`/`c`
+                // name what is in the buffer.
+                best.isLast = false;
+                g = ag; c = ac;
+                av = violatedMask (am, req);
+                if (! keepRecord (sol, clock, ag, ac, am, av)) { sol.status = MasteringSolveStatus::Cancelled; return false; }
+                bound.add (ag, ac, am, aim, pmax, req, av);
+                if (offerIt || (av & kDriveBound) == 0u)
+                    best.offerAside (ag, ac, am, av == 0, std::fabs (am.integratedLufs - target), worstExcess (am, req));
+                return true;
+            };
+            // A render that holds the limit AND lands on the target is simply the answer — which takes a
+            // loudness measurement, unlike holding the limit.
+            auto solvedBy = [&] (const MasterMeasurement& am, std::uint32_t av)
+            {
+                return av == 0 && am.loudnessValid && std::fabs (am.integratedLufs - target) <= req.toleranceLu;
+            };
+
+            MasterMeasurement rm;
+            std::uint32_t rv = 0;
+            if (! aside (rg, rc, rm, rv)) return sol;
+            if (solvedBy (rm, rv))
+            {
+                sol.status = MasteringSolveStatus::Solved;
+                sol.preLimiterGainDb = rg; sol.ceilingDbTp = rc; sol.measured = rm;
+                return sol;
+            }
+
+            for (int spare = req.maxPasses - searchPasses;
+                 spare > 0 && bound.ok.have && bound.cap.have && bound.ok.d < bound.cap.d; --spare)
+            {
+                const double nd = bound.probe (req, spare <= 1);
+                double ng = 0.0, nc = 0.0;
+                if (! pairFor (nd, std::fmin (pmax, aim - bound.overshootAt (bound.cap.d)), pmax, ng, nc)) break;
+                if (std::fabs (ng - g) < 1.0e-6 && std::fabs (nc - c) < 1.0e-3) break;
+                MasterMeasurement pm;
+                std::uint32_t pv = 0;
+                if (! aside (ng, nc, pm, pv, false)) return sol;
+                if (solvedBy (pm, pv))
+                {
+                    sol.status = MasteringSolveStatus::Solved;
+                    sol.preLimiterGainDb = ng; sol.ceilingDbTp = nc; sol.measured = pm;
+                    return sol;
+                }
+            }
+            bound.acted = true;
+        }
+
         // --- no candidate met the target -----------------------------------------------------------
         // A TARGET BETWEEN TWO ACHIEVABLE VALUES IS ITS OWN ANSWER. Two renders straddling the target,
         // both outside tolerance, and a gain gap too small to hold anything between them, is not a
@@ -1126,7 +1402,11 @@ public:
         // Once the drive bound has acted: `TargetUnreachable`, `binding` from what `cap` broke.
         if (bound.acted)
         {
-            std::uint32_t viol = best.nearestViolated | bound.capViol;
+            // AND WHAT THE DELIVERED RENDER ITSELF BREAKS. `nearestViolated | capViol` is what stopped the
+            // SEARCH; the render handed back is chosen by a different rule and, where nothing holds every
+            // constraint, breaks something of its own. A caller told only why the search stopped would not be
+            // told that the file it received is above the promise.
+            std::uint32_t viol = best.nearestViolated | bound.capViol | violatedMask (best.m, req);
             if (pinnedDir != 0 && best.have && best.err > req.toleranceLu)
                 viol |= constraintBit (MasteringConstraint::GainRange);
             sol.status  = MasteringSolveStatus::TargetUnreachable;
@@ -1186,7 +1466,8 @@ public:
                                        || (std::fabs (g - best.g) < 1.0e-12 && std::fabs (c - best.c) < 1.0e-12);
             if (! alreadyDelivered)
             {
-                if (! clock.begin (ProgressStage::FinalRender, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
+                if (! clock.begin (ProgressStage::FinalRender, sol.passes + 1,
+                                   req.maxPasses + (rescued ? 2 : 1), passUnits, frames))
                     return cancelled (sol);
                 params.preLimiterGainDb    = best.g;
                 params.limiter.ceilingDbTp = best.c;
@@ -1254,16 +1535,36 @@ private:
         bool nearestHave = false;
 
 
+        // A render the SEARCH made: it may be delivered, and its violations may name what stopped the search.
         void offer (double gg, double cc, const MasterMeasurement& mm, bool feas, double e,
                     double exc, std::uint32_t viol) noexcept
         {
             if (! nearestHave || e < nearestErr) { nearestErr = e; nearestViolated = viol; nearestHave = true; }
-            // WHEN NOTHING IS FEASIBLE, THE ANSWER IS THE GENTLEST RENDER, NOT THE CLOSEST ONE. Picking
-            // the closest to a target that has already been declared unreachable delivers the most
-            // crushed render there is AND a refusal to go with it — which is the "push it through
-            // anyway" behaviour with a warning label. The tie-break among infeasible candidates is
-            // therefore the WORST constraint excess, in the constraint's own units, and only then the
-            // distance to the target.
+            consider (gg, cc, mm, feas, e, exc);
+        }
+
+        // A render taken ASIDE from the search — the bracket rescue's and the probes after it. It may be
+        // DELIVERED and it may not say which violations stopped the search, so `nearest*` never sees it: a
+        // feasible probe landing nearer the target than any render the search made would otherwise empty
+        // `nearestViolated` and rename the verdict.
+        // `e` IS NOT A DISTANCE when the render has no measurable loudness: every such render reads the meter's
+        // -120 sentinel, so two of them tie and the FIRST one offered stays. "The loudest render that holds the
+        // limit" is therefore the contract only where the loudness is a measurement; where it is not, nothing
+        // here can order two candidates and the one that arrived first is kept.
+        void offerAside (double gg, double cc, const MasterMeasurement& mm, bool feas, double e, double exc) noexcept
+        {
+            consider (gg, cc, mm, feas, e, exc);
+        }
+
+    private:
+        // WHEN NOTHING IS FEASIBLE, THE ANSWER IS THE GENTLEST RENDER, NOT THE CLOSEST ONE. Picking
+        // the closest to a target that has already been declared unreachable delivers the most
+        // crushed render there is AND a refusal to go with it — which is the "push it through
+        // anyway" behaviour with a warning label. The tie-break among infeasible candidates is
+        // therefore the WORST constraint excess, in the constraint's own units, and only then the
+        // distance to the target.
+        void consider (double gg, double cc, const MasterMeasurement& mm, bool feas, double e, double exc) noexcept
+        {
             const bool better = ! have
                               || (feas && ! feasible)
                               || (feas == feasible && (feas ? (e < err)
@@ -1283,6 +1584,28 @@ private:
 
     // The overshoot `truePeakDbTp - c` assumed for a working render when none is measured at or under its drive.
     static constexpr double kFirstLimitingOvershootDb = 0.15;
+
+    // THE PAIR THAT EXPRESSES A DRIVE. `d = g - c`, and the two are clamped to +-60 dB one number at a time, so
+    // a ceiling chosen for the true-peak aim alone can put the gain the drive needs past its clamp — after which
+    // the drive RENDERED is not the drive chosen. The ceiling is therefore picked for the drive: `wantC` moved
+    // into the window that keeps the gain in range and at or under `pmax`, inside which `d + c` is in range by
+    // construction. False, and `outG`/`outC` untouched, where that window is empty: no pair expresses `d`.
+    [[nodiscard]] static bool pairFor (double d, double wantC, double pmax, double& outG, double& outC) noexcept
+    {
+        if (! std::isfinite (d)) return false;
+        const double lo = std::fmax (-kMaxGainDb, -kMaxGainDb - d);
+        const double hi = std::fmin (std::fmin (kMaxGainDb, kMaxGainDb - d), pmax);
+        if (! (lo <= hi)) return false;
+        outC = std::fmin (std::fmax (wantC, lo), hi);
+        outG = std::clamp (d + outC, -kMaxGainDb, kMaxGainDb);
+        return true;
+    }
+
+    // HOW FAR UNDER THE ENGAGEMENT POINT the bracket rescue renders. At the engagement drive the reduction is
+    // zero in real arithmetic and only near zero in float — the gain node's rounding can put the reconstructed
+    // peak millionths of a dB over the ceiling — and that render is wanted for one property: that it holds ANY
+    // reduction limit, 0 dB included. 0.01 dB is four decades above that rounding.
+    static constexpr double kIdleDriveMarginDb = 0.01;
 
     // THE DRIVE BOUND over the renders made, in drive `d = g - c`: `ok` is the largest drive that broke no `kDriveBound` limit,
     // `cap` the smallest that broke one, each with every limit's excess (> 0 where violatedMask() flags it, NaN when off or
@@ -1317,9 +1640,7 @@ private:
             const double nan = std::numeric_limits<double>::quiet_NaN();
             double e[3] = { nan, nan, nan };
             if (! req.limiterGr.off() && ! req.limiterGr.malformed() && m.limiter.valid)
-                e[0] = ((req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
-                      : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db
-                                                                        : m.limiter.maxDb) - req.limiterGr.limitDb;
+                e[0] = grStatisticValue (m.limiter, req.limiterGr) - req.limiterGr.limitDb;
             if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()))
                 e[1] = req.minPlrDb - m.plrDb;
             if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
@@ -1394,6 +1715,17 @@ private:
         }
     };
 
+    // WHAT THE IDLE RENDER'S CEILING OWES THE PROMISE: the measured difference between the certifying meter's
+    // reading and the ceiling the limiter aims at, LESS the aim's own margin, and never below zero. The margin
+    // exists to absorb that difference, so a difference it covers costs the render nothing; one it does not is
+    // taken off in full. `DriveBound::overshootAt` answers `kFirstLimitingOvershootDb` where no working render
+    // was made at or under the capping drive, which is the same assumption the ordinary search makes.
+    static double overshootPastAim (const DriveBound& bound, const LoudnessRequest& req) noexcept
+    {
+        const double over = bound.overshootAt (bound.cap.d);       // `admits()` bounds the aim: finite, and >= 0
+        return over > req.truePeakAimDb ? over : 0.0;
+    }
+
     // How far past its limit the worst violated constraint is, in that constraint's own units (dB or
     // LU). Zero when nothing is violated. It is a RANKING, not a physical quantity — the units are only
     // comparable because every one of them is a logarithmic ratio and the caller set them all.
@@ -1403,11 +1735,11 @@ private:
         if (m.truePeakDbTp > req.maxTruePeakDbTp) e = std::fmax (e, m.truePeakDbTp - req.maxTruePeakDbTp);
         if (! req.limiterGr.off() && ! req.limiterGr.malformed() && m.limiter.valid)
         {
-            const double v = (req.limiterGr.statistic == GrStatistic::Mean) ? m.limiter.meanDb
-                           : (req.limiterGr.statistic == GrStatistic::P95)  ? m.limiter.p95Db : m.limiter.maxDb;
+            const double v = grStatisticValue (m.limiter, req.limiterGr);
             if (v > req.limiterGr.limitDb) e = std::fmax (e, v - req.limiterGr.limitDb);
         }
-        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()) && m.plrDb < req.minPlrDb)
+        if (m.loudnessValid && ! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity())
+            && m.plrDb < req.minPlrDb)
             e = std::fmax (e, req.minPlrDb - m.plrDb);
         if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
             && std::isfinite (req.inputLoudnessRangeLu) && m.lraValid)
@@ -1441,9 +1773,9 @@ private:
         if (lim.off()) return false;                 // +infinity, and ONLY +infinity, means "no limit"
         if (lim.malformed()) return false;           // NaN is refused up front; never silently permissive
         if (! s.valid) return false;                 // an unanswerable statistic is not a violation
-        const double v = (lim.statistic == GrStatistic::Mean) ? s.meanDb
-                       : (lim.statistic == GrStatistic::P95)  ? s.p95Db : s.maxDb;
-        return v > lim.limitDb;
+        // ... and so is a quantile the distribution could not answer: `grStatisticValue` is NaN there and every
+        // comparison against NaN is false.
+        return grStatisticValue (s, lim) > lim.limitDb;
     }
 
     std::uint32_t violatedMask (const MasterMeasurement& m, const LoudnessRequest& req) const noexcept
@@ -1453,7 +1785,13 @@ private:
         if (violates (m.limiter, req.limiterGr))  v |= constraintBit (MasteringConstraint::LimiterGainReduction);
         // OFF is `-infinity` for a FLOOR and `+infinity` for a CEILING — the sign is part of the
         // meaning, and testing `isfinite` throws it away in the direction that always says "satisfied".
-        if (! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity()) && m.plrDb < req.minPlrDb)
+        // AND IT NEEDS A LOUDNESS MEASUREMENT: `plrDb` is `truePeakDbTp - integratedLufs`, so without one it
+        // is not a ratio and may not be judged — the same rule `lraValid` already carries for the range below.
+        // It cannot change an answer today and is not claimed to: the only caller that can reach it with an
+        // invalid measurement is the bracket rescue, and there `integratedLufs` is the meter's -120 sentinel,
+        // which makes `plrDb` large and a FLOOR satisfied either way.
+        if (m.loudnessValid && ! core::exactlyEqual (req.minPlrDb, -std::numeric_limits<double>::infinity())
+            && m.plrDb < req.minPlrDb)
             v |= constraintBit (MasteringConstraint::PeakToLoudness);
         // LRA is a DELTA against the input's, and it is only asked when both ends are measurements.
         if (! core::exactlyEqual (req.maxLraLossLu, std::numeric_limits<double>::infinity())
@@ -1470,21 +1808,29 @@ private:
                      const LoudnessRequest& req, MasterMeasurement& m, LoudnessSolution& sol, ProgressClock& clock)
     {
         (void) params;
-        compHist_.reset();
-        limHist_.reset();
-        compActive_ = 0; limActive_ = 0; compFrames_ = 0; limFrames_ = 0;
         maxReconLin_ = 0.0f;
-        // The traces are reset with the histograms, at the same place and for the same reason: whatever they held
-        // described a render that is about to be overwritten in `out`.
+        // Each tap on its own clock: the compressor's is one sample a frame, the limiter's `tapOversampleFactor`
+        // times faster, and the window is 4 ms on both.
+        GainReductionSummariser compSum (compHist_, grQuantileWindowSamples (fs_), req.activityThresholdDb);
+        GainReductionSummariser limSum  (limHist_, grQuantileWindowSamples (fs_ * (double) chain.tapOversampleFactor()),
+                                         req.activityThresholdDb);
+        // The traces and the solution's copies of the distributions are reset with the histograms: whatever they
+        // held describes a render about to be overwritten in `out`.
         GainReductionTraceBuilder compTrace (sol.compressorTrace, frames, req.grTraceBuckets);
         GainReductionTraceBuilder limTrace  (sol.limiterTrace, frames, req.grTraceBuckets);
-        if (! renderTapped (chain, renderer, in, out, nch, frames, req, compTrace, limTrace, clock)) return false;
+        sol.compressorGrWindows.reset();
+        sol.limiterGrWindows.reset();
+        if (! renderTapped (chain, renderer, in, out, nch, frames, compSum, limSum, compTrace, limTrace, clock)) return false;
         compTrace.finish();
         limTrace.finish();
 
         m.latencySamples = chain.latencySamples();
-        m.compressor = summarise (compHist_, compActive_, compFrames_);
-        m.limiter    = summarise (limHist_,  limActive_,  limFrames_);
+        // EACH STAGE AT ITS OWN LIMIT'S `q`: `grStatisticValue` reads `quantileDb` without knowing which
+        // fraction produced it, so the fraction must be that stage's limit's.
+        m.compressor = compSum.finish (req.compressorGr.quantile);
+        m.limiter    = limSum.finish  (req.limiterGr.quantile);
+        sol.compressorGrWindows = compHist_;
+        sol.limiterGrWindows    = limHist_;
         // `gainToDbDet` for the same reason as peakDb() above, and this one is the stronger case of the two:
         // the field crosses the C ABI into the browser (fc_master_abi.h, fc_master.cpp) AND it is read back
         // as a DECISION — `headroomToEngage = ceiling - m.limiterMaxReconstructedPeakDb` a few hundred lines
@@ -1498,7 +1844,8 @@ private:
     // alignment arithmetic. The sink below is the only thing this class adds to a plain render.
     bool renderTapped (MasteringChain& chain, OfflineRenderer& renderer,
                        const float* const* in, float* const* out, int nch, int frames,
-                       const LoudnessRequest& req, GainReductionTraceBuilder& compTrace, GainReductionTraceBuilder& limTrace,
+                       GainReductionSummariser& compSum, GainReductionSummariser& limSum,
+                       GainReductionTraceBuilder& compTrace, GainReductionTraceBuilder& limTrace,
                        ProgressClock& clock)
     {
         const int F = chain.tapOversampleFactor();
@@ -1520,7 +1867,6 @@ private:
         const long long compTo   = compFrom + frames;
         const long long limFrom  = r.limiterTapOffset;
         const long long limTo    = limFrom + frames;
-        const double activityDb = req.activityThresholdDb;
 
         MasteringChainTaps taps;
         taps.compressorGrDb = compTap_.data();
@@ -1537,9 +1883,7 @@ private:
                 if (s >= compFrom && s < compTo)
                 {
                     const double a = std::fabs ((double) compTap_[(std::size_t) j]);
-                    compHist_.add (a);
-                    if (a > activityDb) ++compActive_;
-                    ++compFrames_;
+                    compSum.add (a);
                     compTrace.add ((std::uint64_t) (s - compFrom), a);
                 }
                 if (s >= limFrom && s < limTo)
@@ -1547,9 +1891,7 @@ private:
                     {
                         const std::size_t idx = (std::size_t) j * (std::size_t) F + (std::size_t) k;
                         const double a = std::fabs ((double) limTap_[idx]);
-                        limHist_.add (a);
-                        if (a > activityDb) ++limActive_;
-                        ++limFrames_;
+                        limSum.add (a);
                         const float pk = limPeak_[idx];
                         if (pk > maxReconLin_) maxReconLin_ = pk;
                         limTrace.add ((std::uint64_t) (s - limFrom), a);
@@ -1557,24 +1899,6 @@ private:
             }
         };
         return renderer.render (chain, in, out, nch, frames, taps, sink, &clock);
-    }
-
-    static GainReductionStats summarise (const dynamics::offline::QuantileHistogram& h,
-                                         std::uint64_t active, std::uint64_t frames) noexcept
-    {
-        GainReductionStats s;
-        s.frames = frames;
-        s.nonFinite = h.nonFiniteCount();
-        s.aboveRange = h.aboveRange();
-        if (frames == 0 || h.count() == 0) return s;
-        double p95 = 0.0;
-        if (! h.quantile (0.95, p95)) return s;      // out of range: NOT reported as a plausible number
-        s.meanDb = h.mean();
-        s.p95Db  = p95;
-        s.maxDb  = h.maxValue();
-        s.activeFraction = (double) active / (double) frames;
-        s.valid = (s.nonFinite == 0);
-        return s;
     }
 
     // THE TWO RULES THE MEASURING RIG OWES, both measured rather than argued:
@@ -1780,7 +2104,6 @@ private:
 
     std::vector<float> compTap_, limTap_, limPeak_;
     dynamics::offline::QuantileHistogram compHist_, limHist_;
-    std::uint64_t compActive_ = 0, limActive_ = 0, compFrames_ = 0, limFrames_ = 0;
     float  maxReconLin_ = 0.0f;
 
     double weights_[core::kMaxChannels] { };
