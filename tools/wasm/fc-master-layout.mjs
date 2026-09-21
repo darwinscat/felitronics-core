@@ -356,11 +356,208 @@ export const FC_CONSTRAINT = [
     'None', 'TruePeak', 'LimiterGr', 'Plr', 'Lra', 'GainRange', 'CompressorGr',
 ];
 
-// fc_eq_axis (v7), in the order the header declares it: the INDEX is the code `_fc_master_eq_curve` takes for
-// `lane`. The order, the length and the spelling are held against that enum by layout-check.mjs, which reads
-// `FC_EQ_AXIS_*` out of tools/fc_master_abi.h and compares it entry by entry — a permutation in the header is a
-// failure there, not a silent disagreement here. This is the one list of lane names a consumer needs.
-export const FC_EQ_AXIS = ['Stereo', 'Left', 'Right', 'Mid', 'Side'];
+// ── the enum codes ────────────────────────────────────────────────────────────────────────────────
+//
+// One list per enum a caller writes into a struct or passes to an entry point. THE INDEX IS THE CODE. A name is
+// the header suffix with the underscores dropped and the words capitalised; `FC_ENUMS` below names the header
+// enum and the prefix each list mirrors, and layout-check.mjs holds every list against it — order, value and
+// letters, in both directions.
+export const FC_EQ_AXIS       = ['Stereo', 'Left', 'Right', 'Mid', 'Side'];                    // v7, `lane` of eq_curve
+export const FC_FILTER_TYPE   = ['Bell', 'LowShelf', 'HighShelf', 'HighPass', 'LowPass',
+                                 'BandPass', 'Notch', 'AllPass', 'Tilt'];                      // fc_eq_band.type
+export const FC_DETECTOR      = ['Peak', 'Rms'];                                               // fc_compressor.detector
+export const FC_LINK_MODE     = ['Max', 'MeanPower'];                                          // fc_compressor.link
+export const FC_COMP_MODE     = ['DownCompress', 'UpCompress', 'DownExpand'];                  // fc_compressor.mode
+export const FC_SHAPE         = ['Tanh', 'Atan', 'Cubic', 'Asym'];                             // fc_clipper.shape
+export const FC_NOISE_SHAPING = ['None', 'Weighted', 'Psycho'];                                // fc_dither.shaping
+export const FC_GR_STATISTIC  = ['Mean', 'P95', 'Max', 'Percentile'];                          // fc_gr_limit.statistic
+export const FC_GR_STAGE      = ['Compressor', 'Limiter'];                                     // `stage` of gr_trace
+export const FC_PROGRESS_STAGE= ['Convert', 'Lra', 'Pass', 'Final', 'Render'];                 // fc_progress.stage
+
+// Which header enum each list mirrors, and under which prefix — the gate reads this rather than a list of its
+// own, so a list added here without a header enum to hold it against is a failure and not an omission.
+export const FC_ENUMS = {
+    FC_EQ_AXIS:        { enum: 'fc_eq_axis',        prefix: 'FC_EQ_AXIS_',   names: FC_EQ_AXIS },
+    FC_FILTER_TYPE:    { enum: 'fc_filter_type',    prefix: 'FC_FILTER_',    names: FC_FILTER_TYPE },
+    FC_DETECTOR:       { enum: 'fc_detector',       prefix: 'FC_DETECTOR_',  names: FC_DETECTOR },
+    FC_LINK_MODE:      { enum: 'fc_link_mode',      prefix: 'FC_LINK_',      names: FC_LINK_MODE },
+    FC_COMP_MODE:      { enum: 'fc_comp_mode',      prefix: 'FC_COMP_',      names: FC_COMP_MODE },
+    FC_SHAPE:          { enum: 'fc_shape',          prefix: 'FC_SHAPE_',     names: FC_SHAPE },
+    FC_NOISE_SHAPING:  { enum: 'fc_noise_shaping',  prefix: 'FC_SHAPING_',   names: FC_NOISE_SHAPING },
+    FC_GR_STATISTIC:   { enum: 'fc_gr_statistic',   prefix: 'FC_GR_',        names: FC_GR_STATISTIC },
+    FC_GR_STAGE:       { enum: 'fc_gr_stage',       prefix: 'FC_GR_STAGE_',  names: FC_GR_STAGE },
+    FC_PROGRESS_STAGE: { enum: 'fc_progress_stage', prefix: 'FC_PROGRESS_',  names: FC_PROGRESS_STAGE },
+};
+
+// ==================================================================================================
+// THE FIELD DOMAINS
+// ==================================================================================================
+// What every input field of `fc_master_config`, `fc_master_params` and `fc_loudness_request` ADMITS, where the
+// boundary is, and what a value on the far side of it does. Every number is the code's: the checks in `toCore`
+// and `fc_master_create` (tools/wasm/fc_master.cpp), each module's own `prepare`/`setParams` clamps, and
+// `TargetLoudnessSolver::admits`. A field the code does not bound is written down as unbounded.
+//
+// NO ROW HAS A LIST-VALUED DOMAIN: every one is an interval, an enum code range, or unbounded. Two that look
+// list-valued are not — `oversampleFactor` admits every INTEGER in its interval (the mastering chain builds the
+// Kaiser oversampler, which has no power-of-two restriction), and `dither.bits` refuses nothing.
+//
+// tools/tests/MasterDomainsTests.cpp holds this table against the running ABI with a real call per bound.
+//
+// THE COLUMNS
+//   field      the path from the struct root; `[]` stands for EVERY element (all 24 bands, all 5 lanes)
+//   unit       dB · dBTP · dB/oct · LUFS · LU · Hz · ms · x (a multiplier) · fraction · frames · samples ·
+//              count · bits · code (an opaque 32-bit value) · flag (0 / non-0) · enum:<NAME> (an index into
+//              that list above)
+//   min, max   the bound, `null` where the code has none, or a string in `sr` — the CHAIN sample rate (the
+//              delivery rate on a delivering handle) — which `domainBound()` below evaluates
+//   open       which bound is EXCLUSIVE ('max' means the bound itself is already outside), '' when both are inclusive
+//   edge       what a value outside the interval does:
+//                'refuse'  the call is refused with `err`, nothing moves
+//                'clamp'   ⚠ the value is SILENTLY pulled to the bound and the call succeeds — `resolved` says
+//                          where the applied value can be read back, and '' means it cannot be read anywhere
+//                'verdict' `fc_master_solve` still answers FC_OK; the SOLUTION carries `err` (an FC_SOLVE_* name),
+//                          so this one has to be caught by reading the summary, not the status
+//                'free'    the code bounds nothing — only the finiteness check in `nonFinite` stands
+//                'any'     every value of the field type means something (a flag read as `!= 0`, an opaque code)
+//   err        the refusal that names this boundary, '' where there is none
+//   nonFinite  'refuse'      NaN and both infinities are FC_ERR_NON_FINITE
+//              'verdict'     any non-finite value is FC_SOLVE_INVALID_REQUEST
+//              'nan-verdict' a NaN is FC_SOLVE_INVALID_REQUEST; the infinities are ordinary values of this field
+//              'off'         a non-finite value switches the field off / means "not supplied"
+//              'none'        an integer field
+//   resolved   where the APPLIED value can be read back: a field of `fc_master_resolved`, `eqCurve` (the
+//              magnitude `fc_master_eq_curve` answers), `render` (what the chain puts out), or '' — the
+//              applied value is not observable through this ABI at all
+//   depends    what else moves this domain — the sample rate, or another field
+//
+// 'refuse' AGAINST 'clamp' IS THE DISTINCTION AN INTERFACE NEEDS. A refusal is a status on the call that made
+// it. A clamp is silent, and shows only in what was rendered: every 'clamp' row is a control that must bound
+// itself, because the core will not complain.
+export const FC_DOMAINS = [
+    // ── fc_master_config — the topology, fixed for the life of a handle (`fc_master_create`) ──────
+    { field: 'fc_master_config.sampleRate', unit: 'Hz', min: 8000, max: 3e6, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'refuse', resolved: '', depends: 'deliveryRate: when it is not 0 this is the SOURCE rate and the chain runs at the delivery rate, and the pair must have a resampling route' },
+    { field: 'fc_master_config.channels', unit: 'count', min: 1, max: 16, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'none', resolved: '', depends: 'monoBass: with the mono-bass stage on the only admitted width is 2' },
+    { field: 'fc_master_config.internalBlock', unit: 'frames', min: 8, max: 8192, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'none', resolved: 'internalBlock', depends: '' },
+    { field: 'fc_master_config.eq', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_config.monoBass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'none', resolved: '', depends: 'channels: on with a width other than 2 the create is refused, because the stage would leave the buffer untouched' },
+    { field: 'fc_master_config.compressor', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_config.clipper', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_config.limiter', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_config.dither', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_config.compressorLookaheadMs', unit: 'ms', min: 0, max: 250, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'refuse', resolved: '', depends: 'compressor: the 250 ms ceiling is the compressor stage own and is only reached with the stage on; a negative value is refused either way' },
+    { field: 'fc_master_config.limiterLookaheadMs', unit: 'ms', min: '2000/sr', max: 20, open: '', edge: 'clamp', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'refuse', resolved: '', depends: 'sampleRate: the floor is 2 baseband samples. A NEGATIVE value is refused; everything from 0 up is clamped into the interval, and the applied lookahead is readable only in SAMPLES as resolved.limiterLookahead' },
+    { field: 'fc_master_config.oversampleFactor', unit: 'x', min: 2, max: 16, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'none', resolved: 'oversampleFactor', depends: 'limiter and clipper: 16 is the limiter ceiling, 64 the clipper ceiling with no limiter, and with both stages off nothing above 2 is refused at all - and the resolved value is then 0, since no stage oversamples' },
+    { field: 'fc_master_config.tapsPerPhase', unit: 'count', min: 4, max: 1024, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'none', resolved: '', depends: 'limiter and clipper: the 1024 ceiling is the oversampler own, so with both stages off only the floor of 4 stands' },
+    { field: 'fc_master_config.sidechainHpfHz', unit: 'Hz', min: 0, max: '0.5*sr', open: 'max', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'refuse', resolved: '', depends: 'sampleRate: the Nyquist itself is already refused' },
+    { field: 'fc_master_config.deliveryRate', unit: 'Hz', min: 8000, max: 3e6, open: '', edge: 'refuse', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'refuse', resolved: '', depends: '0 means no conversion. Inside the interval the value must also be a WHOLE number of hertz and share a resampling route with sampleRate, so the interval is necessary and not sufficient' },
+
+    // ── fc_master_params — per-configure, and every numeric field of it is CLAMPED rather than refused ──
+    // The only refusals this struct can make are the two the ABI makes on its own: a non-finite number, and an
+    // enum code this version does not define. Nothing in `fc_master_configure` below the mapping can say no —
+    // the chain re-prepares at the geometry the handle already has — so a value out of range is a clamp, always.
+    { field: 'fc_master_params.inputGainDb', unit: 'dB', min: -60, max: 60, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
+    { field: 'fc_master_params.preLimiterGainDb', unit: 'dB', min: -60, max: 60, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
+    { field: 'fc_master_params.compressorMix', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'compressorMix', depends: 'compressor: 0 is reported without the stage, whatever was asked for' },
+    { field: 'fc_master_params.limiterDualRelease', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.limiterSlowReleaseMs', unit: 'ms', min: '8000/sr', max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'limiterSlowReleaseMs', depends: 'sampleRate: the floor is 8 baseband samples. limiterDualRelease: the resolved value reads 0 while the second envelope is off' },
+    { field: 'fc_master_params.bypassEq', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.bypassMonoBass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.bypassCompressor', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.bypassClipper', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.bypassLimiter', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.bypassDither', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+
+    // ── fc_master_params.eqBands[] — every band, and `lanes[]` every lane of it ───────────────────
+    { field: 'fc_master_params.eqBands[].on', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].type', unit: 'enum:FC_FILTER_TYPE', min: 0, max: 8, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].swept', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].bypass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].dyn.on', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].dyn.rangeDb', unit: 'dB', min: -30, max: 30, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].dyn.thrDb', unit: 'dB', min: -120, max: 24, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: 'dyn.thrAuto: an ABSOLUTE dBFS threshold, read ONLY while the automatic threshold is off' },
+    { field: 'fc_master_params.eqBands[].dyn.thrAuto', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].dyn.atk', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].dyn.rel', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].lanes[].on', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].lanes[].freq', unit: 'Hz', min: 10, max: '0.49*sr', open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'eqCurve', depends: 'sampleRate' },
+    { field: 'fc_master_params.eqBands[].lanes[].q', unit: 'x', min: 0.05, max: 40, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'eqCurve', depends: '' },
+    { field: 'fc_master_params.eqBands[].lanes[].gainDb', unit: 'dB', min: -30, max: 30, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'eqCurve', depends: '' },
+    { field: 'fc_master_params.eqBands[].lanes[].slope', unit: 'dB/oct', min: 6, max: 96, open: '', edge: 'clamp', err: '', nonFinite: 'none', resolved: '', depends: 'eqBands[].type: read only by the cut, notch and band-pass types, and read as slope/6 POLES clamped to [1, 16] — so only multiples of 6 are distinct and everything below 6 behaves as 6' },
+    { field: 'fc_master_params.eqBands[].lanes[].bypass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+
+    // ── fc_master_params.monoBass ─────────────────────────────────────────────────────────────────
+    { field: 'fc_master_params.monoBass.enabled', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: 'monoBass.enabled', depends: 'fc_master_config.monoBass: the resolved flag is the AND of the two, so it reads 0 whenever the stage is not in the chain' },
+    { field: 'fc_master_params.monoBass.frequencyHz', unit: 'Hz', min: 20, max: '0.45*sr', open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'monoBass.frequencyHz', depends: 'sampleRate' },
+    { field: 'fc_master_params.monoBass.lowWidth', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'monoBass.lowWidth', depends: '' },
+
+    // ── fc_master_params.compressor ───────────────────────────────────────────────────────────────
+    { field: 'fc_master_params.compressor.detector', unit: 'enum:FC_DETECTOR', min: 0, max: 1, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.compressor.link', unit: 'enum:FC_LINK_MODE', min: 0, max: 1, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.compressor.rmsWindowMs', unit: 'ms', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'compressor.detector: read only by the Rms detector. At or below 0 the envelope is instant' },
+    { field: 'fc_master_params.compressor.mode', unit: 'enum:FC_COMP_MODE', min: 0, max: 2, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.compressor.thresholdDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'the detector level enters the curve through a floor of -240 dB, so a threshold below that makes digital silence an ACTIVE sample' },
+    { field: 'fc_master_params.compressor.ratio', unit: 'x', min: 1, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
+    { field: 'fc_master_params.compressor.kneeDb', unit: 'dB', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.compressor.rangeDb', unit: 'dB', min: 0, max: 400, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.compressor.attackMs', unit: 'ms', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'at or below 0 the ballistics are instant, and a time long enough to round the coefficient to 1 is backed off so the envelope never freezes' },
+    { field: 'fc_master_params.compressor.releaseMs', unit: 'ms', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'as attackMs' },
+    { field: 'fc_master_params.compressor.makeupDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'what is bounded is the SUM of this and the gain reduction, inside the render, and not this field' },
+    { field: 'fc_master_params.compressor.autoMakeup', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+
+    // ── fc_master_params.clipper ──────────────────────────────────────────────────────────────────
+    { field: 'fc_master_params.clipper.shape', unit: 'enum:FC_SHAPE', min: 0, max: 3, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.clipper.driveDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'the drive the shaper runs is dbToGain(driveDb) - 1 floored at 1e-4, so every value at or below 0.00087 dB is the same linear stage' },
+    { field: 'fc_master_params.clipper.bias', unit: 'fraction', min: -0.95, max: 0.95, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'clipper.shape: read only by Asym' },
+    { field: 'fc_master_params.clipper.mix', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
+    { field: 'fc_master_params.clipper.outputDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.clipper.autoComp', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
+    { field: 'fc_master_params.clipper.dcBlockHz', unit: 'Hz', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'sampleRate AND oversampleFactor: the corner is clamped to [0, 0.49*sr*oversampleFactor], the blocker runs in the OVERSAMPLED domain, and clipper.shape gates it — only Asym enables it at all' },
+
+    // ── fc_master_params.limiter ──────────────────────────────────────────────────────────────────
+    { field: 'fc_master_params.limiter.ceilingDbTp', unit: 'dBTP', min: -200, max: 60, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'limiterCeilingDbTp', depends: '' },
+    { field: 'fc_master_params.limiter.releaseMs', unit: 'ms', min: '8000/sr', max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'limiterReleaseMs', depends: 'sampleRate: the floor is 8 baseband samples. A time long enough to round the coefficient to 1 is backed off, so the recovery never stops' },
+
+    // ── fc_master_params.dither ───────────────────────────────────────────────────────────────────
+    { field: 'fc_master_params.dither.bits', unit: 'bits', min: 2, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'none', resolved: 'render', depends: 'nothing is refused. The quantiser scale is built from bits clamped to [2, 31], so everything below 2 is 2 - but the TOP is not a clamp: any value of 32 or more BYPASSES the stage entirely (a float export), which is why there is no max here' },
+    { field: 'fc_master_params.dither.shaping', unit: 'enum:FC_NOISE_SHAPING', min: 0, max: 2, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.dither.seedLo', unit: 'code', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: 'the low half of the 64-bit seed; every 32-bit value is a seed' },
+    { field: 'fc_master_params.dither.seedHi', unit: 'code', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: 'the high half of the 64-bit seed' },
+    { field: 'fc_master_params.dither.autoBlank', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_master_params.dither.autoBlankSamples', unit: 'samples', min: 1, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'none', resolved: 'render', depends: '' },
+
+    // ── fc_loudness_request — judged by the SOLVER, so its refusals arrive as a VERDICT ───────────
+    // `fc_master_solve` answers FC_OK for every row below (the two enum codes excepted, which the mapping
+    // refuses before the solver is reached) and the solution carries FC_SOLVE_INVALID_REQUEST. Read the summary.
+    // The infinities are MEANINGFUL here and are not swept away: `limitDb` at +infinity is "no limit",
+    // `minPlrDb` at -infinity is "no limit", a non-finite `inputLoudnessRangeLu` is "not supplied" and a
+    // non-finite `initialGainDb` is "use the parameter set own gain".
+    { field: 'fc_loudness_request.targetLufs', unit: 'LUFS', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'verdict', resolved: '', depends: 'REQUIRED: the defaults writer leaves it NaN on purpose, because a delivery target is a product policy' },
+    { field: 'fc_loudness_request.toleranceLu', unit: 'LU', min: 0, max: null, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: '' },
+    { field: 'fc_loudness_request.maxTruePeakDbTp', unit: 'dBTP', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'verdict', resolved: '', depends: 'REQUIRED, and it is the DELIVERED measured peak, not the limiter setting, which the solver derives' },
+    { field: 'fc_loudness_request.truePeakAimDb', unit: 'dB', min: 0, max: null, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: '' },
+    { field: 'fc_loudness_request.limiterGr.limitDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'nan-verdict', resolved: '', depends: '+infinity is the OFF value and the default; a NaN is malformed' },
+    { field: 'fc_loudness_request.limiterGr.statistic', unit: 'enum:FC_GR_STATISTIC', min: 0, max: 3, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_loudness_request.compressorGr.limitDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'nan-verdict', resolved: '', depends: 'as limiterGr.limitDb' },
+    { field: 'fc_loudness_request.compressorGr.statistic', unit: 'enum:FC_GR_STATISTIC', min: 0, max: 3, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
+    { field: 'fc_loudness_request.minPlrDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'nan-verdict', resolved: '', depends: '-infinity is the OFF value and the default' },
+    { field: 'fc_loudness_request.maxLraLossLu', unit: 'LU', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'nan-verdict', resolved: '', depends: '+infinity is the OFF value and the default. It is a LOSS against inputLoudnessRangeLu, not an absolute floor' },
+    { field: 'fc_loudness_request.inputLoudnessRangeLu', unit: 'LU', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'maxLraLossLu: it is the other end of that delta, and a non-finite value switches the pair off' },
+    { field: 'fc_loudness_request.activityThresholdDb', unit: 'dB', min: 0, max: null, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: '' },
+    { field: 'fc_loudness_request.maxPasses', unit: 'count', min: 1, max: 32, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'it bounds the SEARCH; the delivered solution can cost two renders more, and the summary passes count says so' },
+    { field: 'fc_loudness_request.initialGainDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'a non-finite value means start from the parameter set own preLimiterGainDb' },
+    { field: 'fc_loudness_request.grTraceBuckets', unit: 'count', min: 1, max: 65536, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'the trace actually built has min(this, programme frames) buckets' },
+    { field: 'fc_loudness_request.limiterGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'admitted WHATEVER the statistic is, so a 0 here is refused even when the limit does not read it' },
+    { field: 'fc_loudness_request.compressorGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'as limiterGrQuantile' },
+];
+
+// A bound of FC_DOMAINS at a given CHAIN sample rate: a number passes through, `null` stays null, and the two
+// string forms `<a>*sr` and `<a>/sr` are evaluated. There is no third form; anything else throws.
+export function domainBound (bound, sampleRate) {
+    if (bound === null || typeof bound === 'number') return bound;
+    const m = /^(-?[0-9.eE+-]+)([*/])sr$/.exec(String(bound));
+    if (!m) throw new Error(`fc-master-layout: '${bound}' is not a domain bound — use a number, null, <a>*sr or <a>/sr`);
+    return m[2] === '*' ? Number(m[1]) * sampleRate : Number(m[1]) / sampleRate;
+}
 
 // The one check this file can make about itself before anything is rendered. Called by every loader; throws
 // rather than returning, because a mismatch here means every later refusal would be FC_ERR_STRUCT_SIZE with no

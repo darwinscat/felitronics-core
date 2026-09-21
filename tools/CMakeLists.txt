@@ -102,6 +102,21 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_master_abi_reentry_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_master_abi_reentry_tests COMMAND felitronics_master_abi_reentry_tests)
 
+    # `FC_DOMAINS` of tools/wasm/fc-master-layout.mjs against the running ABI, one real call per bound. The
+    # table is the test's ARGUMENT and every probe is derived from its numbers. Same arrangement as the suites
+    # above — the shim compiles natively, so this runs under ASan too.
+    # NOT ON THE WASM TIER: the suite reads the layout file off the host filesystem, which the node runner the
+    # emscripten tests go through does not have. layout-check.mjs holds the same table against the wasm build.
+    if(NOT EMSCRIPTEN)
+        add_executable(felitronics_master_domains_tests tests/MasterDomainsTests.cpp wasm/fc_master.cpp)
+        target_link_libraries(felitronics_master_domains_tests PRIVATE felitronics::mastering felitronics::analysis)
+        target_include_directories(felitronics_master_domains_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${felitronics_core_SOURCE_DIR}/test_support)
+        target_compile_features(felitronics_master_domains_tests PRIVATE cxx_std_20)
+        add_test(NAME felitronics_master_domains_tests
+                 COMMAND felitronics_master_domains_tests ${CMAKE_CURRENT_SOURCE_DIR}/wasm/fc-master-layout.mjs)
+    endif()
+
     add_executable(felitronics_master_abi_progress_tests tests/MasterAbiProgressTests.cpp wasm/fc_master.cpp)
     target_link_libraries(felitronics_master_abi_progress_tests PRIVATE felitronics::mastering felitronics::analysis)
     target_include_directories(felitronics_master_abi_progress_tests PRIVATE
