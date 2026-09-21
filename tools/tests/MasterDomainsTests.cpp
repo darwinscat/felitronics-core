@@ -24,7 +24,11 @@
 // WHAT IT DOES NOT CATCH: a row DEMOTED to a weaker claim — `clamp` rewritten as `free` or `any` with the
 // bounds dropped — since an unbounded row asserts only that huge values are accepted, which a clamped field
 // also does. The structural half of that class is closed (a floating field may not be `any`, an integer may not
-// be `free`, neither may carry a bound), and every run prints the rows whose clamp nothing here can pin.
+// be `free`, neither may carry a bound). What is left cannot be closed by testing the claim, because a field
+// the code does not bound and a field whose EFFECT saturates look the same from outside.
+//
+// AND WHAT NOTHING HERE CAN PIN is printed by name on every run: a clamp with no read-back can be shown to be
+// a clamp rather than a refusal, and no more.
 
 #include <felitronics_test.h>
 
@@ -56,14 +60,18 @@ constexpr std::uint32_t kSolveFrames = 4800;       // 0.1 s: `admits()` runs bef
 //==============================================================================
 // THE TABLE, READ OUT OF THE JAVASCRIPT
 
-// A bound: a number, nothing at all, or `<a>*sr` / `<a>/sr` — the three forms `domainBound()` evaluates.
+// A bound: a number, nothing at all, or `<a>*sr` / `<a>/sr` / `<a>*sr*os` — the four forms `domainBound()`
+// evaluates, `sr` being the chain rate and `os` the oversample factor.
 struct Bound
 {
     bool   present = false;
     double a       = 0.0;
-    char   op      = 0;            // 0 = a plain number · '*' or '/' = scaled by the sample rate
-    double at (double sr) const noexcept { return op == '*' ? a * sr : op == '/' ? a / sr : a; }
-    bool   scaled() const noexcept { return op != 0; }
+    char   op      = 0;            // 0 = a plain number · '*' = a*sr · '/' = a/sr · 'o' = a*sr*os
+    double at (double sr, double os) const noexcept
+    {
+        return op == '*' ? a * sr : op == '/' ? a / sr : op == 'o' ? a * sr * os : a;
+    }
+    bool scaled() const noexcept { return op != 0; }
 };
 
 struct Row
@@ -79,13 +87,14 @@ bool parseBound (std::string t, Bound& out)
     if (t == "null") { out = Bound {}; return true; }
     if (t.size() >= 2 && t.front() == '\'' && t.back() == '\'')
     {
-        static const std::regex re (R"(^(-?[0-9.eE+-]+)([*/])sr$)");
+        static const std::regex re (R"(^(-?[0-9.eE+-]+)(\*sr\*os|\*sr|/sr)$)");
         std::smatch m;
         const std::string body = t.substr (1, t.size() - 2);
         if (! std::regex_match (body, m, re)) return false;
+        const std::string tail = m[2].str();
         out.present = true;
         out.a       = std::strtod (m[1].str().c_str(), nullptr);
-        out.op      = m[2].str()[0];
+        out.op      = tail == "/sr" ? '/' : tail == "*sr" ? '*' : 'o';
         return true;
     }
     char* end = nullptr;
@@ -176,12 +185,20 @@ struct World
     fc_loudness_request req {};
 };
 
+// `stepRel`/`stepAbs` are the RESOLUTION OF THIS FIELD'S READ-BACK — the smallest change at a bound the
+// read-back can still tell apart, and therefore how tightly the bound is pinned. 0 takes the default for the
+// field's type and the row's `edge`: a status boundary is sharp, a read-back is not. `arm` is the parameter
+// set under which the bound is observable at all, applied BEFORE the probed field is written; its argument
+// says which bound is being approached, for the fields whose two ends need different signals.
 struct Knob
 {
     const char* field;
     Where       where;
     Ty          type;
     void      (*set) (World&, double);
+    double      stepRel = 0.0;
+    double      stepAbs = 0.0;
+    void      (*arm) (World&, bool isMin) = nullptr;
 };
 
 // A double into an integer field WITHOUT the out-of-range conversion, which is undefined and is exactly what a
@@ -219,6 +236,31 @@ std::uint32_t toU32 (double v) noexcept
 #define EQL_I(path, member) { path, Where::Params, Ty::I32, [] (World& w, double v) \
     { w.prm.eqBands[0].lanes[0].member = toI32 (v); w.prm.eqBands[FC_MAX_EQ_BANDS - 1].lanes[FC_MAX_EQ_LANES - 1].member = toI32 (v); } }
 
+// The same three, with a probe resolution and an arming.
+#define PRM_DX(path, member, rel, ab, armfn) { path, Where::Params, Ty::F64, \
+    [] (World& w, double v) { w.prm.member = v; }, rel, ab, armfn }
+#define EQB_DX(path, member, rel, ab, armfn) { path, Where::Params, Ty::F64, \
+    [] (World& w, double v) { w.prm.eqBands[0].member = v; w.prm.eqBands[FC_MAX_EQ_BANDS - 1].member = v; }, \
+    rel, ab, armfn }
+#define REQ_DX(path, member, rel, ab, armfn) { path, Where::Request, Ty::F64, \
+    [] (World& w, double v) { w.req.member = v; }, rel, ab, armfn }
+
+// THE ARMINGS. Each is a parameter set under which one field's bound is REACHABLE: an idle stage, a delta
+// already hard against its cap, or a quantiser whose step is coarser than the probe all make a clamp
+// invisible, and an invisible clamp cannot be pinned to the place the table puts it.
+void armNoDither (World& w, bool) { w.cfg.dither = 0; }
+
+// The compressor's range caps the DELTA, so it bites only where the delta would exceed it.
+void armCompCap (World& w, bool)
+{
+    w.cfg.dither = 0;
+    w.prm.compressor.thresholdDb = -2000.0;
+}
+
+// The search moves the gain after its first render, so what it reports is the gain it was GIVEN only while
+// there is one pass to give it to.
+void armOnePass (World& w, bool) { w.req.maxPasses = 1; }
+
 const Knob kKnobs[] = {
     CFG_D ("fc_master_config.sampleRate", sampleRate),
     // THE MONO-BASS STAGE IS TURNED OFF BY THIS ONE WRITER, unconditionally: the stage admits a width of 2 and
@@ -240,11 +282,11 @@ const Knob kKnobs[] = {
     { "fc_master_config.deliveryRate", Where::Config, Ty::F64W,
       [] (World& w, double v) { w.cfg.deliveryRate = std::round (v); } },   // whole hertz, or no route at all
 
-    PRM_D ("fc_master_params.inputGainDb", inputGainDb),
-    PRM_D ("fc_master_params.preLimiterGainDb", preLimiterGainDb),
-    PRM_D ("fc_master_params.compressorMix", compressorMix),
+    PRM_DX ("fc_master_params.inputGainDb", inputGainDb, 1.0e-6, 1.0e-6, armNoDither),
+    PRM_DX ("fc_master_params.preLimiterGainDb", preLimiterGainDb, 1.0e-6, 1.0e-6, armNoDither),
+    PRM_DX ("fc_master_params.compressorMix", compressorMix, 1.0e-6, 1.0e-6, nullptr),
     PRM_I ("fc_master_params.limiterDualRelease", limiterDualRelease),
-    PRM_D ("fc_master_params.limiterSlowReleaseMs", limiterSlowReleaseMs),
+    PRM_DX ("fc_master_params.limiterSlowReleaseMs", limiterSlowReleaseMs, 1.0e-4, 1.0e-4, nullptr),
     PRM_I ("fc_master_params.bypassEq", bypassEq),
     PRM_I ("fc_master_params.bypassMonoBass", bypassMonoBass),
     PRM_I ("fc_master_params.bypassCompressor", bypassCompressor),
@@ -275,14 +317,14 @@ const Knob kKnobs[] = {
 
     PRM_I ("fc_master_params.compressor.detector", compressor.detector),
     PRM_I ("fc_master_params.compressor.link", compressor.link),
-    PRM_D ("fc_master_params.compressor.rmsWindowMs", compressor.rmsWindowMs),
+    PRM_DX ("fc_master_params.compressor.rmsWindowMs", compressor.rmsWindowMs, 1.0e-6, 1.0e-2, armNoDither),
     PRM_I ("fc_master_params.compressor.mode", compressor.mode),
     PRM_D ("fc_master_params.compressor.thresholdDb", compressor.thresholdDb),
-    PRM_D ("fc_master_params.compressor.ratio", compressor.ratio),
-    PRM_D ("fc_master_params.compressor.kneeDb", compressor.kneeDb),
-    PRM_D ("fc_master_params.compressor.rangeDb", compressor.rangeDb),
-    PRM_D ("fc_master_params.compressor.attackMs", compressor.attackMs),
-    PRM_D ("fc_master_params.compressor.releaseMs", compressor.releaseMs),
+    PRM_DX ("fc_master_params.compressor.ratio", compressor.ratio, 1.0e-5, 1.0e-5, armNoDither),
+    PRM_DX ("fc_master_params.compressor.kneeDb", compressor.kneeDb, 1.0e-6, 1.0, armNoDither),
+    PRM_DX ("fc_master_params.compressor.rangeDb", compressor.rangeDb, 1.0e-6, 1.0e-5, armCompCap),
+    PRM_DX ("fc_master_params.compressor.attackMs", compressor.attackMs, 1.0e-6, 1.0e-2, armNoDither),
+    PRM_DX ("fc_master_params.compressor.releaseMs", compressor.releaseMs, 1.0e-6, 1.0e-2, armNoDither),
     PRM_D ("fc_master_params.compressor.makeupDb", compressor.makeupDb),
     PRM_I ("fc_master_params.compressor.autoMakeup", compressor.autoMakeup),
 
@@ -295,7 +337,7 @@ const Knob kKnobs[] = {
     PRM_F ("fc_master_params.clipper.dcBlockHz", clipper.dcBlockHz),
 
     PRM_D ("fc_master_params.limiter.ceilingDbTp", limiter.ceilingDbTp),
-    PRM_D ("fc_master_params.limiter.releaseMs", limiter.releaseMs),
+    PRM_DX ("fc_master_params.limiter.releaseMs", limiter.releaseMs, 1.0e-4, 1.0e-4, nullptr),
 
     PRM_I ("fc_master_params.dither.bits", dither.bits),
     PRM_I ("fc_master_params.dither.shaping", dither.shaping),
@@ -317,7 +359,7 @@ const Knob kKnobs[] = {
     REQ_D ("fc_loudness_request.inputLoudnessRangeLu", inputLoudnessRangeLu),
     REQ_D ("fc_loudness_request.activityThresholdDb", activityThresholdDb),
     REQ_I ("fc_loudness_request.maxPasses", maxPasses),
-    REQ_D ("fc_loudness_request.initialGainDb", initialGainDb),
+    REQ_DX ("fc_loudness_request.initialGainDb", initialGainDb, 1.0e-9, 1.0e-9, armOnePass),
     REQ_I ("fc_loudness_request.grTraceBuckets", grTraceBuckets),
     REQ_D ("fc_loudness_request.limiterGrQuantile", limiterGrQuantile),
     REQ_D ("fc_loudness_request.compressorGrQuantile", compressorGrQuantile),
@@ -380,6 +422,13 @@ std::vector<double> eqCurve (const fc_master_params& p, double sr)
     return db;
 }
 
+bool summaryField (const fc_solution_summary& sum, const std::string& path, double& out)
+{
+    if (path == "preLimiterGainDb") { out = sum.preLimiterGainDb; return true; }
+    if (path == "ceilingDbTp")      { out = sum.ceilingDbTp;      return true; }
+    return false;
+}
+
 bool resolvedField (const fc_master_resolved& r, const std::string& path, double& out)
 {
     if (path == "internalBlock")        { out = (double) r.internalBlock;    return true; }
@@ -435,9 +484,10 @@ const std::vector<float>& programme()
     return in;
 }
 
-Result probe (const Knob& k, double value, double sr, const std::string& resolved)
+Result probe (const Knob& k, double value, double sr, const std::string& resolved, bool isMin = true)
 {
     World w = baseWorld (sr);
+    if (k.arm != nullptr) k.arm (w, isMin);
     k.set (w, value);
 
     Result out;
@@ -451,7 +501,7 @@ Result probe (const Knob& k, double value, double sr, const std::string& resolve
     if (k.where == Where::Params) out.status = cf;
     else if (k.where == Where::Config && cf != FC_OK) out.status = cf;   // an accepted geometry must configure
 
-    if (cf == FC_OK && ! resolved.empty())
+    if (cf == FC_OK && ! resolved.empty() && resolved.rfind ("summary.", 0) != 0)
     {
         if (resolved == "eqCurve") { out.read = eqCurve (w.prm, sr); out.haveRead = ! out.read.empty(); }
         else if (resolved == "render")
@@ -482,7 +532,16 @@ Result probe (const Knob& k, double value, double sr, const std::string& resolve
         if (out.status == FC_OK)
         {
             fc_solution_summary sum {}; FC_INIT (sum);
-            if (fc_solution_summary_get (s, &sum) == FC_OK) out.verdict = sum.status;
+            if (fc_solution_summary_get (s, &sum) == FC_OK)
+            {
+                out.verdict = sum.status;
+                if (resolved.rfind ("summary.", 0) == 0)
+                {
+                    double v = 0.0;
+                    if (summaryField (sum, resolved.substr (8), v)) { out.read = { v }; out.haveRead = true; }
+                    else out.readFailed = true;
+                }
+            }
             fc_solution_destroy (s);
         }
     }
@@ -502,13 +561,19 @@ std::string at (const Row& row, double sr, const std::string& what, double v)
     return buf;
 }
 
-// One step outside a bound: a hundredth of it, and never less than the smallest step the field can carry.
-double stepFor (const Knob& k, double bound)
+// ONE STEP OUTSIDE A BOUND IS THE RESOLUTION OF WHAT ANSWERS, and the bound is pinned to within it. A whole
+// number steps by 1. A status is sharp, so a refusal steps by a billionth. A read-back is not, and the field
+// says how coarse its own is (`stepRel`/`stepAbs`); the default is a float ulp's worth for an `f32` field and
+// a billionth for an `f64` one.
+double stepFor (const Knob& k, const Row& row, double bound)
 {
-    const bool   whole = (k.type == Ty::I32 || k.type == Ty::U32 || k.type == Ty::F64W);
-    const double rel   = std::fabs (bound) * 0.01;
-    const double floorStep = whole ? 1.0 : 0.01;
-    return whole ? std::round (rel > 1.0 ? rel : 1.0) : (rel > floorStep ? rel : floorStep);
+    if (k.type == Ty::I32 || k.type == Ty::U32 || k.type == Ty::F64W) return 1.0;
+    const bool   sharp = (row.edge == "refuse" || row.edge == "verdict");
+    const double tiny  = (! sharp && k.type == Ty::F32) ? 1.0e-6 : 1.0e-9;
+    const double rel   = k.stepRel > 0.0 ? k.stepRel : tiny;
+    const double abs   = k.stepAbs > 0.0 ? k.stepAbs : tiny;
+    const double sc    = std::fabs (bound) * rel;
+    return sc > abs ? sc : abs;
 }
 
 // Was this value ADMITTED? For a config or a params row that is the status; for a request row the solver's
@@ -524,8 +589,8 @@ void checkBound (const Row& row, const Knob& k, double sr, bool isMin)
 {
     const Bound& b = isMin ? row.min : row.max;
     if (! b.present) return;
-    const double bound  = b.at (sr);
-    const double step   = stepFor (k, bound);
+    const double bound  = b.at (sr, (double) baseWorld (sr).cfg.oversampleFactor);
+    const double step   = stepFor (k, row, bound);
     const double out    = isMin ? bound - step : bound + step;      // one step past it
     const double in     = isMin ? bound + step : bound - step;      // one step inside it
     const bool   isOpen = (row.open == (isMin ? "min" : "max")) || row.open == "both";
@@ -541,9 +606,9 @@ void checkBound (const Row& row, const Knob& k, double sr, bool isMin)
         // ten steps past a zero or negative one — where a bound that had crept inwards would have to ACCEPT.
         const double far = isMin ? (bound > 0.0 ? bound * 0.5 : bound - 10.0 * step)
                                  : (bound > 0.0 ? bound * 2.0 : bound + 10.0 * step);
-        const Result bad = probe (k, outside, sr, "");
-        const Result away = probe (k, far, sr, "");
-        const Result good = probe (k, inside, sr, row.resolved);
+        const Result bad = probe (k, outside, sr, "", isMin);
+        const Result away = probe (k, far, sr, "", isMin);
+        const Result good = probe (k, inside, sr, row.resolved, isMin);
         if (row.edge == "refuse")
         {
             fc_status want = FC_OK;
@@ -574,12 +639,12 @@ void checkBound (const Row& row, const Knob& k, double sr, bool isMin)
 
     if (row.edge == "clamp")
     {
-        const Result beyond = probe (k, outside, sr, row.resolved);
-        const Result atB    = probe (k, inside,  sr, row.resolved);
-        const Result within = probe (k, isMin ? inside + step : inside - step, sr, row.resolved);
-        ok (beyond.status == FC_OK, at (row, sr, "past the bound is ACCEPTED, not refused", outside)
+        const Result beyond = probe (k, outside, sr, row.resolved, isMin);
+        const Result atB    = probe (k, inside,  sr, row.resolved, isMin);
+        const Result within = probe (k, isMin ? inside + step : inside - step, sr, row.resolved, isMin);
+        ok (admitted (row, beyond), at (row, sr, "past the bound is ACCEPTED, not refused", outside)
                                     + " — " + statusName (beyond.status));
-        ok (atB.status == FC_OK, at (row, sr, "the bound itself is accepted", inside));
+        ok (admitted (row, atB), at (row, sr, "the bound itself is accepted", inside));
         ok (! atB.readFailed, row.field + ": `resolved` names no field of fc_master_resolved (" + row.resolved + ")");
         if (row.resolved.empty()) return;
         ok (beyond.haveRead && atB.haveRead && within.haveRead, row.field + ": the read-back could not be taken");
@@ -698,6 +763,23 @@ bool lookaheadSamples (double sr, double ms, int& out)
     return good;
 }
 
+std::vector<double> renderOf (const World& in)
+{
+    World w = in;
+    fc_master h = 0;
+    if (fc_master_create (&w.cfg, &h) != FC_OK) return {};
+    fc_master_resolved r {}; FC_INIT (r);
+    std::vector<double> got;
+    if (fc_master_configure (h, &w.prm, &r) == FC_OK)
+    {
+        std::vector<float> dst ((std::size_t) kSolveFrames * 2, 0.0f);
+        if (fc_master_process (h, programme().data(), dst.data(), kSolveFrames) == FC_OK)
+            got.assign (dst.begin(), dst.end());
+    }
+    fc_master_destroy (h);
+    return got;
+}
+
 std::vector<double> curveWithSlope (double sr, double slope)
 {
     World w = baseWorld (sr);
@@ -756,16 +838,21 @@ void checkDependencies (const std::vector<Row>& rows)
         if (row != nullptr)
             for (const double sr : { kFsA, kFsB })
             {
-                const double lo = row->min.at (sr), hi = row->max.at (sr);
-                int floorS = 0, belowS = 0, capS = 0, beyondS = 0, insideS = 0;
+                const std::string where = " at " + std::to_string ((int) sr) + " Hz";
+                const double lo = row->min.at (sr, 1.0), hi = row->max.at (sr, 1.0);
+                int floorS = 0, belowS = 0, twiceS = 0, capS = 0, beyondS = 0, insideS = 0;
                 const bool got = lookaheadSamples (sr, lo, floorS) && lookaheadSamples (sr, lo * 0.5, belowS)
+                              && lookaheadSamples (sr, lo * 2.0, twiceS)
                               && lookaheadSamples (sr, hi, capS) && lookaheadSamples (sr, hi * 1000.0, beyondS)
-                              && lookaheadSamples (sr, hi * 0.99, insideS);
-                ok (got, "the limiter lookahead reads back at every probe");
-                ok (floorS == 2, "the table's floor is exactly 2 baseband samples at " + std::to_string ((int) sr) + " Hz");
-                ok (belowS == floorS, "below it the lookahead is clamped, not refused");
-                ok (capS == beyondS, "the table's ceiling is where the lookahead stops growing");
-                ok (insideS < capS, "and one per cent inside it the lookahead is still shorter");
+                              && lookaheadSamples (sr, hi - 1000.0 / sr, insideS);
+                ok (got, "the limiter lookahead reads back at every probe" + where);
+                ok (floorS == 2, "the table's floor is exactly 2 baseband samples" + where);
+                ok (belowS == floorS, "below it the lookahead is clamped, not refused" + where);
+                // The floor is the SMALLEST time that rounds to 2 samples, so twice it must be 4 — a floor
+                // stated too low still reads 2 samples, because the clamp has already absorbed it.
+                ok (twiceS == 4, "and twice the floor is 4 samples, which a floor stated too low is not" + where);
+                ok (capS == beyondS, "the table's ceiling is where the lookahead stops growing" + where);
+                ok (insideS == capS - 1, "and one sample inside it the lookahead is exactly one shorter" + where);
             }
         World w = baseWorld (kFsA);
         w.cfg.limiterLookaheadMs = -1.0;
@@ -789,16 +876,38 @@ void checkDependencies (const std::vector<Row>& rows)
         ok (row != nullptr, "the table carries a row for the lane slope");
         if (row != nullptr)
         {
-            const double lo = row->min.at (kFsA), hi = row->max.at (kFsA);
+            // THE STEP IS SIX, the divisor the design reads the slope through: one pole. A probe closer than
+            // that shares a pole with the bound and cannot tell a floor of 6 from one of -10000.
+            constexpr double kPole = 6.0;
+            const double lo = row->min.at (kFsA, 1.0), hi = row->max.at (kFsA, 1.0);
             const std::vector<double> atLo = curveWithSlope (kFsA, lo);
-            ok (! atLo.empty(), "the slope curve is answered");
-            ok (sameCurve (atLo, curveWithSlope (kFsA, 0.0)), "every slope below the table's floor is the floor");
-            ok (sameCurve (atLo, curveWithSlope (kFsA, -1.0e6)), "a hugely negative slope included");
             const std::vector<double> atHi = curveWithSlope (kFsA, hi);
-            ok (sameCurve (atHi, curveWithSlope (kFsA, 1.0e9)), "and everything above the ceiling is the ceiling");
-            ok (! sameCurve (atHi, curveWithSlope (kFsA, hi - 6.0)), "which is one pole above the slope below it");
+            ok (! atLo.empty() && ! atHi.empty(), "the slope curve is answered");
+            ok (sameCurve (atLo, curveWithSlope (kFsA, lo - kPole)), "one pole below the floor is the floor");
+            ok (sameCurve (atLo, curveWithSlope (kFsA, -1.0e6)), "a hugely negative slope included");
+            ok (! sameCurve (atLo, curveWithSlope (kFsA, lo + kPole)),
+                "and one pole ABOVE it is a different filter, which a floor stated too low is not");
+            ok (sameCurve (atHi, curveWithSlope (kFsA, hi + kPole)), "one pole above the ceiling is the ceiling");
+            ok (sameCurve (atHi, curveWithSlope (kFsA, 1.0e9)), "a hugely positive slope included");
+            ok (! sameCurve (atHi, curveWithSlope (kFsA, hi - kPole)), "and one pole below it is a different filter");
             ok (! sameCurve (atLo, atHi), "the two ends are different filters");
         }
+    }
+
+    // WHY THE FOUR `dyn` ROWS ARE UNPINNABLE HERE. `eq::EqBand` applies a delta that a PRODUCER pushes in
+    // through `setLaneDeltaDb`; `eq::EqEngine`, which this chain drives, has no producer, so the dynamics
+    // fields are carried and clamped and change nothing this ABI can render. If one is ever wired in, this
+    // check goes red and the four rows become pinnable like any other clamp.
+    {
+        World w = baseWorld (kFsA);
+        w.cfg.dither = 0;
+        w.prm.eqBands[0].dyn.on = 1; w.prm.eqBands[0].dyn.thrAuto = 0;
+        w.prm.eqBands[0].dyn.thrDb = -30.0; w.prm.eqBands[0].dyn.rangeDb = -30.0;
+        const std::vector<double> armed = renderOf (w);
+        World off = w; off.prm.eqBands[0].dyn.on = 0;
+        ok (! armed.empty(), "the dynamics probe renders");
+        ok (sameCurve (armed, renderOf (off)),
+            "the band dynamics are INERT in this chain: nothing drives the delta, so dyn.on changes no sample");
     }
 
     // dither.bits — a depth of 32 or more is a BYPASS, accepted like every other value.

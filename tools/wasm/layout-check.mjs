@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { layoutOf, structNames, STRUCT_IDS, FC_MASTER_ABI_VERSION,
-         FC_ENUMS, FC_DOMAINS, domainBound } from './fc-master-layout.mjs';
+         FC_ENUMS, FC_DOMAINS, domainBound, FC_CONSTRAINT, FC_CONSTRAINT_BITS } from './fc-master-layout.mjs';
 
 const [, , bin] = process.argv;
 if (!bin) { console.error('usage: node layout-check.mjs <fcore_master | fcore_master.js>'); process.exit(2); }
@@ -146,13 +146,35 @@ for (const row of FC_DOMAINS) {
     seen.add(row.field);
     check(fieldExists(row.field), `FC_DOMAINS: ${row.field} is not a value field of any struct described here`);
     for (const which of ['min', 'max'])
-        try { domainBound(row[which], 48000); } catch (e) { check(false, `FC_DOMAINS: ${row.field}.${which}: ${e.message}`); }
+        try { domainBound(row[which], 48000, 4); } catch (e) { check(false, `FC_DOMAINS: ${row.field}.${which}: ${e.message}`); }
     if (row.unit.startsWith('enum:'))
         check(FC_ENUMS[row.unit.slice(5)] !== undefined, `FC_DOMAINS: ${row.field} names ${row.unit}, which is not in FC_ENUMS`);
-    if (row.resolved !== '' && row.resolved !== 'eqCurve' && row.resolved !== 'render')
+    if (row.resolved.startsWith('summary.'))
+        check(fieldExists(`fc_solution_summary.${row.resolved.slice(8)}`),
+              `FC_DOMAINS: ${row.field} reads back through ${row.resolved}, which is not a field of fc_solution_summary`);
+    else if (row.resolved !== '' && row.resolved !== 'eqCurve' && row.resolved !== 'render')
         check(fieldExists(`fc_master_resolved.${row.resolved}`),
               `FC_DOMAINS: ${row.field} reads back through fc_master_resolved.${row.resolved}, which does not exist`);
 }
+
+// ── FC_CONSTRAINT_BITS against `constraintBit()` ──────────────────────────────────────────────────
+// The mask is built by ONE expression in the core, and this list is the page's reading of it. The
+// expression is REQUIRED to be found: a regex that matched nothing would leave the list unheld.
+const solver = readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+                                 '..', '..', 'modules', 'mastering', 'include', 'felitronics', 'mastering',
+                                 'LoudnessSolver.h'), 'utf8');
+const bitFn = /constraintBit\s*\(MasteringConstraint c\)[^{]*\{\s*return\s*([^;]*);/.exec(solver);
+check(bitFn !== null, 'constraintBit: no such function in LoudnessSolver.h');
+if (bitFn) {
+    const body = bitFn[1].replace(/\s+/g, '');
+    check(body === '(c==MasteringConstraint::None)?0u:(1u<<((int)c-1))',
+          `constraintBit: the mask is built by \`${body}\`, which is not what FC_CONSTRAINT_BITS assumes`);
+}
+check(FC_CONSTRAINT_BITS.length === FC_CONSTRAINT.length - 1,
+      `FC_CONSTRAINT_BITS: ${FC_CONSTRAINT_BITS.length} bits for ${FC_CONSTRAINT.length} constraint codes`);
+FC_CONSTRAINT_BITS.forEach((name, bit) =>
+    check(name === FC_CONSTRAINT[bit + 1],
+          `FC_CONSTRAINT_BITS[${bit}] is ${name}; code ${bit + 1} is ${FC_CONSTRAINT[bit + 1]}`));
 
 console.log(`layout-check: ${structNames().length} structs, ${compared} fields, `
           + `${codesCompared} enum codes, ${FC_DOMAINS.length} domain rows over ${leaves} input fields, `

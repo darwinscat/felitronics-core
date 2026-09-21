@@ -24,9 +24,23 @@ factor stops at 16 with the limiter, 64 with the clipper alone and nowhere with 
 250 ms lookahead ceiling is that stage's own). **Silent clamps are marked**, because the difference decides an
 interface: a refusal arrives on the call that made it, a clamp arrives as nothing at all. No field of this ABI
 has a list-valued domain — `oversampleFactor` admits every integer in its interval and `dither.bits` refuses
-nothing — and the table says so instead of inventing one. `layout-check.mjs` holds the table against the struct
-layouts in both directions: a row must name a value field that exists, and EVERY input field of the three
-structs must have a row, so a field added in a later version cannot arrive without a domain.
+nothing — and the table says so instead of inventing one. Bounds that move with the oversample factor as well
+as the rate are written `0.49*sr*os`, and `domainBound (bound, sampleRate, oversampleFactor)` evaluates all
+three forms. `layout-check.mjs` holds the table against the struct layouts in both directions: a row must name
+a value field that exists, and EVERY input field of the three structs must have a row, so a field added in a
+later version cannot arrive without a domain.
+
+**`FC_CONSTRAINT_BITS` and `constraintsOf (mask)`** — `fc_solution_summary.alsoViolated` is a bitmask whose bit
+`i` is `FC_CONSTRAINT[i + 1]`, with `binding` included in it. The list is derived from `FC_CONSTRAINT` rather
+than written out, and `layout-check.mjs` holds the core's `constraintBit()` expression against what it assumes;
+`fc_constraint` and `fc_solve_status` join the enums pinned to the header, and a reordering of the C++
+`MasteringConstraint` behind them is already a build error in the facade's static asserts.
+
+**Two rows the first draft got wrong, both found by review and both reproduced through the ABI before they were
+changed.** `initialGainDb` said "no bound"; the search clamps the starting gain to the chain's own ±60 dB
+before its first render, and at `maxPasses = 1` a request of 100 comes back as 60 in the summary — so the row
+is a clamp now, read back through `summary.preLimiterGainDb`. `clipper.dcBlockHz` said it had no ceiling; the
+corner is clamped to `0.49*sr*os`, measured as 100000 Hz applying as 94080 at 48 kHz and 4×.
 
 **`felitronics_master_domains_tests`** holds the table against the running ABI with a real C-ABI call per
 bound, at two sample rates for every rate-dependent row. The table is the test's ARGUMENT and every probe is
@@ -36,8 +50,24 @@ one, `fc_master_eq_curve` for the EQ lane fields, the rendered audio for the res
 at the bound and beyond it are the same number while one step inside it is a different one; acceptance alone
 would pass against a clamp anywhere at all. A refusal is probed twice — one step out and WELL out — because a
 bound moved INWARDS still refuses one step past itself, and that near probe alone could not tell a delivery
-floor of 8000 Hz from one of 22050. The six clamps nothing can pin are printed by name on every run.
-1235 checks; a planted-mutation round over the table killed 56 of 59, and all three survivors are a row DEMOTED
-to a weaker claim, which the suite's header names as what it does not catch. Eleven more planted violations —
-an enum permuted in the header, a list shortened, a row naming a field that no longer exists — are all caught
-by `layout-check.mjs`.
+floor of 8000 Hz from one of 22050.
+
+**The step is the RESOLUTION OF WHAT ANSWERS, not a fixed fraction.** A whole number steps by 1; a status is
+sharp, so a refusal steps by a billionth; a read-back is not, and each field states its own (`stepRel` /
+`stepAbs`) — which is how tightly that bound is pinned. Where a bound is unreachable at ordinary settings the
+field also states the parameter set that reaches it: the compressor's 400 dB range cap needs a threshold far
+under the programme, the time constants need a step above the point where the ballistics stop being
+distinguishable from instant, and the dither has to be off wherever the quantiser step is coarser than the
+probe.
+
+**The four `eqBands[].dyn` rows cannot be pinned here, and the reason is now a checked fact.** `eq::EqBand`
+applies a delta that a producer pushes in through `setLaneDeltaDb`, and the engine the mastering chain drives
+has none — so those fields are carried and clamped and change nothing this ABI renders. A named check renders
+with the band dynamics armed and with `dyn.on` cleared and requires the two to be identical; if a producer is
+ever wired in, that check goes red and the four rows become pinnable like any other clamp. They are the whole
+of the list the run prints of clamps nothing can pin.
+
+1280 checks; a planted-mutation round over the table killed 56 of 59, and all three survivors are a row DEMOTED
+to a weaker claim, which the suite's header names as what it does not catch. Sixteen more planted violations —
+an enum permuted in the header, a list shortened, a row naming a field that no longer exists, an input field
+with no row, `constraintBit()` rewritten — are all caught by `layout-check.mjs`.

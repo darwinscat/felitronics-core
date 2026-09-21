@@ -356,6 +356,12 @@ export const FC_CONSTRAINT = [
     'None', 'TruePeak', 'LimiterGr', 'Plr', 'Lra', 'GainRange', 'CompressorGr',
 ];
 
+// `fc_solution_summary.alsoViolated` — the INDEX is the bit position and the value is the constraint that
+// bit stands for, so bit `i` is `FC_CONSTRAINT[i + 1]` and `None` has no bit. `binding` is INCLUDED in the
+// mask. Held against the core's `constraintBit()` by layout-check.mjs.
+export const FC_CONSTRAINT_BITS = FC_CONSTRAINT.slice(1);
+export const constraintsOf = mask => FC_CONSTRAINT_BITS.filter((_, bit) => (mask & (1 << bit)) !== 0);
+
 // ── the enum codes ────────────────────────────────────────────────────────────────────────────────
 //
 // One list per enum a caller writes into a struct or passes to an entry point. THE INDEX IS THE CODE. A name is
@@ -387,6 +393,8 @@ export const FC_ENUMS = {
     FC_GR_STATISTIC:   { enum: 'fc_gr_statistic',   prefix: 'FC_GR_',        names: FC_GR_STATISTIC },
     FC_GR_STAGE:       { enum: 'fc_gr_stage',       prefix: 'FC_GR_STAGE_',  names: FC_GR_STAGE },
     FC_PROGRESS_STAGE: { enum: 'fc_progress_stage', prefix: 'FC_PROGRESS_',  names: FC_PROGRESS_STAGE },
+    FC_SOLVE_STATUS:   { enum: 'fc_solve_status',   prefix: 'FC_SOLVE_',     names: FC_SOLVE_STATUS },
+    FC_CONSTRAINT:     { enum: 'fc_constraint',     prefix: 'FC_CONSTRAINT_', names: FC_CONSTRAINT },
 };
 
 // ==================================================================================================
@@ -408,8 +416,9 @@ export const FC_ENUMS = {
 //   unit       dB · dBTP · dB/oct · LUFS · LU · Hz · ms · x (a multiplier) · fraction · frames · samples ·
 //              count · bits · code (an opaque 32-bit value) · flag (0 / non-0) · enum:<NAME> (an index into
 //              that list above)
-//   min, max   the bound, `null` where the code has none, or a string in `sr` — the CHAIN sample rate (the
-//              delivery rate on a delivering handle) — which `domainBound()` below evaluates
+//   min, max   the bound, `null` where the code has none, or a formula in `sr` — the CHAIN sample rate (the
+//              delivery rate on a delivering handle) — and `os`, `fc_master_config.oversampleFactor`, which
+//              `domainBound()` below evaluates
 //   open       which bound is EXCLUSIVE ('max' means the bound itself is already outside), '' when both are inclusive
 //   edge       what a value outside the interval does:
 //                'refuse'  the call is refused with `err`, nothing moves
@@ -425,9 +434,10 @@ export const FC_ENUMS = {
 //              'nan-verdict' a NaN is FC_SOLVE_INVALID_REQUEST; the infinities are ordinary values of this field
 //              'off'         a non-finite value switches the field off / means "not supplied"
 //              'none'        an integer field
-//   resolved   where the APPLIED value can be read back: a field of `fc_master_resolved`, `eqCurve` (the
-//              magnitude `fc_master_eq_curve` answers), `render` (what the chain puts out), or '' — the
-//              applied value is not observable through this ABI at all
+//   resolved   where the APPLIED value can be read back: a field of `fc_master_resolved`, `summary.<field>`
+//              (a field of the solution `fc_solution_summary_get` answers), `eqCurve` (the magnitude
+//              `fc_master_eq_curve` answers), `render` (what the chain puts out), or '' — the applied value
+//              is not observable through this ABI at all
 //   depends    what else moves this domain — the sample rate, or another field
 //
 // 'refuse' AGAINST 'clamp' IS THE DISTINCTION AN INTERFACE NEEDS. A refusal is a status on the call that made
@@ -473,11 +483,11 @@ export const FC_DOMAINS = [
     { field: 'fc_master_params.eqBands[].swept', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.eqBands[].bypass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.eqBands[].dyn.on', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
-    { field: 'fc_master_params.eqBands[].dyn.rangeDb', unit: 'dB', min: -30, max: 30, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
-    { field: 'fc_master_params.eqBands[].dyn.thrDb', unit: 'dB', min: -120, max: 24, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: 'dyn.thrAuto: an ABSOLUTE dBFS threshold, read ONLY while the automatic threshold is off' },
+    { field: 'fc_master_params.eqBands[].dyn.rangeDb', unit: 'dB', min: -30, max: 30, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: 'the band DYNAMICS ARE INERT IN THIS CHAIN: eq::EqBand applies a delta a producer pushes in, and the engine the mastering chain drives has none - so this is carried and clamped and changes nothing rendered here. The sign chooses the direction and the MAGNITUDE is what the interval bounds' },
+    { field: 'fc_master_params.eqBands[].dyn.thrDb', unit: 'dB', min: -120, max: 24, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: 'dyn.thrAuto: an ABSOLUTE dBFS threshold, read ONLY while the automatic threshold is off. The band dynamics are INERT in this chain - see dyn.rangeDb' },
     { field: 'fc_master_params.eqBands[].dyn.thrAuto', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
-    { field: 'fc_master_params.eqBands[].dyn.atk', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
-    { field: 'fc_master_params.eqBands[].dyn.rel', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.eqBands[].dyn.atk', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: 'the band dynamics are INERT in this chain - see dyn.rangeDb. 0.5 is the automatic value and the ends are deviations from it' },
+    { field: 'fc_master_params.eqBands[].dyn.rel', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: 'the band dynamics are INERT in this chain - see dyn.rangeDb. 0.5 is the automatic value and the ends are deviations from it' },
     { field: 'fc_master_params.eqBands[].lanes[].on', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.eqBands[].lanes[].freq', unit: 'Hz', min: 10, max: '0.49*sr', open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'eqCurve', depends: 'sampleRate' },
     { field: 'fc_master_params.eqBands[].lanes[].q', unit: 'x', min: 0.05, max: 40, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'eqCurve', depends: '' },
@@ -497,8 +507,8 @@ export const FC_DOMAINS = [
     { field: 'fc_master_params.compressor.mode', unit: 'enum:FC_COMP_MODE', min: 0, max: 2, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.compressor.thresholdDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'the detector level enters the curve through a floor of -240 dB, so a threshold below that makes digital silence an ACTIVE sample' },
     { field: 'fc_master_params.compressor.ratio', unit: 'x', min: 1, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
-    { field: 'fc_master_params.compressor.kneeDb', unit: 'dB', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
-    { field: 'fc_master_params.compressor.rangeDb', unit: 'dB', min: 0, max: 400, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
+    { field: 'fc_master_params.compressor.kneeDb', unit: 'dB', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
+    { field: 'fc_master_params.compressor.rangeDb', unit: 'dB', min: 0, max: 400, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
     { field: 'fc_master_params.compressor.attackMs', unit: 'ms', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'at or below 0 the ballistics are instant, and a time long enough to round the coefficient to 1 is backed off so the envelope never freezes' },
     { field: 'fc_master_params.compressor.releaseMs', unit: 'ms', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'as attackMs' },
     { field: 'fc_master_params.compressor.makeupDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'what is bounded is the SUM of this and the gain reduction, inside the render, and not this field' },
@@ -511,7 +521,7 @@ export const FC_DOMAINS = [
     { field: 'fc_master_params.clipper.mix', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
     { field: 'fc_master_params.clipper.outputDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
     { field: 'fc_master_params.clipper.autoComp', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
-    { field: 'fc_master_params.clipper.dcBlockHz', unit: 'Hz', min: 0, max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'sampleRate AND oversampleFactor: the corner is clamped to [0, 0.49*sr*oversampleFactor], the blocker runs in the OVERSAMPLED domain, and clipper.shape gates it — only Asym enables it at all' },
+    { field: 'fc_master_params.clipper.dcBlockHz', unit: 'Hz', min: 0, max: '0.49*sr*os', open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'sampleRate AND fc_master_config.oversampleFactor: the blocker runs in the OVERSAMPLED domain. clipper.shape gates it — only Asym enables it at all' },
 
     // ── fc_master_params.limiter ──────────────────────────────────────────────────────────────────
     { field: 'fc_master_params.limiter.ceilingDbTp', unit: 'dBTP', min: -200, max: 60, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'limiterCeilingDbTp', depends: '' },
@@ -544,19 +554,22 @@ export const FC_DOMAINS = [
     { field: 'fc_loudness_request.inputLoudnessRangeLu', unit: 'LU', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'maxLraLossLu: it is the other end of that delta, and a non-finite value switches the pair off' },
     { field: 'fc_loudness_request.activityThresholdDb', unit: 'dB', min: 0, max: null, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: '' },
     { field: 'fc_loudness_request.maxPasses', unit: 'count', min: 1, max: 32, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'it bounds the SEARCH; the delivered solution can cost two renders more, and the summary passes count says so' },
-    { field: 'fc_loudness_request.initialGainDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'a non-finite value means start from the parameter set own preLimiterGainDb' },
+    { field: 'fc_loudness_request.initialGainDb', unit: 'dB', min: -60, max: 60, open: '', edge: 'clamp', err: '', nonFinite: 'off', resolved: 'summary.preLimiterGainDb', depends: 'the search clamps the starting gain to the chain own +-60 dB before its first render. A non-finite value means start from the parameter set own preLimiterGainDb' },
     { field: 'fc_loudness_request.grTraceBuckets', unit: 'count', min: 1, max: 65536, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'the trace actually built has min(this, programme frames) buckets' },
     { field: 'fc_loudness_request.limiterGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'admitted WHATEVER the statistic is, so a 0 here is refused even when the limit does not read it' },
     { field: 'fc_loudness_request.compressorGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'as limiterGrQuantile' },
 ];
 
-// A bound of FC_DOMAINS at a given CHAIN sample rate: a number passes through, `null` stays null, and the two
-// string forms `<a>*sr` and `<a>/sr` are evaluated. There is no third form; anything else throws.
-export function domainBound (bound, sampleRate) {
+// A bound of FC_DOMAINS at a given CHAIN sample rate and oversample factor: a number passes through, `null`
+// stays null, and the three formula forms `<a>*sr`, `<a>/sr` and `<a>*sr*os` are evaluated. There is no fourth
+// form; anything else throws.
+export function domainBound (bound, sampleRate, oversampleFactor = 1) {
     if (bound === null || typeof bound === 'number') return bound;
-    const m = /^(-?[0-9.eE+-]+)([*/])sr$/.exec(String(bound));
-    if (!m) throw new Error(`fc-master-layout: '${bound}' is not a domain bound — use a number, null, <a>*sr or <a>/sr`);
-    return m[2] === '*' ? Number(m[1]) * sampleRate : Number(m[1]) / sampleRate;
+    const m = /^(-?[0-9.eE+-]+)(\*sr\*os|\*sr|\/sr)$/.exec(String(bound));
+    if (!m) throw new Error(`fc-master-layout: '${bound}' is not a domain bound — use a number, null, `
+                          + `<a>*sr, <a>/sr or <a>*sr*os`);
+    if (m[2] === '/sr') return Number(m[1]) / sampleRate;
+    return Number(m[1]) * sampleRate * (m[2] === '*sr*os' ? oversampleFactor : 1);
 }
 
 // The one check this file can make about itself before anything is rendered. Called by every loader; throws
