@@ -29,7 +29,7 @@ same audit had been started three times.
 |---|---|---|
 | `saturation` | oversampled soft-saturation | `WaveShaper` (Tanh/Atan/Cubic/Asym), `Saturator` |
 | `stereo` | mid/side image tools | `MidSide`, `MonoBass` (bass mono-maker / elliptical), `StereoWidth` (mono-fold-safe) |
-| `dynamiceq` | level-driven EQ band (cut/boost when loud/quiet) | `DynamicEqBand` |
+| `dynamiceq` | level-driven EQ band (cut/boost when loud/quiet) | `DynamicEqBand`, `LaneDynamics` (drives an `eq::EqBand` point's per-lane delta seam — what makes the mastering chain's EQ points dynamic) |
 | `deesser` | sibilance control, 2 topologies | `DeEsser` (surgical dynamic-EQ · classic split-band) |
 | `multiband` | split → per-band processor → recombine (LR4, allpass-flat) | `MultibandProcessor`, `MultibandCompressor`, `MultibandWidth` |
 | `dither` | export bit-depth reduction | `Dither` (TPDF + noise shaping; 16/20/24-bit) |
@@ -51,7 +51,7 @@ Add `-DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON` for both optional co
 **A full mastering chain is now buildable in core:** saturation → dynamic-EQ → de-esser → multiband comp →
 stereo width → transient → mono-bass → dither, metered by true-peak (dBTP) + LUFS/LRA.
 
-**...and one is now BUILT, in `mastering`:** `gain → EQ → [M/S mono-bass] → compressor (optional internal
+**...and one is now BUILT, in `mastering`:** `gain → EQ (each point optionally DYNAMIC) → [M/S mono-bass] → compressor (optional internal
 sidechain HPF) → [soft clipper] → gain → true-peak limiter → dither`, as a single streaming object with a
 declared latency, a latency-neutral per-stage bypass, and a tail that is not lost. It is deliberately the
 composite of the stages above rather than a new one; what it adds is the thing composition kept getting

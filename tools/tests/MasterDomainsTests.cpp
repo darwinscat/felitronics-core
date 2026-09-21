@@ -261,6 +261,39 @@ void armCompCap (World& w, bool)
 // there is one pass to give it to.
 void armOnePass (World& w, bool) { w.req.maxPasses = 1; }
 
+// THE POINT'S DYNAMICS, ARMED AND ABSOLUTE. `rangeDb` caps the delta, so a clamp on it is visible only
+// where the reduction is hard against that cap — which a threshold every sample is over is what buys.
+// The same arming makes the delta travel from 0 to that cap at the start of the programme, which is
+// what a clamp on `atk`/`rel` needs to be seen at all.
+void armDyn (World& w, bool)
+{
+    w.cfg.dither = 0;
+    w.prm.eqBands[0].dyn.on      = 1;
+    w.prm.eqBands[0].dyn.thrAuto = 0;
+    w.prm.eqBands[0].dyn.thrDb   = -120.0;
+    w.prm.eqBands[0].dyn.rangeDb = -30.0;
+}
+
+// THE THRESHOLD is measured against the band probe's own level, so its two bounds are reachable only
+// where the programme sits near them — and between them the computer must be OFF its cap, since a
+// reduction pinned there is the same reduction at every threshold. The input gain is what moves the
+// programme to meet each end.
+void armDynThr (World& w, bool isMin)
+{
+    armDyn (w, isMin);
+    w.prm.inputGainDb = isMin ? -60.0 : 60.0;
+}
+
+// A BALLISTICS KNOB CHANGES NOTHING UNLESS THE DELTA MOVES BOTH WAYS, and the arming above only ever
+// moves it one: with the threshold 96 dB under this programme the computer sits on its cap and the
+// reduction never releases (measured over the 18 quanta of the fixture: eighteen falls, not one rise).
+// A threshold inside the programme's own band level runs both halves.
+void armDynMove (World& w, bool isMin)
+{
+    armDyn (w, isMin);
+    w.prm.eqBands[0].dyn.thrDb = -60.0;
+}
+
 const Knob kKnobs[] = {
     CFG_D ("fc_master_config.sampleRate", sampleRate),
     // THE MONO-BASS STAGE IS TURNED OFF BY THIS ONE WRITER, unconditionally: the stage admits a width of 2 and
@@ -299,11 +332,14 @@ const Knob kKnobs[] = {
     EQB_I ("fc_master_params.eqBands[].swept", swept),
     EQB_I ("fc_master_params.eqBands[].bypass", bypass),
     EQB_I ("fc_master_params.eqBands[].dyn.on", dyn.on),
-    EQB_D ("fc_master_params.eqBands[].dyn.rangeDb", dyn.rangeDb),
-    EQB_D ("fc_master_params.eqBands[].dyn.thrDb", dyn.thrDb),
+    // A RENDER IS THE READ-BACK for the four `dyn` clamps, and the probe resolution is stated because the
+    // default billionth is below what a float coefficient can carry: the bell's gain, the computer's cap
+    // and the follower's time constant all reach the samples through a narrowing.
+    EQB_DX ("fc_master_params.eqBands[].dyn.rangeDb", dyn.rangeDb, 1.0e-4, 1.0e-4, armDyn),
+    EQB_DX ("fc_master_params.eqBands[].dyn.thrDb", dyn.thrDb, 1.0e-4, 1.0e-4, armDynThr),
     EQB_I ("fc_master_params.eqBands[].dyn.thrAuto", dyn.thrAuto),
-    EQB_D ("fc_master_params.eqBands[].dyn.atk", dyn.atk),
-    EQB_D ("fc_master_params.eqBands[].dyn.rel", dyn.rel),
+    EQB_DX ("fc_master_params.eqBands[].dyn.atk", dyn.atk, 1.0e-3, 1.0e-3, armDynMove),
+    EQB_DX ("fc_master_params.eqBands[].dyn.rel", dyn.rel, 1.0e-3, 1.0e-3, armDynMove),
     EQL_I ("fc_master_params.eqBands[].lanes[].on", on),
     EQL_D ("fc_master_params.eqBands[].lanes[].freq", freq),
     EQL_D ("fc_master_params.eqBands[].lanes[].q", q),
@@ -894,10 +930,10 @@ void checkDependencies (const std::vector<Row>& rows)
         }
     }
 
-    // WHY THE FOUR `dyn` ROWS ARE UNPINNABLE HERE. `eq::EqBand` applies a delta that a PRODUCER pushes in
-    // through `setLaneDeltaDb`; `eq::EqEngine`, which this chain drives, has no producer, so the dynamics
-    // fields are carried and clamped and change nothing this ABI can render. If one is ever wired in, this
-    // check goes red and the four rows become pinnable like any other clamp.
+    // THE `dyn` GROUP IS LIVE, which is what makes the four rows above pinnable by a render at all. The
+    // chain's EQ stage drives `dynamiceq::LaneDynamics` into each point's delta seam, so an armed point
+    // is a different render — and `dyn.on` is the gate: with it off, every other field in the group is
+    // carried and changes nothing.
     {
         World w = baseWorld (kFsA);
         w.cfg.dither = 0;
@@ -905,9 +941,25 @@ void checkDependencies (const std::vector<Row>& rows)
         w.prm.eqBands[0].dyn.thrDb = -30.0; w.prm.eqBands[0].dyn.rangeDb = -30.0;
         const std::vector<double> armed = renderOf (w);
         World off = w; off.prm.eqBands[0].dyn.on = 0;
-        ok (! armed.empty(), "the dynamics probe renders");
-        ok (sameCurve (armed, renderOf (off)),
-            "the band dynamics are INERT in this chain: nothing drives the delta, so dyn.on changes no sample");
+        const std::vector<double> unarmed = renderOf (off);
+        ok (! armed.empty() && ! unarmed.empty(), "the dynamics probe renders");
+        ok (! sameCurve (armed, unarmed),
+            "the band dynamics MOVE the render: an armed point is not the same samples as dyn.on = 0");
+
+        // ...AND THE GROUP IS GATED BY THAT ONE FLAG. Every other field moved to its far end, with
+        // `dyn.on` off, is the same render — the claim `dyn.on`'s own row makes by being a flag.
+        World other = off;
+        other.prm.eqBands[0].dyn.rangeDb = 30.0;
+        other.prm.eqBands[0].dyn.thrDb   = 24.0;
+        other.prm.eqBands[0].dyn.thrAuto = 1;
+        other.prm.eqBands[0].dyn.atk     = 0.0;
+        other.prm.eqBands[0].dyn.rel     = 1.0;
+        ok (sameCurve (unarmed, renderOf (other)),
+            "with dyn.on = 0 the rest of the group changes no sample");
+
+        // RANGE 0 IS NO DYNAMICS, whatever `dyn.on` says — the sentence its own row carries.
+        World zero = w; zero.prm.eqBands[0].dyn.rangeDb = 0.0;
+        ok (sameCurve (unarmed, renderOf (zero)), "an armed point with rangeDb = 0 renders as an unarmed one");
     }
 
     // dither.bits — a depth of 32 or more is a BYPASS, accepted like every other value.

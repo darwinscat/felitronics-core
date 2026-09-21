@@ -10,6 +10,9 @@ target_link_libraries(felitronics_mastering INTERFACE
     felitronics::core
     felitronics::eq
     felitronics::dynamics
+    # The EQ stage's dynamics producer: each band's per-lane delta seam is driven by
+    # `dynamiceq::LaneDynamics`, which `eq` itself deliberately does not know about.
+    felitronics::dynamiceq
     felitronics::saturation
     felitronics::limiter
     felitronics::stereo
@@ -29,6 +32,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_mastering_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_mastering_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_mastering_tests COMMAND felitronics_mastering_tests)
+
+    # The EQ stage's dynamics, as a NULL against the producer built outside this chain: the oracle is
+    # `eq::EqBand` + `dynamiceq::LaneDynamics` on the same signal, and the unarmed case is
+    # `eq::EqEngine::process` over the same quantum.
+    add_executable(felitronics_mastering_dyneq_tests tests/DynamicEqInChainTests.cpp)
+    target_link_libraries(felitronics_mastering_dyneq_tests PRIVATE felitronics::mastering felitronics::dynamiceq)
+    target_include_directories(felitronics_mastering_dyneq_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_mastering_dyneq_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_mastering_dyneq_tests COMMAND felitronics_mastering_dyneq_tests)
 
     # Kept separate because it is a different KIND of test: it re-derives the chain's promises from
     # outside — a hand-built reference chain, an independently computed alignment oracle, and the
