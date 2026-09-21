@@ -1208,70 +1208,105 @@ public:
         // it and every drive under it breaks the limit too — and the drive can be expressed as a `(g, c)` pair
         // the actuator admits.
         //
-        // THE DRIVE HAS TO SURVIVE BOTH CLAMPS. `d = g - c` and the two are clamped to +-60 dB one number at a
-        // time, so a ceiling chosen for the true-peak aim alone can put the gain the drive needs past the clamp
-        // — and the drive then RENDERED is not the drive chosen, with the limiter working at it. The ceiling is
-        // therefore picked for the drive, inside the window that keeps the gain in range and at or under the
-        // promise. Inside that window `rescueD + rc` is in range by construction, so the pair expresses the
-        // drive exactly; where the window is EMPTY no pair does and the rescue is not taken.
+        // THE DRIVE IS EXPRESSED BY `pairFor`, which chooses the ceiling for the drive rather than for the aim;
+        // where no `(g, c)` pair expresses it the rescue is not taken. The ceiling asked for is the aim less the
+        // overshoot already measured, here and at every probe: at the engagement drive the delivered peak IS the
+        // ceiling as the limiter's own oversampler reads it, and the certifying meter reads that much above.
         //
         // IT RUNS AFTER THE SEARCH, so a search that finds its own `ok` never reaches it and is unchanged,
-        // render for render and bit for bit. The render is not a step of the loudness search: it moves `bound`
-        // and the DELIVERED candidate and nothing else — never `Best::nearest*`, which is what names the
-        // violations that stopped the search — so `pinnedDir` and the bracket sides below still describe the
-        // search proper. It does not refine the boundary afterwards: what comes back is the idle render, which
-        // holds the limit and is quieter than the loudest render that would.
+        // render for render and bit for bit. Neither the idle render nor the probes after it are steps of the
+        // loudness search: they move `bound` and the DELIVERED candidate and nothing else — never
+        // `Best::nearest*` — so `pinnedDir` and the bracket sides below still describe the search proper.
         //
-        // ITS LOUDNESS NEED NOT BE MEASURABLE. The reduction is read off the tap and the peak off the peak
-        // meter, neither of which needs a gating block, so a render below the absolute gate still HOLDS the
-        // limit and is still the answer — the promise is about holding. What it cannot then be is `Solved`.
+        // THEN THE BOUNDARY, with whatever the search did not spend. The idle render is `ok` and the search's
+        // gentlest broken one is `cap`, which is the bracket the ordinary search would have had, so the probe
+        // between them is the ordinary `DriveBound::probe` and the answer is the LOUDEST render that holds the
+        // limit rather than the quietest. The refinement stops when the budget runs out, when a probe cannot be
+        // expressed, or when the step falls under the actuator's resolution; with no budget left at all the
+        // idle render is what comes back, which is the one case where a quiet render is delivered on purpose.
         //
-        // THE COST is one render, and two where no render holds the limit at all: the idle render does not
-        // become the answer either, `out` holds it rather than the reported candidate, and the delivery
-        // re-render below puts that back.
+        // A PROBE'S LOUDNESS NEED NOT BE MEASURABLE. The reduction is read off the tap and the peak off the
+        // peak meter, neither of which needs a gating block, so a render below the absolute gate still HOLDS
+        // the limit and is still the answer — the promise is about holding. What it cannot then be is `Solved`.
+        //
+        // AND `binding` IS READ FROM `cap`: `bound.acted` is set here, so the verdict names what was broken at
+        // the SMALLEST drive that broke anything — the boundary the refinement has just tightened — and not
+        // what the render nearest the target happened to break. The rest go into `alsoViolated`.
+        //
+        // THE COST is one render plus the spare budget, and one more where no render holds the limit at all:
+        // the idle render does not become the answer either, `out` holds it rather than the reported candidate,
+        // and the delivery re-render below puts that back.
+        const int searchPasses = sol.passes;
         const double rescueD = bound.engageD - kIdleDriveMarginDb;
-        const double rcLo = std::fmax (-kMaxGainDb, -kMaxGainDb - rescueD);
-        const double rcHi = std::fmin (std::fmin (kMaxGainDb, kMaxGainDb - rescueD), pmax);
-        // At the engagement drive the delivered peak IS the ceiling — that is what engagement means — so the
-        // ceiling the aim asks for is the one that lands the peak where the aim wants it, when the window
-        // admits it. `fmin`/`fmax` and not `clamp`, whose behaviour is undefined for an empty window.
-        const double rc = std::fmin (std::fmax (std::fmin (pmax, aim), rcLo), rcHi);
-        const double rg = std::clamp (rescueD + rc, -kMaxGainDb, kMaxGainDb);
+        double rg = 0.0, rc = 0.0;
         if (best.have && bound.cap.have && ! bound.ok.have && bound.haveEngage
-            && std::isfinite (rescueD) && bound.engageD < bound.cap.d
-            && rcLo <= rcHi)
+            && bound.engageD < bound.cap.d
+            && pairFor (rescueD, std::fmin (pmax, aim - bound.overshootAt (bound.cap.d)), pmax, rg, rc))
         {
             rescued = true;
-            if (! clock.begin (ProgressStage::SearchPass, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
-                return cancelled (sol);
-            params.preLimiterGainDb    = rg;
-            params.limiter.ceilingDbTp = rc;
-            chain.setParams (params);
-            MasterMeasurement rm;
-            if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, rm, sol, clock))
+            // One render taken ASIDE from the loudness search. Renders `(ag, ac)`, records it, moves `bound`
+            // and the delivered candidate, and never `Best::nearest*`. False on a refusal, with `sol.status`
+            // already set to the one the caller must return.
+            auto aside = [&] (double ag, double ac, MasterMeasurement& am, std::uint32_t& av) -> bool
             {
+                if (! clock.begin (ProgressStage::SearchPass, sol.passes + 1, req.maxPasses + 1, passUnits, frames))
+                { sol.status = MasteringSolveStatus::Cancelled; return false; }
+                params.preLimiterGainDb    = ag;
+                params.limiter.ceilingDbTp = ac;
+                chain.setParams (params);
+                if (! renderPass (chain, renderer, params, in, out, numChannels, frames, req, am, sol, clock))
+                {
+                    ++sol.passes;
+                    sol.status = clock.stopped() ? MasteringSolveStatus::Cancelled : MasteringSolveStatus::RenderFailed;
+                    return false;
+                }
                 ++sol.passes;
-                sol.status = clock.stopped() ? MasteringSolveStatus::Cancelled : MasteringSolveStatus::RenderFailed;
-                return sol;
-            }
-            ++sol.passes;
-            // `out` now holds THIS render, so the delivery test below must read it and not the search's last
-            // step: `best.isLast` is cleared here and set again only by an `offer` that wins, and `g`/`c` name
-            // what is in the buffer.
-            best.isLast = false;
-            g = rg; c = rc;
-            const std::uint32_t rv = violatedMask (rm, req);
-            if (! keepRecord (sol, clock, rg, rc, rm, rv)) return cancelled (sol);
-            bound.add (rg, rc, rm, aim, pmax, req, rv);
-            best.offerAside (rg, rc, rm, rv == 0, std::fabs (rm.integratedLufs - target), worstExcess (rm, req));
-            // A programme whose idle drive already delivers the target is SOLVED by this render — which takes a
+                // `out` now holds THIS render, so the delivery test below must read it and not the search's
+                // last step: `best.isLast` is cleared and set again only by an offer that wins, and `g`/`c`
+                // name what is in the buffer.
+                best.isLast = false;
+                g = ag; c = ac;
+                av = violatedMask (am, req);
+                if (! keepRecord (sol, clock, ag, ac, am, av)) { sol.status = MasteringSolveStatus::Cancelled; return false; }
+                bound.add (ag, ac, am, aim, pmax, req, av);
+                best.offerAside (ag, ac, am, av == 0, std::fabs (am.integratedLufs - target), worstExcess (am, req));
+                return true;
+            };
+            // A render that holds the limit AND lands on the target is simply the answer — which takes a
             // loudness measurement, unlike holding the limit.
-            if (rv == 0 && rm.loudnessValid && std::fabs (rm.integratedLufs - target) <= req.toleranceLu)
+            auto solvedBy = [&] (const MasterMeasurement& am, std::uint32_t av)
+            {
+                return av == 0 && am.loudnessValid && std::fabs (am.integratedLufs - target) <= req.toleranceLu;
+            };
+
+            MasterMeasurement rm;
+            std::uint32_t rv = 0;
+            if (! aside (rg, rc, rm, rv)) return sol;
+            if (solvedBy (rm, rv))
             {
                 sol.status = MasteringSolveStatus::Solved;
                 sol.preLimiterGainDb = rg; sol.ceilingDbTp = rc; sol.measured = rm;
                 return sol;
             }
+
+            for (int spare = req.maxPasses - searchPasses;
+                 spare > 0 && bound.ok.have && bound.cap.have && bound.ok.d < bound.cap.d; --spare)
+            {
+                const double nd = bound.probe (req, spare <= 1);
+                double ng = 0.0, nc = 0.0;
+                if (! pairFor (nd, std::fmin (pmax, aim - bound.overshootAt (bound.cap.d)), pmax, ng, nc)) break;
+                if (std::fabs (ng - g) < 1.0e-6 && std::fabs (nc - c) < 1.0e-3) break;
+                MasterMeasurement pm;
+                std::uint32_t pv = 0;
+                if (! aside (ng, nc, pm, pv)) return sol;
+                if (solvedBy (pm, pv))
+                {
+                    sol.status = MasteringSolveStatus::Solved;
+                    sol.preLimiterGainDb = ng; sol.ceilingDbTp = nc; sol.measured = pm;
+                    return sol;
+                }
+            }
+            bound.acted = true;
         }
 
         // --- no candidate met the target -----------------------------------------------------------
@@ -1528,6 +1563,22 @@ private:
 
     // The overshoot `truePeakDbTp - c` assumed for a working render when none is measured at or under its drive.
     static constexpr double kFirstLimitingOvershootDb = 0.15;
+
+    // THE PAIR THAT EXPRESSES A DRIVE. `d = g - c`, and the two are clamped to +-60 dB one number at a time, so
+    // a ceiling chosen for the true-peak aim alone can put the gain the drive needs past its clamp — after which
+    // the drive RENDERED is not the drive chosen. The ceiling is therefore picked for the drive: `wantC` moved
+    // into the window that keeps the gain in range and at or under `pmax`, inside which `d + c` is in range by
+    // construction. False, and `outG`/`outC` untouched, where that window is empty: no pair expresses `d`.
+    [[nodiscard]] static bool pairFor (double d, double wantC, double pmax, double& outG, double& outC) noexcept
+    {
+        if (! std::isfinite (d)) return false;
+        const double lo = std::fmax (-kMaxGainDb, -kMaxGainDb - d);
+        const double hi = std::fmin (std::fmin (kMaxGainDb, kMaxGainDb - d), pmax);
+        if (! (lo <= hi)) return false;
+        outC = std::fmin (std::fmax (wantC, lo), hi);
+        outG = std::clamp (d + outC, -kMaxGainDb, kMaxGainDb);
+        return true;
+    }
 
     // HOW FAR UNDER THE ENGAGEMENT POINT the bracket rescue renders. At the engagement drive the reduction is
     // zero in real arithmetic and only near zero in float — the gain node's rounding can put the reconstructed

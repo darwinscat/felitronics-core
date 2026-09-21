@@ -4230,7 +4230,8 @@ static void testTheRescuesOwnEdges()
     // (1) THE IDLE RENDER'S LOUDNESS NEED NOT BE MEASURABLE. Digital near-silence with one full-scale sample:
     //     the idle drive is set by that sample, and at that drive every gating block of the programme sits
     //     under the absolute gate. The reduction is still measured — it comes off the tap, not off the meter —
-    //     so the render still HOLDS the limit, and the promise is about holding.
+    //     so the render still HOLDS the limit, and the promise is about holding. One pass of budget, so the
+    //     boundary refinement has nothing to spend and this render is the answer.
     {
         const int n = 50400;
         Programme src;
@@ -4247,7 +4248,7 @@ static void testTheRescuesOwnEdges()
         rig.params.bypassCompressor = true; rig.params.bypassDither = true;
         Programme dst; dst.ch = src.ch; dst.bind();
         LoudnessRequest req;
-        req.targetLufs = -60.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 4; req.initialGainDb = 20.0;
+        req.targetLufs = -60.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 1; req.initialGainDb = 20.0;
         req.limiterGr.limitDb = 12.0; req.limiterGr.statistic = GrStatistic::Max;
         const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, n, req);
         test::ok (sol.logCount > 0
@@ -4390,6 +4391,211 @@ static void testTheRescuesOwnEdges()
     }
 }
 
+
+// =============================================================================================
+// AFTER THE RESCUE, THE BOUNDARY. The idle render proves a holding render EXISTS; it is not the answer a
+// caller wants, because it is the QUIETEST such render. With budget left the search probes the bracket the
+// rescue completed and delivers the loudest render that holds the limit instead.
+static void testTheRescueThenFindsTheBoundary()
+{
+    test::group ("the rescue completes the bracket, and the spare budget walks it to the boundary");
+    // `minLouderLu` is the fixture's OWN gap between the idle point and the boundary — measured here at 0.4 to
+    // 0.8 LU, and 0.4 to 1.8 on the three mixes this was built for. What is general is the boundary claim
+    // below; how much loudness it is worth is the material's.
+    struct Row { const char* what; int kind; double target, limitDb, startDb, minLouderLu; GrStatistic st;
+                 bool onBoundary; double aimDb; };
+    const auto make = [] (int kind)
+    {
+        switch (kind)
+        {
+            case 1:  return makeMusic (4.0, 0.30, 777u, 2.4);
+            case 2:  return makeWideRange (5.0);
+            default: return makeMusic (4.0, 0.42, 4242u);
+        }
+    };
+    const auto solve = [&] (const Row& r, int passes, Programme& src, Programme& dst, Rig& rig)
+    {
+        LoudnessRequest req;
+        req.targetLufs = r.target; req.maxTruePeakDbTp = -1.0; req.maxPasses = passes;
+        req.initialGainDb = r.startDb; req.truePeakAimDb = r.aimDb;
+        req.limiterGr.limitDb = r.limitDb; req.limiterGr.statistic = r.st;
+        return rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(),
+                                 src.nch(), src.frames(), req);
+    };
+    // A probe is placed `min(toleranceLu, width/2)` inside the bracket (DriveBound::probe), so the delivered
+    // reduction sits just UNDER the limit rather than on it; this is that margin.
+    const double kBand = 0.2;
+    // The last row's aim is FINER than the material's own between-grid overshoot (0.014 dB here), so a probe
+    // that aimed its ceiling at the aim alone would deliver above the promise, be refused for it, and leave the
+    // idle render as the answer.
+    const Row rows[] {
+        { "sparser music, Max 1 dB",      1, -10.0, 1.0, 20.0, 0.75, GrStatistic::Max, true,  0.05  },
+        { "sparser music, warmer start",  1, -12.0, 1.0, 12.0, 0.75, GrStatistic::Max, true,  0.05  },
+        { "wide-range, Max 0.5 dB",       2,  -8.0, 0.5, 20.0, 0.35, GrStatistic::Max, true,  0.05  },
+        { "sparser music, p95 0.5 dB",    1, -10.0, 0.5, 20.0, 0.35, GrStatistic::P95, false, 0.05  },
+        { "sparser music, a 0.002 aim",   1, -10.0, 1.0, 20.0, 0.75, GrStatistic::Max, true,  0.002 },
+    };
+    for (const Row& r : rows)
+    {
+        Programme src = make (r.kind);
+        GainReductionLimit lim; lim.limitDb = r.limitDb; lim.statistic = r.st;
+        LoudnessSolution idle, walked;
+        {
+            Rig rig; if (! test::run (rig.build (src.nch()))) return;
+            Programme dst; dst.ch = src.ch; dst.bind();
+            idle = solve (r, 1, src, dst, rig);      // one pass: nothing spare, so the idle render is the answer
+        }
+        Rig rig; if (! test::run (rig.build (src.nch()))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        walked = solve (r, 8, src, dst, rig);
+        const double heldIdle = grStatisticValue (idle.measured.limiter, lim);
+        const double heldWalk = grStatisticValue (walked.measured.limiter, lim);
+        const std::string at = std::string (r.what) + ": ";
+        test::ok (idle.measured.limiter.valid && heldIdle <= r.limitDb && heldIdle < 0.001,
+                  "PRECONDITION: " + at + "one pass of budget delivers the idle render (" + std::to_string (heldIdle)
+                  + " dB of reduction, " + std::to_string (idle.measured.integratedLufs) + " LUFS)");
+        test::ok (walked.status == MasteringSolveStatus::TargetUnreachable
+                  && walked.binding == MasteringConstraint::LimiterGainReduction
+                  && walked.measured.limiter.valid && heldWalk <= r.limitDb,
+                  at + "with budget left the delivered render still holds the limit (" + std::to_string (heldWalk)
+                     + " dB against " + std::to_string (r.limitDb) + ")");
+        test::ok (walked.measured.integratedLufs - idle.measured.integratedLufs >= r.minLouderLu,
+                  at + "and is louder than the idle render by at least " + std::to_string (r.minLouderLu)
+                     + " LU (" + std::to_string (walked.measured.integratedLufs) + " against "
+                     + std::to_string (idle.measured.integratedLufs) + ")");
+        if (r.onBoundary)
+            test::ok (heldWalk >= r.limitDb - kBand,
+                      at + "and sits ON the boundary, inside the probe's own margin (" + std::to_string (heldWalk)
+                         + " dB against " + std::to_string (r.limitDb) + ")");
+        const Independent ind = measureIndependently (dst.ch);
+        test::ok (std::fabs (ind.I - walked.measured.integratedLufs) < 0.01 && ind.TP <= -1.0,
+                  at + "and the buffer handed back IS that render, under the promise");
+        std::printf ("      %-28s idle %.4f LUFS -> boundary %.4f LUFS, GR %.4f of %.2f, %d renders\n",
+                     r.what, idle.measured.integratedLufs, walked.measured.integratedLufs, heldWalk, r.limitDb,
+                     walked.passes);
+    }
+
+    // EVERY RENDER TAKEN ASIDE AIMS ITS CEILING BY THE OVERSHOOT ALREADY MEASURED, not by the aim alone —
+    // the idle one as much as the probes after it. A 15 kHz tone's reconstructed peak runs a QUARTER of a
+    // decibel above the limiter's own grid, five times the aim's margin, so a ceiling left at the aim would
+    // deliver that quarter of a decibel above the promise. Two passes, so the idle render is the one delivered
+    // and it is its own ceiling under test.
+    {
+        Programme src = makeTone ((int) (2.0 * kFs), 2, 0.7, 15000.0);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        const Row r { "near-Nyquist", 0, -4.0, 0.0, 20.0, 0.0, GrStatistic::Max, false, 0.05 };
+        const auto sol = solve (r, 2, src, dst, rig);
+        const double aim = -1.0 - 0.05;
+        test::ok (sol.passes == 3 && sol.measured.limiter.valid && sol.measured.limiter.maxDb <= 0.0,
+                  "PRECONDITION: two passes and the idle render, which holds a 0 dB limit ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " dB)");
+        test::ok (sol.ceilingDbTp <= aim - 0.2,
+                  "its ceiling is pulled under the aim by the overshoot measured on the working renders ("
+                  + std::to_string (sol.ceilingDbTp) + " against an aim of " + std::to_string (aim) + ")");
+        const Independent ind = measureIndependently (dst.ch);
+        test::ok (sol.measured.truePeakDbTp <= -1.0 && ind.TP <= -1.0,
+                  "so the delivered peak is still under the promise (" + std::to_string (ind.TP) + ")");
+    }
+
+    // WITH NO BRACKET THERE IS NOTHING TO WALK. When the idle render breaks the limit too — a ratio floor no
+    // render can meet — `DriveBound` still has no `ok`, and the spare budget is not spent probing between a
+    // side that does not exist and one that does.
+    {
+        Programme src = makeMusic (4.0, 0.30, 777u, 2.4);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 12; req.initialGainDb = 20.0;
+        req.minPlrDb = 40.0;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        test::ok (sol.measured.plrDb < req.minPlrDb,
+                  "PRECONDITION: no render meets the floor, the idle one included ("
+                  + std::to_string (sol.measured.plrDb) + " against 40)");
+        // The search converges well inside its twelve passes, so several are spare — and none of them is spent:
+        // the LAST render made is the idle one. A count is not pinned here because the pass the search converges
+        // on is a float trajectory and moves by one between rows of the matrix.
+        test::ok (sol.passes < req.maxPasses && sol.logCount == sol.passes
+                  && sol.log[sol.logCount - 1].limiterMaxGrDb < 0.001,
+                  "the search's passes and the idle render, and nothing probed on top of them ("
+                  + std::to_string (sol.passes) + " renders of a 12-pass budget, the last at "
+                  + std::to_string (sol.log[sol.logCount - 1].limiterMaxGrDb) + " dB)");
+    }
+
+    // AND THE WALK STOPS WHEN THE BRACKET CLOSES, rather than spending what is left on renders the actuator
+    // cannot tell apart: the probe's step falls under the gain node's own resolution long before a 32-pass
+    // budget runs out.
+    {
+        Programme src = makeMusic (4.0, 0.30, 777u, 2.4);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        const Row r { "closing bracket", 1, -10.0, 1.0, 20.0, 0.0, GrStatistic::Max, false, 0.05 };
+        const auto sol = solve (r, 32, src, dst, rig);
+        test::ok (sol.passes < 32 && sol.measured.limiter.valid && sol.measured.limiter.maxDb <= 1.0,
+                  "a 32-pass budget stops at " + std::to_string (sol.passes) + " renders, on the boundary ("
+                  + std::to_string (sol.measured.limiter.maxDb) + " dB)");
+    }
+
+    // WHERE THE SEARCH SPENDS THE WHOLE BUDGET there is nothing to walk with and the idle render is what comes
+    // back — the one case where a quiet render is delivered on purpose, because the guarantee outranks the
+    // loudness. Whether a given programme exhausts a given budget is a float trajectory and is not pinned; what
+    // is pinned is that the budget never buys a render that breaks the limit or one that is quieter.
+    {
+        Programme src = makeMusic (4.0, 0.42, 4242u);
+        const Row r { "dense music", 0, -8.0, 1.0, 20.0, 0.0, GrStatistic::Max, false, 0.05 };
+        LoudnessSolution one, many;
+        {
+            Rig rig; if (! test::run (rig.build (2))) return;
+            Programme dst; dst.ch = src.ch; dst.bind();
+            one = solve (r, 1, src, dst, rig);
+        }
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        many = solve (r, 8, src, dst, rig);
+        test::ok (one.passes == 2 && one.measured.limiter.valid && one.measured.limiter.maxDb < 0.001,
+                  "PRECONDITION: one pass and the idle render, the exhausted budget's answer ("
+                  + std::to_string (one.measured.integratedLufs) + " LUFS)");
+        test::ok (many.measured.limiter.valid && many.measured.limiter.maxDb <= r.limitDb
+                  && many.measured.integratedLufs >= one.measured.integratedLufs - 1.0e-9
+                  && many.passes <= 8 + 1,
+                  "and eight passes buy a render that still holds it and is never quieter ("
+                  + std::to_string (many.measured.integratedLufs) + " against "
+                  + std::to_string (one.measured.integratedLufs) + " LUFS, " + std::to_string (many.passes)
+                  + " renders, " + std::to_string (many.measured.limiter.maxDb) + " dB)");
+    }
+
+    // TWO LIMITS BROKEN AT ONCE, and `binding` is the one broken at the SMALLEST drive that broke anything —
+    // the boundary the walk has just tightened — not the one the render nearest the target happened to break.
+    // The peak-to-loudness floor here gives way before the reduction limit does, while every render the search
+    // made broke both.
+    {
+        Programme src = makeMusic (4.0, 0.30, 777u, 2.4);
+        Rig rig; if (! test::run (rig.build (2))) return;
+        Programme dst; dst.ch = src.ch; dst.bind();
+        LoudnessRequest req;
+        req.targetLufs = -10.0; req.maxTruePeakDbTp = -1.0; req.maxPasses = 8; req.initialGainDb = 20.0;
+        req.limiterGr.limitDb = 1.0; req.limiterGr.statistic = GrStatistic::Max;
+        req.minPlrDb = 14.3;
+        const auto sol = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        const std::uint32_t grBit  = constraintBit (MasteringConstraint::LimiterGainReduction);
+        const std::uint32_t plrBit = constraintBit (MasteringConstraint::PeakToLoudness);
+        test::ok (sol.logCount > 0 && (sol.log[0].violated & grBit) != 0u && (sol.log[0].violated & plrBit) != 0u,
+                  "PRECONDITION: the warm start breaks both the reduction limit and the ratio floor");
+        test::ok (sol.status == MasteringSolveStatus::TargetUnreachable
+                  && sol.binding == MasteringConstraint::PeakToLoudness,
+                  "the verdict names the ratio, which gives way first (" + std::string (statusName (sol.status))
+                  + "/" + constraintName (sol.binding) + ")");
+        test::ok ((sol.alsoViolated & grBit) != 0u && (sol.alsoViolated & plrBit) != 0u,
+                  "and both are in `alsoViolated`");
+        test::ok (sol.measured.plrDb >= req.minPlrDb && sol.measured.limiter.valid
+                  && sol.measured.limiter.maxDb <= req.limiterGr.limitDb,
+                  "while the delivered render holds BOTH (ratio " + std::to_string (sol.measured.plrDb)
+                  + " >= 14.3, reduction " + std::to_string (sol.measured.limiter.maxDb) + " <= 1)");
+        std::printf ("      two at once: %s/%s, PLR %.4f, GR %.4f, %d renders\n", statusName (sol.status),
+                     constraintName (sol.binding), sol.measured.plrDb, sol.measured.limiter.maxDb, sol.passes);
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
@@ -4435,5 +4641,6 @@ int main()
     testTheDefaultQuantileChangesNothing();
     testTheDeliveredRenderHoldsTheNamedLimit();
     testTheRescuesOwnEdges();
+    testTheRescueThenFindsTheBoundary();
     return felitronics::test::report();
 }

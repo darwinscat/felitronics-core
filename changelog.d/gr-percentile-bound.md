@@ -16,9 +16,8 @@ quantities under one name. `GainReductionStats::aboveRange` therefore counts WIN
 **`GrStatistic::Percentile`.** A fourth statistic beside `Mean`, `P95` and `Max`, with its fraction in
 `GainReductionLimit::quantile` — in (0, 1] and finite, else `InvalidRequest` before any pass, whatever the statistic.
 The default is 0.95, so a `Percentile` limit at its default is the `P95` limit, bit for bit. `grStatisticValue` is the
-one function that reads a statistic off a summary; `violatedMask` and `worstExcess` no longer judge the
-peak-to-loudness ratio without a loudness measurement, the rule `lraValid` already carried for the range.
-`GainReductionStats::quantileDb` is the number the limit was judged by — NaN where the distribution cannot answer, which is "an unanswerable statistic is not a violation" in
+one function that reads a statistic off a summary. `GainReductionStats::quantileDb` is the number the limit was
+judged by — NaN where the distribution cannot answer, which is "an unanswerable statistic is not a violation" in
 arithmetic rather than in a second branch.
 
 **`LoudnessSolution::grQuantile (stage, q, outDb)`.** The q-quantile of a stage's `|GR|`, read off the very
@@ -33,16 +32,25 @@ limit that grows with drive once it has seen a render holding one — it bracket
 nothing, under `cap`, the quietest that broke something. A search that started past the boundary and ended there never
 got an `ok`, and what came back was the gentlest BROKEN render carrying the broken limit's name. The search now spends
 ONE render at the drive the limiter idles at (`kIdleDriveMarginDb` under the engagement point, where the reduction is
-zero and zero holds any reduction limit), and only there: it is taken after the search, so a solve that finds its own
-holding render is unchanged render for render and bit for bit. That render's ceiling is chosen for the DRIVE, inside
-the window that keeps the gain within ±60 dB and at or under the promise — `d = g - c` and the two are clamped one
-number at a time, so a ceiling picked for the true-peak aim alone put the gain past its clamp and the drive rendered
-was not the drive chosen — and where that window is empty no pair expresses the drive and the rescue is not taken. Its
-loudness need not be measurable: the reduction comes off the tap and the peak off the peak meter, so a render under
-the absolute gate still holds the limit and is still the answer, though never `Solved`. It never enters
-`Best::nearest*`, which is what names the violations that stopped the search. Where no render holds the limit at all —
-a limit broken with the limiter idle — the cost is two renders and the verdict is what it was. The
-`TargetUnreachable` line in the header says this instead of "the best FEASIBLE render".
+zero and zero holds any reduction limit), and then walks the bracket that render completes with whatever budget the
+search did not spend — `DriveBound::probe`, the same one the ordinary search uses — so what comes back is the LOUDEST
+render that holds the limit rather than the quietest. Measured on this tree, 0.40 to 0.81 LU above the idle point; on
+the three mixes this was built for, 0.4 to 1.8. It is all taken after the search, so a solve that finds its own
+holding render is unchanged render for render and bit for bit, and with the budget exhausted the idle render is still
+what comes back — the one case where a quiet render is delivered on purpose, because the guarantee outranks the
+loudness.
+- `pairFor` is the one place a drive becomes a `(gain, ceiling)` pair: `d = g - c` and the two are clamped to ±60 dB
+  one number at a time, so a ceiling picked for the true-peak aim alone put the gain past its clamp and the drive
+  RENDERED was not the drive chosen. The ceiling is chosen for the drive, inside the window that keeps the gain in
+  range and at or under the promise, less the between-grid overshoot already measured (a quarter of a decibel on a
+  15 kHz tone, five times the aim's own margin); where that window is empty no pair expresses the drive and the
+  rescue is not taken.
+- A render taken aside need not have a measurable loudness: the reduction comes off the tap and the peak off the peak
+  meter, so a render under the absolute gate still holds the limit and is still the answer, though never `Solved`.
+  `violatedMask` and `worstExcess` no longer judge the peak-to-loudness ratio without one.
+- None of these renders enters `Best::nearest*`, so `binding` is read from `cap` — what was broken at the smallest
+  drive that broke anything, which the walk has just tightened — and the rest go into `alsoViolated`.
+The `TargetUnreachable` line in the header says all this instead of "the best FEASIBLE render".
 
 **C ABI v8.** `fc_loudness_request` gains `limiterGrQuantile` and `compressorGrQuantile` (144 B), defaulting to 0.95;
 at their defaults a call is v7's. `FC_GR_PERCENTILE = 3` joins `fc_gr_statistic`. `fc_solution_gr_quantile (s, stage,
