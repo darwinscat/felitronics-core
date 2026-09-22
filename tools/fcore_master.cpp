@@ -735,7 +735,8 @@ int printLayout()
         { "fc_master_config", FC_STRUCT_CONFIG }, { "fc_master_params", FC_STRUCT_PARAMS },
         { "fc_master_resolved", FC_STRUCT_RESOLVED }, { "fc_master_stats", FC_STRUCT_STATS },
         { "fc_need", FC_STRUCT_NEED }, { "fc_loudness_request", FC_STRUCT_REQUEST },
-        { "fc_measurement", FC_STRUCT_MEASUREMENT }, { "fc_solution_summary", FC_STRUCT_SUMMARY } };
+        { "fc_measurement", FC_STRUCT_MEASUREMENT }, { "fc_solution_summary", FC_STRUCT_SUMMARY },
+        { "fc_gr_active_stats", FC_STRUCT_GR_ACTIVE } };
     for (const auto& s : headered)
         std::printf ("T %s %d %u\n", s.name, s.id, fc_master_sizeof (s.id, fc_master_abi_version()));
     return 0;

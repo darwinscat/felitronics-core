@@ -200,6 +200,7 @@ const STRUCTS = {
 export const STRUCT_IDS = {
     fc_master_config: 0, fc_master_params: 1, fc_master_resolved: 2, fc_master_stats: 3,
     fc_need: 4, fc_loudness_request: 5, fc_measurement: 6, fc_solution_summary: 7,
+    fc_gr_active_stats: 8,
 };
 
 export const structNames = () => Object.keys(STRUCTS);
@@ -567,7 +568,7 @@ export const FC_DOMAINS = [
     { field: 'fc_loudness_request.grTraceBuckets', unit: 'count', min: 1, max: 65536, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'the trace actually built has min(this, programme frames) buckets' },
     { field: 'fc_loudness_request.limiterGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'admitted WHATEVER the statistic is, so a 0 here is refused even when the limit does not read it' },
     { field: 'fc_loudness_request.compressorGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'as limiterGrQuantile' },
-    { field: 'fc_loudness_request.limiterActiveInputDb', unit: 'dBFS', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'K11. The gate on the LIMITER INPUT for fc_solution_gr_active_stats, at the limiter node (after preLimiterGainDb). Decides nothing the solver judges — every limit still reads the ungated distribution. Not clamped and not refused: -inf accepts every window that carried any non-zero input, +inf accepts none, NaN reads as -inf. `off` is the nearest word this vocabulary has and its prose is looser than the truth: a non-finite value is ADMITTED and each one means something, rather than one of them switching the field off. Default -60' },
+    { field: 'fc_loudness_request.limiterActiveInputDb', unit: 'dBFS', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'K11. The gate on the LIMITER INPUT for fc_solution_gr_active_stats, at the limiter node (after preLimiterGainDb). Decides nothing the solver judges — every limit still reads the ungated distribution. Not clamped and not refused: -inf accepts every window that carried any non-zero input, +inf accepts none, and a NaN accepts NOTHING — the narrowest reading, so a mistake announces itself through activeWindows == 0, valid == 0 and the NaN echoed back in thresholdDb, instead of passing for a measurement at a gate nobody chose. `off` is the nearest word this vocabulary has and its prose is looser than the truth: a non-finite value is ADMITTED and each one means something, rather than one of them switching the field off. Default -60' },
 ];
 
 // A bound of FC_DOMAINS at a given CHAIN sample rate and oversample factor: a number passes through, `null`

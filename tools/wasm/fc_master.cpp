@@ -795,8 +795,9 @@ fc_status toCore (const fc_loudness_request& r, LoudnessRequest& out) noexcept
     out.compressorGr.quantile = r.compressorGrQuantile;
     // v10 — NOT refused for being non-finite, unlike almost everything else here, and the asymmetry is the
     // field's own contract: the infinities are the two ends of its range (accept every window that carried
-    // anything / accept none) and a NaN lands on the wide end through the comparison it is used in. It decides
-    // nothing the solver does, so a bad value cannot move a verdict — only the statistic it gates.
+    // anything / accept none) and a NaN lands on the NARROW end, so that a mistake reads back as zero active
+    // windows and a NaN echo rather than as a measurement. It decides nothing the solver does, so a bad value
+    // cannot move a verdict — only the statistic it gates.
     out.limiterActiveInputDb  = r.limiterActiveInputDb;
     return FC_OK;
 }

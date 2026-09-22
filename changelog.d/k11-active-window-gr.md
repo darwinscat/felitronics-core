@@ -37,10 +37,34 @@ The third renders both at ONE fixed drive (`maxPasses = 1`, every drive-bound li
 music is rendered identically in both and the only difference is the silence appended to one. The gated p95 is
 then bit-identical between them and the ungated one falls, which is the whole claim.
 
-The control's threshold was also wrong on its own terms: it demanded a 25 % collapse and failed at 8.635 →
-8.225 dB, where the mechanism had worked perfectly. How far an ungated p95 falls is a fact about the
-distribution's shape near its top — with half the programme silent it becomes the music's own p90, and a dense
-distribution moves little. The check now claims the direction, which is what is true.
+The control's threshold was also wrong on its own terms: it demanded a 25 % collapse and failed where the
+mechanism had worked perfectly. How far an ungated p95 falls is a fact about the distribution's shape near its
+top — with half the programme silent it becomes the music's own p90, and a dense distribution moves little. The
+check now claims the direction, which is what is true.
+
+The suite PRINTS the four figures, because a passing check prints nothing and a number quoted from a green run
+would then be one nobody could reproduce — which had already happened once, an earlier fixture's numbers
+reaching a report describing this one. As it stands: ungated 6.0850 → 5.4950 dB, gated 6.0850 → 6.0850 dB.
+
+What is invariant is the GATED QUANTILE and the maximum, not every field: the seam window between the music and
+the silence passes the gate (the limiter's release carries into it), so the accepted-window count and the mean
+move by that one window. "The same music at the same drive" is a statement about the population the quantile is
+read from, and the test asserts exactly that and nothing wider.
+
+**Two things a review round found afterwards, and one of them is a hole of a class already closed once.**
+`fc_gr_active_stats` was missing from the size oracle on BOTH sides — the native `headered[]` table and the
+JavaScript `STRUCT_IDS` — so `layout-check` passed while neither half knew the struct existed. Exactly the shape
+of the flag hole fixed a commit earlier: when both halves are silent, the diff between them says nothing. Both
+now carry it, so the row has an oracle and the page's `Struct` can stamp it.
+
+The other was a **contradiction between the code and three doc sites about a NaN gate**. The code accepts
+NOTHING for a NaN (it falls through both tests and lands on +inf); the header, the facade comment and the domain
+row all claimed the opposite. The code is what was kept, and deliberately: a NaN is a caller's mistake, and
+taking it as the widest gate hands back a full set of statistics that look like a measurement at a gate nobody
+chose, while taking it as the narrowest hands back zero active windows, `valid = 0` and the NaN itself echoed in
+`thresholdDb` — three signals a reader cannot miss. The three doc sites now say that, and a test pins the
+MEANING rather than the admissibility: the domains gate can only report that a non-finite value crossed without
+a refusal, not which end of the range it landed on.
 
 **The budget grew by one histogram**, and every allocation oracle in three suites went red at once — which is
 the oracle doing its job. Two of them were also carrying numbers their own run no longer produced (a "727 696 B"

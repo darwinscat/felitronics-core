@@ -359,7 +359,7 @@ private:
 // circular — it would define "where the stage works" as "where the stage worked" and report a statistic of a
 // set chosen by the statistic. The input is the independent variable, and for the limiter it is already
 // measured at the right place and on the right clock: `MasteringChainTaps::limiterPeakLin` is the reconstructed
-// peak the limiter SAW, one per oversampled sample, at the same index as `limiterGrDb` (MasteringChain.h:132).
+// peak the limiter SAW, one per oversampled sample, at the same index as `limiterGrDb` (MasteringChain.h:141).
 // Nothing new is tapped for this and nothing new is aligned.
 //
 // A WHOLE WINDOW IS ACCEPTED OR DROPPED, never part of one. The window is the quantile's unit, and half a
@@ -384,10 +384,22 @@ class ActiveWindowGrSummariser
 public:
     // `inputGateDb` is in dBFS at the stage's input. -inf accepts every window that carried any non-zero input
     // at all, which is the widest gate that still excludes digital silence; +inf accepts none.
+    //
+    // AND A NaN ACCEPTS NOTHING — deliberately, and it is the one non-finite value with no natural reading. A
+    // caller that writes a NaN has made a mistake, and the two ways of absorbing one are not equal: taking it
+    // as the widest gate hands back a full set of statistics that look like a measurement at a gate nobody
+    // chose, while taking it as the narrowest hands back `activeWindows == 0`, `valid == false` and the NaN
+    // itself echoed in `thresholdDb` — three signals a reader cannot miss. This repository already prefers the
+    // second wherever it has had the choice (an unanswerable statistic is not a violation), so that is what
+    // the arithmetic below does, and this header now says so rather than the opposite.
     ActiveWindowGrSummariser (dynamics::offline::QuantileHistogram& windows, long long windowSamples,
                               double activityThresholdDb, double inputGateDb) noexcept
         : h_ (windows), w_ (windowSamples > 0 ? windowSamples : 1),
           activity_ (activityThresholdDb), gateDb_ (inputGateDb),
+          // NaN falls through BOTH tests (`isfinite` is false, and `NaN < 0.0` is false) and lands on +inf,
+          // the narrowest gate. That is the INTENDED reading, spelled here so it is a decision rather than a
+          // side effect of two comparisons — a review found the header claiming the opposite, and it was the
+          // header that was wrong.
           gateLin_ (std::isfinite (inputGateDb) ? core::dbToGain (inputGateDb)
                                                 : (inputGateDb < 0.0 ? 0.0 : std::numeric_limits<double>::infinity()))
     {
@@ -687,7 +699,8 @@ struct LoudnessRequest
     // statistic outright. -60 dBFS is a default that removes digital silence and near-silence and little else;
     // a caller budgeting transparency wants it near the ceiling instead, and it is a field so that it can be.
     // NOT clamped and not refused: -inf accepts every window carrying any non-zero input, +inf accepts none,
-    // and a NaN is read as -inf by the comparison it is used in, which is the widest gate and not a surprise.
+    // and a NaN accepts NOTHING — the narrowest reading, so a mistake announces itself through
+    // `activeWindows == 0`, `valid == false` and the NaN echoed back, instead of passing for a measurement.
     double limiterActiveInputDb = -60.0;
 };
 

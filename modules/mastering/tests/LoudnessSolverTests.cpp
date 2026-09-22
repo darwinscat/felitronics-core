@@ -4821,6 +4821,11 @@ void testK11ActiveWindowStatistics()
     test::ok (std::fabs (unB - unA) > 10.0 * std::fabs (gaB - gaA),
               "the ungated figure moved " + std::to_string (std::fabs (unB - unA)) + " dB and the gated one "
               + std::to_string (std::fabs (gaB - gaA)) + " dB");
+    // PRINTED, NOT ONLY ASSERTED. A passing check prints nothing here, so a number quoted in a release note
+    // from a green run would be a number nobody could reproduce from the run — and one was: an earlier
+    // fixture's 8.635 -> 8.225 reached a report describing this one. The figures are now in the output.
+    std::printf ("        K11 p95: ungated %.4f -> %.4f dB, gated %.4f -> %.4f dB (music alone, then with "
+                 "an equal stretch of silence)\n", unA, unB, gaA, gaB);
 
     // 4. A GATE AT -inf ACCEPTS EVERY WINDOW THAT CARRIED ANYTHING, so on a programme with NO silence it must
     //    agree with the ungated summary exactly — the two roads then summarise the same set.
@@ -4840,6 +4845,18 @@ void testK11ActiveWindowStatistics()
                   && shut.limiterActive.windows > 0 && shut.limiterActive.thresholdDb == 60.0,
                   "a gate above every sample accepts nothing: not valid, "
                   + std::to_string (shut.limiterActive.windows) + " windows counted, and the gate echoed back");
+
+    // 5b. A NaN GATE ACCEPTS NOTHING, and this checks the MEANING rather than that the value was admitted.
+    //     The domains gate can only say a non-finite value crossed without a refusal; which END of the range it
+    //     landed on is a decision, and a review found the header claiming the opposite of the code. A NaN has no
+    //     natural reading, so it takes the one that announces itself: no active windows, not valid, and the NaN
+    //     echoed back — rather than a full set of statistics at a gate nobody chose.
+    LoudnessSolution nan {};
+    if (test::run (solveIt (music, std::numeric_limits<double>::quiet_NaN(), nan)))
+        test::ok (nan.limiterActive.activeWindows == 0 && ! nan.limiterActive.stats.valid
+                  && nan.limiterActive.windows > 0 && std::isnan (nan.limiterActive.thresholdDb),
+                  "a NaN gate accepts NOTHING and says so three ways: 0 of "
+                  + std::to_string (nan.limiterActive.windows) + " windows, not valid, and the NaN echoed back");
 
     // 6. THE UNGATED NUMBERS DID NOT MOVE. The solver's own constraint reads them, so K11 may not touch them:
     //    the same programme through a build with the gate wide open and one with it shut must report the same
