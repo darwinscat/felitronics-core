@@ -137,6 +137,7 @@ const STRUCTS = {
         ['activityThresholdDb', 'f64'], ['maxPasses', 'i32'], ['initialGainDb', 'f64'],
         ['grTraceBuckets', 'i32'], ['_pad0', 'i32'],            // v6
         ['limiterGrQuantile', 'f64'], ['compressorGrQuantile', 'f64'],   // v8
+        ['limiterActiveInputDb', 'f64'],                                 // v10 — K11's gate, dBFS
     ],
 
     fc_solve_pass: [
@@ -160,6 +161,14 @@ const STRUCTS = {
         ['nonFiniteSubHops', 'i32'], ['loudnessValid', 'i32'], ['lraValid', 'i32'],
         ['compressorGrTraceBuckets', 'i32'], ['limiterGrTraceBuckets', 'i32'],            // v4
         ['compressorGrTraceValid', 'i32'], ['limiterGrTraceValid', 'i32'],                // v4
+    ],
+
+    // v10 — `_fc_solution_gr_active_stats`: the limiter's statistics over the windows its INPUT reached the gate.
+    // `stats` is the same frozen fc_gr_stats, every field of it over the accepted windows only.
+    fc_gr_active_stats: [
+        ['header', 'fc_header'],
+        ['stats', 'fc_gr_stats'],
+        ['windows', 'u64'], ['activeWindows', 'u64'], ['thresholdDb', 'f64'],
     ],
 
     // v4 — one bucket of `_fc_solution_gr_trace`, header-less (read with a stride of its size, like fc_solve_pass).
@@ -337,7 +346,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 9;
+export const FC_MASTER_ABI_VERSION = 10;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
@@ -558,6 +567,7 @@ export const FC_DOMAINS = [
     { field: 'fc_loudness_request.grTraceBuckets', unit: 'count', min: 1, max: 65536, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'the trace actually built has min(this, programme frames) buckets' },
     { field: 'fc_loudness_request.limiterGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'admitted WHATEVER the statistic is, so a 0 here is refused even when the limit does not read it' },
     { field: 'fc_loudness_request.compressorGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'as limiterGrQuantile' },
+    { field: 'fc_loudness_request.limiterActiveInputDb', unit: 'dBFS', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'K11. The gate on the LIMITER INPUT for fc_solution_gr_active_stats, at the limiter node (after preLimiterGainDb). Decides nothing the solver judges — every limit still reads the ungated distribution. Not clamped and not refused: -inf accepts every window that carried any non-zero input, +inf accepts none, NaN reads as -inf. `off` is the nearest word this vocabulary has and its prose is looser than the truth: a non-finite value is ADMITTED and each one means something, rather than one of them switching the field off. Default -60' },
 ];
 
 // A bound of FC_DOMAINS at a given CHAIN sample rate and oversample factor: a number passes through, `null`

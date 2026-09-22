@@ -38,11 +38,15 @@ namespace
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kFs = 48000.0;
 
-// The two quantile histograms a solve leaves in its solution — a ONE-TIME allocation of the first render, not a
-// per-pass one. Spelled through the histogram's own sizing function so a bin width or a range that moves moves
-// this with it.
+// The THREE quantile histograms a solve leaves in its solution — the compressor's, the limiter's, and (K11) the
+// limiter's gated one — a ONE-TIME allocation of the first render, not a per-pass one. Spelled through the
+// histogram's own sizing function so a bin width or a range that moves moves this with it.
+//
+// THE COUNT IS PART OF THE ORACLE, not a detail of it: when K11 added the third histogram every one of these
+// checks went red, in three suites at once, which is the allocation oracle doing exactly the job it exists for.
+// A number updated here without a reason in the commit would be the oracle silenced rather than satisfied.
 const long long kGrWindowBytes =
-    2LL * (long long) dynamics::offline::QuantileHistogram::storageBytes (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01);
+    3LL * (long long) dynamics::offline::QuantileHistogram::storageBytes (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01);
 
 // ---------------------------------------------------------------------------------------------
 // Programme generators. NONE of them is a plateau of identical gating blocks: that shape flips every
@@ -835,7 +839,7 @@ void testTheTraceBucketsAreTheRequests()
                   && sol.limiterTrace.bucket.size() == (std::size_t) b,
                   "grTraceBuckets " + std::to_string (b) + " over " + std::to_string (frames) + " frames: a render, " + std::to_string (b) + " buckets per stage");
         test::ok (perPass > 0 && got == (long long) sol.passes * perPass + traces + kGrWindowBytes,
-                  "and the solve allocates passes x its meters + its window histograms + two traces of " + std::to_string (traces / 2) + " B ("
+                  "and the solve allocates passes x its meters + its three window histograms + two traces of " + std::to_string (traces / 2) + " B ("
                   + std::to_string (got) + " B over " + std::to_string (sol.passes) + " passes)");
     }
 
@@ -904,10 +908,16 @@ void testAStoppedOrRefusedSolveHoldsItsTracesOnce()
     const std::uint64_t budget = TargetLoudnessSolver::solveBytes (kFs, 1, frames, B);
     const long long traces = 2LL * (long long) GainReductionTrace::bytesFor (B, frames);
     const long long perPass = (long long) budget - traces - kGrWindowBytes;
-    test::ok (budget == 4855712u && traces == 4194304LL && kGrWindowBytes == 640016LL,
+    // THE PIN IS THE PART THAT DOES NOT MOVE. Three literals stood here — the budget, the traces and the
+    // histograms — and two of the three are functions of things this test is not about: the bucket count and
+    // how many distributions a solution keeps. K11's third histogram moved two of them at once, which reads as
+    // a failure of the solve budget and is a failure of nothing. What this group is about is the PER-PASS cost,
+    // so that is the literal, and the rest is spelled through the same expressions the budget is made of.
+    test::ok (budget == 21392u + (std::uint64_t) traces + (std::uint64_t) kGrWindowBytes
+              && traces == 4194304LL,
               "PRECONDITION: mono, 65536 frames and buckets: a budget of "
-              + std::to_string (budget) + " B, the traces " + std::to_string (traces) + " B, the window histograms "
-              + std::to_string (kGrWindowBytes) + " B");
+              + std::to_string (budget) + " B = 21 392 B of meters + the traces " + std::to_string (traces)
+              + " B + the window histograms " + std::to_string (kGrWindowBytes) + " B");
 
     using When = StopAt::When;
     struct Case
@@ -3764,10 +3774,14 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
               "solveBytes: 0 for a channel count solve() refuses");
     // Two traces of 1000 x 32 B.
     test::ok (sizeof (GainReductionTraceBucket) == 32u, "a trace bucket is 32 B");
+    // THE FIGURE IS PRINTED, NOT SPELLED. It used to read "727 696 B" in the text while the comparison beside it
+    // was parameterised by `kGrWindowBytes` — so K11's third histogram moved the assertion and left the sentence
+    // describing a number that no longer existed. A test may not carry a number its own run does not produce.
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB)
                   == 2672u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes,
-              "and 727 696 B for 1 s of stereo at the default 1000 buckets — meter, reference true-peak meter, two "
-              "traces and the two window histograms (the ABI suite's oracle)");
+              "and " + std::to_string (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB))
+              + " B for 1 s of stereo at the default 1000 buckets — meter, reference true-peak meter, two "
+                "traces and the three window histograms (the ABI suite's oracle)");
     // A prepare() refused on its bin width (400 dB at 1e-7 dB is 4e9 bins, past the 4e6 ceiling) allocates NOTHING —
     // which is what its budget says. The diverse-testing round found the tap buffers assigned before that refusal, and
     // kept. The delta is read into a local before the check.
@@ -4708,6 +4722,134 @@ static void testTheAsideRendersKeepTheirTwoPromises()
     }
 }
 
+
+//==================================================================================================
+// K11 — THE LIMITER'S STATISTICS OVER THE WINDOWS ITS INPUT REACHED THE GATE.
+//
+// THE DEFECT BEING CLOSED, stated so a test can fail on it: `GainReductionSummariser` makes every 4 ms window
+// of the programme an entry, silence included. That is right for a LIMIT — a caller may not buy headroom with
+// silence — and wrong for a transparency budget, because the quantile then measures how much of the programme
+// was quiet. The two fixtures below are the SAME music, one of them followed by digital silence, so the only
+// thing that changes between them is the denominator.
+//
+// THE ORACLE IS OUTSIDE THE OBJECT twice over. The window COUNT is arithmetic — windows are 4 ms of tap
+// samples and the tap runs at `fs * tapOversampleFactor`, so a programme of `T` seconds is `T / 0.004` of them
+// to within the partial last one, whatever the solver thinks. And the gated p95 is held against the p95 of a
+// DIFFERENT PROGRAMME — the music alone — which no re-slicing of one object can satisfy by construction.
+void testK11ActiveWindowStatistics()
+{
+    test::group ("K11: the limiter's statistics over the windows its input reached the gate");
+
+    // The same music twice: alone, and followed by an equal stretch of digital silence.
+    Programme music  = makeMusic (6.0, 0.7);
+    Programme padded;
+    padded.ch.assign (2, std::vector<float> ((std::size_t) (12.0 * kFs), 0.0f));
+    for (int c = 0; c < 2; ++c)
+        std::copy (music.ch[(std::size_t) c].begin(), music.ch[(std::size_t) c].end(), padded.ch[(std::size_t) c].begin());
+    music.bind(); padded.bind();
+
+    auto solveIt = [] (Programme& src, double gateDb, LoudnessSolution& out)
+    {
+        Rig rig;
+        if (! rig.build (2)) return false;
+        Programme dst; dst.ch.assign (2, std::vector<float> ((std::size_t) src.frames(), 0.0f)); dst.bind();
+        LoudnessRequest req;
+        // ONE RENDER AT A FIXED DRIVE, not a search — so the two fixtures' MUSIC is rendered by the same chain
+        // at the same gain and ceiling, and the only difference between them is the silence appended to one.
+        // A search would re-converge on each and move the gain a little, and then a moved statistic could not
+        // be told from a moved denominator: the confounder would be the thing under test.
+        //
+        // AND A DRIVE THAT MAKES THE LIMITER WORK. At -14 LUFS this material's limiter touches only the peaks,
+        // so 95 % of the windows hold no reduction and BOTH p95 figures read 0.000 — a fixture that cannot tell
+        // the two distributions apart while looking like a measurement. The first version of this group did
+        // exactly that. The statistic is a quantile; the fixture has to put reduction in most windows.
+        req.targetLufs = -7.0; req.maxTruePeakDbTp = -1.0;
+        req.maxPasses = 1; req.initialGainDb = 12.0;
+        req.limiterGr.limitDb  = std::numeric_limits<double>::infinity();
+        req.minPlrDb           = -std::numeric_limits<double>::infinity();
+        req.maxLraLossLu       = std::numeric_limits<double>::infinity();
+        req.limiterActiveInputDb = gateDb;
+        out = rig.solver.solve (rig.chain, rig.renderer, rig.params, src.in(), dst.out(), 2, src.frames(), req);
+        return out.measured.limiter.valid;
+    };
+
+    LoudnessSolution justMusic {}, withSilence {};
+    const bool a = solveIt (music,  -60.0, justMusic);
+    const bool b = solveIt (padded, -60.0, withSilence);
+    test::ok (a && b, "PRECONDITION: both solves produced a valid limiter measurement");
+    if (! (a && b)) return;
+
+    // 1. THE WINDOW COUNT IS ARITHMETIC, not the object's opinion. 4 ms of tap samples at 4x of 48 kHz.
+    const double tapRate = kFs * 4.0;
+    const auto   wSamp   = (double) grQuantileWindowSamples (tapRate);
+    const auto   wantWindows = [&] (double seconds)
+    {
+        return (std::uint64_t) std::ceil (seconds * tapRate / wSamp);
+    };
+    test::ok (justMusic.limiterActive.windows == wantWindows (6.0)
+              && withSilence.limiterActive.windows == wantWindows (12.0),
+              "the programme is cut into " + std::to_string (justMusic.limiterActive.windows) + " and "
+              + std::to_string (withSilence.limiterActive.windows)
+              + " windows — 4 ms of tap samples each, by arithmetic and not by the object");
+
+    // 2. THE SILENCE IS NOT ACTIVE, and the count says so to within one window (the boundary between the
+    //    music and the silence falls inside a window, and the limiter's release carries into it).
+    const auto activeMusic = justMusic.limiterActive.activeWindows;
+    const auto activePad   = withSilence.limiterActive.activeWindows;
+    const long long slack  = (long long) activeMusic / 50 + 4;    // 2 % plus the seam
+    test::ok (std::llabs ((long long) activePad - (long long) activeMusic) <= slack,
+              "the added silence adds no active windows (" + std::to_string (activeMusic) + " against "
+              + std::to_string (activePad) + ", slack " + std::to_string (slack) + ")");
+
+    // 3. THE FINDING, and the control for it. The UNGATED p95 is dragged down by the silence — that is the
+    //    defect K11 exists for, and if it does not happen the fixture is not exercising it. The GATED p95 is
+    //    not: it is held against the p95 of a DIFFERENT PROGRAMME, which self-consistency cannot deliver.
+    const double unA = justMusic.measured.limiter.p95Db,   unB = withSilence.measured.limiter.p95Db;
+    const double gaA = justMusic.limiterActive.stats.p95Db, gaB = withSilence.limiterActive.stats.p95Db;
+    // THE CONTROL IS A DIRECTION, NOT A SIZE. How FAR the ungated p95 falls is a fact about this distribution's
+    // shape near its top — with half the programme silent it becomes the music's own p90, and a dense
+    // distribution moves little between the two. An earlier version of this check demanded a 25 % collapse,
+    // which was a number fitted to nothing: it failed at 8.635 -> 8.225 dB, where the mechanism had worked
+    // perfectly. What is claimed is what is true: the silence moves the ungated figure and cannot move the
+    // gated one, because silence never enters the gated population at all.
+    test::ok (unA > 0.0 && unB < unA,
+              "CONTROL: the ungated p95 falls when half the programme is silence (" + std::to_string (unA)
+              + " -> " + std::to_string (unB) + " dB) — the defect is present to be fixed");
+    test::ok (gaA > 0.0 && std::fabs (gaB - gaA) <= 1.0e-9,
+              "and the gated p95 does not move at all: " + std::to_string (gaA) + " against "
+              + std::to_string (gaB) + " dB, the same music at the same drive");
+    test::ok (std::fabs (unB - unA) > 10.0 * std::fabs (gaB - gaA),
+              "the ungated figure moved " + std::to_string (std::fabs (unB - unA)) + " dB and the gated one "
+              + std::to_string (std::fabs (gaB - gaA)) + " dB");
+
+    // 4. A GATE AT -inf ACCEPTS EVERY WINDOW THAT CARRIED ANYTHING, so on a programme with NO silence it must
+    //    agree with the ungated summary exactly — the two roads then summarise the same set.
+    LoudnessSolution wideOpen {};
+    if (test::run (solveIt (music, -std::numeric_limits<double>::infinity(), wideOpen)))
+        test::ok (wideOpen.limiterActive.activeWindows == wideOpen.limiterActive.windows
+                  && wideOpen.limiterActive.stats.p95Db == wideOpen.measured.limiter.p95Db
+                  && wideOpen.limiterActive.stats.maxDb == wideOpen.measured.limiter.maxDb,
+                  "a gate at -inf on a programme with no silence accepts every window and reproduces the "
+                  "ungated summary, bit for bit");
+
+    // 5. A GATE ABOVE EVERYTHING ACCEPTS NOTHING, and the answer is a refusal to answer rather than a zero:
+    //    `valid` false with the counts published, so a reader can see WHY there is no number.
+    LoudnessSolution shut {};
+    if (test::run (solveIt (music, 60.0, shut)))
+        test::ok (shut.limiterActive.activeWindows == 0 && ! shut.limiterActive.stats.valid
+                  && shut.limiterActive.windows > 0 && shut.limiterActive.thresholdDb == 60.0,
+                  "a gate above every sample accepts nothing: not valid, "
+                  + std::to_string (shut.limiterActive.windows) + " windows counted, and the gate echoed back");
+
+    // 6. THE UNGATED NUMBERS DID NOT MOVE. The solver's own constraint reads them, so K11 may not touch them:
+    //    the same programme through a build with the gate wide open and one with it shut must report the same
+    //    ungated statistics.
+    test::ok (wideOpen.measured.limiter.p95Db == shut.measured.limiter.p95Db
+              && wideOpen.measured.limiter.maxDb == shut.measured.limiter.maxDb
+              && wideOpen.measured.limiter.frames == shut.measured.limiter.frames,
+              "the gate moves nothing the solver judges: the ungated statistics are identical at both gates");
+}
+
 int main()
 {
     std::printf ("felitronics::mastering::TargetLoudnessSolver — P7\n");
@@ -4723,6 +4865,7 @@ int main()
     testTheTraceBuilderCountsWhatNoAudioCanReach();
     testTheTraceBucketsAreTheRequests();
     testAStoppedOrRefusedSolveHoldsItsTracesOnce();
+    testK11ActiveWindowStatistics();
     testTheTraceDescribesTheDeliveredRender();
     testTheTraceLocatesAnImpulse();
     testRefusalsAndDegenerateInputs();

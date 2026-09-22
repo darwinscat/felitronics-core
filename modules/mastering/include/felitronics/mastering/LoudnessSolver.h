@@ -344,6 +344,134 @@ private:
     std::uint64_t frames_ = 0, finite_ = 0, nonFinite_ = 0, active_ = 0;
 };
 
+//==============================================================================================================
+// K11 — THE SAME SUMMARY OVER THE WINDOWS WHERE THE STAGE HAD SOMETHING TO WORK ON.
+//
+// WHAT IS WRONG WITH THE SUMMARY ABOVE, and it is not a defect in it: `GainReductionSummariser` makes EVERY
+// window of the programme an entry, the silent ones included, because that is what a LIMIT must be judged on —
+// a limit is a promise about the delivered programme and a caller may not buy headroom with silence. But a
+// TRANSPARENCY BUDGET is a different question with the same units: "how hard does this stage work where it
+// works". On the same distribution, 20 % of silence turns the music's p95 into its p93.75 — and enough silence
+// zeroes the statistic outright, because the quantile then lands in the silent mass. So the two questions need
+// two distributions, and the existing one may not move: the solver's own constraint reads it.
+//
+// THE GATE IS ON THE STAGE'S INPUT, NOT ON ITS OUTPUT AND NOT ON ITS GAIN REDUCTION. Gating on |GR| would be
+// circular — it would define "where the stage works" as "where the stage worked" and report a statistic of a
+// set chosen by the statistic. The input is the independent variable, and for the limiter it is already
+// measured at the right place and on the right clock: `MasteringChainTaps::limiterPeakLin` is the reconstructed
+// peak the limiter SAW, one per oversampled sample, at the same index as `limiterGrDb` (MasteringChain.h:132).
+// Nothing new is tapped for this and nothing new is aligned.
+//
+// A WHOLE WINDOW IS ACCEPTED OR DROPPED, never part of one. The window is the quantile's unit, and half a
+// window is an entry whose mean is over a denominator nobody stated. The window's decision is its PEAK input,
+// not its mean: a limiter reacts to peaks, so a 4 ms window holding one transient over an otherwise quiet
+// stretch is a window it worked in.
+//
+// AND EVERY FIELD IS OVER THE ACCEPTED WINDOWS — the samples' mean, max and active fraction too, not only the
+// quantiles. A mean over the whole programme sitting beside a quantile over part of it would be two bases in
+// one struct under one name, which is exactly the trap the note above `GainReductionSummariser` spells out.
+struct ActiveGainReductionStats
+{
+    GainReductionStats stats {};         // every field over the ACCEPTED windows only
+    std::uint64_t windows       = 0;     // windows the programme was cut into
+    std::uint64_t activeWindows = 0;     // ... of which accepted. 0 ⇒ `stats.valid` is false
+    double        thresholdDb   = 0.0;   // the input gate this was read at, echoed — a fraction without its
+                                         // threshold is not a number, the same rule as `activityThresholdDb`
+};
+
+class ActiveWindowGrSummariser
+{
+public:
+    // `inputGateDb` is in dBFS at the stage's input. -inf accepts every window that carried any non-zero input
+    // at all, which is the widest gate that still excludes digital silence; +inf accepts none.
+    ActiveWindowGrSummariser (dynamics::offline::QuantileHistogram& windows, long long windowSamples,
+                              double activityThresholdDb, double inputGateDb) noexcept
+        : h_ (windows), w_ (windowSamples > 0 ? windowSamples : 1),
+          activity_ (activityThresholdDb), gateDb_ (inputGateDb),
+          gateLin_ (std::isfinite (inputGateDb) ? core::dbToGain (inputGateDb)
+                                                : (inputGateDb < 0.0 ? 0.0 : std::numeric_limits<double>::infinity()))
+    {
+        h_.reset();
+    }
+
+    // One tap sample, in stream order: `a` is |GR| in dB (non-negative) and `inputLin` the stage's input at
+    // THAT SAME sample, linear. A non-finite input is not allowed to decide the window — it is skipped for the
+    // peak rather than poisoning it, and the non-finite count below still reports what the trace carried.
+    void add (double a, double inputLin) noexcept
+    {
+        if (std::isfinite (inputLin))
+        {
+            const double m = std::fabs (inputLin);
+            if (m > winPeak_) winPeak_ = m;
+        }
+        if (std::isfinite (a))
+        {
+            winSumFinite_ += a; ++winFinite_;
+            if (a > winMax_) winMax_ = a;
+            if (a > activity_) ++winActive_;
+        }
+        else ++winNonFinite_;
+        winSum_ += a;
+        ++winN_;
+        if (winN_ >= w_) flush();
+    }
+
+    // The partial last window — an entry like any other, judged by its own input peak — and then the summary.
+    ActiveGainReductionStats finish (double q) noexcept
+    {
+        if (winN_ > 0) flush();
+        ActiveGainReductionStats out;
+        out.windows       = windows_;
+        out.activeWindows = activeWindows_;
+        out.thresholdDb   = gateDb_;
+        GainReductionStats& s = out.stats;
+        s.frames     = frames_;
+        s.nonFinite  = nonFinite_;
+        s.aboveRange = h_.aboveRange();
+        s.quantileQ  = q;
+        if (activeWindows_ == 0 || frames_ == 0 || h_.count() == 0) return out;
+        double p95 = 0.0;
+        if (! h_.quantile (0.95, p95)) return out;      // out of range: NOT reported as a plausible number
+        s.meanDb = finite_ > 0 ? sum_ / (double) finite_ : 0.0;
+        s.p95Db  = p95;
+        s.maxDb  = max_;
+        s.activeFraction = (double) active_ / (double) frames_;
+        double qv = 0.0;
+        if (grQuantileAdmitted (q) && h_.quantile (q, qv)) s.quantileDb = qv;
+        s.valid = (s.nonFinite == 0);
+        return out;
+    }
+
+private:
+    void flush() noexcept
+    {
+        ++windows_;
+        if (winPeak_ > gateLin_)
+        {
+            ++activeWindows_;
+            h_.add (winSum_ / (double) winN_);
+            frames_    += (std::uint64_t) winN_;
+            sum_       += winSumFinite_;
+            finite_    += winFinite_;
+            nonFinite_ += winNonFinite_;
+            active_    += winActive_;
+            if (winMax_ > max_) max_ = winMax_;
+        }
+        winSum_ = 0.0; winN_ = 0; winPeak_ = 0.0;
+        winSumFinite_ = 0.0; winMax_ = 0.0;
+        winFinite_ = 0; winNonFinite_ = 0; winActive_ = 0;
+    }
+
+    dynamics::offline::QuantileHistogram& h_;
+    long long w_ = 1, winN_ = 0;
+    double activity_ = 0.0, gateDb_ = 0.0, gateLin_ = 0.0;
+    double winSum_ = 0.0, winSumFinite_ = 0.0, winMax_ = 0.0, winPeak_ = 0.0;
+    std::uint64_t winFinite_ = 0, winNonFinite_ = 0, winActive_ = 0;
+    double sum_ = 0.0, max_ = 0.0;
+    std::uint64_t windows_ = 0, activeWindows_ = 0;
+    std::uint64_t frames_ = 0, finite_ = 0, nonFinite_ = 0, active_ = 0;
+};
+
 // THE SAME TAPS, RESOLVED IN TIME (P59b). `GainReductionStats` says how much a stage worked over the whole programme;
 // this says WHERE: the programme's frames cut into `buckets` uniform stretches, and per stretch the largest and the
 // mean |GR|. A maximum per bucket and not a sample every N frames — a point sample steps over the peak it is meant to
@@ -549,6 +677,18 @@ struct LoudnessRequest
     // Buckets per gain-reduction trace of the solution: min(this, programme frames). 1..GainReductionTrace::kMaxBuckets,
     // else InvalidRequest.
     int    grTraceBuckets = GainReductionTrace::kDefaultBuckets;
+
+    // K11 — THE GATE ON THE LIMITER'S INPUT for the SECOND set of statistics, in dBFS at the limiter's own node
+    // (after `preLimiterGainDb`, which is where `limiterPeakLin` is measured). It changes NOTHING the search
+    // judges: the constraint still reads the ungated distribution, because a limit is a promise about the
+    // delivered programme and silence may not buy headroom. It exists for the other question with the same
+    // units — how hard the stage works WHERE it works — which the ungated distribution answers wrongly in a
+    // way that looks right: 20 % of silence turns the music's p95 into its p93.75, and enough of it zeroes the
+    // statistic outright. -60 dBFS is a default that removes digital silence and near-silence and little else;
+    // a caller budgeting transparency wants it near the ceiling instead, and it is a field so that it can be.
+    // NOT clamped and not refused: -inf accepts every window carrying any non-zero input, +inf accepts none,
+    // and a NaN is read as -inf by the comparison it is used in, which is the widest gate and not a surprise.
+    double limiterActiveInputDb = -60.0;
 };
 
 // One render the search made. The whole trace is returned, not just the winner: a caller that has to
@@ -600,6 +740,14 @@ struct LoudnessSolution
     // every render and reset at the start of each, like the traces above, and owned HERE: a later solve on the
     // same solver, or destroying it, does not touch them.
     dynamics::offline::QuantileHistogram compressorGrWindows {}, limiterGrWindows {};
+
+    // K11 — the limiter's SECOND distribution and its summary: the same windows, minus the ones whose input
+    // never reached `LoudnessRequest::limiterActiveInputDb`. Written by every render and reset with the others,
+    // so it describes the LAST render like everything around it. The compressor has no counterpart: its input
+    // is not tapped (`MasteringChainTaps` carries `preLimiter`, which is the LIMITER's node), and a gate on a
+    // level nobody measured would be a guess wearing a number's clothes.
+    dynamics::offline::QuantileHistogram limiterActiveGrWindows {};
+    ActiveGainReductionStats             limiterActive {};
 
     // The q-quantile of a stage's |GR|, by the one definition (GainReductionSummariser): a reading here and a
     // `GrStatistic::Percentile` limit at the same `q` are the same number. False, and `outDb` untouched, for a
@@ -672,6 +820,7 @@ public:
         // folded into the top bin, so a quantile that lands there answers `false` instead of lying.
         if (! compHist_.prepare (0.0, kGrRangeDb, binDb)) return false;
         if (! limHist_.prepare  (0.0, kGrRangeDb, binDb)) return false;
+        if (! limActiveHist_.prepare (0.0, kGrRangeDb, binDb)) return false;   // K11 — the gated distribution
         prepared_ = true;
         return true;
     }
@@ -723,7 +872,8 @@ public:
     // budgets before it prepares anything, and the rate is an argument, not state.
     static constexpr double kGrRangeDb   = 400.0;    // the gain-reduction histograms' span — see prepare()
 
-    // prepare(): the tap buffers and the two histograms. 0 where prepare() refuses the same arguments.
+    // prepare(): the tap buffers and the three histograms — the compressor's, the limiter's, and (K11) the
+    // limiter's gated one. 0 where prepare() refuses the same arguments.
     static std::uint64_t prepareBytes (int rendererBlock, int internalBlock, int oversampleFactor, double binDb = 0.01) noexcept
     {
         if (rendererBlock < 1 || internalBlock < 1 || oversampleFactor < 1) return 0;
@@ -731,16 +881,17 @@ public:
         if (! tapLayoutFor (rendererBlock, internalBlock, oversampleFactor, frameCap, osCap)) return 0;
         const std::uint64_t hist = dynamics::offline::QuantileHistogram::storageBytes (0.0, kGrRangeDb, binDb);
         if (hist == 0) return 0;
-        return (std::uint64_t) sizeof (float) * ((std::uint64_t) frameCap + 2u * (std::uint64_t) osCap) + 2u * hist;
+        return (std::uint64_t) sizeof (float) * ((std::uint64_t) frameCap + 2u * (std::uint64_t) osCap) + 3u * hist;
     }
 
     // solve(): its PEAK. Every pass builds a loudness meter and the reference true-peak meter and frees them at the
     // pass's end, so the peak is ONE pass. (The drain used to be a buffer of zeros the first solve allocated and later
     // ones reused; the reference meter drains from its own fixed array, so there is nothing left over.) 0 for a length
     // or a channel count solve() refuses before any pass.
-    // Plus the solution's two traces of `grTraceBuckets` buckets and its two quantile histograms, which the first
-    // render allocates; 0 for a bucket count or a bin width solve() refuses. `binDb` is the one prepare() was
-    // given, because the histograms the solution keeps are copies of the ones prepare() sized.
+    // Plus the solution's two traces of `grTraceBuckets` buckets and its THREE quantile histograms — the two
+    // the limits are judged on and (K11) the limiter's gated one — which the first render allocates; 0 for a
+    // bucket count or a bin width solve() refuses. `binDb` is the one prepare() was given, because the
+    // histograms the solution keeps are copies of the ones prepare() sized.
     static std::uint64_t solveBytes (double sampleRate, int numChannels, int frames, int grTraceBuckets,
                                      double binDb = 0.01) noexcept
     {
@@ -751,7 +902,7 @@ public:
         const std::uint64_t meter = meterBytes (sampleRate, frames);
         if (meter == 0) return 0u;       // the meter refuses its capacity: measure() stops before anything is allocated
         return meter + analysis::ReferenceTruePeakMeter::storageFor (sampleRate, frames, numChannels).bytes()
-             + 2u * GainReductionTrace::bytesFor (grTraceBuckets, frames) + 2u * hist;
+             + 2u * GainReductionTrace::bytesFor (grTraceBuckets, frames) + 3u * hist;
     }
 
     // The request's bucket count, as admits() judges it.
@@ -1814,13 +1965,20 @@ private:
         GainReductionSummariser compSum (compHist_, grQuantileWindowSamples (fs_), req.activityThresholdDb);
         GainReductionSummariser limSum  (limHist_, grQuantileWindowSamples (fs_ * (double) chain.tapOversampleFactor()),
                                          req.activityThresholdDb);
+        // K11 — THE SAME TAP, THE SAME WINDOW, A DIFFERENT DENOMINATOR. Same window length on purpose: two
+        // window lengths would be two quantities under one name, which is the note above `kGrQuantileWindowSeconds`.
+        ActiveWindowGrSummariser limActive (limActiveHist_,
+                                            grQuantileWindowSamples (fs_ * (double) chain.tapOversampleFactor()),
+                                            req.activityThresholdDb, req.limiterActiveInputDb);
         // The traces and the solution's copies of the distributions are reset with the histograms: whatever they
         // held describes a render about to be overwritten in `out`.
         GainReductionTraceBuilder compTrace (sol.compressorTrace, frames, req.grTraceBuckets);
         GainReductionTraceBuilder limTrace  (sol.limiterTrace, frames, req.grTraceBuckets);
         sol.compressorGrWindows.reset();
         sol.limiterGrWindows.reset();
-        if (! renderTapped (chain, renderer, in, out, nch, frames, compSum, limSum, compTrace, limTrace, clock)) return false;
+        sol.limiterActiveGrWindows.reset();
+        sol.limiterActive = ActiveGainReductionStats {};
+        if (! renderTapped (chain, renderer, in, out, nch, frames, compSum, limSum, limActive, compTrace, limTrace, clock)) return false;
         compTrace.finish();
         limTrace.finish();
 
@@ -1831,6 +1989,10 @@ private:
         m.limiter    = limSum.finish  (req.limiterGr.quantile);
         sol.compressorGrWindows = compHist_;
         sol.limiterGrWindows    = limHist_;
+        // At the LIMITER's own `q`, like the ungated summary beside it: the two answer the same question on two
+        // populations, so reading them at two fractions would make the pair incomparable.
+        sol.limiterActive          = limActive.finish (req.limiterGr.quantile);
+        sol.limiterActiveGrWindows = limActiveHist_;
         // `gainToDbDet` for the same reason as peakDb() above, and this one is the stronger case of the two:
         // the field crosses the C ABI into the browser (fc_master_abi.h, fc_master.cpp) AND it is read back
         // as a DECISION — `headroomToEngage = ceiling - m.limiterMaxReconstructedPeakDb` a few hundred lines
@@ -1845,6 +2007,7 @@ private:
     bool renderTapped (MasteringChain& chain, OfflineRenderer& renderer,
                        const float* const* in, float* const* out, int nch, int frames,
                        GainReductionSummariser& compSum, GainReductionSummariser& limSum,
+                       ActiveWindowGrSummariser& limActive,
                        GainReductionTraceBuilder& compTrace, GainReductionTraceBuilder& limTrace,
                        ProgressClock& clock)
     {
@@ -1893,6 +2056,10 @@ private:
                         const double a = std::fabs ((double) limTap_[idx]);
                         limSum.add (a);
                         const float pk = limPeak_[idx];
+                        // K11 — the SAME sample's |GR| and the input that produced it, into the gated summary.
+                        // `limiterPeakLin` is the reconstructed peak the limiter saw, at this very index
+                        // (MasteringChain.h:141), so nothing is aligned here and nothing new is tapped.
+                        limActive.add (a, (double) pk);
                         if (pk > maxReconLin_) maxReconLin_ = pk;
                         limTrace.add ((std::uint64_t) (s - limFrom), a);
                     }
@@ -2103,7 +2270,7 @@ private:
     bool   prepared_ = false;
 
     std::vector<float> compTap_, limTap_, limPeak_;
-    dynamics::offline::QuantileHistogram compHist_, limHist_;
+    dynamics::offline::QuantileHistogram compHist_, limHist_, limActiveHist_;
     float  maxReconLin_ = 0.0f;
 
     double weights_[core::kMaxChannels] { };

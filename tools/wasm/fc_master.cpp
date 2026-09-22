@@ -251,6 +251,7 @@ template <> struct AbiId<fc_need>             { static constexpr int id = FC_STR
 template <> struct AbiId<fc_loudness_request> { static constexpr int id = FC_STRUCT_REQUEST; };
 template <> struct AbiId<fc_measurement>      { static constexpr int id = FC_STRUCT_MEASUREMENT; };
 template <> struct AbiId<fc_solution_summary> { static constexpr int id = FC_STRUCT_SUMMARY; };
+template <> struct AbiId<fc_gr_active_stats>  { static constexpr int id = FC_STRUCT_GR_ACTIVE; };
 
 constexpr std::uint32_t sizeFor (int id, std::uint32_t version) noexcept
 {
@@ -323,9 +324,10 @@ FC_ENDS_AT (fc_master_params,    limiterSlowReleaseMs);
 FC_ENDS_AT (fc_master_resolved,  limiterSlowReleaseMs);
 FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
 FC_ENDS_AT (fc_need,             _pad0);
-FC_ENDS_AT (fc_loudness_request, compressorGrQuantile);
+FC_ENDS_AT (fc_loudness_request, limiterActiveInputDb);
 FC_ENDS_AT (fc_measurement,      limiterGrTraceValid);
 FC_ENDS_AT (fc_solution_summary, gainAboveDb);
+FC_ENDS_AT (fc_gr_active_stats,  thresholdDb);
 // and the types the table's sizes were computed from
 static_assert (sizeof (fc_master_config::deliveryRate) == 8 && sizeof (fc_master_params::compressorMix) == 8
                && sizeof (fc_master_resolved::compressorMix) == 8);
@@ -791,6 +793,11 @@ fc_status toCore (const fc_loudness_request& r, LoudnessRequest& out) noexcept
     // verdict `fc_master_solve` forwards. A NaN is not refused here either, for the reason the note above gives.
     out.limiterGr.quantile    = r.limiterGrQuantile;
     out.compressorGr.quantile = r.compressorGrQuantile;
+    // v10 — NOT refused for being non-finite, unlike almost everything else here, and the asymmetry is the
+    // field's own contract: the infinities are the two ends of its range (accept every window that carried
+    // anything / accept none) and a NaN lands on the wide end through the comparison it is used in. It decides
+    // nothing the solver does, so a bad value cannot move a verdict — only the statistic it gates.
+    out.limiterActiveInputDb  = r.limiterActiveInputDb;
     return FC_OK;
 }
 
@@ -1929,6 +1936,35 @@ FC_EXPORT fc_status fc_solution_gr_quantile (fc_solution sh, std::int32_t stage,
     return FC_OK;
 }
 
+// K11 — the limiter's statistics over the windows its input reached the gate. The solution owns them, written by
+// every render like the traces and the distributions beside them, so this reads and never recomputes.
+FC_EXPORT fc_status fc_solution_gr_active_stats (fc_solution sh, std::int32_t stage, fc_gr_active_stats* out)
+{
+    FC_GUARD;
+    Slot* s = lookup (sh, Kind::Solution);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
+    // THE CODE FIRST, THEN WHAT THIS BUILD CAN ANSWER FOR IT — two different refusals and they must not be one.
+    // A code that names no stage is FC_ERR_ENUM; the compressor names a stage this ABI knows and has no gated
+    // distribution, which is FC_ERR_STATE ("legal, but not here"). Answering it with zeroes would say the
+    // compressor never worked, which is a measurement, where the truth is that nothing measured its input.
+    switch (stage)
+    {
+        case FC_GR_STAGE_COMPRESSOR: return FC_ERR_STATE;
+        case FC_GR_STAGE_LIMITER:    break;
+        default:                     return FC_ERR_ENUM;
+    }
+    const felitronics::mastering::ActiveGainReductionStats& a = s->solution->limiterActive;
+    fc_gr_active_stats o {};
+    fromCore (a.stats, o.stats);
+    o.windows       = a.windows;
+    o.activeWindows = a.activeWindows;
+    o.thresholdDb   = a.thresholdDb;
+    writeOut (out, o, bytes);
+    return FC_OK;
+}
+
 FC_EXPORT fc_status fc_solution_destroy (fc_solution sh)
 {
     FC_GUARD;
@@ -2259,6 +2295,7 @@ void writeDefaults (fc_loudness_request& o) noexcept
     out->grTraceBuckets         = d.grTraceBuckets;     // v6
     out->limiterGrQuantile      = d.limiterGr.quantile;    // v8
     out->compressorGrQuantile   = d.compressorGr.quantile;
+    out->limiterActiveInputDb   = d.limiterActiveInputDb;  // v10
 }
 }   // namespace
 

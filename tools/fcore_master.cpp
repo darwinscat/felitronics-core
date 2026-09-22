@@ -314,6 +314,7 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "limGrStat")  return parseEnumName (val, kGrSt, 4, a.req.limiterGr.statistic);
     if (key == "compGrLimit"){ FC_D (a.req.compressorGr.limitDb = d); }
     if (key == "compGrStat") return parseEnumName (val, kGrSt, 4, a.req.compressorGr.statistic);
+    if (key == "limActiveDb"){ FC_D (a.req.limiterActiveInputDb = d); }   // v10 — K11's gate on the limiter's input
     if (key == "limGrQ")     { FC_D (a.req.limiterGrQuantile = d); }
     if (key == "compGrQ")    { FC_D (a.req.compressorGrQuantile = d); }
     if (key == "activityDb") { FC_D (a.req.activityThresholdDb = d); }
@@ -691,6 +692,9 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_loudness_request, activityThresholdDb) X (fc_loudness_request, maxPasses)                                \
     X (fc_loudness_request, initialGainDb) X (fc_loudness_request, grTraceBuckets) X (fc_loudness_request, _pad0)  \
     X (fc_loudness_request, limiterGrQuantile) X (fc_loudness_request, compressorGrQuantile)                        \
+    X (fc_loudness_request, limiterActiveInputDb)                                                                  \
+    X (fc_gr_active_stats, header) X (fc_gr_active_stats, stats) X (fc_gr_active_stats, windows)                   \
+    X (fc_gr_active_stats, activeWindows) X (fc_gr_active_stats, thresholdDb)                                      \
     X (fc_solve_pass, gainDb) X (fc_solve_pass, ceilingDb) X (fc_solve_pass, integratedLufs)                       \
     X (fc_solve_pass, truePeakDbTp) X (fc_solve_pass, plrDb) X (fc_solve_pass, limiterMaxGrDb)                     \
     X (fc_solve_pass, loudnessRangeLu) X (fc_solve_pass, violated)                                                 \
@@ -981,6 +985,9 @@ int selftest (double fs, int nc)
     a.req.compressorGr.statistic = FC_GR_PERCENTILE;
     a.req.limiterGrQuantile      = 0.877;
     a.req.compressorGrQuantile   = 0.611;
+    // v10 — EVERY NEW FIELD MOVED OFF ITS DEFAULT, which is what this fixture is for: a field left at its
+    // default crosses the ABI identically whether it is marshalled or forgotten.
+    a.req.limiterActiveInputDb   = -47.5;
     a.prm.dither.bits            = 24;
     a.prm.dither.seedLo          = 0x748fea9bu;
     a.prm.dither.seedHi          = 0x853c49e6u;

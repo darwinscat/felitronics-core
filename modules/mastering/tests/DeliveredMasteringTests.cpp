@@ -283,13 +283,14 @@ static void testSolveAndRangeAreTheComposition()
         ok (bitDiff (oracle, got) == 0, tag + "and so is its delivered audio, bit for bit");
         const long long programmeBytes = identity ? 0 : (long long) kNch * d * 4;
         const long long traceBytes = 2LL * (long long) GainReductionTrace::bytesFor (req.grTraceBuckets, (int) d);
-        // The two quantile histograms the solution keeps — a ONE-TIME allocation of the first render, like the traces.
+        // The THREE quantile histograms the solution keeps — the compressor's, the limiter's and (K11) the
+        // limiter's gated one — a ONE-TIME allocation of the first render, like the traces.
         const long long windowBytes =
-            2LL * (long long) dynamics::offline::QuantileHistogram::storageBytes (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01);
+            3LL * (long long) dynamics::offline::QuantileHistogram::storageBytes (0.0, TargetLoudnessSolver::kGrRangeDb, 0.01);
         const long long perPass = (long long) solveBudget - programmeBytes - traceBytes - windowBytes;
         ok (perPass > 0 && traceBytes == 2LL * 1000LL * 32LL
             && solveBytes == (long long) sg.passes * perPass + traceBytes + windowBytes + programmeBytes,
-            tag + "the search allocates passes x its meters + its two 1000-bucket traces + its window histograms + the "
+            tag + "the search allocates passes x its meters + its two 1000-bucket traces + its three window histograms + the "
                   "converted programme (" + std::to_string (solveBytes) + ")");
     }
 

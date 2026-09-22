@@ -70,9 +70,17 @@ constexpr int    kNch = 2;
 // The two quantile histograms a solve leaves in its solution (`GainReductionSummariser`) — a ONE-TIME allocation of the
 // first render, like the traces, and 0.01 dB over 400 dB on every row. Spelled through the histogram's own sizing
 // function so a range or a bin width that moves moves this with it.
+// THREE since K11: the compressor's distribution, the limiter's, and the limiter's gated one. The count is part
+// of the oracle — adding the third turned every budget check in three suites red at once, which is the
+// allocation oracle doing its job rather than an inconvenience to be edited away.
 const std::uint64_t kGrWindowBytes =
-    2u * felitronics::dynamics::offline::QuantileHistogram::storageBytes (
+    3u * felitronics::dynamics::offline::QuantileHistogram::storageBytes (
              0.0, felitronics::mastering::TargetLoudnessSolver::kGrRangeDb, 0.01);
+
+// What a `LoudnessSolution` costs BESIDES the parts spelled out at its check: the passes' log, the measurement,
+// the verdict fields. Named so that the parts that DO move — the traces, the histograms, K11's gated summary —
+// are added one by one and a change to any of them names itself instead of being absorbed into a total.
+constexpr std::uint64_t kSolutionRecordRest = 2368u;
 
 // The topology axis of the P41 create/configure matrix — see the switch that reads it.
 constexpr int kTopologies = 9;
@@ -1522,9 +1530,12 @@ int main()
         // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer).
         // And two traces of 1000 x 32 B: 64 000 B.
         ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
-        // And, since the quantile read-back (`fc_solution_gr_quantile`), the two window histograms the solution keeps.
+        // And, since the quantile read-back (`fc_solution_gr_quantile`), the window histograms the solution keeps —
+        // three of them since K11. THE FIGURE IS PRINTED rather than spelled: the literal that used to stand here
+        // (727 960 B) described the two-histogram build and would have gone on reading as a measurement.
         ok (solve.callBytes == 2936u + 21008u + 64000u + kGrWindowBytes,
-            "the solve budget is meter + reference true-peak meter + two traces + two window histograms = 727 960 B");
+            "the solve budget is meter + reference true-peak meter + two traces + three window histograms = "
+            + std::to_string (solve.callBytes) + " B");
 
         long long before = alloc::bytes.load();
         const fc_status w = fc_master_set_channel_weight (h, 0, 1.0);
@@ -1866,38 +1877,39 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 9u, "PRECONDITION: this group is written for v9 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
-                        "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
-                        "v7: fc_master_eq_curve, no struct grew; v8: the request's two quantiles and "
-                        "fc_solution_gr_quantile; v9: fc_master_eq_dyn_times, no struct grew)");
+        ok (kCur == 10u, "PRECONDITION: this group is written for v10 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+                         "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
+                         "v7: fc_master_eq_curve, no struct grew; v8: the request's two quantiles and "
+                         "fc_solution_gr_quantile; v9: fc_master_eq_dyn_times, no struct grew; v10: K11 — the request's "
+                         "limiter input gate, fc_gr_active_stats and fc_solution_gr_active_stats)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 6) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 7) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 8) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 9) == 88u,
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 9) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 10) == 88u,
             "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 6) == 6584u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 7) == 6584u && fc_master_sizeof (FC_STRUCT_PARAMS, 8) == 6584u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 9) == 6584u,
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 9) == 6584u && fc_master_sizeof (FC_STRUCT_PARAMS, 10) == 6584u,
             "params: 6560 at v1 and v2, 6568 from v3, 6584 from v6");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 6) == 96u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 7) == 96u && fc_master_sizeof (FC_STRUCT_RESOLVED, 8) == 96u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 9) == 96u,
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 9) == 96u && fc_master_sizeof (FC_STRUCT_RESOLVED, 10) == 96u,
             "resolved: 80 at v1 and v2, 88 from v3, 96 from v6");
         ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
             && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 5) == 224u
             && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 7) == 224u
-            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 8) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 9) == 224u,
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 8) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 9) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 10) == 224u,
             "measurement: 208 to v3, 224 from v4 — the trace's four fields");
         ok (fc_master_sizeof (FC_STRUCT_REQUEST, 1) == 120u && fc_master_sizeof (FC_STRUCT_REQUEST, 5) == 120u
             && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u && fc_master_sizeof (FC_STRUCT_REQUEST, 7) == 128u
-            && fc_master_sizeof (FC_STRUCT_REQUEST, 8) == 144u && fc_master_sizeof (FC_STRUCT_REQUEST, 9) == 144u,
+            && fc_master_sizeof (FC_STRUCT_REQUEST, 8) == 144u && fc_master_sizeof (FC_STRUCT_REQUEST, 9) == 144u && fc_master_sizeof (FC_STRUCT_REQUEST, 10) == 152u,
             "request: 120 to v5, 128 from v6 — `grTraceBuckets` and its named padding — 144 from v8, the two quantiles");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
@@ -1923,6 +1935,7 @@ int main()
             { 7u, 88u, FC_OK,              "v7 at 88 bytes — nor at v7" },
             { 8u, 88u, FC_OK,              "v8 at 88 bytes — nor at v8" },
             { 9u, 88u, FC_OK,              "v9 at 88 bytes — nor at v9" },
+            { 10u, 88u, FC_OK,             "v10 at 88 bytes — nor at v10" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
@@ -2250,11 +2263,15 @@ int main()
             fc_need nd {}; FC_INIT (nd);
             using felitronics::dynamics::offline::QuantileHistogram;
             ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK
-                && nd.facadeBytes == 2368u + 2u * sizeof (GainReductionTrace) + 2u * sizeof (QuantileHistogram)
+                && nd.facadeBytes == kSolutionRecordRest + 2u * sizeof (GainReductionTrace)
+                                      + 3u * sizeof (QuantileHistogram)
+                                      + sizeof (felitronics::mastering::ActiveGainReductionStats)
                 && sizeof (GainReductionTrace) == (24u + sizeof (GainReductionTrace::bucket) + 7u) / 8u * 8u,
-                "a solution record costs 2368 B plus two traces of " + std::to_string (sizeof (GainReductionTrace))
-                + " B and two window histograms of " + std::to_string (sizeof (QuantileHistogram)) + " B, neither one's store included ("
-                + std::to_string (nd.facadeBytes) + ")");
+                "a solution record costs " + std::to_string (kSolutionRecordRest) + " B plus two traces of "
+                + std::to_string (sizeof (GainReductionTrace)) + " B, three window histograms of "
+                + std::to_string (sizeof (QuantileHistogram)) + " B and K11's gated summary of "
+                + std::to_string (sizeof (felitronics::mastering::ActiveGainReductionStats))
+                + " B, no store included (" + std::to_string (nd.facadeBytes) + ")");
             (void) fc_master_destroy (hb);
         }
 
@@ -3902,6 +3919,94 @@ int main()
             ok (ask (p, 48000.0, 3, 0) == FC_OK && agrees (want.first, want.second),
                 "a v1-stamped parameter set answers the same milliseconds");
         }
+    }
+
+    //==========================================================================
+    // v10 / K11 — `fc_solution_gr_active_stats`: the limiter's statistics over the windows its input reached the
+    // gate. The behaviour is pinned in LoudnessSolverTests against a second programme; what is pinned HERE is
+    // the SURFACE — which stage is answerable, which refusal each wrong call gets, and that the gate crosses.
+    group ("v10: fc_solution_gr_active_stats — the limiter's active-window statistics across the ABI");
+    {
+        fc_master h = make();
+        fc_master_params p = goodParams();
+        fc_master_resolved rr {}; FC_INIT (rr);
+        (void) fc_master_configure (h, &p, &rr);
+        // THE VERSIONED WRITER, and the choice is the point. `fc_loudness_request_default` is FROZEN at v1: it
+        // stamps 120 bytes, and a v10 field written after it lands past the stamp where nothing reads it. The
+        // first version of this group used it and read the gate back as 0 — which is not a defect, it is rule 6
+        // working, and it is pinned as such at the end of this group.
+        fc_loudness_request req {}; FC_INIT (req);
+        ok (fc_loudness_request_defaults (&req) == FC_OK, "PRECONDITION: a request at THIS version's layout");
+        req.targetLufs = -7.0; req.maxTruePeakDbTp = -1.0;
+        req.maxPasses = 1; req.initialGainDb = 12.0;
+        req.limiterActiveInputDb = -47.5;                       // off its default, so a lost field shows
+        const std::size_t frames = (std::size_t) (kFs * 3.0);
+        const std::vector<float> in = tone (frames, kNch);
+        std::vector<float> out (in.size(), 0.0f);
+        fc_solution sol = 0;
+        const bool solved = fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol) == FC_OK;
+        ok (solved && sol != 0, "PRECONDITION: a one-pass solve at a fixed drive");
+
+        fc_gr_active_stats a {}; FC_INIT (a);
+        const fc_status st = fc_solution_gr_active_stats (sol, FC_GR_STAGE_LIMITER, &a);
+        ok (st == FC_OK && a.windows > 0, "the limiter answers, over " + std::to_string (a.windows) + " windows");
+        // THE GATE CROSSED THE ABI. A field that is marshalled and a field that is forgotten are the same
+        // number when the value equals its default, which is why the request above moved it.
+        ok (st == FC_OK && a.thresholdDb == -47.5,
+            "and it echoes the gate it was read at, so a lost field cannot pass for a default");
+        ok (st == FC_OK && a.activeWindows <= a.windows,
+            "the active count is a subset of the windows (" + std::to_string (a.activeWindows) + " of "
+            + std::to_string (a.windows) + ")");
+
+        // THE COMPRESSOR IS A REFUSAL, NOT ZEROES — the distinction this ABI exists to keep. FC_ERR_STATE says
+        // "a stage this ABI knows, with no such measurement here"; zeroes would say "the compressor never
+        // worked", which is a claim about the audio that nothing measured.
+        fc_gr_active_stats c {}; FC_INIT (c);
+        c.windows = 0xABCDu;
+        ok (fc_solution_gr_active_stats (sol, FC_GR_STAGE_COMPRESSOR, &c) == FC_ERR_STATE && c.windows == 0xABCDu,
+            "the compressor is FC_ERR_STATE and the out-struct is untouched — its input is not tapped, so there "
+            "is no gated distribution to answer with, and zeroes would be a measurement nobody made");
+        ok (fc_solution_gr_active_stats (sol, 7, &a) == FC_ERR_ENUM, "a code this ABI does not define: ENUM");
+        ok (fc_solution_gr_active_stats (sol, -1, &a) == FC_ERR_ENUM, "... and a negative one");
+        ok (fc_solution_gr_active_stats (sol, FC_GR_STAGE_LIMITER, nullptr) == FC_ERR_NULL, "a null out-struct");
+        ok (fc_solution_gr_active_stats (0, FC_GR_STAGE_LIMITER, &a) == FC_ERR_HANDLE, "a handle that is not one");
+        { fc_gr_active_stats bad {}; FC_INIT (bad); bad.header.abiVersion = FC_MASTER_ABI_VERSION + 1u;
+          ok (fc_solution_gr_active_stats (sol, FC_GR_STAGE_LIMITER, &bad) == FC_ERR_ABI_VERSION,
+              "a version this build does not know"); }
+        { fc_gr_active_stats bad {}; FC_INIT (bad); bad.header.structSize = (std::uint32_t) sizeof (bad) + 8u;
+          ok (fc_solution_gr_active_stats (sol, FC_GR_STAGE_LIMITER, &bad) == FC_ERR_STRUCT_SIZE,
+              "a size that is not its version's row"); }
+        // THE HANDLE IS CHECKED BEFORE THE STAGE, the header's order: a bad handle AND a bad code is HANDLE.
+        ok (fc_solution_gr_active_stats (0, 7, &a) == FC_ERR_HANDLE, "and the handle is checked before the code");
+
+        // RULE 6, ON THIS FIELD: a caller still at v1 gets the DEFAULT gate, whatever it wrote past its stamp.
+        // That is the compatibility rule's whole promise — only the caller's bytes are read — and the number it
+        // lands on is -60, the documented default, not the -47.5 sitting in memory at offset 144.
+        {
+            fc_loudness_request old {}; FC_INIT (old);
+            (void) fc_loudness_request_defaults (&old);
+            old.targetLufs = -7.0; old.maxTruePeakDbTp = -1.0;
+            old.maxPasses = 1; old.initialGainDb = 12.0;
+            old.limiterActiveInputDb = -47.5;
+            old.header.abiVersion = 1u; old.header.structSize = 120u;      // a v1 caller, with v10 bytes after it
+            fc_master h1 = make();
+            fc_master_params p1 = goodParams();
+            fc_master_resolved r1 {}; FC_INIT (r1);
+            (void) fc_master_configure (h1, &p1, &r1);
+            std::vector<float> o1 (in.size(), 0.0f);
+            fc_solution s1 = 0;
+            const bool ran = fc_master_solve (h1, &p1, &old, in.data(), o1.data(), (std::uint32_t) frames, &s1) == FC_OK;
+            fc_gr_active_stats v1 {}; FC_INIT (v1);
+            const fc_status vs = ran ? fc_solution_gr_active_stats (s1, FC_GR_STAGE_LIMITER, &v1) : FC_ERR_HANDLE;
+            ok (vs == FC_OK && v1.thresholdDb == -60.0,
+                "a v1-stamped request is read with the DEFAULT gate (-60), not the v10 bytes past its size ("
+                + std::to_string (v1.thresholdDb) + ")");
+            if (s1 != 0) fc_solution_destroy (s1);
+            fc_master_destroy (h1);
+        }
+
+        if (sol != 0) fc_solution_destroy (sol);
+        fc_master_destroy (h);
     }
 
     //==========================================================================

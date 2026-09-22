@@ -399,6 +399,9 @@ const Knob kKnobs[] = {
     REQ_I ("fc_loudness_request.grTraceBuckets", grTraceBuckets),
     REQ_D ("fc_loudness_request.limiterGrQuantile", limiterGrQuantile),
     REQ_D ("fc_loudness_request.compressorGrQuantile", compressorGrQuantile),
+    // v10 / K11 — the gate on the limiter's input. It decides nothing the solver judges, so its row's `edge` is
+    // `free`: there is no clamp and no refusal to probe, only the value crossing and being echoed back.
+    REQ_D ("fc_loudness_request.limiterActiveInputDb", limiterActiveInputDb),
 };
 
 const Knob* knobFor (const std::string& field)

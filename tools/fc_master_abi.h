@@ -100,6 +100,10 @@ extern "C" {
 // v8: the gain-reduction PERCENTILE — the `q` each limit binds at the end of `fc_loudness_request` (one row) and
 // `fc_solution_gr_quantile`, the general read-back that replaces a fixed field per fraction.
 // v9: `fc_master_eq_dyn_times` — one entry point, no struct, and therefore no row, exactly as v7.
+// v10: the limiter's ACTIVE-WINDOW gain-reduction statistics (K11) — `fc_gr_active_stats` and
+// `fc_solution_gr_active_stats`, plus the gate itself at the end of `fc_loudness_request`: a new struct with
+// its own id, one entry point and one row. NOTHING existing moved: `fc_gr_stats` is nested by value and
+// therefore frozen (rule 3), and the solver's own constraint still reads the ungated distribution.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -174,7 +178,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 9u
+#define FC_MASTER_ABI_VERSION 10u
 
 typedef struct fc_header
 {
@@ -701,6 +705,15 @@ typedef struct fc_loudness_request
     // v8 is read with.
     double  limiterGrQuantile;
     double  compressorGrQuantile;
+
+    // ---- v10 ----
+    // THE GATE ON THE LIMITER'S INPUT for `fc_solution_gr_active_stats`, in dBFS at the limiter's own node —
+    // after `preLimiterGainDb`, which is where the reconstructed peak it reads is measured. It changes NOTHING
+    // this request decides: every limit is still judged on the ungated distribution, because a limit is a
+    // promise about the delivered programme and silence may not buy headroom with it. -60 is the default and
+    // is what a request older than v10 is read with. NOT refused and NOT clamped, on purpose: -inf accepts
+    // every window that carried any non-zero input, +inf accepts none, and both are answers.
+    double  limiterActiveInputDb;
 } fc_loudness_request;
 
 typedef struct fc_solve_pass
@@ -721,6 +734,33 @@ typedef struct fc_gr_stats
     uint64_t frames, nonFinite, aboveRange;
     int32_t  valid;
 } fc_gr_stats;
+
+//==============================================================================
+// v10 — THE SAME STATISTICS OVER THE WINDOWS WHERE THE STAGE HAD SOMETHING TO WORK ON (K11).
+//
+// `fc_gr_stats` above answers what a LIMIT is judged on, and it must: every 4 ms window of the programme is an
+// entry, the silent ones included, so a caller cannot buy headroom with silence. That makes it the wrong answer
+// to the other question with the same units — how hard the stage works WHERE it works. On the same distribution
+// 20 % of silence turns the music's p95 into its p93.75, and enough of it drags the quantile into the silent
+// mass and zeroes the statistic outright. Two questions, two distributions; the first one does not move.
+//
+// THE GATE IS ON THE STAGE'S INPUT, never on its gain reduction: gating on |GR| would define "where the stage
+// works" as "where it worked" and report a statistic of a set the statistic itself chose. `windows` and
+// `activeWindows` are published beside the numbers, so a caller can see how much of the programme the answer
+// rests on rather than trusting it.
+//
+// `stats` IS THE SAME STRUCT, nested by value and frozen with it, and every one of its fields is over the
+// ACCEPTED windows — the samples' mean, max and active fraction too, not only the quantiles. A mean over the
+// whole programme beside a quantile over part of it would be two bases under one name.
+typedef struct fc_gr_active_stats
+{
+    fc_header   header;
+
+    fc_gr_stats stats;              // over the accepted windows only; `stats.valid` is 0 when none were
+    uint64_t    windows;            // 4 ms windows the programme was cut into
+    uint64_t    activeWindows;      // ... of which the input reached the gate
+    double      thresholdDb;        // the gate this was read at, echoed back
+} fc_gr_active_stats;
 
 typedef struct fc_measurement
 {
@@ -787,7 +827,8 @@ typedef struct fc_solution_summary
 typedef enum fc_struct_id
 {
     FC_STRUCT_CONFIG = 0, FC_STRUCT_PARAMS = 1, FC_STRUCT_RESOLVED = 2, FC_STRUCT_STATS = 3,
-    FC_STRUCT_NEED = 4, FC_STRUCT_REQUEST = 5, FC_STRUCT_MEASUREMENT = 6, FC_STRUCT_SUMMARY = 7
+    FC_STRUCT_NEED = 4, FC_STRUCT_REQUEST = 5, FC_STRUCT_MEASUREMENT = 6, FC_STRUCT_SUMMARY = 7,
+    FC_STRUCT_GR_ACTIVE = 8
 } fc_struct_id;
 
 //      X(id,                     since, bytes)
@@ -805,9 +846,11 @@ typedef enum fc_struct_id
         X(FC_STRUCT_REQUEST,      1,      120)    \
         X(FC_STRUCT_REQUEST,      6,      128)    \
         X(FC_STRUCT_REQUEST,      8,      144)    \
+        X(FC_STRUCT_REQUEST,     10,      152)    \
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
         X(FC_STRUCT_MEASUREMENT,  4,      224)    \
-        X(FC_STRUCT_SUMMARY,      1,       88)
+        X(FC_STRUCT_SUMMARY,      1,       88)    \
+        X(FC_STRUCT_GR_ACTIVE,   10,       96)
 
 //==============================================================================
 // HANDLES
@@ -1174,6 +1217,18 @@ fc_status fc_master_solve_delivered (fc_master h, const fc_master_params* params
                                      fc_solution* out_solution);
 
 fc_status fc_solution_summary_get (fc_solution s, fc_solution_summary* out);
+
+// v10 (K11) — the limiter's gain-reduction statistics over the windows its INPUT reached
+// `fc_loudness_request::limiterActiveInputDb`. Of the LAST render this solution made, which is the one whose
+// audio the caller holds, exactly like `fc_solution_gr_trace` and `fc_solution_gr_quantile`.
+//
+// ONLY FC_GR_STAGE_LIMITER IS ANSWERABLE, and the compressor is FC_ERR_STATE rather than a struct full of
+// zeroes. The gate needs the stage's input, and the chain taps the limiter's (the reconstructed peak it saw)
+// and not the compressor's; answering 0 active windows would say "the compressor never worked", which is a
+// measurement, where the truth is that nothing measured it. A code this ABI does not define is FC_ERR_ENUM.
+//
+// `out` is stamped by the CALLER like every other OUT struct, and is written only on FC_OK.
+fc_status fc_solution_gr_active_stats (fc_solution s, int32_t stage, fc_gr_active_stats* out);
 fc_status fc_solution_measurement (fc_solution s, fc_measurement* out);
 // Copies min(logCount, cap) pass records into `out` and reports how many were written. Same ownership
 // rule as everywhere else here: the buffer is the caller's and its capacity is binding.
