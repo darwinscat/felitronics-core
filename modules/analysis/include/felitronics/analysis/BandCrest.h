@@ -333,6 +333,7 @@ public:
         grid_.reset();
         hops_ = 0; dropped_ = 0; samples_ = 0; nonFinite_ = 0; firstNonFiniteAt_ = -1;
         osSkipped_ = 0; osInHop_ = 0; osMeasured_ = 0; ranNc_ = 0; finished_ = false; curCount_ = 0;
+        narrowed_ = 0; widest_ = 0;
         baseHops_ = 0; baseInHop_ = 0; baseCur_ = 0.0;
         for (int b = 0; b < kBands; ++b) { curPeak_[b] = 0.0; curSum_[b] = 0.0; }
     }
@@ -345,6 +346,8 @@ public:
         if (n == 0) return true;
         if (in == nullptr) return false;
         for (int c = 0; c < numChannels; ++c) if (in[c] == nullptr) return false;
+        if (numChannels > widest_) widest_ = numChannels;
+        if (numChannels < widest_) narrowed_ += n;
         ranNc_ = numChannels;
 
         for (int off = 0; off < n; )
@@ -438,6 +441,15 @@ public:
     long long    droppedHops() const noexcept { return dropped_; }
     long long    samplesProcessed() const noexcept { return samples_; }
     long long    nonFiniteSamples() const noexcept { return nonFinite_; }
+
+    // A CHANNEL THAT VANISHES MID-PROGRAMME CHANGES THE MEASUREMENT, and silently unless it is counted. The
+    // peak is a maximum over the channels PRESENT and the mean square is divided by the samples actually
+    // accumulated, so a stretch fed at one channel where the rest was fed at two is measured over a different
+    // width — the numbers stay finite and plausible and nothing in them says the width moved. This is the
+    // count: base samples processed at fewer channels than the widest this run has seen. `BandBursts` counts
+    // its absent channels for the same reason and this is that rule kept.
+    long long    narrowedSamples() const noexcept { return narrowed_; }
+    int          widestChannels() const noexcept { return widest_; }
     long long    firstNonFiniteAt() const noexcept { return firstNonFiniteAt_; }
 
     long long blockCount() const noexcept
@@ -661,7 +673,8 @@ private:
     int           osSkipped_ = 0;
     long long     osInHop_ = 0, osMeasured_ = 0;
     std::uint64_t curCount_ = 0;      // the samples accumulated into the hop being built, all channels
-    long long     baseHops_ = 0, baseInHop_ = 0;
+    long long     baseHops_ = 0, baseInHop_ = 0, narrowed_ = 0;
+    int           widest_ = 0;
     double        baseCur_ = 0.0;
     double    curPeak_[kBands] {}, curSum_[kBands] {};
     double    floorMs_ = 0.0, shareRatio_ = 0.0;

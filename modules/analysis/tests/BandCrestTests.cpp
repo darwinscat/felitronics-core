@@ -220,6 +220,27 @@ void theLossIsInvariantToGain()
     }
     ok (bad == 0, "a master that is the source at exactly -6 dB loses no crest in any band: the loss is a "
                   "ratio of linear cells and a gain cancels out of it");
+
+    // AND AT GAINS THAT ARE NOT POWERS OF TWO, where the claim is narrower and the earlier version of this
+    // check did not look. x0.5 is EXACT in float, so it demonstrates the arithmetic and nothing about the
+    // general case; at x0.37 the loss is 1.1e-5 dB, which is not the comparison drifting but the FIXTURE:
+    // `k*x` rounds per sample, so the two signals genuinely differ by about that much and the loss correctly
+    // says so. The claim is therefore two claims — exactly zero where the scaling is exact, and inside float
+    // rounding where it is not — and both are asserted rather than the stronger one being implied.
+    int drift = 0;
+    double worst = 0.0;
+    for (const double g : { 0.37, 1.0e-3, 1.0e3, 0.999999 })
+    {
+        auto scaled = src;
+        for (auto& c : scaled) for (auto& v : c) v = (float) ((double) v * g);
+        BandCrest sc;
+        if (! runIt (sc, scaled, fs)) { ++drift; continue; }
+        for (int band = 0; band < BandCrest::kBands; ++band)
+            worst = std::max (worst, std::fabs (bandCrestLoss (a, sc, band, scratch).maxDb));
+    }
+    ok (drift == 0 && worst < 1.0e-3,
+        "at gains that are not powers of two the loss stays inside float rounding of the fixture (worst "
+        + std::to_string (worst) + " dB) — the arithmetic does not amplify it");
 }
 
 //==================================================================================================
@@ -398,6 +419,33 @@ void theProgrammeLevelIsInTheGatesUnits()
             ok (std::fabs (high.programmeMeanSquareDb() - lvl) <= 1.0e-12,
                 "moving the configured floor by 50 dB does not move the published level ("
                 + std::to_string (high.programmeMeanSquareDb()) + " against " + std::to_string (lvl) + ")");
+    }
+
+    // 2b. A CHANNEL THAT VANISHES MID-PROGRAMME IS COUNTED. It changes the measurement — the peak is a max
+    //     over the channels PRESENT and the mean square is divided by what was accumulated — and every number
+    //     stays finite and plausible while it happens, so without a counter nothing says the width moved.
+    {
+        auto two = programme (fs, 2, 4.0);
+        BandCrest bc;
+        if (felitronics::test::run (bc.prepare (fs, 2, (long long) two[0].size())))
+        {
+            const int n = (int) two[0].size();
+            const float* q2[2] { two[0].data(), two[1].data() };
+            const float* q1[1] { two[0].data() + n / 2 };
+            const bool a1 = bc.process (q2, 2, n / 2);
+            const bool b1 = bc.process (q1, 1, n - n / 2);
+            bc.finish();
+            ok (a1 && b1 && bc.widestChannels() == 2 && bc.narrowedSamples() == (long long) (n - n / 2),
+                "a programme fed at two channels and then at one counts the narrowed stretch ("
+                + std::to_string (bc.narrowedSamples()) + " samples of " + std::to_string (n) + ")");
+            // AND A RUN THAT NEVER NARROWS COUNTS NOTHING — the control, without which the line above passes
+            // on a counter wired to the frame count.
+            BandCrest steady;
+            auto whole = programme (fs, 2, 4.0);
+            if (felitronics::test::run (runIt (steady, whole, fs)))
+                ok (steady.narrowedSamples() == 0 && steady.widestChannels() == 2,
+                    "... and a run at a steady width counts none");
+        }
     }
 
     // 3. AND IT IS A SENTINEL, NOT A LEVEL, WHEN NOTHING CLEARS THE GATE.
