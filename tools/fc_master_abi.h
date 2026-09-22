@@ -465,6 +465,10 @@ typedef struct fc_clipper
     float   dcBlockHz;
 } fc_clipper;
 
+// `ceilingDbTp` IS WHAT THE STAGE IS GIVEN OUTSIDE A SEARCH — and is NOT what a search starts from. A solve
+// takes `min(req.maxTruePeakDbTp, this)` for its first pass and moves the ceiling from there, so a caller that
+// sets a generous ceiling here and a strict promise in the request gets the promise, not this number. Read what
+// was actually applied out of `fc_solution_summary::ceilingDbTp`; this field is the request, not the verdict.
 typedef struct fc_limiter
 {
     double ceilingDbTp;
@@ -682,7 +686,7 @@ typedef struct fc_loudness_request
     double  maxLraLossLu;
     double  inputLoudnessRangeLu;   // NaN = not supplied, which switches the range constraint off
     double  activityThresholdDb;
-    int32_t maxPasses;
+    int32_t maxPasses;              // bounds the SEARCH, not the renders — see `fc_solution_summary::passes`
     double  initialGainDb;          // NaN = use the params' own
 
     // ---- v6 ----
@@ -762,6 +766,14 @@ typedef struct fc_solution_summary
     int32_t  binding;               // fc_constraint
     uint32_t alsoViolated;
     double   preLimiterGainDb, ceilingDbTp;
+    // RENDERS SPENT, ALL OF THEM, AND IT CAN EXCEED `maxPasses` BY TWO. `maxPasses` bounds the SEARCH; delivering
+    // the chosen candidate costs one more whenever the search did not end on it, and the bracket rescue one more
+    // again. A caller budgeting time by `maxPasses` alone is budgeting for the best case. The one corner where
+    // `passes == 1` is guaranteed — an external search's oracle — is `maxPasses == 1` with every drive-bound
+    // limit off (`limiterGr.limitDb == +inf`, `minPlrDb == -inf`, `maxLraLossLu == +inf` or a NaN input range):
+    // a single-pass search always ends on its own candidate, so nothing is re-rendered, and the rescue is
+    // unreachable because only a render that BROKE one of those three can arm it. MasterAbiTests counts the
+    // renders through the progress callback rather than through this field, and keeps a control at four passes.
     int32_t  passes, logCount;
     double   activityThresholdDb;
     double   achievedBelowLufs, achievedAboveLufs, gainBelowDb, gainAboveDb;

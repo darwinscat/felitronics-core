@@ -3905,6 +3905,92 @@ int main()
     }
 
     //==========================================================================
+    // Q2 — `maxPasses = 1` WITH NO DRIVE-BOUND LIMIT IS EXACTLY ONE RENDER. An external search wants an oracle:
+    // render once at a chosen gain and hand back the full measurement, without a search of the solver's own. It
+    // does not need a new entry point, and this group is the evidence for that rather than a claim about it.
+    //
+    // WHY IT HOLDS, from the solver: the search is `for (pass = 0; pass < maxPasses; ++pass)`; the delivery
+    // re-render is skipped when the reported candidate is the last one rendered, which a single-pass search
+    // always is; and the bracket rescue needs `bound.cap.have`, which is set ONLY by a render that broke a
+    // `kDriveBound` limit — `limiterGr`, `minPlrDb`, `maxLraLossLu`. With those three off, nothing can break
+    // one, so the rescue is unreachable. `passes == maxPasses + 2` is real, and this is the corner where it
+    // cannot happen.
+    //
+    // THE COUNT IS TAKEN FROM OUTSIDE. `summary.passes` is the solver's own counter, and a test that read only
+    // that would be the object agreeing with itself; the renders are counted here through the PROGRESS
+    // callback, which is a different road into the same fact. And the instrument gets a control: the same
+    // material at `maxPasses = 4` must make it count more than one, or "exactly one" is a statement about a
+    // counter that never moves.
+    group ("Q2: maxPasses = 1 with no drive-bound limit is exactly one render");
+    {
+        struct Counter { std::int32_t lastStage = -1, lastPass = -1; int passStarts = 0, finalStarts = 0; };
+        const fc_progress_fn fn = [] (void* ctx, const fc_progress* e) -> std::int32_t
+        {
+            auto& c = *static_cast<Counter*> (ctx);
+            if (e->stage != c.lastStage || e->pass != c.lastPass)
+            {
+                c.lastStage = e->stage; c.lastPass = e->pass;
+                if (e->stage == FC_PROGRESS_PASS)  ++c.passStarts;
+                if (e->stage == FC_PROGRESS_FINAL) ++c.finalStarts;
+            }
+            return 1;
+        };
+        // The three drive-bound limits, OFF — and each off-value is the request's own contract, not a guess:
+        // `limitDb == +inf` is "no limit", `minPlrDb == -inf` is "no limit", a NaN input range switches the
+        // range constraint off.
+        auto oracleRequest = [] (std::int32_t passes)
+        {
+            fc_loudness_request r {}; fc_loudness_request_default (&r);
+            r.targetLufs = -16.0; r.maxTruePeakDbTp = -1.0;
+            r.limiterGr.limitDb       = std::numeric_limits<double>::infinity();
+            r.compressorGr.limitDb    = std::numeric_limits<double>::infinity();
+            r.minPlrDb                = -std::numeric_limits<double>::infinity();
+            r.maxLraLossLu            = std::numeric_limits<double>::infinity();
+            r.inputLoudnessRangeLu    = std::numeric_limits<double>::quiet_NaN();
+            r.maxPasses               = passes;
+            r.initialGainDb           = 6.0;      // a chosen drive, which is the whole point of the oracle
+            return r;
+        };
+
+        const std::size_t frames = (std::size_t) (kFs * 4.0);
+        const std::vector<float> in = tone (frames, kNch);
+        auto runIt = [&] (std::int32_t passes, Counter& c, fc_solution_summary& sum)
+        {
+            fc_master h = make();
+            fc_master_params p = goodParams();
+            fc_master_resolved rr {}; FC_INIT (rr);
+            (void) fc_master_configure (h, &p, &rr);
+            (void) fc_master_set_progress (h, fn, &c);
+            fc_loudness_request req = oracleRequest (passes);
+            std::vector<float> out (in.size(), 0.0f);
+            fc_solution sol = 0;
+            const fc_status st = fc_master_solve (h, &p, &req, in.data(), out.data(), (std::uint32_t) frames, &sol);
+            FC_INIT (sum);
+            if (st == FC_OK) (void) fc_solution_summary_get (sol, &sum);
+            if (sol != 0) fc_solution_destroy (sol);
+            fc_master_destroy (h);
+            return st;
+        };
+
+        Counter one {}; fc_solution_summary s1 {};
+        const fc_status st1 = runIt (1, one, s1);
+        ok (st1 == FC_OK && one.passStarts == 1 && one.finalStarts == 0,
+            "one search pass and no final re-render (" + std::to_string (one.passStarts) + " + "
+            + std::to_string (one.finalStarts) + " renders seen from the progress road)");
+        ok (st1 == FC_OK && s1.passes == 1,
+            "... and the solver's own counter agrees: passes == " + std::to_string (s1.passes));
+
+        // THE CONTROL, and it is the half that makes the check above mean anything: the same material and the
+        // same request at four passes has to move the counter. Without this, an instrument wired to a constant
+        // 1 would read as a proof.
+        Counter four {}; fc_solution_summary s4 {};
+        const fc_status st4 = runIt (4, four, s4);
+        ok (st4 == FC_OK && four.passStarts > 1,
+            "CONTROL: the same material at maxPasses = 4 spends " + std::to_string (four.passStarts)
+            + " search passes, so the counter is live");
+    }
+
+    //==========================================================================
     // K6 — THE DELIVERED RENDER IS ALIGNED WITH ITS INPUT. A consumer comparing input against output block by
     // block (a crest or spectrum loss per 400 ms window) has to know whether output sample n is input sample n.
     // `OfflineRenderer`'s contract says it is — `out[n] = y[n + D]` — and `MasteringChainTests` nulls that for the
