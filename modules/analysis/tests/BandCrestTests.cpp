@@ -289,6 +289,68 @@ void cvarSeesWhatP95CannotAndNeverLess()
 }
 
 //==================================================================================================
+// THE BANDS ARE THE FILTERS THE HEADER NAMES — against arithmetic, not against the object.
+//
+// This is the check that survives a rewrite of the filter bank, and the reason it exists: the bank was five
+// `Crossover2` objects and became six `Svf` cascades, which is bit-identical only if the definitions are the
+// same. Nothing else in this suite could tell the two apart — a wrong corner, a swapped band index or a
+// missing section all pass a re-slicing test and a peak null.
+//
+// THE MEASURED QUANTITY IS A RATIO, band mean-square over full-band mean-square, which cancels the tone's
+// amplitude, the interpolator's passband gain and the window: for a steady tone at f it is |H_b(f)|^2. The
+// oracle is the prewarped Linkwitz-Riley magnitude written out from the filter's own definition — at
+// Q = 1/sqrt(2) a second-order section gives |LP|^2 = 1/(1+W^4) and |HP|^2 = W^4/(1+W^4), with
+// W = tan(pi f / fs') / tan(pi fc / fs'), the fourth order being each squared. `fs'` is the OVERSAMPLED rate:
+// the split runs at 4x, and an oracle at the base rate would be describing a different filter.
+void theBandsAreTheFiltersTheHeaderNames()
+{
+    felitronics::test::group ("each band is its named cascade — analytic magnitudes, not the object's own word");
+    const double fs = 48000.0, osRate = fs * BandCrest::kFactor;
+    const felitronics::analysis::BandCrestParams pr {};
+    auto W   = [&] (double f, double fc) { return std::tan (kPi * f / osRate) / std::tan (kPi * fc / osRate); };
+    auto lp4 = [&] (double f, double fc) { const double w = W (f, fc); const double d = 1.0 + w * w * w * w; return 1.0 / (d * d); };
+    auto hp4 = [&] (double f, double fc) { const double w = W (f, fc); const double w4 = w * w * w * w;
+                                           const double d = 1.0 + w4; return (w4 * w4) / (d * d); };
+
+    for (const double f : { 60.0, 500.0, 3500.0, 11000.0, 1200.0 })
+    {
+        const auto n = (std::size_t) (fs * 3.0);
+        std::vector<std::vector<float>> ch (2, std::vector<float> (n, 0.0f));
+        for (int c = 0; c < 2; ++c)
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const double w = std::min (1.0, std::min (t / 0.25, (3.0 - t) / 0.25));   // taper BOTH ends
+                ch[(std::size_t) c][i] = (float) (0.30 * w * std::sin (2.0 * kPi * f * t));
+            }
+        BandCrest bc;
+        if (! felitronics::test::run (runIt (bc, ch, fs))) continue;
+        const long long mid = bc.blockCount() / 2;              // a block in the settled middle, past the taper
+        const double full = bc.blockMeanSq (mid, BandCrest::kFull);
+        if (! (full > 0.0)) { ok (false, "the full band carries energy at " + std::to_string ((int) f) + " Hz"); continue; }
+
+        const double want[4] {
+            lp4 (f, pr.bandEdgeHz[0]),
+            hp4 (f, pr.bandEdgeHz[0]) * lp4 (f, pr.bandEdgeHz[1]),
+            hp4 (f, pr.bandEdgeHz[1]) * lp4 (f, pr.bandEdgeHz[2]),
+            hp4 (f, pr.bandEdgeHz[2]),
+        };
+        double worst = 0.0; int at = -1;
+        for (int b = 0; b < BandCrest::kFull; ++b)
+        {
+            const double got = bc.blockMeanSq (mid, b) / full;
+            // Relative where the band carries something, absolute where it is far down and the float state is
+            // at its own floor — a relative test on 1e-9 would be measuring rounding, not the filter.
+            const double err = want[b] > 1.0e-6 ? std::fabs (got - want[b]) / want[b] : std::fabs (got - want[b]);
+            if (err > worst) { worst = err; at = b; }
+        }
+        ok (worst < 2.0e-3, std::to_string ((int) f) + " Hz: every band within "
+                            + std::to_string (worst) + " of its analytic magnitude (worst at band "
+                            + std::to_string (at) + ")");
+    }
+}
+
+//==================================================================================================
 // THREE PRECONDITIONS THE COMPARATOR USED TO ASSUME. Each was found by review with a measurement attached, and
 // each failed in the same direction: a plausible number for a comparison that had not happened.
 void theComparatorRefusesWhatItCannotCompare()
@@ -440,6 +502,7 @@ int main()
     theGridIsTheLoudnessMeters();
     theLossIsInvariantToGain();
     cvarSeesWhatP95CannotAndNeverLess();
+    theBandsAreTheFiltersTheHeaderNames();
     theComparatorRefusesWhatItCannotCompare();
     theSameProgrammeInAnySlicing();
     processAsksTheHeapForNothing();

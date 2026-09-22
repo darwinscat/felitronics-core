@@ -11,6 +11,7 @@
 #include <felitronics/oversampling/PolyphaseOversampler.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -149,6 +150,10 @@ public:
     // road (BandBursts, LowEnd, ProgrammeReport) and MathPolicyTests asserts it of each; this one was written
     // without it, which is the same class of defect the wasm tier caught in K11's dB threshold.
     using CrossoverType = eq::DeterministicCrossover2;   // asserted by the math-policy suite
+    using SvfType       = eq::DeterministicSvf;          // what the cascades below are actually built from
+    // `eq::Crossover2`'s own Q, so the cascades here ARE its cascades: 1/sqrt(2) per section, two sections,
+    // which is a 4th-order Linkwitz-Riley.
+    static constexpr double kCrossoverQ = 0.7071067811865476;
 
     // low, lowMid, highMid, high, full — `full` last so that a loop over the four BANDS is `b < kFull`.
     static constexpr int kBands = 5;
@@ -284,12 +289,28 @@ public:
         os_.resize ((std::size_t) maxChannels);
         for (auto& o : os_) if (! o.prepare (kFactor, 1, kTapsPerPhase)) return false;
 
+        // SIX CASCADES, NOT FIVE CROSSOVERS. A `Crossover2` computes BOTH of its outputs and has no one-sided
+        // form, so four of the five here threw one away: 8 of 20 filter evaluations a sample were work nobody
+        // read. The cascades below are the SAME arithmetic — `Crossover2` is exactly `lp2(lp1(x))` and
+        // `hp2(hp1(x))` at Q = 1/sqrt(2), with no correction term — so this is bit-identical and 40 % cheaper,
+        // which matters because an automatic search runs this once per candidate. The suite nulls each band
+        // against a cascade it builds itself, so the identity is asserted rather than asserted to be obvious.
         const double osRate = fs_ * (double) kFactor;
-        x0_.prepare (osRate, maxChannels); x0_.setFrequency ((float) p_.bandEdgeHz[0]);
-        x1_.prepare (osRate, maxChannels); x1_.setFrequency ((float) p_.bandEdgeHz[1]);
-        x2_.prepare (osRate, maxChannels); x2_.setFrequency ((float) p_.bandEdgeHz[2]);
-        b1_.prepare (osRate, maxChannels); b1_.setFrequency ((float) p_.bandEdgeHz[1]);
-        b2_.prepare (osRate, maxChannels); b2_.setFrequency ((float) p_.bandEdgeHz[2]);
+        const auto arm = [&] (SvfType& a, SvfType& b2, eq::FilterType t, double hz)
+        {
+            // THE ARGUMENTS ARE `Crossover2`'s, TO THE TYPE. It stores its corner as a float and then passes
+            // `kQ` as a DOUBLE; rounding Q to float here made the coefficients differ and the rework stopped
+            // being the same filter — caught by diffing the output against the previous build rather than by
+            // reasoning about it, which is the only way this class of claim is worth anything.
+            a.prepare (osRate, maxChannels);  a.setParams  (t, (double) (float) hz, kCrossoverQ, 0.0);
+            b2.prepare (osRate, maxChannels); b2.setParams (t, (double) (float) hz, kCrossoverQ, 0.0);
+        };
+        arm (lo0a_, lo0b_, eq::FilterType::LowPass,  p_.bandEdgeHz[0]);   // band `low`
+        arm (hi0a_, hi0b_, eq::FilterType::HighPass, p_.bandEdgeHz[0]);   // ... and the head of `lowMid`
+        arm (m1a_,  m1b_,  eq::FilterType::LowPass,  p_.bandEdgeHz[1]);   // band `lowMid`
+        arm (hi1a_, hi1b_, eq::FilterType::HighPass, p_.bandEdgeHz[1]);   // the head of `highMid`
+        arm (m2a_,  m2b_,  eq::FilterType::LowPass,  p_.bandEdgeHz[2]);   // band `highMid`
+        arm (hi2a_, hi2b_, eq::FilterType::HighPass, p_.bandEdgeHz[2]);   // band `high`
 
         // THE GATES BECOME RATIOS HERE, so that no logarithm takes part in a decision later.
         floorMs_    = core::det::pow10 (p_.programmeFloorDb / 10.0);
@@ -307,7 +328,7 @@ public:
         std::fill (cells_.begin(), cells_.end(), 0.0);
         std::fill (counts_.begin(), counts_.end(), 0u);
         std::fill (basePeak_.begin(), basePeak_.end(), 0.0);
-        x0_.reset(); x1_.reset(); x2_.reset(); b1_.reset(); b2_.reset();
+        for (SvfType* f : filters()) f->reset();
         for (auto& o : os_) o.reset();
         grid_.reset();
         hops_ = 0; dropped_ = 0; samples_ = 0; nonFinite_ = 0; firstNonFiniteAt_ = -1;
@@ -542,14 +563,12 @@ private:
                     if (nonFinite_ != ~0LL) ++nonFinite_;
                     if (firstNonFiniteAt_ < 0) firstNonFiniteAt_ = samples_;
                 }
-                float lo0 = 0.0f, hi0 = 0.0f, lo1 = 0.0f, hi1 = 0.0f, lo2 = 0.0f, hi2 = 0.0f;
-                float m1 = 0.0f, d1 = 0.0f, m2 = 0.0f, d2 = 0.0f;
-                x0_.processSample (c, v, lo0, hi0);     // lo0 = LP4(f0) = `low`
-                x1_.processSample (c, v, lo1, hi1);     // hi1 = HP4(f1), the head of `highMid`
-                x2_.processSample (c, v, lo2, hi2);     // hi2 = HP4(f2) = `high`
-                b1_.processSample (c, hi0, m1, d1);     // m1 = LP4(f1) of HP4(f0) = `lowMid`
-                b2_.processSample (c, hi1, m2, d2);     // m2 = LP4(f2) of HP4(f1) = `highMid`
-                (void) lo1; (void) lo2; (void) d1; (void) d2;
+                const float lo0 = lo0b_.processSample (c, lo0a_.processSample (c, v));     // LP4(f0) = `low`
+                const float hi0 = hi0b_.processSample (c, hi0a_.processSample (c, v));     // HP4(f0)
+                const float m1  = m1b_ .processSample (c, m1a_ .processSample (c, hi0));   // -> LP4(f1) = `lowMid`
+                const float hi1 = hi1b_.processSample (c, hi1a_.processSample (c, v));     // HP4(f1)
+                const float m2  = m2b_ .processSample (c, m2a_ .processSample (c, hi1));   // -> LP4(f2) = `highMid`
+                const float hi2 = hi2b_.processSample (c, hi2a_.processSample (c, v));     // HP4(f2) = `high`
                 if (! measuring) continue;
 
                 const float band[kBands] { lo0, m1, m2, hi2, v };
@@ -574,11 +593,7 @@ private:
             // TIME, which is `core::StateGrid::advance`'s precondition and what every other analyzer here
             // does. Advancing it by a whole chunk made the flush land at a different point for different call
             // sizes, and two cells then differed between a 1-sample call and a 4096-sample one.
-            if (grid_.advance (1))
-            {
-                x0_.flushDenormals(); x1_.flushDenormals(); x2_.flushDenormals();
-                b1_.flushDenormals(); b2_.flushDenormals();
-            }
+            if (grid_.advance (1)) flushAll();
         }
     }
 
@@ -622,7 +637,13 @@ private:
     std::vector<std::uint64_t> counts_;
     std::vector<float>  scratch_;
     std::vector<oversampling::PolyphaseOversampler> os_;
-    CrossoverType x0_, x1_, x2_, b1_, b2_;
+    SvfType lo0a_, lo0b_, hi0a_, hi0b_, m1a_, m1b_, hi1a_, hi1b_, m2a_, m2b_, hi2a_, hi2b_;
+
+    std::array<SvfType*, 12> filters() noexcept
+    {
+        return { &lo0a_, &lo0b_, &hi0a_, &hi0b_, &m1a_, &m1b_, &hi1a_, &hi1b_, &m2a_, &m2b_, &hi2a_, &hi2b_ };
+    }
+    void flushAll() noexcept { for (SvfType* f : filters()) f->flushDenormals(); }
     core::StateGrid grid_;
 };
 
