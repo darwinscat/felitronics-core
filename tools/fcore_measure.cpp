@@ -75,6 +75,7 @@
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/BandCrest.h>
 
 #include <algorithm>
 #include <cmath>
@@ -225,7 +226,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|forensics> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|crest|forensics> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -756,6 +757,153 @@ int main (int argc, char** argv)
                      (unsigned long long) bits (le.backgroundDensity()), (unsigned long long) bits (le.peakBandEnergy()),
                      (unsigned long long) bits (le.peakBandWidthHz()), (unsigned long long) bits (le.peakShare()),
                      (unsigned long long) bits (le.totalBandEnergy()));
+        return 0;
+    }
+
+    // K1 — BandCrest: the crest per 400 ms block and per band, and (with `--against`) the PAIRED loss between
+    // this file as the SOURCE and that one as the master. Every float is a raw IEEE-754 bit pattern, as
+    // `bursts` does it, so a later wasm comparison catches a flipped bit that decimal printing would round
+    // away. The loss is computed HERE, in the core's own function, and not reassembled from the printed
+    // per-run numbers: formed from linear cells it is one logarithm and invariant to the gain a master has
+    // over its source, and a consumer re-deriving it from two dB columns would lose both properties.
+    if (mode == "crest")
+    {
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
+        analysis::BandCrestParams bp;
+        std::string against;
+        {
+            struct Flag { const char* name; double* into; };
+            const Flag flags[] = {
+                { "--edge0",      &bp.bandEdgeHz[0] }, { "--edge1", &bp.bandEdgeHz[1] },
+                { "--edge2",      &bp.bandEdgeHz[2] }, { "--hop-ms", &bp.hopMs },
+                { "--floor-db",   &bp.programmeFloorDb }, { "--share-db", &bp.bandShareFloorDb },
+            };
+            for (int i = 5; i < argc; ++i)
+            {
+                const Flag* hit = nullptr;
+                for (const Flag& fl : flags) if (std::strcmp (argv[i], fl.name) == 0) { hit = &fl; break; }
+                if (hit != nullptr)
+                {
+                    if (i + 1 >= argc || ! parseFinite (argv[i + 1], *hit->into))
+                    { std::fprintf (stderr, "crest: %s needs a finite number\n", hit->name); std::fclose (f); return 2; }
+                    ++i; continue;
+                }
+                if (std::strcmp (argv[i], "--block-hops") == 0)
+                {
+                    std::uint64_t v = 0;
+                    if (i + 1 >= argc || ! parseCount (argv[i + 1], v) || v < 1 || v > 64)
+                    { std::fprintf (stderr, "crest: --block-hops needs 1..64\n"); std::fclose (f); return 2; }
+                    bp.blockHops = (int) v; ++i; continue;
+                }
+                if (std::strcmp (argv[i], "--against") == 0)
+                {
+                    if (i + 1 >= argc) { std::fprintf (stderr, "crest: --against needs a file\n"); std::fclose (f); return 2; }
+                    against = argv[i + 1]; ++i; continue;
+                }
+                // AN OPTION NOBODY KNOWS IS A REFUSAL — the rule the bursts mode learned the hard way.
+                if (std::strncmp (argv[i], "--", 2) == 0 && std::strcmp (argv[i], "--precise") != 0)
+                {
+                    std::fprintf (stderr, "crest: unknown option %s (want --edge0 --edge1 --edge2 --hop-ms "
+                                          "--block-hops --floor-db --share-db --against)\n", argv[i]);
+                    std::fclose (f);
+                    return 2;
+                }
+            }
+        }
+
+        auto runOne = [&] (std::FILE* fh, std::uint64_t frames, analysis::BandCrest& bc) -> bool
+        {
+            bc.setParams (bp);
+            if (! bc.prepare (fs, nc, (long long) frames)) return false;
+            bool okAll = true;
+            streamPlanar (fh, nc, [&] (const float* const* p, int n) { okAll = bc.process (p, nc, n) && okAll; });
+            bc.finish();
+            return okAll;
+        };
+
+        analysis::BandCrest src;
+        if (! runOne (f, declaredFrames, src))
+        {
+            std::fprintf (stderr, "crest: refused this configuration — edges %g/%g/%g Hz must rise and clear "
+                                  "0.49 of the oversampled rate (%g Hz), hop %g ms, blockHops %d, at %g Hz\n",
+                          bp.bandEdgeHz[0], bp.bandEdgeHz[1], bp.bandEdgeHz[2],
+                          0.49 * fs * analysis::BandCrest::kFactor, bp.hopMs, bp.blockHops, fs);
+            std::fclose (f);
+            return 2;
+        }
+        std::fclose (f);
+        if ((std::uint64_t) src.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) src.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
+
+        std::printf ("# fcore crest v1 sr=%016llx ch=%d hop=%d blockHops=%d e0=%016llx e1=%016llx e2=%016llx "
+                     "floor=%016llx share=%016llx chunk=%d\n",
+                     (unsigned long long) bits (fs), nc, src.hopSamples(), src.blockHops(),
+                     (unsigned long long) bits (bp.bandEdgeHz[0]), (unsigned long long) bits (bp.bandEdgeHz[1]),
+                     (unsigned long long) bits (bp.bandEdgeHz[2]), (unsigned long long) bits (bp.programmeFloorDb),
+                     (unsigned long long) bits (bp.bandShareFloorDb), kChunk);
+        std::printf ("samples %lld\n", (long long) src.samplesProcessed());
+        std::printf ("hops %lld %lld %lld %lld %d\n", (long long) src.hopCount(), (long long) src.basePeakHops(),
+                     (long long) src.blockCount(), (long long) src.nonFiniteSamples(),
+                     (int) src.invalidReason());
+        std::printf ("peak %016llx\n", (unsigned long long) bits (src.fullBandPeakLin()));
+        std::printf ("active");
+        for (int b = 0; b < analysis::BandCrest::kBands; ++b)
+            std::printf (" %lld", (long long) src.activeBlocks (b));
+        std::printf ("\n");
+        for (long long j = 0; j < src.blockCount(); ++j)
+        {
+            std::printf ("b %lld", j);
+            for (int b = 0; b < analysis::BandCrest::kBands; ++b)
+                std::printf (" %016llx %016llx %d", (unsigned long long) bits (src.blockPeakLin (j, b)),
+                             (unsigned long long) bits (src.blockMeanSq (j, b)), src.blockActive (j, b) ? 1 : 0);
+            std::printf ("\n");
+        }
+
+        if (! against.empty())
+        {
+            std::FILE* g = std::fopen (against.c_str(), "rb");
+            if (! g) { std::perror ("open --against"); return 2; }
+            std::uint64_t gFrames = 0;
+            if (! fileFrames (g, nc, gFrames))
+            { std::fprintf (stderr, "--against: not a whole number of %d-channel float32 frames\n", nc); std::fclose (g); return 2; }
+            analysis::BandCrest dst;
+            if (! runOne (g, gFrames, dst)) { std::fprintf (stderr, "crest: --against refused\n"); std::fclose (g); return 2; }
+            std::fclose (g);
+            std::vector<double> scratch;
+            for (int b = 0; b < analysis::BandCrest::kBands; ++b)
+            {
+                const auto L = analysis::bandCrestLoss (src, dst, b, scratch);
+                std::printf ("loss %d %lld %lld %lld %016llx %016llx %016llx %016llx %016llx %016llx "
+                             "%lld %lld %lld %016llx %016llx %d\n",
+                             b, (long long) L.blocks, (long long) L.inActive, (long long) L.usable,
+                             (unsigned long long) bits (L.p50Db), (unsigned long long) bits (L.p95Db),
+                             (unsigned long long) bits (L.cvar95Db), (unsigned long long) bits (L.meanDb),
+                             (unsigned long long) bits (L.maxDb), (unsigned long long) bits (L.p5Db),
+                             (long long) L.over1Db, (long long) L.over3Db, (long long) L.over6Db,
+                             (unsigned long long) bits (L.peakShiftDb), (unsigned long long) bits (L.levelShiftDb),
+                             L.valid ? 1 : 0);
+            }
+        }
         return 0;
     }
 

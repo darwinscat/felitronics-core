@@ -73,6 +73,28 @@ if (cmd === 'table') {
 let checks = 0, bad = 0;
 const ok = (cond, what) => { ++checks; if (!cond) { ++bad; console.error(`FAIL: ${what}`); } };
 
+// K1 — the crest price and its two entry points, on the artifact. Its geometry includes the programme LENGTH
+// (the cell store is per hop), which is why it takes a third argument and cannot be a row of the table above.
+{
+    const q = M._fc_probe_crest_storage_bytes, qw = M._fc_probe_crest_storage_bytes_with;
+    if (typeof q !== 'function')
+        refuse(`_fc_probe_crest_storage_bytes is ${typeof q} on this module — it did not reach the artifact`);
+    if (typeof qw !== 'function')
+        refuse(`_fc_probe_crest_storage_bytes_with is ${typeof qw} on this module`);
+    for (const n of ['_fc_probe_crest_run', '_fc_probe_crest_run_with', '_fc_probe_crest_scalars',
+                     '_fc_probe_crest_blocks', '_fc_probe_crest_loss'])
+        if (typeof M[n] !== 'function') refuse(`${n} is ${typeof M[n]} on this module`);
+    const oneSec = q(2, 48000, 48000);
+    ok(oneSec > 0, 'crest: one second of stereo at 48 kHz is priced above zero');
+    ok(q(2, 48000, 480000) > oneSec, 'crest: ten times the programme costs more — the store is per hop');
+    ok(qw(2, 48000, 48000, 120, 2000, 6000, 100, 4, -70, -40) === oneSec,
+       'crest: the parameterised price at the documented defaults is the default price');
+    ok(qw(2, 48000, 48000, 3000, 2000, 6000, 100, 4, -70, -40) === 0,
+       'crest: edges that do not rise are priced at the canonical zero');
+    ok(q(0, 48000, 48000) === 0 && q(99, 48000, 48000) === 0,
+       'crest: a width the core does not have is priced at zero');
+}
+
 // K3 — the PARAMETERISED bursts price, which has a different arity and so cannot be a row of the table
 // above. It still needs a gate on the artifact: the failure that matters is the name not reaching the
 // module at all, and after that, the two claims the native suite makes about it. Same shape as the rest

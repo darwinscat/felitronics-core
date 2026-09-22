@@ -65,6 +65,17 @@ extern "C"
     std::uint32_t fc_probe_report_values   (double*, std::uint32_t);
     std::uint32_t fc_probe_report_names    (char*, std::uint32_t);
 
+    int           fc_probe_crest_run       (std::int32_t, const float*, std::uint32_t, std::uint32_t, double);
+    int           fc_probe_crest_run_with  (std::int32_t, const float*, std::uint32_t, std::uint32_t, double,
+                                            double, double, double, double, std::int32_t, double, double);
+    std::uint32_t fc_probe_crest_scalars_len  (void);
+    std::uint32_t fc_probe_crest_block_stride (void);
+    std::uint32_t fc_probe_crest_loss_len     (void);
+    std::uint32_t fc_probe_crest_scalars   (std::int32_t, double*, std::uint32_t);
+    std::uint32_t fc_probe_crest_blocks    (std::int32_t, double*, std::uint32_t);
+    std::uint32_t fc_probe_crest_loss      (std::int32_t, double*, std::uint32_t);
+    double        fc_probe_crest_storage_bytes (std::uint32_t, double, std::uint32_t);
+
     int           fc_probe_bursts_run      (const float*, std::uint32_t, std::uint32_t, double);
     int           fc_probe_bursts_run_with (const float*, std::uint32_t, std::uint32_t, double,
                                             double, double, double, double, double, double);
@@ -743,6 +754,85 @@ void k3TheBandIsAnArgument (int ch)
     }
 }
 
+//==================================================================================================
+// K1 — TWO SLOTS AND A COMPARISON. Every other analyzer here holds one result, because every other question is
+// about one programme; this one is about the DIFFERENCE between two, so both live in the module and the loss
+// is computed here rather than reassembled from printed columns on the other side of the ABI.
+void k1TheTwoSlotsAndTheLoss (int ch)
+{
+    felitronics::test::group ("K1 — crest: two slots, a comparison, and what each refusal does");
+    const int frames = 3 * 48000;
+    const std::vector<float> src = burstyFixture (frames, ch);
+    std::vector<float> quiet = src;
+    for (auto& v : quiet) v = std::clamp (v, -0.2f, 0.2f);     // a "master" with its peaks taken off
+    const auto n = (std::uint32_t) frames, nc = (std::uint32_t) ch;
+    const std::uint32_t slen = fc_probe_crest_scalars_len(), stride = fc_probe_crest_block_stride();
+    const std::uint32_t llen = fc_probe_crest_loss_len();
+    ok (slen == 21u && stride == 15u && llen == 15u,
+        "the shapes are 21 scalars (16 plus one accepted-block count per band), 15 doubles a block row and "
+        "15 loss fields");
+
+    // A getter is silent until its OWN slot has run — the two are independent, which is the whole point.
+    std::vector<double> v (64, kCanary);
+    ok (fc_probe_crest_scalars (0, v.data(), slen) == 0 && fc_probe_crest_scalars (1, v.data(), slen) == 0,
+        "both slots are silent before either has run");
+    ok (fc_probe_crest_loss (0, v.data(), llen) == 0, "and the loss refuses while a slot is missing");
+
+    ok (fc_probe_crest_run (0, src.data(), n, nc, 48000.0) == 1, "slot 0 accepts a real programme");
+    ok (fc_probe_crest_loss (0, v.data(), llen) == 0,
+        "the loss STILL refuses with only one slot filled — a comparison needs two, and answering from one "
+        "would be a number about nothing");
+    ok (fc_probe_crest_run (1, quiet.data(), n, nc, 48000.0) == 1, "slot 1 accepts the master");
+    ok (fc_probe_crest_loss (0, v.data(), llen) == llen, "and now the loss answers");
+
+    // THE SLOTS DO NOT SHARE STATE. Running slot 1 at different parameters must not move slot 0's numbers.
+    std::vector<double> a0 (slen, 0.0), a1 (slen, 0.0);
+    ok (fc_probe_crest_scalars (0, a0.data(), slen) == slen, "slot 0 answers its scalars");
+    ok (fc_probe_crest_run_with (1, quiet.data(), n, nc, 48000.0, 200.0, 1500.0, 7000.0, 50.0, 8, -65.0, -35.0) == 1,
+        "slot 1 runs again at other parameters");
+    ok (fc_probe_crest_scalars (0, a1.data(), slen) == slen, "slot 0 still answers");
+    std::size_t moved = 0;
+    for (std::uint32_t i = 0; i < slen; ++i) if (! (a0[i] == a1[i])) ++moved;
+    ok (moved == 0, "and slot 0's scalars did not move (" + std::to_string (moved) + " differ)");
+    // ... and slot 1's DID, including the parameters it echoes back.
+    std::vector<double> b1 (slen, 0.0);
+    ok (fc_probe_crest_scalars (1, b1.data(), slen) == slen
+        && b1[4] == 200.0 && b1[5] == 1500.0 && b1[6] == 7000.0 && b1[3] == 8.0,
+        "while slot 1 reports the parameters THIS run installed, not the defaults");
+
+    // THE BLOCK TABLE IS ALL OF IT OR NONE OF IT — a short capacity writes nothing rather than a prefix that
+    // looks like a measurement of a shorter programme.
+    {
+        const auto rows = (std::uint32_t) a0[12];                 // blockCount
+        std::vector<double> big ((std::size_t) rows * stride + 8u, kCanary);
+        ok (rows > 0 && fc_probe_crest_blocks (0, big.data(), rows * stride) == rows,
+            "the block table fills an exact capacity (" + std::to_string (rows) + " rows)");
+        std::vector<double> small ((std::size_t) rows * stride, kCanary);
+        ok (fc_probe_crest_blocks (0, small.data(), rows * stride - 1u) == 0,
+            "and one double short writes NOTHING");
+        bool clean = true;
+        for (double d : small) clean = clean && (d == kCanary);
+        ok (clean, "... leaving the buffer as it found it");
+    }
+
+    // A SLOT THAT DOES NOT EXIST, and a band that does not.
+    ok (fc_probe_crest_run (2, src.data(), n, nc, 48000.0) == 0
+        && fc_probe_crest_run (-1, src.data(), n, nc, 48000.0) == 0, "a slot outside 0..1 is refused");
+    ok (fc_probe_crest_scalars (2, v.data(), slen) == 0 && fc_probe_crest_loss (5, v.data(), llen) == 0,
+        "and so are a slot and a band outside their ranges on the getters");
+
+    // A REFUSED RUN GOES SILENT, and does not leave the previous measurement readable under new parameters.
+    ok (fc_probe_crest_run_with (0, src.data(), n, nc, 48000.0, 3000.0, 2000.0, 6000.0, 100.0, 4, -70.0, -40.0) == 0,
+        "edges that do not rise are refused");
+    ok (fc_probe_crest_scalars (0, v.data(), slen) == 0, "and that slot is silent afterwards");
+
+    // THE PRICE MOVES WITH THE PROGRAMME, because the cell store is per hop — which is why this query takes a
+    // length where its neighbours take only a geometry.
+    const double oneSec = fc_probe_crest_storage_bytes (nc, 48000.0, 48000u);
+    ok (oneSec > 0.0 && fc_probe_crest_storage_bytes (nc, 48000.0, 480000u) > oneSec,
+        "ten times the programme costs more than one second (" + std::to_string (oneSec) + " B)");
+}
+
 void printStorageTable()
 {
     const std::uint32_t widths[] = { 1u, 2u, 6u, 16u, 17u };
@@ -910,6 +1000,7 @@ int main (int argc, char** argv)
     }
 
     k3TheBandIsAnArgument (ch);
+    k1TheTwoSlotsAndTheLoss (ch);
 
     // ---------- P81, last: asking the price disturbs nothing, and the two roads refuse the same set ----------
     // queriesAreStateless() first, while the analyzers still hold the fixtures the block above measured;

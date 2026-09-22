@@ -24,6 +24,7 @@
 #include "fcore_stream.h"
 
 #include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/BandCrest.h>
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/SourceForensics.h>
@@ -1533,6 +1534,180 @@ FC_EXPORT double fc_probe_report_storage_bytes (std::uint32_t channels, double s
     if (! geometry (channels)) return 0.0;
     return demand (felitronics::analysis::ProgrammeReport::storageFor (
                        sampleRate, (int) fcore::Probe::kChunk, (int) channels, kReportParams));
+}
+
+//==================================================================================================
+// K1 — BandCrest: the crest of a programme per 400 ms block and per band, and the PAIRED loss between a source
+// and its master.
+//
+// TWO SLOTS, NOT ONE, and that is the whole reason this surface looks different from its neighbours. Every
+// other analyzer here holds one static result because every other question is about one programme. This one
+// is about the DIFFERENCE between two, and the loss is arithmetic that must not be reimplemented on the other
+// side of the ABI: formed from linear cells it is one logarithm and invariant to the gain a master has over
+// its source, and formed from two dB numbers in JavaScript it would be neither. So both runs live here and
+// `fc_probe_crest_loss` does the comparing.
+//
+// SLOT 0 IS THE SOURCE AND SLOT 1 IS THE MASTER, and the order is load-bearing rather than a convention: the
+// activity mask comes from the SOURCE alone, because a mask taken from the output can drop exactly the blocks
+// the chain damaged most.
+namespace
+{
+    felitronics::analysis::BandCrest& crest (int slot)
+    {
+        static felitronics::analysis::BandCrest a, b;
+        return slot == 0 ? a : b;
+    }
+    bool haveCrest[2] { false, false };
+    felitronics::analysis::BandCrestParams installedCrest[2] {};
+
+    constexpr std::uint32_t kCrestScalars     = 21;   // 16 + one active-block count per band
+    constexpr std::uint32_t kCrestBlockStride = 15;   // 5 bands x { peak, meanSq, active }
+    constexpr std::uint32_t kCrestLossFields  = 15;
+
+    int runCrest (int slot, const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate,
+                  const felitronics::analysis::BandCrestParams& p)
+    {
+        if (slot < 0 || slot > 1) return 0;
+        haveCrest[slot] = false;
+        if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
+        auto& d = crest (slot);
+        d.setParams (p);
+        if (! d.prepare (sampleRate, (int) channels, (long long) frames)) return 0;
+        installedCrest[slot] = p;
+        const float* view[felitronics::core::kMaxChannels] {};
+        if (frames != 0)
+            for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+        if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
+        d.finish();
+        haveCrest[slot] = true;
+        return 1;
+    }
+}
+
+FC_EXPORT int fc_probe_crest_run (std::int32_t slot, const float* planar, std::uint32_t frames,
+                                  std::uint32_t channels, double sampleRate)
+{
+    return runCrest ((int) slot, planar, frames, channels, sampleRate, felitronics::analysis::BandCrestParams {});
+}
+
+FC_EXPORT int fc_probe_crest_run_with (std::int32_t slot, const float* planar, std::uint32_t frames,
+                                       std::uint32_t channels, double sampleRate,
+                                       double edge0Hz, double edge1Hz, double edge2Hz,
+                                       double hopMs, std::int32_t blockHops,
+                                       double programmeFloorDb, double bandShareFloorDb)
+{
+    felitronics::analysis::BandCrestParams p;
+    p.bandEdgeHz[0] = edge0Hz; p.bandEdgeHz[1] = edge1Hz; p.bandEdgeHz[2] = edge2Hz;
+    p.hopMs = hopMs; p.blockHops = (int) blockHops;
+    p.programmeFloorDb = programmeFloorDb; p.bandShareFloorDb = bandShareFloorDb;
+    return runCrest ((int) slot, planar, frames, channels, sampleRate, p);
+}
+
+FC_EXPORT std::uint32_t fc_probe_crest_scalars_len  (void) { return kCrestScalars; }
+FC_EXPORT std::uint32_t fc_probe_crest_block_stride (void) { return kCrestBlockStride; }
+FC_EXPORT std::uint32_t fc_probe_crest_loss_len     (void) { return kCrestLossFields; }
+
+// The scalars, IN THE ORDER THE CLI PRINTS THEM. The order is the contract.
+FC_EXPORT std::uint32_t fc_probe_crest_scalars (std::int32_t slot, double* out, std::uint32_t cap)
+{
+    if (slot < 0 || slot > 1 || ! haveCrest[slot]) return 0u;
+    if (out == nullptr || cap < kCrestScalars || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = crest ((int) slot);
+    const auto& p = installedCrest[slot];
+    std::uint32_t i = 0;
+    out[i++] = d.sampleRate();
+    out[i++] = (double) d.channels();
+    out[i++] = (double) d.hopSamples();
+    out[i++] = (double) d.blockHops();
+    out[i++] = p.bandEdgeHz[0];
+    out[i++] = p.bandEdgeHz[1];
+    out[i++] = p.bandEdgeHz[2];
+    out[i++] = p.programmeFloorDb;
+    out[i++] = p.bandShareFloorDb;
+    out[i++] = (double) d.samplesProcessed();
+    out[i++] = (double) d.hopCount();
+    // THE BASE-RATE CLOCK'S OWN COUNT, published rather than derived: it must equal the one above, and the two
+    // are counted by different code over the same time. They disagreed once, by a whole hop.
+    out[i++] = (double) d.basePeakHops();
+    out[i++] = (double) d.blockCount();
+    out[i++] = (double) d.nonFiniteSamples();
+    out[i++] = (double) (int) d.invalidReason();
+    out[i++] = d.fullBandPeakLin();     // the number the certifying true-peak meter also answers
+    // THE POPULATION, per band, published rather than left to be counted from the block table. A consumer
+    // deciding on a statistic needs to know how many blocks it rests on without walking the rows, and a count
+    // it derives itself is a second definition of "active" waiting to drift from this one.
+    for (int b = 0; b < felitronics::analysis::BandCrest::kBands; ++b)
+        out[i++] = (double) d.activeBlocks (b);
+    return i;
+}
+
+// One row per block: for each of the five bands, the linear peak, the mean square and the ACTIVE flag. Linear,
+// not dB — the loss is a ratio of these and a dB store would put a logarithm in the middle of it.
+FC_EXPORT std::uint32_t fc_probe_crest_blocks (std::int32_t slot, double* out, std::uint32_t cap)
+{
+    if (slot < 0 || slot > 1 || ! haveCrest[slot]) return 0u;
+    if (out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = crest ((int) slot);
+    const auto rows = (std::uint64_t) d.blockCount();
+    if (rows * kCrestBlockStride > (std::uint64_t) cap) return 0u;        // all of it or none of it
+    std::uint32_t i = 0;
+    for (long long j = 0; j < d.blockCount(); ++j)
+        for (int b = 0; b < felitronics::analysis::BandCrest::kBands; ++b)
+        {
+            out[i++] = d.blockPeakLin (j, b);
+            out[i++] = d.blockMeanSq  (j, b);
+            out[i++] = d.blockActive  (j, b) ? 1.0 : 0.0;
+        }
+    return (std::uint32_t) rows;
+}
+
+// THE COMPARISON, for one band: slot 0 as the source, slot 1 as the master. The mask is the source's.
+FC_EXPORT std::uint32_t fc_probe_crest_loss (std::int32_t band, double* out, std::uint32_t cap)
+{
+    if (! haveCrest[0] || ! haveCrest[1]) return 0u;
+    if (band < 0 || band >= felitronics::analysis::BandCrest::kBands) return 0u;
+    if (out == nullptr || cap < kCrestLossFields || ! outSpan (out, cap, 8)) return 0u;
+    static std::vector<double> scratch;
+    const auto L = felitronics::analysis::bandCrestLoss (crest (0), crest (1), (int) band, scratch);
+    std::uint32_t i = 0;
+    out[i++] = (double) L.blocks;
+    out[i++] = (double) L.inActive;
+    out[i++] = (double) L.usable;
+    out[i++] = L.p50Db;
+    out[i++] = L.p95Db;
+    out[i++] = L.cvar95Db;
+    out[i++] = L.meanDb;
+    out[i++] = L.maxDb;
+    out[i++] = L.p5Db;
+    out[i++] = (double) L.over1Db;
+    out[i++] = (double) L.over3Db;
+    out[i++] = (double) L.over6Db;
+    out[i++] = L.peakShiftDb;
+    out[i++] = L.levelShiftDb;
+    out[i++] = L.valid ? 1.0 : 0.0;
+    return i;
+}
+
+FC_EXPORT double fc_probe_crest_storage_bytes (std::uint32_t channels, double sampleRate, std::uint32_t frames)
+{
+    if (! geometry (channels)) return 0.0;
+    const auto st = felitronics::analysis::BandCrest::storageFor (sampleRate, (int) channels, (long long) frames,
+                                                                  felitronics::analysis::BandCrestParams {});
+    return st.ok ? (double) st.bytes() : 0.0;
+}
+
+FC_EXPORT double fc_probe_crest_storage_bytes_with (std::uint32_t channels, double sampleRate, std::uint32_t frames,
+                                                    double edge0Hz, double edge1Hz, double edge2Hz,
+                                                    double hopMs, std::int32_t blockHops,
+                                                    double programmeFloorDb, double bandShareFloorDb)
+{
+    if (! geometry (channels)) return 0.0;
+    felitronics::analysis::BandCrestParams p;
+    p.bandEdgeHz[0] = edge0Hz; p.bandEdgeHz[1] = edge1Hz; p.bandEdgeHz[2] = edge2Hz;
+    p.hopMs = hopMs; p.blockHops = (int) blockHops;
+    p.programmeFloorDb = programmeFloorDb; p.bandShareFloorDb = bandShareFloorDb;
+    const auto st = felitronics::analysis::BandCrest::storageFor (sampleRate, (int) channels, (long long) frames, p);
+    return st.ok ? (double) st.bytes() : 0.0;
 }
 
 FC_EXPORT double fc_probe_bursts_storage_bytes (std::uint32_t channels, double sampleRate)
