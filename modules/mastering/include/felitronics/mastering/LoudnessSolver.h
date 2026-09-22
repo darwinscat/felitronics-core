@@ -709,6 +709,15 @@ struct LoudnessRequest
     // NOT clamped and not refused: -inf accepts every window carrying any non-zero input, +inf accepts none,
     // and a NaN accepts NOTHING — the narrowest reading, so a mistake announces itself through
     // `activeWindows == 0`, `valid == false` and the NaN echoed back, instead of passing for a measurement.
+    //
+    // IT IS AN ABSOLUTE GATE AND IT IS NOT LEVEL-INVARIANT, which is worth saying because it can LOOK
+    // invariant. A consumer measured 1509 / 1510 / 1513 active windows of 2500 while moving its input by
+    // -12 / 0 / +12 dB and read that as invariance; it is not, it is a gate sitting far below the material,
+    // where only the fades cross it. Measured here at a gate of -20 dBFS on the same 24 dB of input: 31,
+    // 2479, 2494 — the population moves by a factor of eighty. That matters because a caller budgeting
+    // transparency is told, a few lines up, to put the gate NEAR the ceiling, which is exactly where the
+    // dependence bites. A population that must not move with level has to be derived from the programme's own
+    // level, not fixed in dBFS.
     double limiterActiveInputDb = -60.0;
 };
 
