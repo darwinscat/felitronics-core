@@ -136,6 +136,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_band_bursts_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_band_bursts_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_band_bursts_tests COMMAND felitronics_band_bursts_tests)
+    # BandCrest (K1) — the peak-to-RMS of a programme per 400 ms block and per band, and the PAIRED loss
+    # between a source and its master. Links analysis_offline for eq::Crossover2 and the oversampler.
+    add_executable(felitronics_band_crest_tests tests/BandCrestTests.cpp)
+    target_link_libraries(felitronics_band_crest_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_band_crest_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_band_crest_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_band_crest_tests COMMAND felitronics_band_crest_tests)
     add_executable(felitronics_source_forensics_tests tests/SourceForensicsTests.cpp)   # the spectral wall + the sample grid: the traps, two oracles, law 8a
     target_link_libraries(felitronics_source_forensics_tests PRIVATE felitronics::analysis_offline)
     target_include_directories(felitronics_source_forensics_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

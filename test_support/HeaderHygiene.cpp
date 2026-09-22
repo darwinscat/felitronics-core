@@ -29,6 +29,9 @@
 #if __has_include(<felitronics/analysis/BandBursts.h>)
  #include <felitronics/analysis/BandBursts.h>
 #endif
+#if __has_include(<felitronics/analysis/BandCrest.h>)
+ #include <felitronics/analysis/BandCrest.h>
+#endif
 #if __has_include(<felitronics/analysis/HumDetector.h>)
  #include <felitronics/analysis/HumDetector.h>
 #endif
