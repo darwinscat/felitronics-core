@@ -6,6 +6,7 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/analysis/ReferenceTruePeakMeter.h>
 #include <felitronics/core/Config.h>
+#include <felitronics/core/DetMath.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/dynamics/offline/Quantile.h>
 #include <felitronics/mastering/MasteringChain.h>
@@ -400,7 +401,14 @@ public:
           // the narrowest gate. That is the INTENDED reading, spelled here so it is a decision rather than a
           // side effect of two comparisons — a review found the header claiming the opposite, and it was the
           // header that was wrong.
-          gateLin_ (std::isfinite (inputGateDb) ? core::dbToGain (inputGateDb)
+          //
+          // `core::det::pow10`, NOT `core::dbToGain`, and the difference is a whole tier. `dbToGain` is
+          // `std::pow`, whose result differs between libms on 41 % of dB thresholds (DetMath.h's own measured
+          // table) — so the same request would turn into two different linear gates on two rows, and a window
+          // sitting on the boundary would be accepted on one and dropped on the other. The wasm tier's libm
+          // audit caught this: a transcendental on a path whose outputs CI diffs has to be the deterministic
+          // one, which is also what every other dB threshold in this tree is built from (BandBursts.h:469).
+          gateLin_ (std::isfinite (inputGateDb) ? core::det::pow10 (inputGateDb / 20.0)
                                                 : (inputGateDb < 0.0 ? 0.0 : std::numeric_limits<double>::infinity()))
     {
         h_.reset();
