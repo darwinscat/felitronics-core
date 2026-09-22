@@ -191,9 +191,14 @@ public:
         std::uint64_t bytes() const noexcept
         {
             return (std::uint64_t) cellEntries  * sizeof (double)
-                 + (std::uint64_t) countEntries * (sizeof (std::uint64_t) + sizeof (double))
+                 + (std::uint64_t) countEntries * (sizeof (std::uint64_t) + 2u * sizeof (double))
                  + (std::uint64_t) scratchOs   * sizeof (float)
-                 + (std::uint64_t) channels    * (std::uint64_t) oneOversamplerBytes();
+                 // THE INTERPOLATORS THEMSELVES, not only their buffers: `os_.resize(maxChannels)` asks the
+                 // heap for `maxChannels * sizeof(PolyphaseOversampler)` and that was missing from the demand,
+                 // which under-reported by 168 B a channel at EVERY length. A budget is a promise about what
+                 // the call asks for, so the container it asks for counts.
+                 + (std::uint64_t) channels    * ((std::uint64_t) oneOversamplerBytes()
+                                                  + sizeof (oversampling::PolyphaseOversampler));
         }
 
         static std::uint64_t oneOversamplerBytes() noexcept
@@ -207,14 +212,29 @@ public:
     // `maxSamples` is the programme this preparation can hold cells for. Blocks past it are COUNTED and not
     // kept (`droppedHops()`), the rule `LoudnessMeter` already follows — an instrument that silently measured
     // the first part of a programme and reported it as the whole is the failure this counts instead.
+    // The rate ceiling every sibling analyzer carries (BandBursts, ClipDetector, HumDetector, LowEnd,
+    // ProgrammeReport, SourceForensics). This one was written without it, and the consequence was not merely a
+    // silly number being accepted: `llround` SATURATES on arm64 and WRAPS on x86-64 glibc, so `fs = 1e308` was
+    // refused on one row and accepted on another with a 10-sample hop — a refusal set that differs between
+    // platforms, which is half a parity contract gone. Measured on both rows before this was written.
+    static constexpr double kMaxSampleRate = 768000.0;
+    static constexpr double kMaxHopMs      = 10000.0;    // ten seconds of hop is already absurd; the point is
+                                                         // that the bound exists BEFORE `llround` sees it
+
     static Storage storageFor (double sampleRate, int maxChannels, long long maxSamples,
                                const BandCrestParams& p) noexcept
     {
         Storage st;
-        if (! (sampleRate >= core::kMinSampleRate) || ! std::isfinite (sampleRate)) return st;
+        if (! (sampleRate >= core::kMinSampleRate) || ! (sampleRate <= kMaxSampleRate)) return st;   // NaN fails both
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return st;
         if (maxSamples < 0) return st;
-        if (! (p.hopMs > 0.0) || ! std::isfinite (p.hopMs)) return st;
+        // BOUNDED BEFORE THE CONVERSION, not after: `llround(1e299/10)` is undefined, and what it does in
+        // practice differs by row. A comparison, not a conversion, is what makes this portable.
+        // AND THE FLOOR IS THE QUANTUM, not 1 ms. A hop is built from 10 ms sub-hops, so `hopMs` is rounded to
+        // a multiple of 10 and anything under 10 becomes 10 — which means a caller passing 1 would read its own
+        // 1 back out of `params()` while the measurement ran at 10. The parameter refuses rather than echoes a
+        // number that describes nothing.
+        if (! (p.hopMs >= 10.0) || ! (p.hopMs <= kMaxHopMs)) return st;
         if (p.blockHops < 1 || p.blockHops > 64) return st;
         if (! cornersAdmitted (sampleRate, p)) return st;
 
@@ -272,7 +292,13 @@ public:
     {
         // LAW 11(b): DISARM FIRST, validate, then write. A refused prepare() leaves the object unusable rather
         // than leaving the previous preparation standing and answering process() calls.
+        // LAW 11(b), AND ITS OTHER HALF. Disarming `prepared_` stops `process()` and stopped nothing else: a
+        // refused prepare() left the PREVIOUS run's blocks, crests and validity readable, and `bandCrestLoss`
+        // would happily compare them. The header claimed the object was unusable; only one of its doors was
+        // shut. A done-flag is not a validity flag — every reader is keyed on this now.
         prepared_ = false;
+        hops_ = 0; dropped_ = 0; samples_ = 0; baseHops_ = 0; finished_ = false;
+        nonFinite_ = 0; firstNonFiniteAt_ = -1; narrowed_ = 0; widest_ = 0; ranNc_ = 0;
         const Storage st = storageFor (sampleRate, maxChannels, maxSamples, pending_);
         if (! st.ok) return false;
 
@@ -285,6 +311,7 @@ public:
         cells_.assign (st.cellEntries, 0.0);
         counts_.assign (st.countEntries, 0u);
         basePeak_.assign (st.countEntries, 0.0);
+        baseMs_.assign   (st.countEntries, 0.0);
         scratch_.assign (st.scratchOs, 0.0f);
         os_.resize ((std::size_t) maxChannels);
         for (auto& o : os_) if (! o.prepare (kFactor, 1, kTapsPerPhase)) return false;
@@ -328,13 +355,14 @@ public:
         std::fill (cells_.begin(), cells_.end(), 0.0);
         std::fill (counts_.begin(), counts_.end(), 0u);
         std::fill (basePeak_.begin(), basePeak_.end(), 0.0);
+        std::fill (baseMs_.begin(), baseMs_.end(), 0.0);
         for (SvfType* f : filters()) f->reset();
         for (auto& o : os_) o.reset();
         grid_.reset();
         hops_ = 0; dropped_ = 0; samples_ = 0; nonFinite_ = 0; firstNonFiniteAt_ = -1;
         osSkipped_ = 0; osInHop_ = 0; osMeasured_ = 0; ranNc_ = 0; finished_ = false; curCount_ = 0;
         narrowed_ = 0; widest_ = 0;
-        baseHops_ = 0; baseInHop_ = 0; baseCur_ = 0.0;
+        baseHops_ = 0; baseInHop_ = 0; baseCur_ = 0.0; baseSum_ = 0.0; baseCount_ = 0;
         for (int b = 0; b < kBands; ++b) { curPeak_[b] = 0.0; curSum_[b] = 0.0; }
     }
 
@@ -377,12 +405,21 @@ public:
                     if (std::isfinite (a) && a > g) g = a;
                 }
                 if ((double) g > baseCur_) baseCur_ = (double) g;
+                for (int c = 0; c < numChannels; ++c)
+                {
+                    const double x = (double) in[c][off + i];
+                    if (std::isfinite (x)) { baseSum_ += x * x; ++baseCount_; }
+                }
                 if (++baseInHop_ >= hopSamples_)
                 {
                     baseInHop_ = 0;
-                    if ((std::size_t) baseHops_ < hopCap_) basePeak_[(std::size_t) baseHops_] = baseCur_;
+                    if ((std::size_t) baseHops_ < hopCap_)
+                    {
+                        basePeak_[(std::size_t) baseHops_] = baseCur_;
+                        baseMs_[(std::size_t) baseHops_]   = baseCount_ > 0 ? baseSum_ / (double) baseCount_ : 0.0;
+                    }
                     ++baseHops_;
-                    baseCur_ = 0.0;
+                    baseCur_ = 0.0; baseSum_ = 0.0; baseCount_ = 0;
                 }
             }
             walkOs (m * kFactor, numChannels);
@@ -421,9 +458,13 @@ public:
         // The base clock's partial hop, closed like the oversampled one.
         if (baseInHop_ > 0)
         {
-            if ((std::size_t) baseHops_ < hopCap_) basePeak_[(std::size_t) baseHops_] = baseCur_;
+            if ((std::size_t) baseHops_ < hopCap_)
+            {
+                basePeak_[(std::size_t) baseHops_] = baseCur_;
+                baseMs_[(std::size_t) baseHops_]   = baseCount_ > 0 ? baseSum_ / (double) baseCount_ : 0.0;
+            }
             ++baseHops_;
-            baseInHop_ = 0; baseCur_ = 0.0;
+            baseInHop_ = 0; baseCur_ = 0.0; baseSum_ = 0.0; baseCount_ = 0;
         }
         finished_ = true;
     }
@@ -454,6 +495,7 @@ public:
 
     long long blockCount() const noexcept
     {
+        if (! prepared_) return 0;                     // a refused preparation answers nothing, not the last run
         const long long b = hops_ - (long long) p_.blockHops + 1;
         return b > 0 ? b : 0;
     }
@@ -475,9 +517,26 @@ public:
         return pk;
     }
 
+    // THE FULL BAND'S MEAN SQUARE IS THE BASE-RATE ONE, and that is a correction rather than a choice. Its
+    // PEAK is the reconstruction (max of the sample peak and the 4x one, the certifying meter's own quantity),
+    // but its mean square used to come from the oversampled stream — and the 32-tap interpolator droops above
+    // about 0.375*fs. The two together made a HYBRID: a pure 0.45*fs tone read a crest of 9.03 dB where the
+    // truth is 3.0103, and 23.8 dB at 0.49*fs. Measured, not derived. The per-band crests were never affected
+    // — their peak and their mean square come from the same stream — so only this one number was wrong, and it
+    // fed the absolute gate and `programmeMeanSquareDb` with it.
+    //
+    // The SHARE gate still divides by the oversampled full-band power (`osMeanSq`), because a band's power is
+    // an oversampled quantity and a ratio across two domains is not a share of anything.
     double blockMeanSq (long long block, int band) const noexcept
     {
         if (! inRange (block, band)) return 0.0;
+        if (band == kFull)
+        {
+            double s = 0.0; long long have = 0;
+            for (int k = 0; k < p_.blockHops; ++k)
+                if (block + k < baseHops_) { s += baseMs_[(std::size_t) (block + k)]; ++have; }
+            return have > 0 ? s / (double) have : 0.0;
+        }
         // THE DENOMINATOR IS COUNTED, NOT COMPUTED. The last hop is partial — the drain closes it over its own
         // length — so a denominator derived from the hop length would understate exactly one block's mean
         // square, and it would be the block at the end of the programme, where a master's loudest material
@@ -502,10 +561,10 @@ public:
     bool blockActive (long long block, int band) const noexcept
     {
         if (! inRange (block, band)) return false;
-        const double full = blockMeanSq (block, kFull);
-        if (! (full >= floorMs_)) return false;
+        if (! (blockMeanSq (block, kFull) >= floorMs_)) return false;      // the ABSOLUTE gate, base-rate
         if (band == kFull) return true;
-        return blockMeanSq (block, band) >= shareRatio_ * full;
+        const double os = osMeanSq (block);                                 // the SHARE gate, one domain
+        return os > 0.0 && blockMeanSq (block, band) >= shareRatio_ * os;
     }
 
     long long activeBlocks (int band) const noexcept
@@ -574,6 +633,15 @@ private:
     double cellSum (long long hop, int band) const noexcept
     {
         return cells_[(std::size_t) ((hop * kBands + band) * 2 + 1)];
+    }
+
+    // The full band's OVERSAMPLED mean square — the share gate's denominator, in the bands' own domain.
+    double osMeanSq (long long block) const noexcept
+    {
+        double s = 0.0; std::uint64_t n = 0;
+        for (int k = 0; k < p_.blockHops; ++k)
+        { s += cellSum (block + k, kFull); n += counts_[(std::size_t) (block + k)]; }
+        return n > 0u ? s / (double) n : 0.0;
     }
 
     // One channel's plane inside the shared oversampled scratch.
@@ -675,11 +743,12 @@ private:
     std::uint64_t curCount_ = 0;      // the samples accumulated into the hop being built, all channels
     long long     baseHops_ = 0, baseInHop_ = 0, narrowed_ = 0;
     int           widest_ = 0;
-    double        baseCur_ = 0.0;
+    double        baseCur_ = 0.0, baseSum_ = 0.0;
+    long long     baseCount_ = 0;
     double    curPeak_[kBands] {}, curSum_[kBands] {};
     double    floorMs_ = 0.0, shareRatio_ = 0.0;
 
-    std::vector<double>        cells_, basePeak_;
+    std::vector<double>        cells_, basePeak_, baseMs_;
     std::vector<std::uint64_t> counts_;
     std::vector<float>  scratch_;
     std::vector<oversampling::PolyphaseOversampler> os_;
@@ -775,8 +844,13 @@ inline BandCrestLoss bandCrestLoss (const BandCrest& in, const BandCrest& out, i
     // THE COARSE ALIGNMENT CHECK — where the two full-band peak series agree best, in blocks. See the note on
     // `lagBlocks`: this catches a gross mistake and cannot catch a small one.
     {
+        // NO EVIDENCE IS NOT A LAG. `best` began at -1 and every correlation of a silent side is 0, so the
+        // FIRST lag tried won and a muted master read "misaligned by 8 blocks". The correlation at lag 0 is
+        // the reference now: another lag has to BEAT it, so a flat or empty series answers 0.
         const long long span = std::min<long long> (8, n - 1);
-        double best = -1.0; long long bestLag = 0;
+        double best = 0.0; long long bestLag = 0;
+        for (long long j = 0; j < n; ++j)
+            best += in.blockPeakLin (j, BandCrest::kFull) * out.blockPeakLin (j, BandCrest::kFull);
         for (long long lag = -span; lag <= span; ++lag)
         {
             double acc = 0.0;

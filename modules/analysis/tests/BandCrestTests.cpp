@@ -372,6 +372,131 @@ void theBandsAreTheFiltersTheHeaderNames()
 }
 
 //==================================================================================================
+// FIVE THINGS A FALSIFICATION ROUND FOUND, each with the measurement that found it.
+void theFalsificationRoundsFindings()
+{
+    const double fs = 48000.0;
+    std::vector<double> scratch;
+
+    // 1. THE FULL BAND'S CREST WAS A HYBRID. Its peak is the reconstruction and its mean square used to come
+    //    from the oversampled stream, which the 32-tap interpolator droops above ~0.375*fs. A PURE SINE has a
+    //    crest of exactly 20*log10(sqrt(2)) = 3.0103 dB — an oracle that owes nothing to this code — and the
+    //    hybrid read 9.03 dB at 0.45*fs and 23.8 dB at 0.49*fs.
+    felitronics::test::group ("the full band's crest is peak over the programme's own RMS, at every frequency");
+    {
+        const double truth = 20.0 * std::log10 (std::sqrt (2.0));
+        double worst = 0.0; double worstAt = 0.0;
+        for (const double frac : { 0.05, 0.25, 0.375, 0.41, 0.45, 0.49 })
+        {
+            const auto n = (std::size_t) (fs * 3.0);
+            std::vector<std::vector<float>> ch (2, std::vector<float> (n, 0.0f));
+            for (int c = 0; c < 2; ++c)
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const double t = (double) i / fs;
+                    const double w = std::min (1.0, std::min (t / 0.25, (3.0 - t) / 0.25));
+                    ch[(std::size_t) c][i] = (float) (0.5 * w * std::sin (2.0 * kPi * frac * fs * t));
+                }
+            BandCrest bc;
+            if (! felitronics::test::run (runIt (bc, ch, fs))) continue;
+            const double got = bc.blockCrestDb (bc.blockCount() / 2, BandCrest::kFull);
+            if (std::fabs (got - truth) > worst) { worst = std::fabs (got - truth); worstAt = frac; }
+        }
+        ok (worst < 0.01, "a pure sine reads " + std::to_string (truth) + " dB from 0.05 to 0.49 of Nyquist "
+                          "(worst error " + std::to_string (worst) + " dB, at " + std::to_string (worstAt) + " fs)");
+    }
+
+    // 2. THE RATE AND HOP CEILINGS. Without them `llround` decided the answer, and it SATURATES on arm64 and
+    //    WRAPS on x86-64 glibc: fs = 1e308 was refused on one row and accepted with a 10-sample hop on the
+    //    other. A refusal set that differs by platform is half a parity contract gone, so the bound is a
+    //    comparison made BEFORE any conversion.
+    felitronics::test::group ("the admission set is decided by comparisons, not by llround's platform");
+    {
+        const felitronics::analysis::BandCrestParams d {};
+        const double inf = std::numeric_limits<double>::infinity();
+        int bad = 0;
+        for (const double r : { 7999.0, 768001.0, 1.0e6, 1.0e100, 1.0e308, inf, -inf })
+            if (BandCrest::storageFor (r, 2, 48000, d).ok) ++bad;
+        ok (bad == 0, "every rate outside [8000, 768000] is refused, both infinities included");
+        ok (BandCrest::storageFor (8000.0, 2, 48000, d).ok && BandCrest::storageFor (768000.0, 2, 48000, d).ok,
+            "and both ends of the range are admitted");
+        int badHop = 0;
+        for (const double h : { 0.0, 1.0, 9.99, 10001.0, 1.0e20, 1.0e299, inf })
+        {
+            felitronics::analysis::BandCrestParams p; p.hopMs = h;
+            if (BandCrest::storageFor (48000.0, 2, 48000, p).ok) ++badHop;
+        }
+        ok (badHop == 0, "and a hop under the 10 ms quantum or past the ceiling is refused rather than "
+                         "silently rounded to something else");
+    }
+
+    // 3. A REFUSED prepare() ANSWERS NOTHING. It used to leave the previous run's blocks, crests and validity
+    //    readable, and the comparator would compare them — a done-flag standing in for a validity flag.
+    felitronics::test::group ("a refused preparation leaves no readable measurement behind");
+    {
+        auto buf = programme (fs, 2, 4.0);
+        BandCrest bc;
+        if (felitronics::test::run (runIt (bc, buf, fs)))
+        {
+            const long long had = bc.blockCount();
+            felitronics::analysis::BandCrestParams bad; bad.bandEdgeHz[0] = -1.0;
+            bc.setParams (bad);
+            const bool refused = ! bc.prepare (fs, 2, (long long) buf[0].size());
+            ok (had > 0 && refused && bc.blockCount() == 0 && ! bc.isPrepared() && ! bc.valid(),
+                "after a refused prepare the object answers 0 blocks and not valid, where it had "
+                + std::to_string (had));
+            BandCrest fresh;
+            if (felitronics::test::run (runIt (fresh, buf, fs)))
+                ok (bandCrestLoss (fresh, bc, BandCrest::kFull, scratch).usable == 0,
+                    "... and the comparator will not compare against it");
+        }
+    }
+
+    // 4. NO EVIDENCE IS NOT A LAG. Every correlation against a silent side is 0, and with `best` starting
+    //    below zero the FIRST lag tried won: a muted master read "misaligned by 8 blocks".
+    felitronics::test::group ("a lag is reported only when something supports it");
+    {
+        auto src = programme (fs, 2, 6.0, 4.0);
+        std::vector<std::vector<float>> silence (2, std::vector<float> (src[0].size(), 0.0f));
+        BandCrest a, b;
+        if (felitronics::test::run (runIt (a, src, fs)) && felitronics::test::run (runIt (b, silence, fs)))
+        {
+            const auto r = bandCrestLoss (a, b, BandCrest::kFull, scratch);
+            ok (r.lagBlocks == 0, "a silent master reports lag 0, not the first lag the loop tried ("
+                                  + std::to_string (r.lagBlocks) + ")");
+        }
+    }
+
+    // 5. THE BUDGET IS COMPARED, NOT ASSERTED POSITIVE. `storageFor().bytes() > 0` is a tautology: it passed
+    //    while the demand omitted the interpolators themselves and under-reported by 168 B a channel at every
+    //    length. This measures what prepare() asks the heap for.
+    felitronics::test::group ("storageFor is the demand, measured against what prepare asks for");
+    {
+        int bad = 0;
+        std::string worst;
+        for (const int nch : { 1, 2, 16 })
+            for (const long long frames : { 0LL, 1LL, 48000LL, 2880000LL })
+            {
+                const felitronics::analysis::BandCrestParams d {};
+                const auto st = BandCrest::storageFor (fs, nch, frames, d);
+                if (! st.ok) { ++bad; continue; }
+                BandCrest bc;
+                const long long before = alloc::bytes.load();
+                const bool okp = bc.prepare (fs, nch, frames);
+                const long long got = alloc::bytes.load() - before;
+                if (! okp || got > (long long) st.bytes())
+                {
+                    ++bad;
+                    worst = std::to_string (nch) + " ch x " + std::to_string (frames) + " frames: asked "
+                          + std::to_string (got) + " B against a published " + std::to_string (st.bytes());
+                }
+            }
+        ok (bad == 0, "twelve geometries ask the heap for no more than the published demand"
+                      + (worst.empty() ? std::string() : std::string (" — ") + worst));
+    }
+}
+
+//==================================================================================================
 // THE PROGRAMME LEVEL IS IN THE GATE'S OWN UNITS — the point of publishing it at all.
 //
 // A caller wanting a floor "40-odd dB below the programme" reaches for integrated loudness, and `I - 42` is
@@ -612,6 +737,7 @@ int main()
     cvarSeesWhatP95CannotAndNeverLess();
     theBandsAreTheFiltersTheHeaderNames();
     theProgrammeLevelIsInTheGatesUnits();
+    theFalsificationRoundsFindings();
     theComparatorRefusesWhatItCannotCompare();
     theSameProgrammeInAnySlicing();
     processAsksTheHeapForNothing();
