@@ -710,14 +710,30 @@ struct LoudnessRequest
     // and a NaN accepts NOTHING — the narrowest reading, so a mistake announces itself through
     // `activeWindows == 0`, `valid == false` and the NaN echoed back, instead of passing for a measurement.
     //
-    // IT IS AN ABSOLUTE GATE AND IT IS NOT LEVEL-INVARIANT, which is worth saying because it can LOOK
-    // invariant. A consumer measured 1509 / 1510 / 1513 active windows of 2500 while moving its input by
-    // -12 / 0 / +12 dB and read that as invariance; it is not, it is a gate sitting far below the material,
-    // where only the fades cross it. Measured here at a gate of -20 dBFS on the same 24 dB of input: 31,
-    // 2479, 2494 — the population moves by a factor of eighty. That matters because a caller budgeting
-    // transparency is told, a few lines up, to put the gate NEAR the ceiling, which is exactly where the
-    // dependence bites. A population that must not move with level has to be derived from the programme's own
-    // level, not fixed in dBFS.
+    // IT IS AN ABSOLUTE GATE AND IT IS NOT LEVEL-INVARIANT — and it can LOOK invariant for TWO different
+    // reasons, which is why this is spelled out rather than left to be inferred.
+    //
+    // IT CAN LOOK INVARIANT, AND THE REASON IS THE MARGIN — nothing else. A gate far below the material
+    // passes nearly every window at any level, so only the fades cross it. A consumer measured
+    // 1509 / 1510 / 1513 active windows of 2500 across -12 / 0 / +12 dB of source at a -60 dBFS gate and read
+    // that as invariance.
+    //
+    // Both sides then measured it properly, and the gate's own behaviour is plain. Here, drive pinned, same
+    // 24 dB: at -60 dBFS 2500 / 2500 / 2500, at -20 dBFS 31 / 2479 / 2494 — a factor of eighty. On the
+    // consumer's bare limiter over 2000 windows: gate -60 gives 1001 / 1001 / 1002; -20 gives 493 / 1000 /
+    // 1000; -10 gives 0 / 595 / 1000; 0 gives 0 / 0 / 687.
+    //
+    // NB an earlier version of this note carried a second explanation — that a solve's gain normalises the
+    // limiter's input, so the gate sits still by a property of the PATH. It was offered in good faith, it was
+    // plausible, and it was wrong: the consumer's own renders use a fixed gain, and the counts do not move
+    // when the gate is shifted under an unchanged chain. It is recorded here because it was believed long
+    // enough to be written down, and because the margin alone explains every number above.
+    //
+    // Which matters because a caller budgeting transparency is told, a few lines up, to put the gate NEAR the
+    // ceiling: exactly where the margin is gone and the dependence bites. A population that must not move with
+    // level has to be derived from the programme's own level. If that is ever wanted here, the reference is
+    // the MEAN SQUARE of the limiter's input, the construction `BandCrest::programmeMeanSquareDb` uses — not
+    // `limiterMaxReconstructedPeakDb`, which is one sample and cannot say where a population sits.
     double limiterActiveInputDb = -60.0;
 };
 

@@ -298,7 +298,7 @@ public:
         // shut. A done-flag is not a validity flag — every reader is keyed on this now.
         prepared_ = false;
         hops_ = 0; dropped_ = 0; samples_ = 0; baseHops_ = 0; finished_ = false;
-        nonFinite_ = 0; firstNonFiniteAt_ = -1; narrowed_ = 0; widest_ = 0; ranNc_ = 0;
+        nonFinite_ = 0; overflowed_ = 0; firstNonFiniteAt_ = -1; narrowed_ = 0; widest_ = 0; ranNc_ = 0;
         const Storage st = storageFor (sampleRate, maxChannels, maxSamples, pending_);
         if (! st.ok) return false;
 
@@ -359,7 +359,7 @@ public:
         for (SvfType* f : filters()) f->reset();
         for (auto& o : os_) o.reset();
         grid_.reset();
-        hops_ = 0; dropped_ = 0; samples_ = 0; nonFinite_ = 0; firstNonFiniteAt_ = -1;
+        hops_ = 0; dropped_ = 0; samples_ = 0; nonFinite_ = 0; overflowed_ = 0; firstNonFiniteAt_ = -1;
         osSkipped_ = 0; osInHop_ = 0; osMeasured_ = 0; ranNc_ = 0; finished_ = false; curCount_ = 0;
         narrowed_ = 0; widest_ = 0;
         baseHops_ = 0; baseInHop_ = 0; baseCur_ = 0.0; baseSum_ = 0.0; baseCount_ = 0;
@@ -376,6 +376,18 @@ public:
         for (int c = 0; c < numChannels; ++c) if (in[c] == nullptr) return false;
         if (numChannels > widest_) widest_ = numChannels;
         if (numChannels < widest_) narrowed_ += n;
+        // A CHANNEL THAT STOPPED IS CLEARED, ONCE, ON THE EDGE. Its interpolator holds `tapsPerPhase` samples
+        // and its filters hold their state; leaving them there splices a 32-sample-old ring onto whatever
+        // arrives when the channel returns. Measured before this: one call at a narrower width moved a
+        // block's high-band peak from 0.000383 to 0.2023 — 40 dB of crest — of which about 0.8 dB was the
+        // stale ring alone and the rest the returning channel's onset. `LoudnessMeter` resets its dropped
+        // channels and `ReferenceTruePeakMeter` drains them; this is that rule kept rather than a third
+        // behaviour invented.
+        for (int c = numChannels; c < ranNc_; ++c)
+        {
+            os_[(std::size_t) c].resetChannel (0);       // one oversampler per channel: its only lane
+            for (SvfType* f : filters()) f->resetChannel (c);
+        }
         ranNc_ = numChannels;
 
         for (int off = 0; off < n; )
@@ -402,7 +414,19 @@ public:
                 for (int c = 0; c < numChannels; ++c)
                 {
                     const float a = std::fabs (in[c][off + i]);
-                    if (std::isfinite (a) && a > g) g = a;
+                    // COUNTED AND LOCATED HERE, ON THE INPUT. The count used to be taken on the
+                    // interpolator's OUTPUT, where one bad input sample becomes `factor * tapsPerPhase` bad
+                    // ones — 128 of them — so `nonFiniteSamples` meant something different here than it does
+                    // in `BandBursts` under the same ABI name, and the location was the CHUNK's start, which
+                    // made it depend on the call sizes (law 8a). Both are exact now: one bad input sample is
+                    // one, at its own index.
+                    if (! std::isfinite (a))
+                    {
+                        if (nonFinite_ != ~0LL) ++nonFinite_;
+                        if (firstNonFiniteAt_ < 0) firstNonFiniteAt_ = samples_ + i;
+                        continue;
+                    }
+                    if (a > g) g = a;
                 }
                 if ((double) g > baseCur_) baseCur_ = (double) g;
                 for (int c = 0; c < numChannels; ++c)
@@ -481,7 +505,12 @@ public:
     long long    basePeakHops() const noexcept { return baseHops_; }
     long long    droppedHops() const noexcept { return dropped_; }
     long long    samplesProcessed() const noexcept { return samples_; }
+    // INPUT samples that were not finite, and where the first one was — both exact, both independent of the
+    // call sizes. `BandBursts` means the same thing by the same name.
     long long    nonFiniteSamples() const noexcept { return nonFinite_; }
+    // Band outputs that overflowed float state from a FINITE input — a fact about the signal's size, not
+    // about the file. Separate so the two cannot be read as one.
+    long long    overflowedSamples() const noexcept { return overflowed_; }
 
     // A CHANNEL THAT VANISHES MID-PROGRAMME CHANGES THE MEASUREMENT, and silently unless it is counted. The
     // peak is a maximum over the channels PRESENT and the mean square is divided by the samples actually
@@ -502,7 +531,7 @@ public:
 
     BandCrestInvalid invalidReason() const noexcept
     {
-        if (nonFinite_ > 0) return BandCrestInvalid::NonFiniteInput;
+        if (nonFinite_ > 0 || overflowed_ > 0) return BandCrestInvalid::NonFiniteInput;
         if (blockCount() == 0) return BandCrestInvalid::NoBlock;
         return BandCrestInvalid::None;
     }
@@ -669,13 +698,11 @@ private:
                 const float x = planeFor (c)[i];
                 // NON-FINITE IS GATED, NOT FLUSHED: an infinity in a recursive filter is not healable, and a
                 // hop it poisoned is not a measurement. It is replaced by silence, counted, and located.
+                // The interpolator's output is silenced where it is not finite, but NOT counted here: the
+                // count and the location are the input's, taken on the base-rate pass above. One bad input
+                // sample smeared over the FIR is still one bad input sample.
                 float v = x;
-                if (! std::isfinite (v))
-                {
-                    v = 0.0f;
-                    if (nonFinite_ != ~0LL) ++nonFinite_;
-                    if (firstNonFiniteAt_ < 0) firstNonFiniteAt_ = samples_;
-                }
+                if (! std::isfinite (v)) v = 0.0f;
                 const float lo0 = lo0b_.processSample (c, lo0a_.processSample (c, v));     // LP4(f0) = `low`
                 const float hi0 = hi0b_.processSample (c, hi0a_.processSample (c, v));     // HP4(f0)
                 const float m1  = m1b_ .processSample (c, m1a_ .processSample (c, hi0));   // -> LP4(f1) = `lowMid`
@@ -690,7 +717,12 @@ private:
                     const float a = std::fabs (band[b]);
                     // A FILTER CAN OVERFLOW FROM A FINITE INPUT (`eq::Svf` narrows its state to float), so the
                     // OUTPUT is gated too — the rule `BandBursts` applies, and for the same reason.
-                    if (! std::isfinite (a)) { if (nonFinite_ != ~0LL) ++nonFinite_; continue; }
+                    // A FILTER CAN OVERFLOW FROM A FINITE INPUT, and that is a different fact from a
+                    // non-finite input: it says the SIGNAL was too large for float state, not that the file
+                    // was broken. Its own counter, so the pair cannot contradict — the old code added it to
+                    // the input count and left the location unset, so a run could report non-finite samples
+                    // and "none found" at once.
+                    if (! std::isfinite (a)) { if (overflowed_ != ~0LL) ++overflowed_; continue; }
                     if ((double) a > curPeak_[b]) curPeak_[b] = (double) a;
                     curSum_[b] += (double) a * (double) a;
                 }
@@ -737,7 +769,7 @@ private:
     double    fs_ = 0.0;
     int       hopSamples_ = 0, channels_ = 0, ranNc_ = 0;
     std::size_t hopCap_ = 0;
-    long long hops_ = 0, dropped_ = 0, samples_ = 0, nonFinite_ = 0, firstNonFiniteAt_ = -1;
+    long long hops_ = 0, dropped_ = 0, samples_ = 0, nonFinite_ = 0, overflowed_ = 0, firstNonFiniteAt_ = -1;
     int           osSkipped_ = 0;
     long long     osInHop_ = 0, osMeasured_ = 0;
     std::uint64_t curCount_ = 0;      // the samples accumulated into the hop being built, all channels
@@ -837,6 +869,12 @@ inline BandCrestLoss bandCrestLoss (const BandCrest& in, const BandCrest& out, i
         || in.channels() != out.channels()) return r;
     for (int k = 0; k < 3; ++k)
         if (! core::exactlyEqual (in.params().bandEdgeHz[k], out.params().bandEdgeHz[k])) return r;
+    // A MASTER WITH NO LEVEL AT ALL IS NOT A COMPARISON. Scale a source down by 2^-50 and its blocks are
+    // float subnormals: every cell is still strictly positive, so the per-block silence test below passes
+    // them, and the comparator answered 11.6 dB of CVaR95 with `valid` true against a master whose own
+    // published level was the silence sentinel. Two things were true at once and only one of them was.
+    if (core::exactlyEqual (out.programmeMeanSquareDb(), BandCrest::kSilenceDb)
+        || core::exactlyEqual (in.programmeMeanSquareDb(), BandCrest::kSilenceDb)) return r;
     const long long n = std::min (in.blockCount(), out.blockCount());
     r.blocks = n;
     if (n <= 0) return r;
