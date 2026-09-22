@@ -351,6 +351,66 @@ void theBandsAreTheFiltersTheHeaderNames()
 }
 
 //==================================================================================================
+// THE PROGRAMME LEVEL IS IN THE GATE'S OWN UNITS — the point of publishing it at all.
+//
+// A caller wanting a floor "40-odd dB below the programme" reaches for integrated loudness, and `I - 42` is
+// the obvious spelling. It is also wrong in a way that hides: `I` is K-weighted and this gate is not, and the
+// offset between them is a function of the SPECTRUM. This checks the two claims that make the scalar useful —
+// that a floor set from it lands where arithmetic says, and that it is gated at a FIXED -70 dBFS rather than
+// at `programmeFloorDb`, so a caller deriving the floor from it is not chasing its own tail.
+void theProgrammeLevelIsInTheGatesUnits()
+{
+    felitronics::test::group ("the programme level is the gate's own quantity, gated at a fixed floor");
+    const double fs = 48000.0;
+    auto buf = programme (fs, 2, 8.0, 25.0);
+    BandCrest bc;
+    if (! felitronics::test::run (runIt (bc, buf, fs))) return;
+    const double lvl = bc.programmeMeanSquareDb();
+    ok (lvl > -100.0 && lvl < 0.0, "the programme answers a level of " + std::to_string (lvl) + " dBFS");
+
+    // 1. A FLOOR SET FROM IT LANDS WHERE ARITHMETIC SAYS. At `level` exactly, every block at or above the
+    //    programme's own mean is admitted and the rest are not — so the count matches a count taken here.
+    {
+        felitronics::analysis::BandCrestParams p;
+        p.programmeFloorDb = lvl;
+        BandCrest at;
+        at.setParams (p);
+        if (felitronics::test::run (runIt2 (at, buf, fs)))
+        {
+            long long want = 0;
+            const double thr = std::pow (10.0, lvl / 10.0);
+            for (long long j = 0, e = at.blockCount(); j < e; ++j)
+                if (at.blockMeanSq (j, BandCrest::kFull) >= thr) ++want;
+            ok (at.activeBlocks (BandCrest::kFull) == want,
+                "a floor set AT the published level admits the blocks arithmetic says it should ("
+                + std::to_string (at.activeBlocks (BandCrest::kFull)) + " of " + std::to_string (at.blockCount()) + ")");
+        }
+    }
+
+    // 2. THE SCALAR DOES NOT MOVE WITH `programmeFloorDb`. If it were gated at the configured floor, a caller
+    //    deriving the floor from it would be solving a fixed point; it is gated at -70 dBFS and nothing else.
+    {
+        felitronics::analysis::BandCrestParams p;
+        p.programmeFloorDb = -20.0;                 // far above anything this fixture has in most blocks
+        BandCrest high;
+        high.setParams (p);
+        if (felitronics::test::run (runIt2 (high, buf, fs)))
+            ok (std::fabs (high.programmeMeanSquareDb() - lvl) <= 1.0e-12,
+                "moving the configured floor by 50 dB does not move the published level ("
+                + std::to_string (high.programmeMeanSquareDb()) + " against " + std::to_string (lvl) + ")");
+    }
+
+    // 3. AND IT IS A SENTINEL, NOT A LEVEL, WHEN NOTHING CLEARS THE GATE.
+    {
+        std::vector<std::vector<float>> quiet (2, std::vector<float> ((std::size_t) (fs * 2.0), 0.0f));
+        BandCrest silent;
+        if (felitronics::test::run (runIt (silent, quiet, fs)))
+            ok (silent.programmeMeanSquareDb() == BandCrest::kSilenceDb,
+                "digital silence answers the sentinel, not a number that looks like a level");
+    }
+}
+
+//==================================================================================================
 // THREE PRECONDITIONS THE COMPARATOR USED TO ASSUME. Each was found by review with a measurement attached, and
 // each failed in the same direction: a plausible number for a comparison that had not happened.
 void theComparatorRefusesWhatItCannotCompare()
@@ -503,6 +563,7 @@ int main()
     theLossIsInvariantToGain();
     cvarSeesWhatP95CannotAndNeverLess();
     theBandsAreTheFiltersTheHeaderNames();
+    theProgrammeLevelIsInTheGatesUnits();
     theComparatorRefusesWhatItCannotCompare();
     theSameProgrammeInAnySlicing();
     processAsksTheHeapForNothing();

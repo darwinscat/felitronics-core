@@ -1560,7 +1560,7 @@ namespace
     bool haveCrest[2] { false, false };
     felitronics::analysis::BandCrestParams installedCrest[2] {};
 
-    constexpr std::uint32_t kCrestScalars     = 21;   // 16 + one active-block count per band
+    constexpr std::uint32_t kCrestScalars     = 22;   // 16 + one active-block count per band + the level
     constexpr std::uint32_t kCrestBlockStride = 15;   // 5 bands x { peak, meanSq, active }
     constexpr std::uint32_t kCrestLossFields  = 17;   // + outSilent and the coarse block lag
 
@@ -1638,6 +1638,9 @@ FC_EXPORT std::uint32_t fc_probe_crest_scalars (std::int32_t slot, double* out, 
     // it derives itself is a second definition of "active" waiting to drift from this one.
     for (int b = 0; b < felitronics::analysis::BandCrest::kBands; ++b)
         out[i++] = (double) d.activeBlocks (b);
+    // The programme's own level in the gate's units, so a caller can set `programmeFloorDb` RELATIVE to it
+    // without converting between two quantities that are not the same one. See the header.
+    out[i++] = d.programmeMeanSquareDb();
     return i;
 }
 

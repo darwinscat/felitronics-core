@@ -503,6 +503,39 @@ public:
         return n;
     }
 
+    // THE PROGRAMME'S OWN LEVEL, in the units `programmeFloorDb` is compared against — so a caller can set a
+    // RELATIVE floor without converting between two quantities that are not the same one.
+    //
+    // WHY IT EXISTS. A caller wanting "40-odd dB below the programme" naturally reaches for integrated
+    // loudness, and `I - 42` is the obvious spelling. But `I` is K-weighted and this gate is not: measured on
+    // three 20 s fixtures, `I` minus this number runs from -0.15 dB on bass-heavy material to +5.87 dB on
+    // bright material — the offset is a function of the SPECTRUM, so a floor derived that way is a floor that
+    // moves with the mix, and a calibration made on one kind of material would silently be wrong on another.
+    // This is the same quantity, by the same code path, so the difference is zero by construction.
+    //
+    // THE GATE HERE IS A FIXED -70 dBFS, NOT `programmeFloorDb`, and that is the point rather than a detail:
+    // a caller derives its floor FROM this number, so averaging over the population that floor selects would
+    // be a threshold chasing its own tail. Two stages, an absolute gate and then a relative one computed from
+    // what it admitted, is exactly BS.1770's own construction for the integrated measure — this is not a new
+    // idea, it is that idea in unweighted units.
+    //
+    // 0 blocks above the gate answers `kSilenceDb`, which is a sentinel and not a level.
+    static constexpr double kProgrammeGateDb = -70.0;
+    static constexpr double kSilenceDb       = -200.0;
+
+    double programmeMeanSquareDb() const noexcept
+    {
+        const double gate = core::det::pow10 (kProgrammeGateDb / 10.0);
+        double sum = 0.0; long long n = 0;
+        for (long long j = 0, e = blockCount(); j < e; ++j)
+        {
+            const double ms = blockMeanSq (j, kFull);
+            if (std::isfinite (ms) && ms >= gate) { sum += ms; ++n; }
+        }
+        if (n == 0) return kSilenceDb;
+        return 10.0 * core::det::log10 (sum / (double) n);
+    }
+
     // The whole programme's reconstructed peak, which is the quantity `ReferenceTruePeakMeter` certifies — the
     // one number here with an instrument OUTSIDE this class to be nulled against.
     double fullBandPeakLin() const noexcept

@@ -769,6 +769,16 @@ typedef struct fc_measurement
     double integratedLufs, truePeakDbTp, samplePeakDb, loudnessRangeLu, plrDb;
     fc_gr_stats compressor, limiter;
     double  limiterMaxReconstructedPeakDb;
+    // `droppedBlocks` IS CAPACITY, and nothing else: 400 ms gating blocks that did not fit the meter's
+    // pre-allocated array. Not blocks that failed the loudness gate (`gatingBlocks` counts what was built) and
+    // not non-finite ones (`nonFiniteSubHops`, sticky until reset). A measurement is whole when `loudnessValid`
+    // and `lraValid` hold AND both of those counters are zero.
+    //
+    // TWO SURFACES OF THIS CORE HAVE DIFFERENT LENGTH BEHAVIOUR, and a caller using both will meet it: the
+    // programme REPORT (`fc_probe_report_*`) sizes its stores from `maxDurationSec`, one hour by default, and
+    // answers `LoudnessCapacityExceeded` past it — while a SOLVE sizes its meter from the programme it was
+    // handed and has no such ceiling. So a 65-minute file can come back invalid from the report and Solved
+    // from the search, which is each surface keeping its own contract rather than either one being wrong.
     int32_t latencySamples, gatingBlocks, droppedBlocks, nonFiniteSubHops;
     int32_t loudnessValid, lraValid;
 

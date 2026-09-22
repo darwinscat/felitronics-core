@@ -869,7 +869,7 @@ int main (int argc, char** argv)
         std::printf ("active");
         for (int b = 0; b < analysis::BandCrest::kBands; ++b)
             std::printf (" %lld", (long long) src.activeBlocks (b));
-        std::printf ("\n");
+        std::printf (" %016llx\n", (unsigned long long) bits (src.programmeMeanSquareDb()));
         for (long long j = 0; j < src.blockCount(); ++j)
         {
             std::printf ("b %lld", j);

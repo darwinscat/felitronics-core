@@ -768,9 +768,9 @@ void k1TheTwoSlotsAndTheLoss (int ch)
     const auto n = (std::uint32_t) frames, nc = (std::uint32_t) ch;
     const std::uint32_t slen = fc_probe_crest_scalars_len(), stride = fc_probe_crest_block_stride();
     const std::uint32_t llen = fc_probe_crest_loss_len();
-    ok (slen == 21u && stride == 15u && llen == 17u,
-        "the shapes are 21 scalars (16 plus one accepted-block count per band), 15 doubles a block row and "
-        "17 loss fields");
+    ok (slen == 22u && stride == 15u && llen == 17u,
+        "the shapes are 22 scalars (16, one accepted-block count per band, and the programme level), 15 "
+        "doubles a block row and 17 loss fields");
 
     // A getter is silent until its OWN slot has run — the two are independent, which is the whole point.
     std::vector<double> v (64, kCanary);

@@ -15,6 +15,7 @@ const S = {
     sr: 0, ch: 1, hop: 2, blockHops: 3, e0: 4, e1: 5, e2: 6, floor: 7, share: 8,
     samples: 9, hopCount: 10, baseHops: 11, blockCount: 12, nonFinite: 13, reason: 14, peak: 15,
     active0: 16,   // one accepted-block count per band, in band order
+    programmeMs: 21,   // the programme's level in the gate's units, dBFS
 };
 
 // One loss row, in the order `fc_probe_crest_loss` writes it.
@@ -40,6 +41,7 @@ export function formatCrest({ ok, s, blocks, blockStride, loss }) {
     {
         let line = 'active';
         for (let k = 0; k < CREST_BANDS; ++k) line += ` ${s[S.active0 + k]}`;
+        line += ` ${bitsOf(s[S.programmeMs])}`;
         out.push(line);
     }
     for (let j = 0; j < s[S.blockCount]; ++j) {
