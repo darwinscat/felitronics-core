@@ -79,3 +79,47 @@ consumer derives itself is a second definition of "active" waiting to drift.
 An unrecognised `--` token is a refusal on both roads from the start. Native and wasm are byte-identical on the
 default road, on a parameterised one and on a run carrying the loss rows; their refusal sets agree on twelve
 argument lists, ten of them refusals.
+
+#### What two review rounds found, and what that says about the tests
+
+A code review found seven things and a falsification round — whose mandate was to make this analyzer report a
+wrong number rather than to read it — found nine more. Both are worth listing, because six of the sixteen were
+cases where a TEST was narrower than the claim it stood under.
+
+**The full band's crest was a hybrid and wrong near Nyquist.** Its peak is the reconstruction; its mean square
+came from the oversampled stream, which the 32-tap interpolator droops above about 0.375·fs. A pure sine has a
+crest of exactly 3.0103 dB — an oracle that owes this code nothing — and it read **9.03 dB at 0.45·fs and
+23.8 dB at 0.49·fs**. The per-band crests were never affected, because their peak and their mean square come
+from the same stream; only that one number was wrong, and it fed the absolute gate and the published programme
+level with it. The full band's mean square is the base-rate one now and the share gate keeps the oversampled
+denominator, because a ratio across two domains is a share of nothing.
+
+**The refusal set differed by platform.** Six sibling analyzers carry a 768 kHz ceiling; this one had none, so
+`llround` decided — and it saturates on arm64 while it wraps on x86-64 glibc. Measured on both rows:
+`fs = 1e308` was refused on one and accepted on the other with a 10-sample hop, answering a measurement that
+looked entirely valid. The bounds are comparisons made before any conversion now, and the two rows agree.
+
+**The filters were `SystemMath`**, where every sibling is deterministic and the math-policy suite asserts it of
+each — `std::tan` disagrees between libms and moved 12 block rows of 3752 on a 6.3-minute mix. **The hop was
+`llround(fs·hopMs/1000)`** where the loudness meter builds it from sub-hops, so 22050 Hz gave 2205 samples
+against 2210 — and the test that claimed the identity ran at 44.1, 48 and 96 kHz, the three rates where the two
+agree. **A refused `prepare()` answered the previous run.** **The comparator compared anything**: the same audio
+with the master on a 50 ms hop gave CVaR95 7.8 dB with `valid` true. **No evidence was reported as a lag**: a
+muted master read "misaligned by 8 blocks". **The non-finite count meant interpolator outputs**, 128 for one
+NaN, and its location depended on the call sizes. **A master scaled by 2⁻⁵⁰** — float subnormals, strictly
+positive — was compared as real. **A channel that stopped was not cleared**, so a returning one spliced a
+32-sample-old ring onto new audio: 40 dB of crest on a block. **And the budget was a tautology**: `bytes() > 0`
+passed while the demand omitted the interpolators themselves, 168 B a channel at every length.
+
+**The bed placed every transient on the hop grid.** At t = k·0.5 s, which is a hop boundary at every rate this
+suite uses — the feature sat exactly on the grid the measurement is made of, in the fixture the alignment tests
+are built on. That is this repository's own rule 2 inverted. Moved off it by a third of a hop, which turned the
+CVaR95 control red, because that control's threshold was a number fitted to the fixture of the day rather than
+a statement of the mechanism. It states the mechanism now.
+
+Also measured and then gated: gain invariance is **exact only where the scaling is exact** — ×0.5 is, ×0.37 is
+not, and the 1.1e-5 dB that appears there is the fixture rounding rather than the comparison drifting, so the
+claim is now the two claims it always was. And the filter bank runs the twelve evaluations it reads instead of
+the twenty it computed: **2.84–3.12 s → 2.04–2.05 s** on a 4-minute stereo programme, bit-identical — but only
+after a diff said it was not, because the first version passed `kQ` cast to float where `Crossover2` passes a
+double.
