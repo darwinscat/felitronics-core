@@ -66,6 +66,9 @@ extern "C"
     std::uint32_t fc_probe_report_names    (char*, std::uint32_t);
 
     int           fc_probe_bursts_run      (const float*, std::uint32_t, std::uint32_t, double);
+    int           fc_probe_bursts_run_with (const float*, std::uint32_t, std::uint32_t, double,
+                                            double, double, double, double, double, double);
+    std::uint32_t fc_probe_bursts_scalars_len (void);
     std::uint32_t fc_probe_bursts_scalars  (double*, std::uint32_t);
     std::uint32_t fc_probe_bursts_chan     (double*, std::uint32_t);
     std::uint32_t fc_probe_bursts_events   (double*, std::uint32_t);
@@ -96,6 +99,8 @@ extern "C"
     // the whole use is to ask BEFORE the input buffer exists.
     double fc_probe_report_storage_bytes    (std::uint32_t, double);
     double fc_probe_bursts_storage_bytes    (std::uint32_t, double);
+    double fc_probe_bursts_storage_bytes_with (std::uint32_t, double, double, double, double, double,
+                                               double, double);
     double fc_probe_hum_storage_bytes       (std::uint32_t, double);
     double fc_probe_forensics_storage_bytes (std::uint32_t, double);
     double fc_probe_lowend_storage_bytes    (std::uint32_t, double);
@@ -630,6 +635,114 @@ std::vector<double> snapshot()
 // `std::size_t`, its own struct layouts and its own libm, and a release-vs-debug diff of one tier would
 // happily compare a wrong number with itself. Only integer sample rates are listed, so "48000" is
 // "48000" on both sides and the comparison is of numbers rather than of two printf dialects.
+//==================================================================================================
+// K3 — THE BAND IS AN ARGUMENT. `fc_probe_bursts_run` answers one question (sibilance, 5-9 kHz);
+// `fc_probe_bursts_run_with` is the SAME detector pointed somewhere else, which is what makes "how dense
+// are the transients" answerable without a second analyzer.
+//
+// THREE THINGS HAVE TO BE TRUE, and only the first is obvious:
+//   * the parameterised road at the documented defaults IS the default road — bit for bit, or there are
+//     quietly two detectors;
+//   * the scalars report the parameters THIS measurement ran at. They used to read a constant, which was
+//     true while one road existed and would have become a plausible lie the moment a second one did: the
+//     thresholds would have described 6/3 dB while the events came from the caller's numbers;
+//   * a refused parameterised run leaves NOTHING half-swapped. The established contract here is that a
+//     refusal goes silent, and the state to rule out is new parameters sitting beside old events, which
+//     is the one combination a reader cannot detect from the outside.
+void k3TheBandIsAnArgument (int ch)
+{
+    felitronics::test::group ("K3 — bursts with the caller's band: the same detector, pointed elsewhere");
+    const int frames = 5 * 48000;
+    const std::vector<float> bursty = burstyFixture (frames, ch);
+    const auto n = (std::uint32_t) frames, nc = (std::uint32_t) ch;
+    const std::uint32_t len = fc_probe_bursts_scalars_len();
+
+    auto scalars = [&] ()
+    {
+        std::vector<double> v (len + 8u, kCanary);
+        const std::uint32_t got = fc_probe_bursts_scalars (v.data(), len);
+        v.resize (got);
+        return v;
+    };
+    // The scalar block's own order, as fc_probe.cpp writes it and bursts-format.mjs reads it.
+    enum { kSr = 0, kCh = 1, kHop = 2, kBase = 3, kLo = 4, kHi = 5, kEnter = 6, kExit = 7,
+           kSamples = 9, kHops = 10, kEligible = 11, kOnsets = 26, kOnsetsPerSec = 31 };
+
+    ok (len == 32u, "the scalar block is 32 doubles — 31 of them since P81, plus K3's onsets per second");
+
+    // ---- the parameterised road at the documented defaults IS the default road ----
+    const bool plain = fc_probe_bursts_run (bursty.data(), n, nc, 48000.0) == 1;
+    const std::vector<double> a = scalars();
+    const bool withDefaults = fc_probe_bursts_run_with (bursty.data(), n, nc, 48000.0,
+                                                        5000.0, 9000.0, 10.0, 2000.0, 6.0, 3.0) == 1;
+    const std::vector<double> b = scalars();
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) if (! (a[i] == b[i])) ++differing;
+    ok (plain && withDefaults && a.size() == b.size() && differing == 0,
+        "run_with at the documented defaults answers the default road's scalars, bit for bit ("
+        + std::to_string (differing) + " differ)");
+
+    // ---- the thresholds in the scalars are the ones THIS run installed, not a constant ----
+    const bool moved = fc_probe_bursts_run_with (bursty.data(), n, nc, 48000.0,
+                                                 80.0, 8000.0, 20.0, 500.0, 9.0, 4.5) == 1;
+    const std::vector<double> c = scalars();
+    ok (moved && c[kEnter] == 9.0 && c[kExit] == 4.5,
+        "the scalars report the thresholds this measurement ran at (" + std::to_string (c[kEnter]) + " / "
+        + std::to_string (c[kExit]) + " dB), not the documented 6 / 3");
+    ok (moved && c[kLo] == 80.0 && c[kHi] == 8000.0,
+        "... and the band it ran at, read back out of the detector");
+    // The HOP is the detector's own answer in SAMPLES, so it is evidence that the millisecond argument
+    // reached the core rather than being stored beside it: 20 ms at 48 kHz is 960 samples, not 480.
+    ok (moved && c[kHop] == 960.0 && c[kBase] == 25.0,
+        "... and 20 ms of hop is 960 samples with a 25-hop baseline — the arguments reached the detector ("
+        + std::to_string (c[kHop]) + " / " + std::to_string (c[kBase]) + ")");
+
+    // ---- ONSETS PER SECOND, against the other published scalars. The analyzer owns the denominator; this
+    // recomputes it from numbers the same block publishes, so a changed denominator shows up here.
+    {
+        const double sec = c[kEligible] * c[kHop] / c[kSr];
+        const double want = sec > 0.0 ? c[kOnsets] / sec : 0.0;
+        ok (std::fabs (c[kOnsetsPerSec] - want) <= 1.0e-12 * std::max (1.0, std::fabs (want)),
+            "onsets per second is the onset count over the JUDGED programme, not the file ("
+            + std::to_string (c[kOnsetsPerSec]) + "/s over " + std::to_string (sec) + " s)");
+        // And the denominator is not the file: the first `baselineHops` are not judged, so the two differ.
+        const double fileSec = c[kSamples] / c[kSr];
+        ok (fileSec > sec, "... and the judged stretch is shorter than the file (" + std::to_string (sec)
+                           + " s of " + std::to_string (fileSec) + " s), so the two denominators differ");
+    }
+
+    // ---- A REFUSED PARAMETERISED RUN LEAVES THE PREVIOUS MEASUREMENT WHOLE, parameters included ----
+    {
+        // 30 kHz cannot be the top corner at 48 kHz: 0.49*fs is 23520.
+        const bool refused = fc_probe_bursts_run_with (bursty.data(), n, nc, 48000.0,
+                                                       20000.0, 30000.0, 10.0, 2000.0, 6.0, 3.0) == 0;
+        const std::vector<double> after = scalars();
+        ok (refused && after.empty(), "a band the core cannot build is refused, and the getters go silent");
+        // AND THE NEXT SUCCESSFUL RUN IS NOT CONTAMINATED BY IT. Silence alone does not rule out the half
+        // swap: parameters recorded by the refused call would sit in the module and be read beside the NEXT
+        // measurement's events. So run the defaults again and check the thresholds came back to 6 / 3.
+        const bool again = fc_probe_bursts_run (bursty.data(), n, nc, 48000.0) == 1;
+        const std::vector<double> back = scalars();
+        ok (again && back.size() == a.size() && back[kEnter] == 6.0 && back[kExit] == 3.0
+            && back[kLo] == 5000.0 && back[kHi] == 9000.0,
+            "... and the run after it reports ITS OWN parameters, not the refused call's");
+    }
+
+    // ---- THE PRICE MOVES WITH THE PARAMETERS, which is why a second one had to exist: the baseline ring
+    // is round(baselineMs / hopMs) hops of hopMs each, so a page sizing itself by the default figure would
+    // be short exactly where it asked for a longer memory.
+    {
+        const double dflt = fc_probe_bursts_storage_bytes (nc, 48000.0);
+        const double same = fc_probe_bursts_storage_bytes_with (nc, 48000.0, 5000.0, 9000.0, 10.0, 2000.0, 6.0, 3.0);
+        ok (dflt > 0.0 && same == dflt, "the parameterised price at the documented defaults is the default price");
+        const double longer = fc_probe_bursts_storage_bytes_with (nc, 48000.0, 5000.0, 9000.0, 10.0, 8000.0, 6.0, 3.0);
+        ok (longer > dflt, "a four-times-longer baseline costs more (" + std::to_string (longer)
+                           + " over " + std::to_string (dflt) + " bytes)");
+        ok (fc_probe_bursts_storage_bytes_with (nc, 48000.0, 20000.0, 30000.0, 10.0, 2000.0, 6.0, 3.0) == 0.0,
+            "and a band the run refuses is priced at the canonical zero, as the default query does");
+    }
+}
+
 void printStorageTable()
 {
     const std::uint32_t widths[] = { 1u, 2u, 6u, 16u, 17u };
@@ -795,6 +908,8 @@ int main (int argc, char** argv)
         }
         else ok (true, "lowend_note_name: this fixture has no valid note, so there is no name — said out loud");
     }
+
+    k3TheBandIsAnArgument (ch);
 
     // ---------- P81, last: asking the price disturbs nothing, and the two roads refuse the same set ----------
     // queriesAreStateless() first, while the analyzers still hold the fixtures the block above measured;

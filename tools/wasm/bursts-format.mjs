@@ -19,6 +19,7 @@ const S = {
     eventsValid: 19, eventsReason: 20, progValid: 21, progReason: 22,
     eventCount: 23, storedEvents: 24, eventsComplete: 25,
     onsets: 26, intervals: 27, intervalOverflow: 28, modalHops: 29, modalMass: 30,
+    onsetsPerSec: 31,
 };
 
 export function formatBursts({ ok, s, chan, events, ioi, lag, strideChan, strideEvt, strideBin }) {
@@ -46,7 +47,8 @@ export function formatBursts({ ok, s, chan, events, ioi, lag, strideChan, stride
              + ` ${bitsOf(events[b + 7])} ${bitsOf(events[b + 8])}`
              + ` ${events[b + 9]}${events[b + 10]}${events[b + 11]}`);
     }
-    L.push(`onsets ${s[S.onsets]} ${s[S.intervals]} ${s[S.intervalOverflow]} ${s[S.modalHops]} ${s[S.modalMass]}`);
+    L.push(`onsets ${s[S.onsets]} ${s[S.intervals]} ${s[S.intervalOverflow]} ${s[S.modalHops]} ${s[S.modalMass]}`
+         + ` ${bitsOf(s[S.onsetsPerSec])}`);
     for (let i = 0; i < ioi.length / strideBin; ++i) L.push(`ioi ${ioi[i * strideBin]} ${ioi[i * strideBin + 1]}`);
     for (let i = 0; i < lag.length / strideBin; ++i) L.push(`lag ${lag[i * strideBin]} ${lag[i * strideBin + 1]}`);
     return L.join('\n') + '\n';

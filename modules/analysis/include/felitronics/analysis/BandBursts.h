@@ -681,6 +681,23 @@ public:
     // what is enough. The useful range is about 5 to 512 hops (50 ms – 5.1 s at the default hop): below
     // ~5 the 10 ms grid quantises a period into two adjacent bins, above 512 it is in the overflow count.
     std::int64_t onsetCount() const noexcept { return onsetCount_; }
+
+    // ONSETS PER SECOND, and the whole of the question is the DENOMINATOR — which is why this lives here
+    // rather than being left to each consumer's arithmetic. It is the JUDGED programme, `eligibleHops()`
+    // hops long, not the file: the first `baselineHops` of a programme have no surroundings to be measured
+    // against and are not judged, so dividing by the file's length reports a density over a stretch where
+    // no onset could have been found and reads LOW on exactly the short programmes where it matters most
+    // (at the 2 s default baseline, a 10 s file would be diluted by a fifth).
+    //
+    // 0 when nothing was judged. That is a real answer and not a missing one — `eventsValid()` and its
+    // reason say whether the measurement happened at all, and a caller reads them as it does for every
+    // other number here.
+    double onsetsPerSecond() const noexcept
+    {
+        const double sec = (double) eligibleHops_ * (double) hopSamples_ / sampleRate_;
+        return sec > 0.0 ? (double) onsetCount_ / sec : 0.0;
+    }
+
     std::int64_t intervalCount() const noexcept { return intervalCount_; }
     std::int64_t intervalOverflow() const noexcept { return ioiOverflow_; }        // spacings past kIoiBins
     std::int64_t intervalBin (int hops) const noexcept                             // spacing of `hops` hops

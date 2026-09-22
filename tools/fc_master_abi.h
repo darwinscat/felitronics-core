@@ -99,6 +99,11 @@ extern "C" {
 // v7: `fc_master_eq_curve` — one entry point, no struct, and therefore no row.
 // v8: the gain-reduction PERCENTILE — the `q` each limit binds at the end of `fc_loudness_request` (one row) and
 // `fc_solution_gr_quantile`, the general read-back that replaces a fixed field per fraction.
+// v9: `fc_master_eq_dyn_times` — one entry point, no struct, and therefore no row, exactly as v7.
+// v10: the limiter's ACTIVE-WINDOW gain-reduction statistics (K11) — `fc_gr_active_stats` and
+// `fc_solution_gr_active_stats`, plus the gate itself at the end of `fc_loudness_request`: a new struct with
+// its own id, one entry point and one row. NOTHING existing moved: `fc_gr_stats` is nested by value and
+// therefore frozen (rule 3), and the solver's own constraint still reads the ungated distribution.
 //
 // A NEW CODE IS NOT A NEW VERSION, and the rule for codes is written here rather than left to be inferred
 // from the one for structs. A status or op code is only ever APPENDED — an existing code never changes
@@ -173,7 +178,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 8u
+#define FC_MASTER_ABI_VERSION 10u
 
 typedef struct fc_header
 {
@@ -464,6 +469,10 @@ typedef struct fc_clipper
     float   dcBlockHz;
 } fc_clipper;
 
+// `ceilingDbTp` IS WHAT THE STAGE IS GIVEN OUTSIDE A SEARCH — and is NOT what a search starts from. A solve
+// takes `min(req.maxTruePeakDbTp, this)` for its first pass and moves the ceiling from there, so a caller that
+// sets a generous ceiling here and a strict promise in the request gets the promise, not this number. Read what
+// was actually applied out of `fc_solution_summary::ceilingDbTp`; this field is the request, not the verdict.
 typedef struct fc_limiter
 {
     double ceilingDbTp;
@@ -681,7 +690,7 @@ typedef struct fc_loudness_request
     double  maxLraLossLu;
     double  inputLoudnessRangeLu;   // NaN = not supplied, which switches the range constraint off
     double  activityThresholdDb;
-    int32_t maxPasses;
+    int32_t maxPasses;              // bounds the SEARCH, not the renders — see `fc_solution_summary::passes`
     double  initialGainDb;          // NaN = use the params' own
 
     // ---- v6 ----
@@ -696,6 +705,15 @@ typedef struct fc_loudness_request
     // v8 is read with.
     double  limiterGrQuantile;
     double  compressorGrQuantile;
+
+    // ---- v10 ----
+    // THE GATE ON THE LIMITER'S INPUT for `fc_solution_gr_active_stats`, in dBFS at the limiter's own node —
+    // after `preLimiterGainDb`, which is where the reconstructed peak it reads is measured. It changes NOTHING
+    // this request decides: every limit is still judged on the ungated distribution, because a limit is a
+    // promise about the delivered programme and silence may not buy headroom with it. -60 is the default and
+    // is what a request older than v10 is read with. NOT refused and NOT clamped, on purpose: -inf accepts
+    // every window that carried any non-zero input, +inf accepts none, and both are answers.
+    double  limiterActiveInputDb;
 } fc_loudness_request;
 
 typedef struct fc_solve_pass
@@ -716,6 +734,33 @@ typedef struct fc_gr_stats
     uint64_t frames, nonFinite, aboveRange;
     int32_t  valid;
 } fc_gr_stats;
+
+//==============================================================================
+// v10 — THE SAME STATISTICS OVER THE WINDOWS WHERE THE STAGE HAD SOMETHING TO WORK ON (K11).
+//
+// `fc_gr_stats` above answers what a LIMIT is judged on, and it must: every 4 ms window of the programme is an
+// entry, the silent ones included, so a caller cannot buy headroom with silence. That makes it the wrong answer
+// to the other question with the same units — how hard the stage works WHERE it works. On the same distribution
+// 20 % of silence turns the music's p95 into its p93.75, and enough of it drags the quantile into the silent
+// mass and zeroes the statistic outright. Two questions, two distributions; the first one does not move.
+//
+// THE GATE IS ON THE STAGE'S INPUT, never on its gain reduction: gating on |GR| would define "where the stage
+// works" as "where it worked" and report a statistic of a set the statistic itself chose. `windows` and
+// `activeWindows` are published beside the numbers, so a caller can see how much of the programme the answer
+// rests on rather than trusting it.
+//
+// `stats` IS THE SAME STRUCT, nested by value and frozen with it, and every one of its fields is over the
+// ACCEPTED windows — the samples' mean, max and active fraction too, not only the quantiles. A mean over the
+// whole programme beside a quantile over part of it would be two bases under one name.
+typedef struct fc_gr_active_stats
+{
+    fc_header   header;
+
+    fc_gr_stats stats;              // over the accepted windows only; `stats.valid` is 0 when none were
+    uint64_t    windows;            // 4 ms windows the programme was cut into
+    uint64_t    activeWindows;      // ... of which the input reached the gate
+    double      thresholdDb;        // the gate this was read at, echoed back
+} fc_gr_active_stats;
 
 typedef struct fc_measurement
 {
@@ -761,6 +806,14 @@ typedef struct fc_solution_summary
     int32_t  binding;               // fc_constraint
     uint32_t alsoViolated;
     double   preLimiterGainDb, ceilingDbTp;
+    // RENDERS SPENT, ALL OF THEM, AND IT CAN EXCEED `maxPasses` BY TWO. `maxPasses` bounds the SEARCH; delivering
+    // the chosen candidate costs one more whenever the search did not end on it, and the bracket rescue one more
+    // again. A caller budgeting time by `maxPasses` alone is budgeting for the best case. The one corner where
+    // `passes == 1` is guaranteed — an external search's oracle — is `maxPasses == 1` with every drive-bound
+    // limit off (`limiterGr.limitDb == +inf`, `minPlrDb == -inf`, `maxLraLossLu == +inf` or a NaN input range):
+    // a single-pass search always ends on its own candidate, so nothing is re-rendered, and the rescue is
+    // unreachable because only a render that BROKE one of those three can arm it. MasterAbiTests counts the
+    // renders through the progress callback rather than through this field, and keeps a control at four passes.
     int32_t  passes, logCount;
     double   activityThresholdDb;
     double   achievedBelowLufs, achievedAboveLufs, gainBelowDb, gainAboveDb;
@@ -774,7 +827,8 @@ typedef struct fc_solution_summary
 typedef enum fc_struct_id
 {
     FC_STRUCT_CONFIG = 0, FC_STRUCT_PARAMS = 1, FC_STRUCT_RESOLVED = 2, FC_STRUCT_STATS = 3,
-    FC_STRUCT_NEED = 4, FC_STRUCT_REQUEST = 5, FC_STRUCT_MEASUREMENT = 6, FC_STRUCT_SUMMARY = 7
+    FC_STRUCT_NEED = 4, FC_STRUCT_REQUEST = 5, FC_STRUCT_MEASUREMENT = 6, FC_STRUCT_SUMMARY = 7,
+    FC_STRUCT_GR_ACTIVE = 8
 } fc_struct_id;
 
 //      X(id,                     since, bytes)
@@ -792,9 +846,11 @@ typedef enum fc_struct_id
         X(FC_STRUCT_REQUEST,      1,      120)    \
         X(FC_STRUCT_REQUEST,      6,      128)    \
         X(FC_STRUCT_REQUEST,      8,      144)    \
+        X(FC_STRUCT_REQUEST,     10,      152)    \
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
         X(FC_STRUCT_MEASUREMENT,  4,      224)    \
-        X(FC_STRUCT_SUMMARY,      1,       88)
+        X(FC_STRUCT_SUMMARY,      1,       88)    \
+        X(FC_STRUCT_GR_ACTIVE,   10,       96)
 
 //==============================================================================
 // HANDLES
@@ -990,6 +1046,47 @@ fc_status fc_master_need_create (const fc_master_config* cfg, fc_need* out);
 fc_status fc_master_eq_curve (const fc_master_params* params, double sampleRate, int32_t lane, int32_t band,
                               const double* freqHz, uint32_t count, double* outDb, uint32_t cap, uint32_t* written);
 
+//==============================================================================
+// v9 — WHAT THE DYNAMICS OF ONE EQ POINT ARE ACTUALLY TIMED AT, in milliseconds.
+//
+// `fc_eq_dyn::atk` and `::rel` are NOT times. They are DEVIATION knobs in [0, 1] around an automatic value the
+// core derives from the band's own fc/Q — 0.5 is that automatic value, 0 is four times faster and 1 four times
+// slower — and the automatic value is not a field of any struct here. So the pair is unreadable from outside,
+// and a caller cannot tell "50 ms" from "the slow rail" by looking at what it wrote. This call answers what the
+// follower is set to.
+//
+// NO HANDLE AND NO RENDER, as `fc_master_eq_curve`: the parameters travel with the call, so the answer is
+// available while a knob is moving. It asks the heap for nothing.
+//
+// PER LANE, NOT PER BAND — the contract's one surprise, and it is the core's shape rather than this facade's.
+// The times come from the SIDECHAIN PROBE, and the probe sits on the LANE: a point's up-to-FC_MAX_EQ_LANES lanes
+// carry their own freq/Q and therefore their own pair, while `dyn` is shared by all of them. `band` is
+// 0..FC_MAX_EQ_BANDS-1 and `lane` 0..FC_MAX_EQ_LANES-1; anything else is FC_ERR_RANGE. A lane that is off, and a
+// band that is off or bypassed, are answered like any other: the core computes a lane's ballistics whatever its
+// switch says, so a refusal here would be this facade inventing a rule the audio does not have.
+//
+// THE CORE'S RAILS ARE VISIBLE IN THE ANSWER, which is the point of a readback. The lane's freq is read within
+// [10 Hz, 0.49*sampleRate] and its Q within [0.05, 40] before the ballistics see them, and each knob within
+// [0, 1] — so a caller that wrote MILLISECONDS into a knob reads back the slow rail, not what it meant. The call
+// runs `dynamiceq::LaneDynamics::ballisticsFor`, the one expression the chain runs; it does not re-derive it, and
+// the rails are that class's, read through it.
+//
+// `sampleRate` IN HERTZ, and it is REFUSED where a chain would refuse it rather than substituted: non-finite is
+// FC_ERR_NON_FINITE and anything below `core::kMinSampleRate` (8000) is FC_ERR_REFUSED_BY_CORE. The audio path
+// substitutes 48000 for a rate it cannot use, because by then `prepare` has already refused one; nothing has
+// refused anything here, and an answer computed at a rate the caller did not ask about is a plausible lie.
+//
+// `params` IS READ BY THE MAPPING EVERY OTHER CALL USES, so this call is refused exactly where
+// `fc_master_configure` is — a non-finite field FC_ERR_NON_FINITE, a filter type that names nothing
+// FC_ERR_ENUM — including a non-finite `dyn.atk`/`dyn.rel`, which therefore never reaches the [0, 1] rail
+// through this entry point. NEITHER OUTPUT MAY TOUCH the other or `params`: all three pairs are FC_ERR_SPAN.
+//
+// Checks in the header's order: poison, the two outputs, `params`' header and span, the three overlaps, then
+// `band`, `lane`, `sampleRate`, then the parameter set. BOTH outputs are written on FC_OK and NEITHER is touched
+// by a refusal — a caller that keeps the previous pair in them reads its own number back, not half of a new one.
+fc_status fc_master_eq_dyn_times (const fc_master_params* params, double sampleRate, int32_t band, int32_t lane,
+                                  double* attackMsOut, double* releaseMsOut);
+
 typedef enum fc_progress_stage
 {
     FC_PROGRESS_CONVERT = 0, FC_PROGRESS_LRA = 1, FC_PROGRESS_PASS = 2, FC_PROGRESS_FINAL = 3,
@@ -1082,6 +1179,26 @@ fc_status fc_master_solve (fc_master h, const fc_master_params* params, const fc
 // counted (`fc_master_stats::nonFiniteIn`): converting a NaN is bit-identical to converting a zero in its place, as
 // processing one is on a plain handle. Without that a windowed sinc would spread one bad sample over its kernel.
 
+//==============================================================================
+// WHERE THE OUTPUT SITS AGAINST THE INPUT (K6) — the question a caller has to answer before it can compare the
+// two, and it has two halves that are easy to confuse for one.
+//
+// THE LATENCY IS ALREADY OFF. `OfflineRenderer`'s contract is arithmetic, not a description: with `y` the chain's
+// output for the input followed by `D = latencySamples` zeros, `out[n] = y[n + D]`. So the output has exactly as
+// many frames as the input, output sample n IS input sample n processed, and the chain's tail — the last `D`
+// frames, which leave the chain only after the input has ended — is IN it rather than cut off. There is no
+// residual offset to correct and no field reporting one, because there is nothing to report: a caller that
+// subtracts `latencySamples` here is introducing an error, not removing one. Pinned in MasterAbiTests three ways
+// — bit for bit with every stage bypassed, by correlation lag with the stages running, and by where a lone
+// impulse lands — and in MasteringChainTests against the formula's own right-hand side.
+//
+// THE RATE IS THE OTHER HALF, AND IT IS NOT LATENCY. On a delivering handle the input is at `sampleRate` and the
+// output at `deliveryRate`, `fc_master_delivered_frames` long. The two therefore have different lengths and
+// different sample grids, so output index n is NOT input index n whenever the rates differ, while 0.25 s in is
+// still 0.25 s out. A consumer comparing the two — a crest or a band level per 400 ms window, say — states its
+// windows in TIME and converts each side at its own rate; an index-for-index comparison silently measures a
+// drift that is the resampling ratio, not the processing.
+
 // The exact delivered length for `inFrames` of programme — `DeliveryConverter::deliveredFrames`, read out, never
 // recomputed: the natural `ceil(inFrames * deliveryRate / sampleRate)` in double is wrong on real lengths (147
 // frames at 44.1 -> 48 kHz is 160, and the double says 161). `*outFrames` is written only on FC_OK.
@@ -1100,6 +1217,18 @@ fc_status fc_master_solve_delivered (fc_master h, const fc_master_params* params
                                      fc_solution* out_solution);
 
 fc_status fc_solution_summary_get (fc_solution s, fc_solution_summary* out);
+
+// v10 (K11) — the limiter's gain-reduction statistics over the windows its INPUT reached
+// `fc_loudness_request::limiterActiveInputDb`. Of the LAST render this solution made, which is the one whose
+// audio the caller holds, exactly like `fc_solution_gr_trace` and `fc_solution_gr_quantile`.
+//
+// ONLY FC_GR_STAGE_LIMITER IS ANSWERABLE, and the compressor is FC_ERR_STATE rather than a struct full of
+// zeroes. The gate needs the stage's input, and the chain taps the limiter's (the reconstructed peak it saw)
+// and not the compressor's; answering 0 active windows would say "the compressor never worked", which is a
+// measurement, where the truth is that nothing measured it. A code this ABI does not define is FC_ERR_ENUM.
+//
+// `out` is stamped by the CALLER like every other OUT struct, and is written only on FC_OK.
+fc_status fc_solution_gr_active_stats (fc_solution s, int32_t stage, fc_gr_active_stats* out);
 fc_status fc_solution_measurement (fc_solution s, fc_measurement* out);
 // Copies min(logCount, cap) pass records into `out` and reports how many were written. Same ownership
 // rule as everywhere else here: the buffer is the caller's and its capacity is binding.

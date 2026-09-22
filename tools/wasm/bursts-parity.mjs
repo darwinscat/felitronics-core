@@ -5,6 +5,8 @@
 //   fcore_measure bursts 48000 2 x.f32                          > native.txt
 //   node bursts-parity.mjs build/fcprobe.node.js 48000 2 x.f32   > wasm.txt
 //   diff native.txt wasm.txt
+// The six K3 flags are accepted after the file on both roads, with the same names, the same defaults and
+// the same refusals: --band-low --band-high --hop-ms --baseline-ms --enter-db --exit-db.
 // No HEAP view is held across a call into the module: every prepare() here allocates, so memory.grow can
 // fire inside _run and a view taken before it would then address freed memory.
 
@@ -34,6 +36,44 @@ const rateOf = s => {
 const sr = rateOf(srArg), ch = count(chArg, 'channels');
 if (ch < 1 || ch > 16) refuse(`bad channels: ${chArg}`);
 
+// K3 — THE BAND AS AN ARGUMENT, and the grammar is fcore_measure's `parseFinite`, not `rateOf`: a threshold
+// in dB is legitimately 0 or negative, so only "finite" is required. Same strictness otherwise — the whole
+// string must be the number — and the same residual as the rate above: strtod also reads C99 hex floats,
+// which are refused here and accepted natively, loudly (exit 2, no output) rather than silently.
+// A FLAG WITHOUT ITS VALUE IS A REFUSAL on both roads; leaving the default standing would measure one thing
+// while the operator believes it asked for another.
+const finiteOf = (s2, name) => {
+    if (!/^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/.test(s2)) refuse(`bad ${name}: ${s2}`);
+    const v = Number(s2);
+    if (!Number.isFinite(v)) refuse(`bad ${name}: ${s2}`);
+    return v;
+};
+// These are BandBurstsParams' documented defaults, repeated because the module publishes no reader for
+// them. The repetition is not unguarded: with one flag given, the other five ride on these values and the
+// native run rides on the C++ ones, and the scalar block prints all six — so a drift between the two lists
+// shows up as a DIFF on the first line of the output, which is what this harness is for.
+const P = { '--band-low': 5000, '--band-high': 9000, '--hop-ms': 10, '--baseline-ms': 2000,
+            '--enter-db': 6, '--exit-db': 3 };
+let parameterised = false;
+{
+    const rest = process.argv.slice(6);
+    for (let i = 0; i < rest.length; ++i) {
+        if (Object.prototype.hasOwnProperty.call(P, rest[i])) {
+            if (i + 1 >= rest.length) refuse(`bursts: ${rest[i]} needs a finite number`);
+            P[rest[i]] = finiteOf(rest[i + 1], rest[i]);
+            parameterised = true;
+            ++i;
+            continue;
+        }
+        // A NAME NOBODY KNOWS IS A REFUSAL, on this road too and with the same exit. Both roads used to skip
+        // an unrecognised option in silence, so `--band-lo 80` measured the DEFAULT band at exit 0 on both —
+        // byte-identical, and therefore invisible to the very diff that is supposed to catch a divergence.
+        // The refusal sets are half of parity, and a hole present in both halves is not covered by either.
+        if (rest[i].startsWith('--') && rest[i] !== '--precise')
+            refuse(`bursts: unknown option ${rest[i]} (want ${Object.keys(P).join(' ')})`);
+    }
+}
+
 const require = createRequire(import.meta.url);
 const M = await require(resolve(modPath))();
 
@@ -49,7 +89,10 @@ for (let c = 0; c < ch; ++c) for (let i = 0; i < frames; ++i) planar[c * frames 
 const ptr = M._malloc(planar.length * 4);
 if (!ptr) refuse('wasm OOM on the input');
 M.HEAPF32.set(planar, ptr >>> 2);
-const ok = M._fc_probe_bursts_run(ptr, frames, ch, sr) === 1;
+const ok = (parameterised
+    ? M._fc_probe_bursts_run_with(ptr, frames, ch, sr, P['--band-low'], P['--band-high'],
+                                  P['--hop-ms'], P['--baseline-ms'], P['--enter-db'], P['--exit-db'])
+    : M._fc_probe_bursts_run(ptr, frames, ch, sr)) === 1;
 M._free(ptr);
 // A refused run exits 2, as fcore_measure does. Exiting 0 with empty output would tell a caller the
 // measurement succeeded and produced nothing — and the refusals are half of what parity means: a byte

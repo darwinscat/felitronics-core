@@ -137,6 +137,7 @@ const STRUCTS = {
         ['activityThresholdDb', 'f64'], ['maxPasses', 'i32'], ['initialGainDb', 'f64'],
         ['grTraceBuckets', 'i32'], ['_pad0', 'i32'],            // v6
         ['limiterGrQuantile', 'f64'], ['compressorGrQuantile', 'f64'],   // v8
+        ['limiterActiveInputDb', 'f64'],                                 // v10 — K11's gate, dBFS
     ],
 
     fc_solve_pass: [
@@ -160,6 +161,14 @@ const STRUCTS = {
         ['nonFiniteSubHops', 'i32'], ['loudnessValid', 'i32'], ['lraValid', 'i32'],
         ['compressorGrTraceBuckets', 'i32'], ['limiterGrTraceBuckets', 'i32'],            // v4
         ['compressorGrTraceValid', 'i32'], ['limiterGrTraceValid', 'i32'],                // v4
+    ],
+
+    // v10 — `_fc_solution_gr_active_stats`: the limiter's statistics over the windows its INPUT reached the gate.
+    // `stats` is the same frozen fc_gr_stats, every field of it over the accepted windows only.
+    fc_gr_active_stats: [
+        ['header', 'fc_header'],
+        ['stats', 'fc_gr_stats'],
+        ['windows', 'u64'], ['activeWindows', 'u64'], ['thresholdDb', 'f64'],
     ],
 
     // v4 — one bucket of `_fc_solution_gr_trace`, header-less (read with a stride of its size, like fc_solve_pass).
@@ -191,6 +200,7 @@ const STRUCTS = {
 export const STRUCT_IDS = {
     fc_master_config: 0, fc_master_params: 1, fc_master_resolved: 2, fc_master_stats: 3,
     fc_need: 4, fc_loudness_request: 5, fc_measurement: 6, fc_solution_summary: 7,
+    fc_gr_active_stats: 8,
 };
 
 export const structNames = () => Object.keys(STRUCTS);
@@ -337,7 +347,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 8;
+export const FC_MASTER_ABI_VERSION = 10;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
@@ -516,7 +526,7 @@ export const FC_DOMAINS = [
 
     // ── fc_master_params.clipper ──────────────────────────────────────────────────────────────────
     { field: 'fc_master_params.clipper.shape', unit: 'enum:FC_SHAPE', min: 0, max: 3, open: '', edge: 'refuse', err: 'FC_ERR_ENUM', nonFinite: 'none', resolved: '', depends: '' },
-    { field: 'fc_master_params.clipper.driveDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'the drive the shaper runs is dbToGain(driveDb) - 1 floored at 1e-4, so every value at or below 0.00087 dB is the same linear stage' },
+    { field: 'fc_master_params.clipper.driveDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: 'the drive the shaper runs is dbToGain(driveDb) - 1 floored at 1e-4, so every driveDb at or below 20*log10(1 + 1e-4) = 8.685455e-4 dB is the same linear stage. The figure this row used to give, 0.00087, is that threshold ROUNDED THE WRONG WAY: 8.7e-4 is past it, so the value the row named as identical to zero drive already renders differently. A threshold in prose rounds toward the safe side or not at all. NB the floored stage is still not a BYPASSED one — it runs the oversampler round trip; only bypassClipper skips that, and clipper.mix = 0 does not (see MasteringChain.h)' },
     { field: 'fc_master_params.clipper.bias', unit: 'fraction', min: -0.95, max: 0.95, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: 'clipper.shape: read only by Asym' },
     { field: 'fc_master_params.clipper.mix', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'render', depends: '' },
     { field: 'fc_master_params.clipper.outputDb', unit: 'dB', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'refuse', resolved: '', depends: '' },
@@ -558,6 +568,7 @@ export const FC_DOMAINS = [
     { field: 'fc_loudness_request.grTraceBuckets', unit: 'count', min: 1, max: 65536, open: '', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'none', resolved: '', depends: 'the trace actually built has min(this, programme frames) buckets' },
     { field: 'fc_loudness_request.limiterGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'admitted WHATEVER the statistic is, so a 0 here is refused even when the limit does not read it' },
     { field: 'fc_loudness_request.compressorGrQuantile', unit: 'fraction', min: 0, max: 1, open: 'min', edge: 'verdict', err: 'FC_SOLVE_INVALID_REQUEST', nonFinite: 'verdict', resolved: '', depends: 'as limiterGrQuantile' },
+    { field: 'fc_loudness_request.limiterActiveInputDb', unit: 'dBFS', min: null, max: null, open: '', edge: 'free', err: '', nonFinite: 'off', resolved: '', depends: 'K11. The gate on the LIMITER INPUT for fc_solution_gr_active_stats, at the limiter node (after preLimiterGainDb). Decides nothing the solver judges — every limit still reads the ungated distribution. Not clamped and not refused: -inf accepts every window that carried any non-zero input, +inf accepts none, and a NaN accepts NOTHING — the narrowest reading, so a mistake announces itself through activeWindows == 0, valid == 0 and the NaN echoed back in thresholdDb, instead of passing for a measurement at a gate nobody chose. `off` is the nearest word this vocabulary has and its prose is looser than the truth: a non-finite value is ADMITTED and each one means something, rather than one of them switching the field off. Default -60' },
 ];
 
 // A bound of FC_DOMAINS at a given CHAIN sample rate and oversample factor: a number passes through, `null`

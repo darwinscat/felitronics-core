@@ -177,6 +177,18 @@ namespace
         return true;
     }
 
+    // A FINITE double, sign and zero allowed — `parseRate` insists on positive, which is right for a rate and
+    // wrong for a threshold in dB, where 0 and a negative value are both ordinary. Same strictness otherwise:
+    // the whole string must be the number, so "6dB" is refused rather than read as 6.
+    bool parseFinite (const char* s, double& out)
+    {
+        char* end = nullptr;
+        const double v = std::strtod (s, &end);
+        if (end == s || *end != '\0' || ! std::isfinite (v)) return false;
+        out = v;
+        return true;
+    }
+
     // A whole non-negative decimal integer, nothing else — `atoi("12x")` would read 12.
     bool parseCount (const std::string& s, std::uint64_t& out)
     {
@@ -781,13 +793,62 @@ int main (int argc, char** argv)
         // later wasm comparison catches a flipped bit that decimal printing would round away. The
         // histograms print only their NON-ZERO bins, which is a complete description of an integer
         // histogram and keeps a quiet file's output short.
+        // K3 — THE BAND IS AN ARGUMENT NOW, and it has to be one HERE as well as in the wasm ABI. A road the
+        // parity harness cannot drive is a road with no gate: `fc_probe_bursts_run_with` would have shipped
+        // with its only evidence being that it compiles. Every flag is optional and defaults to the documented
+        // value, so a command written before this still produces the same bytes.
         analysis::BandBursts det;
-        const analysis::BandBurstsParams bp;              // the documented defaults
+        analysis::BandBurstsParams bp;                    // the documented defaults, unless a flag moves one
+        {
+            struct Flag { const char* name; double* into; };
+            const Flag flags[] = {
+                { "--band-low",    &bp.bandLowHz },  { "--band-high",  &bp.bandHighHz },
+                { "--hop-ms",      &bp.hopMs },      { "--baseline-ms", &bp.baselineMs },
+                { "--enter-db",    &bp.enterDb },    { "--exit-db",    &bp.exitDb },
+            };
+            for (int i = 5; i < argc; ++i)
+            {
+                const Flag* hit = nullptr;
+                for (const Flag& fl : flags) if (std::strcmp (argv[i], fl.name) == 0) { hit = &fl; break; }
+                if (hit != nullptr)
+                {
+                    // A FLAG WITHOUT ITS VALUE IS A REFUSAL, not a silently kept default: `--enter-db` at the
+                    // end of a command line would otherwise measure at 6 dB while the operator believes it
+                    // set something. The same reasoning as the strict parse above.
+                    if (i + 1 >= argc || ! parseFinite (argv[i + 1], *hit->into))
+                    {
+                        std::fprintf (stderr, "bursts: %s needs a finite number\n", hit->name);
+                        std::fclose (f);
+                        return 2;
+                    }
+                    ++i;            // the value is consumed; it must not be read as a name on the next turn
+                    continue;
+                }
+                // AND A NAME NOBODY KNOWS IS A REFUSAL TOO. Without this the first version of the loop simply
+                // did not match `--band-lo` and measured the DEFAULT 5-9 kHz band at exit 0, while the operator
+                // read the command line and believed it had asked for 80 Hz. A typo that measures the wrong
+                // thing silently is worse than one that measures nothing, and this is the same argument that
+                // made a flag without its value a refusal — it was just applied to half the cases.
+                if (std::strncmp (argv[i], "--", 2) == 0 && std::strcmp (argv[i], "--precise") != 0)
+                {
+                    std::fprintf (stderr, "bursts: unknown option %s (want --band-low --band-high --hop-ms "
+                                          "--baseline-ms --enter-db --exit-db)\n", argv[i]);
+                    std::fclose (f);
+                    return 2;
+                }
+            }
+        }
         det.setParams (bp);
         if (! det.prepare (fs, kChunk, nc))
         {
-            std::fprintf (stderr, "bursts: prepare refused this configuration — the default 5-9 kHz band "
-                                  "needs a sample rate above 18368 Hz (0.49 fs must clear 9 kHz)\n");
+            // EVERY VALUE THE CORE JUDGED, not a guess at which one it disliked. The first version of this
+            // named the band and the baseline, so `--enter-db 0` — refused because a threshold must be
+            // positive and at least the exit one — reported a band problem that did not exist. The core
+            // does not say which bound it hit; the honest thing is to print what it was handed.
+            std::fprintf (stderr, "bursts: prepare refused this configuration — band %g-%g Hz (0.49 fs must "
+                                  "clear the top corner), hop %g ms, baseline %g ms (>= one hop), "
+                                  "enter %g dB (> 0), exit %g dB (0 <= exit <= enter), at %g Hz\n",
+                          bp.bandLowHz, bp.bandHighHz, bp.hopMs, bp.baselineMs, bp.enterDb, bp.exitDb, fs);
             std::fclose (f);
             return 2;
         }
@@ -831,9 +892,10 @@ int main (int argc, char** argv)
                          e.touchedNonFinite ? 1 : 0, e.baselineTouchedNonFinite ? 1 : 0,
                          e.closedByFinish ? 1 : 0);
         }
-        std::printf ("onsets %lld %lld %lld %d %lld\n", (long long) det.onsetCount(),
+        std::printf ("onsets %lld %lld %lld %d %lld %016llx\n", (long long) det.onsetCount(),
                      (long long) det.intervalCount(), (long long) det.intervalOverflow(),
-                     det.modalIntervalHops(), (long long) det.modalIntervalMass());
+                     det.modalIntervalHops(), (long long) det.modalIntervalMass(),
+                     (unsigned long long) bits (det.onsetsPerSecond()));
         for (int b = 1; b <= analysis::BandBursts::kIoiBins; ++b)
             if (det.intervalBin (b) != 0) std::printf ("ioi %d %lld\n", b, (long long) det.intervalBin (b));
         for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)

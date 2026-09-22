@@ -50,6 +50,34 @@ class LaneDynamics
 public:
     static constexpr int kControl = 16;      // samples between delta updates (~0.33 ms at 48 k)
 
+    // THE PROBE'S RAILS, PUBLISHED — because a second copy of them is a second answer. A lane's freq/Q
+    // reach this class RAW (MasteringChain hands the producers the caller's band parameters, not the
+    // band's clamped copy), so what the ballistics describe is not `lp.freq`/`lp.Q` but these two
+    // functions of them, and a reader that asked `BandBallistics` with the raw pair would describe a
+    // filter this class is not running: at 5 Hz it answers for 5 Hz where the probe sits at 10.
+    // `setParams` and every reader call THESE, so there is one place where the rails live.
+    [[nodiscard]] static double probeFreqFor (double fs, double f) noexcept
+    {
+        const double rate = (std::isfinite (fs) && fs > 0.0) ? fs : 48000.0;
+        return std::clamp (std::isfinite (f) ? f : 1000.0, 10.0, 0.49 * rate);
+    }
+
+    [[nodiscard]] static double probeQFor (double q) noexcept
+    {
+        return std::clamp (std::isfinite (q) ? q : 1.0, 0.05, 40.0);
+    }
+
+    // What this class WOULD set on a lane's gain follower for that lane's raw freq/Q and the point's
+    // deviation knobs — the same expression `setParams` runs, so a readback cannot drift from the audio.
+    // The knobs are NOT clamped here: `BandBallistics` sanitises them itself (non-finite -> auto), and
+    // doing it twice would mean two rails to keep in step.
+    [[nodiscard]] static dynamics::BandBallistics::Times ballisticsFor (double fs, double laneFreqHz, double laneQ,
+                                                                        double attackKnob, double releaseKnob) noexcept
+    {
+        return dynamics::BandBallistics::compute (fs, probeFreqFor (fs, laneFreqHz), probeQFor (laneQ),
+                                                  attackKnob, releaseKnob);
+    }
+
     [[nodiscard]] bool prepare (double sampleRate, int maxChannels) noexcept
     {
         // LAW 11(b): DISARM first, validate, then write. Validating first meant returning before the
@@ -113,14 +141,13 @@ public:
                 const double f = probeFreq (lp.freq), q = probeQ (lp.Q);
                 s.probe.setParams (eq::FilterType::BandPass, f, q, 0.0);
                 s.rel.retuned();
-                const auto t = dynamics::BandBallistics::compute (fs_, f, q, p.dyn.atk, p.dyn.rel);
+                const auto t = ballisticsFor (fs_, lp.freq, lp.Q, p.dyn.atk, p.dyn.rel);
                 s.gr.setTimes (t.attackMs, t.releaseMs);
                 s.freq = lp.freq; s.Q = lp.Q;   // raw, so retune detection tracks what the caller sent
             }
             else if (! nearlyEqual (p.dyn.atk, dynAtk_) || ! nearlyEqual (p.dyn.rel, dynRel_))
             {
-                const auto t = dynamics::BandBallistics::compute (fs_, probeFreq (lp.freq), probeQ (lp.Q),
-                                                                  p.dyn.atk, p.dyn.rel);
+                const auto t = ballisticsFor (fs_, lp.freq, lp.Q, p.dyn.atk, p.dyn.rel);
                 s.gr.setTimes (t.attackMs, t.releaseMs);
             }
 
@@ -293,14 +320,10 @@ private:
     // The SAME rails eq::EqBand applies to itself, so the detector, the ballistics and the filter can
     // never describe three different bands — and so a NaN freq cannot reach tan() and poison the
     // follower permanently (env = in + c*(env-in) never recovers from NaN).
-    double probeFreq (double f) const noexcept
-    {
-        return std::clamp (std::isfinite (f) ? f : 1000.0, 10.0, 0.49 * fs_);
-    }
-    static double probeQ (double q) noexcept
-    {
-        return std::clamp (std::isfinite (q) ? q : 1.0, 0.05, 40.0);
-    }
+    // The instance spellings of the published rails — the probe's own setParams reads them, and they
+    // are the SAME functions, not a copy that happens to agree today.
+    double probeFreq (double f) const noexcept { return probeFreqFor (fs_, f); }
+    static double probeQ (double q) noexcept   { return probeQFor (q); }
 
     // WHAT A PARK DOES TO THE PROGRAMME ESTIMATE. `rel` is the lane's picture of its own recent norm, and
     // a parked lane cannot see the programme move. Keeping the picture and discarding it are BOTH wrong,
