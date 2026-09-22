@@ -18,6 +18,7 @@
 
 #include "fc_master_abi.h"
 
+#include <felitronics/dynamiceq/LaneDynamics.h>
 #include <felitronics/eq/EqEngine.h>
 #include <felitronics/mastering/DeliveredMastering.h>
 #include <felitronics/mastering/LoudnessSolver.h>
@@ -1540,6 +1541,44 @@ FC_EXPORT fc_status fc_master_eq_curve (const fc_master_params* params, double s
     for (std::uint32_t i = 0; i < count; ++i)
         outDb[i] = eq::EqEngine::magnitudeDbFor (bands, numBands, freqHz[i], sampleRate, axis);
     *written = count;
+    return FC_OK;
+}
+
+FC_EXPORT fc_status fc_master_eq_dyn_times (const fc_master_params* params, double sampleRate,
+                                            std::int32_t band, std::int32_t lane,
+                                            double* attackMsOut, double* releaseMsOut)
+{
+    FC_GUARD;
+    if (const fc_status st = checkScalarOut (attackMsOut);  st != FC_OK) return st;
+    if (const fc_status st = checkScalarOut (releaseMsOut); st != FC_OK) return st;
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (params, bytes); st != FC_OK) return st;
+    // NO TWO OF THE THREE MAY TOUCH, and the pair that is not a matter of taste is an output inside `params`:
+    // the store that writes the attack would land in the caller's `const` parameter set BEFORE the release is
+    // read out of it, and the second number would then describe a band this call had just rewritten.
+    if (aliasesSpan (attackMsOut,  sizeof (*attackMsOut),  releaseMsOut, sizeof (*releaseMsOut))) return FC_ERR_SPAN;
+    if (aliasesSpan (attackMsOut,  sizeof (*attackMsOut),  params, bytes)) return FC_ERR_SPAN;
+    if (aliasesSpan (releaseMsOut, sizeof (*releaseMsOut), params, bytes)) return FC_ERR_SPAN;
+
+    if (band < 0 || band >= FC_MAX_EQ_BANDS) return FC_ERR_RANGE;
+    if (lane < 0 || lane >= FC_MAX_EQ_LANES) return FC_ERR_RANGE;
+    if (! fin (sampleRate)) return FC_ERR_NON_FINITE;
+    // REFUSED, NOT SUBSTITUTED. The core reads a rate it cannot use as 48000, which is right where it sits —
+    // `prepare` has already refused such a rate before any of it runs. Nothing has refused anything here, so
+    // substituting would answer a question the caller did not ask, in a number indistinguishable from one it did.
+    if (! (sampleRate >= core::kMinSampleRate)) return FC_ERR_REFUSED_BY_CORE;
+
+    MasteringChainParams cp {};
+    if (const fc_status st = toCore (loadIn (params, bytes), cp); st != FC_OK) return st;
+
+    // THE CHAIN'S OWN EXPRESSION, not a copy of it: `MasteringChain` hands the producers the CALLER's band
+    // parameters and each producer applies its own rails (MasteringChain::setParams), so the rails are part of
+    // the answer and they live in exactly one place — that class.
+    const eq::BandParams& b  = cp.eqBands[band];
+    const eq::LaneParams& lp = b.lanes[(std::size_t) lane];
+    const auto t = dynamiceq::LaneDynamics::ballisticsFor (sampleRate, lp.freq, lp.Q, b.dyn.atk, b.dyn.rel);
+    *attackMsOut  = t.attackMs;
+    *releaseMsOut = t.releaseMs;
     return FC_OK;
 }
 

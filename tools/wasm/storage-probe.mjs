@@ -73,6 +73,25 @@ if (cmd === 'table') {
 let checks = 0, bad = 0;
 const ok = (cond, what) => { ++checks; if (!cond) { ++bad; console.error(`FAIL: ${what}`); } };
 
+// K3 — the PARAMETERISED bursts price, which has a different arity and so cannot be a row of the table
+// above. It still needs a gate on the artifact: the failure that matters is the name not reaching the
+// module at all, and after that, the two claims the native suite makes about it. Same shape as the rest
+// of this file, and it runs before the table's own checks because it touches nothing they read.
+{
+    const qw = M._fc_probe_bursts_storage_bytes_with;
+    if (typeof qw !== 'function')
+        refuse(`_fc_probe_bursts_storage_bytes_with is ${typeof qw} on this module — it did not reach the artifact`);
+    if (typeof M._fc_probe_bursts_run_with !== 'function')
+        refuse(`_fc_probe_bursts_run_with is ${typeof M._fc_probe_bursts_run_with} on this module`);
+    const dflt = M._fc_probe_bursts_storage_bytes(2, 48000);
+    ok(qw(2, 48000, 5000, 9000, 10, 2000, 6, 3) === dflt,
+       'bursts: the parameterised price at the documented defaults is the default price');
+    ok(qw(2, 48000, 5000, 9000, 10, 8000, 6, 3) > dflt,
+       'bursts: a four-times-longer baseline costs more than the default');
+    ok(qw(2, 48000, 20000, 30000, 10, 2000, 6, 3) === 0,
+       'bursts: a band the run refuses is priced at the canonical zero');
+}
+
 // A real, non-empty programme: `lowend` refuses an empty one where the other four report on it, and the
 // equivalence below is about GEOMETRY, so it must not be confounded with an input-contract refusal.
 const FRAMES = 512, WIDEST = 16;

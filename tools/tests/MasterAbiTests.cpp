@@ -1866,35 +1866,38 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 8u, "PRECONDITION: this group is written for v8 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+        ok (kCur == 9u, "PRECONDITION: this group is written for v9 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
                         "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
                         "v7: fc_master_eq_curve, no struct grew; v8: the request's two quantiles and "
-                        "fc_solution_gr_quantile)");
+                        "fc_solution_gr_quantile; v9: fc_master_eq_dyn_times, no struct grew)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 3) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 4) == 88u
             && fc_master_sizeof (FC_STRUCT_CONFIG, 5) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 6) == 88u
-            && fc_master_sizeof (FC_STRUCT_CONFIG, 7) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 8) == 88u,
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 7) == 88u && fc_master_sizeof (FC_STRUCT_CONFIG, 8) == 88u
+            && fc_master_sizeof (FC_STRUCT_CONFIG, 9) == 88u,
             "config: 80 at v1, 88 from v2");
         ok (fc_master_sizeof (FC_STRUCT_PARAMS, 1) == 6560u && fc_master_sizeof (FC_STRUCT_PARAMS, 2) == 6560u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 3) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 4) == 6568u
             && fc_master_sizeof (FC_STRUCT_PARAMS, 5) == 6568u && fc_master_sizeof (FC_STRUCT_PARAMS, 6) == 6584u
-            && fc_master_sizeof (FC_STRUCT_PARAMS, 7) == 6584u && fc_master_sizeof (FC_STRUCT_PARAMS, 8) == 6584u,
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 7) == 6584u && fc_master_sizeof (FC_STRUCT_PARAMS, 8) == 6584u
+            && fc_master_sizeof (FC_STRUCT_PARAMS, 9) == 6584u,
             "params: 6560 at v1 and v2, 6568 from v3, 6584 from v6");
         ok (fc_master_sizeof (FC_STRUCT_RESOLVED, 1) == 80u && fc_master_sizeof (FC_STRUCT_RESOLVED, 2) == 80u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 3) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 4) == 88u
             && fc_master_sizeof (FC_STRUCT_RESOLVED, 5) == 88u && fc_master_sizeof (FC_STRUCT_RESOLVED, 6) == 96u
-            && fc_master_sizeof (FC_STRUCT_RESOLVED, 7) == 96u && fc_master_sizeof (FC_STRUCT_RESOLVED, 8) == 96u,
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 7) == 96u && fc_master_sizeof (FC_STRUCT_RESOLVED, 8) == 96u
+            && fc_master_sizeof (FC_STRUCT_RESOLVED, 9) == 96u,
             "resolved: 80 at v1 and v2, 88 from v3, 96 from v6");
         ok (fc_master_sizeof (FC_STRUCT_MEASUREMENT, 1) == 208u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 3) == 208u
             && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 4) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 5) == 224u
             && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 6) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 7) == 224u
-            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 8) == 224u,
+            && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 8) == 224u && fc_master_sizeof (FC_STRUCT_MEASUREMENT, 9) == 224u,
             "measurement: 208 to v3, 224 from v4 — the trace's four fields");
         ok (fc_master_sizeof (FC_STRUCT_REQUEST, 1) == 120u && fc_master_sizeof (FC_STRUCT_REQUEST, 5) == 120u
             && fc_master_sizeof (FC_STRUCT_REQUEST, 6) == 128u && fc_master_sizeof (FC_STRUCT_REQUEST, 7) == 128u
-            && fc_master_sizeof (FC_STRUCT_REQUEST, 8) == 144u,
+            && fc_master_sizeof (FC_STRUCT_REQUEST, 8) == 144u && fc_master_sizeof (FC_STRUCT_REQUEST, 9) == 144u,
             "request: 120 to v5, 128 from v6 — `grTraceBuckets` and its named padding — 144 from v8, the two quantiles");
         int inherit = 0;
         for (int id = FC_STRUCT_STATS; id <= FC_STRUCT_SUMMARY; ++id)
@@ -1919,6 +1922,7 @@ int main()
             { 6u, 88u, FC_OK,              "v6 at 88 bytes — nor at v6" },
             { 7u, 88u, FC_OK,              "v7 at 88 bytes — nor at v7" },
             { 8u, 88u, FC_OK,              "v8 at 88 bytes — nor at v8" },
+            { 9u, 88u, FC_OK,              "v9 at 88 bytes — nor at v9" },
             { 1u, 88u, FC_ERR_STRUCT_SIZE, "v1 claiming v2's size" },
             { 2u, 80u, FC_ERR_STRUCT_SIZE, "v2 claiming v1's size" },
             { 0u, 80u, FC_ERR_ABI_VERSION, "version 0" },
@@ -3657,6 +3661,446 @@ int main()
             old.header.abiVersion = 1u; old.header.structSize = 6560u;
             ok (ask (old, FC_EQ_AXIS_LEFT, -1) == FC_OK && written == nf && worstAgainst (axisCurve[1]) <= 0.0,
                 "a v1-stamped parameter set answers the same bits");
+        }
+    }
+
+    //==========================================================================
+    // v9 — fc_master_eq_dyn_times. The knobs are DEVIATIONS around a value nothing publishes, so this call is the
+    // only way to read what the follower is set to. What makes the group worth writing is the ORACLE: `times()`
+    // below is the arithmetic of BandBallistics' HEADER PROSE, re-derived, not a second call into the class — and
+    // it simplifies where the class does not (the band's tau is `ringMs/ln9`, and the ln9 cancels), so agreement
+    // is two constructions meeting rather than one object agreeing with itself.
+    group ("v9: fc_master_eq_dyn_times — the milliseconds behind a deviation knob");
+    {
+        constexpr double kLn9 = 2.1972245773362196;
+
+        // THE ORACLE, from BandBallistics.h's prose: the digital-bandwidth ring, the period floor, the auto rails,
+        // the 2^((knob-0.5)*4) deviation, the absolute rails, and release never shorter than attack. The lane rails
+        // in front of it are LaneDynamics' ([10, 0.49*fs] and [0.05, 40]), which is the pair the chain applies.
+        auto times = [&] (double fs, double laneF, double laneQ, double atkKnob, double relKnob)
+        {
+            auto fin  = [] (double v, double fb) { return std::isfinite (v) ? v : fb; };
+            const double fc = std::clamp (fin (laneF, 1000.0), 10.0, 0.49 * fs);
+            const double Q  = std::clamp (fin (laneQ, 1.0), 0.05, 40.0);
+            const double tauBandMs = 2.0e3 * Q / (fs * std::sin (2.0 * felitronics::core::kPi * fc / fs));
+            const double period    = 2.5 * 1.0e3 / fc;
+            const double atkAuto   = std::clamp (std::max (0.35 * tauBandMs, period), 1.0, 300.0);
+            const double relAuto   = std::clamp (3.0 * atkAuto, 12.0, 500.0);
+            auto mult = [&] (double k) { return std::pow (2.0, (std::clamp (fin (k, 0.5), 0.0, 1.0) - 0.5) * 4.0); };
+            const double atk = std::clamp (atkAuto * mult (atkKnob), 0.2, 1000.0);
+            double       rel = std::clamp (relAuto * mult (relKnob), 3.0, 1000.0);
+            rel = std::max (rel, atk);
+            return std::pair<double, double> { atk, rel };
+        };
+
+        // A parameter set with ONE point whose lanes sit apart on purpose: lane 0 low, lane 1 high, so "per lane,
+        // not per band" is a measurable claim rather than a sentence in the header.
+        auto dynParams = [&] (double f0, double q0, double f1, double q1, double atk, double rel)
+        {
+            fc_master_params p = goodParams();
+            p.eqBands[3].on = 1;
+            p.eqBands[3].lanes[0].on = 1; p.eqBands[3].lanes[0].freq = f0; p.eqBands[3].lanes[0].q = q0;
+            p.eqBands[3].lanes[1].on = 1; p.eqBands[3].lanes[1].freq = f1; p.eqBands[3].lanes[1].q = q1;
+            p.eqBands[3].dyn.on = 1; p.eqBands[3].dyn.rangeDb = -6.0;
+            p.eqBands[3].dyn.atk = atk; p.eqBands[3].dyn.rel = rel;
+            return p;
+        };
+
+        double gotA = -1.0, gotR = -1.0;
+        auto ask = [&] (const fc_master_params& p, double fs, std::int32_t band, std::int32_t lane)
+        {
+            gotA = -1.0; gotR = -1.0;
+            return fc_master_eq_dyn_times (&p, fs, band, lane, &gotA, &gotR);
+        };
+        auto agrees = [&] (double wantA, double wantR)
+        {
+            const double ea = std::fabs (gotA - wantA) / std::max (1.0, std::fabs (wantA));
+            const double er = std::fabs (gotR - wantR) / std::max (1.0, std::fabs (wantR));
+            return ea <= 1.0e-12 && er <= 1.0e-12;
+        };
+
+        // ---- THE VALUE, against the oracle, over the rates and the shapes the product actually asks for ----
+        {
+            struct Row { double fs, f, q, atk, rel; const char* what; };
+            const Row rows[] = {
+                { 48000.0,  7000.0,  4.0, 0.5, 0.5, "a de-esser at 7 kHz, both knobs on auto" },
+                { 48000.0,   120.0,  1.0, 0.5, 0.5, "a boom tamer at 120 Hz" },
+                { 48000.0,   250.0,  0.7, 0.0, 1.0, "fastest attack, slowest release — the knobs at their ends" },
+                { 44100.0, 16000.0, 40.0, 0.5, 0.5, "near Nyquist at the highest Q the EQ admits" },
+                { 96000.0,    30.0,  0.3, 0.2, 0.8, "a wide low point at 96 kHz" },
+                {  8000.0,  3000.0,  2.0, 0.5, 0.5, "the lowest rate a chain will run at" },
+                { 192000.0,  9000.0, 12.0, 0.9, 0.1, "a high rate, and a release knob FASTER than its attack" },
+            };
+            int bad = 0;
+            for (const Row& r : rows)
+            {
+                const fc_master_params p = dynParams (r.f, r.q, 1000.0, 1.0, r.atk, r.rel);
+                const auto want = times (r.fs, r.f, r.q, r.atk, r.rel);
+                if (! (ask (p, r.fs, 3, 0) == FC_OK && agrees (want.first, want.second))) { ++bad; }
+                ok (ask (p, r.fs, 3, 0) == FC_OK && agrees (want.first, want.second),
+                    std::string (r.what) + ": " + std::to_string (gotA) + " / " + std::to_string (gotR) + " ms");
+            }
+            ok (bad == 0, "every row met the independently derived oracle");
+        }
+
+        // ---- RELEASE IS NEVER SHORTER THAN ATTACK, knobs notwithstanding — the last line of compute() ----
+        {
+            const fc_master_params p = dynParams (9000.0, 12.0, 1000.0, 1.0, 1.0, 0.0);
+            ok (ask (p, 48000.0, 3, 0) == FC_OK && gotR >= gotA,
+                "attack knob at its slowest and release at its fastest still leaves release >= attack");
+        }
+
+        // ---- PER LANE, NOT PER BAND. Same `dyn`, two lanes, two answers — and that is the contract's surprise ----
+        {
+            const fc_master_params p = dynParams (120.0, 1.0, 9000.0, 8.0, 0.5, 0.5);
+            const auto w0 = times (48000.0, 120.0, 1.0, 0.5, 0.5);
+            const auto w1 = times (48000.0, 9000.0, 8.0, 0.5, 0.5);
+            const bool l0 = ask (p, 48000.0, 3, 0) == FC_OK && agrees (w0.first, w0.second);
+            const double a0 = gotA;
+            const bool l1 = ask (p, 48000.0, 3, 1) == FC_OK && agrees (w1.first, w1.second);
+            ok (l0 && l1 && std::fabs (a0 - gotA) > 1.0e-9,
+                "one point's two lanes answer their own times — the shared `dyn` does not make them one number");
+        }
+
+        // ---- A LANE THAT IS OFF, AND A BAND THAT IS OFF OR BYPASSED, ARE ANSWERED ANYWAY. The core computes a
+        // lane's ballistics whatever its switch says (LaneDynamics::setParams loops over every lane), so a refusal
+        // here would be this facade inventing a rule the audio does not have.
+        {
+            fc_master_params p = dynParams (3000.0, 2.0, 500.0, 1.0, 0.5, 0.5);
+            const auto want = times (48000.0, 500.0, 1.0, 0.5, 0.5);
+            p.eqBands[3].lanes[1].on = 0;
+            const bool offLane = ask (p, 48000.0, 3, 1) == FC_OK && agrees (want.first, want.second);
+            p.eqBands[3].on = 0; p.eqBands[3].bypass = 1;
+            const bool offBand = ask (p, 48000.0, 3, 1) == FC_OK && agrees (want.first, want.second);
+            ok (offLane && offBand, "an off lane, and an off and bypassed band, answer the times they would run at");
+        }
+
+        // ---- THE RAILS ARE VISIBLE IN THE ANSWER, which is the whole point of a readback. A caller that wrote
+        // MILLISECONDS into a knob reads back the slow rail — the failure the site had, made legible.
+        {
+            const fc_master_params ms   = dynParams (4000.0, 3.0, 1000.0, 1.0, 50.0, 250.0);   // ms into a knob
+            const fc_master_params rail = dynParams (4000.0, 3.0, 1000.0, 1.0,  1.0,   1.0);
+            const bool a = ask (ms, 48000.0, 3, 0) == FC_OK;
+            const double msA = gotA, msR = gotR;
+            const bool b = ask (rail, 48000.0, 3, 0) == FC_OK;
+            ok (a && b && std::fabs (msA - gotA) <= 0.0 && std::fabs (msR - gotR) <= 0.0,
+                "50 and 250 written into the knobs read back as the SLOW rail, bit for bit — not as 50 and 250 ms");
+
+            const fc_master_params below = dynParams (4000.0, 3.0, 1000.0, 1.0, -3.0, -3.0);
+            const fc_master_params zero  = dynParams (4000.0, 3.0, 1000.0, 1.0,  0.0,  0.0);
+            const bool c = ask (below, 48000.0, 3, 0) == FC_OK;
+            const double loA = gotA, loR = gotR;
+            const bool d = ask (zero, 48000.0, 3, 0) == FC_OK;
+            ok (c && d && std::fabs (loA - gotA) <= 0.0 && std::fabs (loR - gotR) <= 0.0,
+                "a knob below 0 reads back as 0 — the fast rail");
+        }
+
+        // ---- THE LANE'S OWN RAILS, and they are LaneDynamics', not BandBallistics' wider pair. A reader that
+        // asked BandBallistics with the RAW freq would answer for 5 Hz where the probe sits at 10.
+        {
+            const fc_master_params lo  = dynParams (5.0,  3.0, 1000.0, 1.0, 0.5, 0.5);
+            const fc_master_params ten = dynParams (10.0, 3.0, 1000.0, 1.0, 0.5, 0.5);
+            const bool a = ask (lo, 48000.0, 3, 0) == FC_OK; const double loA = gotA, loR = gotR;
+            const bool b = ask (ten, 48000.0, 3, 0) == FC_OK;
+            ok (a && b && std::fabs (loA - gotA) <= 0.0 && std::fabs (loR - gotR) <= 0.0,
+                "a lane at 5 Hz answers for 10 Hz — the probe's floor, bit for bit");
+
+            const fc_master_params hiQ = dynParams (2000.0, 1.0e6, 1000.0, 1.0, 0.5, 0.5);
+            const fc_master_params q40 = dynParams (2000.0,   40.0, 1000.0, 1.0, 0.5, 0.5);
+            const bool c = ask (hiQ, 48000.0, 3, 0) == FC_OK; const double hiA = gotA, hiR = gotR;
+            const bool d = ask (q40, 48000.0, 3, 0) == FC_OK;
+            ok (c && d && std::fabs (hiA - gotA) <= 0.0 && std::fabs (hiR - gotR) <= 0.0,
+                "Q at 1e6 answers for Q 40 — the EQ's own ceiling, bit for bit");
+
+            // And the ceiling moves WITH the rate: 0.49*fs, not a constant. AT Q 40, deliberately — at the Q 3 this
+            // check first used, BOTH rates land on the 1 ms auto floor and answer the same number, so the fixture
+            // proved nothing while reading as if it had. The rail is what has to be cleared for the claim to be
+            // measurable, and the ring time is linear in Q.
+            const fc_master_params up = dynParams (1.0e9, 40.0, 1000.0, 1.0, 0.5, 0.5);
+            const auto w44 = times (44100.0, 1.0e9, 40.0, 0.5, 0.5);
+            const auto w96 = times (96000.0, 1.0e9, 40.0, 0.5, 0.5);
+            const bool e = ask (up, 44100.0, 3, 0) == FC_OK && agrees (w44.first, w44.second);
+            const double at44 = gotA;
+            const bool f = ask (up, 96000.0, 3, 0) == FC_OK && agrees (w96.first, w96.second);
+            ok (e && f && std::fabs (at44 - gotA) > 1.0e-9,
+                "the frequency ceiling is 0.49*sampleRate and the answer moves with the rate");
+        }
+
+        // ---- THE REFUSALS, in the header's order, and NEITHER OUTPUT IS TOUCHED BY ANY OF THEM ----
+        {
+            const fc_master_params p = dynParams (3000.0, 2.0, 1000.0, 1.0, 0.5, 0.5);
+            double a = -7.0, r = -9.0;
+            auto refused = [&] (fc_status want, fc_status st, const char* what)
+            {
+                ok (st == want && std::fabs (a + 7.0) <= 0.0 && std::fabs (r + 9.0) <= 0.0,
+                    std::string (what) + " — refused, and neither output is written");
+            };
+
+            refused (FC_ERR_NULL,  fc_master_eq_dyn_times (&p, 48000.0, 3, 0, nullptr, &r), "a null attack output");
+            refused (FC_ERR_NULL,  fc_master_eq_dyn_times (&p, 48000.0, 3, 0, &a, nullptr), "a null release output");
+            refused (FC_ERR_NULL,  fc_master_eq_dyn_times (nullptr, 48000.0, 3, 0, &a, &r), "a null parameter set");
+            refused (FC_ERR_SPAN,  fc_master_eq_dyn_times (&p, 48000.0, 3, 0, &a, &a), "both outputs at one address");
+            refused (FC_ERR_RANGE, fc_master_eq_dyn_times (&p, 48000.0, -1, 0, &a, &r), "band -1");
+            refused (FC_ERR_RANGE, fc_master_eq_dyn_times (&p, 48000.0, FC_MAX_EQ_BANDS, 0, &a, &r), "band past the bank");
+            refused (FC_ERR_RANGE, fc_master_eq_dyn_times (&p, 48000.0, 3, -1, &a, &r), "lane -1");
+            refused (FC_ERR_RANGE, fc_master_eq_dyn_times (&p, 48000.0, 3, FC_MAX_EQ_LANES, &a, &r), "lane past the point");
+
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            const double inf = std::numeric_limits<double>::infinity();
+            refused (FC_ERR_NON_FINITE, fc_master_eq_dyn_times (&p, nan, 3, 0, &a, &r), "a NaN rate");
+            refused (FC_ERR_NON_FINITE, fc_master_eq_dyn_times (&p, inf, 3, 0, &a, &r), "an infinite rate");
+            // REFUSED, NOT SUBSTITUTED — the header's rule, and the boundary is `>=`, so 8000 itself is audio.
+            refused (FC_ERR_REFUSED_BY_CORE, fc_master_eq_dyn_times (&p, 0.0, 3, 0, &a, &r), "a rate of zero");
+            refused (FC_ERR_REFUSED_BY_CORE, fc_master_eq_dyn_times (&p, -48000.0, 3, 0, &a, &r), "a negative rate");
+            refused (FC_ERR_REFUSED_BY_CORE, fc_master_eq_dyn_times (&p, 7999.0, 3, 0, &a, &r),
+                     "a rate below the core's floor");
+            ok (fc_master_eq_dyn_times (&p, 8000.0, 3, 0, &a, &r) == FC_OK, "and 8000 itself is answered");
+            a = -7.0; r = -9.0;
+
+            // THE HEADER, and the refusal set of `fc_master_configure` reached through the mapping.
+            { fc_master_params bad = p; bad.header.abiVersion = FC_MASTER_ABI_VERSION + 1u;
+              refused (FC_ERR_ABI_VERSION, fc_master_eq_dyn_times (&bad, 48000.0, 3, 0, &a, &r), "a version this build does not know"); }
+            { fc_master_params bad = p; bad.header.structSize = (std::uint32_t) sizeof (bad) + 8u;
+              refused (FC_ERR_STRUCT_SIZE, fc_master_eq_dyn_times (&bad, 48000.0, 3, 0, &a, &r), "a size that is not its version's row"); }
+            { fc_master_params bad = p; bad.eqBands[3].dyn.atk = nan;
+              refused (FC_ERR_NON_FINITE, fc_master_eq_dyn_times (&bad, 48000.0, 3, 0, &a, &r),
+                       "a non-finite knob — refused where configure refuses it, so it never reaches the [0,1] rail"); }
+            { fc_master_params bad = p; bad.eqBands[3].lanes[0].freq = nan;
+              refused (FC_ERR_NON_FINITE, fc_master_eq_dyn_times (&bad, 48000.0, 3, 0, &a, &r), "a non-finite lane frequency"); }
+
+            // ORDER: a call wrong in two ways answers the EARLIER check. `band` is read before `sampleRate`, and a
+            // null output before either — one malformed call, one answer, and the header says which.
+            ok (fc_master_eq_dyn_times (&p, nan, FC_MAX_EQ_BANDS, 0, &a, &r) == FC_ERR_RANGE,
+                "a bad band AND a NaN rate answers RANGE — the band is checked first");
+            ok (fc_master_eq_dyn_times (&p, nan, FC_MAX_EQ_BANDS, 0, nullptr, &r) == FC_ERR_NULL,
+                "... and a null output beats both");
+        }
+
+        // ---- AN OUTPUT INSIDE `params` IS REFUSED, and this is the pair that is not a matter of taste: the store
+        // that writes the attack lands in the caller's `const` parameter set BEFORE the release is read out of it.
+        {
+            fc_master_params p = dynParams (3000.0, 2.0, 1000.0, 1.0, 0.5, 0.5);
+            const fc_master_params was = p;
+            double r = -9.0;
+            auto* inside = reinterpret_cast<double*> (reinterpret_cast<unsigned char*> (&p) + 8);
+            const fc_status st = fc_master_eq_dyn_times (&p, 48000.0, 3, 0, inside, &r);
+            ok (st == FC_ERR_SPAN && std::memcmp (&p, &was, sizeof (p)) == 0 && std::fabs (r + 9.0) <= 0.0,
+                "the attack output pointing into `params`: refused, and the parameter set is untouched");
+
+            double aa = -7.0;
+            auto* inside2 = reinterpret_cast<double*> (reinterpret_cast<unsigned char*> (&p) + 16);
+            const fc_status st2 = fc_master_eq_dyn_times (&p, 48000.0, 3, 0, &aa, inside2);
+            ok (st2 == FC_ERR_SPAN && std::memcmp (&p, &was, sizeof (p)) == 0 && std::fabs (aa + 7.0) <= 0.0,
+                "and the release output pointing into `params` likewise");
+        }
+
+        // ---- A CALLER STILL AT v1 reads the same pair: the eq bands and their `dyn` are v1's own fields ----
+        {
+            fc_master_params p = dynParams (7000.0, 4.0, 1000.0, 1.0, 0.25, 0.75);
+            const auto want = times (48000.0, 7000.0, 4.0, 0.25, 0.75);
+            p.header.abiVersion = 1u; p.header.structSize = 6560u;
+            ok (ask (p, 48000.0, 3, 0) == FC_OK && agrees (want.first, want.second),
+                "a v1-stamped parameter set answers the same milliseconds");
+        }
+    }
+
+    //==========================================================================
+    // K6 — THE DELIVERED RENDER IS ALIGNED WITH ITS INPUT. A consumer comparing input against output block by
+    // block (a crest or spectrum loss per 400 ms window) has to know whether output sample n is input sample n.
+    // `OfflineRenderer`'s contract says it is — `out[n] = y[n + D]` — and `MasteringChainTests` nulls that for the
+    // renderer. What is pinned HERE is the same claim through the DELIVERED path and the ABI, where a second axis
+    // exists that is not latency: at `deliveryRate != sampleRate` the two sides have different LENGTHS and
+    // different sample grids, so the correspondence is in TIME and the index correspondence is simply gone.
+    group ("K6: the delivered render is aligned with its input — no latency offset, and the rest is time, not index");
+    {
+        auto deliveringConfig = [] (double fs, double dr)
+        {
+            fc_master_config c {}; FC_INIT (c);
+            (void) fc_master_config_defaults (&c);
+            c.sampleRate = fs; c.channels = kNch; c.deliveryRate = dr;
+            c.clipper = 1;                  // ON so the chain CARRIES latency: an alignment claim on a chain with
+            c.limiter = 1;                  // D == 0 would hold for a renderer that never compensated anything
+            return c;
+        };
+        auto allBypassed = [] ()
+        {
+            fc_master_params p = goodParams();
+            p.inputGainDb = 0.0; p.preLimiterGainDb = 0.0;
+            p.bypassEq = 1; p.bypassMonoBass = 1; p.bypassCompressor = 1;
+            p.bypassClipper = 1; p.bypassLimiter = 1; p.bypassDither = 1;
+            return p;
+        };
+        // A burst with SILENCE either side, so "where is the feature" is a question with an answer, and the energy
+        // centroid is the instrument rather than a first-sample-above-a-threshold (the oversamplers' FIRs ring
+        // symmetrically about an edge, so an onset index moves with the filter while the centroid does not).
+        auto burst = [] (std::size_t frames, int nch, double fs, double atSec, double lenSec)
+        {
+            std::vector<float> v (frames * (std::size_t) nch, 0.0f);
+            const auto from = (std::size_t) (atSec * fs);
+            const auto to   = std::min (frames, from + (std::size_t) (lenSec * fs));
+            for (int c = 0; c < nch; ++c)
+                for (std::size_t i = from; i < to; ++i)
+                {
+                    const double w = 0.5 - 0.5 * std::cos (2.0 * felitronics::core::kPi
+                                                           * (double) (i - from) / (double) (to - from));
+                    v[(std::size_t) c * frames + i] =
+                        (float) (0.5 * w * std::sin (2.0 * felitronics::core::kPi * (700.0 + 300.0 * c)
+                                                     * (double) i / fs));
+                }
+            return v;
+        };
+        auto centroidSec = [] (const std::vector<float>& v, std::size_t frames, int nch, double fs)
+        {
+            double num = 0.0, den = 0.0;
+            for (int c = 0; c < nch; ++c)
+                for (std::size_t i = 0; i < frames; ++i)
+                {
+                    const double e = (double) v[(std::size_t) c * frames + i] * (double) v[(std::size_t) c * frames + i];
+                    num += e * (double) i; den += e;
+                }
+            return den > 0.0 ? (num / den) / fs : -1.0;
+        };
+
+        // ---- (a) EQUAL RATES, EVERY STAGE BYPASSED: the delivered render is the input, BIT FOR BIT, at the same
+        // index. The chain still carries its PDC — a bypassed clipper and limiter hold theirs in a `core::DryAligner`
+        // — so this is the strongest available form of "the latency is compensated": not close, identical.
+        {
+            fc_master_config c = deliveringConfig (kFs, kFs);
+            fc_master h = 0;
+            const bool made = fc_master_create (&c, &h) == FC_OK;
+            fc_master_params p = allBypassed();
+            fc_master_resolved rr {}; FC_INIT (rr);
+            const bool cfg = made && fc_master_configure (h, &p, &rr) == FC_OK;
+            ok (cfg && rr.latencySamples > 0, "PRECONDITION: a delivering handle whose chain carries latency ("
+                + std::to_string (rr.latencySamples) + " samples)");
+
+            const std::size_t n = 48000;
+            const std::vector<float> in = burst (n, kNch, kFs, 0.25, 0.10);
+            std::vector<float> out (in.size(), -1.0f);
+            const bool ran = cfg && fc_master_render_delivered (h, in.data(), (std::uint32_t) n,
+                                                                out.data(), (std::uint32_t) n) == FC_OK;
+            std::size_t differing = 0;
+            for (std::size_t i = 0; i < in.size(); ++i) if (! (out[i] == in[i])) ++differing;
+            ok (ran && differing == 0,
+                "every stage bypassed: the delivered render IS the input, bit for bit, at the same index ("
+                + std::to_string (differing) + " samples differ)");
+            if (made) (void) fc_master_destroy (h);
+        }
+
+        // A BROADBAND burst, because the lag instrument below needs an unambiguous autocorrelation. A TONE burst
+        // does not have one: at 700 Hz the correlation peaks every 68.6 samples and the first version of this check
+        // reported a best lag of -206, which is -3 periods to within a tenth of a sample. The Hann envelope over
+        // 4800 samples cannot outvote three periods of phase, so the instrument was reading the carrier, not the
+        // alignment. Deterministic noise (an LCG, a different seed per channel) has one peak and no second-best.
+        auto noiseBurst = [] (std::size_t frames, int nch, double fs, double atSec, double lenSec)
+        {
+            std::vector<float> v (frames * (std::size_t) nch, 0.0f);
+            const auto from = (std::size_t) (atSec * fs);
+            const auto to   = std::min (frames, from + (std::size_t) (lenSec * fs));
+            for (int c = 0; c < nch; ++c)
+            {
+                std::uint32_t s = 0x9E3779B9u + 0x7F4A7C15u * (std::uint32_t) c;
+                for (std::size_t i = from; i < to; ++i)
+                {
+                    s = s * 1664525u + 1013904223u;
+                    const double w = 0.5 - 0.5 * std::cos (2.0 * felitronics::core::kPi
+                                                           * (double) (i - from) / (double) (to - from));
+                    v[(std::size_t) c * frames + i] = (float) (0.4 * w * ((double) (s >> 8) / 8388608.0 - 1.0));
+                }
+            }
+            return v;
+        };
+
+        // ---- (b) EQUAL RATES, THE STAGES RUNNING. A bit-compare is gone once the clipper and the limiter act, so
+        // the instrument is the lag that maximises the cross-correlation. It must be 0 — not "small". A SECOND
+        // instrument of a different construction stands beside it (the energy centroid), because a single one
+        // agreeing with itself is what the tone-burst version above did while it was wrong.
+        {
+            fc_master_config c = deliveringConfig (kFs, kFs);
+            fc_master h = 0;
+            fc_master_params p = goodParams();
+            p.bypassDither = 1;                        // the RNG would put noise in the silence and blunt the lag
+            fc_master_resolved rr {}; FC_INIT (rr);
+            const bool cfg = fc_master_create (&c, &h) == FC_OK && fc_master_configure (h, &p, &rr) == FC_OK;
+
+            const std::size_t n = 48000;
+            const std::vector<float> in = noiseBurst (n, kNch, kFs, 0.25, 0.10);
+            std::vector<float> out (in.size(), 0.0f);
+            const bool ran = cfg && fc_master_render_delivered (h, in.data(), (std::uint32_t) n,
+                                                                out.data(), (std::uint32_t) n) == FC_OK;
+            long bestLag = 0x7FFFFFFF; double best = -1.0;
+            const long span = 4L * (long) std::max (1, rr.latencySamples);
+            for (long lag = -span; lag <= span; ++lag)
+            {
+                double acc = 0.0;
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const long j = (long) i + lag;
+                    if (j < 0 || j >= (long) n) continue;
+                    acc += (double) in[i] * (double) out[(std::size_t) j];
+                }
+                if (acc > best) { best = acc; bestLag = lag; }
+            }
+            ok (ran && bestLag == 0, "the stages running: the lag of best correlation is 0 over +-"
+                + std::to_string (span) + " samples (found " + std::to_string (bestLag) + ")");
+            // THE SECOND INSTRUMENT, of a different construction: WHERE THE PEAK OF A LONE IMPULSE LANDS. It reads
+            // one index rather than a whole distribution, so nothing about the envelope can move it.
+            //
+            // NOT the energy centroid, which this check used first and which failed by 3.2 ms while the lag search
+            // said 0. That disagreement was the limiter telling the truth, not a misalignment: it attenuates ahead
+            // of the peak through its lookahead and stays down through its release, so more of the burst's TAIL is
+            // pulled down than its head and the energy really does sit earlier. A centroid measures the envelope a
+            // dynamics stage is there to reshape, so it can only answer an alignment question with every stage
+            // bypassed — which is where (a) and (c) use it and where it is exact.
+            std::vector<float> imp ((std::size_t) n * (std::size_t) kNch, 0.0f);
+            const std::size_t at = 20000;
+            for (int ch = 0; ch < kNch; ++ch) imp[(std::size_t) ch * n + at] = 0.3f;    // modest: the alignment is
+            std::vector<float> impOut (imp.size(), 0.0f);                               // the claim, not the ceiling
+            const bool ran2 = cfg && fc_master_render_delivered (h, imp.data(), (std::uint32_t) n,
+                                                                 impOut.data(), (std::uint32_t) n) == FC_OK;
+            std::size_t peakAt = 0; double peak = -1.0;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double a2 = std::fabs ((double) impOut[i]);
+                if (a2 > peak) { peak = a2; peakAt = i; }
+            }
+            ok (ran2 && peakAt == at, "... and a lone impulse comes back at its own index (" + std::to_string (at)
+                + " in, " + std::to_string (peakAt) + " out)");
+            (void) fc_master_destroy (h);
+        }
+
+        // ---- (c) DIFFERENT RATES: the index correspondence is GONE and the TIME correspondence holds. This is the
+        // half a consumer gets wrong — the output is not the input's length, and sample n of one is not sample n of
+        // the other, while 0.25 s in is still 0.25 s in.
+        {
+            constexpr double kPairs[][2] = { { 48000.0, 44100.0 }, { 44100.0, 48000.0 }, { 48000.0, 96000.0 } };
+            for (const auto& pr : kPairs)
+            {
+                const double sr = pr[0], dr = pr[1];
+                fc_master_config c = deliveringConfig (sr, dr);
+                fc_master h = 0;
+                fc_master_params p = allBypassed();
+                fc_master_resolved rr {}; FC_INIT (rr);
+                const bool cfg = fc_master_create (&c, &h) == FC_OK && fc_master_configure (h, &p, &rr) == FC_OK;
+
+                const std::size_t n = (std::size_t) sr;                     // one second
+                std::uint32_t d = 0;
+                const bool len = cfg && fc_master_delivered_frames (h, (std::uint32_t) n, &d) == FC_OK;
+                const std::vector<float> in = burst (n, kNch, sr, 0.25, 0.10);
+                std::vector<float> out ((std::size_t) d * (std::size_t) kNch, 0.0f);
+                const bool ran = len && fc_master_render_delivered (h, in.data(), (std::uint32_t) n,
+                                                                    out.data(), d) == FC_OK;
+                const double tIn  = centroidSec (in, n, kNch, sr);
+                const double tOut = centroidSec (out, (std::size_t) d, kNch, dr);
+                const bool lengthIsTheConverters =
+                    len && (long long) d == felitronics::mastering::DeliveryConverter::deliveredFrames (sr, dr, (long long) n);
+                ok (ran && lengthIsTheConverters && std::fabs (tIn - tOut) < 1.0e-3,
+                    std::to_string ((int) sr) + " -> " + std::to_string ((int) dr)
+                    + " Hz: the delivered length is the converter's (" + std::to_string (d)
+                    + " frames, not " + std::to_string (n) + ") and the feature stays at the same TIME ("
+                    + std::to_string (tIn) + " s in, " + std::to_string (tOut) + " s out)");
+                (void) fc_master_destroy (h);
+            }
         }
     }
 

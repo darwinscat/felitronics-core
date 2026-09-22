@@ -795,31 +795,73 @@ namespace
     // One definition, two roads — see kReportParams above.
     constexpr felitronics::analysis::BandBurstsParams kBurstsParams {};
 
-    constexpr std::uint32_t kBurstsScalars    = 31;
+    // WHAT THE LAST RUN ACTUALLY INSTALLED. Until K3 the scalars read `kBurstsParams` for `enterDb` and
+    // `exitDb`, which was true while the only road installed that constant and became a LIE the moment a
+    // second road could install something else: the two thresholds would have described the defaults while
+    // the events came from the caller's. The detector does not report its own thresholds back out of a
+    // finished measurement, so the honest fix is to remember what was installed and read THAT — one
+    // variable written by every road into the detector, rather than a constant beside them.
+    felitronics::analysis::BandBurstsParams installedBursts = kBurstsParams;
+
+    constexpr std::uint32_t kBurstsScalars    = 32;
     constexpr std::uint32_t kBurstsChanStride = 4;
     constexpr std::uint32_t kBurstsEvtStride  = 12;
     constexpr std::uint32_t kBurstsBinStride  = 2;
 }
 
+namespace
+{
+    // THE ONE ROAD INTO THE DETECTOR. Both entry points below are this function with a different parameter
+    // set, so the ordering that matters — disarm, validate, install, prepare, process, finish — has one
+    // spelling and a caller cannot reach a state one road guards and the other does not.
+    int runBursts (const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate,
+                   const felitronics::analysis::BandBurstsParams& p)
+    {
+        haveBursts = false;
+        if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
+        auto& d = bursts();
+        d.setParams (p);
+        if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
+        // INSTALLED ONLY ONCE THE PREPARE HELD, so that what is remembered is what actually ran. A refused
+        // run is silent anyway — `haveBursts` is cleared on the first line, the established contract for
+        // every road here — so no reader can see these; recording them before the prepare would simply
+        // leave a false answer waiting for the NEXT successful run to be read beside.
+        installedBursts = p;
+        const float* view[felitronics::core::kMaxChannels] {};
+        if (frames != 0)
+            for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+        if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
+        d.finish();
+        haveBursts = true;
+        return 1;
+    }
+}
+
 FC_EXPORT int fc_probe_bursts_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
                                    double sampleRate)
 {
-    haveBursts = false;
-    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
-    auto& d = bursts();
-    d.setParams (kBurstsParams);
-    if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
-    const float* view[felitronics::core::kMaxChannels] {};
-    // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
-    // planar is null EVEN IF the offset is zero, and an empty programme is allowed to arrive with a null
-    // pointer. JavaScript's _malloc(0) happens to return something non-null, so the manifestation is
-    // theoretical from that road — and a direct C ABI caller is not obliged to be as lucky.
-    if (frames != 0)
-        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
-    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
-    d.finish();
-    haveBursts = true;
-    return 1;
+    return runBursts (planar, frames, channels, sampleRate, kBurstsParams);
+}
+
+// K3 — THE SAME DETECTOR, THE CALLER'S BAND. The default 5-9 kHz band answers "sibilance"; the same
+// machinery at 80 Hz - 8 kHz with a shorter baseline answers "how dense are the transients", which is a
+// different question and not a different analyzer. `maxEvents` is NOT exposed: it is the event list's
+// capacity, the counters keep counting past it, and `fc_probe_bursts_events_complete` already says whether
+// the list is whole — a caller that could shrink it could only make the list lie about itself.
+//
+// EVERY VALUE IS THE CORE'S TO JUDGE. `prepare` refuses a band it cannot build (0.49*fs must clear the top
+// corner), a non-positive hop, a baseline shorter than a hop; this returns 0 for all of it, exactly as the
+// default road does, and a refused run leaves the getters SILENT — the contract every road here already
+// had, and the one state a reader can act on without knowing which road refused.
+FC_EXPORT int fc_probe_bursts_run_with (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                        double sampleRate, double bandLowHz, double bandHighHz,
+                                        double hopMs, double baselineMs, double enterDb, double exitDb)
+{
+    felitronics::analysis::BandBurstsParams p;      // maxEvents keeps its default: see above
+    p.bandLowHz = bandLowHz; p.bandHighHz = bandHighHz;
+    p.hopMs = hopMs; p.baselineMs = baselineMs;
+    p.enterDb = enterDb; p.exitDb = exitDb;
+    return runBursts (planar, frames, channels, sampleRate, p);
 }
 
 FC_EXPORT std::uint32_t fc_probe_bursts_scalars_len (void) { return kBurstsScalars; }
@@ -833,7 +875,7 @@ FC_EXPORT std::uint32_t fc_probe_bursts_scalars (double* out, std::uint32_t cap)
 {
     if (! haveBursts || out == nullptr || cap < kBurstsScalars || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = bursts();
-    const auto& bp = kBurstsParams;      // the constant the run and the price read — not a fresh default
+    const auto& bp = installedBursts;    // WHAT THIS MEASUREMENT RAN AT — see the note on the variable
     std::uint32_t i = 0;
     out[i++] = d.sampleRate();
     out[i++] = (double) d.channels();
@@ -866,6 +908,7 @@ FC_EXPORT std::uint32_t fc_probe_bursts_scalars (double* out, std::uint32_t cap)
     out[i++] = (double) d.intervalOverflow();
     out[i++] = (double) d.modalIntervalHops();
     out[i++] = (double) d.modalIntervalMass();
+    out[i++] = d.onsetsPerSecond();      // K3 — over the JUDGED programme; the analyzer owns the denominator
     return i;
 }
 
@@ -1497,6 +1540,23 @@ FC_EXPORT double fc_probe_bursts_storage_bytes (std::uint32_t channels, double s
     if (! geometry (channels)) return 0.0;
     return demand (felitronics::analysis::BandBursts::storageFor (
                        sampleRate, (int) channels, kBurstsParams));
+}
+
+// K3's price, and it exists because the default one CANNOT answer for a parameterised run: the baseline
+// ring is `round(baselineMs / hopMs)` hops of `hopMs` each, so both of those move the allocation and a page
+// that sized itself by the default figure would be short exactly where it asked for a longer memory. It
+// takes the same six values as `fc_probe_bursts_run_with` so the pair cannot drift apart.
+FC_EXPORT double fc_probe_bursts_storage_bytes_with (std::uint32_t channels, double sampleRate,
+                                                     double bandLowHz, double bandHighHz,
+                                                     double hopMs, double baselineMs,
+                                                     double enterDb, double exitDb)
+{
+    if (! geometry (channels)) return 0.0;
+    felitronics::analysis::BandBurstsParams p;
+    p.bandLowHz = bandLowHz; p.bandHighHz = bandHighHz;
+    p.hopMs = hopMs; p.baselineMs = baselineMs;
+    p.enterDb = enterDb; p.exitDb = exitDb;
+    return demand (felitronics::analysis::BandBursts::storageFor (sampleRate, (int) channels, p));
 }
 
 FC_EXPORT double fc_probe_hum_storage_bytes (std::uint32_t channels, double sampleRate)
