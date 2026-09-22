@@ -67,6 +67,10 @@ std::vector<std::vector<float>> programme (double fs, int nch, double seconds, d
     return ch;
 }
 
+// The same as `runIt`, for an object whose parameters were set by the caller: `runIt` prepares from whatever
+// `setParams` left, so the two differ only in that this one does not reset them.
+bool runIt2 (BandCrest& bc, std::vector<std::vector<float>>& buf, double fs, int block = 4096);
+
 bool runIt (BandCrest& bc, std::vector<std::vector<float>>& buf, double fs, int block = 4096)
 {
     std::vector<const float*> p;
@@ -83,6 +87,11 @@ bool runIt (BandCrest& bc, std::vector<std::vector<float>>& buf, double fs, int 
     }
     bc.finish();
     return true;
+}
+
+bool runIt2 (BandCrest& bc, std::vector<std::vector<float>>& buf, double fs, int block)
+{
+    return runIt (bc, buf, fs, block);
 }
 
 //==================================================================================================
@@ -147,8 +156,12 @@ void thePeakIsTheCertificate()
 //==================================================================================================
 void theGridIsTheLoudnessMeters()
 {
+    // THE RATES ARE CHOSEN AGAINST THE FORMULA, not for convenience. At 44.1, 48 and 96 kHz `0.01*fs` is an
+    // integer and a hop rounded whole agrees with a hop built from sub-hops — so a sweep over those three is
+    // blind to the difference, and the first version of this check was exactly that sweep. 22050 and 11025 are
+    // where they part (2210 samples against 2205), and 8000 is the core's floor.
     felitronics::test::group ("the block grid is the loudness meter's, counted by different code");
-    for (const double fs : { 44100.0, 48000.0, 96000.0 })
+    for (const double fs : { 8000.0, 11025.0, 22050.0, 44100.0, 48000.0, 96000.0 })
     {
         auto buf = programme (fs, 2, 3.0);
         BandCrest bc;
@@ -160,9 +173,23 @@ void theGridIsTheLoudnessMeters()
         const float* q[2] { buf[0].data(), buf[1].data() };
         if (! felitronics::test::run (lm.process (q, 2, n))) continue;
 
-        ok (bc.blockCount() == (long long) lm.gatingBlockCount(),
+        // THE HOP ITSELF, in samples, before any count derived from it: a block count can agree by luck when
+        // the hop does not, and the hop is the thing the header claims is shared.
+        const int lmHop = 10 * (int) std::lround (0.01 * fs);
+        ok (bc.hopSamples() == lmHop,
+            std::to_string ((int) fs) + " Hz: the hop is " + std::to_string (bc.hopSamples())
+            + " samples, built from sub-hops exactly as the meter builds it (" + std::to_string (lmHop) + ")");
+        // THE COUNT IS THE METER'S PLUS THE PARTIAL LAST HOP, and the difference is deliberate rather than a
+        // discrepancy: this analyzer closes the hop the programme ends inside, because that hop is the end of
+        // the file and dropping it would lose exactly the material a master's loudest moments often sit in.
+        // The meter does not. So the relationship is an equality with a named term, not an equality — the
+        // header used to claim the latter and the test could not see it, because the only lengths it tried
+        // ended on a hop boundary.
+        const long long partial = ((long long) buf[0].size() % bc.hopSamples()) != 0 ? 1 : 0;
+        ok (bc.blockCount() == (long long) lm.gatingBlockCount() + partial,
             std::to_string ((int) fs) + " Hz: " + std::to_string (bc.blockCount())
-            + " blocks here and " + std::to_string (lm.gatingBlockCount()) + " gating blocks there");
+            + " blocks here and " + std::to_string (lm.gatingBlockCount()) + " gating blocks there, the "
+            + (partial ? "programme ending inside a hop" : "programme ending on a hop boundary"));
         // THE TWO HOP CLOCKS INSIDE THIS CLASS. They partition the same input time and are counted by
         // different code; they disagreed by one when the interpolator's drain was taken whole, closing a hop
         // of silence as programme. A comment claiming they agree is not the same thing as this line.
@@ -262,6 +289,86 @@ void cvarSeesWhatP95CannotAndNeverLess()
 }
 
 //==================================================================================================
+// THREE PRECONDITIONS THE COMPARATOR USED TO ASSUME. Each was found by review with a measurement attached, and
+// each failed in the same direction: a plausible number for a comparison that had not happened.
+void theComparatorRefusesWhatItCannotCompare()
+{
+    felitronics::test::group ("the comparison refuses two runs that are not the same question");
+    const double fs = 48000.0;
+    auto a = programme (fs, 2, 6.0, 25.0);
+    auto b = a;
+    std::vector<double> scratch;
+
+    BandCrest same0, same1;
+    if (! felitronics::test::run (runIt (same0, a, fs))) return;
+    if (! felitronics::test::run (runIt (same1, b, fs))) return;
+    const auto ok0 = bandCrestLoss (same0, same1, BandCrest::kFull, scratch);
+    ok (ok0.usable > 0 && ok0.valid && std::fabs (ok0.maxDb) <= 1.0e-9,
+        "PRECONDITION: the same audio against itself is a comparison, and it finds no loss");
+
+    // A DIFFERENT GRID IS A DIFFERENT QUESTION. Same audio, master on a 50 ms hop: before the guard this
+    // answered CVaR95 7.8 dB and `valid` true.
+    {
+        BandCrest other;
+        felitronics::analysis::BandCrestParams p; p.hopMs = 50.0;
+        other.setParams (p);
+        if (felitronics::test::run (runIt2 (other, b, fs)))
+        {
+            const auto r = bandCrestLoss (same0, other, BandCrest::kFull, scratch);
+            ok (! r.valid && r.usable == 0 && r.blocks == 0,
+                "a master measured on a 50 ms hop is refused, not compared (usable "
+                + std::to_string (r.usable) + ", blocks " + std::to_string (r.blocks) + ")");
+        }
+    }
+    // ... and so is a different band split.
+    {
+        BandCrest other;
+        felitronics::analysis::BandCrestParams p; p.bandEdgeHz[1] = 1500.0;
+        other.setParams (p);
+        if (felitronics::test::run (runIt2 (other, b, fs)))
+            ok (! bandCrestLoss (same0, other, BandCrest::kFull, scratch).valid,
+                "and so is a master measured through different band edges");
+    }
+
+    // A GROSS MISALIGNMENT IS SEEN. A master delayed by whole blocks must not read as a clean comparison.
+    //
+    // THE FIXTURE NEEDS A FEATURE TO LOCK ONTO, which the first version of this check did not give it: with a
+    // transient every 0.5 s the block-peak series is nearly flat, the correlation is flat with it, and the
+    // argmax lands on lag 0 for want of anything better — the instrument read "aligned" because it could not
+    // see. The same lesson as the tone burst in K6. `bigEvery = 4` puts a much larger transient every 2 s, so
+    // the series has structure at the scale the lag is measured in.
+    {
+        auto marked = programme (fs, 2, 6.0, 4.0);
+        BandCrest ref2;
+        if (! felitronics::test::run (runIt (ref2, marked, fs))) return;
+        const auto hop = (std::size_t) ref2.hopSamples();
+        auto shifted = marked;
+        for (auto& c : shifted) { c.insert (c.begin(), 3 * hop, 0.0f); c.resize (marked[0].size()); }
+        BandCrest late;
+        if (felitronics::test::run (runIt (late, shifted, fs)))
+        {
+            const auto r = bandCrestLoss (ref2, late, BandCrest::kFull, scratch);
+            ok (r.lagBlocks != 0, "a master delayed by three hops reports a non-zero block lag ("
+                                  + std::to_string (r.lagBlocks) + ")");
+        }
+    }
+
+    // A MUTED OUTPUT BAND IS COUNTED, NOT DROPPED. Before this it left the population in silence, so a band
+    // the chain removed read exactly like a band it left alone.
+    {
+        auto muted = a;
+        for (auto& c : muted) std::fill (c.begin() + (std::ptrdiff_t) (c.size() / 2), c.end(), 0.0f);
+        BandCrest half;
+        if (felitronics::test::run (runIt (half, muted, fs)))
+        {
+            const auto r = bandCrestLoss (same0, half, BandCrest::kFull, scratch);
+            ok (r.outSilent > 0, "the blocks whose master band is digital silence are counted ("
+                                 + std::to_string (r.outSilent) + " of " + std::to_string (r.inActive) + ")");
+        }
+    }
+}
+
+//==================================================================================================
 void theSameProgrammeInAnySlicing()
 {
     felitronics::test::group ("law 8a — the call sizes do not change the measurement");
@@ -333,6 +440,7 @@ int main()
     theGridIsTheLoudnessMeters();
     theLossIsInvariantToGain();
     cvarSeesWhatP95CannotAndNeverLess();
+    theComparatorRefusesWhatItCannotCompare();
     theSameProgrammeInAnySlicing();
     processAsksTheHeapForNothing();
     return felitronics::test::report();

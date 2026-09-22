@@ -20,6 +20,7 @@
 
 #include <felitronics_test.h>
 #include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/BandCrest.h>
 #include <felitronics/analysis/KWeightingFilter.h>
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/ProgrammeReport.h>
@@ -58,6 +59,7 @@ static_assert (std::is_same_v<an::ProgrammeReport::KWeightingType, an::Determini
 static_assert (std::is_same_v<an::ProgrammeReport::LoudnessType,   an::DeterministicLoudnessMeter>);
 static_assert (std::is_same_v<an::LowEnd::CrossoverType,           eq::DeterministicCrossover2>);
 static_assert (std::is_same_v<an::BandBursts::CrossoverType,       eq::DeterministicCrossover2>);
+static_assert (std::is_same_v<an::BandCrest::CrossoverType,        eq::DeterministicCrossover2>);
 
 int main()
 {

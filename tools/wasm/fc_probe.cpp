@@ -1562,7 +1562,7 @@ namespace
 
     constexpr std::uint32_t kCrestScalars     = 21;   // 16 + one active-block count per band
     constexpr std::uint32_t kCrestBlockStride = 15;   // 5 bands x { peak, meanSq, active }
-    constexpr std::uint32_t kCrestLossFields  = 15;
+    constexpr std::uint32_t kCrestLossFields  = 17;   // + outSilent and the coarse block lag
 
     int runCrest (int slot, const float* planar, std::uint32_t frames, std::uint32_t channels, double sampleRate,
                   const felitronics::analysis::BandCrestParams& p)
@@ -1684,6 +1684,8 @@ FC_EXPORT std::uint32_t fc_probe_crest_loss (std::int32_t band, double* out, std
     out[i++] = (double) L.over6Db;
     out[i++] = L.peakShiftDb;
     out[i++] = L.levelShiftDb;
+    out[i++] = (double) L.outSilent;
+    out[i++] = (double) L.lagBlocks;
     out[i++] = L.valid ? 1.0 : 0.0;
     return i;
 }

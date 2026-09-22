@@ -894,14 +894,14 @@ int main (int argc, char** argv)
             {
                 const auto L = analysis::bandCrestLoss (src, dst, b, scratch);
                 std::printf ("loss %d %lld %lld %lld %016llx %016llx %016llx %016llx %016llx %016llx "
-                             "%lld %lld %lld %016llx %016llx %d\n",
+                             "%lld %lld %lld %016llx %016llx %lld %lld %d\n",
                              b, (long long) L.blocks, (long long) L.inActive, (long long) L.usable,
                              (unsigned long long) bits (L.p50Db), (unsigned long long) bits (L.p95Db),
                              (unsigned long long) bits (L.cvar95Db), (unsigned long long) bits (L.meanDb),
                              (unsigned long long) bits (L.maxDb), (unsigned long long) bits (L.p5Db),
                              (long long) L.over1Db, (long long) L.over3Db, (long long) L.over6Db,
                              (unsigned long long) bits (L.peakShiftDb), (unsigned long long) bits (L.levelShiftDb),
-                             L.valid ? 1 : 0);
+                             (long long) L.outSilent, (long long) L.lagBlocks, L.valid ? 1 : 0);
             }
         }
         return 0;

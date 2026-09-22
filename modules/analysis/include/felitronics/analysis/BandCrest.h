@@ -84,9 +84,16 @@ namespace felitronics::analysis
 //==================================================================================================
 // TIME, EXACTLY
 //==================================================================================================
-// The hop grid is `LoudnessMeter`'s: a hop of `round(hopMs * fs / 1000)` samples, a block of `blockHops` hops
-// (400 ms at the defaults), one block every hop once the first `blockHops` are in. Block j therefore covers
-// input samples [j*H, (j+blockHops)*H) and a consumer can pair block j of one run with block j of another.
+// The hop grid is `LoudnessMeter`'s, and it is built the way that meter builds it — out of `kSubHopsPerHop`
+// sub-hops of `lround(0.01*fs)` samples, not by rounding the whole hop. The two agree wherever `0.01*fs` is an
+// integer and part where it is not: at 22050 Hz a rounded hop is 2205 samples and the meter's is 2210. A block
+// is `blockHops` hops (400 ms at the defaults), one block every hop once the first `blockHops` are in, so
+// block j covers input samples [j*H, (j+blockHops)*H) and block j of one run pairs with block j of another.
+//
+// WITH ONE NAMED DIFFERENCE: this analyzer closes the hop the programme ENDS INSIDE and the meter does not, so
+// on a programme that does not end on a hop boundary there is one more block here. That is deliberate — the
+// last hop is the end of the file, and a master's loudest material often sits there — and it is stated rather
+// than left for a consumer to discover from a count that is one off.
 //
 // THE INTERPOLATOR'S DELAY IS HALF AN OVERSAMPLED SAMPLE, and it is named rather than rounded away in silence.
 // The polyphase FIR is symmetric over `factor*tapsPerPhase` oversampled taps, so its group delay is
@@ -134,6 +141,15 @@ enum class BandCrestInvalid : std::uint8_t
 class BandCrest
 {
 public:
+    // THE FILTERS ARE THE DETERMINISTIC ONES, and the alias is here so a static_assert can say so. `eq::Crossover2`
+    // is `BasicCrossover2<core::SystemMath>`, whose prewarp is `std::tan` — and `std::tan` does not agree
+    // between libms: a review measured Apple's against glibc/musl/UCRT at 120 Hz on 44.1 kHz and found them
+    // apart, and one ulp in `g` moves the SVF's coefficients. On a 6.3-minute mix that showed up as 12 block
+    // rows of 3752 differing between the two spellings. Every other offline analyzer here already took this
+    // road (BandBursts, LowEnd, ProgrammeReport) and MathPolicyTests asserts it of each; this one was written
+    // without it, which is the same class of defect the wasm tier caught in K11's dB threshold.
+    using CrossoverType = eq::DeterministicCrossover2;   // asserted by the math-policy suite
+
     // low, lowMid, highMid, high, full — `full` last so that a loop over the four BANDS is `b < kFull`.
     static constexpr int kBands = 5;
     static constexpr int kLow = 0, kLowMid = 1, kHighMid = 2, kHigh = 3, kFull = 4;
@@ -197,7 +213,16 @@ public:
         if (p.blockHops < 1 || p.blockHops > 64) return st;
         if (! cornersAdmitted (sampleRate, p)) return st;
 
-        const long long hop = std::llround (sampleRate * p.hopMs / 1000.0);
+        // THE HOP IS THE LOUDNESS METER'S OWN ARITHMETIC, not a formula that agrees with it at the rates
+        // anyone happened to test. It builds a hop out of `kSubHopsPerHop` sub-hops of `lround(0.01*fs)`
+        // samples; rounding the whole hop instead gives a different integer wherever 0.01*fs is not one —
+        // at 22050 Hz that is 2210 samples against 2205, and the header's claim that block j is the meter's
+        // block j would have been false there. A review found it; the test that claimed the identity ran
+        // only at 44.1, 48 and 96 kHz, where the two agree.
+        const double subHop = 0.01 * sampleRate;
+        const long long sub = std::max (1LL, (long long) std::llround (subHop));
+        const long long hopsPerStep = std::max (1LL, (long long) std::llround (p.hopMs / 10.0));
+        const long long hop = sub * hopsPerStep;
         if (hop < 1 || hop > 0x7FFFFFFFLL) return st;
         // The hops a programme of `maxSamples` can close, plus the partial one `finish()` closes.
         const long long hops = maxSamples / hop + 1;
@@ -233,7 +258,10 @@ public:
     }
 
     void setParams (const BandCrestParams& p) noexcept { pending_ = p; }   // taken at the next prepare()
-    const BandCrestParams& params() const noexcept { return pending_; }
+    // WHAT THE LAST prepare() TOOK, not what the next one would: a reader asking an object what it measured
+    // with must not be told what it is about to measure with. `pendingParams()` answers the other question.
+    const BandCrestParams& params() const noexcept { return p_; }
+    const BandCrestParams& pendingParams() const noexcept { return pending_; }
 
     [[nodiscard]] bool prepare (double sampleRate, int maxChannels, long long maxSamples) noexcept
     {
@@ -542,12 +570,15 @@ private:
                 ++taken; ++osMeasured_;
                 if (++osInHop_ >= hopOs) { osInHop_ = 0; closeHop(); }
             }
-        }
-        // Denormal maintenance on the OVERSAMPLED clock, which is this bank's own clock.
-        if (grid_.advance (osSamples))
-        {
-            x0_.flushDenormals(); x1_.flushDenormals(); x2_.flushDenormals();
-            b1_.flushDenormals(); b2_.flushDenormals();
+            // Denormal maintenance on the OVERSAMPLED clock, which is this bank's own clock — ONE SAMPLE AT A
+            // TIME, which is `core::StateGrid::advance`'s precondition and what every other analyzer here
+            // does. Advancing it by a whole chunk made the flush land at a different point for different call
+            // sizes, and two cells then differed between a 1-sample call and a 4096-sample one.
+            if (grid_.advance (1))
+            {
+                x0_.flushDenormals(); x1_.flushDenormals(); x2_.flushDenormals();
+                b1_.flushDenormals(); b2_.flushDenormals();
+            }
         }
     }
 
@@ -591,7 +622,7 @@ private:
     std::vector<std::uint64_t> counts_;
     std::vector<float>  scratch_;
     std::vector<oversampling::PolyphaseOversampler> os_;
-    eq::Crossover2 x0_, x1_, x2_, b1_, b2_;
+    CrossoverType x0_, x1_, x2_, b1_, b2_;
     core::StateGrid grid_;
 };
 
@@ -633,6 +664,16 @@ struct BandCrestLoss
     long long blocks   = 0;     // blocks the two runs have in common
     long long inActive = 0;     // ... of which the SOURCE's mask admits, which is the population
     long long usable   = 0;     // ... of which both sides carry a finite peak and energy
+    long long outSilent = 0;    // ... and of the admitted ones, those whose MASTER band is digital silence.
+                                // They are not "no data": they are an infinite loss, and folding them into a
+                                // quantile would put an infinity in it while dropping them silently makes a
+                                // muted band read as a clean one. Counted here, decided by the consumer.
+    long long lagBlocks = 0;    // the block lag at which the two full-band peak series agree best. NOT a
+                                // guarantee of alignment: it sees whole blocks, so a delay of a few
+                                // milliseconds reads 0 — and a few milliseconds is enough to fabricate damage
+                                // (a review measured 5 ms as up to 1.1 dB of CVaR95 and a 17 dB maximum, the
+                                // order of a real limiter's). Alignment is the caller's precondition; this is
+                                // the coarse half of it, published so a GROSS mistake cannot pass unseen.
     double    p50Db = 0.0, p95Db = 0.0, cvar95Db = 0.0, meanDb = 0.0, maxDb = 0.0;   // of max(0, loss)
     double    p5Db  = 0.0;      // the signed loss at the 5th percentile: negative means crest was GAINED
     long long over1Db = 0, over3Db = 0, over6Db = 0;
@@ -647,9 +688,41 @@ inline BandCrestLoss bandCrestLoss (const BandCrest& in, const BandCrest& out, i
 {
     BandCrestLoss r;
     if (band < 0 || band >= BandCrest::kBands) return r;
+    // THE TWO RUNS MUST BE COMPARABLE, and nothing upstream checks it. A loss is a per-block difference, so
+    // two runs on different grids are two different questions: a review fed the same audio to both slots with
+    // the master on a 50 ms hop and got CVaR95 7.8 dB and `valid` true — a plausible number for a comparison
+    // that never happened. A mismatch is a refusal here, not a number with a caveat.
+    // `core::exactlyEqual` because the comparison IS exact here and says so: two runs are the same question
+    // only if they were asked with the same numbers, and a tolerance would let a grid that differs in its last
+    // bit pass as the same grid. This is the one place a float comparison is not a mistake, and the helper is
+    // how this tree spells that.
+    if (! core::exactlyEqual (in.sampleRate(), out.sampleRate())
+        || in.hopSamples() != out.hopSamples() || in.blockHops() != out.blockHops()
+        || in.channels() != out.channels()) return r;
+    for (int k = 0; k < 3; ++k)
+        if (! core::exactlyEqual (in.params().bandEdgeHz[k], out.params().bandEdgeHz[k])) return r;
     const long long n = std::min (in.blockCount(), out.blockCount());
     r.blocks = n;
     if (n <= 0) return r;
+
+    // THE COARSE ALIGNMENT CHECK — where the two full-band peak series agree best, in blocks. See the note on
+    // `lagBlocks`: this catches a gross mistake and cannot catch a small one.
+    {
+        const long long span = std::min<long long> (8, n - 1);
+        double best = -1.0; long long bestLag = 0;
+        for (long long lag = -span; lag <= span; ++lag)
+        {
+            double acc = 0.0;
+            for (long long j = 0; j < n; ++j)
+            {
+                const long long k = j + lag;
+                if (k < 0 || k >= n) continue;
+                acc += in.blockPeakLin (j, BandCrest::kFull) * out.blockPeakLin (k, BandCrest::kFull);
+            }
+            if (acc > best) { best = acc; bestLag = lag; }
+        }
+        r.lagBlocks = bestLag;
+    }
     if (scratch.size() < (std::size_t) n) scratch.resize ((std::size_t) n);
 
     std::size_t k = 0;
@@ -662,7 +735,11 @@ inline BandCrestLoss bandCrestLoss (const BandCrest& in, const BandCrest& out, i
         ++r.inActive;
         const double pA = in.blockPeakLin (j, band),  mA = in.blockMeanSq (j, band);
         const double pB = out.blockPeakLin (j, band), mB = out.blockMeanSq (j, band);
-        if (! (pA > 0.0) || ! (mA > 0.0) || ! (pB > 0.0) || ! (mB > 0.0)) continue;
+        // A MASTER BAND THAT IS DIGITAL SILENCE is counted rather than skipped in silence: the loss there is
+        // infinite, and an infinity cannot enter a quantile — but a band the chain muted must not read as a
+        // band it left alone, which is what dropping the block quietly would do.
+        if (! (pA > 0.0) || ! (mA > 0.0)) continue;
+        if (! (pB > 0.0) || ! (mB > 0.0)) { ++r.outSilent; continue; }
         const double ratio = (pA * pA * mB) / (pB * pB * mA);
         if (! (ratio > 0.0) || ! std::isfinite (ratio)) continue;
         const double loss = 10.0 * core::det::log10 (ratio);

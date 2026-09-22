@@ -20,7 +20,8 @@ const S = {
 // One loss row, in the order `fc_probe_crest_loss` writes it.
 const L = {
     blocks: 0, inActive: 1, usable: 2, p50: 3, p95: 4, cvar95: 5, mean: 6, max: 7, p5: 8,
-    over1: 9, over3: 10, over6: 11, peakShift: 12, levelShift: 13, valid: 14,
+    over1: 9, over3: 10, over6: 11, peakShift: 12, levelShift: 13,
+    outSilent: 14, lagBlocks: 15, valid: 16,
 };
 
 export const CREST_BANDS = 5;
@@ -55,7 +56,8 @@ export function formatCrest({ ok, s, blocks, blockStride, loss }) {
                    + ` ${bitsOf(r[L.p50])} ${bitsOf(r[L.p95])} ${bitsOf(r[L.cvar95])} ${bitsOf(r[L.mean])}`
                    + ` ${bitsOf(r[L.max])} ${bitsOf(r[L.p5])}`
                    + ` ${r[L.over1]} ${r[L.over3]} ${r[L.over6]}`
-                   + ` ${bitsOf(r[L.peakShift])} ${bitsOf(r[L.levelShift])} ${r[L.valid]}`);
+                   + ` ${bitsOf(r[L.peakShift])} ${bitsOf(r[L.levelShift])}`
+                   + ` ${r[L.outSilent]} ${r[L.lagBlocks]} ${r[L.valid]}`);
         }
     }
     return out.join('\n') + '\n';
