@@ -57,13 +57,21 @@ const P = { '--band-low': 5000, '--band-high': 9000, '--hop-ms': 10, '--baseline
 let parameterised = false;
 {
     const rest = process.argv.slice(6);
-    for (let i = 0; i < rest.length; ++i)
+    for (let i = 0; i < rest.length; ++i) {
         if (Object.prototype.hasOwnProperty.call(P, rest[i])) {
             if (i + 1 >= rest.length) refuse(`bursts: ${rest[i]} needs a finite number`);
             P[rest[i]] = finiteOf(rest[i + 1], rest[i]);
             parameterised = true;
             ++i;
+            continue;
         }
+        // A NAME NOBODY KNOWS IS A REFUSAL, on this road too and with the same exit. Both roads used to skip
+        // an unrecognised option in silence, so `--band-lo 80` measured the DEFAULT band at exit 0 on both —
+        // byte-identical, and therefore invisible to the very diff that is supposed to catch a divergence.
+        // The refusal sets are half of parity, and a hole present in both halves is not covered by either.
+        if (rest[i].startsWith('--') && rest[i] !== '--precise')
+            refuse(`bursts: unknown option ${rest[i]} (want ${Object.keys(P).join(' ')})`);
+    }
 }
 
 const require = createRequire(import.meta.url);

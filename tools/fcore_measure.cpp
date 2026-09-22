@@ -807,21 +807,36 @@ int main (int argc, char** argv)
                 { "--enter-db",    &bp.enterDb },    { "--exit-db",    &bp.exitDb },
             };
             for (int i = 5; i < argc; ++i)
-                for (const Flag& fl : flags)
-                    if (std::strcmp (argv[i], fl.name) == 0)
+            {
+                const Flag* hit = nullptr;
+                for (const Flag& fl : flags) if (std::strcmp (argv[i], fl.name) == 0) { hit = &fl; break; }
+                if (hit != nullptr)
+                {
+                    // A FLAG WITHOUT ITS VALUE IS A REFUSAL, not a silently kept default: `--enter-db` at the
+                    // end of a command line would otherwise measure at 6 dB while the operator believes it
+                    // set something. The same reasoning as the strict parse above.
+                    if (i + 1 >= argc || ! parseFinite (argv[i + 1], *hit->into))
                     {
-                        // A FLAG WITHOUT ITS VALUE IS A REFUSAL, not a silently kept default: `--enter-db` at the
-                        // end of a command line would otherwise measure at 6 dB while the operator believes it
-                        // set something. The same reasoning as the strict parse above.
-                        if (i + 1 >= argc || ! parseFinite (argv[i + 1], *fl.into))
-                        {
-                            std::fprintf (stderr, "bursts: %s needs a finite number\n", fl.name);
-                            std::fclose (f);
-                            return 2;
-                        }
-                        ++i;
-                        break;      // the value is consumed; it must not be matched against the next name
+                        std::fprintf (stderr, "bursts: %s needs a finite number\n", hit->name);
+                        std::fclose (f);
+                        return 2;
                     }
+                    ++i;            // the value is consumed; it must not be read as a name on the next turn
+                    continue;
+                }
+                // AND A NAME NOBODY KNOWS IS A REFUSAL TOO. Without this the first version of the loop simply
+                // did not match `--band-lo` and measured the DEFAULT 5-9 kHz band at exit 0, while the operator
+                // read the command line and believed it had asked for 80 Hz. A typo that measures the wrong
+                // thing silently is worse than one that measures nothing, and this is the same argument that
+                // made a flag without its value a refusal — it was just applied to half the cases.
+                if (std::strncmp (argv[i], "--", 2) == 0 && std::strcmp (argv[i], "--precise") != 0)
+                {
+                    std::fprintf (stderr, "bursts: unknown option %s (want --band-low --band-high --hop-ms "
+                                          "--baseline-ms --enter-db --exit-db)\n", argv[i]);
+                    std::fclose (f);
+                    return 2;
+                }
+            }
         }
         det.setParams (bp);
         if (! det.prepare (fs, kChunk, nc))
