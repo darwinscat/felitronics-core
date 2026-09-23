@@ -102,6 +102,13 @@ const STRUCTS = {
         ['compressorMix', 'f64'],                               // v3
         ['limiterDualRelease', 'i32'], ['_pad0', 'i32'],        // v6
         ['limiterSlowReleaseMs', 'f64'],                        // v6
+        // v11 (K13) — the peak clipper INSIDE the limiter's oversampling island. Not a stage: there is
+        // no entry in fc_master_config and no bypass flag beside the others; this one positive switch,
+        // default 0, is the whole of it. `peakClipperOverCeilingDb` is dB ABOVE the ceiling, an offset
+        // that rides it, and the ABSOLUTE level it lands on is read from resolved.
+        ['peakClipper', 'i32'], ['_pad1', 'i32'],               // v11
+        ['peakClipperOverCeilingDb', 'f64'],                    // v11
+        ['peakClipperKneeDb', 'f64'],                           // v11
     ],
 
     fc_master_resolved: [
@@ -113,6 +120,7 @@ const STRUCTS = {
         ['monoBass', 'fc_mono_bass'], ['tapOversampleFactor', 'i32'],
         ['compressorMix', 'f64'],                               // v3
         ['limiterSlowReleaseMs', 'f64'],                        // v6
+        ['peakClipperThresholdDbTp', 'f64'],                    // v11
     ],
 
     fc_master_stats: [
@@ -161,6 +169,15 @@ const STRUCTS = {
         ['nonFiniteSubHops', 'i32'], ['loudnessValid', 'i32'], ['lraValid', 'i32'],
         ['compressorGrTraceBuckets', 'i32'], ['limiterGrTraceBuckets', 'i32'],            // v4
         ['compressorGrTraceValid', 'i32'], ['limiterGrTraceValid', 'i32'],                // v4
+        // v11 (K13) — what the peak clipper did, on the limiter's OVERSAMPLED grid. The reading above,
+        // `limiterMaxReconstructedPeakDb`, is unchanged and still means the peak that ARRIVED, before
+        // the clip; the difference between the two is what the clipper took off. `peakClipOccupancy`
+        // is -1.0, never 0.0, when nothing was judged, and `peakClipReductionP95Db` is a quantile over
+        // CLIPPED SAMPLES at 0.1 dB, not a window quantile.
+        ['peakClipReductionMaxDb', 'f64'], ['peakClipReductionP95Db', 'f64'],             // v11
+        ['peakClipOccupancy', 'f64'],                                                     // v11
+        ['peakClipRuns', 'u64'], ['peakClipRunSamplesTotal', 'u64'],                      // v11
+        ['peakClipLongestRunSamples', 'u64'],                                             // v11
     ],
 
     // v10 — `_fc_solution_gr_active_stats`: the limiter's statistics over the windows its INPUT reached the gate.
@@ -347,7 +364,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 10;
+export const FC_MASTER_ABI_VERSION = 11;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
@@ -480,6 +497,9 @@ export const FC_DOMAINS = [
     { field: 'fc_master_params.compressorMix', unit: 'fraction', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'compressorMix', depends: 'compressor: 0 is reported without the stage, whatever was asked for' },
     { field: 'fc_master_params.limiterDualRelease', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.limiterSlowReleaseMs', unit: 'ms', min: '8000/sr', max: null, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'limiterSlowReleaseMs', depends: 'sampleRate: the floor is 8 baseband samples. limiterDualRelease: the resolved value reads 0 while the second envelope is off' },
+    { field: 'fc_master_params.peakClipper', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: 'limiter: the clipper lives inside the limiter, so without one there is nothing to clip and no ceiling for the offset to ride' },
+    { field: 'fc_master_params.peakClipperOverCeilingDb', unit: 'dB over the ceiling', min: 0, max: 12, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'peakClipperThresholdDbTp', depends: 'limiterCeilingDbTp: this is an OFFSET above it, and the resolved field is the absolute level the pair lands on. peakClipper: nothing is clipped while the flag is 0, and an offset no sample reaches is the OTHER way of not clipping — both are bit-exact' },
+    { field: 'fc_master_params.peakClipperKneeDb', unit: 'dB', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '0 is an exact hard clip; above 0 the curve is C1 at both joins and the clipping starts kneeDb BELOW the level' },
     { field: 'fc_master_params.bypassEq', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.bypassMonoBass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.bypassCompressor', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },

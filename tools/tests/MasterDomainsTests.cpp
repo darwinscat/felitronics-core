@@ -320,6 +320,9 @@ const Knob kKnobs[] = {
     PRM_DX ("fc_master_params.compressorMix", compressorMix, 1.0e-6, 1.0e-6, nullptr),
     PRM_I ("fc_master_params.limiterDualRelease", limiterDualRelease),
     PRM_DX ("fc_master_params.limiterSlowReleaseMs", limiterSlowReleaseMs, 1.0e-4, 1.0e-4, nullptr),
+    PRM_I  ("fc_master_params.peakClipper", peakClipper),
+    PRM_DX ("fc_master_params.peakClipperOverCeilingDb", peakClipperOverCeilingDb, 1.0e-9, 1.0e-9, nullptr),
+    PRM_DX ("fc_master_params.peakClipperKneeDb", peakClipperKneeDb, 1.0e-9, 1.0e-9, nullptr),
     PRM_I ("fc_master_params.bypassEq", bypassEq),
     PRM_I ("fc_master_params.bypassMonoBass", bypassMonoBass),
     PRM_I ("fc_master_params.bypassCompressor", bypassCompressor),
@@ -476,6 +479,7 @@ bool resolvedField (const fc_master_resolved& r, const std::string& path, double
     if (path == "limiterCeilingDbTp")   { out = r.limiterCeilingDbTp;        return true; }
     if (path == "limiterReleaseMs")     { out = r.limiterReleaseMs;          return true; }
     if (path == "limiterSlowReleaseMs") { out = r.limiterSlowReleaseMs;      return true; }
+    if (path == "peakClipperThresholdDbTp") { out = r.peakClipperThresholdDbTp; return true; }
     if (path == "compressorMix")        { out = r.compressorMix;             return true; }
     if (path == "monoBass.enabled")     { out = (double) r.monoBass.enabled; return true; }
     if (path == "monoBass.frequencyHz") { out = (double) r.monoBass.frequencyHz; return true; }

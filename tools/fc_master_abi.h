@@ -178,7 +178,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 10u
+#define FC_MASTER_ABI_VERSION 11u
 
 typedef struct fc_header
 {
@@ -525,6 +525,27 @@ typedef struct fc_master_params
     int32_t limiterDualRelease;
     int32_t _pad0;                  // written 0
     double  limiterSlowReleaseMs;
+
+    // ---- v11 (K13) ----
+    // THE PEAK CLIPPER, AND IT IS NOT A STAGE. It lives inside the limiter's own oversampling island, so
+    // there is no `peakClipper` in `fc_master_config` and no `bypassPeakClipper` beside the other bypass
+    // flags — those switch off stages the topology declares, and this is a limiter parameter. One
+    // positive switch, here, default 0: a v10 parameter set read over v11 defaults renders bit for bit.
+    //
+    // TWO DIFFERENT WAYS OF NOT CLIPPING, and both are bit-exact. `peakClipper = 0` never enters the
+    // code at all; `peakClipperOverCeilingDb` so high nothing reaches it enters and finds nothing to do.
+    // They are not the same setting — the first cannot start clipping when the ceiling moves, the second
+    // can — and a page that means "off" should say so with the flag.
+    //
+    // `peakClipperOverCeilingDb` is an OFFSET ABOVE `fc_limiter::ceilingDbTp`, not an absolute level:
+    // it rides the ceiling, so sweeping the ceiling cannot leave the clipper under the thing it guards.
+    // Clamped to [0, limiter::TruePeakLimiter::kMaxOverCeilingDb] and read back, ABSOLUTE, through
+    // `fc_master_resolved::peakClipperThresholdDbTp`. `peakClipperKneeDb` is clamped to [0, 1]; 0 is an
+    // exact hard clip. Non-finite in either is FC_ERR_NON_FINITE, as elsewhere in this struct.
+    int32_t peakClipper;
+    int32_t _pad1;                  // written 0
+    double  peakClipperOverCeilingDb;
+    double  peakClipperKneeDb;
 } fc_master_params;
 
 //==============================================================================
@@ -562,6 +583,13 @@ typedef struct fc_master_resolved
     // ---- v6 ----
     // The limiter's slow release in ms after the core's floor; 0 without a limiter or with the dual release off.
     double limiterSlowReleaseMs;
+
+    // ---- v11 (K13) ----
+    // Where the peak clipper actually cuts, ABSOLUTE in dBTP, after both clamps: ceiling + the clamped
+    // offset. Published because the request is an offset and the clamp is silent otherwise — a caller
+    // that asked for 20 dB over got 12, and this is the only place that says so. 0 without a limiter,
+    // where there is no ceiling for an offset to ride.
+    double peakClipperThresholdDbTp;
 } fc_master_resolved;
 
 //==============================================================================
@@ -797,6 +825,23 @@ typedef struct fc_measurement
     // (mastering::GainReductionTrace::valid — the render ran to its end, the window saw a sample, none non-finite).
     int32_t compressorGrTraceBuckets, limiterGrTraceBuckets;
     int32_t compressorGrTraceValid, limiterGrTraceValid;
+
+    // v11 (K13) — WHAT THE PEAK CLIPPER DID, all of it on the limiter's OVERSAMPLED grid, which is where
+    // it acted. `limiterMaxReconstructedPeakDb` above is unchanged and still means the peak that ARRIVED
+    // at the limiter, BEFORE the clip; how much the clipper took off is the difference between the two.
+    //
+    // `peakClipReductionP95Db` is a quantile over the CLIPPED SAMPLES — "of the samples it touched,
+    // 95 % were pulled down by no more than this" — at 0.1 dB resolution, reported as the bin's upper
+    // edge so it never under-reports. NOT a window quantile: it is a different question from K11's.
+    // `peakClipOccupancy` is the share of judged oversampled samples that were clipped, and it is -1.0,
+    // never 0.0, when nothing was judged — 0.0 is a legitimate reading.
+    //
+    // WHAT THIS DOES NOT SAY. The clipper bounds every sample on that 4x grid; it does NOT bound the
+    // delivered true peak. A hard-clipped sine comes back from the downsampler as its own fundamental
+    // ABOVE the clip level, up to 4/pi = +2.10 dB, and no oversampling factor removes that. Read
+    // `truePeakDbTp` for what shipped.
+    double  peakClipReductionMaxDb, peakClipReductionP95Db, peakClipOccupancy;
+    int64_t peakClipRuns, peakClipRunSamplesTotal, peakClipLongestRunSamples;
 } fc_measurement;
 
 // One bucket of a gain-reduction trace (v4) — mastering::GainReductionTraceBucket, field for field. HEADER-LESS and
@@ -858,9 +903,11 @@ typedef enum fc_struct_id
         X(FC_STRUCT_PARAMS,       1,     6560)    \
         X(FC_STRUCT_PARAMS,       3,     6568)    \
         X(FC_STRUCT_PARAMS,       6,     6584)    \
+        X(FC_STRUCT_PARAMS,      11,     6608)    \
         X(FC_STRUCT_RESOLVED,     1,       80)    \
         X(FC_STRUCT_RESOLVED,     3,       88)    \
         X(FC_STRUCT_RESOLVED,     6,       96)    \
+        X(FC_STRUCT_RESOLVED,    11,      104)    \
         X(FC_STRUCT_STATS,        1,       32)    \
         X(FC_STRUCT_NEED,         1,       40)    \
         X(FC_STRUCT_REQUEST,      1,      120)    \
@@ -869,6 +916,7 @@ typedef enum fc_struct_id
         X(FC_STRUCT_REQUEST,     10,      152)    \
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
         X(FC_STRUCT_MEASUREMENT,  4,      224)    \
+        X(FC_STRUCT_MEASUREMENT, 11,      272)    \
         X(FC_STRUCT_SUMMARY,      1,       88)    \
         X(FC_STRUCT_GR_ACTIVE,   10,       96)
 

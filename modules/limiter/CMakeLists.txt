@@ -16,6 +16,12 @@ if(FELITRONICS_BUILD_TESTS)
     # The ceiling PROOF suite: synthesized witnesses that break a sample-peak limiter, measured by an
     # independent oracle. Separate from the unit suite above because it is numerically heavy (FFT
     # interpolation, phase scans) and carries its own negative controls.
+    add_executable(felitronics_peak_clipper_tests tests/PeakClipperTests.cpp)
+    target_link_libraries(felitronics_peak_clipper_tests PRIVATE felitronics::limiter felitronics::analysis)
+    target_include_directories(felitronics_peak_clipper_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_peak_clipper_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_peak_clipper_tests COMMAND felitronics_peak_clipper_tests)
+
     add_executable(felitronics_limiter_ceiling_tests tests/TruePeakCeilingTests.cpp)
     target_link_libraries(felitronics_limiter_ceiling_tests PRIVATE felitronics::limiter)
     target_include_directories(felitronics_limiter_ceiling_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
