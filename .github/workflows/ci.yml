@@ -768,17 +768,28 @@ jobs:
           # Both rates matter and not for symmetry: at 44.1 kHz the filter arguments of these analyzers
           # (30 Hz, 9 kHz, the K-weighting corner) are ones where the system libm's tan DID differ between
           # rows, so this is the rate that would have caught a regression in the deterministic floor.
-          for mode in report forensics hum lowend bursts excursions; do
+          for mode in report forensics hum lowend bursts stereobursts excursions; do
             check "$mode" 48000 2 fixture.f32
             check "$mode" 44100 2 fixture441.f32
           done
+          # AND K3c ASSERTED TO HAVE FIRED ON BOTH AXES. A stereo instrument whose fixture happens to be
+          # centred has an exactly zero Side, no eligible hop and no event on it — and two such reports
+          # diff clean while the cross arithmetic, which is the whole point of the class, never runs. This
+          # is the same trap the hum check below names, one axis over.
+          $M stereobursts 48000 2 fixture.f32 > an-native.txt
+          grep -qE '^axis 0 [0-9]+ [0-9]+ [0-9]+ [0-9]+ 1 0 [1-9]' an-native.txt \
+            || { echo "the stereobursts fixture stopped firing on Mid — the gate is comparing nothing"; exit 1; }
+          grep -qE '^axis 1 [0-9]+ [0-9]+ [0-9]+ [0-9]+ 1 0 [1-9]' an-native.txt \
+            || { echo "the stereobursts fixture stopped firing on Side — the cross reading is untested"; exit 1; }
+          grep -qE '^e 1 ' an-native.txt \
+            || { echo "no Side event row — crossAt() is not exercised by this gate"; exit 1; }
           # hum again, on the programme that reaches its measurement — and asserted to be a real finding,
           # because a clean diff of two "nothing found" reports is the shape this whole gate exists to
           # refuse.
           check hum 48000 2 humfix.f32
           grep -q '^ch 0 valid 1 reason 0 mains 1' an-native.txt \
             || { echo "the hum fixture stopped finding its line — the gate is comparing nothing again"; exit 1; }
-          echo "bit-identical: $n native-vs-wasm comparisons across five analyzers, two rates, two modules"
+          echo "bit-identical: $n native-vs-wasm comparisons across six analyzers, two rates, two modules"
 
       - name: the price of a measurement — the same demand on both tiers (P81)
         if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
@@ -801,11 +812,11 @@ jobs:
           test -s storage-native.txt
           # A table of nothing but refusals would compare clean and say nothing, which is the shape this
           # repository keeps catching. Floors, not equalities, so the grid may grow — but it may not
-          # shrink: 475 rows today, of which 284 are priced. (P51 moved the rate floor to 8000 Hz: the 1000 Hz
+          # shrink: 571 rows today, of which 329 are priced (K3c added 95 rows, 44 of them priced). (P51 moved the rate floor to 8000 Hz: the 1000 Hz
           # rows went to zero, the 2000 Hz rows left the grid, and 7999 / 12000 / 16000 joined — 425 / 280 before.)
-          [ "$(wc -l < storage-native.txt)" -ge 475 ] \
+          [ "$(wc -l < storage-native.txt)" -ge 570 ] \
             || { echo "the storage table lost rows — a smaller grid still compares clean"; exit 1; }
-          [ "$(grep -cv ' 0$' storage-native.txt)" -ge 284 ] \
+          [ "$(grep -cv ' 0$' storage-native.txt)" -ge 328 ] \
             || { echo "the storage table is mostly refusals — it is comparing nothing"; exit 1; }
           for mod in fcprobe.node.js fcprobe.debug.js; do
             node tools/wasm/storage-probe.mjs "tools/wasm/build/$mod" table > storage-wasm.txt

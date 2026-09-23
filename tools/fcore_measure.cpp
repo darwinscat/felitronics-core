@@ -76,6 +76,7 @@
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/PeakExcursions.h>
 #include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/StereoBandBursts.h>
 #include <felitronics/analysis/BandCrest.h>
 
 #include <algorithm>
@@ -227,7 +228,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|crest|excursions|forensics> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|stereobursts|crest|excursions|forensics> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -1139,6 +1140,130 @@ int main (int argc, char** argv)
             if (det.intervalBin (b) != 0) std::printf ("ioi %d %lld\n", b, (long long) det.intervalBin (b));
         for (int b = 1; b <= analysis::BandBursts::kMaxLag; ++b)
             if (det.lagBin (b) != 0) std::printf ("lag %d %lld\n", b, (long long) det.lagBin (b));
+        return 0;
+    }
+
+    // K3c — the same band detector on Mid and Side, with the cross reading that says which axis carried
+    // each burst. A SEPARATE MODE, not a version of `bursts`: the mono road above keeps its bytes and its
+    // readers. Everything float is a raw IEEE-754 bit pattern, as every mode here prints it.
+    if (mode == "stereobursts")
+    {
+        std::uint64_t declaredFrames = 0;
+        if (! fileFrames (f, nc, declaredFrames))
+        {
+            std::fprintf (stderr, "cannot size the file, or it is not a whole number of %d-channel float32 frames\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        {
+            double sRate = 0.0; std::uint64_t sWidth = 0;
+            if (! parseRate (argv[2], sRate) || ! parseCount (argv[3], sWidth)
+                || sWidth < 1 || sWidth > (std::uint64_t) core::kMaxChannels)
+            {
+                std::fprintf (stderr, "bad sampleRate/channels\n");
+                std::fclose (f);
+                return 2;
+            }
+        }
+        analysis::StereoBandBursts sdet;
+        analysis::BandBurstsParams sp;
+        {
+            struct Flag { const char* name; double* into; };
+            const Flag flags[] = {
+                { "--band-low",    &sp.bandLowHz },  { "--band-high",   &sp.bandHighHz },
+                { "--hop-ms",      &sp.hopMs },      { "--baseline-ms", &sp.baselineMs },
+                { "--enter-db",    &sp.enterDb },    { "--exit-db",     &sp.exitDb },
+            };
+            for (int i = 5; i < argc; ++i)
+            {
+                const Flag* hit = nullptr;
+                for (const Flag& fl : flags) if (std::strcmp (argv[i], fl.name) == 0) { hit = &fl; break; }
+                if (hit != nullptr)
+                {
+                    if (i + 1 >= argc || ! parseFinite (argv[i + 1], *hit->into))
+                    {
+                        std::fprintf (stderr, "stereobursts: %s needs a finite number\n", hit->name);
+                        std::fclose (f);
+                        return 2;
+                    }
+                    ++i;
+                    continue;
+                }
+                if (std::strncmp (argv[i], "--", 2) == 0 && std::strcmp (argv[i], "--precise") != 0)
+                {
+                    std::fprintf (stderr, "stereobursts: unknown option %s (want --band-low --band-high "
+                                          "--hop-ms --baseline-ms --enter-db --exit-db)\n", argv[i]);
+                    std::fclose (f);
+                    return 2;
+                }
+            }
+        }
+        sdet.setParams (sp);
+        if (! sdet.prepare (fs, nc))
+        {
+            std::fprintf (stderr, "stereobursts: prepare refused this configuration — band %g-%g Hz (0.49 fs "
+                                  "must clear the top corner), hop %g ms, baseline %g ms (>= one hop), "
+                                  "enter %g dB (> 0), exit %g dB (0 <= exit <= enter), at %g Hz\n",
+                          sp.bandLowHz, sp.bandHighHz, sp.hopMs, sp.baselineMs, sp.enterDb, sp.exitDb, fs);
+            std::fclose (f);
+            return 2;
+        }
+        bool sfed = true;
+        streamPlanar (f, nc, [&] (const float* const* p, int n) { if (sfed) sfed = sdet.process (p, nc, n); });
+        std::fclose (f);
+        if (! sfed || ! sdet.finish())
+        {
+            std::fprintf (stderr, "stereobursts: the detector refused the stream\n");
+            return 2;
+        }
+        if ((std::uint64_t) sdet.samplesProcessed() != declaredFrames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) sdet.samplesProcessed(), (unsigned long long) declaredFrames);
+            return 2;
+        }
+
+        const analysis::BandBursts& sm = sdet.mid();
+        const analysis::BandBursts& ss = sdet.side();
+        std::printf ("# fcore stereobursts v1 sr=%016llx ch=%d hop=%d base=%d lo=%016llx hi=%016llx "
+                     "enter=%016llx exit=%016llx chunk=%d\n",
+                     (unsigned long long) bits (fs), nc, sm.hopSamples(), sm.baselineHops(),
+                     (unsigned long long) bits (sm.bandLowHz()), (unsigned long long) bits (sm.bandHighHz()),
+                     (unsigned long long) bits (sp.enterDb), (unsigned long long) bits (sp.exitDb), kChunk);
+        // ASKED FOR and OBSERVED, both: on a zero-length programme nothing arrives, so the detector's own
+        // channel count is 0 while the header above still describes the two that were requested.
+        std::printf ("samples %lld ran %d\n", (long long) sdet.samplesProcessed(), sdet.channels());
+        // The dome: what the band can report AT ALL for a pure tone, and where it peaks. A share read
+        // against a textbook number instead of against this one is wrong by the dome at every rate.
+        std::printf ("dome %016llx %016llx\n", (unsigned long long) bits (sdet.domeShare()),
+                     (unsigned long long) bits (sdet.domeHz()));
+        // Absence is STRUCTURAL — one channel — and never a threshold on how small Side is.
+        std::printf ("side %d %lld %lld\n", sdet.sideAbsent() ? 1 : 0,
+                     (long long) sdet.exactZeroHops (analysis::StereoBandBursts::kMid),
+                     (long long) sdet.exactZeroHops (analysis::StereoBandBursts::kSide));
+        for (int a = 0; a < analysis::StereoBandBursts::kAxes; ++a)
+        {
+            const analysis::BandBursts& d = a == 0 ? sm : ss;
+            std::printf ("axis %d %lld %lld %lld %lld %d %d %lld %lld %d\n", a,
+                         (long long) d.hopCount(), (long long) d.eligibleHops(),
+                         (long long) d.zeroBaselineHops(), (long long) d.burstHops(),
+                         d.eventsValid() ? 1 : 0, (int) d.eventsInvalidReason(),
+                         (long long) d.eventCount(), (long long) d.storedEventCount(),
+                         d.eventsComplete() ? 1 : 0);
+            for (std::int64_t i = 0; i < d.storedEventCount(); ++i)
+            {
+                const analysis::BandBurst e = d.event (i);
+                const analysis::StereoBandBursts::Cross c = sdet.crossAt (a, i);
+                std::printf ("e %d %lld %lld %lld %lld %016llx %016llx %016llx %016llx %016llx %016llx %016llx %d %lld\n",
+                             a, (long long) e.start, (long long) e.length, (long long) e.peakAt,
+                             (long long) e.hops,
+                             (unsigned long long) bits (e.peakPower), (unsigned long long) bits (e.peakBaseline),
+                             (unsigned long long) bits (e.peakExcessDb), (unsigned long long) bits (e.peakWidePower),
+                             (unsigned long long) bits (e.energy),
+                             (unsigned long long) bits (c.power), (unsigned long long) bits (c.baseline),
+                             c.eligible ? 1 : 0, (long long) c.hop);
+            }
+        }
         return 0;
     }
 
