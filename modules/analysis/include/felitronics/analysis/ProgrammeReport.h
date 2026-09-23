@@ -113,10 +113,21 @@ namespace felitronics::analysis
 //     function answers 0.0 both for a constant tone (whose range really is 0 LU) and for a programme where
 //     the gates left fewer than two short-term observations, and from outside the meter the two cannot be
 //     told apart. EBU Tech 3342 is computed here from this class's own short-term series, where the gated
-//     count is known exactly. The two agree to about 0.3 LU wherever both are defined — not bitwise, and
-//     the reason is worth knowing: the meter sums its short-term window newest-first
-//     (LoudnessMeter::meanLastSubHops) and this class oldest-first, so the two orders leave different residues. The
-//     suite pins the agreement at that tolerance.
+//     count is known exactly.
+//
+//     THEY NO LONGER AGREE, AND THIS SENTENCE USED TO SAY THEY DID — "to about 0.3 LU wherever both are
+//     defined", with summation order named as the only difference. That was true while both sampled the
+//     short-term window once a second. K12 moved `LoudnessMeter` to one sample per 100 ms hop, which is what
+//     EBU Tech 3342 §3.1 requires ("a minimum block overlap of 2.9 s … i.e. >=10 Hz sampling"); THIS class
+//     still samples once a second (`kObservationHops = 100`, libebur128's cadence). On steady material the
+//     two still land within that 0.3 LU, which is why the suite's agreement check went on passing. On a square
+//     envelope whose states last exactly the 3 s window they do not: measured at 44.1 and 48 kHz, over 12, 30
+//     and 120 s programmes, `lraLu` reads 20.00 LU and the meter reads 9.50. Both are labelled EBU Tech 3342.
+//
+//     THAT IS AN OPEN DEFECT, recorded rather than repaired here: moving this cadence moves `lraLu`,
+//     `shortTermP10/P50/P95`, `shortTermSpreadLu` and `shortTermObservations`, every one of them a published
+//     number a consumer may be calibrated against, and that is a decision about the report surface rather
+//     than about the meter. ProgrammeReportTests measures the gap so it cannot go quiet again.
 //
 // FORM. setParams / prepare / process / finish / reset, like `analysis::ClipDetector`. `process()` is
 // READ-ONLY and allocates nothing; `finish()` drains the true-peak filter, closes the report and freezes
@@ -382,7 +393,10 @@ public:
         ProgrammeValue integratedLufs;                  // BS.1770 gated, analysis::LoudnessMeter
         ProgrammeValue truePeakDbtp;                    // analysis::ReferenceTruePeakMeter, 4× / 32 taps
         ProgrammeValue plrDb;                           // truePeakDbtp - integratedLufs
-        ProgrammeValue lraLu;                           // EBU Tech 3342, P95-P10 of the gated short-term set
+        // EBU Tech 3342, P95-P10 of the gated short-term set — BUT READ FROM A 1 Hz SERIES, which §3.1 of that
+        // same standard does not allow (it asks for >=10 Hz). `LoudnessMeter::loudnessRangeLu()` has sampled at
+        // 10 Hz since K12 and the two can differ by 10.5 LU; see the file head. Open defect, not a definition.
+        ProgrammeValue lraLu;
         ProgrammeValue shortTermP10, shortTermP50, shortTermP95;   // absolute-gated only
         ProgrammeValue shortTermSpreadLu;               // P95 - P10 of the same set
         std::int64_t   shortTermObservations      = 0;

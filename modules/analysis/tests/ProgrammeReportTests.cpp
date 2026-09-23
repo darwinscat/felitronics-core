@@ -418,8 +418,10 @@ static Ref reference (const Planes& p, double fs, const Params& pm, int channels
     // `PR::kShortTermSubHops` and `PR::kObservationHops` from the header, and a crew testing round showed
     // what that costs: changing the observation stride from 100 sub-hops to 99 or 101 left all 350 checks
     // GREEN, because the "independent" reference imported the mutated constant and moved with it instead of
-    // opposing it. An oracle that reads the subject's own parameters is the subject. 300 sub-hops is 3 s and
-    // 100 is one second, from EBU Tech 3342 and libebur128, not from this header.
+    // opposing it. An oracle that reads the subject's own parameters is the subject. 300 sub-hops is 3 s, from
+    // EBU Tech 3342, and 100 is one second, from libebur128 — NOT from 3342, whose §3.1 asks for a sample at
+    // least every 100 ms. Both numbers are written here rather than read from the header; the attribution used
+    // to name 3342 for both, which credited the standard with the cadence it does not specify.
     const int kRefWindowHops = 300;
     const int kRefObsStride  = 100;
     const double kRefAbsGate = 1.1724653045822981e-07;      // 10^((-70 + 0.691)/10), the BS.1770 gate
@@ -750,7 +752,49 @@ static void testClosedForms()
             test::run (lm.process (ch, 2, n));
         }
         test::approx (o.R.lraLu.value, lm.loudnessRangeLu(), 0.3,
-                      "the LRA here and LoudnessMeter::loudnessRangeLu() are the same number");
+                      "on THIS programme the LRA here and LoudnessMeter::loudnessRangeLu() are the same number "
+                      "(long steady steps, where the sampling cadence cannot matter — see the group below)");
+
+        // …ON THIS FIXTURE, AND THE CHECK ABOVE IS NARROWER THAN THE SENTENCE IT STANDS UNDER. Its programme is
+        // long steady steps, where every window that is not straddling a step reads the same value and the
+        // sampling CADENCE cannot matter. Since K12 the two classes no longer share one: LoudnessMeter takes a
+        // short-term sample per 100 ms hop, the >=10 Hz EBU Tech 3342 §3.1 requires, and this class still takes
+        // one a second (kObservationHops = 100, libebur128's). An envelope whose states last exactly the 3 s
+        // window is where that shows, because then the window can sit wholly inside a state and how often it
+        // does is decided by the grid.
+        //
+        // AN OPEN DEFECT, MEASURED RATHER THAN BLESSED. Both numbers are labelled EBU Tech 3342 and they are
+        // 10.5 LU apart. This group asserts what is true today so the gap cannot go quiet; whoever closes it —
+        // by moving this cadence, which also moves shortTermP10/P50/P95, shortTermSpreadLu and
+        // shortTermObservations, every one a published number — will find this check red and pointing at itself.
+        {
+            const double fs = kFs;
+            const int frames = (int) (fs * 12.0);
+            const std::size_t state = (std::size_t) (fs * 3.0);
+            std::vector<std::vector<float>> q (2, std::vector<float> ((std::size_t) frames, 0.0f));
+            for (int i = 0; i < frames; ++i)
+            {
+                const double s = std::sin (2.0 * core::kPi * 1000.0 * (double) i / fs);
+                const double g = (((std::size_t) i / state) % 2 == 0) ? 0.25 : 0.025;   // 20 dB apart
+                q[0][(std::size_t) i] = q[1][(std::size_t) i] = (float) (g * s);
+            }
+            Params wpm; wpm.maxDurationSec = 120.0;
+            const auto w = run (q, fs, 4096, { 4096 }, wpm);
+            analysis::LoudnessMeter ref;
+            test::run (ref.prepareForSamples (fs, 2, (double) frames));
+            const float* rp[2] { q[0].data(), q[1].data() };
+            test::run (ref.process (rp, 2, frames));
+            test::ok (w.R.lraLu.valid, "PRECONDITION: the report publishes an LRA for this programme");
+            test::approx (w.R.lraLu.value, 20.0, 0.25,
+                          "the report's 1 Hz series reads " + std::to_string (w.R.lraLu.value)
+                          + " LU — the full swing a coarse grid lands on");
+            test::approx (ref.loudnessRangeLu(), 9.5, 0.25,
+                          "the meter's 10 Hz series reads " + std::to_string (ref.loudnessRangeLu()) + " LU");
+            test::ok (w.R.lraLu.value - ref.loudnessRangeLu() > 10.0,
+                      "KNOWN DEFECT: two numbers labelled EBU Tech 3342 differ by "
+                      + std::to_string (w.R.lraLu.value - ref.loudnessRangeLu())
+                      + " LU because only one of them samples at the cadence §3.1 requires");
+        }
     }
 }
 

@@ -913,10 +913,10 @@ void testAStoppedOrRefusedSolveHoldsItsTracesOnce()
     // how many distributions a solution keeps. K11's third histogram moved two of them at once, which reads as
     // a failure of the solve budget and is a failure of nothing. What this group is about is the PER-PASS cost,
     // so that is the literal, and the rest is spelled through the same expressions the budget is made of.
-    test::ok (budget == 21392u + (std::uint64_t) traces + (std::uint64_t) kGrWindowBytes
+    test::ok (budget == 21568u + (std::uint64_t) traces + (std::uint64_t) kGrWindowBytes
               && traces == 4194304LL,
               "PRECONDITION: mono, 65536 frames and buckets: a budget of "
-              + std::to_string (budget) + " B = 21 392 B of meters + the traces " + std::to_string (traces)
+              + std::to_string (budget) + " B = 21 568 B of meters + the traces " + std::to_string (traces)
               + " B + the window histograms " + std::to_string (kGrWindowBytes) + " B");
 
     using When = StopAt::When;
@@ -2513,7 +2513,7 @@ void testSurvivorsOfTheMutationStand()
     // ---------------------------------------------------------------------------------------------
     test::group ("a programme too short for a loudness RANGE does not get one invented");
     {
-        // EBU Tech 3342 needs short-term samples, one a second. Under three seconds there are none, and
+        // EBU Tech 3342 needs short-term samples, and their window is 3 s. Under three seconds there are none, and
         // `loudnessRangeLu()` answers 0.0 — which is also what "no dynamic range at all" answers. A
         // solver that took that as a measurement would compute a range LOSS equal to the whole input
         // range and refuse a programme it should have mastered.
@@ -3245,9 +3245,48 @@ void testTheBoundIsTheSearchsLimit()
                   && (sol.alsoViolated & lraBit) != 0u,
                   std::string ("refused by name: the loudness range (got ") + statusName (sol.status) + "/"
                   + constraintName (sol.binding) + ")");
-        // Regula falsi on the range from the drive the limiter starts working at closes this bracket in six renders, the
-        // delivery re-render included; bisection, or regula falsi that never halves a stale end, takes eight.
-        test::ok (sol.passes <= 6, "closed in six renders (" + std::to_string (sol.passes) + ")");
+        // SEVEN RENDERS SINCE K12 — AND THE SEARCH STILL TAKES SIX. The seventh is the DELIVERY re-render, and
+        // that distinction is the whole finding: pass 7 is bit-identical to pass 4 (same drive, same ceiling,
+        // same integrated), because the search's last probe broke the limit and delivery goes back to the best
+        // feasible one. Before K12 the sixth probe happened to KEEP the limit and was delivered as it stood, so
+        // no re-render was spent. What decided that is a 0.05 LU quantum: the range reads on a 0.1 LU staircase
+        // and the 2.05 LU limit sits between the 11.2 and 11.3 the sixth probe can land on. Input LRA 12.80 to
+        // 13.30 with the cadence, and the delivered range moved with it (pass 2 reads 9.40 where it read 8.80).
+        //
+        // SO THE SIX IS KEPT, AS A SEARCH COUNT. A bound of "<= 7 renders" would have covered this, and would
+        // also have covered a search that genuinely needed a seventh probe — the property the old six carried
+        // (regula falsi, not bisection) would have been spent to absorb a re-render. The re-render is therefore
+        // identified and subtracted, and the halving that makes it regula falsi is asserted on its own below.
+        const bool reRendered = sol.passes >= 2
+                             && core::exactlyEqual (sol.log[sol.logCount - 1].gainDb,    sol.log[3].gainDb)
+                             && core::exactlyEqual (sol.log[sol.logCount - 1].ceilingDb, sol.log[3].ceilingDb);
+        test::ok (reRendered, "the last render repeats an earlier probe exactly — it is the delivery re-render");
+        test::ok (sol.passes - (reRendered ? 1 : 0) <= 6,
+                  "the SEARCH closed in " + std::to_string (sol.passes - (reRendered ? 1 : 0))
+                  + " renders, the delivery re-render taken off (" + std::to_string (sol.passes) + " in total)");
+        // Passes 3 and 4 both advance the FEASIBLE end, which leaves pass 2 a stale upper end. False position on
+        // a stale end stalls, so its excess is halved before the next proposal is drawn. Reconstructed from the
+        // log's own numbers: the proposal is the secant between the feasible end's excess and HALF the stale
+        // one's. Un-halved, the same arithmetic lands about 0.08 dB lower — far outside the tolerance here, so
+        // this check distinguishes the two searches that `passes <= 7` cannot.
+        if (sol.logCount >= 5)
+        {
+            const auto drive = [] (const auto& r) { return r.gainDb - r.ceilingDb; };
+            const double eLo = (inLra - sol.log[3].loudnessRangeLu) - req.maxLraLossLu;   // pass 4: feasible, excess < 0
+            const double eHi = (inLra - sol.log[1].loudnessRangeLu) - req.maxLraLossLu;   // pass 2: the stale end
+            const double dLo = drive (sol.log[3]), dHi = drive (sol.log[1]);
+            const double halved   = dLo + (dHi - dLo) * (-eLo) / (0.5 * eHi - eLo);
+            const double unhalved = dLo + (dHi - dLo) * (-eLo) / (eHi - eLo);
+            test::ok (eLo < 0.0 && eHi > 0.0 && dHi > dLo,
+                      "PRECONDITION: pass 4 is the feasible end and pass 2 the stale one above it");
+            test::approx (drive (sol.log[4]), halved, 0.01,
+                          "pass 5 is drawn against a HALVED stale end (" + std::to_string (drive (sol.log[4]))
+                          + " against " + std::to_string (halved) + "; without the halving it would be "
+                          + std::to_string (unhalved) + ")");
+            test::ok (std::fabs (halved - unhalved) > 0.05,
+                      "…and the two proposals are far enough apart for that check to mean something ("
+                      + std::to_string (std::fabs (halved - unhalved)) + " dB)");
+        }
         const Independent ind = measureIndependently (dst.ch);
         test::ok (inLra - ind.LRA <= req.maxLraLossLu && ind.TP <= req.maxTruePeakDbTp,
                   "the delivered audio keeps the limit and the promise (loss " + std::to_string (inLra - ind.LRA)
@@ -3646,11 +3685,20 @@ static void testLraRefusesAPoisonedProgramme()
 
     double clean = 0.0;
     test::ok (s.measureInputLoudnessRange (in, nch, frames, clean), "a clean programme is measured");
-    test::approx (clean, 4.8, 0.05, "and the range is the fixture's own 4.8 LU");
+    // 8.5 LU SINCE K12, WHERE IT WAS 4.8 — and the fixture is the reason, not a drift. Its envelope steps
+    // every 3 seconds, which is EXACTLY the short-term window's length: at the old 1 Hz cadence the window
+    // caught three samples per phase and missed every transition between them, and at 10 Hz it catches the
+    // ramps too, which fill the distribution the percentiles are read from. Measured across periods on this
+    // shape: 3 s +3.7 LU, 4 s +2.9, 6 s +2.2, 10 s +2.6. What it does to material with a SMOOTH envelope was
+    // not measured and is not claimed here — a sentence saying it "moves nothing at all" stood in this place
+    // and was an extrapolation from the shapes above, which are all square. The number here is re-derived, not
+    // adjusted: 8.5 is what a correctly sampled 3 s window says about a programme that alternates on the
+    // window's own timescale.
+    test::approx (clean, 8.5, 0.05, "and the range is the fixture's own 8.5 LU");
 
     // Poison every LOUD second. A poisoned sub-hop is recorded as SILENCE, silence fails the absolute
     // gate, and the loud blocks leave the distribution the range is computed over — so the number this
-    // used to return was 21.4 LU, a range the programme does not have, with `true` beside it.
+    // used to return was 9.6 LU, a range the programme does not have, with `true` beside it.
     for (int sec = 0; sec < 30; ++sec)
         if (sec % 6 < 3)
             for (int i = sec * 48000; i < (sec + 1) * 48000; ++i)
@@ -3661,13 +3709,15 @@ static void testLraRefusesAPoisonedProgramme()
     test::ok (poisoned == -1.0, "and the out-parameter is untouched by the refusal");
 
     // PRECONDITION, and the whole reason this test is worth having: the number really would have moved.
-    // A fixture on which poisoning changes nothing would pass this test while proving nothing.
+    // A fixture on which poisoning changes nothing would pass this test while proving nothing. (9.6 LU since
+    // K12, where it was 21.4, for the same reason the clean figure moved — and the point stands either way:
+    // poisoning the loud seconds still changes the answer, which is what makes the refusal worth making.)
     analysis::LoudnessMeter lm;
     test::ok (lm.prepare (fs, nch, (double) frames / fs + 1.0), "an independent meter for the precondition");
     (void) lm.process (in, nch, frames);
     test::ok (lm.nonFiniteSubHops() > 0, "PRECONDITION: the meter really is flagging this programme");
-    test::approx (lm.loudnessRangeLu(), 21.4, 0.05,
-            "PRECONDITION: and the number it would have returned is 21.4 LU, not 4.8");
+    test::approx (lm.loudnessRangeLu(), 9.6, 0.05,
+            "PRECONDITION: and the number it would have returned is 9.6 LU, not 8.5");
 }
 
 // P51 — THE SEARCH MEASURES AT NO RATE BELOW THE CORE'S FLOOR. Before P51 it took any finite rate > 0: a chain at
@@ -3778,7 +3828,7 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // was parameterised by `kGrWindowBytes` — so K11's third histogram moved the assertion and left the sentence
     // describing a number that no longer existed. A test may not carry a number its own run does not produce.
     test::ok (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB)
-                  == 2672u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes,
+                  == 2816u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes,
               "and " + std::to_string (TargetLoudnessSolver::solveBytes (48000.0, 2, 48000, kB))
               + " B for 1 s of stereo at the default 1000 buckets — meter, reference true-peak meter, two "
                 "traces and the three window histograms (the ABI suite's oracle)");
@@ -3798,13 +3848,16 @@ static void testTheBudgetsRefuseWhatTheCallsRefuse()
     // The cheap meter's factor followed the RATE and its budget had to follow too (the diverse-testing round's mutant
     // sized it at 48 kHz and passed). The reference is 4x at EVERY rate, so its budget must NOT move with the rate —
     // the opposite claim, pinned for the same reason: one rate could not tell. 1 s is 20 hops at any multiple of 100 Hz,
-    // so the loudness meter is 8·(300 + 24 + 10) = 2672 B at each of them.
+    // so the loudness meter is 8·(300 + 24 + 28) = 2816 B at each of them. THE LAST TERM IS WHAT K12 MOVED: the
+    // short-term store used to hold one sample per ten hops and now holds one per hop, the cadence EBU Tech 3342
+    // §3.1 asks for, so 10 doubles became 28 — the 20 hops, plus the same margin of 8 that stood there before.
     test::ok (ReferenceTruePeakMeter::storageFor (96000.0, 96000, 2).bytes() == 21008u && ReferenceTruePeakMeter::storageFor (192000.0, 192000, 2).bytes() == 21008u,
               "the reference true-peak meter is 21 008 B at 96 and at 192 kHz too");
-    const std::uint64_t oneSecond = 2672u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes;
+    const std::uint64_t oneSecond = 2816u + 21008u + 64000u + (std::uint64_t) kGrWindowBytes;
     test::ok (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000, kB) == oneSecond
               && TargetLoudnessSolver::solveBytes (192000.0, 2, 192000, kB) == oneSecond,
-              "and a 1 s solve at 96 and 192 kHz carries it unchanged: 727 696 B");
+              "and a 1 s solve at 96 and 192 kHz carries it unchanged: "
+              + std::to_string (TargetLoudnessSolver::solveBytes (96000.0, 2, 96000, kB)) + " B");
 }
 
 // P62 — THE INSTRUMENT CHANGED, THE SPELLING OF SILENCE DID NOT. The solver now reads with ReferenceTruePeakMeter, whose

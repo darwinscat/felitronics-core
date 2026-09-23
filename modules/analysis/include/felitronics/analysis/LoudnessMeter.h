@@ -96,7 +96,7 @@ public:
     {
         int         subSamples = 0;     // one 10 ms sub-hop, lround (0.01·fs) and at least 1
         std::size_t blocks     = 0;     // 400 ms gating blocks kept for the integrated measure
-        std::size_t shortTerm  = 0;     // 3 s short-term samples kept for LRA, one a second
+        std::size_t shortTerm  = 0;     // 3 s short-term samples kept for LRA, one per 100 ms hop (10 Hz)
         // 64 bits because the product is the point: on wasm32 a `size_t` byte count wraps long before the element
         // counts above do.
         std::uint64_t bytes() const noexcept
@@ -131,7 +131,9 @@ public:
         if (! (hops <= (double) kMaxBlocks)) return false;
         out.subSamples = s;
         out.blocks     = (std::size_t) hops + 4;
-        out.shortTerm  = (std::size_t) (hops / 10.0) + 8;
+        // ONE PER HOP since the cadence became 10 Hz, where it used to be one per ten. Ten times the entries
+        // and ten times this term of the demand: for a ten-minute programme it is 48 KB where it was 4.8.
+        out.shortTerm  = (std::size_t) std::ceil (hops) + 8;
         return true;
     }
 
@@ -142,7 +144,7 @@ public:
         ranNc_ = 0;                             // nothing has run, so nothing can be stopping
         subCount = 0; subWrite = 0; subFilled = 0; subInHop = 0; blockCount = 0; droppedBlocks_ = 0;
         nonFiniteSubHops_ = 0;
-        stCount = 0; stSince = 0;
+        stCount = 0; droppedShortTerm_ = 0;
         std::fill (subRing.begin(), subRing.end(), 0.0);
     }
 
@@ -189,11 +191,36 @@ public:
     double shortTermLufs()  const noexcept { return lufsOf (meanLastSubHops (kSubRing)); }           // 3 s
     double integratedLufs() const noexcept { return integrated(); }                                  // gated
     double loudnessRangeLu() const noexcept { return lra(); }                                        // EBU Tech 3342 (P95−P10)
+    // How many 3 s short-term samples the range was read from. Published because the CADENCE is part of what
+    // Tech 3342 3.1 specifies — "a minimum block overlap of 2.9 s … i.e. >=10 Hz sampling" — and a count is
+    // the only way a caller, or a test, can see which cadence a build runs.
+    int shortTermCount() const noexcept { return stCount; }
 
-    // Gating blocks that arrived past the prepared capacity and were not kept. Non-zero means integratedLufs() and
-    // loudnessRangeLu() describe only the part of the program that fitted — a caller that must not lose a block
-    // sizes prepare() / prepareForSamples() for its longest program and checks this reads 0.
+    // Gating blocks that arrived past the prepared capacity and were not kept. Non-zero means integratedLufs()
+    // describes only the part of the program that fitted — a caller that must not lose a block sizes prepare() /
+    // prepareForSamples() for its longest program and checks this reads 0.
+    //
+    // THE SENTENCE USED TO NAME loudnessRangeLu() HERE TOO, and that was an overstatement worth spelling out:
+    // the range is read from a SECOND store, the two overflow at different moments, and a non-zero count here
+    // does NOT mean the range was truncated. Blocks: capacity floor(hops) + 4 against a production of
+    // floor(hops) - 3, so an overfeed of 8 hops loses the first one. Short-term: capacity ceil(hops) + 8
+    // against floor(hops) - 29, so it takes 38. Thirty hops — three seconds — where this counter climbs and
+    // the range is still whole. Integers, not rates: LoudnessConformanceTests feeds exact hop multiples at
+    // 48 and 44.1 kHz and gets the same two thresholds.
+    //
+    // So the block store always goes first, and a caller that sizes for its longest programme and checks THIS
+    // reads 0 does have both answers whole — the half of the old sentence that was true. What it could not do
+    // before droppedShortTermSamples() existed was tell the two apart once this one was non-zero.
     int droppedBlocks() const noexcept { return droppedBlocks_; }
+
+    // Short-term samples that arrived past the prepared capacity and were not kept — the same statement for
+    // loudnessRangeLu() that droppedBlocks() makes for integratedLufs(), and until K12 nothing made it. A
+    // truncated range is not a smaller range, it is a different number: the percentiles are taken over whatever
+    // survived. The margin this counter watches NARROWED with the cadence — at one sample a second the store
+    // held floor(hops/10) + 8 (a truncating cast, not a ceiling) against a production of about hops/10 - 2,
+    // which took an overfeed of about a hundred hops; at one a hop it is ceil(hops) + 8 against
+    // floor(hops) - 29, and 38 hops are enough. Both were silent; this is the counter that is not.
+    int droppedShortTermSamples() const noexcept { return droppedShortTerm_; }
 
     // Completed 10 ms sub-hops whose channel-weighted mean square came out NON-FINITE — the damage counter,
     // and the reason the readings above may be believed or may not. STICKY until reset()/prepare(): a live
@@ -244,7 +271,13 @@ private:
     static constexpr int kSubRing          = 300;                                   // 3 s — the short-term window, and the ring
     // The bounds storageFor() refuses beyond, each named for the property it protects.
     static constexpr int kMaxSubHop        = std::numeric_limits<int>::max() / 10;  // ten sub-hops make a hop, and a hop is an int
-    static constexpr int kMaxBlocks        = std::numeric_limits<int>::max() - 4;   // every block index is an int
+    // THE BOUND IS THE TIGHTER OF THE TWO STORES, and until K12 it was written for the looser one. It read
+    // INT_MAX - 4, sized for `blocks = floor(hops) + 4`, because the short-term store was a tenth of the hop
+    // count and could not be the binding constraint. At one sample a hop it is `ceil(hops) + 8`, so INT_MAX - 4
+    // ACCEPTS a capacity of INT_MAX + 4 — and `stCount < (int) stE.size()` then compares against a narrowed
+    // negative, rejecting every short-term sample from the first one on, with `droppedBlocks()` still reading 0.
+    // Unreachable in practice (the store would be 17 GB) but reachable on paper, which is where a bound lives.
+    static constexpr int kMaxBlocks        = std::numeric_limits<int>::max() - 8;   // both stores' indices are ints
 
     void finishSubHop (int nc) noexcept
     {
@@ -319,7 +352,7 @@ private:
     }
 
     // Every 100 ms: a 400 ms gating block for the integrated measure and, once 3 s are in, a short-term
-    // sample every 1 s for LRA.
+    // sample for LRA — one PER HOP since K12, which is the 10 Hz Tech 3342 3.1 asks for.
     void finishHop() noexcept
     {
         if (subFilled >= kMomentarySubHops)                                         // a 400 ms block every 100 ms
@@ -327,10 +360,50 @@ private:
             if (blockCount < (int) blockE.size()) blockE[(std::size_t) blockCount++] = meanLastSubHops (kMomentarySubHops);
             else ++droppedBlocks_;                                                  // past the capacity: counted, not kept
         }
-        if (subFilled >= kSubRing)                                                  // a 3 s short-term sample every 1 s (LRA)
+        // A 3 s SHORT-TERM SAMPLE EVERY HOP — 10 Hz, which is what EBU Tech 3342 requires and what this meter
+        // did not do. §3.1, verbatim: "using a sliding analysis-window of length 3 seconds for integration …
+        // A minimum block overlap of 2.9 s between consecutive analysis windows (i.e. >=10 Hz sampling of the
+        // loudness level) is required". With a 3 s window a 2.9 s overlap IS a 100 ms step, so the two
+        // phrasings are one requirement. The requirement entered in V3 (January 2016); this meter kept
+        // libebur128's 1 Hz cadence, which is a 2 s overlap.
+        //
+        // "OUR HOP IS EXACTLY IT" ONLY WHERE 0.01·fs IS A WHOLE NUMBER. A sub-hop is lround (0.01·fs) samples,
+        // so at 48 and 44.1 kHz a hop is 100 ms to the sample and the cadence is 10 Hz exactly. At 22050 Hz the
+        // sub-hop rounds 220.5 up to 221, a hop is 2210 samples = 100.227 ms, and the cadence is 9.9774 Hz —
+        // UNDER the standard's minimum, by 0.23 %. At 8050 Hz it is 9.9383 Hz. The window rounds with it: 3.0068 s
+        // at 22050, 3.0186 s at 8050, against a specified 3 s. It cuts the other way too — 8049 Hz rounds 80.49
+        // DOWN to 80, giving 10.0613 Hz and a window of 2.9817 s — fast enough, and too short. That is the
+        // meter's whole sub-hop grid, not something K12 introduced, and moving it would move every number this
+        // class produces at those rates — so it is named here rather than quietly fixed, and the compliance
+        // claim above is made for rates whose hundredth is whole.
+        //
+        // WHAT IT CHANGES — and the answer that stood here was WRONG. It read "on programmes of 30 s and
+        // longer, nothing", which was true of the three fixtures it was measured on and false as a claim.
+        // A square envelope whose states last exactly the window's 3 s reads 20.0 LU at 1 Hz and 9.5 LU at
+        // 10 Hz, and that gap does NOT close with length: 1 Hz answers a flat 20.0 at 12, 20, 30, 60 and 120 s,
+        // while 10 Hz answers 9.5 at all of them but 20 s, which is 9.3 — the same figures at 44.1 kHz and at
+        // 48 kHz. (The sentence here used to call all five "the same two numbers"; the 20 s row was in the
+        // sweep that produced it, reading 9.3, and the summary rounded a measurement away.)
+        //
+        // The mechanism is the PERCENTILES, not the sample count. At 1 Hz such a programme offers the window
+        // six phases; a sixth of them sit on a pure loud block and a sixth on a pure quiet one, so P95 and P10
+        // both land on an extreme and the range comes out the full 20 dB the envelope swings. At 10 Hz there
+        // are sixty phases, each aligned one is 1.7 % — under the 5 % P95 reaches for — and the fifty-odd
+        // mixed windows that 1 Hz never looked at fill the distribution in between. So the move is away from
+        // a number that depended on where the grid happened to land, which is what the overlap is for: the
+        // standard asks for it "to prevent loss of precision in the measurement of shorter programmes".
+        // ON THIS FIXTURE the two cadences agree exactly away from the window's own timescale — 0 LU at 1.5 s
+        // states, 20 LU at 5 s and at 7.5 s — and that is a property of the FIXTURE, not a regime. Its two
+        // states are 20 dB apart, so both clear the -20 LU relative gate and the distribution keeps them both.
+        // Drop the quiet state to -30 dB and it does not: at 60 s, 5 s states read 4.7 LU at 1 Hz against 7.7 at
+        // 10 Hz, 7.5 s states 4.7 against 6.9, 10 s states 4.7 against 5.7 — slow envelopes, disagreeing. Even
+        // "far faster" is not flat: 1 s states read 3.0 against 2.6 on both shapes. The 1 Hz figures throughout
+        // were read off the pre-change meter and are not pinned by anything; the 10 Hz ones are —
+        // LoudnessConformanceTests measures them.
+        if (subFilled >= kSubRing)
         {
-            if (stSince == 0 && stCount < (int) stE.size()) stE[(std::size_t) stCount++] = meanLastSubHops (kSubRing);
-            if (++stSince >= 10) stSince = 0;                                        // first at 3 s, then every 10 hops (libebur128)
+            if (stCount < (int) stE.size()) stE[(std::size_t) stCount++] = meanLastSubHops (kSubRing);
+            else ++droppedShortTerm_;                                               // past the capacity: counted, not kept
         }
     }
 
@@ -364,7 +437,7 @@ private:
     }
 
     // LRA (EBU Tech 3342) = P95 − P10 of the gated 3 s short-term loudness distribution. Two-pass gate over
-    // the 1 s-cadence stE[] energies: absolute −70 LUFS, then −20 LU below the energy-mean of the abs-gated
+    // the 10 Hz-cadence stE[] energies: absolute −70 LUFS, then −20 LU below the energy-mean of the abs-gated
     // set; percentiles via a fixed 0.1 LU histogram (−70..+30 LUFS), libebur128-faithful (no sort, no alloc).
     double lra() const noexcept
     {
@@ -412,10 +485,10 @@ private:
     std::vector<double> subRing;                                                    // 300 × 10 ms sub-hop energies
     int subWrite = 0, subFilled = 0, subInHop = 0;
     std::vector<double> blockE;
-    int blockCount = 0, droppedBlocks_ = 0;
+    int blockCount = 0, droppedBlocks_ = 0, droppedShortTerm_ = 0;
     std::uint64_t nonFiniteSubHops_ = 0;   // sticky until reset()/prepare() — see the accessor
-    std::vector<double> stE;                                                        // 3 s short-term energies @1 s (LRA)
-    int stCount = 0, stSince = 0;
+    std::vector<double> stE;                                                        // 3 s short-term energies @10 Hz (LRA)
+    int stCount = 0;
 };
 
 

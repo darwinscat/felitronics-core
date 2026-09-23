@@ -2154,7 +2154,7 @@ private:
         return analysis::LoudnessMeter::storageFor (sampleRate, meterSamples (frames, sampleRate), st) ? st.bytes() : 0u;
     }
 
-    // EBU Tech 3342 needs short-term samples, one a second: under 3 s of programme there is no range to measure. ONE
+    // EBU Tech 3342 needs short-term samples, and the window is 3 s: under 3 s of programme there is not one. ONE
     // rule, read by measureInputLoudnessRange() (which refuses before it builds a meter), by its budget, and by
     // `lraValid`.
     static bool rangeMeasurable (int frames, double sampleRate) noexcept
@@ -2241,7 +2241,7 @@ private:
         // reading clamps to +60 dBTP and the true peak stops being bounded at all.
         m.loudnessValid    = (m.gatingBlocks > 0 && m.droppedBlocks == 0 && m.nonFiniteSubHops == 0
                               && m.integratedLufs > -120.0);
-        // LRA needs short-term samples, one a second: a programme too short for them reports 0.0 LU,
+        // LRA needs short-term samples, whose window is 3 s: a programme too short for them reports 0.0 LU,
         // which is also what "no dynamic range at all" reports. Saying which one it is is the only way
         // an LRA constraint can mean anything.
         m.lraValid         = m.loudnessValid && rangeMeasurable (frames, fs_);
@@ -2252,8 +2252,8 @@ public:
     // The input's loudness range, for the LRA constraint — which is a DELTA and therefore needs both
     // ends. STATELESS on purpose: it returns the number and the caller puts it in the request, so it
     // cannot outlive the programme it describes. Returns false, and leaves `out` alone, when the
-    // programme is too short for the measure to mean anything (EBU Tech 3342 needs short-term samples,
-    // one a second) or when the meter could not answer — because `loudnessRangeLu()` returning 0.0 is
+    // programme is too short for the measure to mean anything (EBU Tech 3342 needs short-term samples, and
+    // their window is 3 s) or when the meter could not answer — because `loudnessRangeLu()` returning 0.0 is
     // also what "no dynamic range at all" returns, and a constraint cannot tell those apart.
     [[nodiscard]] bool measureInputLoudnessRange (const float* const* in, int nch, int frames,
                                                   double& out) const
@@ -2286,8 +2286,10 @@ public:
         // meter is a local, so the caller could not check for itself. A poisoned 10 ms is recorded as
         // silence, silence fails the absolute gate, and the blocks it was in leave the distribution
         // the range is computed over. Measured on a 30 s programme alternating 3 s loud / 3 s quiet at
-        // 48 kHz, with every LOUD second poisoned: 4.8000 LU clean against **21.4000 LU** poisoned,
-        // both returned `true`. That number then travels into `LoudnessRequest::inputLoudnessRangeLu`
+        // 48 kHz, with every LOUD second poisoned: 8.5000 LU clean against **9.6000 LU** poisoned,
+        // both returned `true`. (Those were 4.8 and 21.4 until K12 gave the meter the 10 Hz short-term cadence
+        // Tech 3342 asks for, which moved both; the pair is what the test pins, and this sentence had gone
+        // stale against it.) That number then travels into `LoudnessRequest::inputLoudnessRangeLu`
         // as the far end of the `maxLraLossLu` DELTA, so the constraint is judged against a range the
         // programme does not have. The same condition already guards `MasterMeasurement::loudnessValid`
         // below; the two now agree on what "measured" means.
