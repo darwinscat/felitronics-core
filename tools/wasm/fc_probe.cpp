@@ -2014,7 +2014,10 @@ FC_EXPORT int fc_probe_lowend_settling_blocks (double sampleRate, double crossov
 // not, and on anti-phase content under 20 Hz the two give opposite answers.
 FC_EXPORT double fc_probe_lowend_side_fraction_below (double hz)
 {
-    return haveLowEnd ? lowEnd().sideFractionBelow (hz) : 0.0;
+    // …and the same -1.0 for "there is no measurement yet", which this returned as 0.0 while the comment
+    // above declared the rule. Half a convention is worse than none: a caller that trusted the note read
+    // an un-run probe as a perfectly mono low end.
+    return haveLowEnd ? lowEnd().sideFractionBelow (hz) : -1.0;
 }
 
 // The lowest band present in at least `dutyMin` of the counted frames: band, midi, centreHz, count, duty,

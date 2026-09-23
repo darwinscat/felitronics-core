@@ -34,3 +34,9 @@ click's excess over the ceiling grows with its amplitude while its width does no
 `e/A`, so **there is no single click frequency**: it is **8.40 kHz at amplitude 0.85** and **11.40 kHz at
 1.0**. Both are now printed by the suite that cites them, as is the 60 Hz sine's 59.3 Hz — the header said
 59.4.
+
+### Fixed — and the same half-convention one function over
+
+`fc_probe_lowend_side_fraction_below` returned `0.0` when no measurement had been run, while the comment
+directly above it declared the `-1.0` rule and the core already obeyed it for a refused frequency. A caller
+that trusted the note read an un-run probe as a perfectly mono low end. It now returns `-1.0` there too.
