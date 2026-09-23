@@ -1,4 +1,4 @@
-### analysis · mastering — the short-term window is sampled at 10 Hz, as EBU Tech 3342 requires
+### analysis · mastering — every short-term series is sampled at 10 Hz, as EBU Tech 3342 requires
 
 `LoudnessMeter` took one 3 s short-term sample a second. Tech 3342 §3.1 asks for more: *"A minimum block
 overlap of 2.9 s between consecutive analysis windows (i.e. ≥10 Hz sampling of the loudness level) is
@@ -71,24 +71,45 @@ Two things the change made visible rather than caused:
   used to carry (regula falsi, not bisection) stays a search count, and the stale-end halving that makes it
   regula falsi is now asserted directly from the log.
 
-**An open defect this uncovered, recorded and not repaired here.** `ProgrammeReport` samples its own
-short-term series at 1 Hz (`kObservationHops = 100`, libebur128's cadence) and publishes `lraLu` from it —
-labelled EBU Tech 3342, computed with that standard's −20 LU relative gate. So the core now holds **two
-numbers labelled EBU Tech 3342 that disagree**: on the 3 s-state envelope, at 44.1 and 48 kHz, over 12, 30 and
-120 s programmes, `lraLu` reads 20.0 LU where `LoudnessMeter::loudnessRangeLu()` reads 9.5. (An earlier draft
-of this note said the report "is not an LRA — absolute-gated only". That is true of `shortTermSpreadLu` and
-false of `lraLu`, which is the field that matters.)
+**`ProgrammeReport` moves with it — the same clause governs it.** That class computes EBU Tech 3342 from its
+own short-term series rather than reading `LoudnessMeter::loudnessRangeLu()`, so that the gated observation
+count is known exactly, and it sampled that series once a second. For the length of this work the core
+therefore held **two numbers under one standard's name that disagreed by 10.5 LU** — on the 3 s-state
+envelope, at 44.1 and 48 kHz, over 12, 30 and 120 s programmes, `lraLu` read 20.0 where the meter read 9.5.
+`kObservationHops` is now 10, both series sample at 10 Hz, and they agree to 0.3 LU again — the tolerance
+being summation order (this class oldest-first, the meter newest-first) and nothing else.
 
-It is recorded rather than moved because moving that cadence moves `lraLu`, `shortTermP10/P50/P95`,
-`shortTermSpreadLu` and `shortTermObservations` — every one a published number a consumer may be calibrated
-against — which is a decision about the report surface, not about the meter. The gap is named at the field,
-at the file head, and measured by a ProgrammeReportTests group so it cannot go quiet; the suite's existing
-agreement check kept passing because its fixture is long steady steps, where the cadence cannot matter.
+Six published fields move with that cadence: `lraLu`, `shortTermP10`, `shortTermP50`, `shortTermP95`,
+`shortTermSpreadLu` and `shortTermObservations` — the last by a factor of ten, since it counts observations. A consumer calibrated
+against them will see the change; that is the point, not a side effect.
 
-**A compliance caveat the work surfaced, also not repaired.** A sub-hop is `lround(0.01·fs)` samples, so the
-hop is 100 ms only where a hundredth of the rate is whole. At 48 and 44.1 kHz the cadence is 10 Hz exactly; at
-22050 Hz it is 9.9774 Hz — *under* §3.1's minimum, by 0.23 % — and at 8050 Hz 9.9383 Hz, with the window
+**The guard that should have caught it, and why it did not.** A check asserting the two classes agree to
+0.3 LU already existed and passed the whole time. Its fixture is long steady steps, where every window that
+is not straddling a step reads the same value and the sampling cadence cannot matter — a guard naming the
+right pair and blind by fixture. It is now held on a square envelope with 3 s states as well, which is the
+shape that can tell two cadences apart, and the independent oracle beside it writes out BOTH numbers (300
+sub-hops for the window, 10 for the step) rather than importing either from the header.
+
+**One boundary moved with it, worth naming.** `ProgrammeReport` refuses with `LoudnessCapacityExceeded`
+past `maxDurationSec` — but the store carries a fixed margin behind that line, and the margin is counted in
+OBSERVATIONS, so ten times as many observations is a tenth as much slack in seconds. Measured against a 10 s
+declaration at 48 kHz: the refusal used to turn at 20 s of programme and now turns at 13.8. The contract did
+not change; the undeclared slack behind it shrank to match its own words, from about a hundred hops to 38. A
+caller that fed a few seconds over its declaration and got away with it will now be refused. Pinned in hops
+at both rates, which nothing did before — the check that stood there was a disjunction ("either fitted or
+says it did not") and asserted nothing either way.
+
+**Budgets, for anything that reads them.** `fc_master_need(FC_NEED_MEASURE_LRA)` at the ABI suite's geometry
+is **3296 B** where it was 2936; `fc_master_need(FC_NEED_SOLVE)` for 1 s of stereo at the default 1000
+buckets is **1 047 848 B** where it was 1 047 704. Struct layouts and the ABI version are untouched — these
+are computed, not frozen. `ProgrammeReport`'s short-term store at the default one-hour ceiling is 288 KB
+where it was 28.9.
+
+**A compliance caveat the work surfaced, deliberately left alone.** A sub-hop is `lround(0.01·fs)` samples,
+so the hop is 100 ms only where a hundredth of the rate is whole. At 48 and 44.1 kHz the cadence is 10 Hz
+exactly; at 22050 Hz it is 9.9774 Hz — *under* §3.1's minimum, by 0.23 % — and at 8050 Hz 9.9383 Hz, with the window
 rounding to 3.0068 s and 3.0186 s against a specified 3 s. The rounding cuts the other way too: 8049 Hz takes
 80.49 down to 80, giving 10.0613 Hz and a 2.9817 s window — fast enough, and too short. That is the meter's
 whole sub-hop grid, older than this change, and moving it would move every number the class produces at
-those rates.
+those rates. Recorded as its own item rather than touched here: the rates that ship are 44.1, 48 and 96 kHz,
+where the cadence is 10 Hz exactly.

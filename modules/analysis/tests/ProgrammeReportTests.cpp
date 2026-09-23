@@ -416,14 +416,15 @@ static Ref reference (const Planes& p, double fs, const Params& pm, int channels
     // --- the short-term series, its own K-weighting, and percentiles BY SORTING ---
     // THE CADENCE IS WRITTEN OUT HERE ON PURPOSE. The first version of this reference read
     // `PR::kShortTermSubHops` and `PR::kObservationHops` from the header, and a crew testing round showed
-    // what that costs: changing the observation stride from 100 sub-hops to 99 or 101 left all 350 checks
-    // GREEN, because the "independent" reference imported the mutated constant and moved with it instead of
-    // opposing it. An oracle that reads the subject's own parameters is the subject. 300 sub-hops is 3 s, from
-    // EBU Tech 3342, and 100 is one second, from libebur128 — NOT from 3342, whose §3.1 asks for a sample at
-    // least every 100 ms. Both numbers are written here rather than read from the header; the attribution used
-    // to name 3342 for both, which credited the standard with the cadence it does not specify.
+    // what that costs: changing the observation stride left all 350 checks GREEN, because the "independent"
+    // reference imported the mutated constant and moved with it instead of opposing it. An oracle that reads
+    // the subject's own parameters is the subject. BOTH numbers are written out here: 300 sub-hops is the 3 s
+    // window and 10 is the 100 ms step, and EBU Tech 3342 §3.1 is the source of both — "a sliding
+    // analysis-window of length 3 seconds" and "a minimum block overlap of 2.9 s … i.e. >=10 Hz sampling".
+    // The stride was 100 until v0.43, one second, which came from libebur128 and not from the standard; this
+    // comment used to credit 3342 with it.
     const int kRefWindowHops = 300;
-    const int kRefObsStride  = 100;
+    const int kRefObsStride  = 10;
     const double kRefAbsGate = 1.1724653045822981e-07;      // 10^((-70 + 0.691)/10), the BS.1770 gate
     const std::int64_t sub = std::max<std::int64_t> (1, (std::int64_t) std::lround (0.01 * fs));
     analysis::KWeightingFilter kw;
@@ -755,18 +756,18 @@ static void testClosedForms()
                       "on THIS programme the LRA here and LoudnessMeter::loudnessRangeLu() are the same number "
                       "(long steady steps, where the sampling cadence cannot matter — see the group below)");
 
-        // …ON THIS FIXTURE, AND THE CHECK ABOVE IS NARROWER THAN THE SENTENCE IT STANDS UNDER. Its programme is
-        // long steady steps, where every window that is not straddling a step reads the same value and the
-        // sampling CADENCE cannot matter. Since K12 the two classes no longer share one: LoudnessMeter takes a
-        // short-term sample per 100 ms hop, the >=10 Hz EBU Tech 3342 §3.1 requires, and this class still takes
-        // one a second (kObservationHops = 100, libebur128's). An envelope whose states last exactly the 3 s
-        // window is where that shows, because then the window can sit wholly inside a state and how often it
-        // does is decided by the grid.
+        // …AND THE CHECK ABOVE, ALONE, IS NARROWER THAN THE SENTENCE IT STANDS UNDER. Its programme is long
+        // steady steps, where every window that is not straddling a step reads the same value and the sampling
+        // CADENCE cannot matter. That is exactly why it kept passing through the window in which the two
+        // classes had different cadences: K12 gave LoudnessMeter the 10 Hz EBU Tech 3342 §3.1 requires while
+        // this class still took one observation a second, and on a square envelope whose states last exactly
+        // the 3 s window they read 20.0 LU against 9.5 — 10.5 LU apart, both labelled Tech 3342, with this
+        // group's ancestor measuring the gap and calling it an open defect.
         //
-        // AN OPEN DEFECT, MEASURED RATHER THAN BLESSED. Both numbers are labelled EBU Tech 3342 and they are
-        // 10.5 LU apart. This group asserts what is true today so the gap cannot go quiet; whoever closes it —
-        // by moving this cadence, which also moves shortTermP10/P50/P95, shortTermSpreadLu and
-        // shortTermObservations, every one a published number — will find this check red and pointing at itself.
+        // v0.43 CLOSED IT: `kObservationHops` is 10, both series sample at 10 Hz, and what was a gap detector
+        // is now the guard for the equality. Held on the fixture that can SEE a cadence, at the same 0.3 LU
+        // the steady one uses — that tolerance is summation order (this class oldest-first, the meter
+        // newest-first), and nothing else should fit inside it.
         {
             const double fs = kFs;
             const int frames = (int) (fs * 12.0);
@@ -785,15 +786,15 @@ static void testClosedForms()
             const float* rp[2] { q[0].data(), q[1].data() };
             test::run (ref.process (rp, 2, frames));
             test::ok (w.R.lraLu.valid, "PRECONDITION: the report publishes an LRA for this programme");
-            test::approx (w.R.lraLu.value, 20.0, 0.25,
-                          "the report's 1 Hz series reads " + std::to_string (w.R.lraLu.value)
-                          + " LU — the full swing a coarse grid lands on");
-            test::approx (ref.loudnessRangeLu(), 9.5, 0.25,
-                          "the meter's 10 Hz series reads " + std::to_string (ref.loudnessRangeLu()) + " LU");
-            test::ok (w.R.lraLu.value - ref.loudnessRangeLu() > 10.0,
-                      "KNOWN DEFECT: two numbers labelled EBU Tech 3342 differ by "
-                      + std::to_string (w.R.lraLu.value - ref.loudnessRangeLu())
-                      + " LU because only one of them samples at the cadence §3.1 requires");
+            // The fixture is live as a cadence probe only if a 1 Hz grid would answer differently — 20.0 LU,
+            // which is also the envelope's full swing and so the ceiling. Asserting the pair is BELOW that
+            // keeps the precondition honest without pinning a number no shipped build can produce.
+            test::ok (w.R.lraLu.value < 12.0 && ref.loudnessRangeLu() < 12.0,
+                      "PRECONDITION: neither reads the 20 LU swing a 1 Hz grid lands on (report "
+                      + std::to_string (w.R.lraLu.value) + ", meter " + std::to_string (ref.loudnessRangeLu()) + ")");
+            test::approx (w.R.lraLu.value, ref.loudnessRangeLu(), 0.3,
+                          "on an envelope that CAN tell two cadences apart, the LRA here and "
+                          "LoudnessMeter::loudnessRangeLu() are still the same number");
         }
     }
 }
@@ -979,9 +980,10 @@ static void testInvariance()
         test::ok (base.trace.size() > 1000, "the trace is substantial (" + std::to_string (base.trace.size()) + " events)");
         test::ok (base.traceOverflow == 0, "the trace buffer held every event");
 
-        // THE CADENCE, ASSERTED. 3 s of sub-hops, then one observation a second: observation k closes at
-        // sample (300 + 100k) * subHopSamples. Nothing else in the suite pins the stride, and a crew round
-        // showed a 99 or 101 stride surviving every other check in this file.
+        // THE CADENCE, ASSERTED. 3 s of sub-hops, then one observation per 100 ms HOP — ten sub-hops, the
+        // >=10 Hz EBU Tech 3342 §3.1 requires: observation k closes at sample (300 + 10k) * subHopSamples.
+        // Nothing else in the suite pins the stride, and a crew round showed a stride one off surviving every
+        // other check in this file. (It read 100 — one second, libebur128's — until v0.43.)
         {
             const std::int64_t H64 = (std::int64_t) H;
             std::int64_t k = 0;
@@ -989,9 +991,9 @@ static void testInvariance()
                 if (e.kind == analysis::ProgrammeTraceKind::ShortTerm)
                 {
                     test::ok (e.index == k, "observation " + std::to_string (k) + " is numbered in order");
-                    test::ok (e.end == (300 + 100 * k) * H64,
-                              "observation " + std::to_string (k) + " closes at (300 + 100k) sub-hops = "
-                              + std::to_string ((300 + 100 * k) * H64) + " (got " + std::to_string (e.end) + ")");
+                    test::ok (e.end == (300 + 10 * k) * H64,
+                              "observation " + std::to_string (k) + " closes at (300 + 10k) sub-hops = "
+                              + std::to_string ((300 + 10 * k) * H64) + " (got " + std::to_string (e.end) + ")");
                     test::ok (e.end - e.begin == 300 * H64, "…and spans exactly 3 s of sub-hops");
                     ++k;
                 }
@@ -1518,6 +1520,30 @@ static void testEdges()
         test::ok (! o.R.plrDb.valid, "PLR refuses with it");
         test::ok (o.R.shortTermDroppedObservations > 0 || o.R.lraLu.valid == false,
                   "the short-term series either fitted or says it did not");
+        // WHERE IT ACTUALLY TURNS, which that disjunction does not say and nothing else pinned. The store holds
+        // floor(hops) + 8 observations against a production of floor(hops) - 29, so a programme is refused once
+        // it runs 38 hops past its declared length. THAT MOVED WITH v0.43: at one observation a second the same
+        // arithmetic gave about a hundred hops of undeclared slack, so a file 5 s over its declared length used
+        // to slip through and is now refused — measured against a 10 s declaration at 48 kHz, the turn was at
+        // 20 s and is at 13.8. The contract ("past maxDurationSec it refuses") did not change; the slack behind
+        // it shrank to match the words. In hops, not seconds, so the two rates give the same two numbers.
+        for (const double rate : { 48000.0, 44100.0 })
+        {
+            const long long hop = 10LL * std::llround (0.01 * rate);
+            const long long declHops = 100;
+            for (const long long over : { 37LL, 38LL })
+            {
+                Params bp; bp.maxDurationSec = (double) (declHops * hop) / rate;
+                const auto b2 = run (tone (2, (std::size_t) ((declHops + over) * hop), 1000.0, amp, rate),
+                                     rate, 4096, { 4096 }, bp);
+                const std::string where = std::to_string ((int) rate) + " Hz, " + std::to_string (over) + " hops over";
+                test::ok ((b2.R.shortTermDroppedObservations > 0) == (over == 38),
+                          where + ": dropped " + std::to_string (b2.R.shortTermDroppedObservations)
+                                + " (37 over still fits, 38 does not)");
+                test::ok (b2.R.lraLu.valid == (over == 37),
+                          where + ": the LRA is " + (b2.R.lraLu.valid ? "a measurement" : "refused"));
+            }
+        }
         test::ok (o.R.totalSamples == (std::int64_t) (kFs * 12.0), "and every sample was still measured");
         test::ok (o.R.samplePeak.valid && o.R.rms.valid, "the sample-domain measurements are untouched");
     }
