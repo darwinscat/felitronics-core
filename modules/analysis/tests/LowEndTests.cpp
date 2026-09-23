@@ -1939,5 +1939,201 @@ int main()
         }
     }
 
+    //==========================================================================
+    // K9 — THE CROSSOVER SWEEP. The spectral axes are fed the RAW Mid and Side, before the crossover, so
+    // any LR4 low-pass can be applied to the band table afterwards as a weight. The oracle is the REAL
+    // FILTER: install fc, read lowSideFraction(), and compare.
+    test::group ("K9 sweep: the same number as the installed filter — until the content leaves the table");
+    {
+        const std::size_t n = 1u << 19;
+        const double fs = 48000.0;
+        auto make = [&] (bool outside)
+        {
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const double m = 0.5 * std::sin (2.0 * kPi * 41.2 * t);
+                double s = 0.20 * std::sin (2.0 * kPi * 98.0 * t) + 0.30 * std::sin (2.0 * kPi * 220.0 * t);
+                // 15 Hz is under lowNoteHz and 700 Hz is over highNoteHz: the table cannot see either,
+                // while an LR4 at 60 Hz passes the 15 Hz almost untouched.
+                if (outside) s += 0.60 * std::sin (2.0 * kPi * 700.0 * t) + 0.40 * std::sin (2.0 * kPi * 15.0 * t);
+                x.l[i] = (float) (m + s); x.r[i] = (float) (m - s);
+            }
+            return x;
+        };
+
+        const double fcs[] = { 60.0, 80.0, 100.0, 120.0, 150.0, 200.0, 300.0 };
+        {
+            const Stereo x = make (false);
+            double worst = 0.0;
+            for (const double fc : fcs)
+            {
+                LowEndParams q = base; q.fftOrder = 17; q.crossoverHz = fc;
+                LowEnd le; le.setParams (q);
+                if (! test::run (le.prepare (fs, 1 << 13, 2)) || ! test::run (feed (le, x, 2))) continue;
+                worst = std::max (worst, std::fabs (le.sideFractionBelow (fc) - le.lowSideFraction()));
+            }
+            // 4.7e-5 measured; the tolerance is one decade up so a real regression still shows.
+            ok (worst < 5.0e-4, "on material inside the table the sweep IS the filter's number (worst gap "
+                                + std::to_string (worst) + " over seven crossovers)");
+        }
+
+        // THE LIMITATION, ASSERTED AS A FAILURE RATHER THAN HEDGED IN A COMMENT. With anti-phase energy
+        // outside [lowNoteHz, highNoteHz] the two part company completely, and a caller must not read the
+        // sweep as the answer. Under 20 Hz is the case that matters: an LR4 at 60 Hz passes it.
+        {
+            const Stereo x = make (true);
+            LowEndParams q = base; q.fftOrder = 17; q.crossoverHz = 60.0;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
+            {
+                const double sweep = le.sideFractionBelow (60.0), real = le.lowSideFraction();
+                ok (real > 0.4 && sweep < 0.01,
+                    "the filter sees " + std::to_string (real) + " where the sweep sees " + std::to_string (sweep)
+                    + " — out-of-table content is invisible to the table, and this is the documented limit");
+                ok (real - sweep > 0.4, "the gap is " + std::to_string (real - sweep)
+                                        + ", against a question asked at 0.25: the opposite answer, not a tolerance");
+            }
+        }
+
+        // AND THE SWEEP DOES NOT DEPEND ON WHICH CROSSOVER WAS INSTALLED — it reads the raw table, so two
+        // builds that filtered differently must agree BIT FOR BIT at the same query frequency.
+        {
+            const Stereo x = make (false);
+            LowEndParams lo = base, hi = base;
+            lo.fftOrder = hi.fftOrder = 17; lo.crossoverHz = 80.0; hi.crossoverHz = 250.0;
+            LowEnd a2, b2; a2.setParams (lo); b2.setParams (hi);
+            if (test::run (a2.prepare (fs, 1 << 13, 2)) && test::run (feed (a2, x, 2))
+                && test::run (b2.prepare (fs, 1 << 13, 2)) && test::run (feed (b2, x, 2)))
+                ok (core::exactlyEqual (a2.sideFractionBelow (120.0), b2.sideFractionBelow (120.0)),
+                    "an 80 Hz build and a 250 Hz build answer the same bits at 120 Hz ("
+                    + std::to_string (a2.sideFractionBelow (120.0)) + ")");
+        }
+
+        // The refusals: a frequency the crossover itself would not take, and the 0/0.
+        {
+            const Stereo x = make (false);
+            LowEndParams q = base; q.fftOrder = 17;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
+            {
+                ok (le.sideFractionBelow (0.0) == 0.0, "fc = 0 is refused to the canonical zero");
+                ok (le.sideFractionBelow (-120.0) == 0.0, "and a negative one");
+                ok (le.sideFractionBelow (std::numeric_limits<double>::quiet_NaN()) == 0.0, "and NaN");
+                ok (le.sideFractionBelow (std::numeric_limits<double>::infinity()) == 0.0, "and +inf");
+                ok (le.sideFractionBelow (0.5 * fs) == 0.0, "and Nyquist, which the crossover would refuse too");
+                ok (le.sideFractionBelow (120.0) > 0.0, "while a frequency it accepts answers a number");
+            }
+        }
+    }
+
+    //==========================================================================
+    // K9 — THE WARM-UP, DERIVED RATHER THAN WRITTEN DOWN. The consumer asked for "the first 10 blocks",
+    // reading it out of this header's "the first 10 ms block holds 96.65 %" and "the first 100 ms". The
+    // header names no such count, and ten is wrong at every candidate crossover.
+    test::group ("K9 settlingBlocks: the filter says how long it charges, and skipBlocks moves ONLY the histogram");
+    {
+        using LE = analysis::LowEnd;
+        // THE MODEL, RE-DERIVED OUTSIDE THE OBJECT. LR4 has a DOUBLE pole pair at real part -wc/sqrt(2),
+        // so the envelope is t·exp(-t/tau), tau = sqrt(2)/(2·pi·fc); normalised to its peak at t = tau that
+        // is u·exp(1-u), and u is where it reaches 10^(-dB/20). Bisected here on the same equation but with
+        // std::exp rather than the deterministic pair, so this is an independent arrival at the number.
+        auto uFor = [] (double dB)
+        {
+            const double target = std::pow (10.0, -dB / 20.0);
+            double lo = 1.0, hi = 400.0;
+            for (int i = 0; i < 200; ++i)
+            {
+                const double u = 0.5 * (lo + hi);
+                if (u * std::exp (1.0 - u) > target) lo = u; else hi = u;
+            }
+            return 0.5 * (lo + hi);
+        };
+        approx (uFor (60.0), 10.2334, 1e-3, "u = 10.233 at -60 dB (the figure a design round put at 9.12)");
+        approx (uFor (120.0), 17.6884, 1e-3, "and 17.688 at -120 dB");
+        for (const double fc : { 20.0, 100.0, 120.0, 150.0 })
+            for (const double dB : { 60.0, 120.0 })
+            {
+                const double tau = std::sqrt (2.0) / (2.0 * kPi * fc);
+                const int want = (int) std::ceil (uFor (dB) * tau / 0.01);        // 48 kHz: a block is 10 ms
+                ok (LE::settlingBlocks (48000.0, fc, dB) == want,
+                    "settlingBlocks(48 kHz, " + std::to_string ((int) fc) + " Hz, -" + std::to_string ((int) dB)
+                    + " dB) = " + std::to_string (want) + ", got " + std::to_string (LE::settlingBlocks (48000.0, fc, dB)));
+            }
+        ok (LE::settlingBlocks (48000.0, 120.0, 60.0) == 2 && LE::settlingBlocks (48000.0, 20.0, 60.0) == 12,
+            "so 2 blocks at 120 Hz and 12 at 20 Hz — the 'ten' it replaces is five times too many at one end"
+            " and too few at the other");
+        // the refusals: the same arguments the crossover itself refuses, plus a dB that asks for nothing
+        ok (LE::settlingBlocks (0.0, 120.0, 60.0) == 0, "a rate the class refuses gives 0");
+        ok (LE::settlingBlocks (48000.0, 0.0, 60.0) == 0, "and a crossover it refuses");
+        ok (LE::settlingBlocks (48000.0, 0.49 * 48000.0 + 1.0, 60.0) == 0, "and one past its ceiling");
+        ok (LE::settlingBlocks (48000.0, 120.0, 0.0) == 0, "-0 dB asks to skip nothing");
+        ok (LE::settlingBlocks (48000.0, 120.0, -3.0) == 0, "and a negative dB is not a longer wait");
+        ok (LE::settlingBlocks (48000.0, 120.0, std::numeric_limits<double>::quiet_NaN()) == 0, "NaN gives 0");
+        ok (LE::settlingBlocks (std::numeric_limits<double>::quiet_NaN(), 120.0, 60.0) == 0, "and a NaN rate");
+
+        // AND IT IS NOT OPTIMISTIC AGAINST THE REAL FILTER. The header's own fixture: mono 82 Hz bass with
+        // anti-phase 900 Hz, whose settled low side fraction is ~5.3e-8 while block 0 holds most of the
+        // file's low Side energy. After `settlingBlocks` blocks the series must be at the settled value,
+        // not on its way there.
+        {
+            const double fs = 48000.0, fc = 120.0;
+            const std::size_t n = (std::size_t) (fs * 4.0);
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const double m = std::sin (2.0 * kPi * 82.0 * t), s = std::sin (2.0 * kPi * 900.0 * t);
+                x.l[i] = (float) (0.5 * (m + s)); x.r[i] = (float) (0.5 * (m - s));
+            }
+            LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
+            {
+                const int k = LE::settlingBlocks (fs, fc, 60.0);
+                ok (k >= 1 && (std::int64_t) k < le.blockCount(), "the settling is " + std::to_string (k)
+                    + " blocks of the " + std::to_string (le.blockCount()) + " this programme has");
+                const double atK = le.block ((std::int64_t) k).sideFraction();
+                const double late = le.block (le.blockCount() - 2).sideFraction();
+                ok (le.block (0).sideFraction() > 100.0 * late,
+                    "PRECONDITION: block 0 really is the charge-up (" + std::to_string (le.block (0).sideFraction())
+                    + " against a settled " + std::to_string (late) + ")");
+                ok (atK <= 10.0 * late, "and by block " + std::to_string (k) + " it is within a decade of settled ("
+                                        + std::to_string (atK) + ") — the bound is not optimistic");
+            }
+        }
+
+        // skipBlocks MOVES THE HISTOGRAM AND NOTHING ELSE. Everything a coordinate points at must survive:
+        // the series, the integral, the extrema. A skip that quietly shortened those would make
+        // worstFractionBlock() an index into a programme that no longer exists.
+        {
+            const double fs = 48000.0;
+            const std::size_t n = (std::size_t) (fs * 2.0);
+            Stereo x = twoTone (n, fs, 82.0, 900.0);
+            LowEndParams q0 = base, q5 = base;
+            q0.fftOrder = q5.fftOrder = 15; q0.crossoverHz = q5.crossoverHz = 120.0;
+            q5.skipBlocks = 5;
+            LowEnd a2, b2; a2.setParams (q0); b2.setParams (q5);
+            if (test::run (a2.prepare (fs, 1 << 13, 2)) && test::run (feed (a2, x, 2))
+                && test::run (b2.prepare (fs, 1 << 13, 2)) && test::run (feed (b2, x, 2)))
+            {
+                ok (a2.skippedBlocks() == 0 && b2.skippedBlocks() == 5,
+                    "the skip is published: " + std::to_string (b2.skippedBlocks()) + " blocks not counted");
+                std::int64_t dropped = 0;
+                for (std::int64_t i = 0; i < 5; ++i) dropped += a2.block (i).finiteSamples;
+                ok (b2.histogramSamples() == a2.histogramSamples() - dropped,
+                    "and the histogram is exactly those samples lighter (" + std::to_string (dropped) + ")");
+                ok (b2.blockCount() == a2.blockCount(), "the SERIES keeps every block");
+                for (std::int64_t i = 0; i < a2.blockCount(); ++i)
+                    if (! core::exactlyEqual (b2.block (i).sideEnergy, a2.block (i).sideEnergy)) { ok (false, "a block moved"); break; }
+                ok (core::exactlyEqual (b2.lowSideFraction(), a2.lowSideFraction()),
+                    "the INTEGRAL is bit-identical — the skip is not a measurement, it is a population");
+                ok (b2.worstFractionBlock() == a2.worstFractionBlock(),
+                    "and worstFractionBlock() still points at the same block of the same programme");
+            }
+        }
+    }
+
     return test::report();
 }

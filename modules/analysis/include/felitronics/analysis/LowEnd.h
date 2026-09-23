@@ -184,6 +184,17 @@ struct LowEndParams
     // and it will calibrate. Turned into a linear ratio ONCE, at prepare(), so no logarithm stands in a
     // per-frame decision.
     double dutyThresholdDb = 20.0;
+    // K9. How many leading 10 ms blocks the HISTOGRAM ignores. Default 0, so nothing already shipped moves.
+    //
+    // ONLY THE HISTOGRAM, deliberately. The series, the integrals and the extrema stay complete: the
+    // instrument's standing rule is that nothing is dropped on its own initiative — `worstFractionBlock()`
+    // is a COORDINATE into a programme, and a coordinate that silently skipped a prefix would be a lie.
+    // What the histogram is, and only it, is a population a caller reads a time fraction from, and a
+    // caller that wants that fraction free of the crossover's own charge-up says so HERE, in a number it
+    // chose. `settlingBlocks()` derives that number from the filter instead of leaving it to be guessed:
+    // "the first 10 blocks" was a guess, and it is three to five times too many at 100–150 Hz and two
+    // times too few at 20 Hz.
+    int    skipBlocks = 0;
     int    maxBlocks   = 1 << 16;   // capacity of the stored 10 ms series: 10.9 min. Everything that is
                                     // not the series itself (integrals, histogram, extrema, counters)
                                     // keeps going past it — law 11, exhaustion is data.
@@ -461,6 +472,7 @@ public:
         finiteSamples_ = holeSamples_ = nonFiniteSamples_ = filterNonFinite_ = absentSamples_ = 0;
         firstHole_ = lastHole_ = -1;
         for (int i = 0; i < kHistogramBins; ++i) hist_[i] = 0;
+        skippedBlocks_ = 0;
         std::fill (dutyCount_.begin(), dutyCount_.end(), (std::int64_t) 0);
         std::fill (dutyRatio_.begin(), dutyRatio_.end(), 0.0);
         dutyFrames_ = 0;
@@ -675,6 +687,44 @@ public:
     // not a mono block) and histogramSamples() says how much was covered. It accumulates from block
     // zero and never stops, so it does not change with maxBlocks.
     std::int64_t histogram (int bin) const noexcept { return bin >= 0 && bin < kHistogramBins ? hist_[bin] : 0; }
+    // Blocks the histogram did NOT count, because `skipBlocks` asked. Published rather than implied: a
+    // population whose size a caller cannot see is a population it cannot divide by.
+    std::int64_t skippedBlocks() const noexcept { return skippedBlocks_; }
+
+    // HOW MANY 10 ms BLOCKS AN LR4 AT `crossoverHz` NEEDS TO FALL `dB` BELOW ITS OWN PEAK — the number
+    // `skipBlocks` wants, derived from the filter rather than written down. Pure, static, allocation-free:
+    // a caller computes it before prepare() and passes the answer back in.
+    //
+    // THE MODEL, stated so it can be argued with. LR4 is two cascaded Butterworth sections, so its poles
+    // are a DOUBLE pair at real part -wc/sqrt(2): the transient envelope is t·exp(-t/tau) with
+    // tau = sqrt(2)/(2·pi·fc). Normalised to its own peak (at t = tau) that is u·exp(1-u) with u = t/tau,
+    // and the answer is the u where it reaches 10^(-dB/20). Solved here by bisection, which is
+    // deterministic, needs no libm beyond an exponential and cannot diverge.
+    //
+    // u = 10.233 at -60 dB and 17.688 at -120, so at 48 kHz: 12 blocks at 20 Hz and 2 at 120 Hz for -60 dB.
+    // The "ten blocks" this replaces was five times too many at 120 Hz and too few at 20.
+    //
+    // It is an ENVELOPE bound, not a promise about a particular programme: a filter driven by music is
+    // never at its own impulse peak, so this is the pessimistic end. 0 for arguments the crossover itself
+    // would refuse, and for a non-positive dB — a caller asking to skip nothing gets nothing skipped.
+    static int settlingBlocks (double sampleRate, double crossoverHz, double dB) noexcept
+    {
+        if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return 0;
+        if (! (crossoverHz >= kMinCrossoverHz) || ! (crossoverHz <= 0.49 * sampleRate)) return 0;
+        if (! (dB > 0.0) || ! (dB <= 400.0)) return 0;
+        const double target = core::det::pow10 (-dB / 20.0);
+        double lo = 1.0, hi = 400.0;
+        for (int i = 0; i < 200; ++i)                       // fixed count: the same work on every input
+        {
+            const double u = 0.5 * (lo + hi);
+            const double v = u * core::det::exp2 ((1.0 - u) * 1.4426950408889634);   // exp(1-u)
+            if (v > target) lo = u; else hi = u;
+        }
+        const double tau = 1.4142135623730951 / (2.0 * core::kPi * crossoverHz);
+        const double blockSec = (double) std::max<std::int64_t> (1, (std::int64_t) std::lround (0.01 * sampleRate)) / sampleRate;
+        const double blocks = std::ceil (0.5 * (lo + hi) * tau / blockSec);
+        return (blocks >= 0.0 && blocks < 1.0e9) ? (int) blocks : 0;
+    }
     std::int64_t histogramSamples() const noexcept { return histSamples_; }
 
     // The coordinates. Three different questions, three different blocks — a block can win any one of
@@ -796,6 +846,60 @@ public:
     // about a third of its power in the band beneath, only ~5 dB down, which a 20 dB threshold admits. The
     // returned band's `centsOffset` in the table is the tell — near +50 cents means the energy sits at the
     // band's top edge and belongs to the note above.
+    // THE SIDE FRACTION BELOW ANY CANDIDATE CROSSOVER, from the band table alone — no second pass over the
+    // audio, no second filter, no extra state. The spectral axes are fed the RAW Mid and Side, BEFORE the
+    // crossover (see process()), so the table is an unfiltered semitone spectrum of both axes and any LR4
+    // low-pass can be applied to it afterwards as a weight:
+    //
+    //     sideFractionBelow(fc) = SUM_b |H(c_b;fc)|^2 · side_b  /  SUM_b |H(c_b;fc)|^2 · (mid_b + side_b)
+    //
+    // with the SAME response the real filter has — |H|^2 = 1/(1+r^4)^2, r = tan(pi·f/fs)/tan(pi·fc/fs).
+    // The prewarped ratio is not optional: f/fc is the analogue prototype and is wrong near Nyquist, which
+    // the header above says at length. `det::tan` for the same reason `det::pow10` is used elsewhere — a
+    // published number must not depend on which libm the row was built against.
+    //
+    // WHAT IT IS AND IS NOT, MEASURED BOTH WAYS. It is a SWEEP instrument: it answers "where should the
+    // crossover sit" for a whole curve at one call per point, which is what choosing a mono-bass frequency
+    // actually asks. It is NOT the number the installed crossover produces.
+    //
+    // ON MATERIAL WHOSE LOW END LIVES INSIDE THE TABLE it is very nearly the same number: against a real
+    // LR4 on mono 41 Hz plus anti-phase 98 and 220 Hz, the two agree to 4.7e-5 absolute at every crossover
+    // from 60 to 300 Hz — far closer than the arithmetic needs to be for a question posed at 0.25.
+    //
+    // OUTSIDE THE TABLE IT IS BLIND, AND THE FAILURE IS NOT SMALL. The bands cover [lowNoteHz, highNoteHz]
+    // and nothing else, so anti-phase energy under 20 Hz or above 300 Hz is absent from both sums while
+    // the real low-pass passes it. Add anti-phase 15 Hz and 700 Hz to that fixture and at fc = 60 Hz this
+    // function reads 0.0036 where the installed filter reads 0.488 — the opposite answer to a question
+    // asked at 0.25, and the 15 Hz term is precisely the vertical hazard a lacquer cares about. Two more
+    // differences are small beside that one and are named for completeness: the population is the USED
+    // FRAMES, window-weighted, not every sample; and no filter start-up is carried.
+    //
+    // SO: sweep to CHOOSE a frequency, then install it and read lowSideFraction() for the answer. A caller
+    // that wants one number and not a curve should not be here.
+    //
+    // Canonically 0.0 for a frequency the crossover itself would refuse, and for the 0/0 of a silent or
+    // unmeasured programme — the same convention as LowEndBand::sideFraction().
+    double sideFractionBelow (double fc) const noexcept
+    {
+        if (! (fc >= kMinCrossoverHz) || ! (fc <= 0.49 * sampleRate_)) return 0.0;
+        const double tc = core::det::tan (core::kPi * fc / sampleRate_);
+        if (! (tc > 0.0) || ! std::isfinite (tc)) return 0.0;
+        double num = 0.0, den = 0.0;
+        for (int b = 0; b < bandCount_; ++b)
+        {
+            const LowEndBand& row = bands_[(std::size_t) b];
+            const double r  = core::det::tan (core::kPi * row.centreHz / sampleRate_) / tc;
+            const double r4 = r * r * r * r;
+            const double d  = 1.0 + r4;
+            if (! std::isfinite (d) || ! (d > 0.0)) continue;          // far above fc: weight is 0, skip it
+            const double w  = 1.0 / (d * d);
+            if (! std::isfinite (w)) continue;
+            num += w * row.sideEnergy;
+            den += w * (row.midEnergy + row.sideEnergy);
+        }
+        return (std::isfinite (num) && std::isfinite (den) && den > 0.0) ? num / den : 0.0;
+    }
+
     LowestOccupied lowestOccupiedBand (double dutyMin) const noexcept
     {
         LowestOccupied r;
@@ -991,8 +1095,12 @@ private:
             int bin = (int) (frac * (double) kHistogramBins);
             if (bin < 0) bin = 0;
             if (bin >= kHistogramBins) bin = kHistogramBins - 1;
-            hist_[bin] += openFinite_;                                  // duration-weighted: samples, not blocks
-            histSamples_ += openFinite_;
+            if (blockIndex_ >= (std::int64_t) params_.skipBlocks)        // the leading blocks a caller asked to drop
+            {
+                hist_[bin] += openFinite_;                              // duration-weighted: samples, not blocks
+                histSamples_ += openFinite_;
+            }
+            else ++skippedBlocks_;
             if (frac > worstFrac_) { worstFrac_ = frac; worstFracBlock_ = blockIndex_; worstFracEnergy_ = energy; }
             if (energy > peakEnergy_) { peakEnergy_ = energy; peakEnergyBlock_ = blockIndex_; peakEnergyFrac_ = frac; }
             if (openSide_ > peakSide_) { peakSide_ = openSide_; peakSideBlock_ = blockIndex_; }
@@ -1222,6 +1330,7 @@ private:
     std::int64_t firstHole_ = -1, lastHole_ = -1;
 
     std::int64_t hist_[kHistogramBins] {};
+    std::int64_t skippedBlocks_ = 0;
     std::int64_t histSamples_ = 0;
     double worstFrac_ = -1.0, worstFracEnergy_ = 0.0;
     std::int64_t worstFracBlock_ = -1;
