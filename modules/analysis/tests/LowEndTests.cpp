@@ -2018,11 +2018,14 @@ int main()
             LowEnd le; le.setParams (q);
             if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
             {
-                ok (le.sideFractionBelow (0.0) == 0.0, "fc = 0 is refused to the canonical zero");
-                ok (le.sideFractionBelow (-120.0) == 0.0, "and a negative one");
-                ok (le.sideFractionBelow (std::numeric_limits<double>::quiet_NaN()) == 0.0, "and NaN");
-                ok (le.sideFractionBelow (std::numeric_limits<double>::infinity()) == 0.0, "and +inf");
-                ok (le.sideFractionBelow (0.5 * fs) == 0.0, "and Nyquist, which the crossover would refuse too");
+                // A REFUSAL IS -1.0 AND NOT 0.0, which a consumer found by reading one as the other: 0.0 is
+                // a legitimate answer (a perfectly mono low end), so a refused frequency returning it is
+                // indistinguishable from a finding. A fraction lives in [0, 1]; a negative cannot be one.
+                ok (le.sideFractionBelow (0.0) == -1.0, "fc = 0 is refused with a sentinel, not with a fraction");
+                ok (le.sideFractionBelow (-120.0) == -1.0, "and a negative one");
+                ok (le.sideFractionBelow (std::numeric_limits<double>::quiet_NaN()) == -1.0, "and NaN");
+                ok (le.sideFractionBelow (std::numeric_limits<double>::infinity()) == -1.0, "and +inf");
+                ok (le.sideFractionBelow (0.5 * fs) == -1.0, "and Nyquist, which the crossover would refuse too");
                 ok (le.sideFractionBelow (120.0) > 0.0, "while a frequency it accepts answers a number");
             }
         }
@@ -2138,6 +2141,30 @@ int main()
     //==========================================================================
     // K9 — infraLowShare(). The consumer replaces a safeguard with this number, so what it MEANS is the
     // test: not "the energy below the crossover" but that share weighted by the LR4's power response.
+    test::group ("K9 parameters: refused rather than accepted and then ignored");
+    {
+        // BOTH OF THESE WERE ACCEPTED AND HAD NO EFFECT, which a consumer found by passing them. That is
+        // worse than a refusal: `params()` echoed the caller's own number back while the measurement ran
+        // on something else. `skipBlocks = -1` compared as `blockIndex >= -1` and skipped nothing;
+        // `dutyThresholdDb = -5` made the linear gate 10^0.5 = 3.16, which no band can reach against its
+        // own frame's maximum, so every duty read 0 and the measurement was silently empty.
+        LowEndParams q = base;
+        q.skipBlocks = -1;
+        ok (! LowEnd::storageFor (kFs, 2, q).ok, "a negative skipBlocks is refused");
+        q = base; q.skipBlocks = LowEnd::kMaxBlocksLimit + 1;
+        ok (! LowEnd::storageFor (kFs, 2, q).ok, "and one past the block ceiling");
+        q = base; q.dutyThresholdDb = -5.0;
+        ok (! LowEnd::storageFor (kFs, 2, q).ok, "a negative duty threshold — 'louder than the loudest' is not a gate");
+        q = base; q.dutyThresholdDb = std::numeric_limits<double>::quiet_NaN();
+        ok (! LowEnd::storageFor (kFs, 2, q).ok, "and a NaN one");
+        q = base; q.dutyThresholdDb = 1.0e6;
+        ok (! LowEnd::storageFor (kFs, 2, q).ok, "and one past what det::pow10 keeps useful");
+        q = base; q.dutyThresholdDb = 0.0;
+        ok (LowEnd::storageFor (kFs, 2, q).ok, "…while zero is legal: only the frame's loudest band counts");
+        q = base; q.skipBlocks = 0;
+        ok (LowEnd::storageFor (kFs, 2, q).ok, "and so is skipping nothing, said with a zero");
+    }
+
     test::group ("K9 infraLowShare: the LR4-weighted share, and NOT the energy below the crossover");
     {
         const double fs = 48000.0, fc = 30.0;

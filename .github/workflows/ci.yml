@@ -768,7 +768,7 @@ jobs:
           # Both rates matter and not for symmetry: at 44.1 kHz the filter arguments of these analyzers
           # (30 Hz, 9 kHz, the K-weighting corner) are ones where the system libm's tan DID differ between
           # rows, so this is the rate that would have caught a regression in the deterministic floor.
-          for mode in report forensics hum lowend bursts; do
+          for mode in report forensics hum lowend bursts excursions; do
             check "$mode" 48000 2 fixture.f32
             check "$mode" 44100 2 fixture441.f32
           done

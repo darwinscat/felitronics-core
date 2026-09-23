@@ -27,6 +27,7 @@
 #include <felitronics/analysis/BandCrest.h>
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
+#include <felitronics/analysis/PeakExcursions.h>
 #include <felitronics/analysis/SourceForensics.h>
 #include <felitronics/analysis/ProgrammeReport.h>
 
@@ -1799,6 +1800,180 @@ FC_EXPORT double fc_probe_forensics_storage_bytes (std::uint32_t channels, doubl
                        sampleRate, (int) channels, kFxParams));
 }
 
+//======================================================================================================
+// K10 — excursions over a delivery ceiling, through analysis::PeakExcursions. The caller hands a render
+// made WITHOUT the limiter and the ceiling it means to deliver at.
+//
+// EVERY AGGREGATE SURVIVES THE RUN LIST'S EXHAUSTION, so a page that asks only for scalars gets exact
+// answers however long the programme is; the list is for coordinates, and `runs_complete` says whether it
+// holds all of them.
+namespace
+{
+    felitronics::analysis::PeakExcursions& excursions()
+    {
+        static felitronics::analysis::PeakExcursions e;
+        return e;
+    }
+    bool haveExcursions = false;
+
+    constexpr std::uint32_t kExScalars   = 22;
+    constexpr std::uint32_t kExRunStride = 6;
+    // What the last SUCCESSFUL run installed — never the compile-time default. The scalars publish the
+    // ceiling and the window a caller must divide by, and a constant there becomes a lie the moment
+    // `_run_with` exists: the crest section above learned that the expensive way.
+    felitronics::analysis::PeakExcursions::Params installedEx {};
+}
+
+static int excursionsRunWith (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                              double sampleRate, const felitronics::analysis::PeakExcursions::Params& p)
+{
+    haveExcursions = false;
+    if (! planarSpan (planar, frames, channels)) return 0;
+    auto& d = excursions();
+    d.setParams (p);
+    if (! d.prepare (sampleRate, (int) channels)) return 0;
+    const float* view[felitronics::core::kMaxChannels] {};
+    // Guarded on `frames`: `planar + k * frames` is undefined behaviour when planar is null EVEN at a
+    // zero offset, and an empty programme is allowed to arrive with one.
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
+    if (! d.finish()) return 0;
+    installedEx = p;
+    haveExcursions = true;
+    return 1;
+}
+
+FC_EXPORT int fc_probe_excursions_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                       double sampleRate, double thresholdDbtp)
+{
+    felitronics::analysis::PeakExcursions::Params p {};
+    p.thresholdDbtp = thresholdDbtp;
+    return excursionsRunWith (planar, frames, channels, sampleRate, p);
+}
+
+// The same measurement with the geometry a caller chose. Validated BY THE CORE, which is the only place
+// that decides: a second opinion here would be a second definition. A refused run answers 0 and leaves
+// the previous geometry rather than half of a new one.
+FC_EXPORT int fc_probe_excursions_run_with (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                            double sampleRate, double thresholdDbtp, double mergeMs,
+                                            double e0, double e1, double e2, double e3, std::int32_t maxRuns)
+{
+    felitronics::analysis::PeakExcursions::Params p {};
+    p.thresholdDbtp = thresholdDbtp;
+    p.mergeMs       = mergeMs;
+    p.classEdgesMs[0] = e0; p.classEdgesMs[1] = e1; p.classEdgesMs[2] = e2; p.classEdgesMs[3] = e3;
+    p.maxRuns       = (int) maxRuns;
+    return excursionsRunWith (planar, frames, channels, sampleRate, p);
+}
+
+FC_EXPORT std::uint32_t fc_probe_excursions_scalars_len (void) { return kExScalars; }
+FC_EXPORT std::uint32_t fc_probe_excursions_run_stride  (void) { return kExRunStride; }
+FC_EXPORT std::uint32_t fc_probe_excursions_classes     (void)
+{ return (std::uint32_t) felitronics::analysis::PeakExcursions::kClasses; }
+FC_EXPORT std::uint32_t fc_probe_excursions_crest_bins  (void)
+{ return (std::uint32_t) felitronics::analysis::PeakExcursions::kCrestBins; }
+
+FC_EXPORT std::uint32_t fc_probe_excursions_scalars (double* out, std::uint32_t cap)
+{
+    if (! haveExcursions || out == nullptr || cap < kExScalars || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = excursions();
+    const auto& p = installedEx;
+    std::uint32_t i = 0;
+    out[i++] = d.sampleRate();              out[i++] = (double) d.channels();
+    out[i++] = p.thresholdDbtp;             out[i++] = d.thresholdLinear();
+    out[i++] = p.mergeMs;                   out[i++] = (double) d.samplesProcessed();
+    out[i++] = (double) d.measuredOs();     out[i++] = (double) (int) d.reason();
+    out[i++] = d.valid() ? 1.0 : 0.0;
+    // The two peaks separately: the certificate is the larger of them, and an instrument publishing only
+    // one would disagree with it without saying where.
+    out[i++] = d.reconstructedPeak();       out[i++] = d.samplePeakLinear();
+    out[i++] = d.truePeakLinear();
+    out[i++] = (double) d.runCount();       out[i++] = (double) d.storedRunCount();
+    out[i++] = d.runsComplete() ? 1.0 : 0.0;
+    // Merge-free, both: a caller sweeping mergeMs keeps these two still while the count moves.
+    out[i++] = (double) d.aboveOs();        out[i++] = d.occupancy();
+    out[i++] = d.totalDose();               out[i++] = d.maxExcess();
+    out[i++] = d.p90Ms();                   out[i++] = d.p90Saturated() ? 1.0 : 0.0;
+    out[i++] = d.runsPerMinute();
+    return i;
+}
+
+// One row per run: startOs, lengthOs, aboveOs, peak, dose, crestHz. Coordinates are OVERSAMPLED samples
+// on the programme's own grid — the interpolator's 63.5-sample lag is already off, so `startOs / 4` is
+// the input-sample position and the residual eighth of a sample is the FIR's half, not a rounding.
+FC_EXPORT std::uint32_t fc_probe_excursions_runs (double* out, std::uint32_t cap)
+{
+    if (! haveExcursions || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = excursions();
+    const std::uint32_t room = cap / kExRunStride;
+    std::uint32_t at = 0;
+    for (std::int64_t r = 0; r < d.storedRunCount() && at < room; ++r, ++at)
+    {
+        const auto row = d.run (r);
+        double* w = out + (std::size_t) at * kExRunStride;
+        w[0] = (double) row.startOs;  w[1] = (double) row.lengthOs;  w[2] = (double) row.aboveOs;
+        w[3] = row.peak;              w[4] = row.dose;
+        w[5] = row.crestHz (d.sampleRate(), d.thresholdLinear());
+    }
+    return at;
+}
+
+// Per duration class: count then dose, in pairs. The classes are the installed edges plus "longer".
+FC_EXPORT std::uint32_t fc_probe_excursions_classes_out (double* out, std::uint32_t cap)
+{
+    const std::uint32_t need = 2u * (std::uint32_t) felitronics::analysis::PeakExcursions::kClasses;
+    if (! haveExcursions || out == nullptr || cap < need || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = excursions();
+    std::uint32_t i = 0;
+    for (int k = 0; k < felitronics::analysis::PeakExcursions::kClasses; ++k)
+    {
+        out[i++] = (double) d.classCount (k);
+        out[i++] = d.classDose (k);
+    }
+    return i;
+}
+
+// The crest-frequency histogram, third-octaves from 20 Hz: low edge, count, dose, in triples. This is
+// what replaces the `lowShare` that could not be measured — a consumer sweeps "is this bass" on its own
+// corpus instead of receiving a boundary baked in at one frequency.
+FC_EXPORT std::uint32_t fc_probe_excursions_crest (double* out, std::uint32_t cap)
+{
+    const std::uint32_t need = 3u * (std::uint32_t) felitronics::analysis::PeakExcursions::kCrestBins;
+    if (! haveExcursions || out == nullptr || cap < need || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = excursions();
+    std::uint32_t i = 0;
+    for (int b = 0; b < felitronics::analysis::PeakExcursions::kCrestBins; ++b)
+    {
+        out[i++] = felitronics::analysis::PeakExcursions::crestBinLowHz (b);
+        out[i++] = (double) d.crestBinCount (b);
+        out[i++] = d.crestBinDose (b);
+    }
+    return i;
+}
+
+// How tightly the peaks sit under the ceiling — the tell for a source that was true-peak LIMITED rather
+// than clipped, whose maxima cluster with no flat tops for a clipping test to find. `minusDb` is the
+// floor under the denominator; pass a large number for "every local maximum".
+FC_EXPORT double fc_probe_excursions_ceiling_density (double minusDb, double withinDb)
+{
+    return haveExcursions ? excursions().ceilingDensityAbove (minusDb, withinDb) : 0.0;
+}
+FC_EXPORT double fc_probe_excursions_ceiling_maxima (void)
+{
+    return haveExcursions ? (double) excursions().ceilingMaxima() : 0.0;
+}
+
+FC_EXPORT double fc_probe_excursions_storage_bytes (std::uint32_t channels, double sampleRate,
+                                                    double thresholdDbtp, double mergeMs, std::int32_t maxRuns)
+{
+    if (! geometry (channels)) return 0.0;
+    felitronics::analysis::PeakExcursions::Params p {};
+    p.thresholdDbtp = thresholdDbtp; p.mergeMs = mergeMs; p.maxRuns = (int) maxRuns;
+    const auto st = felitronics::analysis::PeakExcursions::storageFor (sampleRate, (int) channels, p);
+    return st.ok ? (double) st.bytes() : 0.0;
+}
+
 FC_EXPORT double fc_probe_lowend_storage_bytes (std::uint32_t channels, double sampleRate)
 {
     if (! geometry (channels)) return 0.0;
@@ -1820,8 +1995,19 @@ FC_EXPORT double fc_probe_lowend_storage_bytes_with (std::uint32_t channels, dou
     return demand (felitronics::analysis::LowEnd::storageFor (sampleRate, (int) channels, lp));
 }
 
+// HOW MANY 10 ms BLOCKS AN LR4 AT `crossoverHz` NEEDS TO FALL `dB` BELOW ITS OWN PEAK — the number
+// `skipBlocks` wants, derived from the filter rather than written down on either side of the ABI. Exported
+// because a consumer asked not to re-implement `u = 10.233` in its own language: a constant copied across
+// a boundary is a second definition, and this one comes from a bisection on u*exp(1-u) = 10^(-dB/20).
+// Pure: no instance, no state, nothing to prepare. 0 for arguments the class itself would refuse.
+FC_EXPORT int fc_probe_lowend_settling_blocks (double sampleRate, double crossoverHz, double dB)
+{
+    return felitronics::analysis::LowEnd::settlingBlocks (sampleRate, crossoverHz, dB);
+}
+
 // The side fraction below a candidate crossover, from the band table — the SWEEP. One call per point, so
-// a caller draws a curve; 0.0 for a frequency the crossover itself would refuse. Read the core's note
+// a caller draws a curve. -1.0 — NOT 0.0 — for a frequency the crossover itself would refuse: 0.0 is a
+// legitimate reading (a perfectly mono low end) and a consumer read one as the other. Read the core's note
 // before using it as a number: outside [lowNoteHz, highNoteHz] the table is blind and the real filter is
 // not, and on anti-phase content under 20 Hz the two give opposite answers.
 FC_EXPORT double fc_probe_lowend_side_fraction_below (double hz)

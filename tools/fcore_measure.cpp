@@ -74,6 +74,7 @@
 #include <felitronics/analysis/SourceForensics.h>
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
+#include <felitronics/analysis/PeakExcursions.h>
 #include <felitronics/analysis/BandBursts.h>
 #include <felitronics/analysis/BandCrest.h>
 
@@ -226,7 +227,7 @@ int main (int argc, char** argv)
     if (argc < 5)
     {
         std::fprintf (stderr,
-            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|crest|forensics> <sampleRate> <channels> <raw.f32le>\n"
+            "usage: %s <lufs|truepeak|correlation|blocks|waveform|stereo|needle|clips|stream|report|hum|lowend|bursts|crest|excursions|forensics> <sampleRate> <channels> <raw.f32le>\n"
             "          [--precise] [--buckets N] [--mix avr|L|R|max] [--columns N] [--from A --to B]\n"
             "          [--max-runs N] [--chunk N]\n"
             "          [--quiet-db X] [--order N]\n",
@@ -636,6 +637,86 @@ int main (int argc, char** argv)
         R.visitValues ([] (const char* name, int ch, const analysis::ProgrammeValue& v)
                        { std::printf ("V %s %d %d %d %016llx\n", name, ch, v.valid ? 1 : 0,
                                       (int) v.reason, (unsigned long long) bits (v.value)); });
+        return 0;
+    }
+
+    if (mode == "excursions")
+    {
+        // K10. The excursions a render makes over a delivery ceiling, on the 4x/32 reconstruction the
+        // certificate is issued on. Streamed in kChunk steps, and bit-identical under any slicing.
+        double rate = 0.0; std::uint64_t width = 0;
+        if (! parseRate (argv[2], rate) || ! parseCount (argv[3], width)
+            || width < 1 || width > (std::uint64_t) core::kMaxChannels)
+        {
+            std::fprintf (stderr, "bad sampleRate/channels\n");
+            std::fclose (f);
+            return 2;
+        }
+        std::uint64_t frames = 0;
+        if (! fileFrames (f, nc, frames) || frames == 0)
+        {
+            std::fprintf (stderr, "cannot size the file, it is not a whole number of %d-channel float32 frames, or it is empty\n", nc);
+            std::fclose (f);
+            return 2;
+        }
+        analysis::PeakExcursions::Params xp;
+        analysis::PeakExcursions xe;
+        xe.setParams (xp);
+        if (! xe.prepare (rate, nc))
+        {
+            std::fprintf (stderr, "PeakExcursions refused this geometry (rate, channels, ceiling or class edges)\n");
+            std::fclose (f);
+            return 2;
+        }
+        bool okAll = true;
+        const bool read = streamPlanar (f, nc, [&] (const float* const* pp, int n) { okAll = xe.process (pp, nc, n) && okAll; });
+        std::fclose (f);
+        if (! read || ! okAll || ! xe.finish()) { std::fprintf (stderr, "PeakExcursions refused a chunk, or the file could not be read\n"); return 2; }
+        if ((std::uint64_t) xe.samplesProcessed() != frames)
+        {
+            std::fprintf (stderr, "read %lld of %llu frames — refusing to report a partial measurement\n",
+                          (long long) xe.samplesProcessed(), (unsigned long long) frames);
+            return 2;
+        }
+        std::printf ("# fcore excursions v1 sr=%016llx ch=%d ceiling=%016llx merge=%016llx\n",
+                     (unsigned long long) bits (rate), nc,
+                     (unsigned long long) bits (xp.thresholdDbtp), (unsigned long long) bits (xp.mergeMs));
+        std::printf ("reason %d valid %d samples %lld measuredOs %lld\n",
+                     (int) xe.reason(), xe.valid() ? 1 : 0,
+                     (long long) xe.samplesProcessed(), (long long) xe.measuredOs());
+        std::printf ("peaks recon %016llx sample %016llx truepeak %016llx\n",
+                     (unsigned long long) bits (xe.reconstructedPeak()),
+                     (unsigned long long) bits (xe.samplePeakLinear()),
+                     (unsigned long long) bits (xe.truePeakLinear()));
+        std::printf ("runs %lld stored %lld complete %d aboveOs %lld\n",
+                     (long long) xe.runCount(), (long long) xe.storedRunCount(),
+                     xe.runsComplete() ? 1 : 0, (long long) xe.aboveOs());
+        std::printf ("occupancy %016llx dose %016llx maxexcess %016llx p90 %016llx sat %d perminute %016llx\n",
+                     (unsigned long long) bits (xe.occupancy()), (unsigned long long) bits (xe.totalDose()),
+                     (unsigned long long) bits (xe.maxExcess()), (unsigned long long) bits (xe.p90Ms()),
+                     xe.p90Saturated() ? 1 : 0, (unsigned long long) bits (xe.runsPerMinute()));
+        std::printf ("class count dose\n");
+        for (int k = 0; k < analysis::PeakExcursions::kClasses; ++k)
+            std::printf ("c %d %lld %016llx\n", k, (long long) xe.classCount (k),
+                         (unsigned long long) bits (xe.classDose (k)));
+        std::printf ("crest lowHz count dose\n");
+        for (int b = 0; b < analysis::PeakExcursions::kCrestBins; ++b)
+            std::printf ("k %d %016llx %lld %016llx\n", b,
+                         (unsigned long long) bits (analysis::PeakExcursions::crestBinLowHz (b)),
+                         (long long) xe.crestBinCount (b), (unsigned long long) bits (xe.crestBinDose (b)));
+        std::printf ("run startOs lengthOs aboveOs peak dose crestHz\n");
+        for (std::int64_t r = 0; r < xe.storedRunCount(); ++r)
+        {
+            const auto row = xe.run (r);
+            std::printf ("r %lld %lld %lld %016llx %016llx %016llx\n",
+                         (long long) row.startOs, (long long) row.lengthOs, (long long) row.aboveOs,
+                         (unsigned long long) bits (row.peak), (unsigned long long) bits (row.dose),
+                         (unsigned long long) bits (row.crestHz (rate, xe.thresholdLinear())));
+        }
+        std::printf ("ceiling maxima %lld density %016llx above12 %016llx\n",
+                     (long long) xe.ceilingMaxima(),
+                     (unsigned long long) bits (xe.ceilingDensity()),
+                     (unsigned long long) bits (xe.ceilingDensityAbove (12.0)));
         return 0;
     }
 
