@@ -369,6 +369,11 @@ public:
         std::array<PerChannel, core::kMaxChannels> channel {};
 
         // --- the whole programme ---
+        // `programmeMeanSquare` is UNGATED and sample-level: the sum of squares over every finite sample
+        // inside the programme span, divided by that count. `BandCrest::programmeMeanSquareDb()` is a mean
+        // of BLOCK mean-squares over blocks clearing a -70 dBFS gate, so the two agree on a stationary tone
+        // (6e-10 dB) and part on real material — 0.04 dB where only granularity differs, 3 dB once blocks
+        // fall under that gate. See the note at BandCrest::programmeMeanSquareDb().
         ProgrammeValue samplePeak, rms, crestFactorDb, infraLowFraction, programmeMeanSquare;
         std::int64_t   programmeSpanSamples = 0;   // [firstSignal, lastSignal] inclusive, in frames
         std::int64_t   programmeSpanFinite  = 0;   // finite present samples inside it, all channels

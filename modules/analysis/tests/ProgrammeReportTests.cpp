@@ -70,6 +70,7 @@
 
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
+#include <felitronics/analysis/BandCrest.h>
 #include <felitronics/analysis/ProgrammeReport.h>
 
 #include <algorithm>
@@ -1504,6 +1505,60 @@ static void testEdges()
                   "the stereo relation is measured only over the frames that had both channels");
         test::ok (R.channel[0].finiteSamples == (std::int64_t) p[0].size(), "channel 0 lost nothing");
         test::ok (R.integratedLufs.valid, "the loudness family is still a measurement — the gap was silence, not damage");
+    }
+
+    // TWO AVERAGES OF ONE PROGRAMME, and the header now says where they part — so the suite says it too.
+    // `programmeMeanSquare` here is a SAMPLE total over the programme span, ungated;
+    // `BandCrest::programmeMeanSquareDb()` is a mean of BLOCK mean-squares over blocks clearing -70 dBFS.
+    // The consumer holds both and asked for the boundary in writing; a sentence in a header that nothing runs
+    // is the thing that goes stale, so the two numbers the header cites are measured here.
+    test::group ("programmeMeanSquare against BandCrest's: one on a tone, two different things on real shapes");
+    {
+        struct Case { const char* what; bool quietUnderGate; double wantDelta, tol; };
+        // A stationary tone collapses the two: every block identical, every one over the gate, nothing trimmed.
+        // A loud smooth envelope leaves only block-granularity against a sample total. States at -62 dBFS put
+        // blocks UNDER the gate, which drops them from one population and keeps them in the other.
+        const Case cases[] = { { "stationary tone",        false, 0.0,   1.0e-6 },
+                               { "smooth loud envelope",   false, -0.039, 0.02  },
+                               { "quiet states under -70", true,  3.048, 0.05   } };
+        for (const Case& c : cases)
+        {
+            const int n = (int) (kFs * 20.0);
+            Planes q (2, std::vector<float> ((std::size_t) n, 0.0f));
+            for (int i = 0; i < n; ++i)
+            {
+                const double t = (double) i / kFs;
+                double s;
+                if (c.quietUnderGate)
+                {
+                    const double env = (((std::size_t) i / (std::size_t) (kFs * 0.7)) % 3 == 0) ? 1.0 : 0.0008;
+                    s = env * (0.3 * std::sin (kTwoPi * 220.0 * t) + 0.1 * std::sin (kTwoPi * 1310.0 * t));
+                }
+                else if (std::string (c.what) == "stationary tone") s = 0.2 * std::sin (kTwoPi * 997.0 * t);
+                else s = (0.5 + 0.45 * std::sin (kTwoPi * 0.31 * t)) * 0.3 * std::sin (kTwoPi * 220.0 * t);
+                q[0][(std::size_t) i] = q[1][(std::size_t) i] = (float) s;
+            }
+            analysis::BandCrest bc;
+            if (! test::run (bc.prepare (kFs, 2, (long long) n))) continue;
+            for (int at = 0; at < n; )
+            {
+                const int k = std::min (4096, n - at);
+                const float* qp[2] { q[0].data() + at, q[1].data() + at };
+                if (! test::run (bc.process (qp, 2, k))) break;
+                at += k;
+            }
+            bc.finish();
+            Params mp; mp.maxDurationSec = 600.0;
+            const auto o = run (q, kFs, 4096, { 4096 }, mp);
+            const bool measured = o.R.programmeMeanSquare.valid;
+            test::ok (measured, std::string (c.what) + ": PRECONDITION: the report measured this programme");
+            if (! measured) continue;
+            const double there = 10.0 * std::log10 (o.R.programmeMeanSquare.value);
+            const double delta = bc.programmeMeanSquareDb() - there;
+            test::approx (delta, c.wantDelta, c.tol,
+                          std::string (c.what) + ": crest " + std::to_string (bc.programmeMeanSquareDb())
+                          + " dB against report " + std::to_string (there) + " dB, apart by " + std::to_string (delta));
+        }
     }
 
     test::group ("capacity: overflow is DATA — a partial answer is refused, the counters keep counting");

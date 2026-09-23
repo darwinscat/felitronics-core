@@ -623,6 +623,24 @@ public:
     static constexpr double kProgrammeGateDb = -70.0;
     static constexpr double kSilenceDb       = -200.0;
 
+    // NOT `ProgrammeReport::programmeMeanSquare`, and a caller holding both should know where they part
+    // rather than discover it on a mix. They are two different averages of the same audio:
+    //
+    //   · THIS one is the mean of full-band BLOCK mean-squares over the blocks that clear the -70 dBFS gate
+    //     above, in dB. Blocks below it leave the population entirely.
+    //   · THAT one is a sample-level total — the sum of squares over every finite sample inside the programme
+    //     SPAN (leading and trailing silence trimmed), divided by that sample count. No level gate at all.
+    //
+    // On a stationary tone the two collapse onto each other: every block is identical, every one clears the
+    // gate, and there is no lead or trail to trim — measured at 48 kHz, 20 s of 997 Hz, they agree to
+    // 6e-10 dB. On real material they do not, and the size depends on which difference is doing the work.
+    // With nothing under the gate it is only block granularity against a sample total: a smooth 0.31 Hz
+    // envelope reads -17.963 here against -17.923 there, 0.039 dB BELOW it, and the consumer harness measures
+    // 0.004 to 0.149 dB across eleven mixes. Once quiet blocks fall under -70 dBFS the gate dominates and the
+    // two are not comparable at all: 0.7 s states at -62 dBFS read -14.521 here against -17.570 there, 3.05 dB.
+    //
+    // Which to use: THIS one, when setting `programmeFloorDb`, because that floor is applied to these same
+    // blocks — the header above says why a threshold must not be derived from a population it then selects.
     double programmeMeanSquareDb() const noexcept
     {
         const double gate = core::det::pow10 (kProgrammeGateDb / 10.0);
