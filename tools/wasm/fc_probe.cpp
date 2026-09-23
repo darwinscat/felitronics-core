@@ -1820,8 +1820,19 @@ FC_EXPORT double fc_probe_lowend_storage_bytes_with (std::uint32_t channels, dou
     return demand (felitronics::analysis::LowEnd::storageFor (sampleRate, (int) channels, lp));
 }
 
+// HOW MANY 10 ms BLOCKS AN LR4 AT `crossoverHz` NEEDS TO FALL `dB` BELOW ITS OWN PEAK — the number
+// `skipBlocks` wants, derived from the filter rather than written down on either side of the ABI. Exported
+// because a consumer asked not to re-implement `u = 10.233` in its own language: a constant copied across
+// a boundary is a second definition, and this one comes from a bisection on u*exp(1-u) = 10^(-dB/20).
+// Pure: no instance, no state, nothing to prepare. 0 for arguments the class itself would refuse.
+FC_EXPORT std::int32_t fc_probe_lowend_settling_blocks (double sampleRate, double crossoverHz, double dB)
+{
+    return (std::int32_t) felitronics::analysis::LowEnd::settlingBlocks (sampleRate, crossoverHz, dB);
+}
+
 // The side fraction below a candidate crossover, from the band table — the SWEEP. One call per point, so
-// a caller draws a curve; 0.0 for a frequency the crossover itself would refuse. Read the core's note
+// a caller draws a curve. -1.0 — NOT 0.0 — for a frequency the crossover itself would refuse: 0.0 is a
+// legitimate reading (a perfectly mono low end) and a consumer read one as the other. Read the core's note
 // before using it as a number: outside [lowNoteHz, highNoteHz] the table is blind and the real filter is
 // not, and on anti-phase content under 20 Hz the two give opposite answers.
 FC_EXPORT double fc_probe_lowend_side_fraction_below (double hz)

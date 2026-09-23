@@ -355,6 +355,15 @@ public:
         if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return s;
         if (maxChannels < 1 || maxChannels > core::kMaxChannels) return s;
         if (p.maxBlocks < 0 || p.maxBlocks > kMaxBlocksLimit) return s;
+        // K9's two parameters, REFUSED HERE RATHER THAN IGNORED LATER — and they were neither, which is
+        // the defect a consumer found by passing them. `skipBlocks = -1` compared as `blockIndex >= -1`,
+        // true of every block, so the parameter was accepted and then did nothing; a caller reading its own
+        // -1 back out of params() would have believed the histogram was cut. `dutyThresholdDb = -5` makes
+        // the linear gate 10^(0.5) = 3.16, which no band can reach against its own frame's maximum, so
+        // every duty read 0 and the measurement was silently empty. A parameter that is taken and then has
+        // no effect is worse than one that is refused: the refusal is visible.
+        if (p.skipBlocks < 0 || p.skipBlocks > kMaxBlocksLimit) return s;
+        if (! (p.dutyThresholdDb >= 0.0) || ! (p.dutyThresholdDb <= 200.0)) return s;
         if (! (p.crossoverHz >= kMinCrossoverHz) || ! (p.crossoverHz <= 0.49 * sampleRate)) return s;   // Svf would clamp either end silently
         if (! (p.tuningHz >= kMinNoteHz) || ! (p.tuningHz < sampleRate)) return s;
         if (! (p.lowNoteHz >= kMinNoteHz) || ! (p.highNoteHz > p.lowNoteHz)) return s;
@@ -909,13 +918,15 @@ public:
     // SO: sweep to CHOOSE a frequency, then install it and read lowSideFraction() for the answer. A caller
     // that wants one number and not a curve should not be here.
     //
-    // Canonically 0.0 for a frequency the crossover itself would refuse, and for the 0/0 of a silent or
-    // unmeasured programme — the same convention as LowEndBand::sideFraction().
+    // 0.0 FOR THE 0/0 of a silent or unmeasured programme — the convention LowEndBand::sideFraction() uses.
+    // But -1.0 FOR A FREQUENCY THIS CLASS WOULD REFUSE, and the difference matters: 0.0 is a legitimate
+    // reading (a perfectly mono low end) and a caller that passed a bad frequency would have read it as
+    // one. A fraction is in [0, 1], so a negative is unmistakably not an answer.
     double sideFractionBelow (double fc) const noexcept
     {
-        if (! (fc >= kMinCrossoverHz) || ! (fc <= 0.49 * sampleRate_)) return 0.0;
+        if (! (fc >= kMinCrossoverHz) || ! (fc <= 0.49 * sampleRate_)) return -1.0;
         const double tc = core::det::tan (core::kPi * fc / sampleRate_);
-        if (! (tc > 0.0) || ! std::isfinite (tc)) return 0.0;
+        if (! (tc > 0.0) || ! std::isfinite (tc)) return -1.0;
         double num = 0.0, den = 0.0;
         for (int b = 0; b < bandCount_; ++b)
         {
