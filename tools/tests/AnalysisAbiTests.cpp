@@ -50,6 +50,7 @@
 // live.
 #include <felitronics/core/Config.h>
 #include <felitronics/analysis/BandBursts.h>
+#include <felitronics/analysis/StereoBandBursts.h>
 #include <felitronics/analysis/HumDetector.h>
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/SourceForensics.h>
@@ -115,6 +116,19 @@ extern "C"
     double fc_probe_bursts_storage_bytes_with (std::uint32_t, double, double, double, double, double,
                                                double, double);
     double fc_probe_hum_storage_bytes       (std::uint32_t, double);
+
+    // K3c — band bursts on Mid and Side.
+    int           fc_probe_stereobursts_run           (const float*, std::uint32_t, std::uint32_t, double);
+    std::uint32_t fc_probe_stereobursts_scalars       (double*, std::uint32_t);
+    std::uint32_t fc_probe_stereobursts_events        (std::int32_t, double*, std::uint32_t);
+    std::uint32_t fc_probe_stereobursts_scalars_len   (void);
+    std::uint32_t fc_probe_stereobursts_evt_stride    (void);
+    int           fc_probe_stereobursts_run_with      (const float*, std::uint32_t, std::uint32_t, double,
+                                                       double, double, double, double, double, double,
+                                                       std::int32_t);
+    double        fc_probe_stereobursts_storage_bytes (std::uint32_t, double);
+    double        fc_probe_stereobursts_storage_bytes_with (std::uint32_t, double, double, double, double,
+                                                            double, std::int32_t);
     double fc_probe_forensics_storage_bytes (std::uint32_t, double);
     double fc_probe_lowend_storage_bytes    (std::uint32_t, double);
 }
@@ -262,6 +276,15 @@ double oracleForensics (std::uint32_t ch, double sr)
     const auto st = felitronics::analysis::SourceForensics::storageFor (sr, (int) ch, felitronics::analysis::SourceForensicsParams {});
     return st.ok ? (double) st.bytes() : 0.0;
 }
+// K3c runs TWO MONO engines whatever the input width, so the width does not enter the price — but an
+// invalid one is still refused, which is why `ch` is passed through geometry on the other side.
+double oracleStereoBursts (std::uint32_t ch, double sr)
+{
+    if (ch < 1u || ch > (std::uint32_t) felitronics::core::kMaxChannels) return 0.0;
+    const auto st = felitronics::analysis::StereoBandBursts::storageFor (
+                        sr, felitronics::analysis::BandBurstsParams {});
+    return st.ok ? (double) st.bytes() : 0.0;
+}
 double oracleLowEnd (std::uint32_t ch, double sr)
 {
     const auto st = felitronics::analysis::LowEnd::storageFor (sr, (int) ch, felitronics::analysis::LowEndParams {});
@@ -285,6 +308,8 @@ const Priced priced[] = {
       true,  fc_probe_forensics_scalars },
     { "lowend",    fc_probe_lowend_storage_bytes,    fc_probe_lowend_run,    oracleLowEnd,
       false, fc_probe_lowend_scalars },
+    { "stereobursts", fc_probe_stereobursts_storage_bytes, fc_probe_stereobursts_run, oracleStereoBursts,
+      true,  fc_probe_stereobursts_scalars },
 };
 
 // THE GEOMETRY THE ALLOCATION ORACLE IS MEASURED AT, and the widest the ABI has rather than the ordinary
@@ -422,7 +447,8 @@ void theShimQuotesTheCoreBudget()
     ok (floorHz == 8000.0, "the shared floor is 8000 Hz — a literal pin");
     for (const Priced& m : priced)
     {
-        const bool band = std::string (m.name) == "bursts";
+        // K3c runs the SAME detector on two axes, so it inherits bursts' band floor, not just the shared one.
+        const bool band = std::string (m.name) == "bursts" || std::string (m.name) == "stereobursts";
         ok (m.query (2u, under) == 0.0 && (band || m.query (2u, floorHz) > 0.0) && m.query (2u, 44.1) == 0.0,
             std::string (m.name) + ": refused one ulp under 8000 Hz and at 44.1"
             + (band ? " (and its own band floor is higher still)" : ", priced at 8000"));
@@ -432,6 +458,9 @@ void theShimQuotesTheCoreBudget()
     // now subsumed. A grid that only visits 44.1/48 kHz cannot see either.
     ok (fc_probe_bursts_storage_bytes (2u, 18367.0) == 0.0 && fc_probe_bursts_storage_bytes (2u, 18368.0) > 0.0,
         "bursts: refused at 18367 Hz and priced at 18368 — its own 9 kHz band decides that, not a shared bound");
+    ok (fc_probe_stereobursts_storage_bytes (2u, 18367.0) == 0.0
+            && fc_probe_stereobursts_storage_bytes (2u, 18368.0) > 0.0,
+        "stereobursts: the same 18367/18368 edge — two axes of one detector share its band floor exactly");
     ok (fc_probe_forensics_storage_bytes (2u, 1999.999) == 0.0 && fc_probe_forensics_storage_bytes (2u, 2000.0) == 0.0,
         "forensics: its 2 kHz plateau span no longer decides anything — the shared floor refuses both sides of it");
     // A FRACTIONAL RATE, which a shim narrowing the rate to an integer would lose — and chosen so that it loses it
@@ -849,6 +878,106 @@ void printStorageTable()
                 std::printf ("%s %u %.0f %.0f\n", m.name, ch, sr, m.query (ch, sr));
 }
 
+//==================================================================================================
+// K3c — the stereo surface. Three things, and the third is the one that bites in this ABI.
+void k3cTheStereoSurface (int ch)
+{
+    felitronics::test::group ("K3c — band bursts on Mid and Side, across the ABI");
+    const int frames = 6 * 48000;
+    const std::vector<float> bursty = burstyFixture (frames, ch);
+    const auto n = (std::uint32_t) frames, nc = (std::uint32_t) ch;
+    const std::uint32_t len = fc_probe_stereobursts_scalars_len();
+    const std::uint32_t evt = fc_probe_stereobursts_evt_stride();
+
+    ok (len == 36u && evt == 13u,
+        "the published widths are 36 scalars and 13 doubles per event (got " + std::to_string (len)
+            + " and " + std::to_string (evt) + ")");
+
+    auto scalars = [&] ()
+    {
+        std::vector<double> v (len + 8u, kCanary);
+        const std::uint32_t got = fc_probe_stereobursts_scalars (v.data(), len);
+        v.resize (got);
+        return v;
+    };
+
+    const bool plain = fc_probe_stereobursts_run (bursty.data(), n, nc, 48000.0) == 1;
+    const std::vector<double> a = scalars();
+    const bool withDefaults = fc_probe_stereobursts_run_with (bursty.data(), n, nc, 48000.0,
+                                                              5000.0, 9000.0, 10.0, 2000.0, 6.0, 3.0,
+                                                              1 << 14) == 1;
+    const std::vector<double> b = scalars();
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) if (! (a[i] == b[i])) ++differing;
+    ok (plain && withDefaults && a.size() == b.size() && differing == 0,
+        "run_with at the documented defaults answers the default road's scalars, bit for bit ("
+            + std::to_string (differing) + " differ)");
+
+    // THE CAPACITY IS IN ELEMENTS, as every copier in this ABI takes it — an eighth that took ROWS was a
+    // 6x heap overwrite once. Asking for exactly one row's worth must yield exactly one row, and asking
+    // for one element LESS than a row must yield none rather than a partial write past the caller's end.
+    {
+        const std::int64_t stored = (std::int64_t) a[16 + 9 * 0 + 7];
+        ok (stored > 0, "the fixture stored events on Mid (" + std::to_string (stored) + ")");
+        std::vector<double> one ((std::size_t) evt + 8u, kCanary);
+        const std::uint32_t got = fc_probe_stereobursts_events (0, one.data(), evt);
+        ok (got == 1u, "a capacity of one row's ELEMENTS returns exactly one row (got "
+                           + std::to_string (got) + ")");
+        bool canary = true;
+        for (std::size_t i = evt; i < one.size(); ++i) if (! (one[i] == kCanary)) canary = false;
+        ok (canary, "…and wrote nothing past it");
+        std::vector<double> shy ((std::size_t) evt + 8u, kCanary);
+        const std::uint32_t none = fc_probe_stereobursts_events (0, shy.data(), evt - 1u);
+        bool untouched = true;
+        for (std::size_t i = 0; i < shy.size(); ++i) if (! (shy[i] == kCanary)) untouched = false;
+        ok (none == 0u && untouched, "one element short of a row writes NOTHING, rather than a partial row");
+    }
+
+    // An axis nobody knows is a refusal, not silently Mid — the reading a caller could never detect.
+    {
+        std::vector<double> v ((std::size_t) evt * 4u, kCanary);
+        ok (fc_probe_stereobursts_events (2, v.data(), (std::uint32_t) v.size()) == 0u
+                && fc_probe_stereobursts_events (-1, v.data(), (std::uint32_t) v.size()) == 0u,
+            "an axis outside {0, 1} is refused rather than read as Mid");
+    }
+
+    // A REFUSED RUN LEAVES NOTHING HALF-SWAPPED: the established contract is that a refusal goes silent,
+    // and the state to rule out is new parameters sitting beside the previous run's events.
+    {
+        const bool refused = fc_probe_stereobursts_run_with (bursty.data(), n, nc, 48000.0,
+                                                             9000.0, 5000.0, 10.0, 2000.0, 6.0, 3.0,
+                                                             1 << 14) == 0;
+        std::vector<double> v (len + 8u, kCanary);
+        const std::uint32_t got = fc_probe_stereobursts_scalars (v.data(), len);
+        ok (refused && got == 0u, "an inverted band is refused and leaves the scalars silent");
+    }
+
+    // LAW 11d FOR THE PARAMETERISED PRICE. `_storage_bytes_with` had no gate at all — the repository's own
+    // rule is that a road nothing can drive is a road with nothing checking it, and a price is exactly the
+    // kind of number that stays plausible while being wrong.
+    {
+        const double def  = fc_probe_stereobursts_storage_bytes (2u, 48000.0);
+        const double same = fc_probe_stereobursts_storage_bytes_with (2u, 48000.0, 5000.0, 9000.0, 10.0,
+                                                                      2000.0, 1 << 14);
+        ok (def > 0.0 && same == def,
+            "_storage_bytes_with at the documented band answers the default price exactly");
+        // A LONGER baseline is strictly more ring, so the demand must GROW — an equality here would mean
+        // the parameters never reached storageFor at all, which is the failure mode worth naming.
+        const double longer = fc_probe_stereobursts_storage_bytes_with (2u, 48000.0, 5000.0, 9000.0, 10.0,
+                                                                        4000.0, 1 << 14);
+        ok (longer > def, "doubling the baseline raises the demand (" + std::to_string (longer) + " > "
+                              + std::to_string (def) + ")");
+        ok (fc_probe_stereobursts_storage_bytes_with (0u, 48000.0, 5000.0, 9000.0, 10.0, 2000.0, 1 << 14) == 0.0
+                && fc_probe_stereobursts_storage_bytes_with (2u, 48000.0, 9000.0, 5000.0, 10.0, 2000.0, 1 << 14) == 0.0,
+            "a refused width and an inverted band both quote nothing");
+    }
+
+    // AND THE GROUP LEAVES A LIVE MEASUREMENT BEHIND, because the next block asks every mode for a
+    // readable result — a refusal is the right last act for this group and the wrong state to hand on.
+    ok (fc_probe_stereobursts_run (bursty.data(), n, nc, 48000.0) == 1,
+        "a successful run is reinstated for the blocks that follow");
+}
+
 void queriesAreStateless()
 {
     felitronics::test::group ("storage_bytes — the query is a function of its arguments and of nothing else");
@@ -866,11 +995,11 @@ void queriesAreStateless()
         const std::uint32_t widest = 4096u;
         std::vector<double> probe ((std::size_t) widest + 8, 0.0);
         for (const Priced& m : priced) if (m.silent (probe.data(), widest) > 0) ++live;
-        ok (live == 5, "all five modes have a readable result before the queries — "
-                       + std::to_string (live) + " of five — so there is something for a query to disturb");
+        ok (live == 6, "all six modes have a readable result before the queries — "
+                       + std::to_string (live) + " of six — so there is something for a query to disturb");
     }
-    double first[5] {};
-    for (int i = 0; i < 5; ++i) first[i] = priced[(std::size_t) i].query (2u, 48000.0);
+    double first[6] {};
+    for (int i = 0; i < 6; ++i) first[i] = priced[(std::size_t) i].query (2u, 48000.0);
     // ask about other geometries in between, including refused ones
     for (const Priced& m : priced)
     {
@@ -880,7 +1009,7 @@ void queriesAreStateless()
     ok (before == after, "twenty getters answer identically across a round of queries — asking the price "
                          "neither clears a result nor reconfigures an analyzer");
     bool same = true;
-    for (int i = 0; i < 5; ++i) if (priced[(std::size_t) i].query (2u, 48000.0) != first[i]) same = false;
+    for (int i = 0; i < 6; ++i) if (priced[(std::size_t) i].query (2u, 48000.0) != first[i]) same = false;
     ok (same, "and each query repeats its own answer afterwards");
 }
 } // namespace
@@ -1015,6 +1144,7 @@ int main (int argc, char** argv)
     }
 
     k3TheBandIsAnArgument (ch);
+    k3cTheStereoSurface (ch);
     k1TheTwoSlotsAndTheLoss (ch);
 
     // ---------- P81, last: asking the price disturbs nothing, and the two roads refuse the same set ----------

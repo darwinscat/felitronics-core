@@ -333,6 +333,11 @@ struct BandBurstsHopTrace
     bool         above       = false;   // the decision taken for this hop (enter or stay, as applicable)
     bool         inEvent     = false;   // event state AFTER this hop
     std::int64_t eventStart  = -1;      // the open event's start, or -1
+    // K3c. WHERE THE OPEN EVENT'S PEAK SITS RIGHT NOW, as a hop start, or -1 when no event is open. The
+    // detector has always tracked it (`peakAt_`); it is exposed here so that a wrapper carrying a SECOND
+    // axis can attach that axis's hop to this event's peak without re-deriving the peak rule — which is a
+    // strict cross-multiplication with a `volatile` pin (see closeHop) and must have exactly one spelling.
+    std::int64_t peakAt      = -1;
 };
 
 // PRECONDITION: an observer MUST NOT call back into the detector it was called from. It is a read-only
@@ -898,6 +903,7 @@ private:
             t.energy = energy; t.wideEnergy = wide; t.baseline = baseline;
             t.full = full; t.eligible = eligible; t.damaged = dmg; t.above = above;
             t.inEvent = inEvent_; t.eventStart = inEvent_ ? evStart_ : (std::int64_t) -1;
+            t.peakAt  = inEvent_ ? peakAt_ : (std::int64_t) -1;
             observer_ (observerUser_, t);
         }
 

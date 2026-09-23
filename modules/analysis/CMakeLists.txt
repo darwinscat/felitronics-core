@@ -131,6 +131,12 @@ if(FELITRONICS_BUILD_TESTS)
     add_test(NAME felitronics_low_end_tests COMMAND felitronics_low_end_tests)
     # BandBursts (P76) — an offline burst detector: energy in a band against the MEDIAN of a long trailing
     # ring of hops. Links analysis_offline for eq::Crossover2 (the LR4 that makes the band).
+    add_executable(felitronics_stereo_band_bursts_tests tests/StereoBandBurstsTests.cpp)
+    target_link_libraries(felitronics_stereo_band_bursts_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_stereo_band_bursts_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_stereo_band_bursts_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_stereo_band_bursts_tests COMMAND felitronics_stereo_band_bursts_tests)
+
     add_executable(felitronics_band_bursts_tests tests/BandBurstsTests.cpp)
     target_link_libraries(felitronics_band_bursts_tests PRIVATE felitronics::analysis_offline)
     target_include_directories(felitronics_band_bursts_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

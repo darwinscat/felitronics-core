@@ -29,6 +29,7 @@
 #include <felitronics/analysis/LowEnd.h>
 #include <felitronics/analysis/PeakExcursions.h>
 #include <felitronics/analysis/SourceForensics.h>
+#include <felitronics/analysis/StereoBandBursts.h>
 #include <felitronics/analysis/ProgrammeReport.h>
 
 #include <cstdint>
@@ -2031,4 +2032,166 @@ FC_EXPORT std::uint32_t fc_probe_lowend_lowest_occupied (double dutyMin, double*
     out[i++] = (double) r.count;  out[i++] = r.duty;           out[i++] = r.levelWhenOnDb;
     out[i++] = r.marginWhenOnDb;
     return i;
+}
+
+// K3c — band bursts on Mid and Side, through analysis::StereoBandBursts. The mono `bursts` surface above
+// is untouched: this is a second instrument, not a version of that one, and a page reading either keeps
+// reading it.
+//
+// THE CROSS FIELDS TRAVEL WITH THE EVENT THEY BELONG TO, in the same row. Published apart they would be
+// two lists a caller has to align by index, and the first off-by-one would read one burst's Side against
+// another burst's Mid — a mistake that looks like a stereo finding rather than like a bug.
+namespace
+{
+    felitronics::analysis::StereoBandBursts& sbursts()
+    {
+        static felitronics::analysis::StereoBandBursts s;
+        return s;
+    }
+    bool haveSbursts = false;
+
+    constexpr std::uint32_t kSbScalars   = 36;
+    constexpr std::uint32_t kSbEvtStride = 13;
+    felitronics::analysis::StereoBandBursts::Params installedSb {};
+    // ASKED FOR and OBSERVED are two facts, not one. On a zero-length programme process() is
+    // never called, so the detector's own channels() is 0 while the caller did ask for two —
+    // and the header describes the configuration, not what the silence happened to carry.
+    std::uint32_t installedSbChannels = 0;
+}
+
+static int sburstsRunWith (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                           double sampleRate, const felitronics::analysis::StereoBandBursts::Params& p)
+{
+    haveSbursts = false;
+    // …OrEmpty, not planarSpan: the native road measures a zero-length programme and prints a perfectly
+    // good empty report, so a road that refuses one here is a refusal set that does not match. This is
+    // the trap the comment on planarSpanOrEmpty already describes, walked into by copying the excursions
+    // block — where refusing an empty file IS the native behaviour.
+    if (! planarSpanOrEmpty (planar, frames, channels)) return 0;
+    auto& d = sbursts();
+    d.setParams (p);
+    if (! d.prepare (sampleRate, (int) channels)) return 0;
+    const float* view[felitronics::core::kMaxChannels] {};
+    if (frames != 0)
+        for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
+    if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
+    if (! d.finish()) return 0;
+    installedSb = p;
+    installedSbChannels = channels;
+    haveSbursts = true;
+    return 1;
+}
+
+FC_EXPORT int fc_probe_stereobursts_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                         double sampleRate)
+{
+    return sburstsRunWith (planar, frames, channels, sampleRate,
+                           felitronics::analysis::StereoBandBursts::Params {});
+}
+
+FC_EXPORT int fc_probe_stereobursts_run_with (const float* planar, std::uint32_t frames,
+                                              std::uint32_t channels, double sampleRate,
+                                              double bandLowHz, double bandHighHz, double hopMs,
+                                              double baselineMs, double enterDb, double exitDb,
+                                              std::int32_t maxEvents)
+{
+    felitronics::analysis::StereoBandBursts::Params p {};
+    p.bandLowHz = bandLowHz; p.bandHighHz = bandHighHz; p.hopMs = hopMs; p.baselineMs = baselineMs;
+    p.enterDb = enterDb;     p.exitDb = exitDb;         p.maxEvents = (int) maxEvents;
+    return sburstsRunWith (planar, frames, channels, sampleRate, p);
+}
+
+FC_EXPORT std::uint32_t fc_probe_stereobursts_scalars_len (void) { return kSbScalars; }
+FC_EXPORT std::uint32_t fc_probe_stereobursts_evt_stride  (void) { return kSbEvtStride; }
+
+FC_EXPORT std::uint32_t fc_probe_stereobursts_scalars (double* out, std::uint32_t cap)
+{
+    if (! haveSbursts || out == nullptr || cap < kSbScalars || ! outSpan (out, cap, 8)) return 0u;
+    const auto& d = sbursts();
+    const auto& p = installedSb;
+    std::uint32_t i = 0;
+    out[i++] = d.sampleRate();                out[i++] = (double) installedSbChannels;
+    out[i++] = (double) d.samplesProcessed();
+    // The filters' OWN corners, not the requested ones: a rate that cannot carry 9 kHz moves them.
+    out[i++] = d.mid().bandLowHz();           out[i++] = d.mid().bandHighHz();
+    out[i++] = p.hopMs;                       out[i++] = p.baselineMs;
+    out[i++] = p.enterDb;                     out[i++] = p.exitDb;
+    out[i++] = (double) d.mid().hopSamples(); out[i++] = (double) d.mid().baselineHops();
+    // What the band can report AT ALL for a pure tone, and where. Without it a caller thresholding a
+    // share against a textbook number is wrong by the dome, and wrong again at another sample rate.
+    out[i++] = d.domeShare();                 out[i++] = d.domeHz();
+    // Absence is STRUCTURAL — one channel — never a threshold on how small Side is. The exact-zero hop
+    // counts beside it are what let a caller set its own near-mono rule without one being baked in here.
+    out[i++] = d.sideAbsent() ? 1.0 : 0.0;
+    out[i++] = (double) d.exactZeroHops (felitronics::analysis::StereoBandBursts::kMid);
+    out[i++] = (double) d.exactZeroHops (felitronics::analysis::StereoBandBursts::kSide);
+    // Then NINE PER AXIS, Mid first — the same nine the native road prints on its `axis` line, in the
+    // same order. Two blocks of a fixed width rather than interleaved pairs, so a reader indexes one
+    // axis with `16 + 9 * a` and cannot read Mid's count against Side's baseline.
+    for (int a = 0; a < felitronics::analysis::StereoBandBursts::kAxes; ++a)
+    {
+        const auto& e = d.axis (a);
+        out[i++] = (double) e.hopCount();          out[i++] = (double) e.eligibleHops();
+        out[i++] = (double) e.zeroBaselineHops();  out[i++] = (double) e.burstHops();
+        out[i++] = e.eventsValid() ? 1.0 : 0.0;    out[i++] = (double) (int) e.eventsInvalidReason();
+        out[i++] = (double) e.eventCount();        out[i++] = (double) e.storedEventCount();
+        out[i++] = e.eventsComplete() ? 1.0 : 0.0;
+    }
+    // The streaming step the NATIVE road uses, published rather than written down again in JavaScript: a
+    // constant copied across the boundary is a second definition, and the headers must agree byte for byte.
+    out[i++] = (double) fcore::Probe::kChunk;
+    // …and the width that actually ARRIVED, beside the width that was asked for at index 1.
+    out[i++] = (double) d.channels();
+    return i;
+}
+
+// One row per event on `axis` (0 = Mid, 1 = Side): start, length, peakAt, peakPower, peakBaseline,
+// peakExcessDb, peakWidePower, energy, hops, then the OTHER axis at this event's peak hop — power,
+// baseline, eligible, hop. `cap` is in ELEMENTS, as every copier in this ABI takes it.
+FC_EXPORT std::uint32_t fc_probe_stereobursts_events (std::int32_t axis, double* out, std::uint32_t cap)
+{
+    if (! haveSbursts || out == nullptr || ! outSpan (out, cap, 8)) return 0u;
+    if (axis != 0 && axis != 1) return 0u;
+    const auto& d = sbursts();
+    const auto& e = d.axis ((int) axis);
+    const std::uint32_t room = cap / kSbEvtStride;
+    std::uint32_t at = 0;
+    for (std::int64_t k = 0; k < e.storedEventCount() && at < room; ++k, ++at)
+    {
+        const auto ev = e.event (k);
+        const auto cr = d.crossAt ((int) axis, k);
+        double* w = out + (std::size_t) at * kSbEvtStride;
+        w[0]  = (double) ev.start;        w[1] = (double) ev.length;   w[2] = (double) ev.peakAt;
+        w[3]  = ev.peakPower;             w[4] = ev.peakBaseline;      w[5] = ev.peakExcessDb;
+        w[6]  = ev.peakWidePower;         w[7] = ev.energy;            w[8] = (double) ev.hops;
+        w[9]  = cr.power;                 w[10] = cr.baseline;
+        w[11] = cr.eligible ? 1.0 : 0.0;  w[12] = (double) cr.hop;
+    }
+    return at;
+}
+
+// The price at the documented defaults, in the (channels, sampleRate) shape every priced mode takes — so
+// the cross-tier storage table can carry this one too. The demand does NOT depend on the width: the class
+// always runs two MONO engines, Mid and Side, whatever arrives. `channels` is still read, as a validity
+// gate: a width the ABI would refuse must not be quoted a price.
+FC_EXPORT double fc_probe_stereobursts_storage_bytes (std::uint32_t channels, double sampleRate)
+{
+    if (! geometry (channels)) return 0.0;
+    const auto st = felitronics::analysis::StereoBandBursts::storageFor (
+                        sampleRate, felitronics::analysis::StereoBandBursts::Params {});
+    return st.ok ? (double) st.bytes() : 0.0;
+}
+
+// …and law 11d: a caller sizing a heap for a non-default band must be able to ask about THAT band.
+FC_EXPORT double fc_probe_stereobursts_storage_bytes_with (std::uint32_t channels, double sampleRate,
+                                                           double bandLowHz, double bandHighHz,
+                                                           double hopMs, double baselineMs,
+                                                           std::int32_t maxEvents)
+{
+    if (! geometry (channels)) return 0.0;
+    felitronics::analysis::StereoBandBursts::Params p {};
+    p.bandLowHz = bandLowHz; p.bandHighHz = bandHighHz; p.hopMs = hopMs; p.baselineMs = baselineMs;
+    p.maxEvents = (int) maxEvents;
+    const auto st = felitronics::analysis::StereoBandBursts::storageFor (sampleRate, p);
+    return st.ok ? (double) st.bytes() : 0.0;
 }

@@ -41,8 +41,9 @@ const M = await require(resolve(modPath))();
 
 // `acceptsEmpty` is the one deliberate asymmetry between the price and the run: four of the five report
 // on an empty programme, and `lowend` refuses one because `fcore_measure lowend` refuses it too.
-const MODES = ['report', 'bursts', 'hum', 'forensics', 'lowend'];
-const ACCEPTS_EMPTY = { report: true, bursts: true, hum: true, forensics: true, lowend: false };
+const MODES = ['report', 'bursts', 'hum', 'forensics', 'lowend', 'stereobursts'];
+const ACCEPTS_EMPTY = { report: true, bursts: true, hum: true, forensics: true, lowend: false,
+                        stereobursts: true };
 
 // THE FIRST ASSERTION, AND IT IS MADE IN BOTH MODES. A name that did not reach the artifact is `undefined`
 // here, and calling it would throw a TypeError three lines later with nothing to say about why.
@@ -159,7 +160,8 @@ const COUNTS = [0, 64, FRAMES];
 let rows = 0, disagreed = 0, spoke = 0;
 const silent = { report: '_fc_probe_report_counts', bursts: '_fc_probe_bursts_scalars',
                  hum: '_fc_probe_hum_scalars', forensics: '_fc_probe_forensics_scalars',
-                 lowend: '_fc_probe_lowend_scalars' };
+                 lowend: '_fc_probe_lowend_scalars',
+                 stereobursts: '_fc_probe_stereobursts_scalars' };
 const scratch = M._malloc(64 * 8);
 if (!scratch) refuse('wasm OOM on the probe scratch');
 for (const m of MODES)
