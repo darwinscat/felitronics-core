@@ -1299,13 +1299,20 @@ namespace
     // One definition, two roads — see kReportParams above.
     constexpr felitronics::analysis::LowEndParams kLeParams {};
 
-    constexpr std::uint32_t kLeScalars     = 60;
+    constexpr std::uint32_t kLeScalars     = 68;
     constexpr std::uint32_t kLeSeriesStride = 6;
-    constexpr std::uint32_t kLeBandStride   = 11;
+    constexpr std::uint32_t kLeBandStride   = 13;
+    constexpr std::uint32_t kLeLowestFields = 7;
+
+    // WHAT THE LAST SUCCESSFUL RUN INSTALLED, not the compile-time default. The scalars publish the
+    // geometry a caller must divide by, and the moment `_run_with` exists a constant there is a lie:
+    // fftOrder, the note range and the duty threshold would keep reporting the defaults while the
+    // measurement used something else. Same arrangement as the crest section above.
+    felitronics::analysis::LowEndParams installedLe = kLeParams;
 }
 
-FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
-                                   double sampleRate)
+static int lowEndRunWith (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                          double sampleRate, const felitronics::analysis::LowEndParams& lp)
 {
     haveLowEnd = false;
     // planarSpan, NOT planarSpanOrEmpty: `fcore_measure lowend` REFUSES an empty programme where the
@@ -1314,7 +1321,7 @@ FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, st
     // measure, and it says so by exiting rather than by publishing an invalid report.)
     if (! planarSpan (planar, frames, channels)) return 0;
     auto& d = lowEnd();
-    d.setParams (kLeParams);
+    d.setParams (lp);
     if (! d.prepare (sampleRate, (int) fcore::Probe::kChunk, (int) channels)) return 0;
     const float* view[felitronics::core::kMaxChannels] {};
     // Guarded on `frames`, not merely skipped later: `planar + k * frames` is undefined behaviour when
@@ -1325,11 +1332,37 @@ FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, st
         for (std::uint32_t k = 0; k < channels; ++k) view[k] = planar + (std::size_t) k * (std::size_t) frames;
     if (frames != 0 && ! d.process (view, (int) channels, (int) frames)) return 0;
     if (! d.finish()) return 0;
+    installedLe = lp;                    // only on success: a refused run leaves the last good geometry
     haveLowEnd = true;
     return 1;
 }
 
+FC_EXPORT int fc_probe_lowend_run (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                   double sampleRate)
+{
+    return lowEndRunWith (planar, frames, channels, sampleRate, kLeParams);
+}
+
+// The same measurement with the geometry a caller chose. Every argument is VALIDATED BY THE CORE, not
+// here: `storageFor` refuses exactly what `prepare` refuses, and a second opinion in this file would be a
+// second definition waiting to drift. A refused run answers 0 and changes nothing a reader can see.
+FC_EXPORT int fc_probe_lowend_run_with (const float* planar, std::uint32_t frames, std::uint32_t channels,
+                                        double sampleRate, double crossoverHz, double lowNoteHz,
+                                        double highNoteHz, std::int32_t fftOrder, double dutyThresholdDb,
+                                        std::int32_t skipBlocks)
+{
+    felitronics::analysis::LowEndParams lp = kLeParams;
+    lp.crossoverHz     = crossoverHz;
+    lp.lowNoteHz       = lowNoteHz;
+    lp.highNoteHz      = highNoteHz;
+    lp.fftOrder        = (int) fftOrder;
+    lp.dutyThresholdDb = dutyThresholdDb;
+    lp.skipBlocks      = (int) skipBlocks;
+    return lowEndRunWith (planar, frames, channels, sampleRate, lp);
+}
+
 FC_EXPORT std::uint32_t fc_probe_lowend_scalars_len  (void) { return kLeScalars; }
+FC_EXPORT std::uint32_t fc_probe_lowend_lowest_fields (void) { return kLeLowestFields; }
 FC_EXPORT std::uint32_t fc_probe_lowend_series_stride (void) { return kLeSeriesStride; }
 FC_EXPORT std::uint32_t fc_probe_lowend_band_stride   (void) { return kLeBandStride; }
 FC_EXPORT std::uint32_t fc_probe_lowend_hist_bins     (void)
@@ -1339,7 +1372,7 @@ FC_EXPORT std::uint32_t fc_probe_lowend_scalars (double* out, std::uint32_t cap)
 {
     if (! haveLowEnd || out == nullptr || cap < kLeScalars || ! outSpan (out, cap, 8)) return 0u;
     const auto& d = lowEnd();
-    const auto& lp = kLeParams;          // the constant the run and the price read — not a fresh default
+    const auto& lp = installedLe;        // what the RUN installed — see the note beside it
     std::uint32_t i = 0;
     out[i++] = d.sampleRate();            out[i++] = (double) d.channels();
     out[i++] = d.crossoverHz();           out[i++] = (double) lp.fftOrder;
@@ -1370,6 +1403,16 @@ FC_EXPORT std::uint32_t fc_probe_lowend_scalars (double* out, std::uint32_t cap)
     out[i++] = d.frameEnergy();    out[i++] = d.bandRangeShare();
     out[i++] = d.backgroundDensity(); out[i++] = d.peakBandEnergy(); out[i++] = d.peakBandWidthHz();
     out[i++] = d.peakShare();      out[i++] = d.totalBandEnergy();
+    // K9. The resolution boundary, so `underResolvedBands` above is actionable rather than a count; the
+    // duty population, so a consumer never has to define it; the installed threshold, because a run may
+    // not have used the default; and what the histogram did not count.
+    out[i++] = (double) d.firstResolvedBand();  out[i++] = d.resolvedAboveHz();
+    out[i++] = (double) felitronics::analysis::LowEnd::lobeBins();
+    out[i++] = (double) d.dutyFrames();         out[i++] = d.dutyThresholdDb();
+    out[i++] = (double) d.skippedBlocks();      out[i++] = (double) lp.skipBlocks;
+    // The low band's share of the whole programme, named rather than left to be recomposed — see the
+    // core's note: it is LR4-weighted, and content at the crossover counts at a quarter.
+    out[i++] = d.infraLowShare();
     return i;
 }
 
@@ -1435,6 +1478,9 @@ FC_EXPORT std::uint32_t fc_probe_lowend_bands (double* out, std::uint32_t cap)
         w[3] = r.widthHz;         w[4] = r.binsPerBand;     w[5] = r.midEnergy;
         w[6] = r.sideEnergy;      w[7] = r.energy;          w[8] = r.density;
         w[9] = r.centroidHz;      w[10] = r.centsOffset;
+        // K9: how OFTEN the band was there, and how loud it was when it was. The duty itself is
+        // count/dutyFrames — one division both roads do identically, from two numbers both published.
+        w[11] = (double) d.dutyCount (b);       w[12] = d.levelWhenOnDb (b);
     }
     return at;
 }
@@ -1758,4 +1804,40 @@ FC_EXPORT double fc_probe_lowend_storage_bytes (std::uint32_t channels, double s
     if (! geometry (channels)) return 0.0;
     return demand (felitronics::analysis::LowEnd::storageFor (
                        sampleRate, (int) channels, kLeParams));
+}
+
+// The price of the geometry `_run_with` would take. Law 11d: the budget is the allocation, so a caller
+// sizing a heap for a non-default order must be able to ask about THAT order, not about the default.
+FC_EXPORT double fc_probe_lowend_storage_bytes_with (std::uint32_t channels, double sampleRate,
+                                                     double crossoverHz, double lowNoteHz, double highNoteHz,
+                                                     std::int32_t fftOrder, double dutyThresholdDb,
+                                                     std::int32_t skipBlocks)
+{
+    if (! geometry (channels)) return 0.0;
+    felitronics::analysis::LowEndParams lp = kLeParams;
+    lp.crossoverHz = crossoverHz; lp.lowNoteHz = lowNoteHz; lp.highNoteHz = highNoteHz;
+    lp.fftOrder = (int) fftOrder; lp.dutyThresholdDb = dutyThresholdDb; lp.skipBlocks = (int) skipBlocks;
+    return demand (felitronics::analysis::LowEnd::storageFor (sampleRate, (int) channels, lp));
+}
+
+// The side fraction below a candidate crossover, from the band table — the SWEEP. One call per point, so
+// a caller draws a curve; 0.0 for a frequency the crossover itself would refuse. Read the core's note
+// before using it as a number: outside [lowNoteHz, highNoteHz] the table is blind and the real filter is
+// not, and on anti-phase content under 20 Hz the two give opposite answers.
+FC_EXPORT double fc_probe_lowend_side_fraction_below (double hz)
+{
+    return haveLowEnd ? lowEnd().sideFractionBelow (hz) : 0.0;
+}
+
+// The lowest band present in at least `dutyMin` of the counted frames: band, midi, centreHz, count, duty,
+// levelWhenOnDb, marginWhenOnDb. `band` is -1 when none qualifies, which is the core's own convention.
+FC_EXPORT std::uint32_t fc_probe_lowend_lowest_occupied (double dutyMin, double* out, std::uint32_t cap)
+{
+    if (! haveLowEnd || out == nullptr || cap < kLeLowestFields || ! outSpan (out, cap, 8)) return 0u;
+    const auto r = lowEnd().lowestOccupiedBand (dutyMin);
+    std::uint32_t i = 0;
+    out[i++] = (double) r.band;   out[i++] = (double) r.midi;  out[i++] = r.centreHz;
+    out[i++] = (double) r.count;  out[i++] = r.duty;           out[i++] = r.levelWhenOnDb;
+    out[i++] = r.marginWhenOnDb;
+    return i;
 }

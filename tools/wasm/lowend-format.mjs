@@ -9,10 +9,10 @@ import { bitsOf } from './blocks-format.mjs';
 
 export function formatLowEnd({ ok, s, hist, series, bands, noteName, sSeries, sBand, hBins }) {
     if (!ok) return '';
-    if (sSeries !== 6 || sBand !== 11)
-        throw new Error(`lowend v1 is 6/11 doubles per row, the module says ${sSeries}/${sBand}`);
+    if (sSeries !== 6 || sBand !== 13)
+        throw new Error(`lowend v2 is 6/13 doubles per row, the module says ${sSeries}/${sBand}`);
     const L = [];
-    L.push(`# fcore lowend v1 sr=${bitsOf(s[0])} ch=${s[1]} xover=${bitsOf(s[2])} order=${s[3]} hop=${s[4]} block=${s[5]} bands=${s[6]} chunk=${s[7]}`);
+    L.push(`# fcore lowend v2 sr=${bitsOf(s[0])} ch=${s[1]} xover=${bitsOf(s[2])} order=${s[3]} hop=${s[4]} block=${s[5]} bands=${s[6]} chunk=${s[7]}`);
     L.push(`reason ${s[8]} ${s[9]}`);
     L.push(`samples ${s[10]} finite ${s[11]} holes ${s[12]} nonfinite ${s[13]} absent ${s[14]} overflow ${s[15]}`);
     const en = ['lowmid', 'lowside', 'highmid', 'highside', 'rawmid', 'rawside', 'lowfrac'];
@@ -29,11 +29,13 @@ export function formatLowEnd({ ok, s, hist, series, bands, noteName, sSeries, sB
         const r = series.subarray(i * sSeries, i * sSeries + sSeries);
         L.push(`s ${r[0]} ${r[1]} ${r[2]} ${r[3]} ${bitsOf(r[4])} ${bitsOf(r[5])}`);
     }
-    L.push('band midi centreHz widthHz binsPerBand midEnergy sideEnergy energy density centroidHz centsOffset');
+    L.push('band midi centreHz widthHz binsPerBand midEnergy sideEnergy energy density centroidHz centsOffset dutyCount levelWhenOnDb');
     for (let i = 0; i < bands.length / sBand; ++i) {
         const r = bands.subarray(i * sBand, i * sBand + sBand);
+        // dutyCount is a COUNT and prints as one; every other column is a double and prints as bits.
         let line = `b ${r[0]} ${r[1]}`;
         for (let k = 2; k < 11; ++k) line += ` ${bitsOf(r[k])}`;
+        line += ` ${r[11]} ${bitsOf(r[12])}`;
         L.push(line);
     }
     L.push(`peak ${s[44]} ${s[45]} density ${s[46]} second ${s[47]}`);
@@ -41,5 +43,9 @@ export function formatLowEnd({ ok, s, hist, series, bands, noteName, sSeries, sB
     else             L.push(`note INVALID reason ${s[9]}`);
     L.push(`frame ${bitsOf(s[53])} rangeshare ${bitsOf(s[54])}`);
     L.push(`background ${bitsOf(s[55])} peakenergy ${bitsOf(s[56])} peakwidth ${bitsOf(s[57])} share ${bitsOf(s[58])} total ${bitsOf(s[59])}`);
+    // v2. The resolution boundary, the duty population and what the histogram did not count.
+    L.push(`resolved first ${s[60]} above ${bitsOf(s[61])} lobebins ${s[62]}`);
+    L.push(`infralow ${bitsOf(s[67])}`);
+    L.push(`duty frames ${s[63]} thresholddb ${bitsOf(s[64])} skipped ${s[65]} asked ${s[66]}`);
     return L.join('\n') + '\n';
 }

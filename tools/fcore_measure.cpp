@@ -686,7 +686,7 @@ int main (int argc, char** argv)
         // Raw bit patterns, not %g: the other side of this comparison is JavaScript, whose decimal
         // formatting is not C's, so a 16-hex-digit pattern is the one representation both sides produce
         // identically. A decimal header would break a whole-file diff while every measured bit matched.
-        std::printf ("# fcore lowend v1 sr=%016llx ch=%d xover=%016llx order=%d hop=%lld block=%lld bands=%d chunk=%d\n",
+        std::printf ("# fcore lowend v2 sr=%016llx ch=%d xover=%016llx order=%d hop=%lld block=%lld bands=%d chunk=%d\n",
                      (unsigned long long) bits (fs), nc, (unsigned long long) bits (le.crossoverHz()),
                      lp.fftOrder, (long long) le.hopSamples(), (long long) le.blockSamples(), le.bandCount(), kChunk);
         std::printf ("reason %d %d\n", (int) le.widthReason(), (int) le.noteReason());
@@ -726,16 +726,17 @@ int main (int argc, char** argv)
                          (long long) r.finiteSamples, (long long) r.holes,
                          (unsigned long long) bits (r.midEnergy), (unsigned long long) bits (r.sideEnergy));
         }
-        std::printf ("band midi centreHz widthHz binsPerBand midEnergy sideEnergy energy density centroidHz centsOffset\n");
+        std::printf ("band midi centreHz widthHz binsPerBand midEnergy sideEnergy energy density centroidHz centsOffset dutyCount levelWhenOnDb\n");
         for (int b = 0; b < le.bandCount(); ++b)
         {
             const analysis::LowEndBand r = le.band (b);
-            std::printf ("b %d %d %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", b, r.midi,
+            std::printf ("b %d %d %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %lld %016llx\n", b, r.midi,
                          (unsigned long long) bits (r.centreHz), (unsigned long long) bits (r.widthHz),
                          (unsigned long long) bits (r.binsPerBand), (unsigned long long) bits (r.midEnergy),
                          (unsigned long long) bits (r.sideEnergy), (unsigned long long) bits (r.energy),
                          (unsigned long long) bits (r.density), (unsigned long long) bits (r.centroidHz),
-                         (unsigned long long) bits (r.centsOffset));
+                         (unsigned long long) bits (r.centsOffset),
+                         (long long) le.dutyCount (b), (unsigned long long) bits (le.levelWhenOnDb (b)));
         }
         std::printf ("peak %d %d density %d second %d\n", le.peakBand(), le.peakMidi(),
                      le.peakDensityBand(), le.secondBand());
@@ -757,6 +758,15 @@ int main (int argc, char** argv)
                      (unsigned long long) bits (le.backgroundDensity()), (unsigned long long) bits (le.peakBandEnergy()),
                      (unsigned long long) bits (le.peakBandWidthHz()), (unsigned long long) bits (le.peakShare()),
                      (unsigned long long) bits (le.totalBandEnergy()));
+        // v2 — K9. The resolution boundary makes underResolvedBands actionable; the duty population is
+        // published so a consumer never defines it twice; `skipped`/`asked` say what the histogram lost.
+        std::printf ("resolved first %d above %016llx lobebins %d\n",
+                     le.firstResolvedBand(), (unsigned long long) bits (le.resolvedAboveHz()),
+                     analysis::LowEnd::lobeBins());
+        std::printf ("infralow %016llx\n", (unsigned long long) bits (le.infraLowShare()));
+        std::printf ("duty frames %lld thresholddb %016llx skipped %lld asked %d\n",
+                     (long long) le.dutyFrames(), (unsigned long long) bits (le.dutyThresholdDb()),
+                     (long long) le.skippedBlocks(), lp.skipBlocks);
         return 0;
     }
 

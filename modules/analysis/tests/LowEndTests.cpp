@@ -107,6 +107,7 @@ constexpr double kPi = core::kPi;
 // designed against. The exceptions are the rows that ran at the lowest accepted rate, 1 kHz: they run at 8 kHz now
 // (the centroid sweep, the crossover's edge, the largest geometry), with their own orders.
 constexpr double kFs = 12000.0;
+
 constexpr std::int64_t kB = 120;                 // lround (0.01 * kFs): one 10 ms block
 
 //==============================================================================
@@ -130,6 +131,17 @@ double lr4HighPower (double f, double fc, double fs) noexcept
 }
 
 double noteHzOf (int midi, double tuning) noexcept { return tuning * std::exp2 ((double) (midi - 69) / 12.0); }
+
+// THE FIRST MIDI OF A RANGE, DERIVED. Three oracles in this file used to spell `23` — the first band of the
+// 30 Hz default — and every one of them went red when K9 took the range down to 20 Hz, because they were
+// addressing a band by POSITION. That is the same mistake the header now warns a consumer against, so the
+// tests stop making it: the first note is whatever note the range starts at.
+inline int firstMidiOf (double lowHz, double tuningHz)
+{
+    int n = 0;
+    while (noteHzOf (n, tuningHz) < lowHz) ++n;
+    return n;
+}
 
 // A windowed direct DFT and an independently written fractional-overlap band integration: the second
 // implementation of the fold, written from the definition rather than from the header.
@@ -415,7 +427,8 @@ int main()
     {
         const LowEnd::Storage st = LowEnd::storageFor (kFs, 2, base);
         ok (st.ok, "storageFor accepts the default geometry");
-        ok (st.bandCount == 40, "30..300 Hz at A4=440 is 40 semitone bands (MIDI 23..62), got " + std::to_string (st.bandCount));
+        ok (st.bandCount == 47, "20..300 Hz at A4=440 is 47 semitone bands (MIDI 16..62), got " + std::to_string (st.bandCount)
+                                + " — 40 until K9 took the bottom to E0");
         ok (st.blockSamples == 120, "10 ms at 12 kHz is lround(0.01*fs) = 120 samples, got " + std::to_string (st.blockSamples));
         ok (st.frames.ok && st.frames.bytes() > 0, "the nested SpectrumFrames ask is part of the budget");
         ok (st.bytes() > st.frames.bytes(), "the total exceeds the nested part");
@@ -486,7 +499,7 @@ int main()
                 std::size_t want = 0;
                 for (int b = 0; b < st3.bandCount; ++b)
                 {
-                    const double c = noteHzOf (23 + b, q.tuningHz);
+                    const double c = noteHzOf (firstMidiOf (q.lowNoteHz, q.tuningHz) + b, q.tuningHz);
                     const int ka = std::max (0, (int) std::floor (c * std::exp2 (-1.0 / 24.0) / bh + 0.5));
                     const int kb = std::min (bins - 1, (int) std::floor (c * std::exp2 (1.0 / 24.0) / bh + 0.5));
                     if (kb >= ka) want += (std::size_t) (kb - ka + 1);
@@ -751,17 +764,34 @@ int main()
         LowEnd le; le.setParams (p);
         ok (test::run (le.prepare (kFs, 1 << 13, 2)) && test::run (feed (le, x, 2)), "prepare+feed");
         ok (le.noteValid(), "the note report is valid");
-        const analysis::LowEndBand b0 = le.band (0);
-        ok (b0.midi == 23, "band 0 is MIDI 23");
-        approx (b0.centreHz, c0, 1e-9, "band 0's centre is the note");
+        // THE NOTE IS ADDRESSED BY ITS NAME, NOT BY ITS PLACE. B0 was band 0 while the range started at
+        // 30 Hz; since K9 it is band 7. A test that spells the index is a test that will move with a default.
+        int bIdx = -1;
+        for (int k = 0; k < le.bandCount(); ++k) if (le.band (k).midi == 23) bIdx = k;
+        ok (bIdx >= 0, "B0 is in the table, at index " + std::to_string (bIdx));
+        const analysis::LowEndBand b0 = le.band (bIdx);
+        approx (b0.centreHz, c0, 1e-9, "its centre is the note");
         approx (b0.binsPerBand, 4.869, 0.01, "a semitone at 30.87 Hz is 4.87 bins at this geometry");
         // THE calibration number: a unit-amplitude sine's mean square is 0.5, and 99.96 % of it is in band
         approx (b0.midEnergy, 0.5, 0.002,
                 "a full-scale sine inside one band reads A^2/2 = 0.5 (got " + std::to_string (b0.midEnergy) + ")");
         ok (b0.sideEnergy < 1e-30, "and nothing at all in the Side axis");
-        ok (le.peakBand() == 0, "it is the peak band");
+        ok (le.peakBand() == bIdx, "it is the peak band");
         approx (b0.centsOffset, 0.0, 0.5, "a tone at the centre reads 0 cents");
-        ok (le.underResolvedBands() == 0, "no band is narrower than a Hann main lobe at this order");
+        // FOUR SINCE K9, WHERE IT WAS NONE — E0..G0, whose semitones are 3.25 to 3.86 bins against a Hann
+        // main lobe of 4. Refused to fix by raising fftOrder: that doubles the window and halves the frame
+        // count a duty rests on. So the limit is PUBLISHED instead, and this pins the publication rather
+        // than the absence: the under-resolved set is a prefix, and both readings name its end.
+        ok (le.underResolvedBands() == 4, "the four bottom bands are narrower than a Hann main lobe (got "
+                                          + std::to_string (le.underResolvedBands()) + ")");
+        ok (le.firstResolvedBand() == 4, "and the first resolved band is index 4");
+        approx (le.resolvedAboveHz(), 25.356, 0.001, "the closed form says 25.356 Hz at this geometry");
+        for (int k = 0; k < le.bandCount(); ++k)
+            ok ((le.band (k).binsPerBand < (double) analysis::LowEnd::lobeBins()) == (k < le.firstResolvedBand()),
+                "band " + std::to_string (k) + " is on the side of the boundary its index says");
+        ok (le.band (le.firstResolvedBand()).centreHz >= le.resolvedAboveHz()
+            && le.band (le.firstResolvedBand() - 1).centreHz < le.resolvedAboveHz(),
+            "and the closed form brackets the first resolved band's centre");
         ok (centroidsOutsideTheirBand (le) == 0, "every band's centroid lies inside its own semitone");
 
         // the same tone one order LOWER does not resolve the bottom, and the report says so
@@ -888,13 +918,36 @@ int main()
             y.r = y.l;
             LowEnd d; d.setParams (p);
             ok (test::run (d.prepare (kFs, 1 << 13, 2)) && test::run (feed (d, y, 2)), "prepare+feed white noise");
-            const double top = d.band (d.bandCount() - 1).energy, bottom = d.band (0).energy;
+            // MEASURED AGAINST A RESOLVED BAND, NOT AGAINST THE BOTTOM ONE. The tilt is a property of the
+            // semitone grid — width grows with centre, so energy does — and B0 to D4 is almost exactly a
+            // decade (293.665/30.868 = 9.514, i.e. 9.785 dB). Reading it from band 0 instead would mix the
+            // grid's tilt with the bottom band's own estimator behaviour, which since K9 is a different
+            // thing: see the check below.
+            int ref = -1;
+            for (int k = 0; k < d.bandCount(); ++k) if (d.band (k).midi == 23) ref = k;
+            ok (ref >= 0, "B0 is the reference band, at index " + std::to_string (ref));
+            const double top = d.band (d.bandCount() - 1).energy, bottom = d.band (ref).energy;
             const double ratioDb = 10.0 * std::log10 (top / bottom);
-            approx (ratioDb, 10.0, 2.0,
-                    "under white noise the band ENERGIES tilt ~10 dB across a decade of the range (got "
+            approx (ratioDb, 9.785, 2.0,
+                    "under white noise the band ENERGIES tilt ~9.8 dB from B0 to the top of the range (got "
                     + std::to_string (ratioDb) + " dB) — the grid's own tilt, not a note");
-            const double dTop = d.band (d.bandCount() - 1).density, dBottom = d.band (0).density;
+            const double dTop = d.band (d.bandCount() - 1).density, dBottom = d.band (ref).density;
             approx (10.0 * std::log10 (dTop / dBottom), 0.0, 2.0, "while the DENSITIES are flat, which is why the background uses them");
+            // AND WHAT THE BOTTOM BAND DOES ON NOISE, which is the price of the 20 Hz extension as a number.
+            // Measured over 24 noise realisations at 48 kHz / order 17: the narrowest band's density reads
+            // -0.985 dB against the top band's, with a standard deviation of 1.343 dB, while bands 1..9 sit
+            // within 0.43 dB. So one realisation is worth about +-3 dB, and the tolerance here says so.
+            //
+            // IT IS NOT A BIAS OF THE GRID. On a DETERMINISTIC flat spectrum the same ratio is 1.0 to 1e-6
+            // — the impulse group below pins exactly that — so the geometry is exact and the fractional
+            // edge rule is doing its job. What shifts is the LOG OF A NOISY ESTIMATE: 3.25 bins over three
+            // frames is a handful of degrees of freedom, and the mean of 10*log10 of such an estimate sits
+            // below the log of its mean. It shrinks as frames accumulate. A caller reading
+            // `lowestOccupiedBand` on a short programme should know the bottom band arrives at a 20 dB
+            // threshold about a decibel light, and that a longer programme takes that back.
+            approx (10.0 * std::log10 (d.band (0).density / d.band (ref).density), -1.0, 3.0,
+                    "the narrowest band under-reads its density by about 1 dB, and by not much more (got "
+                    + std::to_string (10.0 * std::log10 (d.band (0).density / d.band (ref).density)) + " dB)");
             // and the background IS the median of those densities — computed here independently, over
             // the non-peak bands, with the same even-count convention
             std::vector<double> dens;
@@ -1302,16 +1355,25 @@ int main()
         // the bands are contiguous (band n's upper edge f(n)*2^(1/24) IS band n+1's lower edge), so the
         // covered width is exactly top edge minus bottom edge, and on a flat spectrum the range's share
         // must equal that width over Nyquist
-        const double bottom = noteHzOf (23, 440.0) * std::exp2 (-1.0 / 24.0);
+        const double bottom = noteHzOf (firstMidiOf (p.lowNoteHz, p.tuningHz), 440.0) * std::exp2 (-1.0 / 24.0);
         const double top    = noteHzOf (62, 440.0) * std::exp2 ( 1.0 / 24.0);
         const double covered = (top - bottom) / (0.5 * fs);
-        approx (covered, 0.011345034991353543, 1e-15, "the default range covers 1.1345 % of Nyquist");
+        // 1.1761 % since K9 took the bottom to E0; it was 1.1345 % over 30..300. The number is re-derived
+        // from the range rather than adjusted: the bottom edge is the FIRST band's lower edge, whichever
+        // note that is.
+        approx (covered, 0.011760607132362483, 1e-15, "the default range covers 1.1761 % of Nyquist");
         approx (le.bandRangeShare() / covered, 1.0, 1e-9,
                 "on a FLAT spectrum bandRangeShare() IS that covered fraction (got "
                 + std::to_string (le.bandRangeShare()) + ") — which is also why the published table is NOT"
                 " the whole frame, and why the Parseval sentence has to say so");
-        approx (le.totalBandEnergy() / 2.30815327786327e-7, 1.0, 1e-9,
-                "so totalBandEnergy() is 2.308e-7, not the frame's 2.035e-5");
+        // SPELLED AS A PRODUCT, NOT AS A LITERAL. It used to read 2.308e-7, the value for the 30 Hz range,
+        // and a literal here is a number that must be re-derived every time the range moves. Both factors
+        // come from outside the object: Parseval's 8/(3N) for a unit impulse, and the covered fraction
+        // computed above from the note grid. (Not the same statement as bandRangeShare() == covered one
+        // line up: that one is a RATIO the object reports, this one is the absolute magnitude.)
+        approx (le.totalBandEnergy() / (8.0 / (3.0 * (double) N) * covered), 1.0, 1e-9,
+                "so totalBandEnergy() is frameEnergy times the covered fraction, "
+                + std::to_string (le.totalBandEnergy()) + " against the frame's " + std::to_string (le.frameEnergy()));
         // THE GRID'S TILT, exactly: the widest band wins a flat spectrum, and its share is its own width
         // over the covered width. No note is present.
         ok (le.peakMidi() == 62, "a flat spectrum's loudest BAND is the widest one, MIDI 62, got "
@@ -1681,7 +1743,7 @@ int main()
         // Nyquist-inclusive power rows — 176 160 784 at N = 2^22.)
         const LowEnd::Storage st = LowEnd::storageFor (LowEnd::kMinSampleRate, 2, p);
         ok (st.ok, "fftOrder 22 at 8 kHz is accepted");
-        ok (st.bandCount == 40, "still 40 bands");
+        ok (st.bandCount == 47, "still 47 bands — the band set is the note range, not the transform size");
         ok (st.blockSamples == 80, "10 ms at 8 kHz is 80 samples");
         ok (st.frames.bytes() == 176160784u, "the nested frame store is 176160784 bytes, got "
             + std::to_string (st.frames.bytes()));
@@ -1694,7 +1756,7 @@ int main()
         std::size_t expect = 0;
         for (int b = 0; b < st.bandCount; ++b)
         {
-            const double c = noteHzOf (23 + b, p.tuningHz);
+            const double c = noteHzOf (firstMidiOf (p.lowNoteHz, p.tuningHz) + b, p.tuningHz);
             const int ka = std::max (0, (int) std::floor (c * std::exp2 (-1.0 / 24.0) / bh + 0.5));
             const int kb = std::min (bins - 1, (int) std::floor (c * std::exp2 (1.0 / 24.0) / bh + 0.5));
             if (kb >= ka) expect += (std::size_t) (kb - ka + 1);
@@ -1756,6 +1818,398 @@ int main()
         ok (le.usedFrames() > 0, "…and really transformed frames while being measured");
         test::okNoAlloc (after == before, "process() and finish() allocated nothing ("
                          + std::to_string (after - before) + " allocations)");
+    }
+
+    //==========================================================================
+    // K9 — OCCUPANCY. How OFTEN a band is present, which the integral cannot say: a sub playing an eighth
+    // of the programme is 9.03 dB down in the integral against one that plays throughout.
+    test::group ("K9 duty: a silent programme occupies NOTHING, which is the trap this gate exists for");
+    {
+        // THE CONTROL COMES FIRST, BUILT FROM THE FAILURE. "Within dutyThresholdDb of the frame's loudest
+        // band" is `E >= max·q`; on a frame of digital silence that is `0 >= 0`, true of every band. Both
+        // design seats found it independently, and it is not a small error — it is the exact opposite of
+        // the answer, reported with confidence. So: silence, and then silence with a tone in it.
+        const std::size_t n = 1u << 18;
+        LowEndParams p = base; p.fftOrder = 15;
+        {
+            Stereo z; z.l.assign (n, 0.0f); z.r.assign (n, 0.0f);
+            LowEnd le; le.setParams (p);
+            ok (test::run (le.prepare (kFs, 1 << 13, 2)) && test::run (feed (le, z, 2)), "prepare+feed silence");
+            ok (le.usedFrames() > 0, "PRECONDITION: frames closed — the fixture is long enough to be measured");
+            ok (le.dutyFrames() == 0, "no frame entered the duty denominator (got "
+                                      + std::to_string (le.dutyFrames()) + ")");
+            std::int64_t marked = 0;
+            for (int b = 0; b < le.bandCount(); ++b) marked += le.dutyCount (b);
+            ok (marked == 0, "and not one of the " + std::to_string (le.bandCount())
+                             + " bands was marked present (got " + std::to_string (marked) + ")");
+            ok (le.lowestOccupiedBand (0.10).band == -1, "so there is no lowest occupied band");
+            ok (le.duty (0) == 0.0 && le.levelWhenOnDb (0) == 0.0, "duty and level read their canonical zero");
+        }
+
+        // A STEADY TONE: present in every counted frame, and it IS the loudest band, so its level when on
+        // is 0 dB and its margin is the whole threshold. The oracle is arithmetic, not a second run.
+        {
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            const double c = noteHzOf (30, 440.0);                 // F#1, comfortably resolved
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const float v = (float) (0.5 * std::sin (2.0 * kPi * c * (double) i / kFs));
+                x.l[i] = v; x.r[i] = v;
+            }
+            LowEnd le; le.setParams (p);
+            ok (test::run (le.prepare (kFs, 1 << 13, 2)) && test::run (feed (le, x, 2)), "prepare+feed a steady tone");
+            int bIdx = -1;
+            for (int k = 0; k < le.bandCount(); ++k) if (le.band (k).midi == 30) bIdx = k;
+            ok (bIdx >= 0 && le.peakBand() == bIdx, "the tone's band is the peak band");
+            ok (le.dutyFrames() == le.usedFrames(), "every used frame counted ("
+                + std::to_string (le.dutyFrames()) + " of " + std::to_string (le.usedFrames()) + ")");
+            approx (le.duty (bIdx), 1.0, 1e-12, "the tone's band is present in every one of them");
+            approx (le.levelWhenOnDb (bIdx), 0.0, 1e-9, "it IS the loudest band when it plays, so 0 dB");
+            approx (le.marginWhenOnDb (bIdx), le.dutyThresholdDb(), 1e-9, "and its margin is the whole threshold");
+            const auto lo = le.lowestOccupiedBand (0.10);
+            ok (lo.band == bIdx && lo.midi == 30, "and it is the lowest occupied band");
+            approx (lo.centreHz, c, 1e-9, "reported at its own centre");
+
+            // THE GUARD ON dutyMin, which is what stops an empty band reading as a finding: at or below
+            // zero every band satisfies `duty >= dutyMin`, and band 0 is present in no frame at all.
+            ok (le.dutyCount (0) == 0, "PRECONDITION: band 0 is present in no frame");
+            ok (le.lowestOccupiedBand (0.0).band == bIdx, "dutyMin = 0 still does not return an absent band");
+            ok (le.lowestOccupiedBand (-1.0).band == bIdx, "nor does a negative one");
+            ok (le.lowestOccupiedBand (std::numeric_limits<double>::quiet_NaN()).band == -1,
+                "a NaN dutyMin fails every comparison and returns none");
+            ok (le.lowestOccupiedBand (1.0).band == bIdx, "dutyMin = 1 still finds a band present in every frame");
+            ok (le.lowestOccupiedBand (std::nextafter (1.0, 2.0)).band == -1, "and one hair above 1 finds none");
+
+            // LAW 8a: the duty clock is the frame schedule, not the caller's slicing.
+            LowEnd sliced; sliced.setParams (p);
+            if (test::run (sliced.prepare (kFs, 1 << 13, 2)))
+            {
+                const float* pl[2] { x.l.data(), x.r.data() };
+                std::size_t at = 0; int k = 0;
+                const int cuts[] = { 1, 4093, 17, 8192, 333 };
+                bool okAll = true;
+                while (at < n)
+                {
+                    const int len = (int) std::min<std::size_t> ((std::size_t) cuts[k++ % 5], n - at);
+                    const float* q[2] { pl[0] + at, pl[1] + at };
+                    if (! sliced.process (q, 2, len)) { okAll = false; break; }
+                    at += (std::size_t) len;
+                }
+                ok (okAll && test::run (sliced.finish()), "the same programme in irregular calls");
+                ok (sliced.dutyFrames() == le.dutyFrames(), "the same duty denominator");
+                bool same = true;
+                for (int b2 = 0; b2 < le.bandCount(); ++b2) if (sliced.dutyCount (b2) != le.dutyCount (b2)) same = false;
+                ok (same, "and the same count in every band — duty is on the frame clock, not the call's");
+            }
+        }
+
+        // TWO TONES, ONE INTERMITTENT: this is the case the integral misses and duty is for. The lower
+        // note plays in the first quarter only; the upper plays throughout and is louder.
+        {
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            const double cLow = noteHzOf (28, 440.0), cHigh = noteHzOf (50, 440.0);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                double v = 0.5 * std::sin (2.0 * kPi * cHigh * (double) i / kFs);
+                if (i < n / 4) v += 0.25 * std::sin (2.0 * kPi * cLow * (double) i / kFs);
+                x.l[i] = (float) v; x.r[i] = (float) v;
+            }
+            LowEnd le; le.setParams (p);
+            ok (test::run (le.prepare (kFs, 1 << 13, 2)) && test::run (feed (le, x, 2)), "prepare+feed an intermittent low note");
+            int bLow = -1, bHigh = -1;
+            for (int k = 0; k < le.bandCount(); ++k)
+            {
+                if (le.band (k).midi == 28) bLow = k;
+                if (le.band (k).midi == 50) bHigh = k;
+            }
+            ok (bLow >= 0 && bHigh >= 0, "both notes are in the table");
+            approx (le.duty (bHigh), 1.0, 1e-12, "the sustained note is present in every counted frame");
+            ok (le.duty (bLow) > 0.0 && le.duty (bLow) < 1.0,
+                "the intermittent one is present in SOME of them (" + std::to_string (le.dutyCount (bLow))
+                + " of " + std::to_string (le.dutyFrames()) + ")");
+            // AND THE INTEGRAL UNDER-READS IT, which is the whole argument: 9.03 dB per eighth of the time.
+            const double integralDb = 10.0 * std::log10 (le.band (bLow).energy / le.band (bHigh).energy);
+            ok (integralDb < le.levelWhenOnDb (bLow),
+                "the integral puts it " + std::to_string (integralDb) + " dB under the peak while it sits at "
+                + std::to_string (le.levelWhenOnDb (bLow)) + " dB when it actually plays");
+            ok (le.lowestOccupiedBand (le.duty (bLow) * 0.5).band == bLow,
+                "a dutyMin under its duty finds it; the integral alone would not have");
+            ok (le.lowestOccupiedBand (std::min (1.0, le.duty (bLow) * 2.0 + 0.01)).band == bHigh,
+                "and one above its duty steps up to the sustained note");
+        }
+    }
+
+    //==========================================================================
+    // K9 — THE CROSSOVER SWEEP. The spectral axes are fed the RAW Mid and Side, before the crossover, so
+    // any LR4 low-pass can be applied to the band table afterwards as a weight. The oracle is the REAL
+    // FILTER: install fc, read lowSideFraction(), and compare.
+    test::group ("K9 sweep: the same number as the installed filter — until the content leaves the table");
+    {
+        const std::size_t n = 1u << 19;
+        const double fs = 48000.0;
+        auto make = [&] (bool outside)
+        {
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const double m = 0.5 * std::sin (2.0 * kPi * 41.2 * t);
+                double s = 0.20 * std::sin (2.0 * kPi * 98.0 * t) + 0.30 * std::sin (2.0 * kPi * 220.0 * t);
+                // 15 Hz is under lowNoteHz and 700 Hz is over highNoteHz: the table cannot see either,
+                // while an LR4 at 60 Hz passes the 15 Hz almost untouched.
+                if (outside) s += 0.60 * std::sin (2.0 * kPi * 700.0 * t) + 0.40 * std::sin (2.0 * kPi * 15.0 * t);
+                x.l[i] = (float) (m + s); x.r[i] = (float) (m - s);
+            }
+            return x;
+        };
+
+        const double fcs[] = { 60.0, 80.0, 100.0, 120.0, 150.0, 200.0, 300.0 };
+        {
+            const Stereo x = make (false);
+            double worst = 0.0;
+            for (const double fc : fcs)
+            {
+                LowEndParams q = base; q.fftOrder = 17; q.crossoverHz = fc;
+                LowEnd le; le.setParams (q);
+                if (! test::run (le.prepare (fs, 1 << 13, 2)) || ! test::run (feed (le, x, 2))) continue;
+                worst = std::max (worst, std::fabs (le.sideFractionBelow (fc) - le.lowSideFraction()));
+            }
+            // 4.7e-5 measured; the tolerance is one decade up so a real regression still shows.
+            ok (worst < 5.0e-4, "on material inside the table the sweep IS the filter's number (worst gap "
+                                + std::to_string (worst) + " over seven crossovers)");
+        }
+
+        // THE LIMITATION, ASSERTED AS A FAILURE RATHER THAN HEDGED IN A COMMENT. With anti-phase energy
+        // outside [lowNoteHz, highNoteHz] the two part company completely, and a caller must not read the
+        // sweep as the answer. Under 20 Hz is the case that matters: an LR4 at 60 Hz passes it.
+        {
+            const Stereo x = make (true);
+            LowEndParams q = base; q.fftOrder = 17; q.crossoverHz = 60.0;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
+            {
+                const double sweep = le.sideFractionBelow (60.0), real = le.lowSideFraction();
+                ok (real > 0.4 && sweep < 0.01,
+                    "the filter sees " + std::to_string (real) + " where the sweep sees " + std::to_string (sweep)
+                    + " — out-of-table content is invisible to the table, and this is the documented limit");
+                ok (real - sweep > 0.4, "the gap is " + std::to_string (real - sweep)
+                                        + ", against a question asked at 0.25: the opposite answer, not a tolerance");
+            }
+        }
+
+        // AND THE SWEEP DOES NOT DEPEND ON WHICH CROSSOVER WAS INSTALLED — it reads the raw table, so two
+        // builds that filtered differently must agree BIT FOR BIT at the same query frequency.
+        {
+            const Stereo x = make (false);
+            LowEndParams lo = base, hi = base;
+            lo.fftOrder = hi.fftOrder = 17; lo.crossoverHz = 80.0; hi.crossoverHz = 250.0;
+            LowEnd a2, b2; a2.setParams (lo); b2.setParams (hi);
+            if (test::run (a2.prepare (fs, 1 << 13, 2)) && test::run (feed (a2, x, 2))
+                && test::run (b2.prepare (fs, 1 << 13, 2)) && test::run (feed (b2, x, 2)))
+                ok (core::exactlyEqual (a2.sideFractionBelow (120.0), b2.sideFractionBelow (120.0)),
+                    "an 80 Hz build and a 250 Hz build answer the same bits at 120 Hz ("
+                    + std::to_string (a2.sideFractionBelow (120.0)) + ")");
+        }
+
+        // The refusals: a frequency the crossover itself would not take, and the 0/0.
+        {
+            const Stereo x = make (false);
+            LowEndParams q = base; q.fftOrder = 17;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
+            {
+                ok (le.sideFractionBelow (0.0) == 0.0, "fc = 0 is refused to the canonical zero");
+                ok (le.sideFractionBelow (-120.0) == 0.0, "and a negative one");
+                ok (le.sideFractionBelow (std::numeric_limits<double>::quiet_NaN()) == 0.0, "and NaN");
+                ok (le.sideFractionBelow (std::numeric_limits<double>::infinity()) == 0.0, "and +inf");
+                ok (le.sideFractionBelow (0.5 * fs) == 0.0, "and Nyquist, which the crossover would refuse too");
+                ok (le.sideFractionBelow (120.0) > 0.0, "while a frequency it accepts answers a number");
+            }
+        }
+    }
+
+    //==========================================================================
+    // K9 — THE WARM-UP, DERIVED RATHER THAN WRITTEN DOWN. The consumer asked for "the first 10 blocks",
+    // reading it out of this header's "the first 10 ms block holds 96.65 %" and "the first 100 ms". The
+    // header names no such count, and ten is wrong at every candidate crossover.
+    test::group ("K9 settlingBlocks: the filter says how long it charges, and skipBlocks moves ONLY the histogram");
+    {
+        using LE = analysis::LowEnd;
+        // THE MODEL, RE-DERIVED OUTSIDE THE OBJECT. LR4 has a DOUBLE pole pair at real part -wc/sqrt(2),
+        // so the envelope is t·exp(-t/tau), tau = sqrt(2)/(2·pi·fc); normalised to its peak at t = tau that
+        // is u·exp(1-u), and u is where it reaches 10^(-dB/20). Bisected here on the same equation but with
+        // std::exp rather than the deterministic pair, so this is an independent arrival at the number.
+        auto uFor = [] (double dB)
+        {
+            const double target = std::pow (10.0, -dB / 20.0);
+            double lo = 1.0, hi = 400.0;
+            for (int i = 0; i < 200; ++i)
+            {
+                const double u = 0.5 * (lo + hi);
+                if (u * std::exp (1.0 - u) > target) lo = u; else hi = u;
+            }
+            return 0.5 * (lo + hi);
+        };
+        approx (uFor (60.0), 10.2334, 1e-3, "u = 10.233 at -60 dB (the figure a design round put at 9.12)");
+        approx (uFor (120.0), 17.6884, 1e-3, "and 17.688 at -120 dB");
+        for (const double fc : { 20.0, 100.0, 120.0, 150.0 })
+            for (const double dB : { 60.0, 120.0 })
+            {
+                const double tau = std::sqrt (2.0) / (2.0 * kPi * fc);
+                const int want = (int) std::ceil (uFor (dB) * tau / 0.01);        // 48 kHz: a block is 10 ms
+                ok (LE::settlingBlocks (48000.0, fc, dB) == want,
+                    "settlingBlocks(48 kHz, " + std::to_string ((int) fc) + " Hz, -" + std::to_string ((int) dB)
+                    + " dB) = " + std::to_string (want) + ", got " + std::to_string (LE::settlingBlocks (48000.0, fc, dB)));
+            }
+        ok (LE::settlingBlocks (48000.0, 120.0, 60.0) == 2 && LE::settlingBlocks (48000.0, 20.0, 60.0) == 12,
+            "so 2 blocks at 120 Hz and 12 at 20 Hz — the 'ten' it replaces is five times too many at one end"
+            " and too few at the other");
+        // the refusals: the same arguments the crossover itself refuses, plus a dB that asks for nothing
+        ok (LE::settlingBlocks (0.0, 120.0, 60.0) == 0, "a rate the class refuses gives 0");
+        ok (LE::settlingBlocks (48000.0, 0.0, 60.0) == 0, "and a crossover it refuses");
+        ok (LE::settlingBlocks (48000.0, 0.49 * 48000.0 + 1.0, 60.0) == 0, "and one past its ceiling");
+        ok (LE::settlingBlocks (48000.0, 120.0, 0.0) == 0, "-0 dB asks to skip nothing");
+        ok (LE::settlingBlocks (48000.0, 120.0, -3.0) == 0, "and a negative dB is not a longer wait");
+        ok (LE::settlingBlocks (48000.0, 120.0, std::numeric_limits<double>::quiet_NaN()) == 0, "NaN gives 0");
+        ok (LE::settlingBlocks (std::numeric_limits<double>::quiet_NaN(), 120.0, 60.0) == 0, "and a NaN rate");
+
+        // AND IT IS NOT OPTIMISTIC AGAINST THE REAL FILTER. The header's own fixture: mono 82 Hz bass with
+        // anti-phase 900 Hz, whose settled low side fraction is ~5.3e-8 while block 0 holds most of the
+        // file's low Side energy. After `settlingBlocks` blocks the series must be at the settled value,
+        // not on its way there.
+        {
+            const double fs = 48000.0, fc = 120.0;
+            const std::size_t n = (std::size_t) (fs * 4.0);
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const double m = std::sin (2.0 * kPi * 82.0 * t), s = std::sin (2.0 * kPi * 900.0 * t);
+                x.l[i] = (float) (0.5 * (m + s)); x.r[i] = (float) (0.5 * (m - s));
+            }
+            LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 1 << 13, 2)) && test::run (feed (le, x, 2)))
+            {
+                const int k = LE::settlingBlocks (fs, fc, 60.0);
+                ok (k >= 1 && (std::int64_t) k < le.blockCount(), "the settling is " + std::to_string (k)
+                    + " blocks of the " + std::to_string (le.blockCount()) + " this programme has");
+                const double atK = le.block ((std::int64_t) k).sideFraction();
+                const double late = le.block (le.blockCount() - 2).sideFraction();
+                ok (le.block (0).sideFraction() > 100.0 * late,
+                    "PRECONDITION: block 0 really is the charge-up (" + std::to_string (le.block (0).sideFraction())
+                    + " against a settled " + std::to_string (late) + ")");
+                ok (atK <= 10.0 * late, "and by block " + std::to_string (k) + " it is within a decade of settled ("
+                                        + std::to_string (atK) + ") — the bound is not optimistic");
+            }
+        }
+
+        // skipBlocks MOVES THE HISTOGRAM AND NOTHING ELSE. Everything a coordinate points at must survive:
+        // the series, the integral, the extrema. A skip that quietly shortened those would make
+        // worstFractionBlock() an index into a programme that no longer exists.
+        {
+            const double fs = 48000.0;
+            const std::size_t n = (std::size_t) (fs * 2.0);
+            Stereo x = twoTone (n, fs, 82.0, 900.0);
+            LowEndParams q0 = base, q5 = base;
+            q0.fftOrder = q5.fftOrder = 15; q0.crossoverHz = q5.crossoverHz = 120.0;
+            q5.skipBlocks = 5;
+            LowEnd a2, b2; a2.setParams (q0); b2.setParams (q5);
+            if (test::run (a2.prepare (fs, 1 << 13, 2)) && test::run (feed (a2, x, 2))
+                && test::run (b2.prepare (fs, 1 << 13, 2)) && test::run (feed (b2, x, 2)))
+            {
+                ok (a2.skippedBlocks() == 0 && b2.skippedBlocks() == 5,
+                    "the skip is published: " + std::to_string (b2.skippedBlocks()) + " blocks not counted");
+                std::int64_t dropped = 0;
+                for (std::int64_t i = 0; i < 5; ++i) dropped += a2.block (i).finiteSamples;
+                ok (b2.histogramSamples() == a2.histogramSamples() - dropped,
+                    "and the histogram is exactly those samples lighter (" + std::to_string (dropped) + ")");
+                ok (b2.blockCount() == a2.blockCount(), "the SERIES keeps every block");
+                for (std::int64_t i = 0; i < a2.blockCount(); ++i)
+                    if (! core::exactlyEqual (b2.block (i).sideEnergy, a2.block (i).sideEnergy)) { ok (false, "a block moved"); break; }
+                ok (core::exactlyEqual (b2.lowSideFraction(), a2.lowSideFraction()),
+                    "the INTEGRAL is bit-identical — the skip is not a measurement, it is a population");
+                ok (b2.worstFractionBlock() == a2.worstFractionBlock(),
+                    "and worstFractionBlock() still points at the same block of the same programme");
+            }
+        }
+    }
+
+    //==========================================================================
+    // K9 — infraLowShare(). The consumer replaces a safeguard with this number, so what it MEANS is the
+    // test: not "the energy below the crossover" but that share weighted by the LR4's power response.
+    test::group ("K9 infraLowShare: the LR4-weighted share, and NOT the energy below the crossover");
+    {
+        const double fs = 48000.0, fc = 30.0;
+        const std::size_t n = (std::size_t) (fs * 20.0);
+        // THE TRUTH IS ARITHMETIC, NOT MEASURED. A sine of amplitude a carries a^2/2 of mean square, so
+        // two sines put an EXACT 3.000 % of the total in the infra component — an oracle computed outside
+        // the object, from the fixture's own construction.
+        const double aHi = 0.5, want = 0.03;
+        const double aInfra = aHi * std::sqrt (want / (1.0 - want));
+        const double truth = (aInfra * aInfra) / (aInfra * aInfra + aHi * aHi);
+        approx (truth, want, 1e-15, "PRECONDITION: the fixture's infra share is exactly 3 % by construction");
+
+        struct Row { double hz, weight; };
+        // f/fc = 0.17, 0.40, 0.67, 1.00, 1.33, 2.00 — the analytic |H|^2 = 1/(1+r^4)^2 at each.
+        const Row rows[] = { { 5.0, 0.99846 }, { 12.0, 0.95070 }, { 20.0, 0.69731 },
+                             { 30.0, 0.25000 }, { 40.0, 0.05777 }, { 60.0, 0.00346 } };
+        for (const Row& r : rows)
+        {
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const float v = (float) (aInfra * std::sin (2.0 * kPi * r.hz * t)
+                                       + aHi    * std::sin (2.0 * kPi * 200.0 * t));
+                x.l[i] = v; x.r[i] = v;                       // mono: the whole programme is Mid
+            }
+            LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+            LowEnd le; le.setParams (q);
+            if (! test::run (le.prepare (fs, 4096, 2)) || ! test::run (feed (le, x, 2))) continue;
+            // The analytic weight is computed HERE, from the prewarped ratio the filter itself uses, and
+            // compared against the row's spelled constant so neither can drift alone.
+            const double rr = std::tan (kPi * r.hz / fs) / std::tan (kPi * fc / fs);
+            const double h  = 1.0 / ((1.0 + rr * rr * rr * rr) * (1.0 + rr * rr * rr * rr));
+            approx (h, r.weight, 5e-5, std::to_string ((int) r.hz) + " Hz: the analytic weight is "
+                                       + std::to_string (r.weight));
+            approx (le.infraLowShare() / truth, h, 2e-3,
+                    std::to_string ((int) r.hz) + " Hz: a true 3 % reads as "
+                    + std::to_string (le.infraLowShare()) + " — the share times the filter's own response");
+        }
+        // AND THE HEADLINE, SPELLED, because it is the sentence that stops a threshold being carried over
+        // from a different definition: at the crossover the weight is a QUARTER, so the same physical 3 %
+        // reads four times smaller there than it does an octave and a half down.
+        {
+            auto shareAt = [&] (double hz)
+            {
+                Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const double t = (double) i / fs;
+                    const float v = (float) (aInfra * std::sin (2.0 * kPi * hz * t)
+                                           + aHi    * std::sin (2.0 * kPi * 200.0 * t));
+                    x.l[i] = v; x.r[i] = v;
+                }
+                LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+                LowEnd le; le.setParams (q);
+                if (! le.prepare (fs, 4096, 2) || ! feed (le, x, 2)) return -1.0;
+                return le.infraLowShare();
+            };
+            const double at12 = shareAt (12.0), at30 = shareAt (30.0);
+            ok (at12 > 3.5 * at30, "the SAME 3 % reads " + std::to_string (at12) + " at 12 Hz and "
+                                   + std::to_string (at30) + " at 30 — a factor of "
+                                   + std::to_string (at12 / at30) + ", which is why a nominal threshold "
+                                   "does not transfer between definitions");
+        }
+        // the 0/0, and that nothing leaks in from well above
+        {
+            Stereo z; z.l.assign (n, 0.0f); z.r.assign (n, 0.0f);
+            LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 4096, 2)) && test::run (feed (le, z, 2)))
+                ok (le.infraLowShare() == 0.0, "a silent programme answers the canonical zero, not 0/0");
+        }
     }
 
     return test::report();

@@ -105,6 +105,8 @@ extern "C"
     std::uint32_t fc_probe_lowend_series   (double*, std::uint32_t);
     std::uint32_t fc_probe_lowend_bands    (double*, std::uint32_t);
     std::uint32_t fc_probe_lowend_note_name (char*, std::uint32_t);
+    std::uint32_t fc_probe_lowend_band_stride (void);
+    std::uint32_t fc_probe_lowend_scalars_len (void);
 
     // P81 — the price of a measurement, asked before it is paid. Geometry only: no audio pointer, because
     // the whole use is to ask BEFORE the input buffer exists.
@@ -857,8 +859,13 @@ void queriesAreStateless()
     // each of the five is asked for itself.
     {
         int live = 0;
-        std::vector<double> probe (64, 0.0);
-        for (const Priced& m : priced) if (m.silent (probe.data(), 60u) > 0) ++live;
+        // THE BUFFER IS SIZED FROM THE WIDEST MODE, NOT FROM A NUMBER. It held 64 doubles and asked for
+        // 60, which was comfortable until K9 took lowend's scalars to 67 — and then a getter that refuses
+        // a short capacity, correctly, read here as "this mode has no result", which is a different
+        // statement entirely. A capacity this check is not about must never be the thing it measures.
+        const std::uint32_t widest = 4096u;
+        std::vector<double> probe ((std::size_t) widest + 8, 0.0);
+        for (const Priced& m : priced) if (m.silent (probe.data(), widest) > 0) ++live;
         ok (live == 5, "all five modes have a readable result before the queries — "
                        + std::to_string (live) + " of five — so there is something for a query to disturb");
     }
@@ -968,7 +975,15 @@ int main (int argc, char** argv)
     hammer (fc_probe_lowend_scalars, "lowend_scalars", 0);
     hammer (fc_probe_lowend_hist,    "lowend_hist",    0);
     hammer (fc_probe_lowend_series,  "lowend_series",  6);
-    hammer (fc_probe_lowend_bands,   "lowend_bands",   11);
+    // THE STRIDE IS SPELLED, AND CHECKED AGAINST THE MODULE. Spelling it makes this an oracle — a test
+    // that read the subject's own stride would move with a stride bug instead of catching it. Checking it
+    // makes the spelling survive: it was 11 until K9 widened the band row to 13, and the only symptom was
+    // this truncation check quietly measuring a 46-row buffer at the wrong width and expecting 38.
+    ok (fc_probe_lowend_scalars_len() == 68, "lowend publishes 68 scalars, and the module agrees ("
+        + std::to_string (fc_probe_lowend_scalars_len()) + ")");
+    ok (fc_probe_lowend_band_stride() == 13, "the band row is 13 doubles, and the module agrees ("
+        + std::to_string (fc_probe_lowend_band_stride()) + ")");
+    hammer (fc_probe_lowend_bands,   "lowend_bands",   13);
 
     // ---------- the two char buffers, whose capacity is in BYTES ----------
     {

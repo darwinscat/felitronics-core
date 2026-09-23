@@ -165,12 +165,36 @@ namespace felitronics::analysis
 struct LowEndParams
 {
     double crossoverHz = 120.0;     // the LR4 split. Below it is the lacquer's phase question.
-    double lowNoteHz   = 30.0;      // the semitone range: every note whose CENTRE lies in [low, high]
-    double highNoteHz  = 300.0;     // defaults give MIDI 23..62 (B0..D4), 40 bands
+    // TWENTY SINCE K9, WHERE IT WAS THIRTY. E0 is 20.60 Hz and a lacquer's vertical hazard lives under B0,
+    // so a table that starts at 30 could not see it. The price is four bands at the bottom narrower than a
+    // Hann main lobe at 48 kHz — counted by underResolvedBands() and bounded by resolvedAboveHz(), not
+    // hidden. Raising fftOrder to 18 would resolve them and was REFUSED: it doubles the window to 5.46 s,
+    // which halves the frame count a duty is measured over and smears the intermittency duty exists to find.
+    //
+    // NOTE FOR A CALLER THAT ADDRESSES BANDS BY POSITION: it must not. Band 0 was MIDI 23 and is now MIDI
+    // 16 — every index moved by seven semitones. `LowEndBand::midi` and `centreHz` are the addresses.
+    double lowNoteHz   = 20.0;      // the semitone range: every note whose CENTRE lies in [low, high]
+    double highNoteHz  = 300.0;     // defaults give MIDI 16..62 (E0..D4), 47 bands
     double tuningHz    = 440.0;     // A4. f(n) = tuningHz * 2^((n-69)/12), MIDI numbering (60 = C4)
     int    fftOrder    = 17;        // N = 1 << fftOrder. 17 is the smallest that resolves a semitone at
                                     // 30 Hz at 48 kHz — see "RESOLUTION" above.
     int    hop         = 0;         // 0 means N/2
+    // K9. How far under a FRAME'S loudest band a band may sit and still count as present in that frame.
+    // A parameter and not a constant because it is the consumer's hypothesis: 20 dB is its starting point,
+    // and it will calibrate. Turned into a linear ratio ONCE, at prepare(), so no logarithm stands in a
+    // per-frame decision.
+    double dutyThresholdDb = 20.0;
+    // K9. How many leading 10 ms blocks the HISTOGRAM ignores. Default 0, so nothing already shipped moves.
+    //
+    // ONLY THE HISTOGRAM, deliberately. The series, the integrals and the extrema stay complete: the
+    // instrument's standing rule is that nothing is dropped on its own initiative — `worstFractionBlock()`
+    // is a COORDINATE into a programme, and a coordinate that silently skipped a prefix would be a lie.
+    // What the histogram is, and only it, is a population a caller reads a time fraction from, and a
+    // caller that wants that fraction free of the crossover's own charge-up says so HERE, in a number it
+    // chose. `settlingBlocks()` derives that number from the filter instead of leaving it to be guessed:
+    // "the first 10 blocks" was a guess, and it is three to five times too many at 100–150 Hz and two
+    // times too few at 20 Hz.
+    int    skipBlocks = 0;
     int    maxBlocks   = 1 << 16;   // capacity of the stored 10 ms series: 10.9 min. Everything that is
                                     // not the series itself (integrals, histogram, extrema, counters)
                                     // keeps going past it — law 11, exhaustion is data.
@@ -304,6 +328,8 @@ public:
         std::size_t accDoubles    = 0;      // 3 * bands: the mid / side / moment accumulators
         std::size_t traceDoubles  = 0;      // 2 * bands: one frame's raw band powers, for the observer
         std::size_t sortDoubles   = 0;      // bands: the median's scratch
+        std::size_t dutyCounts    = 0;      // bands: how many frames each band was present in (int64)
+        std::size_t dutyRatios    = 0;      // bands: the sum of its share of the frame max, over those frames
         std::int64_t blockSamples = 0;      // lround(0.01*fs), published because every coordinate uses it
         int bandCount             = 0;
         std::uint64_t bytes() const noexcept
@@ -314,7 +340,8 @@ public:
                  + (std::uint64_t) binWeights * sizeof (BinWeight)
                  + (std::uint64_t) bandBinCounts * sizeof (int)
                  + (std::uint64_t) sizeof (double) * ((std::uint64_t) accDoubles + (std::uint64_t) traceDoubles
-                                                    + (std::uint64_t) sortDoubles);
+                                                    + (std::uint64_t) sortDoubles + (std::uint64_t) dutyRatios)
+                 + (std::uint64_t) dutyCounts * sizeof (std::int64_t);
         }
     };
 
@@ -364,6 +391,8 @@ public:
         s.accDoubles    = 3u * (std::size_t) bands;
         s.traceDoubles  = 2u * (std::size_t) bands;
         s.sortDoubles   = (std::size_t) bands;
+        s.dutyCounts    = (std::size_t) bands;
+        s.dutyRatios    = (std::size_t) bands;
         s.blockSamples = blockSamples;
         s.bandCount    = bands;
         return s;
@@ -413,6 +442,12 @@ public:
         accMid_.assign (st.bands, 0.0);
         accSide_.assign (st.bands, 0.0);
         accMoment_.assign (st.bands, 0.0);
+        dutyCount_.assign (st.dutyCounts, 0);
+        dutyRatio_.assign (st.dutyRatios, 0.0);
+        // The threshold becomes a linear ratio HERE and never again: a decision taken per frame per band
+        // must not carry a logarithm, and det::pow10 is the one this repo agrees on across libms.
+        dutyShare_  = core::det::pow10 (-params_.dutyThresholdDb / 10.0);
+        dutyFrames_ = 0;
 
         if (! buildBands()) return false;      // law 11b: prepared_ is still false here
 
@@ -437,6 +472,10 @@ public:
         finiteSamples_ = holeSamples_ = nonFiniteSamples_ = filterNonFinite_ = absentSamples_ = 0;
         firstHole_ = lastHole_ = -1;
         for (int i = 0; i < kHistogramBins; ++i) hist_[i] = 0;
+        skippedBlocks_ = 0;
+        std::fill (dutyCount_.begin(), dutyCount_.end(), (std::int64_t) 0);
+        std::fill (dutyRatio_.begin(), dutyRatio_.end(), 0.0);
+        dutyFrames_ = 0;
         histSamples_ = 0;
         worstFrac_ = -1.0; worstFracBlock_ = -1; worstFracEnergy_ = 0.0;
         peakEnergy_ = -1.0; peakEnergyBlock_ = -1; peakEnergyFrac_ = 0.0;
@@ -596,6 +635,38 @@ public:
     // S/(M+S) of the low band over the whole programme: the ENERGY-WEIGHTED answer. 0 for mono; 0 for
     // silence too, which is why widthReason() and not this number tells the two apart.
     double lowSideFraction() const noexcept { const double t = sum (0) + sum (1); return t > 0.0 ? sum (1) / t : 0.0; }
+
+    // THE LOW BAND'S SHARE OF THE WHOLE PROGRAMME — (lowMid + lowSide) / (rawMid + rawSide). All four are
+    // published already and the division is trivial; it is named here so that a caller neither recomposes
+    // it from four scalars nor, far more likely, forgets what the numerator actually contains.
+    //
+    // IT IS NOT "THE ENERGY BELOW crossoverHz", AND THE DIFFERENCE IS LARGE ENOUGH TO INVERT A DECISION.
+    // The low band is an LR4, not a brick wall, so this is the true share WEIGHTED BY THAT FILTER'S POWER
+    // RESPONSE — and a fourth-order low-pass is -6 dB in power at its own corner, so content AT the
+    // crossover counts at a QUARTER. Measured against a fixture whose share is exact by construction (a
+    // sine of amplitude a carries a^2/2, so 3.000 % is arithmetic rather than a measurement), at 48 kHz
+    // with fc = 30 Hz, and agreeing with the analytic response to four decimals at every row:
+    //
+    //     f / fc     0.17   0.33   0.40   0.60   0.67   0.83   1.00   1.33   2.00
+    //     counted   0.998  0.976  0.950  0.784  0.697  0.455  0.250  0.058  0.0035
+    //
+    // The ratios are in units of fc and hold at any crossover: the response depends on f/fc alone this far
+    // below Nyquist. So a real 3 % of infra energy reads as 2.85 % if it sits at 12 Hz and as 0.75 % if it
+    // sits at 30 — the same physical fact, four times apart. A threshold carried over from a different
+    // definition of "infra-low" will be wrong; one calibrated on real material against THIS number will
+    // not, because the number is stable to four decimals against its own analytic form.
+    //
+    // WHAT IT IS FOR, now that the band table reaches 20 Hz: the table answers 20..300 Hz per semitone,
+    // with duty and levelWhenOnDb, so the octave from E0 to B0 needs no filter at all. This ratio is the
+    // right instrument for what the table CANNOT see — strictly below lowNoteHz — and the two together say
+    // more than either alone: a share from the filter, and named notes with their occupancy from the bands.
+    //
+    // 0.0 for the 0/0 of a silent or unmeasured programme, like every other fraction here.
+    double infraLowShare() const noexcept
+    {
+        const double lo = sum (0) + sum (1), raw = sum (4) + sum (5);
+        return raw > 0.0 ? lo / raw : 0.0;
+    }
     double highSideFraction() const noexcept { const double t = sum (2) + sum (3); return t > 0.0 ? sum (3) / t : 0.0; }
     double rawSideFraction() const noexcept { const double t = sum (4) + sum (5); return t > 0.0 ? sum (5) / t : 0.0; }
 
@@ -648,6 +719,44 @@ public:
     // not a mono block) and histogramSamples() says how much was covered. It accumulates from block
     // zero and never stops, so it does not change with maxBlocks.
     std::int64_t histogram (int bin) const noexcept { return bin >= 0 && bin < kHistogramBins ? hist_[bin] : 0; }
+    // Blocks the histogram did NOT count, because `skipBlocks` asked. Published rather than implied: a
+    // population whose size a caller cannot see is a population it cannot divide by.
+    std::int64_t skippedBlocks() const noexcept { return skippedBlocks_; }
+
+    // HOW MANY 10 ms BLOCKS AN LR4 AT `crossoverHz` NEEDS TO FALL `dB` BELOW ITS OWN PEAK — the number
+    // `skipBlocks` wants, derived from the filter rather than written down. Pure, static, allocation-free:
+    // a caller computes it before prepare() and passes the answer back in.
+    //
+    // THE MODEL, stated so it can be argued with. LR4 is two cascaded Butterworth sections, so its poles
+    // are a DOUBLE pair at real part -wc/sqrt(2): the transient envelope is t·exp(-t/tau) with
+    // tau = sqrt(2)/(2·pi·fc). Normalised to its own peak (at t = tau) that is u·exp(1-u) with u = t/tau,
+    // and the answer is the u where it reaches 10^(-dB/20). Solved here by bisection, which is
+    // deterministic, needs no libm beyond an exponential and cannot diverge.
+    //
+    // u = 10.233 at -60 dB and 17.688 at -120, so at 48 kHz: 12 blocks at 20 Hz and 2 at 120 Hz for -60 dB.
+    // The "ten blocks" this replaces was five times too many at 120 Hz and too few at 20.
+    //
+    // It is an ENVELOPE bound, not a promise about a particular programme: a filter driven by music is
+    // never at its own impulse peak, so this is the pessimistic end. 0 for arguments the crossover itself
+    // would refuse, and for a non-positive dB — a caller asking to skip nothing gets nothing skipped.
+    static int settlingBlocks (double sampleRate, double crossoverHz, double dB) noexcept
+    {
+        if (! (sampleRate >= kMinSampleRate && sampleRate <= kMaxSampleRate)) return 0;
+        if (! (crossoverHz >= kMinCrossoverHz) || ! (crossoverHz <= 0.49 * sampleRate)) return 0;
+        if (! (dB > 0.0) || ! (dB <= 400.0)) return 0;
+        const double target = core::det::pow10 (-dB / 20.0);
+        double lo = 1.0, hi = 400.0;
+        for (int i = 0; i < 200; ++i)                       // fixed count: the same work on every input
+        {
+            const double u = 0.5 * (lo + hi);
+            const double v = u * core::det::exp2 ((1.0 - u) * 1.4426950408889634);   // exp(1-u)
+            if (v > target) lo = u; else hi = u;
+        }
+        const double tau = 1.4142135623730951 / (2.0 * core::kPi * crossoverHz);
+        const double blockSec = (double) std::max<std::int64_t> (1, (std::int64_t) std::lround (0.01 * sampleRate)) / sampleRate;
+        const double blocks = std::ceil (0.5 * (lo + hi) * tau / blockSec);
+        return (blocks >= 0.0 && blocks < 1.0e9) ? (int) blocks : 0;
+    }
     std::int64_t histogramSamples() const noexcept { return histSamples_; }
 
     // The coordinates. Three different questions, three different blocks — a block can win any one of
@@ -676,6 +785,169 @@ public:
         int k = 0;
         for (int b = 0; b < bandCount_; ++b) if (bands_[(std::size_t) b].binsPerBand < (double) kLobeBins) ++k;
         return k;
+    }
+
+    // WHERE THE UNDER-RESOLVED BANDS STOP. A count without a boundary is not actionable: a caller reading
+    // `underResolvedBands() == 4` cannot tell WHICH four without walking the table. Band width grows
+    // monotonically with centre frequency (widthHz = c·(kSemiUp - kSemiDown)), so the under-resolved set is
+    // always a PREFIX and one index names it.
+    //
+    // THIS IS NOT A K9 PROBLEM, and that is the reason it is published rather than left implicit. At 96 kHz
+    // the bin is 0.7324 Hz, and the OLD 30 Hz table already had NINE under-resolved bands, up to 49.0 Hz —
+    // true of every 96 kHz file this class has ever measured, with nothing saying so.
+    int firstResolvedBand() const noexcept { const int k = underResolvedBands(); return k < bandCount_ ? k : -1; }
+
+    // The centre frequency at and above which a band is at least kLobeBins wide — the closed form of the
+    // same criterion, so it is defined even where the table does not reach:
+    //     resolvedAboveHz = kLobeBins·binHz / (kSemiUp - kSemiDown)
+    // 25.356 Hz at 48 kHz / order 17, 23.298 at 44.1 kHz, 50.712 at 96 kHz, 12.678 at 48 kHz / order 18.
+    // It is a NOMINAL threshold on the band CENTRE under the four-bin criterion, not a promise about a tone
+    // near a band edge: a tone 50 cents off splits roughly 50/50 between two bands at any resolution.
+    // 0.0 before prepare(), like every other geometry reading here.
+    double resolvedAboveHz() const noexcept
+    {
+        return binHz_ > 0.0 ? (double) kLobeBins * binHz_ / (kSemiUp - kSemiDown) : 0.0;
+    }
+    static constexpr int lobeBins() noexcept { return kLobeBins; }   // so a caller never re-types the 4
+
+    //==============================================================================
+    // --- the report: part 2b, OCCUPANCY (K9). How OFTEN a band is there, not how loud it is on average ---
+    //
+    // WHY THE INTEGRAL IS NOT ENOUGH, which is the whole reason this exists. A sub that plays on an eighth
+    // of the programme is 10·log10(1/8) = 9.03 dB down in the integral against one that plays throughout,
+    // and a threshold set for the second misses the first. Duty separates "how loud when present" from
+    // "how often present", and the band table already answers the first.
+    //
+    // DUTY IS A COUNT OF FRAMES, NOT A FRACTION OF TIME, and a caller must calibrate in those units. The
+    // frames overlap — at the default hop each sample is in two — so one event can mark two frames, and
+    // the quantum is 1/dutyFrames(). At 48 kHz and order 17 the hop is 1.365 s, so a three-minute
+    // programme offers 130 frames: an event on "an eighth of the time" does NOT read 0.125.
+    std::int64_t dutyFrames() const noexcept { return dutyFrames_; }          // the denominator, published
+    std::int64_t dutyCount (int b) const noexcept                             // the numerator, published
+    {
+        return b >= 0 && b < bandCount_ ? dutyCount_[(std::size_t) b] : 0;
+    }
+    // In [0, 1]. Canonically 0 when no frame was counted — and then noteReason() says which kind of
+    // nothing it was (ShorterThanWindow, NoUsableFrames, NoEnergy), so a caller is never left to guess.
+    double duty (int b) const noexcept
+    {
+        return dutyFrames_ > 0 ? (double) dutyCount (b) / (double) dutyFrames_ : 0.0;
+    }
+    // HOW LOUD THE BAND IS WHEN IT IS ON, against the loudest band of the same frame, in dB — the mean
+    // over the frames that counted it. In [-dutyThresholdDb, 0] by construction. This is the number duty
+    // does NOT carry: two bands with the same duty can sit at 0 dB ("it IS the bass when it plays") and at
+    // -19 dB ("it just scraped in"), and a consumer choosing a filter needs to tell those apart. 0.0 when
+    // the band was never counted.
+    //
+    // The ratio is accumulated LINEARLY and the logarithm is taken here, once, on read: a dB is a view.
+    double levelWhenOnDb (int b) const noexcept
+    {
+        const std::int64_t k = dutyCount (b);
+        return k > 0 ? 10.0 * core::det::log10 (dutyRatio_[(std::size_t) b] / (double) k) : 0.0;
+    }
+    // …and the same number measured from the threshold rather than from the frame's peak, which is what a
+    // caller asking "how much room did it have" wants. Zero means it sat exactly on the line.
+    double marginWhenOnDb (int b) const noexcept
+    {
+        return dutyCount (b) > 0 ? levelWhenOnDb (b) + params_.dutyThresholdDb : 0.0;
+    }
+    double dutyThresholdDb() const noexcept { return params_.dutyThresholdDb; }   // the installed value
+
+    // The lowest band present in at least `dutyMin` of the counted frames, with everything a caller needs
+    // to act on it. `band == -1` is the canonical none — this file's own convention (an absent index is
+    // -1, never a sentinel frequency) — and it covers both "no band qualified" and "nothing was measured";
+    // dutyFrames() and noteReason() tell those apart without a second enum.
+    struct LowestOccupied
+    {
+        int          band  = -1;
+        int          midi  = 0;
+        double       centreHz = 0.0;
+        std::int64_t count = 0;
+        double       duty  = 0.0;
+        double       levelWhenOnDb = 0.0;
+        double       marginWhenOnDb = 0.0;
+    };
+    // An ACCESSOR, taking the threshold, because the consumer sweeps it while calibrating and a field
+    // frozen at finish() would force a re-run of the audio for every hypothesis. 47 comparisons.
+    //
+    // `count > 0` IS LOAD-BEARING: with dutyMin <= 0 the test `duty >= dutyMin` is true of a band present
+    // in no frame at all, and the call would return band 0 "occupied 0 % of the time" — a number that
+    // reads as a finding. A non-finite dutyMin fails every comparison and returns none, by the same rule.
+    //
+    // ±1 BAND BY CONSTRUCTION, and a caller must expect it: a tone 40 cents below a band centre leaves
+    // about a third of its power in the band beneath, only ~5 dB down, which a 20 dB threshold admits. The
+    // returned band's `centsOffset` in the table is the tell — near +50 cents means the energy sits at the
+    // band's top edge and belongs to the note above.
+    // THE SIDE FRACTION BELOW ANY CANDIDATE CROSSOVER, from the band table alone — no second pass over the
+    // audio, no second filter, no extra state. The spectral axes are fed the RAW Mid and Side, BEFORE the
+    // crossover (see process()), so the table is an unfiltered semitone spectrum of both axes and any LR4
+    // low-pass can be applied to it afterwards as a weight:
+    //
+    //     sideFractionBelow(fc) = SUM_b |H(c_b;fc)|^2 · side_b  /  SUM_b |H(c_b;fc)|^2 · (mid_b + side_b)
+    //
+    // with the SAME response the real filter has — |H|^2 = 1/(1+r^4)^2, r = tan(pi·f/fs)/tan(pi·fc/fs).
+    // The prewarped ratio is not optional: f/fc is the analogue prototype and is wrong near Nyquist, which
+    // the header above says at length. `det::tan` for the same reason `det::pow10` is used elsewhere — a
+    // published number must not depend on which libm the row was built against.
+    //
+    // WHAT IT IS AND IS NOT, MEASURED BOTH WAYS. It is a SWEEP instrument: it answers "where should the
+    // crossover sit" for a whole curve at one call per point, which is what choosing a mono-bass frequency
+    // actually asks. It is NOT the number the installed crossover produces.
+    //
+    // ON MATERIAL WHOSE LOW END LIVES INSIDE THE TABLE it is very nearly the same number: against a real
+    // LR4 on mono 41 Hz plus anti-phase 98 and 220 Hz, the two agree to 4.7e-5 absolute at every crossover
+    // from 60 to 300 Hz — far closer than the arithmetic needs to be for a question posed at 0.25.
+    //
+    // OUTSIDE THE TABLE IT IS BLIND, AND THE FAILURE IS NOT SMALL. The bands cover [lowNoteHz, highNoteHz]
+    // and nothing else, so anti-phase energy under 20 Hz or above 300 Hz is absent from both sums while
+    // the real low-pass passes it. Add anti-phase 15 Hz and 700 Hz to that fixture and at fc = 60 Hz this
+    // function reads 0.0036 where the installed filter reads 0.488 — the opposite answer to a question
+    // asked at 0.25, and the 15 Hz term is precisely the vertical hazard a lacquer cares about. Two more
+    // differences are small beside that one and are named for completeness: the population is the USED
+    // FRAMES, window-weighted, not every sample; and no filter start-up is carried.
+    //
+    // SO: sweep to CHOOSE a frequency, then install it and read lowSideFraction() for the answer. A caller
+    // that wants one number and not a curve should not be here.
+    //
+    // Canonically 0.0 for a frequency the crossover itself would refuse, and for the 0/0 of a silent or
+    // unmeasured programme — the same convention as LowEndBand::sideFraction().
+    double sideFractionBelow (double fc) const noexcept
+    {
+        if (! (fc >= kMinCrossoverHz) || ! (fc <= 0.49 * sampleRate_)) return 0.0;
+        const double tc = core::det::tan (core::kPi * fc / sampleRate_);
+        if (! (tc > 0.0) || ! std::isfinite (tc)) return 0.0;
+        double num = 0.0, den = 0.0;
+        for (int b = 0; b < bandCount_; ++b)
+        {
+            const LowEndBand& row = bands_[(std::size_t) b];
+            const double r  = core::det::tan (core::kPi * row.centreHz / sampleRate_) / tc;
+            const double r4 = r * r * r * r;
+            const double d  = 1.0 + r4;
+            if (! std::isfinite (d) || ! (d > 0.0)) continue;          // far above fc: weight is 0, skip it
+            const double w  = 1.0 / (d * d);
+            if (! std::isfinite (w)) continue;
+            num += w * row.sideEnergy;
+            den += w * (row.midEnergy + row.sideEnergy);
+        }
+        return (std::isfinite (num) && std::isfinite (den) && den > 0.0) ? num / den : 0.0;
+    }
+
+    LowestOccupied lowestOccupiedBand (double dutyMin) const noexcept
+    {
+        LowestOccupied r;
+        for (int b = 0; b < bandCount_; ++b)
+        {
+            if (! (dutyCount_[(std::size_t) b] > 0) || ! (duty (b) >= dutyMin)) continue;
+            r.band = b;
+            r.midi = bands_[(std::size_t) b].midi;
+            r.centreHz = bands_[(std::size_t) b].centreHz;
+            r.count = dutyCount_[(std::size_t) b];
+            r.duty  = duty (b);
+            r.levelWhenOnDb  = levelWhenOnDb (b);
+            r.marginWhenOnDb = marginWhenOnDb (b);
+            break;
+        }
+        return r;
     }
 
     int peakBand() const noexcept { return peakBand_; }                  // argmax of ENERGY — what a tone does
@@ -855,8 +1127,12 @@ private:
             int bin = (int) (frac * (double) kHistogramBins);
             if (bin < 0) bin = 0;
             if (bin >= kHistogramBins) bin = kHistogramBins - 1;
-            hist_[bin] += openFinite_;                                  // duration-weighted: samples, not blocks
-            histSamples_ += openFinite_;
+            if (blockIndex_ >= (std::int64_t) params_.skipBlocks)        // the leading blocks a caller asked to drop
+            {
+                hist_[bin] += openFinite_;                              // duration-weighted: samples, not blocks
+                histSamples_ += openFinite_;
+            }
+            else ++skippedBlocks_;
             if (frac > worstFrac_) { worstFrac_ = frac; worstFracBlock_ = blockIndex_; worstFracEnergy_ = energy; }
             if (energy > peakEnergy_) { peakEnergy_ = energy; peakEnergyBlock_ = blockIndex_; peakEnergyFrac_ = frac; }
             if (openSide_ > peakSide_) { peakSide_ = openSide_; peakSideBlock_ = blockIndex_; }
@@ -937,7 +1213,43 @@ private:
         accFrameEnergy_ += frameTotal;
         frameTotal_ = frameTotal;
         ++usedFrames_;
+        countDuty (frameTotal);
         if (trace_ != nullptr) fireFrameTrace (true);
+    }
+
+
+    // DUTY: IN HOW MANY FRAMES WAS THIS BAND PRESENT. Called once per ACCEPTED frame, from the one place a
+    // frame is accepted, so its clock is the frame schedule and law 8a holds by construction. The trace
+    // arrays it reads are written unconditionally — the observer only decides whether they are REPORTED —
+    // so duty costs a caller nothing and does not depend on one being installed.
+    //
+    // THE GATE IS THE WHOLE DESIGN. "Within dutyThresholdDb of the frame's loudest band" is `E_b >= max·q`,
+    // and on a frame whose every band is zero that reads `0 >= 0` — TRUE for all of them. A silent
+    // programme would report every band occupied in every frame, which is not a small error: it is the
+    // exact opposite of the answer. A frame whose bands hold only the transform's own round-off is the
+    // same failure wearing a number. So a frame enters the denominator only if its band total clears the
+    // note floor, the same share of frameEnergy() the whole-programme report uses — one rule, two places.
+    void countDuty (double frameTotal) noexcept
+    {
+        double bandTotal = 0.0, frameMax = 0.0;
+        for (int b = 0; b < bandCount_; ++b)
+        {
+            const double e = traceMid_[(std::size_t) b] + traceSide_[(std::size_t) b];
+            bandTotal += e;
+            if (e > frameMax) frameMax = e;
+        }
+        if (! (frameMax > 0.0) || ! (bandTotal > kNoteFloorShare * frameTotal)) return;
+        ++dutyFrames_;
+        const double floorE = frameMax * dutyShare_;
+        for (int b = 0; b < bandCount_; ++b)
+        {
+            const double e = traceMid_[(std::size_t) b] + traceSide_[(std::size_t) b];
+            if (e >= floorE)
+            {
+                ++dutyCount_[(std::size_t) b];
+                dutyRatio_[(std::size_t) b] += e / frameMax;   // linear; the dB is a VIEW, taken on read
+            }
+        }
     }
 
     void fireFrameTrace (bool used) noexcept
@@ -1050,6 +1362,7 @@ private:
     std::int64_t firstHole_ = -1, lastHole_ = -1;
 
     std::int64_t hist_[kHistogramBins] {};
+    std::int64_t skippedBlocks_ = 0;
     std::int64_t histSamples_ = 0;
     double worstFrac_ = -1.0, worstFracEnergy_ = 0.0;
     std::int64_t worstFracBlock_ = -1;
@@ -1075,6 +1388,10 @@ private:
     std::vector<BinWeight>   weights_;
     std::vector<int>         bandCountBins_;
     std::vector<double>      accMid_, accSide_, accMoment_, traceMid_, traceSide_, sort_;
+    std::vector<std::int64_t> dutyCount_;   // K9: frames this band was present in
+    std::vector<double>      dutyRatio_;    // …and the sum of its share of the frame max over those
+    double                   dutyShare_ = 0.0;   // the threshold as a linear ratio, made once
+    std::int64_t             dutyFrames_ = 0;    // frames that cleared the note floor and were counted
 };
 
 } // namespace felitronics::analysis
