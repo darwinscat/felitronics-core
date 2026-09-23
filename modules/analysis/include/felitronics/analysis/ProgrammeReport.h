@@ -113,10 +113,20 @@ namespace felitronics::analysis
 //     function answers 0.0 both for a constant tone (whose range really is 0 LU) and for a programme where
 //     the gates left fewer than two short-term observations, and from outside the meter the two cannot be
 //     told apart. EBU Tech 3342 is computed here from this class's own short-term series, where the gated
-//     count is known exactly. The two agree to about 0.3 LU wherever both are defined — not bitwise, and
-//     the reason is worth knowing: the meter sums its short-term window newest-first
-//     (LoudnessMeter::meanLastSubHops) and this class oldest-first, so the two orders leave different residues. The
-//     suite pins the agreement at that tolerance.
+//     count is known exactly.
+//
+//     They agree to about 0.3 LU wherever both are defined — not bitwise, and the reason is worth knowing:
+//     the meter sums its short-term window newest-first (LoudnessMeter::meanLastSubHops) and this class
+//     oldest-first, so the two orders leave different residues. The suite pins the agreement at that
+//     tolerance, on steady material AND on a square envelope whose states last exactly the 3 s window.
+//
+//     THAT SECOND FIXTURE IS THERE BECAUSE THE PAIR ONCE CAME APART. Until v0.43 this class sampled its
+//     series once a second (libebur128's cadence) while K12 gave the meter the 10 Hz EBU Tech 3342 §3.1
+//     requires — and two numbers carrying that standard's name read 20.00 LU here against 9.50 there, at
+//     44.1 and 48 kHz, over 12, 30 and 120 s programmes. The agreement check of the day kept passing the
+//     whole time, because its only fixture was long steady steps, where every window that is not straddling
+//     a step reads the same value and the sampling cadence cannot matter. Both cadences are 10 Hz now
+//     (`kObservationHops = 10`), and the guard is held on a fixture that can tell them apart.
 //
 // FORM. setParams / prepare / process / finish / reset, like `analysis::ClipDetector`. `process()` is
 // READ-ONLY and allocates nothing; `finish()` drains the true-peak filter, closes the report and freezes
@@ -319,7 +329,11 @@ public:
     static constexpr double kMinSampleRate      = core::kMinSampleRate;   // P51: the core's floor, one number
     static constexpr double kMaxSampleRate      = 768000.0;
     static constexpr int    kShortTermSubHops   = 300;    // 3 s of 10 ms sub-hops — the short-term window
-    static constexpr int    kObservationHops    = 100;    // one short-term observation a second (libebur128's cadence)
+    // TEN SINCE v0.43, WHERE IT WAS A HUNDRED. A hundred sub-hops is one second, libebur128's cadence and
+    // this class's until K12 gave `LoudnessMeter` the 10 Hz EBU Tech 3342 §3.1 requires — at which point two
+    // numbers in one core carried that standard's name and disagreed by 10.5 LU. Ten sub-hops is the 100 ms
+    // hop the clause asks for, and the two series are one series again.
+    static constexpr int    kObservationHops    = 10;     // one short-term observation per 100 ms hop (10 Hz)
     static constexpr int    kHistogramBins      = 1000;   // -70 … +30 LUFS in 0.1 LU bins (LoudnessMeter::lra)
     static constexpr double kHistogramFloorLufs = -70.0;
     static constexpr double kHistogramBinLu     = 0.1;
@@ -355,6 +369,11 @@ public:
         std::array<PerChannel, core::kMaxChannels> channel {};
 
         // --- the whole programme ---
+        // `programmeMeanSquare` is UNGATED and sample-level: the sum of squares over every finite sample
+        // inside the programme span, divided by that count. `BandCrest::programmeMeanSquareDb()` is a mean
+        // of BLOCK mean-squares over blocks clearing a -70 dBFS gate, so the two agree on a stationary tone
+        // (6e-10 dB) and part on real material — 0.04 dB where only granularity differs, 3 dB once blocks
+        // fall under that gate. See the note at BandCrest::programmeMeanSquareDb().
         ProgrammeValue samplePeak, rms, crestFactorDb, infraLowFraction, programmeMeanSquare;
         std::int64_t   programmeSpanSamples = 0;   // [firstSignal, lastSignal] inclusive, in frames
         std::int64_t   programmeSpanFinite  = 0;   // finite present samples inside it, all channels
@@ -382,9 +401,15 @@ public:
         ProgrammeValue integratedLufs;                  // BS.1770 gated, analysis::LoudnessMeter
         ProgrammeValue truePeakDbtp;                    // analysis::ReferenceTruePeakMeter, 4× / 32 taps
         ProgrammeValue plrDb;                           // truePeakDbtp - integratedLufs
-        ProgrammeValue lraLu;                           // EBU Tech 3342, P95-P10 of the gated short-term set
+        // EBU Tech 3342, P95-P10 of the gated short-term set, read from a series sampled at 10 Hz — one
+        // observation per 100 ms hop, which is what §3.1 of that standard requires. IT WAS 1 Hz UNTIL v0.43,
+        // libebur128's cadence: a programme whose envelope varies near the 3 s window reads differently across
+        // that boundary, by up to 10.5 LU on the worst shape (states exactly as long as the window).
+        ProgrammeValue lraLu;
         ProgrammeValue shortTermP10, shortTermP50, shortTermP95;   // absolute-gated only
         ProgrammeValue shortTermSpreadLu;               // P95 - P10 of the same set
+        // Observations taken, at ONE PER 100 ms HOP (10 Hz) — the cadence EBU Tech 3342 §3.1 requires, and
+        // ten times what this field counted before v0.43, when the series was sampled once a second.
         std::int64_t   shortTermObservations      = 0;
         std::int64_t   shortTermGatedObservations = 0;  // …that passed the -70 LUFS absolute gate
         std::int64_t   uncoveredSubHopSamples     = 0;  // T - (closed sub-hops)·subHopSamples
@@ -494,7 +519,7 @@ public:
         std::size_t   tailPendingCounts = 0;   // int32 — the deferred quiet run's per-frame counts
         std::size_t   tailPendingEnergies = 0; // doubles — …and their energies, which are not always zero
         std::size_t   scratchFloats    = 0;    // maxBlock · channels — the constant-width feed
-        std::size_t   shortTermEntries = 0;    // doubles: one short-term observation a second
+        std::size_t   shortTermEntries = 0;    // doubles: one short-term observation per 100 ms hop (10 Hz)
         DeterministicLoudnessMeter::Storage          loudness {};
         ReferenceTruePeakMeter::Storage truePeak {};
 
@@ -543,7 +568,9 @@ public:
         st.truePeak = ReferenceTruePeakMeter::storageFor (sampleRate, maxBlock, maxChannels);
         if (! st.truePeak.ok) return st;
 
-        // One observation per kObservationHops sub-hops, the first at kShortTermSubHops. The +8 is margin,
+        // One observation per kObservationHops sub-hops (ten of them, a 100 ms hop), the first at
+        // kShortTermSubHops. Production is floor(hops) - 29 against a capacity of floor(hops) + 8, so the
+        // slack is 37 hops; it was ten times fewer entries and the same shape before v0.43. The +8 is margin,
         // not need — the shape LoudnessMeter::storageFor uses for its own short-term store.
         const double obs = std::ceil (maxSamples) / (double) (sub * (std::int64_t) kObservationHops);
         if (! (obs <= 1.0e8)) return st;                       // a count no sane store would hold

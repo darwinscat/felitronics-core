@@ -138,6 +138,173 @@ namespace
     }
 }
 
+//==================================================================================================
+// EBU TECH 3342 TABLE 1 — the minimum-requirements compliance test for Loudness Range, which this suite did
+// not have. Tech 3341's Table 1 covers I, M and S and is unaffected by the LRA cadence, so nothing here was
+// watching the one measure that cadence decides.
+//
+// Cases 1-4 are synthetic and reproduced exactly from the standard's text: a 1 kHz stereo sine, applied in
+// phase to both channels, in 20 s segments at the stated PER-CHANNEL PEAK levels, each case's expected LRA
+// carrying the standard's own +-1 LU tolerance. Cases 5 and 6 are authentic programme material distributed by
+// the EBU and are not reproducible here; their absence is stated rather than papered over.
+//
+// WORTH KNOWING: both the 1 Hz cadence this meter used to run and the 10 Hz one Tech 3342 3.1 requires pass
+// all four EXACTLY — measured on both, not argued. The reason is the SHAPE, not the length: each case is a
+// few long steady segments, so every window that is not straddling a step reads the same value and where the
+// grid samples them does not matter. (Length alone would prove nothing, and the sentence here used to say it
+// did: a 120 s programme whose states last the window's 3 s splits 20.0 LU against 9.5.) So this test does
+// not prove the cadence right; it pins
+// compliance, which is a different claim and one nothing was making.
+void tech3342MinimumRequirements()
+{
+    felitronics::test::group ("EBU Tech 3342 Table 1: the Loudness Range minimum requirements");
+    constexpr double kFs = 48000.0;
+    struct Case { const char* what; std::vector<double> peaksDb; double wantLu; };
+    const Case cases[] = {
+        { "case 1: -20 then -30 dBFS",                     { -20.0, -30.0 },                 10.0 },
+        { "case 2: -20 then -15 dBFS",                     { -20.0, -15.0 },                  5.0 },
+        { "case 3: -40 then -20 dBFS",                     { -40.0, -20.0 },                 20.0 },
+        { "case 4: -50, -35, -20, -35, -50 dBFS",          { -50.0, -35.0, -20.0, -35.0, -50.0 }, 15.0 },
+    };
+    for (const Case& c : cases)
+    {
+        std::vector<std::vector<float>> ch (2);
+        for (const double peakDb : c.peaksDb)
+        {
+            const double a = std::pow (10.0, peakDb / 20.0);
+            const auto n = (std::size_t) (20.0 * kFs);
+            const std::size_t at = ch[0].size();
+            for (auto& v : ch) v.resize (at + n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                // CONTINUOUS PHASE ACROSS THE SEGMENTS, so the level step is the only discontinuity: a phase
+                // jump would be a click, and a click is a transient the meter would rightly see.
+                const double t = (double) (at + i) / kFs;
+                const float v = (float) (a * std::sin (2.0 * 3.14159265358979323846 * 1000.0 * t));
+                ch[0][at + i] = v; ch[1][at + i] = v;
+            }
+        }
+        const int n = (int) ch[0].size();
+        felitronics::analysis::LoudnessMeter m;
+        if (! felitronics::test::run (m.prepareForSamples (kFs, 2, n))) continue;
+        const float* q[2] { ch[0].data(), ch[1].data() };
+        if (! felitronics::test::run (m.process (q, 2, n))) continue;
+        const double got = m.loudnessRangeLu();
+        felitronics::test::ok (std::fabs (got - c.wantLu) <= 1.0,
+            std::string (c.what) + ": LRA " + std::to_string (got) + " LU against the standard's "
+            + std::to_string (c.wantLu) + " +-1");
+    }
+    felitronics::test::ok (true, "cases 5 and 6 are authentic EBU programme segments and are NOT covered here — said out loud "
+              "rather than left to be inferred from four rows where the standard lists six");
+}
+
+//==================================================================================================
+// THE CADENCE ITSELF. Tech 3342 3.1 requires a short-term sample at least every 100 ms; this meter sampled
+// every second until K12. The count is the claim: one per hop, not one per ten.
+void theShortTermCadenceIsTenHertz()
+{
+    felitronics::test::group ("Tech 3342 3.1: a short-term sample every hop, not every tenth");
+    constexpr double kFs = 48000.0;
+    const auto n = (std::size_t) (kFs * 12.0);
+    std::vector<std::vector<float>> ch (2, std::vector<float> (n, 0.0f));
+    for (int c = 0; c < 2; ++c)
+        for (std::size_t i = 0; i < n; ++i)
+            ch[(std::size_t) c][i] = (float) (0.1 * std::sin (2.0 * 3.14159265358979323846 * 1000.0 * (double) i / kFs));
+    felitronics::analysis::LoudnessMeter m;
+    if (! felitronics::test::run (m.prepareForSamples (kFs, 2, (int) n))) return;
+    const float* q[2] { ch[0].data(), ch[1].data() };
+    if (! felitronics::test::run (m.process (q, 2, (int) n))) return;
+    // 12 s of programme is 120 hops; the first short-term sample lands once 3 s are in, so 120 - 30 + 1 = 91.
+    // At the old 1 Hz cadence it would have been 10.
+    felitronics::test::ok (m.shortTermCount() == 91,
+        "12 s gives " + std::to_string (m.shortTermCount())
+        + " short-term samples — one per 100 ms hop from 3 s on (91); at 1 Hz it was 10");
+
+    // A TOTAL IS NOT A CADENCE. 91 over 12 s pins the average; it does not pin WHERE the first sample lands or
+    // that the spacing is uniform, and a build that started late and then ran fast would match it. So: the count
+    // at each hop boundary around the first sample, and at the next few, fed in IRREGULAR call sizes so the
+    // answer cannot come from the call boundaries. (The companion range check is weaker than it looks — a 20 Hz
+    // cadence lands inside its tolerance, and 20 Hz satisfies §3.1 anyway, which asks a MINIMUM. What is pinned
+    // here is this meter's exact grid, which is the thing a caller reading shortTermCount() is told.)
+    {
+        const long long hop = 10LL * std::llround (0.01 * kFs);
+        struct Step { long long hops; int want; };
+        const Step steps[] = { { 29, 0 }, { 30, 1 }, { 31, 2 }, { 32, 3 }, { 60, 31 }, { 120, 91 } };
+        const int splits[] = { 1, 4096, 37, 8192, 300, 1 };                 // nothing lines up with 4800
+        for (const Step& s : steps)
+        {
+            const auto total = (std::size_t) (s.hops * hop);
+            std::vector<std::vector<float>> v (2, std::vector<float> (total, 0.0f));
+            for (std::size_t i = 0; i < total; ++i)
+                v[0][i] = v[1][i] = (float) (0.1 * std::sin (2.0 * 3.14159265358979323846 * 1000.0 * (double) i / kFs));
+            felitronics::analysis::LoudnessMeter mm;
+            if (! felitronics::test::run (mm.prepareForSamples (kFs, 2, (double) total))) continue;
+            std::size_t at = 0, k = 0;
+            while (at < total)
+            {
+                const int len = (int) std::min<std::size_t> ((std::size_t) splits[k++ % 6], total - at);
+                const float* q2[2] { v[0].data() + at, v[1].data() + at };
+                if (! felitronics::test::run (mm.process (q2, 2, len))) break;
+                at += (std::size_t) len;
+            }
+            felitronics::test::ok (mm.shortTermCount() == s.want,
+                std::to_string (s.hops) + " hops in irregular calls: " + std::to_string (mm.shortTermCount())
+                + " short-term samples (the first at hop 30, then one each)");
+        }
+    }
+}
+
+//==================================================================================================
+// WHAT THE CADENCE IS WORTH, on the programme that shows it. A square envelope whose states last exactly the
+// window's 3 s is the worst case for a coarse grid: the window can sit wholly inside a state, and how often it
+// does is decided by the sampling phase rather than by the audio. The header states 20.0 LU at the old 1 Hz
+// against 9.5 LU here, unchanged from 12 s out to 120 s — this measures the half of that pair the shipped code
+// can produce, so the header is not citing a number nothing runs. The 1 Hz figures are named there as read off
+// the pre-change meter, and stay named that way; no gate can hold them once the code cannot produce them.
+//
+// The swing is a flat 20 dB, so 20.0 LU is what a phase-lucky grid reports and also the ceiling: a result of
+// 9.5 is the mixed windows being counted, not precision lost. Both rates, because a cadence expressed in hops
+// must not depend on how many samples a hop holds.
+//
+// THE VALUE HERE DOES NOT IDENTIFY THE CADENCE, and it would be easy to read this group as if it did. The
+// range is a function of the PHASE SET the grid visits, {k·stride mod 60}, whose size is 60/gcd(stride,60) —
+// so strides that share a gcd give the same distribution. Measured on a stride-parametrised meter at 48 kHz:
+// stride 3 (3.33 Hz) and stride 9 (1.11 Hz) both read 9.6 LU, inside the tolerance below, while stride 2 reads
+// 8.2 and stride 4 reads 11.2. Faster cadences land inside too (20 Hz reads 9.4, and the continuous limit is
+// 10·log10(95.05/10.9) = 9.41) — which is correct behaviour, since §3.1 sets a MINIMUM and 20 Hz meets it.
+// What pins this meter's grid is the COUNT, in the group above: the first sample's hop and the spacing. This
+// group pins the number that grid produces, and is the half that would catch a change in the percentile rule
+// or the window rather than in the cadence.
+void theCadenceIsMeasuredOnAWindowLengthEnvelope()
+{
+    felitronics::test::group ("Tech 3342 3.1: the range of a 3 s-state envelope, at the cadence the standard asks for");
+    for (const double fs : { 44100.0, 48000.0 })
+        for (const double secs : { 12.0, 30.0, 120.0 })
+        {
+            const auto n   = (std::size_t) (fs * secs);
+            const auto blk = (std::size_t) (fs * 3.0);          // a state exactly as long as the window
+            std::vector<std::vector<float>> ch (2, std::vector<float> (n, 0.0f));
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double s = std::sin (2.0 * 3.14159265358979323846 * 1000.0 * (double) i / fs);
+                const double g = ((i / blk) % 2 == 0) ? 0.25 : 0.025;   // 20 dB apart, so 20 LU is the ceiling
+                ch[0][i] = ch[1][i] = (float) (g * s);
+            }
+            felitronics::analysis::LoudnessMeter m;
+            if (! felitronics::test::run (m.prepareForSamples (fs, 2, (double) n))) return;
+            const float* q[2] { ch[0].data(), ch[1].data() };
+            if (! felitronics::test::run (m.process (q, 2, (int) n))) return;
+            const std::string where = std::to_string ((int) fs) + " Hz, " + std::to_string ((int) secs) + " s";
+            felitronics::test::approx (m.loudnessRangeLu(), 9.5, 0.25,
+                where + ": the range is " + std::to_string (m.loudnessRangeLu())
+                      + " LU — the mixed windows counted, not the full 20 LU swing a 1 Hz grid lands on");
+            // AND THE LENGTH DOES NOT BUY IT BACK: the count grows tenfold from 12 s to 120 s and the range does
+            // not move, which is the point the old claim ("nothing changes past 30 s") got backwards.
+            felitronics::test::ok (m.shortTermCount() == (int) std::llround ((secs - 3.0) * 10.0) + 1,
+                where + ": " + std::to_string (m.shortTermCount()) + " short-term samples, one per hop from 3 s on");
+        }
+}
+
 int main()
 {
     std::printf ("felitronics::analysis LoudnessMeter — EBU Tech 3341 conformance\n");
@@ -485,6 +652,65 @@ int main()
             lm.reset();
             test::ok (lm.droppedBlocks() == 0, "reset clears the count");
         }
+        // K12 — THE RANGE HAS ITS OWN STORE AND ITS OWN OVERFLOW, and until this group nothing said so. The
+        // counter above was documented as covering loudnessRangeLu() as well; it does not, and the two do not
+        // even overflow together. Block store: capacity floor(hops) + 4 against a production of floor(hops) - 3,
+        // so slack 7. Short-term store: capacity ceil(hops) + 8 against floor(hops) - 29, so slack 37. Blocks
+        // always go first, by thirty hops, and between the two thresholds one counter climbs while the other
+        // answer is still whole.
+        //
+        // MEASURED IN HOPS, NOT SECONDS, and that is not pedantry — the first draft of this group asked for
+        // "3.8 s past" and got 1 622 399 samples at 48 kHz where it meant 1 622 400, which is one hop short and
+        // put the threshold on the wrong side. A hop is 10·lround(0.01·fs) samples; every length below is an
+        // exact multiple of one, so the thresholds are integers and the same integers at both rates.
+        {
+            // `spare` is the extra SAMPLE that makes the declared length a fractional number of hops. It moves
+            // the short-term threshold by one and the block threshold not at all — capacity is ceil(hops) + 8
+            // against floor(hops) + 4 — so a grid of whole hops alone would never exercise the ceiling.
+            for (const double rate : { 48000.0, 44100.0 })
+                for (const long long declHops : { 300LL, 73LL })
+                    for (const long long spare : { 0LL, 1LL })
+                {
+                    const long long hop = 10LL * std::llround (0.01 * rate);
+                    const long long stGoes = 38 + spare;          // 38 at whole hops, 39 with the extra sample
+                    struct Row { long long over; bool wantBlk; bool wantSt; };
+                    // 7 hops over: the block store is exactly full. 8: it goes. One short of stGoes the
+                    // short-term store is exactly full, blocks long gone. At stGoes it goes too.
+                    const Row rows[] = { { 0, false, false }, { 7, false, false }, { 8, true, false },
+                                         { stGoes - 1, true, false }, { stGoes, true, true } };
+                    for (const Row& r : rows)
+                    {
+                        analysis::LoudnessMeter m;
+                        if (! felitronics::test::run (m.prepareForSamples (rate, 2, (double) (declHops * hop + spare)))) continue;
+                        long long fed = 0;
+                        feedSine (m, rate, kToneHz, -20.0, (double) ((declHops + r.over) * hop) / rate, fed);
+                        const std::string where = std::to_string ((int) rate) + " Hz, " + std::to_string (declHops)
+                                                + " hops + " + std::to_string (spare) + " declared, "
+                                                + std::to_string (r.over) + " over";
+                        const bool blk = m.droppedBlocks() > 0, st = m.droppedShortTermSamples() > 0;
+                        test::ok (blk == r.wantBlk && st == r.wantSt,
+                                  where + ": blocks dropped " + std::to_string (m.droppedBlocks())
+                                        + ", short-term dropped " + std::to_string (m.droppedShortTermSamples()));
+                        // AND THE ORDERING ITSELF, which is the property rather than the two numbers: the
+                        // range's store never overflows first. This is what fails if one capacity formula is
+                        // changed without the other, at any rate and any declared length.
+                        test::ok (! (st && ! blk),
+                                  where + ": the range's store did not overflow before the block store");
+                    }
+                }
+            // reset() clears it, like every other exposure — a counter that survives a reset reports the
+            // previous programme's damage against this one's numbers.
+            analysis::LoudnessMeter m;
+            if (felitronics::test::run (m.prepare (sr, 2, 5.0)))
+            {
+                long long fed = 0;
+                feedSine (m, sr, kToneHz, -20.0, 20.0, fed);
+                test::ok (m.droppedShortTermSamples() > 0, "far past the capacity the range's store is counted too ("
+                          + std::to_string (m.droppedShortTermSamples()) + " dropped)");
+                m.reset();
+                test::ok (m.droppedShortTermSamples() == 0, "and reset clears it");
+            }
+        }
     }
 
     // --- P41: the store is sized by ONE function, in samples, and that function is TOTAL ---
@@ -517,6 +743,28 @@ int main()
         test::ok (! M::storageFor (21474836450.0, 1000.0, s2), "21474836450 Hz: 0.01·fs is .5 over — refused");
         M lmRate;
         test::ok (lmRate.prepare (2.1e10, 1, 1.0e-6), "prepare(21 GHz, 1 µs) is accepted, as it always was");
+
+        // K12 — THE LENGTH BOUND BELONGS TO THE TIGHTER STORE, and it used to be written for the looser one.
+        // `blocks` is floor(hops) + 4 and `shortTerm` is ceil(hops) + 8, so a bound of INT_MAX - 4 kept the
+        // block index in an int and handed the short-term store a capacity of INT_MAX + 4. Then
+        // `stCount < (int) stE.size()` compares against a NARROWED value — negative — and every short-term
+        // sample is refused from the first one onward, while droppedBlocks() still reads 0: a range of 0.0 LU
+        // presented as a measurement. Nothing allocates here; storageFor() is arithmetic, and arithmetic is
+        // where a bound is wrong or right. 4800 samples is a hop at 48 kHz, so the length is exact in a double.
+        {
+            constexpr double kHop = 4800.0;                       // 10 · lround (0.01 · 48000)
+            const double atBound  = 2147483639.0 * kHop;          // hops = INT_MAX - 8
+            const double overIt   = 2147483640.0 * kHop;          // one hop more
+            M::Storage edge, past;
+            const bool tookIt = M::storageFor (48000.0, atBound, edge);
+            test::ok (tookIt && edge.shortTerm == (std::size_t) std::numeric_limits<int>::max()
+                             && edge.blocks    == (std::size_t) std::numeric_limits<int>::max() - 4,
+                      "the longest accepted programme sizes the short-term store at exactly INT_MAX ("
+                      + std::to_string (edge.shortTerm) + ") and the block store below it");
+            test::ok (edge.shortTerm <= (std::size_t) std::numeric_limits<int>::max(),
+                      "…so (int) stE.size() is the capacity and not a negative");
+            test::ok (! M::storageFor (48000.0, overIt, past), "and one hop past it is refused");
+        }
 
         // P41 F1, RE-HOMED TWICE (P51, P103). The solver sizes the meter behind a solve in SAMPLES, because `frames / fs`
         // seconds was +inf at an absurd finite rate and the store used to be `(std::size_t) inf` — 3 kept blocks on arm64
@@ -554,18 +802,22 @@ int main()
         // THE ORACLE IS A TABLE, on purpose (the one place a restatement is mandatory): prepare() and a caller's
         // budget both READ storageFor(), so a check of one against the other cannot move when storageFor's own
         // arithmetic does. Each row is derived by hand from `s = max(1, lround(0.01·fs))`, `hops = ⌈n⌉/(10·s)`,
-        // blocks = ⌊hops⌋ + 4, shortTerm = ⌊hops/10⌋ + 8, bytes = 8·(300 + blocks + shortTerm):
+        // blocks = ⌊hops⌋ + 4, shortTerm = ⌈hops⌉ + 8, bytes = 8·(300 + blocks + shortTerm). `shortTerm` was
+        // ⌊hops/10⌋ + 8 until K12: the short-term cadence is one sample per HOP now, ten times as many, which
+        // is what EBU Tech 3342 §3.1 requires. Every row below is re-derived by hand from the new formula
+        // rather than copied from a run — that is the whole point of a table nobody can satisfy by editing
+        // one number:
         struct Row { double fs, n; int s; std::size_t blocks, shortTerm; std::uint64_t bytes; };
         // (Since P103 the rows sit at 8000 Hz and up, with the same block counts they had at 150, 149 and 100 Hz. The
         // plateau `max(1, ·)` is out of reach now: the smallest sub-hop an accepted rate has is 80 samples, and a rate
         // <= 0 reads as 48 kHz.)
         const Row rows[] = {
-            { 48000.0,    480000.0, 480,    104,    18,    3376 },   // hops 100
-            { 44100.0,    441000.0, 441,    104,    18,    3376 },   // hops 100
-            { 22050.0,    220500.0, 221,    103,    17,    3360 },   // lround(220.5) = 221, hops 99.77
-            {  8050.0,     60750.0,  81,     79,    15,    3152 },   // lround(80.5) = 81, hops 75
-            {  8049.0,        80.0,  80,      4,     8,    2496 },   // lround(80.49) = 80, hops 0.1
-            {  8000.0, 288000000.0,  80, 360004, 36008, 3170496 },   // the floor: hops 360000
+            { 48000.0,    480000.0, 480,    104,    108,     4096 },   // hops 100
+            { 44100.0,    441000.0, 441,    104,    108,     4096 },   // hops 100
+            { 22050.0,    220500.0, 221,    103,    108,     4088 },   // lround(220.5) = 221, hops 99.77 → ⌈⌉ 100
+            {  8050.0,     60750.0,  81,     79,     83,     3696 },   // lround(80.5) = 81, hops 75
+            {  8049.0,        80.0,  80,      4,      9,     2504 },   // lround(80.49) = 80, hops 0.1 → ⌈⌉ 1
+            {  8000.0, 288000000.0,  80, 360004, 360008,  5762496 },   // the floor: hops 360000
         };
         for (const Row& r : rows)
         {
@@ -655,25 +907,35 @@ int main()
                 && bits (m.loudnessRangeLu()) == bits (fresh.loudnessRangeLu())
                 && m.droppedBlocks() == fresh.droppedBlocks() && m.nonFiniteSubHops() == fresh.nonFiniteSubHops()
                 && m.gatingBlockCount() == fresh.gatingBlockCount()
+                // K12's two readings belong in this list. A list that omits an exposure certifies the ones it
+                // names and says nothing about the rest, which is the shape of every stale-state defect.
+                && m.shortTermCount() == fresh.shortTermCount()
+                && m.droppedShortTermSamples() == fresh.droppedShortTermSamples()
                 && m.gatingBlockEnergies().size() == fresh.gatingBlockEnergies().size();
         };
-        // A previous programme that leaves EVERY reading non-trivial: 12 s of tone into 10 s of capacity (blocks
-        // dropped, a range), one NaN sample in it (a poisoned sub-hop), the last 400 ms loud (momentary).
+        // A previous programme that leaves EVERY reading non-trivial: 14 s of tone into 10 s of capacity, one
+        // NaN sample in it (a poisoned sub-hop), the last 400 ms loud (momentary).
+        //
+        // FOURTEEN, WHERE TWELVE STOOD. Twelve dropped gating blocks but NOT short-term samples — the block
+        // store's slack is 7 hops and the short-term store's 38, so 12 s into 10 s (20 hops over) is past one
+        // threshold and short of the other. `droppedShortTermSamples()` would have been compared at 0 against a
+        // fresh meter's 0: in the list, and dead. 40 hops over puts it at 3.
         auto played = [&] () {
             M m;
             felitronics::test::run (m.prepare (48000.0, 2, 10.0));
             long long idx = 0;
-            feedSine (m, 48000.0, kToneHz, -30.0, 6.0, idx);
+            feedSine (m, 48000.0, kToneHz, -30.0, 7.0, idx);
             std::vector<float> bad (480, 0.1f);
             bad[7] = std::numeric_limits<float>::quiet_NaN();
             const float* bp[2] { bad.data(), bad.data() };
             felitronics::test::run (m.process (bp, 2, 480));
-            feedSine (m, 48000.0, kToneHz, -20.0, 6.0, idx);
+            feedSine (m, 48000.0, kToneHz, -20.0, 7.0, idx);
             return m;
         };
         {
             const M m = played();
             test::ok (! sameAsFresh (m) && m.droppedBlocks() > 0 && m.nonFiniteSubHops() > 0 && m.gatingBlockCount() > 0
+                      && m.shortTermCount() > 0 && m.droppedShortTermSamples() > 0
                       && std::isfinite (m.integratedLufs()) && m.loudnessRangeLu() > 0.0,
                       "PRECONDITION: the previous programme is readable through every reading (dropped "
                       + std::to_string (m.droppedBlocks()) + ", non-finite " + std::to_string (m.nonFiniteSubHops()) + ")");
@@ -742,5 +1004,8 @@ int main()
         }
     }
 
+    tech3342MinimumRequirements();
+    theShortTermCadenceIsTenHertz();
+    theCadenceIsMeasuredOnAWindowLengthEnvelope();
     return test::report();
 }

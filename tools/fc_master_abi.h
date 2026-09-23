@@ -774,6 +774,16 @@ typedef struct fc_measurement
     // not non-finite ones (`nonFiniteSubHops`, sticky until reset). A measurement is whole when `loudnessValid`
     // and `lraValid` hold AND both of those counters are zero.
     //
+    // THAT COVERS `loudnessRangeLu` BY AN INVARIANT, not by this counter watching it. The range is read from a
+    // second store with its own capacity, and no field here counts ITS overflow. The rule above is still sound
+    // because the block store is always the first to fill: its slack is 7 hops against the short-term store's
+    // 37, so any programme long enough to truncate the range has been reporting `droppedBlocks` for thirty hops
+    // already. That is now pinned rather than assumed — `LoudnessMeter::droppedShortTermSamples()` exists on the
+    // C++ side and LoudnessConformanceTests asserts the ORDERING at exact hop multiples, at two rates. If a
+    // capacity formula is ever changed on one store and not the other, that test fails before this sentence
+    // becomes false. (No field is added here for it: the rule needs the ordering, not a second counter, and a
+    // field is an ABI version.)
+    //
     // TWO SURFACES OF THIS CORE HAVE DIFFERENT LENGTH BEHAVIOUR, and a caller using both will meet it: the
     // programme REPORT (`fc_probe_report_*`) sizes its stores from `maxDurationSec`, one hour by default, and
     // answers `LoudnessCapacityExceeded` past it — while a SOLVE sizes its meter from the programme it was

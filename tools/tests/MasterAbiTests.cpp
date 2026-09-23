@@ -1297,8 +1297,16 @@ int main()
             // THE RANGE LIVES IN CHANNEL 1 ONLY, and channel 0 is a steady tone. With the modulation in
             // both planes, a mutant that read channel 0 for every plane measured the same range and
             // survived — the fixture could not tell "both channels" from "channel 0 twice".
+            //
+            // FOUR SECONDS A STATE, WHERE IT WAS ONE, and the reason is the instrument, not this check. The
+            // short-term window is 3 s: against 1 s states it never sat inside one, so it averaged them and the
+            // fixture's range came out 0.5–0.6 LU — a fifth of the 1.9 LU the programme actually swings, and a
+            // precondition of "> 0.5" that passed by a single 0.1 LU histogram bin. K12 spent that bin (0.6 → 0.5)
+            // and the check went red, which is the margin being one bin, not the cadence being wrong. At 4 s the
+            // window fits inside a state, so the measured range IS the swing — 1.9 LU at BOTH cadences, at 8, 12
+            // and 20 s — and a mutant that shifts the result by half a LU has somewhere to be seen.
             for (std::size_t i = 0; i < frames; ++i)
-                if ((i / 48000) % 2 == 0) in[frames + i] *= 0.05f;
+                if ((i / 192000) % 2 == 0) in[frames + i] *= 0.05f;
             double viaAbi = 0.0;
             ok (fc_master_measure_lra (h, in.data(), (std::uint32_t) frames, &viaAbi) == FC_OK, "measured");
 
@@ -1308,7 +1316,14 @@ int main()
             double direct = 0.0;
             ok (solver.measureInputLoudnessRange (ip, kNch, (int) frames, direct), "the core measured too");
             ok (viaAbi == direct, "and the two are the SAME NUMBER, bit for bit");
-            ok (direct > 0.5, "PRECONDITION: the fixture has a range, so an added offset would show");
+            // WHAT THE RANGE IS FOR, stated precisely: the equality above already catches an added offset even
+            // on a range of zero, because it compares two measurements of the SAME audio. What needs a range is
+            // the OTHER mutant this block exists for — the one that reads channel 0 for every plane. Channel 0 is
+            // the steady tone, so that mutant measures 0.0 LU where the truth is 1.9, and the precondition is
+            // what guarantees those two are far apart. (The sentence here used to say the range was needed so
+            // "half a LU added would show", which is the check that does not need it.)
+            ok (direct > 1.5, "PRECONDITION: the fixture swings " + std::to_string (direct)
+                              + " LU, so reading channel 0 for both planes would read 0.0 instead");
             fc_master_destroy (h);
         }
 
@@ -1523,17 +1538,19 @@ int main()
         ok (solve.solverPrepared == 0, "PRECONDITION: the solver is not prepared yet");
 
         // THE ORACLE, literal on purpose (the one place a restatement is mandatory). 48 kHz stereo, 4 s: the loudness
-        // meter is sized for 192000 + 48000 samples = 50 hops of 4800 → 8·(300 + 54 + 13) = 2936 B; the REFERENCE
+        // meter is sized for 192000 + 48000 samples = 50 hops of 4800 → 8·(300 + 54 + 58) = 3296 B. The last term
+        // is what K12 moved: one short-term sample per hop, the cadence EBU Tech 3342 §3.1 asks for, where it used
+        // to be one per ten — so 5 + 8 became 50 + 8, the margin of 8 unchanged. The REFERENCE
         // true-peak meter (P62) is, per channel, one 4x / 32-tap PolyphaseOversampler — prototype 128, phase-major copy
         // 4·32, up ring 2·32, down ring 2·128 floats = 2304 B, plus two int cursors = 2312 B — and one shared scratch of
         // 1024·4 floats = 16 384 B: 2·2312 + 16 384 = 21 008 B. It drains from a fixed array, so there is no drain term
         // (the pre-P62 solve carried a 392 B TruePeakMeter and a 512 B drain buffer).
         // And two traces of 1000 x 32 B: 64 000 B.
-        ok (lra.callBytes == 2936u, "the measure_lra budget is the hand-derived 2936 B");
+        ok (lra.callBytes == 3296u, "the measure_lra budget is the hand-derived 3296 B");
         // And, since the quantile read-back (`fc_solution_gr_quantile`), the window histograms the solution keeps —
         // three of them since K11. THE FIGURE IS PRINTED rather than spelled: the literal that used to stand here
         // (727 960 B) described the two-histogram build and would have gone on reading as a measurement.
-        ok (solve.callBytes == 2936u + 21008u + 64000u + kGrWindowBytes,
+        ok (solve.callBytes == 3296u + 21008u + 64000u + kGrWindowBytes,
             "the solve budget is meter + reference true-peak meter + two traces + three window histograms = "
             + std::to_string (solve.callBytes) + " B");
 
@@ -1571,11 +1588,14 @@ int main()
         ok (fc_master_need (h, FC_NEED_MEASURE_LRA, 143999, &under3) == FC_OK && under3.callBytes == 0,
             "one frame under 3 s: nothing is");
         // A solve builds its meters whatever the length — the range rule is NOT the solve's. 1 s still costs
-        // meter + reference true-peak meter + two traces: 8·(300 + 24 + 10) + 21 008 + 64 000 = 87 680 B. A length the
-        // solve refuses costs 0.
+        // meter + reference true-peak meter + two traces: 8·(300 + 24 + 28) + 21 008 + 64 000 = 87 824 B, the
+        // short-term term being the one K12 moved (one sample per hop, not one per ten). A length the solve
+        // refuses costs 0. THE TOTAL IS PRINTED rather than spelled: the literal that used to close this line
+        // (727 696 B) was parameterised on one side and written out on the other, so it went on reading as a
+        // measurement after the histograms moved it.
         fc_need s1 {}, s0 {}; FC_INIT (s1); FC_INIT (s0);
-        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 87680u + kGrWindowBytes,
-            "a 1 s solve is budgeted in full: 727 696 B");
+        ok (fc_master_need (h, FC_NEED_SOLVE, 48000, &s1) == FC_OK && s1.callBytes == 87824u + kGrWindowBytes,
+            "a 1 s solve is budgeted in full: " + std::to_string (s1.callBytes) + " B");
         ok (fc_master_need (h, FC_NEED_SOLVE, 0, &s0) == FC_OK && s0.callBytes == 0,
             "a 0-frame solve, which the core refuses before any pass, costs 0");
 
