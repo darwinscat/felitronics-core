@@ -1957,7 +1957,9 @@ FC_EXPORT std::uint32_t fc_probe_excursions_crest (double* out, std::uint32_t ca
 // floor under the denominator; pass a large number for "every local maximum".
 FC_EXPORT double fc_probe_excursions_ceiling_density (double minusDb, double withinDb)
 {
-    return haveExcursions ? excursions().ceilingDensityAbove (minusDb, withinDb) : 0.0;
+    // -1.0 without a measurement, matching what the core answers for a request it cannot serve: a density
+    // lives in [0, 1] and 0.0 is a real reading, so a refusal must not wear it.
+    return haveExcursions ? excursions().ceilingDensityAbove (minusDb, withinDb) : -1.0;
 }
 FC_EXPORT double fc_probe_excursions_ceiling_maxima (void)
 {

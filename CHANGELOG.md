@@ -53,7 +53,9 @@ which is the one thing a clipper must not touch. The quantity is monotone in pha
 
 In its place, **the crest's own frequency, from its shape**: for `A·cos(ωt)` over a ceiling by `e` for a
 duration `D`, `e = A·ω²·D²/8`, so `ω = sqrt(8e/(A·D²))`. No filter, no phase, no window, gain-invariant. A
-60 Hz sine reads 59.3 Hz, a 40 Hz sine 39.6, a two-sample click 10.8 kHz. It is published per run and as a
+60 Hz sine reads 59.3 Hz, a 40 Hz sine 39.6, a two-sample click 8.40 kHz at amplitude 0.85 (11.40 kHz at
+1.0 — a click's excess grows with its amplitude while its width does not, so the figure needs the amplitude
+beside it). It is published per run and as a
 third-octave histogram of **dose**, so a consumer sweeps "is this bass" on its own corpus rather than
 receiving a boundary baked in at one frequency.
 

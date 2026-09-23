@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace
@@ -323,6 +324,112 @@ int main()
             ok (pe.reason() == PeakExcursions::Reason::NonFiniteInput && ! pe.valid(),
                 "the report refuses to call itself valid");
             ok (pe.runCount() > 0, "…while still publishing what it measured, which is the useful half");
+        }
+    }
+
+    // THE FIGURES THE HEADER AND THE RELEASE NOTE CITE, printed by the suite that owns them. The one that
+    // stood in both was 10.8 kHz, taken from another fixture and belonging to neither amplitude below: a
+    // click's excess over the ceiling grows with its amplitude while its width does not, and the formula
+    // reads e/A, so there is no single "click frequency" to quote.
+    test::group ("a click's crest frequency depends on its amplitude, so the amplitude is quoted with it");
+    {
+        const double thr = std::pow (10.0, -1.0 / 20.0);
+        for (const auto& c : { std::pair<double, double> { 0.85, 8397.9 }, std::pair<double, double> { 1.0, 11400.8 } })
+        {
+            std::vector<float> x (8192, 0.0f);
+            x[4000] = (float) c.first; x[4001] = (float) c.first;
+            PeakExcursions::Params p; p.thresholdDbtp = -1.0;
+            PeakExcursions pe; pe.setParams (p);
+            if (test::run (pe.prepare (kFs, 1)) && test::run (feed (pe, x)))
+            {
+                ok (pe.runCount() == 1, "the click is one run at amplitude " + std::to_string (c.first));
+                if (pe.runCount() == 1)
+                    approx (pe.run (0).crestHz (kFs, thr), c.second, 0.05,
+                            "…and its crest reads " + std::to_string (c.second) + " Hz");
+            }
+        }
+    }
+
+    // THE ACCESSORS THAT SHIPPED WITHOUT A TEST, and the reason they could. ceilingDensityAbove walked the
+    // histogram from bin 0 UP to the loudest populated bin — but the bins run DOWNWARD in level, so that
+    // range is the one ABOVE the maximum and is empty by construction. Numerator and denominator were both
+    // the top bin and the answer was EXACTLY 1 for every programme ever measured. Nothing here asked.
+    //
+    // THE ORACLE IS A SCALED COPY, so it does not need to know the kernel. An ISOLATED impulse reconstructs
+    // to the interpolation kernel itself; halving the impulse halves the whole reconstruction, so the two
+    // groups below contribute the SAME number of local maxima in the same shape, one group sitting exactly
+    // 20log10(2) = 6.0206 dB under the other. Whatever that count is, the share within 0.2 dB of the top is
+    // 3/(3+7) = 0.3 — an exact rational that no measurement of mine chose.
+    test::group ("the ceiling histogram: a density that is not 1");
+    {
+        constexpr int kLoud = 3, kQuiet = 7, kGap = 512;
+        std::vector<float> x ((std::size_t) ((kLoud + kQuiet + 2) * kGap), 0.0f);
+        for (int i = 0; i < kLoud + kQuiet; ++i)
+            x[(std::size_t) ((i + 1) * kGap)] = i < kLoud ? 1.0f : 0.5f;
+
+        PeakExcursions::Params p; p.thresholdDbtp = -1.0;
+        PeakExcursions pe; pe.setParams (p);
+        if (test::run (pe.prepare (kFs, 1)) && test::run (feed (pe, x)))
+        {
+            // First the fixture, because an oracle read off a fixture nobody checked is not an oracle.
+            const int top = [&] { for (int b = 0; b < PeakExcursions::kCeilingBins; ++b) if (pe.ceilingBin (b) > 0) return b; return -1; }();
+            ok (top >= 0 && pe.ceilingBin (top) == kLoud,
+                "the " + std::to_string (kLoud) + " full-scale impulses share the loudest bin (got "
+                    + std::to_string (top >= 0 ? pe.ceilingBin (top) : -1) + ")");
+            const int half = top + (int) std::floor (20.0 * std::log10 (2.0) / PeakExcursions::kCeilingBinDb);
+            std::int64_t nearHalf = 0;
+            for (int b = half - 1; b <= half + 1; ++b) nearHalf += pe.ceilingBin (b);
+            ok (nearHalf == kQuiet,
+                "the " + std::to_string (kQuiet) + " half-scale ones land 6.02 dB under it (got "
+                    + std::to_string (nearHalf) + ")");
+
+            std::int64_t sum = 0;
+            for (int b = 0; b < PeakExcursions::kCeilingBins; ++b) sum += pe.ceilingBin (b);
+            ok (sum == pe.ceilingMaxima(),
+                "every counted maximum is in a bin — no silent clamp (" + std::to_string (sum) + " vs "
+                    + std::to_string (pe.ceilingMaxima()) + ")");
+
+            // The kernel's sidelobes are the rest of the histogram; they must be well under 12 dB down, or
+            // the rational below is not the one this fixture computes.
+            ok (pe.ceilingMaxima() > kLoud + kQuiet,
+                "the kernel rings, so there ARE quieter maxima to be excluded ("
+                    + std::to_string (pe.ceilingMaxima()) + " in all)");
+
+            const double d12 = pe.ceilingDensityAbove (12.0, 0.2);
+            approx (d12, (double) kLoud / (double) (kLoud + kQuiet), 1e-12,
+                    "within 12 dB the density is exactly 3/10 (got " + std::to_string (d12) + ")");
+            ok (d12 < 1.0, "…which the old loop direction could not produce: it returned 1 for every input");
+
+            const double dAll = pe.ceilingDensity();
+            ok (dAll > 0.0 && dAll < d12,
+                "over the whole span the sidelobes enlarge the denominator (" + std::to_string (dAll)
+                    + " < " + std::to_string (d12) + ")");
+        }
+    }
+
+    // A density lives in [0, 1], so 0.0 is a LEGITIMATE reading — "nothing sits near the loudest maximum".
+    // A refusal that also answers 0.0 is therefore unreadable, which is the mistake this repeats from
+    // LowEnd::sideFractionBelow. -1.0 is outside the range and cannot be mistaken for a measurement.
+    test::group ("a request the instrument cannot serve is refused, not answered with a number in range");
+    {
+        PeakExcursions fresh;
+        ok (fresh.ceilingDensity() < 0.0, "before any measurement there is no density to report");
+        ok (fresh.ceilingMaxima() == 0, "and no maxima have been counted");
+
+        auto x = sine (kFs, 0.2, 60.0, -0.01);
+        PeakExcursions::Params p; p.thresholdDbtp = -1.0;
+        PeakExcursions pe; pe.setParams (p);
+        if (test::run (pe.prepare (kFs, 1)) && test::run (feed (pe, x)))
+        {
+            ok (pe.ceilingDensity() >= 0.0, "a measured programme does have one");
+            ok (pe.ceilingDensityAbove (-1.0, 0.2) < 0.0, "a negative span is refused");
+            ok (pe.ceilingDensityAbove (0.0, 0.2) < 0.0, "a zero span is refused");
+            ok (pe.ceilingDensityAbove (12.0, 0.0) < 0.0, "a zero window is refused");
+            ok (pe.ceilingDensityAbove (12.0, -0.2) < 0.0, "a negative window is refused");
+            // 1e9 dB is what the wasm harness passes for "every maximum". 1e9 / 0.05 is 2e10, which is not
+            // an int; converting it would be undefined, so the width is clamped before the conversion.
+            approx (pe.ceilingDensityAbove (1.0e9, 0.2), pe.ceilingDensity(), 0.0,
+                    "and a span wider than the histogram is the whole histogram, not undefined behaviour");
         }
     }
 
