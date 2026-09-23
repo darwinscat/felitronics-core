@@ -615,6 +615,12 @@ struct MasterMeasurement
     GainReductionStats compressor {};
     GainReductionStats limiter {};
     double limiterMaxReconstructedPeakDb = 0.0;   // the peak the limiter's own oversampler saw
+    // K13 — the peak clipper inside that limiter, on the same oversampled grid. `...MaxDb` above is the
+    // peak that ARRIVED, before the clip; the difference between the two is what the clipper took off.
+    double peakClipReductionMaxDb = 0.0;
+    double peakClipReductionP95Db = -1.0;         // over CLIPPED samples; -1.0 when none were
+    double peakClipOccupancy      = -1.0;         // -1.0, never 0.0, when nothing was judged
+    std::int64_t peakClipRuns = 0, peakClipRunSamplesTotal = 0, peakClipLongestRunSamples = 0;
     int    latencySamples   = 0;
     int    gatingBlocks     = 0;
     int    droppedBlocks    = 0;        // non-zero ⇒ the loudness numbers describe a PREFIX
@@ -2045,6 +2051,14 @@ private:
         // up — so on the system spelling the solver could take a different branch on Apple than on the row
         // that rendered the same file. The LINEAR peak it converts is the limiter's own, and stays RT.
         m.limiterMaxReconstructedPeakDb = core::gainToDbDet ((double) maxReconLin_);
+        // K13 — read off the chain AFTER the render, where the clipper counted them. Not tapped: these
+        // are aggregates with no coordinate, so a tap would cost a buffer and answer the same thing.
+        m.peakClipReductionMaxDb      = chain.peakClipReductionMaxDb();
+        m.peakClipReductionP95Db      = chain.peakClipReductionP95Db();
+        m.peakClipOccupancy           = chain.peakClipOccupancy();
+        m.peakClipRuns                = chain.peakClipRuns();
+        m.peakClipRunSamplesTotal     = chain.peakClipRunSamplesTotal();
+        m.peakClipLongestRunSamples   = chain.peakClipLongestRunSamples();
         return measure (out, nch, frames, m, clock);
     }
 

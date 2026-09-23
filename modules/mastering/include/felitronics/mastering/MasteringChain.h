@@ -195,6 +195,9 @@ struct MasteringChainResolved
     double compressorMix         = 0.0;
     // `TruePeakLimiter::effectiveSlowReleaseMs()`; 0 without a limiter.
     double limiterSlowReleaseMs  = 0.0;
+    // K13 — where the peak clipper inside the limiter actually cuts, ABSOLUTE in dBTP after both
+    // clamps. 0 without a limiter: the offset rides a ceiling that does not exist there.
+    double peakClipperThresholdDbTp = 0.0;
 };
 
 //==============================================================================
@@ -431,6 +434,17 @@ public:
     {
         return config.limiter ? limiter::TruePeakLimiter::oversampleFactorFor (limiterConfigFor (config)) : 1;
     }
+
+    // K13 — WHAT THE PEAK CLIPPER DID, straight through from the limiter that owns it. Not a copy of the
+    // numbers and not a second definition: the clipper acts on the limiter's oversampled grid, so these
+    // are read where they were counted. Zeroes without a limiter, which is the rule a bypassed stage
+    // already follows here — a stage that is not there reports nothing, not a hole.
+    double peakClipReductionMaxDb()   const noexcept { return cfg_.limiter ? lim_.clipReductionMaxDb() : 0.0; }
+    double peakClipReductionP95Db()   const noexcept { return cfg_.limiter ? lim_.clipReductionQuantileDb (0.95) : -1.0; }
+    double peakClipOccupancy()        const noexcept { return cfg_.limiter ? lim_.clipOccupancy() : -1.0; }
+    std::int64_t peakClipRuns()               const noexcept { return cfg_.limiter ? lim_.clipRunCount() : 0; }
+    std::int64_t peakClipRunSamplesTotal()    const noexcept { return cfg_.limiter ? lim_.clipRunOsTotal() : 0; }
+    std::int64_t peakClipLongestRunSamples()  const noexcept { return cfg_.limiter ? lim_.clipLongestRunOs() : 0; }
 
     // FALSE, with `out` untouched, exactly where prepare() refuses the same arguments — it IS prepare()'s
     // gate, and every stage's gate under it. Allocates nothing on any path.
@@ -795,6 +809,7 @@ public:
         r.monoBass            = cfg_.monoBass ? monoBass_.params() : stereo::MonoBassParams { false, 0.0f, 0.0f };
         r.compressorMix       = cfg_.compressor ? (double) compMix_ : 0.0;
         r.limiterSlowReleaseMs = cfg_.limiter ? lim_.effectiveSlowReleaseMs() : 0.0;
+        r.peakClipperThresholdDbTp = cfg_.limiter ? lim_.clipThresholdDbTp() : 0.0;
         return r;
     }
 

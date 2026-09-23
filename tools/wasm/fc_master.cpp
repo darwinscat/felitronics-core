@@ -133,11 +133,11 @@ static_assert (sizeof (dynamics::DetectorParams)       == 16);
 static_assert (sizeof (dynamics::GainReductionParams)  == 72);
 static_assert (sizeof (dynamics::CompressorParams)     == 96);
 static_assert (sizeof (saturation::Saturator::Params)  == 28);
-static_assert (sizeof (limiter::TruePeakLimiterParams) == 32);   // + dualRelease, slowReleaseMs (v6)
+static_assert (sizeof (limiter::TruePeakLimiterParams) == 56);   // + dualRelease, slowReleaseMs (v6); + peakClip, overCeilingDb, kneeDb (K13, v11)
 static_assert (sizeof (dither::DitherParams)           == 24);
 static_assert (sizeof (MasteringChainConfig)           == 48);
-static_assert (sizeof (MasteringChainParams)           == 6568);   // + compressorMix (P60) — see below
-static_assert (sizeof (MasteringChainResolved)         == 88);     // + compressorMix (P60) — see below
+static_assert (sizeof (MasteringChainParams)           == 6592);   // + compressorMix (P60), + the limiter's K13 fields (v11) — see below
+static_assert (sizeof (MasteringChainResolved)         == 96);     // + compressorMix (P60), + peakClipperThresholdDbTp (K13, v11)
 
 // THE PIN THAT WORKS THROUGH INHERITANCE. A structured binding cannot decompose a type whose base has
 // members, and `sizeof` is blind to a field that lands in existing padding — so between them the two
@@ -199,8 +199,9 @@ static_assert (! BraceInit<dynamics::CompressorParams,
     (void) c_shape; (void) c_drive; (void) c_bias; (void) c_mix; (void) c_out; (void) c_auto; (void) c_dc;
 
     limiter::TruePeakLimiterParams lim {};
-    auto& [lim_ceil, lim_rel, lim_dual, lim_slow] = lim;
+    auto& [lim_ceil, lim_rel, lim_dual, lim_slow, lim_pclip, lim_pover, lim_pknee] = lim;
     (void) lim_ceil; (void) lim_rel; (void) lim_dual; (void) lim_slow;
+    (void) lim_pclip; (void) lim_pover; (void) lim_pknee;
 
     dither::DitherParams dit {};
     auto& [dit_bits, dit_shape, dit_seed, dit_blank, dit_blankn] = dit;
@@ -222,9 +223,10 @@ static_assert (! BraceInit<dynamics::CompressorParams,
 
     MasteringChainResolved res {};
     auto& [r_lat, r_blk, r_clook, r_clip, r_lim, r_llook, r_os, r_ctap, r_ltap,
-           r_ceil, r_rel, r_mb, r_mix, r_slow] = res;
+           r_ceil, r_rel, r_mb, r_mix, r_slow, r_pclip] = res;
     (void) r_lat; (void) r_blk; (void) r_clook; (void) r_clip; (void) r_lim; (void) r_llook;
     (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb; (void) r_mix; (void) r_slow;
+    (void) r_pclip;
 }
 
 //==============================================================================
@@ -320,12 +322,12 @@ static_assert (newestRowIsSizeof<fc_solution_summary>());
 #define FC_ENDS_AT(T, last) \
     static_assert (sizeof (T) == offsetof (T, last) + sizeof (T::last), #T " ends in implicit padding — name it (rule 4)")
 FC_ENDS_AT (fc_master_config,    deliveryRate);
-FC_ENDS_AT (fc_master_params,    limiterSlowReleaseMs);
-FC_ENDS_AT (fc_master_resolved,  limiterSlowReleaseMs);
+FC_ENDS_AT (fc_master_params,    peakClipperKneeDb);
+FC_ENDS_AT (fc_master_resolved,  peakClipperThresholdDbTp);
 FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
 FC_ENDS_AT (fc_need,             _pad0);
 FC_ENDS_AT (fc_loudness_request, limiterActiveInputDb);
-FC_ENDS_AT (fc_measurement,      limiterGrTraceValid);
+FC_ENDS_AT (fc_measurement,      peakClipLongestRunSamples);
 FC_ENDS_AT (fc_solution_summary, gainAboveDb);
 FC_ENDS_AT (fc_gr_active_stats,  thresholdDb);
 // and the types the table's sizes were computed from
@@ -356,6 +358,13 @@ static_assert (std::is_same_v<decltype (fc_master_params::limiterDualRelease), i
                && std::is_same_v<decltype (fc_master_params::limiterSlowReleaseMs), double>
                && std::is_same_v<decltype (fc_master_resolved::limiterSlowReleaseMs), double>
                && std::is_same_v<decltype (fc_loudness_request::grTraceBuckets), int32_t> && std::is_same_v<decltype (fc_loudness_request::_pad0), int32_t>);
+// v11's fields by type (K13).
+static_assert (std::is_same_v<decltype (fc_master_params::peakClipper), int32_t> && std::is_same_v<decltype (fc_master_params::_pad1), int32_t>
+               && std::is_same_v<decltype (fc_master_params::peakClipperOverCeilingDb), double>
+               && std::is_same_v<decltype (fc_master_params::peakClipperKneeDb), double>
+               && std::is_same_v<decltype (fc_master_resolved::peakClipperThresholdDbTp), double>
+               && std::is_same_v<decltype (fc_measurement::peakClipReductionMaxDb), double>
+               && std::is_same_v<decltype (fc_measurement::peakClipRuns), int64_t>);
 // v8's fields by type.
 static_assert (std::is_same_v<decltype (fc_loudness_request::limiterGrQuantile), double>
                && std::is_same_v<decltype (fc_loudness_request::compressorGrQuantile), double>);
@@ -384,6 +393,9 @@ FC_AT (fc_master_params, bypassClipper, 6548); FC_AT (fc_master_params, bypassLi
 FC_AT (fc_master_params, bypassDither, 6556); FC_AT (fc_master_params, compressorMix, 6560);             // v3
 FC_AT (fc_master_params, limiterDualRelease, 6568); FC_AT (fc_master_params, _pad0, 6572);               // v6
 FC_AT (fc_master_params, limiterSlowReleaseMs, 6576);                                                     // v6
+FC_AT (fc_master_params, peakClipper, 6584); FC_AT (fc_master_params, _pad1, 6588);                       // v11
+FC_AT (fc_master_params, peakClipperOverCeilingDb, 6592);                                                 // v11
+FC_AT (fc_master_params, peakClipperKneeDb, 6600);                                                        // v11
 
 FC_AT (fc_master_resolved, header, 0);         FC_AT (fc_master_resolved, latencySamples, 8);
 FC_AT (fc_master_resolved, internalBlock, 12); FC_AT (fc_master_resolved, compressorLookahead, 16);
@@ -394,6 +406,7 @@ FC_AT (fc_master_resolved, limiterCeilingDbTp, 48); FC_AT (fc_master_resolved, l
 FC_AT (fc_master_resolved, monoBass, 64);      FC_AT (fc_master_resolved, tapOversampleFactor, 76);
 FC_AT (fc_master_resolved, compressorMix, 80);                                                              // v3
 FC_AT (fc_master_resolved, limiterSlowReleaseMs, 88);                                                       // v6
+FC_AT (fc_master_resolved, peakClipperThresholdDbTp, 96);                                                   // v11
 
 FC_AT (fc_master_stats, header, 0);            FC_AT (fc_master_stats, framesIn, 8);
 FC_AT (fc_master_stats, framesFlushed, 16);    FC_AT (fc_master_stats, nonFiniteIn, 24);
@@ -417,6 +430,9 @@ FC_AT (fc_measurement, truePeakDbTp, 16);      FC_AT (fc_measurement, samplePeak
 FC_AT (fc_measurement, loudnessRangeLu, 32);   FC_AT (fc_measurement, plrDb, 40);
 FC_AT (fc_measurement, compressor, 48);        FC_AT (fc_measurement, limiter, 112);
 FC_AT (fc_measurement, limiterMaxReconstructedPeakDb, 176); FC_AT (fc_measurement, latencySamples, 184);
+FC_AT (fc_measurement, peakClipReductionMaxDb, 224);  FC_AT (fc_measurement, peakClipReductionP95Db, 232);  // v11
+FC_AT (fc_measurement, peakClipOccupancy, 240);       FC_AT (fc_measurement, peakClipRuns, 248);            // v11
+FC_AT (fc_measurement, peakClipRunSamplesTotal, 256); FC_AT (fc_measurement, peakClipLongestRunSamples, 264);
 FC_AT (fc_measurement, gatingBlocks, 188);     FC_AT (fc_measurement, droppedBlocks, 192);
 FC_AT (fc_measurement, nonFiniteSubHops, 196); FC_AT (fc_measurement, loudnessValid, 200);
 FC_AT (fc_measurement, lraValid, 204);
@@ -743,6 +759,13 @@ fc_status toCore (const fc_master_params& p, MasteringChainParams& out) noexcept
     if (! fin (p.limiterSlowReleaseMs)) return FC_ERR_NON_FINITE;
     out.limiter.dualRelease   = p.limiterDualRelease != 0;
     out.limiter.slowReleaseMs = p.limiterSlowReleaseMs;
+    // v11 — K13. Refused non-finite rather than mapped, as every double here is: the core would clamp a
+    // NaN to its default without a word, and a caller that sent one would read back a number it never
+    // asked for. The RANGES are clamped by the core and read back through resolved.
+    if (! fin (p.peakClipperOverCeilingDb) || ! fin (p.peakClipperKneeDb)) return FC_ERR_NON_FINITE;
+    out.limiter.peakClip      = p.peakClipper != 0;
+    out.limiter.overCeilingDb = p.peakClipperOverCeilingDb;
+    out.limiter.kneeDb        = p.peakClipperKneeDb;
 
     if (! mapShaping (p.dither.shaping, out.dither.shaping)) return FC_ERR_ENUM;
     out.dither.bits             = p.dither.bits;
@@ -821,6 +844,7 @@ void fromCore (const MasteringChainResolved& r, int tapOs, fc_master_resolved& o
     out.tapOversampleFactor = tapOs;
     out.compressorMix       = r.compressorMix;          // v3
     out.limiterSlowReleaseMs = r.limiterSlowReleaseMs;  // v6
+    out.peakClipperThresholdDbTp = r.peakClipperThresholdDbTp;   // v11
 }
 
 void fromCore (const GainReductionStats& s, fc_gr_stats& out) noexcept
@@ -841,6 +865,12 @@ void fromCore (const MasterMeasurement& m, fc_measurement& out) noexcept
     fromCore (m.compressor, out.compressor);
     fromCore (m.limiter,    out.limiter);
     out.limiterMaxReconstructedPeakDb = m.limiterMaxReconstructedPeakDb;
+    out.peakClipReductionMaxDb     = m.peakClipReductionMaxDb;       // v11
+    out.peakClipReductionP95Db     = m.peakClipReductionP95Db;
+    out.peakClipOccupancy          = m.peakClipOccupancy;
+    out.peakClipRuns               = m.peakClipRuns;
+    out.peakClipRunSamplesTotal    = m.peakClipRunSamplesTotal;
+    out.peakClipLongestRunSamples  = m.peakClipLongestRunSamples;
     out.latencySamples   = m.latencySamples;
     out.gatingBlocks     = m.gatingBlocks;
     out.droppedBlocks    = m.droppedBlocks;
@@ -2268,6 +2298,10 @@ void writeDefaults (fc_master_params& o) noexcept
     out->compressorMix    = d.compressorMix;            // v3: 1, the chain before the field existed
     out->limiterDualRelease   = d.limiter.dualRelease ? 1 : 0;   // v6
     out->limiterSlowReleaseMs = d.limiter.slowReleaseMs;
+    out->peakClipper              = d.limiter.peakClip ? 1 : 0;      // v11 — 0, so a v10 set renders as it did
+    out->_pad1                    = 0;
+    out->peakClipperOverCeilingDb = d.limiter.overCeilingDb;
+    out->peakClipperKneeDb        = d.limiter.kneeDb;
 }
 
 void writeDefaults (fc_loudness_request& o) noexcept

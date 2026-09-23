@@ -108,6 +108,30 @@ struct TruePeakLimiterParams
     // the slow envelope and its windows from 0 dB; switching off continues the fast envelope from the reduction applied.
     bool   dualRelease   = false;
     double slowReleaseMs = 200.0;    // ms; floored like `releaseMs`
+
+    // ==================================================================================
+    // K13 — THE PEAK CLIPPER, AND IT LIVES INSIDE THIS LIMITER'S OVERSAMPLING ISLAND.
+    // ==================================================================================
+    // Not a chain stage. The island already carries the AUDIO (upsample -> act -> downsample, the
+    // "Option B" above), so a clip placed between the upsampler and the detector costs NOTHING: no
+    // second round trip, no extra latency, no PDC field anywhere moves, and with `peakClip` off the
+    // loop runs the instructions it ran before — bit-identical, which is the whole point of the
+    // switch. A separate stage would have cost a third round trip, 63 samples and, at 44.1 kHz,
+    // -15.55 dB at 20 kHz (oversampling::Oversampler's own figure) paid even when nothing clipped.
+    //
+    // WHAT IT IS FOR. The limiter's gain has an instant attack but a finite release, so one short
+    // needle holds reduction for the whole release. Shaving the needle's top on the same grid the
+    // limiter measures on leaves the limiter less to do and for less time. `overCeilingDb` is where
+    // the shaving starts, ABOVE the ceiling: at 0 the clipper does the limiter's job with no release
+    // at all, at 3 it only touches what is far over.
+    //
+    // CHANNEL-LINKED, like everything else here: one gain for all channels on that oversampled
+    // sample. Clipping each channel on its own would satisfy the same bound and move the stereo
+    // image on exactly the samples a listener notices; and linked makes the post-clip linked peak
+    // exactly q(peak) by construction rather than by an argument about monotonicity.
+    bool   peakClip       = false;   // OFF by default: an old parameter set must render as it did
+    double overCeilingDb  = 1.0;     // where clipping starts, in dB ABOVE ceilingDbTp; [0, kMaxOverCeilingDb]
+    double kneeDb         = 0.0;     // [0, kMaxKneeDb]; 0 is an exact hard clip
 };
 
 //==============================================================================
@@ -497,6 +521,9 @@ public:
         slowFill_ = 0;
         grSlowDb  = 0.0f;
         grDb = 0.0f;
+        clipOsSamples_ = clipOsTotal_ = clipRuns_ = clipRunOs_ = clipLongestOs_ = clipOpenOs_ = 0;
+        clipMaxRedDb_  = 0.0f;
+        for (auto& h : clipRedHist_) h = 0;
         linkedPeakLin_ = 0.0f;                                 // a free-running maximum SINCE RESET, like
                                                                // TruePeakMeter's — so it means "this stream"
         lastNc_ = 0;
@@ -534,6 +561,74 @@ public:
     int    lookaheadSamples()  const noexcept { return prepared_ ? lookBaseband : 0; }
     double effectiveReleaseMs()   const noexcept { return relMsEffective; }
     double effectiveCeilingDbTp() const noexcept { return ceilingDb; }
+
+    // K13 — THE RANGES, PUBLIC because they are the contract: a caller that cannot read the clamp
+    // cannot tell a value it chose from a value it was given. `overCeilingDb` is a WORKING range, not a
+    // safety clamp — above ~3 dB a clipper stops being a needle tool and the knee's alias benefit is
+    // gone by 6, so 12 is generous rather than meaningful. The knee stops at 1 dB because that is where
+    // it stops buying anything: a 1 dB knee is worth 12-13 dB of alias rejection while the excess is
+    // inside it, and under 1 dB once the plateau dominates.
+    static constexpr double kMaxOverCeilingDb = 12.0;
+    static constexpr double kMaxKneeDb        =  1.0;
+    // The reduction histogram: 0.1 dB up to 12.8 dB, everything deeper in the last bin. A quantile over
+    // CLIPPED SAMPLES — a different question from K11's window quantiles, and it must be read as such.
+    //
+    // SIZED AGAINST THE OBJECT, NOT AGAINST THE IDEAL. This array is carried by EVERY limiter, the ones
+    // that never turn the clipper on included, and the object is 744 bytes without it. At 0.05 dB it
+    // would be 2 KiB and would nearly quadruple that — the tax a by-value option levied on the Saturator
+    // once. Moving it into prepare()'s allocation would have fixed the size and put a new field into a
+    // law-11d budget that tests and the cross-tier table pin; 0.1 dB is finer than anyone reads a clip
+    // depth and costs 1 KiB, so the resolution pays for itself and the plumbing does not.
+    static constexpr int    kClipRedBins  = 128;
+    static constexpr double kClipRedBinDb = 0.1;
+
+    // ==============================================================================================
+    // K13 — WHAT THE CLIPPER DID. All of it on the oversampled grid, because that is where it acted.
+    // ==============================================================================================
+    // WHAT IS PROMISED AND WHAT IS NOT. Promised, and it is algebra: every sample on this limiter's
+    // own F x fs grid leaves the clip with magnitude <= the level `clipThresholdDbTp()` reports. NOT
+    // promised: that the DELIVERED file's true peak is under it. A hard-clipped sine comes back, after
+    // the downsampler re-band-limits it, as its own fundamental ABOVE the clip level — the limit is
+    // 4/pi = +2.10 dB, the square wave's first Fourier coefficient, and no oversampling factor touches
+    // it. That is exactly the gap the header's WHAT IT DOES NOT PROMISE section already describes for
+    // the limiter, and the clipper inherits it rather than adding a new one. The number that settles
+    // it on any given programme is the meter on the output, not a table.
+    bool   peakClipActive()      const noexcept { return clipOn_; }
+    double clipThresholdDbTp()   const noexcept { return clipThresholdDb_; }
+    double clipReductionMaxDb()  const noexcept { return (double) clipMaxRedDb_; }
+    std::int64_t clipOsSamples() const noexcept { return clipOsSamples_; }   // oversampled samples reduced
+    std::int64_t clipOsTotal()   const noexcept { return clipOsTotal_; }     // …of this many judged
+    std::int64_t clipRunCount()  const noexcept { return clipRuns_; }
+    std::int64_t clipRunOsTotal()   const noexcept { return clipRunOs_; }
+    std::int64_t clipLongestRunOs() const noexcept { return clipLongestOs_; }
+    // The share of judged samples the clipper touched — K10's `occupancy`, on this grid. -1.0, never
+    // 0.0, when nothing has been judged: 0.0 is a legitimate reading (a programme that never reached
+    // the clip level) and a refusal must not wear a value the caller can act on.
+    double clipOccupancy() const noexcept
+    {
+        return clipOsTotal_ > 0 ? (double) clipOsSamples_ / (double) clipOsTotal_ : -1.0;
+    }
+    // A quantile of the REDUCTION, over the clipped samples only — not over windows, and not over the
+    // programme. Read it that way: "of the samples this clipper touched, 95 % were pulled down by no
+    // more than X dB". Resolution is kClipRedBinDb and the answer is the bin's UPPER edge, so it never
+    // under-reports. -1.0 when nothing was clipped, and for a quantile outside [0, 1].
+    double clipReductionQuantileDb (double q) const noexcept
+    {
+        if (! (q >= 0.0) || ! (q <= 1.0) || clipOsSamples_ <= 0) return -1.0;
+        const std::int64_t want = (std::int64_t) std::ceil (q * (double) clipOsSamples_);
+        std::int64_t seen = 0;
+        for (int b = 0; b < kClipRedBins; ++b)
+        {
+            seen += clipRedHist_[(std::size_t) b];
+            if (seen >= want || seen == clipOsSamples_)
+                return (double) (b + 1) * kClipRedBinDb;
+        }
+        return (double) kClipRedBins * kClipRedBinDb;
+    }
+    std::int64_t clipReductionBin (int b) const noexcept
+    {
+        return b >= 0 && b < kClipRedBins ? clipRedHist_[(std::size_t) b] : 0;
+    }
     // The slow release in ms after the floor; 0 while `dualRelease` is off.
     double effectiveSlowReleaseMs() const noexcept { return dual_ ? slowMsEffective : 0.0; }
 
@@ -651,6 +746,61 @@ private:
             if (linkedPeakLin_ < linkedPeak) linkedPeakLin_ = linkedPeak;
             if (tap.linkedPeakLin != nullptr) tap.linkedPeakLin[(std::size_t) i] = linkedPeak;
 
+            // ==========================================================================================
+            // K13 — THE CLIP, AND IT SITS EXACTLY HERE FOR A REASON.
+            // ==========================================================================================
+            // AFTER the two lines above, which are the report of what ARRIVED: `linkedPeakLin_` feeds
+            // maxReconstructedPeakDb(), documented as "the reconstructed peak the limiter saw". Clip
+            // before them and that field silently reports the CLIPPED value — still plausible, still
+            // under the ceiling, and indistinguishable from the truth to every test that only asks
+            // whether it is in range. A consumer would read "+0.0 dBTP arrived" on a programme that
+            // arrived at +2.5.
+            //
+            // BEFORE `slide.push`, because the detector must see what will actually be scaled: the
+            // limiter's whole bound is the algebra "every emitted sample is inside its own detector
+            // window", and handing the window an unclipped peak while scaling a clipped sample breaks
+            // that identity — the limiter would reduce for a needle that is no longer there.
+            //
+            // ONE LINKED GAIN, not a per-channel clamp. Both satisfy `|sample| <= T`; the per-channel
+            // version squashes the loud channel alone and moves the stereo image on exactly the samples
+            // a listener is most sensitive to. Linked also makes the post-clip linked peak EXACTLY
+            // q(linkedPeak) by construction, rather than by an argument about q being monotone.
+            if (clipOn_)
+            {
+                ++clipOsTotal_;
+                const float q = clipMag (linkedPeak);
+                if (q < linkedPeak)
+                {
+                    const float g = q / linkedPeak;            // linkedPeak > q >= 0, so it is finite
+                    for (int c = 0; c < nc; ++c) osBuf[(std::size_t) c][(std::size_t) i] *= g;
+
+                    ++clipOsSamples_;
+                    ++clipRunOs_;
+                    if (clipOpenOs_ == 0) ++clipRuns_;
+                    ++clipOpenOs_;
+                    if (clipOpenOs_ > clipLongestOs_) clipLongestOs_ = clipOpenOs_;
+
+                    // THE DETERMINISTIC SPELLING, and only here. The gain above is pure arithmetic and the
+                    // limiter's own `gainToDb (smax)` stays as it is; this one feeds a number that CROSSES
+                    // THE ABI and is read as a finding, and an ulp of difference between two libms moves a
+                    // sample into the neighbouring histogram bin — which moves the published p95 by a whole
+                    // 0.1 dB between macOS and wasm. `gainToDbDet` is 4.6x the system call and it is paid on
+                    // CLIPPED samples only; the plateau case needs one call rather than two, because
+                    // `clipThresholdDb_` already is the level in dB.
+                    const double peakDb = core::gainToDbDet ((double) linkedPeak);
+                    const float  red    = (float) (q >= clipT_ ? peakDb - clipThresholdDb_
+                                                               : peakDb - core::gainToDbDet ((double) q));
+                    if (red > clipMaxRedDb_) clipMaxRedDb_ = red;
+                    int b = (int) (red / (float) kClipRedBinDb);
+                    if (b < 0) b = 0;
+                    if (b >= kClipRedBins) b = kClipRedBins - 1;   // deeper than the table: the last bin
+                    ++clipRedHist_[(std::size_t) b];
+
+                    linkedPeak = q;
+                }
+                else clipOpenOs_ = 0;                          // the run, if one was open, ends here
+            }
+
             const float  smax    = slide.push (linkedPeak);
             const double smaxDb  = core::gainToDb (smax);
             double rawRedDb = ceilingDb - smaxDb;
@@ -712,6 +862,56 @@ private:
         if (p.dualRelease && ! dual_)       { slowWin.reset(); bridgeWin.reset(); slowFill_ = 0; grSlowDb = 0.0f; }
         else if (! p.dualRelease && dual_)  grDb = std::min (grDb, grSlowDb);
         dual_ = p.dualRelease;
+
+        // K13. The clip level RIDES THE CEILING — it is an offset, not an absolute, so a caller sweeping
+        // the ceiling does not have to move a second number in step with it and cannot leave the clipper
+        // below the thing it is protecting. Non-finite falls back to the default, as every parameter here
+        // does; the ranges are clamped and the RESULT is published, so a caller can see what it got.
+        clipOn_ = p.peakClip;
+        const double over = std::clamp (std::isfinite (p.overCeilingDb) ? p.overCeilingDb : 1.0,
+                                        0.0, kMaxOverCeilingDb);
+        const double knee = std::clamp (std::isfinite (p.kneeDb) ? p.kneeDb : 0.0, 0.0, kMaxKneeDb);
+        clipThresholdDb_ = ceilingDb + over;
+        const double T   = core::dbToGain (clipThresholdDb_);
+        const double W   = T * (1.0 - core::dbToGain (-knee));
+        clipT_ = (float) T;
+        // THE WIDTH IS READ BACK OUT OF THE FLOAT, not carried in double: a knee small enough to vanish
+        // in the cast must take the hard branch rather than divide by a zero it does not know it has.
+        clipW_ = (float) W;
+        clipInv4W_ = clipW_ > 0.0f ? 0.25f / clipW_ : 0.0f;
+    }
+
+    // K13 — THE KNEE, in the LINEAR domain, on a MAGNITUDE. With T the clip level and
+    // W = T*(1 - 10^(-kneeDb/20)) the half-width:
+    //
+    //     a <= T - W          : a                       (identity)
+    //     T - W < a < T + W   : a - (a - (T-W))^2/(4W)  (quadratic)
+    //     a >= T + W          : T                       (plateau)
+    //
+    // Derived to be C1 at BOTH joins, which is the whole reason for the parameter: q(T-W) = T-W and
+    // q'(T-W) = 1; q(T+W) = T+W - (2W)^2/(4W) = T and q'(T+W) = 0. On the knee q' = 1 - (a-(T-W))/(2W),
+    // which lies in [0, 1], so the curve is monotone and never has gain above 1. A hard clip cannot also
+    // be C1 at its corner, so kneeDb = 0 takes the plain branch and is an EXACT clamp.
+    //
+    // Why C1 is worth a parameter at all: a hard clip leaves a first-derivative corner and its harmonics
+    // fall off like 1/n^2; this leaves a second-derivative corner and they fall off like 1/n^3. That is
+    // real alias rejection while the excess is inside the knee, and nothing once the plateau dominates —
+    // which is why the knee stops at 1 dB.
+    //
+    // THE FINAL min IS NOT DECORATION. `a - t*t*inv4W` can land one ulp above T in float, and the only
+    // thing this stage actually promises — every sample on this grid is <= T — is a bit-exact claim.
+    float clipMag (float a) const noexcept
+    {
+        if (clipW_ > 0.0f)
+        {
+            const float lo = clipT_ - clipW_;
+            if (a <= lo) return a;
+            if (a >= clipT_ + clipW_) return clipT_;
+            const float t = a - lo;
+            const float y = a - t * t * clipInv4W_;
+            return y < clipT_ ? y : clipT_;
+        }
+        return a < clipT_ ? a : clipT_;
     }
 
     // A release in ms: its coefficient per OVERSAMPLED sample, and the release in ms that coefficient runs.
@@ -754,6 +954,17 @@ private:
     float  relCoef = 0.0f, grDb = 0.0f;
     float  relCoefSlow = 0.0f, grSlowDb = 0.0f;
     float  linkedPeakLin_ = 0.0f;               // free-running max of the reconstructed linked peak
+
+    // K13 — the clipper's own state. `clipOn_` gates every instruction of it, so an off clipper is the
+    // previous loop exactly. The three thresholds are precomputed in apply(): below `clipLo_` nothing
+    // happens, above `clipHi_` the magnitude is `clipT_`, and between them the quadratic knee runs.
+    bool   clipOn_   = false;
+    float  clipT_    = 1.0f, clipW_ = 0.0f, clipInv4W_ = 0.0f;
+    double clipThresholdDb_ = 0.0;              // the absolute dBTP the clip acts at, AFTER clamping
+    std::int64_t clipOsSamples_ = 0, clipOsTotal_ = 0, clipRuns_ = 0, clipRunOs_ = 0, clipLongestOs_ = 0;
+    std::int64_t clipOpenOs_ = 0;               // length of the run currently open, 0 when none is
+    float  clipMaxRedDb_ = 0.0f;
+    std::int64_t clipRedHist_[kClipRedBins] {};
 };
 
 } // namespace felitronics::limiter

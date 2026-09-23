@@ -80,7 +80,9 @@ const std::uint64_t kGrWindowBytes =
 // What a `LoudnessSolution` costs BESIDES the parts spelled out at its check: the passes' log, the measurement,
 // the verdict fields. Named so that the parts that DO move — the traces, the histograms, K11's gated summary —
 // are added one by one and a change to any of them names itself instead of being absorbed into a total.
-constexpr std::uint64_t kSolutionRecordRest = 2368u;
+// K13 (v11) took it from 2368 to 2416: the measurement gained three doubles and three int64s for what
+// the peak clipper did. Exactly 48 bytes, and the pin is here so that a growth nobody meant names itself.
+constexpr std::uint64_t kSolutionRecordRest = 2416u;
 
 // The topology axis of the P41 create/configure matrix — see the switch that reads it.
 constexpr int kTopologies = 9;
@@ -1897,11 +1899,12 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 10u, "PRECONDITION: this group is written for v10 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+        ok (kCur == 11u, "PRECONDITION: this group is written for v11 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
                          "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
                          "v7: fc_master_eq_curve, no struct grew; v8: the request's two quantiles and "
                          "fc_solution_gr_quantile; v9: fc_master_eq_dyn_times, no struct grew; v10: K11 — the request's "
-                         "limiter input gate, fc_gr_active_stats and fc_solution_gr_active_stats)");
+                         "limiter input gate, fc_gr_active_stats and fc_solution_gr_active_stats; v11: K13 — the peak "
+                         "clipper inside the limiter, params/resolved/measurement grew)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u

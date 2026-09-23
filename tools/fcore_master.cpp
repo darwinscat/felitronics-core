@@ -282,6 +282,10 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "lim.release") { FC_D (a.prm.limiter.releaseMs = d); }
     if (key == "lim.dual")    return parseBool (val, a.prm.limiterDualRelease);
     if (key == "lim.slowRelease") { FC_D (a.prm.limiterSlowReleaseMs = d); }
+    // K13 — the peak clipper inside the limiter's island. `over` is dB ABOVE the ceiling, not a level.
+    if (key == "lim.peakClip")     return parseBool (val, a.prm.peakClipper);
+    if (key == "lim.clipOver")     { FC_D (a.prm.peakClipperOverCeilingDb = d); }
+    if (key == "lim.clipKnee")     { FC_D (a.prm.peakClipperKneeDb = d); }
 
     if (key == "dith.bits")    { FC_I (a.prm.dither.bits = i); }
     if (key == "dith.shaping") return parseEnumName (val, kShap, 3, a.prm.dither.shaping);
@@ -560,6 +564,9 @@ void mirror (const Args& a, MasteringChainConfig& cc, MasteringChainParams& cp)
     cp.limiter.releaseMs = a.prm.limiter.releaseMs;
     cp.limiter.dualRelease = a.prm.limiterDualRelease != 0;
     cp.limiter.slowReleaseMs = a.prm.limiterSlowReleaseMs;
+    cp.limiter.peakClip      = a.prm.peakClipper != 0;
+    cp.limiter.overCeilingDb = a.prm.peakClipperOverCeilingDb;
+    cp.limiter.kneeDb        = a.prm.peakClipperKneeDb;
     cp.dither.bits = a.prm.dither.bits;
     cp.dither.shaping = (dither::NoiseShaping) a.prm.dither.shaping;
     cp.dither.seed = ((std::uint64_t) a.prm.dither.seedHi << 32) | (std::uint64_t) a.prm.dither.seedLo;
@@ -672,6 +679,8 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_params, bypassClipper) X (fc_master_params, bypassLimiter) X (fc_master_params, bypassDither)     \
     X (fc_master_params, compressorMix) X (fc_master_params, limiterDualRelease) X (fc_master_params, _pad0)       \
     X (fc_master_params, limiterSlowReleaseMs)                                                                     \
+    X (fc_master_params, peakClipper) X (fc_master_params, _pad1)                                                  \
+    X (fc_master_params, peakClipperOverCeilingDb) X (fc_master_params, peakClipperKneeDb)                         \
     X (fc_master_resolved, header) X (fc_master_resolved, latencySamples) X (fc_master_resolved, internalBlock)    \
     X (fc_master_resolved, compressorLookahead) X (fc_master_resolved, clipperLatency)                             \
     X (fc_master_resolved, limiterLatency) X (fc_master_resolved, limiterLookahead)                                \
@@ -679,7 +688,7 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_resolved, limiterTapOffset) X (fc_master_resolved, limiterCeilingDbTp)                            \
     X (fc_master_resolved, limiterReleaseMs) X (fc_master_resolved, monoBass)                                      \
     X (fc_master_resolved, tapOversampleFactor) X (fc_master_resolved, compressorMix)                              \
-    X (fc_master_resolved, limiterSlowReleaseMs)                                                                   \
+    X (fc_master_resolved, limiterSlowReleaseMs) X (fc_master_resolved, peakClipperThresholdDbTp)                  \
     X (fc_master_stats, header) X (fc_master_stats, framesIn) X (fc_master_stats, framesFlushed)                   \
     X (fc_master_stats, nonFiniteIn)                                                                               \
     X (fc_need, header) X (fc_need, callBytes) X (fc_need, solverPrepareBytes) X (fc_need, facadeBytes)            \
@@ -707,6 +716,9 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_measurement, nonFiniteSubHops) X (fc_measurement, loudnessValid) X (fc_measurement, lraValid)            \
     X (fc_measurement, compressorGrTraceBuckets) X (fc_measurement, limiterGrTraceBuckets)                         \
     X (fc_measurement, compressorGrTraceValid) X (fc_measurement, limiterGrTraceValid)                             \
+    X (fc_measurement, peakClipReductionMaxDb) X (fc_measurement, peakClipReductionP95Db)                          \
+    X (fc_measurement, peakClipOccupancy) X (fc_measurement, peakClipRuns)                                         \
+    X (fc_measurement, peakClipRunSamplesTotal) X (fc_measurement, peakClipLongestRunSamples)                      \
     X (fc_gr_trace_bucket, maxDb) X (fc_gr_trace_bucket, meanDb) X (fc_gr_trace_bucket, samples)                   \
     X (fc_gr_trace_bucket, nonFinite)                                                                              \
     X (fc_gr_trace_bucket64, maxDb) X (fc_gr_trace_bucket64, meanDb) X (fc_gr_trace_bucket64, samples)             \
@@ -979,6 +991,9 @@ int selftest (double fs, int nc)
     // v6
     a.prm.limiterDualRelease     = 1;
     a.prm.limiterSlowReleaseMs   = 173.7;
+    a.prm.peakClipper              = 1;
+    a.prm.peakClipperOverCeilingDb = 1.7;
+    a.prm.peakClipperKneeDb        = 0.4;
     a.req.grTraceBuckets         = 4099;
     // v8, off their defaults like every other field, and the statistics moved with them so the numbers are read
     // rather than merely carried.
@@ -1134,7 +1149,13 @@ int selftest (double fs, int nc)
             return abiRender (x, held, frames, nc, viaAbiX, rx) && directRender (x, held, frames, nc, viaCppX);
         };
         std::vector<float> dAbi, dCpp, offAbi, offCpp, slowAbi, slowCpp, v5Abi, v5Cpp;
+        // EVERY field past the stamped size, not just v6's: a v5 caller cannot reach v11's clipper either,
+        // so the baseline it is compared against must hold the clipper at ITS defaults too. Written out
+        // rather than left at the fixture's values — the fixture deliberately turns the clipper ON.
         Args off = b;  off.prm.limiterDualRelease = 0;
+        off.prm.peakClipper = 0;
+        off.prm.peakClipperOverCeilingDb = felitronics::limiter::TruePeakLimiterParams {}.overCeilingDb;
+        off.prm.peakClipperKneeDb        = felitronics::limiter::TruePeakLimiterParams {}.kneeDb;
         Args slow = b; slow.prm.limiterSlowReleaseMs = 200.0;
         Args v5 = b;   v5.prm.header.abiVersion = 5u; v5.prm.header.structSize = 6568u;
         const bool ran = render (b, dAbi, dCpp) && render (off, offAbi, offCpp) && render (slow, slowAbi, slowCpp)
@@ -1279,6 +1300,9 @@ int selftest (double fs, int nc)
         prev.cfg.deliveryRate = 0.0;
         prev.prm.compressorMix = 1.0;
         prev.prm.limiterDualRelease = 0;
+        prev.prm.peakClipper = 0;                                              // v11
+        prev.prm.peakClipperOverCeilingDb = felitronics::limiter::TruePeakLimiterParams {}.overCeilingDb;
+        prev.prm.peakClipperKneeDb        = felitronics::limiter::TruePeakLimiterParams {}.kneeDb;
         std::vector<float> viaPrev, viaPrevCpp; fc_master_resolved rp {};
         const bool ranPrev = abiRender (prev, in, frames, nc, viaPrev, rp) && directRender (prev, in, frames, nc, viaPrevCpp);
         double wp = 0.0;
