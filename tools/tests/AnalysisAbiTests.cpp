@@ -106,6 +106,7 @@ extern "C"
     std::uint32_t fc_probe_lowend_bands    (double*, std::uint32_t);
     std::uint32_t fc_probe_lowend_note_name (char*, std::uint32_t);
     std::uint32_t fc_probe_lowend_band_stride (void);
+    std::uint32_t fc_probe_lowend_scalars_len (void);
 
     // P81 — the price of a measurement, asked before it is paid. Geometry only: no audio pointer, because
     // the whole use is to ask BEFORE the input buffer exists.
@@ -978,6 +979,8 @@ int main (int argc, char** argv)
     // that read the subject's own stride would move with a stride bug instead of catching it. Checking it
     // makes the spelling survive: it was 11 until K9 widened the band row to 13, and the only symptom was
     // this truncation check quietly measuring a 46-row buffer at the wrong width and expecting 38.
+    ok (fc_probe_lowend_scalars_len() == 68, "lowend publishes 68 scalars, and the module agrees ("
+        + std::to_string (fc_probe_lowend_scalars_len()) + ")");
     ok (fc_probe_lowend_band_stride() == 13, "the band row is 13 doubles, and the module agrees ("
         + std::to_string (fc_probe_lowend_band_stride()) + ")");
     hammer (fc_probe_lowend_bands,   "lowend_bands",   13);

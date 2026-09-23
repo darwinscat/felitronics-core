@@ -763,6 +763,7 @@ int main (int argc, char** argv)
         std::printf ("resolved first %d above %016llx lobebins %d\n",
                      le.firstResolvedBand(), (unsigned long long) bits (le.resolvedAboveHz()),
                      analysis::LowEnd::lobeBins());
+        std::printf ("infralow %016llx\n", (unsigned long long) bits (le.infraLowShare()));
         std::printf ("duty frames %lld thresholddb %016llx skipped %lld asked %d\n",
                      (long long) le.dutyFrames(), (unsigned long long) bits (le.dutyThresholdDb()),
                      (long long) le.skippedBlocks(), lp.skipBlocks);

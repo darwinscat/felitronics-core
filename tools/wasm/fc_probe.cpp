@@ -1299,7 +1299,7 @@ namespace
     // One definition, two roads — see kReportParams above.
     constexpr felitronics::analysis::LowEndParams kLeParams {};
 
-    constexpr std::uint32_t kLeScalars     = 67;
+    constexpr std::uint32_t kLeScalars     = 68;
     constexpr std::uint32_t kLeSeriesStride = 6;
     constexpr std::uint32_t kLeBandStride   = 13;
     constexpr std::uint32_t kLeLowestFields = 7;
@@ -1410,6 +1410,9 @@ FC_EXPORT std::uint32_t fc_probe_lowend_scalars (double* out, std::uint32_t cap)
     out[i++] = (double) felitronics::analysis::LowEnd::lobeBins();
     out[i++] = (double) d.dutyFrames();         out[i++] = d.dutyThresholdDb();
     out[i++] = (double) d.skippedBlocks();      out[i++] = (double) lp.skipBlocks;
+    // The low band's share of the whole programme, named rather than left to be recomposed — see the
+    // core's note: it is LR4-weighted, and content at the crossover counts at a quarter.
+    out[i++] = d.infraLowShare();
     return i;
 }
 

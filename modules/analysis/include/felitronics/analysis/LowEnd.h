@@ -635,6 +635,38 @@ public:
     // S/(M+S) of the low band over the whole programme: the ENERGY-WEIGHTED answer. 0 for mono; 0 for
     // silence too, which is why widthReason() and not this number tells the two apart.
     double lowSideFraction() const noexcept { const double t = sum (0) + sum (1); return t > 0.0 ? sum (1) / t : 0.0; }
+
+    // THE LOW BAND'S SHARE OF THE WHOLE PROGRAMME — (lowMid + lowSide) / (rawMid + rawSide). All four are
+    // published already and the division is trivial; it is named here so that a caller neither recomposes
+    // it from four scalars nor, far more likely, forgets what the numerator actually contains.
+    //
+    // IT IS NOT "THE ENERGY BELOW crossoverHz", AND THE DIFFERENCE IS LARGE ENOUGH TO INVERT A DECISION.
+    // The low band is an LR4, not a brick wall, so this is the true share WEIGHTED BY THAT FILTER'S POWER
+    // RESPONSE — and a fourth-order low-pass is -6 dB in power at its own corner, so content AT the
+    // crossover counts at a QUARTER. Measured against a fixture whose share is exact by construction (a
+    // sine of amplitude a carries a^2/2, so 3.000 % is arithmetic rather than a measurement), at 48 kHz
+    // with fc = 30 Hz, and agreeing with the analytic response to four decimals at every row:
+    //
+    //     f / fc     0.17   0.33   0.40   0.60   0.67   0.83   1.00   1.33   2.00
+    //     counted   0.998  0.976  0.950  0.784  0.697  0.455  0.250  0.058  0.0035
+    //
+    // The ratios are in units of fc and hold at any crossover: the response depends on f/fc alone this far
+    // below Nyquist. So a real 3 % of infra energy reads as 2.85 % if it sits at 12 Hz and as 0.75 % if it
+    // sits at 30 — the same physical fact, four times apart. A threshold carried over from a different
+    // definition of "infra-low" will be wrong; one calibrated on real material against THIS number will
+    // not, because the number is stable to four decimals against its own analytic form.
+    //
+    // WHAT IT IS FOR, now that the band table reaches 20 Hz: the table answers 20..300 Hz per semitone,
+    // with duty and levelWhenOnDb, so the octave from E0 to B0 needs no filter at all. This ratio is the
+    // right instrument for what the table CANNOT see — strictly below lowNoteHz — and the two together say
+    // more than either alone: a share from the filter, and named notes with their occupancy from the bands.
+    //
+    // 0.0 for the 0/0 of a silent or unmeasured programme, like every other fraction here.
+    double infraLowShare() const noexcept
+    {
+        const double lo = sum (0) + sum (1), raw = sum (4) + sum (5);
+        return raw > 0.0 ? lo / raw : 0.0;
+    }
     double highSideFraction() const noexcept { const double t = sum (2) + sum (3); return t > 0.0 ? sum (3) / t : 0.0; }
     double rawSideFraction() const noexcept { const double t = sum (4) + sum (5); return t > 0.0 ? sum (5) / t : 0.0; }
 

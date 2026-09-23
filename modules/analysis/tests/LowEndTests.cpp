@@ -2135,5 +2135,82 @@ int main()
         }
     }
 
+    //==========================================================================
+    // K9 — infraLowShare(). The consumer replaces a safeguard with this number, so what it MEANS is the
+    // test: not "the energy below the crossover" but that share weighted by the LR4's power response.
+    test::group ("K9 infraLowShare: the LR4-weighted share, and NOT the energy below the crossover");
+    {
+        const double fs = 48000.0, fc = 30.0;
+        const std::size_t n = (std::size_t) (fs * 20.0);
+        // THE TRUTH IS ARITHMETIC, NOT MEASURED. A sine of amplitude a carries a^2/2 of mean square, so
+        // two sines put an EXACT 3.000 % of the total in the infra component — an oracle computed outside
+        // the object, from the fixture's own construction.
+        const double aHi = 0.5, want = 0.03;
+        const double aInfra = aHi * std::sqrt (want / (1.0 - want));
+        const double truth = (aInfra * aInfra) / (aInfra * aInfra + aHi * aHi);
+        approx (truth, want, 1e-15, "PRECONDITION: the fixture's infra share is exactly 3 % by construction");
+
+        struct Row { double hz, weight; };
+        // f/fc = 0.17, 0.40, 0.67, 1.00, 1.33, 2.00 — the analytic |H|^2 = 1/(1+r^4)^2 at each.
+        const Row rows[] = { { 5.0, 0.99846 }, { 12.0, 0.95070 }, { 20.0, 0.69731 },
+                             { 30.0, 0.25000 }, { 40.0, 0.05777 }, { 60.0, 0.00346 } };
+        for (const Row& r : rows)
+        {
+            Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const double t = (double) i / fs;
+                const float v = (float) (aInfra * std::sin (2.0 * kPi * r.hz * t)
+                                       + aHi    * std::sin (2.0 * kPi * 200.0 * t));
+                x.l[i] = v; x.r[i] = v;                       // mono: the whole programme is Mid
+            }
+            LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+            LowEnd le; le.setParams (q);
+            if (! test::run (le.prepare (fs, 4096, 2)) || ! test::run (feed (le, x, 2))) continue;
+            // The analytic weight is computed HERE, from the prewarped ratio the filter itself uses, and
+            // compared against the row's spelled constant so neither can drift alone.
+            const double rr = std::tan (kPi * r.hz / fs) / std::tan (kPi * fc / fs);
+            const double h  = 1.0 / ((1.0 + rr * rr * rr * rr) * (1.0 + rr * rr * rr * rr));
+            approx (h, r.weight, 5e-5, std::to_string ((int) r.hz) + " Hz: the analytic weight is "
+                                       + std::to_string (r.weight));
+            approx (le.infraLowShare() / truth, h, 2e-3,
+                    std::to_string ((int) r.hz) + " Hz: a true 3 % reads as "
+                    + std::to_string (le.infraLowShare()) + " — the share times the filter's own response");
+        }
+        // AND THE HEADLINE, SPELLED, because it is the sentence that stops a threshold being carried over
+        // from a different definition: at the crossover the weight is a QUARTER, so the same physical 3 %
+        // reads four times smaller there than it does an octave and a half down.
+        {
+            auto shareAt = [&] (double hz)
+            {
+                Stereo x; x.l.assign (n, 0.0f); x.r.assign (n, 0.0f);
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const double t = (double) i / fs;
+                    const float v = (float) (aInfra * std::sin (2.0 * kPi * hz * t)
+                                           + aHi    * std::sin (2.0 * kPi * 200.0 * t));
+                    x.l[i] = v; x.r[i] = v;
+                }
+                LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+                LowEnd le; le.setParams (q);
+                if (! le.prepare (fs, 4096, 2) || ! feed (le, x, 2)) return -1.0;
+                return le.infraLowShare();
+            };
+            const double at12 = shareAt (12.0), at30 = shareAt (30.0);
+            ok (at12 > 3.5 * at30, "the SAME 3 % reads " + std::to_string (at12) + " at 12 Hz and "
+                                   + std::to_string (at30) + " at 30 — a factor of "
+                                   + std::to_string (at12 / at30) + ", which is why a nominal threshold "
+                                   "does not transfer between definitions");
+        }
+        // the 0/0, and that nothing leaks in from well above
+        {
+            Stereo z; z.l.assign (n, 0.0f); z.r.assign (n, 0.0f);
+            LowEndParams q = base; q.fftOrder = 15; q.crossoverHz = fc;
+            LowEnd le; le.setParams (q);
+            if (test::run (le.prepare (fs, 4096, 2)) && test::run (feed (le, z, 2)))
+                ok (le.infraLowShare() == 0.0, "a silent programme answers the canonical zero, not 0/0");
+        }
+    }
+
     return test::report();
 }

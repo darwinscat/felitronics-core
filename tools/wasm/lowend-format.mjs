@@ -45,6 +45,7 @@ export function formatLowEnd({ ok, s, hist, series, bands, noteName, sSeries, sB
     L.push(`background ${bitsOf(s[55])} peakenergy ${bitsOf(s[56])} peakwidth ${bitsOf(s[57])} share ${bitsOf(s[58])} total ${bitsOf(s[59])}`);
     // v2. The resolution boundary, the duty population and what the histogram did not count.
     L.push(`resolved first ${s[60]} above ${bitsOf(s[61])} lobebins ${s[62]}`);
+    L.push(`infralow ${bitsOf(s[67])}`);
     L.push(`duty frames ${s[63]} thresholddb ${bitsOf(s[64])} skipped ${s[65]} asked ${s[66]}`);
     return L.join('\n') + '\n';
 }
