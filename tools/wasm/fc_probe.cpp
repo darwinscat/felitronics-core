@@ -1957,7 +1957,9 @@ FC_EXPORT std::uint32_t fc_probe_excursions_crest (double* out, std::uint32_t ca
 // floor under the denominator; pass a large number for "every local maximum".
 FC_EXPORT double fc_probe_excursions_ceiling_density (double minusDb, double withinDb)
 {
-    return haveExcursions ? excursions().ceilingDensityAbove (minusDb, withinDb) : 0.0;
+    // -1.0 without a measurement, matching what the core answers for a request it cannot serve: a density
+    // lives in [0, 1] and 0.0 is a real reading, so a refusal must not wear it.
+    return haveExcursions ? excursions().ceilingDensityAbove (minusDb, withinDb) : -1.0;
 }
 FC_EXPORT double fc_probe_excursions_ceiling_maxima (void)
 {
@@ -2012,7 +2014,10 @@ FC_EXPORT int fc_probe_lowend_settling_blocks (double sampleRate, double crossov
 // not, and on anti-phase content under 20 Hz the two give opposite answers.
 FC_EXPORT double fc_probe_lowend_side_fraction_below (double hz)
 {
-    return haveLowEnd ? lowEnd().sideFractionBelow (hz) : 0.0;
+    // …and the same -1.0 for "there is no measurement yet", which this returned as 0.0 while the comment
+    // above declared the rule. Half a convention is worse than none: a caller that trusted the note read
+    // an un-run probe as a perfectly mono low end.
+    return haveLowEnd ? lowEnd().sideFractionBelow (hz) : -1.0;
 }
 
 // The lowest band present in at least `dutyMin` of the counted frames: band, midi, centreHz, count, duty,

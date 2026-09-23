@@ -147,8 +147,12 @@ public:
         // The crest's own frequency, from its SHAPE and nothing else. A crest of peak A over a ceiling T
         // by e = A - T for a duration D is, to second order, A*cos(wt): e = A*w^2*D^2/8, so
         // w = sqrt(8e / (A*D^2)). No filter, no phase, no window, and gain-invariant because e/A is a
-        // ratio. Measured on the reconstruction at 48 kHz: a 60 Hz sine reads 59.4 Hz, a 40 Hz sine 39.6,
-        // a two-sample click 10.8 kHz.
+        // ratio. Measured on the reconstruction at 48 kHz: a 60 Hz sine reads 59.3 Hz, a 40 Hz sine 39.6,
+        // and a two-sample click 8.40 kHz at amplitude 0.85 — 11.40 kHz at 1.0. A CLICK HAS NO ONE ANSWER:
+        // its excess over the ceiling grows with its amplitude while its width does not, and e/A is what
+        // the formula reads, so the figure is meaningless unless the amplitude is given with it. Both
+        // numbers are pinned in the tests; the 10.8 kHz that stood here was carried over from elsewhere
+        // and belonged to neither.
         //
         // IT READS THE CREST'S SHAPE, NOT A SPECTRUM, and the difference shows on a crest that has been
         // flattened by earlier saturation: it reads low, because a flat top IS slow. For the decision this
@@ -477,22 +481,38 @@ public:
     // musical waveform, so a dynamic programme reads low for reasons that are not about peak control;
     // `ceilingDensityAbove` takes the same histogram with a floor under it.
     std::int64_t ceilingMaxima() const noexcept { return ceilingMaxima_; }
-    double ceilingDensity (double withinDb = 0.2) const noexcept { return ceilingDensityAbove (1.0e9, withinDb); }
+    // THE BINS RUN DOWNWARD IN LEVEL — `b = floor((kCeilingTopDb - dB) / kCeilingBinDb)` — so `top` is the
+    // LOUDEST populated bin and every quieter maximum sits at a LARGER index. The first version of this
+    // walked `b = 0 .. top`, which is the range ABOVE the loudest maximum and is empty by definition, so
+    // numerator and denominator were both `ceilHist_[top]` and the answer was EXACTLY 1 on every
+    // programme. A consumer measured 1 on 102 files and said so; nothing here had a test.
+    //
+    // -1.0, NOT 0.0, for a request this cannot answer — a bad argument, or a call before a measurement.
+    // A density lives in [0, 1] and 0.0 is a legitimate reading ("no maximum sits near the loudest"), so
+    // the two must not share a value. Same rule, and the same reason, as LowEnd::sideFractionBelow.
+    double ceilingDensity (double withinDb = 0.2) const noexcept
+    {
+        return ceilingDensityAbove ((double) kCeilingSpanDb, withinDb);
+    }
     double ceilingDensityAbove (double minusDb, double withinDb = 0.2) const noexcept
     {
-        if (! (withinDb > 0.0) || ! (minusDb > 0.0) || ceilingMaxima_ <= 0) return 0.0;
+        if (! (withinDb > 0.0) || ! (minusDb > 0.0)) return -1.0;
+        if (ceilingMaxima_ <= 0) return -1.0;
         const int top = ceilingTopBin();
-        if (top < 0) return 0.0;
-        const int inner = (int) std::ceil (withinDb / kCeilingBinDb);
-        const int floorB = (int) std::floor ((double) top - minusDb / kCeilingBinDb);
+        if (top < 0) return -1.0;
+        // BOTH WIDTHS ARE CLAMPED IN DOUBLE BEFORE THEY BECOME AN int. The harness asks for 1e9 dB to mean
+        // "every maximum", and 1e9 / 0.05 is 2e10 — not representable in an int, so the conversion alone
+        // would be undefined. The histogram is kCeilingBins wide; nothing past it exists to count.
+        const double binsPerDb = 1.0 / kCeilingBinDb;
+        const int inner = (int) std::ceil  (std::fmin (withinDb * binsPerDb, (double) kCeilingBins));
+        const int span  = (int) std::floor (std::fmin (minusDb  * binsPerDb, (double) kCeilingBins));
         std::int64_t num = 0, den = 0;
-        for (int b = 0; b <= top; ++b)
+        for (int b = top; b < kCeilingBins && b - top <= span; ++b)
         {
-            if (b < floorB) continue;
             den += ceilHist_[b];
-            if (b > top - inner) num += ceilHist_[b];
+            if (b - top < inner) num += ceilHist_[b];
         }
-        return den > 0 ? (double) num / (double) den : 0.0;
+        return den > 0 ? (double) num / (double) den : -1.0;
     }
     std::int64_t ceilingBin (int b) const noexcept { return b >= 0 && b < kCeilingBins ? ceilHist_[b] : 0; }
     static double ceilingBinTopDb (int b) noexcept { return kCeilingTopDb - (double) b * kCeilingBinDb; }
@@ -561,9 +581,17 @@ private:
 
     // A local maximum of the reconstruction, from a three-sample window. It lags the stream by one sample,
     // which costs nothing here because the histogram is an aggregate with no coordinate.
+    //
+    // THE RISE IS STRICT AND THE FALL IS NOT, so a PLATEAU counts ONCE — at its first sample. With `>=` on
+    // both sides every sample of a flat top is a maximum, and a flat top is exactly what this instrument
+    // is pointed at: a clipped programme's L-sample plateau then contributed L counts at the ceiling and
+    // the density read the DURATION of the flatness as its crowding. It is not a corner case either — the
+    // reconstruction's group delay is 63.5 oversampled samples, a half sample, so the crest of an isolated
+    // impulse falls BETWEEN two samples that are then bit-identical by symmetry, and even a lone spike
+    // counted twice.
     void noteLocalMax (double mag) noexcept
     {
-        if (haveTwo_ && prev1_ >= prev2_ && prev1_ >= mag && prev1_ > 0.0)
+        if (haveTwo_ && prev1_ > prev2_ && prev1_ >= mag && prev1_ > 0.0)
         {
             const double db = 20.0 * core::det::log10 (prev1_);
             int b = (int) std::floor ((kCeilingTopDb - db) / kCeilingBinDb);
