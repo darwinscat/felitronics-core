@@ -2070,29 +2070,46 @@ void testPreLimiterTapIsTheRealSignal()
         std::vector<float> pk3 ((std::size_t) (blk3 + K3) * (std::size_t) F3, 0.0f);
         MasteringChainTaps t3;
         t3.limiterPeakLin = pk3.data(); t3.osCapacity = (blk3 + K3) * F3;
+        // THE ARGMAX IS NOT THE GROUP DELAY, and reading it as one is what hid this defect for so long.
+        // The oversampler's group delay is a HALF sample, so the crest of the tap's impulse response falls
+        // BETWEEN two bit-identical samples and the maximum sits a quarter frame early — measured 31.75
+        // against a truth of 31.875. So the argmax is kept only to locate the response, and the offset is
+        // read from its ENERGY CENTROID, which does not care where the grid fell.
         long long argmaxOs = -1; double best3 = 0.0;
+        double cenNum = 0.0, cenDen = 0.0;
         if (! test::run (r3.render (ch3, ip3.data(), op3.data(), 2, n3, t3,
             [&] (const MasteringChainTaps& t, long long tapPos) noexcept
             {
                 for (int i = 0; i < t.osWritten; ++i)
-                    if ((double) pk3[(std::size_t) i] > best3)
-                    { best3 = pk3[(std::size_t) i]; argmaxOs = tapPos * F3 + i; }
+                {
+                    const double v = (double) pk3[(std::size_t) i];
+                    if (v > best3) { best3 = v; argmaxOs = tapPos * F3 + i; }
+                    const double w = v * v;
+                    cenNum += w * (double) (tapPos * F3 + i);
+                    cenDen += w;
+                }
             })))
             return;
         const MasteringChainResolved r4 = ch3.resolved();
         const long long stated = r4.limiterTapOffset;
         test::ok (best3 > 0.5, "precondition: the impulse really reached the limiter's detector ("
                                + std::to_string (best3) + ")");
-        const double foundOffset = (double) argmaxOs / (double) F3 - (double) hit;
-        // Half an oversampled sample of slack: the peak of a reconstructed impulse need not land exactly
-        // on a grid point, and the contract is in whole baseband frames.
-        test::approx (foundOffset, (double) stated, 1.0,
+        const double argmaxOffset = (double) argmaxOs / (double) F3 - (double) hit;
+        const double foundOffset   = cenDen > 0.0 ? cenNum / cenDen / (double) F3 - (double) hit : -1.0e9;
+        // UNDER HALF A FRAME, because the contract is a whole number of frames and the truth here is
+        // 31.875: the published value must be the NEAREST integer, and a tolerance of 1.0 could not tell
+        // 32 from the 31 that shipped. The remaining 0.125 is the distance from the truth to the nearest
+        // frame, and nothing about the measurement.
+        test::approx (foundOffset, (double) stated, 0.5,
                       "the measured tap offset is the stated one (found " + std::to_string (foundOffset)
                       + ", stated " + std::to_string (stated) + ")");
-        std::printf ("      limiter tap offset: measured %.3f frames, stated %lld "
-                     "(compLook %d + clip %d + half the oversampler round trip %d)\n",
-                     foundOffset, stated, r4.compressorLookahead, r4.clipperLatency,
-                     (r4.limiterLatency - r4.limiterLookahead) / 2);
+        test::ok (std::fabs (argmaxOffset - foundOffset) > 0.1,
+                  "PRECONDITION: the argmax and the centroid really do disagree here (" + std::to_string (argmaxOffset)
+                  + " against " + std::to_string (foundOffset) + ") — if they ever agree, the half-sample "
+                  "delay this test is written around has moved and the tolerance above must be re-derived");
+        std::printf ("      limiter tap offset: centroid %.4f frames, argmax %.4f, stated %lld "
+                     "(compLook %d + clip %d + the oversampler's UP leg, (N-1)/(2F))\n",
+                     foundOffset, argmaxOffset, stated, r4.compressorLookahead, r4.clipperLatency);
     }
 }
 
