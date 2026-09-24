@@ -45,6 +45,12 @@ struct MasteringChainConfig
     // Which stages exist. gain nodes are free and always present.
     bool eq         = true;
     bool monoBass   = false;      // OFF by default: it is a decision about the low end, not a default
+    // K14 — the Side air shelf shares mono-bass's M/S island, but it is its OWN topology decision: the
+    // island is opened when EITHER is configured, so a caller can have the shelf without the bass. It is
+    // a config flag and not only a parameter because it decides two things prepare() must know — whether
+    // the island is entered at all, and whether a MONO chain must be refused (a stereo tool silently
+    // doing nothing is the class this chain already closed for mono-bass).
+    bool stereoAir  = false;
     bool compressor = true;
     bool clipper    = false;      // OFF by default: it is where loudness is won, and it costs latency
     bool limiter    = true;
@@ -83,6 +89,7 @@ struct MasteringChainParams
 
     eq::BandParams                 eqBands[eq::EqEngine::kMaxBands] {};
     stereo::MonoBassParams         monoBass {};
+    stereo::StereoAirParams        stereoAir {};    // K14 — off, 6 kHz, 0 dB; rides mono-bass's island
     dynamics::CompressorParams     compressor {};   // lookaheadMs IGNORED — it is topology, see prepare()
     saturation::Saturator::Params  clipper {};
     limiter::TruePeakLimiterParams limiter {};
@@ -198,6 +205,9 @@ struct MasteringChainResolved
     // K13 — where the peak clipper inside the limiter actually cuts, ABSOLUTE in dBTP after both
     // clamps. 0 without a limiter: the offset rides a ceiling that does not exist there.
     double peakClipperThresholdDbTp = 0.0;
+    // K14 — the air shelf's corner and plateau after both clamps; 0 without the island.
+    double stereoAirHz = 0.0;
+    double stereoAirDb = 0.0;
 };
 
 //==============================================================================
@@ -439,6 +449,15 @@ public:
     // numbers and not a second definition: the clipper acts on the limiter's oversampled grid, so these
     // are read where they were counted. Zeroes without a limiter, which is the rule a bypassed stage
     // already follows here — a stage that is not there reports nothing, not a hole.
+    // K14 — the air shelf's own band reading, straight through from the island that measured it. Zeroes
+    // and a refused width without the island, the rule a stage that is not there already follows here.
+    double airMidEnergy()        const noexcept { return cfg_.stereoAir ? monoBass_.airMidEnergy() : 0.0; }
+    double airSideEnergyBefore() const noexcept { return cfg_.stereoAir ? monoBass_.airSideEnergyBefore() : 0.0; }
+    double airSideEnergyAfter()  const noexcept { return cfg_.stereoAir ? monoBass_.airSideEnergyAfter() : 0.0; }
+    double airWidthBefore()      const noexcept { return cfg_.stereoAir ? monoBass_.airWidthBefore() : -1.0; }
+    double airWidthAfter()       const noexcept { return cfg_.stereoAir ? monoBass_.airWidthAfter() : -1.0; }
+    std::int64_t airJudgedSamples() const noexcept { return cfg_.stereoAir ? monoBass_.airJudgedSamples() : 0; }
+
     double peakClipReductionMaxDb()   const noexcept { return cfg_.limiter ? lim_.clipReductionMaxDb() : 0.0; }
     double peakClipReductionP95Db()   const noexcept { return cfg_.limiter ? lim_.clipReductionQuantileDb (0.95) : -1.0; }
     double peakClipOccupancy()        const noexcept { return cfg_.limiter ? lim_.clipOccupancy() : -1.0; }
@@ -463,7 +482,7 @@ public:
         // mono chain that reported this stage as enabled would be reporting a stage that does nothing —
         // the class of silent no-op this plan keeps closing. It is also the whole of MonoBass's own gate
         // (it refuses a width outside [1, 2] and nothing else), so no stage check is missing below.
-        if (config.monoBass && numChannels != 2) return false;
+        if ((config.monoBass || config.stereoAir) && numChannels != 2) return false;   // K14 rides the same island
 
         const int K = config.internalBlock;
         Storage st;
@@ -644,7 +663,7 @@ public:
         }
         else { eq_.reset(); dyn_ = {}; }
 
-        if (cfg_.monoBass && ! monoBass_.prepare (fs_, K_, nch_)) return false;   // it is stereo-only, and
+        if ((cfg_.monoBass || cfg_.stereoAir) && ! monoBass_.prepare (fs_, K_, nch_)) return false;   // it is stereo-only, and
                                                                                  // says so now — law 11(b)
 
         int compLat = 0;
@@ -742,7 +761,7 @@ public:
         nonFiniteIn_ = 0;
         if (eq_) eq_->reset();
         for (auto& d : dyn_) d.reset();
-        if (cfg_.monoBass)   monoBass_.reset();
+        if (cfg_.monoBass || cfg_.stereoAir) monoBass_.reset();
         if (cfg_.compressor) { comp_.reset(); alignComp_.reset(); }
         if (cfg_.clipper)  { sat_.reset();  alignClip_.reset(); }
         if (cfg_.limiter)  { lim_.reset();  alignLim_.reset(); }
@@ -830,6 +849,10 @@ public:
         r.compressorMix       = cfg_.compressor ? (double) compMix_ : 0.0;
         r.limiterSlowReleaseMs = cfg_.limiter ? lim_.effectiveSlowReleaseMs() : 0.0;
         r.peakClipperThresholdDbTp = cfg_.limiter ? lim_.clipThresholdDbTp() : 0.0;
+        // K14 — what the shelf ACTUALLY got, after the corner's rate clamp and the plateau's range clamp.
+        // Zeroes without the island, the rule a stage that is not there already follows here.
+        r.stereoAirHz = cfg_.stereoAir ? (double) monoBass_.air().frequencyHz : 0.0;
+        r.stereoAirDb = cfg_.stereoAir ? (double) monoBass_.air().gainDb      : 0.0;
         return r;
     }
 
@@ -985,7 +1008,7 @@ private:
         }
 
         // --- M/S mono-bass (zero latency) ------------------------------------------------------
-        if (cfg_.monoBass)
+        if (cfg_.monoBass || cfg_.stereoAir)
         {
             if (! params_.bypassMonoBass) stageRefused_ |= ! monoBass_.process (ch, nch_, K_);
             else if (bypassChanged_.monoBass) monoBass_.reset();
@@ -1218,7 +1241,14 @@ private:
             dyn_[i].setParams (p.eqBands[i]);
             dynArmed_ = dynArmed_ || (d.on && ! (std::fabs (d.rangeDb) <= 0.0));
         }
-        if (cfg_.monoBass) monoBass_.setParams (p.monoBass);
+        // THE ISLAND'S OWNER TAKES BOTH SETS, and each only when its own stage is configured: writing
+        // mono-bass parameters into an island opened for the air alone would engage a tool the topology
+        // does not have, which is the mirror of the silent no-op refused at prepare().
+        if (cfg_.monoBass || cfg_.stereoAir)
+        {
+            monoBass_.setParams (cfg_.monoBass ? p.monoBass : stereo::MonoBassParams { false, 120.0f, 0.0f });
+            monoBass_.setAir    (cfg_.stereoAir ? p.stereoAir : stereo::StereoAirParams {});
+        }
 
         if (cfg_.compressor)
         {

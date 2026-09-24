@@ -621,6 +621,12 @@ struct MasterMeasurement
     double peakClipReductionP95Db = -1.0;         // over CLIPPED samples; -1.0 when none were
     double peakClipOccupancy      = -1.0;         // -1.0, never 0.0, when nothing was judged
     std::int64_t peakClipRuns = 0, peakClipRunSamplesTotal = 0, peakClipLongestRunSamples = 0;
+    // K14 — the air band, on the shelf's own corner. THREE ENERGIES and not only a fraction: on an
+    // anti-phase top both widths read 1.000 and neither moves while the Side energy grows by the whole
+    // band integral, so a report carrying the fraction alone says "nothing happened" there.
+    double airMidEnergy = 0.0, airSideEnergyBefore = 0.0, airSideEnergyAfter = 0.0;
+    double airWidthBefore = -1.0, airWidthAfter = -1.0;   // -1.0, never 0.0, when there was nothing to judge
+    std::int64_t airJudgedSamples = 0;
     int    latencySamples   = 0;
     int    gatingBlocks     = 0;
     int    droppedBlocks    = 0;        // non-zero ⇒ the loudness numbers describe a PREFIX
@@ -2059,6 +2065,12 @@ private:
         m.peakClipRuns                = chain.peakClipRuns();
         m.peakClipRunSamplesTotal     = chain.peakClipRunSamplesTotal();
         m.peakClipLongestRunSamples   = chain.peakClipLongestRunSamples();
+        m.airMidEnergy          = chain.airMidEnergy();
+        m.airSideEnergyBefore   = chain.airSideEnergyBefore();
+        m.airSideEnergyAfter    = chain.airSideEnergyAfter();
+        m.airWidthBefore        = chain.airWidthBefore();
+        m.airWidthAfter         = chain.airWidthAfter();
+        m.airJudgedSamples      = chain.airJudgedSamples();
         return measure (out, nch, frames, m, clock);
     }
 

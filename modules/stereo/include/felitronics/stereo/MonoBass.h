@@ -5,10 +5,12 @@
 
 #include <felitronics/stereo/MidSide.h>
 #include <felitronics/eq/Crossover2.h>
+#include <felitronics/eq/MatchedBiquad.h>
 #include <felitronics/core/Smoother.h>
 #include <felitronics/core/StateGrid.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 
 namespace felitronics::stereo
@@ -73,6 +75,32 @@ struct MonoBassParams
     float lowWidth    = 0.0f;      // 0 = mono below fc, 1 = full stereo (settles into bypass)
 };
 
+//==============================================================================
+// K14 — "stereo air": a high shelf on SIDE ONLY, riding in the SAME M/S island this class already
+// opens. A separate stage would have opened a second one, and the encode/decode round trip is not the
+// identity in float (see the note in process()), so a second one would perturb the programme twice for
+// no reason. It is here, and not in an EQ band, because an EQ band works on L and R.
+//
+// WHAT IT DOES TO THE SOUND, stated where a caller will read it:
+//  * THE MONO FOLD DOES NOT CHANGE. With m = (l+r)/2 and l = m+s, (l'+r')/2 = m for ANY Side
+//    processing, phase included. What grows is the GAP: stereo gains top end, mono does not. On
+//    uncorrelated highs a +3 dB plateau takes the stereo-to-mono drop from -3.01 dB to -4.76.
+//  * ON ANTI-PHASE HIGHS EVERY WIDTH NUMBER IS BLIND. Width reads 1.000 before and 1.000 after while
+//    the Side energy grows by the full plateau, because the fold was already empty. Read the band
+//    ENERGIES, not the fraction — which is why the chain publishes all three.
+//  * IT BLEEDS A HARD-PANNED TOP INTO THE OTHER CHANNEL. With content only in L, the output R is
+//    about -15 dB of L with INVERTED polarity above the corner, because r' = m - H·s. No L/R shelf
+//    does this; it is a property of acting on Side, not a defect.
+//  * `gainDb` IS THE PLATEAU, not the gain at the corner: the shelf reaches half of it AT `frequencyHz`
+//    and the rest above. At a 12 kHz corner and 44.1 kHz even the analogue prototype only reaches
+//    +2.75 dB by Nyquist, so the band energy moves by x1.74 rather than x2 for a +3 dB request.
+struct StereoAirParams
+{
+    bool  enabled     = false;     // OFF, so a parameter set written before this existed renders as it did
+    float frequencyHz = 6000.0f;   // the shelf corner; clamped to [3000, min(12000, 0.45*fs)]
+    float gainDb      = 0.0f;      // the PLATEAU, clamped to [0, kMaxAirDb]; 0 skips the filter entirely
+};
+
 class MonoBass
 {
 public:
@@ -94,6 +122,10 @@ public:
         widthSm_.reset (fs_, kSmoothingMs * 0.001);
         xfSm_.reset (fs_, kSmoothingMs * 0.001);
         applyFrequency();
+        airSm_.reset (fs_, kSmoothingMs * 0.001);
+        clampAirFrequency();                        // the ceiling is 0.45*fs, so it moves with the rate
+        wxM_.prepare (fs_, 1); wxSb_.prepare (fs_, 1); wxSa_.prepare (fs_, 1);
+        retuneWidthBand();
         reset();
         prepared_ = true;
         return true;
@@ -106,6 +138,14 @@ public:
         xo_.reset();
         grid_.reset();                              // a stream restart re-anchors the maintenance grid
         bypassed_ = false;
+        // K14. The shelf's ramp snaps like the others, its state clears like the crossover's, and the
+        // width interval starts over: a total carried across a restart is not a measurement of either
+        // side of it.
+        airSm_.setCurrentAndTargetValue (airDb_);
+        airShelf_.reset();
+        airBypassed_ = ! airEnabled_ || core::exactlyEqual (airDb_, 0.0f);
+        airDesignedDb_ = airDesignedHz_ = -1.0f;
+        retuneWidthBand();
     }
 
     void setEnabled (bool e) noexcept { enabled_ = e; }
@@ -139,6 +179,56 @@ public:
     // that has to report what it actually applied reads this, rather than echoing what it was handed.
     MonoBassParams params() const noexcept { return { enabled_, freq_, lowWidth_ }; }
 
+    // K14 — the Side shelf. Same house rule as everything else here: non-finite is REFUSED and the last
+    // good value stands, the ranges are clamped, and `air()` reads back what was actually applied.
+    void setAir (const StereoAirParams& p) noexcept
+    {
+        airEnabled_ = p.enabled;
+        if (std::isfinite (p.frequencyHz)) airFreq_ = p.frequencyHz;
+        if (std::isfinite (p.gainDb))      airDb_   = std::clamp (p.gainDb, 0.0f, kMaxAirDb);
+        const float wasFreq = airFreq_;
+        clampAirFrequency();
+        if (! core::exactlyEqual (wasFreq, airFreq_)) retuneWidthBand();
+        // THE SMOOTHER CARRIES THE dB, not the coefficients: a +3 dB step on Side is a 0.41*S jump, and
+        // a shelf redesigned between two settled values is still a discontinuity in the output.
+        airSm_.setTargetValue (airDb_);
+    }
+    StereoAirParams air() const noexcept { return { airEnabled_, airFreq_, airDb_ }; }
+
+    // ==============================================================================================
+    // K14 — WHAT THE SHELF DID TO THE TOP, measured where it acted and on the band it acted on.
+    // ==============================================================================================
+    // THREE ENERGIES, NOT A FRACTION, and the reason is a case a fraction cannot report: on anti-phase
+    // highs the width reads 1.000 before and 1.000 after while the Side energy grows by the whole
+    // plateau, because the mono fold was already empty. From these three a caller gets the width on any
+    // convention it likes, the fold loss 10log10(M/(M+S)), and the stereo-level rise — all of which the
+    // fraction alone cannot give back.
+    //
+    // THE BAND IS AN LR4 HIGH-PASS AT THE SHELF'S OWN CORNER, so content AT the corner counts a quarter
+    // (-6 dB) and the shelf also acts a little below it: this is a WEIGHTING, not a brick wall, and a
+    // caller comparing it with a textbook "energy above 6 kHz" will be wrong by the skirt.
+    //
+    // ONLY WHILE THE AIR IS ENGAGED. Three LR4 pairs per sample is real work, and with the tool off
+    // there is nothing to report anyway — `airJudgedSamples() == 0` says exactly that, and is not a
+    // measurement of zero.
+    double       airMidEnergy()        const noexcept { return wSumM_; }
+    double       airSideEnergyBefore() const noexcept { return wSumSb_; }
+    double       airSideEnergyAfter()  const noexcept { return wSumSa_; }
+    std::int64_t airJudgedSamples()    const noexcept { return wSamples_; }
+    // The PAGE's own convention, named so nobody puts two different "widths" side by side: the amplitude
+    // fraction sqrt(S)/(sqrt(M)+sqrt(S)), which is what stereo-meter.js computes. -1.0, never 0.0, when
+    // there is no energy to judge — 0.0 is a legitimate reading (an exactly mono top).
+    static double airWidth (double mid, double side) noexcept
+    {
+        if (! (mid >= 0.0) || ! (side >= 0.0) || (mid + side) <= 0.0) return -1.0;
+        const double m = std::sqrt (mid), s = std::sqrt (side);
+        return (m + s) > 0.0 ? s / (m + s) : -1.0;
+    }
+    double airWidthBefore() const noexcept { return airWidth (wSumM_, wSumSb_); }
+    double airWidthAfter()  const noexcept { return airWidth (wSumM_, wSumSa_); }
+    static constexpr float kMaxAirDb = 6.0f;
+    static constexpr float kMinAirFreq = 3000.0f, kMaxAirFreq = 12000.0f;
+
     bool  isEnabled() const noexcept { return enabled_; }
     float frequency() const noexcept { return freq_; }
     float lowWidth()  const noexcept { return lowWidth_; }
@@ -155,13 +245,22 @@ public:
         if (numChannels > 2) return false;              // width is a LIMIT — law 11(b)
         if (n == 0) return true;                        // no samples: no time, no edge, nothing at all —
                                                         // the bypass edge below used to fire even here
-        if (numChannels != 2 || ! enabled_ || (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f)))
+        // TWO TOOLS SHARE THIS ISLAND NOW, so the gate asks about BOTH. The island is skipped only when
+        // neither has anything to do; with the bass settled full-wide and the air ramping, the round trip
+        // still has to run, and the old spelling would have skipped it and dropped the shelf silently.
+        const bool mbIdle = ! enabled_ || (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f));
+        if (numChannels != 2 || (mbIdle && airIdle()))
         {
-            if (! bypassed_) { bypassed_ = true; xo_.reset(); }
+            if (! bypassed_)    { bypassed_ = true;    xo_.reset(); }
+            if (! airBypassed_) { airBypassed_ = true; airShelf_.reset(); }
             grid_.skip (n);                 // bypassed audio is still audio TIME — keep the grid anchored
             return true;
         }
-        bypassed_ = false;
+        // …and each tool owns its own latch. Resetting the crossover because the AIR toggled would click
+        // the bass; resetting the shelf because the bass settled would click the top.
+        bool mbDone = mbIdle;
+        if (mbDone) { if (! bypassed_) { bypassed_ = true; xo_.reset(); } }
+        else bypassed_ = false;
         float* L = io[0];
         float* R = io[1];
         for (int i = 0; i < n; ++i)
@@ -172,28 +271,62 @@ public:
             // rounds twice), so the output depended on where the caller cut: measured 1 LSB of 24 bit
             // (5.96e-08) on 22953 of 336000 samples across the re-slicing sweep. Same test, same
             // one-shot reset, moved to the clock it belongs on.
-            if (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f))
+            // …and it retires the BASS, not the island: the air may still be working, and leaving the
+            // loop here would drop its shelf for the rest of the block — silently, with no refusal and
+            // nothing in the report. Only when BOTH are done is there nothing left to do.
+            if (! mbDone && ! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f))
             {
-                bypassed_ = true; xo_.reset();
-                grid_.skip (n - i);           // the bypassed remainder is still audio time
-                return true;
+                mbDone = true;
+                if (! bypassed_) { bypassed_ = true; xo_.reset(); }
+                if (airIdle()) { grid_.skip (n - i); return true; }
             }
-            const float w  = widthSm_.getNextValue();
-            const float xf = xfSm_.getNextValue();
             float m, s; MidSide::encode (L[i], R[i], m, s);
-            float lp, hp; xo_.processSample (0, s, lp, hp);
-            const float wet  = w * lp + hp;                  // side magnitude (w + r⁴)/(1+r⁴) — bump-free (LR4 in-phase)
-            const float sOut = xf * s + (1.0f - xf) * wet;   // ≠ wet only while fading into/out of full-wide
+            float sOut = s;
+            if (! mbDone)
+            {
+                const float w  = widthSm_.getNextValue();
+                const float xf = xfSm_.getNextValue();
+                float lp, hp; xo_.processSample (0, s, lp, hp);
+                const float wet = w * lp + hp;               // side magnitude (w + r⁴)/(1+r⁴) — bump-free (LR4 in-phase)
+                sOut = xf * s + (1.0f - xf) * wet;           // ≠ wet only while fading into/out of full-wide
+            }
+            // K14. NOT a multiply by one and NOT a unity biquad when the gain is zero: `highShelfDb`
+            // substitutes g = 1.00001 for a zero request (it is designed as a +8.7e-5 dB shelf), and even
+            // forced identity coefficients are not transparent — the biquad computes 1.0*x + 0.0 in double
+            // and turns -0.0f into +0.0f, measured, which is the very defect that disqualified the
+            // clipper's mix = 0 bypass. So zero is a BRANCH, taken on the smoothed and clamped value.
+            if (airEnabled_)
+            {
+                const bool  moving = airSm_.isSmoothing();
+                const float db     = airSm_.getNextValue();
+                if (moving || ! core::exactlyEqual (db, 0.0f))
+                {
+                    designAir (db, moving);
+                    airBypassed_ = false;
+                    sOut = airShelf_.processSample (sOut);
+                }
+                else if (! airBypassed_) { airBypassed_ = true; airShelf_.reset(); }
+            }
+            // The measurement, on the band the shelf acts on, taking `s` and `sOut` while both are in hand.
+            if (airEnabled_)
+            {
+                float lp, hp;
+                wxM_ .processSample (0, m,    lp, hp); wSumM_  += (double) hp * (double) hp;
+                wxSb_.processSample (0, s,    lp, hp); wSumSb_ += (double) hp * (double) hp;
+                wxSa_.processSample (0, sOut, lp, hp); wSumSa_ += (double) hp * (double) hp;
+                ++wSamples_;
+            }
             MidSide::decode (m, sOut, L[i], R[i]);
             // LAW 8 on the AUDIO-TIME grid, not at the end of the call: the flush zeroes state, so
             // putting it where the caller happened to cut made the output a function of the host's
             // block size (measured on this stage: 37180 of 40000 tail samples differ between a
             // whole-file call and one-sample calls, and a whole-file call never flushed at all).
             // One increment and a compare per sample; the flush itself still runs once per period.
-            if (grid_.advance (1)) xo_.flushDenormals();
+            if (grid_.advance (1)) { xo_.flushDenormals(); airShelf_.flushDenormals(); }
         }
         // The poison half stays per call — see eq::Biquad::healPoison(). Invisible on a finite stream.
         xo_.healPoison();
+        airShelf_.healPoison();
         return true;
     }
 
@@ -205,6 +338,35 @@ private:
         xo_.setFrequency (freq_);
     }
 
+    void clampAirFrequency() noexcept
+    {
+        // The shelf has no Nyquist clamp of its own, unlike the crossover, so the ceiling is applied
+        // here and `air()` reports it. At the core's 8 kHz floor this collapses to [3000, 3600], and
+        // lo <= hi still holds — the same shape applyFrequency() uses for the crossover.
+        const float hi = std::max (kMinAirFreq, std::min (kMaxAirFreq, (float) (0.45 * fs_)));
+        airFreq_ = std::clamp (airFreq_, kMinAirFreq, hi);
+    }
+
+    // IDLE IS NOT "gainDb == 0": a ramp still moving is still an operation. Same test StereoWidth makes
+    // before it skips its own round trip, and the same reason.
+    bool airIdle() const noexcept
+    {
+        return ! airEnabled_ || (! airSm_.isSmoothing() && core::exactlyEqual (airSm_.getCurrentValue(), 0.0f));
+    }
+
+    // WHILE THE RAMP MOVES the design is quantised to 0.01 dB, so a 6 dB move costs 600 redesigns
+    // rather than one per sample; at REST it is designed at the exact value, so `air()` and the sound
+    // agree. The quantisation is a function of the smoothed value alone, which is a function of audio
+    // time alone — so it does not depend on where the caller cut the block (law 8a).
+    void designAir (float db, bool moving) noexcept
+    {
+        const float use = moving ? std::round (db * 100.0f) * 0.01f : db;
+        if (core::exactlyEqual (use, airDesignedDb_) && core::exactlyEqual (airFreq_, airDesignedHz_)) return;
+        airDesignedDb_ = use;
+        airDesignedHz_ = airFreq_;
+        airShelf_.setCoeffs (eq::matched::highShelfDb ((double) airFreq_, fs_, (double) use));
+    }
+
     double fs_ = 48000.0;
     bool   prepared_ = false;   // law 11: the crossover has no coefficients before prepare()
     float  freq_ = 120.0f, lowWidth_ = 0.0f;
@@ -212,6 +374,27 @@ private:
     eq::Crossover2 xo_;                             // the Side-channel LR4 split (the primitive extracted from here, reused back)
     core::StateGrid grid_;                          // law 8 on audio time, never on the caller's block
     core::LinearSmoother widthSm_ { 0.0f }, xfSm_ { 0.0f };
+
+    // K14. `airBypassed_` is the shelf's OWN latch: the crossover must not be reset because the air
+    // toggled, and the shelf must not be reset because the bass settled. Two tools, two latches.
+    // The measurement's own band, three LR4 pairs at the shelf's corner: Mid, Side before, Side after.
+    // Reset together with their sums whenever the corner moves — the interval belongs to one band, and a
+    // total accumulated across two of them is not a measurement of either.
+    void retuneWidthBand() noexcept
+    {
+        wxM_.setFrequency (airFreq_); wxSb_.setFrequency (airFreq_); wxSa_.setFrequency (airFreq_);
+        wxM_.reset(); wxSb_.reset(); wxSa_.reset();
+        wSumM_ = wSumSb_ = wSumSa_ = 0.0; wSamples_ = 0;
+    }
+
+    bool   airEnabled_ = false, airBypassed_ = true;
+    float  airFreq_ = 6000.0f, airDb_ = 0.0f;
+    float  airDesignedDb_ = -1.0f, airDesignedHz_ = -1.0f;   // -1: nothing designed yet
+    eq::Biquad airShelf_ {};
+    core::LinearSmoother airSm_ { 0.0f };
+    eq::Crossover2 wxM_, wxSb_, wxSa_;
+    double wSumM_ = 0.0, wSumSb_ = 0.0, wSumSa_ = 0.0;
+    std::int64_t wSamples_ = 0;
 };
 
 } // namespace felitronics::stereo

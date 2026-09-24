@@ -183,6 +183,15 @@ public:
             exactZero_[a] = 0;
             pendingHop_[a] = -1;
             pending_[a] = Cross {};
+            // AND THE COMMIT CURSOR, which this loop forgot and which is the whole of the defect it had.
+            // `committed_` counts how many events' cross readings have been written; after a run it equals
+            // the event count, and `while (committed_ < stored)` then fires for NONE of the next run's
+            // first events. Their `cross_` entries stay at Cross {} — power 0, eligible false, hop -1 —
+            // which is exactly what this class's own header calls "reads as 'the other axis was silent
+            // there'". A consumer running the same instance twice, as a render's output witness does,
+            // got a correct first answer and a confidently wrong second one. Shipped in v0.48.0; the
+            // fixture below runs the same instance twice and demands the same bits.
+            committed_[a] = 0;
         }
     }
 
