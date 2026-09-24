@@ -11,6 +11,13 @@
 // the ABI's own documentation rather than left to be inferred.
 
 #include <felitronics_test.h>
+// THE PRICE IS COUNTED FROM THE ALLOCATOR, NOT FROM `sizeof`, and through the tree's ONE counter rather
+// than a hand-rolled pair of operators: P52 removed 61 of those, of which 50 could not see an over-aligned
+// allocation at all, and the source gate refuses a file that grows another. Why from the allocator: the
+// object `sizeof` reports is 120 bytes while its bins are a SEPARATE allocation of tens of thousands of
+// entries, so an estimate built from `sizeof` came out 2500 times too small and nearly shipped a design
+// costing 73 MB a solve. A number about memory that the allocator was not asked for is not a measurement.
+#include <alloc_counter.h>
 
 #include <felitronics/mastering/LoudnessSolver.h>
 #include <felitronics/mastering/MasteringChain.h>
@@ -21,16 +28,6 @@
 #include <cstdlib>
 #include <random>
 #include <vector>
-
-// THE PRICE IS COUNTED THROUGH `operator new`, NOT THROUGH `sizeof`, and that is not a stylistic choice:
-// `sizeof(QuantileHistogram)` is 120 bytes and its bins are a SEPARATE allocation of tens of thousands of
-// entries, so an estimate built from `sizeof` came out 2500 times too small and nearly shipped a design
-// that would have cost 73 MB a solve. A number about memory that was not taken from the allocator is not
-// a measurement of memory.
-namespace { std::size_t g_live = 0; bool g_count = false; }
-void* operator new (std::size_t n) { if (g_count) g_live += n; return std::malloc (n); }
-void operator delete (void* p) noexcept { std::free (p); }
-void operator delete (void* p, std::size_t) noexcept { std::free (p); }
 
 namespace
 {
@@ -232,10 +229,9 @@ int main()
             // ONE PASS, because this counter is CUMULATIVE and not a peak: the accumulators are locals of
             // one render, freed at its end, so a two-pass solve allocates them twice and a reading taken
             // across both would say the price is double what a solve ever holds at once.
-            g_live = 0; g_count = true;
+            const std::size_t before = felitronics::test::alloc::bytes;
             (void) solveOn (rig, in, 1);
-            g_count = false;
-            return g_live;
+            return (std::size_t) (felitronics::test::alloc::bytes - before);
         };
         const std::size_t c0 = solveCost (0), c1 = solveCost (1), c10 = solveCost (10);
         std::printf ("      a solve allocates %zu with no armed pair, %zu with one, %zu with ten\n", c0, c1, c10);
