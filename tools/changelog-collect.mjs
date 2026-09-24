@@ -63,7 +63,13 @@ if (preview)
     process.exit(0);
 }
 
-const date = new Date().toISOString().slice(0, 10);
+// THE LOCAL DATE, NOT toISOString()'s UTC. The heading sits beside a tag whose date git writes in local
+// time, and the two disagreed for every release cut between midnight and 02:00 CEST — v0.47.0 and v0.48.0
+// both carry 2026-09-23 against tags dated the 24th. Nobody reads a changelog in UTC, and a heading a day
+// behind its own tag is a small thing that reads as a mistake in the release rather than in the clock.
+const now  = new Date();
+const pad  = v => String (v).padStart (2, '0');
+const date = `${now.getFullYear()}-${pad (now.getMonth() + 1)}-${pad (now.getDate())}`;
 let text = readFileSync(book, 'utf8');
 
 // Either there is an `## Unreleased` section to close, or the release opens its own above the newest one.
