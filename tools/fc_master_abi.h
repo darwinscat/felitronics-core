@@ -178,7 +178,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 11u
+#define FC_MASTER_ABI_VERSION 12u
 
 typedef struct fc_header
 {
@@ -390,6 +390,15 @@ typedef struct fc_master_config
     // floor (P51), and on a delivering handle it is the resampler's plan that holds it for `sampleRate`: the
     // chain runs at the delivery rate and never sees the source.
     double  deliveryRate;
+    // ---- v12 (K14) ----
+    // THE SIDE AIR SHELF IS A TOPOLOGY DECISION, not only a parameter: it shares mono-bass's M/S island,
+    // and the island is opened when EITHER is configured. It is here and not only in the params because
+    // prepare() must know two things — whether to enter the island at all, and whether to REFUSE a mono
+    // chain. A stereo tool silently doing nothing on a mono programme is the class this chain already
+    // closed for mono-bass, and `stereoAir` is refused on `channels != 2` exactly as `monoBass` is.
+    int32_t stereoAir;
+    int32_t _pad3;                  // written 0
+
 } fc_master_config;
 
 //==============================================================================
@@ -546,6 +555,21 @@ typedef struct fc_master_params
     int32_t _pad1;                  // written 0
     double  peakClipperOverCeilingDb;
     double  peakClipperKneeDb;
+
+    // ---- v12 (K14) ----
+    // The Side high shelf inside mono-bass's island. `stereoAirDb` is the PLATEAU: the shelf reaches HALF
+    // of it at `stereoAirHz` and the rest above, so a request of 3 gives about 1.5 dB at the corner. 0
+    // skips the filter entirely and is bit-identical to `stereoAir = 0` — one path, unlike K13's two.
+    // `stereoAirHz` is clamped to [3000, min(12000, 0.45*fs)] and `stereoAirDb` to [0, 6]; both read back
+    // through `fc_master_resolved`. Non-finite in either is FC_ERR_NON_FINITE.
+    //
+    // WHAT IT DOES: the mono fold does NOT change — (l+r)/2 is Mid, and Mid is untouched. What grows is
+    // the GAP between stereo and mono. On anti-phase highs every width number is blind (1.000 before and
+    // after) while the Side energy grows by the full band integral: read the three energies below.
+    int32_t stereoAir;
+    int32_t _pad2;                  // written 0
+    double  stereoAirHz;
+    double  stereoAirDb;
 } fc_master_params;
 
 //==============================================================================
@@ -590,6 +614,12 @@ typedef struct fc_master_resolved
     // that asked for 20 dB over got 12, and this is the only place that says so. 0 without a limiter,
     // where there is no ceiling for an offset to ride.
     double peakClipperThresholdDbTp;
+
+    // ---- v12 (K14) ----
+    // The corner and the plateau the shelf ACTUALLY got, after the rate clamp and the range clamp. 0 when
+    // the island is not configured — the same rule the rest of this struct follows for an absent stage.
+    double stereoAirHz;
+    double stereoAirDb;
 } fc_master_resolved;
 
 //==============================================================================
@@ -842,6 +872,23 @@ typedef struct fc_measurement
     // `truePeakDbTp` for what shipped.
     double  peakClipReductionMaxDb, peakClipReductionP95Db, peakClipOccupancy;
     int64_t peakClipRuns, peakClipRunSamplesTotal, peakClipLongestRunSamples;
+
+    // v12 (K14) — the air band, on an LR4 high-pass at the shelf's own corner, measured inside the island
+    // where the shelf acted. THREE ENERGIES, because a fraction cannot report the case that matters: on an
+    // anti-phase top `airWidthBefore` and `airWidthAfter` both read 1.000 and neither moves, while
+    // `airSideEnergyAfter / airSideEnergyBefore` shows the whole band integral of the boost.
+    //
+    // The widths use the PAGE's convention, sqrt(S)/(sqrt(M)+sqrt(S)) — an AMPLITUDE fraction, not an
+    // energy one — so they sit on the same scale as the broadband stereo meter. They are -1.0, never 0.0,
+    // when there was nothing to judge; 0.0 is a legitimate reading (an exactly mono top).
+    //
+    // The band is a WEIGHTING, not a wall: content at the corner counts a quarter, and the shelf acts a
+    // little below it too. A +3 dB plateau moves the band energy by x1.91 at a 6 kHz corner and x1.77 at
+    // 12 kHz, not by the plateau's x2.00. `airJudgedSamples` is 0 when the tool was off — which is not
+    // the same as a measurement of zero.
+    double  airMidEnergy, airSideEnergyBefore, airSideEnergyAfter;
+    double  airWidthBefore, airWidthAfter;
+    int64_t airJudgedSamples;
 } fc_measurement;
 
 // One bucket of a gain-reduction trace (v4) — mastering::GainReductionTraceBucket, field for field. HEADER-LESS and
@@ -900,14 +947,17 @@ typedef enum fc_struct_id
 #define FC_MASTER_STRUCT_SIZES(X)                 \
         X(FC_STRUCT_CONFIG,       1,       80)    \
         X(FC_STRUCT_CONFIG,       2,       88)    \
+        X(FC_STRUCT_CONFIG,      12,       96)    \
         X(FC_STRUCT_PARAMS,       1,     6560)    \
         X(FC_STRUCT_PARAMS,       3,     6568)    \
         X(FC_STRUCT_PARAMS,       6,     6584)    \
         X(FC_STRUCT_PARAMS,      11,     6608)    \
+        X(FC_STRUCT_PARAMS,      12,     6632)    \
         X(FC_STRUCT_RESOLVED,     1,       80)    \
         X(FC_STRUCT_RESOLVED,     3,       88)    \
         X(FC_STRUCT_RESOLVED,     6,       96)    \
         X(FC_STRUCT_RESOLVED,    11,      104)    \
+        X(FC_STRUCT_RESOLVED,    12,      120)    \
         X(FC_STRUCT_STATS,        1,       32)    \
         X(FC_STRUCT_NEED,         1,       40)    \
         X(FC_STRUCT_REQUEST,      1,      120)    \
@@ -917,6 +967,7 @@ typedef enum fc_struct_id
         X(FC_STRUCT_MEASUREMENT,  1,      208)    \
         X(FC_STRUCT_MEASUREMENT,  4,      224)    \
         X(FC_STRUCT_MEASUREMENT, 11,      272)    \
+        X(FC_STRUCT_MEASUREMENT, 12,      320)    \
         X(FC_STRUCT_SUMMARY,      1,       88)    \
         X(FC_STRUCT_GR_ACTIVE,   10,       96)
 

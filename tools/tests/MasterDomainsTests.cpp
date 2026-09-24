@@ -250,6 +250,11 @@ std::uint32_t toU32 (double v) noexcept
 // invisible, and an invisible clamp cannot be pinned to the place the table puts it.
 void armNoDither (World& w, bool) { w.cfg.dither = 0; }
 
+// K14 — the air shelf's clamps are only READABLE through resolved() when the island is in the topology:
+// without `cfg.stereoAir` the chain reports zeros, which is the "absent stage reports nothing" rule and
+// not a clamp. So the row arms the config flag, exactly as the dither rows disarm theirs.
+void armAir (World& w, bool) { w.cfg.stereoAir = 1; w.prm.stereoAir = 1; }
+
 // The compressor's range caps the DELTA, so it bites only where the delta would exceed it.
 void armCompCap (World& w, bool)
 {
@@ -323,6 +328,10 @@ const Knob kKnobs[] = {
     PRM_I  ("fc_master_params.peakClipper", peakClipper),
     PRM_DX ("fc_master_params.peakClipperOverCeilingDb", peakClipperOverCeilingDb, 1.0e-9, 1.0e-9, nullptr),
     PRM_DX ("fc_master_params.peakClipperKneeDb", peakClipperKneeDb, 1.0e-9, 1.0e-9, nullptr),
+    CFG_I  ("fc_master_config.stereoAir", stereoAir),
+    PRM_I  ("fc_master_params.stereoAir", stereoAir),
+    PRM_DX ("fc_master_params.stereoAirHz", stereoAirHz, 1.0e-6, 1.0e-6, armAir),
+    PRM_DX ("fc_master_params.stereoAirDb", stereoAirDb, 1.0e-6, 1.0e-6, armAir),
     PRM_I ("fc_master_params.bypassEq", bypassEq),
     PRM_I ("fc_master_params.bypassMonoBass", bypassMonoBass),
     PRM_I ("fc_master_params.bypassCompressor", bypassCompressor),
@@ -480,6 +489,8 @@ bool resolvedField (const fc_master_resolved& r, const std::string& path, double
     if (path == "limiterReleaseMs")     { out = r.limiterReleaseMs;          return true; }
     if (path == "limiterSlowReleaseMs") { out = r.limiterSlowReleaseMs;      return true; }
     if (path == "peakClipperThresholdDbTp") { out = r.peakClipperThresholdDbTp; return true; }
+    if (path == "stereoAirHz") { out = r.stereoAirHz; return true; }
+    if (path == "stereoAirDb") { out = r.stereoAirDb; return true; }
     if (path == "compressorMix")        { out = r.compressorMix;             return true; }
     if (path == "monoBass.enabled")     { out = (double) r.monoBass.enabled; return true; }
     if (path == "monoBass.frequencyHz") { out = (double) r.monoBass.frequencyHz; return true; }

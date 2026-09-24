@@ -202,5 +202,57 @@ int main()
         }
     }
 
+    // A SECOND RUN ON THE SAME OBJECT MUST SAY THE SAME THING, and this is where it did not. `reset()`
+    // cleared every list and every latch except the COMMIT CURSOR, so on a second run the cross readings
+    // of the first N events were never written and stayed at their default: power 0, eligible false,
+    // hop -1 — which this file's own header calls "reads as 'the other axis was silent there'". A page
+    // holding one probe per request never saw it; a witness run on a render's OUTPUT, and every test that
+    // reuses an instance, did. Found by the consumer on v0.48.0, reproduced twice before it was reported.
+    //
+    // THE FIXTURE IS HARD-PANNED ON PURPOSE: with content only in L, Side equals Mid exactly, so the
+    // cross reading is a large number that cannot be confused with a small one going astray.
+    test::group ("running the same object twice says the same thing, cross readings included");
+    {
+        const std::size_t n = (std::size_t) (kFs * 6.0);
+        std::vector<std::vector<float>> in (2, std::vector<float> (n, 0.0f));
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const double t = (double) i / kFs;
+            double a = 0.25 * std::sin (2.0 * kPi * 220.0 * t);
+            for (double t0 : { 3.0, 4.3 })
+                if (t >= t0 && t < t0 + 0.1) a += 0.45 * std::sin (2.0 * kPi * 6800.0 * t);
+            in[0][i] = (float) a;                       // L only — a hard pan, so Side == Mid
+        }
+
+        StereoBandBursts sb;
+        if (test::run (sb.prepare (kFs, 2)))
+        {
+            struct Snap { std::int64_t events, hop; double peak, cross; bool eligible; };
+            auto once = [&] ()
+            {
+                sb.reset();
+                const float* ch[2] { in[0].data(), in[1].data() };
+                if (! sb.process (ch, 2, (int) n) || ! sb.finish()) return Snap { -1, -1, 0.0, 0.0, false };
+                const std::int64_t e = sb.mid().storedEventCount();
+                if (e <= 0) return Snap { e, -1, 0.0, 0.0, false };
+                const auto c = sb.crossAt (StereoBandBursts::kMid, 0);
+                return Snap { e, c.hop, sb.mid().event (0).peakPower, c.power, c.eligible };
+            };
+            const Snap a1 = once(), a2 = once(), a3 = once();
+            ok (a1.events > 0 && a1.eligible && a1.hop >= 0,
+                "the first run captures the cross reading (" + std::to_string (a1.events) + " events, hop "
+                    + std::to_string (a1.hop) + ")");
+            // On a hard pan Side IS Mid, so the two powers are the same number — and that identity is
+            // what makes an unwritten cross reading unmistakable rather than merely small.
+            approx (a1.cross, a1.peak, 0.0, "…and on a hard pan it equals Mid's own peak power exactly");
+            ok (a2.events == a1.events && a2.hop == a1.hop && a2.eligible == a1.eligible
+                    && a2.cross == a1.cross && a2.peak == a1.peak,
+                "the SECOND run on the same object is bit-identical (cross " + std::to_string (a2.cross)
+                    + " against " + std::to_string (a1.cross) + ")");
+            ok (a3.events == a1.events && a3.cross == a1.cross && a3.eligible == a1.eligible,
+                "and so is the third — the cursor is cleared, not merely decremented");
+        }
+    }
+
     return test::report();
 }

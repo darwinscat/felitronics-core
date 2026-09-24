@@ -286,6 +286,11 @@ bool applyKey (Args& a, const std::string& key, const std::string& val)
     if (key == "lim.peakClip")     return parseBool (val, a.prm.peakClipper);
     if (key == "lim.clipOver")     { FC_D (a.prm.peakClipperOverCeilingDb = d); }
     if (key == "lim.clipKnee")     { FC_D (a.prm.peakClipperKneeDb = d); }
+    // K14 — the Side air shelf. `air.hz` is the corner, `air.db` the PLATEAU (half of it lands AT the corner).
+    if (key == "cfg.air")          return parseBool (val, a.cfg.stereoAir);
+    if (key == "air.on")           return parseBool (val, a.prm.stereoAir);
+    if (key == "air.hz")           { FC_D (a.prm.stereoAirHz = d); }
+    if (key == "air.db")           { FC_D (a.prm.stereoAirDb = d); }
 
     if (key == "dith.bits")    { FC_I (a.prm.dither.bits = i); }
     if (key == "dith.shaping") return parseEnumName (val, kShap, 3, a.prm.dither.shaping);
@@ -507,6 +512,7 @@ void mirror (const Args& a, MasteringChainConfig& cc, MasteringChainParams& cp)
     cc.internalBlock         = a.cfg.internalBlock;
     cc.eq                    = a.cfg.eq != 0;
     cc.monoBass              = a.cfg.monoBass != 0;
+    cc.stereoAir             = a.cfg.stereoAir != 0;      // K14 — the island is opened by either flag
     cc.compressor            = a.cfg.compressor != 0;
     cc.clipper               = a.cfg.clipper != 0;
     cc.limiter               = a.cfg.limiter != 0;
@@ -567,6 +573,9 @@ void mirror (const Args& a, MasteringChainConfig& cc, MasteringChainParams& cp)
     cp.limiter.peakClip      = a.prm.peakClipper != 0;
     cp.limiter.overCeilingDb = a.prm.peakClipperOverCeilingDb;
     cp.limiter.kneeDb        = a.prm.peakClipperKneeDb;
+    cp.stereoAir.enabled     = a.prm.stereoAir != 0;
+    cp.stereoAir.frequencyHz = (float) a.prm.stereoAirHz;
+    cp.stereoAir.gainDb      = (float) a.prm.stereoAirDb;
     cp.dither.bits = a.prm.dither.bits;
     cp.dither.shaping = (dither::NoiseShaping) a.prm.dither.shaping;
     cp.dither.seed = ((std::uint64_t) a.prm.dither.seedHi << 32) | (std::uint64_t) a.prm.dither.seedLo;
@@ -655,7 +664,7 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_config, compressor) X (fc_master_config, clipper) X (fc_master_config, limiter)                   \
     X (fc_master_config, dither) X (fc_master_config, compressorLookaheadMs)                                       \
     X (fc_master_config, limiterLookaheadMs) X (fc_master_config, oversampleFactor)                                \
-    X (fc_master_config, tapsPerPhase) X (fc_master_config, sidechainHpfHz) X (fc_master_config, deliveryRate)      \
+    X (fc_master_config, tapsPerPhase) X (fc_master_config, sidechainHpfHz) X (fc_master_config, deliveryRate)       X (fc_master_config, stereoAir) X (fc_master_config, _pad3)\
     X (fc_eq_lane, on) X (fc_eq_lane, freq) X (fc_eq_lane, q) X (fc_eq_lane, gainDb) X (fc_eq_lane, slope)         \
     X (fc_eq_lane, bypass)                                                                                         \
     X (fc_eq_dyn, on) X (fc_eq_dyn, rangeDb) X (fc_eq_dyn, thrDb) X (fc_eq_dyn, thrAuto) X (fc_eq_dyn, atk)        \
@@ -681,6 +690,8 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_params, limiterSlowReleaseMs)                                                                     \
     X (fc_master_params, peakClipper) X (fc_master_params, _pad1)                                                  \
     X (fc_master_params, peakClipperOverCeilingDb) X (fc_master_params, peakClipperKneeDb)                         \
+    X (fc_master_params, stereoAir) X (fc_master_params, _pad2)                                                    \
+    X (fc_master_params, stereoAirHz) X (fc_master_params, stereoAirDb)                                            \
     X (fc_master_resolved, header) X (fc_master_resolved, latencySamples) X (fc_master_resolved, internalBlock)    \
     X (fc_master_resolved, compressorLookahead) X (fc_master_resolved, clipperLatency)                             \
     X (fc_master_resolved, limiterLatency) X (fc_master_resolved, limiterLookahead)                                \
@@ -689,6 +700,7 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_master_resolved, limiterReleaseMs) X (fc_master_resolved, monoBass)                                      \
     X (fc_master_resolved, tapOversampleFactor) X (fc_master_resolved, compressorMix)                              \
     X (fc_master_resolved, limiterSlowReleaseMs) X (fc_master_resolved, peakClipperThresholdDbTp)                  \
+    X (fc_master_resolved, stereoAirHz) X (fc_master_resolved, stereoAirDb)                                        \
     X (fc_master_stats, header) X (fc_master_stats, framesIn) X (fc_master_stats, framesFlushed)                   \
     X (fc_master_stats, nonFiniteIn)                                                                               \
     X (fc_need, header) X (fc_need, callBytes) X (fc_need, solverPrepareBytes) X (fc_need, facadeBytes)            \
@@ -719,6 +731,9 @@ bool directRenderDelivered (const Args& a, const std::vector<float>& in, std::si
     X (fc_measurement, peakClipReductionMaxDb) X (fc_measurement, peakClipReductionP95Db)                          \
     X (fc_measurement, peakClipOccupancy) X (fc_measurement, peakClipRuns)                                         \
     X (fc_measurement, peakClipRunSamplesTotal) X (fc_measurement, peakClipLongestRunSamples)                      \
+    X (fc_measurement, airMidEnergy) X (fc_measurement, airSideEnergyBefore)                                       \
+    X (fc_measurement, airSideEnergyAfter) X (fc_measurement, airWidthBefore)                                      \
+    X (fc_measurement, airWidthAfter) X (fc_measurement, airJudgedSamples)                                         \
     X (fc_gr_trace_bucket, maxDb) X (fc_gr_trace_bucket, meanDb) X (fc_gr_trace_bucket, samples)                   \
     X (fc_gr_trace_bucket, nonFinite)                                                                              \
     X (fc_gr_trace_bucket64, maxDb) X (fc_gr_trace_bucket64, meanDb) X (fc_gr_trace_bucket64, samples)             \
@@ -994,6 +1009,10 @@ int selftest (double fs, int nc)
     a.prm.peakClipper              = 1;
     a.prm.peakClipperOverCeilingDb = 1.7;
     a.prm.peakClipperKneeDb        = 0.4;
+    a.cfg.stereoAir                = 1;
+    a.prm.stereoAir                = 1;
+    a.prm.stereoAirHz              = 7000.0;
+    a.prm.stereoAirDb              = 2.5;
     a.req.grTraceBuckets         = 4099;
     // v8, off their defaults like every other field, and the statistics moved with them so the numbers are read
     // rather than merely carried.
@@ -1096,6 +1115,7 @@ int selftest (double fs, int nc)
         {
             Args b = a;
             b.cfg.eq = b.cfg.monoBass = b.cfg.compressor = b.cfg.clipper = b.cfg.limiter = 0;
+            b.cfg.stereoAir = 0;                          // "almost every stage absent" means this one too
             b.cfg.dither = 1;
             b.prm.dither.autoBlank = autoBlank;
             std::vector<float> mAbi, mCpp; fc_master_resolved rm {};
@@ -1156,6 +1176,9 @@ int selftest (double fs, int nc)
         off.prm.peakClipper = 0;
         off.prm.peakClipperOverCeilingDb = felitronics::limiter::TruePeakLimiterParams {}.overCeilingDb;
         off.prm.peakClipperKneeDb        = felitronics::limiter::TruePeakLimiterParams {}.kneeDb;
+        off.prm.stereoAir   = 0;                                               // v12
+        off.prm.stereoAirHz = (double) felitronics::stereo::StereoAirParams {}.frequencyHz;
+        off.prm.stereoAirDb = (double) felitronics::stereo::StereoAirParams {}.gainDb;
         Args slow = b; slow.prm.limiterSlowReleaseMs = 200.0;
         Args v5 = b;   v5.prm.header.abiVersion = 5u; v5.prm.header.structSize = 6568u;
         const bool ran = render (b, dAbi, dCpp) && render (off, offAbi, offCpp) && render (slow, slowAbi, slowCpp)
@@ -1303,6 +1326,10 @@ int selftest (double fs, int nc)
         prev.prm.peakClipper = 0;                                              // v11
         prev.prm.peakClipperOverCeilingDb = felitronics::limiter::TruePeakLimiterParams {}.overCeilingDb;
         prev.prm.peakClipperKneeDb        = felitronics::limiter::TruePeakLimiterParams {}.kneeDb;
+        prev.prm.stereoAir   = 0;                                              // v12
+        prev.prm.stereoAirHz = (double) felitronics::stereo::StereoAirParams {}.frequencyHz;
+        prev.prm.stereoAirDb = (double) felitronics::stereo::StereoAirParams {}.gainDb;
+        prev.cfg.stereoAir   = 0;
         std::vector<float> viaPrev, viaPrevCpp; fc_master_resolved rp {};
         const bool ranPrev = abiRender (prev, in, frames, nc, viaPrev, rp) && directRender (prev, in, frames, nc, viaPrevCpp);
         double wp = 0.0;

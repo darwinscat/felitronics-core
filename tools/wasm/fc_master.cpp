@@ -136,8 +136,8 @@ static_assert (sizeof (saturation::Saturator::Params)  == 28);
 static_assert (sizeof (limiter::TruePeakLimiterParams) == 56);   // + dualRelease, slowReleaseMs (v6); + peakClip, overCeilingDb, kneeDb (K13, v11)
 static_assert (sizeof (dither::DitherParams)           == 24);
 static_assert (sizeof (MasteringChainConfig)           == 48);
-static_assert (sizeof (MasteringChainParams)           == 6592);   // + compressorMix (P60), + the limiter's K13 fields (v11) — see below
-static_assert (sizeof (MasteringChainResolved)         == 96);     // + compressorMix (P60), + peakClipperThresholdDbTp (K13, v11)
+static_assert (sizeof (MasteringChainParams)           == 6600);   // + compressorMix (P60), the limiter's K13 fields (v11), K14's air (v12) — see below
+static_assert (sizeof (MasteringChainResolved)         == 112);    // + compressorMix (P60), + peakClipperThresholdDbTp (K13, v11), + the K14 pair (v12)
 
 // THE PIN THAT WORKS THROUGH INHERITANCE. A structured binding cannot decompose a type whose base has
 // members, and `sizeof` is blind to a field that lands in existing padding — so between them the two
@@ -208,25 +208,25 @@ static_assert (! BraceInit<dynamics::CompressorParams,
     (void) dit_bits; (void) dit_shape; (void) dit_seed; (void) dit_blank; (void) dit_blankn;
 
     MasteringChainConfig cfg {};
-    auto& [k_block, k_eq, k_mb, k_comp, k_clip, k_lim, k_dith,
+    auto& [k_block, k_eq, k_mb, k_air, k_comp, k_clip, k_lim, k_dith,
            k_clook, k_llook, k_os, k_taps, k_hpf] = cfg;
-    (void) k_block; (void) k_eq; (void) k_mb; (void) k_comp; (void) k_clip; (void) k_lim; (void) k_dith;
+    (void) k_block; (void) k_eq; (void) k_mb; (void) k_air; (void) k_comp; (void) k_clip; (void) k_lim; (void) k_dith;
     (void) k_clook; (void) k_llook; (void) k_os; (void) k_taps; (void) k_hpf;
 
     // `p_mix` and `r_mix` arrived with P60 as a build break here, and are mapped since ABI v3 — `toCore` and
     // `fromCore` below, at the end of `fc_master_params` and `fc_master_resolved`.
     MasteringChainParams prm {};
-    auto& [p_in, p_pre, p_eq, p_mb, p_comp, p_clip, p_lim, p_dith,
+    auto& [p_in, p_pre, p_eq, p_mb, p_air, p_comp, p_clip, p_lim, p_dith,
            p_bE, p_bM, p_bC, p_bK, p_bL, p_bD, p_mix] = prm;
-    (void) p_in; (void) p_pre; (void) p_eq; (void) p_mb; (void) p_comp; (void) p_clip; (void) p_lim;
+    (void) p_in; (void) p_pre; (void) p_eq; (void) p_mb; (void) p_air; (void) p_comp; (void) p_clip; (void) p_lim;
     (void) p_dith; (void) p_bE; (void) p_bM; (void) p_bC; (void) p_bK; (void) p_bL; (void) p_bD; (void) p_mix;
 
     MasteringChainResolved res {};
     auto& [r_lat, r_blk, r_clook, r_clip, r_lim, r_llook, r_os, r_ctap, r_ltap,
-           r_ceil, r_rel, r_mb, r_mix, r_slow, r_pclip] = res;
+           r_ceil, r_rel, r_mb, r_mix, r_slow, r_pclip, r_airHz, r_airDb] = res;
     (void) r_lat; (void) r_blk; (void) r_clook; (void) r_clip; (void) r_lim; (void) r_llook;
     (void) r_os; (void) r_ctap; (void) r_ltap; (void) r_ceil; (void) r_rel; (void) r_mb; (void) r_mix; (void) r_slow;
-    (void) r_pclip;
+    (void) r_pclip; (void) r_airHz; (void) r_airDb;
 }
 
 //==============================================================================
@@ -321,13 +321,13 @@ static_assert (newestRowIsSizeof<fc_solution_summary>());
 // would have agreed with both.
 #define FC_ENDS_AT(T, last) \
     static_assert (sizeof (T) == offsetof (T, last) + sizeof (T::last), #T " ends in implicit padding — name it (rule 4)")
-FC_ENDS_AT (fc_master_config,    deliveryRate);
-FC_ENDS_AT (fc_master_params,    peakClipperKneeDb);
-FC_ENDS_AT (fc_master_resolved,  peakClipperThresholdDbTp);
+FC_ENDS_AT (fc_master_config,    _pad3);
+FC_ENDS_AT (fc_master_params,    stereoAirDb);
+FC_ENDS_AT (fc_master_resolved,  stereoAirDb);
 FC_ENDS_AT (fc_master_stats,     nonFiniteIn);
 FC_ENDS_AT (fc_need,             _pad0);
 FC_ENDS_AT (fc_loudness_request, limiterActiveInputDb);
-FC_ENDS_AT (fc_measurement,      peakClipLongestRunSamples);
+FC_ENDS_AT (fc_measurement,      airJudgedSamples);
 FC_ENDS_AT (fc_solution_summary, gainAboveDb);
 FC_ENDS_AT (fc_gr_active_stats,  thresholdDb);
 // and the types the table's sizes were computed from
@@ -396,6 +396,9 @@ FC_AT (fc_master_params, limiterSlowReleaseMs, 6576);                           
 FC_AT (fc_master_params, peakClipper, 6584); FC_AT (fc_master_params, _pad1, 6588);                       // v11
 FC_AT (fc_master_params, peakClipperOverCeilingDb, 6592);                                                 // v11
 FC_AT (fc_master_params, peakClipperKneeDb, 6600);                                                        // v11
+FC_AT (fc_master_config, stereoAir, 88); FC_AT (fc_master_config, _pad3, 92);                             // v12
+FC_AT (fc_master_params, stereoAir, 6608); FC_AT (fc_master_params, _pad2, 6612);                         // v12
+FC_AT (fc_master_params, stereoAirHz, 6616); FC_AT (fc_master_params, stereoAirDb, 6624);                 // v12
 
 FC_AT (fc_master_resolved, header, 0);         FC_AT (fc_master_resolved, latencySamples, 8);
 FC_AT (fc_master_resolved, internalBlock, 12); FC_AT (fc_master_resolved, compressorLookahead, 16);
@@ -407,6 +410,7 @@ FC_AT (fc_master_resolved, monoBass, 64);      FC_AT (fc_master_resolved, tapOve
 FC_AT (fc_master_resolved, compressorMix, 80);                                                              // v3
 FC_AT (fc_master_resolved, limiterSlowReleaseMs, 88);                                                       // v6
 FC_AT (fc_master_resolved, peakClipperThresholdDbTp, 96);                                                   // v11
+FC_AT (fc_master_resolved, stereoAirHz, 104); FC_AT (fc_master_resolved, stereoAirDb, 112);                 // v12
 
 FC_AT (fc_master_stats, header, 0);            FC_AT (fc_master_stats, framesIn, 8);
 FC_AT (fc_master_stats, framesFlushed, 16);    FC_AT (fc_master_stats, nonFiniteIn, 24);
@@ -433,6 +437,9 @@ FC_AT (fc_measurement, limiterMaxReconstructedPeakDb, 176); FC_AT (fc_measuremen
 FC_AT (fc_measurement, peakClipReductionMaxDb, 224);  FC_AT (fc_measurement, peakClipReductionP95Db, 232);  // v11
 FC_AT (fc_measurement, peakClipOccupancy, 240);       FC_AT (fc_measurement, peakClipRuns, 248);            // v11
 FC_AT (fc_measurement, peakClipRunSamplesTotal, 256); FC_AT (fc_measurement, peakClipLongestRunSamples, 264);
+FC_AT (fc_measurement, airMidEnergy, 272);        FC_AT (fc_measurement, airSideEnergyBefore, 280);         // v12
+FC_AT (fc_measurement, airSideEnergyAfter, 288);  FC_AT (fc_measurement, airWidthBefore, 296);              // v12
+FC_AT (fc_measurement, airWidthAfter, 304);       FC_AT (fc_measurement, airJudgedSamples, 312);            // v12
 FC_AT (fc_measurement, gatingBlocks, 188);     FC_AT (fc_measurement, droppedBlocks, 192);
 FC_AT (fc_measurement, nonFiniteSubHops, 196); FC_AT (fc_measurement, loudnessValid, 200);
 FC_AT (fc_measurement, lraValid, 204);
@@ -670,6 +677,7 @@ fc_status toCore (const fc_master_config& c, MasteringChainConfig& out) noexcept
     out.internalBlock         = c.internalBlock;
     out.eq                    = c.eq != 0;
     out.monoBass              = c.monoBass != 0;
+    out.stereoAir             = c.stereoAir != 0;      // v12 — K14 shares mono-bass's island
     out.compressor            = c.compressor != 0;
     out.clipper               = c.clipper != 0;
     out.limiter               = c.limiter != 0;
@@ -766,6 +774,12 @@ fc_status toCore (const fc_master_params& p, MasteringChainParams& out) noexcept
     out.limiter.peakClip      = p.peakClipper != 0;
     out.limiter.overCeilingDb = p.peakClipperOverCeilingDb;
     out.limiter.kneeDb        = p.peakClipperKneeDb;
+    // v12 — K14. Refused non-finite like every double here; the RANGES are clamped by the core and read
+    // back through resolved, so a caller can see what its request became.
+    if (! fin (p.stereoAirHz) || ! fin (p.stereoAirDb)) return FC_ERR_NON_FINITE;
+    out.stereoAir.enabled     = p.stereoAir != 0;
+    out.stereoAir.frequencyHz = (float) p.stereoAirHz;
+    out.stereoAir.gainDb      = (float) p.stereoAirDb;
 
     if (! mapShaping (p.dither.shaping, out.dither.shaping)) return FC_ERR_ENUM;
     out.dither.bits             = p.dither.bits;
@@ -845,6 +859,8 @@ void fromCore (const MasteringChainResolved& r, int tapOs, fc_master_resolved& o
     out.compressorMix       = r.compressorMix;          // v3
     out.limiterSlowReleaseMs = r.limiterSlowReleaseMs;  // v6
     out.peakClipperThresholdDbTp = r.peakClipperThresholdDbTp;   // v11
+    out.stereoAirHz = r.stereoAirHz;                             // v12
+    out.stereoAirDb = r.stereoAirDb;
 }
 
 void fromCore (const GainReductionStats& s, fc_gr_stats& out) noexcept
@@ -871,6 +887,12 @@ void fromCore (const MasterMeasurement& m, fc_measurement& out) noexcept
     out.peakClipRuns               = m.peakClipRuns;
     out.peakClipRunSamplesTotal    = m.peakClipRunSamplesTotal;
     out.peakClipLongestRunSamples  = m.peakClipLongestRunSamples;
+    out.airMidEnergy        = m.airMidEnergy;                    // v12
+    out.airSideEnergyBefore = m.airSideEnergyBefore;
+    out.airSideEnergyAfter  = m.airSideEnergyAfter;
+    out.airWidthBefore      = m.airWidthBefore;
+    out.airWidthAfter       = m.airWidthAfter;
+    out.airJudgedSamples    = m.airJudgedSamples;
     out.latencySamples   = m.latencySamples;
     out.gatingBlocks     = m.gatingBlocks;
     out.droppedBlocks    = m.droppedBlocks;
@@ -2204,6 +2226,8 @@ void writeDefaults (fc_master_config& o) noexcept
     o.internalBlock         = d.internalBlock;
     o.eq                    = d.eq ? 1 : 0;
     o.monoBass              = d.monoBass ? 1 : 0;
+    o.stereoAir             = d.stereoAir ? 1 : 0;     // v12 — 0, so a v11 config renders as it did
+    o._pad3                 = 0;
     o.compressor            = d.compressor ? 1 : 0;
     o.clipper               = d.clipper ? 1 : 0;
     o.limiter               = d.limiter ? 1 : 0;
@@ -2302,6 +2326,10 @@ void writeDefaults (fc_master_params& o) noexcept
     out->_pad1                    = 0;
     out->peakClipperOverCeilingDb = d.limiter.overCeilingDb;
     out->peakClipperKneeDb        = d.limiter.kneeDb;
+    out->stereoAir   = d.stereoAir.enabled ? 1 : 0;               // v12 — 0, so a v11 set renders as it did
+    out->_pad2       = 0;
+    out->stereoAirHz = (double) d.stereoAir.frequencyHz;
+    out->stereoAirDb = (double) d.stereoAir.gainDb;
 }
 
 void writeDefaults (fc_loudness_request& o) noexcept

@@ -8,6 +8,12 @@ target_link_libraries(felitronics_stereo INTERFACE felitronics::core felitronics
 target_compile_features(felitronics_stereo INTERFACE cxx_std_20)
 
 if(FELITRONICS_BUILD_TESTS)
+    add_executable(felitronics_stereo_air_tests tests/StereoAirTests.cpp)
+    target_link_libraries(felitronics_stereo_air_tests PRIVATE felitronics::stereo felitronics::eq)
+    target_include_directories(felitronics_stereo_air_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_stereo_air_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_stereo_air_tests COMMAND felitronics_stereo_air_tests)
+
     add_executable(felitronics_stereo_tests tests/StereoTests.cpp)
     target_link_libraries(felitronics_stereo_tests PRIVATE felitronics::stereo)
     target_include_directories(felitronics_stereo_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

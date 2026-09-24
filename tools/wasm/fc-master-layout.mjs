@@ -60,6 +60,9 @@ const STRUCTS = {
         ['compressorLookaheadMs', 'f64'], ['limiterLookaheadMs', 'f64'],
         ['oversampleFactor', 'i32'], ['tapsPerPhase', 'i32'], ['sidechainHpfHz', 'f64'],
         ['deliveryRate', 'f64'],                                // v2
+        // v12 (K14) — the air shelf is a TOPOLOGY decision: it shares mono-bass's island, the island is
+        // opened when either is configured, and a mono chain is REFUSED with it exactly as with mono-bass.
+        ['stereoAir', 'i32'], ['_pad3', 'i32'],                 // v12
     ],
 
     fc_eq_lane: [
@@ -109,6 +112,11 @@ const STRUCTS = {
         ['peakClipper', 'i32'], ['_pad1', 'i32'],               // v11
         ['peakClipperOverCeilingDb', 'f64'],                    // v11
         ['peakClipperKneeDb', 'f64'],                           // v11
+        // v12 (K14) — the Side air shelf inside mono-bass's M/S island. `stereoAirDb` is the PLATEAU:
+        // half of it lands AT the corner and the rest above. 0 skips the filter and is bit-identical to
+        // the flag being off — one path, unlike K13's two.
+        ['stereoAir', 'i32'], ['_pad2', 'i32'],                 // v12
+        ['stereoAirHz', 'f64'], ['stereoAirDb', 'f64'],         // v12
     ],
 
     fc_master_resolved: [
@@ -121,6 +129,7 @@ const STRUCTS = {
         ['compressorMix', 'f64'],                               // v3
         ['limiterSlowReleaseMs', 'f64'],                        // v6
         ['peakClipperThresholdDbTp', 'f64'],                    // v11
+        ['stereoAirHz', 'f64'], ['stereoAirDb', 'f64'],         // v12 — after both clamps
     ],
 
     fc_master_stats: [
@@ -178,6 +187,13 @@ const STRUCTS = {
         ['peakClipOccupancy', 'f64'],                                                     // v11
         ['peakClipRuns', 'u64'], ['peakClipRunSamplesTotal', 'u64'],                      // v11
         ['peakClipLongestRunSamples', 'u64'],                                             // v11
+        // v12 (K14) — the air band. THREE energies, because the fraction is blind where it matters: on
+        // an anti-phase top both widths read 1.000 and neither moves while the Side energy grows by the
+        // whole band integral. The widths use the PAGE's amplitude convention sqrt(S)/(sqrt(M)+sqrt(S)),
+        // and are -1.0 — never 0.0 — when there was nothing to judge.
+        ['airMidEnergy', 'f64'], ['airSideEnergyBefore', 'f64'],                          // v12
+        ['airSideEnergyAfter', 'f64'], ['airWidthBefore', 'f64'],                         // v12
+        ['airWidthAfter', 'f64'], ['airJudgedSamples', 'u64'],                            // v12
     ],
 
     // v10 — `_fc_solution_gr_active_stats`: the limiter's statistics over the windows its INPUT reached the gate.
@@ -364,7 +380,7 @@ export class Struct {
     }
 }
 
-export const FC_MASTER_ABI_VERSION = 11;
+export const FC_MASTER_ABI_VERSION = 12;
 
 // The status codes, in the order fc_master_abi.h declares them — so a refusal reaches a human as a name.
 export const FC_STATUS = [
@@ -500,6 +516,10 @@ export const FC_DOMAINS = [
     { field: 'fc_master_params.peakClipper', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: 'limiter: the clipper lives inside the limiter, so without one there is nothing to clip and no ceiling for the offset to ride' },
     { field: 'fc_master_params.peakClipperOverCeilingDb', unit: 'dB over the ceiling', min: 0, max: 12, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'peakClipperThresholdDbTp', depends: 'limiterCeilingDbTp: this is an OFFSET above it, and the resolved field is the absolute level the pair lands on. peakClipper: nothing is clipped while the flag is 0, and an offset no sample reaches is the OTHER way of not clipping — both are bit-exact' },
     { field: 'fc_master_params.peakClipperKneeDb', unit: 'dB', min: 0, max: 1, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: '', depends: '0 is an exact hard clip; above 0 the curve is C1 at both joins and the clipping starts kneeDb BELOW the level' },
+    { field: 'fc_master_config.stereoAir', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: 'FC_ERR_REFUSED_BY_CORE', nonFinite: 'none', resolved: '', depends: 'channels: refused on a chain that is not exactly 2, as monoBass is — a stereo tool doing nothing on a mono programme is the failure this refusal exists for' },
+    { field: 'fc_master_params.stereoAir', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: 'fc_master_config.stereoAir: without the island in the topology this parameter has nothing to engage' },
+    { field: 'fc_master_params.stereoAirHz', unit: 'Hz', min: 3000, max: 12000, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'stereoAirHz', depends: 'sampleRate: the ceiling is the LESSER of 12000 and 0.45 fs, so at 8 kHz the range collapses to [3000, 3600] and this column\'s 12000 is not reachable there. The resolved field is what was applied' },
+    { field: 'fc_master_params.stereoAirDb', unit: 'dB', min: 0, max: 6, open: '', edge: 'clamp', err: '', nonFinite: 'refuse', resolved: 'stereoAirDb', depends: 'this is the PLATEAU: the shelf reaches half of it AT stereoAirHz and the rest above. 0 skips the filter and is bit-identical to the flag being off' },
     { field: 'fc_master_params.bypassEq', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.bypassMonoBass', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
     { field: 'fc_master_params.bypassCompressor', unit: 'flag', min: null, max: null, open: '', edge: 'any', err: '', nonFinite: 'none', resolved: '', depends: '' },
