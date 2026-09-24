@@ -5,7 +5,7 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
-## v0.48.0 — 2026-09-23
+## v0.48.0 — 2026-09-24
 
 ### Added — K13, a peak clipper, and it lives INSIDE the limiter's oversampling island
 
@@ -66,7 +66,7 @@ early and `limiterMaxReconstructedPeakDb` reports the *clipped* value: on a prog
 dressed as a measurement, plausible and under the ceiling and invisible to any range check. The planted
 control is in the suite.
 
-## v0.47.0 — 2026-09-23
+## v0.47.0 — 2026-09-24
 
 ### Added — `analysis::StereoBandBursts`: which axis carried the burst
 
