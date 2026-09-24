@@ -802,8 +802,28 @@ public:
         r.oversampleFactor    = cfg_.limiter ? lim_.oversampleFactor()
                                              : (cfg_.clipper ? cfg_.oversampleFactor : 0);
         r.compressorTapOffset = 0;
-        r.limiterTapOffset    = r.compressorLookahead + r.clipperLatency
-                              + (cfg_.limiter ? (lim_.latencySamples() - lim_.lookaheadSamples()) / 2 : 0);
+        // THE UP LEG IS NOT HALF THE ROUND TRIP, and that is the whole of this fix. The limiter's trace is
+        // written where the gain is DECIDED, on the oversampled copy, so the tap lags by the UP leg alone —
+        // and for the Kaiser polyphase that leg is (N - 1) / (2F) with N = factor * tapsPerPhase, which at
+        // 4x/64 is 255/8 = 31.875 frames. Half the reported round trip is 31.5, and the integer division of
+        // it gave 31: the published number ran 0.875 frames EARLY, and a consumer cropping a statistic by it
+        // cropped a frame short.
+        //
+        // MEASURED, not argued, because two earlier readings of this disagreed. Impulse into the chain with
+        // the limiter neutralised, the tap's own response is exactly symmetric about oversampled index
+        // x.5 — the two samples either side are bit-identical, the pairs around them too — and its energy
+        // centroid lands on 31.8750 frames. The maximum SAMPLE sits at 31.75, a quarter frame early, because
+        // a half-sample group delay puts the crest between two equal samples; reading the argmax is what
+        // made this look like a simple truncation. The audio is unaffected: the limiter's own delay measures
+        // exactly 111 samples, so the chain's PDC was never wrong.
+        //
+        // Kaiser is what the chain builds (limiterConfigFor leaves `topology` at its default); a Cascade
+        // switch would have to re-derive this, and the +0 below is where that would go.
+        const int limUpLegFrames = cfg_.limiter
+            ? (cfg_.oversampleFactor * cfg_.tapsPerPhase - 1 + cfg_.oversampleFactor)
+              / (2 * cfg_.oversampleFactor)                      // (N-1)/(2F) rounded to nearest
+            : 0;
+        r.limiterTapOffset    = r.compressorLookahead + r.clipperLatency + limUpLegFrames;
         r.limiterCeilingDbTp  = cfg_.limiter ? lim_.effectiveCeilingDbTp() : 0.0;
         r.limiterReleaseMs    = cfg_.limiter ? lim_.effectiveReleaseMs() : 0.0;
         r.monoBass            = cfg_.monoBass ? monoBass_.params() : stereo::MonoBassParams { false, 0.0f, 0.0f };
