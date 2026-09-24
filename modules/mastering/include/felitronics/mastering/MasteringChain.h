@@ -154,6 +154,20 @@ struct MasteringChainParams
 // A render feeds `frames` of programme and then `latencySamples()` zeros, so the tap frames that carry
 // real programme are the ones whose INPUT index is below `frames` — which is the window a statistic
 // must be cropped to, and the reason the offsets above are part of the contract.
+// K5 — the width of one tap row: every band by every lane. The dynamic delta lives PER LANE, not per
+// band: the `dyn` block is shared but each lane has its own probe, its own level and its own delta, so a
+// band with Mid and Side both enabled has two different answers at once and "the band's GR" is not one
+// number. Indexing by the pair is what keeps that true tomorrow as well as today.
+inline constexpr int kBandGrBands  = eq::EqEngine::kMaxBands;
+inline constexpr int kBandGrLanes  = eq::kNumLanes;
+inline constexpr int kBandGrStride = kBandGrBands * kBandGrLanes;
+inline constexpr int bandGrIndex (int band, int lane) noexcept { return band * kBandGrLanes + lane; }
+// The delta's own reachable range, and it is NOT the limiter's 400 dB: `LaneDynamics` clamps |rangeDb| to
+// 30 and the gain computer saturates there exactly (measured: a request of 99 dB reaches 30.0000 and not a
+// hair more). A histogram over 0..30 therefore covers everything that can happen and costs a thirteenth of
+// one over the limiter's scale. It also makes `aboveRange` structurally zero for a band — see the ABI note.
+inline constexpr double kBandGrRangeDb = 30.0;
+
 struct MasteringChainTaps
 {
     // Per BASEBAND frame. `frameCapacity` covers both of these.
@@ -161,14 +175,25 @@ struct MasteringChainTaps
     float* const* preLimiter     = nullptr;      // numChannels planes
     int           frameCapacity  = 0;
 
+    // K5 — per QUANTUM, one row of `kBandGrStride` values: the dynamic delta of every (band, lane) pair
+    // as it stood at the end of that quantum. Per quantum and not per frame on purpose — the value is a
+    // smoothed envelope read by a 4 ms window statistic, and a per-frame plane would be 120 floats a
+    // sample for a number that moves on a 20 ms clock. `bandQuantaWritten` is set by every accepted call.
+    //
+    // THE SIGN IS KEPT. The statistics take |delta|, but a caller reading the tap itself must be able to
+    // tell a cut from a lift, and `rangeDb` is the caller's own parameter, not the tap's.
+    float*        bandDeltaDb    = nullptr;
+    int           bandQuantaCapacity = 0;
+
     // Per OVERSAMPLED sample: `MasteringChain::tapOversampleFactor()` samples per frame.
     float*        limiterGrDb    = nullptr;
     float*        limiterPeakLin = nullptr;
     int           osCapacity     = 0;
 
-    // OUT. Set by every accepted call, including one that ran no quantum (both zero).
+    // OUT. Set by every accepted call, including one that ran no quantum (all three zero).
     int framesWritten = 0;
     int osWritten     = 0;
+    int bandQuantaWritten = 0;
 };
 
 // What the chain ACTUALLY applied, after every stage's own clamps and refusals. `configure` in the
@@ -873,6 +898,7 @@ public:
     {
         taps.framesWritten = 0;
         taps.osWritten     = 0;
+        taps.bandQuantaWritten = 0;
         if (numChannels < 0 || numSamples < 0) return false;
         if (! prepared_ || io == nullptr) return false;
         if (numChannels != nch_) return false;   // the chain's width is EXACT: the stages behind it are
@@ -891,6 +917,9 @@ public:
             && (long long) taps.frameCapacity < willFrames) return false;
         if ((taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr)
             && (long long) taps.osCapacity < willFrames * (long long) osFactor_) return false;
+        // K5's row is per QUANTUM, so its capacity is counted in quanta and not in frames — the one
+        // tap here whose clock is not the sample.
+        if (taps.bandDeltaDb != nullptr && (long long) taps.bandQuantaCapacity < willRun) return false;
         if (numSamples == 0) return true;
         stageRefused_ = false;                   // this call's verdict; the quanta below OR into it
         // Only borrowed when something was actually asked for. The plain three-argument form forwards a
@@ -898,7 +927,8 @@ public:
         // on a long offline call for a caller that never asked for a trace: 2^31 / 256 quanta is 12
         // hours of audio at 48 kHz, which an offline whole-file call can reach.
         const bool wantTaps = (taps.compressorGrDb != nullptr || taps.preLimiter != nullptr
-                               || taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr);
+                               || taps.limiterGrDb != nullptr || taps.limiterPeakLin != nullptr
+                               || taps.bandDeltaDb != nullptr);
         tap_ = wantTaps ? &taps : nullptr;       // read by runQuantum(); cleared before returning
 
         for (int off = 0; off < numSamples; )
@@ -999,6 +1029,17 @@ private:
                 const float* const* key = dynArmed_ ? eq_->captureSectionInput (ch, nch_, K_) : nullptr;
                 for (int i = 0; i < eq::EqEngine::kMaxBands; ++i)
                     stageRefused_ |= ! dyn_[(std::size_t) i].processBand (ch, key, nch_, K_, eq_->bandAt (i));
+                // K5 — one row per quantum, read AFTER every band has run, so the row is a coherent
+                // snapshot of the whole point bank at one instant rather than a diagonal across it.
+                if (tap_ != nullptr && tap_->bandDeltaDb != nullptr)
+                {
+                    float* row = tap_->bandDeltaDb
+                               + (std::size_t) tap_->bandQuantaWritten * (std::size_t) kBandGrStride;
+                    for (int i = 0; i < kBandGrBands; ++i)
+                        for (int l = 0; l < kBandGrLanes; ++l)
+                            row[(std::size_t) bandGrIndex (i, l)] =
+                                (float) dyn_[(std::size_t) i].deltaDb ((eq::Lane) l);
+                }
             }
             else if (bypassChanged_.eq)
             {
@@ -1125,7 +1166,8 @@ private:
         // --- dither, last, and only when it is not bypassed --------------------------------------
         if (cfg_.dither && ! params_.bypassDither) stageRefused_ |= ! dith_.process (ch, nch_, K_);
 
-        if (tap_ != nullptr) { tap_->framesWritten += K_; tap_->osWritten += K_ * osFactor_; }
+        if (tap_ != nullptr) { tap_->framesWritten += K_; tap_->osWritten += K_ * osFactor_;
+                               ++tap_->bandQuantaWritten; }
         bypassChanged_ = {};
     }
 

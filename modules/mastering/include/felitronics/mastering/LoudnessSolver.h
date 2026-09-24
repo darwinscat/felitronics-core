@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <limits>
 #include <utility>
+#include <array>
 #include <vector>
 
 namespace felitronics::mastering
@@ -539,6 +540,36 @@ struct GainReductionTrace
     }
 };
 
+// K5 — ONE ARMED (band, lane) PAIR'S GAIN REDUCTION. The dynamic delta lives per LANE, not per band: the
+// `dyn` block is shared but each lane has its own probe, level and delta, so a band with Mid and Side both
+// enabled has two different answers at once. Indexed by the pair for that reason.
+//
+// ONLY ARMED PAIRS ARE HERE, and "armed" is the same predicate the ABI's refusals use — `dyn.on`,
+// `rangeDb != 0`, the lane enabled — so "has a statistic" and "is not refused" are one set by construction
+// rather than by agreement. The cost is why: at 0.01 dB over the delta's own +-30 dB a histogram is 24 KB
+// and the pair needs two, so one armed pair is about 48 KB while a full 24x5 grid would have been 5.8 MB
+// of which 119 pairs' worth is never read. (Measured through `operator new`, not `sizeof`: the object is
+// 120 bytes and its bins are a separate allocation, which is how an earlier estimate came out 2500x low.)
+// WHY A PAIR HAS NO STATISTIC — decided HERE, beside the arming itself, and carried in the solution. A
+// facade re-deriving "armed" from the parameters would be a SECOND definition of it, and the two would
+// drift the first time one of them was edited. One predicate, one place, and the refusal is its output.
+enum class BandGrAbsence : std::uint8_t
+{
+    Armed = 0,      // the pair has a statistic
+    NotDynamic,     // `dyn.on` is false
+    Inert,          // `dyn.on` is true and `rangeDb` is 0 — the core's own "no dynamics"
+    LaneOff         // the lane is not enabled in that band
+};
+
+struct BandGrResult
+{
+    int band = -1, lane = -1;
+    GainReductionStats       whole {};    // over the whole programme — "how OFTEN it worked"
+    ActiveGainReductionStats active {};   // over windows with a non-zero delta — "how DEEP when it did"
+    GainReductionTrace       trace {};
+};
+
+
 // THE TRACE'S THREE STEPS, as one small object the solver's tap sink drives — public so the one path no audio can
 // reach through the solver (a non-finite tap: the chain sanitises its input) can be tested directly.
 //   * construction — before a render: bucketsFor(requested, frames) buckets, `requested` clamped to [1, kMaxBuckets],
@@ -769,6 +800,18 @@ struct LoudnessSolution
     double preLimiterGainDb = 0.0;              // what was applied to produce the delivered render
     double ceilingDbTp      = 0.0;              // ... and the ceiling the limiter was actually given
     MasterMeasurement measured {};              // of the DELIVERED render, always — never of a probe
+    // K5 — the armed (band, lane) pairs of THIS solve, in band-then-lane order. Only armed pairs appear;
+    // `bandGrFor` returns nullptr for the rest, which the ABI turns into the refusal that says WHY.
+    std::vector<BandGrResult> bandGr {};
+    // One entry per (band, lane), indexed by `bandGrIndex`. `Armed` here and a null from `bandGrFor`
+    // together would be this class's own bug, not a caller's.
+    std::array<BandGrAbsence, (std::size_t) kBandGrStride> bandGrAbsence {};
+
+    const BandGrResult* bandGrFor (int band, int lane) const noexcept
+    {
+        for (const auto& b : bandGr) if (b.band == band && b.lane == lane) return &b;
+        return nullptr;
+    }
 
     // RENDERS SPENT, all of them. `maxPasses` bounds the SEARCH; delivering the chosen candidate can
     // cost one more when the search did not end on it, and the bracket rescue (see solve()) costs one
@@ -873,6 +916,12 @@ public:
         compTap_.assign ((std::size_t) frameCap_, 0.0f);
         limTap_.assign  ((std::size_t) osCap_, 0.0f);
         limPeak_.assign ((std::size_t) osCap_, 0.0f);
+        // K5 — the band tap is counted in QUANTA, and a quantum is at least one frame, so a capacity of
+        // `frameCap` rows can never be short however small the internal block turns out to be. 120 floats
+        // a row: sized here because process() refuses a tap it cannot fill, and refusing mid-solve for a
+        // buffer this class owns would be its own bug rather than the caller's.
+        bandQuantaCap_ = frameCap_;
+        bandTap_.assign ((std::size_t) bandQuantaCap_ * (std::size_t) kBandGrStride, 0.0f);
         // The gain-reduction range: `GainComputer` caps its own range at 400 dB, and the limiter's is
         // bounded by its ceiling clamp. 400 covers both, and anything past it is COUNTED rather than
         // folded into the top bin, so a quantile that lands there answers `false` instead of lying.
@@ -939,7 +988,14 @@ public:
         if (! tapLayoutFor (rendererBlock, internalBlock, oversampleFactor, frameCap, osCap)) return 0;
         const std::uint64_t hist = dynamics::offline::QuantileHistogram::storageBytes (0.0, kGrRangeDb, binDb);
         if (hist == 0) return 0;
-        return (std::uint64_t) sizeof (float) * ((std::uint64_t) frameCap + 2u * (std::uint64_t) osCap) + 3u * hist;
+        // K5's band tap, sized in QUANTA and capped at `frameCap` rows because a quantum is never shorter
+        // than a frame. Counted here whether or not any band is armed: prepare() allocates it either way,
+        // and a budget that describes only the interesting case is the kind of law-11d lie this function
+        // exists to prevent.
+        const std::uint64_t bandTap = (std::uint64_t) sizeof (float)
+                                    * (std::uint64_t) frameCap * (std::uint64_t) kBandGrStride;
+        return (std::uint64_t) sizeof (float) * ((std::uint64_t) frameCap + 2u * (std::uint64_t) osCap)
+             + 3u * hist + bandTap;
     }
 
     // solve(): its PEAK. Every pass builds a loudness meter and the reference true-peak meter and frees them at the
@@ -2016,8 +2072,52 @@ private:
                      const float* const* in, float* const* out, int nch, int frames,
                      const LoudnessRequest& req, MasterMeasurement& m, LoudnessSolution& sol, ProgressClock& clock)
     {
-        (void) params;
         maxReconLin_ = 0.0f;
+        // K5 — THE ARMED PAIRS OF THIS SOLVE, decided once and from the parameters the render will use.
+        // "Armed" is exactly the ABI's three refusals turned inside out: the band's dynamics are on, its
+        // range is not zero (the header's own "0 == no dynamics"), and the lane is enabled. Deciding it
+        // here rather than per pair is what makes "has a statistic" and "is not refused" one set.
+        struct Armed { int band, lane; };
+        std::vector<Armed> armed;
+        for (int b = 0; b < kBandGrBands; ++b)
+        {
+            const eq::BandParams& bpar = params.eqBands[(std::size_t) b];
+            const BandGrAbsence bandWhy = ! bpar.dyn.on                       ? BandGrAbsence::NotDynamic
+                                        : ! (std::fabs (bpar.dyn.rangeDb) > 0.0) ? BandGrAbsence::Inert
+                                                                                 : BandGrAbsence::Armed;
+            for (int l = 0; l < kBandGrLanes; ++l)
+            {
+                const BandGrAbsence why = bandWhy != BandGrAbsence::Armed ? bandWhy
+                                        : (bpar.lanes[(std::size_t) l].on ? BandGrAbsence::Armed
+                                                                          : BandGrAbsence::LaneOff);
+                sol.bandGrAbsence[(std::size_t) bandGrIndex (b, l)] = why;
+                if (why == BandGrAbsence::Armed) armed.push_back ({ b, l });
+            }
+        }
+        // Two histograms per armed pair, over the DELTA'S OWN range rather than the limiter's 400 dB: the
+        // core clamps |delta| to 30 dB, so 0..30 is the whole reachable set and costs 24 KB instead of 320.
+        std::vector<dynamics::offline::QuantileHistogram> bandWholeH (armed.size()), bandActiveH (armed.size());
+        for (std::size_t i = 0; i < armed.size(); ++i)
+            if (! bandWholeH[i].prepare (0.0, kBandGrRangeDb, 0.01)
+                || ! bandActiveH[i].prepare (0.0, kBandGrRangeDb, 0.01)) return false;
+        std::vector<GainReductionSummariser> bandWhole;
+        std::vector<ActiveWindowGrSummariser> bandActive;
+        bandWhole.reserve (armed.size()); bandActive.reserve (armed.size());
+        // The band tap's clock is the QUANTUM, not the sample: one row per internal block, so the 4 ms
+        // window is counted in rows and the two statistics still describe the same 4 ms as the others.
+        const int  bandK   = chain.resolved().internalBlock;
+        const long long bandWin = grQuantileWindowSamples (fs_ / (double) (bandK > 0 ? bandK : 1));
+        for (std::size_t i = 0; i < armed.size(); ++i)
+        {
+            // activity 0.0: "active" for a band is "the delta was not zero", which is the fraction the
+            // page reads as "how often it worked". And the ACTIVE half is gated at -inf on the delta's
+            // own magnitude — the widest gate that still excludes silence, which for this signal means
+            // exactly "a window in which the band did something". Gating on the band's INPUT instead
+            // would admit all the music and dilute the depth back to the whole-programme number.
+            bandWhole.emplace_back (bandWholeH[i], bandWin, 0.0);
+            bandActive.emplace_back (bandActiveH[i], bandWin, 0.0,
+                                     -std::numeric_limits<double>::infinity());
+        }
         // Each tap on its own clock: the compressor's is one sample a frame, the limiter's `tapOversampleFactor`
         // times faster, and the window is 4 ms on both.
         GainReductionSummariser compSum (compHist_, grQuantileWindowSamples (fs_), req.activityThresholdDb);
@@ -2036,7 +2136,27 @@ private:
         sol.limiterGrWindows.reset();
         sol.limiterActiveGrWindows.reset();
         sol.limiterActive = ActiveGainReductionStats {};
-        if (! renderTapped (chain, renderer, in, out, nch, frames, compSum, limSum, limActive, compTrace, limTrace, clock)) return false;
+        std::vector<std::pair<int, int>> armedPairs;
+        armedPairs.reserve (armed.size());
+        for (const Armed& a2 : armed) armedPairs.emplace_back (a2.band, a2.lane);
+        sol.bandGr.clear();
+        sol.bandGr.resize (armed.size());
+        std::vector<GainReductionTraceBuilder> bandTrace;
+        bandTrace.reserve (armed.size());
+        for (std::size_t i = 0; i < armed.size(); ++i)
+            bandTrace.emplace_back (sol.bandGr[i].trace, frames, req.grTraceBuckets);
+        if (! renderTapped (chain, renderer, in, out, nch, frames, compSum, limSum, limActive, compTrace, limTrace,
+                            armedPairs, bandWhole, bandActive, bandTrace, clock)) return false;
+        for (std::size_t i = 0; i < armed.size(); ++i)
+        {
+            bandTrace[i].finish();
+            sol.bandGr[i].band   = armed[i].band;
+            sol.bandGr[i].lane   = armed[i].lane;
+            // 0.95 because the field is named p95Db and no LIMIT binds a band's delta — unlike the
+            // compressor and the limiter, whose quantile is the one their own constraint is judged at.
+            sol.bandGr[i].whole  = bandWhole[i].finish (0.95);
+            sol.bandGr[i].active = bandActive[i].finish (0.95);
+        }
         compTrace.finish();
         limTrace.finish();
 
@@ -2081,6 +2201,10 @@ private:
                        GainReductionSummariser& compSum, GainReductionSummariser& limSum,
                        ActiveWindowGrSummariser& limActive,
                        GainReductionTraceBuilder& compTrace, GainReductionTraceBuilder& limTrace,
+                       const std::vector<std::pair<int, int>>& armed,
+                       std::vector<GainReductionSummariser>& bandWhole,
+                       std::vector<ActiveWindowGrSummariser>& bandActive,
+                       std::vector<GainReductionTraceBuilder>& bandTrace,
                        ProgressClock& clock)
     {
         const int F = chain.tapOversampleFactor();
@@ -2109,9 +2233,37 @@ private:
         taps.limiterGrDb    = limTap_.data();
         taps.limiterPeakLin = limPeak_.data();
         taps.osCapacity     = osCap_;
+        // K5 — one ROW per quantum, and only when something armed asks for it: a caller with no dynamic
+        // band must not pay a 120-float row per internal block for a statistic nobody will read.
+        if (! armed.empty())
+        {
+            taps.bandDeltaDb        = bandTap_.data();
+            taps.bandQuantaCapacity = bandQuantaCap_;
+        }
 
         auto sink = [&] (const MasteringChainTaps& t, long long tapPos) noexcept
         {
+            // K5 — the band rows first, on their own clock. No offset arithmetic: the dynamic points are
+            // ZERO-LATENCY (the chain says so where the EQ stage is described), so a row written during a
+            // quantum describes that quantum's own programme and has nothing to be aligned against.
+            const long long bandK = (long long) (r.internalBlock > 0 ? r.internalBlock : 1);
+            for (int q = 0; q < t.bandQuantaWritten && t.bandDeltaDb != nullptr; ++q)
+            {
+                const float* row = t.bandDeltaDb + (std::size_t) q * (std::size_t) kBandGrStride;
+                for (std::size_t k = 0; k < armed.size(); ++k)
+                {
+                    const double d = std::fabs ((double) row[(std::size_t) bandGrIndex (armed[k].first,
+                                                                                        armed[k].second)]);
+                    bandWhole[k].add (d);
+                    // THE GATING SIGNAL IS THE DELTA ITSELF, not the band's input and not the programme.
+                    // With the gate at -inf that reads as "any window in which this band did something";
+                    // handing it the input instead would admit every window with music in it and dilute
+                    // the depth back into the whole-programme number this pair exists to separate from.
+                    bandActive[k].add (d, d);
+                    bandTrace[k].add ((std::uint64_t) ((tapPos + (long long) q * bandK) < 0 ? 0
+                                                       : (tapPos + (long long) q * bandK)), d);
+                }
+            }
             for (int j = 0; j < t.framesWritten; ++j)
             {
                 const long long s = tapPos + j;
@@ -2343,7 +2495,8 @@ private:
     int    nch_ = 0, frameCap_ = 0, osCap_ = 0;
     bool   prepared_ = false;
 
-    std::vector<float> compTap_, limTap_, limPeak_;
+    std::vector<float> compTap_, limTap_, limPeak_, bandTap_;
+    int    bandQuantaCap_ = 0;
     dynamics::offline::QuantileHistogram compHist_, limHist_, limActiveHist_;
     float  maxReconLin_ = 0.0f;
 

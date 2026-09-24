@@ -82,8 +82,14 @@ const std::uint64_t kGrWindowBytes =
 // are added one by one and a change to any of them names itself instead of being absorbed into a total.
 // K13 (v11) took it from 2368 to 2416: the measurement gained three doubles and three int64s for what
 // the peak clipper did. K14 (v12) took it to 2464 for the air band's five doubles and its sample count.
-// Exactly 48 bytes each time, and the pin is here so that a growth nobody meant names itself.
-constexpr std::uint64_t kSolutionRecordRest = 2464u;
+// K5 (v13) took it to 2608: the solution's list of armed (band, lane) results, and one byte per pair
+// saying why the rest have none. The pin is here so
+// that a growth nobody meant names itself.
+// K5 (v13) left this at its pre-K5 value on a 64-bit host, because both members it added are subtracted
+// at the check below — which is the point of subtracting them. wasm32 is four bytes tighter: the 120-byte
+// absence array lands in padding the smaller vector leaves behind, and no single term expresses that. The
+// two spellings are stated rather than absorbed into an inequality, because an inequality is not a pin.
+constexpr std::uint64_t kSolutionRecordRest = sizeof (void*) == 8 ? 2464u : 2460u;
 
 // The topology axis of the P41 create/configure matrix — see the switch that reads it.
 constexpr int kTopologies = 9;
@@ -1900,13 +1906,14 @@ int main()
     group ("the version rule — what is read, what is written, and nothing past the caller's size");
     {
         const std::uint32_t kCur = FC_MASTER_ABI_VERSION;
-        ok (kCur == 12u, "PRECONDITION: this group is written for v12 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
+        ok (kCur == 13u, "PRECONDITION: this group is written for v13 (v2: deliveryRate; v3: compressorMix; v4: the GR trace; "
                          "v5: fc_master_set_progress, no struct grew; v6: M2 — params, resolved and request grew; "
                          "v7: fc_master_eq_curve, no struct grew; v8: the request's two quantiles and "
                          "fc_solution_gr_quantile; v9: fc_master_eq_dyn_times, no struct grew; v10: K11 — the request's "
                          "limiter input gate, fc_gr_active_stats and fc_solution_gr_active_stats; v11: K13 — the peak "
                          "clipper inside the limiter, params/resolved/measurement grew; v12: K14 — the Side air "
-                         "shelf: config, params, resolved and measurement grew)");
+                         "shelf: config, params, resolved and measurement grew; v13: K5 — three entry points for a "
+                         "dynamic band's gain reduction and three refusal codes, no struct grew)");
 
         // THE TABLE (rule 5), every (struct, version) pair of today.
         ok (fc_master_sizeof (FC_STRUCT_CONFIG, 1) == 80u && fc_master_sizeof (FC_STRUCT_CONFIG, 2) == 88u
@@ -2287,10 +2294,18 @@ int main()
             fc_master hb = make();
             fc_need nd {}; FC_INIT (nd);
             using felitronics::dynamics::offline::QuantileHistogram;
+            // K5's list is a std::vector, and a vector is THREE POINTERS — 24 bytes on a 64-bit host and 12
+            // on wasm32. Subtracting it here the way the traces and the histograms are already subtracted
+            // is what keeps `kSolutionRecordRest` one number for both tiers; folding it into the constant
+            // instead would have made the pin pass on the desktop and fail in the browser, which is how
+            // this was found.
             ok (fc_master_need (hb, FC_NEED_SOLVE, 48000u, &nd) == FC_OK
                 && nd.facadeBytes == kSolutionRecordRest + 2u * sizeof (GainReductionTrace)
                                       + 3u * sizeof (QuantileHistogram)
                                       + sizeof (felitronics::mastering::ActiveGainReductionStats)
+                                      + sizeof (std::vector<felitronics::mastering::BandGrResult>)
+                                      + sizeof (std::array<felitronics::mastering::BandGrAbsence,
+                                                           (std::size_t) felitronics::mastering::kBandGrStride>)
                 && sizeof (GainReductionTrace) == (24u + sizeof (GainReductionTrace::bucket) + 7u) / 8u * 8u,
                 "a solution record costs " + std::to_string (kSolutionRecordRest) + " B plus two traces of "
                 + std::to_string (sizeof (GainReductionTrace)) + " B, three window histograms of "
