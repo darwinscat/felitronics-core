@@ -1962,6 +1962,103 @@ FC_EXPORT fc_status fc_solution_gr_trace64 (fc_solution sh, std::int32_t stage, 
     return copyTrace (sh, stage, out, cap, written);
 }
 
+// v13 (K5) — WHICH (band, lane) PAIR, and why a pair with no statistic is refused rather than zeroed.
+// `band` and `lane` are INDICES, not enum codes, so an out-of-range one is FC_ERR_RANGE — the same reading
+// `fc_master_eq_dyn_times` gives them. The three "no statistic" cases are separated because a page must
+// show them differently: a band with no dynamics, a band armed with a zero range (the core's own header
+// calls that "no dynamics" too, but it is a DIFFERENT thing to tell a user), and a lane that is not on.
+// Answering any of them with zeroes would say the band never worked, which is a measurement; the truth is
+// that nothing measured it.
+fc_status bandPairStatus (const LoudnessSolution& v, std::int32_t band, std::int32_t lane,
+                          const felitronics::mastering::BandGrResult*& out) noexcept
+{
+    if (band < 0 || band >= FC_MAX_EQ_BANDS || lane < 0 || lane >= FC_MAX_EQ_LANES) return FC_ERR_RANGE;
+    using A = felitronics::mastering::BandGrAbsence;
+    // THE REASON COMES FROM THE SOLVE, not from re-reading the parameters here. Deriving "armed" a second
+    // time in this facade is how the two definitions start to disagree — and the disagreement would show
+    // as a refusal on a pair that has a statistic, or the reverse, neither of which any test would ask.
+    switch (v.bandGrAbsence[(std::size_t) felitronics::mastering::bandGrIndex (band, lane)])
+    {
+        case A::NotDynamic: return FC_ERR_BAND_NOT_DYNAMIC;
+        case A::Inert:      return FC_ERR_BAND_INERT;
+        case A::LaneOff:    return FC_ERR_LANE_OFF;
+        case A::Armed:      break;
+    }
+    out = v.bandGrFor (band, lane);
+    // ARMED AND ABSENT IS THIS LIBRARY'S OWN BUG, not a caller's: the solver fills the list from the very
+    // predicate that wrote the reason above, so the two cannot disagree unless one was edited alone.
+    return out != nullptr ? FC_OK : FC_ERR_STATE;
+}
+
+FC_EXPORT fc_status fc_solution_band_gr_stats (fc_solution sh, std::int32_t band, std::int32_t lane,
+                                               fc_gr_stats* out)
+{
+    FC_GUARD;
+    Slot* s = lookup (sh, Kind::Solution);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    if (out == nullptr) return FC_ERR_NULL;
+    if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
+    if (! inHeap (out, sizeof (fc_gr_stats))) return FC_ERR_SPAN;
+    const felitronics::mastering::BandGrResult* r = nullptr;
+    if (const fc_status st = bandPairStatus (*s->solution, band, lane, r); st != FC_OK) return st;
+    fc_gr_stats o {};
+    fromCore (r->whole, o);
+    *out = o;
+    return FC_OK;
+}
+
+FC_EXPORT fc_status fc_solution_band_gr_active_stats (fc_solution sh, std::int32_t band, std::int32_t lane,
+                                                      fc_gr_active_stats* out)
+{
+    FC_GUARD;
+    Slot* s = lookup (sh, Kind::Solution);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    std::uint32_t bytes = 0;
+    if (const fc_status st = checkHeader (out, bytes); st != FC_OK) return st;
+    const felitronics::mastering::BandGrResult* r = nullptr;
+    if (const fc_status st = bandPairStatus (*s->solution, band, lane, r); st != FC_OK) return st;
+    fc_gr_active_stats o {};
+    fromCore (r->active.stats, o.stats);
+    o.windows       = r->active.windows;
+    o.activeWindows = r->active.activeWindows;
+    o.thresholdDb   = r->active.thresholdDb;      // -inf: "any window in which this band did something"
+    writeOut (out, o, bytes);
+    return FC_OK;
+}
+
+FC_EXPORT fc_status fc_solution_band_gr_trace (fc_solution sh, std::int32_t band, std::int32_t lane,
+                                               fc_gr_trace_bucket64* out, std::uint32_t cap,
+                                               std::uint32_t* written)
+{
+    FC_GUARD;
+    Slot* s = lookup (sh, Kind::Solution);
+    if (s == nullptr) return FC_ERR_HANDLE;
+    if (const fc_status st = checkScalarOut (written); st != FC_OK) return st;
+    if (cap > 0)
+    {
+        if (out == nullptr) return FC_ERR_NULL;
+        if ((reinterpret_cast<std::uintptr_t> (out) & 0x7u) != 0) return FC_ERR_ALIGNMENT;
+        if (! inHeap (out, (std::uint64_t) cap * sizeof (fc_gr_trace_bucket64))) return FC_ERR_SPAN;
+        if (aliasesSpan (written, sizeof (*written), out,
+                         (std::uint64_t) cap * sizeof (fc_gr_trace_bucket64))) return FC_ERR_SPAN;
+    }
+    const felitronics::mastering::BandGrResult* r = nullptr;
+    // THE SPANS ARE CHECKED FIRST AND `written` IS SET LAST, as every copier here does it: a refusal must
+    // leave the caller's buffer and its count exactly as they were.
+    if (const fc_status st = bandPairStatus (*s->solution, band, lane, r); st != FC_OK) return st;
+    const felitronics::mastering::GainReductionTrace& t = r->trace;
+    const std::uint32_t nb = (std::uint32_t) t.buckets < cap ? (std::uint32_t) t.buckets : cap;
+    *written = 0;
+    for (std::uint32_t i = 0; i < nb; ++i)
+    {
+        const felitronics::mastering::GainReductionTraceBucket& b = t.bucket[i];
+        out[i].maxDb = b.maxDb; out[i].meanDb = b.meanDb;
+        out[i].samples = b.samples; out[i].nonFinite = b.nonFinite;
+    }
+    *written = nb;
+    return FC_OK;
+}
+
 // v8 — the stage code is read as `copyTrace` reads it (a switch on the CODE: an int outside the enum's range is
 // not a value of it), and `q` is then a field value like any other. Everything past that is the core's:
 // `LoudnessSolution::grQuantile` owns the admitted range of `q`, the "not a measurement" rule and the histogram.

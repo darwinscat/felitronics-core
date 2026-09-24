@@ -178,7 +178,7 @@ extern "C" {
 // TRANSITION. The rule makes v3 cheap for a page written against v2; it cannot reach back into a page already
 // shipped against v1, whose loader requires `version === 1` and fails on a v2 module before its first call.
 // The move from v1 to v2 on the site is therefore a coordinated release of the worker and the module together.
-#define FC_MASTER_ABI_VERSION 12u
+#define FC_MASTER_ABI_VERSION 13u
 
 typedef struct fc_header
 {
@@ -254,7 +254,19 @@ typedef enum fc_status
     FC_ERR_EXHAUSTED       = 13,   // no free slot in the handle table
     FC_ERR_POISONED        = 14,   // an earlier call into this module never returned: the instance is
                                    // abandoned, and nothing but a new one answers — see above
-    FC_ERR_CANCELLED       = 15
+    FC_ERR_CANCELLED       = 15,
+
+    // v13 (K5) — THE THREE WAYS A DYNAMIC BAND HAS NO STATISTIC, each its own code because a page must
+    // tell them apart: "off" and "armed but inert" are different things to show a user.
+    //
+    // AND WHY THESE REFUSE AT ALL, when `fc_master_eq_dyn_times` deliberately does not. That call answers
+    // a lane's BALLISTICS, which the core computes whatever the switch says — refusing there would be the
+    // facade inventing a rule the audio does not have. These calls answer a STATISTIC OF A RENDER, and a
+    // pair that was not armed while it ran has none: the absence is the audio's, not this facade's.
+    FC_ERR_BAND_NOT_DYNAMIC = 16,  // the band's `dyn.on` is false — it has no dynamics at all
+    FC_ERR_BAND_INERT       = 17,  // `dyn.on` is true but `rangeDb` is 0, which the core's own header
+                                   // calls "no dynamics": armed and motionless, which is not "off"
+    FC_ERR_LANE_OFF         = 18   // the lane is not enabled in that band, so it has no probe and no delta
 } fc_status;
 
 //==============================================================================
@@ -1382,6 +1394,51 @@ fc_status fc_solution_log (fc_solution s, fc_solve_pass* out, uint32_t cap, uint
 fc_status fc_solution_gr_trace (fc_solution s, int32_t stage, fc_gr_trace_bucket* out, uint32_t cap, uint32_t* written);
 // v6 — `fc_solution_gr_trace` into `fc_gr_trace_bucket64`, without the 32-bit check.
 fc_status fc_solution_gr_trace64 (fc_solution s, int32_t stage, fc_gr_trace_bucket64* out, uint32_t cap, uint32_t* written);
+
+//==============================================================================
+// v13 (K5) — WHAT A DYNAMIC EQ BAND DID, read by the (band, lane) PAIR.
+//
+// PER LANE, NOT PER BAND, and it is the core's shape rather than this facade's — the same surprise
+// `fc_master_eq_dyn_times` carries. The `dyn` block is shared by a point's lanes, but each lane has its
+// own probe, its own level and therefore its own delta: a band with Mid and Side both enabled has two
+// different answers at once, and "the band's GR" is not one number. `band` is 0..FC_MAX_EQ_BANDS-1 and
+// `lane` 0..FC_MAX_EQ_LANES-1; anything else is FC_ERR_RANGE.
+//
+// THE UNIT IS NOT THE COMPRESSOR'S. This is the DEPTH OF THE DYNAMIC DELTA AT THE BELL'S CENTRE, in dB,
+// as it stood at each internal quantum — not a change in loudness, and not one multiplier over the whole
+// signal the way a compressor's gain reduction is. The statistics carry |delta|; its SIGN is the sign of
+// `dyn.rangeDb`, which the caller already has: negative cuts as the band gets loud, positive lifts, and
+// the delta saturates at exactly `rangeDb` (measured: a request of 99 dB reaches 30.0000 and no further,
+// because the core clamps the magnitude to 30).
+//
+// TWO HALVES, AND NEITHER IS THE OTHER:
+//   * `fc_solution_band_gr_stats` — over the WHOLE programme. `activeFraction` is the share of quanta
+//     with a non-zero delta: "how OFTEN it worked".
+//   * `fc_solution_band_gr_active_stats` — over the windows in which the delta was not zero: "how DEEP
+//     when it did". Its `thresholdDb` echoes -inf, which this ABI's own gate documentation defines as
+//     "every window that carried any non-zero input at all" — and the gating signal here is the DELTA
+//     itself, so -inf reads as "any window in which this band did something". There is no dB threshold
+//     to set, and 0.0 is not written there because 0.0 would read as a gate at 0 dBFS.
+// The pair is not circular ONLY because both are published: the active number is conditioned, and the
+// whole-programme `activeFraction` states the condition. A page deciding "is a de-esser needed" from the
+// active p95 alone will always see a busy band. Measured, on a de-esser at 0.5 % sibilant duty: the delta
+// is non-zero on 9.6 % of quanta, the active p95 reads 5.41 dB and the whole-programme p95 reads 0.27.
+//
+// `aboveRange` IS STRUCTURALLY ZERO HERE, and that is not "nothing exceeded the range". The distribution
+// spans 0..30 dB because the core clamps |delta| to exactly that, so there is nothing above it to count.
+// The field is kept because `fc_gr_stats` is one shape shared with the compressor and the limiter.
+//
+// ONLY ARMED PAIRS HAVE AN ANSWER, and "armed" is exactly the three refusals turned inside out: `dyn.on`,
+// `rangeDb != 0`, the lane enabled. A pair that was not armed while the render ran has no statistic —
+// FC_ERR_BAND_NOT_DYNAMIC, FC_ERR_BAND_INERT or FC_ERR_LANE_OFF says which. That is a different rule from
+// `fc_master_eq_dyn_times`, which answers an off lane like any other, and the difference is the subject:
+// ballistics exist whatever the switch says, a statistic of a render does not.
+fc_status fc_solution_band_gr_stats        (fc_solution s, int32_t band, int32_t lane, fc_gr_stats* out);
+fc_status fc_solution_band_gr_active_stats (fc_solution s, int32_t band, int32_t lane, fc_gr_active_stats* out);
+// The trace of one pair, in the 64-bit bucket only — the 32-bit form is v4's legacy and a second way to
+// ask the same question is a second thing to keep true.
+fc_status fc_solution_band_gr_trace        (fc_solution s, int32_t band, int32_t lane,
+                                            fc_gr_trace_bucket64* out, uint32_t cap, uint32_t* written);
 // v8 — the q-quantile of a stage's |GR| over the audio this solution handed back, BY THE DEFINITION ITS LIMITS
 // WERE JUDGED BY (see fc_gr_statistic): a reading at the same `q` as an FC_GR_PERCENTILE limit is that limit's own
 // number, to the bit. `stage` is an fc_gr_stage, as for the trace; `q` is in (0, 1] and finite.

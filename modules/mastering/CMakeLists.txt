@@ -117,6 +117,12 @@ if(FELITRONICS_BUILD_TESTS)
     # P7 — the target-loudness solver, its constraints and its statistics. Separate from the chain's own
     # suite because it tests a different KIND of claim: not "the chain computes this", but "the search
     # lands here, in this many renders, and refuses by name when it cannot".
+    add_executable(felitronics_band_gr_tests tests/BandGrTests.cpp)
+    target_link_libraries(felitronics_band_gr_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_band_gr_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_band_gr_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_band_gr_tests COMMAND felitronics_band_gr_tests)
+
     add_executable(felitronics_loudness_solver_tests tests/LoudnessSolverTests.cpp)
     target_link_libraries(felitronics_loudness_solver_tests PRIVATE felitronics::mastering)
     target_include_directories(felitronics_loudness_solver_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
