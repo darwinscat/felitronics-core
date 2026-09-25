@@ -38,6 +38,7 @@ cmake_install.cmake
 CLAUDE.md
 .claude
 .private
+.dev
 
 # Stray logs
 *.log
