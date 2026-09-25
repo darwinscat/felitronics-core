@@ -28,11 +28,19 @@ Core keeps every mastering STAGE (`limiter`, `dither`, `deesser`, `multiband`, `
   exists (`ZONE-ROT`), and an include that resolves in both repositories is refused. Core's zone is now the
   four files the analyzers stand on (`ReferenceTruePeakMeter`, `OfflineFft`, `PolyphaseOversampler`,
   `CascadeOversampler`); core has no parity entry point left.
+- `modules/laws/tests/PublishedNumbersTests.cpp` (new): the stages' own law-11d numbers — `storageFor()` against
+  what `prepare()` allocates at each stage's clamps, `latencyFor()` against the prepared latency for the
+  compressor, limiter and saturator, `EqEngine::objectBytes()`, the delay line's re-clamped tap, `MonoBass`
+  `setParams()` — which the mastering chain's suite pinned and nothing else in core did. The meter's
+  conformance suite pins its chunk invariance bit for bit on every pre-gate block energy.
+- The det-math lint scans every file the parity closure reaches, whatever its extension (a `.inc` included
+  from a zone file was read by the closure and audited by nobody).
 - CI: the wasm job keeps the tier, the no-threads audit, the long-double gates and the three lints with
   their planted-violation controls (moved onto core's own zone; a new control plants a zone entry for a
   missing file); the wasm-spike build, the native-vs-wasm NULL steps and the storage-price step moved. The
   scope job's `abi` output is gone — nothing in this tree is an ABI any more.
 
-134 -> 100 tests (pffft on): 36 moved — the 34 suites of those modules and tools, plus the two split out of the
-law census and the math-policy gate on the way — carrying 10067 of the 30560 checks; every suite that stayed
-prints the number it printed before, except the census (528 -> 522).
+134 -> 101 tests (pffft on): 36 moved — the 34 suites of those modules and tools, plus the two split out of the
+law census and the math-policy gate on the way — carrying 10067 of the 30560 checks, and one was added. Every
+suite that stayed prints the number it printed before except the census (528 -> 522, the 6 went with the chain)
+and the loudness conformance suite (286 -> 294, the bit-exact chunking above).
