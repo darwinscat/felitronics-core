@@ -254,9 +254,11 @@ public:
     void setParams (const Params& p) noexcept
     {
         const bool shapeMoved = p.shape != params_.shape;
+        const bool dcMoved    = ! core::exactlyEqual (finite (p.dcBlockHz, 10.0f), finite (params_.dcBlockHz, 10.0f));
         params_ = p;
         if (fresh_ || shapeMoved || glideTicks_ == 0) { applyParams(); snapGlide(); return; }
-        applyDc();                                                       // a coefficient: lands at once
+        if (dcMoved) applyDc();                                          // a coefficient: lands at once — and only when
+                                                                         // it moved, so an unchanged write costs no exp()
         float t[kNumP];
         targetOf (params_, t);
         if (std::equal (t, t + kNumP, pt_)) return;                      // nothing continuous moved
@@ -384,7 +386,14 @@ private:
             dK_  = (ce_.sh.drive    - cs_.sh.drive)    / nOs;
             dB_  = (ce_.sh.bias     - cs_.sh.bias)     / nOs;
             dBt_ = (ce_.sh.biasTanh - cs_.sh.biasTanh) / nOs;
-            dN_  = (ce_.sh.norm     - cs_.sh.norm)     / nOs;
+            // THE NORMALISER IS INTERPOLATED AS ITS RECIPROCAL — the curve's raw peak, which moves WITH k — and
+            // divided by, never interpolated itself. norm ~ 1/k for a small drive, so a straight line between two
+            // norms is not a straight line between two curves: the code-review round measured a 0 -> 3 dB glide
+            // on a constant 0.2 peaking at 7.665 (k from 1e-4 to 0.015 in the first period, norm from 10000 to 67,
+            // and halfway along k·norm was 37 where the curve's slope is 1). The raw peak is ~k there, so k/raw
+            // stays at the curve's own slope all the way.
+            rs_  = 1.0f / cs_.sh.norm;
+            dR_  = (1.0f / ce_.sh.norm - rs_) / nOs;
             dC_  = (ce_.comp - cs_.comp) / nB;
             dM_  = (ce_.mix  - cs_.mix)  / nB;
             dO_  = (ce_.out  - cs_.out)  / nB;
@@ -428,7 +437,8 @@ private:
 
     // The interpolated curve over one os-rate run starting at os index `r0` of the period: every coefficient is
     // `start + d * index`, the product and the sum in SEPARATE statements so `-ffp-contract=on` fuses neither
-    // (law 10) — the value is a function of the index alone, never of an accumulator a cut could reset.
+    // (law 10) — the value is a function of the index alone, never of an accumulator a cut could reset. The
+    // peak normaliser enters as a DIVISION by the interpolated raw peak (see tick()).
     template <WaveShaper::Shape S>
     void shapeGlide (float* b, int osN, int r0, int c) noexcept
     {
@@ -437,10 +447,11 @@ private:
         for (int i = 0; i < osN; ++i)
         {
             const float r = (float) (r0 + i);
-            const float ek = dK_ * r, eb = dB_ * r, et = dBt_ * r, en = dN_ * r;
+            const float ek = dK_ * r, eb = dB_ * r, et = dBt_ * r, er = dR_ * r;
             WaveShaper::Coeffs k;
-            k.drive = cs_.sh.drive + ek; k.bias = cs_.sh.bias + eb; k.biasTanh = cs_.sh.biasTanh + et; k.norm = cs_.sh.norm + en;
-            const float w = WaveShaper::shapeAt<S> (k, b[i]);
+            k.drive = cs_.sh.drive + ek; k.bias = cs_.sh.bias + eb; k.biasTanh = cs_.sh.biasTanh + et; k.norm = 1.0f;
+            const float raw = rs_ + er;
+            const float w = WaveShaper::shapeAt<S> (k, b[i]) / raw;     // the curve at norm 1, over its raw peak
             if (dc)
             {
                 const float d = w - x1 + dcR_ * y1;                      // the settled loop's DC blocker, verbatim
@@ -673,7 +684,7 @@ private:
     double pv_[kNumP] {}, pd_[kNumP] {};
     float  pt_[kNumP] {};
     Consts cs_ {}, ce_ {};
-    float  dK_ = 0.0f, dB_ = 0.0f, dBt_ = 0.0f, dN_ = 0.0f, dC_ = 0.0f, dM_ = 0.0f, dO_ = 0.0f;
+    float  dK_ = 0.0f, dB_ = 0.0f, dBt_ = 0.0f, rs_ = 1.0f, dR_ = 0.0f, dC_ = 0.0f, dM_ = 0.0f, dO_ = 0.0f;
     int    ranNc_ = 0, ranDcNc_ = 0;                       // what advanced state on the previous accepted call
 
     std::vector<float>  osBuf_, wetBuf_;

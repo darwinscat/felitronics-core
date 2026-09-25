@@ -142,7 +142,9 @@ static void testFirstWriteSnaps()
     for (int os : { 1, 4 })
     {
         const std::string tag = " (os " + std::to_string (os) + ")";
-        const Sat::Params a = P (Shape::Tanh, 3.0f), b = P (Shape::Asym, 12.0f, 0.2f, 0.7f, -2.0f, 0.9f);
+        // b keeps a's SHAPE: a shape change snaps on its own, and would prove nothing about the first-write rule
+        // (the code-review round found the first version of this test passing with that rule removed).
+        const Sat::Params a = P (Shape::Tanh, 3.0f), b = P (Shape::Tanh, 12.0f, 0.2f, 0.7f, -2.0f, 0.9f);
         // The reference: b written before prepare(), the only order that never involved a glide.
         const Buf ref = render (x, os, 512, b, {}, fixed (512));
         // prepare(a) -> setParams(b) -> process: the write lands at once.
@@ -150,6 +152,7 @@ static void testFirstWriteSnaps()
         Sat s; s.setParams (a);
         ok (s.prepare (kFs, 512, 2, os), "PRECONDITION: prepare" + tag);
         s.setParams (P (Shape::Tanh, 20.0f));                  // several writes before the first sample: all snap
+        ok (! s.isGliding(), "a write before the first sample starts no glide" + tag);
         s.setParams (b);
         ok (! s.isGliding(), "no glide is pending after writes before the first sample" + tag);
         float* io[2] { y[0].data(), y[1].data() };
@@ -275,6 +278,43 @@ static void testNoClick()
         "retargets mid-glide do not step either");
 }
 
+// NO SPIKE ON THE WAY: a constant input through a drive glide stays inside the range the SETTLED stage covers along
+// the same path. The first version interpolated the curve's peak normaliser directly — it goes like 1/k at small
+// drives — and a 0 -> 3 dB glide on a constant 0.2 peaked at 7.665 (found by the code-review round). The bound is the
+// envelope of 65 settled designs between the two ends, because the path itself can rise above both ends (the auto-
+// compensated level of a constant is not monotonic in drive). Asym runs with its DC blocker off here (dcBlockHz 0),
+// so the curve is measured and not the blocker's answer to a moving DC; its drive stops at 12 dB, past which a 0.2
+// bias flattens the curve at zero and auto-compensation divides by that flatness in the settled stage too.
+static void testNoSpikeFromZeroDrive()
+{
+    group ("no spike on the way — a constant through a drive glide stays inside the settled path's own range");
+    const int n = 9000, at = 4000;
+    for (Shape sh : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym })
+        for (float to : { 3.0f, 12.0f, 24.0f })
+            for (int os : { 1, 4 })
+            {
+                if (sh == Shape::Asym && to > 12.0f) continue;
+                const float bias = sh == Shape::Asym ? 0.2f : 0.0f;
+                auto prm = [&] (float db) { Sat::Params q = P (sh, db, bias); q.dcBlockHz = 0.0f; return q; };
+                Buf x (1, std::vector<float> ((std::size_t) n, 0.2f));
+                float lo = 1e9f, hi = -1e9f;
+                for (int k = 0; k <= 64; ++k)
+                {
+                    const Buf ys = render (x, os, 512, prm (to * (float) k / 64.0f), {}, fixed (512));
+                    const float v = ys[0][(std::size_t) (n - 1)];
+                    lo = std::min (lo, v); hi = std::max (hi, v);
+                }
+                const Buf y = render (x, os, 512, prm (0.0f), { { at, prm (to) } }, fixed (256));
+                float gl = 1e9f, gh = -1e9f;
+                for (int i = at; i < n; ++i) { gl = std::min (gl, y[0][(std::size_t) i]); gh = std::max (gh, y[0][(std::size_t) i]); }
+                const float slack = 0.02f * std::max (std::fabs (lo), std::fabs (hi));
+                ok (gl >= lo - slack && gh <= hi + slack,
+                    "shape " + std::to_string ((int) sh) + ", 0 -> " + std::to_string ((int) to) + " dB, os " + std::to_string (os)
+                    + ": glide [" + std::to_string (gl) + ", " + std::to_string (gh) + "] inside the settled path's ["
+                    + std::to_string (lo) + ", " + std::to_string (hi) + "]");
+            }
+}
+
 static void testRepeatedWritesCostNothing()
 {
     group ("a write that changes nothing is free — no glide, and the same bits as writing once");
@@ -286,11 +326,24 @@ static void testRepeatedWritesCostNothing()
     const Buf many = render (x, 4, 512, a, every, fixed (128), {}, &s);
     const Buf once = render (x, 4, 512, a, {}, fixed (128));
     ok (diffs (many, once) == 0 && ! s.isGliding(), "re-sending the same parameters every block renders the same bits, no glide");
-    // A dcBlockHz change is a coefficient and lands at once, without a glide.
+    // Asked RIGHT AFTER each write, not thousands of samples later (a glide lasts 1472): a write that changes
+    // nothing continuous — the same set, or only dcBlockHz, a coefficient that lands at once — starts no glide.
     Sat d;
+    d.setParams (a);
+    ok (d.prepare (kFs, 512, 2, 4), "PRECONDITION: prepare");
+    Buf y = x;
+    float* io[2] { y[0].data(), y[1].data() };
+    felitronics::test::run (d.process (io, 2, 1000));
+    bool never = true;
+    d.setParams (a);                        never = never && ! d.isGliding();
     Sat::Params b = a; b.dcBlockHz = 25.0f;
-    (void) render (x, 4, 512, a, { { 4000, b } }, fixed (128), {}, &d);
-    ok (! d.isGliding(), "a dcBlockHz change starts no glide");
+    d.setParams (b);                        never = never && ! d.isGliding();
+    felitronics::test::run (d.process (io, 2, 7));
+    d.setParams (b);                        never = never && ! d.isGliding();
+    ok (never, "neither an unchanged write nor a dcBlockHz-only write starts a glide, asked at once");
+    Sat::Params c = b; c.mix = 0.5f;
+    d.setParams (c);
+    ok (d.isGliding(), "PRECONDITION: a mix write does start one — the probe can see a glide");
 }
 
 static void testNoAllocation()
@@ -320,6 +373,7 @@ int main()
     testGlideIsClockedBySamples();
     testGlideLands();
     testNoClick();
+    testNoSpikeFromZeroDrive();
     testRepeatedWritesCostNothing();
     testNoAllocation();
     return felitronics::test::report();
