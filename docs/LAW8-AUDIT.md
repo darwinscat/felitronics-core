@@ -35,7 +35,7 @@ so the decay stops dead as soon as it enters that band. Two consequences, and th
   (`core::Smoother`'s cost-zero early-out) never fires. Same defect, invisible cost.
 
 A flush written only against the first case fixes half the problem. Both fixed kernels that glide toward a
-*parameter* — `core::Smoother`, `poweramp`'s coefficient smoothers, `rigplayer`'s gain ramps — therefore
+*parameter* — `core::Smoother` among them — therefore
 carry **two** conditions: a magnitude threshold, and "the update did not move the value", which is exact,
 target-independent, and cannot fire early (in the normal range the mantissa makes `k(1−r) ≫ ½`).
 
@@ -51,12 +51,10 @@ target-independent, and cannot fire early (in the normal range the mantissa make
 | `measurement::Sweep` | no recursion at all | — | — | clean |
 | `dither::Dither` | loop exists, state does not decay | no | — | clean |
 | `saturation::Saturator` DC blocker | yes | **yes** — 2.14e-42 from 1.5 s, permanent | **23.9× measured**, and it leaks out of the stage | **FIXED** |
-| `rigplayer` blend / trim ramps | yes | **yes** — 2 ulp, stall from ~1 s | ~3 assisting ops **per sample per channel**, forever | **FIXED** |
-| `poweramp` coefficient smoothers | yes | **yes** — ~5 ulp | `topoCur`/`leakCur` reach the **per-oversampled-sample** kernel | **FIXED** |
 | `analysis::CorrelationMeter` | yes | **yes** — 7200 ulp after ~220 s | three subnormal double FMAs **per sample** | **FIXED** |
 | `dynamics::AutoLeveler` | yes | **yes** — 28 ulp after ~106 s | two FMAs **per block**, behind a silence gate | **FIXED** (see "not independently tested") |
 
-### The six that were stalling
+### The six that were stalling — four here, two in felitronics-guitar-core
 
 **`core::Smoother`** — the one the previous pass named. `current = target + coeff·(current−target)`; with
 `target == 0` (a mute, a band parked at 0 dB) it is a pure geometric decay. At 30 ms / 48 kHz,
@@ -102,25 +100,6 @@ The flush is applied **per sample, not per call** — a threshold at the end of 
 event wherever the *caller* cut the stream, which is exactly the chunk-invariance argument from
 [`LAW8-KWEIGHTING.md`](LAW8-KWEIGHTING.md), and this module asserts bit-identical chunking explicitly.
 
-**`rigplayer`'s blend and trim ramps.** `end = want + (current−want)·decay`, per block. An exact-zero
-target needs no exotic pack: `BlendKnob::linOf` returns `0.0` for any level at or below −120 dB, which is
-how a pack spells "this path is off" — the repo's own test rig ships it (dry end `wetDb −120`, wet end
-`dryDb −120`). Move the dial there after an audible position and the gain decays to a subnormal fixed
-point (`decay = 0.766` at block 128 → `k ≤ 2.1`, so 2 ulp; stall from ~1 s) and stays, while the mix loop
-— gated on `dryActive_`, a dry IR being **loaded**, not on either gain — keeps running
-`gd += stepDry; a[c][i]·gw + d[c][i]·gd` over it, ~3 assisting operations per sample per channel, for the
-life of the rig. What does *not* stall is the initialised or reset `0.0f`: `0 → 0` stays exactly 0.
-
-**`poweramp`'s 13 block-rate coefficient smoothers.** Most are consumed behind a per-block gate
-(`presOn`, `depthOn`, `loadOn`, `biasOn`, `ironOn`, all `> 1e-4f`), which reads a stuck subnormal as
-"off" — the right answer, reached by accident. **`topoCur` is not gated**: `TubeStage` blends
-`(1−topo)·pp + topo·se` on every *oversampled* sample, so after one SE→PP toggle a stuck topo costs a
-subnormal multiply and add per sample per channel at 4× rate, forever; `leakCur` reaches the per-sample
-curves the same way. So this was never the 13-FMAs-per-block housekeeping it looked like. Snapping also
-restores a real property: `topo` lands on exact 0, so the "all-off ⇒ bare push-pull path, byte-identical"
-contract holds after a toggle and not only from a cold start. The per-*sample* states in this file
-(`dcx1/dcy1`, `otLp/otHf`) were already flushed at 1e-30f and are clean.
-
 **`analysis::CorrelationMeter`** — found in this pass, and it is the first pass's own lesson repeating:
 `flushDenormals()` existed and **nothing in the repo called it**. It is a leaf primitive with no in-repo
 owner (only a comment in `stereo::StereoWidth` mentions the class), so the adapter driving it was the only
@@ -155,24 +134,21 @@ two compares and law 8 is not a cost-benefit rule.
 
 `TruePeakLimiter` (its `grDb` is flushed) · `dynamics::RelativeLevel` (dB domain, fixed point is nonzero)
 · `NoiseGate` (per-sample flush plus an env flush) · `eq::EqBand` (per-block `flushState()`, and a reset
-when no lane runs) · `eq::Svf` / `eq::MatchedBiquad` (1e-15f) · `rigplayer::runBands` (flushes each
-`MatchedBiquad` per block) · `nam::BlendLaw` (linear step + clamp lands on exact 0/1) · the convolver IR
+when no lane runs) · `eq::Svf` / `eq::MatchedBiquad` (1e-15f) · the convolver IR
 crossfade (a countdown, not a decay) · `stereo::MonoBass` (flushes its crossover, resets on bypass) ·
 `stereo::StereoWidth` (`LinearSmoother` only) · `MultiResSpectrumPane` (has its own power-aware guard) ·
-`SagEnvelope` (1e-30f) · `dynamics::EnvelopeFollower` in **Rms** mode (1e-30f — the state there is a
+`dynamics::EnvelopeFollower` in **Rms** mode (1e-30f — the state there is a
 POWER, so the house 1e-15 amplitude threshold would have zapped a level of 3.2e-8, i.e. −150 dBFS. That
 is not merely audible-adjacent, it made the OUTPUT depend on the caller's block partition, because the
 flush fires once per `process()` call: measured on a −160 dBFS input, −7.5 dB of gain reduction in one
 10000-sample call against 0.00 dB in 10000 one-sample calls, the same stream. Same reasoning, and the
-same constant, as `SagEnvelope` and the power-aware guard in `MultiResSpectrumPane`) · `TubeStage` (memoryless) · `poweramp`'s `gApplied`/`postApplied` (linear ramps,
-land exactly) · every `EnvelopeFollower` owner (Compressor, NoiseGate, DeEsser, DynamicEqBand,
+same constant, as the power-aware guard in `MultiResSpectrumPane`) · every `EnvelopeFollower` owner (Compressor, NoiseGate, DeEsser, DynamicEqBand,
 LaneDynamics, TransientShaper) · `DelayLine` / `DryAligner` / `StreamResampler` (no recursion) ·
 `Fft` / `Pffft*` / `MatrixConvolver*` / `IrResampler` / `PolyphaseOversampler` / `CascadeOversampler` / `BlendKernels` (FIR and
 transforms — no decaying recursion) · `TruePeakMeter` and `SpectrumPane` (settled in the F1 pass) ·
 `measurement` / `blend` / `lineareq` / `io` (offline or FIR).
 
-**Not verified:** NAM/neural inference state (external code; an LSTM's zero-input fixed point is nonzero,
-so no subnormal stall is expected, but it has not been measured).
+**Not verified here:** neural inference state — the backends live outside core.
 
 ### ⚠ THE SWEEP ABOVE ASSUMED A SMALL BLOCK, and one call shape falls outside it
 
@@ -235,7 +211,7 @@ would otherwise run the new topology on the old coefficients for up to 63 sample
 `mastering::MasteringChain`, which drives one per EQ band, always calls it with exactly the internal
 quantum, so that restart lands on the same absolute sample whatever the caller's block size),
 `dynamics::Compressor` / `NoiseGate` / `TransientShaper` (their followers), `multiband::MultibandProcessor`,
-`poweramp::PowerAmpStage`, `rigplayer::RigPlayer`, `limiter::TruePeakLimiter` (its internal chunk loop is
+`limiter::TruePeakLimiter` (its internal chunk loop is
 anchored at the call, not at audio time), and the offline `EnvelopeAnalyzer` / `ThresholdSolver`, which
 flush once per WHOLE KEY and so carry the whole-file hole into the solver.
 
@@ -255,21 +231,16 @@ is never called from the test, so a test that passes with the flush removed is n
 | `core::Smoother` | `value()` after 5 s aimed at 0, via `next()` and `advance(128)`; plus a **non-zero** target reached exactly and `settled(0)` firing | 4.15e-73 — a normal double, so FTZ cannot mask it |
 | `analysis::CorrelationMeter` | after 5 s of silence, 1000 samples on L only ⇒ `sRR == 0` ⇒ `d == 0` ⇒ `correlation()` is exactly 1.0 | residual 1.9e-19 gives `d = 1.6e-10`, **161× the meter's own 1e-12 gate**, and `correlation()` reads ~1e-9 |
 | `saturation::Saturator` | the **output** — a state that reached zero emits exact zero | −3.4e-41 on every sample |
-| `rigplayer` | `liveWet()`, the gain the audio thread actually applied | 1.8e-35 at 0.8 s |
 
-Two of them assert **twice**, at an early instant and at 5 s, and the reason is worth keeping: at 5 s the
+Saturator's asserts **twice** (as rigplayer's does, in felitronics-guitar-core), at an early instant and at 5 s, and the reason is worth keeping: at 5 s the
 un-flushed value is *subnormal*, so a machine running hardware FTZ would read it as zero and a regression
 could hide. The early assertion is placed where the un-flushed value is still a **normal** float
 (Saturator: the flush fires at 1.10 s, the value goes subnormal at 1.39 s, so 1.25 s discriminates on any
-machine; rigplayer: flush at 0.69 s, subnormal at 0.87 s, assert at 0.8 s).
+machine).
 
-**Not independently tested, deliberately:** `dynamics::AutoLeveler` and `poweramp`'s *gated* coefficient
-smoothers. Both are invisible through their public surface — the AutoLeveler's silence gate returns before
-the state can influence anything, and every poweramp gate reads a stuck subnormal as "off", which is the
-same answer as a snapped zero. There is no assertion that would fail without the fix, so writing one would
-be theatre. `poweramp`'s `topoCur` is the exception in principle (it is consumed per sample), but at
-`u = 0` both `pp` and `se` are exactly zero and with signal the subnormal is absorbed, so it is not
-output-observable either.
+**Not independently tested, deliberately:** `dynamics::AutoLeveler`. It is invisible through its public
+surface — its silence gate returns before the state can influence anything. There is no assertion that
+would fail without the fix, so writing one would be theatre.
 
 ---
 

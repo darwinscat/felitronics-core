@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
-// JUCE-free self-tests for core::DryAligner — the PDC-alignment gate ported from OrbitCab's
-// PowerAmpRouterAlignTests. The aligned dry must be delayed by EXACTLY the requested tap: bit-exact
+// JUCE-free self-tests for core::DryAligner — the PDC-alignment gate. The aligned dry must be delayed by EXACTLY the requested tap: bit-exact
 // by construction (a pure copy through the ring — no arithmetic, no tolerance). Designed to BREAK on
 // any off-by-one in the ring, a bad ring-wrap at ragged block sizes, a stale tap after a per-block
 // tap change, or channel cross-talk in the shared-cursor multi-channel ring.

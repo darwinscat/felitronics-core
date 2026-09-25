@@ -11,10 +11,10 @@ namespace felitronics::neural
 {
 
 //==============================================================================
-// The PROCESS-ONLY inference seam (ADR §3/§8). A neural backend (NAM/Eigen, RTNeural, a tiny MCU net…)
+// The PROCESS-ONLY inference seam (ADR §3/§8). A neural backend (a NAM runner, RTNeural, a tiny MCU net…)
 // satisfies this compile-time concept; the core never sees the backend's headers, model format, file
-// I/O, or exceptions — those live in the adapter. The seam is multichannel + in place (matches the rest
-// of felitronics-core and orbitcab's cab::AmpStage). Reached as a TEMPLATE (no vtable in the hot path).
+// I/O, or exceptions — those live in the adapter. The seam is multichannel + in place, like the rest of
+// felitronics-core. Reached as a TEMPLATE (no vtable in the hot path).
 //
 //   prepare(sampleRate, maxBlock, maxChannels)  — off the audio thread; may allocate / prewarm.
 //   process(io, numChannels, numSamples) -> bool — RT-safe: no alloc/lock/IO/throw; in place. Law 11:
@@ -25,8 +25,7 @@ namespace felitronics::neural
 //                                                 the backend's own memory is finite and reachable. A
 //                                                 backend that cannot reach all of it (a recurrent cell,
 //                                                 a third party's clock) says so with a number rather
-//                                                 than promising: felitronics::nam::NamStage does, in
-//                                                 its header. RT-safe in the sense law 2 means — no alloc,
+//                                                 than promising, in its own header. RT-safe in the sense law 2 means — no alloc,
 //                                                 lock, IO or throw beyond whatever process() already
 //                                                 costs — but NOT necessarily O(the block): a backend
 //                                                 with a receptive field has to spend it, and it is the

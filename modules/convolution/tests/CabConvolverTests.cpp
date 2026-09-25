@@ -656,7 +656,7 @@ int main()
         test::ok (disarmed == (int) (sizeof bad / sizeof bad[0]), "and process() refuses afterwards — the object is not armed");
 
         test::ok (CabConvolver::kMaxSampleRate == 3.0e6,
-                  "the ceiling is the house figure — Compressor, TruePeakLimiter, EqBand and RigPlayer spell the same one");
+                  "the ceiling is the house figure — Compressor, TruePeakLimiter and EqBand spell the same one");
         CabConvolver ok1, ok2;
         // 0.001 s, not the 4 s default: what is under test is the RATE, and four seconds AT THE CEILING is a
         // twelve-million-tap schedule — a gigabyte of partitions to prove a comparison.
@@ -1033,7 +1033,7 @@ int main()
     // answer the next programme with the same bits — that is what reset() promises now that it ADOPTS the
     // publication instead of dropping it. clearAudioState() is the verb that leaves the fade running, so for
     // it the two DIFFER: that is its documented contract, and a composite choosing between the two verbs
-    // (rigplayer::RigPlayer does) is choosing exactly this. Measured before P88, reset() lost the filter
+    // is choosing exactly this. Measured before P88, reset() lost the filter
     // outright: the restart one block in played the OLD IR.
     test::group ("P88 — reset() mid-fade is independent of the fade position; clearAudioState() is not");
     {

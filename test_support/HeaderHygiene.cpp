@@ -126,24 +126,9 @@
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/neural/Inference.h>
 #include <felitronics/neural/NeuralStage.h>
-#if defined(FELITRONICS_WITH_NAM)   // optional compiled NAM backend — public pImpl header is gated with its target
-#include <felitronics/nam/BlendLaw.h>
-#include <felitronics/nam/NamStage.h>
-#include <felitronics/rigplayer/AlignmentTable.h>   // …and the pack player over it, gated with the same option
-#include <felitronics/rigplayer/BlendKnob.h>
-#include <felitronics/rigplayer/ModelAlignment.h>
-#include <felitronics/rigplayer/ModelBlend.h>
-#include <felitronics/rigplayer/RigPlayer.h>
-#include <felitronics/rigplayer/RigSelection.h>
-#include <felitronics/rigplayer/SectionBiquad.h>
-#include <felitronics/rigplayer/ToneKnobs.h>
-#endif
 #include <felitronics/oversampling/CascadeOversampler.h>
 #include <felitronics/oversampling/Oversampler.h>
 #include <felitronics/oversampling/PolyphaseOversampler.h>
-#include <felitronics/poweramp/PowerAmpStage.h>
-#include <felitronics/poweramp/SagEnvelope.h>
-#include <felitronics/poweramp/TubeStage.h>
 #include <felitronics/saturation/Saturator.h>
 #include <felitronics/saturation/WaveShaper.h>
 #include <felitronics/stereo/MidSide.h>

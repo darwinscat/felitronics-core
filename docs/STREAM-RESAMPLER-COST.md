@@ -482,56 +482,7 @@ the protocol but nothing will tell you when they rot; treat them as dated measur
 
 ## 8. What `latencySamples()` is used for downstream — it is not only PDC
 
-`nam::NamStage::latencySamples()` moved again with this kernel (4 → **61** at 44.1 kHz, 6 → **96** at
-96, 6 → **91** at 88.2, 3 → **53** at 32), and inside this repository that number reaches nothing but a
-report: `RigPlayer::latencySamples()` republishes the max of its two slots outward, and slot alignment
-runs on `AlignmentTable::delayOf()` → `blendDelay()` / `lagTail_`, which never read it.
-
-**Outside this repository it aligns audio.** OrbitCab delays its dry / bypass path by exactly this
-number (`src/poweramp/PowerAmpRouter.cpp`, `src/core/CabEngine.cpp`), and orbit-amp does the same at
-the dry end of its crossfade. P32 corrected the reported number from a guessed 6 to the true 3.84 and
-moved the first comb notch of an on↔off crossfade from ~10.2 kHz out to ~136 kHz; the same arithmetic
-holds here, with a residual of 0.40 samples at 44.1 kHz (notch at ~55 kHz) and 0.00 at 96.
-
-🔴 **But the ABSOLUTE number is now 16× larger, and that is a product-visible change, not a rounding
-one.** A host that reports 61 samples of PDC at 44.1 kHz instead of 4 will latency-compensate by
-1.39 ms; anything that delays a dry path by this figure must be able to. Both shipped hosts also **sum
-two rate-matching stages** for PDC (preamp + poweramp), so the number the host sees is **122 samples at
-44.1 kHz** and 192 at 96.
-
-### 8.1 What this moves in `orbit-amp`, measured rather than assumed
-
-`orbit-amp` pins core **hybridly** (`CMakeLists.txt:69-80`): a sibling `../felitronics-core` checkout
-wins over the release tag, so it meets a change like this **locally, at merge**, while its CI stays
-green until the pin moves. Its whole test suite was built against this branch and run — seven targets,
-zero compile errors, zero failures. **There is no orbit-amp test that breaks.**
-
-What does break is not a test but a **silent clamp**:
-
-> `orbit-amp/src/core/BypassWire.h:37` — `static constexpr int maxDelay = 64;`, justified at `:35-36`
-> by *"The most a rate-match can cost: `ceil (3 * hostSR / modelSR) + 3`, which at 192 kHz against a
-> 48 kHz pack is fifteen"*. The clamp bites at `:52` (`juce::jlimit (0, maxDelay, delay)`).
-
-That formula is two generations stale — it is the guess P32 replaced with `2 + 2·h/m`, which P34
-replaced with `D·(1 + h/m)`:
-
-| host | as commented | v0.26.0 | **this branch** | what the wire delivers | short by |
-|---|---|---|---|---|---|
-| 44 100 | 6 | 4 | **61** | 61 | 0 |
-| 48 001 | 7 | 4 | **64** | 64 | 0 |
-| 88 200 | 9 | 6 | **91** | 64 | **27** |
-| 96 000 | 9 | 6 | **96** | 64 | **32** |
-| 192 000 | 15 | 10 | **160** | 64 | **96** |
-
-So 44.1 kHz still fits, by three samples, and **every host above 48 kHz under-delays the bypass path
-without complaining**. The consequence is exactly what that class exists to prevent — its own comment
-calls blending against an undelayed copy "a comb" — and at 96 kHz the residual 32 samples put the first
-null at 1500 Hz. The fix belongs in that repository and must be the GEOMETRY,
-`D·(1 + hostSR/modelRunSR)` with `D` from `StreamResampler::delayInputSamples()`, not a bigger constant.
-
-Two more addresses the merge touches, for whoever picks it up: `src/PluginProcessor.cpp:404` sums the
-two blocks' latencies into the host's PDC (**8 → 122** samples at 44.1 kHz), and `:765` is where that
-number is handed to the clamping wire (`:771`, `:785`, `:791`).
-
-**OrbitCab is deliberately not listed.** It leaves with NAM and poweramp, and an earlier version of this
-document pointed at three of its tests on the strength of P32's notes rather than a measurement.
+A consumer that aligns a dry or bypass path delays it by exactly this figure, so it is an audio-alignment
+number as well as a PDC report, and a consumer that sums two rate-matching stages reports the sum. What
+the kernel swap moved downstream, in the NAM stage and the products, left this document with those
+modules.

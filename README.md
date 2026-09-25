@@ -32,6 +32,8 @@ crossovers) · `lineareq` (linear- & mixed-phase "Natural" FIR EQ over partition
 `dynamiceq` · `deesser` · `stereo` · `saturation` · `dither` · `oversampling` · `limiter` (true-peak) ·
 `analysis` (LUFS/LRA · dBTP true-peak · correlation) · `neural` (inference seam) ·
 `fftpffft` (**optional** compiled SIMD FFT backend — vendored pffft, `-DFELITRONICS_WITH_PFFFT=ON`).
+The guitar-amp DSP — NAM, the `.orbitrig` pack player, the tube power amp — lives in
+[felitronics-guitar-core](https://github.com/darwinscat/felitronics-guitar-core).
 
 Each module links on its own (`felitronics::eq`, `felitronics::lineareq`, …) — pull only what you use.
 Every module ships JUCE-free self-tests (measured audio == analytic truth).

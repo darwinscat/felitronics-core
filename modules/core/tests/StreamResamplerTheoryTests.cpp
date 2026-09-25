@@ -285,7 +285,7 @@ int main()
         }
 
         // (f) IDENTITY builds no table at all — a bit-copy has nothing to read, and 128 KiB per
-        // instance is not free when a NamStage holds four of them and retires up to 64 backends.
+        // instance is not free when a consumer holds four of them and retires up to 64 backends.
         {
             StreamResampler r;
             r.reset (48000.0, 48000.0, 512);

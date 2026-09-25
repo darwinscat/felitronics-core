@@ -270,7 +270,7 @@ int main()
     }
 
     // --- 🔴 P88: reset() KEEPS AN OPERATOR PUBLISHED BUT NOT YET ADOPTED (the first instance of the class) ---
-    // P85 closed the composite's path here by adding clearAudioState() and routing rigplayer::RigPlayer
+    // P85 closed the composite's path here by adding clearAudioState() and routing a pack player
     // through it; the VERB itself still dropped the publication, and lineareq — the live product path —
     // reaches this class through `reset()`. On that body this group reads the old operator in every cell,
     // a worst sample 1.927e+00 from the settled restart. Full reasoning in ConvolutionEngine::reset().

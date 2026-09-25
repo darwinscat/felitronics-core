@@ -56,8 +56,8 @@ def declared_tests(directory):
     names = set()
     for cml in directory.rglob('CMakeLists.txt'):
         for name in ADD_TEST.findall(cml.read_text(encoding='utf-8', errors='replace')):
-            # rigplayer names its tests felitronics_rigplayer_${tl}_tests: read literally that was the prefix
-            # alone, which matches no test, so its four suites silently left every selection. Stand for any
+            # A test named through a CMake variable (felitronics_<m>_${tl}_tests) read literally is its prefix
+            # alone, which matches no test, so its suites would silently leave every selection. Stand for any
             # value of the variable instead -- selecting too much is visible, selecting too little is green.
             names.add(VARIABLE.sub('[A-Za-z0-9_]*', name))
     return names

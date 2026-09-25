@@ -61,17 +61,14 @@ modules/eq/include/felitronics/eq/EqEngine.h  [abs*3 log10*2]  retain-rt  the co
 modules/eq/include/felitronics/eq/MatchedBiquad.h  [abs*25 cos*10 cosh*1 exp*7 log10*1 polar*1 pow*9 sin*12 sqrt*19 tan*3]  retain-rt  TabbyEQ's filter design, all of it: matched-pole placement, shelf solving, notch cascades, bandpass cascades. These transcendentals ARE the coefficients, and the coefficients ARE the product's sound. The 25 std::abs are a MIX — most are scalar magnitude on a coefficient, and only the ones taking a std::complex are hypot; the 19 std::sqrt include complex square roots in the pole solver (:400, :641), which scalar IEEE exactness does not cover
 modules/eq/include/felitronics/eq/MultibandSplitter.h  [pow*1]  retain-rt  the default band frequencies, laid out geometrically
 
-# --- limiter / saturation / poweramp: shipped audio, some of it per sample ---
+# --- limiter / saturation: shipped audio, some of it per sample ---
 modules/limiter/include/felitronics/limiter/TruePeakLimiter.h  [dbToGain()*3 exp*1 gainToDb()*2 log*1]  retain-rt  the release coefficient. NOTE the limiter's other libm reach is through core::gainToDb and core::dbToGain INSIDE its oversampled per-sample loop — a carrier, not a direct call, and the reason gainToDb was not converted in place. K13 added dbToGain twice in apply(): the clip level and the knee half-width, COEFFICIENTS computed once per parameter change, which is the same consumer class as every other gain coefficient here and not a reported value. The clipper's own reported dB goes through gainToDbDet instead, because that one crosses the ABI and an ulp there moves a histogram bin
 modules/saturation/include/felitronics/saturation/Saturator.h  [dbToGain()*2 exp*1 pow*1]  retain-rt  drive and bias mapping for the saturator
 modules/saturation/include/felitronics/saturation/WaveShaper.h  [atan*2 tanh*6]  retain-rt  PER-SAMPLE libm on the audio path: tanh and atan ARE the waveshaping curve. Nothing deterministic can go here at any price — det has no tanh or atan, and the cost would be paid every sample
-modules/poweramp/include/felitronics/poweramp/PowerAmpStage.h  [exp*4 pow*2 tanh*1]  retain-rt  power-amp stage curve and bias, per sample on the shaping path
-modules/poweramp/include/felitronics/poweramp/SagEnvelope.h  [exp*3]  retain-rt  supply-sag envelope coefficients
-modules/nam/src/NamStage.cpp  [pow*1]  retain-rt  one gain conversion in the neural amp stage
 
 # --- lineareq: FIR design, offline-built but shipped as audio ---
 modules/lineareq/include/felitronics/lineareq/LinearPhaseEq.h  [cos*3]  retain-rt  the design window for a linear-phase FIR the plugin then convolves with
-modules/lineareq/include/felitronics/lineareq/MagnitudeCurve.h  [cos*1 log*2 pow*2]  retain-rt  the magnitude curve a minimum-phase FIR is built from; RigPlayer consumes the resulting FIR
+modules/lineareq/include/felitronics/lineareq/MagnitudeCurve.h  [cos*1 log*2 pow*2]  retain-rt  the magnitude curve a minimum-phase FIR is built from
 modules/lineareq/include/felitronics/lineareq/MixedPhaseFir.h  [cos*1 log*3 sin*1]  retain-rt  mixed-phase FIR construction (cepstral, hence the logs)
 modules/lineareq/include/felitronics/lineareq/NaturalPhaseEq.h  [abs*1 cos*2]  retain-rt  natural-phase design window and response
 
@@ -83,12 +80,6 @@ modules/measurement/include/felitronics/measurement/PeakClip.h  [log10*1]  retai
 modules/measurement/include/felitronics/measurement/ReferenceUnity.h  [log10*1 pow*2]  retain-offline  the -60 dB normalisation floor that decides whether a measured IR is normalised at all. Its header says plainly that this float arithmetic defines shipped audible unity gain, so it is read and left, not waved through
 modules/measurement/include/felitronics/measurement/Sweep.h  [cos*2 exp*2 log*2 sin*1]  retain-offline  the exponential sweep and its inverse filter — sin() PER SAMPLE of the generated stimulus, which is the one place a deterministic sin would cost real time for a signal that is measured, not compared
 
-# --- rigplayer: pack playback and its knobs ---
-modules/rigplayer/include/felitronics/rigplayer/AlignmentTable.h  [exp*1 log*1 sin*1]  retain-offline  alignment search between IRs; the chosen delay becomes persisted pack metadata, so it is a decision that outlives the run — recorded here rather than dismissed
-modules/rigplayer/include/felitronics/rigplayer/BlendKnob.h  [pow*1]  retain-rt  a knob taper
-modules/rigplayer/include/felitronics/rigplayer/RigPlayer.h  [exp*2 log*2 pow*1]  retain-rt  block ramps and level conversions on the playback path
-modules/rigplayer/include/felitronics/rigplayer/SectionBiquad.h  [cos*1 log10*1 pow*2 sin*1]  retain-rt  the tone-section biquad's coefficients
-modules/rigplayer/include/felitronics/rigplayer/ToneKnobs.h  [pow*1]  retain-rt  knob-to-gain taper
 
 # --- tools that are not on the parity surface ---
 tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1 sqrt*10]  retain-local  a developer visualiser; it draws curves and nobody diffs its output

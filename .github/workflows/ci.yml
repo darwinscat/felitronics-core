@@ -41,7 +41,7 @@ jobs:
           fi
 
   build-test:
-    name: ${{ matrix.os }} pffft=${{ matrix.pffft }} nam=${{ matrix.nam }}
+    name: ${{ matrix.os }} pffft=${{ matrix.pffft }}
     needs: scope
     if: needs.scope.outputs.mode != 'none'
     # SELF-HOSTED FOR THE macOS ROWS. GitHub's hosted macos-latest is a 3-core arm64 VM and it is the
@@ -56,21 +56,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:          # OFF/OFF proves the default header-only path on every toolchain. NAM is also
-          - { os: ubuntu-latest,  pffft: OFF, nam: OFF }   # compiled on all three; pffft ON covers the two SIMD
-          - { os: macos-latest,   pffft: OFF, nam: OFF, selfHosted: true }   # arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
-          - { os: windows-latest, pffft: OFF, nam: OFF }   # (macos). Its cross-backend NULL suite runs on ON.
-          - { os: macos-latest,   pffft: OFF, nam: ON,  selfHosted: true }
-          - { os: windows-latest, pffft: OFF, nam: ON  }
-          - { os: ubuntu-latest,  pffft: ON,  nam: ON  }
-          - { os: macos-latest,   pffft: ON,  nam: ON,  selfHosted: true }
+        include:          # OFF proves the default header-only path on every toolchain; pffft ON covers
+          - { os: ubuntu-latest,  pffft: OFF }   # the two SIMD arches we ship: x86-64/SSE (ubuntu) + arm64/NEON
+          - { os: macos-latest,   pffft: OFF, selfHosted: true }   # (macos). Its cross-backend NULL suite runs on ON.
+          - { os: windows-latest, pffft: OFF }
+          - { os: ubuntu-latest,  pffft: ON  }
+          - { os: macos-latest,   pffft: ON,  selfHosted: true }
           # arm64 LINUX — the axis nothing above covers. Every other row confounds two variables: the two
           # arm64 rows are also the only Apple rows, so "arm64" and "Apple's toolchain" always move together
           # and a divergence cannot be attributed. It is not a hypothetical distinction — the P0 spike found
           # Apple's libm returning different doubles from tan() than musl and glibc at 88.2/192 kHz, i.e. the
           # outlier was the TOOLCHAIN while the ISA was innocent (docs/P0-WASM-SPIKE.md). glibc-on-arm64 is
           # the cell that separates them. Free for public repositories, same steps as every other row.
-          - { os: ubuntu-24.04-arm, pffft: OFF, nam: OFF }
+          - { os: ubuntu-24.04-arm, pffft: OFF }
           # windows-latest + pffft ON is a fast-follow (pending a first green MSVC-pffft run); the OFF row
           # already proves the core compiles + tests on Windows.
     steps:
@@ -91,7 +89,7 @@ jobs:
           cmake --version | head -1
           ninja --version 2>/dev/null && echo "(ninja, above)" || echo "(no ninja — the default generator it is)"
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }} -DFELITRONICS_WITH_NAM=${{ matrix.nam }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=${{ matrix.pffft }}
       - name: Build
         shell: bash
         # A BARE `-j` MEANS UNLIMITED, not "use the cores" - the same footgun 7eb0894 fixed for CodeQL and
@@ -121,14 +119,13 @@ jobs:
         #
         # An empty selection is refused by COUNTING it, once, rather than per line: a selection can be
         # nothing but a timing suite (a pull request touching only fftpffft), which the first line runs and
-        # the second then rightly finds empty. A row built WITHOUT an option is different: for a pull request
-        # that touches only nam, rigplayer or fftpffft it has nothing to run, and that is a skip, not a red
-        # (before, --no-tests=error failed four rows on it). A row with every option ON still refuses zero —
-        # there the same filter must match, so zero means the filter is broken.
+        # the second then rightly finds empty. A row built WITHOUT pffft is different: for a pull request
+        # that touches only fftpffft it has nothing to run, and that is a skip, not a red. A row with pffft ON
+        # still refuses zero — there the same filter must match, so zero means the filter is broken.
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}
-          ALL_OPTIONS: ${{ matrix.pffft == 'ON' && matrix.nam == 'ON' }}
+          ALL_OPTIONS: ${{ matrix.pffft == 'ON' }}
         shell: bash
         run: |
           PERF='^(felitronics_pffft_tests|felitronics_spectrum_pane_perf_tests|felitronics_analysis_tests)$'
@@ -138,7 +135,7 @@ jobs:
             SEL=(-R "$SCOPE_REGEX")
             found=$(ctest --test-dir build -C Release -N "${SEL[@]}" | tr -d '\r' | sed -n 's/^Total Tests: *//p')
             if [ "$found" = 0 ] && [ "$ALL_OPTIONS" != true ]; then
-              echo "none of the selected tests is built with pffft=${{ matrix.pffft }} nam=${{ matrix.nam }} - nothing to run here"; exit 0
+              echo "none of the selected tests is built with pffft=${{ matrix.pffft }} - nothing to run here"; exit 0
             fi
             [ "$found" -gt 0 ] || { echo "::error::the selection matched no test here (found: '$found')"; exit 1; }
           fi
@@ -169,7 +166,6 @@ jobs:
           -DFELITRONICS_BUILD_TESTS=ON
           -DFELITRONICS_ENABLE_SANITIZERS=ON
           -DFELITRONICS_WITH_PFFFT=ON
-          -DFELITRONICS_WITH_NAM=ON
         # pffft ON here too, so the vendored C runs under ASan+UBSan. CMAKE_C_COMPILER=clang is REQUIRED: the
         # sanitizer runtime is clang's (CXX=clang++), and a gcc-compiled pffft.c would link the wrong ASan.
       - name: Build
@@ -212,7 +208,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++-14
       - name: Configure
         env: { CC: gcc-14, CXX: g++-14 }
-        run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON
+        run: cmake -S . -B build-gcc14 -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON -DFELITRONICS_WITH_PFFFT=ON
       - name: Build
         run: cmake --build build-gcc14 -j 4
       - name: Test
@@ -310,9 +306,9 @@ jobs:
         # ctest drives each test .js through node: the Emscripten toolchain sets CMAKE_CROSSCOMPILING_EMULATOR.
         # Same reasoning as the ASan row: the wall-clock gate measures node and the shared machine, not the
         # code, and it already runs natively in build-test. Without it the suite can use every core.
-        # No --no-tests=error: this tier builds neither nam, rigplayer nor fftpffft, so a pull request touching
-        # only those selects nothing that exists here, and that is not a failure. The empty-FILTER guard lives
-        # where the same selection must match: the build-test rows with every option ON.
+        # No --no-tests=error: this tier does not build fftpffft, so a pull request touching only it selects
+        # nothing that exists here, and that is not a failure. The empty-FILTER guard lives where the same
+        # selection must match: the build-test rows with pffft ON.
         env:
           SCOPE_MODE: ${{ needs.scope.outputs.mode }}
           SCOPE_REGEX: ${{ needs.scope.outputs.regex }}

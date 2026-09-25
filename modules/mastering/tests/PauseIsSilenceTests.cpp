@@ -3,6 +3,8 @@
 //
 // LAW 11c — "A PAUSE IS SILENCE". One suite for the whole law, across every module that owns an address
 // of it, because the law is one claim and splitting it per module would let a stage answer it its own way.
+// Its fixture helpers live in test_support/law11c_pause.h, so felitronics-guitar-core tests its address of
+// the law (poweramp::PowerAmpStage) with the same ones.
 //
 // THE CLAIM, and the only one worth testing: a call with `nch == 0, n > 0` leaves the stage's SHARED,
 // one-per-instance state exactly where `n` samples of digital silence at a live width would have left it.
@@ -32,12 +34,12 @@
 #include <felitronics/deesser/DeEsser.h>
 #include <felitronics/dynamiceq/DynamicEqBand.h>
 #include <felitronics/dynamiceq/LaneDynamics.h>
-#include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/core/Math.h>
 #include <felitronics/eq/EqBand.h>
 
 #include <felitronics_test.h>
+#include <law11c_pause.h>
 
 #include <algorithm>
 #include <cmath>
@@ -50,60 +52,8 @@ using namespace felitronics;
 using felitronics::test::ok;
 using felitronics::test::group;
 using felitronics::test::run;
+using namespace felitronics::test::law11c;
 
-namespace
-{
-constexpr double kFs = 48000.0;
-
-bool bitsEqual (float a, float b) noexcept { return core::sameBits (a, b); }
-bool bitsEqual (double a, double b) noexcept { return std::memcmp (&a, &b, sizeof (double)) == 0; }
-
-// The gap lengths. Deliberately NOT multiples of 16 (DynamicEqBand's control period), of 64 (the block
-// sizes the older gap tests use) or of the lookahead: a length aligned to the mechanism's own period is
-// the third recorded form of a blind fixture, and the counter shortcut in DynamicEqBand is exactly what
-// such a length would hide.
-const int kGaps[] = { 1, 2, 7, 15, 16, 17, 31, 63, 64, 65, 127, 480, 1000, 4801, 48000 };
-
-// The collapse's own list adds the interval BETWEEN the two events that bound it: with a 5 ms Rms window
-// the detector level crosses `kGainToDbFloor` at about 13 200 samples and the recurrence parks at about
-// 23 609, and phase 2 is the stretch in between. `kGaps` jumps 4 801 -> 48 000 straight over it, so a
-// silent loop that stopped one sample early was invisible: in Peak mode the level reaches zero in a
-// single step, and by 48 000 both runs are long since parked on the same word.
-const int kGapsCollapse[] = { 1, 2, 7, 15, 16, 17, 31, 63, 64, 65, 127, 480, 1000, 4801,
-                              14000, 16000, 20000, 23000, 48000 };
-
-// BRING A STAGE'S PER-CHANNEL PATH TO EXACT REST by feeding it real digital silence until its output is
-// bit-zero on every sample of a whole block. It has to be MEASURED, not counted: the fixture's first
-// version drained a fixed four blocks, which is enough for a band that CUTS and not for the same band
-// BOOSTING — a +18 dB bell rings down about x80 per block, so it needs nine, and at four the residue was
-// 1.1e-5 and produced a 1.4e-7 difference on the return that looked exactly like a defect in the code.
-// Returns false if rest was not reached inside `maxBlocks`, and every caller asserts that.
-template <class Stage>
-bool drainToRest (Stage& a, Stage& b, int blockSize, int maxBlocks = 64)
-{
-    for (int k = 0; k < maxBlocks; ++k)
-    {
-        std::vector<float> z1 ((std::size_t) blockSize, 0.0f), z2 ((std::size_t) blockSize, 0.0f);
-        float* io[2] = { z1.data(), z2.data() };
-        std::vector<float> w1 ((std::size_t) blockSize, 0.0f), w2 ((std::size_t) blockSize, 0.0f);
-        float* jo[2] = { w1.data(), w2.data() };
-        if (! (a.process (io, 2, blockSize) && b.process (jo, 2, blockSize))) return false;
-        bool rest = true;
-        for (int i = 0; i < blockSize; ++i)
-            rest = rest && bitsEqual (z1[(std::size_t) i], 0.0f) && bitsEqual (z2[(std::size_t) i], 0.0f)
-                        && bitsEqual (w1[(std::size_t) i], 0.0f) && bitsEqual (w2[(std::size_t) i], 0.0f);
-        if (rest && k > 0) return true;          // k > 0: one more block AFTER the first silent one
-    }
-    return false;
-}
-
-// A tone that charges a detector: full scale, so the shared state has somewhere to travel FROM.
-void fillTone (std::vector<float>& v, int startSample, double hz, float amp)
-{
-    for (std::size_t i = 0; i < v.size(); ++i)
-        v[i] = amp * (float) std::sin (2.0 * core::kPi * hz * (double) (startSample + (int) i) / kFs);
-}
-} // namespace
 
 //==============================================================================
 // 1. The premise the collapse stands on. `GainReductionPath::advanceSilence` stops taking the log the
@@ -526,79 +476,6 @@ static void deEsserInvariant()
               if (! same) ok (false, "the return is bit-identical, mode " + std::to_string ((int) m) + " gap " + std::to_string (gap));
           }
     ok (true, "DeEsser: gap == silence in both topologies, with listen on and off, both links");
-}
-
-// --- PowerAmpStage (the SEVENTH address) --------------------------------------------------------
-static void powerAmpInvariant()
-{
-    group ("law 11c — poweramp::PowerAmpStage: the shared sag supply spends the pause");
-    for (int gap : kGaps)
-    {
-        const int B = 128;
-        // The observable is the RETURN AUDIO, because the sag supply has no public getter — and the
-        // return is the thing a listener hears anyway. `C` is a COLD instance that never saw the loud
-        // tone: it is the precondition, and without it this fixture could not tell a live sag rail from
-        // an inert one (the `Voicing` defaults are all zero, so a stage with an unfilled voicing does
-        // not move a single bit — the fifth blind form, and this repository has already paid for it).
-        poweramp::PowerAmpStage A, Bp, C;
-        poweramp::Voicing v;
-        // A 20-SECOND sag recovery, which is not musical and is the point: the drain to exact rest takes
-        // 512 blocks (~1.4 s), and a musical 150 ms recovery would have released the supply completely
-        // before the pause even started — the fixture would then compare two rested rails and pass
-        // against a stage that freezes the supply. A state defect is tested at settings where the state
-        // is still VISIBLE; the musical setting belongs to a test about sound, not about this.
-        v.sagMaxDroop = 0.35f; v.sagFastMs = 3.0f; v.sagRecoveryMs = 20000.0f; v.driveScale = 1.0f;
-        poweramp::Params pp; pp.driveDb = 18.0f; pp.sag = 1.0f; pp.outputDb = 0.0f;
-        A.prepare (kFs, B); Bp.prepare (kFs, B); C.prepare (kFs, B);
-        A.setParams (pp, v); Bp.setParams (pp, v); C.setParams (pp, v);
-        std::vector<float> l (B), r (B);
-        for (int k = 0; k < 24; ++k)
-        {
-            fillTone (l, k * B, 120.0, 0.9f); r = l; float* io[2] = { l.data(), r.data() }; run (A.process (io, 2, B));
-            fillTone (l, k * B, 120.0, 0.9f); r = l; float* jo[2] = { l.data(), r.data() }; run (Bp.process (jo, 2, B));
-        }
-        // TWO OBSERVABLES, and the audio one is the load-bearing half. This stage's per-channel path DOES
-        // reach exact rest on silence, but slowly: measured, its residue is 5.1e-08 after 64 silent
-        // blocks, 8.0e-22 after 256 and exactly zero after 512 — so a 256-block drain would have compared
-        // law 11a's drop against a ring-down that had not finished, and read a defect that is not there.
-        // Past rest the return is bit-comparable, and it is the only thing that can see the thirteen
-        // block-rate GLIDES: `sagDroop()` cannot, because it reads the supply and not the drive.
-        if (! drainToRest (A, Bp, B, 1024)) ok (false, "precondition: the per-channel path reaches exact rest before the pause");
-        // ...AND A GLIDE IN FLIGHT. The thirteen block-rate smoothers are snapped on the first block and
-        // never moved again unless a parameter changes, so a fixture that sets the params once and then
-        // pauses would pass against an implementation that freezes the glides — which is half of what
-        // this stage's law-11c defect was. Move Drive and Output right before the gap so both runs enter
-        // it mid-transition.
-        poweramp::Params moved = pp; moved.driveDb = 3.0f; moved.outputDb = -8.0f; moved.sag = 0.3f;
-        A.setParams (moved, v); Bp.setParams (moved, v); C.setParams (moved, v);
-        const float chargedDroop = A.sagDroop();
-        for (int off = 0; off < gap; )
-        {
-            const int n = std::min (B, gap - off);
-            float* io[2] = { nullptr, nullptr }; run (A.process (io, 0, n));
-            std::vector<float> z1 ((std::size_t) n, 0.0f), z2 ((std::size_t) n, 0.0f);
-            float* jo[2] = { z1.data(), z2.data() }; run (Bp.process (jo, 2, n));
-            off += n;
-        }
-        if (! bitsEqual (A.sagDroop(), Bp.sagDroop()))
-            ok (false, "the sag supply after a gap equals the sag supply after silence, gap " + std::to_string (gap));
-        {
-            std::vector<float> al ((std::size_t) B), ar ((std::size_t) B), bl ((std::size_t) B), br ((std::size_t) B);
-            fillTone (al, 0, 120.0, 0.9f); ar = al; bl = al; br = al;
-            float* ai[2] = { al.data(), ar.data() }; float* bi[2] = { bl.data(), br.data() };
-            run (A.process (ai, 2, B)); run (Bp.process (bi, 2, B));
-            bool same = true, live = false;
-            for (int i = 0; i < B; ++i) { same = same && bitsEqual (al[(std::size_t) i], bl[(std::size_t) i]);
-                                          live = live || std::fabs ((double) bl[(std::size_t) i]) > 1.0e-3; }
-            if (! same) ok (false, "the return after a gap is bit-identical to the return after silence, gap " + std::to_string (gap));
-            if (gap == kGaps[0]) ok (live, "precondition: the return actually carries audio");
-        }
-        if (gap <= 480) ok (! bitsEqual (Bp.sagDroop(), C.sagDroop()),
-                            "precondition: the sag supply is genuinely charged — a cold stage answers differently");
-        if (gap >= 48000) ok (Bp.sagDroop() < chargedDroop,
-                            "...and a second of pause has visibly recovered the rail, exactly as silence does");
-    }
-    ok (true, "PowerAmpStage: the sag supply and its glides spend a pause exactly as silence does");
 }
 
 // --- LaneDynamics -------------------------------------------------------------------------------
@@ -1517,7 +1394,6 @@ int main()
     dynamicEqBandInvariant();
     controlCounterPhase();
     deEsserInvariant();
-    powerAmpInvariant();
     laneDynamicsInvariant();
     multibandDoesNotDoubleClock();
     multibandBypassedNarrowingDoesNotCrash();

@@ -15,8 +15,8 @@ namespace felitronics::core
 
 //==============================================================================
 // felitronics::core::StreamResampler — streaming arbitrary-ratio resampler (polyphase windowed sinc).
-// Promoted from OrbitCab, where it runs a rate-locked neural (NAM) model at its native 48 kHz on any
-// host rate — host→model on the way in, model→host on the way out. feed() appends input; the
+// Its first use rate-locks a model to its native 48 kHz on any host rate — host→model on the way in,
+// model→host on the way out. feed() appends input; the
 // produce*() calls emit as many output samples as the buffered history allows, with `pos` carrying
 // the sub-sample phase across blocks — arbitrary in/out block sizes, no long-term drift.
 //
@@ -62,8 +62,7 @@ namespace felitronics::core
 // The phase delay is FLAT with frequency: swept on one stage at 50 Hz … 19 kHz on both legs it reads
 // 32.000000 in every cell. (The cubic's was not, and its header carried a +0.62-sample-at-20-kHz
 // caveat; that caveat died with it and is deliberately not restated.) Callers that must align a dry
-// path (OrbitCab, orbit-amp, and rigplayer's own dry/wet blend) take this same figure, so it is an
-// audio-alignment number there and not only PDC.
+// path take this same figure, so it is an audio-alignment number there and not only PDC.
 //
 // IDENTITY RATIO. At an exactly equal in/out rate the class short-circuits to a pure delay: a 0.99
 // cutoff is a real (if gentle) low-pass, and a caller asking for no rate change must not silently get
@@ -126,10 +125,9 @@ struct StreamResampler
     //
     // 🔴 THIS IS GEOMETRY, NOT LATENCY. It answers "what would a pair of these cost", and at equal
     // rates it answers 2·kHalf, because a pair really would cost that. Whether a pair is INSTALLED at
-    // all is a policy question belonging to the consumer — nam::NamStage installs one only past a
-    // 0.5 Hz difference and reports 0 below it, and that gate lives with the policy, in
-    // NamStage::rateMatch(). Reading this number as "the latency" is the mistake this split exists to
-    // make impossible.
+    // all is a policy question belonging to the consumer — one may install a pair only past a small
+    // rate difference and report 0 below it, and that gate lives with the consumer's policy, not here.
+    // Reading this number as "the latency" is the mistake this split exists to make impossible.
     //
     // The expression order is the shipped one and is kept deliberately: `a + a·h/m`, not the tidier
     // `a·(1 + h/m)`. They agree bit-for-bit on every rate pair measured (60 pairs, zero differences)
@@ -142,13 +140,13 @@ struct StreamResampler
     // hostSR <= DBL_MAX/kHalf = 5.6177910464e306. Past that the multiplication overflows and the
     // answer is inf even where the true one is finite. There is no lower bound to state — a subnormal
     // quotient is absorbed by the leading kHalf, measured. A non-positive modelRunSR divides by zero,
-    // which is why nam::NamStage::rateMatch() normalises BEFORE it calls in here.
+    // so a caller normalises it BEFORE it calls in here.
     static double pairDelayHostSamples (double hostSR, double modelRunSR) noexcept
     {
         const double down = delayInputSamples (hostSR, modelRunSR);      // host samples, going down
         const double up   = delayInputSamples (modelRunSR, hostSR);      // MODEL samples, coming back
         // 🔴 THE GROUPING IS THE SHIPPED ONE, LITERALLY. `up * hostSR / modelRunSR` parses as
-        // `(up * hostSR) / modelRunSR`, which is what NamStage computed before this extraction
+        // `(up * hostSR) / modelRunSR`, which is what its first consumer computed before this extraction
         // (`d + d * hostSR / modelRunSR`). A crew round caught a regrouping into
         // `up * (hostSR / modelRunSR)`; "no number moves" has to mean the arithmetic, not just the
         // answers we sampled.
@@ -172,7 +170,7 @@ struct StreamResampler
         //
         // So the parenthesised spelling is, today, strictly the wider of the two, and it is NOT used
         // anyway — deliberately. The reasons are continuity and the future, not accuracy: this is
-        // literally the expression NamStage shipped, a crew round already caught one regrouping of it,
+        // literally the expression its first consumer shipped, a crew round already caught one regrouping of it,
         // and under `-ffp-contract=on` (this repository's build flag) `down + up*(h/m)` is an FMA
         // candidate while `down + (up*h)/m` is not. None of that bites while D is a power of two and
         // both are exact. It all bites at once when the open kTaps item makes D ratio-dependent — at
@@ -235,8 +233,8 @@ struct StreamResampler
         // 🔴 ORDER MATTERS ON THE FAILURE PATH. len goes to 0 FIRST, so that if either allocation below
         // throws (bad_alloc, and this function is not noexcept), the object is left in the one state
         // that produces nothing rather than one that reads an empty table: produceAvailable's first
-        // test is `i + kHalf >= len`, which is true at len = 0 and breaks immediately. NamStage's
-        // prepare catches and marks itself unprepared, but a standalone caller may catch and carry on.
+        // test is `i + kHalf >= len`, which is true at len = 0 and breaks immediately. A consumer's
+        // prepare may catch and mark itself unprepared, but a standalone caller may catch and carry on.
         // …and `configured_` goes with it, because `len` alone cannot carry that meaning: the backstop
         // in feed() legitimately drops len to 0 on a live instance, so a restart could not tell the two
         // apart. It is a VALIDITY bit and nothing else reads it — see clearAudioState().

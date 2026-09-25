@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 
-// Streaming Catmull-Rom rate-matcher (promoted from OrbitCab, where it rate-locks the NAM stage to
-// 48 kHz on any host rate). The first four groups are OrbitCab's AmpStageTests resampler cases,
-// ported with the SAME expected values — they are the golden this extraction must not move:
+// Streaming rate-matcher (it rate-locks a model to 48 kHz on any host rate). The first four groups are
+// the resampler cases of the product it was promoted from, ported with the SAME expected values — they are the golden this extraction must not move:
 // identity ratio = a clean 2-sample delay, up/down conversion keeps level and output count, DC
 // shows no drift over many blocks. On top: block-size invariance (same count, samples within one
 // float ulp — the phase accumulator runs at different magnitudes per chunking, measured 5.96e-8
@@ -200,7 +199,7 @@ int main()
         // WHY IT EXISTS: `reset (rates, capacity)` is this class's prepare(). It reassigns both vectors,
         // `shrink_to_fit()`s on the identity path and re-derives 513 x 64 windowed-sinc coefficients with
         // a Bessel evaluation per tap — 1.756 ms for the two legs of one lane, measured, and deliberately
-        // not noexcept. A caller restarting a LIVE stream (felitronics::nam::NamStage::reset) cannot pay
+        // not noexcept. A caller restarting a LIVE stream (a model stage's reset()) cannot pay
         // that on the audio thread, and re-deriving a kernel is not what a restart means anyway.
         //
         // WHAT IT MUST BE: the state `reset()` leaves, exactly — so a restarted leg and a freshly reset

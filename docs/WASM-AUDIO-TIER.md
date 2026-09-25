@@ -137,8 +137,7 @@ Everything below was invisible on desktop and surfaced from one act: compiling t
    compared `rangeDb == 0.0`, which **gcc** rejects under `-Wfloat-equal` and **clang does not** (clang
    exempts a comparison against a literal). It is now `std::fabs (rangeDb) <= 0.0` — exactly equivalent on
    every input, and deliberately not the obvious `<= 0.0`, because `rangeDb`'s sign is the direction and
-   that would have disengaged half the modes. The remaining 12 are the opt-in `fftpffft` / `nam` /
-   `rigplayer` headers, gated with their options.
+   that would have disengaged half the modes. The remaining 12 were opt-in headers, gated with their options.
 
 5. **The no-threads checker was blind in exactly the failing case.** `check-no-threads.mjs` parsed only the
    memory *section*. A `-pthread` build declares no memory section at all — the shared memory is
@@ -240,7 +239,4 @@ diff native.txt wasm.txt          # empty output IS the acceptance criterion
 here and is easy to leave off: without it `felitronics_spectrum_pane_perf_tests` fails, 19 s against 1 s — a
 footgun already hit and written down once. It names `Release` in its build and test presets too, which is
 what multi-config generators (Visual Studio) actually read; `CMAKE_BUILD_TYPE` alone means nothing there.
-Its `binaryDir` is the conventional `build/`, so a build directory created before v0.25.0 will still carry
-that era's cached `FELITRONICS_NAM_CORE_TAG`/`..._NAMZ_TAG` — `set(... CACHE ...)` never overwrites an
-existing entry — and fail to compile against the old namz. `rm -rf build` once; it is not a defect of the
-preset, the documented raw command hits it identically.
+Its `binaryDir` is the conventional `build/`.
