@@ -574,7 +574,11 @@ function selfTest ()
 function lintTree (t, closure, carriers, entryPointsShown, display, violations)
 {
     const V = (f, line, rule, msg) => violations.push({ f: display(t, f), line, rule, msg });
-    const files = sourceFiles(t.root);
+    // EVERY FILE THE PARITY CLOSURE REACHES IS SCANNED, whatever it is called. The directory walk takes only
+    // the usual source extensions, and a `#include "tables.inc"` from a zone file was read by the closure and
+    // audited by nobody: a system call planted in it passed on both sides while the same call one level up
+    // failed. The closure is the net, so what it catches is inventoried.
+    const files = [...new Set(sourceFiles(t.root).concat([...closure].filter (f => ! /\/(tests|bench)\//.test (f))))].sort();
     const scanned = new Set(files);
     const carrierNames = carriers.map(c => c.name);
     const inventory = [];
