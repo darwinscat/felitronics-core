@@ -284,9 +284,9 @@ private:
         // LAW 8 lives HERE, not at the end of process(), and the difference is not cosmetic. This boundary
         // is a deterministic 10 ms of AUDIO (lround(0.01*fs) samples); the end of process() is wherever the
         // caller happened to cut the stream. Flushing there would make the numbers depend on the host's
-        // block size, and the family claims — and tests — that they do not (here within 1e-9 by
-        // LoudnessConformanceTests' "chunk invariance"; bit-exact across call sizes 1 … 100 003 by
-        // felitronics-mastering-core's ProbeTests, which drives this meter through its measurement probe). It also failed outright at low rates: this meter took any
+        // block size, and this repo claims — and tests — that they do not (bit-exact across call sizes
+        // 1 … 100 003: the integrated reading in AnalysisTests, every pre-gate block energy in
+        // LoudnessConformanceTests). It also failed outright at low rates: this meter took any
         // rate before P103 (the probe took 1 kHz before P51), and at 1 kHz a single 8192-sample call spans 8.2 s. And the
         // interval to beat is not the RLB's 2.85 s but the SHELF's 90 ms (4 324 samples at 48 kHz) — 8192
         // samples is already 170 ms, so a per-host-block flush would let the shelf sit subnormal for half of

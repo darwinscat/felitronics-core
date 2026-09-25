@@ -31,4 +31,15 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_pause_is_silence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_pause_is_silence_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_pause_is_silence_tests COMMAND felitronics_pause_is_silence_tests)
+
+    # Law 11d for the stages themselves: a published storageFor()/latencyFor() is what prepare() does, at each
+    # stage's own clamps. The mastering chain's suite pinned these for as long as the chain lived here, and was
+    # their only gate; it keeps its copy in felitronics-mastering-core, and core keeps its own here.
+    add_executable(felitronics_published_numbers_tests tests/PublishedNumbersTests.cpp)
+    target_link_libraries(felitronics_published_numbers_tests PRIVATE
+        felitronics::core felitronics::dynamics felitronics::eq felitronics::limiter
+        felitronics::oversampling felitronics::saturation felitronics::stereo)
+    target_include_directories(felitronics_published_numbers_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_published_numbers_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_published_numbers_tests COMMAND felitronics_published_numbers_tests)
 endif()
