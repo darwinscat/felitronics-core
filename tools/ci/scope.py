@@ -7,7 +7,7 @@
 
 Prints a summary and, under GitHub Actions, writes to $GITHUB_OUTPUT:
 
-    mode    none      only prose changed (docs/, changelog.d/, *.md) -- nothing to test
+    mode    none      only prose changed (docs/, changelog.d/, *.md, and a release's version line) -- nothing to test
             selected  only modules/ changed -- those modules, everything that includes them, and nothing else
             all       anything else: tools/, CMake, CI, the root, or not a pull request at all
     regex   the ctest -R pattern for `selected`, anchored; empty otherwise
@@ -40,6 +40,19 @@ SOURCE_SUFFIXES = {'.h', '.hpp', '.cpp', '.cc', '.inl'}
 
 def is_prose(path):
     return path.startswith(('docs/', 'changelog.d/')) or path.endswith('.md')
+
+
+def version_bump_only(base, head, path):
+    # A release pull request folds the changelog and moves ONE line: `project(felitronics_core VERSION x.y.z
+    # LANGUAGES CXX)`. That is prose for testing purposes -- the code is the tree main already tested -- and the
+    # whole matrix runs on the release's merge to main, which is the tree the tag goes on.
+    if path != 'CMakeLists.txt':
+        return False
+    diff = subprocess.run(['git', 'diff', '-U0', base, head, '--', path], cwd=ROOT,
+                          capture_output=True, text=True, check=True).stdout.splitlines()
+    changed = [l for l in diff if l[:1] in '+-' and not l.startswith(('+++', '---'))]
+    return bool(changed) and all(re.fullmatch(r'[+-]project\(felitronics_core VERSION [0-9]+\.[0-9]+\.[0-9]+ LANGUAGES CXX\)', l)
+                                 for l in changed)
 
 
 def included_modules(directory):
@@ -85,7 +98,7 @@ def main(argv):
     modules = sorted(p.name for p in (ROOT / 'modules').iterdir() if p.is_dir())
     touched, elsewhere = set(), []
     for path in changed:
-        if is_prose(path):
+        if is_prose(path) or version_bump_only(base, head, path):
             continue
         m = re.match(r'modules/([^/]+)/', path)
         if m and m.group(1) in modules:
