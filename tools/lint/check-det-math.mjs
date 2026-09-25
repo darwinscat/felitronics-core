@@ -192,49 +192,28 @@ const IMPLEMENTATION = new Set([
     'modules/core/include/felitronics/core/Math.h',      // defines both dB spellings; gainToDb's std::log10 is the point
 ]);
 
-const ENTRY_POINTS = [
-    'tools/wasm/fc_probe.cpp',     // the wasm probe — CI diffs its stdout against the native CLI's
-    'tools/wasm/fc_master.cpp',    // the mastering ABI
-    'tools/fcore_measure.cpp',     // the native CLI, the other side of every one of those diffs
-];
+// The parity entry points of THIS repository: none since the C ABIs moved to felitronics-mastering-core, whose own
+// list names them (its tools/lint/det-math-zone.txt). A tree that grows a native-vs-wasm comparison again
+// lists its entry point here, and rule 4's net comes back with it.
+const ENTRY_POINTS = [];
 
-// THE DETERMINISTIC ZONE. Every file here produces, or is directly consumed by, a number that CI compares
-// BYTE FOR BYTE between the native CLI and the wasm module (tools/wasm/*-parity.mjs, and the plain `diff`
-// steps in .github/workflows/ci.yml). Membership is a claim about where a value GOES, which is why it is
-// written rather than computed — see the note at the top of this file about the closure.
+// THE DETERMINISTIC ZONE of this repository. Every file here produces, or is directly consumed by, a number
+// that is compared BYTE FOR BYTE between a native build and the wasm module. Those comparisons run in
+// felitronics-mastering-core, whose analyzers and probe stand on these four files; its own zone lists the
+// rest, and its CI runs this script with --satellite, which runs this tree's pass as well. Membership is a
+// claim about where a value GOES, which is why it is written rather than computed — see the note at the top
+// of this file about the closure.
 const ZONE = new Set([
-    // the analyzers whose output is diffed, one per parity harness
-    'modules/analysis/include/felitronics/analysis/ProgrammeReport.h',
-    'modules/analysis/include/felitronics/analysis/SourceForensics.h',
-    'modules/analysis/include/felitronics/analysis/HumDetector.h',
-    'modules/analysis/include/felitronics/analysis/LowEnd.h',
-    'modules/analysis/include/felitronics/analysis/BandBursts.h',
-    'modules/analysis/include/felitronics/analysis/ClipDetector.h',
-    'modules/analysis/include/felitronics/analysis/WaveformPeaks.h',
-    'modules/analysis/include/felitronics/analysis/StereoColumns.h',
-    'modules/analysis/include/felitronics/analysis/SpectrumFrames.h',
+    // the reference true-peak instrument: what certifies a delivered file, and what the probe prints
     'modules/analysis/include/felitronics/analysis/ReferenceTruePeakMeter.h',
-    // the shared floor those analyzers stand on
+    // the shared floor the offline analyzers stand on
     'modules/core/include/felitronics/core/OfflineFft.h',
     'modules/oversampling/include/felitronics/oversampling/PolyphaseOversampler.h',
     // P31: not diffed by a parity harness today (no tool builds it), but it promises the same filter bits on
-    // every row — its suite pins them by hash on each one — and it sits in fc_master's include closure
-    // through Saturator.h. A system sine in its design would break that promise silently; here it is red.
+    // every row — its suite pins them by hash on each one — and it sits in the mastering ABI's include
+    // closure through Saturator.h. A system sine in its design would break that promise silently; here it is red.
     'modules/oversampling/include/felitronics/oversampling/CascadeOversampler.h',
-    // and the tools that PRINT the diffed text. The long-double lint deliberately skips tools/; for this
-    // lint that would be a hole exactly on the surface being defended — fcore_probe.h computes the dBTP
-    // that `diff native.txt wasm.txt` compares, with its own floor and, until P80, its own std::log10.
-    'tools/fcore_probe.h',
-    'tools/fcore_clips.h',
-    // The wasm entry point itself. It PRINTS the numbers CI diffs (parity.mjs renders its lufs/dbtp as
-    // text and the step runs a plain `diff`), and until P80 it computed one of them with a constant
-    // `20.0 * std::log10 (1e-9)` — a libm call in the last place anyone would look for one.
-    'tools/wasm/fc_probe.cpp',
 ]);
-// A NOTE ON WHAT fc_probe.cpp's MEMBERSHIP RESTS ON, because an earlier comment here got it wrong: what CI
-// byte-diffs from this binary is its STDOUT — the block energies and the true peak as a LINEAR bit pattern.
-// `dbtp` is printed only under --debug and only to stderr. The file is in the zone because the numbers it
-// prints on the diffed path come from here, not because every getter it exposes is diffed.
 
 // IN-ZONE EXCEPTIONS, each of which had to be argued rather than waved through. A line in the zone may
 // call libm only if it carries a `// libm-ok: <reason>` marker AND appears here; a marker without an
