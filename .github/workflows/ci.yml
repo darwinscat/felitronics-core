@@ -29,7 +29,6 @@ jobs:
     outputs:
       mode:  ${{ steps.plan.outputs.mode }}
       regex: ${{ steps.plan.outputs.regex }}
-      abi:   ${{ steps.plan.outputs.abi }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -68,7 +67,7 @@ jobs:
           # arm64 rows are also the only Apple rows, so "arm64" and "Apple's toolchain" always move together
           # and a divergence cannot be attributed. It is not a hypothetical distinction — the P0 spike found
           # Apple's libm returning different doubles from tan() than musl and glibc at 88.2/192 kHz, i.e. the
-          # outlier was the TOOLCHAIN while the ISA was innocent (docs/P0-WASM-SPIKE.md). glibc-on-arm64 is
+          # outlier was the TOOLCHAIN while the ISA was innocent (felitronics-mastering-core's WASM-SPIKE.md). glibc-on-arm64 is
           # the cell that separates them. Free for public repositories, same steps as every other row.
           - { os: ubuntu-24.04-arm, pffft: OFF }
           # windows-latest + pffft ON is a fast-follow (pending a first green MSVC-pffft run); the OFF row
@@ -232,9 +231,9 @@ jobs:
 
   # wasm-audio — the tier DSP-ARCHITECTURE.md §2 declares, GATED here instead of aspirational. Builds every
   # default module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole suite in node, and
-  # proves the no-threads claim from the ARTIFACTS rather than from the command line. It is also the only
-  # place CI compiles the P0 spike at all — that build broke unnoticed once, precisely because nothing here
-  # touched it.
+  # proves the no-threads claim from the ARTIFACTS rather than from the command line. The C ABIs built on the
+  # tier (the probe and the mastering chain) and their native-vs-wasm comparisons live, and are gated, in
+  # felitronics-mastering-core.
   #
   # WHAT THIS GATE ACTUALLY CATCHES, so nobody reads more into a green tick than it earns:
   #   an exception or RTTI            -> COMPILE error (the preset's -fno-exceptions -fno-rtti)
@@ -254,14 +253,8 @@ jobs:
   #   long double ON AN EMITTED PATH  -> caught from the ARTIFACT: on wasm32 the type is software binary128,
   #                                      so every operation is a compiler-rt libcall (__addtf3, __multf3, …)
   #                                      standing in the object file as an undefined symbol. Measured: the
-  #                                      tier's objects yield no hit, with no exclusion (the one sanctioned
-  #                                      use, fcore_measure's correlation accumulator, is binary64 since P59a).
+  #                                      tier's objects yield no hit, with no exclusion.
   #   long double in code NEVER emitted -> the text lint. Same split as the thread wrap and the header lint.
-  #
-  # ubuntu, NOT macos, and for the parity step that is load-bearing: Apple's libm and musl (what emscripten
-  # compiles in) return different doubles from tan() at 88.2 and 192 kHz, so an arm64-macOS reference would
-  # diverge from wasm for a reason that is not a regression. glibc agrees with musl at every rate measured.
-  # docs/P0-WASM-SPIKE.md has the numbers.
   wasm-audio:
     name: wasm-audio-tier
     needs: scope
@@ -275,8 +268,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install emsdk 6.0.9
         # Installed from upstream directly rather than through a third-party action, so the only thing this
-        # job trusts is emscripten itself. 6.0.9 is the toolchain every number in docs/P0-WASM-SPIKE.md was
-        # measured on; moving it should be a deliberate act, not drift.
+        # job trusts is emscripten itself. 6.0.9 is the toolchain the tier was measured on (docs/WASM-AUDIO-TIER.md);
+        # moving it should be a deliberate act, not drift.
         # `--branch 6.0.9` pins the CLONE too. Without it `--depth 1` fetches emsdk master — the installer
         # and the release manifest — and only the SDK *version argument* would be pinned, which is not the
         # same thing and would have made the word "pinned" here false.
@@ -335,9 +328,7 @@ jobs:
         # libcall — `__addtf3`, `__multf3`, `__trunctfdf2` — and shows up as an UNDEFINED SYMBOL in the
         # object file. Measured on emsdk 6.0.9: an accumulate in `long double` emits them, `sizeof(long
         # double)` alone emits nothing (correctly — naming the type is not using it), plain `double` emits
-        # nothing. The tier's objects match NOTHING, and nothing is excluded: the one named exclusion this step
-        # used to carry — fcore_measure.cpp.o's `long double` correlation accumulator — became the stereo band's
-        # binary64 formula in P59a, so the gate now covers that file too.
+        # nothing. The tier's objects match NOTHING, and nothing is excluded.
         #
         # It pairs with the text lint below exactly as `--wrap=pthread_create` pairs with the header lint:
         # this one reads EMITTED code, so no comment can fool it and a type reached through a macro or an
@@ -430,19 +421,20 @@ jobs:
             echo "CONTROL FAILED: sizeof(long double) alone now emits a libcall — the gate would false-positive on the ABI probe"; exit 1
           fi
           echo "control 4 ok: long double arithmetic still lowers to a tf libcall, and sizeof() alone still does not"
-          # Controls 5-10: the libm audit. Its --self-test above proves the MATCHER; these prove the RULES,
+          # Controls 5-13: the libm audit. Its --self-test above proves the MATCHER; these prove the RULES,
           # and each one is a way this lint could go quietly dead. The carrier control (6) is the one that
-          # matters most: the analyzers it defends contain no direct `std::` call, so a lint that only
-          # caught control 5 would pass forever while the real exposure walked in through gainToDb.
-          ZONEH=modules/analysis/include/felitronics/analysis/HumDetector.h
+          # matters most: the analyzers the zone defends contain no direct `std::` call, so a lint that only
+          # caught control 5 would pass forever while the real exposure walked in through gainToDb. The same
+          # rules, planted on the analyzers themselves, run in felitronics-mastering-core's CI.
+          ZONEH=modules/analysis/include/felitronics/analysis/ReferenceTruePeakMeter.h
           MANH=modules/analysis/include/felitronics/analysis/PlotMap.h
           OFF=modules/core/include/felitronics/core/OfflineFft.h
           MANIFEST=tools/lint/det-math-manifest.txt
-          SOLV=modules/mastering/include/felitronics/mastering/LoudnessSolver.h
+          LINT=tools/lint/check-det-math.mjs
           # Restore ONLY the files these controls touch. A bare `git checkout -- .` would also discard
           # anything else in the tree, which is harmless on a CI checkout and destructive if a human runs
           # this block locally to see what it does — and someone will.
-          det_restore () { git checkout -- "$ZONEH" "$MANH" "$OFF" "$MANIFEST" "$SOLV"; }
+          det_restore () { git checkout -- "$ZONEH" "$MANH" "$OFF" "$MANIFEST" "$LINT"; }
           det_control () {  # det_control <n> <what> <expected substring>
             if node tools/lint/check-det-math.mjs > /dev/null 2>&1; then
               det_restore; echo "CONTROL FAILED ($1): the lint PASSED with $2 planted"; exit 1; fi
@@ -462,23 +454,21 @@ jobs:
           det_control 9 "a libm-ok marker with no ZONE_EXCEPTIONS entry behind it" "no entry for it in ZONE_EXCEPTIONS"
           sed -i 's|   // libm-ok: hypot, see ZONE_EXCEPTIONS||' "$OFF"
           det_control 10 "an allowed exception whose marker was deleted" "[ZONE-EXCEPTION-ROT]"
-          # 11 is THE regression this lint was written after: reverting LoudnessSolver::peakDb to the
-          # system spelling breaks "the solver's report IS the certificate, bit for bit". The first
-          # version of the lint PASSED on it, because carrier calls were checked only inside the zone.
-          sed -i 's|core::gainToDbDet (lin)|core::gainToDb (lin)|' "$SOLV"
-          # And prove the mutation LANDED: an earlier version of this control keyed on `... : -200.0`,
-          # which a refactor renamed to kPeakDbSilence, so the sed matched nothing and the lint's pass
-          # read as a working gate. A stand that does not verify its own mutation is wired to nothing.
-          grep -q 'core::gainToDb (lin)' "$SOLV" \
-            || { det_restore; echo "CONTROL BROKEN (11): the sed planted nothing"; exit 1; }
-          det_control 11 "LoudnessSolver::peakDb reverted to the system spelling" "$SOLV"
+          # 11 — a carrier call reverted OUTSIDE the zone (LoudnessSolver::peakDb, the regression this lint was
+          # written after) — left with LoudnessSolver for felitronics-mastering-core, whose CI plants it there.
           # 12: the matcher used to read one line at a time, so a call whose parenthesis sat on the next
           # line was not a call at all — in the zone, with no marker needed, because nothing was recorded.
           printf '\nnamespace { inline double p80c (double x) { return std::cos\n    (x); } }\n' >> "$ZONEH"
           det_control 12 "a call split between its name and its parenthesis" "$ZONEH"
+          # 13: a zone entry naming a file that is not there covers nothing and used to count as coverage —
+          # the state twelve entries would have been left in when the analyzers moved out of this tree.
+          sed -i "s|    'modules/core/include/felitronics/core/OfflineFft.h',|&\n    'modules/core/include/felitronics/core/NoSuchFile.h',|" "$LINT"
+          grep -q "NoSuchFile.h" "$LINT" \
+            || { det_restore; echo "CONTROL BROKEN (13): the sed planted nothing"; exit 1; }
+          det_control 13 "a zone entry for a file that does not exist" "[ZONE-ROT]"
           node tools/lint/check-det-math.mjs > /dev/null \
-            || { echo "CONTROL FAILED: the tree did not come back clean, so controls 5-12 proved nothing"; exit 1; }
-          echo "controls 5-12 ok: the libm audit fires on every rule and the tree is clean again"
+            || { echo "CONTROL FAILED: the tree did not come back clean, so controls 5-13 proved nothing"; exit 1; }
+          echo "controls 5-13 ok: the libm audit fires on every rule and the tree is clean again"
           # Control 5: the allocation counter, BOTH halves. First the lint's reach — its --self-test above
           # proves the matcher, this proves the scan actually lands on a test file and fails the step.
           printf 'void* operator new (unsigned long s);\n' > modules/core/tests/_lint_control.cpp
@@ -517,7 +507,7 @@ jobs:
         # Only for the whole matrix. A change confined to modules/ leaves the wasm PLUMBING as it was; its
         # memory errors in module code are the ASan row's job, natively. The release branch runs this always.
         if: needs.scope.outputs.mode == 'all'
-        # The libsoxr lesson from the P0 report: a release build that works proves less than a checked build
+        # The libsoxr lesson from the wasm spike: a release build that works proves less than a checked build
         # that agrees with it. Cheap here — ~15 s to build, ~17 s to run. STACK_OVERFLOW_CHECK is what turns
         # a blown stack from "wrong answers, then memory access out of bounds" into a named diagnosis.
         # The perf suite is excluded: its assertions are RELATIVE wall-clock, and SAFE_HEAP instruments every
@@ -529,299 +519,7 @@ jobs:
           # All cores: the one test that must not share the machine — the wall-clock gate — is excluded right
           # here by -E, so nothing in this run measures time. Under SAFE_HEAP every load and store is checked,
           # which makes this the slowest test run in the workflow; capping it at 4 left deb three-quarters idle.
-          # Also excluded: the three exhaustive sweeps (two mastering, one clip detector). Under SAFE_HEAP they are the whole tail of this
-          # step — measured on deb, each alone on a core for over four minutes while the other eighteen sat idle,
-          # because one test cannot be split by -j. They add nothing here: the same sweeps already ran in this
-          # workflow, for their numbers in the release wasm suite and for memory safety natively under ASan,
-          # which is the stronger instrument.
-          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E 'spectrum_pane_perf|delivered_ceiling|loudness_solver|clip_detector'
-      - name: The P0 spike artifacts still build
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        run: ./tools/wasm/build.sh
-      - name: NULL test — native vs wasm, bit-exact, on a GENERATED fixture
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        # No private audio in a public repo: the fixture is synthesised from an integer PRNG with no
-        # transcendental in sight, so it is byte-identical on any engine. The comparison surface is the
-        # pre-gate 400 ms block-energy vector, not the scalar LUFS — a gated scalar is discontinuous in its
-        # own inputs and cannot carry a bit-exactness claim (docs/P0-WASM-SPIKE.md). The checked artifact
-        # (SAFE_HEAP + ASSERTIONS=2 + stack checks) is diffed too: building it without running it would
-        # prove nothing, and the libsoxr precedent is exactly a clean build that died at runtime.
-        run: |
-          cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=OFF
-          cmake --build build-native -j "$(nproc)" --target fcore_measure
-          node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
-          # The generator claims to be deterministic by construction; this turns that into a MEASURED fact
-          # on a different machine, OS and node build than the one it was written on. Recorded from two
-          # local runs on macOS/arm64. If a future edit to the generator changes the signal, this line is
-          # what says so, instead of every report quietly citing a different "97 block energies".
-          echo "ad4b9513d9d9b88827a07116d36ceafa5c73a7602239c8e4ff6d49c6e2beac39  fixture.f32" | sha256sum -c -
-          ./build-native/tools/fcore_measure blocks 48000 2 fixture.f32 > native.txt
-          node tools/wasm/parity.mjs tools/wasm/build/fcprobe.node.js  48000 2 fixture.f32 > wasm.txt
-          node tools/wasm/parity.mjs tools/wasm/build/fcprobe.debug.js 48000 2 fixture.f32 > wasm-checked.txt
-          diff native.txt wasm.txt
-          diff native.txt wasm-checked.txt
-          echo "bit-identical: $(sed -n 's/^blocks //p' native.txt) block energies + true peak + sample peak"
-      - name: NULL test — waveform peaks, stereo band and needle, native vs wasm, bit-exact
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        # P59a: the page's waveform and stereo pictures and the sidecars that stand in for them now come from one
-        # definition (analysis::WaveformPeaks / StereoColumns via fcore::ShapeProbe), and this is the proof the
-        # two roads to it — the native CLI a server would run and the browser module — draw the same bits. Every
-        # mix mode; bucket and column counts that are the page's (1000, 1100), the spec's default (1200), one, and
-        # more than the frames hold; a mono, a stereo and a six-channel fixture at three rates; the needle over the
-        # whole file, a stretch, one frame and an empty stretch. Release and checked artifacts both.
-        run: |
-          node tools/wasm/make-fixture.mjs fix6.f32 44100 6 3
-          node tools/wasm/make-fixture.mjs fix1.f32 22050 1 2
-          M=./build-native/tools/fcore_measure
-          n=0
-          check() { f=$1; sr=$2; ch=$3; mode=$4; shift 4
-            $M "$mode" "$sr" "$ch" "$f" "$@" > shapes-native.txt
-            test -s shapes-native.txt
-            for mod in fcprobe.node.js fcprobe.debug.js; do
-              node tools/wasm/shapes-parity.mjs "tools/wasm/build/$mod" "$mode" "$sr" "$ch" "$f" "$@" > shapes-wasm.txt
-              diff shapes-native.txt shapes-wasm.txt || { echo "DIFFER: $mode $sr $ch $* ($mod)"; exit 1; }
-              n=$((n+1))
-            done; }
-          for mix in avr L R max; do for b in 1 1000 1100 100000; do
-            check fixture.f32 48000 2 waveform --buckets $b --mix $mix
-            check fix6.f32    44100 6 waveform --buckets $b --mix $mix
-            check fix1.f32    22050 1 waveform --buckets $b --mix $mix
-          done; done
-          for c in 1 1100 1200 50000; do
-            check fixture.f32 48000 2 stereo --columns $c
-            check fix6.f32    44100 6 stereo --columns $c
-            check fix1.f32    22050 1 stereo --columns $c
-          done
-          check fixture.f32 48000 2 needle
-          check fixture.f32 48000 2 needle --from 12345 --to 400000
-          check fix6.f32    44100 6 needle --from 7 --to 8
-          check fix1.f32    22050 1 needle --from 100 --to 100
-          echo "bit-identical: $n native-vs-wasm comparisons of peaks, stereo band and needle"
-      - name: NULL test — the clipped runs, native vs wasm, bit-exact
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        # P71: analysis::ClipDetector now has a way out (fcore::ClipProbe, `fcore_measure clips` and
-        # fc_probe_clips_*), and this is the proof the two roads report the same runs. The generated fixture
-        # above is CLEAN — its flat stretches are square waves and a hit that stops, which the detector
-        # correctly reports as clipping-free — so it is kept as the zero-run case and a second, CLAMPED
-        # generator provides the runs. Both are transcendental-free and their bytes are pinned.
-        #
-        # --chunk IS THE LAW-8a HANDLE. It is honoured by the native tool and ignored by the module (which
-        # always measures in one call), so every row below that carries it compares an N-sample-at-a-time
-        # native run against a whole-buffer wasm run: re-slicing invariance and cross-toolchain identity in
-        # the same diff. Without it both sides cut the stream at multiples of fcore::ClipProbe::kChunk and the
-        # comparison would say nothing at all about slicing.
-        run: |
-          node tools/wasm/make-clip-fixture.mjs clipfix.f32  48000 2 2
-          node tools/wasm/make-clip-fixture.mjs clipfix6.f32 44100 6 1
-          node tools/wasm/make-clip-fixture.mjs clipfix1.f32 22050 1 1
-          # Deterministic by construction, turned into a measured fact on another machine, OS and node build.
-          # The generator's passages are fractions of the length, so even the 1-second fixtures carry all
-          # seven: quiet noise, silence, a hard clamp, a clean passage, a shallow clamp, non-finite HOLES
-          # (150 / 191 / 17 of them here) and a clamped tail whose runs exist only after finish().
-          sha256sum -c - <<'SUMS'
-          fab7d41e1925e58f58462e39b7c2481dc0418b5aa28cc0b4203f3c6a710f955f  clipfix.f32
-          91de246c7f8f6fc98df1957762c87c50fbc8fda87abddff974753ef7d19ecc85  clipfix6.f32
-          b0e173a8d8f0732b0882425367f8065b11ed986b925c6a49b99aa4b32ece7171  clipfix1.f32
-          SUMS
-          M=./build-native/tools/fcore_measure
-          n=0
-          check() { f=$1; sr=$2; ch=$3; shift 3
-            $M clips "$sr" "$ch" "$f" "$@" > clips-native.txt
-            test -s clips-native.txt
-            for mod in fcprobe.node.js fcprobe.debug.js; do
-              node tools/wasm/clips-parity.mjs "tools/wasm/build/$mod" clips "$sr" "$ch" "$f" "$@" > clips-wasm.txt
-              diff clips-native.txt clips-wasm.txt || { echo "DIFFER: clips $sr $ch $f $* ($mod)"; exit 1; }
-              n=$((n+1))
-            done; }
-          # AND THE REFUSALS MUST MATCH TOO. A byte diff of two successful commands says nothing about the
-          # command lines both sides are supposed to REJECT, and a domain mismatch there is a silent
-          # disagreement: `--max-runs 4294967296` wrapped to 0 in a uint32_t parameter and came back as a
-          # cheerful `maxruns=0` report from the module while the native tool exited 2. Both sides must refuse,
-          # both must print nothing to stdout.
-          refuse() { f=$1; sr=$2; ch=$3; shift 3
-            if $M clips "$sr" "$ch" "$f" "$@" > r-native.txt 2>/dev/null; then
-              echo "NATIVE ACCEPTED what it should refuse: clips $sr $ch $f $*"; exit 1; fi
-            test ! -s r-native.txt || { echo "NATIVE printed a report and then failed: $*"; exit 1; }
-            for mod in fcprobe.node.js fcprobe.debug.js; do
-              if node tools/wasm/clips-parity.mjs "tools/wasm/build/$mod" clips "$sr" "$ch" "$f" "$@" \
-                   > r-wasm.txt 2>/dev/null; then
-                echo "WASM ACCEPTED what native refuses: clips $sr $ch $f $* ($mod)"; exit 1; fi
-              test ! -s r-wasm.txt || { echo "WASM printed a report and then failed: $* ($mod)"; exit 1; }
-              n=$((n+1))
-            done; }
-          # a file with NO clipping at all, then clamped material at three rates and three widths
-          check fixture.f32   48000 2
-          check clipfix.f32   48000 2
-          check clipfix6.f32  44100 6
-          check clipfix1.f32  22050 1
-          # the detector's own capacity running out: the count keeps counting, the list says it is short
-          # 1051 is this fixture's exact run count, so 1050/1051 straddles the completeness boundary
-          for c in 0 1 3 500 1050 1051 1052; do check clipfix.f32 48000 2 --max-runs $c; done
-          # re-slicing, across the tier
-          for k in 1 2 3 7 959 960 961 8191 8192; do check clipfix.f32 48000 2 --chunk $k; done
-          for k in 1 7 882; do check clipfix6.f32 44100 6 --chunk $k; check clipfix1.f32 22050 1 --chunk $k; done
-          refuse clipfix.f32 48000 2 --max-runs 4294967296
-          refuse clipfix.f32 48000 2 --max-runs 1048577
-          refuse clipfix.f32 48000 2 --chunk 2147483648
-          refuse clipfix.f32 48000 2 --max-runs 5 --max-runs 6
-          refuse clipfix.f32 48000 2 --bogus 1
-          refuse clipfix.f32 48000 2 --max-runs
-          refuse clipfix.f32 48000 0
-          refuse clipfix.f32 48000 17
-          # THE RATE FLOOR, FROM BOTH SIDES (P51: the core's 8000 Hz; it was 1000 here, with `999` the row).
-          # The refusal rows see the floor move down; they cannot see it move UP, so 8000 itself is a comparison
-          # that must produce a report. 44.1 is the mistake the floor exists for: kilohertz passed as hertz.
-          refuse clipfix.f32 7999 2
-          refuse clipfix.f32 7999.999999999999 2
-          refuse clipfix.f32 44.1 2
-          refuse clipfix.f32 1000 2
-          check  clipfix.f32 8000 2
-          refuse clipfix.f32 768001 2
-          refuse clipfix.f32 0 2
-          : > empty.f32 && refuse empty.f32 48000 2
-          echo "bit-identical: $n native-vs-wasm comparisons of the clipped runs, refusals included"
-
-      - name: NULL test — the streaming surface, native vs wasm, bit-exact (P120)
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        # The fc_stream_* handles (fcore::StreamProbe: the deterministic loudness meter and the clip detector, fed
-        # piece by piece and read between the pieces) against `fcore_measure stream`, which drives the same class
-        # without the ABI. Every line after every piece is compared: momentary, short-term and integrated LUFS as
-        # bit patterns, the samples consumed, and the runs decided so far — then finish() and the runs only it
-        # decides. The native reference is this job's contract-off fcore_measure; fcore_master is not a reference,
-        # it is built with contraction, and the detector's run existence depends on it.
-        #
-        # 88200 IS THE ROW THAT MATTERS. The system-libm meter (the one fc_probe_run still uses) gives different
-        # block energies natively and in wasm there; the deterministic one must not. 44100 and 48000 beside it.
-        run: |
-          set -euo pipefail
-          for sr in 44100 48000 88200; do
-            node tools/wasm/make-fixture.mjs      "stream-fix$sr.f32"  "$sr" 2 10
-            node tools/wasm/make-clip-fixture.mjs "stream-clip$sr.f32" "$sr" 2 2
-          done
-          sha256sum -c - <<'SUMS'
-          00b8afdc735b206b80ba349fd64afc81052f5c45477ed64c540ddf7f3f630bd3  stream-fix44100.f32
-          ad4b9513d9d9b88827a07116d36ceafa5c73a7602239c8e4ff6d49c6e2beac39  stream-fix48000.f32
-          c6d50a1b6a60b07b4ccc0531269a4d8f770de12378e02bf2b84021f101d00c1a  stream-fix88200.f32
-          df41196bcac8e77c9e5eecee7b0a807ad672ed76733d63723eee63a37da65c3f  stream-clip44100.f32
-          fab7d41e1925e58f58462e39b7c2481dc0418b5aa28cc0b4203f3c6a710f955f  stream-clip48000.f32
-          2043d1f4c2346cab191e380c931fdaac4786575d9e7995a4d570cbbeaa7f81aa  stream-clip88200.f32
-          SUMS
-          M=./build-native/tools/fcore_measure
-          n=0
-          check() { f=$1; sr=$2; shift 2
-            $M stream "$sr" 2 "$f" "$@" > stream-native.txt
-            test -s stream-native.txt
-            # A clean diff of silence proves nothing: the integrated reading must not be the -120 floor.
-            ! grep '^at ' stream-native.txt | tail -1 | grep -q ' i c05e000000000000 ' \
-              || { echo "integrated is the -120 floor on $f — the comparison is comparing nothing"; exit 1; }
-            for mod in fcprobe.node.js fcprobe.debug.js; do
-              node tools/wasm/stream-parity.mjs "tools/wasm/build/$mod" stream "$sr" 2 "$f" "$@" > stream-wasm.txt
-              test -s stream-wasm.txt
-              diff stream-native.txt stream-wasm.txt || { echo "DIFFER: stream $sr $f $* ($mod)"; exit 1; }
-              n=$((n+1))
-            done; }
-          for sr in 44100 48000 88200; do
-            for k in 4096 4095 $((sr / 100)) 100000; do
-              check "stream-fix$sr.f32"  "$sr" --chunk "$k"
-              check "stream-clip$sr.f32" "$sr" --chunk "$k"
-              # the clamped fixture must have runs, and runs that only finish() decides
-              grep -q '^run ' stream-native.txt || { echo "no runs on stream-clip$sr.f32"; exit 1; }
-              before=$(grep '^at ' stream-native.txt | tail -1 | sed 's/.* runs //')
-              after=$(sed -n 's/^finish runs //p' stream-native.txt)
-              [ "$after" -gt "$before" ] || { echo "finish() decided no runs on stream-clip$sr.f32 ($before -> $after)"; exit 1; }
-            done
-          done
-          echo "bit-identical: $n native-vs-wasm comparisons of the streaming surface, read after every piece"
-
-      - name: the five offline analyzers — native vs wasm, byte for byte (P77)
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        run: |
-          set -euo pipefail
-          # WHY THIS GATE CAN EXIST AT ALL. Before P79 it could not: the five analyzers computed their
-          # windows, dB values and thresholds through the SYSTEM libm, which is not the same function on
-          # every row — 4032 of 131072 Hann coefficients differ between Apple's libm and musl's at order
-          # 17, and 41 % of pow10 results over the dB range these thresholds live in. A byte diff of the
-          # two rows was therefore unattainable for hum, lowend and forensics, and the acceptance had been
-          # weakened to a wasm-only comparison. core::det made the original criterion reachable, so it is
-          # the one enforced here.
-          node tools/wasm/make-fixture.mjs fixture441.f32 44100 2 10   # 48 kHz one already exists above
-          # AND A PROGRAMME THAT ACTUALLY HAS HUM. On the loudness fixture HumDetector finds zero quiet
-          # frames and returns NoQuietStretch before reaching its peak search at all: 47 lines of "nothing
-          # found" satisfy `test -s` and diff clean without the measurement path ever running. This one
-          # carries a 50 Hz line with three harmonics in two quiet stretches, each longer than a whole
-          # analysis window plus a hop — which is what it takes for a frame to sit entirely inside one.
-          node tools/wasm/make-hum-fixture.mjs humfix.f32 48000 2 30
-          M=./build-native/tools/fcore_measure
-          n=0
-          check() { mode=$1; sr=$2; ch=$3; f=$4
-            $M "$mode" "$sr" "$ch" "$f" > an-native.txt
-            # A clean diff of two empty files proves nothing: refuse to count a comparison with no content.
-            test -s an-native.txt
-            for mod in fcprobe.node.js fcprobe.debug.js; do
-              node "tools/wasm/$mode-parity.mjs" "tools/wasm/build/$mod" "$sr" "$ch" "$f" > an-wasm.txt
-              test -s an-wasm.txt
-              diff an-native.txt an-wasm.txt || { echo "DIFFER: $mode $sr $ch $f ($mod)"; exit 1; }
-              n=$((n+1))
-            done; }
-          # Both rates matter and not for symmetry: at 44.1 kHz the filter arguments of these analyzers
-          # (30 Hz, 9 kHz, the K-weighting corner) are ones where the system libm's tan DID differ between
-          # rows, so this is the rate that would have caught a regression in the deterministic floor.
-          for mode in report forensics hum lowend bursts stereobursts excursions; do
-            check "$mode" 48000 2 fixture.f32
-            check "$mode" 44100 2 fixture441.f32
-          done
-          # AND K3c ASSERTED TO HAVE FIRED ON BOTH AXES. A stereo instrument whose fixture happens to be
-          # centred has an exactly zero Side, no eligible hop and no event on it — and two such reports
-          # diff clean while the cross arithmetic, which is the whole point of the class, never runs. This
-          # is the same trap the hum check below names, one axis over.
-          $M stereobursts 48000 2 fixture.f32 > an-native.txt
-          grep -qE '^axis 0 [0-9]+ [0-9]+ [0-9]+ [0-9]+ 1 0 [1-9]' an-native.txt \
-            || { echo "the stereobursts fixture stopped firing on Mid — the gate is comparing nothing"; exit 1; }
-          grep -qE '^axis 1 [0-9]+ [0-9]+ [0-9]+ [0-9]+ 1 0 [1-9]' an-native.txt \
-            || { echo "the stereobursts fixture stopped firing on Side — the cross reading is untested"; exit 1; }
-          grep -qE '^e 1 ' an-native.txt \
-            || { echo "no Side event row — crossAt() is not exercised by this gate"; exit 1; }
-          # hum again, on the programme that reaches its measurement — and asserted to be a real finding,
-          # because a clean diff of two "nothing found" reports is the shape this whole gate exists to
-          # refuse.
-          check hum 48000 2 humfix.f32
-          grep -q '^ch 0 valid 1 reason 0 mains 1' an-native.txt \
-            || { echo "the hum fixture stopped finding its line — the gate is comparing nothing again"; exit 1; }
-          echo "bit-identical: $n native-vs-wasm comparisons across six analyzers, two rates, two modules"
-
-      - name: the price of a measurement — the same demand on both tiers (P81)
-        if: needs.scope.outputs.mode == 'all' || needs.scope.outputs.abi == 'true'
-        # `fc_probe_<mode>_storage_bytes` publishes what each analyzer's storageFor() is about to ask the
-        # heap for, so a page can decide BEFORE the allocation that -fno-exceptions turns into an abort.
-        # Two things are checked here that the native suite structurally cannot:
-        #   * that the five names reached the ARTIFACT. felitronics_analysis_abi_tests compiles
-        #     fc_probe.cpp natively; an export missing from the module leaves it green and the page holding
-        #     `undefined`, and `cmp` cannot detect a function nobody called.
-        #   * that the two TIERS agree on the number. wasm32 has its own std::size_t and its own struct
-        #     layouts, so this is a cross-tier oracle — a release-vs-checked diff of one tier would happily
-        #     compare a wrong demand with itself.
-        run: |
-          set -euo pipefail
-          # build-native was configured with tests OFF (it only needed fcore_measure); turning them on
-          # re-uses its object cache and adds this one target.
-          cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release -DFELITRONICS_BUILD_TESTS=ON
-          cmake --build build-native -j "$(nproc)" --target felitronics_analysis_abi_tests
-          ./build-native/tools/felitronics_analysis_abi_tests --storage-table > storage-native.txt
-          test -s storage-native.txt
-          # A table of nothing but refusals would compare clean and say nothing, which is the shape this
-          # repository keeps catching. Floors, not equalities, so the grid may grow — but it may not
-          # shrink: 571 rows today, of which 329 are priced (K3c added 95 rows, 44 of them priced). (P51 moved the rate floor to 8000 Hz: the 1000 Hz
-          # rows went to zero, the 2000 Hz rows left the grid, and 7999 / 12000 / 16000 joined — 425 / 280 before.)
-          [ "$(wc -l < storage-native.txt)" -ge 570 ] \
-            || { echo "the storage table lost rows — a smaller grid still compares clean"; exit 1; }
-          [ "$(grep -cv ' 0$' storage-native.txt)" -ge 328 ] \
-            || { echo "the storage table is mostly refusals — it is comparing nothing"; exit 1; }
-          for mod in fcprobe.node.js fcprobe.debug.js; do
-            node tools/wasm/storage-probe.mjs "tools/wasm/build/$mod" table > storage-wasm.txt
-            cmp storage-native.txt storage-wasm.txt || { echo "the published demand differs between tiers ($mod)"; exit 1; }
-            node tools/wasm/storage-probe.mjs "tools/wasm/build/$mod" check
-          done
-          echo "identical on both tiers: $(wc -l < storage-native.txt) rows of published demand, release and checked"
+          ctest --test-dir build-wasm-checked -j "$(nproc)" --output-on-failure -E 'spectrum_pane_perf'
 
   # eqviz — renders the per-filter PNG quality maps (digital vs independent analog references) and
   # uploads them as a PR artifact, so a reviewer SEES filter quality instead of trusting their ears.

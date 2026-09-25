@@ -24,6 +24,7 @@
 #include <felitronics/analysis/LoudnessMeter.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -561,6 +562,36 @@ int main()
         feedSine (many, sr, kToneHz, -23.0, 5.0, b, 4097);     // odd chunks, straddling hops
         test::approx (many.integratedLufs(), one.integratedLufs(), 1e-9, "the same stream in 4097-frame pieces reads identically");
         test::approx (many.momentaryLufs(),  one.momentaryLufs(),  1e-9, "momentary too");
+    }
+
+    // --- ...and BIT-exact, not merely close: a comparison of this meter across toolchains or call patterns
+    //     leans on it. The measurement probe's suite (felitronics-mastering-core's ProbeTests) pins the same
+    //     property through the probe, from call sizes 1 to 100 003; the meter's own suite pins it here, on
+    //     every pre-gate block energy and the integrated and momentary readings as bit patterns. ---
+    test::group ("chunk invariance is BIT-exact: every pre-gate block energy, at every call size");
+    {
+        struct Reading { std::vector<std::uint64_t> blocks; std::uint64_t integrated = 0, momentary = 0; };
+        auto measure = [&] (int chunk)
+        {
+            analysis::LoudnessMeter lm; felitronics::test::run (lm.prepare (sr, 2, 20.0));
+            long long idx = 0;
+            feedSine (lm, sr, kToneHz, -20.0, 2.0, idx, chunk);
+            feedSine (lm, sr, kToneHz, -35.0, 1.5, idx, chunk);   // a level step, so the gates have work to do
+            Reading r;
+            for (const double e : lm.gatingBlockEnergies()) r.blocks.push_back (std::bit_cast<std::uint64_t> (e));
+            r.integrated = std::bit_cast<std::uint64_t> (lm.integratedLufs());
+            r.momentary  = std::bit_cast<std::uint64_t> (lm.momentaryLufs());
+            return r;
+        };
+        const Reading whole = measure (1 << 20);
+        test::ok (whole.blocks.size() > 30, "PRECONDITION: the programme produced a meaningful number of gating blocks ("
+                                            + std::to_string (whole.blocks.size()) + ")");
+        for (const int chunk : { 1, 7, 999, 4096, 8192, 8193, 100003 })
+        {
+            const Reading r = measure (chunk);
+            test::ok (r.blocks == whole.blocks && r.integrated == whole.integrated && r.momentary == whole.momentary,
+                      "chunk " + std::to_string (chunk) + " gives the same block energies and readings, bit for bit");
+        }
     }
 
     // --- the pre-gate block energies are exposed so a cross-toolchain check can compare a quantity that is

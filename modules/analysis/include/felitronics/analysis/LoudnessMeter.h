@@ -284,8 +284,9 @@ private:
         // LAW 8 lives HERE, not at the end of process(), and the difference is not cosmetic. This boundary
         // is a deterministic 10 ms of AUDIO (lround(0.01*fs) samples); the end of process() is wherever the
         // caller happened to cut the stream. Flushing there would make the numbers depend on the host's
-        // block size, and this repo claims — and tests — that they do not (tools/tests/ProbeTests.cpp:212,
-        // bit-exact across call sizes 1 … 100 003). It also failed outright at low rates: this meter took any
+        // block size, and this repo claims — and tests — that they do not (bit-exact across call sizes
+        // 1 … 100 003: the integrated reading in AnalysisTests, every pre-gate block energy in
+        // LoudnessConformanceTests). It also failed outright at low rates: this meter took any
         // rate before P103 (the probe took 1 kHz before P51), and at 1 kHz a single 8192-sample call spans 8.2 s. And the
         // interval to beat is not the RLB's 2.85 s but the SHELF's 90 ms (4 324 samples at 48 kHz) — 8192
         // samples is already 170 ms, so a per-host-block flush would let the shelf sit subnormal for half of
@@ -319,7 +320,7 @@ private:
             // BS.1770 gives LFE — flagged a sub-hop whose weighted energy was perfectly fine. The
             // energy path next door already reasons this way, and reasoned it first; the counter had
             // simply not been made to agree with it. That mattered the moment the counter became
-            // load-bearing: `TargetLoudnessSolver::measureInputLoudnessRange()` now REFUSES on it, so
+            // load-bearing: `TargetLoudnessSolver::measureInputLoudnessRange()` (felitronics-mastering-core) REFUSES on it, so
             // an unweighted count would refuse a 5.1 programme over a channel the standard excludes.
             //
             // EXCLUDED MEANS EXACTLY ZERO, and the comparison is exact ON PURPOSE — `core::exactlyEqual`

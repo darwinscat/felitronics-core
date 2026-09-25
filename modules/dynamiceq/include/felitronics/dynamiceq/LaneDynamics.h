@@ -51,7 +51,7 @@ public:
     static constexpr int kControl = 16;      // samples between delta updates (~0.33 ms at 48 k)
 
     // THE PROBE'S RAILS, PUBLISHED — because a second copy of them is a second answer. A lane's freq/Q
-    // reach this class RAW (MasteringChain hands the producers the caller's band parameters, not the
+    // reach this class RAW (a composite — felitronics-mastering-core's MasteringChain — hands the producers the caller's band parameters, not the
     // band's clamped copy), so what the ballistics describe is not `lp.freq`/`lp.Q` but these two
     // functions of them, and a reader that asked `BandBallistics` with the raw pair would describe a
     // filter this class is not running: at 5 Hz it answers for 5 Hz where the probe sits at 10.

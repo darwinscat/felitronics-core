@@ -11,15 +11,12 @@ Prints a summary and, under GitHub Actions, writes to $GITHUB_OUTPUT:
             selected  only modules/ changed -- those modules, everything that includes them, and nothing else
             all       anything else: tools/, CMake, CI, the root, or not a pull request at all
     regex   the ctest -R pattern for `selected`, anchored; empty otherwise
-    abi     true when the selection reaches a module that tools/ is built on, so the native-vs-wasm parity
-            and the ABI tests must run; the plumbing itself (tools/wasm) changing is already `all`
 
 Every mapping is DERIVED, none is listed by hand -- in this repository a hand list is the first thing to go
 stale:
     test    -> module   the CMakeLists.txt under modules/<m>/ that declares it with add_test(NAME ...); a name
                         built from a variable (a foreach over test files) matches any value of that variable
     module  -> users    #include <felitronics/<m>/...> anywhere in modules/<user>/ (headers, sources, tests)
-    tools   -> modules  the same includes read from tools/, then closed forward through the modules' own
 
 A selection that resolves to no test at all is not trusted: it falls back to `all`, because an empty filter
 reads as a green run that tested nothing.
@@ -76,12 +73,12 @@ def declared_tests(directory):
     return names
 
 
-def emit(mode, regex='', abi=False, note=''):
+def emit(mode, regex='', note=''):
     print(f'scope: {mode}' + (f' -- {note}' if note else ''))
     out = os.environ.get('GITHUB_OUTPUT')
     if out:
         with open(out, 'a', encoding='utf-8') as fh:
-            fh.write(f'mode={mode}\nregex={regex}\nabi={"true" if abi else "false"}\n')
+            fh.write(f'mode={mode}\nregex={regex}\n')
 
 
 def main(argv):
@@ -114,10 +111,9 @@ def main(argv):
         emit('none', note=f'{len(changed)} file(s), all prose')
         return 0
 
-    users, forward = defaultdict(set), {}
+    users = defaultdict(set)
     for m in modules:
         uses = included_modules(ROOT / 'modules' / m) - {m}
-        forward[m] = uses
         for dep in uses:
             users[dep].add(m)
 
@@ -128,28 +124,16 @@ def main(argv):
                 closure.add(user)
                 queue.append(user)
 
-    reached, queue = set(), deque(included_modules(ROOT / 'tools'))
-    while queue:
-        m = queue.popleft()
-        if m in reached or m not in forward:
-            continue
-        reached.add(m)
-        queue.extend(forward[m])
-    abi = bool(closure & reached)
-
     tests = set()
     for m in closure:
         tests |= declared_tests(ROOT / 'modules' / m)
-    if abi:
-        tests |= declared_tests(ROOT / 'tools')
     if not tests:
         emit('all', note=f'{sorted(closure)} declare no test -- not trusting an empty filter')
         return 0
 
     regex = '^(' + '|'.join(sorted(tests)) + ')$'
-    emit('selected', regex, abi,
-         note=f'changed {sorted(touched)}; with users {len(closure)} module(s), {len(tests)} test(s)'
-              f'{"; reaches the ABI" if abi else ""}')
+    emit('selected', regex,
+         note=f'changed {sorted(touched)}; with users {len(closure)} module(s), {len(tests)} test(s)')
     return 0
 
 

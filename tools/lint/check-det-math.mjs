@@ -10,7 +10,8 @@
 // releases later.
 //
 // WHY THIS IS NOT A LIST OF CALL SITES, WHICH IS THE OBVIOUS DESIGN AND THE WRONG ONE.
-// The analyzers whose output is diffed byte-for-byte against the wasm module contain, today, ZERO direct
+// The analyzers whose output is diffed byte-for-byte against the wasm module (felitronics-mastering-core's,
+// linted by this script with --satellite) contained, when this was written, ZERO direct
 // system transcendental calls — all thirty of their transcendental calls already spell `det::` (11 pow10,
 // 11 log10, 4 log2, 2 sin, 1 exp2, 1 cos). Their entire remaining exposure was INDIRECT, through four
 // ordinary-looking functions:
@@ -30,8 +31,8 @@
 //
 // WHY THE ZONE IS A TYPED LIST AND THE CLOSURE IS ONLY A NET. The elegant design is to COMPUTE the zone
 // as the #include closure of the three translation units whose outputs CI diffs, and let it maintain
-// itself. It was tried here and it is wrong, for a reason worth writing down: `fcore_measure` links BOTH
-// regimes into one binary — its `report` mode is the deterministic analyzer and its `master` mode is the
+// itself. It was tried here and it is wrong, for a reason worth writing down: `fcore_measure` (now in
+// felitronics-mastering-core) links BOTH regimes into one binary — its `report` mode is the deterministic analyzer and its `master` mode is the
 // shipped RT chain (DetMath.h says exactly this about it). So the closure sweeps in MatchedBiquad,
 // Compressor, Smoother and EnvelopeFollower — 52 files, most of them TabbyEQ's and OrbitCab's own DSP,
 // whose `std::tan` is their sound and must not be touched. A ban over the closure would have demanded
@@ -60,13 +61,15 @@
 //   --report     print the full inventory (file, line, scope, call) and exit 0 — for an audit, not a gate
 //   --propose    print manifest lines for files that have none, marked UNCLASSIFIED. It never writes the
 //                manifest and never marks anything allowed: a human types the reason or the build stays red.
-//   --satellite  run from ANOTHER repository's root (felitronics-guitar-core): its ./modules against its own
-//                ./tools/lint/det-math-manifest.txt. Skips only the two checks of this lint's OWN lists
-//                against core's files (ZONE-EXCEPTION-ROT, CARRIER-ROT) — they are core's, core's CI runs them,
-//                and from another root the files they read are not there.
+//   --satellite  run from ANOTHER repository's root (felitronics-mastering-core, felitronics-guitar-core),
+//                with this script taken from the felitronics-core checkout that repository builds against.
+//                Two passes, both whole: core's tree against the lists in this file and core's manifest,
+//                exactly as core's CI runs it; then the satellite's ./modules and ./tools against ITS lists
+//                (tools/lint/det-math-zone.txt — see ZONE FILE below) and its own manifest, with core's
+//                carriers. Nothing is skipped on either side; see TWO REPOSITORIES, ONE GATE below.
 
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from 'node:fs';
+import { join, dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Everything below the matcher runs ONLY when this file is invoked as a program. Without this an
@@ -190,92 +193,129 @@ const IMPLEMENTATION = new Set([
     'modules/core/include/felitronics/core/Math.h',      // defines both dB spellings; gainToDb's std::log10 is the point
 ]);
 
-const ENTRY_POINTS = [
-    'tools/wasm/fc_probe.cpp',     // the wasm probe — CI diffs its stdout against the native CLI's
-    'tools/wasm/fc_master.cpp',    // the mastering ABI
-    'tools/fcore_measure.cpp',     // the native CLI, the other side of every one of those diffs
-];
+// The parity entry points of THIS repository: none since the C ABIs moved to felitronics-mastering-core, whose own
+// list names them (its tools/lint/det-math-zone.txt). A tree that grows a native-vs-wasm comparison again
+// lists its entry point here, and rule 4's net comes back with it.
+const ENTRY_POINTS = [];
 
-// THE DETERMINISTIC ZONE. Every file here produces, or is directly consumed by, a number that CI compares
-// BYTE FOR BYTE between the native CLI and the wasm module (tools/wasm/*-parity.mjs, and the plain `diff`
-// steps in .github/workflows/ci.yml). Membership is a claim about where a value GOES, which is why it is
-// written rather than computed — see the note at the top of this file about the closure.
+// THE DETERMINISTIC ZONE of this repository. Every file here produces, or is directly consumed by, a number
+// that is compared BYTE FOR BYTE between a native build and the wasm module. Those comparisons run in
+// felitronics-mastering-core, whose analyzers and probe stand on these four files; its own zone lists the
+// rest, and its CI runs this script with --satellite, which runs this tree's pass as well. Membership is a
+// claim about where a value GOES, which is why it is written rather than computed — see the note at the top
+// of this file about the closure.
 const ZONE = new Set([
-    // the analyzers whose output is diffed, one per parity harness
-    'modules/analysis/include/felitronics/analysis/ProgrammeReport.h',
-    'modules/analysis/include/felitronics/analysis/SourceForensics.h',
-    'modules/analysis/include/felitronics/analysis/HumDetector.h',
-    'modules/analysis/include/felitronics/analysis/LowEnd.h',
-    'modules/analysis/include/felitronics/analysis/BandBursts.h',
-    'modules/analysis/include/felitronics/analysis/ClipDetector.h',
-    'modules/analysis/include/felitronics/analysis/WaveformPeaks.h',
-    'modules/analysis/include/felitronics/analysis/StereoColumns.h',
-    'modules/analysis/include/felitronics/analysis/SpectrumFrames.h',
+    // the reference true-peak instrument: what certifies a delivered file, and what the probe prints
     'modules/analysis/include/felitronics/analysis/ReferenceTruePeakMeter.h',
-    // the shared floor those analyzers stand on
+    // the shared floor the offline analyzers stand on
     'modules/core/include/felitronics/core/OfflineFft.h',
     'modules/oversampling/include/felitronics/oversampling/PolyphaseOversampler.h',
     // P31: not diffed by a parity harness today (no tool builds it), but it promises the same filter bits on
-    // every row — its suite pins them by hash on each one — and it sits in fc_master's include closure
-    // through Saturator.h. A system sine in its design would break that promise silently; here it is red.
+    // every row — its suite pins them by hash on each one — and it sits in the mastering ABI's include
+    // closure through Saturator.h. A system sine in its design would break that promise silently; here it is red.
     'modules/oversampling/include/felitronics/oversampling/CascadeOversampler.h',
-    // and the tools that PRINT the diffed text. The long-double lint deliberately skips tools/; for this
-    // lint that would be a hole exactly on the surface being defended — fcore_probe.h computes the dBTP
-    // that `diff native.txt wasm.txt` compares, with its own floor and, until P80, its own std::log10.
-    'tools/fcore_probe.h',
-    'tools/fcore_clips.h',
-    // The wasm entry point itself. It PRINTS the numbers CI diffs (parity.mjs renders its lufs/dbtp as
-    // text and the step runs a plain `diff`), and until P80 it computed one of them with a constant
-    // `20.0 * std::log10 (1e-9)` — a libm call in the last place anyone would look for one.
-    'tools/wasm/fc_probe.cpp',
 ]);
-// A NOTE ON WHAT fc_probe.cpp's MEMBERSHIP RESTS ON, because an earlier comment here got it wrong: what CI
-// byte-diffs from this binary is its STDOUT — the block energies and the true peak as a LINEAR bit pattern.
-// `dbtp` is printed only under --debug and only to stderr. The file is in the zone because the numbers it
-// prints on the diffed path come from here, not because every getter it exposes is diffed.
 
 // IN-ZONE EXCEPTIONS, each of which had to be argued rather than waved through. A line in the zone may
 // call libm only if it carries a `// libm-ok: <reason>` marker AND appears here; a marker without an
 // entry is red, and an entry whose marker has gone is red. Two locks, because one of them is a comment.
 const ZONE_EXCEPTIONS = [
     { file: 'modules/core/include/felitronics/core/OfflineFft.h', fn: 'abs', count: 1,
-      why: '`std::abs(std::complex<double>)` IS std::hypot — measured, identical checksums to an explicit hypot on Apple, glibc and musl, and three DIFFERENT checksums between those rows. There is no det::hypot to move it to, and sqrt(norm(z)) is not a rewrite, it is a different (less accurate, differently-overflowing) function. It is recorded rather than converted because magSpectrum feeds analysis/offline/SpectrumCurve and measurement/CaptureGate, neither of which is in a byte diff: the analyzers that ARE diffed take their magnitudes from SpectrumFrames, which uses re*re+im*im and calls no libm at all.' },
+      why: '`std::abs(std::complex<double>)` IS std::hypot — measured, identical checksums to an explicit hypot on Apple, glibc and musl, and three DIFFERENT checksums between those rows. There is no det::hypot to move it to, and sqrt(norm(z)) is not a rewrite, it is a different (less accurate, differently-overflowing) function. It is recorded rather than converted because magSpectrum feeds analysis/offline/SpectrumCurve and measurement/CaptureGate, neither of which is in a byte diff: the analyzers that ARE diffed (felitronics-mastering-core) take their magnitudes from SpectrumFrames, which uses re*re+im*im and calls no libm at all.' },
 ];
-const INCLUDE_ROOTS = [];   // filled from modules/*/include below
+//==============================================================================
+// TWO REPOSITORIES, ONE GATE. felitronics-core owns this script, the carriers and the deterministic floor;
+// a satellite repository runs the SAME script from its own root with --satellite. Every file is named by the
+// tree it lives in and its path inside that tree, never by a bare relative path: both repositories have a
+// modules/analysis/..., and a list entry that meant one of them must not quietly cover the other.
+//   core pass       core's ./modules and ./tools against the lists above and core's manifest — the whole
+//                   gate, on the core checkout the satellite builds with, so a satellite run cannot be green
+//                   on a core whose own lists have rotted.
+//   satellite pass  the satellite's ./modules and ./tools against its lists and its manifest, with core's
+//                   carriers. Its parity entry points' #include closure walks INTO core's headers; a core file
+//                   reached that way is judged by the core pass, and labelled there as reachable from one.
+// Each pass checks its own lists for rot (a zone entry, an entry point or an exception naming a file or a call
+// that is not there any more), so neither side's allowances can outlive what they allowed.
+const CORE_ROOT = realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+
+// THE ZONE FILE of a satellite: tools/lint/det-math-zone.txt at its root. One entry per line, `#` comments:
+//     entry      <path>                  <why>    a parity entry point: its #include closure is rule 4's net
+//     zone       <path>                  <why>    a file whose numbers are compared byte for byte across rows
+//     exception  <path>  <fn>*<count>    <why>    an in-zone libm call, argued for (the line marker is required too)
+// A repository with no such file has no zone and no entry points: every libm call in it is a manifest line.
+// That is a legitimate state (felitronics-guitar-core), so an ABSENT file is not an error — which is why the
+// repository that does have a zone pins it with a planted-violation control in its own CI.
+const ZONE_FILE = 'tools/lint/det-math-zone.txt';
+
+export function parseZoneFile (text)
+{
+    const lists = { entryPoints: [], zone: [], exceptions: [], errors: [] };
+    const seen = new Set();
+    text.split('\n').forEach ((raw, i) =>
+    {
+        const line = raw.trim();
+        if (! line || line.startsWith('#')) return;
+        const err = (msg) => lists.errors.push({ line: i + 1, msg });
+        let m;
+        if ((m = /^(entry|zone)\s+(\S+)\s+(\S.*)$/.exec(line)))
+        {
+            if (seen.has(m[1] + ' ' + m[2])) return err(`${m[1]} ${m[2]} is listed twice`);
+            seen.add(m[1] + ' ' + m[2]);
+            (m[1] === 'entry' ? lists.entryPoints : lists.zone).push({ path: m[2], why: m[3].trim() });
+        }
+        else if ((m = /^exception\s+(\S+)\s+([A-Za-z0-9_]+)\*([1-9][0-9]*)\s+(\S.*)$/.exec(line)))
+            lists.exceptions.push({ file: m[1], fn: m[2], count: Number(m[3]), why: m[4].trim() });
+        else
+            err(`unparseable line: ${line} — expected "entry <path> <why>", "zone <path> <why>" or "exception <path> <fn>*<count> <why>", and every one of them needs its reason`);
+    });
+    return lists;
+}
 
 //==============================================================================
 function walk (dir, acc) { for (const e of readdirSync(dir)) { const p = join(dir, e); if (statSync(p).isDirectory()) walk(p, acc); else if (/\.(h|hpp|inl|c|cc|cpp|cxx)$/.test(e)) acc.push(p); } return acc; }
 
-function sourceFiles ()
+function relOf (root, p) { return relative(root, p).split(sep).join('/'); }
+
+function sourceFiles (root)
 {
     const files = [];
-    for (const m of readdirSync('modules'))
+    const modules = join(root, 'modules');
+    for (const m of (existsSync(modules) ? readdirSync(modules) : []))
         for (const sub of ['include', 'src'])
-        { const p = join('modules', m, sub); try { if (statSync(p).isDirectory()) walk(p, files); } catch { /* module has no such dir */ } }
+        { const p = join(modules, m, sub); try { if (statSync(p).isDirectory()) walk(p, files); } catch { /* module has no such dir */ } }
     // tools/ IS scanned, deliberately and unlike the long-double lint. The parity SURFACE lives there:
-    // tools/fcore_probe.h computes the dBTP that CI diffs, with its own floor and its own log10. A
-    // modules-only audit would have declared that path clean while the printed number was unpinned.
-    for (const p of ['tools']) { try { if (statSync(p).isDirectory()) walk(p, files); } catch {} }
-    return files.filter (f => ! /\/(tests|bench)\//.test (f)).sort();
+    // felitronics-mastering-core's tools/fcore_probe.h computes the dBTP that CI diffs, with its own floor
+    // and, once, its own log10. A modules-only audit would have declared that path clean while the printed
+    // number was unpinned.
+    for (const p of [join(root, 'tools')]) { try { if (statSync(p).isDirectory()) walk(p, files); } catch {} }
+    return files.map (f => relOf(root, f)).filter (f => ! /\/(tests|bench)\//.test (f)).sort();
 }
 
-function resolveInclude (inc)
+function includeRootsOf (root)
 {
-    for (const r of INCLUDE_ROOTS) { const p = join(r, inc); if (existsSync(p)) return p; }
-    return null;
+    const roots = [];
+    const modules = join(root, 'modules');
+    for (const m of (existsSync(modules) ? readdirSync(modules) : []))
+    { const p = join(modules, m, 'include'); try { if (statSync(p).isDirectory()) roots.push(p); } catch {} }
+    return roots;
 }
 
-// The zone: everything reachable by #include from the entry points. Returns a Set of repo-relative paths.
-function computeZone ()
+// Rule 4's net: everything the parity entry points can #include, across every tree on the include path (the
+// running repository's first, then core's). Returns Map<tree, Set<path in that tree>>. An include of
+// felitronics/... that resolves in NO tree, or in TWO, is a violation rather than a silent gap: a header
+// this lint cannot find is one it cannot audit, and one that two repositories both provide is one where it
+// may be auditing a different file from the one the compiler takes.
+function computeClosure (trees, violations, display)
 {
-    for (const m of readdirSync('modules'))
-    { const p = join('modules', m, 'include'); try { if (statSync(p).isDirectory()) INCLUDE_ROOTS.push(p); } catch {} }
-    const zone = new Set(), queue = [];
-    for (const e of ENTRY_POINTS) if (existsSync(e)) { zone.add(e); queue.push(e); }
+    const reached = new Map(trees.map (t => [t, new Set()]));
+    const queue = [];
+    const add = (t, rel) => { if (! reached.get(t).has(rel)) { reached.get(t).add(rel); queue.push([t, rel]); } };
+    for (const t of trees) for (const e of t.entryPoints) if (existsSync(join(t.root, e))) add(t, e);
     while (queue.length)
     {
-        const f = queue.shift();
-        let text; try { text = readFileSync(f, 'utf8'); } catch { continue; }
+        const [t, rel] = queue.shift();
+        const abs = join(t.root, rel);
+        let text; try { text = readFileSync(abs, 'utf8'); } catch { continue; }
         // Comments only. stripNonCode() also blanks STRING literals, and `#include "fcore_probe.h"` IS a
         // string literal — so every quoted include vanished before this regex saw it, and the closure
         // silently lost the tools' own headers, which is where the parity surface lives.
@@ -284,19 +324,32 @@ function computeZone ()
         for (const m of code.matchAll(/#[ \t]*include[ \t]*[<"]([^">]+)[">]/g))
         {
             const inc = m[1];
-            let p = null;
-            if (inc.startsWith('felitronics/')) p = resolveInclude(inc);
+            if (inc.startsWith('felitronics/'))
+            {
+                const hits = [];
+                for (const tt of trees)
+                    for (const r of tt.includeRoots)
+                    { const p = join(r, inc); if (existsSync(p)) { hits.push([tt, relOf(tt.root, p)]); break; } }
+                const line = lineAt(code, m.index);
+                if (hits.length === 0)
+                    violations.push({ f: display(t, rel), line, rule: 'CLOSURE',
+                                      msg: `#include <${inc}> resolves in no include root this lint knows. A header it cannot find is a header it cannot audit.` });
+                else if (hits.length > 1)
+                    violations.push({ f: display(t, rel), line, rule: 'CLOSURE',
+                                      msg: `#include <${inc}> resolves in two repositories: ${hits.map (([tt, r]) => display(tt, r)).join(' and ')}. One header, one owner — otherwise this lint may audit a different file from the one the compiler takes.` });
+                if (hits.length) add(hits[0][0], hits[0][1]);
+            }
             else
             {
-                const sib = join(dirname(f), inc);
-                // beside the file, then on the tools include path: tools/wasm/fc_probe.cpp includes
-                // "fcore_probe.h", which lives in tools/ and arrives through -I, not as a sibling.
-                p = existsSync(sib) ? sib : (existsSync(join('tools', inc)) ? join('tools', inc) : null);
+                // beside the file, then on the tools include path of its own tree: tools/wasm/fc_probe.cpp
+                // includes "fcore_probe.h", which lives in tools/ and arrives through -I, not as a sibling.
+                const sib = join(dirname(abs), inc), viaTools = join(t.root, 'tools', inc);
+                const p = existsSync(sib) ? sib : (existsSync(viaTools) ? viaTools : null);
+                if (p) add(t, relOf(t.root, p));
             }
-            if (p && ! zone.has(p)) { zone.add(p); queue.push(p); }
         }
     }
-    return zone;
+    return reached;
 }
 
 //==============================================================================
@@ -392,14 +445,16 @@ export function scanCarriers (text, names)
 // Each line pins the exact MULTISET of functions that file calls, so a call added, removed, or swapped
 // for another moves the line and forces a review; whitespace and line moves do not.
 //     <path>  <fn*count fn*count ...>  <disposition>  <reason>
+// Each repository has its own, at this path under its root.
 const MANIFEST_PATH = 'tools/lint/det-math-manifest.txt';
 const DISPOSITIONS = new Set(['retain-rt', 'retain-local', 'retain-offline', 'owner-decision', 'UNCLASSIFIED']);
 
-function parseManifest ()
+function parseManifest (root)
 {
-    if (! existsSync(MANIFEST_PATH)) return { entries: new Map(), missing: true };
+    const path = join(root, MANIFEST_PATH);
+    if (! existsSync(path)) return { entries: new Map(), missing: true };
     const entries = new Map();
-    for (const raw of readFileSync(MANIFEST_PATH, 'utf8').split('\n'))
+    for (const raw of readFileSync(path, 'utf8').split('\n'))
     {
         const line = raw.trim();
         if (! line || line.startsWith('#')) continue;
@@ -489,9 +544,179 @@ function selfTest ()
         const got = /\/\/[^\n]*libm-ok:/.test(stripStringsKeepComments(src));
         if (got !== want) { console.error(`  SELF-TEST FAIL (marker): wanted ${want}, got ${got} for: ${JSON.stringify(src)}`); bad++; }
     }
-    const total = cases.length + carrierCases.length + markerCases.length;
+    // The ZONE FILE parser: a satellite's lists. A line it cannot read is an error, never an empty list —
+    // a misspelt keyword that parsed as "nothing" would be a zone that covers nothing and reads as coverage.
+    const zoneCases = [
+        ['zone modules/a/include/x.h the analyzer whose report is diffed',            { zone: 1, errors: 0 }],
+        ['entry tools/wasm/fc_probe.cpp the wasm probe',                              { entryPoints: 1, errors: 0 }],
+        ['exception modules/a/include/x.h abs*1 std::abs of a complex is hypot',      { exceptions: 1, errors: 0 }],
+        ['# a comment\n\n   ',                                                         { errors: 0 }],
+        ['zones modules/a/include/x.h misspelt keyword',                              { zone: 0, errors: 1 }],
+        ['zone modules/a/include/x.h',                                                { zone: 0, errors: 1 }],   // no reason
+        ['exception modules/a/include/x.h abs the count is missing',                  { exceptions: 0, errors: 1 }],
+        ['zone a.h why\nzone a.h why again',                                          { zone: 1, errors: 1 }],   // listed twice
+    ];
+    for (const [src, want] of zoneCases)
+    {
+        const got = parseZoneFile(src);
+        for (const [k, n] of Object.entries(want))
+            if (got[k].length !== n) { console.error(`  SELF-TEST FAIL (zone file): wanted ${n} ${k}, got ${got[k].length} for: ${JSON.stringify(src)}`); bad++; }
+    }
+    const total = cases.length + carrierCases.length + markerCases.length + zoneCases.length;
     if (bad) { console.error(`det-math lint self-test: ${bad} of ${total} cases wrong`); process.exit(1); }
     console.log(`det-math lint self-test: ${total}/${total} cases correct`);
+}
+
+//==============================================================================
+// ONE PASS over one tree: rules 1-3 against that tree's own lists and manifest, plus the rot checks of those
+// lists. `closure` is the set of this tree's files reached from any parity entry point (rule 4's net), and
+// `carriers` the carrier NAMES to look for — core's, wherever the tree is.
+function lintTree (t, closure, carriers, entryPointsShown, display, violations)
+{
+    const V = (f, line, rule, msg) => violations.push({ f: display(t, f), line, rule, msg });
+    // EVERY FILE THE PARITY CLOSURE REACHES IS SCANNED, whatever it is called. The directory walk takes only
+    // the usual source extensions, and a `#include "tables.inc"` from a zone file was read by the closure and
+    // audited by nobody: a system call planted in it passed on both sides while the same call one level up
+    // failed. The closure is the net, so what it catches is inventoried.
+    const files = [...new Set(sourceFiles(t.root).concat([...closure].filter (f => ! /\/(tests|bench)\//.test (f))))].sort();
+    const scanned = new Set(files);
+    const carrierNames = carriers.map(c => c.name);
+    const inventory = [];
+    const perFile = new Map();
+    const exceptionUses = new Map();
+
+    // THE LISTS MUST NAME FILES THAT ARE THERE. A zone entry for a file that moved covers nothing, and the
+    // count printed at the end kept reading as if it did — the move of the mastering modules out of this
+    // repository is exactly the change that would have left twelve such entries behind, green.
+    for (const f of t.zone)
+        if (! scanned.has(f))
+            V(f, 0, 'ZONE-ROT', `the deterministic zone names a file this lint does not scan (moved, renamed, or under tests/). A zone entry that covers nothing reads as coverage — fix the path or remove the entry.`);
+    for (const f of t.entryPoints)
+        if (! existsSync(join(t.root, f)))
+            V(f, 0, 'ZONE-ROT', `a parity entry point that does not exist: its #include closure is empty, and rule 4 with it.`);
+    for (const f of t.implementation)
+        if (! scanned.has(f))
+            V(f, 0, 'ZONE-ROT', `IMPLEMENTATION names a file this lint does not scan — the exemption now covers nothing.`);
+
+    for (const f of files)
+    {
+        const text = readFileSync(join(t.root, f), 'utf8');
+        const markerLines = stripStringsKeepComments(text).split('\n');   // comments kept, strings blanked
+        const hits = scanText(text);
+        const carrierHits = t.implementation.has(f) ? [] : scanCarriers(text, carrierNames);
+        // CARRIER CALLS COUNT TOWARDS THE MANIFEST TOO, and this is not tidiness. Without it the rule only
+        // looked inside the zone, and a file outside it could be reverted from `gainToDbDet` to `gainToDb`
+        // with the gate still green — measured on LoudnessSolver::peakDb, which is the one place the
+        // certificate and the report must agree bit for bit, i.e. exactly the regression this lint was
+        // written after. They are spelled `name()` so they cannot collide with a scalar of the same name.
+        const all = hits.concat (carrierHits.map (h => ({ ...h, fn: h.fn + '()', ns: '', kind: 'carrier' })));
+        if (all.length) perFile.set(f, all);
+        for (const h of all) inventory.push({ f, ...h });
+
+        if (t.implementation.has(f)) continue;               // det:: itself and the dB definitions
+
+        if (t.zone.has(f))
+        {
+            for (const h of hits)
+            {
+                // The marker must be ON the calling line, and the exception must be recorded. Either alone
+                // is not enough: a comment anyone can type is not an approval, and an approval nobody can see
+                // at the call site is not a warning.
+                const marked = /\/\/[^\n]*libm-ok:/.test(markerLines[h.line - 1] || '');
+                const listed = t.exceptions.find(e => e.file === f && e.fn === h.fn);
+                if (marked && listed) { exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
+                if (marked && ! listed)
+                { V(f, h.line, 'ZONE', `${h.ns}${h.fn}() carries a "libm-ok" marker but there is no entry for it in ZONE_EXCEPTIONS. A marker is a note to a reader; the entry is where the argument has to be written down.`); continue; }
+                V(f, h.line, 'ZONE', `${h.ns}${h.fn}() in the deterministic zone (scope ${h.scope}). This file's numbers are compared BYTE FOR BYTE between the native CLI and the wasm module, and ${h.fn} is not the same function on those rows. Use core::det::${h.fn} — but check its DOMAIN first, which is not the same as std's: det::tan returns NaN at |x| >= 2^24 and det::pow returns NaN at x <= 0, and only det::cos/det::sin are pinned against the mpmath oracle (the other six are checked by identities), so a new use needs its own argument-range argument. If it genuinely must stay system, mark the line "// libm-ok: <why>" and add an entry to ZONE_EXCEPTIONS.`);
+            }
+            for (const h of carrierHits)
+            {
+                const c = carriers.find(x => x.name === h.fn);
+                const marked = /\/\/[^\n]*libm-ok:/.test(markerLines[h.line - 1] || '');
+                const listed = t.exceptions.find(e => e.file === f && e.fn === h.fn);
+                if (marked && listed) { exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
+                V(f, h.line, 'CARRIER', `${h.fn}() in the deterministic zone (scope ${h.scope}) — ${c.why}. It reads as ordinary arithmetic and is a libm call: that is the whole reason this rule exists, because the analyzers here contain no direct std:: call at all and were exposed entirely through functions that look like this one.`);
+            }
+        }
+    }
+
+    // AND THE EXCEPTIONS MUST NOT ROT EITHER. One that no longer matches anything is an argument left
+    // standing for a call that is gone — exactly the stale allowance this lint exists to prevent elsewhere.
+    for (const e of t.exceptions)
+    {
+        const used = exceptionUses.get(e.file + '::' + e.fn) || 0;
+        if (used === 0)
+            V(e.file, 0, 'ZONE-EXCEPTION-ROT', `ZONE_EXCEPTIONS allows ${e.fn}() here, but no marked call to it was found. Either the call went away (remove the entry) or its "// libm-ok:" marker did (put it back) — an unused allowance is how a list stops meaning anything.`);
+        else if (used !== e.count)
+            V(e.file, 0, 'ZONE-EXCEPTION-ROT', `ZONE_EXCEPTIONS allows ${e.count} marked ${e.fn}() call(s) here and found ${used}. The written argument is about specific calls; another one needs its own, not a share of this one.`);
+    }
+
+    // Rule 4 — THE CARRIER LIST MUST NOT ROT. A carrier that no longer reaches libm would forbid something
+    // harmless forever; one deleted from this list while still reaching libm would let the real thing through.
+    // So each declared carrier is checked against the file that defines it — by the tree that defines it.
+    for (const c of t.carriers)
+    {
+        const path = join(t.root, c.defined);
+        if (! existsSync(path))
+        { V(c.defined, 0, 'CARRIER-ROT', `carrier ${c.name} names a file that does not exist`); continue; }
+        const body = stripNonCode(readFileSync(path, 'utf8'));
+        const lines = body.split('\n');
+        const defLine = lines.findIndex(l => new RegExp(`\\b${c.name}\\b\\s*\\(`).test(l) && DEFN_RE.test(l.slice(0, l.indexOf(c.name))));
+        if (defLine < 0)
+            V(c.defined, 0, 'CARRIER-ROT', `carrier ${c.name} is declared in this lint but no definition of it was found in ${c.defined}. Either it moved (update CARRIERS) or it is gone (remove it) — a carrier list nobody checks is a list that stops being true.`);
+        else
+        {
+            // AND THE BODY MUST STILL REACH libm. Checking only that a definition EXISTS leaves the other
+            // half of the rot: a carrier that was converted to det:: would go on forbidding something
+            // harmless in the zone forever, and the comment above claimed this was checked when it was not.
+            // The window is the definition line plus the few that can hold a one-expression body.
+            const window = lines.slice(defLine, defLine + 6).join('\n');
+            if (scanText(window).length === 0)
+                V(c.defined, defLine + 1, 'CARRIER-ROT', `carrier ${c.name} no longer calls a system transcendental in its first lines. If it was converted, it is not a carrier any more — remove it from CARRIERS, or the zone keeps refusing a call that is now safe.`);
+        }
+    }
+
+    // Rule 3 — the manifest, for everything outside the zone.
+    const { entries, missing } = parseManifest(t.root);
+    if (missing)
+        V(MANIFEST_PATH, 0, 'MANIFEST', 'the manifest does not exist; run with --propose to generate a starting point (every line UNCLASSIFIED until a human writes a reason)');
+    else
+    {
+        for (const [k, v] of entries)
+            if (v === null) V(MANIFEST_PATH, 0, 'MANIFEST', `unparseable line: ${k.replace('__PARSE_ERROR__', '')}`);
+
+        for (const [f, hits] of perFile)
+        {
+            if (t.zone.has(f) || t.implementation.has(f)) continue;
+            const want = multisetOf(hits);
+            const e = entries.get(f);
+            if (! e)
+            { V(f, hits[0].line, closure.has(f) ? 'CLOSURE' : 'MANIFEST',
+                `calls libm [${want}] and has no manifest entry.`
+                + (closure.has(f) ? ` THIS FILE IS REACHABLE BY #include FROM A PARITY ENTRY POINT (${entryPointsShown.join(', ')}), so it is compiled into the binaries whose outputs CI diffs — read it before classifying it.`
+                                  : ` It is not reachable from any parity entry point, so this is bookkeeping rather than a hazard — but it is still a decision somebody made.`)
+                + ` Add a line to ${display(t, MANIFEST_PATH)} (--propose prints a starting one, marked UNCLASSIFIED so it cannot pass by accident).`); continue; }
+            // `--propose` emits a placeholder reason. Changing only the DISPOSITION in front of it and leaving
+            // the placeholder made the gate green with nobody having written anything — measured.
+            if (/^<.*>$/.test(e.reason) || e.reason.includes('why they stay system'))
+                V(f, hits[0].line, 'MANIFEST', `the manifest entry still carries --propose's placeholder reason. The disposition is not the classification; the sentence after it is.`);
+            if (e.disposition === 'UNCLASSIFIED')
+                V(f, hits[0].line, 'MANIFEST', `manifest entry is still UNCLASSIFIED — someone has to say what these calls are and why they stay`);
+            else if (! DISPOSITIONS.has(e.disposition))
+                V(f, 0, 'MANIFEST', `unknown disposition "${e.disposition}" (expected one of ${[...DISPOSITIONS].join(', ')})`);
+            if (e.multiset !== want)
+                V(f, hits[0].line, 'MANIFEST', `the calls in this file CHANGED.\n      manifest: [${e.multiset}]\n      actual:   [${want}]\n      A libm call was added, removed or swapped for another. Re-read the file, then update the line — this is the review, not an obstacle to it.`);
+        }
+        for (const [f, e] of entries)
+        {
+            if (f.startsWith('__PARSE_ERROR__')) continue;
+            if (! perFile.has(f) || t.zone.has(f))
+                V(f, 0, 'MANIFEST', ! existsSync(join(t.root, f)) ? 'manifest names a file that no longer exists — remove the line'
+                                  : t.zone.has(f)                   ? 'this file is now inside the deterministic zone, where the ban applies and a manifest entry means nothing — remove the line and convert the calls'
+                                                                    : 'manifest entry for a file with no libm calls left — remove the line (a stale allowance is how a list stops meaning anything)');
+        }
+    }
+    return { t, inventory, perFile, entries: entries || new Map() };
 }
 
 //==============================================================================
@@ -500,171 +725,78 @@ if (! RUN_AS_PROGRAM) { /* imported for its matcher; the gate below is not ours 
 else {
 if (args.includes('--self-test')) { selfTest(); process.exit(0); }
 
-const closure = computeZone();          // rule 4's net — NOT the ban set; see the note at the top
-const zone = ZONE;
-const files = sourceFiles();
-const carrierNames = CARRIERS.map(c => c.name);
+// WHERE THIS RUNS, stated rather than assumed. Without --satellite the tree is core itself, so the working
+// directory must BE this script's checkout; with it, the working directory is another repository and core is
+// the checkout this script came from. Either mix-up used to lint the wrong tree against the wrong lists.
+const SATELLITE = args.includes('--satellite');
+const CWD = realpathSync(process.cwd());
+if (! existsSync(join(CORE_ROOT, 'modules/core/include/felitronics/core/DetMath.h')))
+{ console.error(`check-det-math: ${CORE_ROOT} does not look like a felitronics-core checkout (no core/DetMath.h) — this script must be run from inside one`); process.exit(2); }
+if (SATELLITE && CWD === CORE_ROOT)
+{ console.error(`check-det-math: --satellite is for ANOTHER repository's root; this is felitronics-core's own (${CORE_ROOT}). Run it without --satellite.`); process.exit(2); }
+if (! SATELLITE && CWD !== CORE_ROOT)
+{ console.error(`check-det-math: run from felitronics-core's root (${CORE_ROOT}), or pass --satellite to lint the repository in ${CWD} against this core.`); process.exit(2); }
+
 const violations = [];
-const inventory = [];
-const perFile = new Map();
-const usedExceptions = new Set();
-const exceptionUses = new Map();
-
-for (const f of files)
+const core = { name: 'felitronics-core', root: CORE_ROOT, zone: ZONE, entryPoints: ENTRY_POINTS, exceptions: ZONE_EXCEPTIONS,
+               carriers: CARRIERS, implementation: IMPLEMENTATION, includeRoots: includeRootsOf(CORE_ROOT) };
+let local = core;
+if (SATELLITE)
 {
-    const text = readFileSync(f, 'utf8');
-    const markerLines = stripStringsKeepComments(text).split('\n');   // comments kept, strings blanked
-    const hits = scanText(text);
-    const carrierHits = IMPLEMENTATION.has(f) ? [] : scanCarriers(text, carrierNames);
-    // CARRIER CALLS COUNT TOWARDS THE MANIFEST TOO, and this is not tidiness. Without it the rule only
-    // looked inside the zone, and a file outside it could be reverted from `gainToDbDet` to `gainToDb`
-    // with the gate still green — measured on LoudnessSolver::peakDb, which is the one place the
-    // certificate and the report must agree bit for bit, i.e. exactly the regression this lint was
-    // written after. They are spelled `name()` so they cannot collide with a scalar of the same name.
-    const all = hits.concat (carrierHits.map (h => ({ ...h, fn: h.fn + '()', ns: '', kind: 'carrier' })));
-    if (all.length) perFile.set(f, all);
-    for (const h of all) inventory.push({ f, ...h });
-
-    if (IMPLEMENTATION.has(f)) continue;                 // det:: itself and the dB definitions
-
-    if (zone.has(f))
-    {
-        for (const h of hits)
-        {
-            // The marker must be ON the calling line, and the exception must be recorded. Either alone
-            // is not enough: a comment anyone can type is not an approval, and an approval nobody can see
-            // at the call site is not a warning.
-            const marked = /\/\/[^\n]*libm-ok:/.test(markerLines[h.line - 1] || '');
-            const listed = ZONE_EXCEPTIONS.find(e => e.file === f && e.fn === h.fn);
-            if (marked && listed) { usedExceptions.add(f + '::' + h.fn); exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
-            if (marked && ! listed)
-            { violations.push({ f, line: h.line, rule: 'ZONE',
-                                msg: `${h.ns}${h.fn}() carries a "libm-ok" marker but there is no entry for it in ZONE_EXCEPTIONS. A marker is a note to a reader; the entry is where the argument has to be written down.` }); continue; }
-            violations.push({ f, line: h.line, rule: 'ZONE',
-                              msg: `${h.ns}${h.fn}() in the deterministic zone (scope ${h.scope}). This file's numbers are compared BYTE FOR BYTE between the native CLI and the wasm module, and ${h.fn} is not the same function on those rows. Use core::det::${h.fn} — but check its DOMAIN first, which is not the same as std's: det::tan returns NaN at |x| >= 2^24 and det::pow returns NaN at x <= 0, and only det::cos/det::sin are pinned against the mpmath oracle (the other six are checked by identities), so a new use needs its own argument-range argument. If it genuinely must stay system, mark the line "// libm-ok: <why>" and add an entry to ZONE_EXCEPTIONS.` });
-        }
-        for (const h of carrierHits)
-        {
-            const c = CARRIERS.find(x => x.name === h.fn);
-            const marked = /\/\/[^\n]*libm-ok:/.test(markerLines[h.line - 1] || '');
-            const listed = ZONE_EXCEPTIONS.find(e => e.file === f && e.fn === h.fn);
-            if (marked && listed) { usedExceptions.add(f + '::' + h.fn); exceptionUses.set(f + '::' + h.fn, (exceptionUses.get(f + '::' + h.fn) || 0) + 1); continue; }
-            violations.push({ f, line: h.line, rule: 'CARRIER',
-                              msg: `${h.fn}() in the deterministic zone (scope ${h.scope}) — ${c.why}. It reads as ordinary arithmetic and is a libm call: that is the whole reason this rule exists, because the analyzers here contain no direct std:: call at all and were exposed entirely through functions that look like this one.` });
-        }
-    }
+    const zonePath = join(CWD, ZONE_FILE);
+    const lists = existsSync(zonePath) ? parseZoneFile(readFileSync(zonePath, 'utf8')) : { entryPoints: [], zone: [], exceptions: [], errors: [] };
+    for (const e of lists.errors) violations.push({ f: ZONE_FILE, line: e.line, rule: 'LISTS', msg: e.msg });
+    local = { name: 'this repository', root: CWD, zone: new Set(lists.zone.map(z => z.path)), entryPoints: lists.entryPoints.map(e => e.path),
+              exceptions: lists.exceptions, carriers: [], implementation: new Set(), includeRoots: includeRootsOf(CWD),
+              zoneFile: existsSync(zonePath) };
 }
+const trees = SATELLITE ? [local, core] : [core];
+const display = (t, rel) => t.root === CWD ? rel : relOf(CWD, join(t.root, rel));
+const entryPointsShown = trees.flatMap (t => t.entryPoints.map (e => display(t, e)));
 
-// AND THE EXCEPTIONS MUST NOT ROT EITHER. One that no longer matches anything is an argument left
-// standing for a call that is gone — exactly the stale allowance this lint exists to prevent elsewhere.
-for (const e of (args.includes('--satellite') ? [] : ZONE_EXCEPTIONS))
-{
-    const used = exceptionUses.get(e.file + '::' + e.fn) || 0;
-    if (used === 0)
-        violations.push({ f: e.file, line: 0, rule: 'ZONE-EXCEPTION-ROT',
-                          msg: `ZONE_EXCEPTIONS allows ${e.fn}() here, but no marked call to it was found. Either the call went away (remove the entry) or its "// libm-ok:" marker did (put it back) — an unused allowance is how a list stops meaning anything.` });
-    else if (used !== e.count)
-        violations.push({ f: e.file, line: 0, rule: 'ZONE-EXCEPTION-ROT',
-                          msg: `ZONE_EXCEPTIONS allows ${e.count} marked ${e.fn}() call(s) here and found ${used}. The written argument is about specific calls; another one needs its own, not a share of this one.` });
-}
-
-// Rule 4 — THE CARRIER LIST MUST NOT ROT. A carrier that no longer reaches libm would forbid something
-// harmless forever; one deleted from this list while still reaching libm would let the real thing through.
-// So each declared carrier is checked against the file that defines it.
-for (const c of (args.includes('--satellite') ? [] : CARRIERS))
-{
-    if (! existsSync(c.defined))
-    { violations.push({ f: c.defined, line: 0, rule: 'CARRIER-ROT', msg: `carrier ${c.name} names a file that does not exist` }); continue; }
-    const body = stripNonCode(readFileSync(c.defined, 'utf8'));
-    const lines = body.split('\n');
-    const defLine = lines.findIndex(l => new RegExp(`\\b${c.name}\\b\\s*\\(`).test(l) && DEFN_RE.test(l.slice(0, l.indexOf(c.name))));
-    if (defLine < 0)
-        violations.push({ f: c.defined, line: 0, rule: 'CARRIER-ROT',
-                          msg: `carrier ${c.name} is declared in this lint but no definition of it was found in ${c.defined}. Either it moved (update CARRIERS) or it is gone (remove it) — a carrier list nobody checks is a list that stops being true.` });
-    else
-    {
-        // AND THE BODY MUST STILL REACH libm. Checking only that a definition EXISTS leaves the other
-        // half of the rot: a carrier that was converted to det:: would go on forbidding something
-        // harmless in the zone forever, and the comment above claimed this was checked when it was not.
-        // The window is the definition line plus the few that can hold a one-expression body.
-        const window = lines.slice(defLine, defLine + 6).join('\n');
-        if (scanText(window).length === 0)
-            violations.push({ f: c.defined, line: defLine + 1, rule: 'CARRIER-ROT',
-                              msg: `carrier ${c.name} no longer calls a system transcendental in its first lines. If it was converted, it is not a carrier any more — remove it from CARRIERS, or the zone keeps refusing a call that is now safe.` });
-    }
-}
-
-// Rule 3 — the manifest, for everything outside the zone.
-const { entries, missing } = parseManifest();
-if (missing)
-    violations.push({ f: MANIFEST_PATH, line: 0, rule: 'MANIFEST', msg: 'the manifest does not exist; run with --propose to generate a starting point (every line UNCLASSIFIED until a human writes a reason)' });
-else
-{
-    for (const [k, v] of entries)
-        if (v === null) violations.push({ f: MANIFEST_PATH, line: 0, rule: 'MANIFEST', msg: `unparseable line: ${k.replace('__PARSE_ERROR__', '')}` });
-
-    for (const [f, hits] of perFile)
-    {
-        if (zone.has(f) || IMPLEMENTATION.has(f)) continue;
-        const want = multisetOf(hits);
-        const e = entries.get(f);
-        if (! e)
-        { violations.push({ f, line: hits[0].line, rule: closure.has(f) ? 'CLOSURE' : 'MANIFEST',
-                            msg: `calls libm [${want}] and has no manifest entry.`
-                                 + (closure.has(f) ? ` THIS FILE IS REACHABLE BY #include FROM A PARITY ENTRY POINT (${ENTRY_POINTS.join(', ')}), so it is compiled into the binaries whose outputs CI diffs — read it before classifying it.`
-                                                   : ` It is not reachable from any parity entry point, so this is bookkeeping rather than a hazard — but it is still a decision somebody made.`)
-                                 + ` Add a line to ${MANIFEST_PATH} (--propose prints a starting one, marked UNCLASSIFIED so it cannot pass by accident).` }); continue; }
-        // `--propose` emits a placeholder reason. Changing only the DISPOSITION in front of it and leaving
-        // the placeholder made the gate green with nobody having written anything — measured.
-        if (/^<.*>$/.test(e.reason) || e.reason.includes('why they stay system'))
-            violations.push({ f, line: hits[0].line, rule: 'MANIFEST',
-                              msg: `the manifest entry still carries --propose's placeholder reason. The disposition is not the classification; the sentence after it is.` });
-        if (e.disposition === 'UNCLASSIFIED')
-            violations.push({ f, line: hits[0].line, rule: 'MANIFEST', msg: `manifest entry is still UNCLASSIFIED — someone has to say what these calls are and why they stay` });
-        else if (! DISPOSITIONS.has(e.disposition))
-            violations.push({ f, line: 0, rule: 'MANIFEST', msg: `unknown disposition "${e.disposition}" (expected one of ${[...DISPOSITIONS].join(', ')})` });
-        if (e.multiset !== want)
-            violations.push({ f, line: hits[0].line, rule: 'MANIFEST',
-                              msg: `the calls in this file CHANGED.\n      manifest: [${e.multiset}]\n      actual:   [${want}]\n      A libm call was added, removed or swapped for another. Re-read the file, then update the line — this is the review, not an obstacle to it.` });
-    }
-    for (const [f, e] of entries)
-    {
-        if (f.startsWith('__PARSE_ERROR__')) continue;
-        if (! perFile.has(f) || zone.has(f))
-            violations.push({ f, line: 0, rule: 'MANIFEST',
-                              msg: ! existsSync(f) ? 'manifest names a file that no longer exists — remove the line'
-                                 : zone.has(f)     ? 'this file is now inside the deterministic zone, where the ban applies and a manifest entry means nothing — remove the line and convert the calls'
-                                                   : 'manifest entry for a file with no libm calls left — remove the line (a stale allowance is how a list stops meaning anything)' });
-    }
-}
+const reached = computeClosure(trees, violations, display);          // rule 4's net — NOT the ban set; see the note at the top
+const results = trees.slice().reverse().map (t =>                     // core's pass first, then the satellite's
+    lintTree(t, reached.get(t), CARRIERS, entryPointsShown, display, violations));
 
 //==============================================================================
 if (args.includes('--report'))
 {
-    console.log(`# det-math inventory — ${inventory.length} governed calls in ${perFile.size} files`);
-    console.log(`# deterministic zone: ${zone.size} files (a written list — see ZONE; the #include closure of`);
-    console.log(`#   ${ENTRY_POINTS.join(', ')} is the DISCOVERY net, not the zone)`);
-    for (const h of inventory) console.log(`${h.f}:${h.line}\t${h.ns}${h.fn}\t${h.scope}\t${zone.has(h.f) ? 'ZONE' : 'outside'}`);
+    for (const { t, inventory, perFile } of results)
+    {
+        console.log(`# det-math inventory${SATELLITE ? ' [' + t.name + ']' : ''} — ${inventory.length} governed calls in ${perFile.size} files`);
+        console.log(`# deterministic zone: ${t.zone.size} files (a written list — see ZONE; the #include closure of`);
+        console.log(`#   ${entryPointsShown.join(', ') || '(no parity entry points)'} is the DISCOVERY net, not the zone)`);
+        for (const h of inventory) console.log(`${display(t, h.f)}:${h.line}\t${h.ns}${h.fn}\t${h.scope}\t${t.zone.has(h.f) ? 'ZONE' : 'outside'}`);
+    }
     process.exit(0);
 }
 if (args.includes('--propose'))
 {
+    const { t, perFile, entries } = results[results.length - 1];      // the running repository's own tree
     console.log(`# proposed lines for files with no manifest entry — EVERY ONE IS UNCLASSIFIED ON PURPOSE.`);
     console.log(`# The lint stays red until a human replaces UNCLASSIFIED with a disposition and a real reason.`);
     for (const [f, hits] of perFile)
     {
-        if (zone.has(f) || IMPLEMENTATION.has(f) || entries.has(f)) continue;
+        if (t.zone.has(f) || t.implementation.has(f) || entries.has(f)) continue;
         console.log(`${f}  [${multisetOf(hits)}]  UNCLASSIFIED  <what these are, and why they stay system>`);
     }
     process.exit(0);
 }
 
+const summary = ({ t, inventory, perFile }) =>
+    `${inventory.length} governed libm calls in ${perFile.size} files; ${t.zone.size}-file deterministic zone`;
 if (violations.length)
 {
     for (const v of violations)
         console.error(`${v.f}${v.line ? ':' + v.line : ''}: [${v.rule}] ${v.msg}`);
-    console.error(`\n^^ ${violations.length} violation(s). ${inventory.length} governed calls in ${perFile.size} files; deterministic zone is ${zone.size} files.`);
+    console.error(`\n^^ ${violations.length} violation(s). ` + results.map (r => (SATELLITE ? `[${r.t.name}] ` : '')
+        + `${r.inventory.length} governed calls in ${r.perFile.size} files; deterministic zone is ${r.t.zone.size} files.`).join(' '));
     process.exit(1);
 }
-console.log(`det-math: ${inventory.length} governed libm calls in ${perFile.size} files; ${zone.size}-file deterministic zone is clean (direct + carriers); manifest matches.`);
+if (! SATELLITE)
+    console.log(`det-math: ${summary(results[0])} is clean (direct + carriers); manifest matches.`);
+else
+    for (const r of results)
+        console.log(`det-math [${r.t.name}${r.t === core ? ' at ' + (relOf(CWD, CORE_ROOT) || '.') : ''}]: ${summary(r)} is clean (direct + carriers); manifest matches.`
+                    + (r.t === local ? ` Lists: ${local.zoneFile ? ZONE_FILE : 'none (no ' + ZONE_FILE + ')'}; ${local.entryPoints.length} parity entry point(s), closure ${[...reached.values()].reduce((n, s) => n + s.size, 0)} files, ${reached.get(core).size} of them in felitronics-core.` : ''));
 }

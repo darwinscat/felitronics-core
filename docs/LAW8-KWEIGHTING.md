@@ -51,7 +51,7 @@ both reasons were found by the review consilium rather than by writing it.
 **1. It would break chunk invariance.** The end of `process()` is wherever the *caller* chose to cut the
 stream. Putting a numerical event there makes the answer depend on the host's block size — and this repo
 explicitly claims and tests the opposite, bit-exact across call sizes 1 … 100 003
-(`tools/tests/ProbeTests.cpp`). The 10 ms sub-hop is a deterministic amount of *audio*, so the cadence is
+(`tools/tests/ProbeTests.cpp`, felitronics-mastering-core's now). The 10 ms sub-hop is a deterministic amount of *audio*, so the cadence is
 identical however the caller chunks.
 
 **2. The binding constant is 90 ms, not 2.85 s — and it is the shelf, not the RLB.** From the 1e-15 flush
@@ -115,7 +115,8 @@ without it.
   **CLOSED FOR THE ENTRIES P51 FLOORED.** `core::kMinSampleRate` = 8000 Hz is the floor
   of `fcore::Probe`, of every analyzer behind the probe ABI (`ProgrammeReport`, which holds its own K-weighting,
   among them), of `mastering::TargetLoudnessSolver` and of the mastering chain and delivery resampler under
-  `fc_master_create`; a `static_assert` in `KWeightingFilter.h` keeps it above twice the shelf. Measured on
+  `fc_master_create` — all of them felitronics-mastering-core's now, taking this constant from here; a
+  `static_assert` in `KWeightingFilter.h` keeps it above twice the shelf. Measured on
   origin/main before the change: the probe read the CI fixture at **+3048.86 LUFS** at 3300 Hz, and a search at
   3363 Hz rode its −60 dB rail chasing +2448 LUFS. The shelf's pole radius is 0.43 at 8 kHz. **And for the meter
   itself (P103):** `analysis::LoudnessMeter` refuses a rate in (0, 8000) Hz — a rate ≤ 0 or NaN is "not given"

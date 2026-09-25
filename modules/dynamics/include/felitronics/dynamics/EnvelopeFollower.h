@@ -136,7 +136,7 @@ public:
     // it unreachable. What the floor buys is that ordinary material does not reach the window between
     // 1e-15 and 1e-12; it is not a proof that nothing can. A caller that needs the output to be
     // partition-independent has to stop the caller's blocks reaching the stage at all — which is what
-    // `felitronics::mastering` does with a fixed internal quantum, and why it has one.
+    // `felitronics::mastering` (felitronics-mastering-core) does with a fixed internal quantum, and why it has one.
     // POISON IS CLEARED TOO, and in Rms mode NOT by swapping in `core::flushPoison`. That would look
     // like the obvious edit and would silently undo the paragraph above: `flushPoison` carries the
     // house 1e-15 threshold, which in the POWER domain means an amplitude of 3.2e-8, i.e. -150 dBFS —

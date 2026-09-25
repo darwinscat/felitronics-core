@@ -196,9 +196,10 @@ the CPU at runtime, invisible to any build. Full write-up:
    documented, not measured here.) None of this is a toolchain bug; it is what the type is.
    **Use `double`, or compensated (Kahan / Neumaier) summation**, which is deterministic on every tier
    because it never asks for anything but IEEE `double` arithmetic. **There is no exception any more.**
-   The law used to sanction one, the `correlation` accumulator in `tools/fcore_measure.cpp`; P59a found it
+   The law used to sanction one, the `correlation` accumulator in `tools/fcore_measure.cpp` (now
+   felitronics-mastering-core's); the waveform-and-stereo port found it
    was a third definition of a number the page and the stereo band already defined, and it became their
-   binary64 formula (`analysis::StereoSums`). The artifact gate below lost its one named exclusion with it. **This law IS enforced**, in the two halves the
+   binary64 formula (`analysis::StereoSums`, felitronics-mastering-core). The artifact gate below lost its one named exclusion with it. **This law IS enforced**, in the two halves the
    `wasm-audio` job pairs everywhere: a text lint over `modules/*/include` and `modules/*/src` that lexes
    before it matches (the words appear in prose constantly, including in this paragraph) and also catches
    an L-suffixed float literal, which is a `long double` that never names itself; and an **artifact** gate,
@@ -250,20 +251,11 @@ the CPU at runtime, invisible to any build. Full write-up:
    than asserted. What stays outside it, because it is runtime state and not code: FTZ/DAZ (wasm cannot flush
    at all, so a host that flushes splits it from every native row — with NORMAL inputs, since a normal times a
    normal can land subnormal), the rounding mode, and NaN sign/payload.
-   **AND A PIN THAT IS NOT AN OVERRIDE: `analysis::StereoSums` STORES its products before it adds them** (P59a).
-   Its answers are gated against JavaScript, which never contracts, so the right number is the unfused one:
-   `mid += m*m` fused on arm64 under this law's own `on` reads a playhead width of 0x3fdffffff7c00010 where the
-   spec reads ...0012. A `volatile` store per product holds under every contraction mode, gcc's `fast` included,
-   and needs no pragma. (Only the mid and side terms can move: a product of two float32 samples is exact in
-   double, so `ll`, `rr` and `lr` could not be fused into a different number — they are stored anyway, so the
-   rule reads "every product" and nobody has to re-derive which ones are safe.) The pin holds in every
-   cell measured — Apple clang 21 arm64, gcc 14.2 x86-64 and gcc 14 arm64, `on` and `fast`, O2/O3, with and without
-   `-march=native` — while the removed pin fuses exactly where each compiler fuses: one expression under `on` on the
-   arm64 rows, two statements only under gcc's `fast` (with FMA available). The test target keeps the tree's `on`,
-   which catches the natural removal. The two-statement form is visible only to a build with gcc-style cross-statement
-   fusion AND FMA — no in-tree target, CI row or tier is one (`fcore_measure` and the wasm modules are
-   `-ffp-contract=off`), so in the tree it is defended and not gated; the out-of-tree NULL's C++ side is built
-   `-ffp-contract=fast -march=native` precisely to see it.
+   **AND A PIN THAT IS NOT AN OVERRIDE.** Where a number is gated against a reference that never contracts
+   (JavaScript), the right answer is the unfused one, and a `volatile` store of each product before it is added
+   holds under every contraction mode, gcc's `fast` included, with no pragma. The worked case — the stereo band's
+   `analysis::StereoSums`, the width it read fused on arm64 and every cell the pin was measured in — moved with
+   the offline analyzers to felitronics-mastering-core (`docs/LAW10-STEREOSUMS.md` there).
 
 11. **THE CALL IS A REQUEST AGAINST A PREPARED CAPACITY, AND A REQUEST THAT CANNOT BE HONOURED IN FULL
    IS REFUSED AS A WHOLE — `[[nodiscard]] bool process(...)`.** `prepare(sampleRate, maxBlock,
@@ -312,8 +304,8 @@ the CPU at runtime, invisible to any build. Full write-up:
    got digital silence and no way to find out. **A module whose width is EXACT refuses `nch == 0` too,
    and its gap is `reset()`, not a zero-width call** — the clock-only form of 11(d) is not expressible
    for an operator that needs its planes. A composite therefore does not forward a gap to such a
-   module: `lineareq::LinearPhaseEq`, `NaturalPhaseEq`, both matrix convolvers and
-   `mastering::MasteringChain` are the list.
+   module: `lineareq::LinearPhaseEq`, `NaturalPhaseEq` and both matrix convolvers are the list here, and
+   felitronics-mastering-core's `mastering::MasteringChain` is one downstream.
 
    **(d) FOR AN ACCEPTED CALL, `n > 0` IS THE TRIGGER FOR BOTH CLOCKS: AUDIO TIME *AND* THE FALLING
    EDGE.** "Accepted" is not decoration: a REFUSED call moves nothing at all, the clock included, so the
@@ -405,8 +397,8 @@ the CPU at runtime, invisible to any build. Full write-up:
    readiness flag on entry, validate every argument, and only then store any of them. Both halves are
    load-bearing, and both were got wrong three times each while this law was being applied. Validating one
    argument, storing it, and then refusing on the next leaves a new WIDTH standing beside an old buffer:
-   in `mastering::OfflineRenderer` that was a **heap-buffer-overflow**, a write past the scratch region,
-   which ASan caught only because a consilium seat went looking for it. And a refusal that returns
+   in `mastering::OfflineRenderer` (felitronics-mastering-core) that was a **heap-buffer-overflow**, a write past
+   the scratch region, which ASan caught only because a reviewer went looking for it. And a refusal that returns
    before reaching the inner `prepare()` leaves the object ARMED on its previous build — measured on
    `multiband::MultibandCompressor`: `prepare(2)`, then a refused `prepare(0)`, then `process(io, 2, 64)`
    still returned true and still processed.
@@ -500,9 +492,9 @@ the CPU at runtime, invisible to any build. Full write-up:
    INSTEAD.** Law 11b refuses an ARGUMENT that cannot be honoured. It does not refuse memory that cannot be had —
    and on the wasm tier it could not: under `-fno-exceptions` a throwing `new` that fails aborts inside the call
    (emsdk 6.0.9: `bad_alloc` → `abort()` → a JavaScript `RuntimeError`). Natively `bad_alloc` escapes the call — or
-   ends the process where it meets a `noexcept` boundary, and the two are one line apart: `MasteringChain::prepare`
-   allocates the EQ engine itself (an escape), then calls `EqEngine::prepare`, which is `noexcept` and allocates its
-   scratch (a `terminate`). So exhaustion is **outside the refusal contract on every row**: it ends the module's
+   ends the process where it meets a `noexcept` boundary, and in a composite the two can be one line apart: a
+   composite that allocates a stage itself (an escape), then calls that stage's `noexcept` `prepare()`, which
+   allocates its scratch (a `terminate`). So exhaustion is **outside the refusal contract on every row**: it ends the module's
    usefulness and is never answered with `false` — save where a third-party backend throws (the NAM backend,
    in felitronics-guitar-core, catches what its preparation throws and stays unprepared), a refusal this law
    neither asks of the other modules nor forbids there. This is the explicit exception to 11b, and it was chosen over nothrow
@@ -514,11 +506,11 @@ the CPU at runtime, invisible to any build. Full write-up:
 
    * **THE DEMAND.** An allocating call on the worker path can state, before it is made, a bound on how much of the
      heap its OWN requests will occupy at once — not what the object already holds — computed by the very functions
-     its `prepare()` sizes itself with, so the bound cannot drift from the allocation; the C ABI forwards it
-     (`fc_master_need`). In 64 bits. What each number bounds is written where it is defined, because "at once" is
+     its `prepare()` sizes itself with, so the bound cannot drift from the allocation; a C ABI over it forwards
+     it. In 64 bits. What each number bounds is written where it is defined, because "at once" is
      not one formula: a call that keeps what it asks for is bounded by the sum of its requests, exact on a FRESH
-     object (one already prepared keeps storage that still fits); a call that builds and frees per pass
-     (`TargetLoudnessSolver::solve`) by one pass. REQUESTED bytes, not a promise that a heap can serve them:
+     object (one already prepared keeps storage that still fits); a call that builds and frees per pass (a
+     search that renders once per pass) by one pass. REQUESTED bytes, not a promise that a heap can serve them:
      allocator headers, the standard library's own alignment (MSVC's STL, in a release build, asks for
      `sizeof(void*) + 31` more on a block of 4096 bytes or more), fragmentation and the runtime's growth step are
      the caller's margin.
@@ -533,44 +525,32 @@ the CPU at runtime, invisible to any build. Full write-up:
      number a budget reads and the number the prepared object reports are one expression.
 
      **A CALL THAT REFUSES MAY HAVE ASKED FOR PART OF ITS BOUND ON THE WAY — except where it can be decided for
-     nothing, and then it must be.** `MasteringChain::admits()` reaches the whole verdict, every stage's included,
-     without a single allocation, so `fc_master_create` refuses an impossible geometry having touched no heap at
-     all. It used to ask for 394 456 bytes on its way to saying no on the default geometry, and 1 668 312 at
-     sixteen channels and an 8192-sample quantum — on the tier where an allocation that cannot be served is
+     nothing, and then it must be.** A composite that can reach the whole verdict, every stage's included,
+     without a single allocation publishes it as its own `admits()`, and a boundary over it then refuses an
+     impossible geometry having touched no heap at all — on the tier where an allocation that cannot be served is
      not a refusal but the end of the module, which is what this law is about.
 
-     **THE DEMAND IS A NUMBER, NOT A PERMISSION.** `fc_master_need` answers what a call would REQUEST and does not
-     consult the handle's state: a solve and a configure are both budgeted while a stream is in progress, though
-     either would be refused with `FC_ERR_STATE` in that moment. The cost of a call does not depend on when it is
-     made, and a caller deciding whether to reset a stream and re-configure needs the number precisely then. The
-     one exception is the call that has no handle to ask: `fc_master_need_create` is a DRY RUN, returning every
-     status the create would return before its first allocation, because the configuration it is handed has never
-     been admitted anywhere and whether it is admissible is the question only that entry point can answer — and
-     because a budget of 0 must keep meaning one thing.
+     **THE DEMAND IS A NUMBER, NOT A PERMISSION.** A boundary's demand query answers what a call would REQUEST and
+     does not consult the handle's state: the cost of a call does not depend on when it is made, and a caller
+     deciding whether to reset a stream and re-configure needs the number precisely when the other calls would be
+     refused. The one exception is the call that has no handle to ask: the create's own query is a DRY RUN,
+     returning every status the create would return before its first allocation, because the configuration it is
+     handed has never been admitted anywhere — and because a budget of 0 must keep meaning one thing.
    * **A MODULE WHOSE CALL NEVER RETURNED ANSWERS EVERY STATUS CALL WITH "DISCARD ME".** The runtime does not stop a
-     module that aborted; it answers the next call with objects wherever the abort left them. Measured on v0.30.0 in
-     wasm32: after an abort inside `fc_master_solve`, `fc_master_process` answered `FC_OK` at the search's pass-1
-     gain — +12 dB in that replay, the `initialGainDb` it asked for, which `MasterAbiTests` repeats — and seven such
-     aborts in all (`kMaxHandles − 1`) left the handle table full for good. So a boundary that cannot outlive an
-     abort marks every call in progress and, finding the mark on entry, answers `FC_ERR_POISONED` for good and
-     touches nothing — ahead of every other check, for every handle, and for a re-entrant call too, which it cannot
+     module that aborted; it answers the next call with objects wherever the abort left them (measured: a stream
+     answering `OK` at the gain of a search that never returned, and a handle table left full for good). So a
+     boundary that cannot outlive an abort marks every call in progress and, finding the mark on entry, answers
+     "poisoned" for good and touches nothing — ahead of every other check, for every handle, and for a re-entrant call too, which it cannot
      tell apart. Entry points that read no instance state (build identity, the defaults writers) stay callable.
 
    Not promised: that a demand will be admitted, that anything survives exhaustion, or that a native host which
    catches `bad_alloc` holds a usable object. RT law 2 is unchanged — `process()` allocates nothing — so none of
-   this reaches the audio path. Gated: the C-ABI suites pin the poison (natively, through an escaped exception) and
-   every published budget against the bytes its call requests, byte for byte — over a matrix of four rates, three
-   widths and NINE topologies for the chain's own storage, every optional stage absent on some row of it (with
-   only one stage moving, a budget that charged for an EQ engine a chain never builds was green on every row),
-   with a counter that installs EVERY form of `operator
-   new`, the over-aligned one included (without it the EQ engine's 331 KiB — the largest single request a create
-   makes on the default geometry — is invisible to the counter and both sides of the comparison silently omit
-   it). The suites also pin that
-   `admits()` is `prepare()`'s own verdict, that a refused preparation allocates nothing, that every stage's
-   `latencyFor()` is the latency the prepared stage reports, and — by null, over three topologies and across a
-   chain moved to another rate and quantum — that re-preparing
-   a chain, which now re-uses its EQ engine instead of building a second one, does not move a sample. The re-entry
-   suite runs on the wasm tier too; the abort path itself is measured, not gated.
+   this reaches the audio path. Gated: each allocating stage's suite pins its published budget against the bytes its
+   `prepare()` requests, with the ONE counter in `test_support/alloc_counter.h`, which installs EVERY form of
+   `operator new`, the over-aligned one included. The worked case of this whole law — the mastering chain, its C ABI
+   and the measurements behind every clause above (the escape and the `terminate` one line apart, the bytes a
+   refusal used to ask for, the poisoned replay), with the gates that pin them over a matrix of rates, widths and
+   topologies — moved with the chain to felitronics-mastering-core, `docs/LAW11D-MASTERING.md`.
 
    **11e. A RESTART NEVER LOSES AN ACCEPTED PUBLICATION — IT ADOPTS IT.** A swap-safe convolver publishes an
    operator from the message thread (`setIr()`/`setOperator()` return true) and the audio thread adopts it
@@ -677,7 +657,8 @@ lowest-common-denominator that kills desktop performance).
   **AMENDED — where the line actually is.** As written this read as "no composite belongs in the core",
   and the tree had already outgrown that in five places (`dynamiceq`, `deesser`, `multiband`, and two
   guitar composites since moved to felitronics-guitar-core) before `mastering` arrived. The rule those
-  follow, stated properly:
+  follow, stated properly — and "the core" in it is the family's shared layer, this repository or a
+  satellite repository beside it:
 
   > A composite belongs in the core when **it is the unit under test** and its behaviour is shared.
   > It gets its OWN module, which may depend on many others; the primitive modules stay independent of
@@ -687,8 +668,10 @@ lowest-common-denominator that kills desktop performance).
   The discriminator is not "how many modules does it touch" but "can it be wrong on its own". A
   mastering chain can: its defects are latency arithmetic, block dependence, stale state across a
   bypass and a lost tail — none of which live in any stage, and all of which are only reachable by
-  testing the composition. `felitronics::mastering` therefore ships here while `mastering-config.json`
-  (JAZZ/METAL, LIGHT/HEAVY) stays in the product, and that split is the rule, not an exception to it.
+  testing the composition. `felitronics::mastering` therefore ships in that shared layer — in
+  felitronics-mastering-core, beside this repository, since this one keeps the base functions — while
+  `mastering-config.json` (JAZZ/METAL, LIGHT/HEAVY) stays in the product, and that split is the rule, not an
+  exception to it.
 
 ---
 

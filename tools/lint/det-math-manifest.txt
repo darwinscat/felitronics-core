@@ -83,7 +83,6 @@ modules/measurement/include/felitronics/measurement/Sweep.h  [cos*2 exp*2 log*2 
 
 # --- tools that are not on the parity surface ---
 tools/eqviz/eqviz.cpp  [abs*5 arg*1 cos*1 log*8 log10*1 pow*26 sin*1 sqrt*10]  retain-local  a developer visualiser; it draws curves and nobody diffs its output
-tools/fcore_master.cpp  [sin*4]  retain-local  test-signal generation inside the mastering CLI's own fixtures, not a measured value
 tools/fftbench.cpp  [exp*6]  retain-local  benchmark input generation
 
 
@@ -96,4 +95,3 @@ modules/dynamics/include/felitronics/dynamics/Compressor.h  [dbToGain()*1]  reta
 modules/dynamics/include/felitronics/dynamics/GainReductionPath.h  [gainToDb()*2]  retain-rt  the canonical per-sample site: step() is "a log10 and a knee per sample" in its own words, and advanceSilence() evaluates the same expression once at the floor. This is the path that makes gainToDb untouchable
 modules/dynamics/include/felitronics/dynamics/offline/DetectorAnalysis.h  [gainToDb()*3]  retain-offline  offline, but the histogram conversion at :169 runs per sample and the whole point of the class is to model the SHIPPED chain exactly; converting the final peak/RMS alone would make it a mixed-policy answer that is deterministic nowhere
 modules/dynamics/include/felitronics/dynamics/offline/ThresholdSolver.h  [gainToDb()*1]  retain-offline  one gainToDb per frame feeding a > statisticsGateDb decision; it drives the SHIPPED GainReductionPath, so it must read what that path reads
-modules/mastering/include/felitronics/mastering/MasteringChain.h  [dbToGain()*1]  retain-rt  dbToGain for the chain gain, applied to audio

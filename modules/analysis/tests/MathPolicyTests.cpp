@@ -7,23 +7,18 @@
 //   · the RT names must stay on the SYSTEM math. eq::Svf's coefficients are TabbyEQ's and OrbitCab's
 //     sound; rerouting them through the deterministic floor would move a shipped product's bits for the
 //     sake of a test, which is the wrong way round.
-//   · the offline analyzers must stay on the DETERMINISTIC math. They are compared byte for byte across
-//     rows, and the system libm is not the same function on every row: at 44.1 kHz the filter arguments
-//     of ProgrammeReport (30 Hz), BandBursts (9 kHz) and the K-weighting corner (1681.97 Hz) all give
-//     different coefficients on Apple's libm than on glibc's and musl's — measured. Today's green parity
-//     survives that only because the difference has not yet reached a printed digit on the fixtures in
-//     use. That is luck, and this gate is what replaces it.
+//   · the deterministic spellings must stay a DIFFERENT type. Offline code that is compared byte for byte
+//     across rows declares its members with them, and the system libm is not the same function on every
+//     row: at 44.1 kHz the K-weighting corner (1681.97 Hz) gives different coefficients on Apple's libm
+//     than on glibc's and musl's — measured. (The analyzers that own those spellings pin that ownership in
+//     a suite beside them, AnalyzerMathPolicyTests.cpp.)
 //
 // The static_asserts make an alias change a deliberate act that must also edit this file. The runtime
 // half proves the policy is LIVE — that the two spellings are not quietly the same type — and it says so
 // out loud when it cannot find a witness on the running row, rather than passing in silence.
 
 #include <felitronics_test.h>
-#include <felitronics/analysis/BandBursts.h>
-#include <felitronics/analysis/BandCrest.h>
 #include <felitronics/analysis/KWeightingFilter.h>
-#include <felitronics/analysis/LowEnd.h>
-#include <felitronics/analysis/ProgrammeReport.h>
 #include <felitronics/analysis/LoudnessMeter.h>
 #include <felitronics/core/DetMath.h>
 #include <felitronics/eq/Crossover2.h>
@@ -50,16 +45,6 @@ static_assert (! std::is_same_v<eq::Svf,              eq::DeterministicSvf>);
 static_assert (! std::is_same_v<eq::Crossover2,       eq::DeterministicCrossover2>);
 static_assert (! std::is_same_v<an::KWeightingFilter, an::DeterministicKWeightingFilter>);
 static_assert (! std::is_same_v<an::LoudnessMeter,    an::DeterministicLoudnessMeter>);
-// --- and the ANALYZERS OWN the deterministic ones. These assert the public aliases — and the aliases are
-// what the members are DECLARED WITH (ProgrammeReport.h: `CrossoverType lr4_`), so there is nothing for
-// them to drift from. An earlier draft declared the members with the concrete type and the aliases beside
-// them, which let a member be switched to SystemMath with the alias left intact and this gate still green.
-static_assert (std::is_same_v<an::ProgrammeReport::CrossoverType,  eq::DeterministicCrossover2>);
-static_assert (std::is_same_v<an::ProgrammeReport::KWeightingType, an::DeterministicKWeightingFilter>);
-static_assert (std::is_same_v<an::ProgrammeReport::LoudnessType,   an::DeterministicLoudnessMeter>);
-static_assert (std::is_same_v<an::LowEnd::CrossoverType,           eq::DeterministicCrossover2>);
-static_assert (std::is_same_v<an::BandBursts::CrossoverType,       eq::DeterministicCrossover2>);
-static_assert (std::is_same_v<an::BandCrest::CrossoverType,        eq::DeterministicCrossover2>);
 
 int main()
 {

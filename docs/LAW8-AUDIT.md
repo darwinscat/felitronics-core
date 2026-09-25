@@ -176,8 +176,8 @@ genuinely clean either way, because its flush is per SAMPLE.
 **What to do about it is a choice, and P6 took the third option:** (a) move the flushes into the sample
 loop — correct, but a versioned behaviour change in a module TabbyEQ ships; (b) cap the block a stage
 will accept — reintroduces the silent-truncation defect P2 F2 closed; (c) **stop the caller's block from
-reaching the stage at all**, which is what `felitronics::mastering` does with a fixed internal quantum,
-and why it has one. A future re-audit should measure the whole-file shape for every row above rather than
+reaching the stage at all**, which is what `felitronics::mastering` (felitronics-mastering-core) does with a
+fixed internal quantum, and why it has one. A future re-audit should measure the whole-file shape for every row above rather than
 assume the sweep covered it.
 
 ### ✅ CLOSED for `eq` and `stereo` — option (a), on a GRID rather than per sample
@@ -208,7 +208,7 @@ would otherwise run the new topology on the old coefficients for up to 63 sample
 **Still per call, measured and left for their own pass** — same mechanism, different owners:
 `deesser::DeEsser` (1 735 samples of 336 000 slicing-dependent, worst 1.97e-17), `dynamiceq::DynamicEqBand`
 (5 844, worst 2.46e-16), `dynamiceq::LaneDynamics` (its 16-sample control grid restarts at every call —
-`mastering::MasteringChain`, which drives one per EQ band, always calls it with exactly the internal
+felitronics-mastering-core's `mastering::MasteringChain`, which drives one per EQ band, always calls it with exactly the internal
 quantum, so that restart lands on the same absolute sample whatever the caller's block size),
 `dynamics::Compressor` / `NoiseGate` / `TransientShaper` (their followers), `multiband::MultibandProcessor`,
 `limiter::TruePeakLimiter` (its internal chunk loop is

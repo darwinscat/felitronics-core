@@ -4,7 +4,9 @@
 # The `wasm-audio` tier — gated, not aspirational
 
 [`DSP-ARCHITECTURE.md`](DSP-ARCHITECTURE.md) §2 has always named a `wasm-audio` tier and always marked it
-*aspirational*. [`P0-WASM-SPIKE.md`](P0-WASM-SPIKE.md) proved the core **can** live under Emscripten. This
+*aspirational*. The wasm spike (felitronics-mastering-core's
+[`WASM-SPIKE.md`](https://github.com/darwinscat/felitronics-mastering-core/blob/main/docs/WASM-SPIKE.md)) proved
+the core **can** live under Emscripten. This
 document is what turned that into a gate: a `wasm-audio` CMake preset and a CI job that builds every default
 module for wasm32 with exceptions and RTTI off and no pthreads, runs the whole self-test suite in node, and
 audits every emitted artifact.
@@ -165,10 +167,7 @@ Everything below was invisible on desktop and surfaced from one act: compiling t
 
 ## The CI job
 
-One job, `wasm-audio-tier`, on **`ubuntu-latest`** — and the runner choice is load-bearing for its last step.
-Apple's libm and musl (what Emscripten compiles in) return different doubles from `tan()` at 88.2 and
-192 kHz, so an arm64-macOS reference would diverge from wasm for a reason that is not a regression. glibc
-agrees with musl at every rate measured. See [`P0-WASM-SPIKE.md`](P0-WASM-SPIKE.md).
+One job, `wasm-audio-tier`, on Linux x86-64 (a hosted `ubuntu-latest`, or a self-hosted runner for this repository's own pull requests).
 
 emsdk is installed from upstream rather than through a third-party action, so the only thing the job trusts
 is emscripten itself, and **6.0.9** is the toolchain every number in the spike report was measured on. The
@@ -184,38 +183,11 @@ The steps, and what each is for:
    build and ~17 s to run, all green but the perf suite (excluded: its assertions are *relative* wall-clock
    and SAFE_HEAP instruments every load and store, so it would measure the instrumentation). This is the
    configuration that names a stack overflow instead of letting it corrupt quietly.
-5. **`tools/wasm/build.sh`** — CI had never compiled the P0 spike at all, which is why it broke unnoticed
-   during the session that wrote it.
-6. **native↔wasm NULL test** on a **generated** fixture — no private audio enters a public repo. The
-   comparison surface is the pre-gate 400 ms block-energy vector plus the true-peak linear maximum, not the
-   scalar LUFS: a gated scalar is discontinuous in its own inputs and cannot carry a bit-exactness claim.
-   The **checked** artifact (`SAFE_HEAP` + `ASSERTIONS=2` + stack checks) is diffed as well — building it
-   without running it would prove nothing, and the libsoxr precedent is precisely a clean build that died
-   at runtime.
 
-The fixture (`tools/wasm/make-fixture.mjs`) calls no transcendental — an integer xorshift PRNG and float32
-arithmetic only — so its bytes are identical on every JS engine and node version (on a little-endian host: a
-TypedArray uses the platform's byte order, and the native tool reads f32**le**, so the harness already
-assumed that). It is 10 s of stereo at 48 kHz in
-five deliberate sections: ordinary noise, **digital silence** (the absolute gate), louder noise, an fs/4
-pattern sampled 45° off the crests, and a decaying burst that stops on a transient at the very last sample.
-
-Two of those sections were designed against a measurement, not a hunch.
-
-**The fs/4 section.** An obvious "alternating ±A" sits at *exactly* Nyquist, where the reconstruction maximum
-**is** A — measured `tp == sp`, so the compared true peak came from the sample-peak floor and the polyphase
-FIR was never under test at all. Sampling fs/4 45° off the crests puts every sample at A while the
-reconstruction peaks near A·√2, which is what puts the filter's own output into the compared number.
-
-**The ending.** The first version decayed a burst across the last second — and `0.98 × 0.9995^48000` is
-`3.7e-11`, about −209 dBFS, so the "abrupt ending" was silence and tested nothing. It is now a full-scale hit
-occupying the **last 16 samples**, louder than anything before it, so the file's true peak is decided there.
-That is what makes it a test: disabling `finish()` in `fcore::Probe` drops the reported true peak from
-**1.3936 to 1.0125** — 2.8 dB under-reported — and changes the compared line. With the drain in place, the
-whole ending is exact.
-
-Current result on that fixture: **97 block energies plus true peak plus sample peak, every bit equal**,
-native arm64 (Apple clang) vs wasm32 — and identical again from the checked `SAFE_HEAP` build.
+The C ABIs built on this tier — the measurement probe and the mastering chain — and every native-vs-wasm
+comparison of them (the generated fixture, the byte-for-byte NULL tests, the mastering parity within its stated
+tolerance) moved with those modules to felitronics-mastering-core, and are gated in its CI:
+`docs/WASM-PARITY.md` there.
 
 ---
 
@@ -225,14 +197,6 @@ native arm64 (Apple clang) vs wasm32 — and identical again from the checked `S
 source ~/emsdk/emsdk_env.sh
 cmake --preset wasm-audio && cmake --build --preset wasm-audio && ctest --preset wasm-audio
 node tools/wasm/check-no-threads.mjs --all build-wasm-audio
-
-# the NULL test
-./tools/wasm/build.sh
-cmake --preset desktop && cmake --build --preset desktop --target fcore_measure
-node tools/wasm/make-fixture.mjs fixture.f32 48000 2 10
-./build/tools/fcore_measure blocks 48000 2 fixture.f32                        > native.txt
-node tools/wasm/parity.mjs tools/wasm/build/fcprobe.node.js 48000 2 fixture.f32 > wasm.txt
-diff native.txt wasm.txt          # empty output IS the acceptance criterion
 ```
 
 `CMakePresets.json` also carries a `desktop` preset, because `-DCMAKE_BUILD_TYPE=Release` is not optional

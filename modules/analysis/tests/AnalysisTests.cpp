@@ -256,8 +256,9 @@ int main()
     // --- the flush must not make the answer depend on the host's block size ---
     // This is the test that killed the first design. Flushing at the end of LoudnessMeter::process() looks
     // equivalent and is not: it puts a numerical event on a boundary the CALLER chooses, so the same stream
-    // split differently gives different numbers — and this repo tests the opposite (ProbeTests.cpp:212,
-    // bit-exact across call sizes 1 … 100 003). Flushing per 10 ms sub-hop is caller-independent.
+    // split differently gives different numbers — and this repo tests the opposite (the group below, and
+    // LoudnessConformanceTests on every pre-gate block energy, bit-exact across call sizes 1 … 100 003).
+    // Flushing per 10 ms sub-hop is caller-independent.
     test::group ("LoudnessMeter: the law-8 flush keeps chunk invariance bit-exact");
     {
         const double fs = 48000.0;

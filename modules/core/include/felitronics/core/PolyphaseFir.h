@@ -11,7 +11,8 @@
 //
 // It replaced three separately written scalar loops — `PolyphaseOversampler::upsample`, the same
 // class's `downsample`, and `TruePeakMeter::process` — which between them were ~83 % of a mastering
-// render (measured: `downsample` 50 %, `upsample` 33 % of a 10 s sample of `fcore_master render`).
+// render (measured: `downsample` 50 %, `upsample` 33 % of a 10 s sample of `fcore_master render`, the
+// mastering CLI now in felitronics-mastering-core).
 // The three were NOT the same loop: two gathered their coefficients with a stride of `L`
 // (`proto[k*L+p]`) and one read them contiguously, and all three walked a modulo ring backwards with
 // a wrap test inside the inner loop. What makes them one loop is the REPACKING at the call sites,

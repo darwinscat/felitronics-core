@@ -25,7 +25,7 @@ same audit had been started three times.
 The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer` (the `.orbitrig` pack player) and
 `poweramp` (the tube power-amp trunk) — live in [felitronics-guitar-core](https://github.com/darwinscat/felitronics-guitar-core).
 
-## Mastering chain
+## Mastering stages
 
 | Module | What | Key types |
 |---|---|---|
@@ -36,13 +36,12 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 | `multiband` | split → per-band processor → recombine (LR4, allpass-flat) | `MultibandProcessor`, `MultibandCompressor`, `MultibandWidth` |
 | `dither` | export bit-depth reduction | `Dither` (TPDF + noise shaping; 16/20/24-bit) |
 | `limiter` | brick-wall ceiling | `TruePeakLimiter` (oversample → limit → down) |
-| `mastering` | **the chain itself**, streaming + block-independent, plus the offline render wrapper. The one module that composes many others on purpose — the composite is the unit under test; the VOICING (preset tables, targets) stays in the product | `MasteringChain` (fixed internal quantum → the same bits at any caller block size), `MasteringChainConfig`/`Params`/`Resolved`, `OfflineRenderer` (`out[n] = y[n+D]`, tail included) |
 
 ## Meters · analysis · measurement
 
 | Module | What | Key types |
 |---|---|---|
-| `analysis` | RT metering, the analyser taps and the spectrum panes (JUCE-free display pipelines); **offline display curves** (`::offline`) | `LoudnessMeter` (LUFS M/S/I + **LRA**), `TruePeakMeter` (dBTP, BS.1770-4 — the spec's short filter, for live display), `ReferenceTruePeakMeter` (dBTP, the 4×/128-tap reference a delivered file is certified and a delivered ceiling aimed with; the gap between the two is pinned by `felitronics_truepeak_instrument_gap_tests`), `ClipDetector` (offline: sample-clipped runs by flatness, with positions, peak and DC), `CorrelationMeter`, `KWeightingFilter`, `SpectrumTap`, `RollingSpectrumTap` (hop ≠ window, reports the hop that happened), `PlotMap`, `SpectrumPaneT<Fft>` (single FFT, the classic look), `MultiResSpectrumPaneT<…, Fft>` (constant-Q from several FFT lengths — `docs/ANALYZER-MULTIRES.md`), `MultiResSpectrumPaneFastT<…, Fft>` (the same pane, ~1.8–2.3× cheaper on pffft, fill bit-identical — `docs/PERF-ANALYZER-MULTIRES.md`), `offline::logMagnitudeCurve` (1/N-oct, log-f), `offline::interferenceDb`, `WaveformPeaks` (the waveform bars — a port of the site's `audio-peaks.js`, bit-identical, native and wasm; box-averaged max-abs, not a metering peak) and `StereoColumns` / `StereoSums` (the stereo band: width, uncentred phase correlation, RMS per column + the playhead needle — a port of `stereo-meter.js`) |
+| `analysis` | RT metering, the analyser taps and the spectrum panes (JUCE-free display pipelines); **offline display curves** (`::offline`) | `LoudnessMeter` (LUFS M/S/I + **LRA**), `TruePeakMeter` (dBTP, BS.1770-4 — the spec's short filter, for live display), `ReferenceTruePeakMeter` (dBTP, the 4×/128-tap reference a delivered file is certified and a delivered ceiling aimed with), `CorrelationMeter`, `KWeightingFilter`, `SpectrumTap`, `RollingSpectrumTap` (hop ≠ window, reports the hop that happened), `PlotMap`, `SpectrumPaneT<Fft>` (single FFT, the classic look), `MultiResSpectrumPaneT<…, Fft>` (constant-Q from several FFT lengths — `docs/ANALYZER-MULTIRES.md`), `MultiResSpectrumPaneFastT<…, Fft>` (the same pane, ~1.8–2.3× cheaper on pffft, fill bit-identical — `docs/PERF-ANALYZER-MULTIRES.md`), `offline::logMagnitudeCurve` (1/N-oct, log-f), `offline::interferenceDb` |
 | `measurement` | **offline** IR capture: ESS/Farina sweep + deconv, IR post, capture gate (+ standalone sweepless peak/flat-top clip scan), multi-mic align, fine time/polarity align by cross-correlation (message-thread, double) | `Sweep`, `Deconvolve`, `IrPost`, `CaptureGate`, `PeakClip`, `MicSetAlign`, `XcorrAlign`, `ModelGuess` |
 | `blend` | **offline** multi-mic IR blend engine: per-mic gain/phase/shift/HPF/LPF + master, solo/mute — the canonical home of the blend defaults | `StripParams`/`MasterParams`, `Filter`, `blendIrs`, `processedMic`, `Overlay` (`makeOverlay` — the one-call mix-view facade) |
 | `io` | **offline** file I/O: minimal self-contained WAV read/write (moved from OrbitCapture's `oc/wav.hpp`; zero-dep, loud rejects, memory + file readers) | `WavData`, `readWav`, `readWavMemory`, `writeWav`, `writeWavMonoF32` |
@@ -50,11 +49,12 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 **Build & test:** `cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON && cmake --build build -j && ctest --test-dir build`.
 Add `-DFELITRONICS_WITH_PFFFT=ON` for the optional compiled SIMD FFT backend.
 
-**A full mastering chain is now buildable in core:** saturation → dynamic-EQ → de-esser → multiband comp →
+**Every stage of a mastering chain is in core:** saturation → dynamic-EQ → de-esser → multiband comp →
 stereo width → transient → mono-bass → dither, metered by true-peak (dBTP) + LUFS/LRA.
 
-**...and one is now BUILT, in `mastering`:** `gain → EQ (each point optionally DYNAMIC) → [M/S mono-bass] → compressor (optional internal
-sidechain HPF) → [soft clipper] → gain → true-peak limiter → dither`, as a single streaming object with a
-declared latency, a latency-neutral per-stage bypass, and a tail that is not lost. It is deliberately the
-composite of the stages above rather than a new one; what it adds is the thing composition kept getting
-wrong — see its header for why block independence needed a fixed internal quantum instead of a promise.
+The chain BUILT from them — `mastering` (`MasteringChain`, `OfflineRenderer`, the target-loudness solver,
+delivery at another rate) — and the offline programme analyzers over the meters above (`ProgrammeReport`,
+`SourceForensics`, `HumDetector`, `LowEnd`, `BandBursts`, `ClipDetector`, `WaveformPeaks` / `StereoColumns`, …,
+target `felitronics::analysis_offline`) live in
+[felitronics-mastering-core](https://github.com/darwinscat/felitronics-mastering-core), with their C ABIs and
+the wasm build.
