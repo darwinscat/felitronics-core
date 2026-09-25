@@ -13,4 +13,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_io_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_io_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_io_tests COMMAND felitronics_io_tests)
+
+    # The writer's PCM grid is felitronics::dither's: every code survives write∘read, and Dither's output is
+    # written as the codes Dither chose. Links dither to TEST that agreement — the io library itself stays
+    # zero-dep and restates the rule rather than including it.
+    add_executable(felitronics_io_grid_tests tests/WavGridTests.cpp)
+    target_link_libraries(felitronics_io_grid_tests PRIVATE felitronics::io felitronics::dither)
+    target_include_directories(felitronics_io_grid_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_io_grid_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_io_grid_tests COMMAND felitronics_io_grid_tests)
 endif()

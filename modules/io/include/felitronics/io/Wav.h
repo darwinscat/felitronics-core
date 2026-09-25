@@ -13,6 +13,11 @@
 // string) — never silent zeros. 512 MB DoS guard. Writes 16/24-bit PCM or 32-bit float; clamps,
 // zeroes NaN/Inf, guards ragged channels. Little-endian (the WAV convention).
 // OFFLINE, MESSAGE-THREAD-ONLY (allocates, touches the filesystem).
+//
+// ONE PCM GRID, AND IT IS felitronics::dither's: a `bits`-bit code k stands for k / 2^(bits-1), both ways.
+// The reader divides by 2^(bits-1); the writer quantizes with Dither's own rule (detail::pcmCode below), so
+// write∘read is the identity on every code and a master Dither already put on the grid is written as the
+// codes Dither chose — not quantized a second time, without dither, onto a grid one LSB narrower.
 //==============================================================================
 
 #include <algorithm>
@@ -56,6 +61,23 @@ namespace detail
         o.push_back ((std::uint8_t) (v & 0xFF)); o.push_back ((std::uint8_t) ((v >> 8) & 0xFF));
     }
     inline void wrTag (std::vector<std::uint8_t>& o, const char* t) { o.insert (o.end(), t, t + 4); }
+
+    // A sample, nominally in [-1, 1) → its `bits`-bit PCM code, by felitronics::dither::Dither's rule exactly:
+    // floor(v·2^(bits-1) + 0.5) — mid-tread, ties UP on both signs — clamped to [−2^(bits-1), 2^(bits-1) − 1]
+    // in the DOUBLE domain, before the conversion, so no finite input reaches an out-of-range cast. NaN/Inf → 0.
+    // The scale used to be 2^(bits-1) − 1 (32767 / 8388607) under llround, one LSB narrower than the grid the
+    // reader and Dither use: 32767 of the 65536 16-bit codes (every |k| > 16384, code 20000 → 19999) and
+    // 8388607 of the 16777216 24-bit ones came back moved by one LSB. `bits` is 16 or 24 here. The product
+    // v·2^(bits-1) is exact, so a contracted multiply-add (law 10) rounds the same sum and moves no code.
+    inline std::int32_t pcmCode (double v, int bits) noexcept
+    {
+        if (! std::isfinite (v)) return 0;
+        const double full = (double) ((std::int32_t) 1 << (bits - 1));   // 32768 / 8388608, exact
+        const double q = std::floor (v * full + 0.5);
+        return q <= -full        ? (std::int32_t) -full
+             : q >= full - 1.0   ? (std::int32_t) (full - 1.0)
+                                 : (std::int32_t) q;
+    }
 } // namespace detail
 
 // Parse a whole WAVE image from memory (the file-reading wrapper is below). Exposed separately so a
@@ -195,20 +217,15 @@ inline std::vector<std::uint8_t> writeWavMemory (const std::vector<std::vector<d
     wrTag (o, "fmt "); wrU32 (o, 16); wrU16 (o, fmt); wrU16 (o, nch);
     wrU32 (o, rate); wrU32 (o, rate * block); wrU16 (o, block); wrU16 (o, (std::uint16_t) bits);
     wrTag (o, "data"); wrU32 (o, datalen);
-    auto clampd = [] (double v)
-    {
-        if (! std::isfinite (v)) return 0.0;                  // NaN/Inf → 0 (no llround UB)
-        return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v);
-    };
     for (std::size_t i = 0; i < nf; ++i)
         for (std::uint16_t c = 0; c < nch; ++c)
         {
             const double v = ch[c][i];
             if (is_float && bits == 32) { float fv = std::isfinite (v) ? (float) v : 0.0f; std::uint8_t t[4]; std::memcpy (t, &fv, 4); o.insert (o.end(), t, t + 4); }
-            else if (bits == 16) { std::int16_t iv = (std::int16_t) std::llround (clampd (v) * 32767.0); wrU16 (o, (std::uint16_t) iv); }
+            else if (bits == 16) { std::int16_t iv = (std::int16_t) pcmCode (v, 16); wrU16 (o, (std::uint16_t) iv); }
             else if (bits == 24)
             {
-                std::int32_t iv = (std::int32_t) std::llround (clampd (v) * 8388607.0);
+                std::int32_t iv = pcmCode (v, 24);
                 o.push_back ((std::uint8_t) (iv & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 8) & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 16) & 0xFF));
             }
         }
