@@ -22,18 +22,18 @@ namespace felitronics::analysis
 //
 // The filter: `oversampling::PolyphaseOversampler` at 4x, 32 taps per phase (a 128-tap Kaiser-sinc prototype,
 // cutoff 0.90 x base Nyquist, beta 9), at EVERY sample rate; the running maximum of |x| over the 4x stream,
-// floored at the sample peak. This is the arithmetic `fcore::Probe` (tools/fcore_probe.h) has always run —
-// `fcore_measure` and the browser's `fc_probe` report it, it is what the site's baseline harness and the EBU
-// Tech 3341 runs were judged by — moved here so that a second caller cannot be a second copy. The probe now
-// measures THROUGH this class, so "the solver's reading equals `fcore_measure` on the delivered file" is a
-// statement about one class and one set of doubles, not about two implementations that happen to agree.
+// floored at the sample peak. This is the arithmetic the measurement probe (`fcore::Probe`, now in
+// felitronics-mastering-core) has always run — its native CLI and wasm module report it, and the EBU Tech 3341
+// runs were judged by it — moved here so that a second caller cannot be a second copy. The probe measures
+// THROUGH this class, so "the solver's reading equals the probe's on the delivered file" is a statement about
+// one class and one set of doubles, not about two implementations that happen to agree.
 //
 // WHY THE CORE HOLDS TWO TRUE-PEAK METERS, AND WHICH ONE TO REACH FOR. `analysis::TruePeakMeter` is the spec's
 // short filter (12 taps per phase, cutoff at the base Nyquist, factor 4/2/1 by rate): cheap, built for a live
 // chain. It is a different filter and reads a different number, and on high delivery rates it stops
 // interpolating altogether (2x at 88.2-176.4 kHz, a plain sample peak at >= 176.4). How far the two readings
 // sit apart — on which material, at which rate — is not stated here: it is measured and pinned by
-// `felitronics_truepeak_instrument_gap_tests`, the only owner of that number. The rule is the design, not the
+// `felitronics_truepeak_instrument_gap_tests` (felitronics-mastering-core), the only owner of that number. The rule is the design, not the
 // number: a PROMISE about a delivered file is aimed and certified with this class; a display is free to use
 // the cheap one.
 //
@@ -48,7 +48,7 @@ namespace felitronics::analysis
 // not left the filter when the input ends. The sample-peak floor does not stand in for it: a buffer ending on ten
 // samples at 0.95 reads 0.95 undrained and 1.062468 drained — an over the floor cannot see (the 4x maximum alone
 // is 0.015 undrained). `drain()` pushes `kTapsPerPhase` samples of digital silence through every prepared channel
-// — exactly what `fcore::Probe::finish()` always did — and after it the history IS that silence, so a stream that
+// — exactly what the probe's `finish()` always did — and after it the history IS that silence, so a stream that
 // continues is simply a stream with 32 zeros in it. One more drain adds nothing: the ring is already zero.
 //
 // A CHANNEL THAT STOPS IS DRAINED, NOT DROPPED. Law 11 (DSP-ARCHITECTURE.md §2) makes a narrower call legal and says

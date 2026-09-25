@@ -241,7 +241,7 @@ public:
 
     // THE LATENCY a prepared compressor will report for this geometry, WITHOUT preparing one. A composite
     // that has to size a dry aligner before its stages exist needs this number, and deriving it a second
-    // time is exactly what `MasteringChain::prepare` refuses to do — so here it is once, and the prepared
+    // time is exactly what `MasteringChain::prepare` (felitronics-mastering-core) refuses to do — so here it is once, and the prepared
     // object reports what this returns (pinned in the suites). 0 where prepare() refuses the same
     // arguments, which is how `latencySamples()` reads on an unprepared compressor.
     static int latencyFor (double sampleRate, int maxBlock, int maxChannels,

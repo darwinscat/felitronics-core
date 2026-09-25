@@ -167,8 +167,8 @@ public:
         }
         // Does an oversampler already holding `other` have room for this without asking the heap again?
         // It lives HERE rather than being spelled out field by field at each caller, because a caller's
-        // copy of the list is a copy that can go stale: the one in `MasteringChain::Storage::fitsWithin`
-        // silently omitted `downPos`, and would have omitted `protoPhase` the moment P56 added it.
+        // copy of the list is a copy that can go stale: the one in `MasteringChain::Storage::fitsWithin` (now in
+        // felitronics-mastering-core, and still a caller of this) silently omitted `downPos`, and would have omitted `protoPhase` the moment it was added.
         bool fitsWithin (const Storage& other) const noexcept
         {
             return proto <= other.proto && protoPhase <= other.protoPhase

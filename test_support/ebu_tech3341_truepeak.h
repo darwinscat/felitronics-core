@@ -5,7 +5,7 @@
 
 // EBU Tech 3341-2023 §2.6 / Table 1, true-peak test signals 15-19 — the FIRST external true-peak criterion
 // in this repository. The core holds two independent true-peak paths (felitronics::analysis::TruePeakMeter
-// and, in tools/, fcore::Probe), and they must both answer to the same published envelope, so the signals
+// and the measurement probe, fcore::Probe, in felitronics-mastering-core), and they must both answer to the same published envelope, so the signals
 // live here rather than in either suite: two copies of a specification drift, and a drifted fixture is the
 // exact failure this finding already suffered three times.
 //

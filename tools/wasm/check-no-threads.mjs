@@ -6,7 +6,8 @@
 // and it needs no browser, no server and no wasm-objdump (which is not installed on most machines — the
 // build script's earlier objdump step silently checked nothing).
 //
-// Usage: node check-no-threads.mjs <module.wasm> [glue.js]   — one module (what tools/wasm/build.sh does)
+// Usage: node check-no-threads.mjs <module.wasm> [glue.js]   — one module (what felitronics-mastering-core's
+//                                                              tools/wasm/build.sh does with it)
 //        node check-no-threads.mjs --all <dir>               — every .wasm under dir, each paired with its
 //                                                              sibling .js; one line per module + a summary
 // Exits non-zero if anything thread-shaped is found.

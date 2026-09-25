@@ -128,8 +128,8 @@ inline std::vector<double> magSpectrum (std::span<const double> x, std::size_t n
     // no det::hypot to move it to, and sqrt(norm(z)) is a different function (less accurate, overflows
     // differently), not a rewrite of this one. It stays system because magSpectrum's consumers —
     // analysis/offline/SpectrumCurve and measurement/CaptureGate — are not in a byte diff; the analyzers
-    // that ARE diffed take their magnitudes from SpectrumFrames, which squares and sums and calls no libm
-    // at all. tools/lint/check-det-math.mjs holds this argument in ZONE_EXCEPTIONS, where it has to keep
+    // that ARE diffed (felitronics-mastering-core) take their magnitudes from SpectrumFrames, which squares
+    // and sums and calls no libm at all. tools/lint/check-det-math.mjs holds this argument in ZONE_EXCEPTIONS, where it has to keep
     // being true to stay allowed, and the marker below is what makes it visible at the call itself.
     for (std::size_t i = 0; i < nfft / 2; ++i) m[i] = std::abs (X[i]);   // libm-ok: hypot, see ZONE_EXCEPTIONS
     return m;

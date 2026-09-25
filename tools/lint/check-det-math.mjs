@@ -10,7 +10,8 @@
 // releases later.
 //
 // WHY THIS IS NOT A LIST OF CALL SITES, WHICH IS THE OBVIOUS DESIGN AND THE WRONG ONE.
-// The analyzers whose output is diffed byte-for-byte against the wasm module contain, today, ZERO direct
+// The analyzers whose output is diffed byte-for-byte against the wasm module (felitronics-mastering-core's,
+// linted by this script with --satellite) contained, when this was written, ZERO direct
 // system transcendental calls — all thirty of their transcendental calls already spell `det::` (11 pow10,
 // 11 log10, 4 log2, 2 sin, 1 exp2, 1 cos). Their entire remaining exposure was INDIRECT, through four
 // ordinary-looking functions:
@@ -30,8 +31,8 @@
 //
 // WHY THE ZONE IS A TYPED LIST AND THE CLOSURE IS ONLY A NET. The elegant design is to COMPUTE the zone
 // as the #include closure of the three translation units whose outputs CI diffs, and let it maintain
-// itself. It was tried here and it is wrong, for a reason worth writing down: `fcore_measure` links BOTH
-// regimes into one binary — its `report` mode is the deterministic analyzer and its `master` mode is the
+// itself. It was tried here and it is wrong, for a reason worth writing down: `fcore_measure` (now in
+// felitronics-mastering-core) links BOTH regimes into one binary — its `report` mode is the deterministic analyzer and its `master` mode is the
 // shipped RT chain (DetMath.h says exactly this about it). So the closure sweeps in MatchedBiquad,
 // Compressor, Smoother and EnvelopeFollower — 52 files, most of them TabbyEQ's and OrbitCab's own DSP,
 // whose `std::tan` is their sound and must not be touched. A ban over the closure would have demanded
@@ -220,7 +221,7 @@ const ZONE = new Set([
 // entry is red, and an entry whose marker has gone is red. Two locks, because one of them is a comment.
 const ZONE_EXCEPTIONS = [
     { file: 'modules/core/include/felitronics/core/OfflineFft.h', fn: 'abs', count: 1,
-      why: '`std::abs(std::complex<double>)` IS std::hypot — measured, identical checksums to an explicit hypot on Apple, glibc and musl, and three DIFFERENT checksums between those rows. There is no det::hypot to move it to, and sqrt(norm(z)) is not a rewrite, it is a different (less accurate, differently-overflowing) function. It is recorded rather than converted because magSpectrum feeds analysis/offline/SpectrumCurve and measurement/CaptureGate, neither of which is in a byte diff: the analyzers that ARE diffed take their magnitudes from SpectrumFrames, which uses re*re+im*im and calls no libm at all.' },
+      why: '`std::abs(std::complex<double>)` IS std::hypot — measured, identical checksums to an explicit hypot on Apple, glibc and musl, and three DIFFERENT checksums between those rows. There is no det::hypot to move it to, and sqrt(norm(z)) is not a rewrite, it is a different (less accurate, differently-overflowing) function. It is recorded rather than converted because magSpectrum feeds analysis/offline/SpectrumCurve and measurement/CaptureGate, neither of which is in a byte diff: the analyzers that ARE diffed (felitronics-mastering-core) take their magnitudes from SpectrumFrames, which uses re*re+im*im and calls no libm at all.' },
 ];
 //==============================================================================
 // TWO REPOSITORIES, ONE GATE. felitronics-core owns this script, the carriers and the deterministic floor;
@@ -283,8 +284,9 @@ function sourceFiles (root)
         for (const sub of ['include', 'src'])
         { const p = join(modules, m, sub); try { if (statSync(p).isDirectory()) walk(p, files); } catch { /* module has no such dir */ } }
     // tools/ IS scanned, deliberately and unlike the long-double lint. The parity SURFACE lives there:
-    // tools/fcore_probe.h computes the dBTP that CI diffs, with its own floor and its own log10. A
-    // modules-only audit would have declared that path clean while the printed number was unpinned.
+    // felitronics-mastering-core's tools/fcore_probe.h computes the dBTP that CI diffs, with its own floor
+    // and, once, its own log10. A modules-only audit would have declared that path clean while the printed
+    // number was unpinned.
     for (const p of [join(root, 'tools')]) { try { if (statSync(p).isDirectory()) walk(p, files); } catch {} }
     return files.map (f => relOf(root, f)).filter (f => ! /\/(tests|bench)\//.test (f)).sort();
 }

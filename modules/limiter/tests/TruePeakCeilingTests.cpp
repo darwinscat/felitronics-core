@@ -46,7 +46,7 @@
 //
 // EVERY TRUE-PEAK NUMBER NAMES ITS PATH. The core holds two true-peak designs that disagree on nothing but
 // the sample-grid offset of one band-limited signal (by how much is pinned in
-// felitronics_truepeak_instrument_gap_tests), so a bare "dBTP" is not a measurement. The primary oracle here is `test::tp::truePeakDbFft` — spectral zero-padding, i.e. the
+// felitronics-mastering-core's felitronics_truepeak_instrument_gap_tests), so a bare "dBTP" is not a measurement. The primary oracle here is `test::tp::truePeakDbFft` — spectral zero-padding, i.e. the
 // definition of band-limited reconstruction rather than an implementation of it — cross-checked by an
 // independently designed windowed-sinc reconstruction, and both are validated in-suite against the
 // five analytically-known EBU Tech 3341 Table 1 signals before anything else runs.

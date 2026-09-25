@@ -33,12 +33,11 @@ constexpr int kMaxChannels = 16;
 constexpr int kMaxBlockSize = 8192;
 
 // THE LOWEST SAMPLE RATE THE CORE TAKES AS AUDIO (P51). NOT a size and NOT a tier knob like the two above: a
-// validity floor, and one number for every entry that takes a rate a caller could have got wrong — the loudness
-// search (mastering::TargetLoudnessSolver), the mastering chain and the delivery resampler under the C ABI's
-// `fc_master_create`, the probe ABI's measurers (fcore::Probe, fcore::ShapeProbe and the analysis classes behind
-// it), oversampling::CascadeOversampler (P31) — with it every nonlinear stage prepared under
+// validity floor, and one number for every entry that takes a rate a caller could have got wrong — here
+// core::DeliveryResampler's plan, oversampling::CascadeOversampler — with it every nonlinear stage prepared under
 // oversampling::Topology::Cascade — and since P103 analysis::LoudnessMeter itself (which still reads a rate <= 0 as
-// "not given", 48 kHz). Each keeps its own name for it (`X::kMinSampleRate`), and every one of them is THIS
+// "not given", 48 kHz); downstream, felitronics-mastering-core's loudness search, chain, C ABIs and offline
+// analyzers take the same constant. Each keeps its own name for it (`X::kMinSampleRate`), and every one of them is THIS
 // constant, because the floor used to be three answers to one question: any rate > 0 (the search), whatever the
 // chain's stages happened to refuse (above 50 Hz with the limiter on, 20.4 Hz with only the EQ, nothing without
 // either), and 1000 Hz (the probe and its analyzers, in seven copies). The CEILINGS stay per class, with their own

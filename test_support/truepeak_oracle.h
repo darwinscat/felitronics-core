@@ -33,7 +33,7 @@
 // the truth and LABEL it. Every true-peak number in this repository is required to name the path that
 // produced it, because the core holds two true-peak designs that disagree on nothing more than the
 // sample-grid offset of one band-limited signal — by how much, per material and delivery rate, is pinned by
-// felitronics_truepeak_instrument_gap_tests rather than quoted here.
+// felitronics_truepeak_instrument_gap_tests (felitronics-mastering-core) rather than quoted here.
 //
 // OFFLINE, ALLOCATING, TEST-ONLY. This is not an RT meter and must never be used as one.
 

@@ -60,7 +60,7 @@ public:
         // WHAT preparing a DEFAULT-CONSTRUCTED aligner asks the heap for: each buffer that outgrows the seed
         // is asked for its size, and one that still fits inside the seed is asked for nothing, since `assign`
         // re-uses capacity it already holds. Not an edge nobody reaches — a ONE-channel aligner for a stage
-        // with no latency is a 2-slot ring, i.e. exactly the seed, and the mastering chain builds one for a
+        // with no latency is a 2-slot ring, i.e. exactly the seed, and the mastering chain (felitronics-mastering-core) builds one for a
         // mono compressor whose lookahead rounds to 0 samples. `bytes()` over-stated that preparation by 8 B.
         std::uint64_t freshBytes() const noexcept
         {

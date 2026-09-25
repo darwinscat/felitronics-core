@@ -78,7 +78,7 @@ carries its payload identically on both — which is precisely why the old pinne
 
 ## The test that pinned the defect could not see it
 
-The group in `tools/tests/ProbeTests.cpp` existed to make this behaviour impossible to change unnoticed. It
+The group in `tools/tests/ProbeTests.cpp` (felitronics-mastering-core's now) existed to make this behaviour impossible to change unnoticed. It
 did not notice: its 8192-sample lead-in is 171 ms, shorter than one 400 ms gating block, so `lufsBefore` was
 the −120 no-block sentinel and the "frozen" assertion compared a sentinel with itself. It passed both before
 and after the behaviour changed. It is rewritten around a fixture long enough to have a reading, and the

@@ -354,7 +354,7 @@ public:
     // ledgers, the dynamic seams and the design-key caches. What a STOP needs — a stage that is skipped for
     // a while and comes back must not re-emit audio from before the gap, but it is still the same stream and
     // the same parameter trajectory, so the smoothers, the targets and the grid phase are none of its
-    // business. This is the operation `MasteringChain` and OrbitCab reach for at a bypass edge, and it is
+    // business. This is the operation `MasteringChain` (felitronics-mastering-core) and OrbitCab reach for at a bypass edge, and it is
     // the granularity P18 settled on inside this file: a stop clears signal memory, only an explicit
     // reset() restarts the parameter epoch.
     void clearAudioState() noexcept

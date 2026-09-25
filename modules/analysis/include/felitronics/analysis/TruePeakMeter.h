@@ -47,15 +47,15 @@ namespace detail
 // and they beat against the baseband term. Measured consequence on the official EBU inter-sample transient
 // files (tests 20-23, which are ONE band-limited signal at four sample-grid offsets, so a shift-invariant
 // meter must read one number): this meter reads −0.130 / −0.084 / −0.217 / −0.084, a spread of 0.13 dB,
-// where tools/fcore_probe.h's longer 0.90 × Nyquist design spreads 0.0001. All four pass, and the spread is
+// where ReferenceTruePeakMeter's longer 0.90 × Nyquist design spreads 0.0001. All four pass, and the spread is
 // not a correctness bug, but it is why the two designs disagree and it belongs in any decision to merge them.
 //
 // NOT THE INSTRUMENT A DELIVERED PROMISE IS AIMED WITH. A file promised "<= X dBTP" is certified by
-// `analysis::ReferenceTruePeakMeter` (what `fcore_measure` and the browser's `fc_probe` report), and a solver that
+// `analysis::ReferenceTruePeakMeter` (what the measurement probe reports), and a solver that
 // aimed with this meter instead certified its own reading rather than the delivered one: at 2x (88.2-176.4 kHz)
 // this meter evaluates the samples and the two quarter-sample points, at 1x (>= 176.4 kHz) the samples alone, so on
 // bright material it reads under the reference by more than any sane aim margin. How far, on which material and at
-// which rate, is pinned by felitronics_truepeak_instrument_gap_tests — the only owner of that number. This meter
+// which rate, is pinned by felitronics_truepeak_instrument_gap_tests (felitronics-mastering-core) — the only owner of that number. This meter
 // stays the spec's filter and stays cheap; it is the right one for a live display and the wrong one for a promise.
 //
 // BS.1770-4 specifies a particular table; the Recommendation also allows an equivalent filter, so we DESIGN

@@ -414,8 +414,9 @@ namespace felitronics::core
 // BasicSvf<core::DetMath> where it wants reproducibility.
 //
 // There is deliberately NO default on the offline side and no runtime switch: a compile-time flag would
-// reroute every consumer in a build at once (and fcore_measure links both regimes into ONE binary — its
-// `lufs` mode is the system meter and its `report` mode is the deterministic one), while a
+// reroute every consumer in a build at once (and a measurement CLI links both regimes into ONE binary —
+// felitronics-mastering-core's fcore_measure: its `lufs` mode is the system meter and its `report` mode is the
+// deterministic one), while a
 // setParamsDet() would be a second copy of the coefficient formula, which is the drift these policies
 // exist to prevent. static_assert in the suites pins both directions, so changing an alias is a
 // deliberate act that must also edit a test.

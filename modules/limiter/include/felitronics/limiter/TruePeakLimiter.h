@@ -202,7 +202,7 @@ struct TruePeakLimiterTap
 //     2fs/5 before delivery, which left fs/3 (+1.250 / +0.302 / +0.076) worst by default. The pass band
 //     is flat there now, so the tone reaches the output and the 4× and 8× figures rise by 0.135 and
 //     0.032 dB. Read that correctly: the old numbers were not a property of the limiter, they were a
-//     property of its lowpass, and hiding the term is not the same as not having it — `mastering` has
+//     property of its lowpass, and hiding the term is not the same as not having it — the mastering chain has
 //     run at 64 taps, and therefore at +0.436, since it was written. A sweep of every fs·p/q with
 //     q ≤ 64 below 0.46 fs, net of the round-trip droop, confirms 2fs/5 is the maximum and that it
 //     holds at every taps count anything here uses (64, 80, 96, 128, 256 all give +0.436 at 4×), but NOT
@@ -381,7 +381,7 @@ public:
     }
 
     // THE EFFECTIVE FACTOR, in one place: a requested 1 becomes 2, and anything above kMaxFactor was
-    // refused before this is asked. `MasteringChain` reads this to size a tap buffer without a limiter in
+    // refused before this is asked. A composite (felitronics-mastering-core's `MasteringChain`) reads this to size a tap buffer without a limiter in
     // hand, and reading it back off a prepared limiter has to give the same answer (pinned).
     static int oversampleFactorFor (const TruePeakLimiterConfig& config) noexcept
     {
@@ -411,7 +411,7 @@ public:
     }
 
     // THE LATENCY a prepared limiter will report for this geometry, without preparing one: the
-    // oversampler's round trip plus the lookahead. `MasteringChain` sizes its dry aligner from the
+    // oversampler's round trip plus the lookahead. A composite (`MasteringChain`, felitronics-mastering-core) sizes its dry aligner from the
     // latency it READS BACK off the stage, and this is how a budget reaches the same number without a
     // second derivation of it. 0 where prepare() refuses the same arguments.
     static int latencyFor (double sampleRate, int maxBlock, int maxChannels,

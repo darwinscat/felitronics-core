@@ -4,8 +4,9 @@
 //==================================================================================================
 // LAW 11 (DSP-ARCHITECTURE.md §2) — the property harness of CallContractTests: the fixture helpers,
 // the ADAPT macro that describes a stage, and the seven properties P1–P7 swept by allProperties<A>().
-// Moved out of modules/mastering/tests/CallContractTests.cpp verbatim, so felitronics-guitar-core
-// sweeps its stages with the SAME properties instead of a copy that could drift. The census of
+// Moved out of the census, CallContractTests.cpp (now modules/laws/tests/), verbatim, so the satellite
+// repositories (felitronics-guitar-core, felitronics-mastering-core) sweep their stages with the SAME
+// properties instead of a copy that could drift. The census of
 // stages and the named cases stay with each repository's own suite.
 //
 // Include in ONE translation unit per executable, then `using namespace felitronics::test::law11;`.

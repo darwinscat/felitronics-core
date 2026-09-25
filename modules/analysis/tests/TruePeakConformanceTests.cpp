@@ -7,7 +7,7 @@
 // published acceptance envelope that no one here wrote.
 //
 // The signals, the amplitudes, the taper, the budget and the reasons for each live in one place, shared with
-// the fcore::Probe suite so the two cannot drift: test_support/ebu_tech3341_truepeak.h. Read it first.
+// the probe's suite (felitronics-mastering-core) so the two cannot drift: test_support/ebu_tech3341_truepeak.h. Read it first.
 //
 // Four assertions per case, and they answer four different questions:
 //   1. the EBU envelope, target +0.2/-0.4 — "would this meter pass the formal test?";

@@ -5,9 +5,10 @@
 //
 // The decisive group is the first: the class IS `oversampling::PolyphaseOversampler` at 4x / 32 taps per phase,
 // one per channel, maximum of |x| over the 4x stream, floored at the sample peak, drained with 32 zeros — the
-// arithmetic `fcore::Probe` ran by hand before P62 — recomputed here by hand and compared BIT FOR BIT. A
-// reference that is merely close to itself is not a reference. How far it reads from the OTHER meter is
-// felitronics_truepeak_instrument_gap_tests' question; law 11 is felitronics_call_contract_tests'.
+// arithmetic the measurement probe (`fcore::Probe`) ran by hand before it moved into this class — recomputed here by hand and
+// compared BIT FOR BIT. A reference that is merely close to itself is not a reference. How far it reads from
+// the OTHER meter is felitronics_truepeak_instrument_gap_tests' question (felitronics-mastering-core); law 11
+// is felitronics_call_contract_tests'.
 
 #include <felitronics_test.h>
 #include <alloc_counter.h>   // installs the allocation counter: EVERY form of `new`, over-aligned included
@@ -140,7 +141,7 @@ int main()
         test::ok (m.truePeakLinear() == drained, "one more drain moves nothing: the ring is already silence");
     }
 
-    // The example TargetLoudnessSolver's measuring-rig comment quotes: a programme ending `..., 0, 1, 1`.
+    // The example the loudness solver's measuring-rig comment quotes (felitronics-mastering-core): a programme ending `..., 0, 1, 1`.
     test::group ("a programme ending on [0, 1, 1] reads +0 dBTP undrained and +1.833993 dBTP drained");
     {
         std::vector<std::vector<float>> x (1, std::vector<float> (64, 0.0f));

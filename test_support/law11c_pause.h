@@ -4,7 +4,7 @@
 //==================================================================================================
 // LAW 11c ("a pause is silence") — the shared fixture helpers of PauseIsSilenceTests: the gap lengths,
 // the bit comparisons, the drain to exact rest and the charging tone. Moved out of
-// modules/mastering/tests/PauseIsSilenceTests.cpp verbatim, so felitronics-guitar-core tests its
+// PauseIsSilenceTests.cpp (now modules/laws/tests/) verbatim, so felitronics-guitar-core tests its
 // address of the law (poweramp::PowerAmpStage) with the SAME fixtures instead of a copy that could drift.
 //
 // Include in ONE translation unit per executable, then `using namespace felitronics::test::law11c;`.

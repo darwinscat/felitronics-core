@@ -263,8 +263,9 @@ namespace felitronics::test::alloc
     // line that is missing in exactly the places hardest to notice is not evidence.
     //
     // ⚠ STDERR, AND THAT IS LOAD-BEARING. A test binary's stdout is a DATA channel for whoever runs it:
-    // `felitronics_analysis_abi_tests --storage-table` writes 425 rows of published demand there, and CI
-    // compares them BYTE FOR BYTE against the same table off the wasm module (P81's cross-tier gate).
+    // `felitronics_analysis_abi_tests --storage-table` (felitronics-mastering-core) writes rows of published
+    // demand there, and CI compares them BYTE FOR BYTE against the same table off the wasm module (the storage
+    // price's cross-tier gate).
     // Announcing on stdout put this line at byte 1 of that file and the gate failed on the first byte —
     // the instrument's own proof of health corrupting the answer it was measuring. Diagnostics go to
     // stderr; the run's result goes to stdout. The verify() failure above follows the same rule.
@@ -282,7 +283,7 @@ namespace felitronics::test::alloc
         if (align != 0) alignedCount.fetch_add (1, std::memory_order_relaxed);
         // RAW for an over-aligned request, corrected otherwise. kStlBigPad undoes what MSVC's STL adds ON
         // TOP of a container's request; an over-aligned `new` in this tree is an OBJECT whose size is
-        // exactly `sizeof`, and taking the correction off it subtracts bytes nobody ever added. The `win`
+        // exactly `sizeof`, and taking the correction off it subtracts bytes nobody ever added. The MSVC
         // row found that, on the mastering chain: 339 072 read as 339 033, and 88 budget rows with it.
         bytes.fetch_add (align != 0 ? (long long) s : containerBytes (s), std::memory_order_relaxed);
         rawBytes.fetch_add ((long long) s, std::memory_order_relaxed);
@@ -323,8 +324,8 @@ namespace felitronics::test::alloc
        #endif
         // A THROWING allocation function may not return null — it reports failure by throwing, and a caller
         // is entitled to dereference what it got back. Returning null there turns an out-of-memory into a
-        // null dereference somewhere else entirely; SourceForensicsTests.cpp's own counter says so and this
-        // keeps it. Where there are no exceptions (the `wasm-audio` tier) the honest answer is the abort.
+        // null dereference somewhere else entirely; the private counter SourceForensicsTests.cpp once carried
+        // said so and this keeps it. Where there are no exceptions (the `wasm-audio` tier) the honest answer is the abort.
         if (p == nullptr && ! nothrow)
         {
            #if defined(__cpp_exceptions) || defined(_CPPUNWIND)

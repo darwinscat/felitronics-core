@@ -34,7 +34,7 @@ enum class Topology { Kaiser, Cascade };
 //
 // THE CASCADE LIVES ON THE HEAP, and only when it is chosen. Held by value it added about half a kilobyte
 // (sizeof (CascadeOversampler)) to every Saturator and TruePeakLimiter whether or not anyone asked for it,
-// and twice that to a MasteringChain — a change to the default. A vector of zero or one keeps the switch
+// and twice that to a MasteringChain (felitronics-mastering-core) — a change to the default. A vector of zero or one keeps the switch
 // copyable and costs the Kaiser path 32 bytes (sizeof (Oversampler) 200 against 168; Saturator 432 -> 464,
 // TruePeakLimiter 408 -> 440, MasteringChain 18016 -> 18080 on arm64); the object it allocates is counted
 // in Storage::heapObjects, so a stage's published budget still equals what its prepare() asks for.
