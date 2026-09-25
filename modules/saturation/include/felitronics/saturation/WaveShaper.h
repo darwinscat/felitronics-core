@@ -35,6 +35,23 @@ public:
 
     float drive() const noexcept { return drive_; }
 
+    // THE CURVE'S FOUR COEFFICIENTS, and the curve evaluated at explicit ones. `processSample()` reads the
+    // members; `shapeAt<S>()` is the SAME arithmetic, operand for operand, with the coefficients handed in —
+    // for a caller that moves them per sample (the Saturator's parameter glide interpolates them between two
+    // designed sets). At the coefficients `coeffs()` returns it is `processSample()` exactly. Additive: nothing
+    // above changes, and a consumer that never calls these gets the curve it always had.
+    struct Coeffs { float drive = 1.0f, bias = 0.0f, biasTanh = 0.0f, norm = 1.0f; };
+    Coeffs coeffs() const noexcept { return { drive_, bias_, biasTanh_, norm_ }; }
+
+    template <Shape S>
+    static float shapeAt (const Coeffs& c, float x) noexcept
+    {
+        if constexpr (S == Shape::Tanh)       return std::tanh (c.drive * x) * c.norm;
+        else if constexpr (S == Shape::Atan)  return std::atan (c.drive * x) * c.norm;
+        else if constexpr (S == Shape::Cubic) return cubicClip (c.drive * x) * c.norm;
+        else                                  return (std::tanh (c.drive * (x + c.bias)) - c.biasTanh) * c.norm;
+    }
+
     // d y / d x at x = 0 — the small-signal gain. The Saturator uses it for drive-compensation
     // (auto-gain = slopeAtZero^(-amount)) so turning up drive doesn't change the low-level loudness.
     float slopeAtZero() const noexcept

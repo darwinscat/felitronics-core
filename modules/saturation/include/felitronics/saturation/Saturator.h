@@ -9,6 +9,7 @@
 #include <felitronics/core/Config.h>
 #include <felitronics/core/DelayLine.h>
 #include <felitronics/core/Math.h>
+#include <felitronics/core/StateGrid.h>
 
 #include <algorithm>
 #include <cmath>
@@ -31,10 +32,16 @@ namespace felitronics::saturation
 // with drive, and the dry/wet blend is LINEAR (convex combination of bounded signals → peak-safe). Place it
 // BEFORE the loudness gain + final limiter.
 //
-// RT-safe: prepare() does all allocation; process() is alloc/lock/throw-free, in place. Params apply per
-// block (mastering params are near-static; a parameter smoother can wrap setParams() for automation). n
-// may exceed the maxBlock passed to prepare() — process() chunks internally, state carries across chunks.
-// With oversampling the stage reports a round-trip latency.
+// RT-safe: prepare() does all allocation; process() is alloc/lock/throw-free, in place. n may exceed the
+// maxBlock passed to prepare() — process() chunks internally, state carries across chunks. With oversampling
+// the stage reports a round-trip latency.
+//
+// PARAMETERS GLIDE — and the first write of a stream SNAPS. See `kGlideMs` for the rule, the clock and the
+// number it was chosen by. In one line: a write that moves drive, bias, auto-compensation, mix or output trim
+// starts a linear parameter-space ramp on the 64-sample `core::StateGrid`, and the curve's coefficients are
+// interpolated per sample between two designed sets, so no knob steps the output; a write before the first
+// sample after prepare()/reset() applies at once, exactly as setParams() always did. `shape` and `dcBlockHz`
+// are not continuous and land at once, as they always did (a shape change snaps every parameter with it).
 //
 // THE OVERSAMPLER IS A CHOICE (P31), made at prepare(): `Topology::Kaiser` (the default, and the only one
 // for a factor that is not a power of two) is PolyphaseOversampler — cutoff fixed at 0.45 fs, round trip
@@ -170,6 +177,11 @@ public:
         // prepare(2) -> process -> prepare(1) -> process. prepare() does not call reset(), so this cannot
         // be left to reset() to do.
         ranNc_ = ranDcNc_ = 0;
+        // The glide restarts with the stream, in the rate's own units: kGlideMs in 64-sample grid periods.
+        glideTicks_ = ticksFor (sampleRate, glideMs_);
+        snapGlide();
+        grid_.reset();
+        fresh_ = true;
         prepared_ = true;                                              // fully built — process() may now run
         return true;
     }
@@ -181,6 +193,12 @@ public:
         std::fill (dcY1_.begin(), dcY1_.end(), 0.0f);
         for (auto& d : dryDelay_) d.reset();
         ranNc_ = ranDcNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedCells)
+        // A STREAM RESTART LANDS EVERY GLIDE on its target and re-anchors the grid, and the next write snaps:
+        // a restart that resumed a ramp would make a second render of the same programme start somewhere else.
+        if (glideActive()) applyParams();
+        snapGlide();
+        grid_.reset();
+        fresh_ = true;
     }
 
     int  latencySamples() const noexcept { return os_ > 1 ? ovs_.latencySamples() : 0; }
@@ -192,7 +210,65 @@ public:
         return oversampleFactor > 1 && tapsPerPhase > 0 ? tapsPerPhase - 1 : 0;
     }
 
-    void setParams (const Params& p) noexcept { params_ = p; applyParams(); }
+    // THE GLIDE. A write that changes a CONTINUOUS parameter — driveDb, bias, autoComp, mix, outputDb — does not
+    // apply at once: it becomes a target, and at the next `core::StateGrid` boundary (64 samples of audio time) a
+    // linear ramp in PARAMETER space starts toward it, `glideTicks()` boundaries long. At each boundary the curve
+    // is DESIGNED at the ramp's next point (the same WaveShaper + drive-compensation arithmetic as a settled
+    // stage), and inside the period every coefficient — k, bias, tanh(k·b) and the peak normaliser in the
+    // oversampled loop; drive-compensation, mix and trim at base rate — is interpolated per sample between the
+    // two designed sets. So the output moves continuously, and the transcendental cost of a glide is one design
+    // per 64 samples, not one per sample.
+    //
+    // WHY, measured on a -12 dBFS 227 Hz sine through the chain (K = 128), max|Δ²y| where the change reaches
+    // the output against -67.2 dBFS for the steady saturated tone: driveDb 3 -> 9 was -18.3 dBFS as a step and
+    // 3 -> 3.5, a small knob move, -44.6. The length was chosen against those two and the other continuous
+    // parameters — see the item's note in CHANGELOG.
+    //
+    // CLOCKED BY AUDIO SAMPLES, NEVER BY CALLS (law 8a): the ramp steps on the grid, and a coefficient inside a
+    // period is a function of the sample's index in it, so a stream cut any other way — whole, per sample, around
+    // maxBlock — renders the same bits for the same event timeline. A clock-only call (nch == 0) spends the same
+    // audio time on the glide. It changes no latency and allocates nothing.
+    //
+    // SNAPPED, NOT RAMPED, before the first sample of a stream: every write between prepare()/reset() and the
+    // first accepted call with samples applies at once — so a stage whose parameters were set before its first
+    // sample renders exactly what it rendered before the glide existed, which is the whole offline contract of
+    // the mastering chain above it. A write that changes nothing continuous costs a comparison (it used to cost
+    // a full re-design), so a caller that re-sends its parameters every block does not pay for the glide.
+    // `shape` is a topology switch and SNAPS every parameter with it; `dcBlockHz` is a filter coefficient and
+    // lands at once, as both always did.
+    static constexpr double kGlideMs = 30.0;
+
+    // THE GLIDE LENGTH IS THE CALLER'S TO CHANGE, and 0 turns it off: every write then lands at once, which is
+    // the stage exactly as it was before the glide existed, bit for bit (pinned against the frozen pre-change
+    // engine in the suite). A product with its own parameter smoothing, or one that wants a hard step, says 0.
+    // Takes effect for the next write; a glide in progress when it is set to 0 lands at once. Non-finite or
+    // negative is 0. RT-safe; call it from the thread that calls setParams().
+    void setGlideMs (double ms) noexcept
+    {
+        glideMs_ = (std::isfinite (ms) && ms > 0.0) ? ms : 0.0;
+        glideTicks_ = ticksFor (fs_, glideMs_);
+        if (glideTicks_ == 0 && glideActive()) { applyParams(); snapGlide(); }
+    }
+    double glideMs() const noexcept { return glideMs_; }
+
+    void setParams (const Params& p) noexcept
+    {
+        const bool shapeMoved = p.shape != params_.shape;
+        params_ = p;
+        if (fresh_ || shapeMoved || glideTicks_ == 0) { applyParams(); snapGlide(); return; }
+        applyDc();                                                       // a coefficient: lands at once
+        float t[kNumP];
+        targetOf (params_, t);
+        if (std::equal (t, t + kNumP, pt_)) return;                      // nothing continuous moved
+        std::copy (t, t + kNumP, pt_);
+        pending_ = true;                                                 // the ramp starts at the next boundary
+    }
+
+    // How many grid periods a glide takes at the prepared rate: glideMs() / 64 samples, rounded, at least 1 —
+    // or 0 when the glide is off (or before prepare()).
+    int  glideTicks() const noexcept { return glideTicks_; }
+    // True while a written parameter has not landed: a target waiting for the grid, or a ramp in progress.
+    bool isGliding() const noexcept { return glideActive(); }
 
     // In place, planar. RT-safe. n may exceed maxBlock — chunked internally, fully processed.
     // Law 11 (DSP-ARCHITECTURE.md §2). The width used to be clamped and the surplus left BIT-IDENTICAL to
@@ -204,9 +280,10 @@ public:
         if (! prepared_) return false;                                   // unprepared / failed-prepare → no OOB
         if (numChannels > channels_) return false;                       // width is a LIMIT — law 11(b)
         if (n == 0) return true;                                         // no samples: no time, no edge
+        fresh_ = false;                                                  // the stream has started: writes glide now
         const int nc = numChannels;
         dropStoppedCells (nc);                                           // law 11(d): the edge is clocked by n
-        if (nc == 0) return true;
+        if (nc == 0) { advanceClock (n); return true; }                  // a pause is audio time for the glide too
         // Chunk to maxBlock so a caller passing n > maxBlock is FULLY processed instead of silently
         // dropped. State carries across chunks via the members → bit-identical to one big call.
         // maxBlock_ ≥ 1 whenever prepared_ (prepare() rejects less), so the loop always advances.
@@ -215,13 +292,171 @@ public:
         {
             const int m = std::min (n - off, maxBlock_);
             for (int c = 0; c < nc; ++c) sub[c] = io[c] + off;
-            processChunk (sub, nc, m);
+            runChunk (sub, nc, m);
             off += m;                                                    // `off += maxBlock_` could step past INT_MAX
         }
         return true;
     }
 
 private:
+    //==========================================================================================================
+    // THE GLIDE MACHINERY — see kGlideMs for the contract.
+    enum { kDrive, kBias, kAutoComp, kMix, kOutDb, kNumP };
+
+    // The continuous parameters as the stage uses them: non-finite -> the struct default (the house rule),
+    // autoComp and mix clamped to [0, 1]. The ramp runs in THIS space, so it never spends time past a clamp.
+    static void targetOf (const Params& p, float* t) noexcept
+    {
+        t[kDrive]    = finite (p.driveDb,  3.0f);
+        t[kBias]     = finite (p.bias,     0.0f);
+        t[kAutoComp] = std::clamp (finite (p.autoComp, 0.5f), 0.0f, 1.0f);
+        t[kMix]      = std::clamp (finite (p.mix,      1.0f), 0.0f, 1.0f);
+        t[kOutDb]    = finite (p.outputDb, 0.0f);
+    }
+
+    // Everything the audio loops read, at one point of the parameter space.
+    struct Consts { WaveShaper::Coeffs sh {}; float comp = 1.0f, mix = 1.0f, out = 1.0f; };
+
+    // THE DESIGN — the one arithmetic both the settled stage and every glide point use, so a glide that lands
+    // hands over to the settled path on the very floats it arrived with. A WaveShaper's coefficients are a pure
+    // function of (shape, bias, drive): the three setters below leave it where applyParams() leaves `shaper_`.
+    Consts design (const float* v, WaveShaper& w) const noexcept
+    {
+        w.setShape (params_.shape);
+        w.setBias  (v[kBias]);
+        w.setDrive ((float) (core::dbToGain (v[kDrive]) - 1.0));    // driveDb 0 → k≈0 (linear)
+        Consts c;
+        c.sh   = w.coeffs();
+        c.comp = (float) std::pow ((double) std::max (1.0e-6f, w.slopeAtZero()), (double) -v[kAutoComp]);
+        c.mix  = v[kMix];
+        c.out  = (float) core::dbToGain (v[kOutDb]);
+        return c;
+    }
+
+    Consts settled() const noexcept { Consts c; c.sh = shaper_.coeffs(); c.comp = comp_; c.mix = mix_; c.out = outGain_; return c; }
+
+    bool glideActive() const noexcept { return pending_ || ticksLeft_ > 0 || interp_; }
+
+    static int ticksFor (double fs, double ms) noexcept
+    {
+        if (! (ms > 0.0) || ! (fs > 0.0)) return 0;
+        return std::max (1, (int) std::lround (ms * 1.0e-3 * fs / (double) core::StateGrid::kPeriod));
+    }
+
+    // The stream's parameters ARE the written ones: no target waits, no ramp runs, the vector sits on it.
+    void snapGlide() noexcept
+    {
+        targetOf (params_, pt_);
+        for (int i = 0; i < kNumP; ++i) pv_[i] = (double) pt_[i];
+        pending_ = false; ticksLeft_ = 0; interp_ = false;
+    }
+
+    // ONE GRID BOUNDARY of a glide. The period that starts here interpolates from where the last one ended
+    // (`ce_`, or the settled design when no ramp was running) to the design at the ramp's next point. A target
+    // written since the last boundary restarts the ramp from the point it stands on, so a retarget never jumps.
+    // When the ramp has landed, the boundary after its last period hands over to the settled path — on the same
+    // floats, because `design()` is applyParams()'s own arithmetic.
+    void tick() noexcept
+    {
+        const Consts start = interp_ ? ce_ : settled();
+        if (pending_)
+        {
+            pending_   = false;
+            ticksLeft_ = glideTicks_;
+            for (int i = 0; i < kNumP; ++i) pd_[i] = ((double) pt_[i] - pv_[i]) / (double) glideTicks_;
+        }
+        if (ticksLeft_ > 0)
+        {
+            --ticksLeft_;
+            // IN DOUBLE, and landing on the target itself: the ramp ACCUMULATES, and a float accumulator drifts
+            // by ~ticks·ulp/2 — at a few MHz enough to overshoot a small target before the last step lands it.
+            float v[kNumP];
+            for (int i = 0; i < kNumP; ++i)
+            {
+                pv_[i] = ticksLeft_ > 0 ? pv_[i] + pd_[i] : (double) pt_[i];
+                v[i]   = (float) pv_[i];
+            }
+            WaveShaper w;
+            cs_ = start;
+            ce_ = design (v, w);
+            // Per-sample increments over one period: os samples for the curve, base samples for the rest.
+            const float nOs = (float) (core::StateGrid::kPeriod * os_), nB = (float) core::StateGrid::kPeriod;
+            dK_  = (ce_.sh.drive    - cs_.sh.drive)    / nOs;
+            dB_  = (ce_.sh.bias     - cs_.sh.bias)     / nOs;
+            dBt_ = (ce_.sh.biasTanh - cs_.sh.biasTanh) / nOs;
+            dN_  = (ce_.sh.norm     - cs_.sh.norm)     / nOs;
+            dC_  = (ce_.comp - cs_.comp) / nB;
+            dM_  = (ce_.mix  - cs_.mix)  / nB;
+            dO_  = (ce_.out  - cs_.out)  / nB;
+            interp_ = true;
+            return;
+        }
+        interp_ = false;
+        applyParams();                                                   // the target, on ce_'s own floats
+    }
+
+    // A whole ≤ maxBlock slice. Settled, it is one pass exactly as before the glide existed; gliding, it is cut at
+    // the grid so each piece lies inside one period and knows its place in it.
+    void runChunk (float* const* io, int nc, int m) noexcept
+    {
+        if (! glideActive()) { processChunk (io, nc, m); grid_.skip (m); return; }
+        float* sub[core::kMaxChannels];
+        for (int o = 0; o < m; )
+        {
+            if (grid_.phase() == 0 && glideActive()) tick();
+            const int seg = grid_.segment (m - o);
+            for (int c = 0; c < nc; ++c) sub[c] = io[c] + o;
+            if (interp_) processChunkGlide (sub, nc, seg, grid_.phase());
+            else         processChunk (sub, nc, seg);
+            grid_.advance (seg);
+            o += seg;
+        }
+    }
+
+    // A clock-only call: the same boundaries a call with audio would have met.
+    void advanceClock (int n) noexcept
+    {
+        if (! glideActive()) { grid_.skip (n); return; }
+        for (int o = 0; o < n; )
+        {
+            if (grid_.phase() == 0 && glideActive()) tick();
+            const int seg = grid_.segment (n - o);
+            grid_.advance (seg);
+            o += seg;
+        }
+    }
+
+    // The interpolated curve over one os-rate run starting at os index `r0` of the period: every coefficient is
+    // `start + d * index`, the product and the sum in SEPARATE statements so `-ffp-contract=on` fuses neither
+    // (law 10) — the value is a function of the index alone, never of an accumulator a cut could reset.
+    template <WaveShaper::Shape S>
+    void shapeGlide (float* b, int osN, int r0, int c) noexcept
+    {
+        const bool dc = dcEnabled_;
+        float x1 = dc ? dcX1_[(std::size_t) c] : 0.0f, y1 = dc ? dcY1_[(std::size_t) c] : 0.0f;
+        for (int i = 0; i < osN; ++i)
+        {
+            const float r = (float) (r0 + i);
+            const float ek = dK_ * r, eb = dB_ * r, et = dBt_ * r, en = dN_ * r;
+            WaveShaper::Coeffs k;
+            k.drive = cs_.sh.drive + ek; k.bias = cs_.sh.bias + eb; k.biasTanh = cs_.sh.biasTanh + et; k.norm = cs_.sh.norm + en;
+            const float w = WaveShaper::shapeAt<S> (k, b[i]);
+            if (dc)
+            {
+                const float d = w - x1 + dcR_ * y1;                      // the settled loop's DC blocker, verbatim
+                x1 = w;
+                y1 = (std::fabs (d) < 1e-30f) ? 0.0f : d;
+                b[i] = y1;
+            }
+            else b[i] = w;
+        }
+        if (dc)
+        {
+            dcX1_[(std::size_t) c] = std::isfinite (x1) ? x1 : 0.0f;
+            dcY1_[(std::size_t) c] = std::isfinite (y1) ? y1 : 0.0f;
+        }
+    }
+
     // Clear the sample memory of every cell that ran on the previous accepted call and does not run on this
     // one. A channel that leaves and RETURNS is the case: its oversampler FIR, its DC blocker and its dry
     // delay are frozen, not decayed, and it replays them into a stream that has moved on — measured 0.9337
@@ -345,22 +580,73 @@ private:
         }
     }
 
+    // processChunk() for a slice INSIDE ONE GLIDING GRID PERIOD, starting at base index `ph0` of it: the same
+    // gate, the same oversampler, the same DC blocker and the same dry path, with the curve's coefficients and
+    // comp/mix/trim interpolated per sample (see shapeGlide). A separate function on purpose: the settled slice
+    // above is left exactly as it was, code and all, so a stage that is not gliding pays nothing for this one.
+    void processChunkGlide (float* const* io, int nc, int n, int ph0) noexcept
+    {
+        if (n <= 0) return;
+        const int osN = n * os_;
+        for (int c = 0; c < nc; ++c)
+        {
+            osPtrs_[(std::size_t) c]  = &osBuf_[(std::size_t) c * (std::size_t) (maxBlock_ * os_)];
+            wetPtrs_[(std::size_t) c] = &wetBuf_[(std::size_t) c * (std::size_t) maxBlock_];
+        }
+        for (int c = 0; c < nc; ++c)
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = io[c][i];
+                io[c][i] = std::clamp (std::isfinite (v) ? v : 0.0f, -1.0e6f, 1.0e6f);
+            }
+        if (os_ > 1) ovs_.upsample (io, nc, n, osPtrs_.data());
+        else for (int c = 0; c < nc; ++c) std::copy (io[c], io[c] + n, osPtrs_[(std::size_t) c]);
+        for (int c = 0; c < nc; ++c)
+        {
+            float* b = osPtrs_[(std::size_t) c];
+            switch (params_.shape)
+            {
+                case WaveShaper::Shape::Tanh:  shapeGlide<WaveShaper::Shape::Tanh>  (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Atan:  shapeGlide<WaveShaper::Shape::Atan>  (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Cubic: shapeGlide<WaveShaper::Shape::Cubic> (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Asym:  shapeGlide<WaveShaper::Shape::Asym>  (b, osN, ph0 * os_, c); break;
+            }
+        }
+        if (os_ > 1) ovs_.downsample (osPtrs_.data(), nc, n, wetPtrs_.data());
+        else for (int c = 0; c < nc; ++c) std::copy (osPtrs_[(std::size_t) c], osPtrs_[(std::size_t) c] + n, wetPtrs_[(std::size_t) c]);
+        for (int c = 0; c < nc; ++c)
+        {
+            core::DelayLine& dl = dryDelay_[(std::size_t) c];
+            for (int i = 0; i < n; ++i)
+            {
+                const float j = (float) (ph0 + i);
+                const float ec = dC_ * j, em = dM_ * j, eo = dO_ * j;         // separate statements: law 10
+                const float comp = cs_.comp + ec, mix = cs_.mix + em, out = cs_.out + eo;
+                const float dry = dl.process (io[c][i]);
+                const float wet = comp * wetPtrs_[(std::size_t) c][i];
+                io[c][i] = out * ((1.0f - mix) * dry + mix * wet);
+            }
+        }
+    }
+
     static float finite (float v, float fallback) noexcept { return std::isfinite (v) ? v : fallback; }
 
+    // The SETTLED design, at the written parameters. Non-finite params fall back to the struct defaults (house
+    // rule) — std::clamp passes NaN through. `design()` is the arithmetic, shared with every glide point.
     void applyParams() noexcept
     {
-        // Non-finite params fall back to the struct defaults (house rule) — std::clamp passes NaN through.
-        const float driveDb  = finite (params_.driveDb,   3.0f);
-        const float bias     = finite (params_.bias,      0.0f);
-        const float autoComp = finite (params_.autoComp,  0.5f);
-        const float dcHz     = finite (params_.dcBlockHz, 10.0f);
-        shaper_.setShape (params_.shape);
-        shaper_.setBias  (bias);
-        shaper_.setDrive ((float) (core::dbToGain (driveDb) - 1.0));    // driveDb 0 → k≈0 (linear)
-        comp_    = (float) std::pow ((double) std::max (1.0e-6f, shaper_.slopeAtZero()),
-                                     (double) -std::clamp (autoComp, 0.0f, 1.0f));
-        mix_     = std::clamp (finite (params_.mix, 1.0f), 0.0f, 1.0f);
-        outGain_ = (float) core::dbToGain (finite (params_.outputDb, 0.0f));
+        float t[kNumP];
+        targetOf (params_, t);
+        const Consts c = design (t, shaper_);
+        comp_    = c.comp;
+        mix_     = c.mix;
+        outGain_ = c.out;
+        applyDc();
+    }
+
+    void applyDc() noexcept
+    {
+        const float dcHz = finite (params_.dcBlockHz, 10.0f);
         const double fsOs = fs_ * (double) os_;
         const double fc   = std::clamp ((double) dcHz, 0.0, 0.49 * fsOs);
         dcR_ = (fc <= 0.0) ? 0.0f : (float) std::exp (-2.0 * core::kPi * fc / fsOs);
@@ -376,6 +662,18 @@ private:
     float  comp_ = 1.0f, dcR_ = 0.0f, mix_ = 1.0f, outGain_ = 1.0f;
     bool   dcEnabled_ = false;
     bool   prepared_  = false;                             // true only after a fully-successful prepare()
+
+    // The glide (see kGlideMs). `pv_` is the parameter vector at the last grid boundary, `pt_` the target, `pd_`
+    // the ramp's per-boundary step; `cs_`/`ce_` the designs the current period interpolates between, and the
+    // d*_ members their per-sample increments (os rate for the curve, base rate for comp/mix/trim).
+    core::StateGrid grid_;
+    double glideMs_ = kGlideMs;
+    int    glideTicks_ = 0, ticksLeft_ = 0;
+    bool   fresh_ = true, pending_ = false, interp_ = false;
+    double pv_[kNumP] {}, pd_[kNumP] {};
+    float  pt_[kNumP] {};
+    Consts cs_ {}, ce_ {};
+    float  dK_ = 0.0f, dB_ = 0.0f, dBt_ = 0.0f, dN_ = 0.0f, dC_ = 0.0f, dM_ = 0.0f, dO_ = 0.0f;
     int    ranNc_ = 0, ranDcNc_ = 0;                       // what advanced state on the previous accepted call
 
     std::vector<float>  osBuf_, wetBuf_;

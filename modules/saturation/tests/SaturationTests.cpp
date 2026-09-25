@@ -298,6 +298,9 @@ namespace nulltest
             case 5:   // os=4, 2ch, finite param sweep between blocks (shape switch mid-stream), odd block size
             {
                 s.prepare (44100.0, 333, 2, 4, tpp);
+                // The frozen engine applies a mid-stream write at once; the live one GLIDES unless told not to.
+                // Glide 0 is the pre-glide stage by contract, so this scenario pins exactly that contract.
+                if constexpr (requires { s.setGlideMs (0.0); }) s.setGlideMs (0.0);
                 Rng r (0xAB12CD34u);
                 ch0.resize (333); ch1.resize (333);
                 float* io[2] { ch0.data(), ch1.data() };
