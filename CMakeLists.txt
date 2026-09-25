@@ -12,7 +12,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FelitronicsPolicy.cmake)
 #
 # Independent modules, each separately includable so a consumer pulls only what it needs (an EQ
 # plugin must NOT drag in the neural runtime). Most modules are header-only INTERFACE targets;
-# fftpffft and nam are compiled only when explicitly opted in. The full per-module map with key
+# fftpffft is compiled only when explicitly opted in. The full per-module map with key
 # types is docs/CORE-OVERVIEW.md. See docs/DSP-ARCHITECTURE.md for the design rationale.
 #
 # Module          Namespace               Target                Deps
@@ -40,9 +40,15 @@ option(FELITRONICS_BUILD_TESTS "Build felitronics-core self-tests" "${PROJECT_IS
 # (with tests) its cross-backend NULL suite runs. See modules/fftpffft + THIRD_PARTY_NOTICES.md.
 option(FELITRONICS_WITH_PFFFT "Build the optional compiled pffft SIMD FFT backend (felitronics::fftpffft)" OFF)
 
-# Optional COMPILED NAM backend. Default OFF preserves the JUCE-free, external-dependency-free header-only
-# path; ON fetches the pinned NeuralAmpModelerCore + namz sources and builds felitronics::nam.
-option(FELITRONICS_WITH_NAM "Build the optional NeuralAmpModelerCore backend (felitronics::nam)" OFF)
+# The NAM backend, the .orbitrig pack player and the tube power-amp trunk (felitronics::nam, ::rigplayer,
+# ::poweramp) moved to felitronics-guitar-core. A build that still asks for them is told so, instead of
+# failing later on a target that no longer exists here.
+if(FELITRONICS_WITH_NAM)
+    message(FATAL_ERROR
+        "FELITRONICS_WITH_NAM: felitronics::nam, ::rigplayer and ::poweramp moved to felitronics-guitar-core "
+        "(https://github.com/darwinscat/felitronics-guitar-core). Make felitronics-core available first, then "
+        "that repository, and drop FELITRONICS_WITH_NAM from your CMake and your cache (-UFELITRONICS_WITH_NAM).")
+endif()
 
 if(FELITRONICS_BUILD_TESTS)
     enable_testing()
@@ -59,10 +65,7 @@ add_subdirectory(modules/fftpffft)   # OPTIONAL, compiled pffft SIMD backend —
 add_subdirectory(modules/convolution)
 add_subdirectory(modules/limiter)
 add_subdirectory(modules/neural)
-add_subdirectory(modules/nam)   # OPTIONAL, compiled NAM backend — depends on neural + core; self-gates on FELITRONICS_WITH_NAM
-add_subdirectory(modules/rigplayer)   # OPTIONAL, the .orbitrig pack player — header-only over nam + convolution + lineareq + eq; self-gates on FELITRONICS_WITH_NAM
 add_subdirectory(modules/saturation)
-add_subdirectory(modules/poweramp)   # tube power-amp trunk (SagEnvelope + TubeStage + PowerAmpStage, from OrbitCab) — needs eq + oversampling + saturation
 add_subdirectory(modules/stereo)
 add_subdirectory(modules/multiband)
 add_subdirectory(modules/dynamiceq)
@@ -101,12 +104,9 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
     target_link_libraries(felitronics_header_hygiene PRIVATE
         felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
-        felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
+        felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::mastering felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text)
-    if(FELITRONICS_WITH_NAM)
-        target_link_libraries(felitronics_header_hygiene PRIVATE felitronics::nam felitronics::rigplayer)
-    endif()
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -124,15 +124,13 @@ endif()
 # Why a NATIVE target when the wasm-audio job already builds this way: the wasm job is one toolchain
 # (emscripten/clang). This runs on every existing CI row, so gcc and Apple clang are covered too, and it
 # stays green on a machine with no emsdk. Building it IS the assertion — there is nothing to run.
-# NOT linked against felitronics::nam / ::rigplayer: the NAM backend legitimately uses try/catch (its
-# upstream sources throw), so it is outside the exception-free tier by design, not by oversight.
 # Clang/GCC only — MSVC spells this /EHs-c- and warns rather than errors, so it is not a gate there.
 if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
     add_library(felitronics_no_exceptions_probe OBJECT test_support/HeaderHygiene.cpp)
     target_link_libraries(felitronics_no_exceptions_probe PRIVATE
         felitronics::core felitronics::analysis felitronics::dynamics felitronics::eq
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
-        felitronics::saturation felitronics::poweramp felitronics::stereo felitronics::multiband felitronics::dynamiceq
+        felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::mastering felitronics::lineareq felitronics::measurement felitronics::blend
         felitronics::io felitronics::text)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)

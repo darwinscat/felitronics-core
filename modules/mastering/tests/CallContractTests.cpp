@@ -17,16 +17,16 @@
 //   P4  CHUNKING EQUIVALENCE. For a stage that chunks (law 11a), one call of length N is bit-identical
 //       to the caller having made the same maxBlock-sized calls itself.
 //
-// The stage list is the census. Five entry points are driven by their OWN suites instead, and the
-// reason is the same in every case — they need a fixture this one cannot build: `nam::NamStage` and
-// `rigplayer::RigPlayer` need a loaded model (see NamStageTests / RigPlayerTests),
+// The stage list is the census of THIS repository. Three entry points are driven by their OWN suites
+// instead, and the reason is the same in every case — they need a fixture this one cannot build:
 // `dynamiceq::LaneDynamics` needs an EqBand and a captured sidechain, `mastering::MasteringChain` has
 // an EXACT width and its own block-invariance suite, and `neural::NeuralStage` is a template over a
 // backend (NeuralTests). Saying "if a module has a process(), it is here" would be false, and the
 // diff-pass consilium checked.
 //
-// The properties themselves live in test_support/law11_call_contract.h, so a satellite repository can
-// sweep its own stages with the same ones.
+// The properties themselves live in test_support/law11_call_contract.h, so felitronics-guitar-core
+// sweeps its stages with the same ones: `poweramp::PowerAmpStage` in its PowerAmpCallContractTests,
+// and `nam::NamStage` / `rigplayer::RigPlayer` in their own model-loading suites.
 //==================================================================================================
 
 #include <felitronics_test.h>
@@ -54,7 +54,6 @@
 #include <felitronics/multiband/MultibandWidth.h>
 #include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
-#include <felitronics/poweramp/PowerAmpStage.h>
 #include <felitronics/saturation/Saturator.h>
 #include <felitronics/stereo/MonoBass.h>
 #include <felitronics/stereo/StereoWidth.h>
@@ -158,13 +157,6 @@ ADAPT (A_StereoWidthBase, felitronics::stereo::StereoWidth, 2, true, true, true,
        { return s.process (io, nch, n); },
        { (void) s; return 0.0; },
        { return s.prepare (kFs, 0, w); });
-
-ADAPT (A_PowerAmpBase, felitronics::poweramp::PowerAmpStage, 2, true, true, true,
-       { felitronics::poweramp::Params p; p.driveDb = 8.0f; p.autoComp = 1.0f;
-         felitronics::poweramp::Voicing v; s.prepare (kFs, kMaxBlock, 4); s.setParams (p, v); return true; },
-       { return s.process (io, nch, n); },
-       { (void) s; return 0.0; },
-       { (void) w; (void) s; return true; });
 
 ADAPT (A_TruePeakMeterBase, felitronics::analysis::TruePeakMeter, kPrepCh, true, true, false,
        { felitronics::test::run (s.prepare (kFs, kMaxBlock, kPrepCh)); return true; },
@@ -279,10 +271,6 @@ struct A_MatrixConvolver: A_MatrixConvolverBase { static constexpr int prepareCe
 // does not fold: measured on a pure side signal at lowWidth 0, the side band came out at -6.02 dB where
 // a prepared object kills it to -54.22 — 48.199 dB at 30 Hz. Both stereo stages have a prepared_ gate
 // now, and answer P5 like every other stage.)
-
-// `poweramp::PowerAmpStage::prepare` takes no channel count at all — its width is the compile-time
-// `kMaxCh`, so there is no prepare-side width to bind and P7 has nothing to ask it.
-struct A_PowerAmp : A_PowerAmpBase { static constexpr bool hasPrepareWidth = false; };
 
 // A METER'S GAP IS VISIBLE ONLY IN A PER-BLOCK READING. `truePeakDb()` is a running maximum and
 // `shortTermLufs()` is a three-second window: both are SUPPOSED to remember the programme, so asking
@@ -842,7 +830,6 @@ int main()
     allProperties<A_EqEngine>();
     allProperties<A_MonoBass>();
     allProperties<A_StereoWidth>();
-    allProperties<A_PowerAmp>();
     allProperties<A_TruePeakMeter>();
     allProperties<A_ReferenceTruePeakMeter>();
     allProperties<A_LoudnessMeter>();

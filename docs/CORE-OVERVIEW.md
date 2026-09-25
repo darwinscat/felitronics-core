@@ -21,7 +21,9 @@ same audit had been started three times.
 | `convolution` | zero-latency partitioned IR convolver + the shared cabinet loader (reference-unity normalization OR, un-normalized, the rate factor a resample costs; resample-on-load, click-free latest-wins swaps) | `PartitionedConvolver`, `MatrixConvolverNupc`, `ConvolutionEngine`, `IrResampler`, `CabConvolver` |
 | `lineareq` | linear- & mixed-phase FIR EQ over partitioned convolution | `LinearPhaseEq` (5 quality steps), `NaturalPhaseEq` + `MixedPhaseFir` (φ=k·φ_min "Natural" blend) |
 | `neural` | process-only inference seam + swap-safe model holder (backend-free, header-only) | `Inference`, `NeuralStage` |
-| `nam` *(opt-in)* | compiled NeuralAmpModelerCore backend: raw `.nam` / packed `.namz`, dual-instance true stereo, loudness makeup, host-rate matching. `felitronics::nam` compiles the namz implementation (`NAMZ_IMPLEMENTATION`) exactly once; consumers include `<namz.h>` WITHOUT defining it and link the symbols from this module. (Migrating consumers must delete their own define — OrbitCab `src/core/NamCodec.cpp` and OrbitCapture NAM `src/queue/NamzPacker.h` both carry one today.) | `NamStage` |
+
+The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer` (the `.orbitrig` pack player) and
+`poweramp` (the tube power-amp trunk) — live in [felitronics-guitar-core](https://github.com/darwinscat/felitronics-guitar-core).
 
 ## Mastering chain
 
@@ -46,7 +48,7 @@ same audit had been started three times.
 | `io` | **offline** file I/O: minimal self-contained WAV read/write (moved from OrbitCapture's `oc/wav.hpp`; zero-dep, loud rejects, memory + file readers) | `WavData`, `readWav`, `readWavMemory`, `writeWav`, `writeWavMonoF32` |
 
 **Build & test:** `cmake -S . -B build -DFELITRONICS_BUILD_TESTS=ON && cmake --build build -j && ctest --test-dir build`.
-Add `-DFELITRONICS_WITH_PFFFT=ON -DFELITRONICS_WITH_NAM=ON` for both optional compiled backends.
+Add `-DFELITRONICS_WITH_PFFFT=ON` for the optional compiled SIMD FFT backend.
 
 **A full mastering chain is now buildable in core:** saturation → dynamic-EQ → de-esser → multiband comp →
 stereo width → transient → mono-bass → dither, metered by true-peak (dBTP) + LUFS/LRA.

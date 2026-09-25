@@ -55,11 +55,15 @@
 //     SystemMath/DetMath policy routing is pinned by static_assert in MathPolicyTests.cpp instead; that
 //     is the right tool for it and this is not.
 //
-// Usage: node tools/lint/check-det-math.mjs [--self-test] [--report] [--propose]
+// Usage: node tools/lint/check-det-math.mjs [--self-test] [--report] [--propose] [--satellite]
 //   --self-test  run the matcher's own negative controls and exit
 //   --report     print the full inventory (file, line, scope, call) and exit 0 — for an audit, not a gate
 //   --propose    print manifest lines for files that have none, marked UNCLASSIFIED. It never writes the
 //                manifest and never marks anything allowed: a human types the reason or the build stays red.
+//   --satellite  run from ANOTHER repository's root (felitronics-guitar-core): its ./modules against its own
+//                ./tools/lint/det-math-manifest.txt. Skips only the two checks of this lint's OWN lists
+//                against core's files (ZONE-EXCEPTION-ROT, CARRIER-ROT) — they are core's, core's CI runs them,
+//                and from another root the files they read are not there.
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -352,10 +356,9 @@ export function scanText (text, opts = {})
 // `p->gainToDb(x)` or `other::gainToDb(x)`: all three matched before the lookbehind below, because the
 // suffix alone was enough and the qualification was optional.
 //
-// AND NOT A FILE'S OWN FUNCTION OF THE SAME NAME. `dynamics/NoiseGate.h`, `poweramp/PowerAmpStage.h` and
-// `nam/src/NamStage.cpp` each define a private `static float dbToGain (float)` and call it unqualified.
-// Counting those as `core::dbToGain` put four phantom carrier calls into NoiseGate's manifest line and
-// two into NamStage's — a manifest that says a file reaches libm through a function it never calls is
+// AND NOT A FILE'S OWN FUNCTION OF THE SAME NAME. `dynamics/NoiseGate.h` defines a private
+// `static float dbToGain (float)` and calls it unqualified. Counting that as `core::dbToGain` put four
+// phantom carrier calls into its manifest line — a manifest that says a file reaches libm through a function it never calls is
 // wrong in the direction that matters, because it reads as an audited fact. Their own `std::pow` is
 // already counted as a direct call; this only stops it being counted twice under someone else's name.
 export function scanCarriers (text, names)
@@ -554,7 +557,7 @@ for (const f of files)
 
 // AND THE EXCEPTIONS MUST NOT ROT EITHER. One that no longer matches anything is an argument left
 // standing for a call that is gone — exactly the stale allowance this lint exists to prevent elsewhere.
-for (const e of ZONE_EXCEPTIONS)
+for (const e of (args.includes('--satellite') ? [] : ZONE_EXCEPTIONS))
 {
     const used = exceptionUses.get(e.file + '::' + e.fn) || 0;
     if (used === 0)
@@ -568,7 +571,7 @@ for (const e of ZONE_EXCEPTIONS)
 // Rule 4 — THE CARRIER LIST MUST NOT ROT. A carrier that no longer reaches libm would forbid something
 // harmless forever; one deleted from this list while still reaching libm would let the real thing through.
 // So each declared carrier is checked against the file that defines it.
-for (const c of CARRIERS)
+for (const c of (args.includes('--satellite') ? [] : CARRIERS))
 {
     if (! existsSync(c.defined))
     { violations.push({ f: c.defined, line: 0, rule: 'CARRIER-ROT', msg: `carrier ${c.name} names a file that does not exist` }); continue; }

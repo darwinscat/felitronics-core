@@ -42,10 +42,9 @@ fine. This is only about what gets merged *here*.
 
 ## Third-party code
 
-The optional compiled backends vendor third-party code (pffft, NeuralAmpModelerCore, Eigen,
-nlohmann/json, namz) under permissive licences, recorded in `THIRD_PARTY_NOTICES.md`. Those are
-governed by their own terms and are unaffected by the policy above. New third-party dependencies
-are not added without review — see the watch-list at the bottom of that file.
+The optional compiled backend vendors third-party code (pffft) under a permissive licence, recorded in
+`THIRD_PARTY_NOTICES.md`. It is governed by its own terms and is unaffected by the policy above. New
+third-party dependencies are not added without review — see the watch-list at the bottom of that file.
 
 The Felitronics and Darwin's Cat names and logos are trademarks and are *not* covered by the code
 licence.

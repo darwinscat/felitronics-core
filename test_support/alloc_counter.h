@@ -70,7 +70,8 @@
 //     rather than assumed: with `--wrap=malloc,calloc,realloc` on the gcc row, 200 `process()` calls through
 //     `MatrixConvolver<PffftRealFft>` make ZERO C allocations (4 in the whole run, all inside `prepare`).
 //   * an allocator a dependency reaches by its own syscall or pool. Eigen is the live example, and
-//     `modules/nam/tests/NamStageRtAllocTests.cpp` covers it with Eigen's own malloc gate instead.
+//     felitronics-guitar-core's `modules/nam/tests/NamStageRtAllocTests.cpp` covers it with Eigen's own
+//     malloc gate instead.
 //   * a path no suite drives. This counts what is executed, not what exists.
 
 #include <felitronics_test.h>
