@@ -19,7 +19,9 @@ jobs:
   # WHICH TESTS THIS CHANGE NEEDS — by subject, derived from the tree (tools/ci/scope.py says how).
   # A pull request that touches only prose runs nothing; one that touches only modules/ runs those modules and
   # everything that includes them; anything else — tools/, CMake, CI — and anything that is not a pull request
-  # runs everything. A release branch therefore always gets the whole matrix before its tag.
+  # runs everything. A release pull request that only folds the changelog and moves the `project(... VERSION)`
+  # line is prose and runs nothing: its code is the tree main already tested, and the whole matrix runs on its
+  # merge to main — the tree the tag goes on, so the tag waits for that run.
   scope:
     name: scope
     runs-on: ubuntu-latest
