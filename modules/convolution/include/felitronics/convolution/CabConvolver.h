@@ -98,10 +98,9 @@ public:
     // analysis window from `lround(hostSr_)`.
     //
     // The VALUE is the house convention, not a new number: dynamics::Compressor::kMaxSampleRate and
-    // limiter::TruePeakLimiter::kMaxSampleRate are both 3.0e6 with the same stated reason, eq::EqBand
-    // refuses past the same figure as a literal, and rigplayer::RigPlayer spells it a fourth time while
-    // naming the duplication as its own disease. This is the fifth spelling; consolidating them is still
-    // its own task, and convolution links none of those modules, so it cannot simply ask.
+    // limiter::TruePeakLimiter::kMaxSampleRate are both 3.0e6 with the same stated reason, and eq::EqBand
+    // refuses past the same figure as a literal. This is the fourth spelling here; consolidating them is
+    // still its own task, and convolution links none of those modules, so it cannot simply ask.
     static constexpr double kMaxSampleRate = 3.0e6;
 
     // The IR budget prepare() will ask the backend for, as a pure function of the two arguments that

@@ -71,7 +71,7 @@ namespace detail
 // the certified true-peak reference at 4x/32 (analysis::ReferenceTruePeakMeter) and every stage's
 // default, and a moved cutoff would move both. Flat-to-20-kHz is a SEPARATE topology —
 // oversampling::CascadeOversampler, just as strict, a Kaiser 2x stage sized from the sample rate and then
-// halfbands — which Saturator, TruePeakLimiter and PowerAmpStage take on request (oversampling::Topology).
+// halfbands — which Saturator and TruePeakLimiter take on request (oversampling::Topology).
 // Its price is latency, not CPU: 131 base samples at 44.1 kHz 4x against 63 here, for about the same
 // multiply count (572 against 512). Above 44.1 kHz it gets cheaper — in multiplies almost at once (508 at
 // 44.7 kHz, 348 at 48), in latency only from 50.5 kHz (76 at 48 kHz, 28 at 88.2). Switching the stages'
@@ -137,8 +137,8 @@ public:
     // -fno-exceptions. TruePeakLimiter::prepare refused both at its own gate (its contract, kept), but
     // Saturator passes an unbounded oversampleFactor straight through, and `prepare(INT_MAX, 1)` on the
     // default taps is UBSan-confirmed signed overflow followed by that same length_error. The ceiling is
-    // generous rather than tight: the largest factor anything in the tree asks for is 32 (PowerAmpStage's
-    // alias-free reference), and 64 x 1024 taps is still a trivially small allocation.
+    // generous rather than tight: the largest factor any known consumer asks for is 32 (an alias-free
+    // reference), and 64 x 1024 taps is still a trivially small allocation.
     static constexpr int kMaxTapsPerPhase = 1024;
     static constexpr int kMaxFactor       = 64;
 

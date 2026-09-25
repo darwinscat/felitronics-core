@@ -142,7 +142,7 @@ public:
     // thread WITHOUT writing the two fields setOperator() reads (`cur_` and `state_`), and with a fade
     // left running rather than ended.
     //
-    // Added for rigplayer::RigPlayer::reset() (P86), against a measured sequence: publish a tone curve and
+    // Added for a composite's stream restart, against a measured sequence: publish a tone curve and
     // restart before the 50 ms crossfade ends. reset() below used to drop the incoming operator on the
     // floor there — `cur_` stayed on the OLD one and `CabConvolver::pendingRetry_` is already false after
     // a successful publish, so nothing ever re-staged it, and the knob move was lost until the next knob

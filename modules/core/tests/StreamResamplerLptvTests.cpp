@@ -120,7 +120,7 @@ namespace
         }
     };
 
-    // The shipped NAM round trip, with NamStage::configureRates' own capacities and call pattern.
+    // The shipped model-rate round trip, with its consumer's own capacities and call pattern.
     // Templated so the SAME instrument drives the shipped kernel and the reference cubic.
     template <typename R>
     struct RoundTrip
@@ -383,7 +383,7 @@ int main()
         // The branch that owns this file spent itself removing restatements of the round-trip formula,
         // and 61.4 is, textually, one more of them. It is not: it is the ORACLE, and an oracle that
         // asks the thing it measures has stopped being one. The same file already learned this once —
-        // a sweep in NamStageTests was rewritten to ask core, a +1 error walked straight through it,
+        // a consumer's sweep was rewritten to ask core, a +1 error walked straight through it,
         // and it had to be restored.
         //
         // MEASURED, not argued, so the next reader does not have to take it on trust. Inject the very
@@ -413,7 +413,7 @@ int main()
         // claims the new kernel is flat; that claim belongs up there. Above ~360 Hz the delay exceeds
         // half a tone period and the phase wraps, so each reading is resolved into the branch nearest
         // the geometry — which is legitimate BECAUSE the integer is independently fixed by the impulse
-        // onset in NamStageTests, not because we like 61.4.
+        // onset in the consumer's own suite, not because we like 61.4.
         for (double f : { 5000.0, 10000.0, 17640.0, 19000.0 })
         {
             const auto gh = roundTripGains<StreamResampler> (f, H, M, 64, kSkip, kKeep);
@@ -500,7 +500,7 @@ int main()
         // and at lengths that land EXACTLY on an integer boundary that changes which side of it the
         // sum falls on. Measured against the cubic: N = 147 at 44.1->48 gives 161 where the cubic gave
         // 160, and N = 160 at 48->44.1 gives 147 where it gave 148. Every other length in the sweep
-        // agrees exactly. This is harmless inside NamStage — the down leg is bounded by
+        // agrees exactly. This is harmless inside the round-trip consumer — the down leg is bounded by
         // maxModelFrames and the up leg is asked for exactly n — but "unchanged" was the wrong word
         // and the difference is a real ULP fact, not a rounding of the prose.
         //
@@ -556,7 +556,7 @@ int main()
         // produceExact()'s documented behaviour on a startup underflow is "pad with silence", and a
         // mutation that pads with the PREVIOUS sample instead once survived every suite. Silence and a
         // hold are audibly different at a stream start — a held sample is a DC step. NOTE: inside
-        // NamStage this branch is structurally unreachable (K_up = ceil(K_down·h/m) >= n for every n),
+        // the round-trip consumer this branch is structurally unreachable (K_up = ceil(K_down·h/m) >= n for every n),
         // and the longer kernel does NOT change that, because the availability test moved with the
         // priming. This pins the CLASS's contract, which other callers can reach.
         {

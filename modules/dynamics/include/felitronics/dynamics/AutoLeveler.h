@@ -26,7 +26,7 @@
 //     (measured 0.4 dB/s @ 64-sample blocks vs the intended 9 dB/s — the frozen-leveler
 //     bug this design replaces).
 //
-// DETERMINISTIC retargets — a poweramp route snap (the engine knows the correct makeup
+// DETERMINISTIC retargets — a route snap (the engine knows the correct makeup
 // for the route it is switching to), the enable/disable toggle, seed() at IR load — are
 // not follower chases: they may jump the TARGET directly (bypassing the target slew) and
 // open a bounded FAST window (kSnapSlewDbPerSec) so the applied gain lands in ~a fade
@@ -89,7 +89,7 @@ public:
         mixMeanSq = kSeedMeanSq / ((double) g * g);     // sqrt(dryMeanSq / mixMeanSq) == g
     }
 
-    // DETERMINISTIC route retarget (the poweramp seam capture<->tube/off switch): jump the
+    // DETERMINISTIC route retarget (a router switching between signal paths): jump the
     // target to the KNOWN converged makeup of the route being switched to and glide there at
     // the fast (still hard-limited) rate, in sync with the router's crossfade. The mix follower
     // is re-seeded at the CURRENT dry level so the followers agree with the snapped ratio

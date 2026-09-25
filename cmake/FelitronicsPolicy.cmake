@@ -20,7 +20,7 @@ else()
     # single FMA with ONE rounding instead of two, and the toolchains do not agree on when: clang defaults
     # to `on` (fusion within one expression, the C/C++ standard's own rule), GCC defaults to `fast` (fusion
     # ACROSS statements). That difference is not academic — it broke two exactness claims the moment an
-    # arm64 Linux row reached CI, on untouched main: poweramp's "silence in ⇒ output identically 0" read
+    # arm64 Linux row reached CI, on untouched main: a nonlinear stage's "silence in ⇒ output identically 0" read
     # 1.26e-08, and the multi-res fast pane missed its budget by 0.005841 dB. Neither the Mac (clang) nor
     # any x86 row could see it: baseline x86-64 has no FMA instruction to contract with at all.
     #

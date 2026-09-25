@@ -50,7 +50,7 @@ public:
     // not the state, so no amount of flushing reaches it; `reset()` does not either. It is the one
     // exception to "a bad sample is no longer permanent", and it is named here rather than left to be
     // discovered. Every consumer in this repository sanitises before calling (EqBand, DynamicEqBand,
-    // DeEsser, LaneDynamics, MultibandSplitter, MonoBass, PowerAmpStage all do), so there is no live
+    // DeEsser, LaneDynamics, MultibandSplitter, MonoBass all do), so there is no live
     // defect — but the primitive's own API does not, and the comment used to say otherwise.
     void setParams (FilterType type, double freq, double Q, double gainDb) noexcept
     {

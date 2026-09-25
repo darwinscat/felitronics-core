@@ -15,8 +15,7 @@ namespace felitronics::neural
 {
 
 //==============================================================================
-// felitronics::neural::NeuralStage<Backend> — the swap-safe holder that generalizes orbitcab's
-// cab::AmpStage. The adapter builds + prepares a new model INSTANCE off the audio thread and hands it in
+// felitronics::neural::NeuralStage<Backend> — the swap-safe model holder. The adapter builds + prepares a new model INSTANCE off the audio thread and hands it in
 // via swapPrepared(); process() (audio) uses the live instance and NEVER allocates, locks, or DELETES;
 // the replaced instance is retired and freed later on the message thread (collectGarbage()), only once
 // the audio thread has provably stepped into a LATER block — so no use-after-free and no audio-thread
@@ -67,7 +66,7 @@ public:
     // Law 11 — the verdict is the BACKEND's. No model loaded is not a refusal: a stage with nothing
     // installed is a documented clean passthrough, so it accepts the call and does nothing to it.
     // The live pointer is resolved ONCE here, so a backend that chunks internally keeps one model for
-    // the whole host call — see the note in NamBackend::process.
+    // the whole host call.
     [[nodiscard]] bool process (float* const* io, int numChannels, int numSamples) noexcept
     {
         // GEOMETRY FIRST, before the no-model shortcut AND before the retire counter. Deferring it to

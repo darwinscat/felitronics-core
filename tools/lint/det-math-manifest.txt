@@ -68,7 +68,7 @@ modules/saturation/include/felitronics/saturation/WaveShaper.h  [atan*2 tanh*6] 
 
 # --- lineareq: FIR design, offline-built but shipped as audio ---
 modules/lineareq/include/felitronics/lineareq/LinearPhaseEq.h  [cos*3]  retain-rt  the design window for a linear-phase FIR the plugin then convolves with
-modules/lineareq/include/felitronics/lineareq/MagnitudeCurve.h  [cos*1 log*2 pow*2]  retain-rt  the magnitude curve a minimum-phase FIR is built from; RigPlayer consumes the resulting FIR
+modules/lineareq/include/felitronics/lineareq/MagnitudeCurve.h  [cos*1 log*2 pow*2]  retain-rt  the magnitude curve a minimum-phase FIR is built from
 modules/lineareq/include/felitronics/lineareq/MixedPhaseFir.h  [cos*1 log*3 sin*1]  retain-rt  mixed-phase FIR construction (cepstral, hence the logs)
 modules/lineareq/include/felitronics/lineareq/NaturalPhaseEq.h  [abs*1 cos*2]  retain-rt  natural-phase design window and response
 

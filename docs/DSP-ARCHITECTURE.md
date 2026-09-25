@@ -99,8 +99,8 @@ the CPU at runtime, invisible to any build. Full write-up:
 
 1. **No threads in the core.** Threading is the *adapter's* job. The core is called synchronously.
    *(Why: WASM threads need SharedArrayBuffer + COOP/COEP; bare-metal may have none. Precedent:
-   OrbitCab builds/loads NAM models + IRs on a background/message thread and atomic-swaps them into the
-   live pointer — the DSP core (`cab::AmpStage::process`, `cab::Convolver`) never spawns or blocks.)*
+   a plugin builds/loads models + IRs on a background/message thread and atomic-swaps them into the
+   live pointer — the DSP core never spawns or blocks.)*
 2. **No allocation / lock / IO / syscall / throw in `process()`** (the existing RT rule). Preallocate
    in a `prepare()` step. Ideally no heap at all in hot classes (fixed-size state) so bare-MCU works.
 3. **Float in the hot path; `double` only in offline coefficient design.** No FPU → `double` is
@@ -212,7 +212,7 @@ the CPU at runtime, invisible to any build. Full write-up:
    *across statements*, beyond what the standard permits), and **MSVC's `/fp:precise` does not contract
    at all**. Three defaults, three sets of numbers, from one source file.
    *(Not academic. It broke two exactness claims the day an arm64 Linux row first reached CI, on
-   untouched `main`: `poweramp`'s "silence in ⇒ output identically 0" read **1.26e-08**, and the
+   untouched `main`: a tube stage's "silence in ⇒ output identically 0" read **1.26e-08**, and the
    multi-res fast pane missed its budget by **0.005841 dB**. Both are cancellations — TT1 wants
    `g(0+vb) − g(−0+vb)` to vanish exactly — and a cancellation stops cancelling the moment one half is
    computed with one rounding and the other with two. Nothing could see it before: baseline x86-64 has
@@ -276,15 +276,14 @@ the CPU at runtime, invisible to any build. Full write-up:
    internally, so any `n >= 0` is processed IN FULL, and the chunked pass is **bit-identical to the
    caller having chunked it itself AT THE SAME BOUNDARIES** — that is the invariant, and it is what makes
    the rule testable. (It is deliberately not "bit-identical under arbitrary re-slicing": that is law 8a's
-   claim, it is owned by the grid, and a rate-matched stage such as `nam::NamStage` cannot make it at all.)
+   claim, it is owned by the grid, and a rate-matched stage cannot make it at all.)
    Never truncate the tail, never refuse a long call. *(An offline caller sizing `maxBlock` to a whole
    file is a normal thing to do — `Compressor`, `EqEngine`, `Dither` and `TruePeakLimiter` all invite one
    in their headers — and refusing it would return the buffer UNTOUCHED, i.e. exactly the
    unlimited-passthrough defect the refusal was meant to prevent.)* Measured before this law:
    `dynamics::NoiseGate` clamped `n` to its curve and let **3840 of 4096** samples out **+89.99 dB**
    louder than the gated ones — 100 % of the construction ceiling, which is `-floorDb` = 90 dB;
-   `nam::NamStage` clamped `n` to `maxBlock` and let **448 of 512** samples bypass the amp model
-   BIT-IDENTICAL to its input; `multiband::MultibandProcessor` dropped the **entire** call.
+   `multiband::MultibandProcessor` dropped the **entire** call.
    **The one exception is a two-phase API whose first phase RETURNS a buffer of `maxBlock`**
    (`NoiseGate::analyse`/`applyGain`, `EqEngine::captureSectionInput`): it cannot chunk, because the
    result must outlive the call. Those refuse — observably — and their fused convenience form chunks.
@@ -356,146 +355,37 @@ the CPU at runtime, invisible to any build. Full write-up:
    half-open range — and law 11's malformed-call refusal now does that job earlier and better.
 
    **AND WHERE THE MEMORY CANNOT BE DROPPED, IT IS DRAINED.** "Drop its sample memory" assumes the
-   memory is ours to clear, and for a delay line it is. For a stage that owns a black box it is not:
-   `nam::NamStage` holds a neural network whose window belongs to NAM (whose `Reset` allocates, and for
-   a `Linear` capture does not clear that window at all) and two `core::StreamResampler` legs beside it.
-   The third answer is to hand the stopped channel the DIGITAL SILENCE it is receiving — the same code
-   path, into the stage's own scratch, since `io` need not carry that plane and at `nch == 0` may be
-   null — until its state is provably the state of a channel that was silent all along, and then to
-   STOP. Bounded, so a permanently mono host still pays for one network rather than two: the length is
-   the model's own memory plus each rate-matcher's tap window, each counted in ITS OWN rate. Measured
-   before it, through `rigplayer::RigPlayer`, worst |out| out of digital silence: **0.518588 at
-   44.1 kHz** with a memoryless capture (the rate-matchers alone) and **0.499533 at 48 kHz** with a
-   2001-tap one (the network alone, at the one rate where no rate-matcher is installed) — two
-   independent halves, each with a fixture that cannot see the other. **The same class reaches a stage a
-   composite stops CALLING at all** for reasons of its own: `RigPlayer` skipped a slot the blend law had
-   put to sleep, which replayed **0.500000** for a whole receptive field, and hands it a width-zero call
-   now. And because "it drains, and then it stops" has no witness in the audio — past the debt the
-   output is zero either way — the stage publishes an odometer (`NamStage::drainedSamples()`) so a test
-   can see the length; three mutations of it survived a suite of 960 checks before that existed.
-   ⚠️ A recurrent cell has no flush length, so for an LSTM this is a bound on NAM's own half-second
-   heuristic and not on the memory (0.419 against 0.023 for a lane clocked throughout) — said here
-   rather than left for the next reader to find.
+   memory is ours to clear. For a stage that owns a black box — a third-party network whose window it
+   cannot reach, a resampler leg beside it — the answer is to hand the stopped channel the DIGITAL
+   SILENCE it is receiving, through the same code path into the stage's own scratch (`io` need not carry
+   that plane, and at `nch == 0` may be null), until its state is provably that of a channel that was
+   silent all along, and then to STOP: bounded by the memory the stage can count, each part in its own
+   rate, so a permanently mono host pays for one lane, not two. "It drains, and then it stops" has no
+   witness in the audio — past the debt the output is zero either way — so such a stage publishes an
+   odometer a test can read. A recurrent cell has no flush length; its bound is a heuristic, and says so.
 
-   **AND THE OTHER HALF IS `reset()`, WHICH IS A DIFFERENT OPERATION AND NOT A LONGER ONE.** Everything
-   above is about a lane the caller STOPPED handing over: it is still the same stream, so the answer is
-   to feed it the silence it is really receiving and let its state evolve as silence evolves it. A lane
-   that is PRESENT gets the caller's own samples, and a stale window speaking into them is not a falling
-   edge — it is a stream RESTART, and the restart verb has to do it. `felitronics::nam::NamStage::reset()`
-   was EMPTY, so it did not: a dense 2001-tap capture that had played a tone answered digital silence
-   with **0.224604502320**, and so did the same capture through `prepare()`, because `::nam::DSP::Reset`
-   calls `SetMaxBufferSize` and then a prewarm that is zero samples for a `Linear`. The two verbs differ
-   in what they restore, not in how long they run: a drain SIMULATES silence, and a restart puts the
-   stage back where a freshly loaded and prepared one is. For a finite-memory capture the two states
-   coincide and the same zero-feed reaches it. What that buys is INDEPENDENCE, and it is exact: two stages
-   fed different audio before the restart answer the next programme with the same bits, on real captures
-   and synthetic ones, at every rate. It does NOT buy bit-identity with a stage prepared a moment ago —
-   NAM's answer depends on how the stream is cut into CALLS, so a restart, whose chunking is its own,
-   lands 1.037e-06 away on a real Standard at blocks 64…512 and exactly on it for a real slimmable at the
-   same blocks. The restart additionally re-primes the
-   rate-matcher legs, because a restart re-anchors the audio-time clocks, exactly as `eq::EqBand::reset()`
-   re-anchors its `StateGrid` (leave them and the next programme runs at the previous stream's sub-sample
-   phase: 1.039e-06 at 44.1 kHz). For a RECURRENT capture they do not coincide, and the exception stays
-   named: a restart spends the heuristic again — which is what NAM's own `Reset` does — and leaves what
-   that leaves (300 samples differing from a fresh instance, worst 1.49e-07, on a real LSTM).
-
-   **A RESTART IS THE ONE AUDIO-THREAD CALL WHOSE COST IS NOT THE BLOCK'S.** It is a whole drain length
-   of inference per dirty lane — the field, the ring and the legs, so more than `prewarmSamples()`
-   reports: on an M-series core, per lane, **3.77 ms at a 64-sample block — 282 % of that callback** —
-   3.46 at 256, 3.43 at 512, against 1.3 ms for a real LSTM and 0.13 for a dense 2001-tap Linear. There is no cheaper exact mechanism to substitute: NAM's own `Reset` with the prewarm off
-   zeroes the Conv1D rings in 0.014 ms and still misses the prepared state by 4089 samples (worst 0.324),
-   because that state is a PREWARMED one, and on a `Linear` with the FFT engine it allocates 46 times. So
-   the price is published rather than hidden, and the operation is made IDEMPOTENT instead — the debt is
-   re-armed only by audio actually being fed, so a second restart with nothing in between is free and a
-   mono host pays for one lane. What a restart cannot rewind is a third-party clock: NAM's partitioned
-   `Linear` counts every sample it has ever seen, and rewinding that means re-configuring the engine,
-   which allocates; the residue peaks at 1.788139e-07 over nine block sizes x eight rates against a stage
-   prepared a moment ago and is EXACTLY ZERO against one clocked to the same point, i.e. it is the
-   engine's arithmetic and not our state. **And a restart
-   flushes what the LEDGER can see** — so the ledger has to answer for the WHOLE model. A capture whose
-   conditioner is a model of its own (`config.condition_dsp`) hid that model's memory from both readers
-   of the field, and was under-flushed by exactly as much as law 11a's drain under-drained it —
-   0.905147969723 either way, one defect in one ledger. It was corrected in the ledger and both readers
-   moved together: `detail::receptiveFieldFromConfig` adds a conditioner's memory to the network's own
-   IN SERIES, because the conditioner's output is the network's conditioning input, and the two other
-   questions the ledger answers — whether anything in the tree is recurrent, and whether anything in it
-   is charged NAM's partitioned-FFT ring — walk the same branch. On NAM's own shipped captures the
-   whole change moves one number: +1 sample of drain on the two that carry a conditioner, and a
-   byte-identical render on every other.
-   **And where the ledger cannot PLACE something, it charges ONE allowance — never zero, never the
-   face value** (P92). The ledger promises an upper bound, so "I do not know" has an answer, and the
-   costs are asymmetric: an understated number is the previous sound coming out of digital silence, an
-   overstated one is inference nobody hears — as long as it is BOUNDED. The measured case was NAM's
-   slimmable wrapper, whose real config sits under `config.model` where nothing read it: 0 samples
-   flushed for a model reaching 2046. Three events now mean "cannot place" — a config carrying a model's
-   vocabulary under a key the ledger does not read (keyed on SHAPE, never on NAM's dispatch, so it fires
-   under any key name), a value that is there and cannot be read, and a reading the ledger sets aside
-   (a declared field beside a stack) — and each adds `kUnreadShapeCeiling` = 48 000 samples ONCE per
-   tree to what the ledger did read. Once, because an allowance per node turned a 1.6 MB file into an
-   INT_MAX drain; added, because a max let a large known part swallow the unknown's share; and never
-   the face value, because a dead number costs NAM nothing and was spent here as a half-hour `reset()`.
-   The price is measured through `reset()`: 39.7 ms per lane on the most expensive real capture
-   rewrapped (256 block, 48 kHz). It fires on none of the author's 1229 distinct captures. What it does
-   NOT close is stated with it, as two doors of which shutting either opens the other: a LIVE memory the
-   ledger cannot place, longer than the allowance, drains short by the difference; and a DEAD number the
-   ledger PLACES (a lower reading with no stack, the wrapped form's own decoy stack) is trusted at face
-   value, as before — which door stays open is a registered policy question. Separately, NAM's own
-   recursive copy of the config takes the host down on a deep enough file (about 2 000 levels, 134 KB,
-   on a 512 KiB thread) before the ledger runs at all.
+   **AND THE OTHER HALF IS `reset()`, WHICH IS A DIFFERENT OPERATION AND NOT A LONGER ONE.** A lane the
+   caller STOPPED handing over is still the same stream; a lane that is PRESENT gets the caller's own
+   samples, and a stale window speaking into them is a stream RESTART, which is `reset()`'s job. A drain
+   SIMULATES silence; a restart puts the stage back where a freshly prepared one is, and for a
+   finite-memory stage the two states coincide. What a restart buys is INDEPENDENCE, and it is exact: two
+   instances fed different audio before it answer the next programme with the same bits. It re-anchors
+   the audio-time clocks as well, exactly as `eq::EqBand::reset()` re-anchors its `StateGrid`. Where its
+   cost is not the block's — a whole drain length — the price is published and the operation made
+   IDEMPOTENT: the debt is re-armed only by audio actually being fed. And it flushes what the stage's
+   LEDGER of its own memory can see, so the ledger answers for the whole model; what it cannot place is
+   charged ONE bounded allowance — never zero, never the face value.
 
    **AND `prepare()` PERFORMS THAT RESTART TOO, ALWAYS — THE TWO VERBS NAME ONE STATE.** A prepared stage
-   holds no audio the caller fed, on any rate, on any shape, and whether or not the rate or the block
-   size actually changed. This is the second half of the same defect: the 0.224604502320 above was first
-   measured through `prepare()`, and over a grid of eight host rates x two block sizes x three capture
-   shapes x {re-prepare at the same rate, re-prepare at a different one}, **72 of 96 cells leaked, worst
-   0.567861497402**, with both lanes PRESENT. There is deliberately no predicate on what changed: a
-   re-prepare at the SAME numbers is the common case — a host's buffer-size slider moves more often than
-   its rate one, and a driver stops the stream for either — and it was the case that leaked loudest.
-   The mechanism is the drain above, not a second one: `configureRates` charges every lane that may still
-   be holding audio — fed since it was last emptied, whether by a restart or by a falling-edge drain that
-   ran to the end (a recurrent lane is never emptied, so it is always charged) — and the tail of
-   `prepare()` spends it, so a first prepare after a load costs nothing and a
-   model change (which prepares a never-fed backend, in `prepareModel()` and again in `install()` when the
-   host's numbers moved between the halves) costs nothing either. Where it does cost, it
-   is the message thread and the price is published: for an architecture whose own `Reset` already
-   prewarms, the drain is a SECOND pass over the field and roughly doubles the call — a stereo real
-   Standard WaveNet measured 6.5 ms before and 13.1 ms after at 48 kHz. Skipping that pass is sound only
-   per architecture, and that was measured rather than argued: with the drain removed, every capture NAM
-   ships keeps independence at exactly 0, while this tree's own `Buffer`-based fixtures leak on 72 of 96
-   cells again. NAM's example set has no such capture in any tree, so a check against real captures alone
-   would have approved a blanket skip. The predicate is structural and belongs to the receptive-field
-   registry (P98).
+   holds no audio the caller fed, whether or not the rate or the block size changed. There is
+   deliberately no predicate on what changed: a re-prepare at the SAME numbers is the common case.
+   **A prepare restates what it COUNTS, not only what it designs:** state kept as a count of host samples
+   is recomputed, mapped by its predicate, or rescaled by the rate ratio — whichever its own algebra
+   allows. **And a composite owes its consumer the same verb:** its `reset()` reaches every child that
+   holds audio, bypassed or not.
 
-   **AND A PREPARE RESTATES WHAT IT COUNTS, NOT ONLY WHAT IT DESIGNS.** After `RigPlayer::prepare()`
-   nothing the player acts on is expressed in the samples of a rate it no longer runs at. Rebuilding the
-   rate-DESIGNED state — filters, rings, stages, a threshold kept in seconds — was never the whole of it:
-   the blend law's warm-up debt, its rest count, the two per-slot alignment delays and a landing in
-   flight are COUNTS of host samples, and they were written once and read for ever. Measured on a 6x6
-   rate grid: a slot woken after 48 -> 96 kHz warmed for half the field it owed, and 44.1 <-> 48 kHz —
-   the pair a fixture reaches for first — read exactly right. Each count is restated by the rule its own
-   algebra allows: the debt RECOMPUTED (it is not homogeneous in the rate), the warm-up progress mapped
-   by its PREDICATE (audible stays audible, warming starts over), the rest count RESCALED (it is pure
-   elapsed time, so the ratio is exact and is 1 where nothing moved).
-
-   **AND A COMPOSITE OWES ITS CONSUMER THE SAME VERB.** `rigplayer::RigPlayer` had none, so a product
-   reaching a `NamStage` through it — which is how orbit-amp reaches one — could not call the restart at
-   all. `RigPlayer::reset()` is that verb: both model slots, the three convolvers (bypassed or not — a
-   bypassed one is skipped, so its history freezes and is replayed), the dry path's alignment ring, the
-   per-slot alignment tails, the band filters and the scratch. It leaves the blend law's state alone with
-   ONE exception: a restart is not a device change, and re-arming the warm-up of a slot that is already
-   AUDIBLE would not deliver invariant 3 anyway (the law ramps its gain down over four blocks, so an unfed
-   network is audible regardless) while costing 192 ms of hole at every restart. A slot still WARMING is
-   the exception, and it is re-armed: it is at weight zero by construction, so re-arming it is silent,
-   and its network has just been flushed, so crediting it the field it heard before the flush would mark
-   it audible with up to a whole field missing (`nam::blendRestated`, P89). Its price is FOUR networks,
-   not one. And it reaches a convolver through `clearAudioState()` rather than `reset()`, because when
-   this was written `reset()` there DISCARDED a filter published a block ago and still fading in. P88
-   closed that in the verb itself (11e), and that removes the reason for the choice: `clearAudioState()`
-   leaves a fade RUNNING, so it does not give this verb's own independence while one is in flight
-   (measured through `CabConvolver`, 2143 of 5120 samples a channel differ between a clear one block into
-   a 50 ms fade and a clear after it settled; the same two `reset()` calls differ in none), and `reset()`
-   no longer races a loader (measured under ThreadSanitizer, not yet the contract — 11e). Switching the
-   player to `reset()` is registered as its own task rather than taken here.
+   The NAM backend and the `.orbitrig` pack player are the worked case of all of this, with the
+   measurements: felitronics-guitar-core `docs/LAW11-NAM.md`.
 
    **11b. `prepare()` IS BINDING, AND REFUSES WHAT IT CANNOT HONOUR.** An observable refusal in
    `process()` is worth nothing if `prepare()` already lied about the width: `convolution::CabConvolver`
@@ -540,11 +430,10 @@ the CPU at runtime, invisible to any build. Full write-up:
    (`-floorDb` = 90 dB).
 
    **THE ADDRESSES ARE THE MECHANISM, NOT A LIST**: shared, one-per-instance ballistics that a zero-width
-   call leaves without a clock. Seven today — the five above plus `dynamiceq::LaneDynamics` (whose lanes
-   now run the control loop at width zero, where the Stereo lane's linked probe over zero columns is
-   exactly `+0.0f` and L/R/M/S take the same "this lane stopped" branch they take at width one) and
-   `poweramp::PowerAmpStage`, whose ONE shared sag supply and thirteen block-rate glides stopped dead on
-   a gap. **`LaneDynamics` is width-dependent BY DESIGN and its entry here is narrower than it looks:**
+   call leaves without a clock. Six in this repository — the five above plus `dynamiceq::LaneDynamics`
+   (whose lanes now run the control loop at width zero, where the Stereo lane's linked probe over zero
+   columns is exactly `+0.0f` and L/R/M/S take the same "this lane stopped" branch they take at width
+   one) — and a seventh, `poweramp::PowerAmpStage`, in felitronics-guitar-core. **`LaneDynamics` is width-dependent BY DESIGN and its entry here is narrower than it looks:**
    `laneRuns()` gates L/R/M/S on `nc == 2`, so at width zero only the Stereo lane runs on silence and the
    other four take the same "this lane stopped" branch they take at width ONE — a hard drop of their
    detector, exactly as before. Its answer to a pause is therefore "what this stage does at that width",
@@ -576,8 +465,8 @@ the CPU at runtime, invisible to any build. Full write-up:
    against and run their full per-sample body until they park. Measured at 48 kHz, ONE zero-width call
    covering a full minute (2 880 000 samples): `Compressor` **1.49 ms** (it collapses), `NoiseGate`
    **0.20 ms**, `TransientShaper` **3.65 ms**, `DeEsser` **4.08 ms**, `DynamicEqBand` **6.43 ms** — three
-   of which are past a 128-sample callback's 2.67 ms budget — and `LaneDynamics` and `PowerAmpStage`, the
-   two most expensive, are further past it again. **Read those as orders of magnitude, not as figures:**
+   of which are past a 128-sample callback's 2.67 ms budget — and `LaneDynamics`, the most expensive,
+   is further past it again. **Read those as orders of magnitude, not as figures:**
    they are wall-clock timings and they moved by 2x between runs of the same binary on the same machine
    depending on what else was building, which is exactly why the arithmetic claims above are stated in
    samples and these are not. What does not move is the SHAPE: that is a statement about ONE CALL carrying
@@ -614,9 +503,9 @@ the CPU at runtime, invisible to any build. Full write-up:
    ends the process where it meets a `noexcept` boundary, and the two are one line apart: `MasteringChain::prepare`
    allocates the EQ engine itself (an escape), then calls `EqEngine::prepare`, which is `noexcept` and allocates its
    scratch (a `terminate`). So exhaustion is **outside the refusal contract on every row**: it ends the module's
-   usefulness and is never answered with `false` — save in `nam`, natively, whose third-party backend throws:
-   `NamStage` catches what the backend's preparation throws and stays unprepared, a refusal this law neither asks of
-   the other modules nor forbids there. This is the explicit exception to 11b, and it was chosen over nothrow
+   usefulness and is never answered with `false` — save where a third-party backend throws (the NAM backend,
+   in felitronics-guitar-core, catches what its preparation throws and stays unprepared), a refusal this law
+   neither asks of the other modules nor forbids there. This is the explicit exception to 11b, and it was chosen over nothrow
    storage plus a status in every allocating module on measured grounds: what the core holds is a constant of its
    CONFIGURATION plus a small fraction of the programme, a caller can read it before committing (below) and stay
    clear of exhaustion by arithmetic, and a later move to the nothrow form is ADDITIVE — a new status code, no
@@ -761,7 +650,7 @@ its own JUCE-free self-tests.
 | `convolution`   | partitioned (uniform / **zero-latency**) FFT convolution            | **compiled**; FFT **via the seam** |
 | `oversampling`  | polyphase up/down-sampling                                           | compiled if SIMD; for true-peak + nonlinear |
 | `limiter`       | true-peak limiter                                                    | compiled; uses `oversampling` |
-| `neural`        | a thin **inference-object seam** (process-only); model *loading* lives in the adapter | **compiled, heavy, isolated**; backend chosen at build time per tier (NAM/Eigen desktop+wasm). NOT a runtime model-swap |
+| `neural`        | a thin **inference-object seam** (process-only) + the swap-safe model holder; model *loading* lives in the adapter | header-only, backend-free; a backend (the NAM one is in felitronics-guitar-core) is chosen at build time. NOT a runtime model-swap of one backend for another |
 
 **The FFT seam** (`core/Fft`) — the architecture's keystone, **designed FIRST** (see §6). NOT a bare
 `virtual fft(float*)`: a **plan object created in `prepare`** with explicit scratch ownership,
@@ -786,8 +675,9 @@ lowest-common-denominator that kills desktop performance).
   compressor uses the same `dynamics` broadband. The core gives primitives; products compose them.
 
   **AMENDED — where the line actually is.** As written this read as "no composite belongs in the core",
-  and the tree had already outgrown that in five places (`dynamiceq`, `deesser`, `multiband`,
-  `poweramp`, `rigplayer`) before `mastering` arrived. The rule those five follow, stated properly:
+  and the tree had already outgrown that in five places (`dynamiceq`, `deesser`, `multiband`, and two
+  guitar composites since moved to felitronics-guitar-core) before `mastering` arrived. The rule those
+  follow, stated properly:
 
   > A composite belongs in the core when **it is the unit under test** and its behaviour is shared.
   > It gets its OWN module, which may depend on many others; the primitive modules stay independent of
@@ -825,8 +715,7 @@ lowest-common-denominator that kills desktop performance).
   test on a generated fixture. An **arm-none-eabi** job is documented but **not gated**
   until an embedded product funds it (see §2).
 - **License:** AGPL-3.0-or-later, SPDX header on every file. Each heavy module records its third-party
-  deps + AGPL-compatibility in `THIRD_PARTY_NOTICES.md` (NAM MIT, Eigen MPL-2.0, nlohmann/json MIT,
-  pffft/kissfft BSD = OK; watch ONNX/others).
+  deps + AGPL-compatibility in `THIRD_PARTY_NOTICES.md` (pffft/kissfft BSD = OK; watch ONNX/others).
 
 ---
 
@@ -903,99 +792,10 @@ here is the *goal* state — only the adapter touches JUCE.
   in the FIR phase modes, `docs/DYNAMICS.md:112-117`) is now live behaviour, not a future constraint.
 - possibly **`limiter`** on the output (future).
 
-### Guitar amp plugin (OrbitCab) — desktop plugin
-Signal chain: `input → preamp (NAM) → tone EQ (teq) → poweramp (NAM) → cab (IR convolution) → output`.
-The headless DSP lives in `src/core/` (namespace `cab::`); the JUCE adapter (APVTS / processor / editor)
-is `src/`. Formats VST3/AU/CLAP/Standalone.
-
-**1. Reuse of `teq::` — already on the FetchContent model, not a copy.**
-- **Correction to §1/§5's premise:** OrbitCab does **not** copy-vendor `teq/`. It pulls it via CMake
-  `FetchContent` from `github.com/darwinscat/tabby-eq`, **pinned tag `v0.1.0`**, `SOURCE_SUBDIR teq`
-  (only the header-only `teq/` core, never the TabbyEQ plugin or its JUCE), linked as `teq::core`.
-  So this product is *already* on the pinned-fetch model the doc targets — there is no folder-copy to
-  migrate; the `teq → felitronics::eq` move here is just repointing the `FetchContent` URL/tag.
-- **Used for the amp tone stack only:** `cab::AmpEq` (`src/core/AmpEq.h`) wraps `teq::EqEngine`, using
-  **6 of teq's 24 bands** — HPF, Bass (low shelf), Mid (bell), Treble (high shelf), Presence (high
-  shelf), LPF — at fixed (generic) frequencies. Recorded in `THIRD_PARTY_NOTICES.md`.
-- **Footprint gotcha (relevant to the `eq` module):** `teq::EqEngine` is ~**200 KB** (a fixed 24-band
-  bank), so `cab::AmpEq` holds it on the **heap** (`unique_ptr`, built in `prepare()`), never by value
-  — a by-value member overflowed MSVC's **1 MB** main-thread stack (the integration test stack-allocates
-  the processor; macOS's 8 MB hid it). → keep `eq` heap-placeable and make `kMaxBands` shrinkable (law 5).
-- Note: the cab's *own* per-slot HPF/LPF are **not** teq — they are `juce::dsp::StateVariableTPTFilter`
-  (see §6). `teq` is the amp EQ only.
-
-**2. Amp-specific DSP we have today** (all `cab::`, `src/core/`):
-- **Neural amp (preamp + poweramp):** `cab::AmpStage` (`AmpStage.{h,cpp}`) over **NeuralAmpModelerCore**
-  (sdatkinson, pinned commit `b5a68c3…`), inference on **Eigen** (MPL-2.0) + nlohmann/json (MIT),
-  `NAM_SAMPLE_FLOAT` (float hot path). **Not RTNeural, not ONNX.** WaveNet/LSTM/ConvNet architectures
-  self-register via static initializers → must be linked `WHOLE_ARCHIVE`. Two instances = preamp +
-  poweramp. Effectively **JUCE-free** (NAM + std + StreamResampler). Model load is off-thread + atomic
-  swap (threading in the adapter, law 1).
-- **`cab::StreamResampler` (`StreamResampler.h`):** **JUCE-free** 64-tap polyphase windowed-sinc resampler (Catmull-Rom until P34) that rate-matches
-  a model's native SR to the host SR; the only source of reported latency (0 when SRs match).
-- **IR cabinet convolution:** `cab::Convolver` (`Convolver.h`) + `cab::IRSlot` (`IRSlot.{h,cpp}`) over
-  **`juce::dsp::Convolution`** in **zero-latency** mode. **JUCE-dependent** (see §6 conflicts).
-- **Per-slot cab HPF/LPF:** `juce::dsp::StateVariableTPTFilter` (12 dB/oct Butterworth), pre-convolution,
-  per A/B slot. **JUCE-dependent.**
-- **Auto-leveler:** `cab::AutoLeveler` (`AutoLeveler.h`) — wet/dry RMS followers + silence gate →
-  makeup `sqrt(dryMS/mixMS)`. JUCE-free math.
-- **Spectrum tap:** `cab::SpectrumTap` (`SpectrumTap.h`) — the same struct as the doc's `analysis`
-  SpectrumTap, but a **JUCE-coupled diverged copy** (`juce::FloatVectorOperations`, `SpectrumTap.h:6,37`);
-  the JUCE-free `teq::SpectrumTap` twin is the consolidation base (see §7.3).
-- **NOT present today:** dedicated noise gate, drive / boost / clipper / waveshaper, oversampling.
-  ("boost" is a NAM *capture* variant, not DSP; "gate" in the code = bypass / mute / auto-level gating.)
-
-**3. Core vs product-specific — recommended boundaries.**
-- **Lift to the shared core:**
-  - `eq` ← already `teq`. ✓
-  - `analysis` ← `SpectrumTap` — **but `cab::SpectrumTap` is NOT JUCE-free** (`SpectrumTap.h:6,37` use
-    `juce::FloatVectorOperations`); the **`teq::SpectrumTap` copy IS** (`std::copy` + `reset()` +
-    `tryPull()`). They are **diverged copies** of one struct → consolidate to the `teq::` shape as
-    `felitronics::analysis::SpectrumTap`; OrbitCab swaps `FloatVectorOperations`→`std::copy` and
-    `CabEngine::pullSpectrum` (`CabEngine.cpp:323`) → `tap.tryPull()`.
-  - `neural` ← the NAM/Eigen runtime — **isolated behind the inference seam** so EQ/comp products never
-    drag it in. (Runtime is NAM, not RTNeural; model loading stays in the adapter, see §8.)
-  - `convolution` ← the cab IR conv — but only **after** a JUCE-free FFT impl exists behind the seam
-    (today it is `juce::dsp::Convolution`); must preserve **zero-latency** partitioning.
-  - A small **resampler** util (StreamResampler) — generic rate-match, candidate for `core`.
-- **Stays product-specific (OrbitCab):** the chain glue (`cab::CabEngine`: stage order, dry/wet, A↔B
-  mix, phase, trim, auto-level), the tone-stack **voicing** (fixed freqs / future per-model measured
-  stacks — composition, not a primitive), the NAM **library/selector** (`PreampLibrary` /
-  `PowerampLibrary` filename → channel/gain/PP·SE/hours), IR loading, UI, APVTS. `AutoLeveler` is a thin
-  matcher — leave product-specific unless a second product wants it.
-
-**4. Target platforms.**
-- **Shipping: desktop only** — macOS universal / Windows x64+arm64 / Linux x64+arm64.
-- **WASM:** aspirational, not built. *Partly* ready — `cab::Params` is deliberately JUCE-free ("compiles
-  under Emscripten / embedded"); `teq` + `cab::AmpStage` are JUCE-free. But the **cab path
-  (convolution + SVF + `juce::AudioBuffer`/`SmoothedValue`/`FloatVectorOperations`) is JUCE-coupled** →
-  not WASM-ready as-is.
-- **Embedded / hardware:** **no concrete SoC / fixed-point / no-heap target defined for this plugin yet.**
-  Honest blocker: the neural amp (**Eigen + WaveNet/LSTM**) is desktop/WASM-grade, not bare-MCU-grade — a
-  real hardware amp would need a *different, lighter* neural runtime (RTNeural fixed-size, or a tiny
-  model), not NAM-on-Eigen. So "embedded amp" changes the `neural` impl, not just shrinks constants.
-
-**5. Constraints the core must respect for the amp.**
-- **Zero-latency convolution** — the `convolution` module must offer a zero-latency partitioned mode
-  (not only uniform-partitioned with PDC); OrbitCab advertises ~0-sample latency.
-- **Separable `prepare()`/`process()` + swap-safe hot path** — NAM models and IRs are large; build/load
-  on the message thread, atomic-swap into the live pointer (law 1, no alloc in `process()`).
-- **Float hot path** — NAM (`NAM_SAMPLE_FLOAT`) and teq both process float (law 3 ✓).
-- **Large fixed-size state** — `teq::EqEngine` ~200 KB; `eq` must stay heap-placeable, `kMaxBands`
-  shrinkable for small RAM.
-- **Licenses (all AGPL-compatible):** NAM = MIT, Eigen = MPL-2.0, nlohmann/json = MIT, teq = AGPL,
-  JUCE = AGPL option. A JUCE-free `convolution` FFT must use a permissive lib (pffft / kissfft BSD = OK).
-
-**6. Constraints / conflicts with the portability laws.**
-- **Law 4 (deps behind a seam) is VIOLATED by the cab path today.** `cab::Convolver` hard-wires
-  `juce::dsp::Convolution` and `cab::IRSlot` the JUCE SVF — so OrbitCab's "core" is **not fully
-  JUCE-free**: only `teq` (eq) and `cab::AmpStage` (neural) are. Lifting the cab path into
-  `felitronics::convolution` requires real de-JUCE-ing: a JUCE-free FFT behind the seam, replacing the
-  JUCE SVF (teq's Cytomic SVF is the natural swap), and dropping `juce::AudioBuffer`/`SmoothedValue`/
-  `FloatVectorOperations` for `core` primitives. **This is the guitar plugin's main migration cost — size
-  it explicitly.** (This is exactly why the FFT-seam spike comes first, §6.)
-- **Neural-on-embedded conflicts with "bare-MCU friendly."** NAM-on-Eigen will not fit a small MCU →
-  the inference seam must allow a *different backend per build* (not a runtime swap of one model), §8.
+### Guitar products (OrbitCab, orbit-amp, the capture apps)
+Their DSP beyond this core — the NAM backend, the `.orbitrig` pack player, the tube power-amp trunk —
+lives in felitronics-guitar-core. This section's original OrbitCab inventory, the pre-migration map of
+that product's DSP, moved there verbatim: `docs/HISTORY-ORBITCAB-INVENTORY.md`.
 
 ### Future products
 - Standalone **compressor** (Felitronics) — `dynamics` broadband + optional sidechain `eq`.
