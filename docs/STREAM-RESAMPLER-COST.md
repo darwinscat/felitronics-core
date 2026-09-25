@@ -484,5 +484,5 @@ the protocol but nothing will tell you when they rot; treat them as dated measur
 
 A consumer that aligns a dry or bypass path delays it by exactly this figure, so it is an audio-alignment
 number as well as a PDC report, and a consumer that sums two rate-matching stages reports the sum. What
-the P34 kernel moved downstream — in the NAM stage, the pack player, OrbitCab and orbit-amp, measured —
-is recorded with those modules: felitronics-guitar-core `docs/STREAM-RESAMPLER-DOWNSTREAM.md`.
+the kernel swap moved downstream, in the NAM stage and the products, left this document with those
+modules.

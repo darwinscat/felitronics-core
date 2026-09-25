@@ -794,8 +794,8 @@ here is the *goal* state — only the adapter touches JUCE.
 
 ### Guitar products (OrbitCab, orbit-amp, the capture apps)
 Their DSP beyond this core — the NAM backend, the `.orbitrig` pack player, the tube power-amp trunk —
-lives in felitronics-guitar-core. This section's original OrbitCab inventory, the pre-migration map of
-that product's DSP, moved there verbatim: `docs/HISTORY-ORBITCAB-INVENTORY.md`.
+lives in felitronics-guitar-core. The pre-migration inventory of OrbitCab's DSP that this section used to
+carry left core with those modules.
 
 ### Future products
 - Standalone **compressor** (Felitronics) — `dynamics` broadband + optional sidechain `eq`.
