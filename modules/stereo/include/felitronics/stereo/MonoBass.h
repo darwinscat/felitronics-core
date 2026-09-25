@@ -52,11 +52,32 @@ namespace felitronics::stereo
 // click. Instead lowWidth=1 also ramps the dry/wet crossfade `xf`→1 (same 20 ms), and only once xf has
 // SETTLED at 1.0 does process() take the bit-exact early-return bypass. Entering ANY bypass (settled
 // full-wide / disabled / non-stereo) resets the crossover state, so re-entry never replays stale tails —
-// it restarts the filters from zero, a bounded click-free settle (tested). `setEnabled` stays a hard
-// toggle (host-level bypasses ramp; sibling StereoWidth parity). Setters reject non-finite values and
-// clamp (a stray host NaN can't poison the SVF state — std::clamp would pass it through). reset() snaps
+// it restarts the filters from zero, a bounded click-free settle (tested). Setters reject non-finite values
+// and clamp (a stray host NaN can't poison the SVF state — std::clamp would pass it through). reset() snaps
 // the smoothers to their targets (snap-on-load: no ramp on session recall). `frequency()` reads back the
 // clamped value ([20, 0.45·fs], re-clamped if prepare() lowers fs).
+//
+// LIVE MOVES GLIDE, and the first write of a stream SNAPS. Measured on a 103.7 Hz tone with L and R 90° apart
+// (a large Side) through the mastering chain, max|Δ²y| where the change reaches the output against -84 dBFS
+// for the steady tone: the crossover frequency 60 -> 250 Hz stepped at -45.3 dBFS (its SVF coefficients were
+// set at once), `enabled` false -> true at -48.7 and true -> false at -21.5 (a hard switch with a crossover
+// reset). So:
+//  * THE CROSSOVER FREQUENCY rides a one-pole `core::Smoother` (kFreqSmoothMs = 30 ms, the EQ's own), advanced
+//    by 64 samples at every `core::StateGrid` boundary with the four SVFs redesigned there when it moved —
+//    EqBand's idiom, and a TPT SVF is the topology made for a moving coefficient.
+//  * `enabled` IS THE xf CROSSFADE: disabling fades the Side to dry exactly as a full-wide lowWidth does, and
+//    the bit-exact bypass follows once it has settled; enabling fades back in from a crossover restarted at
+//    zero. It used to be a hard toggle "for parity with StereoWidth"; the mastering chain's live preview is
+//    the product that disagrees.
+//  * THE AIR SHELF'S CORNER rides a Smoother like the crossover's, and its `enabled` glides the plateau to and
+//    from 0 dB (where the shelf is skipped) instead of switching it.
+// Every one of those advances on audio time — per sample, or at grid boundaries counted in samples, bypassed
+// stretches included — so a stream cut any other way renders the same bits (law 8a). And every write that
+// lands before the first sample after prepare()/reset() SNAPS, lowWidth and the air plateau included, which
+// they did not: a write between prepare() and the first sample used to glide those two from the prepared
+// values, so "configure, then prepare" and "prepare, then configure" rendered differently (measured through
+// the mastering chain, 71 529 and 59 030 samples of a one-second render). They are one behaviour now — the
+// configure-then-prepare one, whose bits are unchanged.
 //
 // STRICTLY STEREO: process() touches the buffer ONLY when numChannels == 2 — a mono or surround bus
 // passes through whole (treating a stereo pair inside a wider layout is a routing decision the host
@@ -105,6 +126,7 @@ class MonoBass
 {
 public:
     static constexpr double kSmoothingMs = 20.0;    // click-free lowWidth automation + the bypass crossfade
+    static constexpr double kFreqSmoothMs = 30.0;   // the crossover and the air corner, one-pole on the grid
     static constexpr float  kMinFreq     = 20.0f;
 
     // Law 11: a default-constructed MonoBass is NOT a valid configuration, whatever its member defaults
@@ -118,9 +140,13 @@ public:
         prepared_ = false;
         if (maxChannels < 1 || maxChannels > 2) return false;
         fs_ = (std::isfinite (sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;   // inf/NaN/≤0 -> 48 kHz
+        fresh_ = true;                              // a preparation is a stream restart: the corners design at once,
+        xoHz_  = -1.0f;                             // and at THIS rate, whatever the last one designed
         xo_.prepare (fs_, 1);
         widthSm_.reset (fs_, kSmoothingMs * 0.001);
         xfSm_.reset (fs_, kSmoothingMs * 0.001);
+        freqSm_.prepare (fs_, kFreqSmoothMs);
+        airFreqSm_.prepare (fs_, kFreqSmoothMs);
         applyFrequency();
         airSm_.reset (fs_, kSmoothingMs * 0.001);
         clampAirFrequency();                        // the ceiling is 0.45*fs, so it moves with the rate
@@ -134,21 +160,33 @@ public:
     void reset() noexcept                           // snap smoothers to targets (settled, no glide) + clear filter state
     {
         widthSm_.setCurrentAndTargetValue (lowWidth_);
-        xfSm_.setCurrentAndTargetValue (lowWidth_ >= 1.0f ? 1.0f : 0.0f);
+        xfSm_.setCurrentAndTargetValue (xfTarget());
+        // The corners land where they were written and are designed there — a glide in flight does not resume.
+        freqSm_.snap ((double) freq_);
+        designXo();
+        airFreqSm_.snap ((double) airFreq_);
+        airFreqCur_ = airFreq_;
         xo_.reset();
         grid_.reset();                              // a stream restart re-anchors the maintenance grid
         bypassed_ = false;
         // K14. The shelf's ramp snaps like the others, its state clears like the crossover's, and the
         // width interval starts over: a total carried across a restart is not a measurement of either
         // side of it.
-        airSm_.setCurrentAndTargetValue (airDb_);
+        airSm_.setCurrentAndTargetValue (airTarget());
         airShelf_.reset();
-        airBypassed_ = ! airEnabled_ || core::exactlyEqual (airDb_, 0.0f);
+        airBypassed_ = core::exactlyEqual (airTarget(), 0.0f);
         airDesignedDb_ = airDesignedHz_ = -1.0f;
         retuneWidthBand();
+        fresh_ = true;                              // the next writes, up to the first sample, snap
     }
 
-    void setEnabled (bool e) noexcept { enabled_ = e; }
+    // Glides through the xf crossfade (see LIVE MOVES GLIDE) — or lands at once before the stream's first sample.
+    void setEnabled (bool e) noexcept
+    {
+        enabled_ = e;
+        if (fresh_) xfSm_.setCurrentAndTargetValue (xfTarget());
+        else        xfSm_.setTargetValue (xfTarget());
+    }
 
     void setFrequency (float hz) noexcept
     {
@@ -161,8 +199,14 @@ public:
     {
         if (! std::isfinite (w)) return;
         lowWidth_ = std::clamp (w, 0.0f, 1.0f);
+        if (fresh_)
+        {
+            widthSm_.setCurrentAndTargetValue (lowWidth_);
+            xfSm_.setCurrentAndTargetValue (xfTarget());
+            return;
+        }
         widthSm_.setTargetValue (lowWidth_);
-        xfSm_.setTargetValue (lowWidth_ >= 1.0f ? 1.0f : 0.0f);
+        xfSm_.setTargetValue (xfTarget());
     }
 
     // The three setters above as one object — see MonoBassParams. Order matters only in that it is the
@@ -183,15 +227,30 @@ public:
     // good value stands, the ranges are clamped, and `air()` reads back what was actually applied.
     void setAir (const StereoAirParams& p) noexcept
     {
+        // THE CORNER IS COMPARED AGAINST WHAT IT WAS BEFORE THIS WRITE. It used to be captured after the
+        // assignment, so the width-measurement band was re-tuned only when the CLAMP moved the corner, never
+        // when the caller did: a live 6000 -> 8000 Hz move kept summing across both bands (measured:
+        // airJudgedSamples() read 2000 where the new band had judged 1000). The note at retuneWidthBand() was
+        // always the contract; this is the code agreeing with it.
+        const float wasFreq = airFreq_;
         airEnabled_ = p.enabled;
         if (std::isfinite (p.frequencyHz)) airFreq_ = p.frequencyHz;
         if (std::isfinite (p.gainDb))      airDb_   = std::clamp (p.gainDb, 0.0f, kMaxAirDb);
-        const float wasFreq = airFreq_;
         clampAirFrequency();
         if (! core::exactlyEqual (wasFreq, airFreq_)) retuneWidthBand();
         // THE SMOOTHER CARRIES THE dB, not the coefficients: a +3 dB step on Side is a 0.41*S jump, and
-        // a shelf redesigned between two settled values is still a discontinuity in the output.
-        airSm_.setTargetValue (airDb_);
+        // a shelf redesigned between two settled values is still a discontinuity in the output. `enabled`
+        // rides the same smoother now — its target is the plateau, or 0 dB (where the shelf is skipped) — and
+        // the corner rides its own, on the grid.
+        if (fresh_)
+        {
+            airSm_.setCurrentAndTargetValue (airTarget());
+            airFreqSm_.snap ((double) airFreq_);
+            airFreqCur_ = airFreq_;
+            return;
+        }
+        airSm_.setTargetValue (airTarget());
+        airFreqSm_.setTarget ((double) airFreq_);
     }
     StereoAirParams air() const noexcept { return { airEnabled_, airFreq_, airDb_ }; }
 
@@ -245,15 +304,17 @@ public:
         if (numChannels > 2) return false;              // width is a LIMIT — law 11(b)
         if (n == 0) return true;                        // no samples: no time, no edge, nothing at all —
                                                         // the bypass edge below used to fire even here
+        fresh_ = false;                                 // the stream has started: a write glides from here on
         // TWO TOOLS SHARE THIS ISLAND NOW, so the gate asks about BOTH. The island is skipped only when
         // neither has anything to do; with the bass settled full-wide and the air ramping, the round trip
         // still has to run, and the old spelling would have skipped it and dropped the shelf silently.
-        const bool mbIdle = ! enabled_ || (! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f));
+        // A DISABLED bass is one whose crossfade has settled at dry — `enabled` rides xf now.
+        const bool mbIdle = ! xfSm_.isSmoothing() && core::exactlyEqual (xfSm_.getCurrentValue(), 1.0f);
         if (numChannels != 2 || (mbIdle && airIdle()))
         {
             if (! bypassed_)    { bypassed_ = true;    xo_.reset(); }
             if (! airBypassed_) { airBypassed_ = true; airShelf_.reset(); }
-            grid_.skip (n);                 // bypassed audio is still audio TIME — keep the grid anchored
+            skipTime (n);                   // bypassed audio is still audio TIME — the grid and the corners move on
             return true;
         }
         // …and each tool owns its own latch. Resetting the crossover because the AIR toggled would click
@@ -278,7 +339,7 @@ public:
             {
                 mbDone = true;
                 if (! bypassed_) { bypassed_ = true; xo_.reset(); }
-                if (airIdle()) { grid_.skip (n - i); return true; }
+                if (airIdle()) { skipTime (n - i); return true; }
             }
             float m, s; MidSide::encode (L[i], R[i], m, s);
             float sOut = s;
@@ -295,7 +356,8 @@ public:
             // forced identity coefficients are not transparent — the biquad computes 1.0*x + 0.0 in double
             // and turns -0.0f into +0.0f, measured, which is the very defect that disqualified the
             // clipper's mix = 0 bypass. So zero is a BRANCH, taken on the smoothed and clamped value.
-            if (airEnabled_)
+            // `enabled` rides the plateau's smoother (its target is 0 dB when off), so the shelf runs for as long
+            // as that smoother is away from 0 — a switch-off fades instead of stepping.
             {
                 const bool  moving = airSm_.isSmoothing();
                 const float db     = airSm_.getNextValue();
@@ -322,7 +384,7 @@ public:
             // block size (measured on this stage: 37180 of 40000 tail samples differ between a
             // whole-file call and one-sample calls, and a whole-file call never flushed at all).
             // One increment and a compare per sample; the flush itself still runs once per period.
-            if (grid_.advance (1)) { xo_.flushDenormals(); airShelf_.flushDenormals(); }
+            if (grid_.advance (1)) { xo_.flushDenormals(); airShelf_.flushDenormals(); tickCorners(); }
         }
         // The poison half stays per call — see eq::Biquad::healPoison(). Invisible on a finite stream.
         xo_.healPoison();
@@ -331,12 +393,60 @@ public:
     }
 
 private:
-    void applyFrequency() noexcept                  // coefficients only — no state reset, so a freq move doesn't click
+    // The clamp, then either the design at once (before the stream's first sample) or a new target for the
+    // corner's smoother, which the grid walks to it.
+    void applyFrequency() noexcept
     {
         const float hi = std::max (kMinFreq, (float) (0.45 * fs_));   // keep lo <= hi even at absurdly low fs (clamp UB otherwise)
         freq_ = std::clamp (freq_, kMinFreq, hi);
-        xo_.setFrequency (freq_);
+        if (fresh_) { freqSm_.snap ((double) freq_); designXo(); }
+        else        freqSm_.setTarget ((double) freq_);
     }
+
+    // The crossover at the smoother's value — redesigned only when that value moved, so a settled corner costs
+    // a comparison per grid boundary and nothing else.
+    void designXo() noexcept
+    {
+        const float f = (float) freqSm_.value();
+        if (core::exactlyEqual (f, xoHz_)) return;
+        xoHz_ = f;
+        xo_.setFrequency (f);
+    }
+
+    // ONE GRID BOUNDARY for the two corners: each smoother advances by exactly one period (EqBand's rule — a
+    // partial period must never advance control, or the glide would be back on the caller's clock), and the
+    // crossover is redesigned if its corner moved. The shelf picks its corner up at its next design.
+    void tickCorners() noexcept
+    {
+        freqSm_.advance (core::StateGrid::kPeriod);
+        airFreqSm_.advance (core::StateGrid::kPeriod);
+        designXo();
+        airFreqCur_ = (float) airFreqSm_.value();
+    }
+
+    // Audio time that ran no audio — a bypassed island, a mono stretch, a clock-only call — still carries the
+    // corners: every boundary it crosses is a tick, exactly as the audio path would have taken it. Bounded by the
+    // smoothers' own settling (they arrive exactly and then cost nothing), not by the length of the call.
+    void skipTime (int n) noexcept
+    {
+        long long boundaries = ((long long) grid_.phase() + (long long) n) / core::StateGrid::kPeriod;
+        grid_.skip (n);
+        const bool moving = ! (core::exactlyEqual (freqSm_.value(), freqSm_.targetValue())
+                               && core::exactlyEqual (airFreqSm_.value(), airFreqSm_.targetValue()));
+        if (! moving) return;
+        for (; boundaries > 0; --boundaries)
+        {
+            freqSm_.advance (core::StateGrid::kPeriod);
+            airFreqSm_.advance (core::StateGrid::kPeriod);
+            if (core::exactlyEqual (freqSm_.value(), freqSm_.targetValue())
+                && core::exactlyEqual (airFreqSm_.value(), airFreqSm_.targetValue())) break;
+        }
+        designXo();
+        airFreqCur_ = (float) airFreqSm_.value();
+    }
+
+    float xfTarget()  const noexcept { return (! enabled_ || lowWidth_ >= 1.0f) ? 1.0f : 0.0f; }
+    float airTarget() const noexcept { return airEnabled_ ? airDb_ : 0.0f; }
 
     void clampAirFrequency() noexcept
     {
@@ -351,7 +461,7 @@ private:
     // before it skips its own round trip, and the same reason.
     bool airIdle() const noexcept
     {
-        return ! airEnabled_ || (! airSm_.isSmoothing() && core::exactlyEqual (airSm_.getCurrentValue(), 0.0f));
+        return ! airSm_.isSmoothing() && core::exactlyEqual (airSm_.getCurrentValue(), 0.0f);
     }
 
     // WHILE THE RAMP MOVES the design is quantised to 0.01 dB, so a 6 dB move costs 600 redesigns
@@ -361,16 +471,20 @@ private:
     void designAir (float db, bool moving) noexcept
     {
         const float use = moving ? std::round (db * 100.0f) * 0.01f : db;
-        if (core::exactlyEqual (use, airDesignedDb_) && core::exactlyEqual (airFreq_, airDesignedHz_)) return;
+        if (core::exactlyEqual (use, airDesignedDb_) && core::exactlyEqual (airFreqCur_, airDesignedHz_)) return;
         airDesignedDb_ = use;
-        airDesignedHz_ = airFreq_;
-        airShelf_.setCoeffs (eq::matched::highShelfDb ((double) airFreq_, fs_, (double) use));
+        airDesignedHz_ = airFreqCur_;
+        airShelf_.setCoeffs (eq::matched::highShelfDb ((double) airFreqCur_, fs_, (double) use));
     }
 
     double fs_ = 48000.0;
     bool   prepared_ = false;   // law 11: the crossover has no coefficients before prepare()
+    bool   fresh_ = true;       // no sample since prepare()/reset(): a write SNAPS instead of gliding
     float  freq_ = 120.0f, lowWidth_ = 0.0f;
+    float  xoHz_ = -1.0f;       // the corner the crossover is designed at (-1: none yet)
     bool   enabled_ = true, bypassed_ = false;
+    core::Smoother freqSm_, airFreqSm_;             // the two corners' glides, on the grid
+    float  airFreqCur_ = 6000.0f;                   // the air corner the shelf is designed at, as the grid walks it
     eq::Crossover2 xo_;                             // the Side-channel LR4 split (the primitive extracted from here, reused back)
     core::StateGrid grid_;                          // law 8 on audio time, never on the caller's block
     core::LinearSmoother widthSm_ { 0.0f }, xfSm_ { 0.0f };
