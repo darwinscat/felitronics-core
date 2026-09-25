@@ -22,7 +22,8 @@
 // `dynamiceq::LaneDynamics` needs an EqBand and a captured sidechain, `mastering::MasteringChain` has
 // an EXACT width and its own block-invariance suite, and `neural::NeuralStage` is a template over a
 // backend (NeuralTests). Saying "if a module has a process(), it is here" would be false, and the
-// diff-pass consilium checked.
+// diff-pass review checked. The chain's and the renderer's refused-prepare case lives beside them,
+// in MasteringCallContractTests.
 //
 // The properties themselves live in test_support/law11_call_contract.h, so felitronics-guitar-core
 // sweeps its stages with the same ones: `poweramp::PowerAmpStage` in its PowerAmpCallContractTests,
@@ -49,10 +50,8 @@
 #include <felitronics/eq/EqEngine.h>
 #include <felitronics/limiter/TruePeakLimiter.h>
 #include <felitronics/lineareq/LinearPhaseEq.h>
-#include <felitronics/mastering/MasteringChain.h>
 #include <felitronics/multiband/MultibandCompressor.h>
 #include <felitronics/multiband/MultibandWidth.h>
-#include <felitronics/mastering/OfflineRenderer.h>
 #include <felitronics/lineareq/NaturalPhaseEq.h>
 #include <felitronics/saturation/Saturator.h>
 #include <felitronics/stereo/MonoBass.h>
@@ -475,25 +474,6 @@ void namedCases()
 //==================================================================================================
 void secondPassCases()
 {
-    group ("law 11b — a refused prepare() adopts nothing and leaves the object UNUSABLE");
-    {
-        // The two halves are only compatible in one order — disarm, validate, write — and the
-        // observable contract is these three lines, not "the old fields survive": storing the width
-        // before validating the block size was a heap-buffer-overflow in render().
-        felitronics::mastering::OfflineRenderer r;
-        ok (r.prepare (1, 256), "precondition: a 1-channel, 256-sample renderer");
-        ok (! r.prepare (2, 0), "prepare(2, 0) is refused — the block size is impossible");
-        ok (r.maxChannels() != 2, "...and the REFUSED call's own width was not adopted");
-        felitronics::mastering::MasteringChain chain;
-        ok (chain.prepare (kFs, 1), "precondition: a 1-channel chain to render through");
-        std::vector<float> buf ((std::size_t) 256, 0.1f);
-        float* p[1] { buf.data() };
-        ok (! r.render (chain, (const float* const*) p, p, 1, 256),
-            "...and the renderer is UNUSABLE until a prepare() succeeds (it used to write past its scratch)");
-        ok (r.prepare (1, 256) && r.render (chain, (const float* const*) p, p, 1, 256),
-            "...and a successful prepare() brings it back");
-    }
-
     group ("law 11b — a refused prepare() leaves the object UNPREPARED, not armed on the old build");
     {
         felitronics::multiband::MultibandCompressor<4> mc;

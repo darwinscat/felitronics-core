@@ -42,10 +42,16 @@ if(FELITRONICS_BUILD_TESTS)
     add_test(NAME felitronics_spectrum_frames_tests COMMAND felitronics_spectrum_frames_tests)
 
     add_executable(felitronics_math_policy_tests tests/MathPolicyTests.cpp)   # the RT/offline coefficient-math routing gate
-    target_link_libraries(felitronics_math_policy_tests PRIVATE felitronics::analysis_offline)
+    target_link_libraries(felitronics_math_policy_tests PRIVATE felitronics::analysis felitronics::eq)
     target_include_directories(felitronics_math_policy_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_math_policy_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_math_policy_tests COMMAND felitronics_math_policy_tests)
+
+    add_executable(felitronics_analyzer_math_policy_tests tests/AnalyzerMathPolicyTests.cpp)   # ...and the analyzers' half: they own the deterministic spellings
+    target_link_libraries(felitronics_analyzer_math_policy_tests PRIVATE felitronics::analysis_offline)
+    target_include_directories(felitronics_analyzer_math_policy_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_analyzer_math_policy_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_analyzer_math_policy_tests COMMAND felitronics_analyzer_math_policy_tests)
 
     add_executable(felitronics_clip_detector_tests tests/ClipDetectorTests.cpp)   # clipping by construction + a whole-file reference null
     target_link_libraries(felitronics_clip_detector_tests PRIVATE felitronics::analysis)

@@ -90,32 +90,6 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_delivered_ceiling_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_delivered_ceiling_tests COMMAND felitronics_delivered_ceiling_tests)
 
-    # LAW 11 — the caller's contract, as PROPERTIES over the whole accepted and the whole rejected
-    # domain of every block-level entry point in the core. It lives here rather than in a module
-    # because the law is cross-module by construction: the census that produced it found three answers
-    # for the width and four for the length, and a single-module suite is exactly what let that happen.
-    # Links every module that has such an entry point (mastering already pulls most of them in).
-    add_executable(felitronics_call_contract_tests tests/CallContractTests.cpp)
-    target_link_libraries(felitronics_call_contract_tests PRIVATE
-        felitronics::mastering felitronics::multiband felitronics::deesser felitronics::dynamiceq
-        felitronics::lineareq felitronics::convolution felitronics::analysis)
-    target_include_directories(felitronics_call_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
-    target_compile_features(felitronics_call_contract_tests PRIVATE cxx_std_20)
-    add_test(NAME felitronics_call_contract_tests COMMAND felitronics_call_contract_tests)
-
-    # Law 11c ("a pause is silence") spans six addresses in five modules plus one composite, and the law
-    # is ONE claim — split per module, each stage would get to answer it its own way. Lives here for the
-    # same reason CallContractTests does: this is the module that already links everything law 11 touches.
-    # The seventh address, poweramp::PowerAmpStage, moved with its module to felitronics-guitar-core and is
-    # tested there through the same fixture helpers (test_support/law11c_pause.h), not a copy of them.
-    add_executable(felitronics_pause_is_silence_tests tests/PauseIsSilenceTests.cpp)
-    target_link_libraries(felitronics_pause_is_silence_tests PRIVATE
-        felitronics::mastering felitronics::multiband felitronics::deesser felitronics::dynamiceq
-        felitronics::eq)
-    target_include_directories(felitronics_pause_is_silence_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
-    target_compile_features(felitronics_pause_is_silence_tests PRIVATE cxx_std_20)
-    add_test(NAME felitronics_pause_is_silence_tests COMMAND felitronics_pause_is_silence_tests)
-
     # P7 — the target-loudness solver, its constraints and its statistics. Separate from the chain's own
     # suite because it tests a different KIND of claim: not "the chain computes this", but "the search
     # lands here, in this many renders, and refuses by name when it cannot".
@@ -136,4 +110,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_mastering_progress_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_mastering_progress_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_mastering_progress_tests COMMAND felitronics_mastering_progress_tests)
+
+    # Law 11b for OfflineRenderer and the chain — the named case the law-11 census carried for them, through
+    # the same harness (test_support/law11_call_contract.h); the census itself is modules/laws.
+    add_executable(felitronics_mastering_call_contract_tests tests/MasteringCallContractTests.cpp)
+    target_link_libraries(felitronics_mastering_call_contract_tests PRIVATE felitronics::mastering)
+    target_include_directories(felitronics_mastering_call_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_mastering_call_contract_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_mastering_call_contract_tests COMMAND felitronics_mastering_call_contract_tests)
 endif()
