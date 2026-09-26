@@ -54,10 +54,11 @@ namespace felitronics::dynamiceq
 // as it releases, the band's dynamic seam is HELD OPEN: EqBand ignores deltas while its own `dyn.on` is false, so
 // this layer writes the band's parameters back with `dyn.on` true, and restores the caller's value when it is done
 // (the band's delta bell at 0 dB is transparent, so the hand-back is seamless). It is OPT-IN because it writes the
-// band: a product that re-writes every band every block (TabbyEQ does) would flip that flag back and forth and pay
-// a redesign each time, and one that stops calling processBand() for a point with no dynamics left would never see
-// the release finish. The mastering chain calls this layer only from its own quanta and writes bands only when a
-// parameter moved, so it opts in. A point switched back on mid-release carries on from where the release stands.
+// band and because the caller must keep calling processBand() for the point until the release has landed: a product
+// that stops calling it for a point with no dynamics left would never see the release finish. The mastering chain
+// calls this layer only from its own quanta and writes bands only when a parameter moved; TabbyEQ keeps its dynamic
+// path running while any seam still carries a delta. Both opt in. A point switched back on mid-release carries on
+// from where the release stands.
 // The DETECTORS KEEP RUNNING through a release — on the sidechain when there is one, on silence at the audio's
 // width when there is not — with only the gain computer's target forced to 0 dB, so a point switched back on finds
 // a detector that heard the release rather than one frozen at the duck; and the engaged path's lane bookkeeping
