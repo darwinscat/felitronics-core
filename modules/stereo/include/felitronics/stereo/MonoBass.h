@@ -180,6 +180,28 @@ public:
         fresh_ = true;                              // the next writes, up to the first sample, snap
     }
 
+    // A HOST BYPASS OF THE WHOLE ISLAND, riding the island's own fades: the bass's crossfade goes to dry and the air's
+    // plateau to 0 dB (kSmoothingMs each, the fades `enabled` uses), after which the island retires on the sample
+    // clock — a bit-exact passthrough that returns before touching the buffer — and clearing the bypass fades both
+    // back in from filters restarted at zero. It OVERRIDES the parameters without replacing them: params() and air()
+    // keep reporting the caller's settings, and a write made while bypassed cannot switch either tool back on. Before
+    // the stream's first sample it lands at once, so a stage bypassed from the start is untouched input, exactly as
+    // one that was never called. This is what felitronics-mastering-core's MasteringChain uses for `bypassMonoBass`:
+    // the stage has no latency and no dry copy to blend with, and its own fades are already on the sample clock.
+    void setBypass (bool b) noexcept
+    {
+        bypass_ = b;
+        if (fresh_)
+        {
+            xfSm_.setCurrentAndTargetValue (xfTarget());
+            airSm_.setCurrentAndTargetValue (airTarget());
+            return;
+        }
+        xfSm_.setTargetValue (xfTarget());
+        airSm_.setTargetValue (airTarget());
+    }
+    bool isBypassed() const noexcept { return bypass_; }
+
     // Glides through the xf crossfade (see LIVE MOVES GLIDE) — or lands at once before the stream's first sample.
     void setEnabled (bool e) noexcept
     {
@@ -476,8 +498,8 @@ private:
         airFreqCur_ = (float) airFreqSm_.value();
     }
 
-    float xfTarget()  const noexcept { return (! enabled_ || lowWidth_ >= 1.0f) ? 1.0f : 0.0f; }
-    float airTarget() const noexcept { return airEnabled_ ? airDb_ : 0.0f; }
+    float xfTarget()  const noexcept { return (bypass_ || ! enabled_ || lowWidth_ >= 1.0f) ? 1.0f : 0.0f; }
+    float airTarget() const noexcept { return (airEnabled_ && ! bypass_) ? airDb_ : 0.0f; }
 
     void clampAirFrequency() noexcept
     {
@@ -511,6 +533,7 @@ private:
     double fs_ = 48000.0;
     bool   prepared_ = false;   // law 11: the crossover has no coefficients before prepare()
     bool   fresh_ = true;       // no sample since prepare()/reset(): a write SNAPS instead of gliding
+    bool   bypass_ = false;     // setBypass(): both tools fade out and the island retires
     float  freq_ = 120.0f, lowWidth_ = 0.0f;
     float  xoHz_ = -1.0f;       // the corner the crossover is designed at (-1: none yet)
     bool   enabled_ = true, bypassed_ = false;

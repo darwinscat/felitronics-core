@@ -375,6 +375,58 @@ static void testSetAirRetunesOnALiveMove()
     ok (m.airJudgedSamples() == 1000, "a plateau-only write keeps the interval");
 }
 
+
+// setBypass — the island's host bypass rides its own fades: after them a bit-exact passthrough; params() and air()
+// unchanged; a write made while bypassed cannot switch a tool back on; before the first sample it lands at once.
+static void testSetBypass()
+{
+    group ("setBypass — the island fades out, retires, keeps the caller's settings, and ignores writes until cleared");
+    const int n = 20000, at = 3000 + 7;
+    const Buf x = programme (n, 41u);
+    MonoBass m;
+    Set s = base();
+    apply (m, s);
+    ok (m.prepare (kFs, 4096, 2), "PRECONDITION: prepare");
+    Buf y = x;
+    float* io[2] { y[0].data(), y[1].data() };
+    felitronics::test::run (m.process (io, 2, at));
+    m.setBypass (true);
+    s.b.frequencyHz = 200.0f; s.a.gainDb = 6.0f;                      // a write while bypassed
+    apply (m, s);
+    float* io2[2] { y[0].data() + at, y[1].data() + at };
+    felitronics::test::run (m.process (io2, 2, n - at));
+    long long d = 0;
+    for (int c = 0; c < 2; ++c) for (int i = at + 960 + 1; i < n; ++i) d += bits (y[(std::size_t) c][(std::size_t) i]) != bits (x[(std::size_t) c][(std::size_t) i]);
+    ok (d == 0, "past its fades the bypassed island is the input, bit for bit, a write made meanwhile notwithstanding");
+    ok (m.params().enabled && bits (m.params().frequencyHz) == bits (200.0f) && m.air().enabled && bits (m.air().gainDb) == bits (6.0f),
+        "params() and air() report the caller's settings through the bypass");
+    // Before the first sample it lands at once: bypassed from the start is untouched input.
+    MonoBass z;
+    apply (z, base());
+    ok (z.prepare (kFs, 4096, 2), "PRECONDITION: prepare");
+    z.setBypass (true);
+    Buf w = x;
+    float* iw[2] { w[0].data(), w[1].data() };
+    felitronics::test::run (z.process (iw, 2, n));
+    long long dz = 0;
+    for (int c = 0; c < 2; ++c) for (int i = 0; i < n; ++i) dz += bits (w[(std::size_t) c][(std::size_t) i]) != bits (x[(std::size_t) c][(std::size_t) i]);
+    ok (dz == 0, "bypassed before the first sample: untouched input from sample 0");
+    // Cleared: the tools fade back in without a click (pure tones, the absolute bound).
+    const Buf t = tones (n);
+    MonoBass r;
+    apply (r, base());
+    ok (r.prepare (kFs, 4096, 2), "PRECONDITION: prepare");
+    r.setBypass (true);
+    Buf u = t;
+    float* iu[2] { u[0].data(), u[1].data() };
+    felitronics::test::run (r.process (iu, 2, at));
+    r.setBypass (false);
+    float* iu2[2] { u[0].data() + at, u[1].data() + at };
+    felitronics::test::run (r.process (iu2, 2, n - at));
+    ok (maxD2 (u[0], at - 64, at + 4000) < 1.0e-3, "cleared: the island fades back in under -60 dBFS of Δ²");
+    ok (diffs (u, t, at + 2000) > 1000, "PRECONDITION: and it is working again");
+}
+
 static void testNoAllocation()
 {
     group ("RT — nothing is allocated while the corners and the fades move");
@@ -403,6 +455,7 @@ int main()
     testEnabledIsAFade();
     testGlidesSpendSkippedTime();
     testAirRetiresTheIsland();
+    testSetBypass();
     testSetAirRetunesOnALiveMove();
     testNoAllocation();
     return felitronics::test::report();
