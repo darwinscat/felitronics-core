@@ -549,7 +549,11 @@ public:
     // for the ceiling c_i IN FORCE AT THAT SAMPLE, whatever path c takes (the dual release takes the min of
     // two reductions each at least that deep; the peak clipper acts before the window sees the sample, and
     // rides the gliding ceiling too). During a downward glide c_i lies between the old and the new ceiling:
-    // the limit is never exceeded, it is lowered over a couple of milliseconds instead of in one sample.
+    // the limit is never exceeded, it is lowered over a couple of milliseconds instead of in one sample. "Never" is
+    // the limiter's own algebra and carries the limiter's own float rounding — the gain is a float of a float dB, so
+    // an emitted sample can sit an ulp or two above 10^(c_i/20) (the code-review round measured 1.2e-7 relative, about
+    // 1e-6 dB, contraction on and off alike); the static ceiling always had exactly that margin. A clock-only call
+    // spends the glide too, as audio time.
     // `effectiveCeilingDbTp()` and `clipThresholdDbTp()` keep reporting the TARGET.
     static constexpr double kCeilingGlideMs = 2.0;
     // The ceiling the detector compared against on the last oversampled sample (the target when not gliding).
@@ -704,7 +708,11 @@ public:
         if (lastNc_ != 0 && nc != lastNc_) reset();
         lastNc_ = nc;
         fresh_ = false;                                        // the stream has started: a lower ceiling glides
-        if (nc == 0) return true;                              // law 11(d): the reset above IS the edge
+        if (nc == 0)                                           // law 11(d): the reset above IS the edge —
+        {                                                      // and the ceiling glide spends the gap's audio time
+            glideCeilingOver ((long long) numSamples * (long long) F);   // (found by the code-review round)
+            return true;
+        }
 
         float* sub[core::kMaxChannels] {};
         for (int off = 0; off < numSamples; )
@@ -909,6 +917,19 @@ private:
         clipKnee_ = std::clamp (std::isfinite (p.kneeDb) ? p.kneeDb : 0.0, 0.0, kMaxKneeDb);
         clipThresholdDb_ = ceilingDb + clipOver_;              // PUBLISHED: the target's
         clipAt (ceilNowDb_);                                   // IN FORCE: the ceiling that is (see kCeilingGlideMs)
+    }
+
+    // `osSamples` of the ceiling glide with no audio — a clock-only call. The same step per oversampled sample the audio
+    // loop takes, so a gap cut any way lands the ceiling in the same place; bounded by the glide's own landing, not by
+    // the gap's length. The clip level follows once, at the end: nothing reads it before the next audio sample.
+    void glideCeilingOver (long long osSamples) noexcept
+    {
+        for (long long k = 0; k < osSamples && ceilNowDb_ > ceilingDb; ++k)
+        {
+            const double d = ceilCoef_ * (ceilNowDb_ - ceilingDb);
+            ceilNowDb_ = d < 1.0e-9 ? ceilingDb : ceilingDb + d;
+        }
+        if (clipOn_) clipAt (ceilNowDb_);
     }
 
     // The clip level for a ceiling — the offset and knee apply() resolved, riding `ceilDb`. At the target this is

@@ -116,7 +116,9 @@ static void testBoundHoldsAgainstTheCeilingInForce()
                 const double over = 20.0 * std::log10 (std::max (out, 1e-30)) - c;
                 worst = std::max (worst, over);
             }
-            ok (glideSamples > F * 48 && worst <= 1.0e-4, std::string ("clip ") + (clip ? "on" : "off") + ", dual " + (dual ? "on" : "off")
+            // 1e-5 dB is a few float ulps: the limiter's gain is a float of a float dB, and its static ceiling has always
+            // carried that rounding (the code-review round measured 1e-6 dB over, contraction on and off alike).
+            ok (glideSamples > F * 48 && worst <= 1.0e-5, std::string ("clip ") + (clip ? "on" : "off") + ", dual " + (dual ? "on" : "off")
                 + ": every emitted sample within its own ceiling (worst " + std::to_string (worst) + " dB over, "
                 + std::to_string (glideSamples) + " gliding os samples)");
         }
@@ -153,6 +155,43 @@ static void testLandsUpInstantFirstWriteSnaps()
     ok (lim.ceilingNowDbTp() > -24.0, "PRECONDITION: gliding");
     lim.reset();
     ok (lim.ceilingNowDbTp() == -24.0, "reset() lands the glide");
+}
+
+// A CLOCK-ONLY CALL SPENDS THE GLIDE: a lower ceiling written during a gap has landed when audio returns after a gap
+// longer than the glide (found by the code-review round: it stood frozen at the old ceiling through the whole gap).
+static void testGapSpendsTheGlide()
+{
+    group ("a clock-only gap spends the ceiling glide as audio time");
+    TruePeakLimiter lim;
+    lim.setParams (P (0.0, true));
+    ok (lim.prepare (kFs, 512, 2), "PRECONDITION: prepare");
+    std::vector<float> a = tone (4800, 0.5), b = a;
+    float* io[2] { a.data(), b.data() };
+    felitronics::test::run (lim.process (io, 2, 4800));
+    felitronics::test::run (lim.process (nullptr, 0, 100));       // the gap starts
+    lim.setParams (P (-18.0, true));
+    felitronics::test::run (lim.process (nullptr, 0, 4800));      // 100 ms of gap, the glide is 2 ms
+    ok (lim.ceilingNowDbTp() == -18.0, "the ceiling has landed during the gap (" + std::to_string (lim.ceilingNowDbTp()) + ")");
+    TruePeakLimiter cut;
+    cut.setParams (P (0.0, true));
+    ok (cut.prepare (kFs, 512, 2), "PRECONDITION: prepare");
+    std::vector<float> c = tone (4800, 0.5), d = c;
+    float* io2[2] { c.data(), d.data() };
+    felitronics::test::run (cut.process (io2, 2, 4800));
+    felitronics::test::run (cut.process (nullptr, 0, 100));
+    cut.setParams (P (-18.0, true));
+    for (int k = 0; k < 10; ++k) felitronics::test::run (cut.process (nullptr, 0, 3));   // 30 samples of gap, cut
+    TruePeakLimiter whole;
+    whole.setParams (P (0.0, true));
+    ok (whole.prepare (kFs, 512, 2), "PRECONDITION: prepare");
+    std::vector<float> e = tone (4800, 0.5), f = e;
+    float* io3[2] { e.data(), f.data() };
+    felitronics::test::run (whole.process (io3, 2, 4800));
+    felitronics::test::run (whole.process (nullptr, 0, 100));
+    whole.setParams (P (-18.0, true));
+    felitronics::test::run (whole.process (nullptr, 0, 30));
+    ok (cut.ceilingNowDbTp() == whole.ceilingNowDbTp() && cut.ceilingNowDbTp() > -18.0,
+        "a gap cut in pieces lands the glide where one call does (" + std::to_string (cut.ceilingNowDbTp()) + ")");
 }
 
 static void testClockedBySamples()
@@ -193,6 +232,7 @@ int main()
     std::printf ("felitronics::limiter — the ceiling glide\n");
     testBoundHoldsAgainstTheCeilingInForce();
     testLandsUpInstantFirstWriteSnaps();
+    testGapSpendsTheGlide();
     testClockedBySamples();
     testNoClick();
     return felitronics::test::report();

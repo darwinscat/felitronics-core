@@ -19,3 +19,11 @@ lowered over a couple of milliseconds instead of in one sample, and never exceed
 `felitronics_limiter_ceiling_glide_tests`: the bound replayed per oversampled sample through the taps against the
 recursion's c_i (clipper off and on, single and dual release), the landing, the instant rise, the snap, law 8a under
 per-sample, 64 and ragged cuts, and the edge under -60 dBFS.
+
+THE REVIEW ROUND (codex astra): a clock-only call froze the glide — a lower ceiling written during a gap stood at the old
+one until audio returned; the gap now spends it as audio time, one step per oversampled sample, the same steps the audio
+loop takes (a gap cut in pieces lands where one call does). And "never exceeded" carries the limiter's own float
+rounding — the gain is a float of a float dB, so an emitted sample can sit an ulp or two above 10^(c_i/20) (1e-6 dB
+measured, contraction on and off alike), the margin the static ceiling always had; the doc says so and the test's
+tolerance is 1e-5 dB, a few ulps, where it was 1e-4.
+
