@@ -174,6 +174,13 @@ inline double autoMakeupDb (const GainComputer& gc) noexcept { return -0.5 * gc.
 //     advancing, so they are not stale and clearing them would be a gain jump the change never asked
 //     for. Without this, stereo → mono → stereo re-emitted the returning channel's pre-mono audio:
 //     measured at 0.75 out of digital silence, 417 ms after the fact.
+//   * A CHANGE OF MAKEUP GLIDES — `makeupDb`, and `autoMakeup` with every curve change that moves it — over
+//     kMakeupGlideMs, linearly in dB and per sample, on the samples this stage processes. It used to be added
+//     as is: measured through the mastering chain on a -12 dBFS sine at 4:1, makeupDb 0 -> +3 put max|Δ²y|
+//     at -30.5 dBFS (the steady tone reads -76.8), autoMakeup switched on -21.4, and a threshold move with
+//     autoMakeup on -19.5 — the curve's own change goes through the GR ballistics, its makeup did not. Every
+//     write before the first sample after prepare()/reset() lands at once, so a compressor configured before
+//     its first sample renders exactly what it rendered before the glide existed.
 //   * A CHANGE OF THE RESULTING SAMPLE DELAY — the rounded, clamped one, not every touch of
 //     `lookaheadMs` — clears the delay lines and moves `latencySamples()`, which makes it a
 //     resynchronisation event rather than automation. Moving the read pointer of a live ring re-emits
@@ -188,6 +195,10 @@ public:
                                                         // size inside int with the lookahead capacity
     static constexpr double kMaxLookaheadMs = 250.0;    // five times any musical setting; bounds what one
                                                         // prepare() can be asked to allocate per channel
+    // The makeup glide (see "A CHANGE OF MAKEUP GLIDES" above): 30 ms, the length the mastering chain's own gain
+    // ramps and the EQ's smoothers use, linear in dB. Measured on the chain's -12 dBFS sine: makeup 0 -> +3 at
+    // -30.5 dBFS as a step, -76.4 as this glide.
+    static constexpr double kMakeupGlideMs  = 30.0;
 
     // Returns false and leaves the compressor UNPREPARED on a configuration it cannot honour; process()
     // then does nothing at all rather than half-processing. A false return is the only way to learn
@@ -263,7 +274,9 @@ public:
         maxLookSamples = st.maxLookSamples;
         core::prepareDelayBank (delays, st.lines, maxLookSamples);
         path.prepare (fs);
+        makeupRampLen_ = std::max (1, (int) std::lround (kMakeupGlideMs * 0.001 * fs));
         lookSamples = -1;                                      // force apply() to size the fresh lines
+        fresh_ = true;                                         // a preparation is a stream restart
         apply (params);
         reset();
         prepared_ = true;
@@ -275,6 +288,9 @@ public:
         for (auto& d : delays) d.reset();
         path.reset();
         lastNc_ = 0;
+        // A stream restart lands the makeup glide on its target, and the next write snaps.
+        makeupNowDb_ = makeupAppliedDb; makeupLeft_ = 0;
+        fresh_ = true;
     }
 
     void   setParams (const CompressorParams& p) noexcept { params = p; apply (p); }
@@ -322,6 +338,7 @@ public:
         // Checked BEFORE anything moves, so a refused call is indistinguishable from one never made.
         if (gr.data != nullptr && gr.capacity < numSamples) return false;
         if (numSamples == 0) return true;                      // no samples: no time, no edge, nothing
+        fresh_ = false;                                        // the stream has started: makeup writes glide
         const int nc = numChannels;
 
         // A channel that sat out blocks holds `lookSamples` of audio from before it left. Zero only
@@ -370,6 +387,9 @@ public:
             else if (gr.data != nullptr) for (int i = 0; i < numSamples; ++i) gr.data[i] = path.processSample (0.0f);
             else                         path.advanceSilence (numSamples);
             path.flushDenormals();                             // the same once-per-call cadence as below
+            // The makeup glide spends the pause too — sample by sample, the same steps the audio loop takes,
+            // so a gap cut any way lands it at the same place. Bounded by the glide, not by the pause.
+            for (int i = 0; i < numSamples && makeupLeft_ > 0; ++i) stepMakeup();
             return true;
         }
 
@@ -382,12 +402,13 @@ public:
             // --- detector → curve → GR ballistics, in the ONE object an offline pass drives too ---
             const float  grDb       = path.process (detCh, detNc, i);
             if (gr.data != nullptr) gr.data[i] = grDb;         // signed, BEFORE makeup and the delay
+            if (makeupLeft_ > 0) stepMakeup();                 // the makeup glide, one step per sample
             // THE SUM is what reaches dbToGain, and it is bounded here and nowhere else. An UpCompress
             // curve sitting at +rangeDb plus a large makeup is +800 dB, i.e. 1e40 — +Inf once cast to
             // float — and `0.0f * Inf` is NaN, so a silent passage came out poisoned from entirely
             // finite parameters (measured: 64 of 64 output samples). Two comparisons, and
             // bit-transparent for any total inside ±400 dB, a gain of 1e±20 no real setting approaches.
-            const double totalDb    = (double) grDb + makeupAppliedDb;
+            const double totalDb    = (double) grDb + makeupNowDb_;
             const float  gain       = (float) core::dbToGain (totalDb < -kMaxGainDb ? -kMaxGainDb : (totalDb > kMaxGainDb ? kMaxGainDb : totalDb));
 
             // --- apply to the lookahead-delayed signal (read input before overwriting in place) ---
@@ -408,6 +429,7 @@ private:
     // casts its own size to int internally — so the pair above is what keeps that conversion in range.
     static constexpr double kMaxGainDb      = 400.0;    // gain reduction PLUS makeup, the only thing that
                                                         // reaches dbToGain; 400 dB is a gain of 1e20
+    static constexpr double kRampBoundDb    = 1.0e6;    // the makeup glide's arithmetic only — see apply()
 
     void apply (const CompressorParams& p) noexcept
     {
@@ -434,6 +456,29 @@ private:
         // gain reduction, and process() bounds that in one place. Two clamps would mask each other —
         // and did, until a mutation of either survived the suite because the other was still standing.
         makeupAppliedDb = (std::isfinite (p.makeupDb) ? p.makeupDb : 0.0) + (p.autoMakeup ? autoMakeupDb (path.curve()) : 0.0);
+        // THE GLIDE: a moved target restarts a linear ramp from where the makeup stands NOW (double, landing on
+        // the target itself); before the stream's first sample it lands at once. An unchanged target — every
+        // re-sent parameter set — restarts nothing.
+        // The STEP is computed between endpoints bounded to ±kRampBoundDb, and only the arithmetic sees that bound:
+        // a finite makeup of ±1e308 is a legal write (process() clamps the SUM to ±kMaxGainDb, the one clamp this
+        // class has), but the difference of two of them overflows to inf and the next retarget turns the ramp into
+        // NaN, which that clamp passes (the code-review round: -1e308 -> +1e308 -> 0 emitted NaN). The bound is far
+        // outside ±kMaxGainDb, so it never decides a gain; the last step still lands on the exact target.
+        if (fresh_ || makeupRampLen_ <= 0) { makeupNowDb_ = makeupAppliedDb; makeupLeft_ = 0; }
+        else if (! core::exactlyEqual (makeupAppliedDb, makeupTargetDb_))
+        {
+            const auto bounded = [] (double v) noexcept { return std::clamp (v, -kRampBoundDb, kRampBoundDb); };
+            makeupNowDb_  = bounded (makeupNowDb_);
+            makeupLeft_   = makeupRampLen_;
+            makeupStepDb_ = (bounded (makeupAppliedDb) - makeupNowDb_) / (double) makeupRampLen_;
+        }
+        makeupTargetDb_ = makeupAppliedDb;
+    }
+
+    void stepMakeup() noexcept
+    {
+        --makeupLeft_;
+        makeupNowDb_ = makeupLeft_ > 0 ? makeupNowDb_ + makeupStepDb_ : makeupTargetDb_;
     }
 
     double fs = 48000.0;
@@ -443,8 +488,10 @@ private:
     std::vector<core::DelayLine> delays;
 
     int    lookSamples = 0, maxLookSamples = 0, maxCh = 0, lastNc_ = 0;
-    double makeupAppliedDb = 0.0;
-    bool   prepared_ = false;
+    double makeupAppliedDb = 0.0;                      // the TARGET the parameters resolve to
+    double makeupNowDb_ = 0.0, makeupStepDb_ = 0.0, makeupTargetDb_ = 0.0;   // the glide toward it
+    int    makeupLeft_ = 0, makeupRampLen_ = 0;
+    bool   prepared_ = false, fresh_ = true;
 };
 
 } // namespace felitronics::dynamics

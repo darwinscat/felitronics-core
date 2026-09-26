@@ -14,6 +14,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_stereo_air_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_stereo_air_tests COMMAND felitronics_stereo_air_tests)
 
+    # MonoBass's live moves: the corners glide on the grid, `enabled` fades, the first write snaps (law 8a pinned).
+    add_executable(felitronics_monobass_glide_tests tests/MonoBassGlideTests.cpp)
+    target_link_libraries(felitronics_monobass_glide_tests PRIVATE felitronics::stereo)
+    target_include_directories(felitronics_monobass_glide_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_monobass_glide_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_monobass_glide_tests COMMAND felitronics_monobass_glide_tests)
+
     add_executable(felitronics_stereo_tests tests/StereoTests.cpp)
     target_link_libraries(felitronics_stereo_tests PRIVATE felitronics::stereo)
     target_include_directories(felitronics_stereo_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)

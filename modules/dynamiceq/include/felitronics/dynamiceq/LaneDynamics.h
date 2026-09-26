@@ -44,11 +44,45 @@ namespace felitronics::dynamiceq
 // so the audio and the deltas stay in step. Feeding a whole 512-sample block at once would quantise
 // a 1 ms attack to 10 ms.
 //
+// RELEASE ON DISENGAGE (opt-in, setReleaseOnDisengage). By default a point whose dynamics are switched off —
+// dyn.on false, rangeDb 0, or no sidechain — is DISENGAGED on the edge: every lane's delta goes to 0 at once and
+// the detectors drop, which is a hard step in the band's gain when it happens mid-duck (measured through the
+// mastering chain: dyn.on switched off while a -9 dB range was ducking a -12 dBFS tone put max|Δ²y| at -16.1 dBFS
+// against -82.1 for the steady tone). Opted in, the edge instead RELEASES: each lane's gain-reduction follower is
+// driven to 0 dB through its own release ballistics, sample by sample, on the same control grid, and the point
+// disengages exactly as before once every delta is within kReleaseFloorDb of 0 — a step 140 dB down. For as long
+// as it releases, the band's dynamic seam is HELD OPEN: EqBand ignores deltas while its own `dyn.on` is false, so
+// this layer writes the band's parameters back with `dyn.on` true, and restores the caller's value when it is done
+// (the band's delta bell at 0 dB is transparent, so the hand-back is seamless). It is OPT-IN because it writes the
+// band: a product that re-writes every band every block (TabbyEQ does) would flip that flag back and forth and pay
+// a redesign each time, and one that stops calling processBand() for a point with no dynamics left would never see
+// the release finish. The mastering chain calls this layer only from its own quanta and writes bands only when a
+// parameter moved, so it opts in. A point switched back on mid-release carries on from where the release stands.
+// The DETECTORS KEEP RUNNING through a release — on the sidechain when there is one, on silence at the audio's
+// width when there is not — with only the gain computer's target forced to 0 dB, so a point switched back on finds
+// a detector that heard the release rather than one frozen at the duck; and the engaged path's lane bookkeeping
+// runs too, so a lane switched off mid-release drops its delta exactly as it would while engaged. The band a
+// release holds open is REMEMBERED until the release ends: reset() and prepare() hand it back (its deltas to 0,
+// the caller's `dyn.on` restored), so that band must outlive this producer's next reset() — the mastering chain's
+// bands do, being owned beside their producers. From the sample a release ends, a band whose ducked lane is the
+// only one it runs renders bit for bit what a band that never had dynamics renders; a lane DOWNSTREAM of the
+// ducked one in the band's order (ST, then L/R, then the M/S fold) keeps a recursive filter's memory of the duck,
+// so for such a band that holds only once the memory has decayed. And like the engaged path, the 16-sample
+// control grid starts at every call: the release is invariant under re-slicing only where the caller's calls
+// are (the mastering chain's always are — one internal quantum each).
+//
 // 🔴 RT-safe: prepare() allocates nothing beyond its members; process paths are alloc/lock/throw-free.
 class LaneDynamics
 {
 public:
     static constexpr int kControl = 16;      // samples between delta updates (~0.33 ms at 48 k)
+    static constexpr double kReleaseFloorDb = 1.0e-6;   // a release ends when every |delta| is below this
+
+    // See RELEASE ON DISENGAGE above. Off by default: an existing consumer is bit-identical.
+    void setReleaseOnDisengage (bool on) noexcept { releaseOnOff_ = on; }
+    bool releaseOnDisengage() const noexcept { return releaseOnOff_; }
+    // True while a switched-off point is still releasing its deltas (and holding the band's seam open).
+    bool isReleasing() const noexcept { return releasing_; }
 
     // THE PROBE'S RAILS, PUBLISHED — because a second copy of them is a second answer. A lane's freq/Q
     // reach this class RAW (a composite — felitronics-mastering-core's MasteringChain — hands the producers the caller's band parameters, not the
@@ -122,6 +156,14 @@ public:
             s.freq = -1.0; s.Q = -1.0;
         }
         engaged_ = false;
+        // A release in flight holds a band's seam open: hand it back — its deltas to 0 and the caller's dyn.on
+        // restored — or that band would keep its duck and its open seam while this producer reports nothing.
+        if (held_ != nullptr)
+        {
+            for (int i = 0; i < eq::kNumLanes; ++i) held_->setLaneDeltaDb ((eq::Lane) i, 0.0);
+            restoreSeam (*held_);
+        }
+        releasing_ = false;
         ranStProbeNc_ = 0;
     }
 
@@ -207,10 +249,12 @@ public:
             if (! band.processBlock (audio, 0, numSamples)) return false;
             if (! dyn_.on || std::fabs (dyn_.rangeDb) <= 0.0)
             {
-                if (engaged_) { disengage (band); engaged_ = false; }
+                if (engaged_ && ! beginRelease (band)) { disengage (band); engaged_ = false; }
+                if (releasing_) { releaseSteps (nullptr, 0, nullptr, 0, numSamples, band); return true; }
                 for (auto& st : st_) st.parked = addParked (st.parked, numSamples);
                 return true;
             }
+            releasing_ = false;                            // switched back on mid-release: carry on from here
             engaged_ = true;
             for (int done = 0; done < numSamples; )
             {
@@ -227,7 +271,15 @@ public:
         // rather than on a null pointer; a lane that ends up with no sidechain at all is refused above.
         if (sidechain != nullptr)
             for (int c = 0; c < nc; ++c) if (sidechain[c] == nullptr) { nc = c; break; }
-        if (nc <= 0) { if (engaged_) { disengage (band); engaged_ = false; } return band.processBlock (audio, numChannels, numSamples); }
+        if (nc <= 0)
+        {
+            // The band's verdict FIRST, as a zero-length probe of the same geometry: a refused call must move
+            // nothing here either, and starting a release writes the band.
+            if (! band.processBlock (audio, numChannels, 0)) return false;
+            if (engaged_ && ! beginRelease (band)) { disengage (band); engaged_ = false; }
+            if (releasing_) return releaseSteps (audio, numChannels, nullptr, numChannels, numSamples, band);
+            return band.processBlock (audio, numChannels, numSamples);
+        }
 
         // Disengaging must not leave the band frozen mid-duck: zero the seams and drop the
         // detector/programme/GR state once, on the edge. Without this, toggling dynamics off during a
@@ -242,10 +294,13 @@ public:
         // the direction (negative = cut when loud, :138), so that would disengage half the modes.
         if (! dyn_.on || std::fabs (dyn_.rangeDb) <= 0.0 || sidechain == nullptr)
         {
-            if (engaged_) { disengage (band); engaged_ = false; }
+            if (! band.processBlock (audio, nc, 0)) return false;              // the verdict first — see above
+            if (engaged_ && ! beginRelease (band)) { disengage (band); engaged_ = false; }
+            if (releasing_) return releaseSteps (audio, nc, sidechain, nc, numSamples, band);
             for (auto& st : st_) st.parked = addParked (st.parked, numSamples);   // this park counts too — see applyParkPolicy
             return band.processBlock (audio, nc, numSamples);
         }
+        if (releasing_) { releasing_ = false; restoreSeam (band); }   // switched back on mid-release
         engaged_ = true;
 
         bool ok = true;
@@ -352,6 +407,85 @@ private:
         s.parked = 0;                                          // below that: too short to have moved
     }
 
+    // THE RELEASE (see RELEASE ON DISENGAGE). Entered on the disengage edge when opted in and some delta is not
+    // already 0; false means "disengage as before".
+    bool beginRelease (const eq::EqBand& band) noexcept
+    {
+        if (! releaseOnOff_) return false;
+        if (releasing_) return true;
+        const eq::BandParams& bp = band.params();
+        if (! bp.on || bp.bypass) return false;            // a point switched off or bypassed is a hard step anyway
+        bool any = false;
+        for (const auto& st : st_) any = any || ! (std::fabs (st.deltaDb) <= 0.0);
+        if (! any) return false;
+        releasing_ = true;
+        return true;
+    }
+
+    // The band's own `dyn.on` must be true for its seam to be read; the caller's value comes back at the end. The
+    // band is REMEMBERED while held, so reset() can hand it back (see the class note).
+    void holdSeamOpen (eq::EqBand& band) noexcept
+    {
+        held_ = &band;
+        if (band.params().dyn.on) return;
+        eq::BandParams bp = band.params();
+        bp.dyn.on = true;
+        band.setParams (bp);
+    }
+    void restoreSeam (eq::EqBand& band) noexcept
+    {
+        held_ = nullptr;
+        if (band.params().dyn.on == dyn_.on) return;
+        eq::BandParams bp = band.params();
+        bp.dyn.on = dyn_.on;
+        band.setParams (bp);
+    }
+
+    // Silence for a detector with no key: a chunk is at most kControl samples, and every column may point here.
+    static constexpr float kSilence[kControl] {};
+
+    // `numSamples` of the release, on the SAME control grid and through the SAME control step the engaged path
+    // uses — the band runs a chunk on the delta derived from the previous one, then `advance()` runs every lane's
+    // detector (on `sc`, or on silence at `scNc` columns when there is no key) with the target forced to 0 dB, so
+    // each follower releases through its own ballistics while the detector keeps listening. When every delta has
+    // arrived the point disengages exactly as it would have on the edge, and the rest of the call is the band's.
+    bool releaseSteps (float* const* audio, int audioNc, const float* const* sc, int scNc, int numSamples,
+                       eq::EqBand& band) noexcept
+    {
+        holdSeamOpen (band);
+        for (int done = 0; done < numSamples; )
+        {
+            const int n = std::min (kControl, numSamples - done);
+            if (audio != nullptr)
+            {
+                float* aud[core::kMaxChannels];
+                for (int c = 0; c < audioNc; ++c) aud[c] = audio[c] + done;
+                if (! band.processBlock (aud, audioNc, n)) return false;
+            }
+            const float* key[core::kMaxChannels] {};
+            for (int c = 0; c < scNc; ++c) key[c] = sc != nullptr ? sc[c] + done : kSilence;
+            advance (key, scNc, n, band, true);
+            done += n;
+            bool all = true;
+            for (const auto& st : st_) all = all && std::fabs (st.deltaDb) <= 0.0;
+            if (all)
+            {
+                releasing_ = false;
+                disengage (band);
+                engaged_ = false;
+                restoreSeam (band);
+                if (audio != nullptr && done < numSamples)
+                {
+                    float* aud[core::kMaxChannels];
+                    for (int c = 0; c < audioNc; ++c) aud[c] = audio[c] + done;
+                    return band.processBlock (aud, audioNc, numSamples - done);
+                }
+                return true;
+            }
+        }
+        return true;
+    }
+
     // Leave the band exactly as an opted-out one: no residual delta, no state that could resume.
     void disengage (eq::EqBand& band) noexcept
     {
@@ -367,7 +501,7 @@ private:
 
     // One control-rate chunk: run every running lane's detector over the SECTION INPUT and push its
     // delta into the band.
-    void advance (const float* const* sc, int nc, int n, eq::EqBand& band) noexcept
+    void advance (const float* const* sc, int nc, int n, eq::EqBand& band, bool release = false) noexcept
     {
         const eq::BandParams& p = band.params();
 
@@ -444,7 +578,9 @@ private:
                 // are ONE decision. Setting an absolute threshold while still feeding a relative
                 // level produced full-range reduction on material 20 dB UNDER the threshold.
                 double target = 0.0;
-                if (dyn_.thrAuto)
+                if (release) {}                                     // RELEASING: the detector listens, the
+                                                                    // gain computer is not asked — target 0 dB
+                else if (dyn_.thrAuto)
                 {
                     // Relative: threshold pinned at 0, level expressed as excess over the programme.
                     // Gate the COMPUTER'S INPUT, not merely the estimator: with a soft knee a relative
@@ -465,7 +601,8 @@ private:
             }
             s.rel.update (n);
 
-            s.deltaDb = (double) smoothed;
+            // A release ends on arrival: under kReleaseFloorDb is 0, a step 140 dB down (see the class note).
+            s.deltaDb = (release && std::fabs ((double) smoothed) < kReleaseFloorDb) ? 0.0 : (double) smoothed;
             band.setLaneDeltaDb (l, s.deltaDb);
 
             s.probe.flushDenormals(); s.env.flushDenormals(); s.rel.flushDenormals(); s.gr.flushDenormals();
@@ -517,6 +654,9 @@ private:
     double        dynAtk_ = 0.5, dynRel_ = 0.5;
     float         sign_ = 1.0f;
     bool          engaged_ = false;      // was the dynamics path live last call? (edge detect)
+    bool          releaseOnOff_ = false; // RELEASE ON DISENGAGE, opted in by the composite
+    bool          releasing_ = false;    // a switched-off point is releasing its deltas
+    eq::EqBand*   held_ = nullptr;       // the band whose seam a release holds open, until it ends
     int           ranStProbeNc_ = 0;     // ST probe columns that advanced on the previous chunk
     LaneState     st_[eq::kNumLanes];
 };

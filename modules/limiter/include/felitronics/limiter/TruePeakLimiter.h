@@ -502,6 +502,8 @@ public:
         for (auto& d : osDelays) d.setDelay (lookOS);
         slide.setWindow (lookOS + 1);                          // the window must equal the ACTUAL lookahead + the emitted sample
 
+        ceilCoef_ = std::exp (-1.0 / (kCeilingGlideMs * 0.001 * fs * (double) F));   // per OVERSAMPLED sample
+        fresh_ = true;                                         // a preparation is a stream restart
         apply (params);
         reset();
         prepared_ = true;                                      // fully built — process() may now run
@@ -527,9 +529,35 @@ public:
         linkedPeakLin_ = 0.0f;                                 // a free-running maximum SINCE RESET, like
                                                                // TruePeakMeter's — so it means "this stream"
         lastNc_ = 0;
+        // A stream restart lands the ceiling glide on its target, and the next write snaps.
+        if (! core::exactlyEqual (ceilNowDb_, ceilingDb)) { ceilNowDb_ = ceilingDb; clipAt (ceilNowDb_); }
+        fresh_ = true;
     }
 
     void setParams (const TruePeakLimiterParams& p) noexcept { params = p; apply (p); }
+
+    // THE CEILING GLIDES DOWN, AND ONLY DOWN. A lower ceiling used to act on the next oversampled sample — the
+    // attack is instant by design — so a knob pulled down while the limiter held a tone stepped the output:
+    // measured through the mastering chain on a -12 dBFS 227 Hz sine, 0 -> -18 dBTP put max|Δ²y| at -29.9
+    // dBFS (the steady tone reads -73.1). The ceiling the detector compares against now falls to a lower target
+    // along a one-pole of kCeilingGlideMs, per oversampled sample, landing exactly; a HIGHER ceiling still
+    // applies at once, because the release already makes that move smooth and gliding it too would only delay
+    // the recovery. Every write before the first sample after prepare()/reset() lands at once.
+    //
+    // WHAT STILL HOLDS, and why: every emitted oversampled sample is inside its own detector window, so its
+    // gain is at most 10^((c_i - smaxDb_i)/20) with smax_i >= its own magnitude — i.e. |out_i| <= 10^(c_i/20)
+    // for the ceiling c_i IN FORCE AT THAT SAMPLE, whatever path c takes (the dual release takes the min of
+    // two reductions each at least that deep; the peak clipper acts before the window sees the sample, and
+    // rides the gliding ceiling too). During a downward glide c_i lies between the old and the new ceiling:
+    // the limit is never exceeded, it is lowered over a couple of milliseconds instead of in one sample. "Never" is
+    // the limiter's own algebra and carries the limiter's own float rounding — the gain is a float of a float dB, so
+    // an emitted sample can sit an ulp or two above 10^(c_i/20) (the code-review round measured 1.2e-7 relative, about
+    // 1e-6 dB, contraction on and off alike); the static ceiling always had exactly that margin. A clock-only call
+    // spends the glide too, as audio time.
+    // `effectiveCeilingDbTp()` and `clipThresholdDbTp()` keep reporting the TARGET.
+    static constexpr double kCeilingGlideMs = 2.0;
+    // The ceiling the detector compared against on the last oversampled sample (the target when not gliding).
+    double ceilingNowDbTp() const noexcept { return ceilNowDb_; }
 
     // All of these read as "nothing prepared" after a failed prepare(), rather than reporting the
     // topology of whatever was prepared before it — a stale latency is worse than an obvious zero.
@@ -679,7 +707,12 @@ public:
         // already is, and it restores the bound from the first sample after it.
         if (lastNc_ != 0 && nc != lastNc_) reset();
         lastNc_ = nc;
-        if (nc == 0) return true;                              // law 11(d): the reset above IS the edge
+        fresh_ = false;                                        // the stream has started: a lower ceiling glides
+        if (nc == 0)                                           // law 11(d): the reset above IS the edge —
+        {                                                      // and the ceiling glide spends the gap's audio time
+            glideCeilingOver ((long long) numSamples * (long long) F);   // (found by the code-review round)
+            return true;
+        }
 
         float* sub[core::kMaxChannels] {};
         for (int off = 0; off < numSamples; )
@@ -738,6 +771,16 @@ private:
 
         for (int i = 0; i < osN; ++i)
         {
+            // THE CEILING GLIDE (see kCeilingGlideMs): one step per oversampled sample, before anything reads
+            // the level. Product and sum in separate statements (law 10); lands exactly, and a residual under
+            // 1e-9 dB is the target (a one-pole never arrives on its own).
+            if (ceilNowDb_ > ceilingDb)
+            {
+                const double d = ceilCoef_ * (ceilNowDb_ - ceilingDb);
+                ceilNowDb_ = d < 1.0e-9 ? ceilingDb : ceilingDb + d;
+                if (clipOn_) clipAt (ceilNowDb_);
+            }
+
             float linkedPeak = 0.0f;
             for (int c = 0; c < nc; ++c) { const float a = std::fabs (osBuf[(std::size_t) c][(std::size_t) i]); if (a > linkedPeak) linkedPeak = a; }
 
@@ -788,7 +831,7 @@ private:
                     // CLIPPED samples only; the plateau case needs one call rather than two, because
                     // `clipThresholdDb_` already is the level in dB.
                     const double peakDb = core::gainToDbDet ((double) linkedPeak);
-                    const float  red    = (float) (q >= clipT_ ? peakDb - clipThresholdDb_
+                    const float  red    = (float) (q >= clipT_ ? peakDb - clipNowDb_
                                                                : peakDb - core::gainToDbDet ((double) q));
                     if (red > clipMaxRedDb_) clipMaxRedDb_ = red;
                     int b = (int) (red / (float) kClipRedBinDb);
@@ -803,7 +846,7 @@ private:
 
             const float  smax    = slide.push (linkedPeak);
             const double smaxDb  = core::gainToDb (smax);
-            double rawRedDb = ceilingDb - smaxDb;
+            double rawRedDb = ceilNowDb_ - smaxDb;             // == ceilingDb unless a lower one is gliding in
             if (rawRedDb > 0.0) rawRedDb = 0.0;
 
             grDb = std::min ((float) rawRedDb, grDb * relCoef);   // instant attack, exponential release toward 0 dB
@@ -846,6 +889,8 @@ private:
         // material ships UNLIMITED — worse, for a module whose only promise is a ceiling. So the range
         // is clamped to what a true-peak ceiling can mean at all. Nothing a caller would ever set moves.
         ceilingDb = std::clamp (std::isfinite (p.ceilingDbTp) ? p.ceilingDbTp : -1.0, kMinCeilingDb, kMaxCeilingDb);
+        // UP (or before the stream's first sample) lands at once; DOWN glides from where the ceiling stands.
+        if (fresh_ || ceilingDb >= ceilNowDb_) ceilNowDb_ = ceilingDb;
 
         // The release floor, like the lookahead floor, is measured rather than chosen: at zero the
         // coefficient is zero and the gain may jump on every oversampled sample. Measured with the floor
@@ -868,12 +913,33 @@ private:
         // below the thing it is protecting. Non-finite falls back to the default, as every parameter here
         // does; the ranges are clamped and the RESULT is published, so a caller can see what it got.
         clipOn_ = p.peakClip;
-        const double over = std::clamp (std::isfinite (p.overCeilingDb) ? p.overCeilingDb : 1.0,
-                                        0.0, kMaxOverCeilingDb);
-        const double knee = std::clamp (std::isfinite (p.kneeDb) ? p.kneeDb : 0.0, 0.0, kMaxKneeDb);
-        clipThresholdDb_ = ceilingDb + over;
-        const double T   = core::dbToGain (clipThresholdDb_);
-        const double W   = T * (1.0 - core::dbToGain (-knee));
+        clipOver_ = std::clamp (std::isfinite (p.overCeilingDb) ? p.overCeilingDb : 1.0, 0.0, kMaxOverCeilingDb);
+        clipKnee_ = std::clamp (std::isfinite (p.kneeDb) ? p.kneeDb : 0.0, 0.0, kMaxKneeDb);
+        clipThresholdDb_ = ceilingDb + clipOver_;              // PUBLISHED: the target's
+        clipAt (ceilNowDb_);                                   // IN FORCE: the ceiling that is (see kCeilingGlideMs)
+    }
+
+    // `osSamples` of the ceiling glide with no audio — a clock-only call. The same step per oversampled sample the audio
+    // loop takes, so a gap cut any way lands the ceiling in the same place; bounded by the glide's own landing, not by
+    // the gap's length. The clip level follows once, at the end: nothing reads it before the next audio sample.
+    void glideCeilingOver (long long osSamples) noexcept
+    {
+        for (long long k = 0; k < osSamples && ceilNowDb_ > ceilingDb; ++k)
+        {
+            const double d = ceilCoef_ * (ceilNowDb_ - ceilingDb);
+            ceilNowDb_ = d < 1.0e-9 ? ceilingDb : ceilingDb + d;
+        }
+        if (clipOn_) clipAt (ceilNowDb_);
+    }
+
+    // The clip level for a ceiling — the offset and knee apply() resolved, riding `ceilDb`. At the target this is
+    // exactly the arithmetic apply() always ran; during a downward glide it follows the gliding ceiling, so the
+    // clip never cuts at a level the ceiling has not reached yet.
+    void clipAt (double ceilDb) noexcept
+    {
+        clipNowDb_ = ceilDb + clipOver_;
+        const double T = core::dbToGain (clipNowDb_);
+        const double W = T * (1.0 - core::dbToGain (-clipKnee_));
         clipT_ = (float) T;
         // THE WIDTH IS READ BACK OUT OF THE FLOAT, not carried in double: a knee small enough to vanish
         // in the cast must take the hard branch rather than divide by a zero it does not know it has.
@@ -960,7 +1026,11 @@ private:
     // happens, above `clipHi_` the magnitude is `clipT_`, and between them the quadratic knee runs.
     bool   clipOn_   = false;
     float  clipT_    = 1.0f, clipW_ = 0.0f, clipInv4W_ = 0.0f;
-    double clipThresholdDb_ = 0.0;              // the absolute dBTP the clip acts at, AFTER clamping
+    double clipThresholdDb_ = 0.0;              // the absolute dBTP the clip acts at, AFTER clamping (the target's)
+    double clipNowDb_ = 0.0;                    // …and the one in force, riding the gliding ceiling
+    double clipOver_ = 1.0, clipKnee_ = 0.0;    // the resolved offset and knee clipAt() builds the level from
+    double ceilNowDb_ = -1.0, ceilCoef_ = 0.0;  // the ceiling glide (see kCeilingGlideMs)
+    bool   fresh_ = true;                       // no sample since prepare()/reset(): a write lands at once
     std::int64_t clipOsSamples_ = 0, clipOsTotal_ = 0, clipRuns_ = 0, clipRunOs_ = 0, clipLongestOs_ = 0;
     std::int64_t clipOpenOs_ = 0;               // length of the run currently open, 0 when none is
     float  clipMaxRedDb_ = 0.0f;

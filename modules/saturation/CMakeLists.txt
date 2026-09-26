@@ -26,6 +26,14 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_saturation_gatestate_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_saturation_gatestate_tests COMMAND felitronics_saturation_gatestate_tests)
 
+    # The parameter glide: the first write snaps, a mid-stream write glides on audio time (law 8a), lands, and
+    # does not click.
+    add_executable(felitronics_saturation_glide_tests tests/SaturatorGlideTests.cpp)
+    target_link_libraries(felitronics_saturation_glide_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_glide_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_glide_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_glide_tests COMMAND felitronics_saturation_glide_tests)
+
     add_executable(felitronics_saturation_falsify_tests tests/SaturatorFalsifyTests.cpp)
     target_link_libraries(felitronics_saturation_falsify_tests PRIVATE felitronics::saturation)
     target_include_directories(felitronics_saturation_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
