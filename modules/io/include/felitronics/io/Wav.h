@@ -148,6 +148,7 @@ inline WavData readWavMemory (const std::uint8_t* bytes, std::size_t size)
                   ", bits=" + std::to_string (bits) + ")";
         return w;
     }
+    if (rate == 0) { w.error = "corrupt WAV (sample rate 0 Hz)"; return w; }
     w.sr = rate; w.bits = bits; w.is_float = (fmt == 3);
     const std::size_t bytesPer = (std::size_t) bits / 8;
     const std::size_t frame = bytesPer * nch;
@@ -214,6 +215,7 @@ inline std::vector<std::uint8_t> writeWavMemory (const std::vector<std::vector<d
     const std::uint16_t nch = (std::uint16_t) ch.size();
     const std::uint16_t fmt = is_float ? 3 : 1;
     const std::uint32_t rate = (std::uint32_t) std::llround (sr);
+    if (rate == 0) return {};   // a rate in (0, 0.5) rounds to a 0 Hz header, which no reader can use
     if ((std::uint64_t) rate * block64 > 0xFFFFFFFFull) return {};   // byteRate is a u32 too
     const std::uint16_t block = (std::uint16_t) block64;
     const std::uint32_t datalen = (std::uint32_t) data64;

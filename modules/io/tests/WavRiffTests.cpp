@@ -295,5 +295,22 @@ int main()
         ok (discriminating == 4, "planted: 4 of the 5 images tell a pad-skipping reader from one that is not");
     }
 
+    group ("a sample rate that rounds to 0 Hz is refused by the writer and a 0 Hz header by the reader");
+    {
+        const std::vector<std::vector<double>> one { { 0.25, -0.25 } };
+        ok (io::writeWavMemory (one, 0.3, 16, false).empty(),  "writer: 0.3 Hz (rounds to 0) is refused");
+        ok (io::writeWavMemory (one, 0.49, 24, false).empty(), "writer: 0.49 Hz (rounds to 0) is refused");
+        const Bytes lowest = io::writeWavMemory (one, 0.5, 16, false);
+        ok (! lowest.empty() && u32at (lowest, 24) == 1u,       "writer: 0.5 Hz rounds to a 1 Hz header and is written");
+        Bytes zero = io::writeWavMemory (one, 48000.0, 16, false);
+        const bool built = zero.size() > 28;
+        if (built) putU32 (zero, 24, 0u);
+        const io::WavData w = built ? io::readWavMemory (zero.data(), zero.size()) : io::WavData {};
+        ok (built && ! w.ok,                                    "reader: a 0 Hz header is refused, not read as sr = 0");
+        ok (! built || w.error.find ("sample rate 0") != std::string::npos, "reader: the refusal names the rate");
+        const Bytes fine = io::writeWavMemory (one, 48000.0, 16, false);
+        ok (io::readWavMemory (fine.data(), fine.size()).ok,    "control: the same image at 48 kHz reads");
+    }
+
     return felitronics::test::report();
 }
