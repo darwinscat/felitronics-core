@@ -5,6 +5,203 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.53.0 — 2026-09-26
+
+### io — the WAV writer quantizes on `dither`'s grid, so a dithered master is written as the codes it was given
+
+`writeWav`/`writeWavMemory` scaled 16- and 24-bit PCM by 2^(bits-1) − 1 (32767, 8388607) under `llround`, while
+`readWav` divides by 2^(bits-1) and `dither::Dither` defines a code as `floor(v·2^(bits-1) + 0.5)` clamped to
+[−2^(bits-1), 2^(bits-1) − 1]. A master Dither had already put on the grid was therefore quantized a second time,
+onto a grid one LSB narrower, with no dither. Measured before the fix, writing every code k as k/2^(bits-1): 32767
+of the 65536 16-bit codes came back moved by one LSB toward zero (every |k| > 16384 — 20000 was written as 19999,
+−32768 as −32767), 8388607 of the 16777216 24-bit codes, and 30001 of 48000 samples of a Weighted-dithered 0.9
+sine at 16 bit (30002 at 24 bit).
+
+The writer now uses Dither's rule exactly — the same scale, mid-tread round-half-up on both signs, the clamp in
+the double domain before the conversion, NaN/Inf → 0 as before. The reader was already on the grid and is
+unchanged. So write∘read is the identity on every code, read∘write gives a canonical image's bytes back, and a
+Dither output is written as the codes Dither chose. What a caller sees change: −1.0 is now the bottom code
+(−32768, was −32767); +1.0 is still the top code; an off-grid sample past half scale can land one LSB away from
+where it used to; a sample exactly on a half-code rounds up on both signs, where `llround` took a negative one
+away from zero. Images written before are not byte-identical to images written now; the 32-bit float writer is
+untouched.
+
+New suite `felitronics_io_grid_tests` (59 checks, links `dither` to test the agreement; the io library stays
+zero-dep): every 16-bit code and a 24-bit sample dense where the two grids part, both directions; Dither's output
+at 16 and 24 bit under all three shapings; ties, the ends, ±DBL_MAX, NaN, ±Inf and subnormals against Dither's rule.
+Planted failures run through the same instruments: the old writer moves exactly the codes with |k| > 2^(bits-2),
+and a writer on the right grid with `llround`'s rounding misses exactly the negative ties.
+
+### saturation — the Saturator's parameters glide, and the first write of a stream snaps
+
+A write to `driveDb`, `bias`, `autoComp`, `mix` or `outputDb` used to apply at once, so a knob turned on a live
+stream stepped the output: through the mastering chain on a -12 dBFS 227 Hz sine (K = 128), max|Δ²y| where the change
+reaches the output was -18.3 dBFS for drive 3 -> 9 dB and -44.6 for a 3 -> 3.5 dB nudge, against -67.2 for the steady
+saturated tone; the bias of the Asym curve 0 -> 0.3 read -11.1, trim 0 -> -3 dB -50.8, autoComp 0.5 -> 1 -48.6, mix 1
+-> 0.5 -54.6. A continuous write now starts a linear ramp in PARAMETER space (`Saturator::kGlideMs` = 30 ms), stepped
+on the 64-sample `core::StateGrid`: at each grid boundary the curve is designed at the ramp's next point with the
+settled stage's own arithmetic, and inside the period the curve's coefficients (k, bias, tanh(k·bias) and the RAW
+PEAK the normaliser is the reciprocal of; oversampled rate) and drive-compensation, mix and trim (base rate) are
+interpolated per sample between the two designs — as `start + d·index`, product and sum in separate statements (law
+10), so a coefficient is a function of the sample's place in its period and never of a call. The curve is divided by
+the interpolated raw peak rather than multiplied by an interpolated normaliser: the normaliser goes like 1/k at a small
+drive, and the review round measured a 0 -> 3 dB glide on a constant 0.2 peaking at 7.665 when it was interpolated
+directly; a glide now stays inside the range the settled stage covers along the same path (pinned for every shape). Measured the same way: -63.8, -67.2, -63.6, -67.3, -65.2,
+-65.3 — at or within 3.4 dB of the steady tone's own reading. 30 ms was measured against 10, 20 and 50: every length
+from 20 ms is clean, 10 ms leaves the bias move at -59.7, and 30 ms matches the mastering chain's own ramps.
+
+The first write of a stream SNAPS: every `setParams()` between `prepare()`/`reset()` and the first accepted call with
+samples applies at once, exactly as before, so a stage whose parameters were set before its first sample renders the
+bits it always rendered — the whole offline contract of the mastering chain above it (six chain topologies compared
+by hash, identical). `reset()` lands a glide in flight. `shape` is a topology switch and snaps every parameter with
+it; `dcBlockHz` lands at once — both as they always did. `setGlideMs (0)` turns the glide off and IS the pre-glide
+stage, bit for bit: the frozen pre-change engine's mid-stream sweep (the hardening NULL's scenario 5) now pins exactly
+that. A write that changes nothing continuous costs a comparison (it used to cost a full re-design, and `dcBlockHz` is
+re-designed only when it moved), so a caller that re-sends its parameters every block pays nothing. The ramp accumulates in double, landing on the target itself. New
+`WaveShaper::coeffs()` and `WaveShaper::shapeAt<S>()` expose the curve at explicit coefficients — additive, and
+`processSample()` is untouched (the guitar core's TubeStage uses only that). `glideTicks()` and `isGliding()` read the
+state back. The settled slice keeps its code verbatim and the glide runs in a separate function, so a stage that is
+not gliding pays nothing: the mastering chain's bench is flat (3.94 / 3.90 %RT on the heavy case, 4.03 / 4.02 with
+every glide moving every call).
+
+New suite `felitronics_saturation_glide_tests`: the snap in every order, a timeline of writes (retarget, shape switch,
+a bias glide on Asym, a clock-only pause mid-glide) bit-identical under per-sample, 64, 100, ragged-with-empty-calls,
+maxBlock-37 and maxBlock-512 cuts at os 1 and 4 (a mutation that indexes the period from the call instead fails every
+row), landing bit-identical to the target stage past the round trip, no click, repeated writes free, no allocation.
+
+### stereo — MonoBass: the corners glide, `enabled` fades, the first write snaps, and setAir re-tunes on a live move
+
+Measured through the mastering chain on a 103.7 Hz tone with L and R 90° apart (a large Side), max|Δ²y| where the
+change reaches the output against -84.2 dBFS for the steady tone: the crossover corner 60 -> 250 Hz stepped at
+-45.3 dBFS (its four SVFs were redesigned at once) and 60 -> 70 Hz at -69.3; `enabled` false -> true read -48.7 and
+true -> false -21.5 (a hard switch with a crossover reset). The air shelf's corner and `enabled` switched as hard,
+which the Δ² metric cannot see on a 5 kHz tone: through a Q-2 notch at the tone, which it can, corner 6000 -> 3000 Hz
+read -25.9 and `enabled` true -> false -26.3, where the plateau's own 20 ms glide reads -66.3.
+
+* THE CROSSOVER CORNER rides a one-pole `core::Smoother` (`kFreqSmoothMs` = 30 ms, the EQ's time constant), advanced
+  by exactly 64 samples at every `core::StateGrid` boundary with the SVFs redesigned there when it moved — EqBand's
+  idiom. A stretch the island skips (bypassed, full-wide, a mono or a clock-only call) still crosses its boundaries:
+  the corner walks through it as through audio. Now -73.0 and -83.0.
+* `enabled` IS THE xf CROSSFADE: off fades the Side to dry as a full-wide lowWidth does (20 ms), and the bit-exact
+  passthrough follows once it settles; on fades back in from a crossover restarted at zero. Now -75.5 and -74.3. It
+  used to be a hard toggle for parity with StereoWidth; the mastering chain's live preview is the product that
+  disagrees, and a host that wants a hard bypass has one — not calling the stage.
+* THE AIR SHELF'S CORNER rides a Smoother of its own on the grid, and its `enabled` glides the plateau to and from
+  0 dB (where the shelf is skipped). Notch reading now -56.9 for the corner and -66.4 / -66.3 for the enable edges.
+* EVERY WRITE BEFORE THE FIRST SAMPLE after prepare()/reset() SNAPS — lowWidth and the air plateau included, which
+  used to glide from the prepared values when written between prepare() and the first sample. So "set, then prepare"
+  and "prepare, then set" rendered differently (through the mastering chain, 71 529 and 59 030 samples of a
+  one-second render for a lowWidth and a plateau write); they are one behaviour now, the set-then-prepare one, whose
+  bits are unchanged. `reset()` lands both corner glides and designs the crossover at its corner.
+* setAir RE-TUNES ITS WIDTH BAND ON A LIVE CORNER MOVE. `wasFreq` was captured after the assignment, so the band was
+  re-tuned only when the clamp moved the corner — contrary to the note at `retuneWidthBand()` — and a live 6000 ->
+  8000 Hz move kept summing across both bands: `airJudgedSamples()` read 2000 where the new band had judged 1000.
+
+THE REVIEW ROUND (codex astra) found five defects in the first spelling of this, all fixed: the linear ramps (width,
+crossfade, plateau) froze through a skipped stretch while the corners walked on — a disable followed by a pause ran
+its whole fade on return — and now spend it sample by sample; with the bass already idle an air fade-out that landed
+mid-call never retired the island, so the rest of the call stayed in the M/S round trip and depended on the cut
+(7 471 floats between whole-block and one-sample renders) — the island now retires on the air's settle too, on the
+sample clock; that exit did not reset the shelf, which then replayed a 1.42e-5 tail on the next enable; the width
+ramp froze while a disabled bass let the air keep the island running; and the air's band measurement stopped the
+moment `enabled` went false although the shelf was still audibly fading — it covers the fade now (an enabled 0 dB
+plateau is measured as before). Its test critique was right too: a noisy programme's own Δ² hid a hard step, and
+nothing observed the skipped time, so the click checks run on pure tones against an absolute -60 dBFS bound with a
+spliced hard switch as the precondition, and new accessors (`crossoverDesignHz()`, `airDesignHz()`, `crossfade()`,
+`lowWidthNow()`) let a test see where the glides stand after a pause, a mono stretch and an idle island.
+
+New suite `felitronics_monobass_glide_tests`: the two configuration orders bit-identical for seven parameters, the
+snap after a reset() mid-glide, a timeline of writes (both corners with a retarget, both enables, lowWidth, the
+plateau) bit-identical under per-sample, 64, 100, 4096 and ragged-with-empty-calls cuts with a clock-only pause and a
+mono stretch in it, a corner glide started while the island is idle, the fades' passthrough and edges, the setAir
+re-tune, the skipped-time positions, the air retiring the island, no allocation. Mutations caught: `wasFreq` after the
+assignment, an extra corner tick per call, lowWidth gliding after a reset, no corner ticks in a skip, no linear-ramp
+steps in a skip, an instantaneous crossover, no air retire, a width frozen while the bass is idle.
+
+### dynamics · dynamiceq — the Compressor's makeup glides; LaneDynamics can release a switched-off point instead of snapping it
+
+**Compressor makeup.** `makeupDb`, and `autoMakeup` with every curve change that moves it, used to be added as is, so a
+live change stepped the output: through the mastering chain on a -12 dBFS sine at 4:1 (steady -76.8 dBFS max|Δ²y|),
+makeup 0 -> +3 read -30.5 dBFS, autoMakeup switched on -21.4, and a -18 -> -30 dB threshold move with autoMakeup on
+-19.5 (the curve's own change rides the GR ballistics; its auto-makeup did not). The makeup now glides linearly in dB
+over `Compressor::kMakeupGlideMs` = 30 ms, one step per processed sample (double accumulator, landing on the target
+itself), and a clock-only call spends the glide sample by sample as the silence it stands for would: -73.8, -69.4 and
+-67.7. Every write before the first sample after prepare()/reset() snaps, so a compressor configured before its first
+sample renders what it always did. New `felitronics_dynamics_makeup_glide_tests`: both configuration orders agree, the
+glide replayed sample for sample below the threshold (where the output IS the delayed input times the makeup), no step
+from makeup or autoMakeup (a threshold move is held to the same move's edge without autoMakeup, scaled by level), law
+8a under per-sample, 64 and ragged cuts with a clock-only pause mid-glide, a glide spanned by a pause landed on return,
+repeated writes free, no allocation. Mutations caught: no glide, a pause that does not spend it.
+
+**LaneDynamics — RELEASE ON DISENGAGE, opt-in** (`setReleaseOnDisengage`, off by default, so TabbyEQ and every other
+consumer is bit-identical). A point whose dynamics are switched off mid-duck — dyn.on false, rangeDb 0, or no sidechain
+— used to disengage on the edge: every lane's delta to 0 at once, a step in the band's gain (through the mastering
+chain, a -9 dB range ducking a -12 dBFS tone: -16.1 dBFS against -82.1 for the steady tone). Opted in, each lane's
+gain-reduction follower is driven to 0 dB through its own release ballistics on the same control grid, and the point
+disengages exactly as before once every |delta| is under `kReleaseFloorDb` (1e-6 dB); a clock-only pause spends the
+release like silence, and switching back on mid-release carries on from where it stands. EqBand ignores deltas while
+its own `dyn.on` is false, so for as long as it releases this layer writes the band back with `dyn.on` true and
+restores the caller's value when it is done — the delta bell at 0 dB is transparent, so from that sample the band
+renders bit for bit what a band that never had dynamics renders (pinned). Now -55.3 dBFS: 39 dB down, and what is left
+is the band's 16-sample control grid, the same zipper its own attack and release have while engaged. It is opt-in
+because it writes the band: TabbyEQ re-writes every band every block (so the flag would flip back and forth, a
+redesign each time) and stops calling processBand() for a point once no point is dynamic (so the release would never
+finish) — both would have to change before it can opt in. New `felitronics_dynamiceq_release_tests`.
+
+THE REVIEW ROUND (codex astra) found, and this note's code already carries the fixes: reset() and prepare() forgot a
+band held open mid-release (it kept its duck and dyn.on while the producer reported 0) — the held band is remembered
+and handed back; the release froze the detectors, so a point switched back on over silence re-ducked from the stale
+loud envelope (-0.48 -> -2.26 dB) — the release now runs the engaged control step with only the target forced to 0 dB,
+the detectors listening on the key or, without one, on silence at the audio's width, which also restores the engaged
+path's lane bookkeeping (a lane switched off mid-release drops its delta as it would while engaged); a call the band
+refused had already opened the seam — the band's verdict is taken first, as a zero-length probe; finite makeups of
+±1e308 overflowed the glide's arithmetic to NaN, which the ±400 dB sum clamp passes — the step is computed between
+endpoints bounded to ±1e6 dB, a bound no gain decision ever reaches; and the post-release bit identity is a property of
+a band whose ducked lane is the only one it runs (a downstream lane keeps a filter's memory of the duck), stated so now.
+The per-call 16-sample control grid the release shares with the engaged path is NOT changed: it is how the producer has
+always run, the mastering chain's quanta make it cut-invariant there, and changing it would move every offline render.
+
+### limiter — a lower ceiling glides in over 2 ms; the bound holds against the ceiling in force
+
+A lower `ceilingDbTp` acted on the next oversampled sample — the attack is instant by design — so a ceiling pulled
+down while the limiter held a tone stepped the output: through the mastering chain on a -12 dBFS 227 Hz sine, 0 ->
+-18 dBTP put max|Δ²y| at -29.9 dBFS against -73.1 for the steady tone. The ceiling the detector compares against now
+falls to a lower target along a one-pole of `TruePeakLimiter::kCeilingGlideMs` = 2 ms per oversampled sample (the
+product and the sum in separate statements, landing exactly once the residual is under 1e-9 dB): -64.4. 2 ms was
+measured against 1 ms (-52.1) and 5 ms (-62.8). A HIGHER ceiling still lands at once — the release already makes that
+move smooth, and gliding it too would only delay recovery — and every write before the first sample after
+prepare()/reset() lands at once, so a limiter configured before its first sample renders what it always did.
+
+THE BOUND STILL HOLDS, against the ceiling IN FORCE: every emitted oversampled sample is inside its own detector
+window, so its gain is at most 10^((c_i - smaxDb_i)/20) with smax_i at least its own magnitude — |out_i| <= 10^(c_i/20)
+whatever path c takes; the dual release takes the min of two reductions each at least that deep, and the peak clipper
+acts before the window sees the sample and now rides the gliding ceiling too (`clipAt()`), so it never cuts at a level
+the ceiling has not reached. During a downward glide c_i lies between the old ceiling and the new one: the limit is
+lowered over a couple of milliseconds instead of in one sample, and never exceeded. `effectiveCeilingDbTp()` and
+`clipThresholdDbTp()` keep reporting the target; `ceilingNowDbTp()` reads the one in force. New
+`felitronics_limiter_ceiling_glide_tests`: the bound replayed per oversampled sample through the taps against the
+recursion's c_i (clipper off and on, single and dual release), the landing, the instant rise, the snap, law 8a under
+per-sample, 64 and ragged cuts, and the edge under -60 dBFS.
+
+THE REVIEW ROUND (codex astra): a clock-only call froze the glide — a lower ceiling written during a gap stood at the old
+one until audio returned; the gap now spends it as audio time, one step per oversampled sample, the same steps the audio
+loop takes (a gap cut in pieces lands where one call does). And "never exceeded" carries the limiter's own float
+rounding — the gain is a float of a float dB, so an emitted sample can sit an ulp or two above 10^(c_i/20) (1e-6 dB
+measured, contraction on and off alike), the margin the static ceiling always had; the doc says so and the test's
+tolerance is 1e-5 dB, a few ulps, where it was 1e-4.
+
+### stereo — MonoBass::setBypass: a host bypass of the whole island that rides its own fades
+
+`setBypass (true)` fades the bass's crossfade to dry and the air's plateau to 0 dB (`kSmoothingMs` each, the fades
+`enabled` uses since the corners-glide note), after which the island retires on the sample clock — a bit-exact
+passthrough that returns before touching the buffer — and `setBypass (false)` fades both back in from filters
+restarted at zero. It OVERRIDES the parameters without replacing them: `params()` and `air()` keep reporting the
+caller's settings, and a write made while bypassed cannot switch either tool back on (the bypass is part of both fade
+targets). Before the stream's first sample it lands at once, so a stage bypassed from the start is untouched input.
+felitronics-mastering-core's MasteringChain uses it for `bypassMonoBass`, which used to skip the stage with a reset on
+both edges: -21.5 dBFS max|Δ²y| into the bypass and -48.7 out of it on a wide 103.7 Hz tone, -74.3 and -75.5 now. Pinned
+in `felitronics_monobass_glide_tests`.
+
 ## v0.52.0 — 2026-09-25
 
 ### mastering · the offline analyzers · the C ABIs — moved to felitronics-mastering-core (BREAKING)
