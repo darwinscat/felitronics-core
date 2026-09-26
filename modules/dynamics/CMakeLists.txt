@@ -13,6 +13,14 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_dynamics_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dynamics_tests COMMAND felitronics_dynamics_tests)
 
+    # The makeup glide: the first write snaps, a mid-stream move glides per sample and lands (replayed bit for bit),
+    # clocked by samples through a clock-only pause.
+    add_executable(felitronics_dynamics_makeup_glide_tests tests/CompressorMakeupGlideTests.cpp)
+    target_link_libraries(felitronics_dynamics_makeup_glide_tests PRIVATE felitronics::dynamics)
+    target_include_directories(felitronics_dynamics_makeup_glide_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dynamics_makeup_glide_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dynamics_makeup_glide_tests COMMAND felitronics_dynamics_makeup_glide_tests)
+
     add_executable(felitronics_dynamics_compressor_tests tests/CompressorTests.cpp)
     target_link_libraries(felitronics_dynamics_compressor_tests PRIVATE felitronics::dynamics)
     target_include_directories(felitronics_dynamics_compressor_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
