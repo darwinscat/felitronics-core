@@ -22,4 +22,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_io_grid_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_io_grid_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_io_grid_tests COMMAND felitronics_io_grid_tests)
+
+    # RIFF's word alignment: the pad byte after an odd chunk, written (counted in RIFF, not in the chunk) and
+    # skipped on read, with the old unpadded layout and a pad-blind reader planted through the same walk.
+    add_executable(felitronics_io_riff_tests tests/WavRiffTests.cpp)
+    target_link_libraries(felitronics_io_riff_tests PRIVATE felitronics::io)
+    target_include_directories(felitronics_io_riff_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_io_riff_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_io_riff_tests COMMAND felitronics_io_riff_tests)
 endif()

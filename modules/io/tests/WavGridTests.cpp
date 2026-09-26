@@ -46,13 +46,17 @@ constexpr double kPi = 3.14159265358979323846;
 double full (int bits) { return bits == 16 ? 32768.0 : 8388608.0; }   // 2^(bits-1): the grid, both ways
 
 // The codes an image carries, read from its bytes. Every image here is one channel behind the canonical
-// 44-byte header, which is what the writer emits; anything else reads as empty and fails the count.
+// 44-byte header, which is what the writer emits: the data chunk's size from its header, then RIFF's zero pad
+// byte after it when that size is odd (a 24-bit image of an odd length). Anything else — including the pad
+// missing — reads as empty and fails the count.
 std::vector<long long> codesOf (const std::vector<std::uint8_t>& img, int bits)
 {
     std::vector<long long> k;
     const std::size_t bp = (std::size_t) bits / 8;
-    if (img.size() < 44 || std::memcmp (img.data() + 36, "data", 4) != 0 || (img.size() - 44) % bp != 0) return k;
-    for (std::size_t off = 44; off < img.size(); off += bp)
+    if (img.size() < 44 || std::memcmp (img.data() + 36, "data", 4) != 0) return k;
+    const std::size_t len = (std::size_t) img[40] | ((std::size_t) img[41] << 8) | ((std::size_t) img[42] << 16) | ((std::size_t) img[43] << 24);
+    if (len % bp != 0 || img.size() != 44 + len + (len & 1u) || ((len & 1u) && img.back() != 0)) return k;
+    for (std::size_t off = 44; off < 44 + len; off += bp)
     {
         if (bits == 16) { k.push_back ((std::int16_t) (std::uint16_t) (img[off] | (img[off + 1] << 8))); continue; }
         std::int32_t v = img[off] | (img[off + 1] << 8) | (img[off + 2] << 16);
@@ -63,18 +67,20 @@ std::vector<long long> codesOf (const std::vector<std::uint8_t>& img, int bits)
 }
 
 // A mono image holding exactly these codes, built without the writer — the reader's input for read∘write.
+// Canonical, so an odd data chunk carries RIFF's pad byte, and the RIFF size counts it.
 std::vector<std::uint8_t> imageOf (const std::vector<long long>& k, int bits)
 {
     std::vector<std::uint8_t> o;
     auto u32 = [&] (std::uint32_t v) { for (int i = 0; i < 4; ++i) o.push_back ((std::uint8_t) ((v >> (8 * i)) & 0xFF)); };
     auto u16 = [&] (std::uint16_t v) { for (int i = 0; i < 2; ++i) o.push_back ((std::uint8_t) ((v >> (8 * i)) & 0xFF)); };
     auto tag = [&] (const char* t) { o.insert (o.end(), t, t + 4); };
-    const std::uint32_t bp = (std::uint32_t) bits / 8, len = (std::uint32_t) k.size() * bp;
-    tag ("RIFF"); u32 (36 + len); tag ("WAVE");
+    const std::uint32_t bp = (std::uint32_t) bits / 8, len = (std::uint32_t) k.size() * bp, pad = len & 1u;
+    tag ("RIFF"); u32 (36 + len + pad); tag ("WAVE");
     tag ("fmt "); u32 (16); u16 (1); u16 (1); u32 (48000); u32 (48000 * bp); u16 ((std::uint16_t) bp); u16 ((std::uint16_t) bits);
     tag ("data"); u32 (len);
     for (long long c : k)
         for (std::uint32_t b = 0; b < bp; ++b) o.push_back ((std::uint8_t) (((unsigned long long) c >> (8 * b)) & 0xFF));
+    if (pad) o.push_back (0);
     return o;
 }
 
@@ -180,6 +186,14 @@ std::size_t indexOf (const std::vector<long long>& k, long long c)
 {
     return (std::size_t) (std::find (k.begin(), k.end(), c) - k.begin());
 }
+
+// codes[indexOf (k, c)], or a value no code can be when the image did not decode — an instrument that read
+// out of bounds would crash the suite instead of failing the check.
+long long codeAt (const std::vector<long long>& codes, const std::vector<long long>& k, long long c)
+{
+    const std::size_t i = indexOf (k, c);
+    return i < codes.size() ? codes[i] : std::numeric_limits<long long>::min();
+}
 } // namespace
 
 int main()
@@ -208,13 +222,13 @@ int main()
             if (bits == 16)
             {
                 ok (parted == 32767, "planted: at 16 bit that is 32767 of the 65536 codes");
-                ok (badK[indexOf (k, 20000)] == 19999 && badK[indexOf (k, -32768)] == -32767
-                        && badK[indexOf (k, 16385)] == 16384 && badK[indexOf (k, 16384)] == 16384,
+                ok (codeAt (badK, k, 20000) == 19999 && codeAt (badK, k, -32768) == -32767
+                        && codeAt (badK, k, 16385) == 16384 && codeAt (badK, k, 16384) == 16384,
                     "planted: 20000 → 19999, -32768 → -32767, 16385 → 16384, and 16384 stays");
             }
             else
-                ok (badK[indexOf (k, 4194305)] == 4194304 && badK[indexOf (k, -8388608)] == -8388607
-                        && badK[indexOf (k, 4194304)] == 4194304,
+                ok (codeAt (badK, k, 4194305) == 4194304 && codeAt (badK, k, -8388608) == -8388607
+                        && codeAt (badK, k, 4194304) == 4194304,
                     "planted: 4194305 → 4194304, -8388608 → -8388607, and 4194304 stays");
         }
 
