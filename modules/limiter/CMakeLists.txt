@@ -22,6 +22,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_compile_features(felitronics_peak_clipper_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_peak_clipper_tests COMMAND felitronics_peak_clipper_tests)
 
+    # The ceiling glide: the bound per oversampled sample against the ceiling in force, landing, law 8a, no click.
+    add_executable(felitronics_limiter_ceiling_glide_tests tests/LimiterCeilingGlideTests.cpp)
+    target_link_libraries(felitronics_limiter_ceiling_glide_tests PRIVATE felitronics::limiter)
+    target_include_directories(felitronics_limiter_ceiling_glide_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_limiter_ceiling_glide_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_limiter_ceiling_glide_tests COMMAND felitronics_limiter_ceiling_glide_tests)
+
     add_executable(felitronics_limiter_ceiling_tests tests/TruePeakCeilingTests.cpp)
     target_link_libraries(felitronics_limiter_ceiling_tests PRIVATE felitronics::limiter)
     target_include_directories(felitronics_limiter_ceiling_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
