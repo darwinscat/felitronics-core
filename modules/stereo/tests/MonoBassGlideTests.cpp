@@ -116,6 +116,20 @@ auto ragged (std::uint32_t seed)
     };
 }
 
+// The same wide tones WITHOUT the noise: a second difference measures a click only where nothing else moves it (the
+// code-review round found the noisy programme's own Δ² hiding a hard step entirely).
+Buf tones (int n)
+{
+    Buf x (2, std::vector<float> ((std::size_t) n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = i / kFs;
+        x[0][(std::size_t) i] = (float) (0.3 * std::sin (2 * kPi * 103.7 * t));
+        x[1][(std::size_t) i] = (float) (0.3 * std::sin (2 * kPi * 103.7 * t + kPi / 2));
+    }
+    return x;
+}
+
 Set base()
 {
     Set s;
@@ -222,7 +236,7 @@ static void testEnabledIsAFade()
 {
     group ("`enabled` is a fade — off settles into a bit-exact passthrough, and neither edge steps");
     const int n = 30000, at = 12000 + 17;
-    const Buf x = programme (n, 11u);
+    const Buf x = tones (n);
     Set on = base(); on.a.enabled = false; on.b.frequencyHz = 250.0f;
     Set off = on; off.b.enabled = false;
     const Buf goOff = render (x, on, { { at, off } }, fixed (128));
@@ -231,19 +245,109 @@ static void testEnabledIsAFade()
     ok (diffs (goOff, x, at, at + 960) > 0, "PRECONDITION: and not before — it faded");
     const Buf goOn = render (x, off, { { at, on } }, fixed (128));
     ok (diffs (goOn, x, 0, at) == 0, "PRECONDITION: disabled before the write is a passthrough");
+    // THE CRITERION IS THE HARNESS'S, in absolute terms: max|Δ²y| under -60 dBFS is clean (a -10.5 dBFS 104 Hz tone's own
+    // Δ² is -85 dBFS, and a LINEAR fade's kink necessarily sits above that — amplitude times one step, the level the
+    // shipped lowWidth fade has always had), and a hard switch here reads above -40.
+    constexpr double kClean = 1.0e-3, kClick = 1.0e-2;
     for (const auto* y : { &goOff, &goOn })
     {
-        const double steady = std::max (maxD2 ((*y)[0], 2000, 10000), maxD2 ((*y)[0], at + 8000, n));
         const double edge = maxD2 ((*y)[0], at - 64, at + 4000);
-        ok (edge < 1.3 * steady, std::string (y == &goOff ? "off" : "on") + ": the edge's Δ² stays at the steady tone's ("
-                                  + std::to_string (edge) + " against " + std::to_string (steady) + ")");
+        ok (edge < kClean, std::string (y == &goOff ? "off" : "on") + ": the edge stays under -60 dBFS of Δ² ("
+                           + std::to_string (20.0 * std::log10 (edge)) + " dBFS)");
     }
     // And the corner: a 60 -> 250 Hz move glides — the worst Δ² around it stays at the steady tone's.
     Set lo = base(); lo.a.enabled = false; lo.b.frequencyHz = 60.0f;
     Set hi = lo; hi.b.frequencyHz = 250.0f;
     const Buf mv = render (x, lo, { { at, hi } }, fixed (128));
-    const double steady = std::max (maxD2 (mv[0], 2000, 10000), maxD2 (mv[0], at + 10000, n));
-    ok (maxD2 (mv[0], at - 64, at + 6000) < 1.5 * steady, "the crossover corner glides 60 -> 250 Hz without a step");
+    ok (maxD2 (mv[0], at - 64, at + 6000) < kClean, "the crossover corner glides 60 -> 250 Hz under -60 dBFS of Δ² ("
+                                                    + std::to_string (20.0 * std::log10 (maxD2 (mv[0], at - 64, at + 6000))) + " dBFS)");
+    // …and the check can see a step: the same move written into a stage whose stream has not started (it SNAPS)
+    // and spliced — the pre-write half from `lo`, the post-write half from a stage that had `hi` all along — is a
+    // hard switch between two settled renders, and its Δ² is many times the steady tone's.
+    const Buf always = render (x, hi, {}, fixed (128));
+    std::vector<float> spliced (mv[0]);
+    const Buf still = render (x, lo, {}, fixed (128));
+    for (int i = 0; i < n; ++i) spliced[(std::size_t) i] = i < at ? still[0][(std::size_t) i] : always[0][(std::size_t) i];
+    ok (maxD2 (spliced, at - 64, at + 64) > kClick, "PRECONDITION: a hard switch between the two corners IS visible to this check ("
+                                                    + std::to_string (20.0 * std::log10 (maxD2 (spliced, at - 64, at + 64))) + " dBFS)");
+}
+
+// A GLIDE IN FLIGHT KEEPS MOVING THROUGH A PAUSE, a mono stretch or an idle island — the same samples of audio time,
+// the same place: the designed corners and the crossfade after N samples of any of them equal those after N samples
+// of stereo audio. (With the skip's corner ticks removed, the code-review round saw every earlier check still pass.)
+static void testGlidesSpendSkippedTime()
+{
+    group ("a glide in flight spends a pause, a mono stretch and an idle island exactly as it spends audio");
+    const Buf x = programme (8000, 21u);
+    Set s0 = base();
+    Set s1 = s0; s1.b.frequencyHz = 300.0f; s1.b.enabled = false; s1.a.frequencyHz = 11000.0f; s1.a.gainDb = 5.0f;
+    struct Way { const char* name; int width; };
+    float refXo = 0.0f, refAir = 0.0f, refXf = 0.0f;
+    for (const Way w : { Way { "stereo audio", 2 }, Way { "a clock-only pause", 0 }, Way { "a mono stretch", 1 } })
+    {
+        MonoBass m;
+        apply (m, s0);
+        ok (m.prepare (kFs, 4096, 2), "PRECONDITION: prepare");
+        Buf y = x;
+        float* io[2] { y[0].data(), y[1].data() };
+        felitronics::test::run (m.process (io, 2, 1000));
+        apply (m, s1);
+        felitronics::test::run (m.process (io, 2, 100));                     // the glides are in flight
+        float* io2[2] { y[0].data() + 1100, y[1].data() + 1100 };
+        felitronics::test::run (m.process (w.width == 0 ? nullptr : io2, w.width, 700));
+        if (w.width == 2) { refXo = m.crossoverDesignHz(); refAir = m.airDesignHz(); refXf = m.crossfade(); }
+        ok (bits (m.crossoverDesignHz()) == bits (refXo) && bits (m.airDesignHz()) == bits (refAir) && bits (m.crossfade()) == bits (refXf),
+            std::string ("after 700 samples of ") + w.name + ", the corners and the crossfade stand where audio would have left them ("
+            + std::to_string (m.crossoverDesignHz()) + " Hz, " + std::to_string (m.airDesignHz()) + " Hz, xf " + std::to_string (m.crossfade()) + ")");
+        ok (m.crossoverDesignHz() > 150.0f && m.crossoverDesignHz() < 300.0f && m.crossfade() > 0.5f && m.crossfade() < 1.0f,
+            std::string ("PRECONDITION: mid-glide, not before it and not landed — ") + w.name + " (" + std::to_string (m.crossoverDesignHz())
+            + " Hz, xf " + std::to_string (m.crossfade()) + ")");
+    }
+    // A width written while the bass is disabled arrives while the air keeps the island running.
+    MonoBass m;
+    Set d = base(); d.b.enabled = false;
+    apply (m, d);
+    ok (m.prepare (kFs, 4096, 2), "PRECONDITION: prepare");
+    Buf y = x;
+    float* io[2] { y[0].data(), y[1].data() };
+    felitronics::test::run (m.process (io, 2, 500));
+    d.b.lowWidth = 0.7f;
+    apply (m, d);
+    felitronics::test::run (m.process (io, 2, 1500));
+    ok (bits (m.lowWidthNow()) == bits (0.7f), "a width written while the bass is disabled has arrived 1500 samples later ("
+                                              + std::to_string (m.lowWidthNow()) + ")");
+}
+
+// THE AIR RETIRES THE ISLAND ON THE SAMPLE CLOCK: with the bass idle, an air fade-out that lands mid-call must leave the
+// rest of the call untouched — whole, per-sample and ragged renders the same bits — and a shelf that faded out with the
+// bass in the same sample holds no tail for the next enable.
+static void testAirRetiresTheIsland()
+{
+    group ("the air retires the island on the sample clock, and leaves no tail behind");
+    const Buf x = programme (12000, 31u);
+    Set s = base(); s.b.enabled = false;
+    Set off = s; off.a.enabled = false;
+    const std::vector<Write> ws { { 3001, off } };
+    const Buf ref = render (x, s, ws, fixed (12000));
+    for (const auto& cut : { std::function<int (int)> (fixed (1)), std::function<int (int)> (ragged (5)), std::function<int (int)> (fixed (777)) })
+    {
+        const Buf got = render (x, s, ws, cut);
+        ok (diffs (ref, got) == 0, "bass idle, air fading out mid-call: the same bits under a different cut (" + std::to_string (diffs (ref, got)) + " differ)");
+    }
+    ok (diffs (ref, x, 3001 + 960 + 1) == 0, "past the fade the island is retired: the input, bit for bit");
+    // Both fades landing on the same sample, then silence, then the air back on: nothing but silence comes out of it.
+    Buf z = programme (12000, 33u);
+    for (int i = 5000; i < 12000; ++i) z[0][(std::size_t) i] = z[1][(std::size_t) i] = 0.0f;
+    Set both = base();
+    Set bothOff = both; bothOff.b.enabled = false; bothOff.a.enabled = false;
+    Set airBack = bothOff; airBack.a.enabled = true;
+    for (const auto& cut : { std::function<int (int)> (fixed (4096)), std::function<int (int)> (fixed (1)) })
+    {
+        const Buf y = render (z, both, { { 3000, bothOff }, { 8000, airBack } }, cut);
+        double tail = 0.0;
+        for (int i = 8000; i < 12000; ++i) tail = std::max (tail, (double) std::fabs (y[0][(std::size_t) i]) + std::fabs (y[1][(std::size_t) i]));
+        ok (tail == 0.0, "re-enabled out of silence after both fades landed together: exactly zero (" + std::to_string (tail) + ")");
+    }
 }
 
 static void testSetAirRetunesOnALiveMove()
@@ -297,6 +401,8 @@ int main()
     testFirstWriteSnapsAndTheOrdersAgree();
     testGlidesAreOnAudioTime();
     testEnabledIsAFade();
+    testGlidesSpendSkippedTime();
+    testAirRetiresTheIsland();
     testSetAirRetunesOnALiveMove();
     testNoAllocation();
     return felitronics::test::report();

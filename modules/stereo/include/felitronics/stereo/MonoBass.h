@@ -289,6 +289,12 @@ public:
     static constexpr float kMinAirFreq = 3000.0f, kMaxAirFreq = 12000.0f;
 
     bool  isEnabled() const noexcept { return enabled_; }
+    // WHERE THE GLIDES STAND — the corners the filters are designed at and the crossfade's value, as audio time
+    // has walked them (a pause and a skipped stretch included). For tests and meters; the targets are params()/air().
+    float crossoverDesignHz() const noexcept { return xoHz_; }
+    float airDesignHz()       const noexcept { return airFreqCur_; }
+    float crossfade()         const noexcept { return xfSm_.getCurrentValue(); }
+    float lowWidthNow()       const noexcept { return widthSm_.getCurrentValue(); }
     float frequency() const noexcept { return freq_; }
     float lowWidth()  const noexcept { return lowWidth_; }
     static constexpr int latencySamples() noexcept { return 0; }
@@ -339,13 +345,26 @@ public:
             {
                 mbDone = true;
                 if (! bypassed_) { bypassed_ = true; xo_.reset(); }
-                if (airIdle()) { skipTime (n - i); return true; }
+            }
+            // …and the AIR retires the island on the same clock. This used to be asked only when the BASS
+            // settled mid-call, so an air fade-out that landed while the bass was already idle kept every
+            // remaining sample of the call in the M/S round trip — and the output depended on the cut (the
+            // code-review round: 7 471 floats between a whole-block and a one-sample render). And the exit
+            // resets a shelf that has not been reset yet, as the call-level bypass does: leaving it held a
+            // tail that replayed on the next enable (1.42e-5 out of silence, found by the same round).
+            if (mbDone && airIdle())
+            {
+                if (! airBypassed_) { airBypassed_ = true; airShelf_.reset(); }
+                skipTime (n - i);
+                return true;
             }
             float m, s; MidSide::encode (L[i], R[i], m, s);
             float sOut = s;
+            // THE WIDTH RAMP RUNS ON EVERY SAMPLE THE ISLAND PROCESSES, used or not: a width written while the
+            // bass is disabled (xf settled at dry) must have arrived when it is enabled again, not start then.
+            const float w = widthSm_.getNextValue();
             if (! mbDone)
             {
-                const float w  = widthSm_.getNextValue();
                 const float xf = xfSm_.getNextValue();
                 float lp, hp; xo_.processSample (0, s, lp, hp);
                 const float wet = w * lp + hp;               // side magnitude (w + r⁴)/(1+r⁴) — bump-free (LR4 in-phase)
@@ -358,6 +377,7 @@ public:
             // clipper's mix = 0 bypass. So zero is a BRANCH, taken on the smoothed and clamped value.
             // `enabled` rides the plateau's smoother (its target is 0 dB when off), so the shelf runs for as long
             // as that smoother is away from 0 — a switch-off fades instead of stepping.
+            bool shelfRan = false;
             {
                 const bool  moving = airSm_.isSmoothing();
                 const float db     = airSm_.getNextValue();
@@ -366,11 +386,14 @@ public:
                     designAir (db, moving);
                     airBypassed_ = false;
                     sOut = airShelf_.processSample (sOut);
+                    shelfRan = true;
                 }
                 else if (! airBypassed_) { airBypassed_ = true; airShelf_.reset(); }
             }
-            // The measurement, on the band the shelf acts on, taking `s` and `sOut` while both are in hand.
-            if (airEnabled_)
+            // The measurement, on the band the shelf acts on, taking `s` and `sOut` while both are in hand —
+            // while the air is enabled (a 0 dB plateau included, as ever) AND while a switched-off shelf is still
+            // fading out, which is audible and so is reported (the code-review round).
+            if (airEnabled_ || shelfRan)
             {
                 float lp, hp;
                 wxM_ .processSample (0, m,    lp, hp); wSumM_  += (double) hp * (double) hp;
@@ -429,6 +452,14 @@ private:
     // smoothers' own settling (they arrive exactly and then cost nothing), not by the length of the call.
     void skipTime (int n) noexcept
     {
+        // THE LINEAR RAMPS SPEND IT TOO — width, the crossfade, the plateau — one step per sample, exactly the
+        // steps the audio path would have taken, so a fade that meets a pause or a mono stretch has moved on by
+        // it and a pause cut any way lands in the same place (the code-review round: a disable followed by 1000
+        // clock-only samples used to run its whole 960-sample fade on return). Bounded by the ramps, not by n.
+        for (int i = 0; i < n && (widthSm_.isSmoothing() || xfSm_.isSmoothing() || airSm_.isSmoothing()); ++i)
+        {
+            (void) widthSm_.getNextValue(); (void) xfSm_.getNextValue(); (void) airSm_.getNextValue();
+        }
         long long boundaries = ((long long) grid_.phase() + (long long) n) / core::StateGrid::kPeriod;
         grid_.skip (n);
         const bool moving = ! (core::exactlyEqual (freqSm_.value(), freqSm_.targetValue())

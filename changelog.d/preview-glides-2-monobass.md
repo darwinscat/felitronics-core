@@ -26,9 +26,23 @@ read -25.9 and `enabled` true -> false -26.3, where the plateau's own 20 ms glid
   re-tuned only when the clamp moved the corner — contrary to the note at `retuneWidthBand()` — and a live 6000 ->
   8000 Hz move kept summing across both bands: `airJudgedSamples()` read 2000 where the new band had judged 1000.
 
+THE REVIEW ROUND (codex astra) found five defects in the first spelling of this, all fixed: the linear ramps (width,
+crossfade, plateau) froze through a skipped stretch while the corners walked on — a disable followed by a pause ran
+its whole fade on return — and now spend it sample by sample; with the bass already idle an air fade-out that landed
+mid-call never retired the island, so the rest of the call stayed in the M/S round trip and depended on the cut
+(7 471 floats between whole-block and one-sample renders) — the island now retires on the air's settle too, on the
+sample clock; that exit did not reset the shelf, which then replayed a 1.42e-5 tail on the next enable; the width
+ramp froze while a disabled bass let the air keep the island running; and the air's band measurement stopped the
+moment `enabled` went false although the shelf was still audibly fading — it covers the fade now (an enabled 0 dB
+plateau is measured as before). Its test critique was right too: a noisy programme's own Δ² hid a hard step, and
+nothing observed the skipped time, so the click checks run on pure tones against an absolute -60 dBFS bound with a
+spliced hard switch as the precondition, and new accessors (`crossoverDesignHz()`, `airDesignHz()`, `crossfade()`,
+`lowWidthNow()`) let a test see where the glides stand after a pause, a mono stretch and an idle island.
+
 New suite `felitronics_monobass_glide_tests`: the two configuration orders bit-identical for seven parameters, the
 snap after a reset() mid-glide, a timeline of writes (both corners with a retarget, both enables, lowWidth, the
 plateau) bit-identical under per-sample, 64, 100, 4096 and ragged-with-empty-calls cuts with a clock-only pause and a
 mono stretch in it, a corner glide started while the island is idle, the fades' passthrough and edges, the setAir
-re-tune, no allocation. Mutations caught: `wasFreq` after the assignment, an extra corner tick per call, lowWidth
-gliding after a reset.
+re-tune, the skipped-time positions, the air retiring the island, no allocation. Mutations caught: `wasFreq` after the
+assignment, an extra corner tick per call, lowWidth gliding after a reset, no corner ticks in a skip, no linear-ramp
+steps in a skip, an instantaneous crossover, no air retire, a width frozen while the bass is idle.
