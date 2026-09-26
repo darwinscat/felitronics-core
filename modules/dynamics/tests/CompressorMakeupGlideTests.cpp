@@ -204,6 +204,22 @@ static void testClockedBySamples()
     ok (diffs (mv, snap, 6000 + 48) == 0, "a glide spanned by a pause has landed when the audio returns");
 }
 
+// ABSURD BUT FINITE MAKEUPS stay finite through a glide: -1e308 -> +1e308 -> 0 overflowed the ramp's difference to inf
+// and the retarget to NaN, which the ±400 dB sum clamp passes (the code-review round).
+static void testAbsurdMakeupsStayFinite()
+{
+    group ("absurd but finite makeups glide without leaving the finite numbers");
+    const int n = 12000;
+    const Buf x = tone (n, 0.3);
+    const Buf y = render (x, P (-1.0e308), { { 1000, P (1.0e308) }, { 1500, P (0.0) }, { 5000, P (-1.0e308) }, { 5100, P (3.0) } },
+                          fixed (100));
+    bool finite = true;
+    for (const auto& c : y) for (float v : c) finite = finite && std::isfinite (v);
+    ok (! y.empty() && finite, "every output sample is finite");
+    const Buf ref = render (x, P (3.0), {}, fixed (100));
+    ok (diffs (y, ref, 5100 + 1440 + 48) == 0, "…and past the last glide the makeup is exactly the target's");
+}
+
 static void testUnchangedWritesAndAllocation()
 {
     group ("an unchanged write restarts nothing, and nothing is allocated");
@@ -238,6 +254,7 @@ int main()
     testMakeupGlideExact();
     testAutoMakeupGlides();
     testClockedBySamples();
+    testAbsurdMakeupsStayFinite();
     testUnchangedWritesAndAllocation();
     return felitronics::test::report();
 }

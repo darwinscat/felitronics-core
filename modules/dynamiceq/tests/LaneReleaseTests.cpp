@@ -6,8 +6,11 @@
 //   * OFF BY DEFAULT: a point switched off mid-duck still snaps its delta to 0 on the edge, exactly as before.
 //   * OPTED IN, the edge RELEASES: the delta decays monotonically through the lane's own release follower, the
 //     band's dynamic seam is held open for exactly as long (band.params().dyn.on), and when every delta has arrived
-//     the point disengages as it would have and the caller's `dyn.on` is back on the band — from then on the band
-//     renders bit for bit what a band that never had dynamics renders.
+//     the point disengages as it would have and the caller's `dyn.on` is back on the band — from then on a band
+//     whose ducked lane is the only one it runs renders bit for bit what a band that never had dynamics renders (a
+//     lane downstream of the ducked one keeps a recursive filter's memory of the duck; see the class note).
+//   * THE DETECTOR KEEPS LISTENING through a release, lanes keep their participation rules, a refused call moves
+//     nothing, and reset() hands a held band back.
 //   * EVERY DISENGAGE EDGE releases: dyn.on off, rangeDb 0, and a missing sidechain (the mastering chain's case when
 //     no other point is armed); a clock-only pause spends the release; switching back on mid-release carries on from
 //     where it stands.
@@ -129,8 +132,8 @@ static void testReleaseOnDisengage()
     for (std::size_t i = (std::size_t) finishedAt; i < r.L.size(); ++i)
         d += std::bit_cast<std::uint32_t> (r.L[i]) != std::bit_cast<std::uint32_t> (still.L[i])
           || std::bit_cast<std::uint32_t> (r.R[i]) != std::bit_cast<std::uint32_t> (still.R[i]);
-    ok (d == 0, "from the moment it finished, the band renders bit for bit what a band that never had dynamics renders ("
-                + std::to_string (d) + " differ)");
+    ok (d == 0, "from the moment it finished, this single-lane band renders bit for bit what a band that never had dynamics "
+                "renders (" + std::to_string (d) + " differ)");
 }
 
 static void testEveryEdgeReleases()
@@ -181,6 +184,72 @@ static void testEveryEdgeReleases()
     }
 }
 
+
+// FOUND BY THE CODE-REVIEW ROUND, each pinned where it was found.
+static void testReviewFindings()
+{
+    group ("the detector keeps listening, lanes keep their rules, a refused call moves nothing, reset() hands the band back");
+    // reset() mid-release: the held band gets its deltas and the caller's dyn.on back.
+    {
+        Rig r;
+        ok (r.init (bell (true), true) && r.run (48000), "PRECONDITION: ducking");
+        r.write (bell (false));
+        ok (r.run (256) && r.dyn.isReleasing() && r.band.params().dyn.on, "PRECONDITION: releasing, the seam held open");
+        r.dyn.reset();
+        ok (! r.band.params().dyn.on && r.band.laneDeltaDb (eq::Lane::Stereo) == 0.0 && ! r.dyn.isReleasing(),
+            "reset() mid-release restores the caller's dyn.on and zeroes the band's delta");
+    }
+    // The detector listens through the release: the programme goes silent while releasing, the point is switched back on
+    // 100 ms later — it must not re-duck from an envelope frozen at the loud passage.
+    {
+        Rig r;
+        ok (r.init (bell (true), true) && r.run (48000), "PRECONDITION: ducking");
+        r.write (bell (false));
+        ok (r.run (1024), "PRECONDITION: releasing");
+        // silence, key included
+        std::vector<float> a (128, 0.0f), b (128, 0.0f), sa (128, 0.0f), sb (128, 0.0f);
+        float* io[2] { a.data(), b.data() };
+        const float* sc[2] { sa.data(), sb.data() };
+        for (int k = 0; k < 37; ++k) felitronics::test::run (r.dyn.processBand (io, sc, 2, 128, r.band));   // ~100 ms
+        const double before = r.dyn.deltaDb (eq::Lane::Stereo);
+        r.write (bell (true));
+        for (int k = 0; k < 8; ++k) felitronics::test::run (r.dyn.processBand (io, sc, 2, 128, r.band));
+        const double after = r.dyn.deltaDb (eq::Lane::Stereo);
+        ok (after >= before - 1e-6, "switched back on over silence: no re-duck (" + std::to_string (before) + " -> " + std::to_string (after) + " dB)");
+    }
+    // A lane switched off mid-release drops its delta at once, as it would while engaged.
+    {
+        Rig r;
+        ok (r.init (bell (true), true) && r.run (48000), "PRECONDITION: ducking");
+        eq::BandParams off = bell (false);
+        r.write (off);
+        ok (r.run (256) && r.dyn.deltaDb (eq::Lane::Stereo) < -3.0, "PRECONDITION: releasing");
+        off.lane (eq::Lane::Stereo).on = false;
+        r.write (off);
+        ok (r.run (64) && r.dyn.deltaDb (eq::Lane::Stereo) == 0.0, "a lane switched off mid-release drops its delta, as while engaged");
+    }
+    // A call the band refuses moves nothing: a band prepared for ONE channel, a producer for two, a stereo call on the edge.
+    {
+        eq::EqBand band; dynamiceq::LaneDynamics dyn;
+        ok (band.prepare (kFs, 1) && dyn.prepare (kFs, 2), "PRECONDITION: prepare");
+        band.setParams (bell (true)); dyn.setParams (bell (true)); dyn.setReleaseOnDisengage (true);
+        std::vector<float> m (128), s2 (128);
+        for (int k = 0; k < 400; ++k)
+        {
+            for (int i = 0; i < 128; ++i) m[(std::size_t) i] = (float) (0.25 * std::sin (2.0 * core::kPi * 227.3 * (double) (k * 128 + i) / kFs));
+            std::vector<float> key = m;
+            float* io[1] { m.data() }; const float* sc[1] { key.data() };
+            felitronics::test::run (dyn.processBand (io, sc, 1, 128, band));
+        }
+        ok (dyn.deltaDb (eq::Lane::Stereo) < -3.0, "PRECONDITION: the mono point ducks");
+        band.setParams (bell (false)); dyn.setParams (bell (false));
+        float* io2[2] { m.data(), s2.data() };
+        const float* sc2[2] { m.data(), s2.data() };
+        ok (! dyn.processBand (io2, sc2, 2, 128, band), "PRECONDITION: the band refuses a stereo call");
+        ok (! dyn.isReleasing() && ! band.params().dyn.on, "the refused call started no release and did not open the seam");
+    }
+}
+
 static void testTheEdgeNoLongerSteps()
 {
     group ("the edge no longer steps — a fraction of the snap's second difference");
@@ -221,6 +290,7 @@ int main()
     testDefaultSnaps();
     testReleaseOnDisengage();
     testEveryEdgeReleases();
+    testReviewFindings();
     testTheEdgeNoLongerSteps();
     testNoAllocation();
     return felitronics::test::report();

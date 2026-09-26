@@ -27,3 +27,17 @@ is the band's 16-sample control grid, the same zipper its own attack and release
 because it writes the band: TabbyEQ re-writes every band every block (so the flag would flip back and forth, a
 redesign each time) and stops calling processBand() for a point once no point is dynamic (so the release would never
 finish) — both would have to change before it can opt in. New `felitronics_dynamiceq_release_tests`.
+
+THE REVIEW ROUND (codex astra) found, and this note's code already carries the fixes: reset() and prepare() forgot a
+band held open mid-release (it kept its duck and dyn.on while the producer reported 0) — the held band is remembered
+and handed back; the release froze the detectors, so a point switched back on over silence re-ducked from the stale
+loud envelope (-0.48 -> -2.26 dB) — the release now runs the engaged control step with only the target forced to 0 dB,
+the detectors listening on the key or, without one, on silence at the audio's width, which also restores the engaged
+path's lane bookkeeping (a lane switched off mid-release drops its delta as it would while engaged); a call the band
+refused had already opened the seam — the band's verdict is taken first, as a zero-length probe; finite makeups of
+±1e308 overflowed the glide's arithmetic to NaN, which the ±400 dB sum clamp passes — the step is computed between
+endpoints bounded to ±1e6 dB, a bound no gain decision ever reaches; and the post-release bit identity is a property of
+a band whose ducked lane is the only one it runs (a downstream lane keeps a filter's memory of the duck), stated so now.
+The per-call 16-sample control grid the release shares with the engaged path is NOT changed: it is how the producer has
+always run, the mastering chain's quanta make it cut-invariant there, and changing it would move every offline render.
+

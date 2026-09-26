@@ -429,6 +429,7 @@ private:
     // casts its own size to int internally — so the pair above is what keeps that conversion in range.
     static constexpr double kMaxGainDb      = 400.0;    // gain reduction PLUS makeup, the only thing that
                                                         // reaches dbToGain; 400 dB is a gain of 1e20
+    static constexpr double kRampBoundDb    = 1.0e6;    // the makeup glide's arithmetic only — see apply()
 
     void apply (const CompressorParams& p) noexcept
     {
@@ -458,11 +459,18 @@ private:
         // THE GLIDE: a moved target restarts a linear ramp from where the makeup stands NOW (double, landing on
         // the target itself); before the stream's first sample it lands at once. An unchanged target — every
         // re-sent parameter set — restarts nothing.
+        // The STEP is computed between endpoints bounded to ±kRampBoundDb, and only the arithmetic sees that bound:
+        // a finite makeup of ±1e308 is a legal write (process() clamps the SUM to ±kMaxGainDb, the one clamp this
+        // class has), but the difference of two of them overflows to inf and the next retarget turns the ramp into
+        // NaN, which that clamp passes (the code-review round: -1e308 -> +1e308 -> 0 emitted NaN). The bound is far
+        // outside ±kMaxGainDb, so it never decides a gain; the last step still lands on the exact target.
         if (fresh_ || makeupRampLen_ <= 0) { makeupNowDb_ = makeupAppliedDb; makeupLeft_ = 0; }
         else if (! core::exactlyEqual (makeupAppliedDb, makeupTargetDb_))
         {
-            makeupLeft_ = makeupRampLen_;
-            makeupStepDb_ = (makeupAppliedDb - makeupNowDb_) / (double) makeupRampLen_;
+            const auto bounded = [] (double v) noexcept { return std::clamp (v, -kRampBoundDb, kRampBoundDb); };
+            makeupNowDb_  = bounded (makeupNowDb_);
+            makeupLeft_   = makeupRampLen_;
+            makeupStepDb_ = (bounded (makeupAppliedDb) - makeupNowDb_) / (double) makeupRampLen_;
         }
         makeupTargetDb_ = makeupAppliedDb;
     }
