@@ -11,7 +11,9 @@
 // Reads canonical PCM/float WAVE (16/24/32-bit int, 32/64-bit float, incl. WAVE_FORMAT_EXTENSIBLE),
 // deinterleaves to per-channel doubles in [-1,1]. Rejects unsupported formats loudly (ok=false + error
 // string) — never silent zeros. 512 MB DoS guard. Writes 16/24-bit PCM or 32-bit float; clamps,
-// zeroes NaN/Inf, guards ragged channels. Little-endian (the WAV convention).
+// zeroes NaN/Inf, guards ragged channels. Little-endian (the WAV convention). Both sides keep RIFF's
+// word alignment: an odd chunk carries one uncounted zero pad byte, which the writer emits after an odd
+// `data` chunk (and counts in the RIFF size) and the reader skips.
 // OFFLINE, MESSAGE-THREAD-ONLY (allocates, touches the filesystem).
 //
 // ONE PCM GRID, AND IT IS felitronics::dither's: a `bits`-bit code k stands for k / 2^(bits-1), both ways.
@@ -129,6 +131,9 @@ inline WavData readWavMemory (const std::uint8_t* bytes, std::size_t size)
             data = bytes + body;
             datalen = clen;
         }
+        // An odd chunk is followed by one pad byte its size does not count, so the next header starts at the
+        // next EVEN offset. A final odd chunk whose pad is missing — what writeWav produced before it wrote the
+        // pad, and what careless writers still produce — has been parsed above and simply ends the walk.
         const std::size_t advance = (std::size_t) clen + (clen & 1u);
         if (advance > size - body) break;                 // odd-length final chunk: parsed, done
         pos = body + advance;
@@ -143,6 +148,7 @@ inline WavData readWavMemory (const std::uint8_t* bytes, std::size_t size)
                   ", bits=" + std::to_string (bits) + ")";
         return w;
     }
+    if (rate == 0) { w.error = "corrupt WAV (sample rate 0 Hz)"; return w; }
     w.sr = rate; w.bits = bits; w.is_float = (fmt == 3);
     const std::size_t bytesPer = (std::size_t) bits / 8;
     const std::size_t frame = bytesPer * nch;
@@ -209,11 +215,19 @@ inline std::vector<std::uint8_t> writeWavMemory (const std::vector<std::vector<d
     const std::uint16_t nch = (std::uint16_t) ch.size();
     const std::uint16_t fmt = is_float ? 3 : 1;
     const std::uint32_t rate = (std::uint32_t) std::llround (sr);
+    if (rate == 0) return {};   // a rate in (0, 0.5) rounds to a 0 Hz header, which no reader can use
     if ((std::uint64_t) rate * block64 > 0xFFFFFFFFull) return {};   // byteRate is a u32 too
     const std::uint16_t block = (std::uint16_t) block64;
     const std::uint32_t datalen = (std::uint32_t) data64;
-    std::vector<std::uint8_t> o; o.reserve (44 + datalen);
-    wrTag (o, "RIFF"); wrU32 (o, 36 + datalen); wrTag (o, "WAVE");
+    // RIFF pads every chunk to an even length with one zero byte that the chunk's own size does NOT count
+    // and the RIFF size DOES. Only `data` can be odd here — 24-bit, an odd channel count, an odd frame count
+    // (3 bytes a frame for mono): `fmt ` is 16 and the 12-byte header is even. Without the pad the file ended
+    // on an odd byte, so a chunk anything appended after it (LIST, bext, iXML) started on an odd offset, where
+    // a reader that skips the pad — ours included — lands one byte into its header. The size guard above
+    // leaves room for it: 36 + datalen + 1 cannot wrap.
+    const std::uint32_t pad = datalen & 1u;
+    std::vector<std::uint8_t> o; o.reserve (44 + (std::size_t) datalen + pad);
+    wrTag (o, "RIFF"); wrU32 (o, 36 + datalen + pad); wrTag (o, "WAVE");
     wrTag (o, "fmt "); wrU32 (o, 16); wrU16 (o, fmt); wrU16 (o, nch);
     wrU32 (o, rate); wrU32 (o, rate * block); wrU16 (o, block); wrU16 (o, (std::uint16_t) bits);
     wrTag (o, "data"); wrU32 (o, datalen);
@@ -229,6 +243,7 @@ inline std::vector<std::uint8_t> writeWavMemory (const std::vector<std::vector<d
                 o.push_back ((std::uint8_t) (iv & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 8) & 0xFF)); o.push_back ((std::uint8_t) ((iv >> 16) & 0xFF));
             }
         }
+    if (pad) o.push_back (0);
     return o;
 }
 
