@@ -673,6 +673,15 @@ lowest-common-denominator that kills desktop performance).
   `mastering-config.json` (JAZZ/METAL, LIGHT/HEAVY) stays in the product, and that split is the rule, not an
   exception to it.
 
+  **AMENDED AGAIN — the mastering brain moves into the shared layer too.** For mastering the product is now
+  two shells, a web page and a desktop app, that must decide identically on the same file. The decisions —
+  which devices to place and how, the voicing they read (targets, device defaults), the texts of the report
+  and the project file itself — therefore live in `felitronics::session`, a module of
+  felitronics-mastering-core, and the product keeps only what a shell is: the screen, the playback, the
+  storage, the threads. `session` is offline code, not a real-time stage; the laws it keeps and the ones it
+  does not are stated in that repository (`docs/SESSION.md`). The line above still holds for everything that
+  has one product and no second shell: there the voicing stays in the product.
+
 ---
 
 ## 5. Build & repo strategy
