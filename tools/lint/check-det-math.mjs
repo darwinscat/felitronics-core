@@ -56,7 +56,7 @@
 //     SystemMath/DetMath policy routing is pinned by static_assert in MathPolicyTests.cpp instead; that
 //     is the right tool for it and this is not.
 //
-// Usage: node tools/lint/check-det-math.mjs [--self-test] [--report] [--propose] [--satellite]
+// Usage: node tools/lint/check-det-math.mjs [--self-test] [--report] [--propose] [--satellite [--include-root <dir>]...]
 //   --self-test  run the matcher's own negative controls and exit
 //   --report     print the full inventory (file, line, scope, call) and exit 0 — for an audit, not a gate
 //   --propose    print manifest lines for files that have none, marked UNCLASSIFIED. It never writes the
@@ -67,9 +67,15 @@
 //                exactly as core's CI runs it; then the satellite's ./modules and ./tools against ITS lists
 //                (tools/lint/det-math-zone.txt — see ZONE FILE below) and its own manifest, with core's
 //                carriers. Nothing is skipped on either side; see TWO REPOSITORIES, ONE GATE below.
+//   --include-root <dir>
+//                with --satellite only, repeatable: the include directory of a THIRD library the satellite
+//                #includes as <felitronics/...> (felitronics-toml's, for felitronics-mastering-core), absolute
+//                or relative to the satellite's root. Its files join the satellite's pass, under every rule and
+//                named by their include spelling; see A THIRD LIBRARY below.
 
-import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from 'node:fs';
-import { join, dirname, relative, sep } from 'node:path';
+import { readFileSync, readdirSync, statSync, existsSync, realpathSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join, dirname, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 // Everything below the matcher runs ONLY when this file is invoked as a program. Without this an
@@ -231,9 +237,10 @@ const ZONE_EXCEPTIONS = [
 //   core pass       core's ./modules and ./tools against the lists above and core's manifest — the whole
 //                   gate, on the core checkout the satellite builds with, so a satellite run cannot be green
 //                   on a core whose own lists have rotted.
-//   satellite pass  the satellite's ./modules and ./tools against its lists and its manifest, with core's
-//                   carriers. Its parity entry points' #include closure walks INTO core's headers; a core file
-//                   reached that way is judged by the core pass, and labelled there as reachable from one.
+//   satellite pass  the satellite's ./modules and ./tools, and every --include-root it names, against its lists
+//                   and its manifest, with core's carriers. Its parity entry points' #include closure walks INTO
+//                   core's headers; a core file reached that way is judged by the core pass, and labelled there
+//                   as reachable from one.
 // Each pass checks its own lists for rot (a zone entry, an entry point or an exception naming a file or a call
 // that is not there any more), so neither side's allowances can outlive what they allowed.
 const CORE_ROOT = realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..'));
@@ -242,10 +249,40 @@ const CORE_ROOT = realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..
 //     entry      <path>                  <why>    a parity entry point: its #include closure is rule 4's net
 //     zone       <path>                  <why>    a file whose numbers are compared byte for byte across rows
 //     exception  <path>  <fn>*<count>    <why>    an in-zone libm call, argued for (the line marker is required too)
-// A repository with no such file has no zone and no entry points: every libm call in it is a manifest line.
-// That is a legitimate state (felitronics-guitar-core), so an ABSENT file is not an error — which is why the
-// repository that does have a zone pins it with a planted-violation control in its own CI.
+// <path> is relative to the satellite's root, or — for a file under an --include-root — its include spelling in
+// angle brackets, as below. A repository with no such file has no zone and no entry points: every libm call in
+// it is a manifest line. That is a legitimate state (felitronics-guitar-core), so an ABSENT file is not an
+// error — which is why the repository that does have a zone pins it with a planted-violation control in its CI.
 const ZONE_FILE = 'tools/lint/det-math-zone.txt';
+
+// A THIRD LIBRARY. A satellite may build against a library that is neither core nor itself — the session of
+// felitronics-mastering-core reads its config with felitronics-toml — and `#include <felitronics/toml/Toml.h>`
+// resolves in neither repository's modules/*/include. Rule 4 refuses a header it cannot find, rightly, so the
+// satellite names that library's include directory with --include-root, once per library. What that does, and
+// deliberately does not:
+//   · A file under an include root is a file of the SATELLITE's pass, under every rule: in the zone if the zone
+//     file says so, a manifest line if it calls libm outside the zone, rot-checked like the rest. It is walked
+//     whole, as a module's include directory is, and not only where the closure happens to reach: the same
+//     headers staged under the satellite's modules/ must get the same verdict, and do. A third library is not
+//     exempt for being someone else's; its code is compiled into the same binaries.
+//   · The lists name such a file by its INCLUDE SPELLING in angle brackets — `zone <felitronics/toml/Toml.h> <why>`
+//     in the zone file, `<felitronics/toml/Toml.h>  [...]  <disposition>  <why>` in the manifest — and never by
+//     a path. The checkout sits under build/_deps on CI and beside the repository on a desk; an entry that
+//     meant one of those would be rot on the other. The spelling is what the compiler resolves, on both.
+//   · Fail closed, before anything is scanned: a root that does not exist, is not a directory, is given twice,
+//     or overlaps another root or a directory this lint already scans as a repository's own (either tree's
+//     modules/*/{include,src} or tools/) is an ERROR, never an empty root — a scan of nothing reads as a scan.
+//     A header that two roots provide, or a root and a repository, is refused like a header two repositories
+//     provide; two roots holding one spelling are refused even where nothing includes it; and a root no #include
+//     of the parity closure resolves through is ROOT-ROT, a flag that outlived the dependency it declared.
+// WHY A FLAG AND NOT A LINE IN THE ZONE FILE. Everything in the zone file is a claim a human makes about where a
+// number goes, and it reads the same on every machine. Where a library's checkout lives is neither: it is a fact
+// of the build, which CMake resolved and records in its cache (felitronics-mastering-core's
+// FELITRONICS_MASTERING_TOML_SOURCE_DIR), and which a CI step reads back exactly as it reads core's checkout. So
+// the location comes in from the build, on the command line, and the written lists name only what does not move —
+// the include spelling. A run that forgets the flag is not quietly narrower: the headers are unresolved, and
+// rule 4 says so.
+const INCLUDE_ROOT_FLAG = '--include-root';
 
 export function parseZoneFile (text)
 {
@@ -276,19 +313,29 @@ function walk (dir, acc) { for (const e of readdirSync(dir)) { const p = join(di
 
 function relOf (root, p) { return relative(root, p).split(sep).join('/'); }
 
+// The directories a tree's own files are read from: every module's include/ and src/, and tools/.
+// tools/ IS scanned, deliberately and unlike the long-double lint. The parity SURFACE lives there:
+// felitronics-mastering-core's tools/fcore_probe.h computes the dBTP that CI diffs, with its own floor
+// and, once, its own log10. A modules-only audit would have declared that path clean while the printed
+// number was unpinned.
+function scannedDirsOf (root)
+{
+    const dirs = [];
+    const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
+    const modules = join(root, 'modules');
+    for (const m of (existsSync(modules) ? readdirSync(modules) : []))
+        for (const sub of ['include', 'src']) if (isDir(join(modules, m, sub))) dirs.push(join(modules, m, sub));
+    if (isDir(join(root, 'tools'))) dirs.push(join(root, 'tools'));
+    return dirs;
+}
+
+const isTestPath = (f) => /\/(tests|bench)\//.test (f);
+
 function sourceFiles (root)
 {
     const files = [];
-    const modules = join(root, 'modules');
-    for (const m of (existsSync(modules) ? readdirSync(modules) : []))
-        for (const sub of ['include', 'src'])
-        { const p = join(modules, m, sub); try { if (statSync(p).isDirectory()) walk(p, files); } catch { /* module has no such dir */ } }
-    // tools/ IS scanned, deliberately and unlike the long-double lint. The parity SURFACE lives there:
-    // felitronics-mastering-core's tools/fcore_probe.h computes the dBTP that CI diffs, with its own floor
-    // and, once, its own log10. A modules-only audit would have declared that path clean while the printed
-    // number was unpinned.
-    for (const p of [join(root, 'tools')]) { try { if (statSync(p).isDirectory()) walk(p, files); } catch {} }
-    return files.map (f => relOf(root, f)).filter (f => ! /\/(tests|bench)\//.test (f)).sort();
+    for (const d of scannedDirsOf(root)) walk(d, files);
+    return files.map (f => relOf(root, f)).filter (f => ! isTestPath (f)).sort();
 }
 
 function includeRootsOf (root)
@@ -300,21 +347,82 @@ function includeRootsOf (root)
     return roots;
 }
 
+//==============================================================================
+// THE INCLUDE ROOTS of a third library — see A THIRD LIBRARY above. `specs` are the --include-root arguments,
+// `base` the satellite's root that a relative one is taken against, and `scanned` every directory the two trees
+// already read their own files from. Returns the roots, real paths, and one error per refused argument; the caller
+// stops on any error, before a file is read.
+const within = (p, dir) => p === dir || p.startsWith(dir + sep);
+
+export function resolveIncludeRoots (specs, base, scanned)
+{
+    const dirs = [], errors = [];
+    for (const spec of specs)
+    {
+        if (! spec || spec.startsWith('--'))
+        { errors.push(`${INCLUDE_ROOT_FLAG} needs a directory after it${spec ? `, and "${spec}" is the next option` : ''}`); continue; }
+        let real;
+        try { real = realpathSync(resolve(base, spec)); }
+        catch { errors.push(`${INCLUDE_ROOT_FLAG} ${spec}: ${resolve(base, spec)} does not exist. A root that is not there is refused, not taken as empty: a scan of nothing reads as a scan.`); continue; }
+        if (! statSync(real).isDirectory())
+        { errors.push(`${INCLUDE_ROOT_FLAG} ${spec}: ${real} is not a directory — the root is the directory the library's <felitronics/...> spellings are relative to`); continue; }
+        if (dirs.includes(real))
+        { errors.push(`${INCLUDE_ROOT_FLAG} ${spec} is given twice`); continue; }
+        const own = scanned.find (d => within(real, d) || within(d, real));
+        if (own)
+        { errors.push(`${INCLUDE_ROOT_FLAG} ${spec} overlaps ${own}, which this lint already reads as a repository's own files: one file would be audited twice, under two names. An include root is for a library outside both repositories' modules and tools.`); continue; }
+        const other = dirs.find (d => within(real, d) || within(d, real));
+        if (other)
+        { errors.push(`${INCLUDE_ROOT_FLAG} ${spec} overlaps another include root, ${other}: one file would be audited twice, under two names`); continue; }
+        dirs.push(real);
+    }
+    return { dirs, errors };
+}
+
+// The NAME of a file in a tree's lists: its path under the tree's root, or — under an include root — its include
+// spelling in angle brackets, which is the same on every machine (see A THIRD LIBRARY). Every name given out is
+// recorded, and one spelling that turns out to mean two files is refused: the lists could not say which one they meant,
+// and the file list would keep only one of them.
+function nameIn (t, abs, violations)
+{
+    const r = t.extraRoots.find (d => abs.startsWith(d + sep));
+    if (! r) return relOf(t.root, abs);
+    const name = `<${relOf(r, abs)}>`;
+    const had = t.extraFiles.get(name);
+    if (! had) t.extraFiles.set(name, { abs, root: r });
+    else if (had.abs !== abs && ! had.clash)
+    {
+        had.clash = true;
+        violations.push({ f: name, line: 0, rule: 'CLOSURE',
+                          msg: `two include roots hold a file of this spelling: ${had.abs} and ${abs}. The lists name a file under an include root by its spelling, so one spelling must be one file — otherwise this lint may audit a different file from the one the compiler takes.` });
+    }
+    return name;
+}
+
+// ...and back: where a name's file is. A bracketed name no include root of this run holds maps to no file at all.
+function absOf (t, name) { const x = t.extraFiles.get(name); return x ? x.abs : join(t.root, name); }
+
+// Why a name that should be there is not: a bracketed one usually means the run was not given its root.
+const missingWhy = (f) => /^<.*>$/.test(f)
+    ? ` It is named by its include spelling, and no ${INCLUDE_ROOT_FLAG} of this run holds it — pass the library's include directory, or remove the entry.`
+    : '';
+
 // Rule 4's net: everything the parity entry points can #include, across every tree on the include path (the
-// running repository's first, then core's). Returns Map<tree, Set<path in that tree>>. An include of
+// running repository's first, then core's). Returns Map<tree, Set<name in that tree>>. An include of
 // felitronics/... that resolves in NO tree, or in TWO, is a violation rather than a silent gap: a header
 // this lint cannot find is one it cannot audit, and one that two repositories both provide is one where it
-// may be auditing a different file from the one the compiler takes.
+// may be auditing a different file from the one the compiler takes. An --include-root counts as an owner of
+// its own for that: a header it provides and a repository's modules provide too is the same hazard.
 function computeClosure (trees, violations, display)
 {
     const reached = new Map(trees.map (t => [t, new Set()]));
     const queue = [];
     const add = (t, rel) => { if (! reached.get(t).has(rel)) { reached.get(t).add(rel); queue.push([t, rel]); } };
-    for (const t of trees) for (const e of t.entryPoints) if (existsSync(join(t.root, e))) add(t, e);
+    for (const t of trees) for (const e of t.entryPoints) if (existsSync(absOf(t, e))) add(t, e);
     while (queue.length)
     {
         const [t, rel] = queue.shift();
-        const abs = join(t.root, rel);
+        const abs = absOf(t, rel);
         let text; try { text = readFileSync(abs, 'utf8'); } catch { continue; }
         // Comments only. stripNonCode() also blanks STRING literals, and `#include "fcore_probe.h"` IS a
         // string literal — so every quoted include vanished before this regex saw it, and the closure
@@ -328,15 +436,20 @@ function computeClosure (trees, violations, display)
             {
                 const hits = [];
                 for (const tt of trees)
+                {
                     for (const r of tt.includeRoots)
                     { const p = join(r, inc); if (existsSync(p)) { hits.push([tt, relOf(tt.root, p)]); break; } }
+                    for (const r of tt.extraRoots)
+                    { const p = join(r, inc); if (existsSync(p)) { hits.push([tt, nameIn(tt, p, violations)]); tt.extraUsed.add(r); } }
+                }
                 const line = lineAt(code, m.index);
                 if (hits.length === 0)
                     violations.push({ f: display(t, rel), line, rule: 'CLOSURE',
-                                      msg: `#include <${inc}> resolves in no include root this lint knows. A header it cannot find is a header it cannot audit.` });
+                                      msg: `#include <${inc}> resolves in no include root this lint knows. A header it cannot find is a header it cannot audit.`
+                                           + (trees.length > 1 ? ` If it is a third library's, pass that library's include directory with ${INCLUDE_ROOT_FLAG}.` : '') });
                 else if (hits.length > 1)
                     violations.push({ f: display(t, rel), line, rule: 'CLOSURE',
-                                      msg: `#include <${inc}> resolves in two repositories: ${hits.map (([tt, r]) => display(tt, r)).join(' and ')}. One header, one owner — otherwise this lint may audit a different file from the one the compiler takes.` });
+                                      msg: `#include <${inc}> resolves in two places: ${hits.map (([tt, r]) => display(tt, r)).join(' and ')}. One header, one owner — otherwise this lint may audit a different file from the one the compiler takes.` });
                 if (hits.length) add(hits[0][0], hits[0][1]);
             }
             else
@@ -345,7 +458,7 @@ function computeClosure (trees, violations, display)
                 // includes "fcore_probe.h", which lives in tools/ and arrives through -I, not as a sibling.
                 const sib = join(dirname(abs), inc), viaTools = join(t.root, 'tools', inc);
                 const p = existsSync(sib) ? sib : (existsSync(viaTools) ? viaTools : null);
-                if (p) add(t, relOf(t.root, p));
+                if (p) add(t, nameIn(t, p, violations));
             }
         }
     }
@@ -473,6 +586,96 @@ function multisetOf (hits)
 }
 
 //==============================================================================
+// The include-root cases of the self-test: [what, passed, what came back]. Each case gets a fixture of its own, so
+// no case can see another's plant: `files` adds to or replaces the base set, `roots` are --include-root arguments
+// ($FIX is the fixture's directory, the satellite being $FIX/sat), `zone` the satellite's zone entries.
+function includeRootCases ()
+{
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'det-math-roots-')));
+    const LIB = '<felitronics/lib/Lib.h>';
+    const base = {
+        'sat/modules/app/src/App.cpp':          '#include <felitronics/lib/Lib.h>\nint app () { return lib (); }\n',
+        'sat/tools/lint/det-math-manifest.txt': '# the fixture manifest\n',
+        'lib/include/felitronics/lib/Lib.h':    '#pragma once\ninline int lib () { return 1; }\n',
+    };
+    const COS = '#pragma once\ninline double lib () { return std::cos (0.5); }\n';
+    let n = 0;
+    const lint = ({ files = {}, roots = [], zone = [] } = {}) =>
+    {
+        const dir = join(tmp, String(n++));
+        for (const [rel, text] of Object.entries({ ...base, ...files }))
+            if (text !== null) { mkdirSync(dirname(join(dir, rel)), { recursive: true }); writeFileSync(join(dir, rel), text); }
+        const sat = join(dir, 'sat');
+        const r = resolveIncludeRoots(roots.map (s => s.replace('$FIX', dir)), sat, scannedDirsOf(sat));
+        if (r.errors.length) return { errors: r.errors, violations: [] };
+        const t = satelliteTree(sat, { entryPoints: [{ path: 'modules/app/src/App.cpp' }], zone: zone.map (path => ({ path })), exceptions: [] }, r.dirs);
+        const violations = [];
+        runPasses([t], (tt, rel) => rel, violations);
+        return { errors: [], violations: violations.map (v => ({ f: v.f, rule: v.rule, msg: v.msg })) };
+    };
+    // Exactly the violations named — each [rule, file, words of its message] — and nothing else.
+    const only = (res, ...want) => res.errors.length === 0 && res.violations.length === want.length
+        && want.every (([rule, f, text]) => res.violations.some (v => v.rule === rule && v.f === f && v.msg.includes(text)));
+    const refused = (res, text) => res.errors.length === 1 && res.errors[0].includes(text);
+    const cases = [];
+    const check = (what, res, ok) => cases.push([what, ok(res), res]);
+    try
+    {
+        check('no root: the library header is unresolved — the fixture is wired to fail without one',
+              lint(), r => only(r, ['CLOSURE', 'modules/app/src/App.cpp', 'resolves in no include root']));
+        check('a root relative to the satellite resolves it, and the tree is clean',
+              lint({ roots: ['../lib/include'] }), r => only(r));
+        check('an absolute root does the same',
+              lint({ roots: ['$FIX/lib/include'] }), r => only(r));
+        check('a root that does not exist is an error, not an empty root',
+              lint({ roots: ['../nowhere/include'] }), r => refused(r, 'does not exist'));
+        check('a root that is a file is an error',
+              lint({ roots: ['../lib/include/felitronics/lib/Lib.h'] }), r => refused(r, 'is not a directory'));
+        check('a flag with no directory after it is an error',
+              lint({ roots: [''] }), r => refused(r, 'needs a directory'));
+        check('a root given twice is an error',
+              lint({ roots: ['../lib/include', '$FIX/lib/include'] }), r => refused(r, 'given twice'));
+        check('a root inside a directory the satellite scans as its own is an error',
+              lint({ roots: ['modules/app/src'] }), r => refused(r, 'overlaps'));
+        check('a root that contains one is an error too',
+              lint({ roots: ['.'] }), r => refused(r, 'overlaps'));
+        check('a libm call in a header under the root, reached and unlisted, is rule 4 red — the root exempts nothing',
+              lint({ roots: ['../lib/include'], files: { 'lib/include/felitronics/lib/Lib.h': COS } }),
+              r => only(r, ['CLOSURE', LIB, 'has no manifest entry']));
+        check('...and a manifest line naming it by its include spelling classifies it',
+              lint({ roots: ['../lib/include'], files: { 'lib/include/felitronics/lib/Lib.h': COS,
+                     'sat/tools/lint/det-math-manifest.txt': `${LIB}  [cos*1]  retain-offline  the fixture's call\n` } }), r => only(r));
+        check('a header under the root in the zone is held to the ban',
+              lint({ roots: ['../lib/include'], zone: [LIB], files: { 'lib/include/felitronics/lib/Lib.h': COS } }),
+              r => only(r, ['ZONE', LIB, 'in the deterministic zone']));
+        check('a zone entry for a header under a root the run was not given is rot, and says which flag is missing',
+              lint({ zone: [LIB] }), r => only(r, ['CLOSURE', 'modules/app/src/App.cpp', 'resolves in no include root'],
+                                               ['ZONE-ROT', LIB, `no ${INCLUDE_ROOT_FLAG} of this run holds it`]));
+        check('a file under the root that nothing includes is scanned all the same, as a module header would be',
+              lint({ roots: ['../lib/include'], files: { 'lib/include/felitronics/lib/Unused.h': '#pragma once\ninline double u (double x) { return std::log10 (x); }\n' } }),
+              r => only(r, ['MANIFEST', '<felitronics/lib/Unused.h>', 'not reachable from any parity entry point']));
+        check('a file under the root\'s tests/ is left out, as the satellite\'s own tests/ are',
+              lint({ roots: ['../lib/include'], files: { 'lib/include/felitronics/lib/tests/T.h': '#pragma once\ninline double u (double x) { return std::log10 (x); }\n' } }),
+              r => only(r));
+        check('a quoted include from a header under the root is followed, whatever the included file is called',
+              lint({ roots: ['../lib/include'], files: { 'lib/include/felitronics/lib/Lib.h': '#pragma once\n#include "tables.inc"\ninline int lib () { return 1; }\n',
+                                                         'lib/include/felitronics/lib/tables.inc': 'static const double k = std::cos (0.5);\n' } }),
+              r => only(r, ['CLOSURE', '<felitronics/lib/tables.inc>', 'has no manifest entry']));
+        check('a root nothing resolves through is ROOT-ROT',
+              lint({ roots: ['../lib/include', '../other/include'], files: { 'other/include/felitronics/other/O.h': '#pragma once\n' } }),
+              r => r.errors.length === 0 && r.violations.length === 1 && r.violations[0].rule === 'ROOT-ROT' && r.violations[0].f.endsWith(`other${sep}include`));
+        check('a header both the root and the satellite\'s modules provide is refused',
+              lint({ roots: ['../lib/include'], files: { 'sat/modules/app/include/felitronics/lib/Lib.h': '#pragma once\ninline int lib () { return 2; }\n' } }),
+              r => only(r, ['CLOSURE', 'modules/app/src/App.cpp', 'resolves in two places']));
+        check('two roots holding one spelling are refused, even where nothing includes it',
+              lint({ roots: ['../lib/include', '../lib2/include'], files: { 'lib/include/felitronics/lib/X.h': '#pragma once\n',
+                     'lib2/include/felitronics/lib/X.h': '#pragma once\n', 'lib2/include/felitronics/lib2/Y.h': '#pragma once\n' } }),
+              r => r.violations.some (v => v.rule === 'CLOSURE' && v.f === '<felitronics/lib/X.h>' && v.msg.includes('two include roots hold')));
+    }
+    finally { rmSync(tmp, { recursive: true, force: true }); }
+    return cases;
+}
+
 function selfTest ()
 {
     const cases = [
@@ -562,7 +765,14 @@ function selfTest ()
         for (const [k, n] of Object.entries(want))
             if (got[k].length !== n) { console.error(`  SELF-TEST FAIL (zone file): wanted ${n} ${k}, got ${got[k].length} for: ${JSON.stringify(src)}`); bad++; }
     }
-    const total = cases.length + carrierCases.length + markerCases.length + zoneCases.length;
+    // THE INCLUDE ROOTS. Resolution is a property of a filesystem, so these run on one: a satellite built for the
+    // purpose in a temporary directory, whose entry point includes <felitronics/lib/Lib.h>, and that library's
+    // include directory beside it — through the same passes the gate runs. A case that only parsed arguments would
+    // prove the parser.
+    const rootCases = includeRootCases();
+    for (const [what, ok, got] of rootCases)
+        if (! ok) { console.error(`  SELF-TEST FAIL (include root): ${what}\n    got: ${JSON.stringify(got)}`); bad++; }
+    const total = cases.length + carrierCases.length + markerCases.length + zoneCases.length + rootCases.length;
     if (bad) { console.error(`det-math lint self-test: ${bad} of ${total} cases wrong`); process.exit(1); }
     console.log(`det-math lint self-test: ${total}/${total} cases correct`);
 }
@@ -578,7 +788,10 @@ function lintTree (t, closure, carriers, entryPointsShown, display, violations)
     // the usual source extensions, and a `#include "tables.inc"` from a zone file was read by the closure and
     // audited by nobody: a system call planted in it passed on both sides while the same call one level up
     // failed. The closure is the net, so what it catches is inventoried.
-    const files = [...new Set(sourceFiles(t.root).concat([...closure].filter (f => ! /\/(tests|bench)\//.test (f))))].sort();
+    // The files under an include root are this tree's too, walked whole as its own directories are (see A THIRD
+    // LIBRARY); their names were given out, and recorded, before the closure ran.
+    const extra = [...t.extraFiles.keys()].filter (f => ! isTestPath ('/' + f.slice(1, -1)));
+    const files = [...new Set(sourceFiles(t.root).concat(extra, [...closure].filter (f => ! isTestPath (f))))].sort();
     const scanned = new Set(files);
     const carrierNames = carriers.map(c => c.name);
     const inventory = [];
@@ -590,17 +803,24 @@ function lintTree (t, closure, carriers, entryPointsShown, display, violations)
     // repository is exactly the change that would have left twelve such entries behind, green.
     for (const f of t.zone)
         if (! scanned.has(f))
-            V(f, 0, 'ZONE-ROT', `the deterministic zone names a file this lint does not scan (moved, renamed, or under tests/). A zone entry that covers nothing reads as coverage — fix the path or remove the entry.`);
+            V(f, 0, 'ZONE-ROT', `the deterministic zone names a file this lint does not scan (moved, renamed, or under tests/). A zone entry that covers nothing reads as coverage — fix the path or remove the entry.${missingWhy(f)}`);
     for (const f of t.entryPoints)
-        if (! existsSync(join(t.root, f)))
-            V(f, 0, 'ZONE-ROT', `a parity entry point that does not exist: its #include closure is empty, and rule 4 with it.`);
+        if (! existsSync(absOf(t, f)))
+            V(f, 0, 'ZONE-ROT', `a parity entry point that does not exist: its #include closure is empty, and rule 4 with it.${missingWhy(f)}`);
     for (const f of t.implementation)
         if (! scanned.has(f))
             V(f, 0, 'ZONE-ROT', `IMPLEMENTATION names a file this lint does not scan — the exemption now covers nothing.`);
+    // AND AN INCLUDE ROOT MUST RESOLVE SOMETHING. One that no #include of the parity closure resolves through is a
+    // flag that outlived the dependency it declared — or one pointed a level off (the library's checkout instead
+    // of its include directory), whose headers then fail to resolve while its files are inventoried under
+    // spellings nothing includes.
+    for (const r of t.extraRoots)
+        if (! t.extraUsed.has(r))
+            V(`${INCLUDE_ROOT_FLAG} ${r}`, 0, 'ROOT-ROT', `no #include reached from a parity entry point resolves through this root. Remove the flag if the dependency is gone; if it is not, the root is probably the checkout rather than its include directory.`);
 
     for (const f of files)
     {
-        const text = readFileSync(join(t.root, f), 'utf8');
+        const text = readFileSync(absOf(t, f), 'utf8');
         const markerLines = stripStringsKeepComments(text).split('\n');   // comments kept, strings blanked
         const hits = scanText(text);
         const carrierHits = t.implementation.has(f) ? [] : scanCarriers(text, carrierNames);
@@ -711,12 +931,43 @@ function lintTree (t, closure, carriers, entryPointsShown, display, violations)
         {
             if (f.startsWith('__PARSE_ERROR__')) continue;
             if (! perFile.has(f) || t.zone.has(f))
-                V(f, 0, 'MANIFEST', ! existsSync(join(t.root, f)) ? 'manifest names a file that no longer exists — remove the line'
+                V(f, 0, 'MANIFEST', ! existsSync(absOf(t, f))  ? 'manifest names a file that no longer exists — remove the line' + missingWhy(f)
                                   : t.zone.has(f)                   ? 'this file is now inside the deterministic zone, where the ban applies and a manifest entry means nothing — remove the line and convert the calls'
                                                                     : 'manifest entry for a file with no libm calls left — remove the line (a stale allowance is how a list stops meaning anything)');
         }
     }
     return { t, inventory, perFile, entries: entries || new Map() };
+}
+
+// A satellite's tree: its root, the lists its zone file gave, and the include roots its run was given.
+function satelliteTree (root, lists, extraRoots)
+{
+    return { name: 'this repository', root, zone: new Set(lists.zone.map(z => z.path)), entryPoints: lists.entryPoints.map(e => e.path),
+             exceptions: lists.exceptions, carriers: [], implementation: new Set(), includeRoots: includeRootsOf(root),
+             extraRoots, extraFiles: new Map(), extraUsed: new Set() };
+}
+
+// EVERY PASS, for the gate and for the self-test alike, so the cases below run the code the gate runs. The include
+// roots are walked first: every file under one has its name before the closure or a list asks for it.
+function runPasses (trees, display, violations)
+{
+    for (const t of trees) for (const r of t.extraRoots) for (const f of walk(r, [])) nameIn(t, f, violations);
+    const entryPointsShown = trees.flatMap (t => t.entryPoints.map (e => display(t, e)));
+    const reached = computeClosure(trees, violations, display);          // rule 4's net — NOT the ban set; see the note at the top
+    const results = trees.slice().reverse().map (t =>                     // core's pass first, then the satellite's
+        lintTree(t, reached.get(t), CARRIERS, entryPointsShown, display, violations));
+    return { reached, results, entryPointsShown };
+}
+
+// --include-root <dir>, repeatable, or --include-root=<dir>. A flag with nothing after it is kept as '' — or as the
+// option that follows it — so that resolveIncludeRoots refuses it by name, instead of the run going on without it.
+function includeRootSpecs (args)
+{
+    const specs = [];
+    for (let i = 0; i < args.length; i++)
+        if (args[i] === INCLUDE_ROOT_FLAG) specs.push(args[++i] ?? '');
+        else if (args[i].startsWith(INCLUDE_ROOT_FLAG + '=')) specs.push(args[i].slice(INCLUDE_ROOT_FLAG.length + 1));
+    return specs;
 }
 
 //==============================================================================
@@ -736,27 +987,28 @@ if (SATELLITE && CWD === CORE_ROOT)
 { console.error(`check-det-math: --satellite is for ANOTHER repository's root; this is felitronics-core's own (${CORE_ROOT}). Run it without --satellite.`); process.exit(2); }
 if (! SATELLITE && CWD !== CORE_ROOT)
 { console.error(`check-det-math: run from felitronics-core's root (${CORE_ROOT}), or pass --satellite to lint the repository in ${CWD} against this core.`); process.exit(2); }
+const ROOT_SPECS = includeRootSpecs(args);
+if (ROOT_SPECS.length && ! SATELLITE)
+{ console.error(`check-det-math: ${INCLUDE_ROOT_FLAG} names a third library a SATELLITE builds against; core's own tree has no parity entry point and resolves nothing outside itself. Pass it with --satellite, from that repository's root.`); process.exit(2); }
 
 const violations = [];
 const core = { name: 'felitronics-core', root: CORE_ROOT, zone: ZONE, entryPoints: ENTRY_POINTS, exceptions: ZONE_EXCEPTIONS,
-               carriers: CARRIERS, implementation: IMPLEMENTATION, includeRoots: includeRootsOf(CORE_ROOT) };
+               carriers: CARRIERS, implementation: IMPLEMENTATION, includeRoots: includeRootsOf(CORE_ROOT),
+               extraRoots: [], extraFiles: new Map(), extraUsed: new Set() };
 let local = core;
 if (SATELLITE)
 {
+    // The include roots are settled before anything is read, and a refused one stops the run: see A THIRD LIBRARY.
+    const roots = resolveIncludeRoots(ROOT_SPECS, CWD, scannedDirsOf(CWD).concat(scannedDirsOf(CORE_ROOT)));
+    if (roots.errors.length) { for (const e of roots.errors) console.error(`check-det-math: ${e}`); process.exit(2); }
     const zonePath = join(CWD, ZONE_FILE);
     const lists = existsSync(zonePath) ? parseZoneFile(readFileSync(zonePath, 'utf8')) : { entryPoints: [], zone: [], exceptions: [], errors: [] };
     for (const e of lists.errors) violations.push({ f: ZONE_FILE, line: e.line, rule: 'LISTS', msg: e.msg });
-    local = { name: 'this repository', root: CWD, zone: new Set(lists.zone.map(z => z.path)), entryPoints: lists.entryPoints.map(e => e.path),
-              exceptions: lists.exceptions, carriers: [], implementation: new Set(), includeRoots: includeRootsOf(CWD),
-              zoneFile: existsSync(zonePath) };
+    local = { ...satelliteTree(CWD, lists, roots.dirs), zoneFile: existsSync(zonePath) };
 }
 const trees = SATELLITE ? [local, core] : [core];
 const display = (t, rel) => t.root === CWD ? rel : relOf(CWD, join(t.root, rel));
-const entryPointsShown = trees.flatMap (t => t.entryPoints.map (e => display(t, e)));
-
-const reached = computeClosure(trees, violations, display);          // rule 4's net — NOT the ban set; see the note at the top
-const results = trees.slice().reverse().map (t =>                     // core's pass first, then the satellite's
-    lintTree(t, reached.get(t), CARRIERS, entryPointsShown, display, violations));
+const { reached, results, entryPointsShown } = runPasses(trees, display, violations);
 
 //==============================================================================
 if (args.includes('--report'))
@@ -798,5 +1050,6 @@ if (! SATELLITE)
 else
     for (const r of results)
         console.log(`det-math [${r.t.name}${r.t === core ? ' at ' + (relOf(CWD, CORE_ROOT) || '.') : ''}]: ${summary(r)} is clean (direct + carriers); manifest matches.`
-                    + (r.t === local ? ` Lists: ${local.zoneFile ? ZONE_FILE : 'none (no ' + ZONE_FILE + ')'}; ${local.entryPoints.length} parity entry point(s), closure ${[...reached.values()].reduce((n, s) => n + s.size, 0)} files, ${reached.get(core).size} of them in felitronics-core.` : ''));
+                    + (r.t === local ? ` Lists: ${local.zoneFile ? ZONE_FILE : 'none (no ' + ZONE_FILE + ')'}; ${local.entryPoints.length} parity entry point(s), closure ${[...reached.values()].reduce((n, s) => n + s.size, 0)} files, ${reached.get(core).size} of them in felitronics-core`
+                                       + (local.extraRoots.length ? `, ${[...reached.get(local)].filter (f => local.extraFiles.has(f)).length} under ${local.extraRoots.length} ${INCLUDE_ROOT_FLAG} (${local.extraRoots.map (d => relOf(CWD, d)).join(', ')})` : '') + '.' : ''));
 }
