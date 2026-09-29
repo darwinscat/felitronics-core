@@ -23,6 +23,7 @@
 #include <felitronics/limiter/TruePeakLimiter.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -216,6 +217,73 @@ int main()
             lim.reset();
             ok (lim.clipOsSamples() == 0 && lim.clipRunCount() == 0 && lim.clipOccupancy() < 0.0,
                 "reset clears what it counted");
+        }
+    }
+
+    test::group ("the K13 tap: the reduction of every oversampled sample, and it changes nothing");
+    {
+        // Two limiters on the same clipped tone, one tapped. The tap is a window onto the clipper, not a stage:
+        // the PCM and every aggregate must agree bit for bit, the trace must hold exactly the samples the
+        // clipper counted and never a negative, and its deepest value IS the published maximum.
+        const auto in = tone (100.0, -0.1, 0.25);
+        const int n = (int) in[0].size();
+        TruePeakLimiterParams p; p.peakClip = true; p.overCeilingDb = 0.0; p.ceilingDbTp = -6.0;
+        TruePeakLimiter plain, tapped;
+        if (test::run (plain.prepare (kFs, n, 2, {})) && test::run (tapped.prepare (kFs, n, 2, {})))
+        {
+            plain.setParams (p);
+            tapped.setParams (p);
+            const std::size_t os = (std::size_t) n * (std::size_t) tapped.oversampleFactor();
+            std::vector<std::vector<float>> a = in, b = in;
+            std::vector<float*> pa { a[0].data(), a[1].data() }, pb { b[0].data(), b[1].data() };
+            std::vector<float> gr (os), pk (os), red (os, -1.0f);
+
+            felitronics::limiter::TruePeakLimiterTap shortTap { nullptr, nullptr, (int) os - 1 };
+            shortTap.peakClipReductionDb = red.data();
+            ok (! tapped.process (pb.data(), 2, n, shortTap) && b == in && red[0] == -1.0f,
+                "a short capacity refuses the call with the clip trace alone, before anything moves");
+
+            felitronics::limiter::TruePeakLimiterTap tap { gr.data(), pk.data(), (int) os };
+            tap.peakClipReductionDb = red.data();
+            const bool ranPlain  = plain.process (pa.data(), 2, n);
+            const bool ranTapped = tapped.process (pb.data(), 2, n, tap);
+            ok (ranPlain && ranTapped && a == b, "the tapped output is the untapped output, sample for sample");
+            ok (plain.clipReductionMaxDb() == tapped.clipReductionMaxDb()
+                    && plain.clipOsSamples() == tapped.clipOsSamples()
+                    && plain.clipRunCount() == tapped.clipRunCount()
+                    && plain.maxReconstructedPeakDb() == tapped.maxReconstructedPeakDb(),
+                "and so is every aggregate");
+
+            std::int64_t reduced = 0;
+            float deepest = 0.0f;
+            bool negative = false;
+            for (const float r : red)
+            {
+                if (r > 0.0f) ++reduced;
+                if (r > deepest) deepest = r;
+                if (r < 0.0f) negative = true;
+            }
+            ok (! negative, "every oversampled sample was written, and none below zero");
+            ok (reduced > 0 && reduced == tapped.clipOsSamples(),
+                "the trace holds exactly the samples the clipper counted (" + std::to_string (reduced) + " of "
+                    + std::to_string (tapped.clipOsSamples()) + ")");
+            ok ((double) deepest == tapped.clipReductionMaxDb(), "its deepest value is the published maximum");
+        }
+
+        TruePeakLimiterParams off = p; off.peakClip = false;
+        TruePeakLimiter idle;
+        if (test::run (idle.prepare (kFs, n, 2, {})))
+        {
+            idle.setParams (off);
+            const std::size_t os = (std::size_t) n * (std::size_t) idle.oversampleFactor();
+            std::vector<std::vector<float>> c = in;
+            std::vector<float*> pc { c[0].data(), c[1].data() };
+            std::vector<float> red (os, -1.0f);
+            felitronics::limiter::TruePeakLimiterTap tap { nullptr, nullptr, (int) os };
+            tap.peakClipReductionDb = red.data();
+            bool allZero = idle.process (pc.data(), 2, n, tap);
+            for (const float r : red) allZero = allZero && r == 0.0f;
+            ok (allZero, "with the clipper off the trace is written, and it is zero everywhere");
         }
     }
 
