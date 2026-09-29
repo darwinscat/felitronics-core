@@ -170,6 +170,7 @@ struct TruePeakLimiterTap
     float* gainReductionDb = nullptr;   // signed dB (<= 0), one per OVERSAMPLED sample
     float* linkedPeakLin   = nullptr;   // linear, one per oversampled sample, BEFORE the gain
     int    capacity        = 0;         // in OVERSAMPLED samples; < numSamples * F refuses the call
+    float* peakClipReductionDb = nullptr; // positive K13 reduction, on the same oversampled grid
 };
 
 //==============================================================================
@@ -677,8 +678,8 @@ public:
         return process (channels, numChannels, numSamples, TruePeakLimiterTap {});
     }
 
-    // The full form: the same call, with the oversampled gain-reduction and reconstructed-peak traces
-    // written out. `tap.gainReductionDb == nullptr && tap.linkedPeakLin == nullptr` is off and costs
+    // The full form: the same call, with the oversampled limiter, reconstructed-peak and K13 reduction traces
+    // written out. All three tap pointers null is off and costs
     // nothing; a non-null tap with `tap.capacity < numSamples * oversampleFactor()` REFUSES the whole
     // call, before anything moves. RT-safe.
     [[nodiscard]] bool process (float* const* channels, int numChannels, int numSamples,
@@ -691,7 +692,7 @@ public:
         // The multiplication is in `long long` on purpose: `numSamples * F` overflows a signed int at
         // 537 million samples per channel at 4x, which a whole-file offline call can reach, and the
         // overflow would make a SHORT buffer compare as large enough.
-        if ((tap.gainReductionDb != nullptr || tap.linkedPeakLin != nullptr)
+        if ((tap.gainReductionDb != nullptr || tap.linkedPeakLin != nullptr || tap.peakClipReductionDb != nullptr)
             && (long long) tap.capacity < (long long) numSamples * (long long) F) return false;
         if (numSamples == 0) return true;
         const int nc = numChannels;
@@ -726,6 +727,7 @@ public:
             const std::size_t osOff = (std::size_t) off * (std::size_t) F;
             if (tap.gainReductionDb != nullptr) sTap.gainReductionDb = tap.gainReductionDb + osOff;
             if (tap.linkedPeakLin   != nullptr) sTap.linkedPeakLin   = tap.linkedPeakLin   + osOff;
+            if (tap.peakClipReductionDb != nullptr) sTap.peakClipReductionDb = tap.peakClipReductionDb + osOff;
             processChunk (sub, nc, n, sTap);
             off += n;                                          // `off += maxBlock_` could step past INT_MAX
         }
@@ -788,6 +790,7 @@ private:
             // saw, which is what a mastering report means and what the delivered file no longer holds.
             if (linkedPeakLin_ < linkedPeak) linkedPeakLin_ = linkedPeak;
             if (tap.linkedPeakLin != nullptr) tap.linkedPeakLin[(std::size_t) i] = linkedPeak;
+            if (tap.peakClipReductionDb != nullptr) tap.peakClipReductionDb[(std::size_t) i] = 0.0f;
 
             // ==========================================================================================
             // K13 — THE CLIP, AND IT SITS EXACTLY HERE FOR A REASON.
@@ -833,6 +836,7 @@ private:
                     const double peakDb = core::gainToDbDet ((double) linkedPeak);
                     const float  red    = (float) (q >= clipT_ ? peakDb - clipNowDb_
                                                                : peakDb - core::gainToDbDet ((double) q));
+                    if (tap.peakClipReductionDb != nullptr) tap.peakClipReductionDb[(std::size_t) i] = red;
                     if (red > clipMaxRedDb_) clipMaxRedDb_ = red;
                     int b = (int) (red / (float) kClipRedBinDb);
                     if (b < 0) b = 0;
