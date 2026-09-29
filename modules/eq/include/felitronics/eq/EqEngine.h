@@ -41,7 +41,7 @@ public:
     // a zero or non-finite one does not degrade the EQ, it poisons it — measured, prepare(NaN, 64, 2)
     // then a 0.25 input gives 63 non-finite samples out of 64. This was the second half of P6 F12:
     // Saturator's identical hole was closed then and this one was not, so only the mastering chain, which
-    // validates at its own входе, was protected — a direct consumer of `eq` got NaN in silence.
+    // validates at its own entry, was protected — a direct consumer of `eq` got NaN in silence.
     // [[nodiscard]] and a refusal, matching TruePeakLimiter (P12) and Compressor (P2), rather than the
     // silent substitution some void prepare()s in this repo do: a caller that believes it prepared and
     // processes at the wrong rate is the failure those two exist to prevent. Spelled positively so NaN fails.

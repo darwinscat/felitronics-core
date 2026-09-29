@@ -5,7 +5,7 @@
 //
 // The first is the second half of P6 F12: `Saturator::prepare` was closed then with "spelled positively
 // so NaN fails", and the EQ, which validated NOTHING, was left. Only the mastering chain was protected,
-// because it validates at its own входе; a direct consumer of `eq` got NaN in silence. Measured on the
+// because it validates at its own entry; a direct consumer of `eq` got NaN in silence. Measured on the
 // old code: prepare(0) and prepare(NaN) each put 63 of 64 output samples non-finite on a 0.25 input,
 // and prepare(1.0) does the same to a HighPass or a Notch.
 //

@@ -1,6 +1,6 @@
 // Cross-language NULL dumper for felitronics::measurement. Dumps C++ results as raw
 // little-endian f64 for an INDEPENDENT numpy recompute to null against. NOT part of ctest
-// (keeps core Python-free) — a one-off dev verification per Oleh's "ноль-тестами со scipy/numpy".
+// (keeps core Python-free) — a one-off dev verification: null-test the C++ against scipy/numpy.
 #include <felitronics/measurement/Convolve.h>
 #include <felitronics/measurement/Sweep.h>
 #include <cstdio>
