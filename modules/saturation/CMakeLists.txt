@@ -56,4 +56,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_saturation_transformer_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_saturation_transformer_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_saturation_transformer_tests COMMAND felitronics_saturation_transformer_tests)
+
+    # Tape: Tanh's core between a pre-emphasis and its exact inverse — its double-precision reference NULL, the top
+    # saturating first, peaks against Tanh's, the bypass rate, and the two-float state's lifecycle.
+    add_executable(felitronics_saturation_tape_tests tests/SaturatorTapeTests.cpp)
+    target_link_libraries(felitronics_saturation_tape_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_tape_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_tape_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_tape_tests COMMAND felitronics_saturation_tape_tests)
 endif()

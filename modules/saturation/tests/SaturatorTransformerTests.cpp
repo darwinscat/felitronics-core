@@ -480,7 +480,7 @@ void lifecycle()
     // The model state's bytes: Storage says them, prepare() asks for exactly that, and they are
     // kModelFloats floats per channel on top of everything else.
     {
-        bool okAll = Sat::kModelFloats == 1;
+        bool okAll = Sat::kModelFloats == 2;   // slot 0 is the flux; the second is Tape's
         const int taps = oversampling::PolyphaseOversampler::kDefaultTapsPerPhase;
         struct G { double fs; int mb, ch, os; };
         for (const G& g : { G { 48000.0, 512, 2, 4 }, G { 44100.0, 256, 1, 1 }, G { 96000.0, 300, 6, 2 } })
@@ -498,7 +498,7 @@ void lifecycle()
                          g.fs, g.mb, g.ch, g.os, (unsigned long long) st.bytes(), got);
             okAll = okAll && row;
         }
-        ok (okAll, "Storage::bytes() == what prepare() allocated, and the model state is kModelFloats (1) floats per channel of it");
+        ok (okAll, "Storage::bytes() == what prepare() allocated, and the model state is kModelFloats (2) floats per channel of it");
     }
 }
 

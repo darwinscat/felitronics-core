@@ -52,10 +52,13 @@ static void testChannelGate()
 {
     group ("channel gate: a returning channel emits nothing from digital silence");
 
-    // Tanh, and the Transformer, whose flux L is a third recursion a returning channel must not replay.
-    for (auto shape : { saturation::WaveShaper::Shape::Tanh, saturation::WaveShaper::Shape::Transformer })
+    // Tanh, the Transformer, whose flux L is a third recursion a returning channel must not replay, and Tape, whose
+    // two emphasis states are a third and a fourth.
+    for (auto shape : { saturation::WaveShaper::Shape::Tanh, saturation::WaveShaper::Shape::Transformer,
+                        saturation::WaveShaper::Shape::Tape })
     {
-    const std::string tag = shape == saturation::WaveShaper::Shape::Tanh ? "" : " (Transformer)";
+    const std::string tag = shape == saturation::WaveShaper::Shape::Tanh ? ""
+                          : shape == saturation::WaveShaper::Shape::Tape ? " (Tape)" : " (Transformer)";
     const int N = 64;
     saturation::Saturator s;
     saturation::Saturator::Params p;

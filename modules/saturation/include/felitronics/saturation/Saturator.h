@@ -22,7 +22,7 @@ namespace felitronics::saturation
 
 //==============================================================================
 // felitronics::saturation::Saturator — the production soft-saturation stage (the mastering "glue/color"
-// before the make-loud gain). Wraps a stateless WaveShaper curve (for Transformer, a model around one — below)
+// before the make-loud gain). Wraps a stateless WaveShaper curve (for Transformer and Tape, a model around one — below)
 // in OVERSAMPLING (default 4×) so the new harmonics fold above the base Nyquist instead of aliasing back, runs
 // a DC blocker inside the oversampled region (the asymmetric curves' even harmonics shift the mean — Asym and
 // Tube), then returns to base rate and applies DRIVE-COMPENSATION + a linear dry/wet + output trim.
@@ -38,9 +38,25 @@ namespace felitronics::saturation
 // and autoComp), and the model's output peak never exceeds its input's: |y| <= max(|x|, |L|), and |L| never
 // exceeds the input's peak, for any 0 < a <= 1 (at os > 1 the oversampler's round trip can overshoot on its own,
 // as for every shape). It adds no latency, needs no DC blocker (the core is odd), and has no knob of its own:
-// drive, mix, output and autoComp only, `bias` unread. L is the stage's MODEL STATE (kModelFloats per channel),
-// gated, flushed and guarded exactly like the DC blocker's, so a channel that leaves and returns, or a switch
-// away from the shape and back, starts it from L = 0.
+// drive, mix, output and autoComp only, `bias` unread. L is the stage's MODEL STATE (slot 0 of kModelFloats per
+// channel), gated, flushed and guarded exactly like the DC blocker's, so a channel that leaves and returns, a switch
+// away from the shape and back, or a direct switch from Tape, starts it from L = 0.
+//
+// TAPE is the other model: Tanh's core between a pre-emphasis E and its exact inverse D. Per channel, per OVERSAMPLED
+// sample:
+//   e = E(x),  w = tanh(k·e)/tanh(k),  y = D(w)      E(s) = (1 + s/ω1) / (1 + s/ω2),  D = 1/E
+// with f1 = 1/(2π·50 µs) = 3183.1 Hz, the NAB 15 ips corner, and f2 = f1·10^(6/20) = 6351.1 Hz — a +6 dB high shelf.
+// The top reaches the core louder, so it saturates first, and D takes the shelf back off. At driveDb 6 (48 kHz, os 4,
+// autoComp 0) the fundamental is 0.5 dB compressed at -11.104 dBFS for a 10 kHz sine and at -6.429 for 1 kHz — 4.675 dB
+// apart, where the analog |E(10k)|/|E(1k)| is 4.645 dB — while Tanh's two sit together at -6.126; the 10 kHz point moves
+// 0.0285 dB across 44.1, 48 and 96 kHz. D·E = 1, so a quiet signal passes as Tanh passes it at the same drive (a -60 dBFS
+// multitone within 6.4e-10) and drive-compensation is Tanh's. Each section is the bilinear transform of one factor with
+// its corner prewarped on its own (both corners exact at every rate), in transposed direct form II with one float of
+// state, so Tape's model state is two floats per channel (slots 0 and 1), gated, flushed and guarded like the
+// Transformer's. The pair is BYPASSED where f2 >= 0.45·fsOs — os 1 below 14113.6 Hz — and Tape then renders Tanh's
+// bits. No knob of its own (`bias` unread), no head bump, no HF roll-off, no hysteresis, no DC blocker (the core is odd)
+// and no added latency. At os 1 the stage nulls against a double evaluation to 2.43e-7; on full-scale 1/5/10 kHz sines,
+// a 1 kHz square and band-limited clicks at driveDb 0/6/12 its peak is Tanh's or lower, to the printed 0.001 dB.
 //
 // Gain-staging (a reference tool reverted its saturator twice over this): the curve is peak-normalised
 // (|x|≤1 → |y|≤1; Transformer's is slope-normalised and keeps |y|≤|x|), `autoComp` undoes the small-signal-gain
@@ -85,11 +101,17 @@ public:
         float dcBlockHz = 10.0f;   // DC blocker corner (in the oversampled domain)
     };
 
-    // Floats of model state per channel — the Transformer's flux L. One vector of channels × this, zeroed by
-    // prepare() and reset() and gated per channel like the DC blocker's state.
-    static constexpr int kModelFloats = 1;
+    // Floats of model state per channel — the Transformer's flux L in slot 0; Tape's pre-emphasis state in slot 0 and
+    // its de-emphasis state in slot 1. One vector of channels × this, zeroed by prepare() and reset() and gated per
+    // channel like the DC blocker's state.
+    static constexpr int kModelFloats = 2;
     // The Transformer's flux corner: the leaky integrator's step is a = 1 − exp(−2π·this / fsOs).
     static constexpr double kTransformerHz = 40.0;
+    // Tape's emphasis: the NAB 15 ips corner f1 = 1/(2π·50 µs), a high shelf of this many dB above it (its upper corner
+    // f2 = f1·10^(dB/20)), and the pair is bypassed where f2 >= kTapeMaxCorner·fsOs.
+    static constexpr double kTapeCornerHz  = 1.0 / (2.0 * core::kPi * 50.0e-6);
+    static constexpr double kTapeShelfDb   = 6.0;
+    static constexpr double kTapeMaxCorner = 0.45;
 
     // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
     // budgeting memory reads the counts the seven buffers and the dry bank are actually built from. FALSE,
@@ -100,7 +122,8 @@ public:
         std::size_t osBuf = 0, wetBuf = 0;      // floats
         std::size_t ptrs  = 0;                  // float* in EACH of the two pointer tables
         std::size_t dc    = 0;                  // floats in EACH of the two DC-blocker state vectors
-        std::size_t model = 0;                  // floats of model state: kModelFloats per channel
+        std::size_t model = 0;                  // floats of model state: kModelFloats (2) per channel — the
+                                                // Transformer's flux, or Tape's two section states
         std::size_t dryLines = 0;               // core::DelayLine per channel
         int         dryDelaySamples = 0;        // the oversampler round trip each of them holds
         oversampling::Oversampler::Storage os {};            // empty when the factor is 1
@@ -535,13 +558,52 @@ private:
         m[0] = std::isfinite (L) ? L : 0.0f;
     }
 
+    // ONE OF TAPE'S TWO SECTIONS: a first-order y = (b0 + b1·z⁻¹) / (1 + a1·z⁻¹) in transposed direct form II, its
+    // one float of state `s` flushed per sample (law 8, as fluxStep) — on silence it is a pure (−a1)^n decay. Each
+    // product and sum in its own statement (law 10).
+    struct Section { float b0 = 1.0f, b1 = 0.0f, a1 = 0.0f; };
+
+    static float sectionStep (float x, float& s, const Section& q) noexcept
+    {
+        const float bx = q.b0 * x;
+        const float y  = bx + s;
+        const float px = q.b1 * x;
+        const float py = q.a1 * y;
+        const float n  = px - py;
+        s = (std::fabs (n) < 1e-30f) ? 0.0f : n;
+        return y;
+    }
+
+    // Tape over one os-rate run of a gliding period: the pre-emphasis, the core with shapeGlide<Tanh>'s interpolated
+    // k and raw peak (the same arithmetic, operand for operand), then the de-emphasis.
+    void tapeGlide (float* b, int osN, int r0, int c) noexcept
+    {
+        float* m = &model_[(std::size_t) c * (std::size_t) kModelFloats];
+        float se = m[0], sd = m[1];
+        for (int i = 0; i < osN; ++i)
+        {
+            const float r  = (float) (r0 + i);
+            const float ek = dK_ * r, er = dR_ * r;
+            WaveShaper::Coeffs k;
+            k.drive = cs_.sh.drive + ek; k.norm = 1.0f;
+            const float raw = rs_ + er;
+            const float e = sectionStep (b[i], se, tapeE_);
+            const float w = WaveShaper::shapeAt<WaveShaper::Shape::Tape> (k, e) / raw;
+            b[i] = sectionStep (w, sd, tapeD_);
+        }
+        m[0] = std::isfinite (se) ? se : 0.0f;
+        m[1] = std::isfinite (sd) ? sd : 0.0f;
+    }
+
     // Clear the sample memory of every cell that ran on the previous accepted call and does not run on this
     // one. A channel that leaves and RETURNS is the case: its oversampler FIR, its DC blocker and its dry
     // delay are frozen, not decayed, and it replays them into a stream that has moved on — measured 0.9337
     // out of DIGITAL SILENCE, 29 samples after a return. The DC blocker has a second gate of its own,
     // dcEnabled_, which the Asym→symmetric→Asym path opens and closes at a constant channel count and which
     // freezes x1/y1 exactly the same way; the model state has its own, modelOn_ (Transformer -> another shape ->
-    // Transformer), with its own ran-count for the same reason. Per channel, never wholesale: a channel that never left keeps its
+    // Transformer), with its own ran-count for the same reason — and the shape that ran it: a DIRECT switch between the
+    // two model shapes (Transformer <-> Tape) keeps modelOn_ true while the slots hold the other model's state, so every
+    // channel that ran the old model starts the new one from zero. Per channel, never wholesale: a channel that never left keeps its
     // history bit-exact, which is why the oversampler grew resetChannel(). A call that carries no samples
     // (or none this stage accepts) ran nothing, so it stops nothing and never reaches here.
     void dropStoppedCells (int nc) noexcept
@@ -558,9 +620,10 @@ private:
             dcY1_[(std::size_t) c] = 0.0f;
         }
         const int nowModel = modelOn_ ? nc : 0;
-        for (int c = nowModel; c < ranModelNc_; ++c)
+        const int keepModel = params_.shape == ranModelShape_ ? nowModel : 0;
+        for (int c = keepModel; c < ranModelNc_; ++c)
             for (int j = 0; j < kModelFloats; ++j) model_[(std::size_t) (c * kModelFloats + j)] = 0.0f;
-        ranNc_ = nc; ranDcNc_ = nowDc; ranModelNc_ = nowModel;
+        ranNc_ = nc; ranDcNc_ = nowDc; ranModelNc_ = nowModel; ranModelShape_ = params_.shape;
     }
 
     // One ≤ maxBlock slice; nc already clamped by process(). Everything stateful streams across calls.
@@ -635,6 +698,24 @@ private:
                 // the poison guard: a NaN in recursive state never decays out on its own.
                 dcX1_[(std::size_t) c] = std::isfinite (x1) ? x1 : 0.0f;
                 dcY1_[(std::size_t) c] = std::isfinite (y1) ? y1 : 0.0f;
+            }
+            else if (tapeOn_)
+            {
+                // Tape (see the class comment): the pre-emphasis, Tanh's core at the settled curve (shapeAt<Tape> is
+                // processSample() operand for operand), the de-emphasis. Both states flushed per sample and guarded
+                // per call like the Transformer's flux below. modelOn_ is true for Tape as well, so this branch must
+                // come BEFORE the Transformer's `modelOn_` one.
+                const WaveShaper::Coeffs k = shaper_.coeffs();
+                float* m = &model_[(std::size_t) c * (std::size_t) kModelFloats];
+                float se = m[0], sd = m[1];
+                for (int i = 0; i < osN; ++i)
+                {
+                    const float e = sectionStep (b[i], se, tapeE_);
+                    const float w = WaveShaper::shapeAt<WaveShaper::Shape::Tape> (k, e);
+                    b[i] = sectionStep (w, sd, tapeD_);
+                }
+                m[0] = std::isfinite (se) ? se : 0.0f;
+                m[1] = std::isfinite (sd) ? sd : 0.0f;
             }
             else if (modelOn_)
             {
@@ -712,6 +793,10 @@ private:
                 case WaveShaper::Shape::Tube:  shapeGlide<WaveShaper::Shape::Tube>  (b, osN, ph0 * os_, c); break;
                 case WaveShaper::Shape::Transistor: shapeGlide<WaveShaper::Shape::Transistor> (b, osN, ph0 * os_, c); break;
                 case WaveShaper::Shape::Transformer: transformerGlide (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Tape:                                    // bypassed: Tanh's curve, as settled
+                    if (tapeOn_) tapeGlide (b, osN, ph0 * os_, c);
+                    else         shapeGlide<WaveShaper::Shape::Tape> (b, osN, ph0 * os_, c);
+                    break;
             }
         }
         if (os_ > 1) ovs_.downsample (osPtrs_.data(), nc, n, wetPtrs_.data());
@@ -755,7 +840,20 @@ private:
         dcEnabled_ = (dcHz > 0.0f) && (params_.shape == WaveShaper::Shape::Asym
                                        || params_.shape == WaveShaper::Shape::Tube);   // the asymmetric curves
         modelA_  = (float) (1.0 - std::exp (-2.0 * core::kPi * kTransformerHz / fsOs));
-        modelOn_ = params_.shape == WaveShaper::Shape::Transformer;
+        // Tape's pair at fsOs by the bilinear transform, EACH corner prewarped on its own: a factor (1 + s/ωc) becomes
+        // (1 + 1/T) + (1 − 1/T)·z⁻¹ with T = tan(π·fc/fsOs) (the substitution's (1 + z⁻¹) cancels between the two
+        // factors), normalised to a0 = 1; the de-emphasis is the pre-emphasis with numerator and denominator swapped.
+        // In double, stored as float. Where f2 is not below 0.45·fsOs the pair is bypassed and Tape plays as Tanh.
+        const double f2 = kTapeCornerHz * std::pow (10.0, kTapeShelfDb / 20.0);
+        const bool tapeFits = f2 < kTapeMaxCorner * fsOs;
+        if (tapeFits)
+        {
+            const double i1 = 1.0 / std::tan (core::kPi * kTapeCornerHz / fsOs), i2 = 1.0 / std::tan (core::kPi * f2 / fsOs);
+            tapeE_ = { (float) ((1.0 + i1) / (1.0 + i2)), (float) ((1.0 - i1) / (1.0 + i2)), (float) ((1.0 - i2) / (1.0 + i2)) };
+            tapeD_ = { (float) ((1.0 + i2) / (1.0 + i1)), (float) ((1.0 - i2) / (1.0 + i1)), (float) ((1.0 - i1) / (1.0 + i1)) };
+        }
+        tapeOn_  = tapeFits && params_.shape == WaveShaper::Shape::Tape;
+        modelOn_ = params_.shape == WaveShaper::Shape::Transformer || tapeOn_;
     }
 
     Params      params_ {};
@@ -767,7 +865,9 @@ private:
     float  comp_ = 1.0f, dcR_ = 0.0f, mix_ = 1.0f, outGain_ = 1.0f;
     float  modelA_ = 0.0f;                                 // the Transformer's flux step a, at fsOs
     bool   dcEnabled_ = false;
-    bool   modelOn_   = false;                             // the shape runs the model state (Transformer)
+    bool   modelOn_   = false;                             // the shape runs the model state (Transformer, or Tape)
+    bool   tapeOn_    = false;                             // Tape with its emphasis pair (false where it is bypassed)
+    Section tapeE_ {}, tapeD_ {};                          // Tape's pre-emphasis and de-emphasis at fsOs
     bool   prepared_  = false;                             // true only after a fully-successful prepare()
 
     // The glide (see kGlideMs). `pv_` is the parameter vector at the last grid boundary, `pt_` the target, `pd_`
@@ -782,11 +882,12 @@ private:
     Consts cs_ {}, ce_ {};
     float  dK_ = 0.0f, dB_ = 0.0f, dBt_ = 0.0f, rs_ = 1.0f, dR_ = 0.0f, dC_ = 0.0f, dM_ = 0.0f, dO_ = 0.0f;
     int    ranNc_ = 0, ranDcNc_ = 0, ranModelNc_ = 0;      // what advanced state on the previous accepted call
+    WaveShaper::Shape ranModelShape_ = WaveShaper::Shape::Tanh;   // ... and the shape it ran (see dropStoppedCells)
 
     std::vector<float>  osBuf_, wetBuf_;
     std::vector<float*> osPtrs_, wetPtrs_;
     std::vector<float>  dcX1_, dcY1_;
-    std::vector<float>  model_;                // kModelFloats per channel — the Transformer's flux L
+    std::vector<float>  model_;                // kModelFloats per channel — the Transformer's flux L, or Tape's two states
     std::vector<core::DelayLine> dryDelay_;    // per channel, os round-trip — keeps the dry/wet mix comb-free
 };
 

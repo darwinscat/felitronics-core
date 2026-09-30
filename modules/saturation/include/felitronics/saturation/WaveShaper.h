@@ -19,7 +19,8 @@ namespace felitronics::saturation
 // Tanh (odd, smooth/dark — the safe default), Atan (odd, a touch brighter/harder
 // knee), Cubic (mostly 3rd, a cheap soft clipper), Asym (tube/triode — `bias` adds EVEN harmonics),
 // Tube (a fixed tube-like bias: mostly 2nd, no knob of its own), Transistor (odd, cleaner than Tanh below
-// the knee, harder past it), Transformer (odd; the curve below is only its static core — see the note):
+// the knee, harder past it), Transformer and Tape (odd; the curves below are only their static cores — see the
+// notes):
 //   Tanh        y = tanh(kx)/tanh(k)
 //   Atan        y = atan(kx)/atan(k)
 //   Cubic       y = h(kx)/h(k),  h(u)=1.5u-0.5u³ (|u|<1), sign(u) else
@@ -27,6 +28,7 @@ namespace felitronics::saturation
 //   Tube        r(u)=q·t/(1+c·t), t=tanh(u), u=kx, c=tanh(0.3), q=1-c²,  y = r(kx)/|r(-k)|
 //   Transistor  s(u)=u/(1+u⁴)^(1/4),  y = s(kx)/s(k)
 //   Transformer y = tanh(kx)/k                        (SLOPE-normalised, not peak-normalised)
+//   Tape        y = tanh(kx)/tanh(k)                  (Tanh's curve, operand for operand)
 // Pure function of the input (no per-sample state) → this is the kernel an oversampled Saturator wraps
 // (run it at N× so the new harmonics stay below the base Nyquist). Asym's bias makes y(0)=0 but NOT a
 // zero-mean output for music, so the Saturator follows it with a DC blocker; Tube gets the same blocker.
@@ -56,11 +58,16 @@ namespace felitronics::saturation
 // unity gain. |y| <= |x| still holds (in float to within an ulp), so |x| <= 1 still maps to |y| <= 1, but the
 // full-scale output is not 1:
 // y(1) = tanh(k)/k < 1. processSample() here is that static curve alone, without the flux.
+//
+// TAPE is the other model shape: the Saturator wraps its static core in a pre-emphasis / de-emphasis pair (see
+// Saturator.h) so the top saturates before the low end. The core IS Tanh's curve — processSample(), shapeAt<Tape>(),
+// the peak normaliser tanh(k) and slopeAtZero() = norm·k are Tanh's arithmetic operand for operand, so a standalone
+// WaveShaper set to Tape renders Tanh's bits. The emphasis lives in the Saturator, not here.
 class WaveShaper
 {
 public:
     // Append only: a consumer pins these integers in an ABI. Never renumber.
-    enum class Shape { Tanh, Atan, Cubic, Asym, Tube, Transistor, Transformer };
+    enum class Shape { Tanh, Atan, Cubic, Asym, Tube, Transistor, Transformer, Tape };
 
     // Tube's fixed bias c = tanh(0.3) and q = 1 - c², as the nearest floats (std::tanh is not constexpr).
     static constexpr float kTubeC = 0.2913126124515909f;
@@ -90,6 +97,7 @@ public:
         else if constexpr (S == Shape::Tube)  return tubeRaw (c.drive * x) * c.norm;
         else if constexpr (S == Shape::Transistor) return transistorRaw (c.drive * x) * c.norm;
         else if constexpr (S == Shape::Transformer) return std::tanh (c.drive * x) * c.norm;
+        else if constexpr (S == Shape::Tape)  return std::tanh (c.drive * x) * c.norm;       // Tanh's core
         else
         {
             // A new Shape gets its own branch above — a bare `else` would play it as the previous formula.
@@ -111,6 +119,7 @@ public:
             case Shape::Tube:  return norm_ * drive_ * kTubeQ;                         // raw'(0) = q
             case Shape::Transistor: return norm_ * drive_;                             // raw'(0) = 1
             case Shape::Transformer: return 1.0f;       // slope-normalised: exactly 1, not norm_ * drive_ rounded
+            case Shape::Tape:  return norm_ * drive_;                                  // Tanh's: raw'(0) = 1
         }
         return 1.0f;
     }
@@ -126,6 +135,7 @@ public:
             case Shape::Tube:  return tubeRaw (drive_ * x) * norm_;
             case Shape::Transistor: return transistorRaw (drive_ * x) * norm_;
             case Shape::Transformer: return std::tanh (drive_ * x) * norm_;
+            case Shape::Tape:  return std::tanh (drive_ * x) * norm_;                   // Tanh's core
         }
         return x;
     }
@@ -184,6 +194,7 @@ private:
             case Shape::Transistor: raw = transistorRaw (drive_); break;
             // Not a peak: the slope of tanh(k·u) at 0, so the normalised curve's slope there is 1.
             case Shape::Transformer: raw = drive_; break;
+            case Shape::Tape:  raw = std::tanh (drive_); break;                         // Tanh's peak
         }
         norm_ = (raw > 1.0e-12f) ? 1.0f / raw : 1.0f;
     }
