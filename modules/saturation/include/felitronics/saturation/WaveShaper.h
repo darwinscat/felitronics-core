@@ -53,7 +53,8 @@ namespace felitronics::saturation
 // per-channel flux state (see Saturator.h), and what this class holds is that model's static core sat(u) =
 // tanh(ku)/k. It is normalised by its SLOPE, not its peak — norm = 1/k, so slopeAtZero() is 1 at every drive
 // (the literal 1.0f, which makes the Saturator's drive-compensation exactly 1.0f) and a quiet signal passes at
-// unity gain. |y| <= |x| still holds, so |x| <= 1 still maps to |y| <= 1, but the full-scale output is not 1:
+// unity gain. |y| <= |x| still holds (in float to within an ulp), so |x| <= 1 still maps to |y| <= 1, but the
+// full-scale output is not 1:
 // y(1) = tanh(k)/k < 1. processSample() here is that static curve alone, without the flux.
 class WaveShaper
 {

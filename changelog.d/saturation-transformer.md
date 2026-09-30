@@ -8,7 +8,8 @@ is 8.95 % at 20 Hz, 1.40 % at 160 Hz, 0.096 % at 640 Hz and 0.0016 % at 5 kHz, w
 THD at 44.1, 48 and 96 kHz to 0.002 dB. It has no knob of its own (drive, mix, output and autoComp; `Params::bias` is
 not read), no hysteresis, no DC blocker and no added latency. The curve is SLOPE-normalised (norm = 1/k, so
 `slopeAtZero()` is exactly 1.0f and drive-compensation is exactly 1.0f): a -60 dBFS multitone comes out within 1.2e-10
-of Tanh at driveDb 0, and the model's output peak never exceeds its input's. At os 1 the stage nulls against a
+of Tanh at driveDb 0, and the model's output peak never exceeds its input's (at os > 1 the oversampler's own round trip can still
+overshoot, as it does for every shape: +0.467 dB on a 20 Hz square at driveDb 6, against Tanh's +0.727). At os 1 the stage nulls against a
 double-precision evaluation of the model to 9.3e-7. The model state is one float per channel
 (`Saturator::kModelFloats`), in `Storage` and `Storage::bytes()` — which grow by exactly that — zeroed by prepare() and
 reset(), flushed per sample, and gated like the DC blocker, so a channel that leaves and returns, or a switch to another
