@@ -289,7 +289,8 @@ static void testNoSpikeFromZeroDrive()
 {
     group ("no spike on the way — a constant through a drive glide stays inside the settled path's own range");
     const int n = 9000, at = 4000;
-    for (Shape sh : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym })
+    for (Shape sh : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor, Shape::Transformer,
+                      Shape::Tape })
         for (float to : { 3.0f, 12.0f, 24.0f })
             for (int os : { 1, 4 })
             {
@@ -349,9 +350,11 @@ static void testRepeatedWritesCostNothing()
 static void testNoAllocation()
 {
     group ("RT — nothing is allocated while a glide runs, writes and retargets included");
+    for (Shape sh : { Shape::Asym, Shape::Tube, Shape::Transistor, Shape::Transformer, Shape::Tape })
+    {
     const int N = 128;
     Sat s;
-    s.setParams (P (Shape::Asym, 3.0f, 0.1f));
+    s.setParams (P (sh, 3.0f, 0.1f));
     ok (s.prepare (kFs, N, 2, 4), "PRECONDITION: prepare");
     std::vector<float> a ((std::size_t) N, 0.2f), b ((std::size_t) N, -0.1f);
     float* io[2] { a.data(), b.data() };
@@ -359,11 +362,13 @@ static void testNoAllocation()
     const long long before = alloc::count.load();
     for (int k = 0; k < 200; ++k)
     {
-        if (k % 17 == 0) s.setParams (P (Shape::Asym, 3.0f + (float) (k % 5) * 3.0f, 0.05f * (float) (k % 3), 0.5f + 0.1f * (float) (k % 4)));
+        if (k % 17 == 0) s.setParams (P (sh, 3.0f + (float) (k % 5) * 3.0f, 0.05f * (float) (k % 3), 0.5f + 0.1f * (float) (k % 4)));
         felitronics::test::run (s.process (io, 2, N));
         if (k == 100) felitronics::test::run (s.process (nullptr, 0, 3000));
     }
-    felitronics::test::okNoAlloc (alloc::count.load() == before, "no allocation across 200 gliding blocks and a pause");
+    felitronics::test::okNoAlloc (alloc::count.load() == before, "shape " + std::to_string ((int) sh)
+                                                                 + ": no allocation across 200 gliding blocks and a pause");
+    }
 }
 
 int main()
