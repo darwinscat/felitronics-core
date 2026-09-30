@@ -39,4 +39,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_saturation_falsify_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_saturation_falsify_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_saturation_falsify_tests COMMAND felitronics_saturation_falsify_tests)
+
+    # The Tube and Transistor curves. The exhaustive float sweep of Transistor's curve is its own ctest entry, so a
+    # slow instrumented build can leave it out.
+    add_executable(felitronics_saturation_types_tests tests/SaturatorTypesTests.cpp)
+    target_link_libraries(felitronics_saturation_types_tests PRIVATE felitronics::saturation)
+    target_include_directories(felitronics_saturation_types_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_saturation_types_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_saturation_types_tests COMMAND felitronics_saturation_types_tests)
+    add_test(NAME felitronics_saturation_types_exhaustive_tests COMMAND felitronics_saturation_types_tests exhaustive)
 endif()

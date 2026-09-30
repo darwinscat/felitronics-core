@@ -24,7 +24,7 @@ namespace felitronics::saturation
 // felitronics::saturation::Saturator — the production soft-saturation stage (the mastering "glue/color"
 // before the make-loud gain). Wraps a stateless WaveShaper curve in OVERSAMPLING (default 4×) so the new
 // harmonics fold above the base Nyquist instead of aliasing back, runs a DC blocker inside the oversampled
-// region (the asymmetric curve's even harmonics shift the mean), then returns to base rate and applies
+// region (the asymmetric curves' even harmonics shift the mean — Asym and Tube), then returns to base rate and applies
 // DRIVE-COMPENSATION + a linear dry/wet + output trim.
 //
 // Gain-staging (a reference tool reverted its saturator twice over this): the curve
@@ -519,7 +519,7 @@ private:
         if (os_ > 1) ovs_.upsample (io, nc, n, osPtrs_.data());
         else for (int c = 0; c < nc; ++c) std::copy (io[c], io[c] + n, osPtrs_[(std::size_t) c]);
 
-        // 2) waveshape per channel in the oversampled domain; DC-block only the asymmetric curve (the
+        // 2) waveshape per channel in the oversampled domain; DC-block only the asymmetric curves (the
         //    even-harmonic offset). Symmetric curves are zero-mean → no blocker → no needless phase shift.
         for (int c = 0; c < nc; ++c)
         {
@@ -621,6 +621,8 @@ private:
                 case WaveShaper::Shape::Atan:  shapeGlide<WaveShaper::Shape::Atan>  (b, osN, ph0 * os_, c); break;
                 case WaveShaper::Shape::Cubic: shapeGlide<WaveShaper::Shape::Cubic> (b, osN, ph0 * os_, c); break;
                 case WaveShaper::Shape::Asym:  shapeGlide<WaveShaper::Shape::Asym>  (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Tube:  shapeGlide<WaveShaper::Shape::Tube>  (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Transistor: shapeGlide<WaveShaper::Shape::Transistor> (b, osN, ph0 * os_, c); break;
             }
         }
         if (os_ > 1) ovs_.downsample (osPtrs_.data(), nc, n, wetPtrs_.data());
@@ -661,7 +663,8 @@ private:
         const double fsOs = fs_ * (double) os_;
         const double fc   = std::clamp ((double) dcHz, 0.0, 0.49 * fsOs);
         dcR_ = (fc <= 0.0) ? 0.0f : (float) std::exp (-2.0 * core::kPi * fc / fsOs);
-        dcEnabled_ = (dcHz > 0.0f) && (params_.shape == WaveShaper::Shape::Asym);
+        dcEnabled_ = (dcHz > 0.0f) && (params_.shape == WaveShaper::Shape::Asym
+                                       || params_.shape == WaveShaper::Shape::Tube);   // the asymmetric curves
     }
 
     Params      params_ {};

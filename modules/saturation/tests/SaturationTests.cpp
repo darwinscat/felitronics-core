@@ -377,7 +377,7 @@ namespace cascadeprobe
     // One sine exactly on bin `bin` of a kW window; the stage runs for kWarm first. Returns |X| per bin
     // (single-sided amplitude), read over the last kW samples.
     inline std::vector<double> spectrum (double fs, oversampling::Topology topo, Shape shape, float driveDb, float bias,
-                                         int bin, double amp)
+                                         int bin, double amp, float dcBlockHz = 10.0f)
     {
         std::vector<float> x ((std::size_t) (kW + kWarm));
         for (std::size_t i = 0; i < x.size(); ++i)
@@ -385,6 +385,7 @@ namespace cascadeprobe
         saturation::Saturator s;
         (void) s.prepare (fs, 512, 1, 4, 64, topo);
         saturation::Saturator::Params p; p.shape = shape; p.driveDb = driveDb; p.bias = bias; p.mix = 1.0f;
+        p.dcBlockHz = dcBlockHz;
         s.setParams (p);
         for (std::size_t o = 0; o < x.size(); o += 512)
         {
@@ -595,6 +596,35 @@ static void runCascadeTopologyTests()
         test::ok (totC < -118.0 && inC < -130.0, "the cascade's total non-harmonic energy stays under -118 dBc, and under -130 in the audio band");
         test::ok (totC < totK + 1.0 && inC < inK, "and it is no worse than the Kaiser stage's (" + std::to_string (totK)
                                                    + " total, " + std::to_string (inK) + " in band)");
+
+        // The same measure for Tube and Transistor, against Tanh's number at the same operating point and topology:
+        // neither curve may alias more than 3 dB above it, in total or inside 0..20 kHz. Tube is measured with its DC
+        // blocker off for that, and on — as it plays — beside it: with the blocker on, the in-band column reads the
+        // blocker's own float rounding noise at 8..27 Hz (about -124 dBc, Asym with the blocker on reads the same), not
+        // aliasing, so that row is gated on the total only.
+        for (Topology topo : { Topology::Cascade, Topology::Kaiser })
+        {
+            struct Row { const char* name; Shape shape; float dcHz; bool inBand; double tot = -1e9, in = -1e9; };
+            Row rows[] { { "Tanh", Shape::Tanh, 10.0f, true }, { "Tube (blocker off)", Shape::Tube, 0.0f, true },
+                         { "Tube (blocker on)", Shape::Tube, 10.0f, false }, { "Transistor", Shape::Transistor, 10.0f, true } };
+            for (Row& r : rows)
+                for (int k = 0; k < 9; ++k)
+                {
+                    const int b = (int) std::lround ((0.150 + 0.005 * k) * kW);
+                    const auto m = spectrum (fs, topo, r.shape, 6.0f, 0.0f, b, 0.9, r.dcHz);
+                    r.tot = std::max (r.tot, nonHarmonicDbc (m, b, kW / 2));
+                    r.in  = std::max (r.in,  nonHarmonicDbc (m, b, b20k));
+                }
+            const std::string tn = topo == Topology::Cascade ? "cascade" : "Kaiser";
+            std::printf ("       %s, +6 dB, worst of nine tones, dBc total (in 0..20 kHz):", tn.c_str());
+            for (const Row& r : rows) std::printf ("  %s %.1f (%.1f)", r.name, r.tot, r.in);
+            std::printf ("\n");
+            for (int i = 1; i < 4; ++i)
+                test::ok (rows[i].tot <= rows[0].tot + 3.0 && (! rows[i].inBand || rows[i].in <= rows[0].in + 3.0),
+                          std::string (rows[i].name) + " aliases within 3 dB of Tanh under the " + tn + " stage ("
+                          + std::to_string (rows[i].tot) + " total, " + std::to_string (rows[i].in) + " in band"
+                          + (rows[i].inBand ? "" : ", not gated") + ")");
+        }
 
         // The reason the guard band exists: content at 0.48 fs (in the don't-care band) through the asymmetric
         // curve. An ideal oversampler puts NOTHING in 0..20 kHz here; a halfband first stage flat to 20 kHz put
