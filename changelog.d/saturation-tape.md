@@ -11,7 +11,7 @@ drive, a full-scale one within 4.17e-7 at driveDb 0, and drive-compensation is T
 bilinear transform with its own corner prewarped (both exact at every rate), in transposed direct form II. On
 full-scale 1/5/10 kHz sines, a 1 kHz square and band-limited clicks at driveDb 0/6/12 (os 4, autoComp 1), Tape's peak
 is Tanh's or lower to the printed 0.001 dB. At os 1 the stage nulls against a double-precision evaluation of E, the
-core and D to 2.43e-7. Where f2 >= 0.45·fsOs (os 1 below 14113.6 Hz) the pair is bypassed and Tape renders Tanh's bits.
+core and D to 2.43e-7. Where f2 >= 0.45·fsOs (os 1 below 14113.6 Hz, os 2 below half that) the pair is bypassed and Tape renders Tanh's bits.
 Tape has no knob of its own (`Params::bias` is not read), no head bump, no HF roll-off, no hysteresis, no DC blocker
 and no added latency; a standalone `WaveShaper` set to Tape is Tanh's curve, operand for operand.
 

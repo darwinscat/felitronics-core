@@ -27,7 +27,8 @@ namespace felitronics::saturation
 // a DC blocker inside the oversampled region (the asymmetric curves' even harmonics shift the mean — Asym and
 // Tube), then returns to base rate and applies DRIVE-COMPENSATION + a linear dry/wet + output trim.
 //
-// THE TRANSFORMER is the one shape with memory: a model, not a curve. Per channel, per OVERSAMPLED sample (fsOs):
+// THE TRANSFORMER is a shape with memory (Tape, below, is the other): a model, not a curve. Per channel, per
+// OVERSAMPLED sample (fsOs):
 //   L += a·(x − L)                  a leaky integrator, unity DC gain, a = 1 − exp(−2π·40 Hz / fsOs)
 //   y  = sat(L) + sat'(L)·(x − L)   sat(u) = tanh(k·u)/k (the WaveShaper's Transformer curve), sat' = 1 − tanh²(k·L)
 // L stands for the core's flux, the integral of the voltage, so the low end saturates and the top rides the
@@ -53,10 +54,11 @@ namespace felitronics::saturation
 // multitone within 6.4e-10) and drive-compensation is Tanh's. Each section is the bilinear transform of one factor with
 // its corner prewarped on its own (both corners exact at every rate), in transposed direct form II with one float of
 // state, so Tape's model state is two floats per channel (slots 0 and 1), gated, flushed and guarded like the
-// Transformer's. The pair is BYPASSED where f2 >= 0.45·fsOs — os 1 below 14113.6 Hz — and Tape then renders Tanh's
-// bits. No knob of its own (`bias` unread), no head bump, no HF roll-off, no hysteresis, no DC blocker (the core is odd)
-// and no added latency. At os 1 the stage nulls against a double evaluation to 2.43e-7; on full-scale 1/5/10 kHz sines,
-// a 1 kHz square and band-limited clicks at driveDb 0/6/12 its peak is Tanh's or lower, to the printed 0.001 dB.
+// Transformer's. The pair is BYPASSED where f2 >= 0.45·fsOs — os 1 below 14113.6 Hz, os 2 below half that — and
+// Tape then renders Tanh's bits. No knob of its own (`bias` unread), no head bump, no HF roll-off, no hysteresis,
+// no DC blocker (the core is odd) and no added latency. At os 1 the stage nulls against a double evaluation to
+// 2.43e-7; on full-scale 1/5/10 kHz sines, a 1 kHz square and band-limited clicks at driveDb 0/6/12 its peak is Tanh's
+// or lower, to the printed 0.001 dB.
 //
 // Gain-staging (a reference tool reverted its saturator twice over this): the curve is peak-normalised
 // (|x|≤1 → |y|≤1; Transformer's is slope-normalised and keeps |y|≤|x|), `autoComp` undoes the small-signal-gain
