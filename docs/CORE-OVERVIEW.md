@@ -29,7 +29,7 @@ The guitar-amp modules — `nam` (the NeuralAmpModelerCore backend), `rigplayer`
 
 | Module | What | Key types |
 |---|---|---|
-| `saturation` | oversampled soft-saturation | `WaveShaper` (Tanh/Atan/Cubic/Asym/Tube/Transistor), `Saturator` |
+| `saturation` | oversampled soft-saturation | `WaveShaper` (Tanh/Atan/Cubic/Asym/Tube/Transistor/Transformer), `Saturator` |
 | `stereo` | mid/side image tools | `MidSide`, `MonoBass` (bass mono-maker / elliptical), `StereoWidth` (mono-fold-safe) |
 | `dynamiceq` | level-driven EQ band (cut/boost when loud/quiet) | `DynamicEqBand`, `LaneDynamics` (drives an `eq::EqBand` point's per-lane delta seam — what makes the mastering chain's EQ points dynamic) |
 | `deesser` | sibilance control, 2 topologies | `DeEsser` (surgical dynamic-EQ · classic split-band) |

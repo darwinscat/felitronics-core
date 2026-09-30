@@ -49,6 +49,7 @@ const char* name (Shape s)
         case Shape::Asym:       return "Asym";
         case Shape::Tube:       return "Tube";
         case Shape::Transistor: return "Transistor";
+        case Shape::Transformer: return "Transformer";
     }
     return "?";
 }

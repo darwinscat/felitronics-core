@@ -289,7 +289,7 @@ static void testNoSpikeFromZeroDrive()
 {
     group ("no spike on the way — a constant through a drive glide stays inside the settled path's own range");
     const int n = 9000, at = 4000;
-    for (Shape sh : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor })
+    for (Shape sh : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor, Shape::Transformer })
         for (float to : { 3.0f, 12.0f, 24.0f })
             for (int os : { 1, 4 })
             {
@@ -349,7 +349,7 @@ static void testRepeatedWritesCostNothing()
 static void testNoAllocation()
 {
     group ("RT — nothing is allocated while a glide runs, writes and retargets included");
-    for (Shape sh : { Shape::Asym, Shape::Tube, Shape::Transistor })
+    for (Shape sh : { Shape::Asym, Shape::Tube, Shape::Transistor, Shape::Transformer })
     {
     const int N = 128;
     Sat s;

@@ -80,7 +80,8 @@ static const char* shapeName (Shape s)
 {
     switch (s) { case Shape::Tanh: return "Tanh"; case Shape::Atan: return "Atan";
                  case Shape::Cubic: return "Cubic"; case Shape::Asym: return "Asym";
-                 case Shape::Tube: return "Tube"; case Shape::Transistor: return "Transistor"; }
+                 case Shape::Tube: return "Tube"; case Shape::Transistor: return "Transistor";
+                 case Shape::Transformer: return "Transformer"; }
     return "?";
 }
 
@@ -141,7 +142,7 @@ int main()
     // 1) Odd symmetry — steady-state paired instances: process(x) and process(-x) must be exact negations.
     test::group ("odd symmetry: f(-x) == -f(x) exactly (paired instances; symmetric shapes bypass the DC blocker)");
     for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym,      // Asym with bias=0 is odd by its formula
-                         Shape::Transistor })                                         // (Tube is not odd: its bias is fixed)
+                         Shape::Transistor, Shape::Transformer })                     // (Tube is not odd: its bias is fixed)
         for (float driveDb : { 0.0f, 3.0f, 36.0f })
             for (int os : { 1, 4 })
             {
@@ -197,7 +198,7 @@ int main()
     //==========================================================================
     // 3a) Gate substitution equivalence: poisoned stream == clean twin fed the documented substitution, bitwise.
     test::group ("poison gate: poisoned stream bit-identical to the doc-mapped substitution twin (all shapes)");
-    for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor })
+    for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor, Shape::Transformer })
     {
         Params p; p.shape = shape; p.driveDb = 6.0f; p.bias = 0.25f; p.mix = 0.7f;
 
@@ -239,7 +240,7 @@ int main()
     //==========================================================================
     // 3b) Containment horizon vs the TRUE clean twin.
     test::group ("poison horizon: single NaN — finite-memory shapes reconverge bit-exactly within H = 4*latency + 128");
-    for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Transistor })   // Tube has Asym's IIR blocker
+    for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Transistor })   // Tube has Asym's IIR blocker, Transformer its flux
     {
         Params p; p.shape = shape; p.driveDb = 6.0f; p.mix = 0.7f;
 
@@ -587,7 +588,7 @@ int main()
     //==========================================================================
     // Totality storm: heavy random poison mixture, every shape — output always finite.
     test::group ("totality: 30% poison storm (NaN/sNaN/Inf/huge/random-bits) — output always finite, every shape");
-    for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor })
+    for (Shape shape : { Shape::Tanh, Shape::Atan, Shape::Cubic, Shape::Asym, Shape::Tube, Shape::Transistor, Shape::Transformer })
     {
         Params p; p.shape = shape; p.driveDb = 12.0f; p.bias = 0.4f; p.mix = 0.5f;
 

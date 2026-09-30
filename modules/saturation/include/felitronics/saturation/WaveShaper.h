@@ -10,21 +10,23 @@ namespace felitronics::saturation
 {
 
 //==============================================================================
-// felitronics::saturation::WaveShaper — a stateless soft-saturation transfer curve, PEAK-NORMALISED so
-// |x| <= 1 maps to |y| <= 1: the curve rounds the top + adds harmonics WITHOUT changing the full-scale
-// level (the right shape for a mastering "glue" saturator that sits before the make-loud gain).
+// felitronics::saturation::WaveShaper — a stateless soft-saturation transfer curve, PEAK-NORMALISED (all but
+// Transformer, which is slope-normalised — see its note) so |x| <= 1 maps to |y| <= 1: the curve rounds the
+// top + adds harmonics WITHOUT changing the full-scale level (the right shape for a mastering "glue"
+// saturator that sits before the make-loud gain).
 //
 // `drive` (k) sets how much curve: k → 0 is ~linear (no effect), larger k = more harmonics. Curves:
 // Tanh (odd, smooth/dark — the safe default), Atan (odd, a touch brighter/harder
 // knee), Cubic (mostly 3rd, a cheap soft clipper), Asym (tube/triode — `bias` adds EVEN harmonics),
 // Tube (a fixed tube-like bias: mostly 2nd, no knob of its own), Transistor (odd, cleaner than Tanh below
-// the knee, harder past it):
+// the knee, harder past it), Transformer (odd; the curve below is only its static core — see the note):
 //   Tanh        y = tanh(kx)/tanh(k)
 //   Atan        y = atan(kx)/atan(k)
 //   Cubic       y = h(kx)/h(k),  h(u)=1.5u-0.5u³ (|u|<1), sign(u) else
 //   Asym        r(x)=tanh(k(x+b))-tanh(kb),  y = r(x)/max(|r(1)|,|r(-1)|)
 //   Tube        r(u)=q·t/(1+c·t), t=tanh(u), u=kx, c=tanh(0.3), q=1-c²,  y = r(kx)/|r(-k)|
 //   Transistor  s(u)=u/(1+u⁴)^(1/4),  y = s(kx)/s(k)
+//   Transformer y = tanh(kx)/k                        (SLOPE-normalised, not peak-normalised)
 // Pure function of the input (no per-sample state) → this is the kernel an oversampled Saturator wraps
 // (run it at N× so the new harmonics stay below the base Nyquist). Asym's bias makes y(0)=0 but NOT a
 // zero-mean output for music, so the Saturator follows it with a DC blocker; Tube gets the same blocker.
@@ -46,11 +48,18 @@ namespace felitronics::saturation
 // is clamped to 64 before u⁴ — s(64) is exactly 1 in float, and without the clamp u⁴ overflows near
 // |u| = 4.3e9 and a full-scale sample maps to 0 (driveDb is not clamped). In float s is not monotone (it
 // steps back by up to 3 ulp), so its normalised peak over [-1, 1] is 1 to within one ulp.
+//
+// TRANSFORMER is the one shape that is not a pure function of the input: the Saturator runs it as a model with a
+// per-channel flux state (see Saturator.h), and what this class holds is that model's static core sat(u) =
+// tanh(ku)/k. It is normalised by its SLOPE, not its peak — norm = 1/k, so slopeAtZero() is 1 at every drive
+// (the literal 1.0f, which makes the Saturator's drive-compensation exactly 1.0f) and a quiet signal passes at
+// unity gain. |y| <= |x| still holds, so |x| <= 1 still maps to |y| <= 1, but the full-scale output is not 1:
+// y(1) = tanh(k)/k < 1. processSample() here is that static curve alone, without the flux.
 class WaveShaper
 {
 public:
     // Append only: a consumer pins these integers in an ABI. Never renumber.
-    enum class Shape { Tanh, Atan, Cubic, Asym, Tube, Transistor };
+    enum class Shape { Tanh, Atan, Cubic, Asym, Tube, Transistor, Transformer };
 
     // Tube's fixed bias c = tanh(0.3) and q = 1 - c², as the nearest floats (std::tanh is not constexpr).
     static constexpr float kTubeC = 0.2913126124515909f;
@@ -79,6 +88,7 @@ public:
         else if constexpr (S == Shape::Asym)  return (std::tanh (c.drive * (x + c.bias)) - c.biasTanh) * c.norm;
         else if constexpr (S == Shape::Tube)  return tubeRaw (c.drive * x) * c.norm;
         else if constexpr (S == Shape::Transistor) return transistorRaw (c.drive * x) * c.norm;
+        else if constexpr (S == Shape::Transformer) return std::tanh (c.drive * x) * c.norm;
         else
         {
             // A new Shape gets its own branch above — a bare `else` would play it as the previous formula.
@@ -99,6 +109,7 @@ public:
             case Shape::Asym:  return norm_ * drive_ * (1.0f - biasTanh_ * biasTanh_); // sech²(kb)
             case Shape::Tube:  return norm_ * drive_ * kTubeQ;                         // raw'(0) = q
             case Shape::Transistor: return norm_ * drive_;                             // raw'(0) = 1
+            case Shape::Transformer: return 1.0f;       // slope-normalised: exactly 1, not norm_ * drive_ rounded
         }
         return 1.0f;
     }
@@ -113,6 +124,7 @@ public:
             case Shape::Asym:  return (std::tanh (drive_ * (x + bias_)) - biasTanh_) * norm_;
             case Shape::Tube:  return tubeRaw (drive_ * x) * norm_;
             case Shape::Transistor: return transistorRaw (drive_ * x) * norm_;
+            case Shape::Transformer: return std::tanh (drive_ * x) * norm_;
         }
         return x;
     }
@@ -169,6 +181,8 @@ private:
             // The curve at x = -1, by the very arithmetic processSample() runs: its peak for any k > 0.
             case Shape::Tube:       raw = std::fabs (tubeRaw (-drive_)); break;
             case Shape::Transistor: raw = transistorRaw (drive_); break;
+            // Not a peak: the slope of tanh(k·u) at 0, so the normalised curve's slope there is 1.
+            case Shape::Transformer: raw = drive_; break;
         }
         norm_ = (raw > 1.0e-12f) ? 1.0f / raw : 1.0f;
     }

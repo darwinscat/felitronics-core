@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 using namespace felitronics;
@@ -51,9 +52,14 @@ static void testChannelGate()
 {
     group ("channel gate: a returning channel emits nothing from digital silence");
 
+    // Tanh, and the Transformer, whose flux L is a third recursion a returning channel must not replay.
+    for (auto shape : { saturation::WaveShaper::Shape::Tanh, saturation::WaveShaper::Shape::Transformer })
+    {
+    const std::string tag = shape == saturation::WaveShaper::Shape::Tanh ? "" : " (Transformer)";
     const int N = 64;
     saturation::Saturator s;
     saturation::Saturator::Params p;
+    p.shape   = shape;
     p.driveDb = 12.0f;
     p.mix     = 0.5f;   // mix < 1 puts the DRY DELAY LINE in the returned channel's path as well; at full
                         // wet it contributes nothing and a frozen delay line would go unmeasured.
@@ -69,8 +75,9 @@ static void testChannelGate()
 
     std::fill (L.begin(), L.end(), 0.0f); std::fill (R.begin(), R.end(), 0.0f);
     felitronics::test::run (s.process (io, 2, N));
-    ok (peakOf (R) == 0.0, "silence in, exact zero out on the returned channel (was 0.9337 at i=29)");
-    ok (peakOf (L) == 0.0, "and on the channel that stayed, which has heard nothing but silence");
+    ok (peakOf (R) == 0.0, "silence in, exact zero out on the returned channel (was 0.9337 at i=29)" + tag);
+    ok (peakOf (L) == 0.0, "and on the channel that stayed, which has heard nothing but silence" + tag);
+    }
 }
 
 static void testIsolation()
@@ -142,6 +149,32 @@ static void testShapeGate()
     std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
     felitronics::test::run (s.process (io, 2, N));
     ok (peakOf (a) == 0.0 && peakOf (b) == 0.0, "Asym -> Tanh -> Asym: exact zero out of silence");
+
+    // The same gate for the Transformer's flux L: it stops advancing on another shape and must restart from 0.
+    {
+        saturation::Saturator t;
+        saturation::Saturator::Params q;
+        q.shape = saturation::WaveShaper::Shape::Transformer; q.driveDb = 12.0f;
+        t.setParams (q);
+        ok (t.prepare (kFs, N, 2), "precondition: the stage prepared");
+        for (int k = 0; k < 20; ++k)
+        {
+            for (int i = 0; i < N; ++i) a[(std::size_t) i] = b[(std::size_t) i] = (float) (0.8 * std::sin (0.006 * (k * N + i)));
+            felitronics::test::run (t.process (io, 2, N));
+        }
+        q.shape = saturation::WaveShaper::Shape::Tanh;
+        t.setParams (q);
+        for (int k = 0; k < 40; ++k)
+        {
+            std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
+            felitronics::test::run (t.process (io, 2, N));
+        }
+        q.shape = saturation::WaveShaper::Shape::Transformer;
+        t.setParams (q);
+        std::fill (a.begin(), a.end(), 0.0f); std::fill (b.begin(), b.end(), 0.0f);
+        felitronics::test::run (t.process (io, 2, N));
+        ok (peakOf (a) == 0.0 && peakOf (b) == 0.0, "Transformer -> Tanh -> Transformer: exact zero out of silence");
+    }
 }
 
 static void testNoEdgeWithoutSamples()

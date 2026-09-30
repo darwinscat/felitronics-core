@@ -22,15 +22,30 @@ namespace felitronics::saturation
 
 //==============================================================================
 // felitronics::saturation::Saturator — the production soft-saturation stage (the mastering "glue/color"
-// before the make-loud gain). Wraps a stateless WaveShaper curve in OVERSAMPLING (default 4×) so the new
-// harmonics fold above the base Nyquist instead of aliasing back, runs a DC blocker inside the oversampled
-// region (the asymmetric curves' even harmonics shift the mean — Asym and Tube), then returns to base rate and applies
-// DRIVE-COMPENSATION + a linear dry/wet + output trim.
+// before the make-loud gain). Wraps a stateless WaveShaper curve (for Transformer, a model around one — below)
+// in OVERSAMPLING (default 4×) so the new harmonics fold above the base Nyquist instead of aliasing back, runs
+// a DC blocker inside the oversampled region (the asymmetric curves' even harmonics shift the mean — Asym and
+// Tube), then returns to base rate and applies DRIVE-COMPENSATION + a linear dry/wet + output trim.
 //
-// Gain-staging (a reference tool reverted its saturator twice over this): the curve
-// is peak-normalised (|x|≤1 → |y|≤1), `autoComp` undoes the small-signal-gain bump so loudness doesn't jump
-// with drive, and the dry/wet blend is LINEAR (convex combination of bounded signals → peak-safe). Place it
-// BEFORE the loudness gain + final limiter.
+// THE TRANSFORMER is the one shape with memory: a model, not a curve. Per channel, per OVERSAMPLED sample (fsOs):
+//   L += a·(x − L)                  a leaky integrator, unity DC gain, a = 1 − exp(−2π·40 Hz / fsOs)
+//   y  = sat(L) + sat'(L)·(x − L)   sat(u) = tanh(k·u)/k (the WaveShaper's Transformer curve), sat' = 1 − tanh²(k·L)
+// L stands for the core's flux, the integral of the voltage, so the low end saturates and the top rides the
+// linear term: the higher the frequency, the less L moves. At driveDb 6 on a full-scale sine (48 kHz, os 4) THD
+// is 8.95 % at 20 Hz, 1.40 % at 160 Hz, 0.096 % at 640 Hz and 0.0016 % at 5 kHz, where Tanh has 6.6 %. y is the
+// exact derivative of the saturated flux (v = I⁻¹(sat(I·x)) with L' = ω₀·(x − L)) — no differentiator filter
+// anywhere. A quiet signal passes at unity (sat has slope 1, so drive-compensation is exactly 1.0f at every drive
+// and autoComp), and the model's output peak never exceeds its input's: |y| <= max(|x|, |L|), and |L| never
+// exceeds the input's peak, for any 0 < a <= 1 (at os > 1 the oversampler's round trip can overshoot on its own,
+// as for every shape). It adds no latency, needs no DC blocker (the core is odd), and has no knob of its own:
+// drive, mix, output and autoComp only, `bias` unread. L is the stage's MODEL STATE (kModelFloats per channel),
+// gated, flushed and guarded exactly like the DC blocker's, so a channel that leaves and returns, or a switch
+// away from the shape and back, starts it from L = 0.
+//
+// Gain-staging (a reference tool reverted its saturator twice over this): the curve is peak-normalised
+// (|x|≤1 → |y|≤1; Transformer's is slope-normalised and keeps |y|≤|x|), `autoComp` undoes the small-signal-gain
+// bump so loudness doesn't jump with drive, and the dry/wet blend is LINEAR (convex combination of bounded
+// signals → peak-safe). Place it BEFORE the loudness gain + final limiter.
 //
 // RT-safe: prepare() does all allocation; process() is alloc/lock/throw-free, in place. n may exceed the
 // maxBlock passed to prepare() — process() chunks internally, state carries across chunks. With oversampling
@@ -54,7 +69,7 @@ namespace felitronics::saturation
 //
 // Poison-hardened: non-finite params fall back to defaults (applyParams), each input sample is
 // sanitized at the gate (NaN/Inf → 0, huge finite → ±1e6 clamp) so one bad sample can't lodge in the
-// oversampler/DC/dry-delay state, and the DC-blocker state flushes non-finite values per block. All
+// oversampler/DC/dry-delay state, and the DC-blocker and model state flush non-finite values per block. All
 // three guards are bit-transparent on finite, in-range signals (the NULL test proves it).
 class Saturator
 {
@@ -70,8 +85,14 @@ public:
         float dcBlockHz = 10.0f;   // DC blocker corner (in the oversampled domain)
     };
 
+    // Floats of model state per channel — the Transformer's flux L. One vector of channels × this, zeroed by
+    // prepare() and reset() and gated per channel like the DC blocker's state.
+    static constexpr int kModelFloats = 1;
+    // The Transformer's flux corner: the leaky integrator's step is a = 1 − exp(−2π·this / fsOs).
+    static constexpr double kTransformerHz = 40.0;
+
     // WHAT prepare() ASKS THE HEAP FOR (law 11d) — the one function it sizes itself with, so a caller
-    // budgeting memory reads the counts the six buffers and the dry bank are actually built from. FALSE,
+    // budgeting memory reads the counts the seven buffers and the dry bank are actually built from. FALSE,
     // with `out` untouched, exactly where prepare() refuses the same arguments (it IS prepare()'s gate),
     // and a refused prepare() allocates nothing. Asked of a FRESH saturator.
     struct Storage
@@ -79,12 +100,13 @@ public:
         std::size_t osBuf = 0, wetBuf = 0;      // floats
         std::size_t ptrs  = 0;                  // float* in EACH of the two pointer tables
         std::size_t dc    = 0;                  // floats in EACH of the two DC-blocker state vectors
+        std::size_t model = 0;                  // floats of model state: kModelFloats per channel
         std::size_t dryLines = 0;               // core::DelayLine per channel
         int         dryDelaySamples = 0;        // the oversampler round trip each of them holds
         oversampling::Oversampler::Storage os {};            // empty when the factor is 1
         std::uint64_t bytes() const noexcept
         {
-            return (std::uint64_t) sizeof (float)  * ((std::uint64_t) osBuf + wetBuf + 2u * (std::uint64_t) dc)
+            return (std::uint64_t) sizeof (float)  * ((std::uint64_t) osBuf + wetBuf + 2u * (std::uint64_t) dc + model)
                  + (std::uint64_t) sizeof (float*) * (2u * (std::uint64_t) ptrs)
                  + core::delayBankBytes (dryLines, dryDelaySamples)
                  + os.bytes();
@@ -107,6 +129,7 @@ public:
         st.wetBuf   = ch * (std::size_t) maxBlock;
         st.ptrs     = ch;
         st.dc       = ch;
+        st.model    = ch * (std::size_t) kModelFloats;
         st.dryLines = ch;
         st.dryDelaySamples = os > 1 ? oversampling::Oversampler::latencyFor (topology, sampleRate, os, tapsPerPhase) : 0;
         out = st;
@@ -167,6 +190,7 @@ public:
         wetPtrs_.assign(st.ptrs, nullptr);
         dcX1_.assign   (st.dc, 0.0f);
         dcY1_.assign   (st.dc, 0.0f);
+        model_.assign  (st.model, 0.0f);
         const int lat = st.dryDelaySamples;                      // align the dry to the wet's round-trip
         core::prepareDelayBank (dryDelay_, st.dryLines, lat);
         for (auto& d : dryDelay_) d.setDelay (lat);
@@ -176,7 +200,7 @@ public:
         // new ones — measured as an AddressSanitizer container-overflow on dryDelay_ after
         // prepare(2) -> process -> prepare(1) -> process. prepare() does not call reset(), so this cannot
         // be left to reset() to do.
-        ranNc_ = ranDcNc_ = 0;
+        ranNc_ = ranDcNc_ = ranModelNc_ = 0;
         // The glide restarts with the stream, in the rate's own units: kGlideMs in 64-sample grid periods.
         glideTicks_ = ticksFor (sampleRate, glideMs_);
         snapGlide();
@@ -191,8 +215,9 @@ public:
         if (os_ > 1) ovs_.reset();
         std::fill (dcX1_.begin(), dcX1_.end(), 0.0f);
         std::fill (dcY1_.begin(), dcY1_.end(), 0.0f);
+        std::fill (model_.begin(), model_.end(), 0.0f);
         for (auto& d : dryDelay_) d.reset();
-        ranNc_ = ranDcNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedCells)
+        ranNc_ = ranDcNc_ = ranModelNc_ = 0;   // nothing has run, so nothing can be stopping (see dropStoppedCells)
         // A STREAM RESTART LANDS EVERY GLIDE on its target and re-anchors the grid, and the next write snaps:
         // a restart that resumed a ramp would make a second render of the same programme start somewhere else.
         if (glideActive()) applyParams();
@@ -468,12 +493,55 @@ private:
         }
     }
 
+    // THE TRANSFORMER'S TWO HALVES, shared by the settled loop and the glide. The flux step L += a·(x − L), flushed
+    // per sample (law 8: on silence L is a pure (1 − a)^n decay, which in float sticks at a subnormal instead of
+    // reaching zero — the DC blocker's stall), and the output sat(L) + sat'(L)·(x − L) given t = tanh(k·L) and
+    // s = sat(L). Each product and sum in its own statement, so `-ffp-contract=on` fuses none of them (law 10).
+    static float fluxStep (float L, float x, float a) noexcept
+    {
+        const float d    = x - L;
+        const float step = a * d;
+        const float n    = L + step;
+        return (std::fabs (n) < 1e-30f) ? 0.0f : n;
+    }
+
+    static float fluxOut (float x, float L, float t, float s) noexcept
+    {
+        const float t2 = t * t;
+        const float g  = 1.0f - t2;
+        const float e  = x - L;
+        const float ge = g * e;
+        return s + ge;
+    }
+
+    // The Transformer over one os-rate run of a gliding period: shapeGlide()'s interpolation, k and the raw
+    // normaliser (which for this curve is k itself, so k / raw stays at 1 to rounding all the way), and
+    // sat(L) = tanh(k·L) / raw.
+    void transformerGlide (float* b, int osN, int r0, int c) noexcept
+    {
+        float* m = &model_[(std::size_t) c * (std::size_t) kModelFloats];
+        float L = m[0];
+        for (int i = 0; i < osN; ++i)
+        {
+            const float r  = (float) (r0 + i);
+            const float ek = dK_ * r, er = dR_ * r;
+            const float k  = cs_.sh.drive + ek;
+            const float raw = rs_ + er;
+            const float x  = b[i];
+            L = fluxStep (L, x, modelA_);
+            const float t  = std::tanh (k * L);
+            b[i] = fluxOut (x, L, t, t / raw);
+        }
+        m[0] = std::isfinite (L) ? L : 0.0f;
+    }
+
     // Clear the sample memory of every cell that ran on the previous accepted call and does not run on this
     // one. A channel that leaves and RETURNS is the case: its oversampler FIR, its DC blocker and its dry
     // delay are frozen, not decayed, and it replays them into a stream that has moved on — measured 0.9337
     // out of DIGITAL SILENCE, 29 samples after a return. The DC blocker has a second gate of its own,
     // dcEnabled_, which the Asym→symmetric→Asym path opens and closes at a constant channel count and which
-    // freezes x1/y1 exactly the same way. Per channel, never wholesale: a channel that never left keeps its
+    // freezes x1/y1 exactly the same way; the model state has its own, modelOn_ (Transformer -> another shape ->
+    // Transformer), with its own ran-count for the same reason. Per channel, never wholesale: a channel that never left keeps its
     // history bit-exact, which is why the oversampler grew resetChannel(). A call that carries no samples
     // (or none this stage accepts) ran nothing, so it stops nothing and never reaches here.
     void dropStoppedCells (int nc) noexcept
@@ -489,7 +557,10 @@ private:
             dcX1_[(std::size_t) c] = 0.0f;
             dcY1_[(std::size_t) c] = 0.0f;
         }
-        ranNc_ = nc; ranDcNc_ = nowDc;
+        const int nowModel = modelOn_ ? nc : 0;
+        for (int c = nowModel; c < ranModelNc_; ++c)
+            for (int j = 0; j < kModelFloats; ++j) model_[(std::size_t) (c * kModelFloats + j)] = 0.0f;
+        ranNc_ = nc; ranDcNc_ = nowDc; ranModelNc_ = nowModel;
     }
 
     // One ≤ maxBlock slice; nc already clamped by process(). Everything stateful streams across calls.
@@ -565,6 +636,23 @@ private:
                 dcX1_[(std::size_t) c] = std::isfinite (x1) ? x1 : 0.0f;
                 dcY1_[(std::size_t) c] = std::isfinite (y1) ? y1 : 0.0f;
             }
+            else if (modelOn_)
+            {
+                // The Transformer (see the class comment), at the settled curve: sat(L) is shapeAt<Transformer>
+                // (coeffs, L) operand for operand, with tanh(k·L) kept for the slope. L is flushed per sample
+                // and guarded per call exactly like the DC blocker's state above.
+                const WaveShaper::Coeffs k = shaper_.coeffs();
+                float* m = &model_[(std::size_t) c * (std::size_t) kModelFloats];
+                float L = m[0];
+                for (int i = 0; i < osN; ++i)
+                {
+                    const float x = b[i];
+                    L = fluxStep (L, x, modelA_);
+                    const float t = std::tanh (k.drive * L);
+                    b[i] = fluxOut (x, L, t, t * k.norm);
+                }
+                m[0] = std::isfinite (L) ? L : 0.0f;
+            }
             else
             {
                 for (int i = 0; i < osN; ++i) b[i] = shaper_.processSample (b[i]);
@@ -623,6 +711,7 @@ private:
                 case WaveShaper::Shape::Asym:  shapeGlide<WaveShaper::Shape::Asym>  (b, osN, ph0 * os_, c); break;
                 case WaveShaper::Shape::Tube:  shapeGlide<WaveShaper::Shape::Tube>  (b, osN, ph0 * os_, c); break;
                 case WaveShaper::Shape::Transistor: shapeGlide<WaveShaper::Shape::Transistor> (b, osN, ph0 * os_, c); break;
+                case WaveShaper::Shape::Transformer: transformerGlide (b, osN, ph0 * os_, c); break;
             }
         }
         if (os_ > 1) ovs_.downsample (osPtrs_.data(), nc, n, wetPtrs_.data());
@@ -665,6 +754,8 @@ private:
         dcR_ = (fc <= 0.0) ? 0.0f : (float) std::exp (-2.0 * core::kPi * fc / fsOs);
         dcEnabled_ = (dcHz > 0.0f) && (params_.shape == WaveShaper::Shape::Asym
                                        || params_.shape == WaveShaper::Shape::Tube);   // the asymmetric curves
+        modelA_  = (float) (1.0 - std::exp (-2.0 * core::kPi * kTransformerHz / fsOs));
+        modelOn_ = params_.shape == WaveShaper::Shape::Transformer;
     }
 
     Params      params_ {};
@@ -674,7 +765,9 @@ private:
     double fs_ = 0.0;
     int    maxBlock_ = 0, channels_ = 0, os_ = 1;
     float  comp_ = 1.0f, dcR_ = 0.0f, mix_ = 1.0f, outGain_ = 1.0f;
+    float  modelA_ = 0.0f;                                 // the Transformer's flux step a, at fsOs
     bool   dcEnabled_ = false;
+    bool   modelOn_   = false;                             // the shape runs the model state (Transformer)
     bool   prepared_  = false;                             // true only after a fully-successful prepare()
 
     // The glide (see kGlideMs). `pv_` is the parameter vector at the last grid boundary, `pt_` the target, `pd_`
@@ -688,11 +781,12 @@ private:
     float  pt_[kNumP] {};
     Consts cs_ {}, ce_ {};
     float  dK_ = 0.0f, dB_ = 0.0f, dBt_ = 0.0f, rs_ = 1.0f, dR_ = 0.0f, dC_ = 0.0f, dM_ = 0.0f, dO_ = 0.0f;
-    int    ranNc_ = 0, ranDcNc_ = 0;                       // what advanced state on the previous accepted call
+    int    ranNc_ = 0, ranDcNc_ = 0, ranModelNc_ = 0;      // what advanced state on the previous accepted call
 
     std::vector<float>  osBuf_, wetBuf_;
     std::vector<float*> osPtrs_, wetPtrs_;
     std::vector<float>  dcX1_, dcY1_;
+    std::vector<float>  model_;                // kModelFloats per channel — the Transformer's flux L
     std::vector<core::DelayLine> dryDelay_;    // per channel, os round-trip — keeps the dry/wet mix comb-free
 };
 
