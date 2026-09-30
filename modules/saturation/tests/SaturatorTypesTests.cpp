@@ -58,6 +58,10 @@ std::string num (double v, const char* fmt = "%.4g") { char b[64]; std::snprintf
 // ok() that also prints what it measured — the report cites these lines.
 void okp (bool cond, const std::string& msg) { std::printf ("       %s\n", msg.c_str()); ok (cond, msg); }
 
+// A running maximum a NaN cannot hide from: std::max (w, NaN) keeps w; here a NaN wins and STAYS (a later finite
+// value would pass `! (v <= NaN)` and overwrite it), and every gate below compares with <=, which a NaN fails.
+template <class T> void worse (T& w, T v) { if (! std::isnan (w) && ! (v <= w)) w = v; }
+
 bool bitEq (float a, float b) { return std::bit_cast<std::uint32_t> (a) == std::bit_cast<std::uint32_t> (b); }
 
 // The drive the Saturator designs from a driveDb (Saturator::design()).
@@ -115,7 +119,7 @@ void slopeAtZero (Shape s)
             // truncation: the u³ term, |r'''(0)/(6 r'(0))| <= 0.25 for Tube, 0 for Transistor (no cubic term);
             // rounding: a few float ulps of each output.
             const double tol = hu * hu + 2.0e-6;
-            worst = std::max (worst, rel);
+            worse (worst, rel);
             if (! (rel <= tol))
             {
                 allOk = false;
@@ -159,12 +163,12 @@ void peakNormalisation (Shape s)
         for (float x : xs)
         {
             const float y = w.processSample (x);
-            if (x > 0.0f) pos = std::max (pos, y);
-            if (x < 0.0f) neg = std::max (neg, -y);
+            if (x > 0.0f) worse (pos, y);
+            if (x < 0.0f) worse (neg, -y);
         }
-        const float m = std::max (pos, neg);
-        hiAll = std::max (hiAll, (double) m); loAll = std::min (loAll, (double) m);
-        peak = peak && m <= up && m >= down;
+        float m = pos; worse (m, neg);
+        worse (hiAll, (double) m); if (! ((double) m >= loAll)) loAll = (double) m;
+        peak = peak && std::isfinite (pos) && std::isfinite (neg) && m <= up && m >= down;
         if (s == Shape::Tube) negSide = negSide && neg > pos && pos < 1.0f;
     }
     ok (zero, std::string (name (s)) + ": y(0) == 0 exactly at every drive");
@@ -205,8 +209,8 @@ void tubePrecision()
         for (int i = -100000; i <= 100000; ++i)
         {
             const float x = (float) i / 100000.0f;
-            worst = std::max (worst, std::fabs ((double) w.processSample (x) - rd ((double) x) * norm));
-            worstDiff = std::max (worstDiff, std::fabs ((double) (diff (x) * diffNorm) - rd ((double) x) * norm));
+            worse (worst, std::fabs ((double) w.processSample (x) - rd ((double) x) * norm));
+            worse (worstDiff, std::fabs ((double) (diff (x) * diffNorm) - rd ((double) x) * norm));
         }
         okp (worst <= 1.0e-6, "Tube driveDb " + num (db) + ": float within 1e-6 of tanh(kx+0.3)-tanh(0.3) in double over [-1, 1] ("
                              + num (worst) + "; the difference in float would be off by " + num (worstDiff)
@@ -229,7 +233,7 @@ void tubePrecision()
             const float y = rep (t) / std::fabs (rep (tn));
             for (float t1 : { std::nextafter (t, 2.0f), std::nextafter (t, -2.0f) })
                 for (float tn1 : { tn, std::nextafter (tn, 2.0f), std::nextafter (tn, -2.0f) })
-                    worst = std::max (worst, (double) std::fabs (rep (t1) / std::fabs (rep (tn1)) - y));
+                    worse (worst, (double) std::fabs (rep (t1) / std::fabs (rep (tn1)) - y));
         }
     }
     ok (pinned == 0, "PRECONDITION: the replica is Tube's arithmetic, bit for bit (" + std::to_string (pinned) + "/"
@@ -306,6 +310,27 @@ void transistorHuge()
     ok (bad == 0, "Transistor: y(-x) == -y(x) exactly over a sweep (" + std::to_string (bad) + " differ)");
 }
 
+// Transistor against a double evaluation of u/(1+u⁴)^(1/4), normalised the same way. |u| <= k <= 62 here, so the
+// clamp at 64 never acts.
+void transistorPrecision()
+{
+    for (float db : { 0.0f, 0.1f, 1.0f, 6.0f, 12.0f, 36.0f })
+    {
+        const WS w = shaper (Shape::Transistor, kOf (db));
+        const double k = (double) w.drive();
+        auto sd = [] (double u) { return u / std::pow (1.0 + u * u * u * u, 0.25); };
+        const double norm = 1.0 / sd (k);
+        double worst = 0.0;
+        for (int i = -100000; i <= 100000; ++i)
+        {
+            const float x = (float) i / 100000.0f;
+            worse (worst, std::fabs ((double) w.processSample (x) - sd (k * (double) x) * norm));
+        }
+        okp (worst <= 1.0e-6, "Transistor driveDb " + num (db) + ": float within 1e-6 of u/(1+u^4)^(1/4) in double over [-1, 1] ("
+                              + num (worst) + ")");
+    }
+}
+
 //==============================================================================
 // Through the whole Saturator: a bin-exact tone at os 4, mix 1, read over a settled window.
 constexpr int kW = 16384, kWarm = 32768, kBin = 341;   // 341 · 48000 / 16384 = 999 Hz
@@ -371,7 +396,7 @@ void harmonics()
                            + " dBFS (first above at " + num (cross) + ")");
     }
     double evenWorst = -1e9;
-    for (int h = 2; h * kBin < kW / 2; h += 2) evenWorst = std::max (evenWorst, dbc (tr, h));
+    for (int h = 2; h * kBin < kW / 2; h += 2) worse (evenWorst, dbc (tr, h));
     okp (evenWorst < -120.0, "Transistor: every even harmonic below Nyquist under -120 dBc (worst " + num (evenWorst) + ")");
 }
 
@@ -401,8 +426,8 @@ void tubeOvershoot()
             const float db = 0.5f * (float) i;
             const std::vector<float> y = render (Shape::Tube, db, 1.0, 1.0f, hz);
             double m = 0.0;
-            for (float v : y) m = std::max (m, (double) std::fabs (v));
-            if (m > worst) { worst = m; at = db; }
+            for (float v : y) worse (m, (double) std::fabs (v));
+            if (! std::isnan (worst) && ! (m <= worst)) { worst = m; at = db; }
         }
         okp (worst <= 1.07, std::string ("Tube, autoComp 1, full-scale sine, driveDb 0..12, blocker ") + (hz > 0.0f ? "on" : "off")
                             + ": max |out| " + num (worst, "%.5f") + " (" + num (20.0 * std::log10 (worst), "%+.3f")
@@ -434,6 +459,8 @@ int main (int argc, char** argv)
     tubePrecision();
     group ("Transistor at huge inputs, and its symmetry");
     transistorHuge();
+    group ("Transistor's precision");
+    transistorPrecision();
     group ("the harmonic signature through the Saturator");
     harmonics();
     group ("Tube's DC is removed");

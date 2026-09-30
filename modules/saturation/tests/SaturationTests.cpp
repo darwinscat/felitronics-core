@@ -581,15 +581,16 @@ static void runCascadeTopologyTests()
         // strict, so it may not be worse than the Kaiser stage — measured -122.4 against -120.8 dBc in total,
         // and -137.7 against -120.8 inside 0..20 kHz (both columns printed below).
         double totC = -1e9, inC = -1e9, totK = -1e9, inK = -1e9;
+        auto worse = [] (double& w, double v) { if (! std::isnan (w) && ! (v <= w)) w = v; };   // a NaN wins and stays
         for (int k = 0; k < 9; ++k)
         {
             const int b = (int) std::lround ((0.150 + 0.005 * k) * kW);
             const auto mc = spectrum (fs, Topology::Cascade, Shape::Tanh, 6.0f, 0.0f, b, 0.9);
             const auto mk = spectrum (fs, Topology::Kaiser,  Shape::Tanh, 6.0f, 0.0f, b, 0.9);
-            totC = std::max (totC, nonHarmonicDbc (mc, b, kW / 2));
-            inC  = std::max (inC,  nonHarmonicDbc (mc, b, b20k));
-            totK = std::max (totK, nonHarmonicDbc (mk, b, kW / 2));
-            inK  = std::max (inK,  nonHarmonicDbc (mk, b, b20k));
+            worse (totC, nonHarmonicDbc (mc, b, kW / 2));
+            worse (inC,  nonHarmonicDbc (mc, b, b20k));
+            worse (totK, nonHarmonicDbc (mk, b, kW / 2));
+            worse (inK,  nonHarmonicDbc (mk, b, b20k));
         }
         std::printf ("       tanh +6 dB, worst of nine tones: cascade %.1f dBc (%.1f in 0..20 kHz), Kaiser %.1f dBc (%.1f in 0..20 kHz)\n",
                      totC, inC, totK, inK);
@@ -598,32 +599,34 @@ static void runCascadeTopologyTests()
                                                    + " total, " + std::to_string (inK) + " in band)");
 
         // The same measure for Tube and Transistor, against Tanh's number at the same operating point and topology:
-        // neither curve may alias more than 3 dB above it, in total or inside 0..20 kHz. Tube is measured with its DC
-        // blocker off for that, and on — as it plays — beside it: with the blocker on, the in-band column reads the
-        // blocker's own float rounding noise at 8..27 Hz (about -124 dBc, Asym with the blocker on reads the same), not
-        // aliasing, so that row is gated on the total only.
+        // neither curve may alias more than 3 dB above it, in total or inside 0..20 kHz. Tube is gated with its DC
+        // blocker off. The blocker-on rows (Tube, and Asym beside it) are printed only: their non-harmonic energy is
+        // the float blocker's own rounding noise at 8..27 Hz, lifted by its pole — a double-precision blocker in its
+        // place empties those bins — so they measure the blocker, not aliasing, and move with the platform's tanh.
         for (Topology topo : { Topology::Cascade, Topology::Kaiser })
         {
-            struct Row { const char* name; Shape shape; float dcHz; bool inBand; double tot = -1e9, in = -1e9; };
-            Row rows[] { { "Tanh", Shape::Tanh, 10.0f, true }, { "Tube (blocker off)", Shape::Tube, 0.0f, true },
-                         { "Tube (blocker on)", Shape::Tube, 10.0f, false }, { "Transistor", Shape::Transistor, 10.0f, true } };
+            struct Row { const char* name; Shape shape; float bias, dcHz; bool gated; double tot = -1e9, in = -1e9; };
+            Row rows[] { { "Tanh", Shape::Tanh, 0.0f, 10.0f, false }, { "Tube (blocker off)", Shape::Tube, 0.0f, 0.0f, true },
+                         { "Transistor", Shape::Transistor, 0.0f, 10.0f, true },
+                         { "Tube (blocker on)", Shape::Tube, 0.0f, 10.0f, false },
+                         { "Asym bias 0.3 (blocker on)", Shape::Asym, 0.3f, 10.0f, false } };
             for (Row& r : rows)
                 for (int k = 0; k < 9; ++k)
                 {
                     const int b = (int) std::lround ((0.150 + 0.005 * k) * kW);
-                    const auto m = spectrum (fs, topo, r.shape, 6.0f, 0.0f, b, 0.9, r.dcHz);
-                    r.tot = std::max (r.tot, nonHarmonicDbc (m, b, kW / 2));
-                    r.in  = std::max (r.in,  nonHarmonicDbc (m, b, b20k));
+                    const auto m = spectrum (fs, topo, r.shape, 6.0f, r.bias, b, 0.9, r.dcHz);
+                    worse (r.tot, nonHarmonicDbc (m, b, kW / 2));
+                    worse (r.in,  nonHarmonicDbc (m, b, b20k));
                 }
             const std::string tn = topo == Topology::Cascade ? "cascade" : "Kaiser";
             std::printf ("       %s, +6 dB, worst of nine tones, dBc total (in 0..20 kHz):", tn.c_str());
             for (const Row& r : rows) std::printf ("  %s %.1f (%.1f)", r.name, r.tot, r.in);
             std::printf ("\n");
-            for (int i = 1; i < 4; ++i)
-                test::ok (rows[i].tot <= rows[0].tot + 3.0 && (! rows[i].inBand || rows[i].in <= rows[0].in + 3.0),
-                          std::string (rows[i].name) + " aliases within 3 dB of Tanh under the " + tn + " stage ("
-                          + std::to_string (rows[i].tot) + " total, " + std::to_string (rows[i].in) + " in band"
-                          + (rows[i].inBand ? "" : ", not gated") + ")");
+            for (const Row& r : rows)
+                if (r.gated)
+                    test::ok (r.tot <= rows[0].tot + 3.0 && r.in <= rows[0].in + 3.0,
+                              std::string (r.name) + " aliases within 3 dB of Tanh under the " + tn + " stage ("
+                              + std::to_string (r.tot) + " total, " + std::to_string (r.in) + " in band)");
         }
 
         // The reason the guard band exists: content at 0.48 fs (in the don't-care band) through the asymmetric
