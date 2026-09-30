@@ -5,6 +5,64 @@
 Notable changes to felitronics-core. Releases are git tags (`vX.Y.Z`); the project VERSION lives in
 `CMakeLists.txt`.
 
+## v0.57.0 — 2026-09-30
+
+### saturation — Tube and Transistor shapes
+
+`WaveShaper::Shape` gains `Tube` and `Transistor`, appended as 4 and 5 so no existing value moves. Neither has a knob of
+its own: drive, mix, output and autoComp work as for every shape, and `Params::bias` stays Asym's. **Tube** is
+tanh(u+0.3) - tanh(0.3), evaluated as q·t/(1+c·t) so it keeps float precision at low drive (within 1e-6 of a double
+evaluation at every drive; the plain difference is off by 5.1e-4 at driveDb 0). It adds mostly the 2nd harmonic — H2
+leads H3 by 9.3 dB at driveDb 6 and -3 dBFS — its negative peak is the larger one, and the Saturator's DC blocker runs
+for it as for Asym. With autoComp 1 its small-signal slope below 1 (0.936 at the least, near driveDb 3) lifts a
+full-scale sine's peak by up to +0.58 dB before the blocker settles and +0.17 dB after. **Transistor** is
+u/(1+u⁴)^(1/4): odd, with no cubic term, so it is cleaner than Tanh at low drive (H3 -35.3 dBc against Tanh's -28.7 at
+driveDb 6 and -3 dBFS) and harder past its knee; |u| is clamped to 64 so a huge input at a huge drive keeps its sign.
+Tanh, Atan, Cubic and Asym are unchanged bit for bit, settled and gliding.
+
+### saturation — Transformer shape
+
+`WaveShaper::Shape` gains `Transformer`, appended as 6 so no existing value moves. It is the one shape with memory: per
+channel and per oversampled sample the Saturator runs a flux proxy L (a leaky integrator at 40 Hz, unity DC gain) and
+outputs sat(L) + sat'(L)·(x − L) with sat(u) = tanh(k·u)/k — the exact derivative of the saturated flux, with no
+differentiator filter. The low end saturates and the top passes: at driveDb 6 on a full-scale sine (48 kHz, os 4) THD
+is 8.95 % at 20 Hz, 1.40 % at 160 Hz, 0.096 % at 640 Hz and 0.0016 % at 5 kHz, where Tanh has 6.6 %; the same 80 Hz
+THD at 44.1, 48 and 96 kHz to 0.002 dB. It has no knob of its own (drive, mix, output and autoComp; `Params::bias` is
+not read), no hysteresis, no DC blocker and no added latency. The curve is SLOPE-normalised (norm = 1/k, so
+`slopeAtZero()` is exactly 1.0f and drive-compensation is exactly 1.0f): a -60 dBFS multitone comes out within 1.2e-10
+of Tanh at driveDb 0, and the model's output peak never exceeds its input's (at os > 1 the oversampler's own round trip can still
+overshoot, as it does for every shape: +0.467 dB on a 20 Hz square at driveDb 6, against Tanh's +0.727). At os 1 the stage nulls against a
+double-precision evaluation of the model to 9.3e-7. The model state is one float per channel
+(`Saturator::kModelFloats`), in `Storage` and `Storage::bytes()` — which grow by exactly that — zeroed by prepare() and
+reset(), flushed per sample, and gated like the DC blocker, so a channel that leaves and returns, or a switch to another
+shape and back, starts it from zero. Tanh, Atan, Cubic, Asym, Tube and Transistor are unchanged bit for bit, settled
+and gliding.
+
+### saturation — Tape shape
+
+`WaveShaper::Shape` gains `Tape`, appended as 7 so no existing value moves. The Saturator runs it as a model: per channel
+and per oversampled sample, a pre-emphasis E(s) = (1 + s/ω1)/(1 + s/ω2), Tanh's core tanh(k·e)/tanh(k), then the exact
+inverse D = 1/E, with f1 = 1/(2π·50 µs) = 3183.1 Hz (the NAB 15 ips corner) and f2 = f1·10^(6/20) = 6351.1 Hz, a +6 dB
+high shelf. The top reaches the core louder and saturates first: at driveDb 6 (48 kHz, os 4, autoComp 0) the
+fundamental of a 10 kHz sine is 0.5 dB compressed at -11.104 dBFS and that of a 1 kHz sine at -6.429 — 4.675 dB apart,
+where the analog |E(10k)|/|E(1k)| is 4.645 dB — while Tanh compresses both at -6.126. The 10 kHz point stays within
+0.0285 dB across 44.1, 48 and 96 kHz. Since D·E = 1, a -60 dBFS multitone comes out within 6.4e-10 of Tanh at the same
+drive, a full-scale one within 4.17e-7 at driveDb 0, and drive-compensation is Tanh's. Each section is a first-order
+bilinear transform with its own corner prewarped (both exact at every rate), in transposed direct form II. On
+full-scale 1/5/10 kHz sines, a 1 kHz square and band-limited clicks at driveDb 0/6/12 (os 4, autoComp 1), Tape's peak
+is Tanh's or lower to the printed 0.001 dB. At os 1 the stage nulls against a double-precision evaluation of E, the
+core and D to 2.43e-7. Where f2 >= 0.45·fsOs (os 1 below 14113.6 Hz, os 2 below half that) the pair is bypassed and Tape renders Tanh's bits.
+Tape has no knob of its own (`Params::bias` is not read), no head bump, no HF roll-off, no hysteresis, no DC blocker
+and no added latency; a standalone `WaveShaper` set to Tape is Tanh's curve, operand for operand.
+
+`Saturator::kModelFloats` rises from 1 to 2 (the Transformer keeps slot 0, Tape uses slots 0 and 1), so `Storage` and
+`Storage::bytes()` grow by one float per channel. The state is zeroed by prepare() and reset(), flushed per sample and
+gated like the Transformer's. A direct switch between the Transformer and Tape starts the new model from zeroed state:
+at os 1 the switched stage renders what a fresh stage of the new shape renders from the switch on. A drive glide lands
+on the settled stage's bits 20 samples after the landing at os 1 and 9 at os 4, once the de-emphasis state has
+forgotten the glide. Tanh, Atan, Cubic, Asym, Tube, Transistor and Transformer are unchanged bit for bit, settled and
+gliding.
+
 ## v0.56.0 — 2026-09-29
 
 ### limiter — the K13 peak clipper's reduction, sample by sample
