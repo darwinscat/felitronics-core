@@ -38,4 +38,18 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_codecgrid_scan_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_codecgrid_scan_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_codecgrid_scan_tests COMMAND felitronics_codecgrid_scan_tests)
+
+    # The detector's verdicts on programmes made to have one property each.
+    add_executable(felitronics_codecgrid_detector_tests tests/CodecGridDetectorTests.cpp)
+    target_link_libraries(felitronics_codecgrid_detector_tests PRIVATE felitronics::codecgrid)
+    target_include_directories(felitronics_codecgrid_detector_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_codecgrid_detector_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_codecgrid_detector_tests COMMAND felitronics_codecgrid_detector_tests)
+
+    # The detector's form: the call contract (law 11), split invariance, the published storage, no allocation.
+    add_executable(felitronics_codecgrid_law_tests tests/CodecGridLawTests.cpp)
+    target_link_libraries(felitronics_codecgrid_law_tests PRIVATE felitronics::codecgrid)
+    target_include_directories(felitronics_codecgrid_law_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_codecgrid_law_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_codecgrid_law_tests COMMAND felitronics_codecgrid_law_tests)
 endif()

@@ -158,7 +158,8 @@ struct CodecGridResult
 
     float zeroByBand[kZeroBands] {};    // the zero share at the found offset of bestWindow, 32 bands to the top of the transform
     float zeroShare = 0.0f;             // its mean over bands 2 .. 15 — coarser coding, more zeros
-    std::uint64_t nonFiniteSamples = 0; // NaN or infinite samples met in the stretches (read as zero)
+    std::uint64_t nonFiniteSamples = 0; // NaN or infinite samples met in the stretches kept (read as zero); one that lies in
+                                        // two stretches' margins is met twice
 };
 
 template <ComplexFftBackend Fft = MixedRadixFft>
@@ -501,19 +502,26 @@ private:
         advanceWindow();
     }
 
-    // Move to the next usable stretch and order its hypotheses: those the rule has already found somewhere first.
+    // Move to the next usable stretch and order its hypotheses: those the rule has already found somewhere first,
+    // the best score among them first of all — so that the stretch which confirms a grid confirms it with the
+    // hypothesis that reads it best — then the rest in their own order.
     void advanceWindow() noexcept
     {
         do { ++window_; } while (window_ < windows_ && (! readings_[window_].complete || readings_[window_].silent));
         if (window_ >= windows_) { stage_ = Stage::Finalize; return; }
+        double top[kHypotheses] {};
+        bool seen[kHypotheses] {};
+        for (int h = 0; h < kHypotheses; ++h)
+            for (int w = 0; w < window_; ++w)
+                if (readings_[w].hypotheses[h].found)
+                {
+                    seen[h] = true;
+                    top[h] = std::max (top[h], readings_[w].hypotheses[h].reading.score);
+                }
         int n = 0;
-        for (int pass = 0; pass < 2; ++pass)
-            for (int h = 0; h < kHypotheses; ++h)
-            {
-                bool seen = false;
-                for (int w = 0; w < window_; ++w) seen = seen || readings_[w].hypotheses[h].found;
-                if (seen == (pass == 0)) order_[n++] = h;
-            }
+        for (int h = 0; h < kHypotheses; ++h) if (seen[h]) order_[n++] = h;
+        std::stable_sort (order_, order_ + n, [&top] (int a, int b) noexcept { return top[a] > top[b]; });
+        for (int h = 0; h < kHypotheses; ++h) if (! seen[h]) order_[n++] = h;
         position_ = 0;
         resampledWindow_ = -1;
         stage_ = Stage::NextScan;
