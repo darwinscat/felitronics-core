@@ -251,5 +251,58 @@ int main()
         ok (a.offset == 123 && a.cells == kCells / 2, "and the dip in every other cell is counted in exactly 16 cells");
     }
 
+    group ("the rule's numbers are the measured ones");
+    {
+        // The thresholds are what a measurement fixed, not tunables: moving one is changing the instrument, and
+        // has to be done on purpose. Each condition is pinned from both sides.
+        constexpr GridRule rule {};
+        GridReading r;
+        r.score = 9.2;
+        r.localDipSum = 5.01;
+        r.cells = 6;
+        r.second = 4.6;
+        ok (! rule.found (r) && ! rule.several (r), "a score of exactly 9.2 is not over the threshold");
+        r.score = 9.21;
+        ok (rule.found (r) && ! rule.several (r), "9.21 is");
+        r.localDipSum = 5.0;
+        ok (! rule.found (r), "a dip of exactly 5 dB is not deep enough");
+        r.localDipSum = 5.01;
+        r.cells = 5;
+        ok (! rule.found (r), "five cells are not broad enough, six are");
+        r.cells = 6;
+        r.second = 4.61;
+        ok (! rule.found (r) && rule.several (r), "a runner-up over half the winner is `several`, not found");
+    }
+
+    group ("what a score is worth when the frames repeat");
+    {
+        // 30 frames: lags 1 .. 20 are given, periods 1 .. 10 are candidates
+        std::vector<float> rho (20, 0.0f);
+        ok (repeatLag (rho.data(), 30).period == 0, "no correlation at any lag: no repeat");
+        rho[0] = 0.6f;
+        rho[1] = 0.36f;
+        ok (repeatLag (rho.data(), 30).period == 0, "neighbours that resemble each other and fade at two lags are not a repeat");
+        rho[1] = 0.6f;
+        ok (repeatLag (rho.data(), 30).period == 1 && std::fabs (repeatLag (rho.data(), 30).repeat - 0.6) < 1.0e-6, "the same correlation at one lag and at two is one");
+        std::fill (rho.begin(), rho.end(), 0.0f);
+        rho[5] = 0.95f;
+        ok (repeatLag (rho.data(), 30).period == 0, "back at six frames and not at twelve: not a repeat");
+        rho[11] = 0.9f;
+        rho[17] = 0.9f;
+        ok (repeatLag (rho.data(), 30).period == 6 && std::fabs (repeatLag (rho.data(), 30).repeat - 0.9) < 1.0e-6, "back at six and at twelve: every six, by the smaller of the two");
+        rho[2] = 0.5f;
+        rho[5] = 0.5f;
+        ok (repeatLag (rho.data(), 30).period == 3, "a half-repeat every three inflates more than a full one every six would, and is taken");
+        rho[2] = 0.49f;
+        ok (repeatLag (rho.data(), 30).period == 6 && std::fabs (repeatLag (rho.data(), 30).repeat - 0.5) < 1.0e-6, "under the floor at one of its two lags the shorter is out, and the longer stands");
+        ok (repeatLag (rho.data(), 2).period == 0 && repeatLag (rho.data(), 0).period == 0, "fewer than three frames have no candidate lag");
+
+        ok (std::fabs (repeatFactor (1.0, 6, 96) - 0.25) < 1.0e-12, "exact copies every 6 of 96 frames: a quarter — the square root of 6 / 96");
+        ok (std::fabs (repeatFactor (0.5, 6, 96) - 1.0 / std::sqrt (0.5 + 0.5 * 16.0)) < 1.0e-12, "half of each frame coming back: the variance is half one's and half the other's");
+        ok (repeatFactor (0.49, 6, 96) >= 1.0 && repeatFactor (0.0, 0, 96) >= 1.0 && repeatFactor (-1.0, 3, 96) >= 1.0, "under the floor the frames are taken as they are");
+        ok (repeatFactor (std::numeric_limits<double>::quiet_NaN(), 6, 96) >= 1.0 && repeatFactor (1.0, 0, 96) >= 1.0 && repeatFactor (1.0, 6, 0) >= 1.0, "NaN, no period, no frames: the same");
+        ok (std::fabs (repeatFactor (7.0, 6, 96) - 0.25) < 1.0e-12 && repeatFactor (1.0, 96, 96) >= 1.0 && repeatFactor (1.0, 200, 96) >= 1.0, "a correlation over one is one; a period as long as the stretch inflates nothing");
+    }
+
     return felitronics::test::report();
 }

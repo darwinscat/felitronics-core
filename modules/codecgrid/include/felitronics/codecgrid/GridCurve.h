@@ -391,6 +391,44 @@ inline GridReading readCurve (const float* curve, int offsets, const ReadScratch
     return out;
 }
 
+// Frames that repeat are not independent readings (GridScan::frameRepeat). With a share `repeat` of a frame's
+// signature coming back every `period` frames, the variance of the mean over `frames` of them is
+// (1 - repeat) / frames + repeat / period of one frame's — against 1 / frames, which is what the score assumes. The
+// score is worth this factor of itself: 1 for frames that do not repeat, sqrt (period / frames) for exact copies.
+inline constexpr double kRepeatFloor = 0.5;        // under this correlation the frames are taken as they are
+
+// The lag at which a stretch's frames repeat, from rho[p - 1], their correlation with the frames p on, for
+// p = 1 .. 2 * (frames / 3). A repeat comes back at one lag AND at two: the smaller of the two correlations is
+// what counts, it has to reach the floor, and of the lags that do, the one that inflates a score most is taken —
+// the shortest for exact copies. Neighbours that merely resemble each other correlate at one lag and fade at two;
+// that is not a repeat. period 0: the frames do not repeat.
+struct RepeatLag { int period = 0; double repeat = 0.0; };
+
+inline RepeatLag repeatLag (const float* rho, int frames) noexcept
+{
+    RepeatLag out;
+    double best = 0.0;
+    for (int p = 1; p <= frames / 3; ++p)
+    {
+        const double r = (double) std::min (rho[p - 1], rho[2 * p - 1]);
+        if (r >= kRepeatFloor && r / (double) p > best)
+        {
+            best = r / (double) p;
+            out.repeat = r;
+            out.period = p;
+        }
+    }
+    return out;
+}
+
+inline double repeatFactor (double repeat, int period, int frames) noexcept
+{
+    if (! (repeat >= kRepeatFloor) || period < 1 || frames < 1) return 1.0;
+    const double r = repeat < 1.0 ? repeat : 1.0;
+    const double inflation = 1.0 - r + r * (double) frames / (double) period;
+    return inflation > 1.0 ? 1.0 / std::sqrt (inflation) : 1.0;
+}
+
 // Two grid phases agree when they are within `tolerance` samples of each other on the circle of `hop`.
 constexpr bool phasesAgree (int a, int b, int hop, int tolerance) noexcept
 {

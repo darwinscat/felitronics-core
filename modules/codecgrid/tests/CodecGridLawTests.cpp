@@ -59,14 +59,79 @@ int main()
         d.setParams (bad);
         ok (! d.prepare (44100.0, 2, (std::uint64_t) n), "a phase ground of one stretch is refused: one stretch agrees with itself");
 
+        // numbers the object could accept and not honour: each would change what a verdict means without a word
+        const auto refused = [&d] (const CodecGridParams& p)
+        {
+            d.setParams (p);
+            return ! d.prepare (44100.0, 2, (std::uint64_t) n) && ! Detector::storageFor (44100.0, 2, (std::uint64_t) n, p).ok;
+        };
+        bad = params();
+        bad.phaseTolerance = Detector::kMaxPhaseTolerance + 1;
+        ok (refused (bad), "a phase tolerance over the ceiling is refused: wide enough, it calls any two offsets one phase");
+        bad.phaseTolerance = Detector::kMaxPhaseTolerance;
+        ok (! refused (bad), "...and the ceiling itself is accepted");
+        bad = params();
+        bad.phaseAgreeWindows = kWindows + 1;
+        ok (refused (bad), "a phase ground of more stretches than there are is refused: it would switch the ground off in silence");
+        bad.phaseAgreeWindows = kWindows;
+        ok (! refused (bad), "...and all of them is accepted");
+        for (double db : { nan, inf, -inf, 0.5, -200.5 })
+        {
+            bad = params();
+            bad.silentWindowDb = db;
+            ok (refused (bad), "a silence level of " + std::to_string (db) + " dB is refused");
+        }
+        for (double v : { nan, inf, 0.0, -1.0 })
+        {
+            bad = params();
+            bad.rule.minScore = v;
+            ok (refused (bad), "a score threshold of " + std::to_string (v) + " is refused");
+            bad = params();
+            bad.rule.maxSecondShare = v;
+            ok (refused (bad), "a runner-up share of " + std::to_string (v) + " is refused");
+        }
+        for (double v : { nan, inf, -1.0 })
+        {
+            bad = params();
+            bad.rule.minDipDb = v;
+            ok (refused (bad), "a depth threshold of " + std::to_string (v) + " dB is refused");
+        }
+        bad = params();
+        bad.rule.maxSecondShare = 1.5;
+        ok (refused (bad), "a runner-up share over one is refused");
+        for (int cells : { 0, -3, kCells + 1 })
+        {
+            bad = params();
+            bad.rule.minCells = cells;
+            ok (refused (bad), "a breadth threshold of " + std::to_string (cells) + " cells is refused");
+        }
+        for (int found : { -1, kWindows + 1 })
+        {
+            bad = params();
+            bad.phaseFoundWindows = found;
+            ok (refused (bad), "a phase ground asking for " + std::to_string (found) + " found stretches is refused");
+        }
+        ok (CodecGridParams {}.phaseTolerance == 1 && CodecGridParams {}.phaseAgreeWindows == 4 && CodecGridParams {}.phaseFoundWindows == 1,
+            "the defaults are the measured ones: one sample of tolerance, four stretches, one of them found by the rule");
+
         // a finished analysis, then a refused prepare(): the old report must be gone
         d.setParams (lawParams (Depth::Verdict));
         ok (d.prepare (44100.0, 2, (std::uint64_t) n) && d.process (planes, 2, n) && d.finish(), "a finished analysis");
         ok (d.result().verdict == Verdict::Confirmed && d.finished() && d.curveOffsets() > 0, "...with a report");
+        ok (d.hypothesis (0).codecRate == 44100 && d.hypothesis (kHypotheses - 1).codecRate == 48000, "...and its seven hypotheses");
         ok (! d.prepare (nan, 2, (std::uint64_t) n), "then a refused prepare()");
         ok (d.result().verdict == Verdict::NotExamined && d.result().reason == Reason::NotFinished && d.result().family == Family::None
                 && d.result().bestWindow < 0 && d.windows() == 0 && d.curveOffsets() == 0 && d.zeroMapRows() == 0 && ! d.finished(),
             "leaves no verdict, no stretch, no curve: nothing of the old report is readable");
+        bool emptyHypotheses = true;
+        for (int h = 0; h < kHypotheses; ++h) emptyHypotheses = emptyHypotheses && d.hypothesis (h).codecRate == 0;
+        ok (emptyHypotheses, "...and no hypothesis of the old run");
+        d.setParams (lawParams (Depth::Verdict));
+        ok (d.prepare (44100.0, 2, (std::uint64_t) n) && d.hypothesis (0).codecRate == 44100 && d.prepare (96000.0, 2, (std::uint64_t) n), "a prepared run, then a rate that is accepted and not examined");
+        emptyHypotheses = true;
+        for (int h = 0; h < kHypotheses; ++h) emptyHypotheses = emptyHypotheses && d.hypothesis (h).codecRate == 0;
+        ok (emptyHypotheses && d.result().verdict == Verdict::NotExamined, "...has no hypotheses either");
+        ok (! d.prepare (nan, 2, (std::uint64_t) n), "unprepared again");
         ok (! d.process (planes, 2, 10) && ! d.finish() && ! d.finishStep() && d.progress() <= 0.0, "...and the object is unprepared: process() and finish() refuse");
         ok (d.window (-1).best < 0 && d.window (99).best < 0 && d.hypothesis (-1).codecRate == 0 && d.hypothesis (99).codecRate == 0, "reading a stretch or a hypothesis that is not there returns an empty one");
     }
@@ -262,6 +327,26 @@ int main()
         ok (d.params().depth == Depth::Verdict && std::fabs (d.params().windowSeconds - kStretch) < 1.0e-12, "params() still says what prepare() installed");
         ok (d.process (planes, 2, n) && d.finish() && scans (d) == kHypotheses + 1, "and the analysis ran with it: eight scans");
         ok (d.prepare (44100.0, 2, (std::uint64_t) n) && d.params().depth == Depth::Exhaustive && std::fabs (d.params().windowSeconds - 1.0) < 1.0e-12, "the next prepare() installs the new ones");
+    }
+
+    group ("a non-finite sample of a mono programme is one sample");
+    {
+        const float inf = std::numeric_limits<float>::infinity();
+        std::uint64_t counted[2] { 0, 0 };
+        for (int channels = 1; channels <= 2; ++channels)
+        {
+            Detector d;
+            d.setParams (lawParams (Depth::Verdict));
+            if (! felitronics::test::run (d.prepare (44100.0, channels, (std::uint64_t) n) && d.windows() == kWindows)) continue;
+            auto holed = coded;
+            const std::size_t at = (std::size_t) Detector::windowStart (Detector::geometryFor (44100.0, kStretch), (std::uint64_t) n, 0) + 100u;   // inside the first stretch, in nobody else's margin
+            for (std::size_t i = 0; i < 10u; ++i) holed.left[at + i] = holed.right[at + i] = inf;
+            const float* in[2] { holed.left.data(), holed.right.data() };
+            ok (d.process (in, channels, n) && d.finish(), std::to_string (channels) + " channel(s): analysed");
+            counted[channels - 1] = d.result().nonFiniteSamples;
+        }
+        std::printf ("  non-finite samples counted: mono %llu, stereo %llu\n", (unsigned long long) counted[0], (unsigned long long) counted[1]);
+        ok (counted[0] == 10u && counted[1] == 20u, "ten holes are ten samples in mono and twenty in stereo");
     }
 
     return felitronics::test::report();

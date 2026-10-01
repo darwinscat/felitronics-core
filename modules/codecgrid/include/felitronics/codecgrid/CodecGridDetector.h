@@ -36,11 +36,22 @@
 //   TwoWindows      two stretches in which the rule finds a grid (GridRule: score, depth, breadth, uniqueness),
 //                   of one codec family at one rate, on EXACTLY the same phase;
 //   PhaseAgreement  the best offset of one hypothesis lands on one phase (within a sample) in at least four of
-//                   the eight stretches — whatever the scores. On a programme without a grid the best offsets
-//                   are scattered, and four of eight landing together by chance is about 1e-5 per hypothesis;
-//                   measured, 146 lossless programmes never had more than three. This ground is what sees a weak
-//                   grid everywhere (HE-AAC from a streaming service: every stretch under the rule's threshold,
-//                   all eight on one phase) and a grid half a sample off after a rate conversion and a crop.
+//                   the eight stretches — whatever their scores — AND the rule finds the grid on that phase in at
+//                   least one of them. This ground is what sees a weak grid everywhere (HE-AAC from a streaming
+//                   service: one stretch over the rule's threshold, all eight on one phase) and a grid half a
+//                   sample off after a rate conversion and a crop.
+//
+// WHAT A RHYTHM DOES, AND THE TWO THINGS THAT ANSWER IT. A programme whose events repeat on a whole number of
+// frames — sample-locked drums at 120, 125 or 150 bpm are on CELT's 20 ms, at 125 bpm on MP3's granule at 48 kHz
+// too — puts its best offset on ONE phase in every stretch, exactly as a codec does, and in sparse material makes
+// a dip deep and broad enough for the rule. Phases agreeing are therefore NOT independent evidence (the chance
+// figure of four of eight landing together, about 1e-5, holds for material without such a period only), which is
+// why that ground asks for a stretch the rule found. And the rule's score counts the frames of a stretch as
+// independent readings, which the frames of such a programme are not: they repeat, the curve's noise is that of one
+// period's worth of them, and its largest offset scores like a grid. So the frames are compared with each other
+// (GridScan::frameRepeat) and a score is taken for what it is worth among the frames that really differ
+// (repeatFactor in GridCurve.h). A reading the rule would accept at face value and does not accept so is
+// `repeated`.
 // One stretch found and nothing to confirm it is `InPlaces`, and is NOT a finding: the one false alarm of the
 // measurement campaign was exactly that — a 1024-sample block structure in two seconds of one programme, and
 // 1024 is both AAC's hop and an ordinary buffer size.
@@ -100,6 +111,8 @@ struct CodecGridParams
     int phaseTolerance = 1;             // samples: two best offsets this close are one phase
     int phaseAgreeWindows = 4;          // this many stretches on one phase confirm a grid on their own
     double silentWindowDb = -70.0;      // a stretch at or under this level is not examined
+    int phaseFoundWindows = 1;          // ...if the rule finds the grid on that phase in at least this many of them
+    bool countRepeats = true;           // frames that repeat are not counted as independent readings (repeatFactor)
 };
 
 struct Hypothesis
@@ -114,6 +127,10 @@ struct HypothesisReading
     bool scanned = false;
     bool found = false;                 // the rule finds a grid
     bool several = false;               // broad and deep but not unique
+    bool repeated = false;              // the rule would find it had its frames been independent readings; they repeat
+    float repeat = 0.0f;                // GridScan::FrameRepeat at the reading's offset: how much of a frame comes back...
+    int repeatPeriod = 0;               // ...every this many frames (0: the frames do not repeat)
+    double scoreFactor = 1.0;           // repeatFactor(): what the reading's score and runner-up are worth
     int gridPhase = 0;                  // (offset + the stretch's start at the codec's rate) mod hop
     GridReading reading;
 };
@@ -171,6 +188,9 @@ public:
     static constexpr int kMaxZeroRows = 192;             // frames of the zero map kept: 2 s holds at most 167 granules
     static constexpr int kOffsetsPerStep = 32;           // one finishStep() of a scan
     static constexpr double kMaxSampleRate = 768000.0;
+    static constexpr int kMaxPhaseTolerance = 4;         // samples; the measurement used 1
+    static constexpr double kMinSilentWindowDb = -200.0;
+    static constexpr double kMaxRuleNumber = 1.0e6;
     static constexpr std::uint64_t kMaxFrames = std::uint64_t (1) << 40;
 
     //==============================================================================
@@ -246,7 +266,17 @@ public:
         if (channels < 1 || channels > core::kMaxChannels) return s;
         if (totalFrames > kMaxFrames) return s;
         if (! (p.windowSeconds >= kMinWindowSeconds && p.windowSeconds <= kMaxWindowSeconds)) return s;
-        if (p.phaseTolerance < 0 || p.phaseAgreeWindows < 2) return s;
+        // a number the object could accept and not honour is refused: each of these would change what a verdict
+        // means without a word (a tolerance of half a hop calls any two offsets one phase; more stretches than
+        // there are switches the phase ground off; a NaN level reads every stretch as silent)
+        if (p.phaseTolerance < 0 || p.phaseTolerance > kMaxPhaseTolerance) return s;
+        if (p.phaseAgreeWindows < 2 || p.phaseAgreeWindows > kWindows) return s;
+        if (! (p.silentWindowDb >= kMinSilentWindowDb && p.silentWindowDb <= 0.0)) return s;                // NaN fails
+        if (! (p.rule.minScore > 0.0 && p.rule.minScore <= kMaxRuleNumber)) return s;
+        if (! (p.rule.minDipDb >= 0.0 && p.rule.minDipDb <= kMaxRuleNumber)) return s;
+        if (p.rule.minCells < 1 || p.rule.minCells > kCells) return s;
+        if (p.phaseFoundWindows < 0 || p.phaseFoundWindows > kWindows) return s;
+        if (! (p.rule.maxSecondShare > 0.0 && p.rule.maxSecondShare <= 1.0)) return s;
         s.ok = true;
         const Geometry g = geometryFor (sampleRate, p.windowSeconds);
         if (! g.ok) return s;
@@ -272,16 +302,7 @@ public:
     [[nodiscard]] bool prepare (double sampleRate, int channels, std::uint64_t totalFrames)
     {
         // law 11b: disarm, validate, write
-        prepared_ = false;
-        finished_ = false;
-        stage_ = Stage::Ready;
-        channels_ = 0;
-        total_ = 0;
-        seen_ = 0;
-        windows_ = 0;
-        geometry_ = Geometry {};
-        installed_ = CodecGridParams {};
-        clearReport();
+        disarm();
         const Storage st = storageFor (sampleRate, channels, totalFrames, params_);
         if (! st.ok) return false;
 
@@ -302,8 +323,11 @@ public:
             readDoubles_.assign (st.readDoubles, 0.0);
             zeroMap_.assign (st.zeroMapBytes, std::uint8_t (0));
             const auto ratio = BackResampler::ratioFor (geometry_.rate, geometry_.other);
-            if (! resampler_.prepare (ratio.up, ratio.down)) return false;
-            if (! scan_.prepare (std::max (geometry_.length, geometry_.otherLength))) return false;
+            if (! resampler_.prepare (ratio.up, ratio.down) || ! scan_.prepare (std::max (geometry_.length, geometry_.otherLength)))
+            {
+                disarm();                 // a refusal this late leaves nothing written either
+                return false;
+            }
             // the seven hypotheses, in the order they are tried
             const Transform order[3] { Transform::Mp3, Transform::AacSine, Transform::AacKbd };
             int h = 0;
@@ -361,7 +385,7 @@ public:
                 const bool lf = std::isfinite (l), rf = std::isfinite (r);
                 dl[i] = lf ? l : 0.0f;
                 dr[i] = rf ? r : 0.0f;
-                nonFinite_ += (lf ? 0u : 1u) + (rf ? 0u : 1u);
+                nonFinite_ += (lf ? 0u : 1u) + (channels_ > 1 && ! rf ? 1u : 0u);       // a mono sample is one sample
             }
         }
         seen_ = b;
@@ -439,6 +463,23 @@ private:
             ++count;
         }
         return count;
+    }
+
+    // What a refused prepare() leaves: nothing prepared and nothing of an earlier run readable — the hypotheses
+    // of that run included.
+    void disarm() noexcept
+    {
+        prepared_ = false;
+        finished_ = false;
+        stage_ = Stage::Ready;
+        channels_ = 0;
+        total_ = 0;
+        seen_ = 0;
+        windows_ = 0;
+        geometry_ = Geometry {};
+        installed_ = CodecGridParams {};
+        for (Hypothesis& h : hypotheses_) h = Hypothesis {};
+        clearReport();
     }
 
     void clearReport() noexcept
@@ -595,8 +636,16 @@ private:
         HypothesisReading& hr = readings_[window_].hypotheses[current_];
         hr.reading = readCurve (curve_.data(), hop, scratch);
         hr.scanned = true;
-        hr.found = installed_.rule.found (hr.reading);
-        hr.several = installed_.rule.several (hr.reading);
+        const auto frames = scan_.frameRepeat (hr.reading.offset);
+        hr.repeat = frames.repeat;
+        hr.repeatPeriod = frames.period;
+        hr.scoreFactor = installed_.countRepeats ? repeatFactor ((double) frames.repeat, frames.period, frames.frames) : 1.0;
+        GridReading worth = hr.reading;                  // the score and the runner-up in sigmas of the frames there really are
+        worth.score *= hr.scoreFactor;
+        worth.second *= hr.scoreFactor;
+        hr.found = installed_.rule.found (worth);
+        hr.several = installed_.rule.several (worth);
+        hr.repeated = ! hr.found && installed_.rule.found (hr.reading);
         hr.gridPhase = (int) (((std::uint64_t) hr.reading.offset + startAtRate (window_, hypotheses_[current_].codecRate)) % (std::uint64_t) hop);
 
         WindowReading& wr = readings_[window_];
@@ -692,6 +741,21 @@ private:
             int phase = 0;
             const int count = agreement (h, phase);
             if (count < installed_.phaseAgreeWindows) continue;
+            // ...and the rule must have found this grid on this phase somewhere: agreeing phases alone are what a
+            // rhythm on the frame's period gives
+            int foundOn = 0;
+            for (int w = 0; w < windows_; ++w)
+            {
+                bool on = false;
+                for (int k = 0; k < kHypotheses; ++k)
+                {
+                    const HypothesisReading& other = readings_[w].hypotheses[k];
+                    on = on || (other.found && sameGrid (k, familyOf (hypotheses_[h].transform), hypotheses_[h].codecRate)
+                                && phasesAgree (other.gridPhase, phase, hopFor (h), installed_.phaseTolerance));
+                }
+                if (on) ++foundOn;
+            }
+            if (foundOn < installed_.phaseFoundWindows) continue;
             double score = 0.0;
             for (int w = 0; w < windows_; ++w)
                 if (readings_[w].hypotheses[h].scanned && phasesAgree (readings_[w].hypotheses[h].gridPhase, phase, hopFor (h), installed_.phaseTolerance))
@@ -706,7 +770,6 @@ private:
             // THE RULE'S GROUND. The phase is the one most stretches of the family were found on; the hypothesis
             // reported is the one found most often there (for AAC: which window read it best), then the best score.
             verdict = Verdict::Confirmed;
-            result_.ground = agreeHyp >= 0 ? Ground::Both : Ground::TwoWindows;
             int most = 0;
             for (int w = 0; w < windows_; ++w)
                 for (int h = 0; h < kHypotheses; ++h)
@@ -723,6 +786,8 @@ private:
                     }
                     if (count > most) { most = count; phase = p; }
                 }
+            // both grounds only when the phase the stretches agree on is the phase reported
+            result_.ground = agreeHyp >= 0 && phasesAgree (agreePhase, phase, hopFor (agreeHyp), installed_.phaseTolerance) ? Ground::Both : Ground::TwoWindows;
             int best = -1;
             double top = 0.0;
             for (int h = 0; h < kHypotheses; ++h)

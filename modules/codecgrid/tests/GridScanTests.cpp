@@ -90,6 +90,8 @@ int main()
             std::printf ("    %-9s at %4d: found %4d, score %7.1f, runner-up %5.1f, dip %6.1f dB, cells %2d\n", nameOf (c.t), c.offset,
                          s.reading.offset, s.reading.score, s.reading.second, s.reading.localDipSum, s.reading.cells);
             ok (s.reading.offset == c.offset, tag + "the offset is the one it was coded at");
+            const auto repeat = scanner.frameRepeat (s.reading.offset);
+            ok (repeat.frames > 0 && repeat.period == 0, tag + "its frames do not repeat: the score stands");
             ok (rule.found (s.reading) && s.reading.cells >= 24, tag + "the rule finds it, in at least 24 of the 32 cells");
 
             float share[kZeroBands];
@@ -215,6 +217,75 @@ int main()
         const auto after = alloc::count.load();
         ok (accepted, "the four scans were accepted");
         felitronics::test::okNoAlloc (after == before, "begin(), step() and zeroProfile() did not allocate");
+    }
+
+    group ("a rhythm on the frame's period makes a dip the rule accepts, and the frames say it is not a grid");
+    {
+        // One noise burst, the same samples every time, every 5292 samples of 44.1 kHz: a sixteenth note at 125 bpm,
+        // 120 ms, six frames of CELT. Nothing in it was ever coded. Two seconds, taken back to 48 kHz as the
+        // detector does for that hypothesis.
+        const int n44 = 90000, n48 = 96000, period = 5292, length = 2646;
+        BackResampler rs;
+        GridScan<> wide;
+        int fooled = 0;
+        if (felitronics::test::run (rs.prepare (160, 147) && wide.prepare (n48)))
+            for (std::uint32_t seed : { 1u, 4u, 22u, 38u, 54u })      // 22, 38 and 54 are the three of the first sixty that fool the rule
+            {
+                std::uint32_t state = seed * 2654435761u;
+                const auto noise = [&state]() noexcept
+                {
+                    float v = 0.0f;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        state = state * 1664525u + 1013904223u;
+                        v += (float) (state >> 8) * (1.0f / 16777216.0f);
+                    }
+                    return (v - 2.0f) * 1.7320508f;
+                };
+                std::vector<float> burst ((std::size_t) length);
+                float previous = noise();
+                for (int i = 0; i < length; ++i)
+                {
+                    const float v = noise();
+                    burst[(std::size_t) i] = (v - previous) * (float) std::exp (-(double) i / 352.8);
+                    previous = v;
+                }
+                std::vector<float> l44 ((std::size_t) n44, 0.0f), r44 ((std::size_t) n44, 0.0f);
+                for (int at = 0; at + length < n44; at += period)
+                    for (int i = 0; i < length; ++i)
+                    {
+                        l44[(std::size_t) (at + i)] += 0.072f * burst[(std::size_t) i];
+                        r44[(std::size_t) (at + i)] += 0.072f * burst[(std::size_t) i];
+                    }
+                for (int i = 0; i < n44; ++i)
+                {
+                    l44[(std::size_t) i] += 0.0006f * noise();
+                    r44[(std::size_t) i] += 0.0006f * noise();
+                }
+                synthetic::Stereo x;
+                x.left.assign ((std::size_t) n48, 0.0f);
+                x.right.assign ((std::size_t) n48, 0.0f);
+                rs.resample (l44.data(), n44, 200, n48, x.left.data());
+                rs.resample (r44.data(), n44, 200, n48, x.right.data());
+                const Scanned s = scan (wide, Transform::Celt, x);
+                const auto repeat = wide.frameRepeat (s.reading.offset);
+                const double factor = repeatFactor ((double) repeat.repeat, repeat.period, repeat.frames);
+                GridReading worth = s.reading;
+                worth.score *= factor;
+                worth.second *= factor;
+                const bool found = rule.found (s.reading);
+                if (found) ++fooled;
+                std::printf ("    burst %u: score %5.1f, runner-up %4.1f, dip %5.1f dB, cells %2d%s; %d frames repeat every %d by %.3f: the score is worth %.1f\n",
+                             (unsigned) seed, s.reading.score, s.reading.second, s.reading.localDipSum, s.reading.cells, found ? ", FOUND by the rule" : "",
+                             repeat.frames, repeat.period, (double) repeat.repeat, worth.score);
+                const std::string tag = "burst " + std::to_string (seed) + ": ";
+                ok (s.ran && repeat.frames > 90 && repeat.period == 6 && repeat.repeat > 0.75f, tag + "the frames repeat every six");
+                ok (! rule.found (worth) && worth.score < 0.75 * rule.minScore, tag + "and for what it is worth among six different frames the score is far under the rule's");
+            }
+        ok (fooled >= 1, "at face value the rule finds a grid in at least one of them");
+        ok (wide.frameRepeat (-1).frames == 0 && wide.frameRepeat (hopOf (Transform::Celt)).frames == 0, "an offset that is not there has no reading");
+        GridScan<> fresh;
+        ok (fresh.prepare (4096) && fresh.frameRepeat (0).frames == 0, "nor has a scan that was never run");
     }
 
     group ("the back resampler: zero phase, unity gain, and the published length");

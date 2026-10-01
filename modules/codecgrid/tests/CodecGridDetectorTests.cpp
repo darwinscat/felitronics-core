@@ -144,7 +144,7 @@ int main()
         }
     }
 
-    group ("a grid too weak for the rule, on one phase in every stretch: confirmed by the phase alone");
+    group ("a grid too weak for the rule, on one phase in every stretch: confirmed by the phase once the rule finds one stretch");
     {
         // the coded programme under another, uncoded one at half its level
         auto x = synthetic::coded (original44, Transform::AacSine, 480, 0.3);
@@ -160,9 +160,44 @@ int main()
             print ("AAC under an uncoded programme", *d);
             const auto& r = d->result();
             ok (r.windowsFound == 0, "the rule finds it in no stretch");
+            ok (r.verdict == Verdict::NoGrid && r.ground == Ground::None, "so it is not confirmed: phases that agree are what a rhythm on the frame's period gives too");
+            ok (scans (*d) == 8 * kHypotheses, "it cost every scan");
+        }
+        // the ground as it was first measured, on the phase alone: the same programme is confirmed
+        auto alone = params();
+        alone.phaseFoundWindows = 0;
+        const auto a = analyse (x, 44100.0, alone);
+        if (felitronics::test::run (a != nullptr))
+        {
+            const auto& r = a->result();
+            ok (r.windowsFound == 0 && r.verdict == Verdict::Confirmed && r.ground == Ground::PhaseAgreement, "asked for no found stretch, the phase alone confirms it");
+            ok (r.family == Family::Aac && r.codecRate == 44100 && r.gridPhase == 480 && r.windowsAgreeing >= 4, "the family, the rate and the phase are the grid's");
+        }
+        // one stretch in the clear — the coded programme alone — and the default ground confirms
+        const auto clean = synthetic::coded (original44, Transform::AacSine, 480, 0.3);
+        const auto geometry = Detector::geometryFor (44100.0, kStretchSeconds);
+        const std::size_t from = (std::size_t) Detector::windowStart (geometry, (std::uint64_t) n44, 3);
+        const auto one = spliced (x, clean, from, from + (std::size_t) geometry.length);
+        const auto e = analyse (one, 44100.0, params());
+        if (felitronics::test::run (e != nullptr))
+        {
+            print ("the same, one stretch in the clear", *e);
+            const auto& r = e->result();
+            ok (r.windowsFound == 1, "the rule finds it in that one stretch");
             ok (r.verdict == Verdict::Confirmed && r.ground == Ground::PhaseAgreement, "and it is confirmed, by the phase ground");
             ok (r.family == Family::Aac && r.codecRate == 44100 && r.gridPhase == 480 && r.windowsAgreeing >= 4, "the family, the rate and the phase are the grid's");
-            ok (scans (*d) == 8 * kHypotheses, "it cost every scan: the phase ground has no early exit");
+        }
+        // the frames of a coded programme that does not repeat are taken as they are
+        if (felitronics::test::run (e != nullptr))
+        {
+            bool asTheyAre = true;
+            for (int w = 0; w < e->windows(); ++w)
+                for (int h = 0; h < kHypotheses; ++h)
+                {
+                    const auto& hr = e->window (w).hypotheses[h];
+                    asTheyAre = asTheyAre && (! hr.found || (hr.repeatPeriod == 0 && ! hr.repeated && hr.scoreFactor >= 1.0));
+                }
+            ok (asTheyAre, "a found reading of a programme that does not repeat has its score at face value");
         }
     }
 
@@ -230,6 +265,48 @@ int main()
                 several = several && any;
             }
             ok (several, "every stretch has a reading that is `several`");
+        }
+    }
+
+    group ("frames that repeat: a score is taken for what it is worth among the frames that differ");
+    {
+        // A programme that repeats every two frames of CELT at 48 kHz, coded on that grid. The grid is real and every
+        // frame carries it — but a stretch has two different frames in it, however many it holds.
+        constexpr int n48 = 48000 * 3, tile = 2 * 960;
+        auto periodic = synthetic::programme (n48, 31u);
+        for (int i = tile; i < n48; ++i)
+        {
+            periodic.left[(std::size_t) i] = periodic.left[(std::size_t) (i % tile)];
+            periodic.right[(std::size_t) i] = periodic.right[(std::size_t) (i % tile)];
+        }
+        const auto x = synthetic::coded (periodic, Transform::Celt, 0, 0.3);
+        auto face = params();
+        face.countRepeats = false;
+        const auto f = analyse (x, 48000.0, face);
+        const auto c = analyse (x, 48000.0, params());
+        if (felitronics::test::run (f != nullptr && c != nullptr))
+        {
+            const int celt = kHypotheses - 1;
+            const HypothesisReading atFace = f->window (0).hypotheses[celt], counted = c->window (0).hypotheses[celt];
+            std::printf ("    score %.1f at face value; the frames repeat every %d by %.3f, and it is worth %.3f of that\n",
+                         atFace.reading.score, counted.repeatPeriod, (double) counted.repeat, counted.scoreFactor);
+            ok (atFace.found && atFace.scoreFactor >= 1.0 && f->result().verdict == Verdict::Confirmed, "repeats not counted: the grid is found at the face value of its score");
+            ok (counted.repeatPeriod == 2 && counted.repeat > 0.9f && counted.scoreFactor > 0.3 && counted.scoreFactor < 0.6,
+                "repeats counted: the frames come back every two, and the score is worth about the square root of two frames in ten");
+            ok (counted.found && ! counted.repeated && c->result().verdict == Verdict::Confirmed && c->result().family == Family::Celt, "a grid this strong is found all the same");
+            // a threshold between what the score is worth and its face value tells the two apart
+            auto between = params();
+            between.rule.minScore = atFace.reading.score * 0.5 * (1.0 + counted.scoreFactor);
+            const auto refused = analyse (x, 48000.0, between);
+            between.countRepeats = false;
+            const auto accepted = analyse (x, 48000.0, between);
+            if (felitronics::test::run (refused != nullptr && accepted != nullptr))
+            {
+                const HypothesisReading r = refused->window (0).hypotheses[celt];
+                ok (! r.found && r.repeated && refused->result().windowsFound == 0 && refused->result().verdict != Verdict::Confirmed,
+                    "under such a threshold the reading is `repeated`, not found, and nothing is confirmed");
+                ok (accepted->window (0).hypotheses[celt].found && accepted->result().verdict == Verdict::Confirmed, "...and at face value it is found");
+            }
         }
     }
 

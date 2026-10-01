@@ -8,6 +8,7 @@
 #include <felitronics/codecgrid/Mp3Hybrid.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -80,7 +81,8 @@ public:
         if (maxSamples <= 0) return 0;
         const std::uint64_t n = (std::uint64_t) maxSamples;
         const std::uint64_t sub = 2u * (n / 32u + 1u) * 32u;                         // the subband samples of both channels
-        return sizeof (float) * (sub + 2u * n + 2u * (std::uint64_t) kMaxLines + (std::uint64_t) LevelAccumulator::floatsFor (kMaxLines))
+        return sizeof (float) * (sub + 2u * n + 2u * (std::uint64_t) kMaxLines + (std::uint64_t) LevelAccumulator::floatsFor (kMaxLines)
+                                 + (std::uint64_t) supportFloatsFor (maxSamples))
              + sizeof (double) * ((std::uint64_t) LevelAccumulator::doublesFor (kMaxLines) + (std::uint64_t) kAacFrame + (std::uint64_t) kAacFrame / 2u + 1u)
              + 2u * (std::uint64_t) Mdct<Fft>::bytesFor (kAacFrame) + (std::uint64_t) Mdct<Fft>::bytesFor (kCeltFrame);
     }
@@ -107,6 +109,7 @@ public:
         lines_[1].assign ((std::size_t) kMaxLines, 0.0f);
         floats_.assign (LevelAccumulator::floatsFor (kMaxLines), 0.0f);
         doubles_.assign (LevelAccumulator::doublesFor (kMaxLines), 0.0);
+        support_.assign (supportFloatsFor (maxSamples), 0.0f);
         maxSamples_ = maxSamples;
         prepared_ = true;
         return true;
@@ -206,7 +209,102 @@ public:
         return rows;
     }
 
+    // DO THE FRAMES REPEAT? The score counts the frames of a stretch as independent readings: the curve is their
+    // mean, and its noise from offset to offset falls as the square root of their number. A programme that repeats
+    // on a whole number of frames — sample-locked drums at 125 bpm put the same sixteenth note every six frames of
+    // 20 ms — has only as many DIFFERENT frames as its period holds; the noise of its curve is that of six frames,
+    // not of a hundred, the largest of several hundred offsets then scores like a grid, and it is on the same phase
+    // in every stretch. So the frames are compared with each other: each one's level at the 12 offsets around the
+    // one the curve named (the 2 nearest on each side left out — a real grid's dip lives there), with the frame's
+    // own level and the mean over the frames removed, is a signature; frames p apart are correlated over all of it.
+    //   repeat   the correlation at the lag that inflates the score most, among the lags at which the frames come
+    //            back at or over kRepeatFloor BOTH one lag and two lags on — the smaller of the two; 0 when no lag
+    //            does. Neighbouring frames that merely resemble each other (they overlap by half, and music is
+    //            smooth) correlate at one lag and fade at two: that is not a repeat, and it is in the measurement
+    //            the rule's numbers came from already;
+    //   period   that lag, in frames (up to a third of the stretch's frames).
+    // What to do with it is repeatFactor() in GridCurve.h. Valid for the stretch last scanned to completion, like
+    // zeroProfile(); zeros otherwise.
+    struct FrameRepeat { float repeat = 0.0f; int period = 0, frames = 0; };
+
+    static constexpr std::size_t supportFloatsFor (int maxSamples) noexcept
+    {
+        return maxSamples <= 0 ? 0u : (std::size_t) (kSupportSpan + 1) * ((std::size_t) maxSamples / (std::size_t) Mp3Hybrid::kLines + 2u);
+    }
+
+    FrameRepeat frameRepeat (int offset) noexcept
+    {
+        FrameRepeat out;
+        const int hop = active_ ? hopOf (transform_) : 0;
+        if (! active_ || next_ < hop || offset < 0 || offset >= hop) return out;
+        const std::size_t capacity = support_.size() / (std::size_t) (kSupportSpan + 1);
+        float* rows = support_.data();
+        std::size_t frames = capacity;
+        if (transform_ == Transform::Mp3) phaseReady_ = -1;
+        for (int j = 0; j < kSupportSpan; ++j)
+        {
+            float* row = rows + (std::size_t) j * capacity;
+            std::size_t f = 0;
+            forEachFrame (detail::mirrored (offset - kLocalHalf + j, hop), [&] (const float* l, const float* r) noexcept
+            {
+                if (f >= capacity) return;
+                float cells[kCells];
+                acc_.beginOffset();
+                acc_.addFrame (l, r);
+                acc_.finishOffset (cells);
+                float sum = 0.0f;
+                for (int c = 0; c < kCells; ++c) sum += cells[c];
+                row[f++] = sum;
+            });
+            frames = std::min (frames, f);
+        }
+        out.frames = (int) frames;
+        if (frames < 6u) return out;
+        // the frame's own level out (the median over the offsets), then each offset's mean over the frames
+        for (std::size_t f = 0; f < frames; ++f)
+        {
+            float v[kSupportSpan];
+            for (int j = 0; j < kSupportSpan; ++j) v[j] = rows[(std::size_t) j * capacity + f];
+            std::nth_element (v, v + kLocalHalf, v + kSupportSpan);
+            const float level = v[kLocalHalf];
+            for (int j = 0; j < kSupportSpan; ++j) rows[(std::size_t) j * capacity + f] -= level;
+        }
+        for (int j = 0; j < kSupportSpan; ++j)
+        {
+            float* row = rows + (std::size_t) j * capacity;
+            double mean = 0.0;
+            for (std::size_t f = 0; f < frames; ++f) mean += (double) row[f];
+            mean /= (double) frames;
+            for (std::size_t f = 0; f < frames; ++f) row[f] = (float) ((double) row[f] - mean);
+        }
+        // the correlation of the frames with the frames p on, for every lag that leaves a third of them to compare
+        float* rho = rows + (std::size_t) kSupportSpan * capacity;
+        const std::size_t lags = 2u * (frames / 3u);
+        for (std::size_t p = 1; p <= lags; ++p)
+        {
+            double cross = 0.0, first = 0.0, second = 0.0;
+            for (int j = 0; j < kSupportSpan; ++j)
+            {
+                if (j >= kLocalHalf - 2 && j <= kLocalHalf + 2) continue;
+                const float* row = rows + (std::size_t) j * capacity;
+                for (std::size_t f = 0; f + p < frames; ++f)
+                {
+                    const double x = (double) row[f], y = (double) row[f + p];
+                    cross += x * y;
+                    first += x * x;
+                    second += y * y;
+                }
+            }
+            rho[p - 1u] = first > 0.0 && second > 0.0 ? (float) (cross / std::sqrt (first * second)) : 0.0f;
+        }
+        const RepeatLag lag = repeatLag (rho, (int) frames);
+        out.repeat = (float) lag.repeat;
+        out.period = lag.period;
+        return out;
+    }
+
 private:
+    static constexpr int kSupportSpan = 2 * kLocalHalf + 1;
     static constexpr int frameOf (Transform t) noexcept { return t == Transform::Celt ? kCeltFrame : kAacFrame; }
 
     template <class F>
@@ -250,7 +348,7 @@ private:
     Mp3Hybrid mp3_;
     Mdct<Fft> sine_, kbd_, celt_;
     LevelAccumulator acc_;
-    std::vector<float> sub_[2], pre_[2], lines_[2], floats_;
+    std::vector<float> sub_[2], pre_[2], lines_[2], floats_, support_;
     std::vector<double> doubles_;
 };
 

@@ -17,8 +17,16 @@ examined — never "lossless". Long blocks only; HE-AAC, whose core runs at half
 A grid is `Confirmed` on either of two grounds. The rule (`GridRule`: score, depth in decibels, breadth over the 32
 cells of four signals by eight band groups, uniqueness against the best offset more than two samples away) finds it in
 two stretches on exactly the same phase; or the best offset of one hypothesis lands within a sample of one phase in at
-least four of the eight stretches, whatever the scores. One stretch found and nothing to confirm it is `InPlaces`. The
-rule's numbers, the stretch length of 2 s, the eight stretches at tenths of the programme and the phase tolerance are
+least four of the eight stretches and the rule finds the grid on that phase in at least one of them. One stretch found
+and nothing to confirm it is `InPlaces`.
+
+A score counts the frames of a stretch as independent readings, and the frames of a programme that repeats on a whole
+number of frames are not: sample-locked drums at 125 bpm put the same sixteenth note every six frames of 20 ms, the
+noise of the curve is then that of six frames instead of a hundred, its largest offset scores like a grid, and it sits
+on the same phase in every stretch. `GridScan::frameRepeat` compares the frames of a stretch with each other and
+`repeatFactor` says what a score is worth among the frames that differ; a reading the rule accepts only at face value
+is `repeated` and confirms nothing. The suite's rhythm — one noise burst every six frames, never coded — is found by
+the rule at face value with scores of 17.6, 9.9 and 12.8 and is worth 4.5 at most. The rule's numbers, the stretch length of 2 s, the eight stretches at tenths of the programme and the phase tolerance are
 parameters whose defaults were set by a measurement on real encoders that is not part of this repository; the suites
 here prove the mechanism on programmes made to carry a grid — a transform, the smallest 30 % of every frame's
 coefficients set to zero, the inverse — with no codec and no audio file.
@@ -32,9 +40,10 @@ under the peak against its 2M x M sum for the three frames in use; `tests/crossn
 the resampler against numpy and scipy.
 
 The form is the offline measurers': `storageFor()` publishes what `prepare()` takes and it is taken byte for byte
-(10 017 428 bytes at 44.1 kHz and 10 579 028 at 48 kHz with the default stretches); `prepare()` is the only
+(10 029 524 bytes at 44.1 kHz and 10 591 124 at 48 kHz with the default stretches); `prepare()` is the only
 allocation; `process()` keeps a copy of the stretches, takes any split of the programme and gives the same report for
 every split; a request it cannot honour in full is refused whole; `finishStep()` does a bounded piece of the analysis
-per call and `finish()` drives the same steps. A rate other than 44.1 or 48 kHz, a programme shorter than one stretch
+per call and `finish()` drives the same steps. Parameters it could accept and not honour — a phase tolerance wide enough to call any two offsets one phase, more
+agreeing stretches than there are, a NaN anywhere — are refused. A rate other than 44.1 or 48 kHz, a programme shorter than one stretch
 and a silent one are accepted and reported `NotExamined` with the reason. Non-finite samples are read as zero and
 counted.
