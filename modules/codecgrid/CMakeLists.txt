@@ -30,4 +30,12 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_codecgrid_mdct_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_codecgrid_mdct_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_codecgrid_mdct_tests COMMAND felitronics_codecgrid_mdct_tests)
+
+    # The scan on programmes made to carry a grid (a transform, zeros, the inverse — no codec, no audio file),
+    # and the back resampler.
+    add_executable(felitronics_codecgrid_scan_tests tests/GridScanTests.cpp)
+    target_link_libraries(felitronics_codecgrid_scan_tests PRIVATE felitronics::codecgrid)
+    target_include_directories(felitronics_codecgrid_scan_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_codecgrid_scan_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_codecgrid_scan_tests COMMAND felitronics_codecgrid_scan_tests)
 endif()

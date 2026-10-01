@@ -77,9 +77,10 @@ int main()
     group ("the accumulator gives the mean of logarithms, with a logarithm per sixteen frames");
     {
         const int bins = 64, frames = 37;                        // 37 is not a multiple of 16: the last batch is short
-        std::vector<double> store (3 * LevelAccumulator::doublesFor (bins));
+        std::vector<float> floats (LevelAccumulator::floatsFor (bins));
+        std::vector<double> doubles (LevelAccumulator::doublesFor (bins));
         LevelAccumulator acc;
-        acc.attach (store.data(), store.data() + LevelAccumulator::doublesFor (bins), store.data() + 2 * LevelAccumulator::doublesFor (bins), bins);
+        acc.attach (floats.data(), doubles.data(), bins);
 
         Lcg rng { 99u };
         std::vector<float> l ((std::size_t) frames * bins), r ((std::size_t) frames * bins);
@@ -110,18 +111,18 @@ int main()
                     std::vector<double> v ((std::size_t) frames);
                     for (int f = 0; f < frames; ++f)
                     {
-                        const double a = l[(std::size_t) f * bins + (std::size_t) k], b = r[(std::size_t) f * bins + (std::size_t) k];
-                        v[(std::size_t) f] = s == 0 ? a : s == 1 ? b : s == 2 ? 0.5 * (a + b) : 0.5 * (a - b);
+                        const float a = l[(std::size_t) f * bins + (std::size_t) k], b = r[(std::size_t) f * bins + (std::size_t) k];
+                        v[(std::size_t) f] = s == 0 ? a : s == 1 ? b : s == 2 ? 0.5f * (a + b) : 0.5f * (a - b);       // mid and side are single precision
                         power += v[(std::size_t) f] * v[(std::size_t) f];
                     }
                     const double rms = std::sqrt (power / frames) + 1.0e-30;
-                    for (int f = 0; f < frames; ++f) sum += 20.0 * std::log10 (std::fmin (std::fmax (std::fabs (v[(std::size_t) f]) / rms, 1.0e-4), 1.0e12));
+                    for (int f = 0; f < frames; ++f) sum += 20.0 * std::log10 (std::fmin (std::fmax (std::fabs (v[(std::size_t) f]) / rms, kLevelFloor), kLevelCeiling));
                 }
                 const double want = sum / ((bins / kGroups) * frames);
                 worst = std::fmax (worst, std::fabs ((double) cells[s * kGroups + g] - want));
             }
         std::printf ("    worst difference from a logarithm per coefficient: %.3e dB\n", worst);
-        ok (std::isfinite (worst) && worst < 1.0e-4, "the batched product is the same mean (within float storage of the cell)");
+        ok (std::isfinite (worst) && worst < 1.0e-4, "the batched product is the same mean (within single precision of the ratios)");
         bool finite = true;
         for (float c : cells) finite = finite && std::isfinite (c);
         ok (finite, "true zeros and a huge value leave every cell finite");

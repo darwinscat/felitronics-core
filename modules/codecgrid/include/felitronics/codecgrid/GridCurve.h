@@ -37,8 +37,8 @@
 // put every false maximum at offset 0 — so the neighbourhood is MIRRORED at the ends, never wrapped).
 //
 // THE PRODUCT INSTEAD OF A LOGARITHM PER COEFFICIENT. A mean of logarithms is the logarithm of a product, so the
-// ratios are multiplied, sixteen frames at a time, and one logarithm is taken per sixteen — exactly the same sum,
-// a sixteenth of the logarithms. Sixteen ratios in [1e-4, about 1e3] cannot leave a double.
+// ratios are multiplied, sixteen frames at a time, and one logarithm is taken per sixteen — the same sum, a
+// sixteenth of the logarithms. Sixteen ratios in [1e-4, 1e4] cannot leave a double.
 //
 // No allocation anywhere here: every function works in storage the caller owns.
 //==============================================================================
@@ -50,22 +50,40 @@ inline constexpr int kGroups  = 8;                 // band groups per signal
 inline constexpr int kCells   = kSignals * kGroups;
 inline constexpr int kZeroBands = 32;              // the zero share is published in 32 bands
 inline constexpr double kLevelFloor = 1.0e-4;      // a coefficient is read no deeper than 80 dB below its level
+inline constexpr double kLevelCeiling = 1.0e4;     // ...and no higher than 80 dB above it: a guard, not a reading
 inline constexpr double kZeroLevel  = 1.0e-2;      // "a zero": 40 dB below the coefficient's own level
 inline constexpr int kLocalHalf = 8;               // the local median takes this many offsets each side
 inline constexpr int kLogBatch  = 16;              // frames per logarithm
 
 //==============================================================================
 // LevelAccumulator — turns frames of coefficients (left and right, `bins` each) into the 32 cells of one offset.
-// The caller owns the storage: inverseRef, product, logSum — kSignals * bins doubles each.
+//
+// WHERE THE TIME OF A SCAN GOES, measured before this was written: with a SIMD FFT the transform is the smaller
+// part and this loop the larger — in wasm four fifths of a scan. So it is laid out for the vectoriser: one
+// contiguous pass per signal, single precision, no branch in it. The ratios of FOUR frames are multiplied in
+// float ([1e-4, 1e4]^4 stays inside a float), each four are folded into a double product, and every sixteen
+// frames one logarithm is taken.
+//
+// The caller owns the storage: `floatsFor (bins)` floats and `doublesFor (bins)` doubles.
 //==============================================================================
 class LevelAccumulator
 {
 public:
-    static constexpr std::size_t doublesFor (int bins) noexcept { return (std::size_t) kSignals * (std::size_t) bins; }
+    static constexpr int kFloatBatch = 4;           // frames multiplied in single precision
+    static constexpr std::size_t floatsFor (int bins) noexcept { return 10u * (std::size_t) bins; }    // inverse reference, product: 4 x bins each; mid and side: bins each
+    static constexpr std::size_t doublesFor (int bins) noexcept { return 8u * (std::size_t) bins; }    // product and log sum: 4 x bins each
 
-    void attach (double* inverseRef, double* product, double* logSum, int bins) noexcept
+    void attach (float* floats, double* doubles, int bins) noexcept
     {
-        inverseRef_ = inverseRef; product_ = product; logSum_ = logSum; bins_ = bins;
+        bins_ = bins;
+        inverseRef_ = floats;
+        batch_ = floats + (std::size_t) kSignals * (std::size_t) bins;
+        mid_ = floats + 2u * (std::size_t) kSignals * (std::size_t) bins;
+        side_ = mid_ + bins;
+        product_ = doubles;
+        logSum_ = doubles + (std::size_t) kSignals * (std::size_t) bins;
+        frames_ = 0;
+        pending_ = 0;
     }
 
     int bins() const noexcept { return bins_; }
@@ -73,20 +91,19 @@ public:
     //--- the reference level: the rms of every (signal, coefficient) over the frames of ONE offset
     void beginReference() noexcept
     {
-        std::fill (logSum_, logSum_ + doublesFor (bins_), 0.0);
+        std::fill (logSum_, logSum_ + total(), 0.0);
         frames_ = 0;
     }
 
     void addReferenceFrame (const float* left, const float* right) noexcept
     {
-        for (int k = 0; k < bins_; ++k)
+        midSide (left, right);
+        const float* v[kSignals] { left, right, mid_, side_ };
+        for (int s = 0; s < kSignals; ++s)
         {
-            const double l = (double) left[k], r = (double) right[k];
-            const double m = 0.5 * (l + r), s = 0.5 * (l - r);
-            logSum_[(std::size_t) k]             += l * l;
-            logSum_[(std::size_t) (bins_ + k)]     += r * r;
-            logSum_[(std::size_t) (2 * bins_ + k)] += m * m;
-            logSum_[(std::size_t) (3 * bins_ + k)] += s * s;
+            double* acc = logSum_ + (std::size_t) s * (std::size_t) bins_;
+            const float* x = v[s];
+            for (int k = 0; k < bins_; ++k) acc[k] += (double) x[k] * (double) x[k];
         }
         ++frames_;
     }
@@ -95,16 +112,17 @@ public:
     bool finishReference() noexcept
     {
         if (frames_ <= 0) return false;
-        const std::size_t n = doublesFor (bins_);
+        const std::size_t n = total();
         for (std::size_t i = 0; i < n; ++i)
-            inverseRef_[i] = 1.0 / (std::sqrt (logSum_[i] / (double) frames_) + 1.0e-30);
+            inverseRef_[i] = (float) (1.0 / (std::sqrt (logSum_[i] / (double) frames_) + 1.0e-30));
         return true;
     }
 
     //--- one offset
     void beginOffset() noexcept
     {
-        const std::size_t n = doublesFor (bins_);
+        const std::size_t n = total();
+        std::fill (batch_, batch_ + n, 1.0f);
         std::fill (product_, product_ + n, 1.0);
         std::fill (logSum_, logSum_ + n, 0.0);
         frames_ = 0;
@@ -113,28 +131,31 @@ public:
 
     void addFrame (const float* left, const float* right) noexcept
     {
-        const double* ir = inverseRef_;
-        for (int k = 0; k < bins_; ++k)
+        midSide (left, right);
+        const float* v[kSignals] { left, right, mid_, side_ };
+        for (int s = 0; s < kSignals; ++s)
         {
-            const double l = (double) left[k], r = (double) right[k];
-            const double v[kSignals] { l, r, 0.5 * (l + r), 0.5 * (l - r) };
-            for (int s = 0; s < kSignals; ++s)
+            const float* x = v[s];
+            const float* ir = inverseRef_ + (std::size_t) s * (std::size_t) bins_;
+            float* p = batch_ + (std::size_t) s * (std::size_t) bins_;
+            for (int k = 0; k < bins_; ++k)
             {
-                const std::size_t i = (std::size_t) (s * bins_ + k);
-                double ratio = std::fabs (v[s]) * ir[i];
-                if (! (ratio >= kLevelFloor)) ratio = kLevelFloor;     // a NaN is read as the floor, never kept
-                if (ratio > 1.0e12) ratio = 1.0e12;                    // sixteen of these stay inside a double
-                product_[i] *= ratio;
+                float r = std::fabs (x[k]) * ir[k];
+                r = r >= (float) kLevelFloor ? r : (float) kLevelFloor;        // a NaN is read as the floor, never kept
+                r = r <= (float) kLevelCeiling ? r : (float) kLevelCeiling;
+                p[k] *= r;
             }
         }
         ++frames_;
-        if (++pending_ == kLogBatch) flush();
+        ++pending_;
+        if (pending_ % kFloatBatch == 0) fold();
+        if (pending_ == kLogBatch) flush();
     }
 
     // cells: kCells floats, [signal][group]. The mean log level of the offset, in decibels. Zero frames: zeros.
     void finishOffset (float* cells) noexcept
     {
-        if (pending_ > 0) flush();
+        if (pending_ > 0) { fold(); flush(); }
         const int perGroup = bins_ / kGroups;
         for (int s = 0; s < kSignals; ++s)
             for (int g = 0; g < kGroups; ++g)
@@ -150,24 +171,58 @@ public:
 
     //--- the zero share at one offset: per signal, how many coefficients of each of 32 bands sit 40 dB under
     // their own level. counts: kSignals * kZeroBands integers, zeroed by the caller before the first frame.
-    void addZeroFrame (const float* left, const float* right, std::uint32_t* counts) const noexcept
+    // frameShare (optional): kZeroBands floats, the share of zeros of this frame per band, the largest of the
+    // four signals.
+    void addZeroFrame (const float* left, const float* right, std::uint32_t* counts, float* frameShare = nullptr) noexcept
     {
+        midSide (left, right);
+        const float* v[kSignals] { left, right, mid_, side_ };
         const int perBand = bins_ / kZeroBands;
-        for (int k = 0; k < perBand * kZeroBands; ++k)
+        if (frameShare != nullptr) for (int b = 0; b < kZeroBands; ++b) frameShare[b] = 0.0f;
+        for (int s = 0; s < kSignals; ++s)
         {
-            const double l = (double) left[k], r = (double) right[k];
-            const double v[kSignals] { l, r, 0.5 * (l + r), 0.5 * (l - r) };
-            const int band = k / perBand;
-            for (int s = 0; s < kSignals; ++s)
-                if (std::fabs (v[s]) * inverseRef_[(std::size_t) (s * bins_ + k)] < kZeroLevel)
-                    ++counts[s * kZeroBands + band];
+            const float* x = v[s];
+            const float* ir = inverseRef_ + (std::size_t) s * (std::size_t) bins_;
+            for (int b = 0; b < kZeroBands; ++b)
+            {
+                std::uint32_t zeros = 0;
+                for (int k = b * perBand; k < (b + 1) * perBand; ++k)
+                    if (std::fabs (x[k]) * ir[k] < (float) kZeroLevel) ++zeros;
+                counts[s * kZeroBands + b] += zeros;
+                if (frameShare != nullptr)
+                {
+                    const float share = (float) zeros / (float) perBand;
+                    if (share > frameShare[b]) frameShare[b] = share;
+                }
+            }
         }
     }
 
 private:
+    std::size_t total() const noexcept { return (std::size_t) kSignals * (std::size_t) bins_; }
+
+    void midSide (const float* left, const float* right) noexcept
+    {
+        for (int k = 0; k < bins_; ++k)
+        {
+            mid_[k] = 0.5f * (left[k] + right[k]);
+            side_[k] = 0.5f * (left[k] - right[k]);
+        }
+    }
+
+    void fold() noexcept
+    {
+        const std::size_t n = total();
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            product_[i] *= (double) batch_[i];
+            batch_[i] = 1.0f;
+        }
+    }
+
     void flush() noexcept
     {
-        const std::size_t n = doublesFor (bins_);
+        const std::size_t n = total();
         for (std::size_t i = 0; i < n; ++i)
         {
             logSum_[i] += core::det::log10 (product_[i]);
@@ -176,7 +231,10 @@ private:
         pending_ = 0;
     }
 
-    double* inverseRef_ = nullptr;
+    float* inverseRef_ = nullptr;
+    float* batch_ = nullptr;
+    float* mid_ = nullptr;
+    float* side_ = nullptr;
     double* product_ = nullptr;
     double* logSum_ = nullptr;
     int bins_ = 0, frames_ = 0, pending_ = 0;
