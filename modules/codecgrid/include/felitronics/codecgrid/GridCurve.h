@@ -37,8 +37,8 @@
 // put every false maximum at offset 0 — so the neighbourhood is MIRRORED at the ends, never wrapped).
 //
 // THE PRODUCT INSTEAD OF A LOGARITHM PER COEFFICIENT. A mean of logarithms is the logarithm of a product, so the
-// ratios are multiplied, sixteen frames at a time, and one logarithm is taken per sixteen — the same sum, a
-// sixteenth of the logarithms. Sixteen ratios in [1e-4, 1e4] cannot leave a double.
+// ratios are multiplied and the logarithm is taken of the product — the same sum, a small fraction of the
+// logarithms (LevelAccumulator says how small).
 //
 // No allocation anywhere here: every function works in storage the caller owns.
 //==============================================================================
@@ -53,25 +53,35 @@ inline constexpr double kLevelFloor = 1.0e-4;      // a coefficient is read no d
 inline constexpr double kLevelCeiling = 1.0e4;     // ...and no higher than 80 dB above it: a guard, not a reading
 inline constexpr double kZeroLevel  = 1.0e-2;      // "a zero": 40 dB below the coefficient's own level
 inline constexpr int kLocalHalf = 8;               // the local median takes this many offsets each side
-inline constexpr int kLogBatch  = 16;              // frames per logarithm
+inline constexpr int kLogBatch  = 64;              // frames per logarithm: 64 ratios in [1e-4, 1e4] stay inside a double
 
 //==============================================================================
 // LevelAccumulator — turns frames of coefficients (left and right, `bins` each) into the 32 cells of one offset.
 //
 // WHERE THE TIME OF A SCAN GOES, measured before this was written: with a SIMD FFT the transform is the smaller
 // part and this loop the larger — in wasm four fifths of a scan. So it is laid out for the vectoriser: one
-// contiguous pass per signal, single precision, no branch in it. The ratios of FOUR frames are multiplied in
-// float ([1e-4, 1e4]^4 stays inside a float), each four are folded into a double product, and every sixteen
-// frames one logarithm is taken.
+// contiguous pass per signal, single precision, no branch in it, and pointers that are declared not to alias.
+// The ratios of FOUR frames are multiplied in float ([1e-4, 1e4]^4 stays inside a float), each four are folded
+// into a double product, and every 64 frames the products are turned into logarithms — not one per coefficient
+// but one per CELL: a double is a mantissa and an exponent, the exponents of a cell's coefficients add up
+// exactly as integers, the mantissas multiply (128 of them in [1/2, 1) stay inside a double), and
+//
+//     sum of log10 (product) = log10 (the product of the mantissas) + (the sum of the exponents) x log10 (2).
 //
 // The caller owns the storage: `floatsFor (bins)` floats and `doublesFor (bins)` doubles.
 //==============================================================================
+#if defined(_MSC_VER)
+ #define FELITRONICS_CODECGRID_RESTRICT __restrict
+#else
+ #define FELITRONICS_CODECGRID_RESTRICT __restrict__
+#endif
+
 class LevelAccumulator
 {
 public:
     static constexpr int kFloatBatch = 4;           // frames multiplied in single precision
     static constexpr std::size_t floatsFor (int bins) noexcept { return 10u * (std::size_t) bins; }    // inverse reference, product: 4 x bins each; mid and side: bins each
-    static constexpr std::size_t doublesFor (int bins) noexcept { return 8u * (std::size_t) bins; }    // product and log sum: 4 x bins each
+    static constexpr std::size_t doublesFor (int bins) noexcept { return 4u * (std::size_t) bins + kCells; }   // product: 4 x bins; the log sum of each cell
 
     void attach (float* floats, double* doubles, int bins) noexcept
     {
@@ -81,7 +91,7 @@ public:
         mid_ = floats + 2u * (std::size_t) kSignals * (std::size_t) bins;
         side_ = mid_ + bins;
         product_ = doubles;
-        logSum_ = doubles + (std::size_t) kSignals * (std::size_t) bins;
+        cellLog_ = doubles + (std::size_t) kSignals * (std::size_t) bins;
         frames_ = 0;
         pending_ = 0;
     }
@@ -91,20 +101,15 @@ public:
     //--- the reference level: the rms of every (signal, coefficient) over the frames of ONE offset
     void beginReference() noexcept
     {
-        std::fill (logSum_, logSum_ + total(), 0.0);
+        std::fill (product_, product_ + total(), 0.0);
         frames_ = 0;
     }
 
     void addReferenceFrame (const float* left, const float* right) noexcept
     {
-        midSide (left, right);
+        midSide (left, right, mid_, side_, bins_);
         const float* v[kSignals] { left, right, mid_, side_ };
-        for (int s = 0; s < kSignals; ++s)
-        {
-            double* acc = logSum_ + (std::size_t) s * (std::size_t) bins_;
-            const float* x = v[s];
-            for (int k = 0; k < bins_; ++k) acc[k] += (double) x[k] * (double) x[k];
-        }
+        for (int s = 0; s < kSignals; ++s) addSquares (v[s], product_ + (std::size_t) s * (std::size_t) bins_, bins_);
         ++frames_;
     }
 
@@ -114,7 +119,7 @@ public:
         if (frames_ <= 0) return false;
         const std::size_t n = total();
         for (std::size_t i = 0; i < n; ++i)
-            inverseRef_[i] = (float) (1.0 / (std::sqrt (logSum_[i] / (double) frames_) + 1.0e-30));
+            inverseRef_[i] = (float) (1.0 / (std::sqrt (product_[i] / (double) frames_) + 1.0e-30));
         return true;
     }
 
@@ -124,47 +129,34 @@ public:
         const std::size_t n = total();
         std::fill (batch_, batch_ + n, 1.0f);
         std::fill (product_, product_ + n, 1.0);
-        std::fill (logSum_, logSum_ + n, 0.0);
+        std::fill (cellLog_, cellLog_ + kCells, 0.0);
         frames_ = 0;
         pending_ = 0;
     }
 
     void addFrame (const float* left, const float* right) noexcept
     {
-        midSide (left, right);
+        midSide (left, right, mid_, side_, bins_);
         const float* v[kSignals] { left, right, mid_, side_ };
         for (int s = 0; s < kSignals; ++s)
-        {
-            const float* x = v[s];
-            const float* ir = inverseRef_ + (std::size_t) s * (std::size_t) bins_;
-            float* p = batch_ + (std::size_t) s * (std::size_t) bins_;
-            for (int k = 0; k < bins_; ++k)
-            {
-                float r = std::fabs (x[k]) * ir[k];
-                r = r >= (float) kLevelFloor ? r : (float) kLevelFloor;        // a NaN is read as the floor, never kept
-                r = r <= (float) kLevelCeiling ? r : (float) kLevelCeiling;
-                p[k] *= r;
-            }
-        }
+            multiplyRatios (v[s], inverseRef_ + (std::size_t) s * (std::size_t) bins_, batch_ + (std::size_t) s * (std::size_t) bins_, bins_);
         ++frames_;
         ++pending_;
-        if (pending_ % kFloatBatch == 0) fold();
+        if (pending_ % kFloatBatch == 0) fold (batch_, product_, total());
         if (pending_ == kLogBatch) flush();
     }
 
     // cells: kCells floats, [signal][group]. The mean log level of the offset, in decibels. Zero frames: zeros.
     void finishOffset (float* cells) noexcept
     {
-        if (pending_ > 0) { fold(); flush(); }
+        if (pending_ > 0)
+        {
+            fold (batch_, product_, total());
+            flush();
+        }
         const int perGroup = bins_ / kGroups;
-        for (int s = 0; s < kSignals; ++s)
-            for (int g = 0; g < kGroups; ++g)
-            {
-                double acc = 0.0;
-                const double* p = logSum_ + (std::size_t) (s * bins_ + g * perGroup);
-                for (int k = 0; k < perGroup; ++k) acc += p[k];
-                cells[s * kGroups + g] = frames_ > 0 ? (float) (20.0 * acc / ((double) perGroup * (double) frames_)) : 0.0f;
-            }
+        for (int c = 0; c < kCells; ++c)
+            cells[c] = frames_ > 0 ? (float) (20.0 * cellLog_[c] / ((double) perGroup * (double) frames_)) : 0.0f;
     }
 
     int frames() const noexcept { return frames_; }
@@ -175,7 +167,7 @@ public:
     // four signals.
     void addZeroFrame (const float* left, const float* right, std::uint32_t* counts, float* frameShare = nullptr) noexcept
     {
-        midSide (left, right);
+        midSide (left, right, mid_, side_, bins_);
         const float* v[kSignals] { left, right, mid_, side_ };
         const int perBand = bins_ / kZeroBands;
         if (frameShare != nullptr) for (int b = 0; b < kZeroBands; ++b) frameShare[b] = 0.0f;
@@ -201,33 +193,68 @@ public:
 private:
     std::size_t total() const noexcept { return (std::size_t) kSignals * (std::size_t) bins_; }
 
-    void midSide (const float* left, const float* right) noexcept
+    static void midSide (const float* FELITRONICS_CODECGRID_RESTRICT left, const float* FELITRONICS_CODECGRID_RESTRICT right,
+                         float* FELITRONICS_CODECGRID_RESTRICT mid, float* FELITRONICS_CODECGRID_RESTRICT side, int n) noexcept
     {
-        for (int k = 0; k < bins_; ++k)
+        for (int k = 0; k < n; ++k)
         {
-            mid_[k] = 0.5f * (left[k] + right[k]);
-            side_[k] = 0.5f * (left[k] - right[k]);
+            mid[k] = 0.5f * (left[k] + right[k]);
+            side[k] = 0.5f * (left[k] - right[k]);
         }
     }
 
-    void fold() noexcept
+    static void addSquares (const float* FELITRONICS_CODECGRID_RESTRICT x, double* FELITRONICS_CODECGRID_RESTRICT acc, int n) noexcept
     {
-        const std::size_t n = total();
+        for (int k = 0; k < n; ++k) acc[k] += (double) x[k] * (double) x[k];
+    }
+
+    static void multiplyRatios (const float* FELITRONICS_CODECGRID_RESTRICT x, const float* FELITRONICS_CODECGRID_RESTRICT inverseRef,
+                                float* FELITRONICS_CODECGRID_RESTRICT product, int n) noexcept
+    {
+        const float lo = (float) kLevelFloor, hi = (float) kLevelCeiling;
+        for (int k = 0; k < n; ++k)
+        {
+            float r = std::fabs (x[k]) * inverseRef[k];
+            r = r >= lo ? r : lo;                  // a NaN is read as the floor, never kept
+            r = r <= hi ? r : hi;
+            product[k] *= r;
+        }
+    }
+
+    static void fold (float* FELITRONICS_CODECGRID_RESTRICT batch, double* FELITRONICS_CODECGRID_RESTRICT product, std::size_t n) noexcept
+    {
         for (std::size_t i = 0; i < n; ++i)
         {
-            product_[i] *= (double) batch_[i];
-            batch_[i] = 1.0f;
+            product[i] *= (double) batch[i];
+            batch[i] = 1.0f;
         }
     }
 
     void flush() noexcept
     {
-        const std::size_t n = total();
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            logSum_[i] += core::det::log10 (product_[i]);
-            product_[i] = 1.0;
-        }
+        constexpr double kLog10Of2 = 0.30102999566398119521;
+        const int perGroup = bins_ / kGroups;
+        for (int s = 0; s < kSignals; ++s)
+            for (int g = 0; g < kGroups; ++g)
+            {
+                double* p = product_ + (std::size_t) (s * bins_ + g * perGroup);
+                double mantissa = 1.0;
+                long long exponent = 0;
+                for (int k = 0; k < perGroup; ++k)
+                {
+                    int e = 0;
+                    mantissa *= std::frexp (p[k], &e);
+                    exponent += e;
+                    p[k] = 1.0;
+                    if ((k & 127) == 127)                               // 128 mantissas at a time stay far inside a double
+                    {
+                        int em = 0;
+                        mantissa = std::frexp (mantissa, &em);
+                        exponent += em;
+                    }
+                }
+                cellLog_[s * kGroups + g] += core::det::log10 (mantissa) + (double) exponent * kLog10Of2;
+            }
         pending_ = 0;
     }
 
@@ -236,7 +263,7 @@ private:
     float* mid_ = nullptr;
     float* side_ = nullptr;
     double* product_ = nullptr;
-    double* logSum_ = nullptr;
+    double* cellLog_ = nullptr;
     int bins_ = 0, frames_ = 0, pending_ = 0;
 };
 

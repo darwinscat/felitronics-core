@@ -74,9 +74,9 @@ int main()
         ok (phasesAgree (575, 575 + 576, 576, 0) && phasesAgree (-1, 575, 576, 0), "phases are compared modulo the hop, negatives included");
     }
 
-    group ("the accumulator gives the mean of logarithms, with a logarithm per sixteen frames");
+    group ("the accumulator gives the mean of logarithms, with a logarithm per cell and per 64 frames");
     {
-        const int bins = 64, frames = 37;                        // 37 is not a multiple of 16: the last batch is short
+        const int bins = 2048, frames = 150;                     // 256 coefficients a cell: more than one mantissa batch; 150 frames: two full log batches and a short one, not a multiple of four
         std::vector<float> floats (LevelAccumulator::floatsFor (bins));
         std::vector<double> doubles (LevelAccumulator::doublesFor (bins));
         LevelAccumulator acc;

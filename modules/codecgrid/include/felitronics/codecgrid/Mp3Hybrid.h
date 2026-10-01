@@ -62,6 +62,7 @@ public:
                     (float) core::det::cos ((double) ((2 * sb + 1) * (j - 16)) * core::kPi / 64.0);
         for (int n = 0; n < 2 * kBlock; ++n)
             win_[(std::size_t) n] = (float) core::det::sin (core::kPi / 36.0 * ((double) n + 0.5));
+        for (int sb = 0; sb < kSubbands; ++sb) sign_[(std::size_t) sb] = (sb & 1) != 0 ? -1.0f : 1.0f;
         // the DCT-IV the fold leaves: cos (pi / 18 (n + 1/2) (k + 1/2)), written with integers so that the
         // argument is one rounding of an exact product
         for (int n = 0; n < kBlock; ++n)
@@ -121,34 +122,49 @@ public:
 
     // One granule: `sub` points at subband sample (granule start + 18 q) of the array subbands() filled, and 36
     // subband samples are read from there. `lines` takes 576 floats, subband-major: lines[sb * 18 + k].
+    //
+    // The 32 subbands are transformed side by side — every loop below runs across the subbands, which lie next
+    // to each other in `sub` — so the 18 x 18 products are 32 wide instead of 18 long.
     void granule (const float* sub, float* lines) const noexcept
     {
-        for (int sb = 0; sb < kSubbands; ++sb)
+        // the fold of the 36 windowed samples to 18: quarters a b c d of nine samples each ->
+        // u = (-c reversed - d, a - b reversed). The frequency inversion — the odd sample of an odd subband
+        // changes sign, counted inside each block of 18 — is the factor sign_[sb] on the odd samples.
+        float u[kBlock][kSubbands];
+        const auto windowed = [this, sub] (int n, float* out) noexcept
         {
-            // the 36 inputs of this subband, windowed, with the frequency inversion: the odd sample of an odd
-            // subband changes sign, counted inside each block of 18
-            float w[2 * kBlock];
-            for (int n = 0; n < 2 * kBlock; ++n)
+            const float* x = sub + (std::size_t) n * kSubbands;
+            const float w = win_[(std::size_t) n];
+            if (((n % kBlock) & 1) != 0) for (int sb = 0; sb < kSubbands; ++sb) out[sb] = x[sb] * w * sign_[(std::size_t) sb];
+            else                         for (int sb = 0; sb < kSubbands; ++sb) out[sb] = x[sb] * w;
+        };
+        for (int n = 0; n < kBlock / 2; ++n)
+        {
+            float a[kSubbands], b[kSubbands], c[kSubbands], d[kSubbands];
+            windowed (n, a);
+            windowed (kBlock - 1 - n, b);
+            windowed (kBlock + kBlock / 2 - 1 - n, c);
+            windowed (kBlock + kBlock / 2 + n, d);
+            for (int sb = 0; sb < kSubbands; ++sb)
             {
-                const float v = sub[(std::size_t) n * kSubbands + (std::size_t) sb] * win_[(std::size_t) n];
-                w[n] = ((sb & 1) != 0 && ((n % kBlock) & 1) != 0) ? -v : v;
-            }
-            // the fold: quarters a b c d of nine samples each -> u = (-c reversed - d, a - b reversed)
-            float u[kBlock];
-            for (int n = 0; n < kBlock / 2; ++n)
-            {
-                u[n] = -w[kBlock + kBlock / 2 - 1 - n] - w[kBlock + kBlock / 2 + n];
-                u[kBlock / 2 + n] = w[n] - w[kBlock - 1 - n];
-            }
-            float* o = lines + (std::size_t) sb * kBlock;
-            for (int k = 0; k < kBlock; ++k) o[k] = 0.0f;
-            for (int n = 0; n < kBlock; ++n)
-            {
-                const float un = u[n];
-                const float* row = dct_[(std::size_t) n].data();
-                for (int k = 0; k < kBlock; ++k) o[k] += un * row[k];
+                u[n][sb] = -c[sb] - d[sb];
+                u[kBlock / 2 + n][sb] = a[sb] - b[sb];
             }
         }
+        // the DCT-IV, line by line across the subbands
+        float y[kBlock][kSubbands];
+        for (int k = 0; k < kBlock; ++k)
+        {
+            float acc[kSubbands] {};
+            for (int n = 0; n < kBlock; ++n)
+            {
+                const float c = dct_[(std::size_t) n][(std::size_t) k];
+                for (int sb = 0; sb < kSubbands; ++sb) acc[sb] += u[n][sb] * c;
+            }
+            for (int sb = 0; sb < kSubbands; ++sb) y[k][sb] = acc[sb];
+        }
+        for (int sb = 0; sb < kSubbands; ++sb)
+            for (int k = 0; k < kBlock; ++k) lines[(std::size_t) (sb * kBlock + k)] = y[k][sb];
         // the alias reduction between neighbouring subbands, in the encoder's direction
         for (int sb = 1; sb < kSubbands; ++sb)
             for (int i = 0; i < kAliasPairs; ++i)
@@ -167,6 +183,7 @@ private:
     std::array<float, 2 * kBlock> win_ {};
     std::array<std::array<float, kBlock>, kBlock> dct_ {};
     std::array<float, kAliasPairs> cs_ {}, ca_ {};
+    std::array<float, kSubbands> sign_ {};
 };
 
 } // namespace felitronics::codecgrid
