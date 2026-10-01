@@ -52,4 +52,13 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_codecgrid_law_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_codecgrid_law_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_codecgrid_law_tests COMMAND felitronics_codecgrid_law_tests)
+
+    # The optional SIMD backend under the MDCT, the scan and the detector, against the scalar reference.
+    if(FELITRONICS_WITH_PFFFT)
+        add_executable(felitronics_codecgrid_pffft_tests tests/PffftGridTests.cpp)
+        target_link_libraries(felitronics_codecgrid_pffft_tests PRIVATE felitronics::codecgrid felitronics::fftpffft)
+        target_include_directories(felitronics_codecgrid_pffft_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+        target_compile_features(felitronics_codecgrid_pffft_tests PRIVATE cxx_std_20)
+        add_test(NAME felitronics_codecgrid_pffft_tests COMMAND felitronics_codecgrid_pffft_tests)
+    endif()
 endif()

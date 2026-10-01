@@ -30,6 +30,7 @@
 #include <felitronics/codecgrid/Mdct.h>
 #include <felitronics/codecgrid/Mp3Hybrid.h>
 #include <felitronics/codecgrid/Mp3Window.h>
+#include <felitronics/codecgrid/Windows.h>
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
@@ -116,6 +117,7 @@
 #if defined(FELITRONICS_WITH_PFFFT)   // optional compiled SIMD backend — headers only reach the gate when the option is ON
 #include <felitronics/fftpffft/PffftRealFft.h>
 #include <felitronics/fftpffft/PffftOrderedRealFft.h>
+#include <felitronics/fftpffft/PffftComplexFft.h>
 #endif
 
 // The teq compat shims are public too — they are what TabbyEQ/OrbitCab actually include.
@@ -154,6 +156,9 @@ template struct felitronics::analysis::MultiResSpectrumPaneT<14, 4, felitronics:
 template class  felitronics::convolution::MatrixConvolver<felitronics::fftpffft::PffftRealFft>;            // and the ordered one under both panes
 template struct felitronics::analysis::SpectrumPaneT<felitronics::fftpffft::PffftOrderedRealFft>;
 template struct felitronics::analysis::MultiResSpectrumPaneT<14, 4, felitronics::fftpffft::PffftOrderedRealFft>;
+template class  felitronics::codecgrid::Mdct<felitronics::fftpffft::PffftComplexFft>;                   // the complex backend under the MDCT, the scan
+template class  felitronics::codecgrid::GridScan<felitronics::fftpffft::PffftComplexFft>;               // and the detector
+template class  felitronics::codecgrid::CodecGridDetector<felitronics::fftpffft::PffftComplexFft>;
 #endif
 template class  felitronics::eq::MultibandSplitter<4>;
 template class  felitronics::multiband::MultibandProcessor<felitronics::dynamics::Compressor, 4>;

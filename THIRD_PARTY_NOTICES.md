@@ -13,6 +13,7 @@ deps must be AGPL-compatible (BSD / MIT / Apache / MPL-2.0) and are recorded her
 | `analysis` | **none** | Original code (`SpectrumTap`, the spectrum panes). The panes' FFT is a template parameter: the core's own scalar reference by default, or `fftpffft::PffftOrderedRealFft` when a consumer opts into that module (licence recorded on its row). |
 | `dynamics` | **none** | Original code. |
 | `eq` | **none copied** | The matched-filter **method** is from Martin Vicanek's papers — *"Matched Second Order Digital Filters"* (2016) and *"Matched Two-Pole Digital Shelving Filters"* (2024–2025) — **cited inline in `MatchedBiquad.h`**; no third-party code is copied. The Cytomic/Zavalishin TPT SVF (`Svf.h`) likewise implements a published method, not copied code. |
+| `codecgrid` | **no code**; one table of numbers | `Mp3Window.h` holds the 512 coefficients of the MPEG-1 audio polyphase window (ISO/IEC 11172-3, Annex B, table 3-B.3) — numbers the format defines, without which nothing reads an MP3's subbands. This copy of the digits was taken from the public-domain PDMP3 decoder (`pdmp3.c`, `g_synth_dtbl`), not retyped from the standard. The filterbank, the MDCT, the windows of AAC and CELT and the FFT are written here from the standards' formulas; the butterflies of `MixedRadixFft` follow the well-known decomposition kissfft uses (no kissfft source was copied). |
 
 ## Optional compiled modules (opt-in via a CMake option)
 

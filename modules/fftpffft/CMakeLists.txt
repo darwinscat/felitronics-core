@@ -2,7 +2,8 @@
 # the core: it vendors the 2-file original Julien-Pommier pffft (pffft.c/.h; BSD/FFTPACK — see
 # THIRD_PARTY_NOTICES.md) and exposes two RealFftBackends: felitronics::fftpffft::PffftRealFft (z-order,
 # the audio convolvers' backend, vectorised MAC) and PffftOrderedRealFft (packed-Hermitian order, for the
-# spectrum panes and anything that reads bins). Default OFF (option in the root CMakeLists) so the
+# spectrum panes and anything that reads bins) — and PffftComplexFft, pffft's complex transform for any size
+# 2^a 3^b 5^c, the SIMD backend of felitronics::codecgrid's MDCTs. Default OFF (option in the root CMakeLists) so the
 # header-only "link only what you use" and "no external deps" contract is unchanged for every consumer
 # that does not opt in.
 if(NOT FELITRONICS_WITH_PFFFT)
@@ -22,6 +23,7 @@ endif()
 add_library(felitronics_fftpffft STATIC
     src/PffftRealFft.cpp
     src/PffftOrderedRealFft.cpp        # the ORDERED (packed-Hermitian) sibling: for consumers that read bins
+    src/PffftComplexFft.cpp            # the COMPLEX transform (any 2^a 3^b 5^c, a >= 4): the MDCTs of codecgrid
     pffft/pffft.c)
 add_library(felitronics::fftpffft ALIAS felitronics_fftpffft)
 
