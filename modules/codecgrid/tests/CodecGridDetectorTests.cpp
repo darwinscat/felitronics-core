@@ -30,7 +30,7 @@ void print (const char* what, const Detector& d)
 int main()
 {
     std::printf ("felitronics::codecgrid detector verdict tests\n");
-    constexpr int kSeconds = 6;
+    constexpr int kSeconds = 3;
     const int n44 = 44100 * kSeconds, n48 = 48000 * kSeconds;
     const auto original44 = synthetic::programme (n44, 7u);
     const auto original48 = synthetic::programme (n48, 8u);
@@ -56,7 +56,7 @@ int main()
             ok (r.windows == 8 && r.windowsExamined == 8 && r.windowsFound == 8 && r.windowsAgreeing == 8, tag + "eight stretches placed, examined, found, and on the phase");
             ok (r.bestWindow >= 0 && r.bestHypothesis >= 0 && d->hypothesis (r.bestHypothesis).transform == c.t && r.bestOffset >= 0 && r.bestOffset < c.hop
                     && r.bestScore > 100.0, tag + "the published reading is one of this transform, with a score far over the rule's");
-            ok (d->curveOffsets() == c.hop && d->zeroMapRows() > 10, tag + "its curve and its zero map are published");
+            ok (d->curveOffsets() == c.hop && d->zeroMapRows() > 5, tag + "its curve and its zero map are published");
             ok (r.zeroShare > 0.2f && r.zeroShare < 0.5f, tag + "the zero share is about the 30 % that were zeroed");
             // the curve really is that reading's: its deepest summed offset is bestOffset
             int deepest = 0;
@@ -168,7 +168,7 @@ int main()
 
     group ("a grid in ONE stretch is `InPlaces`, not a finding");
     {
-        const auto g = Detector::geometryFor (44100.0, 0.5);
+        const auto g = Detector::geometryFor (44100.0, kStretchSeconds);
         const std::uint64_t start = Detector::windowStart (g, (std::uint64_t) n44, 3);
         const auto coded = synthetic::coded (original44, Transform::AacSine, 480, 0.3);
         const auto x = spliced (original44, coded, (std::size_t) start, (std::size_t) start + (std::size_t) g.length);
@@ -197,7 +197,7 @@ int main()
             bool where = true;
             for (int w = 0; w < 8; ++w)
             {
-                const bool inside = d->window (w).startFrame + 22050u <= (std::uint64_t) n44 / 2u;
+                const bool inside = d->window (w).startFrame + (std::uint64_t) Detector::geometryFor (44100.0, kStretchSeconds).length <= (std::uint64_t) n44 / 2u;
                 const bool outside = d->window (w).startFrame >= (std::uint64_t) n44 / 2u;
                 if (inside) where = where && d->window (w).best >= 0;
                 if (outside) where = where && d->window (w).best < 0;
@@ -210,7 +210,7 @@ int main()
     group ("material cut into pieces, each with its own phase: several grids, not one");
     {
         synthetic::Stereo x = original44;
-        const int piece = 6615;                                 // 150 ms
+        const int piece = 3307;                                 // 75 ms
         const int offsets[5] { 0, 277, 554, 831, 84 };
         synthetic::Stereo codedAt[5];
         for (int i = 0; i < 5; ++i) codedAt[i] = synthetic::coded (original44, Transform::AacSine, offsets[i], 0.3);
@@ -218,7 +218,7 @@ int main()
         const auto d = analyse (x, 44100.0, params());
         if (felitronics::test::run (d != nullptr))
         {
-            print ("AAC in 150 ms pieces", *d);
+            print ("AAC in 75 ms pieces", *d);
             const auto& r = d->result();
             ok (r.verdict == Verdict::SeveralGrids && r.ground == Ground::None, "SeveralGrids: broad and deep in every stretch, unique in none");
             ok (r.family == Family::Aac && r.windowsFound == 0, "the family is named; the rule found nothing");
@@ -258,7 +258,7 @@ int main()
         ok (d.finish() && d.result().verdict == Verdict::NotExamined && d.result().reason == Reason::UnsupportedRate, "NotExamined, UnsupportedRate");
         ok (d.progress() >= 1.0 && d.curveOffsets() == 0 && d.result().bestWindow < 0, "finished, with no curve");
         // too short: one sample under what one stretch and its margins need
-        const auto g = Detector::geometryFor (44100.0, 0.5);
+        const auto g = Detector::geometryFor (44100.0, kStretchSeconds);
         const std::uint64_t least = (std::uint64_t) g.length + 2u * (std::uint64_t) g.margin + (std::uint64_t) g.grid;
         ok (d.prepare (44100.0, 2, least - 1) && d.windows() == 0, "a programme one sample too short is accepted and has no stretch");
         ok (d.process (in, 2, (int) least - 1) && d.finish() && d.result().verdict == Verdict::NotExamined && d.result().reason == Reason::TooShort, "NotExamined, TooShort");
@@ -288,10 +288,10 @@ int main()
 
     group ("a short programme has fewer stretches, and they never share samples");
     {
-        for (double seconds : { 1.1, 1.6, 2.6, 5.1, 6.0 })
+        for (double seconds : { 0.8, 1.1, 1.6, 2.6, 3.0 })
         {
             const std::uint64_t total = (std::uint64_t) (seconds * 44100.0);
-            const auto g = Detector::geometryFor (44100.0, 0.5);
+            const auto g = Detector::geometryFor (44100.0, kStretchSeconds);
             const auto st = Detector::storageFor (44100.0, 2, total, params());
             Detector d;
             d.setParams (params());
@@ -312,13 +312,13 @@ int main()
             std::printf ("    %.1f s: %d stretches\n", seconds, d.windows());
             ok (sane, std::to_string (seconds) + " s: the stretches are on the grid, inside the programme, and do not overlap");
         }
-        // 2.6 s coded: fewer than eight stretches, still confirmed by the rule
-        const int n = (int) (2.6 * 44100.0);
+        // 1.6 s coded: fewer than eight stretches, still confirmed by the rule
+        const int n = (int) (1.6 * 44100.0);
         const auto x = synthetic::coded (synthetic::programme (n, 5u), Transform::AacSine, 480, 0.3);
         const auto d = analyse (x, 44100.0, params());
         if (felitronics::test::run (d != nullptr))
         {
-            print ("AAC, 2.6 s", *d);
+            print ("AAC, 1.6 s", *d);
             ok (d->windows() < 8 && d->windows() >= 2 && d->result().verdict == Verdict::Confirmed && d->result().gridPhase == 480, "a short coded programme is confirmed from the stretches it has");
         }
     }

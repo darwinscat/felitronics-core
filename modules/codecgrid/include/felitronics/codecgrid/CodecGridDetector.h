@@ -204,14 +204,17 @@ public:
         int otherLength = 0, otherMargin = 0;       // at the other rate
     };
 
+    // Exactly this rate: both comparisons hold for it alone, and neither holds for a NaN.
+    static constexpr bool isRate (double sampleRate, double rate) noexcept { return sampleRate >= rate && sampleRate <= rate; }
+
     // The stretch is a whole number of grid steps (147 samples at 44.1 kHz are 160 at 48 kHz), so that it is a
     // whole number of samples at both rates.
     static constexpr Geometry geometryFor (double sampleRate, double windowSeconds) noexcept
     {
         Geometry g;
         int otherGrid = 0;
-        if (sampleRate == 44100.0)      { g.rate = 44100; g.other = 48000; g.grid = 147; otherGrid = 160; }
-        else if (sampleRate == 48000.0) { g.rate = 48000; g.other = 44100; g.grid = 160; otherGrid = 147; }
+        if (isRate (sampleRate, 44100.0))      { g.rate = 44100; g.other = 48000; g.grid = 147; otherGrid = 160; }
+        else if (isRate (sampleRate, 48000.0)) { g.rate = 48000; g.other = 44100; g.grid = 160; otherGrid = 147; }
         else return g;
         if (! (windowSeconds >= kMinWindowSeconds && windowSeconds <= kMaxWindowSeconds)) return g;     // NaN fails
         const int steps = (int) (windowSeconds * (double) g.rate / (double) g.grid);
@@ -221,7 +224,7 @@ public:
         return g;
     }
 
-    static constexpr bool rateExamined (double sampleRate) noexcept { return sampleRate == 44100.0 || sampleRate == 48000.0; }
+    static constexpr bool rateExamined (double sampleRate) noexcept { return isRate (sampleRate, 44100.0) || isRate (sampleRate, 48000.0); }
 
     // Where stretch i (0 .. kWindows - 1) starts in a programme of `totalFrames`: at (i + 1) tenths of it,
     // rounded down to the grid, and kept a margin away from both ends.

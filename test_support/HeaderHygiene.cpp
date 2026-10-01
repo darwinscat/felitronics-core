@@ -23,6 +23,13 @@
 #include <felitronics/blend/BlendParams.h>
 #include <felitronics/blend/IrBlend.h>
 #include <felitronics/blend/Overlay.h>
+#include <felitronics/codecgrid/BackResampler.h>
+#include <felitronics/codecgrid/CodecGridDetector.h>
+#include <felitronics/codecgrid/GridCurve.h>
+#include <felitronics/codecgrid/GridScan.h>
+#include <felitronics/codecgrid/Mdct.h>
+#include <felitronics/codecgrid/Mp3Hybrid.h>
+#include <felitronics/codecgrid/Mp3Window.h>
 #include <felitronics/convolution/CabConvolver.h>
 #include <felitronics/convolution/ConvolutionEngine.h>
 #include <felitronics/convolution/IrResampler.h>
@@ -160,5 +167,8 @@ template struct felitronics::analysis::SpectrumTapT<felitronics::analysis::kSpec
 template class  felitronics::convolution::NonUniformConvolver<felitronics::core::fft::DefaultRealFft>;
 template class  felitronics::convolution::MatrixConvolverNupc<felitronics::core::fft::DefaultRealFft>;
 template struct felitronics::analysis::RollingSpectrumTapT<14>;
+template class  felitronics::codecgrid::Mdct<felitronics::codecgrid::MixedRadixFft>;
+template class  felitronics::codecgrid::GridScan<felitronics::codecgrid::MixedRadixFft>;
+template class  felitronics::codecgrid::CodecGridDetector<felitronics::codecgrid::MixedRadixFft>;
 
 int main() { return 0; }

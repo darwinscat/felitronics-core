@@ -31,10 +31,12 @@ inline const char* name (Ground g)
     return g == Ground::Both ? "Both" : g == Ground::TwoWindows ? "TwoWindows" : g == Ground::PhaseAgreement ? "PhaseAgreement" : "None";
 }
 
-// The stretches of the suites are half a second: every property under test is one of the detector's logic, and
-// a quarter of the arithmetic proves it as well. The rule's numbers were measured at 2 s; the fixtures zero 30 %
-// of every frame and stand far above them at either length.
-inline CodecGridParams params (Depth depth = Depth::Follow, double windowSeconds = 0.5)
+// The stretches of the suites are a quarter of a second: every property under test is one of the detector's
+// logic, and an eighth of the arithmetic proves it as well. The rule's numbers were measured at 2 s; the fixtures
+// zero 30 % of every frame and stand far above them at any length.
+inline constexpr double kStretchSeconds = 0.25;
+
+inline CodecGridParams params (Depth depth = Depth::Follow, double windowSeconds = kStretchSeconds)
 {
     CodecGridParams p;
     p.depth = depth;

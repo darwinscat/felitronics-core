@@ -214,9 +214,12 @@ private:
         const float lo = (float) kLevelFloor, hi = (float) kLevelCeiling;
         for (int k = 0; k < n; ++k)
         {
+            // std::max (lo, r) is `lo < r ? r : lo`: a NaN fails the comparison and is read as the floor, never
+            // kept. The ARGUMENT ORDER is the point — std::max (r, lo) would keep the NaN — and the std:: spelling
+            // is what gcc's vectoriser takes (measured: it refuses the same selects written as ternaries).
             float r = std::fabs (x[k]) * inverseRef[k];
-            r = r >= lo ? r : lo;                  // a NaN is read as the floor, never kept
-            r = r <= hi ? r : hi;
+            r = std::max (lo, r);
+            r = std::min (hi, r);
             product[k] *= r;
         }
     }

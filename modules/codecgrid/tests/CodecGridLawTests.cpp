@@ -25,7 +25,7 @@ int main()
     // Three seconds and stretches of a quarter of a second: the form does not depend on the length of a stretch,
     // and the fixture's grid stands far above the rule at any length.
     constexpr int n = 44100 * 3;
-    constexpr double kStretch = 0.25;
+    constexpr double kStretch = kStretchSeconds;
     const auto lawParams = [] (Depth depth) { return params (depth, kStretch); };
     const auto original = synthetic::programme (n, 7u);
     const auto coded = synthetic::coded (original, Transform::AacSine, 480, 0.3);

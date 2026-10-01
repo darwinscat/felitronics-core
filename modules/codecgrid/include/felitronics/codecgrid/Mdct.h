@@ -110,11 +110,11 @@ private:
         const int p = radix_[stage], m = remain_[stage];
         if (m == 1) { leaf (out, in, stride, p); return; }
         for (int i = 0; i < p; ++i)
-            work (out + 2 * (std::size_t) i * (std::size_t) m, in + 2 * (std::size_t) i * (std::size_t) stride, stride * p, stage + 1);
+            work (out + 2 * i * m, in + 2 * i * stride, stride * p, stage + 1);
         const float* tw = twiddle_.data();
-        const std::size_t s = (std::size_t) stride;
+        const int s = stride;
         float* f0 = out;
-        float* f1 = out + 2 * (std::size_t) m;
+        float* f1 = out + 2 * m;
         if (p == 2)
         {
             for (int k = 0; k < m; ++k)
@@ -127,8 +127,8 @@ private:
         }
         else if (p == 4)
         {
-            float* f2 = out + 4 * (std::size_t) m;
-            float* f3 = out + 6 * (std::size_t) m;
+            float* f2 = out + 4 * m;
+            float* f3 = out + 6 * m;
             for (int k = 0; k < m; ++k)
             {
                 const float w1r = tw[2 * k * s], w1i = tw[2 * k * s + 1];
@@ -148,8 +148,8 @@ private:
         }
         else if (p == 3)
         {
-            float* f2 = out + 4 * (std::size_t) m;
-            const float epi = tw[2 * (std::size_t) m * s + 1];                 // the imaginary part of exp (-2 pi i / 3)
+            float* f2 = out + 4 * m;
+            const float epi = tw[2 * m * s + 1];                 // the imaginary part of exp (-2 pi i / 3)
             for (int k = 0; k < m; ++k)
             {
                 const float w1r = tw[2 * k * s], w1i = tw[2 * k * s + 1];
@@ -166,11 +166,11 @@ private:
         }
         else                                                                    // 5
         {
-            float* f2 = out + 4 * (std::size_t) m;
-            float* f3 = out + 6 * (std::size_t) m;
-            float* f4 = out + 8 * (std::size_t) m;
-            const float yar = tw[2 * (std::size_t) m * s], yai = tw[2 * (std::size_t) m * s + 1];      // exp (-2 pi i / 5)
-            const float ybr = tw[4 * (std::size_t) m * s], ybi = tw[4 * (std::size_t) m * s + 1];      // exp (-4 pi i / 5)
+            float* f2 = out + 4 * m;
+            float* f3 = out + 6 * m;
+            float* f4 = out + 8 * m;
+            const float yar = tw[2 * m * s], yai = tw[2 * m * s + 1];      // exp (-2 pi i / 5)
+            const float ybr = tw[4 * m * s], ybi = tw[4 * m * s + 1];      // exp (-4 pi i / 5)
             for (int k = 0; k < m; ++k)
             {
                 const float w1r = tw[2 * k * s], w1i = tw[2 * k * s + 1];
@@ -200,7 +200,7 @@ private:
     // A transform of p points taken `stride` apart: the leaf of the recursion.
     void leaf (float* out, const float* in, int stride, int p) const noexcept
     {
-        const std::size_t s = 2u * (std::size_t) stride;
+        const int s = 2 * stride;
         if (p == 4)
         {
             const float a0r = in[0], a0i = in[1], a1r = in[s], a1i = in[s + 1], a2r = in[2 * s], a2i = in[2 * s + 1], a3r = in[3 * s], a3i = in[3 * s + 1];
@@ -226,8 +226,8 @@ private:
             float accR = in[0], accI = in[1];
             for (int q = 1; q < p; ++q)
             {
-                const std::size_t t = 2u * (std::size_t) (((k * q) % p) * step);
-                const float xr = in[(std::size_t) q * s], xi = in[(std::size_t) q * s + 1];
+                const int t = 2 * (((k * q) % p) * step);
+                const float xr = in[q * s], xi = in[q * s + 1];
                 accR += xr * tw[t] - xi * tw[t + 1];
                 accI += xr * tw[t + 1] + xi * tw[t];
             }
