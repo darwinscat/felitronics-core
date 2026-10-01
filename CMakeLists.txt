@@ -76,6 +76,7 @@ add_subdirectory(modules/measurement)   # OFFLINE IR-measurement math (sweep/Far
 add_subdirectory(modules/blend)   # OFFLINE mic-blend engine (mixer params + kernels + Σ(gain·strip) blend) — double coeffs, float buffers
 add_subdirectory(modules/io)   # OFFLINE file I/O (WAV read/write, moved from OrbitCapture's oc/wav.hpp) — zero-dep, message-thread
 add_subdirectory(modules/text)   # JUCE-free UTF-8 → ASCII romanization for filename slugs (German/ß + Cyrillic), from OrbitCapture NAM's Matrix.h — zero-dep, message-thread
+add_subdirectory(modules/codecgrid)   # OFFLINE measurement: the frame grid a lossy codec leaves in decoded PCM (MP3, AAC, Opus) — float transforms, message-thread
 add_subdirectory(modules/laws)   # NOT a module: the cross-module law suites (law 11, law 11c), tests only — see its CMakeLists
 
 # felitronics::test_support — the house test harness (felitronics_test.h, the ONE allocation counter, the
@@ -106,7 +107,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text)
+        felitronics::io felitronics::text felitronics::codecgrid)
     target_compile_features(felitronics_header_hygiene PRIVATE cxx_std_20)
     target_compile_options(felitronics_header_hygiene PRIVATE ${FELITRONICS_HYGIENE_WARNINGS})
     # When selected, felitronics::convolution propagates the uniform FELITRONICS_WITH_PFFFT definition
@@ -132,7 +133,7 @@ if(FELITRONICS_BUILD_TESTS AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
         felitronics::convolution felitronics::oversampling felitronics::limiter felitronics::neural
         felitronics::saturation felitronics::stereo felitronics::multiband felitronics::dynamiceq
         felitronics::deesser felitronics::dither felitronics::lineareq felitronics::measurement felitronics::blend
-        felitronics::io felitronics::text)
+        felitronics::io felitronics::text felitronics::codecgrid)
     target_compile_features(felitronics_no_exceptions_probe PRIVATE cxx_std_20)
     target_compile_options(felitronics_no_exceptions_probe PRIVATE -fno-exceptions -fno-rtti)
 endif()
