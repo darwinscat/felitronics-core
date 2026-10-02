@@ -3311,7 +3311,7 @@ half — the one definition and its two roads; moving the site's generators and 
   over every mix mode, bucket and column count and a mono / stereo / six-channel fixture.
 - **`fcore_measure correlation`** is the stereo band's binary64 formula over the whole file; law 9's one sanctioned
   `long double` exception is gone, and the artifact gate lost its one named exclusion.
-- **Measured (out of tree, `.private/harness/p59a-shapes/`):** NULL site-JS vs C++ (`-ffp-contract=fast`) vs wasm on
+- **Measured (with an out-of-tree harness):** NULL site-JS vs C++ (`-ffp-contract=fast`) vs wasm on
   560 synthetic, 35 real and 79 decoded gate items — 0 differences, 0 split mismatches. Demo road vs upload road:
   lossless WAV/FLAC at the native rate bit-identical after PCM equality (46 of 53 files; the 7 others are float64 WAV,
   which the site's WAV reader reads as zeros — a site finding); 21 lossy decoder pairs all inside the bound derived
