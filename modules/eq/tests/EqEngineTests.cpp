@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cmath>
 #include <complex>
@@ -288,6 +289,57 @@ void runEqEngineTests()
         expectNear (highs,  12.0, 1.0, "highs ~ +12 dB");
         expectNear (lows,  rLow,  0.4, "audio == displayed curve (lows)");
         expectNear (highs, rHigh, 0.4, "audio == displayed curve (highs)");
+    }
+
+    group ("gentle Tilt (slope 6): first-order shelves about f0; every other slope keeps the 2-pole tilt bit for bit");
+    {
+        // The analog pair the gentle tilt matches: low shelf (x² + G)/(x² + 1/G) at G = 1/A, high shelf
+        // A²·(x² + 1/A)/(x² + A), x = f/f0, A = 10^(gain/20) — unity at f0, ends at -gain and +gain.
+        const double gain = 3.0, f0 = 1000.0, A = std::pow (10.0, gain / 20.0);
+        auto analogDb = [&] (double f)
+        {
+            const double x2 = (f / f0) * (f / f0);
+            return 10.0 * std::log10 ((x2 + 1.0 / A) / (x2 + A)) + 10.0 * std::log10 (A * A * (x2 + 1.0 / A) / (x2 + A));
+        };
+        BandParams p; p.on = true; p.type = FilterType::Tilt;
+        p.lane (Lane::Stereo).freq = f0; p.lane (Lane::Stereo).gainDb = gain; p.lane (Lane::Stereo).slope = 6;
+        auto curveDb = [&] (const BandParams& q, double f) { return 20.0 * std::log10 (std::abs (bandResponse (q, fs, 2.0 * kPi * f / fs))); };
+        const double want[][2] { { 125.0, -2.91 }, { 250.0, -2.64 }, { 500.0, -1.79 }, { 1000.0, 0.0 },
+                                 { 2000.0, 1.79 }, { 4000.0, 2.64 }, { 8000.0, 2.91 } };
+        for (const auto& [f, db] : want)
+        {
+            const double got = curveDb (p, f);
+            std::printf ("      gentle tilt +3 dB at %5.0f Hz: %+.4f dB (analog %+.4f)\n", f, got, analogDb (f));
+            expectNear (got, db,           0.01,  "gentle tilt +3 dB at " + std::to_string ((int) f) + " Hz");
+            expectNear (got, analogDb (f), 0.01,  "gentle tilt tracks the analog first-order pair at " + std::to_string ((int) f) + " Hz");
+        }
+        expectNear (curveDb (p, f0), 0.0, 1e-9, "gentle tilt: the pivot stays at unity");
+        expectNear (20.0 * std::log10 (std::abs (bandResponse (p, fs, 0.0))), -gain, 1e-9, "gentle tilt: DC at -gain");
+        const auto d6 = designBand (p, fs);
+        expectTrue (d6.n == 2 && d6.sec[0].isStable() && d6.sec[1].isStable() && d6.sec[0].b2 == 0.0 && d6.sec[0].a2 == 0.0
+                        && d6.sec[1].b2 == 0.0 && d6.sec[1].a2 == 0.0, "gentle tilt: two stable first-order sections");
+
+        // The audio runs what the curve shows (375 Hz = two whole periods in the measured 256-sample block).
+        EqBand band; band.prepare (fs, 1); band.setParams (p);
+        auto ap = [&] (float* const* ch, int nc, int n) { felitronics::test::run (band.processBlock (ch, nc, n)); };
+        expectNear (sineGainDb (ap, 375.0, fs), curveDb (p, 375.0), 0.01, "gentle tilt: audio == displayed curve at 375 Hz");
+
+        // The default and every other slope: the previous Tilt path, the two 2-pole matched shelves, bit for bit.
+        auto bits = [] (const BiquadCoeffs& a, const BiquadCoeffs& b)
+        {
+            auto same = [] (double x, double y) { return std::bit_cast<std::uint64_t> (x) == std::bit_cast<std::uint64_t> (y); };
+            return same (a.b0, b.b0) && same (a.b1, b.b1) && same (a.b2, b.b2) && same (a.a1, b.a1) && same (a.a2, b.a2);
+        };
+        bool unchanged = true;
+        for (const int slope : { 12, 0, 18, 24, 48 })
+            for (const double g : { -6.0, -1.25, 0.0, 3.0, 12.0 })
+                for (const double fq : { 40.0, 1000.0, 15000.0 })
+                {
+                    BandParams q = p; q.lane (Lane::Stereo).slope = slope; q.lane (Lane::Stereo).gainDb = g; q.lane (Lane::Stereo).freq = fq;
+                    const auto d = designBand (q, fs);
+                    unchanged = unchanged && d.n == 2 && bits (d.sec[0], matched::lowShelfDb (fq, fs, -g)) && bits (d.sec[1], matched::highShelfDb (fq, fs, g));
+                }
+        expectTrue (unchanged, "slope != 6: the 2-pole matched shelves, bit for bit (the default 12 included)");
     }
 
     group ("swept SVF high shelf is Butterworth (plateau == gain, Q-independent)");

@@ -42,7 +42,7 @@ enum class FilterType
                  // legitimately reads below 0 dB at fs/2; slope 6/12 = the frozen single notch,
                  // which under-shoots that residual — see matched::notch)
     AllPass,     // flat magnitude, 360° phase rotation through f0 (Q = sharpness)
-    Tilt         // spectral tilt about f0: lows -gainDb, highs +gainDb
+    Tilt         // spectral tilt about f0: lows -gainDb, highs +gainDb; slope 6 = first-order shelves
 };
 
 // Placement lanes (Pro-Q-style, but multi-select — a point may live in several at once). The fixed
@@ -60,7 +60,8 @@ struct LaneParams
     double Q      = 1.0;
     double gainDb = 0.0;      // bells & shelves
     int    slope  = 12;       // HP/LP: 6..96 dB/oct Butterworth. Notch/BandPass: skirt steepness
-                              // (order = slope/6; Q stays the −3 dB bandwidth, order-invariant)
+                              // (order = slope/6; Q stays the −3 dB bandwidth, order-invariant).
+                              // Tilt: 6 = first-order shelves (gentle), anything else the 2-pole ones
     bool   bypass = false;    // lane kept but muted (ghost node) — distinct from on=false
 
     // Doubles compared by bit pattern (not `==`) so the engine's recompute-skip stays exact without
