@@ -48,8 +48,10 @@ namespace felitronics::dehum
 //       the line qualifies quiet for the TRACKER (Auto's streak, the coarse estimate and acquisition, the FLL's gate)
 //       but lends the learn WIDTH quiet only within 15 dB of the broadband rule (pm < 32·hum); the glide asks the
 //       broadband one (a held note's leakage into the 50 Hz bin can make three estimates agree on a wrong
-//       frequency); and the FLL's narrowband `explained` path judges the residual against a residual floor that
-//       rises only 0.05 dB per line-quiet hop (a held note lifts rf_ by 0.5 dB a hop until it IS the floor);
+//       frequency); and the FLL's narrowband `explained` path, on a line-only quiet, judges the residual against a
+//       residual floor that rises only on a broadband-confirmed hop (a held note lifts rf_ by 0.5 dB a hop until it
+//       IS the floor) — so when the hiss rises alone and the broadband rule fails, that path waits for a broadband
+//       quiet (on a humbucker over hiss, seconds to tens of seconds); a broadband-quiet hop is judged against rf_;
 //   (b) the canceller's RESIDUAL (20 ms-smoothed) is within 12 dB of the RESIDUAL FLOOR — the minimum of
 //       that power over the last 4 s (sixteen 0.25 s hop minima), which may RISE by at most 0.5 dB per hop
 //       (2 dB/s) and restarts on every re-arm, zeroing or restore. After cancellation true quiet is the
@@ -131,9 +133,13 @@ namespace felitronics::dehum
 // the old floor) and anything longer than 3 s (a snapshot that old is stale: drift, hands on the strings) close
 // with no return and keep the old behaviour. Since review 5: no return when the input settled more than 3 dB UNDER
 // the floor the note began on (a quieter hum — hands on), or when f̂ moved during the event (a glide, a lockRange
-// change); and every return is CHECKED — 16 periods after it the residual must not be over its 16 periods before
-// it and the input must not sit 3 dB under the old floor, or the weights go back over 40 ms to where the return
-// found them (a hum turned under the note at the same level). The snapshot keeps its own time origin, so a new
+// change); and every return is CHECKED against the ghost it replaced — over the 16 periods after it, the residual
+// the stage made is compared with the one the weights it found (the ghost and all) would have made on the SAME
+// samples, and if those did better, or the input sits 3 dB under the old floor, the weights go back over 40 ms to
+// where the return found them (a hum turned under the note at the same level): "no worse than without the return",
+// not an absolute test. A trigger cancels a check; a take-back's target is never reused as a note's snapshot.
+// OPEN (review 6): an attack in the ≈ 10 ms right after a return ends opens no event until the check's end, and
+// that note's ghost is not returned. The snapshot keeps its own time origin, so a new
 // attack mid-return does not turn it twice. LIMITS (V10/V11): the end fires at the first 21 ms mean under 4× the
 // old floor, so with the 10 dB drop the return engages only for notes ≥ ≈ 16 dB over the hum's mean square; and
 // there is ONE event for all channels — a channel that adapted legitimately under it is returned with the rest. FREEZING adaptation while active instead was measured and rejected:
@@ -296,7 +302,6 @@ public:
     static constexpr double kHoldSeconds    = 0.050;    // a trigger keeps the playing width at least this long
     static constexpr double kSlewHzPerSec   = 0.05;     // the tracker's slew bound
     static constexpr double kResidualRise   = 1.1220184543019633;   // the residual floor rises <= 0.5 dB per hop (2 dB/s)
-    static constexpr double kSlowRise       = 1.0115794542598986;   // the FLL's floor: 0.05 dB per line-quiet hop (V1)
     static constexpr double kJitterRatio    = 0.1;      // -10 dB: beyond it the lines are lost in their own notches' hiss
     static constexpr int    kCoarseAvg      = 4;        // coarse estimates averaged (their median) for the FLL's agreement and acquisition
     static constexpr double kGhostReturnSec = 0.040;    // the weights' return to the pre-note model, raised cosine
@@ -978,6 +983,14 @@ private:
                 if (zero) continue;                                  // a zero is no measurement
 
                 const double err = (double) x - corr;
+                if (chk_ > 0 && retLeft_ == 0)                       // W3: the check's two residuals, same samples
+                {
+                    double cu = 0.0;
+                    for (int k = 0; k < nActive_; ++k) { const double a = uRe_[c][k] * rRe_[k]; const double b = uIm_[c][k] * rIm_[k]; const double t = a - b; cu += t; }
+                    const double eu = (double) x - cu;
+                    const double e1 = err * err; const double e2 = eu * eu;
+                    chkW_ += e1; chkU_ += e2;
+                }
                 if (det)
                 {
                     const double e2 = err * err;
@@ -1041,7 +1054,13 @@ private:
             }
     }
 
-    void resetGhost() noexcept { evOn_ = false; evAge_ = 0; evQuiet_ = 0; retLeft_ = 0; retC_ = 0.0; frameHz_ = 0.0; evHz_ = 0.0; chk_ = 0; retN_ = 0; }
+    void resetGhost() noexcept
+    {
+        evOn_ = false; evAge_ = 0; evQuiet_ = 0; retLeft_ = 0; retC_ = 0.0; frameHz_ = 0.0; evHz_ = 0.0; chk_ = 0; retN_ = 0;
+        snapOk_ = false; chkW_ = 0.0; chkU_ = 0.0;
+        for (int i = 0; i < kGhostEndPeriods; ++i) { rsRing_[i] = 0.0; evRing_[i] = 0.0; }
+        rsSum_ = 0.0; evSum_ = 0.0; rsPos_ = 0; evPos_ = 0;
+    }
 
     // An EVENT starts with a trigger (the snapshot: the weights at the last boundary, before the attack's
     // period; the reference: the input floor as it stood then) and ends when the input's mean over the last
@@ -1051,28 +1070,37 @@ private:
     void ghostPeriod (double p, double pe) noexcept
     {
         clock_ += kPeriod;
-        rsSum_ -= rsRing_[rsPos_]; rsRing_[rsPos_] = pe; rsSum_ += pe; rsPos_ = (rsPos_ + 1) % kGhostEndPeriods;
-        // the input's mean over the last kGhostEndPeriods periods, not one period: a peaky hum (a buzz) has periods
-        // far over its mean, and a mains cycle's mean is its level
-        evSum_ -= evRing_[evPos_]; evRing_[evPos_] = p; evSum_ += p; evPos_ = (evPos_ + 1) % kGhostEndPeriods;
+        // the input's and the residual's means over the last kGhostEndPeriods periods, not one period: a peaky hum
+        // (a buzz) has periods far over its mean, and a mains cycle's mean is its level. W2: summed afresh from the
+        // rings every period — a running subtract-add sum never heals after one huge sample
+        rsRing_[rsPos_] = pe; rsPos_ = (rsPos_ + 1) % kGhostEndPeriods;
+        evRing_[evPos_] = p;  evPos_ = (evPos_ + 1) % kGhostEndPeriods;
+        rsSum_ = 0.0; evSum_ = 0.0;
+        for (int i = 0; i < kGhostEndPeriods; ++i) { rsSum_ += rsRing_[i]; evSum_ += evRing_[i]; }
         if (! running_ || learning_ || swapPhase_ != 0 || pending_ || ! floorValid_) { evOn_ = false; chk_ = 0; return; }
         // V2: did the return help? 16 periods after it the residual must not be over what it was in the 16 before
         // it, and the input must not have settled 3 dB under the floor the note began on: if the hum changed under
         // the note (hands on the strings: quieter; a turned phase) the snapshot is stale, and the weights go back
         // over 40 ms to where the return found them
+        // W3: both models judged on the SAME samples — the residual the stage made over the check, against the one
+        // the weights the return left would have made on them — so hiss alone never decides it. W4: a trigger
+        // cancels the check first (its note opens an event below)
+        if (hit_ && chk_ > 0) chk_ = 0;
         const double half = 2.0 * evSum_;
-        if (chk_ > 0 && retLeft_ == 0 && --chk_ == 0 && (rsSum_ > rsBefore_ || half < (double) kGhostEndPeriods * evRef_))
+        if (chk_ > 0 && retLeft_ == 0 && --chk_ == 0 && (chkU_ < chkW_ || half < (double) kGhostEndPeriods * evRef_))
         {
             for (int c = 0; c < maxCh_; ++c)
                 for (int k = 0; k < nActive_; ++k) { sRe_[c][k] = uRe_[c][k]; sIm_[c][k] = uIm_[c][k]; }
+            snapOk_ = false;                                       // W5: the take-back's target is no note's snapshot
             beginReturn (false);
             return;
         }
         if (! evOn_)
         {
             if (! hit_) return;
-            if (retLeft_ == 0)                                     // mid-return the target stays the snapshot...
+            if (retLeft_ == 0 || ! snapOk_)                       // mid-return the target stays the snapshot...
             {
+                snapOk_ = true;
                 for (int c = 0; c < maxCh_; ++c)
                     for (int k = 0; k < nActive_; ++k) { sRe_[c][k] = pRe_[c][k]; sIm_[c][k] = pIm_[c][k]; }
                 sT_ = clock_ - kPeriod; sF_ = fHat_;               // ...with its own time origin and frame (V4)
@@ -1118,7 +1146,6 @@ private:
         sT_ = target;
         for (int c = 0; c < maxCh_; ++c)
             for (int k = 0; k < nActive_; ++k) { uRe_[c][k] = wRe_[c][k]; uIm_[c][k] = wIm_[c][k]; }   // where it found them
-        rsBefore_ = rsSum_;
         beginReturn (true);
     }
 
@@ -1140,7 +1167,7 @@ private:
         }
         if (retN_ == 0) { chk_ = 0; return; }
         retLeft_ = retLen_; retC_ = 1.0;
-        chk_ = check ? kGhostEndPeriods : 0;
+        chk_ = check ? kGhostEndPeriods : 0; chkW_ = 0.0; chkU_ = 0.0;
         const int hold = retLen_ + hopPeriods_ * kPeriod;           // the FLL and the motion record skip the return
         if (fllHold_ < hold) fllHold_ = hold;
     }
@@ -1208,7 +1235,8 @@ private:
         // ...or, in the weights' own terms (narrowband: only what reaches the notches), the last hop's weight motion
         // that a common frequency offset does not explain is 20 dB under the model — hiss in a notch is small,
         // a note's beat in it is not
-        const bool explained = ! (psEValid_ && psValid_) || psE_ <= 0.0316 * ps_ || (jit_ < kNone && jfValid_ && jit_ <= 4.0 * jf_ && jit_ <= kJitterRatio && rfBValid_ && psE_ <= 4.0 * rfB_);
+        const bool explained = ! (psEValid_ && psValid_) || psE_ <= 0.0316 * ps_ || (jit_ < kNone && jfValid_ && jit_ <= 4.0 * jf_ && jit_ <= kJitterRatio
+                               && (quietWinBroad_ ? (rfValid_ && psE_ <= 4.0 * rf_) : (rfBValid_ && psE_ <= 4.0 * rfB_)));
         fllFast_ = learning_ || (quietPeriod_ && ! hit_);      // the width this period ran at: the FLL's gain follows it
         const bool   wasQuiet = quietWin_ && floorValid_ && hitHold_ <= 0 && ! hit_ && coarseOk_ && fllHold_ <= 0 && explained;
         if (fllHold_ > 0) fllHold_ -= kPeriod;
@@ -1543,14 +1571,15 @@ private:
                 frameHz_ = rotHz_;                             // the weights' turn in a clean hop: the ghost's return uses it
             // V1: the residual floor as the BROADBAND quiet last confirmed it — a held note lifts rf_ by 0.5 dB a hop
             // until it is the floor; this one it never reaches, so the FLL's narrowband path and its floor stay shut
-            if (running_ && quietWinBroad_ && residualQuiet() && rfValid_) { rfB_ = rf_; rfBValid_ = true; }
-            if (running_ && rfValid_)                          // V1: the FLL's residual floor (see rfB_)
+            // W1: the floor the line-only quiet is judged against follows rf_ down at once and UP only on a
+            // broadband-confirmed hop — never on a line-only one (a held note lifts rf_ by 0.5 dB a hop until it is
+            // the floor). A broadband-quiet hop keeps the old judgement against rf_ itself
+            if (running_ && rfValid_)
             {
                 if (! rfBValid_ || rf_ <= rfB_ || quietWinBroad_) rfB_ = rf_;
-                else if (quietWin_) { const double up = rfB_ * kSlowRise; rfB_ = rf_ < up ? rf_ : up; }
                 rfBValid_ = true;
             }
-            updateMotionFloor (running_ && quietWin_ && rfBValid_ && psEValid_ && psE_ <= 4.0 * rfB_);
+            updateMotionFloor (running_ && quietWin_ && (quietWinBroad_ ? residualQuiet() : (rfBValid_ && psEValid_ && psE_ <= 4.0 * rfB_)));
             for (int c = 0; c < maxCh_; ++c)
                 for (int b = 0; b < kBins; ++b) { winRe_[c][b] = nowRe_[c][b]; winIm_[c][b] = nowIm_[c][b]; }
             prevWinValid_ = true;
@@ -1643,7 +1672,8 @@ private:
     double cRing_[2][kCoarseAvg] {};
     double sRe_[core::kMaxChannels][MaxHarmonics] {}, sIm_[core::kMaxChannels][MaxHarmonics] {};   // the pre-event model
     double uRe_[core::kMaxChannels][MaxHarmonics] {}, uIm_[core::kMaxChannels][MaxHarmonics] {};   // where a return found them
-    double rsRing_[kGhostEndPeriods] {}, rsSum_ = 0.0, rsBefore_ = 0.0, sF_ = 0.0;
+    double rsRing_[kGhostEndPeriods] {}, rsSum_ = 0.0, sF_ = 0.0, chkW_ = 0.0, chkU_ = 0.0;
+    bool   snapOk_ = false;
     long long clock_ = 0, sT_ = 0;
     int    rsPos_ = 0, chk_ = 0, retN_ = 0, retCh_[core::kMaxChannels] {};
     double retC_ = 0.0, frameHz_ = 0.0, evHz_ = 0.0, evRef_ = 0.0, evPeak_ = 0.0, evSum_ = 0.0, evRing_[kGhostEndPeriods] {};

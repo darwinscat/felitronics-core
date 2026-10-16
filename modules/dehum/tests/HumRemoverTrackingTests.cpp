@@ -1309,14 +1309,16 @@ static void testLineQuietNoNote()
 {
     group ("V1: a held note beside a harmonic over hiss is never quiet, and keeps the 0.5 Hz comb's transfer");
     const double fs = 48000.0, f0 = 50.0;
-    for (int pass = 0; pass < 2; ++pass)
+    for (int pass = 0; pass < 3; ++pass)
     {
-        const bool g2 = pass == 1;
-        const double T = g2 ? 30.0 : 40.0, t0 = 10.0, nf = g2 ? 98.0 : 349.23, na = g2 ? 0.00562 : 0.1;
+        // pass 2 (W1, review 6): a SOFT F4 (-35 dBFS) over louder hiss (white -45): the residual only ≈ 8 dB over its
+        // floor, so a floor that rises at all on line-only hops reaches it within seconds, not minutes
+        const bool g2 = pass == 1, soft = pass == 2;
+        const double T = g2 ? 30.0 : (soft ? 70.0 : 40.0), t0 = 10.0, nf = g2 ? 98.0 : 349.23, na = g2 ? 0.00562 : (soft ? 0.0178 : 0.1);
         std::vector<float> x ((std::size_t) (T * fs), 0.0f);
         {
             Lcg r { 11u }; double ph[40]; for (double& p : ph) p = 2.0 * kPi * r.uniform();
-            const double a1 = std::pow (10.0, -63.0 / 20.0), w = std::pow (10.0, (g2 ? -45.0 : -75.0) / 20.0) * std::sqrt (3.0);
+            const double a1 = std::pow (10.0, -63.0 / 20.0), w = std::pow (10.0, (g2 || soft ? -45.0 : -75.0) / 20.0) * std::sqrt (3.0);
             Lcg n { 21u };
             for (std::size_t i = 0; i < x.size(); ++i)
             {
@@ -1350,7 +1352,7 @@ static void testLineQuietNoNote()
         const std::int64_t a = (std::int64_t) ((T - 4.0) * fs), len = (std::int64_t) (4.0 * fs);
         const double got = dbOf (fitAmp (x, a, len, nf, fs) / fitAmp (in, a, len, nf, fs));
         const double want = exactGainDb (nf, fEnd, 24, 0.5, fs);
-        const std::string tag = g2 ? "G2 98 Hz over -45 dB hiss" : "F4 349.23 Hz held 30 s";
+        const std::string tag = g2 ? "G2 98 Hz over -45 dB hiss" : (soft ? "soft F4 held 60 s over -45 dB hiss" : "F4 349.23 Hz held 30 s");
         std::printf ("      %s: quiet first at %.2f s (never: -1); the note %.2f dB, the 0.5 Hz comb's transfer %.2f dB; f̂ %.4f before it, %.4f at the end, at worst %.4f Hz off the mains under it\n", tag.c_str(), firstQuiet, got, want, fAt, fEnd, fDev);
         ok (firstQuiet < 0.0, tag + ": never quiet while it holds (" + fmt (firstQuiet, 2) + " s)");
         ok (std::fabs (got - want) <= 0.2, tag + ": within 0.2 dB of the 0.5 Hz transfer (" + fmt (got, 2) + " vs " + fmt (want, 2) + " dB)");
@@ -1407,9 +1409,9 @@ static void testNoisyDriftRecovered()
 {
     group ("V7: a drift accumulated while playing over hiss is recovered in the quiet (an independent deadline)");
     const double fs = 48000.0, f0 = 49.9931, slope = 0.02 / 20.0, r0 = 4.0, r1 = 24.0;
-    std::vector<float> x = realInput (false, f0, 36.0, fs, false);
+    std::vector<float> x = realInput (false, f0, 42.0, fs, false);
     {   // replace the steady hum by a drifting one: subtract it, add the drifting copy
-        const std::vector<float> steady = realInput (false, f0, 36.0, fs, false, -200.0);
+        const std::vector<float> steady = realInput (false, f0, 42.0, fs, false, -200.0);
         std::vector<float> hiss (x.size()); for (std::size_t i = 0; i < x.size(); ++i) hiss[i] = x[i] - steady[i];
         Lcg r { 11u }; double ph[40]; for (double& p : ph) p = 2.0 * kPi * r.uniform();
         const double a1 = std::pow (10.0, -63.0 / 20.0);
@@ -1424,7 +1426,7 @@ static void testNoisyDriftRecovered()
     }
     addPlucks (x, r0, r1, fs, 0.1);
     HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 256, 1));
-    double back = -1.0;
+    double back = -1.0, after = 0.0;
     const double fEndTrue = f0 + slope * (r1 - r0);
     for (std::size_t o = 0; o < x.size(); o += 256)
     {
@@ -1432,9 +1434,73 @@ static void testNoisyDriftRecovered()
         felitronics::test::run (h.process (io, 1, (int) std::min<std::size_t> (256, x.size() - o)));
         const double t = (double) (o + 256) / fs;
         if (t > r1 && std::fabs (h.mainsHz() - fEndTrue) > 0.003) back = t - r1;
+        if (t >= r1 + 12.0) after = std::max (after, std::fabs (h.mainsHz() - fEndTrue));   // W6: AT the deadline and on
     }
     std::printf ("      drift +0.02 Hz over 20 s of playing over hiss: within 3 mHz %.2f s after the playing ends (the plucks ring ~3 s)\n", back);
+    ok (after <= 0.003, "V7/W6: from the 12 s deadline to the end (6 s more) f̂ stays within 3 mHz (" + fmt (after, 4) + " Hz at worst)");
     ok (back >= 0.0 && back <= 12.0, "V7: f̂ within 3 mHz of the mains by 12 s after the playing (" + fmt (back, 2) + " s; slow: the FLL waits for the strings to stop ringing and for its narrowband floor)");
+}
+
+//------------------------------------------------------------------------------------------------------
+// Review 6: the ghost machinery's own bookkeeping. W2: a poison burst (finite ±3e38 samples) must not leave the
+// sliding sums broken — afterwards a note's ghost is still returned. W3: on an unchanged hum under hiss the check
+// must not take a good return back (12 seeds). W4: an attack that lands in the check's last period still opens its
+// own event (swept over the check window in 64-sample steps).
+static void ghostAfter (std::vector<float>& x, double fs, double stop, double& g)
+{
+    std::vector<double> fr; for (int k = 1; k <= 24; ++k) fr.push_back (50.0 * k);
+    HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 256, 1));
+    for (std::size_t o = 0; o < x.size(); o += 256)
+    {
+        float* io[1] { x.data() + o };
+        felitronics::test::run (h.process (io, 1, (int) std::min<std::size_t> (256, x.size() - o)));
+    }
+    const auto a = fitAmps (x, std::llround ((stop + 0.1) * fs), (std::int64_t) (0.1 * fs), fr, fs);
+    double e = 0.0; for (double v : a) e += v * v;
+    g = dbOf (std::sqrt (e) / 0.1);
+}
+static void testGhostBookkeeping()
+{
+    group ("the ghost's bookkeeping: survives a poison burst, no take-back on hiss, an attack in the check's last period");
+    const double fs = 48000.0;
+    auto fixture = [&] (std::uint32_t seed, double hissDb, double n2At, double n1At = 3.0) {
+        std::vector<float> x ((std::size_t) ((n1At + 3.0) * fs), 0.0f);
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.seed = 17u; addHum (x, hs, fs);
+        if (hissDb < 0.0) { Lcg r { seed }; const double w = std::pow (10.0, hissDb / 20.0) * std::sqrt (3.0); for (float& v : x) v += (float) (w * (2.0 * r.uniform() - 1.0)); }
+        Note n; n.f0 = 330.0; n.partials = 1; n.amp = 0.1; n.start = n1At; n.dur = 0.3; addNote (x, n, fs);
+        if (n2At > 0.0) { Note m = n; m.f0 = 247.0; m.start = n2At; addNote (x, m, fs); }
+        return x;
+    };
+    {   // W2: the burst at 0.5 s; the stage's smoothed levels take ≈ 4 s to fall back from 3e38², so the note is at 7 s
+        std::vector<float> x = fixture (1u, 0.0, 0.0, 7.0);
+        for (std::size_t i = (std::size_t) (0.5 * fs); i < (std::size_t) (0.5 * fs) + 64; ++i) x[i] = (i & 1) ? 3e38f : -3e38f;
+        double g; ghostAfter (x, fs, 7.3, g);
+        std::printf ("      W2: after a poison burst at 0.5 s, the ghost 0.1-0.2 s after a note's end at 7.3 s: %.1f dB re the note\n", g);
+        ok (g <= -60.0, "W2: a poison burst leaves the ghost return working (" + fmt (g, 1) + " dB)");
+    }
+    {   // W3
+        double worst = -400.0;
+        for (std::uint32_t seed = 1; seed <= 12; ++seed)
+        {
+            std::vector<float> x = fixture (seed, -70.0, 0.0);
+            double g; ghostAfter (x, fs, 3.3, g); worst = std::max (worst, g);
+        }
+        std::printf ("      W3: unchanged hum under -70 dBFS hiss, 12 seeds: the worst ghost 0.1-0.2 s after the end %.1f dB re the note\n", worst);
+        ok (worst <= -55.0, "W3: no good return is taken back on hiss (" + fmt (worst, 1) + " dB at worst over 12 seeds)");
+    }
+    {   // W4: a second note starting 70..110 ms after the first's end (the check runs ≈ 55-76 ms after it). OPEN (named):
+        // an attack 60-69 ms after the end, just after the return, opens no event until ≈ 76 ms and its ghost stays
+        double worst = -400.0, early = -400.0;
+        for (int st = 0; st < 38; ++st)
+        {
+            const double t2 = 3.3 + 0.060 + 64.0 * st / fs;
+            std::vector<float> x = fixture (1u, 0.0, t2);
+            double g; ghostAfter (x, fs, t2 + 0.3, g);
+            if (t2 - 3.3 >= 0.070) worst = std::max (worst, g); else early = std::max (early, g);
+        }
+        std::printf ("      W4: a second note 70-110 ms after the first's end: the worst ghost after it %.1f dB re the note (60-69 ms, open: %.1f)\n", worst, early);
+        ok (worst <= -50.0, "W4: a second note's ghost is returned when its attack lands in the check (" + fmt (worst, 1) + " dB)");
+    }
 }
 
 static void testPalmMuteGhost()
@@ -1628,5 +1694,6 @@ int main()
     testLineQuietNoNote();
     testCoarseRingRestarts();
     testNoisyDriftRecovered();
+    testGhostBookkeeping();
     return felitronics::test::report();
 }
