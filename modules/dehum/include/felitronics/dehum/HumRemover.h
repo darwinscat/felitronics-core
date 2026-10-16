@@ -259,7 +259,8 @@ public:
         anchorPhase_ = 0;
         for (int b = 0; b < 4; ++b) binAnchor_[b] = 0;
         for (int c = 0; c < core::kMaxChannels; ++c) zeros_[c] = 0;
-        learning_ = false; swapPhase_ = 0; learnFamily_ = 0;
+        learning_ = false; swapPhase_ = 0; learnFamily_ = 0; bkLive_ = false; freqPending_ = false;
+        binsValid_ = false; binStep_ = 0;                      // every lazily-anchored phasor re-anchors (law 11a)
         resetDetector();
         applyWanted();
     }
@@ -280,7 +281,7 @@ public:
         if (! prepared_) return;
         updateRates();
         if (wasOff && params_.mains != Mains::Off) resetDetector();
-        if (running_) setFrequency (clampToLock (fHat_));
+        if (running_) { fHat_ = clampToLock (fHat_); freqPending_ = true; }   // takes effect on the next boundary
         retarget();
     }
 
@@ -365,6 +366,7 @@ public:
             for (int k = 0; k < MaxHarmonics; ++k) { bkRe_[c][k] = wRe_[c][k]; bkIm_[c][k] = wIm_[c][k]; }
         bkFamily_ = family_; bkRunning_ = running_; bkAcquired_ = acquired_; bkAuto_ = autoFamily_;
         bkLocked_ = lockedPeriods_; bkHz_ = fHat_; bkActive_ = nActive_;
+        bkInc_ = inc_; bkAnchor_ = anchorPhase_; bkLive_ = true;   // the frame the snapshot's weights belong to
         learning_ = true; learnStatus_ = LearnStatus::Running; learnElapsed_ = 0; learnFamily_ = 0;
         learnArmAt_ = -1; peakOut_ = 0.0; streak_ = 0; streakFamily_ = 0;
         if (running_ && ramp_.getCurrentValue() > 0.0f) { swapPhase_ = 1; swapAction_ = 0; ramp_.setTargetValue (0.0f); }
@@ -399,6 +401,7 @@ public:
         if (commit && r.verdict == LearnVerdict::Learned)
         {
             if (params_.mains == Mains::Auto) autoFamily_ = learnFamily_;
+            bkLive_ = false;
             if (swapPhase_ == 0) retarget();
         }
         else if (running_ && ramp_.getCurrentValue() > 0.0f) { swapPhase_ = 1; swapAction_ = 1; pending_ = false; ramp_.setTargetValue (0.0f); }
@@ -479,11 +482,17 @@ private:
         ramp_.setTargetValue (pending_ || ! running_ ? 0.0f : 1.0f);
     }
 
-    // The oscillator at f: only the increment and the per-sample rotations change, never the phase.
+    // The oscillator at f: only the increment and the per-sample rotations change, never the phase. Called
+    // ONLY on a grid boundary (after the anchor advance) or on a restart — a period that ran p samples at one
+    // increment must be advanced at that increment; a change asked for between calls waits (freqPending_).
     void setFrequency (double f) noexcept
     {
         fHat_ = f;
-        const std::uint32_t ni = f > 0.0 ? incFor (f) : 0u;
+        setIncrement (f > 0.0 ? incFor (f) : 0u);
+    }
+
+    void setIncrement (std::uint32_t ni) noexcept
+    {
         if (ni == inc_ && rotsValid_) return;
         inc_ = ni;
         detail::phasor (inc_, rotRe_[0], rotIm_[0]);
@@ -511,7 +520,7 @@ private:
         double f  = (double) family_;
         const int s = family_ == 60 ? 1 : 0;
         if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s]) { f = clampToLock (coarse_[s]); acquired_ = true; }
-        rotsValid_ = false;
+        rotsValid_ = false; freqPending_ = false;
         setFrequency (running_ ? f : 0.0);
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
@@ -546,8 +555,12 @@ private:
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = bkRe_[c][k]; wIm_[c][k] = bkIm_[c][k]; pRe_[c][k] = bkRe_[c][k]; pIm_[c][k] = bkIm_[c][k]; }
         family_ = bkFamily_; nActive_ = bkActive_; running_ = bkRunning_; acquired_ = bkAcquired_; autoFamily_ = bkAuto_;
         lockedPeriods_ = bkLocked_;
+        // the snapshot's own phase frame: its anchor advanced at its own increment through the learn, so the
+        // weights come back paired with the references they were learned against (exact, uint32)
+        anchorPhase_ = bkAnchor_; fHat_ = bkHz_; freqPending_ = false; bkLive_ = false;
+        streak_ = 0; streakFamily_ = 0;                        // Auto re-decides only on windows after the restore
         rotsValid_ = false;
-        setFrequency (bkHz_);
+        setIncrement (bkInc_);
         refsValid_ = false; psE_ = 0.0; psEValid_ = false; thrE2_ = thr2_; pending_ = false;
         if (running_) { ramp_.setCurrentAndTargetValue (0.0f); ramp_.setTargetValue (1.0f); swapPhase_ = 2; }
         else          { ramp_.setCurrentAndTargetValue (0.0f); swapPhase_ = 0; retarget(); }
@@ -720,6 +733,7 @@ private:
     {
         const std::uint32_t P = (std::uint32_t) kPeriod;
         anchorPhase_ += P * inc_;                                   // exact, mod 2³²
+        if (bkLive_) bkAnchor_ += P * bkInc_;                       // the LEARN snapshot's frame, at its own rate
         for (int b = 0; b < 4; ++b) binAnchor_[b] += P * binInc_[b];
         refsValid_ = false;
         binsValid_ = false;
@@ -742,6 +756,7 @@ private:
         else if (swapPhase_ == 2 && ! ramp_.isSmoothing()) { swapPhase_ = 0; retarget(); }
         else if (swapPhase_ == 0 && pending_ && ! ramp_.isSmoothing() && core::exactlyEqual (ramp_.getCurrentValue(), 0.0f))
             applyWanted();
+        if (freqPending_) { freqPending_ = false; if (running_) setFrequency (fHat_); }
     }
 
     void endPeriod() noexcept
@@ -950,6 +965,8 @@ private:
     int    floorCount_ = 0, floorPos_ = 0, activeRun_ = 0, activeSamples_ = 960, hitHold_ = 0, holdSamples_ = 2400;
     int    streak_ = 0, streakFamily_ = 0, autoFamily_ = 0, winner_ = 0;   // winner_: the last window's family
     int    lockedPeriods_ = 0;
+    std::uint32_t bkInc_ = 0, bkAnchor_ = 0;
+    bool   bkLive_ = false, freqPending_ = false;
 
     // ---- LEARN ----
     double      bkRe_[core::kMaxChannels][MaxHarmonics] {};   // the snapshot endLearn(false) restores

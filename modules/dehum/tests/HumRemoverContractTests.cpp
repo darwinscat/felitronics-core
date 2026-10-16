@@ -470,6 +470,128 @@ static void testModes()
     }
 }
 
+//------------------------------------------------------------------------------------------------------
+// PHASE FRAMES. (A) A restart — reset(), or prepare() again at the same or another rate — must be a fresh
+// instance: every lazily-anchored phasor (references AND the detector's bins) re-anchors. (B) A cancelled
+// LEARN brings the old model back in the phase frame it belongs to, even when the learn ran at the other
+// family or moved the estimate. (B2) A frequency change between calls takes effect on the grid.
+static void feed64 (HR& h, std::vector<float>& v)
+{
+    for (std::size_t o = 0; o < v.size(); o += 64)
+    {
+        float* io[1] { v.data() + o };
+        felitronics::test::run (h.process (io, 1, (int) std::min<std::size_t> (64, v.size() - o)));
+    }
+}
+
+static void testRestartIsFresh()
+{
+    group ("a restart (reset, re-prepare at the same or another rate) is a fresh instance, bit for bit");
+    const int N = (int) (3.5 * kFs);
+    for (int mode = 0; mode < 2; ++mode)
+    {
+    Hum hum; hum.f0 = mode == 0 ? 50.3 : 49.7; hum.seed (13u);
+    std::vector<float> x ((std::size_t) N);
+    for (int i = 0; i < N; ++i) x[(std::size_t) i] = (float) hum.at (i);
+    const auto p = params (mode == 0 ? dh::Mains::Hz50 : dh::Mains::Auto, 0.5, 3.0);
+    HR fresh; fresh.setParams (p); felitronics::test::run (fresh.prepare (kFs, 512, 1));
+    std::vector<float> yF = x; feed64 (fresh, yF);
+    const char* how[] = { "reset()", "prepare() again, same rate", "prepare() again after 44.1 kHz" };
+    for (int w = 0; w < 3; ++w)
+    {
+        HR h; h.setParams (p); felitronics::test::run (h.prepare (w == 2 ? 44100.0 : kFs, 512, 1));
+        std::vector<float> pre ((std::size_t) 100);
+        for (int i = 0; i < 100; ++i) pre[(std::size_t) i] = (float) hum.at (i + 777);
+        { float* io[1] { pre.data() }; felitronics::test::run (h.process (io, 1, 100)); }
+        if (w == 0) h.reset(); else felitronics::test::run (h.prepare (kFs, 512, 1));
+        std::vector<float> y = x; feed64 (h, y);
+        const double a = h.mainsHz(), b = fresh.mainsHz();
+        int diff = 0; for (std::size_t i = 0; i < y.size(); ++i) diff += core::sameBits (y[i], yF[i]) ? 0 : 1;
+        ok (diff == 0 && std::memcmp (&a, &b, sizeof a) == 0, std::string (how[w]) + (mode == 0 ? " then 3.5 s of 50.3 Hz hum, mode 50: " : " then 3.5 s of 49.7 Hz hum, Auto: ")
+                                                               + std::to_string (diff) + " samples differ from a fresh instance");
+    }
+    }
+}
+
+static void testCancelledLearnKeepsPhase()
+{
+    group ("a cancelled LEARN restores the model in its own phase frame (learn at the other family; learn that moved f)");
+    const char* name[] = { "learn ran at 60 Hz", "learn moved the estimate 50.20 -> 50.25 Hz" };
+    for (int sc = 0; sc < 2; ++sc)
+    {
+        Hum h0; h0.f0 = 50.2; h0.seed (41u);
+        Hum hs; hs.f0 = sc == 0 ? 60.0 : 50.25; hs.seed (42u);
+        const int T1 = 3 * 48000, T2 = T1 + 2 * 48000, T3 = T2 + 9600, T4 = T3 + 24000;
+        const int pluck = T1 + (sc == 0 ? 76800 : 86400) + 13;
+        HR L, R;
+        for (HR* h : { &L, &R }) { h->setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h->prepare (kFs, 512, 1)); }
+        std::vector<float> a ((std::size_t) T1);
+        for (int i = 0; i < T1; ++i) a[(std::size_t) i] = (float) h0.at (i);
+        std::vector<float> a2 = a; feed64 (L, a); feed64 (R, a2);
+        L.beginLearn();
+        std::vector<float> s ((std::size_t) (T2 - T1)), z ((std::size_t) (T2 - T1), 0.0f);
+        // the learn's input changes SMOOTHLY (an abrupt change would trip the residual trigger at once and
+        // freeze the learn before it ran anywhere): a 0.5 s crossfade to 60 Hz hum, or a phase-continuous glide
+        double cyc = h0.f0 * (double) T1 / kFs;
+        for (int i = 0; i < T2 - T1; ++i)
+        {
+            const int n = T1 + i;
+            const double t = (double) i / kFs, a01 = std::min (1.0, std::max (0.0, (t - 0.1) / 0.5));
+            double v = 0.0;
+            if (sc == 0) v = (1.0 - a01) * h0.at (n) + a01 * hs.at (n);
+            else
+            {
+                for (int k = 1; k <= 24; ++k) v += h0.a1 / k * std::sin (2.0 * kPi * (k * cyc - std::floor (k * cyc)) + h0.ph[k - 1]);
+                cyc += (50.2 + 0.05 * a01) / kFs;   // after the sample: the glide is phase-continuous with h0
+            }
+            if (n >= pluck) { const double t = (double) (n - pluck) / kFs; v += 0.1 * std::exp (-t) * std::min (1.0, t / 0.001) * std::sin (2.0 * kPi * 329.628 * t); }
+            s[(std::size_t) i] = (float) v;
+        }
+        feed64 (L, s); feed64 (R, z);
+        const bool disturbed = L.learnStatus() == HR::LearnStatus::Disturbed;
+        const double fLearn = L.mainsHz();
+        (void) L.endLearn (false);
+        std::vector<float> z2 ((std::size_t) (T3 - T2), 0.0f), z3 = z2; feed64 (L, z2); feed64 (R, z3);
+        const double fl = L.mainsHz(), fr = R.mainsHz(), ol = L.oscillatorHz(), orr = R.oscillatorHz();
+        bool same = ! L.swapping() && L.detected() == R.detected() && std::memcmp (&fl, &fr, sizeof fl) == 0 && std::memcmp (&ol, &orr, sizeof ol) == 0;
+        for (int k = 1; k <= HR::kMaxHarmonics; ++k) { const auto x = L.weight (0, k), y = R.weight (0, k); same = same && std::memcmp (&x, &y, sizeof x) == 0; }
+        std::vector<float> b ((std::size_t) (T4 - T3));
+        for (int i = 0; i < T4 - T3; ++i) b[(std::size_t) i] = (float) h0.at (T3 + i);
+        std::vector<float> b2 = b; feed64 (L, b); feed64 (R, b2);
+        double dev = 0.0; for (std::size_t i = 0; i < b.size(); ++i) dev = std::max (dev, (double) std::fabs (b[i] - b2[i]));
+        const double devDb = dbOf (dev / 0.0316227766);
+        std::printf ("      %s: estimate during the learn %.4f Hz; after the restore |cancelled-learn - never-learned| peaks %.1f dB re the hum\n", name[sc], fLearn, devDb);
+        ok (disturbed && (sc == 0 ? std::fabs (fLearn - 60.0) < 0.1 : std::fabs (fLearn - 50.25) < 0.01), std::string (name[sc]) + ": precondition — the learn ran elsewhere (" + std::to_string (fLearn) + " Hz) and was Disturbed");
+        ok (same, std::string (name[sc]) + ": restored state = the never-learned twin's (weights, estimate, oscillator, decision)");
+        ok (core::sameBits (b[0], b2[0]), std::string (name[sc]) + ": the first returning sample is bit-identical (same phase frame)");
+        ok (devDb <= -40.0, std::string (name[sc]) + ": and the next 0.5 s stay within -40 dB of it (" + std::to_string (devDb) + ")");
+    }
+}
+
+static void testFrequencyChangeOnTheGrid()
+{
+    group ("a frequency change between calls takes effect on the grid: lockRange narrowed at grid phase 63, no step");
+    HR h; h.setParams (params (dh::Mains::Hz50, 0.5, 3.0)); felitronics::test::run (h.prepare (kFs, 512, 1));
+    Hum hum; hum.f0 = 50.9; hum.k = 6; hum.seed (44u);   // six harmonics: the correction's own curvature is ≈ -91 dBFS
+    const int A = 4 * 48000 + 63, N = A + 4800;
+    std::vector<float> x ((std::size_t) N);
+    for (int i = 0; i < N; ++i) x[(std::size_t) i] = (float) hum.at (i);
+    const std::vector<float> in = x;
+    { float* io[1] { x.data() }; felitronics::test::run (h.process (io, 1, A)); }
+    const double before = h.mainsHz();
+    h.setParams (params (dh::Mains::Hz50, 0.5, 3.0, 0.0));
+    { float* io[1] { x.data() + A }; felitronics::test::run (h.process (io, 1, N - A)); }
+    double m = 0.0;
+    for (int i = A - 2400; i < N; ++i)
+    {
+        const double c0 = (double) in[(std::size_t) i] - x[(std::size_t) i], c1 = (double) in[(std::size_t) i - 1] - x[(std::size_t) i - 1], c2 = (double) in[(std::size_t) i - 2] - x[(std::size_t) i - 2];
+        m = std::max (m, std::fabs (c0 - 2.0 * c1 + c2));
+    }
+    std::printf ("      locked at %.4f Hz, narrowed to %.4f Hz: max second difference of the correction %.1f dBFS\n", before, h.mainsHz(), dbOf (m));
+    ok (before > 50.85 && std::fabs (h.mainsHz() - 50.0) < 1e-9, "precondition: locked at 50.9, pulled to 50.0");
+    ok (dbOf (m) <= -80.0, "no step: the correction's second difference stays at " + std::to_string (dbOf (m)) + " dBFS");
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover as a stage\n");
@@ -481,5 +603,8 @@ int main()
     testMinuteOfSilence();
     testPoison();
     testModes();
+    testRestartIsFresh();
+    testCancelledLearnKeepsPhase();
+    testFrequencyChangeOnTheGrid();
     return felitronics::test::report();
 }
