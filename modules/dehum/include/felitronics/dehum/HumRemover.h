@@ -138,8 +138,14 @@ namespace felitronics::dehum
 // samples, and if those did better, or the input sits 3 dB under the old floor, the weights go back over 40 ms to
 // where the return found them (a hum turned under the note at the same level): "no worse than without the return",
 // not an absolute test. A trigger cancels a check; a take-back's target is never reused as a note's snapshot.
-// OPEN (review 6): an attack in the ≈ 10 ms right after a return ends opens no event until the check's end, and
-// that note's ghost is not returned. The snapshot keeps its own time origin, so a new
+// OPEN (reviews 6–7): a SLOW attack within ≈ 100 ms of the previous note may trip no trigger at all — the residual
+// trigger wants 4× the recent peak, still raised by the previous note, and an attack's envelope grows ≤ 6 dB per
+// period after its first, so whether it trips depends on its first period (measured: 2 ms ramps never missed, 10 ms
+// ramps missed 10 of 22 gaps of 55–76 ms) — and then no event opens and that note keeps the old ghost. Opening an
+// event on level as well was tried and parked: on a take whose hum vanished under ringing strings it kept the stale
+// model longer. That case is a limit of its own: a hum that leaves the input while strings ring is still subtracted
+// at its old level until the playing width re-converges (seconds; measured ≈ 4.5 s to the input's level at k11).
+// The snapshot keeps its own time origin, so a new
 // attack mid-return does not turn it twice. LIMITS (V10/V11): the end fires at the first 21 ms mean under 4× the
 // old floor, so with the 10 dB drop the return engages only for notes ≥ ≈ 16 dB over the hum's mean square; and
 // there is ONE event for all channels — a channel that adapted legitimately under it is returned with the rest. FREEZING adaptation while active instead was measured and rejected:
@@ -1078,13 +1084,12 @@ private:
         rsSum_ = 0.0; evSum_ = 0.0;
         for (int i = 0; i < kGhostEndPeriods; ++i) { rsSum_ += rsRing_[i]; evSum_ += evRing_[i]; }
         if (! running_ || learning_ || swapPhase_ != 0 || pending_ || ! floorValid_) { evOn_ = false; chk_ = 0; return; }
-        // V2: did the return help? 16 periods after it the residual must not be over what it was in the 16 before
-        // it, and the input must not have settled 3 dB under the floor the note began on: if the hum changed under
-        // the note (hands on the strings: quieter; a turned phase) the snapshot is stale, and the weights go back
-        // over 40 ms to where the return found them
-        // W3: both models judged on the SAME samples — the residual the stage made over the check, against the one
-        // the weights the return left would have made on them — so hiss alone never decides it. W4: a trigger
-        // cancels the check first (its note opens an event below)
+        // V2/W3: did the return help? Over the 16 periods after it, the residual the stage made is compared with the
+        // one the weights the return found (the ghost and all) would have made on the SAME samples; if those did
+        // better, or the input settled 3 dB under the floor the note began on (hands on the strings: a quieter hum),
+        // the snapshot was stale and the weights go back over 40 ms to where the return found them. Hiss alone never
+        // decides it (both models see the same samples). W4: a trigger cancels the check first (its note opens an
+        // event below)
         if (hit_ && chk_ > 0) chk_ = 0;
         const double half = 2.0 * evSum_;
         if (chk_ > 0 && retLeft_ == 0 && --chk_ == 0 && (chkU_ < chkW_ || half < (double) kGhostEndPeriods * evRef_))
