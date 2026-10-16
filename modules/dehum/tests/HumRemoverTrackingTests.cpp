@@ -26,7 +26,8 @@ using HR = dh::HumRemover<>;
 struct HumSpec
 {
     double f0 = 50.0, a1 = 0.01, slope = 0.0, rampFrom = 0.0, rampTo = 0.0, sign = 1.0, until = 1e9;
-    int    kmin = 1, kmax = 24, parity = 0;   // parity 1 = odd harmonics only, 2 = even only
+    int    kmin = 1, kmax = 24, parity = 0;   // parity 1 = odd harmonics only, 2 = even only; kmax <= 128
+    bool   aligned = false;                   // edge-aligned harmonics: a pulse-train buzz (rectifier, dimmer)
     std::uint32_t seed = 1;
 };
 static double humCycles (const HumSpec& s, double t)
@@ -46,8 +47,8 @@ static double humFreq (const HumSpec& s, double t)
 }
 static void addHum (std::vector<float>& x, const HumSpec& s, double fs, std::int64_t from = 0)
 {
-    Lcg r { s.seed }; double ph[64];
-    for (double& p : ph) p = 2.0 * kPi * r.uniform();
+    Lcg r { s.seed }; double ph[128];
+    for (double& p : ph) p = s.aligned ? 0.5 * kPi : 2.0 * kPi * r.uniform();
     for (std::int64_t n = from; n < (std::int64_t) x.size(); ++n)
     {
         const double t = (double) n / fs;
@@ -942,6 +943,155 @@ static void testFllLiveChannels()
     ok (worst[1] <= 1.1 * worst[0] + 1e-5, "the stopped channel does not slow the tracker (" + fmt (worst[1], 5) + " vs " + fmt (worst[0], 5) + " Hz)");
 }
 
+//------------------------------------------------------------------------------------------------------
+// ROUND 2. R1 the FLL recovers a drift accumulated while playing; R2 an edge-aligned buzz is quiet and
+// locks; R3 hands on / hands off the strings (hum −12 dB while playing, back at the pause) re-qualifies.
+static void addPlucks (std::vector<float>& x, double from, double to, double fs, double amp)
+{
+    const double fr[] = { 196.0, 246.942, 329.628, 659.255 };
+    for (int i = 0; from + 0.5 * i < to; ++i)
+    {
+        Note n; n.f0 = fr[i % 4]; n.amp = amp; n.start = from + 0.5 * i; n.tau = 1.0; n.attack = 0.001;
+        n.dur = std::min (3.0, to - n.start);
+        addNote (x, n, fs);
+    }
+}
+
+static void testDriftRecovered()
+{
+    group ("R1: a drift accumulated while playing is recovered in the first quiet");
+    const double fs = 48000.0;
+    for (double drift : { 0.06, -0.06 })
+    {
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.slope = drift / 60.0; hs.rampFrom = 3.0; hs.rampTo = 63.0; hs.seed = 81u;
+        std::vector<float> x ((std::size_t) (75.0 * fs), 0.0f);
+        addHum (x, hs, fs);
+        addPlucks (x, 3.0, 63.0, fs, 0.1);
+        const std::vector<float> in = x;
+        Tel tel;
+        const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        double back = -1.0;
+        for (std::size_t i = 0; i < tel.f.size(); ++i)
+        {
+            const double t = tOf (tel, i, fs);
+            if (t > 63.0 && std::fabs (tel.f[i] - humFreq (hs, t)) >= 0.005) back = t - 63.0;
+        }
+        const double nul = worstNull (y, in, (std::int64_t) (73.0 * fs), (std::int64_t) fs, 50.0 + drift, fs);
+        std::printf ("      drift %+.2f Hz over 60 s of playing: within 5 mHz %.2f s after it ends; null 10 s after %.1f dB\n", drift, back, nul);
+        ok (back >= 0.0 && back <= 3.0, "R1 drift " + fmt (drift, 2) + " Hz: re-locked within 3.0 s of the first quiet (" + fmt (back, 2) + " s)");
+        ok (nul <= -60.0, "R1 drift " + fmt (drift, 2) + " Hz: and the hum nulled again (" + fmt (nul, 1) + " dB)");
+    }
+}
+
+static void testAlignedBuzz()
+{
+    group ("R2: an edge-aligned buzz (24 and 100 harmonics) is quiet, locks and nulls; LEARN is Learned");
+    const double fs = 48000.0;
+    double nulOf[2][2] {};
+    for (int kmax : { 24, 100 })
+    for (int al = 1; al >= 0; --al)
+    {
+        HumSpec hs; hs.f0 = 50.2; hs.a1 = 0.0316; hs.kmax = kmax; hs.aligned = al == 1; hs.seed = 82u;
+        std::vector<float> x ((std::size_t) (9.0 * fs), 0.0f);
+        addHum (x, hs, fs);
+        const std::vector<float> in = x;
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::int64_t o = 0;
+        block64 (h, x, o, (std::int64_t) (5.0 * fs));
+        const bool quiet = h.quiet();
+        const double f5 = h.mainsHz();
+        h.beginLearn(); block64 (h, x, o, (std::int64_t) (7.5 * fs));
+        const auto r = h.endLearn (true);
+        block64 (h, x, o, (std::int64_t) x.size());
+        // fit k1..30 jointly: with 100 harmonics the uncancelled k25+ would leak into a k1..24-only fit
+        std::vector<double> fr; for (int k = 1; k <= std::min (kmax, 30); ++k) fr.push_back (50.2 * k);
+        const auto ay = fitAmps (x, (std::int64_t) (8.0 * fs), (std::int64_t) fs - 2000, fr, fs), ax = fitAmps (in, (std::int64_t) (8.0 * fs), (std::int64_t) fs - 2000, fr, fs);
+        double nul = -400.0; for (int k = 0; k < 24; ++k) nul = std::max (nul, dbOf (ay[(std::size_t) k] / ax[(std::size_t) k]));
+        std::printf ("      %s, %d harmonics: quiet %d, %.4f Hz at 5 s, learn verdict %d, worst of k1..24 %.1f dB\n", al ? "aligned buzz" : "random phases", kmax, (int) quiet, f5, (int) r.verdict, nul);
+        const std::string tag = std::string (al ? "R2 aligned buzz " : "R2 random phases ") + std::to_string (kmax);
+        ok (quiet && std::fabs (f5 - 50.2) < 0.005, tag + ": quiet and locked by 5 s");
+        ok (r.verdict == HR::LearnVerdict::Learned, tag + ": LEARN is Learned");
+        nulOf[kmax == 100 ? 1 : 0][al] = nul;
+        if (al == 0 && kmax == 24)
+            ok (nulOf[0][1] <= std::max (-60.0, nul + 6.0), "R2 24 harmonics: the aligned buzz nulls like random phases (" + fmt (nulOf[0][1], 1) + " vs " + fmt (nul, 1) + " dB)");
+        if (al == 0 && kmax == 100)   // THE LIMIT, stated in the header: harmonics above the active set bias the FLL
+            ok (nulOf[1][1] <= -43.0 && nul <= -43.0, "R2 100 harmonics: k1..24 nulled to the stated limit, <= -43 dB (aligned " + fmt (nulOf[1][1], 1)
+                + ", random " + fmt (nul, 1) + " dB; raise `harmonics` to cover the buzz)");
+    }
+}
+
+static void testHandsOnHandsOff()
+{
+    group ("R3: hands on the strings (hum -12 dB while playing), hands off at the pause: quiet and the null come back");
+    const double fs = 48000.0;
+    HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.0316; hs.seed = 83u;
+    std::vector<float> x ((std::size_t) (10.5 * fs), 0.0f);
+    addHum (x, hs, fs);
+    {   // hands on the strings: the grounding changes the hum's LEVEL (-12 dB) and its PHASE
+        std::vector<float> on (x.size(), 0.0f);
+        HumSpec hb = hs; hb.seed = 84u; hb.a1 = hs.a1 * 0.2512; addHum (on, hb, fs);
+        for (std::size_t i = (std::size_t) (3.0 * fs); i < (std::size_t) (7.0 * fs); ++i) x[i] = on[i];
+    }
+    addPlucks (x, 3.0, 7.0, fs, 0.1);
+    const std::vector<float> in = x;
+    Tel tel;
+    const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+    double back = 0.0;
+    for (std::size_t i = 0; i < tel.quiet.size(); ++i) { const double t = tOf (tel, i, fs); if (t > 7.5 && t < 10.5 && ! tel.quiet[i]) back = t - 7.0; }
+    double k1[3];
+    for (int j = 0; j < 3; ++j)
+    {
+        const std::int64_t a = (std::int64_t) ((7.5 + j) * fs);
+        k1[j] = dbOf (fitAmp (y, a, 4800, 50.0, fs) / fitAmp (in, a, 4800, 50.0, fs));
+    }
+    std::printf ("      hands off at 7 s (plucks ring until ~10 s): quiet steady from %.2f s after; k1 %.1f / %.1f / %.1f dB at 0.5 / 1.5 / 2.5 s\n", back, k1[0], k1[1], k1[2]);
+    ok (k1[1] <= -60.0, "R3: k1 nulled to <= -60 dB by 1.5 s into the pause (" + fmt (k1[1], 1) + " dB)");
+}
+
+// R3, THE REVIEW'S PROBE: Hz50, 50.2 Hz, 24 harmonics at phase 0.7·k (a linear phase — an edge-aligned buzz) or
+// random; −30 dBFS hands-off 4 s, −42 hands-on with G3 plucks every 0.5 s for 4 s, then hands-off; 64-sample
+// calls, 1e-4 noise. Quiet back and k1 <= −60 dB within 1 s of hands-off.
+static void testHandsProbe()
+{
+    group ("R3 (the review's probe): hands off after 4 s of playing hands-on — quiet within 1 s, k1 <= -60 dB by 1.5 s");
+    const double fs = 48000.0, T0 = 4.0, T1 = 8.0, T2 = 11.0;
+    for (int linear = 1; linear >= 0; --linear)
+    {
+        double ph[25]; Lcg pr { 85u };
+        for (int k = 1; k <= 24; ++k) ph[k] = linear ? 0.7 * k : 2.0 * kPi * pr.uniform();
+        const long long N = (long long) (T2 * fs);
+        std::vector<float> x ((std::size_t) N);
+        unsigned sd = 1;
+        for (long long n = 0; n < N; ++n)
+        {
+            const double t = (double) n / fs; const bool play = t >= T0 && t < T1;
+            const double a1 = play ? 0.0316 * 0.25 : 0.0316;
+            double hum = 0.0; for (int k = 1; k <= 24; ++k) hum += a1 / k * std::sin (2.0 * kPi * 50.2 * k * (double) n / fs + ph[k]);
+            double env = 1.0, nt = 0.0;
+            if (play)
+            {
+                const double tp = std::fmod (t - T0, 0.5);
+                env = tp < 0.005 ? tp / 0.005 : std::exp (-(tp - 0.005) / 0.6);
+                for (int k = 1; k <= 6; ++k) nt += 0.1 / k * std::sin (2.0 * kPi * 196.0 * k * (double) n / fs + 0.3 * k);
+            }
+            sd = sd * 1664525u + 1013904223u;
+            x[(std::size_t) n] = (float) (hum + (play ? env * nt : 0.0) + 1e-4 * ((double) sd / 4294967296.0 - 0.5));
+        }
+        const std::vector<float> in = x;
+        HR h; dh::HumRemoverParams p; p.mains = dh::Mains::Hz50; h.setParams (p); felitronics::test::run (h.prepare (fs, 64, 1));
+        std::vector<int> q;
+        for (long long o = 0; o < N; o += 64) { float* io[1] { x.data() + o }; felitronics::test::run (h.process (io, 1, 64)); q.push_back (h.quiet() ? 1 : 0); }
+        double k1[4]; for (int j = 0; j < 4; ++j) { const std::int64_t a = (std::int64_t) ((T1 + 0.5 * j) * fs); k1[j] = dbOf (fitAmp (x, a, 12000, 50.2, fs) / fitAmp (in, a, 12000, 50.2, fs)); }
+        double back = -1.0; for (std::size_t i = 0; i < q.size(); ++i) { const double t = (double) ((i + 1) * 64) / fs; if (t > T1 && q[i] && back < 0.0) back = t - T1; }
+        std::printf ("      %s phases: quiet back %.2f s after hands-off; k1 %.1f / %.1f / %.1f / %.1f dB at 0 / 0.5 / 1.0 / 1.5 s\n",
+                     linear ? "linear (buzz)" : "random", back, k1[0], k1[1], k1[2], k1[3]);
+        // the step at hands-off trips the trigger, so the two hops holding it are not trigger-free: quiet can come
+        // back at ~0.5 s at the earliest, and 44 dB at the learn width then takes 5·τ ≈ 0.5 s more
+        ok (back >= 0.0 && back <= 1.0 && k1[3] <= -60.0, std::string ("R3 probe, ") + (linear ? "linear" : "random") + " phases: quiet within 1 s ("
+                                                        + fmt (back, 2) + " s) and k1 <= -60 dB by 1.5 s (" + fmt (k1[3], 1) + " dB; " + fmt (k1[2], 1) + " at 1 s)");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -964,5 +1114,9 @@ int main()
     testLearnAfterChanges();
     testLearnContract();
     testFllLiveChannels();
+    testDriftRecovered();
+    testAlignedBuzz();
+    testHandsOnHandsOff();
+    testHandsProbe();
     return felitronics::test::report();
 }

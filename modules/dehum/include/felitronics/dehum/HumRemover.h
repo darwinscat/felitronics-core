@@ -47,7 +47,9 @@ namespace felitronics::dehum
 //       not quiet for ≈ 19 s. A LOUDER HUM is told apart from a note: the running family's bins up 3 dB in a
 //       quiet, trigger-free window AND the coarse estimate within 0.05 Hz of ours → the residual floor
 //       restarts and quiet returns (measured: 0.51 s after a +10 dB step). The input floor no longer gates
-//       quiet; it keeps active() and the trigger used before the canceller runs. Smoothed powers are seeded
+//       quiet; it keeps active() and the trigger used before the canceller runs. (Since review 2 the louder
+//       hum is judged against what the MODEL explains — its k1/k2 a hop ago — not a past window: hands on
+//       the strings and off again re-qualifies within 1 s.) Smoothed powers are seeded
 //       from a settled level, never from one 64-sample period (a waveform trough there set every trigger off);
 //   (c) no per-sample trigger in the last 50 ms: a sample 12 dB over the floor's sine peak (x² > 32·floor),
 //       or — while the canceller runs — a RESIDUAL sample 12 dB over the residual's own 20 ms-smoothed level
@@ -159,6 +161,10 @@ namespace felitronics::dehum
 //   * Law 11c: a clock-only call (nch == 0) is digital silence for every shared clock — the grid, the mains
 //     and bin phases, the hop and window counters, the ramp and a pending re-arm advance exactly as through
 //     n zeros at a live width; weights and detector statistics hold, as they do through zeros.
+//
+// A BUZZ ABOVE THE ACTIVE SET: harmonics past `harmonics` are not cancelled, and the first of them leaks into the
+// top active weight as a ripple at f0 that biases the FLL by ≈ 0.3 mHz — an edge-aligned 100-harmonic buzz
+// nulls k1..24 to ≈ −46 dB (−56 with random phases) instead of −90. Remedy: raise `harmonics` to cover it.
 //
 // WHAT IT CANNOT DO: remove hum that is made after this stage's input (e.g. inside a physical amplifier
 // downstream), harmonics above the active set, or hum whose phase moves faster than τ lets the weights follow.
@@ -272,6 +278,7 @@ public:
         activeSamples_ = (int) std::llround (kActiveSeconds * fs_);
         holdSamples_   = (int) std::llround (kHoldSeconds * fs_);
         settlePeriods_ = (int) std::llround (3.0 * kSmoothSeconds * fs_ / (double) kPeriod) + 1;
+        pkDecay64_     = core::det::exp2 (-2.0 * (double) kPeriod / (0.040 * fs_));   // peak reference: -6 dB per 40 ms
         for (int i = 0; i <= kBlackRun; ++i)                  // the black fade: a raised cosine over 64 samples
             blackFade_[i] = 0.5 - 0.5 * core::det::cos (core::kPi * (double) i / (double) kBlackRun);
         blackFade_[0] = 0.0; blackFade_[kBlackRun] = 1.0;
@@ -569,7 +576,7 @@ private:
         double f  = (double) family_;
         const int s = family_ == 60 ? 1 : 0;
         if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s]) { f = clampToLock (coarse_[s]); acquired_ = true; }
-        rotsValid_ = false; freqPending_ = false;
+        rotsValid_ = false; freqPending_ = false; glide_ = false; lastCoarseValid_ = false; prevModel_ = 0.0;
         setFrequency (running_ ? f : 0.0);
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int k = 0; k < MaxHarmonics; ++k) { wRe_[c][k] = 0.0; wIm_[c][k] = 0.0; pRe_[c][k] = 0.0; pIm_[c][k] = 0.0; }
@@ -618,6 +625,25 @@ private:
         else          { ramp_.setCurrentAndTargetValue (0.0f); swapPhase_ = 0; retarget(); }
     }
 
+    // The hum power the model explains in the bins' terms: its k1/k2 (A²/2 per channel), times the bins' own
+    // rectangular-window response at f̂ (sinc² of the offset over the window).
+    double modelBinPower() const noexcept
+    {
+        double m = 0.0;
+        for (int h = 1; h <= 2 && h <= nActive_; ++h)
+        {
+            const double x = (double) h * (fHat_ - (double) family_) * 2.0 * hopSec_;
+            const double px = core::kPi * x;
+            const double sn = std::fabs (px) < 1e-12 ? 1.0 : core::det::sin (px) / px;
+            double p = 0.0;
+            for (int c = 0; c < maxCh_; ++c) { const double a = wRe_[c][h - 1] * wRe_[c][h - 1]; const double b = wIm_[c][h - 1] * wIm_[c][h - 1]; p += a; p += b; }
+            const double q = 0.5 * p;
+            const double r = sn * sn;
+            m += q * r;
+        }
+        return m;
+    }
+
     // After cancellation true quiet is the noise floor; a note is not. Within 12 dB of the residual floor.
     bool residualQuiet() const noexcept { return ! running_ || ! rfValid_ || ! psEValid_ || ! (psE_ > kQuietRatio * rf_); }
 
@@ -627,8 +653,8 @@ private:
     {
         fllHold_ = hopPeriods_ * kPeriod;   // fresh weights are small and moving: the FLL waits one hop for them
         psE_ = ps_; psEValid_ = psValid_; psEAge_ = settlePeriods_;
-        if (psEValid_ && floorValid_) { const double lo = 1e-4 * floor_; thrE2_ = kHitRatio * (psE_ > lo ? psE_ : lo); }
-        else thrE2_ = thr2_;
+        thrE2_ = floorValid_ ? kHitRatio * 1e-4 * floor_ : thr2_;
+        for (int c = 0; c < core::kMaxChannels; ++c) { pkE_[c] = kHitRatio * ps_; pkCur_[c] = 0.0; }   // the residual IS the input now
     }
 
     void resetResidualFloor() noexcept { rfCount_ = 0; rfPos_ = 0; rfValid_ = false; rf_ = 0.0; hopMinE_ = kNone; }
@@ -636,6 +662,7 @@ private:
     void resetDetector() noexcept
     {
         famRef_[0] = famRef_[1] = 0.0; hitInHop_ = false; hitPrevHop_ = false; lwMin_ = kNone; coarseOk_ = false; psAge_ = 0; psEAge_ = 0;
+        glide_ = false; lastCoarseValid_ = false; prevModel_ = 0.0;
         resetResidualFloor();
         for (int c = 0; c < core::kMaxChannels; ++c)
             for (int b = 0; b < 4; ++b)
@@ -772,7 +799,12 @@ private:
                 {
                     const double e2 = err * err;
                     periodSumE_ += e2;
-                    if (e2 > thrE2_) hit_ = true;
+                    // R2: against the residual's recent PEAK (released 6 dB per 40 ms), not its mean — a pulse-
+                    // train residual (an edge-aligned buzz) is stationary, and a pluck still trips on its first
+                    // samples; never below the 1e-4·floor bound
+                    const double t4 = 4.0 * pkE_[c];               // the reference, refreshed on the grid only
+                    if (e2 > (t4 > thrE2_ ? t4 : thrE2_)) hit_ = true;
+                    if (e2 > pkCur_[c]) pkCur_[c] = e2;
                 }
                 if (learning_ && hit_) learnStatus_ = LearnStatus::Disturbed;   // frozen from this very sample
                 chanLive_[c] = true;
@@ -813,7 +845,13 @@ private:
         refsValid_ = false;
         binsValid_ = false;
         if (detOn()) endPeriod();
-        for (int c = 0; c < core::kMaxChannels; ++c) chanLive_[c] = false;
+        for (int c = 0; c < core::kMaxChannels; ++c)
+        {
+            chanLive_[c] = false;
+            const double d = pkE_[c] * pkDecay64_;               // the residual's peak reference: last periods' peak,
+            pkE_[c] = pkCur_[c] > d ? pkCur_[c] : d;             // released 6 dB per 40 ms (a pause decays it too)
+            pkCur_[c] = 0.0;
+        }
         for (int c = 0; c < maxCh_; ++c)
             for (int k = 0; k < nActive_; ++k)
             {
@@ -863,7 +901,13 @@ private:
             const bool above = floorValid_ && p > kQuietRatio * floor_;
             activeRun_ = above ? (activeRun_ < activeSamples_ ? activeRun_ + kPeriod : activeRun_) : 0;
             if (psAge_ >= settlePeriods_ && ps_ < hopMin_) hopMin_ = ps_;
-            if (running_ && wasQuiet && winner_ == family_ && swapPhase_ == 0 && params_.lockRangeHz > 0.0) trackFrequency();
+            if (running_ && glide_ && swapPhase_ == 0 && hitHold_ <= 0 && ! hit_ && fllHold_ <= 0 && params_.lockRangeHz > 0.0)
+            {
+                const double d = glideTarget_ - fHat_;
+                if (std::fabs (d) <= 0.01) glide_ = false;
+                else setFrequency (clampToLock (fHat_ + (d > slewT_ ? slewT_ : (d < -slewT_ ? -slewT_ : d))));
+            }
+            else if (running_ && wasQuiet && winner_ == family_ && swapPhase_ == 0 && params_.lockRangeHz > 0.0) trackFrequency();
         }
         if (sumE > 0.0)                                        // the residual's smoothed level (running only)
         {
@@ -886,12 +930,7 @@ private:
         quietPeriod_ = quietWin_ && floorValid_ && hitHold_ <= 0 && residualQuiet();
         hit_  = false;
         thr2_ = floorValid_ ? kHitRatio * floor_ : (psValid_ && psAge_ >= settlePeriods_ ? kHitRatio * ps_ : kNone);
-        if (psEValid_ && floorValid_)
-        {
-            const double lo = 1e-4 * floor_;
-            thrE2_ = kHitRatio * (psE_ > lo ? psE_ : lo);
-        }
-        else thrE2_ = thr2_;
+        thrE2_ = floorValid_ ? kHitRatio * 1e-4 * floor_ : thr2_;   // the residual trigger's absolute bound
     }
 
     // The FLL: the weights' rotation over this period, weighted by k·|w|², one gain-and-slew step.
@@ -990,12 +1029,26 @@ private:
             else { streak_ = 0; streakFamily_ = 0; }
             // A LOUDER HUM is not a note: the running family's bins up 3 dB, at the frequency we track — the
             // residual floor restarts, so quiet returns while the canceller re-converges at the learn width.
-            if (running_ && quiet && trigFree && winner == family_)
-            {
-                const int fs2 = family_ == 60 ? 1 : 0;
-                if (famRef_[fs2] > 0.0 && famOf[fs2] > 2.0 * famRef_[fs2] && coarseValid_[fs2] && std::fabs (coarse_[fs2] - fHat_) < 0.05)
-                    resetResidualFloor();
-            }
+            // Both compare the bins with what the MODEL explains (its own k1/k2, at the bins' sinc for f̂), not with
+            // a past window: (R3) the family's bins 3 dB OVER the model, at the frequency we track (coarse within
+            // 0.05 Hz), is a louder hum — hands off the strings — and the residual floor restarts; (R1) a coarse
+            // estimate stable over two windows but 0.05 Hz or more from f̂, with the bins within 3 dB of the
+            // model (the hum we model, not a note at a bin), is a drift accumulated while the FLL held — f̂
+            // glides to it at the slew bound, then the FLL takes over.
+            const int    rs    = family_ == 60 ? 1 : 0;
+            const double model = running_ ? modelBinPower() : 0.0;
+            // the window averages the last 0.5 s, so it is held against the model as it stood a hop ago (the
+            // smaller of the two): a model already climbing toward a louder hum must not hide it
+            const double modelRef = (prevModel_ > 0.0 && prevModel_ < model) ? prevModel_ : model;
+            prevModel_ = model;
+            if (running_ && quiet && trigFree && winner == family_ && modelRef > 0.0 && famOf[rs] > 2.0 * modelRef
+                && coarseValid_[rs] && std::fabs (coarse_[rs] - fHat_) < 0.05)
+                resetResidualFloor();
+            const bool stable = coarseValid_[rs] && lastCoarseValid_ && std::fabs (coarse_[rs] - lastCoarse_) < 0.01;
+            glide_ = running_ && quiet && trigFree && stable && std::fabs (coarse_[rs] - fHat_) >= 0.05
+                     && model > 0.0 && famOf[rs] < 2.0 * model && famOf[rs] > 0.5 * model;
+            if (glide_) glideTarget_ = clampToLock (coarse_[rs]);
+            lastCoarse_ = coarse_[rs]; lastCoarseValid_ = coarseValid_[rs];
             if (quiet && trigFree && winner != 0) famRef_[winner == 60 ? 1 : 0] = famOf[winner == 60 ? 1 : 0];
             if (learning_)                                      // a learn decides with Auto's windows, whatever the mode
             {
@@ -1082,6 +1135,10 @@ private:
     int    zeros_[core::kMaxChannels] {};
     int    blackGain_[core::kMaxChannels] {};   // 0..kBlackRun: the black fade's position per channel
     bool   chanLive_[core::kMaxChannels] {};    // adapted during this grid period (the FLL sums only these)
+    double pkE_[core::kMaxChannels] {};         // the residual's peak follower, per channel
+    double pkCur_[core::kMaxChannels] {};       // this period's residual peak
+    double pkDecay64_ = 1.0, glideTarget_ = 0.0, lastCoarse_ = 0.0, prevModel_ = 0.0;
+    bool   glide_ = false, lastCoarseValid_ = false;
     double blackFade_[kBlackRun + 1] {};
 
     // ---- detector ----
