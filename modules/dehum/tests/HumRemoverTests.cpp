@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
 //
-// dehum::HumRemover as a FILTER: the null it digs at every harmonic, the notch shape against the exact
+// dehum::HumRemover as a FILTER (the LTI configuration: one width, no tracking — dehumtest::lti): the null it digs at every harmonic, the notch shape against the exact
 // transfer of the LMS loop (and the −3 dB point at ±BW/2), what it does to the partials of real notes, a
 // sweep away from the harmonics, and the ring an impulse leaves. At 48 and 192 kHz, 50 and 60 Hz mains.
 #include <felitronics_test.h>
@@ -30,7 +30,7 @@ static double nullDepth (double fs, dh::Mains m, double bw, double settleS, doub
     const std::vector<float> in = x;
 
     dh::HumRemover<> h;
-    h.setParams (params (m, bw));   // params first: prepare applies them at once
+    h.setParams (lti (m, bw));   // params first: prepare applies them at once
     felitronics::test::run (h.prepare (fs, 512, 1));
     runMono (h, x);
 
@@ -76,9 +76,9 @@ static void testNullDepth()
 static void notchPoint (double fs, int k, double d, double bw, double& measured, double& exact)
 {
     dh::HumRemover<> h;
-    h.setParams (params (dh::Mains::Hz50, bw));   // params first: prepare applies them at once
+    h.setParams (lti (dh::Mains::Hz50, bw));   // params first: prepare applies them at once
     felitronics::test::run (h.prepare (fs, 512, 1));
-    const double fOsc = h.mainsHz(), f = k * fOsc + d;
+    const double fOsc = h.oscillatorHz(), f = k * fOsc + d;
     const std::int64_t S = (std::int64_t) (10.0 * fs), W = (std::int64_t) (4.0 * fs);
     std::vector<float> x ((std::size_t) (S + W + (std::int64_t) (0.02 * fs)));
     for (std::size_t n = 0; n < x.size(); ++n) x[n] = (float) (0.25 * std::sin (2.0 * kPi * std::fmod (f * (double) n / fs, 1.0) + 0.3));
@@ -139,9 +139,9 @@ static void testPassband()
         for (int ni = 0; ni < 4; ++ni)
         {
             dh::HumRemover<> h;
-            h.setParams (params (m, bw));   // params first: prepare applies them at once
+            h.setParams (lti (m, bw));   // params first: prepare applies them at once
             felitronics::test::run (h.prepare (fs, 512, 1));
-            const double fOsc = h.mainsHz();
+            const double fOsc = h.oscillatorHz();
             const int    K    = h.activeHarmonics();
             std::vector<double> fr; double ph[8]; Lcg r { 77u + (std::uint32_t) ni };
             for (int p = 1; p <= 8; ++p) { fr.push_back (p * notes[ni] * std::sqrt (1.0 + 1e-4 * p * p)); ph[p - 1] = 2.0 * kPi * r.uniform(); }
@@ -189,10 +189,10 @@ static void testSweep()
         for (double f : fr)
         {
             dh::HumRemover<> h;
-            h.setParams (params (m, bw));   // params first: prepare applies them at once
+            h.setParams (lti (m, bw));   // params first: prepare applies them at once
             felitronics::test::run (h.prepare (fs, 512, 1));
             double dist = 1e9;
-            for (int k = 1; k <= h.activeHarmonics(); ++k) dist = std::min (dist, std::fabs (f - k * h.mainsHz()));
+            for (int k = 1; k <= h.activeHarmonics(); ++k) dist = std::min (dist, std::fabs (f - k * h.oscillatorHz()));
             ok (dist >= 3.0, "precondition: " + std::to_string (f) + " Hz is 3 Hz or more from every harmonic");
             const std::int64_t S = (std::int64_t) (4.0 * fs), W = (std::int64_t) (2.0 * fs);
             std::vector<float> x ((std::size_t) (S + W + 960));
@@ -220,7 +220,7 @@ static void testImpulseRing()
     const double fs = 48000.0, bw = 0.5;
     Hum hum; hum.fs = fs; hum.seed (5u);
     dh::HumRemover<> a;
-    a.setParams (params (dh::Mains::Hz50, bw));   // params first: prepare applies them at once
+    a.setParams (lti (dh::Mains::Hz50, bw));   // params first: prepare applies them at once
     felitronics::test::run (a.prepare (fs, 512, 1));
     const std::int64_t S = (std::int64_t) (6.0 * fs);
     std::vector<float> pre ((std::size_t) S);
@@ -256,7 +256,7 @@ static void testImpulseRing()
     for (int i = n0 + 1; i < L; ++i) { d[(std::size_t) i] = xi[(std::size_t) i] - xr[(std::size_t) i]; peak = std::max (peak, (double) std::fabs (d[(std::size_t) i])); }
     // the emitted ring per harmonic, measured on the audio over its first 0.2 s (whole periods)
     std::vector<double> fr;
-    for (int k = 1; k <= a.activeHarmonics(); ++k) fr.push_back (k * a.mainsHz());
+    for (int k = 1; k <= a.activeHarmonics(); ++k) fr.push_back (k * a.oscillatorHz());
     const auto amps = fitAmps (d, n0 + 1, 9600, fr, fs);
     double worstA = 0.0;
     for (double v : amps) worstA = std::max (worstA, v);

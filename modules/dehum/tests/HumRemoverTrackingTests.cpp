@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Darwin's Cat — Oleh Tsymaienko & Alisa Lafoks. Part of felitronics-core — see LICENSE.
+//
+// dehum::HumRemover knowing the mains: the FLL on detuned and drifting mains, Auto 50/60 on every hum shape
+// (full, missing fundamental, odd-only, even-only, opposite-phase stereo), stickiness while playing, the
+// false-learning fixtures (held notes beside harmonics, vibrato, a bend, a chord — and the tracker must not
+// move under them), plucks beside harmonics, steps at mode switches, and the ghost a note leaves.
+//
+// THE CLEAN PASS. "Within x dB of the clean pass" compares the stage, fed hum + note, with the same stage
+// fed the note alone in its LTI configuration (dehumtest::lti: the playing width, no tracking) — what a fixed
+// 0.5 Hz notch comb does to the note. The difference is what the hum, the learner and the tracker did.
+#include <felitronics_test.h>
+#include "dehum_fixtures.h"
+
+#include <cstdio>
+#include <string>
+
+using namespace dehumtest;
+namespace dh = felitronics::dehum;
+using felitronics::test::ok;
+using felitronics::test::group;
+using HR = dh::HumRemover<>;
+
+//------------------------------------------------------------------------------------------------------
+struct HumSpec
+{
+    double f0 = 50.0, a1 = 0.01, slope = 0.0, rampFrom = 0.0, rampTo = 0.0, sign = 1.0, until = 1e9;
+    int    kmin = 1, kmax = 24, parity = 0;   // parity 1 = odd harmonics only, 2 = even only
+    std::uint32_t seed = 1;
+};
+static double humCycles (const HumSpec& s, double t)
+{
+    double c = s.f0 * t;
+    if (s.slope != 0.0 && t > s.rampFrom)
+    {
+        const double te = std::min (t, s.rampTo) - s.rampFrom;
+        c += 0.5 * s.slope * te * te;
+        if (t > s.rampTo) c += s.slope * (s.rampTo - s.rampFrom) * (t - s.rampTo);
+    }
+    return c;
+}
+static double humFreq (const HumSpec& s, double t)
+{
+    return t <= s.rampFrom ? s.f0 : s.f0 + s.slope * (std::min (t, s.rampTo) - s.rampFrom);
+}
+static void addHum (std::vector<float>& x, const HumSpec& s, double fs, std::int64_t from = 0)
+{
+    Lcg r { s.seed }; double ph[64];
+    for (double& p : ph) p = 2.0 * kPi * r.uniform();
+    for (std::int64_t n = from; n < (std::int64_t) x.size(); ++n)
+    {
+        const double t = (double) n / fs;
+        if (t >= s.until) break;
+        const double c = humCycles (s, t);
+        double v = 0.0;
+        for (int k = s.kmin; k <= s.kmax; ++k)
+        {
+            if ((s.parity == 1 && k % 2 == 0) || (s.parity == 2 && k % 2 == 1)) continue;
+            const double kc = k * c;
+            v += s.a1 / k * std::sin (2.0 * kPi * (kc - std::floor (kc)) + ph[k - 1]);
+        }
+        x[(std::size_t) n] += (float) (s.sign * v);
+    }
+}
+
+struct Note
+{
+    double f0 = 0.0, amp = 0.1, B = 1e-4, start = 0.0, dur = 1.0, tau = 0.0, attack = 0.010;
+    double vibRate = 0.0, vibDepth = 0.0, bendRatio = 1.0, bendSec = 0.0, release = 0.010;
+    int    partials = 6;
+    double partialHz (int p) const { return p * f0 * std::sqrt (1.0 + B * p * p); }
+};
+static void addNote (std::vector<float>& x, const Note& nt, double fs)
+{
+    const std::int64_t n0 = std::llround (nt.start * fs), n1 = std::min ((std::int64_t) x.size(), std::llround ((nt.start + nt.dur) * fs));
+    double cyc[16] {};
+    for (std::int64_t n = n0; n < n1; ++n)
+    {
+        const double t = (double) (n - n0) / fs, left = (double) (n1 - n) / fs;
+        double ratio = 1.0;
+        if (nt.vibRate > 0.0) ratio *= 1.0 + nt.vibDepth * std::sin (2.0 * kPi * nt.vibRate * t);
+        if (nt.bendSec > 0.0) ratio *= t < nt.bendSec ? 1.0 + (nt.bendRatio - 1.0) * t / nt.bendSec : nt.bendRatio;
+        double env = t < nt.attack ? 0.5 - 0.5 * std::cos (kPi * t / nt.attack) : 1.0;
+        if (left < nt.release) env *= 0.5 - 0.5 * std::cos (kPi * left / nt.release);
+        if (nt.tau > 0.0) env *= std::exp (-t / nt.tau);
+        double v = 0.0;
+        for (int p = 1; p <= nt.partials; ++p)
+        {
+            cyc[p] += nt.partialHz (p) * ratio / fs;
+            cyc[p] -= std::floor (cyc[p]);
+            v += nt.amp / p * std::sin (2.0 * kPi * cyc[p] + 0.3 * p);
+        }
+        x[(std::size_t) n] += (float) (env * v);
+    }
+}
+
+// Telemetry per block of the run.
+struct Tel { std::vector<double> f; std::vector<int> det, quiet, run; int block = 256; };
+static void render (HR& h, std::vector<float>& l, std::vector<float>* r, Tel* tel, int block = 256)
+{
+    if (tel) tel->block = block;
+    for (std::size_t o = 0; o < l.size(); o += (std::size_t) block)
+    {
+        const int n = (int) std::min<std::size_t> ((std::size_t) block, l.size() - o);
+        float* io[2] { l.data() + o, r ? r->data() + o : nullptr };
+        felitronics::test::run (h.process (io, r ? 2 : 1, n));
+        if (tel)
+        {
+            tel->f.push_back (h.mainsHz());
+            tel->det.push_back (h.detected() == dh::Mains::Hz50 ? 50 : (h.detected() == dh::Mains::Hz60 ? 60 : 0));
+            tel->quiet.push_back (h.quiet() ? 1 : 0);
+            tel->run.push_back (h.running() ? 1 : 0);
+        }
+    }
+}
+static double tOf (const Tel& t, std::size_t i, double fs) { return (double) ((i + 1) * (std::size_t) t.block) / fs; }
+
+static std::vector<float> processed (const std::vector<float>& in, const dh::HumRemoverParams& p, double fs, Tel* tel = nullptr)
+{
+    HR h; h.setParams (p); felitronics::test::run (h.prepare (fs, 512, 1));
+    std::vector<float> x = in;
+    render (h, x, nullptr, tel);
+    return x;
+}
+
+static double rmsDiffDb (const std::vector<float>& a, const std::vector<float>& b, std::int64_t from, std::int64_t to)
+{
+    double e = 0.0, r = 0.0;
+    for (std::int64_t i = from; i < to; ++i)
+    {
+        const double d = (double) a[(std::size_t) i] - (double) b[(std::size_t) i];
+        e += d * d;
+        r += (double) b[(std::size_t) i] * (double) b[(std::size_t) i];
+    }
+    return 10.0 * std::log10 (std::max (e, 1e-300) / std::max (r, 1e-300));
+}
+
+static std::string fmt (double v, int prec = 3) { char b[32]; std::snprintf (b, sizeof b, "%.*f", prec, v); return b; }
+
+//------------------------------------------------------------------------------------------------------
+// DETUNED MAINS: Auto, hum at 49.6 / 50.4 / 59.5 / 60.4 Hz (-30 dBFS, 24 harmonics). |f̂ − f| < 0.01 Hz by
+// 10 s, and k = 24 nulled by >= 40 dB. The coarse estimate alone must bring it within 0.05 Hz by 3 s.
+static void testDetuned()
+{
+    group ("FLL: detuned mains -> |f - f_true| < 0.01 Hz by 10 s, k24 <= -40 dB");
+    struct C { double fs, f; };
+    for (C c : { C { 48000.0, 49.6 }, C { 48000.0, 50.4 }, C { 48000.0, 59.5 }, C { 48000.0, 60.4 }, C { 192000.0, 49.6 } })
+    {
+        HumSpec hs; hs.f0 = c.f; hs.a1 = 0.0316; hs.seed = 3u;
+        std::vector<float> x ((std::size_t) (12.0 * c.fs), 0.0f);
+        addHum (x, hs, c.fs);
+        Tel tel;
+        const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), c.fs, &tel);
+        double worstLate = 0.0, at3 = 1e9, lockT = 0.0;
+        for (std::size_t i = 0; i < tel.f.size(); ++i)
+        {
+            const double t = tOf (tel, i, c.fs), e = std::fabs (tel.f[i] - c.f);
+            if (t >= 10.0) worstLate = std::max (worstLate, e);
+            if (t >= 3.0 && at3 > 1e8) at3 = e;
+            if (e >= 0.01) lockT = t;
+        }
+        std::vector<double> fr;
+        for (int k = 1; k <= 24; ++k) fr.push_back (k * c.f);
+        const std::int64_t S = (std::int64_t) (11.0 * c.fs), W = (std::int64_t) c.fs - 1000;
+        const auto ao = fitAmps (y, S, W, fr, c.fs), ai = fitAmps (x, S, W, fr, c.fs);
+        double worstNull = -400.0;
+        for (std::size_t k = 0; k < fr.size(); ++k) worstNull = std::max (worstNull, dbOf (ao[k] / ai[k]));
+        const double k24 = dbOf (ao[23] / ai[23]);
+        const std::string tag = std::to_string ((int) c.fs) + " Hz, mains " + fmt (c.f, 1);
+        std::printf ("      %s: locked (< 0.01 Hz for good) at %.2f s; |err| at 3 s %.4f, after 10 s <= %.5f Hz; k24 %.1f dB, worst harmonic %.1f dB\n",
+                     tag.c_str(), lockT, at3, worstLate, k24, worstNull);
+        ok (worstLate < 0.01, tag + ": |f - f_true| < 0.01 Hz from 10 s on (" + fmt (worstLate, 5) + ")");
+        ok (at3 < 0.05, tag + ": the coarse estimate has it within 0.05 Hz by 3 s (" + fmt (at3, 4) + ")");
+        ok (k24 <= -40.0, tag + ": k24 nulled to " + fmt (k24, 1) + " dB");
+    }
+}
+
+// HISS: hum at 50.3 Hz, -40 dBFS, under white noise at -60 dBFS RMS. The estimate's jitter once locked is
+// what the FLL's damping buys; printed, and bounded by what keeps k24 within a tenth of the learn width.
+static void testHiss()
+{
+    group ("FLL under hiss: the estimate's jitter once locked");
+    const double fs = 48000.0, f = 50.3;
+    HumSpec hs; hs.f0 = f; hs.a1 = 0.01; hs.seed = 5u;
+    std::vector<float> x ((std::size_t) (15.0 * fs), 0.0f);
+    addHum (x, hs, fs);
+    Lcg rng { 77u };
+    for (float& v : x) v += (float) (0.001 * std::sqrt (3.0)) * rng.bipolar();
+    Tel tel;
+    processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+    double e2 = 0.0, worst = 0.0; int n = 0;
+    for (std::size_t i = 0; i < tel.f.size(); ++i)
+        if (tOf (tel, i, fs) >= 5.0) { const double e = tel.f[i] - f; e2 += e * e; worst = std::max (worst, std::fabs (e)); ++n; }
+    const double rmsErr = std::sqrt (e2 / std::max (n, 1));
+    std::printf ("      50.3 Hz at -40 dBFS + hiss at -60 dBFS: |f - f_true| rms %.5f Hz, worst %.5f Hz (from 5 s on)\n", rmsErr, worst);
+    ok (worst < 0.0125, "under hiss the estimate stays within 0.0125 Hz (k24 within 0.3 Hz, a tenth of the learn width): " + fmt (worst, 5));
+}
+
+// SLOW MAINS DRIFT: 50 Hz, then +-0.05 Hz over 20 s, then steady — tracked within 0.01 Hz throughout.
+static void testRamp()
+{
+    group ("FLL: a slow mains ramp (+-0.05 Hz over 20 s) is tracked within 0.01 Hz");
+    const double fs = 48000.0;
+    for (double slope : { 0.0025, -0.0025 })
+    {
+        HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.slope = slope; hs.rampFrom = 4.0; hs.rampTo = 24.0; hs.seed = 9u;
+        std::vector<float> x ((std::size_t) (26.0 * fs), 0.0f);
+        addHum (x, hs, fs);
+        Tel tel;
+        processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        double worst = 0.0;
+        for (std::size_t i = 0; i < tel.f.size(); ++i)
+        {
+            const double t = tOf (tel, i, fs);
+            if (t >= 3.0) worst = std::max (worst, std::fabs (tel.f[i] - humFreq (hs, t)));
+        }
+        std::printf ("      ramp %+.3f Hz over 20 s: worst |f - f_true| from 3 s on %.5f Hz\n", slope * 20.0, worst);
+        ok (worst < 0.01, "ramp " + fmt (slope * 20.0, 3) + " Hz: tracked within 0.01 Hz (" + fmt (worst, 5) + ")");
+    }
+}
+
+//------------------------------------------------------------------------------------------------------
+// AUTO on every hum shape: decided within 1.5 s, never the other family.
+static void testAutoFamilies()
+{
+    group ("Auto: hum-only decided in <= 1.5 s — full, missing fundamental, odd-only, even-only, opposite-phase stereo");
+    const double fs = 48000.0;
+    struct C { const char* name; double f0; int kmin, parity; bool opposite; };
+    const C cases[] = { { "full", 50, 1, 0, false }, { "full", 60, 1, 0, false },
+                        { "missing fundamental", 50, 2, 0, false }, { "missing fundamental", 60, 2, 0, false },
+                        { "odd only", 50, 1, 1, false }, { "odd only", 60, 1, 1, false },
+                        { "even only", 50, 1, 2, false }, { "even only", 60, 1, 2, false },
+                        { "opposite-phase stereo", 50, 1, 0, true }, { "opposite-phase stereo", 60, 1, 0, true } };
+    for (const C& c : cases)
+    {
+        HumSpec hs; hs.f0 = c.f0; hs.a1 = 0.01; hs.kmin = c.kmin; hs.parity = c.parity; hs.seed = 21u;
+        std::vector<float> l ((std::size_t) (3.0 * fs), 0.0f), r = l;
+        addHum (l, hs, fs);
+        hs.sign = c.opposite ? -1.0 : 1.0;
+        addHum (r, hs, fs);
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 2));
+        Tel tel;
+        render (h, l, &r, &tel);
+        const int want = (int) c.f0;
+        double tDecide = -1.0; bool wrong = false;
+        for (std::size_t i = 0; i < tel.det.size(); ++i)
+        {
+            if (tel.det[i] != 0 && tel.det[i] != want) wrong = true;
+            if (tDecide < 0.0 && tel.det[i] == want) tDecide = tOf (tel, i, fs);
+        }
+        const std::string tag = std::string (c.name) + " " + std::to_string (want) + " Hz";
+        std::printf ("      %-32s decided at %.3f s, running at %.3f Hz\n", tag.c_str(), tDecide, h.mainsHz());
+        ok (tDecide > 0.0 && tDecide <= 1.5 && ! wrong, tag + ": decided " + std::to_string (want) + " in " + fmt (tDecide) + " s, never the other");
+        ok (h.running() && std::fabs (h.mainsHz() - c.f0) < 0.05, tag + ": running at the mains frequency");
+    }
+}
+
+// A FIXED MODE ON THE WRONG FAMILY (the user's error) learns nothing it should not: its coarse estimate is
+// taken only where its family wins, so it stays at its own nominal frequency.
+static void testWrongFamily()
+{
+    group ("a fixed mode on the other family's hum stays at its nominal frequency");
+    const double fs = 48000.0;
+    for (double f : { 50.0, 60.0 })
+    {
+        HumSpec hs; hs.f0 = f; hs.a1 = 0.01; hs.seed = 8u;
+        std::vector<float> x ((std::size_t) (5.0 * fs), 0.0f);
+        addHum (x, hs, fs);
+        const dh::Mains m = f > 55.0 ? dh::Mains::Hz50 : dh::Mains::Hz60;
+        const double nominal = f > 55.0 ? 50.0 : 60.0;
+        Tel tel;
+        processed (x, params (m, 0.5, 3.0), fs, &tel);
+        double dev = 0.0;
+        for (double v : tel.f) dev = std::max (dev, std::fabs (v - nominal));
+        ok (dev <= 0.05, "mode " + fmt (nominal, 0) + " on " + fmt (f, 0) + " Hz hum: the estimate stays within 0.05 Hz of "
+                         + fmt (nominal, 0) + " (" + fmt (dev, 4) + ")");
+    }
+}
+
+//------------------------------------------------------------------------------------------------------
+// B1 (61.7 Hz) at -20 dBFS beside 60 Hz, on 50 Hz mains. Once decided it stays 50 and the tracker does not
+// move under the note; a note there from the start never makes Auto say 60.
+static void testB1()
+{
+    group ("Auto: 50 Hz hum + a B1 61.7 Hz note at -20 dBFS -> still 50, the tracker not pulled");
+    const double fs = 48000.0;
+    HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.seed = 4u;
+    {
+        std::vector<float> x ((std::size_t) (12.0 * fs), 0.0f);
+        addHum (x, hs, fs);
+        Note b1; b1.f0 = 61.735; b1.amp = 0.1; b1.start = 2.5; b1.dur = 8.0;
+        addNote (x, b1, fs);
+        Tel tel;
+        processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        double fAt = 0.0, dev = 0.0; bool stay = true;
+        for (std::size_t i = 0; i < tel.f.size(); ++i)
+        {
+            const double t = tOf (tel, i, fs);
+            if (t < 2.5) fAt = tel.f[i];
+            else { dev = std::max (dev, std::fabs (tel.f[i] - fAt)); stay = stay && tel.det[i] == 50 && tel.run[i] == 1; }
+        }
+        std::printf ("      decided before the note; through 8 s of B1 the estimate moved %.5f Hz\n", dev);
+        ok (stay, "decided 50 before the note, still 50 through it and after");
+        ok (dev <= 0.05, "the tracker is not pulled by B1 (moved " + fmt (dev, 5) + " Hz, bound 0.05)");
+    }
+    {
+        // hum at -50 dBFS: B1's leakage into the 60/120 bins then beats the 50 family by more than 6 dB, so
+        // only the quiet gate (broadband power within 12 dB of the bins) keeps Auto from saying 60
+        HumSpec quietHum = hs; quietHum.a1 = 0.00316;
+        std::vector<float> x ((std::size_t) (9.0 * fs), 0.0f);
+        addHum (x, quietHum, fs);
+        Note b1; b1.f0 = 61.735; b1.amp = 0.1; b1.start = 0.2; b1.dur = 6.0;
+        addNote (x, b1, fs);
+        Tel tel;
+        processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        bool never60 = true;
+        for (int d : tel.det) never60 = never60 && d != 60;
+        ok (never60, "B1 sounding from the start never makes Auto say 60");
+        ok (tel.det.back() == 50, "and once the note is gone it decides 50");
+    }
+}
+
+// NEVER FLIPS WHILE PLAYING: decided 50, then 10 s of loud notes that put their energy in the 60/120 bins.
+static void testNeverFlips()
+{
+    group ("Auto: never flips while playing (10 s of B1 / A#1 / B2 / A#2 over 50 Hz hum)");
+    const double fs = 48000.0;
+    HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.seed = 6u;
+    std::vector<float> x ((std::size_t) (13.0 * fs), 0.0f);
+    addHum (x, hs, fs);
+    const double fr[] = { 61.735, 58.270, 123.471, 116.541 };
+    for (int i = 0; i < 20; ++i)
+    {
+        Note n; n.f0 = fr[i % 4]; n.amp = 0.2; n.start = 2.5 + 0.5 * i; n.dur = 1.5; n.tau = 1.0; n.attack = 0.001;
+        addNote (x, n, fs);
+    }
+    Tel tel;
+    processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+    bool stay = true;
+    for (std::size_t i = 0; i < tel.det.size(); ++i)
+        if (tOf (tel, i, fs) >= 2.5) stay = stay && tel.det[i] == 50 && tel.run[i] == 1;
+    ok (stay, "decided 50 before the playing, 50 throughout it");
+}
+
+//------------------------------------------------------------------------------------------------------
+// FALSE LEARNING: hum locked for 3 s, then a note held 8 s beside a harmonic. The tracker must not move
+// (bound printed); the output must equal the clean pass (rms error, and per partial for steady notes).
+static void testFalseLearning()
+{
+    group ("false learning: held notes beside harmonics, vibrato, a bend, a chord vs the clean pass");
+    const double fs = 48000.0;
+    struct C { const char* name; double mains; std::vector<Note> notes; bool steady; };
+    auto note = [] (double f0, double amp) { Note n; n.f0 = f0; n.amp = amp; n.start = 3.0; n.dur = 8.0; return n; };
+    Note vib = note (659.255, 0.1); vib.vibRate = 5.0; vib.vibDepth = 0.004;
+    Note bend = note (640.0, 0.1); bend.bendRatio = 665.0 / 640.0; bend.bendSec = 1.0;
+    std::vector<Note> chord;
+    for (double f : { 82.407, 123.471, 164.814, 207.652, 246.942, 329.628 }) chord.push_back (note (f, 0.05));
+    const C cases[] = { { "F4 349.2 Hz held 8 s (50 Hz mains, k7 350)", 50.0, { note (349.228, 0.1) }, true },
+                        { "E5 659.3 Hz held 8 s (60 Hz mains, k11 660)", 60.0, { note (659.255, 0.1) }, true },
+                        { "A2 110 Hz, 5th partial 550.7 (50 Hz mains, k11 550)", 50.0, { note (110.0, 0.1) }, true },
+                        { "E5 with 5 Hz vibrato +-0.4 % (60 Hz mains)", 60.0, { vib }, false },
+                        { "a bend 640 -> 665 Hz through 660 (60 Hz mains)", 60.0, { bend }, false },
+                        { "an E major chord, six notes (60 Hz mains)", 60.0, chord, false } };
+    for (const C& c : cases)
+    {
+        std::vector<float> clean ((std::size_t) (12.0 * fs), 0.0f);
+        for (const Note& n : c.notes) addNote (clean, n, fs);
+        std::vector<float> x = clean;
+        HumSpec hs; hs.f0 = c.mains; hs.a1 = 0.01; hs.seed = 12u;
+        addHum (x, hs, fs);
+        Tel tel;
+        const auto y = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs, &tel);
+        const auto yc = processed (clean, lti (c.mains > 55.0 ? dh::Mains::Hz60 : dh::Mains::Hz50, 0.5), fs);
+        double fOn = 0.0, dev = 0.0;
+        for (std::size_t i = 0; i < tel.f.size(); ++i)
+        {
+            const double t = tOf (tel, i, fs);
+            if (t < 3.0) fOn = tel.f[i];
+            else if (t < 11.0) dev = std::max (dev, std::fabs (tel.f[i] - fOn));
+        }
+        const double err = rmsDiffDb (y, yc, (std::int64_t) (3.0 * fs), (std::int64_t) (11.0 * fs));
+        double worstP = 0.0;
+        if (c.steady)
+        {
+            std::vector<double> fr;
+            for (int p = 1; p <= 6; ++p) fr.push_back (c.notes[0].partialHz (p));
+            const auto a = fitAmps (y, (std::int64_t) (7.0 * fs), (std::int64_t) (3.5 * fs), fr, fs);
+            const auto b = fitAmps (yc, (std::int64_t) (7.0 * fs), (std::int64_t) (3.5 * fs), fr, fs);
+            for (std::size_t p = 0; p < fr.size(); ++p) worstP = std::max (worstP, std::fabs (dbOf (a[p] / b[p])));
+        }
+        std::printf ("      %-52s tracker moved %.5f Hz; out - clean %.1f dB re clean%s\n", c.name, dev, err,
+                     c.steady ? (", worst partial " + fmt (worstP, 3) + " dB").c_str() : "");
+        ok (tel.det.back() == (int) c.mains && fOn > 0.0, std::string (c.name) + ": precondition — locked before the note");
+        ok (dev <= 0.005, std::string (c.name) + ": the tracker held through the note (moved " + fmt (dev, 5) + " Hz, bound 0.005)");
+        ok (err <= -40.0, std::string (c.name) + ": output - clean pass " + fmt (err, 1) + " dB re the clean pass");
+        if (c.steady) ok (worstP <= 1.0, std::string (c.name) + ": every partial within 1 dB of the clean pass (" + fmt (worstP, 3) + ")");
+    }
+}
+
+//------------------------------------------------------------------------------------------------------
+// PLUCKS beside harmonics (G3 / B3 / E4 / E5, tau 1 s, an onset every 0.5 s) after lock: the output equals
+// the clean pass to -40 dB, and in the 50 ms after each onset nothing beyond it reaches -60 dB re the pluck.
+static void testPlucks()
+{
+    group ("plucks beside harmonics: output - clean <= -40 dB, no onset artefact > -60 dB re the pluck");
+    const double fs = 48000.0;
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        const double mains = pass == 1 ? 50.0 : 60.0;
+        const int partials = pass >= 2 ? 1 : 6;          // passes 2, 3: pure tones (harmonics), the smallest crest factor
+        const double attack = pass == 3 ? 0.040 : 0.001; // pass 3: volume swells — the residual rises slowly
+        std::vector<float> clean ((std::size_t) (10.0 * fs), 0.0f);
+        const double fr[] = { 196.0, 246.942, 329.628, 659.255 };
+        std::vector<double> onsets;
+        for (int i = 0; i < 12; ++i)
+        {
+            Note n; n.f0 = fr[i % 4]; n.amp = 0.1; n.start = 3.0 + 0.5 * i; n.tau = 1.0; n.attack = attack; n.release = 0.0; n.partials = partials;
+            n.dur = 10.0 - n.start;
+            addNote (clean, n, fs);
+            onsets.push_back (n.start);
+        }
+        std::vector<float> x = clean;
+        HumSpec hs; hs.f0 = mains; hs.a1 = 0.01; hs.seed = 14u;
+        addHum (x, hs, fs);
+        const auto y  = processed (x, params (dh::Mains::Auto, 0.5, 3.0), fs);
+        const auto yc = processed (clean, lti (mains > 55.0 ? dh::Mains::Hz60 : dh::Mains::Hz50, 0.5), fs);
+        const double err = rmsDiffDb (y, yc, (std::int64_t) (3.0 * fs), (std::int64_t) (9.5 * fs));
+        double worstOnset = -400.0;
+        for (double t0 : onsets)
+        {
+            const std::int64_t a = std::llround (t0 * fs), b = a + (std::int64_t) (0.05 * fs);
+            double d = 0.0, pk = 0.0;
+            for (std::int64_t i = a; i < b; ++i)
+            {
+                d  = std::max (d, std::fabs ((double) y[(std::size_t) i] - (double) yc[(std::size_t) i]));
+                pk = std::max (pk, std::fabs ((double) clean[(std::size_t) i]));
+            }
+            worstOnset = std::max (worstOnset, dbOf (d / pk));
+        }
+        const std::string tag = std::to_string ((int) mains) + " Hz mains" + (partials == 1 ? (attack > 0.01 ? ", pure-tone swells" : ", pure tones") : "");
+        std::printf ("      %s: out - clean %.1f dB re clean; worst onset window %.1f dB re the pluck peak\n", tag.c_str(), err, worstOnset);
+        ok (err <= -40.0, tag + ": output - clean pass " + fmt (err, 1) + " dB");
+        ok (worstOnset <= -60.0, tag + ": the 50 ms after every onset stays within -60 dB of the pluck (" + fmt (worstOnset, 1) + ")");
+    }
+}
+
+//------------------------------------------------------------------------------------------------------
+// STEPS at mode switches at arbitrary sample offsets: the correction (in - out) has no step. Measured as
+// its second difference, which a step of size s shows as about s; the smooth -30 dBFS hum's own is ≈ -68 dBFS.
+static double maxSecondDiff (const std::vector<float>& in, const std::vector<float>& out, std::int64_t from, std::int64_t to)
+{
+    double m = 0.0;
+    for (std::int64_t i = std::max<std::int64_t> (from, 2); i < to; ++i)
+    {
+        auto c = [&] (std::int64_t j) { return (double) in[(std::size_t) j] - (double) out[(std::size_t) j]; };
+        m = std::max (m, std::fabs (c (i) - 2.0 * c (i - 1) + c (i - 2)));
+    }
+    return m;
+}
+static void testSwitchSteps()
+{
+    group ("mode switches at arbitrary offsets: no step > -60 dBFS in the correction");
+    const double fs = 48000.0;
+    struct Ev { double at; dh::Mains to; };
+    struct C { const char* name; double humF0, humF1, humSwitch; dh::Mains start; std::vector<Ev> ev; };
+    const C cases[] = { { "Off -> 50", 50, 50, 99, dh::Mains::Off, { { 2.0 + 33.0 / fs, dh::Mains::Hz50 } } },
+                        { "50 -> 60", 50, 50, 99, dh::Mains::Hz50, { { 3.0 + 17.0 / fs, dh::Mains::Hz60 } } },
+                        { "60 -> Off", 60, 60, 99, dh::Mains::Hz60, { { 3.0 + 5.0 / fs, dh::Mains::Off } } },
+                        { "Auto re-decision 50 -> 60 (the hum changes at 4.0003 s)", 50, 60, 4.0003, dh::Mains::Auto, {} } };
+    for (const C& c : cases)
+    {
+        std::vector<float> x ((std::size_t) (8.0 * fs), 0.0f);
+        HumSpec a; a.f0 = c.humF0; a.a1 = 0.0316; a.seed = 2u; a.until = c.humSwitch;
+        addHum (x, a, fs);
+        if (c.humSwitch < 90.0) { HumSpec b = a; b.f0 = c.humF1; b.until = 1e9; addHum (x, b, fs, std::llround (c.humSwitch * fs)); }
+        HR h; h.setParams (params (c.start, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 512, 1));
+        std::vector<float> y = x;
+        std::int64_t o = 0;
+        for (const Ev& e : c.ev)
+        {
+            const std::int64_t at = std::llround (e.at * fs);
+            float* io[1] { y.data() + o }; felitronics::test::run (h.process (io, 1, (int) (at - o)));
+            h.setParams (params (e.to, 0.5, 3.0));
+            o = at;
+        }
+        { float* io[1] { y.data() + o }; felitronics::test::run (h.process (io, 1, (int) ((std::int64_t) y.size() - o))); }
+        const double m = maxSecondDiff (x, y, 0, (std::int64_t) y.size());
+        std::printf ("      %-56s max |second difference of the correction| %.1f dBFS\n", c.name, dbOf (m));
+        ok (dbOf (m) <= -60.0, std::string (c.name) + ": no step > -60 dBFS (" + fmt (dbOf (m), 1) + ")");
+        if (c.ev.empty()) ok (h.detected() == dh::Mains::Hz60 && h.running() && std::fabs (h.mainsHz() - 60.0) < 0.05, "  and Auto re-decided 60");
+    }
+}
+
+//------------------------------------------------------------------------------------------------------
+// THE GHOST: a 330 Hz tone (20 Hz below k7 = 350 on 50 Hz mains) held 2 s over locked hum, then stopped.
+// The notch's state rings out at 350 Hz. Bound: it starts at the LTI value A·(BW/2)/sqrt(Δ² + (BW/2)²)
+// (−38.1 dB re the tone) and, with the learn width resuming once the input is quiet, falls below -60 dB re
+// the tone within 1.0 s of the stop; at the playing width alone it takes about 2.5·τ = 1.6 s. The switch
+// back to the learn width is a μ change only: no step.
+static void ghostRun (const dh::HumRemoverParams& p, double& startDb, double& t60, double& stepDb, double& tQuiet)
+{
+    const double fs = 48000.0, stop = 5.0;
+    std::vector<float> x ((std::size_t) (9.0 * fs), 0.0f);
+    HumSpec hs; hs.f0 = 50.0; hs.a1 = 0.01; hs.seed = 17u;
+    addHum (x, hs, fs);
+    Note n; n.f0 = 330.0; n.partials = 1; n.amp = 0.1; n.start = 3.0; n.dur = 2.0;
+    addNote (x, n, fs);
+    Tel tel;
+    const auto y = processed (x, p, fs, &tel);
+    tQuiet = -1.0;
+    for (std::size_t i = 0; i < tel.quiet.size(); ++i)
+        if (tOf (tel, i, fs) > stop && tel.quiet[i] && tQuiet < 0.0) tQuiet = tOf (tel, i, fs) - stop;
+    const std::int64_t W = 1920;   // 40 ms, two periods
+    startDb = -400.0; t60 = -1.0;
+    for (std::int64_t a = std::llround (stop * fs); a + W < (std::int64_t) y.size(); a += 480)
+    {
+        const double g = dbOf (fitAmp (y, a, W, 350.0, fs) / n.amp);
+        if (a == std::llround (stop * fs)) startDb = g;
+        if (g > -60.0) t60 = (double) (a + W - std::llround (stop * fs)) / fs;
+    }
+    stepDb = dbOf (maxSecondDiff (x, y, std::llround (stop * fs), std::llround ((stop + 2.0) * fs)));
+}
+static void testGhost()
+{
+    group ("the ghost a note leaves: 330 Hz held 2 s, 20 Hz from k7, then stopped");
+    const double theory = dbOf (0.25 / std::sqrt (20.0 * 20.0 + 0.25 * 0.25));
+    double s1, t1, st1, q1, s2, t2, st2, q2;
+    ghostRun (params (dh::Mains::Auto, 0.5, 3.0), s1, t1, st1, q1);
+    ghostRun (params (dh::Mains::Auto, 0.5, 0.5), s2, t2, st2, q2);
+    std::printf ("      LTI start %.1f dB re the tone. Learn width resuming (quiet again %.2f s after the stop): starts %.1f dB,"
+                 " below -60 dB after %.2f s. Playing width only: starts %.1f dB, below -60 dB after %.2f s."
+                 " Correction second difference over the 2 s after the stop: %.1f / %.1f dBFS\n",
+                 theory, q1, s1, t1, s2, t2, st1, st2);
+    ok (s1 <= theory + 1.0, "the ghost starts at the LTI value (" + fmt (s1, 1) + " dB, theory " + fmt (theory, 1) + ")");
+    ok (t1 > 0.0 && t1 <= 1.0, "with the learn width resuming it is below -60 dB re the note within 1.0 s (" + fmt (t1, 2) + " s)");
+    ok (t2 > t1 + 0.3, "and that is the learn width's doing: the playing width alone takes " + fmt (t2, 2) + " s");
+    ok (st1 <= -60.0, "the switch back to the learn width steps nothing (" + fmt (st1, 1) + " dBFS)");
+}
+
+int main()
+{
+    std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
+    testDetuned();
+    testRamp();
+    testHiss();
+    testAutoFamilies();
+    testWrongFamily();
+    testB1();
+    testNeverFlips();
+    testFalseLearning();
+    testPlucks();
+    testSwitchSteps();
+    testGhost();
+    return felitronics::test::report();
+}

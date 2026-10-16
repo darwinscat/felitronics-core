@@ -58,7 +58,8 @@ static bool sameWeights (const HR& a, const HR& b)
             const auto x = a.weight (c, k), y = b.weight (c, k);
             if (std::memcmp (&x.re, &y.re, sizeof (double)) != 0 || std::memcmp (&x.im, &y.im, sizeof (double)) != 0) return false;
         }
-    return true;
+    const double fa = a.mainsHz(), fb = b.mainsHz();   // and the tracker's estimate
+    return std::memcmp (&fa, &fb, sizeof (double)) == 0 && a.quiet() == b.quiet() && a.detected() == b.detected();
 }
 
 static bool bitsEqual (const std::vector<float>& a, const std::vector<float>& b)
@@ -95,7 +96,7 @@ static void testReslicing()
     auto render = [&] (int mode, std::vector<float>& l, std::vector<float>& r, HR& h)
     {
         l = l0; r = r0;
-        h.setParams (params (dh::Mains::Hz50, 3.0));   // params first: prepare applies them at once
+        h.setParams (params (dh::Mains::Hz50, 0.5, 3.0));   // params first: prepare applies them at once
         felitronics::test::run (h.prepare (kFs, 512, 2));
         Lcg rng { 4242u };
         auto span = [&] (int from, int to)
@@ -109,7 +110,7 @@ static void testReslicing()
             }
         };
         span (0, SWITCH);
-        h.setParams (params (dh::Mains::Hz60, 3.0));
+        h.setParams (params (dh::Mains::Hz60, 0.5, 3.0));
         span (SWITCH, N);
     };
     std::vector<float> la, ra, lb, rb, lc, rc;
@@ -141,7 +142,7 @@ static void testPauseIsSilence()
             HR a, b;
             felitronics::test::run (a.prepare (kFs, 512, 2));
             felitronics::test::run (b.prepare (kFs, 512, 2));
-            a.setParams (params (dh::Mains::Hz50, 3.0)); b.setParams (params (dh::Mains::Hz50, 3.0));
+            a.setParams (params (dh::Mains::Hz50, 0.5, 3.0)); b.setParams (params (dh::Mains::Hz50, 0.5, 3.0));
             std::vector<float> l, r, l2, r2;
             programme (l, r, 0, 24000 + 13, 3u); l2 = l; r2 = r;
             felitronics::test::run (run2 (a, l, r, 0, (int) l.size()));
@@ -380,10 +381,10 @@ static void testPoison()
 //------------------------------------------------------------------------------------------------------
 // MODES. 50 -> Off at an arbitrary sample: the correction (in - out) is the unswitched twin's correction
 // times a 20 ms linear ramp, then dry bit-exact. 50 -> 60: ramp, re-arm with zero weights, and the 60 Hz
-// null forms. Auto is dry in this version. Off -> 50 starts at the next grid boundary.
+// null forms. Auto abstains (dry) on an input with no hum. Off -> 50 starts at the next grid boundary.
 static void testModes()
 {
-    group ("modes: 20 ms ramp of the correction, re-arm, Auto dry, Off -> 50");
+    group ("modes: 20 ms ramp of the correction, re-arm, Auto abstains on no hum, Off -> 50");
     std::vector<float> l, r;
     programme (l, r, 0, 4 * 48000, 21u);
     HR a;
@@ -430,19 +431,27 @@ static void testModes()
         { float* io[1] { x.data() }; felitronics::test::run (h.process (io, 1, 48000 + 5)); }
         h.setParams (params (dh::Mains::Hz60, 3.0));
         { float* io[1] { x.data() + 48005 }; felitronics::test::run (h.process (io, 1, ramp + 64)); }
-        ok (h.running() && std::fabs (h.mainsHz() - 60.0) < 1e-5, "50 -> 60: re-armed at 60 Hz after the ramp");
+        ok (h.running() && std::fabs (h.mainsHz() - 60.0) < 0.02, "50 -> 60: re-armed at 60 Hz after the ramp");
         { float* io[1] { x.data() + 48005 + ramp + 64 }; felitronics::test::run (h.process (io, 1, (int) x.size() - 48005 - ramp - 64)); }
         const double nul = worstNull (x, xin, 4 * 48000, 48000, 60.0);
         ok (nul <= -50.0, "and the 60 Hz null forms (worst harmonic " + std::to_string (nul) + " dB at 3 s)");
     }
-    // Auto is dry
+    // Auto abstains on an input that carries no hum: dry, bit-exact
     {
         HR h;
-        h.setParams (params (dh::Mains::Auto, 3.0));   // params first: prepare applies them at once
+        h.setParams (params (dh::Mains::Auto, 0.5, 3.0));   // params first: prepare applies them at once
         felitronics::test::run (h.prepare (kFs, 512, 2));
-        std::vector<float> al = l, ar = r;
+        Lcg rng { 5u };
+        std::vector<float> al ((std::size_t) (4 * 48000)), ar ((std::size_t) (4 * 48000));
+        for (int i = 0; i < 4 * 48000; ++i)
+        {
+            al[(std::size_t) i] = (float) (0.1 * sinAt (329.6276, i, kFs, 0.0)) + 0.001f * rng.bipolar();
+            ar[(std::size_t) i] = (float) (0.1 * sinAt (246.9417, i, kFs, 1.0)) + 0.001f * rng.bipolar();
+        }
+        const std::vector<float> l0 = al, r0 = ar;
         felitronics::test::run (run2 (h, al, ar, 0, (int) al.size()));
-        ok (bitsEqual (al, l) && bitsEqual (ar, r) && ! h.running(), "Auto (no detector yet) passes the input untouched");
+        ok (bitsEqual (al, l0) && bitsEqual (ar, r0) && ! h.running() && h.detected() == dh::Mains::Off,
+            "Auto on a hum-free input abstains and passes it untouched");
     }
     // Off -> 50 at an arbitrary sample: dry until the next grid boundary, live from it
     {

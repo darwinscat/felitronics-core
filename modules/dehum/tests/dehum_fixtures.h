@@ -173,12 +173,18 @@ inline void runMono (H& h, std::vector<float>& x, int block = 512)
     }
 }
 
-inline felitronics::dehum::HumRemoverParams params (felitronics::dehum::Mains m, double bw)
+// Params: playing width `bw`, learn width `learn` (default: the same, so μ never switches), tracker bound.
+inline felitronics::dehum::HumRemoverParams params (felitronics::dehum::Mains m, double bw, double learn = -1.0, double lock = 1.0)
 {
     felitronics::dehum::HumRemoverParams p;
     p.mains = m;
     p.bandwidthHz = bw;
+    p.learnBandwidthHz = learn > 0.0 ? learn : bw;
+    p.lockRangeHz = lock;
     return p;
 }
+
+// The LTI configuration: one width, no tracking — the exact notch comb at the nominal frequency.
+inline felitronics::dehum::HumRemoverParams lti (felitronics::dehum::Mains m, double bw) { return params (m, bw, bw, 0.0); }
 
 } // namespace dehumtest

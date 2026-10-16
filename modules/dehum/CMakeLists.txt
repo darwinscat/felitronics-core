@@ -20,4 +20,11 @@ if(FELITRONICS_BUILD_TESTS)
     target_include_directories(felitronics_dehum_contract_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
     target_compile_features(felitronics_dehum_contract_tests PRIVATE cxx_std_20)
     add_test(NAME felitronics_dehum_contract_tests COMMAND felitronics_dehum_contract_tests)
+
+    # Knowing the mains: the FLL, Auto 50/60, the quiet detector, false learning, plucks, switch steps, the ghost.
+    add_executable(felitronics_dehum_tracking_tests tests/HumRemoverTrackingTests.cpp)
+    target_link_libraries(felitronics_dehum_tracking_tests PRIVATE felitronics::dehum)
+    target_include_directories(felitronics_dehum_tracking_tests PRIVATE ${felitronics_core_SOURCE_DIR}/test_support)
+    target_compile_features(felitronics_dehum_tracking_tests PRIVATE cxx_std_20)
+    add_test(NAME felitronics_dehum_tracking_tests COMMAND felitronics_dehum_tracking_tests)
 endif()
