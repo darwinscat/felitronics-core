@@ -44,7 +44,8 @@ namespace felitronics::dehum
 //       that power over the last 4 s (sixteen 0.25 s hop minima), which may RISE by at most 0.5 dB per hop
 //       (2 dB/s) and restarts on every re-arm, zeroing or restore. After cancellation true quiet is the
 //       noise floor; a note is not, however stationary — a −40 dBFS note over a −90 dB residual floor is
-//       not quiet for ≈ 19 s. A LOUDER HUM is told apart from a note: the running family's bins 3 dB over what
+//       not quiet for ≈ 19 s (a residual 90 dB under the input floor is quiet whatever its floor: there it is
+//       arithmetic, and a noiseless null's floor is the deepest dip the arithmetic made). A LOUDER HUM is told apart from a note: the running family's bins 3 dB over what
 //       the MODEL explained a hop ago (the 0.5 s window straddling the step reads it ≈ 2 dB low, so ≈ +5 dB
 //       effective), in a quiet, trigger-free window, AND the coarse estimate within 0.05 Hz of ours → the residual floor
 //       restarts and quiet returns (measured: 0.51 s after a +10 dB step). The input floor no longer gates
@@ -71,12 +72,22 @@ namespace felitronics::dehum
 //     free of triggers: a 60/120 Hz tone over a 50 Hz hum that is still there flips nothing; a real swap
 //     re-decides (measured 1.26 s after it).
 //   * COARSE frequency: the winning family's stronger bin, phase advance between windows one hop apart
-//     (±2 Hz unambiguous), taken only between two quiet windows and only for a family that wins by 6 dB. Auto starts the canceller at it; a fixed
-//     mode jumps to it once, the first time it exists ("acquisition").
+//     (±2 Hz unambiguous), taken only between two quiet windows and only for a family that wins by 6 dB. Auto starts the canceller at
+//     the MEDIAN of the last (up to four) consecutive estimates; a fixed mode jumps to it once, the first time it exists
+//     ("acquisition"). On a real input hiss in the bins scatters single estimates by ±0.02–0.1 Hz.
 //   * FINE (an FLL, only in quiet, and only while the running family is the one the last window's bins
-//     heard win, while the canceller explains the input (residual 15 dB under it: a note anywhere holds it),
-//     while its coarse estimate agrees with ours within 0.05 Hz — a note at a bin drags the coarse
-//     estimate off and so holds the FLL — and not in the first hop after fresh weights; NOT gated by the
+//     heard win, while the canceller explains the input, and not in the first hop after fresh weights. EXPLAINS:
+//     the broadband residual 15 dB under the input (a note anywhere holds it) — or, where hiss makes that
+//     impossible (on a guitar DI the hiss is 4–15 dB under the hum broadband, yet 30+ dB under each line in its
+//     own notch), in the weights' own narrowband terms: over the last hop the weights' motion that ONE common
+//     frequency offset does not explain (each harmonic's scatter around its mean, less the best common k·ρ
+//     rotation, k²-weighted like the FLL, re the model's k²-weighted power) is within 6 dB of its own floor (a
+//     4 s minimum rising 0.5 dB per hop, learned only in quiet trigger-free hops with the residual near its
+//     floor) and under −10 dB, with the broadband residual within 6 dB of the residual floor. A note's beat in a
+//     notch lifts the motion; hiss is its floor; a frequency error is the rotation and is explained. AGREES: the
+//     median coarse estimate within 0.05 Hz of ours, or within three standard errors of the estimates' mean
+//     where they scatter more (hiss in the bins), never beyond 0.25 Hz — a note at a bin drags the estimates
+//     CONSISTENTLY (small scatter, large offset) and so still holds the FLL. NOT gated by the
 //     residual floor, since a residual grown by the FLL's own lag must not hold the FLL that cures it; a
 //     fixed mode on the other family's hum would otherwise chase beats): the weights' own rotation, Δf = Σ k·Im(w_k·conj w_k') / (2πT·Σ k²|w_k|²)
 //     over each grid period T, weighted by k·|w_k|² so a weak fundamental does not matter. Gain
@@ -106,8 +117,16 @@ namespace felitronics::dehum
 // k = 1 at −12.6 dB, k = 4 at −3.2 dB, k = 10 at −0.7 dB — the upper harmonics are back. The first quiet gap
 // re-locks it: once two clear windows give a stable coarse estimate the model agrees with, f̂ glides to it at
 // ≤ 0.05 Hz/s and the FLL takes over — measured 0.8–1.05 s after the playing ends for a 0.06 Hz drift. The FLL
-// itself runs only while the canceller explains the input (residual 15 dB under it), so it needs the hum at
-// least 15 dB over the broadband noise; under that the frequency holds where it was.
+// itself runs only while the canceller explains the input (above), so under broadband hiss it judges the weights'
+// narrowband motion instead; on a guitar DI (single coil, hum 7 dB over the hiss broadband) it locks ≈ 1–2.5 s
+// after Auto decides.
+//
+// A REAL INPUT'S LIMITS (measured on fixtures modelled on the owner's DI takes, HumRemoverTrackingTests): hiss
+// that is stronger below a line than above it (pink) and the harmonics above the active set both bias the FLL,
+// 1–2 mHz with 24 of a single coil's 40 audible harmonics active (≈ 0.5 mHz with `harmonics` at 40), which keeps
+// k13–k17 near −38 dB at the learn width while k1–k9 reach −42…−53. A pickup whose hum is only ≈ 4 dB over its
+// hiss broadband (k1+k2 under 10 % of the quiet's power) passes quiet (a) only now and then: there the lock
+// comes and goes and the depth is set by how long the clean quiet is.
 //
 // LEARN (beginLearn / learnStatus / endLearn): a short, deliberate quiet — the player mutes the strings and
 // asks the stage to learn. The model is snapshotted, ramped out, zeroed, and relearnt at the learn width
@@ -133,8 +152,9 @@ namespace felitronics::dehum
 // says NotLearning; prepare()/reset() are restarts and cancel a learn. THREADING: setParams, beginLearn and
 // endLearn belong on the process thread, or strictly between process calls — nothing here is atomic.
 //
-// TELEMETRY (process thread): detected(), mainsHz(), oscillatorHz(), locked() (the FLL's last steps under
-// 5 mHz for a hop, or no tracking asked for), humDb() (10·log10 Σ|w_k|², max over channels), harmonicDb(k),
+// TELEMETRY (process thread): detected(), mainsHz(), oscillatorHz(), locked() (the FLL ran for most of the
+// last hop it ran and the weights' common rotation over that hop was under 5 mHz — judged on the hop, since a
+// single period's estimate is mostly hiss on a real input — or no tracking asked for), humDb() (10·log10 Σ|w_k|², max over channels), harmonicDb(k),
 // quiet(), active().
 //
 // NUMERICS (law 3 carve-out, stated): weights and references in DOUBLE, samples in float. Float weights
@@ -176,8 +196,9 @@ namespace felitronics::dehum
 // downstream), harmonics above the active set, or hum whose phase moves faster than τ lets the weights follow.
 //
 // RT-safe: no allocation, lock, IO or throw anywhere after construction — there is no heap at all. Footprint
-// sizeof(HumRemover): weights, their previous-period copy and the LEARN snapshot, 6·kMaxChannels·MaxHarmonics
-// doubles (48 KiB at 64, 18 KiB at 24), plus ≈ 7 KiB of detector state and references.
+// sizeof(HumRemover): weights, their previous-period copy, the LEARN snapshot and the hop's weight record (five
+// sums), 11·kMaxChannels·MaxHarmonics doubles (88 KiB at 64, 33 KiB at 24), plus ≈ 7 KiB of detector state and
+// references.
 //==============================================================================
 
 enum class Mains { Off, Hz50, Hz60, Auto };
@@ -241,6 +262,8 @@ public:
     static constexpr double kHoldSeconds    = 0.050;    // a trigger keeps the playing width at least this long
     static constexpr double kSlewHzPerSec   = 0.05;     // the tracker's slew bound
     static constexpr double kResidualRise   = 1.1220184543019633;   // the residual floor rises <= 0.5 dB per hop (2 dB/s)
+    static constexpr double kJitterRatio    = 0.1;      // -10 dB: beyond it the lines are lost in their own notches' hiss
+    static constexpr int    kCoarseAvg      = 4;        // coarse estimates averaged for the FLL's agreement gate and acquisition
 
     struct Weight { double re, im; };
 
@@ -594,7 +617,7 @@ private:
         acquired_ = false;
         double f  = (double) family_;
         const int s = family_ == 60 ? 1 : 0;
-        if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s]) { f = clampToLock (coarse_[s]); acquired_ = true; }
+        if (running_ && params_.lockRangeHz > 0.0 && coarseValid_[s]) { f = clampToLock (coarseAvg (s)); acquired_ = true; }
         rotsValid_ = false; freqPending_ = false; glide_ = false; lastCoarseValid_ = false; lastCoarse2Valid_ = false; prevModel_ = 0.0;
         setFrequency (running_ ? f : 0.0);
         for (int c = 0; c < core::kMaxChannels; ++c)
@@ -668,8 +691,46 @@ private:
         return m;
     }
 
-    // After cancellation true quiet is the noise floor; a note is not. Within 12 dB of the residual floor.
-    bool residualQuiet() const noexcept { return ! running_ || ! rfValid_ || ! psEValid_ || ! (psE_ > kQuietRatio * rf_); }
+    // The MEDIAN of the last consecutive coarse estimates (the latest is valid whenever this is asked): hiss in
+    // the bins throws the odd estimate 0.1 Hz off, and one of them must not move an acquisition.
+    double coarseAvg (int s) const noexcept
+    {
+        const int n = cRingN_[s];
+        if (n <= 0) return coarse_[s];
+        double v[kCoarseAvg];
+        for (int i = 0; i < n; ++i)
+        {
+            double x = cRing_[s][i]; int j = i;
+            for (; j > 0 && v[j - 1] > x; --j) v[j] = v[j - 1];
+            v[j] = x;
+        }
+        return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    }
+
+    // How far the averaged coarse estimate may sit from f̂ and still agree: 0.05 Hz, or three standard errors of the
+    // average where the estimates scatter more (hiss in the bins), never beyond 0.25 Hz. A note at a bin drags the
+    // estimates CONSISTENTLY — a small scatter, a large offset — so it still holds the FLL.
+    double coarseTolerance (int s) const noexcept
+    {
+        const int n = cRingN_[s];
+        if (n < 2) return 0.05;
+        double m = 0.0;
+        for (int i = 0; i < n; ++i) m += cRing_[s][i];
+        m /= (double) n;
+        double v = 0.0;
+        for (int i = 0; i < n; ++i) { const double d = cRing_[s][i] - m; v += d * d; }
+        const double se = std::sqrt (v / (double) (n - 1) / (double) n);
+        const double t  = 3.0 * se;
+        return t < 0.05 ? 0.05 : (t > 0.25 ? 0.25 : t);
+    }
+
+    // After cancellation true quiet is the noise floor; a note is not. Within 12 dB of the residual floor — or
+    // 90 dB under the input floor, where the residual is arithmetic, not signal: a noiseless null's floor is
+    // whatever dip the arithmetic last made, and the residual then sits 20+ dB over it for good (R2's buzz)
+    bool residualQuiet() const noexcept
+    {
+        return ! running_ || ! rfValid_ || ! psEValid_ || ! (psE_ > kQuietRatio * rf_) || (floorValid_ && psE_ <= 1e-9 * floor_);
+    }
 
     // With zero (or freshly restored) weights the residual IS the input, so its level starts at the input's
     // settled level, not at one period's power — a trough there would set every trigger off on the next peak.
@@ -714,7 +775,14 @@ private:
         return bpos_[c] >= (double) kBlackRun ? 1.0 : 0.5 - 0.5 * core::det::cos (core::kPi * bpos_[c] / (double) kBlackRun);
     }
 
-    void resetResidualFloor() noexcept { rfCount_ = 0; rfPos_ = 0; rfValid_ = false; rf_ = 0.0; hopMinE_ = kNone; }
+    void resetResidualFloor() noexcept { rfCount_ = 0; rfPos_ = 0; rfValid_ = false; rf_ = 0.0; hopMinE_ = kNone; resetMotion(); }
+
+    // The weights' motion over a hop (sampled on the grid): fresh or restored weights start a new record.
+    void resetMotion() noexcept
+    {
+        jit_ = kNone; rotHz_ = kNone; lkSum_ = 0.0; lkN_ = 0; jfCount_ = 0; jfPos_ = 0; jfValid_ = false; jf_ = 0.0;
+        for (int c = 0; c < core::kMaxChannels; ++c) jN_[c] = 0;
+    }
 
     void resetDetector() noexcept
     {
@@ -734,6 +802,7 @@ private:
         hit_ = false; hitHold_ = 0; activeRun_ = 0; quietWin_ = false; quietPeriod_ = false; thr2_ = kNone; thrE2_ = kNone;
         streak_ = 0; streakFamily_ = 0; autoFamily_ = 0; winner_ = 0;
         coarse_[0] = coarse_[1] = 0.0; coarseValid_[0] = coarseValid_[1] = false;
+        cRingN_[0] = cRingN_[1] = 0; cRingPos_[0] = cRingPos_[1] = 0;
     }
 
     // The references at grid phase p: the anchor of the current period, rotated p times. Lazy, so a stretch
@@ -906,7 +975,6 @@ private:
         if (detOn()) endPeriod();
         for (int c = 0; c < core::kMaxChannels; ++c)
         {
-            chanLive_[c] = false;
             const double d = pkE_[c] * pkDecay64_;               // the residual's peak reference: last periods' peak,
             pkE_[c] = pkCur_[c] > d ? pkCur_[c] : d;             // released 6 dB per 40 ms (a pause decays it too)
             core::flushDenormal (pkE_[c]);                       // S3, law 8: it decays geometrically through silence
@@ -923,6 +991,23 @@ private:
                 pRe_[c][k] = re;
                 pIm_[c][k] = im;
             }
+        for (int c = 0; c < maxCh_; ++c)                         // the hop's record of each live channel's weights
+        {
+            if (! chanLive_[c] || jN_[c] >= kMotionMax) continue;
+            const double t = (double) jN_[c];
+            for (int k = 0; k < nActive_; ++k)
+            {
+                const double re = wRe_[c][k], im = wIm_[c][k];
+                if (jN_[c] == 0) { jRe_[c][k] = 0.0; jIm_[c][k] = 0.0; jTr_[c][k] = 0.0; jTi_[c][k] = 0.0; jPw_[c][k] = 0.0; }
+                jRe_[c][k] += re; jIm_[c][k] += im;
+                const double tr = t * re; const double ti = t * im;
+                jTr_[c][k] += tr; jTi_[c][k] += ti;
+                const double a = re * re; const double b = im * im;
+                jPw_[c][k] += a; jPw_[c][k] += b;
+            }
+            ++jN_[c];
+        }
+        for (int c = 0; c < core::kMaxChannels; ++c) chanLive_[c] = false;
         if (swapPhase_ == 1 && ! ramp_.isSmoothing() && core::exactlyEqual (ramp_.getCurrentValue(), 0.0f))
         {
             if (swapAction_ == 0) zeroForLearn(); else restoreBackup();
@@ -939,7 +1024,10 @@ private:
         // not the residual criterion (a residual grown by the FLL's own lag must not hold the FLL that cures it)
         // ...and the canceller explains the input: the residual 15 dB under it (a note, being residual, holds
         // the FLL; the FLL's own lag and a hiss 20 dB down do not)
-        const bool explained = ! (psEValid_ && psValid_) || psE_ <= 0.0316 * ps_;
+        // ...or, in the weights' own terms (narrowband: only what reaches the notches), the last hop's weight motion
+        // that a common frequency offset does not explain is 20 dB under the model — hiss in a notch is small,
+        // a note's beat in it is not
+        const bool explained = ! (psEValid_ && psValid_) || psE_ <= 0.0316 * ps_ || (jit_ < kNone && jfValid_ && jit_ <= 4.0 * jf_ && jit_ <= kJitterRatio && rfValid_ && psE_ <= 4.0 * rf_);
         fllFast_ = learning_ || (quietPeriod_ && ! hit_);      // the width this period ran at: the FLL's gain follows it
         const bool   wasQuiet = quietWin_ && floorValid_ && hitHold_ <= 0 && ! hit_ && coarseOk_ && fllHold_ <= 0 && explained;
         if (fllHold_ > 0) fllHold_ -= kPeriod;
@@ -1016,16 +1104,91 @@ private:
             }
         if (! (den > 1e-16)) return;
         const double delta = num / (2.0 * core::kPi * periodSec_ * den);
-        lockedPeriods_ = std::fabs (delta) < 0.005 ? (lockedPeriods_ < hopPeriods_ ? lockedPeriods_ + 1 : lockedPeriods_) : 0;
+        lkSum_ += delta; ++lkN_;                                // locked(): judged per hop, on the weights' rotation
         double step = (fllFast_ ? fllGainT_ : fllGainSlowT_) * delta;
         if (step >  slewT_) step =  slewT_;
         if (step < -slewT_) step = -slewT_;
         setFrequency (clampToLock (fHat_ + step));
     }
 
+    // The hop's weight motion (a real input): per harmonic, the samples' scatter around their mean, less what
+    // the best COMMON rotation (k·ρ per period, a frequency offset) and each harmonic's own radial drift (a level
+    // change) explain, summed k²-weighted like the FLL and taken re the model's k²-weighted power. Hiss in a notch
+    // leaves a small scatter; a note's beat in a notch does not; a frequency error is explained.
+    void endMotion() noexcept
+    {
+        double rn = 0.0, rd = 0.0;
+        for (int c = 0; c < maxCh_; ++c)
+        {
+            if (jN_[c] < 8) continue;
+            const double n = (double) jN_[c], pb = 0.5 * (n - 1.0), st2 = n * (n * n - 1.0) / 12.0;
+            for (int k = 0; k < nActive_; ++k)
+            {
+                const double kk = (double) (k + 1);
+                const double mr = jRe_[c][k] / n, mi = jIm_[c][k] / n;
+                const double br = jTr_[c][k] - pb * jRe_[c][k], bi = jTi_[c][k] - pb * jIm_[c][k];   // Σ τ·w, centred
+                const double x  = (bi * mr - br * mi) / st2;           // Im(s·conj m), s the slope per period
+                const double t  = kk * x;
+                rn += t;
+                const double m2 = mr * mr + mi * mi;
+                const double v  = kk * kk * m2;
+                rd += v;
+            }
+        }
+        if (! (rd > 1e-30)) { jit_ = kNone; rotHz_ = kNone; return; }
+        const double rho = rn / rd;                                    // rad per period per harmonic
+        double un = 0.0;
+        for (int c = 0; c < maxCh_; ++c)
+        {
+            if (jN_[c] < 8) continue;
+            const double n = (double) jN_[c], pb = 0.5 * (n - 1.0), st2 = n * (n * n - 1.0) / 12.0;
+            for (int k = 0; k < nActive_; ++k)
+            {
+                const double kk = (double) (k + 1);
+                const double mr = jRe_[c][k] / n, mi = jIm_[c][k] / n;
+                const double m2 = mr * mr + mi * mi;
+                if (! (m2 > 0.0)) continue;
+                const double br = jTr_[c][k] - pb * jRe_[c][k], bi = jTi_[c][k] - pb * jIm_[c][k];
+                const double q  = kk * rho;
+                const double sr = -q * mi, si = q * mr;                // the common rotation's slope j·k·ρ·m
+                const double cross = sr * br + si * bi;                // Re(conj(s)·B)
+                const double v = (jPw_[c][k] - n * m2 - 2.0 * cross + (sr * sr + si * si) * st2) / n;
+                if (v > 0.0) un += kk * kk * v;
+            }
+        }
+        jit_   = un / rd;
+        rotHz_ = rho / (2.0 * core::kPi * periodSec_);
+    }
+
+    // The motion's own floor, like the residual floor: the minimum over kFloorHops, rising <= 0.5 dB per hop,
+    // learned only from hops the stage already takes for hum and hiss (quiet, trigger-free, the residual near
+    // its floor), restarted with it.
+    void updateMotionFloor (bool learnable) noexcept
+    {
+        if (! (jit_ < kNone) || ! learnable) return;
+        jfRing_[jfPos_] = jit_;
+        jfPos_ = (jfPos_ + 1) % kFloorHops;
+        if (jfCount_ < kFloorHops) ++jfCount_;
+        double m = jfRing_[0];
+        for (int i = 1; i < jfCount_; ++i) if (jfRing_[i] < m) m = jfRing_[i];
+        const double capped = jf_ * kResidualRise;
+        jf_ = (jfValid_ && m > capped) ? capped : m;
+        jfValid_ = true;
+    }
+
     void endHop() noexcept
     {
         hopCount_ = 0;
+        endMotion();
+        for (int c = 0; c < core::kMaxChannels; ++c) jN_[c] = 0;
+        // locked(): the FLL ran for most of the hop and the weights' common rotation over it is under 5 mHz —
+        // judged on the whole hop (a period's own estimate is mostly hiss on a real input)
+        if (lkN_ >= hopPeriods_ / 2)
+        {
+            const double e = rotHz_ < kNone ? rotHz_ : lkSum_ / (double) lkN_;
+            lockedPeriods_ = std::fabs (e) < 0.005 ? hopPeriods_ : 0;
+        }
+        lkSum_ = 0.0; lkN_ = 0;
         if (hopsSeen_ >= 1)
         {
             const double nW = 2.0 * (double) (hopPeriods_ * kPeriod);
@@ -1073,6 +1236,13 @@ private:
                 const double off = std::atan2 (ci, cr) / (2.0 * core::kPi * hopSec_);
                 coarse_[s]      = (kBinHz[b] + off) / (double) ((b & 1) + 1);
                 coarseValid_[s] = true;
+            }
+            for (int s = 0; s < 2; ++s)                        // the last kCoarseAvg consecutive estimates, averaged
+            {
+                if (! coarseValid_[s]) { cRingN_[s] = 0; continue; }
+                cRing_[s][cRingPos_[s]] = coarse_[s];
+                cRingPos_[s] = (cRingPos_[s] + 1) % kCoarseAvg;
+                if (cRingN_[s] < kCoarseAvg) ++cRingN_[s];
             }
 
             const int winner = wins[0] ? 50 : (wins[1] ? 60 : 0);
@@ -1132,15 +1302,16 @@ private:
             }
             {
                 const int cs = family_ == 60 ? 1 : 0;
-                coarseOk_ = running_ && coarseValid_[cs] && std::fabs (coarse_[cs] - fHat_) < 0.05;
+                coarseOk_ = running_ && coarseValid_[cs] && std::fabs (coarseAvg (cs) - fHat_) < coarseTolerance (cs);
             }
             if (running_ && ! acquired_ && params_.lockRangeHz > 0.0 && coarseValid_[family_ == 60 ? 1 : 0])
             {
-                setFrequency (clampToLock (coarse_[family_ == 60 ? 1 : 0]));
+                setFrequency (clampToLock (coarseAvg (family_ == 60 ? 1 : 0)));
                 acquired_ = true;
                 coarseOk_ = true;
             }
             quietWin_ = quiet && trigFree;                     // a window that held a trigger is not quiet
+            updateMotionFloor (running_ && quietWin_ && residualQuiet());
             for (int c = 0; c < maxCh_; ++c)
                 for (int b = 0; b < 4; ++b) { winRe_[c][b] = nowRe_[c][b]; winIm_[c][b] = nowIm_[c][b]; }
             prevWinValid_ = true;
@@ -1223,6 +1394,18 @@ private:
     int    lwHops_ = 0;
     bool   glide_ = false, lastCoarseValid_ = false, lastCoarse2Valid_ = false;
     double lastCoarse2_ = 0.0;
+    static constexpr int kMotionMax = 1 << 20;
+    double jRe_[core::kMaxChannels][MaxHarmonics] {}, jIm_[core::kMaxChannels][MaxHarmonics] {};   // the hop's weight record:
+    double jTr_[core::kMaxChannels][MaxHarmonics] {}, jTi_[core::kMaxChannels][MaxHarmonics] {};   // Σw, Σt·w, Σ|w|²
+    double jPw_[core::kMaxChannels][MaxHarmonics] {};
+    int    jN_[core::kMaxChannels] {};
+    double jit_ = kNone, rotHz_ = kNone, lkSum_ = 0.0;
+    int    lkN_ = 0;
+    double cRing_[2][kCoarseAvg] {};
+    int    cRingN_[2] {}, cRingPos_[2] {};
+    double jfRing_[kFloorHops] {}, jf_ = 0.0;
+    int    jfCount_ = 0, jfPos_ = 0;
+    bool   jfValid_ = false;
 
     // ---- detector ----
     double hopRe_[core::kMaxChannels][4] {}, hopIm_[core::kMaxChannels][4] {};

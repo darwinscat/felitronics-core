@@ -1185,6 +1185,108 @@ static void testBeatDoesNotGlide()
     ok (dev <= 0.005, "F1: the estimate is not pulled by the note's beat (" + fmt (dev, 4) + " Hz)");
 }
 
+//------------------------------------------------------------------------------------------------------
+// A REAL INPUT: the owner's single-coil and humbucker DI takes, modelled. The harmonic tables are fitted from
+// them (peak dB re k1, k1..40 — single coils carry strong odd harmonics past k24), the hiss is PINK (a pickup's
+// hiss is strongest at the low harmonics: on the takes the coarse estimate scatters ±0.02–0.1 Hz) at the takes'
+// level: the hum's harmonic power is 80 % of the quiet's (single coil) and 60 % (humbucker), so the broadband
+// residual after cancellation is the hiss, 7 and 4 dB under the input. Before this the FLL never ran on them
+// (every gate compared broadband powers), f̂ stayed at the first coarse estimate (0.02 / 0.06 Hz off) and
+// locked() never came. Measured here: lock, f̂ against the fixture's f0, the strong lines' nulls (a joint fit
+// over 8 s at the known frequencies, re the input fitted the same way), and a chord that must not pull f̂.
+static const double kSingleCoilDb[40] = { 0,-29,-12,-30,-10,-27,-9,-26,-10,-29,-22,-24,-14,-26,-23,-33,-15,-22,-18,-25,
+                                          -17,-28,-19,-25,-18,-30,-17,-29,-18,-28,-24,-30,-19,-46,-18,-34,-30,-27,-22,-28 };
+static const double kHumbuckerDb[40]  = { 0,-24,-8,-22,-3,-23,-2,-21,-8,-24,-23,-21,-9,-21,-16,-31,-14,-20,-12,-23,
+                                          -13,-28,-17,-21,-16,-28,-12,-30,-15,-28,-22,-28,-18,-38,-17,-31,-22,-25,-25,-26 };
+static std::vector<float> realInput (bool humbucker, double f0, double seconds, double fs, bool chord)
+{
+    const std::size_t N = (std::size_t) (seconds * fs);
+    std::vector<float> x (N, 0.0f), nz (N, 0.0f);
+    const double a1 = std::pow (10.0, (humbucker ? -83.0 : -63.0) / 20.0), hiss = std::pow (10.0, (humbucker ? -83.4 : -69.1) / 20.0);
+    {   // pink hiss (Kellet's three-pole filter on white), scaled to its RMS
+        Lcg r { 7u }; double b0 = 0.0, b1 = 0.0, b2 = 0.0, e = 0.0;
+        for (std::size_t n = 0; n < N; ++n)
+        {
+            const double w = 2.0 * r.uniform() - 1.0;
+            b0 = 0.99765 * b0 + w * 0.0990460; b1 = 0.96300 * b1 + w * 0.2965164; b2 = 0.57000 * b2 + w * 1.0526913;
+            const double v = b0 + b1 + b2 + w * 0.1848;
+            nz[n] = (float) v; e += v * v;
+        }
+        const double g = hiss / std::sqrt (e / (double) N);
+        for (float& v : nz) v = (float) ((double) v * g);
+    }
+    Lcg r { 11u }; double ph[40]; for (double& p : ph) p = 2.0 * kPi * r.uniform();
+    const double* tab = humbucker ? kHumbuckerDb : kSingleCoilDb;
+    double amp[40]; for (int k = 0; k < 40; ++k) amp[k] = a1 * std::pow (10.0, tab[k] / 20.0);
+    for (std::size_t n = 0; n < N; ++n)
+    {
+        const double c = f0 * (double) n / fs;
+        double v = 0.0;
+        for (int k = 1; k <= 40; ++k) { const double kc = k * c; v += amp[k - 1] * std::sin (2.0 * kPi * (kc - std::floor (kc)) + ph[k - 1]); }
+        x[n] = (float) v + nz[n];
+    }
+    if (chord)   // an open E chord at 8 s, strings at -20 dBFS, τ 2.5 s, stopped at 14 s
+    {
+        const double fr[6] = { 82.41, 123.47, 164.81, 207.65, 246.94, 329.63 };
+        for (int st = 0; st < 6; ++st)
+        {
+            Note nt; nt.f0 = fr[st]; nt.amp = 0.1; nt.start = 8.0 + 0.02 * st; nt.dur = 14.0 - nt.start; nt.tau = 2.5;
+            nt.attack = 0.002; nt.release = 0.05; nt.partials = 8; nt.ph0 = (double) st;
+            addNote (x, nt, fs);
+        }
+    }
+    return x;
+}
+
+static void testRealInput()
+{
+    group ("a real input: single-coil and humbucker hum over pink hiss lock, null the strong lines, and a chord does not pull f̂");
+    const double fs = 48000.0;
+    for (int pass = 0; pass < 3; ++pass)
+    {
+        const bool hb = pass == 1, chord = pass == 2;
+        const double f0 = hb ? 50.0072 : 49.9931, T = chord ? 24.0 : 16.0;
+        const std::vector<float> in = realInput (hb, f0, T, fs, chord);
+        std::vector<float> x = in;
+        HR h; h.setParams (params (dh::Mains::Auto, 0.5, 3.0)); felitronics::test::run (h.prepare (fs, 256, 1));
+        double firstLock = -1.0, worstF = 0.0, worstChordF = 0.0, sumF = 0.0; int lockedBlocks = 0, blocks = 0;
+        for (std::size_t o = 0; o < x.size(); o += 256)
+        {
+            float* io[1] { x.data() + o };
+            felitronics::test::run (h.process (io, 1, (int) std::min<std::size_t> (256, x.size() - o)));
+            const double t = (double) (o + 256) / fs;
+            if (firstLock < 0.0 && h.locked()) firstLock = t;
+            if (t >= 8.0 && ! (chord && t < 16.0)) { worstF = std::max (worstF, std::fabs (h.mainsHz() - f0)); sumF += h.mainsHz() - f0; lockedBlocks += h.locked() ? 1 : 0; ++blocks; }
+            if (chord && t >= 8.0) worstChordF = std::max (worstChordF, std::fabs (h.mainsHz() - f0));
+        }
+        const double from = chord ? 16.0 : 8.0;
+        const std::vector<int> strong = hb ? std::vector<int> { 1, 3, 5, 7, 9, 13 } : std::vector<int> { 1, 3, 5, 7, 9, 13, 17 };
+        std::vector<double> fr; for (int k : strong) fr.push_back (k * f0);
+        const auto ay = fitAmps (x, (std::int64_t) (from * fs), (std::int64_t) (8.0 * fs), fr, fs), ax = fitAmps (in, (std::int64_t) (from * fs), (std::int64_t) (8.0 * fs), fr, fs);
+        double worstNul = -400.0, worstLow = -400.0; std::string nuls;
+        for (std::size_t i = 0; i < strong.size(); ++i)
+        {
+            const double d = dbOf (ay[i] / ax[i]);
+            worstNul = std::max (worstNul, d);
+            if (strong[i] <= 9) worstLow = std::max (worstLow, d);
+            nuls += " k" + std::to_string (strong[i]) + " " + fmt (d, 0);
+        }
+        const std::string tag = hb ? "humbucker" : (chord ? "single coil + chord" : "single coil");
+        const double lockedShare = blocks > 0 ? (double) lockedBlocks / blocks : 0.0, meanF = blocks > 0 ? sumF / blocks : 1.0;
+        std::printf ("      %s: first locked %.2f s, locked %.0f%% of the quiet from 8 s, f̂ - f0 %+.4f Hz (worst %.4f)%s; nulls%s dB\n", tag.c_str(), firstLock,
+                     100.0 * lockedShare, meanF, worstF, chord ? (" (" + fmt (worstChordF, 4) + " from the chord on)").c_str() : "", nuls.c_str());
+        // THE LIMITS, stated in the header: hiss stronger below a line than above it, and the uncancelled k25+,
+        // bias the FLL by 1–2 mHz with 24 of the 40 harmonics active (≈ 0.5 mHz with all 40), which is what keeps
+        // k13/k17 near -38 dB; the humbucker's lines are 4 dB over the hiss broadband, its lock comes and goes
+        ok (firstLock > 0.0 && firstLock <= 4.0 && lockedShare >= (hb ? 0.75 : 0.9), tag + ": locked within 4 s and stays locked (first " + fmt (firstLock, 2) + " s, " + fmt (100.0 * lockedShare, 0) + " %)");
+        ok (std::fabs (meanF) <= (hb ? 0.006 : 0.003) && worstF <= (hb ? 0.008 : 0.005), tag + ": f̂ within " + (hb ? "6" : "3") + " mHz of the mains on average, "
+            + (hb ? "8" : "5") + " at worst (" + fmt (meanF, 4) + ", " + fmt (worstF, 4) + " Hz)");
+        ok (hb ? worstNul <= -30.0 : (worstLow <= -40.0 && worstNul <= -35.0),
+            tag + (hb ? ": the strong lines nulled to -30 dB (worst " : ": k1..k9 nulled to -40 dB, k13/k17 to -35 (worst ") + fmt (hb ? worstNul : worstLow, 1) + ", " + fmt (worstNul, 1) + ")");
+        if (chord) ok (worstChordF <= 0.003, tag + ": the chord and its tail do not pull f̂ (" + fmt (worstChordF, 4) + " Hz)");
+    }
+}
+
 int main()
 {
     std::printf ("felitronics::dehum — HumRemover knowing the mains\n");
@@ -1214,5 +1316,6 @@ int main()
     testRingingLearnAndSharedLine();
     testRound4();
     testBeatDoesNotGlide();
+    testRealInput();
     return felitronics::test::report();
 }
